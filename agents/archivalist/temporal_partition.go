@@ -310,7 +310,7 @@ func (pm *TemporalPartitionManager) CompactOldPartitions() int {
 
 	for _, partition := range pm.partitions {
 		partition.mu.Lock()
-		if !partition.IsCompacted && partition.EndTime.Before(threshold) {
+		if !partition.IsCompacted && !partition.LastAccessTime.After(threshold) {
 			partition.IsCompacted = true
 			now := time.Now()
 			partition.CompactedAt = &now

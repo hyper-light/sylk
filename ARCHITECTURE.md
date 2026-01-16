@@ -822,6 +822,7 @@ At 75% cache hit rate (higher than Librarian due to immutable history):
 | **Architect** | Planning & coordination | PRIMARY (default agent) | Abstract → Concrete, DAG design, user coordination |
 | **Orchestrator** | Workflow execution | NONE (invisible) | Execute DAGs, manage Engineers, status propagation |
 | **Engineer** | Task execution | NONE (invisible) | Code writing, problem solving |
+| **Designer** | UI/UX implementation | PRIMARY (during UI work) | Component design, styling, accessibility, design systems |
 | **Librarian** | Local codebase RAG | DIRECT (triggered by codebase queries) | Code context, pattern detection |
 | **Archivalist** | Historical RAG | DIRECT (triggered by history queries) | Past decisions, solution patterns |
 | **Inspector** | Code validation | PRIMARY (during inspection) | Compliance checking, issue detection |
@@ -1152,6 +1153,148 @@ engineer_skills_contextual := []Skill{
         Domain:      "consultation",
         Keywords:    []string{"best practice", "how should", "recommended"},
         LoadTrigger: "best practice|recommend|should|standard",
+    },
+}
+```
+
+### Designer Skills
+
+```go
+// Core Skills (Tier 1)
+designer_skills_core := []Skill{
+    {
+        Name:        "create_component",
+        Description: "Create a new UI component",
+        Domain:      "ui",
+        Keywords:    []string{"component", "create", "new", "ui"},
+        Priority:    100,
+        Parameters: []Param{
+            {Name: "name", Type: "string", Required: true},
+            {Name: "type", Type: "enum", Values: []string{"functional", "class", "styled"}, Required: false},
+            {Name: "framework", Type: "enum", Values: []string{"react", "vue", "svelte", "solid"}, Required: false},
+        },
+    },
+    {
+        Name:        "style_component",
+        Description: "Apply styling to a component",
+        Domain:      "styling",
+        Keywords:    []string{"style", "css", "tailwind", "styled"},
+        Priority:    100,
+        Parameters: []Param{
+            {Name: "component", Type: "string", Required: true},
+            {Name: "approach", Type: "enum", Values: []string{"css-modules", "tailwind", "styled-components", "css-in-js"}, Required: false},
+        },
+    },
+    {
+        Name:        "get_design_tokens",
+        Description: "Retrieve design system tokens",
+        Domain:      "design_system",
+        Keywords:    []string{"token", "color", "spacing", "typography", "theme"},
+        Priority:    100,
+        Parameters: []Param{
+            {Name: "category", Type: "enum", Values: []string{"color", "spacing", "typography", "shadow", "border", "all"}, Required: false},
+            {Name: "name", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "find_component",
+        Description: "Find existing UI components in the codebase",
+        Domain:      "ui",
+        Keywords:    []string{"find", "existing", "component", "reuse"},
+        Priority:    100,
+        Parameters: []Param{
+            {Name: "query", Type: "string", Required: true},
+            {Name: "type", Type: "enum", Values: []string{"component", "hook", "utility", "all"}, Required: false},
+        },
+    },
+    {
+        Name:        "preview_ui",
+        Description: "Preview UI changes in isolation",
+        Domain:      "preview",
+        Keywords:    []string{"preview", "render", "show", "display"},
+        Priority:    90,
+    },
+    {
+        Name:        "check_accessibility",
+        Description: "Check component accessibility compliance",
+        Domain:      "accessibility",
+        Keywords:    []string{"a11y", "accessibility", "aria", "wcag"},
+        Priority:    90,
+        Parameters: []Param{
+            {Name: "component", Type: "string", Required: true},
+            {Name: "level", Type: "enum", Values: []string{"A", "AA", "AAA"}, Required: false},
+        },
+    },
+}
+
+// Contextual Skills (Tier 2)
+designer_skills_contextual := []Skill{
+    {
+        Name:        "analyze_layout",
+        Description: "Analyze and suggest layout improvements",
+        Domain:      "layout",
+        Keywords:    []string{"layout", "grid", "flex", "responsive"},
+        LoadTrigger: "layout|grid|flex|responsive|breakpoint",
+    },
+    {
+        Name:        "suggest_animation",
+        Description: "Suggest appropriate animations",
+        Domain:      "animation",
+        Keywords:    []string{"animate", "transition", "motion"},
+        LoadTrigger: "animate|transition|motion|effect",
+    },
+    {
+        Name:        "audit_consistency",
+        Description: "Audit design consistency across components",
+        Domain:      "design_system",
+        Keywords:    []string{"consistency", "audit", "design system"},
+        LoadTrigger: "consistent|audit|design system|theme",
+    },
+    {
+        Name:        "generate_variants",
+        Description: "Generate component variants (sizes, states)",
+        Domain:      "ui",
+        Keywords:    []string{"variant", "size", "state"},
+        LoadTrigger: "variant|size|state|small|large|disabled",
+    },
+    {
+        Name:        "consult_engineer",
+        Description: "Consult Engineer for implementation details",
+        Domain:      "consultation",
+        Keywords:    []string{"implement", "logic", "state management"},
+        LoadTrigger: "implement|logic|state|hook|data",
+    },
+    {
+        Name:        "consult_academic",
+        Description: "Research UI/UX best practices",
+        Domain:      "consultation",
+        Keywords:    []string{"best practice", "pattern", "guideline"},
+        LoadTrigger: "best practice|pattern|guideline|ux",
+    },
+}
+
+// Specialized Skills (Tier 3)
+designer_skills_specialized := []Skill{
+    {
+        Name:        "design_system_scaffold",
+        Description: "Scaffold a complete design system",
+        Domain:      "design_system",
+        Keywords:    []string{"scaffold", "design system", "foundation"},
+        LoadTrigger: "explicit_request",
+    },
+    {
+        Name:        "theme_migration",
+        Description: "Migrate between design systems or themes",
+        Domain:      "design_system",
+        Keywords:    []string{"migrate", "theme", "redesign"},
+        LoadTrigger: "explicit_request",
+    },
+    {
+        Name:        "responsive_audit",
+        Description: "Full responsive design audit",
+        Domain:      "responsive",
+        Keywords:    []string{"responsive", "mobile", "tablet", "breakpoint"},
+        LoadTrigger: "explicit_request",
     },
 }
 ```
@@ -7807,6 +7950,343 @@ Cross-domain queries are where VectorGraphDB really shines - previously required
 
 **Key Insight**: The agent always runs on cache misses - VectorGraphDB doesn't replace LLM reasoning, it **reduces context size** by providing curated, scored, pre-filtered results instead of raw files and grep output. Combined with intent caching, this achieves 75% total token savings.
 
+### XOR Filters as Internal Optimization
+
+XOR filters are used **internally within search skills**, not exposed as separate LLM tools. This is critical for actual token savings.
+
+#### Why NOT Expose XOR Filters to LLMs
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    XOR AS SEPARATE TOOL = BAD                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Agent: exists_in_domain("retry", "code")     → 20 tokens                 │
+│   Agent: (thinks) "It exists, I should search" → 10 tokens                 │
+│   Agent: search_code("retry logic")            → 800 tokens                │
+│   Total: 830 tokens                                                        │
+│                                                                             │
+│   vs WITHOUT XOR:                                                          │
+│   Agent: search_code("retry logic")            → 800 tokens                │
+│                                                                             │
+│   XOR as separate tool is WORSE when content exists!                       │
+│   Only saves tokens when content DOESN'T exist.                            │
+│                                                                             │
+│   If 80% of searches find something:                                       │
+│   • Without XOR: 800 tokens                                                │
+│   • With XOR tool: 0.8 × 830 + 0.2 × 20 = 668 tokens                      │
+│   • Only ~16% savings, not worth the complexity                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Correct Approach: XOR as Internal Implementation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    XOR AS INTERNAL OPTIMIZATION = GOOD                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   LLM calls: search_code("retry")                                          │
+│                                                                             │
+│   INTERNALLY (hidden from LLM):                                            │
+│   ─────────────────────────────                                            │
+│   1. XOR filter check: topic exists in code domain?                        │
+│      → If NO: return {"status": "no_matches", "hint": "..."} immediately  │
+│      → If YES: continue to step 2                                          │
+│                                                                             │
+│   2. HNSW vector search for actual results                                 │
+│                                                                             │
+│   3. Return results to LLM                                                 │
+│                                                                             │
+│   LLM doesn't know XOR exists - it just gets faster "no matches"           │
+│   responses when content doesn't exist (30 tokens vs 800 tokens).          │
+│                                                                             │
+│   NO EXTRA TOOL CALL OVERHEAD                                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Smart Search Skills with Internal XOR
+
+```go
+// search_code with internal XOR optimization
+var SearchCodeSkill = skills.NewSkill("search_code").
+    Description("Search code by semantic similarity. Returns results or 'no_matches' quickly.").
+    Domain("code").
+    StringParam("query", "What to search for", true).
+    IntParam("limit", "Max results (default: 10)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query string `json:"query"`
+            Limit int    `json:"limit"`
+        }
+        json.Unmarshal(input, &params)
+
+        // INTERNAL: XOR filter early exit (not exposed to LLM)
+        topicHash := hashTopic(params.Query)
+        if !xorFilters.Code.Contains(topicHash) {
+            // Return minimal response - saves ~770 tokens
+            return SearchResponse{
+                Status: "no_matches",
+                Hint:   "No code matches this query. Consider searching history or academic.",
+            }, nil
+        }
+
+        // Content likely exists - do full search
+        results, err := vdb.SimilarNodes(ctx, params.Query, params.Limit,
+            &SearchFilter{Domain: DomainCode})
+        if err != nil {
+            return nil, err
+        }
+
+        return formatSearchResults(results), nil
+    }).
+    Build()
+```
+
+#### Multi-Domain Search (Reduces Tool Calls)
+
+Instead of agent making 3 separate calls, one call searches all domains:
+
+```go
+// search_all - Single call for multi-domain search
+var SearchAllSkill = skills.NewSkill("search_all").
+    Description("Search across multiple domains in one call. Returns results grouped by domain.").
+    Domain("search").
+    StringParam("query", "What to search for", true).
+    ArrayParam("domains", "Domains to search: code, history, academic (default: all)", "string", false).
+    IntParam("limit_per_domain", "Max results per domain (default: 5)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query          string   `json:"query"`
+            Domains        []string `json:"domains"`
+            LimitPerDomain int      `json:"limit_per_domain"`
+        }
+        json.Unmarshal(input, &params)
+
+        if len(params.Domains) == 0 {
+            params.Domains = []string{"code", "history", "academic"}
+        }
+        if params.LimitPerDomain == 0 {
+            params.LimitPerDomain = 5
+        }
+
+        results := make(map[string]any)
+        topicHash := hashTopic(params.Query)
+
+        for _, domain := range params.Domains {
+            // INTERNAL: XOR early exit per domain
+            if !xorFilters.Get(domain).Contains(topicHash) {
+                results[domain] = DomainResult{Status: "no_matches"}
+                continue
+            }
+
+            domainResults, _ := vdb.SimilarNodes(ctx, params.Query,
+                params.LimitPerDomain, &SearchFilter{Domain: Domain(domain)})
+            results[domain] = formatDomainResults(domainResults)
+        }
+
+        return MultiDomainResponse{
+            Query:   params.Query,
+            Results: results,
+        }, nil
+    }).
+    Build()
+```
+
+**Token savings:**
+```
+BEFORE (3 separate calls):
+  search_code("retry")     → 800 tokens
+  search_history("retry")  → 800 tokens
+  search_academic("retry") → 800 tokens
+  Total: 2,400 tokens
+
+AFTER (1 call with internal XOR):
+  search_all("retry", domains=["code", "history", "academic"])
+    → code: 5 results (exists)
+    → history: no_matches (XOR early exit - minimal tokens)
+    → academic: 3 results (exists)
+  Total: ~900 tokens (62% savings)
+```
+
+#### Search with Inline Domain Hints
+
+Include hints about other domains in search results:
+
+```go
+type SearchResponse struct {
+    Results      []SearchResult `json:"results"`
+    AlsoExistsIn []string       `json:"also_exists_in,omitempty"`
+    Suggestions  []string       `json:"suggestions,omitempty"`
+}
+
+func formatSearchWithHints(results []SearchResult, query string) SearchResponse {
+    resp := SearchResponse{Results: results}
+
+    // INTERNAL: XOR probe other domains (fast, no extra tool call)
+    topicHash := hashTopic(query)
+    if xorFilters.History.Contains(topicHash) {
+        resp.AlsoExistsIn = append(resp.AlsoExistsIn, "history")
+    }
+    if xorFilters.Academic.Contains(topicHash) {
+        resp.AlsoExistsIn = append(resp.AlsoExistsIn, "academic")
+    }
+
+    if len(resp.AlsoExistsIn) > 0 {
+        resp.Suggestions = append(resp.Suggestions,
+            fmt.Sprintf("Related content in: %s", strings.Join(resp.AlsoExistsIn, ", ")))
+    }
+
+    return resp
+}
+```
+
+**Example response to LLM:**
+```json
+{
+  "results": [
+    {"id": "auth/handler.go:Login", "score": 0.92, "snippet": "..."},
+    {"id": "auth/middleware.go:Validate", "score": 0.87, "snippet": "..."}
+  ],
+  "also_exists_in": ["history"],
+  "suggestions": ["Related content in: history"]
+}
+```
+
+Agent learns about related domains without extra tool calls.
+
+#### Smart Search with Budget Control
+
+Let the tool manage progressive retrieval internally:
+
+```go
+// smart_search - Budget-aware search with internal progressive retrieval
+var SmartSearchSkill = skills.NewSkill("smart_search").
+    Description("Intelligent search that retrieves until confident or budget exhausted.").
+    Domain("search").
+    StringParam("query", "What to search for", true).
+    IntParam("token_budget", "Max tokens for results (default: 1000)", false).
+    EnumParam("thoroughness", "Search depth", []string{"quick", "moderate", "thorough"}, false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query        string `json:"query"`
+            TokenBudget  int    `json:"token_budget"`
+            Thoroughness string `json:"thoroughness"`
+        }
+        json.Unmarshal(input, &params)
+
+        if params.TokenBudget == 0 {
+            params.TokenBudget = 1000
+        }
+
+        // INTERNAL: XOR early exit
+        if !xorFilters.HasAny(params.Query) {
+            return SearchResponse{
+                Status: "no_matches",
+                Hint:   "No content matches this query in any domain.",
+            }, nil
+        }
+
+        // Progressive retrieval within budget
+        var results []SearchResult
+        var tokensUsed int
+        batchSize := 3
+
+        for tokensUsed < params.TokenBudget {
+            batch, _ := vdb.SimilarNodes(ctx, params.Query, batchSize, nil)
+            if len(batch) == 0 {
+                break
+            }
+
+            for _, r := range batch {
+                result := formatResult(r)
+                resultTokens := estimateTokens(result)
+
+                if tokensUsed + resultTokens > params.TokenBudget {
+                    break
+                }
+
+                results = append(results, result)
+                tokensUsed += resultTokens
+            }
+
+            // Check confidence based on thoroughness
+            if hasEnoughResults(results, params.Thoroughness) {
+                break
+            }
+
+            batchSize += 2 // Expand search
+        }
+
+        return SearchResponse{
+            Results:    results,
+            TokensUsed: tokensUsed,
+            Budget:     params.TokenBudget,
+        }, nil
+    }).
+    Build()
+```
+
+#### XOR Filter Maintenance (Internal)
+
+XOR filters are rebuilt in the background, with a pending set for consistency:
+
+```go
+type XORFilterManager struct {
+    filters    map[string]*xorfilter.Xor8  // Immutable XOR filters
+    pending    map[string]*bloom.Filter     // Mutable bloom for recent adds
+    vdb        *VectorGraphDB
+    rebuildMu  sync.Mutex
+}
+
+// Contains checks both XOR (stable) and pending (recent)
+func (m *XORFilterManager) Contains(domain string, key uint64) bool {
+    // Check immutable XOR filter (fast)
+    if m.filters[domain] != nil && m.filters[domain].Contains(key) {
+        return true
+    }
+    // Check pending bloom filter (recent additions)
+    if m.pending[domain] != nil && m.pending[domain].Test(key) {
+        return true
+    }
+    return false
+}
+
+// NotifyAdd adds to pending (called after VectorGraphDB write)
+func (m *XORFilterManager) NotifyAdd(domain string, keys []uint64) {
+    for _, key := range keys {
+        m.pending[domain].Add(key)
+    }
+}
+
+// Rebuild runs periodically in background
+func (m *XORFilterManager) Rebuild(ctx context.Context) error {
+    m.rebuildMu.Lock()
+    defer m.rebuildMu.Unlock()
+
+    for _, domain := range []string{"code", "history", "academic"} {
+        keys, _ := m.vdb.CollectTopicKeys(ctx, domain)
+        m.filters[domain], _ = xorfilter.Populate(keys)
+        m.pending[domain] = bloom.NewWithEstimates(10000, 0.01) // Reset pending
+    }
+
+    return nil
+}
+```
+
+#### Token Savings Summary with Internal XOR
+
+| Optimization | Mechanism | Token Savings |
+|--------------|-----------|---------------|
+| **XOR early exit** | Skip HNSW when no matches | ~770 tokens/empty search |
+| **Multi-domain search** | One call instead of 3 | ~1,500 tokens/cross-domain |
+| **Inline domain hints** | No extra probe calls | ~20 tokens × avoided calls |
+| **Budget-controlled search** | Tool manages retrieval | ~200 tokens/query |
+
+**Updated total savings: ~80%** (up from 75% without XOR)
+
 ### Latency Analysis
 
 ```
@@ -9367,6 +9847,1301 @@ func (agent *KnowledgeAgent) progressiveRetrieve(ctx context.Context, query stri
 
 ---
 
+## Agent Efficiency Techniques
+
+This section describes techniques to help agents work more efficiently, avoid repeated mistakes, and maintain consistency. These address common inefficiencies in LLM-based coding agents.
+
+### Agent Pain Points Addressed
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    AGENT INEFFICIENCIES ADDRESSED                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   CONTEXT LOSS                        REPEATED WORK                         │
+│   ─────────────                       ─────────────                         │
+│   • Forgets what it learned           • Reads same files repeatedly        │
+│   • Loses track of current task       • Searches for same things           │
+│   • Re-gathers context it just had    • Rebuilds context unnecessarily     │
+│                                                                             │
+│   PATTERN BLINDNESS                   STYLE DRIFT                           │
+│   ────────────────                    ───────────                           │
+│   • Doesn't recognize similar work    • Inconsistent code style            │
+│   • Reinvents solved problems         • Mismatched UI patterns             │
+│   • Misses reusable components        • Naming inconsistencies             │
+│                                                                             │
+│   MISTAKE REPETITION                  USER PREFERENCE AMNESIA              │
+│   ─────────────────                   ───────────────────────              │
+│   • Makes same errors repeatedly      • Forgets stated preferences         │
+│   • Doesn't learn from failures       • Re-asks clarifying questions       │
+│   • Falls into known pitfalls         • Ignores implicit preferences       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Technique Summary
+
+| Technique | Problem Solved | Token Savings | Complexity |
+|-----------|---------------|---------------|------------|
+| **Scratchpad Memory** | Context loss within session | ~15% | Low |
+| **Style Inference** | Style drift, inconsistency | ~10% | Medium |
+| **Component Registry** | Duplicate components | ~20% | Medium |
+| **Mistake Memory** | Repeated errors | ~15% | Medium |
+| **Diff Preview** | Wrong edits | ~5% | Low |
+| **User Preferences** | Re-asking, wrong choices | ~10% | Medium |
+| **File Snapshot Cache** | Re-reading files | ~10% | Low |
+| **Dependency Awareness** | Duplicate deps | ~5% | Low |
+| **Task Continuity** | Context rebuild on resume | ~20% | Medium |
+| **Design Token Awareness** | UI inconsistency | ~5% | Low |
+
+---
+
+### 1. Scratchpad Memory (Working Memory)
+
+Within-session memory that persists across tool calls. Agents write notes to themselves.
+
+```go
+// Scratchpad provides within-session working memory for agents
+type Scratchpad struct {
+    mu      sync.RWMutex
+    notes   map[string]ScratchpadNote
+    session string
+}
+
+type ScratchpadNote struct {
+    Key       string    `json:"key"`
+    Content   string    `json:"content"`
+    CreatedAt time.Time `json:"created_at"`
+    UpdatedAt time.Time `json:"updated_at"`
+    TTL       time.Duration `json:"ttl,omitempty"`
+}
+
+// Skills for scratchpad access
+var ScratchpadWriteSkill = skills.NewSkill("scratchpad_write").
+    Description("Write a note to yourself for later reference in this session. Use for tracking progress, decisions, things tried, or user preferences.").
+    Domain("memory").
+    Keywords("remember", "note", "track", "save").
+    Priority(100).
+    StringParam("key", "Short key for this note (e.g., 'current_task', 'user_preference', 'tried_failed')", true).
+    StringParam("note", "The note content", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Key  string `json:"key"`
+            Note string `json:"note"`
+        }
+        json.Unmarshal(input, &params)
+
+        session := getSession(ctx)
+        session.Scratchpad.Set(params.Key, params.Note)
+
+        return map[string]any{
+            "stored": true,
+            "key":    params.Key,
+        }, nil
+    }).
+    Build()
+
+var ScratchpadReadSkill = skills.NewSkill("scratchpad_read").
+    Description("Read a note you wrote earlier in this session.").
+    Domain("memory").
+    StringParam("key", "Key to read (or 'all' for all notes)", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Key string `json:"key"`
+        }
+        json.Unmarshal(input, &params)
+
+        session := getSession(ctx)
+
+        if params.Key == "all" {
+            return session.Scratchpad.GetAll(), nil
+        }
+
+        note, exists := session.Scratchpad.Get(params.Key)
+        if !exists {
+            return map[string]any{"exists": false}, nil
+        }
+
+        return map[string]any{
+            "exists":  true,
+            "content": note.Content,
+        }, nil
+    }).
+    Build()
+```
+
+**Use cases:**
+```
+Agent: scratchpad_write("current_approach", "Using JWT with refresh tokens, user confirmed")
+Agent: scratchpad_write("tried_failed", "Redis caching failed - version mismatch with existing redis 5.x")
+Agent: scratchpad_write("user_prefers", "Functional components, minimal comments, early returns")
+Agent: scratchpad_write("files_modified", "auth/handler.go, auth/middleware.go, auth/types.go")
+
+Later in session...
+Agent: scratchpad_read("current_approach")
+  → "Using JWT with refresh tokens, user confirmed"
+Agent: scratchpad_read("tried_failed")
+  → "Redis caching failed - version mismatch with existing redis 5.x"
+```
+
+**Token savings**: Avoids re-asking user, avoids re-gathering context, tracks what was tried.
+
+---
+
+### 2. Code Style Inference
+
+Automatically analyze and enforce codebase style without agent effort.
+
+```go
+// StyleInference analyzes codebase to infer coding conventions
+type StyleInference struct {
+    mu sync.RWMutex
+
+    // Inferred styles by language
+    styles map[string]*LanguageStyle
+
+    // Last analysis time
+    analyzedAt time.Time
+}
+
+type LanguageStyle struct {
+    Language string `json:"language"`
+
+    // Naming conventions
+    Naming NamingStyle `json:"naming"`
+
+    // Formatting
+    Formatting FormattingStyle `json:"formatting"`
+
+    // Patterns
+    Patterns PatternStyle `json:"patterns"`
+
+    // Examples from codebase
+    Examples []StyleExample `json:"examples,omitempty"`
+}
+
+type NamingStyle struct {
+    Functions   string `json:"functions"`    // camelCase, snake_case, PascalCase
+    Variables   string `json:"variables"`
+    Constants   string `json:"constants"`
+    Types       string `json:"types"`
+    Files       string `json:"files"`        // kebab-case, snake_case, camelCase
+    Components  string `json:"components"`   // For React/Vue
+}
+
+type FormattingStyle struct {
+    IndentStyle string `json:"indent_style"` // tabs, spaces
+    IndentSize  int    `json:"indent_size"`
+    QuoteStyle  string `json:"quote_style"`  // single, double
+    Semicolons  bool   `json:"semicolons"`
+    TrailingComma string `json:"trailing_comma"` // all, es5, none
+}
+
+type PatternStyle struct {
+    ErrorHandling  string `json:"error_handling"`  // try-catch, Result, early-return
+    AsyncStyle     string `json:"async_style"`     // async-await, promises, callbacks
+    ComponentStyle string `json:"component_style"` // functional, class
+    ExportStyle    string `json:"export_style"`    // named, default, mixed
+    ImportOrder    []string `json:"import_order"`  // ["builtin", "external", "internal", "relative"]
+}
+
+// Skill to get style guide
+var GetStyleGuideSkill = skills.NewSkill("get_style_guide").
+    Description("Get the inferred code style guide for this project. Use BEFORE writing code to match existing patterns.").
+    Domain("code").
+    Keywords("style", "convention", "format", "naming").
+    Priority(90).
+    StringParam("language", "Language to get style for (or 'all')", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Language string `json:"language"`
+        }
+        json.Unmarshal(input, &params)
+
+        if params.Language == "" || params.Language == "all" {
+            return styleInference.GetAll(), nil
+        }
+
+        return styleInference.Get(params.Language), nil
+    }).
+    Build()
+```
+
+**Example response:**
+```json
+{
+  "language": "typescript",
+  "naming": {
+    "functions": "camelCase",
+    "variables": "camelCase",
+    "constants": "UPPER_SNAKE_CASE",
+    "types": "PascalCase",
+    "files": "kebab-case",
+    "components": "PascalCase"
+  },
+  "formatting": {
+    "indent_style": "spaces",
+    "indent_size": 2,
+    "quote_style": "single",
+    "semicolons": false,
+    "trailing_comma": "es5"
+  },
+  "patterns": {
+    "error_handling": "try-catch with custom errors",
+    "async_style": "async-await",
+    "component_style": "functional with hooks",
+    "export_style": "named exports",
+    "import_order": ["react", "external", "internal", "relative", "styles"]
+  },
+  "examples": [
+    {"pattern": "error_handling", "file": "src/utils/api.ts", "line": 45}
+  ]
+}
+```
+
+**Token savings**: Agent doesn't guess style, produces consistent code first time.
+
+---
+
+### 3. Component/Pattern Registry
+
+Know what reusable components and patterns exist before writing new ones.
+
+```go
+// ComponentRegistry indexes reusable code artifacts
+type ComponentRegistry struct {
+    mu sync.RWMutex
+
+    // Indexed components by type
+    uiComponents []UIComponent
+    hooks        []Hook
+    utilities    []Utility
+    patterns     []Pattern
+
+    // Search index
+    searchIndex *SearchIndex
+}
+
+type UIComponent struct {
+    Name        string            `json:"name"`
+    Path        string            `json:"path"`
+    Description string            `json:"description"`
+    Props       []PropDefinition  `json:"props"`
+    UsageExample string           `json:"usage_example"`
+    Tags        []string          `json:"tags"`
+    Variants    []string          `json:"variants,omitempty"`
+}
+
+type Hook struct {
+    Name        string   `json:"name"`
+    Path        string   `json:"path"`
+    Description string   `json:"description"`
+    Parameters  []Param  `json:"parameters"`
+    Returns     string   `json:"returns"`
+    UsageExample string  `json:"usage_example"`
+}
+
+type Utility struct {
+    Name        string   `json:"name"`
+    Path        string   `json:"path"`
+    Description string   `json:"description"`
+    Signature   string   `json:"signature"`
+    UsageExample string  `json:"usage_example"`
+}
+
+// Skill to search for existing components
+var FindComponentSkill = skills.NewSkill("find_component").
+    Description("Search for existing reusable components, hooks, or utilities BEFORE writing new ones. Prevents duplication.").
+    Domain("code").
+    Keywords("component", "hook", "utility", "reuse", "existing").
+    Priority(95).
+    StringParam("need", "What you need (e.g., 'modal dialog', 'date formatting', 'auth hook')", true).
+    EnumParam("type", "Type to search for", []string{"ui", "hook", "utility", "pattern", "any"}, false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Need string `json:"need"`
+            Type string `json:"type"`
+        }
+        json.Unmarshal(input, &params)
+
+        if params.Type == "" {
+            params.Type = "any"
+        }
+
+        matches := componentRegistry.Search(params.Need, params.Type)
+
+        if len(matches) == 0 {
+            return map[string]any{
+                "found": false,
+                "suggestion": "No existing component found. You may need to create one.",
+            }, nil
+        }
+
+        return map[string]any{
+            "found":   true,
+            "matches": formatComponentMatches(matches),
+        }, nil
+    }).
+    Build()
+```
+
+**Example usage:**
+```
+Agent: find_component("confirmation dialog", type="ui")
+Response: {
+  "found": true,
+  "matches": [
+    {
+      "name": "ConfirmModal",
+      "path": "src/components/modals/ConfirmModal.tsx",
+      "description": "Reusable confirmation dialog with customizable actions",
+      "props": [
+        {"name": "title", "type": "string", "required": true},
+        {"name": "message", "type": "string", "required": true},
+        {"name": "onConfirm", "type": "() => void", "required": true},
+        {"name": "onCancel", "type": "() => void", "required": false},
+        {"name": "confirmText", "type": "string", "default": "Confirm"},
+        {"name": "variant", "type": "'danger' | 'warning' | 'info'", "default": "warning"}
+      ],
+      "usage_example": "<ConfirmModal\n  title=\"Delete Item?\"\n  message=\"This cannot be undone.\"\n  onConfirm={handleDelete}\n  variant=\"danger\"\n/>"
+    }
+  ]
+}
+```
+
+Agent uses existing `ConfirmModal` instead of creating a duplicate.
+
+**Token savings**: Avoids writing duplicate components, ensures UI consistency.
+
+---
+
+### 4. Mistake Memory (Anti-Pattern Database)
+
+Learn from failures and share knowledge across sessions.
+
+```go
+// MistakeMemory stores known anti-patterns and failures
+type MistakeMemory struct {
+    mu sync.RWMutex
+
+    mistakes []Mistake
+    index    *SearchIndex
+
+    // Persistence
+    storage Storage
+}
+
+type Mistake struct {
+    ID          string    `json:"id"`
+    Pattern     string    `json:"pattern"`      // What was tried
+    Error       string    `json:"error"`        // What went wrong
+    Fix         string    `json:"fix"`          // How to fix/avoid
+    Context     string    `json:"context"`      // When this applies
+    Tags        []string  `json:"tags"`
+    Confidence  float64   `json:"confidence"`   // How reliable (0-1)
+    Occurrences int       `json:"occurrences"`  // Times encountered
+    CreatedAt   time.Time `json:"created_at"`
+    LastSeenAt  time.Time `json:"last_seen_at"`
+}
+
+// Skill to check for known mistakes
+var CheckMistakesSkill = skills.NewSkill("check_mistakes").
+    Description("Check if an approach has known issues BEFORE trying it. Learns from past failures across all sessions.").
+    Domain("memory").
+    Keywords("mistake", "issue", "problem", "avoid", "pitfall").
+    Priority(95).
+    StringParam("approach", "What you're planning to do", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Approach string `json:"approach"`
+        }
+        json.Unmarshal(input, &params)
+
+        matches := mistakeMemory.Search(params.Approach)
+
+        if len(matches) == 0 {
+            return map[string]any{
+                "known_issues": false,
+                "safe_to_proceed": true,
+            }, nil
+        }
+
+        return map[string]any{
+            "known_issues": true,
+            "warnings": formatMistakeWarnings(matches),
+        }, nil
+    }).
+    Build()
+
+// Skill to report a new mistake
+var ReportMistakeSkill = skills.NewSkill("report_mistake").
+    Description("Report a mistake or anti-pattern you discovered. Helps future sessions avoid it.").
+    Domain("memory").
+    Keywords("report", "learned", "discovered", "anti-pattern").
+    Priority(80).
+    StringParam("pattern", "What was tried", true).
+    StringParam("error", "What went wrong", true).
+    StringParam("fix", "How to fix or avoid this", true).
+    StringParam("context", "When this applies (optional)", false).
+    ArrayParam("tags", "Tags for categorization", "string", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Pattern string   `json:"pattern"`
+            Error   string   `json:"error"`
+            Fix     string   `json:"fix"`
+            Context string   `json:"context"`
+            Tags    []string `json:"tags"`
+        }
+        json.Unmarshal(input, &params)
+
+        mistake := &Mistake{
+            ID:          generateID("mistake"),
+            Pattern:     params.Pattern,
+            Error:       params.Error,
+            Fix:         params.Fix,
+            Context:     params.Context,
+            Tags:        params.Tags,
+            Confidence:  0.7, // Initial confidence
+            Occurrences: 1,
+            CreatedAt:   time.Now(),
+            LastSeenAt:  time.Now(),
+        }
+
+        mistakeMemory.Add(mistake)
+
+        return map[string]any{
+            "recorded": true,
+            "id":       mistake.ID,
+        }, nil
+    }).
+    Build()
+```
+
+**Example - checking before trying:**
+```
+Agent: check_mistakes("using localStorage for auth tokens")
+Response: {
+  "known_issues": true,
+  "warnings": [
+    {
+      "pattern": "storing auth tokens in localStorage",
+      "error": "XSS vulnerability - tokens accessible via JavaScript injection",
+      "fix": "Use httpOnly cookies for sensitive tokens, or sessionStorage for less sensitive data",
+      "context": "Web applications with authentication",
+      "confidence": 0.95,
+      "occurrences": 12
+    }
+  ]
+}
+Agent: "I'll use httpOnly cookies instead"
+```
+
+**Example - reporting a new mistake:**
+```
+Agent: report_mistake(
+  pattern="using moment.js for new projects",
+  error="moment.js is deprecated and has large bundle size",
+  fix="Use date-fns or dayjs instead - smaller, tree-shakeable",
+  context="JavaScript/TypeScript date handling",
+  tags=["javascript", "dependencies", "performance"]
+)
+```
+
+**Token savings**: Avoids making known mistakes, avoids debugging sessions.
+
+---
+
+### 5. Diff Preview
+
+Show what will change before making changes. Catches errors early.
+
+```go
+// DiffPreview shows changes before applying them
+type DiffPreview struct {
+    Diff          string   `json:"diff"`
+    LinesAdded    int      `json:"lines_added"`
+    LinesRemoved  int      `json:"lines_removed"`
+    FilesAffected int      `json:"files_affected"`
+    Warnings      []string `json:"warnings,omitempty"`
+    Reversible    bool     `json:"reversible"`
+}
+
+var PreviewEditSkill = skills.NewSkill("preview_edit").
+    Description("Preview what an edit will look like BEFORE applying it. Shows diff and potential issues.").
+    Domain("code").
+    Keywords("preview", "diff", "check", "before").
+    Priority(85).
+    StringParam("file_path", "File to edit", true).
+    StringParam("old_string", "Text to replace", true).
+    StringParam("new_string", "Replacement text", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            FilePath  string `json:"file_path"`
+            OldString string `json:"old_string"`
+            NewString string `json:"new_string"`
+        }
+        json.Unmarshal(input, &params)
+
+        // Read current file
+        content, err := readFile(params.FilePath)
+        if err != nil {
+            return nil, err
+        }
+
+        // Check if old_string exists
+        if !strings.Contains(content, params.OldString) {
+            return map[string]any{
+                "error": "old_string not found in file",
+                "suggestion": "Check for whitespace differences or use a larger context",
+            }, nil
+        }
+
+        // Check for multiple matches
+        matchCount := strings.Count(content, params.OldString)
+
+        // Generate preview
+        newContent := strings.Replace(content, params.OldString, params.NewString, 1)
+        diff := generateUnifiedDiff(params.FilePath, content, newContent)
+
+        preview := DiffPreview{
+            Diff:          diff,
+            LinesAdded:    countLines(params.NewString),
+            LinesRemoved:  countLines(params.OldString),
+            FilesAffected: 1,
+            Reversible:    true,
+        }
+
+        if matchCount > 1 {
+            preview.Warnings = append(preview.Warnings,
+                fmt.Sprintf("old_string matches %d times - only first will be replaced", matchCount))
+        }
+
+        return preview, nil
+    }).
+    Build()
+```
+
+**Example:**
+```
+Agent: preview_edit(
+  file_path="src/auth/handler.ts",
+  old_string="const token = localStorage.getItem('token')",
+  new_string="const token = await getSecureToken()"
+)
+Response: {
+  "diff": "--- src/auth/handler.ts\n+++ src/auth/handler.ts\n@@ -45,7 +45,7 @@\n-  const token = localStorage.getItem('token')\n+  const token = await getSecureToken()",
+  "lines_added": 1,
+  "lines_removed": 1,
+  "files_affected": 1,
+  "warnings": [],
+  "reversible": true
+}
+```
+
+**Token savings**: Catches errors before they happen, avoids fix-up cycles.
+
+---
+
+### 6. User Preference Learning
+
+Automatically learn and apply user preferences.
+
+```go
+// UserPreferences tracks explicit and inferred preferences
+type UserPreferences struct {
+    mu sync.RWMutex
+
+    // Explicitly stated by user
+    Explicit map[string]string `json:"explicit"`
+
+    // Inferred from behavior
+    Implicit map[string]InferredPreference `json:"implicit"`
+
+    // Session overrides (temporary)
+    SessionOverrides map[string]string `json:"session_overrides,omitempty"`
+}
+
+type InferredPreference struct {
+    Value       string   `json:"value"`
+    Confidence  float64  `json:"confidence"`  // 0-1
+    Evidence    []string `json:"evidence"`    // Why we think this
+    ObservedAt  time.Time `json:"observed_at"`
+}
+
+// Learn from user feedback
+func (p *UserPreferences) LearnFromFeedback(category, suggestion, response string) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    existing, exists := p.Implicit[category]
+
+    if response == "accepted" {
+        if exists && existing.Value == suggestion {
+            // Reinforce
+            existing.Confidence = min(existing.Confidence + 0.1, 1.0)
+            existing.Evidence = append(existing.Evidence, "accepted: "+suggestion)
+        } else {
+            // New preference
+            p.Implicit[category] = InferredPreference{
+                Value:      suggestion,
+                Confidence: 0.6,
+                Evidence:   []string{"accepted: " + suggestion},
+                ObservedAt: time.Now(),
+            }
+        }
+    } else if response == "rejected" {
+        if exists && existing.Value == suggestion {
+            // Diminish confidence
+            existing.Confidence = max(existing.Confidence - 0.2, 0)
+        }
+    }
+}
+
+// Skill to get preferences
+var GetPreferencesSkill = skills.NewSkill("get_preferences").
+    Description("Get known user preferences to inform your approach. Includes explicit and inferred preferences.").
+    Domain("memory").
+    Keywords("preference", "like", "prefer", "style").
+    Priority(90).
+    StringParam("category", "Category: code_style, ui, workflow, tools, all", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Category string `json:"category"`
+        }
+        json.Unmarshal(input, &params)
+
+        if params.Category == "" || params.Category == "all" {
+            return userPreferences.GetAll(), nil
+        }
+
+        return userPreferences.GetCategory(params.Category), nil
+    }).
+    Build()
+
+// Skill to set explicit preference
+var SetPreferenceSkill = skills.NewSkill("set_preference").
+    Description("Record an explicit user preference.").
+    Domain("memory").
+    StringParam("category", "Preference category", true).
+    StringParam("preference", "The preference value", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Category   string `json:"category"`
+            Preference string `json:"preference"`
+        }
+        json.Unmarshal(input, &params)
+
+        userPreferences.SetExplicit(params.Category, params.Preference)
+
+        return map[string]any{"stored": true}, nil
+    }).
+    Build()
+```
+
+**Example response:**
+```json
+{
+  "explicit": {
+    "framework": "React with TypeScript",
+    "styling": "Tailwind CSS",
+    "testing": "Prefer integration tests over unit tests",
+    "comments": "Only for complex logic"
+  },
+  "implicit": {
+    "error_handling": {
+      "value": "early return pattern",
+      "confidence": 0.85,
+      "evidence": ["accepted in auth.ts", "accepted in api.ts", "used in user code"]
+    },
+    "component_size": {
+      "value": "small, single responsibility",
+      "confidence": 0.78,
+      "evidence": ["broke up large component when suggested", "approved split"]
+    },
+    "variable_naming": {
+      "value": "descriptive, avoid abbreviations",
+      "confidence": 0.72,
+      "evidence": ["renamed 'usr' to 'user'", "renamed 'btn' to 'button'"]
+    }
+  }
+}
+```
+
+**Token savings**: Avoids re-asking user, makes choices that match expectations.
+
+---
+
+### 7. File Snapshot Cache
+
+Avoid re-reading files that haven't changed within a session.
+
+```go
+// FileSnapshotCache caches file contents within a session
+type FileSnapshotCache struct {
+    mu        sync.RWMutex
+    snapshots map[string]*FileSnapshot
+    watcher   *fsnotify.Watcher
+    maxAge    time.Duration
+}
+
+type FileSnapshot struct {
+    Path       string    `json:"path"`
+    Content    string    `json:"-"`  // Not serialized
+    Hash       string    `json:"hash"`
+    Size       int64     `json:"size"`
+    ModTime    time.Time `json:"mod_time"`
+    ReadAt     time.Time `json:"read_at"`
+    TokenCount int       `json:"token_count"`
+    HitCount   int       `json:"hit_count"`
+}
+
+// GetOrRead returns cached content or reads fresh
+func (c *FileSnapshotCache) GetOrRead(ctx context.Context, path string) (*FileSnapshot, bool, error) {
+    c.mu.RLock()
+    snapshot, exists := c.snapshots[path]
+    c.mu.RUnlock()
+
+    if exists {
+        // Check if file has changed
+        stat, err := os.Stat(path)
+        if err == nil && stat.ModTime().Equal(snapshot.ModTime) && stat.Size() == snapshot.Size {
+            // Cache hit
+            c.mu.Lock()
+            snapshot.HitCount++
+            c.mu.Unlock()
+            return snapshot, true, nil
+        }
+    }
+
+    // Cache miss - read file
+    content, err := os.ReadFile(path)
+    if err != nil {
+        return nil, false, err
+    }
+
+    stat, _ := os.Stat(path)
+
+    snapshot = &FileSnapshot{
+        Path:       path,
+        Content:    string(content),
+        Hash:       hashContent(content),
+        Size:       stat.Size(),
+        ModTime:    stat.ModTime(),
+        ReadAt:     time.Now(),
+        TokenCount: estimateTokens(string(content)),
+        HitCount:   0,
+    }
+
+    c.mu.Lock()
+    c.snapshots[path] = snapshot
+    c.mu.Unlock()
+
+    return snapshot, false, nil
+}
+
+// Integrated into Read skill handler
+func enhancedReadHandler(ctx context.Context, input json.RawMessage) (any, error) {
+    var params struct {
+        FilePath string `json:"file_path"`
+    }
+    json.Unmarshal(input, &params)
+
+    snapshot, cacheHit, err := fileCache.GetOrRead(ctx, params.FilePath)
+    if err != nil {
+        return nil, err
+    }
+
+    return FileReadResponse{
+        Content:   snapshot.Content,
+        CacheHit:  cacheHit,
+        TokenCount: snapshot.TokenCount,
+    }, nil
+}
+```
+
+**Token savings**: Avoids re-reading unchanged files (common in iterative work).
+
+---
+
+### 8. Dependency Awareness
+
+Know what's available before suggesting new dependencies.
+
+```go
+// DependencyRegistry tracks project dependencies and their capabilities
+type DependencyRegistry struct {
+    mu sync.RWMutex
+
+    // Parsed from package.json, go.mod, requirements.txt, etc.
+    dependencies map[string]*Dependency
+
+    // Capability index
+    capabilities map[string][]*Dependency  // capability -> deps that provide it
+}
+
+type Dependency struct {
+    Name         string            `json:"name"`
+    Version      string            `json:"version"`
+    Type         string            `json:"type"`  // runtime, dev, peer
+    Capabilities []string          `json:"capabilities"`
+    UsageExamples map[string]string `json:"usage_examples"`
+}
+
+// Skill to check for existing capabilities
+var CheckDependencySkill = skills.NewSkill("check_dependency").
+    Description("Check if a capability is already available via existing dependencies BEFORE suggesting a new one.").
+    Domain("code").
+    Keywords("dependency", "package", "library", "install").
+    Priority(90).
+    StringParam("need", "What capability you need (e.g., 'date formatting', 'HTTP client', 'form validation')", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Need string `json:"need"`
+        }
+        json.Unmarshal(input, &params)
+
+        existing := dependencyRegistry.FindCapability(params.Need)
+
+        if len(existing) > 0 {
+            return map[string]any{
+                "already_available": true,
+                "packages": formatDependencies(existing),
+            }, nil
+        }
+
+        // Suggest alternatives
+        suggestions := dependencyRegistry.SuggestPackages(params.Need)
+
+        return map[string]any{
+            "already_available": false,
+            "suggestions":       suggestions,
+        }, nil
+    }).
+    Build()
+```
+
+**Example:**
+```
+Agent: check_dependency("date formatting")
+Response: {
+  "already_available": true,
+  "packages": [
+    {
+      "name": "date-fns",
+      "version": "2.30.0",
+      "type": "runtime",
+      "capabilities": ["date formatting", "date parsing", "date manipulation"],
+      "usage_examples": {
+        "format": "import { format } from 'date-fns'\nformat(new Date(), 'yyyy-MM-dd')",
+        "parse": "import { parse } from 'date-fns'\nparse('2024-01-15', 'yyyy-MM-dd', new Date())"
+      }
+    }
+  ]
+}
+Agent: "I'll use the existing date-fns instead of adding moment.js"
+```
+
+**Token savings**: Avoids adding duplicate dependencies, knows how to use existing ones.
+
+---
+
+### 9. Task Continuity (Checkpoint/Resume)
+
+Resume interrupted work without re-gathering context.
+
+```go
+// TaskCheckpoint saves progress for later resumption
+type TaskCheckpoint struct {
+    ID          string          `json:"id"`
+    SessionID   string          `json:"session_id"`
+    Description string          `json:"description"`
+    Status      string          `json:"status"`  // in_progress, blocked, paused, completed
+
+    // Progress tracking
+    Progress    []string        `json:"progress"`     // Steps completed
+    NextSteps   []string        `json:"next_steps"`   // What's remaining
+
+    // Context preservation
+    Context     map[string]any  `json:"context"`      // Gathered context
+    FilesRead   []string        `json:"files_read"`   // Files already read
+    FilesModi   []string        `json:"files_modified"` // Files changed
+    Decisions   []Decision      `json:"decisions"`    // Decisions made
+
+    // Scratchpad at time of checkpoint
+    Scratchpad  map[string]string `json:"scratchpad"`
+
+    CreatedAt   time.Time       `json:"created_at"`
+    UpdatedAt   time.Time       `json:"updated_at"`
+}
+
+type Decision struct {
+    Question string `json:"question"`
+    Choice   string `json:"choice"`
+    Reason   string `json:"reason"`
+}
+
+// Skill to save checkpoint
+var SaveCheckpointSkill = skills.NewSkill("save_checkpoint").
+    Description("Save your current progress so you can resume later if interrupted. Include what you've done and what's next.").
+    Domain("memory").
+    Keywords("save", "checkpoint", "pause", "resume later").
+    Priority(85).
+    StringParam("summary", "Brief summary of what you've done so far", true).
+    ArrayParam("completed", "Steps you've completed", "string", true).
+    ArrayParam("next_steps", "Steps remaining", "string", true).
+    StringParam("status", "Status: in_progress, blocked, paused", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Summary   string   `json:"summary"`
+            Completed []string `json:"completed"`
+            NextSteps []string `json:"next_steps"`
+            Status    string   `json:"status"`
+        }
+        json.Unmarshal(input, &params)
+
+        session := getSession(ctx)
+
+        checkpoint := &TaskCheckpoint{
+            ID:          generateID("checkpoint"),
+            SessionID:   session.ID,
+            Description: params.Summary,
+            Status:      params.Status,
+            Progress:    params.Completed,
+            NextSteps:   params.NextSteps,
+            FilesRead:   session.FilesRead,
+            FilesModi:   session.FilesModified,
+            Scratchpad:  session.Scratchpad.GetAll(),
+            CreatedAt:   time.Now(),
+            UpdatedAt:   time.Now(),
+        }
+
+        checkpointStore.Save(checkpoint)
+
+        return map[string]any{
+            "saved": true,
+            "id":    checkpoint.ID,
+            "hint":  "Use resume_task with this ID to continue later",
+        }, nil
+    }).
+    Build()
+
+// Skill to resume from checkpoint
+var ResumeTaskSkill = skills.NewSkill("resume_task").
+    Description("Resume a previously saved task with full context restored.").
+    Domain("memory").
+    Keywords("resume", "continue", "pick up").
+    Priority(100).
+    StringParam("task_id", "Checkpoint ID to resume (or 'latest' for most recent)", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            TaskID string `json:"task_id"`
+        }
+        json.Unmarshal(input, &params)
+
+        var checkpoint *TaskCheckpoint
+        if params.TaskID == "latest" {
+            checkpoint = checkpointStore.GetLatest()
+        } else {
+            checkpoint = checkpointStore.Get(params.TaskID)
+        }
+
+        if checkpoint == nil {
+            return map[string]any{
+                "found": false,
+                "error": "No checkpoint found",
+            }, nil
+        }
+
+        // Restore scratchpad
+        session := getSession(ctx)
+        for k, v := range checkpoint.Scratchpad {
+            session.Scratchpad.Set(k, v)
+        }
+
+        return TaskResume{
+            ID:            checkpoint.ID,
+            Summary:       checkpoint.Description,
+            Completed:     checkpoint.Progress,
+            NextSteps:     checkpoint.NextSteps,
+            FilesRead:     checkpoint.FilesRead,
+            FilesModified: checkpoint.FilesModi,
+            Scratchpad:    checkpoint.Scratchpad,
+            Hint:          fmt.Sprintf("Continue with: %s", checkpoint.NextSteps[0]),
+        }, nil
+    }).
+    Build()
+```
+
+**Example - saving:**
+```
+Agent: save_checkpoint(
+  summary="Implementing JWT auth - middleware done, need handler",
+  completed=["Created auth types", "Implemented JWT middleware", "Added config"],
+  next_steps=["Implement login handler", "Implement refresh endpoint", "Add tests"],
+  status="paused"
+)
+Response: {"saved": true, "id": "checkpoint_abc123"}
+```
+
+**Example - resuming:**
+```
+Agent: resume_task("checkpoint_abc123")
+Response: {
+  "id": "checkpoint_abc123",
+  "summary": "Implementing JWT auth - middleware done, need handler",
+  "completed": ["Created auth types", "Implemented JWT middleware", "Added config"],
+  "next_steps": ["Implement login handler", "Implement refresh endpoint", "Add tests"],
+  "files_read": ["auth/types.go", "auth/middleware.go", "config/config.go"],
+  "files_modified": ["auth/types.go", "auth/middleware.go"],
+  "scratchpad": {
+    "user_prefers": "Early returns, minimal error wrapping",
+    "token_expiry": "15 minutes access, 7 days refresh - user confirmed"
+  },
+  "hint": "Continue with: Implement login handler"
+}
+```
+
+**Token savings**: Avoids re-gathering context after interruption.
+
+---
+
+### 10. Design Token Awareness
+
+For UI work, know the design system and use consistent values.
+
+```go
+// DesignSystem stores design tokens and patterns
+type DesignSystem struct {
+    mu sync.RWMutex
+
+    // Core tokens
+    Colors     map[string]string `json:"colors"`
+    Spacing    map[string]string `json:"spacing"`
+    Typography map[string]TypographyToken `json:"typography"`
+    Shadows    map[string]string `json:"shadows"`
+    Radii      map[string]string `json:"radii"`
+
+    // Component patterns
+    ComponentPatterns map[string]ComponentPattern `json:"component_patterns"`
+
+    // Source files
+    Sources    []string `json:"sources"`  // Where tokens are defined
+}
+
+type TypographyToken struct {
+    FontFamily string `json:"font_family"`
+    FontSize   string `json:"font_size"`
+    FontWeight string `json:"font_weight"`
+    LineHeight string `json:"line_height"`
+}
+
+type ComponentPattern struct {
+    Name        string   `json:"name"`
+    Description string   `json:"description"`
+    Tokens      []string `json:"tokens"`  // Design tokens used
+    Example     string   `json:"example"`
+}
+
+// Skill to get design tokens
+var GetDesignTokensSkill = skills.NewSkill("get_design_tokens").
+    Description("Get the project's design tokens. Use these values instead of hardcoding colors, spacing, etc.").
+    Domain("ui").
+    Keywords("design", "token", "color", "spacing", "theme").
+    Priority(90).
+    EnumParam("category", "Token category", []string{"colors", "spacing", "typography", "shadows", "radii", "all"}, false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Category string `json:"category"`
+        }
+        json.Unmarshal(input, &params)
+
+        if params.Category == "" || params.Category == "all" {
+            return designSystem.GetAll(), nil
+        }
+
+        return designSystem.GetCategory(params.Category), nil
+    }).
+    Build()
+
+// Skill to find token by value
+var FindDesignTokenSkill = skills.NewSkill("find_design_token").
+    Description("Find the design token name for a hardcoded value. Helps replace magic values with tokens.").
+    Domain("ui").
+    StringParam("value", "The value to find (e.g., '#3B82F6', '16px')", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Value string `json:"value"`
+        }
+        json.Unmarshal(input, &params)
+
+        matches := designSystem.FindByValue(params.Value)
+
+        if len(matches) == 0 {
+            return map[string]any{
+                "found": false,
+                "suggestion": "No matching token found. Consider adding one or using a similar existing token.",
+            }, nil
+        }
+
+        return map[string]any{
+            "found":   true,
+            "matches": matches,
+        }, nil
+    }).
+    Build()
+```
+
+**Example - getting tokens:**
+```
+Agent: get_design_tokens(category="colors")
+Response: {
+  "colors": {
+    "primary": "#3B82F6",
+    "primary-hover": "#2563EB",
+    "primary-light": "#DBEAFE",
+    "secondary": "#6B7280",
+    "error": "#EF4444",
+    "error-light": "#FEE2E2",
+    "success": "#10B981",
+    "warning": "#F59E0B",
+    "text": "#1F2937",
+    "text-muted": "#6B7280",
+    "background": "#FFFFFF",
+    "background-secondary": "#F9FAFB",
+    "border": "#E5E7EB"
+  }
+}
+```
+
+**Example - finding a token:**
+```
+Agent: find_design_token(value="#3B82F6")
+Response: {
+  "found": true,
+  "matches": [
+    {"category": "colors", "name": "primary", "value": "#3B82F6"}
+  ]
+}
+Agent: "I should use 'colors.primary' instead of hardcoding '#3B82F6'"
+```
+
+**Token savings**: Ensures UI consistency, avoids hardcoded values that break themes.
+
+---
+
+### Agent-to-Technique Mapping
+
+Each efficiency technique is applicable to specific agents based on their responsibilities:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              AGENT EFFICIENCY TECHNIQUE MATRIX                                           │
+├────────────────────────┬────────┬──────────┬──────────┬──────────┬────────┬──────────┬─────────────────┤
+│ Technique              │ Router │ Architect│ Engineer │ Inspector│ Tester │ Designer │ Knowledge RAGs  │
+├────────────────────────┼────────┼──────────┼──────────┼──────────┼────────┼──────────┼─────────────────┤
+│ Scratchpad Memory      │   -    │    ✓     │    ✓     │    ✓     │   ✓    │    ✓     │       -         │
+│ Style Inference        │   -    │    -     │    ✓     │    ✓     │   ✓    │    -     │       -         │
+│ Component Registry     │   -    │    -     │    ✓     │    -     │   -    │    ✓     │       -         │
+│ Mistake Memory         │   -    │    -     │    ✓     │    ✓     │   ✓    │    -     │  Archivalist*   │
+│ Diff Preview           │   -    │    -     │    ✓     │    -     │   -    │    ✓     │       -         │
+│ User Preferences       │   ✓    │    ✓     │    ✓     │    -     │   -    │    ✓     │       -         │
+│ File Snapshot Cache    │   -    │    -     │    ✓     │    ✓     │   ✓    │    -     │   Librarian*    │
+│ Dependency Awareness   │   -    │    -     │    ✓     │    ✓     │   ✓    │    -     │   Academic*     │
+│ Task Continuity        │   -    │    ✓     │    ✓     │    -     │   ✓    │    -     │       -         │
+│ Design Token Awareness │   -    │    -     │    ✓     │    ✓     │   -    │    ✓     │       -         │
+├────────────────────────┼────────┼──────────┼──────────┼──────────┼────────┼──────────┼─────────────────┤
+│ TOTAL TECHNIQUES       │   1    │    3     │   10     │    6     │   6    │    5     │      3*         │
+└────────────────────────┴────────┴──────────┴──────────┴──────────┴────────┴──────────┴─────────────────┘
+
+* Knowledge RAG agents (Librarian, Archivalist, Academic) serve as SOURCES for some techniques:
+  - Archivalist: SOURCE for Mistake Memory (provides historical error data)
+  - Librarian: SOURCE for File Snapshot Cache (indexes code files)
+  - Academic: SOURCE for Dependency Awareness (provides best practices)
+```
+
+#### Agent-Specific Rationale
+
+**Router (Guide)**
+- **User Preferences only** - Can route based on preferred workflow
+- No code writing, no memory needs, no task state
+
+**Architect**
+- **Scratchpad** - Track requirements, decisions, blockers during planning
+- **User Preferences** - Adapt verbosity, detail level to user style
+- **Task Continuity** - Multi-step planning can be interrupted
+
+**Engineer**
+- **All 10 techniques** - Primary code writer benefits from everything
+- Critical: Style Inference, Component Registry, Mistake Memory, Diff Preview
+
+**Inspector**
+- **Scratchpad** - Track issues found during review
+- **Style Inference** - Must know style to review against
+- **Mistake Memory** - Flag known anti-patterns
+- **File Snapshot** - Efficient reading during review
+- **Dependency Awareness** - Flag deprecated API usage
+- **Design Tokens** - Flag raw values instead of tokens
+
+**Tester**
+- **Scratchpad** - Track test cases to cover
+- **Style Inference** - Tests should match project style
+- **Mistake Memory** - Know common failure patterns
+- **File Snapshot** - Efficient test file reading
+- **Dependency Awareness** - Mock dependencies correctly
+- **Task Continuity** - Large test suites can be interrupted
+
+**Designer**
+- **Scratchpad** - Track design decisions, user feedback
+- **Component Registry** - Know existing components to reuse
+- **Diff Preview** - Preview UI changes
+- **User Preferences** - Design style preferences
+- **Design Tokens** - Primary user of design system
+
+**Knowledge RAGs (Librarian, Archivalist, Academic)**
+- Primarily serve as data SOURCES for other agents
+- Archivalist indexes and retrieves historical mistakes
+- Librarian provides cached file snapshots
+- Academic provides dependency best practices
+
+---
+
+### Token Savings Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    AGENT EFFICIENCY TECHNIQUES - SAVINGS                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Technique                    │ Primary Benefit           │ Token Savings │
+│   ════════════════════════════╪═══════════════════════════╪═══════════════│
+│   Scratchpad Memory           │ Context preservation      │     ~15%     │
+│   Style Inference             │ Consistent code style     │     ~10%     │
+│   Component Registry          │ No duplicate components   │     ~20%     │
+│   Mistake Memory              │ Avoid known pitfalls      │     ~15%     │
+│   Diff Preview                │ Catch errors early        │      ~5%     │
+│   User Preferences            │ Match expectations        │     ~10%     │
+│   File Snapshot Cache         │ Avoid re-reading          │     ~10%     │
+│   Dependency Awareness        │ Use existing packages     │      ~5%     │
+│   Task Continuity             │ Resume without re-context │     ~20%     │
+│   Design Token Awareness      │ Consistent UI             │      ~5%     │
+│   ──────────────────────────────────────────────────────────────────────── │
+│                                                                             │
+│   Note: Savings are not additive - they apply to different scenarios.     │
+│   Estimated combined impact: 15-25% additional savings on top of          │
+│   VectorGraphDB + XOR optimizations.                                       │
+│                                                                             │
+│   TOTAL ESTIMATED SAVINGS:                                                  │
+│   • Baseline:                     0% savings                               │
+│   • + Intent Cache:              67% savings                               │
+│   • + VectorGraphDB:             75% savings                               │
+│   • + XOR Internal:              80% savings                               │
+│   • + Agent Efficiency:          85-88% savings                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Implementation Guide
 
 ### Session Management
@@ -9405,6 +11180,7 @@ func (agent *KnowledgeAgent) progressiveRetrieve(ctx context.Context, query stri
 - `agents/architect/`: Planning and coordination
 - `agents/orchestrator/`: DAG execution (session-aware)
 - `agents/engineer/`: Task execution (session-scoped)
+- `agents/designer/`: UI/UX implementation (components, styling, accessibility, design systems)
 - `agents/librarian/`: Local codebase RAG
 - `agents/archivalist/`: Historical RAG (session-aware storage, cross-session queries)
 - `agents/inspector/`: Code validation

@@ -6764,6 +6764,183 @@ Creates comprehensive integration tests for the full VectorGraphDB system.
 
 ---
 
+### 6.19 XOR Filter Internal Optimization
+
+Implements XOR filters as **internal optimizations** within search skills, NOT as separate LLM tools. This is critical for actual token savings.
+
+**IMPORTANT**: XOR filters are NOT exposed to LLMs. They are used internally by search skills to return "no_matches" quickly when content doesn't exist.
+
+**Files to create:**
+- `core/vectorgraphdb/xorfilter.go`
+- `core/vectorgraphdb/xorfilter_manager.go`
+- `core/vectorgraphdb/xorfilter_test.go`
+
+**Acceptance Criteria:**
+
+#### XOR Filter Manager
+- [ ] `XORFilterManager` struct with filters per domain (code, history, academic)
+- [ ] `Contains(domain, topicHash) bool` - checks XOR filter + pending
+- [ ] `NotifyAdd(domain, keys)` - adds to pending bloom filter after VDB write
+- [ ] `Rebuild(ctx) error` - rebuilds all filters from VectorGraphDB
+- [ ] Background goroutine rebuilds periodically (configurable interval)
+- [ ] Pending bloom filter for recent additions (zero staleness)
+- [ ] Thread-safe with RWMutex for filter access
+
+#### XOR Filter Data Structure
+- [ ] Use `github.com/FastFilter/xorfilter` or equivalent
+- [ ] Xor8 filters for ~0.3% false positive rate
+- [ ] Topic key hashing: consistent hash function for query terms
+- [ ] Filter size tracking and metrics
+
+#### Integration with Search Skills
+- [ ] `search_code` uses XOR internally for early exit
+- [ ] `search_history` uses XOR internally for early exit
+- [ ] `search_academic` uses XOR internally for early exit
+- [ ] `search_all` uses XOR per-domain for selective searching
+- [ ] Early exit returns `{"status": "no_matches", "hint": "..."}` (~30 tokens vs ~800)
+
+#### Multi-Domain Search Skill
+- [ ] `search_all` skill searches multiple domains in ONE call
+- [ ] Internal XOR check per domain before searching
+- [ ] Skips domains with no matches (minimal tokens)
+- [ ] Returns results grouped by domain
+- [ ] Reduces 3 tool calls to 1 (saves ~1,500 tokens/cross-domain query)
+
+```go
+// search_all response format
+type MultiDomainResponse struct {
+    Query   string                      `json:"query"`
+    Results map[string]DomainResult     `json:"results"`
+}
+
+type DomainResult struct {
+    Status  string         `json:"status"`  // "found" or "no_matches"
+    Results []SearchResult `json:"results,omitempty"`
+    Count   int            `json:"count"`
+}
+```
+
+#### Inline Domain Hints
+- [ ] Search results include `also_exists_in` field
+- [ ] XOR probes other domains after primary search (internal, fast)
+- [ ] Agent learns about related domains without extra tool calls
+- [ ] Suggestions field with actionable hints
+
+```go
+type SearchResponse struct {
+    Results      []SearchResult `json:"results"`
+    AlsoExistsIn []string       `json:"also_exists_in,omitempty"`
+    Suggestions  []string       `json:"suggestions,omitempty"`
+}
+```
+
+#### Smart Search with Budget Control
+- [ ] `smart_search` skill with token budget parameter
+- [ ] Internal progressive retrieval within budget
+- [ ] Thoroughness levels: quick, moderate, thorough
+- [ ] Returns `tokens_used` and `budget` in response
+- [ ] Agent doesn't manage retrieval depth - skill handles it
+
+#### Pending Set for Zero Staleness
+- [ ] Bloom filter for pending additions (fast, mutable)
+- [ ] Updated atomically with VectorGraphDB writes
+- [ ] Cleared during XOR rebuild
+- [ ] `Contains()` checks both XOR and pending
+
+```go
+func (m *XORFilterManager) Contains(domain string, key uint64) bool {
+    // Check immutable XOR filter (stable content)
+    if m.filters[domain].Contains(key) {
+        return true
+    }
+    // Check pending bloom filter (recent additions)
+    if m.pending[domain].Test(key) {
+        return true
+    }
+    return false
+}
+```
+
+#### Topic Key Extraction
+- [ ] Extract topic keys from node content during indexing
+- [ ] Consistent hashing for query terms
+- [ ] Handle multi-word topics (n-grams or word-level)
+- [ ] Normalize: lowercase, stemming optional
+
+**Tests:**
+- [ ] XOR filter contains returns correct results
+- [ ] Pending set catches recent additions
+- [ ] Rebuild correctly merges pending into XOR
+- [ ] Early exit returns minimal tokens
+- [ ] Multi-domain search reduces token usage
+- [ ] Inline hints probe other domains correctly
+- [ ] Budget control stays within limits
+- [ ] No false negatives (pending + XOR covers all)
+
+---
+
+### 6.20 Architect Planning Preflight
+
+Special planning-oriented preflight for Architect agent to scope work before detailed planning.
+
+**Files to create:**
+- `agents/architect/planning_preflight.go`
+- `agents/architect/planning_preflight_test.go`
+
+**Acceptance Criteria:**
+
+#### Planning Preflight Skill
+- [ ] `plan_preflight` skill for Architect only
+- [ ] Checks all 3 domains in one call
+- [ ] Returns existence flags per domain
+- [ ] Includes planning hints based on what exists
+- [ ] Uses XOR filters internally (fast)
+
+```go
+// plan_preflight response
+type PlanningPreflight struct {
+    Topic         string                  `json:"topic"`
+    Domains       map[string]DomainCheck  `json:"domains"`
+    PlanningHints []string                `json:"planning_hints"`
+}
+
+type DomainCheck struct {
+    Exists bool   `json:"exists"`
+    Hint   string `json:"hint"`
+}
+```
+
+#### Planning Hints Generation
+- [ ] "Greenfield work" when code domain is empty
+- [ ] "Historical context available" when history has matches
+- [ ] "Best practices exist" when academic has matches
+- [ ] "Suggested agent order" based on what exists
+
+**Example response:**
+```json
+{
+  "topic": "retry logic",
+  "domains": {
+    "code": {"exists": false, "hint": "No existing implementation"},
+    "history": {"exists": true, "hint": "Past solutions available"},
+    "academic": {"exists": true, "hint": "Best practices available"}
+  },
+  "planning_hints": [
+    "This is greenfield work (no existing code)",
+    "Historical context available - learn from past",
+    "Best practices exist - follow standards",
+    "Suggested: Archivalist → Academic → Engineer"
+  ]
+}
+```
+
+**Tests:**
+- [ ] Preflight returns correct domain flags
+- [ ] Planning hints are actionable
+- [ ] Fast response (<50ms)
+
+---
+
 ## Token Savings Targets
 
 ### CRITICAL: How VectorGraphDB Saves Tokens
@@ -6811,13 +6988,19 @@ Creates comprehensive integration tests for the full VectorGraphDB system.
 
 ### Agent Token Estimates (per 100 queries)
 
-| Agent | Baseline | Cache Only | +VectorGraphDB | Total Savings |
-|-------|----------|------------|----------------|---------------|
-| **Librarian** | 300,000 | 90,000 | 54,000 | **82%** |
-| **Archivalist** | 250,000 | 62,500 | 37,500 | **85%** |
-| **Academic** | 400,000 | 160,000 | 96,000 | **76%** |
-| **Cross-Domain** | N/A | N/A | 50,000 | New capability |
-| **TOTAL** | 950,000 | 312,500 | 237,500 | **75%** |
+| Agent | Baseline | Cache Only | +VectorGraphDB | +XOR Internal | Total Savings |
+|-------|----------|------------|----------------|---------------|---------------|
+| **Librarian** | 300,000 | 90,000 | 54,000 | 48,000 | **84%** |
+| **Archivalist** | 250,000 | 62,500 | 37,500 | 33,000 | **87%** |
+| **Academic** | 400,000 | 160,000 | 96,000 | 82,000 | **80%** |
+| **Cross-Domain** | N/A | N/A | 50,000 | 35,000 | **~65% vs non-XOR** |
+| **TOTAL** | 950,000 | 312,500 | 237,500 | 198,000 | **~80%** |
+
+**XOR Internal Optimization Savings:**
+- Empty search early exit: ~770 tokens saved per empty search
+- Multi-domain `search_all`: ~1,500 tokens saved per cross-domain query
+- Inline domain hints: ~100 tokens saved per query (avoids extra probe calls)
+- Architect planning preflight: ~750 tokens saved per planning decision
 
 ### Monthly Cost Targets
 
@@ -6825,9 +7008,10 @@ Creates comprehensive integration tests for the full VectorGraphDB system.
 |----------|-------------|-------------|
 | Baseline (no cache, no VDB) | $285/month | - |
 | Cache only | $94/month | 67% savings |
-| **Cache + VectorGraphDB** | **$72/month** | **75% savings** |
+| Cache + VectorGraphDB | $72/month | 75% savings |
+| **Cache + VectorGraphDB + XOR** | **$60/month** | **~80% savings** |
 
-**Overall Target**: 75% token reduction across all agents.
+**Overall Target**: 80% token reduction across all agents (with XOR optimization).
 
 ### Implementation Guidelines
 
@@ -6837,12 +7021,18 @@ Creates comprehensive integration tests for the full VectorGraphDB system.
 - Include only necessary metadata in results
 - Let the agent decide retrieval depth (progressive retrieval)
 - Cache skill results where appropriate
+- Use XOR filters INTERNALLY in search skills for early exit
+- Return "no_matches" quickly when XOR says content doesn't exist
+- Include `also_exists_in` hints in search responses
+- Use `search_all` for multi-domain queries (1 call vs 3)
 
 **DON'T:**
 - Assume VectorGraphDB calls are "free" (agent still runs)
 - Return raw file contents in skill results
 - Return all matching results (use limits)
 - Bypass the agent with "graph-only" resolution
+- Expose XOR filters as separate LLM tools (adds tool call overhead)
+- Make agents call existence checks before searches (baked into search internally)
 
 ---
 
@@ -6876,6 +7066,895 @@ Creates comprehensive integration tests for the full VectorGraphDB system.
 3. **Week 4-5**: 6.5-6.11 (All Mitigations) - can parallelize
 4. **Week 6**: 6.12 (Unified Resolver)
 5. **Week 7-8**: 6.13-6.16 (Agent Integrations) - can parallelize
-6. **Week 9**: 6.17-6.18 (Benchmarks, Integration Tests)
+6. **Week 9**: 6.19 (XOR Filter Optimization) - integrates with 6.13-6.16 search skills
+7. **Week 10**: 6.20 (Architect Planning Preflight)
+8. **Week 11-12**: 6.21-6.24 (Scratchpad, Style Inference, Component Registry, Mistake Memory) - can parallelize
+9. **Week 13-14**: 6.25-6.28 (Diff Preview, Preferences, File Snapshot, Dependency Awareness) - can parallelize
+10. **Week 15**: 6.29-6.30 (Task Continuity, Design Tokens)
+11. **Week 16**: 6.31 (Designer Agent Implementation)
+12. **Week 17-18**: 6.32-6.42 (Skill/Agent Integrations) - can parallelize
+13. **Week 19**: 6.17-6.18 (Benchmarks, Integration Tests) - validates all optimizations
 
 **Note**: Weeks are relative units of work, not calendar estimates.
+
+**XOR Filter Integration Points:**
+- 6.19 must be integrated with search skills from 6.13-6.16
+- All search skills gain internal XOR early exit
+- `search_all` multi-domain skill added
+- Inline domain hints added to responses
+
+**Agent Efficiency Integration Points:**
+- 6.31 (Designer) can be parallelized with 6.21-6.30
+- 6.33-6.42 depend on 6.21-6.30 (skills must exist before integration)
+- See section 6.32 for full agent-to-technique mapping
+
+---
+
+## Agent Efficiency Techniques
+
+### 6.21 Scratchpad Memory
+
+Within-session working memory for agents to track notes, reasoning, and temporary state.
+
+**Files to create:**
+- `agents/common/scratchpad.go`
+- `agents/common/scratchpad_test.go`
+- `skills/scratchpad_skill.go`
+
+**Acceptance Criteria:**
+
+#### Scratchpad Data Structure
+- [ ] `ScratchpadEntry` with key, value, category, timestamp, expiry
+- [ ] `Scratchpad` manager with `Set()`, `Get()`, `Delete()`, `GetByCategory()`, `All()`
+- [ ] Session-scoped (entries tied to session ID)
+- [ ] Auto-cleanup on session end
+- [ ] Thread-safe with RWMutex
+
+```go
+type ScratchpadEntry struct {
+    Key       string    `json:"key"`
+    Value     string    `json:"value"`
+    Category  string    `json:"category"`
+    CreatedAt time.Time `json:"created_at"`
+    ExpiresAt time.Time `json:"expires_at,omitempty"`
+}
+```
+
+#### Scratchpad Skills
+- [ ] `scratchpad_set` - Store a note (key, value, category optional)
+- [ ] `scratchpad_get` - Retrieve a note by key
+- [ ] `scratchpad_list` - List all notes (optional category filter)
+- [ ] `scratchpad_delete` - Remove a note by key
+
+#### Common Use Cases
+- [ ] "Requirements noted from user" category
+- [ ] "Partial work" category for intermediate results
+- [ ] "Decisions made" category for reasoning trail
+- [ ] "Blockers found" category for issues
+
+**Tests:**
+- [ ] Set and get works correctly
+- [ ] Category filtering works
+- [ ] Expiry removes old entries
+- [ ] Session isolation (can't access other session's notes)
+- [ ] Thread-safe under concurrent access
+
+---
+
+### 6.22 Code Style Inference
+
+Automatic detection of project code style from existing files.
+
+**Files to create:**
+- `agents/engineer/style_inference.go`
+- `agents/engineer/style_inference_test.go`
+- `skills/style_check_skill.go`
+
+**Acceptance Criteria:**
+
+#### Style Analysis
+- [ ] `InferredStyle` struct with naming, formatting, patterns
+- [ ] `StyleInferrer.Analyze()` reads sample files
+- [ ] Detect naming conventions (camelCase, snake_case, PascalCase)
+- [ ] Detect indentation (tabs vs spaces, indent width)
+- [ ] Detect quote style (single vs double)
+- [ ] Detect trailing comma preference
+- [ ] Detect import organization pattern
+
+```go
+type InferredStyle struct {
+    Language       string              `json:"language"`
+    NamingConvention struct {
+        Variables string `json:"variables"` // "camelCase", "snake_case"
+        Functions string `json:"functions"`
+        Types     string `json:"types"`
+        Constants string `json:"constants"` // "SCREAMING_SNAKE"
+    } `json:"naming_convention"`
+    Formatting struct {
+        IndentStyle string `json:"indent_style"` // "tabs", "spaces"
+        IndentSize  int    `json:"indent_size"`
+        QuoteStyle  string `json:"quote_style"` // "single", "double"
+        TrailingComma bool `json:"trailing_comma"`
+    } `json:"formatting"`
+    Patterns struct {
+        ErrorHandling string `json:"error_handling"` // "early_return", "nested"
+        Imports       string `json:"imports"`        // "grouped", "ungrouped"
+    } `json:"patterns"`
+}
+```
+
+#### Style Check Skill
+- [ ] `check_style` skill returns project style for language
+- [ ] Caches inferred styles per project/language
+- [ ] Updates when new files detected
+- [ ] Returns actionable guidance
+
+**Tests:**
+- [ ] Correctly detects camelCase vs snake_case
+- [ ] Correctly detects tabs vs spaces
+- [ ] Handles mixed styles (reports majority)
+- [ ] Cache invalidation on new files
+- [ ] Multi-language project support
+
+---
+
+### 6.23 Component/Pattern Registry
+
+Index of reusable UI components, hooks, utilities, and patterns in the project.
+
+**Files to create:**
+- `agents/engineer/component_registry.go`
+- `agents/engineer/component_registry_test.go`
+- `skills/find_component_skill.go`
+
+**Acceptance Criteria:**
+
+#### Registry Data Structure
+- [ ] `RegisteredComponent` with name, type, file path, exports, props/params
+- [ ] `ComponentRegistry` with `Register()`, `Find()`, `FindByType()`, `GetAll()`
+- [ ] Auto-scan project for components on startup
+- [ ] Watch for file changes and update registry
+
+```go
+type RegisteredComponent struct {
+    Name        string            `json:"name"`
+    Type        string            `json:"type"`  // "component", "hook", "utility", "pattern"
+    FilePath    string            `json:"file_path"`
+    Exports     []string          `json:"exports"`
+    Props       []ComponentProp   `json:"props,omitempty"`
+    Description string            `json:"description,omitempty"`
+    Examples    []string          `json:"examples,omitempty"`
+}
+
+type ComponentProp struct {
+    Name     string `json:"name"`
+    Type     string `json:"type"`
+    Required bool   `json:"required"`
+    Default  string `json:"default,omitempty"`
+}
+```
+
+#### Component Scanning
+- [ ] Scan React/Vue/Svelte component files
+- [ ] Extract exported names
+- [ ] Parse props/parameters
+- [ ] Detect custom hooks (use* pattern)
+- [ ] Detect utility functions
+
+#### Find Component Skill
+- [ ] `find_component` - Search by name or purpose
+- [ ] Returns existing components that match need
+- [ ] Includes usage examples from codebase
+- [ ] Warns before suggesting new component that exists
+
+**Tests:**
+- [ ] Correctly finds React components
+- [ ] Extracts props from TypeScript interfaces
+- [ ] Detects hooks correctly
+- [ ] Search by partial name works
+- [ ] Updates on file change
+
+---
+
+### 6.24 Mistake Memory
+
+Cross-session learning from errors and anti-patterns.
+
+**Files to create:**
+- `agents/common/mistake_memory.go`
+- `agents/common/mistake_memory_test.go`
+- `skills/recall_mistakes_skill.go`
+
+**Acceptance Criteria:**
+
+#### Mistake Data Structure
+- [ ] `RecordedMistake` with pattern, context, resolution, occurrences
+- [ ] `MistakeMemory` with `Record()`, `Recall()`, `RecallByCategory()`
+- [ ] Persistent storage (SQLite)
+- [ ] Relevance scoring (recent + frequent = higher priority)
+
+```go
+type RecordedMistake struct {
+    ID         string    `json:"id"`
+    Pattern    string    `json:"pattern"`     // What went wrong
+    Category   string    `json:"category"`    // "syntax", "logic", "import", "api_misuse"
+    Context    string    `json:"context"`     // Where/when it happened
+    Resolution string    `json:"resolution"`  // How to fix
+    Occurrences int      `json:"occurrences"`
+    FirstSeen  time.Time `json:"first_seen"`
+    LastSeen   time.Time `json:"last_seen"`
+    FilePaths  []string  `json:"file_paths"`  // Where it occurred
+}
+```
+
+#### Mistake Recording
+- [ ] Automatic recording from failed builds/tests
+- [ ] Manual recording via skill
+- [ ] Increment occurrences on repeat
+- [ ] Extract patterns from error messages
+
+#### Recall Skill
+- [ ] `recall_mistakes` - Get relevant past mistakes
+- [ ] Accepts optional category filter
+- [ ] Returns most relevant (recent + frequent) first
+- [ ] Used by Engineer before writing similar code
+
+**Tests:**
+- [ ] Records mistakes correctly
+- [ ] Increments occurrences on repeat
+- [ ] Persistence across restarts
+- [ ] Relevance scoring works
+- [ ] Category filtering works
+
+---
+
+### 6.25 Diff Preview
+
+Preview changes before applying them.
+
+**Files to create:**
+- `agents/engineer/diff_preview.go`
+- `agents/engineer/diff_preview_test.go`
+- `skills/diff_preview_skill.go`
+
+**Acceptance Criteria:**
+
+#### Diff Generation
+- [ ] `DiffPreview` with original, proposed, unified diff, stats
+- [ ] Generate unified diff format
+- [ ] Calculate stats (lines added, removed, changed)
+- [ ] Support multi-file diffs
+- [ ] Syntax highlighting hints
+
+```go
+type DiffPreview struct {
+    FilePath    string `json:"file_path"`
+    Original    string `json:"original,omitempty"`
+    Proposed    string `json:"proposed,omitempty"`
+    UnifiedDiff string `json:"unified_diff"`
+    Stats       DiffStats `json:"stats"`
+}
+
+type DiffStats struct {
+    LinesAdded   int `json:"lines_added"`
+    LinesRemoved int `json:"lines_removed"`
+    LinesChanged int `json:"lines_changed"`
+    Hunks        int `json:"hunks"`
+}
+```
+
+#### Preview Skill
+- [ ] `preview_diff` - Show what changes would be made
+- [ ] Accepts file path and proposed content
+- [ ] Returns unified diff and stats
+- [ ] Can preview multiple files at once
+
+#### Validation
+- [ ] Flag potentially dangerous changes (>100 lines removed)
+- [ ] Flag changes to sensitive files (.env, credentials)
+- [ ] Suggest review for large refactors
+
+**Tests:**
+- [ ] Unified diff format correct
+- [ ] Stats calculation accurate
+- [ ] Multi-file preview works
+- [ ] Sensitive file detection works
+- [ ] Large change warning triggers
+
+---
+
+### 6.26 User Preference Learning
+
+Learn and apply user preferences over time.
+
+**Files to create:**
+- `agents/common/preference_learning.go`
+- `agents/common/preference_learning_test.go`
+- `skills/preferences_skill.go`
+
+**Acceptance Criteria:**
+
+#### Preference Data Structure
+- [ ] `UserPreference` with domain, key, value, confidence, source
+- [ ] `PreferenceStore` with `Learn()`, `Get()`, `GetAll()`
+- [ ] Persistent storage (SQLite)
+- [ ] Confidence increases with repeated signals
+
+```go
+type UserPreference struct {
+    Domain     string    `json:"domain"`      // "code_style", "communication", "workflow"
+    Key        string    `json:"key"`         // "verbosity", "test_framework"
+    Value      string    `json:"value"`       // "concise", "jest"
+    Confidence float64   `json:"confidence"`  // 0.0-1.0
+    Source     string    `json:"source"`      // "explicit", "implicit", "inferred"
+    LearnedAt  time.Time `json:"learned_at"`
+    SeenCount  int       `json:"seen_count"`
+}
+```
+
+#### Learning Sources
+- [ ] Explicit: User says "I prefer X"
+- [ ] Implicit: User accepts/rejects suggestions
+- [ ] Inferred: Patterns from code edits
+
+#### Preference Application
+- [ ] `get_preferences` - Retrieve preferences for domain
+- [ ] `set_preference` - Explicitly set a preference
+- [ ] Preferences influence response generation
+- [ ] Confidence-weighted (high confidence = strong preference)
+
+**Tests:**
+- [ ] Explicit preferences stored correctly
+- [ ] Confidence increases on repeated signals
+- [ ] Implicit learning from accept/reject
+- [ ] Persistence across sessions
+- [ ] Domain filtering works
+
+---
+
+### 6.27 File Snapshot Cache
+
+Efficient caching of file states to avoid re-reading.
+
+**Files to create:**
+- `agents/common/file_snapshot.go`
+- `agents/common/file_snapshot_test.go`
+
+**Acceptance Criteria:**
+
+#### Snapshot Data Structure
+- [ ] `FileSnapshot` with path, content hash, last modified, content
+- [ ] `SnapshotCache` with `Get()`, `Invalidate()`, `InvalidateAll()`
+- [ ] Content-addressable (hash-based)
+- [ ] LRU eviction when over capacity
+
+```go
+type FileSnapshot struct {
+    Path         string    `json:"path"`
+    ContentHash  string    `json:"content_hash"`
+    LastModified time.Time `json:"last_modified"`
+    Content      []byte    `json:"-"`
+    LineCount    int       `json:"line_count"`
+    Size         int64     `json:"size"`
+}
+
+type SnapshotCache struct {
+    maxSize    int64
+    currentSize int64
+    snapshots  map[string]*FileSnapshot
+    lru        *list.List
+    mu         sync.RWMutex
+}
+```
+
+#### Cache Operations
+- [ ] Check modified time before returning cached
+- [ ] Automatic invalidation on file change detection
+- [ ] Pre-warm cache for frequently accessed files
+- [ ] Track access patterns for eviction
+
+#### Integration
+- [ ] File read operations use cache
+- [ ] Invalidate on write operations
+- [ ] Stats: hits, misses, evictions
+
+**Tests:**
+- [ ] Cache hit returns correct content
+- [ ] Modified file triggers re-read
+- [ ] LRU eviction works correctly
+- [ ] Write invalidates cache
+- [ ] Concurrent access safe
+
+---
+
+### 6.28 Dependency Awareness
+
+Track project dependencies and their APIs.
+
+**Files to create:**
+- `agents/engineer/dependency_awareness.go`
+- `agents/engineer/dependency_awareness_test.go`
+- `skills/check_dependency_skill.go`
+
+**Acceptance Criteria:**
+
+#### Dependency Tracking
+- [ ] `TrackedDependency` with name, version, import path, common APIs
+- [ ] `DependencyTracker` with `Scan()`, `Get()`, `GetAll()`
+- [ ] Parse package.json, go.mod, requirements.txt, etc.
+- [ ] Track which dependencies are actually used
+
+```go
+type TrackedDependency struct {
+    Name        string   `json:"name"`
+    Version     string   `json:"version"`
+    ImportPath  string   `json:"import_path"`
+    CommonAPIs  []string `json:"common_apis"`
+    UsedIn      []string `json:"used_in"`      // File paths
+    DevOnly     bool     `json:"dev_only"`
+    Deprecated  bool     `json:"deprecated,omitempty"`
+}
+```
+
+#### API Awareness
+- [ ] Index common APIs from frequently-used deps
+- [ ] Detect deprecated API usage
+- [ ] Suggest correct imports
+- [ ] Version compatibility warnings
+
+#### Check Dependency Skill
+- [ ] `check_dependency` - Get info about a dependency
+- [ ] Returns version, common APIs, usage examples
+- [ ] Warns about deprecated/insecure versions
+
+**Tests:**
+- [ ] Parses package.json correctly
+- [ ] Parses go.mod correctly
+- [ ] Tracks usage across files
+- [ ] Detects deprecated APIs
+- [ ] Version parsing correct
+
+---
+
+### 6.29 Task Continuity
+
+Checkpoint and resume interrupted tasks.
+
+**Files to create:**
+- `agents/common/task_continuity.go`
+- `agents/common/task_continuity_test.go`
+- `skills/checkpoint_skill.go`
+
+**Acceptance Criteria:**
+
+#### Checkpoint Data Structure
+- [ ] `TaskCheckpoint` with task ID, description, progress, state, files modified
+- [ ] `ContinuityManager` with `Checkpoint()`, `Resume()`, `List()`, `Clear()`
+- [ ] Persistent storage (JSON files or SQLite)
+- [ ] Auto-checkpoint on significant progress
+
+```go
+type TaskCheckpoint struct {
+    ID            string            `json:"id"`
+    TaskDescription string          `json:"task_description"`
+    Progress      TaskProgress      `json:"progress"`
+    State         map[string]any    `json:"state"`
+    FilesModified []string          `json:"files_modified"`
+    CreatedAt     time.Time         `json:"created_at"`
+    UpdatedAt     time.Time         `json:"updated_at"`
+}
+
+type TaskProgress struct {
+    TotalSteps     int      `json:"total_steps"`
+    CompletedSteps int      `json:"completed_steps"`
+    CurrentStep    string   `json:"current_step"`
+    NextSteps      []string `json:"next_steps"`
+    Blockers       []string `json:"blockers,omitempty"`
+}
+```
+
+#### Checkpoint Skills
+- [ ] `checkpoint_task` - Save current progress
+- [ ] `resume_task` - Resume from checkpoint
+- [ ] `list_checkpoints` - Show incomplete tasks
+- [ ] Auto-checkpoint on multi-step tasks
+
+#### Resume Logic
+- [ ] Restore state from checkpoint
+- [ ] Validate files haven't changed significantly
+- [ ] Generate handoff context for agent
+- [ ] Clear checkpoint on task completion
+
+**Tests:**
+- [ ] Checkpoint saves all state
+- [ ] Resume restores correctly
+- [ ] File change detection works
+- [ ] Persistence across restarts
+- [ ] Auto-checkpoint triggers correctly
+
+---
+
+### 6.30 Design Token Awareness
+
+Track and apply design system tokens.
+
+**Files to create:**
+- `agents/designer/design_tokens.go`
+- `agents/designer/design_tokens_test.go`
+- `skills/design_token_skill.go`
+
+**Acceptance Criteria:**
+
+#### Token Data Structure
+- [ ] `DesignToken` with category, name, value, usage context
+- [ ] `DesignTokenRegistry` with `Get()`, `GetByCategory()`, `Suggest()`
+- [ ] Parse from CSS variables, Tailwind config, theme files
+- [ ] Auto-scan project for design system
+
+```go
+type DesignToken struct {
+    Category string `json:"category"` // "color", "spacing", "typography", "shadow"
+    Name     string `json:"name"`     // "primary", "md", "heading-1"
+    Value    string `json:"value"`    // "#3b82f6", "16px", "24px"
+    Usage    string `json:"usage"`    // "Primary brand color for buttons and links"
+    CSSVar   string `json:"css_var,omitempty"`  // "--color-primary"
+    Tailwind string `json:"tailwind,omitempty"` // "text-primary"
+}
+```
+
+#### Token Discovery
+- [ ] Scan CSS custom properties (--var-name)
+- [ ] Parse Tailwind theme config
+- [ ] Parse design system JSON/JS exports
+- [ ] Map values to semantic names
+
+#### Design Token Skill
+- [ ] `get_design_token` - Get token by category/name
+- [ ] `suggest_token` - Find token for a use case
+- [ ] Returns value, CSS var, Tailwind class if available
+- [ ] Warns when using raw value instead of token
+
+**Tests:**
+- [ ] Parses CSS variables correctly
+- [ ] Parses Tailwind config correctly
+- [ ] Suggestion finds appropriate tokens
+- [ ] Multiple design system formats supported
+- [ ] Raw value warning triggers
+
+---
+
+## Agent Efficiency Token Savings
+
+### Additional Savings from Efficiency Techniques
+
+| Technique | Savings Per Use | Frequency | Monthly Impact |
+|-----------|-----------------|-----------|----------------|
+| **Scratchpad** | ~50 tokens (avoids re-explain) | ~20% of queries | ~2% |
+| **Style Inference** | ~100 tokens (no style questions) | ~15% of edits | ~1.5% |
+| **Component Registry** | ~200 tokens (avoids duplication) | ~10% of UI work | ~1% |
+| **Mistake Memory** | ~150 tokens (avoids repeat errors) | ~8% of builds | ~1% |
+| **Diff Preview** | ~100 tokens (confident changes) | ~25% of edits | ~1.5% |
+| **Preference Learning** | ~75 tokens (no clarification) | ~30% of queries | ~2% |
+| **File Snapshot** | ~50 tokens (no re-read) | ~40% of file ops | ~1.5% |
+| **Dependency Awareness** | ~100 tokens (correct imports) | ~15% of edits | ~1% |
+| **Task Continuity** | ~300 tokens (resume vs restart) | ~5% of sessions | ~0.5% |
+| **Design Tokens** | ~75 tokens (correct values) | ~20% of UI work | ~0.5% |
+| **TOTAL** | | | **~12.5%** |
+
+### Updated Cost Projections
+
+| Scenario | Monthly Cost | vs Baseline |
+|----------|-------------|-------------|
+| Baseline (no optimization) | $285/month | - |
+| Cache only | $94/month | 67% savings |
+| Cache + VectorGraphDB | $72/month | 75% savings |
+| Cache + VectorGraphDB + XOR | $60/month | ~80% savings |
+| **+ Agent Efficiency** | **$45/month** | **~85% savings** |
+
+**Target**: 85% token reduction with all optimizations enabled.
+
+---
+
+## Skill/Agent Integrations
+
+### 6.31 Designer Agent Implementation
+
+New agent for UI/UX implementation tasks.
+
+**Files to create:**
+- `agents/designer/designer.go`
+- `agents/designer/designer_test.go`
+- `agents/designer/skills.go`
+
+**Acceptance Criteria:**
+
+#### Core Designer Agent
+- [ ] Designer agent struct with standard agent interface
+- [ ] Session-scoped state for design context
+- [ ] Integration with Guide for routing
+- [ ] LLM model selection (Sonnet for speed)
+
+#### Designer Skills (Tier 1 - Core)
+- [ ] `create_component` - Create new UI component
+- [ ] `style_component` - Apply styling to component
+- [ ] `get_design_tokens` - Retrieve design system tokens
+- [ ] `find_component` - Find existing UI components
+- [ ] `preview_ui` - Preview UI changes in isolation
+- [ ] `check_accessibility` - Check a11y compliance
+
+#### Designer Skills (Tier 2 - Contextual)
+- [ ] `analyze_layout` - Suggest layout improvements
+- [ ] `suggest_animation` - Suggest appropriate animations
+- [ ] `audit_consistency` - Audit design consistency
+- [ ] `generate_variants` - Generate component variants
+- [ ] `consult_engineer` - Consult on implementation
+- [ ] `consult_academic` - Research UI/UX best practices
+
+#### Designer Skills (Tier 3 - Specialized)
+- [ ] `design_system_scaffold` - Scaffold complete design system
+- [ ] `theme_migration` - Migrate between themes
+- [ ] `responsive_audit` - Full responsive audit
+
+#### Guide Routing Integration
+- [ ] Route UI/UX intents to Designer
+- [ ] Keywords: "component", "ui", "style", "css", "tailwind", "design", "a11y"
+- [ ] Handoff patterns between Designer and Engineer
+
+**Tests:**
+- [ ] Designer agent responds to UI intents
+- [ ] All core skills work correctly
+- [ ] Guide routes to Designer appropriately
+- [ ] Designer/Engineer handoff works
+
+---
+
+### 6.32 Skill/Agent Integration Matrix
+
+Integrate efficiency techniques with appropriate agents per the mapping.
+
+**Reference Matrix:**
+
+| Technique              | Guide | Architect | Engineer | Inspector | Tester | Designer |
+|------------------------|-------|-----------|----------|-----------|--------|----------|
+| Scratchpad Memory      |   -   |     ✓     |    ✓     |     ✓     |   ✓    |    ✓     |
+| Style Inference        |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Component Registry     |   -   |     -     |    ✓     |     -     |   -    |    ✓     |
+| Mistake Memory         |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Diff Preview           |   -   |     -     |    ✓     |     -     |   -    |    ✓     |
+| User Preferences       |   ✓   |     ✓     |    ✓     |     -     |   -    |    ✓     |
+| File Snapshot Cache    |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Dependency Awareness   |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Task Continuity        |   -   |     ✓     |    ✓     |     -     |   ✓    |    -     |
+| Design Token Awareness |   -   |     -     |    ✓     |     ✓     |   -    |    ✓     |
+
+---
+
+### 6.33 Scratchpad Integration
+
+Integrate scratchpad skills with: **Architect, Engineer, Inspector, Tester, Designer**
+
+**Files to modify:**
+- `agents/architect/skills.go` - Add scratchpad skills
+- `agents/engineer/skills.go` - Add scratchpad skills
+- `agents/inspector/skills.go` - Add scratchpad skills
+- `agents/tester/skills.go` - Add scratchpad skills
+- `agents/designer/skills.go` - Add scratchpad skills
+
+**Acceptance Criteria:**
+- [ ] `scratchpad_write` skill available to Architect
+- [ ] `scratchpad_write` skill available to Engineer
+- [ ] `scratchpad_write` skill available to Inspector
+- [ ] `scratchpad_write` skill available to Tester
+- [ ] `scratchpad_write` skill available to Designer
+- [ ] `scratchpad_read` skill available to all above
+- [ ] Session-scoped isolation verified
+- [ ] Agent-specific suggested keys documented
+
+**Suggested Keys by Agent:**
+- **Architect**: `requirements`, `decisions`, `blockers`, `plan_state`
+- **Engineer**: `current_task`, `tried_failed`, `partial_work`
+- **Inspector**: `issues_found`, `review_notes`, `flagged_patterns`
+- **Tester**: `test_cases`, `coverage_gaps`, `flaky_tests`
+- **Designer**: `design_decisions`, `component_notes`, `accessibility_flags`
+
+---
+
+### 6.34 Style Inference Integration
+
+Integrate style inference with: **Engineer, Inspector, Tester**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add style check skill
+- `agents/inspector/skills.go` - Add style check skill
+- `agents/tester/skills.go` - Add style check skill
+
+**Acceptance Criteria:**
+- [ ] `check_style` skill available to Engineer
+- [ ] `check_style` skill available to Inspector
+- [ ] `check_style` skill available to Tester
+- [ ] Engineer uses style before writing code
+- [ ] Inspector compares against detected style
+- [ ] Tester matches test style to project style
+
+---
+
+### 6.35 Component Registry Integration
+
+Integrate component registry with: **Engineer, Designer**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add find_component skill
+- `agents/designer/skills.go` - Add find_component skill
+
+**Acceptance Criteria:**
+- [ ] `find_component` skill available to Engineer
+- [ ] `find_component` skill available to Designer
+- [ ] Auto-suggest existing components before creating new
+- [ ] Warn when creating duplicate component
+- [ ] Designer priority access (primary user)
+
+---
+
+### 6.36 Mistake Memory Integration
+
+Integrate mistake memory with: **Engineer, Inspector, Tester** (Archivalist as source)
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add recall_mistakes skill
+- `agents/inspector/skills.go` - Add recall_mistakes skill
+- `agents/tester/skills.go` - Add recall_mistakes skill
+- `agents/archivalist/skills.go` - Add mistake storage/retrieval
+
+**Acceptance Criteria:**
+- [ ] `recall_mistakes` skill available to Engineer
+- [ ] `recall_mistakes` skill available to Inspector
+- [ ] `recall_mistakes` skill available to Tester
+- [ ] Archivalist records mistakes from failed builds/tests
+- [ ] Engineer queries before similar work
+- [ ] Inspector flags known anti-patterns
+- [ ] Tester knows common failure patterns
+
+---
+
+### 6.37 Diff Preview Integration
+
+Integrate diff preview with: **Engineer, Designer**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add preview_diff skill
+- `agents/designer/skills.go` - Add preview_diff skill
+
+**Acceptance Criteria:**
+- [ ] `preview_diff` skill available to Engineer
+- [ ] `preview_diff` skill available to Designer
+- [ ] Preview before large changes (>50 lines)
+- [ ] Warn on sensitive file changes
+- [ ] Stats: lines added/removed/changed
+
+---
+
+### 6.38 User Preferences Integration
+
+Integrate user preferences with: **Guide, Architect, Engineer, Designer**
+
+**Files to modify:**
+- `agents/guide/skills.go` - Add preference skills
+- `agents/architect/skills.go` - Add preference skills
+- `agents/engineer/skills.go` - Add preference skills
+- `agents/designer/skills.go` - Add preference skills
+
+**Acceptance Criteria:**
+- [ ] `get_preferences` skill available to Guide
+- [ ] `get_preferences` skill available to Architect
+- [ ] `get_preferences` skill available to Engineer
+- [ ] `get_preferences` skill available to Designer
+- [ ] Guide routes based on workflow preferences
+- [ ] Architect adjusts verbosity per preference
+- [ ] Engineer follows code style preferences
+- [ ] Designer follows design style preferences
+
+---
+
+### 6.39 File Snapshot Cache Integration
+
+Integrate file snapshot cache with: **Engineer, Inspector, Tester** (Librarian as source)
+
+**Files to modify:**
+- `agents/engineer/file_ops.go` - Use snapshot cache
+- `agents/inspector/file_ops.go` - Use snapshot cache
+- `agents/tester/file_ops.go` - Use snapshot cache
+- `agents/librarian/indexer.go` - Populate snapshot cache
+
+**Acceptance Criteria:**
+- [ ] Engineer reads use snapshot cache
+- [ ] Inspector reads use snapshot cache
+- [ ] Tester reads use snapshot cache
+- [ ] Librarian populates cache during indexing
+- [ ] Cache invalidation on write operations
+- [ ] Stats: cache hits, misses, evictions
+
+---
+
+### 6.40 Dependency Awareness Integration
+
+Integrate dependency awareness with: **Engineer, Inspector, Tester** (Academic as source)
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add check_dependency skill
+- `agents/inspector/skills.go` - Add check_dependency skill
+- `agents/tester/skills.go` - Add check_dependency skill
+- `agents/academic/skills.go` - Provide dependency best practices
+
+**Acceptance Criteria:**
+- [ ] `check_dependency` skill available to Engineer
+- [ ] `check_dependency` skill available to Inspector
+- [ ] `check_dependency` skill available to Tester
+- [ ] Engineer uses correct imports
+- [ ] Inspector flags deprecated deps
+- [ ] Tester mocks dependencies correctly
+- [ ] Academic provides version/security info
+
+---
+
+### 6.41 Task Continuity Integration
+
+Integrate task continuity with: **Architect, Engineer, Tester**
+
+**Files to modify:**
+- `agents/architect/skills.go` - Add checkpoint skills
+- `agents/engineer/skills.go` - Add checkpoint skills
+- `agents/tester/skills.go` - Add checkpoint skills
+
+**Acceptance Criteria:**
+- [ ] `checkpoint_task` skill available to Architect
+- [ ] `checkpoint_task` skill available to Engineer
+- [ ] `checkpoint_task` skill available to Tester
+- [ ] `resume_task` skill available to all above
+- [ ] Auto-checkpoint on significant progress
+- [ ] Resume generates handoff context
+
+---
+
+### 6.42 Design Token Integration
+
+Integrate design tokens with: **Engineer, Inspector, Designer**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add design token skills
+- `agents/inspector/skills.go` - Add design token skills
+- `agents/designer/skills.go` - Add design token skills
+
+**Acceptance Criteria:**
+- [ ] `get_design_tokens` skill available to Engineer
+- [ ] `get_design_tokens` skill available to Inspector
+- [ ] `get_design_tokens` skill available to Designer
+- [ ] `find_design_token` skill available to all above
+- [ ] Engineer uses tokens instead of hardcoded values
+- [ ] Inspector flags hardcoded values
+- [ ] Designer primary user of tokens
+
+---
+
+## Updated Implementation Order
+
+1. **Week 1-2**: 6.1 (Schema), 6.2 (HNSW) - can parallelize
+2. **Week 3**: 6.3 (Nodes/Edges), 6.4 (Search/Traversal) - can parallelize
+3. **Week 4-5**: 6.5-6.11 (All Mitigations) - can parallelize
+4. **Week 6**: 6.12 (Unified Resolver)
+5. **Week 7-8**: 6.13-6.16 (Agent Integrations) - can parallelize
+6. **Week 9**: 6.19 (XOR Filter Optimization)
+7. **Week 10**: 6.20 (Architect Planning Preflight)
+8. **Week 11-12**: 6.21-6.24 (Scratchpad, Style Inference, Component Registry, Mistake Memory)
+9. **Week 13-14**: 6.25-6.28 (Diff Preview, Preferences, File Snapshot, Dependency Awareness)
+10. **Week 15**: 6.29-6.30 (Task Continuity, Design Tokens)
+11. **Week 16**: 6.31 (Designer Agent Implementation)
+12. **Week 17-18**: 6.32-6.42 (Skill/Agent Integrations) - can parallelize
+13. **Week 19**: 6.17-6.18 (Benchmarks, Integration Tests) - validates all optimizations
+
+**Note**: Weeks are relative units of work, not calendar estimates.
+
+**Integration Dependencies:**
+- 6.33-6.42 depend on 6.21-6.30 (skills must exist before integration)
+- 6.31 (Designer) can be parallelized with 6.21-6.30
+- 6.32 (Matrix) is a reference, not implementation
+- 6.42 (Design Tokens) depends on 6.31 (Designer agent)

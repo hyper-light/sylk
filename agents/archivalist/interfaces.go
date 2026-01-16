@@ -198,7 +198,6 @@ type EmbeddingStoreService interface {
 	Close() error
 }
 
-// SemanticRetrieverService defines the semantic retrieval interface
 type SemanticRetrieverService interface {
 	Close() error
 	Retrieve(ctx context.Context, query string, opts RetrievalOptions) ([]*RetrievalResult, error)
@@ -206,7 +205,6 @@ type SemanticRetrieverService interface {
 	Delete(ctx context.Context, id string) error
 }
 
-// SynthesizerService defines the synthesis interface
 type SynthesizerService interface {
 	Answer(ctx context.Context, query string, sessionID string, queryType QueryType) (*SynthesisResponse, error)
 	AnswerWithContext(ctx context.Context, query string, contextResults []*RetrievalResult) (*SynthesisResponse, error)
@@ -215,7 +213,6 @@ type SynthesizerService interface {
 	SynthesizeBriefing(ctx context.Context, briefing *AgentBriefing, query string) (*SynthesisResponse, error)
 }
 
-// MemoryManagerService defines the memory management interface
 type MemoryManagerService interface {
 	Add(item *MemoryItem) error
 	Get(id string) (*MemoryItem, bool)
@@ -225,14 +222,11 @@ type MemoryManagerService interface {
 	Stats() MemoryStats
 }
 
-// ToolHandlerService defines the tool handler interface
 type ToolHandlerService interface {
 	Handle(ctx context.Context, toolName string, input json.RawMessage) (string, error)
 }
 
-// AgentContextService defines the agent context interface
 type AgentContextService interface {
-	// File tracking
 	RecordFileRead(path, summary string, agent SourceModel)
 	RecordFileModified(path string, change FileChange, agent SourceModel)
 	RecordFileCreated(path, summary string, agent SourceModel)
@@ -242,21 +236,18 @@ type AgentContextService interface {
 	GetModifiedFiles() []*FileState
 	WasFileRead(path string) bool
 
-	// Pattern tracking
 	RegisterPattern(p *Pattern)
 	GetPattern(idOrCategory string) *Pattern
 	GetPatternByID(id string) (*Pattern, bool)
 	GetPatternsByCategory(category string) []*Pattern
 	GetAllPatterns() []*Pattern
 
-	// Failure tracking
 	RecordFailure(approach, reason, context string, agent SourceModel) *Failure
 	RecordFailureWithResolution(approach, reason, context, resolution string, agent SourceModel) *Failure
 	GetAllFailures() []*Failure
 	GetRecentFailures(limit int) []*Failure
 	CheckFailure(approach string) (*Failure, bool)
 
-	// Intent tracking
 	RecordIntent(intentType IntentType, content, priority, source string) *Intent
 	RecordUserWants(content, priority, source string) *Intent
 	RecordUserRejects(content, source string) *Intent
@@ -265,7 +256,6 @@ type AgentContextService interface {
 	GetUserWants() []*Intent
 	GetUserRejects() []*Intent
 
-	// Resume state
 	UpdateResumeState(update func(*ResumeState))
 	SetCurrentTask(task, objective string, agent SourceModel)
 	CompleteStep(step string)
@@ -278,14 +268,12 @@ type AgentContextService interface {
 	GetAgentBriefing() *AgentBriefing
 }
 
-// ConflictHistoryService defines the conflict history interface
 type ConflictHistoryService interface {
 	Record(record *ConflictRecord)
 	GetRecent(n int) []*ConflictRecord
 	GetUnresolved() []*ConflictRecord
 }
 
-// Ensure structs implement their interfaces (compile-time check)
 var (
 	_ StoreService             = (*Store)(nil)
 	_ ArchiveService           = (*Archive)(nil)
