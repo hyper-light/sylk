@@ -32,6 +32,32 @@ func TestHookRegistry_RegisterToolCallHook(t *testing.T) {
 	}
 }
 
+func TestHookRegistry_RegisterStoreHook(t *testing.T) {
+	registry := NewHookRegistry()
+
+	registry.RegisterPreStoreHook("test_hook", HookPriorityNormal, func(ctx context.Context, data *StoreHookData) HookResult {
+		return HookResult{Continue: true}
+	})
+
+	stats := registry.Stats()
+	if stats.PreStoreHooks != 1 {
+		t.Errorf("expected 1 pre-store hook, got %d", stats.PreStoreHooks)
+	}
+}
+
+func TestHookRegistry_RegisterQueryHook(t *testing.T) {
+	registry := NewHookRegistry()
+
+	registry.RegisterPreQueryHook("test_hook", HookPriorityNormal, func(ctx context.Context, data *QueryHookData) HookResult {
+		return HookResult{Continue: true}
+	})
+
+	stats := registry.Stats()
+	if stats.PreQueryHooks != 1 {
+		t.Errorf("expected 1 pre-query hook, got %d", stats.PreQueryHooks)
+	}
+}
+
 func TestHookRegistry_PriorityOrder(t *testing.T) {
 	registry := NewHookRegistry()
 
@@ -192,6 +218,50 @@ func TestHookRegistry_ExecuteToolCallHooks_SkipExecution(t *testing.T) {
 	}
 }
 
+func TestHookRegistry_ExecuteStoreHooks_ModifiesData(t *testing.T) {
+	registry := NewHookRegistry()
+
+	registry.RegisterPreStoreHook("modifier", HookPriorityNormal, func(ctx context.Context, data *StoreHookData) HookResult {
+		modified := *data
+		modified.Entry = "updated"
+		return HookResult{
+			Continue:          true,
+			ModifiedStoreData: &modified,
+		}
+	})
+
+	data := &StoreHookData{Entry: "original"}
+	result, _, err := registry.ExecutePreStoreHooks(context.Background(), data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Entry != "updated" {
+		t.Fatalf("expected updated entry, got %v", result.Entry)
+	}
+}
+
+func TestHookRegistry_ExecuteQueryHooks_ModifiesData(t *testing.T) {
+	registry := NewHookRegistry()
+
+	registry.RegisterPreQueryHook("modifier", HookPriorityNormal, func(ctx context.Context, data *QueryHookData) HookResult {
+		modified := *data
+		modified.Query = "updated"
+		return HookResult{
+			Continue:          true,
+			ModifiedQueryData: &modified,
+		}
+	})
+
+	data := &QueryHookData{Query: "original"}
+	result, _, err := registry.ExecutePreQueryHooks(context.Background(), data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Query != "updated" {
+		t.Fatalf("expected updated query, got %v", result.Query)
+	}
+}
+
 func TestHookRegistry_UnregisterPromptHook(t *testing.T) {
 	registry := NewHookRegistry()
 
@@ -235,6 +305,42 @@ func TestHookRegistry_UnregisterToolCallHook(t *testing.T) {
 	stats := registry.Stats()
 	if stats.PreToolCallHooks != 0 {
 		t.Errorf("expected 0 hooks, got %d", stats.PreToolCallHooks)
+	}
+}
+
+func TestHookRegistry_UnregisterStoreHook(t *testing.T) {
+	registry := NewHookRegistry()
+
+	registry.RegisterPreStoreHook("removable", HookPriorityNormal, func(ctx context.Context, data *StoreHookData) HookResult {
+		return HookResult{Continue: true}
+	})
+
+	ok := registry.UnregisterStoreHook("removable")
+	if !ok {
+		t.Error("expected unregister to return true")
+	}
+
+	stats := registry.Stats()
+	if stats.PreStoreHooks != 0 {
+		t.Errorf("expected 0 hooks, got %d", stats.PreStoreHooks)
+	}
+}
+
+func TestHookRegistry_UnregisterQueryHook(t *testing.T) {
+	registry := NewHookRegistry()
+
+	registry.RegisterPreQueryHook("removable", HookPriorityNormal, func(ctx context.Context, data *QueryHookData) HookResult {
+		return HookResult{Continue: true}
+	})
+
+	ok := registry.UnregisterQueryHook("removable")
+	if !ok {
+		t.Error("expected unregister to return true")
+	}
+
+	stats := registry.Stats()
+	if stats.PreQueryHooks != 0 {
+		t.Errorf("expected 0 hooks, got %d", stats.PreQueryHooks)
 	}
 }
 
@@ -351,6 +457,18 @@ func TestHookRegistry_Stats(t *testing.T) {
 	registry.RegisterPostToolCallHook("tool2", HookPriorityNormal, func(ctx context.Context, data *ToolCallHookData) HookResult {
 		return HookResult{Continue: true}
 	})
+	registry.RegisterPreStoreHook("store1", HookPriorityNormal, func(ctx context.Context, data *StoreHookData) HookResult {
+		return HookResult{Continue: true}
+	})
+	registry.RegisterPostStoreHook("store2", HookPriorityNormal, func(ctx context.Context, data *StoreHookData) HookResult {
+		return HookResult{Continue: true}
+	})
+	registry.RegisterPreQueryHook("query1", HookPriorityNormal, func(ctx context.Context, data *QueryHookData) HookResult {
+		return HookResult{Continue: true}
+	})
+	registry.RegisterPostQueryHook("query2", HookPriorityNormal, func(ctx context.Context, data *QueryHookData) HookResult {
+		return HookResult{Continue: true}
+	})
 
 	stats := registry.Stats()
 
@@ -366,8 +484,20 @@ func TestHookRegistry_Stats(t *testing.T) {
 	if stats.PostToolCallHooks != 1 {
 		t.Errorf("expected 1 post-tool-call hook, got %d", stats.PostToolCallHooks)
 	}
-	if stats.TotalHooks != 5 {
-		t.Errorf("expected 5 total hooks, got %d", stats.TotalHooks)
+	if stats.PreStoreHooks != 1 {
+		t.Errorf("expected 1 pre-store hook, got %d", stats.PreStoreHooks)
+	}
+	if stats.PostStoreHooks != 1 {
+		t.Errorf("expected 1 post-store hook, got %d", stats.PostStoreHooks)
+	}
+	if stats.PreQueryHooks != 1 {
+		t.Errorf("expected 1 pre-query hook, got %d", stats.PreQueryHooks)
+	}
+	if stats.PostQueryHooks != 1 {
+		t.Errorf("expected 1 post-query hook, got %d", stats.PostQueryHooks)
+	}
+	if stats.TotalHooks != 9 {
+		t.Errorf("expected 9 total hooks, got %d", stats.TotalHooks)
 	}
 }
 
