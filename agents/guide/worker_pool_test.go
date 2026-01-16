@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestWorkerPool_NewWorkerPool tests creating a worker pool
 func TestWorkerPool_NewWorkerPool(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.DefaultWorkerPoolConfig())
 	require.NotNil(t, pool)
@@ -25,7 +24,6 @@ func TestWorkerPool_NewWorkerPool(t *testing.T) {
 	assert.False(t, stats.Running)
 }
 
-// TestWorkerPool_StartStop tests starting and stopping
 func TestWorkerPool_StartStop(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -45,7 +43,6 @@ func TestWorkerPool_StartStop(t *testing.T) {
 	pool.Stop()
 }
 
-// TestWorkerPool_Submit tests job submission and execution
 func TestWorkerPool_Submit(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -81,7 +78,6 @@ func TestWorkerPool_Submit(t *testing.T) {
 	assert.Equal(t, int64(0), stats.JobsFailed)
 }
 
-// TestWorkerPool_SubmitWithError tests error handling
 func TestWorkerPool_SubmitWithError(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -115,7 +111,6 @@ func TestWorkerPool_SubmitWithError(t *testing.T) {
 	assert.Equal(t, int64(1), stats.JobsFailed)
 }
 
-// TestWorkerPool_QueueFull tests behavior when queue is full
 func TestWorkerPool_QueueFull(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -154,7 +149,6 @@ func TestWorkerPool_QueueFull(t *testing.T) {
 	close(blockChan)
 }
 
-// TestWorkerPool_SubmitBlocking tests blocking submission
 func TestWorkerPool_SubmitBlocking(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -179,7 +173,6 @@ func TestWorkerPool_SubmitBlocking(t *testing.T) {
 	wg.Wait()
 }
 
-// TestWorkerPool_SubmitWithTimeout tests timeout submission
 func TestWorkerPool_SubmitWithTimeout(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -217,7 +210,6 @@ func TestWorkerPool_SubmitWithTimeout(t *testing.T) {
 	close(blockChan)
 }
 
-// TestWorkerPool_SubmitToStoppedPool tests submission to stopped pool
 func TestWorkerPool_SubmitToStoppedPool(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.DefaultWorkerPoolConfig())
 	// Don't start
@@ -233,7 +225,6 @@ func TestWorkerPool_SubmitToStoppedPool(t *testing.T) {
 	assert.False(t, pool.SubmitBlocking(job))
 }
 
-// TestWorkerPool_ConcurrentSubmit tests concurrent submission
 func TestWorkerPool_ConcurrentSubmit(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -270,7 +261,6 @@ func TestWorkerPool_ConcurrentSubmit(t *testing.T) {
 	assert.Equal(t, int64(100), atomic.LoadInt64(&completed))
 }
 
-// TestWorkerPool_ContextCancellation tests context cancellation in jobs
 func TestWorkerPool_ContextCancellation(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{
 		Name:       "test",
@@ -308,7 +298,6 @@ func TestWorkerPool_ContextCancellation(t *testing.T) {
 	_ = ctxCancelled.Load() // Verify we can read the value
 }
 
-// TestClassificationWorkerPool tests the classification-specific pool
 func TestClassificationWorkerPool(t *testing.T) {
 	pool := guide.NewClassificationWorkerPool(guide.ClassificationWorkerPoolConfig{
 		NumWorkers: 2,
@@ -322,7 +311,6 @@ func TestClassificationWorkerPool(t *testing.T) {
 	assert.Equal(t, "classification", stats.Name)
 }
 
-// TestDefaultConfig tests default configuration
 func TestWorkerPool_DefaultConfig(t *testing.T) {
 	cfg := guide.DefaultWorkerPoolConfig()
 	assert.Equal(t, "default", cfg.Name)
@@ -330,7 +318,6 @@ func TestWorkerPool_DefaultConfig(t *testing.T) {
 	assert.Equal(t, 1000, cfg.QueueSize)
 }
 
-// TestWorkerPool_ZeroConfig tests handling of zero config values
 func TestWorkerPool_ZeroConfig(t *testing.T) {
 	pool := guide.NewWorkerPool(guide.WorkerPoolConfig{})
 	require.NotNil(t, pool)

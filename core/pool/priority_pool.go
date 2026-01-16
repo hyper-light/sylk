@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"container/heap"
 	"context"
 	"errors"
 	"sync"
@@ -9,27 +8,16 @@ import (
 	"time"
 )
 
-// =============================================================================
-// Priority Levels
-// =============================================================================
-
-// Priority represents job priority levels
 type Priority int
 
 const (
-	// PriorityBackground is the lowest priority
 	PriorityBackground Priority = iota
-	// PriorityLow is low priority
 	PriorityLow
-	// PriorityNormal is normal priority
 	PriorityNormal
-	// PriorityHigh is high priority
 	PriorityHigh
-	// PriorityCritical is the highest priority
 	PriorityCritical
 )
 
-// String returns the string representation of a priority
 func (p Priority) String() string {
 	switch p {
 	case PriorityBackground:
@@ -47,11 +35,6 @@ func (p Priority) String() string {
 	}
 }
 
-// =============================================================================
-// Priority Job
-// =============================================================================
-
-// PriorityJob represents a job with priority
 type PriorityJob struct {
 	ID        string
 	Priority  Priority
@@ -59,90 +42,37 @@ type PriorityJob struct {
 	OnError   func(error)
 	SessionID string
 	CreatedAt time.Time
-
-	// Internal
-	index int // Index in the heap
 }
 
-// =============================================================================
-// Priority Queue (Heap)
-// =============================================================================
-
-// priorityQueue implements heap.Interface for priority-based ordering
-type priorityQueue []*PriorityJob
-
-func (pq priorityQueue) Len() int { return len(pq) }
-
-func (pq priorityQueue) Less(i, j int) bool {
-	// Higher priority comes first
-	if pq[i].Priority != pq[j].Priority {
-		return pq[i].Priority > pq[j].Priority
-	}
-	// Same priority: older jobs come first (age-based promotion)
-	return pq[i].CreatedAt.Before(pq[j].CreatedAt)
-}
-
-func (pq priorityQueue) Swap(i, j int) {
-	pq[i], pq[j] = pq[j], pq[i]
-	pq[i].index = i
-	pq[j].index = j
-}
-
-func (pq *priorityQueue) Push(x any) {
-	n := len(*pq)
-	job := x.(*PriorityJob)
-	job.index = n
-	*pq = append(*pq, job)
-}
-
-func (pq *priorityQueue) Pop() any {
-	old := *pq
-	n := len(old)
-	job := old[n-1]
-	old[n-1] = nil  // avoid memory leak
-	job.index = -1  // for safety
-	*pq = old[0 : n-1]
-	return job
-}
-
-// =============================================================================
-// Priority Worker Pool
-// =============================================================================
-
-// PriorityPool is a worker pool with priority-based job selection
 type PriorityPool struct {
 	mu sync.Mutex
 
-	// Configuration
-	name        string
-	numWorkers  int
+	name         string
+	numWorkers   int
 	maxQueueSize int
 
-	// Priority queue
-	queue priorityQueue
+	lanes    [5][]*PriorityJob
+	queueLen int
 
-	// Queue signal
 	jobReady chan struct{}
 
-	// Control
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// State
 	running atomic.Bool
 	closed  atomic.Bool
 
-	// Statistics
 	jobsSubmitted int64
 	jobsCompleted int64
 	jobsFailed    int64
 	jobsDropped   int64
 
-	// Per-priority stats
 	priorityStats [5]priorityLevelStats
 
-	// Starvation prevention
+	waitBuckets map[string]int64
+	runBuckets  map[string]int64
+
 	promotionInterval time.Duration
 	lastPromotion     time.Time
 }
@@ -150,18 +80,16 @@ type PriorityPool struct {
 type priorityLevelStats struct {
 	submitted int64
 	completed int64
-	waitTime  int64 // Total wait time in nanoseconds
+	waitTime  int64
 }
 
-// PriorityPoolConfig configures a priority pool
 type PriorityPoolConfig struct {
 	Name              string
 	NumWorkers        int
 	MaxQueueSize      int
-	PromotionInterval time.Duration // How often to promote aged jobs
+	PromotionInterval time.Duration
 }
 
-// DefaultPriorityPoolConfig returns sensible defaults
 func DefaultPriorityPoolConfig() PriorityPoolConfig {
 	return PriorityPoolConfig{
 		Name:              "priority-pool",
@@ -171,7 +99,6 @@ func DefaultPriorityPoolConfig() PriorityPoolConfig {
 	}
 }
 
-// NewPriorityPool creates a new priority worker pool
 func NewPriorityPool(cfg PriorityPoolConfig) *PriorityPool {
 	if cfg.NumWorkers <= 0 {
 		cfg.NumWorkers = 4
@@ -189,55 +116,42 @@ func NewPriorityPool(cfg PriorityPoolConfig) *PriorityPool {
 		name:              cfg.Name,
 		numWorkers:        cfg.NumWorkers,
 		maxQueueSize:      cfg.MaxQueueSize,
-		queue:             make(priorityQueue, 0),
 		jobReady:          make(chan struct{}, cfg.MaxQueueSize),
 		ctx:               ctx,
 		cancel:            cancel,
 		promotionInterval: cfg.PromotionInterval,
 		lastPromotion:     time.Now(),
+		waitBuckets:       make(map[string]int64),
+		runBuckets:        make(map[string]int64),
 	}
-
-	heap.Init(&pool.queue)
 
 	return pool
 }
 
-// =============================================================================
-// Lifecycle
-// =============================================================================
-
-// Start begins processing jobs
 func (p *PriorityPool) Start() {
 	if p.running.Swap(true) {
 		return
 	}
 
-	// Start workers
 	for i := 0; i < p.numWorkers; i++ {
 		p.wg.Add(1)
 		go p.worker(i)
 	}
 
-	// Start promotion goroutine
 	p.wg.Add(1)
 	go p.promotionWorker()
 }
 
-// Stop halts all workers
 func (p *PriorityPool) Stop() {
 	if !p.running.Swap(false) {
 		return
 	}
 
 	p.cancel()
-
-	// Drain jobReady channel
 	close(p.jobReady)
-
 	p.wg.Wait()
 }
 
-// Close closes the pool
 func (p *PriorityPool) Close() error {
 	if p.closed.Swap(true) {
 		return ErrPoolClosed
@@ -247,11 +161,6 @@ func (p *PriorityPool) Close() error {
 	return nil
 }
 
-// =============================================================================
-// Job Submission
-// =============================================================================
-
-// Submit adds a job to the queue
 func (p *PriorityPool) Submit(job *PriorityJob) bool {
 	if !p.running.Load() || p.closed.Load() {
 		return false
@@ -262,18 +171,26 @@ func (p *PriorityPool) Submit(job *PriorityJob) bool {
 	}
 
 	p.mu.Lock()
-	if len(p.queue) >= p.maxQueueSize {
+	if p.queueLen >= p.maxQueueSize {
 		p.mu.Unlock()
 		atomic.AddInt64(&p.jobsDropped, 1)
 		return false
 	}
 
-	heap.Push(&p.queue, job)
+	lane := int(job.Priority)
+	if lane < 0 {
+		lane = 0
+	}
+	if lane > int(PriorityCritical) {
+		lane = int(PriorityCritical)
+	}
+
+	p.lanes[lane] = append(p.lanes[lane], job)
+	p.queueLen++
 	atomic.AddInt64(&p.jobsSubmitted, 1)
-	atomic.AddInt64(&p.priorityStats[job.Priority].submitted, 1)
+	atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
 	p.mu.Unlock()
 
-	// Signal that a job is ready
 	select {
 	case p.jobReady <- struct{}{}:
 	default:
@@ -282,7 +199,6 @@ func (p *PriorityPool) Submit(job *PriorityJob) bool {
 	return true
 }
 
-// SubmitBlocking blocks until space is available
 func (p *PriorityPool) SubmitBlocking(job *PriorityJob) bool {
 	if !p.running.Load() || p.closed.Load() {
 		return false
@@ -294,10 +210,18 @@ func (p *PriorityPool) SubmitBlocking(job *PriorityJob) bool {
 
 	for {
 		p.mu.Lock()
-		if len(p.queue) < p.maxQueueSize {
-			heap.Push(&p.queue, job)
+		if p.queueLen < p.maxQueueSize {
+			lane := int(job.Priority)
+			if lane < 0 {
+				lane = 0
+			}
+			if lane > int(PriorityCritical) {
+				lane = int(PriorityCritical)
+			}
+			p.lanes[lane] = append(p.lanes[lane], job)
+			p.queueLen++
 			atomic.AddInt64(&p.jobsSubmitted, 1)
-			atomic.AddInt64(&p.priorityStats[job.Priority].submitted, 1)
+			atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
 			p.mu.Unlock()
 
 			select {
@@ -308,7 +232,6 @@ func (p *PriorityPool) SubmitBlocking(job *PriorityJob) bool {
 		}
 		p.mu.Unlock()
 
-		// Wait and retry
 		select {
 		case <-time.After(10 * time.Millisecond):
 		case <-p.ctx.Done():
@@ -317,7 +240,6 @@ func (p *PriorityPool) SubmitBlocking(job *PriorityJob) bool {
 	}
 }
 
-// SubmitWithTimeout blocks for up to timeout
 func (p *PriorityPool) SubmitWithTimeout(job *PriorityJob, timeout time.Duration) bool {
 	if !p.running.Load() || p.closed.Load() {
 		return false
@@ -331,10 +253,18 @@ func (p *PriorityPool) SubmitWithTimeout(job *PriorityJob, timeout time.Duration
 
 	for time.Now().Before(deadline) {
 		p.mu.Lock()
-		if len(p.queue) < p.maxQueueSize {
-			heap.Push(&p.queue, job)
+		if p.queueLen < p.maxQueueSize {
+			lane := int(job.Priority)
+			if lane < 0 {
+				lane = 0
+			}
+			if lane > int(PriorityCritical) {
+				lane = int(PriorityCritical)
+			}
+			p.lanes[lane] = append(p.lanes[lane], job)
+			p.queueLen++
 			atomic.AddInt64(&p.jobsSubmitted, 1)
-			atomic.AddInt64(&p.priorityStats[job.Priority].submitted, 1)
+			atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
 			p.mu.Unlock()
 
 			select {
@@ -345,7 +275,6 @@ func (p *PriorityPool) SubmitWithTimeout(job *PriorityJob, timeout time.Duration
 		}
 		p.mu.Unlock()
 
-		// Wait and retry
 		remaining := time.Until(deadline)
 		waitTime := 10 * time.Millisecond
 		if remaining < waitTime {
@@ -363,11 +292,6 @@ func (p *PriorityPool) SubmitWithTimeout(job *PriorityJob, timeout time.Duration
 	return false
 }
 
-// =============================================================================
-// Workers
-// =============================================================================
-
-// worker processes jobs from the queue
 func (p *PriorityPool) worker(id int) {
 	defer p.wg.Done()
 
@@ -385,11 +309,13 @@ func (p *PriorityPool) worker(id int) {
 				continue
 			}
 
-			// Execute job
 			waitTime := time.Since(job.CreatedAt)
 			atomic.AddInt64(&p.priorityStats[job.Priority].waitTime, int64(waitTime))
+			p.recordWaitBucket(waitTime)
 
+			start := time.Now()
 			err := p.executeJob(job)
+			p.recordRunBucket(time.Since(start))
 			if err != nil {
 				atomic.AddInt64(&p.jobsFailed, 1)
 				if job.OnError != nil {
@@ -403,19 +329,24 @@ func (p *PriorityPool) worker(id int) {
 	}
 }
 
-// popJob removes and returns the highest priority job
 func (p *PriorityPool) popJob() *PriorityJob {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if len(p.queue) == 0 {
-		return nil
+	for priority := PriorityCritical; priority >= PriorityBackground; priority-- {
+		lane := int(priority)
+		if len(p.lanes[lane]) == 0 {
+			continue
+		}
+		job := p.lanes[lane][0]
+		p.lanes[lane] = p.lanes[lane][1:]
+		p.queueLen--
+		return job
 	}
 
-	return heap.Pop(&p.queue).(*PriorityJob)
+	return nil
 }
 
-// executeJob executes a single job with panic recovery
 func (p *PriorityPool) executeJob(job *PriorityJob) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -426,7 +357,6 @@ func (p *PriorityPool) executeJob(job *PriorityJob) (err error) {
 	return job.Execute(p.ctx)
 }
 
-// promotionWorker periodically promotes aged low-priority jobs
 func (p *PriorityPool) promotionWorker() {
 	defer p.wg.Done()
 
@@ -443,33 +373,71 @@ func (p *PriorityPool) promotionWorker() {
 	}
 }
 
-// promoteAgedJobs promotes jobs that have been waiting too long
 func (p *PriorityPool) promoteAgedJobs() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	threshold := time.Now().Add(-p.promotionInterval * 2)
 
-	for i, job := range p.queue {
-		// Promote jobs that have been waiting too long
-		if job.CreatedAt.Before(threshold) && job.Priority < PriorityCritical {
-			p.queue[i].Priority++
+	for prio := PriorityBackground; prio < PriorityCritical; prio++ {
+		lane := int(prio)
+		if len(p.lanes[lane]) == 0 {
+			continue
 		}
+
+		keep := p.lanes[lane][:0]
+		for _, job := range p.lanes[lane] {
+			if job.CreatedAt.Before(threshold) {
+				p.lanes[lane+1] = append(p.lanes[lane+1], job)
+			} else {
+				keep = append(keep, job)
+			}
+		}
+		p.lanes[lane] = keep
 	}
 
-	// Re-heapify after promotions
-	heap.Init(&p.queue)
 	p.lastPromotion = time.Now()
 }
 
-// =============================================================================
-// Statistics
-// =============================================================================
+func (p *PriorityPool) recordWaitBucket(d time.Duration) {
+	bucket := latencyBucket(d)
+	p.mu.Lock()
+	p.waitBuckets[bucket]++
+	p.mu.Unlock()
+}
 
-// Stats returns pool statistics
+func (p *PriorityPool) recordRunBucket(d time.Duration) {
+	bucket := latencyBucket(d)
+	p.mu.Lock()
+	p.runBuckets[bucket]++
+	p.mu.Unlock()
+}
+
+func latencyBucket(d time.Duration) string {
+	if d <= 0 {
+		return "0"
+	}
+	if d <= 10*time.Millisecond {
+		return "<=10ms"
+	}
+	if d <= 50*time.Millisecond {
+		return "<=50ms"
+	}
+	if d <= 100*time.Millisecond {
+		return "<=100ms"
+	}
+	if d <= 250*time.Millisecond {
+		return "<=250ms"
+	}
+	if d <= time.Second {
+		return "<=1s"
+	}
+	return ">1s"
+}
+
 func (p *PriorityPool) Stats() PriorityPoolStats {
 	p.mu.Lock()
-	queueLen := len(p.queue)
+	queueLen := p.queueLen
 	p.mu.Unlock()
 
 	stats := PriorityPoolStats{
@@ -483,6 +451,8 @@ func (p *PriorityPool) Stats() PriorityPoolStats {
 		JobsFailed:    atomic.LoadInt64(&p.jobsFailed),
 		JobsDropped:   atomic.LoadInt64(&p.jobsDropped),
 		PriorityStats: make(map[string]PriorityLevelStats),
+		WaitBuckets:   make(map[string]int64),
+		RunBuckets:    make(map[string]int64),
 	}
 
 	for i, ps := range p.priorityStats {
@@ -494,10 +464,16 @@ func (p *PriorityPool) Stats() PriorityPoolStats {
 		}
 	}
 
+	for key, value := range p.waitBuckets {
+		stats.WaitBuckets[key] = value
+	}
+	for key, value := range p.runBuckets {
+		stats.RunBuckets[key] = value
+	}
+
 	return stats
 }
 
-// PriorityPoolStats contains pool statistics
 type PriorityPoolStats struct {
 	Name          string                        `json:"name"`
 	NumWorkers    int                           `json:"num_workers"`
@@ -509,23 +485,17 @@ type PriorityPoolStats struct {
 	JobsFailed    int64                         `json:"jobs_failed"`
 	JobsDropped   int64                         `json:"jobs_dropped"`
 	PriorityStats map[string]PriorityLevelStats `json:"priority_stats"`
+	WaitBuckets   map[string]int64              `json:"wait_buckets"`
+	RunBuckets    map[string]int64              `json:"run_buckets"`
 }
 
-// PriorityLevelStats contains per-priority statistics
 type PriorityLevelStats struct {
 	Submitted   int64         `json:"submitted"`
 	Completed   int64         `json:"completed"`
 	AvgWaitTime time.Duration `json:"avg_wait_time"`
 }
 
-// =============================================================================
-// Errors
-// =============================================================================
-
 var (
-	// ErrPoolClosed indicates the pool is closed
 	ErrPoolClosed = errors.New("pool is closed")
-
-	// ErrPoolFull indicates the pool queue is full
-	ErrPoolFull = errors.New("pool queue is full")
+	ErrPoolFull   = errors.New("pool queue is full")
 )

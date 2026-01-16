@@ -16,35 +16,36 @@ import (
 type SessionPool struct {
 	mu sync.RWMutex
 
-	// Configuration
 	name         string
 	numWorkers   int
 	maxQueueSize int
 
-	// Per-session queues
 	sessionQueues map[string]*sessionQueue
 
-	// Round-robin state
 	sessionOrder []string
 	currentIndex int
 
-	// Job channel
 	jobs chan *SessionJob
 
-	// Control
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// State
 	running atomic.Bool
 	closed  atomic.Bool
 
-	// Global limits
-	maxJobsPerSession int
-	maxTotalJobs      int
+	baseMaxJobsPerSession int
+	baseMaxTotalJobs      int
+	maxJobsPerSession     int
+	maxTotalJobs          int
+	maxJobsPerSessionMax  int
+	maxTotalJobsMax       int
+	dynamicLimits         bool
+	adjustInterval        time.Duration
 
-	// Statistics
+	maxAgents     map[string]int
+	runningAgents map[string]int
+
 	totalSubmitted int64
 	totalCompleted int64
 	totalFailed    int64
@@ -65,6 +66,7 @@ type sessionQueue struct {
 type SessionJob struct {
 	ID        string
 	SessionID string
+	AgentType string
 	Priority  Priority
 	Execute   func(ctx context.Context) error
 	OnError   func(error)
@@ -73,11 +75,16 @@ type SessionJob struct {
 
 // SessionPoolConfig configures a session pool
 type SessionPoolConfig struct {
-	Name              string
-	NumWorkers        int
-	MaxQueueSize      int
-	MaxJobsPerSession int
-	MaxTotalJobs      int
+	Name                 string
+	NumWorkers           int
+	MaxQueueSize         int
+	MaxJobsPerSession    int
+	MaxTotalJobs         int
+	MaxAgents            map[string]int
+	EnableDynamicLimits  bool
+	AdjustInterval       time.Duration
+	MaxJobsPerSessionMax int
+	MaxTotalJobsMax      int
 }
 
 // DefaultSessionPoolConfig returns sensible defaults
@@ -105,20 +112,37 @@ func NewSessionPool(cfg SessionPoolConfig) *SessionPool {
 	if cfg.MaxTotalJobs <= 0 {
 		cfg.MaxTotalJobs = 500
 	}
+	if cfg.MaxJobsPerSessionMax <= 0 {
+		cfg.MaxJobsPerSessionMax = cfg.MaxJobsPerSession
+	}
+	if cfg.MaxTotalJobsMax <= 0 {
+		cfg.MaxTotalJobsMax = cfg.MaxTotalJobs
+	}
+	if cfg.AdjustInterval <= 0 {
+		cfg.AdjustInterval = 2 * time.Second
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &SessionPool{
-		name:              cfg.Name,
-		numWorkers:        cfg.NumWorkers,
-		maxQueueSize:      cfg.MaxQueueSize,
-		sessionQueues:     make(map[string]*sessionQueue),
-		sessionOrder:      make([]string, 0),
-		jobs:              make(chan *SessionJob, cfg.MaxQueueSize),
-		ctx:               ctx,
-		cancel:            cancel,
-		maxJobsPerSession: cfg.MaxJobsPerSession,
-		maxTotalJobs:      cfg.MaxTotalJobs,
+		name:                  cfg.Name,
+		numWorkers:            cfg.NumWorkers,
+		maxQueueSize:          cfg.MaxQueueSize,
+		sessionQueues:         make(map[string]*sessionQueue),
+		sessionOrder:          make([]string, 0),
+		jobs:                  make(chan *SessionJob, cfg.MaxQueueSize),
+		ctx:                   ctx,
+		cancel:                cancel,
+		baseMaxJobsPerSession: cfg.MaxJobsPerSession,
+		baseMaxTotalJobs:      cfg.MaxTotalJobs,
+		maxJobsPerSession:     cfg.MaxJobsPerSession,
+		maxTotalJobs:          cfg.MaxTotalJobs,
+		maxJobsPerSessionMax:  cfg.MaxJobsPerSessionMax,
+		maxTotalJobsMax:       cfg.MaxTotalJobsMax,
+		dynamicLimits:         cfg.EnableDynamicLimits,
+		adjustInterval:        cfg.AdjustInterval,
+		maxAgents:             cfg.MaxAgents,
+		runningAgents:         make(map[string]int),
 	}
 }
 
@@ -138,9 +162,12 @@ func (p *SessionPool) Start() {
 		go p.worker(i)
 	}
 
-	// Start fair scheduler
 	p.wg.Add(1)
 	go p.scheduler()
+	if p.dynamicLimits {
+		p.wg.Add(1)
+		go p.limitAdjuster()
+	}
 }
 
 // Stop halts all workers
@@ -187,7 +214,26 @@ func (p *SessionPool) Submit(job *SessionJob) bool {
 
 	p.mu.Lock()
 
-	// Get or create session queue
+	if job.AgentType != "" && p.maxAgents != nil {
+		if limit, ok := p.maxAgents[job.AgentType]; ok && limit > 0 {
+			queued := 0
+			for _, sq := range p.sessionQueues {
+				sq.mu.Lock()
+				for _, queuedJob := range sq.jobs {
+					if queuedJob.AgentType == job.AgentType {
+						queued++
+					}
+				}
+				sq.mu.Unlock()
+			}
+			if queued+p.runningAgents[job.AgentType] >= limit {
+				p.mu.Unlock()
+				atomic.AddInt64(&p.totalDropped, 1)
+				return false
+			}
+		}
+	}
+
 	sq, ok := p.sessionQueues[job.SessionID]
 	if !ok {
 		sq = &sessionQueue{
@@ -270,6 +316,56 @@ func (p *SessionPool) scheduler() {
 	}
 }
 
+func (p *SessionPool) limitAdjuster() {
+	defer p.wg.Done()
+
+	ticker := time.NewTicker(p.adjustInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			p.adjustLimits()
+		}
+	}
+}
+
+func (p *SessionPool) adjustLimits() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	queued := 0
+	for _, sq := range p.sessionQueues {
+		sq.mu.Lock()
+		queued += len(sq.jobs)
+		sq.mu.Unlock()
+	}
+
+	if queued > p.maxQueueSize/2 {
+		if p.maxJobsPerSession < p.maxJobsPerSessionMax {
+			p.maxJobsPerSession++
+		}
+		if p.maxTotalJobs < p.maxTotalJobsMax {
+			p.maxTotalJobs += 5
+		}
+		return
+	}
+
+	if queued == 0 {
+		if p.maxJobsPerSession > p.baseMaxJobsPerSession {
+			p.maxJobsPerSession--
+		}
+		if p.maxTotalJobs > p.baseMaxTotalJobs {
+			p.maxTotalJobs -= 5
+			if p.maxTotalJobs < p.baseMaxTotalJobs {
+				p.maxTotalJobs = p.baseMaxTotalJobs
+			}
+		}
+	}
+}
+
 // selectNextJob selects the next job using round-robin across sessions
 func (p *SessionPool) selectNextJob() *SessionJob {
 	p.mu.Lock()
@@ -291,15 +387,27 @@ func (p *SessionPool) selectNextJob() *SessionJob {
 
 		sq.mu.Lock()
 		if len(sq.jobs) > 0 {
-			// Pop first job
 			job := sq.jobs[0]
+			if job.AgentType != "" && p.maxAgents != nil {
+				if limit, ok := p.maxAgents[job.AgentType]; ok && limit > 0 {
+					if p.runningAgents[job.AgentType] >= limit {
+						sq.mu.Unlock()
+						continue
+					}
+				}
+			}
+
 			sq.jobs = sq.jobs[1:]
 			sq.mu.Unlock()
 
-			// Update round-robin index
+			if job.AgentType != "" && p.maxAgents != nil {
+				p.runningAgents[job.AgentType]++
+			}
+
 			p.currentIndex = (idx + 1) % len(p.sessionOrder)
 
 			return job
+
 		}
 		sq.mu.Unlock()
 	}
@@ -326,6 +434,14 @@ func (p *SessionPool) worker(id int) {
 		} else {
 			atomic.AddInt64(&p.totalCompleted, 1)
 			p.updateSessionStats(job.SessionID, true)
+		}
+
+		if job.AgentType != "" && p.maxAgents != nil {
+			p.mu.Lock()
+			if p.runningAgents[job.AgentType] > 0 {
+				p.runningAgents[job.AgentType]--
+			}
+			p.mu.Unlock()
 		}
 	}
 }
@@ -426,16 +542,19 @@ func (p *SessionPool) Stats() SessionPoolStats {
 	defer p.mu.RUnlock()
 
 	stats := SessionPoolStats{
-		Name:            p.name,
-		NumWorkers:      p.numWorkers,
-		MaxQueueSize:    p.maxQueueSize,
-		Running:         p.running.Load(),
-		TotalSubmitted:  atomic.LoadInt64(&p.totalSubmitted),
-		TotalCompleted:  atomic.LoadInt64(&p.totalCompleted),
-		TotalFailed:     atomic.LoadInt64(&p.totalFailed),
-		TotalDropped:    atomic.LoadInt64(&p.totalDropped),
-		SessionCount:    len(p.sessionQueues),
-		SessionStats:    make(map[string]SessionStats),
+		Name:              p.name,
+		NumWorkers:        p.numWorkers,
+		MaxQueueSize:      p.maxQueueSize,
+		Running:           p.running.Load(),
+		TotalSubmitted:    atomic.LoadInt64(&p.totalSubmitted),
+		TotalCompleted:    atomic.LoadInt64(&p.totalCompleted),
+		TotalFailed:       atomic.LoadInt64(&p.totalFailed),
+		TotalDropped:      atomic.LoadInt64(&p.totalDropped),
+		SessionCount:      len(p.sessionQueues),
+		SessionStats:      make(map[string]SessionStats),
+		AgentStats:        make(map[string]AgentStats),
+		MaxJobsPerSession: p.maxJobsPerSession,
+		MaxTotalJobs:      p.maxTotalJobs,
 	}
 
 	for sessionID, sq := range p.sessionQueues {
@@ -451,22 +570,51 @@ func (p *SessionPool) Stats() SessionPoolStats {
 		sq.mu.Unlock()
 	}
 
+	for agentType, limit := range p.maxAgents {
+		queued := 0
+		for _, sq := range p.sessionQueues {
+			sq.mu.Lock()
+			for _, job := range sq.jobs {
+				if job.AgentType == agentType {
+					queued++
+				}
+			}
+			sq.mu.Unlock()
+		}
+		stats.AgentStats[agentType] = AgentStats{
+			AgentType: agentType,
+			Limit:     limit,
+			Queued:    queued,
+			Running:   p.runningAgents[agentType],
+		}
+	}
+
 	return stats
 }
 
 // SessionPoolStats contains pool statistics
 type SessionPoolStats struct {
-	Name           string                  `json:"name"`
-	NumWorkers     int                     `json:"num_workers"`
-	MaxQueueSize   int                     `json:"max_queue_size"`
-	Running        bool                    `json:"running"`
-	TotalSubmitted int64                   `json:"total_submitted"`
-	TotalCompleted int64                   `json:"total_completed"`
-	TotalFailed    int64                   `json:"total_failed"`
-	TotalDropped   int64                   `json:"total_dropped"`
-	TotalQueued    int                     `json:"total_queued"`
-	SessionCount   int                     `json:"session_count"`
-	SessionStats   map[string]SessionStats `json:"session_stats"`
+	Name              string                  `json:"name"`
+	NumWorkers        int                     `json:"num_workers"`
+	MaxQueueSize      int                     `json:"max_queue_size"`
+	Running           bool                    `json:"running"`
+	TotalSubmitted    int64                   `json:"total_submitted"`
+	TotalCompleted    int64                   `json:"total_completed"`
+	TotalFailed       int64                   `json:"total_failed"`
+	TotalDropped      int64                   `json:"total_dropped"`
+	TotalQueued       int                     `json:"total_queued"`
+	SessionCount      int                     `json:"session_count"`
+	SessionStats      map[string]SessionStats `json:"session_stats"`
+	AgentStats        map[string]AgentStats   `json:"agent_stats"`
+	MaxJobsPerSession int                     `json:"max_jobs_per_session"`
+	MaxTotalJobs      int                     `json:"max_total_jobs"`
+}
+
+type AgentStats struct {
+	AgentType string `json:"agent_type"`
+	Limit     int    `json:"limit"`
+	Queued    int    `json:"queued"`
+	Running   int    `json:"running"`
 }
 
 // SessionStats contains per-session statistics

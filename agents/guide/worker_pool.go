@@ -7,27 +7,12 @@ import (
 	"time"
 )
 
-// =============================================================================
-// Worker Pool
-// =============================================================================
-//
-// WorkerPool provides bounded concurrency for background tasks.
-// It manages a pool of workers that process jobs from a queue.
-//
-// Use cases:
-// - LLM classification requests (rate-limited, bounded concurrency)
-// - Batch processing of archivalist requests
-// - Background cache population
-// - Async notification delivery
-
-// Job represents a unit of work for the pool
 type Job struct {
 	ID      string
 	Execute func(ctx context.Context) error
 	OnError func(error)
 }
 
-// WorkerPool manages a pool of workers for background processing
 type WorkerPool struct {
 	// Configuration
 	name       string
@@ -228,7 +213,6 @@ type WorkerPoolStats struct {
 // Async Classification Request
 // =============================================================================
 
-// AsyncClassificationRequest represents an async classification job
 type AsyncClassificationRequest struct {
 	Request       *RouteRequest
 	ResultChan    chan *AsyncClassificationResult
@@ -245,7 +229,6 @@ type AsyncClassificationResult struct {
 	ProcessingTime time.Duration
 }
 
-// ClassificationWorkerPool is a specialized pool for LLM classification
 type ClassificationWorkerPool struct {
 	pool       *WorkerPool
 	classifier *Classifier
@@ -253,7 +236,6 @@ type ClassificationWorkerPool struct {
 	parser     *Parser
 }
 
-// ClassificationWorkerPoolConfig configures the classification pool
 type ClassificationWorkerPoolConfig struct {
 	NumWorkers int // Default: 4
 	QueueSize  int // Default: 500
@@ -262,7 +244,6 @@ type ClassificationWorkerPoolConfig struct {
 	Parser     *Parser
 }
 
-// NewClassificationWorkerPool creates a classification worker pool
 func NewClassificationWorkerPool(cfg ClassificationWorkerPoolConfig) *ClassificationWorkerPool {
 	if cfg.NumWorkers <= 0 {
 		cfg.NumWorkers = 4
@@ -396,7 +377,6 @@ func (p *ClassificationWorkerPool) Stats() WorkerPoolStats {
 	return p.pool.Stats()
 }
 
-// ErrWorkerPoolFull is returned when the worker pool queue is full
 var ErrWorkerPoolFull = errorf("worker pool queue is full")
 
 func errorf(format string, args ...any) error {

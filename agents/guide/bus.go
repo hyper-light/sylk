@@ -306,9 +306,30 @@ const (
 	// MessageTypeHeartbeat is a health check heartbeat
 	MessageTypeHeartbeat MessageType = "heartbeat"
 
-	// MessageTypeAgentReady signals that an agent has completed initialization
-	// and is ready to receive requests. Sent after registration is complete.
 	MessageTypeAgentReady MessageType = "agent_ready"
+
+	MessageTypeDAGExecute            MessageType = "dag_execute"
+	MessageTypeDAGStatus             MessageType = "dag_status"
+	MessageTypeDAGCancel             MessageType = "dag_cancel"
+	MessageTypeTaskDispatch          MessageType = "task_dispatch"
+	MessageTypeTaskComplete          MessageType = "task_complete"
+	MessageTypeTaskFailed            MessageType = "task_failed"
+	MessageTypeTaskHelp              MessageType = "task_help"
+	MessageTypeClarificationRequest  MessageType = "clarification_request"
+	MessageTypeClarificationResponse MessageType = "clarification_response"
+	MessageTypeValidateTask          MessageType = "validate_task"
+	MessageTypeValidationResult      MessageType = "validation_result"
+	MessageTypeValidationFull        MessageType = "validation_full"
+	MessageTypeValidationCorrections MessageType = "validation_corrections"
+	MessageTypeTestPlanRequest       MessageType = "test_plan_request"
+	MessageTypeTestPlanResponse      MessageType = "test_plan_response"
+	MessageTypeTestDAGRequest        MessageType = "test_dag_request"
+	MessageTypeTestsReady            MessageType = "tests_ready"
+	MessageTypeTestResults           MessageType = "test_results"
+	MessageTypeTestCorrections       MessageType = "test_corrections"
+	MessageTypeUserOverride          MessageType = "user_override"
+	MessageTypeUserInterrupt         MessageType = "user_interrupt"
+	MessageTypeWorkflowComplete      MessageType = "workflow_complete"
 )
 
 // =============================================================================
@@ -745,10 +766,10 @@ func (m *Message) GetActionRequest() (*ActionRequest, bool) {
 // Agents send this to archivalist when nearing context limits.
 type PreserveRequest struct {
 	// What to preserve
-	Summaries    []string       `json:"summaries,omitempty"`
-	KeyInsights  []string       `json:"key_insights,omitempty"`
-	Decisions    []string       `json:"decisions,omitempty"`
-	Context      map[string]any `json:"context,omitempty"`
+	Summaries   []string       `json:"summaries,omitempty"`
+	KeyInsights []string       `json:"key_insights,omitempty"`
+	Decisions   []string       `json:"decisions,omitempty"`
+	Context     map[string]any `json:"context,omitempty"`
 
 	// Metadata
 	SourceAgentID string    `json:"source_agent_id"`

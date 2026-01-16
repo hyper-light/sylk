@@ -14,7 +14,7 @@ This document defines:
 - DAG planning and execution
 - Quality assurance loop (Inspector + Tester)
 - **Skills per agent** (progressive disclosure)
-- **Tool calls per agent**
+- **Skill definitions per agent**
 - **LLM hooks per agent**
 - State transitions and lifecycle tracking
 - Failure handling and recovery
@@ -1123,11 +1123,11 @@ tester_skills_contextual := []Skill{
 
 ---
 
-## Agent Tool Calls
+## Agent Skill Definitions
 
-Each agent exposes specific tools that other agents (via Guide) can invoke.
+Each agent exposes specific skills that other agents (via Guide) can invoke.
 
-### Tool Naming Convention
+### Skill Naming Convention
 
 ```
 <agent_name>_<action>_<domain>
@@ -1139,10 +1139,10 @@ Examples:
 - inspector_validate_task
 ```
 
-### Guide Tool Definitions
+### Guide Skill Definitions
 
 ```go
-guide_tools := []ToolDefinition{
+guide_skills := []SkillDefinition{
     {
         Name:        "guide_route_message",
         Description: "Route a message to the appropriate agent",
@@ -1178,10 +1178,10 @@ guide_tools := []ToolDefinition{
 }
 ```
 
-### Archivalist Tool Definitions
+### Archivalist Skill Definitions
 
 ```go
-archivalist_tools := []ToolDefinition{
+archivalist_skills := []SkillDefinition{
     {
         Name:        "archivalist_store_entry",
         Description: "Store an entry in the chronicle",
@@ -1265,10 +1265,10 @@ archivalist_tools := []ToolDefinition{
 }
 ```
 
-### Librarian Tool Definitions
+### Librarian Skill Definitions
 
 ```go
-librarian_tools := []ToolDefinition{
+librarian_skills := []SkillDefinition{
     {
         Name:        "librarian_search_code",
         Description: "Search codebase for patterns, symbols, or text",
@@ -1322,10 +1322,10 @@ librarian_tools := []ToolDefinition{
 }
 ```
 
-### Engineer Tool Definitions
+### Engineer Skill Definitions
 
 ```go
-engineer_tools := []ToolDefinition{
+engineer_skills := []SkillDefinition{
     {
         Name:        "engineer_read_file",
         Description: "Read a file's contents",
@@ -2521,6 +2521,483 @@ WORKFLOW_COMPLETE       Architect → User: all done, summary
 
 ---
 
+## Pipeline Architecture
+
+**CRITICAL: Pipelines are isolated execution contexts that enable tight feedback loops for individual tasks while preserving the session-wide quality assurance flow.**
+
+### Two-Level Quality Assurance
+
+Sylk implements quality assurance at TWO levels:
+
+1. **Pipeline-Level (task-specific)**: Direct feedback loops within an isolated context
+2. **Session-Level (integration)**: Full validation after all pipelines complete, routed through Architect
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        TWO-LEVEL QUALITY ASSURANCE                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  LEVEL 1: PIPELINE-INTERNAL (per-task, direct feedback)                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                               │  │
+│  │   Engineer ◄─────────────────────────────────────────────────┐                │  │
+│  │      │                                                       │                │  │
+│  │      │ completes task                                        │                │  │
+│  │      ▼                                                       │                │  │
+│  │   Inspector (task-specific)                                  │                │  │
+│  │      │ - Lint this file                                      │                │  │
+│  │      │ - Format this file                                    │                │  │
+│  │      │ - Type-check this file                                │                │  │
+│  │      │ - Task compliance check                               │                │  │
+│  │      ▼                                                       │                │  │
+│  │   ┌──────┐                                                   │                │  │
+│  │   │ PASS?├──No──► DIRECT FEEDBACK (no Architect) ────────────┘                │  │
+│  │   └──┬───┘                                                                    │  │
+│  │      │ Yes                                                                    │  │
+│  │      ▼                                                       ┌────────────────┘  │
+│  │   Tester (task-specific)                                     │                   │
+│  │      │ - Generate tests for THIS requirement                 │                   │
+│  │      │ - Run tests for THIS task only                        │                   │
+│  │      ▼                                                       │                   │
+│  │   ┌──────┐                                                   │                   │
+│  │   │ PASS?├──No──► DIRECT FEEDBACK (no Architect) ────────────┘                   │
+│  │   └──┬───┘                                                                       │
+│  │      │ Yes                                                                       │
+│  │      ▼                                                                           │
+│  │   PIPELINE COMPLETE                                                              │
+│  │                                                                                  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                     │
+│  LEVEL 2: SESSION-WIDE (post-DAG, through Architect)                                │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                               │  │
+│  │   ALL Pipelines Complete                                                      │  │
+│  │      │                                                                        │  │
+│  │      ▼                                                                        │  │
+│  │   Orchestrator → Architect: "DAG execution done"                              │  │
+│  │      │                                                                        │  │
+│  │      ▼                                                                        │  │
+│  │   INSPECTOR (session-wide)                                                    │  │
+│  │      │ - Full scan of ALL changes together                                    │  │
+│  │      │ - Integration validation                                               │  │
+│  │      │ - Cross-cutting concerns (security, patterns)                          │  │
+│  │      │ - Codebase-wide compliance                                             │  │
+│  │      ▼                                                                        │  │
+│  │   ┌──────┐                                                                    │  │
+│  │   │ PASS?├──No──► Architect creates FIX DAG ──► New Pipelines ──► Loop        │  │
+│  │   └──┬───┘                                                                    │  │
+│  │      │ Yes                                                                    │  │
+│  │      ▼                                                                        │  │
+│  │   TESTER (session-wide)                                                       │  │
+│  │      │ - Full test suite (integration, regression, e2e)                       │  │
+│  │      │ - Cross-change validation                                              │  │
+│  │      │ - Tests affected by ANY change in DAG                                  │  │
+│  │      ▼                                                                        │  │
+│  │   ┌──────┐                                                                    │  │
+│  │   │ PASS?├──No──► Architect creates FIX DAG ──► New Pipelines ──► Loop        │  │
+│  │   └──┬───┘                                                                    │  │
+│  │      │ Yes                                                                    │  │
+│  │      ▼                                                                        │  │
+│  │   WORKFLOW COMPLETE → Architect → User                                        │  │
+│  │                                                                               │  │
+│  └──────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pipeline vs Session-Level QA Scope
+
+| Concern | Pipeline-Level | Session-Level |
+|---------|----------------|---------------|
+| **Scope** | Single task's changes | All DAG changes combined |
+| **Feedback routing** | Direct to Engineer | Through Architect |
+| **Creates new DAG?** | No (internal loop) | Yes (fix DAG) |
+| **Inspector focus** | File-level lint/format/types | Integration & cross-cutting |
+| **Tester focus** | Task-specific unit tests | Full suite, regression, e2e |
+| **User override** | `/task <id>` can ignore | `USER_OVERRIDE` message |
+
+### Pipeline Data Model
+
+```go
+// core/pipeline/pipeline.go
+
+type PipelineID string
+
+type PipelineState string
+
+const (
+    PipelineStateCreated    PipelineState = "created"
+    PipelineStateRunning    PipelineState = "running"
+    PipelineStateInspecting PipelineState = "inspecting"
+    PipelineStateTesting    PipelineState = "testing"
+    PipelineStateCompleted  PipelineState = "completed"
+    PipelineStateFailed     PipelineState = "failed"
+)
+
+// Pipeline is an isolated execution context containing Engineer + Inspector + Tester
+type Pipeline struct {
+    ID            PipelineID             `json:"id"`
+    SessionID     string                 `json:"session_id"`
+    DAGID         string                 `json:"dag_id"`
+    TaskID        string                 `json:"task_id"`
+
+    // State
+    State         PipelineState          `json:"state"`
+    CreatedAt     time.Time              `json:"created_at"`
+    CompletedAt   *time.Time             `json:"completed_at,omitempty"`
+
+    // Co-located agents (pipeline-scoped instances)
+    EngineerID    string                 `json:"engineer_id"`
+    InspectorID   string                 `json:"inspector_id"`
+    TesterID      string                 `json:"tester_id"`
+
+    // Task context (shared by all three agents)
+    Context       *PipelineContext       `json:"context"`
+
+    // Iteration tracking
+    InspectorLoops int                   `json:"inspector_loops"`
+    TesterLoops    int                   `json:"tester_loops"`
+    MaxLoops       int                   `json:"max_loops"`
+
+    // Results
+    EngineerResult  *EngineerResult      `json:"engineer_result,omitempty"`
+    InspectorResult *InspectorResult     `json:"inspector_result,omitempty"`
+    TesterResult    *TesterResult        `json:"tester_result,omitempty"`
+}
+
+// PipelineContext is shared state within a pipeline (all three agents can access)
+type PipelineContext struct {
+    // Task definition
+    TaskPrompt       string              `json:"task_prompt"`
+    TaskConstraints  []string            `json:"task_constraints,omitempty"`
+    ComplianceCriteria []string          `json:"compliance_criteria,omitempty"`
+
+    // Upstream context (from DAG dependencies)
+    UpstreamOutputs  map[string]any      `json:"upstream_outputs,omitempty"`
+
+    // Files touched by this pipeline
+    ModifiedFiles    []string            `json:"modified_files,omitempty"`
+    CreatedFiles     []string            `json:"created_files,omitempty"`
+
+    // Feedback history (for context in subsequent loops)
+    InspectorFeedback []InspectorFeedback `json:"inspector_feedback,omitempty"`
+    TesterFeedback    []TesterFeedback    `json:"tester_feedback,omitempty"`
+}
+
+// InspectorFeedback is direct feedback from Inspector to Engineer
+type InspectorFeedback struct {
+    Loop        int                     `json:"loop"`
+    Timestamp   time.Time               `json:"timestamp"`
+    Issues      []InspectorIssue        `json:"issues"`
+    Passed      bool                    `json:"passed"`
+}
+
+type InspectorIssue struct {
+    File        string                  `json:"file"`
+    Line        int                     `json:"line,omitempty"`
+    Category    string                  `json:"category"` // lint, format, type, compliance
+    Severity    string                  `json:"severity"` // error, warning
+    Message     string                  `json:"message"`
+    Suggestion  string                  `json:"suggestion,omitempty"`
+}
+
+// TesterFeedback is direct feedback from Tester to Engineer
+type TesterFeedback struct {
+    Loop        int                     `json:"loop"`
+    Timestamp   time.Time               `json:"timestamp"`
+    TestsRun    int                     `json:"tests_run"`
+    TestsPassed int                     `json:"tests_passed"`
+    Failures    []TestFailure           `json:"failures,omitempty"`
+    Passed      bool                    `json:"passed"`
+}
+
+type TestFailure struct {
+    TestName    string                  `json:"test_name"`
+    File        string                  `json:"file"`
+    Message     string                  `json:"message"`
+    Expected    string                  `json:"expected,omitempty"`
+    Actual      string                  `json:"actual,omitempty"`
+    StackTrace  string                  `json:"stack_trace,omitempty"`
+}
+```
+
+### Pipeline Internal Bus
+
+Pipelines use a dedicated internal bus for direct Engineer ↔ Inspector ↔ Tester communication that bypasses the Guide:
+
+```go
+// core/pipeline/bus.go
+
+// PipelineBus handles direct communication within a pipeline
+// This is NOT routed through Guide - it's pipeline-internal only
+type PipelineBus struct {
+    pipelineID PipelineID
+
+    // Direct feedback channels
+    inspectorToEngineer chan *InspectorFeedback
+    testerToEngineer    chan *TesterFeedback
+
+    // Control channels
+    engineerDone        chan *EngineerResult
+    inspectorDone       chan *InspectorResult
+    testerDone          chan *TesterResult
+
+    // Cancellation
+    ctx    context.Context
+    cancel context.CancelFunc
+
+    closed atomic.Bool
+}
+
+func NewPipelineBus(ctx context.Context, pipelineID PipelineID) *PipelineBus {
+    ctx, cancel := context.WithCancel(ctx)
+    return &PipelineBus{
+        pipelineID:          pipelineID,
+        inspectorToEngineer: make(chan *InspectorFeedback, 8),
+        testerToEngineer:    make(chan *TesterFeedback, 8),
+        engineerDone:        make(chan *EngineerResult, 1),
+        inspectorDone:       make(chan *InspectorResult, 1),
+        testerDone:          make(chan *TesterResult, 1),
+        ctx:                 ctx,
+        cancel:              cancel,
+    }
+}
+
+// SendInspectorFeedback sends feedback directly to Engineer (no Guide routing)
+func (b *PipelineBus) SendInspectorFeedback(feedback *InspectorFeedback) error {
+    if b.closed.Load() {
+        return ErrPipelineClosed
+    }
+    select {
+    case b.inspectorToEngineer <- feedback:
+        return nil
+    case <-b.ctx.Done():
+        return b.ctx.Err()
+    }
+}
+
+// SendTesterFeedback sends feedback directly to Engineer (no Guide routing)
+func (b *PipelineBus) SendTesterFeedback(feedback *TesterFeedback) error {
+    if b.closed.Load() {
+        return ErrPipelineClosed
+    }
+    select {
+    case b.testerToEngineer <- feedback:
+        return nil
+    case <-b.ctx.Done():
+        return b.ctx.Err()
+    }
+}
+```
+
+### Pipeline Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           PIPELINE LIFECYCLE                                         │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Orchestrator receives TASK_DISPATCH for engineer task                              │
+│      │                                                                              │
+│      ▼                                                                              │
+│  ┌──────────┐                                                                       │
+│  │ CREATED  │  Pipeline created with:                                               │
+│  │          │  - Engineer instance                                                  │
+│  └────┬─────┘  - Inspector instance (task-scoped)                                   │
+│       │        - Tester instance (task-scoped)                                      │
+│       │        - Shared PipelineContext                                             │
+│       │        - Internal PipelineBus                                               │
+│       ▼                                                                             │
+│  ┌──────────┐                                                                       │
+│  │ RUNNING  │  Engineer executes task                                               │
+│  │          │  - Reads/writes files                                                 │
+│  │          │  - Updates PipelineContext.ModifiedFiles                              │
+│  └────┬─────┘                                                                       │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌────────────┐                                                                     │
+│  │ INSPECTING │  Inspector validates Engineer's output                              │
+│  │            │  - Runs lint/format/type checks on ModifiedFiles                    │
+│  │            │  - Checks task compliance                                           │
+│  └────┬───────┘                                                                     │
+│       │                                                                             │
+│       ├── Issues found & loops < max ──► SendInspectorFeedback ──► RUNNING          │
+│       │                                                                             │
+│       ├── Issues found & loops >= max ──► User prompted (ignore/fail)               │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌──────────┐                                                                       │
+│  │ TESTING  │  Tester generates & runs task-specific tests                          │
+│  │          │  - Creates tests for THIS requirement                                 │
+│  │          │  - Runs only relevant tests                                           │
+│  └────┬─────┘                                                                       │
+│       │                                                                             │
+│       ├── Failures & loops < max ──► SendTesterFeedback ──► RUNNING                 │
+│       │                                                                             │
+│       ├── Failures & loops >= max ──► User prompted (ignore/fail)                   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌───────────┐                                                                      │
+│  │ COMPLETED │  Pipeline done, results sent to Orchestrator                         │
+│  └───────────┘                                                                      │
+│                                                                                     │
+│  At any point:                                                                      │
+│  ├── User /task <id> ──► Guide routes to Pipeline ──► Engineer receives             │
+│  ├── Unrecoverable error ──► FAILED                                                 │
+│  └── User cancellation ──► FAILED                                                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pipeline Manager
+
+```go
+// core/pipeline/manager.go
+
+type PipelineManager interface {
+    // Lifecycle
+    Create(ctx context.Context, cfg CreatePipelineConfig) (*Pipeline, error)
+    Start(ctx context.Context, id PipelineID) error
+    Cancel(ctx context.Context, id PipelineID) error
+
+    // Queries
+    Get(id PipelineID) (*Pipeline, bool)
+    GetBySession(sessionID string) []*Pipeline
+    GetByDAG(dagID string) []*Pipeline
+    GetActive() []*Pipeline
+
+    // User interaction (via Guide)
+    RouteUserMessage(pipelineID PipelineID, msg string) error
+
+    // Results
+    GetResult(id PipelineID) (*PipelineResult, error)
+
+    // Cleanup
+    CloseAll() error
+}
+
+type CreatePipelineConfig struct {
+    SessionID          string
+    DAGID              string
+    TaskID             string
+    TaskPrompt         string
+    TaskConstraints    []string
+    ComplianceCriteria []string
+    UpstreamOutputs    map[string]any
+    MaxLoops           int  // Default: 3
+}
+
+type PipelineResult struct {
+    PipelineID      PipelineID          `json:"pipeline_id"`
+    Success         bool                `json:"success"`
+    EngineerResult  *EngineerResult     `json:"engineer_result"`
+    InspectorResult *InspectorResult    `json:"inspector_result"`
+    TesterResult    *TesterResult       `json:"tester_result"`
+    ModifiedFiles   []string            `json:"modified_files"`
+    CreatedFiles    []string            `json:"created_files"`
+    LoopsUsed       int                 `json:"loops_used"`
+    Duration        time.Duration       `json:"duration"`
+}
+```
+
+### Guide Integration for /task Command
+
+The Guide routes user messages to specific pipelines via the `/task` command:
+
+```go
+// Guide skill for pipeline interaction
+{
+    Name:        "task_interact",
+    Description: "Route user message to a specific pipeline's engineer",
+    Domain:      "routing",
+    Keywords:    []string{"/task"},
+    Priority:    100,
+    Parameters: []Param{
+        {Name: "pipeline_id", Type: "string", Required: true, Description: "Pipeline ID or index"},
+        {Name: "action", Type: "enum", Values: []string{"prompt", "query", "interrupt", "ignore_inspector", "ignore_tester"}, Required: true},
+        {Name: "message", Type: "string", Required: false},
+    },
+}
+```
+
+User interaction examples:
+```
+/task 1 prompt "Focus on error handling first"     → Guide → Pipeline 1 → Engineer
+/task 2 query "What files have you modified?"      → Guide → Pipeline 2 → Engineer
+/task 1 interrupt                                  → Guide → Pipeline 1 → Pause
+/task 3 ignore_inspector                           → Guide → Pipeline 3 → Skip inspector loop
+/task 2 ignore_tester                              → Guide → Pipeline 2 → Skip tester loop
+```
+
+### Orchestrator Changes for Pipelines
+
+The Orchestrator's task dispatch now creates pipelines instead of bare engineers:
+
+```go
+// Before (current): Orchestrator spawns Engineer directly
+func (o *Orchestrator) dispatchTask(task *DAGNode) error {
+    engineer := o.engineerPool.Acquire()
+    result, err := engineer.Execute(task)
+    // ... handle result, report to Architect
+}
+
+// After (with pipelines): Orchestrator creates Pipeline
+func (o *Orchestrator) dispatchTask(task *DAGNode) error {
+    pipeline, err := o.pipelineManager.Create(ctx, CreatePipelineConfig{
+        SessionID:          task.SessionID,
+        DAGID:              task.DAGID,
+        TaskID:             task.ID,
+        TaskPrompt:         task.Prompt,
+        TaskConstraints:    task.Constraints,
+        ComplianceCriteria: task.ComplianceCriteria,
+        UpstreamOutputs:    o.gatherUpstreamOutputs(task),
+        MaxLoops:           3,
+    })
+    if err != nil {
+        return err
+    }
+
+    // Start pipeline (runs Engineer → Inspector → Tester loop internally)
+    if err := o.pipelineManager.Start(ctx, pipeline.ID); err != nil {
+        return err
+    }
+
+    // Wait for pipeline completion
+    result, err := o.pipelineManager.GetResult(pipeline.ID)
+    // ... handle result, report to Architect
+}
+```
+
+### Message Types
+
+New pipeline-internal messages (NOT routed through Guide):
+```
+INSPECTOR_FEEDBACK      Inspector → Engineer: task-specific issues (pipeline-internal)
+TESTER_FEEDBACK         Tester → Engineer: task-specific test failures (pipeline-internal)
+PIPELINE_COMPLETE       Pipeline → Orchestrator: all loops passed
+PIPELINE_FAILED         Pipeline → Orchestrator: max loops exceeded or error
+```
+
+Existing messages (unchanged - used for session-level QA):
+```
+INSPECTION_REQUEST      Architect → Inspector: validate ALL changes (session-wide)
+INSPECTION_RESULTS      Inspector → Architect: session-wide issues found
+TEST_PLAN_REQUEST       Architect → Tester: create test plan (session-wide)
+TEST_RESULTS            Tester → Architect: session-wide test results
+TEST_CORRECTIONS        Tester → Architect: impl fixes needed (creates fix DAG)
+```
+
+New Guide-routed messages:
+```
+USER_TASK_PROMPT        User → Guide → Pipeline: prompt specific engineer
+USER_TASK_QUERY         User → Guide → Pipeline: query specific engineer
+USER_TASK_INTERRUPT     User → Guide → Pipeline: interrupt pipeline
+USER_IGNORE_INSPECTOR   User → Guide → Pipeline: skip inspector for this pipeline
+USER_IGNORE_TESTER      User → Guide → Pipeline: skip tester for this pipeline
+```
+
+---
+
 ## Multi-Session Architecture
 
 ### Session Coordination
@@ -2596,8 +3073,7 @@ For multiple sessions operating on the same codebase:
 ### Guide and Bus
 - `agents/guide/guide.go`: Central routing, session-aware correlation
 - `agents/guide/bus.go`: Bus interface and topic constants
-- `agents/guide/channel_bus.go`: In-process bus
-- `agents/guide/scalable_bus.go`: High-throughput bus
+- `agents/guide/channel_bus.go`: In-process bus (sharded for multi-session scalability)
 
 ### Routing and Classification
 - `agents/guide/agent_router.go`: Tiered routing (DSL → cache → LLM)

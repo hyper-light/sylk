@@ -206,7 +206,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 	// Create hook registry
 	hookRegistry := skills.NewHookRegistry()
 
-	return &Guide{
+	guide := &Guide{
 		router:         router,
 		config:         cfg,
 		bus:            cfg.Bus,
@@ -227,7 +227,12 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		hooks:          hookRegistry,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
-	}, nil
+	}
+
+	guide.registerCoreSkills()
+	guide.registerExtendedSkills()
+
+	return guide, nil
 }
 
 // NewWithAPIKey creates a new Guide agent with an API key
@@ -1094,10 +1099,10 @@ func (g *Guide) GetRegisteredAgentAnnouncements() []*AgentAnnouncement {
 	for _, reg := range agents {
 		info := g.routing.GetRoutingInfo(reg.ID)
 		ann := &AgentAnnouncement{
-			AgentID:     reg.ID,
-			AgentName:   reg.Name,
-			Aliases:     reg.Aliases,
-			Description: reg.Description,
+			AgentID:      reg.ID,
+			AgentName:    reg.Name,
+			Aliases:      reg.Aliases,
+			Description:  reg.Description,
 			Capabilities: &reg.Capabilities,
 			Constraints:  &reg.Constraints,
 		}

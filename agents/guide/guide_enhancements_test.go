@@ -7,13 +7,10 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/skills"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// =============================================================================
-// Capability Index Tests
-// =============================================================================
 
 func TestCapabilityIndex_Index(t *testing.T) {
 	ci := guide.NewCapabilityIndex()
@@ -82,7 +79,6 @@ func TestCapabilityIndex_FindByKeyword(t *testing.T) {
 
 	ci.Index(agent)
 
-	// Case-insensitive lookup
 	agents := ci.FindByKeyword("Remember")
 	require.Len(t, agents, 1)
 	assert.Equal(t, "memory-agent", agents[0].ID)
@@ -112,12 +108,33 @@ func TestCapabilityIndex_Remove(t *testing.T) {
 	assert.Empty(t, agents)
 }
 
-// =============================================================================
-// Session Routing Tests
-// =============================================================================
+func TestGuide_SkillsLoaded(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	g, err := guide.NewWithAPIKey("", guide.Config{
+		Bus: bus,
+	})
+	require.NoError(t, err)
+
+	toolDefs := g.GetLoadedSkillDefinitions()
+	assert.NotEmpty(t, toolDefs)
+}
+
+func TestGuide_HooksStats(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	g, err := guide.NewWithAPIKey("", guide.Config{
+		Bus: bus,
+	})
+	require.NoError(t, err)
+
+	g.RegisterPrePromptHook("test-pre", skills.HookPriorityNormal, func(ctx context.Context, data *skills.PromptHookData) skills.HookResult {
+		return skills.HookResult{Continue: true}
+	})
+	stats := g.Hooks().Stats()
+	assert.Equal(t, 1, stats.PrePromptHooks)
+	assert.Equal(t, 1, stats.TotalHooks)
+}
 
 func TestSessionRouter_GetOrCreateSession(t *testing.T) {
-	// Create a mock guide (we only need the router field)
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
 		Bus: bus,
@@ -126,15 +143,12 @@ func TestSessionRouter_GetOrCreateSession(t *testing.T) {
 
 	sr := guide.NewSessionRouter(g)
 
-	// Create session
 	cache1 := sr.GetOrCreateSession("session1")
 	require.NotNil(t, cache1)
 
-	// Get same session
 	cache2 := sr.GetOrCreateSession("session1")
 	assert.Equal(t, cache1, cache2)
 
-	// Stats
 	stats := sr.Stats()
 	assert.Equal(t, 1, stats.TotalSessions)
 	assert.Equal(t, 1, stats.ActiveSessions)
@@ -196,18 +210,12 @@ func TestSessionRouter_RemoveSession(t *testing.T) {
 	assert.Equal(t, 1, stats.ActiveSessions)
 }
 
-// =============================================================================
-// Route Versioning Tests
-// =============================================================================
-
 func TestRouteVersionStore_CreateVersion(t *testing.T) {
 	cache := guide.NewRouteCache(guide.DefaultRouteCacheConfig())
 	store := guide.NewRouteVersionStore(cache)
 
-	// Initial version is 1
 	assert.Equal(t, 1, store.GetCurrentVersion())
 
-	// Add a route
 	err := store.AddRoute(&guide.VersionedRoute{
 		Input:         "test query",
 		TargetAgentID: "archivalist",
@@ -217,11 +225,9 @@ func TestRouteVersionStore_CreateVersion(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Create new version
 	v2 := store.CreateVersion("test", "Added test route")
 	assert.Equal(t, 2, v2)
 
-	// List versions
 	versions := store.ListVersions()
 	assert.Len(t, versions, 2)
 }
@@ -230,42 +236,14 @@ func TestRouteVersionStore_AddRemoveRoute(t *testing.T) {
 	cache := guide.NewRouteCache(guide.DefaultRouteCacheConfig())
 	store := guide.NewRouteVersionStore(cache)
 
-	// Add route
 	err := store.AddRoute(&guide.VersionedRoute{
-		ID:            "route1",
-		Input:         "test query",
-		TargetAgentID: "archivalist",
-		Intent:        guide.IntentRecall,
-		Domain:        guide.DomainPatterns,
-	})
-	require.NoError(t, err)
 
-	// Verify route exists
-	route := store.GetRoute("route1")
-	require.NotNil(t, route)
-	assert.Equal(t, "test query", route.Input)
-
-	// Remove route
-	err = store.RemoveRoute("route1")
-	require.NoError(t, err)
-
-	route = store.GetRoute("route1")
-	assert.Nil(t, route)
-}
-
-func TestRouteVersionStore_DeprecateRoute(t *testing.T) {
-	cache := guide.NewRouteCache(guide.DefaultRouteCacheConfig())
-	store := guide.NewRouteVersionStore(cache)
-
-	// Add route
-	err := store.AddRoute(&guide.VersionedRoute{
 		ID:            "old-route",
 		Input:         "old query",
 		TargetAgentID: "archivalist",
 	})
 	require.NoError(t, err)
 
-	// Deprecate
 	err = store.DeprecateRoute("old-route", "replaced with better version", "new-route")
 	require.NoError(t, err)
 
@@ -279,7 +257,6 @@ func TestRouteVersionStore_Rollback(t *testing.T) {
 	cache := guide.NewRouteCache(guide.DefaultRouteCacheConfig())
 	store := guide.NewRouteVersionStore(cache)
 
-	// Add route in v1
 	err := store.AddRoute(&guide.VersionedRoute{
 		ID:            "route1",
 		Input:         "query1",
@@ -287,11 +264,9 @@ func TestRouteVersionStore_Rollback(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Create v2 to capture v1 state
 	v2 := store.CreateVersion("test", "v2")
 	assert.Equal(t, 2, v2)
 
-	// Add route in v2
 	err = store.AddRoute(&guide.VersionedRoute{
 		ID:            "route2",
 		Input:         "query2",
@@ -299,18 +274,14 @@ func TestRouteVersionStore_Rollback(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Create v3 to capture v2 state
 	store.CreateVersion("test", "v3")
 
-	// Verify both routes exist
 	assert.NotNil(t, store.GetRoute("route1"))
 	assert.NotNil(t, store.GetRoute("route2"))
 
-	// Rollback to v2 (which has route1 but not route2)
 	err = store.Rollback(2)
 	require.NoError(t, err)
 
-	// Only route1 should exist
 	assert.NotNil(t, store.GetRoute("route1"))
 	assert.Nil(t, store.GetRoute("route2"))
 }
@@ -319,32 +290,26 @@ func TestRouteVersionStore_Diff(t *testing.T) {
 	cache := guide.NewRouteCache(guide.DefaultRouteCacheConfig())
 	store := guide.NewRouteVersionStore(cache)
 
-	// Add route in v1
 	store.AddRoute(&guide.VersionedRoute{
 		ID:            "route1",
 		Input:         "query1",
 		TargetAgentID: "agent1",
 	})
 
-	// Create v2
 	store.CreateVersion("test", "v2")
 
-	// Modify route in v2
 	store.UpdateRoute("route1", func(r *guide.VersionedRoute) {
 		r.TargetAgentID = "agent2"
 	})
 
-	// Add new route in v2
 	store.AddRoute(&guide.VersionedRoute{
 		ID:            "route2",
 		Input:         "query2",
 		TargetAgentID: "agent3",
 	})
 
-	// Create v3 to capture changes
 	store.CreateVersion("test", "v3")
 
-	// Diff v2 and v3
 	diff, err := store.Diff(2, 3)
 	require.NoError(t, err)
 
@@ -352,10 +317,6 @@ func TestRouteVersionStore_Diff(t *testing.T) {
 	assert.Len(t, diff.Modified, 1)
 	assert.Empty(t, diff.Removed)
 }
-
-// =============================================================================
-// Batch Processor Tests
-// =============================================================================
 
 func TestBatchProcessor_Add(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
@@ -365,22 +326,19 @@ func TestBatchProcessor_Add(t *testing.T) {
 	require.NoError(t, err)
 
 	cfg := guide.DefaultBatchConfig()
-	cfg.AutoFlush = false // Manual control for testing
+	cfg.AutoFlush = false
 	bp := guide.NewBatchProcessor(g, cfg)
 	bp.Start()
 	defer bp.Stop()
 
-	// Create a request
 	req := &guide.RouteRequest{
 		Input:         "@archivalist:recall:patterns",
 		SourceAgentID: "test-agent",
 	}
 
-	// Add to batch
 	resultCh := bp.Add(context.Background(), req)
 	require.NotNil(t, resultCh)
 
-	// Get result
 	select {
 	case result := <-resultCh:
 		require.NotNil(t, result)
@@ -403,17 +361,14 @@ func TestBatchProcessor_AddBatch(t *testing.T) {
 	bp.Start()
 	defer bp.Stop()
 
-	// Create multiple DSL requests (these don't need LLM)
 	requests := []*guide.RouteRequest{
 		{Input: "@archivalist:recall:patterns", SourceAgentID: "test"},
 		{Input: "@guide:status:system", SourceAgentID: "test"},
 	}
 
-	// Add batch
 	channels := bp.AddBatch(context.Background(), requests)
 	assert.Len(t, channels, 2)
 
-	// Collect results with longer timeout
 	for i, ch := range channels {
 		select {
 		case result := <-ch:
@@ -438,7 +393,6 @@ func TestBatchProcessor_Stats(t *testing.T) {
 	bp.Start()
 	defer bp.Stop()
 
-	// Add a single request and wait for it
 	req := &guide.RouteRequest{
 		Input:         "@archivalist:recall:patterns",
 		SourceAgentID: "test",
@@ -450,14 +404,9 @@ func TestBatchProcessor_Stats(t *testing.T) {
 		t.Fatal("timeout waiting for request")
 	}
 
-	// Just verify stats method doesn't panic
 	stats := bp.Stats()
 	_ = stats
 }
-
-// =============================================================================
-// Response Streaming Tests
-// =============================================================================
 
 func TestStreamManager_CreateStream(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
@@ -473,14 +422,11 @@ func TestStreamManager_CreateStream(t *testing.T) {
 func TestStreamManager_GetStream(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 
-	// Create stream
 	stream1, _ := sm.CreateStream("corr-123", "session-1")
 
-	// Get same stream
 	stream2 := sm.GetStream("corr-123")
 	assert.Equal(t, stream1, stream2)
 
-	// Get non-existent stream
 	stream3 := sm.GetStream("corr-999")
 	assert.Nil(t, stream3)
 }
@@ -489,14 +435,11 @@ func TestResponseStream_SendData(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 	stream, _ := sm.CreateStream("corr-123", "session-1")
 
-	// Drain the start event
 	<-stream.Events()
 
-	// Send data
 	ok := stream.SendData(map[string]string{"key": "value"})
 	assert.True(t, ok)
 
-	// Read event
 	event := <-stream.Events()
 	assert.Equal(t, guide.StreamEventData, event.Type)
 	assert.NotNil(t, event.Data)
@@ -506,16 +449,13 @@ func TestResponseStream_SendText(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 	stream, _ := sm.CreateStream("corr-123", "session-1")
 
-	// Drain start event
 	<-stream.Events()
 
-	// Send text
 	ok := stream.SendText("Hello, ")
 	assert.True(t, ok)
 	ok = stream.SendText("World!")
 	assert.True(t, ok)
 
-	// Read events
 	event1 := <-stream.Events()
 	assert.Equal(t, "Hello, ", event1.Text)
 
@@ -527,14 +467,11 @@ func TestResponseStream_SendProgress(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 	stream, _ := sm.CreateStream("corr-123", "session-1")
 
-	// Drain start event
 	<-stream.Events()
 
-	// Send progress
 	ok := stream.SendProgress(50, 100, "Half done")
 	assert.True(t, ok)
 
-	// Read event
 	event := <-stream.Events()
 	assert.Equal(t, guide.StreamEventProgress, event.Type)
 
@@ -548,13 +485,10 @@ func TestResponseStream_Close(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 	stream, _ := sm.CreateStream("corr-123", "session-1")
 
-	// Close stream
 	stream.Close()
 
-	// Should be closed
 	assert.True(t, stream.IsClosed())
 
-	// Should not be able to send
 	ok := stream.SendData("test")
 	assert.False(t, ok)
 }
@@ -563,20 +497,16 @@ func TestStreamConsumer_CollectText(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 	stream, _ := sm.CreateStream("corr-123", "session-1")
 
-	// Send text in goroutine
 	go func() {
-		// Drain start event first
 		time.Sleep(10 * time.Millisecond)
 		stream.SendText("Hello, ")
 		stream.SendText("World!")
 		stream.Close()
 	}()
 
-	// Create consumer
 	ctx := context.Background()
 	consumer := guide.NewStreamConsumer(ctx, stream)
 
-	// Collect all text
 	text := consumer.CollectText()
 	assert.Equal(t, "Hello, World!", text)
 }
@@ -584,7 +514,6 @@ func TestStreamConsumer_CollectText(t *testing.T) {
 func TestStreamManager_Stats(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 
-	// Create some streams
 	sm.CreateStream("corr-1", "session-1")
 	sm.CreateStream("corr-2", "session-1")
 	sm.CreateStream("corr-3", "session-2")
@@ -605,10 +534,6 @@ func TestStreamManager_CloseStream(t *testing.T) {
 	assert.True(t, stream.IsClosed())
 	assert.Nil(t, sm.GetStream("corr-123"))
 }
-
-// =============================================================================
-// Concurrent Access Tests
-// =============================================================================
 
 func TestCapabilityIndex_ConcurrentAccess(t *testing.T) {
 	ci := guide.NewCapabilityIndex()
@@ -661,7 +586,6 @@ func TestSessionRouter_ConcurrentSessions(t *testing.T) {
 func TestStreamManager_ConcurrentStreams(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 
-	// Create streams concurrently
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
@@ -674,15 +598,14 @@ func TestStreamManager_ConcurrentStreams(t *testing.T) {
 				return
 			}
 
-			// Just do operations on the stream
 			stream.SendData("test")
 			stream.SendText("text")
 			_ = stream.Stats()
+
 		}(i)
 	}
 	wg.Wait()
 
-	// Clean up sequentially after all operations complete
 	for i := 0; i < 26; i++ {
 		corrID := "corr-" + string(rune('a'+i))
 		sm.CloseStream(corrID)

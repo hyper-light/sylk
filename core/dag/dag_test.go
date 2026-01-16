@@ -13,14 +13,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// =============================================================================
-// Mock Dispatcher
-// =============================================================================
-
 type mockDispatcher struct {
-	mu           sync.Mutex
-	executed     []string
-	shouldFail   map[string]bool
+	mu            sync.Mutex
+	executed      []string
+	shouldFail    map[string]bool
+	failCounts    map[string]int
+	callCounts    map[string]int32
 	executionTime time.Duration
 }
 
@@ -28,13 +26,21 @@ func newMockDispatcher() *mockDispatcher {
 	return &mockDispatcher{
 		executed:   make([]string, 0),
 		shouldFail: make(map[string]bool),
+		failCounts: make(map[string]int),
+		callCounts: make(map[string]int32),
 	}
 }
 
 func (d *mockDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
 	d.mu.Lock()
 	d.executed = append(d.executed, node.ID())
+	d.callCounts[node.ID()]++
 	shouldFail := d.shouldFail[node.ID()]
+	remainingFailCount := d.failCounts[node.ID()]
+	if remainingFailCount > 0 {
+		d.failCounts[node.ID()] = remainingFailCount - 1
+		shouldFail = true
+	}
 	execTime := d.executionTime
 	d.mu.Unlock()
 
@@ -75,6 +81,18 @@ func (d *mockDispatcher) setFail(nodeID string) {
 	d.mu.Unlock()
 }
 
+func (d *mockDispatcher) setFailCount(nodeID string, count int) {
+	d.mu.Lock()
+	d.failCounts[nodeID] = count
+	d.mu.Unlock()
+}
+
+func (d *mockDispatcher) callCount(nodeID string) int32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.callCounts[nodeID]
+}
+
 func (d *mockDispatcher) getExecuted() []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -82,10 +100,6 @@ func (d *mockDispatcher) getExecuted() []string {
 	copy(result, d.executed)
 	return result
 }
-
-// =============================================================================
-// Node Tests
-// =============================================================================
 
 func TestNode_New(t *testing.T) {
 	node := dag.NewNode(dag.NodeConfig{
@@ -175,10 +189,6 @@ func TestNode_IsBlocked(t *testing.T) {
 	assert.True(t, node.IsBlocked(nodeStates))
 }
 
-// =============================================================================
-// DAG Tests
-// =============================================================================
-
 func TestDAG_New(t *testing.T) {
 	d := dag.NewDAG("test-dag", dag.DefaultExecutionPolicy())
 
@@ -246,10 +256,6 @@ func TestDAG_Builder(t *testing.T) {
 	assert.Equal(t, 2, d.NodeCount())
 	assert.True(t, d.IsValidated())
 }
-
-// =============================================================================
-// Validator Tests
-// =============================================================================
 
 func TestValidator_EmptyDAG(t *testing.T) {
 	d := dag.NewDAG("empty", dag.DefaultExecutionPolicy())
@@ -326,10 +332,6 @@ func TestValidator_PrioritySort(t *testing.T) {
 	// High priority should come first
 	assert.Equal(t, "high", order[0][0])
 }
-
-// =============================================================================
-// Executor Tests
-// =============================================================================
 
 func TestExecutor_SimpleDAG(t *testing.T) {
 	d, _ := dag.NewBuilder("simple").
@@ -584,10 +586,6 @@ func (d *concurrencyTrackingDispatcher) Dispatch(ctx context.Context, node *dag.
 	return d.inner.Dispatch(ctx, node, parentResults)
 }
 
-// =============================================================================
-// Scheduler Tests
-// =============================================================================
-
 func TestScheduler_Submit(t *testing.T) {
 	scheduler := dag.NewScheduler(dag.DefaultSchedulerConfig())
 	defer scheduler.Close()
@@ -656,9 +654,81 @@ func TestScheduler_ConcurrentDAGs(t *testing.T) {
 	assert.Equal(t, int32(5), atomic.LoadInt32(&completed))
 }
 
-// =============================================================================
-// Type Tests
-// =============================================================================
+func TestExecutor_RetryBackoff(t *testing.T) {
+	d, _ := dag.NewBuilder("retry").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+			DefaultRetries: 2,
+			RetryBackoff:   20 * time.Millisecond,
+		}).
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.setFailCount("node-1", 2)
+
+	executor := dag.NewExecutor(d.Policy())
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+
+	require.NoError(t, err)
+	assert.Equal(t, dag.DAGStateSucceeded, result.State)
+	assert.Equal(t, int32(3), dispatcher.callCount("node-1"))
+}
+
+func TestExecutor_Timeout(t *testing.T) {
+	d, _ := dag.NewBuilder("timeout").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+			DefaultTimeout: 30 * time.Millisecond,
+		}).
+		AddNode(dag.NodeConfig{ID: "slow"}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.executionTime = 100 * time.Millisecond
+
+	executor := dag.NewExecutor(d.Policy())
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+
+	require.NoError(t, err)
+	assert.Equal(t, dag.DAGStateFailed, result.State)
+	assert.GreaterOrEqual(t, result.NodesFailed, 1)
+}
+
+func TestExecutor_ConcurrentCancel(t *testing.T) {
+	d, _ := dag.NewBuilder("cancel-race").
+		WithPolicy(dag.ExecutionPolicy{
+			MaxConcurrency: 2,
+			DefaultTimeout: time.Second,
+		}).
+		AddNode(dag.NodeConfig{ID: "n1"}).
+		AddNode(dag.NodeConfig{ID: "n2"}).
+		AddNode(dag.NodeConfig{ID: "n3"}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.executionTime = 50 * time.Millisecond
+
+	executor := dag.NewExecutor(d.Policy())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_ = executor.Cancel()
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = executor.Execute(context.Background(), d, dispatcher)
+	}()
+
+	wg.Wait()
+	assert.NotNil(t, executor.Status())
+}
 
 func TestNodeState_String(t *testing.T) {
 	tests := []struct {

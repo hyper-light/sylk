@@ -13,10 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// =============================================================================
-// Priority Pool Tests
-// =============================================================================
-
 func TestPriorityPool_New(t *testing.T) {
 	p := pool.NewPriorityPool(pool.DefaultPriorityPoolConfig())
 	require.NotNil(t, p)
@@ -205,7 +201,6 @@ func TestPriorityPool_SubmitWithTimeout(t *testing.T) {
 	p.Start()
 	defer p.Stop()
 
-	// Block the worker
 	blockChan := make(chan struct{})
 	started := make(chan struct{})
 	p.Submit(&pool.PriorityJob{
@@ -219,10 +214,8 @@ func TestPriorityPool_SubmitWithTimeout(t *testing.T) {
 
 	<-started
 
-	// Fill queue
 	p.Submit(&pool.PriorityJob{ID: "q1", Execute: func(ctx context.Context) error { return nil }})
 
-	// This should timeout
 	result := p.SubmitWithTimeout(
 		&pool.PriorityJob{ID: "timeout", Execute: func(ctx context.Context) error { return nil }},
 		10*time.Millisecond,
@@ -232,9 +225,32 @@ func TestPriorityPool_SubmitWithTimeout(t *testing.T) {
 	close(blockChan)
 }
 
-// =============================================================================
-// Session Pool Tests
-// =============================================================================
+func TestPriorityPool_LatencyBuckets(t *testing.T) {
+	p := pool.NewPriorityPool(pool.PriorityPoolConfig{
+		NumWorkers:   1,
+		MaxQueueSize: 10,
+	})
+	p.Start()
+	defer p.Stop()
+
+	done := make(chan struct{})
+	p.Submit(&pool.PriorityJob{
+		ID:        "latency",
+		Priority:  pool.PriorityNormal,
+		CreatedAt: time.Now().Add(-30 * time.Millisecond),
+		Execute: func(ctx context.Context) error {
+			time.Sleep(15 * time.Millisecond)
+			close(done)
+			return nil
+		},
+	})
+
+	<-done
+
+	stats := p.Stats()
+	assert.NotEmpty(t, stats.WaitBuckets)
+	assert.NotEmpty(t, stats.RunBuckets)
+}
 
 func TestSessionPool_New(t *testing.T) {
 	p := pool.NewSessionPool(pool.DefaultSessionPoolConfig())
@@ -260,6 +276,7 @@ func TestSessionPool_Submit(t *testing.T) {
 		job := &pool.SessionJob{
 			ID:        "test",
 			SessionID: "session-1",
+			AgentType: "worker",
 			Execute: func(ctx context.Context) error {
 				atomic.AddInt32(&completed, 1)
 				wg.Done()
@@ -285,12 +302,12 @@ func TestSessionPool_FairDistribution(t *testing.T) {
 	var session1Count, session2Count int32
 	var wg sync.WaitGroup
 
-	// Submit jobs from two sessions
 	for i := 0; i < 20; i++ {
 		wg.Add(2)
 
 		p.Submit(&pool.SessionJob{
 			SessionID: "session-1",
+			AgentType: "worker",
 			Execute: func(ctx context.Context) error {
 				atomic.AddInt32(&session1Count, 1)
 				wg.Done()
@@ -300,6 +317,7 @@ func TestSessionPool_FairDistribution(t *testing.T) {
 
 		p.Submit(&pool.SessionJob{
 			SessionID: "session-2",
+			AgentType: "worker",
 			Execute: func(ctx context.Context) error {
 				atomic.AddInt32(&session2Count, 1)
 				wg.Done()
@@ -310,7 +328,6 @@ func TestSessionPool_FairDistribution(t *testing.T) {
 
 	wg.Wait()
 
-	// Both sessions should have jobs processed
 	assert.Equal(t, int32(20), atomic.LoadInt32(&session1Count))
 	assert.Equal(t, int32(20), atomic.LoadInt32(&session2Count))
 
@@ -327,11 +344,11 @@ func TestSessionPool_PerSessionLimit(t *testing.T) {
 	p.Start()
 	defer p.Stop()
 
-	// Block the worker
 	blockChan := make(chan struct{})
 	started := make(chan struct{})
 	p.Submit(&pool.SessionJob{
 		SessionID: "session-1",
+		AgentType: "worker",
 		Execute: func(ctx context.Context) error {
 			close(started)
 			<-blockChan
@@ -341,19 +358,87 @@ func TestSessionPool_PerSessionLimit(t *testing.T) {
 
 	<-started
 
-	// Fill session queue
-	p.Submit(&pool.SessionJob{SessionID: "session-1", Execute: func(ctx context.Context) error { return nil }})
-	p.Submit(&pool.SessionJob{SessionID: "session-1", Execute: func(ctx context.Context) error { return nil }})
+	p.Submit(&pool.SessionJob{SessionID: "session-1", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
+	p.Submit(&pool.SessionJob{SessionID: "session-1", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
 
-	// This should be dropped (per-session limit)
-	dropped := !p.Submit(&pool.SessionJob{SessionID: "session-1", Execute: func(ctx context.Context) error { return nil }})
+	dropped := !p.Submit(&pool.SessionJob{SessionID: "session-1", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
 	assert.True(t, dropped)
 
-	// But another session should still work
-	success := p.Submit(&pool.SessionJob{SessionID: "session-2", Execute: func(ctx context.Context) error { return nil }})
+	success := p.Submit(&pool.SessionJob{SessionID: "session-2", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
 	assert.True(t, success)
 
 	close(blockChan)
+}
+
+func TestSessionPool_MaxTotalJobs(t *testing.T) {
+	p := pool.NewSessionPool(pool.SessionPoolConfig{
+		NumWorkers:        1,
+		MaxJobsPerSession: 10,
+		MaxTotalJobs:      2,
+	})
+	p.Start()
+	defer p.Stop()
+
+	blockChan := make(chan struct{})
+	started := make(chan struct{})
+
+	p.Submit(&pool.SessionJob{
+		SessionID: "session-1",
+		AgentType: "worker",
+		Execute: func(ctx context.Context) error {
+			close(started)
+			<-blockChan
+			return nil
+		},
+	})
+
+	<-started
+
+	p.Submit(&pool.SessionJob{SessionID: "session-1", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
+
+	dropped := !p.Submit(&pool.SessionJob{SessionID: "session-2", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
+	assert.True(t, dropped)
+
+	close(blockChan)
+}
+
+func TestSessionPool_DynamicLimits(t *testing.T) {
+	p := pool.NewSessionPool(pool.SessionPoolConfig{
+		NumWorkers:           1,
+		MaxJobsPerSession:    1,
+		MaxTotalJobs:         2,
+		MaxJobsPerSessionMax: 3,
+		MaxTotalJobsMax:      6,
+		EnableDynamicLimits:  true,
+		AdjustInterval:       10 * time.Millisecond,
+	})
+	p.Start()
+	defer p.Stop()
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+
+	p.Submit(&pool.SessionJob{
+		SessionID: "session-1",
+		AgentType: "worker",
+		Execute: func(ctx context.Context) error {
+			close(started)
+			<-block
+			return nil
+		},
+	})
+
+	<-started
+
+	p.Submit(&pool.SessionJob{SessionID: "session-1", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
+
+	time.Sleep(30 * time.Millisecond)
+
+	stats := p.Stats()
+	assert.GreaterOrEqual(t, stats.MaxJobsPerSession, 1)
+	assert.GreaterOrEqual(t, stats.MaxTotalJobs, 2)
+
+	close(block)
 }
 
 func TestSessionPool_RemoveSession(t *testing.T) {
@@ -361,26 +446,98 @@ func TestSessionPool_RemoveSession(t *testing.T) {
 	p.Start()
 	defer p.Stop()
 
-	// Submit jobs for multiple sessions
-	p.Submit(&pool.SessionJob{SessionID: "session-1", Execute: func(ctx context.Context) error { return nil }})
-	p.Submit(&pool.SessionJob{SessionID: "session-2", Execute: func(ctx context.Context) error { return nil }})
-	p.Submit(&pool.SessionJob{SessionID: "session-3", Execute: func(ctx context.Context) error { return nil }})
+	p.Submit(&pool.SessionJob{SessionID: "session-1", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
+	p.Submit(&pool.SessionJob{SessionID: "session-2", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
+	p.Submit(&pool.SessionJob{SessionID: "session-3", AgentType: "worker", Execute: func(ctx context.Context) error { return nil }})
 
-	time.Sleep(50 * time.Millisecond) // Let jobs be processed
+	time.Sleep(50 * time.Millisecond)
 
 	ids := p.SessionIDs()
 	assert.Contains(t, ids, "session-1")
 
-	// Remove session
 	p.RemoveSession("session-1")
 
 	ids = p.SessionIDs()
 	assert.NotContains(t, ids, "session-1")
 }
 
-// =============================================================================
-// Fairness Controller Tests
-// =============================================================================
+func TestSessionPool_AgentLimits(t *testing.T) {
+	p := pool.NewSessionPool(pool.SessionPoolConfig{
+		NumWorkers:        1,
+		MaxJobsPerSession: 10,
+		MaxTotalJobs:      10,
+		MaxAgents:         map[string]int{"engineer": 1},
+	})
+	p.Start()
+	defer p.Stop()
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+
+	p.Submit(&pool.SessionJob{
+		SessionID: "session-1",
+		AgentType: "engineer",
+		Execute: func(ctx context.Context) error {
+			close(started)
+			<-block
+			return nil
+		},
+	})
+
+	<-started
+
+	dropped := !p.Submit(&pool.SessionJob{
+		SessionID: "session-1",
+		AgentType: "engineer",
+		Execute:   func(ctx context.Context) error { return nil },
+	})
+	assert.True(t, dropped)
+
+	stats := p.Stats()
+	assert.Equal(t, 1, stats.AgentStats["engineer"].Limit)
+	assert.Equal(t, 1, stats.AgentStats["engineer"].Running)
+
+	close(block)
+}
+
+func TestSessionPool_AgentLimitWithMultipleSessions(t *testing.T) {
+	p := pool.NewSessionPool(pool.SessionPoolConfig{
+		NumWorkers:        2,
+		MaxJobsPerSession: 10,
+		MaxTotalJobs:      10,
+		MaxAgents:         map[string]int{"engineer": 1},
+	})
+	p.Start()
+	defer p.Stop()
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+
+	p.Submit(&pool.SessionJob{
+		SessionID: "session-1",
+		AgentType: "engineer",
+		Execute: func(ctx context.Context) error {
+			close(started)
+			<-block
+			return nil
+		},
+	})
+
+	<-started
+
+	allowed := p.Submit(&pool.SessionJob{
+		SessionID: "session-2",
+		AgentType: "engineer",
+		Execute:   func(ctx context.Context) error { return nil },
+	})
+	assert.True(t, allowed)
+
+	stats := p.Stats()
+	assert.Equal(t, 1, stats.AgentStats["engineer"].Running)
+	assert.GreaterOrEqual(t, stats.AgentStats["engineer"].Queued, 1)
+
+	close(block)
+}
 
 func TestFairnessController_New(t *testing.T) {
 	fc := pool.NewFairnessController(pool.DefaultFairnessConfig())
@@ -521,10 +678,6 @@ func TestFairnessController_RemoveEntity(t *testing.T) {
 	assert.Equal(t, int64(0), stats.CurrentUsage)
 }
 
-// =============================================================================
-// Priority String Tests
-// =============================================================================
-
 func TestPriority_String(t *testing.T) {
 	tests := []struct {
 		priority pool.Priority
@@ -543,10 +696,6 @@ func TestPriority_String(t *testing.T) {
 		})
 	}
 }
-
-// =============================================================================
-// Concurrent Access Tests
-// =============================================================================
 
 func TestPriorityPool_ConcurrentSubmit(t *testing.T) {
 	p := pool.NewPriorityPool(pool.PriorityPoolConfig{
@@ -595,7 +744,6 @@ func TestSessionPool_ConcurrentSessions(t *testing.T) {
 	var completed int64
 	var wg sync.WaitGroup
 
-	// Submit from multiple sessions concurrently
 	for session := 0; session < 5; session++ {
 		sessionID := string(rune('A' + session))
 		wg.Add(1)
@@ -605,6 +753,7 @@ func TestSessionPool_ConcurrentSessions(t *testing.T) {
 				done := make(chan struct{})
 				p.Submit(&pool.SessionJob{
 					SessionID: sid,
+					AgentType: "worker",
 					Execute: func(ctx context.Context) error {
 						atomic.AddInt64(&completed, 1)
 						close(done)

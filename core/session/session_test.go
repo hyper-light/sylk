@@ -12,10 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// =============================================================================
-// Session Tests
-// =============================================================================
-
 func TestSession_New(t *testing.T) {
 	cfg := session.Config{
 		Name:        "test-session",
@@ -248,10 +244,6 @@ func TestSession_ConcurrentAccess(t *testing.T) {
 	// Should still be in valid state
 	assert.Equal(t, session.StateActive, s.State())
 }
-
-// =============================================================================
-// Session Manager Tests
-// =============================================================================
 
 func TestManager_Create(t *testing.T) {
 	mgr := session.NewManager(session.DefaultManagerConfig())
@@ -514,10 +506,6 @@ func TestManager_ConcurrentSessions(t *testing.T) {
 	assert.Equal(t, 50, mgr.Count())
 }
 
-// =============================================================================
-// Session Context Tests
-// =============================================================================
-
 func TestContext_Basic(t *testing.T) {
 	s := session.NewSession(session.DefaultConfig())
 	ctx := session.NewContext(s)
@@ -597,10 +585,6 @@ func TestContext_FromContext(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// =============================================================================
-// Persistence Tests
-// =============================================================================
-
 func TestMemoryPersister(t *testing.T) {
 	p := session.NewMemoryPersister()
 
@@ -650,25 +634,94 @@ func TestManager_WithPersistence(t *testing.T) {
 		Persister:   p,
 	})
 
-	// Create session with persistence enabled
 	s, err := mgr.Create(context.Background(), session.Config{
 		Name:               "persist-session",
 		PersistenceEnabled: true,
 	})
 	require.NoError(t, err)
 
-	// Activate and pause (triggers save)
 	mgr.Switch(s.ID())
 	mgr.Pause(s.ID())
 
-	// Verify persisted
 	ids, _ := p.List()
 	assert.Contains(t, ids, s.ID())
 }
 
-// =============================================================================
-// State Tests
-// =============================================================================
+func TestManager_SuspendRestoreWithPersistence(t *testing.T) {
+	p := session.NewMemoryPersister()
+
+	mgr := session.NewManager(session.ManagerConfig{
+		MaxSessions: 100,
+		Persister:   p,
+	})
+
+	s, err := mgr.Create(context.Background(), session.Config{
+		Name:               "suspend-session",
+		PersistenceEnabled: true,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, mgr.Switch(s.ID()))
+	require.NoError(t, mgr.Suspend(s.ID()))
+
+	mgr2 := session.NewManager(session.ManagerConfig{
+		MaxSessions: 100,
+		Persister:   p,
+	})
+
+	require.NoError(t, mgr2.Restore(s.ID()))
+	restored, ok := mgr2.Get(s.ID())
+	require.True(t, ok)
+	assert.Equal(t, session.StateActive, restored.State())
+}
+
+func TestManager_ConcurrentSwitchClose(t *testing.T) {
+	mgr := session.NewManager(session.ManagerConfig{
+		MaxSessions: 50,
+		NumShards:   16,
+	})
+
+	sessions := make([]*session.Session, 0, 10)
+	for i := 0; i < 10; i++ {
+		s, err := mgr.Create(context.Background(), session.DefaultConfig())
+		require.NoError(t, err)
+		sessions = append(sessions, s)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var counter uint64
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				idx := int(atomic.AddUint64(&counter, 1) % uint64(len(sessions)))
+				_ = mgr.Switch(sessions[idx].ID())
+			}
+		}()
+	}
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				idx := int(atomic.AddUint64(&counter, 1) % uint64(len(sessions)))
+				_ = mgr.Close(sessions[idx].ID())
+			}
+		}()
+	}
+
+	<-ctx.Done()
+	wg.Wait()
+
+	stats := mgr.Stats()
+	assert.LessOrEqual(t, stats.TotalSessions, 10)
+}
 
 func TestState_String(t *testing.T) {
 	tests := []struct {
@@ -717,10 +770,6 @@ func TestState_CanTransitionTo(t *testing.T) {
 	assert.False(t, session.StateCompleted.CanTransitionTo(session.StateActive))
 	assert.False(t, session.StateFailed.CanTransitionTo(session.StateActive))
 }
-
-// =============================================================================
-// Event Tests
-// =============================================================================
 
 func TestEventType_String(t *testing.T) {
 	assert.Equal(t, "created", session.EventCreated.String())

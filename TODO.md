@@ -847,8 +847,7 @@ Extend event bus for session-scoped topics and wildcards.
 
 **Files to modify:**
 - `agents/guide/bus.go`
-- `agents/guide/channel_bus.go`
-- `agents/guide/scalable_bus.go`
+- `agents/guide/channel_bus.go` (add sharding)
 
 **Files to create:**
 - `agents/guide/topic_router.go`
@@ -877,10 +876,61 @@ Extend event bus for session-scoped topics and wildcards.
 - [ ] Auto-prefix topics with session ID
 - [ ] Session-scoped subscriptions (auto-cleanup)
 
+#### ChannelBus Sharding (`agents/guide/channel_bus.go`)
+
+**Current Problem:** Single `sync.RWMutex` creates lock contention with many topics/sessions.
+
+**Required Changes:**
+- [ ] Replace single `subscriptions map[string][]*channelSubscription` with sharded structure
+- [ ] Configurable shard count (default: 32, must be power of 2)
+- [ ] Topic-to-shard mapping via FNV hash
+- [ ] Per-shard mutex (eliminates single-lock bottleneck)
+- [ ] Backwards compatible - same `EventBus` interface
+
+```go
+// BEFORE (current)
+type ChannelBus struct {
+    mu            sync.RWMutex
+    subscriptions map[string][]*channelSubscription  // Single lock bottleneck
+    // ...
+}
+
+// AFTER (sharded)
+type ChannelBus struct {
+    shards    []*busShard
+    shardMask uint32  // shardCount - 1 for fast modulo
+    // ...
+}
+
+type busShard struct {
+    mu            sync.RWMutex
+    subscriptions map[string][]*channelSubscription
+}
+
+func (b *ChannelBus) getShard(topic string) *busShard {
+    h := fnv32a(topic)
+    return b.shards[h & b.shardMask]
+}
+
+// Publish now only locks one shard
+func (b *ChannelBus) Publish(topic string, msg *Message) error {
+    shard := b.getShard(topic)
+    shard.mu.RLock()
+    subs := shard.subscriptions[topic]
+    shard.mu.RUnlock()
+    // ...
+}
+```
+
+- [ ] Benchmark: 32 shards with 1000 topics should show < 10% lock contention
+- [ ] Benchmark: Linear scaling up to shard count concurrent publishers
+
 **Tests:**
 - [ ] Publish/subscribe with session topics
 - [ ] Wildcard subscription matching
 - [ ] Message filtering by session
+- [ ] Concurrent publish across shards (verify no single-lock bottleneck)
+- [ ] 100+ topics distributed across shards
 
 ---
 
@@ -1950,12 +2000,19 @@ Executes DAG workflows, manages Engineers.
 #### DAG Execution
 - [ ] Accept DAG from Architect via bus
 - [ ] Use DAGExecutor from Phase 0.2
-- [ ] Dispatch nodes to Engineers via Guide (not direct)
+- [ ] **Create Pipelines for engineer tasks** (not bare Engineers) - see Phase 2.3
 - [ ] Correlate responses by correlation ID
 - [ ] Track node state and timing
 
-#### Engineer Management
-- [ ] Create Engineers on demand (up to limit)
+#### Pipeline Management (replaces direct Engineer management)
+- [ ] **Create Pipeline for each engineer task** (contains Engineer + Inspector + Tester)
+- [ ] Use PipelineManager from Phase 2.3
+- [ ] Wait for PIPELINE_COMPLETE or PIPELINE_FAILED
+- [ ] Aggregate pipeline results for DAG node completion
+- [ ] Session-scoped pipeline tracking
+
+#### Engineer Management (for non-pipeline tasks)
+- [ ] Create Engineers on demand for non-code tasks (research, context gathering)
 - [ ] Pool Engineers for reuse
 - [ ] Destroy idle Engineers after timeout
 - [ ] Session-scoped Engineer pool
@@ -1966,11 +2023,18 @@ Executes DAG workflows, manages Engineers.
 - [ ] Overall DAG progress (layers completed / total)
 - [ ] Estimated time remaining
 
-#### Quality Loop
-- [ ] Per-task validation: send to Inspector after each task
-- [ ] Full validation: signal Inspector when DAG complete
-- [ ] Test signal: signal Tester when ready for testing
-- [ ] Handle corrections from Inspector/Tester
+#### Quality Loop (Two-Level)
+
+**Level 1: Pipeline-Internal (handled within Pipeline - see Phase 2.3)**
+- [ ] Pipeline handles per-task Inspector validation internally
+- [ ] Pipeline handles per-task Tester validation internally
+- [ ] Direct feedback loops within pipeline (no Architect involvement)
+
+**Level 2: Session-Wide (after all Pipelines complete)**
+- [ ] Full validation: signal Inspector when ALL pipelines complete
+- [ ] Full test suite: signal Tester when Inspector passes
+- [ ] Handle corrections from session-wide Inspector/Tester via Architect
+- [ ] Architect creates FIX DAG for session-wide issues → new Pipelines
 
 #### Clarification Routing
 - [ ] Engineer help requests → Architect
@@ -2167,6 +2231,166 @@ var OrchestratorTools = []ToolDefinition{
 - [ ] Test Engineer pool management
 - [ ] Test clarification routing
 - [ ] Test cancellation
+
+### 2.3 Pipeline Infrastructure
+
+Isolated execution contexts containing Engineer + Inspector + Tester with direct feedback loops.
+
+**CRITICAL**: Pipelines enable TWO-LEVEL quality assurance:
+1. **Pipeline-internal (task-specific)**: Direct Engineer ↔ Inspector ↔ Tester feedback loops
+2. **Session-wide (post-DAG)**: Full validation through Architect after all pipelines complete
+
+**Files to create:**
+- `core/pipeline/types.go`
+- `core/pipeline/pipeline.go`
+- `core/pipeline/bus.go`
+- `core/pipeline/manager.go`
+- `core/pipeline/lifecycle.go`
+- `core/pipeline/pipeline_test.go`
+
+**Dependencies**: Phase 2.1 (Engineer), Phase 2.2 (Orchestrator)
+
+**Acceptance Criteria:**
+
+#### Pipeline Data Model (`core/pipeline/types.go`)
+- [ ] `PipelineID` type with unique generation
+- [ ] `PipelineState` enum: `Created`, `Running`, `Inspecting`, `Testing`, `Completed`, `Failed`
+- [ ] `Pipeline` struct with:
+  - [ ] ID, SessionID, DAGID, TaskID
+  - [ ] State, CreatedAt, CompletedAt
+  - [ ] EngineerID, InspectorID, TesterID (co-located instances)
+  - [ ] `PipelineContext` (shared by all three agents)
+  - [ ] InspectorLoops, TesterLoops, MaxLoops counters
+  - [ ] EngineerResult, InspectorResult, TesterResult
+- [ ] `PipelineContext` struct with:
+  - [ ] TaskPrompt, TaskConstraints, ComplianceCriteria
+  - [ ] UpstreamOutputs (from DAG dependencies)
+  - [ ] ModifiedFiles, CreatedFiles (tracked by pipeline)
+  - [ ] InspectorFeedback history, TesterFeedback history
+- [ ] `InspectorFeedback` struct with Loop, Timestamp, Issues, Passed
+- [ ] `InspectorIssue` struct with File, Line, Category, Severity, Message, Suggestion
+- [ ] `TesterFeedback` struct with Loop, Timestamp, TestsRun, TestsPassed, Failures, Passed
+- [ ] `TestFailure` struct with TestName, File, Message, Expected, Actual, StackTrace
+
+#### Pipeline Internal Bus (`core/pipeline/bus.go`)
+- [ ] `PipelineBus` struct for direct communication (NOT routed through Guide)
+- [ ] Channels: inspectorToEngineer, testerToEngineer
+- [ ] Channels: engineerDone, inspectorDone, testerDone
+- [ ] `SendInspectorFeedback()` - direct to Engineer, bypasses Guide
+- [ ] `SendTesterFeedback()` - direct to Engineer, bypasses Guide
+- [ ] Context-based cancellation
+- [ ] Graceful shutdown
+
+```go
+type PipelineBus struct {
+    pipelineID          PipelineID
+    inspectorToEngineer chan *InspectorFeedback
+    testerToEngineer    chan *TesterFeedback
+    engineerDone        chan *EngineerResult
+    inspectorDone       chan *InspectorResult
+    testerDone          chan *TesterResult
+    ctx                 context.Context
+    cancel              context.CancelFunc
+    closed              atomic.Bool
+}
+```
+
+#### Pipeline Lifecycle (`core/pipeline/lifecycle.go`)
+- [ ] State machine: Created → Running → Inspecting → Testing → Completed
+- [ ] State machine: Any state → Failed (on error or max loops exceeded)
+- [ ] Engineer execution phase
+- [ ] Inspector validation phase with direct feedback loop
+- [ ] Tester validation phase with direct feedback loop
+- [ ] Max loops enforcement (default: 3)
+- [ ] User override handling (`/task <id> ignore_inspector`, `/task <id> ignore_tester`)
+
+```
+Pipeline Lifecycle:
+  CREATED → RUNNING (Engineer executes)
+          → INSPECTING (Inspector validates)
+            ├── Issues + loops < max → RUNNING (direct feedback)
+            ├── Issues + loops >= max → User prompted
+            └── Pass → TESTING (Tester runs)
+                       ├── Failures + loops < max → RUNNING (direct feedback)
+                       ├── Failures + loops >= max → User prompted
+                       └── Pass → COMPLETED
+```
+
+#### Pipeline Manager (`core/pipeline/manager.go`)
+- [ ] `PipelineManager` interface with Create, Start, Cancel
+- [ ] `PipelineManager` interface with Get, GetBySession, GetByDAG, GetActive
+- [ ] `PipelineManager` interface with RouteUserMessage (for /task command)
+- [ ] `PipelineManager` interface with GetResult, CloseAll
+- [ ] `CreatePipelineConfig` with SessionID, DAGID, TaskID, TaskPrompt, TaskConstraints, ComplianceCriteria, UpstreamOutputs, MaxLoops
+- [ ] `PipelineResult` with PipelineID, Success, EngineerResult, InspectorResult, TesterResult, ModifiedFiles, CreatedFiles, LoopsUsed, Duration
+- [ ] Concurrent pipeline execution within session
+- [ ] Pipeline-scoped resource allocation
+
+```go
+type PipelineManager interface {
+    Create(ctx context.Context, cfg CreatePipelineConfig) (*Pipeline, error)
+    Start(ctx context.Context, id PipelineID) error
+    Cancel(ctx context.Context, id PipelineID) error
+    Get(id PipelineID) (*Pipeline, bool)
+    GetBySession(sessionID string) []*Pipeline
+    GetByDAG(dagID string) []*Pipeline
+    GetActive() []*Pipeline
+    RouteUserMessage(pipelineID PipelineID, msg string) error
+    GetResult(id PipelineID) (*PipelineResult, error)
+    CloseAll() error
+}
+```
+
+#### Guide Integration for /task Command
+- [ ] New Guide skill: `task_interact` for routing to specific pipelines
+- [ ] Actions: prompt, query, interrupt, ignore_inspector, ignore_tester
+- [ ] Route user messages through Guide to Pipeline to Engineer
+- [ ] Support pipeline ID or index for identification
+
+```go
+// Guide skill for pipeline interaction
+skills.NewSkill("task_interact").
+    Description("Route user message to a specific pipeline's engineer").
+    Domain("routing").
+    Keywords("/task", "pipeline", "engineer").
+    StringParam("pipeline_id", "Pipeline ID or index", true).
+    EnumParam("action", "Action type", []string{"prompt", "query", "interrupt", "ignore_inspector", "ignore_tester"}, true).
+    StringParam("message", "Message content (for prompt/query)", false)
+
+// Usage examples:
+// /task 1 prompt "Focus on error handling first"
+// /task 2 query "What files have you modified?"
+// /task 1 interrupt
+// /task 3 ignore_inspector
+// /task 2 ignore_tester
+```
+
+#### Message Types (Pipeline-Specific)
+- [ ] `INSPECTOR_FEEDBACK` - Inspector → Engineer (pipeline-internal, NOT through Guide)
+- [ ] `TESTER_FEEDBACK` - Tester → Engineer (pipeline-internal, NOT through Guide)
+- [ ] `PIPELINE_COMPLETE` - Pipeline → Orchestrator
+- [ ] `PIPELINE_FAILED` - Pipeline → Orchestrator
+- [ ] `USER_TASK_PROMPT` - User → Guide → Pipeline (through Guide)
+- [ ] `USER_TASK_QUERY` - User → Guide → Pipeline (through Guide)
+- [ ] `USER_TASK_INTERRUPT` - User → Guide → Pipeline (through Guide)
+- [ ] `USER_IGNORE_INSPECTOR` - User → Guide → Pipeline (through Guide)
+- [ ] `USER_IGNORE_TESTER` - User → Guide → Pipeline (through Guide)
+
+#### Session Context Updates
+- [ ] Add `ActivePipelines map[string]*PipelineState` to SessionContext
+- [ ] Pipeline state visible in session status
+- [ ] Pipeline cleanup on session close
+
+**Tests:**
+- [ ] Create pipeline, verify all three agents instantiated
+- [ ] Execute pipeline, verify Engineer → Inspector → Tester flow
+- [ ] Test Inspector feedback loop (issue → fix → re-validate)
+- [ ] Test Tester feedback loop (failure → fix → re-test)
+- [ ] Test max loops enforcement
+- [ ] Test /task command routing through Guide
+- [ ] Test user override (ignore_inspector, ignore_tester)
+- [ ] Test concurrent pipelines within session
+- [ ] Test pipeline cancellation
 
 ---
 
@@ -2471,6 +2695,10 @@ var ArchitectTools = []ToolDefinition{
 
 Validates code quality and implementation correctness.
 
+**CRITICAL**: Inspector operates in TWO modes:
+1. **Pipeline-internal mode**: Task-specific validation within a Pipeline, direct feedback to Engineer
+2. **Session-wide mode**: Full validation after all Pipelines complete, feedback through Architect
+
 **Files to create:**
 - `agents/inspector/types.go`
 - `agents/inspector/validators.go`
@@ -2482,11 +2710,47 @@ Validates code quality and implementation correctness.
 - `agents/inspector/skills.go`
 - `agents/inspector/tools.go`
 - `agents/inspector/hooks.go`
+- `agents/inspector/pipeline_mode.go` (NEW - pipeline-internal validation)
 - `agents/inspector/inspector_test.go`
 
 **Acceptance Criteria:**
 
-#### Per-Task Validation
+#### Dual-Mode Operation
+- [ ] `InspectorMode` enum: `PipelineInternal`, `SessionWide`
+- [ ] Pipeline-internal: receive from PipelineBus, send feedback directly to Engineer
+- [ ] Session-wide: receive from Guide/Bus, send corrections through Architect
+- [ ] Mode determined by instantiation context (Pipeline vs standalone)
+
+#### Pipeline-Internal Mode (`pipeline_mode.go`)
+- [ ] Receive task result from PipelineBus (not Guide)
+- [ ] Run task-specific validation (lint, format, type-check on modified files only)
+- [ ] Check task compliance criteria from PipelineContext
+- [ ] Send `InspectorFeedback` directly to Engineer via PipelineBus
+- [ ] NO routing through Guide or Architect
+- [ ] Quick validation (< 5 seconds per task)
+
+```go
+// Pipeline-internal validation flow
+func (i *Inspector) ValidateInPipeline(ctx context.Context, bus *PipelineBus, result *EngineerResult) (*InspectorFeedback, error) {
+    // Validate only the files modified by this task
+    issues := i.validateFiles(result.ModifiedFiles)
+
+    // Check task-specific compliance
+    compliance := i.checkCompliance(result, bus.Context().ComplianceCriteria)
+
+    feedback := &InspectorFeedback{
+        Loop:      bus.Context().InspectorLoops,
+        Timestamp: time.Now(),
+        Issues:    append(issues, compliance...),
+        Passed:    len(issues) == 0 && len(compliance) == 0,
+    }
+
+    // Send directly to Engineer (NOT through Guide)
+    return feedback, bus.SendInspectorFeedback(feedback)
+}
+```
+
+#### Per-Task Validation (Session-Wide Mode)
 - [ ] Naming conventions check
 - [ ] File organization check
 - [ ] Import ordering check
