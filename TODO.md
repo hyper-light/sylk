@@ -5473,3 +5473,1409 @@ Before marking a phase complete:
 - Archivalist stores all workflow history for future reference
 - Cross-session queries are read-only
 - Use existing patterns from Guide and Archivalist as templates
+
+---
+
+## Phase 6: VectorGraphDB Implementation
+
+**Goal**: Build a unified embedded database combining vector similarity search with graph-based structural queries across all three domains (Code, History, Academic).
+
+**Dependencies**: Phase 0 (Session Manager), Phase 1 (Knowledge Agents - particularly Archivalist and Librarian foundations)
+
+**Parallelization**: Items 6.1-6.4 can execute in parallel. Items 6.5-6.11 (mitigations) can execute in parallel after 6.1-6.4. Item 6.12 requires all prior items.
+
+---
+
+### 6.1 SQLite Schema & Core Types
+
+Creates the database schema and type definitions for the VectorGraphDB.
+
+**Files to create:**
+- `core/vectorgraphdb/schema.sql`
+- `core/vectorgraphdb/types.go`
+- `core/vectorgraphdb/constants.go`
+- `core/vectorgraphdb/db.go`
+- `core/vectorgraphdb/db_test.go`
+
+**Acceptance Criteria:**
+
+#### Schema Creation
+- [ ] Create `nodes` table with: id, domain, node_type, content_hash, metadata (JSON), created_at, updated_at, accessed_at
+- [ ] Create `edges` table with: id, from_node_id, to_node_id, edge_type, weight, metadata (JSON), created_at
+- [ ] Create `vectors` table with: id, node_id, embedding (BLOB - 768 float32s packed), magnitude, model_version
+- [ ] Create `provenance` table with: id, node_id, source_type, source_id, confidence, verified_at, verifier
+- [ ] Create `conflicts` table with: id, node_a_id, node_b_id, conflict_type, detected_at, resolution, resolved_at
+- [ ] Create `hnsw_graph` table with: id, node_id, layer, neighbors (JSON array)
+- [ ] Create `hnsw_metadata` table with: id, entry_point, max_level, M, ef_construct
+- [ ] Create all required indexes for efficient querying
+- [ ] Enable WAL mode for concurrent read/write
+- [ ] Create migration support for schema versioning
+
+#### Type Definitions
+- [ ] Define `Domain` type with constants: `DomainCode`, `DomainHistory`, `DomainAcademic`
+- [ ] Define `NodeType` type with all node types per domain:
+  - Code: `NodeTypeFile`, `NodeTypeFunction`, `NodeTypeType`, `NodeTypePackage`, `NodeTypeImport`
+  - History: `NodeTypeSession`, `NodeTypeDecision`, `NodeTypeFailure`, `NodeTypePattern`, `NodeTypeWorkflow`
+  - Academic: `NodeTypeRepo`, `NodeTypeDoc`, `NodeTypeArticle`, `NodeTypeConcept`, `NodeTypeBestPractice`
+- [ ] Define `EdgeType` type with all edge types:
+  - Structural: `EdgeTypeCalls`, `EdgeTypeImports`, `EdgeTypeDefines`, `EdgeTypeImplements`, `EdgeTypeContains`
+  - Temporal: `EdgeTypeFollows`, `EdgeTypeCauses`, `EdgeTypeResolves`
+  - Cross-domain: `EdgeTypeReferences`, `EdgeTypeAppliesTo`, `EdgeTypeDocuments`, `EdgeTypeModified`
+- [ ] Define `GraphNode` struct with all fields
+- [ ] Define `GraphEdge` struct with all fields
+- [ ] Define `VectorData` struct for embedding storage
+- [ ] Define `Provenance` struct for source tracking
+- [ ] Define `Conflict` struct for contradiction detection
+
+#### Database Operations
+- [ ] Implement `Open(path string) (*VectorGraphDB, error)`
+- [ ] Implement `Close() error`
+- [ ] Implement `Migrate() error` for schema migrations
+- [ ] Implement `Vacuum() error` for database compaction
+- [ ] Implement `Stats() (*DBStats, error)` for metrics
+
+**Tests:**
+- [ ] Schema creation succeeds on fresh database
+- [ ] Migrations apply correctly
+- [ ] Concurrent read/write operations succeed (WAL mode)
+- [ ] Foreign key constraints enforced
+- [ ] Index performance verified with EXPLAIN QUERY PLAN
+
+```go
+// Required types
+type Domain string
+const (
+    DomainCode     Domain = "code"
+    DomainHistory  Domain = "history"
+    DomainAcademic Domain = "academic"
+)
+
+type NodeType string
+// ... (full list per domain)
+
+type EdgeType string
+// ... (full list)
+
+type GraphNode struct {
+    ID          string            `json:"id"`
+    Domain      Domain            `json:"domain"`
+    NodeType    NodeType          `json:"node_type"`
+    ContentHash string            `json:"content_hash"`
+    Metadata    map[string]any    `json:"metadata"`
+    CreatedAt   time.Time         `json:"created_at"`
+    UpdatedAt   time.Time         `json:"updated_at"`
+    AccessedAt  time.Time         `json:"accessed_at"`
+}
+```
+
+---
+
+### 6.2 HNSW Index Implementation
+
+Implements Hierarchical Navigable Small World index for O(log n) approximate nearest neighbor search in pure Go.
+
+**Files to create:**
+- `core/vectorgraphdb/hnsw/index.go`
+- `core/vectorgraphdb/hnsw/layer.go`
+- `core/vectorgraphdb/hnsw/distance.go`
+- `core/vectorgraphdb/hnsw/persistence.go`
+- `core/vectorgraphdb/hnsw/hnsw_test.go`
+
+**Acceptance Criteria:**
+
+#### Index Structure
+- [ ] Implement multi-layer graph structure with exponential decay
+- [ ] Store vectors with magnitudes for fast cosine similarity
+- [ ] Track domain and node type per vector for filtered search
+- [ ] Thread-safe with RWMutex for concurrent operations
+- [ ] Configurable parameters: M (connections per node), efConstruction, efSearch
+
+#### Insert Operation
+- [ ] Random level assignment using exponential distribution: `floor(-log(rand) * levelMult)`
+- [ ] Search for neighbors at each layer during insertion
+- [ ] Connect to M best neighbors per layer
+- [ ] Update entry point if new node has higher level
+- [ ] Handle insertions with existing ID (update vector)
+
+#### Search Operation
+- [ ] Start from entry point at top layer
+- [ ] Greedy search descending through layers
+- [ ] Expand search at layer 0 with efSearch candidates
+- [ ] Return top-k results sorted by similarity
+- [ ] Support filtered search by domain and node type
+- [ ] Support multi-domain search with result merging
+
+#### Distance Functions
+- [ ] Implement cosine similarity: `dot(a,b) / (mag(a) * mag(b))`
+- [ ] Pre-compute magnitudes on insert for performance
+- [ ] SIMD-optimized dot product (optional, fallback to scalar)
+
+#### Persistence
+- [ ] Save index to SQLite tables (hnsw_graph, hnsw_metadata)
+- [ ] Load index from SQLite on startup
+- [ ] Incremental save support (only changed nodes)
+- [ ] Atomic save with transaction
+
+#### Performance Requirements
+- [ ] Insert: < 1ms for index with < 100K nodes
+- [ ] Search: < 5ms for k=10 on index with < 100K nodes
+- [ ] Memory: ~100 bytes per node overhead (connections + metadata)
+
+**Tests:**
+- [ ] Insert 10K random vectors, verify all retrievable
+- [ ] Search returns correct nearest neighbors (vs brute force)
+- [ ] Filtered search respects domain constraints
+- [ ] Concurrent insert/search operations (race detector)
+- [ ] Persistence: save, reload, verify identical results
+- [ ] Performance benchmarks for insert and search
+
+```go
+// Required interface
+type HNSWIndex struct {
+    mu          sync.RWMutex
+    layers      []map[string][]string  // layer -> nodeID -> neighbor IDs
+    vectors     map[string][]float32   // nodeID -> embedding
+    magnitudes  map[string]float64     // nodeID -> pre-computed magnitude
+    domains     map[string]Domain      // nodeID -> domain
+    nodeTypes   map[string]NodeType    // nodeID -> node type
+    M           int                    // max connections per node per layer
+    efConstruct int                    // construction search width
+    efSearch    int                    // search width
+    levelMult   float64                // level generation multiplier
+    maxLevel    int                    // current max level
+    entryPoint  string                 // entry node ID
+}
+
+func (h *HNSWIndex) Insert(id string, vector []float32, domain Domain, nodeType NodeType) error
+func (h *HNSWIndex) Search(query []float32, k int, filter *SearchFilter) []SearchResult
+func (h *HNSWIndex) Delete(id string) error
+func (h *HNSWIndex) Save(db *sql.DB) error
+func (h *HNSWIndex) Load(db *sql.DB) error
+```
+
+---
+
+### 6.3 Node & Edge Management
+
+Implements CRUD operations for nodes and edges with cross-domain support.
+
+**Files to create:**
+- `core/vectorgraphdb/nodes.go`
+- `core/vectorgraphdb/edges.go`
+- `core/vectorgraphdb/batch.go`
+- `core/vectorgraphdb/nodes_test.go`
+- `core/vectorgraphdb/edges_test.go`
+
+**Acceptance Criteria:**
+
+#### Node Operations
+- [ ] `InsertNode(node *GraphNode, embedding []float32) error`
+- [ ] `GetNode(id string) (*GraphNode, error)`
+- [ ] `UpdateNode(node *GraphNode) error`
+- [ ] `DeleteNode(id string) error` (cascade to edges, vectors, provenance)
+- [ ] `GetNodesByType(domain Domain, nodeType NodeType, limit int) ([]*GraphNode, error)`
+- [ ] `GetNodesByContentHash(hash string) ([]*GraphNode, error)`
+- [ ] `TouchNode(id string) error` (update accessed_at)
+- [ ] Automatic content hash computation on insert/update
+- [ ] Automatic embedding insertion into HNSW index
+
+#### Edge Operations
+- [ ] `InsertEdge(edge *GraphEdge) error`
+- [ ] `GetEdge(id string) (*GraphEdge, error)`
+- [ ] `GetEdgesBetween(fromID, toID string) ([]*GraphEdge, error)`
+- [ ] `GetOutgoingEdges(nodeID string, edgeTypes ...EdgeType) ([]*GraphEdge, error)`
+- [ ] `GetIncomingEdges(nodeID string, edgeTypes ...EdgeType) ([]*GraphEdge, error)`
+- [ ] `DeleteEdge(id string) error`
+- [ ] `DeleteEdgesBetween(fromID, toID string) error`
+- [ ] Validate edge endpoints exist before insert
+- [ ] Cross-domain edge validation (certain edge types allowed between domains)
+
+#### Batch Operations
+- [ ] `BatchInsertNodes(nodes []*GraphNode, embeddings [][]float32) error`
+- [ ] `BatchInsertEdges(edges []*GraphEdge) error`
+- [ ] `BatchDeleteNodes(ids []string) error`
+- [ ] Transaction support for atomic batch operations
+- [ ] Progress callback for large batch operations
+
+#### Cross-Domain Edge Rules
+- [ ] `EdgeTypeReferences`: Code ↔ Academic (references doc to code)
+- [ ] `EdgeTypeAppliesTo`: Academic → Code (best practice applies to file)
+- [ ] `EdgeTypeDocuments`: Academic → Code (article documents pattern)
+- [ ] `EdgeTypeModified`: History → Code (session modified file)
+- [ ] `EdgeTypeLedTo`: History → History (decision led to outcome)
+- [ ] `EdgeTypeUsedPattern`: History → Academic (session used pattern)
+- [ ] Reject invalid cross-domain edges
+
+**Tests:**
+- [ ] Insert and retrieve nodes across all domains
+- [ ] Insert and retrieve edges across all types
+- [ ] Delete node cascades to related data
+- [ ] Batch insert 10K nodes in single transaction
+- [ ] Cross-domain edge validation enforced
+- [ ] Invalid edges rejected with clear error
+
+---
+
+### 6.4 Vector Search & Graph Traversal
+
+Implements combined vector similarity and graph traversal queries.
+
+**Files to create:**
+- `core/vectorgraphdb/search.go`
+- `core/vectorgraphdb/traversal.go`
+- `core/vectorgraphdb/query.go`
+- `core/vectorgraphdb/search_test.go`
+- `core/vectorgraphdb/traversal_test.go`
+
+**Acceptance Criteria:**
+
+#### Vector Search
+- [ ] `VectorSearch(query []float32, k int, filter *SearchFilter) ([]*SearchResult, error)`
+- [ ] `VectorSearchByText(text string, k int, filter *SearchFilter) ([]*SearchResult, error)` (uses embedder)
+- [ ] `VectorSearchMultiDomain(query []float32, k int, domains []Domain) ([]*SearchResult, error)`
+- [ ] Filter by domain, node type, min similarity threshold
+- [ ] Return results with similarity score, node, and metadata
+- [ ] Support hybrid scoring (vector similarity + graph distance)
+
+#### Graph Traversal
+- [ ] `GetNeighbors(nodeID string, depth int, edgeTypes ...EdgeType) ([]*GraphNode, error)`
+- [ ] `ShortestPath(fromID, toID string, edgeTypes ...EdgeType) ([]*GraphNode, error)`
+- [ ] `GetConnectedComponent(nodeID string, maxNodes int) ([]*GraphNode, error)`
+- [ ] `FindPath(fromID, toID string, constraints *PathConstraints) ([]*PathResult, error)`
+- [ ] BFS and DFS traversal options
+- [ ] Cycle detection and prevention
+
+#### Combined Queries
+- [ ] `HybridQuery(text string, constraints *QueryConstraints) ([]*QueryResult, error)`
+- [ ] First: vector search to find semantic matches
+- [ ] Then: graph expansion to find related context
+- [ ] Score combination: `finalScore = α * vectorSim + (1-α) * graphScore`
+- [ ] Configurable alpha parameter for balance
+
+#### Cross-Domain Queries
+- [ ] Find code files → related academic docs → history of changes
+- [ ] Find failure → resolution → similar code patterns
+- [ ] Find concept → implementing code → usage examples
+- [ ] Query result includes domain path for provenance
+
+#### Query Optimization
+- [ ] Use domain hints to reduce search space
+- [ ] Cache frequent traversal paths
+- [ ] Early termination for low-relevance branches
+- [ ] Parallel traversal for independent subgraphs
+
+**Tests:**
+- [ ] Vector search returns semantically similar nodes
+- [ ] Graph traversal respects depth limits
+- [ ] Combined query returns relevant cross-domain results
+- [ ] Performance: hybrid query < 50ms for 100K node graph
+- [ ] Cycle detection prevents infinite loops
+
+```go
+// Query types
+type SearchFilter struct {
+    Domains       []Domain
+    NodeTypes     []NodeType
+    MinSimilarity float64
+    MaxResults    int
+    IncludeEdges  bool
+}
+
+type QueryConstraints struct {
+    Text          string
+    Domains       []Domain
+    GraphDepth    int
+    EdgeTypes     []EdgeType
+    Alpha         float64  // vector vs graph balance
+    MinScore      float64
+    MaxResults    int
+}
+
+type QueryResult struct {
+    Node         *GraphNode
+    VectorScore  float64
+    GraphScore   float64
+    FinalScore   float64
+    Path         []*GraphNode  // path from query origin
+    Edges        []*GraphEdge  // edges traversed
+}
+```
+
+---
+
+### 6.5 Mitigation 1: Hallucination Firewall
+
+Prevents storage of unverified LLM outputs to avoid contaminating the knowledge base.
+
+**Files to create:**
+- `core/vectorgraphdb/mitigations/hallucination_firewall.go`
+- `core/vectorgraphdb/mitigations/verification.go`
+- `core/vectorgraphdb/mitigations/hallucination_firewall_test.go`
+
+**Acceptance Criteria:**
+
+#### Firewall Implementation
+- [ ] Intercept all LLM-sourced data before storage
+- [ ] Verify existence of referenced files, functions, patterns
+- [ ] Cross-reference claims against existing verified data
+- [ ] Assign confidence scores based on verification depth
+- [ ] Block storage for unverifiable claims
+- [ ] Queue ambiguous claims for human review
+
+#### Verification Strategies
+- [ ] `VerifyFileExists(path string) (bool, error)` - check file system
+- [ ] `VerifyFunctionExists(file, funcName string) (bool, error)` - parse AST
+- [ ] `VerifyPatternExists(pattern string) (bool, float64, error)` - search codebase
+- [ ] `CrossReferenceNode(node *GraphNode) (float64, []string, error)` - check against DB
+- [ ] `VerifyEdgeValid(edge *GraphEdge) (bool, error)` - validate relationship
+
+#### Confidence Scoring
+- [ ] 1.0: Directly verified (file exists, AST confirms)
+- [ ] 0.8-0.99: Cross-referenced with multiple sources
+- [ ] 0.6-0.79: Partial verification (some claims verified)
+- [ ] 0.4-0.59: Low verification (inference from patterns)
+- [ ] 0.0-0.39: Unverifiable (blocked)
+- [ ] Configurable threshold for storage (default: 0.6)
+
+#### Review Queue
+- [ ] `QueueForReview(node *GraphNode, reason string) error`
+- [ ] `GetReviewQueue(limit int) ([]*ReviewItem, error)`
+- [ ] `ApproveReview(id string, reviewer string) error`
+- [ ] `RejectReview(id string, reason string) error`
+- [ ] Automatic expiration of stale review items
+
+#### Metrics
+- [ ] Track verified vs rejected claims
+- [ ] Track verification failure reasons
+- [ ] Track review queue depth and resolution time
+
+**Tests:**
+- [ ] Valid file references pass verification
+- [ ] Invalid file references blocked
+- [ ] Cross-referenced data gets high confidence
+- [ ] Ambiguous data queued for review
+- [ ] Review workflow completes correctly
+
+```go
+type HallucinationFirewall struct {
+    db                *VectorGraphDB
+    librarian         LibrarianClient  // for file/code verification
+    minConfidence     float64
+    reviewQueue       chan *ReviewItem
+    verificationCache *VerificationCache
+}
+
+func (f *HallucinationFirewall) Verify(ctx context.Context, node *GraphNode, source SourceType) (*VerificationResult, error)
+func (f *HallucinationFirewall) Store(ctx context.Context, node *GraphNode, verification *VerificationResult) error
+
+type VerificationResult struct {
+    Verified     bool
+    Confidence   float64
+    Checks       []VerificationCheck
+    FailedChecks []string
+    ShouldQueue  bool
+    QueueReason  string
+}
+```
+
+---
+
+### 6.6 Mitigation 2: Freshness Tracking & Decay
+
+Tracks data freshness and applies temporal decay to prevent stale data from polluting results.
+
+**Files to create:**
+- `core/vectorgraphdb/mitigations/freshness.go`
+- `core/vectorgraphdb/mitigations/decay.go`
+- `core/vectorgraphdb/mitigations/freshness_test.go`
+
+**Acceptance Criteria:**
+
+#### Freshness Tracking
+- [ ] Track last_verified timestamp for each node
+- [ ] Track source_modified timestamp (e.g., file mtime)
+- [ ] Detect stale nodes: node.updated_at < source.modified_at
+- [ ] Mark nodes requiring re-verification
+- [ ] Automatic staleness detection on access
+
+#### Decay Functions
+- [ ] Exponential decay: `score * exp(-λ * age_hours)`
+- [ ] Linear decay with cliff: `max(0, score - age_days * decay_rate)`
+- [ ] Domain-specific decay rates:
+  - Code: λ = 0.01 (slow decay, code changes less frequently)
+  - History: λ = 0.05 (moderate decay)
+  - Academic: λ = 0.001 (very slow decay, docs are stable)
+- [ ] Apply decay to search result scores
+
+#### Freshness Score Calculation
+- [ ] `ComputeFreshnessScore(node *GraphNode) float64`
+- [ ] Consider: time since update, time since access, source freshness
+- [ ] Weight formula: `freshness = base * decay(age) * accessBoost(recency)`
+- [ ] Configurable weights per domain
+
+#### Staleness Resolution
+- [ ] `FindStaleNodes(domain Domain, threshold time.Duration) ([]*GraphNode, error)`
+- [ ] `MarkStale(nodeID string) error`
+- [ ] `RefreshNode(nodeID string) error` (re-verify and update)
+- [ ] Batch refresh for bulk staleness resolution
+- [ ] Background staleness scanner (configurable interval)
+
+#### Integration with Search
+- [ ] Apply decay before returning search results
+- [ ] Filter out nodes below freshness threshold
+- [ ] Return freshness score in result metadata
+- [ ] Option to include stale results with warning flag
+
+**Tests:**
+- [ ] Fresh nodes have freshness score near 1.0
+- [ ] Old nodes have decayed freshness score
+- [ ] Stale node detection works correctly
+- [ ] Search results respect freshness thresholds
+- [ ] Background scanner identifies stale nodes
+
+```go
+type FreshnessTracker struct {
+    db          *VectorGraphDB
+    decayRates  map[Domain]float64
+    scanner     *StalenessScannerConfig
+    refreshChan chan string
+}
+
+func (f *FreshnessTracker) GetFreshness(nodeID string) (*FreshnessInfo, error)
+func (f *FreshnessTracker) ApplyDecay(results []*SearchResult) []*SearchResult
+func (f *FreshnessTracker) MarkStale(nodeID string) error
+func (f *FreshnessTracker) RefreshNode(ctx context.Context, nodeID string) error
+func (f *FreshnessTracker) StartScanner(ctx context.Context) error
+
+type FreshnessInfo struct {
+    NodeID          string
+    LastVerified    time.Time
+    SourceModified  time.Time
+    IsStale         bool
+    FreshnessScore  float64
+    DecayRate       float64
+    NextScanAt      time.Time
+}
+```
+
+---
+
+### 6.7 Mitigation 3: Source Attribution & Provenance
+
+Tracks the origin and verification chain for all stored information.
+
+**Files to create:**
+- `core/vectorgraphdb/mitigations/provenance.go`
+- `core/vectorgraphdb/mitigations/attribution.go`
+- `core/vectorgraphdb/mitigations/provenance_test.go`
+
+**Acceptance Criteria:**
+
+#### Provenance Record
+- [ ] Store source type: `verified_code`, `llm_inference`, `user_input`, `academic_source`, `cross_reference`
+- [ ] Store source ID: file path, document URL, session ID, etc.
+- [ ] Store confidence score from verification
+- [ ] Store verifier: human, automated, cross-reference
+- [ ] Store verification chain (what verified what)
+
+#### Source Types Hierarchy
+- [ ] `SourceTypeCode` (1.0 base trust) - directly from codebase
+- [ ] `SourceTypeUser` (0.95 base trust) - explicit user input
+- [ ] `SourceTypeAcademic` (0.85 base trust) - documentation, articles
+- [ ] `SourceTypeCrossRef` (0.75 base trust) - inferred from multiple sources
+- [ ] `SourceTypeLLM` (0.5 base trust) - LLM inference (requires verification)
+
+#### Attribution Operations
+- [ ] `RecordProvenance(nodeID string, prov *Provenance) error`
+- [ ] `GetProvenance(nodeID string) ([]*Provenance, error)`
+- [ ] `GetProvenanceChain(nodeID string, depth int) ([]*ProvenanceChain, error)`
+- [ ] `FindBySource(sourceType SourceType, sourceID string) ([]*GraphNode, error)`
+- [ ] `InvalidateBySource(sourceID string) error` (mark all from source as stale)
+
+#### Verification Chain
+- [ ] Track what data verified other data
+- [ ] Build verification DAG for complex claims
+- [ ] Compute transitive confidence: `conf = prod(chain_confs) * base_conf`
+- [ ] Detect circular verification (reject)
+
+#### Citation Generation
+- [ ] `GenerateCitation(nodeID string) (string, error)`
+- [ ] Include source, verification status, timestamp
+- [ ] Format for LLM context injection
+- [ ] Support multiple citation formats (inline, footnote, structured)
+
+**Tests:**
+- [ ] Provenance recorded correctly for all source types
+- [ ] Provenance chain retrieved correctly
+- [ ] Confidence correctly propagated through chain
+- [ ] Circular verification detected and rejected
+- [ ] Citation generation produces valid output
+
+```go
+type ProvenanceTracker struct {
+    db *VectorGraphDB
+}
+
+type Provenance struct {
+    ID          string     `json:"id"`
+    NodeID      string     `json:"node_id"`
+    SourceType  SourceType `json:"source_type"`
+    SourceID    string     `json:"source_id"`
+    Confidence  float64    `json:"confidence"`
+    VerifiedAt  time.Time  `json:"verified_at"`
+    Verifier    string     `json:"verifier"`  // "human", "automated", "cross_ref"
+    VerifiedBy  []string   `json:"verified_by"`  // IDs of verifying nodes
+}
+
+type ProvenanceChain struct {
+    Node             *GraphNode
+    DirectProvenance *Provenance
+    Chain            []*Provenance
+    TransitiveConf   float64
+}
+```
+
+---
+
+### 6.8 Mitigation 4: Trust Hierarchy
+
+Implements a trust scoring system that weights information by source reliability.
+
+**Files to create:**
+- `core/vectorgraphdb/mitigations/trust.go`
+- `core/vectorgraphdb/mitigations/trust_scoring.go`
+- `core/vectorgraphdb/mitigations/trust_test.go`
+
+**Acceptance Criteria:**
+
+#### Trust Levels
+- [ ] Level 6 - Verified Code (1.0): AST-parsed, type-checked
+- [ ] Level 5 - Recent History (0.9): Last 24h decisions/outcomes
+- [ ] Level 4 - Official Docs (0.8): README, API docs, comments
+- [ ] Level 3 - Old History (0.7): >24h ago, verified outcomes
+- [ ] Level 2 - External Articles (0.5): Blogs, tutorials, StackOverflow
+- [ ] Level 1 - LLM Inference (0.3): Unverified LLM output
+- [ ] Level 0 - Unknown (0.1): No provenance
+
+#### Trust Score Computation
+- [ ] `ComputeTrustScore(node *GraphNode) (float64, error)`
+- [ ] Consider: source type, age, verification status, cross-references
+- [ ] Formula: `trust = baseTrust * freshnessDecay * verificationBoost * crossRefBoost`
+- [ ] Cross-reference boost: +0.1 per independent verification (max +0.3)
+
+#### Trust-Weighted Search
+- [ ] Apply trust scores to search results
+- [ ] Option to filter by minimum trust level
+- [ ] Sort by: `finalScore = similarity * trustWeight`
+- [ ] Return trust metadata with results
+
+#### Trust Promotion/Demotion
+- [ ] `PromoteTrust(nodeID string, reason string) error` (human verification)
+- [ ] `DemoteTrust(nodeID string, reason string) error` (contradicted)
+- [ ] Automatic demotion on staleness
+- [ ] Automatic promotion on cross-reference verification
+
+#### Trust Audit Log
+- [ ] Log all trust changes with timestamp, reason, actor
+- [ ] Query trust history for a node
+- [ ] Export trust report for analysis
+
+**Tests:**
+- [ ] Trust levels assigned correctly by source
+- [ ] Trust decay applied correctly over time
+- [ ] Search results weighted by trust
+- [ ] Promotion/demotion changes trust correctly
+- [ ] Audit log records all changes
+
+```go
+type TrustHierarchy struct {
+    db         *VectorGraphDB
+    levels     map[SourceType]TrustLevel
+    decayRates map[TrustLevel]float64
+}
+
+type TrustLevel int
+const (
+    TrustUnknown TrustLevel = iota
+    TrustLLMInference
+    TrustExternalArticle
+    TrustOldHistory
+    TrustOfficialDocs
+    TrustRecentHistory
+    TrustVerifiedCode
+)
+
+type TrustInfo struct {
+    NodeID          string
+    TrustLevel      TrustLevel
+    TrustScore      float64
+    BaseScore       float64
+    FreshnessBoost  float64
+    VerifyBoost     float64
+    CrossRefBoost   float64
+    EffectiveScore  float64
+}
+
+func (t *TrustHierarchy) GetTrustInfo(nodeID string) (*TrustInfo, error)
+func (t *TrustHierarchy) ApplyTrust(results []*SearchResult) []*SearchResult
+func (t *TrustHierarchy) Promote(nodeID string, reason string, actor string) error
+func (t *TrustHierarchy) Demote(nodeID string, reason string, actor string) error
+```
+
+---
+
+### 6.9 Mitigation 5: Conflict Detection
+
+Detects and tracks contradictions between stored information.
+
+**Files to create:**
+- `core/vectorgraphdb/mitigations/conflicts.go`
+- `core/vectorgraphdb/mitigations/contradiction.go`
+- `core/vectorgraphdb/mitigations/conflicts_test.go`
+
+**Acceptance Criteria:**
+
+#### Conflict Detection
+- [ ] Detect semantic contradictions using embedding similarity + content analysis
+- [ ] Detect temporal contradictions (newer data contradicts older)
+- [ ] Detect structural contradictions (graph inconsistencies)
+- [ ] Run detection on insert and on query
+
+#### Conflict Types
+- [ ] `ConflictSemantic`: Similar embeddings, contradictory content
+- [ ] `ConflictTemporal`: Same topic, different answers at different times
+- [ ] `ConflictStructural`: Graph edges that shouldn't coexist
+- [ ] `ConflictProvenance`: Same source, different claims
+
+#### Detection Algorithms
+- [ ] `DetectOnInsert(node *GraphNode) ([]*Conflict, error)` - check against existing
+- [ ] `DetectInResults(results []*QueryResult) ([]*Conflict, error)` - check within results
+- [ ] `ScanForConflicts(domain Domain) ([]*Conflict, error)` - batch scan
+- [ ] Semantic comparison: high similarity (>0.9) + low content match (<0.5) = potential conflict
+- [ ] Temporal comparison: same subject, different values, temporal gap
+
+#### Conflict Resolution
+- [ ] `ResolveConflict(id string, resolution Resolution) error`
+- [ ] Resolution options: `KeepNewer`, `KeepTrusted`, `KeepBoth`, `MarkBothStale`, `HumanReview`
+- [ ] Automatic resolution for clear cases (much newer + higher trust)
+- [ ] Queue ambiguous conflicts for human review
+
+#### Conflict Reporting
+- [ ] `GetActiveConflicts(limit int) ([]*Conflict, error)`
+- [ ] `GetConflictsForNode(nodeID string) ([]*Conflict, error)`
+- [ ] `GetConflictStats() (*ConflictStats, error)`
+- [ ] Include conflicts in search result metadata
+
+**Tests:**
+- [ ] Semantic conflicts detected correctly
+- [ ] Temporal conflicts detected correctly
+- [ ] Automatic resolution works for clear cases
+- [ ] Ambiguous conflicts queued for review
+- [ ] Resolved conflicts marked correctly
+
+```go
+type ConflictDetector struct {
+    db              *VectorGraphDB
+    hnsw            *HNSWIndex
+    semanticThresh  float64  // similarity threshold for potential conflict
+    contentAnalyzer ContentAnalyzer
+}
+
+type Conflict struct {
+    ID           string       `json:"id"`
+    NodeAID      string       `json:"node_a_id"`
+    NodeBID      string       `json:"node_b_id"`
+    ConflictType ConflictType `json:"conflict_type"`
+    Similarity   float64      `json:"similarity"`
+    Details      string       `json:"details"`
+    DetectedAt   time.Time    `json:"detected_at"`
+    Resolution   *Resolution  `json:"resolution,omitempty"`
+    ResolvedAt   *time.Time   `json:"resolved_at,omitempty"`
+}
+
+func (d *ConflictDetector) DetectOnInsert(ctx context.Context, node *GraphNode, embedding []float32) ([]*Conflict, error)
+func (d *ConflictDetector) Resolve(conflictID string, resolution Resolution) error
+func (d *ConflictDetector) AnnotateResults(results []*QueryResult) []*QueryResult
+```
+
+---
+
+### 6.10 Mitigation 6: Context Quality Scoring
+
+Optimizes context selection to maximize information density while minimizing token usage.
+
+**Files to create:**
+- `core/vectorgraphdb/mitigations/quality.go`
+- `core/vectorgraphdb/mitigations/scoring.go`
+- `core/vectorgraphdb/mitigations/quality_test.go`
+
+**Acceptance Criteria:**
+
+#### Quality Metrics
+- [ ] `Relevance`: Vector similarity to query
+- [ ] `Freshness`: Temporal decay score
+- [ ] `Trust`: Trust hierarchy score
+- [ ] `Density`: Information per token (unique content / token count)
+- [ ] `Diversity`: Penalty for redundant information
+
+#### Quality Score Formula
+- [ ] `quality = w1*relevance + w2*freshness + w3*trust + w4*density - w5*redundancy`
+- [ ] Default weights: relevance=0.35, freshness=0.20, trust=0.25, density=0.15, redundancy=0.05
+- [ ] Configurable weights per use case
+
+#### Token Estimation
+- [ ] `EstimateTokens(node *GraphNode) int` - estimate token count for node
+- [ ] Use tiktoken-compatible estimation for accuracy
+- [ ] Cache estimates for performance
+- [ ] Account for formatting overhead
+
+#### Context Selection
+- [ ] `SelectContext(results []*QueryResult, tokenBudget int) ([]*ContextItem, error)`
+- [ ] Greedy selection: highest quality-per-token first
+- [ ] Respect token budget strictly
+- [ ] Ensure diversity (don't select redundant items)
+- [ ] Return selection rationale
+
+#### Redundancy Detection
+- [ ] Detect overlapping content between nodes
+- [ ] Compute content similarity matrix
+- [ ] Apply diversity penalty for similar selections
+- [ ] Prefer unique perspectives
+
+#### Budget Optimization
+- [ ] Given budget B, maximize sum of quality scores
+- [ ] Knapsack-style optimization (approximation OK for speed)
+- [ ] Return unused budget for caller
+
+**Tests:**
+- [ ] Quality scores computed correctly
+- [ ] Token estimation matches actual
+- [ ] Context selection respects budget
+- [ ] Diversity penalty applied correctly
+- [ ] Selection maximizes quality within budget
+
+```go
+type ContextQualityScorer struct {
+    db           *VectorGraphDB
+    weights      QualityWeights
+    tokenizer    Tokenizer
+    embedder     Embedder
+}
+
+type QualityWeights struct {
+    Relevance   float64
+    Freshness   float64
+    Trust       float64
+    Density     float64
+    Redundancy  float64
+}
+
+type ContextItem struct {
+    Node          *GraphNode
+    QualityScore  float64
+    TokenCount    int
+    ScorePerToken float64
+    Components    QualityComponents
+    Selected      bool
+    Reason        string
+}
+
+type QualityComponents struct {
+    Relevance   float64
+    Freshness   float64
+    Trust       float64
+    Density     float64
+    Redundancy  float64
+}
+
+func (s *ContextQualityScorer) Score(node *GraphNode, query []float32) (*ContextItem, error)
+func (s *ContextQualityScorer) SelectContext(results []*QueryResult, budget int) ([]*ContextItem, int, error)
+```
+
+---
+
+### 6.11 Mitigation 7: LLM Prompt Engineering
+
+Implements structured context building for LLM prompts with explicit trust and conflict information.
+
+**Files to create:**
+- `core/vectorgraphdb/mitigations/prompt.go`
+- `core/vectorgraphdb/mitigations/context_builder.go`
+- `core/vectorgraphdb/mitigations/prompt_test.go`
+
+**Acceptance Criteria:**
+
+#### Context Structure
+- [ ] Group context by domain (Code, History, Academic)
+- [ ] Include trust level annotation for each item
+- [ ] Include freshness indication (verified date)
+- [ ] Include conflict warnings where applicable
+- [ ] Include provenance summary
+
+#### Prompt Template
+- [ ] Inject structured preamble explaining trust levels
+- [ ] Format context items with clear delineation
+- [ ] Include explicit instructions about handling conflicts
+- [ ] Include instructions about trusting recent code over old docs
+
+#### LLM Context Builder
+- [ ] `BuildContext(items []*ContextItem) (*LLMContext, error)`
+- [ ] Generate structured markdown for context injection
+- [ ] Generate JSON for structured API calls
+- [ ] Generate plain text for simple models
+
+#### Trust Instructions
+- [ ] "Code from the codebase is authoritative"
+- [ ] "Recent session decisions (last 24h) reflect current intent"
+- [ ] "Older documentation may be outdated"
+- [ ] "If information conflicts, prefer higher trust sources"
+- [ ] "Flag any unresolved conflicts in your response"
+
+#### Conflict Handling
+- [ ] Annotate conflicting items in context
+- [ ] Include resolution guidance
+- [ ] Request explicit acknowledgment of conflicts in response
+
+#### Output Formats
+- [ ] `FormatAsMarkdown() string` - for human-readable
+- [ ] `FormatAsJSON() string` - for structured API
+- [ ] `FormatAsXML() string` - for specific models
+- [ ] `EstimateTokens() int` - for budget checking
+
+**Tests:**
+- [ ] Context built correctly with trust annotations
+- [ ] Conflict warnings included
+- [ ] Output formats valid
+- [ ] Token estimate accurate
+- [ ] Preamble instructions present
+
+```go
+type LLMContextBuilder struct {
+    scorer     *ContextQualityScorer
+    trust      *TrustHierarchy
+    conflicts  *ConflictDetector
+    provenance *ProvenanceTracker
+}
+
+type LLMContext struct {
+    Preamble     string
+    CodeContext  []*AnnotatedItem
+    HistContext  []*AnnotatedItem
+    AcadContext  []*AnnotatedItem
+    Conflicts    []*ConflictSummary
+    TotalTokens  int
+}
+
+type AnnotatedItem struct {
+    Content     string
+    Domain      Domain
+    TrustLevel  TrustLevel
+    TrustScore  float64
+    Freshness   time.Time
+    Source      string
+    Conflicts   []string  // IDs of conflicting items
+}
+
+func (b *LLMContextBuilder) Build(ctx context.Context, items []*ContextItem) (*LLMContext, error)
+func (c *LLMContext) FormatAsMarkdown() string
+func (c *LLMContext) FormatAsJSON() string
+func (c *LLMContext) FormatAsSystemPrompt() string
+```
+
+---
+
+### 6.12 Unified Query Resolution
+
+Integrates all components into a unified query resolution pipeline that **agents invoke via skills**.
+
+**IMPORTANT**: The Unified Resolver is NOT a replacement for agent (LLM) reasoning. It is a **skill implementation** that agents call when they decide they need VectorGraphDB context. The agent always runs first, decides what context it needs, then invokes resolver skills.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    RESOLVER IN CONTEXT                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   1. User query arrives                                                     │
+│   2. Intent cache checked (if hit → return cached, 0 tokens)               │
+│   3. Cache miss → Agent (LLM) runs                                         │
+│   4. Agent decides: "I need code context about auth"                       │
+│   5. Agent invokes: search_code("authentication handler")                  │
+│      └─── This skill calls UnifiedResolver internally                      │
+│   6. UnifiedResolver returns curated context (~800 tokens)                 │
+│   7. Agent synthesizes response with curated context                       │
+│                                                                             │
+│   The agent ALWAYS runs on cache miss. Resolver provides curated context.  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Files to create:**
+- `core/vectorgraphdb/resolver.go`
+- `core/vectorgraphdb/pipeline.go`
+- `core/vectorgraphdb/resolver_test.go`
+
+**Acceptance Criteria:**
+
+#### Resolution Pipeline (called by skills, not directly by users)
+1. [ ] Parse query intent (code, history, academic, hybrid)
+2. [ ] Check intent cache for exact/similar match
+3. [ ] Generate query embedding
+4. [ ] Execute HNSW search (domain-filtered)
+5. [ ] Graph expansion for context
+6. [ ] Apply freshness decay
+7. [ ] Apply trust weighting
+8. [ ] Detect conflicts in results
+9. [ ] Score context quality
+10. [ ] Select within token budget
+11. [ ] Format results for agent consumption (NOT raw LLM prompt)
+12. [ ] Cache result for future queries
+
+#### Unified Resolver
+- [ ] `Resolve(ctx context.Context, query string, opts *ResolveOptions) (*Resolution, error)`
+- [ ] Single entry point for all queries
+- [ ] Automatic domain detection from query text
+- [ ] Configurable pipeline stages
+
+#### Resolution Options
+- [ ] `Domains []Domain` - restrict to specific domains
+- [ ] `TokenBudget int` - max tokens for context
+- [ ] `MinTrust TrustLevel` - minimum trust threshold
+- [ ] `MinFreshness time.Duration` - max age for results
+- [ ] `IncludeConflicts bool` - include conflicting data with warnings
+- [ ] `MaxGraphDepth int` - limit graph expansion
+- [ ] `CacheResult bool` - whether to cache this resolution
+
+#### Resolution Result
+- [ ] Selected context items with annotations
+- [ ] Formatted LLM prompt
+- [ ] Pipeline metrics (timing per stage)
+- [ ] Conflict report
+- [ ] Token usage summary
+- [ ] Cache hit/miss info
+
+#### Performance Requirements
+- [ ] Full resolution < 100ms for typical query
+- [ ] Cache hit < 10ms
+- [ ] Pipeline stage timing tracked
+
+**Tests:**
+- [ ] End-to-end resolution works
+- [ ] All pipeline stages execute correctly
+- [ ] Cache integration works
+- [ ] Options respected
+- [ ] Performance targets met
+
+```go
+type UnifiedResolver struct {
+    db          *VectorGraphDB
+    hnsw        *HNSWIndex
+    embedder    Embedder
+    intentCache *IntentCache
+    firewall    *HallucinationFirewall
+    freshness   *FreshnessTracker
+    provenance  *ProvenanceTracker
+    trust       *TrustHierarchy
+    conflicts   *ConflictDetector
+    scorer      *ContextQualityScorer
+    prompter    *LLMContextBuilder
+}
+
+type ResolveOptions struct {
+    Domains         []Domain
+    TokenBudget     int
+    MinTrust        TrustLevel
+    MinFreshness    time.Duration
+    IncludeConflicts bool
+    MaxGraphDepth   int
+    CacheResult     bool
+}
+
+type Resolution struct {
+    Query           string
+    Context         *LLMContext
+    Items           []*ContextItem
+    Conflicts       []*Conflict
+    Metrics         *PipelineMetrics
+    TokensUsed      int
+    TokenBudget     int
+    CacheHit        bool
+}
+
+type PipelineMetrics struct {
+    IntentDetect   time.Duration
+    CacheCheck     time.Duration
+    Embedding      time.Duration
+    VectorSearch   time.Duration
+    GraphExpand    time.Duration
+    Freshness      time.Duration
+    Trust          time.Duration
+    Conflict       time.Duration
+    Scoring        time.Duration
+    ContextBuild   time.Duration
+    Total          time.Duration
+}
+
+func (r *UnifiedResolver) Resolve(ctx context.Context, query string, opts *ResolveOptions) (*Resolution, error)
+```
+
+---
+
+### 6.13 Agent Integration: Librarian
+
+Integrates VectorGraphDB with the Librarian agent for code domain. The Librarian agent (LLM) **decides** when to invoke these skills based on the query.
+
+**IMPORTANT**: Skills return curated context to the agent, not raw files. Target ~800 tokens of context per skill invocation vs ~2,000 tokens of raw file content.
+
+**Files to create:**
+- `agents/librarian/vectorgraphdb.go`
+- `agents/librarian/code_indexer.go`
+- `agents/librarian/skills_vectorgraphdb.go`
+- `agents/librarian/vectorgraphdb_test.go`
+
+**Acceptance Criteria:**
+
+#### Code Indexing
+- [ ] Index files as `NodeTypeFile` with content embeddings
+- [ ] Index functions as `NodeTypeFunction` with signature + doc embeddings
+- [ ] Index types as `NodeTypeType` with definition embeddings
+- [ ] Index packages as `NodeTypePackage`
+- [ ] Create structural edges: `Calls`, `Imports`, `Defines`, `Implements`, `Contains`
+- [ ] Incremental indexing on file change
+
+#### Query Integration
+- [ ] VectorGraphDB skills available for agent to invoke (agent decides when)
+- [ ] Skills return scored, curated results (not raw files)
+- [ ] Results include relevant snippets, not entire file contents
+- [ ] Target: ~800 tokens of context per skill invocation
+
+#### Skills (Agent Decides When to Invoke)
+- [ ] `search_code` - Semantic search, returns scored snippets (~10 results max)
+- [ ] `get_symbol` - Get specific symbol details with source
+- [ ] `get_dependencies` - Graph traversal for what symbol depends on
+- [ ] `get_dependents` - Graph traversal for what depends on symbol
+- [ ] `find_similar_symbols` - Find semantically similar code
+- [ ] `get_file_symbols` - All symbols in a file
+- [ ] `get_history_for_code` - Cross-domain: history for code (via edges)
+
+**Tests:**
+- [ ] File indexing creates correct nodes/edges
+- [ ] Semantic search finds relevant code
+- [ ] Graph queries return correct relationships
+- [ ] Incremental indexing updates correctly
+
+---
+
+### 6.14 Agent Integration: Archivalist
+
+Integrates VectorGraphDB with the Archivalist agent for history domain. The Archivalist agent (LLM) **decides** when to invoke these skills based on the query.
+
+**IMPORTANT**: Skills return curated context to the agent, not full history dumps. Target ~800 tokens of context per skill invocation.
+
+**Files to create:**
+- `agents/archivalist/vectorgraphdb.go`
+- `agents/archivalist/history_indexer.go`
+- `agents/archivalist/skills_vectorgraphdb.go`
+- `agents/archivalist/vectorgraphdb_test.go`
+
+**Acceptance Criteria:**
+
+#### History Indexing
+- [ ] Index sessions as `NodeTypeSession`
+- [ ] Index decisions as `NodeTypeDecision` with context embeddings
+- [ ] Index failures as `NodeTypeFailure` with error + resolution embeddings
+- [ ] Index patterns as `NodeTypePattern`
+- [ ] Index workflows as `NodeTypeWorkflow`
+- [ ] Create temporal edges: `Follows`, `Causes`, `Resolves`
+- [ ] Create cross-domain edges: `Modified` (to code files)
+
+#### Query Integration
+- [ ] VectorGraphDB skills available for agent to invoke (agent decides when)
+- [ ] Skills return scored, curated results (not full history)
+- [ ] Results include relevant context, not entire session logs
+- [ ] Target: ~800 tokens of context per skill invocation
+
+#### Skills (Agent Decides When to Invoke)
+- [ ] `store_summary` - Store summaries from other agents (creates cross-domain edges)
+- [ ] `search_history` - Semantic search over historical context
+- [ ] `find_patterns` - Find recurring patterns with min occurrence threshold
+- [ ] `find_failures` - Find similar failures with resolutions
+- [ ] `get_session_history` - Get history for specific session
+- [ ] `get_code_for_history` - Cross-domain: code referenced in history (via edges)
+- [ ] `get_decisions` - Find past architectural/design decisions
+
+**Tests:**
+- [ ] History entries indexed correctly
+- [ ] Similar failure search works
+- [ ] Pattern matching finds relevant patterns
+- [ ] Cross-domain edges to code created
+
+---
+
+### 6.15 Agent Integration: Academic
+
+Integrates VectorGraphDB with the Academic agent for academic domain. The Academic agent (Opus 4.5 for complex reasoning) **decides** when to invoke these skills based on the query.
+
+**IMPORTANT**: Academic uses Opus 4.5 for complex reasoning tasks like research synthesis and approach comparison. Skills return curated context; the agent does the heavy reasoning.
+
+**Files to create:**
+- `agents/academic/vectorgraphdb.go`
+- `agents/academic/knowledge_indexer.go`
+- `agents/academic/skills_vectorgraphdb.go`
+- `agents/academic/vectorgraphdb_test.go`
+
+**Acceptance Criteria:**
+
+#### Knowledge Indexing
+- [ ] Index GitHub repos as `NodeTypeRepo`
+- [ ] Index documentation as `NodeTypeDoc`
+- [ ] Index articles as `NodeTypeArticle`
+- [ ] Index concepts as `NodeTypeConcept`
+- [ ] Index best practices as `NodeTypeBestPractice`
+- [ ] Create semantic edges between related concepts
+- [ ] Create cross-domain edges: `References`, `AppliesTo`, `Documents`
+
+#### Query Integration
+- [ ] VectorGraphDB skills available for agent to invoke (agent decides when)
+- [ ] Skills return scored, curated results (not full documents)
+- [ ] Agent (Opus 4.5) synthesizes and reasons over curated context
+- [ ] Target: ~1,200 tokens of context per skill invocation (higher for research)
+
+#### Skills (Agent Decides When to Invoke)
+- [ ] `research` - Deep research with configurable depth (agent synthesizes)
+- [ ] `find_best_practices` - Find established best practices
+- [ ] `find_papers` - Find academic papers with abstracts
+- [ ] `compare_approaches` - Get context for comparing approaches (agent reasons)
+- [ ] `synthesize_with_codebase` - Cross-domain: theory vs practice (via edges)
+- [ ] `get_code_for_academic` - Cross-domain: code implementing concepts (via edges)
+- [ ] `get_history_for_academic` - Cross-domain: history related to concepts (via edges)
+
+**Tests:**
+- [ ] Academic content indexed correctly
+- [ ] Concept search finds relevant knowledge
+- [ ] Cross-domain queries work (academic → code)
+- [ ] Best practice recommendations work
+
+---
+
+### 6.16 Cross-Domain Query Integration
+
+Implements unified cross-domain queries across all three agents.
+
+**Files to create:**
+- `core/vectorgraphdb/crossdomain.go`
+- `core/vectorgraphdb/crossdomain_test.go`
+
+**Acceptance Criteria:**
+
+#### Unified Query Interface
+- [ ] Single query entry point for all domains
+- [ ] Automatic domain routing based on query intent
+- [ ] Result merging from multiple domains
+- [ ] Cross-domain path discovery
+
+#### Cross-Domain Scenarios
+- [ ] "How do I implement X?" → Academic (patterns) → Code (examples) → History (past attempts)
+- [ ] "Why did this fail?" → History (failure) → Code (file) → Academic (known issues)
+- [ ] "Best way to do Y?" → Academic (best practices) → Code (existing impl) → History (outcomes)
+
+#### Result Aggregation
+- [ ] Merge results from multiple domains
+- [ ] De-duplicate overlapping information
+- [ ] Order by combined relevance + trust + freshness
+- [ ] Annotate with domain source
+
+**Tests:**
+- [ ] Cross-domain queries return results from all relevant domains
+- [ ] Result merging works correctly
+- [ ] Domain paths tracked correctly
+
+---
+
+### 6.17 Performance Benchmarks
+
+Creates benchmarks to validate performance targets.
+
+**Files to create:**
+- `core/vectorgraphdb/benchmark_test.go`
+
+**Acceptance Criteria:**
+
+#### Insert Benchmarks
+- [ ] Insert 10K nodes: < 10 seconds
+- [ ] Insert 100K nodes: < 2 minutes
+- [ ] Insert single node: < 1ms average
+
+#### Search Benchmarks
+- [ ] Vector search k=10, 10K nodes: < 5ms
+- [ ] Vector search k=10, 100K nodes: < 20ms
+- [ ] Graph traversal depth=3, 10K nodes: < 10ms
+- [ ] Hybrid query, 10K nodes: < 50ms
+
+#### Full Pipeline Benchmarks
+- [ ] Unified resolution (cache miss): < 100ms
+- [ ] Unified resolution (cache hit): < 10ms
+- [ ] Context building: < 20ms
+
+#### Memory Benchmarks
+- [ ] Memory per 10K nodes: < 50MB
+- [ ] Memory per 100K nodes: < 500MB
+- [ ] No memory leaks over 1M operations
+
+**Tests:**
+- [ ] All benchmarks pass performance targets
+- [ ] Results logged for regression tracking
+
+---
+
+### 6.18 Integration Tests
+
+Creates comprehensive integration tests for the full VectorGraphDB system.
+
+**Files to create:**
+- `tests/integration/vectorgraphdb_test.go`
+- `tests/integration/crossdomain_test.go`
+- `tests/integration/mitigations_test.go`
+
+**Acceptance Criteria:**
+
+#### End-to-End Tests
+- [ ] Index codebase, query for function, get results with context
+- [ ] Store session history, query for similar failure, get resolution
+- [ ] Ingest documentation, query for best practice, get recommendations
+- [ ] Cross-domain query spanning all three domains
+
+#### Mitigation Tests
+- [ ] Hallucination firewall blocks unverified LLM output
+- [ ] Freshness decay affects search results correctly
+- [ ] Trust hierarchy weights results correctly
+- [ ] Conflict detection finds contradictions
+- [ ] Quality scoring maximizes information density
+
+#### Failure Mode Tests
+- [ ] Graceful degradation on embedder failure
+- [ ] Graceful degradation on SQLite failure
+- [ ] Recovery after crash (WAL replay)
+- [ ] Concurrent access stress test
+
+**Tests:**
+- [ ] All integration tests pass
+- [ ] No race conditions detected
+- [ ] Recovery tests pass
+
+---
+
+## Token Savings Targets
+
+### CRITICAL: How VectorGraphDB Saves Tokens
+
+**VectorGraphDB does NOT replace LLM calls.** The agent (LLM) always runs on cache misses and **decides** when to invoke VectorGraphDB skills. Savings come from **context reduction**, not from avoiding LLM reasoning.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CORRECT ARCHITECTURE                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   L1: INTENT CACHE                    L2: AGENT (LLM)                       │
+│   ─────────────────                   ───────────────                       │
+│   • 0 tokens on hit                   • Agent ALWAYS runs on cache miss    │
+│   • ~68% of queries                   • Agent DECIDES to call VDB skills   │
+│                                       • Agent processes curated results    │
+│                                       • ~32% of queries                    │
+│                                                                             │
+│   Example flow:                                                             │
+│   1. Cache miss → Agent runs (~300 tokens for reasoning)                   │
+│   2. Agent invokes: search_code("auth handler", limit=10)                  │
+│   3. VectorGraphDB returns curated results (~800 tokens vs ~2000 raw)      │
+│   4. Agent synthesizes response (~700 tokens)                              │
+│   5. Total: ~1,800 tokens (vs ~3,000 baseline)                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Token Savings Breakdown
+
+| Source | Savings | How It Works |
+|--------|---------|--------------|
+| **Intent Cache** | ~67% | Similar queries hit cache (0 tokens) |
+| **Context Reduction** | ~24% additional | VDB returns curated ~800 tokens vs raw ~2,000 tokens |
+| **Combined** | **~75%** | Total savings vs baseline |
+
+### Per-Query Token Estimates
+
+| Component | Without VDB | With VDB | Savings |
+|-----------|-------------|----------|---------|
+| Query understanding | 300 tokens | 300 tokens | 0% |
+| Context from search | 2,000 tokens | 800 tokens | **60%** |
+| Response generation | 700 tokens | 700 tokens | 0% |
+| **Total per query** | 3,000 tokens | 1,800 tokens | **40%** |
+
+### Agent Token Estimates (per 100 queries)
+
+| Agent | Baseline | Cache Only | +VectorGraphDB | Total Savings |
+|-------|----------|------------|----------------|---------------|
+| **Librarian** | 300,000 | 90,000 | 54,000 | **82%** |
+| **Archivalist** | 250,000 | 62,500 | 37,500 | **85%** |
+| **Academic** | 400,000 | 160,000 | 96,000 | **76%** |
+| **Cross-Domain** | N/A | N/A | 50,000 | New capability |
+| **TOTAL** | 950,000 | 312,500 | 237,500 | **75%** |
+
+### Monthly Cost Targets
+
+| Scenario | Monthly Cost | vs Baseline |
+|----------|-------------|-------------|
+| Baseline (no cache, no VDB) | $285/month | - |
+| Cache only | $94/month | 67% savings |
+| **Cache + VectorGraphDB** | **$72/month** | **75% savings** |
+
+**Overall Target**: 75% token reduction across all agents.
+
+### Implementation Guidelines
+
+**DO:**
+- Design skills that return curated, scored results
+- Return ~5-10 relevant results, not 50
+- Include only necessary metadata in results
+- Let the agent decide retrieval depth (progressive retrieval)
+- Cache skill results where appropriate
+
+**DON'T:**
+- Assume VectorGraphDB calls are "free" (agent still runs)
+- Return raw file contents in skill results
+- Return all matching results (use limits)
+- Bypass the agent with "graph-only" resolution
+
+---
+
+## Latency Targets
+
+| Operation | Target | P95 |
+|-----------|--------|-----|
+| Vector insert | < 1ms | < 5ms |
+| Vector search (k=10) | < 5ms | < 20ms |
+| Graph traversal (depth=3) | < 10ms | < 30ms |
+| Hybrid query | < 50ms | < 100ms |
+| Full resolution (cache miss) | < 100ms | < 200ms |
+| Full resolution (cache hit) | < 10ms | < 25ms |
+
+---
+
+## Memory Targets
+
+| Scale | RAM Usage | SQLite Size |
+|-------|-----------|-------------|
+| 10K nodes | ~50MB | ~100MB |
+| 50K nodes | ~200MB | ~500MB |
+| 100K nodes | ~400MB | ~1GB |
+
+---
+
+## Implementation Order
+
+1. **Week 1-2**: 6.1 (Schema), 6.2 (HNSW) - can parallelize
+2. **Week 3**: 6.3 (Nodes/Edges), 6.4 (Search/Traversal) - can parallelize
+3. **Week 4-5**: 6.5-6.11 (All Mitigations) - can parallelize
+4. **Week 6**: 6.12 (Unified Resolver)
+5. **Week 7-8**: 6.13-6.16 (Agent Integrations) - can parallelize
+6. **Week 9**: 6.17-6.18 (Benchmarks, Integration Tests)
+
+**Note**: Weeks are relative units of work, not calendar estimates.

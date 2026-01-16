@@ -4593,6 +4593,4780 @@ For multiple sessions operating on the same codebase:
 
 ---
 
+## VectorGraphDB: Unified Knowledge Graph
+
+### Overview
+
+The VectorGraphDB is a unified, embedded knowledge graph that combines **vector similarity search** with **graph-based structural queries** across three domains: Code (Librarian), History (Archivalist), and Academic (external knowledge). It uses SQLite as the storage backend with in-memory HNSW indexes for fast vector search - no external dependencies required.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    VECTORGRAPHDB: THREE-DOMAIN ARCHITECTURE                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
+│  │   LIBRARIAN     │  │   ARCHIVALIST   │  │    ACADEMIC     │             │
+│  │   (Code)        │  │   (History)     │  │   (Knowledge)   │             │
+│  │                 │  │                 │  │                 │             │
+│  │  Domain: 0      │  │  Domain: 1      │  │  Domain: 2      │             │
+│  │                 │  │                 │  │                 │             │
+│  │  Nodes:         │  │  Nodes:         │  │  Nodes:         │             │
+│  │  • File         │  │  • Entry        │  │  • Paper        │             │
+│  │  • Function     │  │  • Session      │  │  • Docs         │             │
+│  │  • Struct       │  │  • Workflow     │  │  • BestPractice │             │
+│  │  • Interface    │  │  • Outcome      │  │  • RFC          │             │
+│  │  • Package      │  │  • Decision     │  │  • Tutorial     │             │
+│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘             │
+│           │                    │                    │                       │
+│           └────────────────────┼────────────────────┘                       │
+│                                │                                            │
+│                    CROSS-DOMAIN EDGES                                       │
+│           ┌────────────────────┼────────────────────┐                       │
+│           │                    │                    │                       │
+│           ▼                    ▼                    ▼                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                      VECTORGRAPHDB                                   │   │
+│  │                    (Single SQLite File)                              │   │
+│  │                                                                     │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │  NODES TABLE                                                 │   │   │
+│  │  │  • Unified schema for all domains                           │   │   │
+│  │  │  • Domain field partitions data                             │   │   │
+│  │  │  • Type field identifies node kind                          │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                     │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │  EDGES TABLE                                                 │   │   │
+│  │  │  • Structural: calls, imports, implements                   │   │   │
+│  │  │  • Temporal: produced_by, resulted_in                       │   │   │
+│  │  │  • Cross-domain: modified, based_on, documents              │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                     │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │  VECTORS TABLE (BLOBs)        HNSW INDEX (In-Memory)        │   │   │
+│  │  │  • Embeddings as binary       • O(log n) search             │   │   │
+│  │  │  • Pre-computed magnitudes    • Loaded on startup           │   │   │
+│  │  │  • Persisted to disk          • ~50MB per 10K nodes         │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### SQLite Schema
+
+```sql
+-- =============================================================================
+-- DOMAIN AND TYPE ENUMS (stored as integers)
+-- =============================================================================
+-- Domain: 0 = code, 1 = history, 2 = academic
+-- NodeType: See node type constants below
+
+-- =============================================================================
+-- NODES TABLE (unified for all domains)
+-- =============================================================================
+CREATE TABLE nodes (
+    id TEXT PRIMARY KEY,
+    domain INTEGER NOT NULL,
+    node_type INTEGER NOT NULL,
+    name TEXT NOT NULL,
+
+    -- Code domain fields
+    path TEXT,
+    package TEXT,
+    line_start INTEGER,
+    line_end INTEGER,
+    signature TEXT,
+
+    -- History domain fields
+    session_id TEXT,
+    timestamp DATETIME,
+    category TEXT,
+
+    -- Academic domain fields
+    url TEXT,
+    source TEXT,
+    authors JSON,
+    published_at DATETIME,
+
+    -- Common fields
+    content TEXT,
+    content_hash TEXT,
+    metadata JSON,
+
+    -- Verification and trust
+    verified BOOLEAN DEFAULT FALSE,
+    verification_type INTEGER,
+    confidence REAL DEFAULT 1.0,
+    trust_level INTEGER DEFAULT 50,
+
+    -- Temporal tracking
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME,
+    superseded_by TEXT,
+
+    CHECK (domain IN (0, 1, 2)),
+    FOREIGN KEY (superseded_by) REFERENCES nodes(id) ON DELETE SET NULL
+);
+
+-- =============================================================================
+-- EDGES TABLE
+-- =============================================================================
+CREATE TABLE edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    edge_type INTEGER NOT NULL,
+    weight REAL DEFAULT 1.0,
+    metadata JSON,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    UNIQUE (source_id, target_id, edge_type)
+);
+
+-- =============================================================================
+-- VECTORS TABLE (embeddings as BLOBs)
+-- =============================================================================
+CREATE TABLE vectors (
+    node_id TEXT PRIMARY KEY,
+    embedding BLOB NOT NULL,
+    magnitude REAL NOT NULL,
+    dimensions INTEGER NOT NULL DEFAULT 768,
+    domain INTEGER NOT NULL,
+    node_type INTEGER NOT NULL,
+
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
+-- =============================================================================
+-- PROVENANCE TABLE (tracks source of information)
+-- =============================================================================
+CREATE TABLE provenance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id TEXT NOT NULL,
+    source_type INTEGER NOT NULL,
+    source_node_id TEXT,
+    source_path TEXT,
+    source_url TEXT,
+    confidence REAL NOT NULL,
+    verified_at DATETIME,
+
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_node_id) REFERENCES nodes(id) ON DELETE SET NULL
+);
+
+-- =============================================================================
+-- CONFLICTS TABLE (detected contradictions)
+-- =============================================================================
+CREATE TABLE conflicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conflict_type INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    node_id_a TEXT NOT NULL,
+    node_id_b TEXT NOT NULL,
+    description TEXT NOT NULL,
+    resolution TEXT,
+    resolved BOOLEAN DEFAULT FALSE,
+    detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    resolved_at DATETIME,
+
+    FOREIGN KEY (node_id_a) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id_b) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
+-- =============================================================================
+-- HNSW INDEX PERSISTENCE
+-- =============================================================================
+CREATE TABLE hnsw_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE hnsw_edges (
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    level INTEGER NOT NULL,
+    PRIMARY KEY (source_id, target_id, level)
+);
+
+-- =============================================================================
+-- ACADEMIC-SPECIFIC TABLES
+-- =============================================================================
+CREATE TABLE academic_sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_endpoint TEXT,
+    rate_limit_per_min INTEGER,
+    requires_auth BOOLEAN DEFAULT FALSE,
+    last_crawled_at DATETIME
+);
+
+CREATE TABLE academic_chunks (
+    id TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    UNIQUE (node_id, chunk_index)
+);
+
+CREATE TABLE library_docs (
+    library_path TEXT PRIMARY KEY,
+    doc_node_id TEXT,
+    FOREIGN KEY (doc_node_id) REFERENCES nodes(id) ON DELETE SET NULL
+);
+
+-- =============================================================================
+-- INDEXES
+-- =============================================================================
+CREATE INDEX idx_nodes_domain_type ON nodes(domain, node_type);
+CREATE INDEX idx_nodes_path ON nodes(path) WHERE path IS NOT NULL;
+CREATE INDEX idx_nodes_name ON nodes(name);
+CREATE INDEX idx_nodes_session ON nodes(session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX idx_nodes_hash ON nodes(content_hash) WHERE content_hash IS NOT NULL;
+CREATE INDEX idx_nodes_superseded ON nodes(superseded_by) WHERE superseded_by IS NOT NULL;
+
+CREATE INDEX idx_edges_source ON edges(source_id, edge_type);
+CREATE INDEX idx_edges_target ON edges(target_id, edge_type);
+CREATE INDEX idx_edges_type ON edges(edge_type);
+
+CREATE INDEX idx_vectors_domain ON vectors(domain);
+CREATE INDEX idx_vectors_domain_type ON vectors(domain, node_type);
+
+CREATE INDEX idx_provenance_node ON provenance(node_id);
+CREATE INDEX idx_conflicts_unresolved ON conflicts(resolved) WHERE resolved = FALSE;
+
+CREATE INDEX idx_hnsw_edges_level ON hnsw_edges(level, source_id);
+CREATE INDEX idx_chunks_node ON academic_chunks(node_id);
+```
+
+### Node and Edge Types
+
+```go
+// =============================================================================
+// DOMAIN CONSTANTS
+// =============================================================================
+
+type Domain int
+
+const (
+    DomainCode     Domain = 0  // Librarian - live codebase
+    DomainHistory  Domain = 1  // Archivalist - historical data
+    DomainAcademic Domain = 2  // Academic - external knowledge
+)
+
+// =============================================================================
+// NODE TYPES BY DOMAIN
+// =============================================================================
+
+type NodeType int
+
+// Code domain (0-99)
+const (
+    NodeTypeFile      NodeType = 0
+    NodeTypePackage   NodeType = 1
+    NodeTypeFunction  NodeType = 2
+    NodeTypeMethod    NodeType = 3
+    NodeTypeStruct    NodeType = 4
+    NodeTypeInterface NodeType = 5
+    NodeTypeVariable  NodeType = 6
+    NodeTypeConstant  NodeType = 7
+    NodeTypeImport    NodeType = 8
+)
+
+// History domain (100-199)
+const (
+    NodeTypeHistoryEntry NodeType = 100
+    NodeTypeSession      NodeType = 101
+    NodeTypeWorkflow     NodeType = 102
+    NodeTypeOutcome      NodeType = 103
+    NodeTypeDecision     NodeType = 104
+)
+
+// Academic domain (200-299)
+const (
+    NodeTypePaper         NodeType = 200
+    NodeTypeDocumentation NodeType = 201
+    NodeTypeBestPractice  NodeType = 202
+    NodeTypeRFC           NodeType = 203
+    NodeTypeStackOverflow NodeType = 204
+    NodeTypeBlogPost      NodeType = 205
+    NodeTypeTutorial      NodeType = 206
+)
+
+// =============================================================================
+// EDGE TYPES
+// =============================================================================
+
+type EdgeType int
+
+// Code structural edges (0-49)
+const (
+    EdgeTypeCalls         EdgeType = 0   // function calls function
+    EdgeTypeCalledBy      EdgeType = 1   // reverse of Calls
+    EdgeTypeImports       EdgeType = 2   // file imports package
+    EdgeTypeImportedBy    EdgeType = 3   // reverse of Imports
+    EdgeTypeImplements    EdgeType = 4   // struct implements interface
+    EdgeTypeImplementedBy EdgeType = 5   // reverse of Implements
+    EdgeTypeEmbeds        EdgeType = 6   // struct embeds struct
+    EdgeTypeHasField      EdgeType = 7   // struct has field of type
+    EdgeTypeHasMethod     EdgeType = 8   // type has method
+    EdgeTypeDefines       EdgeType = 9   // file defines symbol
+    EdgeTypeDefinedIn     EdgeType = 10  // reverse of Defines
+    EdgeTypeReturns       EdgeType = 11  // function returns type
+    EdgeTypeReceives      EdgeType = 12  // function receives param type
+)
+
+// History edges (50-99)
+const (
+    EdgeTypeProducedBy  EdgeType = 50  // entry produced by session
+    EdgeTypeResultedIn  EdgeType = 51  // workflow resulted in outcome
+    EdgeTypeSimilarTo   EdgeType = 52  // semantically similar
+    EdgeTypeFollowedBy  EdgeType = 53  // temporal sequence
+    EdgeTypeSupersedes  EdgeType = 54  // newer supersedes older
+)
+
+// Cross-domain edges (100-149)
+const (
+    EdgeTypeModified    EdgeType = 100  // history entry modified code
+    EdgeTypeCreated     EdgeType = 101  // history entry created code
+    EdgeTypeDeleted     EdgeType = 102  // history entry deleted code
+    EdgeTypeBasedOn     EdgeType = 103  // decision based on academic
+    EdgeTypeReferences  EdgeType = 104  // entry references academic
+    EdgeTypeValidatedBy EdgeType = 105  // approach validated by academic
+    EdgeTypeDocuments   EdgeType = 106  // academic documents code
+    EdgeTypeUsesLibrary EdgeType = 107  // code uses library (→ docs)
+    EdgeTypeImplementsPattern EdgeType = 108  // code implements pattern
+)
+
+// Academic edges (150-199)
+const (
+    EdgeTypeCites       EdgeType = 150  // paper cites paper
+    EdgeTypeRelatedTo   EdgeType = 151  // conceptually related
+)
+
+// =============================================================================
+// VERIFICATION AND TRUST TYPES
+// =============================================================================
+
+type VerificationType int
+
+const (
+    VerificationNone         VerificationType = 0
+    VerificationAgainstCode  VerificationType = 1
+    VerificationAgainstHistory VerificationType = 2
+    VerificationByUser       VerificationType = 3
+)
+
+type SourceType int
+
+const (
+    SourceTypeCode         SourceType = 0
+    SourceTypeHistory      SourceType = 1
+    SourceTypeAcademic     SourceType = 2
+    SourceTypeLLMInference SourceType = 3
+    SourceTypeUserProvided SourceType = 4
+)
+
+type TrustLevel int
+
+const (
+    TrustLevelGround     TrustLevel = 100  // Current code (source of truth)
+    TrustLevelRecent     TrustLevel = 80   // Recent verified history
+    TrustLevelStandard   TrustLevel = 70   // RFCs, official docs
+    TrustLevelAcademic   TrustLevel = 60   // Peer-reviewed papers
+    TrustLevelOldHistory TrustLevel = 40   // Old history (may be stale)
+    TrustLevelBlog       TrustLevel = 30   // Blog posts, SO answers
+    TrustLevelLLM        TrustLevel = 20   // LLM inference (unverified)
+)
+
+type ConflictType int
+
+const (
+    ConflictTypeTemporal       ConflictType = 0  // Old vs new data
+    ConflictTypeSourceMismatch ConflictType = 1  // Code vs history
+    ConflictTypeSemantic       ConflictType = 2  // Contradictory claims
+)
+```
+
+### HNSW Index Implementation (Pure Go, No Extensions)
+
+The HNSW (Hierarchical Navigable Small World) index provides O(log n) approximate nearest neighbor search without requiring sqlite-vec or any external dependencies.
+
+```go
+// =============================================================================
+// HNSW INDEX (Hierarchical Navigable Small World)
+// =============================================================================
+
+// HNSWIndex provides O(log n) approximate nearest neighbor search
+type HNSWIndex struct {
+    mu sync.RWMutex
+
+    // Graph layers (layer 0 = all nodes, higher layers = fewer nodes)
+    layers []map[string][]string  // layer -> nodeID -> neighbor IDs
+
+    // Node data
+    vectors    map[string][]float32
+    magnitudes map[string]float64
+    domains    map[string]Domain
+    nodeTypes  map[string]NodeType
+
+    // Parameters
+    M            int     // Max connections per node (default: 16)
+    efConstruct  int     // Beam width during construction (default: 200)
+    efSearch     int     // Beam width during search (default: 50)
+    levelMult    float64 // Level multiplier (default: 1/ln(M))
+    maxLevel     int     // Current max level
+    entryPoint   string  // Entry node ID
+}
+
+// HNSWConfig configures the HNSW index
+type HNSWConfig struct {
+    M           int  // Max connections per node
+    EfConstruct int  // Beam width during construction
+    EfSearch    int  // Beam width during search
+}
+
+// DefaultHNSWConfig returns sensible defaults
+func DefaultHNSWConfig() HNSWConfig {
+    return HNSWConfig{
+        M:           16,
+        EfConstruct: 200,
+        EfSearch:    50,
+    }
+}
+
+// NewHNSWIndex creates a new HNSW index
+func NewHNSWIndex(config HNSWConfig) *HNSWIndex {
+    if config.M == 0 {
+        config = DefaultHNSWConfig()
+    }
+
+    return &HNSWIndex{
+        layers:      make([]map[string][]string, 0),
+        vectors:     make(map[string][]float32),
+        magnitudes:  make(map[string]float64),
+        domains:     make(map[string]Domain),
+        nodeTypes:   make(map[string]NodeType),
+        M:           config.M,
+        efConstruct: config.EfConstruct,
+        efSearch:    config.EfSearch,
+        levelMult:   1.0 / math.Log(float64(config.M)),
+    }
+}
+
+// Add inserts a node into the index
+func (h *HNSWIndex) Add(nodeID string, embedding []float32, domain Domain, nodeType NodeType) {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+
+    mag := magnitude(embedding)
+    h.vectors[nodeID] = embedding
+    h.magnitudes[nodeID] = mag
+    h.domains[nodeID] = domain
+    h.nodeTypes[nodeID] = nodeType
+
+    // Random level for this node
+    level := h.randomLevel()
+
+    // Ensure we have enough layers
+    for len(h.layers) <= level {
+        h.layers = append(h.layers, make(map[string][]string))
+    }
+
+    if h.entryPoint == "" {
+        // First node
+        h.entryPoint = nodeID
+        h.maxLevel = level
+        for l := 0; l <= level; l++ {
+            h.layers[l][nodeID] = []string{}
+        }
+        return
+    }
+
+    // Find entry point at top level, descend
+    currNode := h.entryPoint
+
+    for l := h.maxLevel; l > level; l-- {
+        currNode = h.greedySearchSingle(embedding, currNode, l)
+    }
+
+    // Insert at each level
+    for l := min(level, h.maxLevel); l >= 0; l-- {
+        neighbors := h.searchLayer(embedding, currNode, h.efConstruct, l)
+        selected := h.selectNeighbors(embedding, neighbors, h.M)
+
+        h.layers[l][nodeID] = selected
+        for _, neighbor := range selected {
+            h.layers[l][neighbor] = append(h.layers[l][neighbor], nodeID)
+            if len(h.layers[l][neighbor]) > h.M*2 {
+                h.layers[l][neighbor] = h.selectNeighbors(
+                    h.vectors[neighbor],
+                    h.layers[l][neighbor],
+                    h.M,
+                )
+            }
+        }
+
+        if l > 0 && len(neighbors) > 0 {
+            currNode = neighbors[0]
+        }
+    }
+
+    if level > h.maxLevel {
+        h.maxLevel = level
+        h.entryPoint = nodeID
+    }
+}
+
+// Search finds k nearest neighbors
+func (h *HNSWIndex) Search(query []float32, k int, filter *SearchFilter) []ScoredNode {
+    h.mu.RLock()
+    defer h.mu.RUnlock()
+
+    if h.entryPoint == "" {
+        return nil
+    }
+
+    // Descend from top to layer 0
+    currNode := h.entryPoint
+    for l := h.maxLevel; l > 0; l-- {
+        currNode = h.greedySearchSingle(query, currNode, l)
+    }
+
+    // Search at layer 0
+    ef := h.efSearch
+    if k > ef {
+        ef = k
+    }
+
+    candidates := h.searchLayer(query, currNode, ef*2, 0)  // Get extra for filtering
+
+    // Apply filter and score
+    queryMag := magnitude(query)
+    var results []ScoredNode
+
+    for _, nodeID := range candidates {
+        // Apply domain/type filter
+        if filter != nil {
+            if filter.Domain != nil && h.domains[nodeID] != *filter.Domain {
+                continue
+            }
+            if filter.NodeType != nil && h.nodeTypes[nodeID] != *filter.NodeType {
+                continue
+            }
+        }
+
+        sim := cosineSimilarityPrecomputed(query, h.vectors[nodeID], queryMag, h.magnitudes[nodeID])
+        results = append(results, ScoredNode{
+            NodeID:     nodeID,
+            Similarity: sim,
+            Domain:     h.domains[nodeID],
+            NodeType:   h.nodeTypes[nodeID],
+        })
+    }
+
+    // Sort by similarity
+    sort.Slice(results, func(i, j int) bool {
+        return results[i].Similarity > results[j].Similarity
+    })
+
+    if len(results) > k {
+        results = results[:k]
+    }
+
+    return results
+}
+
+// Delete removes a node from the index
+func (h *HNSWIndex) Delete(nodeID string) {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+
+    delete(h.vectors, nodeID)
+    delete(h.magnitudes, nodeID)
+    delete(h.domains, nodeID)
+    delete(h.nodeTypes, nodeID)
+
+    // Remove from all layers
+    for level := range h.layers {
+        delete(h.layers[level], nodeID)
+        // Remove references from neighbors
+        for nid, neighbors := range h.layers[level] {
+            newNeighbors := make([]string, 0, len(neighbors))
+            for _, n := range neighbors {
+                if n != nodeID {
+                    newNeighbors = append(newNeighbors, n)
+                }
+            }
+            h.layers[level][nid] = newNeighbors
+        }
+    }
+
+    // Update entry point if deleted
+    if h.entryPoint == nodeID {
+        h.entryPoint = ""
+        for _, layer := range h.layers {
+            for nid := range layer {
+                h.entryPoint = nid
+                break
+            }
+            if h.entryPoint != "" {
+                break
+            }
+        }
+    }
+}
+
+// Helper functions
+func (h *HNSWIndex) randomLevel() int {
+    level := 0
+    for rand.Float64() < 0.5 && level < 16 {
+        level++
+    }
+    return level
+}
+
+func (h *HNSWIndex) greedySearchSingle(query []float32, entry string, level int) string {
+    curr := entry
+    currDist := h.distance(query, curr)
+
+    for {
+        changed := false
+        for _, neighbor := range h.layers[level][curr] {
+            dist := h.distance(query, neighbor)
+            if dist < currDist {
+                curr = neighbor
+                currDist = dist
+                changed = true
+            }
+        }
+        if !changed {
+            break
+        }
+    }
+
+    return curr
+}
+
+func (h *HNSWIndex) searchLayer(query []float32, entry string, ef int, level int) []string {
+    visited := make(map[string]bool)
+    visited[entry] = true
+
+    candidates := []string{entry}
+    results := []string{entry}
+
+    for len(candidates) > 0 {
+        // Get closest candidate
+        closest := candidates[0]
+        closestDist := h.distance(query, closest)
+        closestIdx := 0
+        for i, c := range candidates[1:] {
+            d := h.distance(query, c)
+            if d < closestDist {
+                closest = c
+                closestDist = d
+                closestIdx = i + 1
+            }
+        }
+        candidates = append(candidates[:closestIdx], candidates[closestIdx+1:]...)
+
+        // Get furthest result
+        furthest := results[len(results)-1]
+        furthestDist := h.distance(query, furthest)
+        for _, r := range results {
+            d := h.distance(query, r)
+            if d > furthestDist {
+                furthest = r
+                furthestDist = d
+            }
+        }
+
+        if closestDist > furthestDist {
+            break
+        }
+
+        // Explore neighbors
+        for _, neighbor := range h.layers[level][closest] {
+            if visited[neighbor] {
+                continue
+            }
+            visited[neighbor] = true
+
+            neighborDist := h.distance(query, neighbor)
+            if neighborDist < furthestDist || len(results) < ef {
+                candidates = append(candidates, neighbor)
+                results = append(results, neighbor)
+
+                // Keep only ef best
+                if len(results) > ef {
+                    sort.Slice(results, func(i, j int) bool {
+                        return h.distance(query, results[i]) < h.distance(query, results[j])
+                    })
+                    results = results[:ef]
+                }
+            }
+        }
+    }
+
+    return results
+}
+
+func (h *HNSWIndex) selectNeighbors(query []float32, candidates []string, m int) []string {
+    if len(candidates) <= m {
+        return candidates
+    }
+
+    // Sort by distance
+    sort.Slice(candidates, func(i, j int) bool {
+        return h.distance(query, candidates[i]) < h.distance(query, candidates[j])
+    })
+
+    return candidates[:m]
+}
+
+func (h *HNSWIndex) distance(query []float32, nodeID string) float64 {
+    return 1.0 - cosineSimilarityPrecomputed(
+        query,
+        h.vectors[nodeID],
+        magnitude(query),
+        h.magnitudes[nodeID],
+    )
+}
+
+// SearchFilter filters search results
+type SearchFilter struct {
+    Domain   *Domain
+    NodeType *NodeType
+}
+
+// ScoredNode is a search result with similarity score
+type ScoredNode struct {
+    NodeID     string
+    Similarity float64
+    Domain     Domain
+    NodeType   NodeType
+}
+
+// Utility functions
+func magnitude(v []float32) float64 {
+    var sum float64
+    for _, x := range v {
+        sum += float64(x) * float64(x)
+    }
+    return math.Sqrt(sum)
+}
+
+func cosineSimilarityPrecomputed(a, b []float32, magA, magB float64) float64 {
+    var dot float64
+    for i := range a {
+        dot += float64(a[i]) * float64(b[i])
+    }
+    if magA == 0 || magB == 0 {
+        return 0
+    }
+    return dot / (magA * magB)
+}
+
+func serializeEmbedding(embedding []float32) []byte {
+    buf := make([]byte, len(embedding)*4)
+    for i, v := range embedding {
+        binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
+    }
+    return buf
+}
+
+func deserializeEmbedding(data []byte) []float32 {
+    embedding := make([]float32, len(data)/4)
+    for i := range embedding {
+        embedding[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4:]))
+    }
+    return embedding
+}
+```
+
+### Core VectorGraphDB Structure
+
+```go
+// =============================================================================
+// VECTORGRAPHDB CORE
+// =============================================================================
+
+// VectorGraphDB is the unified knowledge graph with vector search
+type VectorGraphDB struct {
+    mu sync.RWMutex
+
+    // SQLite connection
+    db *sql.DB
+
+    // In-memory HNSW index
+    hnsw *HNSWIndex
+
+    // Embedder for generating vectors
+    embedder Embedder
+
+    // Prepared statements
+    stmtInsertNode   *sql.Stmt
+    stmtInsertEdge   *sql.Stmt
+    stmtInsertVector *sql.Stmt
+    stmtGetNode      *sql.Stmt
+    stmtGetEdges     *sql.Stmt
+
+    // Configuration
+    config VectorGraphDBConfig
+}
+
+// VectorGraphDBConfig configures the database
+type VectorGraphDBConfig struct {
+    DBPath          string
+    EmbeddingDims   int
+    HNSWConfig      HNSWConfig
+    MaxNodes        int
+    EnableWAL       bool
+}
+
+// DefaultVectorGraphDBConfig returns sensible defaults
+func DefaultVectorGraphDBConfig(dbPath string) VectorGraphDBConfig {
+    return VectorGraphDBConfig{
+        DBPath:        dbPath,
+        EmbeddingDims: 768,
+        HNSWConfig:    DefaultHNSWConfig(),
+        MaxNodes:      1000000,
+        EnableWAL:     true,
+    }
+}
+
+// NewVectorGraphDB creates a new VectorGraphDB
+func NewVectorGraphDB(config VectorGraphDBConfig, embedder Embedder) (*VectorGraphDB, error) {
+    // Open SQLite with WAL mode
+    dsn := config.DBPath
+    if config.EnableWAL {
+        dsn += "?_journal_mode=WAL&_synchronous=NORMAL"
+    }
+
+    db, err := sql.Open("sqlite3", dsn)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open database: %w", err)
+    }
+
+    vdb := &VectorGraphDB{
+        db:       db,
+        hnsw:     NewHNSWIndex(config.HNSWConfig),
+        embedder: embedder,
+        config:   config,
+    }
+
+    // Initialize schema
+    if err := vdb.initSchema(); err != nil {
+        return nil, fmt.Errorf("failed to init schema: %w", err)
+    }
+
+    // Prepare statements
+    if err := vdb.prepareStatements(); err != nil {
+        return nil, fmt.Errorf("failed to prepare statements: %w", err)
+    }
+
+    // Load HNSW index from disk
+    if err := vdb.loadHNSWIndex(); err != nil {
+        return nil, fmt.Errorf("failed to load HNSW index: %w", err)
+    }
+
+    return vdb, nil
+}
+
+// AddNode adds a node to the graph
+func (vdb *VectorGraphDB) AddNode(ctx context.Context, node *Node) error {
+    vdb.mu.Lock()
+    defer vdb.mu.Unlock()
+
+    // Generate embedding if content provided
+    var embedding []float32
+    var mag float64
+    if node.Content != "" && vdb.embedder != nil {
+        var err error
+        embedding, err = vdb.embedder.Embed(ctx, node.Name+" "+node.Content)
+        if err != nil {
+            return fmt.Errorf("failed to generate embedding: %w", err)
+        }
+        mag = magnitude(embedding)
+    }
+
+    // Insert node
+    _, err := vdb.stmtInsertNode.ExecContext(ctx,
+        node.ID, node.Domain, node.Type, node.Name,
+        node.Path, node.Package, node.LineStart, node.LineEnd, node.Signature,
+        node.SessionID, node.Timestamp, node.Category,
+        node.URL, node.Source, node.Authors, node.PublishedAt,
+        node.Content, node.ContentHash, node.Metadata,
+        node.Verified, node.VerificationType, node.Confidence, node.TrustLevel,
+        node.ExpiresAt, node.SupersededBy,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to insert node: %w", err)
+    }
+
+    // Insert vector if embedding generated
+    if len(embedding) > 0 {
+        blob := serializeEmbedding(embedding)
+        _, err = vdb.stmtInsertVector.ExecContext(ctx,
+            node.ID, blob, mag, len(embedding), node.Domain, node.Type,
+        )
+        if err != nil {
+            return fmt.Errorf("failed to insert vector: %w", err)
+        }
+
+        // Add to HNSW index
+        vdb.hnsw.Add(node.ID, embedding, node.Domain, node.Type)
+    }
+
+    return nil
+}
+
+// AddEdge adds an edge between nodes
+func (vdb *VectorGraphDB) AddEdge(ctx context.Context, sourceID, targetID string, edgeType EdgeType, weight float64, metadata map[string]any) error {
+    vdb.mu.Lock()
+    defer vdb.mu.Unlock()
+
+    metaJSON, _ := json.Marshal(metadata)
+
+    _, err := vdb.stmtInsertEdge.ExecContext(ctx,
+        sourceID, targetID, edgeType, weight, metaJSON,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to insert edge: %w", err)
+    }
+
+    return nil
+}
+
+// SimilarNodes finds similar nodes using vector search
+func (vdb *VectorGraphDB) SimilarNodes(ctx context.Context, query string, k int, filter *SearchFilter) ([]ScoredNode, error) {
+    // Generate query embedding
+    embedding, err := vdb.embedder.Embed(ctx, query)
+    if err != nil {
+        return nil, fmt.Errorf("failed to embed query: %w", err)
+    }
+
+    // Search HNSW index
+    vdb.mu.RLock()
+    results := vdb.hnsw.Search(embedding, k, filter)
+    vdb.mu.RUnlock()
+
+    return results, nil
+}
+
+// SimilarToNode finds nodes similar to an existing node
+func (vdb *VectorGraphDB) SimilarToNode(ctx context.Context, nodeID string, k int, filter *SearchFilter) ([]ScoredNode, error) {
+    vdb.mu.RLock()
+    embedding, ok := vdb.hnsw.vectors[nodeID]
+    vdb.mu.RUnlock()
+
+    if !ok {
+        return nil, fmt.Errorf("node not found: %s", nodeID)
+    }
+
+    vdb.mu.RLock()
+    results := vdb.hnsw.Search(embedding, k+1, filter)  // +1 because it will find itself
+    vdb.mu.RUnlock()
+
+    // Remove self from results
+    filtered := make([]ScoredNode, 0, k)
+    for _, r := range results {
+        if r.NodeID != nodeID {
+            filtered = append(filtered, r)
+        }
+    }
+
+    return filtered, nil
+}
+
+// TraverseEdges traverses edges from a node
+func (vdb *VectorGraphDB) TraverseEdges(ctx context.Context, nodeID string, edgeType EdgeType, direction string) ([]*Node, error) {
+    var query string
+    if direction == "outgoing" {
+        query = `
+            SELECT n.* FROM nodes n
+            JOIN edges e ON e.target_id = n.id
+            WHERE e.source_id = ? AND e.edge_type = ?
+        `
+    } else {
+        query = `
+            SELECT n.* FROM nodes n
+            JOIN edges e ON e.source_id = n.id
+            WHERE e.target_id = ? AND e.edge_type = ?
+        `
+    }
+
+    return vdb.queryNodes(ctx, query, nodeID, edgeType)
+}
+
+// GetNode retrieves a node by ID
+func (vdb *VectorGraphDB) GetNode(ctx context.Context, nodeID string) (*Node, error) {
+    row := vdb.stmtGetNode.QueryRowContext(ctx, nodeID)
+    return vdb.scanNode(row)
+}
+
+// Close closes the database
+func (vdb *VectorGraphDB) Close() error {
+    // Save HNSW index
+    if err := vdb.saveHNSWIndex(); err != nil {
+        return fmt.Errorf("failed to save HNSW index: %w", err)
+    }
+
+    return vdb.db.Close()
+}
+```
+
+### Cross-Domain Query Examples
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      CROSS-DOMAIN QUERY EXAMPLES                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  QUERY: "What patterns does our auth code implement?"                       │
+│  ═══════════════════════════════════════════════════                        │
+│                                                                             │
+│       LIBRARIAN                           ACADEMIC                          │
+│       (Code)                              (Knowledge)                       │
+│           │                                   │                             │
+│           ▼                                   │                             │
+│  1. Vector search: "authentication"          │                             │
+│     Returns: auth/middleware.go,             │                             │
+│              auth/jwt.go, etc.               │                             │
+│           │                                   │                             │
+│           ▼                                   │                             │
+│  2. Traverse IMPLEMENTS_PATTERN edges ──────▶ 3. Get pattern nodes         │
+│                                               │                             │
+│                                               ▼                             │
+│                                            Result:                          │
+│                                            • "JWT Bearer Token Pattern"     │
+│                                            • "Middleware Chain Pattern"     │
+│  Token cost: 0 (graph traversal only)                                      │
+│                                                                             │
+│  ───────────────────────────────────────────────────────────────────────   │
+│                                                                             │
+│  QUERY: "Why did we choose JWT over sessions?"                             │
+│  ═════════════════════════════════════════════                              │
+│                                                                             │
+│       ARCHIVALIST                         ACADEMIC                          │
+│       (History)                           (Knowledge)                       │
+│           │                                   │                             │
+│           ▼                                   │                             │
+│  1. Search history: "JWT sessions decision"  │                             │
+│     Returns: decision entry from 2024-06     │                             │
+│           │                                   │                             │
+│           ▼                                   │                             │
+│  2. Traverse BASED_ON edges ────────────────▶ 3. Get referenced sources    │
+│                                               │                             │
+│                                               ▼                             │
+│                                            Result:                          │
+│                                            • RFC 7519 (JWT spec)            │
+│                                            • "Stateless Auth at Scale"      │
+│  Token cost: 0 (graph traversal only)                                      │
+│                                                                             │
+│  ───────────────────────────────────────────────────────────────────────   │
+│                                                                             │
+│  QUERY: "What changes did we make to auth code last week?"                 │
+│  ═════════════════════════════════════════════════════════                  │
+│                                                                             │
+│       ARCHIVALIST              LIBRARIAN                                    │
+│       (History)                (Code)                                       │
+│           │                        │                                        │
+│           ▼                        │                                        │
+│  1. Query entries from             │                                        │
+│     last 7 days with               │                                        │
+│     subject "auth"                 │                                        │
+│           │                        │                                        │
+│           ▼                        │                                        │
+│  2. Traverse MODIFIED edges ──────▶ 3. Resolve to current code nodes       │
+│                                    │                                        │
+│                                    ▼                                        │
+│                                 Result:                                     │
+│                                 • auth/jwt.go:ValidateToken (modified)     │
+│                                 • auth/refresh.go (created)                │
+│  Token cost: 0 (graph traversal only)                                      │
+│                                                                             │
+│  ───────────────────────────────────────────────────────────────────────   │
+│                                                                             │
+│  QUERY: "Have we had issues with this function before?"                    │
+│  ══════════════════════════════════════════════════════                     │
+│                                                                             │
+│       LIBRARIAN                ARCHIVALIST                                  │
+│       (Code)                   (History)                                    │
+│           │                        │                                        │
+│           ▼                        │                                        │
+│  1. Identify function node         │                                        │
+│     (from context or query)        │                                        │
+│           │                        │                                        │
+│           ▼                        │                                        │
+│  2. Traverse MODIFIED edges ──────▶ 3. Get history entries that            │
+│     (reverse direction)               modified this function               │
+│                                    │                                        │
+│                                    ▼                                        │
+│                                 4. Filter for outcomes with                │
+│                                    category "bug_fix" or "issue"           │
+│                                    │                                        │
+│                                    ▼                                        │
+│                                 Result:                                     │
+│                                 • 2024-01-05: Token expiry bypass (fixed)  │
+│                                 • 2024-02-12: Algorithm confusion (fixed)  │
+│  Token cost: 0 (graph traversal only)                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// Cross-domain query implementations
+
+// GetHistoryForCode returns history entries that modified a code node
+func (vdb *VectorGraphDB) GetHistoryForCode(ctx context.Context, codeNodeID string) ([]*Node, error) {
+    query := `
+        SELECT n.*
+        FROM nodes n
+        JOIN edges e ON e.source_id = n.id
+        WHERE e.target_id = ?
+          AND e.edge_type IN (?, ?, ?)
+          AND n.domain = ?
+        ORDER BY n.timestamp DESC
+    `
+    return vdb.queryNodes(ctx, query,
+        codeNodeID,
+        EdgeTypeModified, EdgeTypeCreated, EdgeTypeDeleted,
+        DomainHistory,
+    )
+}
+
+// GetCodeForHistory returns code nodes referenced by a history entry
+func (vdb *VectorGraphDB) GetCodeForHistory(ctx context.Context, historyNodeID string) ([]*Node, error) {
+    query := `
+        SELECT n.*
+        FROM nodes n
+        JOIN edges e ON e.target_id = n.id
+        WHERE e.source_id = ?
+          AND e.edge_type IN (?, ?, ?)
+          AND n.domain = ?
+    `
+    return vdb.queryNodes(ctx, query,
+        historyNodeID,
+        EdgeTypeModified, EdgeTypeCreated, EdgeTypeDeleted,
+        DomainCode,
+    )
+}
+
+// GetAcademicForCode returns academic nodes that document code
+func (vdb *VectorGraphDB) GetAcademicForCode(ctx context.Context, codeNodeID string) ([]*Node, error) {
+    query := `
+        SELECT n.*
+        FROM nodes n
+        JOIN edges e ON e.source_id = n.id
+        WHERE e.target_id = ?
+          AND e.edge_type IN (?, ?)
+          AND n.domain = ?
+    `
+    return vdb.queryNodes(ctx, query,
+        codeNodeID,
+        EdgeTypeDocuments, EdgeTypeImplementsPattern,
+        DomainAcademic,
+    )
+}
+
+// GetAcademicForDecision returns academic nodes that a decision was based on
+func (vdb *VectorGraphDB) GetAcademicForDecision(ctx context.Context, historyNodeID string) ([]*Node, error) {
+    query := `
+        SELECT n.*
+        FROM nodes n
+        JOIN edges e ON e.target_id = n.id
+        WHERE e.source_id = ?
+          AND e.edge_type IN (?, ?, ?)
+          AND n.domain = ?
+    `
+    return vdb.queryNodes(ctx, query,
+        historyNodeID,
+        EdgeTypeBasedOn, EdgeTypeReferences, EdgeTypeValidatedBy,
+        DomainAcademic,
+    )
+}
+
+// SimilarAcrossDomainsWithContext performs vector search with graph context
+func (vdb *VectorGraphDB) SimilarAcrossDomainsWithContext(
+    ctx context.Context,
+    query string,
+    k int,
+    pathFilter string,
+) (*CrossDomainResult, error) {
+    // 1. Vector search across all domains
+    embedding, err := vdb.embedder.Embed(ctx, query)
+    if err != nil {
+        return nil, err
+    }
+
+    similar := vdb.hnsw.Search(embedding, k*3, nil)  // Get extra for filtering
+
+    // 2. Filter by path if specified
+    var filtered []ScoredNode
+    for _, node := range similar {
+        if pathFilter != "" {
+            n, err := vdb.GetNode(ctx, node.NodeID)
+            if err != nil {
+                continue
+            }
+            if n.Path != "" && !strings.Contains(n.Path, pathFilter) {
+                continue
+            }
+        }
+        filtered = append(filtered, node)
+        if len(filtered) >= k {
+            break
+        }
+    }
+
+    // 3. Enrich with cross-domain context
+    result := &CrossDomainResult{
+        Query:   query,
+        Results: make([]EnrichedNode, len(filtered)),
+    }
+
+    for i, scored := range filtered {
+        node, _ := vdb.GetNode(ctx, scored.NodeID)
+        enriched := EnrichedNode{
+            Node:       node,
+            Similarity: scored.Similarity,
+        }
+
+        // Get cross-domain context based on domain
+        switch node.Domain {
+        case DomainCode:
+            enriched.History, _ = vdb.GetHistoryForCode(ctx, node.ID)
+            enriched.Academic, _ = vdb.GetAcademicForCode(ctx, node.ID)
+        case DomainHistory:
+            enriched.Code, _ = vdb.GetCodeForHistory(ctx, node.ID)
+            enriched.Academic, _ = vdb.GetAcademicForDecision(ctx, node.ID)
+        case DomainAcademic:
+            // Get code that references this academic node
+            enriched.Code, _ = vdb.queryNodes(ctx, `
+                SELECT n.* FROM nodes n
+                JOIN edges e ON e.source_id = n.id
+                WHERE e.target_id = ? AND n.domain = ?
+            `, node.ID, DomainCode)
+        }
+
+        result.Results[i] = enriched
+    }
+
+    return result, nil
+}
+
+// CrossDomainResult contains enriched search results
+type CrossDomainResult struct {
+    Query   string
+    Results []EnrichedNode
+}
+
+// EnrichedNode is a node with cross-domain context
+type EnrichedNode struct {
+    Node       *Node
+    Similarity float64
+    Code       []*Node  // Related code nodes
+    History    []*Node  // Related history nodes
+    Academic   []*Node  // Related academic nodes
+}
+```
+
+### Mitigation 1: Hallucination Firewall (Verify Before Store)
+
+**Risk**: LLM hallucinates facts, they get stored, then retrieved as "evidence" creating a feedback loop.
+
+**Mitigation**: Verify all LLM-generated content against source of truth before storing.
+
+```go
+// =============================================================================
+// MITIGATION 1: HALLUCINATION FIREWALL
+// =============================================================================
+
+// HallucinationFirewall verifies content before storage
+type HallucinationFirewall struct {
+    vdb       *VectorGraphDB
+    librarian *Librarian  // For code verification
+}
+
+// VerificationResult contains verification outcome
+type VerificationResult struct {
+    Verified       bool
+    VerificationType VerificationType
+    Confidence     float64
+    Warnings       []string
+    Contradictions []string
+    SourceNodes    []string  // Nodes used for verification
+}
+
+// VerifyBeforeStore verifies an entry before storing
+func (hf *HallucinationFirewall) VerifyBeforeStore(ctx context.Context, entry *HistoryEntry) (*VerificationResult, error) {
+    result := &VerificationResult{
+        Verified:   true,
+        Confidence: 1.0,
+    }
+
+    // 1. Extract claims from content
+    claims := hf.extractCodeClaims(entry.Content)
+
+    // 2. Verify each claim against code
+    for _, claim := range claims {
+        verified, sources, err := hf.verifyClaimAgainstCode(ctx, claim)
+        if err != nil {
+            result.Warnings = append(result.Warnings,
+                fmt.Sprintf("Could not verify claim: %s", claim.Text))
+            continue
+        }
+
+        if !verified {
+            result.Verified = false
+            result.Contradictions = append(result.Contradictions,
+                fmt.Sprintf("Claim '%s' contradicts code", claim.Text))
+            result.Confidence *= 0.5
+        } else {
+            result.SourceNodes = append(result.SourceNodes, sources...)
+        }
+    }
+
+    // 3. Verify referenced files exist
+    for _, filePath := range entry.ReferencedFiles {
+        exists, err := hf.librarian.FileExists(ctx, filePath)
+        if err != nil || !exists {
+            result.Warnings = append(result.Warnings,
+                fmt.Sprintf("Referenced file not found: %s", filePath))
+            result.Confidence *= 0.8
+        }
+    }
+
+    // 4. Check for contradictions with recent history
+    contradictions, err := hf.findHistoryContradictions(ctx, entry)
+    if err == nil && len(contradictions) > 0 {
+        result.Contradictions = append(result.Contradictions, contradictions...)
+        result.Confidence *= 0.7
+    }
+
+    // 5. Set verification type
+    if result.Verified && result.Confidence >= 0.8 {
+        result.VerificationType = VerificationAgainstCode
+    } else {
+        result.VerificationType = VerificationNone
+    }
+
+    return result, nil
+}
+
+// Claim represents an extractable claim from content
+type Claim struct {
+    Text    string
+    Subject string
+    Type    string  // "uses", "implements", "has", "is"
+}
+
+// extractCodeClaims extracts verifiable claims from content
+func (hf *HallucinationFirewall) extractCodeClaims(content string) []Claim {
+    var claims []Claim
+
+    // Pattern: "we use X for Y"
+    usePatterns := regexp.MustCompile(`(?i)we use (\w+) for (\w+)`)
+    matches := usePatterns.FindAllStringSubmatch(content, -1)
+    for _, m := range matches {
+        claims = append(claims, Claim{
+            Text:    m[0],
+            Subject: m[1],
+            Type:    "uses",
+        })
+    }
+
+    // Pattern: "X implements Y"
+    implPatterns := regexp.MustCompile(`(?i)(\w+) implements (\w+)`)
+    matches = implPatterns.FindAllStringSubmatch(content, -1)
+    for _, m := range matches {
+        claims = append(claims, Claim{
+            Text:    m[0],
+            Subject: m[1],
+            Type:    "implements",
+        })
+    }
+
+    // Pattern: "the X is in Y"
+    locPatterns := regexp.MustCompile(`(?i)the (\w+) is in (\S+)`)
+    matches = locPatterns.FindAllStringSubmatch(content, -1)
+    for _, m := range matches {
+        claims = append(claims, Claim{
+            Text:    m[0],
+            Subject: m[1],
+            Type:    "location",
+        })
+    }
+
+    return claims
+}
+
+// verifyClaimAgainstCode verifies a claim against the codebase
+func (hf *HallucinationFirewall) verifyClaimAgainstCode(ctx context.Context, claim Claim) (bool, []string, error) {
+    // Search code for evidence
+    results, err := hf.vdb.SimilarNodes(ctx, claim.Subject, 10, &SearchFilter{
+        Domain: ptr(DomainCode),
+    })
+    if err != nil {
+        return false, nil, err
+    }
+
+    if len(results) == 0 {
+        return false, nil, nil  // No evidence found
+    }
+
+    // Check if any result supports the claim
+    var sources []string
+    for _, result := range results {
+        node, err := hf.vdb.GetNode(ctx, result.NodeID)
+        if err != nil {
+            continue
+        }
+
+        // Simple heuristic: if claim subject appears in code content
+        if strings.Contains(strings.ToLower(node.Content), strings.ToLower(claim.Subject)) {
+            sources = append(sources, node.ID)
+        }
+    }
+
+    return len(sources) > 0, sources, nil
+}
+
+// findHistoryContradictions finds contradictions with recent history
+func (hf *HallucinationFirewall) findHistoryContradictions(ctx context.Context, entry *HistoryEntry) ([]string, error) {
+    // Get recent entries about same subject
+    results, err := hf.vdb.SimilarNodes(ctx, entry.Summary, 20, &SearchFilter{
+        Domain: ptr(DomainHistory),
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    var contradictions []string
+
+    // Check for contradicting claims
+    entryClaims := hf.extractCodeClaims(entry.Content)
+
+    for _, result := range results {
+        if result.Similarity < 0.7 {
+            continue  // Not similar enough to be relevant
+        }
+
+        node, err := hf.vdb.GetNode(ctx, result.NodeID)
+        if err != nil {
+            continue
+        }
+
+        historyClaims := hf.extractCodeClaims(node.Content)
+
+        for _, ec := range entryClaims {
+            for _, hc := range historyClaims {
+                if ec.Subject == hc.Subject && ec.Type == hc.Type {
+                    // Same subject and type but different claim
+                    if ec.Text != hc.Text {
+                        contradictions = append(contradictions,
+                            fmt.Sprintf("New: '%s' vs History: '%s'", ec.Text, hc.Text))
+                    }
+                }
+            }
+        }
+    }
+
+    return contradictions, nil
+}
+
+// StoreWithVerification stores an entry with verification
+func (hf *HallucinationFirewall) StoreWithVerification(ctx context.Context, entry *HistoryEntry) error {
+    // Verify first
+    result, err := hf.VerifyBeforeStore(ctx, entry)
+    if err != nil {
+        return err
+    }
+
+    // Create node with verification metadata
+    node := &Node{
+        ID:               entry.ID,
+        Domain:           DomainHistory,
+        Type:             NodeTypeHistoryEntry,
+        Name:             entry.Summary,
+        Content:          entry.Content,
+        SessionID:        entry.SessionID,
+        Timestamp:        entry.Timestamp,
+        Category:         entry.Category,
+        Verified:         result.Verified,
+        VerificationType: result.VerificationType,
+        Confidence:       result.Confidence,
+        TrustLevel:       int(TrustLevelRecent),
+    }
+
+    // Mark as unverified if failed
+    if !result.Verified {
+        node.TrustLevel = int(TrustLevelLLM)
+        node.Content = "[UNVERIFIED] " + node.Content
+
+        // Store warnings in metadata
+        meta := map[string]any{
+            "warnings":       result.Warnings,
+            "contradictions": result.Contradictions,
+            "needs_review":   true,
+        }
+        metaJSON, _ := json.Marshal(meta)
+        node.Metadata = string(metaJSON)
+    }
+
+    // Store node
+    if err := hf.vdb.AddNode(ctx, node); err != nil {
+        return err
+    }
+
+    // Create provenance edges to source nodes
+    for _, sourceID := range result.SourceNodes {
+        hf.vdb.AddEdge(ctx, node.ID, sourceID, EdgeTypeReferences, 1.0, nil)
+    }
+
+    return nil
+}
+
+func ptr[T any](v T) *T { return &v }
+```
+
+### Mitigation 2: Freshness Tracking & Decay
+
+**Risk**: Stale data gets retrieved and presented as current truth.
+
+**Mitigation**: Track creation time, apply decay, prefer fresh data.
+
+```go
+// =============================================================================
+// MITIGATION 2: FRESHNESS TRACKING & DECAY
+// =============================================================================
+
+// FreshnessTracker manages temporal relevance of nodes
+type FreshnessTracker struct {
+    vdb *VectorGraphDB
+}
+
+// FreshnessScore represents a node's temporal relevance
+type FreshnessScore struct {
+    Score           float64
+    Age             time.Duration
+    IsSuperseded    bool
+    SupersededBy    string
+    Warning         string
+}
+
+// CalculateFreshness calculates freshness score for a node
+func (ft *FreshnessTracker) CalculateFreshness(ctx context.Context, node *Node) FreshnessScore {
+    result := FreshnessScore{
+        Score: 1.0,
+    }
+
+    // Check if superseded
+    if node.SupersededBy != "" {
+        result.IsSuperseded = true
+        result.SupersededBy = node.SupersededBy
+        result.Score = 0.1  // Heavily penalize superseded nodes
+        result.Warning = "⚠️ SUPERSEDED - newer information available"
+        return result
+    }
+
+    // Calculate age
+    if !node.Timestamp.IsZero() {
+        result.Age = time.Since(node.Timestamp)
+    } else {
+        result.Age = time.Since(node.CreatedAt)
+    }
+
+    // Apply domain-specific decay
+    switch node.Domain {
+    case DomainCode:
+        // Code freshness based on content hash (checked separately)
+        result.Score = 1.0  // Assume fresh if hash matches
+        result.Warning = ""
+
+    case DomainHistory:
+        // History decays over time
+        // 1 day = 0.95, 1 week = 0.8, 1 month = 0.6, 6 months = 0.3
+        days := result.Age.Hours() / 24
+        result.Score = math.Max(0.2, 1.0-days/180.0*0.8)
+
+        if days > 30 {
+            result.Warning = fmt.Sprintf("⚠️ %d days old - may be outdated", int(days))
+        }
+
+    case DomainAcademic:
+        // Academic content decays slower
+        days := result.Age.Hours() / 24
+        result.Score = math.Max(0.3, 1.0-days/365.0*0.7)
+
+        if days > 180 {
+            result.Warning = fmt.Sprintf("⚠️ %d days old - verify still current", int(days))
+        }
+    }
+
+    // Check expiration
+    if node.ExpiresAt != nil && time.Now().After(*node.ExpiresAt) {
+        result.Score *= 0.5
+        result.Warning = "⚠️ EXPIRED - should be refreshed"
+    }
+
+    return result
+}
+
+// GetWithFreshness retrieves a node with freshness information
+func (ft *FreshnessTracker) GetWithFreshness(ctx context.Context, nodeID string) (*NodeWithFreshness, error) {
+    node, err := ft.vdb.GetNode(ctx, nodeID)
+    if err != nil {
+        return nil, err
+    }
+
+    freshness := ft.CalculateFreshness(ctx, node)
+
+    // If superseded, optionally get the newer version
+    var currentVersion *Node
+    if freshness.IsSuperseded {
+        currentVersion, _ = ft.vdb.GetNode(ctx, freshness.SupersededBy)
+    }
+
+    return &NodeWithFreshness{
+        Node:           node,
+        Freshness:      freshness,
+        CurrentVersion: currentVersion,
+    }, nil
+}
+
+// NodeWithFreshness wraps a node with freshness metadata
+type NodeWithFreshness struct {
+    Node           *Node
+    Freshness      FreshnessScore
+    CurrentVersion *Node  // If superseded, this is the newer version
+}
+
+// SupersedeNode marks a node as superseded by another
+func (ft *FreshnessTracker) SupersedeNode(ctx context.Context, oldNodeID, newNodeID string) error {
+    _, err := ft.vdb.db.ExecContext(ctx, `
+        UPDATE nodes SET superseded_by = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    `, newNodeID, oldNodeID)
+    if err != nil {
+        return err
+    }
+
+    // Add supersedes edge
+    return ft.vdb.AddEdge(ctx, newNodeID, oldNodeID, EdgeTypeSupersedes, 1.0, nil)
+}
+
+// RefreshRanking applies freshness to search results
+func (ft *FreshnessTracker) RefreshRanking(ctx context.Context, results []ScoredNode) []ScoredNodeWithFreshness {
+    ranked := make([]ScoredNodeWithFreshness, len(results))
+
+    for i, result := range results {
+        node, err := ft.vdb.GetNode(ctx, result.NodeID)
+        if err != nil {
+            ranked[i] = ScoredNodeWithFreshness{
+                ScoredNode:   result,
+                Freshness:    FreshnessScore{Score: 0.5},
+                CombinedScore: result.Similarity * 0.5,
+            }
+            continue
+        }
+
+        freshness := ft.CalculateFreshness(ctx, node)
+
+        // Combined score: similarity * freshness
+        combined := result.Similarity * freshness.Score
+
+        ranked[i] = ScoredNodeWithFreshness{
+            ScoredNode:    result,
+            Freshness:     freshness,
+            CombinedScore: combined,
+        }
+    }
+
+    // Sort by combined score
+    sort.Slice(ranked, func(i, j int) bool {
+        return ranked[i].CombinedScore > ranked[j].CombinedScore
+    })
+
+    return ranked
+}
+
+// ScoredNodeWithFreshness extends ScoredNode with freshness
+type ScoredNodeWithFreshness struct {
+    ScoredNode
+    Freshness     FreshnessScore
+    CombinedScore float64
+}
+
+// CleanupExpired removes or archives expired nodes
+func (ft *FreshnessTracker) CleanupExpired(ctx context.Context) (int, error) {
+    result, err := ft.vdb.db.ExecContext(ctx, `
+        DELETE FROM nodes
+        WHERE expires_at IS NOT NULL
+          AND expires_at < datetime('now', '-30 days')
+          AND domain = ?
+    `, DomainHistory)  // Only auto-cleanup history, not code or academic
+
+    if err != nil {
+        return 0, err
+    }
+
+    affected, _ := result.RowsAffected()
+    return int(affected), nil
+}
+```
+
+### Mitigation 3: Source Attribution & Provenance
+
+**Risk**: User can't tell where information came from (code? history? academic? LLM inference?).
+
+**Mitigation**: Track and expose provenance for all information.
+
+```go
+// =============================================================================
+// MITIGATION 3: SOURCE ATTRIBUTION & PROVENANCE
+// =============================================================================
+
+// ProvenanceTracker tracks and exposes information sources
+type ProvenanceTracker struct {
+    vdb *VectorGraphDB
+}
+
+// ProvenanceChain represents the full source chain for information
+type ProvenanceChain struct {
+    Sources []ProvenanceSource
+}
+
+// ProvenanceSource represents a single source in the chain
+type ProvenanceSource struct {
+    Type       SourceType
+    NodeID     string
+    Path       string    // File path (if code)
+    URL        string    // URL (if academic)
+    Timestamp  time.Time
+    Confidence float64
+    Verified   bool
+}
+
+// AddProvenance records provenance for a node
+func (pt *ProvenanceTracker) AddProvenance(ctx context.Context, nodeID string, source ProvenanceSource) error {
+    _, err := pt.vdb.db.ExecContext(ctx, `
+        INSERT INTO provenance (node_id, source_type, source_node_id, source_path, source_url, confidence, verified_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, nodeID, source.Type, source.NodeID, source.Path, source.URL, source.Confidence,
+        func() any { if source.Verified { return time.Now() } else { return nil } }())
+
+    return err
+}
+
+// GetProvenance retrieves provenance chain for a node
+func (pt *ProvenanceTracker) GetProvenance(ctx context.Context, nodeID string) (*ProvenanceChain, error) {
+    rows, err := pt.vdb.db.QueryContext(ctx, `
+        SELECT source_type, source_node_id, source_path, source_url, confidence, verified_at
+        FROM provenance
+        WHERE node_id = ?
+        ORDER BY confidence DESC
+    `, nodeID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    chain := &ProvenanceChain{}
+
+    for rows.Next() {
+        var source ProvenanceSource
+        var verifiedAt sql.NullTime
+
+        err := rows.Scan(&source.Type, &source.NodeID, &source.Path, &source.URL, &source.Confidence, &verifiedAt)
+        if err != nil {
+            continue
+        }
+
+        source.Verified = verifiedAt.Valid
+        if verifiedAt.Valid {
+            source.Timestamp = verifiedAt.Time
+        }
+
+        chain.Sources = append(chain.Sources, source)
+    }
+
+    return chain, nil
+}
+
+// AnnotatedResponse is a response with source annotations
+type AnnotatedResponse struct {
+    Text     string
+    Segments []AnnotatedSegment
+}
+
+// AnnotatedSegment is a text segment with provenance
+type AnnotatedSegment struct {
+    Text       string
+    Start      int
+    End        int
+    Provenance ProvenanceChain
+    SourceRef  string  // [1], [2], etc.
+}
+
+// AnnotateResponse adds source citations to a response
+func (pt *ProvenanceTracker) AnnotateResponse(ctx context.Context, response string, usedNodes []string) (*AnnotatedResponse, error) {
+    annotated := &AnnotatedResponse{
+        Text: response,
+    }
+
+    // Build source references
+    sourceRefs := make(map[string]string)  // nodeID -> [n]
+    var sourceList []string
+
+    for i, nodeID := range usedNodes {
+        ref := fmt.Sprintf("[%d]", i+1)
+        sourceRefs[nodeID] = ref
+        sourceList = append(sourceList, nodeID)
+    }
+
+    // Create segments for each source mention
+    for nodeID, ref := range sourceRefs {
+        provenance, err := pt.GetProvenance(ctx, nodeID)
+        if err != nil {
+            continue
+        }
+
+        // Find where this source's content appears in response
+        node, err := pt.vdb.GetNode(ctx, nodeID)
+        if err != nil {
+            continue
+        }
+
+        // Simple heuristic: look for key terms from the node
+        keyTerms := extractKeyTerms(node.Content)
+        for _, term := range keyTerms {
+            idx := strings.Index(strings.ToLower(response), strings.ToLower(term))
+            if idx >= 0 {
+                annotated.Segments = append(annotated.Segments, AnnotatedSegment{
+                    Text:       term,
+                    Start:      idx,
+                    End:        idx + len(term),
+                    Provenance: *provenance,
+                    SourceRef:  ref,
+                })
+                break  // One segment per source
+            }
+        }
+    }
+
+    return annotated, nil
+}
+
+// FormatSourceList formats sources for display
+func (pt *ProvenanceTracker) FormatSourceList(ctx context.Context, nodeIDs []string) (string, error) {
+    var lines []string
+
+    for i, nodeID := range nodeIDs {
+        node, err := pt.vdb.GetNode(ctx, nodeID)
+        if err != nil {
+            continue
+        }
+
+        provenance, _ := pt.GetProvenance(ctx, nodeID)
+
+        var sourceDesc string
+        var warning string
+
+        switch node.Domain {
+        case DomainCode:
+            sourceDesc = fmt.Sprintf("Code: %s", node.Path)
+            if node.LineStart > 0 {
+                sourceDesc += fmt.Sprintf(":%d-%d", node.LineStart, node.LineEnd)
+            }
+            warning = "(verified, current)"
+
+        case DomainHistory:
+            age := time.Since(node.Timestamp)
+            sourceDesc = fmt.Sprintf("History: %s", node.Timestamp.Format("2006-01-02"))
+            if age.Hours() > 24*30 {
+                warning = fmt.Sprintf("(%d days old)", int(age.Hours()/24))
+            } else {
+                warning = "(recent)"
+            }
+
+        case DomainAcademic:
+            sourceDesc = fmt.Sprintf("Academic: %s", node.Name)
+            if node.URL != "" {
+                sourceDesc += fmt.Sprintf(" (%s)", node.URL)
+            }
+            switch node.Type {
+            case NodeTypeRFC:
+                warning = "(authoritative)"
+            case NodeTypeDocumentation:
+                warning = "(official docs)"
+            default:
+                warning = "(external)"
+            }
+        }
+
+        if !node.Verified {
+            warning = "⚠️ UNVERIFIED"
+        }
+
+        // Add provenance details
+        if provenance != nil && len(provenance.Sources) > 0 {
+            sourceDesc += " via " + sourceTypeName(provenance.Sources[0].Type)
+        }
+
+        lines = append(lines, fmt.Sprintf("[%d] %s %s", i+1, sourceDesc, warning))
+    }
+
+    return strings.Join(lines, "\n"), nil
+}
+
+func sourceTypeName(t SourceType) string {
+    switch t {
+    case SourceTypeCode:
+        return "code analysis"
+    case SourceTypeHistory:
+        return "history lookup"
+    case SourceTypeAcademic:
+        return "external reference"
+    case SourceTypeLLMInference:
+        return "inference"
+    case SourceTypeUserProvided:
+        return "user input"
+    default:
+        return "unknown"
+    }
+}
+
+func extractKeyTerms(content string) []string {
+    // Simple term extraction (in practice, use NLP)
+    words := strings.Fields(content)
+    var terms []string
+    for _, word := range words {
+        if len(word) > 5 {  // Only meaningful words
+            terms = append(terms, word)
+        }
+        if len(terms) >= 5 {
+            break
+        }
+    }
+    return terms
+}
+```
+
+### Mitigation 4: Trust Hierarchy
+
+**Risk**: LLM doesn't know which sources to trust when they conflict.
+
+**Mitigation**: Explicit trust hierarchy with code as ground truth.
+
+```go
+// =============================================================================
+// MITIGATION 4: TRUST HIERARCHY
+// =============================================================================
+
+// TrustHierarchy manages source trustworthiness
+type TrustHierarchy struct {
+    vdb *VectorGraphDB
+}
+
+// GetTrustLevel returns the trust level for a node
+func (th *TrustHierarchy) GetTrustLevel(ctx context.Context, node *Node) TrustLevel {
+    // Code is always ground truth
+    if node.Domain == DomainCode {
+        return TrustLevelGround
+    }
+
+    // Check if verified
+    if !node.Verified {
+        return TrustLevelLLM
+    }
+
+    // History trust depends on age and verification
+    if node.Domain == DomainHistory {
+        age := time.Since(node.Timestamp)
+        if age < 7*24*time.Hour {
+            return TrustLevelRecent
+        } else if age < 30*24*time.Hour {
+            return TrustLevel(60)  // Between recent and academic
+        } else {
+            return TrustLevelOldHistory
+        }
+    }
+
+    // Academic trust depends on type
+    if node.Domain == DomainAcademic {
+        switch node.Type {
+        case NodeTypeRFC:
+            return TrustLevelStandard
+        case NodeTypeDocumentation:
+            return TrustLevelStandard
+        case NodeTypePaper:
+            return TrustLevelAcademic
+        case NodeTypeBestPractice:
+            return TrustLevelAcademic
+        case NodeTypeStackOverflow, NodeTypeBlogPost:
+            return TrustLevelBlog
+        default:
+            return TrustLevelAcademic
+        }
+    }
+
+    return TrustLevel(node.TrustLevel)
+}
+
+// TrustLevelName returns a human-readable trust level name
+func TrustLevelName(level TrustLevel) string {
+    switch {
+    case level >= TrustLevelGround:
+        return "Ground Truth (Code)"
+    case level >= TrustLevelRecent:
+        return "Recent Verified"
+    case level >= TrustLevelStandard:
+        return "Authoritative"
+    case level >= TrustLevelAcademic:
+        return "Academic"
+    case level >= TrustLevelOldHistory:
+        return "Old History"
+    case level >= TrustLevelBlog:
+        return "Informal"
+    default:
+        return "Unverified/Inferred"
+    }
+}
+
+// TrustWarning returns a warning message for low-trust content
+func (th *TrustHierarchy) TrustWarning(level TrustLevel) string {
+    switch {
+    case level >= TrustLevelGround:
+        return ""
+    case level >= TrustLevelRecent:
+        return "From recent history, may need verification"
+    case level >= TrustLevelStandard:
+        return "From external docs, verify applies to your context"
+    case level >= TrustLevelAcademic:
+        return "Academic source, may not apply directly"
+    case level >= TrustLevelOldHistory:
+        return "⚠️ OLD DATA - verify this is still accurate"
+    case level >= TrustLevelBlog:
+        return "⚠️ Informal source - verify independently"
+    default:
+        return "⚠️ UNVERIFIED - LLM inference, may be incorrect"
+    }
+}
+
+// RankByTrust sorts nodes by trust level
+func (th *TrustHierarchy) RankByTrust(ctx context.Context, nodes []*Node) []*NodeWithTrust {
+    ranked := make([]*NodeWithTrust, len(nodes))
+
+    for i, node := range nodes {
+        trust := th.GetTrustLevel(ctx, node)
+        ranked[i] = &NodeWithTrust{
+            Node:    node,
+            Trust:   trust,
+            Warning: th.TrustWarning(trust),
+        }
+    }
+
+    // Sort by trust level (highest first)
+    sort.Slice(ranked, func(i, j int) bool {
+        return ranked[i].Trust > ranked[j].Trust
+    })
+
+    return ranked
+}
+
+// NodeWithTrust wraps a node with trust information
+type NodeWithTrust struct {
+    Node    *Node
+    Trust   TrustLevel
+    Warning string
+}
+
+// ResolveConflict resolves conflicts between nodes using trust hierarchy
+func (th *TrustHierarchy) ResolveConflict(ctx context.Context, nodeA, nodeB *Node) *ConflictResolution {
+    trustA := th.GetTrustLevel(ctx, nodeA)
+    trustB := th.GetTrustLevel(ctx, nodeB)
+
+    resolution := &ConflictResolution{
+        NodeA:      nodeA,
+        NodeB:      nodeB,
+        TrustA:     trustA,
+        TrustB:     trustB,
+    }
+
+    // Code always wins
+    if nodeA.Domain == DomainCode && nodeB.Domain != DomainCode {
+        resolution.Winner = nodeA
+        resolution.Reason = "Code is source of truth"
+        return resolution
+    }
+    if nodeB.Domain == DomainCode && nodeA.Domain != DomainCode {
+        resolution.Winner = nodeB
+        resolution.Reason = "Code is source of truth"
+        return resolution
+    }
+
+    // Higher trust wins
+    if trustA > trustB {
+        resolution.Winner = nodeA
+        resolution.Reason = fmt.Sprintf("%s > %s", TrustLevelName(trustA), TrustLevelName(trustB))
+    } else if trustB > trustA {
+        resolution.Winner = nodeB
+        resolution.Reason = fmt.Sprintf("%s > %s", TrustLevelName(trustB), TrustLevelName(trustA))
+    } else {
+        // Same trust - prefer newer
+        if nodeA.Timestamp.After(nodeB.Timestamp) {
+            resolution.Winner = nodeA
+            resolution.Reason = "Same trust level, preferring newer"
+        } else {
+            resolution.Winner = nodeB
+            resolution.Reason = "Same trust level, preferring newer"
+        }
+    }
+
+    return resolution
+}
+
+// ConflictResolution contains the resolution of a conflict
+type ConflictResolution struct {
+    NodeA   *Node
+    NodeB   *Node
+    TrustA  TrustLevel
+    TrustB  TrustLevel
+    Winner  *Node
+    Reason  string
+}
+```
+
+### Mitigation 5: Conflict Detection
+
+**Risk**: Contradictory information retrieved without the user knowing.
+
+**Mitigation**: Detect and surface conflicts before presenting to LLM/user.
+
+```go
+// =============================================================================
+// MITIGATION 5: CONFLICT DETECTION
+// =============================================================================
+
+// ConflictDetector detects contradictions in retrieved context
+type ConflictDetector struct {
+    vdb   *VectorGraphDB
+    trust *TrustHierarchy
+}
+
+// Conflict represents a detected contradiction
+type Conflict struct {
+    Type        ConflictType
+    Subject     string
+    NodeA       *Node
+    NodeB       *Node
+    Description string
+    Resolution  string
+    Resolved    bool
+}
+
+// DetectConflicts finds conflicts in a set of retrieved nodes
+func (cd *ConflictDetector) DetectConflicts(ctx context.Context, nodes []*Node) ([]Conflict, error) {
+    var conflicts []Conflict
+
+    // 1. Temporal conflicts (old vs new on same subject)
+    temporal := cd.detectTemporalConflicts(nodes)
+    conflicts = append(conflicts, temporal...)
+
+    // 2. Source conflicts (code says X, history says Y)
+    source := cd.detectSourceConflicts(ctx, nodes)
+    conflicts = append(conflicts, source...)
+
+    // 3. Semantic contradictions (claim A contradicts claim B)
+    semantic := cd.detectSemanticConflicts(nodes)
+    conflicts = append(conflicts, semantic...)
+
+    // Store detected conflicts
+    for _, c := range conflicts {
+        cd.storeConflict(ctx, c)
+    }
+
+    return conflicts, nil
+}
+
+// detectTemporalConflicts finds conflicts due to time differences
+func (cd *ConflictDetector) detectTemporalConflicts(nodes []*Node) []Conflict {
+    var conflicts []Conflict
+
+    // Group by subject
+    bySubject := make(map[string][]*Node)
+    for _, node := range nodes {
+        subject := extractSubject(node)
+        bySubject[subject] = append(bySubject[subject], node)
+    }
+
+    for subject, group := range bySubject {
+        if len(group) < 2 {
+            continue
+        }
+
+        // Sort by time
+        sort.Slice(group, func(i, j int) bool {
+            return group[i].Timestamp.Before(group[j].Timestamp)
+        })
+
+        oldest := group[0]
+        newest := group[len(group)-1]
+
+        // If >30 days apart, flag as potential conflict
+        if newest.Timestamp.Sub(oldest.Timestamp) > 30*24*time.Hour {
+            conflicts = append(conflicts, Conflict{
+                Type:        ConflictTypeTemporal,
+                Subject:     subject,
+                NodeA:       oldest,
+                NodeB:       newest,
+                Description: fmt.Sprintf("Information about '%s' spans %d days - older data may be stale",
+                    subject, int(newest.Timestamp.Sub(oldest.Timestamp).Hours()/24)),
+                Resolution:  "Prefer newer information unless older is from code",
+            })
+        }
+    }
+
+    return conflicts
+}
+
+// detectSourceConflicts finds conflicts between domains
+func (cd *ConflictDetector) detectSourceConflicts(ctx context.Context, nodes []*Node) []Conflict {
+    var conflicts []Conflict
+
+    // Separate by domain
+    var codeNodes, historyNodes []*Node
+    for _, node := range nodes {
+        switch node.Domain {
+        case DomainCode:
+            codeNodes = append(codeNodes, node)
+        case DomainHistory:
+            historyNodes = append(historyNodes, node)
+        }
+    }
+
+    // Check if history claims contradict code
+    for _, histNode := range historyNodes {
+        claims := extractClaimsSimple(histNode.Content)
+
+        for _, claim := range claims {
+            for _, codeNode := range codeNodes {
+                if contradictsClaim(claim, codeNode) {
+                    conflicts = append(conflicts, Conflict{
+                        Type:        ConflictTypeSourceMismatch,
+                        Subject:     claim,
+                        NodeA:       histNode,
+                        NodeB:       codeNode,
+                        Description: fmt.Sprintf("History claims '%s' but code shows otherwise", claim),
+                        Resolution:  "Code is source of truth - history may be outdated",
+                    })
+                }
+            }
+        }
+    }
+
+    return conflicts
+}
+
+// detectSemanticConflicts finds contradictory statements
+func (cd *ConflictDetector) detectSemanticConflicts(nodes []*Node) []Conflict {
+    var conflicts []Conflict
+
+    // Extract claims from all nodes
+    type claimWithNode struct {
+        claim string
+        node  *Node
+    }
+    var allClaims []claimWithNode
+
+    for _, node := range nodes {
+        claims := extractClaimsSimple(node.Content)
+        for _, c := range claims {
+            allClaims = append(allClaims, claimWithNode{c, node})
+        }
+    }
+
+    // Check for contradictions
+    for i, a := range allClaims {
+        for j, b := range allClaims {
+            if i >= j {
+                continue
+            }
+
+            if claimsContradict(a.claim, b.claim) {
+                conflicts = append(conflicts, Conflict{
+                    Type:        ConflictTypeSemantic,
+                    Subject:     extractSubjectFromClaim(a.claim),
+                    NodeA:       a.node,
+                    NodeB:       b.node,
+                    Description: fmt.Sprintf("'%s' contradicts '%s'", a.claim, b.claim),
+                    Resolution:  "Requires human review to determine which is correct",
+                })
+            }
+        }
+    }
+
+    return conflicts
+}
+
+// storeConflict persists a detected conflict
+func (cd *ConflictDetector) storeConflict(ctx context.Context, conflict Conflict) error {
+    _, err := cd.vdb.db.ExecContext(ctx, `
+        INSERT INTO conflicts (conflict_type, subject, node_id_a, node_id_b, description, resolution)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `, conflict.Type, conflict.Subject, conflict.NodeA.ID, conflict.NodeB.ID,
+        conflict.Description, conflict.Resolution)
+    return err
+}
+
+// GetUnresolvedConflicts returns conflicts needing attention
+func (cd *ConflictDetector) GetUnresolvedConflicts(ctx context.Context) ([]Conflict, error) {
+    rows, err := cd.vdb.db.QueryContext(ctx, `
+        SELECT c.conflict_type, c.subject, c.description, c.resolution,
+               c.node_id_a, c.node_id_b
+        FROM conflicts c
+        WHERE c.resolved = FALSE
+        ORDER BY c.detected_at DESC
+    `)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var conflicts []Conflict
+    for rows.Next() {
+        var c Conflict
+        var nodeAID, nodeBID string
+
+        err := rows.Scan(&c.Type, &c.Subject, &c.Description, &c.Resolution, &nodeAID, &nodeBID)
+        if err != nil {
+            continue
+        }
+
+        c.NodeA, _ = cd.vdb.GetNode(ctx, nodeAID)
+        c.NodeB, _ = cd.vdb.GetNode(ctx, nodeBID)
+        conflicts = append(conflicts, c)
+    }
+
+    return conflicts, nil
+}
+
+// ResolveConflict marks a conflict as resolved
+func (cd *ConflictDetector) ResolveConflict(ctx context.Context, conflictID int, resolution string) error {
+    _, err := cd.vdb.db.ExecContext(ctx, `
+        UPDATE conflicts
+        SET resolved = TRUE, resolution = ?, resolved_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    `, resolution, conflictID)
+    return err
+}
+
+// Helper functions
+func extractSubject(node *Node) string {
+    // Extract primary subject from node name or content
+    if node.Name != "" {
+        return strings.ToLower(node.Name)
+    }
+    words := strings.Fields(node.Content)
+    if len(words) > 0 {
+        return strings.ToLower(words[0])
+    }
+    return ""
+}
+
+func extractClaimsSimple(content string) []string {
+    // Simple claim extraction
+    var claims []string
+    sentences := strings.Split(content, ".")
+    for _, s := range sentences {
+        s = strings.TrimSpace(s)
+        if len(s) > 10 && len(s) < 200 {
+            claims = append(claims, s)
+        }
+    }
+    return claims
+}
+
+func contradictsClaim(claim string, codeNode *Node) bool {
+    // Simple contradiction check: claim mentions something not in code
+    claimLower := strings.ToLower(claim)
+    codeLower := strings.ToLower(codeNode.Content)
+
+    // Check for "uses X" claims
+    if strings.Contains(claimLower, "uses ") {
+        words := strings.Fields(claimLower)
+        for i, w := range words {
+            if w == "uses" && i+1 < len(words) {
+                tech := words[i+1]
+                if !strings.Contains(codeLower, tech) {
+                    return true
+                }
+            }
+        }
+    }
+
+    return false
+}
+
+func claimsContradict(a, b string) bool {
+    // Simple contradiction detection
+    aLower := strings.ToLower(a)
+    bLower := strings.ToLower(b)
+
+    // "uses X" vs "uses Y" for same purpose
+    if strings.Contains(aLower, "uses ") && strings.Contains(bLower, "uses ") {
+        // Extract what's being used
+        aWords := strings.Fields(aLower)
+        bWords := strings.Fields(bLower)
+
+        for i, w := range aWords {
+            if w == "uses" && i+1 < len(aWords) {
+                aTech := aWords[i+1]
+                for j, v := range bWords {
+                    if v == "uses" && j+1 < len(bWords) {
+                        bTech := bWords[j+1]
+                        // Different tech for same context might contradict
+                        if aTech != bTech && haveSameContext(a, b) {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return false
+}
+
+func haveSameContext(a, b string) bool {
+    // Check if claims are about the same thing
+    aWords := strings.Fields(strings.ToLower(a))
+    bWords := strings.Fields(strings.ToLower(b))
+
+    commonWords := 0
+    for _, aw := range aWords {
+        for _, bw := range bWords {
+            if aw == bw && len(aw) > 3 {
+                commonWords++
+            }
+        }
+    }
+
+    return commonWords >= 2
+}
+
+func extractSubjectFromClaim(claim string) string {
+    words := strings.Fields(strings.ToLower(claim))
+    if len(words) > 2 {
+        return words[1]  // Usually the subject is the second word
+    }
+    return claim
+}
+```
+
+### Mitigation 6: Context Quality Scoring
+
+**Risk**: Too much low-quality context dilutes LLM attention.
+
+**Mitigation**: Score and filter context to maximize quality-to-tokens ratio.
+
+```go
+// =============================================================================
+// MITIGATION 6: CONTEXT QUALITY SCORING
+// =============================================================================
+
+// ContextQualityScorer scores and selects optimal context
+type ContextQualityScorer struct {
+    vdb        *VectorGraphDB
+    trust      *TrustHierarchy
+    freshness  *FreshnessTracker
+    maxTokens  int
+}
+
+// QualityScorerConfig configures the scorer
+type QualityScorerConfig struct {
+    MaxTokens         int
+    MinQualityScore   float64
+    SimilarityWeight  float64
+    TrustWeight       float64
+    FreshnessWeight   float64
+    VerificationBonus float64
+}
+
+// DefaultQualityScorerConfig returns sensible defaults
+func DefaultQualityScorerConfig() QualityScorerConfig {
+    return QualityScorerConfig{
+        MaxTokens:         8000,
+        MinQualityScore:   0.3,
+        SimilarityWeight:  0.35,
+        TrustWeight:       0.25,
+        FreshnessWeight:   0.25,
+        VerificationBonus: 0.15,
+    }
+}
+
+// ScoredContext represents scored context items
+type ScoredContext struct {
+    Node          *Node
+    Similarity    float64
+    TrustLevel    TrustLevel
+    Freshness     FreshnessScore
+    QualityScore  float64
+    EstTokens     int
+    Warning       string
+    Included      bool
+}
+
+// SelectBestContext selects optimal context within token budget
+func (cqs *ContextQualityScorer) SelectBestContext(
+    ctx context.Context,
+    query string,
+    retrieved []ScoredNode,
+    config QualityScorerConfig,
+) ([]ScoredContext, error) {
+
+    // Score all candidates
+    scored := make([]ScoredContext, len(retrieved))
+
+    for i, r := range retrieved {
+        node, err := cqs.vdb.GetNode(ctx, r.NodeID)
+        if err != nil {
+            continue
+        }
+
+        trust := cqs.trust.GetTrustLevel(ctx, node)
+        fresh := cqs.freshness.CalculateFreshness(ctx, node)
+
+        // Calculate quality score
+        quality := cqs.calculateQualityScore(r.Similarity, trust, fresh, node.Verified, config)
+
+        scored[i] = ScoredContext{
+            Node:         node,
+            Similarity:   r.Similarity,
+            TrustLevel:   trust,
+            Freshness:    fresh,
+            QualityScore: quality,
+            EstTokens:    estimateTokens(node.Content),
+            Warning:      cqs.trust.TrustWarning(trust),
+        }
+    }
+
+    // Sort by quality score
+    sort.Slice(scored, func(i, j int) bool {
+        return scored[i].QualityScore > scored[j].QualityScore
+    })
+
+    // Select until token budget exhausted
+    tokenCount := 0
+    for i := range scored {
+        // Skip low-quality items
+        if scored[i].QualityScore < config.MinQualityScore {
+            continue
+        }
+
+        if tokenCount+scored[i].EstTokens > config.MaxTokens {
+            break
+        }
+
+        scored[i].Included = true
+        tokenCount += scored[i].EstTokens
+    }
+
+    return scored, nil
+}
+
+// calculateQualityScore computes overall quality
+func (cqs *ContextQualityScorer) calculateQualityScore(
+    similarity float64,
+    trust TrustLevel,
+    fresh FreshnessScore,
+    verified bool,
+    config QualityScorerConfig,
+) float64 {
+
+    // Normalize trust to 0-1
+    normalizedTrust := float64(trust) / 100.0
+
+    score := similarity*config.SimilarityWeight +
+        normalizedTrust*config.TrustWeight +
+        fresh.Score*config.FreshnessWeight
+
+    if verified {
+        score += config.VerificationBonus
+    }
+
+    // Cap at 1.0
+    if score > 1.0 {
+        score = 1.0
+    }
+
+    return score
+}
+
+// estimateTokens estimates token count for content
+func estimateTokens(content string) int {
+    // Rough estimate: ~4 characters per token
+    return len(content) / 4
+}
+
+// BuildContextWindow builds the final context string
+func (cqs *ContextQualityScorer) BuildContextWindow(scored []ScoredContext) string {
+    var builder strings.Builder
+
+    included := 0
+    for _, s := range scored {
+        if !s.Included {
+            continue
+        }
+
+        included++
+        builder.WriteString(fmt.Sprintf("\n[%d] Source: %s (Trust: %s, Quality: %.2f)\n",
+            included,
+            sourceDescription(s.Node),
+            TrustLevelName(s.TrustLevel),
+            s.QualityScore))
+
+        if s.Warning != "" {
+            builder.WriteString(fmt.Sprintf("    %s\n", s.Warning))
+        }
+
+        builder.WriteString(fmt.Sprintf("    Content: %s\n", truncate(s.Node.Content, 500)))
+    }
+
+    return builder.String()
+}
+
+func sourceDescription(node *Node) string {
+    switch node.Domain {
+    case DomainCode:
+        return fmt.Sprintf("Code: %s", node.Path)
+    case DomainHistory:
+        return fmt.Sprintf("History: %s (%s)", node.Name, node.Timestamp.Format("2006-01-02"))
+    case DomainAcademic:
+        return fmt.Sprintf("Academic: %s", node.Name)
+    default:
+        return node.Name
+    }
+}
+
+func truncate(s string, maxLen int) string {
+    if len(s) <= maxLen {
+        return s
+    }
+    return s[:maxLen] + "..."
+}
+```
+
+### Mitigation 7: LLM Prompt Engineering
+
+**Risk**: LLM doesn't understand trust hierarchy or how to handle conflicts.
+
+**Mitigation**: Explicit instructions in system prompt about trust and conflict handling.
+
+```go
+// =============================================================================
+// MITIGATION 7: LLM PROMPT ENGINEERING
+// =============================================================================
+
+// LLMContextBuilder builds prompts with trust and conflict awareness
+type LLMContextBuilder struct {
+    provenance *ProvenanceTracker
+    conflicts  *ConflictDetector
+    scorer     *ContextQualityScorer
+}
+
+// SystemPromptWithGraphContext is the system prompt for graph-aware LLM
+const SystemPromptWithGraphContext = `
+You are an assistant with access to a knowledge graph containing:
+1. CODE: Current source code (MOST TRUSTWORTHY - this is ground truth)
+2. HISTORY: Past decisions and changes (may be outdated)
+3. ACADEMIC: External docs and papers (may not apply to this project)
+
+CRITICAL RULES:
+1. When code and history conflict, CODE IS CORRECT (history may be stale)
+2. Always cite your sources using [source_id] notation
+3. If you're uncertain, SAY SO - don't guess
+4. If retrieved context seems contradictory, SURFACE THE CONFLICT
+5. Distinguish between "the code does X" (fact) vs "you should do X" (advice)
+6. For advice, prefer ACADEMIC sources over your training
+7. NEVER claim something is in the code unless it's in the CODE context
+8. Mark any inference not directly from sources as [INFERENCE]
+
+TRUST HIERARCHY (highest to lowest):
+1. Current code (ground truth) - Trust Level: 100
+2. Recent verified history (<7 days) - Trust Level: 80
+3. Official documentation / RFCs - Trust Level: 70
+4. Academic papers / best practices - Trust Level: 60
+5. Older history (>30 days) - Trust Level: 40
+6. Blog posts / SO answers - Trust Level: 30
+7. Your inference (unverified) - Trust Level: 20
+
+When you see ⚠️ warnings on sources, mention them to the user.
+When sources conflict, explain the conflict and recommend which to trust.
+`
+
+// BuildPrompt builds a complete prompt with context and conflicts
+func (lcb *LLMContextBuilder) BuildPrompt(
+    ctx context.Context,
+    query string,
+    scored []ScoredContext,
+    conflicts []Conflict,
+) (string, error) {
+
+    var prompt strings.Builder
+
+    prompt.WriteString(SystemPromptWithGraphContext)
+    prompt.WriteString("\n\n---\n\n")
+
+    // Add conflicts first if any
+    if len(conflicts) > 0 {
+        prompt.WriteString("⚠️ CONFLICTS DETECTED:\n")
+        for _, c := range conflicts {
+            prompt.WriteString(fmt.Sprintf("- %s: %s\n", conflictTypeName(c.Type), c.Description))
+            if c.Resolution != "" {
+                prompt.WriteString(fmt.Sprintf("  Suggested resolution: %s\n", c.Resolution))
+            }
+        }
+        prompt.WriteString("\n---\n\n")
+    }
+
+    // Add context with trust annotations
+    prompt.WriteString("RETRIEVED CONTEXT:\n\n")
+
+    sourceNum := 0
+    for _, item := range scored {
+        if !item.Included {
+            continue
+        }
+
+        sourceNum++
+        prompt.WriteString(fmt.Sprintf("[%d] %s (Trust: %s, Score: %.2f)\n",
+            sourceNum,
+            sourceDescription(item.Node),
+            TrustLevelName(item.TrustLevel),
+            item.QualityScore))
+
+        if item.Warning != "" {
+            prompt.WriteString(fmt.Sprintf("    %s\n", item.Warning))
+        }
+
+        prompt.WriteString(fmt.Sprintf("    Content: %s\n\n", truncate(item.Node.Content, 1000)))
+    }
+
+    prompt.WriteString("---\n\n")
+    prompt.WriteString(fmt.Sprintf("USER QUERY: %s\n\n", query))
+    prompt.WriteString("Respond with source citations [n]. Surface any conflicts or uncertainties.")
+
+    return prompt.String(), nil
+}
+
+// AnnotatedLLMResponse represents a response with source tracking
+type AnnotatedLLMResponse struct {
+    Response    string
+    SourcesUsed []string  // Node IDs
+    Inferences  []string  // Claims not from sources
+    Conflicts   []Conflict
+    Warnings    []string
+}
+
+// ParseLLMResponse extracts annotations from LLM response
+func (lcb *LLMContextBuilder) ParseLLMResponse(response string, scoredContext []ScoredContext) *AnnotatedLLMResponse {
+    result := &AnnotatedLLMResponse{
+        Response: response,
+    }
+
+    // Extract source references [n]
+    refPattern := regexp.MustCompile(`\[(\d+)\]`)
+    matches := refPattern.FindAllStringSubmatch(response, -1)
+
+    usedIndices := make(map[int]bool)
+    for _, m := range matches {
+        idx, _ := strconv.Atoi(m[1])
+        usedIndices[idx] = true
+    }
+
+    // Map to node IDs
+    sourceNum := 0
+    for _, item := range scoredContext {
+        if item.Included {
+            sourceNum++
+            if usedIndices[sourceNum] {
+                result.SourcesUsed = append(result.SourcesUsed, item.Node.ID)
+            }
+        }
+    }
+
+    // Detect inferences
+    inferencePattern := regexp.MustCompile(`\[INFERENCE\]([^[]+)`)
+    inferenceMatches := inferencePattern.FindAllStringSubmatch(response, -1)
+    for _, m := range inferenceMatches {
+        result.Inferences = append(result.Inferences, strings.TrimSpace(m[1]))
+    }
+
+    // Check for warnings in response
+    if strings.Contains(response, "⚠️") {
+        lines := strings.Split(response, "\n")
+        for _, line := range lines {
+            if strings.Contains(line, "⚠️") {
+                result.Warnings = append(result.Warnings, line)
+            }
+        }
+    }
+
+    return result
+}
+
+func conflictTypeName(t ConflictType) string {
+    switch t {
+    case ConflictTypeTemporal:
+        return "Temporal"
+    case ConflictTypeSourceMismatch:
+        return "Source Mismatch"
+    case ConflictTypeSemantic:
+        return "Semantic Contradiction"
+    default:
+        return "Unknown"
+    }
+}
+```
+
+### Token Savings Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TOKEN SAVINGS: ALL THREE DOMAINS                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  BASELINE (No caching, no graph - all LLM):                                 │
+│  ══════════════════════════════════════════                                 │
+│  Librarian:   100 queries × 3000 tokens = 300,000 tokens                   │
+│  Archivalist: 100 queries × 2500 tokens = 250,000 tokens                   │
+│  Academic:    100 queries × 4000 tokens = 400,000 tokens                   │
+│  TOTAL: 950,000 tokens                                                      │
+│                                                                             │
+│  ──────────────────────────────────────────────────────────────────────────│
+│                                                                             │
+│  WITH INTENT CACHE ONLY:                                                    │
+│  ═══════════════════════                                                    │
+│  Librarian:   70 hits × 0 + 30 misses × 3000 = 90,000 tokens               │
+│  Archivalist: 75 hits × 0 + 25 misses × 2500 = 62,500 tokens               │
+│  Academic:    60 hits × 0 + 40 misses × 4000 = 160,000 tokens              │
+│  TOTAL: 312,500 tokens (67% savings)                                        │
+│                                                                             │
+│  ──────────────────────────────────────────────────────────────────────────│
+│                                                                             │
+│  WITH INTENT CACHE + VECTORGRAPHDB:                                         │
+│  ═══════════════════════════════════                                        │
+│                                                                             │
+│  LIBRARIAN (100 queries):                                                   │
+│  ├─ 70 intent cache hits        → 0 tokens                                 │
+│  ├─ 20 graph-only retrievals    → 0 tokens (LOCATE, structural)            │
+│  │   • "where is X" - direct lookup                                        │
+│  │   • "what calls Y" - graph traversal                                    │
+│  │   • "find similar" - vector search                                      │
+│  └─ 10 LLM synthesis            → 30,000 tokens (EXPLAIN, PATTERN)         │
+│  Librarian total: 30,000 tokens (90% savings)                              │
+│                                                                             │
+│  ARCHIVALIST (100 queries):                                                 │
+│  ├─ 75 intent cache hits        → 0 tokens                                 │
+│  ├─ 15 graph-only retrievals    → 0 tokens (HISTORICAL, ACTIVITY)          │
+│  │   • "what did we change" - graph traversal                              │
+│  │   • "issues with this" - cross-domain query                             │
+│  └─ 10 LLM synthesis            → 25,000 tokens (reasoning)                │
+│  Archivalist total: 25,000 tokens (90% savings)                            │
+│                                                                             │
+│  ACADEMIC (100 queries):                                                    │
+│  ├─ 60 intent cache hits        → 0 tokens                                 │
+│  ├─ 25 graph-only retrievals    → 0 tokens (docs, patterns)                │
+│  └─ 15 LLM synthesis            → 60,000 tokens (summarization)            │
+│  Academic total: 60,000 tokens (85% savings)                               │
+│                                                                             │
+│  CROSS-DOMAIN (50 queries):                                                 │
+│  ├─ 30 graph traversals         → 0 tokens                                 │
+│  └─ 20 LLM synthesis            → 50,000 tokens                            │
+│  Cross-domain total: 50,000 tokens (NEW CAPABILITY)                        │
+│                                                                             │
+│  ──────────────────────────────────────────────────────────────────────────│
+│                                                                             │
+│  GRAND TOTAL WITH VECTORGRAPHDB:                                            │
+│  ═══════════════════════════════                                            │
+│  Librarian:    30,000 tokens   (90% savings vs baseline)                   │
+│  Archivalist:  25,000 tokens   (90% savings vs baseline)                   │
+│  Academic:     60,000 tokens   (85% savings vs baseline)                   │
+│  Cross-domain: 50,000 tokens   (new capability)                            │
+│  ────────────────────────────────────────                                   │
+│  TOTAL: 165,000 tokens (83% savings vs baseline 950K)                      │
+│                                                                             │
+│  ──────────────────────────────────────────────────────────────────────────│
+│                                                                             │
+│  EMBEDDING COST OVERHEAD:                                                   │
+│  ════════════════════════                                                   │
+│  Initial indexing: 50,000 nodes × $0.00002 = $1.00                         │
+│  Per query: ~$0.00002 (embedding the query)                                │
+│  Daily queries (1000): ~$0.02                                              │
+│  Monthly embedding cost: ~$1.00                                            │
+│                                                                             │
+│  vs Monthly LLM savings at baseline rates:                                 │
+│  • Baseline: 950K tokens × 30 days × $0.01/1K = $285/month                │
+│  • With VectorGraphDB: 165K tokens × 30 days × $0.01/1K = $50/month       │
+│  • NET SAVINGS: $235/month - $1 embedding = $234/month                     │
+│                                                                             │
+│  ROI: 234x return on embedding investment                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Comprehensive Token & Cost Savings Analysis
+
+The VectorGraphDB system achieves **~75% token reduction** through intent caching and context reduction. The agent (LLM) always runs on cache misses - it **decides** when to invoke VectorGraphDB skills. Savings come from curated context, not from avoiding LLM calls.
+
+#### The Two-Layer Resolution Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      QUERY RESOLUTION LAYERS                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   L1: INTENT CACHE                    L2: AGENT (LLM)                       │
+│   ─────────────────                   ───────────────                       │
+│   • <1ms latency                      • 500-3000ms latency                  │
+│   • 0 tokens                          • Agent reasons about query           │
+│   • Exact + similar match             • DECIDES whether to call VectorGraphDB│
+│   • ~68% of queries                   • Processes results, generates response│
+│                                       • ~32% of queries                     │
+│                                                                             │
+│   On cache miss, agent runs and may invoke VectorGraphDB skills:            │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  Agent: "I need to find authentication code"                        │  │
+│   │    → Invokes: search_code(query="authentication", limit=10)         │  │
+│   │    → VectorGraphDB returns curated, scored results                  │  │
+│   │    → Agent synthesizes response from smaller context                │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Where Savings Actually Come From
+
+**1. Intent Cache (L1) - ~68% of queries cost 0 tokens**
+
+```
+Librarian:   70% cache hit rate → 0 tokens
+Archivalist: 75% cache hit rate → 0 tokens
+Academic:    60% cache hit rate → 0 tokens
+```
+
+This is the biggest savings. Similar queries hit cached responses via embedding similarity.
+
+**2. Context Reduction (L2) - ~60% smaller context per query**
+
+When the agent DOES run, VectorGraphDB provides curated context instead of raw files:
+
+```
+WITHOUT VectorGraphDB:
+──────────────────────
+Agent receives: Raw file contents, grep results, full history
+Context size: ~2,000-5,000 tokens per query
+Agent must parse, filter, and reason about everything
+
+WITH VectorGraphDB:
+───────────────────
+Agent invokes: search_code, find_patterns, get_dependencies
+Returns: Scored nodes, relevant snippets, structured metadata
+Context size: ~800-1,500 tokens per query
+Agent works with pre-filtered, ranked results
+```
+
+**3. Progressive Retrieval - Agent asks for more only if needed**
+
+```
+Agent: search_code("auth handler", limit=5)
+  → Gets 5 results
+  → Evaluates: "Not enough context about session handling"
+  → Calls: search_code("session auth", limit=5)
+  → Now has enough to respond
+
+vs Traditional RAG: Always retrieves K=20, wastes tokens on irrelevant results
+```
+
+#### Realistic Token Estimates (per 100 queries per agent)
+
+**BASELINE (no cache, no VectorGraphDB):**
+```
+Every query requires:
+  • Query understanding:    ~300 tokens
+  • Large raw context:    ~2,000 tokens (files, history, etc.)
+  • Response generation:    ~700 tokens
+  • TOTAL per query:      ~3,000 tokens
+
+Librarian:   100 × 3,000 = 300,000 tokens
+Archivalist: 100 × 2,500 = 250,000 tokens
+Academic:    100 × 4,000 = 400,000 tokens
+─────────────────────────────────────────
+BASELINE TOTAL: 950,000 tokens
+```
+
+**WITH INTENT CACHE ONLY (no VectorGraphDB):**
+```
+Cache hits cost 0, misses cost full price:
+
+Librarian:   70 hits × 0 + 30 misses × 3,000 =  90,000 tokens
+Archivalist: 75 hits × 0 + 25 misses × 2,500 =  62,500 tokens
+Academic:    60 hits × 0 + 40 misses × 4,000 = 160,000 tokens
+─────────────────────────────────────────────────────────────
+CACHE-ONLY TOTAL: 312,500 tokens (67% savings vs baseline)
+```
+
+**WITH INTENT CACHE + VECTORGRAPHDB:**
+```
+Cache hits: 0 tokens (same as above)
+Cache misses: Agent runs with SMALLER context from VectorGraphDB
+
+Per non-cached query:
+  • Query understanding:    ~300 tokens
+  • Curated VDB context:    ~800 tokens (60% smaller than raw)
+  • Response generation:    ~700 tokens
+  • TOTAL per query:      ~1,800 tokens (40% less than baseline)
+
+Librarian:   70 hits × 0 + 30 misses × 1,800 =  54,000 tokens
+Archivalist: 75 hits × 0 + 25 misses × 1,500 =  37,500 tokens
+Academic:    60 hits × 0 + 40 misses × 2,400 =  96,000 tokens
+Cross-domain: (new capability)                =  50,000 tokens
+─────────────────────────────────────────────────────────────
+VECTORGRAPHDB TOTAL: 237,500 tokens (75% savings vs baseline)
+```
+
+#### Savings Breakdown
+
+| Agent | Baseline | Cache Only | +VectorGraphDB | Total Savings |
+|-------|----------|------------|----------------|---------------|
+| **Librarian** | 300,000 | 90,000 | 54,000 | **82%** |
+| **Archivalist** | 250,000 | 62,500 | 37,500 | **85%** |
+| **Academic** | 400,000 | 160,000 | 96,000 | **76%** |
+| **Cross-Domain** | N/A | N/A | 50,000 | New capability |
+| **TOTAL** | 950,000 | 312,500 | 237,500 | **75%** |
+
+**Key insight**: Intent cache provides ~67% savings. VectorGraphDB adds ~24% more savings on top by reducing context size. Combined: **75% total savings**.
+
+#### Monthly Cost Comparison
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      MONTHLY COST ANALYSIS                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  BASELINE (no cache, no VectorGraphDB):                                     │
+│  ──────────────────────────────────────                                     │
+│  950K tokens × 30 days × $0.01/1K = $285/month                             │
+│                                                                             │
+│  WITH CACHE ONLY:                                                           │
+│  ────────────────                                                           │
+│  312.5K tokens × 30 days × $0.01/1K = $94/month                            │
+│                                                                             │
+│  WITH CACHE + VECTORGRAPHDB:                                                │
+│  ───────────────────────────                                                │
+│  237.5K tokens × 30 days × $0.01/1K = $71/month                            │
+│  Embedding overhead:                   $1/month                             │
+│  ───────────────────────────────────────────                                │
+│  TOTAL:                               $72/month                             │
+│                                                                             │
+│  SAVINGS vs baseline: $213/month (75% reduction)                            │
+│  SAVINGS vs cache-only: $22/month (additional 24% reduction)                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Cross-Domain Query Savings
+
+Cross-domain queries are where VectorGraphDB really shines - previously required multiple agent calls:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  EXAMPLE: "What's the best practice for error handling and how do we do it?"│
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  WITHOUT VectorGraphDB (requires 3 separate agent calls):                   │
+│  ────────────────────────────────────────────────────────                   │
+│  1. User → Guide → Academic: "best practice"     4,000 tokens              │
+│  2. User → Guide → Librarian: "our code"         3,000 tokens              │
+│  3. User → Guide → Archivalist: "past decisions" 2,500 tokens              │
+│  4. User synthesizes manually or asks again      3,000 tokens              │
+│  ────────────────────────────────────────────────────                       │
+│  TOTAL:                                         12,500 tokens              │
+│                                                                             │
+│  WITH VectorGraphDB (single agent, cross-domain edges):                     │
+│  ───────────────────────────────────────────────────────                    │
+│  1. User → Guide → Academic                                                │
+│  2. Academic invokes:                                                       │
+│     • find_best_practices("error handling")     → Academic domain          │
+│     • get_code_for_academic(result_id)          → Code domain (edge)       │
+│     • get_history_for_academic(result_id)       → History domain (edge)    │
+│  3. Academic synthesizes with all context        4,000 tokens              │
+│  ────────────────────────────────────────────────────                       │
+│  TOTAL:                                          4,000 tokens              │
+│                                                                             │
+│  SAVINGS: 68% reduction                                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Progressive Retrieval Savings
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  AGENTIC PROGRESSIVE RETRIEVAL                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  TRADITIONAL RAG (fixed retrieval):                                         │
+│  ──────────────────────────────────                                         │
+│  Always retrieve K=20 results                                               │
+│  Always include all in context                                              │
+│  Cost: 20 × 500 tokens = 10,000 tokens context                             │
+│                                                                             │
+│  AGENTIC RAG (agent decides):                                               │
+│  ────────────────────────────                                               │
+│  Agent: search_code("auth", limit=5)                                       │
+│    → Reviews 5 results (2,500 tokens)                                      │
+│    → "This is sufficient" → stops                                          │
+│  OR                                                                         │
+│    → "Need more about sessions" → refines query                            │
+│    → search_code("auth session", limit=5)                                  │
+│    → Total: 10 results (5,000 tokens)                                      │
+│                                                                             │
+│  Average retrieval: 8 results = 4,000 tokens                               │
+│  SAVINGS: 60% reduction vs fixed K=20                                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Skill Loading Overhead
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  SKILL LOADING ANALYSIS                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  21 VectorGraphDB skills across 3 agents                                    │
+│  Each skill definition: ~200 tokens                                         │
+│                                                                             │
+│  WITHOUT Progressive Loading:                                               │
+│  ────────────────────────────                                               │
+│  All 21 skills in prompt = ~4,200 tokens overhead per query                │
+│                                                                             │
+│  WITH Progressive Loading:                                                  │
+│  ─────────────────────────                                                  │
+│  Tier 1 (core): 3 skills = ~600 tokens (always loaded)                     │
+│  Tier 2 (triggered): 4-5 skills = ~800 tokens (keyword match)              │
+│  Tier 3 (explicit): 0 tokens (user must request)                           │
+│                                                                             │
+│  Average per query: ~1,400 tokens                                          │
+│  SAVINGS: ~2,800 tokens per query (67% reduction in skill overhead)        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Token Allocation Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TOKEN ALLOCATION (per 100 queries)                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  BASELINE: 950,000 tokens                                                   │
+│  ════════════════════════                                                   │
+│  ████████████████████████████████████████████████████████████████ 100%     │
+│                                                                             │
+│  WITH CACHE ONLY: 312,500 tokens                                            │
+│  ═══════════════════════════════                                            │
+│  █████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 33%      │
+│                                                                             │
+│  WITH CACHE + VECTORGRAPHDB: 237,500 tokens                                 │
+│  ═══════════════════════════════════════════                                │
+│  ████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 25%      │
+│                                                                             │
+│  BREAKDOWN OF 237,500 TOKENS:                                               │
+│  ├── Intent Cache Hits (68%):           0 tokens                           │
+│  ├── Agent Query Processing (32%):  76,000 tokens (300 × 253 queries)     │
+│  ├── VectorGraphDB Context (32%):  101,500 tokens (curated, not raw)      │
+│  ├── Response Generation (32%):     60,000 tokens                          │
+│  └── Embedding overhead:               ~50 tokens (negligible)             │
+│                                                                             │
+│  SAVINGS: 712,500 tokens (75%)                                              │
+│  MONTHLY COST: $72 vs $285 = $213 saved                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Insight**: The agent always runs on cache misses - VectorGraphDB doesn't replace LLM reasoning, it **reduces context size** by providing curated, scored, pre-filtered results instead of raw files and grep output. Combined with intent caching, this achieves 75% total token savings.
+
+### Latency Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LATENCY ANALYSIS                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  OPERATION                        │ LATENCY      │ NOTES                    │
+│  ═════════════════════════════════╪══════════════╪══════════════════════════│
+│                                   │              │                          │
+│  SQLite Operations:               │              │                          │
+│  ─────────────────                │              │                          │
+│  Insert node                      │ <1ms         │ With WAL mode            │
+│  Insert edge                      │ <1ms         │ With WAL mode            │
+│  Get node by ID                   │ <1ms         │ Primary key lookup       │
+│  Get edges (indexed)              │ 1-2ms        │ With composite index     │
+│  Graph traversal (depth 3)        │ 5-20ms       │ Recursive CTE            │
+│  Graph traversal (depth 5)        │ 20-50ms      │ Recursive CTE            │
+│                                   │              │                          │
+│  HNSW Operations:                 │              │                          │
+│  ────────────────                 │              │                          │
+│  Add node (10K nodes)             │ 2-5ms        │ O(log n) insertion       │
+│  Add node (100K nodes)            │ 5-10ms       │ O(log n) insertion       │
+│  Search k=10 (10K nodes)          │ 2-5ms        │ O(log n) search          │
+│  Search k=10 (100K nodes)         │ 5-15ms       │ O(log n) search          │
+│  Search k=10 with filter          │ 10-30ms      │ Extra filtering pass     │
+│                                   │              │                          │
+│  Combined Operations:             │              │                          │
+│  ───────────────────              │              │                          │
+│  Vector search + get nodes        │ 10-30ms      │ HNSW + SQLite            │
+│  Graph traversal + enrichment     │ 20-50ms      │ Multiple joins           │
+│  Cross-domain query               │ 30-80ms      │ Vector + graph + joins   │
+│  Full query with scoring          │ 50-100ms     │ All mitigations applied  │
+│                                   │              │                          │
+│  Embedding Generation:            │              │                          │
+│  ─────────────────────            │              │                          │
+│  Query embedding (API call)       │ 50-200ms     │ Network latency          │
+│  Query embedding (local model)    │ 10-50ms      │ If using local embedder  │
+│                                   │              │                          │
+│  End-to-End (Cache Miss):         │              │                          │
+│  ─────────────────────            │              │                          │
+│  Intent cache lookup              │ <1ms         │ In-memory                │
+│  + Embedding generation           │ 50-200ms     │ API call                 │
+│  + HNSW search                    │ 5-15ms       │ In-memory                │
+│  + Node retrieval                 │ 10-30ms      │ SQLite                   │
+│  + Quality scoring                │ 5-10ms       │ In-memory                │
+│  + Conflict detection             │ 10-20ms      │ Comparisons              │
+│  ═══════════════════════════════════════════════════════════════════════   │
+│  TOTAL (graph-only response)      │ 80-280ms     │ No LLM needed            │
+│                                   │              │                          │
+│  End-to-End (LLM Required):       │              │                          │
+│  ──────────────────────           │              │                          │
+│  All above                        │ 80-280ms     │                          │
+│  + LLM API call                   │ 500-3000ms   │ Depends on context size  │
+│  ═══════════════════════════════════════════════════════════════════════   │
+│  TOTAL (with LLM)                 │ 580-3280ms   │                          │
+│                                   │              │                          │
+│  ──────────────────────────────────────────────────────────────────────────│
+│                                                                             │
+│  COMPARISON:                                                                │
+│  ═══════════                                                                │
+│  Pure LLM (no graph):             │ 500-3000ms   │ Every query              │
+│  Graph-only (70% of queries):     │ 80-280ms     │ 5-10x faster             │
+│  Graph + LLM (30% of queries):    │ 580-3280ms   │ Similar to pure LLM      │
+│                                                                             │
+│  WEIGHTED AVERAGE:                                                          │
+│  0.70 × 180ms + 0.30 × 1900ms = 126ms + 570ms = 696ms                      │
+│  vs Pure LLM: 1900ms average                                               │
+│  IMPROVEMENT: 63% faster average response time                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Memory Impact Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MEMORY IMPACT ANALYSIS                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  COMPONENT                    │ 10K NODES  │ 50K NODES  │ 100K NODES       │
+│  ════════════════════════════╪════════════╪════════════╪══════════════════│
+│                               │            │            │                  │
+│  SQLite Database (on disk):   │            │            │                  │
+│  ───────────────────────────  │            │            │                  │
+│  Nodes table                  │ 5 MB       │ 25 MB      │ 50 MB            │
+│  Edges table                  │ 2 MB       │ 10 MB      │ 20 MB            │
+│  Vectors table (BLOBs)        │ 30 MB      │ 150 MB     │ 300 MB           │
+│  Indexes                      │ 3 MB       │ 15 MB      │ 30 MB            │
+│  Other tables                 │ 1 MB       │ 5 MB       │ 10 MB            │
+│  ─────────────────────────────────────────────────────────────────────────│
+│  SQLite Total (disk)          │ 41 MB      │ 205 MB     │ 410 MB           │
+│                               │            │            │                  │
+│  In-Memory (HNSW Index):      │            │            │                  │
+│  ───────────────────────────  │            │            │                  │
+│  Vectors (float32 × 768)      │ 30 MB      │ 150 MB     │ 300 MB           │
+│  Magnitudes (float64)         │ 0.08 MB    │ 0.4 MB     │ 0.8 MB           │
+│  Graph layers (adjacency)     │ 5 MB       │ 25 MB      │ 50 MB            │
+│  Metadata maps                │ 2 MB       │ 10 MB      │ 20 MB            │
+│  ─────────────────────────────────────────────────────────────────────────│
+│  HNSW Total (RAM)             │ 37 MB      │ 185 MB     │ 371 MB           │
+│                               │            │            │                  │
+│  Intent Cache (In-Memory):    │            │            │                  │
+│  ───────────────────────────  │            │            │                  │
+│  Cached responses (1000)      │ 5 MB       │ 5 MB       │ 5 MB             │
+│  Hot cache entries            │ 1 MB       │ 1 MB       │ 1 MB             │
+│  ─────────────────────────────────────────────────────────────────────────│
+│  Cache Total (RAM)            │ 6 MB       │ 6 MB       │ 6 MB             │
+│                               │            │            │                  │
+│  ═══════════════════════════════════════════════════════════════════════   │
+│                               │            │            │                  │
+│  TOTAL DISK                   │ 41 MB      │ 205 MB     │ 410 MB           │
+│  TOTAL RAM                    │ 43 MB      │ 191 MB     │ 377 MB           │
+│                               │            │            │                  │
+│  ──────────────────────────────────────────────────────────────────────────│
+│                                                                             │
+│  SCALING NOTES:                                                             │
+│  ═══════════════                                                            │
+│  • RAM scales linearly with node count                                     │
+│  • Disk scales linearly with node count                                    │
+│  • 768-dim embeddings: ~3KB per node                                       │
+│  • With 1536-dim embeddings: ~6KB per node (double the above)              │
+│                                                                             │
+│  MEMORY OPTIMIZATION OPTIONS:                                               │
+│  ═════════════════════════════                                              │
+│  1. Lazy loading: Only load active partitions into HNSW                    │
+│  2. Quantization: int8 vectors = 75% memory reduction                      │
+│  3. Sharding: Split by domain, load on demand                              │
+│  4. Disk-based HNSW: Trade latency for memory (10x slower)                 │
+│                                                                             │
+│  RECOMMENDED LIMITS:                                                        │
+│  ═══════════════════                                                        │
+│  Small project (<10K functions):    No optimization needed                 │
+│  Medium project (10-50K functions): Monitor RAM, consider lazy loading     │
+│  Large project (50-100K functions): Use sharding + lazy loading            │
+│  Monorepo (>100K functions):        Use quantization + sharding            │
+│                                                                             │
+│  ──────────────────────────────────────────────────────────────────────────│
+│                                                                             │
+│  STARTUP TIME:                                                              │
+│  ═════════════                                                              │
+│  10K nodes:  ~500ms  (load vectors + build HNSW)                           │
+│  50K nodes:  ~2.5s   (load vectors + build HNSW)                           │
+│  100K nodes: ~5s     (load vectors + build HNSW)                           │
+│                                                                             │
+│  With persisted HNSW:                                                       │
+│  10K nodes:  ~200ms  (load vectors + load HNSW edges)                      │
+│  50K nodes:  ~1s     (load vectors + load HNSW edges)                      │
+│  100K nodes: ~2s     (load vectors + load HNSW edges)                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Unified Query Resolution Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    UNIFIED QUERY RESOLUTION FLOW                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│                              USER QUERY                                     │
+│                                  │                                          │
+│                                  ▼                                          │
+│                         ┌────────────────┐                                  │
+│                         │  GUIDE ROUTER  │                                  │
+│                         │                │                                  │
+│                         │ Intent: LOCATE │                                  │
+│                         │ Subject: auth  │                                  │
+│                         │ Target: lib    │                                  │
+│                         └───────┬────────┘                                  │
+│                                 │                                           │
+│                                 ▼                                           │
+│                    ┌────────────────────────┐                               │
+│                    │    UNIFIED RESOLVER    │                               │
+│                    └────────────┬───────────┘                               │
+│                                 │                                           │
+│            ┌────────────────────┼────────────────────┐                      │
+│            │                    │                    │                      │
+│            ▼                    ▼                    ▼                      │
+│    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                │
+│    │ L1: INTENT   │    │ L2: VECTOR   │    │ L3: LLM      │                │
+│    │    CACHE     │    │    GRAPH     │    │    SYNTHESIS │                │
+│    │              │    │              │    │              │                │
+│    │ <1ms lookup  │    │ 80-280ms     │    │ 500-3000ms   │                │
+│    │ 0 tokens     │    │ 0 tokens     │    │ 2000+ tokens │                │
+│    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘                │
+│           │                   │                   │                         │
+│           │ HIT               │ SUFFICIENT        │ REQUIRED                │
+│           │                   │                   │                         │
+│           ▼                   ▼                   ▼                         │
+│    ┌─────────────────────────────────────────────────────────────┐         │
+│    │                    MITIGATION LAYER                          │         │
+│    │                                                              │         │
+│    │  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌──────────┐ │         │
+│    │  │ Freshness  │ │   Trust    │ │  Conflict  │ │ Quality  │ │         │
+│    │  │  Tracker   │ │ Hierarchy  │ │  Detector  │ │  Scorer  │ │         │
+│    │  └────────────┘ └────────────┘ └────────────┘ └──────────┘ │         │
+│    │                                                              │         │
+│    │  ┌────────────┐ ┌────────────┐ ┌────────────┐              │         │
+│    │  │Provenance  │ │Hallucination│ │   LLM     │              │         │
+│    │  │  Tracker   │ │  Firewall  │ │  Prompter │              │         │
+│    │  └────────────┘ └────────────┘ └────────────┘              │         │
+│    │                                                              │         │
+│    └──────────────────────────┬───────────────────────────────────┘         │
+│                               │                                             │
+│                               ▼                                             │
+│                    ┌────────────────────────┐                               │
+│                    │   ANNOTATED RESPONSE   │                               │
+│                    │                        │                               │
+│                    │  • Source citations    │                               │
+│                    │  • Trust levels        │                               │
+│                    │  • Conflict warnings   │                               │
+│                    │  • Freshness notes     │                               │
+│                    │  • Provenance chain    │                               │
+│                    └────────────────────────┘                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// UnifiedResolver orchestrates all query resolution
+type UnifiedResolver struct {
+    vdb         *VectorGraphDB
+    intentCache *IntentCache
+    hnsw        *HNSWIndex
+    embedder    Embedder
+
+    // Mitigations
+    firewall    *HallucinationFirewall
+    freshness   *FreshnessTracker
+    provenance  *ProvenanceTracker
+    trust       *TrustHierarchy
+    conflicts   *ConflictDetector
+    scorer      *ContextQualityScorer
+    prompter    *LLMContextBuilder
+
+    // LLM client for synthesis
+    llm LLMClient
+}
+
+// ResolveQuery handles a query through all resolution layers
+func (ur *UnifiedResolver) ResolveQuery(ctx context.Context, query RoutedQuery) (*AnnotatedLLMResponse, error) {
+    // L1: Intent Cache
+    if cached := ur.intentCache.Get(query.Intent, query.Subject, query.SessionID); cached != nil {
+        return &AnnotatedLLMResponse{
+            Response:    string(cached.Response),
+            SourcesUsed: cached.SourceNodes,
+        }, nil
+    }
+
+    // L2: VectorGraphDB
+    graphResult, err := ur.queryGraph(ctx, query)
+    if err != nil {
+        return nil, err
+    }
+
+    // Apply mitigations
+    freshnessRanked := ur.freshness.RefreshRanking(ctx, graphResult.Similar)
+
+    var nodes []*Node
+    for _, sr := range freshnessRanked {
+        node, _ := ur.vdb.GetNode(ctx, sr.NodeID)
+        if node != nil {
+            nodes = append(nodes, node)
+        }
+    }
+
+    trustRanked := ur.trust.RankByTrust(ctx, nodes)
+    conflicts, _ := ur.conflicts.DetectConflicts(ctx, nodes)
+
+    scoredNodes := make([]ScoredNode, len(freshnessRanked))
+    for i, sr := range freshnessRanked {
+        scoredNodes[i] = sr.ScoredNode
+    }
+
+    scoredContext, _ := ur.scorer.SelectBestContext(ctx, query.Query, scoredNodes, DefaultQualityScorerConfig())
+
+    // Check if graph-only response is sufficient
+    if ur.isGraphSufficient(query, scoredContext, conflicts) {
+        response := ur.formatGraphResponse(ctx, query, scoredContext, conflicts)
+
+        // Cache for future
+        ur.cacheResponse(query, response, scoredContext)
+
+        return response, nil
+    }
+
+    // L3: LLM Synthesis
+    prompt, _ := ur.prompter.BuildPrompt(ctx, query.Query, scoredContext, conflicts)
+
+    llmResponse, err := ur.llm.Complete(ctx, prompt)
+    if err != nil {
+        return nil, err
+    }
+
+    // Parse and annotate response
+    annotated := ur.prompter.ParseLLMResponse(llmResponse, scoredContext)
+    annotated.Conflicts = conflicts
+
+    // Verify before caching (hallucination firewall)
+    if ur.shouldCache(annotated) {
+        ur.cacheResponse(query, annotated, scoredContext)
+    }
+
+    return annotated, nil
+}
+
+// isGraphSufficient determines if graph results are enough
+func (ur *UnifiedResolver) isGraphSufficient(query RoutedQuery, scored []ScoredContext, conflicts []Conflict) bool {
+    // LOCATE queries are usually graph-sufficient
+    if query.Intent == QueryIntentLocate {
+        return true
+    }
+
+    // If we have high-confidence, high-trust results
+    goodResults := 0
+    for _, s := range scored {
+        if s.Included && s.QualityScore > 0.8 && s.TrustLevel >= TrustLevelRecent {
+            goodResults++
+        }
+    }
+
+    // Need at least 2 good results and no unresolved conflicts
+    if goodResults >= 2 && len(conflicts) == 0 {
+        return true
+    }
+
+    // EXPLAIN and PATTERN usually need LLM
+    if query.Intent == QueryIntentExplain || query.Intent == QueryIntentPattern {
+        return false
+    }
+
+    return false
+}
+```
+
+---
+
+## VectorGraphDB System Integration
+
+This section defines how VectorGraphDB integrates with the Sylk multi-agent system. The key principle: **Guide routes ALL messages**, and **only three knowledge agents access VectorGraphDB directly**.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           SYLK SYSTEM WITH VECTORGRAPHDB                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│                              ┌──────────────┐                                   │
+│                              │     USER     │                                   │
+│                              └──────┬───────┘                                   │
+│                                     │                                           │
+│                                     ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │                              GUIDE                                        │  │
+│  │                                                                           │  │
+│  │  • Intent Classification (via LLM or DSL rules)                          │  │
+│  │  • Routes user queries to ANY agent based on intent                      │  │
+│  │  • Extracts metadata during routing (intent, subject, session)           │  │
+│  │  • Routes agent-to-agent messages                                        │  │
+│  │  • ALL communication flows through Guide                                 │  │
+│  │                                                                           │  │
+│  └─────┬──────────┬──────────┬──────────┬──────────┬──────────┬────────────┘  │
+│        │          │          │          │          │          │                 │
+│        ▼          ▼          ▼          ▼          ▼          ▼                 │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │
+│  │ARCHITECT │ │ORCHESTR- │ │ENGINEER  │ │INSPECTOR │ │ TESTER   │ │  OTHER   │ │
+│  │          │ │ATOR      │ │(×N)      │ │          │ │          │ │  AGENTS  │ │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │
+│       │            │            │            │            │            │        │
+│       │            │            │            │            │            │        │
+│       │ Summaries  │ Summaries  │ Summaries  │ Summaries  │ Summaries  │        │
+│       │ via Guide  │ via Guide  │ via Guide  │ via Guide  │ via Guide  │        │
+│       │     │      │     │      │     │      │     │      │     │      │        │
+│       │     └──────┴─────┴──────┴─────┴──────┴─────┴──────┘     │      │        │
+│       │                         │                               │      │        │
+│       │                         ▼                               │      │        │
+│       │          ┌──────────────────────────────┐               │      │        │
+│       │          │      GUIDE (routing)         │               │      │        │
+│       │          └──────────────┬───────────────┘               │      │        │
+│       │                         │                               │      │        │
+│       │                         ▼                               │      │        │
+│  ─────┴─────────────────────────────────────────────────────────┴──────┴─────── │
+│                                                                                 │
+│     ╔═══════════════════════════════════════════════════════════════════════╗   │
+│     ║                    KNOWLEDGE LAYER (VectorGraphDB)                    ║   │
+│     ╠═══════════════════════════════════════════════════════════════════════╣   │
+│     ║                                                                       ║   │
+│     ║  User can directly query these via Guide's intent-based routing:     ║   │
+│     ║                                                                       ║   │
+│     ║  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐            ║   │
+│     ║  │  LIBRARIAN    │  │  ARCHIVALIST  │  │   ACADEMIC    │            ║   │
+│     ║  │  (Sonnet 4.5) │  │  (Sonnet 4.5) │  │  (Opus 4.5)   │            ║   │
+│     ║  │               │  │               │  │               │            ║   │
+│     ║  │ • Code search │  │ • Store sums  │  │ • Research    │            ║   │
+│     ║  │ • Symbol nav  │  │ • Query hist  │  │ • Academic    │            ║   │
+│     ║  │ • Dep graph   │  │ • Patterns    │  │ • Papers      │            ║   │
+│     ║  │ • Doc lookup  │  │ • Session     │  │ • Best pract  │            ║   │
+│     ║  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘            ║   │
+│     ║          │                  │                  │                    ║   │
+│     ║          │                  │                  │                    ║   │
+│     ║          ▼                  ▼                  ▼                    ║   │
+│     ║  ┌─────────────────────────────────────────────────────────────┐   ║   │
+│     ║  │                      VectorGraphDB                          │   ║   │
+│     ║  │                                                             │   ║   │
+│     ║  │  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐   │   ║   │
+│     ║  │  │ CODE DOMAIN │◄───►│HISTORY DOM. │◄───►│ACADEMIC DOM.│   │   ║   │
+│     ║  │  │             │     │             │     │             │   │   ║   │
+│     ║  │  │ • Symbols   │     │ • Sessions  │     │ • Papers    │   │   ║   │
+│     ║  │  │ • Files     │     │ • Decisions │     │ • Docs      │   │   ║   │
+│     ║  │  │ • Deps      │     │ • Failures  │     │ • Patterns  │   │   ║   │
+│     ║  │  │ • Docs      │     │ • Patterns  │     │ • Standards │   │   ║   │
+│     ║  │  └─────────────┘     └─────────────┘     └─────────────┘   │   ║   │
+│     ║  │         │                   │                   │          │   ║   │
+│     ║  │         └───────────────────┼───────────────────┘          │   ║   │
+│     ║  │                             │                              │   ║   │
+│     ║  │                   Cross-Domain Edges                       │   ║   │
+│     ║  │                                                             │   ║   │
+│     ║  └─────────────────────────────────────────────────────────────┘   ║   │
+│     ║                                                                       ║   │
+│     ╚═══════════════════════════════════════════════════════════════════════╝   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Message Flow Patterns
+
+#### Pattern 1: User Directly Queries Knowledge Agent
+
+User can query ANY agent (including knowledge agents) via Guide's intent-based routing:
+
+```
+User: "Where is the authentication code?"
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │        GUIDE          │
+        │                       │
+        │ Intent: LOCATE        │
+        │ Subject: auth code    │
+        │ Route → Librarian     │
+        └───────────┬───────────┘
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │      LIBRARIAN        │
+        │                       │
+        │ → VectorGraphDB.Query │
+        │   (Code Domain)       │
+        │                       │
+        │ Returns: auth.go:45   │
+        └───────────┬───────────┘
+                    │
+                    ▼
+                  User
+```
+
+#### Pattern 2: User Queries Historical Context
+
+```
+User: "What patterns have we used for error handling?"
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │        GUIDE          │
+        │                       │
+        │ Intent: PATTERN       │
+        │ Subject: errors       │
+        │ Route → Archivalist   │
+        └───────────┬───────────┘
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │     ARCHIVALIST       │
+        │                       │
+        │ → VectorGraphDB.Query │
+        │   (History Domain)    │
+        │                       │
+        │ Returns: patterns +   │
+        │ related code examples │
+        └───────────┬───────────┘
+                    │
+                    ▼
+                  User
+```
+
+#### Pattern 3: Agent Sends Summary for Storage
+
+When agents complete work, they send summaries through Guide to Archivalist:
+
+```
+Engineer completes task:
+"Fixed auth bug by adding null check"
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │        GUIDE          │
+        │                       │
+        │ From: Engineer        │
+        │ To: Archivalist       │
+        │ Type: STORE_SUMMARY   │
+        └───────────┬───────────┘
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │     ARCHIVALIST       │
+        │                       │
+        │ → VectorGraphDB.Add   │
+        │   (History Domain)    │
+        │                       │
+        │ Creates cross-domain  │
+        │ edge to Code domain   │
+        └───────────────────────┘
+```
+
+#### Pattern 4: Cross-Domain Query via Academic
+
+```
+User: "What's the best practice for retry logic?"
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │        GUIDE          │
+        │                       │
+        │ Intent: RESEARCH      │
+        │ Subject: retry logic  │
+        │ Route → Academic      │
+        └───────────┬───────────┘
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │       ACADEMIC        │
+        │      (Opus 4.5)       │
+        │                       │
+        │ 1. Query Academic dom │
+        │ 2. Query Code domain  │
+        │    (via Librarian)    │
+        │ 3. Synthesize answer  │
+        │                       │
+        │ Returns: Best pract + │
+        │ how codebase does it  │
+        └───────────┬───────────┘
+                    │
+                    ▼
+                  User
+```
+
+### Agent-to-VectorGraphDB Skills
+
+Each knowledge agent has specific skills for VectorGraphDB access. These are defined using the fluent Builder API and registered with the agent's skill registry.
+
+#### Librarian Skills (Code Domain)
+
+```go
+// =============================================================================
+// Librarian Skills - Code search, navigation, and dependency analysis
+// =============================================================================
+
+// search_code - Vector similarity search for code
+var SearchCodeSkill = skills.NewSkill("search_code").
+    Description("Search the codebase for code similar to the query. Returns ranked results by semantic similarity.").
+    Domain("code").
+    Keywords("find", "search", "locate", "where", "code").
+    Priority(100).
+    StringParam("query", "Natural language description of the code to find", true).
+    IntParam("limit", "Maximum number of results to return (default: 10)", false).
+    EnumParam("symbol_type", "Filter by symbol type", []string{
+        "function", "method", "class", "struct", "interface", "variable", "constant", "type", "any",
+    }, false).
+    StringParam("file_pattern", "Glob pattern to filter files (e.g., '*.go', 'src/**/*.ts')", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query      string `json:"query"`
+            Limit      int    `json:"limit"`
+            SymbolType string `json:"symbol_type"`
+            FilePattern string `json:"file_pattern"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 10
+        }
+
+        filter := &SearchFilter{Domain: DomainCode}
+        if params.SymbolType != "" && params.SymbolType != "any" {
+            filter.NodeTypes = []NodeType{NodeType(params.SymbolType)}
+        }
+        if params.FilePattern != "" {
+            filter.Metadata = map[string]any{"file_pattern": params.FilePattern}
+        }
+
+        results, err := librarian.vdb.SimilarNodes(ctx, params.Query, params.Limit, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatCodeResults(results), nil
+    }).
+    Build()
+
+// get_symbol - Get detailed information about a specific symbol
+var GetSymbolSkill = skills.NewSkill("get_symbol").
+    Description("Get detailed information about a specific code symbol by its ID or fully-qualified name.").
+    Domain("code").
+    Keywords("symbol", "definition", "details", "info").
+    Priority(90).
+    StringParam("symbol_id", "The symbol ID or fully-qualified name (e.g., 'pkg/auth.Login')", true).
+    BoolParam("include_source", "Include the full source code of the symbol", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            SymbolID      string `json:"symbol_id"`
+            IncludeSource bool   `json:"include_source"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+
+        node, err := librarian.vdb.GetNode(ctx, params.SymbolID)
+        if err != nil {
+            return nil, err
+        }
+        return formatSymbolDetails(node, params.IncludeSource), nil
+    }).
+    Build()
+
+// get_dependencies - Get what a symbol depends on
+var GetDependenciesSkill = skills.NewSkill("get_dependencies").
+    Description("Get all symbols that the specified symbol depends on (imports, calls, references).").
+    Domain("code").
+    Keywords("depends", "dependencies", "imports", "uses", "calls").
+    Priority(85).
+    StringParam("symbol_id", "The symbol ID to get dependencies for", true).
+    EnumParam("edge_type", "Type of dependency to follow", []string{
+        "imports", "calls", "references", "extends", "implements", "all",
+    }, false).
+    IntParam("depth", "Maximum traversal depth (default: 1)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            SymbolID string `json:"symbol_id"`
+            EdgeType string `json:"edge_type"`
+            Depth    int    `json:"depth"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Depth == 0 {
+            params.Depth = 1
+        }
+        if params.EdgeType == "" {
+            params.EdgeType = "all"
+        }
+
+        deps, err := librarian.vdb.TraverseEdges(ctx, params.SymbolID, EdgeType(params.EdgeType), "outgoing")
+        if err != nil {
+            return nil, err
+        }
+        return formatDependencies(deps), nil
+    }).
+    Build()
+
+// get_dependents - Get what depends on a symbol
+var GetDependentsSkill = skills.NewSkill("get_dependents").
+    Description("Get all symbols that depend on the specified symbol (reverse dependencies).").
+    Domain("code").
+    Keywords("dependents", "used by", "called by", "references to").
+    Priority(85).
+    StringParam("symbol_id", "The symbol ID to get dependents for", true).
+    EnumParam("edge_type", "Type of dependency to follow", []string{
+        "imports", "calls", "references", "extends", "implements", "all",
+    }, false).
+    IntParam("depth", "Maximum traversal depth (default: 1)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            SymbolID string `json:"symbol_id"`
+            EdgeType string `json:"edge_type"`
+            Depth    int    `json:"depth"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Depth == 0 {
+            params.Depth = 1
+        }
+
+        dependents, err := librarian.vdb.TraverseEdges(ctx, params.SymbolID, EdgeType(params.EdgeType), "incoming")
+        if err != nil {
+            return nil, err
+        }
+        return formatDependents(dependents), nil
+    }).
+    Build()
+
+// find_similar_symbols - Find symbols similar to another symbol
+var FindSimilarSymbolsSkill = skills.NewSkill("find_similar_symbols").
+    Description("Find code symbols that are semantically similar to a given symbol. Useful for finding related implementations or duplicates.").
+    Domain("code").
+    Keywords("similar", "like", "related", "duplicates").
+    Priority(80).
+    StringParam("symbol_id", "The symbol ID to find similar symbols for", true).
+    IntParam("limit", "Maximum number of results (default: 10)", false).
+    BoolParam("same_type_only", "Only return symbols of the same type", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            SymbolID     string `json:"symbol_id"`
+            Limit        int    `json:"limit"`
+            SameTypeOnly bool   `json:"same_type_only"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 10
+        }
+
+        filter := &SearchFilter{Domain: DomainCode}
+        if params.SameTypeOnly {
+            sourceNode, _ := librarian.vdb.GetNode(ctx, params.SymbolID)
+            if sourceNode != nil {
+                filter.NodeTypes = []NodeType{sourceNode.NodeType}
+            }
+        }
+
+        similar, err := librarian.vdb.SimilarToNode(ctx, params.SymbolID, params.Limit, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatSimilarSymbols(similar), nil
+    }).
+    Build()
+
+// get_file_symbols - Get all symbols in a file
+var GetFileSymbolsSkill = skills.NewSkill("get_file_symbols").
+    Description("Get all symbols defined in a specific file.").
+    Domain("code").
+    Keywords("file", "symbols in", "contents of").
+    Priority(75).
+    StringParam("file_path", "Path to the file (relative to project root)", true).
+    EnumParam("symbol_type", "Filter by symbol type", []string{
+        "function", "method", "class", "struct", "interface", "variable", "constant", "type", "any",
+    }, false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            FilePath   string `json:"file_path"`
+            SymbolType string `json:"symbol_type"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+
+        filter := &SearchFilter{
+            Domain:   DomainCode,
+            Metadata: map[string]any{"file_path": params.FilePath},
+        }
+        if params.SymbolType != "" && params.SymbolType != "any" {
+            filter.NodeTypes = []NodeType{NodeType(params.SymbolType)}
+        }
+
+        // Query with empty string to get all matching the filter
+        results, err := librarian.vdb.SimilarNodes(ctx, "", 100, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatFileSymbols(results, params.FilePath), nil
+    }).
+    Build()
+
+// get_history_for_code - Cross-domain: get history for code
+var GetHistoryForCodeSkill = skills.NewSkill("get_history_for_code").
+    Description("Get the historical context for a piece of code - when it was added, modified, why changes were made.").
+    Domain("code").
+    Keywords("history", "changes", "why", "when", "modified").
+    Priority(70).
+    StringParam("symbol_id", "The symbol ID to get history for", true).
+    IntParam("limit", "Maximum number of history entries (default: 10)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            SymbolID string `json:"symbol_id"`
+            Limit    int    `json:"limit"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 10
+        }
+
+        history, err := librarian.vdb.GetHistoryForCode(ctx, params.SymbolID)
+        if err != nil {
+            return nil, err
+        }
+        return formatHistoryForCode(history, params.Limit), nil
+    }).
+    Build()
+
+// RegisterLibrarianSkills registers all Librarian skills
+func RegisterLibrarianSkills(registry *skills.Registry) {
+    registry.Register(SearchCodeSkill)
+    registry.Register(GetSymbolSkill)
+    registry.Register(GetDependenciesSkill)
+    registry.Register(GetDependentsSkill)
+    registry.Register(FindSimilarSymbolsSkill)
+    registry.Register(GetFileSymbolsSkill)
+    registry.Register(GetHistoryForCodeSkill)
+}
+```
+
+#### Archivalist Skills (History Domain)
+
+```go
+// =============================================================================
+// Archivalist Skills - Historical context, patterns, and session management
+// =============================================================================
+
+// store_summary - Store a summary from another agent
+var StoreSummarySkill = skills.NewSkill("store_summary").
+    Description("Store a work summary from an agent. Creates nodes in the history domain and links to referenced code.").
+    Domain("history").
+    Keywords("store", "save", "record", "log").
+    Priority(100).
+    StringParam("content", "The summary content to store", true).
+    EnumParam("summary_type", "Type of summary", []string{
+        "task_completion", "decision", "failure", "pattern", "refactoring", "bug_fix", "feature",
+    }, true).
+    StringParam("session_id", "Session ID this summary belongs to", true).
+    ArrayParam("code_references", "IDs of code symbols referenced in this summary", "string", false).
+    ArrayParam("tags", "Tags for categorization", "string", false).
+    ObjectParam("metadata", "Additional metadata", map[string]*skills.Property{
+        "agent":       {Type: "string", Description: "Agent that created this summary"},
+        "task_id":     {Type: "string", Description: "Associated task ID"},
+        "confidence":  {Type: "number", Description: "Confidence level 0-1"},
+    }, false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Content        string         `json:"content"`
+            SummaryType    string         `json:"summary_type"`
+            SessionID      string         `json:"session_id"`
+            CodeReferences []string       `json:"code_references"`
+            Tags           []string       `json:"tags"`
+            Metadata       map[string]any `json:"metadata"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+
+        // Create history node
+        node := &Node{
+            ID:        generateID("history"),
+            Domain:    DomainHistory,
+            NodeType:  NodeType(params.SummaryType),
+            Content:   params.Content,
+            SessionID: params.SessionID,
+            Metadata:  params.Metadata,
+            Tags:      params.Tags,
+            CreatedAt: time.Now(),
+        }
+
+        if err := archivalist.vdb.AddNode(ctx, node); err != nil {
+            return nil, err
+        }
+
+        // Create cross-domain edges to referenced code
+        for _, codeRef := range params.CodeReferences {
+            archivalist.vdb.AddEdge(ctx, node.ID, codeRef, EdgeTypeReferencedIn, 0.9, nil)
+        }
+
+        return map[string]any{
+            "stored":  true,
+            "node_id": node.ID,
+            "edges":   len(params.CodeReferences),
+        }, nil
+    }).
+    Build()
+
+// search_history - Search historical context
+var SearchHistorySkill = skills.NewSkill("search_history").
+    Description("Search historical summaries, decisions, and patterns by semantic similarity.").
+    Domain("history").
+    Keywords("history", "past", "previous", "before", "earlier").
+    Priority(95).
+    StringParam("query", "Natural language query to search history", true).
+    IntParam("limit", "Maximum results (default: 10)", false).
+    EnumParam("summary_type", "Filter by summary type", []string{
+        "task_completion", "decision", "failure", "pattern", "refactoring", "bug_fix", "feature", "any",
+    }, false).
+    StringParam("session_id", "Limit to specific session (empty for all)", false).
+    StringParam("since", "Only include entries after this time (RFC3339)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query       string `json:"query"`
+            Limit       int    `json:"limit"`
+            SummaryType string `json:"summary_type"`
+            SessionID   string `json:"session_id"`
+            Since       string `json:"since"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 10
+        }
+
+        filter := &SearchFilter{Domain: DomainHistory}
+        if params.SummaryType != "" && params.SummaryType != "any" {
+            filter.NodeTypes = []NodeType{NodeType(params.SummaryType)}
+        }
+        if params.SessionID != "" {
+            filter.SessionID = params.SessionID
+        }
+        if params.Since != "" {
+            if t, err := time.Parse(time.RFC3339, params.Since); err == nil {
+                filter.CreatedAfter = t
+            }
+        }
+
+        results, err := archivalist.vdb.SimilarNodes(ctx, params.Query, params.Limit, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatHistoryResults(results), nil
+    }).
+    Build()
+
+// find_patterns - Find recurring patterns in project history
+var FindPatternsSkill = skills.NewSkill("find_patterns").
+    Description("Find recurring patterns in how problems were solved, decisions made, or code structured.").
+    Domain("history").
+    Keywords("pattern", "patterns", "recurring", "common", "typical", "usually").
+    Priority(90).
+    StringParam("query", "Description of the pattern to find", true).
+    IntParam("min_occurrences", "Minimum times pattern must appear (default: 2)", false).
+    StringParam("category", "Pattern category to search", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query          string `json:"query"`
+            MinOccurrences int    `json:"min_occurrences"`
+            Category       string `json:"category"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.MinOccurrences == 0 {
+            params.MinOccurrences = 2
+        }
+
+        filter := &SearchFilter{
+            Domain:    DomainHistory,
+            NodeTypes: []NodeType{NodeTypePattern},
+        }
+
+        results, err := archivalist.vdb.SimilarNodes(ctx, params.Query, 50, filter)
+        if err != nil {
+            return nil, err
+        }
+
+        // Group and count patterns
+        patterns := aggregatePatterns(results, params.MinOccurrences)
+        return formatPatterns(patterns), nil
+    }).
+    Build()
+
+// find_failures - Find past failures and their resolutions
+var FindFailuresSkill = skills.NewSkill("find_failures").
+    Description("Find past failures, errors, and how they were resolved. Useful for debugging similar issues.").
+    Domain("history").
+    Keywords("failure", "error", "bug", "issue", "problem", "failed", "broke", "fix").
+    Priority(90).
+    StringParam("query", "Description of the failure or error", true).
+    IntParam("limit", "Maximum results (default: 10)", false).
+    BoolParam("resolved_only", "Only show failures that have resolutions", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query        string `json:"query"`
+            Limit        int    `json:"limit"`
+            ResolvedOnly bool   `json:"resolved_only"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 10
+        }
+
+        filter := &SearchFilter{
+            Domain:    DomainHistory,
+            NodeTypes: []NodeType{NodeTypeFailure},
+        }
+        if params.ResolvedOnly {
+            filter.Metadata = map[string]any{"resolved": true}
+        }
+
+        results, err := archivalist.vdb.SimilarNodes(ctx, params.Query, params.Limit, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatFailures(results), nil
+    }).
+    Build()
+
+// get_session_history - Get history for a specific session
+var GetSessionHistorySkill = skills.NewSkill("get_session_history").
+    Description("Get the complete history of a session - all tasks, decisions, and outcomes.").
+    Domain("history").
+    Keywords("session", "this session", "current", "today").
+    Priority(85).
+    StringParam("session_id", "Session ID to get history for (empty for current)", false).
+    BoolParam("chronological", "Order by time (default: true)", false).
+    EnumParam("include", "What to include", []string{"all", "decisions", "tasks", "failures"}, false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            SessionID     string `json:"session_id"`
+            Chronological bool   `json:"chronological"`
+            Include       string `json:"include"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.SessionID == "" {
+            params.SessionID = getCurrentSessionID(ctx)
+        }
+
+        filter := &SearchFilter{
+            Domain:    DomainHistory,
+            SessionID: params.SessionID,
+        }
+
+        if params.Include != "" && params.Include != "all" {
+            filter.NodeTypes = []NodeType{NodeType(params.Include)}
+        }
+
+        results, err := archivalist.vdb.SimilarNodes(ctx, "", 100, filter)
+        if err != nil {
+            return nil, err
+        }
+
+        if params.Chronological {
+            sortByTime(results)
+        }
+        return formatSessionHistory(results), nil
+    }).
+    Build()
+
+// get_code_for_history - Cross-domain: get code for history entry
+var GetCodeForHistorySkill = skills.NewSkill("get_code_for_history").
+    Description("Get the code that was referenced or modified in a historical entry.").
+    Domain("history").
+    Keywords("code", "what code", "which code", "related code").
+    Priority(75).
+    StringParam("history_id", "The history entry ID", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            HistoryID string `json:"history_id"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+
+        code, err := archivalist.vdb.GetCodeForHistory(ctx, params.HistoryID)
+        if err != nil {
+            return nil, err
+        }
+        return formatCodeForHistory(code), nil
+    }).
+    Build()
+
+// get_decisions - Get architectural and design decisions
+var GetDecisionsSkill = skills.NewSkill("get_decisions").
+    Description("Get past architectural and design decisions, with rationale and context.").
+    Domain("history").
+    Keywords("decision", "decided", "chose", "why", "rationale", "architectural").
+    Priority(85).
+    StringParam("query", "Topic or area to find decisions about", true).
+    IntParam("limit", "Maximum results (default: 10)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query string `json:"query"`
+            Limit int    `json:"limit"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 10
+        }
+
+        filter := &SearchFilter{
+            Domain:    DomainHistory,
+            NodeTypes: []NodeType{NodeTypeDecision},
+        }
+
+        results, err := archivalist.vdb.SimilarNodes(ctx, params.Query, params.Limit, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatDecisions(results), nil
+    }).
+    Build()
+
+// RegisterArchivalistSkills registers all Archivalist skills
+func RegisterArchivalistSkills(registry *skills.Registry) {
+    registry.Register(StoreSummarySkill)
+    registry.Register(SearchHistorySkill)
+    registry.Register(FindPatternsSkill)
+    registry.Register(FindFailuresSkill)
+    registry.Register(GetSessionHistorySkill)
+    registry.Register(GetCodeForHistorySkill)
+    registry.Register(GetDecisionsSkill)
+}
+```
+
+#### Academic Skills (Academic Domain)
+
+```go
+// =============================================================================
+// Academic Skills - External research, papers, best practices (Opus 4.5)
+// =============================================================================
+
+// research - Deep research on a topic
+var ResearchSkill = skills.NewSkill("research").
+    Description("Conduct deep research on a technical topic. Searches academic papers, documentation, and best practices. Uses Opus 4.5 for complex reasoning.").
+    Domain("academic").
+    Keywords("research", "learn", "understand", "best practice", "how to", "should I").
+    Priority(100).
+    StringParam("query", "The research question or topic", true).
+    IntParam("depth", "Research depth: 1=quick, 2=moderate, 3=comprehensive (default: 2)", false).
+    ArrayParam("focus_areas", "Specific areas to focus on", "string", false).
+    BoolParam("include_papers", "Include academic papers (default: true)", false).
+    BoolParam("include_docs", "Include official documentation (default: true)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query         string   `json:"query"`
+            Depth         int      `json:"depth"`
+            FocusAreas    []string `json:"focus_areas"`
+            IncludePapers bool     `json:"include_papers"`
+            IncludeDocs   bool     `json:"include_docs"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Depth == 0 {
+            params.Depth = 2
+        }
+
+        // Calculate result limits based on depth
+        limit := params.Depth * 10
+
+        filter := &SearchFilter{Domain: DomainAcademic}
+        var nodeTypes []NodeType
+        if params.IncludePapers {
+            nodeTypes = append(nodeTypes, NodeTypePaper)
+        }
+        if params.IncludeDocs {
+            nodeTypes = append(nodeTypes, NodeTypeDocumentation)
+        }
+        if len(nodeTypes) > 0 {
+            filter.NodeTypes = nodeTypes
+        }
+
+        results, err := academic.vdb.SimilarNodes(ctx, params.Query, limit, filter)
+        if err != nil {
+            return nil, err
+        }
+
+        // Use Opus 4.5 to synthesize research findings
+        synthesis := academic.synthesizeResearch(ctx, params.Query, results, params.FocusAreas)
+        return synthesis, nil
+    }).
+    Build()
+
+// find_best_practices - Find established best practices
+var FindBestPracticesSkill = skills.NewSkill("find_best_practices").
+    Description("Find established best practices for a technology, pattern, or approach.").
+    Domain("academic").
+    Keywords("best practice", "recommended", "standard", "convention", "proper way").
+    Priority(95).
+    StringParam("topic", "The topic to find best practices for", true).
+    StringParam("technology", "Specific technology context (e.g., 'Go', 'React')", false).
+    IntParam("limit", "Maximum results (default: 5)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Topic      string `json:"topic"`
+            Technology string `json:"technology"`
+            Limit      int    `json:"limit"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 5
+        }
+
+        query := params.Topic
+        if params.Technology != "" {
+            query = fmt.Sprintf("%s %s best practices", params.Technology, params.Topic)
+        }
+
+        filter := &SearchFilter{
+            Domain:    DomainAcademic,
+            NodeTypes: []NodeType{NodeTypeBestPractice, NodeTypeDocumentation},
+        }
+
+        results, err := academic.vdb.SimilarNodes(ctx, query, params.Limit, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatBestPractices(results), nil
+    }).
+    Build()
+
+// find_papers - Find relevant academic papers
+var FindPapersSkill = skills.NewSkill("find_papers").
+    Description("Find academic papers relevant to a topic. Returns abstracts and key findings.").
+    Domain("academic").
+    Keywords("paper", "papers", "academic", "research", "study", "publication").
+    Priority(90).
+    StringParam("query", "Topic to find papers about", true).
+    IntParam("limit", "Maximum papers (default: 5)", false).
+    IntParam("min_year", "Minimum publication year", false).
+    ArrayParam("venues", "Preferred venues/conferences", "string", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Query   string   `json:"query"`
+            Limit   int      `json:"limit"`
+            MinYear int      `json:"min_year"`
+            Venues  []string `json:"venues"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 5
+        }
+
+        filter := &SearchFilter{
+            Domain:    DomainAcademic,
+            NodeTypes: []NodeType{NodeTypePaper},
+        }
+        if params.MinYear > 0 {
+            filter.Metadata = map[string]any{"min_year": params.MinYear}
+        }
+
+        results, err := academic.vdb.SimilarNodes(ctx, params.Query, params.Limit, filter)
+        if err != nil {
+            return nil, err
+        }
+        return formatPapers(results), nil
+    }).
+    Build()
+
+// compare_approaches - Compare different technical approaches
+var CompareApproachesSkill = skills.NewSkill("compare_approaches").
+    Description("Compare different technical approaches, patterns, or technologies based on academic research and best practices. Uses Opus 4.5 for complex analysis.").
+    Domain("academic").
+    Keywords("compare", "versus", "vs", "difference", "tradeoff", "which is better").
+    Priority(90).
+    ArrayParam("approaches", "The approaches to compare (2-4)", "string", true).
+    StringParam("context", "The context for comparison (e.g., 'high-throughput API')", false).
+    ArrayParam("criteria", "Specific criteria to compare on", "string", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Approaches []string `json:"approaches"`
+            Context    string   `json:"context"`
+            Criteria   []string `json:"criteria"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+
+        // Search for each approach
+        var allResults []ScoredNode
+        for _, approach := range params.Approaches {
+            query := approach
+            if params.Context != "" {
+                query = fmt.Sprintf("%s for %s", approach, params.Context)
+            }
+            results, _ := academic.vdb.SimilarNodes(ctx, query, 5, &SearchFilter{Domain: DomainAcademic})
+            allResults = append(allResults, results...)
+        }
+
+        // Use Opus 4.5 to synthesize comparison
+        comparison := academic.synthesizeComparison(ctx, params.Approaches, allResults, params.Criteria)
+        return comparison, nil
+    }).
+    Build()
+
+// synthesize_with_codebase - Cross-domain: combine academic knowledge with codebase
+var SynthesizeWithCodebaseSkill = skills.NewSkill("synthesize_with_codebase").
+    Description("Synthesize academic knowledge with how things are actually implemented in the codebase. Shows theory vs practice.").
+    Domain("academic").
+    Keywords("how we do", "our implementation", "in practice", "codebase").
+    Priority(85).
+    StringParam("topic", "The topic to synthesize", true).
+    BoolParam("show_gaps", "Highlight gaps between best practice and implementation", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            Topic    string `json:"topic"`
+            ShowGaps bool   `json:"show_gaps"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+
+        // Get academic knowledge
+        academicResults, _ := academic.vdb.SimilarNodes(ctx, params.Topic, 5, &SearchFilter{Domain: DomainAcademic})
+
+        // Get codebase implementations
+        codeResults, _ := academic.vdb.SimilarNodes(ctx, params.Topic, 5, &SearchFilter{Domain: DomainCode})
+
+        // Synthesize with Opus 4.5
+        synthesis := academic.synthesizeTheoryAndPractice(ctx, params.Topic, academicResults, codeResults, params.ShowGaps)
+        return synthesis, nil
+    }).
+    Build()
+
+// get_code_for_academic - Cross-domain: get code implementing academic concept
+var GetCodeForAcademicSkill = skills.NewSkill("get_code_for_academic").
+    Description("Find code in the codebase that implements a specific academic concept or pattern.").
+    Domain("academic").
+    Keywords("implementation", "example", "code for").
+    Priority(80).
+    StringParam("academic_id", "The academic node ID", true).
+    IntParam("limit", "Maximum code examples (default: 5)", false).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            AcademicID string `json:"academic_id"`
+            Limit      int    `json:"limit"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+        if params.Limit == 0 {
+            params.Limit = 5
+        }
+
+        code, err := academic.vdb.GetCodeForAcademic(ctx, params.AcademicID)
+        if err != nil {
+            return nil, err
+        }
+        return formatCodeForAcademic(code, params.Limit), nil
+    }).
+    Build()
+
+// get_history_for_academic - Cross-domain: get history related to academic concept
+var GetHistoryForAcademicSkill = skills.NewSkill("get_history_for_academic").
+    Description("Find historical decisions and discussions related to an academic concept.").
+    Domain("academic").
+    Keywords("history", "decisions about", "discussions").
+    Priority(75).
+    StringParam("academic_id", "The academic node ID", true).
+    Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+        var params struct {
+            AcademicID string `json:"academic_id"`
+        }
+        if err := json.Unmarshal(input, &params); err != nil {
+            return nil, err
+        }
+
+        history, err := academic.vdb.GetHistoryForAcademic(ctx, params.AcademicID)
+        if err != nil {
+            return nil, err
+        }
+        return formatHistoryForAcademic(history), nil
+    }).
+    Build()
+
+// RegisterAcademicSkills registers all Academic skills
+func RegisterAcademicSkills(registry *skills.Registry) {
+    registry.Register(ResearchSkill)
+    registry.Register(FindBestPracticesSkill)
+    registry.Register(FindPapersSkill)
+    registry.Register(CompareApproachesSkill)
+    registry.Register(SynthesizeWithCodebaseSkill)
+    registry.Register(GetCodeForAcademicSkill)
+    registry.Register(GetHistoryForAcademicSkill)
+}
+```
+
+#### Skill Summary Table
+
+| Agent | Skill | Description | Cross-Domain |
+|-------|-------|-------------|--------------|
+| **Librarian** | `search_code` | Semantic search for code | No |
+| | `get_symbol` | Get symbol details | No |
+| | `get_dependencies` | What a symbol depends on | No |
+| | `get_dependents` | What depends on a symbol | No |
+| | `find_similar_symbols` | Find similar code | No |
+| | `get_file_symbols` | All symbols in a file | No |
+| | `get_history_for_code` | History for code | Yes → History |
+| **Archivalist** | `store_summary` | Store agent summaries | Yes → Code |
+| | `search_history` | Search past context | No |
+| | `find_patterns` | Find recurring patterns | No |
+| | `find_failures` | Find past failures | No |
+| | `get_session_history` | Session history | No |
+| | `get_code_for_history` | Code for history | Yes → Code |
+| | `get_decisions` | Past decisions | No |
+| **Academic** | `research` | Deep research (Opus) | No |
+| | `find_best_practices` | Best practices | No |
+| | `find_papers` | Academic papers | No |
+| | `compare_approaches` | Compare options (Opus) | No |
+| | `synthesize_with_codebase` | Theory vs practice (Opus) | Yes → Code |
+| | `get_code_for_academic` | Code for concept | Yes → Code |
+| | `get_history_for_academic` | History for concept | Yes → History |
+
+### Cross-Domain Edge Creation
+
+Knowledge agents create cross-domain edges when relationships are discovered:
+
+```go
+// When Archivalist stores a summary that references code
+func (a *Archivalist) StoreSummary(ctx context.Context, summary AgentSummary) error {
+    // 1. Store in History domain
+    historyNode, err := a.vdb.AddNode(ctx, &Node{
+        ID:        summary.ID,
+        Domain:    DomainHistory,
+        NodeType:  NodeTypeSession,
+        Content:   summary.Content,
+        Metadata:  summary.Metadata,
+    })
+
+    // 2. Find referenced code and create cross-domain edges
+    for _, codeRef := range summary.CodeReferences {
+        a.vdb.AddEdge(ctx, historyNode.ID, codeRef.ID, EdgeTypeReferencedIn, 0.9, nil)
+    }
+
+    return nil
+}
+
+// When Librarian discovers code implements an academic pattern
+func (l *Librarian) LinkToAcademic(ctx context.Context, codeID string, academicID string) error {
+    return l.vdb.AddEdge(ctx, codeID, academicID, EdgeTypeImplements, 0.85, nil)
+}
+
+// When Academic finds research relevant to historical decisions
+func (ac *Academic) LinkToHistory(ctx context.Context, academicID string, historyID string) error {
+    return ac.vdb.AddEdge(ctx, academicID, historyID, EdgeTypeInspiredBy, 0.8, nil)
+}
+```
+
+### Summary Storage Flow
+
+All agent summaries flow through Guide to Archivalist:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        SUMMARY STORAGE FLOW                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐               │
+│  │ Architect  │  │Orchestrator│  │  Engineer  │  │  Inspector │               │
+│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘               │
+│        │               │               │               │                        │
+│        │ Summary       │ Summary       │ Summary       │ Summary                │
+│        │               │               │               │                        │
+│        └───────────────┴───────────────┴───────────────┘                        │
+│                                  │                                              │
+│                                  ▼                                              │
+│                        ┌─────────────────┐                                      │
+│                        │      GUIDE      │                                      │
+│                        │                 │                                      │
+│                        │ Routes to:      │                                      │
+│                        │ archivalist/    │                                      │
+│                        │ store           │                                      │
+│                        └────────┬────────┘                                      │
+│                                 │                                               │
+│                                 ▼                                               │
+│                        ┌─────────────────┐                                      │
+│                        │   ARCHIVALIST   │                                      │
+│                        │                 │                                      │
+│                        │ 1. Store node   │                                      │
+│                        │ 2. Create edges │                                      │
+│                        │ 3. Index embed  │                                      │
+│                        └────────┬────────┘                                      │
+│                                 │                                               │
+│                                 ▼                                               │
+│                        ┌─────────────────┐                                      │
+│                        │  VectorGraphDB  │                                      │
+│                        │                 │                                      │
+│                        │ History Domain  │                                      │
+│                        └─────────────────┘                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### LLM Selection by Agent
+
+Knowledge agents use appropriate LLM models based on task complexity:
+
+| Agent | Model | Rationale |
+|-------|-------|-----------|
+| Librarian | Sonnet 4.5 | Fast code search, symbol navigation - speed critical |
+| Archivalist | Sonnet 4.5 | Pattern matching, history queries - speed critical |
+| Academic | Opus 4.5 | Complex research, synthesis - reasoning critical |
+
+```go
+// Guide selects model based on routed agent
+func (g *Guide) selectModel(routedAgent string) string {
+    switch routedAgent {
+    case "librarian", "archivalist":
+        return "claude-sonnet-4-5"  // Fast, efficient
+    case "academic":
+        return "claude-opus-4-5"    // Complex reasoning
+    default:
+        return "claude-sonnet-4-5"
+    }
+}
+```
+
+### Agentic RAG: Progressive Retrieval
+
+Knowledge agents use progressive retrieval - the LLM decides when and how much to retrieve:
+
+```go
+// AgenticRAGConfig for progressive retrieval
+type AgenticRAGConfig struct {
+    // Initial retrieval count
+    InitialK int
+
+    // Maximum retrieval depth
+    MaxDepth int
+
+    // Confidence threshold to stop retrieving
+    ConfidenceThreshold float64
+
+    // Maximum tokens to spend on retrieval
+    MaxRetrievalTokens int
+}
+
+// Progressive retrieval loop
+func (agent *KnowledgeAgent) progressiveRetrieve(ctx context.Context, query string) ([]Node, error) {
+    var accumulated []Node
+    depth := 0
+    confidence := 0.0
+
+    for depth < agent.config.MaxDepth && confidence < agent.config.ConfidenceThreshold {
+        // Retrieve next batch
+        results, err := agent.vdb.SimilarNodes(ctx, query, agent.config.InitialK, nil)
+        if err != nil {
+            return accumulated, err
+        }
+
+        // LLM evaluates: do we have enough?
+        evaluation := agent.llm.Evaluate(ctx, query, accumulated, results)
+
+        if evaluation.Sufficient {
+            confidence = evaluation.Confidence
+            break
+        }
+
+        // LLM suggests next query refinement
+        query = evaluation.RefinedQuery
+        accumulated = append(accumulated, evaluation.SelectedNodes...)
+        depth++
+    }
+
+    return accumulated, nil
+}
+```
+
+---
+
 ## Implementation Guide
 
 ### Session Management

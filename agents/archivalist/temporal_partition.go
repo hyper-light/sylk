@@ -7,11 +7,6 @@ import (
 	"time"
 )
 
-// =============================================================================
-// Temporal Partitioning
-// =============================================================================
-
-// PartitionGranularity defines the time granularity for partitions
 type PartitionGranularity string
 
 const (
@@ -21,42 +16,23 @@ const (
 	PartitionMonthly PartitionGranularity = "monthly"
 )
 
-// TemporalPartitionManager manages time-based entry partitions
 type TemporalPartitionManager struct {
 	mu sync.RWMutex
 
-	// Partitions by key (e.g., "2024-01-15" for daily)
 	partitions map[string]*TemporalPartition
-
-	// Partition index for range queries
 	sortedKeys []string
-
-	// Configuration
-	config TemporalPartitionConfig
-
-	// Statistics
-	stats TemporalPartitionStats
+	config     TemporalPartitionConfig
+	stats      TemporalPartitionStats
 }
 
-// TemporalPartitionConfig configures partition management
 type TemporalPartitionConfig struct {
-	// Granularity for partitioning
-	Granularity PartitionGranularity `json:"granularity"`
-
-	// Maximum entries per partition before splitting
-	MaxEntriesPerPartition int `json:"max_entries_per_partition"`
-
-	// Maximum partitions to keep in memory
-	MaxPartitionsInMemory int `json:"max_partitions_in_memory"`
-
-	// Whether to auto-compact old partitions
-	AutoCompact bool `json:"auto_compact"`
-
-	// Age threshold for compaction
-	CompactThreshold time.Duration `json:"compact_threshold"`
+	Granularity            PartitionGranularity `json:"granularity"`
+	MaxEntriesPerPartition int                  `json:"max_entries_per_partition"`
+	MaxPartitionsInMemory  int                  `json:"max_partitions_in_memory"`
+	AutoCompact            bool                 `json:"auto_compact"`
+	CompactThreshold       time.Duration        `json:"compact_threshold"`
 }
 
-// DefaultTemporalPartitionConfig returns sensible defaults
 func DefaultTemporalPartitionConfig() TemporalPartitionConfig {
 	return TemporalPartitionConfig{
 		Granularity:            PartitionDaily,
@@ -67,24 +43,17 @@ func DefaultTemporalPartitionConfig() TemporalPartitionConfig {
 	}
 }
 
-// TemporalPartition represents a time-bounded partition of entries
 type TemporalPartition struct {
 	mu sync.RWMutex
 
-	// Partition key (formatted time string)
-	Key string `json:"key"`
-
-	// Time bounds
+	Key       string    `json:"key"`
 	StartTime time.Time `json:"start_time"`
 	EndTime   time.Time `json:"end_time"`
 
-	// Entry IDs in this partition
-	EntryIDs []string `json:"entry_ids"`
+	EntryIDs  []string `json:"entry_ids"`
+	entrySet  map[string]bool
+	entryTime map[string]time.Time
 
-	// Quick lookup by ID
-	entrySet map[string]bool
-
-	// Statistics
 	EntryCount     int        `json:"entry_count"`
 	TotalTokens    int        `json:"total_tokens"`
 	IsCompacted    bool       `json:"is_compacted"`
@@ -92,7 +61,6 @@ type TemporalPartition struct {
 	LastAccessTime time.Time  `json:"last_access_time"`
 }
 
-// TemporalPartitionStats contains partition manager statistics
 type TemporalPartitionStats struct {
 	TotalPartitions   int   `json:"total_partitions"`
 	TotalEntries      int   `json:"total_entries"`
@@ -103,7 +71,6 @@ type TemporalPartitionStats struct {
 	CacheHits         int64 `json:"cache_hits"`
 }
 
-// NewTemporalPartitionManager creates a new partition manager
 func NewTemporalPartitionManager(config TemporalPartitionConfig) *TemporalPartitionManager {
 	if config.MaxEntriesPerPartition == 0 {
 		config = DefaultTemporalPartitionConfig()
@@ -116,11 +83,6 @@ func NewTemporalPartitionManager(config TemporalPartitionConfig) *TemporalPartit
 	}
 }
 
-// =============================================================================
-// Partition Key Generation
-// =============================================================================
-
-// GeneratePartitionKey creates a partition key for a given time
 func (pm *TemporalPartitionManager) GeneratePartitionKey(t time.Time) string {
 	switch pm.config.Granularity {
 	case PartitionHourly:
@@ -137,7 +99,6 @@ func (pm *TemporalPartitionManager) GeneratePartitionKey(t time.Time) string {
 	}
 }
 
-// GetPartitionBounds returns start and end times for a partition key
 func (pm *TemporalPartitionManager) GetPartitionBounds(key string) (time.Time, time.Time) {
 	var start, end time.Time
 
@@ -164,23 +125,13 @@ func (pm *TemporalPartitionManager) GetPartitionBounds(key string) (time.Time, t
 	return start, end
 }
 
-// weekStart returns the start of the given ISO week
 func weekStart(year, week int) time.Time {
-	// January 4th is always in week 1
 	jan4 := time.Date(year, 1, 4, 0, 0, 0, 0, time.UTC)
-	// Days since Monday
 	daysSinceMonday := int(jan4.Weekday()+6) % 7
-	// Start of week 1
 	week1Start := jan4.AddDate(0, 0, -daysSinceMonday)
-	// Start of requested week
 	return week1Start.AddDate(0, 0, (week-1)*7)
 }
 
-// =============================================================================
-// Partition Operations
-// =============================================================================
-
-// AddEntry adds an entry to the appropriate partition
 func (pm *TemporalPartitionManager) AddEntry(entryID string, timestamp time.Time, tokens int) error {
 	key := pm.GeneratePartitionKey(timestamp)
 
@@ -196,6 +147,7 @@ func (pm *TemporalPartitionManager) AddEntry(entryID string, timestamp time.Time
 			EndTime:        end,
 			EntryIDs:       make([]string, 0, 100),
 			entrySet:       make(map[string]bool),
+			entryTime:      make(map[string]time.Time),
 			LastAccessTime: time.Now(),
 		}
 		pm.partitions[key] = partition
@@ -208,6 +160,7 @@ func (pm *TemporalPartitionManager) AddEntry(entryID string, timestamp time.Time
 	if !partition.entrySet[entryID] {
 		partition.EntryIDs = append(partition.EntryIDs, entryID)
 		partition.entrySet[entryID] = true
+		partition.entryTime[entryID] = timestamp
 		partition.EntryCount++
 		partition.TotalTokens += tokens
 		pm.stats.TotalEntries++
@@ -215,7 +168,6 @@ func (pm *TemporalPartitionManager) AddEntry(entryID string, timestamp time.Time
 	partition.LastAccessTime = time.Now()
 	partition.mu.Unlock()
 
-	// Check if we need to evict old partitions
 	if len(pm.partitions) > pm.config.MaxPartitionsInMemory {
 		pm.evictOldestPartitionLocked()
 	}
@@ -223,7 +175,6 @@ func (pm *TemporalPartitionManager) AddEntry(entryID string, timestamp time.Time
 	return nil
 }
 
-// RemoveEntry removes an entry from its partition
 func (pm *TemporalPartitionManager) RemoveEntry(entryID string, timestamp time.Time) {
 	key := pm.GeneratePartitionKey(timestamp)
 
@@ -238,10 +189,10 @@ func (pm *TemporalPartitionManager) RemoveEntry(entryID string, timestamp time.T
 	partition.mu.Lock()
 	if partition.entrySet[entryID] {
 		delete(partition.entrySet, entryID)
+		delete(partition.entryTime, entryID)
 		partition.EntryCount--
 		pm.stats.TotalEntries--
 
-		// Rebuild entry ID list
 		newIDs := make([]string, 0, len(partition.EntryIDs)-1)
 		for _, id := range partition.EntryIDs {
 			if id != entryID {
@@ -252,7 +203,6 @@ func (pm *TemporalPartitionManager) RemoveEntry(entryID string, timestamp time.T
 	}
 	partition.mu.Unlock()
 
-	// Remove empty partitions
 	if partition.EntryCount == 0 {
 		delete(pm.partitions, key)
 		pm.removeSortedKey(key)
@@ -261,11 +211,6 @@ func (pm *TemporalPartitionManager) RemoveEntry(entryID string, timestamp time.T
 	}
 }
 
-// =============================================================================
-// Query Operations
-// =============================================================================
-
-// QueryTimeRange returns entry IDs within the given time range
 func (pm *TemporalPartitionManager) QueryTimeRange(start, end time.Time) []string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -276,14 +221,21 @@ func (pm *TemporalPartitionManager) QueryTimeRange(start, end time.Time) []strin
 	startKey := pm.GeneratePartitionKey(start)
 	endKey := pm.GeneratePartitionKey(end)
 
-	// Find partitions in range
 	for _, key := range pm.sortedKeys {
 		if key >= startKey && key <= endKey {
 			partition := pm.partitions[key]
 			if partition != nil {
 				pm.stats.PartitionsScanned++
 				partition.mu.RLock()
-				results = append(results, partition.EntryIDs...)
+				for _, id := range partition.EntryIDs {
+					entryTime, ok := partition.entryTime[id]
+					if !ok {
+						entryTime = partition.StartTime
+					}
+					if !entryTime.Before(start) && !entryTime.After(end) {
+						results = append(results, id)
+					}
+				}
 				partition.LastAccessTime = time.Now()
 				partition.mu.RUnlock()
 			}
@@ -293,7 +245,6 @@ func (pm *TemporalPartitionManager) QueryTimeRange(start, end time.Time) []strin
 	return results
 }
 
-// GetPartition returns a specific partition by key
 func (pm *TemporalPartitionManager) GetPartition(key string) *TemporalPartition {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -308,7 +259,6 @@ func (pm *TemporalPartitionManager) GetPartition(key string) *TemporalPartition 
 	return partition
 }
 
-// GetRecentPartitions returns the N most recent partitions
 func (pm *TemporalPartitionManager) GetRecentPartitions(n int) []*TemporalPartition {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -329,11 +279,6 @@ func (pm *TemporalPartitionManager) GetRecentPartitions(n int) []*TemporalPartit
 	return results
 }
 
-// =============================================================================
-// Compaction
-// =============================================================================
-
-// CompactPartition marks a partition as compacted
 func (pm *TemporalPartitionManager) CompactPartition(key string) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -356,7 +301,6 @@ func (pm *TemporalPartitionManager) CompactPartition(key string) error {
 	return nil
 }
 
-// CompactOldPartitions compacts partitions older than the threshold
 func (pm *TemporalPartitionManager) CompactOldPartitions() int {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -376,7 +320,6 @@ func (pm *TemporalPartitionManager) CompactOldPartitions() int {
 		}
 		partition.mu.Unlock()
 
-		// Don't compact too many at once
 		if compacted >= 10 {
 			break
 		}
@@ -385,11 +328,6 @@ func (pm *TemporalPartitionManager) CompactOldPartitions() int {
 	return compacted
 }
 
-// =============================================================================
-// Maintenance
-// =============================================================================
-
-// insertSortedKey inserts a key maintaining sort order
 func (pm *TemporalPartitionManager) insertSortedKey(key string) {
 	idx := sort.SearchStrings(pm.sortedKeys, key)
 	pm.sortedKeys = append(pm.sortedKeys, "")
@@ -397,7 +335,6 @@ func (pm *TemporalPartitionManager) insertSortedKey(key string) {
 	pm.sortedKeys[idx] = key
 }
 
-// removeSortedKey removes a key from the sorted list
 func (pm *TemporalPartitionManager) removeSortedKey(key string) {
 	idx := sort.SearchStrings(pm.sortedKeys, key)
 	if idx < len(pm.sortedKeys) && pm.sortedKeys[idx] == key {
@@ -405,13 +342,11 @@ func (pm *TemporalPartitionManager) removeSortedKey(key string) {
 	}
 }
 
-// evictOldestPartitionLocked evicts the oldest partition (must hold lock)
 func (pm *TemporalPartitionManager) evictOldestPartitionLocked() {
 	if len(pm.sortedKeys) == 0 {
 		return
 	}
 
-	// Find oldest non-compacted partition
 	var oldestKey string
 	var oldestAccess time.Time
 
@@ -446,14 +381,12 @@ func (pm *TemporalPartitionManager) evictOldestPartitionLocked() {
 	}
 }
 
-// Stats returns partition manager statistics
 func (pm *TemporalPartitionManager) Stats() TemporalPartitionStats {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.stats
 }
 
-// GetAllPartitionKeys returns all partition keys in sorted order
 func (pm *TemporalPartitionManager) GetAllPartitionKeys() []string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -463,7 +396,6 @@ func (pm *TemporalPartitionManager) GetAllPartitionKeys() []string {
 	return result
 }
 
-// PartitionCount returns the current number of partitions
 func (pm *TemporalPartitionManager) PartitionCount() int {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()

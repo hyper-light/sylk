@@ -60,11 +60,17 @@ func (c *CrossSessionIndex) QuerySessions(query ArchiveQuery) ([]*Session, error
 		}
 
 		if c.store != nil {
-			current := c.store.GetCurrentSession()
-			if current != nil && current.ID == item.SessionID {
+			if current := c.store.GetCurrentSession(); current != nil && current.ID == item.SessionID {
 				sessions = append(sessions, current)
+				continue
+			}
+			if entry, ok := c.store.GetEntry(item.Entry.ID); ok && entry != nil {
+				sessions = append(sessions, &Session{
+					ID: item.SessionID,
+				})
 			}
 		}
+
 	}
 
 	return sessions, nil

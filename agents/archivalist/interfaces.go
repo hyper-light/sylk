@@ -3,14 +3,12 @@ package archivalist
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/adalundhe/sylk/core/skills"
 )
 
-// ArchivalistService defines the main archivalist interface for mocking
 type ArchivalistService interface {
-	// Lifecycle
 	Close() error
-
-	// Entry management
 	StoreEntry(ctx context.Context, entry *Entry) SubmissionResult
 	UpdateEntry(ctx context.Context, id string, updates func(*Entry)) error
 	GetEntry(ctx context.Context, id string) (*Entry, bool)
@@ -24,7 +22,6 @@ type ArchivalistService interface {
 	GetTokenSavings(sessionID string) TokenSavingsReport
 	GetGlobalTokenSavings() TokenSavingsReport
 
-	// Specialized storage (convenience wrappers around StoreEntry)
 	StoreTaskState(ctx context.Context, content string, source SourceModel) SubmissionResult
 	StoreDecision(ctx context.Context, choice, rationale string, source SourceModel) SubmissionResult
 	StoreIssue(ctx context.Context, problem string, source SourceModel) SubmissionResult
@@ -34,11 +31,9 @@ type ArchivalistService interface {
 	StoreHypothesis(ctx context.Context, content string, source SourceModel) SubmissionResult
 	StoreOpenThread(ctx context.Context, content string, source SourceModel) SubmissionResult
 
-	// Summary generation
 	GenerateSummary(ctx context.Context, content string) (*Entry, error)
 	GenerateSummaryFromEntries(ctx context.Context, query ArchiveQuery) (*Entry, error)
 
-	// Snapshot and sessions
 	GetSnapshot(ctx context.Context) *ChronicleSnapshot
 	EndSession(ctx context.Context, summary string, primaryFocus string) error
 	GetCurrentSession() *Session
@@ -47,11 +42,9 @@ type ArchivalistService interface {
 	GetRecentSessions(ctx context.Context, limit int) ([]*Session, error)
 	Stats() StorageStats
 
-	// Legacy submission API
 	SubmitSummary(ctx context.Context, content string, source SourceModel, metadata map[string]any) SubmissionResult
 	SubmitPromptResponse(ctx context.Context, prompt, response string, source SourceModel, metadata map[string]any) SubmissionResult
 
-	// File tracking
 	RecordFileRead(path, summary string, agent SourceModel)
 	RecordFileModified(path string, startLine, endLine int, description string, agent SourceModel)
 	RecordFileCreated(path, summary string, agent SourceModel)
@@ -59,24 +52,20 @@ type ArchivalistService interface {
 	GetFileState(path string) (*FileState, bool)
 	GetModifiedFiles() []*FileState
 
-	// Pattern tracking
 	RegisterPattern(category, name, description, example string, agent SourceModel)
 	GetPatterns() []*Pattern
 	GetPatternsByCategory(category string) []*Pattern
 
-	// Failure tracking
 	RecordFailure(approach, reason, taskContext string, agent SourceModel)
 	RecordFailureWithResolution(approach, reason, taskContext, resolution string, agent SourceModel)
 	CheckFailure(approach string) (*Failure, bool)
 	GetRecentFailures(limit int) []*Failure
 
-	// Intent tracking
 	RecordUserWants(content, priority, source string)
 	RecordUserRejects(content, source string)
 	GetUserWants() []*Intent
 	GetUserRejects() []*Intent
 
-	// Task/Resume state
 	SetCurrentTask(task, objective string, agent SourceModel)
 	CompleteStep(step string)
 	SetNextSteps(steps []string)
@@ -85,12 +74,10 @@ type ArchivalistService interface {
 	GetResumeState() *ResumeState
 	GetAgentBriefing() *AgentBriefing
 
-	// Agent management
 	RegisterAgent(name, sessionID, parentID string, source SourceModel) (*Response, error)
 	UnregisterAgent(agentID string) error
 	HandleRequest(ctx context.Context, req *Request) Response
 
-	// RAG accessors
 	GetQueryCache() QueryCacheService
 	GetEmbeddings() EmbeddingStoreService
 	GetRetriever() SemanticRetrieverService
@@ -100,9 +87,17 @@ type ArchivalistService interface {
 	GetRegistry() RegistryService
 	GetEventLog() EventLogService
 	GetUnresolvedConflicts() []*ConflictRecord
+
+	RegisterPreStoreHook(name string, priority skills.HookPriority, fn skills.StoreHookFunc)
+	RegisterPostStoreHook(name string, priority skills.HookPriority, fn skills.StoreHookFunc)
+	RegisterPreQueryHook(name string, priority skills.HookPriority, fn skills.QueryHookFunc)
+	RegisterPostQueryHook(name string, priority skills.HookPriority, fn skills.QueryHookFunc)
+	ExecutePreStoreHooks(ctx context.Context, data *skills.StoreHookData) (*skills.StoreHookData, skills.HookResult, error)
+	ExecutePostStoreHooks(ctx context.Context, data *skills.StoreHookData) (*skills.StoreHookData, skills.HookResult, error)
+	ExecutePreQueryHooks(ctx context.Context, data *skills.QueryHookData) (*skills.QueryHookData, skills.HookResult, error)
+	ExecutePostQueryHooks(ctx context.Context, data *skills.QueryHookData) (*skills.QueryHookData, skills.HookResult, error)
 }
 
-// StoreService defines the storage interface
 type StoreService interface {
 	GetCurrentSession() *Session
 	EndSession(summary string, primaryFocus string) error
@@ -117,7 +112,6 @@ type StoreService interface {
 	Stats() StorageStats
 }
 
-// ArchiveService defines the SQLite archive interface
 type ArchiveService interface {
 	Close() error
 	ArchiveEntries(entries []*Entry) error
@@ -130,13 +124,11 @@ type ArchiveService interface {
 	Stats() (map[string]int, error)
 }
 
-// ClientService defines the Anthropic client interface
 type ClientService interface {
 	GenerateSummary(ctx context.Context, content string) (*GeneratedSummary, error)
 	GenerateSummaryFromSubmissions(ctx context.Context, submissions []Submission) (*GeneratedSummary, error)
 }
 
-// RegistryService defines the agent registry interface
 type RegistryService interface {
 	Register(name, sessionID, parentID string, source SourceModel) (*RegisteredAgent, error)
 	Unregister(id string) error
@@ -162,7 +154,6 @@ type RegistryService interface {
 	GetStats() RegistryStats
 }
 
-// EventLogService defines the event logging interface
 type EventLogService interface {
 	Close()
 	Append(event *Event) error
@@ -183,13 +174,11 @@ type EventLogService interface {
 	Stats() EventStats
 }
 
-// ConflictDetectorService defines the conflict detection interface
 type ConflictDetectorService interface {
 	DetectConflict(scope Scope, key string, incoming map[string]any, version, agentID string) *ConflictResult
 	Resolve(result *ConflictResult, existing, incoming map[string]any) map[string]any
 }
 
-// QueryCacheService defines the query cache interface
 type QueryCacheService interface {
 	Get(ctx context.Context, query string, sessionID string) (*CachedResponse, bool)
 	Store(ctx context.Context, query string, sessionID string, response []byte, queryType QueryType) error
@@ -200,7 +189,6 @@ type QueryCacheService interface {
 	StatsBySession(sessionID string) QueryCacheStats
 }
 
-// EmbeddingStoreService defines the embedding store interface
 type EmbeddingStoreService interface {
 	Store(entry *EmbeddingEntry, embedding []float32) error
 	Get(id string) (*EmbeddingEntry, []float32, bool)
