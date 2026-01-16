@@ -1,0 +1,166 @@
+# Mockery configuration for generating mocks
+# Documentation: https://vektra.github.io/mockery/latest/configuration/
+
+# Output directory for all mocks
+dir: "mocks"
+
+# Package name for mock implementations
+mockname: "Mock{{.InterfaceName}}"
+
+# Output file naming pattern
+filename: "mock_{{.InterfaceName | snakecase}}.go"
+
+# Generate mocks for all matching interfaces
+all: false
+
+# Enable inpackage mode (generate mocks in the same package)
+inpackage: false
+
+# Disable version comments in generated files
+disable-version-string: false
+
+# Generate with testify expect methods
+with-expecter: true
+
+# Package-specific configurations
+packages:
+  github.com/adalundhe/sylk/agents/archivalist:
+    config:
+      dir: "agents/archivalist/mocks"
+      outpkg: "mocks"
+    interfaces:
+      # Main service interfaces
+      ArchivalistService:
+        config:
+          mockname: "MockArchivalist"
+
+      StoreService:
+        config:
+          mockname: "MockStore"
+
+      ArchiveService:
+        config:
+          mockname: "MockArchive"
+
+      ClientService:
+        config:
+          mockname: "MockClient"
+
+      RegistryService:
+        config:
+          mockname: "MockRegistry"
+
+      EventLogService:
+        config:
+          mockname: "MockEventLog"
+
+      ConflictDetectorService:
+        config:
+          mockname: "MockConflictDetector"
+
+      QueryCacheService:
+        config:
+          mockname: "MockQueryCache"
+
+      EmbeddingStoreService:
+        config:
+          mockname: "MockEmbeddingStore"
+
+      SemanticRetrieverService:
+        config:
+          mockname: "MockSemanticRetriever"
+
+      SynthesizerService:
+        config:
+          mockname: "MockSynthesizer"
+
+      MemoryManagerService:
+        config:
+          mockname: "MockMemoryManager"
+
+      ToolHandlerService:
+        config:
+          mockname: "MockToolHandler"
+
+      AgentContextService:
+        config:
+          mockname: "MockAgentContext"
+
+      ConflictHistoryService:
+        config:
+          mockname: "MockConflictHistory"
+
+      # Embedder interface (already defined in embeddings.go)
+      Embedder:
+        config:
+          mockname: "MockEmbedder"
+
+  github.com/adalundhe/sylk/agents/guide:
+    config:
+      dir: "agents/guide/mocks"
+      outpkg: "mocks"
+    interfaces:
+      # Core routing interfaces
+      RouterService:
+        config:
+          mockname: "MockRouter"
+
+      ClassifierService:
+        config:
+          mockname: "MockClassifier"
+
+      PendingStoreService:
+        config:
+          mockname: "MockPendingStore"
+
+      RouteCacheService:
+        config:
+          mockname: "MockRouteCache"
+
+      RegistryService:
+        config:
+          mockname: "MockRegistry"
+
+      # Health and circuit breaker interfaces
+      HealthMonitorService:
+        config:
+          mockname: "MockHealthMonitor"
+
+      CircuitBreakerService:
+        config:
+          mockname: "MockCircuitBreaker"
+
+      CircuitBreakerRegistryService:
+        config:
+          mockname: "MockCircuitBreakerRegistry"
+
+      DeadLetterQueueService:
+        config:
+          mockname: "MockDeadLetterQueue"
+
+      # DSL and retry interfaces
+      ParserService:
+        config:
+          mockname: "MockParser"
+
+      RetryPolicyService:
+        config:
+          mockname: "MockRetryPolicy"
+
+      HeartbeatSenderService:
+        config:
+          mockname: "MockHeartbeatSender"
+
+      # EventBus already defined in bus.go
+      EventBus:
+        config:
+          mockname: "MockEventBus"
+
+      Subscription:
+        config:
+          mockname: "MockSubscription"
+
+      # Classifier client for LLM mocking
+      ClassifierClient:
+        config:
+          mockname: "MockClassifierClient"

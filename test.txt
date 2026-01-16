@@ -1,0 +1,77 @@
+ Note:
+  - The architect's scheduling of work with
+  the
+  orchestrator should be a skill.
+  - The architect should have a skill to
+  facilitate ready adjustment of an executing
+  workflow and signal the orchestrator to
+  adjust.
+  - The orchestrator should be able to
+  readily
+  receive and adjust to updated or even
+  cancelled workflows.
+  - The orchestrator's ability to request
+  changes to the architect's plan should be a
+  skill with the new workflow/adjusted
+  workflow
+  as the output.
+  - The librarian should have a skill to scan
+  remote github repositories as well,
+  including
+  private ones.
+  - The librarian should have skills or
+  dynamcially configurable skills to
+  identify the languages and thus linting
+  tools, LSPs, formatters, and other tooling
+  available or appropriate.
+  - The engineer should have skills or
+  dynamcially configurable skills for calling
+  tools like
+  ast-grep, glob, grep, running bash
+  commands,
+  running lsps/formatters/linting tools
+  identified by the librarian and approved by
+  the user via architect, running cat on
+  files,
+  running sed, running awk, running ping, and
+  other common bash commands.
+  - The engineer should also should also have
+  the abiliy to
+  create virtual environments, install
+  packages
+  already existent in the project or approved
+  by
+  the user, etc.
+  - The inspector should also have skills or
+  dynamcially configurable skills to run tools
+  like
+  LSPs, formatters, linters, type-checkers,
+  and other tools identified by the
+  librarian.
+  - The inspector should also have the abiliy
+  to
+  create virtual environments, install
+  packages
+  already existent in the project or approved
+  by
+  the user, etc.
+  - The tester should have a dynamically
+  configurable skills to run tools that call
+  test frameworks or libraries specified by
+  the
+  user or identified as appropriate by the
+  librarian for the codebase.
+  - The tester should also have the abiliy to
+  create virtual environments, install
+  packages
+  already existent in the project or approved
+  by the user, etc.
+  - The tester should have skills that can
+  call cat, grep, and
+  non-write bash skills that can call
+  appropriate tools.
+
+  I also STILL do not see a dedicate section in
+  our TODO.md on the changes needed to the
+  guide and archivalist clients to make them
+  compatible with our architecture.
