@@ -21,26 +21,54 @@ func TestNewSkill_Builder(t *testing.T) {
 		}).
 		Build()
 
-	if skill.Name != "test_skill" {
-		t.Errorf("expected name 'test_skill', got %s", skill.Name)
+	assertSkillName(t, skill, "test_skill")
+	assertSkillDescription(t, skill, "A test skill")
+	assertSkillDomain(t, skill, "testing")
+	assertSkillKeywordsLen(t, skill, 2)
+	assertSkillPriority(t, skill, 10)
+	assertInputSchemaPropertiesLen(t, skill, 3)
+	assertInputSchemaRequiredLen(t, skill, 1)
+}
+
+func assertSkillName(t *testing.T, skill *Skill, expected string) {
+	if skill.Name != expected {
+		t.Errorf("expected name '%s', got %s", expected, skill.Name)
 	}
-	if skill.Description != "A test skill" {
-		t.Errorf("expected description 'A test skill', got %s", skill.Description)
+}
+
+func assertSkillDescription(t *testing.T, skill *Skill, expected string) {
+	if skill.Description != expected {
+		t.Errorf("expected description '%s', got %s", expected, skill.Description)
 	}
-	if skill.Domain != "testing" {
-		t.Errorf("expected domain 'testing', got %s", skill.Domain)
+}
+
+func assertSkillDomain(t *testing.T, skill *Skill, expected string) {
+	if skill.Domain != expected {
+		t.Errorf("expected domain '%s', got %s", expected, skill.Domain)
 	}
-	if len(skill.Keywords) != 2 {
-		t.Errorf("expected 2 keywords, got %d", len(skill.Keywords))
+}
+
+func assertSkillKeywordsLen(t *testing.T, skill *Skill, expected int) {
+	if len(skill.Keywords) != expected {
+		t.Errorf("expected %d keywords, got %d", expected, len(skill.Keywords))
 	}
-	if skill.Priority != 10 {
-		t.Errorf("expected priority 10, got %d", skill.Priority)
+}
+
+func assertSkillPriority(t *testing.T, skill *Skill, expected int) {
+	if skill.Priority != expected {
+		t.Errorf("expected priority %d, got %d", expected, skill.Priority)
 	}
-	if len(skill.InputSchema.Properties) != 3 {
-		t.Errorf("expected 3 properties, got %d", len(skill.InputSchema.Properties))
+}
+
+func assertInputSchemaPropertiesLen(t *testing.T, skill *Skill, expected int) {
+	if len(skill.InputSchema.Properties) != expected {
+		t.Errorf("expected %d properties, got %d", expected, len(skill.InputSchema.Properties))
 	}
-	if len(skill.InputSchema.Required) != 1 {
-		t.Errorf("expected 1 required param, got %d", len(skill.InputSchema.Required))
+}
+
+func assertInputSchemaRequiredLen(t *testing.T, skill *Skill, expected int) {
+	if len(skill.InputSchema.Required) != expected {
+		t.Errorf("expected %d required param, got %d", expected, len(skill.InputSchema.Required))
 	}
 }
 
@@ -458,51 +486,66 @@ func TestRegistry_GetToolDefinitions(t *testing.T) {
 func TestRegistry_Stats(t *testing.T) {
 	registry := NewRegistry()
 
-	for i, name := range []string{"s1", "s2", "s3"} {
-		domain := "domain_x"
-		if i == 2 {
-			domain = "domain_y"
-		}
-		skill := NewSkill(name).
-			Description("Test").
-			Domain(domain).
-			Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-				return nil, nil
-			}).
-			Build()
-		registry.Register(skill)
-	}
-
-	registry.Load("s1")
-	registry.Load("s2")
-
-	// Invoke s1 multiple times
-	for i := 0; i < 10; i++ {
-		registry.Invoke(context.Background(), "s1", nil)
-	}
-	for i := 0; i < 5; i++ {
-		registry.Invoke(context.Background(), "s2", nil)
-	}
+	registerStatsSkills(registry)
+	loadStatsSkills(registry)
+	invokeSkillTimes(registry, "s1", 10)
+	invokeSkillTimes(registry, "s2", 5)
 
 	stats := registry.Stats()
+	assertRegistryStats(t, stats)
+}
 
-	if stats.Total != 3 {
-		t.Errorf("expected total 3, got %d", stats.Total)
+func registerStatsSkills(registry *Registry) {
+	registerSkillWithDomain(registry, "s1", "domain_x")
+	registerSkillWithDomain(registry, "s2", "domain_x")
+	registerSkillWithDomain(registry, "s3", "domain_y")
+}
+
+func registerSkillWithDomain(registry *Registry, name, domain string) {
+	skill := NewSkill(name).
+		Description("Test").
+		Domain(domain).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return nil, nil
+		}).
+		Build()
+	registry.Register(skill)
+}
+
+func loadStatsSkills(registry *Registry) {
+	registry.Load("s1")
+	registry.Load("s2")
+}
+
+func invokeSkillTimes(registry *Registry, name string, times int) {
+	for i := 0; i < times; i++ {
+		registry.Invoke(context.Background(), name, nil)
 	}
-	if stats.Loaded != 2 {
-		t.Errorf("expected loaded 2, got %d", stats.Loaded)
+}
+
+func assertRegistryStats(t *testing.T, stats Stats) {
+	assertRegistryCounts(t, stats)
+	assertRegistryTopInvoked(t, stats)
+}
+
+func assertRegistryCounts(t *testing.T, stats Stats) {
+	assertStatsCount(t, "total", stats.Total, 3)
+	assertStatsCount(t, "loaded", stats.Loaded, 2)
+	assertStatsCount(t, "domain_x", stats.ByDomain["domain_x"], 2)
+	assertStatsCount(t, "domain_y", stats.ByDomain["domain_y"], 1)
+	assertStatsCount(t, "top invoked", len(stats.TopInvoked), 2)
+}
+
+func assertRegistryTopInvoked(t *testing.T, stats Stats) {
+	first := stats.TopInvoked[0]
+	if first.Name != "s1" || first.InvokeCount != 10 {
+		t.Errorf("expected s1 with 10 invokes first, got %+v", first)
 	}
-	if stats.ByDomain["domain_x"] != 2 {
-		t.Errorf("expected 2 in domain_x, got %d", stats.ByDomain["domain_x"])
-	}
-	if stats.ByDomain["domain_y"] != 1 {
-		t.Errorf("expected 1 in domain_y, got %d", stats.ByDomain["domain_y"])
-	}
-	if len(stats.TopInvoked) != 2 {
-		t.Errorf("expected 2 top invoked, got %d", len(stats.TopInvoked))
-	}
-	if stats.TopInvoked[0].Name != "s1" || stats.TopInvoked[0].InvokeCount != 10 {
-		t.Errorf("expected s1 with 10 invokes first, got %+v", stats.TopInvoked[0])
+}
+
+func assertStatsCount(t *testing.T, label string, actual int, expected int) {
+	if actual != expected {
+		t.Errorf("expected %s %d, got %d", label, expected, actual)
 	}
 }
 

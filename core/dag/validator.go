@@ -84,68 +84,95 @@ func (v *Validator) buildDependencyGraph(d *DAG) {
 
 // topologicalSort performs Kahn's algorithm to detect cycles and compute order
 func (v *Validator) topologicalSort(d *DAG) ([]string, error) {
-	// Count incoming edges (dependencies)
-	inDegree := make(map[string]int)
-	for id, node := range d.nodes {
-		inDegree[id] = len(node.dependencies)
-	}
+	inDegree := v.buildInDegreeMap(d)
+	queue := v.collectZeroInDegree(inDegree)
+	result := v.processTopoQueue(d, inDegree, queue)
 
-	// Start with nodes that have no dependencies
-	queue := make([]string, 0)
-	for id, degree := range inDegree {
-		if degree == 0 {
-			queue = append(queue, id)
-		}
-	}
-
-	var result []string
-
-	for len(queue) > 0 {
-		// Pop from queue
-		nodeID := queue[0]
-		queue = queue[1:]
-		result = append(result, nodeID)
-
-		// Process dependents
-		node := d.nodes[nodeID]
-		for _, depID := range node.dependents {
-			inDegree[depID]--
-			if inDegree[depID] == 0 {
-				queue = append(queue, depID)
-			}
-		}
-	}
-
-	// If not all nodes were processed, there's a cycle
-	if len(result) != len(d.nodes) {
+	if v.hasCycle(result, d.nodes) {
 		return nil, ErrCyclicDependency
 	}
 
 	return result, nil
 }
 
+func (v *Validator) buildInDegreeMap(d *DAG) map[string]int {
+	inDegree := make(map[string]int)
+	for id, node := range d.nodes {
+		inDegree[id] = len(node.dependencies)
+	}
+	return inDegree
+}
+
+func (v *Validator) collectZeroInDegree(inDegree map[string]int) []string {
+	queue := make([]string, 0)
+	for id, degree := range inDegree {
+		if degree == 0 {
+			queue = append(queue, id)
+		}
+	}
+	return queue
+}
+
+func (v *Validator) processTopoQueue(d *DAG, inDegree map[string]int, queue []string) []string {
+	result := make([]string, 0, len(d.nodes))
+	for len(queue) > 0 {
+		var nodeID string
+		nodeID, queue = popQueue(queue)
+		result = append(result, nodeID)
+		queue = v.enqueueDependents(d, nodeID, inDegree, queue)
+	}
+	return result
+}
+
+func (v *Validator) enqueueDependents(d *DAG, nodeID string, inDegree map[string]int, queue []string) []string {
+	node := d.nodes[nodeID]
+	for _, depID := range node.dependents {
+		inDegree[depID]--
+		if inDegree[depID] == 0 {
+			queue = append(queue, depID)
+		}
+	}
+	return queue
+}
+
+func (v *Validator) hasCycle(order []string, nodes map[string]*Node) bool {
+	return len(order) != len(nodes)
+}
+
+func popQueue(queue []string) (string, []string) {
+	nodeID := queue[0]
+	return nodeID, queue[1:]
+}
+
 // computeLayers groups nodes into execution layers
 func (v *Validator) computeLayers(d *DAG, order []string) [][]string {
-	// Compute layer for each node
-	// A node's layer is 1 + max layer of its dependencies
+	layerMap := v.buildLayerMap(d, order)
+	layers := v.allocateLayers(layerMap)
+	v.fillLayers(layers, layerMap)
+	return layers
+}
+
+func (v *Validator) buildLayerMap(d *DAG, order []string) map[string]int {
 	layerMap := make(map[string]int)
-
 	for _, nodeID := range order {
-		node := d.nodes[nodeID]
-		maxDepLayer := -1
-
-		for _, depID := range node.dependencies {
-			if layer, ok := layerMap[depID]; ok && layer > maxDepLayer {
-				maxDepLayer = layer
-			}
-		}
-
-		layer := maxDepLayer + 1
+		layer := v.resolveLayer(d.nodes[nodeID], layerMap)
 		layerMap[nodeID] = layer
-		node.setLayer(layer)
+		d.nodes[nodeID].setLayer(layer)
 	}
+	return layerMap
+}
 
-	// Group nodes by layer
+func (v *Validator) resolveLayer(node *Node, layerMap map[string]int) int {
+	maxDepLayer := -1
+	for _, depID := range node.dependencies {
+		if layer, ok := layerMap[depID]; ok && layer > maxDepLayer {
+			maxDepLayer = layer
+		}
+	}
+	return maxDepLayer + 1
+}
+
+func (v *Validator) allocateLayers(layerMap map[string]int) [][]string {
 	maxLayer := 0
 	for _, layer := range layerMap {
 		if layer > maxLayer {
@@ -157,12 +184,13 @@ func (v *Validator) computeLayers(d *DAG, order []string) [][]string {
 	for i := range layers {
 		layers[i] = make([]string, 0)
 	}
+	return layers
+}
 
+func (v *Validator) fillLayers(layers [][]string, layerMap map[string]int) {
 	for nodeID, layer := range layerMap {
 		layers[layer] = append(layers[layer], nodeID)
 	}
-
-	return layers
 }
 
 // sortLayersByPriority sorts nodes within each layer by priority (descending)

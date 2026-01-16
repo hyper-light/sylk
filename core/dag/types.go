@@ -33,32 +33,47 @@ const (
 
 // String returns the string representation of a node state
 func (s NodeState) String() string {
-	switch s {
-	case NodeStatePending:
-		return "pending"
-	case NodeStateQueued:
-		return "queued"
-	case NodeStateRunning:
-		return "running"
-	case NodeStateSucceeded:
-		return "succeeded"
-	case NodeStateFailed:
-		return "failed"
-	case NodeStateBlocked:
-		return "blocked"
-	case NodeStateSkipped:
-		return "skipped"
-	case NodeStateCancelled:
-		return "cancelled"
-	default:
-		return "unknown"
+	if name, ok := nodeStateStrings()[s]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+type nodeStateStringMap map[NodeState]string
+
+func nodeStateStrings() nodeStateStringMap {
+	return nodeStateStringMap{
+		NodeStatePending:   "pending",
+		NodeStateQueued:    "queued",
+		NodeStateRunning:   "running",
+		NodeStateSucceeded: "succeeded",
+		NodeStateFailed:    "failed",
+		NodeStateBlocked:   "blocked",
+		NodeStateSkipped:   "skipped",
+		NodeStateCancelled: "cancelled",
 	}
 }
 
 // IsTerminal returns true if this is a terminal state
 func (s NodeState) IsTerminal() bool {
-	return s == NodeStateSucceeded || s == NodeStateFailed ||
-		s == NodeStateBlocked || s == NodeStateSkipped || s == NodeStateCancelled
+	return nodeTerminalStates().has(s)
+}
+
+type nodeStateSet map[NodeState]struct{}
+
+func nodeTerminalStates() nodeStateSet {
+	return nodeStateSet{
+		NodeStateSucceeded: {},
+		NodeStateFailed:    {},
+		NodeStateBlocked:   {},
+		NodeStateSkipped:   {},
+		NodeStateCancelled: {},
+	}
+}
+
+func (s nodeStateSet) has(state NodeState) bool {
+	_, ok := s[state]
+	return ok
 }
 
 // IsSuccess returns true if this is a success state
@@ -82,13 +97,18 @@ const (
 
 // String returns the string representation of a failure policy
 func (p FailurePolicy) String() string {
-	switch p {
-	case FailurePolicyFailFast:
-		return "fail_fast"
-	case FailurePolicyContinue:
-		return "continue"
-	default:
-		return "unknown"
+	if name, ok := failurePolicyStrings()[p]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+type failurePolicyStringMap map[FailurePolicy]string
+
+func failurePolicyStrings() failurePolicyStringMap {
+	return failurePolicyStringMap{
+		FailurePolicyFailFast: "fail_fast",
+		FailurePolicyContinue: "continue",
 	}
 }
 
@@ -254,19 +274,21 @@ const (
 
 // String returns the string representation of a DAG state
 func (s DAGState) String() string {
-	switch s {
-	case DAGStatePending:
-		return "pending"
-	case DAGStateRunning:
-		return "running"
-	case DAGStateSucceeded:
-		return "succeeded"
-	case DAGStateFailed:
-		return "failed"
-	case DAGStateCancelled:
-		return "cancelled"
-	default:
-		return "unknown"
+	if name, ok := dagStateStrings()[s]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+type dagStateStringMap map[DAGState]string
+
+func dagStateStrings() dagStateStringMap {
+	return dagStateStringMap{
+		DAGStatePending:   "pending",
+		DAGStateRunning:   "running",
+		DAGStateSucceeded: "succeeded",
+		DAGStateFailed:    "failed",
+		DAGStateCancelled: "cancelled",
 	}
 }
 
@@ -340,36 +362,34 @@ const (
 
 // String returns the string representation of an event type
 func (e EventType) String() string {
-	switch e {
-	case EventDAGStarted:
-		return "dag_started"
-	case EventDAGCompleted:
-		return "dag_completed"
-	case EventDAGFailed:
-		return "dag_failed"
-	case EventDAGCancelled:
-		return "dag_cancelled"
-	case EventLayerStarted:
-		return "layer_started"
-	case EventLayerCompleted:
-		return "layer_completed"
-	case EventNodeQueued:
-		return "node_queued"
-	case EventNodeStarted:
-		return "node_started"
-	case EventNodeCompleted:
-		return "node_completed"
-	case EventNodeFailed:
-		return "node_failed"
-	case EventNodeRetrying:
-		return "node_retrying"
-	case EventNodeSkipped:
-		return "node_skipped"
-	case EventNodeCancelled:
-		return "node_cancelled"
-	default:
-		return "unknown"
+	return eventTypeStrings().name(e)
+}
+
+type eventTypeStringMap map[EventType]string
+
+func eventTypeStrings() eventTypeStringMap {
+	return eventTypeStringMap{
+		EventDAGStarted:     "dag_started",
+		EventDAGCompleted:   "dag_completed",
+		EventDAGFailed:      "dag_failed",
+		EventDAGCancelled:   "dag_cancelled",
+		EventLayerStarted:   "layer_started",
+		EventLayerCompleted: "layer_completed",
+		EventNodeQueued:     "node_queued",
+		EventNodeStarted:    "node_started",
+		EventNodeCompleted:  "node_completed",
+		EventNodeFailed:     "node_failed",
+		EventNodeRetrying:   "node_retrying",
+		EventNodeSkipped:    "node_skipped",
+		EventNodeCancelled:  "node_cancelled",
 	}
+}
+
+func (m eventTypeStringMap) name(event EventType) string {
+	if name, ok := m[event]; ok {
+		return name
+	}
+	return "unknown"
 }
 
 // Event represents a DAG execution event

@@ -196,8 +196,12 @@ func TestNewHeartbeatMessage(t *testing.T) {
 
 func TestMessageOptionPattern(t *testing.T) {
 	deadline := time.Now().Add(1 * time.Hour)
+	message := buildOptionMessage(deadline)
+	assertOptionMessage(t, message, deadline)
+}
 
-	msg := NewMessage(
+func buildOptionMessage(deadline time.Time) *Message[string] {
+	return NewMessage(
 		TypeRequest,
 		"source",
 		"payload",
@@ -210,30 +214,48 @@ func TestMessageOptionPattern(t *testing.T) {
 		WithMaxAttemptsOpt[string](5),
 		WithMetadataOpt[string]("key", "value"),
 	)
+}
 
-	if msg.CorrelationID != "corr-123" {
-		t.Errorf("expected correlation 'corr-123', got %s", msg.CorrelationID)
+func assertOptionMessage(t *testing.T, message *Message[string], deadline time.Time) {
+	assertOptionIdentifiers(t, message)
+	assertOptionTiming(t, message, deadline)
+	assertOptionPriority(t, message)
+	assertOptionMetadata(t, message)
+}
+
+func assertOptionIdentifiers(t *testing.T, message *Message[string]) {
+	if message.CorrelationID != "corr-123" {
+		t.Errorf("expected correlation 'corr-123', got %s", message.CorrelationID)
 	}
-	if msg.ParentID != "parent-456" {
-		t.Errorf("expected parent 'parent-456', got %s", msg.ParentID)
+	if message.ParentID != "parent-456" {
+		t.Errorf("expected parent 'parent-456', got %s", message.ParentID)
 	}
-	if msg.Target != "target" {
-		t.Errorf("expected target 'target', got %s", msg.Target)
+	if message.Target != "target" {
+		t.Errorf("expected target 'target', got %s", message.Target)
 	}
-	if msg.Priority != PriorityHigh {
-		t.Errorf("expected priority high, got %d", msg.Priority)
-	}
-	if msg.Deadline == nil || !msg.Deadline.Equal(deadline) {
+}
+
+func assertOptionTiming(t *testing.T, message *Message[string], deadline time.Time) {
+	if message.Deadline == nil || !message.Deadline.Equal(deadline) {
 		t.Error("expected deadline to be set")
 	}
-	if msg.TTL != 30*time.Second {
-		t.Errorf("expected TTL 30s, got %v", msg.TTL)
+	if message.TTL != 30*time.Second {
+		t.Errorf("expected TTL 30s, got %v", message.TTL)
 	}
-	if msg.MaxAttempts != 5 {
-		t.Errorf("expected max attempts 5, got %d", msg.MaxAttempts)
+}
+
+func assertOptionPriority(t *testing.T, message *Message[string]) {
+	if message.Priority != PriorityHigh {
+		t.Errorf("expected priority high, got %d", message.Priority)
 	}
-	if msg.Metadata["key"] != "value" {
-		t.Errorf("expected metadata key='value', got %v", msg.Metadata["key"])
+	if message.MaxAttempts != 5 {
+		t.Errorf("expected max attempts 5, got %d", message.MaxAttempts)
+	}
+}
+
+func assertOptionMetadata(t *testing.T, message *Message[string]) {
+	if message.Metadata["key"] != "value" {
+		t.Errorf("expected metadata key='value', got %v", message.Metadata["key"])
 	}
 }
 

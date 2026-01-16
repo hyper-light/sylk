@@ -442,6 +442,12 @@ func TestNewResponseTransformerHook(t *testing.T) {
 func TestHookRegistry_Stats(t *testing.T) {
 	registry := NewHookRegistry()
 
+	registerStatsHooks(registry)
+	stats := registry.Stats()
+	assertHookStats(t, stats)
+}
+
+func registerStatsHooks(registry *HookRegistry) {
 	registry.RegisterPrePromptHook("pre1", HookPriorityNormal, func(ctx context.Context, data *PromptHookData) HookResult {
 		return HookResult{Continue: true}
 	})
@@ -469,33 +475,31 @@ func TestHookRegistry_Stats(t *testing.T) {
 	registry.RegisterPostQueryHook("query2", HookPriorityNormal, func(ctx context.Context, data *QueryHookData) HookResult {
 		return HookResult{Continue: true}
 	})
+}
 
-	stats := registry.Stats()
+func assertHookStats(t *testing.T, stats HookStats) {
+	assertHookCounts(t, stats)
+	assertHookTotals(t, stats)
+}
 
-	if stats.PrePromptHooks != 2 {
-		t.Errorf("expected 2 pre-prompt hooks, got %d", stats.PrePromptHooks)
+func assertHookCounts(t *testing.T, stats HookStats) {
+	assertHookCount(t, "pre-prompt", stats.PrePromptHooks, 2)
+	assertHookCount(t, "post-prompt", stats.PostPromptHooks, 1)
+	assertHookCount(t, "pre-tool-call", stats.PreToolCallHooks, 1)
+	assertHookCount(t, "post-tool-call", stats.PostToolCallHooks, 1)
+	assertHookCount(t, "pre-store", stats.PreStoreHooks, 1)
+	assertHookCount(t, "post-store", stats.PostStoreHooks, 1)
+	assertHookCount(t, "pre-query", stats.PreQueryHooks, 1)
+	assertHookCount(t, "post-query", stats.PostQueryHooks, 1)
+}
+
+func assertHookCount(t *testing.T, label string, actual int, expected int) {
+	if actual != expected {
+		t.Errorf("expected %d %s hooks, got %d", expected, label, actual)
 	}
-	if stats.PostPromptHooks != 1 {
-		t.Errorf("expected 1 post-prompt hook, got %d", stats.PostPromptHooks)
-	}
-	if stats.PreToolCallHooks != 1 {
-		t.Errorf("expected 1 pre-tool-call hook, got %d", stats.PreToolCallHooks)
-	}
-	if stats.PostToolCallHooks != 1 {
-		t.Errorf("expected 1 post-tool-call hook, got %d", stats.PostToolCallHooks)
-	}
-	if stats.PreStoreHooks != 1 {
-		t.Errorf("expected 1 pre-store hook, got %d", stats.PreStoreHooks)
-	}
-	if stats.PostStoreHooks != 1 {
-		t.Errorf("expected 1 post-store hook, got %d", stats.PostStoreHooks)
-	}
-	if stats.PreQueryHooks != 1 {
-		t.Errorf("expected 1 pre-query hook, got %d", stats.PreQueryHooks)
-	}
-	if stats.PostQueryHooks != 1 {
-		t.Errorf("expected 1 post-query hook, got %d", stats.PostQueryHooks)
-	}
+}
+
+func assertHookTotals(t *testing.T, stats HookStats) {
 	if stats.TotalHooks != 9 {
 		t.Errorf("expected 9 total hooks, got %d", stats.TotalHooks)
 	}

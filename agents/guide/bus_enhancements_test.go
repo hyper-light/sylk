@@ -348,9 +348,38 @@ func TestFilteredHandler(t *testing.T) {
 // =============================================================================
 
 func TestSessionBus_Publish(t *testing.T) {
-	bus := NewChannelBus(DefaultChannelBusConfig())
+	bus, sb := setupSessionBus(t)
 	defer bus.Close()
+	defer sb.Close()
 
+	received := make(chan *Message, 10)
+	subscribeSessionTopic(t, sb, received)
+
+	publishSessionMessage(t, sb)
+	assertPublishedMessage(t, received)
+}
+
+func TestSessionBus_SubscribePattern(t *testing.T) {
+	bus, sb := setupSessionBus(t)
+	defer bus.Close()
+	defer sb.Close()
+
+	var receivedCount int64
+	pattern := "session.*.*.requests"
+	subscribePattern(t, sb, pattern, &receivedCount)
+
+	assertRouterPatternCount(t, sb, 1)
+	fullTopic := assertResolvedTopic(t, sb, "myagent.requests", "session.test-session.myagent.requests")
+	assertPatternMatches(t, sb, pattern, fullTopic)
+
+	publishPatternMessage(t, sb)
+	waitForPatternDelivery()
+	assertPatternStats(t, sb)
+	assertPatternReceived(t, &receivedCount)
+}
+
+func setupSessionBus(t *testing.T) (*ChannelBus, *SessionBus) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
 	sb, err := NewSessionBus(bus, SessionBusConfig{
 		SessionID:       "test-session",
 		EnableWildcards: true,
@@ -358,38 +387,33 @@ func TestSessionBus_Publish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create session bus: %v", err)
 	}
-	defer sb.Close()
+	return bus, sb
+}
 
-	received := make(chan *Message, 10)
-
-	// Subscribe to session topic
-	_, err = sb.Subscribe("guide.requests", func(msg *Message) error {
+func subscribeSessionTopic(t *testing.T, sb *SessionBus, received chan *Message) {
+	_, err := sb.Subscribe("guide.requests", func(msg *Message) error {
 		received <- msg
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("failed to subscribe: %v", err)
 	}
-
-	// Allow subscription to be registered
 	time.Sleep(10 * time.Millisecond)
+}
 
-	// Publish message
-	msg := &Message{
-		ID:   "test-msg",
-		Type: MessageTypeRequest,
-	}
+func publishSessionMessage(t *testing.T, sb *SessionBus) {
+	msg := &Message{ID: "test-msg", Type: MessageTypeRequest}
 	if err := sb.Publish("guide.requests", msg); err != nil {
 		t.Fatalf("failed to publish: %v", err)
 	}
+}
 
-	// Wait for message
+func assertPublishedMessage(t *testing.T, received chan *Message) {
 	select {
 	case rcv := <-received:
 		if rcv.ID != "test-msg" {
 			t.Errorf("expected message ID 'test-msg', got %q", rcv.ID)
 		}
-		// Check session_id was added to metadata
 		if sessID, ok := rcv.Metadata["session_id"].(string); !ok || sessID != "test-session" {
 			t.Error("expected session_id in metadata")
 		}
@@ -398,71 +422,60 @@ func TestSessionBus_Publish(t *testing.T) {
 	}
 }
 
-func TestSessionBus_SubscribePattern(t *testing.T) {
-	bus := NewChannelBus(DefaultChannelBusConfig())
-	defer bus.Close()
-
-	sb, err := NewSessionBus(bus, SessionBusConfig{
-		SessionID:       "test-session",
-		EnableWildcards: true,
-	})
-	if err != nil {
-		t.Fatalf("failed to create session bus: %v", err)
-	}
-	defer sb.Close()
-
-	var receivedCount int64
-
-	// Subscribe to wildcard pattern that matches session topics
-	// Pattern: session.*.*.requests matches session.{sessionID}.{agent}.requests
-	pattern := "session.*.*.requests"
-	_, err = sb.SubscribePattern(pattern, func(msg *Message) error {
-		atomic.AddInt64(&receivedCount, 1)
+func subscribePattern(t *testing.T, sb *SessionBus, pattern string, receivedCount *int64) {
+	_, err := sb.SubscribePattern(pattern, func(msg *Message) error {
+		atomic.AddInt64(receivedCount, 1)
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("failed to subscribe pattern: %v", err)
 	}
+}
 
-	// Verify the router has the pattern
+func assertRouterPatternCount(t *testing.T, sb *SessionBus, expected int) {
 	if sb.router == nil {
 		t.Fatal("router is nil")
 	}
 	routerStats := sb.router.Stats()
-	if routerStats.TotalPatterns != 1 {
-		t.Errorf("expected 1 pattern in router, got %d", routerStats.TotalPatterns)
+	if routerStats.TotalPatterns != int64(expected) {
+		t.Errorf("expected %d pattern in router, got %d", expected, routerStats.TotalPatterns)
 	}
+}
 
-	// Use a non-global topic (myagent is not in the global prefix list)
-	topic := "myagent.requests"
+func assertResolvedTopic(t *testing.T, sb *SessionBus, topic string, expected string) string {
 	fullTopic := sb.resolveTopic(topic)
-	expectedTopic := "session.test-session.myagent.requests"
-	if fullTopic != expectedTopic {
-		t.Errorf("expected resolved topic %q, got %q", expectedTopic, fullTopic)
+	if fullTopic != expected {
+		t.Errorf("expected resolved topic %q, got %q", expected, fullTopic)
 	}
+	return fullTopic
+}
 
-	// Check if pattern matches the topic directly using the router
-	matches := sb.router.Match(fullTopic)
+func assertPatternMatches(t *testing.T, sb *SessionBus, pattern string, topic string) {
+	matches := sb.router.Match(topic)
 	if len(matches) == 0 {
-		t.Errorf("expected pattern %q to match topic %q, but got 0 matches", pattern, fullTopic)
+		t.Errorf("expected pattern %q to match topic %q, but got 0 matches", pattern, topic)
 	}
+}
 
-	// Publish to matching topic (will be session-prefixed)
+func publishPatternMessage(t *testing.T, sb *SessionBus) {
 	msg := &Message{ID: "test-msg"}
-	if err := sb.Publish(topic, msg); err != nil {
+	if err := sb.Publish("myagent.requests", msg); err != nil {
 		t.Fatalf("failed to publish: %v", err)
 	}
+}
 
-	// Allow async processing
+func waitForPatternDelivery() {
 	time.Sleep(100 * time.Millisecond)
+}
 
-	// Check stats
+func assertPatternStats(t *testing.T, sb *SessionBus) {
 	stats := sb.Stats()
 	t.Logf("Session bus stats: published=%d, received=%d, wildcardMatches=%d",
 		stats.MessagesPublished, stats.MessagesReceived, stats.WildcardMatches)
+}
 
-	// Check wildcard subscription received the message
-	if atomic.LoadInt64(&receivedCount) == 0 {
+func assertPatternReceived(t *testing.T, receivedCount *int64) {
+	if atomic.LoadInt64(receivedCount) == 0 {
 		t.Error("expected wildcard subscription to receive message")
 	}
 }
@@ -547,43 +560,62 @@ func TestSessionBus_GlobalTopics(t *testing.T) {
 // =============================================================================
 
 func TestSessionBusManager_GetOrCreate(t *testing.T) {
-	bus := NewChannelBus(DefaultChannelBusConfig())
-	defer bus.Close()
-
-	manager := NewSessionBusManager(bus, SessionBusManagerConfig{
+	manager, cleanup := newSessionBusManager(t, SessionBusManagerConfig{
 		EnableWildcards: true,
 	})
+	defer cleanup()
 
-	// Create first session
-	sb1, err := manager.GetOrCreate("session-1")
-	if err != nil {
-		t.Fatalf("failed to create session bus: %v", err)
-	}
-	if sb1.SessionID() != "session-1" {
-		t.Errorf("expected session ID 'session-1', got %q", sb1.SessionID())
-	}
+	sb1 := getOrCreateSessionBus(t, manager, "session-1")
+	assertSessionBusID(t, sb1, "session-1")
 
-	// Get same session
-	sb2, err := manager.GetOrCreate("session-1")
+	sb2 := getOrCreateSessionBus(t, manager, "session-1")
+	assertSameSessionBus(t, sb1, sb2)
+
+	sb3 := getOrCreateSessionBus(t, manager, "session-2")
+	assertDifferentSessionBus(t, sb1, sb3)
+
+	assertActiveSessionCount(t, manager, 2)
+}
+
+func newSessionBusManager(t *testing.T, cfg SessionBusManagerConfig) (*SessionBusManager, func()) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	manager := NewSessionBusManager(bus, cfg)
+	return manager, func() {
+		manager.CloseAll()
+		bus.Close()
+	}
+}
+
+func getOrCreateSessionBus(t *testing.T, manager *SessionBusManager, sessionID string) *SessionBus {
+	sb, err := manager.GetOrCreate(sessionID)
 	if err != nil {
 		t.Fatalf("failed to get session bus: %v", err)
 	}
-	if sb1 != sb2 {
+	return sb
+}
+
+func assertSessionBusID(t *testing.T, bus *SessionBus, expected string) {
+	if bus.SessionID() != expected {
+		t.Errorf("expected session ID '%s', got %q", expected, bus.SessionID())
+	}
+}
+
+func assertSameSessionBus(t *testing.T, first *SessionBus, second *SessionBus) {
+	if first != second {
 		t.Error("expected same session bus instance")
 	}
+}
 
-	// Create another session
-	sb3, err := manager.GetOrCreate("session-2")
-	if err != nil {
-		t.Fatalf("failed to create session bus: %v", err)
-	}
-	if sb3 == sb1 {
+func assertDifferentSessionBus(t *testing.T, first *SessionBus, second *SessionBus) {
+	if first == second {
 		t.Error("expected different session bus instance")
 	}
+}
 
+func assertActiveSessionCount(t *testing.T, manager *SessionBusManager, expected int) {
 	stats := manager.Stats()
-	if stats.ActiveSessions != 2 {
-		t.Errorf("expected 2 active sessions, got %d", stats.ActiveSessions)
+	if stats.ActiveSessions != expected {
+		t.Errorf("expected %d active sessions, got %d", expected, stats.ActiveSessions)
 	}
 }
 

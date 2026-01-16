@@ -32,42 +32,75 @@ func (h *ToolHandler) Handle(ctx context.Context, toolName string, input json.Ra
 		return "", fmt.Errorf("unknown tool: %s", toolName)
 	}
 
-	var inputMap map[string]any
-	if err := json.Unmarshal(input, &inputMap); err != nil {
-		return "", fmt.Errorf("invalid input: %w", err)
-	}
-
-	toolData := &skills.ToolCallHookData{
-		ToolName: toolName,
-		Input:    inputMap,
-	}
-	if h.archivalist.hooks != nil {
-		updated, result, err := h.archivalist.hooks.ExecutePreToolCallHooks(ctx, toolData)
-		if err != nil {
-			return "", err
-		}
-		if result.SkipExecution {
-			return result.SkipResponse, nil
-		}
-		toolData = updated
-	}
-
-	updatedInput, err := json.Marshal(toolData.Input)
+	inputMap, err := decodeToolInput(input)
 	if err != nil {
 		return "", err
 	}
 
-	output, err := handler(ctx, updatedInput)
-	toolData.Output = output
-	toolData.Error = err
-	if h.archivalist.hooks != nil {
-		_, _, hookErr := h.archivalist.hooks.ExecutePostToolCallHooks(ctx, toolData)
-		if hookErr != nil && err == nil {
-			return "", hookErr
-		}
+	toolData, result, err := h.runPreToolHooks(ctx, toolName, inputMap)
+	if result != nil {
+		return result.output, result.err
+	}
+	if err != nil {
+		return "", err
+	}
+
+	output, err := h.handleToolCall(ctx, handler, toolData)
+	hookErr := h.runPostToolHooks(ctx, toolData, output, err)
+	if hookErr != nil && err == nil {
+		return "", hookErr
 	}
 
 	return output, err
+}
+
+type toolHookResult struct {
+	output string
+	err    error
+}
+
+func decodeToolInput(input json.RawMessage) (map[string]any, error) {
+	var inputMap map[string]any
+	if err := json.Unmarshal(input, &inputMap); err != nil {
+		return nil, fmt.Errorf("invalid input: %w", err)
+	}
+	return inputMap, nil
+}
+
+func (h *ToolHandler) runPreToolHooks(ctx context.Context, toolName string, inputMap map[string]any) (*skills.ToolCallHookData, *toolHookResult, error) {
+	toolData := &skills.ToolCallHookData{
+		ToolName: toolName,
+		Input:    inputMap,
+	}
+	if h.archivalist.hooks == nil {
+		return toolData, nil, nil
+	}
+	updated, result, err := h.archivalist.hooks.ExecutePreToolCallHooks(ctx, toolData)
+	if err != nil {
+		return nil, nil, err
+	}
+	if result.SkipExecution {
+		return nil, &toolHookResult{output: result.SkipResponse, err: nil}, nil
+	}
+	return updated, nil, nil
+}
+
+func (h *ToolHandler) handleToolCall(ctx context.Context, handler toolHandlerFunc, toolData *skills.ToolCallHookData) (string, error) {
+	updatedInput, err := json.Marshal(toolData.Input)
+	if err != nil {
+		return "", err
+	}
+	return handler(ctx, updatedInput)
+}
+
+func (h *ToolHandler) runPostToolHooks(ctx context.Context, toolData *skills.ToolCallHookData, output string, err error) error {
+	toolData.Output = output
+	toolData.Error = err
+	if h.archivalist.hooks == nil {
+		return nil
+	}
+	_, _, hookErr := h.archivalist.hooks.ExecutePostToolCallHooks(ctx, toolData)
+	return hookErr
 }
 
 func (h *ToolHandler) getHandler(toolName string) toolHandlerFunc {

@@ -510,39 +510,54 @@ func (r *HookRegistry) ExecutePostQueryHooks(ctx context.Context, data *QueryHoo
 
 func (r *HookRegistry) executePromptHooks(ctx context.Context, hooks []PromptHook, data *PromptHookData) (*PromptHookData, error) {
 	current := data
-	var injectedContext string
+	injectedContext := ""
 
 	for _, hook := range hooks {
-		select {
-		case <-ctx.Done():
-			return current, ctx.Err()
-		default:
+		if err := ensureHookContext(ctx); err != nil {
+			return current, err
 		}
 
 		result := hook.Execute(ctx, current)
-
 		if result.Error != nil {
 			return current, result.Error
 		}
 
-		if result.ModifiedPromptData != nil {
-			current = result.ModifiedPromptData
-		}
-
-		if result.InjectContext != "" {
-			injectedContext += "\n" + result.InjectContext
-		}
-
+		current = applyPromptHookResult(current, result, &injectedContext)
 		if !result.Continue {
 			break
 		}
 	}
 
+	current = appendInjectedContext(current, injectedContext)
+	return current, nil
+}
+
+func ensureHookContext(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
+func applyPromptHookResult(current *PromptHookData, result HookResult, injectedContext *string) *PromptHookData {
+	if result.ModifiedPromptData != nil {
+		current = result.ModifiedPromptData
+	}
+
+	if result.InjectContext != "" {
+		*injectedContext += "\n" + result.InjectContext
+	}
+
+	return current
+}
+
+func appendInjectedContext(current *PromptHookData, injectedContext string) *PromptHookData {
 	if injectedContext != "" {
 		current.SystemPrompt += injectedContext
 	}
-
-	return current, nil
+	return current
 }
 
 func (r *HookRegistry) executeToolCallHooks(ctx context.Context, hooks []ToolCallHook, data *ToolCallHookData) (*ToolCallHookData, HookResult, error) {

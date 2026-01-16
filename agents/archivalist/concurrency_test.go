@@ -218,7 +218,6 @@ func TestConcurrency_CacheContention(t *testing.T) {
 }
 
 func TestConcurrency_NoDeadlocks(t *testing.T) {
-	// Create all components
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
 	el := newTestEventLog(t)
@@ -230,72 +229,85 @@ func TestConcurrency_NoDeadlocks(t *testing.T) {
 
 	go func() {
 		var wg sync.WaitGroup
-
-		// Store operations
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 100; i++ {
-				store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45))
-				store.Query(ArchiveQuery{Limit: 5})
-				store.Stats()
-			}
-		}()
-
-		// Registry operations
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 50; i++ {
-				agent, _ := registry.Register(fmt.Sprintf("agent-%d", i), "session-1", "", SourceModelClaudeOpus45)
-				if agent != nil {
-					registry.Touch(agent.ID)
-					registry.Get(agent.ID)
-				}
-			}
-		}()
-
-		// Event log operations
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 200; i++ {
-				el.Append(makeEvent(EventTypeFileRead, "agent-1", "session-1", nil))
-				el.GetRecent(10)
-				el.Query(EventQuery{Limit: 5})
-			}
-		}()
-
-		// Cache operations
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx := context.Background()
-			for i := 0; i < 100; i++ {
-				cache.Store(ctx, "Query", "session-1", []byte(`{}`), QueryTypePattern)
-				cache.Get(ctx, "Query", "session-1")
-				cache.Stats()
-			}
-		}()
-
-		// Agent context operations
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 100; i++ {
-				agentCtx.RecordFileRead("/path/"+string(rune('0'+i%10)), "Summary", SourceModelClaudeOpus45)
-				agentCtx.GetAllFiles()
-				agentCtx.GetAgentBriefing()
-			}
-		}()
-
+		launchStoreOps(&wg, store)
+		launchRegistryOps(&wg, registry)
+		launchEventLogOps(&wg, el)
+		launchCacheOps(&wg, cache)
+		launchAgentContextOps(&wg, agentCtx)
 		wg.Wait()
 		done <- true
 	}()
 
+	assertNoDeadlock(t, done, timeout)
+}
+
+func launchStoreOps(wg *sync.WaitGroup, store *Store) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45))
+			store.Query(ArchiveQuery{Limit: 5})
+			store.Stats()
+		}
+	}()
+}
+
+func launchRegistryOps(wg *sync.WaitGroup, registry *Registry) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			agent, _ := registry.Register(fmt.Sprintf("agent-%d", i), "session-1", "", SourceModelClaudeOpus45)
+			if agent != nil {
+				registry.Touch(agent.ID)
+				registry.Get(agent.ID)
+			}
+		}
+	}()
+}
+
+func launchEventLogOps(wg *sync.WaitGroup, el *EventLog) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			el.Append(makeEvent(EventTypeFileRead, "agent-1", "session-1", nil))
+			el.GetRecent(10)
+			el.Query(EventQuery{Limit: 5})
+		}
+	}()
+}
+
+func launchCacheOps(wg *sync.WaitGroup, cache *QueryCache) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx := context.Background()
+		for i := 0; i < 100; i++ {
+			cache.Store(ctx, "Query", "session-1", []byte(`{}`), QueryTypePattern)
+			cache.Get(ctx, "Query", "session-1")
+			cache.Stats()
+		}
+	}()
+}
+
+func launchAgentContextOps(wg *sync.WaitGroup, agentCtx *AgentContext) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			agentCtx.RecordFileRead("/path/"+string(rune('0'+i%10)), "Summary", SourceModelClaudeOpus45)
+			agentCtx.GetAllFiles()
+			agentCtx.GetAgentBriefing()
+		}
+	}()
+}
+
+func assertNoDeadlock(t *testing.T, done <-chan bool, timeout <-chan time.Time) {
 	select {
 	case <-done:
-		// Success - no deadlock
+		return
 	case <-timeout:
 		t.Fatal("Test timed out - potential deadlock")
 	}

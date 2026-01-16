@@ -105,41 +105,23 @@ func (p *FilePersister) LoadAll() ([]*Session, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	entries, err := os.ReadDir(p.baseDir)
+	entries, err := p.readEntries()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to read persistence directory: %w", err)
+		return nil, err
 	}
 
 	var sessions []*Session
 
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if p.shouldSkipEntry(entry) {
 			continue
 		}
 
-		name := entry.Name()
-		if filepath.Ext(name) != ".json" {
+		session, id, err := p.loadSessionEntry(entry)
+		if err != nil {
 			continue
 		}
 
-		// Remove .json extension to get ID
-		id := name[:len(name)-5]
-
-		path := filepath.Join(p.baseDir, name)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue // Skip files we can't read
-		}
-
-		session, err := DeserializeSession(data)
-		if err != nil {
-			continue // Skip files we can't deserialize
-		}
-
-		// Verify ID matches
 		if session.ID() != id {
 			continue
 		}
@@ -148,6 +130,39 @@ func (p *FilePersister) LoadAll() ([]*Session, error) {
 	}
 
 	return sessions, nil
+}
+
+func (p *FilePersister) readEntries() ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(p.baseDir)
+	if err == nil {
+		return entries, nil
+	}
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("failed to read persistence directory: %w", err)
+}
+
+func (p *FilePersister) shouldSkipEntry(entry os.DirEntry) bool {
+	if entry.IsDir() {
+		return true
+	}
+	return filepath.Ext(entry.Name()) != ".json"
+}
+
+func (p *FilePersister) loadSessionEntry(entry os.DirEntry) (*Session, string, error) {
+	name := entry.Name()
+	id := name[:len(name)-5]
+	path := filepath.Join(p.baseDir, name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	child, err := DeserializeSession(data)
+	if err != nil {
+		return nil, "", err
+	}
+	return child, id, nil
 }
 
 // Delete removes a persisted session

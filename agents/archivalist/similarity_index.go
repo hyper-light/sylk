@@ -123,17 +123,33 @@ func (idx *SimilarityIndex) Insert(id string, vector []float32) error {
 
 	atomic.AddInt64(&idx.stats.totalInsertions, 1)
 
-	// Check if already exists
-	if _, exists := idx.nodes[id]; exists {
-		// Update existing node
-		idx.nodes[id].Vector = vector
+	if idx.updateExistingNode(id, vector) {
 		return nil
 	}
 
-	// Determine level for new node
 	level := idx.randomLevel()
+	node := idx.newIndexNode(id, vector, level)
 
-	// Create new node
+	if idx.insertFirstNode(id, node, level) {
+		return nil
+	}
+
+	ep := idx.navigateToLevel(vector, level)
+	idx.connectNode(node, vector, ep, level)
+
+	idx.storeNode(id, node, level)
+	return nil
+}
+
+func (idx *SimilarityIndex) updateExistingNode(id string, vector []float32) bool {
+	if _, exists := idx.nodes[id]; !exists {
+		return false
+	}
+	idx.nodes[id].Vector = vector
+	return true
+}
+
+func (idx *SimilarityIndex) newIndexNode(id string, vector []float32, level int) *IndexNode {
 	node := &IndexNode{
 		ID:        id,
 		Vector:    vector,
@@ -143,73 +159,83 @@ func (idx *SimilarityIndex) Insert(id string, vector []float32) error {
 	for i := 0; i <= level; i++ {
 		node.Neighbors[i] = make([]string, 0, idx.config.M)
 	}
+	return node
+}
 
-	// Handle first node
-	if len(idx.nodes) == 0 {
-		idx.nodes[id] = node
-		idx.entryPoint = id
-		idx.maxLevel = level
-		idx.ensureLayerCapacity(level)
-		idx.layers[level].NodeIDs = append(idx.layers[level].NodeIDs, id)
-		atomic.AddInt64(&idx.stats.totalNodes, 1)
-		return nil
+func (idx *SimilarityIndex) insertFirstNode(id string, node *IndexNode, level int) bool {
+	if len(idx.nodes) != 0 {
+		return false
 	}
+	idx.nodes[id] = node
+	idx.entryPoint = id
+	idx.maxLevel = level
+	idx.ensureLayerCapacity(level)
+	idx.layers[level].NodeIDs = append(idx.layers[level].NodeIDs, id)
+	atomic.AddInt64(&idx.stats.totalNodes, 1)
+	return true
+}
 
-	// Find entry point and navigate down
+func (idx *SimilarityIndex) navigateToLevel(vector []float32, level int) string {
 	ep := idx.entryPoint
-
-	// Search from top to the node's level + 1
 	for l := idx.maxLevel; l > level; l-- {
 		ep = idx.searchLayerGreedy(vector, ep, l)
 	}
+	return ep
+}
 
-	// Insert at each level from node's level down to 0
+func (idx *SimilarityIndex) connectNode(node *IndexNode, vector []float32, entryPoint string, level int) {
+	ep := entryPoint
 	for l := min(level, idx.maxLevel); l >= 0; l-- {
 		neighbors := idx.searchLayerEf(vector, ep, idx.config.EfConstruction, l)
-		selectedNeighbors := idx.selectNeighbors(vector, neighbors, idx.getM(l))
-
-		// Connect new node to selected neighbors
-		node.Neighbors[l] = selectedNeighbors
-
-		// Connect selected neighbors back to new node
-		for _, neighborID := range selectedNeighbors {
-			neighbor := idx.nodes[neighborID]
-			if neighbor != nil && l < len(neighbor.Neighbors) {
-				if len(neighbor.Neighbors[l]) < idx.getM(l) {
-					neighbor.Neighbors[l] = append(neighbor.Neighbors[l], id)
-				} else {
-					// Prune neighbors to make room
-					neighbor.Neighbors[l] = idx.selectNeighbors(
-						neighbor.Vector,
-						append(neighbor.Neighbors[l], id),
-						idx.getM(l),
-					)
-				}
-			}
-		}
-
-		if len(neighbors) > 0 {
-			ep = neighbors[0]
-		}
+		selected := idx.selectNeighbors(vector, neighbors, idx.getM(l))
+		node.Neighbors[l] = selected
+		idx.connectNeighbors(idForNode(node), selected, l)
+		ep = nextEntryPoint(ep, neighbors)
 	}
+}
 
-	// Store node
+func idForNode(node *IndexNode) string {
+	return node.ID
+}
+
+func (idx *SimilarityIndex) connectNeighbors(nodeID string, neighbors []string, level int) {
+	for _, neighborID := range neighbors {
+		idx.connectNeighbor(nodeID, neighborID, level)
+	}
+}
+
+func (idx *SimilarityIndex) connectNeighbor(nodeID string, neighborID string, level int) {
+	neighbor := idx.nodes[neighborID]
+	if neighbor == nil || level >= len(neighbor.Neighbors) {
+		return
+	}
+	if len(neighbor.Neighbors[level]) < idx.getM(level) {
+		neighbor.Neighbors[level] = append(neighbor.Neighbors[level], nodeID)
+		return
+	}
+	neighbor.Neighbors[level] = idx.selectNeighbors(
+		neighbor.Vector,
+		append(neighbor.Neighbors[level], nodeID),
+		idx.getM(level),
+	)
+}
+
+func nextEntryPoint(current string, neighbors []string) string {
+	if len(neighbors) == 0 {
+		return current
+	}
+	return neighbors[0]
+}
+
+func (idx *SimilarityIndex) storeNode(id string, node *IndexNode, level int) {
 	idx.nodes[id] = node
 	atomic.AddInt64(&idx.stats.totalNodes, 1)
-
-	// Update layers
 	idx.ensureLayerCapacity(level)
-	for l := 0; l <= level; l++ {
-		idx.layers[l].NodeIDs = append(idx.layers[l].NodeIDs, id)
-	}
-
-	// Update entry point if new node has higher level
+	idx.layers[level].NodeIDs = append(idx.layers[level].NodeIDs, id)
 	if level > idx.maxLevel {
-		idx.maxLevel = level
 		idx.entryPoint = id
+		idx.maxLevel = level
 	}
-
-	return nil
 }
 
 // Remove removes a vector from the index
@@ -222,36 +248,70 @@ func (idx *SimilarityIndex) Remove(id string) {
 		return
 	}
 
-	// Remove connections from neighbors
-	for l := 0; l <= node.Level; l++ {
-		for _, neighborID := range node.Neighbors[l] {
-			neighbor := idx.nodes[neighborID]
-			if neighbor != nil && l < len(neighbor.Neighbors) {
-				neighbor.Neighbors[l] = removeFromStringSlice(neighbor.Neighbors[l], id)
-			}
-		}
-	}
+	idx.removeNeighborConnections(id, node)
+	idx.removeFromLayers(id, node.Level)
+	idx.deleteNode(id)
+	idx.updateEntryPointIfNeeded(id)
+}
 
-	// Remove from layers
-	for l := 0; l <= node.Level; l++ {
-		idx.layers[l].NodeIDs = removeFromStringSlice(idx.layers[l].NodeIDs, id)
+func (idx *SimilarityIndex) removeNeighborConnections(id string, node *IndexNode) {
+	for level := 0; level <= node.Level; level++ {
+		idx.removeNeighborConnectionsAtLevel(id, node, level)
 	}
+}
 
-	// Delete node
+func (idx *SimilarityIndex) removeNeighborConnectionsAtLevel(id string, node *IndexNode, level int) {
+	for _, neighborID := range node.Neighbors[level] {
+		idx.removeNeighborLink(id, neighborID, level)
+	}
+}
+
+func (idx *SimilarityIndex) removeNeighborLink(id string, neighborID string, level int) {
+	neighbor := idx.nodes[neighborID]
+	if neighbor == nil {
+		return
+	}
+	if level >= len(neighbor.Neighbors) {
+		return
+	}
+	neighbor.Neighbors[level] = removeFromStringSlice(neighbor.Neighbors[level], id)
+}
+
+func (idx *SimilarityIndex) removeFromLayers(id string, maxLevel int) {
+	for level := 0; level <= maxLevel; level++ {
+		idx.layers[level].NodeIDs = removeFromStringSlice(idx.layers[level].NodeIDs, id)
+	}
+}
+
+func (idx *SimilarityIndex) deleteNode(id string) {
 	delete(idx.nodes, id)
 	atomic.AddInt64(&idx.stats.totalNodes, -1)
+}
 
-	// Update entry point if needed
-	if idx.entryPoint == id {
-		idx.entryPoint = ""
-		for l := idx.maxLevel; l >= 0; l-- {
-			if len(idx.layers[l].NodeIDs) > 0 {
-				idx.entryPoint = idx.layers[l].NodeIDs[0]
-				idx.maxLevel = l
-				break
-			}
+func (idx *SimilarityIndex) updateEntryPointIfNeeded(id string) {
+	if idx.entryPoint != id {
+		return
+	}
+	idx.entryPoint = ""
+	idx.refreshEntryPoint()
+}
+
+func (idx *SimilarityIndex) refreshEntryPoint() {
+	for level := idx.maxLevel; level >= 0; level-- {
+		entryPoint, ok := idx.layerEntryPoint(level)
+		if ok {
+			idx.entryPoint = entryPoint
+			idx.maxLevel = level
+			return
 		}
 	}
+}
+
+func (idx *SimilarityIndex) layerEntryPoint(level int) (string, bool) {
+	if len(idx.layers[level].NodeIDs) == 0 {
+		return "", false
+	}
+	return idx.layers[level].NodeIDs[0], true
 }
 
 // =============================================================================
@@ -269,42 +329,14 @@ func (idx *SimilarityIndex) Search(query []float32, k int) []SearchResult {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	atomic.AddInt64(&idx.stats.totalSearches, 1)
-
-	if len(idx.nodes) == 0 || idx.entryPoint == "" {
+	if !idx.beginSearch() {
 		return nil
 	}
 
-	// Start from entry point
-	ep := idx.entryPoint
-
-	// Navigate down from top level
-	for l := idx.maxLevel; l > 0; l-- {
-		ep = idx.searchLayerGreedy(query, ep, l)
-	}
-
-	// Search at base layer with larger ef
+	ep := idx.searchEntryPoint(query)
 	candidates := idx.searchLayerEf(query, ep, max(idx.config.EfSearch, k), 0)
-
-	// Return top k
-	results := make([]SearchResult, 0, k)
-	for i := 0; i < len(candidates) && i < k; i++ {
-		node := idx.nodes[candidates[i]]
-		if node != nil {
-			atomic.AddInt64(&idx.stats.totalComparisons, 1)
-			score := cosineSimilarity(query, node.Vector)
-			results = append(results, SearchResult{
-				ID:    candidates[i],
-				Score: score,
-			})
-		}
-	}
-
-	// Sort by score descending
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
-
+	results := idx.collectTopResults(query, candidates, k)
+	sortResults(results)
 	return results
 }
 
@@ -313,48 +345,68 @@ func (idx *SimilarityIndex) SearchWithThreshold(query []float32, threshold float
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	atomic.AddInt64(&idx.stats.totalSearches, 1)
-
-	if len(idx.nodes) == 0 || idx.entryPoint == "" {
+	if !idx.beginSearch() {
 		return nil
 	}
 
-	// Start from entry point
-	ep := idx.entryPoint
-
-	// Navigate down from top level
-	for l := idx.maxLevel; l > 0; l-- {
-		ep = idx.searchLayerGreedy(query, ep, l)
-	}
-
-	// Search at base layer with larger ef
+	ep := idx.searchEntryPoint(query)
 	candidates := idx.searchLayerEf(query, ep, max(idx.config.EfSearch, maxResults*2), 0)
+	results := idx.filterThresholdResults(query, candidates, threshold, maxResults)
+	sortResults(results)
+	return results
+}
 
-	// Filter by threshold
-	results := make([]SearchResult, 0)
+func (idx *SimilarityIndex) beginSearch() bool {
+	atomic.AddInt64(&idx.stats.totalSearches, 1)
+	return len(idx.nodes) > 0 && idx.entryPoint != ""
+}
+
+func (idx *SimilarityIndex) searchEntryPoint(query []float32) string {
+	ep := idx.entryPoint
+	for level := idx.maxLevel; level > 0; level-- {
+		ep = idx.searchLayerGreedy(query, ep, level)
+	}
+	return ep
+}
+
+func (idx *SimilarityIndex) collectTopResults(query []float32, candidates []string, limit int) []SearchResult {
+	results := make([]SearchResult, 0, limit)
+	for i := 0; i < len(candidates) && i < limit; i++ {
+		if result, ok := idx.scoreCandidate(query, candidates[i]); ok {
+			results = append(results, result)
+		}
+	}
+	return results
+}
+
+func (idx *SimilarityIndex) filterThresholdResults(query []float32, candidates []string, threshold float64, maxResults int) []SearchResult {
+	results := make([]SearchResult, 0, maxResults)
 	for _, candidateID := range candidates {
-		node := idx.nodes[candidateID]
-		if node != nil {
-			atomic.AddInt64(&idx.stats.totalComparisons, 1)
-			score := cosineSimilarity(query, node.Vector)
-			if score >= threshold {
-				results = append(results, SearchResult{
-					ID:    candidateID,
-					Score: score,
-				})
-			}
+		result, ok := idx.scoreCandidate(query, candidateID)
+		if ok && result.Score >= threshold {
+			results = append(results, result)
 		}
 		if len(results) >= maxResults {
 			break
 		}
 	}
+	return results
+}
 
-	// Sort by score descending
+func (idx *SimilarityIndex) scoreCandidate(query []float32, candidateID string) (SearchResult, bool) {
+	node := idx.nodes[candidateID]
+	if node == nil {
+		return SearchResult{}, false
+	}
+	atomic.AddInt64(&idx.stats.totalComparisons, 1)
+	score := cosineSimilarity(query, node.Vector)
+	return SearchResult{ID: candidateID, Score: score}, true
+}
+
+func sortResults(results []SearchResult) {
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Score > results[j].Score
 	})
-
-	return results
 }
 
 // =============================================================================
@@ -366,85 +418,141 @@ func (idx *SimilarityIndex) searchLayerGreedy(query []float32, ep string, level 
 	current := ep
 	currentDist := idx.distance(query, current)
 
-	changed := true
-	for changed {
-		changed = false
-		node := idx.nodes[current]
-		if node == nil || level >= len(node.Neighbors) {
-			break
+	for {
+		nextID, nextDist, moved := idx.greedyStep(query, current, currentDist, level)
+		if !moved {
+			return current
 		}
+		current = nextID
+		currentDist = nextDist
+	}
+}
 
-		for _, neighborID := range node.Neighbors[level] {
-			atomic.AddInt64(&idx.stats.totalComparisons, 1)
-			dist := idx.distance(query, neighborID)
-			if dist < currentDist {
-				current = neighborID
-				currentDist = dist
-				changed = true
-			}
+func (idx *SimilarityIndex) greedyStep(query []float32, current string, currentDist float64, level int) (string, float64, bool) {
+	node := idx.nodes[current]
+	if node == nil || level >= len(node.Neighbors) {
+		return current, currentDist, false
+	}
+
+	nextID := current
+	nextDist := currentDist
+	for _, neighborID := range node.Neighbors[level] {
+		atomic.AddInt64(&idx.stats.totalComparisons, 1)
+		dist := idx.distance(query, neighborID)
+		if dist < nextDist {
+			nextID = neighborID
+			nextDist = dist
 		}
 	}
 
-	return current
+	return nextID, nextDist, nextID != current
 }
 
 // searchLayerEf performs ef-search at a layer
 func (idx *SimilarityIndex) searchLayerEf(query []float32, ep string, ef int, level int) []string {
-	visited := make(map[string]bool)
-	visited[ep] = true
+	state := newLayerSearchState(ep)
+	idx.seedLayerSearch(state, query, ep)
 
-	// Priority queue of candidates (min-heap by distance)
-	candidates := &distanceHeap{}
-	heap.Init(candidates)
-
-	// Dynamic list of found results (max-heap by distance for pruning)
-	results := &distanceHeap{maxHeap: true}
-	heap.Init(results)
-
-	epDist := idx.distance(query, ep)
-	heap.Push(candidates, distanceItem{id: ep, dist: epDist})
-	heap.Push(results, distanceItem{id: ep, dist: epDist})
-
-	for candidates.Len() > 0 {
-		closest := heap.Pop(candidates).(distanceItem)
-
-		// Check termination condition
-		if results.Len() > 0 && closest.dist > results.items[0].dist {
+	for state.candidates.Len() > 0 {
+		closest := heap.Pop(state.candidates).(distanceItem)
+		if shouldStopLayerSearch(state.results, closest) {
 			break
 		}
 
-		node := idx.nodes[closest.id]
-		if node == nil || level >= len(node.Neighbors) {
+		neighbors := idx.layerNeighborIDs(closest.id, level)
+		if len(neighbors) == 0 {
 			continue
 		}
-
-		for _, neighborID := range node.Neighbors[level] {
-			if visited[neighborID] {
-				continue
-			}
-			visited[neighborID] = true
-
-			atomic.AddInt64(&idx.stats.totalComparisons, 1)
-			dist := idx.distance(query, neighborID)
-
-			if results.Len() < ef || dist < results.items[0].dist {
-				heap.Push(candidates, distanceItem{id: neighborID, dist: dist})
-				heap.Push(results, distanceItem{id: neighborID, dist: dist})
-
-				if results.Len() > ef {
-					heap.Pop(results)
-				}
-			}
-		}
+		idx.visitLayerNeighbors(state, query, neighbors, ef)
 	}
 
-	// Extract results
+	return extractLayerResults(state.results)
+}
+
+type layerSearchState struct {
+	visited    map[string]bool
+	candidates *distanceHeap
+	results    *distanceHeap
+}
+
+func newLayerSearchState(ep string) *layerSearchState {
+	visited := map[string]bool{ep: true}
+	candidates := &distanceHeap{}
+	results := &distanceHeap{maxHeap: true}
+	heap.Init(candidates)
+	heap.Init(results)
+	return &layerSearchState{
+		visited:    visited,
+		candidates: candidates,
+		results:    results,
+	}
+}
+
+func (idx *SimilarityIndex) seedLayerSearch(state *layerSearchState, query []float32, ep string) {
+	epDist := idx.distance(query, ep)
+	heap.Push(state.candidates, distanceItem{id: ep, dist: epDist})
+	heap.Push(state.results, distanceItem{id: ep, dist: epDist})
+}
+
+func shouldStopLayerSearch(results *distanceHeap, closest distanceItem) bool {
+	if results.Len() == 0 {
+		return false
+	}
+	return closest.dist > results.items[0].dist
+}
+
+func (idx *SimilarityIndex) layerNeighborIDs(nodeID string, level int) []string {
+	node := idx.nodes[nodeID]
+	if node == nil {
+		return nil
+	}
+	if level >= len(node.Neighbors) {
+		return nil
+	}
+	return node.Neighbors[level]
+}
+
+func (idx *SimilarityIndex) visitLayerNeighbors(state *layerSearchState, query []float32, neighbors []string, ef int) {
+	for _, neighborID := range neighbors {
+		idx.considerLayerNeighbor(state, query, neighborID, ef)
+	}
+}
+
+func (idx *SimilarityIndex) considerLayerNeighbor(state *layerSearchState, query []float32, neighborID string, ef int) {
+	if state.visited[neighborID] {
+		return
+	}
+	state.visited[neighborID] = true
+
+	atomic.AddInt64(&idx.stats.totalComparisons, 1)
+	dist := idx.distance(query, neighborID)
+
+	if shouldAddLayerResult(state.results, ef, dist) {
+		heap.Push(state.candidates, distanceItem{id: neighborID, dist: dist})
+		heap.Push(state.results, distanceItem{id: neighborID, dist: dist})
+		trimLayerResults(state.results, ef)
+	}
+}
+
+func shouldAddLayerResult(results *distanceHeap, ef int, dist float64) bool {
+	if results.Len() < ef {
+		return true
+	}
+	return dist < results.items[0].dist
+}
+
+func trimLayerResults(results *distanceHeap, ef int) {
+	if results.Len() > ef {
+		heap.Pop(results)
+	}
+}
+
+func extractLayerResults(results *distanceHeap) []string {
 	resultIDs := make([]string, results.Len())
 	for i := results.Len() - 1; i >= 0; i-- {
 		item := heap.Pop(results).(distanceItem)
 		resultIDs[i] = item.id
 	}
-
 	return resultIDs
 }
 

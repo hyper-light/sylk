@@ -34,10 +34,10 @@ type DeadLetter struct {
 	Message *Message `json:"message"`
 
 	// Failure info
-	Reason    DeadLetterReason `json:"reason"`
-	Error     string           `json:"error,omitempty"`
-	Topic     string           `json:"topic"`
-	Attempts  int              `json:"attempts"`
+	Reason   DeadLetterReason `json:"reason"`
+	Error    string           `json:"error,omitempty"`
+	Topic    string           `json:"topic"`
+	Attempts int              `json:"attempts"`
 
 	// Timing
 	OriginalTimestamp time.Time `json:"original_timestamp"`
@@ -54,10 +54,10 @@ type DeadLetter struct {
 
 // DeadLetterQueue stores failed messages
 type DeadLetterQueue struct {
-	mu       sync.RWMutex
-	letters  []*DeadLetter
-	maxSize  int
-	onAdd    func(*DeadLetter)
+	mu      sync.RWMutex
+	letters []*DeadLetter
+	maxSize int
+	onAdd   func(*DeadLetter)
 
 	// Stats
 	totalAdded   int64
@@ -66,8 +66,8 @@ type DeadLetterQueue struct {
 
 // DeadLetterQueueConfig configures the DLQ
 type DeadLetterQueueConfig struct {
-	MaxSize int                   // Maximum letters to store (default: 10000)
-	OnAdd   func(*DeadLetter)     // Callback when letter is added
+	MaxSize int               // Maximum letters to store (default: 10000)
+	OnAdd   func(*DeadLetter) // Callback when letter is added
 }
 
 // NewDeadLetterQueue creates a new DLQ
@@ -215,42 +215,84 @@ func (q *DeadLetterQueue) Stats() DeadLetterStats {
 
 // DeadLetterStats contains DLQ statistics
 type DeadLetterStats struct {
-	Size         int                         `json:"size"`
-	MaxSize      int                         `json:"max_size"`
-	TotalAdded   int64                       `json:"total_added"`
-	TotalRetried int64                       `json:"total_retried"`
-	ByReason     map[DeadLetterReason]int    `json:"by_reason"`
+	Size         int                      `json:"size"`
+	MaxSize      int                      `json:"max_size"`
+	TotalAdded   int64                    `json:"total_added"`
+	TotalRetried int64                    `json:"total_retried"`
+	ByReason     map[DeadLetterReason]int `json:"by_reason"`
 }
 
 // DeadLetterFilter filters dead letters
 type DeadLetterFilter struct {
-	Reason        DeadLetterReason
-	SourceAgentID string
-	TargetAgentID string
-	Since         time.Time
-	Until         time.Time
+	Reason         DeadLetterReason
+	SourceAgentID  string
+	TargetAgentID  string
+	Since          time.Time
+	Until          time.Time
 	IncludeRetried bool
 }
 
 // Matches returns true if the letter matches the filter
 func (f DeadLetterFilter) Matches(letter *DeadLetter) bool {
-	if f.Reason != "" && letter.Reason != f.Reason {
+	if !f.matchesReason(letter) {
 		return false
 	}
-	if f.SourceAgentID != "" && letter.SourceAgentID != f.SourceAgentID {
+	if !f.matchesSourceAgent(letter) {
 		return false
 	}
-	if f.TargetAgentID != "" && letter.TargetAgentID != f.TargetAgentID {
+	if !f.matchesTargetAgent(letter) {
 		return false
 	}
-	if !f.Since.IsZero() && letter.FailedAt.Before(f.Since) {
+	if !f.matchesSince(letter) {
 		return false
 	}
-	if !f.Until.IsZero() && letter.FailedAt.After(f.Until) {
+	if !f.matchesUntil(letter) {
 		return false
 	}
-	if !f.IncludeRetried && letter.Retried {
+	if !f.matchesRetried(letter) {
 		return false
 	}
 	return true
+}
+
+func (f DeadLetterFilter) matchesReason(letter *DeadLetter) bool {
+	if f.Reason == "" {
+		return true
+	}
+	return letter.Reason == f.Reason
+}
+
+func (f DeadLetterFilter) matchesSourceAgent(letter *DeadLetter) bool {
+	if f.SourceAgentID == "" {
+		return true
+	}
+	return letter.SourceAgentID == f.SourceAgentID
+}
+
+func (f DeadLetterFilter) matchesTargetAgent(letter *DeadLetter) bool {
+	if f.TargetAgentID == "" {
+		return true
+	}
+	return letter.TargetAgentID == f.TargetAgentID
+}
+
+func (f DeadLetterFilter) matchesSince(letter *DeadLetter) bool {
+	if f.Since.IsZero() {
+		return true
+	}
+	return !letter.FailedAt.Before(f.Since)
+}
+
+func (f DeadLetterFilter) matchesUntil(letter *DeadLetter) bool {
+	if f.Until.IsZero() {
+		return true
+	}
+	return !letter.FailedAt.After(f.Until)
+}
+
+func (f DeadLetterFilter) matchesRetried(letter *DeadLetter) bool {
+	if f.IncludeRetried {
+		return true
+	}
+	return !letter.Retried
 }

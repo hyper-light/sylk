@@ -248,12 +248,12 @@ func (c *RouteCache) Cleanup() int {
 
 // RouteCacheStats contains cache statistics
 type RouteCacheStats struct {
-	Size     int     `json:"size"`
-	MaxSize  int     `json:"max_size"`
-	Hits     int64   `json:"hits"`
-	Misses   int64   `json:"misses"`
-	HitRate  float64 `json:"hit_rate"`
-	TTL      string  `json:"ttl"`
+	Size    int     `json:"size"`
+	MaxSize int     `json:"max_size"`
+	Hits    int64   `json:"hits"`
+	Misses  int64   `json:"misses"`
+	HitRate float64 `json:"hit_rate"`
+	TTL     string  `json:"ttl"`
 }
 
 // Stats returns cache statistics
@@ -295,28 +295,55 @@ func (c *RouteCache) recordMiss() {
 
 // normalizeInput normalizes input for cache lookup
 func normalizeInput(input string) string {
-	// Convert to lowercase
+	lowered := lowerASCII(input)
+	start, end := trimWhitespaceBounds(lowered)
+	return string(lowered[start:end])
+}
+
+func lowerASCII(input string) []byte {
 	result := make([]byte, len(input))
 	for i := 0; i < len(input); i++ {
-		c := input[i]
-		if c >= 'A' && c <= 'Z' {
-			result[i] = c + 32
-		} else {
-			result[i] = c
-		}
+		result[i] = lowerASCIIByte(input[i])
 	}
+	return result
+}
 
-	// Trim whitespace
+func lowerASCIIByte(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + 32
+	}
+	return value
+}
+
+func trimWhitespaceBounds(value []byte) (int, int) {
+	start := trimLeftWhitespace(value)
+	end := trimRightWhitespace(value, start)
+	return start, end
+}
+
+func trimLeftWhitespace(value []byte) int {
 	start := 0
-	end := len(result)
-	for start < end && (result[start] == ' ' || result[start] == '\t' || result[start] == '\n') {
+	for start < len(value) && isWhitespace(value[start]) {
 		start++
 	}
-	for end > start && (result[end-1] == ' ' || result[end-1] == '\t' || result[end-1] == '\n') {
+	return start
+}
+
+func trimRightWhitespace(value []byte, start int) int {
+	end := len(value)
+	for end > start && isWhitespace(value[end-1]) {
 		end--
 	}
+	return end
+}
 
-	return string(result[start:end])
+func isWhitespace(value byte) bool {
+	switch value {
+	case ' ', '\t', '\n':
+		return true
+	default:
+		return false
+	}
 }
 
 // =============================================================================

@@ -18,17 +18,17 @@ const (
 
 // RegisteredAgent represents an agent in the registry
 type RegisteredAgent struct {
-	ID           string       `json:"id"`
-	Name         string       `json:"name"`
-	SessionID    string       `json:"session_id"`
-	ParentID     string       `json:"parent_id,omitempty"`
-	Children     []string     `json:"children,omitempty"`
-	Status       AgentStatus  `json:"status"`
-	Clock        uint64       `json:"clock"`
-	LastVersion  string       `json:"last_version"`
-	RegisteredAt time.Time    `json:"registered_at"`
-	LastSeenAt   time.Time    `json:"last_seen_at"`
-	Source       SourceModel  `json:"source,omitempty"`
+	ID           string      `json:"id"`
+	Name         string      `json:"name"`
+	SessionID    string      `json:"session_id"`
+	ParentID     string      `json:"parent_id,omitempty"`
+	Children     []string    `json:"children,omitempty"`
+	Status       AgentStatus `json:"status"`
+	Clock        uint64      `json:"clock"`
+	LastVersion  string      `json:"last_version"`
+	RegisteredAt time.Time   `json:"registered_at"`
+	LastSeenAt   time.Time   `json:"last_seen_at"`
+	Source       SourceModel `json:"source,omitempty"`
 }
 
 // IsSubAgent returns true if this agent has a parent
@@ -96,36 +96,56 @@ func (r *Registry) Register(name, sessionID, parentID string, source SourceModel
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Check if name already registered in this session
-	if existingID, ok := r.byName[name]; ok {
-		existing := r.agents[existingID]
-		if existing != nil && existing.SessionID == sessionID {
-			// Reactivate existing agent
-			existing.Status = AgentStatusActive
-			existing.LastSeenAt = time.Now()
-			return existing, nil
-		}
+	if existing := r.findExistingAgent(name, sessionID); existing != nil {
+		return existing, nil
+	}
+	if err := r.validateParent(parentID, sessionID); err != nil {
+		return nil, err
 	}
 
-	// Validate parent if specified
-	if parentID != "" {
-		parent, ok := r.agents[parentID]
-		if !ok {
-			return nil, fmt.Errorf("parent agent %s not found", parentID)
-		}
-		if parent.SessionID != sessionID {
-			return nil, fmt.Errorf("parent agent %s is in different session", parentID)
-		}
-	}
+	agent := r.newRegisteredAgent(name, sessionID, parentID, source)
+	r.storeAgent(agent)
+	r.attachParent(parentID, agent.ID)
+	return agent, nil
+}
 
-	// Generate short ID
+func (r *Registry) findExistingAgent(name string, sessionID string) *RegisteredAgent {
+	existingID, ok := r.byName[name]
+	if !ok {
+		return nil
+	}
+	existing := r.agents[existingID]
+	if existing == nil {
+		return nil
+	}
+	if existing.SessionID != sessionID {
+		return nil
+	}
+	existing.Status = AgentStatusActive
+	existing.LastSeenAt = time.Now()
+	return existing
+}
+
+func (r *Registry) validateParent(parentID string, sessionID string) error {
+	if parentID == "" {
+		return nil
+	}
+	parent, ok := r.agents[parentID]
+	if !ok {
+		return fmt.Errorf("parent agent %s not found", parentID)
+	}
+	if parent.SessionID != sessionID {
+		return fmt.Errorf("parent agent %s is in different session", parentID)
+	}
+	return nil
+}
+
+func (r *Registry) newRegisteredAgent(name string, sessionID string, parentID string, source SourceModel) *RegisteredAgent {
 	id := r.generateID(name)
-
-	// Get current version
 	version := r.currentVersionString()
-
 	now := time.Now()
-	agent := &RegisteredAgent{
+
+	return &RegisteredAgent{
 		ID:           id,
 		Name:         name,
 		SessionID:    sessionID,
@@ -137,20 +157,21 @@ func (r *Registry) Register(name, sessionID, parentID string, source SourceModel
 		LastSeenAt:   now,
 		Source:       source,
 	}
+}
 
-	// Store agent
-	r.agents[id] = agent
-	r.byName[name] = id
-	r.bySession[sessionID] = append(r.bySession[sessionID], id)
+func (r *Registry) storeAgent(agent *RegisteredAgent) {
+	r.agents[agent.ID] = agent
+	r.byName[agent.Name] = agent.ID
+	r.bySession[agent.SessionID] = append(r.bySession[agent.SessionID], agent.ID)
+}
 
-	// Update parent's children list
-	if parentID != "" {
-		if parent := r.agents[parentID]; parent != nil {
-			parent.Children = append(parent.Children, id)
-		}
+func (r *Registry) attachParent(parentID string, childID string) {
+	if parentID == "" {
+		return
 	}
-
-	return agent, nil
+	if parent := r.agents[parentID]; parent != nil {
+		parent.Children = append(parent.Children, childID)
+	}
 }
 
 // generateID creates a short unique ID for an agent
@@ -482,14 +503,14 @@ func (r *Registry) collectDescendants(agent *RegisteredAgent, result *[]*Registe
 
 // Stats returns registry statistics
 type RegistryStats struct {
-	TotalAgents   int                    `json:"total_agents"`
-	ActiveAgents  int                    `json:"active_agents"`
-	IdleAgents    int                    `json:"idle_agents"`
-	InactiveAgents int                   `json:"inactive_agents"`
-	SessionCount  int                    `json:"session_count"`
-	GlobalClock   uint64                 `json:"global_clock"`
-	CurrentVersion string                `json:"current_version"`
-	AgentsBySession map[string]int       `json:"agents_by_session"`
+	TotalAgents     int            `json:"total_agents"`
+	ActiveAgents    int            `json:"active_agents"`
+	IdleAgents      int            `json:"idle_agents"`
+	InactiveAgents  int            `json:"inactive_agents"`
+	SessionCount    int            `json:"session_count"`
+	GlobalClock     uint64         `json:"global_clock"`
+	CurrentVersion  string         `json:"current_version"`
+	AgentsBySession map[string]int `json:"agents_by_session"`
 }
 
 // GetStats returns current registry statistics

@@ -285,91 +285,118 @@ func (p *ClassificationWorkerPool) SubmitClassification(req *RouteRequest) chan 
 	job := &Job{
 		ID: req.CorrelationID,
 		Execute: func(ctx context.Context) error {
-			result := &AsyncClassificationResult{
-				Request: req,
-			}
-			start := time.Now()
-
-			// Check cache first
-			if p.cache != nil {
-				if cached := p.cache.Get(req.Input); cached != nil {
-					result.Result = &RouteResult{
-						TargetAgent:          TargetAgent(cached.TargetAgentID),
-						Intent:               cached.Intent,
-						Domain:               cached.Domain,
-						Confidence:           cached.Confidence,
-						ClassificationMethod: "cache",
-					}
-					result.TargetAgentID = cached.TargetAgentID
-					result.ProcessingTime = time.Since(start)
-					resultChan <- result
-					close(resultChan)
-					return nil
-				}
-			}
-
-			// Check DSL
-			if p.parser != nil && p.parser.IsDSL(req.Input) {
-				cmd, err := p.parser.Parse(req.Input)
-				if err == nil {
-					dslResult := cmd.ToRouteResult()
-					result.Result = dslResult
-					result.TargetAgentID = string(dslResult.TargetAgent)
-					result.ProcessingTime = time.Since(start)
-					resultChan <- result
-					close(resultChan)
-					return nil
-				}
-			}
-
-			// Fall back to LLM classification
-			if p.classifier != nil {
-				classResult, err := p.classifier.Classify(ctx, req.Input)
-				if err != nil {
-					result.Error = err
-				} else {
-					result.Result = classResult.ToRouteResult(time.Since(start))
-					result.TargetAgentID = string(result.Result.TargetAgent)
-
-					// Cache the result
-					if p.cache != nil {
-						p.cache.Set(req.Input, result.Result)
-					}
-				}
-			}
-
-			result.ProcessingTime = time.Since(start)
-			resultChan <- result
-			close(resultChan)
-			return result.Error
+			return p.executeClassification(ctx, req, resultChan)
 		},
 		OnError: func(err error) {
-			// Error already captured in result
-			result := &AsyncClassificationResult{
-				Request:        req,
-				Error:          err,
-				ProcessingTime: time.Since(submittedAt),
-			}
-			select {
-			case resultChan <- result:
-			default:
-			}
-			close(resultChan)
+			p.reportJobError(resultChan, req, submittedAt, err)
 		},
 	}
 
 	if !p.pool.Submit(job) {
-		// Queue full - return immediately with error
-		result := &AsyncClassificationResult{
-			Request:        req,
-			Error:          ErrWorkerPoolFull,
-			ProcessingTime: 0,
-		}
-		resultChan <- result
-		close(resultChan)
+		p.reportQueueFull(resultChan, req)
 	}
 
 	return resultChan
+}
+
+func (p *ClassificationWorkerPool) executeClassification(ctx context.Context, req *RouteRequest, resultChan chan *AsyncClassificationResult) error {
+	result := &AsyncClassificationResult{Request: req}
+	start := time.Now()
+
+	if cached := p.classifyFromCache(req); cached != nil {
+		p.completeClassification(resultChan, result, cached, time.Since(start), nil)
+		return nil
+	}
+
+	if dslResult := p.classifyFromDSL(req); dslResult != nil {
+		p.completeClassification(resultChan, result, dslResult, time.Since(start), nil)
+		return nil
+	}
+
+	classification, err := p.classifyFromLLM(ctx, req, start)
+	p.completeClassification(resultChan, result, classification, time.Since(start), err)
+	return err
+}
+
+func (p *ClassificationWorkerPool) classifyFromCache(req *RouteRequest) *RouteResult {
+	if p.cache == nil {
+		return nil
+	}
+	cached := p.cache.Get(req.Input)
+	if cached == nil {
+		return nil
+	}
+	return &RouteResult{
+		TargetAgent:          TargetAgent(cached.TargetAgentID),
+		Intent:               cached.Intent,
+		Domain:               cached.Domain,
+		Confidence:           cached.Confidence,
+		ClassificationMethod: "cache",
+	}
+}
+
+func (p *ClassificationWorkerPool) classifyFromDSL(req *RouteRequest) *RouteResult {
+	if p.parser == nil || !p.parser.IsDSL(req.Input) {
+		return nil
+	}
+	cmd, err := p.parser.Parse(req.Input)
+	if err != nil {
+		return nil
+	}
+	return cmd.ToRouteResult()
+}
+
+func (p *ClassificationWorkerPool) classifyFromLLM(ctx context.Context, req *RouteRequest, start time.Time) (*RouteResult, error) {
+	if p.classifier == nil {
+		return nil, nil
+	}
+	classResult, err := p.classifier.Classify(ctx, req.Input)
+	if err != nil {
+		return nil, err
+	}
+	result := classResult.ToRouteResult(time.Since(start))
+	p.cacheClassification(req, result)
+	return result, nil
+}
+
+func (p *ClassificationWorkerPool) cacheClassification(req *RouteRequest, result *RouteResult) {
+	if p.cache != nil {
+		p.cache.Set(req.Input, result)
+	}
+}
+
+func (p *ClassificationWorkerPool) completeClassification(resultChan chan *AsyncClassificationResult, result *AsyncClassificationResult, routeResult *RouteResult, processingTime time.Duration, err error) {
+	if routeResult != nil {
+		result.Result = routeResult
+		result.TargetAgentID = string(routeResult.TargetAgent)
+	}
+	result.Error = err
+	result.ProcessingTime = processingTime
+	resultChan <- result
+	close(resultChan)
+}
+
+func (p *ClassificationWorkerPool) reportJobError(resultChan chan *AsyncClassificationResult, req *RouteRequest, submittedAt time.Time, err error) {
+	result := &AsyncClassificationResult{
+		Request:        req,
+		Error:          err,
+		ProcessingTime: time.Since(submittedAt),
+	}
+	select {
+	case resultChan <- result:
+	default:
+	}
+	close(resultChan)
+}
+
+func (p *ClassificationWorkerPool) reportQueueFull(resultChan chan *AsyncClassificationResult, req *RouteRequest) {
+	result := &AsyncClassificationResult{
+		Request:        req,
+		Error:          ErrWorkerPoolFull,
+		ProcessingTime: 0,
+	}
+	resultChan <- result
+	close(resultChan)
 }
 
 // Stats returns pool statistics

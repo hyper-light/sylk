@@ -218,45 +218,74 @@ func (m *Manager) Switch(id string) error {
 		return ErrManagerClosed
 	}
 
-	// Get target session
 	session, ok := m.Get(id)
 	if !ok {
 		return ErrSessionNotFound
 	}
 
-	// Pause current active session if any
-	if currentActive, ok := m.GetActive(); ok && currentActive.ID() != id {
-		if err := currentActive.Pause(); err != nil {
-			// Ignore invalid state transitions when pausing
-			if err != ErrInvalidStateTransition {
-				return err
-			}
-		}
+	if err := m.pauseActiveSession(id); err != nil {
+		return err
+	}
+	if err := m.activateSession(session); err != nil {
+		return err
 	}
 
-	// Activate target session if not already active
-	if !session.IsActive() {
-		state := session.State()
-		if state == StateCreated || state == StatePaused || state == StateSuspended {
-			if err := session.Start(); err != nil {
-				if err != ErrInvalidStateTransition {
-					return err
-				}
-			}
-		}
-	}
+	m.setActiveSession(id)
+	m.emitSwitchEvent(id)
 
-	// Update active session
+	return nil
+}
+
+func (m *Manager) pauseActiveSession(targetID string) error {
+	current, ok := m.GetActive()
+	if !ok || current.ID() == targetID {
+		return nil
+	}
+	if err := current.Pause(); err != nil {
+		return m.ignoreInvalidTransition(err)
+	}
+	return nil
+}
+
+func (m *Manager) activateSession(session *Session) error {
+	if session.IsActive() {
+		return nil
+	}
+	if !m.canActivateSession(session.State()) {
+		return nil
+	}
+	if err := session.Start(); err != nil {
+		return m.ignoreInvalidTransition(err)
+	}
+	return nil
+}
+
+func (m *Manager) canActivateSession(state State) bool {
+	switch state {
+	case StateCreated, StatePaused, StateSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) ignoreInvalidTransition(err error) error {
+	if err == ErrInvalidStateTransition {
+		return nil
+	}
+	return err
+}
+
+func (m *Manager) setActiveSession(id string) {
 	m.activeID.Store(&id)
+}
 
-	// Emit event
+func (m *Manager) emitSwitchEvent(id string) {
 	m.emitEvent(&Event{
 		Type:      EventSwitched,
 		SessionID: id,
 		Timestamp: time.Now(),
 	})
-
-	return nil
 }
 
 // Pause pauses a session
@@ -394,51 +423,72 @@ func (m *Manager) Close(id string) error {
 		return ErrManagerClosed
 	}
 
-	shard := m.getShard(id)
+	session, err := m.removeSession(id)
+	if err != nil {
+		return err
+	}
+	if err := m.closeSession(session); err != nil {
+		return err
+	}
 
+	m.clearActiveIfMatches(id)
+	m.updateCompletionStats(session)
+	m.persistFinalState(session)
+	m.emitClosedEvent(id)
+
+	return nil
+}
+
+func (m *Manager) removeSession(id string) (*Session, error) {
+	shard := m.getShard(id)
 	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
 	session, ok := shard.sessions[id]
 	if !ok {
-		shard.mu.Unlock()
-		return ErrSessionNotFound
+		return nil, ErrSessionNotFound
 	}
 	delete(shard.sessions, id)
-	shard.mu.Unlock()
+	return session, nil
+}
 
-	// Close the session
+func (m *Manager) closeSession(session *Session) error {
 	if err := session.Close(); err != nil {
-		// Ignore already closed
 		if err != ErrSessionClosed {
 			return err
 		}
 	}
+	return nil
+}
 
-	// Update active session if needed
+func (m *Manager) clearActiveIfMatches(id string) {
 	activeIDPtr := m.activeID.Load()
 	if activeIDPtr != nil && *activeIDPtr == id {
 		m.activeID.Store(nil)
 	}
+}
 
-	// Update statistics
-	if session.State() == StateCompleted {
+func (m *Manager) updateCompletionStats(session *Session) {
+	switch session.State() {
+	case StateCompleted:
 		atomic.AddInt64(&m.totalCompleted, 1)
-	} else if session.State() == StateFailed {
+	case StateFailed:
 		atomic.AddInt64(&m.totalFailed, 1)
 	}
+}
 
-	// Persist final state if enabled
+func (m *Manager) persistFinalState(session *Session) {
 	if m.persister != nil && session.Config().PersistenceEnabled {
 		_ = m.persister.Save(session)
 	}
+}
 
-	// Emit event
+func (m *Manager) emitClosedEvent(id string) {
 	m.emitEvent(&Event{
 		Type:      EventClosed,
 		SessionID: id,
 		Timestamp: time.Now(),
 	})
-
-	return nil
 }
 
 // CloseAll closes all sessions
@@ -465,7 +515,15 @@ func (m *Manager) Shutdown() error {
 		return ErrManagerClosed
 	}
 
-	// Get all sessions before we start closing
+	sessions := m.collectSessions()
+	m.persistSessions(sessions)
+	lastErr := m.closeSessions(sessions)
+	m.activeID.Store(nil)
+
+	return lastErr
+}
+
+func (m *Manager) collectSessions() []*Session {
 	var sessions []*Session
 	for _, shard := range m.shards {
 		shard.mu.RLock()
@@ -474,40 +532,37 @@ func (m *Manager) Shutdown() error {
 		}
 		shard.mu.RUnlock()
 	}
+	return sessions
+}
 
-	// Save all sessions before closing
-	if m.persister != nil {
-		for _, session := range sessions {
-			if session.Config().PersistenceEnabled {
-				_ = m.persister.Save(session)
-			}
+func (m *Manager) persistSessions(sessions []*Session) {
+	if m.persister == nil {
+		return
+	}
+	for _, session := range sessions {
+		if session.Config().PersistenceEnabled {
+			_ = m.persister.Save(session)
 		}
 	}
+}
 
-	// Close all sessions directly (bypass closed check)
+func (m *Manager) closeSessions(sessions []*Session) error {
 	var lastErr error
 	for _, session := range sessions {
-		shard := m.getShard(session.ID())
-
-		shard.mu.Lock()
-		delete(shard.sessions, session.ID())
-		shard.mu.Unlock()
-
+		m.discardSession(session)
 		if err := session.Close(); err != nil && err != ErrSessionClosed {
 			lastErr = err
 		}
-
-		m.emitEvent(&Event{
-			Type:      EventClosed,
-			SessionID: session.ID(),
-			Timestamp: time.Now(),
-		})
+		m.emitClosedEvent(session.ID())
 	}
-
-	// Clear active session
-	m.activeID.Store(nil)
-
 	return lastErr
+}
+
+func (m *Manager) discardSession(session *Session) {
+	shard := m.getShard(session.ID())
+	shard.mu.Lock()
+	delete(shard.sessions, session.ID())
+	shard.mu.Unlock()
 }
 
 // =============================================================================
@@ -566,20 +621,23 @@ func (m *Manager) Stats() ManagerStats {
 	for _, session := range sessions {
 		sessionStats := session.Stats()
 		stats.Sessions = append(stats.Sessions, sessionStats)
-
-		switch session.State() {
-		case StateActive:
-			stats.ActiveSessions++
-		case StatePaused:
-			stats.PausedSessions++
-		case StateCompleted:
-			stats.CompletedSessions++
-		case StateFailed:
-			stats.FailedSessions++
-		}
+		applySessionStateStats(&stats, session.State())
 	}
 
 	return stats
+}
+
+func applySessionStateStats(stats *ManagerStats, state State) {
+	switch state {
+	case StateActive:
+		stats.ActiveSessions++
+	case StatePaused:
+		stats.PausedSessions++
+	case StateCompleted:
+		stats.CompletedSessions++
+	case StateFailed:
+		stats.FailedSessions++
+	}
 }
 
 // =============================================================================

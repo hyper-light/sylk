@@ -81,8 +81,8 @@ type EventLog struct {
 	doneChan   chan struct{}
 
 	// Configuration
-	archiveFunc func([]*Event) error
-	batchSize   int
+	archiveFunc   func([]*Event) error
+	batchSize     int
 	flushInterval time.Duration
 }
 
@@ -246,43 +246,58 @@ func (el *EventLog) appendEventLocked(event *Event) {
 
 // archiveOldestLocked removes oldest events (caller must hold eventsMu)
 func (el *EventLog) archiveOldestLocked() {
-	// Archive 10% of events
-	archiveCount := el.maxEvents / 10
-	if archiveCount < 1 {
-		archiveCount = 1
+	archiveCount := el.archiveCount()
+	if el.archiveFunc == nil {
+		el.removeOldest(archiveCount)
+		return
 	}
 
-	if el.archiveFunc != nil {
-		toArchive := make([]*Event, 0, archiveCount)
-		for i := 0; i < archiveCount && el.count > 0; i++ {
-			event := el.events[el.tail]
-			if event != nil {
-				toArchive = append(toArchive, event)
-				// Remove from sync.Map indexes
-				el.byID.Delete(event.ID)
-				el.byVersion.Delete(event.Version)
-			}
-			el.events[el.tail] = nil
-			el.tail = (el.tail + 1) % el.maxEvents
-			el.count--
-		}
-		// Archive in background to not block
-		go func(events []*Event) {
-			_ = el.archiveFunc(events)
-		}(toArchive)
-	} else {
-		// Just remove without archiving
-		for i := 0; i < archiveCount && el.count > 0; i++ {
-			event := el.events[el.tail]
-			if event != nil {
-				el.byID.Delete(event.ID)
-				el.byVersion.Delete(event.Version)
-			}
-			el.events[el.tail] = nil
-			el.tail = (el.tail + 1) % el.maxEvents
-			el.count--
-		}
+	toArchive := el.collectOldestForArchive(archiveCount)
+	go func(events []*Event) {
+		_ = el.archiveFunc(events)
+	}(toArchive)
+}
+
+func (el *EventLog) archiveCount() int {
+	archiveCount := el.maxEvents / 10
+	if archiveCount < 1 {
+		return 1
 	}
+	return archiveCount
+}
+
+func (el *EventLog) collectOldestForArchive(archiveCount int) []*Event {
+	toArchive := make([]*Event, 0, archiveCount)
+	for i := 0; i < archiveCount && el.count > 0; i++ {
+		event := el.events[el.tail]
+		if event != nil {
+			toArchive = append(toArchive, event)
+			el.removeEventIndexes(event)
+		}
+		el.clearOldestEvent()
+	}
+	return toArchive
+}
+
+func (el *EventLog) removeOldest(archiveCount int) {
+	for i := 0; i < archiveCount && el.count > 0; i++ {
+		event := el.events[el.tail]
+		if event != nil {
+			el.removeEventIndexes(event)
+		}
+		el.clearOldestEvent()
+	}
+}
+
+func (el *EventLog) removeEventIndexes(event *Event) {
+	el.byID.Delete(event.ID)
+	el.byVersion.Delete(event.Version)
+}
+
+func (el *EventLog) clearOldestEvent() {
+	el.events[el.tail] = nil
+	el.tail = (el.tail + 1) % el.maxEvents
+	el.count--
 }
 
 // updateIndexesLocked updates all indexes (caller must hold indexesMu)
@@ -539,26 +554,41 @@ func (el *EventLog) QueryWithContext(ctx context.Context, q EventQuery) ([]*Even
 
 	var results []*Event
 	for i := 0; i < el.count; i++ {
-		// Check for cancellation periodically
-		if i%1000 == 0 {
-			select {
-			case <-ctx.Done():
-				return results, ctx.Err()
-			default:
-			}
+		if shouldCancelQuery(ctx, i) {
+			return results, ctx.Err()
 		}
 
-		idx := (el.tail + i) % el.maxEvents
-		e := el.events[idx]
-		if e != nil && el.matchesQuery(e, q) {
-			results = append(results, e)
+		event := el.eventAtIndex(i)
+		if event != nil && el.matchesQuery(event, q) {
+			results = append(results, event)
 		}
 	}
 
-	if q.Limit > 0 && len(results) > q.Limit {
-		results = results[len(results)-q.Limit:]
+	return applyQueryLimit(results, q.Limit), nil
+}
+
+func shouldCancelQuery(ctx context.Context, idx int) bool {
+	if idx%1000 != 0 {
+		return false
 	}
-	return results, nil
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (el *EventLog) eventAtIndex(i int) *Event {
+	idx := (el.tail + i) % el.maxEvents
+	return el.events[idx]
+}
+
+func applyQueryLimit(results []*Event, limit int) []*Event {
+	if limit > 0 && len(results) > limit {
+		return results[len(results)-limit:]
+	}
+	return results
 }
 
 func (el *EventLog) matchesQuery(e *Event, q EventQuery) bool {

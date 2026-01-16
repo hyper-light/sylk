@@ -155,78 +155,131 @@ func (p *Parser) IsDSL(input string) bool {
 func (p *Parser) Parse(input string) (*DSLCommand, error) {
 	input = strings.TrimSpace(input)
 
-	if !p.IsDSL(input) {
-		return nil, &DSLParseError{
-			Input:    input,
-			Position: 0,
-			Expected: "DSL command starting with " + p.prefix,
-			Got:      input,
-			Message:  "input does not start with DSL prefix",
-		}
+	if err := p.validateDSLPrefix(input); err != nil {
+		return nil, err
 	}
 
-	// Try each pattern in order of specificity
-
-	// 1. Direct TO routing: @to:<agent> <query>
-	if matches := p.directToPattern.FindStringSubmatch(input); matches != nil {
-		return &DSLCommand{
-			Type:        DSLCommandTypeDirect,
-			Direction:   DSLDirectionTo,
-			TargetAgent: p.resolveAgent(matches[1]),
-			Query:       strings.TrimSpace(matches[2]),
-			Raw:         input,
-		}, nil
+	if cmd := p.parseDirectTo(input); cmd != nil {
+		return cmd, nil
 	}
 
-	// 2. Direct FROM routing: @from:<agent> <response>
-	if matches := p.directFromPattern.FindStringSubmatch(input); matches != nil {
-		return &DSLCommand{
-			Type:        DSLCommandTypeDirect,
-			Direction:   DSLDirectionFrom,
-			TargetAgent: p.resolveAgent(matches[1]),
-			Query:       strings.TrimSpace(matches[2]),
-			Raw:         input,
-		}, nil
+	if cmd := p.parseDirectFrom(input); cmd != nil {
+		return cmd, nil
 	}
 
-	// 3. Guide (intent routing): @guide <query>
-	if matches := p.guidePattern.FindStringSubmatch(input); matches != nil {
-		return &DSLCommand{
-			Type:  DSLCommandTypeIntent,
-			Query: strings.TrimSpace(matches[1]),
-			Raw:   input,
-		}, nil
+	if cmd := p.parseGuideIntent(input); cmd != nil {
+		return cmd, nil
 	}
 
-	// 4. Action shortcuts: @<action> <query>
-	// Check against registered action shortcuts from routing aggregator
-	if matches := p.actionPattern.FindStringSubmatch(input); matches != nil {
-		action := strings.ToLower(matches[1])
-		if shortcut, agentID, ok := p.resolveActionShortcut(action); ok {
-			cmd := &DSLCommand{
-				Type:        DSLCommandTypeAction,
-				TargetAgent: agentID,
-				Query:       strings.TrimSpace(matches[2]),
-				Raw:         input,
-			}
-			// Apply default intent/domain from shortcut if available
-			if shortcut != nil {
-				if shortcut.DefaultIntent != "" {
-					cmd.Intent = shortcut.DefaultIntent
-				}
-				if shortcut.DefaultDomain != "" {
-					cmd.Domain = shortcut.DefaultDomain
-				}
-			}
-			return cmd, nil
-		}
+	if cmd := p.parseActionShortcut(input); cmd != nil {
+		return cmd, nil
 	}
 
-	// 5. Full DSL: @agent:intent:domain?params{data}
-	if matches := p.fullDSLPattern.FindStringSubmatch(input); matches != nil {
-		return p.parseFullDSL(input, matches)
+	if cmd, err := p.parseFullDSLIfMatched(input); cmd != nil || err != nil {
+		return cmd, err
 	}
 
+	return p.unrecognizedDSL(input)
+}
+
+func (p *Parser) validateDSLPrefix(input string) error {
+	if p.IsDSL(input) {
+		return nil
+	}
+	return &DSLParseError{
+		Input:    input,
+		Position: 0,
+		Expected: "DSL command starting with " + p.prefix,
+		Got:      input,
+		Message:  "input does not start with DSL prefix",
+	}
+}
+
+func (p *Parser) parseDirectTo(input string) *DSLCommand {
+	matches := p.directToPattern.FindStringSubmatch(input)
+	if matches == nil {
+		return nil
+	}
+	return &DSLCommand{
+		Type:        DSLCommandTypeDirect,
+		Direction:   DSLDirectionTo,
+		TargetAgent: p.resolveAgent(matches[1]),
+		Query:       strings.TrimSpace(matches[2]),
+		Raw:         input,
+	}
+}
+
+func (p *Parser) parseDirectFrom(input string) *DSLCommand {
+	matches := p.directFromPattern.FindStringSubmatch(input)
+	if matches == nil {
+		return nil
+	}
+	return &DSLCommand{
+		Type:        DSLCommandTypeDirect,
+		Direction:   DSLDirectionFrom,
+		TargetAgent: p.resolveAgent(matches[1]),
+		Query:       strings.TrimSpace(matches[2]),
+		Raw:         input,
+	}
+}
+
+func (p *Parser) parseGuideIntent(input string) *DSLCommand {
+	matches := p.guidePattern.FindStringSubmatch(input)
+	if matches == nil {
+		return nil
+	}
+	return &DSLCommand{
+		Type:  DSLCommandTypeIntent,
+		Query: strings.TrimSpace(matches[1]),
+		Raw:   input,
+	}
+}
+
+func (p *Parser) parseActionShortcut(input string) *DSLCommand {
+	matches := p.actionPattern.FindStringSubmatch(input)
+	if matches == nil {
+		return nil
+	}
+	return p.buildActionShortcutCommand(matches, input)
+}
+
+func (p *Parser) buildActionShortcutCommand(matches []string, input string) *DSLCommand {
+	action := strings.ToLower(matches[1])
+	shortcut, agentID, ok := p.resolveActionShortcut(action)
+	if !ok {
+		return nil
+	}
+	cmd := &DSLCommand{
+		Type:        DSLCommandTypeAction,
+		TargetAgent: agentID,
+		Query:       strings.TrimSpace(matches[2]),
+		Raw:         input,
+	}
+	p.applyActionShortcutDefaults(cmd, shortcut)
+	return cmd
+}
+
+func (p *Parser) applyActionShortcutDefaults(cmd *DSLCommand, shortcut *ActionShortcut) {
+	if shortcut == nil {
+		return
+	}
+	if shortcut.DefaultIntent != "" {
+		cmd.Intent = shortcut.DefaultIntent
+	}
+	if shortcut.DefaultDomain != "" {
+		cmd.Domain = shortcut.DefaultDomain
+	}
+}
+
+func (p *Parser) parseFullDSLIfMatched(input string) (*DSLCommand, error) {
+	matches := p.fullDSLPattern.FindStringSubmatch(input)
+	if matches == nil {
+		return nil, nil
+	}
+	return p.parseFullDSL(input, matches)
+}
+
+func (p *Parser) unrecognizedDSL(input string) (*DSLCommand, error) {
 	return nil, &DSLParseError{
 		Input:    input,
 		Position: 0,
@@ -422,85 +475,132 @@ func (cmd *DSLCommand) ToRouteResult() *RouteResult {
 
 	switch cmd.Type {
 	case DSLCommandTypeFull:
-		// Full DSL has explicit intent/domain
-		result.Intent = cmd.Intent
-		result.Domain = cmd.Domain
-		result.TargetAgent = TargetAgent(cmd.TargetAgent)
-		if cmd.Domain.IsHistoricalDomain() {
-			result.TemporalFocus = TemporalPast
-		} else {
-			result.TemporalFocus = TemporalPresent
-		}
-		result.Entities = cmd.ToEntities()
-
+		cmd.applyFullDSL(result)
 	case DSLCommandTypeDirect, DSLCommandTypeAction:
-		// Direct routing - target is specified, no classification needed
-		result.TargetAgent = TargetAgent(cmd.TargetAgent)
-		result.Intent = IntentUnknown // Will be determined by target agent
-		result.Domain = DomainUnknown
-		result.Entities = &ExtractedEntities{
-			Query: cmd.Query,
-			Data:  cmd.Data,
-		}
-
+		cmd.applyDirectDSL(result)
 	case DSLCommandTypeIntent:
-		// Intent routing - needs LLM classification
-		// This case should actually trigger classification, not return directly
-		result.TargetAgent = TargetUnknown
-		result.Intent = IntentUnknown
-		result.Domain = DomainUnknown
-		result.Confidence = 0 // Needs classification
-		result.Entities = &ExtractedEntities{
-			Query: cmd.Query,
-		}
+		cmd.applyIntentDSL(result)
 	}
 
 	return result
 }
 
+func (cmd *DSLCommand) applyFullDSL(result *RouteResult) {
+	result.Intent = cmd.Intent
+	result.Domain = cmd.Domain
+	result.TargetAgent = TargetAgent(cmd.TargetAgent)
+	result.TemporalFocus = cmd.temporalFocus()
+	result.Entities = cmd.ToEntities()
+}
+
+func (cmd *DSLCommand) temporalFocus() TemporalFocus {
+	if cmd.Domain.IsHistoricalDomain() {
+		return TemporalPast
+	}
+	return TemporalPresent
+}
+
+func (cmd *DSLCommand) applyDirectDSL(result *RouteResult) {
+	result.TargetAgent = TargetAgent(cmd.TargetAgent)
+	result.Intent = IntentUnknown
+	result.Domain = DomainUnknown
+	result.Entities = &ExtractedEntities{
+		Query: cmd.Query,
+		Data:  cmd.Data,
+	}
+}
+
+func (cmd *DSLCommand) applyIntentDSL(result *RouteResult) {
+	result.TargetAgent = TargetUnknown
+	result.Intent = IntentUnknown
+	result.Domain = DomainUnknown
+	result.Confidence = 0
+	result.Entities = &ExtractedEntities{
+		Query: cmd.Query,
+	}
+}
+
 // ToEntities converts DSL params and data to extracted entities
 func (cmd *DSLCommand) ToEntities() *ExtractedEntities {
 	entities := &ExtractedEntities{}
+	cmd.assignQuery(entities)
+	cmd.assignParams(entities)
+	cmd.assignData(entities)
+	return entities
+}
 
-	// Set query if present
+func (cmd *DSLCommand) assignQuery(entities *ExtractedEntities) {
 	if cmd.Query != "" {
 		entities.Query = cmd.Query
 	}
+}
 
-	// Extract from params
-	if cmd.Params != nil {
-		if scope, ok := cmd.Params["scope"]; ok {
-			entities.Scope = scope
-		}
-		if agent, ok := cmd.Params["agent"]; ok {
-			entities.AgentName = agent
-		}
-		if agentID, ok := cmd.Params["agent_id"]; ok {
-			entities.AgentID = agentID
-		}
-		if errorType, ok := cmd.Params["error"]; ok {
-			entities.ErrorType = errorType
-		}
-		if timeframe, ok := cmd.Params["time"]; ok {
-			entities.Timeframe = timeframe
-		}
-		if query, ok := cmd.Params["q"]; ok {
-			entities.Query = query
-		}
-		if path, ok := cmd.Params["path"]; ok {
-			entities.FilePaths = []string{path}
-		}
-		if paths, ok := cmd.Params["paths"]; ok {
-			entities.FilePaths = strings.Split(paths, ",")
-		}
+func (cmd *DSLCommand) assignParams(entities *ExtractedEntities) {
+	if cmd.Params == nil {
+		return
 	}
+	cmd.assignParamScope(entities)
+	cmd.assignParamAgent(entities)
+	cmd.assignParamAgentID(entities)
+	cmd.assignParamErrorType(entities)
+	cmd.assignParamTimeframe(entities)
+	cmd.assignParamQuery(entities)
+	cmd.assignParamPath(entities)
+	cmd.assignParamPaths(entities)
+}
 
-	// Extract from data
+func (cmd *DSLCommand) assignParamScope(entities *ExtractedEntities) {
+	if scope, ok := cmd.Params["scope"]; ok {
+		entities.Scope = scope
+	}
+}
+
+func (cmd *DSLCommand) assignParamAgent(entities *ExtractedEntities) {
+	if agent, ok := cmd.Params["agent"]; ok {
+		entities.AgentName = agent
+	}
+}
+
+func (cmd *DSLCommand) assignParamAgentID(entities *ExtractedEntities) {
+	if agentID, ok := cmd.Params["agent_id"]; ok {
+		entities.AgentID = agentID
+	}
+}
+
+func (cmd *DSLCommand) assignParamErrorType(entities *ExtractedEntities) {
+	if errorType, ok := cmd.Params["error"]; ok {
+		entities.ErrorType = errorType
+	}
+}
+
+func (cmd *DSLCommand) assignParamTimeframe(entities *ExtractedEntities) {
+	if timeframe, ok := cmd.Params["time"]; ok {
+		entities.Timeframe = timeframe
+	}
+}
+
+func (cmd *DSLCommand) assignParamQuery(entities *ExtractedEntities) {
+	if query, ok := cmd.Params["q"]; ok {
+		entities.Query = query
+	}
+}
+
+func (cmd *DSLCommand) assignParamPath(entities *ExtractedEntities) {
+	if path, ok := cmd.Params["path"]; ok {
+		entities.FilePaths = []string{path}
+	}
+}
+
+func (cmd *DSLCommand) assignParamPaths(entities *ExtractedEntities) {
+	if paths, ok := cmd.Params["paths"]; ok {
+		entities.FilePaths = strings.Split(paths, ",")
+	}
+}
+
+func (cmd *DSLCommand) assignData(entities *ExtractedEntities) {
 	if cmd.Data != nil {
 		entities.Data = cmd.Data
 	}
-
-	return entities
 }
 
 // =============================================================================
@@ -510,57 +610,76 @@ func (cmd *DSLCommand) ToEntities() *ExtractedEntities {
 // FormatDSLCommand formats a route result back to DSL
 func FormatDSLCommand(result *RouteResult) string {
 	var sb strings.Builder
+	agent := formatAgentPrefix(result.TargetAgent)
+	formatDSLHeader(&sb, agent, result)
+	formatDSLEntities(&sb, result.Entities)
+	return sb.String()
+}
 
-	// Determine agent prefix
-	agent := "arch"
-	if result.TargetAgent == TargetGuide {
-		agent = "guide"
-	} else if result.TargetAgent != "" {
-		agent = string(result.TargetAgent)
+func formatAgentPrefix(target TargetAgent) string {
+	if target == TargetGuide {
+		return "guide"
 	}
+	if target != "" {
+		return string(target)
+	}
+	return "arch"
+}
 
+func formatDSLHeader(sb *strings.Builder, agent string, result *RouteResult) {
 	sb.WriteString("@")
 	sb.WriteString(agent)
 	sb.WriteString(":")
 	sb.WriteString(string(result.Intent))
 	sb.WriteString(":")
 	sb.WriteString(string(result.Domain))
+}
 
-	// Add params if present
-	if result.Entities != nil {
-		var params []string
-
-		if result.Entities.Scope != "" {
-			params = append(params, "scope="+result.Entities.Scope)
-		}
-		if result.Entities.AgentName != "" {
-			params = append(params, "agent="+result.Entities.AgentName)
-		}
-		if result.Entities.ErrorType != "" {
-			params = append(params, "error="+result.Entities.ErrorType)
-		}
-		if result.Entities.Timeframe != "" {
-			params = append(params, "time="+result.Entities.Timeframe)
-		}
-		if len(result.Entities.FilePaths) > 0 {
-			params = append(params, "paths="+strings.Join(result.Entities.FilePaths, ","))
-		}
-
-		if len(params) > 0 {
-			sb.WriteString("?")
-			sb.WriteString(strings.Join(params, "&"))
-		}
-
-		// Add data if present
-		if result.Entities.Data != nil {
-			data, err := json.Marshal(result.Entities.Data)
-			if err == nil {
-				sb.WriteString(string(data))
-			}
-		}
+func formatDSLEntities(sb *strings.Builder, entities *ExtractedEntities) {
+	if entities == nil {
+		return
 	}
+	params := formatDSLParams(entities)
+	appendDSLParams(sb, params)
+	appendDSLData(sb, entities.Data)
+}
 
-	return sb.String()
+func formatDSLParams(entities *ExtractedEntities) []string {
+	params := make([]string, 0)
+	params = appendParam(params, "scope", entities.Scope)
+	params = appendParam(params, "agent", entities.AgentName)
+	params = appendParam(params, "error", entities.ErrorType)
+	params = appendParam(params, "time", entities.Timeframe)
+	if len(entities.FilePaths) > 0 {
+		params = append(params, "paths="+strings.Join(entities.FilePaths, ","))
+	}
+	return params
+}
+
+func appendParam(params []string, key string, value string) []string {
+	if value == "" {
+		return params
+	}
+	return append(params, key+"="+value)
+}
+
+func appendDSLParams(sb *strings.Builder, params []string) {
+	if len(params) == 0 {
+		return
+	}
+	sb.WriteString("?")
+	sb.WriteString(strings.Join(params, "&"))
+}
+
+func appendDSLData(sb *strings.Builder, data map[string]any) {
+	if data == nil {
+		return
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	sb.WriteString(string(encoded))
 }
 
 // FormatDirectTo formats a direct routing command

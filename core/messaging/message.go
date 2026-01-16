@@ -432,6 +432,16 @@ func (e *ValidationError) Error() string {
 // Validate checks that the message envelope is complete and valid.
 // Returns nil if valid, or a ValidationError describing the issue.
 func (m *Message[T]) Validate() error {
+	if err := m.validateRequiredFields(); err != nil {
+		return err
+	}
+	if err := m.validateTemporalFields(); err != nil {
+		return err
+	}
+	return m.validateStatus()
+}
+
+func (m *Message[T]) validateRequiredFields() error {
 	if m.ID == "" {
 		return &ValidationError{Field: "id", Message: "required"}
 	}
@@ -447,20 +457,23 @@ func (m *Message[T]) Validate() error {
 	if m.Attempt < 1 {
 		return &ValidationError{Field: "attempt", Message: "must be >= 1"}
 	}
+	return nil
+}
 
-	// Validate temporal consistency
+func (m *Message[T]) validateTemporalFields() error {
 	if m.Deadline != nil && m.Deadline.Before(m.Timestamp) {
 		return &ValidationError{Field: "deadline", Message: "cannot be before timestamp"}
 	}
 	if m.TTL < 0 {
 		return &ValidationError{Field: "ttl", Message: "cannot be negative"}
 	}
+	return nil
+}
 
-	// Validate status
+func (m *Message[T]) validateStatus() error {
 	if m.Status == "" {
 		return &ValidationError{Field: "status", Message: "required"}
 	}
-
 	return nil
 }
 
@@ -541,10 +554,10 @@ func (m *Message[T]) ProcessingDuration() time.Duration {
 
 // Common validation errors
 var (
-	ErrMissingID        = errors.New("message id is required")
-	ErrMissingSource    = errors.New("message source is required")
-	ErrMissingType      = errors.New("message type is required")
-	ErrMessageExpired   = errors.New("message has expired")
-	ErrInvalidDeadline  = errors.New("deadline cannot be before timestamp")
+	ErrMissingID          = errors.New("message id is required")
+	ErrMissingSource      = errors.New("message source is required")
+	ErrMissingType        = errors.New("message type is required")
+	ErrMessageExpired     = errors.New("message has expired")
+	ErrInvalidDeadline    = errors.New("deadline cannot be before timestamp")
 	ErrMaxAttemptsReached = errors.New("maximum attempts reached")
 )

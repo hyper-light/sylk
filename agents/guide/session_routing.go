@@ -162,66 +162,126 @@ func (sr *SessionRouter) GetSessionPrefs(sessionID string) *SessionRoutingPrefs 
 
 // Route routes a request with session awareness
 func (sr *SessionRouter) Route(ctx context.Context, sessionID string, request *RouteRequest) (*RouteResult, error) {
+	cache, prefs, hasCache, hasPrefs := sr.sessionState(sessionID)
+	result, ok := sr.trySessionRouting(cache, prefs, hasCache, hasPrefs, request)
+	if ok {
+		return result, nil
+	}
+
+	result, err := sr.classifyRoute(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	result = sr.applyPreferencesIfNeeded(result, prefs, hasPrefs)
+	sr.cacheRouteResult(cache, prefs, hasCache, hasPrefs, request, result)
+
+	return result, nil
+}
+
+func (sr *SessionRouter) sessionState(sessionID string) (*RouteCache, *SessionRoutingPrefs, bool, bool) {
 	sr.mu.RLock()
 	cache, hasCache := sr.sessionCaches[sessionID]
 	prefs, hasPrefs := sr.sessionPrefs[sessionID]
 	sr.mu.RUnlock()
 
 	sr.stats.TotalRoutes++
+	return cache, prefs, hasCache, hasPrefs
+}
 
-	// Try session cache first
-	if hasCache {
-		if cached := cache.Get(request.Input); cached != nil {
-			sr.stats.SessionHits++
-			return sr.cachedToResult(cached), nil
-		}
+func (sr *SessionRouter) trySessionRouting(cache *RouteCache, prefs *SessionRoutingPrefs, hasCache bool, hasPrefs bool, request *RouteRequest) (*RouteResult, bool) {
+	if result := sr.trySessionCache(cache, hasCache, request); result != nil {
+		return result, true
 	}
-
-	// Try session-specific rules
-	if hasPrefs && len(prefs.Rules) > 0 {
-		if result := sr.matchRules(request.Input, prefs.Rules); result != nil {
-			sr.stats.RuleMatches++
-			return result, nil
-		}
+	if result := sr.trySessionRules(prefs, hasPrefs, request); result != nil {
+		return result, true
 	}
-
-	// Try global cache if enabled
-	if hasPrefs && prefs.UseGlobalCache && sr.guide != nil {
-		if cached := sr.guide.routeCache.Get(request.Input); cached != nil {
-			sr.stats.GlobalFallbacks++
-			result := sr.cachedToResult(cached)
-
-			// Cache in session for next time
-			if hasCache {
-				cache.Set(request.Input, result)
-			}
-
-			return result, nil
-		}
+	if result := sr.tryGlobalCache(cache, prefs, hasCache, hasPrefs, request); result != nil {
+		return result, true
 	}
+	return nil, false
+}
 
-	// Full classification via guide
-	result, err := sr.guide.router.Route(ctx, request)
-	if err != nil {
-		return nil, err
+func (sr *SessionRouter) trySessionCache(cache *RouteCache, hasCache bool, request *RouteRequest) *RouteResult {
+	if !hasCache {
+		return nil
 	}
-
-	// Apply preference boosts
-	if hasPrefs {
-		result = sr.applyPreferences(result, prefs)
+	cached := cache.Get(request.Input)
+	if cached == nil {
+		return nil
 	}
+	sr.stats.SessionHits++
+	return sr.cachedToResult(cached)
+}
 
-	// Cache the result
-	if hasCache && result.ClassificationMethod == "llm" {
-		cache.Set(request.Input, result)
+func (sr *SessionRouter) trySessionRules(prefs *SessionRoutingPrefs, hasPrefs bool, request *RouteRequest) *RouteResult {
+	if !hasPrefs || len(prefs.Rules) == 0 {
+		return nil
 	}
-
-	// Populate global cache if enabled
-	if hasPrefs && prefs.PopulateGlobalCache && sr.guide != nil && result.ClassificationMethod == "llm" {
-		sr.guide.routeCache.Set(request.Input, result)
+	result := sr.matchRules(request.Input, prefs.Rules)
+	if result == nil {
+		return nil
 	}
+	sr.stats.RuleMatches++
+	return result
+}
 
-	return result, nil
+func (sr *SessionRouter) tryGlobalCache(cache *RouteCache, prefs *SessionRoutingPrefs, hasCache bool, hasPrefs bool, request *RouteRequest) *RouteResult {
+	if !sr.shouldUseGlobalCache(prefs, hasPrefs) {
+		return nil
+	}
+	cached := sr.guide.routeCache.Get(request.Input)
+	if cached == nil {
+		return nil
+	}
+	sr.stats.GlobalFallbacks++
+	result := sr.cachedToResult(cached)
+	sr.cacheSessionFallback(cache, hasCache, request, result)
+	return result
+}
+
+func (sr *SessionRouter) shouldUseGlobalCache(prefs *SessionRoutingPrefs, hasPrefs bool) bool {
+	return hasPrefs && prefs.UseGlobalCache && sr.guide != nil
+}
+
+func (sr *SessionRouter) cacheSessionFallback(cache *RouteCache, hasCache bool, request *RouteRequest, result *RouteResult) {
+	if !hasCache {
+		return
+	}
+	cache.Set(request.Input, result)
+}
+
+func (sr *SessionRouter) classifyRoute(ctx context.Context, request *RouteRequest) (*RouteResult, error) {
+	return sr.guide.router.Route(ctx, request)
+}
+
+func (sr *SessionRouter) applyPreferencesIfNeeded(result *RouteResult, prefs *SessionRoutingPrefs, hasPrefs bool) *RouteResult {
+	if !hasPrefs {
+		return result
+	}
+	return sr.applyPreferences(result, prefs)
+}
+
+func (sr *SessionRouter) cacheRouteResult(cache *RouteCache, prefs *SessionRoutingPrefs, hasCache bool, hasPrefs bool, request *RouteRequest, result *RouteResult) {
+	sr.cacheSessionResult(cache, hasCache, request, result)
+	sr.cacheGlobalResult(prefs, hasPrefs, request, result)
+}
+
+func (sr *SessionRouter) cacheSessionResult(cache *RouteCache, hasCache bool, request *RouteRequest, result *RouteResult) {
+	if !hasCache || result.ClassificationMethod != "llm" {
+		return
+	}
+	cache.Set(request.Input, result)
+}
+
+func (sr *SessionRouter) cacheGlobalResult(prefs *SessionRoutingPrefs, hasPrefs bool, request *RouteRequest, result *RouteResult) {
+	if !hasPrefs || !prefs.PopulateGlobalCache || sr.guide == nil {
+		return
+	}
+	if result.ClassificationMethod != "llm" {
+		return
+	}
+	sr.guide.routeCache.Set(request.Input, result)
 }
 
 // matchRules tries to match input against session rules
@@ -264,30 +324,61 @@ func (sr *SessionRouter) matchRules(input string, rules []SessionRoutingRule) *R
 // applyPreferences applies session preferences to a route result
 func (sr *SessionRouter) applyPreferences(result *RouteResult, prefs *SessionRoutingPrefs) *RouteResult {
 	agentID := string(result.TargetAgent)
-
-	// Check if agent is blocked
-	if prefs.BlockedAgents[agentID] {
-		result.Rejected = true
-		result.Reason = "agent blocked by session preferences"
+	if sr.isBlockedAgent(prefs, agentID, result) {
 		return result
 	}
+	sr.applyThresholds(result, prefs)
+	sr.trackPreferenceBoost(prefs, agentID)
+	return result
+}
 
-	// Apply confidence thresholds
+func (sr *SessionRouter) isBlockedAgent(prefs *SessionRoutingPrefs, agentID string, result *RouteResult) bool {
+	if !prefs.BlockedAgents[agentID] {
+		return false
+	}
+	result.Rejected = true
+	result.Reason = "agent blocked by session preferences"
+	return true
+}
+
+func (sr *SessionRouter) applyThresholds(result *RouteResult, prefs *SessionRoutingPrefs) {
+	if sr.applyExecuteThreshold(result, prefs) {
+		return
+	}
+	if sr.applyLogThreshold(result, prefs) {
+		return
+	}
+	sr.applySuggestThreshold(result, prefs)
+}
+
+func (sr *SessionRouter) applyExecuteThreshold(result *RouteResult, prefs *SessionRoutingPrefs) bool {
 	if prefs.ExecuteThreshold > 0 && result.Confidence >= prefs.ExecuteThreshold {
 		result.Action = RouteActionExecute
-	} else if prefs.LogThreshold > 0 && result.Confidence >= prefs.LogThreshold {
-		result.Action = RouteActionLog
-	} else if prefs.SuggestThreshold > 0 && result.Confidence >= prefs.SuggestThreshold {
-		result.Action = RouteActionSuggest
+		return true
 	}
+	return false
+}
 
-	// Note: preference boosts would affect agent selection if we had multiple candidates
-	// For now, track that we checked preferences
+func (sr *SessionRouter) applyLogThreshold(result *RouteResult, prefs *SessionRoutingPrefs) bool {
+	if prefs.LogThreshold > 0 && result.Confidence >= prefs.LogThreshold {
+		result.Action = RouteActionLog
+		return true
+	}
+	return false
+}
+
+func (sr *SessionRouter) applySuggestThreshold(result *RouteResult, prefs *SessionRoutingPrefs) bool {
+	if prefs.SuggestThreshold > 0 && result.Confidence >= prefs.SuggestThreshold {
+		result.Action = RouteActionSuggest
+		return true
+	}
+	return false
+}
+
+func (sr *SessionRouter) trackPreferenceBoost(prefs *SessionRoutingPrefs, agentID string) {
 	if _, hasBoost := prefs.PreferredAgents[agentID]; hasBoost {
 		sr.stats.PreferenceBoosts++
 	}
-
-	return result
 }
 
 // cachedToResult converts a cached route to a route result

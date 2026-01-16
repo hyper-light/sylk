@@ -43,37 +43,54 @@ func (c *CrossSessionIndex) QuerySessions(query ArchiveQuery) ([]*Session, error
 	}
 
 	seen := make(map[string]bool)
-	var sessions []*Session
-
+	sessions := make([]*Session, 0, len(results))
 	for _, item := range results {
 		if seen[item.SessionID] {
 			continue
 		}
 		seen[item.SessionID] = true
 
-		if c.archive != nil {
-			session, err := c.archive.GetSession(item.SessionID)
-			if err == nil && session != nil {
-				sessions = append(sessions, session)
-				continue
-			}
+		session := c.sessionFromCrossResult(item)
+		if session != nil {
+			sessions = append(sessions, session)
 		}
-
-		if c.store != nil {
-			if current := c.store.GetCurrentSession(); current != nil && current.ID == item.SessionID {
-				sessions = append(sessions, current)
-				continue
-			}
-			if entry, ok := c.store.GetEntry(item.Entry.ID); ok && entry != nil {
-				sessions = append(sessions, &Session{
-					ID: item.SessionID,
-				})
-			}
-		}
-
 	}
 
 	return sessions, nil
+}
+
+func (c *CrossSessionIndex) sessionFromCrossResult(item CrossSessionResult) *Session {
+	if session := c.sessionFromArchive(item.SessionID); session != nil {
+		return session
+	}
+	if session := c.sessionFromStore(item); session != nil {
+		return session
+	}
+	return nil
+}
+
+func (c *CrossSessionIndex) sessionFromArchive(sessionID string) *Session {
+	if c.archive == nil {
+		return nil
+	}
+	session, err := c.archive.GetSession(sessionID)
+	if err != nil {
+		return nil
+	}
+	return session
+}
+
+func (c *CrossSessionIndex) sessionFromStore(item CrossSessionResult) *Session {
+	if c.store == nil {
+		return nil
+	}
+	if current := c.store.GetCurrentSession(); current != nil && current.ID == item.SessionID {
+		return current
+	}
+	if entry, ok := c.store.GetEntry(item.Entry.ID); ok && entry != nil {
+		return &Session{ID: item.SessionID}
+	}
+	return nil
 }
 
 func (c *CrossSessionIndex) GetSessionHistory(sessionID string, limit int) []*Event {

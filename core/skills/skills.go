@@ -56,7 +56,7 @@ type Property struct {
 	Type        string               `json:"type"`
 	Description string               `json:"description,omitempty"`
 	Enum        []string             `json:"enum,omitempty"`
-	Items       *Property            `json:"items,omitempty"`       // For arrays
+	Items       *Property            `json:"items,omitempty"`      // For arrays
 	Properties  map[string]*Property `json:"properties,omitempty"` // For nested objects
 	Default     any                  `json:"default,omitempty"`
 }
@@ -267,28 +267,33 @@ func (r *Registry) Unregister(name string) {
 	}
 
 	delete(r.skills, name)
+	r.removeDomainIndex(skill)
+	r.removeKeywordIndex(skill)
+}
 
-	// Remove from domain index
-	if skill.Domain != "" {
-		skills := r.byDomain[skill.Domain]
-		for i, s := range skills {
-			if s.Name == name {
-				r.byDomain[skill.Domain] = append(skills[:i], skills[i+1:]...)
-				break
-			}
-		}
+func (r *Registry) removeDomainIndex(skill *Skill) {
+	if skill.Domain == "" {
+		return
 	}
 
-	// Remove from keyword index
-	for _, kw := range skill.Keywords {
-		skills := r.byKeyword[kw]
-		for i, s := range skills {
-			if s.Name == name {
-				r.byKeyword[kw] = append(skills[:i], skills[i+1:]...)
-				break
-			}
+	skills := r.byDomain[skill.Domain]
+	r.byDomain[skill.Domain] = removeSkillByName(skills, skill.Name)
+}
+
+func (r *Registry) removeKeywordIndex(skill *Skill) {
+	for _, keyword := range skill.Keywords {
+		skills := r.byKeyword[keyword]
+		r.byKeyword[keyword] = removeSkillByName(skills, skill.Name)
+	}
+}
+
+func removeSkillByName(skills []*Skill, name string) []*Skill {
+	for index, existing := range skills {
+		if existing.Name == name {
+			return append(skills[:index], skills[index+1:]...)
 		}
 	}
+	return skills
 }
 
 // Get returns a skill by name
@@ -527,25 +532,39 @@ func (r *Registry) Stats() Stats {
 	}
 
 	for _, skill := range r.skills {
-		if skill.Loaded {
-			stats.Loaded++
-		}
-		if skill.Domain != "" {
-			stats.ByDomain[skill.Domain]++
-		}
+		accumulateSkillStats(&stats, skill)
 	}
 
-	// Top 5 most invoked
-	var usages []Usage
-	for _, skill := range r.skills {
+	stats.TopInvoked = topInvokedSkills(r.skills)
+	return stats
+}
+
+func accumulateSkillStats(stats *Stats, skill *Skill) {
+	if skill.Loaded {
+		stats.Loaded++
+	}
+	if skill.Domain != "" {
+		stats.ByDomain[skill.Domain]++
+	}
+}
+
+func topInvokedSkills(skills map[string]*Skill) []Usage {
+	usages := collectSkillUsages(skills)
+	sortTopInvoked(usages)
+	return trimTopInvoked(usages, 5)
+}
+
+func collectSkillUsages(skills map[string]*Skill) []Usage {
+	usages := make([]Usage, 0, len(skills))
+	for _, skill := range skills {
 		if skill.InvokeCount > 0 {
-			usages = append(usages, Usage{
-				Name:        skill.Name,
-				InvokeCount: skill.InvokeCount,
-			})
+			usages = append(usages, Usage{Name: skill.Name, InvokeCount: skill.InvokeCount})
 		}
 	}
-	// Simple sort (for top 5, bubble sort is fine)
+	return usages
+}
+
+func sortTopInvoked(usages []Usage) {
 	for i := 0; i < len(usages) && i < 5; i++ {
 		for j := i + 1; j < len(usages); j++ {
 			if usages[j].InvokeCount > usages[i].InvokeCount {
@@ -553,10 +572,11 @@ func (r *Registry) Stats() Stats {
 			}
 		}
 	}
-	if len(usages) > 5 {
-		usages = usages[:5]
-	}
-	stats.TopInvoked = usages
+}
 
-	return stats
+func trimTopInvoked(usages []Usage, limit int) []Usage {
+	if len(usages) > limit {
+		return usages[:limit]
+	}
+	return usages
 }

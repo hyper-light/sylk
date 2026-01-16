@@ -83,80 +83,103 @@ func (s *Scheduler) Submit(ctx context.Context, dag *DAG, dispatcher NodeDispatc
 		return "", ErrExecutorClosed
 	}
 
-	// Acquire semaphore
+	if err := s.acquireDAGSlot(ctx); err != nil {
+		return "", err
+	}
+
+	if err := s.validateDAG(dag); err != nil {
+		s.releaseDAGSlot()
+		return "", err
+	}
+
+	executor := s.createExecutor(dag)
+	s.registerExecution(dag, executor)
+	s.runExecution(ctx, dag, dispatcher, executor)
+	return dag.ID(), nil
+}
+
+func (s *Scheduler) acquireDAGSlot(ctx context.Context) error {
 	select {
 	case s.dagSem <- struct{}{}:
+		return nil
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return ctx.Err()
 	}
+}
 
-	// Validate DAG
-	if !dag.IsValidated() {
-		if err := ValidateDAG(dag); err != nil {
-			<-s.dagSem
-			return "", err
-		}
+func (s *Scheduler) releaseDAGSlot() {
+	<-s.dagSem
+}
+
+func (s *Scheduler) validateDAG(dag *DAG) error {
+	if dag.IsValidated() {
+		return nil
 	}
+	return ValidateDAG(dag)
+}
 
-	// Create executor with DAG's policy or default
+func (s *Scheduler) createExecutor(dag *DAG) *Executor {
 	policy := dag.Policy()
 	if policy.MaxConcurrency == 0 {
 		policy = s.defaultPolicy
 	}
-
 	executor := NewExecutor(policy)
-
-	// Forward events
 	executor.Subscribe(func(event *Event) {
 		s.emitEvent(event)
 	})
+	return executor
+}
 
-	// Register execution
+func (s *Scheduler) registerExecution(dag *DAG, executor *Executor) {
 	s.mu.Lock()
-	s.executions[dag.ID()] = &Execution{
-		DAG:      dag,
-		Executor: executor,
-	}
+	s.executions[dag.ID()] = &Execution{DAG: dag, Executor: executor}
 	s.mu.Unlock()
+}
 
-	// Execute in background
+func (s *Scheduler) runExecution(ctx context.Context, dag *DAG, dispatcher NodeDispatcher, executor *Executor) {
 	go func() {
-		defer func() {
-			<-s.dagSem
-		}()
+		defer s.releaseDAGSlot()
 
 		result, err := executor.Execute(ctx, dag, dispatcher)
-
-		// Update execution status
-		s.mu.Lock()
-		if exec, ok := s.executions[dag.ID()]; ok {
-			if result != nil {
-				exec.Status = &DAGStatus{
-					ID:             dag.ID(),
-					State:          result.State,
-					Progress:       1.0,
-					NodesTotal:     dag.NodeCount(),
-					NodesCompleted: result.NodesSucceeded + result.NodesFailed + result.NodesSkipped,
-					StartTime:      result.StartTime,
-				}
-			}
-		}
-		s.mu.Unlock()
-
-		// Emit result
-		if err != nil {
-			s.emitEvent(&Event{
-				Type:      EventDAGFailed,
-				DAGID:     dag.ID(),
-				Timestamp: result.EndTime,
-				Data: map[string]any{
-					"error": err.Error(),
-				},
-			})
-		}
+		s.updateExecutionStatus(dag, result)
+		s.emitExecutionFailure(dag, result, err)
 	}()
+}
 
-	return dag.ID(), nil
+func (s *Scheduler) updateExecutionStatus(dag *DAG, result *DAGResult) {
+	if result == nil {
+		return
+	}
+
+	s.mu.Lock()
+	if exec, ok := s.executions[dag.ID()]; ok {
+		exec.Status = &DAGStatus{
+			ID:             dag.ID(),
+			State:          result.State,
+			Progress:       1.0,
+			NodesTotal:     dag.NodeCount(),
+			NodesCompleted: result.NodesSucceeded + result.NodesFailed + result.NodesSkipped,
+			StartTime:      result.StartTime,
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) emitExecutionFailure(dag *DAG, result *DAGResult, err error) {
+	if err == nil {
+		return
+	}
+	if result == nil {
+		return
+	}
+	s.emitEvent(&Event{
+		Type:      EventDAGFailed,
+		DAGID:     dag.ID(),
+		Timestamp: result.EndTime,
+		Data: map[string]any{
+			"error": err.Error(),
+		},
+	})
 }
 
 // SubmitAndWait submits a DAG and waits for completion

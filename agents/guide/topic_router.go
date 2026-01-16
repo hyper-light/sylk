@@ -230,40 +230,59 @@ func (r *TopicRouter) insertPattern(pattern string, sub *topicSubscription) {
 }
 
 func (r *TopicRouter) removePattern(pattern string, subID int64) {
+	node, ok := r.navigateToPatternNode(pattern)
+	if !ok {
+		return
+	}
+
+	r.removeSubscription(node, subID)
+	if len(node.subscriptions) == 0 {
+		node.isTerminal = false
+	}
+}
+
+func (r *TopicRouter) navigateToPatternNode(pattern string) (*trieNode, bool) {
 	segments := splitTopic(pattern)
 	node := r.root
 
 	for _, seg := range segments {
-		switch seg {
-		case "*":
-			if node.singleWildcard == nil {
-				return
-			}
-			node = node.singleWildcard
-		case "**":
-			if node.multiWildcard == nil {
-				return
-			}
-			node = node.multiWildcard
-		default:
-			child, ok := node.children[seg]
-			if !ok {
-				return
-			}
-			node = child
+		next, ok := r.nextPatternNode(node, seg)
+		if !ok {
+			return nil, false
 		}
+		node = next
 	}
 
-	// Remove subscription from terminal node
+	return node, true
+}
+
+func (r *TopicRouter) nextPatternNode(node *trieNode, segment string) (*trieNode, bool) {
+	switch segment {
+	case "*":
+		if node.singleWildcard == nil {
+			return nil, false
+		}
+		return node.singleWildcard, true
+	case "**":
+		if node.multiWildcard == nil {
+			return nil, false
+		}
+		return node.multiWildcard, true
+	default:
+		child, ok := node.children[segment]
+		if !ok {
+			return nil, false
+		}
+		return child, true
+	}
+}
+
+func (r *TopicRouter) removeSubscription(node *trieNode, subID int64) {
 	for i, sub := range node.subscriptions {
 		if sub.id == subID {
 			node.subscriptions = append(node.subscriptions[:i], node.subscriptions[i+1:]...)
-			break
+			return
 		}
-	}
-
-	if len(node.subscriptions) == 0 {
-		node.isTerminal = false
 	}
 }
 
@@ -284,50 +303,49 @@ func (r *TopicRouter) matchRecursive(node *trieNode, segments []string, idx int,
 	if node == nil {
 		return
 	}
-
-	// Check if we've consumed all segments
-	if idx >= len(segments) {
-		if node.isTerminal {
-			for _, sub := range node.subscriptions {
-				if sub.active.Load() {
-					seen[sub.id] = sub
-				}
-			}
-		}
+	if r.matchesAtEnd(node, segments, idx, seen) {
 		return
 	}
-
 	segment := segments[idx]
-
-	// Try exact match
 	if child, ok := node.children[segment]; ok {
 		r.matchRecursive(child, segments, idx+1, seen)
 	}
-
-	// Try single wildcard "*" - matches exactly one segment
 	if node.singleWildcard != nil {
 		r.matchRecursive(node.singleWildcard, segments, idx+1, seen)
 	}
-
-	// Try multi wildcard "**" - matches one or more segments
 	if node.multiWildcard != nil {
-		// ** at end of pattern matches all remaining segments
-		if node.multiWildcard.isTerminal {
-			for _, sub := range node.multiWildcard.subscriptions {
-				if sub.active.Load() {
-					seen[sub.id] = sub
-				}
-			}
-		}
+		r.matchMultiWildcard(node.multiWildcard, segments, idx, seen)
+	}
+}
 
-		// ** can consume current segment and continue matching
-		// Try consuming 1 segment
-		r.matchRecursive(node.multiWildcard, segments, idx+1, seen)
+func (r *TopicRouter) matchesAtEnd(node *trieNode, segments []string, idx int, seen map[int64]*topicSubscription) bool {
+	if idx < len(segments) {
+		return false
+	}
+	if node.isTerminal {
+		r.addActiveSubscriptions(node, seen)
+	}
+	return true
+}
 
-		// ** can also stay in place to match more segments
-		// Try consuming 2+ segments by recursively consuming from multiWildcard
-		for i := idx + 2; i <= len(segments); i++ {
-			r.matchRecursive(node.multiWildcard, segments, i, seen)
+func (r *TopicRouter) matchMultiWildcard(node *trieNode, segments []string, idx int, seen map[int64]*topicSubscription) {
+	if node.isTerminal {
+		r.addActiveSubscriptions(node, seen)
+	}
+	r.matchRecursive(node, segments, idx+1, seen)
+	r.matchMultiWildcardTail(node, segments, idx, seen)
+}
+
+func (r *TopicRouter) matchMultiWildcardTail(node *trieNode, segments []string, idx int, seen map[int64]*topicSubscription) {
+	for i := idx + 2; i <= len(segments); i++ {
+		r.matchRecursive(node, segments, i, seen)
+	}
+}
+
+func (r *TopicRouter) addActiveSubscriptions(node *trieNode, seen map[int64]*topicSubscription) {
+	for _, sub := range node.subscriptions {
+		if sub.active.Load() {
+			seen[sub.id] = sub
 		}
 	}
 }
@@ -442,55 +460,76 @@ func (f *MessageFilter) Matches(msg *Message) bool {
 	if msg == nil {
 		return false
 	}
+	if !f.matchesSession(msg) {
+		return false
+	}
+	if !f.matchesMessageType(msg) {
+		return false
+	}
+	if !f.matchesPriority(msg) {
+		return false
+	}
+	if !f.matchesSourceAgent(msg) {
+		return false
+	}
+	if !f.matchesTargetAgent(msg) {
+		return false
+	}
+	return f.matchesPredicate(msg)
+}
 
-	// Filter by session ID (from metadata)
-	if f.SessionID != "" {
-		if msg.Metadata == nil {
-			return false
-		}
-		if sessID, ok := msg.Metadata["session_id"].(string); !ok || sessID != f.SessionID {
-			return false
+func (f *MessageFilter) matchesSession(msg *Message) bool {
+	if f.SessionID == "" {
+		return true
+	}
+	if msg.Metadata == nil {
+		return false
+	}
+	sessID, ok := msg.Metadata["session_id"].(string)
+	return ok && sessID == f.SessionID
+}
+
+func (f *MessageFilter) matchesMessageType(msg *Message) bool {
+	if len(f.MessageTypes) == 0 {
+		return true
+	}
+	for _, t := range f.MessageTypes {
+		if msg.Type == t {
+			return true
 		}
 	}
+	return false
+}
 
-	// Filter by message type
-	if len(f.MessageTypes) > 0 {
-		found := false
-		for _, t := range f.MessageTypes {
-			if msg.Type == t {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-
-	// Filter by priority range
+func (f *MessageFilter) matchesPriority(msg *Message) bool {
 	if f.MinPriority != nil && msg.Priority < *f.MinPriority {
 		return false
 	}
 	if f.MaxPriority != nil && msg.Priority > *f.MaxPriority {
 		return false
 	}
-
-	// Filter by source agent
-	if f.SourceAgentID != "" && msg.SourceAgentID != f.SourceAgentID {
-		return false
-	}
-
-	// Filter by target agent
-	if f.TargetAgentID != "" && msg.TargetAgentID != f.TargetAgentID {
-		return false
-	}
-
-	// Apply custom predicate
-	if f.Predicate != nil && !f.Predicate(msg) {
-		return false
-	}
-
 	return true
+}
+
+func (f *MessageFilter) matchesSourceAgent(msg *Message) bool {
+	if f.SourceAgentID == "" {
+		return true
+	}
+	return msg.SourceAgentID == f.SourceAgentID
+}
+
+func (f *MessageFilter) matchesTargetAgent(msg *Message) bool {
+	if f.TargetAgentID == "" {
+		return true
+	}
+	return msg.TargetAgentID == f.TargetAgentID
+}
+
+func (f *MessageFilter) matchesPredicate(msg *Message) bool {
+	if f.Predicate == nil {
+		return true
+	}
+	return f.Predicate(msg)
 }
 
 // FilteredHandler wraps a handler with a filter

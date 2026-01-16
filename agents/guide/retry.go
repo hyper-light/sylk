@@ -84,38 +84,51 @@ func Retry[T any](ctx context.Context, policy RetryPolicy, operation func(ctx co
 	var zero T
 
 	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
-		// Check context before each attempt
-		if ctx.Err() != nil {
-			return RetryResult[T]{Value: zero, Attempts: attempt, Err: ctx.Err()}
+		retryResult, done := retryOnce(ctx, policy, operation, attempt, zero)
+		if done {
+			return retryResult
 		}
-
-		// Execute operation
-		result, err := operation(ctx, attempt)
-		if err == nil {
-			return RetryResult[T]{Value: result, Attempts: attempt, Err: nil}
-		}
-
-		lastErr = err
-
-		// Check if error is retryable
-		if policy.RetryableErrors != nil && !policy.RetryableErrors(err) {
-			return RetryResult[T]{Value: zero, Attempts: attempt, Err: err}
-		}
-
-		// Don't sleep after last attempt
-		if attempt < policy.MaxAttempts {
-			delay := calculateDelay(policy, attempt)
-
-			select {
-			case <-ctx.Done():
-				return RetryResult[T]{Value: zero, Attempts: attempt, Err: ctx.Err()}
-			case <-time.After(delay):
-				// Continue to next attempt
-			}
-		}
+		lastErr = retryResult.Err
 	}
 
 	return RetryResult[T]{Value: zero, Attempts: policy.MaxAttempts, Err: lastErr}
+}
+
+func retryOnce[T any](ctx context.Context, policy RetryPolicy, operation func(context.Context, int) (T, error), attempt int, zero T) (RetryResult[T], bool) {
+	if ctx.Err() != nil {
+		return RetryResult[T]{Value: zero, Attempts: attempt, Err: ctx.Err()}, true
+	}
+
+	result, err := operation(ctx, attempt)
+	if err == nil {
+		return RetryResult[T]{Value: result, Attempts: attempt, Err: nil}, true
+	}
+
+	if shouldStopRetry(policy, err, attempt) {
+		return RetryResult[T]{Value: zero, Attempts: attempt, Err: err}, true
+	}
+
+	if err := waitForRetry(ctx, calculateDelay(policy, attempt)); err != nil {
+		return RetryResult[T]{Value: zero, Attempts: attempt, Err: err}, true
+	}
+
+	return RetryResult[T]{Value: zero, Attempts: attempt, Err: err}, false
+}
+
+func shouldStopRetry(policy RetryPolicy, err error, attempt int) bool {
+	if policy.RetryableErrors != nil && !policy.RetryableErrors(err) {
+		return true
+	}
+	return attempt >= policy.MaxAttempts
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(delay):
+		return nil
+	}
 }
 
 // RetryVoid executes an operation that returns no value with retry logic
@@ -265,57 +278,82 @@ func (q *RetryQueue) processLoop() {
 // processRetries attempts to retry pending requests
 func (q *RetryQueue) processRetries() {
 	now := time.Now()
+	toRetry, toRemove := q.collectRetryCandidates(now)
+
+	q.processRetryBatch(now, toRetry)
+	q.removeRequests(toRemove)
+}
+
+func (q *RetryQueue) collectRetryCandidates(now time.Time) ([]*RetryableRequest, []string) {
 	var toRetry []*RetryableRequest
 	var toRemove []string
 
-	// Find requests ready to retry
 	q.mu.RLock()
 	for id, req := range q.requests {
 		if now.After(req.NextAttempt) {
 			toRetry = append(toRetry, req)
 		}
-		// Check if exceeded max attempts
 		if req.Attempts >= req.Policy.MaxAttempts {
 			toRemove = append(toRemove, id)
 		}
 	}
 	q.mu.RUnlock()
 
-	// Process retries
+	return toRetry, toRemove
+}
+
+func (q *RetryQueue) processRetryBatch(now time.Time, toRetry []*RetryableRequest) {
 	for _, req := range toRetry {
 		if req.Attempts >= req.Policy.MaxAttempts {
 			continue
 		}
-
-		// Attempt retry
 		err := q.bus.Publish(req.Topic, req.Message)
+		q.updateRequestAfterPublish(now, req, err)
+	}
+}
 
-		q.mu.Lock()
-		if r, ok := q.requests[req.ID]; ok {
-			r.Attempts++
-			r.LastAttempt = now
-			r.LastError = err
+func (q *RetryQueue) updateRequestAfterPublish(now time.Time, req *RetryableRequest, publishErr error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-			if err != nil {
-				// Schedule next retry
-				delay := calculateDelay(r.Policy, r.Attempts+1)
-				r.NextAttempt = now.Add(delay)
-			} else {
-				// Success - remove from queue
-				delete(q.requests, req.ID)
-			}
-
-			// Check if exhausted
-			if r.Attempts >= r.Policy.MaxAttempts && r.OnFailure != nil {
-				go r.OnFailure(r)
-			}
-		}
-		q.mu.Unlock()
+	record, ok := q.requests[req.ID]
+	if !ok {
+		return
 	}
 
-	// Remove exhausted requests
+	record.Attempts++
+	record.LastAttempt = now
+	record.LastError = publishErr
+
+	if publishErr != nil {
+		q.scheduleNextAttempt(now, record)
+		return
+	}
+
+	delete(q.requests, req.ID)
+}
+
+func (q *RetryQueue) scheduleNextAttempt(now time.Time, req *RetryableRequest) {
+	delay := calculateDelay(req.Policy, req.Attempts+1)
+	req.NextAttempt = now.Add(delay)
+
+	if req.Attempts >= req.Policy.MaxAttempts {
+		q.triggerFailureCallback(req)
+	}
+}
+
+func (q *RetryQueue) triggerFailureCallback(req *RetryableRequest) {
+	if req.Attempts >= req.Policy.MaxAttempts && req.OnFailure != nil {
+		go req.OnFailure(req)
+	}
+}
+
+func (q *RetryQueue) removeRequests(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
 	q.mu.Lock()
-	for _, id := range toRemove {
+	for _, id := range ids {
 		delete(q.requests, id)
 	}
 	q.mu.Unlock()

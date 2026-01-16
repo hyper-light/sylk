@@ -133,44 +133,63 @@ func (ci *CapabilityIndex) Remove(agentID string) {
 
 // removeUnlocked removes an agent without holding the lock
 func (ci *CapabilityIndex) removeUnlocked(agentID string) {
-	agent, ok := ci.agents[agentID]
-	if !ok {
+	if _, ok := ci.agents[agentID]; !ok {
 		return
 	}
 
-	// Remove from intent index
+	ci.removeIntent(agentID)
+	ci.removeDomain(agentID)
+	ci.removeTags(agentID)
+	ci.removeKeywords(agentID)
+	ci.removePatterns(agentID)
+	ci.removeAgentRecord(agentID)
+	ci.updateStats()
+}
+
+func (ci *CapabilityIndex) removeIntent(agentID string) {
+	ci.removeIntentIndex(agentID)
+}
+
+func (ci *CapabilityIndex) removeDomain(agentID string) {
+	ci.removeDomainIndex(agentID)
+}
+
+func (ci *CapabilityIndex) removeTags(agentID string) {
+	ci.removeStringIndex(agentID, ci.byTag)
+}
+
+func (ci *CapabilityIndex) removeKeywords(agentID string) {
+	ci.removeStringIndex(agentID, ci.byKeyword)
+}
+
+func (ci *CapabilityIndex) removeIntentIndex(agentID string) {
 	for intent, agents := range ci.byIntent {
 		ci.byIntent[intent] = removeAgent(agents, agentID)
 		if len(ci.byIntent[intent]) == 0 {
 			delete(ci.byIntent, intent)
 		}
 	}
+}
 
-	// Remove from domain index
+func (ci *CapabilityIndex) removeDomainIndex(agentID string) {
 	for domain, agents := range ci.byDomain {
 		ci.byDomain[domain] = removeAgent(agents, agentID)
 		if len(ci.byDomain[domain]) == 0 {
 			delete(ci.byDomain, domain)
 		}
 	}
+}
 
-	// Remove from tag index
-	for tag, agents := range ci.byTag {
-		ci.byTag[tag] = removeAgent(agents, agentID)
-		if len(ci.byTag[tag]) == 0 {
-			delete(ci.byTag, tag)
+func (ci *CapabilityIndex) removeStringIndex(agentID string, index map[string][]*AgentRegistration) {
+	for key, agents := range index {
+		index[key] = removeAgent(agents, agentID)
+		if len(index[key]) == 0 {
+			delete(index, key)
 		}
 	}
+}
 
-	// Remove from keyword index
-	for keyword, agents := range ci.byKeyword {
-		ci.byKeyword[keyword] = removeAgent(agents, agentID)
-		if len(ci.byKeyword[keyword]) == 0 {
-			delete(ci.byKeyword, keyword)
-		}
-	}
-
-	// Remove patterns
+func (ci *CapabilityIndex) removePatterns(agentID string) {
 	newPatterns := make([]*patternEntry, 0, len(ci.patterns))
 	for _, entry := range ci.patterns {
 		if entry.agent.ID != agentID {
@@ -178,19 +197,19 @@ func (ci *CapabilityIndex) removeUnlocked(agentID string) {
 		}
 	}
 	ci.patterns = newPatterns
+}
 
-	// Remove from agents map
+func (ci *CapabilityIndex) removeAgentRecord(agentID string) {
 	delete(ci.agents, agentID)
+}
 
-	// Update stats
+func (ci *CapabilityIndex) updateStats() {
 	ci.stats.TotalAgents = len(ci.agents)
 	ci.stats.IntentCount = len(ci.byIntent)
 	ci.stats.DomainCount = len(ci.byDomain)
 	ci.stats.TagCount = len(ci.byTag)
 	ci.stats.KeywordCount = len(ci.byKeyword)
 	ci.stats.PatternCount = len(ci.patterns)
-
-	_ = agent // Suppress unused warning
 }
 
 // removeAgent removes an agent from a slice by ID
@@ -322,70 +341,92 @@ func (ci *CapabilityIndex) FindBestMatch(result *RouteResult) *AgentRegistration
 
 	ci.stats.TotalLookups++
 
-	var candidates []*AgentRegistration
+	candidates := ci.collectCandidates(result)
+	scoredCandidates := ci.scoreCandidates(candidates, result)
+	return ci.pickBestCandidate(scoredCandidates)
+}
 
-	// Start with intent matches
-	if intentAgents, ok := ci.byIntent[result.Intent]; ok {
+type scoredAgent struct {
+	agent *AgentRegistration
+	score int
+}
+
+func (ci *CapabilityIndex) collectCandidates(result *RouteResult) []*AgentRegistration {
+	candidates := make([]*AgentRegistration, 0)
+	candidates = ci.appendIntentCandidates(candidates, result.Intent)
+	candidates = ci.appendDomainCandidates(candidates, result.Domain)
+	candidates = ci.appendUniversalCandidates(candidates)
+	return candidates
+}
+
+func (ci *CapabilityIndex) appendIntentCandidates(candidates []*AgentRegistration, intent Intent) []*AgentRegistration {
+	if intentAgents, ok := ci.byIntent[intent]; ok {
 		candidates = append(candidates, intentAgents...)
 	}
+	return candidates
+}
 
-	// Add domain matches
-	if domainAgents, ok := ci.byDomain[result.Domain]; ok {
-		for _, agent := range domainAgents {
-			found := false
-			for _, c := range candidates {
-				if c.ID == agent.ID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				candidates = append(candidates, agent)
-			}
-		}
+func (ci *CapabilityIndex) appendDomainCandidates(candidates []*AgentRegistration, domain Domain) []*AgentRegistration {
+	domainAgents, ok := ci.byDomain[domain]
+	if !ok {
+		return candidates
 	}
+	return ci.appendUniqueCandidates(candidates, domainAgents)
+}
 
-	// Add universal agents (those without specific intent/domain restrictions)
+func (ci *CapabilityIndex) appendUniversalCandidates(candidates []*AgentRegistration) []*AgentRegistration {
 	for _, agent := range ci.agents {
-		if len(agent.Capabilities.Intents) == 0 && len(agent.Capabilities.Domains) == 0 {
-			found := false
-			for _, c := range candidates {
-				if c.ID == agent.ID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				candidates = append(candidates, agent)
-			}
+		if ci.isUniversalAgent(agent) {
+			candidates = ci.appendIfMissing(candidates, agent)
 		}
 	}
+	return candidates
+}
 
-	// Score and sort candidates
-	type scored struct {
-		agent *AgentRegistration
-		score int
+func (ci *CapabilityIndex) appendUniqueCandidates(candidates []*AgentRegistration, additions []*AgentRegistration) []*AgentRegistration {
+	for _, agent := range additions {
+		candidates = ci.appendIfMissing(candidates, agent)
 	}
-	scoredCandidates := make([]scored, 0, len(candidates))
+	return candidates
+}
 
+func (ci *CapabilityIndex) appendIfMissing(candidates []*AgentRegistration, agent *AgentRegistration) []*AgentRegistration {
+	if ci.hasCandidate(candidates, agent.ID) {
+		return candidates
+	}
+	return append(candidates, agent)
+}
+
+func (ci *CapabilityIndex) hasCandidate(candidates []*AgentRegistration, agentID string) bool {
+	for _, candidate := range candidates {
+		if candidate.ID == agentID {
+			return true
+		}
+	}
+	return false
+}
+
+func (ci *CapabilityIndex) isUniversalAgent(agent *AgentRegistration) bool {
+	return len(agent.Capabilities.Intents) == 0 && len(agent.Capabilities.Domains) == 0
+}
+
+func (ci *CapabilityIndex) scoreCandidates(candidates []*AgentRegistration, result *RouteResult) []scoredAgent {
+	scored := make([]scoredAgent, 0, len(candidates))
 	for _, agent := range candidates {
 		if agent.Accepts(result) {
-			scoredCandidates = append(scoredCandidates, scored{
-				agent: agent,
-				score: agent.MatchScore(result),
-			})
+			scored = append(scored, scoredAgent{agent: agent, score: agent.MatchScore(result)})
 		}
 	}
+	return scored
+}
 
+func (ci *CapabilityIndex) pickBestCandidate(scoredCandidates []scoredAgent) *AgentRegistration {
 	if len(scoredCandidates) == 0 {
 		return nil
 	}
-
-	// Sort by score descending
 	sort.Slice(scoredCandidates, func(i, j int) bool {
 		return scoredCandidates[i].score > scoredCandidates[j].score
 	})
-
 	return scoredCandidates[0].agent
 }
 
@@ -396,69 +437,112 @@ func (ci *CapabilityIndex) FindAll(query CapabilityQuery) []*AgentRegistration {
 
 	ci.stats.TotalLookups++
 
-	// Start with all agents if no filters
-	candidates := make(map[string]*AgentRegistration)
+	candidates := ci.initCandidates(query)
+	candidates = ci.filterByDomain(candidates, query.Domain)
+	candidates = ci.filterByTags(candidates, query.Tags)
+	candidates = ci.filterByTemporalFocus(candidates, query.TemporalFocus)
 
-	// Filter by intent
-	if query.Intent != "" {
-		if agents, ok := ci.byIntent[query.Intent]; ok {
-			for _, agent := range agents {
-				candidates[agent.ID] = agent
-			}
-		} else {
-			// Include universal agents
-			for id, agent := range ci.agents {
-				if len(agent.Capabilities.Intents) == 0 {
-					candidates[id] = agent
-				}
-			}
-		}
-	} else {
-		// No intent filter, start with all
-		for id, agent := range ci.agents {
+	return ci.sortCandidates(candidates)
+}
+
+func (ci *CapabilityIndex) initCandidates(query CapabilityQuery) map[string]*AgentRegistration {
+	if query.Intent == "" {
+		return ci.allAgents()
+	}
+	return ci.intentCandidates(query.Intent)
+}
+
+func (ci *CapabilityIndex) allAgents() map[string]*AgentRegistration {
+	candidates := make(map[string]*AgentRegistration, len(ci.agents))
+	for id, agent := range ci.agents {
+		candidates[id] = agent
+	}
+	return candidates
+}
+
+func (ci *CapabilityIndex) intentCandidates(intent Intent) map[string]*AgentRegistration {
+	candidates := make(map[string]*AgentRegistration)
+	agents, ok := ci.byIntent[intent]
+	if ok {
+		ci.addAgents(candidates, agents)
+		return candidates
+	}
+	ci.addUniversalIntentCandidates(candidates)
+	return candidates
+}
+
+func (ci *CapabilityIndex) addAgents(candidates map[string]*AgentRegistration, agents []*AgentRegistration) {
+	for _, agent := range agents {
+		candidates[agent.ID] = agent
+	}
+}
+
+func (ci *CapabilityIndex) addUniversalIntentCandidates(candidates map[string]*AgentRegistration) {
+	for id, agent := range ci.agents {
+		if len(agent.Capabilities.Intents) == 0 {
 			candidates[id] = agent
 		}
 	}
+}
 
-	// Filter by domain
-	if query.Domain != "" {
-		filtered := make(map[string]*AgentRegistration)
-		for id, agent := range candidates {
-			if agent.Capabilities.SupportsDomain(query.Domain) {
-				filtered[id] = agent
+func (ci *CapabilityIndex) filterByDomain(candidates map[string]*AgentRegistration, domain Domain) map[string]*AgentRegistration {
+	if domain == "" {
+		return candidates
+	}
+	filtered := make(map[string]*AgentRegistration)
+	for id, agent := range candidates {
+		if agent.Capabilities.SupportsDomain(domain) {
+			filtered[id] = agent
+		}
+	}
+	return filtered
+}
+
+func (ci *CapabilityIndex) filterByTags(candidates map[string]*AgentRegistration, tags []string) map[string]*AgentRegistration {
+	if len(tags) == 0 {
+		return candidates
+	}
+	filtered := make(map[string]*AgentRegistration)
+	for id, agent := range candidates {
+		if ci.matchesAnyTag(agent, tags) {
+			filtered[id] = agent
+		}
+	}
+	return filtered
+}
+
+func (ci *CapabilityIndex) matchesAnyTag(agent *AgentRegistration, tags []string) bool {
+	for _, requiredTag := range tags {
+		for _, agentTag := range agent.Capabilities.Tags {
+			if strings.EqualFold(agentTag, requiredTag) {
+				return true
 			}
 		}
-		candidates = filtered
 	}
+	return false
+}
 
-	// Filter by tags
-	if len(query.Tags) > 0 {
-		filtered := make(map[string]*AgentRegistration)
-		for id, agent := range candidates {
-			for _, requiredTag := range query.Tags {
-				for _, agentTag := range agent.Capabilities.Tags {
-					if strings.EqualFold(agentTag, requiredTag) {
-						filtered[id] = agent
-						break
-					}
-				}
-			}
+func (ci *CapabilityIndex) filterByTemporalFocus(candidates map[string]*AgentRegistration, focus TemporalFocus) map[string]*AgentRegistration {
+	if focus == "" {
+		return candidates
+	}
+	filtered := make(map[string]*AgentRegistration)
+	for id, agent := range candidates {
+		if ci.matchesTemporalFocus(agent, focus) {
+			filtered[id] = agent
 		}
-		candidates = filtered
 	}
+	return filtered
+}
 
-	// Filter by temporal focus
-	if query.TemporalFocus != "" {
-		filtered := make(map[string]*AgentRegistration)
-		for id, agent := range candidates {
-			if agent.Constraints.TemporalFocus == "" || agent.Constraints.TemporalFocus == query.TemporalFocus {
-				filtered[id] = agent
-			}
-		}
-		candidates = filtered
+func (ci *CapabilityIndex) matchesTemporalFocus(agent *AgentRegistration, focus TemporalFocus) bool {
+	if agent.Constraints.TemporalFocus == "" {
+		return true
 	}
+	return agent.Constraints.TemporalFocus == focus
+}
 
-	// Convert to slice and sort by priority
+func (ci *CapabilityIndex) sortCandidates(candidates map[string]*AgentRegistration) []*AgentRegistration {
 	result := make([]*AgentRegistration, 0, len(candidates))
 	for _, agent := range candidates {
 		result = append(result, agent)

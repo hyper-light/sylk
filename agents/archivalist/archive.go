@@ -323,49 +323,72 @@ func (a *Archive) ArchiveEntry(entry *Entry) error {
 
 // ArchiveEntries stores multiple entries in a transaction
 func (a *Archive) ArchiveEntries(entries []*Entry) error {
-	tx, err := a.db.Begin()
+	tx, stmt, err := a.prepareArchiveEntriesTx()
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return err
 	}
 	defer tx.Rollback()
+	defer stmt.Close()
 
+	now := time.Now()
+	for _, entry := range entries {
+		if err := a.archiveEntry(stmt, entry, now); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (a *Archive) prepareArchiveEntriesTx() (*sql.Tx, *sql.Stmt, error) {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
 	stmt, err := tx.Prepare(`
 		INSERT OR REPLACE INTO entries
 		(id, category, title, content, source, session_id, created_at, updated_at, archived_at, tokens_estimate, metadata, related_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare statement: %w", err)
+		return nil, nil, fmt.Errorf("failed to prepare statement: %w", err)
 	}
-	defer stmt.Close()
+	return tx, stmt, nil
+}
 
-	now := time.Now()
-	for _, entry := range entries {
-		if entry.ArchivedAt == nil {
-			entry.ArchivedAt = &now
-		}
-
-		metadata, err := json.Marshal(entry.Metadata)
-		if err != nil {
-			return fmt.Errorf("failed to marshal metadata: %w", err)
-		}
-
-		relatedIDs, err := json.Marshal(entry.RelatedIDs)
-		if err != nil {
-			return fmt.Errorf("failed to marshal related IDs: %w", err)
-		}
-
-		_, err = stmt.Exec(
-			entry.ID, entry.Category, entry.Title, entry.Content, entry.Source,
-			entry.SessionID, entry.CreatedAt, entry.UpdatedAt, entry.ArchivedAt,
-			entry.TokensEstimate, metadata, relatedIDs,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to archive entry %s: %w", entry.ID, err)
-		}
+func (a *Archive) archiveEntry(stmt *sql.Stmt, entry *Entry, now time.Time) error {
+	if entry.ArchivedAt == nil {
+		entry.ArchivedAt = &now
 	}
 
-	return tx.Commit()
+	metadata, relatedIDs, err := marshalEntryFields(entry)
+	if err != nil {
+		return err
+	}
+
+	_, err = stmt.Exec(
+		entry.ID, entry.Category, entry.Title, entry.Content, entry.Source,
+		entry.SessionID, entry.CreatedAt, entry.UpdatedAt, entry.ArchivedAt,
+		entry.TokensEstimate, metadata, relatedIDs,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to archive entry %s: %w", entry.ID, err)
+	}
+	return nil
+}
+
+func marshalEntryFields(entry *Entry) ([]byte, []byte, error) {
+	metadata, err := json.Marshal(entry.Metadata)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	relatedIDs, err := json.Marshal(entry.RelatedIDs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal related IDs: %w", err)
+	}
+
+	return metadata, relatedIDs, nil
 }
 
 // SaveSession saves or updates a session record
@@ -422,15 +445,33 @@ func (a *Archive) Query(q ArchiveQuery) ([]*Entry, error) {
 }
 
 func (a *Archive) buildSelectQuery(conditions []string, limit int) string {
-	query := "SELECT id, category, title, content, source, session_id, created_at, updated_at, archived_at, tokens_estimate, metadata, related_ids FROM entries WHERE 1=1"
-	for _, cond := range conditions {
-		query += " AND " + cond
-	}
-	query += " ORDER BY created_at DESC"
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+	query := baseEntrySelectQuery()
+	query = addEntryConditions(query, conditions)
+	query = addEntryOrder(query)
+	query = addEntryLimit(query, limit)
+	return query
+}
+
+func baseEntrySelectQuery() string {
+	return "SELECT id, category, title, content, source, session_id, created_at, updated_at, archived_at, tokens_estimate, metadata, related_ids FROM entries WHERE 1=1"
+}
+
+func addEntryConditions(query string, conditions []string) string {
+	for _, condition := range conditions {
+		query += " AND " + condition
 	}
 	return query
+}
+
+func addEntryOrder(query string) string {
+	return query + " ORDER BY created_at DESC"
+}
+
+func addEntryLimit(query string, limit int) string {
+	if limit <= 0 {
+		return query
+	}
+	return query + fmt.Sprintf(" LIMIT %d", limit)
 }
 
 func (a *Archive) executeQuery(query string, args []interface{}) ([]*Entry, error) {
@@ -440,11 +481,50 @@ func (a *Archive) executeQuery(query string, args []interface{}) ([]*Entry, erro
 	}
 	defer rows.Close()
 
+	entries, err := scanEntryRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan entry: %w", err)
+	}
+	return entries, nil
+}
+
+// SearchText performs full-text search on archived entries
+func (a *Archive) SearchText(searchText string, limit int) ([]*Entry, error) {
+	query := entrySearchQuery(limit)
+	rows, err := a.db.Query(query, searchText)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search entries: %w", err)
+	}
+	defer rows.Close()
+
+	entries, err := scanEntryRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan entry: %w", err)
+	}
+	return entries, nil
+}
+
+func entrySearchQuery(limit int) string {
+	query := `
+		SELECT e.id, e.category, e.title, e.content, e.source, e.session_id,
+		       e.created_at, e.updated_at, e.archived_at, e.tokens_estimate, e.metadata, e.related_ids
+		FROM entries e
+		JOIN entries_fts fts ON e.id = fts.id
+		WHERE entries_fts MATCH ?
+		ORDER BY rank
+	`
+	if limit <= 0 {
+		return query
+	}
+	return query + fmt.Sprintf(" LIMIT %d", limit)
+}
+
+func scanEntryRows(rows *sql.Rows) ([]*Entry, error) {
 	var entries []*Entry
 	for rows.Next() {
 		entry, err := scanEntry(rows)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan entry: %w", err)
+			return nil, err
 		}
 		entries = append(entries, entry)
 	}
@@ -467,38 +547,6 @@ func sourcesToStrings(sources []SourceModel) []string {
 	return result
 }
 
-// SearchText performs full-text search on archived entries
-func (a *Archive) SearchText(searchText string, limit int) ([]*Entry, error) {
-	query := `
-		SELECT e.id, e.category, e.title, e.content, e.source, e.session_id,
-		       e.created_at, e.updated_at, e.archived_at, e.tokens_estimate, e.metadata, e.related_ids
-		FROM entries e
-		JOIN entries_fts fts ON e.id = fts.id
-		WHERE entries_fts MATCH ?
-		ORDER BY rank
-	`
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-	}
-
-	rows, err := a.db.Query(query, searchText)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search entries: %w", err)
-	}
-	defer rows.Close()
-
-	var entries []*Entry
-	for rows.Next() {
-		entry, err := scanEntry(rows)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan entry: %w", err)
-		}
-		entries = append(entries, entry)
-	}
-
-	return entries, rows.Err()
-}
-
 // GetEntry retrieves a single entry by ID
 func (a *Archive) GetEntry(id string) (*Entry, error) {
 	row := a.db.QueryRow(`
@@ -517,38 +565,17 @@ func (a *Archive) GetSession(id string) (*Session, error) {
 		FROM sessions WHERE id = ?
 	`, id)
 
-	var session Session
-	var endedAt sql.NullTime
-	var summary, primaryFocus sql.NullString
-
-	err := row.Scan(&session.ID, &session.StartedAt, &endedAt, &summary, &primaryFocus, &session.EntryCount)
+	session, data, err := scanSessionRow(row)
 	if err != nil {
 		return nil, err
 	}
-
-	if endedAt.Valid {
-		session.EndedAt = &endedAt.Time
-	}
-	if summary.Valid {
-		session.Summary = summary.String
-	}
-	if primaryFocus.Valid {
-		session.PrimaryFocus = primaryFocus.String
-	}
-
-	return &session, nil
+	applySessionRow(session, data)
+	return session, nil
 }
 
 // GetRecentSessions retrieves the most recent sessions
 func (a *Archive) GetRecentSessions(limit int) ([]*Session, error) {
-	query := `
-		SELECT id, started_at, ended_at, summary, primary_focus, entry_count
-		FROM sessions ORDER BY started_at DESC
-	`
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-	}
-
+	query := recentSessionsQuery(limit)
 	rows, err := a.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -557,29 +584,57 @@ func (a *Archive) GetRecentSessions(limit int) ([]*Session, error) {
 
 	var sessions []*Session
 	for rows.Next() {
-		var session Session
-		var endedAt sql.NullTime
-		var summary, primaryFocus sql.NullString
-
-		err := rows.Scan(&session.ID, &session.StartedAt, &endedAt, &summary, &primaryFocus, &session.EntryCount)
+		session, data, err := scanSessionRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if endedAt.Valid {
-			session.EndedAt = &endedAt.Time
-		}
-		if summary.Valid {
-			session.Summary = summary.String
-		}
-		if primaryFocus.Valid {
-			session.PrimaryFocus = primaryFocus.String
-		}
-
-		sessions = append(sessions, &session)
+		applySessionRow(session, data)
+		sessions = append(sessions, session)
 	}
 
 	return sessions, rows.Err()
+}
+
+func recentSessionsQuery(limit int) string {
+	query := `
+		SELECT id, started_at, ended_at, summary, primary_focus, entry_count
+		FROM sessions ORDER BY started_at DESC
+	`
+	if limit <= 0 {
+		return query
+	}
+	return query + fmt.Sprintf(" LIMIT %d", limit)
+}
+
+type sessionRowData struct {
+	endedAt      sql.NullTime
+	summary      sql.NullString
+	primaryFocus sql.NullString
+}
+
+func scanSessionRow(scanner interface {
+	Scan(dest ...interface{}) error
+}) (*Session, sessionRowData, error) {
+	var session Session
+	var data sessionRowData
+
+	err := scanner.Scan(&session.ID, &session.StartedAt, &data.endedAt, &data.summary, &data.primaryFocus, &session.EntryCount)
+	if err != nil {
+		return nil, sessionRowData{}, err
+	}
+	return &session, data, nil
+}
+
+func applySessionRow(session *Session, data sessionRowData) {
+	if data.endedAt.Valid {
+		session.EndedAt = &data.endedAt.Time
+	}
+	if data.summary.Valid {
+		session.Summary = data.summary.String
+	}
+	if data.primaryFocus.Valid {
+		session.PrimaryFocus = data.primaryFocus.String
+	}
 }
 
 // SaveLink saves a relationship between entries
@@ -620,104 +675,122 @@ func (a *Archive) GetRelatedEntries(entryID string) ([]*Entry, error) {
 // Stats returns statistics about the archive
 func (a *Archive) Stats() (map[string]int, error) {
 	stats := make(map[string]int)
-
-	// Total entries
-	var total int
-	err := a.db.QueryRow("SELECT COUNT(*) FROM entries").Scan(&total)
-	if err != nil {
+	if err := a.addTotalEntries(stats); err != nil {
 		return nil, err
+	}
+	if err := a.addTotalSessions(stats); err != nil {
+		return nil, err
+	}
+	if err := a.addCategoryCounts(stats); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func (a *Archive) addTotalEntries(stats map[string]int) error {
+	var total int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM entries").Scan(&total); err != nil {
+		return err
 	}
 	stats["total_entries"] = total
+	return nil
+}
 
-	// Total sessions
+func (a *Archive) addTotalSessions(stats map[string]int) error {
 	var sessions int
-	err = a.db.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&sessions)
-	if err != nil {
-		return nil, err
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&sessions); err != nil {
+		return err
 	}
 	stats["total_sessions"] = sessions
+	return nil
+}
 
-	// Entries by category
+func (a *Archive) addCategoryCounts(stats map[string]int) error {
 	rows, err := a.db.Query("SELECT category, COUNT(*) FROM entries GROUP BY category")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var category string
-		var count int
-		if err := rows.Scan(&category, &count); err != nil {
-			return nil, err
+		category, count, err := scanCategoryCount(rows)
+		if err != nil {
+			return err
 		}
 		stats["category_"+category] = count
 	}
+	return rows.Err()
+}
 
-	return stats, rows.Err()
+func scanCategoryCount(scanner interface {
+	Scan(dest ...interface{}) error
+}) (string, int, error) {
+	var category string
+	var count int
+	if err := scanner.Scan(&category, &count); err != nil {
+		return "", 0, err
+	}
+	return category, count, nil
 }
 
 // Helper functions
 
-func scanEntry(rows *sql.Rows) (*Entry, error) {
-	var entry Entry
-	var archivedAt sql.NullTime
-	var title sql.NullString
-	var metadataJSON, relatedIDsJSON []byte
+type entryRowData struct {
+	title      sql.NullString
+	archivedAt sql.NullTime
+	metadata   []byte
+	relatedIDs []byte
+}
 
-	err := rows.Scan(
-		&entry.ID, &entry.Category, &title, &entry.Content, &entry.Source,
-		&entry.SessionID, &entry.CreatedAt, &entry.UpdatedAt, &archivedAt,
-		&entry.TokensEstimate, &metadataJSON, &relatedIDsJSON,
-	)
+func scanEntry(rows *sql.Rows) (*Entry, error) {
+	entry, data, err := scanEntryData(rows)
 	if err != nil {
 		return nil, err
 	}
-
-	if title.Valid {
-		entry.Title = title.String
-	}
-	if archivedAt.Valid {
-		entry.ArchivedAt = &archivedAt.Time
-	}
-	if len(metadataJSON) > 0 {
-		json.Unmarshal(metadataJSON, &entry.Metadata)
-	}
-	if len(relatedIDsJSON) > 0 {
-		json.Unmarshal(relatedIDsJSON, &entry.RelatedIDs)
-	}
-
-	return &entry, nil
+	applyEntryRow(entry, data)
+	return entry, nil
 }
 
 func scanEntryRow(row *sql.Row) (*Entry, error) {
-	var entry Entry
-	var archivedAt sql.NullTime
-	var title sql.NullString
-	var metadataJSON, relatedIDsJSON []byte
-
-	err := row.Scan(
-		&entry.ID, &entry.Category, &title, &entry.Content, &entry.Source,
-		&entry.SessionID, &entry.CreatedAt, &entry.UpdatedAt, &archivedAt,
-		&entry.TokensEstimate, &metadataJSON, &relatedIDsJSON,
-	)
+	entry, data, err := scanEntryData(row)
 	if err != nil {
 		return nil, err
 	}
+	applyEntryRow(entry, data)
+	return entry, nil
+}
 
-	if title.Valid {
-		entry.Title = title.String
-	}
-	if archivedAt.Valid {
-		entry.ArchivedAt = &archivedAt.Time
-	}
-	if len(metadataJSON) > 0 {
-		json.Unmarshal(metadataJSON, &entry.Metadata)
-	}
-	if len(relatedIDsJSON) > 0 {
-		json.Unmarshal(relatedIDsJSON, &entry.RelatedIDs)
+func scanEntryData(scanner interface {
+	Scan(dest ...interface{}) error
+}) (*Entry, entryRowData, error) {
+	var entry Entry
+	var data entryRowData
+
+	err := scanner.Scan(
+		&entry.ID, &entry.Category, &data.title, &entry.Content, &entry.Source,
+		&entry.SessionID, &entry.CreatedAt, &entry.UpdatedAt, &data.archivedAt,
+		&entry.TokensEstimate, &data.metadata, &data.relatedIDs,
+	)
+	if err != nil {
+		return nil, entryRowData{}, err
 	}
 
-	return &entry, nil
+	return &entry, data, nil
+}
+
+func applyEntryRow(entry *Entry, data entryRowData) {
+	if data.title.Valid {
+		entry.Title = data.title.String
+	}
+	if data.archivedAt.Valid {
+		entry.ArchivedAt = &data.archivedAt.Time
+	}
+	if len(data.metadata) > 0 {
+		json.Unmarshal(data.metadata, &entry.Metadata)
+	}
+	if len(data.relatedIDs) > 0 {
+		json.Unmarshal(data.relatedIDs, &entry.RelatedIDs)
+	}
 }
 
 func joinStrings(strs []string, sep string) string {
@@ -814,189 +887,274 @@ func (a *Archive) SaveFactFileChange(fact *FactFileChange) error {
 
 // QueryFactDecisions retrieves decision facts
 func (a *Archive) QueryFactDecisions(sessionID string, limit int) ([]*FactDecision, error) {
-	query := `SELECT id, choice, rationale, context, alternatives, confidence,
-	                 source_entry_ids, session_id, extracted_at, superseded_by
-	          FROM facts_decisions WHERE 1=1`
-	var args []interface{}
-
-	if sessionID != "" {
-		query += " AND session_id = ?"
-		args = append(args, sessionID)
-	}
-
-	query += " ORDER BY extracted_at DESC"
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-	}
-
+	query, args := decisionFactsQuery(sessionID, limit)
 	rows, err := a.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	return scanDecisionFacts(rows)
+}
+
+func decisionFactsQuery(sessionID string, limit int) (string, []interface{}) {
+	query := `SELECT id, choice, rationale, context, alternatives, confidence,
+	                 source_entry_ids, session_id, extracted_at, superseded_by
+	          FROM facts_decisions WHERE 1=1`
+	args := []interface{}{}
+	if sessionID != "" {
+		query += " AND session_id = ?"
+		args = append(args, sessionID)
+	}
+	query += " ORDER BY extracted_at DESC"
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	return query, args
+}
+
+type factDecisionRow struct {
+	fact           FactDecision
+	alternatives   []byte
+	sourceEntryIDs []byte
+	supersededBy   sql.NullString
+}
+
+func scanDecisionFacts(rows *sql.Rows) ([]*FactDecision, error) {
 	var facts []*FactDecision
 	for rows.Next() {
-		var fact FactDecision
-		var alternatives, sourceEntryIDs []byte
-		var supersededBy sql.NullString
-
-		err := rows.Scan(&fact.ID, &fact.Choice, &fact.Rationale, &fact.Context,
-			&alternatives, &fact.Confidence, &sourceEntryIDs, &fact.SessionID,
-			&fact.ExtractedAt, &supersededBy)
+		row, err := scanDecisionFactRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if len(alternatives) > 0 {
-			json.Unmarshal(alternatives, &fact.Alternatives)
-		}
-		if len(sourceEntryIDs) > 0 {
-			json.Unmarshal(sourceEntryIDs, &fact.SourceEntryIDs)
-		}
-		if supersededBy.Valid {
-			fact.SupersededBy = supersededBy.String
-		}
-
-		facts = append(facts, &fact)
+		applyDecisionFactRow(&row.fact, row)
+		facts = append(facts, &row.fact)
 	}
 	return facts, rows.Err()
+}
+
+func scanDecisionFactRow(scanner interface {
+	Scan(dest ...interface{}) error
+}) (factDecisionRow, error) {
+	var row factDecisionRow
+	err := scanner.Scan(&row.fact.ID, &row.fact.Choice, &row.fact.Rationale, &row.fact.Context,
+		&row.alternatives, &row.fact.Confidence, &row.sourceEntryIDs, &row.fact.SessionID,
+		&row.fact.ExtractedAt, &row.supersededBy)
+	if err != nil {
+		return factDecisionRow{}, err
+	}
+	return row, nil
+}
+
+func applyDecisionFactRow(fact *FactDecision, row factDecisionRow) {
+	if len(row.alternatives) > 0 {
+		json.Unmarshal(row.alternatives, &fact.Alternatives)
+	}
+	if len(row.sourceEntryIDs) > 0 {
+		json.Unmarshal(row.sourceEntryIDs, &fact.SourceEntryIDs)
+	}
+	if row.supersededBy.Valid {
+		fact.SupersededBy = row.supersededBy.String
+	}
 }
 
 // QueryFactPatterns retrieves pattern facts
 func (a *Archive) QueryFactPatterns(category string, limit int) ([]*FactPattern, error) {
+	query, args := patternFactsQuery(category, limit)
+	rows, err := a.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanPatternFacts(rows)
+}
+
+func patternFactsQuery(category string, limit int) (string, []interface{}) {
 	query := `SELECT id, category, name, pattern, example, rationale, usage_count,
 	                 source_entry_ids, session_id, extracted_at
 	          FROM facts_patterns WHERE 1=1`
-	var args []interface{}
-
+	args := []interface{}{}
 	if category != "" {
 		query += " AND category = ?"
 		args = append(args, category)
 	}
-
 	query += " ORDER BY usage_count DESC, extracted_at DESC"
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
+	return query, args
+}
 
-	rows, err := a.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+type factPatternRow struct {
+	fact           FactPattern
+	sourceEntryIDs []byte
+}
 
+func scanPatternFacts(rows *sql.Rows) ([]*FactPattern, error) {
 	var facts []*FactPattern
 	for rows.Next() {
-		var fact FactPattern
-		var sourceEntryIDs []byte
-
-		err := rows.Scan(&fact.ID, &fact.Category, &fact.Name, &fact.Pattern,
-			&fact.Example, &fact.Rationale, &fact.UsageCount, &sourceEntryIDs,
-			&fact.SessionID, &fact.ExtractedAt)
+		row, err := scanPatternFactRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if len(sourceEntryIDs) > 0 {
-			json.Unmarshal(sourceEntryIDs, &fact.SourceEntryIDs)
-		}
-
-		facts = append(facts, &fact)
+		applyPatternFactRow(&row.fact, row)
+		facts = append(facts, &row.fact)
 	}
 	return facts, rows.Err()
+}
+
+func scanPatternFactRow(scanner interface {
+	Scan(dest ...interface{}) error
+}) (factPatternRow, error) {
+	var row factPatternRow
+	err := scanner.Scan(&row.fact.ID, &row.fact.Category, &row.fact.Name, &row.fact.Pattern,
+		&row.fact.Example, &row.fact.Rationale, &row.fact.UsageCount, &row.sourceEntryIDs,
+		&row.fact.SessionID, &row.fact.ExtractedAt)
+	if err != nil {
+		return factPatternRow{}, err
+	}
+	return row, nil
+}
+
+func applyPatternFactRow(fact *FactPattern, row factPatternRow) {
+	if len(row.sourceEntryIDs) > 0 {
+		json.Unmarshal(row.sourceEntryIDs, &fact.SourceEntryIDs)
+	}
 }
 
 // QueryFactFailures retrieves failure facts
 func (a *Archive) QueryFactFailures(sessionID string, limit int) ([]*FactFailure, error) {
+	query, args := failureFactsQuery(sessionID, limit)
+	rows, err := a.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanFailureFacts(rows)
+}
+
+func failureFactsQuery(sessionID string, limit int) (string, []interface{}) {
 	query := `SELECT id, approach, reason, context, resolution, resolution_entry_id,
 	                 source_entry_ids, session_id, extracted_at
 	          FROM facts_failures WHERE 1=1`
-	var args []interface{}
-
+	args := []interface{}{}
 	if sessionID != "" {
 		query += " AND session_id = ?"
 		args = append(args, sessionID)
 	}
-
 	query += " ORDER BY extracted_at DESC"
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
+	return query, args
+}
 
-	rows, err := a.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+type factFailureRow struct {
+	fact              FactFailure
+	sourceEntryIDs    []byte
+	resolutionEntryID sql.NullString
+}
 
+func scanFailureFacts(rows *sql.Rows) ([]*FactFailure, error) {
 	var facts []*FactFailure
 	for rows.Next() {
-		var fact FactFailure
-		var sourceEntryIDs []byte
-		var resolutionEntryID sql.NullString
-
-		err := rows.Scan(&fact.ID, &fact.Approach, &fact.Reason, &fact.Context,
-			&fact.Resolution, &resolutionEntryID, &sourceEntryIDs,
-			&fact.SessionID, &fact.ExtractedAt)
+		row, err := scanFailureFactRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if len(sourceEntryIDs) > 0 {
-			json.Unmarshal(sourceEntryIDs, &fact.SourceEntryIDs)
-		}
-		if resolutionEntryID.Valid {
-			fact.ResolutionEntryID = resolutionEntryID.String
-		}
-
-		facts = append(facts, &fact)
+		applyFailureFactRow(&row.fact, row)
+		facts = append(facts, &row.fact)
 	}
 	return facts, rows.Err()
 }
 
+func scanFailureFactRow(scanner interface {
+	Scan(dest ...interface{}) error
+}) (factFailureRow, error) {
+	var row factFailureRow
+	err := scanner.Scan(&row.fact.ID, &row.fact.Approach, &row.fact.Reason, &row.fact.Context,
+		&row.fact.Resolution, &row.resolutionEntryID, &row.sourceEntryIDs,
+		&row.fact.SessionID, &row.fact.ExtractedAt)
+	if err != nil {
+		return factFailureRow{}, err
+	}
+	return row, nil
+}
+
+func applyFailureFactRow(fact *FactFailure, row factFailureRow) {
+	if len(row.sourceEntryIDs) > 0 {
+		json.Unmarshal(row.sourceEntryIDs, &fact.SourceEntryIDs)
+	}
+	if row.resolutionEntryID.Valid {
+		fact.ResolutionEntryID = row.resolutionEntryID.String
+	}
+}
+
 // QueryFactFileChanges retrieves file change facts
 func (a *Archive) QueryFactFileChanges(path string, limit int) ([]*FactFileChange, error) {
-	query := `SELECT id, path, change_type, description, line_start, line_end,
-	                 source_entry_ids, session_id, extracted_at
-	          FROM facts_file_changes WHERE 1=1`
-	var args []interface{}
-
-	if path != "" {
-		query += " AND path = ?"
-		args = append(args, path)
-	}
-
-	query += " ORDER BY extracted_at DESC"
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-	}
-
+	query, args := fileChangeFactsQuery(path, limit)
 	rows, err := a.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	return scanFileChangeFacts(rows)
+}
+
+func fileChangeFactsQuery(path string, limit int) (string, []interface{}) {
+	query := `SELECT id, path, change_type, description, line_start, line_end,
+	                 source_entry_ids, session_id, extracted_at
+	          FROM facts_file_changes WHERE 1=1`
+	args := []interface{}{}
+	if path != "" {
+		query += " AND path = ?"
+		args = append(args, path)
+	}
+	query += " ORDER BY extracted_at DESC"
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	return query, args
+}
+
+type fileChangeRow struct {
+	fact           FactFileChange
+	sourceEntryIDs []byte
+}
+
+func scanFileChangeFacts(rows *sql.Rows) ([]*FactFileChange, error) {
 	var facts []*FactFileChange
 	for rows.Next() {
-		var fact FactFileChange
-		var sourceEntryIDs []byte
-
-		err := rows.Scan(&fact.ID, &fact.Path, &fact.ChangeType, &fact.Description,
-			&fact.LineStart, &fact.LineEnd, &sourceEntryIDs,
-			&fact.SessionID, &fact.ExtractedAt)
+		row, err := scanFileChangeRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if len(sourceEntryIDs) > 0 {
-			json.Unmarshal(sourceEntryIDs, &fact.SourceEntryIDs)
-		}
-
-		facts = append(facts, &fact)
+		applyFileChangeRow(&row.fact, row)
+		facts = append(facts, &row.fact)
 	}
 	return facts, rows.Err()
+}
+
+func scanFileChangeRow(scanner interface {
+	Scan(dest ...interface{}) error
+}) (fileChangeRow, error) {
+	var row fileChangeRow
+	err := scanner.Scan(&row.fact.ID, &row.fact.Path, &row.fact.ChangeType, &row.fact.Description,
+		&row.fact.LineStart, &row.fact.LineEnd, &row.sourceEntryIDs,
+		&row.fact.SessionID, &row.fact.ExtractedAt)
+	if err != nil {
+		return fileChangeRow{}, err
+	}
+	return row, nil
+}
+
+func applyFileChangeRow(fact *FactFileChange, row fileChangeRow) {
+	if len(row.sourceEntryIDs) > 0 {
+		json.Unmarshal(row.sourceEntryIDs, &fact.SourceEntryIDs)
+	}
 }
 
 // =============================================================================
@@ -1035,72 +1193,121 @@ func (a *Archive) SaveSummary(summary *CompactedSummary) error {
 
 // QuerySummaries retrieves summaries matching the query
 func (a *Archive) QuerySummaries(q SummaryQuery) ([]*CompactedSummary, error) {
-	query := `SELECT id, level, scope, scope_id, content, key_points, tokens_estimate,
-	                 source_entry_ids, source_summary_ids, session_id, time_start, time_end, created_at
-	          FROM summaries WHERE 1=1`
-	var args []interface{}
-
-	if len(q.Levels) > 0 {
-		placeholders := make([]string, len(q.Levels))
-		for i, level := range q.Levels {
-			placeholders[i] = "?"
-			args = append(args, level)
-		}
-		query += fmt.Sprintf(" AND level IN (%s)", joinStrings(placeholders, ","))
-	}
-
-	if len(q.Scopes) > 0 {
-		placeholders := make([]string, len(q.Scopes))
-		for i, scope := range q.Scopes {
-			placeholders[i] = "?"
-			args = append(args, scope)
-		}
-		query += fmt.Sprintf(" AND scope IN (%s)", joinStrings(placeholders, ","))
-	}
-
-	if len(q.SessionIDs) > 0 {
-		placeholders := make([]string, len(q.SessionIDs))
-		for i, id := range q.SessionIDs {
-			placeholders[i] = "?"
-			args = append(args, id)
-		}
-		query += fmt.Sprintf(" AND session_id IN (%s)", joinStrings(placeholders, ","))
-	}
-
-	if q.Since != nil {
-		query += " AND time_start >= ?"
-		args = append(args, q.Since)
-	}
-
-	if q.Until != nil {
-		query += " AND time_end <= ?"
-		args = append(args, q.Until)
-	}
-
-	query += " ORDER BY created_at DESC"
-	if q.Limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", q.Limit)
-	}
-
+	query, args := buildSummaryQuery(q)
 	rows, err := a.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var summaries []*CompactedSummary
-	for rows.Next() {
-		summary, err := scanSummary(rows)
-		if err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, summary)
+	return scanSummaries(rows)
+}
+
+func buildSummaryQuery(q SummaryQuery) (string, []interface{}) {
+	query := baseSummaryQuery()
+	args := []interface{}{}
+	query, args = addSummaryLevels(query, args, q.Levels)
+	query, args = addSummaryScopes(query, args, q.Scopes)
+	query, args = addSummarySessions(query, args, q.SessionIDs)
+	query, args = addSummarySince(query, args, q.Since)
+	query, args = addSummaryUntil(query, args, q.Until)
+	query = addSummaryOrder(query)
+	query = addSummaryLimit(query, q.Limit)
+	return query, args
+}
+
+func baseSummaryQuery() string {
+	return `SELECT id, level, scope, scope_id, content, key_points, tokens_estimate,
+	                 source_entry_ids, source_summary_ids, session_id, time_start, time_end, created_at
+	          FROM summaries WHERE 1=1`
+}
+
+func addSummaryLevels(query string, args []interface{}, levels []SummaryLevel) (string, []interface{}) {
+	if len(levels) == 0 {
+		return query, args
 	}
-	return summaries, rows.Err()
+	placeholders := summaryPlaceholders(len(levels))
+	for _, level := range levels {
+		args = append(args, level)
+	}
+	query += fmt.Sprintf(" AND level IN (%s)", joinStrings(placeholders, ","))
+	return query, args
+}
+
+func addSummaryScopes(query string, args []interface{}, scopes []SummaryScope) (string, []interface{}) {
+	if len(scopes) == 0 {
+		return query, args
+	}
+	placeholders := summaryPlaceholders(len(scopes))
+	for _, scope := range scopes {
+		args = append(args, scope)
+	}
+	query += fmt.Sprintf(" AND scope IN (%s)", joinStrings(placeholders, ","))
+	return query, args
+}
+
+func addSummarySessions(query string, args []interface{}, sessionIDs []string) (string, []interface{}) {
+	if len(sessionIDs) == 0 {
+		return query, args
+	}
+	placeholders := summaryPlaceholders(len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		args = append(args, sessionID)
+	}
+	query += fmt.Sprintf(" AND session_id IN (%s)", joinStrings(placeholders, ","))
+	return query, args
+}
+
+func addSummarySince(query string, args []interface{}, since *time.Time) (string, []interface{}) {
+	if since == nil {
+		return query, args
+	}
+	query += " AND time_start >= ?"
+	args = append(args, since)
+	return query, args
+}
+
+func addSummaryUntil(query string, args []interface{}, until *time.Time) (string, []interface{}) {
+	if until == nil {
+		return query, args
+	}
+	query += " AND time_end <= ?"
+	args = append(args, until)
+	return query, args
+}
+
+func addSummaryOrder(query string) string {
+	return query + " ORDER BY created_at DESC"
+}
+
+func addSummaryLimit(query string, limit int) string {
+	if limit <= 0 {
+		return query
+	}
+	return query + fmt.Sprintf(" LIMIT %d", limit)
+}
+
+func summaryPlaceholders(count int) []string {
+	placeholders := make([]string, count)
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	return placeholders
 }
 
 // SearchSummaries performs full-text search on summaries
 func (a *Archive) SearchSummaries(searchText string, limit int) ([]*CompactedSummary, error) {
+	query := summarySearchQuery(limit)
+	rows, err := a.db.Query(query, searchText)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanSummaries(rows)
+}
+
+func summarySearchQuery(limit int) string {
 	query := `
 		SELECT s.id, s.level, s.scope, s.scope_id, s.content, s.key_points, s.tokens_estimate,
 		       s.source_entry_ids, s.source_summary_ids, s.session_id, s.time_start, s.time_end, s.created_at
@@ -1109,16 +1316,13 @@ func (a *Archive) SearchSummaries(searchText string, limit int) ([]*CompactedSum
 		WHERE summaries_fts MATCH ?
 		ORDER BY rank
 	`
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+	if limit <= 0 {
+		return query
 	}
+	return query + fmt.Sprintf(" LIMIT %d", limit)
+}
 
-	rows, err := a.db.Query(query, searchText)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
+func scanSummaries(rows *sql.Rows) ([]*CompactedSummary, error) {
 	var summaries []*CompactedSummary
 	for rows.Next() {
 		summary, err := scanSummary(rows)
@@ -1138,81 +1342,79 @@ func (a *Archive) GetSummary(id string) (*CompactedSummary, error) {
 		FROM summaries WHERE id = ?
 	`, id)
 
-	var summary CompactedSummary
-	var scopeID sql.NullString
-	var keyPoints, sourceEntryIDs, sourceSummaryIDs []byte
-	var sessionID sql.NullString
-	var timeStart, timeEnd sql.NullTime
-
-	err := row.Scan(&summary.ID, &summary.Level, &summary.Scope, &scopeID, &summary.Content,
-		&keyPoints, &summary.TokensEstimate, &sourceEntryIDs, &sourceSummaryIDs,
-		&sessionID, &timeStart, &timeEnd, &summary.CreatedAt)
+	summary, data, err := scanSummaryRow(row)
 	if err != nil {
 		return nil, err
 	}
-
-	if scopeID.Valid {
-		summary.ScopeID = scopeID.String
-	}
-	if sessionID.Valid {
-		summary.SessionID = sessionID.String
-	}
-	if timeStart.Valid {
-		summary.TimeStart = &timeStart.Time
-	}
-	if timeEnd.Valid {
-		summary.TimeEnd = &timeEnd.Time
-	}
-	if len(keyPoints) > 0 {
-		json.Unmarshal(keyPoints, &summary.KeyPoints)
-	}
-	if len(sourceEntryIDs) > 0 {
-		json.Unmarshal(sourceEntryIDs, &summary.SourceEntryIDs)
-	}
-	if len(sourceSummaryIDs) > 0 {
-		json.Unmarshal(sourceSummaryIDs, &summary.SourceSummaryIDs)
-	}
-
-	return &summary, nil
+	applySummaryRowData(summary, data)
+	return summary, nil
 }
 
 func scanSummary(rows *sql.Rows) (*CompactedSummary, error) {
-	var summary CompactedSummary
-	var scopeID sql.NullString
-	var keyPoints, sourceEntryIDs, sourceSummaryIDs []byte
-	var sessionID sql.NullString
-	var timeStart, timeEnd sql.NullTime
-
-	err := rows.Scan(&summary.ID, &summary.Level, &summary.Scope, &scopeID, &summary.Content,
-		&keyPoints, &summary.TokensEstimate, &sourceEntryIDs, &sourceSummaryIDs,
-		&sessionID, &timeStart, &timeEnd, &summary.CreatedAt)
+	summary, data, err := scanSummaryRow(rows)
 	if err != nil {
 		return nil, err
 	}
+	applySummaryRowData(summary, data)
+	return summary, nil
+}
 
-	if scopeID.Valid {
-		summary.ScopeID = scopeID.String
-	}
-	if sessionID.Valid {
-		summary.SessionID = sessionID.String
-	}
-	if timeStart.Valid {
-		summary.TimeStart = &timeStart.Time
-	}
-	if timeEnd.Valid {
-		summary.TimeEnd = &timeEnd.Time
-	}
-	if len(keyPoints) > 0 {
-		json.Unmarshal(keyPoints, &summary.KeyPoints)
-	}
-	if len(sourceEntryIDs) > 0 {
-		json.Unmarshal(sourceEntryIDs, &summary.SourceEntryIDs)
-	}
-	if len(sourceSummaryIDs) > 0 {
-		json.Unmarshal(sourceSummaryIDs, &summary.SourceSummaryIDs)
+type summaryRowData struct {
+	scopeID          sql.NullString
+	sessionID        sql.NullString
+	timeStart        sql.NullTime
+	timeEnd          sql.NullTime
+	keyPoints        []byte
+	sourceEntryIDs   []byte
+	sourceSummaryIDs []byte
+}
+
+func scanSummaryRow(scanner interface {
+	Scan(dest ...interface{}) error
+}) (*CompactedSummary, summaryRowData, error) {
+	var summary CompactedSummary
+	var data summaryRowData
+
+	err := scanner.Scan(&summary.ID, &summary.Level, &summary.Scope, &data.scopeID, &summary.Content,
+		&data.keyPoints, &summary.TokensEstimate, &data.sourceEntryIDs, &data.sourceSummaryIDs,
+		&data.sessionID, &data.timeStart, &data.timeEnd, &summary.CreatedAt)
+	if err != nil {
+		return nil, summaryRowData{}, err
 	}
 
-	return &summary, nil
+	return &summary, data, nil
+}
+
+func applySummaryRowData(summary *CompactedSummary, data summaryRowData) {
+	applySummaryNulls(summary, data)
+	applySummaryLists(summary, data)
+}
+
+func applySummaryNulls(summary *CompactedSummary, data summaryRowData) {
+	if data.scopeID.Valid {
+		summary.ScopeID = data.scopeID.String
+	}
+	if data.sessionID.Valid {
+		summary.SessionID = data.sessionID.String
+	}
+	if data.timeStart.Valid {
+		summary.TimeStart = &data.timeStart.Time
+	}
+	if data.timeEnd.Valid {
+		summary.TimeEnd = &data.timeEnd.Time
+	}
+}
+
+func applySummaryLists(summary *CompactedSummary, data summaryRowData) {
+	if len(data.keyPoints) > 0 {
+		json.Unmarshal(data.keyPoints, &summary.KeyPoints)
+	}
+	if len(data.sourceEntryIDs) > 0 {
+		json.Unmarshal(data.sourceEntryIDs, &summary.SourceEntryIDs)
+	}
+	if len(data.sourceSummaryIDs) > 0 {
+		json.Unmarshal(data.sourceSummaryIDs, &summary.SourceSummaryIDs)
+	}
 }
 
 // GetLatestSummary retrieves the most recent summary for a given level and scope
@@ -1231,40 +1433,10 @@ func (a *Archive) GetLatestSummary(level SummaryLevel, scope SummaryScope, scope
 
 	row := a.db.QueryRow(query, args...)
 
-	var summary CompactedSummary
-	var scopeIDVal sql.NullString
-	var keyPoints, sourceEntryIDs, sourceSummaryIDs []byte
-	var sessionID sql.NullString
-	var timeStart, timeEnd sql.NullTime
-
-	err := row.Scan(&summary.ID, &summary.Level, &summary.Scope, &scopeIDVal, &summary.Content,
-		&keyPoints, &summary.TokensEstimate, &sourceEntryIDs, &sourceSummaryIDs,
-		&sessionID, &timeStart, &timeEnd, &summary.CreatedAt)
+	summary, data, err := scanSummaryRow(row)
 	if err != nil {
 		return nil, err
 	}
-
-	if scopeIDVal.Valid {
-		summary.ScopeID = scopeIDVal.String
-	}
-	if sessionID.Valid {
-		summary.SessionID = sessionID.String
-	}
-	if timeStart.Valid {
-		summary.TimeStart = &timeStart.Time
-	}
-	if timeEnd.Valid {
-		summary.TimeEnd = &timeEnd.Time
-	}
-	if len(keyPoints) > 0 {
-		json.Unmarshal(keyPoints, &summary.KeyPoints)
-	}
-	if len(sourceEntryIDs) > 0 {
-		json.Unmarshal(sourceEntryIDs, &summary.SourceEntryIDs)
-	}
-	if len(sourceSummaryIDs) > 0 {
-		json.Unmarshal(sourceSummaryIDs, &summary.SourceSummaryIDs)
-	}
-
-	return &summary, nil
+	applySummaryRowData(summary, data)
+	return summary, nil
 }

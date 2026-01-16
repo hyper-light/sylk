@@ -334,35 +334,54 @@ func (a *Archivalist) Stop() error {
 		return nil
 	}
 
-	var errs []error
-
-	if a.requestSub != nil {
-		if err := a.requestSub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-		a.requestSub = nil
-	}
-
-	if a.responseSub != nil {
-		if err := a.responseSub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-		a.responseSub = nil
-	}
-
-	if a.registrySub != nil {
-		if err := a.registrySub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-		a.registrySub = nil
-	}
-
+	errs := a.unsubscribeAll()
 	a.running = false
 
 	if len(errs) > 0 {
 		return fmt.Errorf("errors during stop: %v", errs)
 	}
 	return nil
+}
+
+func (a *Archivalist) unsubscribeAll() []error {
+	var errs []error
+	if err := a.unsubscribeRequest(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := a.unsubscribeResponse(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := a.unsubscribeRegistry(); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
+}
+
+func (a *Archivalist) unsubscribeRequest() error {
+	if a.requestSub == nil {
+		return nil
+	}
+	err := a.requestSub.Unsubscribe()
+	a.requestSub = nil
+	return err
+}
+
+func (a *Archivalist) unsubscribeResponse() error {
+	if a.responseSub == nil {
+		return nil
+	}
+	err := a.responseSub.Unsubscribe()
+	a.responseSub = nil
+	return err
+}
+
+func (a *Archivalist) unsubscribeRegistry() error {
+	if a.registrySub == nil {
+		return nil
+	}
+	err := a.registrySub.Unsubscribe()
+	a.registrySub = nil
+	return err
 }
 
 // IsRunning returns true if the archivalist is actively processing bus messages
@@ -435,56 +454,74 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 
 // processForwardedRequest handles the actual request processing
 func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	// Route based on intent and domain
-	switch fwd.Intent {
+	handler, err := a.intentHandler(fwd.Intent)
+	if err != nil {
+		return nil, err
+	}
+	return handler(ctx, fwd)
+}
+
+type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error)
+
+func (a *Archivalist) intentHandler(intent guide.Intent) (forwardedHandler, error) {
+	switch intent {
 	case guide.IntentRecall:
-		return a.handleRecall(ctx, fwd)
+		return a.handleRecall, nil
 	case guide.IntentStore:
-		return a.handleStore(ctx, fwd)
+		return a.handleStore, nil
 	case guide.IntentCheck:
-		return a.handleCheck(ctx, fwd)
+		return a.handleCheck, nil
 	case guide.IntentDeclare:
-		return a.handleDeclare(ctx, fwd)
+		return a.handleDeclare, nil
 	case guide.IntentComplete:
-		return a.handleComplete(ctx, fwd)
+		return a.handleComplete, nil
 	default:
-		return nil, fmt.Errorf("unsupported intent: %s", fwd.Intent)
+		return nil, fmt.Errorf("unsupported intent: %s", intent)
 	}
 }
 
 // handleRecall processes recall (query) requests
 func (a *Archivalist) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	query := ArchiveQuery{}
+	if fwd.Domain == guide.DomainFiles {
+		return a.agentContext.GetModifiedFiles(), nil
+	}
 
-	// Map domain to category
-	switch fwd.Domain {
+	query := ArchiveQuery{}
+	applyDomainFilters(&query, fwd.Domain)
+	applyEntityFilters(&query, fwd.Entities)
+	ensureQueryLimit(&query, 10)
+	return a.Query(ctx, query)
+}
+
+func applyDomainFilters(query *ArchiveQuery, domain guide.Domain) {
+	switch domain {
 	case guide.DomainPatterns:
 		query.Categories = []Category{CategoryGeneral}
 	case guide.DomainFailures:
 		query.Categories = []Category{CategoryIssue}
 	case guide.DomainDecisions:
 		query.Categories = []Category{CategoryDecision}
-	case guide.DomainFiles:
-		return a.agentContext.GetModifiedFiles(), nil
 	case guide.DomainLearnings:
 		query.Categories = []Category{CategoryInsight}
 	}
+}
 
-	// Extract entities for filtering
-	if fwd.Entities != nil {
-		if fwd.Entities.Scope != "" {
-			query.SearchText = fwd.Entities.Scope
-		}
-		if fwd.Entities.Limit > 0 {
-			query.Limit = fwd.Entities.Limit
-		}
+func applyEntityFilters(query *ArchiveQuery, entities *guide.ExtractedEntities) {
+	if entities == nil {
+		return
 	}
+	if entities.Scope != "" {
+		query.SearchText = entities.Scope
+	}
+	if entities.Limit > 0 {
+		query.Limit = entities.Limit
+	}
+}
 
+func ensureQueryLimit(query *ArchiveQuery, fallback int) {
 	if query.Limit == 0 {
-		query.Limit = 10
+		query.Limit = fallback
 	}
-
-	return a.Query(ctx, query)
 }
 
 // handleStore processes store requests
@@ -589,42 +626,74 @@ func (a *Archivalist) PublishRequest(req *guide.RouteRequest) error {
 
 // StoreEntry stores a chronicle entry
 func (a *Archivalist) StoreEntry(ctx context.Context, entry *Entry) SubmissionResult {
-	if !IsValidSource(entry.Source) && entry.Source != SourceModelUser && entry.Source != SourceModelArchivalist {
-		return SubmissionResult{
-			Success: false,
-			Error:   fmt.Errorf("invalid source model: %s", entry.Source),
-		}
+	if err := validateStoreEntry(entry); err != nil {
+		return SubmissionResult{Success: false, Error: err}
 	}
 
+	storeData, result := a.runPreStoreHooks(ctx, entry)
+	if result != nil {
+		return *result
+	}
+
+	storeEntry, err := entryFromStoreData(storeData)
+	if err != nil {
+		return SubmissionResult{Success: false, Error: err}
+	}
+
+	storeResult, err := a.insertStoreEntry(storeEntry)
+	hookErr := a.runPostStoreHooks(ctx, storeData, storeResult, err)
+	return finalizeStoreResult(storeResult, err, hookErr)
+}
+
+func validateStoreEntry(entry *Entry) error {
+	if IsValidSource(entry.Source) || entry.Source == SourceModelUser || entry.Source == SourceModelArchivalist {
+		return nil
+	}
+	return fmt.Errorf("invalid source model: %s", entry.Source)
+}
+
+func (a *Archivalist) runPreStoreHooks(ctx context.Context, entry *Entry) (*skills.StoreHookData, *SubmissionResult) {
 	storeData := &skills.StoreHookData{Entry: entry}
-	if a.hooks != nil {
-		updated, result, err := a.hooks.ExecutePreStoreHooks(ctx, storeData)
-		if err != nil {
-			return SubmissionResult{Success: false, Error: err}
-		}
-		if result.SkipExecution {
-			return SubmissionResult{Success: true}
-		}
-		storeData = updated
+	if a.hooks == nil {
+		return storeData, nil
 	}
+	updated, result, err := a.hooks.ExecutePreStoreHooks(ctx, storeData)
+	if err != nil {
+		return nil, &SubmissionResult{Success: false, Error: err}
+	}
+	if result.SkipExecution {
+		return nil, &SubmissionResult{Success: true}
+	}
+	return updated, nil
+}
 
+func entryFromStoreData(storeData *skills.StoreHookData) (*Entry, error) {
 	storeEntry, ok := storeData.Entry.(*Entry)
 	if !ok || storeEntry == nil {
-		return SubmissionResult{Success: false, Error: fmt.Errorf("invalid store entry")}
+		return nil, fmt.Errorf("invalid store entry")
 	}
+	return storeEntry, nil
+}
 
+func (a *Archivalist) insertStoreEntry(storeEntry *Entry) (SubmissionResult, error) {
 	id, err := a.store.InsertEntryInSession(a.GetDefaultSession(), storeEntry)
-	result := SubmissionResult{Success: err == nil, Error: err, ID: id}
+	return SubmissionResult{Success: err == nil, Error: err, ID: id}, err
+}
 
+func (a *Archivalist) runPostStoreHooks(ctx context.Context, storeData *skills.StoreHookData, result SubmissionResult, err error) error {
 	storeData.Result = result
 	storeData.Error = err
-	if a.hooks != nil {
-		_, _, hookErr := a.hooks.ExecutePostStoreHooks(ctx, storeData)
-		if hookErr != nil && err == nil {
-			return SubmissionResult{Success: false, Error: hookErr}
-		}
+	if a.hooks == nil {
+		return nil
 	}
+	_, _, hookErr := a.hooks.ExecutePostStoreHooks(ctx, storeData)
+	return hookErr
+}
 
+func finalizeStoreResult(result SubmissionResult, err error, hookErr error) SubmissionResult {
+	if hookErr != nil && err == nil {
+		return SubmissionResult{Success: false, Error: hookErr}
+	}
 	return result
 }
 
@@ -713,40 +782,71 @@ func (a *Archivalist) UpdateEntry(ctx context.Context, id string, updates func(*
 
 // Query retrieves entries matching the query parameters
 func (a *Archivalist) Query(ctx context.Context, query ArchiveQuery) ([]*Entry, error) {
-	if len(query.SessionIDs) == 0 {
-		if sessionID := a.GetDefaultSession(); sessionID != "" {
-			query.SessionIDs = []string{sessionID}
-		}
+	a.ensureQuerySession(&query)
+
+	queryData, result := a.runPreQueryHooks(ctx, query)
+	if result != nil {
+		return result.entries, result.err
 	}
 
-	queryData := &skills.QueryHookData{Query: query}
-	if a.hooks != nil {
-		updated, result, err := a.hooks.ExecutePreQueryHooks(ctx, queryData)
-		if err != nil {
-			return nil, err
-		}
-		if result.SkipExecution {
-			return nil, nil
-		}
-		queryData = updated
-	}
-
-	queryValue, ok := queryData.Query.(ArchiveQuery)
-	if !ok {
-		return nil, fmt.Errorf("invalid query")
+	queryValue, err := queryDataArchiveQuery(queryData)
+	if err != nil {
+		return nil, err
 	}
 
 	entries, err := a.store.Query(queryValue)
+	hookErr := a.runPostQueryHooks(ctx, queryData, entries, err)
+	if hookErr != nil && err == nil {
+		return nil, hookErr
+	}
+	return entries, err
+}
+
+type queryHookResult struct {
+	entries []*Entry
+	err     error
+}
+
+func (a *Archivalist) ensureQuerySession(query *ArchiveQuery) {
+	if len(query.SessionIDs) > 0 {
+		return
+	}
+	if sessionID := a.GetDefaultSession(); sessionID != "" {
+		query.SessionIDs = []string{sessionID}
+	}
+}
+
+func (a *Archivalist) runPreQueryHooks(ctx context.Context, query ArchiveQuery) (*skills.QueryHookData, *queryHookResult) {
+	queryData := &skills.QueryHookData{Query: query}
+	if a.hooks == nil {
+		return queryData, nil
+	}
+	updated, result, err := a.hooks.ExecutePreQueryHooks(ctx, queryData)
+	if err != nil {
+		return nil, &queryHookResult{err: err}
+	}
+	if result.SkipExecution {
+		return nil, &queryHookResult{entries: nil, err: nil}
+	}
+	return updated, nil
+}
+
+func queryDataArchiveQuery(queryData *skills.QueryHookData) (ArchiveQuery, error) {
+	queryValue, ok := queryData.Query.(ArchiveQuery)
+	if !ok {
+		return ArchiveQuery{}, fmt.Errorf("invalid query")
+	}
+	return queryValue, nil
+}
+
+func (a *Archivalist) runPostQueryHooks(ctx context.Context, queryData *skills.QueryHookData, entries []*Entry, err error) error {
 	queryData.Result = entries
 	queryData.Error = err
-	if a.hooks != nil {
-		_, _, hookErr := a.hooks.ExecutePostQueryHooks(ctx, queryData)
-		if hookErr != nil && err == nil {
-			return nil, hookErr
-		}
+	if a.hooks == nil {
+		return nil
 	}
-
-	return entries, err
+	_, _, hookErr := a.hooks.ExecutePostQueryHooks(ctx, queryData)
+	return hookErr
 }
 
 // QueryByCategory retrieves entries in a specific category
@@ -1274,36 +1374,60 @@ func (a *Archivalist) logWriteEvent(scope Scope, key string, data map[string]any
 }
 
 func (a *Archivalist) handleBatch(ctx context.Context, req *Request) Response {
-	if req.Batch == nil || len(req.Batch.Writes) == 0 {
-		return ErrorResponse("missing batch data")
-	}
-	if req.AgentID == "" {
-		return ErrorResponse("agent_id required")
+	if err := validateBatchRequest(req); err != nil {
+		return ErrorResponse(err.Error())
 	}
 
 	a.registry.Touch(req.AgentID)
 
+	lastVersion, succeeded, failed := a.processBatchWrites(ctx, req)
+	return batchResponse(lastVersion, succeeded, failed)
+}
+
+func validateBatchRequest(req *Request) error {
+	if req.Batch == nil || len(req.Batch.Writes) == 0 {
+		return fmt.Errorf("missing batch data")
+	}
+	if req.AgentID == "" {
+		return fmt.Errorf("agent_id required")
+	}
+	return nil
+}
+
+func (a *Archivalist) processBatchWrites(ctx context.Context, req *Request) (string, int, int) {
+	lastVersion := ""
 	succeeded := 0
 	failed := 0
-	var lastVersion string
 
 	for _, write := range req.Batch.Writes {
-		writeReq := &Request{
-			AgentID: req.AgentID,
-			Version: req.Version,
-			Write:   &write,
-		}
-		resp := a.handleWrite(ctx, writeReq)
-		if resp.Status == StatusOK || resp.Status == StatusMerged {
-			succeeded++
-			lastVersion = resp.Version
-			// Update version for next write in batch
-			req.Version = resp.Version
-		} else {
-			failed++
-		}
+		resp := a.executeBatchWrite(ctx, req, write)
+		lastVersion, succeeded, failed = updateBatchCounters(resp, lastVersion, succeeded, failed)
 	}
 
+	return lastVersion, succeeded, failed
+}
+
+func (a *Archivalist) executeBatchWrite(ctx context.Context, req *Request, write WriteRequest) Response {
+	writeReq := &Request{
+		AgentID: req.AgentID,
+		Version: req.Version,
+		Write:   &write,
+	}
+	resp := a.handleWrite(ctx, writeReq)
+	if resp.Status == StatusOK || resp.Status == StatusMerged {
+		req.Version = resp.Version
+	}
+	return resp
+}
+
+func updateBatchCounters(resp Response, lastVersion string, succeeded int, failed int) (string, int, int) {
+	if resp.Status == StatusOK || resp.Status == StatusMerged {
+		return resp.Version, succeeded + 1, failed
+	}
+	return lastVersion, succeeded, failed + 1
+}
+
+func batchResponse(lastVersion string, succeeded int, failed int) Response {
 	if failed == 0 {
 		return BatchOKResponse(lastVersion, succeeded)
 	}
@@ -1319,17 +1443,23 @@ func (a *Archivalist) handleRead(ctx context.Context, req *Request) Response {
 		a.registry.Touch(req.AgentID)
 	}
 
-	// Delta read
 	if req.Read.Since != "" {
-		delta := a.eventLog.GetDelta(req.Read.Since, req.Read.Limit)
-		return Response{
-			Status:  StatusOK,
-			Version: a.registry.GetVersion(),
-			Delta:   delta,
-		}
+		return a.handleDeltaRead(req)
 	}
 
-	// Full read (scoped)
+	return a.handleFullRead(req)
+}
+
+func (a *Archivalist) handleDeltaRead(req *Request) Response {
+	delta := a.eventLog.GetDelta(req.Read.Since, req.Read.Limit)
+	return Response{
+		Status:  StatusOK,
+		Version: a.registry.GetVersion(),
+		Delta:   delta,
+	}
+}
+
+func (a *Archivalist) handleFullRead(req *Request) Response {
 	scope, key := ParseScope(req.Read.Scope)
 	data := a.readScope(scope, key, req.Read.Limit)
 
@@ -1349,11 +1479,18 @@ func (a *Archivalist) handleBriefing(ctx context.Context, req *Request) Response
 		a.registry.Touch(req.AgentID)
 	}
 
-	tier := req.Briefing.Tier
-	if tier == "" {
-		tier = BriefingStandard
-	}
+	tier := resolveBriefingTier(req.Briefing.Tier)
+	return a.dispatchBriefing(tier)
+}
 
+func resolveBriefingTier(tier BriefingTier) BriefingTier {
+	if tier == "" {
+		return BriefingStandard
+	}
+	return tier
+}
+
+func (a *Archivalist) dispatchBriefing(tier BriefingTier) Response {
 	switch tier {
 	case BriefingMicro:
 		return a.getMicroBriefing()
@@ -1376,17 +1513,8 @@ func (a *Archivalist) getMicroBriefing() Response {
 		}
 	}
 
-	modFiles := a.agentContext.GetModifiedFiles()
-	modPaths := make([]string, len(modFiles))
-	for i, f := range modFiles {
-		modPaths[i] = f.Path
-	}
-
-	blocker := ""
-	if len(resume.Blockers) > 0 {
-		blocker = resume.Blockers[0]
-	}
-
+	modPaths := collectModifiedPaths(a.agentContext.GetModifiedFiles())
+	blocker := firstBriefingBlocker(resume.Blockers)
 	totalSteps := len(resume.CompletedSteps) + len(resume.NextSteps)
 	briefing := MicroBriefing(
 		resume.CurrentTask,
@@ -1401,6 +1529,21 @@ func (a *Archivalist) getMicroBriefing() Response {
 		Version:  a.registry.GetVersion(),
 		Briefing: briefing,
 	}
+}
+
+func collectModifiedPaths(files []*FileState) []string {
+	paths := make([]string, len(files))
+	for i, file := range files {
+		paths[i] = file.Path
+	}
+	return paths
+}
+
+func firstBriefingBlocker(blockers []string) string {
+	if len(blockers) == 0 {
+		return ""
+	}
+	return blockers[0]
 }
 
 func (a *Archivalist) getStandardBriefing() Response {
@@ -1582,54 +1725,104 @@ func extractStringSlice(data map[string]any, key string) []string {
 }
 
 func (a *Archivalist) readScope(scope Scope, key string, limit int) any {
-	switch scope {
-	case ScopeFiles:
-		if key != "" {
-			return a.agentContext.GetFileState(key)
-		}
-		return a.agentContext.GetModifiedFiles()
-	case ScopePatterns:
-		if key != "" {
-			return a.agentContext.GetPattern(key)
-		}
-		return a.agentContext.GetAllPatterns()
-	case ScopeFailures:
-		return a.agentContext.GetRecentFailures(limit)
-	case ScopeIntents:
-		return map[string]any{
-			"wants":   a.agentContext.GetUserWants(),
-			"rejects": a.agentContext.GetUserRejects(),
-		}
-	case ScopeResume:
-		return a.agentContext.GetResumeState()
-	case ScopeAll:
-		return a.agentContext.GetAgentBriefing()
-	default:
+	reader := scopeReader(scope)
+	if reader == nil {
 		return nil
+	}
+	return reader(a, key, limit)
+}
+
+type scopeReaderFunc func(*Archivalist, string, int) any
+
+type scopeReaderSpec struct {
+	scope  Scope
+	reader scopeReaderFunc
+}
+
+func scopeReader(scope Scope) scopeReaderFunc {
+	for _, spec := range scopeReaders() {
+		if spec.scope == scope {
+			return spec.reader
+		}
+	}
+	return nil
+}
+
+func scopeReaders() []scopeReaderSpec {
+	return []scopeReaderSpec{
+		{scope: ScopeFiles, reader: readFilesScope},
+		{scope: ScopePatterns, reader: readPatternsScope},
+		{scope: ScopeFailures, reader: readFailuresScope},
+		{scope: ScopeIntents, reader: readIntentsScope},
+		{scope: ScopeResume, reader: readResumeScope},
+		{scope: ScopeAll, reader: readAllScope},
 	}
 }
 
-func scopeToEventType(scope Scope, isNew bool) EventType {
-	switch scope {
-	case ScopeFiles:
-		if isNew {
-			return EventTypeFileCreate
-		}
-		return EventTypeFileModify
-	case ScopePatterns:
-		if isNew {
-			return EventTypePatternAdd
-		}
-		return EventTypePatternUpdate
-	case ScopeFailures:
-		return EventTypeFailureRecord
-	case ScopeIntents:
-		return EventTypeIntentAdd
-	case ScopeResume:
-		return EventTypeResumeUpdate
-	default:
-		return EventTypeEntryStore
+func readFilesScope(a *Archivalist, key string, limit int) any {
+	if key != "" {
+		return a.agentContext.GetFileState(key)
 	}
+	return a.agentContext.GetModifiedFiles()
+}
+
+func readPatternsScope(a *Archivalist, key string, limit int) any {
+	if key != "" {
+		return a.agentContext.GetPattern(key)
+	}
+	return a.agentContext.GetAllPatterns()
+}
+
+func readFailuresScope(a *Archivalist, key string, limit int) any {
+	return a.agentContext.GetRecentFailures(limit)
+}
+
+func readIntentsScope(a *Archivalist, key string, limit int) any {
+	return map[string]any{
+		"wants":   a.agentContext.GetUserWants(),
+		"rejects": a.agentContext.GetUserRejects(),
+	}
+}
+
+func readResumeScope(a *Archivalist, key string, limit int) any {
+	return a.agentContext.GetResumeState()
+}
+
+func readAllScope(a *Archivalist, key string, limit int) any {
+	return a.agentContext.GetAgentBriefing()
+}
+
+func scopeToEventType(scope Scope, isNew bool) EventType {
+	if scope == ScopeFiles {
+		return fileScopeEventType(isNew)
+	}
+	if scope == ScopePatterns {
+		return patternScopeEventType(isNew)
+	}
+	if scope == ScopeFailures {
+		return EventTypeFailureRecord
+	}
+	if scope == ScopeIntents {
+		return EventTypeIntentAdd
+	}
+	if scope == ScopeResume {
+		return EventTypeResumeUpdate
+	}
+	return EventTypeEntryStore
+}
+
+func fileScopeEventType(isNew bool) EventType {
+	if isNew {
+		return EventTypeFileCreate
+	}
+	return EventTypeFileModify
+}
+
+func patternScopeEventType(isNew bool) EventType {
+	if isNew {
+		return EventTypePatternAdd
+	}
+	return EventTypePatternUpdate
 }
 
 // =============================================================================

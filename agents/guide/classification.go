@@ -214,91 +214,142 @@ func (c *Classifier) Classify(ctx context.Context, input string) (*Classificatio
 
 // extractClassificationFromText extracts classification from text response
 func (c *Classifier) extractClassificationFromText(resp *anthropic.Message) (*ClassificationResult, error) {
-	// Get text content from response
+	text := extractTextContent(resp)
+	if text == "" {
+		return nil, fmt.Errorf("no text content in response")
+	}
+	jsonStr := extractJSONBlock(text)
+	if jsonStr == "" {
+		return c.parseTextHeuristically(text)
+	}
+	return c.parseToolUseResult([]byte(jsonStr))
+}
+
+func extractTextContent(resp *anthropic.Message) string {
 	var text string
 	for _, block := range resp.Content {
 		if block.Type == "text" {
 			text += block.Text
 		}
 	}
+	return text
+}
 
-	if text == "" {
-		return nil, fmt.Errorf("no text content in response")
+func extractJSONBlock(text string) string {
+	start, end := findJSONBounds(text)
+	if start == -1 || end == -1 {
+		return ""
 	}
+	return text[start:end]
+}
 
-	// Try to parse as JSON (the prompt asks for JSON output)
-	// Look for JSON block in the response
-	jsonStart := -1
-	jsonEnd := -1
+func findJSONBounds(text string) (int, int) {
+	start := -1
 	braceCount := 0
-
 	for i, r := range text {
 		if r == '{' {
-			if jsonStart == -1 {
-				jsonStart = i
-			}
+			start = setStart(start, i)
 			braceCount++
-		} else if r == '}' {
+			continue
+		}
+		if r == '}' {
 			braceCount--
-			if braceCount == 0 && jsonStart != -1 {
-				jsonEnd = i + 1
-				break
+			if braceCount == 0 && start != -1 {
+				return start, i + 1
 			}
 		}
 	}
+	return -1, -1
+}
 
-	if jsonStart == -1 || jsonEnd == -1 {
-		// No JSON found, try to parse the text heuristically
-		return c.parseTextHeuristically(text)
+func setStart(current int, candidate int) int {
+	if current == -1 {
+		return candidate
 	}
-
-	jsonStr := text[jsonStart:jsonEnd]
-	return c.parseToolUseResult([]byte(jsonStr))
+	return current
 }
 
 // parseTextHeuristically attempts to extract classification from unstructured text
 func (c *Classifier) parseTextHeuristically(text string) (*ClassificationResult, error) {
-	// Default result with low confidence
-	result := &ClassificationResult{
+	result := c.newHeuristicResult()
+	textLower := strings.ToLower(text)
+
+	c.applyHeuristicIntent(textLower, result)
+	c.applyHeuristicDomain(textLower, result)
+	c.applyHeuristicRetrospective(textLower, result)
+
+	return result, nil
+}
+
+func (c *Classifier) newHeuristicResult() *ClassificationResult {
+	return &ClassificationResult{
 		IsRetrospective: true,
 		Intent:          IntentUnknown,
 		Domain:          DomainUnknown,
 		Confidence:      0.3,
 	}
+}
 
-	textLower := strings.ToLower(text)
-
-	// Try to detect intent
-	if strings.Contains(textLower, "recall") || strings.Contains(textLower, "retrieve") || strings.Contains(textLower, "query") {
-		result.Intent = IntentRecall
-		result.Confidence = 0.6
-	} else if strings.Contains(textLower, "store") || strings.Contains(textLower, "record") || strings.Contains(textLower, "log") {
-		result.Intent = IntentStore
-		result.Confidence = 0.6
-	} else if strings.Contains(textLower, "check") || strings.Contains(textLower, "verify") {
-		result.Intent = IntentCheck
-		result.Confidence = 0.6
+func (c *Classifier) applyHeuristicIntent(textLower string, result *ClassificationResult) {
+	intent, confidence := c.detectIntent(textLower)
+	if intent == IntentUnknown {
+		return
 	}
+	result.Intent = intent
+	result.Confidence = confidence
+}
 
-	// Try to detect domain
-	if strings.Contains(textLower, "pattern") {
-		result.Domain = DomainPatterns
-	} else if strings.Contains(textLower, "failure") || strings.Contains(textLower, "error") {
-		result.Domain = DomainFailures
-	} else if strings.Contains(textLower, "decision") {
-		result.Domain = DomainDecisions
-	} else if strings.Contains(textLower, "file") {
-		result.Domain = DomainFiles
-	} else if strings.Contains(textLower, "learning") || strings.Contains(textLower, "lesson") {
-		result.Domain = DomainLearnings
+func (c *Classifier) detectIntent(textLower string) (Intent, float64) {
+	if c.containsAny(textLower, []string{"recall", "retrieve", "query"}) {
+		return IntentRecall, 0.6
 	}
+	if c.containsAny(textLower, []string{"store", "record", "log"}) {
+		return IntentStore, 0.6
+	}
+	if c.containsAny(textLower, []string{"check", "verify"}) {
+		return IntentCheck, 0.6
+	}
+	return IntentUnknown, 0.0
+}
 
-	// Check for retrospective/prospective
-	if strings.Contains(textLower, "prospective") || strings.Contains(textLower, "future") || strings.Contains(textLower, "should") {
+func (c *Classifier) applyHeuristicDomain(textLower string, result *ClassificationResult) {
+	if domain := c.detectDomain(textLower); domain != DomainUnknown {
+		result.Domain = domain
+	}
+}
+
+func (c *Classifier) detectDomain(textLower string) Domain {
+	if c.containsAny(textLower, []string{"pattern"}) {
+		return DomainPatterns
+	}
+	if c.containsAny(textLower, []string{"failure", "error"}) {
+		return DomainFailures
+	}
+	if c.containsAny(textLower, []string{"decision"}) {
+		return DomainDecisions
+	}
+	if c.containsAny(textLower, []string{"file"}) {
+		return DomainFiles
+	}
+	if c.containsAny(textLower, []string{"learning", "lesson"}) {
+		return DomainLearnings
+	}
+	return DomainUnknown
+}
+
+func (c *Classifier) applyHeuristicRetrospective(textLower string, result *ClassificationResult) {
+	if c.containsAny(textLower, []string{"prospective", "future", "should"}) {
 		result.IsRetrospective = false
 	}
+}
 
-	return result, nil
+func (c *Classifier) containsAny(textLower string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(textLower, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseToolUseResult parses the JSON input from tool use
@@ -418,39 +469,52 @@ func (cr *ClassificationResult) ToRouteResult(processingTime time.Duration) *Rou
 		ProcessingTime:       processingTime,
 	}
 
-	// Determine target agent
+	cr.assignTargetRouting(result)
+	cr.applyRejection(result)
+	result.Action = determineAction(cr.Confidence)
+	cr.applyMultiIntent(result)
+
+	return result
+}
+
+func (cr *ClassificationResult) assignTargetRouting(result *RouteResult) {
 	if cr.Domain.IsHistoricalDomain() && cr.IsRetrospective {
 		result.TargetAgent = TargetArchivalist
 		result.TemporalFocus = TemporalPast
-	} else if cr.Domain == DomainSystem || cr.Domain == DomainAgents {
+		return
+	}
+	if cr.Domain == DomainSystem || cr.Domain == DomainAgents {
 		result.TargetAgent = TargetGuide
 		result.TemporalFocus = TemporalPresent
-	} else {
-		result.TargetAgent = TargetUnknown
-		result.TemporalFocus = TemporalUnknown
+		return
 	}
+	result.TargetAgent = TargetUnknown
+	result.TemporalFocus = TemporalUnknown
+}
 
-	// Check for rejection
-	if !cr.IsRetrospective && cr.Domain.IsHistoricalDomain() {
-		result.Rejected = true
-		result.Reason = cr.RejectionReason
-		if result.Reason == "" {
-			result.Reason = "Query is prospective (about future), not retrospective (about past)"
-		}
+func (cr *ClassificationResult) applyRejection(result *RouteResult) {
+	if cr.IsRetrospective || !cr.Domain.IsHistoricalDomain() {
+		return
 	}
+	result.Rejected = true
+	result.Reason = cr.rejectionReason()
+}
 
-	// Determine action based on confidence
-	result.Action = determineAction(cr.Confidence)
-
-	// Handle multi-intent
-	if cr.MultiIntent && len(cr.SubResults) > 0 {
-		result.SubResults = make([]*RouteResult, 0, len(cr.SubResults))
-		for _, sub := range cr.SubResults {
-			result.SubResults = append(result.SubResults, sub.ToRouteResult(0))
-		}
+func (cr *ClassificationResult) rejectionReason() string {
+	if cr.RejectionReason != "" {
+		return cr.RejectionReason
 	}
+	return "Query is prospective (about future), not retrospective (about past)"
+}
 
-	return result
+func (cr *ClassificationResult) applyMultiIntent(result *RouteResult) {
+	if !cr.MultiIntent || len(cr.SubResults) == 0 {
+		return
+	}
+	result.SubResults = make([]*RouteResult, 0, len(cr.SubResults))
+	for _, sub := range cr.SubResults {
+		result.SubResults = append(result.SubResults, sub.ToRouteResult(0))
+	}
 }
 
 // determineAction determines the routing action based on confidence

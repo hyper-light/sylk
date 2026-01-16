@@ -52,10 +52,10 @@ func NewCompactor(cfg CompactorConfig) *Compactor {
 	}
 
 	return &Compactor{
-		store:               cfg.Store,
-		archive:             cfg.Archive,
-		factExtractor:       NewFactExtractor(sessionID),
-		summaryGenerator:    NewSummaryGenerator(SummaryGeneratorConfig{
+		store:         cfg.Store,
+		archive:       cfg.Archive,
+		factExtractor: NewFactExtractor(sessionID),
+		summaryGenerator: NewSummaryGenerator(SummaryGeneratorConfig{
 			Client:  cfg.Client,
 			Archive: cfg.Archive,
 		}),
@@ -85,75 +85,111 @@ func (c *Compactor) ShouldCompact() bool {
 // Compact performs a full compaction cycle
 func (c *Compactor) Compact(ctx context.Context) *CompactionResult {
 	startTime := time.Now()
-	result := &CompactionResult{}
+	result := c.newCompactionResult()
 
-	// Get entries eligible for compaction (completed, not recently accessed)
 	entries := c.getCompactionCandidates()
-	if len(entries) < c.minEntriesForSpan {
-		result.Duration = time.Since(startTime)
-		return result
+	if !c.hasMinEntries(entries) {
+		return c.finalizeCompaction(result, startTime)
 	}
 
 	result.EntriesProcessed = len(entries)
-
-	// Extract facts from entries
-	facts := c.factExtractor.ExtractAll(entries)
-	fileChanges := c.factExtractor.ExtractFileChanges(entries)
-	facts.FileChanges = fileChanges
+	facts := c.extractFacts(entries)
 	result.FactsExtracted = facts
 
-	// Save facts to archive
-	if c.archive != nil {
-		if err := c.saveFacts(facts); err != nil {
-			result.Error = fmt.Errorf("failed to save facts: %w", err)
-			result.Duration = time.Since(startTime)
-			return result
-		}
+	if err := c.saveFactsIfAvailable(facts); err != nil {
+		return c.failCompaction(result, startTime, fmt.Errorf("failed to save facts: %w", err))
 	}
 
-	// Generate span summaries
+	summaries, tokens := c.generateSpanSummaries(ctx, entries, c.minEntriesForSpan)
+	result.SummariesGenerated = summaries
+	result.TokensReclaimed += tokens
+
+	c.archiveEntriesIfEnabled(entries, result)
+
+	return c.finalizeCompaction(result, startTime)
+}
+
+func (c *Compactor) newCompactionResult() *CompactionResult {
+	return &CompactionResult{}
+}
+
+func (c *Compactor) hasMinEntries(entries []*Entry) bool {
+	return len(entries) >= c.minEntriesForSpan
+}
+
+func (c *Compactor) extractFacts(entries []*Entry) *ExtractedFacts {
+	facts := c.factExtractor.ExtractAll(entries)
+	facts.FileChanges = c.factExtractor.ExtractFileChanges(entries)
+	return facts
+}
+
+func (c *Compactor) saveFactsIfAvailable(facts *ExtractedFacts) error {
+	if c.archive == nil {
+		return nil
+	}
+	return c.saveFacts(facts)
+}
+
+func (c *Compactor) generateSpanSummaries(ctx context.Context, entries []*Entry, minEntries int) ([]*CompactedSummary, int) {
 	spans := c.summaryGenerator.CompactEntries(entries)
 	sessionID := c.store.GetCurrentSession().ID
+	var summaries []*CompactedSummary
+	var tokensReclaimed int
 
 	for _, span := range spans {
-		if len(span) < c.minEntriesForSpan {
+		if len(span) < minEntries {
 			continue
 		}
-
 		summary, err := c.summaryGenerator.GenerateSpanSummary(ctx, span, sessionID)
 		if err != nil {
-			// Log error but continue with other spans
 			continue
 		}
-
-		result.SummariesGenerated = append(result.SummariesGenerated, summary)
-
-		// Save summary to archive
-		if c.archive != nil {
-			if err := c.archive.SaveSummary(summary); err != nil {
-				// Log error but continue
-				continue
-			}
-		}
-
-		// Calculate tokens reclaimed (original entries - summary)
-		for _, e := range span {
-			result.TokensReclaimed += e.TokensEstimate
-		}
-		result.TokensReclaimed -= summary.TokensEstimate
+		summaries = append(summaries, summary)
+		tokensReclaimed += spanTokens(span) - summary.TokensEstimate
+		c.saveSummaryIfAvailable(summary)
 	}
 
-	// Archive original entries if configured
-	if c.autoArchiveComplete && c.archive != nil {
-		if err := c.archive.ArchiveEntries(entries); err == nil {
-			result.EntriesArchived = len(entries)
-			// Remove from hot storage
-			for _, e := range entries {
-				c.store.MarkArchived(e.ID)
-			}
-		}
-	}
+	return summaries, tokensReclaimed
+}
 
+func spanTokens(entries []*Entry) int {
+	total := 0
+	for _, entry := range entries {
+		total += entry.TokensEstimate
+	}
+	return total
+}
+
+func (c *Compactor) saveSummaryIfAvailable(summary *CompactedSummary) {
+	if c.archive == nil {
+		return
+	}
+	_ = c.archive.SaveSummary(summary)
+}
+
+func (c *Compactor) archiveEntriesIfEnabled(entries []*Entry, result *CompactionResult) {
+	if !c.autoArchiveComplete || c.archive == nil {
+		return
+	}
+	if err := c.archive.ArchiveEntries(entries); err != nil {
+		return
+	}
+	result.EntriesArchived = len(entries)
+	c.markArchived(entries)
+}
+
+func (c *Compactor) markArchived(entries []*Entry) {
+	for _, entry := range entries {
+		c.store.MarkArchived(entry.ID)
+	}
+}
+
+func (c *Compactor) failCompaction(result *CompactionResult, startTime time.Time, err error) *CompactionResult {
+	result.Error = err
+	return c.finalizeCompaction(result, startTime)
+}
+
+func (c *Compactor) finalizeCompaction(result *CompactionResult, startTime time.Time) *CompactionResult {
 	result.Duration = time.Since(startTime)
 	return result
 }
@@ -161,79 +197,67 @@ func (c *Compactor) Compact(ctx context.Context) *CompactionResult {
 // CompactSession performs end-of-session compaction
 func (c *Compactor) CompactSession(ctx context.Context, session *Session) (*CompactionResult, error) {
 	startTime := time.Now()
-	result := &CompactionResult{}
+	result := c.newCompactionResult()
 
-	// Get all entries for the session
-	entries, err := c.store.Query(ArchiveQuery{
-		SessionIDs: []string{session.ID},
-	})
+	entries, err := c.querySessionEntries(session.ID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query session entries: %w", err)
+		return nil, err
 	}
 
 	result.EntriesProcessed = len(entries)
-
-	// Extract facts
-	facts := c.factExtractor.ExtractAll(entries)
-	fileChanges := c.factExtractor.ExtractFileChanges(entries)
-	facts.FileChanges = fileChanges
+	facts := c.extractFacts(entries)
 	result.FactsExtracted = facts
 
-	// Save facts
-	if c.archive != nil {
-		if err := c.saveFacts(facts); err != nil {
-			return nil, fmt.Errorf("failed to save facts: %w", err)
-		}
+	if err := c.saveFactsIfAvailable(facts); err != nil {
+		return nil, fmt.Errorf("failed to save facts: %w", err)
 	}
 
-	// Generate span summaries first
-	spans := c.summaryGenerator.CompactEntries(entries)
-	var spanSummaries []*CompactedSummary
+	spanSummaries, tokens := c.generateSpanSummaries(ctx, entries, 3)
+	result.SummariesGenerated = append(result.SummariesGenerated, spanSummaries...)
+	result.TokensReclaimed += tokens
 
-	for _, span := range spans {
-		if len(span) < 3 { // Lower threshold for session compaction
-			continue
-		}
-
-		summary, err := c.summaryGenerator.GenerateSpanSummary(ctx, span, session.ID)
-		if err != nil {
-			continue
-		}
-
-		spanSummaries = append(spanSummaries, summary)
-		result.SummariesGenerated = append(result.SummariesGenerated, summary)
-
-		if c.archive != nil {
-			c.archive.SaveSummary(summary)
-		}
-	}
-
-	// Generate session summary from span summaries
-	sessionSummary, err := c.summaryGenerator.GenerateSessionSummary(ctx, session, entries, spanSummaries)
-	if err == nil {
-		result.SummariesGenerated = append(result.SummariesGenerated, sessionSummary)
-		if c.archive != nil {
-			c.archive.SaveSummary(sessionSummary)
-		}
-	}
-
-	// Calculate tokens reclaimed
-	for _, e := range entries {
-		result.TokensReclaimed += e.TokensEstimate
-	}
-	for _, s := range result.SummariesGenerated {
-		result.TokensReclaimed -= s.TokensEstimate
-	}
-
-	// Archive all session entries
-	if c.archive != nil {
-		if err := c.archive.ArchiveEntries(entries); err == nil {
-			result.EntriesArchived = len(entries)
-		}
-	}
+	c.appendSessionSummary(ctx, session, entries, spanSummaries, result)
+	c.appendEntryTokens(entries, result)
+	c.archiveSessionEntries(entries, result)
 
 	result.Duration = time.Since(startTime)
 	return result, nil
+}
+
+func (c *Compactor) querySessionEntries(sessionID string) ([]*Entry, error) {
+	entries, err := c.store.Query(ArchiveQuery{SessionIDs: []string{sessionID}})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query session entries: %w", err)
+	}
+	return entries, nil
+}
+
+func (c *Compactor) appendSessionSummary(ctx context.Context, session *Session, entries []*Entry, spanSummaries []*CompactedSummary, result *CompactionResult) {
+	summary, err := c.summaryGenerator.GenerateSessionSummary(ctx, session, entries, spanSummaries)
+	if err != nil {
+		return
+	}
+	result.SummariesGenerated = append(result.SummariesGenerated, summary)
+	c.saveSummaryIfAvailable(summary)
+}
+
+func (c *Compactor) appendEntryTokens(entries []*Entry, result *CompactionResult) {
+	for _, entry := range entries {
+		result.TokensReclaimed += entry.TokensEstimate
+	}
+	for _, summary := range result.SummariesGenerated {
+		result.TokensReclaimed -= summary.TokensEstimate
+	}
+}
+
+func (c *Compactor) archiveSessionEntries(entries []*Entry, result *CompactionResult) {
+	if c.archive == nil {
+		return
+	}
+	if err := c.archive.ArchiveEntries(entries); err != nil {
+		return
+	}
+	result.EntriesArchived = len(entries)
 }
 
 // getCompactionCandidates returns entries eligible for compaction
@@ -266,30 +290,73 @@ func (c *Compactor) getCompactionCandidates() []*Entry {
 
 // saveFacts saves all extracted facts to the archive
 func (c *Compactor) saveFacts(facts *ExtractedFacts) error {
-	for _, d := range facts.Decisions {
-		if err := c.archive.SaveFactDecision(d); err != nil {
+	savers := []func(*ExtractedFacts) error{
+		c.saveDecisionFacts,
+		c.savePatternFacts,
+		c.saveFailureFacts,
+		c.saveFileChangeFacts,
+	}
+	return runFactSavers(facts, savers)
+}
+
+func runFactSavers(facts *ExtractedFacts, savers []func(*ExtractedFacts) error) error {
+	for _, saver := range savers {
+		if err := saver(facts); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
-	for _, p := range facts.Patterns {
-		if err := c.archive.SaveFactPattern(p); err != nil {
+func (c *Compactor) saveDecisionFacts(facts *ExtractedFacts) error {
+	return saveFactDecisions(c.archive, facts.Decisions)
+}
+
+func (c *Compactor) savePatternFacts(facts *ExtractedFacts) error {
+	return saveFactPatterns(c.archive, facts.Patterns)
+}
+
+func (c *Compactor) saveFailureFacts(facts *ExtractedFacts) error {
+	return saveFactFailures(c.archive, facts.Failures)
+}
+
+func (c *Compactor) saveFileChangeFacts(facts *ExtractedFacts) error {
+	return saveFactFileChanges(c.archive, facts.FileChanges)
+}
+
+func saveFactDecisions(archive *Archive, decisions []*FactDecision) error {
+	for _, decision := range decisions {
+		if err := archive.SaveFactDecision(decision); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
-	for _, f := range facts.Failures {
-		if err := c.archive.SaveFactFailure(f); err != nil {
+func saveFactPatterns(archive *Archive, patterns []*FactPattern) error {
+	for _, pattern := range patterns {
+		if err := archive.SaveFactPattern(pattern); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
-	for _, fc := range facts.FileChanges {
-		if err := c.archive.SaveFactFileChange(fc); err != nil {
+func saveFactFailures(archive *Archive, failures []*FactFailure) error {
+	for _, failure := range failures {
+		if err := archive.SaveFactFailure(failure); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
+func saveFactFileChanges(archive *Archive, changes []*FactFileChange) error {
+	for _, change := range changes {
+		if err := archive.SaveFactFileChange(change); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -299,73 +366,105 @@ func (c *Compactor) GetRetrievalContext(ctx context.Context, query string, maxTo
 		return nil, fmt.Errorf("archive not available")
 	}
 
-	result := &RetrievalContext{
+	result := newRetrievalContext(query, maxTokens)
+	budget := newTokenBudget(maxTokens)
+
+	c.addSummaries(result, query, budget)
+	c.addDecisionFacts(result, budget)
+	c.addPatternFacts(result, budget)
+	c.addFailureFacts(result, budget)
+	c.addRecentEntries(result, query, budget)
+
+	result.TotalTokens = budget.tokens
+	return result, nil
+}
+
+type tokenBudget struct {
+	max    int
+	tokens int
+}
+
+func newTokenBudget(maxTokens int) *tokenBudget {
+	return &tokenBudget{max: maxTokens}
+}
+
+func (b *tokenBudget) canAdd(tokens int) bool {
+	return b.tokens+tokens <= b.max
+}
+
+func (b *tokenBudget) add(tokens int) {
+	b.tokens += tokens
+}
+
+func newRetrievalContext(query string, maxTokens int) *RetrievalContext {
+	return &RetrievalContext{
 		Query:     query,
 		MaxTokens: maxTokens,
 	}
+}
 
-	currentTokens := 0
-
-	// 1. Search for relevant summaries first (most compressed)
+func (c *Compactor) addSummaries(result *RetrievalContext, query string, budget *tokenBudget) {
 	summaries, err := c.archive.SearchSummaries(query, 10)
-	if err == nil {
-		for _, s := range summaries {
-			if currentTokens+s.TokensEstimate > maxTokens {
-				break
-			}
-			result.Summaries = append(result.Summaries, s)
-			currentTokens += s.TokensEstimate
-		}
+	if err != nil {
+		return
 	}
+	for _, summary := range summaries {
+		if !budget.canAdd(summary.TokensEstimate) {
+			return
+		}
+		result.Summaries = append(result.Summaries, summary)
+		budget.add(summary.TokensEstimate)
+	}
+}
 
-	// 2. Get relevant facts (very compressed structured data)
-	// Decision facts
+func (c *Compactor) addDecisionFacts(result *RetrievalContext, budget *tokenBudget) {
 	decisions, _ := c.archive.QueryFactDecisions("", 20)
-	for _, d := range decisions {
-		tokens := EstimateTokens(d.Choice + d.Rationale)
-		if currentTokens+tokens > maxTokens {
-			break
+	for _, decision := range decisions {
+		tokens := EstimateTokens(decision.Choice + decision.Rationale)
+		if !budget.canAdd(tokens) {
+			return
 		}
-		result.Decisions = append(result.Decisions, d)
-		currentTokens += tokens
+		result.Decisions = append(result.Decisions, decision)
+		budget.add(tokens)
 	}
+}
 
-	// Pattern facts
+func (c *Compactor) addPatternFacts(result *RetrievalContext, budget *tokenBudget) {
 	patterns, _ := c.archive.QueryFactPatterns("", 20)
-	for _, p := range patterns {
-		tokens := EstimateTokens(p.Pattern + p.Example)
-		if currentTokens+tokens > maxTokens {
-			break
+	for _, pattern := range patterns {
+		tokens := EstimateTokens(pattern.Pattern + pattern.Example)
+		if !budget.canAdd(tokens) {
+			return
 		}
-		result.Patterns = append(result.Patterns, p)
-		currentTokens += tokens
+		result.Patterns = append(result.Patterns, pattern)
+		budget.add(tokens)
 	}
+}
 
-	// Failure facts
+func (c *Compactor) addFailureFacts(result *RetrievalContext, budget *tokenBudget) {
 	failures, _ := c.archive.QueryFactFailures("", 20)
-	for _, f := range failures {
-		tokens := EstimateTokens(f.Approach + f.Reason + f.Resolution)
-		if currentTokens+tokens > maxTokens {
-			break
+	for _, failure := range failures {
+		tokens := EstimateTokens(failure.Approach + failure.Reason + failure.Resolution)
+		if !budget.canAdd(tokens) {
+			return
 		}
-		result.Failures = append(result.Failures, f)
-		currentTokens += tokens
+		result.Failures = append(result.Failures, failure)
+		budget.add(tokens)
 	}
+}
 
-	// 3. If we still have budget, add recent raw entries
-	if currentTokens < maxTokens {
-		entries, _ := c.archive.SearchText(query, 20)
-		for _, e := range entries {
-			if currentTokens+e.TokensEstimate > maxTokens {
-				break
-			}
-			result.Entries = append(result.Entries, e)
-			currentTokens += e.TokensEstimate
+func (c *Compactor) addRecentEntries(result *RetrievalContext, query string, budget *tokenBudget) {
+	if budget.tokens >= budget.max {
+		return
+	}
+	entries, _ := c.archive.SearchText(query, 20)
+	for _, entry := range entries {
+		if !budget.canAdd(entry.TokensEstimate) {
+			return
 		}
+		result.Entries = append(result.Entries, entry)
+		budget.add(entry.TokensEstimate)
 	}
-
-	result.TotalTokens = currentTokens
-	return result, nil
 }
 
 // RetrievalContext holds context assembled for a query
@@ -383,41 +482,62 @@ type RetrievalContext struct {
 // ToPromptContext formats the retrieval context for inclusion in a prompt
 func (rc *RetrievalContext) ToPromptContext() string {
 	var sb strings.Builder
-
-	if len(rc.Summaries) > 0 {
-		sb.WriteString("=== Previous Context ===\n\n")
-		for _, s := range rc.Summaries {
-			sb.WriteString(fmt.Sprintf("[%s Summary]\n%s\n\n", s.Level, s.Content))
-		}
-	}
-
-	if len(rc.Decisions) > 0 {
-		sb.WriteString("=== Key Decisions ===\n")
-		for _, d := range rc.Decisions {
-			sb.WriteString(fmt.Sprintf("- %s: %s\n", d.Choice, d.Rationale))
-		}
-		sb.WriteString("\n")
-	}
-
-	if len(rc.Patterns) > 0 {
-		sb.WriteString("=== Established Patterns ===\n")
-		for _, p := range rc.Patterns {
-			sb.WriteString(fmt.Sprintf("- [%s] %s: %s\n", p.Category, p.Name, p.Pattern))
-		}
-		sb.WriteString("\n")
-	}
-
-	if len(rc.Failures) > 0 {
-		sb.WriteString("=== Learned Failures ===\n")
-		for _, f := range rc.Failures {
-			line := fmt.Sprintf("- %s: %s", f.Approach, f.Reason)
-			if f.Resolution != "" {
-				line += fmt.Sprintf(" (resolved: %s)", f.Resolution)
-			}
-			sb.WriteString(line + "\n")
-		}
-		sb.WriteString("\n")
-	}
-
+	appendSummaryContext(&sb, rc.Summaries)
+	appendDecisionContext(&sb, rc.Decisions)
+	appendPatternContext(&sb, rc.Patterns)
+	appendFailureContext(&sb, rc.Failures)
 	return sb.String()
+}
+
+func appendSummaryContext(sb *strings.Builder, summaries []*CompactedSummary) {
+	if len(summaries) == 0 {
+		return
+	}
+	sb.WriteString("=== Previous Context ===\n\n")
+	for _, summary := range summaries {
+		sb.WriteString(fmt.Sprintf("[%s Summary]\n%s\n\n", summary.Level, summary.Content))
+	}
+}
+
+func appendDecisionContext(sb *strings.Builder, decisions []*FactDecision) {
+	if len(decisions) == 0 {
+		return
+	}
+	sb.WriteString("=== Key Decisions ===\n")
+	for _, decision := range decisions {
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", decision.Choice, decision.Rationale))
+	}
+	sb.WriteString("\n")
+}
+
+func appendPatternContext(sb *strings.Builder, patterns []*FactPattern) {
+	if len(patterns) == 0 {
+		return
+	}
+	sb.WriteString("=== Established Patterns ===\n")
+	for _, pattern := range patterns {
+		sb.WriteString(fmt.Sprintf("- [%s] %s: %s\n", pattern.Category, pattern.Name, pattern.Pattern))
+	}
+	sb.WriteString("\n")
+}
+
+func appendFailureContext(sb *strings.Builder, failures []*FactFailure) {
+	if len(failures) == 0 {
+		return
+	}
+	sb.WriteString("=== Learned Failures ===\n")
+	for _, failure := range failures {
+		line := failureSummaryLine(failure)
+		sb.WriteString(line)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+}
+
+func failureSummaryLine(failure *FactFailure) string {
+	line := fmt.Sprintf("- %s: %s", failure.Approach, failure.Reason)
+	if failure.Resolution == "" {
+		return line
+	}
+	return line + fmt.Sprintf(" (resolved: %s)", failure.Resolution)
 }

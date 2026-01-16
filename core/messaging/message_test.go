@@ -10,32 +10,60 @@ import (
 // =============================================================================
 
 func TestNew(t *testing.T) {
-	type TestPayload struct {
-		Value string
-	}
+	msg := New(TypeRequest, "test-agent", &testPayload{Value: "hello"})
 
-	msg := New(TypeRequest, "test-agent", &TestPayload{Value: "hello"})
+	assertMessageID(t, msg)
+	assertMessageSource(t, msg, "test-agent")
+	assertMessageType(t, msg, TypeRequest)
+	assertMessageStatus(t, msg, StatusQueued)
+	assertMessageAttempt(t, msg, 1)
+	assertMessagePriority(t, msg, PriorityNormal)
+	assertMessagePayloadValue(t, msg, "hello")
+}
 
-	if msg.ID == "" {
+type testPayload struct {
+	Value string
+}
+
+func assertMessageID(t *testing.T, message *Message[*testPayload]) {
+	if message.ID == "" {
 		t.Error("expected ID to be generated")
 	}
-	if msg.Source != "test-agent" {
-		t.Errorf("expected source 'test-agent', got %s", msg.Source)
+}
+
+func assertMessageSource(t *testing.T, message *Message[*testPayload], expected string) {
+	if message.Source != expected {
+		t.Errorf("expected source '%s', got %s", expected, message.Source)
 	}
-	if msg.Type != TypeRequest {
-		t.Errorf("expected type 'request', got %s", msg.Type)
+}
+
+func assertMessageType(t *testing.T, message *Message[*testPayload], expected MessageType) {
+	if message.Type != expected {
+		t.Errorf("expected type '%s', got %s", expected, message.Type)
 	}
-	if msg.Status != StatusQueued {
-		t.Errorf("expected status 'queued', got %s", msg.Status)
+}
+
+func assertMessageStatus(t *testing.T, message *Message[*testPayload], expected MessageStatus) {
+	if message.Status != expected {
+		t.Errorf("expected status '%s', got %s", expected, message.Status)
 	}
-	if msg.Attempt != 1 {
-		t.Errorf("expected attempt 1, got %d", msg.Attempt)
+}
+
+func assertMessageAttempt(t *testing.T, message *Message[*testPayload], expected int) {
+	if message.Attempt != expected {
+		t.Errorf("expected attempt %d, got %d", expected, message.Attempt)
 	}
-	if msg.Priority != PriorityNormal {
-		t.Errorf("expected priority normal, got %d", msg.Priority)
+}
+
+func assertMessagePriority(t *testing.T, message *Message[*testPayload], expected Priority) {
+	if message.Priority != expected {
+		t.Errorf("expected priority %d, got %d", expected, message.Priority)
 	}
-	if msg.Payload.Value != "hello" {
-		t.Errorf("expected payload value 'hello', got %s", msg.Payload.Value)
+}
+
+func assertMessagePayloadValue(t *testing.T, message *Message[*testPayload], expected string) {
+	if message.Payload.Value != expected {
+		t.Errorf("expected payload value '%s', got %s", expected, message.Payload.Value)
 	}
 }
 
@@ -49,44 +77,66 @@ func TestNewWithID(t *testing.T) {
 
 func TestMessage_BuilderPattern(t *testing.T) {
 	deadline := time.Now().Add(1 * time.Hour)
+	message := buildMessageWithMetadata(deadline)
+	assertBuilderMessage(t, message, deadline)
+}
 
-	msg := New(TypeRequest, "source", "payload").
+func buildMessageWithMetadata(deadline time.Time) *Message[string] {
+	return New(TypeRequest, "source", "payload").
 		WithCorrelation("corr-123").
 		WithParent("parent-456").
 		WithTarget("target-agent").
 		WithDeadline(deadline).
-		WithTTL(30 * time.Second).
+		WithTTL(30*time.Second).
 		WithPriority(PriorityHigh).
 		WithMaxAttempts(5).
 		WithMetadata("key1", "value1").
 		WithMetadata("key2", 42)
+}
 
-	if msg.CorrelationID != "corr-123" {
-		t.Errorf("expected correlation 'corr-123', got %s", msg.CorrelationID)
+func assertBuilderMessage(t *testing.T, message *Message[string], deadline time.Time) {
+	assertBuilderIdentifiers(t, message)
+	assertBuilderTiming(t, message, deadline)
+	assertBuilderPriority(t, message)
+	assertBuilderMetadata(t, message)
+}
+
+func assertBuilderIdentifiers(t *testing.T, message *Message[string]) {
+	if message.CorrelationID != "corr-123" {
+		t.Errorf("expected correlation 'corr-123', got %s", message.CorrelationID)
 	}
-	if msg.ParentID != "parent-456" {
-		t.Errorf("expected parent 'parent-456', got %s", msg.ParentID)
+	if message.ParentID != "parent-456" {
+		t.Errorf("expected parent 'parent-456', got %s", message.ParentID)
 	}
-	if msg.Target != "target-agent" {
-		t.Errorf("expected target 'target-agent', got %s", msg.Target)
+	if message.Target != "target-agent" {
+		t.Errorf("expected target 'target-agent', got %s", message.Target)
 	}
-	if msg.Deadline == nil || !msg.Deadline.Equal(deadline) {
+}
+
+func assertBuilderTiming(t *testing.T, message *Message[string], deadline time.Time) {
+	if message.Deadline == nil || !message.Deadline.Equal(deadline) {
 		t.Error("expected deadline to be set")
 	}
-	if msg.TTL != 30*time.Second {
-		t.Errorf("expected TTL 30s, got %v", msg.TTL)
+	if message.TTL != 30*time.Second {
+		t.Errorf("expected TTL 30s, got %v", message.TTL)
 	}
-	if msg.Priority != PriorityHigh {
-		t.Errorf("expected priority high, got %d", msg.Priority)
+}
+
+func assertBuilderPriority(t *testing.T, message *Message[string]) {
+	if message.Priority != PriorityHigh {
+		t.Errorf("expected priority high, got %d", message.Priority)
 	}
-	if msg.MaxAttempts != 5 {
-		t.Errorf("expected max attempts 5, got %d", msg.MaxAttempts)
+	if message.MaxAttempts != 5 {
+		t.Errorf("expected max attempts 5, got %d", message.MaxAttempts)
 	}
-	if msg.Metadata["key1"] != "value1" {
-		t.Errorf("expected metadata key1='value1', got %v", msg.Metadata["key1"])
+}
+
+func assertBuilderMetadata(t *testing.T, message *Message[string]) {
+	if message.Metadata["key1"] != "value1" {
+		t.Errorf("expected metadata key1='value1', got %v", message.Metadata["key1"])
 	}
-	if msg.Metadata["key2"] != 42 {
-		t.Errorf("expected metadata key2=42, got %v", msg.Metadata["key2"])
+	if message.Metadata["key2"] != 42 {
+		t.Errorf("expected metadata key2=42, got %v", message.Metadata["key2"])
 	}
 }
 
@@ -244,34 +294,102 @@ func TestMessageStatus_IsTerminal(t *testing.T) {
 }
 
 func TestMessage_CanRetry(t *testing.T) {
-	// Can retry - not terminal, not expired, under max attempts
-	msg := New(TypeRequest, "source", "payload").
-		WithMaxAttempts(3)
+	assertCanRetry(t, newRetryableMessage())
+	assertCannotRetryTerminal(t, completedMessage())
+	assertCannotRetryExpired(t, expiredMessage())
+	assertCannotRetryMaxAttempts(t, maxAttemptsMessage())
+}
+
+func newRetryableMessage() *Message[string] {
+	return New(TypeRequest, "source", "payload").WithMaxAttempts(3)
+}
+
+func completedMessage() *Message[string] {
+	msg := New(TypeRequest, "source", "payload")
+	msg.MarkCompleted()
+	return msg
+}
+
+func expiredMessage() *Message[string] {
+	msg := New(TypeRequest, "source", "payload")
+	msg.Timestamp = time.Now().Add(-2 * time.Hour)
+	msg.TTL = 1 * time.Hour
+	return msg
+}
+
+func maxAttemptsMessage() *Message[string] {
+	msg := New(TypeRequest, "source", "payload").WithMaxAttempts(3)
+	msg.Attempt = 3
+	return msg
+}
+
+func assertCanRetry(t *testing.T, msg *Message[string]) {
 	if !msg.CanRetry() {
 		t.Error("expected message to be retryable")
 	}
+}
 
-	// Cannot retry - terminal status
-	msg.MarkCompleted()
+func assertCannotRetryTerminal(t *testing.T, msg *Message[string]) {
 	if msg.CanRetry() {
 		t.Error("expected completed message not to be retryable")
 	}
+}
 
-	// Cannot retry - expired
-	msg2 := New(TypeRequest, "source", "payload")
-	msg2.Timestamp = time.Now().Add(-2 * time.Hour)
-	msg2.TTL = 1 * time.Hour
-	if msg2.CanRetry() {
+func assertCannotRetryExpired(t *testing.T, msg *Message[string]) {
+	if msg.CanRetry() {
 		t.Error("expected expired message not to be retryable")
 	}
+}
 
-	// Cannot retry - max attempts reached
-	msg3 := New(TypeRequest, "source", "payload").
-		WithMaxAttempts(3)
-	msg3.Attempt = 3
-	if msg3.CanRetry() {
+func assertCannotRetryMaxAttempts(t *testing.T, msg *Message[string]) {
+	if msg.CanRetry() {
 		t.Error("expected message at max attempts not to be retryable")
 	}
+}
+
+func assertValidMessage(t *testing.T, msg *Message[string]) {
+	if err := msg.Validate(); err != nil {
+		t.Errorf("expected valid message, got error: %v", err)
+	}
+}
+
+func assertInvalidMessage(t *testing.T, msg *Message[string], context string) {
+	if err := msg.Validate(); err == nil {
+		t.Errorf("expected error for %s", context)
+	}
+}
+
+func missingIDMessage() *Message[string] {
+	msg := New(TypeRequest, "source", "payload")
+	msg.ID = ""
+	return msg
+}
+
+func missingSourceMessage() *Message[string] {
+	return New(TypeRequest, "", "payload")
+}
+
+func missingTypeMessage() *Message[string] {
+	return New("", "source", "payload")
+}
+
+func invalidAttemptMessage() *Message[string] {
+	msg := New(TypeRequest, "source", "payload")
+	msg.Attempt = 0
+	return msg
+}
+
+func invalidDeadlineMessage() *Message[string] {
+	msg := New(TypeRequest, "source", "payload")
+	deadline := msg.Timestamp.Add(-1 * time.Hour)
+	msg.Deadline = &deadline
+	return msg
+}
+
+func negativeTTLMessage() *Message[string] {
+	msg := New(TypeRequest, "source", "payload")
+	msg.TTL = -1 * time.Second
+	return msg
 }
 
 func TestMessage_IncrementAttempt(t *testing.T) {
@@ -290,52 +408,13 @@ func TestMessage_IncrementAttempt(t *testing.T) {
 }
 
 func TestMessage_Validate(t *testing.T) {
-	// Valid message
-	msg := New(TypeRequest, "source", "payload")
-	if err := msg.Validate(); err != nil {
-		t.Errorf("expected valid message, got error: %v", err)
-	}
-
-	// Missing ID
-	msg2 := New(TypeRequest, "source", "payload")
-	msg2.ID = ""
-	if err := msg2.Validate(); err == nil {
-		t.Error("expected error for missing ID")
-	}
-
-	// Missing Source
-	msg3 := New(TypeRequest, "", "payload")
-	if err := msg3.Validate(); err == nil {
-		t.Error("expected error for missing source")
-	}
-
-	// Missing Type
-	msg4 := New("", "source", "payload")
-	if err := msg4.Validate(); err == nil {
-		t.Error("expected error for missing type")
-	}
-
-	// Invalid Attempt
-	msg5 := New(TypeRequest, "source", "payload")
-	msg5.Attempt = 0
-	if err := msg5.Validate(); err == nil {
-		t.Error("expected error for attempt < 1")
-	}
-
-	// Deadline before timestamp
-	msg6 := New(TypeRequest, "source", "payload")
-	deadline := msg6.Timestamp.Add(-1 * time.Hour)
-	msg6.Deadline = &deadline
-	if err := msg6.Validate(); err == nil {
-		t.Error("expected error for deadline before timestamp")
-	}
-
-	// Negative TTL
-	msg7 := New(TypeRequest, "source", "payload")
-	msg7.TTL = -1 * time.Second
-	if err := msg7.Validate(); err == nil {
-		t.Error("expected error for negative TTL")
-	}
+	assertValidMessage(t, New(TypeRequest, "source", "payload"))
+	assertInvalidMessage(t, missingIDMessage(), "missing ID")
+	assertInvalidMessage(t, missingSourceMessage(), "missing source")
+	assertInvalidMessage(t, missingTypeMessage(), "missing type")
+	assertInvalidMessage(t, invalidAttemptMessage(), "attempt < 1")
+	assertInvalidMessage(t, invalidDeadlineMessage(), "deadline before timestamp")
+	assertInvalidMessage(t, negativeTTLMessage(), "negative TTL")
 }
 
 func TestMessage_ValidateForRouting(t *testing.T) {
@@ -377,12 +456,19 @@ func TestMessage_Clone(t *testing.T) {
 
 	clone := original.Clone()
 
-	// New ID
+	assertCloneIdentity(t, clone, original)
+	assertClonePreservesFields(t, clone, original)
+	assertCloneResetsFields(t, clone)
+	assertCloneMetadata(t, clone, original)
+}
+
+func assertCloneIdentity(t *testing.T, clone *Message[string], original *Message[string]) {
 	if clone.ID == original.ID {
 		t.Error("expected clone to have new ID")
 	}
+}
 
-	// Preserved fields
+func assertClonePreservesFields(t *testing.T, clone *Message[string], original *Message[string]) {
 	if clone.CorrelationID != original.CorrelationID {
 		t.Error("expected correlation to be preserved")
 	}
@@ -392,8 +478,9 @@ func TestMessage_Clone(t *testing.T) {
 	if clone.Priority != original.Priority {
 		t.Error("expected priority to be preserved")
 	}
+}
 
-	// Reset fields
+func assertCloneResetsFields(t *testing.T, clone *Message[string]) {
 	if clone.Status != StatusQueued {
 		t.Error("expected status reset to queued")
 	}
@@ -406,8 +493,9 @@ func TestMessage_Clone(t *testing.T) {
 	if clone.Error != "" {
 		t.Error("expected Error reset to empty")
 	}
+}
 
-	// Deep copy metadata
+func assertCloneMetadata(t *testing.T, clone *Message[string], original *Message[string]) {
 	if clone.Metadata["key"] != "value" {
 		t.Error("expected metadata to be copied")
 	}

@@ -29,21 +29,22 @@ const (
 
 // String returns the string representation of a session state
 func (s State) String() string {
-	switch s {
-	case StateCreated:
-		return "created"
-	case StateActive:
-		return "active"
-	case StatePaused:
-		return "paused"
-	case StateSuspended:
-		return "suspended"
-	case StateCompleted:
-		return "completed"
-	case StateFailed:
-		return "failed"
-	default:
-		return "unknown"
+	if name, ok := stateStrings()[s]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+type stateStringMap map[State]string
+
+func stateStrings() stateStringMap {
+	return stateStringMap{
+		StateCreated:   "created",
+		StateActive:    "active",
+		StatePaused:    "paused",
+		StateSuspended: "suspended",
+		StateCompleted: "completed",
+		StateFailed:    "failed",
 	}
 }
 
@@ -54,22 +55,43 @@ func (s State) IsTerminal() bool {
 
 // CanTransitionTo returns true if transitioning to the target state is valid
 func (s State) CanTransitionTo(target State) bool {
-	switch s {
-	case StateCreated:
-		return target == StateActive || target == StateFailed
-	case StateActive:
-		return target == StatePaused || target == StateSuspended ||
-			target == StateCompleted || target == StateFailed
-	case StatePaused:
-		return target == StateActive || target == StateSuspended ||
-			target == StateCompleted || target == StateFailed
-	case StateSuspended:
-		return target == StateActive || target == StateFailed
-	case StateCompleted, StateFailed:
-		return false // Terminal states
-	default:
+	allowed := transitionRules()[s]
+	return allowsTransition(allowed, target)
+}
+
+type stateTransitionTable map[State][]State
+
+type stateSet map[State]struct{}
+
+func transitionRules() stateTransitionTable {
+	return stateTransitionTable{
+		StateCreated:   {StateActive, StateFailed},
+		StateActive:    {StatePaused, StateSuspended, StateCompleted, StateFailed},
+		StatePaused:    {StateActive, StateSuspended, StateCompleted, StateFailed},
+		StateSuspended: {StateActive, StateFailed},
+		StateCompleted: {},
+		StateFailed:    {},
+	}
+}
+
+func allowsTransition(allowed []State, target State) bool {
+	if len(allowed) == 0 {
 		return false
 	}
+	return stateSetFromStates(allowed).has(target)
+}
+
+func stateSetFromStates(states []State) stateSet {
+	set := make(stateSet, len(states))
+	for _, state := range states {
+		set[state] = struct{}{}
+	}
+	return set
+}
+
+func (s stateSet) has(state State) bool {
+	_, ok := s[state]
+	return ok
 }
 
 // =============================================================================
@@ -135,13 +157,13 @@ type Stats struct {
 
 // ManagerStats contains statistics for the session manager
 type ManagerStats struct {
-	TotalSessions    int           `json:"total_sessions"`
-	ActiveSessions   int           `json:"active_sessions"`
-	PausedSessions   int           `json:"paused_sessions"`
-	CompletedSessions int          `json:"completed_sessions"`
-	FailedSessions   int           `json:"failed_sessions"`
-	MaxSessions      int           `json:"max_sessions"`
-	Sessions         []Stats       `json:"sessions,omitempty"`
+	TotalSessions     int     `json:"total_sessions"`
+	ActiveSessions    int     `json:"active_sessions"`
+	PausedSessions    int     `json:"paused_sessions"`
+	CompletedSessions int     `json:"completed_sessions"`
+	FailedSessions    int     `json:"failed_sessions"`
+	MaxSessions       int     `json:"max_sessions"`
+	Sessions          []Stats `json:"sessions,omitempty"`
 }
 
 // =============================================================================
@@ -166,30 +188,31 @@ const (
 
 // String returns the string representation of an event type
 func (e EventType) String() string {
-	switch e {
-	case EventCreated:
-		return "created"
-	case EventStarted:
-		return "started"
-	case EventPaused:
-		return "paused"
-	case EventResumed:
-		return "resumed"
-	case EventSuspended:
-		return "suspended"
-	case EventRestored:
-		return "restored"
-	case EventCompleted:
-		return "completed"
-	case EventFailed:
-		return "failed"
-	case EventClosed:
-		return "closed"
-	case EventSwitched:
-		return "switched"
-	default:
-		return "unknown"
+	return eventTypeStrings().name(e)
+}
+
+type eventTypeStringMap map[EventType]string
+
+func eventTypeStrings() eventTypeStringMap {
+	return eventTypeStringMap{
+		EventCreated:   "created",
+		EventStarted:   "started",
+		EventPaused:    "paused",
+		EventResumed:   "resumed",
+		EventSuspended: "suspended",
+		EventRestored:  "restored",
+		EventCompleted: "completed",
+		EventFailed:    "failed",
+		EventClosed:    "closed",
+		EventSwitched:  "switched",
 	}
+}
+
+func (m eventTypeStringMap) name(event EventType) string {
+	if name, ok := m[event]; ok {
+		return name
+	}
+	return "unknown"
 }
 
 // Event represents a session lifecycle event

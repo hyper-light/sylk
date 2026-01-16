@@ -120,18 +120,20 @@ func (cd *ConflictDetector) DetectConflict(
 	cd.mu.RLock()
 	defer cd.mu.RUnlock()
 
-	// Get resolution rule for this scope
-	rule, ok := cd.rules[scope]
+	rule, ok := cd.ruleForScope(scope)
 	if !ok {
-		// Default: accept
-		return &ConflictResult{
-			Type:     ConflictTypeNone,
-			Strategy: ResolutionAccept,
-			Resolved: true,
-		}
+		return cd.acceptNoConflict()
 	}
 
-	// Check based on scope type
+	return cd.dispatchConflict(scope, key, incoming, agentID, rule)
+}
+
+func (cd *ConflictDetector) ruleForScope(scope Scope) (ResolutionRule, bool) {
+	rule, ok := cd.rules[scope]
+	return rule, ok
+}
+
+func (cd *ConflictDetector) dispatchConflict(scope Scope, key string, incoming map[string]any, agentID string, rule ResolutionRule) *ConflictResult {
 	switch scope {
 	case ScopeFiles:
 		return cd.detectFileConflict(key, incoming, agentID)
@@ -144,11 +146,7 @@ func (cd *ConflictDetector) DetectConflict(
 	case ScopeResume:
 		return cd.detectResumeConflict(incoming, agentID, rule)
 	default:
-		return &ConflictResult{
-			Type:     ConflictTypeNone,
-			Strategy: ResolutionAccept,
-			Resolved: true,
-		}
+		return cd.acceptNoConflict()
 	}
 }
 
@@ -238,68 +236,67 @@ func (cd *ConflictDetector) detectPatternConflict(
 	rule ResolutionRule,
 ) *ConflictResult {
 	if cd.agentContext == nil {
-		return &ConflictResult{
-			Type:     ConflictTypeNone,
-			Strategy: ResolutionAccept,
-			Resolved: true,
-		}
+		return cd.acceptNoConflict()
 	}
 
 	incomingPattern, _ := incoming["pattern"].(string)
 
-	// Check if incoming pattern matches a known failure
-	if rule.CheckFailures {
-		failures := cd.agentContext.GetRecentFailures(20)
-		for _, f := range failures {
-			if cd.patternMatchesFailure(incomingPattern, f) {
-				return &ConflictResult{
-					Type:           ConflictTypePatternFailure,
-					Strategy:       ResolutionReject,
-					Resolved:       false,
-					Message:        fmt.Sprintf("pattern '%s' matches failed approach: %s", incomingPattern, f.Approach),
-					RelatedFailure: f,
-					IncomingValue:  incomingPattern,
-				}
+	if result := cd.checkIncomingPatternFailures(incomingPattern, rule); result != nil {
+		return result
+	}
+
+	existing := cd.agentContext.GetPattern(category)
+	if existing == nil {
+		return cd.acceptNoConflict()
+	}
+
+	if existing.Pattern == incomingPattern {
+		return cd.acceptNoConflict()
+	}
+
+	if result := cd.checkExistingPatternFailures(existing.Pattern, incomingPattern, incoming); result != nil {
+		return result
+	}
+
+	return cd.combinePatternOptions(existing, incomingPattern, agentID, incoming)
+}
+
+func (cd *ConflictDetector) checkIncomingPatternFailures(pattern string, rule ResolutionRule) *ConflictResult {
+	if !rule.CheckFailures {
+		return nil
+	}
+	failures := cd.agentContext.GetRecentFailures(20)
+	for _, failure := range failures {
+		if cd.patternMatchesFailure(pattern, failure) {
+			return &ConflictResult{
+				Type:           ConflictTypePatternFailure,
+				Strategy:       ResolutionReject,
+				Resolved:       false,
+				Message:        fmt.Sprintf("pattern '%s' matches failed approach: %s", pattern, failure.Approach),
+				RelatedFailure: failure,
+				IncomingValue:  pattern,
 			}
 		}
 	}
+	return nil
+}
 
-	// Check for existing pattern in same category
-	existing := cd.agentContext.GetPattern(category)
-	if existing == nil {
-		// No existing pattern, accept
-		return &ConflictResult{
-			Type:     ConflictTypeNone,
-			Strategy: ResolutionAccept,
-			Resolved: true,
-		}
-	}
-
-	// Compare patterns
-	if existing.Pattern == incomingPattern {
-		// Same pattern, no conflict
-		return &ConflictResult{
-			Type:     ConflictTypeNone,
-			Strategy: ResolutionAccept,
-			Resolved: true,
-		}
-	}
-
-	// Check if existing pattern has a related failure
-	for _, f := range cd.agentContext.GetRecentFailures(20) {
-		if cd.patternMatchesFailure(existing.Pattern, f) {
-			// Existing pattern failed, accept incoming
+func (cd *ConflictDetector) checkExistingPatternFailures(existingPattern, incomingPattern string, incoming map[string]any) *ConflictResult {
+	for _, failure := range cd.agentContext.GetRecentFailures(20) {
+		if cd.patternMatchesFailure(existingPattern, failure) {
 			return &ConflictResult{
 				Type:       ConflictTypePattern,
 				Strategy:   ResolutionAccept,
 				Resolved:   true,
-				Message:    fmt.Sprintf("existing pattern '%s' has failure record, accepting '%s'", existing.Pattern, incomingPattern),
+				Message:    fmt.Sprintf("existing pattern '%s' has failure record, accepting '%s'", existingPattern, incomingPattern),
 				MergedData: incoming,
 			}
 		}
 	}
+	return nil
+}
 
-	// Neither has failure - combine as options
+func (cd *ConflictDetector) combinePatternOptions(existing *Pattern, incomingPattern, agentID string, incoming map[string]any) *ConflictResult {
 	merged := map[string]any{
 		"status": "pending_decision",
 		"options": []map[string]any{

@@ -7,55 +7,33 @@ import (
 	"time"
 )
 
-// =============================================================================
-// Node Dispatcher Interface
-// =============================================================================
-
-// NodeDispatcher dispatches nodes to agents for execution
 type NodeDispatcher interface {
-	// Dispatch executes a node and returns the result
 	Dispatch(ctx context.Context, node *Node, parentResults map[string]*NodeResult) (*NodeResult, error)
 }
 
-// =============================================================================
-// Executor
-// =============================================================================
-
-// Executor executes DAGs with parallel layer execution
 type Executor struct {
 	mu sync.RWMutex
 
-	// Configuration
-	policy ExecutionPolicy
+	policy       ExecutionPolicy
+	dag          *DAG
+	state        DAGState
+	currentLayer int
+	startTime    time.Time
+	nodeResults  map[string]*NodeResult
+	nodesRunning int32
+	cancelled    atomic.Bool
 
-	// Current execution state
-	dag           *DAG
-	state         DAGState
-	currentLayer  int
-	startTime     time.Time
-	nodeResults   map[string]*NodeResult
-	nodesRunning  int32
-	cancelled     atomic.Bool
-
-	// Control
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// Semaphore for concurrency limiting
 	sem chan struct{}
 
-	// Event handlers
 	handlersMu sync.RWMutex
 	handlers   []EventHandler
-
-	// Dispatcher
 	dispatcher NodeDispatcher
-
-	// Closed
-	closed atomic.Bool
+	closed     atomic.Bool
 }
 
-// NewExecutor creates a new DAG executor
 func NewExecutor(policy ExecutionPolicy) *Executor {
 	return &Executor{
 		policy:      policy,
@@ -64,30 +42,43 @@ func NewExecutor(policy ExecutionPolicy) *Executor {
 	}
 }
 
-// =============================================================================
-// Execution
-// =============================================================================
-
-// Execute runs a DAG to completion
 func (e *Executor) Execute(ctx context.Context, dag *DAG, dispatcher NodeDispatcher) (*DAGResult, error) {
 	if e.closed.Load() {
 		return nil, ErrExecutorClosed
 	}
-
-	// Validate DAG if not already done
-	if !dag.IsValidated() {
-		if err := ValidateDAG(dag); err != nil {
-			return nil, err
-		}
+	if err := e.validateExecution(dag); err != nil {
+		return nil, err
+	}
+	if err := e.initializeExecution(ctx, dag, dispatcher); err != nil {
+		return nil, err
 	}
 
+	e.emitEvent(&Event{
+		Type:      EventDAGStarted,
+		DAGID:     dag.ID(),
+		Timestamp: time.Now(),
+	})
+
+	result := e.executeLayers()
+	e.emitCompletionEvent(dag, result)
+	return result, nil
+}
+
+func (e *Executor) validateExecution(dag *DAG) error {
+	if dag.IsValidated() {
+		return nil
+	}
+	return ValidateDAG(dag)
+}
+
+func (e *Executor) initializeExecution(ctx context.Context, dag *DAG, dispatcher NodeDispatcher) error {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if e.state == DAGStateRunning {
-		e.mu.Unlock()
-		return nil, ErrDAGAlreadyRunning
+		return ErrDAGAlreadyRunning
 	}
 
-	// Initialize execution state
 	e.dag = dag
 	e.state = DAGStateRunning
 	e.currentLayer = 0
@@ -96,57 +87,46 @@ func (e *Executor) Execute(ctx context.Context, dag *DAG, dispatcher NodeDispatc
 	e.dispatcher = dispatcher
 	e.cancelled.Store(false)
 
-	// Create cancellable context
 	e.ctx, e.cancel = context.WithCancel(ctx)
+	e.configureSemaphore()
+	dag.ResetNodeStates()
+	return nil
+}
 
-	// Create semaphore for concurrency limiting
+func (e *Executor) configureSemaphore() {
 	if e.policy.MaxConcurrency > 0 {
 		e.sem = make(chan struct{}, e.policy.MaxConcurrency)
 	}
+}
 
-	// Reset node states
-	dag.ResetNodeStates()
-	e.mu.Unlock()
-
-	// Emit start event
-	e.emitEvent(&Event{
-		Type:      EventDAGStarted,
-		DAGID:     dag.ID(),
-		Timestamp: time.Now(),
-	})
-
-	// Execute layers
-	result := e.executeLayers()
-
-	// Emit completion event
-	var eventType EventType
-	switch result.State {
-	case DAGStateSucceeded:
-		eventType = EventDAGCompleted
-	case DAGStateFailed:
-		eventType = EventDAGFailed
-	case DAGStateCancelled:
-		eventType = EventDAGCancelled
-	default:
-		eventType = EventDAGCompleted
-	}
-
+func (e *Executor) emitCompletionEvent(dag *DAG, result *DAGResult) {
+	eventType := resultEventType(result.State)
 	e.emitEvent(&Event{
 		Type:      eventType,
 		DAGID:     dag.ID(),
 		Timestamp: time.Now(),
 		Data: map[string]any{
-			"duration":   result.Duration,
-			"succeeded":  result.NodesSucceeded,
-			"failed":     result.NodesFailed,
-			"skipped":    result.NodesSkipped,
+			"duration":  result.Duration,
+			"succeeded": result.NodesSucceeded,
+			"failed":    result.NodesFailed,
+			"skipped":   result.NodesSkipped,
 		},
 	})
-
-	return result, nil
 }
 
-// executeLayers executes all layers in order
+func resultEventType(state DAGState) EventType {
+	switch state {
+	case DAGStateSucceeded:
+		return EventDAGCompleted
+	case DAGStateFailed:
+		return EventDAGFailed
+	case DAGStateCancelled:
+		return EventDAGCancelled
+	default:
+		return EventDAGCompleted
+	}
+}
+
 func (e *Executor) executeLayers() *DAGResult {
 	layers := e.dag.ExecutionOrder()
 
@@ -159,7 +139,6 @@ func (e *Executor) executeLayers() *DAGResult {
 		e.currentLayer = layerIdx
 		e.mu.Unlock()
 
-		// Emit layer start event
 		e.emitEvent(&Event{
 			Type:      EventLayerStarted,
 			DAGID:     e.dag.ID(),
@@ -170,16 +149,13 @@ func (e *Executor) executeLayers() *DAGResult {
 			},
 		})
 
-		// Execute nodes in this layer
 		if err := e.executeLayer(layer); err != nil {
-			// Check if we should fail fast
 			if e.policy.FailurePolicy == FailurePolicyFailFast {
-				e.cancelRemainingNodes()
+				e.cancelRemainingNodes(false)
 				break
 			}
 		}
 
-		// Emit layer complete event
 		e.emitEvent(&Event{
 			Type:      EventLayerCompleted,
 			DAGID:     e.dag.ID(),
@@ -191,152 +167,262 @@ func (e *Executor) executeLayers() *DAGResult {
 	return e.buildResult()
 }
 
-// executeLayer executes all nodes in a layer in parallel
+type layerAction int
+
+const (
+	layerActionRun layerAction = iota
+	layerActionSkip
+	layerActionStop
+)
+
+type layerErrorState struct {
+	errOnce  sync.Once
+	firstErr *error
+}
+
+func (s *layerErrorState) record(err error) {
+	if err == nil {
+		return
+	}
+	s.errOnce.Do(func() {
+		*s.firstErr = err
+	})
+}
+
 func (e *Executor) executeLayer(nodeIDs []string) error {
 	var wg sync.WaitGroup
 	var firstErr error
-	var errOnce sync.Once
+	errState := &layerErrorState{firstErr: &firstErr}
 
+loop:
 	for _, nodeID := range nodeIDs {
-		if e.cancelled.Load() {
-			break
+		action, node, err := e.layerAction(nodeID)
+		if err != nil {
+			return err
 		}
-
-		node, ok := e.dag.GetNode(nodeID)
-		if !ok {
+		switch action {
+		case layerActionStop:
+			break loop
+		case layerActionSkip:
 			continue
+		case layerActionRun:
+			e.launchNodeExecution(&wg, node, errState)
 		}
-
-		// Check if node is blocked by failed dependencies
-		nodeStates := e.dag.GetNodeStates()
-		if node.IsBlocked(nodeStates) {
-			e.markNodeBlocked(node)
-			continue
-		}
-
-		// Check if node is ready (all deps succeeded)
-		if !node.IsReady(nodeStates) {
-			// This shouldn't happen if layers are computed correctly
-			e.markNodeBlocked(node)
-			continue
-		}
-
-		// Acquire semaphore if concurrency limited
-		if e.sem != nil {
-			select {
-			case e.sem <- struct{}{}:
-			case <-e.ctx.Done():
-				return e.ctx.Err()
-			}
-		}
-
-		wg.Add(1)
-		atomic.AddInt32(&e.nodesRunning, 1)
-
-		go func(n *Node) {
-			defer wg.Done()
-			defer atomic.AddInt32(&e.nodesRunning, -1)
-			defer func() {
-				if e.sem != nil {
-					<-e.sem
-				}
-			}()
-
-			err := e.executeNode(n)
-			if err != nil {
-				errOnce.Do(func() {
-					firstErr = err
-				})
-			}
-		}(node)
 	}
 
 	wg.Wait()
 	return firstErr
 }
 
-// executeNode executes a single node with retries
+func (e *Executor) layerAction(nodeID string) (layerAction, *Node, error) {
+	if e.cancelled.Load() {
+		return layerActionStop, nil, nil
+	}
+
+	node := e.nodeForLayer(nodeID)
+	if node == nil {
+		return layerActionSkip, nil, nil
+	}
+
+	if err := e.acquireLayerSlot(); err != nil {
+		return layerActionStop, nil, err
+	}
+
+	return layerActionRun, node, nil
+}
+
+func (e *Executor) nodeForLayer(nodeID string) *Node {
+	node, ok := e.dag.GetNode(nodeID)
+	if !ok {
+		return nil
+	}
+
+	nodeStates := e.dag.GetNodeStates()
+	if node.IsBlocked(nodeStates) {
+		e.markNodeBlocked(node)
+		return nil
+	}
+
+	if !node.IsReady(nodeStates) {
+		e.markNodeBlocked(node)
+		return nil
+	}
+
+	return node
+}
+
+func (e *Executor) acquireLayerSlot() error {
+	if e.sem == nil {
+		return nil
+	}
+
+	select {
+	case e.sem <- struct{}{}:
+		return nil
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	}
+}
+
+func (e *Executor) releaseLayerSlot() {
+	if e.sem != nil {
+		<-e.sem
+	}
+}
+
+func (e *Executor) launchNodeExecution(wg *sync.WaitGroup, node *Node, errState *layerErrorState) {
+	wg.Add(1)
+	atomic.AddInt32(&e.nodesRunning, 1)
+
+	go func(n *Node) {
+		defer wg.Done()
+		defer atomic.AddInt32(&e.nodesRunning, -1)
+		defer e.releaseLayerSlot()
+
+		errState.record(e.executeNode(n))
+	}(node)
+}
+
 func (e *Executor) executeNode(node *Node) error {
 	nodeID := node.ID()
-
-	// Get parent results for context
 	parentResults := e.getParentResults(node)
+	timeout := e.resolveNodeTimeout(node)
+	maxRetries := e.resolveNodeRetries(node)
 
-	// Determine timeout
-	timeout := node.Timeout()
-	if timeout == 0 {
-		timeout = e.policy.DefaultTimeout
+	result, err := e.executeNodeWithRetry(node, nodeID, parentResults, timeout, maxRetries)
+	if result != nil {
+		e.recordNodeResult(node, result)
 	}
+	return err
+}
 
-	// Determine max retries
-	maxRetries := node.Retries()
-	if maxRetries == 0 {
-		maxRetries = e.policy.DefaultRetries
-	}
-
+func (e *Executor) executeNodeWithRetry(node *Node, nodeID string, parentResults map[string]*NodeResult, timeout time.Duration, maxRetries int) (*NodeResult, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if e.cancelled.Load() {
-			e.markNodeCancelled(node)
-			return ErrDAGCancelled
+		if err := e.prepareAttempt(node, nodeID, attempt); err != nil {
+			return nil, err
 		}
 
-		// Emit retry event if retrying
-		if attempt > 0 {
-			node.IncrementRetryCount()
-			e.emitEvent(&Event{
-				Type:      EventNodeRetrying,
-				DAGID:     e.dag.ID(),
-				NodeID:    nodeID,
-				Timestamp: time.Now(),
-				Data: map[string]any{
-					"attempt": attempt,
-				},
-			})
-
-			// Backoff between retries
-			select {
-			case <-time.After(e.policy.RetryBackoff):
-			case <-e.ctx.Done():
-				e.markNodeCancelled(node)
-				return e.ctx.Err()
-			}
-		}
-
-		// Execute the node
 		result, err := e.dispatchNode(node, parentResults, timeout)
-
-		if err == nil && result.IsSuccess() {
-			e.recordNodeResult(node, result)
-			return nil
-		}
-
-		lastErr = err
-		if result != nil && result.Error != nil {
-			lastErr = result.Error
+		success, dispatchErr := e.handleDispatchResult(result, err)
+		lastErr = dispatchErr
+		if success {
+			return result, nil
 		}
 	}
 
-	// All retries exhausted
-	result := &NodeResult{
+	return e.failedNodeResult(node, nodeID, lastErr), lastErr
+}
+
+func (e *Executor) prepareAttempt(node *Node, nodeID string, attempt int) error {
+	if e.cancelled.Load() {
+		e.markNodeCancelled(node)
+		return ErrDAGCancelled
+	}
+	if attempt == 0 {
+		return nil
+	}
+
+	node.IncrementRetryCount()
+	e.emitEvent(&Event{
+		Type:      EventNodeRetrying,
+		DAGID:     e.dag.ID(),
+		NodeID:    nodeID,
+		Timestamp: time.Now(),
+		Data: map[string]any{
+			"attempt": attempt,
+		},
+	})
+
+	return e.waitRetryBackoff(node)
+}
+
+func (e *Executor) waitRetryBackoff(node *Node) error {
+	select {
+	case <-time.After(e.policy.RetryBackoff):
+		return nil
+	case <-e.ctx.Done():
+		e.markNodeCancelled(node)
+		return e.ctx.Err()
+	}
+}
+
+func (e *Executor) resolveNodeTimeout(node *Node) time.Duration {
+	timeout := node.Timeout()
+	if timeout == 0 {
+		return e.policy.DefaultTimeout
+	}
+	return timeout
+}
+
+func (e *Executor) resolveNodeRetries(node *Node) int {
+	maxRetries := node.Retries()
+	if maxRetries == 0 {
+		return e.policy.DefaultRetries
+	}
+	return maxRetries
+}
+
+func (e *Executor) handleDispatchResult(result *NodeResult, err error) (bool, error) {
+	if isDispatchSuccess(result, err) {
+		return true, nil
+	}
+	return false, dispatchError(err, result)
+}
+
+func isDispatchSuccess(result *NodeResult, err error) bool {
+	if err != nil {
+		return false
+	}
+	if result == nil {
+		return false
+	}
+	return result.IsSuccess()
+}
+
+func dispatchError(err error, result *NodeResult) error {
+	if result == nil {
+		return err
+	}
+	if result.Error == nil {
+		return err
+	}
+	return result.Error
+}
+
+func (e *Executor) failedNodeResult(node *Node, nodeID string, err error) *NodeResult {
+	return &NodeResult{
 		NodeID:   nodeID,
 		State:    NodeStateFailed,
-		Error:    lastErr,
+		Error:    err,
 		EndTime:  time.Now(),
 		Duration: time.Since(node.StartTime()),
 		Retries:  node.RetryCount(),
 	}
-
-	e.recordNodeResult(node, result)
-	return lastErr
 }
 
-// dispatchNode dispatches a node for execution
 func (e *Executor) dispatchNode(node *Node, parentResults map[string]*NodeResult, timeout time.Duration) (*NodeResult, error) {
 	nodeID := node.ID()
+	e.markNodeQueued(node, nodeID)
+	e.markNodeStarted(node, nodeID)
 
-	// Mark node as queued
+	ctx, cancel := e.nodeContext(timeout)
+	defer cancel()
+
+	if e.dispatcher == nil {
+		return failedDispatchResult(nodeID, ErrNodeNotFound, 0), ErrNodeNotFound
+	}
+
+	result, err := e.dispatcher.Dispatch(ctx, node, parentResults)
+	if ctx.Err() == context.DeadlineExceeded {
+		return failedDispatchResult(nodeID, ErrNodeTimeout, time.Since(node.StartTime())), ErrNodeTimeout
+	}
+
+	return result, err
+}
+
+func (e *Executor) markNodeQueued(node *Node, nodeID string) {
 	node.SetState(NodeStateQueued)
 	e.emitEvent(&Event{
 		Type:      EventNodeQueued,
@@ -344,8 +430,9 @@ func (e *Executor) dispatchNode(node *Node, parentResults map[string]*NodeResult
 		NodeID:    nodeID,
 		Timestamp: time.Now(),
 	})
+}
 
-	// Mark node as running
+func (e *Executor) markNodeStarted(node *Node, nodeID string) {
 	node.SetState(NodeStateRunning)
 	node.SetStartTime(time.Now())
 	e.emitEvent(&Event{
@@ -354,42 +441,28 @@ func (e *Executor) dispatchNode(node *Node, parentResults map[string]*NodeResult
 		NodeID:    nodeID,
 		Timestamp: time.Now(),
 	})
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(e.ctx, timeout)
-	defer cancel()
-
-	// Dispatch to agent
-	if e.dispatcher == nil {
-		return &NodeResult{
-			NodeID:  nodeID,
-			State:   NodeStateFailed,
-			Error:   ErrNodeNotFound,
-			EndTime: time.Now(),
-		}, ErrNodeNotFound
-	}
-
-	result, err := e.dispatcher.Dispatch(ctx, node, parentResults)
-
-	// Check for timeout
-	if ctx.Err() == context.DeadlineExceeded {
-		return &NodeResult{
-			NodeID:   nodeID,
-			State:    NodeStateFailed,
-			Error:    ErrNodeTimeout,
-			EndTime:  time.Now(),
-			Duration: time.Since(node.StartTime()),
-		}, ErrNodeTimeout
-	}
-
-	return result, err
 }
 
-// =============================================================================
-// Helper Methods
-// =============================================================================
+func (e *Executor) nodeContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return e.ctx, func() {}
+	}
+	return context.WithTimeout(e.ctx, timeout)
+}
 
-// getParentResults returns results from dependency nodes
+func failedDispatchResult(nodeID string, err error, duration time.Duration) *NodeResult {
+	result := &NodeResult{
+		NodeID:  nodeID,
+		State:   NodeStateFailed,
+		Error:   err,
+		EndTime: time.Now(),
+	}
+	if duration > 0 {
+		result.Duration = duration
+	}
+	return result
+}
+
 func (e *Executor) getParentResults(node *Node) map[string]*NodeResult {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -406,7 +479,6 @@ func (e *Executor) getParentResults(node *Node) map[string]*NodeResult {
 	return results
 }
 
-// recordNodeResult records a node's result
 func (e *Executor) recordNodeResult(node *Node, result *NodeResult) {
 	e.mu.Lock()
 	e.nodeResults[node.ID()] = result
@@ -414,7 +486,6 @@ func (e *Executor) recordNodeResult(node *Node, result *NodeResult) {
 
 	node.SetResult(result)
 
-	// Emit appropriate event
 	var eventType EventType
 	switch result.State {
 	case NodeStateSucceeded:
@@ -440,7 +511,6 @@ func (e *Executor) recordNodeResult(node *Node, result *NodeResult) {
 	})
 }
 
-// markNodeBlocked marks a node as blocked
 func (e *Executor) markNodeBlocked(node *Node) {
 	result := &NodeResult{
 		NodeID:  node.ID(),
@@ -450,7 +520,6 @@ func (e *Executor) markNodeBlocked(node *Node) {
 	e.recordNodeResult(node, result)
 }
 
-// markNodeCancelled marks a node as cancelled
 func (e *Executor) markNodeCancelled(node *Node) {
 	result := &NodeResult{
 		NodeID:  node.ID(),
@@ -461,7 +530,6 @@ func (e *Executor) markNodeCancelled(node *Node) {
 	e.recordNodeResult(node, result)
 }
 
-// markNodeSkipped marks a node as skipped
 func (e *Executor) markNodeSkipped(node *Node) {
 	result := &NodeResult{
 		NodeID:  node.ID(),
@@ -478,69 +546,73 @@ func (e *Executor) markNodeSkipped(node *Node) {
 	})
 }
 
-// cancelRemainingNodes cancels all pending nodes
-func (e *Executor) cancelRemainingNodes() {
-	e.cancelled.Store(true)
+func (e *Executor) cancelRemainingNodes(markCancelled bool) {
+	if markCancelled {
+		e.cancelled.Store(true)
+	}
 	if e.cancel != nil {
 		e.cancel()
 	}
 
-	// Mark all pending nodes as cancelled
 	for _, node := range e.dag.Nodes() {
 		state := node.State()
-		if !state.IsTerminal() && state != NodeStateRunning {
-			e.markNodeCancelled(node)
+		if state.IsTerminal() {
+			continue
 		}
+		e.markNodeCancelled(node)
 	}
 }
 
-// buildResult builds the final DAG result
 func (e *Executor) buildResult() *DAGResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	result := e.newResultSnapshot()
+	for nodeID, nodeResult := range e.nodeResults {
+		result.NodeResults[nodeID] = nodeResult
+		e.tallyNodeResult(result, nodeResult)
+	}
+
+	e.applyResultState(result)
+	e.state = result.State
+	return result
+}
+
+func (e *Executor) newResultSnapshot() *DAGResult {
 	endTime := time.Now()
-	result := &DAGResult{
+	return &DAGResult{
 		ID:          e.dag.ID(),
 		NodeResults: make(map[string]*NodeResult),
 		StartTime:   e.startTime,
 		EndTime:     endTime,
 		Duration:    endTime.Sub(e.startTime),
 	}
+}
 
-	// Copy node results and count states
-	for nodeID, nodeResult := range e.nodeResults {
-		result.NodeResults[nodeID] = nodeResult
-
-		switch nodeResult.State {
-		case NodeStateSucceeded:
-			result.NodesSucceeded++
-		case NodeStateFailed:
-			result.NodesFailed++
-		case NodeStateSkipped, NodeStateBlocked, NodeStateCancelled:
-			result.NodesSkipped++
-		}
+func (e *Executor) tallyNodeResult(result *DAGResult, nodeResult *NodeResult) {
+	switch nodeResult.State {
+	case NodeStateSucceeded:
+		result.NodesSucceeded++
+	case NodeStateFailed:
+		result.NodesFailed++
+	case NodeStateSkipped, NodeStateBlocked, NodeStateCancelled:
+		result.NodesSkipped++
 	}
+}
 
-	// Determine overall state
+func (e *Executor) applyResultState(result *DAGResult) {
 	if e.cancelled.Load() {
 		result.State = DAGStateCancelled
 		result.Error = ErrDAGCancelled
-	} else if result.NodesFailed > 0 {
-		result.State = DAGStateFailed
-	} else {
-		result.State = DAGStateSucceeded
+		return
 	}
-
-	e.state = result.State
-	return result
+	if result.NodesFailed > 0 {
+		result.State = DAGStateFailed
+		return
+	}
+	result.State = DAGStateSucceeded
 }
 
-// =============================================================================
-// Control Methods
-// =============================================================================
-
-// Cancel cancels the current execution
 func (e *Executor) Cancel() error {
 	e.mu.RLock()
 	if e.state != DAGStateRunning {
@@ -549,11 +621,10 @@ func (e *Executor) Cancel() error {
 	}
 	e.mu.RUnlock()
 
-	e.cancelRemainingNodes()
+	e.cancelRemainingNodes(true)
 	return nil
 }
 
-// Status returns the current execution status
 func (e *Executor) Status() *DAGStatus {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -590,11 +661,6 @@ func (e *Executor) Status() *DAGStatus {
 	}
 }
 
-// =============================================================================
-// Event Handling
-// =============================================================================
-
-// Subscribe registers an event handler
 func (e *Executor) Subscribe(handler EventHandler) func() {
 	e.handlersMu.Lock()
 	e.handlers = append(e.handlers, handler)
@@ -610,7 +676,6 @@ func (e *Executor) Subscribe(handler EventHandler) func() {
 	}
 }
 
-// emitEvent emits an event to all handlers
 func (e *Executor) emitEvent(event *Event) {
 	e.handlersMu.RLock()
 	handlers := make([]EventHandler, len(e.handlers))
@@ -624,17 +689,11 @@ func (e *Executor) emitEvent(event *Event) {
 	}
 }
 
-// =============================================================================
-// Lifecycle
-// =============================================================================
-
-// Close closes the executor
 func (e *Executor) Close() error {
 	if e.closed.Swap(true) {
 		return ErrExecutorClosed
 	}
 
-	// Cancel any running execution
 	if e.cancel != nil {
 		e.cancel()
 	}

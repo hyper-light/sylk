@@ -100,50 +100,52 @@ func (l *Loader) LoadForInput(input string) []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	loaded := []string{}
 	inputLower := strings.ToLower(input)
+	candidates := l.collectKeywordCandidates(inputLower)
+	l.sortCandidates(candidates)
 
-	// Find skills matching keywords in input
+	currentLoaded := len(l.registry.GetLoaded())
+	tokensUsed := l.initialTokens(currentLoaded)
+	return l.loadCandidates(candidates, currentLoaded, tokensUsed)
+}
+
+func (l *Loader) collectKeywordCandidates(inputLower string) []*Skill {
 	allSkills := l.registry.GetAll()
 	candidates := make([]*Skill, 0)
-
 	for _, skill := range allSkills {
-		if skill.Loaded {
-			continue // Already loaded
-		}
-
-		// Check keywords
-		for _, kw := range skill.Keywords {
-			if strings.Contains(inputLower, strings.ToLower(kw)) {
-				candidates = append(candidates, skill)
-				break
-			}
+		if l.isKeywordCandidate(skill, inputLower) {
+			candidates = append(candidates, skill)
 		}
 	}
+	return candidates
+}
 
-	// Sort by priority (higher first), then by usage
+func (l *Loader) isKeywordCandidate(skill *Skill, inputLower string) bool {
+	if skill.Loaded {
+		return false
+	}
+	return l.containsKeyword(inputLower, skill.Keywords)
+}
+
+func (l *Loader) sortCandidates(candidates []*Skill) {
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].Priority != candidates[j].Priority {
 			return candidates[i].Priority > candidates[j].Priority
 		}
 		return candidates[i].InvokeCount > candidates[j].InvokeCount
 	})
+}
 
-	// Load within budget constraints
-	currentLoaded := len(l.registry.GetLoaded())
-	tokensUsed := currentLoaded * l.config.EstimatedTokensPerSkill
+func (l *Loader) initialTokens(currentLoaded int) int {
+	return currentLoaded * l.config.EstimatedTokensPerSkill
+}
 
+func (l *Loader) loadCandidates(candidates []*Skill, currentLoaded int, tokensUsed int) []string {
+	loaded := []string{}
 	for _, skill := range candidates {
-		// Check max skills limit
-		if l.config.MaxLoadedSkills > 0 && currentLoaded >= l.config.MaxLoadedSkills {
-			break
+		if !l.canLoadNext(currentLoaded, tokensUsed) {
+			return loaded
 		}
-
-		// Check token budget
-		if l.config.TokenBudget > 0 && tokensUsed+l.config.EstimatedTokensPerSkill > l.config.TokenBudget {
-			break
-		}
-
 		if l.registry.Load(skill.Name) {
 			loaded = append(loaded, skill.Name)
 			l.recordEvent(skill.Name, "load", "keyword_match")
@@ -151,8 +153,25 @@ func (l *Loader) LoadForInput(input string) []string {
 			tokensUsed += l.config.EstimatedTokensPerSkill
 		}
 	}
-
 	return loaded
+}
+
+func (l *Loader) canLoadNext(currentLoaded int, tokensUsed int) bool {
+	return l.withinMaxLoaded(currentLoaded) && l.withinTokenBudget(tokensUsed)
+}
+
+func (l *Loader) withinMaxLoaded(currentLoaded int) bool {
+	if l.config.MaxLoadedSkills == 0 {
+		return true
+	}
+	return currentLoaded < l.config.MaxLoadedSkills
+}
+
+func (l *Loader) withinTokenBudget(tokensUsed int) bool {
+	if l.config.TokenBudget == 0 {
+		return true
+	}
+	return tokensUsed+l.config.EstimatedTokensPerSkill <= l.config.TokenBudget
 }
 
 // LoadDomain loads all skills in a domain if budget allows
@@ -387,126 +406,183 @@ func (l *Loader) LoadForContext(ctx LoadContext) LoadResult {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	result := LoadResult{
+	result := l.newLoadResult()
+	budget := l.effectiveBudget(ctx)
+
+	l.loadRecentlyInvoked(ctx.RecentlyInvoked, &result)
+	l.loadActiveDomains(ctx.ActiveDomains, &result)
+	l.loadKeywordMatches(ctx.RecentInputs, &result)
+	l.optimizeToBudget(budget, ctx, &result)
+
+	return result
+}
+
+type skillScore struct {
+	skill *Skill
+	score int
+}
+
+func (l *Loader) newLoadResult() LoadResult {
+	return LoadResult{
 		Loaded:   []string{},
 		Unloaded: []string{},
 	}
+}
 
-	// Determine effective token budget
-	budget := l.config.TokenBudget
+func (l *Loader) effectiveBudget(ctx LoadContext) int {
 	if ctx.TokenBudget > 0 {
-		budget = ctx.TokenBudget
+		return ctx.TokenBudget
 	}
+	return l.config.TokenBudget
+}
 
-	// Step 1: Ensure recently invoked skills stay loaded
-	for _, name := range ctx.RecentlyInvoked {
+func (l *Loader) loadRecentlyInvoked(names []string, result *LoadResult) {
+	for _, name := range names {
 		if l.registry.Load(name) {
 			result.Loaded = append(result.Loaded, name)
 			l.recordEvent(name, "load", "recently_invoked")
 		}
 	}
+}
 
-	// Step 2: Load active domains
-	for _, domain := range ctx.ActiveDomains {
-		skills := l.registry.GetByDomain(domain)
-		for _, skill := range skills {
-			if !skill.Loaded {
-				if l.registry.Load(skill.Name) {
-					result.Loaded = append(result.Loaded, skill.Name)
-					l.recordEvent(skill.Name, "load", "active_domain")
-				}
-			}
+func (l *Loader) loadActiveDomains(domains []string, result *LoadResult) {
+	for _, domain := range domains {
+		l.loadDomainSkills(domain, result)
+	}
+}
+
+func (l *Loader) loadDomainSkills(domain string, result *LoadResult) {
+	skills := l.registry.GetByDomain(domain)
+	for _, skill := range skills {
+		if skill.Loaded {
+			continue
+		}
+		if l.registry.Load(skill.Name) {
+			result.Loaded = append(result.Loaded, skill.Name)
+			l.recordEvent(skill.Name, "load", "active_domain")
 		}
 	}
+}
 
-	// Step 3: Analyze recent inputs for keywords
+func (l *Loader) loadKeywordMatches(inputs []string, result *LoadResult) {
+	keywordSkills := l.collectKeywordSkills(inputs)
+	l.loadKeywordSkills(keywordSkills, result)
+}
+
+func (l *Loader) collectKeywordSkills(inputs []string) map[string]*Skill {
 	keywordSkills := make(map[string]*Skill)
-	for _, input := range ctx.RecentInputs {
-		inputLower := strings.ToLower(input)
-		for _, skill := range l.registry.GetAll() {
-			if skill.Loaded {
-				continue
-			}
-			for _, kw := range skill.Keywords {
-				if strings.Contains(inputLower, strings.ToLower(kw)) {
-					keywordSkills[skill.Name] = skill
-					break
-				}
-			}
+	for _, input := range inputs {
+		l.collectKeywordSkillsForInput(keywordSkills, input)
+	}
+	return keywordSkills
+}
+
+func (l *Loader) collectKeywordSkillsForInput(keywordSkills map[string]*Skill, input string) {
+	inputLower := strings.ToLower(input)
+	for _, skill := range l.registry.GetAll() {
+		if l.matchesKeywordInput(skill, inputLower) {
+			keywordSkills[skill.Name] = skill
 		}
 	}
+}
 
-	// Load keyword-matched skills
+func (l *Loader) matchesKeywordInput(skill *Skill, inputLower string) bool {
+	if skill.Loaded {
+		return false
+	}
+	return l.containsKeyword(inputLower, skill.Keywords)
+}
+
+func (l *Loader) containsKeyword(inputLower string, keywords []string) bool {
+	for _, keyword := range keywords {
+		if strings.Contains(inputLower, strings.ToLower(keyword)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *Loader) loadKeywordSkills(keywordSkills map[string]*Skill, result *LoadResult) {
 	for name := range keywordSkills {
 		if l.registry.Load(name) {
 			result.Loaded = append(result.Loaded, name)
 			l.recordEvent(name, "load", "context_keyword")
 		}
 	}
+}
 
-	// Step 4: Optimize to fit budget
-	if budget > 0 {
-		loaded := l.registry.GetLoaded()
-		currentTokens := len(loaded) * l.config.EstimatedTokensPerSkill
+func (l *Loader) optimizeToBudget(budget int, ctx LoadContext, result *LoadResult) {
+	if budget <= 0 {
+		return
+	}
+	loaded := l.registry.GetLoaded()
+	currentTokens := l.currentTokens(loaded)
+	if currentTokens <= budget {
+		return
+	}
+	scores := l.scoreLoadedSkills(loaded, ctx)
+	sort.Slice(scores, func(i, j int) bool {
+		return scores[i].score < scores[j].score
+	})
+	l.unloadToBudget(scores, budget, &currentTokens, result)
+}
 
-		if currentTokens > budget {
-			// Unload least important skills
-			// Sort by: not recently invoked, not in active domain, lowest usage
-			type skillScore struct {
-				skill *Skill
-				score int
-			}
+func (l *Loader) currentTokens(loaded []*Skill) int {
+	return len(loaded) * l.config.EstimatedTokensPerSkill
+}
 
-			scores := make([]skillScore, 0)
-			for _, skill := range loaded {
-				if l.isCoreSkill(skill.Name) {
-					continue
-				}
+func (l *Loader) scoreLoadedSkills(loaded []*Skill, ctx LoadContext) []skillScore {
+	scores := make([]skillScore, 0, len(loaded))
+	for _, skill := range loaded {
+		if l.isCoreSkill(skill.Name) {
+			continue
+		}
+		score := l.computeSkillScore(skill, ctx)
+		scores = append(scores, skillScore{skill: skill, score: score})
+	}
+	return scores
+}
 
-				score := 0
+func (l *Loader) computeSkillScore(skill *Skill, ctx LoadContext) int {
+	score := int(skill.InvokeCount)
+	if l.isRecentlyInvoked(skill.Name, ctx.RecentlyInvoked) {
+		score += 100
+	}
+	if l.isActiveDomain(skill.Domain, ctx.ActiveDomains) {
+		score += 50
+	}
+	return score
+}
 
-				// Recently invoked = high score (keep)
-				for _, name := range ctx.RecentlyInvoked {
-					if name == skill.Name {
-						score += 100
-						break
-					}
-				}
-
-				// In active domain = medium score
-				for _, domain := range ctx.ActiveDomains {
-					if skill.Domain == domain {
-						score += 50
-						break
-					}
-				}
-
-				// Usage-based score
-				score += int(skill.InvokeCount)
-
-				scores = append(scores, skillScore{skill, score})
-			}
-
-			// Sort ascending (lowest score = unload first)
-			sort.Slice(scores, func(i, j int) bool {
-				return scores[i].score < scores[j].score
-			})
-
-			// Unload until within budget
-			for _, ss := range scores {
-				if currentTokens <= budget {
-					break
-				}
-				if l.registry.Unload(ss.skill.Name) {
-					result.Unloaded = append(result.Unloaded, ss.skill.Name)
-					l.recordEvent(ss.skill.Name, "unload", "budget_optimization")
-					currentTokens -= l.config.EstimatedTokensPerSkill
-				}
-			}
+func (l *Loader) isRecentlyInvoked(name string, recentlyInvoked []string) bool {
+	for _, candidate := range recentlyInvoked {
+		if candidate == name {
+			return true
 		}
 	}
+	return false
+}
 
-	return result
+func (l *Loader) isActiveDomain(domain string, activeDomains []string) bool {
+	for _, active := range activeDomains {
+		if active == domain {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *Loader) unloadToBudget(scores []skillScore, budget int, currentTokens *int, result *LoadResult) {
+	for _, scored := range scores {
+		if *currentTokens <= budget {
+			return
+		}
+		if l.registry.Unload(scored.skill.Name) {
+			result.Unloaded = append(result.Unloaded, scored.skill.Name)
+			l.recordEvent(scored.skill.Name, "unload", "budget_optimization")
+			*currentTokens -= l.config.EstimatedTokensPerSkill
+		}
+	}
 }
 
 // LoadResult contains the results of a loading operation

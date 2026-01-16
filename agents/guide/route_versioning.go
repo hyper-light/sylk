@@ -59,10 +59,10 @@ const (
 
 // RouteMigration describes how to migrate between versions
 type RouteMigration struct {
-	FromVersion int                 `json:"from_version"`
-	ToVersion   int                 `json:"to_version"`
+	FromVersion int                  `json:"from_version"`
+	ToVersion   int                  `json:"to_version"`
 	Steps       []RouteMigrationStep `json:"steps"`
-	Reversible  bool                `json:"reversible"`
+	Reversible  bool                 `json:"reversible"`
 }
 
 // RouteMigrationStep describes a single migration operation
@@ -78,11 +78,11 @@ type RouteMigrationStep struct {
 type MigrationStepType string
 
 const (
-	MigrationStepAdd       MigrationStepType = "add"        // Add a new route
-	MigrationStepRemove    MigrationStepType = "remove"     // Remove a route
-	MigrationStepModify    MigrationStepType = "modify"     // Modify a route
-	MigrationStepRename    MigrationStepType = "rename"     // Rename an agent
-	MigrationStepDeprecate MigrationStepType = "deprecate"  // Mark as deprecated
+	MigrationStepAdd       MigrationStepType = "add"       // Add a new route
+	MigrationStepRemove    MigrationStepType = "remove"    // Remove a route
+	MigrationStepModify    MigrationStepType = "modify"    // Modify a route
+	MigrationStepRename    MigrationStepType = "rename"    // Rename an agent
+	MigrationStepDeprecate MigrationStepType = "deprecate" // Mark as deprecated
 )
 
 // =============================================================================
@@ -387,76 +387,206 @@ func (rvs *RouteVersionStore) Migrate(migration *RouteMigration, createdBy strin
 
 // applyMigrationStep applies a single migration step
 func (rvs *RouteVersionStore) applyMigrationStep(step RouteMigrationStep) error {
-	switch step.Type {
+	handler := rvs.stepHandler(step.Type)
+	if handler == nil {
+		return nil
+	}
+	return handler(step)
+}
+
+type migrationStepHandler func(step RouteMigrationStep) error
+
+type migrationStepHandlers struct {
+	add       migrationStepHandler
+	remove    migrationStepHandler
+	modify    migrationStepHandler
+	deprecate migrationStepHandler
+	rename    migrationStepHandler
+}
+
+func (rvs *RouteVersionStore) stepHandler(stepType MigrationStepType) migrationStepHandler {
+	handlers := rvs.migrationStepHandlers()
+	switch stepType {
 	case MigrationStepAdd:
-		var route VersionedRoute
-		if err := json.Unmarshal(step.NewValue, &route); err != nil {
-			return err
-		}
-		route.CreatedVersion = rvs.currentVersion + 1
-		route.ModifiedVersion = rvs.currentVersion + 1
-		route.CreatedAt = time.Now()
-		route.ModifiedAt = time.Now()
-		route.Source = RouteSourceMigration
-		rvs.currentRoutes[route.ID] = &route
-
+		return handlers.add
 	case MigrationStepRemove:
-		delete(rvs.currentRoutes, step.RouteID)
-
+		return handlers.remove
 	case MigrationStepModify:
-		route, exists := rvs.currentRoutes[step.RouteID]
-		if !exists {
-			return fmt.Errorf("route not found: %s", step.RouteID)
-		}
-		var updates map[string]interface{}
-		if err := json.Unmarshal(step.NewValue, &updates); err != nil {
-			return err
-		}
-		if target, ok := updates["target_agent_id"].(string); ok {
-			route.TargetAgentID = target
-		}
-		if intent, ok := updates["intent"].(string); ok {
-			route.Intent = Intent(intent)
-		}
-		if domain, ok := updates["domain"].(string); ok {
-			route.Domain = Domain(domain)
-		}
-		route.ModifiedVersion = rvs.currentVersion + 1
-		route.ModifiedAt = time.Now()
-
+		return handlers.modify
 	case MigrationStepDeprecate:
-		route, exists := rvs.currentRoutes[step.RouteID]
-		if !exists {
-			return fmt.Errorf("route not found: %s", step.RouteID)
-		}
-		route.Deprecated = true
-		var meta map[string]string
-		if err := json.Unmarshal(step.NewValue, &meta); err == nil {
-			route.DeprecatedReason = meta["reason"]
-			route.ReplacedBy = meta["replaced_by"]
-		}
-		route.ModifiedVersion = rvs.currentVersion + 1
-		route.ModifiedAt = time.Now()
-		rvs.stats.DeprecatedCount++
-
+		return handlers.deprecate
 	case MigrationStepRename:
-		var rename struct {
-			OldAgentID string `json:"old_agent_id"`
-			NewAgentID string `json:"new_agent_id"`
-		}
-		if err := json.Unmarshal(step.NewValue, &rename); err != nil {
-			return err
-		}
-		for _, route := range rvs.currentRoutes {
-			if route.TargetAgentID == rename.OldAgentID {
-				route.TargetAgentID = rename.NewAgentID
-				route.ModifiedVersion = rvs.currentVersion + 1
-				route.ModifiedAt = time.Now()
-			}
+		return handlers.rename
+	default:
+		return nil
+	}
+}
+
+func (rvs *RouteVersionStore) migrationStepHandlers() migrationStepHandlers {
+	return migrationStepHandlers{
+		add:       rvs.applyMigrationAdd,
+		remove:    rvs.applyMigrationRemove,
+		modify:    rvs.applyMigrationModify,
+		deprecate: rvs.applyMigrationDeprecate,
+		rename:    rvs.applyMigrationRename,
+	}
+}
+
+func (rvs *RouteVersionStore) applyMigrationAdd(step RouteMigrationStep) error {
+	route, err := rvs.decodeNewRoute(step.NewValue)
+	if err != nil {
+		return err
+	}
+	rvs.addMigrationRoute(route)
+	return nil
+}
+
+func (rvs *RouteVersionStore) decodeNewRoute(data []byte) (*VersionedRoute, error) {
+	var route VersionedRoute
+	if err := json.Unmarshal(data, &route); err != nil {
+		return nil, err
+	}
+	return &route, nil
+}
+
+func (rvs *RouteVersionStore) addMigrationRoute(route *VersionedRoute) {
+	rvs.initializeMigrationRoute(route)
+	rvs.currentRoutes[route.ID] = route
+}
+
+func (rvs *RouteVersionStore) initializeMigrationRoute(route *VersionedRoute) {
+	version := rvs.nextVersion()
+	route.CreatedVersion = version
+	route.ModifiedVersion = version
+	route.CreatedAt = time.Now()
+	route.ModifiedAt = time.Now()
+	route.Source = RouteSourceMigration
+}
+
+func (rvs *RouteVersionStore) applyMigrationRemove(step RouteMigrationStep) error {
+	delete(rvs.currentRoutes, step.RouteID)
+	return nil
+}
+
+func (rvs *RouteVersionStore) applyMigrationModify(step RouteMigrationStep) error {
+	route, err := rvs.getMigrationRoute(step.RouteID)
+	if err != nil {
+		return err
+	}
+	updates, err := rvs.decodeRouteUpdates(step.NewValue)
+	if err != nil {
+		return err
+	}
+	rvs.applyRouteUpdates(route, updates)
+	rvs.touchRoute(route)
+	return nil
+}
+
+func (rvs *RouteVersionStore) applyMigrationDeprecate(step RouteMigrationStep) error {
+	route, err := rvs.getMigrationRoute(step.RouteID)
+	if err != nil {
+		return err
+	}
+	rvs.deprecateRoute(route)
+	meta, err := rvs.decodeDeprecationMeta(step.NewValue)
+	if err == nil {
+		rvs.applyDeprecationMeta(route, meta)
+	}
+	rvs.touchRoute(route)
+	rvs.stats.DeprecatedCount++
+	return nil
+}
+
+func (rvs *RouteVersionStore) applyMigrationRename(step RouteMigrationStep) error {
+	rename, err := rvs.decodeRename(step.NewValue)
+	if err != nil {
+		return err
+	}
+	rvs.renameTargetAgent(rename)
+	return nil
+}
+
+func (rvs *RouteVersionStore) getMigrationRoute(routeID string) (*VersionedRoute, error) {
+	route, exists := rvs.currentRoutes[routeID]
+	if !exists {
+		return nil, fmt.Errorf("route not found: %s", routeID)
+	}
+	return route, nil
+}
+
+func (rvs *RouteVersionStore) decodeRouteUpdates(data []byte) (map[string]interface{}, error) {
+	var updates map[string]interface{}
+	if err := json.Unmarshal(data, &updates); err != nil {
+		return nil, err
+	}
+	return updates, nil
+}
+
+func (rvs *RouteVersionStore) applyRouteUpdates(route *VersionedRoute, updates map[string]interface{}) {
+	if target, ok := updates["target_agent_id"].(string); ok {
+		route.TargetAgentID = target
+	}
+	if intent, ok := updates["intent"].(string); ok {
+		route.Intent = Intent(intent)
+	}
+	if domain, ok := updates["domain"].(string); ok {
+		route.Domain = Domain(domain)
+	}
+}
+
+func (rvs *RouteVersionStore) decodeDeprecationMeta(data []byte) (map[string]string, error) {
+	var meta map[string]string
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
+}
+
+func (rvs *RouteVersionStore) applyDeprecationMeta(route *VersionedRoute, meta map[string]string) {
+	route.DeprecatedReason = meta["reason"]
+	route.ReplacedBy = meta["replaced_by"]
+}
+
+func (rvs *RouteVersionStore) deprecateRoute(route *VersionedRoute) {
+	route.Deprecated = true
+}
+
+func (rvs *RouteVersionStore) decodeRename(data []byte) (*struct {
+	OldAgentID string `json:"old_agent_id"`
+	NewAgentID string `json:"new_agent_id"`
+}, error) {
+	var rename struct {
+		OldAgentID string `json:"old_agent_id"`
+		NewAgentID string `json:"new_agent_id"`
+	}
+	if err := json.Unmarshal(data, &rename); err != nil {
+		return nil, err
+	}
+	return &rename, nil
+}
+
+func (rvs *RouteVersionStore) renameTargetAgent(rename *struct {
+	OldAgentID string `json:"old_agent_id"`
+	NewAgentID string `json:"new_agent_id"`
+}) {
+	version := rvs.nextVersion()
+	for _, route := range rvs.currentRoutes {
+		if route.TargetAgentID == rename.OldAgentID {
+			route.TargetAgentID = rename.NewAgentID
+			route.ModifiedVersion = version
+			route.ModifiedAt = time.Now()
 		}
 	}
+}
 
-	return nil
+func (rvs *RouteVersionStore) touchRoute(route *VersionedRoute) {
+	version := rvs.nextVersion()
+	route.ModifiedVersion = version
+	route.ModifiedAt = time.Now()
+}
+
+func (rvs *RouteVersionStore) nextVersion() int {
+	return rvs.currentVersion + 1
 }
 
 // Rollback reverts to a previous version
@@ -519,64 +649,91 @@ func (rvs *RouteVersionStore) Diff(fromVersion, toVersion int) (*VersionDiff, er
 	rvs.mu.RLock()
 	defer rvs.mu.RUnlock()
 
-	var fromVer, toVer *RouteVersion
-	for _, v := range rvs.versions {
-		if v.Version == fromVersion {
-			fromVer = v
-		}
-		if v.Version == toVersion {
-			toVer = v
-		}
+	fromVer, toVer := rvs.findVersions(fromVersion, toVersion)
+	if err := validateDiffVersions(fromVersion, toVersion, fromVer, toVer); err != nil {
+		return nil, err
 	}
 
+	diff := newVersionDiff(fromVersion, toVersion)
+	fromRoutes := buildRouteMap(fromVer.Routes)
+	toRoutes := buildRouteMap(toVer.Routes)
+
+	addRoutes(diff, fromRoutes, toRoutes)
+	removeRoutes(diff, fromRoutes, toRoutes)
+
+	return diff, nil
+}
+
+func (rvs *RouteVersionStore) findVersions(fromVersion int, toVersion int) (*RouteVersion, *RouteVersion) {
+	var fromVer *RouteVersion
+	var toVer *RouteVersion
+	for _, version := range rvs.versions {
+		if version.Version == fromVersion {
+			fromVer = version
+		}
+		if version.Version == toVersion {
+			toVer = version
+		}
+	}
+	return fromVer, toVer
+}
+
+func validateDiffVersions(fromVersion int, toVersion int, fromVer *RouteVersion, toVer *RouteVersion) error {
 	if fromVer == nil {
-		return nil, fmt.Errorf("from version not found: %d", fromVersion)
+		return fmt.Errorf("from version not found: %d", fromVersion)
 	}
 	if toVer == nil {
-		return nil, fmt.Errorf("to version not found: %d", toVersion)
+		return fmt.Errorf("to version not found: %d", toVersion)
 	}
+	return nil
+}
 
-	diff := &VersionDiff{
+func newVersionDiff(fromVersion int, toVersion int) *VersionDiff {
+	return &VersionDiff{
 		FromVersion: fromVersion,
 		ToVersion:   toVersion,
 		Added:       make([]VersionedRoute, 0),
 		Removed:     make([]VersionedRoute, 0),
 		Modified:    make([]RouteDiff, 0),
 	}
+}
 
-	// Build maps for comparison
-	fromRoutes := make(map[string]VersionedRoute)
-	for _, r := range fromVer.Routes {
-		fromRoutes[r.ID] = r
+func buildRouteMap(routes []VersionedRoute) map[string]VersionedRoute {
+	result := make(map[string]VersionedRoute)
+	for _, route := range routes {
+		result[route.ID] = route
 	}
+	return result
+}
 
-	toRoutes := make(map[string]VersionedRoute)
-	for _, r := range toVer.Routes {
-		toRoutes[r.ID] = r
-	}
-
-	// Find added and modified
+func addRoutes(diff *VersionDiff, fromRoutes map[string]VersionedRoute, toRoutes map[string]VersionedRoute) {
 	for id, toRoute := range toRoutes {
-		fromRoute, exists := fromRoutes[id]
-		if !exists {
-			diff.Added = append(diff.Added, toRoute)
-		} else if !routesEqual(fromRoute, toRoute) {
-			diff.Modified = append(diff.Modified, RouteDiff{
-				RouteID: id,
-				Before:  fromRoute,
-				After:   toRoute,
-			})
+		if fromRoute, exists := fromRoutes[id]; exists {
+			addModifiedRoute(diff, id, fromRoute, toRoute)
+			continue
 		}
+		diff.Added = append(diff.Added, toRoute)
 	}
+}
 
-	// Find removed
+func addModifiedRoute(diff *VersionDiff, id string, fromRoute VersionedRoute, toRoute VersionedRoute) {
+	if routesEqual(fromRoute, toRoute) {
+		return
+	}
+	diff.Modified = append(diff.Modified, RouteDiff{
+		RouteID: id,
+		Before:  fromRoute,
+		After:   toRoute,
+	})
+}
+
+func removeRoutes(diff *VersionDiff, fromRoutes map[string]VersionedRoute, toRoutes map[string]VersionedRoute) {
 	for id, fromRoute := range fromRoutes {
-		if _, exists := toRoutes[id]; !exists {
-			diff.Removed = append(diff.Removed, fromRoute)
+		if _, exists := toRoutes[id]; exists {
+			continue
 		}
+		diff.Removed = append(diff.Removed, fromRoute)
 	}
-
-	return diff, nil
 }
 
 // VersionDiff represents differences between two versions

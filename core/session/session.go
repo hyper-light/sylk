@@ -165,13 +165,20 @@ func (s *Session) SetState(newState State) error {
 	s.state = newState
 	s.updatedAt = time.Now()
 
-	// Track active duration
+	s.trackActiveDuration(oldState, newState)
+	s.recordStateTiming(oldState, newState)
+
+	return nil
+}
+
+func (s *Session) trackActiveDuration(oldState, newState State) {
 	if oldState == StateActive && newState != StateActive {
 		duration := time.Since(s.startedAt)
 		atomic.AddInt64(&s.activeDuration, int64(duration))
 	}
+}
 
-	// Record timing for state transitions
+func (s *Session) recordStateTiming(oldState, newState State) {
 	switch newState {
 	case StateActive:
 		if oldState == StateCreated || oldState == StatePaused || oldState == StateSuspended {
@@ -180,8 +187,6 @@ func (s *Session) SetState(newState State) error {
 	case StatePaused:
 		s.pausedAt = time.Now()
 	}
-
-	return nil
 }
 
 // Start activates the session

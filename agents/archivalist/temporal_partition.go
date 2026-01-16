@@ -217,32 +217,62 @@ func (pm *TemporalPartitionManager) QueryTimeRange(start, end time.Time) []strin
 
 	pm.stats.QueriesExecuted++
 
-	var results []string
+	startKey, endKey := pm.partitionBounds(start, end)
+	return pm.collectPartitionEntries(start, end, startKey, endKey)
+}
+
+func (pm *TemporalPartitionManager) partitionBounds(start, end time.Time) (string, string) {
 	startKey := pm.GeneratePartitionKey(start)
 	endKey := pm.GeneratePartitionKey(end)
+	return startKey, endKey
+}
 
+func (pm *TemporalPartitionManager) collectPartitionEntries(start, end time.Time, startKey string, endKey string) []string {
+	var results []string
 	for _, key := range pm.sortedKeys {
-		if key >= startKey && key <= endKey {
-			partition := pm.partitions[key]
-			if partition != nil {
-				pm.stats.PartitionsScanned++
-				partition.mu.RLock()
-				for _, id := range partition.EntryIDs {
-					entryTime, ok := partition.entryTime[id]
-					if !ok {
-						entryTime = partition.StartTime
-					}
-					if !entryTime.Before(start) && !entryTime.After(end) {
-						results = append(results, id)
-					}
-				}
-				partition.LastAccessTime = time.Now()
-				partition.mu.RUnlock()
-			}
+		if !partitionKeyInRange(key, startKey, endKey) {
+			continue
 		}
+		partition := pm.partitions[key]
+		results = append(results, pm.collectPartitionRange(partition, start, end)...)
 	}
-
 	return results
+}
+
+func partitionKeyInRange(key string, startKey string, endKey string) bool {
+	return key >= startKey && key <= endKey
+}
+
+func (pm *TemporalPartitionManager) collectPartitionRange(partition *TemporalPartition, start time.Time, end time.Time) []string {
+	if partition == nil {
+		return nil
+	}
+	pm.stats.PartitionsScanned++
+	partition.mu.RLock()
+	ids := filterPartitionEntries(partition, start, end)
+	partition.LastAccessTime = time.Now()
+	partition.mu.RUnlock()
+	return ids
+}
+
+func filterPartitionEntries(partition *TemporalPartition, start time.Time, end time.Time) []string {
+	results := make([]string, 0, len(partition.EntryIDs))
+	for _, id := range partition.EntryIDs {
+		entryTime := partitionEntryTime(partition, id)
+		if entryTime.Before(start) || entryTime.After(end) {
+			continue
+		}
+		results = append(results, id)
+	}
+	return results
+}
+
+func partitionEntryTime(partition *TemporalPartition, entryID string) time.Time {
+	entryTime, ok := partition.entryTime[entryID]
+	if ok {
+		return entryTime
+	}
+	return partition.StartTime
 }
 
 func (pm *TemporalPartitionManager) GetPartition(key string) *TemporalPartition {
@@ -343,42 +373,59 @@ func (pm *TemporalPartitionManager) removeSortedKey(key string) {
 }
 
 func (pm *TemporalPartitionManager) evictOldestPartitionLocked() {
-	if len(pm.sortedKeys) == 0 {
+	oldestKey := pm.findOldestPartitionKey()
+	if oldestKey == "" {
 		return
+	}
+
+	pm.adjustStatsForRemoval(oldestKey)
+	delete(pm.partitions, oldestKey)
+	pm.removeSortedKey(oldestKey)
+	pm.stats.TotalPartitions--
+	pm.stats.ActivePartitions--
+}
+
+func (pm *TemporalPartitionManager) findOldestPartitionKey() string {
+	if len(pm.sortedKeys) == 0 {
+		return ""
 	}
 
 	var oldestKey string
 	var oldestAccess time.Time
 
 	for _, key := range pm.sortedKeys {
-		partition := pm.partitions[key]
-		if partition == nil {
+		access, ok := pm.partitionAccessTime(key)
+		if !ok {
 			continue
 		}
-
-		partition.mu.RLock()
-		access := partition.LastAccessTime
-		partition.mu.RUnlock()
-
 		if oldestKey == "" || access.Before(oldestAccess) {
 			oldestKey = key
 			oldestAccess = access
 		}
 	}
 
-	if oldestKey != "" {
-		partition := pm.partitions[oldestKey]
-		if partition != nil {
-			partition.mu.Lock()
-			pm.stats.TotalEntries -= partition.EntryCount
-			partition.mu.Unlock()
-		}
+	return oldestKey
+}
 
-		delete(pm.partitions, oldestKey)
-		pm.removeSortedKey(oldestKey)
-		pm.stats.TotalPartitions--
-		pm.stats.ActivePartitions--
+func (pm *TemporalPartitionManager) partitionAccessTime(key string) (time.Time, bool) {
+	partition := pm.partitions[key]
+	if partition == nil {
+		return time.Time{}, false
 	}
+	partition.mu.RLock()
+	access := partition.LastAccessTime
+	partition.mu.RUnlock()
+	return access, true
+}
+
+func (pm *TemporalPartitionManager) adjustStatsForRemoval(key string) {
+	partition := pm.partitions[key]
+	if partition == nil {
+		return
+	}
+	partition.mu.Lock()
+	pm.stats.TotalEntries -= partition.EntryCount
+	partition.mu.Unlock()
 }
 
 func (pm *TemporalPartitionManager) Stats() TemporalPartitionStats {

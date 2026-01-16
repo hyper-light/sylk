@@ -59,12 +59,12 @@ func DefaultQueryOptimizerConfig() QueryOptimizerConfig {
 
 // IndexStatistics contains index statistics for cost estimation
 type IndexStatistics struct {
-	TotalEntries      int64                   `json:"total_entries"`
-	EntriesByCategory map[Category]int64      `json:"entries_by_category"`
-	EntriesBySource   map[SourceModel]int64   `json:"entries_by_source"`
-	EntriesBySession  map[string]int64        `json:"entries_by_session"`
-	AvgEntriesPerDay  float64                 `json:"avg_entries_per_day"`
-	IndexSelectivity  map[string]float64      `json:"index_selectivity"`
+	TotalEntries      int64                 `json:"total_entries"`
+	EntriesByCategory map[Category]int64    `json:"entries_by_category"`
+	EntriesBySource   map[SourceModel]int64 `json:"entries_by_source"`
+	EntriesBySession  map[string]int64      `json:"entries_by_session"`
+	AvgEntriesPerDay  float64               `json:"avg_entries_per_day"`
+	IndexSelectivity  map[string]float64    `json:"index_selectivity"`
 }
 
 // queryOptimizerStatsInternal holds atomic counters
@@ -200,109 +200,128 @@ func (qo *QueryOptimizer) Plan(query ArchiveQuery) *QueryPlan {
 // generatePlan creates a new query plan
 func (qo *QueryOptimizer) generatePlan(query ArchiveQuery) *QueryPlan {
 	operations := make([]QueryOperation, 0)
-	totalCost := 0.0
-	var estimatedRows int64
+	cost := 0.0
+	estimatedRows := qo.initialRowEstimate()
 
+	primaryOp := qo.selectPrimaryOperation(query, estimatedRows)
+	operations, cost, estimatedRows = appendOperation(operations, cost, estimatedRows, primaryOp)
+	operations, cost, estimatedRows = qo.addFilters(query, primaryOp.Type, operations, cost, estimatedRows)
+	operations, cost, estimatedRows = qo.addSort(operations, cost, estimatedRows)
+	operations, cost, estimatedRows = qo.addLimit(query, operations, cost, estimatedRows)
+
+	parallel := qo.shouldRunParallel(cost, estimatedRows)
+	qo.trackParallel(parallel)
+
+	return &QueryPlan{
+		Query:         query,
+		Operations:    operations,
+		EstimatedCost: cost,
+		EstimatedRows: estimatedRows,
+		Parallel:      parallel,
+		CreatedAt:     time.Now(),
+	}
+}
+
+func (qo *QueryOptimizer) initialRowEstimate() int64 {
 	qo.mu.RLock()
 	totalEntries := qo.indexStats.TotalEntries
 	qo.mu.RUnlock()
 
 	if totalEntries == 0 {
-		totalEntries = 1000 // Default estimate
+		return 1000
 	}
+	return totalEntries
+}
 
-	estimatedRows = totalEntries
+func appendOperation(operations []QueryOperation, cost float64, rows int64, op QueryOperation) ([]QueryOperation, float64, int64) {
+	operations = append(operations, op)
+	cost += op.Cost
+	rows = int64(float64(rows) * op.Selectivity)
+	return operations, cost, rows
+}
 
-	// Determine primary access path
-	primaryOp := qo.selectPrimaryOperation(query, totalEntries)
-	operations = append(operations, primaryOp)
-	totalCost += primaryOp.Cost
-	estimatedRows = int64(float64(estimatedRows) * primaryOp.Selectivity)
+func (qo *QueryOptimizer) addFilters(query ArchiveQuery, primaryType QueryOperationType, operations []QueryOperation, cost float64, rows int64) ([]QueryOperation, float64, int64) {
+	operations, cost, rows = qo.addCategoryFilter(query, primaryType, operations, cost, rows)
+	operations, cost, rows = qo.addSourceFilter(query, primaryType, operations, cost, rows)
+	operations, cost, rows = qo.addDateFilter(query, operations, cost, rows)
+	operations, cost, rows = qo.addTextFilter(query, operations, cost, rows)
+	return operations, cost, rows
+}
 
-	// Add filter operations
-	if len(query.Categories) > 0 && primaryOp.Type != OpIndexCategory {
-		op := QueryOperation{
-			Type:        OpFilterDate,
-			Values:      categoriesToStrings(query.Categories),
-			Selectivity: qo.estimateCategorySelectivity(query.Categories),
-			Cost:        0.01,
-		}
-		operations = append(operations, op)
-		totalCost += op.Cost
-		estimatedRows = int64(float64(estimatedRows) * op.Selectivity)
+func (qo *QueryOptimizer) addCategoryFilter(query ArchiveQuery, primaryType QueryOperationType, operations []QueryOperation, cost float64, rows int64) ([]QueryOperation, float64, int64) {
+	if len(query.Categories) == 0 || primaryType == OpIndexCategory {
+		return operations, cost, rows
 	}
-
-	if len(query.Sources) > 0 && primaryOp.Type != OpIndexSource {
-		op := QueryOperation{
-			Type:        OpFilterDate,
-			Values:      sourcesToStrings(query.Sources),
-			Selectivity: qo.estimateSourceSelectivity(query.Sources),
-			Cost:        0.01,
-		}
-		operations = append(operations, op)
-		totalCost += op.Cost
-		estimatedRows = int64(float64(estimatedRows) * op.Selectivity)
+	op := QueryOperation{
+		Type:        OpFilterDate,
+		Values:      categoriesToStrings(query.Categories),
+		Selectivity: qo.estimateCategorySelectivity(query.Categories),
+		Cost:        0.01,
 	}
+	return appendOperation(operations, cost, rows, op)
+}
 
-	// Add date filter if present
-	if query.Since != nil || query.Until != nil {
-		op := QueryOperation{
-			Type:        OpFilterDate,
-			Selectivity: qo.estimateDateSelectivity(query.Since, query.Until),
-			Cost:        0.02,
-		}
-		operations = append(operations, op)
-		totalCost += op.Cost
-		estimatedRows = int64(float64(estimatedRows) * op.Selectivity)
+func (qo *QueryOptimizer) addSourceFilter(query ArchiveQuery, primaryType QueryOperationType, operations []QueryOperation, cost float64, rows int64) ([]QueryOperation, float64, int64) {
+	if len(query.Sources) == 0 || primaryType == OpIndexSource {
+		return operations, cost, rows
 	}
-
-	// Add text filter if present
-	if query.SearchText != "" {
-		op := QueryOperation{
-			Type:        OpFilterText,
-			Values:      []string{query.SearchText},
-			Selectivity: 0.1, // Text search is usually selective
-			Cost:        0.5, // Text search is expensive
-		}
-		operations = append(operations, op)
-		totalCost += op.Cost
-		estimatedRows = int64(float64(estimatedRows) * op.Selectivity)
+	op := QueryOperation{
+		Type:        OpFilterDate,
+		Values:      sourcesToStrings(query.Sources),
+		Selectivity: qo.estimateSourceSelectivity(query.Sources),
+		Cost:        0.01,
 	}
+	return appendOperation(operations, cost, rows, op)
+}
 
-	// Add sort operation
-	operations = append(operations, QueryOperation{
-		Type: OpSort,
-		Cost: 0.1,
-	})
-	totalCost += 0.1
-
-	// Add limit operation if present
-	if query.Limit > 0 {
-		operations = append(operations, QueryOperation{
-			Type:   OpLimit,
-			Values: []string{},
-			Cost:   0.01,
-		})
-		totalCost += 0.01
-		if int64(query.Limit) < estimatedRows {
-			estimatedRows = int64(query.Limit)
-		}
+func (qo *QueryOptimizer) addDateFilter(query ArchiveQuery, operations []QueryOperation, cost float64, rows int64) ([]QueryOperation, float64, int64) {
+	if query.Since == nil && query.Until == nil {
+		return operations, cost, rows
 	}
+	op := QueryOperation{
+		Type:        OpFilterDate,
+		Selectivity: qo.estimateDateSelectivity(query.Since, query.Until),
+		Cost:        0.02,
+	}
+	return appendOperation(operations, cost, rows, op)
+}
 
-	// Determine if parallel execution is beneficial
-	parallel := qo.config.EnableParallel && totalCost > 0.5 && estimatedRows > 100
+func (qo *QueryOptimizer) addTextFilter(query ArchiveQuery, operations []QueryOperation, cost float64, rows int64) ([]QueryOperation, float64, int64) {
+	if query.SearchText == "" {
+		return operations, cost, rows
+	}
+	op := QueryOperation{
+		Type:        OpFilterText,
+		Values:      []string{query.SearchText},
+		Selectivity: 0.1,
+		Cost:        0.5,
+	}
+	return appendOperation(operations, cost, rows, op)
+}
 
+func (qo *QueryOptimizer) addSort(operations []QueryOperation, cost float64, rows int64) ([]QueryOperation, float64, int64) {
+	return appendOperation(operations, cost, rows, QueryOperation{Type: OpSort, Cost: 0.1})
+}
+
+func (qo *QueryOptimizer) addLimit(query ArchiveQuery, operations []QueryOperation, cost float64, rows int64) ([]QueryOperation, float64, int64) {
+	if query.Limit <= 0 {
+		return operations, cost, rows
+	}
+	operations, cost, rows = appendOperation(operations, cost, rows, QueryOperation{Type: OpLimit, Values: []string{}, Cost: 0.01})
+	limit := int64(query.Limit)
+	if limit < rows {
+		rows = limit
+	}
+	return operations, cost, rows
+}
+
+func (qo *QueryOptimizer) shouldRunParallel(cost float64, rows int64) bool {
+	return qo.config.EnableParallel && cost > 0.5 && rows > 100
+}
+
+func (qo *QueryOptimizer) trackParallel(parallel bool) {
 	if parallel {
 		atomic.AddInt64(&qo.stats.parallelQueries, 1)
-	}
-
-	return &QueryPlan{
-		Query:         query,
-		Operations:    operations,
-		EstimatedCost: totalCost,
-		EstimatedRows: estimatedRows,
-		Parallel:      parallel,
-		CreatedAt:     time.Now(),
 	}
 }
 
@@ -438,40 +457,46 @@ func (qo *QueryOptimizer) estimateSessionSelectivity(sessionIDs []string) float6
 }
 
 func (qo *QueryOptimizer) estimateDateSelectivity(since, until *time.Time) float64 {
-	// Estimate based on date range
 	if since == nil && until == nil {
 		return 1.0
 	}
 
+	avgPerDay, totalEntries := qo.dateSelectivityStats()
+	if avgPerDay == 0 || totalEntries == 0 {
+		return 0.5
+	}
+
+	days := estimateDateRangeDays(since, until)
+	selectivity := (days * avgPerDay) / float64(totalEntries)
+	return clampSelectivity(selectivity, 0.01, 1.0)
+}
+
+func (qo *QueryOptimizer) dateSelectivityStats() (float64, int64) {
 	qo.mu.RLock()
 	avgPerDay := qo.indexStats.AvgEntriesPerDay
 	totalEntries := qo.indexStats.TotalEntries
 	qo.mu.RUnlock()
+	return avgPerDay, totalEntries
+}
 
-	if avgPerDay == 0 || totalEntries == 0 {
-		return 0.5 // Default estimate
-	}
-
-	var days float64
+func estimateDateRangeDays(since, until *time.Time) float64 {
 	if since != nil && until != nil {
-		days = until.Sub(*since).Hours() / 24
-	} else if since != nil {
-		days = time.Since(*since).Hours() / 24
-	} else if until != nil {
-		days = 30 // Assume 30 days if only until is specified
+		return until.Sub(*since).Hours() / 24
 	}
-
-	estimatedRows := days * avgPerDay
-	selectivity := estimatedRows / float64(totalEntries)
-
-	if selectivity > 1.0 {
-		selectivity = 1.0
+	if since != nil {
+		return time.Since(*since).Hours() / 24
 	}
-	if selectivity < 0.01 {
-		selectivity = 0.01
-	}
+	return 30
+}
 
-	return selectivity
+func clampSelectivity(value, min, max float64) float64 {
+	if value > max {
+		return max
+	}
+	if value < min {
+		return min
+	}
+	return value
 }
 
 // =============================================================================

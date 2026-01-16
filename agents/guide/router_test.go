@@ -393,9 +393,6 @@ func TestRouter_IntentDSLTriggersLLM(t *testing.T) {
 
 // TestRouter_RetrospectiveCheck tests that non-retrospective queries are flagged
 func TestRouter_RetrospectiveCheck(t *testing.T) {
-	mockClient := mocks.NewMockClassifierClient(t)
-
-	// Mock a non-retrospective query that targets archivalist
 	classificationJSON := map[string]any{
 		"is_retrospective": false,
 		"rejection_reason": "Query is about future requirements, not past observations",
@@ -405,16 +402,7 @@ func TestRouter_RetrospectiveCheck(t *testing.T) {
 		"confidence":       0.85,
 	}
 
-	mockClient.EXPECT().
-		New(mock.Anything, mock.Anything).
-		Return(createMockMessage(classificationJSON), nil).
-		Once()
-
-	router := guide.NewRouter(mockClient, guide.RouterConfig{
-		DSLPrefix: "@",
-		Model:     "claude-sonnet-4-5-20250929",
-		MaxTokens: 1024,
-	})
+	router, mockClient := newRouterWithMock(t, classificationJSON)
 
 	req := &guide.RouteRequest{
 		Input:         "what patterns should we use for the new feature?",
@@ -424,15 +412,13 @@ func TestRouter_RetrospectiveCheck(t *testing.T) {
 	result, err := router.Route(context.Background(), req)
 	require.NoError(t, err)
 
-	// Should be marked as rejected since it's prospective but targeting historical domain
 	assert.True(t, result.Rejected)
-	assert.Contains(t, result.Reason, "future") // Uses the mock's rejection_reason
+	assert.Contains(t, result.Reason, "future")
+	mockClient.AssertExpectations(t)
 }
 
 // TestClassifier_MultiIntent tests handling of multi-intent queries
 func TestClassifier_MultiIntent(t *testing.T) {
-	mockClient := mocks.NewMockClassifierClient(t)
-
 	classificationJSON := map[string]any{
 		"is_retrospective": true,
 		"intent":           "recall",
@@ -454,15 +440,7 @@ func TestClassifier_MultiIntent(t *testing.T) {
 		},
 	}
 
-	mockClient.EXPECT().
-		New(mock.Anything, mock.Anything).
-		Return(createMockMessage(classificationJSON), nil).
-		Once()
-
-	classifier := guide.NewClassifierWithClient(mockClient, guide.RouterConfig{
-		Model:     "claude-sonnet-4-5-20250929",
-		MaxTokens: 1024,
-	})
+	classifier, mockClient := newClassifierWithMock(t, classificationJSON)
 
 	result, err := classifier.Classify(context.Background(), "what patterns and failures happened?")
 	require.NoError(t, err)
@@ -471,12 +449,11 @@ func TestClassifier_MultiIntent(t *testing.T) {
 	assert.Len(t, result.SubResults, 2)
 	assert.Equal(t, guide.DomainPatterns, result.SubResults[0].Domain)
 	assert.Equal(t, guide.DomainFailures, result.SubResults[1].Domain)
+	mockClient.AssertExpectations(t)
 }
 
 // TestRouter_EntityExtraction tests that entities are properly extracted
 func TestRouter_EntityExtraction(t *testing.T) {
-	mockClient := mocks.NewMockClassifierClient(t)
-
 	classificationJSON := map[string]any{
 		"is_retrospective": true,
 		"intent":           "recall",
@@ -492,16 +469,7 @@ func TestRouter_EntityExtraction(t *testing.T) {
 		},
 	}
 
-	mockClient.EXPECT().
-		New(mock.Anything, mock.Anything).
-		Return(createMockMessage(classificationJSON), nil).
-		Once()
-
-	router := guide.NewRouter(mockClient, guide.RouterConfig{
-		DSLPrefix: "@",
-		Model:     "claude-sonnet-4-5-20250929",
-		MaxTokens: 1024,
-	})
+	router, mockClient := newRouterWithMock(t, classificationJSON)
 
 	req := &guide.RouteRequest{
 		Input:         "what timeout errors happened yesterday in authentication?",
@@ -517,4 +485,30 @@ func TestRouter_EntityExtraction(t *testing.T) {
 	assert.Equal(t, "timeout", result.Entities.ErrorType)
 	assert.Equal(t, "connection timed out", result.Entities.ErrorMessage)
 	assert.Len(t, result.Entities.FilePaths, 2)
+	mockClient.AssertExpectations(t)
+}
+
+func newRouterWithMock(t *testing.T, classification map[string]any) (*guide.Router, *mocks.MockClassifierClient) {
+	mockClient := mocks.NewMockClassifierClient(t)
+	mockClient.EXPECT().
+		New(mock.Anything, mock.Anything).
+		Return(createMockMessage(classification), nil).
+		Once()
+	return guide.NewRouter(mockClient, guide.RouterConfig{
+		DSLPrefix: "@",
+		Model:     "claude-sonnet-4-5-20250929",
+		MaxTokens: 1024,
+	}), mockClient
+}
+
+func newClassifierWithMock(t *testing.T, classification map[string]any) (*guide.Classifier, *mocks.MockClassifierClient) {
+	mockClient := mocks.NewMockClassifierClient(t)
+	mockClient.EXPECT().
+		New(mock.Anything, mock.Anything).
+		Return(createMockMessage(classification), nil).
+		Once()
+	return guide.NewClassifierWithClient(mockClient, guide.RouterConfig{
+		Model:     "claude-sonnet-4-5-20250929",
+		MaxTokens: 1024,
+	}), mockClient
 }

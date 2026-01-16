@@ -113,98 +113,40 @@ func DefaultConfig() Config {
 
 // New creates a new Guide agent
 func New(client *anthropic.Client, cfg Config) (*Guide, error) {
-	if cfg.RouterConfig.Model == "" {
-		cfg.RouterConfig = DefaultRouterConfig()
+	cfg = ensureRouterConfig(cfg)
+	if err := validateBus(cfg); err != nil {
+		return nil, err
 	}
 
-	// Event bus is required
-	if cfg.Bus == nil {
-		return nil, fmt.Errorf("EventBus is required")
-	}
-
-	// Use default registry if not provided
-	registry := cfg.Registry
-	if registry == nil {
-		registry = NewRegistryWithDefaults()
-	}
-
-	// Create routing aggregator
+	registry := resolveRegistry(cfg)
 	routing := NewRoutingAggregator()
-
-	// Register the Guide itself
 	routing.RegisterAgent(GuideRoutingInfo())
 
-	// Create parser with routing support
 	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
-
-	// Create classifier
-	classifierClient := NewRealClassifierClient(client)
-	classifier := NewClassifierWithClient(classifierClient, cfg.RouterConfig)
-
-	// Create router with the configured parser
+	classifier := NewClassifierWithClient(NewRealClassifierClient(client), cfg.RouterConfig)
 	router := &Router{
 		config:     cfg.RouterConfig,
 		parser:     parser,
 		classifier: classifier,
 	}
 
-	// Create pending store
-	pendingCfg := PendingStoreConfig{
-		DefaultTimeout: cfg.PendingTimeout,
-		MaxPerAgent:    cfg.MaxPendingPerAgent,
-	}
-	if pendingCfg.DefaultTimeout == 0 {
-		pendingCfg.DefaultTimeout = 5 * time.Minute
-	}
-	if pendingCfg.MaxPerAgent == 0 {
-		pendingCfg.MaxPerAgent = 1000
-	}
-
-	agentID := cfg.AgentID
-	if agentID == "" {
-		agentID = "guide"
-	}
-
-	// Create route cache
-	cacheCfg := DefaultRouteCacheConfig()
-	if cfg.RouteCacheConfig != nil {
-		cacheCfg = *cfg.RouteCacheConfig
-	}
-
-	// Create circuit breaker registry
+	pendingCfg := resolvePendingConfig(cfg)
+	agentID := resolveAgentID(cfg)
+	cacheCfg := resolveRouteCacheConfig(cfg)
 	circuits := NewCircuitBreakerRegistry(DefaultCircuitBreakerConfig())
-
-	// Create DLQ
-	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{
-		MaxSize: 10000,
-	})
-
-	// Create pending cleanup
+	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{MaxSize: 10000})
 	pendingCleanup := NewPendingCleanup(PendingCleanupConfig{
 		CheckInterval:  1 * time.Second,
 		DefaultTimeout: pendingCfg.DefaultTimeout,
 		DLQ:            dlq,
 		Circuits:       circuits,
 	})
-
-	// Create health monitor
 	health := NewHealthMonitor(cfg.Bus, HealthMonitorConfig{
 		AgentConfig: DefaultAgentHealthConfig(),
 		Circuits:    circuits,
 	})
 
-	// Create skills registry and loader
-	skillsRegistry := skills.NewRegistry()
-	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	if cfg.SkillsConfig != nil {
-		skillsLoaderCfg = *cfg.SkillsConfig
-	}
-	skillsLoaderCfg.CoreSkills = []string{"route", "help", "status"}
-	skillsLoaderCfg.AutoLoadDomains = []string{"routing"}
-	skillLoader := skills.NewLoader(skillsRegistry, skillsLoaderCfg)
-
-	// Create hook registry
-	hookRegistry := skills.NewHookRegistry()
+	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
 
 	guide := &Guide{
 		router:         router,
@@ -235,6 +177,68 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 	return guide, nil
 }
 
+func ensureRouterConfig(cfg Config) Config {
+	if cfg.RouterConfig.Model == "" {
+		cfg.RouterConfig = DefaultRouterConfig()
+	}
+	return cfg
+}
+
+func validateBus(cfg Config) error {
+	if cfg.Bus == nil {
+		return fmt.Errorf("EventBus is required")
+	}
+	return nil
+}
+
+func resolveRegistry(cfg Config) AgentRegistry {
+	registry := cfg.Registry
+	if registry != nil {
+		return registry
+	}
+	return NewRegistryWithDefaults()
+}
+
+func resolvePendingConfig(cfg Config) PendingStoreConfig {
+	pendingCfg := PendingStoreConfig{
+		DefaultTimeout: cfg.PendingTimeout,
+		MaxPerAgent:    cfg.MaxPendingPerAgent,
+	}
+	if pendingCfg.DefaultTimeout == 0 {
+		pendingCfg.DefaultTimeout = 5 * time.Minute
+	}
+	if pendingCfg.MaxPerAgent == 0 {
+		pendingCfg.MaxPerAgent = 1000
+	}
+	return pendingCfg
+}
+
+func resolveAgentID(cfg Config) string {
+	if cfg.AgentID != "" {
+		return cfg.AgentID
+	}
+	return "guide"
+}
+
+func resolveRouteCacheConfig(cfg Config) RouteCacheConfig {
+	cacheCfg := DefaultRouteCacheConfig()
+	if cfg.RouteCacheConfig != nil {
+		return *cfg.RouteCacheConfig
+	}
+	return cacheCfg
+}
+
+func buildSkills(cfg Config) (*skills.Registry, *skills.Loader, *skills.HookRegistry) {
+	skillsRegistry := skills.NewRegistry()
+	skillsLoaderCfg := skills.DefaultLoaderConfig()
+	if cfg.SkillsConfig != nil {
+		skillsLoaderCfg = *cfg.SkillsConfig
+	}
+	skillsLoaderCfg.CoreSkills = []string{"route", "help", "status"}
+	skillsLoaderCfg.AutoLoadDomains = []string{"routing"}
+	return skillsRegistry, skills.NewLoader(skillsRegistry, skillsLoaderCfg), skills.NewHookRegistry()
+}
+
 // NewWithAPIKey creates a new Guide agent with an API key
 func NewWithAPIKey(apiKey string, cfg Config) (*Guide, error) {
 	if cfg.RouterConfig.Model == "" {
@@ -263,80 +267,95 @@ func NewWithAPIKey(apiKey string, cfg Config) (*Guide, error) {
 // 3. Route cache hit - previously classified (0 tokens)
 // 4. LLM classification - cache miss (~250 tokens)
 func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedRequest, error) {
+	g.ensureRequestDefaults(request)
+
+	classification, targetAgentID, err := g.resolveClassification(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	corrID := g.resolveCorrelationID(request)
+	if !request.FireAndForget {
+		corrID = g.pending.Add(request, classification, targetAgentID)
+	}
+
+	return g.buildForwardedRequest(request, classification, corrID), nil
+}
+
+func (g *Guide) ensureRequestDefaults(request *RouteRequest) {
 	if request.Timestamp.IsZero() {
 		request.Timestamp = time.Now()
 	}
 	if request.SessionID == "" {
 		request.SessionID = g.sessionID
 	}
+}
 
-	var classification *RouteResult
-	var err error
-	var targetAgentID string
-	fromCache := false
-
-	// Priority 1: Explicit target bypasses all classification
+func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest) (*RouteResult, string, error) {
 	if request.TargetAgentID != "" {
-		targetAgentID = request.TargetAgentID
-		classification = &RouteResult{
-			TargetAgent:          TargetAgent(targetAgentID),
+		classification := &RouteResult{
+			TargetAgent:          TargetAgent(request.TargetAgentID),
 			Confidence:           1.0,
 			ClassificationMethod: "explicit",
 		}
-	} else {
-		// Priority 2 & 3: Check if DSL or check cache
-		// Router.Route handles DSL first, then we check cache for NL
-		if !g.router.IsDSL(request.Input) {
-			// Check cache for NL input
-			if cached := g.routeCache.Get(request.Input); cached != nil {
-				targetAgentID = cached.TargetAgentID
-				classification = &RouteResult{
-					TargetAgent:          TargetAgent(cached.TargetAgentID),
-					Intent:               cached.Intent,
-					Domain:               cached.Domain,
-					Confidence:           cached.Confidence,
-					ClassificationMethod: "cache",
-				}
-				fromCache = true
-			}
-		}
-
-		// Priority 2 & 4: DSL parse or LLM classification
-		if classification == nil {
-			classification, err = g.router.Route(ctx, request)
-			if err != nil {
-				return nil, err
-			}
-			targetAgentID = string(classification.TargetAgent)
-
-			// Cache the result if it was LLM classification (not DSL)
-			if classification.ClassificationMethod == "llm" {
-				g.routeCache.Set(request.Input, classification)
-				// Broadcast learned route to agents
-				g.broadcastLearnedRoute(request.Input, classification)
-			}
-		}
+		return classification, request.TargetAgentID, nil
 	}
 
-	_ = fromCache // Reserved for metrics
+	classification, targetAgentID, ok := g.cachedClassification(request)
+	if ok {
+		return classification, targetAgentID, nil
+	}
 
-	// Generate correlation ID
-	var corrID string
+	return g.classifyWithRouter(ctx, request)
+}
+
+func (g *Guide) cachedClassification(request *RouteRequest) (*RouteResult, string, bool) {
+	if g.router.IsDSL(request.Input) {
+		return nil, "", false
+	}
+	cached := g.routeCache.Get(request.Input)
+	if cached == nil {
+		return nil, "", false
+	}
+	classification := &RouteResult{
+		TargetAgent:          TargetAgent(cached.TargetAgentID),
+		Intent:               cached.Intent,
+		Domain:               cached.Domain,
+		Confidence:           cached.Confidence,
+		ClassificationMethod: "cache",
+	}
+	return classification, cached.TargetAgentID, true
+}
+
+func (g *Guide) classifyWithRouter(ctx context.Context, request *RouteRequest) (*RouteResult, string, error) {
+	classification, err := g.router.Route(ctx, request)
+	if err != nil {
+		return nil, "", err
+	}
+
+	targetAgentID := string(classification.TargetAgent)
+	g.cacheAndBroadcastClassification(request, classification)
+	return classification, targetAgentID, nil
+}
+
+func (g *Guide) cacheAndBroadcastClassification(request *RouteRequest, classification *RouteResult) {
+	if classification.ClassificationMethod != "llm" {
+		return
+	}
+	g.routeCache.Set(request.Input, classification)
+	g.broadcastLearnedRoute(request.Input, classification)
+}
+
+func (g *Guide) resolveCorrelationID(request *RouteRequest) string {
 	if request.CorrelationID != "" {
-		corrID = request.CorrelationID
-	} else {
-		corrID = fmt.Sprintf("corr_%d", time.Now().UnixNano())
+		return request.CorrelationID
 	}
+	return fmt.Sprintf("corr_%d", time.Now().UnixNano())
+}
 
-	// Only store in pending if NOT fire-and-forget
-	// Fire-and-forget requests don't need correlation tracking
-	if !request.FireAndForget {
-		corrID = g.pending.Add(request, classification, targetAgentID)
-	}
-
-	// Create forwarded request for target agent
-	forwarded := &ForwardedRequest{
-		CorrelationID:        corrID,
+func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *RouteResult, correlationID string) *ForwardedRequest {
+	return &ForwardedRequest{
+		CorrelationID:        correlationID,
 		ParentCorrelationID:  request.ParentCorrelationID,
 		Input:                request.Input,
 		Intent:               classification.Intent,
@@ -348,8 +367,6 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 		Confidence:           classification.Confidence,
 		ClassificationMethod: classification.ClassificationMethod,
 	}
-
-	return forwarded, nil
 }
 
 // broadcastLearnedRoute broadcasts a newly learned route to all agents
@@ -846,38 +863,63 @@ func (g *Guide) Stop() error {
 		return nil
 	}
 
-	var errs []error
+	err := g.stopComponents()
+	g.running = false
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
-	// Stop resilience components
+func (g *Guide) stopComponents() error {
+	var errs []error
+	g.stopResilience()
+	g.collectUnsubscribeErrors(&errs)
+	return g.stopError(errs)
+}
+
+func (g *Guide) stopResilience() {
 	g.pendingCleanup.Stop()
 	g.health.Stop()
+}
 
-	// Unsubscribe from Guide's request channel
-	if g.requestSub != nil {
-		if err := g.requestSub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-		g.requestSub = nil
+func (g *Guide) collectUnsubscribeErrors(errs *[]error) {
+	g.unsubscribeRequest(errs)
+	g.unsubscribeAgentChannels(errs)
+}
+
+func (g *Guide) unsubscribeRequest(errs *[]error) {
+	if g.requestSub == nil {
+		return
 	}
+	if err := g.requestSub.Unsubscribe(); err != nil {
+		*errs = append(*errs, err)
+	}
+	g.requestSub = nil
+}
 
-	// Unsubscribe from all agent response/error channels
+func (g *Guide) unsubscribeAgentChannels(errs *[]error) {
 	g.agentSubs.Range(func(agentID string, subs *agentSubscriptions) bool {
-		if subs.responses != nil {
-			if err := subs.responses.Unsubscribe(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if subs.errors != nil {
-			if err := subs.errors.Unsubscribe(); err != nil {
-				errs = append(errs, err)
-			}
-		}
+		g.unsubscribeAgentSubs(errs, subs)
 		g.agentSubs.Delete(agentID)
 		return true
 	})
+}
 
-	g.running = false
+func (g *Guide) unsubscribeAgentSubs(errs *[]error, subs *agentSubscriptions) {
+	if subs.responses != nil {
+		if err := subs.responses.Unsubscribe(); err != nil {
+			*errs = append(*errs, err)
+		}
+	}
+	if subs.errors != nil {
+		if err := subs.errors.Unsubscribe(); err != nil {
+			*errs = append(*errs, err)
+		}
+	}
+}
 
+func (g *Guide) stopError(errs []error) error {
 	if len(errs) > 0 {
 		return fmt.Errorf("errors during stop: %v", errs)
 	}

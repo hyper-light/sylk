@@ -250,44 +250,40 @@ func (r *TieredRouter) Stop() error {
 	}
 
 	var errs []error
-
-	// Stop resilience components
-	r.pendingCleanup.Stop()
-	r.retryQueue.Stop()
-
-	// Unsubscribe from all topics
-	if r.requestSub != nil {
-		if err := r.requestSub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if r.responseSub != nil {
-		if err := r.responseSub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if r.registrySub != nil {
-		if err := r.registrySub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if r.readySub != nil {
-		if err := r.readySub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if r.routeSub != nil {
-		if err := r.routeSub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
+	r.stopResilience()
+	r.unsubscribeAll(&errs)
 	r.running = false
 
-	if len(errs) > 0 {
-		return fmt.Errorf("errors during stop: %v", errs)
+	return stopError(errs)
+}
+
+func (r *TieredRouter) stopResilience() {
+	r.pendingCleanup.Stop()
+	r.retryQueue.Stop()
+}
+
+func (r *TieredRouter) unsubscribeAll(errs *[]error) {
+	r.unsubscribeSub(r.requestSub, errs)
+	r.unsubscribeSub(r.responseSub, errs)
+	r.unsubscribeSub(r.registrySub, errs)
+	r.unsubscribeSub(r.readySub, errs)
+	r.unsubscribeSub(r.routeSub, errs)
+}
+
+func (r *TieredRouter) unsubscribeSub(sub Subscription, errs *[]error) {
+	if sub == nil {
+		return
 	}
-	return nil
+	if err := sub.Unsubscribe(); err != nil {
+		*errs = append(*errs, err)
+	}
+}
+
+func stopError(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("errors during stop: %v", errs)
 }
 
 // =============================================================================
@@ -655,12 +651,10 @@ func (r *TieredRouter) routeViaGuide(ctx context.Context, correlationID, input s
 
 // handleResponse processes responses to our requests
 func (r *TieredRouter) handleResponse(msg *Message) error {
-	// Handle ACKs
 	if msg.Type == MessageTypeAck {
 		return r.handleAck(msg)
 	}
 
-	// Handle responses
 	if msg.Type != MessageTypeResponse {
 		return nil
 	}
@@ -670,31 +664,15 @@ func (r *TieredRouter) handleResponse(msg *Message) error {
 		return nil
 	}
 
-	// Look up pending request
 	pending, found := r.pending.Get(resp.CorrelationID)
 	if !found {
-		return nil // No pending request
+		return nil
 	}
 
-	// Remove from pending
 	r.removeOutbound(resp.CorrelationID)
-
-	// Record success in circuit breaker
-	if pending.TargetAgentID != "" {
-		r.circuits.RecordSuccess(pending.TargetAgentID)
-	}
-
-	// Call callback if registered
-	if pending.Callback != nil {
-		go pending.Callback(resp, nil)
-	}
-
-	// Also check handler registry
-	handler, found := r.responseHandlers.Get(resp.CorrelationID)
-	if found {
-		r.responseHandlers.Delete(resp.CorrelationID)
-		go handler(resp, nil)
-	}
+	r.recordCircuitSuccess(pending.TargetAgentID)
+	r.invokeOutboundCallback(pending, resp, nil)
+	r.invokeResponseHandler(resp)
 
 	return nil
 }
@@ -706,35 +684,60 @@ func (r *TieredRouter) handleAck(msg *Message) error {
 		return nil
 	}
 
-	// Look up pending request
 	pending, found := r.pending.Get(msg.CorrelationID)
 	if !found {
 		return nil
 	}
 
-	// Record success in circuit breaker (ACK means agent is responding)
-	if pending.TargetAgentID != "" {
-		if ack.Received {
-			r.circuits.RecordSuccess(pending.TargetAgentID)
-		} else {
-			r.circuits.RecordFailure(pending.TargetAgentID)
-		}
-	}
+	r.recordAckCircuitResult(pending.TargetAgentID, ack.Received)
 
-	// For fire-and-forget, ACK completes the request
 	if pending.FireAndForget {
 		r.removeOutbound(msg.CorrelationID)
-
-		if pending.Callback != nil {
-			var err error
-			if !ack.Received {
-				err = fmt.Errorf("request rejected: %s", ack.Message)
-			}
-			go pending.Callback(nil, err)
-		}
+		r.invokeOutboundCallback(pending, nil, r.ackError(ack))
 	}
 
 	return nil
+}
+
+func (r *TieredRouter) recordCircuitSuccess(targetAgentID string) {
+	if targetAgentID == "" {
+		return
+	}
+	r.circuits.RecordSuccess(targetAgentID)
+}
+
+func (r *TieredRouter) recordAckCircuitResult(targetAgentID string, received bool) {
+	if targetAgentID == "" {
+		return
+	}
+	if received {
+		r.circuits.RecordSuccess(targetAgentID)
+		return
+	}
+	r.circuits.RecordFailure(targetAgentID)
+}
+
+func (r *TieredRouter) invokeOutboundCallback(pending *outboundRequest, resp *RouteResponse, err error) {
+	if pending.callback == nil {
+		return
+	}
+	go pending.callback(resp, err)
+}
+
+func (r *TieredRouter) invokeResponseHandler(resp *RouteResponse) {
+	handler, found := r.responseHandlers.Get(resp.CorrelationID)
+	if !found {
+		return
+	}
+	r.responseHandlers.Delete(resp.CorrelationID)
+	go handler(resp, nil)
+}
+
+func (r *TieredRouter) ackError(ack *AckPayload) error {
+	if ack.Received {
+		return nil
+	}
+	return fmt.Errorf("request rejected: %s", ack.Message)
 }
 
 // RegisterResponseHandler registers a one-time callback for a specific correlation ID
@@ -953,14 +956,14 @@ func (r *TieredRouter) Stats() TieredRouterStats {
 
 // TieredRouterStats contains router statistics
 type TieredRouterStats struct {
-	AgentID        string                       `json:"agent_id"`
-	KnownAgents    int                          `json:"known_agents"`
-	ReadyAgents    int                          `json:"ready_agents"`
-	PendingReqs    int                          `json:"pending_requests"`
-	CacheStats     RouteCacheStats              `json:"cache"`
+	AgentID        string                         `json:"agent_id"`
+	KnownAgents    int                            `json:"known_agents"`
+	ReadyAgents    int                            `json:"ready_agents"`
+	PendingReqs    int                            `json:"pending_requests"`
+	CacheStats     RouteCacheStats                `json:"cache"`
 	CircuitStats   map[string]CircuitBreakerStats `json:"circuits"`
-	DLQStats       DeadLetterStats              `json:"dlq"`
-	PendingCleanup PendingCleanupStats          `json:"pending_cleanup"`
+	DLQStats       DeadLetterStats                `json:"dlq"`
+	PendingCleanup PendingCleanupStats            `json:"pending_cleanup"`
 }
 
 // =============================================================================

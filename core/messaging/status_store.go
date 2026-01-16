@@ -28,9 +28,9 @@ const (
 	DefaultStatusStorePath = ".sylk/message_status.db"
 
 	// Default cache configuration
-	defaultNumCounters = 1e6  // 1M counters for admission policy
-	defaultMaxCost     = 1e8  // 100MB max cache size
-	defaultBufferItems = 64   // Buffer for async operations
+	defaultNumCounters = 1e6 // 1M counters for admission policy
+	defaultMaxCost     = 1e8 // 100MB max cache size
+	defaultBufferItems = 64  // Buffer for async operations
 )
 
 // StatusRecord is the minimal representation of message status for storage.
@@ -151,6 +151,28 @@ type internalMetrics struct {
 
 // NewStatusStore creates a new tiered status store
 func NewStatusStore(cfg StatusStoreConfig) (*StatusStore, error) {
+	cfg = normalizeStatusStoreConfig(cfg)
+
+	store := &StatusStore{
+		config:    cfg,
+		evictions: make([]*StatusRecord, 0, cfg.EvictionBatchSize),
+	}
+
+	if err := store.initSQLite(cfg.DBPath); err != nil {
+		return nil, fmt.Errorf("failed to initialize SQLite: %w", err)
+	}
+
+	cache, err := store.initCache()
+	if err != nil {
+		store.db.Close()
+		return nil, err
+	}
+	store.cache = cache
+
+	return store, nil
+}
+
+func normalizeStatusStoreConfig(cfg StatusStoreConfig) StatusStoreConfig {
 	if cfg.DBPath == "" {
 		cfg.DBPath = DefaultStatusStorePath
 	}
@@ -166,32 +188,21 @@ func NewStatusStore(cfg StatusStoreConfig) (*StatusStore, error) {
 	if cfg.EvictionBatchSize == 0 {
 		cfg.EvictionBatchSize = 100
 	}
+	return cfg
+}
 
-	store := &StatusStore{
-		config:    cfg,
-		evictions: make([]*StatusRecord, 0, cfg.EvictionBatchSize),
-	}
-
-	// Initialize SQLite (cold storage)
-	if err := store.initSQLite(cfg.DBPath); err != nil {
-		return nil, fmt.Errorf("failed to initialize SQLite: %w", err)
-	}
-
-	// Initialize Ristretto (hot storage) with eviction callback
+func (s *StatusStore) initCache() (*ristretto.Cache, error) {
 	cache, err := ristretto.NewCache(&ristretto.Config{
-		NumCounters: cfg.NumCounters,
-		MaxCost:     cfg.MaxCost,
-		BufferItems: cfg.BufferItems,
-		OnEvict:     store.onEvict,
-		OnReject:    store.onReject,
+		NumCounters: s.config.NumCounters,
+		MaxCost:     s.config.MaxCost,
+		BufferItems: s.config.BufferItems,
+		OnEvict:     s.onEvict,
+		OnReject:    s.onReject,
 	})
 	if err != nil {
-		store.db.Close()
 		return nil, fmt.Errorf("failed to initialize Ristretto cache: %w", err)
 	}
-	store.cache = cache
-
-	return store, nil
+	return cache, nil
 }
 
 // initSQLite initializes the SQLite database
@@ -681,31 +692,7 @@ func scanStatusRecord(row *sql.Row) (*StatusRecord, error) {
 		return nil, err
 	}
 
-	if correlationID.Valid {
-		record.CorrelationID = correlationID.String
-	}
-	if parentID.Valid {
-		record.ParentID = parentID.String
-	}
-	if target.Valid {
-		record.Target = target.String
-	}
-	if deadline.Valid {
-		record.Deadline = &deadline.Time
-	}
-	if ttlNanos.Valid {
-		record.TTL = time.Duration(ttlNanos.Int64)
-	}
-	if processedAt.Valid {
-		record.ProcessedAt = &processedAt.Time
-	}
-	if errStr.Valid {
-		record.Error = errStr.String
-	}
-	if archivedAt.Valid {
-		record.ArchivedAt = &archivedAt.Time
-	}
-
+	applyStatusRecordOptionals(&record, correlationID, parentID, target, deadline, ttlNanos, processedAt, errStr, archivedAt)
 	return &record, nil
 }
 
@@ -725,30 +712,35 @@ func scanStatusRecordRows(rows *sql.Rows) (*StatusRecord, error) {
 		return nil, err
 	}
 
-	if correlationID.Valid {
-		record.CorrelationID = correlationID.String
-	}
-	if parentID.Valid {
-		record.ParentID = parentID.String
-	}
-	if target.Valid {
-		record.Target = target.String
-	}
-	if deadline.Valid {
-		record.Deadline = &deadline.Time
-	}
-	if ttlNanos.Valid {
-		record.TTL = time.Duration(ttlNanos.Int64)
-	}
-	if processedAt.Valid {
-		record.ProcessedAt = &processedAt.Time
-	}
-	if errStr.Valid {
-		record.Error = errStr.String
-	}
-	if archivedAt.Valid {
-		record.ArchivedAt = &archivedAt.Time
-	}
-
+	applyStatusRecordOptionals(&record, correlationID, parentID, target, deadline, ttlNanos, processedAt, errStr, archivedAt)
 	return &record, nil
+}
+
+func applyStatusRecordOptionals(record *StatusRecord, correlationID, parentID, target sql.NullString, deadline sql.NullTime, ttlNanos sql.NullInt64, processedAt sql.NullTime, errStr sql.NullString, archivedAt sql.NullTime) {
+	setOptionalString(&record.CorrelationID, correlationID)
+	setOptionalString(&record.ParentID, parentID)
+	setOptionalString(&record.Target, target)
+	setOptionalTime(&record.Deadline, deadline)
+	setOptionalDuration(&record.TTL, ttlNanos)
+	setOptionalTime(&record.ProcessedAt, processedAt)
+	setOptionalString(&record.Error, errStr)
+	setOptionalTime(&record.ArchivedAt, archivedAt)
+}
+
+func setOptionalString(target *string, value sql.NullString) {
+	if value.Valid {
+		*target = value.String
+	}
+}
+
+func setOptionalTime(target **time.Time, value sql.NullTime) {
+	if value.Valid {
+		*target = &value.Time
+	}
+}
+
+func setOptionalDuration(target *time.Duration, value sql.NullInt64) {
+	if value.Valid {
+		*target = time.Duration(value.Int64)
+	}
 }

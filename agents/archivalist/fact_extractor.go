@@ -175,56 +175,66 @@ func (e *FactExtractor) extractPattern(entry *Entry) *FactPattern {
 func (e *FactExtractor) extractFromGeneral(entry *Entry, result *ExtractedFacts) {
 	content := entry.Content
 
-	// Try to match decision patterns
-	for _, pattern := range e.decisionPatterns {
-		re := regexp.MustCompile(pattern)
-		if matches := re.FindStringSubmatch(content); len(matches) > 1 {
-			result.Decisions = append(result.Decisions, &FactDecision{
-				ID:             uuid.New().String(),
-				Choice:         strings.TrimSpace(matches[1]),
-				Rationale:      content,
-				Confidence:     0.7, // Lower confidence for pattern-matched extraction
-				SourceEntryIDs: []string{entry.ID},
-				SessionID:      e.sessionID,
-				ExtractedAt:    time.Now(),
-			})
-			return
-		}
+	if e.tryExtractDecision(content, entry, result) {
+		return
 	}
+	if e.tryExtractFailure(content, entry, result) {
+		return
+	}
+	e.tryExtractPattern(content, entry, result)
+}
 
-	// Try to match failure patterns
-	for _, pattern := range e.failurePatterns {
-		re := regexp.MustCompile(pattern)
-		if matches := re.FindStringSubmatch(content); len(matches) > 1 {
-			result.Failures = append(result.Failures, &FactFailure{
-				ID:             uuid.New().String(),
-				Approach:       strings.TrimSpace(matches[1]),
-				Reason:         content,
-				SourceEntryIDs: []string{entry.ID},
-				SessionID:      e.sessionID,
-				ExtractedAt:    time.Now(),
-			})
-			return
-		}
-	}
+func (e *FactExtractor) tryExtractDecision(content string, entry *Entry, result *ExtractedFacts) bool {
+	return e.extractWithPatterns(content, e.decisionPatterns, func(match string) {
+		result.Decisions = append(result.Decisions, &FactDecision{
+			ID:             uuid.New().String(),
+			Choice:         strings.TrimSpace(match),
+			Rationale:      content,
+			Confidence:     0.7,
+			SourceEntryIDs: []string{entry.ID},
+			SessionID:      e.sessionID,
+			ExtractedAt:    time.Now(),
+		})
+	})
+}
 
-	// Try to match pattern patterns
-	for _, pattern := range e.patternPatterns {
+func (e *FactExtractor) tryExtractFailure(content string, entry *Entry, result *ExtractedFacts) bool {
+	return e.extractWithPatterns(content, e.failurePatterns, func(match string) {
+		result.Failures = append(result.Failures, &FactFailure{
+			ID:             uuid.New().String(),
+			Approach:       strings.TrimSpace(match),
+			Reason:         content,
+			SourceEntryIDs: []string{entry.ID},
+			SessionID:      e.sessionID,
+			ExtractedAt:    time.Now(),
+		})
+	})
+}
+
+func (e *FactExtractor) tryExtractPattern(content string, entry *Entry, result *ExtractedFacts) bool {
+	return e.extractWithPatterns(content, e.patternPatterns, func(match string) {
+		result.Patterns = append(result.Patterns, &FactPattern{
+			ID:             uuid.New().String(),
+			Category:       "general",
+			Name:           strings.TrimSpace(match),
+			Pattern:        content,
+			UsageCount:     1,
+			SourceEntryIDs: []string{entry.ID},
+			SessionID:      e.sessionID,
+			ExtractedAt:    time.Now(),
+		})
+	})
+}
+
+func (e *FactExtractor) extractWithPatterns(content string, patterns []string, onMatch func(string)) bool {
+	for _, pattern := range patterns {
 		re := regexp.MustCompile(pattern)
 		if matches := re.FindStringSubmatch(content); len(matches) > 1 {
-			result.Patterns = append(result.Patterns, &FactPattern{
-				ID:             uuid.New().String(),
-				Category:       "general",
-				Name:           strings.TrimSpace(matches[1]),
-				Pattern:        content,
-				UsageCount:     1,
-				SourceEntryIDs: []string{entry.ID},
-				SessionID:      e.sessionID,
-				ExtractedAt:    time.Now(),
-			})
-			return
+			onMatch(matches[1])
+			return true
 		}
 	}
+	return false
 }
 
 // ExtractFileChanges extracts file change facts from entries with file metadata
@@ -333,55 +343,85 @@ func extractContext(content string) string {
 
 // MergeFacts combines facts from multiple extractions, deduplicating where possible
 func MergeFacts(factSets ...*ExtractedFacts) *ExtractedFacts {
-	result := &ExtractedFacts{
-		Decisions:   make([]*FactDecision, 0),
-		Patterns:    make([]*FactPattern, 0),
-		Failures:    make([]*FactFailure, 0),
-		FileChanges: make([]*FactFileChange, 0),
-	}
-
-	seenDecisions := make(map[string]bool)
-	seenPatterns := make(map[string]bool)
-	seenFailures := make(map[string]bool)
-	seenFileChanges := make(map[string]bool)
+	result := newMergedFacts()
+	tracker := newFactMergeTracker()
 
 	for _, facts := range factSets {
 		if facts == nil {
 			continue
 		}
-
-		for _, d := range facts.Decisions {
-			key := d.Choice
-			if !seenDecisions[key] {
-				seenDecisions[key] = true
-				result.Decisions = append(result.Decisions, d)
-			}
-		}
-
-		for _, p := range facts.Patterns {
-			key := p.Category + ":" + p.Name
-			if !seenPatterns[key] {
-				seenPatterns[key] = true
-				result.Patterns = append(result.Patterns, p)
-			}
-		}
-
-		for _, f := range facts.Failures {
-			key := f.Approach
-			if !seenFailures[key] {
-				seenFailures[key] = true
-				result.Failures = append(result.Failures, f)
-			}
-		}
-
-		for _, fc := range facts.FileChanges {
-			key := fc.Path + ":" + string(fc.ChangeType)
-			if !seenFileChanges[key] {
-				seenFileChanges[key] = true
-				result.FileChanges = append(result.FileChanges, fc)
-			}
-		}
+		tracker.mergeDecisions(result, facts)
+		tracker.mergePatterns(result, facts)
+		tracker.mergeFailures(result, facts)
+		tracker.mergeFileChanges(result, facts)
 	}
 
 	return result
+}
+
+type factMergeTracker struct {
+	decisions   map[string]bool
+	patterns    map[string]bool
+	failures    map[string]bool
+	fileChanges map[string]bool
+}
+
+func newMergedFacts() *ExtractedFacts {
+	return &ExtractedFacts{
+		Decisions:   make([]*FactDecision, 0),
+		Patterns:    make([]*FactPattern, 0),
+		Failures:    make([]*FactFailure, 0),
+		FileChanges: make([]*FactFileChange, 0),
+	}
+}
+
+func newFactMergeTracker() *factMergeTracker {
+	return &factMergeTracker{
+		decisions:   make(map[string]bool),
+		patterns:    make(map[string]bool),
+		failures:    make(map[string]bool),
+		fileChanges: make(map[string]bool),
+	}
+}
+
+func (t *factMergeTracker) mergeDecisions(result *ExtractedFacts, facts *ExtractedFacts) {
+	for _, decision := range facts.Decisions {
+		if t.decisions[decision.Choice] {
+			continue
+		}
+		t.decisions[decision.Choice] = true
+		result.Decisions = append(result.Decisions, decision)
+	}
+}
+
+func (t *factMergeTracker) mergePatterns(result *ExtractedFacts, facts *ExtractedFacts) {
+	for _, pattern := range facts.Patterns {
+		key := pattern.Category + ":" + pattern.Name
+		if t.patterns[key] {
+			continue
+		}
+		t.patterns[key] = true
+		result.Patterns = append(result.Patterns, pattern)
+	}
+}
+
+func (t *factMergeTracker) mergeFailures(result *ExtractedFacts, facts *ExtractedFacts) {
+	for _, failure := range facts.Failures {
+		if t.failures[failure.Approach] {
+			continue
+		}
+		t.failures[failure.Approach] = true
+		result.Failures = append(result.Failures, failure)
+	}
+}
+
+func (t *factMergeTracker) mergeFileChanges(result *ExtractedFacts, facts *ExtractedFacts) {
+	for _, change := range facts.FileChanges {
+		key := change.Path + ":" + string(change.ChangeType)
+		if t.fileChanges[key] {
+			continue
+		}
+		t.fileChanges[key] = true
+		result.FileChanges = append(result.FileChanges, change)
+	}
 }

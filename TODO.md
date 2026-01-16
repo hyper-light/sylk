@@ -30,385 +30,1188 @@ Build a highly concurrent multi-agent system capable of:
 
 ---
 
-## Existing Agent Modifications
+## Notes
 
-This section details the specific changes required to make the existing Guide and Archivalist agents compatible with the multi-session architecture.
-
-### Guide Agent Modifications (`agents/guide/`)
-
-The existing Guide agent needs significant modifications to support multi-session routing, session-scoped state, and the new agent ecosystem.
-
-#### Required Code Changes
-
-**1. Session-Aware Routing (`guide.go`)**
-```go
-// CURRENT: Single-session routing
-type Guide struct {
-    sessionID string
-    // ...
-}
-
-// REQUIRED: Multi-session support
-type Guide struct {
-    sessionManager    SessionManager           // Reference to session manager
-    sessionRouters    map[string]*SessionRouter // Per-session routing state
-    globalRouteCache  *RouteCache              // Shared route cache (read-only fallback)
-    sharedAgents      map[string]Agent         // Librarian, Academic, Archivalist
-    // ...
-}
-
-// Add session context to all routing methods
-func (g *Guide) RouteWithSession(ctx context.Context, sessionID string, req *RouteRequest) (*RouteResult, error)
-func (g *Guide) GetSessionRouter(sessionID string) (*SessionRouter, error)
-func (g *Guide) CreateSessionRouter(sessionID string) (*SessionRouter, error)
-func (g *Guide) CloseSessionRouter(sessionID string) error
-```
-
-**2. New SessionRouter Type (`session_router.go` - new file)**
-```go
-type SessionRouter struct {
-    sessionID        string
-    routeCache       *RouteCache           // Session-scoped cache
-    pendingRequests  *PendingRequestStore  // Session-scoped pending
-    agentRegistry    map[string]Agent      // Session-scoped agents (Architect, Orchestrator, etc.)
-    subscriptions    []func()              // Cleanup functions for session topics
-    mu               sync.RWMutex
-}
-```
-
-**3. Message Type Extensions (`types.go`)**
-- [ ] Add all new message types (DAG_EXECUTE, DAG_STATUS, DAG_CANCEL, etc.)
-- [ ] Add SessionID field to RouteRequest
-- [ ] Add SessionID field to RouteResult
-- [ ] Add message priority field
-- [ ] Add correlation ID for request/response matching
-
-**4. Bus Integration Updates (`bus.go`)**
-- [ ] Add session topic creation: `session.{id}.{agent}.{channel}`
-- [ ] Add session topic cleanup on session close
-- [ ] Add wildcard subscription support
-- [ ] Add message filtering by session ID
-
-**5. Skill System Updates (`skills.go` - new file)**
-- [ ] Implement `SkillLoader` interface for progressive disclosure
-- [ ] Add skill registration by tier (Core, Domain, Specialized)
-- [ ] Add skill loading triggers (domain keywords, explicit request)
-- [ ] Add skill unloading with LRU eviction
-- [ ] Add token budget tracking for loaded skills
-
-**6. Hook System Updates**
-- [ ] Add pre-route hook injection point
-- [ ] Add post-route hook injection point
-- [ ] Add pre-dispatch hook injection point
-- [ ] Add post-dispatch hook injection point
-- [ ] Implement hook chain execution with abort capability
-
-#### Required Interface Changes
-
-```go
-// Current Skills() signature - needs enhancement
-func (g *Guide) Skills() []skills.Skill
-
-// Required signature
-func (g *Guide) Skills() []skills.Skill                    // Core skills (always loaded)
-func (g *Guide) ExtendedSkills() []skills.Skill            // Extended skills (on demand)
-func (g *Guide) LoadSkill(name string) error               // Load specific skill
-func (g *Guide) UnloadSkill(name string) error             // Unload skill
-func (g *Guide) LoadedSkills() []string                    // Currently loaded skills
-func (g *Guide) SkillTokenBudget() (used int, max int)     // Token tracking
-
-// Current Hooks() signature - needs enhancement
-func (g *Guide) Hooks() skills.AgentHooks
-
-// Required hook types
-type GuideHooks struct {
-    PreRoute     []func(ctx context.Context, req *RouteRequest) (*RouteRequest, error)
-    PostRoute    []func(ctx context.Context, req *RouteRequest, result *RouteResult) error
-    PreDispatch  []func(ctx context.Context, target string, msg *Message) (*Message, error)
-    PostDispatch []func(ctx context.Context, target string, msg *Message, result any) error
-}
-```
-
-#### Required New Methods
-
-```go
-// Session management
-func (g *Guide) AttachSession(session *Session) error
-func (g *Guide) DetachSession(sessionID string) error
-func (g *Guide) ActiveSession() (*Session, bool)
-func (g *Guide) SwitchSession(sessionID string) error
-
-// Agent registration (session-scoped)
-func (g *Guide) RegisterSessionAgent(sessionID string, agent Agent) error
-func (g *Guide) UnregisterSessionAgent(sessionID string, agentID string) error
-func (g *Guide) GetSessionAgents(sessionID string) []Agent
-
-// Shared agent access
-func (g *Guide) GetSharedAgent(agentID string) (Agent, bool)
-func (g *Guide) RegisterSharedAgent(agent Agent) error
-
-// Message routing
-func (g *Guide) RouteToSession(sessionID string, msg *Message) error
-func (g *Guide) BroadcastToSession(sessionID string, msg *Message) error
-
-// Metrics (session-aware)
-func (g *Guide) SessionMetrics(sessionID string) *SessionRouteMetrics
-func (g *Guide) GlobalMetrics() *GlobalRouteMetrics
-```
-
-#### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `guide.go` | Add SessionManager reference, multi-session support, session-aware routing |
-| `types.go` | Add new message types, SessionID fields, priority field |
-| `routing.go` | Session-scoped route resolution, global fallback |
-| `bus.go` | Session topic support, wildcard subscriptions |
-| `route_cache.go` | Session-scoped cache with global fallback |
-| `worker_pool.go` | Session-aware job scheduling, fair allocation |
-
-#### Files to Create
-
-| File | Purpose |
-|------|---------|
-| `session_router.go` | Per-session routing state and logic |
-| `message_types.go` | New message type definitions |
-| `skills.go` | Skill loading/unloading, progressive disclosure |
-| `hooks.go` | Hook chain implementation |
+- All agents must implement bus integration (Start/Stop/IsRunning)
+- All agents must provide `AgentRoutingInfo` for Guide registration
+- All agents must define core skills (always loaded) and extended skills (on demand)
+- All state operations must be session-aware
+- Engineers are invisible to users - all clarifications route through Architect
+- Guide is the only message router - no direct agent communication
+- Archivalist stores all workflow history for future reference
+- Cross-session queries are read-only
+- Use existing patterns from Guide and Archivalist as templates
 
 ---
 
-### Archivalist Agent Modifications (`agents/archivalist/`)
+## Discipline Protocols (Sisyphus-Inspired)
 
-The existing Archivalist agent needs modifications to enforce session isolation, support cross-session queries, and store workflow history.
+**Goal**: Implement distributed execution discipline across all agents to ensure thorough, robust, and mature behavior. These protocols exceed single-agent approaches by leveraging specialized agent expertise.
 
-#### Required Code Changes
+**Reference**: See ARCHITECTURE.md for detailed protocol specifications and system prompts.
 
-**1. Session Enforcement (`archivalist.go`)**
-```go
-// CURRENT: Optional session tracking
-type Archivalist struct {
-    // sessionID used but not enforced
-}
+### Communication Style (All Agents)
 
-// REQUIRED: Mandatory session enforcement
-type Archivalist struct {
-    defaultSessionID string                    // Default session for writes
-    sessionStores    map[string]*SessionStore  // Per-session storage partitions
-    crossSessionIdx  *CrossSessionIndex        // Index for cross-session queries
-    workflowStore    *WorkflowStore            // DAG execution history
-    // ...
-}
+**Files to modify:**
+- `core/agent/base_prompt.go` (create)
+- Each agent's `system_prompt.go`
 
-// All write operations MUST include session
-func (a *Archivalist) Store(entry *Entry) error                          // Uses defaultSessionID
-func (a *Archivalist) StoreInSession(sessionID string, entry *Entry) error // Explicit session
+**Acceptance Criteria:**
+- [ ] `AgentCommunicationStylePrompt` constant defined in base
+- [ ] All agent system prompts include communication style fragment
+- [ ] No flattery, hedging, status acknowledgments, or filler phrases in agent output
+- [ ] Evidence-based responses with file paths and line numbers
 
-// All read operations default to current session
-func (a *Archivalist) Query(query *ArchiveQuery) ([]*Entry, error)       // Current session only
-func (a *Archivalist) QueryCrossSession(query *ArchiveQuery) ([]*Entry, error) // All sessions
+### Librarian: Codebase Health Assessment
+
+**Files to modify/create:**
+- `agents/librarian/health_assessment.go`
+- `agents/librarian/maturity.go`
+
+**Acceptance Criteria:**
+- [ ] `CodebaseMaturity` enum: `DISCIPLINED`, `TRANSITIONAL`, `LEGACY`, `GREENFIELD`
+- [ ] `assess_codebase_health` skill implementation
+- [ ] Pattern consistency scoring (0.0-1.0)
+- [ ] Test coverage detection
+- [ ] Technical debt marker counting (TODO/FIXME/HACK)
+- [ ] Health assessment included in implementation context responses
+- [ ] `LibrarianHealthAssessmentPrompt` added to system prompt
+
+### Librarian: Context Quality Feedback
+
+**Files to modify/create:**
+- `agents/librarian/context_feedback.go`
+- `agents/librarian/quality_metrics.go`
+
+**Acceptance Criteria:**
+- [ ] `ContextFeedback` struct with query_id, context_provided, failure_type, actual_outcome
+- [ ] `receive_context_feedback` skill implementation
+- [ ] `query_context_feedback` skill implementation
+- [ ] `get_context_quality_metrics` skill implementation
+- [ ] Feedback types: ENGINEER_FAILURE, PATTERN_MISMATCH, OUTDATED_CONTEXT, MISSING_CONTEXT, WRONG_RECOMMENDATION
+- [ ] Feedback stored in Archivalist category "librarian_context_feedback"
+- [ ] Cache invalidation on feedback receipt
+- [ ] Query past feedback during context generation
+- [ ] Confidence warning for query types with high failure history
+- [ ] `LibrarianContextQualityPrompt` added to system prompt
+
+### Archivalist: Failure Pattern Memory
+
+**Files to modify/create:**
+- `agents/archivalist/failure_memory.go`
+- `agents/archivalist/failure_types.go`
+
+**Acceptance Criteria:**
+- [ ] `FailureEntry` struct with approach_signature, error_pattern, resolution, recurrence_count
+- [ ] `query_failure_patterns` skill implementation
+- [ ] `record_failure` skill implementation
+- [ ] `get_approach_statistics` skill implementation
+- [ ] `mark_decision_outcome` skill implementation
+- [ ] Similar failure detection with 0.7 similarity threshold
+- [ ] "SIMILAR FAILURE DETECTED" warning format
+- [ ] Cross-session failure learning (failure patterns always readable)
+- [ ] `ArchivalistFailureMemoryPrompt` added to system prompt
+
+### Archivalist: Retrieval Accuracy Tracking
+
+**Files to modify/create:**
+- `agents/archivalist/retrieval_accuracy.go`
+- `agents/archivalist/self_healing.go`
+
+**Acceptance Criteria:**
+- [ ] `RetrievalAccuracy` struct with query_id, entries_returned, accuracy_issue, correction
+- [ ] `report_retrieval_issue` skill implementation
+- [ ] `mark_entry_stale` skill implementation
+- [ ] `verify_storage` skill implementation
+- [ ] `get_retrieval_accuracy_metrics` skill implementation
+- [ ] Issue types: STALE_RETRIEVAL, IRRELEVANT_RETRIEVAL, INCOMPLETE_RETRIEVAL, WRONG_RESOLUTION, CONFLICTING_ENTRIES
+- [ ] Self-healing actions per issue type
+- [ ] Read-after-write storage verification
+- [ ] Proactive staleness detection (entry age vs file modification)
+- [ ] `ArchivalistRetrievalAccuracyPrompt` added to system prompt
+
+### Academic: Research Discipline Protocol
+
+**Files to modify/create:**
+- `agents/academic/research_discipline.go`
+- `agents/academic/validation.go`
+
+**Acceptance Criteria:**
+- [ ] `validate_against_codebase` skill implementation
+- [ ] `assess_applicability` skill implementation
+- [ ] `identify_adaptation_needs` skill implementation
+- [ ] Applicability classification: `DIRECT`, `ADAPTABLE`, `INCOMPATIBLE`
+- [ ] Confidence scoring: `HIGH`, `MEDIUM`, `LOW`
+- [ ] Theory-reality gap detection
+- [ ] Mandatory Librarian consultation before finalizing recommendations
+- [ ] Maturity-aware recommendations
+- [ ] `AcademicResearchDisciplinePrompt` added to system prompt
+
+### Academic: Recommendation Outcome Tracking
+
+**Files to modify/create:**
+- `agents/academic/outcome_tracking.go`
+- `agents/academic/success_metrics.go`
+
+**Acceptance Criteria:**
+- [ ] `RecommendationOutcome` struct with recommendation_id, query, outcome, outcome_details, lessons_learned
+- [ ] `record_recommendation_outcome` skill implementation
+- [ ] `query_recommendation_outcomes` skill implementation
+- [ ] `get_recommendation_success_rates` skill implementation
+- [ ] Outcome types: IMPLEMENTATION_SUCCESS, IMPLEMENTATION_FAILURE, ADAPTATION_REQUIRED, BETTER_ALTERNATIVE_FOUND, PARTIAL_SUCCESS
+- [ ] Outcomes stored in Archivalist category "academic_recommendation_outcome"
+- [ ] Query past outcomes during research for similar topics
+- [ ] Surface "PAST FAILURE" warnings when similar recommendations failed
+- [ ] Surface "VALIDATED" notes when similar recommendations succeeded
+- [ ] Adjust confidence based on historical success rates (>80% = HIGH, 50-80% = MEDIUM, <50% = LOW)
+- [ ] `AcademicRecommendationOutcomePrompt` added to system prompt
+
+### Guide: Intent Gate Classification (Phase 0)
+
+**Files to modify/create:**
+- `agents/guide/intent_gate.go`
+- `agents/guide/validation.go`
+
+**Acceptance Criteria:**
+- [ ] `RequestType` enum: `TRIVIAL`, `EXPLICIT`, `EXPLORATORY`, `OPEN_ENDED`, `GITHUB_WORK`, `AMBIGUOUS`
+- [ ] Intent classification before routing
+- [ ] Fast-path for TRIVIAL requests
+- [ ] Validation checks (assumptions explicit, scope bounded)
+- [ ] Pre-routing consultation triggers (Librarian, Archivalist)
+- [ ] Confidence threshold (0.7) for routing
+- [ ] `GuideIntentGatePrompt` added to system prompt
+
+### Guide: Routing Failure Tracking
+
+**Files to modify/create:**
+- `agents/guide/routing_failure.go`
+- `agents/guide/routing_metrics.go`
+
+**Acceptance Criteria:**
+- [ ] `RoutingFailure` struct with original_request, routed_to, should_have_been, failure_signal
+- [ ] `record_routing_failure` skill implementation
+- [ ] `query_routing_failures` skill implementation
+- [ ] `get_routing_accuracy` skill implementation
+- [ ] Failure signal detection: EXPLICIT_REDIRECT, USER_CORRECTION, TASK_HELP_ESCALATION, CLARIFICATION_LOOP, EMPTY_RESPONSE
+- [ ] Failures stored in Archivalist category "routing_failure"
+- [ ] Query past failures during Intent Gate classification
+- [ ] Adjust confidence scores based on similar past misroutes
+- [ ] `GuideRoutingFailurePrompt` added to system prompt
+
+### Architect: Pre-Delegation Planning Protocol
+
+**Files to modify/create:**
+- `agents/architect/pre_delegation.go`
+- `agents/architect/consultation.go`
+
+**Acceptance Criteria:**
+- [ ] `pre_delegation_declare` skill implementation (MANDATORY)
+- [ ] `consult_before_planning` skill implementation (MANDATORY)
+- [ ] 4-part declaration format enforced
+- [ ] Mandatory Librarian consultation (codebase health)
+- [ ] Mandatory Archivalist consultation (failure patterns)
+- [ ] Declaration stored in Archivalist for traceability
+- [ ] Orchestrator validates declaration before dispatch
+- [ ] `ArchitectPreDelegationPrompt` added to system prompt
+
+### Orchestrator: Execution Discipline Protocol
+
+**Files to modify/create:**
+- `agents/orchestrator/execution_discipline.go`
+- `agents/orchestrator/validation.go`
+
+**Acceptance Criteria:**
+- [ ] Declaration validation before dispatch
+- [ ] Reject TASK_DISPATCH without pre_delegation_declaration
+- [ ] Verify librarian_health and archivalist_check fields
+- [ ] Dependency tracking and validation
+- [ ] Failure coordination across tasks
+- [ ] Escalation to Architect after failure threshold
+- [ ] Progress signal enforcement
+
+### Engineer: Failure Recovery Protocol
+
+**Files to modify/create:**
+- `agents/engineer/failure_recovery.go`
+- `agents/engineer/checkpoint.go`
+
+**Hooks to add:**
+- [ ] `failure_counter` PostTool hook
+- [ ] `failure_protocol_injection` PrePrompt hook
+- [ ] `checkpoint_creation` PreTool hook
+
+**Acceptance Criteria:**
+- [ ] Consecutive failure tracking per task
+- [ ] Warning injection at 2 failures
+- [ ] Escalation at 3 failures
+- [ ] Checkpoint creation before write operations
+- [ ] Revert to checkpoint on escalation
+- [ ] Failure recording to Archivalist
+- [ ] `ErrFailureThresholdExceeded` error type
+- [ ] `EngineerFailureRecoveryPrompt` added to system prompt
+
+### Designer: Failure Recovery Protocol
+
+**Files to modify/create:**
+- `agents/designer/failure_recovery.go`
+
+**Acceptance Criteria:**
+- [ ] Same failure recovery hooks as Engineer
+- [ ] Design-specific failure patterns (visual regression, accessibility)
+- [ ] Checkpoint creation before component writes
+
+### Inspector: Completion Evidence Protocol
+
+**Files to modify/create:**
+- `agents/inspector/completion_evidence.go`
+- `agents/inspector/evidence_types.go`
+
+**Acceptance Criteria:**
+- [ ] `collect_build_evidence` skill implementation
+- [ ] `collect_type_evidence` skill implementation
+- [ ] `collect_lint_evidence` skill implementation
+- [ ] `verify_pattern_compliance` skill implementation
+- [ ] `store_evidence` skill implementation (MANDATORY)
+- [ ] Evidence checklist: BUILD, TYPES, LINT, PATTERNS, SECURITY
+- [ ] Evidence stored in Archivalist with task correlation
+- [ ] "NO EVIDENCE = NOT COMPLETE" principle enforced
+- [ ] `InspectorCompletionEvidencePrompt` added to system prompt
+
+### Tester: Completion Evidence Protocol
+
+**Files to modify/create:**
+- `agents/tester/completion_evidence.go`
+- `agents/tester/evidence_types.go`
+
+**Acceptance Criteria:**
+- [ ] `collect_test_evidence` skill implementation
+- [ ] `collect_coverage_evidence` skill implementation
+- [ ] `verify_no_regression` skill implementation
+- [ ] `verify_new_tests_exist` skill implementation
+- [ ] `store_evidence` skill implementation (MANDATORY)
+- [ ] Evidence checklist: TESTS_PASS, COVERAGE, REGRESSION, NEW_TESTS
+- [ ] Evidence stored in Archivalist with task correlation
+- [ ] "NO EVIDENCE = NOT COMPLETE" principle enforced
+- [ ] `TesterCompletionEvidencePrompt` added to system prompt
+
+### Cross-Agent Discipline Integration
+
+**Acceptance Criteria:**
+- [ ] Guide's Intent Gate triggers pre-routing consultations
+- [ ] Librarian's health assessment flows to Architect's declarations
+- [ ] Archivalist's failure patterns inform all planning decisions
+- [ ] Academic's recommendations validated against Librarian's codebase state
+- [ ] Engineer failures recorded in Archivalist for cross-session learning
+- [ ] Inspector/Tester evidence stored in Archivalist for future queries
+
+### Knowledge Agent Feedback Loops
+
+**Acceptance Criteria:**
+
+#### Guide → Archivalist Feedback
+- [ ] Guide records routing failures in Archivalist
+- [ ] Guide queries past routing failures during Intent Gate
+- [ ] Routing accuracy metrics tracked over time
+
+#### Librarian → Archivalist Feedback
+- [ ] Engineer/Inspector failures with context_source: "librarian" trigger feedback
+- [ ] Librarian queries past context feedback during query processing
+- [ ] Context quality metrics tracked over time
+- [ ] Cache entries invalidated based on feedback
+
+#### Archivalist Self-Monitoring
+- [ ] Retrieval accuracy issues logged
+- [ ] Self-healing actions triggered per issue type
+- [ ] Storage verification on all writes
+- [ ] Proactive staleness detection
+
+#### Academic → Archivalist Feedback
+- [ ] Recommendation outcomes recorded after implementation
+- [ ] Academic queries past outcomes for similar research
+- [ ] Success rate metrics by topic, maturity, applicability
+- [ ] Confidence adjusted based on historical success
+
+#### Complete Feedback Flow
 ```
+Engineer FAILURE
+    ↓
+Archivalist records with context_source
+    ↓
+├── If context_source = "librarian" → Librarian receives feedback
+├── If context_source = "academic" → Academic receives feedback
+└── If routing_issue → Guide receives feedback
 
-**2. Session Store Type (`session_store.go` - new file)**
-```go
-type SessionStore struct {
-    sessionID      string
-    entries        map[string]*Entry
-    facts          *FactStore           // Session-local facts
-    summaries      []*CompactedSummary  // Session summaries
-    tokenCount     int                  // Hot memory token tracking
-    mu             sync.RWMutex
-}
-
-// Session-scoped operations
-func (s *SessionStore) Insert(entry *Entry) error
-func (s *SessionStore) Get(id string) (*Entry, bool)
-func (s *SessionStore) Query(query *ArchiveQuery) ([]*Entry, error)
-func (s *SessionStore) Archive(entryID string) error
-func (s *SessionStore) TokenBudget() (used int, max int)
+All feedback stored cross-session for continuous improvement
 ```
-
-**3. Cross-Session Query Support (`cross_session.go` - new file)**
-```go
-type CrossSessionIndex struct {
-    byCategory  map[Category][]string    // Entry IDs by category (all sessions)
-    bySource    map[SourceModel][]string // Entry IDs by source
-    byKeyword   map[string][]string      // Entry IDs by keyword
-    sessionMap  map[string]string        // Entry ID → Session ID
-    mu          sync.RWMutex
-}
-
-func (c *CrossSessionIndex) Search(query *ArchiveQuery) ([]CrossSessionResult, error)
-func (c *CrossSessionIndex) IndexEntry(sessionID string, entry *Entry) error
-func (c *CrossSessionIndex) RemoveEntry(entryID string) error
-
-type CrossSessionResult struct {
-    Entry     *Entry
-    SessionID string
-    Score     float64  // Relevance score
-}
-```
-
-**4. Workflow Storage (`workflow_store.go` - new file)**
-```go
-type WorkflowStore struct {
-    dags      map[string]*StoredDAG       // DAG ID → definition
-    runs      map[string]*DAGRun          // Run ID → execution record
-    bySession map[string][]string         // Session ID → Run IDs
-    mu        sync.RWMutex
-}
-
-type StoredDAG struct {
-    ID          string
-    Definition  *DAG
-    SessionID   string
-    CreatedAt   time.Time
-    ExecutionCount int
-}
-
-type DAGRun struct {
-    ID           string
-    DAGID        string
-    SessionID    string
-    StartTime    time.Time
-    EndTime      *time.Time
-    Status       DAGStatus
-    NodeResults  map[string]*NodeResult
-    Corrections  []*Correction
-    FinalOutcome string
-}
-
-func (w *WorkflowStore) StoreDAG(sessionID string, dag *DAG) (string, error)
-func (w *WorkflowStore) RecordRun(run *DAGRun) error
-func (w *WorkflowStore) QuerySimilarWorkflows(query string) ([]*StoredDAG, error)
-func (w *WorkflowStore) GetSessionHistory(sessionID string) ([]*DAGRun, error)
-```
-
-**5. Type Updates (`types.go`)**
-- [ ] Add `IncludeArchived` flag to `ArchiveQuery` (already exists, verify usage)
-- [ ] Add `SessionIDs` filter for cross-session queries (already exists, enhance)
-- [ ] Add `WorkflowQuery` struct for DAG history queries
-- [ ] Add `CrossSessionResult` wrapper type
-- [ ] Add `DAGRun` and `StoredDAG` types
-
-**6. Skill System Updates (`skills.go` - new file)**
-```go
-// Core Skills (always loaded)
-var CoreSkills = []skills.Skill{
-    skills.NewSkill("store").Description("Store an entry").Domain("storage"),
-    skills.NewSkill("query").Description("Query entries").Domain("storage"),
-    skills.NewSkill("briefing").Description("Get session briefing").Domain("status"),
-}
-
-// Extended Skills (on demand)
-var ExtendedSkills = []skills.Skill{
-    skills.NewSkill("cross_session_query").Description("Query across sessions").Domain("history"),
-    skills.NewSkill("workflow_history").Description("Query past workflows").Domain("history"),
-    skills.NewSkill("token_savings").Description("Get token savings report").Domain("metrics"),
-    skills.NewSkill("session_timeline").Description("Get session event timeline").Domain("history"),
-    skills.NewSkill("pattern_search").Description("Find similar patterns").Domain("patterns"),
-    skills.NewSkill("failure_search").Description("Find similar failures").Domain("patterns"),
-    skills.NewSkill("decision_search").Description("Find similar decisions").Domain("patterns"),
-    skills.NewSkill("promote_to_global").Description("Promote entry to global scope").Domain("admin"),
-}
-```
-
-#### Required Interface Changes
-
-```go
-// Current interface - needs enhancement
-type Archivalist interface {
-    Store(entry *Entry) (*SubmissionResult, error)
-    Query(query *ArchiveQuery) ([]*Entry, error)
-    // ...
-}
-
-// Required interface additions
-type Archivalist interface {
-    // Session management
-    SetDefaultSession(sessionID string)
-    GetDefaultSession() string
-
-    // Session-scoped operations
-    StoreInSession(sessionID string, entry *Entry) (*SubmissionResult, error)
-    QueryInSession(sessionID string, query *ArchiveQuery) ([]*Entry, error)
-
-    // Cross-session operations (read-only)
-    QueryCrossSession(query *ArchiveQuery) ([]CrossSessionResult, error)
-    GetSessionList() []SessionInfo
-    GetSessionSummary(sessionID string) (*SessionSummary, error)
-
-    // Workflow storage
-    StoreWorkflow(sessionID string, dag *DAG) (string, error)
-    RecordWorkflowRun(run *DAGRun) error
-    QuerySimilarWorkflows(query string) ([]*StoredDAG, error)
-    GetWorkflowHistory(sessionID string, limit int) ([]*DAGRun, error)
-
-    // Token/savings tracking
-    GetTokenSavings(sessionID string) (*TokenSavingsReport, error)
-    GetGlobalTokenSavings() (*TokenSavingsReport, error)
-
-    // Promotion (session-local → global)
-    PromoteToGlobal(entryID string, reason string) error
-}
-```
-
-#### Required New Methods
-
-```go
-// Session lifecycle hooks
-func (a *Archivalist) OnSessionCreate(sessionID string) error
-func (a *Archivalist) OnSessionClose(sessionID string) error
-func (a *Archivalist) OnSessionSwitch(fromID, toID string) error
-
-// Snapshot support for session persistence
-func (a *Archivalist) CreateSessionSnapshot(sessionID string) (*ChronicleSnapshot, error)
-func (a *Archivalist) RestoreSessionSnapshot(sessionID string, snapshot *ChronicleSnapshot) error
-
-// Compaction (cross-session aware)
-func (a *Archivalist) CompactSession(sessionID string) error
-func (a *Archivalist) CompactGlobal() error
-```
-
-#### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `archivalist.go` | Session enforcement, cross-session query support |
-| `storage.go` | Session-partitioned storage, workflow storage |
-| `types.go` | New types for workflow storage, cross-session results |
-| `query_cache.go` | Session-scoped caching, cross-session cache invalidation |
-
-#### Files to Create
-
-| File | Purpose |
-|------|---------|
-| `session_store.go` | Per-session storage partition |
-| `cross_session.go` | Cross-session index and query logic |
-| `workflow_store.go` | DAG definition and execution history storage |
-| `skills.go` | Skill definitions with progressive disclosure |
-| `hooks.go` | Hook implementations for session lifecycle |
 
 ---
 
-### Migration Path
+## Enhanced Agent Skills (Inspired by oh-my-opencode & opencode)
 
-The following sequence ensures backward compatibility during migration:
+Skills and tooling inspired by tool exploration of oh-my-opencode and anomalyco/opencode repositories.
 
-1. **Phase A: Add Session Support (Non-Breaking)**
-   - Add SessionID fields with defaults
-   - Add new methods alongside existing ones
-   - Existing code continues to work
+### Librarian: Enhanced Search & AST Skills
 
-2. **Phase B: Enable Session Isolation**
-   - Enable session enforcement flag
-   - Migrate existing data to "default" session
-   - Update all callers to provide session context
+**Files to modify:**
+- `agents/librarian/skills.go`
+- `agents/librarian/lsp.go` (new)
+- `agents/librarian/ast_search.go` (new)
 
-3. **Phase C: Remove Legacy Methods**
-   - Deprecate non-session-aware methods
-   - Remove after all callers migrated
-   - Enforce session context on all operations
+**Acceptance Criteria:**
+
+#### AST-Based Search
+- [ ] `ast_grep_search` skill for structural code pattern matching
+- [ ] Support for Go, TypeScript, Python, Rust, Java languages
+- [ ] AST pattern syntax documentation
+- [ ] Integration with existing search for fallback
+
+#### LSP Integration
+- [ ] `lsp_go_to_definition` skill via LSP protocol
+- [ ] `lsp_find_references` skill for all symbol usages
+- [ ] `lsp_hover` skill for type/documentation info
+- [ ] `lsp_symbols` skill for file/workspace symbols
+- [ ] `lsp_call_hierarchy` skill for incoming/outgoing calls
+- [ ] LSP server lifecycle management
+- [ ] Fallback to AST/regex when LSP unavailable
+
+#### Semantic Code Search
+- [ ] `codesearch` skill for natural language code queries
+- [ ] Integration with codebase index
+- [ ] Search type selection logic (when to use which tool)
+
+### Academic: Web Research & Documentation Skills
+
+**Files to modify:**
+- `agents/academic/skills.go`
+- `agents/academic/web.go` (new)
+
+**Acceptance Criteria:**
+
+#### Web Research
+- [ ] `web_search` skill for internet research
+- [ ] Domain filtering support
+- [ ] Rate limiting and caching
+- [ ] Result ranking and deduplication
+
+#### Documentation Fetching
+- [ ] `web_fetch` skill for URL content extraction
+- [ ] `fetch_documentation` skill for package docs
+- [ ] Support for Go, npm, PyPI, crates.io
+- [ ] Version-specific documentation lookup
+
+#### GitHub Integration
+- [ ] `fetch_github_context` skill for repo info
+- [ ] README, structure, issues, releases extraction
+- [ ] Rate limiting for GitHub API
+
+#### Package Search
+- [ ] `search_packages` skill for registry search
+- [ ] Multi-registry support (npm, go, pypi, crates)
+- [ ] Sort by relevance, downloads, recency
+
+### Orchestrator: Batch & Parallel Execution Skills
+
+**Files to modify:**
+- `core/orchestrator/executor.go`
+- `core/orchestrator/batch.go` (new)
+- `core/orchestrator/background.go` (new)
+
+**Acceptance Criteria:**
+
+#### Batch Dispatch
+- [ ] `batch_dispatch` for parallel independent tasks
+- [ ] Respect max_concurrency limits
+- [ ] fail_fast option for early termination
+- [ ] Result aggregation
+
+#### Background Tasks
+- [ ] `background_task` for long-running operations
+- [ ] Progress signal emission at intervals
+- [ ] `task_monitor` for status checking
+- [ ] `kill_task` for graceful termination
+- [ ] Timeout enforcement
+
+#### Parallel Validation
+- [ ] `parallel_validate` for concurrent validations
+- [ ] Build, lint, type, test validation types
+- [ ] Result aggregation before Architect reporting
+
+### Engineer: Multi-Edit & Structural Refactoring Skills
+
+**Files to modify:**
+- `agents/engineer/skills.go`
+- `agents/engineer/multiedit.go` (new)
+- `agents/engineer/refactor.go` (new)
+
+**Acceptance Criteria:**
+
+#### Multi-Edit Operations
+- [ ] `multi_edit` for atomic batch edits in single file
+- [ ] Dry-run support for preview
+- [ ] Rollback on any edit failure
+- [ ] Edit conflict detection
+
+#### Patch Operations
+- [ ] `patch_file` for unified diff application
+- [ ] Reverse patch support
+- [ ] Context validation
+
+#### AST-Based Refactoring
+- [ ] `ast_grep_replace` for structural find-replace
+- [ ] Cross-file rename support
+- [ ] Dry-run with preview
+- [ ] Language-specific patterns
+
+#### Batch File Operations
+- [ ] `batch_write` for atomic multi-file creation
+- [ ] Directory creation support
+- [ ] Rollback on failure
+
+#### Background Execution
+- [ ] `run_background` for long-running commands
+- [ ] Timeout and monitoring support
+
+### Designer: Vision & Multimodal Skills
+
+**Files to modify:**
+- `agents/designer/skills.go`
+- `agents/designer/vision.go` (new)
+
+**Acceptance Criteria:**
+
+#### Image Analysis
+- [ ] `look_at` skill for screenshot/image analysis
+- [ ] Multiple analysis modes (describe, compare, accessibility, spacing, consistency)
+- [ ] Integration with multimodal model (Gemini 3 Pro)
+
+#### Visual Comparison
+- [ ] `compare_screenshots` for visual regression detection
+- [ ] Configurable diff threshold
+- [ ] Diff highlighting output
+
+#### Design Mockup Analysis
+- [ ] `analyze_design_mockup` for implementation planning
+- [ ] Extract components, spacing, colors, typography
+- [ ] Framework-specific output (React, Vue, Svelte, CSS)
+
+#### Visual Accessibility
+- [ ] `visual_accessibility_check` for visual a11y validation
+- [ ] Contrast ratio checking
+- [ ] Touch target size validation
+- [ ] Font size validation
+
+### Inspector: LSP & AST Validation Skills
+
+**Files to modify:**
+- `agents/inspector/skills.go`
+- `agents/inspector/lsp.go` (new)
+- `agents/inspector/security.go` (new)
+
+**Acceptance Criteria:**
+
+#### LSP Diagnostics
+- [ ] `lsp_diagnostics` for file diagnostics
+- [ ] Severity filtering (error, warning, hint)
+- [ ] Per-file caching until file changes
+
+#### AST-Based Linting
+- [ ] `ast_lint` for custom pattern detection
+- [ ] Code smell patterns (long functions, deep nesting)
+- [ ] Anti-pattern detection (error swallowing)
+- [ ] Language-specific rules
+
+#### Security Scanning
+- [ ] `security_scan` for vulnerability detection
+- [ ] Dependency CVE checking
+- [ ] Code vulnerability detection
+- [ ] Secret detection
+- [ ] Configurable severity threshold
+
+#### Complexity Analysis
+- [ ] `complexity_analysis` for code metrics
+- [ ] Cyclomatic complexity per function
+- [ ] Cognitive complexity
+- [ ] Configurable thresholds
+
+#### Type Coverage
+- [ ] `type_coverage` for type safety checking
+- [ ] any/unknown usage detection
+- [ ] Strict mode option
+
+### Librarian: Tool Discovery System
+
+**CRITICAL: Librarian owns ALL tool discovery. Inspector and Tester consult Librarian before execution.**
+
+**Inspired by OpenCode's formatter/linter/test selection architecture, with distributed responsibility.**
+
+**Files to create:**
+- `core/detect/which.go` (new) - Binary detection
+- `core/detect/files.go` (new) - File/config detection
+- `core/detect/dependencies.go` (new) - Dependency detection
+- `core/format/types.go` (new) - Formatter type definitions
+- `core/format/formatters.go` (new) - Formatter definitions
+- `core/format/selector.go` (new) - Formatter selection logic
+- `core/lsp/types.go` (new) - LSP type definitions
+- `core/lsp/servers.go` (new) - LSP server definitions
+- `core/lsp/selector.go` (new) - LSP selection logic
+- `core/test/types.go` (new) - Test framework type definitions
+- `core/test/frameworks.go` (new) - Test framework definitions
+- `core/test/selector.go` (new) - Test framework selection logic
+- `agents/librarian/tool_discovery.go` (new) - Librarian tool discovery skills
+
+**Parallelization Strategy:**
+```
+Phase 1 (FIRST - shared utilities, no dependencies):
+├── 1A: Detection Utilities (core/detect/*)              ─┐
+└── 1B: All Type Definitions (core/*/types.go)           ─┘ PARALLEL
+
+Phase 2 (AFTER Phase 1 - can run in parallel):
+├── 2A: Formatter Definitions (core/format/formatters.go)  ─┐
+├── 2B: Formatter Selector (core/format/selector.go)        │
+├── 2C: LSP Server Definitions (core/lsp/servers.go)        │ PARALLEL
+├── 2D: LSP Selector (core/lsp/selector.go)                 │
+├── 2E: Test Framework Definitions (core/test/frameworks.go)│
+└── 2F: Test Framework Selector (core/test/selector.go)    ─┘
+
+Phase 3 (AFTER Phase 2 - Librarian integration):
+└── Librarian Tool Discovery Skills (agents/librarian/tool_discovery.go)
+
+Phase 4 (AFTER Phase 3):
+└── Integration Testing (Librarian detection accuracy)
+```
+
+**Acceptance Criteria:**
+
+#### Phase 1A: Detection Utilities (Shared)
+
+**File: `core/detect/which.go`**
+- [ ] `Which(binary string) string` - Find binary in PATH
+- [ ] Cross-platform support (Windows/Unix)
+- [ ] Caching of PATH lookups (invalidate on PATH change)
+
+**File: `core/detect/files.go`**
+- [ ] `FileExists(root string, files ...string) bool` - Check if any file exists
+- [ ] `FindUp(startDir string, filename string) (string, error)` - Search upward for file
+- [ ] `FindUpAny(startDir string, filenames ...string) (string, string, error)` - Search upward for any file
+
+**File: `core/detect/dependencies.go`**
+- [ ] `HasDependency(root string, pkg string) (bool, error)` - Check package.json
+- [ ] `HasGemDependency(root string, gem string) (bool, error)` - Check Gemfile
+- [ ] `HasPythonDependency(root string, pkg string) (bool, error)` - Check requirements.txt/pyproject.toml
+- [ ] `HasCargoDependency(root string, crate string) (bool, error)` - Check Cargo.toml
+
+#### Phase 1B: Type Definitions (Shared)
+
+**File: `core/format/types.go`**
+- [ ] `FormatterID` type definition
+- [ ] `FormatterDefinition` struct with ID, Name, Command, Extensions, Enabled func
+- [ ] `FormatterRegistry` struct with thread-safe map
+- [ ] `FormatterResult` struct with FormatterID, FilePath, Success, Changed, Error, Duration
+- [ ] `FormatterConfig` struct for user overrides (disabled, command, extensions)
+
+**File: `core/lsp/types.go`**
+- [ ] `ServerID` type definition
+- [ ] `LanguageServerDefinition` struct with ID, Name, Command, Extensions, LanguageIDs, RootMarkers, Enabled func, AutoDownload
+- [ ] `AutoDownloadConfig` struct with Source, Package, Binary
+- [ ] `LSPClient` struct with ID, ServerID, ProjectRoot, Process, Conn, Capabilities
+- [ ] `DiagnosticResult` struct with ServerID, FilePath, Diagnostics
+- [ ] `LSPConfig` struct for user overrides (disabled, command, auto_download)
+
+**File: `core/test/types.go`**
+- [ ] `TestFrameworkID` type definition
+- [ ] `TestFrameworkDefinition` struct (see Tester section for full definition)
+- [ ] `TestFrameworkRegistry` struct with thread-safe map
+- [ ] `TestResult` struct with passed, failed, skipped, duration, failures, coverage
+- [ ] `TestFailure` struct with TestName, File, Line, Message, Expected, Actual, StackTrace
+- [ ] `TestConfig` struct for user overrides
+
+#### Phase 2A-2B: Formatter Detection (Librarian)
+
+**File: `core/format/formatters.go`**
+- [ ] `BuiltinFormatters` slice with all formatter definitions
+- [ ] Go: gofmt, goimports (priority: goimports > gofmt)
+- [ ] JS/TS: prettier, biome (priority: biome if configured > prettier)
+- [ ] Python: ruff-format, black (priority: ruff > black)
+- [ ] Rust: rustfmt
+- [ ] C/C++: clang-format (requires config)
+- [ ] Shell: shfmt
+- [ ] Ruby: rubocop
+- [ ] Terraform: terraform fmt
+- [ ] Each formatter has correct Enabled() logic
+
+**File: `core/format/selector.go`**
+- [ ] `NewFormatterRegistry() *FormatterRegistry`
+- [ ] `Register(def *FormatterDefinition) error`
+- [ ] `SelectFormatter(ctx *ProjectContext, filePath string) (*FormatterDefinition, error)`
+- [ ] `SelectFormatters(ctx *ProjectContext, filePath string) ([]*FormatterDefinition, error)`
+- [ ] Extension-based filtering, Enabled() check, priority ordering
+- [ ] User config overrides applied
+- [ ] **Confidence scoring** for detection results
+
+#### Phase 2C-2D: Linter/LSP Detection (Librarian)
+
+**File: `core/lsp/servers.go`**
+- [ ] `BuiltinServers` slice with all LSP server definitions
+- [ ] Go: gopls with auto-download
+- [ ] JS/TS: typescript-language-server, eslint, biome
+- [ ] Python: pyright, ruff-lsp
+- [ ] Rust: rust-analyzer
+- [ ] C/C++: clangd
+- [ ] Ruby: solargraph
+- [ ] Java: jdtls
+- [ ] YAML: yaml-language-server
+- [ ] Terraform: terraform-ls
+- [ ] Each server has correct RootMarkers, Enabled()
+
+**File: `core/lsp/selector.go`**
+- [ ] `NewLSPManager() *LSPManager`
+- [ ] `RegisterServer(def *LanguageServerDefinition) error`
+- [ ] `SelectServers(filePath string) ([]*LanguageServerDefinition, error)`
+- [ ] `findProjectRoot(startDir string, markers []string) (string, error)`
+- [ ] Extension-based filtering, Enabled() check
+- [ ] **Confidence scoring** for detection results
+
+#### Phase 2E-2F: Test Framework Detection (Librarian)
+
+**File: `core/test/frameworks.go`**
+- [ ] `BuiltinFrameworks` slice with all test framework definitions
+- [ ] Go: go-test
+- [ ] JS/TS: jest, vitest, mocha, bun-test, node-test (priority: vitest > jest > mocha)
+- [ ] Python: pytest, unittest (priority: pytest > unittest)
+- [ ] Rust: cargo-test
+- [ ] Ruby: rspec, minitest
+- [ ] Java: maven-test, gradle-test
+- [ ] Elixir: mix-test
+- [ ] PHP: phpunit
+- [ ] C++: ctest
+- [ ] Each framework has correct Enabled() logic
+
+**File: `core/test/selector.go`**
+- [ ] `NewTestFrameworkRegistry() *TestFrameworkRegistry`
+- [ ] `Register(def *TestFrameworkDefinition) error`
+- [ ] `SelectFramework(ctx *ProjectContext) (*TestFrameworkDefinition, error)`
+- [ ] `SelectFrameworkForFile(ctx *ProjectContext, filePath string) (*TestFrameworkDefinition, error)`
+- [ ] `SelectFrameworksByLanguage(ctx *ProjectContext, language string) ([]*TestFrameworkDefinition, error)`
+- [ ] **Confidence scoring** for detection results
+
+#### Phase 3: Librarian Tool Discovery Skills
+
+**File: `agents/librarian/tool_discovery.go`**
+- [ ] `detect_formatter` skill - Returns FormatterDefinition with confidence + reason
+- [ ] `list_formatters` skill - Returns all enabled formatters
+- [ ] `detect_linters` skill - Returns LSPServerDefinitions with confidence + reason
+- [ ] `list_lsp_servers` skill - Returns all enabled LSP servers
+- [ ] `detect_test_framework` skill - Returns TestFrameworkDefinition with confidence + reason
+- [ ] `list_test_frameworks` skill - Returns all enabled test frameworks
+- [ ] `get_project_tools` skill - Returns all tools for project
+- [ ] **Caching layer** with config file change invalidation
+- [ ] Integration with Librarian's existing context system
+
+#### Phase 4: Testing (Librarian Detection)
+
+**Unit Tests:**
+- [ ] Detection utilities (which, fileExists, findUp, hasDependency)
+- [ ] Formatter selection logic with mocked filesystem
+- [ ] LSP server selection logic with mocked filesystem
+- [ ] Test framework selection logic with mocked filesystem
+- [ ] Confidence scoring accuracy
+- [ ] Cache invalidation behavior
+
+**Integration Tests:**
+- [ ] End-to-end formatter detection for each language
+- [ ] End-to-end LSP server detection for each language
+- [ ] End-to-end test framework detection for each language
+- [ ] Multi-tool conflict resolution
+- [ ] Config override application
+- [ ] Librarian skill responses include correct confidence/reason
+
+---
+
+### Inspector: Formatter & Linter Execution System
+
+**CRITICAL: Inspector EXECUTES formatting/linting. Detection is Librarian's responsibility.**
+
+**Files to create:**
+- `core/format/executor.go` (new) - Formatter execution
+- `core/lsp/client.go` (new) - LSP client management
+- `core/lsp/download.go` (new) - LSP auto-download
+- `agents/inspector/format.go` (new) - Format execution skills
+- `agents/inspector/lint.go` (new) - Lint execution skills
+
+**Parallelization Strategy:**
+```
+Phase 1 (AFTER Librarian Tool Discovery Phase 2):
+├── 1A: Formatter Executor (core/format/executor.go)  ─┐
+├── 1B: LSP Client (core/lsp/client.go)               │ PARALLEL
+└── 1C: LSP Auto-Download (core/lsp/download.go)     ─┘
+
+Phase 2 (AFTER Phase 1 - Inspector integration):
+├── Inspector Format Skills (agents/inspector/format.go)  ─┐
+└── Inspector Lint Skills (agents/inspector/lint.go)      ─┘ PARALLEL
+
+Phase 3 (AFTER Phase 2):
+└── Integration Testing (Inspector ↔ Librarian consultation)
+```
+
+**Acceptance Criteria:**
+
+#### Phase 1A: Formatter Executor
+
+**File: `core/format/executor.go`**
+- [ ] `Execute(def *FormatterDefinition, filePath string, dryRun bool) (*FormatterResult, error)`
+- [ ] Command building with $FILE placeholder replacement
+- [ ] Working directory set to project root
+- [ ] stdout/stderr capture
+- [ ] Exit code handling
+- [ ] File modification time check for "changed" detection
+- [ ] Timeout support
+- [ ] `ExecuteParallel(files []string, maxWorkers int) ([]*FormatterResult, error)`
+- [ ] Error aggregation
+
+#### Phase 1B: LSP Client
+
+**File: `core/lsp/client.go`**
+- [ ] `SpawnClient(def *LanguageServerDefinition, projectRoot string) (*LSPClient, error)`
+- [ ] Process management (start, stdin/stdout pipes)
+- [ ] JSON-RPC 2.0 connection setup
+- [ ] `initialize` request with capabilities
+- [ ] `initialized` notification
+- [ ] `textDocument/didOpen` for file registration
+- [ ] `textDocument/publishDiagnostics` handler
+- [ ] `GetDiagnostics(filePath string) ([]protocol.Diagnostic, error)`
+- [ ] `Shutdown()` for graceful termination
+- [ ] Connection error handling and recovery
+- [ ] Client caching by serverID:projectRoot key
+
+#### Phase 1C: LSP Auto-Download
+
+**File: `core/lsp/download.go`**
+- [ ] `AutoDownload(config *AutoDownloadConfig) error`
+- [ ] `downloadFromNPM(pkg string) error` - npm install -g
+- [ ] `downloadFromGo(pkg string) error` - go install
+- [ ] `downloadFromGitHub(repo string, binary string) error` - Download release binary
+- [ ] `SYLK_DISABLE_LSP_DOWNLOAD` flag support
+- [ ] Download progress reporting
+- [ ] Error handling and cleanup on failure
+- [ ] Binary verification after download
+
+#### Phase 2: Inspector Execution Skills (Consult Librarian First)
+
+**File: `agents/inspector/format.go`**
+- [ ] `format_file` skill implementation
+  - [ ] Accept optional `formatter` param (FormatterDefinition from Librarian)
+  - [ ] If not provided, consult Librarian via Guide: `detect_formatter`
+  - [ ] Cache Librarian response per file extension
+  - [ ] Execute formatter with provided definition
+  - [ ] Report result to Archivalist
+- [ ] `format_files` skill with parallel execution
+  - [ ] Batch consult Librarian for unique extensions
+  - [ ] Execute formatters in parallel per file
+- [ ] **Librarian consultation protocol** implementation
+  - [ ] Cache invalidation on Librarian signal
+  - [ ] Fallback error handling if Librarian unavailable
+
+**File: `agents/inspector/lint.go`**
+- [ ] `lint_file` skill implementation
+  - [ ] Accept optional `lsp_servers` param (LSPServerDefinitions from Librarian)
+  - [ ] If not provided, consult Librarian via Guide: `detect_linters`
+  - [ ] Cache Librarian response per file extension
+  - [ ] Execute LSP diagnostics with provided definitions
+  - [ ] Report result to Archivalist
+- [ ] `lint_files` skill with parallel execution
+- [ ] `get_diagnostics` skill - retrieve cached diagnostics
+- [ ] Diagnostic merging from multiple servers
+- [ ] Deduplication by range+message
+- [ ] **Librarian consultation protocol** implementation
+
+#### Phase 3: Testing (Inspector Execution + Consultation)
+
+**Unit Tests:**
+- [ ] Formatter executor command building
+- [ ] Formatter executor parallel execution
+- [ ] LSP client communication (mocked)
+- [ ] LSP auto-download logic (mocked)
+- [ ] Inspector → Librarian consultation flow (mocked)
+- [ ] Cache behavior and invalidation
+
+**Integration Tests:**
+- [ ] End-to-end: Librarian detects formatter → Inspector executes
+- [ ] End-to-end: Librarian detects LSP → Inspector retrieves diagnostics
+- [ ] Multi-formatter execution with Librarian detection
+- [ ] Multi-LSP server results merging
+- [ ] Auto-download flow triggered by Librarian response
+- [ ] Consultation failure handling (Librarian unavailable)
+
+**Performance Tests:**
+- [ ] Large file formatting
+- [ ] Parallel formatting of 100+ files
+- [ ] LSP client startup time
+- [ ] Diagnostic retrieval latency
+
+### Architect: Plan Mode & Todo Management Skills
+
+**Files to modify:**
+- `agents/architect/skills.go`
+- `agents/architect/plan_mode.go` (new)
+- `agents/architect/todo.go` (new)
+
+**Acceptance Criteria:**
+
+#### Plan Mode
+- [ ] `enter_plan_mode` for complex task planning
+- [ ] `exit_plan_mode` with approval request
+- [ ] `update_plan_file` for plan management
+- [ ] Plan file format standardization
+- [ ] User approval workflow
+
+#### Todo Management
+- [ ] `todo_write` for task list management
+- [ ] `todo_mark_complete` for status updates
+- [ ] Status tracking (pending, in_progress, completed)
+- [ ] User visibility into progress
+
+#### User Interaction
+- [ ] `ask_user_question` for clarification requests
+- [ ] Multi-option question support
+- [ ] Integration with plan mode workflow
+
+### Knowledge Agent Consultation Protocol (All Agents via Guide)
+
+**Universal mechanism for implementation agents to consult knowledge agents.**
+
+**Files to create/modify:**
+- `core/messages/consultation.go` (new) - Consultation message types
+- `agents/guide/consultation_router.go` (new) - Routing logic for consultations
+- `agents/guide/consultation_cache.go` (new) - Response caching
+- All agent files - Add consultation emission helpers
+
+**Acceptance Criteria:**
+
+#### Phase 1: Message Types and Routing
+
+**File: `core/messages/consultation.go`**
+- [ ] `ConsultationRequest` struct with type, from_agent, session_id, query, timeout_ms
+- [ ] `ConsultationResponse` struct with type, from_agent, to_agent, result, cached, latency_ms
+- [ ] `ConsultationQuery` struct with intent, subject, context, specificity
+- [ ] Message type constants: CONTEXT_REQUEST, HISTORY_REQUEST, RESEARCH_REQUEST
+- [ ] Response type constants: CONTEXT_RESPONSE, HISTORY_RESPONSE, RESEARCH_RESPONSE
+- [ ] Validation functions for request/response
+
+**File: `agents/guide/consultation_router.go`**
+- [ ] `RouteConsultation(req *ConsultationRequest) (*ConsultationResponse, error)`
+- [ ] Route CONTEXT_REQUEST to Librarian
+- [ ] Route HISTORY_REQUEST to Archivalist
+- [ ] Route RESEARCH_REQUEST to Academic
+- [ ] Session validation (verify agent belongs to session)
+- [ ] Timeout handling
+- [ ] Error wrapping for routing failures
+
+#### Phase 2: Caching and Optimization
+
+**File: `agents/guide/consultation_cache.go`**
+- [ ] `ConsultationCache` struct with TTL, max_entries
+- [ ] `Get(key string) (*ConsultationResponse, bool)` - Check cache
+- [ ] `Set(key string, response *ConsultationResponse)` - Store response
+- [ ] Cache key generation from request (agent + intent + subject)
+- [ ] TTL-based expiration (configurable per request type)
+- [ ] Cache invalidation on relevant changes (file edits, new decisions)
+- [ ] Metrics: hit rate, latency reduction
+
+#### Phase 3: Agent Integration
+
+**All Agents - Consultation Emission Helpers:**
+- [ ] `EmitContextRequest(subject, context string) (*ConsultationResponse, error)` - Query Librarian
+- [ ] `EmitHistoryRequest(subject, context string) (*ConsultationResponse, error)` - Query Archivalist
+- [ ] `EmitResearchRequest(subject, context string) (*ConsultationResponse, error)` - Query Academic
+- [ ] Request builder with sensible defaults
+- [ ] Response parsing helpers
+- [ ] Timeout configuration
+
+**Agent-Specific Implementation:**
+- [ ] Architect: Already has consultation protocol (verify integration)
+- [ ] Engineer: Already has consult_* skills (verify integration)
+- [ ] Designer: Add consultation emission to system prompt guidance
+- [ ] Inspector: Add consultation emission for pattern validation
+- [ ] Tester: Add consultation emission for test pattern lookup
+- [ ] Orchestrator: Add consultation emission (rare, for execution context)
+
+#### Phase 4: Testing
+
+**Unit Tests:**
+- [ ] Consultation request/response serialization
+- [ ] Route determination (request type → knowledge agent)
+- [ ] Cache key generation
+- [ ] Cache TTL expiration
+- [ ] Session validation
+- [ ] Timeout handling
+
+**Integration Tests:**
+- [ ] End-to-end: Engineer → Guide → Librarian → Guide → Engineer
+- [ ] End-to-end: Inspector → Guide → Archivalist → Guide → Inspector
+- [ ] End-to-end: Tester → Guide → Academic → Guide → Tester
+- [ ] Cache hit scenario (second identical request)
+- [ ] Cache invalidation scenario (file changed)
+- [ ] Timeout scenario (slow knowledge agent)
+- [ ] Session isolation (agent can't query other session's agents)
+
+**Performance Tests:**
+- [ ] Consultation latency (< 500ms for cached, < 2s for uncached)
+- [ ] Cache hit rate under typical workload
+- [ ] Concurrent consultations from multiple agents
+
+### Session Recording & Replay (Guide + Archivalist)
+
+**Files to create/modify:**
+- `core/recordings/types.go` (new)
+- `core/recordings/recorder.go` (new)
+- `core/recordings/replayer.go` (new)
+- `agents/guide/skills.go`
+- `agents/guide/replay.go` (new)
+- `agents/archivalist/skills.go`
+- `agents/archivalist/recordings.go` (new)
+
+**Parallelization Strategy:**
+```
+Phase 1 (FIRST - shared dependency):
+├── Recording Data Model (core/recordings/types.go)
+
+Phase 2 (PARALLEL after Phase 1):
+├── Guide Recording Skills          ─┐
+├── Guide Replay Skills              │ Can execute in PARALLEL
+├── Archivalist Storage Skills       │
+└── Archivalist Query Skills        ─┘
+
+Phase 3 (AFTER Phase 2):
+├── Guide ↔ Archivalist Integration
+├── Replay Engine
+└── End-to-end Testing
+```
+
+**Acceptance Criteria:**
+
+#### Phase 1: Recording Data Model (Shared Dependency)
+- [ ] `RecordingID` type definition
+- [ ] `SessionRecording` struct with ID, name, session_id, timestamps, tags
+- [ ] `RecordedQuery` struct with index, timestamp, raw_query, intent, routed_to, response, success
+- [ ] `AgentAction` struct for detailed action capture (optional)
+- [ ] `ReplayState` struct for tracking replay progress
+- [ ] JSON serialization/deserialization
+
+#### Phase 2A: Guide Recording Skills (Parallel)
+- [ ] `start_recording` skill implementation
+- [ ] `stop_recording` skill with Archivalist storage
+- [ ] Recording state management (active recording tracking)
+- [ ] Query capture hook in routing pipeline
+- [ ] Response capture (optional based on config)
+- [ ] Agent action capture (optional based on config)
+
+#### Phase 2B: Guide Replay Skills (Parallel)
+- [ ] `replay_session` skill with mode support (exact, interactive, dry_run)
+- [ ] `replay_query` skill for single query replay
+- [ ] `list_recordings` skill with filtering
+- [ ] `get_recording_info` skill
+- [ ] Interactive replay controls (continue, skip, modify, abort)
+- [ ] Replay state tracking
+
+#### Phase 2C: Archivalist Recording Storage (Parallel)
+- [ ] `store_recording` skill implementation
+- [ ] `get_recording` skill (by ID or name)
+- [ ] Recording persistence (file-based or database)
+- [ ] Cross-session recording access
+
+#### Phase 2D: Archivalist Recording Query (Parallel)
+- [ ] `query_recordings` skill with filters (tags, session, date, content)
+- [ ] `delete_recording` skill
+- [ ] `update_recording_metadata` skill
+- [ ] Recording search indexing
+
+#### Phase 3: Integration & Engine (After Phase 2)
+- [ ] Guide → Archivalist recording storage flow
+- [ ] Archivalist → Guide recording retrieval flow
+- [ ] Replay engine with query re-injection
+- [ ] Modification application during replay
+- [ ] Failure handling during replay
+- [ ] Progress reporting during replay
+
+#### Testing
+- [ ] Unit tests for Recording data model
+- [ ] Unit tests for Guide recording skills
+- [ ] Unit tests for Guide replay skills
+- [ ] Unit tests for Archivalist recording storage
+- [ ] Integration test: Record → Store → Retrieve → Replay
+- [ ] Integration test: Interactive replay with modifications
+- [ ] Integration test: Cross-session recording access
+
+### Tester: Test Execution System
+
+**CRITICAL: Tester EXECUTES tests. Framework detection is Librarian's responsibility.**
+
+**Files to create:**
+- `core/test/executor.go` (new) - Test execution
+- `core/test/parsers/common.go` (new) - Common parser utilities
+- `core/test/parsers/go.go` (new) - Go test output parser
+- `core/test/parsers/jest.go` (new) - Jest output parser
+- `core/test/parsers/pytest.go` (new) - pytest output parser
+- `core/test/parsers/cargo.go` (new) - Cargo test output parser
+- `agents/tester/framework.go` (new) - Tester execution skills
+- `agents/tester/skills.go` (modify) - Skills registration
+
+**Parallelization Strategy:**
+```
+Phase 1 (AFTER Librarian Tool Discovery Phase 2):
+├── 1A: Common Parser Utilities (core/test/parsers/common.go)  ─┐
+├── 1B: Go Output Parser (core/test/parsers/go.go)              │
+├── 1C: Jest Output Parser (core/test/parsers/jest.go)          │ PARALLEL
+├── 1D: pytest Output Parser (core/test/parsers/pytest.go)      │
+└── 1E: Cargo Output Parser (core/test/parsers/cargo.go)       ─┘
+
+Phase 2 (AFTER Phase 1):
+└── Test Executor (core/test/executor.go)
+
+Phase 3 (AFTER Phase 2 - Tester integration):
+├── Tester Execution Skills (agents/tester/framework.go)  ─┐
+└── Tester Skills Registration (agents/tester/skills.go)  ─┘ PARALLEL
+
+Phase 4 (AFTER Phase 3):
+└── Integration Testing (Tester ↔ Librarian consultation)
+```
+
+**Acceptance Criteria:**
+
+#### Phase 1A: Common Parser Utilities
+
+**File: `core/test/parsers/common.go`**
+- [ ] `NormalizeTestResult(raw interface{}, format string) *TestResult`
+- [ ] `ExtractStackTrace(output string) string`
+- [ ] `ParseDuration(s string) time.Duration` - Handle various formats ("1.23s", "1230ms", "1m23s")
+- [ ] `ExtractCoverage(output string) *CoverageResult` - Generic coverage extraction
+- [ ] `TestResultFromJUnit(xml []byte) *TestResult` - JUnit XML parser (used by many frameworks)
+
+#### Phase 1B-1E: Output Parsers (Parallel)
+
+**File: `core/test/parsers/go.go`**
+- [ ] `ParseGoTestOutput(output []byte) (*TestResult, error)`
+- [ ] Handle `-json` flag output (JSONL format)
+- [ ] Extract test name, package, status, duration
+- [ ] Extract failure details (file, line, message)
+- [ ] Extract coverage percentage from `-cover` output
+
+**File: `core/test/parsers/jest.go`**
+- [ ] `ParseJestOutput(output []byte) (*TestResult, error)`
+- [ ] Handle `--json` flag output
+- [ ] Extract test suites, test cases, status
+- [ ] Extract failure details with snapshots
+- [ ] Extract coverage from `--coverage` output
+
+**File: `core/test/parsers/pytest.go`**
+- [ ] `ParsePytestOutput(output []byte) (*TestResult, error)`
+- [ ] Handle `--json-report` output (if available)
+- [ ] Handle standard pytest output (fallback)
+- [ ] Extract test names, status, parametrized test details
+- [ ] Extract failure details with pytest traceback
+
+**File: `core/test/parsers/cargo.go`**
+- [ ] `ParseCargoTestOutput(output []byte) (*TestResult, error)`
+- [ ] Handle `--format json` output
+- [ ] Extract test name, module, status
+- [ ] Extract failure details with Rust backtrace
+
+#### Phase 2: Test Executor
+
+**File: `core/test/executor.go`**
+- [ ] `NewTestExecutor() *TestExecutor`
+- [ ] `RunAll(def *TestFrameworkDefinition, ctx *ProjectContext) (*TestResult, error)`:
+  - Build command from def.RunCommand
+  - Execute with timeout
+  - Parse output using def.ParseOutput
+  - Return structured result
+- [ ] `RunFile(def *TestFrameworkDefinition, ctx *ProjectContext, filePath string) (*TestResult, error)`:
+  - Build command from def.RunFileCommand with $FILE placeholder
+  - Execute and parse
+- [ ] `RunSingle(def *TestFrameworkDefinition, ctx *ProjectContext, filePath string, testName string) (*TestResult, error)`:
+  - Build command with $FILE and $TEST placeholders
+  - Execute single test
+- [ ] `RunWithCoverage(def *TestFrameworkDefinition, ctx *ProjectContext) (*TestResult, error)`:
+  - Use def.CoverageCommand
+  - Parse coverage output
+  - Include coverage in result
+- [ ] `Watch(def *TestFrameworkDefinition, ctx *ProjectContext) (<-chan *TestResult, error)`:
+  - Start watch process if def.WatchCommand available
+  - Stream results via channel
+  - Handle process restart on changes
+- [ ] `RunChanged(def *TestFrameworkDefinition, ctx *ProjectContext, gitRef string) (*TestResult, error)`:
+  - Detect changed test files via git diff
+  - Run only affected tests
+- [ ] Command placeholder replacement ($FILE, $TEST, $LINE, $DIR)
+- [ ] Working directory set to project root
+- [ ] Environment variable injection (TEST_ENV vars)
+- [ ] Timeout handling with graceful process termination
+- [ ] stdout/stderr capture and merging
+
+#### Phase 3: Tester Execution Skills (Consult Librarian First)
+
+**File: `agents/tester/framework.go`**
+- [ ] `run_tests_smart` skill implementation
+  - [ ] Accept optional `framework` param (TestFrameworkDefinition from Librarian)
+  - [ ] If not provided, consult Librarian via Guide: `detect_test_framework`
+  - [ ] Cache Librarian response per project root
+  - [ ] Execute tests with provided definition
+  - [ ] Report result to Archivalist
+  - [ ] Support scope: "all", "file", "single", "changed"
+- [ ] `run_tests_with_coverage` skill
+  - [ ] Consult Librarian for framework if not cached
+  - [ ] Execute with coverage command
+  - [ ] Parse and report coverage results
+- [ ] `watch_tests` skill
+  - [ ] Consult Librarian for framework
+  - [ ] Start watch mode with streaming results
+- [ ] `run_changed_tests` skill
+  - [ ] Consult Librarian for framework
+  - [ ] Execute only changed tests
+- [ ] `find_test_files` skill
+  - [ ] Consult Librarian for TestFilePatterns
+  - [ ] Find matching files in project
+- [ ] `get_test_for_file` skill
+  - [ ] Consult Librarian for naming conventions
+  - [ ] Suggest test file path for source file
+- [ ] **Librarian consultation protocol** implementation
+  - [ ] Cache invalidation on Librarian signal
+  - [ ] Fallback error handling if Librarian unavailable
+
+**File: `agents/tester/skills.go`**
+- [ ] Import framework skills from `agents/tester/framework.go`
+- [ ] Register all test execution skills in Tester's skill registry
+- [ ] Update Tester system prompt to include Librarian consultation requirement
+- [ ] Add test framework preference to user config
+
+#### Phase 4: Testing (Tester Execution + Consultation)
+
+**Unit Tests:**
+- [ ] Common parser utilities
+- [ ] Go test output parser with sample outputs
+- [ ] Jest JSON output parser with sample outputs
+- [ ] pytest output parser with sample outputs
+- [ ] Cargo test output parser with sample outputs
+- [ ] Executor command building with placeholder replacement
+- [ ] Executor timeout handling
+- [ ] Tester → Librarian consultation flow (mocked)
+- [ ] Cache behavior and invalidation
+
+**Integration Tests:**
+- [ ] End-to-end: Librarian detects Go framework → Tester executes → parses
+- [ ] End-to-end: Librarian detects Jest → Tester executes → parses
+- [ ] End-to-end: Librarian detects pytest → Tester executes → parses
+- [ ] End-to-end: Librarian detects Cargo → Tester executes → parses
+- [ ] Multi-framework project (e.g., Go + JS) with Librarian detection
+- [ ] Watch mode start/stop
+- [ ] Coverage extraction and reporting
+- [ ] Run changed tests with git diff
+- [ ] Consultation failure handling (Librarian unavailable)
+
+**Performance Tests:**
+- [ ] Large test suite output parsing (1000+ tests)
+- [ ] Concurrent test runs across multiple frameworks
+- [ ] Watch mode responsiveness
 
 ---
 
@@ -418,7 +1221,13 @@ The following sequence ensures backward compatibility during migration:
 
 **Dependencies**: None (can start immediately)
 
-**Parallelization**: Items 0.1, 0.2, 0.3, 0.4, 0.5 can execute in parallel.
+**Parallelization**:
+- **Batch 1** (no deps): 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 can execute in parallel
+- **Batch 2** (no deps): 0.7, 0.8, 0.9, 0.10 can execute in parallel (LLM adapters, config, queue, rate limit)
+- **Batch 3** (after 0.10): 0.11 Signal Bus (needed for rate limit integration)
+- **Batch 4** (after 0.11): 0.12 Agent Signal Handler
+- **Batch 5** (after 0.7): 0.13, 0.14 can execute in parallel (budget, context)
+- **Batch 6** (after all): 0.15 LLM Gate integration, 0.16 Usage CLI
 
 ### 0.1 Session Manager
 
@@ -661,6 +1470,7 @@ Extend Guide for multi-session support and new message types.
 - [ ] `USER_OVERRIDE` - User → Inspector/Tester
 - [ ] `USER_INTERRUPT` - User → Architect
 - [ ] `WORKFLOW_COMPLETE` - Architect → User
+- [ ] `REROUTE_REQUEST` - Agent → Guide: not my domain, reroute this
 
 #### Session-Scoped Topics
 - [ ] Topic pattern: `session.{id}.{agent}.requests`
@@ -831,6 +1641,145 @@ var GuideTools = []ToolDefinition{
 }
 ```
 
+#### Intent Gate Classification (Phase 0)
+
+**CRITICAL**: Before routing ANY request, Guide classifies intent to ensure appropriate handling.
+
+**Files to create:**
+- `agents/guide/intent_gate.go`
+- `agents/guide/validation.go`
+
+**Acceptance Criteria:**
+
+##### Step 0: Role-Aware Skill Decision (Guide's Implementation)
+**CRITICAL: Guide implements the universal Agent Step 0 for routing decisions.**
+
+Guide asks: "Given I'm the router and this request, SHOULD I invoke my skills directly, or should I classify and route to another agent?"
+
+- [ ] Receive request (user request or agent message)
+- [ ] Evaluate against Guide's role (router, session management)
+- [ ] Evaluate against Guide's domain (routing, session commands, system commands)
+- [ ] **YES, my domain** → Execute skill directly (session/status/system commands)
+- [ ] **NO, needs routing** → Continue to Step 1 (Request Type Classification)
+
+| Skill Category | Examples | Behavior |
+|----------------|----------|----------|
+| Session commands | "/session new", "/session list", "/status" | Execute immediately |
+| Workflow commands | "/plan", "/interrupt", "/approve" | Execute immediately |
+| GitHub commands | "/pr", "/issue", "/commit" | Execute immediately |
+| Direct queries | "what is [X]", "show me [X]" | Execute immediately |
+
+**Why role-aware (not just keyword matching):**
+- Guide considers its role as router before deciding
+- Skills are deterministic - no need for LLM classification
+- Faster response time for known commands
+- Reduces token usage by skipping classification for clear intents
+
+##### Step 1: Request Type Classification
+- [ ] `RequestType` enum: `TRIVIAL`, `EXPLICIT`, `EXPLORATORY`, `OPEN_ENDED`, `GITHUB_WORK`, `AMBIGUOUS`
+- [ ] Classification happens ONLY if no skill match in Step 0
+- [ ] Fast-path for TRIVIAL requests (skip Architect)
+
+| Type | Trigger Patterns | Routing |
+|------|-----------------|---------|
+| TRIVIAL | Single-line fix, typo | Fast-path to Engineer |
+| EXPLICIT | User specified exact approach | Architect with locked approach |
+| EXPLORATORY | "How would I...", research | Academic/Librarian first |
+| OPEN_ENDED | Ambiguous scope | Architect for clarification |
+| GITHUB_WORK | PR, issue, commit mentioned | Full cycle expected |
+| AMBIGUOUS | Cannot classify confidently | Ask clarification |
+
+##### Step 2: Validation Checks
+- [ ] Check if assumptions are explicit or implicit
+- [ ] Check if scope is bounded or unbounded
+- [ ] Check if request matches skill patterns
+- [ ] Check if knowledge agents should be consulted first
+- [ ] Reject routing if confidence < 0.7
+
+##### Step 3: Pre-Routing Consultation
+- [ ] For implementation requests: Query Librarian for codebase health
+- [ ] For novel approaches: Query Archivalist for failure patterns
+- [ ] Attach enriched context to routed message
+
+##### Step 4: Handle REROUTE_REQUESTs from Agents
+**When an agent's Step 0 determines a request is not in its domain, it sends a REROUTE_REQUEST to Guide.**
+
+- [ ] Receive `REROUTE_REQUEST` from agent
+- [ ] Parse reason and suggested_target from request
+- [ ] Track reroute count for this request_id
+- [ ] **First reroute**: Normal, route to suggested_target or re-classify
+- [ ] **Second reroute**: Warning logged, likely ambiguous request
+- [ ] **Third+ reroute**: STOP, ask user for clarification
+- [ ] Maintain reroute_history: `{from, reason, to}` for each hop
+- [ ] User clarification message explains: "Routed to [agent1] and [agent2], neither could handle. [reasons]. Can you clarify?"
+
+```go
+type RerouteTracking struct {
+    RequestID      string          `json:"request_id"`
+    RerouteCount   int             `json:"reroute_count"`
+    RerouteHistory []RerouteHop    `json:"reroute_history"`
+    Action         string          `json:"action"` // "REROUTE" or "ASK_USER_CLARIFICATION"
+}
+
+type RerouteHop struct {
+    From   string `json:"from"`
+    Reason string `json:"reason"`
+    To     string `json:"to"`
+}
+```
+
+##### Guide System Prompt
+```go
+const GuideSystemPrompt = `
+You are the Guide agent. You are the universal message router for Sylk.
+ALL messages between agents flow through you.
+
+REQUEST PROCESSING PROTOCOL:
+
+STEP 0: SKILL MATCHING (BLOCKING - do this FIRST)
+Check if request matches a registered skill pattern:
+- Session commands: "/session new", "/session list", "/status"
+- Workflow commands: "/plan", "/interrupt", "/approve"
+- GitHub commands: "/pr", "/issue", "/commit"
+- Direct queries: "what is [X]", "show me [X]"
+
+If skill matches with confidence > 0.9, execute skill directly and SKIP classification.
+Skills are deterministic and don't need LLM classification overhead.
+
+STEP 1: CLASSIFY REQUEST TYPE (only if no skill match)
+- TRIVIAL: Single-line fix, typo → Fast-path to Engineer
+- EXPLICIT: User specified approach → Architect with locked approach
+- EXPLORATORY: Research question → Academic/Librarian first
+- OPEN_ENDED: Ambiguous scope → Architect for clarification
+- GITHUB_WORK: PR/issue mentioned → Full cycle expected
+- AMBIGUOUS: Cannot classify → Ask clarification
+
+STEP 2: VALIDATION CHECKS
+1. Are assumptions explicit?
+2. Is scope bounded?
+3. Is there enough context to route confidently?
+
+STEP 3: PRE-ROUTING CONSULTATION
+For implementation requests, BEFORE routing to Architect:
+- Librarian: "What is codebase health for [target area]?"
+- Archivalist: "Any failure patterns for [approach]?"
+Attach responses to routed message as enriched context.
+
+PRE-ROUTING CONSULTATIONS (for implementation):
+- Librarian: "Codebase health for target area?"
+- Archivalist: "Failure patterns for approach?"
+`
+```
+
+**Tests:**
+- [ ] Test TRIVIAL classification and fast-path
+- [ ] Test EXPLICIT classification
+- [ ] Test EXPLORATORY routing to Academic/Librarian
+- [ ] Test AMBIGUOUS triggers clarification
+- [ ] Test GITHUB_WORK triggers full cycle
+- [ ] Test pre-routing consultation triggers
+- [ ] Test confidence threshold rejection
+
 #### Guide Memory Management
 
 **Thresholds**: 50%, 75%, 90% (checkpoint) | 95% (compact)
@@ -893,6 +1842,538 @@ type GuideSummary struct {
 - [ ] Test checkpoint creation at 50%, 75%, 90%
 - [ ] Test compaction at 95%
 - [ ] Test routing knowledge preservation after compaction
+
+#### Intent Preservation & Confidence Propagation
+
+**CRITICAL**: Prevent information loss as requests flow through multiple agents. The message envelope carries all state (Guide remains stateless). Each agent reports confidence, and cumulative confidence = product of all confidences.
+
+**Files to modify:**
+- `agents/guide/types.go` (Message envelope extensions)
+- `agents/guide/guide.go` (StructuredIntent extraction at intake)
+- All agent base types (confidence reporting)
+
+**Files to create:**
+- `core/messages/intent.go` (StructuredIntent, ConfidenceEntry, RerouteHop types)
+
+##### Message Envelope Extensions
+
+**Acceptance Criteria:**
+- [ ] `StructuredIntent` struct added to Message envelope:
+  - [ ] `OriginalRequest` - Verbatim user request (bounded to 500 chars)
+  - [ ] `KeyConstraints` - Extracted constraints (e.g., ["must use existing auth", "no new deps"])
+  - [ ] `SuccessCriteria` - What constitutes success (e.g., ["tests pass", "handles edge case X"])
+  - [ ] `IntentType` - Classified intent type (CREATE, MODIFY, FIX, EXPLAIN, RESEARCH)
+- [ ] `ConfidenceChain` slice added to Message envelope:
+  - [ ] Each `ConfidenceEntry` contains: Agent, Confidence (0.0-1.0), Reason
+  - [ ] Chain is append-only (agents only add, never modify previous entries)
+- [ ] `RerouteHistory` slice added to Message envelope:
+  - [ ] Each `RerouteHop` contains: From, Reason, To
+  - [ ] History tracks all reroutes for user escalation decisions
+
+```go
+// StructuredIntent captures the original user request in a structured format.
+// Carried in Message envelope throughout request lifecycle.
+type StructuredIntent struct {
+    OriginalRequest string   `json:"original_request"` // Verbatim (bounded)
+    KeyConstraints  []string `json:"key_constraints"`  // Extracted constraints
+    SuccessCriteria []string `json:"success_criteria"` // What constitutes success
+    IntentType      string   `json:"intent_type"`      // CREATE, MODIFY, FIX, EXPLAIN, RESEARCH
+}
+
+// ConfidenceEntry records an agent's confidence after processing.
+type ConfidenceEntry struct {
+    Agent      string  `json:"agent"`      // Agent ID
+    Confidence float64 `json:"confidence"` // 0.0 - 1.0
+    Reason     string  `json:"reason"`     // Brief explanation
+}
+
+// RerouteHop records a reroute event (agent rejected request).
+type RerouteHop struct {
+    From   string `json:"from"`   // Agent that rejected
+    Reason string `json:"reason"` // Why it rejected
+    To     string `json:"to"`     // Where it was rerouted
+}
+```
+
+##### Guide: StructuredIntent Extraction at Request Intake
+
+**Acceptance Criteria:**
+- [ ] Guide extracts `StructuredIntent` during initial routing (same LLM call, zero extra cost)
+- [ ] Extraction prompt added to Guide's routing instructions
+- [ ] `OriginalRequest` bounded to 500 characters (truncate with ellipsis)
+- [ ] At least one `KeyConstraint` and one `SuccessCriterion` extracted
+- [ ] `IntentType` classified from: CREATE, MODIFY, FIX, EXPLAIN, RESEARCH
+- [ ] StructuredIntent attached to outgoing message before routing
+
+```go
+// Added to Guide's routing prompt
+const StructuredIntentExtraction = `
+When processing a request, also extract structured intent:
+
+IntentType (required): CREATE, MODIFY, FIX, EXPLAIN, RESEARCH
+KeyConstraints: Any explicit constraints (max 5)
+SuccessCriteria: What would satisfy the request (max 3)
+
+Examples:
+- "Add logout button without changing auth flow"
+  → IntentType: CREATE
+  → KeyConstraints: ["no changes to auth flow"]
+  → SuccessCriteria: ["logout button visible", "user session terminated on click"]
+
+- "Fix the race condition in worker pool"
+  → IntentType: FIX
+  → KeyConstraints: []
+  → SuccessCriteria: ["race condition resolved", "tests pass with -race flag"]
+`
+```
+
+##### Agent: Confidence Reporting
+
+**Acceptance Criteria:**
+- [ ] All agents append `ConfidenceEntry` to message when responding
+- [ ] Confidence reflects quality of agent's contribution:
+  - 0.90-1.00: High confidence, clear and complete
+  - 0.70-0.89: Good confidence, minor uncertainties
+  - 0.50-0.69: Moderate confidence, notable gaps
+  - 0.30-0.49: Low confidence, significant assumptions
+  - 0.00-0.29: Very low, mostly speculation
+- [ ] `Reason` field explains confidence (e.g., "exact match found", "inferred from context")
+- [ ] Agents do NOT modify previous entries in ConfidenceChain
+- [ ] Confidence reporting happens in agent's `ProcessResponse()` method
+
+```go
+// Example: Librarian appending confidence
+func (l *Librarian) ProcessResponse(ctx context.Context, msg *Message, result *QueryResult) *Message {
+    entry := ConfidenceEntry{
+        Agent:      "librarian",
+        Confidence: result.Confidence,
+        Reason:     result.MatchType, // "exact_match", "semantic_match", "no_match"
+    }
+    msg.ConfidenceChain = append(msg.ConfidenceChain, entry)
+    return msg
+}
+```
+
+##### Requesting Agent: Response Evaluation & Escalation
+
+**Acceptance Criteria:**
+- [ ] Requesting agent (e.g., Architect) evaluates response from knowledge agent
+- [ ] Cumulative confidence calculated as product: `conf1 * conf2 * ... * confN`
+- [ ] If cumulative confidence < 0.5, agent MAY escalate to user
+- [ ] If response does not satisfy StructuredIntent criteria, agent MAY query again or escalate
+- [ ] Escalation via `CLARIFICATION_REQUEST` message through Guide
+- [ ] Escalation message includes: what was tried, why it failed, specific question
+
+```
+                              RESPONSE EVALUATION FLOW
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│   Agent receives response from knowledge agent (via Guide)                      │
+│                          │                                                      │
+│                          ▼                                                      │
+│   ┌──────────────────────────────────────────────────────────────────────┐      │
+│   │ 1. Extract response's ConfidenceEntry                                │      │
+│   │ 2. Calculate cumulative confidence = product of all entries          │      │
+│   │ 3. Check if response satisfies StructuredIntent.SuccessCriteria      │      │
+│   └──────────────────────────────────────────────────────────────────────┘      │
+│                          │                                                      │
+│            ┌─────────────┴─────────────┐                                        │
+│            ▼                           ▼                                        │
+│   ┌─────────────────┐        ┌─────────────────────────┐                        │
+│   │ Satisfactory    │        │ Unsatisfactory          │                        │
+│   │ cumulative>0.5  │        │ cumulative<=0.5 OR      │                        │
+│   │ criteria met    │        │ criteria not met        │                        │
+│   └────────┬────────┘        └───────────┬─────────────┘                        │
+│            │                             │                                      │
+│            ▼                             ▼                                      │
+│   Continue with task           Check RerouteHistory.length                      │
+│                                          │                                      │
+│                          ┌───────────────┴───────────────┐                      │
+│                          ▼                               ▼                      │
+│                  len < 3: Try again           len >= 3: Escalate to user        │
+│                  (different query)            via CLARIFICATION_REQUEST         │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Reroute Handling
+
+**Acceptance Criteria:**
+- [ ] Agent sends `REROUTE_REQUEST` via Guide when Step 0 determines "not my domain"
+- [ ] `REROUTE_REQUEST` includes: original message, reason for rejection
+- [ ] Guide appends `RerouteHop` to message's `RerouteHistory`
+- [ ] Guide re-routes to appropriate agent based on rejection reason
+- [ ] If `RerouteHistory.length >= 3`, Guide sends `CLARIFICATION_REQUEST` to user
+- [ ] Clarification message explains: "Routed to [agents], none could handle. [reasons]"
+
+##### Tests
+
+- [ ] Test StructuredIntent extraction for CREATE, MODIFY, FIX, EXPLAIN, RESEARCH intents
+- [ ] Test confidence chain accumulation across 3+ agents
+- [ ] Test cumulative confidence calculation (product)
+- [ ] Test response evaluation with satisfactory response (proceed)
+- [ ] Test response evaluation with unsatisfactory response (retry or escalate)
+- [ ] Test REROUTE_REQUEST handling with RerouteHistory tracking
+- [ ] Test user escalation after 3 reroutes
+- [ ] Test escalation message content (what was tried, why it failed)
+- [ ] Verify Guide remains stateless (all state in message)
+- [ ] Verify no agent modifies previous ConfidenceChain entries
+
+#### Implicit Requirements Inference
+
+**Goal**: Prevent implicit requirement misses by querying Academic for domain expectations before decomposition.
+
+**Dependencies**: StructuredIntent (above), Academic agent (Phase 1)
+
+**Parallelization**: Items 0.4.IRI.1-3 can execute in parallel. Item 0.4.IRI.4 depends on 0.4.IRI.1-2.
+
+##### 0.4.IRI.1 Domain Expectations Types
+
+**Files to create:**
+- `core/messages/domain_expectations.go`
+
+**Implementation Guidelines:**
+1. Define `ExpectationPriority` enum: `REQUIRED`, `RECOMMENDED`, `OPTIONAL`
+2. Define `DomainExpectation` struct with Expectation, Priority, Rationale fields
+3. Define `DomainExpectationsRequest` with IntentType, FeatureDomain, ExistingConstraints
+4. Define `DomainExpectationsResponse` with Domain, Expectations slice, Confidence
+5. Define `EnrichedSuccessCriterion` with Criterion, Source ("explicit"/"inferred"), Priority
+6. Add `DOMAIN_EXPECTATIONS_REQUEST` and `DOMAIN_EXPECTATIONS_RESPONSE` message types
+
+**Acceptance Criteria:**
+- [ ] `ExpectationPriority` enum with REQUIRED, RECOMMENDED, OPTIONAL constants
+- [ ] `DomainExpectation` struct with json tags for Expectation, Priority, Rationale
+- [ ] `DomainExpectationsRequest` struct with IntentType, FeatureDomain, ExistingConstraints
+- [ ] `DomainExpectationsResponse` struct with Domain, Expectations, Confidence
+- [ ] `EnrichedSuccessCriterion` struct with Criterion, Source, Priority fields
+- [ ] Message type constants for DOMAIN_EXPECTATIONS_REQUEST/RESPONSE
+- [ ] Unit tests for struct serialization/deserialization
+
+##### 0.4.IRI.2 Academic Domain Expectations Skill
+
+**Files to create:**
+- `agents/academic/domain_expectations.go`
+- `agents/academic/domain_knowledge.go` (knowledge base)
+
+**Implementation Guidelines:**
+1. Create `provide_domain_expectations` skill for Academic agent
+2. Build domain knowledge base mapping feature domains to expectations
+3. Categorize expectations by priority (REQUIRED, RECOMMENDED, OPTIONAL)
+4. Include rationale for each expectation
+5. Return confidence based on how well domain matches knowledge base
+
+**Domain Knowledge Structure:**
+```go
+var DomainExpectations = map[string][]DomainExpectation{
+    "authentication/logout": {
+        {Expectation: "session termination", Priority: REQUIRED, Rationale: "security"},
+        {Expectation: "token/cookie cleanup", Priority: REQUIRED, Rationale: "security"},
+        {Expectation: "redirect to login", Priority: REQUIRED, Rationale: "UX"},
+        {Expectation: "confirmation if unsaved", Priority: RECOMMENDED, Rationale: "data loss prevention"},
+    },
+    "authentication/login": {...},
+    "api/caching": {...},
+    // ... more domains
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `provide_domain_expectations` skill registered with Academic
+- [ ] Skill handles DOMAIN_EXPECTATIONS_REQUEST message type
+- [ ] Domain knowledge base with at least 10 common feature domains
+- [ ] Each domain has REQUIRED, RECOMMENDED, OPTIONAL expectations categorized
+- [ ] Rationale provided for each expectation
+- [ ] Confidence returned: 0.9+ for exact domain match, 0.7+ for partial, 0.5 for inferred
+- [ ] Graceful handling of unknown domains (return empty with low confidence)
+- [ ] Unit tests for each domain in knowledge base
+
+##### 0.4.IRI.3 Feature Domain Extraction
+
+**Files to modify:**
+- `agents/architect/architect.go`
+
+**Files to create:**
+- `agents/architect/domain_extractor.go`
+
+**Implementation Guidelines:**
+1. Extract feature_domain from StructuredIntent (intent_type + original_request analysis)
+2. Normalize to hierarchical format: "category/feature" (e.g., "authentication/logout")
+3. Use keyword matching + semantic analysis
+4. Support common categories: authentication, api, database, ui, testing, deployment
+
+**Extraction Rules:**
+```
+IntentType: CREATE + "logout" in request → "authentication/logout"
+IntentType: CREATE + "cache" in request → "api/caching"
+IntentType: FIX + "login" in request → "authentication/login"
+IntentType: MODIFY + "dashboard" in request → "ui/dashboard"
+```
+
+**Acceptance Criteria:**
+- [ ] `ExtractFeatureDomain(intent *StructuredIntent) string` function
+- [ ] Hierarchical domain format: "category/feature"
+- [ ] At least 15 extraction rules covering common domains
+- [ ] Fallback to "general/unknown" for unrecognized patterns
+- [ ] Unit tests for each extraction rule
+- [ ] Integration test with sample StructuredIntents
+
+##### 0.4.IRI.4 Architect Merge Logic
+
+**Files to modify:**
+- `agents/architect/architect.go`
+
+**Files to create:**
+- `agents/architect/implicit_requirements.go`
+
+**Implementation Guidelines:**
+1. Add pre-decomposition hook to query Academic for domain expectations
+2. Implement merge logic respecting precedence rules
+3. Track source ("explicit" vs "inferred") for all criteria
+4. Detect conflicts using semantic similarity
+5. Update StructuredIntent with enriched criteria before decomposition
+
+**Merge Precedence (highest to lowest):**
+1. Explicit KeyConstraints (always win)
+2. Explicit SuccessCriteria
+3. REQUIRED expectations from Academic
+4. RECOMMENDED expectations from Academic
+5. OPTIONAL expectations (only if specifically relevant)
+
+**Acceptance Criteria:**
+- [ ] `MergeImplicitRequirements(intent, expectations) *StructuredIntent` function
+- [ ] Pre-decomposition hook triggers DOMAIN_EXPECTATIONS_REQUEST
+- [ ] Explicit constraints override inferred expectations
+- [ ] Explicit criteria preserved with source="explicit"
+- [ ] Inferred criteria added with source="inferred" and priority
+- [ ] `conflictsWithConstraints(expectation, constraints)` conflict detection
+- [ ] Semantic similarity check for conflict detection (threshold 0.8)
+- [ ] `inferred_from` field tracks Academic domain source
+- [ ] Unit tests for merge logic with conflict scenarios
+- [ ] Integration test: full flow from request to enriched intent
+
+##### 0.4.IRI.5 Implicit Requirements Tests
+
+**Files to create:**
+- `agents/architect/implicit_requirements_test.go`
+- `agents/academic/domain_expectations_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test domain extraction for CREATE, MODIFY, FIX intent types
+- [ ] Test Academic returns correct expectations for "authentication/logout"
+- [ ] Test Academic returns empty for unknown domain with low confidence
+- [ ] Test merge preserves explicit criteria
+- [ ] Test merge adds inferred criteria with correct source
+- [ ] Test explicit constraint "skip confirmation" blocks "confirmation if unsaved"
+- [ ] Test explicit constraint "redirect to home" blocks "redirect to login"
+- [ ] Test no conflict when constraints don't semantically overlap
+- [ ] Integration test: "Add logout button" → enriched with session/token/redirect criteria
+- [ ] Integration test: "Add logout, skip confirmation" → confirmation NOT in criteria
+
+#### Feedback Validation Gate
+
+**Goal**: Prevent local-focus bias by validating corrections against StructuredIntent before sending.
+
+**Dependencies**: StructuredIntent (above), EnrichedSuccessCriterion (0.4.IRI.1)
+
+**Parallelization**: Items 0.4.FVG.1-2 can execute in parallel. Items 0.4.FVG.3-4 can execute in parallel after 0.4.FVG.1.
+
+##### 0.4.FVG.1 Intent Alignment Types
+
+**Files to create:**
+- `core/messages/intent_alignment.go`
+
+**Implementation Guidelines:**
+1. Define `CriteriaImpact` struct with Criterion, Impact (POSITIVE/NEGATIVE/NEUTRAL), Reason
+2. Define `IntentAlignment` struct with ConflictsWithConstraints, AffectedCriteria, RootCauseConfidence, RootCauseAssessment, Warning
+3. Define `CorrectionEntry` struct with Issue, Correction, IntentAlignment
+4. Define `ValidationGateResult` enum: PASSED, FLAGGED, FLAGGED_STRONG, FLAGGED_NOTE, BLOCKED
+
+**Acceptance Criteria:**
+- [ ] `CriteriaImpact` struct with Criterion, Impact, Reason fields
+- [ ] Impact enum values: "POSITIVE", "NEGATIVE", "NEUTRAL"
+- [ ] `IntentAlignment` struct with all fields including optional Warning
+- [ ] `CorrectionEntry` struct wrapping Issue, Correction, IntentAlignment
+- [ ] `ValidationGateResult` enum with PASSED, FLAGGED, FLAGGED_STRONG, FLAGGED_NOTE, BLOCKED
+- [ ] JSON tags for all structs
+- [ ] Unit tests for serialization
+
+##### 0.4.FVG.2 Semantic Conflict Detection Utilities
+
+**Files to create:**
+- `core/analysis/semantic_conflict.go`
+
+**Implementation Guidelines:**
+1. Implement semantic similarity function for conflict detection
+2. Support negation detection ("skip X" conflicts with "add X")
+3. Support alternative detection ("redirect to home" conflicts with "redirect to login")
+4. Use embedding-based similarity if available, keyword fallback otherwise
+5. Configurable threshold (default 0.8 for conflict)
+
+**Conflict Patterns:**
+```go
+// Negation patterns
+"skip X" ↔ "add X", "show X", "include X"
+"no X" ↔ "with X", "include X"
+"without X" ↔ "with X", "using X"
+
+// Alternative patterns
+"redirect to A" ↔ "redirect to B" (where A ≠ B)
+"use A" ↔ "use B" (where A ≠ B)
+```
+
+**Acceptance Criteria:**
+- [ ] `SemanticConflict(a, b string) bool` function
+- [ ] `SemanticSimilarity(a, b string) float64` function
+- [ ] Negation pattern detection (skip/no/without vs add/show/with)
+- [ ] Alternative pattern detection (redirect to X vs redirect to Y)
+- [ ] Configurable similarity threshold
+- [ ] Unit tests for negation conflicts
+- [ ] Unit tests for alternative conflicts
+- [ ] Unit tests for non-conflicting pairs
+
+##### 0.4.FVG.3 Inspector Validation Gate
+
+**Files to modify:**
+- `agents/inspector/inspector.go`
+
+**Files to create:**
+- `agents/inspector/validation_gate.go`
+
+**Implementation Guidelines:**
+1. Add `ValidateCorrection` method that runs gate before sending corrections
+2. Implement three checks: constraint conflicts, criteria impact, root cause assessment
+3. Generate appropriate warnings based on gate result
+4. Block corrections that conflict with constraints (do not send)
+5. Flag corrections with negative criteria impact or low root cause confidence
+
+**Gate Decision Logic:**
+```go
+if constraint_conflicts > 0 {
+    return BLOCKED
+} else if any_negative_criteria_impact {
+    if root_cause_confidence < 0.50 {
+        return FLAGGED_STRONG
+    }
+    return FLAGGED
+} else if root_cause_confidence < 0.50 {
+    return FLAGGED_NOTE
+}
+return PASSED
+```
+
+**Acceptance Criteria:**
+- [ ] `ValidateCorrection(correction, issue string, intent *StructuredIntent) (*CorrectionEntry, ValidationGateResult)`
+- [ ] Check 1: Constraint conflict detection using `conflictsWith`
+- [ ] Check 2: Criteria impact assessment using `assessImpact`
+- [ ] Check 3: Root cause confidence using `assessRootCauseConfidence`
+- [ ] BLOCKED result when constraint conflicts > 0
+- [ ] FLAGGED_STRONG when negative impact AND root_cause < 0.50
+- [ ] FLAGGED when negative impact AND root_cause >= 0.50
+- [ ] FLAGGED_NOTE when no negative impact AND root_cause < 0.50
+- [ ] PASSED when no negative impact AND root_cause >= 0.50
+- [ ] Warning generation for FLAGGED results
+- [ ] Blocked corrections NOT added to VALIDATION_CORRECTIONS message
+- [ ] Unit tests for each gate outcome
+
+##### 0.4.FVG.4 Tester Validation Gate
+
+**Files to modify:**
+- `agents/tester/tester.go`
+
+**Files to create:**
+- `agents/tester/validation_gate.go`
+
+**Implementation Guidelines:**
+1. Copy pattern from Inspector validation gate
+2. Adapt for TEST_CORRECTIONS message type
+3. Same gate logic, same decision matrix
+4. Tester-specific warning templates
+
+**Acceptance Criteria:**
+- [ ] `ValidateCorrection` method matching Inspector signature
+- [ ] Same gate logic as Inspector
+- [ ] Tester-specific warning templates
+- [ ] Blocked corrections NOT added to TEST_CORRECTIONS message
+- [ ] Unit tests mirroring Inspector tests
+
+##### 0.4.FVG.5 Root Cause Assessment
+
+**Files to create:**
+- `core/analysis/root_cause.go`
+
+**Implementation Guidelines:**
+1. Assess whether a correction addresses root cause or symptom
+2. Heuristics:
+   - "mock X" → likely symptom fix (confidence 0.3-0.4)
+   - "fix X logic" → likely root cause (confidence 0.7-0.8)
+   - "add null check" → depends on context (confidence 0.5-0.6)
+3. Consider correction-issue relationship
+4. Return confidence 0.0-1.0 and assessment string
+
+**Symptom Fix Indicators:**
+```go
+symptomIndicators := []string{
+    "mock", "stub", "skip test", "disable", "ignore",
+    "suppress warning", "add timeout", "retry",
+}
+
+rootCauseIndicators := []string{
+    "fix logic", "correct calculation", "handle edge case",
+    "validate input", "check null", "update algorithm",
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `AssessRootCauseConfidence(correction, issue string) float64`
+- [ ] `GenerateRootCauseAssessment(correction, issue string) string`
+- [ ] Symptom fix indicators return confidence < 0.50
+- [ ] Root cause indicators return confidence >= 0.70
+- [ ] Context-dependent corrections return confidence 0.50-0.70
+- [ ] Assessment string explains reasoning
+- [ ] Unit tests for symptom indicators
+- [ ] Unit tests for root cause indicators
+- [ ] Unit tests for context-dependent cases
+
+##### 0.4.FVG.6 Feedback Validation Gate Tests
+
+**Files to create:**
+- `agents/inspector/validation_gate_test.go`
+- `agents/tester/validation_gate_test.go`
+- `core/analysis/root_cause_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test BLOCKED when correction conflicts with KeyConstraint
+- [ ] Test FLAGGED_STRONG when negative criteria impact AND low root cause confidence
+- [ ] Test FLAGGED when negative criteria impact AND medium+ root cause confidence
+- [ ] Test FLAGGED_NOTE when no negative impact AND low root cause confidence
+- [ ] Test PASSED when no negative impact AND high root cause confidence
+- [ ] Test "mock the cache" correction flagged against "caching implemented" criterion
+- [ ] Test "fix cache TTL" correction passed against "caching implemented" criterion
+- [ ] Test blocked correction not included in VALIDATION_CORRECTIONS
+- [ ] Test warning content includes affected criteria and root cause assessment
+- [ ] Integration test: Inspector validates correction flow end-to-end
+- [ ] Integration test: Tester validates correction flow end-to-end
+
+#### Implicit Requirements + Feedback Validation Integration
+
+**Goal**: Ensure both mechanisms work together for complete intent preservation.
+
+**Dependencies**: 0.4.IRI.* and 0.4.FVG.* must be complete
+
+##### 0.4.INT.1 Integration Tests
+
+**Files to create:**
+- `tests/integration/intent_preservation_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test: "Add logout button" → enriched criteria → Inspector validates against enriched criteria
+- [ ] Test: Inspector detects missing redirect, correction PASSED because criterion is inferred
+- [ ] Test: Correction that mocks session cleanup FLAGGED because it bypasses inferred criterion
+- [ ] Test: Full loop from user request to validated correction message
+- [ ] Test: Architect receives FLAGGED correction and can request root cause investigation
+- [ ] Test: Architect receives BLOCKED correction and must rethink approach
+- [ ] Benchmark: Measure token overhead of implicit requirements query (target: < 200 tokens)
+- [ ] Benchmark: Measure latency overhead of validation gate (target: < 50ms)
 
 #### Intent Classification for RAG Agents
 
@@ -1383,6 +2864,3070 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 - [ ] Message filtering by session
 - [ ] Concurrent publish across shards (verify no single-lock bottleneck)
 - [ ] 100+ topics distributed across shards
+
+---
+
+### 0.7 LLM Provider Adapters
+
+Abstract LLM provider interactions behind a common interface.
+
+**Files to create:**
+- `core/llm/types.go`
+- `core/llm/adapter.go`
+- `core/llm/anthropic.go`
+- `core/llm/openai.go`
+- `core/llm/google.go`
+- `core/llm/token_counter.go`
+- `core/llm/adapter_test.go`
+
+**Parallelization:** Can execute in parallel with 0.8, 0.9, 0.10.
+
+**Acceptance Criteria:**
+
+#### Provider Interface
+- [ ] `ProviderAdapter` interface with `Name()`, `SupportedModels()`, `Complete()`, `Stream()`, `CountTokens()`, `MaxContextTokens()`, `HealthCheck()`
+- [ ] `CompletionRequest` struct: Model, Messages, MaxTokens, Temperature, Tools, attribution fields (SessionID, PipelineID, TaskID, AgentID)
+- [ ] `CompletionResponse` struct: Content, ToolCalls, InputTokens, OutputTokens, FinishReason, Provider, Model, Latency
+- [ ] `ModelInfo` struct: ID, Name, MaxContext, InputPricePerM, OutputPricePerM
+
+#### Anthropic Adapter (`core/llm/anthropic.go`)
+- [ ] Implement `ProviderAdapter` for Anthropic API
+- [ ] Support Claude models: claude-sonnet-4-20250514, claude-opus-4-20250514, claude-haiku-3-5-20241022
+- [ ] Handle streaming responses via SSE
+- [ ] Parse usage from response for token tracking
+- [ ] Map tool_use blocks to `ToolCall` struct
+
+#### OpenAI Adapter (`core/llm/openai.go`)
+- [ ] Implement `ProviderAdapter` for OpenAI API
+- [ ] Support GPT models: gpt-4o, gpt-4o-mini, o1, o1-mini
+- [ ] Handle streaming responses
+- [ ] Parse usage from response
+- [ ] Map function_call to `ToolCall` struct
+
+#### Google Adapter (`core/llm/google.go`)
+- [ ] Implement `ProviderAdapter` for Google Generative AI API
+- [ ] Support Gemini models: gemini-2.0-flash, gemini-2.5-pro
+- [ ] Handle streaming responses
+- [ ] Parse usage metadata
+- [ ] Map function calls to `ToolCall` struct
+
+#### Token Counter (`core/llm/token_counter.go`)
+- [ ] `TokenCounter` interface with `Count(messages []Message) int`
+- [ ] Provider-specific implementations (tiktoken for OpenAI, approximation for others)
+- [ ] Cache tokenizer instances per model
+- [ ] Fallback to character-based estimation if tokenizer unavailable
+
+**Tests:**
+- [ ] Each adapter correctly formats requests for its provider
+- [ ] Streaming responses parsed correctly
+- [ ] Token counts match provider response
+- [ ] HealthCheck returns provider status
+- [ ] Invalid API key returns clear error
+
+```go
+// Required interface
+type ProviderAdapter interface {
+    Name() string
+    SupportedModels() []ModelInfo
+    Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error)
+    Stream(ctx context.Context, req *CompletionRequest) (<-chan StreamChunk, error)
+    CountTokens(messages []Message) (int, error)
+    MaxContextTokens(model string) int
+    HealthCheck(ctx context.Context) error
+}
+```
+
+---
+
+### 0.8 Provider Configuration & Auth
+
+Credential management and provider configuration.
+
+**Files to create:**
+- `core/llm/config.go`
+- `core/llm/credentials.go`
+- `core/llm/registry.go`
+- `cmd/auth.go` (CLI command)
+
+**Parallelization:** Can execute in parallel with 0.7, 0.9, 0.10.
+
+**Acceptance Criteria:**
+
+#### Credential Resolution
+- [ ] Load from environment variable first: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`
+- [ ] Fall back to config file: `~/.sylk/credentials.yaml`
+- [ ] Credentials file encrypted at rest using OS keyring or AES-256
+- [ ] Never log or serialize API keys
+
+#### Provider Config (`core/llm/config.go`)
+- [ ] `ProviderConfig` struct: Provider, BaseURL (optional), Models map, SoftLimit, Enabled
+- [ ] `UsageLimit` struct: Requests, Tokens, Period, WarnAt threshold
+- [ ] Load config from `~/.sylk/config.yaml`
+- [ ] Validate config on load (required fields, valid values)
+
+#### Provider Registry (`core/llm/registry.go`)
+- [ ] `ProviderRegistry` manages all configured providers
+- [ ] `Register(adapter ProviderAdapter)` adds provider
+- [ ] `Get(name string) ProviderAdapter` retrieves provider
+- [ ] `GetForModel(model string) ProviderAdapter` finds provider supporting model
+- [ ] `ListEnabled() []ProviderAdapter` returns enabled providers
+- [ ] Lazy initialization of adapters (don't connect until first use)
+
+#### Auth CLI (`cmd/auth.go`)
+- [ ] `sylk auth <provider>` - interactive API key setup
+- [ ] `sylk auth <provider> --api-key <key>` - direct key input
+- [ ] `sylk auth google --credentials-file <path>` - service account JSON
+- [ ] `sylk auth status` - show configured providers and status
+- [ ] `sylk auth remove <provider>` - remove credentials
+- [ ] Validate key with provider health check before saving
+
+**Tests:**
+- [ ] Environment variable takes precedence over config file
+- [ ] Invalid credentials rejected with clear error
+- [ ] Config validation catches missing required fields
+- [ ] Registry returns correct adapter for model
+- [ ] Auth command saves encrypted credentials
+
+```go
+// Config structure
+type ProviderConfig struct {
+    Provider    string            `yaml:"provider"`
+    APIKey      string            `yaml:"-"`  // Never serialized
+    BaseURL     string            `yaml:"base_url,omitempty"`
+    Models      map[string]string `yaml:"models,omitempty"`
+    SoftLimit   *UsageLimit       `yaml:"soft_limit,omitempty"`
+    Enabled     bool              `yaml:"enabled"`
+}
+```
+
+---
+
+### 0.9 Request Priority Queue
+
+Priority-based request queuing for LLM calls.
+
+**Files to create:**
+- `core/llm/queue.go`
+- `core/llm/priority.go`
+- `core/llm/queue_test.go`
+
+**Parallelization:** Can execute in parallel with 0.7, 0.8, 0.10.
+
+**Acceptance Criteria:**
+
+#### Priority Levels
+- [ ] `RequestPriority` type with constants: UserInteractive (100), Planning (80), Execution (60), Validation (40), Background (20)
+- [ ] Priority determination function: if user-invoked → UserInteractive, else based on agent type
+- [ ] Architect → Planning, Engineer/Designer → Execution, Inspector/Tester → Validation, Archivalist/Librarian → Background
+
+#### LLM Request
+- [ ] `LLMRequest` struct with: ID, SessionID, PipelineID, TaskID, AgentID, AgentType, Provider, Model, Messages, Priority, CreatedAt, TokenEstimate
+- [ ] Request ID generation (UUID)
+- [ ] Token estimation before queuing (for budget checks)
+
+#### Priority Queue
+- [ ] `PriorityQueue` using heap-based implementation
+- [ ] Thread-safe Push/Pop operations
+- [ ] Pop blocks when queue empty (using sync.Cond)
+- [ ] Higher priority value = processed first
+- [ ] Within same priority, FIFO ordering (use CreatedAt as tiebreaker)
+- [ ] `Close()` method to unblock waiting consumers
+- [ ] `Len()` method for monitoring
+
+**Tests:**
+- [ ] Higher priority requests dequeued first
+- [ ] Same priority maintains FIFO order
+- [ ] Pop blocks on empty queue
+- [ ] Close unblocks waiting Pop calls
+- [ ] Concurrent Push/Pop is thread-safe
+- [ ] 10,000 requests queued/dequeued correctly
+
+```go
+// Required interface
+type RequestQueue interface {
+    Push(req *LLMRequest)
+    Pop(ctx context.Context) (*LLMRequest, error)
+    Len() int
+    Close()
+}
+```
+
+---
+
+### 0.10 Adaptive Rate Limiter
+
+Exponential backoff rate limiting with workflow pause signaling.
+
+**Files to create:**
+- `core/llm/ratelimit.go`
+- `core/llm/backoff.go`
+- `core/llm/ratelimit_test.go`
+
+**Parallelization:** Can execute in parallel with 0.7, 0.8, 0.9.
+
+**Dependencies:** Requires 0.11 (Signal Bus) for pause signaling - stub initially.
+
+**Acceptance Criteria:**
+
+#### Rate Limit State
+- [ ] `RateLimitState` enum: OK, Warning, Exceeded
+- [ ] State transitions: OK → Warning (approaching soft limit), OK/Warning → Exceeded (429 received)
+- [ ] State recovery: Exceeded → OK (after backoff period)
+
+#### Exponential Backoff
+- [ ] Base backoff: 1 second
+- [ ] Max backoff: 5 minutes
+- [ ] Backoff formula: `min(baseBackoff * 2^attempt, maxBackoff)`
+- [ ] Parse `Retry-After` header if present and use instead
+- [ ] Reset backoff attempt counter on successful request
+
+#### Provider Rate Limiter
+- [ ] `ProviderRateLimiter` struct per provider
+- [ ] `OnResponse(statusCode int, headers http.Header)` - handle response
+- [ ] `CanProceed() bool` - check if requests allowed
+- [ ] `RecordUsage(tokens int)` - track for soft limits
+- [ ] Thread-safe operations
+
+#### Soft Limit Tracking
+- [ ] Track requests and tokens per period
+- [ ] Reset counters when period expires
+- [ ] Emit `SignalQuotaWarning` at warn threshold (e.g., 80%)
+- [ ] Continue allowing requests (soft limit = warning only)
+
+#### Workflow Pause Integration
+- [ ] On 429: broadcast `SignalPauseAll` via SignalBus
+- [ ] Include in payload: provider, resumeAt time, attempt count
+- [ ] On backoff complete: broadcast `SignalResumeAll`
+
+**Tests:**
+- [ ] 429 response triggers exponential backoff
+- [ ] Backoff time doubles each attempt up to max
+- [ ] Retry-After header respected
+- [ ] Success resets backoff counter
+- [ ] Soft limit warning emitted at threshold
+- [ ] CanProceed returns false during backoff
+
+```go
+// Required interface
+type RateLimiter interface {
+    OnResponse(statusCode int, headers http.Header)
+    CanProceed() bool
+    RecordUsage(tokens int)
+    State() RateLimitState
+    BackoffRemaining() time.Duration
+}
+```
+
+---
+
+### 0.11 Signal Bus & Workflow Control
+
+Pub/sub signal system for workflow coordination with ack support.
+
+**Files to create:**
+- `core/signal/types.go`
+- `core/signal/bus.go`
+- `core/signal/handler.go`
+- `core/signal/checkpoint.go`
+- `core/signal/bus_test.go`
+
+**Parallelization:** Should complete before 0.12 (tight dependency).
+
+**Acceptance Criteria:**
+
+#### Signal Types
+- [ ] `Signal` enum: PauseAll, ResumeAll, PausePipeline, ResumePipeline, CancelTask, AbortSession, QuotaWarning
+- [ ] `SignalMessage` struct: ID, Signal, TargetID, Reason, Payload, RequiresAck, Timeout, SentAt
+- [ ] `PausePayload` struct: Provider, ResumeAt, Attempt, Message
+- [ ] `SignalAck` struct: SignalID, SubscriberID, AgentID, ReceivedAt, State, Checkpoint
+
+#### Signal Bus
+- [ ] `SignalBus` manages subscriptions and broadcasts
+- [ ] `Subscribe(sub SignalSubscriber)` - register for signals
+- [ ] `Unsubscribe(subscriberID string)` - remove subscription
+- [ ] `Broadcast(msg SignalMessage) error` - send to all subscribers
+- [ ] `Acknowledge(ack SignalAck)` - receive ack from subscriber
+- [ ] Subscribers specify which signals they handle
+
+#### Acknowledgment System
+- [ ] Track pending acks per signal
+- [ ] Wait for all subscribers to ack (with timeout)
+- [ ] Retry to non-acked subscribers once
+- [ ] Return error if ack timeout exceeded after retry
+- [ ] Configurable timeout per signal (default: 5s)
+
+#### Signal Subscriber
+- [ ] `SignalSubscriber` struct: ID, AgentID, Signals (which to handle), Channel
+- [ ] Buffered channel to prevent blocking broadcast
+- [ ] Log warning if channel full (subscriber may be stuck)
+
+**Tests:**
+- [ ] Broadcast reaches all subscribers
+- [ ] Only subscribed signals delivered
+- [ ] Ack timeout triggers retry
+- [ ] All acks received = success
+- [ ] Unsubscribe stops delivery
+- [ ] Concurrent broadcast/subscribe is safe
+
+```go
+// Required interfaces
+type SignalBus interface {
+    Subscribe(sub SignalSubscriber)
+    Unsubscribe(subscriberID string)
+    Broadcast(msg SignalMessage) error
+    Acknowledge(ack SignalAck)
+}
+
+type SignalSubscriber struct {
+    ID       string
+    AgentID  string
+    Signals  []Signal
+    Channel  chan SignalMessage
+}
+```
+
+---
+
+### 0.12 Agent Signal Handler & Checkpointing
+
+Signal handling in agents with checkpoint/resume capability.
+
+**Files to create:**
+- `core/signal/agent_handler.go`
+- `core/signal/checkpoint.go`
+- `core/signal/resume.go`
+- `core/signal/agent_handler_test.go`
+
+**Dependencies:** Requires 0.11 (Signal Bus).
+
+**Acceptance Criteria:**
+
+#### Agent State Machine
+- [ ] `AgentState` enum: Idle, Running, Paused, Checkpointing, Resuming
+- [ ] State transitions: Running → Checkpointing → Paused (on pause signal)
+- [ ] State transitions: Paused → Resuming → Running (on resume signal)
+- [ ] Only valid transitions allowed
+
+#### Signal Handler
+- [ ] `SignalHandler` per agent, listens for signals
+- [ ] `Start()` begins listening goroutine
+- [ ] `Stop()` stops listener and unsubscribes
+- [ ] `State() AgentState` returns current state
+- [ ] Automatic subscription to: PauseAll, ResumeAll, PausePipeline, ResumePipeline, CancelTask, AbortSession
+
+#### Checkpoint Creation
+- [ ] `Checkpoint` struct: ID, AgentID, AgentType, SessionID, PipelineID, TaskID, CreatedAt
+- [ ] Include: LastOperation, OperationState (Pending/InProgress/Completed)
+- [ ] Include: MessagesHash (for change detection), MessageCount
+- [ ] Include: ToolsInProgress, PendingActions
+- [ ] Include: RecentMessages (last 10 for context)
+- [ ] Checkpoint created immediately on pause signal (before ack sent)
+
+#### Resume Decision Logic
+- [ ] `ResumeDecision` enum: Continue, Retry, Abort
+- [ ] If MessagesHash changed → Retry (context changed while paused)
+- [ ] If OperationState == InProgress → Retry (interrupted mid-operation)
+- [ ] If ToolsInProgress not empty → Retry (tools may have partial state)
+- [ ] Otherwise → Continue from checkpoint
+
+#### Resume Execution
+- [ ] `Continue`: Restore pending actions, clear checkpoint
+- [ ] `Retry`: Re-queue last operation, clear checkpoint
+- [ ] `Abort`: Report error, clear checkpoint, transition to Idle
+
+**Tests:**
+- [ ] Pause signal creates checkpoint and transitions to Paused
+- [ ] Ack sent after checkpoint created
+- [ ] Resume evaluates checkpoint correctly
+- [ ] Context change detected via hash
+- [ ] In-progress operation triggers retry
+- [ ] Clean state allows continue
+
+```go
+// Required interface
+type SignalHandler interface {
+    Start()
+    Stop()
+    State() AgentState
+    Checkpoint() *Checkpoint
+}
+
+type Checkpoint struct {
+    ID              string
+    AgentID         string
+    AgentType       AgentType
+    SessionID       string
+    PipelineID      string
+    TaskID          string
+    CreatedAt       time.Time
+    LastOperation   *Operation
+    OperationState  OperationState
+    MessagesHash    string
+    MessageCount    int
+    ToolsInProgress []ToolCall
+    PendingActions  []Action
+    RecentMessages  []Message
+}
+```
+
+---
+
+### 0.13 Token Budget Manager
+
+Hierarchical token budget enforcement with full attribution.
+
+**Files to create:**
+- `core/llm/budget.go`
+- `core/llm/tracker.go`
+- `core/llm/attribution.go`
+- `core/llm/budget_test.go`
+
+**Dependencies:** Can start after 0.7 (needs types).
+
+**Acceptance Criteria:**
+
+#### Budget Hierarchy
+- [ ] `TokenBudget` struct with: GlobalLimit, SessionLimits map, TaskLimits map, ProviderLimits map
+- [ ] Limits are `int64` (-1 = unlimited)
+- [ ] `CheckBudget(req *LLMRequest) error` checks all applicable limits
+- [ ] Return specific error: ErrGlobalBudgetExceeded, ErrSessionBudgetExceeded, ErrTaskBudgetExceeded, ErrProviderBudgetExceeded
+
+#### Usage Tracker
+- [ ] `UsageTracker` stores all usage records
+- [ ] `UsageRecord` struct: Timestamp, SessionID, PipelineID, TaskID, AgentID, AgentType, Provider, Model, InputTokens, OutputTokens, TotalTokens, Cost, Currency, Latency
+- [ ] `Record(record UsageRecord)` adds record
+- [ ] Thread-safe operations
+
+#### Aggregation Queries
+- [ ] `TotalTokens() int64` - global total
+- [ ] `TokensBySession(sessionID string) int64`
+- [ ] `TokensByTask(taskID string) int64`
+- [ ] `TokensByProvider(provider string) int64`
+- [ ] `TokensByAgent(agentType AgentType) int64`
+- [ ] Use cached aggregates for O(1) lookups
+
+#### Cost Calculation
+- [ ] Cost = (InputTokens / 1M * InputPrice) + (OutputTokens / 1M * OutputPrice)
+- [ ] Price loaded from `ModelInfo` in adapter
+- [ ] Currency always USD
+
+#### Attribution Report
+- [ ] `AttributionReport` struct: SessionID, Period, TotalRequests, TotalTokens, TotalCost
+- [ ] Breakdown by: Provider, Agent, Pipeline, Task
+- [ ] Each breakdown includes: Requests, InputTokens, OutputTokens, TotalCost
+- [ ] `GenerateReport(filter UsageFilter) *AttributionReport`
+
+**Tests:**
+- [ ] Budget check fails when limit exceeded
+- [ ] Hierarchical limits checked in order
+- [ ] Usage recorded correctly
+- [ ] Aggregates match sum of records
+- [ ] Cost calculation matches expected
+- [ ] Attribution report accurate
+
+```go
+// Required interfaces
+type TokenBudget interface {
+    CheckBudget(req *LLMRequest) error
+    RecordUsage(record UsageRecord)
+    SetGlobalLimit(limit int64)
+    SetSessionLimit(sessionID string, limit int64)
+    SetTaskLimit(taskID string, limit int64)
+    SetProviderLimit(provider string, limit int64)
+}
+
+type UsageTracker interface {
+    Record(record UsageRecord)
+    TotalTokens() int64
+    TokensBySession(sessionID string) int64
+    TokensByTask(taskID string) int64
+    TokensByProvider(provider string) int64
+    TokensByAgent(agentType AgentType) int64
+    GenerateReport(filter UsageFilter) *AttributionReport
+}
+```
+
+---
+
+### 0.14 Context Window Manager
+
+Smart context management with overflow handling.
+
+**Files to create:**
+- `core/llm/context.go`
+- `core/llm/context_test.go`
+
+**Dependencies:** Requires 0.7 (adapters for token counting), integrates with Archivalist.
+
+**Acceptance Criteria:**
+
+#### Context Manager
+- [ ] `ContextManager` struct: model, maxContextTokens, reserveTokens (for response)
+- [ ] `PrepareContext(messages []Message, query string) ([]Message, error)`
+- [ ] If fits → return as-is
+- [ ] If overflow → apply strategies in order
+
+#### Strategy 1: Smart Selection
+- [ ] `selectRelevant(messages, query, maxTokens)` keeps semantically relevant
+- [ ] Score messages by relevance to current query
+- [ ] Keep highest-scoring messages that fit budget
+- [ ] Preserve original message order in output
+
+#### Strategy 2: Archivalist Handoff
+- [ ] Store overflow messages in Archivalist: `archivalist.StoreContextOverflow(messages)`
+- [ ] Messages available for RAG retrieval later
+- [ ] Log handoff for debugging
+
+#### Strategy 3: Summarization
+- [ ] Use agent compactor to summarize overflow
+- [ ] Insert summary as system message: "[Context summary of N earlier messages] ..."
+- [ ] Preserve recent messages after summary
+
+#### Context Reconstruction
+- [ ] Final context: SystemPrompt + Summary (if any) + RecentMessages
+- [ ] Total tokens must fit within available budget
+- [ ] Return error if even minimal context exceeds budget
+
+**Tests:**
+- [ ] Small context returned unchanged
+- [ ] Large context triggers smart selection
+- [ ] Overflow stored in Archivalist
+- [ ] Summary generated for excess
+- [ ] Final context within token budget
+- [ ] Message order preserved
+
+```go
+// Required interface
+type ContextManager interface {
+    PrepareContext(messages []Message, query string) ([]Message, error)
+    MaxTokens() int
+    AvailableTokens() int  // MaxTokens - ReserveTokens
+}
+```
+
+---
+
+### 0.15 LLM Request Gate (Integration)
+
+Central gate combining queue, budget, rate limiting, and routing.
+
+**Files to create:**
+- `core/llm/gate.go`
+- `core/llm/gate_test.go`
+
+**Dependencies:** Requires 0.7, 0.8, 0.9, 0.10, 0.13, 0.14.
+
+**Acceptance Criteria:**
+
+#### Request Flow
+1. Request arrives at gate
+2. Determine priority (user-invoked vs task-phase)
+3. Check token budget (reject if exceeded)
+4. Queue request by priority
+5. Dequeue worker checks rate limit (wait if exceeded)
+6. Prepare context (smart selection/summarize if needed)
+7. Route to provider adapter
+8. Record usage on response
+9. Return response to caller
+
+#### Gate Interface
+- [ ] `LLMGate` struct combining all components
+- [ ] `Submit(ctx context.Context, req *LLMRequest) (*CompletionResponse, error)`
+- [ ] `SubmitStream(ctx context.Context, req *LLMRequest) (<-chan StreamChunk, error)`
+- [ ] Request attribution populated before response returned
+
+#### Worker Pool
+- [ ] Configurable number of workers (default: 4)
+- [ ] Workers dequeue from priority queue
+- [ ] Workers respect rate limits (block if needed)
+- [ ] Workers handle context preparation
+- [ ] Workers call provider adapters
+
+#### Error Handling
+- [ ] Budget exceeded → immediate reject with `ErrBudgetExceeded`
+- [ ] Rate limited → wait for backoff (not reject)
+- [ ] Provider error → return error to caller
+- [ ] Context error → return error to caller
+
+#### Metrics
+- [ ] Track: requests submitted, requests completed, requests failed
+- [ ] Track: average latency, p99 latency
+- [ ] Track: queue depth, wait time
+- [ ] Expose via `Stats() GateStats`
+
+**Tests:**
+- [ ] Request flows through all stages
+- [ ] Priority ordering respected
+- [ ] Budget rejection works
+- [ ] Rate limit causes wait (not reject)
+- [ ] Context prepared correctly
+- [ ] Usage recorded on completion
+- [ ] Multiple workers process concurrently
+
+```go
+// Required interface
+type LLMGate interface {
+    Submit(ctx context.Context, req *LLMRequest) (*CompletionResponse, error)
+    SubmitStream(ctx context.Context, req *LLMRequest) (<-chan StreamChunk, error)
+    Stats() GateStats
+    Close() error
+}
+```
+
+---
+
+### 0.16 Usage CLI Commands
+
+CLI commands for viewing usage and attribution.
+
+**Files to create:**
+- `cmd/usage.go`
+
+**Dependencies:** Requires 0.13 (tracker/attribution).
+
+**Acceptance Criteria:**
+
+#### Usage Command
+- [ ] `sylk usage` - current session summary
+- [ ] `sylk usage --session <id>` - specific session breakdown
+- [ ] `sylk usage --provider <name>` - provider-specific usage
+- [ ] `sylk usage --period <day|week|month>` - time-filtered usage
+- [ ] `sylk usage --detailed` - full attribution breakdown
+
+#### Output Format
+- [ ] Default: human-readable table
+- [ ] `--json` flag for JSON output
+- [ ] Include: requests, input tokens, output tokens, cost
+- [ ] Breakdown by provider, agent, task as applicable
+
+#### Cost Display
+- [ ] Format cost as currency: "$1.23"
+- [ ] Show per-provider costs
+- [ ] Show estimated vs actual (if budget set)
+
+**Tests:**
+- [ ] All command variations work
+- [ ] JSON output valid
+- [ ] Cost formatting correct
+- [ ] Empty usage handled gracefully
+
+---
+
+### 0.17 Goroutine Model & Agent Lifecycle
+
+Implements the core goroutine architecture: one goroutine per standalone agent, one goroutine per pipeline.
+
+**Files to create:**
+- `core/concurrency/agent_runner.go`
+- `core/concurrency/lifecycle.go`
+
+**Dependencies:** Requires 0.11 (Signal Bus) for shutdown coordination.
+
+**Acceptance Criteria:**
+
+#### Standalone Agent Goroutines
+- [ ] `AgentRunner` struct manages goroutine lifecycle
+- [ ] `Start(ctx context.Context) error` - spawns goroutine
+- [ ] `Stop() error` - graceful shutdown with timeout
+- [ ] `IsRunning() bool` - status check
+- [ ] Standalone agents: Guide, Architect, Orchestrator, Librarian, Archivalist, Academic
+- [ ] No concurrency limit on standalone agents (they self-regulate via LLM queue)
+
+#### Pipeline Goroutines
+- [ ] Pipeline spawns single goroutine for all phases
+- [ ] Sequential internal execution: Inspector → Tester → Worker → Verify
+- [ ] `PipelineRunner` wraps pipeline lifecycle
+- [ ] Clean shutdown on context cancellation
+- [ ] Panic recovery with error reporting
+
+#### Lifecycle States
+- [ ] States: `Created`, `Starting`, `Running`, `Stopping`, `Stopped`, `Failed`
+- [ ] State transitions are atomic
+- [ ] State change events published to Signal Bus
+- [ ] `WaitForState(state, timeout) error` - blocking wait
+
+**Tests:**
+- [ ] Agent starts and stops cleanly
+- [ ] Concurrent start/stop safe
+- [ ] Panic in goroutine captured and reported
+- [ ] Context cancellation triggers shutdown
+
+---
+
+### 0.18 Pipeline Scheduler
+
+Implements N_CPU_CORES bounded pipeline scheduling with priority ordering.
+
+**Files to create:**
+- `core/concurrency/scheduler.go`
+- `core/concurrency/priority_queue.go`
+
+**Dependencies:** Requires 0.17 (Agent Lifecycle).
+
+**Acceptance Criteria:**
+
+#### Scheduler Core
+- [ ] `PipelineScheduler` struct with configurable `maxConcurrent`
+- [ ] Default `maxConcurrent = runtime.NumCPU()`
+- [ ] Active map: `map[string]*Pipeline` (currently executing)
+- [ ] Ready queue: priority-ordered pipelines awaiting slots
+- [ ] Waiting map: pipelines blocked on dependencies
+
+#### Priority Queue
+- [ ] Priority by: Architect-assigned priority (primary), spawn time (secondary)
+- [ ] `Push(pipeline *Pipeline)`
+- [ ] `Pop() *Pipeline` - returns highest priority
+- [ ] `Remove(pipelineID string)` - for cancellation
+- [ ] `Len() int`
+
+#### Scheduling Logic
+- [ ] `Schedule(pipeline *Pipeline) error` - enqueue for execution
+- [ ] Eager scheduling: start immediately when slot available
+- [ ] `NotifyComplete(pipelineID string)` - release slot, schedule next
+- [ ] `Cancel(pipelineID string)` - remove from any queue/active
+
+#### Dependency Management
+- [ ] Pipelines specify dependencies (other pipeline IDs)
+- [ ] Pipeline moves ready → waiting if dependencies incomplete
+- [ ] Dependency completion triggers re-evaluation
+- [ ] Circular dependency detection with error
+
+**Tests:**
+- [ ] Respects maxConcurrent limit
+- [ ] Priority ordering correct
+- [ ] Dependencies block correctly
+- [ ] Completion triggers next pipeline
+- [ ] Cancellation cleans up properly
+
+---
+
+### 0.19 Dual Queue LLM Gate
+
+Implements separate queues for user-interactive and pipeline requests with user priority.
+
+**Files to create:**
+- `core/concurrency/llm_gate.go`
+- `core/concurrency/unbounded_queue.go`
+
+**Dependencies:** Requires 0.9 (Priority Queue), 0.10 (Rate Limiter).
+
+**Acceptance Criteria:**
+
+#### Dual Queue Architecture
+- [ ] `DualQueueGate` struct
+- [ ] `userQueue`: unbounded queue for user requests (NEVER reject)
+- [ ] `pipelineQueue`: bounded priority queue for pipeline requests
+- [ ] User queue ALWAYS drains first before pipeline queue
+
+#### User Queue (Unbounded)
+- [ ] `UnboundedQueue` with dynamic growth
+- [ ] Initial capacity: 16, grows as needed
+- [ ] No upper limit (user responsiveness is paramount)
+- [ ] FIFO ordering within user queue
+
+#### Pipeline Queue (Bounded + Priority)
+- [ ] Max size configurable (default: 1000)
+- [ ] Priority ordering matches scheduler priority
+- [ ] Rejection when full (pipeline retries)
+- [ ] Preemption support: user request can pause in-flight pipeline request
+
+#### Preemption Logic
+- [ ] `Preempt(pipelineRequestID string) error`
+- [ ] In-flight pipeline request paused (not cancelled)
+- [ ] User request proceeds immediately
+- [ ] Pipeline request resumes after user completes
+- [ ] Preemption event published to Signal Bus
+
+#### Gate Interface
+- [ ] `Submit(request *LLMRequest) (chan *LLMResponse, error)`
+- [ ] `SubmitUser(request *LLMRequest) (chan *LLMResponse, error)` - always succeeds
+- [ ] `Cancel(requestID string)`
+- [ ] `Stats() GateStats`
+
+**Tests:**
+- [ ] User requests never rejected
+- [ ] User requests drain before pipeline
+- [ ] Preemption works correctly
+- [ ] Pipeline queue respects bounds
+- [ ] Priority ordering in pipeline queue
+
+---
+
+### 0.20 Staging Manager
+
+Implements copy-on-write file staging for pipeline isolation.
+
+**Files to create:**
+- `core/concurrency/staging.go`
+- `core/concurrency/merge.go`
+
+**Dependencies:** None (can be built in parallel with 0.17-0.19).
+
+**Acceptance Criteria:**
+
+#### Staging Directory
+- [ ] `StagingManager` creates isolated directories per pipeline
+- [ ] Location: `~/.sylk/staging/<pipeline-id>/`
+- [ ] Copy files on first write
+- [ ] Track original file hashes for conflict detection
+
+#### File Operations
+- [ ] `CreateStaging(pipelineID string) (*PipelineStaging, error)`
+- [ ] `ReadFile(staging, path) ([]byte, error)` - reads from original or staged
+- [ ] `WriteFile(staging, path, content) error` - always writes to staging
+- [ ] `DeleteFile(staging, path) error` - marks as deleted in staging
+- [ ] `ListModified(staging) []string` - all changed files
+
+#### Conflict Detection
+- [ ] Store original hash when file first staged
+- [ ] On merge, compare current original hash to stored hash
+- [ ] Conflict if original changed while pipeline working
+- [ ] `CheckConflicts(staging) ([]Conflict, error)`
+
+#### Merge Strategy
+- [ ] `Merge(staging) error` - applies staged changes to working directory
+- [ ] Atomic: all-or-nothing via temp + rename
+- [ ] On conflict: reject merge, return conflicts
+- [ ] On success: clean up staging directory
+- [ ] `Abort(staging) error` - discard staging, clean up
+
+#### Cleanup
+- [ ] Auto-cleanup on pipeline completion (success or failure)
+- [ ] Periodic cleanup of orphaned staging dirs (crash recovery)
+- [ ] Configurable max staging age (default: 24h)
+
+**Tests:**
+- [ ] Staging isolation works
+- [ ] Conflict detection correct
+- [ ] Merge is atomic
+- [ ] Concurrent pipeline staging independent
+- [ ] Cleanup removes directories
+
+---
+
+### 0.21 Adaptive Channels
+
+Implements auto-resizing channels with overflow handling for user responsiveness.
+
+**Files to create:**
+- `core/concurrency/adaptive_channel.go`
+
+**Dependencies:** None (can be built in parallel with 0.17-0.20).
+
+**Acceptance Criteria:**
+
+#### Adaptive Channel Core
+- [ ] `AdaptiveChannel[T]` generic struct
+- [ ] `minSize`: minimum buffer (default: 16)
+- [ ] `maxSize`: maximum buffer (default: 4096)
+- [ ] `currentSize`: tracks current allocation
+- [ ] Overflow slice for beyond-max scenarios (user paths only)
+
+#### Send Operations
+- [ ] `Send(msg T) error` - sends with auto-resize
+- [ ] `SendTimeout(msg T, timeout time.Duration) error` - with timeout
+- [ ] If channel full and under maxSize: resize up (2x)
+- [ ] If at maxSize: use overflow (user channels) or timeout (other channels)
+- [ ] Never block indefinitely
+
+#### Receive Operations
+- [ ] `Receive() (T, error)` - blocking receive
+- [ ] `ReceiveTimeout(timeout time.Duration) (T, error)`
+- [ ] `TryReceive() (T, bool)` - non-blocking
+- [ ] Drain overflow before channel
+
+#### Auto-Resize Logic
+- [ ] Resize up: when >80% full
+- [ ] Resize down: when <20% full for sustained period (1 minute)
+- [ ] Minimum stays at minSize
+- [ ] Resize is transparent to senders/receivers
+
+#### Metrics
+- [ ] `Size() int` - current buffer size
+- [ ] `Len() int` - current message count
+- [ ] `OverflowLen() int` - overflow queue length
+- [ ] `Stats() ChannelStats` - hit rates, resize counts
+
+**Tests:**
+- [ ] Auto-resize up works
+- [ ] Auto-resize down works
+- [ ] Overflow handles burst
+- [ ] Timeout behavior correct
+- [ ] No message loss
+
+---
+
+### 0.22 Write-Ahead Log
+
+Implements WAL for crash recovery durability.
+
+**Files to create:**
+- `core/concurrency/wal.go`
+- `core/concurrency/wal_entry.go`
+
+**Dependencies:** None (can be built in parallel with 0.17-0.21).
+
+**Acceptance Criteria:**
+
+#### WAL Core
+- [ ] `WriteAheadLog` struct
+- [ ] Location: `~/.sylk/wal/`
+- [ ] Segment files: `wal-<sequence>.log`
+- [ ] Max segment size: 64MB (configurable)
+- [ ] Automatic segment rotation
+
+#### Entry Format
+- [ ] `WALEntry` struct: sequence, timestamp, type, payload
+- [ ] Entry types: `Checkpoint`, `StateChange`, `LLMRequest`, `LLMResponse`, `FileChange`
+- [ ] Binary encoding with length prefix
+- [ ] CRC32 checksum per entry
+
+#### Write Operations
+- [ ] `Append(entry *WALEntry) (uint64, error)` - returns sequence number
+- [ ] `Sync() error` - force fsync
+- [ ] Configurable sync mode: every write, batched, or periodic
+- [ ] Default: batched with 100ms max delay
+
+#### Read Operations
+- [ ] `ReadFrom(sequence uint64) ([]*WALEntry, error)`
+- [ ] `ReadAll() ([]*WALEntry, error)`
+- [ ] Skip corrupted entries with warning
+- [ ] Iterator interface for streaming
+
+#### Segment Management
+- [ ] `Truncate(beforeSequence uint64) error` - remove old segments
+- [ ] Segments older than last checkpoint safe to remove
+- [ ] Automatic truncation after successful checkpoint
+
+**Tests:**
+- [ ] Entries survive crash (kill -9 test)
+- [ ] CRC detects corruption
+- [ ] Segment rotation works
+- [ ] Truncation cleans old segments
+- [ ] Concurrent append safe
+
+---
+
+### 0.23 Checkpointer
+
+Implements continuous checkpointing with 5-second intervals.
+
+**Files to create:**
+- `core/concurrency/checkpointer.go`
+- `core/concurrency/checkpoint.go`
+
+**Dependencies:** Requires 0.22 (WAL).
+
+**Acceptance Criteria:**
+
+#### Checkpoint Content
+- [ ] `Checkpoint` struct captures full system state
+- [ ] Pipeline states (active, waiting, ready queues)
+- [ ] LLM queue states (user queue, pipeline queue)
+- [ ] Staging directory manifest (what files modified)
+- [ ] Agent states (current task, context summary)
+- [ ] WAL sequence number (replay point)
+
+#### Checkpointer Service
+- [ ] `Checkpointer` runs background goroutine
+- [ ] Default interval: 5 seconds
+- [ ] `TriggerCheckpoint()` - force immediate checkpoint
+- [ ] `Stop()` - graceful shutdown with final checkpoint
+
+#### Atomic Writes
+- [ ] Write to temp file first
+- [ ] Validate temp file readable
+- [ ] Atomic rename to checkpoint location
+- [ ] Keep previous checkpoint until new one confirmed
+- [ ] Location: `~/.sylk/checkpoints/checkpoint-<timestamp>.json`
+
+#### Checkpoint Validation
+- [ ] JSON schema validation on read
+- [ ] Version field for forward compatibility
+- [ ] Hash of content for integrity
+
+#### Signal Integration
+- [ ] Subscribe to pause signals
+- [ ] Force checkpoint on pause signal before ack
+- [ ] Checkpoint on graceful shutdown
+
+**Tests:**
+- [ ] Checkpoint created at interval
+- [ ] Atomic write (no partial checkpoints)
+- [ ] Pause triggers checkpoint
+- [ ] Corrupt checkpoint detected
+- [ ] Old checkpoints cleaned up
+
+---
+
+### 0.24 Recovery Manager
+
+Implements crash recovery using WAL and checkpoints.
+
+**Files to create:**
+- `core/concurrency/recovery.go`
+
+**Dependencies:** Requires 0.22 (WAL), 0.23 (Checkpointer).
+
+**Acceptance Criteria:**
+
+#### Recovery Flow
+- [ ] `RecoveryManager` struct
+- [ ] `Recover() (*RecoveryResult, error)` - main entry point
+- [ ] Detect if recovery needed (unclean shutdown marker)
+- [ ] Load latest valid checkpoint
+- [ ] Replay WAL from checkpoint sequence
+
+#### Checkpoint Loading
+- [ ] Find latest checkpoint file
+- [ ] Validate checkpoint integrity
+- [ ] If corrupt, try previous checkpoint
+- [ ] If no valid checkpoint, start fresh with warning
+
+#### WAL Replay
+- [ ] Replay entries after checkpoint sequence
+- [ ] Apply state changes in order
+- [ ] Skip already-applied entries (idempotent replay)
+- [ ] Stop at end of WAL
+
+#### Pipeline Recovery
+- [ ] Completed pipelines: no action
+- [ ] In-progress pipelines: restart from last phase
+- [ ] Waiting pipelines: re-enqueue
+- [ ] Staging directories: validate or recreate
+
+#### Recovery Result
+- [ ] `RecoveryResult` struct with recovered state
+- [ ] List of recovered pipelines
+- [ ] List of failed recoveries (with reasons)
+- [ ] WAL entries replayed count
+
+#### Shutdown Marker
+- [ ] Write marker on startup
+- [ ] Remove marker on clean shutdown
+- [ ] Presence of marker = recovery needed
+
+**Tests:**
+- [ ] Clean shutdown needs no recovery
+- [ ] Crash recovery restores state
+- [ ] Corrupt checkpoint handled
+- [ ] WAL replay idempotent
+- [ ] Pipeline recovery correct
+
+---
+
+### 0.25 Concurrency Integration Tests
+
+End-to-end tests for concurrency system.
+
+**Files to create:**
+- `core/concurrency/integration_test.go`
+
+**Dependencies:** Requires 0.17-0.24.
+
+**Acceptance Criteria:**
+
+#### Pipeline Scheduling Tests
+- [ ] N pipelines scheduled with N_CPU_CORES limit
+- [ ] Priority ordering respected under load
+- [ ] Dependency chains execute correctly
+- [ ] Cancellation cleans up properly
+
+#### LLM Gate Tests
+- [ ] User requests always succeed during pipeline load
+- [ ] Preemption works under high load
+- [ ] Pipeline queue bounds respected
+- [ ] Rate limiting integrates correctly
+
+#### File Staging Tests
+- [ ] Multiple pipelines modify same file independently
+- [ ] Conflict detection on concurrent modification
+- [ ] Merge succeeds when no conflicts
+- [ ] Abort cleans up correctly
+
+#### Crash Recovery Tests
+- [ ] Simulate crash during pipeline execution
+- [ ] Verify recovery restores state
+- [ ] Verify WAL replay correct
+- [ ] Verify staging directories recovered
+
+#### Stress Tests
+- [ ] 100 concurrent pipelines
+- [ ] Rapid user request bursts
+- [ ] Memory usage under control
+- [ ] No goroutine leaks
+
+**Tests:**
+- [ ] All integration scenarios pass
+- [ ] No race conditions (run with -race)
+- [ ] Performance meets targets (<100ms scheduling overhead)
+
+---
+
+### Concurrency Parallelization Notes
+
+The following tasks can be executed in parallel:
+- **Group C1**: 0.20, 0.21, 0.22 (no dependencies between them)
+- **Group C2**: 0.17 → 0.18 → 0.19 (sequential dependency)
+- **Group C3**: 0.22 → 0.23 → 0.24 (sequential dependency)
+
+Optimal execution order:
+1. Start 0.17, 0.20, 0.21, 0.22 in parallel
+2. When 0.17 completes → start 0.18
+3. When 0.18 completes → start 0.19
+4. When 0.22 completes → start 0.23
+5. When 0.23 completes → start 0.24
+6. When 0.19 and 0.24 complete → start 0.25
+
+---
+
+### 0.26 Error Type System
+
+Implements 5-tier error taxonomy with classification and handling behavior.
+
+**Files to create:**
+- `core/errors/types.go`
+- `core/errors/classifier.go`
+- `core/errors/config.go`
+
+**Dependencies:** None (can start immediately, parallel with 0.17-0.25).
+
+**Acceptance Criteria:**
+
+#### Error Tiers
+- [ ] `ErrorTier` enum: Transient, Permanent, UserFixable, ExternalRateLimit, ExternalDegrading
+- [ ] Each tier has defined behavior (retry policy, notification, escalation)
+- [ ] Error wrapping preserves tier through call stack
+
+#### Error Classifier
+- [ ] `ErrorClassifier` struct with configurable patterns
+- [ ] `Classify(error) ErrorTier` - determines tier from error
+- [ ] HTTP status code detection (429 → RateLimit, 5xx → Degrading)
+- [ ] Pattern matching for known error types (regex configurable)
+- [ ] Default to Permanent for unknown errors (fail fast, don't mask)
+
+#### Configuration
+- [ ] `ErrorClassifierConfig` struct with YAML tags
+- [ ] `transient_patterns`: regex list for transient errors
+- [ ] `permanent_patterns`: regex list for permanent errors
+- [ ] `user_fixable_patterns`: regex list for user-fixable errors
+- [ ] `rate_limit_statuses`: HTTP codes (default: [429])
+- [ ] `degrading_statuses`: HTTP codes (default: [500, 502, 503, 504])
+
+**Tests:**
+- [ ] All error tiers classified correctly
+- [ ] HTTP status codes map to correct tiers
+- [ ] Pattern matching works
+- [ ] Unknown errors default to Permanent
+- [ ] Configuration loading works
+
+---
+
+### 0.27 Transient Error Tracker
+
+Implements silent retry with frequency-based notification for transient errors.
+
+**Files to create:**
+- `core/errors/transient_tracker.go`
+
+**Dependencies:** Requires 0.26 (Error Types), 0.11 (Signal Bus).
+
+**Acceptance Criteria:**
+
+#### Frequency Tracking
+- [ ] `TransientTracker` struct with sliding window
+- [ ] `Record(error) bool` - returns true if notification needed
+- [ ] Configurable `frequency_count` (default: 3)
+- [ ] Configurable `frequency_window` (default: 10s)
+- [ ] Configurable `notification_cooldown` (default: 60s)
+
+#### Sliding Window
+- [ ] Prune errors outside window on each record
+- [ ] Thread-safe with mutex
+- [ ] Memory-bounded (only track timestamps, not full errors)
+
+#### Notification Logic
+- [ ] Return false (silent) for isolated transient errors
+- [ ] Return true when frequency threshold exceeded
+- [ ] Respect cooldown after notification
+- [ ] Publish SignalTransientFrequencyAlert to Signal Bus when true
+
+**Tests:**
+- [ ] Single transient error is silent
+- [ ] N errors in window triggers notification
+- [ ] Errors outside window don't count
+- [ ] Cooldown prevents repeated notifications
+- [ ] Thread-safe under concurrent access
+
+---
+
+### 0.28 Retry Policies
+
+Implements per-tier retry behavior with exponential backoff.
+
+**Files to create:**
+- `core/errors/retry.go`
+- `core/errors/backoff.go`
+
+**Dependencies:** Requires 0.26 (Error Types).
+
+**Acceptance Criteria:**
+
+#### Retry Policy
+- [ ] `RetryPolicy` struct per error tier
+- [ ] `max_attempts`: maximum retry count
+- [ ] `initial_delay`: starting backoff duration
+- [ ] `max_delay`: maximum backoff duration
+- [ ] `multiplier`: backoff multiplier (default: 2.0)
+- [ ] `use_retry_after`: respect Retry-After header (for RateLimit)
+
+#### Default Policies (all configurable)
+- [ ] Transient: 5 attempts, 100ms initial, 5s max, 2.0x
+- [ ] ExternalRateLimit: 10 attempts, 1s initial, 60s max, 2.0x, use Retry-After
+- [ ] ExternalDegrading: 3 attempts, 5s initial, 30s max, 2.0x
+- [ ] Permanent: 0 attempts (no retry)
+- [ ] UserFixable: 0 attempts (no retry)
+
+#### Backoff Calculator
+- [ ] `CalculateDelay(attempt int, policy RetryPolicy) time.Duration`
+- [ ] Exponential: delay = initial * (multiplier ^ attempt)
+- [ ] Capped at max_delay
+- [ ] Jitter option (±10%) to prevent thundering herd
+
+#### Retry Executor
+- [ ] `RetryWithPolicy(ctx, fn, tier) (result, error)`
+- [ ] Respects context cancellation
+- [ ] Returns last error if all attempts fail
+- [ ] Publishes retry events to Signal Bus (for UI countdown)
+
+**Tests:**
+- [ ] Exponential backoff calculates correctly
+- [ ] Max delay caps backoff
+- [ ] Jitter stays within bounds
+- [ ] Context cancellation stops retries
+- [ ] Retry-After header respected
+
+---
+
+### 0.29 Circuit Breaker
+
+Implements per-resource circuit breakers with configurable thresholds.
+
+**Files to create:**
+- `core/errors/circuit_breaker.go`
+- `core/errors/circuit_registry.go`
+
+**Dependencies:** Requires 0.26 (Error Types), 0.11 (Signal Bus).
+
+**Acceptance Criteria:**
+
+#### Circuit States
+- [ ] `CircuitState` enum: Closed, Open, HalfOpen
+- [ ] State transitions are atomic
+- [ ] State change publishes to Signal Bus
+
+#### Circuit Breaker
+- [ ] `CircuitBreaker` struct per resource
+- [ ] `RecordResult(success bool)` - tracks outcome
+- [ ] `Allow() bool` - checks if request should proceed
+- [ ] `ForceReset()` - manual reset (user override)
+
+#### Trip Conditions (configurable per resource)
+- [ ] Count-based: N consecutive failures
+- [ ] Rate-based: failure rate in sliding window
+- [ ] Trip on EITHER condition met
+
+#### Per-Resource Defaults
+- [ ] LLM: 5 consecutive, 50% rate, 20 window, 30s cooldown
+- [ ] File: 2 consecutive, 30% rate, 10 window, 10s cooldown
+- [ ] Network: 3 consecutive, 50% rate, 20 window, 30s cooldown
+- [ ] Subprocess: 3 consecutive, 40% rate, 15 window, 20s cooldown
+
+#### Half-Open Probe
+- [ ] After cooldown, allow single probe request
+- [ ] Success → close circuit
+- [ ] Failure → back to open, reset cooldown
+- [ ] Configurable success_threshold for closing (default: 3)
+
+#### Registry
+- [ ] `CircuitRegistry` manages all circuit breakers
+- [ ] `Get(resourceID string) *CircuitBreaker`
+- [ ] Lazy initialization with defaults
+- [ ] Status endpoint for all circuits
+
+**Tests:**
+- [ ] Count-based trip works
+- [ ] Rate-based trip works
+- [ ] Half-open probe works
+- [ ] Manual reset works
+- [ ] Cooldown timing correct
+- [ ] Multiple circuits independent
+
+---
+
+### 0.30 Escalation Chain
+
+Implements Agent → Architect → User escalation with token-budgeted workarounds.
+
+**Files to create:**
+- `core/errors/escalation.go`
+- `core/errors/workaround_budget.go`
+- `core/errors/remedy.go`
+
+**Dependencies:** Requires 0.26-0.29 (Error System), 0.11 (Signal Bus).
+
+**Acceptance Criteria:**
+
+#### Workaround Budget
+- [ ] `WorkaroundBudget` struct tracks token spending
+- [ ] Configurable `max_tokens` (default: 1000)
+- [ ] `CanSpend(tokens int) bool`
+- [ ] `Spend(tokens int)`
+- [ ] `Reset()` on successful recovery
+- [ ] Per-error-type budget overrides (optional)
+
+#### Escalation Manager
+- [ ] `EscalationManager` coordinates escalation flow
+- [ ] `Escalate(error, context) (*Remedy, error)`
+- [ ] Level 1: Agent self-recovery (retry based on tier)
+- [ ] Level 2: Architect workaround (token-budgeted)
+- [ ] Level 3: User decision (present remedies)
+
+#### Critical Error Fast-Path
+- [ ] ExternalDegrading errors skip Level 2
+- [ ] Immediately notify user + show "working on it"
+- [ ] Architect works in background while user informed
+- [ ] Present remedy when ready (or timeout)
+
+#### Remedy Structure
+- [ ] `Remedy` struct: description, action, confidence
+- [ ] Multiple remedies ranked by likelihood
+- [ ] User can accept, reject, modify, or abort
+- [ ] Remedy execution tracked in Archivalist
+
+**Tests:**
+- [ ] Self-recovery works for transient
+- [ ] Architect workaround within budget works
+- [ ] Budget exceeded escalates to user
+- [ ] Critical errors fast-path to user
+- [ ] Remedy presentation correct
+
+---
+
+### 0.31 Retry Briefing System
+
+Implements Archivalist-powered context briefing for retry attempts.
+
+**Files to create:**
+- `core/errors/retry_briefing.go`
+
+**Dependencies:** Requires 0.30 (Escalation), Archivalist agent.
+
+**Acceptance Criteria:**
+
+#### Retry Briefing
+- [ ] `RetryBriefing` struct: prior attempts, failure analysis, suggested approach, avoid patterns
+- [ ] `AttemptSummary`: timestamp, approach, error, tokens spent, phases complete
+
+#### Briefing Preparation
+- [ ] `PrepareRetryBriefing(ctx, pipelineID, error) (*RetryBriefing, error)`
+- [ ] Query Archivalist for prior attempts on this task
+- [ ] Analyze failure patterns across attempts
+- [ ] Generate suggested approach avoiding prior failures
+- [ ] List explicit "avoid patterns" from failures
+
+#### Agent Integration
+- [ ] Briefing injected into agent context before retry
+- [ ] Agent sees: "Attempt 2. Prior attempt failed due to X. Avoid Y. Try Z."
+- [ ] Prevents token waste from rediscovery
+- [ ] Archivalist non-fatal: proceed without history if unavailable
+
+**Tests:**
+- [ ] Briefing generated from Archivalist data
+- [ ] Avoid patterns extracted correctly
+- [ ] Suggested approach differs from failed attempts
+- [ ] Graceful degradation without Archivalist
+
+---
+
+### 0.32 Rollback Manager
+
+Implements multi-layer rollback with history preservation.
+
+**Files to create:**
+- `core/errors/rollback.go`
+- `core/errors/rollback_receipt.go`
+
+**Dependencies:** Requires 0.20 (Staging), 0.22-0.24 (WAL/Checkpoint), Archivalist.
+
+**Acceptance Criteria:**
+
+#### Rollback Layers
+- [ ] Layer 1: File staging (discard staging dir)
+- [ ] Layer 2: Agent state (reset context to checkpoint)
+- [ ] Layer 3: Git state (local: reset --soft, pushed: user decision)
+- [ ] Layer 4: External state (log calls, flag as inconsistent)
+
+#### Rollback Execution
+- [ ] `RollbackManager` coordinates all layers
+- [ ] `Rollback(pipelineID, options) (*RollbackReceipt, error)`
+- [ ] Atomic where possible (staging, git local)
+- [ ] User decision required for pushed commits
+- [ ] Never auto-revert pushed changes
+
+#### History Preservation
+- [ ] Archivalist marks attempt as "rolled_back" (doesn't forget)
+- [ ] Failure record preserved for learning
+- [ ] Queryable for future retry briefings
+
+#### Rollback Receipt
+- [ ] `RollbackReceipt` struct: what was undone, what couldn't be undone
+- [ ] Staged files discarded (count)
+- [ ] Agent context reset (yes/no)
+- [ ] Local commits removed (count)
+- [ ] Pushed commits (user action needed)
+- [ ] External calls logged (cannot undo)
+
+#### User Presentation
+- [ ] Receipt shown to user after rollback
+- [ ] Clear indication of what was undone
+- [ ] Warnings for external state inconsistency
+- [ ] Options for pushed commits
+
+**Tests:**
+- [ ] Staging rollback works
+- [ ] Agent state reset works
+- [ ] Local git rollback works
+- [ ] Pushed commits not auto-reverted
+- [ ] Receipt accurate
+- [ ] Archivalist records failure
+
+---
+
+### 0.33 Memory Monitor
+
+Implements per-component memory budgets with token-weighted eviction.
+
+**Files to create:**
+- `core/resources/memory_monitor.go`
+- `core/resources/eviction.go`
+
+**Dependencies:** Requires 0.11 (Signal Bus). Can run parallel with 0.26-0.32.
+
+**Acceptance Criteria:**
+
+#### Per-Component Budgets
+- [ ] `MemoryMonitor` struct tracks all components
+- [ ] `ComponentMemory` struct per component
+- [ ] Configurable budgets: QueryCache, Staging, AgentContext, WAL
+- [ ] Defaults: 500MB, 1GB, 500MB, 200MB
+
+#### Global Ceiling
+- [ ] Configurable global_ceiling_percent (default: 80%)
+- [ ] Calculate from system available memory
+- [ ] Query system memory periodically
+
+#### Eviction Cascade
+- [ ] 70% component → LRU eviction
+- [ ] 90% component → aggressive eviction + warn user
+- [ ] 80% global → pause new pipelines + cross-component eviction
+- [ ] 95% global → pause ALL + emergency eviction + notify user
+
+#### Token-Weighted Eviction (QueryCache)
+- [ ] `EvictionScore = TokenCost / MemorySize * RecencyFactor`
+- [ ] High token cost entries evicted LAST
+- [ ] Recency factor decays over hours
+- [ ] Sort by score, evict lowest first
+
+#### Monitoring Loop
+- [ ] Background goroutine checks at configurable interval (default: 1s)
+- [ ] Publish signals on threshold crossings
+- [ ] Never crash, never OOM
+
+**Tests:**
+- [ ] Component budgets enforced
+- [ ] Global ceiling enforced
+- [ ] Token-weighted eviction correct
+- [ ] Eviction cascade triggers at thresholds
+- [ ] Signals published correctly
+
+---
+
+### 0.34 Resource Pools
+
+Implements file handle, network, and subprocess pools with user reservation.
+
+**Files to create:**
+- `core/resources/pool.go`
+- `core/resources/file_pool.go`
+- `core/resources/network_pool.go`
+- `core/resources/process_pool.go`
+
+**Dependencies:** Requires 0.11 (Signal Bus). Can run parallel with 0.26-0.33.
+
+**Acceptance Criteria:**
+
+#### Generic Resource Pool
+- [ ] `ResourcePool` struct: total, userReserved, available, waitQueue
+- [ ] `AcquireUser(ctx) (*ResourceHandle, error)` - never fails
+- [ ] `AcquirePipeline(ctx, priority) (*ResourceHandle, error)` - may queue
+- [ ] `Release(handle)` - returns to pool
+
+#### User Reservation
+- [ ] Configurable user_reserved_percent (default: 20%)
+- [ ] User requests ALWAYS succeed (use reserved or preempt)
+- [ ] Preemption signals lowest-priority pipeline to pause
+
+#### Pipeline Queuing
+- [ ] Priority queue for waiting pipelines
+- [ ] Configurable pipeline_wait_timeout (default: 30s)
+- [ ] Timeout returns error (pipeline retries or fails)
+
+#### File Handle Pool
+- [ ] Query OS ulimit on startup
+- [ ] Use configurable percentage (default: 50%)
+- [ ] Track per-handle for leak detection
+
+#### Network Connection Pool
+- [ ] Per-provider limit (default: 10)
+- [ ] Global limit (default: 50)
+- [ ] Connection reuse where possible
+
+#### Subprocess Pool
+- [ ] Max = multiplier × N_CPU_CORES (default: 2×)
+- [ ] Track process IDs for cleanup
+
+**Tests:**
+- [ ] User acquisition never fails
+- [ ] User preempts pipeline when needed
+- [ ] Pipeline queuing works
+- [ ] Timeout returns error
+- [ ] Pool sizes respect config
+- [ ] Release returns resources correctly
+
+---
+
+### 0.35 Disk Quota Manager
+
+Implements auto-scaling disk quota with bounded percentage.
+
+**Files to create:**
+- `core/resources/disk_quota.go`
+
+**Dependencies:** Requires 0.11 (Signal Bus). Can run parallel with 0.26-0.34.
+
+**Acceptance Criteria:**
+
+#### Quota Calculation
+- [ ] `DiskQuotaManager` struct
+- [ ] `CalculateQuota() int64` - returns effective quota
+- [ ] Formula: `max(quota_min, min(quota_max, free_space * quota_percent))`
+- [ ] Defaults: min=1GB, max=20GB, percent=10%
+
+#### Usage Tracking
+- [ ] `CanWrite(size int64) bool`
+- [ ] `RecordWrite(size int64) error`
+- [ ] `RecordDelete(size int64)`
+- [ ] Periodic disk scan to reconcile actual vs tracked
+
+#### Thresholds
+- [ ] Warning at 80% (configurable)
+- [ ] Cleanup trigger at 90% (configurable)
+- [ ] Publish signals at thresholds
+
+#### Cleanup
+- [ ] `TriggerCleanup()` - remove old data
+- [ ] Priority: temp files, old WAL segments, old checkpoints, old staging
+- [ ] Never delete active session data
+
+**Tests:**
+- [ ] Quota calculation respects bounds
+- [ ] Usage tracking accurate
+- [ ] Thresholds trigger signals
+- [ ] Cleanup removes correct files
+- [ ] Quota adjusts to available space
+
+---
+
+### 0.36 Resource Broker
+
+Implements central coordinator for all-or-nothing resource allocation.
+
+**Files to create:**
+- `core/resources/broker.go`
+- `core/resources/allocation.go`
+
+**Dependencies:** Requires 0.33-0.35 (Memory, Pools, Disk).
+
+**Acceptance Criteria:**
+
+#### Resource Bundle
+- [ ] `ResourceBundle` struct: FileHandles, NetworkConns, Subprocesses, MemoryEstimate, DiskEstimate
+- [ ] Pipeline specifies required resources upfront
+- [ ] Broker validates all available before granting
+
+#### All-or-Nothing Allocation
+- [ ] `AcquireBundle(ctx, pipelineID, bundle, priority) (*AllocationSet, error)`
+- [ ] Check memory and disk first (non-blocking)
+- [ ] Acquire pools in fixed order (prevent deadlock)
+- [ ] On any failure: release already-acquired, return error
+
+#### Allocation Tracking
+- [ ] `AllocationSet` tracks all resources held by pipeline
+- [ ] `allocations` map for deadlock detection
+- [ ] Timestamp for debugging long-held resources
+
+#### User Bypass
+- [ ] `AcquireUser(ctx, bundle) (*AllocationSet, error)`
+- [ ] Uses reserved capacity in all pools
+- [ ] Never queues, never fails (preempts if needed)
+
+#### Release
+- [ ] `ReleaseBundle(alloc)` - atomic release of all resources
+- [ ] Wake waiting pipelines
+- [ ] Clear from allocation tracking
+
+#### Deadlock Detection (optional)
+- [ ] Configurable deadlock_detection (default: true)
+- [ ] Periodic check for cycles in wait graph
+- [ ] Alert if potential deadlock detected
+
+**Tests:**
+- [ ] All-or-nothing works
+- [ ] Partial failure releases acquired
+- [ ] User bypass works
+- [ ] Release wakes waiters
+- [ ] Fixed order prevents deadlock
+
+---
+
+### 0.37 Graceful Degradation Controller
+
+Implements priority-based pause/resume under resource pressure.
+
+**Files to create:**
+- `core/resources/degradation.go`
+
+**Dependencies:** Requires 0.33-0.36 (Resource System), 0.18 (Pipeline Scheduler), 0.23 (Checkpointer).
+
+**Acceptance Criteria:**
+
+#### Pressure Detection
+- [ ] Subscribe to resource warning signals
+- [ ] Memory pressure, disk pressure, pool exhaustion
+- [ ] Determine severity level
+
+#### Pause Selection
+- [ ] User-interactive: NEVER paused
+- [ ] Sort pipelines by: priority (asc), then age (desc, newest first)
+- [ ] Pause lowest-value pipelines first
+- [ ] Continue pausing until pressure relieved
+
+#### Pause Execution
+- [ ] Signal pipeline to pause via SignalBus
+- [ ] Pipeline checkpoints state
+- [ ] Pipeline releases resources to broker
+- [ ] Notify user: "Pipeline X paused due to resource pressure"
+
+#### Resume Logic
+- [ ] Monitor for pressure relief
+- [ ] Resume highest-priority paused pipeline first
+- [ ] Pipeline restores from checkpoint
+- [ ] Notify user: "Pipeline X resumed"
+- [ ] Gradual resume (don't flood)
+
+**Tests:**
+- [ ] User never paused
+- [ ] Lowest priority paused first
+- [ ] Checkpoint on pause
+- [ ] Resources released on pause
+- [ ] Resume order correct
+- [ ] Gradual resume works
+
+---
+
+### 0.38 Error & Resource Integration Tests
+
+End-to-end tests for error and resource systems.
+
+**Files to create:**
+- `core/errors/integration_test.go`
+- `core/resources/integration_test.go`
+
+**Dependencies:** Requires 0.26-0.37.
+
+**Acceptance Criteria:**
+
+#### Error System Tests
+- [ ] 5-tier classification works end-to-end
+- [ ] Transient frequency detection + notification
+- [ ] Circuit breaker trips and recovers
+- [ ] Escalation chain works through all levels
+- [ ] Retry briefing improves retry success
+- [ ] Rollback cleans up correctly
+
+#### Resource System Tests
+- [ ] Memory pressure triggers eviction cascade
+- [ ] Token-weighted eviction preserves expensive entries
+- [ ] Resource pools respect user reservation
+- [ ] Disk quota auto-scales correctly
+- [ ] Broker all-or-nothing works under load
+- [ ] Graceful degradation pauses correct pipelines
+
+#### Integration Tests
+- [ ] Error during resource pressure handled correctly
+- [ ] Circuit breaker + resource exhaustion combo
+- [ ] Rollback releases resources
+- [ ] Recovery after pressure-induced pause
+
+#### Stress Tests
+- [ ] Many concurrent errors classified correctly
+- [ ] Resource pressure during error storm
+- [ ] No resource leaks
+- [ ] No goroutine leaks
+
+**Tests:**
+- [ ] All integration scenarios pass
+- [ ] No race conditions (run with -race)
+- [ ] Performance acceptable under load
+
+---
+
+### Error & Resource Parallelization Notes
+
+The following tasks can be executed in parallel:
+- **Group E1**: 0.26 (no dependencies, can start immediately)
+- **Group E2**: 0.27, 0.28, 0.29 (depend on 0.26, can run parallel with each other)
+- **Group E3**: 0.30 → 0.31 → 0.32 (sequential chain)
+- **Group R1**: 0.33, 0.34, 0.35 (no dependencies on error system, parallel with E1-E3)
+- **Group R2**: 0.36 → 0.37 (depend on R1)
+
+Optimal execution order:
+1. Start 0.26, 0.33, 0.34, 0.35 in parallel
+2. When 0.26 completes → start 0.27, 0.28, 0.29 in parallel
+3. When 0.27, 0.28, 0.29 complete → start 0.30
+4. When 0.30 completes → start 0.31
+5. When 0.31 completes → start 0.32
+6. When 0.33, 0.34, 0.35 complete → start 0.36
+7. When 0.36 completes → start 0.37
+8. When 0.32 and 0.37 complete → start 0.38
+
+Cross-group dependencies:
+- 0.30 (Escalation) needs 0.29 (Circuit Breaker)
+- 0.32 (Rollback) needs 0.20 (Staging), 0.22-0.24 (WAL/Checkpoint)
+- 0.37 (Degradation) needs 0.18 (Scheduler), 0.23 (Checkpointer)
+
+---
+
+### 0.39 Session Registry
+
+Implements SQLite-based cross-session coordination and discovery.
+
+**Files to create:**
+- `core/session/registry.go`
+- `core/session/schema.sql`
+
+**Dependencies:** None (can start immediately, parallel with 0.26-0.38).
+
+**Acceptance Criteria:**
+
+#### Database Schema
+- [ ] SQLite database at `~/.sylk/state.db`
+- [ ] WAL mode enabled for concurrent access
+- [ ] Sessions table: session_id, pid, start_time, last_heartbeat, activity_score, running_pipelines, allocated_slots
+- [ ] Allocations table: session_id, resource_type, allocated_count
+- [ ] Migrations support for schema updates
+
+#### Session Lifecycle
+- [ ] `Register(sessionID string) error` - add session to registry
+- [ ] `Unregister(sessionID string) error` - remove session
+- [ ] `Heartbeat(sessionID, runningPipelines, recentInvocations) error` - update liveness
+- [ ] Activity score calculation: `running_pipelines + recent_invocations × decay_rate`
+- [ ] Configurable heartbeat interval (default: 1s)
+
+#### Session Discovery
+- [ ] `GetActiveSessions() ([]SessionRecord, error)` - all non-stale sessions
+- [ ] `GetSession(sessionID) (*SessionRecord, error)` - single session
+- [ ] Configurable stale threshold (default: 10s)
+- [ ] `CleanupStaleSessions() error` - remove dead sessions
+
+#### Process Validation
+- [ ] Verify PID still running on session lookup
+- [ ] Remove sessions with dead PIDs
+- [ ] Handle PID reuse (check start time)
+
+**Tests:**
+- [ ] Session registration works
+- [ ] Heartbeat updates activity score
+- [ ] Stale detection works
+- [ ] Concurrent access safe (WAL)
+- [ ] Dead PID detection works
+
+---
+
+### 0.40 Fair Share Calculator
+
+Implements activity-based resource allocation across sessions.
+
+**Files to create:**
+- `core/session/fair_share.go`
+
+**Dependencies:** Requires 0.39 (Session Registry).
+
+**Acceptance Criteria:**
+
+#### Allocation Model
+- [ ] `FairShareCalculator` struct
+- [ ] Three-tier model: User (absolute), Active (proportional), Idle (baseline)
+- [ ] User reserved: configurable percent (default: 20%) of all pools
+- [ ] Idle baseline: configurable slots (default: 1) per idle session
+
+#### Fair Share Calculation
+- [ ] `Calculate(totalSlots int) (map[string]SessionAllocation, error)`
+- [ ] Active share = `(session_score / total_score) × remaining_capacity`
+- [ ] Minimum 1 slot for any active session
+- [ ] Rebalance on: session join, session leave, significant activity change
+
+#### SessionAllocation Struct
+- [ ] SubprocessSlots, FileHandleSlots, NetworkSlots, MemoryBudget
+- [ ] All resource types scaled by same fair share ratio
+
+#### Rebalancing
+- [ ] Configurable rebalance interval (default: 500ms)
+- [ ] Publish rebalance signal when allocations change significantly (>10%)
+- [ ] Sessions adjust to new allocation within grace period
+
+**Tests:**
+- [ ] Two equal sessions split evenly
+- [ ] High activity session gets more
+- [ ] Idle session gets baseline only
+- [ ] Rebalance triggers correctly
+- [ ] Edge case: single session gets all
+
+---
+
+### 0.41 Signal Dispatcher
+
+Implements fsnotify-based cross-session signaling.
+
+**Files to create:**
+- `core/session/signal_dispatcher.go`
+- `core/session/signals.go`
+
+**Dependencies:** Requires 0.39 (Session Registry).
+
+**Acceptance Criteria:**
+
+#### Signal Directory Structure
+- [ ] Base: `~/.sylk/signals/`
+- [ ] Per-session: `~/.sylk/signals/<session-id>/`
+- [ ] Signal files: `<type>-<timestamp>.signal`
+- [ ] Auto-create directories on session start
+
+#### Signal Types
+- [ ] `SignalPreempt`: User needs resources NOW
+- [ ] `SignalPressure`: Memory/disk pressure alert
+- [ ] `SignalRebalance`: Fair share changed
+- [ ] `SignalShutdown`: Session ending
+
+#### CrossSessionSignal Struct
+- [ ] Type, FromSession, ToSession (empty=broadcast), Timestamp, Payload
+- [ ] JSON serialization
+
+#### Send Operations
+- [ ] `SendSignal(signal CrossSessionSignal) error`
+- [ ] Targeted: write to specific session's directory
+- [ ] Broadcast: write to all session directories (except self)
+
+#### Receive Operations
+- [ ] `Watch(ctx context.Context) error` - start watching
+- [ ] fsnotify on session's signal directory
+- [ ] Parse and dispatch to registered handlers
+- [ ] Delete signal file after processing (consume)
+
+#### Handler Registration
+- [ ] `RegisterHandler(signalType, handler func(CrossSessionSignal))`
+- [ ] Multiple handlers per type allowed
+
+**Tests:**
+- [ ] Signal delivery works (same machine)
+- [ ] Broadcast reaches all sessions
+- [ ] Signal consumed after processing
+- [ ] Handlers invoked correctly
+- [ ] Cleanup on session shutdown
+
+---
+
+### 0.42 Cross-Session Resource Pool
+
+Extends resource pools (0.34) with cross-session fair share enforcement.
+
+**Files to create:**
+- `core/session/cross_session_pool.go`
+
+**Dependencies:** Requires 0.34 (Resource Pools), 0.40 (Fair Share), 0.41 (Signal Dispatcher).
+
+**Acceptance Criteria:**
+
+#### Pool Integration
+- [ ] `CrossSessionPool` wraps `ResourcePool`
+- [ ] Enforces per-session allocation limits from fair share
+- [ ] Tracks allocations per session in registry
+
+#### Acquisition with Fair Share
+- [ ] `Acquire(ctx, sessionID, priority) (*ResourceHandle, error)`
+- [ ] Check session's remaining allocation
+- [ ] If over allocation: queue (pipeline) or preempt (user)
+- [ ] Update registry allocation count
+
+#### Cross-Session Preemption
+- [ ] User request can preempt pipelines in OTHER sessions
+- [ ] Find lowest-priority pipeline across all sessions
+- [ ] Send preempt signal to that session
+- [ ] Wait for slot release (with timeout)
+- [ ] If timeout: escalate to next lowest priority
+
+#### Release with Rebalance
+- [ ] `Release(handle)` - standard release
+- [ ] Decrement session's allocation count
+- [ ] If other sessions waiting: signal availability
+
+#### Allocation Queries
+- [ ] `GetSessionAllocation(sessionID) int`
+- [ ] `GetTotalAllocated() int`
+- [ ] `GetWaitingCount() int`
+
+**Tests:**
+- [ ] Fair share enforced per session
+- [ ] Cross-session preemption works
+- [ ] User from Session A preempts Session B's pipeline
+- [ ] Allocation tracking accurate
+- [ ] Release wakes correct waiters
+
+---
+
+### 0.43 Tool Executor
+
+Implements subprocess spawning with hybrid direct/shell execution.
+
+**Files to create:**
+- `core/tools/executor.go`
+- `core/tools/process_group.go`
+
+**Dependencies:** Requires 0.42 (Cross-Session Pool).
+
+**Acceptance Criteria:**
+
+#### Spawn Decision
+- [ ] `ToolExecutor` struct with configurable shell patterns
+- [ ] Default shell patterns: `|`, `&&`, `||`, `;`, `*`, `?`, `$`, backtick
+- [ ] `needsShell(command string) bool`
+- [ ] Direct: `exec.CommandContext(ctx, cmd, args...)`
+- [ ] Shell: `exec.CommandContext(ctx, "sh", "-c", command)`
+
+#### Environment Handling
+- [ ] Inherit parent environment
+- [ ] Apply blocklist filter (strip sensitive vars)
+- [ ] Default blocklist: `*_API_KEY`, `*_SECRET`, `*_TOKEN`, etc.
+- [ ] Merge additional env vars from invocation
+
+#### Working Directory
+- [ ] `validateWorkingDir(dir string) error`
+- [ ] Must be absolute path
+- [ ] Resolve symlinks
+- [ ] Check against allowed boundaries (project, staging, temp)
+- [ ] Reject if outside boundaries
+
+#### Process Group (Unix)
+- [ ] `ProcessGroup` struct
+- [ ] `Setup(cmd)`: set `Setpgid: true`
+- [ ] `Signal(sig)`: `syscall.Kill(-pgid, sig)`
+- [ ] `Kill()`: SIGKILL to process group
+
+#### Process Group (Windows)
+- [ ] Job Object creation
+- [ ] `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+- [ ] `TerminateJobObject` for kill
+
+#### Pool Integration
+- [ ] Acquire subprocess slot before spawn
+- [ ] Release slot on completion/kill
+- [ ] Track active processes for cleanup
+
+**Tests:**
+- [ ] Direct execution works
+- [ ] Shell execution works
+- [ ] Shell detection correct
+- [ ] Env blocklist filters correctly
+- [ ] Working dir validation works
+- [ ] Process group kills children
+
+---
+
+### 0.44 Adaptive Timeout
+
+Implements timeout extension based on meaningful output.
+
+**Files to create:**
+- `core/tools/adaptive_timeout.go`
+
+**Dependencies:** None (can run parallel with 0.43).
+
+**Acceptance Criteria:**
+
+#### Timeout Configuration
+- [ ] `AdaptiveTimeoutConfig` struct
+- [ ] `base_timeout`: starting timeout (from tool config or default)
+- [ ] `extend_on_output`: extension duration (default: 30s)
+- [ ] `max_timeout`: hard ceiling (default: 30m)
+- [ ] Per-tool timeout overrides
+
+#### Noise Detection
+- [ ] Configurable noise patterns (regex)
+- [ ] Default noise: dots, spinners, percentages alone
+- [ ] `isNoise(line string) bool`
+
+#### Timeout Extension
+- [ ] `OnOutput(line string)` - called for each line
+- [ ] If not noise: update `lastOutputTime`
+- [ ] `ShouldTimeout(started time.Time) bool`
+- [ ] False if: recent meaningful output within extension window
+- [ ] True if: elapsed > base AND no recent output, OR elapsed > max
+
+#### Integration
+- [ ] Output streamer calls `OnOutput` for each line
+- [ ] Executor checks `ShouldTimeout` periodically
+- [ ] Kill sequence triggered when timeout
+
+**Tests:**
+- [ ] Base timeout triggers without output
+- [ ] Meaningful output extends timeout
+- [ ] Noise doesn't extend timeout
+- [ ] Max timeout caps extension
+- [ ] Per-tool config works
+
+---
+
+### 0.45 Kill Sequence Manager
+
+Implements SIGINT → SIGTERM → SIGKILL escalation with configurable timings.
+
+**Files to create:**
+- `core/tools/kill_sequence.go`
+
+**Dependencies:** Requires 0.43 (Tool Executor - process groups).
+
+**Acceptance Criteria:**
+
+#### Kill Sequence
+- [ ] `KillSequenceManager` struct
+- [ ] Configurable: `sigint_grace` (default: 5s), `sigterm_grace` (default: 3s)
+- [ ] `Execute(pg *ProcessGroup) KillResult`
+
+#### Sequence Execution
+- [ ] Send SIGINT to process group
+- [ ] Wait up to `sigint_grace` for exit
+- [ ] If still running: send SIGTERM
+- [ ] Wait up to `sigterm_grace` for exit
+- [ ] If still running: send SIGKILL
+
+#### KillResult
+- [ ] SentSIGINT, SentSIGTERM, SentSIGKILL bools
+- [ ] ExitedAfter: which signal caused exit
+- [ ] Duration: total time to kill
+
+#### User Feedback Integration
+- [ ] Publish progress to Signal Bus
+- [ ] "Stopping..." on SIGINT
+- [ ] "Force stopping..." on SIGTERM
+- [ ] "Killed" on SIGKILL
+
+**Tests:**
+- [ ] Clean exit on SIGINT
+- [ ] Escalation to SIGTERM works
+- [ ] Escalation to SIGKILL works
+- [ ] Timing respected
+- [ ] Process group killed (not just parent)
+
+---
+
+### 0.46 Output Handler
+
+Implements streaming output with smart truncation and progressive disclosure.
+
+**Files to create:**
+- `core/tools/output_handler.go`
+- `core/tools/smart_truncator.go`
+- `core/tools/importance_detector.go`
+
+**Dependencies:** None (can run parallel with 0.43-0.45).
+
+**Acceptance Criteria:**
+
+#### Output Streaming
+- [ ] `OutputHandler` struct
+- [ ] `CreateStreams(streamTo io.Writer) (stdout, stderr io.Writer)`
+- [ ] Tee: write to user stream AND buffer
+- [ ] Line-by-line streaming (flush on newline)
+
+#### Smart Truncator
+- [ ] `SmartTruncator` struct
+- [ ] Configurable: `keep_first_lines` (default: 50), `keep_last_lines` (default: 100)
+- [ ] Configurable: `max_buffer_size` (default: 1MB)
+- [ ] `Truncate(stdout, stderr []byte) *TruncatedOutput`
+
+#### Importance Detection
+- [ ] `ImportanceDetector` with configurable patterns
+- [ ] Default patterns: error, warning, failed, exception, panic, file:line:col, stack trace
+- [ ] `IsImportant(line string) bool`
+- [ ] Extract all important lines during truncation
+
+#### TruncatedOutput
+- [ ] Summary: "N errors, M warnings in X lines"
+- [ ] ImportantLines: all lines matching patterns
+- [ ] FirstLines: first N lines
+- [ ] LastLines: last M lines
+- [ ] TotalLines, Truncated bool
+
+#### Progressive Disclosure
+- [ ] `ProcessOutput(tool, stdout, stderr) *ProcessedOutput`
+- [ ] If parser available: return parsed only
+- [ ] Else: return smart-truncated
+- [ ] Full raw available on explicit request
+
+**Tests:**
+- [ ] Streaming works in real-time
+- [ ] Truncation keeps important lines
+- [ ] First/last lines preserved
+- [ ] Summary accurate
+- [ ] Large output handled
+
+---
+
+### 0.47 Tool Output Parsers
+
+Implements parsers for common development tools.
+
+**Files to create:**
+- `core/tools/parsers/parser.go`
+- `core/tools/parsers/go_parser.go`
+- `core/tools/parsers/npm_parser.go`
+- `core/tools/parsers/pytest_parser.go`
+- `core/tools/parsers/eslint_parser.go`
+- `core/tools/parsers/git_parser.go`
+
+**Dependencies:** Requires 0.46 (Output Handler).
+
+**Acceptance Criteria:**
+
+#### Parser Interface
+- [ ] `OutputParser` interface: `Parse(stdout, stderr []byte) (interface{}, error)`
+- [ ] Each parser returns tool-specific struct
+- [ ] Parser registry: `map[string]OutputParser`
+
+#### Go Parser
+- [ ] Parse `go build` errors: file, line, column, message
+- [ ] Parse `go test` output: pass/fail per test, duration, coverage
+- [ ] Parse `go vet` warnings
+
+#### NPM Parser
+- [ ] Parse `npm install` output: installed packages, warnings
+- [ ] Parse `npm run build` errors
+- [ ] Parse `npm test` (jest format)
+
+#### Pytest Parser
+- [ ] Parse test results: pass/fail/skip per test
+- [ ] Parse failure details: assertion, traceback
+- [ ] Parse coverage if present
+
+#### ESLint Parser
+- [ ] Parse lint errors: file, line, rule, message, severity
+- [ ] Support JSON output format (--format json)
+- [ ] Fallback to text parsing
+
+#### Git Parser
+- [ ] Parse `git status`: staged, unstaged, untracked files
+- [ ] Parse `git diff`: changed files, additions, deletions
+- [ ] Parse `git log`: commits with hash, author, message
+
+#### Extensibility
+- [ ] `RegisterParser(toolPattern, parser)` for custom parsers
+- [ ] Tool pattern supports glob (e.g., "npm *", "go *")
+
+**Tests:**
+- [ ] Each parser handles typical output
+- [ ] Each parser handles error cases
+- [ ] Parser selection by tool name works
+- [ ] Custom parser registration works
+
+---
+
+### 0.48 Parse Template Cache
+
+Implements caching of LLM-learned parse templates via Archivalist.
+
+**Files to create:**
+- `core/tools/parsers/template_cache.go`
+
+**Dependencies:** Requires 0.47 (Parsers), Archivalist integration.
+
+**Acceptance Criteria:**
+
+#### Template Structure
+- [ ] `ParseTemplate` struct: tool pattern, extraction rules, example
+- [ ] Extraction rules: regex patterns for key fields
+- [ ] Validated against example before caching
+
+#### Cache Operations
+- [ ] `Get(tool string) *ParseTemplate`
+- [ ] `Store(tool string, template *ParseTemplate)`
+- [ ] Backed by Archivalist (persistent across sessions)
+- [ ] In-memory cache for fast lookup
+
+#### LLM Template Learning
+- [ ] When no parser and no template: request LLM to create template
+- [ ] LLM returns: field names, regex patterns, example parsing
+- [ ] Validate template against actual output
+- [ ] If valid: cache in Archivalist
+
+#### Template Application
+- [ ] `Apply(template, stdout, stderr) (interface{}, error)`
+- [ ] Apply regex patterns to extract fields
+- [ ] Return structured result matching parser interface
+
+**Tests:**
+- [ ] Template caching works
+- [ ] Template retrieval works
+- [ ] LLM-generated template applied correctly
+- [ ] Invalid templates rejected
+- [ ] Cross-session persistence works
+
+---
+
+### 0.49 Filesystem Manager
+
+Implements safe file operations with write abstraction and symlink boundary checking.
+
+**Files to create:**
+- `core/tools/filesystem.go`
+- `core/tools/symlink_resolver.go`
+
+**Dependencies:** Requires 0.20 (Staging), 0.39 (Session Registry).
+
+**Acceptance Criteria:**
+
+#### Read Path (Direct)
+- [ ] Direct `os.ReadFile` for reads
+- [ ] No abstraction overhead
+- [ ] Permission errors returned as-is
+
+#### Write Path (Abstracted)
+- [ ] `Write(path, content, perm) error`
+- [ ] Pre-check permission (user feedback)
+- [ ] Resolve and validate symlinks
+- [ ] Route to staging if in pipeline
+- [ ] Audit log write operation
+- [ ] Actual write to resolved path
+
+#### Symlink Boundary Check
+- [ ] `resolveWithBoundaryCheck(path) (string, error)`
+- [ ] Follow symlinks (configurable)
+- [ ] Allowed boundaries: project root, staging, temp, configured extras
+- [ ] Reject if resolved path outside boundaries
+- [ ] Clear error message with resolution path
+
+#### Temp Directory Hierarchy
+- [ ] `GetTempDir() string` returns appropriate temp
+- [ ] Pipeline: `~/.sylk/tmp/<session-id>/pipeline-<id>/`
+- [ ] Standalone: `~/.sylk/tmp/<session-id>/standalone/`
+- [ ] Auto-create on first use
+
+#### Cleanup
+- [ ] Pipeline temp cleaned on pipeline completion
+- [ ] Session temp cleaned on session end
+- [ ] Orphan cleanup for crashed sessions
+
+**Tests:**
+- [ ] Reads work directly
+- [ ] Writes go through abstraction
+- [ ] Symlink escape blocked
+- [ ] Staging routing works
+- [ ] Temp hierarchy correct
+- [ ] Cleanup removes directories
+
+---
+
+### 0.50 Tool Cancellation Manager
+
+Implements cascading cancellation with cleanup and partial result preservation.
+
+**Files to create:**
+- `core/tools/cancellation.go`
+
+**Dependencies:** Requires 0.43-0.45 (Executor, Timeout, Kill Sequence).
+
+**Acceptance Criteria:**
+
+#### Cascading Timeouts
+- [ ] Total budget: configurable (default: 30s)
+- [ ] Agent level: budget - 5s
+- [ ] Tool level: agent_budget - 5s
+- [ ] Process level: SIGINT(5s) + SIGTERM(3s) + SIGKILL(instant)
+- [ ] Each level respects remaining budget
+
+#### Cancellation Flow
+- [ ] `Cancel(ctx context.Context) error`
+- [ ] Propagate cancel to all running tools in agent
+- [ ] Each tool initiates kill sequence
+- [ ] Collect results (success, partial, timeout)
+
+#### Cleanup Phase
+- [ ] Budget: 5s (best-effort)
+- [ ] Kill orphan processes (process group)
+- [ ] Remove tool's temp files
+- [ ] Release file locks (if any)
+- [ ] Release pool slots
+- [ ] If cleanup times out: log warning, continue
+
+#### Partial Results
+- [ ] Preserve output captured before cancel
+- [ ] Mark result: `Partial = true`
+- [ ] Include reason: "cancelled by user" / "timeout"
+- [ ] Agent can inspect partial output
+
+#### User Feedback
+- [ ] "Cancelling operation..."
+- [ ] "Stopping [tool]..."
+- [ ] "Force stopping [tool]..."
+- [ ] "Killed [tool]"
+- [ ] "Cleanup incomplete, temp files may remain" (if cleanup timeout)
+
+**Tests:**
+- [ ] Cancellation stops all tools
+- [ ] Cascading budget respected
+- [ ] Cleanup runs within budget
+- [ ] Partial results preserved
+- [ ] User sees progress
+
+---
+
+### 0.51 Tool Output Cache
+
+Implements caching for deterministic tool invocations.
+
+**Files to create:**
+- `core/tools/output_cache.go`
+
+**Dependencies:** None (can run parallel with 0.43-0.50).
+
+**Acceptance Criteria:**
+
+#### Cache Configuration
+- [ ] `ToolCacheConfig` struct
+- [ ] `max_entries`: maximum cache entries (default: 1000)
+- [ ] `max_size`: maximum total size (default: 100MB)
+- [ ] `ttl`: time-to-live (default: 5m)
+- [ ] Per-tool cache policy: cacheable, ttl, invalidate_on patterns
+
+#### Input Hashing
+- [ ] `ComputeInputHash(invocation) string`
+- [ ] Hash: command + args + working_dir
+- [ ] For file-based tools: include file content hashes
+- [ ] Configurable per-tool which inputs matter
+
+#### Cache Operations
+- [ ] `Get(tool, inputHash) (*ToolResult, bool)`
+- [ ] `Put(tool, inputHash, result)`
+- [ ] Respect per-tool TTL
+- [ ] Evict on max_entries or max_size exceeded
+
+#### Invalidation
+- [ ] File change invalidates matching cache entries
+- [ ] `invalidate_on` patterns per tool (e.g., "*.js" for eslint)
+- [ ] Watch project files for changes (optional)
+- [ ] Manual `Invalidate(tool)` for explicit clear
+
+#### Default Cacheable Tools
+- [ ] eslint, prettier, go vet (deterministic on same input)
+- [ ] NOT: go test (may have side effects), npm install (network)
+
+**Tests:**
+- [ ] Cache hit returns stored result
+- [ ] Cache miss returns not found
+- [ ] TTL expiration works
+- [ ] File change invalidates
+- [ ] Size limit enforced
+
+---
+
+### 0.52 Tool Invocation Batcher
+
+Implements batching for tools that support multiple file inputs.
+
+**Files to create:**
+- `core/tools/batcher.go`
+
+**Dependencies:** Requires 0.43 (Tool Executor).
+
+**Acceptance Criteria:**
+
+#### Batch Configuration
+- [ ] Per-tool batch support: max_files, separator
+- [ ] Default batch-capable: eslint, prettier, go vet, go build
+- [ ] Non-batchable: tools with single-file semantics
+
+#### Batch Collection
+- [ ] `Batcher` collects invocations for same tool
+- [ ] Within configurable window (default: 100ms)
+- [ ] Up to max_files per batch
+
+#### Batch Execution
+- [ ] Combine file args: `eslint file1.js file2.js file3.js`
+- [ ] Single subprocess instead of N
+- [ ] Parse output to attribute results to individual files
+
+#### Result Attribution
+- [ ] Split batch result back to individual invocations
+- [ ] Each caller receives their file's result
+- [ ] Handle partial failures (some files error, others don't)
+
+#### Fallback
+- [ ] If batching fails: fall back to individual execution
+- [ ] Log warning about batch failure
+
+**Tests:**
+- [ ] Batching reduces subprocess count
+- [ ] Results attributed correctly
+- [ ] Non-batchable tools not batched
+- [ ] Partial failure handled
+- [ ] Fallback works
+
+---
+
+### 0.53 Streaming Output Parser
+
+Implements real-time parsing during tool execution.
+
+**Files to create:**
+- `core/tools/parsers/streaming_parser.go`
+
+**Dependencies:** Requires 0.47 (Parsers), 0.46 (Output Handler).
+
+**Acceptance Criteria:**
+
+#### Streaming Interface
+- [ ] `StreamingParser` interface: `OnLine(line string) []ParsedEvent`
+- [ ] Returns parsed events as they're detected
+- [ ] Events: Error, Warning, TestResult, Progress
+
+#### ParsedEvent Types
+- [ ] `ErrorEvent`: file, line, column, message, severity
+- [ ] `WarningEvent`: file, line, message
+- [ ] `TestResultEvent`: name, status (pass/fail/skip), duration
+- [ ] `ProgressEvent`: percent, message
+
+#### Real-Time Detection
+- [ ] Error patterns detected immediately
+- [ ] Agent notified of errors before completion
+- [ ] Can decide to cancel early if fatal error
+
+#### Tool-Specific Streaming Parsers
+- [ ] Go test: stream test pass/fail as they complete
+- [ ] Pytest: stream test results
+- [ ] Webpack/Vite: stream compilation errors
+
+#### Integration
+- [ ] Output handler calls `OnLine` for each line
+- [ ] Parsed events published to Signal Bus
+- [ ] Agent subscribes to events for early notification
+
+**Tests:**
+- [ ] Errors detected in real-time
+- [ ] Events published immediately
+- [ ] Agent receives events during execution
+- [ ] Early cancellation on fatal error
+
+---
+
+### 0.54 Tool Execution Integration Tests
+
+End-to-end tests for tool execution system.
+
+**Files to create:**
+- `core/tools/integration_test.go`
+- `core/session/integration_test.go`
+
+**Dependencies:** Requires 0.39-0.53.
+
+**Acceptance Criteria:**
+
+#### Multi-Session Tests
+- [ ] Two sessions share subprocess pool fairly
+- [ ] User in Session A preempts Session B's pipeline tool
+- [ ] Session join/leave rebalances allocations
+- [ ] Stale session cleanup works
+
+#### Tool Execution Tests
+- [ ] Simple command executes correctly
+- [ ] Shell command with pipes works
+- [ ] Adaptive timeout extends on output
+- [ ] Kill sequence terminates hung process
+- [ ] Process group kills all children
+
+#### Output Handling Tests
+- [ ] Streaming output reaches user in real-time
+- [ ] Smart truncation preserves important lines
+- [ ] Parser extracts structured data
+- [ ] Cache hit returns cached result
+
+#### Cancellation Tests
+- [ ] User cancel stops all tools
+- [ ] Partial results preserved
+- [ ] Cleanup completes within budget
+- [ ] Cleanup timeout handled gracefully
+
+#### Filesystem Tests
+- [ ] Symlink escape blocked
+- [ ] Pipeline writes go to staging
+- [ ] Temp cleanup on completion/failure
+
+#### Stress Tests
+- [ ] Many concurrent tool invocations
+- [ ] High output volume
+- [ ] Rapid cancel/restart cycles
+- [ ] No resource leaks
+
+**Tests:**
+- [ ] All integration scenarios pass
+- [ ] No race conditions (run with -race)
+- [ ] Performance acceptable
+
+---
+
+### Tool Execution Parallelization Notes
+
+The following tasks can be executed in parallel:
+- **Group T1**: 0.39, 0.44, 0.46, 0.51 (no dependencies)
+- **Group T2**: 0.40, 0.41 (depend on 0.39)
+- **Group T3**: 0.42 → 0.43 → 0.45, 0.50, 0.52 (sequential)
+- **Group T4**: 0.47 → 0.48, 0.53 (parser chain)
+- **Group T5**: 0.49 (depends on 0.20, 0.39)
+
+Optimal execution order:
+1. Start 0.39, 0.44, 0.46, 0.51 in parallel
+2. When 0.39 completes → start 0.40, 0.41, 0.49 in parallel
+3. When 0.40, 0.41 complete → start 0.42
+4. When 0.42 completes → start 0.43
+5. When 0.43 completes → start 0.45, 0.50, 0.52 in parallel
+6. When 0.46 completes → start 0.47
+7. When 0.47 completes → start 0.48, 0.53 in parallel
+8. When all 0.39-0.53 complete → start 0.54
+
+Cross-group dependencies:
+- 0.42 needs 0.34 (Resource Pools from Tier 1)
+- 0.49 needs 0.20 (Staging from Concurrency)
+- 0.48 needs Archivalist agent
+
+---
+
+## Session Architecture
+
+### Session Isolation Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              SESSION ISOLATION MODEL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  SESSION-LOCAL (Isolated per session):                                              │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                │ │
+│  │  • Guide routing state (pending requests, session route cache)                 │ │
+│  │  • Agent instances (Architect, Orchestrator, Engineers, Inspector, Tester)     │ │
+│  │  • Workflow state (current DAG, phase, progress)                               │ │
+│  │  • Session context (metadata, branch, user preferences)                        │ │
+│  │  • Bus subscriptions (session-scoped topics)                                   │ │
+│  │                                                                                │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+│  SESSION-SHARED (Read-only access across sessions):                                 │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                │ │
+│  │  • Archivalist historical DB (query across sessions, write to own session)     │ │
+│  │  • Librarian index (shared codebase, read-only)                                │ │
+│  │  • Academic sources (shared research, read-only)                               │ │
+│  │  • Global route cache (common routes, read-only fallback)                      │ │
+│  │                                                                                │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+│  CONTEXT POLLUTION PREVENTION:                                                      │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                │ │
+│  │  • All writes tagged with session ID                                           │ │
+│  │  • Default queries filtered by session ID                                      │ │
+│  │  • Cross-session queries explicit and read-only                                │ │
+│  │  • No shared mutable state between sessions                                    │ │
+│  │  • Agent instances never shared (except Librarian, Academic, Archivalist)      │ │
+│  │                                                                                │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Session Lifecycle
+
+```
+CREATE          ACTIVE              PAUSE              RESUME            COMPLETE
+   │               │                   │                  │                  │
+   ▼               ▼                   ▼                  ▼                  ▼
+┌──────┐      ┌────────┐          ┌────────┐        ┌────────┐        ┌──────────┐
+│Create│─────▶│ Active │─────────▶│ Paused │───────▶│ Active │───────▶│ Complete │
+│State │      │Working │          │Saved   │        │Restored│        │ Archived │
+└──────┘      └────────┘          └────────┘        └────────┘        └──────────┘
+   │               │                   │                  │                  │
+   │               │                   │                  │                  │
+   │          ┌────┴────┐              │                  │                  │
+   │          ▼         ▼              │                  │                  │
+   │     Execute    Interrupt          │                  │                  │
+   │     Workflow   (User)             │                  │                  │
+   │          │         │              │                  │                  │
+   │          └────┬────┘              │                  │                  │
+   │               │                   │                  │                  │
+   │               └───────────────────┘                  │                  │
+   │                                                      │                  │
+   └──────────────────────────────────────────────────────┘                  │
+                                                                             │
+                      Archivalist stores all session history ◀───────────────┘
+```
+
+---
+
+## Concurrency Design Principles
+
+### 1. All Messages Through Guide
+```go
+// CORRECT: Route through Guide
+guide.PublishRequest(&RouteRequest{
+    SessionID:     session.ID(),
+    Input:         "query codebase for middleware",
+    TargetAgentID: "librarian",
+})
+
+// WRONG: Direct agent call
+librarian.Query("middleware") // Never do this between agents
+```
+
+### 2. Session-Scoped State
+```go
+// All state operations include session context
+store.Insert(entry, session.ID())
+cache.Get(key, session.ID())
+pending.Add(request, session.ID())
+```
+
+### 3. Shared Read, Isolated Write
+```go
+// Read from any session (explicit)
+archivalist.QueryCrossSession(query)
+
+// Write only to own session (enforced)
+archivalist.Store(entry) // Automatically tagged with session ID
+```
+
+### 4. Bounded Concurrency
+```go
+type SessionConfig struct {
+    MaxConcurrentTasks int // e.g., 50
+    MaxEngineers       int // e.g., 20
+}
+
+type SystemConfig struct {
+    MaxSessions        int // e.g., 100
+    MaxTotalEngineers  int // e.g., 500
+}
+```
+
+---
+
+## Existing Agent Modifications
+
+This section details the specific changes required to make the existing Guide and Archivalist agents compatible with the multi-session architecture.
+
+### Guide Agent Modifications (`agents/guide/`)
+
+The existing Guide agent needs significant modifications to support multi-session routing, session-scoped state, and the new agent ecosystem.
+
+#### Required Code Changes
+
+**1. Session-Aware Routing (`guide.go`)**
+```go
+// CURRENT: Single-session routing
+type Guide struct {
+    sessionID string
+    // ...
+}
+
+// REQUIRED: Multi-session support
+type Guide struct {
+    sessionManager    SessionManager           // Reference to session manager
+    sessionRouters    map[string]*SessionRouter // Per-session routing state
+    globalRouteCache  *RouteCache              // Shared route cache (read-only fallback)
+    sharedAgents      map[string]Agent         // Librarian, Academic, Archivalist
+    // ...
+}
+
+// Add session context to all routing methods
+func (g *Guide) RouteWithSession(ctx context.Context, sessionID string, req *RouteRequest) (*RouteResult, error)
+func (g *Guide) GetSessionRouter(sessionID string) (*SessionRouter, error)
+func (g *Guide) CreateSessionRouter(sessionID string) (*SessionRouter, error)
+func (g *Guide) CloseSessionRouter(sessionID string) error
+```
+
+**2. New SessionRouter Type (`session_router.go` - new file)**
+```go
+type SessionRouter struct {
+    sessionID        string
+    routeCache       *RouteCache           // Session-scoped cache
+    pendingRequests  *PendingRequestStore  // Session-scoped pending
+    agentRegistry    map[string]Agent      // Session-scoped agents (Architect, Orchestrator, etc.)
+    subscriptions    []func()              // Cleanup functions for session topics
+    mu               sync.RWMutex
+}
+```
+
+**3. Message Type Extensions (`types.go`)**
+- [ ] Add all new message types (DAG_EXECUTE, DAG_STATUS, DAG_CANCEL, etc.)
+- [ ] Add SessionID field to RouteRequest
+- [ ] Add SessionID field to RouteResult
+- [ ] Add message priority field
+- [ ] Add correlation ID for request/response matching
+
+**4. Bus Integration Updates (`bus.go`)**
+- [ ] Add session topic creation: `session.{id}.{agent}.{channel}`
+- [ ] Add session topic cleanup on session close
+- [ ] Add wildcard subscription support
+- [ ] Add message filtering by session ID
+
+**5. Skill System Updates (`skills.go` - new file)**
+- [ ] Implement `SkillLoader` interface for progressive disclosure
+- [ ] Add skill registration by tier (Core, Domain, Specialized)
+- [ ] Add skill loading triggers (domain keywords, explicit request)
+- [ ] Add skill unloading with LRU eviction
+- [ ] Add token budget tracking for loaded skills
+
+**6. Hook System Updates**
+- [ ] Add pre-route hook injection point
+- [ ] Add post-route hook injection point
+- [ ] Add pre-dispatch hook injection point
+- [ ] Add post-dispatch hook injection point
+- [ ] Implement hook chain execution with abort capability
+
+#### Required Interface Changes
+
+```go
+// Current Skills() signature - needs enhancement
+func (g *Guide) Skills() []skills.Skill
+
+// Required signature
+func (g *Guide) Skills() []skills.Skill                    // Core skills (always loaded)
+func (g *Guide) ExtendedSkills() []skills.Skill            // Extended skills (on demand)
+func (g *Guide) LoadSkill(name string) error               // Load specific skill
+func (g *Guide) UnloadSkill(name string) error             // Unload skill
+func (g *Guide) LoadedSkills() []string                    // Currently loaded skills
+func (g *Guide) SkillTokenBudget() (used int, max int)     // Token tracking
+
+// Current Hooks() signature - needs enhancement
+func (g *Guide) Hooks() skills.AgentHooks
+
+// Required hook types
+type GuideHooks struct {
+    PreRoute     []func(ctx context.Context, req *RouteRequest) (*RouteRequest, error)
+    PostRoute    []func(ctx context.Context, req *RouteRequest, result *RouteResult) error
+    PreDispatch  []func(ctx context.Context, target string, msg *Message) (*Message, error)
+    PostDispatch []func(ctx context.Context, target string, msg *Message, result any) error
+}
+```
+
+#### Required New Methods
+
+```go
+// Session management
+func (g *Guide) AttachSession(session *Session) error
+func (g *Guide) DetachSession(sessionID string) error
+func (g *Guide) ActiveSession() (*Session, bool)
+func (g *Guide) SwitchSession(sessionID string) error
+
+// Agent registration (session-scoped)
+func (g *Guide) RegisterSessionAgent(sessionID string, agent Agent) error
+func (g *Guide) UnregisterSessionAgent(sessionID string, agentID string) error
+func (g *Guide) GetSessionAgents(sessionID string) []Agent
+
+// Shared agent access
+func (g *Guide) GetSharedAgent(agentID string) (Agent, bool)
+func (g *Guide) RegisterSharedAgent(agent Agent) error
+
+// Message routing
+func (g *Guide) RouteToSession(sessionID string, msg *Message) error
+func (g *Guide) BroadcastToSession(sessionID string, msg *Message) error
+
+// Metrics (session-aware)
+func (g *Guide) SessionMetrics(sessionID string) *SessionRouteMetrics
+func (g *Guide) GlobalMetrics() *GlobalRouteMetrics
+```
+
+#### Files to Modify
+
+| File | Changes |
+|------|---------|
+| `guide.go` | Add SessionManager reference, multi-session support, session-aware routing |
+| `types.go` | Add new message types, SessionID fields, priority field |
+| `routing.go` | Session-scoped route resolution, global fallback |
+| `bus.go` | Session topic support, wildcard subscriptions |
+| `route_cache.go` | Session-scoped cache with global fallback |
+| `worker_pool.go` | Session-aware job scheduling, fair allocation |
+
+#### Files to Create
+
+| File | Purpose |
+|------|---------|
+| `session_router.go` | Per-session routing state and logic |
+| `message_types.go` | New message type definitions |
+| `skills.go` | Skill loading/unloading, progressive disclosure |
+| `hooks.go` | Hook chain implementation |
+
+---
+
+### Archivalist Agent Modifications (`agents/archivalist/`)
+
+The existing Archivalist agent needs modifications to enforce session isolation, support cross-session queries, and store workflow history.
+
+#### Required Code Changes
+
+**1. Session Enforcement (`archivalist.go`)**
+```go
+// CURRENT: Optional session tracking
+type Archivalist struct {
+    // sessionID used but not enforced
+}
+
+// REQUIRED: Mandatory session enforcement
+type Archivalist struct {
+    defaultSessionID string                    // Default session for writes
+    sessionStores    map[string]*SessionStore  // Per-session storage partitions
+    crossSessionIdx  *CrossSessionIndex        // Index for cross-session queries
+    workflowStore    *WorkflowStore            // DAG execution history
+    // ...
+}
+
+// All write operations MUST include session
+func (a *Archivalist) Store(entry *Entry) error                          // Uses defaultSessionID
+func (a *Archivalist) StoreInSession(sessionID string, entry *Entry) error // Explicit session
+
+// All read operations default to current session
+func (a *Archivalist) Query(query *ArchiveQuery) ([]*Entry, error)       // Current session only
+func (a *Archivalist) QueryCrossSession(query *ArchiveQuery) ([]*Entry, error) // All sessions
+```
+
+**2. Session Store Type (`session_store.go` - new file)**
+```go
+type SessionStore struct {
+    sessionID      string
+    entries        map[string]*Entry
+    facts          *FactStore           // Session-local facts
+    summaries      []*CompactedSummary  // Session summaries
+    tokenCount     int                  // Hot memory token tracking
+    mu             sync.RWMutex
+}
+
+// Session-scoped operations
+func (s *SessionStore) Insert(entry *Entry) error
+func (s *SessionStore) Get(id string) (*Entry, bool)
+func (s *SessionStore) Query(query *ArchiveQuery) ([]*Entry, error)
+func (s *SessionStore) Archive(entryID string) error
+func (s *SessionStore) TokenBudget() (used int, max int)
+```
+
+**3. Cross-Session Query Support (`cross_session.go` - new file)**
+```go
+type CrossSessionIndex struct {
+    byCategory  map[Category][]string    // Entry IDs by category (all sessions)
+    bySource    map[SourceModel][]string // Entry IDs by source
+    byKeyword   map[string][]string      // Entry IDs by keyword
+    sessionMap  map[string]string        // Entry ID → Session ID
+    mu          sync.RWMutex
+}
+
+func (c *CrossSessionIndex) Search(query *ArchiveQuery) ([]CrossSessionResult, error)
+func (c *CrossSessionIndex) IndexEntry(sessionID string, entry *Entry) error
+func (c *CrossSessionIndex) RemoveEntry(entryID string) error
+
+type CrossSessionResult struct {
+    Entry     *Entry
+    SessionID string
+    Score     float64  // Relevance score
+}
+```
+
+**4. Workflow Storage (`workflow_store.go` - new file)**
+```go
+type WorkflowStore struct {
+    dags      map[string]*StoredDAG       // DAG ID → definition
+    runs      map[string]*DAGRun          // Run ID → execution record
+    bySession map[string][]string         // Session ID → Run IDs
+    mu        sync.RWMutex
+}
+
+type StoredDAG struct {
+    ID          string
+    Definition  *DAG
+    SessionID   string
+    CreatedAt   time.Time
+    ExecutionCount int
+}
+
+type DAGRun struct {
+    ID           string
+    DAGID        string
+    SessionID    string
+    StartTime    time.Time
+    EndTime      *time.Time
+    Status       DAGStatus
+    NodeResults  map[string]*NodeResult
+    Corrections  []*Correction
+    FinalOutcome string
+}
+
+func (w *WorkflowStore) StoreDAG(sessionID string, dag *DAG) (string, error)
+func (w *WorkflowStore) RecordRun(run *DAGRun) error
+func (w *WorkflowStore) QuerySimilarWorkflows(query string) ([]*StoredDAG, error)
+func (w *WorkflowStore) GetSessionHistory(sessionID string) ([]*DAGRun, error)
+```
+
+**5. Type Updates (`types.go`)**
+- [ ] Add `IncludeArchived` flag to `ArchiveQuery` (already exists, verify usage)
+- [ ] Add `SessionIDs` filter for cross-session queries (already exists, enhance)
+- [ ] Add `WorkflowQuery` struct for DAG history queries
+- [ ] Add `CrossSessionResult` wrapper type
+- [ ] Add `DAGRun` and `StoredDAG` types
+
+**6. Skill System Updates (`skills.go` - new file)**
+```go
+// Core Skills (always loaded)
+var CoreSkills = []skills.Skill{
+    skills.NewSkill("store").Description("Store an entry").Domain("storage"),
+    skills.NewSkill("query").Description("Query entries").Domain("storage"),
+    skills.NewSkill("briefing").Description("Get session briefing").Domain("status"),
+}
+
+// Extended Skills (on demand)
+var ExtendedSkills = []skills.Skill{
+    skills.NewSkill("cross_session_query").Description("Query across sessions").Domain("history"),
+    skills.NewSkill("workflow_history").Description("Query past workflows").Domain("history"),
+    skills.NewSkill("token_savings").Description("Get token savings report").Domain("metrics"),
+    skills.NewSkill("session_timeline").Description("Get session event timeline").Domain("history"),
+    skills.NewSkill("pattern_search").Description("Find similar patterns").Domain("patterns"),
+    skills.NewSkill("failure_search").Description("Find similar failures").Domain("patterns"),
+    skills.NewSkill("decision_search").Description("Find similar decisions").Domain("patterns"),
+    skills.NewSkill("promote_to_global").Description("Promote entry to global scope").Domain("admin"),
+}
+```
+
+#### Required Interface Changes
+
+```go
+// Current interface - needs enhancement
+type Archivalist interface {
+    Store(entry *Entry) (*SubmissionResult, error)
+    Query(query *ArchiveQuery) ([]*Entry, error)
+    // ...
+}
+
+// Required interface additions
+type Archivalist interface {
+    // Session management
+    SetDefaultSession(sessionID string)
+    GetDefaultSession() string
+
+    // Session-scoped operations
+    StoreInSession(sessionID string, entry *Entry) (*SubmissionResult, error)
+    QueryInSession(sessionID string, query *ArchiveQuery) ([]*Entry, error)
+
+    // Cross-session operations (read-only)
+    QueryCrossSession(query *ArchiveQuery) ([]CrossSessionResult, error)
+    GetSessionList() []SessionInfo
+    GetSessionSummary(sessionID string) (*SessionSummary, error)
+
+    // Workflow storage
+    StoreWorkflow(sessionID string, dag *DAG) (string, error)
+    RecordWorkflowRun(run *DAGRun) error
+    QuerySimilarWorkflows(query string) ([]*StoredDAG, error)
+    GetWorkflowHistory(sessionID string, limit int) ([]*DAGRun, error)
+
+    // Token/savings tracking
+    GetTokenSavings(sessionID string) (*TokenSavingsReport, error)
+    GetGlobalTokenSavings() (*TokenSavingsReport, error)
+
+    // Promotion (session-local → global)
+    PromoteToGlobal(entryID string, reason string) error
+}
+```
+
+#### Required New Methods
+
+```go
+// Session lifecycle hooks
+func (a *Archivalist) OnSessionCreate(sessionID string) error
+func (a *Archivalist) OnSessionClose(sessionID string) error
+func (a *Archivalist) OnSessionSwitch(fromID, toID string) error
+
+// Snapshot support for session persistence
+func (a *Archivalist) CreateSessionSnapshot(sessionID string) (*ChronicleSnapshot, error)
+func (a *Archivalist) RestoreSessionSnapshot(sessionID string, snapshot *ChronicleSnapshot) error
+
+// Compaction (cross-session aware)
+func (a *Archivalist) CompactSession(sessionID string) error
+func (a *Archivalist) CompactGlobal() error
+```
+
+#### Files to Modify
+
+| File | Changes |
+|------|---------|
+| `archivalist.go` | Session enforcement, cross-session query support |
+| `storage.go` | Session-partitioned storage, workflow storage |
+| `types.go` | New types for workflow storage, cross-session results |
+| `query_cache.go` | Session-scoped caching, cross-session cache invalidation |
+
+#### Files to Create
+
+| File | Purpose |
+|------|---------|
+| `session_store.go` | Per-session storage partition |
+| `cross_session.go` | Cross-session index and query logic |
+| `workflow_store.go` | DAG definition and execution history storage |
+| `skills.go` | Skill definitions with progressive disclosure |
+| `hooks.go` | Hook implementations for session lifecycle |
+
+---
+
+### Migration Path
+
+The following sequence ensures backward compatibility during migration:
+
+1. **Phase A: Add Session Support (Non-Breaking)**
+   - Add SessionID fields with defaults
+   - Add new methods alongside existing ones
+   - Existing code continues to work
+
+2. **Phase B: Enable Session Isolation**
+   - Enable session enforcement flag
+   - Migrate existing data to "default" session
+   - Update all callers to provide session context
+
+3. **Phase C: Remove Legacy Methods**
+   - Deprecate non-session-aware methods
+   - Remove after all callers migrated
+   - Enforce session context on all operations
 
 ---
 
@@ -2981,6 +7526,45 @@ var DefaultApprovedPatterns = ApprovedCommandPatterns{
 }
 ```
 
+**Superpowers Skills (from superpowers methodology):**
+```go
+// test_driven_development - TDD implementation phase
+// Source: superpowers/test-driven-development
+skills.NewSkill("test_driven_development").
+    Description("Implement code to make failing tests pass (TDD Phase 3 - GREEN)").
+    Domain("implementation").
+    Keywords("tdd", "green", "implement", "pass").
+    ObjectParam("tests", "Tests to make pass", true).
+    ObjectParam("criteria", "Success criteria from Inspector", true)
+
+// systematic_debugging - Methodical debugging approach
+// Source: superpowers/systematic-debugging
+skills.NewSkill("systematic_debugging").
+    Description("Debug issues systematically: reproduce, isolate, fix, verify").
+    Domain("debugging").
+    Keywords("debug", "fix", "issue", "systematic").
+    StringParam("symptom", "What is failing/broken", true).
+    BoolParam("create_reproduction", "Create minimal reproduction", false)
+
+// receiving_code_review_impl - Implement code review feedback
+// Source: superpowers/receiving-code-review
+skills.NewSkill("receiving_code_review_impl").
+    Description("Implement code review feedback with technical evaluation").
+    Domain("implementation").
+    Keywords("review", "feedback", "implement", "fix").
+    ObjectParam("feedback", "Code review feedback to implement", true).
+    BoolParam("verify_first", "Verify suggestion is valid before implementing", false)
+
+// verification_before_completion - Verify implementation complete
+// Source: superpowers/verification-before-completion
+skills.NewSkill("verification_before_completion").
+    Description("Verify implementation satisfies all criteria before marking complete").
+    Domain("implementation").
+    Keywords("verify", "complete", "done", "check").
+    ObjectParam("criteria", "Criteria to verify against", true).
+    ObjectParam("implementation", "Implementation to verify", true)
+```
+
 #### Engineer Tools
 ```go
 var EngineerTools = []ToolDefinition{
@@ -3400,11 +7984,18 @@ var OrchestratorTools = []ToolDefinition{
 
 ### 2.3 Pipeline Infrastructure
 
-Isolated execution contexts containing Engineer + Inspector + Tester with direct feedback loops.
+Isolated TDD execution contexts implementing RED → GREEN → REFACTOR methodology.
+
+**TDD Pipeline Flow (per task):**
+1. **Phase 1 - INSPECTOR**: Defines success criteria, quality gates, constraints
+2. **Phase 2 - TESTER (RED)**: Creates tests based on criteria (tests WILL FAIL - no implementation yet)
+3. **Phase 3 - WORKER (GREEN)**: Implements to make tests pass
+4. **Phase 4 - VALIDATION**: Both Inspector AND Tester validate in parallel
+5. **LOOP**: If either fails, loop back to Phase 1 until BOTH pass
 
 **CRITICAL**: Pipelines enable TWO-LEVEL quality assurance:
-1. **Pipeline-internal (task-specific)**: Direct Engineer ↔ Inspector ↔ Tester feedback loops
-2. **Session-wide (post-DAG)**: Full validation through Architect after all pipelines complete
+1. **Pipeline-internal (TDD)**: Inspector criteria → Tester tests (RED) → Worker implements (GREEN) → BOTH validate
+2. **Session-wide (post-DAG)**: Full integration validation through Architect after all pipelines complete
 
 **Files to create:**
 - `core/pipeline/types.go`
@@ -3420,66 +8011,135 @@ Isolated execution contexts containing Engineer + Inspector + Tester with direct
 
 #### Pipeline Data Model (`core/pipeline/types.go`)
 - [ ] `PipelineID` type with unique generation
-- [ ] `PipelineState` enum: `Created`, `Running`, `Inspecting`, `Testing`, `Completed`, `Failed`
+- [ ] `PipelineState` enum (TDD phases):
+  - [ ] `Pending` - Not yet started
+  - [ ] `DefiningCriteria` - Phase 1: Inspector defines success criteria
+  - [ ] `CreatingTests` - Phase 2: Tester creates tests (RED - tests WILL fail)
+  - [ ] `Executing` - Phase 3: Worker implements (GREEN - make tests pass)
+  - [ ] `Validating` - Phase 4: Both Inspector AND Tester validate in parallel
+  - [ ] `Completed` - Both Inspector AND Tester passed
+  - [ ] `Failed` - Max loops exceeded
 - [ ] `Pipeline` struct with:
   - [ ] ID (PipelineID), SessionID, DAGID, TaskName (human-readable, e.g. `create_dashboard`)
   - [ ] State, CreatedAt, CompletedAt
-  - [ ] EngineerID, InspectorID, TesterID (co-located instances)
+  - [ ] WorkerType (Designer OR Engineer - one per pipeline)
+  - [ ] WorkerID, InspectorID, TesterID (co-located instances)
   - [ ] `PipelineContext` (shared by all three agents)
-  - [ ] InspectorLoops, TesterLoops, MaxLoops counters
-  - [ ] EngineerResult, InspectorResult, TesterResult
+  - [ ] LoopCount, MaxLoops (TDD iteration tracking)
+  - [ ] `InspectorCriteria` (Phase 1 output)
+  - [ ] `TesterTests` (Phase 2 output)
+  - [ ] `WorkerOutput` (Phase 3 output)
+  - [ ] `InspectorResult`, `TesterResult` (Phase 4 validation)
+- [ ] `InspectorCriteria` struct (Phase 1 output):
+  - [ ] TaskID, SuccessCriteria[], QualityGates[], Constraints[], CreatedAt
+- [ ] `SuccessCriterion` struct with ID, Description, Verifiable (bool), Priority
+- [ ] `QualityGate` struct with Name, Threshold, Automated (bool)
+- [ ] `Constraint` struct with Type (security/performance/a11y), Requirement, Rationale
+- [ ] `TesterTests` struct (Phase 2 output):
+  - [ ] TaskID, TestFiles[], InitialRun (should FAIL), BasedOnCriteria[], CreatedAt
+- [ ] `TestFile` struct with Path, TestNames[], Framework
+- [ ] `TestRun` struct with Timestamp, TotalTests, Passed, Failed, Skipped, Duration, AllPassed, Failures[]
+- [ ] `TestFailure` struct with TestName, File, Message, Expected, Actual, StackTrace
 - [ ] `PipelineContext` struct with:
-  - [ ] TaskPrompt, TaskConstraints, ComplianceCriteria
+  - [ ] TaskPrompt, TaskConstraints
   - [ ] UpstreamOutputs (from DAG dependencies)
   - [ ] ModifiedFiles, CreatedFiles (tracked by pipeline)
-  - [ ] InspectorFeedback history, TesterFeedback history
-- [ ] `InspectorFeedback` struct with Loop, Timestamp, Issues, Passed
-- [ ] `InspectorIssue` struct with File, Line, Category, Severity, Message, Suggestion
-- [ ] `TesterFeedback` struct with Loop, Timestamp, TestsRun, TestsPassed, Failures, Passed
-- [ ] `TestFailure` struct with TestName, File, Message, Expected, Actual, StackTrace
+  - [ ] LoopHistory (all previous TDD iterations)
+- [ ] `IsComplete()` method: returns true only when BOTH Inspector.pass AND Tester.pass
+- [ ] `NeedsLoop()` method: returns true if either failed and loops remain
 
 #### Pipeline Internal Bus (`core/pipeline/bus.go`)
-- [ ] `PipelineBus` struct for direct communication (NOT routed through Guide)
-- [ ] Channels: inspectorToEngineer, testerToEngineer
-- [ ] Channels: engineerDone, inspectorDone, testerDone
-- [ ] `SendInspectorFeedback()` - direct to Engineer, bypasses Guide
-- [ ] `SendTesterFeedback()` - direct to Engineer, bypasses Guide
+- [ ] `PipelineBus` struct for TDD phase coordination (NOT routed through Guide)
+- [ ] Phase transition channels:
+  - [ ] `criteriaReady` - Inspector → Tester (Phase 1 → 2)
+  - [ ] `testsReady` - Tester → Worker (Phase 2 → 3)
+  - [ ] `implementationReady` - Worker → Validation (Phase 3 → 4)
+- [ ] Validation channels:
+  - [ ] `inspectorResult` - Inspector validation output
+  - [ ] `testerResult` - Tester validation output
+- [ ] Feedback channels (for loop iterations):
+  - [ ] `loopFeedback` - Combined feedback when loop needed
 - [ ] Context-based cancellation
 - [ ] Graceful shutdown
 
 ```go
 type PipelineBus struct {
     pipelineID          PipelineID
-    inspectorToEngineer chan *InspectorFeedback
-    testerToEngineer    chan *TesterFeedback
-    engineerDone        chan *EngineerResult
-    inspectorDone       chan *InspectorResult
-    testerDone          chan *TesterResult
+
+    // TDD Phase Transitions
+    criteriaReady       chan *InspectorCriteria  // Phase 1 → 2
+    testsReady          chan *TesterTests        // Phase 2 → 3
+    implementationReady chan *WorkerOutput       // Phase 3 → 4
+
+    // Validation (Phase 4 - parallel)
+    inspectorResult     chan *InspectorResult
+    testerResult        chan *TesterResult
+
+    // Loop feedback (when either validation fails)
+    loopFeedback        chan *LoopFeedback
+
     ctx                 context.Context
     cancel              context.CancelFunc
     closed              atomic.Bool
 }
+
+type LoopFeedback struct {
+    LoopCount           int
+    InspectorFailed     bool
+    TesterFailed        bool
+    InspectorIssues     []InspectorIssue
+    TesterFailures      []TestFailure
+    RefinementGuidance  string  // Hints for next iteration
+}
 ```
 
 #### Pipeline Lifecycle (`core/pipeline/lifecycle.go`)
-- [ ] State machine: Created → Running → Inspecting → Testing → Completed
-- [ ] State machine: Any state → Failed (on error or max loops exceeded)
-- [ ] Engineer execution phase
-- [ ] Inspector validation phase with direct feedback loop
-- [ ] Tester validation phase with direct feedback loop
+- [ ] TDD State machine (RED → GREEN → REFACTOR):
+  - [ ] `Pending` → `DefiningCriteria` (Phase 1 starts)
+  - [ ] `DefiningCriteria` → `CreatingTests` (Phase 2 starts when criteria ready)
+  - [ ] `CreatingTests` → `Executing` (Phase 3 starts when tests ready - RED confirmed)
+  - [ ] `Executing` → `Validating` (Phase 4 starts when implementation ready)
+  - [ ] `Validating` → `Completed` (ONLY when BOTH Inspector AND Tester pass)
+  - [ ] `Validating` → `DefiningCriteria` (Loop if EITHER fails and loops remain)
+  - [ ] Any state → `Failed` (on error or max loops exceeded)
+- [ ] Phase 1: Inspector defines criteria (before any tests exist)
+- [ ] Phase 2: Tester creates tests based on criteria (RED - tests WILL fail)
+- [ ] Phase 3: Worker implements to make tests pass (GREEN)
+- [ ] Phase 4: Parallel validation by Inspector AND Tester
+- [ ] Loop condition: `!Inspector.pass || !Tester.pass` AND `loopCount < maxLoops`
+- [ ] Completion condition: `Inspector.pass == true && Tester.pass == true`
 - [ ] Max loops enforcement (default: 3)
 - [ ] User override handling (`/task <name> ignore_inspector`, `/task <name> ignore_tester`)
 
 ```
-Pipeline Lifecycle:
-  CREATED → RUNNING (Engineer executes)
-          → INSPECTING (Inspector validates)
-            ├── Issues + loops < max → RUNNING (direct feedback)
-            ├── Issues + loops >= max → User prompted
-            └── Pass → TESTING (Tester runs)
-                       ├── Failures + loops < max → RUNNING (direct feedback)
-                       ├── Failures + loops >= max → User prompted
-                       └── Pass → COMPLETED
+TDD Pipeline Lifecycle:
+
+  PENDING
+     │
+     ▼
+  DEFINING_CRITERIA (Phase 1: Inspector)
+     │ Inspector outputs: SuccessCriteria, QualityGates, Constraints
+     ▼
+  CREATING_TESTS (Phase 2: Tester - RED)
+     │ Tester outputs: TestFiles, InitialRun (MUST FAIL - no implementation)
+     ▼
+  EXECUTING (Phase 3: Worker - GREEN)
+     │ Worker outputs: Implementation that should make tests pass
+     ▼
+  VALIDATING (Phase 4: Both Inspector AND Tester in parallel)
+     │
+     ├── BOTH pass ────────────────────────────────────► COMPLETED
+     │
+     ├── EITHER fails + loops < max ────────────────┐
+     │                                              │
+     │   ◄──────────────────────────────────────────┘
+     │   (Loop back to Phase 1 with feedback)
+     │
+     └── EITHER fails + loops >= max ──────────────► User prompted:
+                                                    1. Increase max_loops
+                                                    2. ignore_inspector
+                                                    3. ignore_tester
+                                                    4. Cancel → FAILED
 ```
 
 #### Pipeline Manager (`core/pipeline/manager.go`)
@@ -3534,17 +8194,27 @@ skills.NewSkill("task_interact").
 // /task setup_auth_middleware stop_handoff  ← Cancel/prevent handoff
 ```
 
-#### Message Types (Pipeline-Specific)
-- [ ] `INSPECTOR_FEEDBACK` - Inspector → Engineer (pipeline-internal, NOT through Guide)
-- [ ] `TESTER_FEEDBACK` - Tester → Engineer (pipeline-internal, NOT through Guide)
-- [ ] `PIPELINE_COMPLETE` - Pipeline → Orchestrator
-- [ ] `PIPELINE_FAILED` - Pipeline → Orchestrator
+#### Message Types (Pipeline-Specific, TDD-Aware)
+
+**TDD Phase Transition Messages (pipeline-internal, NOT through Guide):**
+- [ ] `CRITERIA_READY` - Inspector → Tester (Phase 1 → 2, carries InspectorCriteria)
+- [ ] `TESTS_READY` - Tester → Worker (Phase 2 → 3, carries TesterTests + RED confirmation)
+- [ ] `IMPLEMENTATION_READY` - Worker → Validation (Phase 3 → 4, carries WorkerOutput)
+- [ ] `VALIDATION_RESULT` - Inspector/Tester → Pipeline (Phase 4, carries pass/fail + details)
+- [ ] `LOOP_FEEDBACK` - Pipeline → All Agents (when loop needed, carries combined feedback)
+
+**Pipeline Lifecycle Messages:**
+- [ ] `PIPELINE_COMPLETE` - Pipeline → Orchestrator (BOTH Inspector AND Tester passed)
+- [ ] `PIPELINE_FAILED` - Pipeline → Orchestrator (max loops exceeded)
+- [ ] `PIPELINE_LOOP` - Internal (Phase 4 → Phase 1 with feedback)
+
+**User Interaction Messages (through Guide):**
 - [ ] `USER_TASK_PROMPT` - User → Guide → Pipeline (through Guide)
 - [ ] `USER_TASK_QUERY` - User → Guide → Pipeline (through Guide)
 - [ ] `USER_TASK_INTERRUPT` - User → Guide → Pipeline (through Guide)
-- [ ] `USER_IGNORE_INSPECTOR` - User → Guide → Pipeline (through Guide)
-- [ ] `USER_IGNORE_TESTER` - User → Guide → Pipeline (through Guide)
-- [ ] `USER_TRIGGER_HANDOFF` - User → Guide → Pipeline → Engineer (user-initiated handoff)
+- [ ] `USER_IGNORE_INSPECTOR` - User → Guide → Pipeline (bypass Inspector in validation)
+- [ ] `USER_IGNORE_TESTER` - User → Guide → Pipeline (bypass Tester in validation)
+- [ ] `USER_TRIGGER_HANDOFF` - User → Guide → Pipeline → Worker (user-initiated handoff)
 - [ ] `USER_STOP_HANDOFF` - User → Guide → Pipeline (cancel/prevent handoff)
 
 #### Session Context Updates
@@ -3561,30 +8231,58 @@ skills.NewSkill("task_interact").
 
 **Acceptance Criteria:**
 
-##### Handoff Data Structures
+##### Handoff Data Structures (TDD-Aware)
 - [ ] `PipelineHandoff` struct containing:
   - [ ] OldPipelineID, NewPipelineID
   - [ ] SessionID, DAGID, TaskID
   - [ ] HandoffReason, HandoffIndex (chains are traceable)
   - [ ] Timestamp
-  - [ ] EngineerHandoffState, InspectorHandoffState, TesterHandoffState
-- [ ] `EngineerHandoffState` with OriginalPrompt, Accomplished, FilesChanged, Remaining, ContextNotes
-- [ ] `InspectorHandoffState` with CurrentFindings, ResolvedByEngineer, PendingForEngineer
-- [ ] `TesterHandoffState` with TestsCreated, TestResults, PendingFailures, TestPlanRemaining
+  - [ ] CurrentTDDPhase (which phase was active at handoff)
+  - [ ] LoopCount (TDD iteration at handoff)
+  - [ ] WorkerHandoffState, InspectorHandoffState, TesterHandoffState
+- [ ] `WorkerHandoffState` with OriginalPrompt, Accomplished, FilesChanged, Remaining, ContextNotes
+- [ ] `InspectorHandoffState` (TDD-aware):
+  - [ ] DefinedCriteria (Phase 1 output, if completed)
+  - [ ] ValidationResult (Phase 4 output, if reached)
+  - [ ] PendingCriteriaRefinements (for next loop)
+- [ ] `TesterHandoffState` (TDD-aware):
+  - [ ] CreatedTests (Phase 2 output, TestFiles list)
+  - [ ] InitialRunResult (RED phase confirmation)
+  - [ ] ValidationRunResult (Phase 4 output, if reached)
+  - [ ] PendingTestUpdates (for next loop)
 
 ```go
 type PipelineHandoff struct {
-    OldPipelineID   PipelineID              `json:"old_pipeline_id"`
-    NewPipelineID   PipelineID              `json:"new_pipeline_id"`
-    SessionID       string                  `json:"session_id"`
-    DAGID           string                  `json:"dag_id"`
-    TaskName        string                  `json:"task_name"`  // Human-readable, e.g. "create_dashboard"
-    HandoffReason   string                  `json:"handoff_reason"`
-    HandoffIndex    int                     `json:"handoff_index"`  // 0 = first, chains traceable
-    Timestamp       time.Time               `json:"timestamp"`
-    EngineerState   *EngineerHandoffState   `json:"engineer_state"`
-    InspectorState  *InspectorHandoffState  `json:"inspector_state"`
-    TesterState     *TesterHandoffState     `json:"tester_state"`
+    OldPipelineID     PipelineID              `json:"old_pipeline_id"`
+    NewPipelineID     PipelineID              `json:"new_pipeline_id"`
+    SessionID         string                  `json:"session_id"`
+    DAGID             string                  `json:"dag_id"`
+    TaskName          string                  `json:"task_name"`  // Human-readable, e.g. "create_dashboard"
+    HandoffReason     string                  `json:"handoff_reason"`
+    HandoffIndex      int                     `json:"handoff_index"`  // 0 = first, chains traceable
+    Timestamp         time.Time               `json:"timestamp"`
+
+    // TDD State at Handoff
+    CurrentTDDPhase   PipelineState           `json:"current_tdd_phase"`
+    LoopCount         int                     `json:"loop_count"`
+
+    // Agent States
+    WorkerState       *WorkerHandoffState     `json:"worker_state"`
+    InspectorState    *InspectorHandoffState  `json:"inspector_state"`
+    TesterState       *TesterHandoffState     `json:"tester_state"`
+}
+
+type InspectorHandoffState struct {
+    DefinedCriteria          *InspectorCriteria `json:"defined_criteria,omitempty"`
+    ValidationResult         *InspectorResult   `json:"validation_result,omitempty"`
+    PendingCriteriaRefinements []string         `json:"pending_refinements,omitempty"`
+}
+
+type TesterHandoffState struct {
+    CreatedTests         *TesterTests   `json:"created_tests,omitempty"`
+    InitialRunResult     *TestRun       `json:"initial_run,omitempty"`      // RED confirmation
+    ValidationRunResult  *TestRun       `json:"validation_run,omitempty"`   // GREEN check
+    PendingTestUpdates   []string       `json:"pending_updates,omitempty"`
 }
 ```
 
@@ -3673,18 +8371,34 @@ type PipelineManager interface {
 ```
 
 **Tests:**
-- [ ] Create pipeline, verify all three agents instantiated
-- [ ] Execute pipeline, verify Engineer → Inspector → Tester flow
-- [ ] Test Inspector feedback loop (issue → fix → re-validate)
-- [ ] Test Tester feedback loop (failure → fix → re-test)
-- [ ] Test max loops enforcement
+
+**TDD Pipeline Flow Tests:**
+- [ ] Create pipeline, verify all three agents instantiated (Worker, Inspector, Tester)
+- [ ] Execute pipeline, verify TDD flow: Inspector → Tester → Worker → Validate
+- [ ] Test Phase 1: Inspector produces InspectorCriteria with success criteria, quality gates
+- [ ] Test Phase 2: Tester receives criteria and creates tests that FAIL (RED)
+- [ ] Test Phase 2: Verify initial test run fails (no implementation yet)
+- [ ] Test Phase 3: Worker receives tests + criteria and implements (GREEN)
+- [ ] Test Phase 4: Both Inspector AND Tester validate in parallel
+- [ ] Test completion: Only when BOTH Inspector.pass AND Tester.pass
+- [ ] Test loop: When Inspector fails but Tester passes, loop to Phase 1
+- [ ] Test loop: When Tester fails but Inspector passes, loop to Phase 1
+- [ ] Test loop: When BOTH fail, loop with combined feedback
+- [ ] Test max loops enforcement (default: 3)
+- [ ] Test user override (ignore_inspector bypasses Inspector validation)
+- [ ] Test user override (ignore_tester bypasses Tester validation)
+
+**Pipeline Interaction Tests:**
 - [ ] Test /task command routing through Guide
-- [ ] Test user override (ignore_inspector, ignore_tester)
 - [ ] Test concurrent pipelines within session
-- [ ] Test pipeline cancellation
-- [ ] Test handoff trigger at Engineer 95% context
-- [ ] Test handoff state bundling (E+I+T combined)
-- [ ] Test handoff flow: Engineer → Guide → Architect → Guide → Orchestrator
+- [ ] Test pipeline cancellation mid-phase
+
+**Handoff Tests (TDD-Aware):**
+- [ ] Test handoff trigger at Worker 95% context
+- [ ] Test handoff preserves TDD phase (resumes at correct phase)
+- [ ] Test handoff preserves loop count
+- [ ] Test handoff state bundling (Worker+Inspector+Tester combined)
+- [ ] Test handoff flow: Worker → Guide → Architect → Guide → Orchestrator
 - [ ] Test handoff retry logic (3 attempts, exponential backoff)
 - [ ] Test handoff fallback (summarize → Archivalist → compact)
 - [ ] Test handoff chaining (A → B → C)
@@ -3720,11 +8434,45 @@ User's main interface. Creates DAGs from abstract requests.
 
 **Acceptance Criteria:**
 
+#### Request Intake (via Guide only)
+- [ ] Accept user requests from Guide (implementation requests)
+- [ ] Accept Academic "research paper" from Guide (research-informed requests)
+- [ ] NEVER receive direct user input - all paths flow through Guide
+
+#### Request Decomposition
+- [ ] Break apart request into discrete components
+- [ ] Identify explicit requirements
+- [ ] Identify implicit assumptions (state them explicitly)
+- [ ] Identify ambiguities requiring resolution
+- [ ] Identify unknowns (missing context)
+- [ ] Identify gaps (information needed but not provided)
+
+#### Context Gathering (CRITICAL: via Guide, NOT directly to agents)
+- [ ] Transform gaps into queries
+- [ ] Submit ALL queries to Guide for routing (Guide routes to appropriate agent)
+- [ ] Receive responses through Guide
+- [ ] Integrate responses into understanding
+- [ ] Iterate until all resolvable gaps are filled
+- [ ] Query Librarian (via Guide) for codebase context
+- [ ] Query Archivalist (via Guide) for past patterns
+- [ ] Query Academic (via Guide) for research (when needed)
+
+#### User Clarification (LAST RESORT)
+- [ ] ONLY ask user after exhausting Librarian, Academic, and Archivalist
+- [ ] ONLY for information that cannot be determined from agents
+- [ ] ONLY for genuine ambiguities (not laziness)
+- [ ] When asking, explain what was already checked
+- [ ] Ask specific, actionable questions
+
+#### Challenge User (when warranted)
+- [ ] Raise concerns when design seems flawed
+- [ ] Point out contradictions with codebase patterns (from Librarian)
+- [ ] Suggest alternatives when approach has known failure patterns (from Archivalist)
+- [ ] State concerns with evidence from agents
+- [ ] Propose alternatives if available
+- [ ] Accept user's final decision after presenting facts
+
 #### Planning
-- [ ] Accept user requests from Guide
-- [ ] Query Librarian for codebase context
-- [ ] Query Archivalist for past patterns
-- [ ] Query Academic for research (optional, user-triggered)
 - [ ] Generate implementation plan with tasks
 - [ ] Convert plan to DAG with explicit execution order
 - [ ] **Generate human-readable task names as DAG node keys** (e.g., `create_dashboard`, `setup_auth_middleware`)
@@ -3732,6 +8480,9 @@ User's main interface. Creates DAGs from abstract requests.
 - [ ] Edge case analysis (empty inputs, boundaries, concurrency)
 - [ ] Failure mode analysis (what could go wrong)
 - [ ] Mitigation proposals for identified risks
+- [ ] Reference specific files (from Librarian context)
+- [ ] Follow existing patterns (from Librarian context)
+- [ ] Avoid known pitfalls (from Archivalist context)
 
 #### User Interaction
 - [ ] Present plan to user for approval
@@ -3940,6 +8691,66 @@ skills.NewSkill("get_workflow_status").
     BoolParam("include_node_details", "Include per-node status", false)
 ```
 
+**Superpowers Skills (from superpowers methodology):**
+
+These skills implement proven methodologies from the superpowers project:
+
+```go
+// brainstorming_3phase - Three-phase brainstorming for complex problems
+// Source: superpowers/brainstorming
+skills.NewSkill("brainstorming_3phase").
+    Description("Three-phase brainstorming: divergent exploration, constraint identification, convergent synthesis").
+    Domain("planning").
+    Keywords("brainstorm", "design", "approach", "options").
+    StringParam("problem", "Problem statement to brainstorm", true).
+    IntParam("exploration_breadth", "Number of initial approaches to explore", false)
+
+// writing_plans_granular - Granular plan writing with proper detail level
+// Source: superpowers/writing-plans
+skills.NewSkill("writing_plans_granular").
+    Description("Write plans with appropriate granularity - not too abstract, not too detailed").
+    Domain("planning").
+    Keywords("plan", "write", "detail", "granular").
+    StringParam("objective", "What the plan should achieve", true).
+    EnumParam("granularity", "Detail level", []string{"high_level", "moderate", "detailed"}, false)
+
+// dispatching_parallel_agents - Domain-based parallel pipeline dispatch
+// Source: superpowers/dispatching-parallel-agents
+skills.NewSkill("dispatching_parallel_agents").
+    Description("Dispatch multiple pipelines in parallel based on domain independence").
+    Domain("orchestration").
+    Keywords("parallel", "dispatch", "concurrent", "domain").
+    ObjectParam("tasks", "Tasks to potentially parallelize", true).
+    BoolParam("analyze_domains", "Analyze domain independence", false)
+
+// using_git_worktrees - Isolated workspace creation
+// Source: superpowers/using-git-worktrees
+skills.NewSkill("using_git_worktrees").
+    Description("Create isolated git worktrees for safe parallel development").
+    Domain("git").
+    Keywords("worktree", "isolate", "branch", "parallel").
+    StringParam("branch_name", "Branch name for worktree", true).
+    StringParam("worktree_path", "Path for worktree (optional)", false)
+
+// finishing_development_branch - Branch completion with options
+// Source: superpowers/finishing-a-development-branch
+skills.NewSkill("finishing_development_branch").
+    Description("Complete development branch: verify tests, present integration options").
+    Domain("git").
+    Keywords("finish", "branch", "merge", "pr", "complete").
+    StringParam("branch_name", "Branch to finish", true).
+    EnumParam("action", "Completion action", []string{"merge_local", "create_pr", "keep", "discard"}, false)
+
+// requesting_code_review - Structured code review request
+// Source: superpowers/requesting-code-review
+skills.NewSkill("requesting_code_review").
+    Description("Request code review with structured context and focus areas").
+    Domain("review").
+    Keywords("review", "request", "feedback", "code").
+    StringParam("pr_or_branch", "PR number or branch name", true).
+    ArrayParam("focus_areas", "Specific areas to review", false)
+```
+
 #### Architect Tools
 ```go
 var ArchitectTools = []ToolDefinition{
@@ -3961,6 +8772,13 @@ var ArchitectTools = []ToolDefinition{
     {Name: "architect_adjust_workflow", Skill: "adjust_workflow"},
     {Name: "architect_signal_orchestrator", Skill: "signal_orchestrator"},
     {Name: "architect_get_workflow_status", Skill: "get_workflow_status"},
+    // Superpowers methodology (Architect-specific)
+    {Name: "architect_brainstorm", Skill: "brainstorming_3phase"},
+    {Name: "architect_write_plan", Skill: "writing_plans_granular"},
+    {Name: "architect_dispatch_parallel", Skill: "dispatching_parallel_agents"},
+    {Name: "architect_worktree", Skill: "using_git_worktrees"},
+    {Name: "architect_finish_branch", Skill: "finishing_development_branch"},
+    {Name: "architect_request_review", Skill: "requesting_code_review"},
     // Routing & commands
     {Name: "route_to", Skill: "route_to"},
     {Name: "reply_to", Skill: "reply_to"},
@@ -4060,10 +8878,14 @@ type ArchitectWorkflowSummary struct {
 
 ### 4.1 Inspector (Code Validator)
 
-Validates code quality and implementation correctness.
+Defines success criteria (TDD Phase 1) and validates implementation correctness (TDD Phase 4).
 
-**CRITICAL**: Inspector operates in TWO modes:
-1. **Pipeline-internal mode**: Task-specific validation within a Pipeline, direct feedback to Engineer
+**CRITICAL**: Inspector operates in TWO TDD phases within Pipeline:
+1. **Phase 1 - Criteria Definition**: Analyze task and define success criteria, quality gates, constraints BEFORE tests are written
+2. **Phase 4 - Validation**: Verify Worker output satisfies criteria defined in Phase 1
+
+**CRITICAL**: Inspector also operates in TWO modes across sessions:
+1. **Pipeline-internal mode**: Task-specific criteria + validation within a Pipeline
 2. **Session-wide mode**: Full validation after all Pipelines complete, feedback through Architect
 
 **Files to create:**
@@ -4084,15 +8906,50 @@ Validates code quality and implementation correctness.
 
 #### Dual-Mode Operation
 - [ ] `InspectorMode` enum: `PipelineInternal`, `SessionWide`
-- [ ] Pipeline-internal: receive from PipelineBus, send feedback directly to Engineer
+- [ ] Pipeline-internal: receive from PipelineBus, operate in TDD phases
 - [ ] Session-wide: receive from Guide/Bus, send corrections through Architect
 - [ ] Mode determined by instantiation context (Pipeline vs standalone)
 
-#### Pipeline-Internal Mode (`pipeline_mode.go`)
-- [ ] Receive task result from PipelineBus (not Guide)
+#### TDD Phase 1 - Criteria Definition (`criteria.go`)
+- [ ] Analyze task prompt and constraints to define success criteria
+- [ ] Generate `InspectorCriteria` struct containing:
+  - [ ] `SuccessCriteria[]` - What must be true for task to be "done"
+  - [ ] `QualityGates[]` - Thresholds that must be met (coverage, complexity, etc.)
+  - [ ] `Constraints[]` - Security, performance, accessibility requirements
+- [ ] Criteria must be VERIFIABLE (testable by Tester or automated tools)
+- [ ] Send `CRITERIA_READY` message to Tester via PipelineBus
+- [ ] Skills used: `define_code_criteria` (Engineer pipeline), `define_ui_criteria` (Designer pipeline)
+
+```go
+// TDD Phase 1: Define what "done" means
+func (i *Inspector) DefineCriteria(ctx context.Context, bus *PipelineBus, taskPrompt string) (*InspectorCriteria, error) {
+    criteria := &InspectorCriteria{
+        TaskID:          bus.PipelineID(),
+        SuccessCriteria: i.analyzeTaskForCriteria(taskPrompt),
+        QualityGates:    i.determineQualityGates(taskPrompt, bus.Context().WorkerType),
+        Constraints:     i.identifyConstraints(taskPrompt),
+        CreatedAt:       time.Now(),
+    }
+
+    // Criteria MUST be verifiable
+    for _, c := range criteria.SuccessCriteria {
+        if !c.Verifiable {
+            return nil, fmt.Errorf("criterion %q is not verifiable", c.Description)
+        }
+    }
+
+    // Send to Tester (Phase 1 → Phase 2)
+    return criteria, bus.SendCriteria(criteria)
+}
+```
+
+#### TDD Phase 4 - Validation (`pipeline_mode.go`)
+- [ ] Receive Worker output after implementation (Phase 3 complete)
+- [ ] Validate against criteria defined in Phase 1
 - [ ] Run task-specific validation (lint, format, type-check on modified files only)
-- [ ] Check task compliance criteria from PipelineContext
-- [ ] Send `InspectorFeedback` directly to Engineer via PipelineBus
+- [ ] Check task compliance criteria from `InspectorCriteria`
+- [ ] Send `InspectorResult` to Pipeline via PipelineBus
+- [ ] Pass condition: ALL success criteria met AND ALL quality gates passed
 - [ ] NO routing through Guide or Architect
 - [ ] Quick validation (< 5 seconds per task)
 
@@ -4221,6 +9078,54 @@ skills.NewSkill("override_issue").
     Keywords("override", "ignore", "skip", "accept").
     StringParam("issue_id", "Issue ID to override", true).
     StringParam("reason", "Reason for override", false)
+```
+
+**Superpowers Skills (from superpowers methodology):**
+```go
+// define_code_criteria - TDD Phase 1 criteria definition (Engineer pipeline)
+// Source: superpowers/subagent-driven-development (two-stage validation)
+skills.NewSkill("define_code_criteria").
+    Description("Define success criteria for code implementation (TDD Phase 1)").
+    Domain("criteria").
+    Keywords("criteria", "success", "define", "requirements").
+    StringParam("task_prompt", "Task to define criteria for", true).
+    ArrayParam("constraints", "Additional constraints", false)
+
+// define_ui_criteria - TDD Phase 1 criteria definition (Designer pipeline)
+// Source: superpowers/subagent-driven-development (two-stage validation)
+skills.NewSkill("define_ui_criteria").
+    Description("Define success criteria for UI implementation (TDD Phase 1)").
+    Domain("criteria").
+    Keywords("criteria", "success", "define", "ui", "requirements").
+    StringParam("task_prompt", "Task to define criteria for", true).
+    ArrayParam("a11y_requirements", "Accessibility requirements", false)
+
+// receiving_code_review - Process code review feedback
+// Source: superpowers/receiving-code-review
+skills.NewSkill("receiving_code_review").
+    Description("Process external code review feedback with technical evaluation").
+    Domain("review").
+    Keywords("review", "feedback", "receive", "evaluate").
+    ObjectParam("feedback", "Code review feedback to process", true).
+    BoolParam("verify_first", "Verify against codebase before implementing", false)
+
+// verification_before_completion - Multi-step verification
+// Source: superpowers/verification-before-completion
+skills.NewSkill("verification_before_completion").
+    Description("Perform thorough verification before marking task complete").
+    Domain("validation").
+    Keywords("verify", "complete", "done", "check").
+    ObjectParam("task_result", "Result to verify", true).
+    ArrayParam("verification_steps", "Steps to verify", false)
+
+// subagent_two_stage_validation - Two-stage validation pattern
+// Source: superpowers/subagent-driven-development
+skills.NewSkill("subagent_two_stage_validation").
+    Description("Two-stage validation: define expectations, then verify results").
+    Domain("validation").
+    Keywords("two-stage", "validate", "subagent", "expectations").
+    ObjectParam("expectations", "What was expected", true).
+    ObjectParam("results", "What was produced", true)
 ```
 
 **Code Quality Execution (dynamically configurable):**
@@ -4492,10 +9397,14 @@ func (i *Inspector) checkContextAndManage() error {
 
 ### 4.2 Tester (Test Planner & Executor)
 
-Plans and executes tests, analyzes failures.
+Creates tests from criteria (TDD Phase 2 - RED) and validates implementation (TDD Phase 4 - GREEN check).
 
-**CRITICAL**: Tester operates in TWO modes:
-1. **Pipeline-internal mode**: Task-specific tests within a Pipeline, direct feedback to Engineer
+**CRITICAL**: Tester operates in TWO TDD phases within Pipeline:
+1. **Phase 2 - Test Creation (RED)**: Receive criteria from Inspector, create tests that WILL FAIL (no implementation yet)
+2. **Phase 4 - Validation (GREEN check)**: Run test suite to verify Worker's implementation makes tests pass
+
+**CRITICAL**: Tester also operates in TWO modes across sessions:
+1. **Pipeline-internal mode**: Task-specific test creation + validation within a Pipeline
 2. **Session-wide mode**: Full test suite after all Pipelines complete, feedback through Architect
 
 **Files to create:**
@@ -4516,17 +9425,59 @@ Plans and executes tests, analyzes failures.
 
 #### Dual-Mode Operation
 - [ ] `TesterMode` enum: `PipelineInternal`, `SessionWide`
-- [ ] Pipeline-internal: receive from PipelineBus, send feedback directly to Engineer
+- [ ] Pipeline-internal: receive from PipelineBus, operate in TDD phases
 - [ ] Session-wide: receive from Guide/Bus, send corrections through Architect
 - [ ] Mode determined by instantiation context (Pipeline vs standalone)
 
-#### Pipeline-Internal Mode (`pipeline_mode.go`)
-- [ ] Receive validated task from PipelineBus (after Inspector passes)
-- [ ] Generate tests for THIS specific task/requirement only
-- [ ] Run only relevant tests (not full suite)
-- [ ] Send `TesterFeedback` directly to Engineer via PipelineBus
+#### TDD Phase 2 - Test Creation RED (`test_creation.go`)
+- [ ] Receive `InspectorCriteria` from Inspector via PipelineBus
+- [ ] Generate tests that map to each success criterion
+- [ ] Create `TesterTests` struct containing:
+  - [ ] `TestFiles[]` - Generated test file paths and test names
+  - [ ] `InitialRun` - Initial test execution (MUST FAIL - no implementation yet)
+  - [ ] `BasedOnCriteria[]` - Links tests back to criteria IDs
+- [ ] Run initial test suite to CONFIRM failure (RED phase verification)
+- [ ] If tests pass (unexpected), flag as ERROR - tests are not testing the right thing
+- [ ] Send `TESTS_READY` message to Worker via PipelineBus
+- [ ] Skills used: `write_unit_test`, `write_integration_test`, `write_component_test`
+
+```go
+// TDD Phase 2: Create tests that WILL FAIL (RED)
+func (t *Tester) CreateTests(ctx context.Context, bus *PipelineBus, criteria *InspectorCriteria) (*TesterTests, error) {
+    tests := &TesterTests{
+        TaskID:          criteria.TaskID,
+        TestFiles:       []TestFile{},
+        BasedOnCriteria: []string{},
+        CreatedAt:       time.Now(),
+    }
+
+    // Generate tests for each success criterion
+    for _, criterion := range criteria.SuccessCriteria {
+        testFile := t.generateTestForCriterion(criterion, bus.Context().WorkerType)
+        tests.TestFiles = append(tests.TestFiles, testFile)
+        tests.BasedOnCriteria = append(tests.BasedOnCriteria, criterion.ID)
+    }
+
+    // Run initial tests - they MUST fail (RED phase)
+    initialRun := t.runTests(tests.TestFiles)
+    tests.InitialRun = initialRun
+
+    if initialRun.AllPassed {
+        return nil, fmt.Errorf("RED phase failed: tests passed without implementation - tests are not testing the right thing")
+    }
+
+    // Send to Worker (Phase 2 → Phase 3)
+    return tests, bus.SendTests(tests)
+}
+```
+
+#### TDD Phase 4 - Validation GREEN check (`pipeline_mode.go`)
+- [ ] Receive Worker output after implementation (Phase 3 complete)
+- [ ] Run test suite created in Phase 2
+- [ ] Send `TesterResult` to Pipeline via PipelineBus
+- [ ] Pass condition: ALL tests pass (GREEN)
 - [ ] NO routing through Guide or Architect
-- [ ] Focused testing (task-specific unit tests only)
+- [ ] Focused testing (task-specific tests only)
 
 ```go
 // Pipeline-internal testing flow
@@ -4653,6 +9604,54 @@ skills.NewSkill("benchmark").
     Domain("testing").
     Keywords("benchmark", "performance", "speed", "timing").
     StringParam("pattern", "Benchmark pattern", false)
+```
+
+**Superpowers Skills (from superpowers methodology):**
+```go
+// test_driven_development - TDD workflow skills
+// Source: superpowers/test-driven-development
+skills.NewSkill("test_driven_development").
+    Description("Follow TDD workflow: create failing tests first, then implement").
+    Domain("testing").
+    Keywords("tdd", "red", "green", "refactor").
+    ObjectParam("criteria", "Success criteria from Inspector", true).
+    BoolParam("verify_red_first", "Verify tests fail before implementation", false)
+
+// write_unit_test - Write unit test from criterion
+// Source: superpowers/test-driven-development
+skills.NewSkill("write_unit_test").
+    Description("Write unit test based on success criterion (TDD Phase 2)").
+    Domain("testing").
+    Keywords("unit", "test", "write", "create").
+    ObjectParam("criterion", "Success criterion to test", true).
+    StringParam("target_function", "Function/method to test", false)
+
+// write_integration_test - Write integration test from criterion
+// Source: superpowers/test-driven-development
+skills.NewSkill("write_integration_test").
+    Description("Write integration test based on success criterion (TDD Phase 2)").
+    Domain("testing").
+    Keywords("integration", "test", "write", "create").
+    ObjectParam("criterion", "Success criterion to test", true).
+    ArrayParam("components", "Components involved in integration", false)
+
+// write_component_test - Write component test (UI)
+// Source: superpowers/test-driven-development
+skills.NewSkill("write_component_test").
+    Description("Write component test for UI based on criterion (TDD Phase 2)").
+    Domain("testing").
+    Keywords("component", "test", "ui", "write").
+    ObjectParam("criterion", "Success criterion to test", true).
+    StringParam("component_path", "Path to component", false)
+
+// verification_before_completion - Verify before marking complete
+// Source: superpowers/verification-before-completion
+skills.NewSkill("verification_before_completion").
+    Description("Thorough verification before completing test phase").
+    Domain("testing").
+    Keywords("verify", "complete", "done", "check").
+    ObjectParam("test_results", "Results to verify", true).
+    ArrayParam("verification_steps", "Steps to verify", false)
 ```
 
 **Test Framework Skills (dynamically configurable):**
@@ -4984,213 +9983,73 @@ func (t *Tester) checkContextAndManage() error {
 
 ---
 
-## Phase 5: Integration
-
-**Goal**: Wire everything together, integration tests.
-
-**Dependencies**: Phases 0-4 complete
-
-### 5.1 Agent Coordinator
-
-Coordinates agent lifecycle and inter-agent communication.
-
-**Files to create:**
-- `core/coordinator/coordinator.go`
-- `core/coordinator/lifecycle.go`
-- `core/coordinator/health.go`
-- `core/coordinator/coordinator_test.go`
-
-**Acceptance Criteria:**
-- [ ] Start all agents in correct order
-- [ ] Register all agents with Guide
-- [ ] Handle agent failures with graceful degradation
-- [ ] Shutdown all agents in correct order
-- [ ] Health monitoring across all agents
-- [ ] Metrics collection from all agents
-- [ ] Session-scoped agent instances
-- [ ] Shared agent instances (Librarian, Academic, Archivalist)
-
-### 5.2 Full Workflow Integration Tests
-
-**Files to create:**
-- `tests/integration/workflow_test.go`
-- `tests/integration/multi_session_test.go`
-- `tests/integration/session_isolation_test.go`
-- `tests/integration/session_switching_test.go`
-- `tests/integration/failure_test.go`
-- `tests/integration/quality_loop_test.go`
-- `tests/integration/skill_loading_test.go`
-- `tests/integration/pipeline_test.go` (NEW)
-- `tests/integration/two_level_qa_test.go` (NEW)
-
-**Acceptance Criteria:**
-
-#### Basic Workflow
-- [ ] Test: User request → Architect → DAG → Pipelines → Complete
-- [ ] Test: Multiple sessions executing concurrently
-- [ ] Test: Session isolation (no context pollution)
-- [ ] Test: Session switching with state preservation
-- [ ] Test: Engineer clarification loop
-- [ ] Test: User interruption during execution
-- [ ] Test: Agent failure recovery
-- [ ] Test: Session cleanup on completion
-- [ ] Test: Skill progressive loading
-- [ ] Test: Cross-session Archivalist queries
-
-#### Pipeline-Specific Tests (`pipeline_test.go`)
-- [ ] Test: Pipeline creation with Engineer + Inspector + Tester
-- [ ] Test: Pipeline-internal Inspector feedback loop
-- [ ] Test: Pipeline-internal Tester feedback loop
-- [ ] Test: Pipeline max loops enforcement
-- [ ] Test: /task command routing through Guide to Pipeline
-- [ ] Test: User override (ignore_inspector) in Pipeline
-- [ ] Test: User override (ignore_tester) in Pipeline
-- [ ] Test: Concurrent Pipelines within same DAG
-- [ ] Test: Pipeline cancellation mid-execution
-- [ ] Test: Pipeline failure propagation to Orchestrator
-
-#### Two-Level QA Tests (`two_level_qa_test.go`)
-- [ ] Test: Pipeline-internal Inspector pass → Pipeline-internal Tester pass → Pipeline complete
-- [ ] Test: Pipeline-internal Inspector fail → direct feedback → Engineer fixes → re-validate
-- [ ] Test: Pipeline-internal Tester fail → direct feedback → Engineer fixes → re-test
-- [ ] Test: All Pipelines complete → Session-wide Inspector triggers
-- [ ] Test: Session-wide Inspector fail → Architect creates FIX DAG → new Pipelines
-- [ ] Test: Session-wide Tester fail → Architect creates FIX DAG → new Pipelines
-- [ ] Test: Full flow: Pipelines → Session Inspector → Session Tester → Complete
-
-### 5.3 Performance Benchmarks
-
-**Files to create:**
-- `tests/benchmark/session_bench_test.go`
-- `tests/benchmark/dag_bench_test.go`
-- `tests/benchmark/throughput_bench_test.go`
-- `tests/benchmark/skill_loading_bench_test.go`
-
-**Acceptance Criteria:**
-- [ ] Benchmark: 10 concurrent sessions with 50 Engineers each
-- [ ] Benchmark: DAG execution with 100 nodes
-- [ ] Benchmark: Message throughput through Guide
-- [ ] Benchmark: Worker pool fairness under load
-- [ ] Benchmark: Skill loading latency
-- [ ] Benchmark: Session switch latency
-- [ ] Target: < 10ms routing latency (cache hit)
-- [ ] Target: < 100ms routing latency (LLM classification)
-- [ ] Target: < 50ms skill loading latency
-- [ ] Target: < 100ms session switch latency
-- [ ] Target: Linear scaling to 100 sessions
-
----
-
-## Execution Workflow
-
-```
-Phase 0 (Foundation)              Phase 1 (Knowledge)      Phase 2 (Execution)           Phase 3         Phase 4 (Quality)      Phase 5
-┌─────────────────────────────┐   ┌─────────────────┐      ┌──────────────────────┐      ┌───────────┐   ┌────────────────┐      ┌──────────────────┐
-│ 0.1 Session Manager         │   │ 1.1 Librarian   │      │ 2.1 Engineer         │      │ 3.1       │   │ 4.1 Inspector  │      │ 5.1 Coordinator  │
-│ 0.2 DAG Engine              │   │ 1.2 Academic    │      │ 2.2 Orchestrator     │      │ Architect │   │ 4.2 Tester     │      │ 5.2 Integration  │
-│ 0.3 Worker Pool Enhancements│──▶│ 1.3 Tool Disc.  │─────▶│ 2.3 Pipeline Infra   │─────▶│           │──▶│                │─────▶│ 5.3 Benchmarks   │
-│ 0.4 Guide Enhancements      │   │                 │      │     (E + I + T)      │      │           │   │                │      │                  │
-│ 0.5 Archivalist Enhancements│   │                 │      │                      │      │           │   │                │      │                  │
-│ 0.6 Bus Enhancements        │   │                 │      │                      │      │           │   │                │      │                  │
-└─────────────────────────────┘   └─────────────────┘      └──────────────────────┘      └───────────┘   └────────────────┘      └──────────────────┘
-```
-
-### Parallelization Summary
-
-| Phase | Items | Parallel Execution |
-|-------|-------|-------------------|
-| 0 | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 | All six in parallel |
-| 1 | 1.1, 1.2, 1.3 | 1.1 and 1.2 in parallel; 1.3 after 1.1+1.2 |
-| 2 | 2.1, 2.2, 2.3 | 2.1 and 2.2 in parallel; 2.3 after 2.1+2.2 |
-| 3 | 3.1 | Sequential (after Phase 2) |
-| 4 | 4.1, 4.2 | Both in parallel (after Phase 3) |
-| 5 | 5.1, 5.2, 5.3 | Sequential (after Phase 4) |
-
-**Note**: Phase 2.3 (Pipeline Infrastructure) depends on 2.1 (Engineer) and 2.2 (Orchestrator) as it combines them with Inspector and Tester instances into isolated execution contexts.
-
-### Critical Path
-
-```
-0.1 (Session) → 0.4 (Guide) → 2.2 (Orchestrator) → 2.3 (Pipeline) → 3.1 (Architect) → 5.1 (Coordinator)
-```
-
----
-
-## Session Architecture
-
-### Session Isolation Model
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              SESSION ISOLATION MODEL                                 │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│  SESSION-LOCAL (Isolated per session):                                              │
-│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
-│  │                                                                                │ │
-│  │  • Guide routing state (pending requests, session route cache)                 │ │
-│  │  • Agent instances (Architect, Orchestrator, Engineers, Inspector, Tester)     │ │
-│  │  • Workflow state (current DAG, phase, progress)                               │ │
-│  │  • Session context (metadata, branch, user preferences)                        │ │
-│  │  • Bus subscriptions (session-scoped topics)                                   │ │
-│  │                                                                                │ │
-│  └────────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                     │
-│  SESSION-SHARED (Read-only access across sessions):                                 │
-│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
-│  │                                                                                │ │
-│  │  • Archivalist historical DB (query across sessions, write to own session)     │ │
-│  │  • Librarian index (shared codebase, read-only)                                │ │
-│  │  • Academic sources (shared research, read-only)                               │ │
-│  │  • Global route cache (common routes, read-only fallback)                      │ │
-│  │                                                                                │ │
-│  └────────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                     │
-│  CONTEXT POLLUTION PREVENTION:                                                      │
-│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
-│  │                                                                                │ │
-│  │  • All writes tagged with session ID                                           │ │
-│  │  • Default queries filtered by session ID                                      │ │
-│  │  • Cross-session queries explicit and read-only                                │ │
-│  │  • No shared mutable state between sessions                                    │ │
-│  │  • Agent instances never shared (except Librarian, Academic, Archivalist)      │ │
-│  │                                                                                │ │
-│  └────────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Session Lifecycle
-
-```
-CREATE          ACTIVE              PAUSE              RESUME            COMPLETE
-   │               │                   │                  │                  │
-   ▼               ▼                   ▼                  ▼                  ▼
-┌──────┐      ┌────────┐          ┌────────┐        ┌────────┐        ┌──────────┐
-│Create│─────▶│ Active │─────────▶│ Paused │───────▶│ Active │───────▶│ Complete │
-│State │      │Working │          │Saved   │        │Restored│        │ Archived │
-└──────┘      └────────┘          └────────┘        └────────┘        └──────────┘
-   │               │                   │                  │                  │
-   │               │                   │                  │                  │
-   │          ┌────┴────┐              │                  │                  │
-   │          ▼         ▼              │                  │                  │
-   │     Execute    Interrupt          │                  │                  │
-   │     Workflow   (User)             │                  │                  │
-   │          │         │              │                  │                  │
-   │          └────┬────┘              │                  │                  │
-   │               │                   │                  │                  │
-   │               └───────────────────┘                  │                  │
-   │                                                      │                  │
-   └──────────────────────────────────────────────────────┘                  │
-                                                                             │
-                      Archivalist stores all session history ◀───────────────┘
-```
-
----
-
 ## Common Agent Skills
 
 All agents MUST implement the following common skills for inter-agent routing and communication.
+
+### Step 0: Role-Aware Skill Decision (All Agents)
+
+**CRITICAL: Every agent MUST perform Step 0 before processing ANY information.**
+
+Step 0 is a role-aware decision gate where each agent asks: "Given MY specific role and the information I'm processing, SHOULD I invoke any of my skills?"
+
+**Files to create:**
+- `agents/common/step0.go`
+- `agents/common/reroute.go`
+
+**Acceptance Criteria:**
+
+#### Step 0 Evaluation
+- [ ] Receive information (request, message, data)
+- [ ] Evaluate against agent's role: "What am I responsible for?"
+- [ ] Evaluate against agent's domain: "Is this information within my domain?"
+- [ ] Evaluate against agent's skills: "Do I have skills that apply to this?"
+- [ ] Make decision: YES (invoke skills), NO (reroute), or PARTIAL (need more context)
+
+#### Decision Handling
+- [ ] **YES** → Proceed with skill execution for this request
+- [ ] **NO** → Send `REROUTE_REQUEST` to Guide with reason and suggested target
+- [ ] **PARTIAL** → Query for additional context before deciding
+
+#### Reroute Request Format
+- [ ] `REROUTE_REQUEST` message type implemented
+- [ ] Include `source` (this agent's ID)
+- [ ] Include `reason` (why this isn't the agent's domain)
+- [ ] Include `suggested_target` (which agent might be better suited)
+- [ ] Include `original_request` (the full original message)
+
+```go
+type RerouteRequest struct {
+    Type            string      `json:"type"`  // "REROUTE_REQUEST"
+    Source          string      `json:"source"`
+    Reason          string      `json:"reason"`
+    SuggestedTarget string      `json:"suggested_target,omitempty"`
+    OriginalRequest interface{} `json:"original_request"`
+}
+```
+
+#### Step 0 Base Prompt Fragment
+- [ ] `AgentStep0Prompt` constant defined
+- [ ] Template includes `[AGENT_ROLE_DESCRIPTION]` placeholder
+- [ ] Template includes `[AGENT_DOMAIN]` placeholder
+- [ ] Template includes `[AGENT_SKILL_LIST]` placeholder
+- [ ] All agents inject this prompt fragment into their system prompts
+
+#### Guide Reroute Handling
+- [ ] Guide tracks reroute count per request
+- [ ] First reroute: normal, proceed to suggested target
+- [ ] Second reroute: warning logged, likely ambiguous request
+- [ ] Third reroute: STOP, ask user for clarification
+- [ ] Reroute history maintained: `{from, reason, to}` for each hop
+- [ ] User clarification message explains what agents said and why
+
+**Tests:**
+- [ ] Test Step 0 decision for "YES" case (within domain)
+- [ ] Test Step 0 decision for "NO" case (outside domain)
+- [ ] Test Step 0 decision for "PARTIAL" case (need more context)
+- [ ] Test REROUTE_REQUEST message generation
+- [ ] Test Guide reroute handling with 1, 2, 3+ reroutes
+- [ ] Test user clarification triggered after 2+ reroutes
 
 ### Routing Skills (All Agents)
 
@@ -5368,111 +10227,2664 @@ var TesterSlashCommands = map[string]string{
 
 ---
 
-## Concurrency Design Principles
+## Agent Efficiency Techniques
 
-### 1. All Messages Through Guide
+### 6.21 Scratchpad Memory
+
+Within-session working memory for agents to track notes, reasoning, and temporary state.
+
+**Files to create:**
+- `agents/common/scratchpad.go`
+- `agents/common/scratchpad_test.go`
+- `skills/scratchpad_skill.go`
+
+**Acceptance Criteria:**
+
+#### Scratchpad Data Structure
+- [ ] `ScratchpadEntry` with key, value, category, timestamp, expiry
+- [ ] `Scratchpad` manager with `Set()`, `Get()`, `Delete()`, `GetByCategory()`, `All()`
+- [ ] Session-scoped (entries tied to session ID)
+- [ ] Auto-cleanup on session end
+- [ ] Thread-safe with RWMutex
+
 ```go
-// CORRECT: Route through Guide
-guide.PublishRequest(&RouteRequest{
-    SessionID:     session.ID(),
-    Input:         "query codebase for middleware",
-    TargetAgentID: "librarian",
-})
-
-// WRONG: Direct agent call
-librarian.Query("middleware") // Never do this between agents
-```
-
-### 2. Session-Scoped State
-```go
-// All state operations include session context
-store.Insert(entry, session.ID())
-cache.Get(key, session.ID())
-pending.Add(request, session.ID())
-```
-
-### 3. Shared Read, Isolated Write
-```go
-// Read from any session (explicit)
-archivalist.QueryCrossSession(query)
-
-// Write only to own session (enforced)
-archivalist.Store(entry) // Automatically tagged with session ID
-```
-
-### 4. Bounded Concurrency
-```go
-type SessionConfig struct {
-    MaxConcurrentTasks int // e.g., 50
-    MaxEngineers       int // e.g., 20
-}
-
-type SystemConfig struct {
-    MaxSessions        int // e.g., 100
-    MaxTotalEngineers  int // e.g., 500
+type ScratchpadEntry struct {
+    Key       string    `json:"key"`
+    Value     string    `json:"value"`
+    Category  string    `json:"category"`
+    CreatedAt time.Time `json:"created_at"`
+    ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 ```
 
----
+#### Scratchpad Skills
+- [ ] `scratchpad_set` - Store a note (key, value, category optional)
+- [ ] `scratchpad_get` - Retrieve a note by key
+- [ ] `scratchpad_list` - List all notes (optional category filter)
+- [ ] `scratchpad_delete` - Remove a note by key
 
-## Testing Strategy
+#### Common Use Cases
+- [ ] "Requirements noted from user" category
+- [ ] "Partial work" category for intermediate results
+- [ ] "Decisions made" category for reasoning trail
+- [ ] "Blockers found" category for issues
 
-### Unit Tests
-Each component has `*_test.go` with:
-- Constructor tests
-- Method tests
-- Error handling tests
-- Concurrency tests (race detector)
-- Skill loading tests
-
-### Integration Tests
-```
-tests/integration/
-├── workflow_test.go          # Full workflow end-to-end
-├── multi_session_test.go     # Concurrent sessions
-├── session_isolation_test.go # No context pollution
-├── session_switching_test.go # State preservation
-├── failure_test.go           # Failure recovery
-├── quality_loop_test.go      # Inspector + Tester loop
-└── skill_loading_test.go     # Progressive disclosure
-```
-
-### Running Tests
-```bash
-go test ./... -race
-go test ./tests/integration/... -v -timeout 10m
-go test ./tests/benchmark/... -bench=. -benchmem
-```
+**Tests:**
+- [ ] Set and get works correctly
+- [ ] Category filtering works
+- [ ] Expiry removes old entries
+- [ ] Session isolation (can't access other session's notes)
+- [ ] Thread-safe under concurrent access
 
 ---
 
-## Acceptance Verification
+### 6.22 Code Style Inference
 
-Before marking a phase complete:
+Automatic detection of project code style from existing files.
 
-1. **Build passes**: `go build ./...`
-2. **Vet passes**: `go vet ./...`
-3. **Tests pass**: `go test ./... -race`
-4. **Coverage > 70%**: `go test ./... -cover`
-5. **No race conditions**: Tests pass with `-race` flag
-6. **Integration works**: Component integrates with existing system
-7. **Skills defined**: All skills documented and registered
-8. **Hooks implemented**: All lifecycle hooks in place
-9. **Session-aware**: All state operations include session context
+**Files to create:**
+- `agents/engineer/style_inference.go`
+- `agents/engineer/style_inference_test.go`
+- `skills/style_check_skill.go`
+
+**Acceptance Criteria:**
+
+#### Style Analysis
+- [ ] `InferredStyle` struct with naming, formatting, patterns
+- [ ] `StyleInferrer.Analyze()` reads sample files
+- [ ] Detect naming conventions (camelCase, snake_case, PascalCase)
+- [ ] Detect indentation (tabs vs spaces, indent width)
+- [ ] Detect quote style (single vs double)
+- [ ] Detect trailing comma preference
+- [ ] Detect import organization pattern
+
+```go
+type InferredStyle struct {
+    Language       string              `json:"language"`
+    NamingConvention struct {
+        Variables string `json:"variables"` // "camelCase", "snake_case"
+        Functions string `json:"functions"`
+        Types     string `json:"types"`
+        Constants string `json:"constants"` // "SCREAMING_SNAKE"
+    } `json:"naming_convention"`
+    Formatting struct {
+        IndentStyle string `json:"indent_style"` // "tabs", "spaces"
+        IndentSize  int    `json:"indent_size"`
+        QuoteStyle  string `json:"quote_style"` // "single", "double"
+        TrailingComma bool `json:"trailing_comma"`
+    } `json:"formatting"`
+    Patterns struct {
+        ErrorHandling string `json:"error_handling"` // "early_return", "nested"
+        Imports       string `json:"imports"`        // "grouped", "ungrouped"
+    } `json:"patterns"`
+}
+```
+
+#### Style Check Skill
+- [ ] `check_style` skill returns project style for language
+- [ ] Caches inferred styles per project/language
+- [ ] Updates when new files detected
+- [ ] Returns actionable guidance
+
+**Tests:**
+- [ ] Correctly detects camelCase vs snake_case
+- [ ] Correctly detects tabs vs spaces
+- [ ] Handles mixed styles (reports majority)
+- [ ] Cache invalidation on new files
+- [ ] Multi-language project support
 
 ---
 
-## Notes
+### 6.23 Component/Pattern Registry
 
-- All agents must implement bus integration (Start/Stop/IsRunning)
-- All agents must provide `AgentRoutingInfo` for Guide registration
-- All agents must define core skills (always loaded) and extended skills (on demand)
-- All state operations must be session-aware
-- Engineers are invisible to users - all clarifications route through Architect
-- Guide is the only message router - no direct agent communication
-- Archivalist stores all workflow history for future reference
-- Cross-session queries are read-only
-- Use existing patterns from Guide and Archivalist as templates
+Index of reusable UI components, hooks, utilities, and patterns in the project.
+
+**Files to create:**
+- `agents/engineer/component_registry.go`
+- `agents/engineer/component_registry_test.go`
+- `skills/find_component_skill.go`
+
+**Acceptance Criteria:**
+
+#### Registry Data Structure
+- [ ] `RegisteredComponent` with name, type, file path, exports, props/params
+- [ ] `ComponentRegistry` with `Register()`, `Find()`, `FindByType()`, `GetAll()`
+- [ ] Auto-scan project for components on startup
+- [ ] Watch for file changes and update registry
+
+```go
+type RegisteredComponent struct {
+    Name        string            `json:"name"`
+    Type        string            `json:"type"`  // "component", "hook", "utility", "pattern"
+    FilePath    string            `json:"file_path"`
+    Exports     []string          `json:"exports"`
+    Props       []ComponentProp   `json:"props,omitempty"`
+    Description string            `json:"description,omitempty"`
+    Examples    []string          `json:"examples,omitempty"`
+}
+
+type ComponentProp struct {
+    Name     string `json:"name"`
+    Type     string `json:"type"`
+    Required bool   `json:"required"`
+    Default  string `json:"default,omitempty"`
+}
+```
+
+#### Component Scanning
+- [ ] Scan React/Vue/Svelte component files
+- [ ] Extract exported names
+- [ ] Parse props/parameters
+- [ ] Detect custom hooks (use* pattern)
+- [ ] Detect utility functions
+
+#### Find Component Skill
+- [ ] `find_component` - Search by name or purpose
+- [ ] Returns existing components that match need
+- [ ] Includes usage examples from codebase
+- [ ] Warns before suggesting new component that exists
+
+**Tests:**
+- [ ] Correctly finds React components
+- [ ] Extracts props from TypeScript interfaces
+- [ ] Detects hooks correctly
+- [ ] Search by partial name works
+- [ ] Updates on file change
+
+---
+
+### 6.24 Mistake Memory
+
+Cross-session learning from errors and anti-patterns.
+
+**Files to create:**
+- `agents/common/mistake_memory.go`
+- `agents/common/mistake_memory_test.go`
+- `skills/recall_mistakes_skill.go`
+
+**Acceptance Criteria:**
+
+#### Mistake Data Structure
+- [ ] `RecordedMistake` with pattern, context, resolution, occurrences
+- [ ] `MistakeMemory` with `Record()`, `Recall()`, `RecallByCategory()`
+- [ ] Persistent storage (SQLite)
+- [ ] Relevance scoring (recent + frequent = higher priority)
+
+```go
+type RecordedMistake struct {
+    ID         string    `json:"id"`
+    Pattern    string    `json:"pattern"`     // What went wrong
+    Category   string    `json:"category"`    // "syntax", "logic", "import", "api_misuse"
+    Context    string    `json:"context"`     // Where/when it happened
+    Resolution string    `json:"resolution"`  // How to fix
+    Occurrences int      `json:"occurrences"`
+    FirstSeen  time.Time `json:"first_seen"`
+    LastSeen   time.Time `json:"last_seen"`
+    FilePaths  []string  `json:"file_paths"`  // Where it occurred
+}
+```
+
+#### Mistake Recording
+- [ ] Automatic recording from failed builds/tests
+- [ ] Manual recording via skill
+- [ ] Increment occurrences on repeat
+- [ ] Extract patterns from error messages
+
+#### Recall Skill
+- [ ] `recall_mistakes` - Get relevant past mistakes
+- [ ] Accepts optional category filter
+- [ ] Returns most relevant (recent + frequent) first
+- [ ] Used by Engineer before writing similar code
+
+**Tests:**
+- [ ] Records mistakes correctly
+- [ ] Increments occurrences on repeat
+- [ ] Persistence across restarts
+- [ ] Relevance scoring works
+- [ ] Category filtering works
+
+---
+
+### 6.25 Diff Preview
+
+Preview changes before applying them.
+
+**Files to create:**
+- `agents/engineer/diff_preview.go`
+- `agents/engineer/diff_preview_test.go`
+- `skills/diff_preview_skill.go`
+
+**Acceptance Criteria:**
+
+#### Diff Generation
+- [ ] `DiffPreview` with original, proposed, unified diff, stats
+- [ ] Generate unified diff format
+- [ ] Calculate stats (lines added, removed, changed)
+- [ ] Support multi-file diffs
+- [ ] Syntax highlighting hints
+
+```go
+type DiffPreview struct {
+    FilePath    string `json:"file_path"`
+    Original    string `json:"original,omitempty"`
+    Proposed    string `json:"proposed,omitempty"`
+    UnifiedDiff string `json:"unified_diff"`
+    Stats       DiffStats `json:"stats"`
+}
+
+type DiffStats struct {
+    LinesAdded   int `json:"lines_added"`
+    LinesRemoved int `json:"lines_removed"`
+    LinesChanged int `json:"lines_changed"`
+    Hunks        int `json:"hunks"`
+}
+```
+
+#### Preview Skill
+- [ ] `preview_diff` - Show what changes would be made
+- [ ] Accepts file path and proposed content
+- [ ] Returns unified diff and stats
+- [ ] Can preview multiple files at once
+
+#### Validation
+- [ ] Flag potentially dangerous changes (>100 lines removed)
+- [ ] Flag changes to sensitive files (.env, credentials)
+- [ ] Suggest review for large refactors
+
+**Tests:**
+- [ ] Unified diff format correct
+- [ ] Stats calculation accurate
+- [ ] Multi-file preview works
+- [ ] Sensitive file detection works
+- [ ] Large change warning triggers
+
+---
+
+### 6.26 User Preference Learning
+
+Learn and apply user preferences over time.
+
+**Files to create:**
+- `agents/common/preference_learning.go`
+- `agents/common/preference_learning_test.go`
+- `skills/preferences_skill.go`
+
+**Acceptance Criteria:**
+
+#### Preference Data Structure
+- [ ] `UserPreference` with domain, key, value, confidence, source
+- [ ] `PreferenceStore` with `Learn()`, `Get()`, `GetAll()`
+- [ ] Persistent storage (SQLite)
+- [ ] Confidence increases with repeated signals
+
+```go
+type UserPreference struct {
+    Domain     string    `json:"domain"`      // "code_style", "communication", "workflow"
+    Key        string    `json:"key"`         // "verbosity", "test_framework"
+    Value      string    `json:"value"`       // "concise", "jest"
+    Confidence float64   `json:"confidence"`  // 0.0-1.0
+    Source     string    `json:"source"`      // "explicit", "implicit", "inferred"
+    LearnedAt  time.Time `json:"learned_at"`
+    SeenCount  int       `json:"seen_count"`
+}
+```
+
+#### Learning Sources
+- [ ] Explicit: User says "I prefer X"
+- [ ] Implicit: User accepts/rejects suggestions
+- [ ] Inferred: Patterns from code edits
+
+#### Preference Application
+- [ ] `get_preferences` - Retrieve preferences for domain
+- [ ] `set_preference` - Explicitly set a preference
+- [ ] Preferences influence response generation
+- [ ] Confidence-weighted (high confidence = strong preference)
+
+**Tests:**
+- [ ] Explicit preferences stored correctly
+- [ ] Confidence increases on repeated signals
+- [ ] Implicit learning from accept/reject
+- [ ] Persistence across sessions
+- [ ] Domain filtering works
+
+---
+
+### 6.27 File Snapshot Cache
+
+Efficient caching of file states to avoid re-reading.
+
+**Files to create:**
+- `agents/common/file_snapshot.go`
+- `agents/common/file_snapshot_test.go`
+
+**Acceptance Criteria:**
+
+#### Snapshot Data Structure
+- [ ] `FileSnapshot` with path, content hash, last modified, content
+- [ ] `SnapshotCache` with `Get()`, `Invalidate()`, `InvalidateAll()`
+- [ ] Content-addressable (hash-based)
+- [ ] LRU eviction when over capacity
+
+```go
+type FileSnapshot struct {
+    Path         string    `json:"path"`
+    ContentHash  string    `json:"content_hash"`
+    LastModified time.Time `json:"last_modified"`
+    Content      []byte    `json:"-"`
+    LineCount    int       `json:"line_count"`
+    Size         int64     `json:"size"`
+}
+
+type SnapshotCache struct {
+    maxSize    int64
+    currentSize int64
+    snapshots  map[string]*FileSnapshot
+    lru        *list.List
+    mu         sync.RWMutex
+}
+```
+
+#### Cache Operations
+- [ ] Check modified time before returning cached
+- [ ] Automatic invalidation on file change detection
+- [ ] Pre-warm cache for frequently accessed files
+- [ ] Track access patterns for eviction
+
+#### Integration
+- [ ] File read operations use cache
+- [ ] Invalidate on write operations
+- [ ] Stats: hits, misses, evictions
+
+**Tests:**
+- [ ] Cache hit returns correct content
+- [ ] Modified file triggers re-read
+- [ ] LRU eviction works correctly
+- [ ] Write invalidates cache
+- [ ] Concurrent access safe
+
+---
+
+### 6.28 Dependency Awareness
+
+Track project dependencies and their APIs.
+
+**Files to create:**
+- `agents/engineer/dependency_awareness.go`
+- `agents/engineer/dependency_awareness_test.go`
+- `skills/check_dependency_skill.go`
+
+**Acceptance Criteria:**
+
+#### Dependency Tracking
+- [ ] `TrackedDependency` with name, version, import path, common APIs
+- [ ] `DependencyTracker` with `Scan()`, `Get()`, `GetAll()`
+- [ ] Parse package.json, go.mod, requirements.txt, etc.
+- [ ] Track which dependencies are actually used
+
+```go
+type TrackedDependency struct {
+    Name        string   `json:"name"`
+    Version     string   `json:"version"`
+    ImportPath  string   `json:"import_path"`
+    CommonAPIs  []string `json:"common_apis"`
+    UsedIn      []string `json:"used_in"`      // File paths
+    DevOnly     bool     `json:"dev_only"`
+    Deprecated  bool     `json:"deprecated,omitempty"`
+}
+```
+
+#### API Awareness
+- [ ] Index common APIs from frequently-used deps
+- [ ] Detect deprecated API usage
+- [ ] Suggest correct imports
+- [ ] Version compatibility warnings
+
+#### Check Dependency Skill
+- [ ] `check_dependency` - Get info about a dependency
+- [ ] Returns version, common APIs, usage examples
+- [ ] Warns about deprecated/insecure versions
+
+**Tests:**
+- [ ] Parses package.json correctly
+- [ ] Parses go.mod correctly
+- [ ] Tracks usage across files
+- [ ] Detects deprecated APIs
+- [ ] Version parsing correct
+
+---
+
+### 6.29 Task Continuity
+
+Checkpoint and resume interrupted tasks.
+
+**Files to create:**
+- `agents/common/task_continuity.go`
+- `agents/common/task_continuity_test.go`
+- `skills/checkpoint_skill.go`
+
+**Acceptance Criteria:**
+
+#### Checkpoint Data Structure
+- [ ] `TaskCheckpoint` with task ID, description, progress, state, files modified
+- [ ] `ContinuityManager` with `Checkpoint()`, `Resume()`, `List()`, `Clear()`
+- [ ] Persistent storage (JSON files or SQLite)
+- [ ] Auto-checkpoint on significant progress
+
+```go
+type TaskCheckpoint struct {
+    ID            string            `json:"id"`
+    TaskDescription string          `json:"task_description"`
+    Progress      TaskProgress      `json:"progress"`
+    State         map[string]any    `json:"state"`
+    FilesModified []string          `json:"files_modified"`
+    CreatedAt     time.Time         `json:"created_at"`
+    UpdatedAt     time.Time         `json:"updated_at"`
+}
+
+type TaskProgress struct {
+    TotalSteps     int      `json:"total_steps"`
+    CompletedSteps int      `json:"completed_steps"`
+    CurrentStep    string   `json:"current_step"`
+    NextSteps      []string `json:"next_steps"`
+    Blockers       []string `json:"blockers,omitempty"`
+}
+```
+
+#### Checkpoint Skills
+- [ ] `checkpoint_task` - Save current progress
+- [ ] `resume_task` - Resume from checkpoint
+- [ ] `list_checkpoints` - Show incomplete tasks
+- [ ] Auto-checkpoint on multi-step tasks
+
+#### Resume Logic
+- [ ] Restore state from checkpoint
+- [ ] Validate files haven't changed significantly
+- [ ] Generate handoff context for agent
+- [ ] Clear checkpoint on task completion
+
+**Tests:**
+- [ ] Checkpoint saves all state
+- [ ] Resume restores correctly
+- [ ] File change detection works
+- [ ] Persistence across restarts
+- [ ] Auto-checkpoint triggers correctly
+
+---
+
+### 6.30 Design Token Awareness
+
+Track and apply design system tokens.
+
+**Files to create:**
+- `agents/designer/design_tokens.go`
+- `agents/designer/design_tokens_test.go`
+- `skills/design_token_skill.go`
+
+**Acceptance Criteria:**
+
+#### Token Data Structure
+- [ ] `DesignToken` with category, name, value, usage context
+- [ ] `DesignTokenRegistry` with `Get()`, `GetByCategory()`, `Suggest()`
+- [ ] Parse from CSS variables, Tailwind config, theme files
+- [ ] Auto-scan project for design system
+
+```go
+type DesignToken struct {
+    Category string `json:"category"` // "color", "spacing", "typography", "shadow"
+    Name     string `json:"name"`     // "primary", "md", "heading-1"
+    Value    string `json:"value"`    // "#3b82f6", "16px", "24px"
+    Usage    string `json:"usage"`    // "Primary brand color for buttons and links"
+    CSSVar   string `json:"css_var,omitempty"`  // "--color-primary"
+    Tailwind string `json:"tailwind,omitempty"` // "text-primary"
+}
+```
+
+#### Token Discovery
+- [ ] Scan CSS custom properties (--var-name)
+- [ ] Parse Tailwind theme config
+- [ ] Parse design system JSON/JS exports
+- [ ] Map values to semantic names
+
+#### Design Token Skill
+- [ ] `get_design_token` - Get token by category/name
+- [ ] `suggest_token` - Find token for a use case
+- [ ] Returns value, CSS var, Tailwind class if available
+- [ ] Warns when using raw value instead of token
+
+**Tests:**
+- [ ] Parses CSS variables correctly
+- [ ] Parses Tailwind config correctly
+- [ ] Suggestion finds appropriate tokens
+- [ ] Multiple design system formats supported
+- [ ] Raw value warning triggers
+
+---
+
+## Agent Efficiency Token Savings
+
+### Additional Savings from Efficiency Techniques
+
+| Technique | Savings Per Use | Frequency | Monthly Impact |
+|-----------|-----------------|-----------|----------------|
+| **Scratchpad** | ~50 tokens (avoids re-explain) | ~20% of queries | ~2% |
+| **Style Inference** | ~100 tokens (no style questions) | ~15% of edits | ~1.5% |
+| **Component Registry** | ~200 tokens (avoids duplication) | ~10% of UI work | ~1% |
+| **Mistake Memory** | ~150 tokens (avoids repeat errors) | ~8% of builds | ~1% |
+| **Diff Preview** | ~100 tokens (confident changes) | ~25% of edits | ~1.5% |
+| **Preference Learning** | ~75 tokens (no clarification) | ~30% of queries | ~2% |
+| **File Snapshot** | ~50 tokens (no re-read) | ~40% of file ops | ~1.5% |
+| **Dependency Awareness** | ~100 tokens (correct imports) | ~15% of edits | ~1% |
+| **Task Continuity** | ~300 tokens (resume vs restart) | ~5% of sessions | ~0.5% |
+| **Design Tokens** | ~75 tokens (correct values) | ~20% of UI work | ~0.5% |
+| **TOTAL** | | | **~12.5%** |
+
+### Updated Cost Projections
+
+| Scenario | Monthly Cost | vs Baseline |
+|----------|-------------|-------------|
+| Baseline (no optimization) | $285/month | - |
+| Cache only | $94/month | 67% savings |
+| Cache + VectorGraphDB | $72/month | 75% savings |
+| Cache + VectorGraphDB + XOR | $60/month | ~80% savings |
+| **+ Agent Efficiency** | **$45/month** | **~85% savings** |
+
+**Target**: 85% token reduction with all optimizations enabled.
+
+---
+
+## Skill/Agent Integrations
+
+### 6.31 Designer Agent Implementation
+
+New agent for UI/UX implementation tasks.
+
+**Files to create:**
+- `agents/designer/designer.go`
+- `agents/designer/designer_test.go`
+- `agents/designer/skills.go`
+
+**Acceptance Criteria:**
+
+#### Core Designer Agent
+- [ ] Designer agent struct with standard agent interface
+- [ ] Session-scoped state for design context
+- [ ] Integration with Guide for routing
+- [ ] LLM model selection (Sonnet for speed)
+
+#### Designer Skills (Tier 1 - Core)
+- [ ] `create_component` - Create new UI component
+- [ ] `style_component` - Apply styling to component
+- [ ] `get_design_tokens` - Retrieve design system tokens
+- [ ] `find_component` - Find existing UI components
+- [ ] `preview_ui` - Preview UI changes in isolation
+- [ ] `check_accessibility` - Check a11y compliance
+
+#### Designer Skills (Tier 2 - Contextual)
+- [ ] `analyze_layout` - Suggest layout improvements
+- [ ] `suggest_animation` - Suggest appropriate animations
+- [ ] `audit_consistency` - Audit design consistency
+- [ ] `generate_variants` - Generate component variants
+- [ ] `consult_engineer` - Consult on implementation
+- [ ] `consult_academic` - Research UI/UX best practices
+
+#### Designer Skills (Tier 3 - Specialized)
+- [ ] `design_system_scaffold` - Scaffold complete design system
+- [ ] `theme_migration` - Migrate between themes
+- [ ] `responsive_audit` - Full responsive audit
+
+#### Guide Routing Integration
+- [ ] Route UI/UX intents to Designer
+- [ ] Keywords: "component", "ui", "style", "css", "tailwind", "design", "a11y"
+- [ ] Handoff patterns between Designer and Engineer
+
+**Tests:**
+- [ ] Designer agent responds to UI intents
+- [ ] All core skills work correctly
+- [ ] Guide routes to Designer appropriately
+- [ ] Designer/Engineer handoff works
+
+---
+
+### 6.32 Skill/Agent Integration Matrix
+
+Integrate efficiency techniques with appropriate agents per the mapping.
+
+**Reference Matrix:**
+
+| Technique              | Guide | Architect | Engineer | Inspector | Tester | Designer |
+|------------------------|-------|-----------|----------|-----------|--------|----------|
+| Scratchpad Memory      |   -   |     ✓     |    ✓     |     ✓     |   ✓    |    ✓     |
+| Style Inference        |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Component Registry     |   -   |     -     |    ✓     |     -     |   -    |    ✓     |
+| Mistake Memory         |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Diff Preview           |   -   |     -     |    ✓     |     -     |   -    |    ✓     |
+| User Preferences       |   ✓   |     ✓     |    ✓     |     -     |   -    |    ✓     |
+| File Snapshot Cache    |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Dependency Awareness   |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
+| Task Continuity        |   -   |     ✓     |    ✓     |     -     |   ✓    |    -     |
+| Design Token Awareness |   -   |     -     |    ✓     |     ✓     |   -    |    ✓     |
+
+---
+
+### 6.33 Scratchpad Integration
+
+Integrate scratchpad skills with: **Architect, Engineer, Inspector, Tester, Designer**
+
+**Files to modify:**
+- `agents/architect/skills.go` - Add scratchpad skills
+- `agents/engineer/skills.go` - Add scratchpad skills
+- `agents/inspector/skills.go` - Add scratchpad skills
+- `agents/tester/skills.go` - Add scratchpad skills
+- `agents/designer/skills.go` - Add scratchpad skills
+
+**Acceptance Criteria:**
+- [ ] `scratchpad_write` skill available to Architect
+- [ ] `scratchpad_write` skill available to Engineer
+- [ ] `scratchpad_write` skill available to Inspector
+- [ ] `scratchpad_write` skill available to Tester
+- [ ] `scratchpad_write` skill available to Designer
+- [ ] `scratchpad_read` skill available to all above
+- [ ] Session-scoped isolation verified
+- [ ] Agent-specific suggested keys documented
+
+**Suggested Keys by Agent:**
+- **Architect**: `requirements`, `decisions`, `blockers`, `plan_state`
+- **Engineer**: `current_task`, `tried_failed`, `partial_work`
+- **Inspector**: `issues_found`, `review_notes`, `flagged_patterns`
+- **Tester**: `test_cases`, `coverage_gaps`, `flaky_tests`
+- **Designer**: `design_decisions`, `component_notes`, `accessibility_flags`
+
+---
+
+### 6.34 Style Inference Integration
+
+Integrate style inference with: **Engineer, Inspector, Tester**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add style check skill
+- `agents/inspector/skills.go` - Add style check skill
+- `agents/tester/skills.go` - Add style check skill
+
+**Acceptance Criteria:**
+- [ ] `check_style` skill available to Engineer
+- [ ] `check_style` skill available to Inspector
+- [ ] `check_style` skill available to Tester
+- [ ] Engineer uses style before writing code
+- [ ] Inspector compares against detected style
+- [ ] Tester matches test style to project style
+
+---
+
+### 6.35 Component Registry Integration
+
+Integrate component registry with: **Engineer, Designer**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add find_component skill
+- `agents/designer/skills.go` - Add find_component skill
+
+**Acceptance Criteria:**
+- [ ] `find_component` skill available to Engineer
+- [ ] `find_component` skill available to Designer
+- [ ] Auto-suggest existing components before creating new
+- [ ] Warn when creating duplicate component
+- [ ] Designer priority access (primary user)
+
+---
+
+### 6.36 Mistake Memory Integration
+
+Integrate mistake memory with: **Engineer, Inspector, Tester** (Archivalist as source)
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add recall_mistakes skill
+- `agents/inspector/skills.go` - Add recall_mistakes skill
+- `agents/tester/skills.go` - Add recall_mistakes skill
+- `agents/archivalist/skills.go` - Add mistake storage/retrieval
+
+**Acceptance Criteria:**
+- [ ] `recall_mistakes` skill available to Engineer
+- [ ] `recall_mistakes` skill available to Inspector
+- [ ] `recall_mistakes` skill available to Tester
+- [ ] Archivalist records mistakes from failed builds/tests
+- [ ] Engineer queries before similar work
+- [ ] Inspector flags known anti-patterns
+- [ ] Tester knows common failure patterns
+
+---
+
+### 6.37 Diff Preview Integration
+
+Integrate diff preview with: **Engineer, Designer**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add preview_diff skill
+- `agents/designer/skills.go` - Add preview_diff skill
+
+**Acceptance Criteria:**
+- [ ] `preview_diff` skill available to Engineer
+- [ ] `preview_diff` skill available to Designer
+- [ ] Preview before large changes (>50 lines)
+- [ ] Warn on sensitive file changes
+- [ ] Stats: lines added/removed/changed
+
+---
+
+### 6.38 User Preferences Integration
+
+Integrate user preferences with: **Guide, Architect, Engineer, Designer**
+
+**Files to modify:**
+- `agents/guide/skills.go` - Add preference skills
+- `agents/architect/skills.go` - Add preference skills
+- `agents/engineer/skills.go` - Add preference skills
+- `agents/designer/skills.go` - Add preference skills
+
+**Acceptance Criteria:**
+- [ ] `get_preferences` skill available to Guide
+- [ ] `get_preferences` skill available to Architect
+- [ ] `get_preferences` skill available to Engineer
+- [ ] `get_preferences` skill available to Designer
+- [ ] Guide routes based on workflow preferences
+- [ ] Architect adjusts verbosity per preference
+- [ ] Engineer follows code style preferences
+- [ ] Designer follows design style preferences
+
+---
+
+### 6.39 File Snapshot Cache Integration
+
+Integrate file snapshot cache with: **Engineer, Inspector, Tester** (Librarian as source)
+
+**Files to modify:**
+- `agents/engineer/file_ops.go` - Use snapshot cache
+- `agents/inspector/file_ops.go` - Use snapshot cache
+- `agents/tester/file_ops.go` - Use snapshot cache
+- `agents/librarian/indexer.go` - Populate snapshot cache
+
+**Acceptance Criteria:**
+- [ ] Engineer reads use snapshot cache
+- [ ] Inspector reads use snapshot cache
+- [ ] Tester reads use snapshot cache
+- [ ] Librarian populates cache during indexing
+- [ ] Cache invalidation on write operations
+- [ ] Stats: cache hits, misses, evictions
+
+---
+
+### 6.40 Dependency Awareness Integration
+
+Integrate dependency awareness with: **Engineer, Inspector, Tester** (Academic as source)
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add check_dependency skill
+- `agents/inspector/skills.go` - Add check_dependency skill
+- `agents/tester/skills.go` - Add check_dependency skill
+- `agents/academic/skills.go` - Provide dependency best practices
+
+**Acceptance Criteria:**
+- [ ] `check_dependency` skill available to Engineer
+- [ ] `check_dependency` skill available to Inspector
+- [ ] `check_dependency` skill available to Tester
+- [ ] Engineer uses correct imports
+- [ ] Inspector flags deprecated deps
+- [ ] Tester mocks dependencies correctly
+- [ ] Academic provides version/security info
+
+---
+
+### 6.41 Task Continuity Integration
+
+Integrate task continuity with: **Architect, Engineer, Tester**
+
+**Files to modify:**
+- `agents/architect/skills.go` - Add checkpoint skills
+- `agents/engineer/skills.go` - Add checkpoint skills
+- `agents/tester/skills.go` - Add checkpoint skills
+
+**Acceptance Criteria:**
+- [ ] `checkpoint_task` skill available to Architect
+- [ ] `checkpoint_task` skill available to Engineer
+- [ ] `checkpoint_task` skill available to Tester
+- [ ] `resume_task` skill available to all above
+- [ ] Auto-checkpoint on significant progress
+- [ ] Resume generates handoff context
+
+---
+
+### 6.42 Design Token Integration
+
+Integrate design tokens with: **Engineer, Inspector, Designer**
+
+**Files to modify:**
+- `agents/engineer/skills.go` - Add design token skills
+- `agents/inspector/skills.go` - Add design token skills
+- `agents/designer/skills.go` - Add design token skills
+
+**Acceptance Criteria:**
+- [ ] `get_design_tokens` skill available to Engineer
+- [ ] `get_design_tokens` skill available to Inspector
+- [ ] `get_design_tokens` skill available to Designer
+- [ ] `find_design_token` skill available to all above
+- [ ] Engineer uses tokens instead of hardcoded values
+- [ ] Inspector flags hardcoded values
+- [ ] Designer primary user of tokens
+
+---
+
+## Lazy Tool Loading
+
+Universal meta-skill enabling on-demand tool schema loading for all agents. Reduces token usage by 50-70% per turn.
+
+**Tier**: 3 (Agents) - Can be implemented in parallel with Pipelines (Tier 4) and Storage (Tier 5)
+
+**Dependencies**:
+- Phase 0: Infrastructure (message bus, hooks system)
+- Agent Skill Definitions (tool schemas exist)
+
+**Parallelizable with**:
+- Single-Worker Pipeline System (Tier 4)
+- Phase 6: VectorGraphDB (Tier 5)
+
+---
+
+### 6.50 Tool Registry Implementation
+
+Core tool registry that stores manifests, schemas, and bundles.
+
+**Files to create:**
+- `core/tools/registry.go`
+- `core/tools/manifest.go`
+- `core/tools/bundle.go`
+
+**Implementation:**
+
+```go
+// core/tools/registry.go
+type ToolRegistry struct {
+    mu        sync.RWMutex
+    manifests map[string]*ToolManifest    // agentID -> manifest
+    schemas   map[string]map[string]any   // toolName -> full schema
+    bundles   map[string][]BundleEntry    // agentID -> bundles
+}
+
+func NewToolRegistry() *ToolRegistry
+func (r *ToolRegistry) RegisterAgent(agentID string, tools []ToolDefinition, bundles []BundleEntry)
+func (r *ToolRegistry) GetManifest(agentID string) *ToolManifest
+func (r *ToolRegistry) GetSchema(toolName string) map[string]any
+func (r *ToolRegistry) GetSchemas(toolNames []string) []map[string]any
+func (r *ToolRegistry) GetBundle(agentID, bundleName string) *BundleEntry
+```
+
+**Acceptance Criteria:**
+- [ ] `ToolRegistry` struct implemented with thread-safe access
+- [ ] `RegisterAgent` stores manifest, schemas, and bundles
+- [ ] `GetManifest` returns lightweight manifest (~20 tokens per tool)
+- [ ] `GetSchema` returns full JSON schema for a tool
+- [ ] `GetSchemas` batch retrieval for multiple tools
+- [ ] `GetBundle` returns tools in a named bundle
+- [ ] Unit tests for all registry operations
+- [ ] Benchmark: manifest retrieval < 1ms
+
+---
+
+### 6.51 Tool Manifest Data Structures
+
+Lightweight tool descriptors for agent bootstrap.
+
+**Files to create:**
+- `core/tools/manifest.go`
+
+**Implementation:**
+
+```go
+// core/tools/manifest.go
+type ToolManifestEntry struct {
+    Name        string   `json:"name"`
+    Description string   `json:"description"`  // Max 100 chars
+    Category    string   `json:"category"`
+    BundleHint  string   `json:"bundle_hint"`
+    Keywords    []string `json:"keywords"`
+}
+
+type ToolManifest struct {
+    AgentID     string              `json:"agent_id"`
+    Tools       []ToolManifestEntry `json:"tools"`
+    Bundles     []BundleEntry       `json:"bundles"`
+    TotalTokens int                 `json:"total_tokens"`
+}
+
+func (m *ToolManifest) HasTool(name string) bool
+func (m *ToolManifest) GetToolsByCategory(category string) []ToolManifestEntry
+func (m *ToolManifest) EstimateTokens() int
+```
+
+**Acceptance Criteria:**
+- [ ] `ToolManifestEntry` limited to essential fields only
+- [ ] Description auto-truncated to 100 characters
+- [ ] `HasTool` O(1) lookup via internal map
+- [ ] `EstimateTokens` accurate within 10% of actual
+- [ ] JSON serialization produces compact output
+- [ ] Unit tests for all manifest operations
+
+---
+
+### 6.52 Tool Bundle Definitions
+
+Predefined tool groupings for efficient loading.
+
+**Files to create:**
+- `core/tools/bundle.go`
+- `agents/designer/bundles.go`
+- `agents/engineer/bundles.go`
+- `agents/*/bundles.go` (for each agent)
+
+**Implementation:**
+
+```go
+// core/tools/bundle.go
+type BundleEntry struct {
+    Name        string   `json:"name"`
+    Description string   `json:"description"`
+    Tools       []string `json:"tools"`
+    UseCases    []string `json:"use_cases"`
+}
+
+// agents/designer/bundles.go
+var DesignerBundles = []BundleEntry{
+    {Name: "component", Tools: [...]},
+    {Name: "design_system", Tools: [...]},
+    {Name: "accessibility", Tools: [...]},
+    {Name: "layout", Tools: [...]},
+    {Name: "preview", Tools: [...]},
+}
+```
+
+**Acceptance Criteria:**
+- [ ] Designer bundles defined: component, design_system, accessibility, layout, preview
+- [ ] Engineer bundles defined: file_ops, execution, consultation
+- [ ] Archivalist bundles defined: query, store, timeline
+- [ ] Inspector bundles defined: code_review, ui_review
+- [ ] Tester bundles defined: test_execution, coverage
+- [ ] Each bundle has clear use cases for auto-suggestion
+- [ ] No tool appears in more than 2 bundles (avoid duplication)
+- [ ] Bundle loading tested for each agent
+
+---
+
+### 6.53 Loaded Tool Set Cache
+
+Per-session cache tracking which tools an agent has loaded.
+
+**Files to create:**
+- `core/tools/cache.go`
+
+**Implementation:**
+
+```go
+// core/tools/cache.go
+type LoadedToolSet struct {
+    AgentID     string
+    SessionID   string
+    CoreTools   []string
+    LoadedTools map[string]bool
+    LoadHistory []LoadEvent
+    mu          sync.RWMutex
+}
+
+type LoadEvent struct {
+    Timestamp  time.Time
+    Tools      []string
+    TaskType   string
+    Successful bool
+}
+
+type LoadedToolCache struct {
+    sets   map[string]*LoadedToolSet  // "agentID:sessionID" -> set
+    config ToolLoaderConfig
+    mu     sync.RWMutex
+}
+
+func NewLoadedToolCache(config ToolLoaderConfig) *LoadedToolCache
+func (c *LoadedToolCache) GetOrCreate(agentID, sessionID string) *LoadedToolSet
+func (c *LoadedToolCache) RecordLoad(agentID, sessionID string, tools []string)
+func (c *LoadedToolCache) IsLoaded(agentID, sessionID, toolName string) bool
+func (c *LoadedToolCache) Cleanup(maxAge time.Duration)
+```
+
+**Acceptance Criteria:**
+- [ ] `LoadedToolSet` tracks loaded tools per agent per session
+- [ ] `LoadEvent` records loading history for pattern learning
+- [ ] Cache automatically creates sets on first access
+- [ ] `IsLoaded` O(1) lookup
+- [ ] `Cleanup` removes expired sets (TTL-based)
+- [ ] Thread-safe for concurrent access
+- [ ] Memory usage < 1KB per session
+- [ ] Unit tests for cache operations
+
+---
+
+### 6.54 Tool Loader Service
+
+Main service coordinating tool loading operations.
+
+**Files to create:**
+- `core/tools/loader.go`
+- `core/tools/config.go`
+
+**Implementation:**
+
+```go
+// core/tools/loader.go
+type ToolLoader struct {
+    registry  *ToolRegistry
+    cache     *LoadedToolCache
+    suggester *IntentBasedSuggester
+    config    ToolLoaderConfig
+}
+
+func NewToolLoader(registry *ToolRegistry, config ToolLoaderConfig) *ToolLoader
+func (l *ToolLoader) Bootstrap(agentID, sessionID string) (*BootstrapResult, error)
+func (l *ToolLoader) LoadTools(ctx context.Context, agentID, sessionID string, toolNames []string) (*LoadResult, error)
+func (l *ToolLoader) LoadBundle(ctx context.Context, agentID, sessionID, bundleName string) (*LoadResult, error)
+func (l *ToolLoader) SuggestTools(ctx context.Context, agentID, intent string) ([]string, error)
+func (l *ToolLoader) GetLoadedTools(agentID, sessionID string) *LoadedToolSet
+
+// core/tools/config.go
+type ToolLoaderConfig struct {
+    AlwaysLoadCore        bool
+    CoreTools             []string
+    MaxToolsPerRequest    int
+    EnableBundles         bool
+    EnableAutoSuggest     bool
+    CacheLoadedTools      bool
+    CacheTTL              time.Duration
+    EnablePatternLearning bool
+}
+
+func DefaultToolLoaderConfig() ToolLoaderConfig
+```
+
+**Acceptance Criteria:**
+- [ ] `Bootstrap` returns manifest + core tools for agent startup
+- [ ] `LoadTools` validates tool names, loads schemas, updates cache
+- [ ] `LoadBundle` expands bundle to tool list, delegates to LoadTools
+- [ ] `SuggestTools` returns relevant tools based on intent
+- [ ] `GetLoadedTools` returns current loaded set for injection
+- [ ] Respects `MaxToolsPerRequest` limit
+- [ ] Respects `CacheTTL` for expiration
+- [ ] Error handling for unknown tools/bundles
+- [ ] Unit tests for all loader operations
+- [ ] Integration test: full load cycle
+
+---
+
+### 6.55 Request Tools Skill Implementation
+
+Universal meta-skill for on-demand tool loading.
+
+**Files to create:**
+- `core/skills/request_tools.go`
+
+**Implementation:**
+
+```go
+// core/skills/request_tools.go
+var RequestToolsSkill = SkillDefinition{
+    Name:        "request_tools",
+    Description: "Load additional tools into your capabilities",
+    Tier:        0,
+    Domain:      "meta",
+    Priority:    100,
+    InputSchema: map[string]any{
+        "type": "object",
+        "properties": map[string]any{
+            "tools":  {"type": "array", "items": {"type": "string"}},
+            "bundle": {"type": "string"},
+            "intent": {"type": "string"},
+        },
+    },
+}
+
+func HandleRequestTools(ctx context.Context, input map[string]any) (*ToolResult, error)
+```
+
+**Acceptance Criteria:**
+- [ ] Skill registered as Tier 0 (always available)
+- [ ] Accepts `tools` array OR `bundle` name OR `intent` string
+- [ ] Validates all requested tools exist in manifest
+- [ ] Returns list of loaded tool names
+- [ ] Returns suggestions for related tools
+- [ ] Errors clearly for unknown tools
+- [ ] Errors clearly when exceeding MaxToolsPerRequest
+- [ ] Unit tests for all input variations
+- [ ] Integration test: skill invocation → schema injection
+
+---
+
+### 6.56 Tool Injection Hooks
+
+Hooks for injecting tool manifest and loaded schemas.
+
+**Files to create:**
+- `core/tools/hooks.go`
+
+**Implementation:**
+
+```go
+// core/tools/hooks.go
+
+// Pre-prompt: Inject manifest + loaded tool schemas
+var InjectToolsHook = Hook{
+    Name:     "inject_loaded_tools",
+    Type:     PrePrompt,
+    Priority: HookPriorityFirst,
+    Handler:  injectToolsHandler,
+}
+
+// Pre-tool: Validate request_tools calls
+var ValidateToolLoadHook = Hook{
+    Name:     "validate_tool_load",
+    Type:     PreTool,
+    Priority: HookPriorityFirst,
+    Trigger:  "request_tools",
+    Handler:  validateToolLoadHandler,
+}
+
+// Post-tool: Record loading for pattern learning
+var RecordToolLoadHook = Hook{
+    Name:     "record_tool_load",
+    Type:     PostTool,
+    Priority: HookPriorityNormal,
+    Trigger:  "request_tools",
+    Handler:  recordToolLoadHandler,
+}
+
+func RegisterToolLoadingHooks(agent Agent)
+```
+
+**Acceptance Criteria:**
+- [ ] `InjectToolsHook` runs before other pre-prompt hooks
+- [ ] Manifest injected on every turn (lightweight)
+- [ ] Loaded tool schemas injected only when present
+- [ ] `ValidateToolLoadHook` blocks invalid tool requests
+- [ ] `RecordToolLoadHook` captures load events for learning
+- [ ] Hooks registered for all agents via common function
+- [ ] Unit tests for each hook
+- [ ] Integration test: hook execution order
+
+---
+
+### 6.57 Intent-Based Tool Suggestion
+
+Embedding-based tool suggestion from natural language intent.
+
+**Files to create:**
+- `core/tools/suggester.go`
+
+**Implementation:**
+
+```go
+// core/tools/suggester.go
+type IntentBasedSuggester struct {
+    embedder    Embedder
+    toolEmbeds  map[string][]float32
+    bundleIndex map[string][]string
+}
+
+func NewIntentBasedSuggester(embedder Embedder) *IntentBasedSuggester
+func (s *IntentBasedSuggester) IndexTools(manifest *ToolManifest) error
+func (s *IntentBasedSuggester) SuggestTools(ctx context.Context, intent string, manifest *ToolManifest) ([]string, error)
+func (s *IntentBasedSuggester) SuggestBundle(intent string, bundles []BundleEntry) *BundleEntry
+```
+
+**Acceptance Criteria:**
+- [ ] Tools indexed by embedding their name + description + keywords
+- [ ] `SuggestTools` returns top 5 tools above 0.7 similarity
+- [ ] `SuggestBundle` matches intent against bundle use cases
+- [ ] Suggestions cached for repeated intents
+- [ ] Fallback to keyword matching if embedder unavailable
+- [ ] Latency < 50ms for suggestion
+- [ ] Unit tests with mock embedder
+- [ ] Integration test: intent → suggested tools
+
+---
+
+### 6.58 Agent Integration - Designer
+
+Integrate lazy tool loading with Designer agent.
+
+**Files to modify:**
+- `agents/designer/agent.go`
+- `agents/designer/skills.go`
+- `agents/designer/bundles.go`
+
+**Implementation:**
+- Register `request_tools` skill
+- Register tool loading hooks
+- Define Designer-specific bundles
+- Update bootstrap to use manifest instead of full schemas
+
+**Acceptance Criteria:**
+- [ ] Designer starts with manifest + core tools only
+- [ ] `request_tools` skill available and functional
+- [ ] All 5 Designer bundles defined and loadable
+- [ ] Tool loading works for explicit tool names
+- [ ] Tool loading works for bundle names
+- [ ] Tool loading works for intent-based suggestion
+- [ ] Token usage reduced by 50%+ in simple tasks
+- [ ] No regression in task completion capability
+- [ ] Integration test: Designer task with lazy loading
+
+---
+
+### 6.59 Agent Integration - Engineer
+
+Integrate lazy tool loading with Engineer agent.
+
+**Files to modify:**
+- `agents/engineer/agent.go`
+- `agents/engineer/skills.go`
+- `agents/engineer/bundles.go`
+
+**Acceptance Criteria:**
+- [ ] Engineer starts with manifest + core tools only
+- [ ] `request_tools` skill available and functional
+- [ ] Engineer bundles defined: file_ops, execution, consultation
+- [ ] Tool loading works for all input types
+- [ ] Token usage reduced by 50%+ in simple tasks
+- [ ] No regression in task completion capability
+- [ ] Integration test: Engineer task with lazy loading
+
+---
+
+### 6.60 Agent Integration - All Remaining Agents
+
+Integrate lazy tool loading with all other agents.
+
+**Files to modify:**
+- `agents/archivalist/agent.go`, `bundles.go`
+- `agents/librarian/agent.go`, `bundles.go`
+- `agents/inspector/agent.go`, `bundles.go`
+- `agents/tester/agent.go`, `bundles.go`
+- `agents/architect/agent.go`, `bundles.go`
+- `agents/academic/agent.go`, `bundles.go`
+
+**Acceptance Criteria:**
+- [ ] All agents have `request_tools` skill
+- [ ] All agents have tool loading hooks registered
+- [ ] All agents have appropriate bundles defined
+- [ ] All agents bootstrap with manifest only
+- [ ] Token savings verified for each agent
+- [ ] No regression in any agent's capabilities
+- [ ] Integration tests for each agent
+
+---
+
+### 6.61 Pattern Learning Implementation
+
+Learn tool co-usage patterns to improve suggestions.
+
+**Files to create:**
+- `core/tools/patterns.go`
+
+**Implementation:**
+
+```go
+// core/tools/patterns.go
+type PatternLearner struct {
+    coUsage     map[string]map[string]int  // tool -> tool -> count
+    taskBundles map[string][]string        // taskType -> commonly used tools
+    mu          sync.RWMutex
+}
+
+func NewPatternLearner() *PatternLearner
+func (p *PatternLearner) RecordUsage(taskType string, tools []string, successful bool)
+func (p *PatternLearner) GetCoUsedTools(tool string, limit int) []string
+func (p *PatternLearner) GetTaskBundle(taskType string) []string
+func (p *PatternLearner) Export() *PatternData
+func (p *PatternLearner) Import(data *PatternData)
+```
+
+**Acceptance Criteria:**
+- [ ] Records which tools are used together
+- [ ] Records which tools are used for which task types
+- [ ] Only records successful task completions
+- [ ] `GetCoUsedTools` returns commonly co-used tools
+- [ ] `GetTaskBundle` returns tools commonly used for task type
+- [ ] Patterns exportable/importable for persistence
+- [ ] Patterns improve suggestions over time
+- [ ] Unit tests for pattern operations
+
+---
+
+### 6.62 Lazy Tool Loading Metrics & Monitoring
+
+Metrics for monitoring lazy loading effectiveness.
+
+**Files to create:**
+- `core/tools/metrics.go`
+
+**Implementation:**
+
+```go
+// core/tools/metrics.go
+type ToolLoadingMetrics struct {
+    BootstrapTokensSaved   prometheus.Counter
+    ToolsLoadedTotal       prometheus.Counter
+    BundlesLoadedTotal     prometheus.Counter
+    SuggestionsAccepted    prometheus.Counter
+    SuggestionsRejected    prometheus.Counter
+    CacheHitRate           prometheus.Gauge
+    AverageToolsPerTask    prometheus.Gauge
+    LoadLatencyHistogram   prometheus.Histogram
+}
+
+func RegisterToolLoadingMetrics(registry prometheus.Registerer)
+func RecordToolLoad(agentID string, toolCount int, latency time.Duration)
+func RecordTokenSavings(agentID string, savedTokens int)
+```
+
+**Acceptance Criteria:**
+- [ ] Prometheus metrics registered
+- [ ] Token savings tracked per agent
+- [ ] Tool load count tracked
+- [ ] Cache hit rate tracked
+- [ ] Suggestion acceptance rate tracked
+- [ ] Load latency histogram (p50, p95, p99)
+- [ ] Dashboard template for Grafana
+- [ ] Alerts for degraded performance
+
+---
+
+### 6.63 End-to-End Testing
+
+Comprehensive testing for lazy tool loading system.
+
+**Files to create:**
+- `core/tools/loader_test.go`
+- `core/tools/integration_test.go`
+- `tests/e2e/lazy_loading_test.go`
+
+**Test Scenarios:**
+
+1. **Bootstrap Test**: Agent starts with manifest only
+2. **Explicit Load Test**: Load specific tools by name
+3. **Bundle Load Test**: Load tools via bundle name
+4. **Intent Load Test**: Load tools via intent description
+5. **Cache Test**: Tools remain loaded across turns
+6. **Expiration Test**: Tools expire after TTL
+7. **Concurrent Test**: Multiple sessions load tools simultaneously
+8. **Error Test**: Unknown tool names rejected
+9. **Limit Test**: MaxToolsPerRequest enforced
+10. **Token Savings Test**: Verify 50%+ reduction
+
+**Acceptance Criteria:**
+- [ ] All 10 test scenarios passing
+- [ ] Unit test coverage > 80%
+- [ ] Integration tests for each agent
+- [ ] E2E test for full task completion with lazy loading
+- [ ] Performance benchmark: load latency < 10ms
+- [ ] Memory benchmark: < 1KB per session overhead
+- [ ] Token savings benchmark: 50-70% reduction verified
+
+---
+
+## Git Tooling
+
+Agent-specific git capabilities with permission enforcement.
+
+### 6.70 Git Permission Layer
+
+Core permission system for git operations.
+
+**Files to create:**
+- `core/git/permissions.go`
+- `core/git/permission_set.go`
+- `core/git/validators.go`
+- `core/git/permissions_test.go`
+
+**Acceptance Criteria:**
+
+#### Permission Types
+- [ ] `GitPermission` enum: `Read`, `Commit`, `Branch`, `History`, `Remote`, `Clone`
+- [ ] `PermissionLevel` enum: `None`, `ReadOnly`, `Scoped`, `Full`
+- [ ] `GitPermissionSet` struct with agent-permission mappings
+- [ ] `PermissionCondition` for conditional permissions (e.g., Tester commits)
+
+#### Permission Matrix
+- [ ] Engineer: `Read`, `Commit`, `Branch` (Full)
+- [ ] Designer: `Read`, `Commit`, `Branch` (Full)
+- [ ] Inspector: `Read`, `History` (ReadOnly)
+- [ ] Tester: `Read`, `Commit` (Conditional on test pass)
+- [ ] Architect: `Read`, `Commit`, `Branch`, `History`, `Remote` (Scoped to repo)
+- [ ] Librarian: `Read`, `History`, `Clone` (ReadOnly + temp clone)
+
+#### Validation
+- [ ] `HasPermission(agentID, permission)` check
+- [ ] `ValidateOperation(agentID, operation)` pre-execution hook
+- [ ] `EnforceRepoScope(operation)` for Architect operations
+- [ ] Permission denial returns clear error with reason
+
+---
+
+### 6.71 Git Read Skills
+
+Read-only git operations available to all agents.
+
+**Files to create:**
+- `skills/git/read_skills.go`
+- `skills/git/read_skills_test.go`
+
+**Acceptance Criteria:**
+
+#### Status Operations
+- [ ] `git_status` skill: Returns working tree state
+- [ ] `git_diff` skill: Shows unstaged changes
+- [ ] `git_diff_staged` skill: Shows staged changes
+- [ ] Output formatting for agent consumption (structured JSON)
+
+#### Log Operations
+- [ ] `git_log` skill: Recent commits with configurable count
+- [ ] `git_log_file` skill: History for specific file
+- [ ] `git_show` skill: Details of specific commit
+- [ ] Pagination support for large histories
+
+#### Blame Operations
+- [ ] `git_blame` skill: Line-by-line attribution
+- [ ] `git_blame_range` skill: Blame for specific line range
+- [ ] Cache blame results per session for performance
+
+#### Branch Information
+- [ ] `git_branch_list` skill: List all branches
+- [ ] `git_branch_current` skill: Get current branch name
+- [ ] `git_branch_compare` skill: Compare two branches
+
+---
+
+### 6.72 Git Commit Skills
+
+Commit operations for authorized agents.
+
+**Files to create:**
+- `skills/git/commit_skills.go`
+- `skills/git/commit_message.go`
+- `skills/git/commit_skills_test.go`
+
+**Acceptance Criteria:**
+
+#### Staging Operations
+- [ ] `git_add` skill: Stage specific files
+- [ ] `git_add_all` skill: Stage all changes
+- [ ] `git_reset` skill: Unstage files
+- [ ] Validate file paths exist before staging
+
+#### Commit Operations
+- [ ] `git_commit` skill: Create commit with message
+- [ ] Conventional commit format enforcement
+- [ ] Message generation from task context
+- [ ] Atomic commit validation (no partial commits)
+
+#### Commit Message Generation
+- [ ] `GenerateCommitMessage(changes, taskContext)` helper
+- [ ] Type inference: `feat`, `fix`, `refactor`, `test`, `docs`, `style`
+- [ ] Scope extraction from file paths
+- [ ] Description generation from change summary
+
+#### Commit Validation
+- [ ] Pre-commit validation hook integration
+- [ ] Empty commit prevention
+- [ ] Large file warning (> 1MB)
+- [ ] Binary file handling
+
+---
+
+### 6.73 Auto-Commit Hook (Engineer/Designer)
+
+Automatic commits on successful task completion.
+
+**Files to create:**
+- `hooks/git/auto_commit.go`
+- `hooks/git/auto_commit_test.go`
+
+**Acceptance Criteria:**
+
+#### Hook Configuration
+- [ ] `AutoCommitHook` struct implementing `Hook` interface
+- [ ] Trigger: `signal_complete` from worker
+- [ ] Priority: `HookPriorityLast` (after all other hooks)
+- [ ] Agent filter: Engineer and Designer only
+
+#### Commit Logic
+- [ ] Detect uncommitted changes via `git status`
+- [ ] Generate commit message from completed task
+- [ ] Stage only files modified during task
+- [ ] Create atomic commit
+
+#### Message Format
+```
+<type>(<scope>): <description>
+
+Task: <task_id>
+Agent: <agent_type>
+Session: <session_id>
+```
+
+#### Error Handling
+- [ ] Skip commit if no changes
+- [ ] Log but don't fail if commit fails
+- [ ] Retry once on transient failures
+- [ ] Emit `commit_skipped` event if nothing to commit
+
+---
+
+### 6.74 Inspector Read-Only Skills
+
+Git read capabilities for Inspector with enforcement.
+
+**Files to create:**
+- `skills/git/inspector_skills.go`
+- `skills/git/inspector_skills_test.go`
+
+**Acceptance Criteria:**
+
+#### Available Skills
+- [ ] All read skills from 6.71
+- [ ] `git_diff_review` skill: Formatted diff for code review
+- [ ] `git_history_summary` skill: Condensed recent history
+- [ ] `git_change_impact` skill: Files affected by recent changes
+
+#### Enforcement
+- [ ] Reject any write operations (commit, branch create, etc.)
+- [ ] Clear error message: "Inspector agents have read-only git access"
+- [ ] Log attempted write operations for audit
+
+#### Review Integration
+- [ ] Diff output optimized for review comments
+- [ ] Line number preservation for review anchoring
+- [ ] Context lines configurable (default: 3)
+
+---
+
+### 6.75 Tester Conditional Commit Hook
+
+Conditional commits based on test results.
+
+**Files to create:**
+- `hooks/git/tester_commit.go`
+- `hooks/git/test_evaluation.go`
+- `hooks/git/tester_commit_test.go`
+
+**Acceptance Criteria:**
+
+#### Commit Conditions
+- [ ] `TestPassCondition`: All tests pass
+- [ ] `TestImproveCondition`: Coverage improved OR failures reduced
+- [ ] `TestAddedCondition`: New tests added (regardless of other test state)
+- [ ] Conditions evaluated via `evaluateCommitCondition(current, previous)`
+
+#### Evaluation Logic
+```go
+type CommitDecision struct {
+    ShouldCommit bool
+    Reason       string
+    Condition    CommitConditionType
+}
+```
+
+#### Test Result Tracking
+- [ ] Store previous test results per session
+- [ ] Compare current vs previous for improvement detection
+- [ ] Track: `passed`, `failed`, `skipped`, `coverage`
+
+#### Commit Message
+- [ ] Include test result summary in commit message
+- [ ] Format: `test(<scope>): <description> [pass: X, fail: Y, coverage: Z%]`
+
+#### Rejection Handling
+- [ ] Clear explanation when commit rejected
+- [ ] Suggest: "Fix failing tests before committing"
+- [ ] Option to force commit with `--allow-failures` flag (logged)
+
+---
+
+### 6.76 Architect Branch/History/Remote Skills
+
+Extended git capabilities for Architect with repo scoping.
+
+**Files to create:**
+- `skills/git/architect_skills.go`
+- `skills/git/repo_scope.go`
+- `skills/git/architect_skills_test.go`
+
+**Acceptance Criteria:**
+
+#### Branch Operations
+- [ ] `git_branch_create` skill: Create new branch
+- [ ] `git_branch_delete` skill: Delete branch (with safety checks)
+- [ ] `git_branch_rename` skill: Rename branch
+- [ ] `git_checkout` skill: Switch branches
+- [ ] `git_merge` skill: Merge branches (no force)
+
+#### History Operations
+- [ ] `git_revert` skill: Revert specific commit
+- [ ] `git_cherry_pick` skill: Cherry-pick commit
+- [ ] `git_stash` skill: Stash/unstash changes
+- [ ] NO `git reset --hard` or destructive operations
+
+#### Remote Operations
+- [ ] `git_fetch` skill: Fetch from remote
+- [ ] `git_pull` skill: Pull with rebase option
+- [ ] `git_push` skill: Push to remote (current branch only)
+- [ ] `git_remote_list` skill: List remotes
+
+#### Repo Scoping
+- [ ] All operations scoped via `git rev-parse --show-toplevel`
+- [ ] Reject operations outside current repo
+- [ ] Path validation before any file operations
+- [ ] Log scope violations for audit
+
+---
+
+### 6.77 Librarian Read-Only + Clone Skills
+
+Git capabilities for Librarian with temp clone support.
+
+**Files to create:**
+- `skills/git/librarian_skills.go`
+- `skills/git/temp_clone.go`
+- `skills/git/librarian_skills_test.go`
+
+**Acceptance Criteria:**
+
+#### Read Operations
+- [ ] All read skills from 6.71
+- [ ] `git_search_history` skill: Search commits by message/author
+- [ ] `git_file_history` skill: Full history of specific file
+- [ ] `git_contributors` skill: List contributors with stats
+
+#### Clone to Temp
+- [ ] `git_clone_temp` skill: Clone repo to temp directory
+- [ ] Clone destination: `os.TempDir()/sylk-clone-<session_id>-<hash>`
+- [ ] Shallow clone by default (`--depth 1`)
+- [ ] Option for full clone with explicit flag
+
+#### Temp Clone Management
+- [ ] Track cloned repos per session
+- [ ] Auto-cleanup on session end
+- [ ] Max 3 active clones per session
+- [ ] Clone expiration: 1 hour max lifetime
+
+#### Clone Operations (Read-Only)
+- [ ] All read operations available on cloned repos
+- [ ] No write operations on clones
+- [ ] Clear error: "Cloned repositories are read-only"
+
+---
+
+### 6.78 Permission Enforcement Hook
+
+Pre-execution permission validation.
+
+**Files to create:**
+- `hooks/git/permission_hook.go`
+- `hooks/git/permission_hook_test.go`
+
+**Acceptance Criteria:**
+
+#### Hook Configuration
+- [ ] `GitPermissionHook` implementing `Hook` interface
+- [ ] Type: `PreTool`
+- [ ] Priority: `HookPriorityFirst` (before any execution)
+- [ ] Applies to all git skills
+
+#### Validation Logic
+- [ ] Extract agent ID from context
+- [ ] Extract operation type from skill name
+- [ ] Check permission matrix
+- [ ] Return `HookResultBlock` if denied
+
+#### Denial Response
+```go
+type PermissionDenial struct {
+    AgentID     string
+    Operation   string
+    Required    GitPermission
+    Reason      string
+    Suggestion  string
+}
+```
+
+#### Condition Evaluation
+- [ ] For conditional permissions (Tester), evaluate condition
+- [ ] Pass context to condition evaluator
+- [ ] Return denial with condition explanation if not met
+
+---
+
+### 6.79 Git Audit Hook
+
+Comprehensive audit logging for git operations.
+
+**Files to create:**
+- `hooks/git/audit_hook.go`
+- `core/git/audit_log.go`
+- `hooks/git/audit_hook_test.go`
+
+**Acceptance Criteria:**
+
+#### Audit Events
+- [ ] `GitOperationAttempted`: Before execution
+- [ ] `GitOperationCompleted`: After successful execution
+- [ ] `GitOperationFailed`: After failed execution
+- [ ] `GitPermissionDenied`: When permission check fails
+
+#### Audit Log Entry
+```go
+type GitAuditEntry struct {
+    Timestamp   time.Time
+    SessionID   string
+    AgentID     string
+    AgentType   string
+    Operation   string
+    Parameters  map[string]any
+    Result      string  // "success", "failure", "denied"
+    Error       string  // if applicable
+    Duration    time.Duration
+}
+```
+
+#### Storage
+- [ ] Write to `~/.sylk/audit/git-<date>.log`
+- [ ] JSON Lines format for easy parsing
+- [ ] Rotate daily, retain 30 days
+- [ ] Async write to avoid blocking operations
+
+#### Query Support
+- [ ] `QueryAuditLog(filter AuditFilter)` function
+- [ ] Filter by: session, agent, operation, result, time range
+- [ ] Support for Archivalist querying audit history
+
+---
+
+### 6.80 Git Tooling Integration Tests
+
+End-to-end testing for git tooling system.
+
+**Files to create:**
+- `tests/e2e/git_tooling_test.go`
+- `tests/e2e/git_permissions_test.go`
+- `tests/fixtures/test_repo_setup.go`
+
+**Test Scenarios:**
+
+1. **Engineer Auto-Commit**: Task completion triggers atomic commit
+2. **Designer Auto-Commit**: UI task completion triggers commit
+3. **Inspector Read-Only**: Write operations rejected with clear error
+4. **Tester Pass Commit**: Tests pass → commit allowed
+5. **Tester Fail No Commit**: Tests fail → commit rejected
+6. **Tester Improve Commit**: Coverage improves → commit allowed
+7. **Architect Branch Ops**: Create/switch/merge branches
+8. **Architect Repo Scope**: Operations outside repo rejected
+9. **Librarian Clone**: Clone to temp, read ops work, write rejected
+10. **Librarian Cleanup**: Temp clones removed on session end
+11. **Permission Denial**: Clear error messages for all denial types
+12. **Audit Trail**: All operations logged correctly
+
+**Acceptance Criteria:**
+- [ ] All 12 test scenarios passing
+- [ ] Test repo setup/teardown automated
+- [ ] Permission matrix exhaustively tested
+- [ ] Audit log entries verified
+- [ ] Error messages user-friendly
+- [ ] No orphaned temp directories after tests
+- [ ] Concurrent operation safety verified
+
+---
+
+## Analysis Skills Orchestration
+
+Context-aware analysis skills that orchestrate existing tools without reimplementing them.
+
+### 6.90 Analysis Skills Foundation
+
+Core types and interfaces for analysis skill orchestration.
+
+**Files to create:**
+- `skills/analysis/types.go`
+- `skills/analysis/orchestrator.go`
+- `skills/analysis/context.go`
+- `skills/analysis/types_test.go`
+
+**Acceptance Criteria:**
+
+#### Core Types
+- [ ] `AnalysisContext` struct with task, session, changed files, conversation
+- [ ] `PrioritizedFinding` struct with finding, priority, historical bugs, explanation
+- [ ] `ChangeRiskAssessment` struct with risk score, findings, blast radius, summary
+- [ ] `Priority` enum: `Critical`, `High`, `Medium`, `Low`
+
+#### Orchestrator Interface
+```go
+type AnalysisOrchestrator interface {
+    // Parallel tool invocation
+    GatherData(ctx context.Context, files []string) (*AnalysisData, error)
+
+    // Context injection
+    EnrichWithContext(findings []Finding, ctx *AnalysisContext) []PrioritizedFinding
+
+    // Historical correlation
+    CorrelateWithHistory(findings []PrioritizedFinding, history []BugRecord) []PrioritizedFinding
+}
+```
+
+- [ ] `AnalysisOrchestrator` interface defined
+- [ ] `BaseOrchestrator` implementation with parallel tool calls
+- [ ] Context extraction from session/task
+- [ ] Error aggregation from multiple tool calls
+
+#### Non-Redundancy Enforcement
+- [ ] Skills MUST call existing skills, never external tools directly
+- [ ] Lint findings come from `lint_run` skill, not `golangci-lint`
+- [ ] Diagnostics come from `lsp_diagnostics` skill, not `gopls`
+- [ ] Coverage comes from `test_coverage` skill, not `go test`
+
+---
+
+### 6.91 Inspector: Assess Change Risk Skill
+
+Prioritized findings filtered to changed code with historical correlation.
+
+**Files to create:**
+- `skills/analysis/inspector/change_risk.go`
+- `skills/analysis/inspector/change_risk_test.go`
+
+**Acceptance Criteria:**
+
+#### Data Gathering (Parallel)
+- [ ] Call `lint_run` for lint findings
+- [ ] Call `lsp_diagnostics` for type diagnostics
+- [ ] Call `git_changed_lines` for changed lines map
+- [ ] Call `archivalist_query_bugs` for bug history
+- [ ] All calls execute in parallel via `errgroup`
+
+#### Filtering
+- [ ] Filter findings to only those in changed lines
+- [ ] Map finding location to changed line ranges
+- [ ] Preserve finding metadata through filter
+
+#### Prioritization
+- [ ] `Critical`: Finding matches historical bug pattern
+- [ ] `High`: Finding in changed code + complexity > 10
+- [ ] `Medium`: Finding in changed code
+- [ ] `Low`: Finding not in changed code (excluded from results)
+
+#### Historical Correlation
+- [ ] Match finding category to past bug categories
+- [ ] Match code pattern to past bug patterns
+- [ ] Include bug record in finding: title, date, fix
+- [ ] Explanation: "This pattern caused bug #X on DATE"
+
+#### Output
+- [ ] Return top 10 prioritized findings (not all 50+)
+- [ ] Include risk score (0.0-1.0)
+- [ ] Include blast radius (affected files)
+- [ ] Include summary for quick review
+
+---
+
+### 6.92 Inspector: Explain Finding Skill
+
+Semantic explanation with project-specific fix suggestions.
+
+**Files to create:**
+- `skills/analysis/inspector/explain_finding.go`
+- `skills/analysis/inspector/explain_finding_test.go`
+
+**Acceptance Criteria:**
+
+#### Context Gathering
+- [ ] Call `lsp_hover` for type information at finding location
+- [ ] Call `archivalist_query_patterns` for project patterns in category
+- [ ] Get task description from session context
+
+#### Explanation Generation
+- [ ] `What`: The lint message (from finding)
+- [ ] `Why`: Why this matters (generated from finding type + context)
+- [ ] `Risk`: What could go wrong (generated from finding severity)
+- [ ] `HowToFix`: Project-specific fix (from patterns OR generic)
+- [ ] `Example`: Code example from this project (from patterns)
+- [ ] `References`: Links to relevant documentation
+
+#### Project-Specific Fixes
+- [ ] If Archivalist has patterns for this category, use them
+- [ ] Include file:line reference to example in this project
+- [ ] Format: "In this project, use the X pattern. See file.go:123"
+- [ ] Fall back to generic fix if no project patterns
+
+#### Output Format
+```
+SA5011: possible nil pointer dereference
+
+Why: The `user` variable can be nil when GetUser() returns no result.
+
+Risk: Runtime panic in production.
+
+Fix: In this project, use the `MustUser()` pattern.
+     See auth/session.go:45 for example.
+
+Example:
+    user := MustUser(ctx)  // Panics with clear error if nil
+```
+
+---
+
+### 6.93 Inspector: Validate Architecture Skill
+
+Enforce project-specific architectural rules.
+
+**Files to create:**
+- `skills/analysis/inspector/architecture.go`
+- `skills/analysis/inspector/architecture_test.go`
+
+**Acceptance Criteria:**
+
+#### Rule Retrieval
+- [ ] Call `archivalist_query_architecture_rules` for project rules
+- [ ] Rules stored as: pattern, constraint, severity, description
+- [ ] Example rules:
+  - `handlers/ cannot import repositories/`
+  - `domain/ cannot import infrastructure/`
+  - `All api/ functions must have context.Context first param`
+
+#### Import Analysis
+- [ ] Call `lsp_import_graph` for import relationships
+- [ ] Build dependency map: file → imported packages
+- [ ] Resolve package paths to file paths
+
+#### Rule Checking
+- [ ] For each rule, check against import graph
+- [ ] Collect violations with: rule, location, description
+- [ ] Query Archivalist for previous violations of same rule
+
+#### Output
+- [ ] List of `ArchViolation` with severity
+- [ ] Score: 1.0 - (violations * 0.1), min 0.0
+- [ ] Summary: "2 architectural violations found"
+- [ ] Suggestion for each violation
+
+---
+
+### 6.94 Inspector: Evaluate Blast Radius Skill
+
+Identify files affected by changes.
+
+**Files to create:**
+- `skills/analysis/inspector/blast_radius.go`
+- `skills/analysis/inspector/blast_radius_test.go`
+
+**Acceptance Criteria:**
+
+#### Symbol Extraction
+- [ ] Call `lsp_document_symbols` for symbols in changed files
+- [ ] Filter to exported symbols only
+- [ ] Track symbol name and location
+
+#### Reference Finding
+- [ ] For each exported symbol, call `lsp_references`
+- [ ] Collect unique files that reference the symbol
+- [ ] Group by: direct dependents, transitive dependents
+
+#### Risk Assessment
+- [ ] `Critical`: > 20 affected files
+- [ ] `High`: 10-20 affected files
+- [ ] `Medium`: 5-10 affected files
+- [ ] `Low`: < 5 affected files
+
+#### Recommendations
+- [ ] `Critical`/`High`: "Run full integration test suite"
+- [ ] `Medium`: "Run integration tests for affected modules"
+- [ ] `Low`: "Unit tests sufficient"
+
+---
+
+### 6.95 Tester: Prioritize Test Targets Skill
+
+Rank what to test by combining coverage, complexity, changes, and history.
+
+**Files to create:**
+- `skills/analysis/tester/prioritize.go`
+- `skills/analysis/tester/prioritize_test.go`
+
+**Acceptance Criteria:**
+
+#### Data Gathering (Parallel)
+- [ ] Call `test_coverage` for coverage data
+- [ ] Call `lint_complexity` for complexity metrics
+- [ ] Call `git_changed_files` for changed files
+- [ ] Call `archivalist_query_bug_density` for bug history
+
+#### Scoring Algorithm
+```
+Score = 0
+
+If file is changed:        +40 points
+If complexity > 10:        +30 points
+If complexity > 5:         +15 points
+If bug_count > 2:          +30 points
+If bug_count > 0:          +15 points
+```
+
+- [ ] Calculate score for each uncovered function
+- [ ] Sort by score descending
+- [ ] Include reasons array for transparency
+
+#### Test Type Recommendation
+- [ ] `unit`: Pure functions, no external deps
+- [ ] `integration`: DB, HTTP, filesystem deps
+- [ ] `e2e`: User flows, API endpoints
+- [ ] Heuristic based on file path and dependencies
+
+#### Output
+```go
+type TestPriority struct {
+    File            string
+    Functions       []string
+    PriorityScore   float64
+    Reasons         []string
+    RecommendedType TestType
+    CurrentCoverage float64
+    Complexity      int
+}
+```
+
+---
+
+### 6.96 Tester: Assess Test Quality Skill
+
+Evaluate test suite quality beyond coverage.
+
+**Files to create:**
+- `skills/analysis/tester/quality.go`
+- `skills/analysis/tester/quality_test.go`
+
+**Acceptance Criteria:**
+
+#### Data Gathering
+- [ ] Call `test_run` for test results
+- [ ] Call `test_coverage` for coverage percentage
+- [ ] Parse test files for pattern analysis
+
+#### Pattern Analysis (via AST)
+- [ ] Count assertions per test
+- [ ] Identify tests with zero assertions
+- [ ] Identify tests that only test happy path
+- [ ] Identify functions with error returns but no error tests
+
+#### Mutation Sampling (Optional)
+- [ ] If enabled, run 10 random mutations
+- [ ] Calculate kill rate (mutations caught / total)
+- [ ] Low kill rate = weak assertions
+
+#### Weakness Detection
+- [ ] `no_assertions`: Test has no assertions
+- [ ] `single_path`: Only tests 1 of N branches
+- [ ] `no_error_test`: Function returns error but not tested
+
+#### Grading
+- [ ] A: Coverage > 80%, assertion density > 2, no weaknesses
+- [ ] B: Coverage > 70%, assertion density > 1.5, < 3 weaknesses
+- [ ] C: Coverage > 60%, assertion density > 1, < 5 weaknesses
+- [ ] D: Coverage > 50%
+- [ ] F: Coverage <= 50%
+
+---
+
+### 6.97 Tester: Suggest Test Cases Skill
+
+Generate specific test suggestions from code analysis.
+
+**Files to create:**
+- `skills/analysis/tester/suggest.go`
+- `skills/analysis/tester/boundaries.go`
+- `skills/analysis/tester/suggest_test.go`
+
+**Acceptance Criteria:**
+
+#### Boundary Extraction
+- [ ] Parse function body for comparisons: `<`, `<=`, `>`, `>=`, `==`
+- [ ] Extract boundary values: `if age < 18` → 17, 18, 19
+- [ ] Parse loops for iteration boundaries: `i < len(x)` → 0, 1, len-1, len
+- [ ] Parse switch statements for case values
+
+#### Existing Test Check
+- [ ] Find test file for function
+- [ ] Parse test cases (table-driven or individual)
+- [ ] Check if boundary is already covered
+
+#### Suggestion Generation
+- [ ] For each uncovered boundary, generate test suggestion
+- [ ] Include: name, description, inputs, expected, reason
+- [ ] Priority: 1 = boundary, 2 = error case, 3 = nil case, 4 = patterns
+
+#### Pattern Matching
+- [ ] Query Archivalist for tests of similar functions
+- [ ] Suggest patterns used in similar tests
+- [ ] Example: "Similar function X uses table-driven tests for Y"
+
+---
+
+### 6.98 Tester: Identify Coverage Gaps Skill
+
+Find uncovered code specifically in changed files.
+
+**Files to create:**
+- `skills/analysis/tester/gaps.go`
+- `skills/analysis/tester/gaps_test.go`
+
+**Acceptance Criteria:**
+
+#### Data Gathering
+- [ ] Call `test_coverage` for uncovered regions
+- [ ] Call `git_changed_lines` for changed lines
+- [ ] Call `lint_complexity` for complexity data
+
+#### Gap Detection
+- [ ] Intersect uncovered lines with changed lines
+- [ ] Prioritize: changed AND uncovered = highest priority
+- [ ] Include function name for each gap
+
+#### Output
+```go
+type CoverageGap struct {
+    File        string
+    Function    string
+    Lines       []int    // Uncovered line numbers
+    IsChanged   bool     // Was this recently changed?
+    Complexity  int
+    Suggestion  string
+}
+```
+
+#### Sorting
+- [ ] Changed gaps first
+- [ ] Then by complexity descending
+- [ ] Return top 20 gaps
+
+---
+
+### 6.99 Analysis Skills Bundle Registration
+
+Register analysis skills with lazy loading system.
+
+**Files to create:**
+- `skills/analysis/bundles.go`
+- `skills/analysis/manifests.go`
+
+**Acceptance Criteria:**
+
+#### Manifests (~20 tokens each)
+```go
+var AnalysisSkillManifests = []SkillManifest{
+    {Name: "assess_change_risk", Brief: "Prioritized findings in changed code"},
+    {Name: "explain_finding", Brief: "Semantic explanation with project fix"},
+    {Name: "validate_architecture", Brief: "Check project architectural rules"},
+    {Name: "evaluate_blast_radius", Brief: "Identify affected files"},
+    {Name: "prioritize_test_targets", Brief: "Rank what to test by risk"},
+    {Name: "assess_test_quality", Brief: "Evaluate tests beyond coverage"},
+    {Name: "suggest_test_cases", Brief: "Generate test suggestions"},
+    {Name: "identify_coverage_gaps", Brief: "Find uncovered changed code"},
+}
+```
+
+#### Bundles
+- [ ] `inspector_analysis`: change_risk, explain, architecture, blast_radius
+- [ ] `tester_analysis`: prioritize, quality, suggest, gaps
+- [ ] Register bundles with lazy loading system
+
+#### Integration
+- [ ] Inspector loads `inspector_analysis` bundle on first analysis request
+- [ ] Tester loads `tester_analysis` bundle on first analysis request
+- [ ] Skills available via `request_tools` skill
+
+---
+
+### 6.100 Analysis Skills Integration Tests
+
+End-to-end testing for analysis skills.
+
+**Files to create:**
+- `tests/e2e/analysis_skills_test.go`
+- `tests/fixtures/analysis_test_repo.go`
+
+**Test Scenarios:**
+
+1. **Change Risk - No History**: Findings filtered to changed code only
+2. **Change Risk - With History**: Historical bugs increase priority
+3. **Explain Finding - With Patterns**: Project-specific fix suggested
+4. **Explain Finding - No Patterns**: Generic fix provided
+5. **Architecture - Violations**: Rule violations detected and reported
+6. **Architecture - Clean**: No violations returns score 1.0
+7. **Blast Radius - Small Change**: Low risk, unit tests recommended
+8. **Blast Radius - Large Change**: High risk, integration tests recommended
+9. **Prioritize Targets - Changed Code**: Changed files ranked higher
+10. **Test Quality - Weak Tests**: Tests with no assertions flagged
+11. **Suggest Cases - Boundaries**: Boundary test cases suggested
+12. **Coverage Gaps - Changed**: Changed uncovered code identified
+
+**Acceptance Criteria:**
+- [ ] All 12 test scenarios passing
+- [ ] Analysis skills call existing skills (not tools directly)
+- [ ] Parallel data gathering verified (timing)
+- [ ] Context injection verified
+- [ ] Historical correlation verified
+- [ ] Token efficiency: manifests < 25 tokens each
+- [ ] No lint/LSP tool reimplementation
+
+---
+
+## Single-Worker Pipeline System
+
+### 6.43 Pipeline Core Implementation
+
+Core pipeline data structures and execution engine.
+
+**Files to create:**
+- `core/pipeline/pipeline.go`
+- `core/pipeline/executor.go`
+- `core/pipeline/state.go`
+- `core/pipeline/pipeline_test.go`
+
+**Acceptance Criteria:**
+
+#### Pipeline Data Structures
+- [ ] `WorkerType` enum: `designer`, `engineer`
+- [ ] `PipelineStatus` enum: `pending`, `executing`, `inspecting`, `testing`, `completed`, `failed`
+- [ ] `Pipeline` struct with ID, TaskID, WorkerType, Status, RetryCount, MaxRetries
+- [ ] `WorkerOutput`, `InspectorResult`, `TesterResult` structs
+- [ ] `InspectorMode()` method derives mode from WorkerType
+- [ ] `TesterMode()` method derives mode from WorkerType
+
+```go
+type Pipeline struct {
+    ID          string         `json:"id"`
+    TaskID      string         `json:"task_id"`
+    WorkerType  WorkerType     `json:"worker_type"`
+    Status      PipelineStatus `json:"status"`
+    RetryCount  int            `json:"retry_count"`
+    MaxRetries  int            `json:"max_retries"`
+    CreatedAt   time.Time      `json:"created_at"`
+    CompletedAt *time.Time     `json:"completed_at,omitempty"`
+}
+
+func (p *Pipeline) InspectorMode() InspectorMode {
+    if p.WorkerType == WorkerDesigner {
+        return InspectorUIMode
+    }
+    return InspectorCodeMode
+}
+```
+
+#### Pipeline Executor
+- [ ] `PipelineExecutor` manages pipeline lifecycle
+- [ ] Spawns appropriate worker based on WorkerType
+- [ ] Runs Inspector with derived mode
+- [ ] Runs Tester with derived mode
+- [ ] Handles failure loops (back to worker)
+- [ ] Reports completion to Architect
+
+#### State Machine
+- [ ] `pending` → `executing` (worker starts)
+- [ ] `executing` → `inspecting` (worker completes)
+- [ ] `inspecting` → `testing` (inspector passes)
+- [ ] `inspecting` → `executing` (inspector fails, retry)
+- [ ] `testing` → `completed` (tester passes)
+- [ ] `testing` → `executing` (tester fails, retry)
+- [ ] Any state → `failed` (max retries exceeded)
+
+**Tests:**
+- [ ] Pipeline creation with correct defaults
+- [ ] Mode derivation works correctly
+- [ ] State transitions are valid
+- [ ] Retry loop stays within pipeline
+- [ ] Max retries triggers failure
+
+---
+
+### 6.44 Inspector Mode Implementation
+
+Inspector agent with switchable UI/Code modes.
+
+**Files to create:**
+- `agents/inspector/modes.go`
+- `agents/inspector/ui_mode.go`
+- `agents/inspector/code_mode.go`
+- `agents/inspector/modes_test.go`
+
+**Acceptance Criteria:**
+
+#### Mode Switching
+- [ ] `InspectorMode` enum: `ui`, `code`
+- [ ] Inspector accepts mode from pipeline
+- [ ] Skills loaded based on active mode
+- [ ] Mode cannot change mid-inspection
+
+#### Code Mode Skills
+- [ ] `check_style` - Code style consistency
+- [ ] `check_security` - Security vulnerabilities
+- [ ] `check_dependencies` - Dependency usage
+- [ ] `check_error_handling` - Error handling patterns
+- [ ] `check_test_coverage` - Test coverage
+- [ ] `check_types` - Type safety
+
+#### UI Mode Skills
+- [ ] `check_accessibility` - WCAG compliance
+- [ ] `check_design_tokens` - Design token usage
+- [ ] `check_component_reuse` - Component reuse
+- [ ] `check_responsive` - Responsive design
+- [ ] `check_color_contrast` - Color contrast ratios
+- [ ] `check_semantic_html` - Semantic HTML
+- [ ] `check_focus_management` - Focus management
+
+#### Inspection Result
+- [ ] `InspectorResult` with pass/fail, issues list, mode
+- [ ] Issues include severity, location, message, fix suggestion
+- [ ] Clear attribution for pipeline failure routing
+
+**Tests:**
+- [ ] Code mode loads correct skills
+- [ ] UI mode loads correct skills
+- [ ] Mode switch rejected during inspection
+- [ ] Issues correctly categorized by severity
+
+---
+
+### 6.45 Tester Mode Implementation
+
+Tester agent with switchable UI/Code modes.
+
+**Files to create:**
+- `agents/tester/modes.go`
+- `agents/tester/ui_mode.go`
+- `agents/tester/code_mode.go`
+- `agents/tester/modes_test.go`
+
+**Acceptance Criteria:**
+
+#### Mode Switching
+- [ ] `TesterMode` enum: `ui`, `code`
+- [ ] Tester accepts mode from pipeline
+- [ ] Test strategies differ by mode
+- [ ] Mode cannot change mid-testing
+
+#### Code Mode Capabilities
+- [ ] Write unit tests
+- [ ] Write integration tests
+- [ ] Run test suites (go test, jest, pytest, etc.)
+- [ ] Check test coverage
+- [ ] Run benchmarks
+
+#### UI Mode Capabilities
+- [ ] Write component tests (Testing Library)
+- [ ] Write visual regression tests (Chromatic/Percy)
+- [ ] Write accessibility tests (axe-core)
+- [ ] Write interaction tests (Playwright/Cypress)
+- [ ] Run Storybook stories
+- [ ] Check responsive breakpoints
+
+#### Test Result
+- [ ] `TesterResult` with pass/fail, test results, mode
+- [ ] Failed tests include name, error, location
+- [ ] Flaky test detection and reporting
+
+**Tests:**
+- [ ] Code mode uses correct test frameworks
+- [ ] UI mode uses correct test frameworks
+- [ ] Test results correctly structured
+- [ ] Flaky tests identified
+
+---
+
+### 6.46 Architect Task Decomposition
+
+Architect capability to analyze and decompose hybrid tasks.
+
+**Files to create:**
+- `agents/architect/decomposition.go`
+- `agents/architect/dependency_analysis.go`
+- `agents/architect/decomposition_test.go`
+
+**Acceptance Criteria:**
+
+#### Task Analysis
+- [ ] Identify UI signals in task description
+- [ ] Identify Code signals in task description
+- [ ] Classify task as: `ui_only`, `code_only`, `hybrid`, `tightly_coupled`
+- [ ] Signal keywords configurable
+
+```go
+var UISignals = []string{
+    "component", "modal", "button", "form",
+    "style", "css", "tailwind", "styled",
+    "responsive", "layout", "grid", "flex",
+    "animation", "transition", "motion",
+    "accessibility", "a11y", "aria", "wcag",
+    "design system", "theme", "token",
+    "ui", "ux", "user interface",
+}
+
+var CodeSignals = []string{
+    "api", "endpoint", "backend", "server",
+    "database", "query", "model", "schema",
+    "algorithm", "logic", "service", "handler",
+    "integration", "auth", "config", "middleware",
+    "cli", "script", "migration", "deploy",
+    "test", "benchmark", "performance", "optimize",
+}
+```
+
+#### Dependency Analysis
+- [ ] Detect if UI depends on Code output (needs data shapes, hooks)
+- [ ] Detect if Code depends on UI output (needs component refs, events)
+- [ ] Detect if independent (can parallelize)
+- [ ] Detect if tightly coupled (single pipeline)
+
+#### Pipeline Creation
+- [ ] Create Designer pipeline for UI tasks
+- [ ] Create Engineer pipeline for Code tasks
+- [ ] Set pipeline dependencies for sequential execution
+- [ ] Enable parallel execution for independent pipelines
+
+#### Execution Order
+- [ ] UI depends on Code → Engineer pipeline first
+- [ ] Code depends on UI → Designer pipeline first
+- [ ] Independent → Parallel execution
+- [ ] Tightly coupled → Single pipeline, Architect picks primary worker
+
+**Tests:**
+- [ ] UI-only task creates Designer pipeline
+- [ ] Code-only task creates Engineer pipeline
+- [ ] Hybrid task creates multiple pipelines
+- [ ] Dependencies correctly ordered
+- [ ] Parallel pipelines execute concurrently
+
+---
+
+### 6.47 Pipeline Failure Routing
+
+Failure handling for inside-pipeline and outside-pipeline issues.
+
+**Files to create:**
+- `core/pipeline/failure_handler.go`
+- `core/pipeline/failure_handler_test.go`
+
+**Acceptance Criteria:**
+
+#### Inside Pipeline Failures
+- [ ] Inspector failure → loop to Worker
+- [ ] Tester failure → loop to Worker
+- [ ] Retry count incremented
+- [ ] Max retries triggers pipeline failure
+- [ ] Worker receives failure context (what to fix)
+
+#### Outside Pipeline Failures (Integration)
+- [ ] Integration check after all pipelines complete
+- [ ] Integration failure → route to Architect
+- [ ] Architect analyzes and creates corrective task
+- [ ] Corrective task may spawn new pipeline
+
+#### Failure Context
+- [ ] `FailureContext` with issue description, location, suggested fix
+- [ ] Worker receives context on retry
+- [ ] Context helps worker focus on specific issue
+
+```go
+type FailureContext struct {
+    PipelineID  string   `json:"pipeline_id"`
+    Stage       string   `json:"stage"`  // "inspector" or "tester"
+    Issues      []Issue  `json:"issues"`
+    RetryCount  int      `json:"retry_count"`
+    Suggestions []string `json:"suggestions"`
+}
+```
+
+**Tests:**
+- [ ] Inspector failure loops to worker
+- [ ] Tester failure loops to worker
+- [ ] Max retries causes pipeline failure
+- [ ] Integration failure routes to Architect
+- [ ] Failure context provided to worker
+
+---
+
+### 6.48 Direct Task Commands
+
+Support for `/task` commands to directly address workers.
+
+**Files to create:**
+- `agents/guide/task_command.go`
+- `agents/guide/task_command_test.go`
+
+**Acceptance Criteria:**
+
+#### Command Parsing
+- [ ] `/task designer "..."` → Designer pipeline
+- [ ] `/task engineer "..."` → Engineer pipeline
+- [ ] `/task "..."` → Architect analyzes
+
+#### Command Handling
+- [ ] Guide parses `/task` commands
+- [ ] Explicit worker type creates direct pipeline
+- [ ] No worker type routes to Architect
+- [ ] Task description passed to pipeline/Architect
+
+```go
+// /task designer "Create a card component"
+// /task engineer "Add retry logic"
+// /task "Add settings page"  // Architect decides
+
+type TaskCommand struct {
+    WorkerType  string  // "designer", "engineer", or ""
+    Description string
+}
+
+func (g *Guide) HandleTaskCommand(ctx context.Context, cmd TaskCommand) error {
+    switch cmd.WorkerType {
+    case "designer":
+        return g.createPipeline(ctx, cmd.Description, WorkerDesigner)
+    case "engineer":
+        return g.createPipeline(ctx, cmd.Description, WorkerEngineer)
+    default:
+        return g.routeToArchitect(ctx, cmd.Description)
+    }
+}
+```
+
+**Tests:**
+- [ ] `/task designer` creates Designer pipeline
+- [ ] `/task engineer` creates Engineer pipeline
+- [ ] `/task` without type routes to Architect
+- [ ] Task description correctly passed
+
+---
+
+### 6.49 Pipeline Integration Tests
+
+End-to-end tests for pipeline system.
+
+**Files to create:**
+- `core/pipeline/integration_test.go`
+
+**Acceptance Criteria:**
+
+#### Designer Pipeline E2E
+- [ ] Designer receives task
+- [ ] Designer produces UI output
+- [ ] Inspector (UI mode) reviews
+- [ ] Tester (UI mode) tests
+- [ ] Pipeline completes successfully
+
+#### Engineer Pipeline E2E
+- [ ] Engineer receives task
+- [ ] Engineer produces code output
+- [ ] Inspector (code mode) reviews
+- [ ] Tester (code mode) tests
+- [ ] Pipeline completes successfully
+
+#### Hybrid Task E2E
+- [ ] Architect receives hybrid task
+- [ ] Architect decomposes into pipelines
+- [ ] Pipelines execute in correct order
+- [ ] Integration check passes
+- [ ] All pipelines complete
+
+#### Failure Recovery E2E
+- [ ] Inspector fails → worker retries → passes
+- [ ] Tester fails → worker retries → passes
+- [ ] Max retries → pipeline fails → Architect notified
+- [ ] Integration fails → Architect creates corrective task
+
+**Tests:**
+- [ ] Full Designer pipeline flow
+- [ ] Full Engineer pipeline flow
+- [ ] Hybrid task decomposition and execution
+- [ ] Failure and retry flow
+- [ ] Parallel pipeline execution
+
+---
+
+## Execution Workflow
+
+```
+Phase 0 (Foundation)              Phase 1 (Knowledge)      Phase 2 (Execution)           Phase 3         Phase 4 (Quality)      Phase 5
+┌─────────────────────────────┐   ┌─────────────────┐      ┌──────────────────────┐      ┌───────────┐   ┌────────────────┐      ┌──────────────────┐
+│ 0.1 Session Manager         │   │ 1.1 Librarian   │      │ 2.1 Engineer         │      │ 3.1       │   │ 4.1 Inspector  │      │ 5.1 Coordinator  │
+│ 0.2 DAG Engine              │   │ 1.2 Academic    │      │ 2.2 Orchestrator     │      │ Architect │   │ 4.2 Tester     │      │ 5.2 Integration  │
+│ 0.3 Worker Pool Enhancements│──▶│ 1.3 Tool Disc.  │─────▶│ 2.3 Pipeline Infra   │─────▶│           │──▶│                │─────▶│ 5.3 Benchmarks   │
+│ 0.4 Guide Enhancements      │   │                 │      │     (E + I + T)      │      │           │   │                │      │                  │
+│ 0.5 Archivalist Enhancements│   │                 │      │                      │      │           │   │                │      │                  │
+│ 0.6 Bus Enhancements        │   │                 │      │                      │      │           │   │                │      │                  │
+└─────────────────────────────┘   └─────────────────┘      └──────────────────────┘      └───────────┘   └────────────────┘      └──────────────────┘
+```
+
+### Parallelization Summary
+
+| Phase | Items | Parallel Execution |
+|-------|-------|-------------------|
+| 0 | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 | All six in parallel |
+| 1 | 1.1, 1.2, 1.3 | 1.1 and 1.2 in parallel; 1.3 after 1.1+1.2 |
+| 2 | 2.1, 2.2, 2.3 | 2.1 and 2.2 in parallel; 2.3 after 2.1+2.2 |
+| 3 | 3.1 | Sequential (after Phase 2) |
+| 4 | 4.1, 4.2 | Both in parallel (after Phase 3) |
+| 5 | 5.1, 5.2, 5.3 | Sequential (after Phase 4) |
+
+**Note**: Phase 2.3 (Pipeline Infrastructure) depends on 2.1 (Engineer) and 2.2 (Orchestrator) as it combines them with Inspector and Tester instances into isolated execution contexts.
+
+### Critical Path
+
+```
+0.1 (Session) → 0.4 (Guide) → 2.2 (Orchestrator) → 2.3 (Pipeline) → 3.1 (Architect) → 5.1 (Coordinator)
+```
 
 ---
 
@@ -6941,6 +14353,103 @@ type DomainCheck struct {
 
 ---
 
+## Phase 5: Integration
+
+**Goal**: Wire everything together, integration tests.
+
+**Dependencies**: Phases 0-4 complete
+
+### 5.1 Agent Coordinator
+
+Coordinates agent lifecycle and inter-agent communication.
+
+**Files to create:**
+- `core/coordinator/coordinator.go`
+- `core/coordinator/lifecycle.go`
+- `core/coordinator/health.go`
+- `core/coordinator/coordinator_test.go`
+
+**Acceptance Criteria:**
+- [ ] Start all agents in correct order
+- [ ] Register all agents with Guide
+- [ ] Handle agent failures with graceful degradation
+- [ ] Shutdown all agents in correct order
+- [ ] Health monitoring across all agents
+- [ ] Metrics collection from all agents
+- [ ] Session-scoped agent instances
+- [ ] Shared agent instances (Librarian, Academic, Archivalist)
+
+### 5.2 Full Workflow Integration Tests
+
+**Files to create:**
+- `tests/integration/workflow_test.go`
+- `tests/integration/multi_session_test.go`
+- `tests/integration/session_isolation_test.go`
+- `tests/integration/session_switching_test.go`
+- `tests/integration/failure_test.go`
+- `tests/integration/quality_loop_test.go`
+- `tests/integration/skill_loading_test.go`
+- `tests/integration/pipeline_test.go` (NEW)
+- `tests/integration/two_level_qa_test.go` (NEW)
+
+**Acceptance Criteria:**
+
+#### Basic Workflow
+- [ ] Test: User request → Architect → DAG → Pipelines → Complete
+- [ ] Test: Multiple sessions executing concurrently
+- [ ] Test: Session isolation (no context pollution)
+- [ ] Test: Session switching with state preservation
+- [ ] Test: Engineer clarification loop
+- [ ] Test: User interruption during execution
+- [ ] Test: Agent failure recovery
+- [ ] Test: Session cleanup on completion
+- [ ] Test: Skill progressive loading
+- [ ] Test: Cross-session Archivalist queries
+
+#### Pipeline-Specific Tests (`pipeline_test.go`)
+- [ ] Test: Pipeline creation with Engineer + Inspector + Tester
+- [ ] Test: Pipeline-internal Inspector feedback loop
+- [ ] Test: Pipeline-internal Tester feedback loop
+- [ ] Test: Pipeline max loops enforcement
+- [ ] Test: /task command routing through Guide to Pipeline
+- [ ] Test: User override (ignore_inspector) in Pipeline
+- [ ] Test: User override (ignore_tester) in Pipeline
+- [ ] Test: Concurrent Pipelines within same DAG
+- [ ] Test: Pipeline cancellation mid-execution
+- [ ] Test: Pipeline failure propagation to Orchestrator
+
+#### Two-Level QA Tests (`two_level_qa_test.go`)
+- [ ] Test: Pipeline-internal Inspector pass → Pipeline-internal Tester pass → Pipeline complete
+- [ ] Test: Pipeline-internal Inspector fail → direct feedback → Engineer fixes → re-validate
+- [ ] Test: Pipeline-internal Tester fail → direct feedback → Engineer fixes → re-test
+- [ ] Test: All Pipelines complete → Session-wide Inspector triggers
+- [ ] Test: Session-wide Inspector fail → Architect creates FIX DAG → new Pipelines
+- [ ] Test: Session-wide Tester fail → Architect creates FIX DAG → new Pipelines
+- [ ] Test: Full flow: Pipelines → Session Inspector → Session Tester → Complete
+
+### 5.3 Performance Benchmarks
+
+**Files to create:**
+- `tests/benchmark/session_bench_test.go`
+- `tests/benchmark/dag_bench_test.go`
+- `tests/benchmark/throughput_bench_test.go`
+- `tests/benchmark/skill_loading_bench_test.go`
+
+**Acceptance Criteria:**
+- [ ] Benchmark: 10 concurrent sessions with 50 Engineers each
+- [ ] Benchmark: DAG execution with 100 nodes
+- [ ] Benchmark: Message throughput through Guide
+- [ ] Benchmark: Worker pool fairness under load
+- [ ] Benchmark: Skill loading latency
+- [ ] Benchmark: Session switch latency
+- [ ] Target: < 10ms routing latency (cache hit)
+- [ ] Target: < 100ms routing latency (LLM classification)
+- [ ] Target: < 50ms skill loading latency
+- [ ] Target: < 100ms session switch latency
+- [ ] Target: Linear scaling to 100 sessions
+
+---
+
 ## Token Savings Targets
 
 ### CRITICAL: How VectorGraphDB Saves Tokens
@@ -7059,6 +14568,53 @@ type DomainCheck struct {
 
 ---
 
+## Testing Strategy
+
+### Unit Tests
+Each component has `*_test.go` with:
+- Constructor tests
+- Method tests
+- Error handling tests
+- Concurrency tests (race detector)
+- Skill loading tests
+
+### Integration Tests
+```
+tests/integration/
+├── workflow_test.go          # Full workflow end-to-end
+├── multi_session_test.go     # Concurrent sessions
+├── session_isolation_test.go # No context pollution
+├── session_switching_test.go # State preservation
+├── failure_test.go           # Failure recovery
+├── quality_loop_test.go      # Inspector + Tester loop
+└── skill_loading_test.go     # Progressive disclosure
+```
+
+### Running Tests
+```bash
+go test ./... -race
+go test ./tests/integration/... -v -timeout 10m
+go test ./tests/benchmark/... -bench=. -benchmem
+```
+
+---
+
+## Acceptance Verification
+
+Before marking a phase complete:
+
+1. **Build passes**: `go build ./...`
+2. **Vet passes**: `go vet ./...`
+3. **Tests pass**: `go test ./... -race`
+4. **Coverage > 70%**: `go test ./... -cover`
+5. **No race conditions**: Tests pass with `-race` flag
+6. **Integration works**: Component integrates with existing system
+7. **Skills defined**: All skills documented and registered
+8. **Hooks implemented**: All lifecycle hooks in place
+9. **Session-aware**: All state operations include session context
+
+---
+
 ## Implementation Order
 
 1. **Week 1-2**: 6.1 (Schema), 6.2 (HNSW) - can parallelize
@@ -7072,8 +14628,10 @@ type DomainCheck struct {
 9. **Week 13-14**: 6.25-6.28 (Diff Preview, Preferences, File Snapshot, Dependency Awareness) - can parallelize
 10. **Week 15**: 6.29-6.30 (Task Continuity, Design Tokens)
 11. **Week 16**: 6.31 (Designer Agent Implementation)
-12. **Week 17-18**: 6.32-6.42 (Skill/Agent Integrations) - can parallelize
-13. **Week 19**: 6.17-6.18 (Benchmarks, Integration Tests) - validates all optimizations
+12. **Week 17-18**: 6.43-6.45 (Pipeline Core, Inspector Modes, Tester Modes)
+13. **Week 19**: 6.46-6.48 (Architect Decomposition, Failure Routing, Task Commands)
+14. **Week 20**: 6.32-6.42 (Skill/Agent Integrations) - can parallelize
+15. **Week 21**: 6.49, 6.17-6.18 (Pipeline Integration Tests, Benchmarks) - validates all
 
 **Note**: Weeks are relative units of work, not calendar estimates.
 
@@ -7088,850 +14646,11 @@ type DomainCheck struct {
 - 6.33-6.42 depend on 6.21-6.30 (skills must exist before integration)
 - See section 6.32 for full agent-to-technique mapping
 
----
-
-## Agent Efficiency Techniques
-
-### 6.21 Scratchpad Memory
-
-Within-session working memory for agents to track notes, reasoning, and temporary state.
-
-**Files to create:**
-- `agents/common/scratchpad.go`
-- `agents/common/scratchpad_test.go`
-- `skills/scratchpad_skill.go`
-
-**Acceptance Criteria:**
-
-#### Scratchpad Data Structure
-- [ ] `ScratchpadEntry` with key, value, category, timestamp, expiry
-- [ ] `Scratchpad` manager with `Set()`, `Get()`, `Delete()`, `GetByCategory()`, `All()`
-- [ ] Session-scoped (entries tied to session ID)
-- [ ] Auto-cleanup on session end
-- [ ] Thread-safe with RWMutex
-
-```go
-type ScratchpadEntry struct {
-    Key       string    `json:"key"`
-    Value     string    `json:"value"`
-    Category  string    `json:"category"`
-    CreatedAt time.Time `json:"created_at"`
-    ExpiresAt time.Time `json:"expires_at,omitempty"`
-}
-```
-
-#### Scratchpad Skills
-- [ ] `scratchpad_set` - Store a note (key, value, category optional)
-- [ ] `scratchpad_get` - Retrieve a note by key
-- [ ] `scratchpad_list` - List all notes (optional category filter)
-- [ ] `scratchpad_delete` - Remove a note by key
-
-#### Common Use Cases
-- [ ] "Requirements noted from user" category
-- [ ] "Partial work" category for intermediate results
-- [ ] "Decisions made" category for reasoning trail
-- [ ] "Blockers found" category for issues
-
-**Tests:**
-- [ ] Set and get works correctly
-- [ ] Category filtering works
-- [ ] Expiry removes old entries
-- [ ] Session isolation (can't access other session's notes)
-- [ ] Thread-safe under concurrent access
-
----
-
-### 6.22 Code Style Inference
-
-Automatic detection of project code style from existing files.
-
-**Files to create:**
-- `agents/engineer/style_inference.go`
-- `agents/engineer/style_inference_test.go`
-- `skills/style_check_skill.go`
-
-**Acceptance Criteria:**
-
-#### Style Analysis
-- [ ] `InferredStyle` struct with naming, formatting, patterns
-- [ ] `StyleInferrer.Analyze()` reads sample files
-- [ ] Detect naming conventions (camelCase, snake_case, PascalCase)
-- [ ] Detect indentation (tabs vs spaces, indent width)
-- [ ] Detect quote style (single vs double)
-- [ ] Detect trailing comma preference
-- [ ] Detect import organization pattern
-
-```go
-type InferredStyle struct {
-    Language       string              `json:"language"`
-    NamingConvention struct {
-        Variables string `json:"variables"` // "camelCase", "snake_case"
-        Functions string `json:"functions"`
-        Types     string `json:"types"`
-        Constants string `json:"constants"` // "SCREAMING_SNAKE"
-    } `json:"naming_convention"`
-    Formatting struct {
-        IndentStyle string `json:"indent_style"` // "tabs", "spaces"
-        IndentSize  int    `json:"indent_size"`
-        QuoteStyle  string `json:"quote_style"` // "single", "double"
-        TrailingComma bool `json:"trailing_comma"`
-    } `json:"formatting"`
-    Patterns struct {
-        ErrorHandling string `json:"error_handling"` // "early_return", "nested"
-        Imports       string `json:"imports"`        // "grouped", "ungrouped"
-    } `json:"patterns"`
-}
-```
-
-#### Style Check Skill
-- [ ] `check_style` skill returns project style for language
-- [ ] Caches inferred styles per project/language
-- [ ] Updates when new files detected
-- [ ] Returns actionable guidance
-
-**Tests:**
-- [ ] Correctly detects camelCase vs snake_case
-- [ ] Correctly detects tabs vs spaces
-- [ ] Handles mixed styles (reports majority)
-- [ ] Cache invalidation on new files
-- [ ] Multi-language project support
-
----
-
-### 6.23 Component/Pattern Registry
-
-Index of reusable UI components, hooks, utilities, and patterns in the project.
-
-**Files to create:**
-- `agents/engineer/component_registry.go`
-- `agents/engineer/component_registry_test.go`
-- `skills/find_component_skill.go`
-
-**Acceptance Criteria:**
-
-#### Registry Data Structure
-- [ ] `RegisteredComponent` with name, type, file path, exports, props/params
-- [ ] `ComponentRegistry` with `Register()`, `Find()`, `FindByType()`, `GetAll()`
-- [ ] Auto-scan project for components on startup
-- [ ] Watch for file changes and update registry
-
-```go
-type RegisteredComponent struct {
-    Name        string            `json:"name"`
-    Type        string            `json:"type"`  // "component", "hook", "utility", "pattern"
-    FilePath    string            `json:"file_path"`
-    Exports     []string          `json:"exports"`
-    Props       []ComponentProp   `json:"props,omitempty"`
-    Description string            `json:"description,omitempty"`
-    Examples    []string          `json:"examples,omitempty"`
-}
-
-type ComponentProp struct {
-    Name     string `json:"name"`
-    Type     string `json:"type"`
-    Required bool   `json:"required"`
-    Default  string `json:"default,omitempty"`
-}
-```
-
-#### Component Scanning
-- [ ] Scan React/Vue/Svelte component files
-- [ ] Extract exported names
-- [ ] Parse props/parameters
-- [ ] Detect custom hooks (use* pattern)
-- [ ] Detect utility functions
-
-#### Find Component Skill
-- [ ] `find_component` - Search by name or purpose
-- [ ] Returns existing components that match need
-- [ ] Includes usage examples from codebase
-- [ ] Warns before suggesting new component that exists
-
-**Tests:**
-- [ ] Correctly finds React components
-- [ ] Extracts props from TypeScript interfaces
-- [ ] Detects hooks correctly
-- [ ] Search by partial name works
-- [ ] Updates on file change
-
----
-
-### 6.24 Mistake Memory
-
-Cross-session learning from errors and anti-patterns.
-
-**Files to create:**
-- `agents/common/mistake_memory.go`
-- `agents/common/mistake_memory_test.go`
-- `skills/recall_mistakes_skill.go`
-
-**Acceptance Criteria:**
-
-#### Mistake Data Structure
-- [ ] `RecordedMistake` with pattern, context, resolution, occurrences
-- [ ] `MistakeMemory` with `Record()`, `Recall()`, `RecallByCategory()`
-- [ ] Persistent storage (SQLite)
-- [ ] Relevance scoring (recent + frequent = higher priority)
-
-```go
-type RecordedMistake struct {
-    ID         string    `json:"id"`
-    Pattern    string    `json:"pattern"`     // What went wrong
-    Category   string    `json:"category"`    // "syntax", "logic", "import", "api_misuse"
-    Context    string    `json:"context"`     // Where/when it happened
-    Resolution string    `json:"resolution"`  // How to fix
-    Occurrences int      `json:"occurrences"`
-    FirstSeen  time.Time `json:"first_seen"`
-    LastSeen   time.Time `json:"last_seen"`
-    FilePaths  []string  `json:"file_paths"`  // Where it occurred
-}
-```
-
-#### Mistake Recording
-- [ ] Automatic recording from failed builds/tests
-- [ ] Manual recording via skill
-- [ ] Increment occurrences on repeat
-- [ ] Extract patterns from error messages
-
-#### Recall Skill
-- [ ] `recall_mistakes` - Get relevant past mistakes
-- [ ] Accepts optional category filter
-- [ ] Returns most relevant (recent + frequent) first
-- [ ] Used by Engineer before writing similar code
-
-**Tests:**
-- [ ] Records mistakes correctly
-- [ ] Increments occurrences on repeat
-- [ ] Persistence across restarts
-- [ ] Relevance scoring works
-- [ ] Category filtering works
-
----
-
-### 6.25 Diff Preview
-
-Preview changes before applying them.
-
-**Files to create:**
-- `agents/engineer/diff_preview.go`
-- `agents/engineer/diff_preview_test.go`
-- `skills/diff_preview_skill.go`
-
-**Acceptance Criteria:**
-
-#### Diff Generation
-- [ ] `DiffPreview` with original, proposed, unified diff, stats
-- [ ] Generate unified diff format
-- [ ] Calculate stats (lines added, removed, changed)
-- [ ] Support multi-file diffs
-- [ ] Syntax highlighting hints
-
-```go
-type DiffPreview struct {
-    FilePath    string `json:"file_path"`
-    Original    string `json:"original,omitempty"`
-    Proposed    string `json:"proposed,omitempty"`
-    UnifiedDiff string `json:"unified_diff"`
-    Stats       DiffStats `json:"stats"`
-}
-
-type DiffStats struct {
-    LinesAdded   int `json:"lines_added"`
-    LinesRemoved int `json:"lines_removed"`
-    LinesChanged int `json:"lines_changed"`
-    Hunks        int `json:"hunks"`
-}
-```
-
-#### Preview Skill
-- [ ] `preview_diff` - Show what changes would be made
-- [ ] Accepts file path and proposed content
-- [ ] Returns unified diff and stats
-- [ ] Can preview multiple files at once
-
-#### Validation
-- [ ] Flag potentially dangerous changes (>100 lines removed)
-- [ ] Flag changes to sensitive files (.env, credentials)
-- [ ] Suggest review for large refactors
-
-**Tests:**
-- [ ] Unified diff format correct
-- [ ] Stats calculation accurate
-- [ ] Multi-file preview works
-- [ ] Sensitive file detection works
-- [ ] Large change warning triggers
-
----
-
-### 6.26 User Preference Learning
-
-Learn and apply user preferences over time.
-
-**Files to create:**
-- `agents/common/preference_learning.go`
-- `agents/common/preference_learning_test.go`
-- `skills/preferences_skill.go`
-
-**Acceptance Criteria:**
-
-#### Preference Data Structure
-- [ ] `UserPreference` with domain, key, value, confidence, source
-- [ ] `PreferenceStore` with `Learn()`, `Get()`, `GetAll()`
-- [ ] Persistent storage (SQLite)
-- [ ] Confidence increases with repeated signals
-
-```go
-type UserPreference struct {
-    Domain     string    `json:"domain"`      // "code_style", "communication", "workflow"
-    Key        string    `json:"key"`         // "verbosity", "test_framework"
-    Value      string    `json:"value"`       // "concise", "jest"
-    Confidence float64   `json:"confidence"`  // 0.0-1.0
-    Source     string    `json:"source"`      // "explicit", "implicit", "inferred"
-    LearnedAt  time.Time `json:"learned_at"`
-    SeenCount  int       `json:"seen_count"`
-}
-```
-
-#### Learning Sources
-- [ ] Explicit: User says "I prefer X"
-- [ ] Implicit: User accepts/rejects suggestions
-- [ ] Inferred: Patterns from code edits
-
-#### Preference Application
-- [ ] `get_preferences` - Retrieve preferences for domain
-- [ ] `set_preference` - Explicitly set a preference
-- [ ] Preferences influence response generation
-- [ ] Confidence-weighted (high confidence = strong preference)
-
-**Tests:**
-- [ ] Explicit preferences stored correctly
-- [ ] Confidence increases on repeated signals
-- [ ] Implicit learning from accept/reject
-- [ ] Persistence across sessions
-- [ ] Domain filtering works
-
----
-
-### 6.27 File Snapshot Cache
-
-Efficient caching of file states to avoid re-reading.
-
-**Files to create:**
-- `agents/common/file_snapshot.go`
-- `agents/common/file_snapshot_test.go`
-
-**Acceptance Criteria:**
-
-#### Snapshot Data Structure
-- [ ] `FileSnapshot` with path, content hash, last modified, content
-- [ ] `SnapshotCache` with `Get()`, `Invalidate()`, `InvalidateAll()`
-- [ ] Content-addressable (hash-based)
-- [ ] LRU eviction when over capacity
-
-```go
-type FileSnapshot struct {
-    Path         string    `json:"path"`
-    ContentHash  string    `json:"content_hash"`
-    LastModified time.Time `json:"last_modified"`
-    Content      []byte    `json:"-"`
-    LineCount    int       `json:"line_count"`
-    Size         int64     `json:"size"`
-}
-
-type SnapshotCache struct {
-    maxSize    int64
-    currentSize int64
-    snapshots  map[string]*FileSnapshot
-    lru        *list.List
-    mu         sync.RWMutex
-}
-```
-
-#### Cache Operations
-- [ ] Check modified time before returning cached
-- [ ] Automatic invalidation on file change detection
-- [ ] Pre-warm cache for frequently accessed files
-- [ ] Track access patterns for eviction
-
-#### Integration
-- [ ] File read operations use cache
-- [ ] Invalidate on write operations
-- [ ] Stats: hits, misses, evictions
-
-**Tests:**
-- [ ] Cache hit returns correct content
-- [ ] Modified file triggers re-read
-- [ ] LRU eviction works correctly
-- [ ] Write invalidates cache
-- [ ] Concurrent access safe
-
----
-
-### 6.28 Dependency Awareness
-
-Track project dependencies and their APIs.
-
-**Files to create:**
-- `agents/engineer/dependency_awareness.go`
-- `agents/engineer/dependency_awareness_test.go`
-- `skills/check_dependency_skill.go`
-
-**Acceptance Criteria:**
-
-#### Dependency Tracking
-- [ ] `TrackedDependency` with name, version, import path, common APIs
-- [ ] `DependencyTracker` with `Scan()`, `Get()`, `GetAll()`
-- [ ] Parse package.json, go.mod, requirements.txt, etc.
-- [ ] Track which dependencies are actually used
-
-```go
-type TrackedDependency struct {
-    Name        string   `json:"name"`
-    Version     string   `json:"version"`
-    ImportPath  string   `json:"import_path"`
-    CommonAPIs  []string `json:"common_apis"`
-    UsedIn      []string `json:"used_in"`      // File paths
-    DevOnly     bool     `json:"dev_only"`
-    Deprecated  bool     `json:"deprecated,omitempty"`
-}
-```
-
-#### API Awareness
-- [ ] Index common APIs from frequently-used deps
-- [ ] Detect deprecated API usage
-- [ ] Suggest correct imports
-- [ ] Version compatibility warnings
-
-#### Check Dependency Skill
-- [ ] `check_dependency` - Get info about a dependency
-- [ ] Returns version, common APIs, usage examples
-- [ ] Warns about deprecated/insecure versions
-
-**Tests:**
-- [ ] Parses package.json correctly
-- [ ] Parses go.mod correctly
-- [ ] Tracks usage across files
-- [ ] Detects deprecated APIs
-- [ ] Version parsing correct
-
----
-
-### 6.29 Task Continuity
-
-Checkpoint and resume interrupted tasks.
-
-**Files to create:**
-- `agents/common/task_continuity.go`
-- `agents/common/task_continuity_test.go`
-- `skills/checkpoint_skill.go`
-
-**Acceptance Criteria:**
-
-#### Checkpoint Data Structure
-- [ ] `TaskCheckpoint` with task ID, description, progress, state, files modified
-- [ ] `ContinuityManager` with `Checkpoint()`, `Resume()`, `List()`, `Clear()`
-- [ ] Persistent storage (JSON files or SQLite)
-- [ ] Auto-checkpoint on significant progress
-
-```go
-type TaskCheckpoint struct {
-    ID            string            `json:"id"`
-    TaskDescription string          `json:"task_description"`
-    Progress      TaskProgress      `json:"progress"`
-    State         map[string]any    `json:"state"`
-    FilesModified []string          `json:"files_modified"`
-    CreatedAt     time.Time         `json:"created_at"`
-    UpdatedAt     time.Time         `json:"updated_at"`
-}
-
-type TaskProgress struct {
-    TotalSteps     int      `json:"total_steps"`
-    CompletedSteps int      `json:"completed_steps"`
-    CurrentStep    string   `json:"current_step"`
-    NextSteps      []string `json:"next_steps"`
-    Blockers       []string `json:"blockers,omitempty"`
-}
-```
-
-#### Checkpoint Skills
-- [ ] `checkpoint_task` - Save current progress
-- [ ] `resume_task` - Resume from checkpoint
-- [ ] `list_checkpoints` - Show incomplete tasks
-- [ ] Auto-checkpoint on multi-step tasks
-
-#### Resume Logic
-- [ ] Restore state from checkpoint
-- [ ] Validate files haven't changed significantly
-- [ ] Generate handoff context for agent
-- [ ] Clear checkpoint on task completion
-
-**Tests:**
-- [ ] Checkpoint saves all state
-- [ ] Resume restores correctly
-- [ ] File change detection works
-- [ ] Persistence across restarts
-- [ ] Auto-checkpoint triggers correctly
-
----
-
-### 6.30 Design Token Awareness
-
-Track and apply design system tokens.
-
-**Files to create:**
-- `agents/designer/design_tokens.go`
-- `agents/designer/design_tokens_test.go`
-- `skills/design_token_skill.go`
-
-**Acceptance Criteria:**
-
-#### Token Data Structure
-- [ ] `DesignToken` with category, name, value, usage context
-- [ ] `DesignTokenRegistry` with `Get()`, `GetByCategory()`, `Suggest()`
-- [ ] Parse from CSS variables, Tailwind config, theme files
-- [ ] Auto-scan project for design system
-
-```go
-type DesignToken struct {
-    Category string `json:"category"` // "color", "spacing", "typography", "shadow"
-    Name     string `json:"name"`     // "primary", "md", "heading-1"
-    Value    string `json:"value"`    // "#3b82f6", "16px", "24px"
-    Usage    string `json:"usage"`    // "Primary brand color for buttons and links"
-    CSSVar   string `json:"css_var,omitempty"`  // "--color-primary"
-    Tailwind string `json:"tailwind,omitempty"` // "text-primary"
-}
-```
-
-#### Token Discovery
-- [ ] Scan CSS custom properties (--var-name)
-- [ ] Parse Tailwind theme config
-- [ ] Parse design system JSON/JS exports
-- [ ] Map values to semantic names
-
-#### Design Token Skill
-- [ ] `get_design_token` - Get token by category/name
-- [ ] `suggest_token` - Find token for a use case
-- [ ] Returns value, CSS var, Tailwind class if available
-- [ ] Warns when using raw value instead of token
-
-**Tests:**
-- [ ] Parses CSS variables correctly
-- [ ] Parses Tailwind config correctly
-- [ ] Suggestion finds appropriate tokens
-- [ ] Multiple design system formats supported
-- [ ] Raw value warning triggers
-
----
-
-## Agent Efficiency Token Savings
-
-### Additional Savings from Efficiency Techniques
-
-| Technique | Savings Per Use | Frequency | Monthly Impact |
-|-----------|-----------------|-----------|----------------|
-| **Scratchpad** | ~50 tokens (avoids re-explain) | ~20% of queries | ~2% |
-| **Style Inference** | ~100 tokens (no style questions) | ~15% of edits | ~1.5% |
-| **Component Registry** | ~200 tokens (avoids duplication) | ~10% of UI work | ~1% |
-| **Mistake Memory** | ~150 tokens (avoids repeat errors) | ~8% of builds | ~1% |
-| **Diff Preview** | ~100 tokens (confident changes) | ~25% of edits | ~1.5% |
-| **Preference Learning** | ~75 tokens (no clarification) | ~30% of queries | ~2% |
-| **File Snapshot** | ~50 tokens (no re-read) | ~40% of file ops | ~1.5% |
-| **Dependency Awareness** | ~100 tokens (correct imports) | ~15% of edits | ~1% |
-| **Task Continuity** | ~300 tokens (resume vs restart) | ~5% of sessions | ~0.5% |
-| **Design Tokens** | ~75 tokens (correct values) | ~20% of UI work | ~0.5% |
-| **TOTAL** | | | **~12.5%** |
-
-### Updated Cost Projections
-
-| Scenario | Monthly Cost | vs Baseline |
-|----------|-------------|-------------|
-| Baseline (no optimization) | $285/month | - |
-| Cache only | $94/month | 67% savings |
-| Cache + VectorGraphDB | $72/month | 75% savings |
-| Cache + VectorGraphDB + XOR | $60/month | ~80% savings |
-| **+ Agent Efficiency** | **$45/month** | **~85% savings** |
-
-**Target**: 85% token reduction with all optimizations enabled.
-
----
-
-## Skill/Agent Integrations
-
-### 6.31 Designer Agent Implementation
-
-New agent for UI/UX implementation tasks.
-
-**Files to create:**
-- `agents/designer/designer.go`
-- `agents/designer/designer_test.go`
-- `agents/designer/skills.go`
-
-**Acceptance Criteria:**
-
-#### Core Designer Agent
-- [ ] Designer agent struct with standard agent interface
-- [ ] Session-scoped state for design context
-- [ ] Integration with Guide for routing
-- [ ] LLM model selection (Sonnet for speed)
-
-#### Designer Skills (Tier 1 - Core)
-- [ ] `create_component` - Create new UI component
-- [ ] `style_component` - Apply styling to component
-- [ ] `get_design_tokens` - Retrieve design system tokens
-- [ ] `find_component` - Find existing UI components
-- [ ] `preview_ui` - Preview UI changes in isolation
-- [ ] `check_accessibility` - Check a11y compliance
-
-#### Designer Skills (Tier 2 - Contextual)
-- [ ] `analyze_layout` - Suggest layout improvements
-- [ ] `suggest_animation` - Suggest appropriate animations
-- [ ] `audit_consistency` - Audit design consistency
-- [ ] `generate_variants` - Generate component variants
-- [ ] `consult_engineer` - Consult on implementation
-- [ ] `consult_academic` - Research UI/UX best practices
-
-#### Designer Skills (Tier 3 - Specialized)
-- [ ] `design_system_scaffold` - Scaffold complete design system
-- [ ] `theme_migration` - Migrate between themes
-- [ ] `responsive_audit` - Full responsive audit
-
-#### Guide Routing Integration
-- [ ] Route UI/UX intents to Designer
-- [ ] Keywords: "component", "ui", "style", "css", "tailwind", "design", "a11y"
-- [ ] Handoff patterns between Designer and Engineer
-
-**Tests:**
-- [ ] Designer agent responds to UI intents
-- [ ] All core skills work correctly
-- [ ] Guide routes to Designer appropriately
-- [ ] Designer/Engineer handoff works
-
----
-
-### 6.32 Skill/Agent Integration Matrix
-
-Integrate efficiency techniques with appropriate agents per the mapping.
-
-**Reference Matrix:**
-
-| Technique              | Guide | Architect | Engineer | Inspector | Tester | Designer |
-|------------------------|-------|-----------|----------|-----------|--------|----------|
-| Scratchpad Memory      |   -   |     ✓     |    ✓     |     ✓     |   ✓    |    ✓     |
-| Style Inference        |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
-| Component Registry     |   -   |     -     |    ✓     |     -     |   -    |    ✓     |
-| Mistake Memory         |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
-| Diff Preview           |   -   |     -     |    ✓     |     -     |   -    |    ✓     |
-| User Preferences       |   ✓   |     ✓     |    ✓     |     -     |   -    |    ✓     |
-| File Snapshot Cache    |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
-| Dependency Awareness   |   -   |     -     |    ✓     |     ✓     |   ✓    |    -     |
-| Task Continuity        |   -   |     ✓     |    ✓     |     -     |   ✓    |    -     |
-| Design Token Awareness |   -   |     -     |    ✓     |     ✓     |   -    |    ✓     |
-
----
-
-### 6.33 Scratchpad Integration
-
-Integrate scratchpad skills with: **Architect, Engineer, Inspector, Tester, Designer**
-
-**Files to modify:**
-- `agents/architect/skills.go` - Add scratchpad skills
-- `agents/engineer/skills.go` - Add scratchpad skills
-- `agents/inspector/skills.go` - Add scratchpad skills
-- `agents/tester/skills.go` - Add scratchpad skills
-- `agents/designer/skills.go` - Add scratchpad skills
-
-**Acceptance Criteria:**
-- [ ] `scratchpad_write` skill available to Architect
-- [ ] `scratchpad_write` skill available to Engineer
-- [ ] `scratchpad_write` skill available to Inspector
-- [ ] `scratchpad_write` skill available to Tester
-- [ ] `scratchpad_write` skill available to Designer
-- [ ] `scratchpad_read` skill available to all above
-- [ ] Session-scoped isolation verified
-- [ ] Agent-specific suggested keys documented
-
-**Suggested Keys by Agent:**
-- **Architect**: `requirements`, `decisions`, `blockers`, `plan_state`
-- **Engineer**: `current_task`, `tried_failed`, `partial_work`
-- **Inspector**: `issues_found`, `review_notes`, `flagged_patterns`
-- **Tester**: `test_cases`, `coverage_gaps`, `flaky_tests`
-- **Designer**: `design_decisions`, `component_notes`, `accessibility_flags`
-
----
-
-### 6.34 Style Inference Integration
-
-Integrate style inference with: **Engineer, Inspector, Tester**
-
-**Files to modify:**
-- `agents/engineer/skills.go` - Add style check skill
-- `agents/inspector/skills.go` - Add style check skill
-- `agents/tester/skills.go` - Add style check skill
-
-**Acceptance Criteria:**
-- [ ] `check_style` skill available to Engineer
-- [ ] `check_style` skill available to Inspector
-- [ ] `check_style` skill available to Tester
-- [ ] Engineer uses style before writing code
-- [ ] Inspector compares against detected style
-- [ ] Tester matches test style to project style
-
----
-
-### 6.35 Component Registry Integration
-
-Integrate component registry with: **Engineer, Designer**
-
-**Files to modify:**
-- `agents/engineer/skills.go` - Add find_component skill
-- `agents/designer/skills.go` - Add find_component skill
-
-**Acceptance Criteria:**
-- [ ] `find_component` skill available to Engineer
-- [ ] `find_component` skill available to Designer
-- [ ] Auto-suggest existing components before creating new
-- [ ] Warn when creating duplicate component
-- [ ] Designer priority access (primary user)
-
----
-
-### 6.36 Mistake Memory Integration
-
-Integrate mistake memory with: **Engineer, Inspector, Tester** (Archivalist as source)
-
-**Files to modify:**
-- `agents/engineer/skills.go` - Add recall_mistakes skill
-- `agents/inspector/skills.go` - Add recall_mistakes skill
-- `agents/tester/skills.go` - Add recall_mistakes skill
-- `agents/archivalist/skills.go` - Add mistake storage/retrieval
-
-**Acceptance Criteria:**
-- [ ] `recall_mistakes` skill available to Engineer
-- [ ] `recall_mistakes` skill available to Inspector
-- [ ] `recall_mistakes` skill available to Tester
-- [ ] Archivalist records mistakes from failed builds/tests
-- [ ] Engineer queries before similar work
-- [ ] Inspector flags known anti-patterns
-- [ ] Tester knows common failure patterns
-
----
-
-### 6.37 Diff Preview Integration
-
-Integrate diff preview with: **Engineer, Designer**
-
-**Files to modify:**
-- `agents/engineer/skills.go` - Add preview_diff skill
-- `agents/designer/skills.go` - Add preview_diff skill
-
-**Acceptance Criteria:**
-- [ ] `preview_diff` skill available to Engineer
-- [ ] `preview_diff` skill available to Designer
-- [ ] Preview before large changes (>50 lines)
-- [ ] Warn on sensitive file changes
-- [ ] Stats: lines added/removed/changed
-
----
-
-### 6.38 User Preferences Integration
-
-Integrate user preferences with: **Guide, Architect, Engineer, Designer**
-
-**Files to modify:**
-- `agents/guide/skills.go` - Add preference skills
-- `agents/architect/skills.go` - Add preference skills
-- `agents/engineer/skills.go` - Add preference skills
-- `agents/designer/skills.go` - Add preference skills
-
-**Acceptance Criteria:**
-- [ ] `get_preferences` skill available to Guide
-- [ ] `get_preferences` skill available to Architect
-- [ ] `get_preferences` skill available to Engineer
-- [ ] `get_preferences` skill available to Designer
-- [ ] Guide routes based on workflow preferences
-- [ ] Architect adjusts verbosity per preference
-- [ ] Engineer follows code style preferences
-- [ ] Designer follows design style preferences
-
----
-
-### 6.39 File Snapshot Cache Integration
-
-Integrate file snapshot cache with: **Engineer, Inspector, Tester** (Librarian as source)
-
-**Files to modify:**
-- `agents/engineer/file_ops.go` - Use snapshot cache
-- `agents/inspector/file_ops.go` - Use snapshot cache
-- `agents/tester/file_ops.go` - Use snapshot cache
-- `agents/librarian/indexer.go` - Populate snapshot cache
-
-**Acceptance Criteria:**
-- [ ] Engineer reads use snapshot cache
-- [ ] Inspector reads use snapshot cache
-- [ ] Tester reads use snapshot cache
-- [ ] Librarian populates cache during indexing
-- [ ] Cache invalidation on write operations
-- [ ] Stats: cache hits, misses, evictions
-
----
-
-### 6.40 Dependency Awareness Integration
-
-Integrate dependency awareness with: **Engineer, Inspector, Tester** (Academic as source)
-
-**Files to modify:**
-- `agents/engineer/skills.go` - Add check_dependency skill
-- `agents/inspector/skills.go` - Add check_dependency skill
-- `agents/tester/skills.go` - Add check_dependency skill
-- `agents/academic/skills.go` - Provide dependency best practices
-
-**Acceptance Criteria:**
-- [ ] `check_dependency` skill available to Engineer
-- [ ] `check_dependency` skill available to Inspector
-- [ ] `check_dependency` skill available to Tester
-- [ ] Engineer uses correct imports
-- [ ] Inspector flags deprecated deps
-- [ ] Tester mocks dependencies correctly
-- [ ] Academic provides version/security info
-
----
-
-### 6.41 Task Continuity Integration
-
-Integrate task continuity with: **Architect, Engineer, Tester**
-
-**Files to modify:**
-- `agents/architect/skills.go` - Add checkpoint skills
-- `agents/engineer/skills.go` - Add checkpoint skills
-- `agents/tester/skills.go` - Add checkpoint skills
-
-**Acceptance Criteria:**
-- [ ] `checkpoint_task` skill available to Architect
-- [ ] `checkpoint_task` skill available to Engineer
-- [ ] `checkpoint_task` skill available to Tester
-- [ ] `resume_task` skill available to all above
-- [ ] Auto-checkpoint on significant progress
-- [ ] Resume generates handoff context
-
----
-
-### 6.42 Design Token Integration
-
-Integrate design tokens with: **Engineer, Inspector, Designer**
-
-**Files to modify:**
-- `agents/engineer/skills.go` - Add design token skills
-- `agents/inspector/skills.go` - Add design token skills
-- `agents/designer/skills.go` - Add design token skills
-
-**Acceptance Criteria:**
-- [ ] `get_design_tokens` skill available to Engineer
-- [ ] `get_design_tokens` skill available to Inspector
-- [ ] `get_design_tokens` skill available to Designer
-- [ ] `find_design_token` skill available to all above
-- [ ] Engineer uses tokens instead of hardcoded values
-- [ ] Inspector flags hardcoded values
-- [ ] Designer primary user of tokens
+**Pipeline System Integration Points:**
+- 6.43 (Pipeline Core) is foundation for all pipeline work
+- 6.44-6.45 (Inspector/Tester Modes) can parallelize
+- 6.46-6.48 depend on 6.43
+- 6.49 validates entire pipeline system
 
 ---
 
@@ -7958,3 +14677,31 @@ Integrate design tokens with: **Engineer, Inspector, Designer**
 - 6.31 (Designer) can be parallelized with 6.21-6.30
 - 6.32 (Matrix) is a reference, not implementation
 - 6.42 (Design Tokens) depends on 6.31 (Designer agent)
+
+---
+
+## Updated Implementation Order (with Pipelines)
+
+1. **Week 1-2**: 6.1 (Schema), 6.2 (HNSW) - can parallelize
+2. **Week 3**: 6.3 (Nodes/Edges), 6.4 (Search/Traversal) - can parallelize
+3. **Week 4-5**: 6.5-6.11 (All Mitigations) - can parallelize
+4. **Week 6**: 6.12 (Unified Resolver)
+5. **Week 7-8**: 6.13-6.16 (Agent Integrations) - can parallelize
+6. **Week 9**: 6.19 (XOR Filter Optimization)
+7. **Week 10**: 6.20 (Architect Planning Preflight)
+8. **Week 11-12**: 6.21-6.24 (Scratchpad, Style Inference, Component Registry, Mistake Memory)
+9. **Week 13-14**: 6.25-6.28 (Diff Preview, Preferences, File Snapshot, Dependency Awareness)
+10. **Week 15**: 6.29-6.30 (Task Continuity, Design Tokens)
+11. **Week 16**: 6.31 (Designer Agent Implementation)
+12. **Week 17-18**: 6.43-6.45 (Pipeline Core, Inspector Modes, Tester Modes)
+13. **Week 19**: 6.46-6.48 (Architect Decomposition, Failure Routing, Task Commands)
+14. **Week 20**: 6.32-6.42 (Skill/Agent Integrations) - can parallelize
+15. **Week 21**: 6.49, 6.17-6.18 (Pipeline Integration Tests, Benchmarks) - validates all
+
+**Pipeline Dependencies:**
+- 6.43 (Pipeline Core) must be complete before 6.44-6.45
+- 6.44-6.45 (Inspector/Tester Modes) can parallelize
+- 6.46 (Architect Decomposition) depends on 6.43
+- 6.47 (Failure Routing) depends on 6.43
+- 6.48 (Task Commands) depends on 6.43
+- 6.49 (Integration Tests) depends on all pipeline sections

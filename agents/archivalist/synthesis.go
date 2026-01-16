@@ -74,43 +74,76 @@ func NewSynthesizer(cfg SynthesizerConfig) *Synthesizer {
 
 // SynthesisResponse is the response from synthesis
 type SynthesisResponse struct {
-	Answer     string              `json:"answer"`
-	Source     string              `json:"source"` // "cache" or "synthesis"
-	CacheHit   bool                `json:"cache_hit"`
-	Context    []*RetrievalResult  `json:"context,omitempty"`
-	TokensUsed int                 `json:"tokens_used,omitempty"`
-	Latency    time.Duration       `json:"latency"`
+	Answer     string             `json:"answer"`
+	Source     string             `json:"source"` // "cache" or "synthesis"
+	CacheHit   bool               `json:"cache_hit"`
+	Context    []*RetrievalResult `json:"context,omitempty"`
+	TokensUsed int                `json:"tokens_used,omitempty"`
+	Latency    time.Duration      `json:"latency"`
 }
 
 // Answer processes a query through the full RAG pipeline
 func (s *Synthesizer) Answer(ctx context.Context, query string, sessionID string, queryType QueryType) (*SynthesisResponse, error) {
 	startTime := time.Now()
 
-	// Step 1: Check query cache
-	if s.queryCache != nil {
-		if cached, ok := s.queryCache.Get(ctx, query, sessionID); ok {
-			return &SynthesisResponse{
-				Answer:   string(cached.Response),
-				Source:   "cache",
-				CacheHit: true,
-				Latency:  time.Since(startTime),
-			}, nil
-		}
+	if cached := s.cachedResponse(ctx, query, sessionID, startTime); cached != nil {
+		return cached, nil
 	}
 
-	// Step 2: Retrieve relevant context
+	contextResults, err := s.retrieveContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	prompt := s.buildPrompt(query, contextResults)
+	message, err := s.synthesize(ctx, prompt)
+	if err != nil {
+		return nil, err
+	}
+
+	answer := extractAnswer(message)
+	tokensUsed := int(message.Usage.InputTokens + message.Usage.OutputTokens)
+	s.cacheResponse(ctx, query, sessionID, answer, queryType)
+
+	return &SynthesisResponse{
+		Answer:     answer,
+		Source:     "synthesis",
+		CacheHit:   false,
+		Context:    contextResults,
+		TokensUsed: tokensUsed,
+		Latency:    time.Since(startTime),
+	}, nil
+}
+
+func (s *Synthesizer) cachedResponse(ctx context.Context, query string, sessionID string, startTime time.Time) *SynthesisResponse {
+	if s.queryCache == nil {
+		return nil
+	}
+	cached, ok := s.queryCache.Get(ctx, query, sessionID)
+	if !ok {
+		return nil
+	}
+	return &SynthesisResponse{
+		Answer:   string(cached.Response),
+		Source:   "cache",
+		CacheHit: true,
+		Latency:  time.Since(startTime),
+	}
+}
+
+func (s *Synthesizer) retrieveContext(ctx context.Context, query string) ([]*RetrievalResult, error) {
 	opts := DefaultRetrievalOptions()
-	opts.TopK = 10 // Get top 10 most relevant results
+	opts.TopK = 10
 
 	contextResults, err := s.retriever.Retrieve(ctx, query, opts)
 	if err != nil {
 		return nil, fmt.Errorf("retrieval failed: %w", err)
 	}
 
-	// Step 3: Build prompt with context
-	prompt := s.buildPrompt(query, contextResults)
+	return contextResults, nil
+}
 
-	// Step 4: Run Sonnet for synthesis
+func (s *Synthesizer) synthesize(ctx context.Context, prompt string) (*anthropic.Message, error) {
 	message, err := s.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(ModelSonnet45),
 		MaxTokens: s.maxTokens,
@@ -124,30 +157,23 @@ func (s *Synthesizer) Answer(ctx context.Context, query string, sessionID string
 	if err != nil {
 		return nil, fmt.Errorf("synthesis failed: %w", err)
 	}
+	return message, nil
+}
 
-	// Extract text content
+func extractAnswer(message *anthropic.Message) string {
 	var answer string
 	for _, block := range message.Content {
 		if block.Type == "text" {
 			answer += block.Text
 		}
 	}
+	return answer
+}
 
-	tokensUsed := int(message.Usage.InputTokens + message.Usage.OutputTokens)
-
-	// Step 5: Cache the response
+func (s *Synthesizer) cacheResponse(ctx context.Context, query, sessionID, answer string, queryType QueryType) {
 	if s.queryCache != nil {
 		s.queryCache.Store(ctx, query, sessionID, []byte(answer), queryType)
 	}
-
-	return &SynthesisResponse{
-		Answer:     answer,
-		Source:     "synthesis",
-		CacheHit:   false,
-		Context:    contextResults,
-		TokensUsed: tokensUsed,
-		Latency:    time.Since(startTime),
-	}, nil
 }
 
 // AnswerWithContext synthesizes an answer from pre-retrieved context

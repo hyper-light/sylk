@@ -162,171 +162,171 @@ func (p *PriorityPool) Close() error {
 }
 
 func (p *PriorityPool) Submit(job *PriorityJob) bool {
-	if !p.running.Load() || p.closed.Load() {
+	if !p.canAcceptJob(job) {
 		return false
 	}
 
-	if job.CreatedAt.IsZero() {
-		job.CreatedAt = time.Now()
-	}
-
-	p.mu.Lock()
-	if p.queueLen >= p.maxQueueSize {
-		p.mu.Unlock()
+	accepted := p.submitIfAvailable(job)
+	if !accepted {
 		atomic.AddInt64(&p.jobsDropped, 1)
-		return false
 	}
-
-	lane := int(job.Priority)
-	if lane < 0 {
-		lane = 0
-	}
-	if lane > int(PriorityCritical) {
-		lane = int(PriorityCritical)
-	}
-
-	p.lanes[lane] = append(p.lanes[lane], job)
-	p.queueLen++
-	atomic.AddInt64(&p.jobsSubmitted, 1)
-	atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
-	p.mu.Unlock()
-
-	select {
-	case p.jobReady <- struct{}{}:
-	default:
-	}
-
-	return true
+	return accepted
 }
 
 func (p *PriorityPool) SubmitBlocking(job *PriorityJob) bool {
-	if !p.running.Load() || p.closed.Load() {
+	if !p.canAcceptJob(job) {
 		return false
 	}
 
-	if job.CreatedAt.IsZero() {
-		job.CreatedAt = time.Now()
-	}
-
 	for {
-		p.mu.Lock()
-		if p.queueLen < p.maxQueueSize {
-			lane := int(job.Priority)
-			if lane < 0 {
-				lane = 0
-			}
-			if lane > int(PriorityCritical) {
-				lane = int(PriorityCritical)
-			}
-			p.lanes[lane] = append(p.lanes[lane], job)
-			p.queueLen++
-			atomic.AddInt64(&p.jobsSubmitted, 1)
-			atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
-			p.mu.Unlock()
-
-			select {
-			case p.jobReady <- struct{}{}:
-			default:
-			}
+		if p.submitIfAvailable(job) {
 			return true
 		}
-		p.mu.Unlock()
 
-		select {
-		case <-time.After(10 * time.Millisecond):
-		case <-p.ctx.Done():
-			return false
+		if p.waitForCapacity(10 * time.Millisecond) {
+			continue
 		}
+		return false
 	}
 }
 
 func (p *PriorityPool) SubmitWithTimeout(job *PriorityJob, timeout time.Duration) bool {
-	if !p.running.Load() || p.closed.Load() {
+	if !p.canAcceptJob(job) {
 		return false
 	}
 
-	if job.CreatedAt.IsZero() {
-		job.CreatedAt = time.Now()
-	}
-
 	deadline := time.Now().Add(timeout)
-
 	for time.Now().Before(deadline) {
-		p.mu.Lock()
-		if p.queueLen < p.maxQueueSize {
-			lane := int(job.Priority)
-			if lane < 0 {
-				lane = 0
-			}
-			if lane > int(PriorityCritical) {
-				lane = int(PriorityCritical)
-			}
-			p.lanes[lane] = append(p.lanes[lane], job)
-			p.queueLen++
-			atomic.AddInt64(&p.jobsSubmitted, 1)
-			atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
-			p.mu.Unlock()
-
-			select {
-			case p.jobReady <- struct{}{}:
-			default:
-			}
+		if p.submitIfAvailable(job) {
 			return true
 		}
-		p.mu.Unlock()
 
 		remaining := time.Until(deadline)
-		waitTime := 10 * time.Millisecond
-		if remaining < waitTime {
-			waitTime = remaining
+		if p.waitForCapacity(p.waitDuration(remaining)) {
+			continue
 		}
-
-		select {
-		case <-time.After(waitTime):
-		case <-p.ctx.Done():
-			return false
-		}
+		return false
 	}
 
 	atomic.AddInt64(&p.jobsDropped, 1)
 	return false
 }
 
+func (p *PriorityPool) canAcceptJob(job *PriorityJob) bool {
+	if !p.running.Load() || p.closed.Load() {
+		return false
+	}
+	if job.CreatedAt.IsZero() {
+		job.CreatedAt = time.Now()
+	}
+	return true
+}
+
+func (p *PriorityPool) submitIfAvailable(job *PriorityJob) bool {
+	p.mu.Lock()
+	if p.queueLen >= p.maxQueueSize {
+		p.mu.Unlock()
+		return false
+	}
+
+	lane := p.normalizeLane(job.Priority)
+	p.lanes[lane] = append(p.lanes[lane], job)
+	p.queueLen++
+	atomic.AddInt64(&p.jobsSubmitted, 1)
+	atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
+	p.mu.Unlock()
+
+	p.signalJobReady()
+	return true
+}
+
+func (p *PriorityPool) normalizeLane(priority Priority) int {
+	lane := int(priority)
+	if lane < 0 {
+		return 0
+	}
+	if lane > int(PriorityCritical) {
+		return int(PriorityCritical)
+	}
+	return lane
+}
+
+func (p *PriorityPool) signalJobReady() {
+	select {
+	case p.jobReady <- struct{}{}:
+	default:
+	}
+}
+
+func (p *PriorityPool) waitForCapacity(waitTime time.Duration) bool {
+	select {
+	case <-time.After(waitTime):
+		return true
+	case <-p.ctx.Done():
+		return false
+	}
+}
+
+func (p *PriorityPool) waitDuration(remaining time.Duration) time.Duration {
+	waitTime := 10 * time.Millisecond
+	if remaining < waitTime {
+		return remaining
+	}
+	return waitTime
+}
+
 func (p *PriorityPool) worker(id int) {
 	defer p.wg.Done()
 
 	for {
-		select {
-		case <-p.ctx.Done():
+		if !p.waitForJobReady() {
 			return
-		case _, ok := <-p.jobReady:
-			if !ok {
-				return
-			}
-
-			job := p.popJob()
-			if job == nil {
-				continue
-			}
-
-			waitTime := time.Since(job.CreatedAt)
-			atomic.AddInt64(&p.priorityStats[job.Priority].waitTime, int64(waitTime))
-			p.recordWaitBucket(waitTime)
-
-			start := time.Now()
-			err := p.executeJob(job)
-			p.recordRunBucket(time.Since(start))
-			if err != nil {
-				atomic.AddInt64(&p.jobsFailed, 1)
-				if job.OnError != nil {
-					job.OnError(err)
-				}
-			} else {
-				atomic.AddInt64(&p.jobsCompleted, 1)
-				atomic.AddInt64(&p.priorityStats[job.Priority].completed, 1)
-			}
 		}
+
+		job := p.popJob()
+		if job == nil {
+			continue
+		}
+
+		p.trackWaitTime(job)
+		err, runDuration := p.runJob(job)
+		p.recordRunBucket(runDuration)
+		p.handleJobResult(job, err)
 	}
+}
+
+func (p *PriorityPool) waitForJobReady() bool {
+	select {
+	case <-p.ctx.Done():
+		return false
+	case _, ok := <-p.jobReady:
+		return ok
+	}
+}
+
+func (p *PriorityPool) trackWaitTime(job *PriorityJob) {
+	waitTime := time.Since(job.CreatedAt)
+	atomic.AddInt64(&p.priorityStats[job.Priority].waitTime, int64(waitTime))
+	p.recordWaitBucket(waitTime)
+}
+
+func (p *PriorityPool) runJob(job *PriorityJob) (error, time.Duration) {
+	start := time.Now()
+	err := p.executeJob(job)
+	return err, time.Since(start)
+}
+
+func (p *PriorityPool) handleJobResult(job *PriorityJob, err error) {
+	if err != nil {
+		atomic.AddInt64(&p.jobsFailed, 1)
+		if job.OnError != nil {
+			job.OnError(err)
+		}
+		return
+	}
+
+	atomic.AddInt64(&p.jobsCompleted, 1)
+	atomic.AddInt64(&p.priorityStats[job.Priority].completed, 1)
 }
 
 func (p *PriorityPool) popJob() *PriorityJob {
