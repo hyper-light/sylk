@@ -157,7 +157,6 @@ func (idx *SimilarityIndex) Insert(id string, vector []float32) error {
 
 	// Find entry point and navigate down
 	ep := idx.entryPoint
-	epNode := idx.nodes[ep]
 
 	// Search from top to the node's level + 1
 	for l := idx.maxLevel; l > level; l-- {
@@ -410,7 +409,7 @@ func (idx *SimilarityIndex) searchLayerEf(query []float32, ep string, ef int, le
 		closest := heap.Pop(candidates).(distanceItem)
 
 		// Check termination condition
-		if results.Len() > 0 && closest.dist > (*results)[0].dist {
+		if results.Len() > 0 && closest.dist > results.items[0].dist {
 			break
 		}
 
@@ -428,7 +427,7 @@ func (idx *SimilarityIndex) searchLayerEf(query []float32, ep string, ef int, le
 			atomic.AddInt64(&idx.stats.totalComparisons, 1)
 			dist := idx.distance(query, neighborID)
 
-			if results.Len() < ef || dist < (*results)[0].dist {
+			if results.Len() < ef || dist < results.items[0].dist {
 				heap.Push(candidates, distanceItem{id: neighborID, dist: dist})
 				heap.Push(results, distanceItem{id: neighborID, dist: dist})
 

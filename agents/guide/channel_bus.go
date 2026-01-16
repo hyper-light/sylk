@@ -6,92 +6,72 @@ import (
 	"sync/atomic"
 )
 
-// =============================================================================
-// Channel Bus Implementation
-// =============================================================================
-//
-// ChannelBus is an in-process event bus using Go channels.
-// Suitable for single-process deployments with many agents.
-//
-// Features:
-// - Buffered channels prevent blocking publishers
-// - Multiple subscribers per topic
-// - Async handler execution option
-// - Graceful shutdown
+type topicSubscriptions struct {
+	mu   sync.RWMutex
+	subs []*channelSubscription
+}
 
 var (
-	ErrBusClosed         = errors.New("bus is closed")
+	ErrBusClosed          = errors.New("bus is closed")
 	ErrSubscriptionClosed = errors.New("subscription is closed")
-	ErrInvalidHandler    = errors.New("handler cannot be nil")
+	ErrInvalidHandler     = errors.New("handler cannot be nil")
 )
 
-// ChannelBus implements EventBus using Go channels
 type ChannelBus struct {
-	mu sync.RWMutex
+	subscriptions *ShardedMap[string, *topicSubscriptions]
 
-	// Subscriptions by topic
-	subscriptions map[string][]*channelSubscription
-
-	// Configuration
 	bufferSize int
 
-	// State
 	closed atomic.Bool
 
-	// Wait group for async handlers
 	wg sync.WaitGroup
 }
 
-// ChannelBusConfig configures the channel bus
 type ChannelBusConfig struct {
-	// BufferSize is the buffer size for subscription channels.
-	// Larger buffers reduce blocking but use more memory.
-	// Default: 256
 	BufferSize int
+	ShardCount int
 }
 
-// DefaultChannelBusConfig returns sensible defaults
 func DefaultChannelBusConfig() ChannelBusConfig {
 	return ChannelBusConfig{
 		BufferSize: 256,
+		ShardCount: DefaultShardCount,
 	}
 }
 
-// NewChannelBus creates a new channel-based event bus
 func NewChannelBus(cfg ChannelBusConfig) *ChannelBus {
 	if cfg.BufferSize <= 0 {
 		cfg.BufferSize = 256
 	}
+	if cfg.ShardCount <= 0 {
+		cfg.ShardCount = DefaultShardCount
+	}
 
 	return &ChannelBus{
-		subscriptions: make(map[string][]*channelSubscription),
+		subscriptions: NewStringMap[*topicSubscriptions](cfg.ShardCount),
 		bufferSize:    cfg.BufferSize,
 	}
 }
 
-// =============================================================================
-// EventBus Implementation
-// =============================================================================
-
-// Publish sends a message to all subscribers of a topic
 func (b *ChannelBus) Publish(topic string, msg *Message) error {
 	if b.closed.Load() {
 		return ErrBusClosed
 	}
 
-	b.mu.RLock()
-	subs := b.subscriptions[topic]
-	b.mu.RUnlock()
+	topicSubs, ok := b.subscriptions.Get(topic)
+	if !ok || topicSubs == nil {
+		return nil
+	}
 
-	// Send to all subscribers (non-blocking with buffered channels)
+	topicSubs.mu.RLock()
+	subs := append([]*channelSubscription(nil), topicSubs.subs...)
+	topicSubs.mu.RUnlock()
+
 	for _, sub := range subs {
 		if sub.active.Load() {
 			select {
 			case sub.ch <- msg:
-				// Delivered
 			default:
-				// Buffer full - message dropped
-				// Could add metrics/logging here
 			}
 		}
 	}
@@ -99,12 +79,10 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 	return nil
 }
 
-// Subscribe registers a synchronous handler for a topic
 func (b *ChannelBus) Subscribe(topic string, handler MessageHandler) (Subscription, error) {
 	return b.subscribe(topic, handler, false)
 }
 
-// SubscribeAsync registers an async handler that runs in a goroutine
 func (b *ChannelBus) SubscribeAsync(topic string, handler MessageHandler) (Subscription, error) {
 	return b.subscribe(topic, handler, true)
 }
@@ -126,52 +104,51 @@ func (b *ChannelBus) subscribe(topic string, handler MessageHandler, async bool)
 	}
 	sub.active.Store(true)
 
-	// Register subscription
-	b.mu.Lock()
-	b.subscriptions[topic] = append(b.subscriptions[topic], sub)
-	b.mu.Unlock()
+	topicSubs, _ := b.subscriptions.GetOrSet(topic, &topicSubscriptions{})
+	topicSubs.mu.Lock()
+	topicSubs.subs = append(topicSubs.subs, sub)
+	topicSubs.mu.Unlock()
+	sub.topicShard = topicSubs
 
-	// Start message processing goroutine
 	b.wg.Add(1)
 	go sub.run(&b.wg)
 
 	return sub, nil
 }
 
-// Close shuts down the bus and all subscriptions
 func (b *ChannelBus) Close() error {
 	if b.closed.Swap(true) {
-		return ErrBusClosed // Already closed
+		return ErrBusClosed
 	}
 
-	b.mu.Lock()
-	// Close all subscription channels
-	for _, subs := range b.subscriptions {
-		for _, sub := range subs {
+	allTopics := b.subscriptions.Snapshot()
+	for _, topicSubs := range allTopics {
+		if topicSubs == nil {
+			continue
+		}
+		topicSubs.mu.Lock()
+		for _, sub := range topicSubs.subs {
 			sub.close()
 		}
+		topicSubs.subs = nil
+		topicSubs.mu.Unlock()
 	}
-	b.subscriptions = make(map[string][]*channelSubscription)
-	b.mu.Unlock()
+	b.subscriptions.Clear()
 
-	// Wait for all handlers to complete
 	b.wg.Wait()
 
 	return nil
 }
 
-// =============================================================================
-// Channel Subscription
-// =============================================================================
-
 type channelSubscription struct {
-	bus     *ChannelBus
-	topic   string
-	ch      chan *Message
-	handler MessageHandler
-	async   bool
-	active  atomic.Bool
-	closed  atomic.Bool
+	bus        *ChannelBus
+	topic      string
+	ch         chan *Message
+	handler    MessageHandler
+	async      bool
+	active     atomic.Bool
+	closed     atomic.Bool
+	topicShard *topicSubscriptions
 }
 
 func (s *channelSubscription) Topic() string {
@@ -187,18 +164,24 @@ func (s *channelSubscription) Unsubscribe() error {
 		return ErrSubscriptionClosed
 	}
 
-	// Remove from bus
-	s.bus.mu.Lock()
-	subs := s.bus.subscriptions[s.topic]
-	for i, sub := range subs {
-		if sub == s {
-			s.bus.subscriptions[s.topic] = append(subs[:i], subs[i+1:]...)
-			break
+	topicSubs := s.topicShard
+	if topicSubs == nil {
+		if looked, ok := s.bus.subscriptions.Get(s.topic); ok {
+			topicSubs = looked
 		}
 	}
-	s.bus.mu.Unlock()
+	if topicSubs != nil {
+		topicSubs.mu.Lock()
+		updated := topicSubs.subs[:0]
+		for _, sub := range topicSubs.subs {
+			if sub != s {
+				updated = append(updated, sub)
+			}
+		}
+		topicSubs.subs = updated
+		topicSubs.mu.Unlock()
+	}
 
-	// Close channel (will cause run() to exit)
 	s.close()
 
 	return nil
@@ -206,7 +189,7 @@ func (s *channelSubscription) Unsubscribe() error {
 
 func (s *channelSubscription) close() {
 	if s.closed.Swap(true) {
-		return // Already closed
+		return
 	}
 	close(s.ch)
 }
@@ -220,20 +203,16 @@ func (s *channelSubscription) run(wg *sync.WaitGroup) {
 		}
 
 		if s.async {
-			// Async: run handler in separate goroutine
 			go s.handleMessage(msg)
 		} else {
-			// Sync: run handler in this goroutine
 			s.handleMessage(msg)
 		}
 	}
 }
 
 func (s *channelSubscription) handleMessage(msg *Message) {
-	// Recover from handler panics to prevent bus crash
 	defer func() {
 		if r := recover(); r != nil {
-			// Could log panic here
 			_ = r
 		}
 	}()
@@ -241,38 +220,36 @@ func (s *channelSubscription) handleMessage(msg *Message) {
 	_ = s.handler(msg)
 }
 
-// =============================================================================
-// Bus Statistics
-// =============================================================================
-
-// ChannelBusStats contains statistics about the bus
 type ChannelBusStats struct {
-	Topics          int            `json:"topics"`
-	Subscriptions   int            `json:"subscriptions"`
-	ByTopic         map[string]int `json:"by_topic"`
-	BufferSize      int            `json:"buffer_size"`
-	Closed          bool           `json:"closed"`
+	Topics        int            `json:"topics"`
+	Subscriptions int            `json:"subscriptions"`
+	ByTopic       map[string]int `json:"by_topic"`
+	BufferSize    int            `json:"buffer_size"`
+	Closed        bool           `json:"closed"`
 }
 
-// Stats returns statistics about the bus
 func (b *ChannelBus) Stats() ChannelBusStats {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
 	stats := ChannelBusStats{
-		Topics:     len(b.subscriptions),
 		ByTopic:    make(map[string]int),
 		BufferSize: b.bufferSize,
 		Closed:     b.closed.Load(),
 	}
 
-	for topic, subs := range b.subscriptions {
+	snapshot := b.subscriptions.Snapshot()
+	stats.Topics = len(snapshot)
+
+	for topic, topicSubs := range snapshot {
+		if topicSubs == nil {
+			continue
+		}
+		topicSubs.mu.RLock()
 		activeSubs := 0
-		for _, sub := range subs {
+		for _, sub := range topicSubs.subs {
 			if sub.active.Load() {
 				activeSubs++
 			}
 		}
+		topicSubs.mu.RUnlock()
 		stats.ByTopic[topic] = activeSubs
 		stats.Subscriptions += activeSubs
 	}
@@ -280,16 +257,19 @@ func (b *ChannelBus) Stats() ChannelBusStats {
 	return stats
 }
 
-// TopicSubscriberCount returns the number of active subscribers for a topic
 func (b *ChannelBus) TopicSubscriberCount(topic string) int {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+	topicSubs, ok := b.subscriptions.Get(topic)
+	if !ok || topicSubs == nil {
+		return 0
+	}
 
+	topicSubs.mu.RLock()
 	count := 0
-	for _, sub := range b.subscriptions[topic] {
+	for _, sub := range topicSubs.subs {
 		if sub.active.Load() {
 			count++
 		}
 	}
+	topicSubs.mu.RUnlock()
 	return count
 }

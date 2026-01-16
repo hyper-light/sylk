@@ -557,6 +557,259 @@ AGENT → AGENT:
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Guide Intent Classification for Librarian
+
+**CRITICAL**: The Guide already classifies intent for routing. When routing to Librarian, the Guide extracts additional metadata to enable intent-aware caching - at zero additional token cost.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    GUIDE INTENT CLASSIFICATION FOR LIBRARIAN                         │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  User: "what patterns do we use for error handling"                                 │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  GUIDE ROUTING (already happening)                                          │   │
+│  │                                                                             │   │
+│  │  Standard classification:                                                   │   │
+│  │    - Is this a codebase question? → YES → Route to Librarian               │   │
+│  │                                                                             │   │
+│  │  NEW: Additional metadata extraction (same LLM call, no extra cost):       │   │
+│  │    - Query Intent: PATTERN (strategy/approach question)                    │   │
+│  │    - Subject/Concept: "error_handling"                                     │   │
+│  │    - Confidence: 0.92                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  ROUTED MESSAGE TO LIBRARIAN                                                │   │
+│  │                                                                             │   │
+│  │  {                                                                          │   │
+│  │    "query": "what patterns do we use for error handling",                  │   │
+│  │    "target": "librarian",                                                  │   │
+│  │    "session_id": "sess_abc123",                                            │   │
+│  │    "intent": "PATTERN",           ← Enables cache lookup by concept        │   │
+│  │    "subject": "error_handling",   ← Cache key                              │   │
+│  │    "confidence": 0.92             ← Use cache if > 0.8                     │   │
+│  │  }                                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Intent Types for Librarian Queries
+
+| Intent | Trigger Patterns | Example Queries |
+|--------|-----------------|-----------------|
+| **LOCATE** | "where is", "find", "show me", "which file", "locate" | "where is the auth code", "find CreateUser function" |
+| **PATTERN** | "strategy", "approach", "pattern", "how do we", "convention" | "what is our caching strategy", "how do we handle errors" |
+| **EXPLAIN** | "how does", "explain", "what does X do", "walk through" | "how does the auth flow work", "explain the pipeline" |
+| **GENERAL** | Other codebase questions | "what languages are used", "list all API endpoints" |
+
+#### Guide Routing Prompt Enhancement
+
+```go
+// Added to Guide's system prompt for Librarian routing
+const LibrarianRoutingInstructions = `
+When routing to Librarian, also classify the query:
+
+Intent (required):
+- LOCATE: User wants to find where something is (file, function, struct, etc.)
+- PATTERN: User asks about patterns, strategies, approaches, conventions
+- EXPLAIN: User wants to understand how something works
+- GENERAL: Other codebase questions
+
+Subject (required): The primary entity or concept being asked about.
+Normalize to snake_case (e.g., "auth code" → "authentication", "error handling" → "error_handling")
+
+Examples:
+- "where is the auth middleware" → LOCATE, "auth_middleware"
+- "what is our caching strategy" → PATTERN, "caching"
+- "how does CreateSession work" → EXPLAIN, "create_session"
+- "what testing frameworks do we use" → PATTERN, "testing"
+`
+
+// Guide extracts this during routing (same LLM call)
+type LibrarianRoutingMetadata struct {
+    Intent     QueryIntent `json:"intent"`
+    Subject    string      `json:"subject"`
+    Confidence float64     `json:"confidence"`
+}
+```
+
+#### Why This Works (Zero Additional Cost)
+
+```
+WITHOUT Intent Classification:
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│ Guide LLM Call: "Route this message"              → ~200 tokens                    │
+│ Librarian LLM Call: "Answer this question"        → ~3000 tokens (every time)     │
+│ TOTAL: ~3200 tokens per query                                                      │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+WITH Intent Classification (cache hit):
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│ Guide LLM Call: "Route this + classify intent"    → ~250 tokens (+50 for metadata)│
+│ Librarian: Cache hit using intent + subject       → 0 tokens                       │
+│ TOTAL: ~250 tokens per query (on cache hit)                                        │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+WITH Intent Classification (cache miss):
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│ Guide LLM Call: "Route this + classify intent"    → ~250 tokens                    │
+│ Librarian LLM Call: "Answer this question"        → ~3000 tokens                   │
+│ TOTAL: ~3250 tokens (same as before, now cached)                                   │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+At 70% cache hit rate:
+- Old: 100 queries × 3200 tokens = 320,000 tokens
+- New: 30 misses × 3250 + 70 hits × 250 = 97,500 + 17,500 = 115,000 tokens
+- SAVINGS: 64%
+```
+
+### Guide Intent Classification for Archivalist
+
+**CRITICAL**: The same zero-cost intent classification approach applies to Archivalist routing. The Guide extracts intent metadata during routing to enable intent-aware historical caching.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    GUIDE INTENT CLASSIFICATION FOR ARCHIVALIST                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  User: "how did we handle the auth migration last month"                            │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  GUIDE ROUTING (already happening)                                          │   │
+│  │                                                                             │   │
+│  │  Standard classification:                                                   │   │
+│  │    - Is this a history/past question? → YES → Route to Archivalist         │   │
+│  │                                                                             │   │
+│  │  NEW: Additional metadata extraction (same LLM call, no extra cost):       │   │
+│  │    - Query Intent: HISTORICAL (past solution/approach)                     │   │
+│  │    - Subject/Concept: "auth_migration"                                     │   │
+│  │    - Time Scope: "last_month"                                              │   │
+│  │    - Confidence: 0.89                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  ROUTED MESSAGE TO ARCHIVALIST                                              │   │
+│  │                                                                             │   │
+│  │  {                                                                          │   │
+│  │    "query": "how did we handle the auth migration last month",             │   │
+│  │    "target": "archivalist",                                                │   │
+│  │    "session_id": "sess_abc123",                                            │   │
+│  │    "intent": "HISTORICAL",        ← Enables cache lookup by subject        │   │
+│  │    "subject": "auth_migration",   ← Cache key component                    │   │
+│  │    "time_scope": "last_month",    ← Temporal partition hint                │   │
+│  │    "confidence": 0.89             ← Use cache if > 0.8                     │   │
+│  │  }                                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Intent Types for Archivalist Queries
+
+| Intent | Trigger Patterns | Example Queries |
+|--------|-----------------|-----------------|
+| **HISTORICAL** | "how did we", "what approach", "last time", "previously" | "how did we handle auth migration", "what was the solution for X" |
+| **ACTIVITY** | "what has", "recent changes", "who worked on", "history of" | "what has happened with the API", "recent changes to auth" |
+| **OUTCOME** | "did it work", "result of", "status of", "how did X turn out" | "did the migration succeed", "result of the refactor" |
+| **SIMILAR** | "similar to", "like before", "same as", "comparable" | "similar issues to this error", "problems like this before" |
+| **RESUME** | "where was I", "continue", "pick up", "last session" | "where did we leave off", "continue from yesterday" |
+| **GENERAL** | Other history questions | "what did the team work on last week" |
+
+#### Guide Routing Prompt Enhancement for Archivalist
+
+```go
+// Added to Guide's system prompt for Archivalist routing
+const ArchivalistRoutingInstructions = `
+When routing to Archivalist, also classify the query:
+
+Intent (required):
+- HISTORICAL: User asks about past solutions, approaches, decisions
+- ACTIVITY: User asks about recent work, changes, who did what
+- OUTCOME: User asks about results, success/failure of past work
+- SIMILAR: User asks about similar problems or patterns from history
+- RESUME: User wants to continue previous work or session state
+- GENERAL: Other history questions
+
+Subject (required): The primary entity or concept being asked about.
+Normalize to snake_case (e.g., "auth migration" → "auth_migration")
+
+Time Scope (optional): Extract any temporal hints:
+- "last month", "yesterday", "last week" → specific time range
+- "recently" → last 7 days
+- "before" → historical, no specific time
+- Empty if no time reference
+
+Examples:
+- "how did we handle the auth migration" → HISTORICAL, "auth_migration", ""
+- "what changed in the API recently" → ACTIVITY, "api", "recently"
+- "did the database fix work" → OUTCOME, "database_fix", ""
+- "similar errors to this before" → SIMILAR, "errors", ""
+- "where did we leave off yesterday" → RESUME, "session", "yesterday"
+`
+
+// Guide extracts this during routing (same LLM call)
+type ArchivalistRoutingMetadata struct {
+    Intent     ArchivalistIntent `json:"intent"`
+    Subject    string            `json:"subject"`
+    TimeScope  string            `json:"time_scope,omitempty"`
+    Confidence float64           `json:"confidence"`
+}
+```
+
+#### Archivalist vs Librarian Intent Classification
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                    KEY DIFFERENCES IN INTENT CLASSIFICATION                         │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                    │
+│  LIBRARIAN (Live Code)                 │  ARCHIVALIST (Historical Data)           │
+│  ─────────────────────────────────────┼──────────────────────────────────────────│
+│  Subject: File/Function/Struct names   │  Subject: Problem/Solution domains       │
+│  Example: "auth_middleware"            │  Example: "auth_migration"               │
+│                                        │                                          │
+│  No time scope (current state)         │  Time scope (temporal partitions)        │
+│  Example: "where is auth"              │  Example: "last month's auth work"       │
+│                                        │                                          │
+│  Invalidation: File changes            │  Invalidation: Session/TTL only          │
+│  Dynamic cache keys                    │  Immutable once recorded                 │
+│                                        │                                          │
+│  Cache duration: 5-30 minutes          │  Cache duration: 1-60 minutes            │
+│  (depends on file volatility)          │  (depends on query type)                 │
+│                                        │                                          │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Expected Token Savings for Archivalist
+
+```
+WITHOUT Intent Classification:
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│ Guide LLM Call: "Route this message"              → ~200 tokens                    │
+│ Archivalist LLM Call: "Search history"            → ~2500 tokens (every time)     │
+│ TOTAL: ~2700 tokens per query                                                      │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+WITH Intent Classification (cache hit):
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│ Guide LLM Call: "Route this + classify intent"    → ~280 tokens (+80 for metadata)│
+│ Archivalist: Cache hit using intent + subject     → 0 tokens                       │
+│ TOTAL: ~280 tokens per query (on cache hit)                                        │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+At 75% cache hit rate (higher than Librarian due to immutable history):
+- Old: 100 queries × 2700 tokens = 270,000 tokens
+- New: 25 misses × 2780 + 75 hits × 280 = 69,500 + 21,000 = 90,500 tokens
+- SAVINGS: 66%
+```
+
 ---
 
 ## Agent Roles, Skills, Tools, and Hooks
@@ -2995,6 +3248,1285 @@ USER_TASK_INTERRUPT     User → Guide → Pipeline: interrupt pipeline
 USER_IGNORE_INSPECTOR   User → Guide → Pipeline: skip inspector for this pipeline
 USER_IGNORE_TESTER      User → Guide → Pipeline: skip tester for this pipeline
 ```
+
+---
+
+## Agent Memory Management
+
+Each agent has specific memory management strategies based on their role, model, and context window characteristics. All checkpoints and compaction summaries are submitted to the Archivalist for persistence.
+
+### Agent Model Assignments
+
+| Agent | Model | Context Strategy |
+|-------|-------|------------------|
+| **Librarian** | (TBD) | Frequent checkpoints (25%, 50%, 75%), compact at 75% |
+| **Guide** | (TBD) | Routing-focused checkpoints (50%, 75%, 90%), compact at 95% |
+| **Academic** | Opus 4.5 | Research paper at 85%, compact at 95% |
+| **Architect** | OpenAI Codex 5.2 | Workflow/plan at 85%, compact at 95% |
+| **Engineer** | Opus 4.5 | **PIPELINE HANDOFF at 95%** (special case) |
+| **Inspector** | OpenAI Codex 5.2 | Findings summary at 85%, compact at 95% |
+| **Tester** | OpenAI Codex 5.2 | Test summary at 85%, compact at 95% |
+
+### Memory Management Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     AGENT MEMORY MANAGEMENT THRESHOLDS                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  LIBRARIAN:    25%──────50%──────75%                                                │
+│                 │        │        │                                                 │
+│                 ▼        ▼        ▼                                                 │
+│              CKPT     CKPT    CKPT+COMPACT                                          │
+│                                                                                     │
+│  GUIDE:                 50%──────75%──────90%──────95%                              │
+│                          │        │        │        │                               │
+│                          ▼        ▼        ▼        ▼                               │
+│                        CKPT     CKPT     CKPT    COMPACT                            │
+│                                                                                     │
+│  ACADEMIC:                               85%──────95%                               │
+│  (Opus 4.5)                               │        │                                │
+│                                           ▼        ▼                                │
+│                                      RESEARCH   COMPACT                             │
+│                                       PAPER                                         │
+│                                                                                     │
+│  ARCHITECT:                              85%──────95%                               │
+│  (Codex 5.2)                              │        │                                │
+│                                           ▼        ▼                                │
+│                                       WORKFLOW  COMPACT                             │
+│                                        + PLAN                                       │
+│                                                                                     │
+│  ENGINEER:                                       95%                                │
+│  (Opus 4.5)                                       │                                 │
+│                                                   ▼                                 │
+│                                           *** PIPELINE ***                          │
+│                                           *** HANDOFF  ***                          │
+│                                                                                     │
+│  INSPECTOR:                              85%──────95%                               │
+│  (Codex 5.2)                              │        │                                │
+│                                           ▼        ▼                                │
+│                                       FINDINGS  COMPACT                             │
+│                                       SUMMARY   (local)                             │
+│                                                                                     │
+│  TESTER:                                 85%──────95%                               │
+│  (Codex 5.2)                              │        │                                │
+│                                           ▼        ▼                                │
+│                                         TEST    COMPACT                             │
+│                                       SUMMARY   (local)                             │
+│                                                                                     │
+│  All checkpoints/summaries → ARCHIVALIST (persistent storage)                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Librarian Memory Management
+
+The Librarian continuously learns about the codebase through indexing and queries. This knowledge must be persisted to survive context window limits.
+
+**Thresholds**: 25%, 50%, 75% (checkpoint) | 75% (compact)
+
+**Checkpoint Summary (Onboarding-Style)**:
+
+```go
+type CodebaseSummary struct {
+    Timestamp          time.Time         `json:"timestamp"`
+    SessionID          string            `json:"session_id"`
+    ContextUsage       float64           `json:"context_usage"`
+    CheckpointIndex    int               `json:"checkpoint_index"`
+
+    // Onboarding information
+    DirectoryStructure string            `json:"directory_structure"`
+    KeyPaths           []string          `json:"key_paths"`
+    CodeStyle          string            `json:"code_style"`
+    Architecture       string            `json:"architecture"`
+    TestingStrategy    string            `json:"testing_strategy"`
+    Tooling            ToolingSummary    `json:"tooling"`
+    PackageManagers    []string          `json:"package_managers"`
+    Patterns           []string          `json:"patterns"`
+    Conventions        []string          `json:"conventions"`
+    NewDiscoveries     []string          `json:"new_discoveries"`
+}
+```
+
+**Archivalist Category**: `librarian_checkpoint`
+
+**Consult Archivalist For**: Agent activity (what files changed, what other agents did)
+
+---
+
+### Librarian Query Caching (Intent-Aware)
+
+The Librarian handles two fundamentally different query types that require different caching strategies:
+
+**Specific Queries** (Location-based):
+- "where is the auth code"
+- "show me the User struct"
+- "find the CreateSession function"
+- Answer: A specific location in the codebase
+
+**Abstract Queries** (Pattern-based):
+- "what is our caching strategy"
+- "how do we handle errors in this repo"
+- "what patterns do we use for authentication"
+- Answer: Synthesized understanding from multiple sources
+
+#### Why Simple Embedding Similarity Fails
+
+With typical embedding models and a 0.95 similarity threshold:
+
+| Query A | Query B | Typical Similarity |
+|---------|---------|-------------------|
+| "where can I find the auth code" | "where is authentication located" | ~0.82-0.88 |
+| "what is our caching strategy" | "how do we handle caching" | ~0.78-0.85 |
+| "where is X" | "find X" | ~0.85-0.90 |
+
+**A 0.95 threshold misses most natural language variations.** Users don't ask the same question the same way twice.
+
+#### Intent-Aware Caching Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         LIBRARIAN QUERY PROCESSING PIPELINE                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  User Query: "what patterns do we use for error handling"                           │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  STEP 1: Intent Classification (provided by Guide during routing)           │   │
+│  │                                                                             │   │
+│  │  Intent Types:                                                              │   │
+│  │    LOCATE  - "where is", "find", "show me", "which file"                   │   │
+│  │    PATTERN - "strategy", "approach", "pattern", "how do we"                │   │
+│  │    EXPLAIN - "how does", "explain", "what does X do"                       │   │
+│  │    GENERAL - other codebase questions                                       │   │
+│  │                                                                             │   │
+│  │  Result: Intent = PATTERN                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  STEP 2: Subject/Concept Extraction (provided by Guide)                     │   │
+│  │                                                                             │   │
+│  │  Query: "what patterns do we use for error handling"                        │   │
+│  │                           │                                                 │   │
+│  │                           ▼                                                 │   │
+│  │  Concept: "error_handling"                                                  │   │
+│  │  Related: ["errors", "error patterns", "exception handling"]               │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  STEP 3: Intent-Specific Cache Lookup                                       │   │
+│  │                                                                             │   │
+│  │  LOCATE:  Key = entity name, Invalidate = file change                      │   │
+│  │  PATTERN: Key = concept, Invalidate = TTL + structural change              │   │
+│  │  EXPLAIN: Key = subject, Invalidate = file change + TTL                    │   │
+│  │  GENERAL: Key = embedding (0.80 threshold), Invalidate = TTL               │   │
+│  │                                                                             │   │
+│  │  Cache Key: "pattern:error_handling"                                        │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌───────────────────────────────┐    ┌────────────────────────────────────────┐   │
+│  │  CACHE HIT                    │    │  CACHE MISS                            │   │
+│  │  Return cached response       │    │  Synthesize → Cache → Return           │   │
+│  │  (0 tokens, <5ms)            │    │  (2,500-10,000 tokens, 500-2000ms)     │   │
+│  └───────────────────────────────┘    └────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Cache Strategies by Intent
+
+```go
+type LibrarianQueryCache struct {
+    // Layer 1: Intent + Subject based (high hit rate for repeated concepts)
+    locateCache  map[string]*LocateCacheEntry   // entity → location + file_hash
+    patternCache map[string]*PatternCacheEntry  // concept → synthesis + sources
+    explainCache map[string]*ExplainCacheEntry  // subject → explanation + sources
+
+    // Layer 2: Semantic fallback (lower threshold than Archivalist)
+    semanticCache *SemanticCache  // embedding similarity at 0.80, not 0.95
+
+    // File change tracking for invalidation
+    fileHashes map[string]string  // path → content hash
+
+    mu sync.RWMutex
+}
+
+// Cache entry for LOCATE intent ("where is X")
+type LocateCacheEntry struct {
+    Entity       string              `json:"entity"`        // normalized entity name
+    Locations    []FileLocation      `json:"locations"`     // where it was found
+    FileHashes   map[string]string   `json:"file_hashes"`   // path → hash at cache time
+    CreatedAt    time.Time           `json:"created_at"`
+    HitCount     int64               `json:"hit_count"`
+}
+
+// Cache entry for PATTERN intent ("what is our X strategy")
+type PatternCacheEntry struct {
+    Concept      string              `json:"concept"`       // normalized concept
+    Synthesis    string              `json:"synthesis"`     // synthesized answer
+    SourceFiles  []string            `json:"source_files"`  // files used to generate
+    TTL          time.Duration       `json:"ttl"`           // 60 min default
+    CreatedAt    time.Time           `json:"created_at"`
+    HitCount     int64               `json:"hit_count"`
+}
+
+// Cache entry for EXPLAIN intent ("how does X work")
+type ExplainCacheEntry struct {
+    Subject      string              `json:"subject"`       // what's being explained
+    Explanation  string              `json:"explanation"`   // the explanation
+    SourceFiles  []string            `json:"source_files"`  // files referenced
+    FileHashes   map[string]string   `json:"file_hashes"`   // for invalidation
+    TTL          time.Duration       `json:"ttl"`           // 30 min default
+    CreatedAt    time.Time           `json:"created_at"`
+    HitCount     int64               `json:"hit_count"`
+}
+```
+
+#### Cache Invalidation by Intent
+
+| Intent | Cache Key | Invalidation Trigger | TTL |
+|--------|-----------|---------------------|-----|
+| **LOCATE** | Entity name | Any file in result changes | Until file change |
+| **PATTERN** | Concept | TTL + major structural change | 60 min |
+| **EXPLAIN** | Subject | Referenced files change + TTL | 30 min |
+| **GENERAL** | Embedding (0.80) | TTL only | 15 min |
+
+```go
+func (lc *LibrarianQueryCache) IsStale(entry any, intent QueryIntent) bool {
+    switch intent {
+    case IntentLocate:
+        e := entry.(*LocateCacheEntry)
+        // Check if any referenced file has changed
+        for path, cachedHash := range e.FileHashes {
+            if currentHash := lc.fileHashes[path]; currentHash != cachedHash {
+                return true  // File changed, invalidate
+            }
+        }
+        return false  // No TTL for location queries
+
+    case IntentPattern:
+        e := entry.(*PatternCacheEntry)
+        // TTL-based + check for major structural changes
+        if time.Since(e.CreatedAt) > e.TTL {
+            return true
+        }
+        // Check if any source directory has new files
+        return lc.hasStructuralChanges(e.SourceFiles)
+
+    case IntentExplain:
+        e := entry.(*ExplainCacheEntry)
+        // Hybrid: file change OR TTL
+        if time.Since(e.CreatedAt) > e.TTL {
+            return true
+        }
+        for path, cachedHash := range e.FileHashes {
+            if currentHash := lc.fileHashes[path]; currentHash != cachedHash {
+                return true
+            }
+        }
+        return false
+
+    default:
+        // General: TTL only
+        return time.Since(entry.(*GeneralCacheEntry).CreatedAt) > 15*time.Minute
+    }
+}
+```
+
+#### File Change Detection & Cache Invalidation
+
+The Librarian uses fsnotify to watch for file changes and invalidate cache entries in real-time.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         FILE CHANGE DETECTION PIPELINE                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐   │
+│  │   fsnotify   │────▶│   Debouncer  │────▶│ Hash Computer│────▶│ Invalidator  │   │
+│  │   Watcher    │     │  (100ms)     │     │              │     │              │   │
+│  └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘   │
+│         │                    │                    │                    │            │
+│         ▼                    ▼                    ▼                    ▼            │
+│  Watch all files      Batch rapid         Compute xxHash64      Invalidate:        │
+│  in repo (recursive)  changes together    (fast, 1GB/s)         - LOCATE entries   │
+│                                                                 - EXPLAIN entries  │
+│                                                                 - Update fileHashes│
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### File Watcher Integration (fsnotify)
+
+```go
+type FileWatcher struct {
+    watcher     *fsnotify.Watcher
+    cache       *LibrarianQueryCache
+    index       *CodebaseIndex
+    debouncer   *Debouncer
+    hashCache   map[string]string  // path → current hash
+
+    // Configuration
+    ignorePaths []string  // .git, node_modules, vendor, etc.
+
+    mu          sync.RWMutex
+    ctx         context.Context
+    cancel      context.CancelFunc
+}
+
+func NewFileWatcher(cache *LibrarianQueryCache, index *CodebaseIndex) *FileWatcher {
+    watcher, _ := fsnotify.NewWatcher()
+    ctx, cancel := context.WithCancel(context.Background())
+
+    fw := &FileWatcher{
+        watcher:   watcher,
+        cache:     cache,
+        index:     index,
+        debouncer: NewDebouncer(100 * time.Millisecond),
+        hashCache: make(map[string]string),
+        ignorePaths: []string{
+            ".git", "node_modules", "vendor", "__pycache__",
+            ".idea", ".vscode", "dist", "build", ".cache",
+        },
+        ctx:    ctx,
+        cancel: cancel,
+    }
+
+    go fw.run()
+    return fw
+}
+
+func (fw *FileWatcher) run() {
+    for {
+        select {
+        case event, ok := <-fw.watcher.Events:
+            if !ok {
+                return
+            }
+            fw.handleEvent(event)
+
+        case err, ok := <-fw.watcher.Errors:
+            if !ok {
+                return
+            }
+            log.Printf("file watcher error: %v", err)
+
+        case <-fw.ctx.Done():
+            return
+        }
+    }
+}
+
+func (fw *FileWatcher) handleEvent(event fsnotify.Event) {
+    // Ignore non-relevant events
+    if fw.shouldIgnore(event.Name) {
+        return
+    }
+
+    // Debounce rapid changes (e.g., editor save creates multiple events)
+    fw.debouncer.Debounce(event.Name, func() {
+        fw.processFileChange(event)
+    })
+}
+```
+
+##### Debouncing Rapid File Changes
+
+Editors often trigger multiple events for a single save (write, chmod, rename). Debouncing batches these together.
+
+```go
+type Debouncer struct {
+    delay   time.Duration
+    timers  map[string]*time.Timer
+    mu      sync.Mutex
+}
+
+func NewDebouncer(delay time.Duration) *Debouncer {
+    return &Debouncer{
+        delay:  delay,
+        timers: make(map[string]*time.Timer),
+    }
+}
+
+func (d *Debouncer) Debounce(key string, fn func()) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+
+    // Cancel existing timer for this key
+    if timer, ok := d.timers[key]; ok {
+        timer.Stop()
+    }
+
+    // Set new timer
+    d.timers[key] = time.AfterFunc(d.delay, func() {
+        d.mu.Lock()
+        delete(d.timers, key)
+        d.mu.Unlock()
+        fn()
+    })
+}
+```
+
+##### Hash Computation (xxHash64)
+
+Using xxHash64 for fast file hashing (~1GB/s, much faster than SHA256).
+
+```go
+import "github.com/cespare/xxhash/v2"
+
+func (fw *FileWatcher) computeHash(path string) (string, error) {
+    file, err := os.Open(path)
+    if err != nil {
+        return "", err
+    }
+    defer file.Close()
+
+    hasher := xxhash.New()
+    if _, err := io.Copy(hasher, file); err != nil {
+        return "", err
+    }
+
+    return fmt.Sprintf("%x", hasher.Sum64()), nil
+}
+
+func (fw *FileWatcher) processFileChange(event fsnotify.Event) {
+    path := event.Name
+
+    fw.mu.Lock()
+    defer fw.mu.Unlock()
+
+    var newHash string
+    var err error
+
+    switch {
+    case event.Op&fsnotify.Remove == fsnotify.Remove:
+        // File deleted
+        newHash = ""
+        delete(fw.hashCache, path)
+
+    case event.Op&fsnotify.Write == fsnotify.Write,
+         event.Op&fsnotify.Create == fsnotify.Create:
+        // File created or modified
+        newHash, err = fw.computeHash(path)
+        if err != nil {
+            return
+        }
+
+        // Check if hash actually changed (content change, not just touch)
+        if oldHash, ok := fw.hashCache[path]; ok && oldHash == newHash {
+            return  // No actual content change
+        }
+        fw.hashCache[path] = newHash
+    }
+
+    // Notify cache of file change
+    fw.cache.OnFileChanged(path, newHash)
+
+    // Also update the index
+    fw.index.OnFileChanged(path, event.Op)
+}
+```
+
+##### Cache Invalidation on File Change
+
+```go
+func (lc *LibrarianQueryCache) OnFileChanged(path string, newHash string) {
+    lc.mu.Lock()
+    defer lc.mu.Unlock()
+
+    // Update current hash
+    if newHash == "" {
+        delete(lc.fileHashes, path)
+    } else {
+        lc.fileHashes[path] = newHash
+    }
+
+    // Invalidate LOCATE entries that reference this file
+    for entity, entry := range lc.locateCache {
+        if _, ok := entry.FileHashes[path]; ok {
+            delete(lc.locateCache, entity)
+            lc.stats.LocateInvalidations++
+        }
+    }
+
+    // Invalidate EXPLAIN entries that reference this file
+    for subject, entry := range lc.explainCache {
+        if _, ok := entry.FileHashes[path]; ok {
+            delete(lc.explainCache, subject)
+            lc.stats.ExplainInvalidations++
+        }
+    }
+
+    // Check PATTERN entries for structural changes (new/deleted files)
+    dir := filepath.Dir(path)
+    for concept, entry := range lc.patternCache {
+        for _, sourceFile := range entry.SourceFiles {
+            if filepath.Dir(sourceFile) == dir {
+                // File added/removed in a directory we synthesized from
+                delete(lc.patternCache, concept)
+                lc.stats.PatternInvalidations++
+                break
+            }
+        }
+    }
+}
+```
+
+##### Index Synchronization
+
+The cache invalidation coordinates with the Librarian's code index:
+
+```go
+func (idx *CodebaseIndex) OnFileChanged(path string, op fsnotify.Op) {
+    switch {
+    case op&fsnotify.Remove == fsnotify.Remove:
+        idx.RemoveFile(path)
+
+    case op&fsnotify.Create == fsnotify.Create:
+        idx.IndexFile(path)
+
+    case op&fsnotify.Write == fsnotify.Write:
+        idx.ReindexFile(path)
+    }
+}
+```
+
+##### Batch Operations for Large Changes
+
+For operations like `git checkout` that change many files at once:
+
+```go
+func (fw *FileWatcher) OnBatchChange(paths []string) {
+    fw.mu.Lock()
+    defer fw.mu.Unlock()
+
+    // Pause normal watching during batch
+    fw.debouncer.Pause()
+    defer fw.debouncer.Resume()
+
+    // Collect all changed hashes
+    changedPaths := make(map[string]string)
+    for _, path := range paths {
+        if hash, err := fw.computeHash(path); err == nil {
+            if oldHash := fw.hashCache[path]; oldHash != hash {
+                changedPaths[path] = hash
+                fw.hashCache[path] = hash
+            }
+        }
+    }
+
+    // Batch invalidate
+    fw.cache.OnBatchFileChanged(changedPaths)
+    fw.index.OnBatchFileChanged(changedPaths)
+}
+
+func (lc *LibrarianQueryCache) OnBatchFileChanged(changes map[string]string) {
+    lc.mu.Lock()
+    defer lc.mu.Unlock()
+
+    // Update all hashes
+    for path, hash := range changes {
+        lc.fileHashes[path] = hash
+    }
+
+    // For large batches, it's more efficient to clear caches entirely
+    if len(changes) > 100 {
+        lc.locateCache = make(map[string]*LocateCacheEntry)
+        lc.explainCache = make(map[string]*ExplainCacheEntry)
+        lc.patternCache = make(map[string]*PatternCacheEntry)
+        return
+    }
+
+    // For smaller batches, selectively invalidate
+    for path := range changes {
+        lc.invalidateByPath(path)
+    }
+}
+```
+
+#### Query Handling with Pre-Classified Intent
+
+The Guide classifies intent during routing (no additional cost to Librarian):
+
+```go
+// Message from Guide includes intent classification
+type LibrarianRequest struct {
+    Query       string      `json:"query"`
+    SessionID   string      `json:"session_id"`
+
+    // Pre-classified by Guide (no additional LLM cost)
+    Intent      QueryIntent `json:"intent"`      // LOCATE, PATTERN, EXPLAIN, GENERAL
+    Subject     string      `json:"subject"`     // extracted entity/concept
+    Confidence  float64     `json:"confidence"`  // Guide's classification confidence
+}
+
+func (l *Librarian) HandleQuery(req *LibrarianRequest) (*Response, error) {
+    // Use Guide's pre-classification if confident
+    if req.Confidence >= 0.8 {
+        switch req.Intent {
+        case IntentLocate:
+            if cached, ok := l.cache.GetLocate(req.Subject); ok {
+                return cached.ToResponse(), nil
+            }
+        case IntentPattern:
+            if cached, ok := l.cache.GetPattern(req.Subject); ok {
+                return cached.ToResponse(), nil
+            }
+        case IntentExplain:
+            if cached, ok := l.cache.GetExplain(req.Subject); ok {
+                return cached.ToResponse(), nil
+            }
+        }
+    }
+
+    // Cache miss or low confidence - do full synthesis
+    response, sources := l.synthesize(req.Query)
+
+    // Cache the result using the classified intent
+    l.cache.Store(req.Intent, req.Subject, response, sources)
+
+    return response, nil
+}
+```
+
+#### Expected Cache Performance
+
+| Query Type | Without Cache | With Intent Cache | Improvement |
+|------------|---------------|-------------------|-------------|
+| "where is auth.go" (repeated) | 3,000 tokens | 0 tokens | 100% |
+| "where is authentication" (variation) | 3,000 tokens | 0 tokens | 100% |
+| "what is our caching strategy" | 5,000 tokens | 0 tokens | 100% |
+| "how do we handle caching" (variation) | 5,000 tokens | 0 tokens | 100% |
+| "explain the auth flow" | 4,000 tokens | 0 tokens | 100% |
+
+**Overall expected hit rate**: 70-85% for typical usage patterns
+
+**Token savings per session**: 60-75% reduction
+
+---
+
+### Guide Memory Management
+
+The Guide tracks routing decisions, matches, and request patterns. This information helps optimize future routing.
+
+**Thresholds**: 50%, 75%, 90% (checkpoint) | 95% (compact)
+
+**Checkpoint Summary**:
+
+```go
+type GuideSummary struct {
+    Timestamp          time.Time                `json:"timestamp"`
+    SessionID          string                   `json:"session_id"`
+    ContextUsage       float64                  `json:"context_usage"`
+    CheckpointIndex    int                      `json:"checkpoint_index"`
+
+    // Routing knowledge
+    KnownRoutings      map[string]string        `json:"known_routings"`      // pattern → agent
+    FrequentMatches    []RoutingMatch           `json:"frequent_matches"`    // common routes
+    FailedRoutings     []FailedRouting          `json:"failed_routings"`     // routes that didn't work
+    AgentCapabilities  map[string][]string      `json:"agent_capabilities"`  // agent → capabilities observed
+    RequestPatterns    []RequestPattern         `json:"request_patterns"`    // common request types
+    SessionRoutingStats RoutingStats            `json:"session_routing_stats"`
+}
+
+type RoutingMatch struct {
+    Pattern     string `json:"pattern"`
+    Agent       string `json:"agent"`
+    Confidence  float64 `json:"confidence"`
+    UsageCount  int    `json:"usage_count"`
+}
+```
+
+**Archivalist Category**: `guide_checkpoint`
+
+---
+
+### Archivalist Query Caching (Intent-Aware)
+
+The Archivalist handles historical queries - past decisions, agent activity, workflow outcomes. Users phrase these queries in many ways that miss the standard 0.95 embedding similarity threshold.
+
+#### Why Intent-Aware Caching for Archivalist
+
+**The Problem**: Same intent, different phrasing:
+
+| Query A | Query B | Similarity | Result at 0.95 |
+|---------|---------|------------|----------------|
+| "What did we do before for auth" | "Past solutions for authentication" | ~0.82 | MISS |
+| "What files changed" | "Recent modifications by engineer" | ~0.80 | MISS |
+| "Did the tests pass" | "What was the test outcome" | ~0.78 | MISS |
+| "Have we seen this error before" | "Similar past failures" | ~0.75 | MISS |
+
+**Key Difference from Librarian**: Historical data is **immutable**. Once stored, it doesn't change. Invalidation is simpler - mostly TTL-based or "new data added", not file-change-based.
+
+#### Archivalist Query Intents
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         ARCHIVALIST QUERY INTENT TYPES                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  HISTORICAL - Past solutions, decisions, approaches                                 │
+│  ├── "What did we do before for X"                                                 │
+│  ├── "Past solutions for X"                                                        │
+│  ├── "How did we handle X previously"                                              │
+│  └── Cache: topic-based, TTL 30-60 min (history doesn't change)                    │
+│                                                                                     │
+│  ACTIVITY - Agent activity, file changes, task results                             │
+│  ├── "What files did the engineer change"                                          │
+│  ├── "What happened in the last task"                                              │
+│  ├── "Show me recent modifications"                                                │
+│  └── Cache: session-scoped, short TTL 5 min (new activity happens frequently)      │
+│                                                                                     │
+│  OUTCOME - Results, status, completion                                             │
+│  ├── "Did the tests pass"                                                          │
+│  ├── "What issues did the inspector find"                                          │
+│  ├── "What was the result of the workflow"                                         │
+│  └── Cache: task/workflow ID, invalidate when result updated                       │
+│                                                                                     │
+│  SIMILAR - Pattern matching, similarity search                                     │
+│  ├── "Have we seen this error before"                                              │
+│  ├── "Find similar past decisions"                                                 │
+│  ├── "What worked for problems like this"                                          │
+│  └── Cache: embedding-based with 0.80 threshold, TTL 30 min                        │
+│                                                                                     │
+│  RESUME - Session state, continuation                                              │
+│  ├── "Where did we leave off"                                                      │
+│  ├── "Resume context"                                                              │
+│  ├── "What's the current status"                                                   │
+│  └── Cache: session ID, very short TTL 1-2 min (state changes constantly)          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Intent-Specific Cache Structures
+
+```go
+type ArchivalistQueryCache struct {
+    // Intent-based caches
+    historicalCache map[string]*HistoricalCacheEntry  // topic → past solutions
+    activityCache   map[string]*ActivityCacheEntry    // session+type → activity
+    outcomeCache    map[string]*OutcomeCacheEntry     // task/workflow ID → result
+    similarCache    *SimilarityCache                  // embedding-based, 0.80 threshold
+    resumeCache     map[string]*ResumeCacheEntry      // session ID → state
+
+    // Existing query cache (fallback)
+    legacyCache     *QueryCache  // Original 0.95 threshold cache
+
+    mu sync.RWMutex
+}
+
+type HistoricalCacheEntry struct {
+    Topic        string        `json:"topic"`         // "authentication", "caching", etc.
+    Solutions    []Solution    `json:"solutions"`     // Past approaches found
+    SessionIDs   []string      `json:"session_ids"`   // Sessions these came from
+    TTL          time.Duration `json:"ttl"`           // 30-60 min
+    CreatedAt    time.Time     `json:"created_at"`
+    HitCount     int64         `json:"hit_count"`
+}
+
+type ActivityCacheEntry struct {
+    SessionID    string        `json:"session_id"`
+    ActivityType string        `json:"activity_type"` // "file_changes", "task_results", etc.
+    Activities   []Activity    `json:"activities"`
+    TTL          time.Duration `json:"ttl"`           // 5 min (short, new activity frequent)
+    CreatedAt    time.Time     `json:"created_at"`
+    LastActivity time.Time     `json:"last_activity"` // Invalidate if new activity after this
+}
+
+type OutcomeCacheEntry struct {
+    WorkflowID   string        `json:"workflow_id"`
+    TaskID       string        `json:"task_id,omitempty"`
+    Outcome      *Outcome      `json:"outcome"`
+    IsComplete   bool          `json:"is_complete"`   // If false, short TTL
+    TTL          time.Duration `json:"ttl"`
+    CreatedAt    time.Time     `json:"created_at"`
+}
+
+type ResumeCacheEntry struct {
+    SessionID    string        `json:"session_id"`
+    State        *SessionState `json:"state"`
+    TTL          time.Duration `json:"ttl"`           // 1-2 min (state changes constantly)
+    CreatedAt    time.Time     `json:"created_at"`
+    StateVersion int64         `json:"state_version"` // Invalidate if version changed
+}
+```
+
+#### Cache Invalidation by Intent
+
+| Intent | Cache Key | Invalidation Trigger | TTL |
+|--------|-----------|---------------------|-----|
+| **HISTORICAL** | Topic (normalized) | TTL only (history is immutable) | 30-60 min |
+| **ACTIVITY** | Session + activity type | New activity recorded OR TTL | 5 min |
+| **OUTCOME** | Workflow/Task ID | Result updated OR TTL | Until complete, then 30 min |
+| **SIMILAR** | Embedding (0.80 threshold) | TTL only | 30 min |
+| **RESUME** | Session ID | Any session activity OR TTL | 1-2 min |
+
+```go
+func (ac *ArchivalistQueryCache) IsStale(entry any, intent ArchivalistIntent) bool {
+    switch intent {
+    case IntentHistorical:
+        e := entry.(*HistoricalCacheEntry)
+        // History doesn't change - TTL only
+        return time.Since(e.CreatedAt) > e.TTL
+
+    case IntentActivity:
+        e := entry.(*ActivityCacheEntry)
+        // Check if new activity since cache
+        if ac.hasNewActivity(e.SessionID, e.LastActivity) {
+            return true
+        }
+        return time.Since(e.CreatedAt) > e.TTL
+
+    case IntentOutcome:
+        e := entry.(*OutcomeCacheEntry)
+        // If workflow not complete, check if result updated
+        if !e.IsComplete {
+            if ac.outcomeUpdated(e.WorkflowID, e.TaskID) {
+                return true
+            }
+        }
+        return time.Since(e.CreatedAt) > e.TTL
+
+    case IntentSimilar:
+        // Similarity cache uses TTL only
+        e := entry.(*SimilarCacheEntry)
+        return time.Since(e.CreatedAt) > e.TTL
+
+    case IntentResume:
+        e := entry.(*ResumeCacheEntry)
+        // Check if session state version changed
+        if ac.sessionStateVersion(e.SessionID) != e.StateVersion {
+            return true
+        }
+        return time.Since(e.CreatedAt) > e.TTL
+
+    default:
+        return true
+    }
+}
+```
+
+#### Guide Intent Classification for Archivalist
+
+The Guide classifies Archivalist query intent during routing (same LLM call, no extra cost):
+
+```go
+type ArchivalistIntent int
+
+const (
+    ArchivalistIntentHistorical ArchivalistIntent = iota  // Past solutions
+    ArchivalistIntentActivity                              // Agent activity
+    ArchivalistIntentOutcome                               // Results/status
+    ArchivalistIntentSimilar                               // Similarity search
+    ArchivalistIntentResume                                // Session state
+    ArchivalistIntentGeneral                               // Fallback
+)
+
+// Intent classification patterns
+var archivalistIntentPatterns = map[ArchivalistIntent][]string{
+    ArchivalistIntentHistorical: {
+        "what did we do", "before", "previously", "past", "last time",
+        "how did we handle", "prior", "earlier", "history",
+    },
+    ArchivalistIntentActivity: {
+        "what changed", "what did .* do", "modifications", "recent",
+        "files changed", "activity", "what happened",
+    },
+    ArchivalistIntentOutcome: {
+        "did .* pass", "result", "outcome", "issues found",
+        "status of", "complete", "succeed", "fail",
+    },
+    ArchivalistIntentSimilar: {
+        "similar", "like this", "seen before", "pattern",
+        "resembles", "related", "comparable",
+    },
+    ArchivalistIntentResume: {
+        "where did we", "resume", "continue", "left off",
+        "current state", "pick up",
+    },
+}
+
+// Message to Archivalist includes intent
+type ArchivalistRequest struct {
+    Query       string             `json:"query"`
+    SessionID   string             `json:"session_id"`
+    Intent      ArchivalistIntent  `json:"intent"`
+    Subject     string             `json:"subject"`     // Topic/entity being queried
+    Confidence  float64            `json:"confidence"`
+}
+```
+
+#### Expected Performance
+
+| Intent | Typical Query Cost | With Cache Hit | Savings |
+|--------|-------------------|----------------|---------|
+| HISTORICAL | ~4,000 tokens | 0 tokens | 100% |
+| ACTIVITY | ~2,000 tokens | 0 tokens | 100% |
+| OUTCOME | ~1,500 tokens | 0 tokens | 100% |
+| SIMILAR | ~5,000 tokens | 0 tokens | 100% |
+| RESUME | ~1,000 tokens | 0 tokens | 100% |
+
+**Expected hit rates by intent**:
+- HISTORICAL: 80-90% (same topics asked repeatedly)
+- ACTIVITY: 60-70% (frequent but session-specific)
+- OUTCOME: 70-80% (asked multiple times during workflow)
+- SIMILAR: 50-60% (varied queries, but patterns repeat)
+- RESUME: 40-50% (short TTL, but frequently asked)
+
+**Overall expected hit rate**: 60-75%
+**Token savings per session**: 50-65% reduction
+
+---
+
+### Academic Memory Management
+
+The Academic researches topics and produces findings. At checkpoint, it produces a "research paper" summarizing its findings.
+
+**Model**: Opus 4.5
+
+**Thresholds**: 85% (checkpoint) | 95% (compact)
+
+**Checkpoint Summary (Research Paper Format)**:
+
+```go
+type AcademicResearchPaper struct {
+    Timestamp          time.Time         `json:"timestamp"`
+    SessionID          string            `json:"session_id"`
+    ContextUsage       float64           `json:"context_usage"`
+
+    // Research paper structure
+    Title              string            `json:"title"`
+    Abstract           string            `json:"abstract"`
+    TopicsResearched   []string          `json:"topics_researched"`
+    KeyFindings        []Finding         `json:"key_findings"`
+    SourcesCited       []Source          `json:"sources_cited"`
+    Recommendations    []string          `json:"recommendations"`
+    OpenQuestions      []string          `json:"open_questions"`
+    RelatedTopics      []string          `json:"related_topics"`
+}
+
+type Finding struct {
+    Topic       string   `json:"topic"`
+    Summary     string   `json:"summary"`
+    Confidence  string   `json:"confidence"` // high, medium, low
+    Sources     []string `json:"sources"`
+}
+```
+
+**Archivalist Category**: `academic_research_paper`
+
+---
+
+### Architect Memory Management
+
+The Architect creates implementation plans and DAGs. At checkpoint, it produces a retrievable workflow/plan document.
+
+**Model**: OpenAI Codex 5.2
+
+**Thresholds**: 85% (checkpoint) | 95% (compact)
+
+**Checkpoint Summary (Retrievable Workflow Format)**:
+
+```go
+type ArchitectWorkflowSummary struct {
+    Timestamp          time.Time         `json:"timestamp"`
+    SessionID          string            `json:"session_id"`
+    ContextUsage       float64           `json:"context_usage"`
+
+    // Workflow state (parseable by other Architects)
+    OriginalRequest    string            `json:"original_request"`
+    ImplementationPlan string            `json:"implementation_plan"`
+    CurrentDAG         *DAGSummary       `json:"current_dag"`
+    CompletedTasks     []TaskSummary     `json:"completed_tasks"`
+    PendingTasks       []TaskSummary     `json:"pending_tasks"`
+    BlockedTasks       []TaskSummary     `json:"blocked_tasks"`
+    ArchitecturalDecisions []Decision   `json:"architectural_decisions"`
+    Risks              []Risk            `json:"risks"`
+    Assumptions        []string          `json:"assumptions"`
+}
+
+type DAGSummary struct {
+    ID             string            `json:"id"`
+    TotalNodes     int               `json:"total_nodes"`
+    CompletedNodes int               `json:"completed_nodes"`
+    CurrentLayer   int               `json:"current_layer"`
+    ExecutionOrder [][]string        `json:"execution_order"` // layer → node IDs
+}
+
+type TaskSummary struct {
+    ID          string `json:"id"`
+    Description string `json:"description"`
+    Status      string `json:"status"`
+    AssignedTo  string `json:"assigned_to,omitempty"`
+    Result      string `json:"result,omitempty"`
+}
+```
+
+**Archivalist Category**: `architect_workflow`
+
+---
+
+### Inspector Memory Management
+
+The Inspector validates code and tracks issues. At checkpoint, it summarizes findings, fixes, and priorities.
+
+**Model**: OpenAI Codex 5.2
+
+**Thresholds**: 85% (checkpoint) | 95% (compact locally)
+
+**Note**: Inspector compacts locally at 95%. Does NOT trigger pipeline handoff.
+
+**Checkpoint Summary**:
+
+```go
+type InspectorFindingsSummary struct {
+    Timestamp          time.Time         `json:"timestamp"`
+    SessionID          string            `json:"session_id"`
+    PipelineID         string            `json:"pipeline_id,omitempty"`
+    ContextUsage       float64           `json:"context_usage"`
+
+    // Findings state
+    ChecksPerformed    []string          `json:"checks_performed"`
+    IssuesFound        int               `json:"issues_found"`
+    IssuesResolved     int               `json:"issues_resolved"`
+    IssuesRemaining    []InspectorIssue  `json:"issues_remaining"`
+    FixesCompleted     []CompletedFix    `json:"fixes_completed"`
+    FixesPending       []PendingFix      `json:"fixes_pending"`
+    ValidationState    map[string]bool   `json:"validation_state"` // category → pass
+}
+
+type CompletedFix struct {
+    IssueID     string `json:"issue_id"`
+    File        string `json:"file"`
+    Line        int    `json:"line"`
+    Description string `json:"description"`
+    FixApplied  string `json:"fix_applied"`
+}
+
+type PendingFix struct {
+    IssueID     string `json:"issue_id"`
+    File        string `json:"file"`
+    Line        int    `json:"line"`
+    Category    string `json:"category"`
+    Severity    string `json:"severity"` // critical, high, medium, low
+    Priority    int    `json:"priority"` // 1 = highest
+    Description string `json:"description"`
+    SuggestedFix string `json:"suggested_fix"`
+}
+```
+
+**Archivalist Category**: `inspector_findings`
+
+---
+
+### Tester Memory Management
+
+The Tester creates and runs tests. At checkpoint, it summarizes test state and results.
+
+**Model**: OpenAI Codex 5.2
+
+**Thresholds**: 85% (checkpoint) | 95% (compact locally)
+
+**Note**: Tester compacts locally at 95%. Does NOT trigger pipeline handoff.
+
+**Checkpoint Summary**:
+
+```go
+type TesterSummary struct {
+    Timestamp          time.Time         `json:"timestamp"`
+    SessionID          string            `json:"session_id"`
+    PipelineID         string            `json:"pipeline_id,omitempty"`
+    ContextUsage       float64           `json:"context_usage"`
+
+    // Test state
+    TestsCreated       []TestInfo        `json:"tests_created"`
+    TestsRun           []TestResult      `json:"tests_run"`
+    PassCount          int               `json:"pass_count"`
+    FailCount          int               `json:"fail_count"`
+    SkipCount          int               `json:"skip_count"`
+    CoverageNeeded     []string          `json:"coverage_needed"`
+    FailureDescriptions []FailureDesc    `json:"failure_descriptions"`
+}
+
+type TestInfo struct {
+    File     string `json:"file"`
+    TestName string `json:"test_name"`
+    Type     string `json:"type"` // unit, integration, e2e
+    ForTask  string `json:"for_task,omitempty"`
+}
+
+type TestResult struct {
+    TestName string `json:"test_name"`
+    Status   string `json:"status"` // pass, fail, skip
+    Duration string `json:"duration,omitempty"`
+}
+
+type FailureDesc struct {
+    TestName    string `json:"test_name"`
+    Error       string `json:"error"`
+    Expected    string `json:"expected,omitempty"`
+    Actual      string `json:"actual,omitempty"`
+    Suggestion  string `json:"suggestion,omitempty"`
+}
+```
+
+**Archivalist Category**: `tester_summary`
+
+---
+
+### Engineer Memory Management: Pipeline Handoff
+
+**CRITICAL**: The Engineer does NOT compact locally. At 95% context, it triggers a **PIPELINE HANDOFF**.
+
+**Model**: Opus 4.5
+
+**Threshold**: 95% → **PIPELINE HANDOFF**
+
+This is a special mechanism where the entire pipeline (Engineer + Inspector + Tester) transfers state to a new pipeline, minimizing re-learning.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    PIPELINE HANDOFF (ENGINEER AT 95%)                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  OLD PIPELINE                                                         NEW PIPELINE  │
+│  (Eng+Insp+Test)       GUIDE          ARCHITECT       ORCHESTRATOR   (Eng+Insp+Test)│
+│       │                  │                │                │               │        │
+│  ┌────┴────┐             │                │                │               │        │
+│  │Engineer │             │                │                │               │        │
+│  │ at 95%  │             │                │                │               │        │
+│  └────┬────┘             │                │                │               │        │
+│       │                  │                │                │               │        │
+│       │ Prepare state    │                │                │               │        │
+│       │ (E + I + T)      │                │                │               │        │
+│       │                  │                │                │               │        │
+│       │══"HANDOFF_REQ"══▶│                │                │               │        │
+│       │  + full state    │══════════════▶│                │               │        │
+│       │  (E+I+T summary) │                │                │               │        │
+│       │                  │                │                │               │        │
+│       │                  │          ┌─────┴─────┐          │               │        │
+│       │                  │          │ Examine   │          │               │        │
+│       │                  │          │ state,    │          │               │        │
+│       │                  │          │ adjust    │          │               │        │
+│       │                  │          │ workflow  │          │               │        │
+│       │                  │          │ if needed │          │               │        │
+│       │                  │          └─────┬─────┘          │               │        │
+│       │                  │                │                │               │        │
+│       │                  │                │══"CREATE_NEW"═▶│               │        │
+│       │                  │                │  + state       │               │        │
+│       │                  │                │  + "close old" │               │        │
+│       │                  │                │                │               │        │
+│       │                  │                │                │──create──────▶│        │
+│       │                  │                │                │  (inject      │        │
+│       │                  │                │                │   state)      │        │
+│       │                  │                │                │               │        │
+│       │                  │                │                │◀──"STARTED"───│        │
+│       │                  │                │                │               │        │
+│       │◀══"CLOSE_NOW"════│◀═══════════════│◀═══════════════│               │        │
+│       │                  │                │                │               │        │
+│       X                  │                │                │         ┌─────┴─────┐  │
+│  (old closes)            │                │                │         │ EXECUTING │  │
+│                          │                │                │         │ (resumed) │  │
+│                          │                │                │         └───────────┘  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Handoff State Structure
+
+```go
+type PipelineHandoff struct {
+    // Metadata
+    OldPipelineID   PipelineID    `json:"old_pipeline_id"`
+    SessionID       string        `json:"session_id"`
+    DAGID           string        `json:"dag_id"`
+    TaskID          string        `json:"task_id"`
+    HandoffReason   string        `json:"handoff_reason"` // "engineer_context_95%"
+    Timestamp       time.Time     `json:"timestamp"`
+    HandoffIndex    int           `json:"handoff_index"`  // For chaining (1, 2, 3...)
+
+    // Bundled state from all three agents
+    EngineerState   *EngineerHandoffState   `json:"engineer_state"`
+    InspectorState  *InspectorHandoffState  `json:"inspector_state"`
+    TesterState     *TesterHandoffState     `json:"tester_state"`
+}
+
+type EngineerHandoffState struct {
+    OriginalPrompt    string            `json:"original_prompt"`    // Verbatim
+    Accomplished      []string          `json:"accomplished"`       // What was done
+    FilesChanged      []FileChange      `json:"files_changed"`      // Specific changes
+    Remaining         []string          `json:"remaining"`          // TODOs to complete
+    ContextNotes      string            `json:"context_notes"`      // Critical context
+}
+
+type InspectorHandoffState struct {
+    ChecksPerformed   []string          `json:"checks_performed"`
+    FixesCompleted    []CompletedFix    `json:"fixes_completed"`    // With file:line refs
+    FixesRemaining    []PendingFix      `json:"fixes_remaining"`    // With priority
+    ValidationState   map[string]bool   `json:"validation_state"`   // category → pass/fail
+}
+
+type TesterHandoffState struct {
+    TestsCreated      []TestInfo        `json:"tests_created"`      // File, name
+    TestResults       []TestResult      `json:"test_results"`       // Pass/fail
+    FailureDescs      []FailureDesc     `json:"failure_descs"`      // Brief errors
+    CoverageNeeded    []string          `json:"coverage_needed"`    // What still needs tests
+}
+```
+
+#### Handoff Message Flow
+
+```
+1. Engineer (old) prepares bundled state (Engineer + Inspector + Tester)
+
+2. Engineer (old) ──GUIDE──▶ Architect    : "HANDOFF_REQUEST" + full state
+
+3. Architect examines state, adjusts workflow if necessary
+
+4. Architect ──GUIDE──▶ Orchestrator      : "CREATE_PIPELINE_WITH_STATE" {
+                                              state: <bundled state>,
+                                              close_pipeline: <old pipeline ID>
+                                            }
+
+5. Orchestrator:
+   - Creates new pipeline
+   - Injects state into new pipeline (all three agents start with context)
+   - New pipeline starts executing
+   - Closes old pipeline
+
+6. Orchestrator ──GUIDE──▶ Architect      : "HANDOFF_COMPLETE"
+```
+
+#### Handoff Rules
+
+| Rule | Description |
+|------|-------------|
+| **Trigger** | Engineer at 95% OR user request |
+| **Who triggers** | Only Engineer triggers handoff (Inspector/Tester compact locally) |
+| **State bundling** | Engineer collects state from Inspector + Tester |
+| **Architect review** | Architect examines and may adjust workflow |
+| **Archivalist** | Handoff state also stored for audit/recovery |
+| **Retry** | If handoff fails, retry. If retries fail, fallback to summarize → Archivalist → compact |
+| **Chaining** | Handoffs can chain infinitely (tracked by HandoffIndex) |
+| **User control** | User can stop a handoff chain if desired |
+
+#### New Pipeline Receives
+
+The new pipeline's agents start with full context:
+
+- **New Engineer**: Knows original prompt, what was done, what remains
+- **New Inspector**: Knows what passed, what failed, pending fixes with priorities
+- **New Tester**: Knows existing tests, results, what coverage is still needed
+
+This minimizes re-learning and re-discovery.
+
+**Archivalist Category**: `pipeline_handoff`
 
 ---
 

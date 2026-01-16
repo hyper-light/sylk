@@ -8,14 +8,9 @@ import (
 	"time"
 )
 
-// =============================================================================
-// Temporal Partition Tests
-// =============================================================================
-
 func TestTemporalPartitionManager_AddEntry(t *testing.T) {
 	pm := NewTemporalPartitionManager(DefaultTemporalPartitionConfig())
 
-	// Add entries
 	now := time.Now()
 	err := pm.AddEntry("entry1", now, 100)
 	if err != nil {
@@ -40,13 +35,11 @@ func TestTemporalPartitionManager_AddEntry(t *testing.T) {
 func TestTemporalPartitionManager_QueryTimeRange(t *testing.T) {
 	pm := NewTemporalPartitionManager(DefaultTemporalPartitionConfig())
 
-	// Add entries across different times
 	baseTime := time.Now()
 	pm.AddEntry("entry1", baseTime, 100)
 	pm.AddEntry("entry2", baseTime.Add(-24*time.Hour), 100)
 	pm.AddEntry("entry3", baseTime.Add(-48*time.Hour), 100)
 
-	// Query range that should include all
 	results := pm.QueryTimeRange(
 		baseTime.Add(-72*time.Hour),
 		baseTime.Add(time.Hour),
@@ -56,7 +49,6 @@ func TestTemporalPartitionManager_QueryTimeRange(t *testing.T) {
 		t.Errorf("Expected 3 results, got %d", len(results))
 	}
 
-	// Query range that should include only recent
 	results = pm.QueryTimeRange(
 		baseTime.Add(-12*time.Hour),
 		baseTime.Add(time.Hour),
@@ -95,17 +87,14 @@ func TestTemporalPartitionManager_PartitionKeys(t *testing.T) {
 
 func TestTemporalPartitionManager_Compaction(t *testing.T) {
 	config := DefaultTemporalPartitionConfig()
-	config.CompactThreshold = time.Millisecond // Very short for testing
+	config.CompactThreshold = time.Millisecond
 	pm := NewTemporalPartitionManager(config)
 
-	// Add old entry
 	oldTime := time.Now().Add(-time.Hour)
 	pm.AddEntry("old_entry", oldTime, 100)
 
-	// Wait a bit
 	time.Sleep(10 * time.Millisecond)
 
-	// Compact
 	compacted := pm.CompactOldPartitions()
 	if compacted < 1 {
 		t.Errorf("Expected at least 1 partition to be compacted, got %d", compacted)
@@ -123,8 +112,7 @@ func TestTemporalPartitionManager_Concurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	baseTime := time.Now()
 
-	// Concurrent adds
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -137,8 +125,7 @@ func TestTemporalPartitionManager_Concurrent(t *testing.T) {
 		}(i)
 	}
 
-	// Concurrent queries
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -154,10 +141,6 @@ func TestTemporalPartitionManager_Concurrent(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Similarity Index Tests
-// =============================================================================
-
 func TestSimilarityIndex_Insert(t *testing.T) {
 	idx := NewSimilarityIndex(SimilarityIndexConfig{
 		Dimension:      4,
@@ -166,7 +149,6 @@ func TestSimilarityIndex_Insert(t *testing.T) {
 		EfSearch:       10,
 	})
 
-	// Insert vectors
 	idx.Insert("v1", []float32{1, 0, 0, 0})
 	idx.Insert("v2", []float32{0, 1, 0, 0})
 	idx.Insert("v3", []float32{0, 0, 1, 0})
@@ -184,20 +166,17 @@ func TestSimilarityIndex_Search(t *testing.T) {
 		EfSearch:       10,
 	})
 
-	// Insert vectors
 	idx.Insert("v1", []float32{1, 0, 0, 0})
 	idx.Insert("v2", []float32{0.9, 0.1, 0, 0})
 	idx.Insert("v3", []float32{0, 1, 0, 0})
 	idx.Insert("v4", []float32{0, 0, 1, 0})
 
-	// Search for similar to v1
 	results := idx.Search([]float32{1, 0, 0, 0}, 2)
 
 	if len(results) < 1 {
 		t.Fatal("Expected at least 1 result")
 	}
 
-	// v1 should be most similar (exact match)
 	if results[0].ID != "v1" {
 		t.Errorf("Expected v1 as top result, got %s", results[0].ID)
 	}
@@ -219,13 +198,11 @@ func TestSimilarityIndex_SearchWithThreshold(t *testing.T) {
 	idx.Insert("v2", []float32{0.9, 0.1, 0, 0})
 	idx.Insert("v3", []float32{0, 1, 0, 0})
 
-	// Search with high threshold
 	results := idx.SearchWithThreshold([]float32{1, 0, 0, 0}, 0.95, 10)
 
-	// Should only find v1 and maybe v2
-	for _, r := range results {
-		if r.Score < 0.95 {
-			t.Errorf("Result %s has score %f below threshold", r.ID, r.Score)
+	for _, result := range results {
+		if result.Score < 0.95 {
+			t.Errorf("Result %s has score %f below threshold", result.ID, result.Score)
 		}
 	}
 }
@@ -251,26 +228,20 @@ func TestSimilarityIndex_Remove(t *testing.T) {
 		t.Errorf("Expected 1 node after removal, got %d", idx.Count())
 	}
 
-	// Search should not find v1
 	results := idx.Search([]float32{1, 0, 0, 0}, 10)
-	for _, r := range results {
-		if r.ID == "v1" {
+	for _, result := range results {
+		if result.ID == "v1" {
 			t.Error("Found v1 after removal")
 		}
 	}
 }
 
-// =============================================================================
-// Compression Tests
-// =============================================================================
-
 func TestCompressor_Compress(t *testing.T) {
 	c := NewCompressor(DefaultCompressorConfig())
 
-	// Test data - highly repetitive content compresses well
 	baseText := "This is test data that should be compressed. The quick brown fox jumps over the lazy dog. "
 	var data []byte
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		data = append(data, []byte(baseText)...)
 	}
 
@@ -279,7 +250,6 @@ func TestCompressor_Compress(t *testing.T) {
 		t.Fatalf("Compression failed: %v", err)
 	}
 
-	// With highly repetitive data, compression should work
 	if compressed.Type == CompressionNone && len(data) > 1024 {
 		t.Logf("Note: Compression type is none for %d bytes of data", len(data))
 	}
@@ -319,7 +289,6 @@ func TestCompressor_SmallData(t *testing.T) {
 		MinSizeToCompress: 1024,
 	})
 
-	// Small data shouldn't be compressed
 	smallData := []byte("small")
 
 	compressed, err := c.Compress(smallData)
@@ -335,7 +304,7 @@ func TestCompressor_SmallData(t *testing.T) {
 func TestCompressor_EntryCompression(t *testing.T) {
 	c := NewCompressor(CompressorConfig{
 		Type:              CompressionGzip,
-		MinSizeToCompress: 10, // Low threshold for testing
+		MinSizeToCompress: 10,
 	})
 
 	entry := &Entry{
@@ -369,14 +338,9 @@ func TestCompressor_EntryCompression(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Query Optimizer Tests
-// =============================================================================
-
 func TestQueryOptimizer_Plan(t *testing.T) {
 	qo := NewQueryOptimizer(DefaultQueryOptimizerConfig())
 
-	// Update statistics
 	qo.UpdateStatistics(IndexStatistics{
 		TotalEntries: 10000,
 		EntriesByCategory: map[Category]int64{
@@ -390,7 +354,6 @@ func TestQueryOptimizer_Plan(t *testing.T) {
 		AvgEntriesPerDay: 100,
 	})
 
-	// Create query
 	query := ArchiveQuery{
 		Categories: []Category{CategoryInsight},
 		Limit:      100,
@@ -406,7 +369,6 @@ func TestQueryOptimizer_Plan(t *testing.T) {
 		t.Error("Expected at least one operation in plan")
 	}
 
-	// First operation should be index lookup
 	if plan.Operations[0].Type != OpIndexCategory && plan.Operations[0].Type != OpScanAll {
 		t.Logf("First operation type: %s", plan.Operations[0].Type)
 	}
@@ -422,10 +384,7 @@ func TestQueryOptimizer_CachePlan(t *testing.T) {
 		Categories: []Category{CategoryInsight},
 	}
 
-	// First call should be a cache miss
 	plan1 := qo.Plan(query)
-
-	// Second call should be a cache hit
 	plan2 := qo.Plan(query)
 
 	if plan1.CacheKey != plan2.CacheKey {
@@ -441,7 +400,6 @@ func TestQueryOptimizer_CachePlan(t *testing.T) {
 func TestQueryOptimizer_IDLookup(t *testing.T) {
 	qo := NewQueryOptimizer(DefaultQueryOptimizerConfig())
 
-	// ID lookup should always use ID index
 	query := ArchiveQuery{
 		IDs: []string{"id1", "id2", "id3"},
 	}
@@ -453,21 +411,15 @@ func TestQueryOptimizer_IDLookup(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Export/Import Tests
-// =============================================================================
-
 func TestExporter_ExportJSONL(t *testing.T) {
 	exporter := NewExporter(ExportConfig{
-		Format:          ExportFormatJSONL,
-		IncludeFacts:    false,
+		Format:           ExportFormatJSONL,
+		IncludeFacts:     false,
 		IncludeSummaries: false,
 	})
 
-	// Create a test store
 	store := NewStore(StoreConfig{TokenThreshold: 100000})
 
-	// Add test entries
 	store.InsertEntry(&Entry{
 		Category: CategoryInsight,
 		Title:    "Test Entry 1",
@@ -482,7 +434,6 @@ func TestExporter_ExportJSONL(t *testing.T) {
 		Source:   SourceModelGPT52Codex,
 	})
 
-	// Export to buffer
 	var buf bytes.Buffer
 	err := exporter.ExportToWriter(&buf, store, nil)
 	if err != nil {
@@ -493,7 +444,6 @@ func TestExporter_ExportJSONL(t *testing.T) {
 		t.Error("Expected non-empty export")
 	}
 
-	// Check stats
 	stats := exporter.Stats()
 	if stats.EntriesExported < 2 {
 		t.Errorf("Expected at least 2 entries exported, got %d", stats.EntriesExported)
@@ -502,8 +452,8 @@ func TestExporter_ExportJSONL(t *testing.T) {
 
 func TestExporter_ExportJSON(t *testing.T) {
 	exporter := NewExporter(ExportConfig{
-		Format:          ExportFormatJSON,
-		IncludeFacts:    false,
+		Format:           ExportFormatJSON,
+		IncludeFacts:     false,
 		IncludeSummaries: false,
 	})
 
@@ -521,17 +471,15 @@ func TestExporter_ExportJSON(t *testing.T) {
 		t.Fatalf("Export failed: %v", err)
 	}
 
-	// Should be valid JSON starting with {
 	if buf.Len() < 2 || buf.Bytes()[0] != '{' {
 		t.Error("Expected JSON object output")
 	}
 }
 
 func TestImporter_Import(t *testing.T) {
-	// First export
 	exporter := NewExporter(ExportConfig{
-		Format:          ExportFormatJSONL,
-		IncludeFacts:    false,
+		Format:           ExportFormatJSONL,
+		IncludeFacts:     false,
 		IncludeSummaries: false,
 	})
 
@@ -547,7 +495,6 @@ func TestImporter_Import(t *testing.T) {
 	var buf bytes.Buffer
 	exporter.ExportToWriter(&buf, sourceStore, nil)
 
-	// Then import to new store
 	importer := NewImporter(ImportConfig{
 		MergeStrategy: MergeStrategyOverwrite,
 		BatchSize:     100,
@@ -573,7 +520,6 @@ func TestImporter_MergeStrategy(t *testing.T) {
 
 	store := NewStore(StoreConfig{TokenThreshold: 100000})
 
-	// Add existing entry
 	existingEntry := &Entry{
 		ID:        "existing",
 		Category:  CategoryInsight,
@@ -584,7 +530,6 @@ func TestImporter_MergeStrategy(t *testing.T) {
 	}
 	store.InsertEntry(existingEntry)
 
-	// Create import data with same ID
 	importData := `{"type":"header","data":{"version":"1.0"}}
 {"type":"entry","data":{"id":"existing","category":"insight","content":"New content","source":"claude-opus-4-5-20251101"}}`
 
@@ -593,24 +538,17 @@ func TestImporter_MergeStrategy(t *testing.T) {
 		t.Fatalf("Import failed: %v", err)
 	}
 
-	// With skip strategy, entry should be skipped
 	if result.EntriesSkipped != 1 {
 		t.Errorf("Expected 1 entry skipped, got %d", result.EntriesSkipped)
 	}
 
-	// Original content should remain
 	entry, _ := store.GetEntry("existing")
 	if entry.Content != "Original content" {
 		t.Error("Entry was modified despite skip strategy")
 	}
 }
 
-// =============================================================================
-// Cosine Similarity Tests
-// =============================================================================
-
 func TestCosineSimilarity(t *testing.T) {
-	// Identical vectors
 	a := []float32{1, 0, 0}
 	b := []float32{1, 0, 0}
 	sim := cosineSimilarity(a, b)
@@ -618,7 +556,6 @@ func TestCosineSimilarity(t *testing.T) {
 		t.Errorf("Expected similarity ~1.0 for identical vectors, got %f", sim)
 	}
 
-	// Orthogonal vectors
 	c := []float32{1, 0, 0}
 	d := []float32{0, 1, 0}
 	sim = cosineSimilarity(c, d)
@@ -626,7 +563,6 @@ func TestCosineSimilarity(t *testing.T) {
 		t.Errorf("Expected similarity ~0 for orthogonal vectors, got %f", sim)
 	}
 
-	// Opposite vectors
 	e := []float32{1, 0, 0}
 	f := []float32{-1, 0, 0}
 	sim = cosineSimilarity(e, f)
@@ -635,12 +571,7 @@ func TestCosineSimilarity(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Integration Tests
-// =============================================================================
-
 func TestEnhancements_Integration(t *testing.T) {
-	// Create all components
 	partitionMgr := NewTemporalPartitionManager(DefaultTemporalPartitionConfig())
 	simIndex := NewSimilarityIndex(SimilarityIndexConfig{
 		Dimension:      4,
@@ -651,11 +582,9 @@ func TestEnhancements_Integration(t *testing.T) {
 	compressor := NewCompressor(DefaultCompressorConfig())
 	optimizer := NewQueryOptimizer(DefaultQueryOptimizerConfig())
 
-	// Create mock embedder
 	embedder := NewMockEmbedder(4)
 	ctx := context.Background()
 
-	// Simulate adding entries
 	entries := []struct {
 		id      string
 		content string
@@ -666,26 +595,22 @@ func TestEnhancements_Integration(t *testing.T) {
 		{"e3", "Third entry about debugging", time.Now().Add(-2 * time.Hour)},
 	}
 
-	for _, e := range entries {
-		// Add to partition manager
-		partitionMgr.AddEntry(e.id, e.time, 100)
+	for _, entry := range entries {
+		partitionMgr.AddEntry(entry.id, entry.time, 100)
 
-		// Generate and store embedding
-		embedding, err := embedder.Embed(ctx, e.content)
+		embedding, err := embedder.Embed(ctx, entry.content)
 		if err != nil {
 			t.Fatalf("Failed to generate embedding: %v", err)
 		}
-		simIndex.Insert(e.id, embedding)
+		simIndex.Insert(entry.id, embedding)
 
-		// Test compression
-		data := []byte(e.content + " " + e.content + " " + e.content)
+		data := []byte(entry.content + " " + entry.content + " " + entry.content)
 		_, err = compressor.Compress(data)
 		if err != nil {
 			t.Fatalf("Failed to compress: %v", err)
 		}
 	}
 
-	// Test query optimization
 	query := ArchiveQuery{
 		Categories: []Category{CategoryInsight},
 		Limit:      10,
@@ -695,14 +620,12 @@ func TestEnhancements_Integration(t *testing.T) {
 		t.Fatal("Failed to generate query plan")
 	}
 
-	// Test similarity search
 	queryEmb, _ := embedder.Embed(ctx, "testing")
 	results := simIndex.Search(queryEmb, 2)
 	if len(results) < 1 {
 		t.Error("Expected at least 1 similarity result")
 	}
 
-	// Test temporal query
 	timeResults := partitionMgr.QueryTimeRange(
 		time.Now().Add(-3*time.Hour),
 		time.Now(),

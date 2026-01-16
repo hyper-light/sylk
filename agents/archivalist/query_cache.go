@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -86,21 +85,16 @@ type SimilarityMatch struct {
 type QueryCache struct {
 	mu sync.RWMutex
 
-	// Query embeddings for similarity matching
 	embeddings []QueryEmbedding
+	responses  map[string]*CachedResponse
+	embedder   Embedder
+	config     QueryCacheConfig
 
-	// Cached responses by query hash
-	responses map[string]*CachedResponse
-
-	// Embedder for generating query embeddings
-	embedder Embedder
-
-	// Configuration
-	config QueryCacheConfig
-
-	// Stats
 	hits   int64
 	misses int64
+
+	sessionHits   sync.Map
+	sessionMisses sync.Map
 }
 
 // NewQueryCache creates a new query cache
@@ -125,7 +119,8 @@ func (qc *QueryCache) Get(ctx context.Context, query string, sessionID string) (
 	if response := qc.tryExactMatch(query, sessionID); response != nil {
 		return response, true
 	}
-	return qc.trySimilarMatch(ctx, query, sessionID)
+	match, ok := qc.trySimilarMatch(ctx, query, sessionID)
+	return match, ok
 }
 
 func (qc *QueryCache) tryExactMatch(query string, sessionID string) *CachedResponse {
@@ -145,28 +140,32 @@ func (qc *QueryCache) tryExactMatch(query string, sessionID string) *CachedRespo
 func (qc *QueryCache) trySimilarMatch(ctx context.Context, query string, sessionID string) (*CachedResponse, bool) {
 	if !qc.config.UseEmbeddings || qc.embedder == nil {
 		qc.recordMiss()
+		qc.recordMissForSession(sessionID)
 		return nil, false
 	}
 
 	queryEmbed, err := qc.embedder.Embed(ctx, query)
 	if err != nil {
 		qc.recordMiss()
+		qc.recordMissForSession(sessionID)
 		return nil, false
 	}
 
 	bestMatch := qc.findMostSimilarLocked(queryEmbed, sessionID)
 	if bestMatch == nil || bestMatch.Similarity < qc.config.HitThreshold {
 		qc.recordMiss()
+		qc.recordMissForSession(sessionID)
 		return nil, false
 	}
 
-	return qc.getMatchedResponse(bestMatch.QueryHash)
+	return qc.getMatchedResponse(bestMatch.QueryHash, sessionID)
 }
 
-func (qc *QueryCache) getMatchedResponse(hash string) (*CachedResponse, bool) {
+func (qc *QueryCache) getMatchedResponse(hash string, sessionID string) (*CachedResponse, bool) {
 	response, ok := qc.responses[hash]
 	if !ok || response.IsExpired() {
 		qc.recordMiss()
+		qc.recordMissForSession(sessionID)
 		return nil, false
 	}
 	qc.recordHit(response)
@@ -177,10 +176,33 @@ func (qc *QueryCache) recordHit(response *CachedResponse) {
 	atomic.AddInt64(&response.HitCount, 1)
 	response.LastHitAt = time.Now()
 	atomic.AddInt64(&qc.hits, 1)
+	if response.SessionID != "" {
+		qc.incrementSessionCount(&qc.sessionHits, response.SessionID)
+	}
 }
 
 func (qc *QueryCache) recordMiss() {
 	atomic.AddInt64(&qc.misses, 1)
+}
+
+func (qc *QueryCache) recordMissForSession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	qc.incrementSessionCount(&qc.sessionMisses, sessionID)
+}
+
+func (qc *QueryCache) incrementSessionCount(store *sync.Map, sessionID string) {
+	value, _ := store.LoadOrStore(sessionID, new(int64))
+	atomic.AddInt64(value.(*int64), 1)
+}
+
+func (qc *QueryCache) sessionCount(store *sync.Map, sessionID string) int64 {
+	value, ok := store.Load(sessionID)
+	if !ok {
+		return 0
+	}
+	return atomic.LoadInt64(value.(*int64))
 }
 
 // Store caches a response for a query
@@ -326,12 +348,51 @@ func (qc *QueryCache) Stats() QueryCacheStats {
 	}
 
 	return QueryCacheStats{
-		TotalQueries:    total,
-		CacheHits:       hits,
-		CacheMisses:     misses,
-		HitRate:         hitRate,
-		CachedResponses: len(qc.responses),
+		TotalQueries:     total,
+		CacheHits:        hits,
+		CacheMisses:      misses,
+		HitRate:          hitRate,
+		CachedResponses:  len(qc.responses),
 		CachedEmbeddings: len(qc.embeddings),
+	}
+}
+
+func (qc *QueryCache) StatsBySession(sessionID string) QueryCacheStats {
+	qc.mu.RLock()
+	defer qc.mu.RUnlock()
+
+	var hits int64
+	var responses int
+	var embeddings int
+
+	for _, resp := range qc.responses {
+		if resp.SessionID != sessionID {
+			continue
+		}
+		hits += resp.HitCount
+		responses++
+	}
+
+	for _, embed := range qc.embeddings {
+		if embed.SessionID == sessionID {
+			embeddings++
+		}
+	}
+
+	misses := qc.sessionCount(&qc.sessionMisses, sessionID)
+	total := hits + misses
+	var hitRate float64
+	if total > 0 {
+		hitRate = float64(hits) / float64(total)
+	}
+
+	return QueryCacheStats{
+		TotalQueries:     total,
+		CacheHits:        hits,
+		CacheMisses:      misses,
+		HitRate:          hitRate,
+		CachedResponses:  responses,
+		CachedEmbeddings: embeddings,
 	}
 }
 
@@ -466,24 +527,4 @@ func getTTLForQueryType(queryType QueryType) time.Duration {
 func hashQuery(query string) string {
 	hash := sha256.Sum256([]byte(query))
 	return hex.EncodeToString(hash[:])
-}
-
-// cosineSimilarity computes the cosine similarity between two embeddings
-func cosineSimilarity(a, b []float32) float64 {
-	if len(a) != len(b) {
-		return 0
-	}
-
-	var dotProduct, normA, normB float64
-	for i := range a {
-		dotProduct += float64(a[i]) * float64(b[i])
-		normA += float64(a[i]) * float64(a[i])
-		normB += float64(b[i]) * float64(b[i])
-	}
-
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-
-	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }

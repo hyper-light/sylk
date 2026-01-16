@@ -77,15 +77,48 @@ type EntryLink struct {
 
 // ArchiveQuery specifies parameters for querying the archive
 type ArchiveQuery struct {
-	Categories  []Category  `json:"categories,omitempty"`
-	Sources     []SourceModel `json:"sources,omitempty"`
-	SessionIDs  []string    `json:"session_ids,omitempty"`
-	Since       *time.Time  `json:"since,omitempty"`
-	Until       *time.Time  `json:"until,omitempty"`
-	SearchText  string      `json:"search_text,omitempty"`
-	Limit       int         `json:"limit,omitempty"`
-	IDs         []string    `json:"ids,omitempty"`
-	IncludeArchived bool    `json:"include_archived"`
+	Categories      []Category    `json:"categories,omitempty"`
+	Sources         []SourceModel `json:"sources,omitempty"`
+	SessionIDs      []string      `json:"session_ids,omitempty"`
+	Since           *time.Time    `json:"since,omitempty"`
+	Until           *time.Time    `json:"until,omitempty"`
+	SearchText      string        `json:"search_text,omitempty"`
+	Limit           int           `json:"limit,omitempty"`
+	IDs             []string      `json:"ids,omitempty"`
+	IncludeArchived bool          `json:"include_archived"`
+}
+
+type WorkflowQuery struct {
+	SessionID string `json:"session_id,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+}
+
+type StoredDAG struct {
+	ID         string          `json:"id"`
+	SessionID  string          `json:"session_id"`
+	Name       string          `json:"name"`
+	Definition json.RawMessage `json:"definition"`
+	CreatedAt  time.Time       `json:"created_at"`
+}
+
+type DAGRun struct {
+	ID           string         `json:"id"`
+	DAGID        string         `json:"dag_id"`
+	SessionID    string         `json:"session_id"`
+	Status       string         `json:"status"`
+	StartTime    time.Time      `json:"start_time"`
+	EndTime      time.Time      `json:"end_time"`
+	NodeResults  map[string]any `json:"node_results,omitempty"`
+	Corrections  []string       `json:"corrections,omitempty"`
+	FinalOutcome string         `json:"final_outcome,omitempty"`
+}
+
+type TokenSavingsReport struct {
+	SessionID        string `json:"session_id,omitempty"`
+	CacheHits        int64  `json:"cache_hits"`
+	CacheMisses      int64  `json:"cache_misses"`
+	CachedResponses  int    `json:"cached_responses"`
+	CachedEmbeddings int    `json:"cached_embeddings"`
 }
 
 // ChronicleSnapshot represents a full snapshot of current state
@@ -102,12 +135,12 @@ type ChronicleSnapshot struct {
 
 // StorageStats contains storage metrics
 type StorageStats struct {
-	TotalEntries         int                 `json:"total_entries"`
-	EntriesByCategory    map[Category]int    `json:"entries_by_category"`
-	EntriesBySource      map[SourceModel]int `json:"entries_by_source"`
-	HotMemoryTokens      int                 `json:"hot_memory_tokens"`
-	ArchivedEntries      int                 `json:"archived_entries"`
-	CurrentSessionID     string              `json:"current_session_id"`
+	TotalEntries      int                 `json:"total_entries"`
+	EntriesByCategory map[Category]int    `json:"entries_by_category"`
+	EntriesBySource   map[SourceModel]int `json:"entries_by_source"`
+	HotMemoryTokens   int                 `json:"hot_memory_tokens"`
+	ArchivedEntries   int                 `json:"archived_entries"`
+	CurrentSessionID  string              `json:"current_session_id"`
 }
 
 // SubmissionResult indicates the outcome of a submission

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 // ToolHandler handles tool calls from agents
@@ -29,7 +31,43 @@ func (h *ToolHandler) Handle(ctx context.Context, toolName string, input json.Ra
 	if handler == nil {
 		return "", fmt.Errorf("unknown tool: %s", toolName)
 	}
-	return handler(ctx, input)
+
+	var inputMap map[string]any
+	if err := json.Unmarshal(input, &inputMap); err != nil {
+		return "", fmt.Errorf("invalid input: %w", err)
+	}
+
+	toolData := &skills.ToolCallHookData{
+		ToolName: toolName,
+		Input:    inputMap,
+	}
+	if h.archivalist.hooks != nil {
+		updated, result, err := h.archivalist.hooks.ExecutePreToolCallHooks(ctx, toolData)
+		if err != nil {
+			return "", err
+		}
+		if result.SkipExecution {
+			return result.SkipResponse, nil
+		}
+		toolData = updated
+	}
+
+	updatedInput, err := json.Marshal(toolData.Input)
+	if err != nil {
+		return "", err
+	}
+
+	output, err := handler(ctx, updatedInput)
+	toolData.Output = output
+	toolData.Error = err
+	if h.archivalist.hooks != nil {
+		_, _, hookErr := h.archivalist.hooks.ExecutePostToolCallHooks(ctx, toolData)
+		if hookErr != nil && err == nil {
+			return "", hookErr
+		}
+	}
+
+	return output, err
 }
 
 func (h *ToolHandler) getHandler(toolName string) toolHandlerFunc {

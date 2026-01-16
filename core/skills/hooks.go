@@ -5,22 +5,6 @@ import (
 	"sync"
 )
 
-// =============================================================================
-// LLM Hook System
-// =============================================================================
-//
-// Hooks provide injection points during LLM interactions:
-// - PrePrompt: Modify/augment prompt before sending to LLM
-// - PostPrompt: Process LLM response before returning
-// - PreToolCall: Intercept/modify tool calls before execution
-// - PostToolCall: Process tool results before returning to LLM
-//
-// Hooks are executed in registration order. Each hook can:
-// - Pass through unchanged
-// - Modify the data
-// - Short-circuit (cancel further processing)
-
-// HookPhase identifies when a hook runs
 type HookPhase string
 
 const (
@@ -28,9 +12,12 @@ const (
 	HookPhasePostPrompt   HookPhase = "post_prompt"
 	HookPhasePreToolCall  HookPhase = "pre_tool_call"
 	HookPhasePostToolCall HookPhase = "post_tool_call"
+	HookPhasePreStore     HookPhase = "pre_store"
+	HookPhasePostStore    HookPhase = "post_store"
+	HookPhasePreQuery     HookPhase = "pre_query"
+	HookPhasePostQuery    HookPhase = "post_query"
 )
 
-// HookPriority determines execution order (higher = earlier)
 type HookPriority int
 
 const (
@@ -39,123 +26,110 @@ const (
 	HookPriorityHigh   HookPriority = 100
 )
 
-// =============================================================================
-// Hook Data Types
-// =============================================================================
-
-// PromptHookData contains data for pre/post prompt hooks
 type PromptHookData struct {
-	// Input (read-only for context)
 	AgentID        string
 	ConversationID string
 	TurnNumber     int
 
-	// Modifiable content
 	SystemPrompt string
 	UserMessage  string
-	Messages     []MessageContent // Full message history
+	Messages     []MessageContent
 
-	// For PostPrompt only
 	Response   string
 	TokensUsed int
 	StopReason string
 
-	// Metadata for hook communication
 	Metadata map[string]any
 }
 
-// MessageContent represents a single message in the conversation
 type MessageContent struct {
-	Role    string // "user", "assistant", "system"
+	Role    string
 	Content string
 }
 
-// ToolCallHookData contains data for pre/post tool call hooks
 type ToolCallHookData struct {
-	// Tool identification
 	ToolName string
 	ToolID   string
 
-	// Context
 	AgentID        string
 	ConversationID string
 
-	// Modifiable content
-	Input map[string]any // Tool input parameters
+	Input map[string]any
 
-	// For PostToolCall only
 	Output any
 	Error  error
 
-	// Metadata for hook communication
 	Metadata map[string]any
 }
 
-// HookResult indicates how to proceed after a hook
+type StoreHookData struct {
+	Entry  any
+	Result any
+	Error  error
+
+	Metadata map[string]any
+}
+
+type QueryHookData struct {
+	Query  any
+	Result any
+	Error  error
+
+	Metadata map[string]any
+}
+
 type HookResult struct {
-	// Continue indicates whether to continue to the next hook
 	Continue bool
 
-	// Modified data (nil means use original)
 	ModifiedPromptData   *PromptHookData
 	ModifiedToolCallData *ToolCallHookData
+	ModifiedStoreData    *StoreHookData
+	ModifiedQueryData    *QueryHookData
 
-	// Error to propagate (stops hook chain)
 	Error error
 
-	// Inject additional context (appended to system prompt)
 	InjectContext string
 
-	// Skip the actual LLM/tool call (use provided response)
 	SkipExecution bool
 	SkipResponse  string
 }
 
-// =============================================================================
-// Hook Interfaces
-// =============================================================================
-
-// PromptHook processes prompt-related events
 type PromptHook interface {
-	// Name returns a unique identifier for this hook
 	Name() string
-
-	// Phase returns when this hook runs
 	Phase() HookPhase
-
-	// Priority returns execution priority
 	Priority() HookPriority
-
-	// Execute runs the hook
 	Execute(ctx context.Context, data *PromptHookData) HookResult
 }
 
-// ToolCallHook processes tool call events
 type ToolCallHook interface {
-	// Name returns a unique identifier for this hook
 	Name() string
-
-	// Phase returns when this hook runs
 	Phase() HookPhase
-
-	// Priority returns execution priority
 	Priority() HookPriority
-
-	// Execute runs the hook
 	Execute(ctx context.Context, data *ToolCallHookData) HookResult
 }
 
-// =============================================================================
-// Functional Hook Types
-// =============================================================================
+type StoreHook interface {
+	Name() string
+	Phase() HookPhase
+	Priority() HookPriority
+	Execute(ctx context.Context, data *StoreHookData) HookResult
+}
 
-// PromptHookFunc is a function that implements PromptHook
+type QueryHook interface {
+	Name() string
+	Phase() HookPhase
+	Priority() HookPriority
+	Execute(ctx context.Context, data *QueryHookData) HookResult
+}
+
 type PromptHookFunc func(ctx context.Context, data *PromptHookData) HookResult
 
-// ToolCallHookFunc is a function that implements ToolCallHook
 type ToolCallHookFunc func(ctx context.Context, data *ToolCallHookData) HookResult
 
-// funcPromptHook wraps a function as a PromptHook
+type StoreHookFunc func(ctx context.Context, data *StoreHookData) HookResult
+
+type QueryHookFunc func(ctx context.Context, data *QueryHookData) HookResult
+
 type funcPromptHook struct {
 	name     string
 	phase    HookPhase
@@ -170,7 +144,6 @@ func (h *funcPromptHook) Execute(ctx context.Context, data *PromptHookData) Hook
 	return h.fn(ctx, data)
 }
 
-// funcToolCallHook wraps a function as a ToolCallHook
 type funcToolCallHook struct {
 	name     string
 	phase    HookPhase
@@ -185,47 +158,78 @@ func (h *funcToolCallHook) Execute(ctx context.Context, data *ToolCallHookData) 
 	return h.fn(ctx, data)
 }
 
-// =============================================================================
-// Hook Registry
-// =============================================================================
+type funcStoreHook struct {
+	name     string
+	phase    HookPhase
+	priority HookPriority
+	fn       StoreHookFunc
+}
 
-// HookRegistry manages all registered hooks
+func (h *funcStoreHook) Name() string           { return h.name }
+func (h *funcStoreHook) Phase() HookPhase       { return h.phase }
+func (h *funcStoreHook) Priority() HookPriority { return h.priority }
+func (h *funcStoreHook) Execute(ctx context.Context, data *StoreHookData) HookResult {
+	return h.fn(ctx, data)
+}
+
+type funcQueryHook struct {
+	name     string
+	phase    HookPhase
+	priority HookPriority
+	fn       QueryHookFunc
+}
+
+func (h *funcQueryHook) Name() string           { return h.name }
+func (h *funcQueryHook) Phase() HookPhase       { return h.phase }
+func (h *funcQueryHook) Priority() HookPriority { return h.priority }
+func (h *funcQueryHook) Execute(ctx context.Context, data *QueryHookData) HookResult {
+	return h.fn(ctx, data)
+}
+
 type HookRegistry struct {
 	mu sync.RWMutex
 
-	// Prompt hooks by phase
 	prePromptHooks  []PromptHook
 	postPromptHooks []PromptHook
 
-	// Tool call hooks by phase
 	preToolCallHooks  []ToolCallHook
 	postToolCallHooks []ToolCallHook
 
-	// Index by name for management
+	preStoreHooks  []StoreHook
+	postStoreHooks []StoreHook
+
+	preQueryHooks  []QueryHook
+	postQueryHooks []QueryHook
+
 	promptHooksByName   map[string]PromptHook
 	toolCallHooksByName map[string]ToolCallHook
+	storeHooksByName    map[string]StoreHook
+	queryHooksByName    map[string]QueryHook
 }
 
-// NewHookRegistry creates a new hook registry
 func NewHookRegistry() *HookRegistry {
 	return &HookRegistry{
 		prePromptHooks:      make([]PromptHook, 0),
 		postPromptHooks:     make([]PromptHook, 0),
 		preToolCallHooks:    make([]ToolCallHook, 0),
 		postToolCallHooks:   make([]ToolCallHook, 0),
+		preStoreHooks:       make([]StoreHook, 0),
+		postStoreHooks:      make([]StoreHook, 0),
+		preQueryHooks:       make([]QueryHook, 0),
+		postQueryHooks:      make([]QueryHook, 0),
 		promptHooksByName:   make(map[string]PromptHook),
 		toolCallHooksByName: make(map[string]ToolCallHook),
+		storeHooksByName:    make(map[string]StoreHook),
+		queryHooksByName:    make(map[string]QueryHook),
 	}
 }
 
-// RegisterPromptHook adds a prompt hook
 func (r *HookRegistry) RegisterPromptHook(hook PromptHook) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.promptHooksByName[hook.Name()] = hook
 
-	// Add to appropriate phase list
 	switch hook.Phase() {
 	case HookPhasePrePrompt:
 		r.prePromptHooks = insertPromptHookSorted(r.prePromptHooks, hook)
@@ -234,14 +238,12 @@ func (r *HookRegistry) RegisterPromptHook(hook PromptHook) {
 	}
 }
 
-// RegisterToolCallHook adds a tool call hook
 func (r *HookRegistry) RegisterToolCallHook(hook ToolCallHook) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.toolCallHooksByName[hook.Name()] = hook
 
-	// Add to appropriate phase list
 	switch hook.Phase() {
 	case HookPhasePreToolCall:
 		r.preToolCallHooks = insertToolCallHookSorted(r.preToolCallHooks, hook)
@@ -250,7 +252,34 @@ func (r *HookRegistry) RegisterToolCallHook(hook ToolCallHook) {
 	}
 }
 
-// RegisterPrePromptHook registers a function as a pre-prompt hook
+func (r *HookRegistry) RegisterStoreHook(hook StoreHook) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.storeHooksByName[hook.Name()] = hook
+
+	switch hook.Phase() {
+	case HookPhasePreStore:
+		r.preStoreHooks = insertStoreHookSorted(r.preStoreHooks, hook)
+	case HookPhasePostStore:
+		r.postStoreHooks = insertStoreHookSorted(r.postStoreHooks, hook)
+	}
+}
+
+func (r *HookRegistry) RegisterQueryHook(hook QueryHook) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.queryHooksByName[hook.Name()] = hook
+
+	switch hook.Phase() {
+	case HookPhasePreQuery:
+		r.preQueryHooks = insertQueryHookSorted(r.preQueryHooks, hook)
+	case HookPhasePostQuery:
+		r.postQueryHooks = insertQueryHookSorted(r.postQueryHooks, hook)
+	}
+}
+
 func (r *HookRegistry) RegisterPrePromptHook(name string, priority HookPriority, fn PromptHookFunc) {
 	r.RegisterPromptHook(&funcPromptHook{
 		name:     name,
@@ -260,7 +289,6 @@ func (r *HookRegistry) RegisterPrePromptHook(name string, priority HookPriority,
 	})
 }
 
-// RegisterPostPromptHook registers a function as a post-prompt hook
 func (r *HookRegistry) RegisterPostPromptHook(name string, priority HookPriority, fn PromptHookFunc) {
 	r.RegisterPromptHook(&funcPromptHook{
 		name:     name,
@@ -270,7 +298,6 @@ func (r *HookRegistry) RegisterPostPromptHook(name string, priority HookPriority
 	})
 }
 
-// RegisterPreToolCallHook registers a function as a pre-tool-call hook
 func (r *HookRegistry) RegisterPreToolCallHook(name string, priority HookPriority, fn ToolCallHookFunc) {
 	r.RegisterToolCallHook(&funcToolCallHook{
 		name:     name,
@@ -280,7 +307,6 @@ func (r *HookRegistry) RegisterPreToolCallHook(name string, priority HookPriorit
 	})
 }
 
-// RegisterPostToolCallHook registers a function as a post-tool-call hook
 func (r *HookRegistry) RegisterPostToolCallHook(name string, priority HookPriority, fn ToolCallHookFunc) {
 	r.RegisterToolCallHook(&funcToolCallHook{
 		name:     name,
@@ -290,7 +316,42 @@ func (r *HookRegistry) RegisterPostToolCallHook(name string, priority HookPriori
 	})
 }
 
-// UnregisterPromptHook removes a prompt hook
+func (r *HookRegistry) RegisterPreStoreHook(name string, priority HookPriority, fn StoreHookFunc) {
+	r.RegisterStoreHook(&funcStoreHook{
+		name:     name,
+		phase:    HookPhasePreStore,
+		priority: priority,
+		fn:       fn,
+	})
+}
+
+func (r *HookRegistry) RegisterPostStoreHook(name string, priority HookPriority, fn StoreHookFunc) {
+	r.RegisterStoreHook(&funcStoreHook{
+		name:     name,
+		phase:    HookPhasePostStore,
+		priority: priority,
+		fn:       fn,
+	})
+}
+
+func (r *HookRegistry) RegisterPreQueryHook(name string, priority HookPriority, fn QueryHookFunc) {
+	r.RegisterQueryHook(&funcQueryHook{
+		name:     name,
+		phase:    HookPhasePreQuery,
+		priority: priority,
+		fn:       fn,
+	})
+}
+
+func (r *HookRegistry) RegisterPostQueryHook(name string, priority HookPriority, fn QueryHookFunc) {
+	r.RegisterQueryHook(&funcQueryHook{
+		name:     name,
+		phase:    HookPhasePostQuery,
+		priority: priority,
+		fn:       fn,
+	})
+}
+
 func (r *HookRegistry) UnregisterPromptHook(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -302,7 +363,6 @@ func (r *HookRegistry) UnregisterPromptHook(name string) bool {
 
 	delete(r.promptHooksByName, name)
 
-	// Remove from phase list
 	switch hook.Phase() {
 	case HookPhasePrePrompt:
 		r.prePromptHooks = removePromptHook(r.prePromptHooks, name)
@@ -313,7 +373,6 @@ func (r *HookRegistry) UnregisterPromptHook(name string) bool {
 	return true
 }
 
-// UnregisterToolCallHook removes a tool call hook
 func (r *HookRegistry) UnregisterToolCallHook(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -325,7 +384,6 @@ func (r *HookRegistry) UnregisterToolCallHook(name string) bool {
 
 	delete(r.toolCallHooksByName, name)
 
-	// Remove from phase list
 	switch hook.Phase() {
 	case HookPhasePreToolCall:
 		r.preToolCallHooks = removeToolCallHook(r.preToolCallHooks, name)
@@ -336,11 +394,48 @@ func (r *HookRegistry) UnregisterToolCallHook(name string) bool {
 	return true
 }
 
-// =============================================================================
-// Hook Execution
-// =============================================================================
+func (r *HookRegistry) UnregisterStoreHook(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-// ExecutePrePromptHooks runs all pre-prompt hooks
+	hook, ok := r.storeHooksByName[name]
+	if !ok {
+		return false
+	}
+
+	delete(r.storeHooksByName, name)
+
+	switch hook.Phase() {
+	case HookPhasePreStore:
+		r.preStoreHooks = removeStoreHook(r.preStoreHooks, name)
+	case HookPhasePostStore:
+		r.postStoreHooks = removeStoreHook(r.postStoreHooks, name)
+	}
+
+	return true
+}
+
+func (r *HookRegistry) UnregisterQueryHook(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	hook, ok := r.queryHooksByName[name]
+	if !ok {
+		return false
+	}
+
+	delete(r.queryHooksByName, name)
+
+	switch hook.Phase() {
+	case HookPhasePreQuery:
+		r.preQueryHooks = removeQueryHook(r.preQueryHooks, name)
+	case HookPhasePostQuery:
+		r.postQueryHooks = removeQueryHook(r.postQueryHooks, name)
+	}
+
+	return true
+}
+
 func (r *HookRegistry) ExecutePrePromptHooks(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
 	r.mu.RLock()
 	hooks := make([]PromptHook, len(r.prePromptHooks))
@@ -350,7 +445,6 @@ func (r *HookRegistry) ExecutePrePromptHooks(ctx context.Context, data *PromptHo
 	return r.executePromptHooks(ctx, hooks, data)
 }
 
-// ExecutePostPromptHooks runs all post-prompt hooks
 func (r *HookRegistry) ExecutePostPromptHooks(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
 	r.mu.RLock()
 	hooks := make([]PromptHook, len(r.postPromptHooks))
@@ -360,7 +454,6 @@ func (r *HookRegistry) ExecutePostPromptHooks(ctx context.Context, data *PromptH
 	return r.executePromptHooks(ctx, hooks, data)
 }
 
-// ExecutePreToolCallHooks runs all pre-tool-call hooks
 func (r *HookRegistry) ExecutePreToolCallHooks(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, HookResult, error) {
 	r.mu.RLock()
 	hooks := make([]ToolCallHook, len(r.preToolCallHooks))
@@ -370,7 +463,6 @@ func (r *HookRegistry) ExecutePreToolCallHooks(ctx context.Context, data *ToolCa
 	return r.executeToolCallHooks(ctx, hooks, data)
 }
 
-// ExecutePostToolCallHooks runs all post-tool-call hooks
 func (r *HookRegistry) ExecutePostToolCallHooks(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, HookResult, error) {
 	r.mu.RLock()
 	hooks := make([]ToolCallHook, len(r.postToolCallHooks))
@@ -380,7 +472,42 @@ func (r *HookRegistry) ExecutePostToolCallHooks(ctx context.Context, data *ToolC
 	return r.executeToolCallHooks(ctx, hooks, data)
 }
 
-// executePromptHooks runs a chain of prompt hooks
+func (r *HookRegistry) ExecutePreStoreHooks(ctx context.Context, data *StoreHookData) (*StoreHookData, HookResult, error) {
+	r.mu.RLock()
+	hooks := make([]StoreHook, len(r.preStoreHooks))
+	copy(hooks, r.preStoreHooks)
+	r.mu.RUnlock()
+
+	return r.executeStoreHooks(ctx, hooks, data)
+}
+
+func (r *HookRegistry) ExecutePostStoreHooks(ctx context.Context, data *StoreHookData) (*StoreHookData, HookResult, error) {
+	r.mu.RLock()
+	hooks := make([]StoreHook, len(r.postStoreHooks))
+	copy(hooks, r.postStoreHooks)
+	r.mu.RUnlock()
+
+	return r.executeStoreHooks(ctx, hooks, data)
+}
+
+func (r *HookRegistry) ExecutePreQueryHooks(ctx context.Context, data *QueryHookData) (*QueryHookData, HookResult, error) {
+	r.mu.RLock()
+	hooks := make([]QueryHook, len(r.preQueryHooks))
+	copy(hooks, r.preQueryHooks)
+	r.mu.RUnlock()
+
+	return r.executeQueryHooks(ctx, hooks, data)
+}
+
+func (r *HookRegistry) ExecutePostQueryHooks(ctx context.Context, data *QueryHookData) (*QueryHookData, HookResult, error) {
+	r.mu.RLock()
+	hooks := make([]QueryHook, len(r.postQueryHooks))
+	copy(hooks, r.postQueryHooks)
+	r.mu.RUnlock()
+
+	return r.executeQueryHooks(ctx, hooks, data)
+}
+
 func (r *HookRegistry) executePromptHooks(ctx context.Context, hooks []PromptHook, data *PromptHookData) (*PromptHookData, error) {
 	current := data
 	var injectedContext string
@@ -411,7 +538,6 @@ func (r *HookRegistry) executePromptHooks(ctx context.Context, hooks []PromptHoo
 		}
 	}
 
-	// Apply injected context to system prompt
 	if injectedContext != "" {
 		current.SystemPrompt += injectedContext
 	}
@@ -419,7 +545,6 @@ func (r *HookRegistry) executePromptHooks(ctx context.Context, hooks []PromptHoo
 	return current, nil
 }
 
-// executeToolCallHooks runs a chain of tool call hooks
 func (r *HookRegistry) executeToolCallHooks(ctx context.Context, hooks []ToolCallHook, data *ToolCallHookData) (*ToolCallHookData, HookResult, error) {
 	current := data
 	var lastResult HookResult
@@ -454,11 +579,74 @@ func (r *HookRegistry) executeToolCallHooks(ctx context.Context, hooks []ToolCal
 	return current, lastResult, nil
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
+func (r *HookRegistry) executeStoreHooks(ctx context.Context, hooks []StoreHook, data *StoreHookData) (*StoreHookData, HookResult, error) {
+	current := data
+	var lastResult HookResult
 
-// insertPromptHookSorted inserts a hook maintaining priority order (highest first)
+	for _, hook := range hooks {
+		select {
+		case <-ctx.Done():
+			return current, lastResult, ctx.Err()
+		default:
+		}
+
+		result := hook.Execute(ctx, current)
+		lastResult = result
+
+		if result.Error != nil {
+			return current, result, result.Error
+		}
+
+		if result.SkipExecution {
+			return current, result, nil
+		}
+
+		if result.ModifiedStoreData != nil {
+			current = result.ModifiedStoreData
+		}
+
+		if !result.Continue {
+			break
+		}
+	}
+
+	return current, lastResult, nil
+}
+
+func (r *HookRegistry) executeQueryHooks(ctx context.Context, hooks []QueryHook, data *QueryHookData) (*QueryHookData, HookResult, error) {
+	current := data
+	var lastResult HookResult
+
+	for _, hook := range hooks {
+		select {
+		case <-ctx.Done():
+			return current, lastResult, ctx.Err()
+		default:
+		}
+
+		result := hook.Execute(ctx, current)
+		lastResult = result
+
+		if result.Error != nil {
+			return current, result, result.Error
+		}
+
+		if result.SkipExecution {
+			return current, result, nil
+		}
+
+		if result.ModifiedQueryData != nil {
+			current = result.ModifiedQueryData
+		}
+
+		if !result.Continue {
+			break
+		}
+	}
+
+	return current, lastResult, nil
+}
+
 func insertPromptHookSorted(hooks []PromptHook, hook PromptHook) []PromptHook {
 	i := 0
 	for i < len(hooks) && hooks[i].Priority() >= hook.Priority() {
@@ -470,7 +658,6 @@ func insertPromptHookSorted(hooks []PromptHook, hook PromptHook) []PromptHook {
 	return hooks
 }
 
-// insertToolCallHookSorted inserts a hook maintaining priority order (highest first)
 func insertToolCallHookSorted(hooks []ToolCallHook, hook ToolCallHook) []ToolCallHook {
 	i := 0
 	for i < len(hooks) && hooks[i].Priority() >= hook.Priority() {
@@ -482,7 +669,28 @@ func insertToolCallHookSorted(hooks []ToolCallHook, hook ToolCallHook) []ToolCal
 	return hooks
 }
 
-// removePromptHook removes a hook by name
+func insertStoreHookSorted(hooks []StoreHook, hook StoreHook) []StoreHook {
+	i := 0
+	for i < len(hooks) && hooks[i].Priority() >= hook.Priority() {
+		i++
+	}
+	hooks = append(hooks, nil)
+	copy(hooks[i+1:], hooks[i:])
+	hooks[i] = hook
+	return hooks
+}
+
+func insertQueryHookSorted(hooks []QueryHook, hook QueryHook) []QueryHook {
+	i := 0
+	for i < len(hooks) && hooks[i].Priority() >= hook.Priority() {
+		i++
+	}
+	hooks = append(hooks, nil)
+	copy(hooks[i+1:], hooks[i:])
+	hooks[i] = hook
+	return hooks
+}
+
 func removePromptHook(hooks []PromptHook, name string) []PromptHook {
 	for i, h := range hooks {
 		if h.Name() == name {
@@ -492,7 +700,6 @@ func removePromptHook(hooks []PromptHook, name string) []PromptHook {
 	return hooks
 }
 
-// removeToolCallHook removes a hook by name
 func removeToolCallHook(hooks []ToolCallHook, name string) []ToolCallHook {
 	for i, h := range hooks {
 		if h.Name() == name {
@@ -502,20 +709,36 @@ func removeToolCallHook(hooks []ToolCallHook, name string) []ToolCallHook {
 	return hooks
 }
 
-// =============================================================================
-// Hook Stats
-// =============================================================================
+func removeStoreHook(hooks []StoreHook, name string) []StoreHook {
+	for i, h := range hooks {
+		if h.Name() == name {
+			return append(hooks[:i], hooks[i+1:]...)
+		}
+	}
+	return hooks
+}
 
-// HookStats contains statistics about registered hooks
+func removeQueryHook(hooks []QueryHook, name string) []QueryHook {
+	for i, h := range hooks {
+		if h.Name() == name {
+			return append(hooks[:i], hooks[i+1:]...)
+		}
+	}
+	return hooks
+}
+
 type HookStats struct {
 	PrePromptHooks    int `json:"pre_prompt_hooks"`
 	PostPromptHooks   int `json:"post_prompt_hooks"`
 	PreToolCallHooks  int `json:"pre_tool_call_hooks"`
 	PostToolCallHooks int `json:"post_tool_call_hooks"`
+	PreStoreHooks     int `json:"pre_store_hooks"`
+	PostStoreHooks    int `json:"post_store_hooks"`
+	PreQueryHooks     int `json:"pre_query_hooks"`
+	PostQueryHooks    int `json:"post_query_hooks"`
 	TotalHooks        int `json:"total_hooks"`
 }
 
-// Stats returns hook statistics
 func (r *HookRegistry) Stats() HookStats {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -525,15 +748,14 @@ func (r *HookRegistry) Stats() HookStats {
 		PostPromptHooks:   len(r.postPromptHooks),
 		PreToolCallHooks:  len(r.preToolCallHooks),
 		PostToolCallHooks: len(r.postToolCallHooks),
-		TotalHooks:        len(r.promptHooksByName) + len(r.toolCallHooksByName),
+		PreStoreHooks:     len(r.preStoreHooks),
+		PostStoreHooks:    len(r.postStoreHooks),
+		PreQueryHooks:     len(r.preQueryHooks),
+		PostQueryHooks:    len(r.postQueryHooks),
+		TotalHooks:        len(r.promptHooksByName) + len(r.toolCallHooksByName) + len(r.storeHooksByName) + len(r.queryHooksByName),
 	}
 }
 
-// =============================================================================
-// Common Hook Implementations
-// =============================================================================
-
-// NewContextInjectionHook creates a hook that injects context into the system prompt
 func NewContextInjectionHook(name string, priority HookPriority, contextFn func(data *PromptHookData) string) PromptHook {
 	return &funcPromptHook{
 		name:     name,
@@ -549,12 +771,11 @@ func NewContextInjectionHook(name string, priority HookPriority, contextFn func(
 	}
 }
 
-// NewToolCallLoggerHook creates a hook that logs tool calls
 func NewToolCallLoggerHook(name string, logFn func(data *ToolCallHookData)) ToolCallHook {
 	return &funcToolCallHook{
 		name:     name,
 		phase:    HookPhasePreToolCall,
-		priority: HookPriorityLow, // Run after other hooks
+		priority: HookPriorityLow,
 		fn: func(ctx context.Context, data *ToolCallHookData) HookResult {
 			logFn(data)
 			return HookResult{Continue: true}
@@ -562,12 +783,11 @@ func NewToolCallLoggerHook(name string, logFn func(data *ToolCallHookData)) Tool
 	}
 }
 
-// NewToolCallValidatorHook creates a hook that validates tool calls
 func NewToolCallValidatorHook(name string, validateFn func(data *ToolCallHookData) error) ToolCallHook {
 	return &funcToolCallHook{
 		name:     name,
 		phase:    HookPhasePreToolCall,
-		priority: HookPriorityHigh, // Run first
+		priority: HookPriorityHigh,
 		fn: func(ctx context.Context, data *ToolCallHookData) HookResult {
 			if err := validateFn(data); err != nil {
 				return HookResult{
@@ -580,7 +800,6 @@ func NewToolCallValidatorHook(name string, validateFn func(data *ToolCallHookDat
 	}
 }
 
-// NewResponseTransformerHook creates a hook that transforms LLM responses
 func NewResponseTransformerHook(name string, priority HookPriority, transformFn func(response string) string) PromptHook {
 	return &funcPromptHook{
 		name:     name,

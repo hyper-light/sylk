@@ -2,7 +2,6 @@ package archivalist
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -19,13 +18,11 @@ type Archivalist struct {
 	agentContext *AgentContext
 	config       Config
 
-	// Concurrency components
 	registry         *Registry
 	eventLog         *EventLog
 	conflictDetector *ConflictDetector
 	conflictHistory  *ConflictHistory
 
-	// RAG components
 	queryCache  *QueryCache
 	embeddings  *EmbeddingStore
 	retriever   *SemanticRetriever
@@ -33,19 +30,22 @@ type Archivalist struct {
 	memory      *MemoryManager
 	toolHandler *ToolHandler
 
-	// Event bus integration
-	bus          guide.EventBus
-	channels     *guide.AgentChannels
-	requestSub   guide.Subscription
-	responseSub  guide.Subscription
-	registrySub  guide.Subscription
-	running      bool
-	knownAgents  map[string]*guide.AgentAnnouncement
+	bus         guide.EventBus
+	channels    *guide.AgentChannels
+	requestSub  guide.Subscription
+	responseSub guide.Subscription
+	registrySub guide.Subscription
+	running     bool
+	knownAgents map[string]*guide.AgentAnnouncement
 
-	// LLM Skills and Hooks
 	skills      *skills.Registry
 	skillLoader *skills.Loader
 	hooks       *skills.HookRegistry
+
+	defaultSessionID string
+	sessionStores    map[string]*SessionStore
+	crossSession     *CrossSessionIndex
+	workflowStore    *WorkflowStore
 }
 
 // Config holds configuration for the Archivalist agent
@@ -70,8 +70,8 @@ type Config struct {
 	ConflictHistorySize int           // Max conflicts to track (default: 100)
 
 	// RAG configuration
-	EmbeddingsPath    string  // Path to embeddings database
-	QueryCacheSize    int     // Max cached queries (default: 10000)
+	EmbeddingsPath      string  // Path to embeddings database
+	QueryCacheSize      int     // Max cached queries (default: 10000)
 	SimilarityThreshold float64 // Query similarity threshold (default: 0.95)
 }
 
@@ -193,8 +193,13 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 		hooks:            hookRegistry,
 	}
 
-	// Register core archivalist skills
+	a.defaultSessionID = c.store.GetCurrentSession().ID
+	a.sessionStores = make(map[string]*SessionStore)
+	a.crossSession = NewCrossSessionIndex(c.store, c.archive, c.eventLog)
+	a.workflowStore = NewWorkflowStore(a)
+
 	a.registerCoreSkills()
+	a.registerExtendedSkills()
 
 	return a
 }
@@ -214,8 +219,8 @@ func (a *Archivalist) initRAG(cfg Config) error {
 		threshold = 0.95
 	}
 	a.queryCache = NewQueryCache(QueryCacheConfig{
-		HitThreshold: threshold,
-		MaxQueries:   cacheSize,
+		HitThreshold:  threshold,
+		MaxQueries:    cacheSize,
 		UseEmbeddings: true,
 	}, embedder)
 
@@ -479,7 +484,7 @@ func (a *Archivalist) handleRecall(ctx context.Context, fwd *guide.ForwardedRequ
 		query.Limit = 10
 	}
 
-	return a.store.Query(query)
+	return a.Query(ctx, query)
 }
 
 // handleStore processes store requests
@@ -509,14 +514,14 @@ func (a *Archivalist) handleStore(ctx context.Context, fwd *guide.ForwardedReque
 // handleCheck processes check (verification) requests
 func (a *Archivalist) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	// Search for matching entries
-	entries, err := a.store.SearchText(fwd.Input, true, 5)
+	entries, err := a.SearchText(ctx, fwd.Input, true, 5)
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]any{
-		"found": len(entries) > 0,
-		"count": len(entries),
+		"found":   len(entries) > 0,
+		"count":   len(entries),
 		"entries": entries,
 	}, nil
 }
@@ -591,18 +596,36 @@ func (a *Archivalist) StoreEntry(ctx context.Context, entry *Entry) SubmissionRe
 		}
 	}
 
-	id, err := a.store.InsertEntry(entry)
-	if err != nil {
-		return SubmissionResult{
-			Success: false,
-			Error:   err,
+	storeData := &skills.StoreHookData{Entry: entry}
+	if a.hooks != nil {
+		updated, result, err := a.hooks.ExecutePreStoreHooks(ctx, storeData)
+		if err != nil {
+			return SubmissionResult{Success: false, Error: err}
+		}
+		if result.SkipExecution {
+			return SubmissionResult{Success: true}
+		}
+		storeData = updated
+	}
+
+	storeEntry, ok := storeData.Entry.(*Entry)
+	if !ok || storeEntry == nil {
+		return SubmissionResult{Success: false, Error: fmt.Errorf("invalid store entry")}
+	}
+
+	id, err := a.store.InsertEntryInSession(a.GetDefaultSession(), storeEntry)
+	result := SubmissionResult{Success: err == nil, Error: err, ID: id}
+
+	storeData.Result = result
+	storeData.Error = err
+	if a.hooks != nil {
+		_, _, hookErr := a.hooks.ExecutePostStoreHooks(ctx, storeData)
+		if hookErr != nil && err == nil {
+			return SubmissionResult{Success: false, Error: hookErr}
 		}
 	}
 
-	return SubmissionResult{
-		Success: true,
-		ID:      id,
-	}
+	return result
 }
 
 // StoreTaskState stores a task state entry (convenience wrapper)
@@ -690,7 +713,40 @@ func (a *Archivalist) UpdateEntry(ctx context.Context, id string, updates func(*
 
 // Query retrieves entries matching the query parameters
 func (a *Archivalist) Query(ctx context.Context, query ArchiveQuery) ([]*Entry, error) {
-	return a.store.Query(query)
+	if len(query.SessionIDs) == 0 {
+		if sessionID := a.GetDefaultSession(); sessionID != "" {
+			query.SessionIDs = []string{sessionID}
+		}
+	}
+
+	queryData := &skills.QueryHookData{Query: query}
+	if a.hooks != nil {
+		updated, result, err := a.hooks.ExecutePreQueryHooks(ctx, queryData)
+		if err != nil {
+			return nil, err
+		}
+		if result.SkipExecution {
+			return nil, nil
+		}
+		queryData = updated
+	}
+
+	queryValue, ok := queryData.Query.(ArchiveQuery)
+	if !ok {
+		return nil, fmt.Errorf("invalid query")
+	}
+
+	entries, err := a.store.Query(queryValue)
+	queryData.Result = entries
+	queryData.Error = err
+	if a.hooks != nil {
+		_, _, hookErr := a.hooks.ExecutePostQueryHooks(ctx, queryData)
+		if hookErr != nil && err == nil {
+			return nil, hookErr
+		}
+	}
+
+	return entries, err
 }
 
 // QueryByCategory retrieves entries in a specific category
@@ -700,7 +756,15 @@ func (a *Archivalist) QueryByCategory(ctx context.Context, category Category, li
 
 // SearchText performs text search across all storage
 func (a *Archivalist) SearchText(ctx context.Context, text string, includeArchived bool, limit int) ([]*Entry, error) {
-	return a.store.SearchText(text, includeArchived, limit)
+	query := ArchiveQuery{
+		SearchText:      text,
+		Limit:           limit,
+		IncludeArchived: includeArchived,
+	}
+	if sessionID := a.GetDefaultSession(); sessionID != "" {
+		query.SessionIDs = []string{sessionID}
+	}
+	return a.Query(ctx, query)
 }
 
 // GetEntry retrieves a single entry by ID
@@ -728,7 +792,7 @@ func (a *Archivalist) GenerateSummary(ctx context.Context, content string) (*Ent
 		TokensEstimate: generated.TokensUsed,
 	}
 
-	_, err = a.store.InsertEntry(entry)
+	_, err = a.store.InsertEntryInSession(a.GetDefaultSession(), entry)
 	if err != nil {
 		return nil, fmt.Errorf("failed to store generated summary: %w", err)
 	}
@@ -738,7 +802,7 @@ func (a *Archivalist) GenerateSummary(ctx context.Context, content string) (*Ent
 
 // GenerateSummaryFromEntries creates a summary from stored entries matching the query
 func (a *Archivalist) GenerateSummaryFromEntries(ctx context.Context, query ArchiveQuery) (*Entry, error) {
-	entries, err := a.store.Query(query)
+	entries, err := a.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query entries: %w", err)
 	}
@@ -775,7 +839,7 @@ func (a *Archivalist) GenerateSummaryFromEntries(ctx context.Context, query Arch
 		RelatedIDs:     generated.SourceIDs,
 	}
 
-	_, err = a.store.InsertEntry(entry)
+	_, err = a.store.InsertEntryInSession(a.GetDefaultSession(), entry)
 	if err != nil {
 		return nil, fmt.Errorf("failed to store generated summary: %w", err)
 	}
@@ -802,12 +866,30 @@ func (a *Archivalist) GetSnapshot(ctx context.Context) *ChronicleSnapshot {
 
 // EndSession ends the current session and archives its data
 func (a *Archivalist) EndSession(ctx context.Context, summary string, primaryFocus string) error {
-	return a.store.EndSession(summary, primaryFocus)
+	err := a.store.EndSession(summary, primaryFocus)
+	if err != nil {
+		return err
+	}
+	a.defaultSessionID = a.store.GetCurrentSession().ID
+	return nil
 }
 
 // GetCurrentSession returns the current session
 func (a *Archivalist) GetCurrentSession() *Session {
 	return a.store.GetCurrentSession()
+}
+
+func (a *Archivalist) GetDefaultSession() string {
+	if a.defaultSessionID == "" {
+		if current := a.store.GetCurrentSession(); current != nil {
+			return current.ID
+		}
+	}
+	return a.defaultSessionID
+}
+
+func (a *Archivalist) SetDefaultSession(sessionID string) {
+	a.defaultSessionID = sessionID
 }
 
 // GetRecentSessions retrieves recent sessions from the archive
@@ -1559,9 +1641,32 @@ func (a *Archivalist) GetRegistry() *Registry {
 	return a.registry
 }
 
-// GetEventLog returns the event log
 func (a *Archivalist) GetEventLog() *EventLog {
 	return a.eventLog
+}
+
+func (a *Archivalist) GetQueryCache() QueryCacheService {
+	return a.queryCache
+}
+
+func (a *Archivalist) GetEmbeddings() EmbeddingStoreService {
+	return a.embeddings
+}
+
+func (a *Archivalist) GetRetriever() SemanticRetrieverService {
+	return a.retriever
+}
+
+func (a *Archivalist) GetSynthesizer() SynthesizerService {
+	return a.synthesizer
+}
+
+func (a *Archivalist) GetMemory() MemoryManagerService {
+	return a.memory
+}
+
+func (a *Archivalist) GetToolHandler() ToolHandlerService {
+	return a.toolHandler
 }
 
 // GetConflictHistory returns the conflict history
@@ -1616,6 +1721,27 @@ func (a *Archivalist) GetQueryCacheStats() *QueryCacheStats {
 	}
 	stats := a.queryCache.Stats()
 	return &stats
+}
+
+func (a *Archivalist) QueryCrossSession(ctx context.Context, query ArchiveQuery) ([]CrossSessionResult, error) {
+	if a.crossSession == nil {
+		return nil, fmt.Errorf("cross session index not available")
+	}
+	return a.crossSession.QueryCrossSession(query)
+}
+
+func (a *Archivalist) QuerySessions(ctx context.Context, query ArchiveQuery) ([]*Session, error) {
+	if a.crossSession == nil {
+		return nil, fmt.Errorf("cross session index not available")
+	}
+	return a.crossSession.QuerySessions(query)
+}
+
+func (a *Archivalist) GetSessionHistory(ctx context.Context, sessionID string, limit int) []*Event {
+	if a.crossSession == nil {
+		return nil
+	}
+	return a.crossSession.GetSessionHistory(sessionID, limit)
 }
 
 // GetMemoryStats returns memory manager statistics
@@ -1710,112 +1836,34 @@ func (a *Archivalist) ExecutePostPromptHooks(ctx context.Context, data *skills.P
 	return a.hooks.ExecutePostPromptHooks(ctx, data)
 }
 
-// registerCoreSkills registers the archivalist's core skills
-func (a *Archivalist) registerCoreSkills() {
-	// Store skill - stores entries in the chronicle
-	storeSkill := skills.NewSkill("store").
-		Description("Store information in the chronicle. Use this to record decisions, insights, patterns, failures, and other important information.").
-		Domain("chronicle").
-		Keywords("store", "save", "record", "remember", "log").
-		Priority(100).
-		StringParam("content", "The content to store", true).
-		EnumParam("category", "Category of the entry", []string{
-			"decision", "insight", "pattern", "failure", "task_state",
-			"timeline", "user_voice", "hypothesis", "open_thread", "general",
-		}, true).
-		StringParam("title", "Optional title for the entry", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Content  string `json:"content"`
-				Category string `json:"category"`
-				Title    string `json:"title"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, err
-			}
+func (a *Archivalist) RegisterPreStoreHook(name string, priority skills.HookPriority, fn skills.StoreHookFunc) {
+	a.hooks.RegisterPreStoreHook(name, priority, fn)
+}
 
-			entry := &Entry{
-				Content:  params.Content,
-				Title:    params.Title,
-				Category: Category(params.Category),
-				Source:   SourceModelArchivalist,
-			}
-			result := a.StoreEntry(ctx, entry)
-			return result, result.Error
-		}).
-		Build()
+func (a *Archivalist) RegisterPostStoreHook(name string, priority skills.HookPriority, fn skills.StoreHookFunc) {
+	a.hooks.RegisterPostStoreHook(name, priority, fn)
+}
 
-	// Query skill - retrieves entries from the chronicle
-	querySkill := skills.NewSkill("query").
-		Description("Query the chronicle for stored information. Use this to recall decisions, patterns, failures, and other recorded information.").
-		Domain("chronicle").
-		Keywords("query", "find", "search", "recall", "retrieve", "what", "when", "how").
-		Priority(100).
-		StringParam("search", "Text to search for", false).
-		EnumParam("category", "Filter by category", []string{
-			"decision", "insight", "pattern", "failure", "task_state",
-			"timeline", "user_voice", "hypothesis", "open_thread", "general", "all",
-		}, false).
-		IntParam("limit", "Maximum number of results", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Search   string `json:"search"`
-				Category string `json:"category"`
-				Limit    int    `json:"limit"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, err
-			}
+func (a *Archivalist) RegisterPreQueryHook(name string, priority skills.HookPriority, fn skills.QueryHookFunc) {
+	a.hooks.RegisterPreQueryHook(name, priority, fn)
+}
 
-			if params.Limit == 0 {
-				params.Limit = 10
-			}
+func (a *Archivalist) RegisterPostQueryHook(name string, priority skills.HookPriority, fn skills.QueryHookFunc) {
+	a.hooks.RegisterPostQueryHook(name, priority, fn)
+}
 
-			query := ArchiveQuery{
-				SearchText: params.Search,
-				Limit:      params.Limit,
-			}
+func (a *Archivalist) ExecutePreStoreHooks(ctx context.Context, data *skills.StoreHookData) (*skills.StoreHookData, skills.HookResult, error) {
+	return a.hooks.ExecutePreStoreHooks(ctx, data)
+}
 
-			if params.Category != "" && params.Category != "all" {
-				query.Categories = []Category{Category(params.Category)}
-			}
+func (a *Archivalist) ExecutePostStoreHooks(ctx context.Context, data *skills.StoreHookData) (*skills.StoreHookData, skills.HookResult, error) {
+	return a.hooks.ExecutePostStoreHooks(ctx, data)
+}
 
-			return a.store.Query(query)
-		}).
-		Build()
+func (a *Archivalist) ExecutePreQueryHooks(ctx context.Context, data *skills.QueryHookData) (*skills.QueryHookData, skills.HookResult, error) {
+	return a.hooks.ExecutePreQueryHooks(ctx, data)
+}
 
-	// Briefing skill - gets agent briefing for context
-	briefingSkill := skills.NewSkill("briefing").
-		Description("Get a briefing of the current session state. Use this to understand current task, progress, blockers, and context.").
-		Domain("memory").
-		Keywords("briefing", "status", "context", "state", "progress", "current").
-		Priority(90).
-		EnumParam("tier", "Level of detail", []string{"micro", "standard", "full"}, false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Tier string `json:"tier"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, err
-			}
-
-			switch params.Tier {
-			case "micro":
-				return a.getMicroBriefing().Data, nil
-			case "full":
-				return a.getFullBriefing().Data, nil
-			default:
-				return a.getStandardBriefing().Data, nil
-			}
-		}).
-		Build()
-
-	// Register and load core skills
-	a.skills.Register(storeSkill)
-	a.skills.Register(querySkill)
-	a.skills.Register(briefingSkill)
-
-	a.skills.Load("store")
-	a.skills.Load("query")
-	a.skills.Load("briefing")
+func (a *Archivalist) ExecutePostQueryHooks(ctx context.Context, data *skills.QueryHookData) (*skills.QueryHookData, skills.HookResult, error) {
+	return a.hooks.ExecutePostQueryHooks(ctx, data)
 }

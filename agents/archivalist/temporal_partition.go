@@ -85,9 +85,9 @@ type TemporalPartition struct {
 	entrySet map[string]bool
 
 	// Statistics
-	EntryCount     int   `json:"entry_count"`
-	TotalTokens    int   `json:"total_tokens"`
-	IsCompacted    bool  `json:"is_compacted"`
+	EntryCount     int        `json:"entry_count"`
+	TotalTokens    int        `json:"total_tokens"`
+	IsCompacted    bool       `json:"is_compacted"`
 	CompactedAt    *time.Time `json:"compacted_at,omitempty"`
 	LastAccessTime time.Time  `json:"last_access_time"`
 }
@@ -364,7 +364,7 @@ func (pm *TemporalPartitionManager) CompactOldPartitions() int {
 	threshold := time.Now().Add(-pm.config.CompactThreshold)
 	compacted := 0
 
-	for key, partition := range pm.partitions {
+	for _, partition := range pm.partitions {
 		partition.mu.Lock()
 		if !partition.IsCompacted && partition.EndTime.Before(threshold) {
 			partition.IsCompacted = true
@@ -382,7 +382,6 @@ func (pm *TemporalPartitionManager) CompactOldPartitions() int {
 		}
 	}
 
-	_ = key // Suppress unused warning
 	return compacted
 }
 

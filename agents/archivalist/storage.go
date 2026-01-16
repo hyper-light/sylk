@@ -118,6 +118,10 @@ func (s *Store) EndSession(summary string, primaryFocus string) error {
 
 // InsertEntry stores an entry and returns the assigned ID
 func (s *Store) InsertEntry(entry *Entry) (string, error) {
+	return s.InsertEntryInSession(s.currentSession.ID, entry)
+}
+
+func (s *Store) InsertEntryInSession(sessionID string, entry *Entry) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -128,10 +132,9 @@ func (s *Store) InsertEntry(entry *Entry) (string, error) {
 		entry.CreatedAt = time.Now()
 	}
 	entry.UpdatedAt = time.Now()
-	entry.SessionID = s.currentSession.ID
+	entry.SessionID = sessionID
 	entry.TokensEstimate = EstimateTokens(entry.Content + entry.Title)
 
-	// Check if we need to archive before inserting
 	if s.totalTokens+entry.TokensEstimate > s.tokenThreshold {
 		if err := s.archiveOldestEntries(); err != nil {
 			return "", fmt.Errorf("failed to archive entries: %w", err)

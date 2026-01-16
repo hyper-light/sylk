@@ -18,6 +18,11 @@ type ArchivalistService interface {
 	QueryByCategory(ctx context.Context, category Category, limit int) []*Entry
 	SearchText(ctx context.Context, text string, includeArchived bool, limit int) ([]*Entry, error)
 	RestoreFromArchive(ctx context.Context, ids []string) error
+	QueryCrossSession(ctx context.Context, query ArchiveQuery) ([]CrossSessionResult, error)
+	QuerySessions(ctx context.Context, query ArchiveQuery) ([]*Session, error)
+	GetSessionHistory(ctx context.Context, sessionID string, limit int) []*Event
+	GetTokenSavings(sessionID string) TokenSavingsReport
+	GetGlobalTokenSavings() TokenSavingsReport
 
 	// Specialized storage (convenience wrappers around StoreEntry)
 	StoreTaskState(ctx context.Context, content string, source SourceModel) SubmissionResult
@@ -37,6 +42,8 @@ type ArchivalistService interface {
 	GetSnapshot(ctx context.Context) *ChronicleSnapshot
 	EndSession(ctx context.Context, summary string, primaryFocus string) error
 	GetCurrentSession() *Session
+	GetDefaultSession() string
+	SetDefaultSession(sessionID string)
 	GetRecentSessions(ctx context.Context, limit int) ([]*Session, error)
 	Stats() StorageStats
 
@@ -100,6 +107,7 @@ type StoreService interface {
 	GetCurrentSession() *Session
 	EndSession(summary string, primaryFocus string) error
 	InsertEntry(entry *Entry) (string, error)
+	InsertEntryInSession(sessionID string, entry *Entry) (string, error)
 	UpdateEntry(id string, updates func(*Entry)) error
 	GetEntry(id string) (*Entry, bool)
 	Query(q ArchiveQuery) ([]*Entry, error)
@@ -189,6 +197,7 @@ type QueryCacheService interface {
 	InvalidateByType(queryType QueryType)
 	Cleanup()
 	Stats() QueryCacheStats
+	StatsBySession(sessionID string) QueryCacheStats
 }
 
 // EmbeddingStoreService defines the embedding store interface

@@ -59,7 +59,6 @@ func TestHookRegistry_PriorityOrder(t *testing.T) {
 		t.Fatalf("expected 3 hooks executed, got %d", len(order))
 	}
 
-	// High priority should run first
 	if order[0] != "high" {
 		t.Errorf("expected 'high' first, got %s", order[0])
 	}
@@ -149,7 +148,7 @@ func TestHookRegistry_ExecutePrePromptHooks_StopsOnContinueFalse(t *testing.T) {
 
 	registry.RegisterPrePromptHook("stopper", HookPriorityHigh, func(ctx context.Context, data *PromptHookData) HookResult {
 		executed = append(executed, "stopper")
-		return HookResult{Continue: false} // Stop chain without error
+		return HookResult{Continue: false}
 	})
 
 	registry.RegisterPrePromptHook("skipped", HookPriorityLow, func(ctx context.Context, data *PromptHookData) HookResult {
@@ -215,7 +214,6 @@ func TestHookRegistry_UnregisterPromptHook(t *testing.T) {
 		t.Errorf("expected 0 hooks after unregister, got %d", stats.PrePromptHooks)
 	}
 
-	// Unregister non-existent
 	ok = registry.UnregisterPromptHook("nonexistent")
 	if ok {
 		t.Error("expected unregister to return false for nonexistent hook")
@@ -248,7 +246,7 @@ func TestHookRegistry_ContextCancellation(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	cancel()
 
 	data := &PromptHookData{}
 	_, err := registry.ExecutePrePromptHooks(ctx, data)
@@ -305,14 +303,12 @@ func TestNewToolCallValidatorHook(t *testing.T) {
 
 	registry.RegisterToolCallHook(hook)
 
-	// Valid tool
 	data := &ToolCallHookData{ToolName: "safe"}
 	_, _, err := registry.ExecutePreToolCallHooks(context.Background(), data)
 	if err != nil {
 		t.Errorf("unexpected error for safe tool: %v", err)
 	}
 
-	// Invalid tool
 	data = &ToolCallHookData{ToolName: "dangerous"}
 	_, _, err = registry.ExecutePreToolCallHooks(context.Background(), data)
 	if err == nil {
