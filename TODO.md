@@ -8976,7 +8976,7 @@ Extends resource pools (0.34) with cross-session fair share enforcement.
 
 ---
 
-### 0.43 Tool Executor
+### 0.43 Tool Executor (DONE)
 
 Implements subprocess spawning with hybrid direct/shell execution.
 
@@ -9432,47 +9432,48 @@ Implements caching for deterministic tool invocations.
 
 ---
 
-### 0.52 Tool Invocation Batcher
+### 0.52 Tool Invocation Batcher ✅ COMPLETED
 
 Implements batching for tools that support multiple file inputs.
 
-**Files to create:**
-- `core/tools/batcher.go`
+**Files created:**
+- `core/tools/batcher.go` ✅
+- `core/tools/batcher_test.go` ✅
 
 **Dependencies:** Requires 0.43 (Tool Executor).
 
 **Acceptance Criteria:**
 
 #### Batch Configuration
-- [ ] Per-tool batch support: max_files, separator
-- [ ] Default batch-capable: eslint, prettier, go vet, go build
-- [ ] Non-batchable: tools with single-file semantics
+- [x] Per-tool batch support: max_files, separator
+- [x] Default batch-capable: eslint, prettier, go vet, go build
+- [x] Non-batchable: tools with single-file semantics
 
 #### Batch Collection
-- [ ] `Batcher` collects invocations for same tool
-- [ ] Within configurable window (default: 100ms)
-- [ ] Up to max_files per batch
+- [x] `Batcher` collects invocations for same tool
+- [x] Within configurable window (default: 100ms)
+- [x] Up to max_files per batch
 
 #### Batch Execution
-- [ ] Combine file args: `eslint file1.js file2.js file3.js`
-- [ ] Single subprocess instead of N
-- [ ] Parse output to attribute results to individual files
+- [x] Combine file args: `eslint file1.js file2.js file3.js`
+- [x] Single subprocess instead of N
+- [x] Parse output to attribute results to individual files
 
 #### Result Attribution
-- [ ] Split batch result back to individual invocations
-- [ ] Each caller receives their file's result
-- [ ] Handle partial failures (some files error, others don't)
+- [x] Split batch result back to individual invocations
+- [x] Each caller receives their file's result
+- [x] Handle partial failures (some files error, others don't)
 
 #### Fallback
-- [ ] If batching fails: fall back to individual execution
-- [ ] Log warning about batch failure
+- [x] If batching fails: fall back to individual execution
+- [x] Log warning about batch failure
 
 **Tests:**
-- [ ] Batching reduces subprocess count
-- [ ] Results attributed correctly
-- [ ] Non-batchable tools not batched
-- [ ] Partial failure handled
-- [ ] Fallback works
+- [x] Batching reduces subprocess count
+- [x] Results attributed correctly
+- [x] Non-batchable tools not batched
+- [x] Partial failure handled
+- [x] Fallback works
 
 ---
 
@@ -23146,14 +23147,14 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ════════════════════════════════════════                                            │
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 3A: Tool System                                                   ││
-│ │ • 0.39 Session Registry                                                          ││
-│ │ • 0.40 Fair Share Calculator                                                     ││
-│ │ • 0.41 Signal Dispatcher                                                         ││
-│ │ • 0.42 Cross-Session Resource Pool                                               ││
-│ │ • 0.43 Tool Executor                                                             ││
-│ │ • 0.44 Adaptive Timeout                                                          ││
-│ │ • 0.45 Kill Sequence Manager                                                     ││
+│ │ PARALLEL GROUP 3A: Tool System (DONE)                                            ││
+│ │ • 0.39 Session Registry (DONE)                                                   ││
+│ │ • 0.40 Fair Share Calculator (DONE)                                              ││
+│ │ • 0.41 Signal Dispatcher (DONE)                                                  ││
+│ │ • 0.42 Cross-Session Resource Pool (DONE)                                        ││
+│ │ • 0.43 Tool Executor (DONE)                                                      ││
+│ │ • 0.44 Adaptive Timeout (DONE)                                                   ││
+│ │ • 0.45 Kill Sequence Manager (DONE)                                              ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -23161,9 +23162,9 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • 0.46 Output Handler                                                            ││
 │ │ • 0.47 Tool Output Parsers                                                       ││
 │ │ • 0.48 Parse Template Cache                                                      ││
-│ │ • 0.50 Tool Cancellation Manager                                                 ││
-│ │ • 0.51 Tool Output Cache                                                         ││
-│ │ • 0.52 Tool Invocation Batcher                                                   ││
+│ │ • 0.50 Tool Cancellation Manager ✅                                              ││
+│ │ • 0.51 Tool Output Cache ✅                                                      ││
+│ │ • 0.52 Tool Invocation Batcher ✅                                                ││
 │ │ • 0.53 Streaming Output Parser                                                   ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
