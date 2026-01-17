@@ -53,19 +53,35 @@ func (p *GitParser) Parse(stdout, stderr []byte) (any, error) {
 	output := string(stdout)
 	result := &GitResult{}
 
-	if p.isStatusOutput(output) {
-		result.Status = p.parseStatus(output)
-	} else if p.isDiffOutput(output) {
+	if p.isDiffOutput(output) {
 		result.Diff = p.parseDiff(output)
 	} else if p.isLogOutput(output) {
 		result.Log = p.parseLog(output)
+	} else if p.isStatusOutput(output) {
+		result.Status = p.parseStatus(output)
 	}
 
 	return result, nil
 }
 
 func (p *GitParser) isStatusOutput(output string) bool {
-	return strings.Contains(output, "modified:") || strings.Contains(output, "new file:") || p.statusPattern.MatchString(output)
+	if p.hasVerboseStatusMarkers(output) {
+		return true
+	}
+	return p.hasShortStatusLine(output)
+}
+
+func (p *GitParser) hasVerboseStatusMarkers(output string) bool {
+	return strings.Contains(output, "modified:") || strings.Contains(output, "new file:")
+}
+
+func (p *GitParser) hasShortStatusLine(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if p.statusPattern.MatchString(line) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *GitParser) isDiffOutput(output string) bool {
