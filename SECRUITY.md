@@ -13,7 +13,7 @@ Examine Comprehensive Parallel Execution Order section of TODO.md WAVE 4, Parall
 - We do NOT defer, bypass, or skip work. EVER.
 
 
-Now for each item in Comprehensive Parallel Execution Order Wave 2, find its matching description in ARCHITECTURE.md. Then validate that our code implmentation FULLY complies with the ARCHITECTURE.md spec,have tests for all files, and that the code meets our coding standards (cyclomatic complexity of 4 or less, minimal or no nested if statements, proper non-circiular imports). Also validate and check for race conditions or deadlocks, memory leaks, poor implementations that could impact performance, proper closure/shutdown, etc.
+Now for each item in Comprehensive Parallel Execution Order WAVE 4, Parallel Group 4B, find its matching description in ARCHITECTURE.md. Then validate that our code implmentation FULLY complies with the ARCHITECTURE.md spec,have tests for all files, and that the code meets our coding standards (cyclomatic complexity of 4 or less, minimal or no nested if statements, proper non-circiular imports). Also validate and check for race conditions or deadlocks, memory leaks, poor implementations that could impact performance, proper closure/shutdown, etc.
 
 - DO NOT generate your own mocks - specify interfaces for structs and use mockery - https://github.com/vektra/mockery to generate them.
 
