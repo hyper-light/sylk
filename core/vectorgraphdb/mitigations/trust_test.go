@@ -88,9 +88,10 @@ func TestTrustHierarchy_Promote(t *testing.T) {
 	node := &vectorgraphdb.GraphNode{
 		ID:       "promote-node",
 		Domain:   vectorgraphdb.DomainAcademic,
-		NodeType: vectorgraphdb.NodeTypeArticle,
+		NodeType: vectorgraphdb.NodeTypePaper,
 		Metadata: map[string]any{},
 	}
+
 	emb := makeTestEmbedding()
 	require.NoError(t, ns.InsertNode(node, emb))
 
@@ -148,7 +149,7 @@ func TestTrustHierarchy_FilterByMinTrust(t *testing.T) {
 	acadNode := &vectorgraphdb.GraphNode{
 		ID:       "acad-filter",
 		Domain:   vectorgraphdb.DomainAcademic,
-		NodeType: vectorgraphdb.NodeTypeArticle,
+		NodeType: vectorgraphdb.NodeTypePaper,
 		Metadata: map[string]any{},
 	}
 	require.NoError(t, ns.InsertNode(acadNode, emb))

@@ -15,14 +15,14 @@ import (
 func TestSignalDispatcher_SendAndReceive(t *testing.T) {
 	baseDir := t.TempDir()
 
-	sender, err := NewSignalDispatcher(SignalDispatcherConfig{
+	sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "sender",
 	})
 	require.NoError(t, err)
 	defer sender.Close()
 
-	receiver, err := NewSignalDispatcher(SignalDispatcherConfig{
+	receiver, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "receiver",
 	})
@@ -59,21 +59,21 @@ func TestSignalDispatcher_SendAndReceive(t *testing.T) {
 func TestSignalDispatcher_Broadcast(t *testing.T) {
 	baseDir := t.TempDir()
 
-	sender, err := NewSignalDispatcher(SignalDispatcherConfig{
+	sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "sender",
 	})
 	require.NoError(t, err)
 	defer sender.Close()
 
-	receiver1, err := NewSignalDispatcher(SignalDispatcherConfig{
+	receiver1, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "receiver1",
 	})
 	require.NoError(t, err)
 	defer receiver1.Close()
 
-	receiver2, err := NewSignalDispatcher(SignalDispatcherConfig{
+	receiver2, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "receiver2",
 	})
@@ -127,7 +127,7 @@ func TestSignalDispatcher_Broadcast(t *testing.T) {
 func TestSignalDispatcher_SignalConsumed(t *testing.T) {
 	baseDir := t.TempDir()
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "test-session",
 	})
@@ -165,7 +165,7 @@ func TestSignalDispatcher_SignalConsumed(t *testing.T) {
 func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
 	baseDir := t.TempDir()
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "test-session",
 	})
@@ -217,7 +217,7 @@ func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
 func TestSignalDispatcher_CleanupOnClose(t *testing.T) {
 	baseDir := t.TempDir()
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "cleanup-test",
 	})
@@ -236,7 +236,7 @@ func TestSignalDispatcher_CleanupOnClose(t *testing.T) {
 func TestSignalDispatcher_ClosedOperations(t *testing.T) {
 	baseDir := t.TempDir()
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "test-session",
 	})
@@ -257,7 +257,7 @@ func TestSignalDispatcher_ClosedOperations(t *testing.T) {
 func TestSignalDispatcher_SessionID(t *testing.T) {
 	baseDir := t.TempDir()
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "my-session",
 	})
@@ -270,7 +270,7 @@ func TestSignalDispatcher_SessionID(t *testing.T) {
 func TestSignalDispatcher_SignalDir(t *testing.T) {
 	baseDir := t.TempDir()
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "my-session",
 	})
@@ -305,7 +305,7 @@ func TestSignal_Constructors(t *testing.T) {
 func TestSignalDispatcher_SenderDoesNotReceiveOwnBroadcast(t *testing.T) {
 	baseDir := t.TempDir()
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   baseDir,
 		SessionID: "self-sender",
 	})

@@ -790,6 +790,792 @@ Archivalist records with context_source
 All feedback stored cross-session for continuous improvement
 ```
 
+### Guide: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/guide/ambiguity.go` (new)
+- `agents/guide/enrichment.go` (new)
+- `agents/guide/skill_verification.go` (new)
+
+#### Guide Ambiguity Resolution Discipline
+**Acceptance Criteria:**
+- [ ] `AmbiguityDetector` struct with detection logic
+- [ ] Detect multi-agent overlap (request matches 2+ agents with >0.5 confidence)
+- [ ] Detect unbounded scope (no clear "done" criteria)
+- [ ] Detect implicit assumptions (relies on unstated context)
+- [ ] Detect conflicting signals (keywords suggest different types)
+- [ ] Query routing failures for similar past misroutes
+- [ ] Generate clarifying questions with specific options
+- [ ] Track clarifications in session for future similar requests
+- [ ] NEVER route with confidence < 0.7 - enforce asking instead
+- [ ] Metrics: ambiguity detection rate, clarification-to-success rate
+
+**Implementation Guide:**
+```go
+type AmbiguityDetector struct {
+    routingHistory   *RoutingHistoryCache
+    archivalistClient ArchivalistClient
+}
+
+func (d *AmbiguityDetector) DetectAmbiguity(ctx context.Context, request string) (*AmbiguityResult, error)
+func (d *AmbiguityDetector) GenerateClarification(result *AmbiguityResult) *ClarificationQuestion
+```
+
+#### Guide Pre-Routing Enrichment Protocol
+**Acceptance Criteria:**
+- [ ] `EnrichmentService` struct managing pre-routing consultations
+- [ ] Mandatory Librarian query: "What is codebase health for [target area]?"
+- [ ] Mandatory Archivalist query: "Any failure patterns for [approach/area]?"
+- [ ] 5-second timeout per consultation, proceed with warning if unavailable
+- [ ] Attach enriched_context to routed message
+- [ ] Skip enrichment for TRIVIAL requests and skill-matched requests
+- [ ] Warn user if both consultations fail, ask if proceed anyway
+- [ ] `EnrichedContext` struct with librarian_health, archivalist_warnings, status
+
+**Implementation Guide:**
+```go
+type EnrichmentService struct {
+    librarianClient   LibrarianClient
+    archivalistClient ArchivalistClient
+    timeout           time.Duration // 5 seconds
+}
+
+func (s *EnrichmentService) Enrich(ctx context.Context, request string) (*EnrichedContext, error)
+```
+
+#### Guide Skill Match Verification Protocol
+**Acceptance Criteria:**
+- [ ] `SkillVerifier` struct tracking skill execution outcomes
+- [ ] Verify execution outcome after each skill match execution
+- [ ] Track outcomes: SUCCESS, REROUTE_NEEDED, EXECUTION_FAILED, USER_REJECTED
+- [ ] Adjust confidence: SUCCESS +0.01, REROUTE -0.05, FAILED -0.10, REJECTED -0.15
+- [ ] Demotion rule: 3+ failures demotes skill from fast path to LLM routing
+- [ ] Log verification results for pattern learning
+- [ ] `SkillVerificationLog` stored in Archivalist
+
+**Implementation Guide:**
+```go
+type SkillVerifier struct {
+    outcomeTracker *OutcomeTracker
+}
+
+func (v *SkillVerifier) RecordOutcome(skillName string, outcome SkillOutcome) error
+func (v *SkillVerifier) ShouldDemote(skillPattern string) bool
+```
+
+### Academic: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/academic/citation.go` (new)
+- `agents/academic/depth_calibration.go` (new)
+- `agents/academic/synthesis.go` (new)
+
+#### Academic Source Citation Discipline
+**Acceptance Criteria:**
+- [ ] `Citation` struct with source_type, url, title, date, freshness, verification, confidence
+- [ ] Source types: official_docs, blog_post, research_paper, community, internal
+- [ ] Freshness calculation: current (<6mo), recent (6-24mo), aging (24-48mo), stale (>48mo)
+- [ ] Stale sources cap confidence at MEDIUM
+- [ ] NEVER fabricate sources - use "unverified" when cannot cite
+- [ ] `CitationValidator` ensures all recommendations have citations
+- [ ] Citation format in responses includes source, type, freshness, confidence
+
+**Implementation Guide:**
+```go
+type Citation struct {
+    SourceType   SourceType `json:"source_type"`
+    URL          string     `json:"url"`
+    Title        string     `json:"title"`
+    Date         string     `json:"date"`
+    Freshness    Freshness  `json:"freshness"`
+    Verification Verification `json:"verification"`
+    Confidence   Confidence `json:"confidence"`
+}
+```
+
+#### Academic Research Depth Calibration Protocol
+**Acceptance Criteria:**
+- [ ] `DepthCalibrator` struct for research depth selection
+- [ ] Initial depth selection: QUICK (1-2 sources), STANDARD (3-5), DEEP (5-10)
+- [ ] Auto-escalation triggers: confidence <0.7, sources conflict, Librarian incompatibility, past failure
+- [ ] Critical topics always DEEP: auth, security, encryption, schema, concurrency
+- [ ] Report depth in response: "Research depth: [LEVEL] - [reason]"
+- [ ] Track escalation triggers and patterns
+
+**Implementation Guide:**
+```go
+type DepthCalibrator struct {
+    librarianClient   LibrarianClient
+    archivalistClient ArchivalistClient
+}
+
+func (c *DepthCalibrator) SelectDepth(ctx context.Context, topic string) (Depth, string)
+func (c *DepthCalibrator) ShouldEscalate(results *ResearchResults) (bool, string)
+```
+
+#### Academic Cross-Agent Research Synthesis Protocol
+**Acceptance Criteria:**
+- [ ] `SynthesisService` coordinating Academic and Librarian
+- [ ] Detect when synthesis required: code patterns, multiple approaches, "we/our" questions
+- [ ] Query Librarian for existing patterns during research
+- [ ] Gap analysis: ALIGNED, MINOR_GAP, MAJOR_GAP, INCOMPATIBLE, GREENFIELD
+- [ ] Unified response format with external_best_practice, codebase_current_pattern, gap_analysis
+- [ ] Adaptation steps for non-aligned recommendations
+
+**Implementation Guide:**
+```go
+type SynthesisService struct {
+    librarianClient LibrarianClient
+}
+
+func (s *SynthesisService) Synthesize(ctx context.Context, research *ResearchResult) (*SynthesizedRecommendation, error)
+```
+
+### Architect: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/architect/complexity.go` (new)
+- `agents/architect/assumptions.go` (new)
+- `agents/architect/failure_integration.go` (new)
+- `agents/architect/scope_creep.go` (new)
+
+#### Architect Plan Complexity Discipline
+**Acceptance Criteria:**
+- [ ] `ComplexityAnalyzer` struct enforcing limits
+- [ ] Limits: MAX_TASKS=20, MAX_DEPTH=5, MAX_PARALLEL=8, MAX_ENGINEER_SCOPE=12
+- [ ] Threshold actions: >10 WARN, >15 REQUIRE justification, >20 BLOCK
+- [ ] `complexity_metrics` in every plan: total_tasks, max_depth, max_parallel, critical_path_length
+- [ ] Complexity rating: LOW, MEDIUM, HIGH, EXCESSIVE
+- [ ] EXCESSIVE triggers phase splitting
+
+**Implementation Guide:**
+```go
+type ComplexityAnalyzer struct {
+    limits ComplexityLimits
+}
+
+func (a *ComplexityAnalyzer) Analyze(plan *Plan) *ComplexityReport
+func (a *ComplexityAnalyzer) ShouldSplit(report *ComplexityReport) bool
+```
+
+#### Architect Assumption Documentation Protocol
+**Acceptance Criteria:**
+- [ ] `Assumption` struct with category, assumption, source, verified, risk_if_wrong
+- [ ] Categories: ENVIRONMENTAL, CODEBASE, BEHAVIORAL, PERFORMANCE, SECURITY, DATA
+- [ ] Verification requirements per category (Librarian, user, spec)
+- [ ] SECURITY assumptions ALWAYS require explicit verification
+- [ ] Unverified assumptions marked for Inspector/Tester validation
+- [ ] Every plan includes "assumptions" section
+
+**Implementation Guide:**
+```go
+type Assumption struct {
+    Category    AssumptionCategory `json:"category"`
+    Assumption  string             `json:"assumption"`
+    Source      string             `json:"source"`
+    Verified    bool               `json:"verified"`
+    RiskIfWrong string             `json:"risk_if_wrong"`
+}
+```
+
+#### Architect Historical Failure Integration Protocol
+**Acceptance Criteria:**
+- [ ] Mandatory Archivalist query for every task: "Failure patterns for [approach]?"
+- [ ] Threshold actions: 0=normal, 1=WARNING, 2=REQUIRE mitigation, 3+=alternative or acknowledgment
+- [ ] Success rate <50% = RED FLAG, recommend alternative
+- [ ] Task annotation with historical_failures: count, warnings, mitigations, alternative_considered
+- [ ] Never suppress failure warnings
+
+**Implementation Guide:**
+```go
+type HistoricalFailureIntegrator struct {
+    archivalistClient ArchivalistClient
+}
+
+func (i *HistoricalFailureIntegrator) GetFailureContext(ctx context.Context, approach string) (*FailureContext, error)
+func (i *HistoricalFailureIntegrator) AnnotateTask(task *Task, failures *FailureContext) error
+```
+
+#### Architect Scope Creep Detection Protocol
+**Acceptance Criteria:**
+- [ ] `ScopeMonitor` tracking original vs current scope
+- [ ] Detect: NEW_TASK_ADDED, TASK_EXPANDED, DEPENDENCY_DISCOVERED, REQUIREMENT_CHANGED
+- [ ] Thresholds: +20% tasks=WARN, +50%=BLOCK, >2 new deps=WARN, >12 Engineer todos=BLOCK
+- [ ] Actions: WARN (log), BLOCK (pause), RE-PLAN (new plan), SPLIT (separate workflow)
+- [ ] Scope boundary tracking with original_scope and current_scope
+
+**Implementation Guide:**
+```go
+type ScopeMonitor struct {
+    originalScope *ScopeBoundary
+    currentScope  *ScopeBoundary
+}
+
+func (m *ScopeMonitor) DetectCreep() *ScopeCreepResult
+func (m *ScopeMonitor) GetAction(result *ScopeCreepResult) ScopeAction
+```
+
+### Engineer: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/engineer/pre_impl_verification.go` (new)
+- `agents/engineer/incremental_validation.go` (new)
+- `agents/engineer/pattern_adherence.go` (new)
+- `agents/engineer/rollback_docs.go` (new)
+
+#### Engineer Pre-Implementation Verification Protocol
+**Acceptance Criteria:**
+- [ ] `PreImplVerifier` struct running mandatory checks
+- [ ] Verify target files exist (Read/Glob confirmation)
+- [ ] Verify patterns match task description (Librarian query if mismatch)
+- [ ] Verify dependencies available (imports exist, packages accessible)
+- [ ] Verify build passes before modification
+- [ ] Verify tests pass for affected area
+- [ ] Verification checklist logged for each task
+- [ ] STOP if any verification fails, report and escalate
+
+**Implementation Guide:**
+```go
+type PreImplVerifier struct {
+    librarianClient LibrarianClient
+    buildRunner     BuildRunner
+    testRunner      TestRunner
+}
+
+func (v *PreImplVerifier) Verify(ctx context.Context, task *Task) (*VerificationResult, error)
+```
+
+#### Engineer Incremental Validation Protocol
+**Acceptance Criteria:**
+- [ ] `IncrementalValidator` for complex tasks (>5 steps, multi-file)
+- [ ] Validation checkpoints after each file modification
+- [ ] Run build, type check, affected tests at each checkpoint
+- [ ] Fix failures before continuing to next step
+- [ ] Checkpoint log with action, build status, test status, fix applied
+- [ ] Benefits: earlier error detection, smaller debug scope, natural rollback points
+
+**Implementation Guide:**
+```go
+type IncrementalValidator struct {
+    checkpoints []Checkpoint
+}
+
+func (v *IncrementalValidator) AddCheckpoint(action string) error
+func (v *IncrementalValidator) ValidateCheckpoint(ctx context.Context) (*CheckpointResult, error)
+```
+
+#### Engineer Pattern Adherence Discipline
+**Acceptance Criteria:**
+- [ ] `PatternAdherence` struct enforcing consistency
+- [ ] Query Librarian for canonical pattern before implementation
+- [ ] Read 2-3 examples of pattern in actual codebase
+- [ ] Match: naming, structure, error handling, logging, testing, documentation
+- [ ] Deviation requires justification: pattern, existing, deviation, justification, approved_by
+- [ ] FORBIDDEN: new patterns when existing works, "improving" during implementation
+
+**Implementation Guide:**
+```go
+type PatternAdherence struct {
+    librarianClient LibrarianClient
+}
+
+func (p *PatternAdherence) GetCanonicalPattern(ctx context.Context, area string) (*Pattern, error)
+func (p *PatternAdherence) ValidateAdherence(code string, pattern *Pattern) (*AdherenceResult, error)
+```
+
+#### Engineer Rollback Documentation Protocol
+**Acceptance Criteria:**
+- [ ] `RollbackDoc` struct with change_id, change_summary, files, rollback_steps, verified, dependencies, data_impact
+- [ ] Required for: schema changes, API changes, config changes, deps, refactoring
+- [ ] Rollback steps must be explicit and actionable
+- [ ] Store in Archivalist with task correlation
+- [ ] Automatic rollback triggers: Inspector fail, Tester fail, 3rd failure, user request
+
+**Implementation Guide:**
+```go
+type RollbackDoc struct {
+    ChangeID        string   `json:"change_id"`
+    ChangeSummary   string   `json:"change_summary"`
+    FilesModified   []string `json:"files_modified"`
+    RollbackSteps   []string `json:"rollback_steps"`
+    RollbackVerified bool    `json:"rollback_verified"`
+    Dependencies    string   `json:"dependencies"`
+    DataImpact      string   `json:"data_impact"`
+}
+```
+
+### Designer: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/designer/visual_regression.go` (new)
+- `agents/designer/token_validation.go` (new)
+- `agents/designer/responsive_testing.go` (new)
+- `agents/designer/animation_perf.go` (new)
+
+#### Designer Visual Regression Awareness Protocol
+**Acceptance Criteria:**
+- [ ] Query Archivalist for visual regression history before modifying component
+- [ ] Risk levels: 0=normal, 1-2=extra testing, 3+=FRAGILE
+- [ ] FRAGILE requirements: before/after screenshots, all breakpoints, visual diff
+- [ ] Always FRAGILE: header, nav, footer, checkout, payment, auth
+- [ ] Document: component, regression_risk, past_issues, extra_verification, visual_diff_required
+
+**Implementation Guide:**
+```go
+type VisualRegressionAwareness struct {
+    archivalistClient ArchivalistClient
+}
+
+func (v *VisualRegressionAwareness) GetRegressionHistory(ctx context.Context, component string) (*RegressionHistory, error)
+func (v *VisualRegressionAwareness) IsFragile(component string, history *RegressionHistory) bool
+```
+
+#### Designer Token Validation Gate Protocol
+**Acceptance Criteria:**
+- [ ] `TokenValidator` as BLOCKING gate before completion
+- [ ] Detect hardcoded: colors (hex, rgb, hsl), spacing (px), typography, shadows, borders, breakpoints
+- [ ] Zero violations required to pass
+- [ ] Validation report: validation_passed, violations, token_coverage, blocking
+- [ ] Exception process: document why, request token creation, get approval
+
+**Implementation Guide:**
+```go
+type TokenValidator struct {
+    tokenRegistry *DesignTokenRegistry
+}
+
+func (v *TokenValidator) Validate(componentCode string) (*TokenValidationResult, error)
+func (v *TokenValidator) IsBlocking(result *TokenValidationResult) bool
+```
+
+#### Designer Responsive Testing Discipline
+**Acceptance Criteria:**
+- [ ] Mandatory breakpoints: SM (320px), MD (768px), LG (1024px), XL (1440px)
+- [ ] SM verification: no horizontal scroll, text readable (14px+), touch targets 44px+
+- [ ] MD verification: layout transitions, no orphaned elements
+- [ ] LG verification: full layout, grids intact
+- [ ] XL verification: no excessive stretching, max-width respected
+- [ ] Completion requires breakpoint_verification object with all breakpoints verified
+
+**Implementation Guide:**
+```go
+type ResponsiveTester struct {
+    breakpoints []Breakpoint
+}
+
+func (t *ResponsiveTester) TestAtBreakpoint(component string, bp Breakpoint) (*BreakpointResult, error)
+func (t *ResponsiveTester) GenerateReport() *ResponsiveTestReport
+```
+
+#### Designer Animation Performance Protocol
+**Acceptance Criteria:**
+- [ ] Performance budget: 60fps target, 30fps minimum
+- [ ] Safe properties: transform, opacity, filter
+- [ ] Avoid animating: width, height, padding, margin, top/left/right/bottom, font-size
+- [ ] Animation review checklist: name, duration, properties, gpu_accelerated, performance_safe
+- [ ] REQUIRED: prefers-reduced-motion support for all animations
+
+**Implementation Guide:**
+```go
+type AnimationReviewer struct {
+    safeProperties []string
+    avoidProperties []string
+}
+
+func (r *AnimationReviewer) ReviewAnimation(animation *Animation) (*AnimationReview, error)
+func (r *AnimationReviewer) SupportsReducedMotion(code string) bool
+```
+
+### Inspector: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/inspector/historical_crossref.go` (new)
+- `agents/inspector/evidence_docs.go` (new)
+- `agents/inspector/progressive_validation.go` (new)
+- `agents/inspector/false_positive.go` (new)
+
+#### Inspector Historical Issue Cross-Reference Protocol
+**Acceptance Criteria:**
+- [ ] Query Archivalist for each file: "Similar patterns that caused issues?"
+- [ ] Thresholds: 0=standard, 1-2=WARNING, 3+=ALERT, known critical=BLOCK
+- [ ] Pattern types: ERROR_PATTERNS, CONCURRENCY_PATTERNS, SECURITY_PATTERNS, PERFORMANCE_PATTERNS, INTEGRATION_PATTERNS
+- [ ] Add historical_cross_reference to validation report
+- [ ] Annotation: "⚠️ HISTORICAL: Pattern matched N past issues"
+
+**Implementation Guide:**
+```go
+type HistoricalCrossRef struct {
+    archivalistClient ArchivalistClient
+}
+
+func (h *HistoricalCrossRef) CheckHistory(ctx context.Context, file string) (*HistoricalMatchResult, error)
+```
+
+#### Inspector Validation Evidence Documentation Protocol
+**Acceptance Criteria:**
+- [ ] Every issue requires: file, line, snippet, issue, severity, category, fix, reproduction
+- [ ] Severities: CRITICAL, HIGH, MEDIUM, LOW
+- [ ] FORBIDDEN: vague issues, missing line numbers, no fix suggestion, unmarked severity
+- [ ] Evidence format enforced by `EvidenceValidator`
+- [ ] Engineers need precise evidence for quick fixes
+
+**Implementation Guide:**
+```go
+type ValidationEvidence struct {
+    File         string   `json:"file"`
+    Line         int      `json:"line"`
+    Snippet      string   `json:"snippet"`
+    Issue        string   `json:"issue"`
+    Severity     Severity `json:"severity"`
+    Category     string   `json:"category"`
+    Fix          string   `json:"fix"`
+    Reproduction string   `json:"reproduction"`
+}
+```
+
+#### Inspector Progressive Validation Protocol
+**Acceptance Criteria:**
+- [ ] Phase 1 (FAST, <5s): Build errors, type errors, syntax issues
+- [ ] Phase 2 (STANDARD): Lint, pattern compliance, basic security
+- [ ] Phase 3 (DEEP): Concurrency, memory/resource, complex patterns, historical cross-ref
+- [ ] Fast-fail: If Phase 1 fails, STOP and report
+- [ ] Report indicates phase: "Stopped at Phase 1: Build failed"
+- [ ] Benefits: save time, faster feedback, reserve deep analysis for worthy code
+
+**Implementation Guide:**
+```go
+type ProgressiveValidator struct {
+    phases []ValidationPhase
+}
+
+func (v *ProgressiveValidator) Validate(ctx context.Context, code string) (*ProgressiveResult, error)
+```
+
+#### Inspector False Positive Tracking Protocol
+**Acceptance Criteria:**
+- [ ] Track overrides: USER_OVERRIDE, ARCHITECT_DISMISS, PATTERN_EXCEPTION, EXTERNAL_CONSTRAINT
+- [ ] False positive record: original_issue, override_type, reason, pattern_signature, recurrence_count
+- [ ] Learning: 1=track, 2=flag potential FP, 3+=reduce severity, 5+=consider removing
+- [ ] Query during validation: "Has this pattern been overridden?"
+- [ ] Note in report if pattern was previously overridden
+
+**Implementation Guide:**
+```go
+type FalsePositiveTracker struct {
+    archivalistClient ArchivalistClient
+}
+
+func (t *FalsePositiveTracker) RecordOverride(issue *ValidationIssue, override OverrideType) error
+func (t *FalsePositiveTracker) ShouldAdjustSeverity(pattern string) (bool, Severity)
+```
+
+### Tester: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/tester/existing_test_integration.go` (new)
+- `agents/tester/flaky_prevention.go` (new)
+- `agents/tester/coverage_prioritization.go` (new)
+- `agents/tester/maintenance_burden.go` (new)
+
+#### Tester Existing Test Integration Protocol
+**Acceptance Criteria:**
+- [ ] Query Librarian before writing: "Tests for [affected code]?"
+- [ ] Read existing test files in package
+- [ ] Identify existing: fixtures, mocks, helpers
+- [ ] REUSE existing fixtures and mocks (don't duplicate)
+- [ ] MATCH existing naming conventions and assertion style
+- [ ] Conflict detection: no duplicate scenarios, no conflicting assertions
+- [ ] Document: existing_tests_found, fixtures_used, new_tests_added, conflicts_detected
+
+**Implementation Guide:**
+```go
+type ExistingTestIntegrator struct {
+    librarianClient LibrarianClient
+}
+
+func (i *ExistingTestIntegrator) DiscoverExisting(ctx context.Context, pkg string) (*ExistingTestInfo, error)
+func (i *ExistingTestIntegrator) CheckConflicts(newTests []*Test, existing *ExistingTestInfo) []Conflict
+```
+
+#### Tester Flaky Test Prevention Protocol
+**Acceptance Criteria:**
+- [ ] Flakiness triggers: time dependency, random without seed, external service, shared state, order dependency, resource contention, async without sync
+- [ ] Prevention: inject clock, seed random, mock external, isolate state, ensure independence, explicit sync
+- [ ] `FlakinessReview` for every test: time_dependencies, random_usage, external_calls, shared_state, risk_level, mitigations_applied
+
+**Implementation Guide:**
+```go
+type FlakyPrevention struct {
+    triggers []FlakinessTrigger
+}
+
+func (p *FlakyPrevention) AnalyzeTest(test *Test) (*FlakinessReview, error)
+func (p *FlakyPrevention) SuggestMitigation(review *FlakinessReview) []string
+```
+
+#### Tester Coverage Gap Prioritization Protocol
+**Acceptance Criteria:**
+- [ ] Priority order: P0=error paths, P1=boundaries, P2=integration, P3=happy paths, P4=convenience
+- [ ] Error paths to test: network failures, invalid input, resource exhaustion, permission denied, timeouts, partial failures
+- [ ] Coverage plan: priority, area, tests_planned for each level
+- [ ] Anti-pattern detection: only happy paths = FALSE coverage
+
+**Implementation Guide:**
+```go
+type CoveragePrioritizer struct {
+    priorities []CoveragePriority
+}
+
+func (p *CoveragePrioritizer) PlanCoverage(implementation string) *CoveragePlan
+func (p *CoveragePrioritizer) DetectAntiPatterns(plan *CoveragePlan) []AntiPattern
+```
+
+#### Tester Test Maintenance Burden Protocol
+**Acceptance Criteria:**
+- [ ] HIGH burden: tests implementation details, brittle, complex setup, tests private, many mocks
+- [ ] LOW burden: tests behavior, isolated, simple setup, tests public, real deps when fast
+- [ ] Burden assessment: burden_score, factors (tests_behavior, tests_implementation, mock_count, setup_complexity, change_sensitivity)
+- [ ] HIGH burden requires justification: why value exceeds cost
+
+**Implementation Guide:**
+```go
+type MaintenanceBurdenAnalyzer struct{}
+
+func (a *MaintenanceBurdenAnalyzer) Assess(test *Test) *BurdenAssessment
+func (a *MaintenanceBurdenAnalyzer) RequiresJustification(assessment *BurdenAssessment) bool
+```
+
+### Librarian: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/librarian/staleness.go` (new)
+- `agents/librarian/confidence_calibration.go` (new)
+- `agents/librarian/pattern_evolution.go` (new)
+- `agents/librarian/index_health.go` (new)
+
+#### Librarian Staleness Detection Discipline
+**Acceptance Criteria:**
+- [ ] Staleness thresholds: FRESH (<5min), RECENT (5-30min), AGING (30-60min), STALE (>60min)
+- [ ] Check file modification times vs cache timestamps
+- [ ] AGING triggers verification before responding
+- [ ] STALE triggers full rescan
+- [ ] Staleness signals: file mtime > cache, recent git commits, agent discrepancy
+- [ ] Response annotation: staleness_check with status, cache_age, action_taken
+
+**Implementation Guide:**
+```go
+type StalenessDetector struct {
+    cacheManager *CacheManager
+}
+
+func (d *StalenessDetector) CheckStaleness(ctx context.Context, files []string) *StalenessResult
+func (d *StalenessDetector) GetAction(result *StalenessResult) StalenessAction
+```
+
+#### Librarian Confidence Calibration Protocol
+**Acceptance Criteria:**
+- [ ] Track all confidence scores with outcomes (success/failure/corrected)
+- [ ] Calibration bands: 0.9-1.0 (90%+ accurate), 0.7-0.9 (70-90%), 0.5-0.7 (50-70%)
+- [ ] Adjustment: if 0.9 conf but <80% accurate, recalibrate down; if 0.7 but >90%, recalibrate up
+- [ ] Track by query type (some harder than others)
+- [ ] Include in response: "Confidence: 0.85 (historically 83% accurate for this query type)"
+
+**Implementation Guide:**
+```go
+type ConfidenceCalibrator struct {
+    archivalistClient ArchivalistClient
+}
+
+func (c *ConfidenceCalibrator) RecordOutcome(queryType string, confidence float64, success bool) error
+func (c *ConfidenceCalibrator) GetCalibrationReport() *CalibrationReport
+```
+
+#### Librarian Pattern Evolution Tracking Protocol
+**Acceptance Criteria:**
+- [ ] Detect evolution: old pattern in N files, new pattern in M files
+- [ ] Evolution states: ESTABLISHED (>90%), TRANSITIONAL (both >10%), EMERGING (<10% new), DEPRECATED (<10% old)
+- [ ] TRANSITIONAL response: old pattern, new pattern, counts, recommendation
+- [ ] Track migration_progress = M/(N+M)
+- [ ] Warn consumers about transitional patterns
+
+**Implementation Guide:**
+```go
+type PatternEvolutionTracker struct{}
+
+func (t *PatternEvolutionTracker) DetectEvolution(ctx context.Context, pattern string) *EvolutionState
+func (t *PatternEvolutionTracker) GetRecommendation(state *EvolutionState) string
+```
+
+#### Librarian Index Health Monitoring Protocol
+**Acceptance Criteria:**
+- [ ] Health metrics: FRESHNESS (time since update), COVERAGE (% indexed), LATENCY (query time), ACCURACY (feedback), SIZE (vs expected)
+- [ ] Thresholds: FRESHNESS >24h=WARN >72h=CRITICAL, COVERAGE <80%=WARN <50%=CRITICAL, LATENCY >500ms=WARN >2s=CRITICAL
+- [ ] Health states: HEALTHY, DEGRADED (1-2 out of range), UNHEALTHY (3+), CRITICAL
+- [ ] Degraded actions: reindex, scan unindexed, alert for optimization, review feedback
+- [ ] Periodic health check report
+
+**Implementation Guide:**
+```go
+type IndexHealthMonitor struct {
+    vectorDB VectorDBClient
+}
+
+func (m *IndexHealthMonitor) CheckHealth(ctx context.Context) *IndexHealthReport
+func (m *IndexHealthMonitor) GetRecommendedAction(report *IndexHealthReport) HealthAction
+```
+
+### Archivalist: Additional Discipline Protocols
+
+**Files to modify:**
+- `agents/archivalist/knowledge_decay.go` (new)
+- `agents/archivalist/cross_session_promotion.go` (new)
+- `agents/archivalist/conflict_resolution.go` (new)
+- `agents/archivalist/retrieval_feedback.go` (new)
+
+#### Archivalist Knowledge Decay Protocol
+**Acceptance Criteria:**
+- [ ] Time decay weights: <1w=1.0, 1-4w=0.8, 1-3m=0.6, 3-6m=0.4, 6-12m=0.2, >12m=0.1
+- [ ] Modifiers: HIGH_VALUE x1.5, REINFORCED x2.0, CONTRADICTED x0.5, DEPRECATED x0.1
+- [ ] Query results ordered by: relevance * decay_weight * modifier
+- [ ] Response annotation with decay info
+- [ ] Old entries: >6m=AGING flag, >12m=VERIFY warning, >24m=archive to cold storage
+
+**Implementation Guide:**
+```go
+type KnowledgeDecay struct{}
+
+func (d *KnowledgeDecay) CalculateWeight(entry *Entry) float64
+func (d *KnowledgeDecay) GetModifier(entry *Entry) float64
+func (d *KnowledgeDecay) OrderResults(results []*Entry) []*Entry
+```
+
+#### Archivalist Cross-Session Promotion Protocol
+**Acceptance Criteria:**
+- [ ] Auto-promote when: 2+ session success, 3+ same-session success, marked best practice, recurring failure
+- [ ] Promotion levels: SESSION_LOCAL, PROJECT_WIDE, GLOBAL, PINNED
+- [ ] Promotion log: pattern_id, promoted_from, promoted_to, reason, success_count
+- [ ] Demotion: if >30% failure rate post-promotion, demote one level with context note
+
+**Implementation Guide:**
+```go
+type PromotionManager struct {
+    archivalistClient ArchivalistClient
+}
+
+func (m *PromotionManager) ShouldPromote(entry *Entry) (bool, PromotionLevel, string)
+func (m *PromotionManager) Promote(entry *Entry, level PromotionLevel) error
+func (m *PromotionManager) CheckForDemotion(entry *Entry) (bool, string)
+```
+
+#### Archivalist Conflict Detection & Resolution Protocol
+**Acceptance Criteria:**
+- [ ] Conflict types: DIRECT_CONTRADICTION, RECOMMENDATION_CONFLICT, CONTEXT_OVERLAP, VERSION_CONFLICT
+- [ ] Detection on store: similar signature (>0.8) + different recommendations
+- [ ] Resolution strategies: NEWER_WINS, CONTEXT_SPLIT, MERGE, FLAG_FOR_REVIEW, KEEP_BOTH
+- [ ] Conflict record: conflict_id, type, entry_a, entry_b, resolution, resolution_note
+- [ ] Surface conflict note when returning conflicting entries
+
+**Implementation Guide:**
+```go
+type ConflictResolver struct{}
+
+func (r *ConflictResolver) DetectConflict(newEntry *Entry, existing []*Entry) *Conflict
+func (r *ConflictResolver) Resolve(conflict *Conflict) (*Resolution, error)
+```
+
+#### Archivalist Retrieval Quality Feedback Loop Protocol
+**Acceptance Criteria:**
+- [ ] Positive signals: used successfully, warning heeded, resolution worked
+- [ ] Negative signals: "not relevant", pattern failed, resolution didn't work, follow-up needed
+- [ ] Actions: POSITIVE=boost weight, NOT_RELEVANT=add negative example, DIDNT_WORK=reduce weight, INCOMPLETE=add cross-refs
+- [ ] Quality metrics: total_retrievals, positive_feedback, negative_feedback, quality_score, trend
+- [ ] Self-improvement loop: collect → analyze → adjust → measure → repeat
+
+**Implementation Guide:**
+```go
+type RetrievalFeedbackLoop struct {
+    archivalistClient ArchivalistClient
+}
+
+func (l *RetrievalFeedbackLoop) RecordFeedback(entryID string, feedback FeedbackType) error
+func (l *RetrievalFeedbackLoop) GetQualityMetrics() *QualityMetrics
+func (l *RetrievalFeedbackLoop) TriggerImprovement() error
+```
+
+### Orchestrator: Additional Discipline Protocols
+
+**Files to modify:**
+- `core/orchestrator/anomaly_detection.go` (new)
+- `core/orchestrator/pipeline_health.go` (new)
+- `core/orchestrator/completion_verification.go` (new)
+- `core/orchestrator/graceful_degradation.go` (new)
+
+#### Orchestrator Execution Anomaly Detection Protocol
+**Acceptance Criteria:**
+- [ ] Anomaly types: TIME_ANOMALY (>3x expected), ERROR_SPIKE (>50%), TOOL_LOOP (>5x same), RESOURCE_EXHAUSTION, STALL_DETECTED (>2min), DEPENDENCY_TIMEOUT (>5min)
+- [ ] Detection thresholds configurable
+- [ ] Alert actions: WARN (log), ALERT (notify Architect), ESCALATE (pause), AUTO_CANCEL (timeout)
+- [ ] Anomaly report: anomaly_id, type, task_id, severity, details, action_taken, architect_notified
+
+**Implementation Guide:**
+```go
+type AnomalyDetector struct {
+    thresholds AnomalyThresholds
+}
+
+func (d *AnomalyDetector) Monitor(ctx context.Context, task *Task) <-chan *Anomaly
+func (d *AnomalyDetector) GetAction(anomaly *Anomaly) AnomalyAction
+```
+
+#### Orchestrator Pipeline Health Monitoring Protocol
+**Acceptance Criteria:**
+- [ ] Health metrics: THROUGHPUT (tasks/time), PROGRESS_RATE, ERROR_RATIO, RETRY_RATIO, BOTTLENECK, RESOURCE_UTILIZATION
+- [ ] Health states: HEALTHY, DEGRADED (1-2 out), UNHEALTHY (3+), CRITICAL
+- [ ] Check frequency: every task completion, every 30s, on anomaly
+- [ ] Health report with metrics, status, bottleneck, recommendation
+- [ ] Report to Architect when health degrades
+
+**Implementation Guide:**
+```go
+type PipelineHealthMonitor struct{}
+
+func (m *PipelineHealthMonitor) CheckHealth(pipeline *Pipeline) *PipelineHealthReport
+func (m *PipelineHealthMonitor) GetRecommendation(report *PipelineHealthReport) string
+```
+
+#### Orchestrator Completion Verification Protocol
+**Acceptance Criteria:**
+- [ ] Verification checks: ARTIFACT_EXISTS, NO_ERROR_INDICATORS, DOWNSTREAM_READY, EVIDENCE_STORED, AGENT_CONFIRMED
+- [ ] False completion indicators: "done" but no changes, build/test failing, files missing, errors in output
+- [ ] Workflow: agent signals → run checks → VERIFIED or FALSE_COMPLETION
+- [ ] FALSE_COMPLETION alerts Architect immediately
+- [ ] Verification report: task_id, signaled_complete, verification_result, checks, failure_reason
+
+**Implementation Guide:**
+```go
+type CompletionVerifier struct{}
+
+func (v *CompletionVerifier) Verify(ctx context.Context, task *Task) *VerificationResult
+func (v *CompletionVerifier) IsFalseCompletion(result *VerificationResult) bool
+```
+
+#### Orchestrator Graceful Degradation Protocol
+**Acceptance Criteria:**
+- [ ] Triggers: TASK_FAILURE, BRANCH_FAILURE, AGENT_UNAVAILABLE, RESOURCE_EXHAUSTED, TIMEOUT
+- [ ] Actions: ISOLATE (mark failed), CONTINUE (independent branches), PARTIAL_COMPLETE, INFORM
+- [ ] Isolation rules: failed → cancel dependents, independent → continue, downstream → BLOCKED
+- [ ] Partial completion report: workflow_id, status=PARTIAL, completed_branches, failed_branches, blocked_tasks, salvageable_work, artifacts_produced
+- [ ] User communication: clear partial results, offer to proceed
+
+**Implementation Guide:**
+```go
+type GracefulDegradation struct{}
+
+func (g *GracefulDegradation) OnFailure(ctx context.Context, task *Task) *DegradationPlan
+func (g *GracefulDegradation) IsolateBranch(branch *Branch) error
+func (g *GracefulDegradation) GeneratePartialReport(workflow *Workflow) *PartialCompletionReport
+```
+
 ---
 
 ## Enhanced Agent Skills (Inspired by oh-my-opencode & opencode)
@@ -1621,6 +2407,636 @@ Phase 3 (AFTER Phase 2):
 - [ ] `ask_user_question` for clarification requests
 - [ ] Multi-option question support
 - [ ] Integration with plan mode workflow
+
+---
+
+## FILESYSTEM Versioning System (MVCC + OT + AST-Aware VFS)
+
+**Reference**: See `FILESYSTEM.md` for detailed architecture specification and `FILESYSTEM_TASKS.md` for complete task breakdown.
+
+This system provides robust file versioning for multi-agent concurrent editing with:
+- **Multi-Version Concurrency Control (MVCC)**: Version DAG with content-addressable storage
+- **Operational Transformation (OT)**: Automatic conflict resolution for concurrent edits
+- **AST-Aware Targeting**: Stable node paths instead of brittle line numbers
+- **Dual VFS**: Pre-change snapshot + working VFS for isolation and instant rollback
+- **Cross-Session Coordination**: File change signals and lock coordination
+
+### FILESYSTEM Phase 1: Foundation Data Structures
+
+**Files to create:**
+- `core/versioning/version_id.go`
+- `core/versioning/vector_clock.go`
+- `core/versioning/operation.go`
+- `core/versioning/target.go`
+- `core/versioning/file_version.go`
+
+**Parallelization Strategy:**
+```
+All items in Phase 1 can execute in parallel - no interdependencies.
+```
+
+**Acceptance Criteria:**
+
+#### FS.1.1 VersionID and Content-Addressable Hashing
+- [ ] `VersionID` type as `[32]byte` SHA-256 hash
+- [ ] `NewVersionID(content []byte) VersionID` - deterministic hash
+- [ ] `NewVersionIDFromMetadata` - includes parents and timestamp
+- [ ] `String()` returns 64-char lowercase hex
+- [ ] `Short()` returns first 8 chars for display
+- [ ] `ParseVersionID(s string)` round-trips correctly
+- [ ] JSON marshaling/unmarshaling
+- [ ] `NilVersion` and `IsNil()` support
+
+#### FS.1.2 Vector Clock for Causality Tracking
+- [ ] `VectorClock` maps `session.SessionID` → `uint64`
+- [ ] `Increment(sessionID)` returns new clock (immutable)
+- [ ] `Merge(other)` returns pointwise maximum
+- [ ] `HappensBefore(other)` for causal ordering
+- [ ] `Concurrent(other)` when neither precedes
+- [ ] `Clone()` creates independent copy
+- [ ] JSON serialization preserves all counts
+- [ ] Uses existing `session.SessionID` type
+
+#### FS.1.3 OperationID and Operation Types
+- [ ] `OperationID` as content-addressable `[32]byte`
+- [ ] `OpType`: Insert, Delete, Replace, Move
+- [ ] `Operation` struct with: ID, BaseVersion, FilePath, Target, Type, Content, OldContent
+- [ ] Includes: `pipeline.PipelineID`, `session.SessionID`, `AgentID`, `security.AgentRole`
+- [ ] `Invert()` for rollback (swap content/oldContent)
+- [ ] `RequiresRole()` returns minimum role for operation
+- [ ] `Sanitize(sanitizer)` redacts secrets before logging
+- [ ] `Validate()` checks operation integrity
+
+#### FS.1.4 AST-Aware Target
+- [ ] `Target` struct with NodePath, NodeType, NodeID
+- [ ] Offset fallback: StartOffset, EndOffset
+- [ ] Line info: StartLine, EndLine
+- [ ] `IsASTBased()` checks targeting mode
+- [ ] `Overlaps(other)` handles AST parent/child relationships
+- [ ] `Contains(other)` for strict containment
+- [ ] `IsAncestorOf` / `IsDescendantOf` for AST hierarchy
+- [ ] `Shift(lineDelta, offsetDelta)` adjusts offsets
+- [ ] `NodePathString()` returns dotted path representation
+
+#### FS.1.5 FileVersion
+- [ ] `FileVersion` struct: ID, FilePath, Parents, Operations, ContentHash, ContentSize
+- [ ] Includes: Clock, Timestamp, PipelineID, SessionID, IsMerge
+- [ ] Variant support: VariantGroupID, VariantLabel
+- [ ] `NewFileVersion()`, `NewMergeVersion()`, `NewVariantVersion()` constructors
+- [ ] `IsRoot()`, `HasParent()`, `IsVariant()` helpers
+- [ ] References `pipeline.PipelineID` and `session.SessionID`
+
+---
+
+### FILESYSTEM Phase 2: Storage Layer
+
+**Files to create:**
+- `core/versioning/blob_store.go`
+- `core/versioning/operation_log.go`
+- `core/versioning/dag_store.go`
+- `core/versioning/wal.go`
+
+**Parallelization Strategy:**
+```
+├── 2A: BlobStore (depends: FS.1.1)                 ─┐
+├── 2B: OperationLog (depends: FS.1.3)               │ PARALLEL
+├── 2C: DAGStore (depends: FS.1.5)                   │
+└── 2D: WAL (depends: none, but used by 2A-2C)     ─┘
+```
+
+**Acceptance Criteria:**
+
+#### FS.2.1 Content-Addressable Blob Store
+- [ ] `BlobStore` interface: Put, PutStream, Get, GetReader, Has, Delete, Size, Stats, GC
+- [ ] `MemoryBlobStore` implementation
+- [ ] `FileBlobStore` with path structure: `<base>/<first 2 chars>/<next 2 chars>/<full hash>`
+- [ ] Content deduplication (same content = same hash)
+- [ ] Thread-safe for concurrent access
+- [ ] Follows `FilesystemConfig` patterns from ARCHITECTURE.md
+- [ ] Integrates with `AuditLog` for tracking
+
+#### FS.2.2 Operation Log
+- [ ] `OperationLog` interface: Append, Get, GetByPosition, Range
+- [ ] Query methods: OperationsSince, OperationsForSession, OperationsForPipeline
+- [ ] Indexes by ID, file path, session, pipeline
+- [ ] `MemoryOperationLog` and `FileOperationLog` implementations
+- [ ] WAL integration for durability
+- [ ] Thread-safe for concurrent append/read
+
+#### FS.2.3 Version DAG Store
+- [ ] `DAGStore` interface: PutVersion, GetVersion, GetHead, SetHead
+- [ ] Query methods: GetHistory, GetAncestors, GetCommonAncestor, GetChildren
+- [ ] Session/Pipeline/VariantGroup queries
+- [ ] `MemoryDAGStore` and `PersistentDAGStore` implementations
+- [ ] Thread-safe, survives restarts
+
+#### FS.2.4 Write-Ahead Log
+- [ ] `WAL` interface: Append, Sync, Replay, Checkpoint, Close
+- [ ] `WALEntry` with Type, Timestamp, SeqNum, SessionID, Data, Checksum
+- [ ] Entry types: Operation, Version, HeadUpdate, Blob, Checkpoint
+- [ ] Segment rotation (default 64MB)
+- [ ] CRC32 checksums for corruption detection
+- [ ] `WALRecovery` for crash recovery
+
+---
+
+### FILESYSTEM Phase 3: Virtual File System
+
+**Files to create:**
+- `core/versioning/vfs.go`
+- `core/versioning/vfs_manager.go`
+
+**Dependencies:** Phase 2 complete
+
+**Acceptance Criteria:**
+
+#### FS.3.1 VFS (Virtual File System)
+- [ ] `VFS` interface extends existing `VirtualFilesystem` patterns
+- [ ] Core ops: Read, Write, Delete, Exists, List
+- [ ] Versioned ops: ReadAt(version), History, Diff
+- [ ] Transaction support: BeginTransaction, Commit, Rollback
+- [ ] `PipelineVFS` scoped to pipeline with:
+  - [ ] Security: `PermissionManager`, `SecretSanitizer`, `AgentRole` checks
+  - [ ] Path validation via existing `VirtualFilesystem.ValidatePath`
+  - [ ] Staging directory isolation
+  - [ ] CVS integration for version coordination
+- [ ] `FileModification` tracking (OriginalPath, StagingPath, Operation, Timestamp, ContentHash, BaseVersion)
+- [ ] `FileDiff` with hunks for version comparison
+
+#### FS.3.2 Pipeline VFS Manager
+- [ ] `VFSManager` interface for managing VFS instances
+- [ ] `CreatePipelineVFS(cfg)`, `GetPipelineVFS(id)`, `ClosePipelineVFS(id)`
+- [ ] Variant group support:
+  - [ ] `CreateVariantGroup(cfg)` - from Pipeline Variants architecture
+  - [ ] `AddVariantToGroup(groupID, variantID, cfg)`
+  - [ ] `SelectVariant(groupID, variantID)` - commits chosen variant
+  - [ ] `CancelVariantGroup(groupID)`
+- [ ] Session queries: `GetSessionVFSes(sessionID)`
+- [ ] Cleanup: `CleanupSession`, `CleanupStaging`
+- [ ] Integrates with `pipeline.VariantGroup`
+
+---
+
+### FILESYSTEM Phase 4: Operational Transformation Engine
+
+**Files to create:**
+- `core/versioning/diff.go`
+- `core/versioning/ot.go`
+- `core/versioning/conflict_ui.go`
+
+**Dependencies:** Phase 1 complete
+
+**Parallelization Strategy:**
+```
+├── 4A: Diff Algorithm (depends: FS.1.4)            ─┐
+├── 4B: OT Engine (depends: FS.1.3, 4A)              │ SEQUENTIAL
+└── 4C: Conflict UI (depends: 4B, Guide)            ─┘
+```
+
+**Acceptance Criteria:**
+
+#### FS.4.1 Diff Algorithm
+- [ ] `Differ` interface: DiffBytes, DiffVersions, ToOperations, FromOperations
+- [ ] `MyersDiffer` with configurable context lines
+- [ ] `ASTDiffer` for semantic diffs
+- [ ] `ASTDiff` with changes: Added, Removed, Modified, Moved
+- [ ] Operations can reconstruct target from base
+
+#### FS.4.2 Operational Transformation
+- [ ] `OTEngine` interface: Transform, TransformBatch, Compose, CanMergeAutomatically, DetectConflict
+- [ ] Transform matrix for all operation type pairs
+- [ ] `Conflict` struct with Op1, Op2, Type, Description, Resolutions
+- [ ] Conflict types: OverlappingEdit, DeleteEdit, MoveEdit, SemanticConflict
+- [ ] `Resolution` with Label, Description, ResultOp
+- [ ] Transform is symmetric (convergent)
+
+#### FS.4.3 Conflict Resolution UI Integration
+- [ ] `ConflictResolver` interface: ResolveConflict, ResolveConflictBatch, AutoResolve
+- [ ] `GuideConflictResolver` routes through Guide
+- [ ] Auto-resolve policies: None, KeepNewest, KeepOldest, KeepBoth
+- [ ] `ConflictMessage` and `ConflictResponse` for Guide communication
+- [ ] Signal: CONFLICT_DETECTED for pipeline handling
+
+---
+
+### FILESYSTEM Phase 5: Central Version Store (CVS)
+
+**Files to create:**
+- `core/versioning/cvs.go`
+
+**Dependencies:** Phases 2, 3, 4 complete
+
+**Acceptance Criteria:**
+
+#### FS.5.1 Central Version Store
+- [ ] `CVS` interface - main coordinator for all versioning
+- [ ] File operations: Read, Write, Delete (versioned)
+- [ ] Version queries: GetVersion, GetHead, GetHistory
+- [ ] Pipeline operations:
+  - [ ] `BeginPipeline(cfg)` returns `PipelineVFS`
+  - [ ] `CommitPipeline(pipelineID)` creates new versions
+  - [ ] `RollbackPipeline(pipelineID)` discards changes
+- [ ] Merge operations: `Merge`, `ThreeWayMerge` with OT
+- [ ] Cross-session coordination:
+  - [ ] `AcquireFileLock(filePath, sessionID)` / `ReleaseFileLock`
+  - [ ] File locks with timeout to prevent deadlocks
+- [ ] Variant operations:
+  - [ ] `BeginVariantGroup`, `AddVariant`, `SelectVariant`
+- [ ] Subscriptions for file changes:
+  - [ ] `Subscribe(filePath, sessionID, callback)` / `Unsubscribe`
+- [ ] Security checks via `PermissionManager` and `SecretSanitizer`
+- [ ] WAL integration for crash recovery
+- [ ] `CVSStats`: TotalFiles, TotalVersions, TotalOperations, ActivePipelines, ActiveVariants, ActiveLocks
+
+---
+
+### FILESYSTEM Phase 6: Pipeline Integration
+
+**Files to create:**
+- `core/pipeline/vfs_integration.go`
+- `core/session/pipeline_scheduler_vfs.go`
+
+**Dependencies:** Phase 5 complete, existing Pipeline architecture
+
+**Acceptance Criteria:**
+
+#### FS.6.1 Integrate VFS with Pipeline Runner
+- [ ] `PipelineVFSIntegration` struct
+- [ ] `SetupPipeline(p *Pipeline)` creates VFS on pipeline creation
+- [ ] `TeardownPipeline(p, success)` commits/rolls back
+- [ ] Engineer file operations route through VFS
+- [ ] Updated engineer skills use VFS
+
+#### FS.6.2 Integrate with Pipeline Scheduler
+- [ ] `PipelineSchedulerVFS` extends existing scheduler
+- [ ] File dependency tracking per task
+- [ ] Write-write conflict detection: `DetectFileConflicts(tasks)`
+- [ ] Conflicting tasks serialized (not parallel)
+- [ ] VFS setup/teardown in task lifecycle
+
+---
+
+### FILESYSTEM Phase 7: Cross-Session Coordination
+
+**Files to create:**
+- `core/session/signal_dispatcher_vfs.go`
+- `core/session/cross_session_pool_vfs.go`
+
+**Dependencies:** Phase 5 complete, existing session infrastructure
+
+**Acceptance Criteria:**
+
+#### FS.7.1 Signal Dispatcher for File Changes
+- [ ] File change signals: FILE_CREATED, FILE_MODIFIED, FILE_DELETED
+- [ ] Lock signals: FILE_LOCKED, FILE_UNLOCKED
+- [ ] Conflict signal: MERGE_CONFLICT
+- [ ] `FileChangeSignal` with FilePath, OldVersion, NewVersion, ChangedBy
+- [ ] `BroadcastFileChange(signal)` to interested sessions
+- [ ] `SubscribeFileChanges(sessionID, patterns)` with glob support
+
+#### FS.7.2 Cross-Session Pool for File Coordination
+- [ ] `CrossSessionPoolVFS` extends existing pool
+- [ ] `AcquireFileAccess(sessionID, files, mode)` - read/write locks
+- [ ] `ReleaseFileAccess(locks)`
+- [ ] Read access allows concurrent reads
+- [ ] Write access is exclusive
+- [ ] `GetFileOwners(files)` returns lock holders
+- [ ] Coordinated operations with automatic lock management
+
+---
+
+### FILESYSTEM Phase 8: Tree-Sitter Parsing Infrastructure
+
+**Overview:** Pure Go tree-sitter integration using purego for cgo-free dynamic library loading.
+Provides universal AST parsing for 30+ languages with incremental parsing and user-extensible grammar support.
+
+**Files to create:**
+- `core/treesitter/bindings.go` (purego bindings)
+- `core/treesitter/types.go` (high-level Go types)
+- `core/treesitter/parser.go` (Parser implementation)
+- `core/treesitter/tree.go` (Tree/Node implementation)
+- `core/treesitter/query.go` (Query/Cursor implementation)
+- `core/treesitter/registry.go` (Grammar registry)
+- `core/treesitter/downloader.go` (Grammar installation)
+- `core/treesitter/manager.go` (CVS integration)
+- `core/treesitter/tool.go` (Agent tool interface)
+- `core/treesitter/skills/` (Agent-specific skills)
+
+**Parallelization Strategy:**
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     TREE-SITTER IMPLEMENTATION PHASES                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  TS PHASE 1 (All parallel - foundation):                                 │
+│  ├── TS.1.1: Purego Bindings (libtree-sitter.so)                         │
+│  ├── TS.1.2: High-Level Go Types                                         │
+│  └── TS.1.3: Grammar Registry (known languages)                          │
+│                                                                          │
+│  TS PHASE 2 (After Phase 1, parallel):                                   │
+│  ├── TS.2.1: Parser Implementation                                       │
+│  ├── TS.2.2: Tree/Node Implementation                                    │
+│  ├── TS.2.3: Query Engine                                                │
+│  └── TS.2.4: Grammar Downloader                                          │
+│                                                                          │
+│  TS PHASE 3 (After Phase 2):                                             │
+│  └── TS.3.1: TreeSitterManager (CVS integration)                         │
+│                                                                          │
+│  TS PHASE 4 (After Phase 3, parallel):                                   │
+│  ├── TS.4.1: TreeSitterTool (agent interface)                            │
+│  ├── TS.4.2: Librarian Skills                                            │
+│  ├── TS.4.3: Engineer Skills                                             │
+│  ├── TS.4.4: Inspector Skills                                            │
+│  ├── TS.4.5: Tester Skills                                               │
+│  └── TS.4.6: Designer Skills                                             │
+│                                                                          │
+│  TS PHASE 5 (After Phase 4):                                             │
+│  ├── TS.5.1: CLI Commands                                                │
+│  └── TS.5.2: Setup Integration                                           │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Acceptance Criteria:**
+
+---
+
+#### TS.1.1 Purego Bindings
+- [ ] `purego.Dlopen` for libtree-sitter.so/.dylib
+- [ ] Core type bindings: `TSParser`, `TSTree`, `TSNode`, `TSLanguage`
+- [ ] Query types: `TSQuery`, `TSQueryCursor`, `TSQueryMatch`
+- [ ] Function bindings via `purego.RegisterLibFunc`:
+  - [ ] `ts_parser_new`, `ts_parser_delete`
+  - [ ] `ts_parser_set_language`, `ts_parser_parse_string`
+  - [ ] `ts_tree_root_node`, `ts_tree_delete`
+  - [ ] `ts_node_*` functions (type, string, child, next_sibling, etc.)
+  - [ ] `ts_query_new`, `ts_query_cursor_*` functions
+- [ ] Platform detection (darwin/linux/windows) for library loading
+- [ ] Error handling for missing library with clear instructions
+
+#### TS.1.2 High-Level Go Types
+- [ ] `Parser` struct wrapping `TSParser`
+- [ ] `Language` struct wrapping `TSLanguage`
+- [ ] `Tree` struct with Root(), Edit(), Copy()
+- [ ] `Node` struct with Type(), Text(), Children(), Range(), etc.
+- [ ] `Point` struct (Row, Column)
+- [ ] `Range` struct (StartPoint, EndPoint, StartByte, EndByte)
+- [ ] `InputEdit` for incremental parsing
+- [ ] Memory management with finalizers
+
+#### TS.1.3 Grammar Registry
+- [ ] `GrammarInfo` struct: Name, Extensions, RepoURL, QueryPatterns
+- [ ] `KnownGrammars` map with 30+ languages:
+  - [ ] Go, Rust, Python, JavaScript, TypeScript, Ruby, Java, C, C++
+  - [ ] HTML, CSS, JSON, YAML, TOML, Markdown, SQL, Bash
+  - [ ] Swift, Kotlin, Scala, Haskell, OCaml, Lua, Zig, Odin
+  - [ ] JSX, TSX, Vue, Svelte, Dockerfile, Terraform, GraphQL
+- [ ] `GetGrammarForFile(path)` returns GrammarInfo
+- [ ] `GetGrammarByName(name)` returns GrammarInfo
+- [ ] `ListKnownGrammars()` returns all available
+- [ ] `ListInstalledGrammars()` returns locally available
+
+---
+
+#### TS.2.1 Parser Implementation
+- [ ] `NewParser()` creates parser with default options
+- [ ] `SetLanguage(lang)` configures parser for language
+- [ ] `Parse(source []byte)` returns Tree
+- [ ] `ParseIncremental(oldTree, newSource, edit)` for incremental parsing
+- [ ] `SetTimeout(micros)` for parsing timeout
+- [ ] `SetIncludedRanges(ranges)` for partial parsing
+- [ ] Thread-safe parsing (one parser per goroutine)
+- [ ] Automatic language detection from file extension
+
+#### TS.2.2 Tree/Node Implementation
+- [ ] `Tree.RootNode()` returns root Node
+- [ ] `Tree.Edit(edit)` updates tree for incremental parsing
+- [ ] `Tree.Walk()` returns TreeCursor for traversal
+- [ ] `Node.Type()` returns node type string
+- [ ] `Node.Text()` returns node source text
+- [ ] `Node.Children()` returns child nodes
+- [ ] `Node.Parent()` returns parent node
+- [ ] `Node.NextSibling()`, `Node.PrevSibling()`
+- [ ] `Node.ChildByFieldName(name)` for named fields
+- [ ] `Node.Range()` returns byte range
+- [ ] `Node.StartPoint()`, `Node.EndPoint()` for position
+- [ ] `Node.IsNamed()`, `Node.IsMissing()`, `Node.IsExtra()`
+- [ ] Stable node path generation: `func.HandleRequest.body.if[0]`
+
+#### TS.2.3 Query Engine
+- [ ] `Query` struct for S-expression patterns
+- [ ] `NewQuery(language, pattern)` compiles query
+- [ ] `Query.CaptureNames()` returns capture names
+- [ ] `QueryCursor` for executing queries
+- [ ] `cursor.Exec(query, node)` starts matching
+- [ ] `cursor.NextMatch()` iterates matches
+- [ ] `QueryMatch` with Captures slice
+- [ ] `QueryCapture` with Node and Name
+- [ ] Predicate support: `#eq?`, `#match?`, `#not-eq?`
+- [ ] Common query patterns for each language in registry
+
+#### TS.2.4 Grammar Downloader
+- [ ] `GrammarDownloader` struct with data directory config
+- [ ] `IsInstalled(name)` checks local availability
+- [ ] `Download(name)` fetches prebuilt binary or source
+- [ ] Platform-specific binary selection (darwin-arm64, linux-amd64, etc.)
+- [ ] Fallback to source compilation if prebuilt unavailable
+- [ ] `InstallFromSource(repoURL)` clones and compiles
+- [ ] `GetLibraryPath(name)` returns path to .so/.dylib
+- [ ] Progress reporting via callback
+- [ ] Checksum verification for downloads
+- [ ] Installation state machine:
+  - [ ] NOT_INSTALLED → DOWNLOADING → VERIFYING → INSTALLED
+  - [ ] DOWNLOADING → FAILED (with retry logic)
+  - [ ] NOT_INSTALLED → COMPILING → INSTALLED (source fallback)
+
+---
+
+#### TS.3.1 TreeSitterManager (CVS Integration)
+- [ ] `TreeSitterManager` struct with Parser pool
+- [ ] `ComputeNodePath(tree, offset)` returns stable AST path
+- [ ] `ResolveNodePath(tree, path)` finds node from path
+- [ ] `ParseIncremental(oldVersion, newContent, edit)` returns new Tree
+- [ ] `GetEditFromOperation(op)` converts VFS operation to InputEdit
+- [ ] Integration with `Target` struct from FS.1.4:
+  - [ ] `Target.NodePath` populated by ComputeNodePath
+  - [ ] `Target.NodeType` from tree-sitter node type
+- [ ] Caching of parsed trees per FileVersion
+- [ ] Automatic language detection from file extension
+- [ ] Fallback to offset-based targeting for unknown languages
+
+---
+
+#### TS.4.1 TreeSitterTool (Agent Interface)
+- [ ] `TreeSitterTool` implements `Tool` interface
+- [ ] Registered as `ts_*` skill family
+- [ ] Operations:
+  - [ ] `parse` - Parse file and return AST
+  - [ ] `query` - Execute S-expression query
+  - [ ] `find_node` - Find node at position or path
+  - [ ] `extract_symbols` - Get all definitions
+  - [ ] `get_node_path` - Get stable path for node
+- [ ] Automatic grammar installation on first use
+- [ ] Permission: Read (file access for parsing)
+- [ ] Output format: JSON with node details
+
+#### TS.4.2 Librarian Tree-Sitter Skills
+- [ ] `ts_parse` - Parse file and cache AST
+- [ ] `ts_query` - Execute pattern query
+- [ ] `ts_find_functions` - Find function definitions
+- [ ] `ts_find_types` - Find type/class/interface definitions
+- [ ] `ts_find_imports` - Find import statements
+- [ ] `ts_find_references` - Find symbol references
+- [ ] `ts_extract_symbols` - Extract all symbols with metadata
+- [ ] Integration with indexing for semantic search
+
+#### TS.4.3 Engineer Tree-Sitter Skills
+- [ ] `ts_parse` - Parse for structure understanding
+- [ ] `ts_rename_symbol` - Find all occurrences for rename
+- [ ] `ts_extract_function` - Identify extractable code blocks
+- [ ] `ts_find_edit_targets` - Get stable targets for edits
+- [ ] `ts_get_node_at` - Get node at cursor position
+- [ ] Integration with versioned_write_file for AST-aware edits
+
+#### TS.4.4 Inspector Tree-Sitter Skills
+- [ ] `ts_complexity_analysis` - Calculate cyclomatic complexity
+- [ ] `ts_find_code_smells` - Detect patterns like deep nesting
+- [ ] `ts_validate_structure` - Check AST for errors
+- [ ] `ts_count_nodes` - Count nodes by type (metrics)
+- [ ] `ts_parse_errors` - Find syntax errors and recovery points
+- [ ] Integration with 8-Phase Validation System
+
+#### TS.4.5 Tester Tree-Sitter Skills
+- [ ] `ts_discover_tests` - Find test functions/classes
+- [ ] `ts_find_testable_functions` - Identify untested functions
+- [ ] `ts_analyze_test_structure` - Analyze test organization
+- [ ] `ts_find_assertions` - Find assertion statements
+- [ ] `ts_match_tests_to_functions` - Map tests to implementations
+- [ ] Integration with 6-Category Test System
+
+#### TS.4.6 Designer Tree-Sitter Skills
+- [ ] `ts_extract_components` - Find React/Vue/Svelte components
+- [ ] `ts_analyze_jsx` - Analyze JSX structure
+- [ ] `ts_find_styles` - Find CSS-in-JS/styled components
+- [ ] `ts_extract_props` - Extract component props/interfaces
+- [ ] `ts_find_hooks` - Find React hooks usage
+- [ ] `ts_analyze_accessibility` - Find a11y attributes
+
+---
+
+#### TS.5.1 CLI Commands
+- [ ] `sylk grammar list` - Show installed and available grammars
+- [ ] `sylk grammar install <name>` - Install grammar from registry
+- [ ] `sylk grammar add <repo-url>` - Add custom grammar
+- [ ] `sylk grammar validate <path>` - Validate grammar.yaml
+- [ ] `sylk grammar remove <name>` - Remove installed grammar
+- [ ] `sylk grammar info <name>` - Show grammar details
+- [ ] Output formatting with progress indicators
+
+#### TS.5.2 Setup Integration
+- [ ] `sylk setup` includes tree-sitter library installation
+- [ ] Automatic libtree-sitter download for platform
+- [ ] Default grammar set installation (Go, TS, Python, Rust)
+- [ ] User grammar directory creation (~/.sylk/grammars/)
+- [ ] Configuration file generation (grammar.yaml template)
+
+---
+
+#### TS.6.1 User-Defined Grammar Support
+- [ ] Grammar directory structure: `~/.sylk/grammars/<name>/`
+- [ ] `grammar.yaml` format:
+  ```yaml
+  name: mylang
+  extensions: [.ml, .mli]
+  library: parser.so      # or parser.dylib, parser.dll
+  queries:
+    highlights: queries/highlights.scm
+    locals: queries/locals.scm
+    tags: queries/tags.scm
+  ```
+- [ ] `~/.sylk/config.yaml` grammar paths configuration
+- [ ] Hot-reload support for grammar changes
+- [ ] Validation of grammar.yaml on load
+
+#### TS.6.2 Testing and Documentation
+- [ ] Unit tests for all purego bindings
+- [ ] Integration tests with real grammars
+- [ ] Benchmark: Parse time vs file size
+- [ ] Benchmark: Incremental vs full parse
+- [ ] Memory leak tests for tree lifecycle
+- [ ] Documentation: Adding new language support
+- [ ] Documentation: Query pattern cookbook
+- [ ] Example: Custom domain-specific language grammar
+
+---
+
+### FILESYSTEM Phase 9: Agent Skills and Hooks
+
+**Files to create:**
+- `core/versioning/skills.go`
+- `core/versioning/hooks.go`
+
+**Dependencies:** Phase 5 complete
+
+**Acceptance Criteria:**
+
+#### FS.9.1 Versioning Skills for Engineers
+- [ ] `versioned_read_file` - read at specific version or HEAD
+- [ ] `versioned_write_file` - creates new version with message
+- [ ] `versioned_file_history` - returns version list
+- [ ] `versioned_file_diff` - diff between versions
+- [ ] `versioned_rollback` - rollback to previous version
+- [ ] All skills respect `AgentRole` permissions
+- [ ] Replaces/extends existing engineer file skills
+
+#### FS.9.2 File Operation Hooks
+- [ ] `PreWriteHook` - validates permissions, sanitizes secrets, checks locks
+- [ ] `PostWriteHook` - records to Archivalist, updates session context, emits signals
+- [ ] `ConflictDetectionHook` - checks for concurrent modification
+- [ ] Integrates with existing hook system from ARCHITECTURE.md
+- [ ] Updates `SessionContext.ModifiedFiles`
+
+---
+
+### FILESYSTEM Phase 10-11: Testing and Documentation
+
+**Files to create:**
+- `core/versioning/integration_test.go`
+- `core/versioning/stress_test.go`
+- `docs/versioning.md`
+- `examples/versioning/`
+
+**Acceptance Criteria:**
+
+#### FS.10.1 Integration Test Framework
+- [ ] `TestHarness` with CVS, VFSManager, temp directory
+- [ ] Test scenarios: SinglePipelineWorkflow, ConcurrentPipelines, VariantWorkflow
+- [ ] Test scenarios: CrossSessionCoordination, ConflictResolution, CrashRecovery
+- [ ] 90%+ code coverage
+
+#### FS.10.2 Stress Tests
+- [ ] High concurrency: 10+ sessions, 100+ pipelines
+- [ ] Large files: 10MB+ without OOM
+- [ ] Many versions: 1000+ per file, stable performance
+- [ ] Benchmarks for Write, Read, Transform, GetHistory
+
+#### FS.11.1 Documentation
+- [ ] Architecture overview
+- [ ] API reference
+- [ ] Configuration options
+- [ ] Troubleshooting guide
+
+---
+
+### FILESYSTEM Security Compliance Checklist
+
+For each file operation task:
+- [ ] Uses `security.PermissionManager` for access control
+- [ ] Uses `security.AgentRole` for role-based permissions
+- [ ] Uses `security.SecretSanitizer` before logging/storing
+- [ ] Validates paths with `VirtualFilesystem.ValidatePath`
+- [ ] Respects `FilesystemConfig` boundaries
+- [ ] Records operations in audit log
 
 ---
 
@@ -3414,7 +4830,7 @@ type SessionContext interface {
 }
 ```
 
-### 0.2 DAG Engine
+### 0.2 DAG Engine (DONE)
 
 Executes directed acyclic graph workflows with parallel layer execution.
 
@@ -3483,7 +4899,7 @@ type NodeDispatcher interface {
 type DAGEventHandler func(event *DAGEvent)
 ```
 
-### 0.3 Worker Pool Enhancements
+### 0.3 Worker Pool Enhancements (DONE)
 
 Extend existing worker pool for multi-session fair scheduling.
 
@@ -6267,7 +7683,7 @@ CLI commands for viewing usage and attribution.
 
 ---
 
-### 0.17 Goroutine Model & Agent Lifecycle
+### 0.17 Goroutine Model & Agent Lifecycle (DONE)
 
 Implements the core goroutine architecture: one goroutine per standalone agent, one goroutine per pipeline.
 
@@ -6308,7 +7724,7 @@ Implements the core goroutine architecture: one goroutine per standalone agent, 
 
 ---
 
-### 0.18 Pipeline Scheduler
+### 0.18 Pipeline Scheduler (DONE)
 
 Implements N_CPU_CORES bounded pipeline scheduling with priority ordering.
 
@@ -6459,7 +7875,7 @@ Implements copy-on-write file staging for pipeline isolation.
 
 ---
 
-### 0.21 Adaptive Channels
+### 0.21 Adaptive Channels (DONE)
 
 Implements auto-resizing channels with overflow handling for user responsiveness.
 
@@ -17566,6 +18982,135 @@ func (o *Orchestrator) CommitVariant(groupID, variantID string) error {
 
 ---
 
+### 6.105B Mandatory User Selection Policy (CRITICAL)
+
+Enforces that user MUST explicitly select variant - no automatic selection permitted.
+
+**Files to create:**
+- `core/pipeline/variant_selection_policy.go`
+- `core/pipeline/variant_selection_policy_test.go`
+- `core/pipeline/variant_presentation.go`
+- `core/pipeline/variant_presentation_test.go`
+
+**Dependencies:** 6.101, 6.103, 6.104, 6.105
+
+**CRITICAL INVARIANT:** Automatic variant selection is PROHIBITED. User must always explicitly choose.
+
+**Acceptance Criteria:**
+
+#### Policy Enforcement
+- [ ] `VariantSelectionPolicy` struct with `AllowAutoSelect` field (MUST always be false)
+- [ ] `TimeoutAction` enum: `none` (wait forever) or `cancel` (discard all)
+- [ ] NO `select` option in `TimeoutAction` - intentionally omitted
+- [ ] `ValidatePolicy()` returns error if `AllowAutoSelect` is true
+- [ ] `ValidatePolicy()` returns error if `TimeoutAction` is anything other than `none` or `cancel`
+- [ ] Policy validation runs on every `WaitForUserSelection` call
+- [ ] Policy embedded in `VariantGroup` struct
+
+#### Blocking Behavior
+- [ ] `WaitForUserSelection(ctx, groupID)` blocks until user decision
+- [ ] Pipeline execution halts at variant gate (Inspector/Tester wait)
+- [ ] No partial commits allowed
+- [ ] Selection is atomic - one commits, all others discard
+- [ ] Context cancellation propagates correctly
+- [ ] Timeout with `cancel` action discards all variants
+
+#### Presentation Requirements
+- [ ] `presentVariantsToUser(group)` called automatically when all variants ready
+- [ ] Original implementation shown FIRST (always position [1])
+- [ ] Each variant displays:
+  - [ ] Approach summary (from Engineer pipeline context)
+  - [ ] Files modified list with (created/modified) annotations
+  - [ ] Lines changed (+added, -removed)
+  - [ ] Completion time
+  - [ ] Status (ready/failed)
+- [ ] Diff command shown: `/variants diff <group> 1 2`
+- [ ] Preview command shown: `/variants preview <group> 2`
+- [ ] Select command shown: `/variants select <group> 2`
+- [ ] Cancel command shown: `/variants cancel <group>`
+
+#### Informed Decision Support
+- [ ] `GetVariantSummary(groupID, variantID)` returns approach description
+- [ ] `GetVariantDiff(groupID, variantID)` returns diff from original
+- [ ] `GetVariantFiles(groupID, variantID)` returns modified files list
+- [ ] `CompareVariants(groupID, id1, id2)` returns side-by-side diff
+- [ ] Time taken displayed for performance comparison
+
+```go
+// VariantSelectionPolicy enforces mandatory user selection
+type VariantSelectionPolicy struct {
+    // AllowAutoSelect MUST be false - automatic selection is PROHIBITED
+    AllowAutoSelect bool `json:"allow_auto_select"` // ALWAYS false
+
+    // TimeoutAction can only be CANCEL or NONE, never SELECT
+    TimeoutAction   TimeoutAction `json:"timeout_action"`
+
+    // TimeoutDuration - 0 means wait indefinitely (default)
+    TimeoutDuration time.Duration `json:"timeout_duration"`
+}
+
+type TimeoutAction string
+
+const (
+    TimeoutActionNone   TimeoutAction = "none"   // Wait indefinitely (default)
+    TimeoutActionCancel TimeoutAction = "cancel" // Cancel group on timeout
+    // NOTE: No TimeoutActionSelect - intentionally omitted, PROHIBITED
+)
+
+// Validate ensures policy does not allow auto-select
+func (p *VariantSelectionPolicy) Validate() error {
+    if p.AllowAutoSelect {
+        return fmt.Errorf("POLICY VIOLATION: AllowAutoSelect must be false - user selection required")
+    }
+    if p.TimeoutAction != TimeoutActionNone && p.TimeoutAction != TimeoutActionCancel {
+        return fmt.Errorf("POLICY VIOLATION: TimeoutAction must be 'none' or 'cancel', got %q", p.TimeoutAction)
+    }
+    return nil
+}
+
+// VariantPresentation contains display info for user decision
+type VariantPresentation struct {
+    GroupID     string               `json:"group_id"`
+    TaskDesc    string               `json:"task_description"`
+    Status      VariantGroupStatus   `json:"status"`
+    Variants    []VariantDisplayInfo `json:"variants"`
+    Commands    []string             `json:"commands"`
+}
+
+type VariantDisplayInfo struct {
+    Position     int      `json:"position"`      // 1 = original, 2+ = variants
+    ID           string   `json:"id"`
+    Label        string   `json:"label"`         // "original" or "variant-N"
+    Approach     string   `json:"approach"`      // Engineer's approach description
+    FilesChanged []string `json:"files_changed"`
+    LinesAdded   int      `json:"lines_added"`
+    LinesRemoved int      `json:"lines_removed"`
+    TimeTaken    string   `json:"time_taken"`
+    Status       string   `json:"status"`        // "ready" or "failed"
+}
+```
+
+**Tests:**
+- [ ] Policy validation fails if `AllowAutoSelect` is true
+- [ ] Policy validation fails if `TimeoutAction` is not `none` or `cancel`
+- [ ] `WaitForUserSelection` blocks until selection received
+- [ ] `WaitForUserSelection` returns error on cancel
+- [ ] `WaitForUserSelection` cancels group on timeout with `cancel` action
+- [ ] `WaitForUserSelection` continues waiting on timeout with `none` action
+- [ ] Presentation includes original at position [1]
+- [ ] Presentation includes all variants with correct info
+- [ ] Diff between variants computed correctly
+- [ ] Commands displayed correctly
+
+**Implementation Guidelines:**
+1. Policy validation MUST run before any wait operation
+2. No configuration option to enable auto-select (intentionally absent)
+3. Default policy: `{AllowAutoSelect: false, TimeoutAction: "none", TimeoutDuration: 0}`
+4. Presentation format matches ARCHITECTURE.md specification
+5. Signal Guide when variants ready for notification aggregation
+
+---
+
 ### 6.106 Lazy Diff Computation and Cache
 
 On-demand diff computation with TTL caching.
@@ -19431,22 +20976,24 @@ type TaskEvent struct {
 3. **6.101 + 6.102** → **6.103** (Variant Injection) - Core injection logic
 4. **6.103** → **6.104** (Variant Cancellation) - Depends on injection
 5. **6.103 + 6.104** → **6.105** (Variant Selection/Commit) - Depends on both
-6. **6.101** → **6.106** (Lazy Diff Cache) - Only needs types
-7. **6.101** → **6.107** (Guide Signal Hub) - Only needs types
-8. **6.107** → **6.108** (Notification Aggregation) - Depends on signals
-9. **6.105 + 6.106** → **6.109** (CLI Commands) - Needs commit and diff
-10. **6.101** → **6.110** (Status Line) - Only needs types
-11. **6.103 + 6.105** → **6.111** (Layer Wait) - Needs injection and commit
-12. **All** → **6.112** (Integration Tests) - Validates entire system
+6. **6.105** → **6.105B** (Mandatory User Selection Policy) - CRITICAL: Enforces no auto-select
+7. **6.101** → **6.106** (Lazy Diff Cache) - Only needs types
+8. **6.101** → **6.107** (Guide Signal Hub) - Only needs types
+9. **6.107** → **6.108** (Notification Aggregation) - Depends on signals
+10. **6.105B + 6.106** → **6.109** (CLI Commands) - Needs policy and diff
+11. **6.101** → **6.110** (Status Line) - Only needs types
+12. **6.103 + 6.105B** → **6.111** (Layer Wait) - Needs injection and policy
+13. **All** → **6.112** (Integration Tests) - Validates entire system including policy enforcement
 
 **Parallel Execution Groups:**
 - Group A: 6.101, 6.102 (no dependencies)
 - Group B: 6.106, 6.107, 6.110 (only depend on 6.101)
 - Group C: 6.103 (depends on A)
 - Group D: 6.104, 6.108 (depend on C, B respectively)
-- Group E: 6.105, 6.111 (depend on C, D)
-- Group F: 6.109 (depends on E, B)
-- Group G: 6.112 (depends on all)
+- Group E: 6.105 (depends on C, D)
+- Group E2: 6.105B (depends on E) - CRITICAL: Must complete before CLI/Layer Wait
+- Group F: 6.109, 6.111 (depend on E2, B)
+- Group G: 6.112 (depends on all, validates policy enforcement)
 
 ---
 
@@ -19927,7 +21474,7 @@ type QueryResult struct {
 
 ---
 
-### 6.5 Mitigation 1: Hallucination Firewall
+### 6.5 Mitigation 1: Hallucination Firewall (DONE)
 
 Prevents storage of unverified LLM outputs to avoid contaminating the knowledge base.
 
@@ -20004,7 +21551,7 @@ type VerificationResult struct {
 
 ---
 
-### 6.6 Mitigation 2: Freshness Tracking & Decay
+### 6.6 Mitigation 2: Freshness Tracking & Decay (DONE)
 
 Tracks data freshness and applies temporal decay to prevent stale data from polluting results.
 
@@ -20084,7 +21631,7 @@ type FreshnessInfo struct {
 
 ---
 
-### 6.7 Mitigation 3: Source Attribution & Provenance
+### 6.7 Mitigation 3: Source Attribution & Provenance (DONE)
 
 Tracks the origin and verification chain for all stored information.
 
@@ -20161,7 +21708,7 @@ type ProvenanceChain struct {
 
 ---
 
-### 6.8 Mitigation 4: Trust Hierarchy
+### 6.8 Mitigation 4: Trust Hierarchy (DONE)
 
 Implements a trust scoring system that weights information by source reliability.
 
@@ -20248,7 +21795,7 @@ func (t *TrustHierarchy) Demote(nodeID string, reason string, actor string) erro
 
 ---
 
-### 6.9 Mitigation 5: Conflict Detection
+### 6.9 Mitigation 5: Conflict Detection (DONE)
 
 Detects and tracks contradictions between stored information.
 
@@ -20324,7 +21871,7 @@ func (d *ConflictDetector) AnnotateResults(results []*QueryResult) []*QueryResul
 
 ---
 
-### 6.10 Mitigation 6: Context Quality Scoring
+### 6.10 Mitigation 6: Context Quality Scoring (DONE)
 
 Optimizes context selection to maximize information density while minimizing token usage.
 
@@ -20418,7 +21965,7 @@ func (s *ContextQualityScorer) SelectContext(results []*QueryResult, budget int)
 
 ---
 
-### 6.11 Mitigation 7: LLM Prompt Engineering
+### 6.11 Mitigation 7: LLM Prompt Engineering (DONE)
 
 Implements structured context building for LLM prompts with explicit trust and conflict information.
 
@@ -20508,7 +22055,7 @@ func (c *LLMContext) FormatAsSystemPrompt() string
 
 ---
 
-### 6.12 Unified Query Resolution
+### 6.12 Unified Query Resolution (DONE)
 
 Integrates all components into a unified query resolution pipeline that **agents invoke via skills**.
 
@@ -21550,12 +23097,12 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ═══════════════════════════                                                         │
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 2A: DAG & Pipeline Execution                                      ││
-│ │ • 0.2 DAG Engine                                                                 ││
-│ │ • 0.3 Worker Pool Enhancements                                                   ││
-│ │ • 0.17 Goroutine Model & Agent Lifecycle                                         ││
-│ │ • 0.18 Pipeline Scheduler                                                        ││
-│ │ • 0.21 Adaptive Channels                                                         ││
+│ │ PARALLEL GROUP 2A: DAG & Pipeline Execution (DONE)                               ││
+│ │ • 0.2 DAG Engine (DONE)                                                          ││
+│ │ • 0.3 Worker Pool Enhancements (DONE)                                            ││
+│ │ • 0.17 Goroutine Model & Agent Lifecycle (DONE)                                  ││
+│ │ • 0.18 Pipeline Scheduler (DONE)                                                 ││
+│ │ • 0.21 Adaptive Channels (DONE)                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -21579,9 +23126,9 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 2D: VectorGraphDB Mitigations                                     ││
-│ │ • 6.5-6.11 All Mitigations (7 items, can parallelize)                            ││
-│ │ • 6.12 Unified Resolver (depends on 6.5-6.11)                                    ││
+│ │ PARALLEL GROUP 2D: VectorGraphDB Mitigations (DONE)                              ││
+│ │ • 6.5-6.11 All Mitigations (7 items, can parallelize) (DONE)                     ││
+│ │ • 6.12 Unified Resolver (depends on 6.5-6.11) (DONE)                             ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ESTIMATED CAPACITY: 18-22 parallel engineer pipelines                              │
@@ -21633,7 +23180,57 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • 0.66 Integrity Monitor                                                         ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 24-30 parallel engineer pipelines                              │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 3D: FILESYSTEM Versioning Foundation (FS Phases 1-2)              ││
+│ │ ** NEW: MVCC + OT + AST-Aware VFS Foundation **                                  ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - no interdependencies):                                   ││
+│ │ • FS.1.1 VersionID and Content-Addressable Hashing                               ││
+│ │ • FS.1.2 Vector Clock for Causality Tracking                                     ││
+│ │ • FS.1.3 OperationID and Operation Types                                         ││
+│ │ • FS.1.4 AST-Aware Target                                                        ││
+│ │ • FS.1.5 FileVersion                                                             ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After Phase 1, items parallel):                                         ││
+│ │ • FS.2.1 Content-Addressable Blob Store                                          ││
+│ │ • FS.2.2 Operation Log                                                           ││
+│ │ • FS.2.3 Version DAG Store                                                       ││
+│ │ • FS.2.4 Write-Ahead Log (for versioning)                                        ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/versioning/version_id.go, vector_clock.go, operation.go,                  ││
+│ │   target.go, file_version.go, blob_store.go, operation_log.go,                   ││
+│ │   dag_store.go, wal.go                                                           ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (all parallel) → Phase 2 (all parallel)                                ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 3E: Tree-Sitter Parsing Infrastructure (TS Phases 1-2)           ││
+│ │ ** NEW: Purego-based tree-sitter for universal AST parsing **                   ││
+│ │                                                                                  ││
+│ │ TS PHASE 1 (All parallel - foundation):                                         ││
+│ │ • TS.1.1 Purego Bindings (libtree-sitter dynamic loading)                       ││
+│ │ • TS.1.2 High-Level Go Types (Parser, Tree, Node, Query)                        ││
+│ │ • TS.1.3 Grammar Registry (30+ languages, extensions map)                       ││
+│ │                                                                                  ││
+│ │ TS PHASE 2 (After Phase 1, all parallel):                                       ││
+│ │ • TS.2.1 Parser Implementation (incremental parsing)                            ││
+│ │ • TS.2.2 Tree/Node Implementation (stable paths)                                ││
+│ │ • TS.2.3 Query Engine (S-expression patterns)                                   ││
+│ │ • TS.2.4 Grammar Downloader (prebuilt + compile fallback)                       ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/treesitter/bindings.go, types.go, parser.go, tree.go,                    ││
+│ │   query.go, registry.go, downloader.go                                          ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   TS Phase 1 (all parallel) → TS Phase 2 (all parallel)                         ││
+│ │   Provides: AST foundation for FS.1.4 (AST-Aware Target)                        ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 34-42 parallel engineer pipelines (increased for FS + TS)      │
 │ DEPENDENCIES: Wave 2 complete                                                       │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
@@ -21667,8 +23264,81 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • 0.73 Session Knowledge Manager                                                 ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 12-15 parallel engineer pipelines                              │
-│ DEPENDENCIES: Wave 3 complete                                                       │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4C: FILESYSTEM Versioning Core (FS Phases 3-5)                    ││
+│ │ ** NEW: VFS, OT Engine, Central Version Store **                                 ││
+│ │                                                                                  ││
+│ │ PHASE 3 - VFS (After Wave 3D Phase 2):                                           ││
+│ │ • FS.3.1 VFS (Virtual File System) with security integration                     ││
+│ │ • FS.3.2 Pipeline VFS Manager (variant group support)                            ││
+│ │                                                                                  ││
+│ │ PHASE 4 - OT Engine (Can parallel with Phase 3):                                 ││
+│ │ • FS.4.1 Diff Algorithm (Myers + AST-aware)                                      ││
+│ │ • FS.4.2 Operational Transformation Engine                                       ││
+│ │ • FS.4.3 Conflict Resolution UI Integration (Guide routing)                      ││
+│ │                                                                                  ││
+│ │ PHASE 5 - CVS (After Phases 3-4):                                                ││
+│ │ • FS.5.1 Central Version Store (main coordinator)                                ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/versioning/vfs.go, vfs_manager.go, diff.go, ot.go,                        ││
+│ │   conflict_ui.go, cvs.go                                                         ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 3 & 4 (parallel) → Phase 5 (CVS coordinates all)                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4D: FILESYSTEM Cross-Session Coordination (FS Phase 7)            ││
+│ │ ** NEW: File change signals and lock coordination **                             ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After Phase 5 CVS):                                                     ││
+│ │ • FS.7.1 Signal Dispatcher for File Changes                                      ││
+│ │   - FILE_CREATED, FILE_MODIFIED, FILE_DELETED signals                            ││
+│ │   - FILE_LOCKED, FILE_UNLOCKED, MERGE_CONFLICT signals                           ││
+│ │   - Pattern-based subscriptions                                                  ││
+│ │ • FS.7.2 Cross-Session Pool for File Coordination                                ││
+│ │   - Read/write lock acquisition                                                  ││
+│ │   - Coordinated multi-file operations                                            ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/session/signal_dispatcher_vfs.go, cross_session_pool_vfs.go               ││
+│ │                                                                                  ││
+│ │ EXTENDS:                                                                         ││
+│ │   - Existing SignalDispatcher (0.41)                                             ││
+│ │   - Existing CrossSessionPool (0.42)                                             ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4E: Tree-Sitter CVS Integration (TS Phases 3-4)                  ││
+│ │ ** NEW: CVS integration and agent tool interface **                              ││
+│ │                                                                                  ││
+│ │ TS PHASE 3 (After Wave 3E, depends on FS.5.1 CVS):                              ││
+│ │ • TS.3.1 TreeSitterManager (CVS integration)                                    ││
+│ │   - ComputeNodePath, ResolveNodePath                                            ││
+│ │   - ParseIncremental for FileVersion                                            ││
+│ │   - Integration with Target struct from FS.1.4                                  ││
+│ │                                                                                  ││
+│ │ TS PHASE 4 (After Phase 3, all parallel):                                       ││
+│ │ • TS.4.1 TreeSitterTool (base agent interface)                                  ││
+│ │ • TS.4.2 Librarian Skills (ts_parse, ts_query, ts_find_*)                       ││
+│ │ • TS.4.3 Engineer Skills (ts_rename, ts_extract, ts_find_targets)               ││
+│ │ • TS.4.4 Inspector Skills (ts_complexity, ts_smells, ts_validate)               ││
+│ │ • TS.4.5 Tester Skills (ts_discover_tests, ts_find_testable)                    ││
+│ │ • TS.4.6 Designer Skills (ts_components, ts_jsx, ts_styles)                     ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/treesitter/manager.go, tool.go, skills/librarian.go,                     ││
+│ │   skills/engineer.go, skills/inspector.go, skills/tester.go,                    ││
+│ │   skills/designer.go                                                            ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   TS.3.1 → TS.4.* (all parallel)                                                ││
+│ │   Depends on: Wave 3E (TS Phases 1-2), FS.5.1 (CVS)                             ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 26-32 parallel engineer pipelines (increased for FS + TS)      │
+│ DEPENDENCIES: Wave 3 complete (including 3D FILESYSTEM and 3E Tree-Sitter)         │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -21799,11 +23469,19 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 6C: Enhanced Agent Skills                                         ││
+│ │ ** DEPENDS ON: Wave 4E (Tree-Sitter CVS Integration) for AST skills **           ││
+│ │                                                                                  ││
 │ │ • Engineer: Multi-Edit & Structural Refactoring                                  ││
+│ │   - Uses: ts_rename_symbol, ts_extract_function, ts_find_edit_targets           ││
 │ │ • Designer: Vision & Multimodal Skills                                           ││
+│ │   - Uses: ts_extract_components, ts_analyze_jsx, ts_find_styles                 ││
 │ │ • Librarian: Enhanced Search & AST Skills                                        ││
+│ │   - Uses: ts_parse, ts_query, ts_find_*, ts_extract_symbols                     ││
 │ │ • Academic: Web Research & Documentation Skills                                  ││
 │ │ • Inspector: LSP & AST Validation Skills                                         ││
+│ │   - Uses: ts_complexity_analysis, ts_find_code_smells, ts_validate_structure    ││
+│ │ • Tester: AST-Aware Test Discovery                                               ││
+│ │   - Uses: ts_discover_tests, ts_find_testable_functions, ts_match_tests         ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -21949,9 +23627,125 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • Research Paper Implementation                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 22-28 parallel engineer pipelines (increased for all systems)  │
-│ DEPENDENCIES: Wave 6 for execution agents, Wave 5 for knowledge                    │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7F: Agent Discipline Protocols (NEW)                              ││
+│ │ Behavioral protocols ensuring consistency, quality, and learning.                ││
+│ │                                                                                  ││
+│ │ GUIDE PROTOCOLS (Can parallelize):                                               ││
+│ │ • Guide: Ambiguity Resolution Discipline                                         ││
+│ │ • Guide: Pre-Routing Enrichment Protocol                                         ││
+│ │ • Guide: Skill Match Verification Protocol                                       ││
+│ │                                                                                  ││
+│ │ ACADEMIC PROTOCOLS (Can parallelize):                                            ││
+│ │ • Academic: Source Citation Discipline                                           ││
+│ │ • Academic: Research Depth Calibration Protocol                                  ││
+│ │ • Academic: Cross-Agent Research Synthesis Protocol                              ││
+│ │                                                                                  ││
+│ │ ARCHITECT PROTOCOLS (Can parallelize):                                           ││
+│ │ • Architect: Plan Complexity Discipline                                          ││
+│ │ • Architect: Assumption Documentation Protocol                                   ││
+│ │ • Architect: Historical Failure Integration Protocol                             ││
+│ │ • Architect: Scope Creep Detection Protocol                                      ││
+│ │                                                                                  ││
+│ │ ENGINEER PROTOCOLS (Can parallelize):                                            ││
+│ │ • Engineer: Pre-Implementation Verification Protocol                             ││
+│ │ • Engineer: Incremental Validation Protocol                                      ││
+│ │ • Engineer: Pattern Adherence Discipline                                         ││
+│ │ • Engineer: Rollback Documentation Protocol                                      ││
+│ │                                                                                  ││
+│ │ DESIGNER PROTOCOLS (Can parallelize):                                            ││
+│ │ • Designer: Visual Regression Awareness Protocol                                 ││
+│ │ • Designer: Token Validation Gate Protocol                                       ││
+│ │ • Designer: Responsive Testing Discipline                                        ││
+│ │ • Designer: Animation Performance Protocol                                       ││
+│ │                                                                                  ││
+│ │ INSPECTOR PROTOCOLS (Can parallelize):                                           ││
+│ │ • Inspector: Historical Issue Cross-Reference Protocol                           ││
+│ │ • Inspector: Validation Evidence Documentation Protocol                          ││
+│ │ • Inspector: Progressive Validation Protocol                                     ││
+│ │ • Inspector: False Positive Tracking Protocol                                    ││
+│ │                                                                                  ││
+│ │ TESTER PROTOCOLS (Can parallelize):                                              ││
+│ │ • Tester: Existing Test Integration Protocol                                     ││
+│ │ • Tester: Flaky Test Prevention Protocol                                         ││
+│ │ • Tester: Coverage Gap Prioritization Protocol                                   ││
+│ │ • Tester: Test Maintenance Burden Protocol                                       ││
+│ │                                                                                  ││
+│ │ LIBRARIAN PROTOCOLS (Can parallelize):                                           ││
+│ │ • Librarian: Staleness Detection Discipline                                      ││
+│ │ • Librarian: Confidence Calibration Protocol                                     ││
+│ │ • Librarian: Pattern Evolution Tracking Protocol                                 ││
+│ │ • Librarian: Index Health Monitoring Protocol                                    ││
+│ │                                                                                  ││
+│ │ ARCHIVALIST PROTOCOLS (Can parallelize):                                         ││
+│ │ • Archivalist: Knowledge Decay Protocol                                          ││
+│ │ • Archivalist: Cross-Session Promotion Protocol                                  ││
+│ │ • Archivalist: Conflict Detection & Resolution Protocol                          ││
+│ │ • Archivalist: Retrieval Quality Feedback Loop Protocol                          ││
+│ │                                                                                  ││
+│ │ ORCHESTRATOR PROTOCOLS (Can parallelize):                                        ││
+│ │ • Orchestrator: Execution Anomaly Detection Protocol                             ││
+│ │ • Orchestrator: Pipeline Health Monitoring Protocol                              ││
+│ │ • Orchestrator: Completion Verification Protocol                                 ││
+│ │ • Orchestrator: Graceful Degradation Protocol                                    ││
+│ │                                                                                  ││
+│ │ DISCIPLINE PROTOCOL PHILOSOPHY:                                                  ││
+│ │   - HISTORICAL AWARENESS: Learn from past failures                               ││
+│ │   - VERIFICATION GATES: Don't proceed without validation                         ││
+│ │   - CONFIDENCE CALIBRATION: Know when you don't know                             ││
+│ │   - CONSISTENCY: Match existing patterns, document deviations                    ││
+│ │   - CONTINUOUS IMPROVEMENT: Track outcomes, adjust behavior                      ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   All protocols within an agent can parallelize.                                 ││
+│ │   Protocols depend on base agent implementation from Groups 7A-7E.               ││
+│ │   Archivalist protocols depend on Archivalist agent (Wave 5).                    ││
+│ │   Librarian protocols depend on Librarian agent (Wave 5).                        ││
+│ │                                                                                  ││
+│ │ ESTIMATED ITEMS: 36 protocol implementations (can parallelize by agent)          ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7G: Tree-Sitter CLI & Setup (TS Phase 5)                         ││
+│ │ ** NEW: User-facing grammar management and setup integration **                  ││
+│ │                                                                                  ││
+│ │ TS PHASE 5 (Can parallel with 7A-7F):                                           ││
+│ │ • TS.5.1 CLI Commands                                                           ││
+│ │   - sylk grammar list (installed + available)                                   ││
+│ │   - sylk grammar install <name>                                                 ││
+│ │   - sylk grammar add <repo-url> (custom grammars)                               ││
+│ │   - sylk grammar validate <path>                                                ││
+│ │   - sylk grammar remove <name>                                                  ││
+│ │   - sylk grammar info <name>                                                    ││
+│ │ • TS.5.2 Setup Integration                                                      ││
+│ │   - libtree-sitter download for platform                                        ││
+│ │   - Default grammar set installation (Go, TS, Python, Rust)                     ││
+│ │   - User grammar directory creation (~/.sylk/grammars/)                         ││
+│ │   - Configuration file generation (grammar.yaml template)                       ││
+│ │                                                                                  ││
+│ │ TS PHASE 6 (After TS.5.*, parallel):                                            ││
+│ │ • TS.6.1 User-Defined Grammar Support                                           ││
+│ │   - grammar.yaml parsing and validation                                         ││
+│ │   - Hot-reload support for grammar changes                                      ││
+│ │ • TS.6.2 Testing and Documentation                                              ││
+│ │   - Unit tests, integration tests, benchmarks                                   ││
+│ │   - Documentation: Adding new language support                                  ││
+│ │   - Query pattern cookbook                                                      ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   cmd/sylk/grammar.go, core/treesitter/setup.go,                                ││
+│ │   core/treesitter/user_grammar.go, docs/treesitter.md                           ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   TS.5.1 & TS.5.2 (parallel) → TS.6.1 & TS.6.2 (parallel)                       ││
+│ │   Depends on: Wave 4E (Tree-Sitter agent skills)                                ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 32-40 parallel engineer pipelines (increased for protocols+TS) │
+│ DEPENDENCIES: Wave 6 for execution agents, Wave 5 for knowledge, Wave 4E for TS    │
 │ NOTE: Groups 7B/7C/7D can execute in parallel, orchestrators sequential after      │
+│ NOTE: Group 7F can parallelize with 7B/7C/7D after agent cores are ready           │
+│ NOTE: Group 7G can parallelize with 7A-7F (independent CLI/setup work)             │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -21967,6 +23761,11 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ PARALLEL GROUP 8A: Pipeline Core                                                 ││
 │ │ • 6.43 Single-Worker Pipeline System                                             ││
 │ │ • Pipeline Variants System Core (6.101-6.112) - REQUIRES Orchestrator (6.130-39) ││
+│ │ • 6.105B Mandatory User Selection Policy (CRITICAL)                              ││
+│ │   - NO auto-select: TimeoutAction can only be 'none' or 'cancel'                ││
+│ │   - User MUST explicitly choose variant via /variants select                    ││
+│ │   - Presentation: original + all variants with approach/files/diff              ││
+│ │   - Blocking: Pipeline halts at variant gate until user decision                ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -21985,8 +23784,50 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • Memory Management: Handoff Protocols                                           ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 8-12 parallel engineer pipelines                               │
-│ DEPENDENCIES: All agent implementations complete                                    │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 8D: FILESYSTEM Pipeline VFS Integration (FS Phase 6)              ││
+│ │ ** NEW: VFS integration with pipeline execution and scheduling **                ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After CVS from Wave 4C):                                                ││
+│ │ • FS.6.1 Integrate VFS with Pipeline Runner                                      ││
+│ │   - PipelineVFSIntegration struct                                                ││
+│ │   - SetupPipeline creates VFS on pipeline creation                               ││
+│ │   - TeardownPipeline commits/rolls back based on success                         ││
+│ │   - Engineer file operations route through VFS                                   ││
+│ │ • FS.6.2 Integrate with Pipeline Scheduler                                       ││
+│ │   - PipelineSchedulerVFS extends existing scheduler                              ││
+│ │   - File dependency tracking per task                                            ││
+│ │   - Write-write conflict detection                                               ││
+│ │   - Conflicting tasks serialized (not parallel)                                  ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/pipeline/vfs_integration.go, core/session/pipeline_scheduler_vfs.go       ││
+│ │                                                                                  ││
+│ │ INTEGRATES WITH:                                                                 ││
+│ │   - Pipeline Variants (6.101-6.112) - variant VFS isolation                      ││
+│ │   - Pipeline Runner - automatic VFS lifecycle                                    ││
+│ │   - Existing PipelineScheduler (0.18, 0.57)                                      ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 8E: FILESYSTEM AST Parsers (FS Phase 8)                           ││
+│ │ ** NEW: Language-specific AST parsers for stable targeting **                    ││
+│ │                                                                                  ││
+│ │ PHASE 8 (All parallel - no interdependencies):                                   ││
+│ │ • FS.8.1 Go AST Parser (using go/ast stdlib)                                     ││
+│ │ • FS.8.2 TypeScript/JavaScript Parser (.ts, .tsx, .js, .jsx)                     ││
+│ │ • FS.8.3 Python Parser (.py, .pyw)                                               ││
+│ │ • FS.8.4 Parser Registry (extension → parser mapping)                            ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/versioning/parser_go.go, parser_typescript.go,                            ││
+│ │   parser_python.go, parser_registry.go                                           ││
+│ │                                                                                  ││
+│ │ NOTE: Can run in parallel with Groups 8A-8D                                      ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 14-20 parallel engineer pipelines (increased for FS)           │
+│ DEPENDENCIES: All agent implementations complete, Wave 4C-4D FILESYSTEM complete   │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -22023,6 +23864,35 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 9C: Skill/Agent Integrations                                      ││
 │ │ • 6.33-6.42 All Agent Efficiency Integrations                                    ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 9E: FILESYSTEM Versioning Skills & Hooks (FS Phase 9)             ││
+│ │ ** NEW: Version-aware file operations and Archivalist integration **             ││
+│ │                                                                                  ││
+│ │ SKILLS (Can parallel - extend/replace existing file skills):                     ││
+│ │ • FS.9.1 Versioning Skills for Engineers                                         ││
+│ │   - versioned_read_file (read at version or HEAD)                                ││
+│ │   - versioned_write_file (creates new version with message)                      ││
+│ │   - versioned_file_history (returns version list)                                ││
+│ │   - versioned_file_diff (diff between versions)                                  ││
+│ │   - versioned_rollback (rollback to previous version)                            ││
+│ │   - All skills respect AgentRole permissions                                     ││
+│ │                                                                                  ││
+│ │ HOOKS (Integrates with existing hook system):                                    ││
+│ │ • FS.9.2 File Operation Hooks                                                    ││
+│ │   - PreWriteHook (validates permissions, sanitizes secrets, checks locks)        ││
+│ │   - PostWriteHook (records to Archivalist, emits signals)                        ││
+│ │   - ConflictDetectionHook (checks for concurrent modification)                   ││
+│ │   - Updates SessionContext.ModifiedFiles                                         ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/versioning/skills.go, core/versioning/hooks.go                            ││
+│ │                                                                                  ││
+│ │ INTEGRATES WITH:                                                                 ││
+│ │   - Existing engineer file skills (read_file, write_file, edit_file)             ││
+│ │   - Hook system from ARCHITECTURE.md (pre-tool, post-tool hooks)                 ││
+│ │   - Archivalist for file change tracking                                         ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -22068,6 +23938,60 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 10C: FILESYSTEM Versioning Tests (FS Phases 10-11)                ││
+│ │ ** NEW: Comprehensive versioning system tests **                                 ││
+│ │                                                                                  ││
+│ │ INTEGRATION TESTS:                                                               ││
+│ │ • FS.10.1 Single Pipeline Workflow (end-to-end)                                  ││
+│ │ • FS.10.1 Concurrent Pipelines (file conflict handling)                          ││
+│ │ • FS.10.1 Variant Workflow (create, execute, select)                             ││
+│ │ • FS.10.1 Cross-Session Coordination (file changes, locks)                       ││
+│ │ • FS.10.1 Conflict Resolution (OT merge, UI interaction)                         ││
+│ │ • FS.10.1 Crash Recovery (WAL replay)                                            ││
+│ │                                                                                  ││
+│ │ STRESS TESTS:                                                                    ││
+│ │ • FS.10.2 High Concurrency (10+ sessions, 100+ pipelines)                        ││
+│ │ • FS.10.2 Large Files (10MB+ without OOM)                                        ││
+│ │ • FS.10.2 Many Versions (1000+ per file, stable performance)                     ││
+│ │ • FS.10.2 Benchmarks (Write, Read, Transform, GetHistory)                        ││
+│ │                                                                                  ││
+│ │ TARGET: 90%+ code coverage for core/versioning package                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 10D: Tree-Sitter Tests (TS.6.2)                                  ││
+│ │ ** NEW: Comprehensive tree-sitter parsing tests **                               ││
+│ │                                                                                  ││
+│ │ UNIT TESTS:                                                                      ││
+│ │ • Purego bindings (all registered functions)                                     ││
+│ │ • Parser lifecycle (create, set language, parse, delete)                         ││
+│ │ • Tree traversal (children, siblings, parent, cursor)                            ││
+│ │ • Query execution (patterns, captures, predicates)                               ││
+│ │ • Grammar Registry (lookup, list, detect language)                               ││
+│ │ • Grammar Downloader (download, verify, fallback to compile)                     ││
+│ │                                                                                  ││
+│ │ INTEGRATION TESTS:                                                               ││
+│ │ • Parse all supported languages (30+ grammar files)                              ││
+│ │ • Incremental parsing vs full parse consistency                                  ││
+│ │ • CVS integration (NodePath stability across versions)                           ││
+│ │ • Agent skill execution (Librarian, Engineer, Inspector, Tester, Designer)       ││
+│ │ • User-defined grammar loading (custom grammar.yaml)                             ││
+│ │ • CLI commands (grammar list/install/add/remove)                                 ││
+│ │                                                                                  ││
+│ │ STRESS TESTS:                                                                    ││
+│ │ • Large file parsing (10MB+ without OOM)                                         ││
+│ │ • Concurrent parsing (multiple parsers, multiple languages)                      ││
+│ │ • Memory leak detection (repeated parse/delete cycles)                           ││
+│ │                                                                                  ││
+│ │ BENCHMARKS:                                                                      ││
+│ │ • Parse time vs file size (linear scaling expected)                              ││
+│ │ • Incremental parse time vs edit size                                            ││
+│ │ • Query execution time vs AST size                                               ││
+│ │                                                                                  ││
+│ │ TARGET: 90%+ code coverage for core/treesitter package                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ SEQUENTIAL: Acceptance Verification                                              ││
 │ │ • Token Savings Targets Validation                                               ││
 │ │ • Latency Targets Validation                                                     ││
@@ -22075,7 +23999,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • Full System Acceptance                                                         ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 10-15 parallel engineer pipelines                              │
+│ ESTIMATED CAPACITY: 14-18 parallel engineer pipelines (increased for TS tests)     │
 │ DEPENDENCIES: All implementation waves complete                                     │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
@@ -22104,11 +24028,15 @@ All items in this wave have zero dependencies and can execute in full parallel.
          ┌────▼─────┐              │               │           │
          │  WAVE 3  │              │               │           │
          │Tool/File │              │               │           │
+         │  +FS 1-2 │              │               │           │
+         │  +TS 1-2 │◄──── Tree-Sitter Foundation ─┤           │
          └────┬─────┘              │               │           │
               │                    │               │           │
          ┌────▼─────┐              │               │           │
          │  WAVE 4  │              │               │           │
          │Security  │              │               │           │
+         │  +FS 3-7 │              │               │           │
+         │  +TS 3-4 │◄──── TS CVS + Agent Skills ──┤           │
          └────┬─────┘              │               │           │
               │                    │               │           │
               └──────────┬─────────┘               │           │
@@ -22116,12 +24044,14 @@ All items in this wave have zero dependencies and can execute in full parallel.
                     ┌────▼─────┐                   │           │
                     │  WAVE 6  │◄──────────────────┘           │
                     │Exec Agts │                               │
+                    │ +TS Agnt │◄──── Enhanced with TS skills  │
                     └────┬─────┘                               │
                          │                                     │
                     ┌────▼─────┐                               │
                     │  WAVE 7  │                               │
                     │Quality/  │                               │
                     │Planning  │                               │
+                    │  +TS CLI │◄──── Grammar CLI + Setup      │
                     └────┬─────┘                               │
                          │                                     │
                     ┌────▼─────┐                               │
@@ -22137,7 +24067,20 @@ All items in this wave have zero dependencies and can execute in full parallel.
                     ┌────▼─────┐
                     │ WAVE 10  │
                     │Validation│
+                    │  +TS Tst │◄──── Tree-Sitter Tests
                     └──────────┘
+```
+
+**Tree-Sitter Dependency Flow:**
+```
+Wave 3 (TS 1-2)    Wave 4 (TS 3-4)    Wave 6        Wave 7 (TS 5-6)    Wave 10
+┌────────────┐    ┌─────────────┐    ┌─────────┐    ┌────────────┐    ┌─────────┐
+│TS.1.1-1.3  │───►│TS.3.1 CVS  │───►│Agent    │───►│TS.5.1 CLI  │───►│TS.6.2   │
+│TS.2.1-2.4  │    │ Integration │    │Skills   │    │TS.5.2 Setup│    │Tests    │
+│Foundation  │    │             │    │Enhanced │    │TS.6.1 User │    │         │
+└────────────┘    │TS.4.1-4.6  │    │         │    │Grammars    │    │         │
+                  │Agent Skills │    │         │    │            │    │         │
+                  └─────────────┘    └─────────┘    └────────────┘    └─────────┘
 ```
 
 ### Parallel Execution Summary
@@ -22147,14 +24090,30 @@ All items in this wave have zero dependencies and can execute in full parallel.
 | 0 | Foundation | 15-20 | None | 15-20 pipelines |
 | 1 | Core Infrastructure | 12-16 | Wave 0 | 12-16 pipelines |
 | 2 | Execution Framework | 18-22 | Wave 1 | 18-22 pipelines |
-| 3 | Tool Execution | 24-30 | Wave 2 | 24-30 pipelines |
-| 4 | Security/Multi-Session | 12-15 | Wave 3 | 12-15 pipelines |
+| 3 | Tool Execution + **FS Foundation** + **TS Phases 1-2** | 34-42 | Wave 2 | 34-42 pipelines |
+| 4 | Security/Multi-Session + **FS Core** + **TS Phases 3-4** | 26-32 | Wave 3 | 26-32 pipelines |
 | 5 | Knowledge Agents | 10-12 | Wave 1 (partial Wave 2) | 10-12 pipelines |
-| 6 | Execution Agents | 18-22 | Wave 2-3, Wave 5 | 18-22 pipelines |
-| 7 | Quality/Planning | 8-10 | Wave 6, Wave 5 | 8-10 pipelines |
-| 8 | Pipeline System | 8-12 | Waves 5-7, Orchestrator (6.130-39) | 8-12 pipelines |
-| 9 | Agent Efficiency | 15-20 | Wave 8 | 15-20 pipelines | **Group 9D COMPLETE** |
-| 10 | Validation | 10-15 | All Waves | 10-15 pipelines |
+| 6 | Execution Agents + **TS Agent Skills** | 22-28 | Wave 2-3, Wave 5, Wave 4E | 22-28 pipelines |
+| 7 | Quality/Planning + Discipline Protocols + **TS CLI** | 48-52 | Wave 6, Wave 5, Wave 4E | 32-40 pipelines |
+| 8 | Pipeline System + **FS Pipeline/Parsers** | 14-20 | Waves 5-7, Wave 4 FS | 14-20 pipelines |
+| 9 | Agent Efficiency + **FS Skills/Hooks** | 18-24 | Wave 8 | 18-24 pipelines | **Group 9D COMPLETE** |
+| 10 | Validation + **FS Tests** + **TS Tests** | 16-22 | All Waves | 16-22 pipelines |
+
+**NEW: Tree-Sitter Distribution:**
+| Wave | TS Phase | Items | Description |
+|------|----------|-------|-------------|
+| 3 | TS 1-2 | 7 | Purego bindings, Go types, Registry, Parser, Tree, Query, Downloader |
+| 4 | TS 3-4 | 7 | CVS Manager + 6 agent-specific skill sets |
+| 7 | TS 5-6 | 4 | CLI commands, Setup integration, User grammars, Testing/Docs |
+
+**NEW: FILESYSTEM Versioning Distribution:**
+| Wave | FS Phase | Items | Description |
+|------|----------|-------|-------------|
+| 3 | FS 1-2 | 9 | Foundation types, Storage layer |
+| 4 | FS 3-5, 7 | 8 | VFS, OT Engine, CVS, Cross-Session |
+| 8 | FS 6, 8 | 6 | Pipeline VFS Integration, AST Parsers |
+| 9 | FS 9 | 2 | Versioning Skills, File Hooks |
+| 10 | FS 10-11 | 4 | Integration Tests, Stress Tests |
 
 **Wave 6 Orchestrator Breakdown (6.130-6.139):**
 | Group | Tasks | Internal Dependencies |
@@ -22173,11 +24132,18 @@ All items in this wave have zero dependencies and can execute in full parallel.
 3. Agent efficiency techniques (Wave 9) highly parallelizable across all 9 agents
 4. Integration tests (Wave 10) can parallelize by subsystem
 5. **Orchestrator (6.130-6.139)** has 7 internal parallel groups, can parallelize within Wave 6
+6. **Discipline Protocols (Group 7F)** adds 36 parallelizable items by agent - can run with 7B/7C/7D
+7. **NEW: FILESYSTEM Phases 1-2** can fully parallelize within Wave 3 Group 3D
+8. **NEW: FILESYSTEM Phases 3-4** can run parallel in Wave 4 (VFS and OT are independent)
+9. **NEW: FILESYSTEM Parsers (Phase 8)** can fully parallelize in Wave 8 Group 8E
 
 **Critical Path:**
-Wave 0 → Wave 1 → Wave 2 → Wave 3 → Wave 6 (incl. Orchestrator 6.130-39) → Wave 7 → Wave 8 → Wave 9 → Wave 10
+Wave 0 → Wave 1 → Wave 2 → Wave 3 (incl. FS 1-2) → Wave 4 (incl. FS 3-5, 7) → Wave 6 (Orchestrator) → Wave 7 → Wave 8 (incl. FS 6, 8) → Wave 9 (incl. FS 9) → Wave 10 (incl. FS 10-11)
+
+**FILESYSTEM Critical Path (within Waves):**
+FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS.5 CVS (W4) → FS.7 Cross-Session (W4) → FS.6 Pipeline (W8) → FS.8 Parsers (W8, parallel) → FS.9 Skills (W9) → FS.10-11 Tests (W10)
 
 **Orchestrator Critical Path (within Wave 6):**
 6.130 → 6.132/6.133 → 6.131/6.134 → 6.135/6.136 → 6.139 → 6.137 → 6.138
 
-**Optimization Note:** Waves 5, 6, 7, 8, 9 have significant cross-dependencies but can overlap if carefully scheduled. The Orchestrator (once implemented in Wave 6) monitors completion status and eagerly starts downstream work as soon as dependencies are satisfied. Pipeline Variants (6.101-6.112) in Wave 8 specifically requires Orchestrator completion.
+**Optimization Note:** Waves 5, 6, 7, 8, 9 have significant cross-dependencies but can overlap if carefully scheduled. The Orchestrator (once implemented in Wave 6) monitors completion status and eagerly starts downstream work as soon as dependencies are satisfied. Pipeline Variants (6.101-6.112) in Wave 8 specifically requires Orchestrator completion. **NEW:** FILESYSTEM VFS integration (FS.6) should integrate with Pipeline Variants for variant VFS isolation.

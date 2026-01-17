@@ -113,10 +113,9 @@ func TestBatchStoreInsertEdges(t *testing.T) {
 	edges := make([]*GraphEdge, 4)
 	for i := 0; i < 4; i++ {
 		edges[i] = &GraphEdge{
-			ID:         "edge" + string(rune('0'+i)),
-			FromNodeID: nodeID(i),
-			ToNodeID:   nodeID(i + 1),
-			EdgeType:   EdgeTypeCalls,
+			SourceID: nodeID(i),
+			TargetID: nodeID(i + 1),
+			EdgeType: EdgeTypeCalls,
 		}
 	}
 
@@ -126,12 +125,13 @@ func TestBatchStoreInsertEdges(t *testing.T) {
 	}
 
 	for i := 0; i < 4; i++ {
-		edge, err := es.GetEdge("edge" + string(rune('0'+i)))
+		edgeID := edges[i].ID
+		edge, err := es.GetEdge(edgeID)
 		if err != nil {
-			t.Errorf("Edge edge%d not found: %v", i, err)
+			t.Errorf("Edge %d not found: %v", edgeID, err)
 		}
 		if edge.EdgeType != EdgeTypeCalls {
-			t.Errorf("Edge edge%d type = %s, want calls", i, edge.EdgeType)
+			t.Errorf("Edge %d type = %s, want calls", edgeID, edge.EdgeType)
 		}
 	}
 }
@@ -154,10 +154,9 @@ func TestBatchStoreInsertEdgesWithProgress(t *testing.T) {
 	edges := make([]*GraphEdge, 2)
 	for i := 0; i < 2; i++ {
 		edges[i] = &GraphEdge{
-			ID:         "edge" + string(rune('0'+i)),
-			FromNodeID: nodeID(i),
-			ToNodeID:   nodeID(i + 1),
-			EdgeType:   EdgeTypeCalls,
+			SourceID: nodeID(i),
+			TargetID: nodeID(i + 1),
+			EdgeType: EdgeTypeCalls,
 		}
 	}
 

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
-	"github.com/google/uuid"
 )
 
 // ProvenanceTracker tracks the source and verification chain for stored information.
@@ -31,21 +30,13 @@ func NewProvenanceTracker(db *vectorgraphdb.VectorGraphDB) *ProvenanceTracker {
 
 // RecordProvenance records provenance for a node.
 func (p *ProvenanceTracker) RecordProvenance(nodeID string, prov *Provenance) error {
-	if prov.ID == "" {
-		prov.ID = uuid.New().String()
-	}
 	prov.NodeID = nodeID
 
-	provJSON, err := json.Marshal(prov)
-	if err != nil {
-		return fmt.Errorf("marshal provenance: %w", err)
-	}
-
-	_, err = p.db.DB().Exec(`
-		INSERT INTO provenance (id, node_id, source_type, source_id, confidence, verified_at, verifier)
+	_, err := p.db.DB().Exec(`
+		INSERT INTO provenance (node_id, source_type, source_node_id, source_path, source_url, confidence, verified_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, prov.ID, prov.NodeID, prov.SourceType, prov.SourceID, prov.Confidence,
-		prov.VerifiedAt.Format(time.RFC3339), string(provJSON))
+	`, prov.NodeID, prov.SourceType, prov.SourceID, prov.SourceID, prov.SourceID,
+		prov.Confidence, prov.VerifiedAt.Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("insert provenance: %w", err)
 	}
@@ -189,7 +180,7 @@ func (p *ProvenanceTracker) buildChain(provs []*Provenance, maxDepth int) ([]*Pr
 // FindBySource finds all nodes from a specific source.
 func (p *ProvenanceTracker) FindBySource(sourceType SourceType, sourceID string) ([]*vectorgraphdb.GraphNode, error) {
 	rows, err := p.db.DB().Query(`
-		SELECT n.id, n.domain, n.node_type, n.content_hash, n.metadata, n.created_at, n.updated_at, n.accessed_at
+		SELECT n.id, n.domain, n.node_type, n.content_hash, n.metadata, n.created_at, n.updated_at
 		FROM nodes n
 		JOIN provenance p ON n.id = p.node_id
 		WHERE p.source_type = ? AND p.source_id = ?
@@ -220,10 +211,10 @@ func (p *ProvenanceTracker) scanNodes(rows interface {
 
 func (p *ProvenanceTracker) scanNodeRow(row interface{ Scan(...any) error }) (*vectorgraphdb.GraphNode, error) {
 	var node vectorgraphdb.GraphNode
-	var metadataJSON, createdAt, updatedAt, accessedAt string
+	var metadataJSON, createdAt, updatedAt string
 
 	err := row.Scan(&node.ID, &node.Domain, &node.NodeType, &node.ContentHash,
-		&metadataJSON, &createdAt, &updatedAt, &accessedAt)
+		&metadataJSON, &createdAt, &updatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("scan node: %w", err)
 	}
@@ -233,7 +224,6 @@ func (p *ProvenanceTracker) scanNodeRow(row interface{ Scan(...any) error }) (*v
 	}
 	node.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	node.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
-	node.AccessedAt, _ = time.Parse(time.RFC3339, accessedAt)
 
 	return &node, nil
 }

@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"errors"
+	"slices"
 	"sort"
 	"sync"
 
@@ -210,9 +211,7 @@ func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
 		maxConn = h.M * 2
 	}
 
-	count := min(len(neighbors), maxConn)
-	for i := 0; i < count; i++ {
-		neighbor := neighbors[i]
+	for _, neighbor := range neighbors[:min(len(neighbors), maxConn)] {
 		h.layers[level].addNeighbor(id, neighbor.ID, maxConn)
 		h.layers[level].addNeighbor(neighbor.ID, id, maxConn)
 	}
@@ -287,21 +286,11 @@ func (h *Index) matchesFilter(id string, filter *SearchFilter) bool {
 }
 
 func (h *Index) containsDomain(domains []vectorgraphdb.Domain, d vectorgraphdb.Domain) bool {
-	for _, domain := range domains {
-		if domain == d {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(domains, d)
 }
 
 func (h *Index) containsNodeType(nodeTypes []vectorgraphdb.NodeType, nt vectorgraphdb.NodeType) bool {
-	for _, nodeType := range nodeTypes {
-		if nodeType == nt {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(nodeTypes, nt)
 }
 
 func (h *Index) Delete(id string) error {
@@ -383,7 +372,7 @@ func (h *Index) GetMetadata(id string) (vectorgraphdb.Domain, vectorgraphdb.Node
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if _, exists := h.vectors[id]; !exists {
-		return "", "", ErrNodeNotFound
+		return 0, 0, ErrNodeNotFound
 	}
 	return h.domains[id], h.nodeTypes[id], nil
 }

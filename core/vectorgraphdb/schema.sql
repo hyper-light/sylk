@@ -1,174 +1,186 @@
--- VectorGraphDB Schema
--- Version: 1
--- 
--- This schema supports a unified knowledge graph with vector similarity search
--- across three domains: Code, History, and Academic.
-
--- Enable WAL mode for concurrent read/write
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-PRAGMA synchronous = NORMAL;
-
--- Schema version tracking for migrations
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL DEFAULT (datetime('now')),
-    description TEXT
-);
-
--- Insert initial schema version
-INSERT OR IGNORE INTO schema_version (version, description)
-VALUES (1, 'Initial schema with nodes, edges, vectors, provenance, conflicts, and HNSW tables');
+-- =============================================================================
+-- DOMAIN AND TYPE ENUMS (stored as integers)
+-- =============================================================================
+-- Domain: 0 = code, 1 = history, 2 = academic
+-- NodeType: See node type constants below
 
 -- =============================================================================
--- Core Tables
+-- NODES TABLE (unified for all domains)
 -- =============================================================================
-
--- Nodes table: stores all graph nodes across all domains
-CREATE TABLE IF NOT EXISTS nodes (
+CREATE TABLE nodes (
     id TEXT PRIMARY KEY,
-    domain TEXT NOT NULL CHECK (domain IN ('code', 'history', 'academic')),
-    node_type TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    metadata TEXT DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    accessed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    domain INTEGER NOT NULL,
+    node_type INTEGER NOT NULL,
+    name TEXT NOT NULL,
+
+    -- Code domain fields
+    path TEXT,
+    package TEXT,
+    line_start INTEGER,
+    line_end INTEGER,
+    signature TEXT,
+
+    -- History domain fields
+    session_id TEXT,
+    timestamp DATETIME,
+    category TEXT,
+
+    -- Academic domain fields
+    url TEXT,
+    source TEXT,
+    authors JSON,
+    published_at DATETIME,
+
+    -- Common fields
+    content TEXT,
+    content_hash TEXT,
+    metadata JSON,
+
+    -- Verification and trust
+    verified BOOLEAN DEFAULT FALSE,
+    verification_type INTEGER,
+    confidence REAL DEFAULT 1.0,
+    trust_level INTEGER DEFAULT 50,
+
+    -- Temporal tracking
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME,
+    superseded_by TEXT,
+
+    CHECK (domain IN (0, 1, 2)),
+    FOREIGN KEY (superseded_by) REFERENCES nodes(id) ON DELETE SET NULL
 );
 
--- Edges table: stores directed edges between nodes
-CREATE TABLE IF NOT EXISTS edges (
-    id TEXT PRIMARY KEY,
-    from_node_id TEXT NOT NULL,
-    to_node_id TEXT NOT NULL,
-    edge_type TEXT NOT NULL,
-    weight REAL DEFAULT 1.0 CHECK (weight >= 0.0 AND weight <= 1.0),
-    metadata TEXT DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE,
-    FOREIGN KEY (to_node_id) REFERENCES nodes(id) ON DELETE CASCADE
-);
-
--- Vectors table: stores embeddings for semantic search
-CREATE TABLE IF NOT EXISTS vectors (
-    id TEXT PRIMARY KEY,
-    node_id TEXT NOT NULL UNIQUE,
-    embedding BLOB NOT NULL,
-    magnitude REAL NOT NULL CHECK (magnitude > 0),
-    model_version TEXT NOT NULL,
-    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
-);
-
--- Provenance table: tracks source and verification of nodes
-CREATE TABLE IF NOT EXISTS provenance (
-    id TEXT PRIMARY KEY,
-    node_id TEXT NOT NULL,
-    source_type TEXT NOT NULL CHECK (source_type IN ('git', 'user', 'llm', 'web', 'api')),
+-- =============================================================================
+-- EDGES TABLE
+-- =============================================================================
+CREATE TABLE edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id TEXT NOT NULL,
-    confidence REAL NOT NULL DEFAULT 1.0 CHECK (confidence >= 0.0 AND confidence <= 1.0),
-    verified_at TEXT,
-    verifier TEXT,
+    target_id TEXT NOT NULL,
+    edge_type INTEGER NOT NULL,
+    weight REAL DEFAULT 1.0,
+    metadata JSON,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    UNIQUE (source_id, target_id, edge_type)
+);
+
+-- =============================================================================
+-- VECTORS TABLE (embeddings as BLOBs)
+-- =============================================================================
+CREATE TABLE vectors (
+    node_id TEXT PRIMARY KEY,
+    embedding BLOB NOT NULL,
+    magnitude REAL NOT NULL,
+    dimensions INTEGER NOT NULL DEFAULT 768,
+    domain INTEGER NOT NULL,
+    node_type INTEGER NOT NULL,
+
     FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
--- Conflicts table: tracks detected contradictions between nodes
-CREATE TABLE IF NOT EXISTS conflicts (
-    id TEXT PRIMARY KEY,
-    node_a_id TEXT NOT NULL,
-    node_b_id TEXT NOT NULL,
-    conflict_type TEXT NOT NULL,
-    detected_at TEXT NOT NULL DEFAULT (datetime('now')),
-    resolution TEXT,
-    resolved_at TEXT,
-    FOREIGN KEY (node_a_id) REFERENCES nodes(id) ON DELETE CASCADE,
-    FOREIGN KEY (node_b_id) REFERENCES nodes(id) ON DELETE CASCADE
+-- =============================================================================
+-- PROVENANCE TABLE (tracks source of information)
+-- =============================================================================
+CREATE TABLE provenance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id TEXT NOT NULL,
+    source_type INTEGER NOT NULL,
+    source_node_id TEXT,
+    source_path TEXT,
+    source_url TEXT,
+    confidence REAL NOT NULL,
+    verified_at DATETIME,
+
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_node_id) REFERENCES nodes(id) ON DELETE SET NULL
 );
 
 -- =============================================================================
--- HNSW Index Tables
+-- CONFLICTS TABLE (detected contradictions)
 -- =============================================================================
+CREATE TABLE conflicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conflict_type INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    node_id_a TEXT NOT NULL,
+    node_id_b TEXT NOT NULL,
+    description TEXT NOT NULL,
+    resolution TEXT,
+    resolved BOOLEAN DEFAULT FALSE,
+    detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    resolved_at DATETIME,
 
--- HNSW graph structure: stores neighbor connections per layer
-CREATE TABLE IF NOT EXISTS hnsw_graph (
+    FOREIGN KEY (node_id_a) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id_b) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
+-- =============================================================================
+-- HNSW INDEX PERSISTENCE
+-- =============================================================================
+CREATE TABLE hnsw_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE hnsw_edges (
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    level INTEGER NOT NULL,
+    PRIMARY KEY (source_id, target_id, level)
+);
+
+-- =============================================================================
+-- ACADEMIC-SPECIFIC TABLES
+-- =============================================================================
+CREATE TABLE academic_sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_endpoint TEXT,
+    rate_limit_per_min INTEGER,
+    requires_auth BOOLEAN DEFAULT FALSE,
+    last_crawled_at DATETIME
+);
+
+CREATE TABLE academic_chunks (
     id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
-    layer INTEGER NOT NULL CHECK (layer >= 0),
-    neighbors TEXT NOT NULL DEFAULT '[]',
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
     FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
-    UNIQUE (node_id, layer)
+    UNIQUE (node_id, chunk_index)
 );
 
--- HNSW metadata: stores index configuration and state
-CREATE TABLE IF NOT EXISTS hnsw_metadata (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    entry_point TEXT,
-    max_level INTEGER NOT NULL DEFAULT 0,
-    m INTEGER NOT NULL DEFAULT 16,
-    ef_construct INTEGER NOT NULL DEFAULT 200,
-    ef_search INTEGER NOT NULL DEFAULT 50,
-    level_mult REAL NOT NULL DEFAULT 0.36067977499789996,
-    total_nodes INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+CREATE TABLE library_docs (
+    library_path TEXT PRIMARY KEY,
+    doc_node_id TEXT,
+    FOREIGN KEY (doc_node_id) REFERENCES nodes(id) ON DELETE SET NULL
 );
 
--- Insert default HNSW metadata
-INSERT OR IGNORE INTO hnsw_metadata (id, m, ef_construct, ef_search)
-VALUES (1, 16, 200, 50);
-
 -- =============================================================================
--- Indexes for Efficient Querying
+-- INDEXES
 -- =============================================================================
+CREATE INDEX idx_nodes_domain_type ON nodes(domain, node_type);
+CREATE INDEX idx_nodes_path ON nodes(path) WHERE path IS NOT NULL;
+CREATE INDEX idx_nodes_name ON nodes(name);
+CREATE INDEX idx_nodes_session ON nodes(session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX idx_nodes_hash ON nodes(content_hash) WHERE content_hash IS NOT NULL;
+CREATE INDEX idx_nodes_superseded ON nodes(superseded_by) WHERE superseded_by IS NOT NULL;
 
--- Nodes indexes
-CREATE INDEX IF NOT EXISTS idx_nodes_domain ON nodes(domain);
-CREATE INDEX IF NOT EXISTS idx_nodes_node_type ON nodes(node_type);
-CREATE INDEX IF NOT EXISTS idx_nodes_domain_type ON nodes(domain, node_type);
-CREATE INDEX IF NOT EXISTS idx_nodes_content_hash ON nodes(content_hash);
-CREATE INDEX IF NOT EXISTS idx_nodes_accessed_at ON nodes(accessed_at);
-CREATE INDEX IF NOT EXISTS idx_nodes_updated_at ON nodes(updated_at);
+CREATE INDEX idx_edges_source ON edges(source_id, edge_type);
+CREATE INDEX idx_edges_target ON edges(target_id, edge_type);
+CREATE INDEX idx_edges_type ON edges(edge_type);
 
--- Edges indexes
-CREATE INDEX IF NOT EXISTS idx_edges_from_node ON edges(from_node_id);
-CREATE INDEX IF NOT EXISTS idx_edges_to_node ON edges(to_node_id);
-CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
-CREATE INDEX IF NOT EXISTS idx_edges_from_type ON edges(from_node_id, edge_type);
-CREATE INDEX IF NOT EXISTS idx_edges_to_type ON edges(to_node_id, edge_type);
+CREATE INDEX idx_vectors_domain ON vectors(domain);
+CREATE INDEX idx_vectors_domain_type ON vectors(domain, node_type);
 
--- Vectors indexes
-CREATE INDEX IF NOT EXISTS idx_vectors_node_id ON vectors(node_id);
-CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model_version);
+CREATE INDEX idx_provenance_node ON provenance(node_id);
+CREATE INDEX idx_conflicts_unresolved ON conflicts(resolved) WHERE resolved = FALSE;
 
--- Provenance indexes
-CREATE INDEX IF NOT EXISTS idx_provenance_node_id ON provenance(node_id);
-CREATE INDEX IF NOT EXISTS idx_provenance_source ON provenance(source_type, source_id);
-CREATE INDEX IF NOT EXISTS idx_provenance_confidence ON provenance(confidence);
-
--- Conflicts indexes
-CREATE INDEX IF NOT EXISTS idx_conflicts_node_a ON conflicts(node_a_id);
-CREATE INDEX IF NOT EXISTS idx_conflicts_node_b ON conflicts(node_b_id);
-CREATE INDEX IF NOT EXISTS idx_conflicts_type ON conflicts(conflict_type);
-CREATE INDEX IF NOT EXISTS idx_conflicts_unresolved ON conflicts(resolved_at) WHERE resolved_at IS NULL;
-
--- HNSW indexes
-CREATE INDEX IF NOT EXISTS idx_hnsw_node_layer ON hnsw_graph(node_id, layer);
-CREATE INDEX IF NOT EXISTS idx_hnsw_layer ON hnsw_graph(layer);
-
--- =============================================================================
--- Triggers for Automatic Timestamp Updates
--- =============================================================================
-
--- Update updated_at on node modification
-CREATE TRIGGER IF NOT EXISTS trg_nodes_updated_at
-AFTER UPDATE ON nodes
-FOR EACH ROW
-BEGIN
-    UPDATE nodes SET updated_at = datetime('now') WHERE id = NEW.id;
-END;
-
--- Update HNSW metadata timestamp
-CREATE TRIGGER IF NOT EXISTS trg_hnsw_metadata_updated
-AFTER UPDATE ON hnsw_metadata
-FOR EACH ROW
-BEGIN
-    UPDATE hnsw_metadata SET updated_at = datetime('now') WHERE id = 1;
-END;
+CREATE INDEX idx_hnsw_edges_level ON hnsw_edges(level, source_id);
+CREATE INDEX idx_chunks_node ON academic_chunks(node_id);

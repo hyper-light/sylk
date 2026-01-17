@@ -2,8 +2,8 @@ package hnsw
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
+	"strconv"
 	"unsafe"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
@@ -19,6 +19,10 @@ func (h *Index) Save(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
+	if err := h.ensureMetaKeys(tx); err != nil {
+		return err
+	}
+
 	if err := h.saveMetadata(tx); err != nil {
 		return err
 	}
@@ -31,17 +35,23 @@ func (h *Index) Save(db *sql.DB) error {
 }
 
 func (h *Index) saveMetadata(tx *sql.Tx) error {
+	if err := h.ensureMetaKeys(tx); err != nil {
+		return err
+	}
+
 	_, err := tx.Exec(`
-		UPDATE hnsw_metadata SET
-			entry_point = ?,
-			max_level = ?,
-			m = ?,
-			ef_construct = ?,
-			ef_search = ?,
-			level_mult = ?,
-			total_nodes = ?,
-			updated_at = datetime('now')
-		WHERE id = 1
+		UPDATE hnsw_meta SET
+			value = CASE key
+				WHEN 'entry_point' THEN ?
+				WHEN 'max_level' THEN ?
+				WHEN 'm' THEN ?
+				WHEN 'ef_construct' THEN ?
+				WHEN 'ef_search' THEN ?
+				WHEN 'level_mult' THEN ?
+				WHEN 'total_nodes' THEN ?
+				ELSE value
+			END
+		WHERE key IN ('entry_point', 'max_level', 'm', 'ef_construct', 'ef_search', 'level_mult', 'total_nodes')
 	`, h.entryPoint, h.maxLevel, h.M, h.efConstruct, h.efSearch, h.levelMult, len(h.vectors))
 	if err != nil {
 		return fmt.Errorf("update metadata: %w", err)
@@ -50,11 +60,11 @@ func (h *Index) saveMetadata(tx *sql.Tx) error {
 }
 
 func (h *Index) saveGraph(tx *sql.Tx) error {
-	if _, err := tx.Exec("DELETE FROM hnsw_graph"); err != nil {
+	if _, err := tx.Exec("DELETE FROM hnsw_edges"); err != nil {
 		return fmt.Errorf("clear graph: %w", err)
 	}
 
-	stmt, err := tx.Prepare(`INSERT INTO hnsw_graph (id, node_id, layer, neighbors) VALUES (?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO hnsw_edges (source_id, target_id, level) VALUES (?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare insert: %w", err)
 	}
@@ -73,13 +83,10 @@ func (h *Index) saveLayer(stmt *sql.Stmt, layer *layer, layerIdx int) error {
 	defer layer.mu.RUnlock()
 
 	for nodeID, node := range layer.nodes {
-		neighborsJSON, err := json.Marshal(node.neighbors)
-		if err != nil {
-			return fmt.Errorf("marshal neighbors: %w", err)
-		}
-		id := fmt.Sprintf("%s:%d", nodeID, layerIdx)
-		if _, err := stmt.Exec(id, nodeID, layerIdx, string(neighborsJSON)); err != nil {
-			return fmt.Errorf("insert graph node: %w", err)
+		for _, neighborID := range node.neighbors {
+			if _, err := stmt.Exec(nodeID, neighborID, layerIdx); err != nil {
+				return fmt.Errorf("insert graph edge: %w", err)
+			}
 		}
 	}
 	return nil
@@ -93,31 +100,37 @@ func (h *Index) Load(db *sql.DB) error {
 		return err
 	}
 
-	return h.loadGraph(db)
+	if err := h.loadGraph(db); err != nil {
+		return err
+	}
+
+	h.refreshDerivedFields()
+	return nil
 }
 
 func (h *Index) loadMetadata(db *sql.DB) error {
-	row := db.QueryRow(`
-		SELECT entry_point, max_level, m, ef_construct, ef_search, level_mult, total_nodes
-		FROM hnsw_metadata WHERE id = 1
-	`)
-
-	var entryPoint sql.NullString
-	var totalNodes int
-
-	err := row.Scan(&entryPoint, &h.maxLevel, &h.M, &h.efConstruct, &h.efSearch, &h.levelMult, &totalNodes)
+	rows, err := db.Query("SELECT key, value FROM hnsw_meta")
 	if err != nil {
-		return fmt.Errorf("scan metadata: %w", err)
+		return fmt.Errorf("query metadata: %w", err)
 	}
+	defer rows.Close()
 
-	if entryPoint.Valid {
-		h.entryPoint = entryPoint.String
+	for rows.Next() {
+		var key string
+		var value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return fmt.Errorf("scan metadata: %w", err)
+		}
+		h.applyMetaValue(key, value)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate metadata: %w", err)
 	}
 	return nil
 }
 
 func (h *Index) loadGraph(db *sql.DB) error {
-	rows, err := db.Query(`SELECT node_id, layer, neighbors FROM hnsw_graph ORDER BY layer`)
+	rows, err := db.Query(`SELECT source_id, target_id, level FROM hnsw_edges ORDER BY level`)
 	if err != nil {
 		return fmt.Errorf("query graph: %w", err)
 	}
@@ -132,23 +145,18 @@ func (h *Index) loadGraph(db *sql.DB) error {
 }
 
 func (h *Index) loadGraphRow(rows *sql.Rows) error {
-	var nodeID string
-	var layerIdx int
-	var neighborsJSON string
+	var sourceID string
+	var targetID string
+	var level int
 
-	if err := rows.Scan(&nodeID, &layerIdx, &neighborsJSON); err != nil {
+	if err := rows.Scan(&sourceID, &targetID, &level); err != nil {
 		return fmt.Errorf("scan graph row: %w", err)
 	}
 
-	h.ensureLayers(layerIdx)
-
-	var neighbors []string
-	if err := json.Unmarshal([]byte(neighborsJSON), &neighbors); err != nil {
-		return fmt.Errorf("unmarshal neighbors: %w", err)
-	}
-
-	h.layers[layerIdx].addNode(nodeID)
-	h.layers[layerIdx].setNeighbors(nodeID, neighbors)
+	h.ensureLayers(level)
+	h.layers[level].addNode(sourceID)
+	h.layers[level].addNode(targetID)
+	h.layers[level].addNeighbor(sourceID, targetID, h.maxNeighborsForLevel(level))
 	return nil
 }
 
@@ -178,8 +186,8 @@ func (h *Index) loadVectorRow(rows *sql.Rows) error {
 	var nodeID string
 	var embeddingBlob []byte
 	var magnitude float64
-	var domain string
-	var nodeType string
+	var domain int64
+	var nodeType int64
 
 	if err := rows.Scan(&nodeID, &embeddingBlob, &magnitude, &domain, &nodeType); err != nil {
 		return fmt.Errorf("scan vector row: %w", err)
@@ -191,6 +199,78 @@ func (h *Index) loadVectorRow(rows *sql.Rows) error {
 	h.domains[nodeID] = vectorgraphdb.Domain(domain)
 	h.nodeTypes[nodeID] = vectorgraphdb.NodeType(nodeType)
 	return nil
+}
+
+func (h *Index) ensureMetaKeys(tx *sql.Tx) error {
+	keys := []string{"entry_point", "max_level", "m", "ef_construct", "ef_search", "level_mult", "total_nodes"}
+	for _, key := range keys {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO hnsw_meta (key, value) VALUES (?, '')", key); err != nil {
+			return fmt.Errorf("insert meta key %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func (h *Index) applyMetaValue(key, value string) {
+	switch key {
+	case "entry_point":
+		h.entryPoint = value
+	case "max_level":
+		h.maxLevel = parseIntDefault(value, -1)
+	case "m":
+		h.M = parseIntDefault(value, h.M)
+	case "ef_construct":
+		h.efConstruct = parseIntDefault(value, h.efConstruct)
+	case "ef_search":
+		h.efSearch = parseIntDefault(value, h.efSearch)
+	case "level_mult":
+		h.levelMult = parseFloatDefault(value, h.levelMult)
+	case "total_nodes":
+		return
+	}
+}
+
+func (h *Index) refreshDerivedFields() {
+	maxLevel := -1
+	for level, layer := range h.layers {
+		if layer.nodeCount() > 0 {
+			maxLevel = level
+		}
+	}
+	h.maxLevel = maxLevel
+
+	if h.entryPoint == "" {
+		for level := h.maxLevel; level >= 0; level-- {
+			ids := h.layers[level].allNodeIDs()
+			if len(ids) > 0 {
+				h.entryPoint = ids[0]
+				break
+			}
+		}
+	}
+}
+
+func (h *Index) maxNeighborsForLevel(level int) int {
+	if level == 0 {
+		return h.M * 2
+	}
+	return h.M
+}
+
+func parseIntDefault(value string, fallback int) int {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseFloatDefault(value string, fallback float64) float64 {
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func bytesToFloat32s(b []byte) []float32 {

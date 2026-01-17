@@ -43,7 +43,9 @@ func (ns *NodeStore) InsertNode(node *GraphNode, embedding []float32) error {
 	now := time.Now()
 	node.CreatedAt = now
 	node.UpdatedAt = now
-	node.AccessedAt = now
+	if node.Name == "" {
+		node.Name = node.ID
+	}
 
 	return ns.insertNodeTx(node, embedding)
 }
@@ -59,7 +61,11 @@ func (ns *NodeStore) validateNode(node *GraphNode) error {
 }
 
 func (ns *NodeStore) computeContentHash(node *GraphNode) string {
-	data, _ := json.Marshal(node.Metadata)
+	payload := map[string]any{
+		"content":  node.Content,
+		"metadata": node.Metadata,
+	}
+	data, _ := json.Marshal(payload)
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
 }
@@ -81,7 +87,7 @@ func (ns *NodeStore) insertNodeToDB(node *GraphNode, embedding []float32) error 
 	if err := ns.insertNodeRow(tx, node); err != nil {
 		return err
 	}
-	if err := ns.insertEmbedding(tx, node.ID, embedding); err != nil {
+	if err := ns.insertEmbedding(tx, node.ID, embedding, node.Domain, node.NodeType); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -97,23 +103,31 @@ func (ns *NodeStore) insertNodeToHNSW(node *GraphNode, embedding []float32) erro
 func (ns *NodeStore) insertNodeRow(tx *sql.Tx, node *GraphNode) error {
 	metadata, _ := json.Marshal(node.Metadata)
 	_, err := tx.Exec(`
-		INSERT INTO nodes (id, domain, node_type, content_hash, metadata, created_at, updated_at, accessed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, node.ID, node.Domain, node.NodeType, node.ContentHash, string(metadata),
-		node.CreatedAt.Format(time.RFC3339), node.UpdatedAt.Format(time.RFC3339), node.AccessedAt.Format(time.RFC3339))
+		INSERT INTO nodes (id, domain, node_type, name, path, package, line_start, line_end, signature,
+			session_id, timestamp, category, url, source, authors, published_at,
+			content, content_hash, metadata, verified, verification_type, confidence, trust_level,
+			created_at, updated_at, expires_at, superseded_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, node.ID, node.Domain, node.NodeType, node.Name, node.Path, node.Package,
+		nullInt(node.LineStart), nullInt(node.LineEnd), node.Signature,
+		nullString(node.SessionID), nullTime(node.Timestamp), nullString(node.Category),
+		nullString(node.URL), nullString(node.Source), nullJSON(node.Authors), nullTime(node.PublishedAt),
+		nullString(node.Content), node.ContentHash, string(metadata),
+		node.Verified, nullInt(int(node.VerificationType)), nullFloat(node.Confidence), nullInt(int(node.TrustLevel)),
+		node.CreatedAt.Format(time.RFC3339), node.UpdatedAt.Format(time.RFC3339), nullTime(node.ExpiresAt), nullString(node.SupersededBy))
 	if err != nil {
 		return fmt.Errorf("insert node: %w", err)
 	}
 	return nil
 }
 
-func (ns *NodeStore) insertEmbedding(tx *sql.Tx, nodeID string, embedding []float32) error {
+func (ns *NodeStore) insertEmbedding(tx *sql.Tx, nodeID string, embedding []float32, domain Domain, nodeType NodeType) error {
 	blob := float32sToBytes(embedding)
 	mag := computeMagnitude(embedding)
 	_, err := tx.Exec(`
-		INSERT INTO vectors (id, node_id, embedding, magnitude, model_version)
-		VALUES (?, ?, ?, ?, ?)
-	`, "vec-"+nodeID, nodeID, blob, mag, "v1")
+		INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, nodeID, blob, mag, EmbeddingDimension, domain, nodeType)
 	if err != nil {
 		return fmt.Errorf("insert embedding: %w", err)
 	}
@@ -130,7 +144,10 @@ func computeMagnitude(v []float32) float64 {
 
 func (ns *NodeStore) GetNode(id string) (*GraphNode, error) {
 	row := ns.db.db.QueryRow(`
-		SELECT id, domain, node_type, content_hash, metadata, created_at, updated_at, accessed_at
+		SELECT id, domain, node_type, name, path, package, line_start, line_end, signature,
+			session_id, timestamp, category, url, source, authors, published_at,
+			content, content_hash, metadata, verified, verification_type, confidence, trust_level,
+			created_at, updated_at, expires_at, superseded_by
 		FROM nodes WHERE id = ?
 	`, id)
 	return ns.scanNode(row)
@@ -138,11 +155,22 @@ func (ns *NodeStore) GetNode(id string) (*GraphNode, error) {
 
 func (ns *NodeStore) scanNode(row *sql.Row) (*GraphNode, error) {
 	var node GraphNode
-	var metadataJSON string
-	var createdAt, updatedAt, accessedAt string
+	var metadataJSON, createdAt, updatedAt string
+	var path, pkg, signature sql.NullString
+	var lineStart, lineEnd sql.NullInt64
+	var sessionID, category, url, source, content, supersededBy sql.NullString
+	var timestamp, publishedAt, expiresAt sql.NullString
+	var authors sql.NullString
+	var verificationType, trustLevel sql.NullInt64
+	var confidence sql.NullFloat64
 
-	err := row.Scan(&node.ID, &node.Domain, &node.NodeType, &node.ContentHash,
-		&metadataJSON, &createdAt, &updatedAt, &accessedAt)
+	err := row.Scan(&node.ID, &node.Domain, &node.NodeType, &node.Name,
+		&path, &pkg, &lineStart, &lineEnd, &signature,
+		&sessionID, &timestamp, &category,
+		&url, &source, &authors, &publishedAt,
+		&content, &node.ContentHash, &metadataJSON,
+		&node.Verified, &verificationType, &confidence, &trustLevel,
+		&createdAt, &updatedAt, &expiresAt, &supersededBy)
 	if err == sql.ErrNoRows {
 		return nil, ErrNodeNotFound
 	}
@@ -150,16 +178,45 @@ func (ns *NodeStore) scanNode(row *sql.Row) (*GraphNode, error) {
 		return nil, fmt.Errorf("scan node: %w", err)
 	}
 
-	return ns.parseNode(&node, metadataJSON, createdAt, updatedAt, accessedAt)
+	node.Path = path.String
+	node.Package = pkg.String
+	node.LineStart = int(lineStart.Int64)
+	node.LineEnd = int(lineEnd.Int64)
+	node.Signature = signature.String
+	node.SessionID = sessionID.String
+	node.Timestamp, _ = time.Parse(time.RFC3339, timestamp.String)
+	node.Category = category.String
+	node.URL = url.String
+	node.Source = source.String
+	if authors.Valid {
+		var decoded any
+		if err := json.Unmarshal([]byte(authors.String), &decoded); err == nil {
+			node.Authors = decoded
+		}
+	}
+	node.PublishedAt, _ = time.Parse(time.RFC3339, publishedAt.String)
+	node.Content = content.String
+	node.VerificationType = VerificationType(verificationType.Int64)
+	node.Confidence = confidence.Float64
+	node.TrustLevel = TrustLevel(trustLevel.Int64)
+	node.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt.String)
+	node.SupersededBy = supersededBy.String
+	if err == sql.ErrNoRows {
+		return nil, ErrNodeNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan node: %w", err)
+	}
+
+	return ns.parseNode(&node, metadataJSON, createdAt, updatedAt)
 }
 
-func (ns *NodeStore) parseNode(node *GraphNode, metadataJSON, createdAt, updatedAt, accessedAt string) (*GraphNode, error) {
+func (ns *NodeStore) parseNode(node *GraphNode, metadataJSON, createdAt, updatedAt string) (*GraphNode, error) {
 	if err := json.Unmarshal([]byte(metadataJSON), &node.Metadata); err != nil {
 		node.Metadata = make(map[string]any)
 	}
 	node.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	node.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
-	node.AccessedAt, _ = time.Parse(time.RFC3339, accessedAt)
 	return node, nil
 }
 
@@ -177,10 +234,18 @@ func (ns *NodeStore) UpdateNode(node *GraphNode) error {
 func (ns *NodeStore) updateNodeRow(node *GraphNode) error {
 	metadata, _ := json.Marshal(node.Metadata)
 	result, err := ns.db.db.Exec(`
-		UPDATE nodes SET domain = ?, node_type = ?, content_hash = ?, metadata = ?, updated_at = ?
+		UPDATE nodes SET domain = ?, node_type = ?, name = ?, path = ?, package = ?, line_start = ?, line_end = ?, signature = ?,
+			session_id = ?, timestamp = ?, category = ?, url = ?, source = ?, authors = ?, published_at = ?,
+			content = ?, content_hash = ?, metadata = ?, verified = ?, verification_type = ?, confidence = ?, trust_level = ?,
+			updated_at = ?, expires_at = ?, superseded_by = ?
 		WHERE id = ?
-	`, node.Domain, node.NodeType, node.ContentHash, string(metadata),
-		node.UpdatedAt.Format(time.RFC3339), node.ID)
+	`, node.Domain, node.NodeType, node.Name, node.Path, node.Package,
+		nullInt(node.LineStart), nullInt(node.LineEnd), node.Signature,
+		nullString(node.SessionID), nullTime(node.Timestamp), nullString(node.Category),
+		nullString(node.URL), nullString(node.Source), nullJSON(node.Authors), nullTime(node.PublishedAt),
+		nullString(node.Content), node.ContentHash, string(metadata),
+		node.Verified, nullInt(int(node.VerificationType)), nullFloat(node.Confidence), nullInt(int(node.TrustLevel)),
+		node.UpdatedAt.Format(time.RFC3339), nullTime(node.ExpiresAt), nullString(node.SupersededBy), node.ID)
 	if err != nil {
 		return fmt.Errorf("update node: %w", err)
 	}
@@ -211,7 +276,10 @@ func (ns *NodeStore) DeleteNode(id string) error {
 
 func (ns *NodeStore) GetNodesByType(domain Domain, nodeType NodeType, limit int) ([]*GraphNode, error) {
 	rows, err := ns.db.db.Query(`
-		SELECT id, domain, node_type, content_hash, metadata, created_at, updated_at, accessed_at
+		SELECT id, domain, node_type, name, path, package, line_start, line_end, signature,
+			session_id, timestamp, category, url, source, authors, published_at,
+			content, content_hash, metadata, verified, verification_type, confidence, trust_level,
+			created_at, updated_at, expires_at, superseded_by
 		FROM nodes WHERE domain = ? AND node_type = ? LIMIT ?
 	`, domain, nodeType, limit)
 	if err != nil {
@@ -236,20 +304,75 @@ func (ns *NodeStore) scanNodes(rows *sql.Rows) ([]*GraphNode, error) {
 
 func (ns *NodeStore) scanNodeRow(rows *sql.Rows) (*GraphNode, error) {
 	var node GraphNode
-	var metadataJSON, createdAt, updatedAt, accessedAt string
+	var metadataJSON, createdAt, updatedAt sql.NullString
+	var path, pkg, signature sql.NullString
+	var lineStart, lineEnd sql.NullInt64
+	var sessionID, category, url, source, content, supersededBy sql.NullString
+	var timestamp, publishedAt, expiresAt sql.NullString
+	var authors sql.NullString
+	var verificationType, trustLevel sql.NullInt64
+	var confidence sql.NullFloat64
 
-	err := rows.Scan(&node.ID, &node.Domain, &node.NodeType, &node.ContentHash,
-		&metadataJSON, &createdAt, &updatedAt, &accessedAt)
+	err := rows.Scan(&node.ID, &node.Domain, &node.NodeType, &node.Name,
+		&path, &pkg, &lineStart, &lineEnd, &signature,
+		&sessionID, &timestamp, &category,
+		&url, &source, &authors, &publishedAt,
+		&content, &node.ContentHash, &metadataJSON,
+		&node.Verified, &verificationType, &confidence, &trustLevel,
+		&createdAt, &updatedAt, &expiresAt, &supersededBy)
 	if err != nil {
 		return nil, fmt.Errorf("scan node row: %w", err)
 	}
 
-	return ns.parseNode(&node, metadataJSON, createdAt, updatedAt, accessedAt)
+	node.Path = path.String
+	node.Package = pkg.String
+	if lineStart.Valid {
+		node.LineStart = int(lineStart.Int64)
+	}
+	if lineEnd.Valid {
+		node.LineEnd = int(lineEnd.Int64)
+	}
+	node.Signature = signature.String
+	node.SessionID = sessionID.String
+	if timestamp.Valid {
+		node.Timestamp, _ = time.Parse(time.RFC3339, timestamp.String)
+	}
+	node.Category = category.String
+	node.URL = url.String
+	node.Source = source.String
+	if authors.Valid {
+		var decoded any
+		if err := json.Unmarshal([]byte(authors.String), &decoded); err == nil {
+			node.Authors = decoded
+		}
+	}
+	if publishedAt.Valid {
+		node.PublishedAt, _ = time.Parse(time.RFC3339, publishedAt.String)
+	}
+	node.Content = content.String
+	if verificationType.Valid {
+		node.VerificationType = VerificationType(verificationType.Int64)
+	}
+	if confidence.Valid {
+		node.Confidence = confidence.Float64
+	}
+	if trustLevel.Valid {
+		node.TrustLevel = TrustLevel(trustLevel.Int64)
+	}
+	if expiresAt.Valid {
+		node.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt.String)
+	}
+	node.SupersededBy = supersededBy.String
+
+	return ns.parseNode(&node, metadataJSON.String, createdAt.String, updatedAt.String)
 }
 
 func (ns *NodeStore) GetNodesByContentHash(hash string) ([]*GraphNode, error) {
 	rows, err := ns.db.db.Query(`
-		SELECT id, domain, node_type, content_hash, metadata, created_at, updated_at, accessed_at
+		SELECT id, domain, node_type, name, path, package, line_start, line_end, signature,
+			session_id, timestamp, category, url, source, authors, published_at,
+			content, content_hash, metadata, verified, verification_type, confidence, trust_level,
+			created_at, updated_at, expires_at, superseded_by
 		FROM nodes WHERE content_hash = ?
 	`, hash)
 	if err != nil {
@@ -262,7 +385,7 @@ func (ns *NodeStore) GetNodesByContentHash(hash string) ([]*GraphNode, error) {
 
 func (ns *NodeStore) TouchNode(id string) error {
 	now := time.Now().Format(time.RFC3339)
-	result, err := ns.db.db.Exec("UPDATE nodes SET accessed_at = ? WHERE id = ?", now, id)
+	result, err := ns.db.db.Exec("UPDATE nodes SET updated_at = ? WHERE id = ?", now, id)
 	if err != nil {
 		return fmt.Errorf("touch node: %w", err)
 	}
@@ -272,6 +395,45 @@ func (ns *NodeStore) TouchNode(id string) error {
 		return ErrNodeNotFound
 	}
 	return nil
+}
+
+func nullString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullInt(value int) any {
+	if value == 0 {
+		return nil
+	}
+	return value
+}
+
+func nullTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value
+}
+
+func nullFloat(value float64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
+}
+
+func nullJSON(value any) any {
+	if value == nil {
+		return nil
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return string(payload)
 }
 
 func float32sToBytes(f []float32) []byte {

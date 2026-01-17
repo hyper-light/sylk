@@ -85,7 +85,7 @@ func (f *FreshnessTracker) computeScore(node *vectorgraphdb.GraphNode, decayRate
 	ageHours := time.Since(node.UpdatedAt).Hours()
 	decayScore := math.Exp(-decayRate * ageHours)
 
-	accessRecency := time.Since(node.AccessedAt).Hours()
+	accessRecency := time.Since(node.UpdatedAt).Hours()
 	accessBoost := computeAccessBoost(accessRecency)
 
 	return decayScore * accessBoost
@@ -204,7 +204,7 @@ func (f *FreshnessTracker) FindStaleNodes(domain vectorgraphdb.Domain, threshold
 	cutoff := time.Now().Add(-threshold).Format(time.RFC3339)
 
 	rows, err := f.db.DB().Query(`
-		SELECT id, domain, node_type, content_hash, metadata, created_at, updated_at, accessed_at
+		SELECT id, domain, node_type, content_hash, metadata, created_at, updated_at
 		FROM nodes WHERE domain = ? AND updated_at < ? LIMIT 1000
 	`, domain, cutoff)
 	if err != nil {
@@ -233,17 +233,16 @@ func (f *FreshnessTracker) scanStaleNodes(rows interface {
 
 func (f *FreshnessTracker) scanNodeRow(row interface{ Scan(...any) error }) (*vectorgraphdb.GraphNode, error) {
 	var node vectorgraphdb.GraphNode
-	var metadataJSON, createdAt, updatedAt, accessedAt string
+	var metadataJSON, createdAt, updatedAt string
 
 	err := row.Scan(&node.ID, &node.Domain, &node.NodeType, &node.ContentHash,
-		&metadataJSON, &createdAt, &updatedAt, &accessedAt)
+		&metadataJSON, &createdAt, &updatedAt)
 	if err != nil {
 		return nil, err
 	}
 
 	node.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	node.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
-	node.AccessedAt, _ = time.Parse(time.RFC3339, accessedAt)
 
 	return &node, nil
 }

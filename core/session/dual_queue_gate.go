@@ -31,13 +31,13 @@ type QueuedRequest struct {
 	RequestType  RequestType
 	Priority     int
 	SpawnTime    time.Time
-	Payload      interface{}
+	Payload      any
 	CancelFunc   context.CancelFunc
 	ResponseChan chan *QueuedResponse
 }
 
 type QueuedResponse struct {
-	Result interface{}
+	Result any
 	Error  error
 }
 
@@ -49,7 +49,7 @@ type SessionQueueState struct {
 }
 
 type CrossSessionDualQueueGateConfig struct {
-	SignalDispatcher    *SignalDispatcher
+	SignalDispatcher    *CrossSessionSignalDispatcher
 	SubscriptionTracker *GlobalSubscriptionTracker
 	FairShare           *FairShareCalculator
 }
@@ -60,7 +60,7 @@ type CrossSessionDualQueueGate struct {
 
 	sessionStates map[string]*SessionQueueState
 
-	signalDispatcher    *SignalDispatcher
+	signalDispatcher    *CrossSessionSignalDispatcher
 	subscriptionTracker *GlobalSubscriptionTracker
 	fairShare           *FairShareCalculator
 
@@ -240,7 +240,7 @@ func (g *CrossSessionDualQueueGate) removeRequest(req *QueuedRequest) {
 	g.pipelineQueue = g.removeFromQueue(g.pipelineQueue, req.ID)
 
 	if state := g.sessionStates[req.SessionID]; state != nil {
-		state.QueuedRequests = maxInt(0, state.QueuedRequests-1)
+		state.QueuedRequests = max(0, state.QueuedRequests-1)
 	}
 }
 
@@ -300,16 +300,16 @@ func (g *CrossSessionDualQueueGate) updateSessionState(req *QueuedRequest, activ
 		return
 	}
 
-	state.QueuedRequests = maxInt(0, state.QueuedRequests-1)
+	state.QueuedRequests = max(0, state.QueuedRequests-1)
 	if active {
 		state.ActiveRequests++
 	}
 }
 
-func (g *CrossSessionDualQueueGate) CompleteRequest(req *QueuedRequest, result interface{}, err error) {
+func (g *CrossSessionDualQueueGate) CompleteRequest(req *QueuedRequest, result any, err error) {
 	g.mu.Lock()
 	if state := g.sessionStates[req.SessionID]; state != nil {
-		state.ActiveRequests = maxInt(0, state.ActiveRequests-1)
+		state.ActiveRequests = max(0, state.ActiveRequests-1)
 	}
 	g.mu.Unlock()
 

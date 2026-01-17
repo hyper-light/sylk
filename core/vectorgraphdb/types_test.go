@@ -23,8 +23,8 @@ func TestDomainConstants(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if string(tt.domain) != tt.expected {
-				t.Errorf("expected %q, got %q", tt.expected, string(tt.domain))
+			if tt.domain.String() != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, tt.domain.String())
 			}
 		})
 	}
@@ -66,10 +66,10 @@ func TestDomainIsValid(t *testing.T) {
 		{"valid code domain", DomainCode, true},
 		{"valid history domain", DomainHistory, true},
 		{"valid academic domain", DomainAcademic, true},
-		{"invalid empty domain", Domain(""), false},
-		{"invalid arbitrary domain", Domain("invalid"), false},
-		{"invalid similar domain", Domain("codes"), false},
-		{"invalid case domain", Domain("Code"), false},
+		{"invalid empty domain", Domain(-1), false},
+		{"invalid arbitrary domain", Domain(99), false},
+		{"invalid similar domain", Domain(4), false},
+		{"invalid case domain", Domain(7), false},
 	}
 
 	for _, tt := range tests {
@@ -89,7 +89,7 @@ func TestDomainString(t *testing.T) {
 		{DomainCode, "code"},
 		{DomainHistory, "history"},
 		{DomainAcademic, "academic"},
-		{Domain("custom"), "custom"},
+		{Domain(42), "domain(42)"},
 	}
 
 	for _, tt := range tests {
@@ -112,9 +112,13 @@ func TestNodeTypeConstants(t *testing.T) {
 		expected string
 	}{
 		{NodeTypeFile, "file"},
-		{NodeTypeFunction, "function"},
-		{NodeTypeType, "type"},
 		{NodeTypePackage, "package"},
+		{NodeTypeFunction, "function"},
+		{NodeTypeMethod, "method"},
+		{NodeTypeStruct, "struct"},
+		{NodeTypeInterface, "interface"},
+		{NodeTypeVariable, "variable"},
+		{NodeTypeConstant, "constant"},
 		{NodeTypeImport, "import"},
 	}
 
@@ -123,11 +127,11 @@ func TestNodeTypeConstants(t *testing.T) {
 		nodeType NodeType
 		expected string
 	}{
+		{NodeTypeHistoryEntry, "history_entry"},
 		{NodeTypeSession, "session"},
-		{NodeTypeDecision, "decision"},
-		{NodeTypeFailure, "failure"},
-		{NodeTypePattern, "pattern"},
 		{NodeTypeWorkflow, "workflow"},
+		{NodeTypeOutcome, "outcome"},
+		{NodeTypeDecision, "decision"},
 	}
 
 	// Academic domain node types
@@ -135,19 +139,21 @@ func TestNodeTypeConstants(t *testing.T) {
 		nodeType NodeType
 		expected string
 	}{
-		{NodeTypeRepo, "repo"},
-		{NodeTypeDoc, "doc"},
-		{NodeTypeArticle, "article"},
-		{NodeTypeConcept, "concept"},
+		{NodeTypePaper, "paper"},
+		{NodeTypeDocumentation, "documentation"},
 		{NodeTypeBestPractice, "best_practice"},
+		{NodeTypeRFC, "rfc"},
+		{NodeTypeStackOverflow, "stackoverflow"},
+		{NodeTypeBlogPost, "blog_post"},
+		{NodeTypeTutorial, "tutorial"},
 	}
 
 	allTypes := append(codeTypes, append(historyTypes, academicTypes...)...)
 
 	for _, tt := range allTypes {
 		t.Run(tt.expected, func(t *testing.T) {
-			if string(tt.nodeType) != tt.expected {
-				t.Errorf("expected %q, got %q", tt.expected, string(tt.nodeType))
+			if tt.nodeType.String() != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, tt.nodeType.String())
 			}
 		})
 	}
@@ -156,30 +162,35 @@ func TestNodeTypeConstants(t *testing.T) {
 func TestValidNodeTypes(t *testing.T) {
 	nodeTypes := ValidNodeTypes()
 
-	// Should have 5 code + 5 history + 5 academic = 15 total
-	if len(nodeTypes) != 15 {
-		t.Errorf("expected 15 node types, got %d", len(nodeTypes))
+	if len(nodeTypes) != 21 {
+		t.Errorf("expected 21 node types, got %d", len(nodeTypes))
 	}
 
 	expectedTypes := map[NodeType]bool{
 		// Code domain
-		NodeTypeFile:     false,
-		NodeTypeFunction: false,
-		NodeTypeType:     false,
-		NodeTypePackage:  false,
-		NodeTypeImport:   false,
+		NodeTypeFile:      false,
+		NodeTypePackage:   false,
+		NodeTypeFunction:  false,
+		NodeTypeMethod:    false,
+		NodeTypeStruct:    false,
+		NodeTypeInterface: false,
+		NodeTypeVariable:  false,
+		NodeTypeConstant:  false,
+		NodeTypeImport:    false,
 		// History domain
-		NodeTypeSession:  false,
-		NodeTypeDecision: false,
-		NodeTypeFailure:  false,
-		NodeTypePattern:  false,
-		NodeTypeWorkflow: false,
+		NodeTypeHistoryEntry: false,
+		NodeTypeSession:      false,
+		NodeTypeWorkflow:     false,
+		NodeTypeOutcome:      false,
+		NodeTypeDecision:     false,
 		// Academic domain
-		NodeTypeRepo:         false,
-		NodeTypeDoc:          false,
-		NodeTypeArticle:      false,
-		NodeTypeConcept:      false,
-		NodeTypeBestPractice: false,
+		NodeTypePaper:         false,
+		NodeTypeDocumentation: false,
+		NodeTypeBestPractice:  false,
+		NodeTypeRFC:           false,
+		NodeTypeStackOverflow: false,
+		NodeTypeBlogPost:      false,
+		NodeTypeTutorial:      false,
 	}
 
 	for _, nt := range nodeTypes {
@@ -207,9 +218,13 @@ func TestValidNodeTypesForDomain(t *testing.T) {
 			domain: DomainCode,
 			expectedTypes: []NodeType{
 				NodeTypeFile,
-				NodeTypeFunction,
-				NodeTypeType,
 				NodeTypePackage,
+				NodeTypeFunction,
+				NodeTypeMethod,
+				NodeTypeStruct,
+				NodeTypeInterface,
+				NodeTypeVariable,
+				NodeTypeConstant,
 				NodeTypeImport,
 			},
 		},
@@ -217,32 +232,34 @@ func TestValidNodeTypesForDomain(t *testing.T) {
 			name:   "history domain",
 			domain: DomainHistory,
 			expectedTypes: []NodeType{
+				NodeTypeHistoryEntry,
 				NodeTypeSession,
-				NodeTypeDecision,
-				NodeTypeFailure,
-				NodeTypePattern,
 				NodeTypeWorkflow,
+				NodeTypeOutcome,
+				NodeTypeDecision,
 			},
 		},
 		{
 			name:   "academic domain",
 			domain: DomainAcademic,
 			expectedTypes: []NodeType{
-				NodeTypeRepo,
-				NodeTypeDoc,
-				NodeTypeArticle,
-				NodeTypeConcept,
+				NodeTypePaper,
+				NodeTypeDocumentation,
 				NodeTypeBestPractice,
+				NodeTypeRFC,
+				NodeTypeStackOverflow,
+				NodeTypeBlogPost,
+				NodeTypeTutorial,
 			},
 		},
 		{
 			name:          "invalid domain",
-			domain:        Domain("invalid"),
+			domain:        Domain(99),
 			expectedTypes: nil,
 		},
 		{
 			name:          "empty domain",
-			domain:        Domain(""),
+			domain:        Domain(-1),
 			expectedTypes: nil,
 		},
 	}
@@ -284,7 +301,8 @@ func TestNodeTypeIsValid(t *testing.T) {
 	// All valid node types
 	validTypes := ValidNodeTypes()
 	for _, nt := range validTypes {
-		t.Run("valid_"+string(nt), func(t *testing.T) {
+		t.Run("valid_"+nt.String(), func(t *testing.T) {
+
 			if !nt.IsValid() {
 				t.Errorf("NodeType(%q).IsValid() = false, want true", nt)
 			}
@@ -293,15 +311,14 @@ func TestNodeTypeIsValid(t *testing.T) {
 
 	// Invalid node types
 	invalidTypes := []NodeType{
-		NodeType(""),
-		NodeType("invalid"),
-		NodeType("File"),   // wrong case
-		NodeType("files"),  // wrong plural
-		NodeType("method"), // similar but not valid
+		NodeType(-1),
+		NodeType(999),
+		NodeType(42),
 	}
 
 	for _, nt := range invalidTypes {
-		t.Run("invalid_"+string(nt), func(t *testing.T) {
+		t.Run("invalid_"+nt.String(), func(t *testing.T) {
+
 			if nt.IsValid() {
 				t.Errorf("NodeType(%q).IsValid() = true, want false", nt)
 			}
@@ -318,40 +335,46 @@ func TestNodeTypeIsValidForDomain(t *testing.T) {
 	}{
 		// Code domain - valid
 		{"file in code", NodeTypeFile, DomainCode, true},
-		{"function in code", NodeTypeFunction, DomainCode, true},
-		{"type in code", NodeTypeType, DomainCode, true},
 		{"package in code", NodeTypePackage, DomainCode, true},
+		{"function in code", NodeTypeFunction, DomainCode, true},
+		{"method in code", NodeTypeMethod, DomainCode, true},
+		{"struct in code", NodeTypeStruct, DomainCode, true},
+		{"interface in code", NodeTypeInterface, DomainCode, true},
+		{"variable in code", NodeTypeVariable, DomainCode, true},
+		{"constant in code", NodeTypeConstant, DomainCode, true},
 		{"import in code", NodeTypeImport, DomainCode, true},
 
 		// Code domain - invalid
 		{"session in code", NodeTypeSession, DomainCode, false},
-		{"repo in code", NodeTypeRepo, DomainCode, false},
+		{"paper in code", NodeTypePaper, DomainCode, false},
 
 		// History domain - valid
+		{"history_entry in history", NodeTypeHistoryEntry, DomainHistory, true},
 		{"session in history", NodeTypeSession, DomainHistory, true},
-		{"decision in history", NodeTypeDecision, DomainHistory, true},
-		{"failure in history", NodeTypeFailure, DomainHistory, true},
-		{"pattern in history", NodeTypePattern, DomainHistory, true},
 		{"workflow in history", NodeTypeWorkflow, DomainHistory, true},
+		{"outcome in history", NodeTypeOutcome, DomainHistory, true},
+		{"decision in history", NodeTypeDecision, DomainHistory, true},
 
 		// History domain - invalid
 		{"file in history", NodeTypeFile, DomainHistory, false},
-		{"doc in history", NodeTypeDoc, DomainHistory, false},
+		{"documentation in history", NodeTypeDocumentation, DomainHistory, false},
 
 		// Academic domain - valid
-		{"repo in academic", NodeTypeRepo, DomainAcademic, true},
-		{"doc in academic", NodeTypeDoc, DomainAcademic, true},
-		{"article in academic", NodeTypeArticle, DomainAcademic, true},
-		{"concept in academic", NodeTypeConcept, DomainAcademic, true},
+		{"paper in academic", NodeTypePaper, DomainAcademic, true},
+		{"documentation in academic", NodeTypeDocumentation, DomainAcademic, true},
 		{"best_practice in academic", NodeTypeBestPractice, DomainAcademic, true},
+		{"rfc in academic", NodeTypeRFC, DomainAcademic, true},
+		{"stackoverflow in academic", NodeTypeStackOverflow, DomainAcademic, true},
+		{"blog_post in academic", NodeTypeBlogPost, DomainAcademic, true},
+		{"tutorial in academic", NodeTypeTutorial, DomainAcademic, true},
 
 		// Academic domain - invalid
 		{"function in academic", NodeTypeFunction, DomainAcademic, false},
 		{"session in academic", NodeTypeSession, DomainAcademic, false},
 
 		// Invalid domain
-		{"file in invalid domain", NodeTypeFile, Domain("invalid"), false},
-		{"invalid type in code", NodeType("invalid"), DomainCode, false},
+		{"file in invalid domain", NodeTypeFile, Domain(99), false},
+		{"invalid type in code", NodeType(999), DomainCode, false},
 	}
 
 	for _, tt := range tests {
@@ -372,8 +395,8 @@ func TestNodeTypeString(t *testing.T) {
 		{NodeTypeFile, "file"},
 		{NodeTypeFunction, "function"},
 		{NodeTypeSession, "session"},
-		{NodeTypeRepo, "repo"},
-		{NodeType("custom"), "custom"},
+		{NodeTypeDocumentation, "documentation"},
+		{NodeType(999), "node_type(999)"},
 	}
 
 	for _, tt := range tests {
@@ -399,7 +422,7 @@ func TestEdgeTypeConstants(t *testing.T) {
 		{EdgeTypeImports, "imports"},
 		{EdgeTypeDefines, "defines"},
 		{EdgeTypeImplements, "implements"},
-		{EdgeTypeContains, "contains"},
+		{EdgeTypeEmbeds, "embeds"},
 	}
 
 	// Temporal edge types
@@ -407,9 +430,9 @@ func TestEdgeTypeConstants(t *testing.T) {
 		edgeType EdgeType
 		expected string
 	}{
-		{EdgeTypeFollows, "follows"},
-		{EdgeTypeCauses, "causes"},
-		{EdgeTypeResolves, "resolves"},
+		{EdgeTypeProducedBy, "produced_by"},
+		{EdgeTypeResultedIn, "resulted_in"},
+		{EdgeTypeSimilarTo, "similar_to"},
 	}
 
 	// Cross-domain edge types
@@ -418,17 +441,17 @@ func TestEdgeTypeConstants(t *testing.T) {
 		expected string
 	}{
 		{EdgeTypeReferences, "references"},
-		{EdgeTypeAppliesTo, "applies_to"},
 		{EdgeTypeDocuments, "documents"},
 		{EdgeTypeModified, "modified"},
+		{EdgeTypeUsesLibrary, "uses_library"},
 	}
 
 	allTypes := append(structuralTypes, append(temporalTypes, crossDomainTypes...)...)
 
 	for _, tt := range allTypes {
 		t.Run(tt.expected, func(t *testing.T) {
-			if string(tt.edgeType) != tt.expected {
-				t.Errorf("expected %q, got %q", tt.expected, string(tt.edgeType))
+			if tt.edgeType.String() != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, tt.edgeType.String())
 			}
 		})
 	}
@@ -437,27 +460,40 @@ func TestEdgeTypeConstants(t *testing.T) {
 func TestValidEdgeTypes(t *testing.T) {
 	edgeTypes := ValidEdgeTypes()
 
-	// Should have 5 structural + 3 temporal + 4 cross-domain = 12 total
-	if len(edgeTypes) != 12 {
-		t.Errorf("expected 12 edge types, got %d", len(edgeTypes))
+	if len(edgeTypes) != 29 {
+		t.Errorf("expected 29 edge types, got %d", len(edgeTypes))
 	}
 
 	expectedTypes := map[EdgeType]bool{
-		// Structural
-		EdgeTypeCalls:      false,
-		EdgeTypeImports:    false,
-		EdgeTypeDefines:    false,
-		EdgeTypeImplements: false,
-		EdgeTypeContains:   false,
-		// Temporal
-		EdgeTypeFollows:  false,
-		EdgeTypeCauses:   false,
-		EdgeTypeResolves: false,
-		// Cross-domain
-		EdgeTypeReferences: false,
-		EdgeTypeAppliesTo:  false,
-		EdgeTypeDocuments:  false,
-		EdgeTypeModified:   false,
+		EdgeTypeCalls:             false,
+		EdgeTypeCalledBy:          false,
+		EdgeTypeImports:           false,
+		EdgeTypeImportedBy:        false,
+		EdgeTypeImplements:        false,
+		EdgeTypeImplementedBy:     false,
+		EdgeTypeEmbeds:            false,
+		EdgeTypeHasField:          false,
+		EdgeTypeHasMethod:         false,
+		EdgeTypeDefines:           false,
+		EdgeTypeDefinedIn:         false,
+		EdgeTypeReturns:           false,
+		EdgeTypeReceives:          false,
+		EdgeTypeProducedBy:        false,
+		EdgeTypeResultedIn:        false,
+		EdgeTypeSimilarTo:         false,
+		EdgeTypeFollowedBy:        false,
+		EdgeTypeSupersedes:        false,
+		EdgeTypeModified:          false,
+		EdgeTypeCreated:           false,
+		EdgeTypeDeleted:           false,
+		EdgeTypeBasedOn:           false,
+		EdgeTypeReferences:        false,
+		EdgeTypeValidatedBy:       false,
+		EdgeTypeDocuments:         false,
+		EdgeTypeUsesLibrary:       false,
+		EdgeTypeImplementsPattern: false,
+		EdgeTypeCites:             false,
+		EdgeTypeRelatedTo:         false,
 	}
 
 	for _, et := range edgeTypes {
@@ -477,16 +513,24 @@ func TestValidEdgeTypes(t *testing.T) {
 func TestStructuralEdgeTypes(t *testing.T) {
 	structuralTypes := StructuralEdgeTypes()
 
-	if len(structuralTypes) != 5 {
-		t.Errorf("expected 5 structural edge types, got %d", len(structuralTypes))
+	if len(structuralTypes) != 13 {
+		t.Errorf("expected 13 structural edge types, got %d", len(structuralTypes))
 	}
 
 	expectedTypes := []EdgeType{
 		EdgeTypeCalls,
+		EdgeTypeCalledBy,
 		EdgeTypeImports,
-		EdgeTypeDefines,
+		EdgeTypeImportedBy,
 		EdgeTypeImplements,
-		EdgeTypeContains,
+		EdgeTypeImplementedBy,
+		EdgeTypeEmbeds,
+		EdgeTypeHasField,
+		EdgeTypeHasMethod,
+		EdgeTypeDefines,
+		EdgeTypeDefinedIn,
+		EdgeTypeReturns,
+		EdgeTypeReceives,
 	}
 
 	typeSet := make(map[EdgeType]bool)
@@ -501,7 +545,7 @@ func TestStructuralEdgeTypes(t *testing.T) {
 	}
 
 	// Verify non-structural types are not included
-	nonStructural := []EdgeType{EdgeTypeFollows, EdgeTypeReferences, EdgeTypeModified}
+	nonStructural := []EdgeType{EdgeTypeProducedBy, EdgeTypeReferences, EdgeTypeModified}
 	for _, et := range nonStructural {
 		if typeSet[et] {
 			t.Errorf("StructuralEdgeTypes incorrectly includes %q", et)
@@ -512,14 +556,16 @@ func TestStructuralEdgeTypes(t *testing.T) {
 func TestTemporalEdgeTypes(t *testing.T) {
 	temporalTypes := TemporalEdgeTypes()
 
-	if len(temporalTypes) != 3 {
-		t.Errorf("expected 3 temporal edge types, got %d", len(temporalTypes))
+	if len(temporalTypes) != 5 {
+		t.Errorf("expected 5 temporal edge types, got %d", len(temporalTypes))
 	}
 
 	expectedTypes := []EdgeType{
-		EdgeTypeFollows,
-		EdgeTypeCauses,
-		EdgeTypeResolves,
+		EdgeTypeProducedBy,
+		EdgeTypeResultedIn,
+		EdgeTypeSimilarTo,
+		EdgeTypeFollowedBy,
+		EdgeTypeSupersedes,
 	}
 
 	typeSet := make(map[EdgeType]bool)
@@ -533,7 +579,6 @@ func TestTemporalEdgeTypes(t *testing.T) {
 		}
 	}
 
-	// Verify non-temporal types are not included
 	nonTemporal := []EdgeType{EdgeTypeCalls, EdgeTypeReferences, EdgeTypeModified}
 	for _, et := range nonTemporal {
 		if typeSet[et] {
@@ -545,15 +590,22 @@ func TestTemporalEdgeTypes(t *testing.T) {
 func TestCrossDomainEdgeTypes(t *testing.T) {
 	crossDomainTypes := CrossDomainEdgeTypes()
 
-	if len(crossDomainTypes) != 4 {
-		t.Errorf("expected 4 cross-domain edge types, got %d", len(crossDomainTypes))
+	if len(crossDomainTypes) != 11 {
+		t.Errorf("expected 11 cross-domain edge types, got %d", len(crossDomainTypes))
 	}
 
 	expectedTypes := []EdgeType{
-		EdgeTypeReferences,
-		EdgeTypeAppliesTo,
-		EdgeTypeDocuments,
 		EdgeTypeModified,
+		EdgeTypeCreated,
+		EdgeTypeDeleted,
+		EdgeTypeBasedOn,
+		EdgeTypeReferences,
+		EdgeTypeValidatedBy,
+		EdgeTypeDocuments,
+		EdgeTypeUsesLibrary,
+		EdgeTypeImplementsPattern,
+		EdgeTypeCites,
+		EdgeTypeRelatedTo,
 	}
 
 	typeSet := make(map[EdgeType]bool)
@@ -568,7 +620,7 @@ func TestCrossDomainEdgeTypes(t *testing.T) {
 	}
 
 	// Verify non-cross-domain types are not included
-	nonCrossDomain := []EdgeType{EdgeTypeCalls, EdgeTypeFollows, EdgeTypeDefines}
+	nonCrossDomain := []EdgeType{EdgeTypeCalls, EdgeTypeProducedBy, EdgeTypeDefines}
 	for _, et := range nonCrossDomain {
 		if typeSet[et] {
 			t.Errorf("CrossDomainEdgeTypes incorrectly includes %q", et)
@@ -580,7 +632,8 @@ func TestEdgeTypeIsValid(t *testing.T) {
 	// All valid edge types
 	validTypes := ValidEdgeTypes()
 	for _, et := range validTypes {
-		t.Run("valid_"+string(et), func(t *testing.T) {
+		t.Run("valid_"+et.String(), func(t *testing.T) {
+
 			if !et.IsValid() {
 				t.Errorf("EdgeType(%q).IsValid() = false, want true", et)
 			}
@@ -589,15 +642,14 @@ func TestEdgeTypeIsValid(t *testing.T) {
 
 	// Invalid edge types
 	invalidTypes := []EdgeType{
-		EdgeType(""),
-		EdgeType("invalid"),
-		EdgeType("Calls"),   // wrong case
-		EdgeType("calling"), // similar but not valid
-		EdgeType("call"),    // similar but not valid
+		EdgeType(-1),
+		EdgeType(999),
+		EdgeType(42),
 	}
 
 	for _, et := range invalidTypes {
-		t.Run("invalid_"+string(et), func(t *testing.T) {
+		t.Run("invalid_"+et.String(), func(t *testing.T) {
+
 			if et.IsValid() {
 				t.Errorf("EdgeType(%q).IsValid() = true, want false", et)
 			}
@@ -616,20 +668,17 @@ func TestEdgeTypeIsStructural(t *testing.T) {
 		{"imports is structural", EdgeTypeImports, true},
 		{"defines is structural", EdgeTypeDefines, true},
 		{"implements is structural", EdgeTypeImplements, true},
-		{"contains is structural", EdgeTypeContains, true},
+		{"embeds is structural", EdgeTypeEmbeds, true},
 
 		// Non-structural types
-		{"follows is not structural", EdgeTypeFollows, false},
-		{"causes is not structural", EdgeTypeCauses, false},
-		{"resolves is not structural", EdgeTypeResolves, false},
+		{"produced_by is not structural", EdgeTypeProducedBy, false},
 		{"references is not structural", EdgeTypeReferences, false},
-		{"applies_to is not structural", EdgeTypeAppliesTo, false},
 		{"documents is not structural", EdgeTypeDocuments, false},
 		{"modified is not structural", EdgeTypeModified, false},
 
 		// Invalid types
-		{"empty is not structural", EdgeType(""), false},
-		{"invalid is not structural", EdgeType("invalid"), false},
+		{"negative is not structural", EdgeType(-1), false},
+		{"unknown is not structural", EdgeType(999), false},
 	}
 
 	for _, tt := range tests {
@@ -649,9 +698,11 @@ func TestEdgeTypeIsTemporal(t *testing.T) {
 		expected bool
 	}{
 		// Temporal types
-		{"follows is temporal", EdgeTypeFollows, true},
-		{"causes is temporal", EdgeTypeCauses, true},
-		{"resolves is temporal", EdgeTypeResolves, true},
+		{"produced_by is temporal", EdgeTypeProducedBy, true},
+		{"resulted_in is temporal", EdgeTypeResultedIn, true},
+		{"similar_to is temporal", EdgeTypeSimilarTo, true},
+		{"followed_by is temporal", EdgeTypeFollowedBy, true},
+		{"supersedes is temporal", EdgeTypeSupersedes, true},
 
 		// Non-temporal types
 		{"calls is not temporal", EdgeTypeCalls, false},
@@ -660,8 +711,8 @@ func TestEdgeTypeIsTemporal(t *testing.T) {
 		{"modified is not temporal", EdgeTypeModified, false},
 
 		// Invalid types
-		{"empty is not temporal", EdgeType(""), false},
-		{"invalid is not temporal", EdgeType("invalid"), false},
+		{"negative is not temporal", EdgeType(-1), false},
+		{"unknown is not temporal", EdgeType(999), false},
 	}
 
 	for _, tt := range tests {
@@ -682,18 +733,18 @@ func TestEdgeTypeIsCrossDomain(t *testing.T) {
 	}{
 		// Cross-domain types
 		{"references is cross-domain", EdgeTypeReferences, true},
-		{"applies_to is cross-domain", EdgeTypeAppliesTo, true},
 		{"documents is cross-domain", EdgeTypeDocuments, true},
 		{"modified is cross-domain", EdgeTypeModified, true},
+		{"uses_library is cross-domain", EdgeTypeUsesLibrary, true},
 
 		// Non-cross-domain types
 		{"calls is not cross-domain", EdgeTypeCalls, false},
-		{"follows is not cross-domain", EdgeTypeFollows, false},
+		{"produced_by is not cross-domain", EdgeTypeProducedBy, false},
 		{"defines is not cross-domain", EdgeTypeDefines, false},
 
 		// Invalid types
-		{"empty is not cross-domain", EdgeType(""), false},
-		{"invalid is not cross-domain", EdgeType("invalid"), false},
+		{"negative is not cross-domain", EdgeType(-1), false},
+		{"unknown is not cross-domain", EdgeType(999), false},
 	}
 
 	for _, tt := range tests {
@@ -712,9 +763,9 @@ func TestEdgeTypeString(t *testing.T) {
 		expected string
 	}{
 		{EdgeTypeCalls, "calls"},
-		{EdgeTypeFollows, "follows"},
+		{EdgeTypeProducedBy, "produced_by"},
 		{EdgeTypeReferences, "references"},
-		{EdgeType("custom"), "custom"},
+		{EdgeType(999), "edge_type(999)"},
 	}
 
 	for _, tt := range tests {
@@ -733,7 +784,7 @@ func TestEdgeTypeString(t *testing.T) {
 func TestEdgeTypeCategoriesMutuallyExclusive(t *testing.T) {
 	// Each edge type should belong to exactly one category
 	for _, et := range ValidEdgeTypes() {
-		t.Run(string(et), func(t *testing.T) {
+		t.Run(et.String(), func(t *testing.T) {
 			categoriesCount := 0
 			if et.IsStructural() {
 				categoriesCount++
@@ -767,9 +818,8 @@ func TestGraphNodeJSONMarshal(t *testing.T) {
 			"path": "/src/main.go",
 			"size": 1024,
 		},
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		AccessedAt: now,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
 	data, err := json.Marshal(node)
@@ -803,11 +853,11 @@ func TestGraphNodeJSONMarshal(t *testing.T) {
 func TestGraphEdgeJSONMarshal(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	edge := GraphEdge{
-		ID:         "edge-456",
-		FromNodeID: "node-123",
-		ToNodeID:   "node-789",
-		EdgeType:   EdgeTypeCalls,
-		Weight:     0.85,
+		ID:       456,
+		SourceID: "node-123",
+		TargetID: "node-789",
+		EdgeType: EdgeTypeCalls,
+		Weight:   0.85,
 		Metadata: map[string]any{
 			"line": 42,
 		},
@@ -827,11 +877,11 @@ func TestGraphEdgeJSONMarshal(t *testing.T) {
 	if unmarshaled.ID != edge.ID {
 		t.Errorf("ID mismatch: got %q, want %q", unmarshaled.ID, edge.ID)
 	}
-	if unmarshaled.FromNodeID != edge.FromNodeID {
-		t.Errorf("FromNodeID mismatch: got %q, want %q", unmarshaled.FromNodeID, edge.FromNodeID)
+	if unmarshaled.SourceID != edge.SourceID {
+		t.Errorf("SourceID mismatch: got %q, want %q", unmarshaled.SourceID, edge.SourceID)
 	}
-	if unmarshaled.ToNodeID != edge.ToNodeID {
-		t.Errorf("ToNodeID mismatch: got %q, want %q", unmarshaled.ToNodeID, edge.ToNodeID)
+	if unmarshaled.TargetID != edge.TargetID {
+		t.Errorf("TargetID mismatch: got %q, want %q", unmarshaled.TargetID, edge.TargetID)
 	}
 	if unmarshaled.EdgeType != edge.EdgeType {
 		t.Errorf("EdgeType mismatch: got %q, want %q", unmarshaled.EdgeType, edge.EdgeType)
@@ -843,11 +893,12 @@ func TestGraphEdgeJSONMarshal(t *testing.T) {
 
 func TestVectorDataJSONMarshal(t *testing.T) {
 	vectorData := VectorData{
-		ID:           "vec-001",
-		NodeID:       "node-123",
-		Embedding:    []float32{0.1, 0.2, 0.3, 0.4, 0.5},
-		Magnitude:    0.7416198487095663,
-		ModelVersion: "v1.0.0",
+		NodeID:     "node-123",
+		Embedding:  []float32{0.1, 0.2, 0.3, 0.4, 0.5},
+		Magnitude:  0.7416198487095663,
+		Dimensions: 5,
+		Domain:     DomainCode,
+		NodeType:   NodeTypeFile,
 	}
 
 	data, err := json.Marshal(vectorData)
@@ -860,9 +911,6 @@ func TestVectorDataJSONMarshal(t *testing.T) {
 		t.Fatalf("failed to unmarshal VectorData: %v", err)
 	}
 
-	if unmarshaled.ID != vectorData.ID {
-		t.Errorf("ID mismatch: got %q, want %q", unmarshaled.ID, vectorData.ID)
-	}
 	if unmarshaled.NodeID != vectorData.NodeID {
 		t.Errorf("NodeID mismatch: got %q, want %q", unmarshaled.NodeID, vectorData.NodeID)
 	}
@@ -878,9 +926,14 @@ func TestVectorDataJSONMarshal(t *testing.T) {
 	if unmarshaled.Magnitude != vectorData.Magnitude {
 		t.Errorf("Magnitude mismatch: got %f, want %f", unmarshaled.Magnitude, vectorData.Magnitude)
 	}
-	if unmarshaled.ModelVersion != vectorData.ModelVersion {
-		t.Errorf("ModelVersion mismatch: got %q, want %q",
-			unmarshaled.ModelVersion, vectorData.ModelVersion)
+	if unmarshaled.Dimensions != vectorData.Dimensions {
+		t.Errorf("Dimensions mismatch: got %d, want %d", unmarshaled.Dimensions, vectorData.Dimensions)
+	}
+	if unmarshaled.Domain != vectorData.Domain {
+		t.Errorf("Domain mismatch: got %q, want %q", unmarshaled.Domain, vectorData.Domain)
+	}
+	if unmarshaled.NodeType != vectorData.NodeType {
+		t.Errorf("NodeType mismatch: got %q, want %q", unmarshaled.NodeType, vectorData.NodeType)
 	}
 }
 
@@ -939,13 +992,12 @@ func TestDBStatsJSONMarshal(t *testing.T) {
 func TestProvenanceJSONMarshal(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	provenance := Provenance{
-		ID:         "prov-001",
+		ID:         1,
 		NodeID:     "node-123",
-		SourceType: SourceTypeGit,
-		SourceID:   "abc123def456",
+		SourceType: SourceTypeCode,
+		SourcePath: "abc123def456",
 		Confidence: 0.95,
 		VerifiedAt: now,
-		Verifier:   "git-sync",
 	}
 
 	data, err := json.Marshal(provenance)
@@ -974,10 +1026,10 @@ func TestProvenanceJSONMarshal(t *testing.T) {
 func TestConflictJSONMarshal(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	conflict := Conflict{
-		ID:           "conflict-001",
+		ID:           1,
 		NodeAID:      "node-123",
 		NodeBID:      "node-456",
-		ConflictType: ConflictTypeSemanticContradiction,
+		ConflictType: ConflictTypeSemantic,
 		DetectedAt:   now,
 		Resolution:   "kept node-123 as source of truth",
 		ResolvedAt:   now,
@@ -994,7 +1046,7 @@ func TestConflictJSONMarshal(t *testing.T) {
 	}
 
 	if unmarshaled.ID != conflict.ID {
-		t.Errorf("ID mismatch: got %q, want %q", unmarshaled.ID, conflict.ID)
+		t.Errorf("ID mismatch: got %d, want %d", unmarshaled.ID, conflict.ID)
 	}
 	if unmarshaled.ConflictType != conflict.ConflictType {
 		t.Errorf("ConflictType mismatch: got %q, want %q",
@@ -1013,20 +1065,20 @@ func TestConflictJSONMarshal(t *testing.T) {
 func TestSourceTypeConstants(t *testing.T) {
 	tests := []struct {
 		name     string
-		value    string
+		value    SourceType
 		expected string
 	}{
-		{"SourceTypeGit", SourceTypeGit, "git"},
-		{"SourceTypeUser", SourceTypeUser, "user"},
-		{"SourceTypeLLM", SourceTypeLLM, "llm"},
-		{"SourceTypeWeb", SourceTypeWeb, "web"},
-		{"SourceTypeAPI", SourceTypeAPI, "api"},
+		{"SourceTypeCode", SourceTypeCode, "code"},
+		{"SourceTypeHistory", SourceTypeHistory, "history"},
+		{"SourceTypeAcademic", SourceTypeAcademic, "academic"},
+		{"SourceTypeLLMInference", SourceTypeLLMInference, "llm_inference"},
+		{"SourceTypeUserProvided", SourceTypeUserProvided, "user_provided"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.value != tt.expected {
-				t.Errorf("expected %q, got %q", tt.expected, tt.value)
+			if tt.value.String() != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, tt.value.String())
 			}
 		})
 	}
@@ -1039,19 +1091,18 @@ func TestSourceTypeConstants(t *testing.T) {
 func TestConflictTypeConstants(t *testing.T) {
 	tests := []struct {
 		name     string
-		value    string
+		value    ConflictType
 		expected string
 	}{
-		{"ConflictTypeSemanticContradiction", ConflictTypeSemanticContradiction, "semantic_contradiction"},
-		{"ConflictTypeVersionMismatch", ConflictTypeVersionMismatch, "version_mismatch"},
-		{"ConflictTypeDuplicate", ConflictTypeDuplicate, "duplicate"},
-		{"ConflictTypeStale", ConflictTypeStale, "stale"},
+		{"ConflictTypeTemporal", ConflictTypeTemporal, "temporal"},
+		{"ConflictTypeSourceMismatch", ConflictTypeSourceMismatch, "source_mismatch"},
+		{"ConflictTypeSemantic", ConflictTypeSemantic, "semantic"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.value != tt.expected {
-				t.Errorf("expected %q, got %q", tt.expected, tt.value)
+			if tt.value.String() != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, tt.value.String())
 			}
 		})
 	}
@@ -1087,10 +1138,12 @@ func TestEmptyMetadata(t *testing.T) {
 
 func TestEmptyEmbedding(t *testing.T) {
 	vectorData := VectorData{
-		ID:        "vec-empty",
-		NodeID:    "node-123",
-		Embedding: []float32{},
-		Magnitude: 0,
+		NodeID:     "node-123",
+		Embedding:  []float32{},
+		Magnitude:  0,
+		Dimensions: 0,
+		Domain:     DomainCode,
+		NodeType:   NodeTypeFile,
 	}
 
 	data, err := json.Marshal(vectorData)
@@ -1131,11 +1184,11 @@ func TestZeroValueDBStats(t *testing.T) {
 
 func TestGraphEdgeZeroWeight(t *testing.T) {
 	edge := GraphEdge{
-		ID:         "edge-zero",
-		FromNodeID: "node-1",
-		ToNodeID:   "node-2",
-		EdgeType:   EdgeTypeCalls,
-		Weight:     0.0,
+		ID:       0,
+		SourceID: "node-1",
+		TargetID: "node-2",
+		EdgeType: EdgeTypeCalls,
+		Weight:   0.0,
 	}
 
 	data, err := json.Marshal(edge)
@@ -1163,7 +1216,7 @@ func TestAllNodeTypesBelongToExactlyOneDomain(t *testing.T) {
 	domains := ValidDomains()
 
 	for _, nt := range allNodeTypes {
-		t.Run(string(nt), func(t *testing.T) {
+		t.Run(nt.String(), func(t *testing.T) {
 			domainCount := 0
 			var belongsToDomains []Domain
 
@@ -1253,7 +1306,6 @@ func TestGraphNodeJSONFieldNames(t *testing.T) {
 		Metadata:    map[string]any{"key": "value"},
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
-		AccessedAt:  time.Now(),
 	}
 
 	data, _ := json.Marshal(node)
@@ -1267,7 +1319,6 @@ func TestGraphNodeJSONFieldNames(t *testing.T) {
 		`"metadata"`,
 		`"created_at"`,
 		`"updated_at"`,
-		`"accessed_at"`,
 	}
 
 	for _, field := range expectedFields {
@@ -1279,13 +1330,13 @@ func TestGraphNodeJSONFieldNames(t *testing.T) {
 
 func TestGraphEdgeJSONFieldNames(t *testing.T) {
 	edge := GraphEdge{
-		ID:         "test-id",
-		FromNodeID: "from",
-		ToNodeID:   "to",
-		EdgeType:   EdgeTypeCalls,
-		Weight:     0.5,
-		Metadata:   map[string]any{"key": "value"},
-		CreatedAt:  time.Now(),
+		ID:        1,
+		SourceID:  "from",
+		TargetID:  "to",
+		EdgeType:  EdgeTypeCalls,
+		Weight:    0.5,
+		Metadata:  map[string]any{"key": "value"},
+		CreatedAt: time.Now(),
 	}
 
 	data, _ := json.Marshal(edge)
@@ -1293,8 +1344,8 @@ func TestGraphEdgeJSONFieldNames(t *testing.T) {
 
 	expectedFields := []string{
 		`"id"`,
-		`"from_node_id"`,
-		`"to_node_id"`,
+		`"source_id"`,
+		`"target_id"`,
 		`"edge_type"`,
 		`"weight"`,
 		`"metadata"`,
@@ -1310,22 +1361,24 @@ func TestGraphEdgeJSONFieldNames(t *testing.T) {
 
 func TestVectorDataJSONFieldNames(t *testing.T) {
 	vec := VectorData{
-		ID:           "test-id",
-		NodeID:       "node-id",
-		Embedding:    []float32{0.1},
-		Magnitude:    0.1,
-		ModelVersion: "v1",
+		NodeID:     "node-id",
+		Embedding:  []float32{0.1},
+		Magnitude:  0.1,
+		Dimensions: 1,
+		Domain:     DomainCode,
+		NodeType:   NodeTypeFile,
 	}
 
 	data, _ := json.Marshal(vec)
 	jsonStr := string(data)
 
 	expectedFields := []string{
-		`"id"`,
 		`"node_id"`,
 		`"embedding"`,
 		`"magnitude"`,
-		`"model_version"`,
+		`"dimensions"`,
+		`"domain"`,
+		`"node_type"`,
 	}
 
 	for _, field := range expectedFields {

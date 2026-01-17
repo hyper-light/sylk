@@ -115,10 +115,10 @@ func (gt *GraphTraverser) extractNeighborIDs(nodeID string, edges []*GraphEdge) 
 }
 
 func (gt *GraphTraverser) getOtherNodeID(nodeID string, e *GraphEdge) string {
-	if e.FromNodeID == nodeID {
-		return e.ToNodeID
+	if e.SourceID == nodeID {
+		return e.TargetID
 	}
-	return e.FromNodeID
+	return e.SourceID
 }
 
 func (gt *GraphTraverser) loadNodesByIDs(ids []string) ([]*GraphNode, error) {
@@ -355,10 +355,11 @@ func (gt *GraphTraverser) expandSubgraph(curr bfsNode, visited, edgeSeen map[str
 	edges, _ := gt.getRelevantEdges(curr.id, opts)
 
 	for _, e := range edges {
-		if edgeSeen[e.ID] {
+		edgeKey := fmt.Sprintf("%d", e.ID)
+		if edgeSeen[edgeKey] {
 			continue
 		}
-		edgeSeen[e.ID] = true
+		edgeSeen[edgeKey] = true
 		newEdges = append(newEdges, e)
 
 		neighborID := gt.getOtherNodeID(curr.id, e)

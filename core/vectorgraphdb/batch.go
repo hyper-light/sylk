@@ -60,16 +60,19 @@ func (bs *BatchStore) insertNodesBatch(tx *sql.Tx, nodes []*GraphNode, embedding
 
 func (bs *BatchStore) prepareNodeStmts(tx *sql.Tx) (*sql.Stmt, *sql.Stmt, error) {
 	nodeStmt, err := tx.Prepare(`
-		INSERT INTO nodes (id, domain, node_type, content_hash, metadata, created_at, updated_at, accessed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO nodes (id, domain, node_type, name, path, package, line_start, line_end, signature,
+			session_id, timestamp, category, url, source, authors, published_at,
+			content, content_hash, metadata, verified, verification_type, confidence, trust_level,
+			created_at, updated_at, expires_at, superseded_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return nil, nil, fmt.Errorf("prepare node stmt: %w", err)
 	}
 
 	vecStmt, err := tx.Prepare(`
-		INSERT INTO vectors (id, node_id, embedding, magnitude, model_version)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		nodeStmt.Close()
@@ -100,18 +103,25 @@ func (bs *BatchStore) insertNodeBatchRow(nodeStmt, vecStmt *sql.Stmt, node *Grap
 	now := time.Now()
 	node.CreatedAt = now
 	node.UpdatedAt = now
-	node.AccessedAt = now
+	if node.Name == "" {
+		node.Name = node.ID
+	}
 
 	metadata, _ := json.Marshal(node.Metadata)
-	_, err := nodeStmt.Exec(node.ID, node.Domain, node.NodeType, node.ContentHash, string(metadata),
-		node.CreatedAt.Format(time.RFC3339), node.UpdatedAt.Format(time.RFC3339), node.AccessedAt.Format(time.RFC3339))
+	_, err := nodeStmt.Exec(node.ID, node.Domain, node.NodeType, node.Name, node.Path, node.Package,
+		nullInt(node.LineStart), nullInt(node.LineEnd), node.Signature,
+		nullString(node.SessionID), nullTime(node.Timestamp), nullString(node.Category),
+		nullString(node.URL), nullString(node.Source), nullJSON(node.Authors), nullTime(node.PublishedAt),
+		nullString(node.Content), node.ContentHash, string(metadata),
+		node.Verified, nullInt(int(node.VerificationType)), nullFloat(node.Confidence), nullInt(int(node.TrustLevel)),
+		node.CreatedAt.Format(time.RFC3339), node.UpdatedAt.Format(time.RFC3339), nullTime(node.ExpiresAt), nullString(node.SupersededBy))
 	if err != nil {
 		return fmt.Errorf("insert node %s: %w", node.ID, err)
 	}
 
 	blob := float32sToBytes(embedding)
 	mag := computeMagnitude(embedding)
-	_, err = vecStmt.Exec("vec-"+node.ID, node.ID, blob, mag, "v1")
+	_, err = vecStmt.Exec(node.ID, blob, mag, EmbeddingDimension, node.Domain, node.NodeType)
 	if err != nil {
 		return fmt.Errorf("insert embedding %s: %w", node.ID, err)
 	}
@@ -169,8 +179,8 @@ func (bs *BatchStore) insertEdgesBatch(tx *sql.Tx, edges []*GraphEdge, progress 
 
 func (bs *BatchStore) prepareEdgeStmt(tx *sql.Tx) (*sql.Stmt, error) {
 	stmt, err := tx.Prepare(`
-		INSERT INTO edges (id, from_node_id, to_node_id, edge_type, weight, metadata, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO edges (source_id, target_id, edge_type, weight, metadata, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("prepare edge stmt: %w", err)
@@ -193,11 +203,16 @@ func (bs *BatchStore) insertEdgeBatchRow(stmt *sql.Stmt, edge *GraphEdge) error 
 		edge.CreatedAt = time.Now()
 	}
 	metadata, _ := json.Marshal(edge.Metadata)
-	_, err := stmt.Exec(edge.ID, edge.FromNodeID, edge.ToNodeID, edge.EdgeType, edge.Weight,
+	result, err := stmt.Exec(edge.SourceID, edge.TargetID, edge.EdgeType, edge.Weight,
 		string(metadata), edge.CreatedAt.Format(time.RFC3339))
 	if err != nil {
-		return fmt.Errorf("insert edge %s: %w", edge.ID, err)
+		return fmt.Errorf("insert edge: %w", err)
 	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("fetch edge id: %w", err)
+	}
+	edge.ID = id
 	return nil
 }
 

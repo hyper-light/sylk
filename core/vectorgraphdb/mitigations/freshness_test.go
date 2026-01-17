@@ -116,7 +116,7 @@ func TestFreshnessTracker_DecayRates(t *testing.T) {
 	acadNode := &vectorgraphdb.GraphNode{
 		ID:       "acad-node",
 		Domain:   vectorgraphdb.DomainAcademic,
-		NodeType: vectorgraphdb.NodeTypeDoc,
+		NodeType: vectorgraphdb.NodeTypeDocumentation,
 		Metadata: map[string]any{},
 	}
 

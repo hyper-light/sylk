@@ -135,13 +135,13 @@ func (v *VectorGraphDB) collectNodeStats(stats *DBStats) error {
 		return fmt.Errorf("failed to count nodes: %w", err)
 	}
 
-	if err := v.scanGroupedCounts("SELECT domain, COUNT(*) FROM nodes GROUP BY domain", func(key string, count int64) {
+	if err := v.scanGroupedCounts("SELECT domain, COUNT(*) FROM nodes GROUP BY domain", func(key int64, count int64) {
 		stats.NodesByDomain[Domain(key)] = count
 	}); err != nil {
 		return fmt.Errorf("failed to count nodes by domain: %w", err)
 	}
 
-	if err := v.scanGroupedCounts("SELECT node_type, COUNT(*) FROM nodes GROUP BY node_type", func(key string, count int64) {
+	if err := v.scanGroupedCounts("SELECT node_type, COUNT(*) FROM nodes GROUP BY node_type", func(key int64, count int64) {
 		stats.NodesByType[NodeType(key)] = count
 	}); err != nil {
 		return fmt.Errorf("failed to count nodes by type: %w", err)
@@ -155,7 +155,7 @@ func (v *VectorGraphDB) collectEdgeStats(stats *DBStats) error {
 		return fmt.Errorf("failed to count edges: %w", err)
 	}
 
-	if err := v.scanGroupedCounts("SELECT edge_type, COUNT(*) FROM edges GROUP BY edge_type", func(key string, count int64) {
+	if err := v.scanGroupedCounts("SELECT edge_type, COUNT(*) FROM edges GROUP BY edge_type", func(key int64, count int64) {
 		stats.EdgesByType[EdgeType(key)] = count
 	}); err != nil {
 		return fmt.Errorf("failed to count edges by type: %w", err)
@@ -183,7 +183,7 @@ func (v *VectorGraphDB) collectMiscStats(stats *DBStats) error {
 
 func (v *VectorGraphDB) collectStaleNodeCount(stats *DBStats) error {
 	staleThreshold := time.Now().Add(-DefaultStaleThreshold).Format(time.RFC3339)
-	if err := v.db.QueryRow("SELECT COUNT(*) FROM nodes WHERE accessed_at < ?", staleThreshold).Scan(&stats.StaleNodes); err != nil {
+	if err := v.db.QueryRow("SELECT COUNT(*) FROM nodes WHERE updated_at < ?", staleThreshold).Scan(&stats.StaleNodes); err != nil {
 		return fmt.Errorf("failed to count stale nodes: %w", err)
 	}
 	return nil
@@ -196,7 +196,7 @@ func (v *VectorGraphDB) collectDBSize(stats *DBStats) {
 	}
 }
 
-func (v *VectorGraphDB) scanGroupedCounts(query string, handler func(key string, count int64)) error {
+func (v *VectorGraphDB) scanGroupedCounts(query string, handler func(key int64, count int64)) error {
 	rows, err := v.db.Query(query)
 	if err != nil {
 		return err
@@ -204,7 +204,7 @@ func (v *VectorGraphDB) scanGroupedCounts(query string, handler func(key string,
 	defer rows.Close()
 
 	for rows.Next() {
-		var key string
+		var key int64
 		var count int64
 		if err := rows.Scan(&key, &count); err != nil {
 			return err

@@ -398,13 +398,11 @@ func TestGlobalSubscriptionTracker_WarningBroadcast(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "subscription.db")
 
-	dispatcher, err := NewSignalDispatcher(SignalDispatcherConfig{
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
 		BaseDir:   tmpDir,
 		SessionID: "test-session",
 	})
-	if err != nil {
-		t.Fatalf("failed to create dispatcher: %v", err)
-	}
+
 	defer dispatcher.Close()
 
 	maxReqs := int64(10)

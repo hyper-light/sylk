@@ -92,7 +92,7 @@ func TestNodeStoreInsertInvalidDomain(t *testing.T) {
 
 	node := &GraphNode{
 		ID:       "node1",
-		Domain:   Domain("invalid"),
+		Domain:   Domain(99),
 		NodeType: NodeTypeFile,
 	}
 
@@ -335,8 +335,8 @@ func TestNodeStoreTouchNode(t *testing.T) {
 	}
 
 	after, _ := ns.GetNode("node1")
-	if !after.AccessedAt.After(before.AccessedAt) && after.AccessedAt.Equal(before.AccessedAt) {
-		t.Log("AccessedAt same or not updated - timing may be too fast")
+	if !after.UpdatedAt.After(before.UpdatedAt) && after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Log("UpdatedAt same or not updated - timing may be too fast")
 	}
 }
 

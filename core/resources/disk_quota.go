@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -99,11 +98,11 @@ func (m *DiskQuotaManager) CalculateQuota() int64 {
 
 // getFreeSpace retrieves available disk space using syscall.Statfs.
 func (m *DiskQuotaManager) getFreeSpace() int64 {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(m.basePath, &stat); err != nil {
+	available, blockSize, err := statFs(m.basePath)
+	if err != nil {
 		return m.config.QuotaMin
 	}
-	return int64(stat.Bavail) * int64(stat.Bsize)
+	return int64(available) * int64(blockSize)
 }
 
 // clampQuota applies min/max bounds to the calculated quota.

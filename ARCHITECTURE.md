@@ -2554,6 +2554,224 @@ When Architect reports TASK_HELP with context_source_issue:
 `
 ```
 
+#### Guide Ambiguity Resolution Discipline
+
+**CRITICAL: Guide must formally detect and resolve ambiguity BEFORE routing to prevent misroutes and clarification loops.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        AMBIGUITY RESOLUTION DISCIPLINE                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Ambiguity detected early prevents wasted cycles downstream.            │
+│                                                                                     │
+│  AMBIGUITY DETECTION TRIGGERS:                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. MULTI-AGENT OVERLAP: Request matches 2+ agent domains with > 0.5 conf   │   │
+│  │  2. SCOPE UNBOUNDED: No clear boundary on what "done" means                  │   │
+│  │  3. IMPLICIT ASSUMPTIONS: Request relies on unstated context                 │   │
+│  │  4. CONFLICTING SIGNALS: Keywords suggest different request types            │   │
+│  │  5. PAST MISROUTE MATCH: Similar request was misrouted before                │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  RESOLUTION PROTOCOL:                                                               │
+│  1. Detect ambiguity type from triggers above                                       │
+│  2. Generate clarifying question with specific options                              │
+│  3. Track clarification in session for future similar requests                      │
+│  4. NEVER route with confidence < 0.7 - ask instead                                 │
+│                                                                                     │
+│  CLARIFICATION QUESTION FORMAT:                                                     │
+│  "I want to make sure I route this correctly. Your request could be:               │
+│   A) [Interpretation 1] → [Agent 1]                                                 │
+│   B) [Interpretation 2] → [Agent 2]                                                 │
+│   Which do you intend?"                                                             │
+│                                                                                     │
+│  METRICS TO TRACK:                                                                  │
+│  ├── Ambiguity detection rate per request type                                     │
+│  ├── Clarification-to-success rate                                                 │
+│  ├── Repeat ambiguity patterns (same user, same pattern)                           │
+│  └── Time-to-clarification (latency impact)                                        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const GuideAmbiguityResolutionPrompt = `
+AMBIGUITY RESOLUTION DISCIPLINE:
+
+BEFORE routing ANY request, check for ambiguity:
+
+DETECTION:
+1. Multi-agent overlap: Does request match multiple agent domains?
+2. Scope unbounded: Is there a clear "done" criteria?
+3. Implicit assumptions: Are there unstated dependencies?
+4. Conflicting signals: Do keywords suggest different interpretations?
+5. Past misroute: Query routing_failures for similar patterns
+
+IF AMBIGUITY DETECTED (confidence < 0.7):
+1. DO NOT route - clarify first
+2. Present specific options with agent destinations
+3. Wait for user clarification
+4. Log clarification for future pattern learning
+
+CLARIFICATION FORMAT:
+"I want to route this correctly. Your request could mean:
+ A) [specific interpretation] → routes to [Agent]
+ B) [alternative interpretation] → routes to [Agent]
+ Which do you intend?"
+
+NEVER guess when ambiguous. Asking saves more time than misrouting.
+`
+```
+
+#### Guide Pre-Routing Enrichment Protocol
+
+**MANDATORY: For ALL implementation requests, Guide MUST enrich context before routing to Architect.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        PRE-ROUTING ENRICHMENT PROTOCOL                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Architect receives enriched context, not raw requests.                  │
+│                                                                                     │
+│  FOR ALL IMPLEMENTATION REQUESTS:                                                   │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  STEP 1: LIBRARIAN CONSULTATION (MANDATORY)                                  │   │
+│  │  Query: "What is codebase health for [target area]?"                        │   │
+│  │  Response includes: maturity, patterns, technical debt, test coverage        │   │
+│  │                                                                             │   │
+│  │  STEP 2: ARCHIVALIST CONSULTATION (MANDATORY)                               │   │
+│  │  Query: "Any failure patterns for [approach/area]?"                         │   │
+│  │  Response includes: similar failures, warnings, recommended mitigations      │   │
+│  │                                                                             │   │
+│  │  STEP 3: ATTACH TO ROUTED MESSAGE                                           │   │
+│  │  enriched_context: {                                                        │   │
+│  │    librarian_health: <response>,                                            │   │
+│  │    archivalist_warnings: <response>,                                        │   │
+│  │    enrichment_timestamp: <now>                                              │   │
+│  │  }                                                                          │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  EXCEPTIONS (Skip enrichment):                                                      │
+│  ├── TRIVIAL requests (single-line fixes, typos)                                   │
+│  ├── Skill-matched requests (deterministic, no LLM needed)                         │
+│  └── User explicitly requests "quick mode" or "no analysis"                        │
+│                                                                                     │
+│  FAILURE HANDLING:                                                                  │
+│  ├── If Librarian unavailable: proceed with warning, note in context               │
+│  ├── If Archivalist unavailable: proceed with warning, note in context             │
+│  └── If both unavailable: warn user, ask if they want to proceed anyway            │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const GuidePreRoutingEnrichmentPrompt = `
+PRE-ROUTING ENRICHMENT PROTOCOL:
+
+FOR ALL IMPLEMENTATION REQUESTS (not TRIVIAL or skill-matched):
+
+MANDATORY CONSULTATIONS:
+1. Librarian: "What is codebase health for [target area]?"
+   - Get: maturity level, patterns, debt markers, test coverage
+   - Timeout: 5 seconds, proceed with warning if unavailable
+
+2. Archivalist: "Any failure patterns for [approach/area]?"
+   - Get: similar failures, warnings, mitigations
+   - Timeout: 5 seconds, proceed with warning if unavailable
+
+ATTACH TO ROUTED MESSAGE:
+{
+  "original_request": <user message>,
+  "enriched_context": {
+    "librarian_health": <response or "unavailable">,
+    "archivalist_warnings": <response or "unavailable">,
+    "enrichment_timestamp": <ISO timestamp>,
+    "enrichment_status": "complete" | "partial" | "failed"
+  }
+}
+
+DO NOT route implementation requests without attempting enrichment.
+Architect relies on this context for informed planning.
+`
+```
+
+#### Guide Skill Match Verification Protocol
+
+**CRITICAL: When skills match with high confidence, verify execution success and track when skill-matched requests still need rerouting.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        SKILL MATCH VERIFICATION PROTOCOL                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: High-confidence skill matches should be verified, not assumed correct. │
+│                                                                                     │
+│  SKILL MATCH FLOW:                                                                  │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. Request arrives                                                          │   │
+│  │  2. Skill matching finds match with confidence > 0.9                        │   │
+│  │  3. Execute skill directly (skip LLM classification)                        │   │
+│  │  4. *** NEW: VERIFY EXECUTION OUTCOME ***                                   │   │
+│  │     - Did skill complete successfully?                                      │   │
+│  │     - Did user accept the result?                                           │   │
+│  │     - Was a follow-up reroute needed?                                       │   │
+│  │  5. Log verification result for pattern learning                            │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  VERIFICATION OUTCOMES:                                                             │
+│  ├── SUCCESS: Skill executed, user satisfied → Reinforce pattern                   │
+│  ├── REROUTE_NEEDED: Skill executed but user asked for agent help → Record        │
+│  ├── EXECUTION_FAILED: Skill failed to execute → Record, maybe lower confidence   │
+│  └── USER_REJECTED: User explicitly rejected skill result → Record pattern        │
+│                                                                                     │
+│  CONFIDENCE ADJUSTMENT:                                                             │
+│  ├── SUCCESS: confidence += 0.01 (cap at 0.99)                                     │
+│  ├── REROUTE_NEEDED: confidence -= 0.05                                            │
+│  ├── EXECUTION_FAILED: confidence -= 0.10                                          │
+│  └── USER_REJECTED: confidence -= 0.15                                             │
+│                                                                                     │
+│  PATTERN LEARNING:                                                                  │
+│  If same skill pattern fails 3+ times, demote from skill-match to LLM routing.    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const GuideSkillMatchVerificationPrompt = `
+SKILL MATCH VERIFICATION PROTOCOL:
+
+AFTER skill match execution (confidence > 0.9):
+
+VERIFY OUTCOME:
+1. Did skill complete without error?
+2. Did user accept the result (no follow-up complaint)?
+3. Was a reroute to an agent needed anyway?
+
+LOG VERIFICATION:
+- skill_name: which skill was matched
+- match_confidence: original confidence score
+- outcome: SUCCESS | REROUTE_NEEDED | EXECUTION_FAILED | USER_REJECTED
+- follow_up_action: what happened next (if any)
+
+ADJUST CONFIDENCE:
+- SUCCESS: boost confidence slightly for this pattern
+- REROUTE_NEEDED: reduce confidence, consider LLM routing next time
+- EXECUTION_FAILED: significant confidence reduction
+- USER_REJECTED: significant confidence reduction
+
+DEMOTION RULE:
+If a skill pattern fails 3+ times in verification, demote it:
+- Remove from skill-match fast path
+- Route to LLM classification instead
+- Log demotion for review
+
+This ensures skill matching remains accurate over time.
+`
+```
+
 ### Guide Intent Classification for Librarian
 
 **CRITICAL**: The Guide already classifies intent for routing. When routing to Librarian, the Guide extracts additional metadata to enable intent-aware caching - at zero additional token cost.
@@ -8584,6 +8802,14 @@ const (
     SignalPressure  SignalType = "pressure"  // Memory/disk pressure
     SignalRebalance SignalType = "rebalance" // Fair share changed
     SignalShutdown  SignalType = "shutdown"  // Session ending
+
+    // File Change Signals (CVS Integration)
+    SignalFileCreated  SignalType = "file_created"   // New file created
+    SignalFileModified SignalType = "file_modified"  // File content changed
+    SignalFileDeleted  SignalType = "file_deleted"   // File deleted
+    SignalFileLocked   SignalType = "file_locked"    // File locked by session
+    SignalFileUnlocked SignalType = "file_unlocked"  // File lock released
+    SignalMergeConflict SignalType = "merge_conflict" // Conflict needs resolution
 )
 
 type CrossSessionSignal struct {
@@ -8592,6 +8818,34 @@ type CrossSessionSignal struct {
     ToSession   string    `json:"to_session"` // empty = broadcast
     Timestamp  time.Time  `json:"timestamp"`
     Payload    string     `json:"payload"`
+}
+
+// FileChangeSignal extends CrossSessionSignal for CVS file changes
+type FileChangeSignal struct {
+    CrossSessionSignal
+    FilePath    string    `json:"file_path"`
+    OldVersion  VersionID `json:"old_version,omitempty"`
+    NewVersion  VersionID `json:"new_version,omitempty"`
+    ChangeType  string    `json:"change_type"`  // "created", "modified", "deleted"
+    PipelineID  string    `json:"pipeline_id,omitempty"`
+}
+
+// FileSubscription tracks a session's interest in file changes
+type FileSubscription struct {
+    SessionID string
+    Patterns  []string    // Glob patterns (e.g., "*.go", "src/**/*.ts")
+}
+
+// SignalDispatcherVFS extends SignalDispatcher with file change handling
+type SignalDispatcherVFS interface {
+    // BroadcastFileChange sends file change to all interested sessions
+    BroadcastFileChange(signal *FileChangeSignal) error
+
+    // SubscribeFileChanges registers for file change notifications
+    SubscribeFileChanges(sessionID string, patterns []string) error
+
+    // UnsubscribeFileChanges removes file change subscription
+    UnsubscribeFileChanges(sessionID string) error
 }
 
 // SendSignal sends a signal to another session (or broadcast)
@@ -9348,12 +9602,16 @@ func (t *SmartTruncator) generateSummary(r *TruncatedOutput) string {
 ### Filesystem Manager
 
 ```go
-// FilesystemManager provides safe file operations for agents
+// FilesystemManager provides safe file operations for agents with CVS integration
 type FilesystemManager struct {
     config     FilesystemConfig
     sessionID  string
     pipelineID string // empty for standalone
     auditLog   *AuditLog
+
+    // CVS Integration (See: Central Version Store)
+    cvs        *CentralVersionStore     // Shared version store (nil if versioning disabled)
+    vfs        *PipelineVFS             // Versioned VFS for this context (nil if standalone)
 }
 
 type FilesystemConfig struct {
@@ -9371,6 +9629,11 @@ type FilesystemConfig struct {
 
     // Symlink resolution
     FollowSymlinks bool `yaml:"follow_symlinks"` // default: true (with boundary check)
+
+    // CVS Configuration
+    VersioningEnabled bool   `yaml:"versioning_enabled"` // Enable MVCC versioning
+    CVSStoragePath    string `yaml:"cvs_storage_path"`   // default: ~/.sylk/versions
+    WALPath           string `yaml:"wal_path"`           // default: ~/.sylk/wal
 }
 
 // Write writes a file through the abstraction layer
@@ -9385,6 +9648,16 @@ func (f *FilesystemManager) Write(path string, content []byte, perm os.FileMode)
         }
     }
 
+    // CVS Integration: Route through versioned VFS if enabled
+    if f.vfs != nil {
+        // Write through PipelineVFS - this automatically:
+        // 1. Records operation with AST-aware targeting
+        // 2. Updates version in change VFS
+        // 3. Queues operation for commit to CVS
+        return f.vfs.Write(path, content)
+    }
+
+    // Non-versioned path (standalone or versioning disabled)
     // Resolve and validate symlinks
     resolved, err := f.resolveWithBoundaryCheck(path)
     if err != nil {
@@ -9762,6 +10035,1305 @@ filesystem:
 
 ---
 
+## Tree-Sitter Parsing Infrastructure
+
+Sylk uses tree-sitter for language-agnostic AST parsing across all agents. This infrastructure is **cgo-free** using purego for dynamic library loading, enabling pure Go builds while maintaining full tree-sitter functionality.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     TREE-SITTER INFRASTRUCTURE (cgo-free via purego)                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │                      CORE RUNTIME (purego bindings)                           │  │
+│  │                                                                               │  │
+│  │  libtree-sitter.dylib ◄──── purego.Dlopen ────► ts_parser_new()              │  │
+│  │  libtree-sitter.so                              ts_parser_parse()             │  │
+│  │  tree-sitter.dll                                ts_tree_root_node()           │  │
+│  │                                                 ts_node_*()                   │  │
+│  │                                                 ts_query_*()                  │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                              │
+│                                      ▼                                              │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    GRAMMAR REGISTRY (dynamic loading)                         │  │
+│  │                                                                               │  │
+│  │  Built-in: go, rust, python, typescript, javascript, java, c, cpp, ...       │  │
+│  │  User-defined: ~/.sylk/grammars/<lang>/parser.{so,dylib,dll}                 │  │
+│  │                                                                               │  │
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐               │  │
+│  │  │ libtree-sitter- │  │ libtree-sitter- │  │ libtree-sitter- │               │  │
+│  │  │ go.dylib        │  │ python.dylib    │  │ rust.dylib      │  ...          │  │
+│  │  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘               │  │
+│  │           │                    │                    │                         │  │
+│  │           └────────────────────┼────────────────────┘                         │  │
+│  │                                ▼                                              │  │
+│  │                   purego.RegisterLibFunc()                                    │  │
+│  │                   tree_sitter_<lang>() → TSLanguage                           │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                              │
+│                                      ▼                                              │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │                      TREE-SITTER TOOL (Agent Interface)                       │  │
+│  │                                                                               │  │
+│  │  Parse(file, content) → ParseResult{functions, types, imports, errors}       │  │
+│  │  Query(file, content, query) → []QueryMatch                                  │  │
+│  │  InstallGrammar(name) → error  (auto-download from GitHub)                   │  │
+│  │  DetectLanguage(file) → (name, found)                                        │  │
+│  │                                                                               │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                              │
+│          ┌───────────────────────────┼───────────────────────────┐                  │
+│          │                           │                           │                  │
+│          ▼                           ▼                           ▼                  │
+│  ┌───────────────┐           ┌───────────────┐           ┌───────────────┐          │
+│  │   LIBRARIAN   │           │   ENGINEER    │           │   INSPECTOR   │          │
+│  │               │           │               │           │               │          │
+│  │ • Indexing    │           │ • Refactoring │           │ • Analysis    │          │
+│  │ • Symbols     │           │ • AST edits   │           │ • Complexity  │          │
+│  │ • Navigation  │           │ • Patterns    │           │ • Validation  │          │
+│  └───────────────┘           └───────────────┘           └───────────────┘          │
+│          │                           │                           │                  │
+│          ▼                           ▼                           ▼                  │
+│  ┌───────────────┐           ┌───────────────┐                                      │
+│  │    TESTER     │           │   DESIGNER    │                                      │
+│  │               │           │               │                                      │
+│  │ • Test locs   │           │ • Components  │                                      │
+│  │ • Coverage    │           │ • Styles      │                                      │
+│  └───────────────┘           └───────────────┘                                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why purego (No cgo)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           CGO VS PUREGO COMPARISON                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  CGO APPROACH (rejected):                                                           │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ • Requires C compiler at build time                                            │ │
+│  │ • Cross-compilation is complex (need target platform's C toolchain)            │ │
+│  │ • Slower builds (cgo overhead)                                                 │ │
+│  │ • Binary size increases                                                        │ │
+│  │ • Cannot use go:embed for grammars easily                                      │ │
+│  │ • Debugging is harder (mixed Go/C stacks)                                      │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+│  PUREGO APPROACH (chosen):                                                          │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ • Pure Go builds (go build just works)                                         │ │
+│  │ • Simple cross-compilation (GOOS/GOARCH)                                       │ │
+│  │ • Dynamic library loading at runtime                                           │ │
+│  │ • Grammars can be downloaded/installed on demand                               │ │
+│  │ • Users can add custom grammars without recompiling Sylk                       │ │
+│  │ • Easier debugging (pure Go stacks)                                            │ │
+│  │ • Libraries loaded via standard OS mechanisms (dlopen/LoadLibrary)             │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Core purego Bindings
+
+```go
+// core/treesitter/bindings.go
+
+package treesitter
+
+import (
+    "fmt"
+    "path/filepath"
+    "runtime"
+    "sync"
+    "unsafe"
+
+    "github.com/ebitengine/purego"
+)
+
+// Tree-sitter C types mapped to Go
+type (
+    TSParser   uintptr
+    TSTree     uintptr
+    TSNode     struct {
+        context  [4]uint32
+        id       uintptr
+        tree     uintptr
+    }
+    TSLanguage uintptr
+    TSQuery    uintptr
+    TSPoint    struct {
+        Row    uint32
+        Column uint32
+    }
+)
+
+// Function pointers loaded via purego
+var (
+    // Parser functions
+    ts_parser_new            func() TSParser
+    ts_parser_delete         func(TSParser)
+    ts_parser_set_language   func(TSParser, TSLanguage) bool
+    ts_parser_parse_string   func(TSParser, TSTree, *byte, uint32) TSTree
+
+    // Tree functions
+    ts_tree_delete           func(TSTree)
+    ts_tree_root_node        func(TSTree) TSNode
+    ts_tree_edit             func(TSTree, *TSInputEdit)
+    ts_tree_copy             func(TSTree) TSTree
+
+    // Node functions
+    ts_node_type             func(TSNode) *byte
+    ts_node_start_byte       func(TSNode) uint32
+    ts_node_end_byte         func(TSNode) uint32
+    ts_node_start_point      func(TSNode) TSPoint
+    ts_node_end_point        func(TSNode) TSPoint
+    ts_node_child_count      func(TSNode) uint32
+    ts_node_child            func(TSNode, uint32) TSNode
+    ts_node_parent           func(TSNode) TSNode
+    ts_node_is_null          func(TSNode) bool
+    ts_node_has_error        func(TSNode) bool
+    ts_node_string           func(TSNode) *byte
+    ts_node_named_child      func(TSNode, uint32) TSNode
+    ts_node_named_child_count func(TSNode) uint32
+    ts_node_child_by_field_name func(TSNode, *byte, uint32) TSNode
+
+    // Query functions
+    ts_query_new             func(TSLanguage, *byte, uint32, *uint32, *uint32) TSQuery
+    ts_query_delete          func(TSQuery)
+    ts_query_cursor_new      func() uintptr
+    ts_query_cursor_exec     func(uintptr, TSQuery, TSNode)
+    ts_query_cursor_next_match func(uintptr, *TSQueryMatch) bool
+
+    // Language info
+    ts_language_version      func(TSLanguage) uint32
+
+    initOnce sync.Once
+    initErr  error
+    libHandle uintptr
+)
+
+type TSInputEdit struct {
+    StartByte      uint32
+    OldEndByte     uint32
+    NewEndByte     uint32
+    StartPoint     TSPoint
+    OldEndPoint    TSPoint
+    NewEndPoint    TSPoint
+}
+
+type TSQueryMatch struct {
+    ID           uint32
+    PatternIndex uint16
+    CaptureCount uint16
+    Captures     uintptr
+}
+
+// Initialize loads libtree-sitter via purego (called once)
+func Initialize() error {
+    initOnce.Do(func() {
+        initErr = loadTreeSitterLibrary()
+    })
+    return initErr
+}
+
+func loadTreeSitterLibrary() error {
+    libPath := findTreeSitterLibrary()
+    if libPath == "" {
+        return fmt.Errorf("libtree-sitter not found; run 'sylk setup' to install")
+    }
+
+    var err error
+    libHandle, err = purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+    if err != nil {
+        return fmt.Errorf("failed to load libtree-sitter: %w", err)
+    }
+
+    // Register all function pointers
+    purego.RegisterLibFunc(&ts_parser_new, libHandle, "ts_parser_new")
+    purego.RegisterLibFunc(&ts_parser_delete, libHandle, "ts_parser_delete")
+    purego.RegisterLibFunc(&ts_parser_set_language, libHandle, "ts_parser_set_language")
+    purego.RegisterLibFunc(&ts_parser_parse_string, libHandle, "ts_parser_parse_string")
+    purego.RegisterLibFunc(&ts_tree_delete, libHandle, "ts_tree_delete")
+    purego.RegisterLibFunc(&ts_tree_root_node, libHandle, "ts_tree_root_node")
+    purego.RegisterLibFunc(&ts_tree_edit, libHandle, "ts_tree_edit")
+    purego.RegisterLibFunc(&ts_tree_copy, libHandle, "ts_tree_copy")
+    purego.RegisterLibFunc(&ts_node_type, libHandle, "ts_node_type")
+    purego.RegisterLibFunc(&ts_node_start_byte, libHandle, "ts_node_start_byte")
+    purego.RegisterLibFunc(&ts_node_end_byte, libHandle, "ts_node_end_byte")
+    purego.RegisterLibFunc(&ts_node_start_point, libHandle, "ts_node_start_point")
+    purego.RegisterLibFunc(&ts_node_end_point, libHandle, "ts_node_end_point")
+    purego.RegisterLibFunc(&ts_node_child_count, libHandle, "ts_node_child_count")
+    purego.RegisterLibFunc(&ts_node_child, libHandle, "ts_node_child")
+    purego.RegisterLibFunc(&ts_node_parent, libHandle, "ts_node_parent")
+    purego.RegisterLibFunc(&ts_node_is_null, libHandle, "ts_node_is_null")
+    purego.RegisterLibFunc(&ts_node_has_error, libHandle, "ts_node_has_error")
+    purego.RegisterLibFunc(&ts_node_string, libHandle, "ts_node_string")
+    purego.RegisterLibFunc(&ts_node_named_child, libHandle, "ts_node_named_child")
+    purego.RegisterLibFunc(&ts_node_named_child_count, libHandle, "ts_node_named_child_count")
+    purego.RegisterLibFunc(&ts_node_child_by_field_name, libHandle, "ts_node_child_by_field_name")
+    purego.RegisterLibFunc(&ts_query_new, libHandle, "ts_query_new")
+    purego.RegisterLibFunc(&ts_query_delete, libHandle, "ts_query_delete")
+    purego.RegisterLibFunc(&ts_query_cursor_new, libHandle, "ts_query_cursor_new")
+    purego.RegisterLibFunc(&ts_query_cursor_exec, libHandle, "ts_query_cursor_exec")
+    purego.RegisterLibFunc(&ts_query_cursor_next_match, libHandle, "ts_query_cursor_next_match")
+    purego.RegisterLibFunc(&ts_language_version, libHandle, "ts_language_version")
+
+    return nil
+}
+
+func findTreeSitterLibrary() string {
+    searchPaths := []string{
+        // Bundled with Sylk
+        filepath.Join(getSylkDataDir(), "lib", libraryName()),
+        // System paths
+        "/usr/local/lib/" + libraryName(),
+        "/usr/lib/" + libraryName(),
+    }
+
+    if runtime.GOOS == "darwin" {
+        searchPaths = append(searchPaths,
+            "/opt/homebrew/lib/"+libraryName(),
+            "/usr/local/opt/tree-sitter/lib/"+libraryName(),
+        )
+    }
+
+    for _, path := range searchPaths {
+        if fileExists(path) {
+            return path
+        }
+    }
+    return ""
+}
+
+func libraryName() string {
+    switch runtime.GOOS {
+    case "darwin":
+        return "libtree-sitter.dylib"
+    case "windows":
+        return "tree-sitter.dll"
+    default:
+        return "libtree-sitter.so"
+    }
+}
+```
+
+### Grammar Registry
+
+```go
+// core/treesitter/registry.go
+
+// KnownGrammars maps language names to download sources
+var KnownGrammars = map[string]GrammarInfo{
+    "go":         {Name: "go", Extensions: []string{".go"}, Repository: "github.com/tree-sitter/tree-sitter-go"},
+    "rust":       {Name: "rust", Extensions: []string{".rs"}, Repository: "github.com/tree-sitter/tree-sitter-rust"},
+    "python":     {Name: "python", Extensions: []string{".py", ".pyi"}, Repository: "github.com/tree-sitter/tree-sitter-python"},
+    "javascript": {Name: "javascript", Extensions: []string{".js", ".mjs", ".cjs"}, Repository: "github.com/tree-sitter/tree-sitter-javascript"},
+    "typescript": {Name: "typescript", Extensions: []string{".ts", ".mts"}, Repository: "github.com/tree-sitter/tree-sitter-typescript"},
+    "tsx":        {Name: "tsx", Extensions: []string{".tsx"}, Repository: "github.com/tree-sitter/tree-sitter-typescript"},
+    "java":       {Name: "java", Extensions: []string{".java"}, Repository: "github.com/tree-sitter/tree-sitter-java"},
+    "c":          {Name: "c", Extensions: []string{".c", ".h"}, Repository: "github.com/tree-sitter/tree-sitter-c"},
+    "cpp":        {Name: "cpp", Extensions: []string{".cpp", ".cc", ".hpp"}, Repository: "github.com/tree-sitter/tree-sitter-cpp"},
+    "c_sharp":    {Name: "c_sharp", Extensions: []string{".cs"}, Repository: "github.com/tree-sitter/tree-sitter-c-sharp"},
+    "ruby":       {Name: "ruby", Extensions: []string{".rb"}, Repository: "github.com/tree-sitter/tree-sitter-ruby"},
+    "swift":      {Name: "swift", Extensions: []string{".swift"}, Repository: "github.com/alex-pinkus/tree-sitter-swift"},
+    "kotlin":     {Name: "kotlin", Extensions: []string{".kt", ".kts"}, Repository: "github.com/fwcd/tree-sitter-kotlin"},
+    "scala":      {Name: "scala", Extensions: []string{".scala"}, Repository: "github.com/tree-sitter/tree-sitter-scala"},
+    "php":        {Name: "php", Extensions: []string{".php"}, Repository: "github.com/tree-sitter/tree-sitter-php"},
+    "html":       {Name: "html", Extensions: []string{".html", ".htm"}, Repository: "github.com/tree-sitter/tree-sitter-html"},
+    "css":        {Name: "css", Extensions: []string{".css"}, Repository: "github.com/tree-sitter/tree-sitter-css"},
+    "json":       {Name: "json", Extensions: []string{".json"}, Repository: "github.com/tree-sitter/tree-sitter-json"},
+    "yaml":       {Name: "yaml", Extensions: []string{".yaml", ".yml"}, Repository: "github.com/ikatyang/tree-sitter-yaml"},
+    "toml":       {Name: "toml", Extensions: []string{".toml"}, Repository: "github.com/ikatyang/tree-sitter-toml"},
+    "markdown":   {Name: "markdown", Extensions: []string{".md"}, Repository: "github.com/ikatyang/tree-sitter-markdown"},
+    "bash":       {Name: "bash", Extensions: []string{".sh", ".bash"}, Repository: "github.com/tree-sitter/tree-sitter-bash"},
+    "sql":        {Name: "sql", Extensions: []string{".sql"}, Repository: "github.com/DerekStride/tree-sitter-sql"},
+    "hcl":        {Name: "hcl", Extensions: []string{".hcl", ".tf"}, Repository: "github.com/MichaHoffmann/tree-sitter-hcl"},
+    "dockerfile": {Name: "dockerfile", Filenames: []string{"Dockerfile"}, Repository: "github.com/camdencheek/tree-sitter-dockerfile"},
+    "lua":        {Name: "lua", Extensions: []string{".lua"}, Repository: "github.com/Azganoth/tree-sitter-lua"},
+    "elixir":     {Name: "elixir", Extensions: []string{".ex", ".exs"}, Repository: "github.com/elixir-lang/tree-sitter-elixir"},
+    "zig":        {Name: "zig", Extensions: []string{".zig"}, Repository: "github.com/maxxnino/tree-sitter-zig"},
+    "ocaml":      {Name: "ocaml", Extensions: []string{".ml", ".mli"}, Repository: "github.com/tree-sitter/tree-sitter-ocaml"},
+    "haskell":    {Name: "haskell", Extensions: []string{".hs"}, Repository: "github.com/tree-sitter/tree-sitter-haskell"},
+    "clojure":    {Name: "clojure", Extensions: []string{".clj", ".cljs"}, Repository: "github.com/sogaiu/tree-sitter-clojure"},
+    "vue":        {Name: "vue", Extensions: []string{".vue"}, Repository: "github.com/ikatyang/tree-sitter-vue"},
+    "svelte":     {Name: "svelte", Extensions: []string{".svelte"}, Repository: "github.com/Himujjal/tree-sitter-svelte"},
+    "graphql":    {Name: "graphql", Extensions: []string{".graphql", ".gql"}, Repository: "github.com/bkegley/tree-sitter-graphql"},
+    "proto":      {Name: "proto", Extensions: []string{".proto"}, Repository: "github.com/mitchellh/tree-sitter-proto"},
+}
+
+type GrammarInfo struct {
+    Name        string   `json:"name"`
+    Extensions  []string `json:"extensions,omitempty"`
+    Filenames   []string `json:"filenames,omitempty"`
+    Repository  string   `json:"repository"`
+    Version     string   `json:"version,omitempty"`
+    Installed   bool     `json:"installed"`
+}
+
+// GrammarRegistry manages dynamic grammar loading
+type GrammarRegistry struct {
+    languages    map[string]*Language      // name → Language
+    byExtension  map[string]*Language      // .go → Language
+    byFilename   map[string]*Language      // Dockerfile → Language
+
+    grammarDir   string
+    downloader   *GrammarDownloader
+    mu           sync.RWMutex
+}
+
+type Language struct {
+    ptr       TSLanguage
+    name      string
+    libPath   string
+    libHandle uintptr
+}
+
+func NewGrammarRegistry(grammarDir string) *GrammarRegistry {
+    return &GrammarRegistry{
+        languages:   make(map[string]*Language),
+        byExtension: make(map[string]*Language),
+        byFilename:  make(map[string]*Language),
+        grammarDir:  grammarDir,
+        downloader:  NewGrammarDownloader(grammarDir),
+    }
+}
+
+// LoadLanguage loads a grammar by name, downloading if necessary
+func (r *GrammarRegistry) LoadLanguage(name string) (*Language, error) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+
+    // Already loaded?
+    if lang, ok := r.languages[name]; ok {
+        return lang, nil
+    }
+
+    // Find grammar library
+    libPath := r.findGrammarLibrary(name)
+
+    if libPath == "" {
+        // Need to download
+        info, ok := KnownGrammars[name]
+        if !ok {
+            return nil, fmt.Errorf("unknown grammar: %s", name)
+        }
+
+        var err error
+        libPath, err = r.downloader.Download(info)
+        if err != nil {
+            return nil, fmt.Errorf("failed to download grammar %s: %w", name, err)
+        }
+    }
+
+    // Load via purego
+    lang, err := r.loadGrammarLibrary(name, libPath)
+    if err != nil {
+        return nil, err
+    }
+
+    r.languages[name] = lang
+
+    // Update extension mappings
+    if info, ok := KnownGrammars[name]; ok {
+        for _, ext := range info.Extensions {
+            r.byExtension[ext] = lang
+        }
+        for _, filename := range info.Filenames {
+            r.byFilename[filename] = lang
+        }
+    }
+
+    return lang, nil
+}
+
+// GetLanguageForFile returns the language for a file, loading if necessary
+func (r *GrammarRegistry) GetLanguageForFile(filePath string) (*Language, error) {
+    ext := filepath.Ext(filePath)
+    filename := filepath.Base(filePath)
+
+    r.mu.RLock()
+    if lang, ok := r.byFilename[filename]; ok && lang != nil {
+        r.mu.RUnlock()
+        return lang, nil
+    }
+    if lang, ok := r.byExtension[ext]; ok && lang != nil {
+        r.mu.RUnlock()
+        return lang, nil
+    }
+    r.mu.RUnlock()
+
+    // Need to load - find which grammar
+    grammarName := r.detectGrammarName(filePath)
+    if grammarName == "" {
+        return nil, fmt.Errorf("no grammar found for %s", filePath)
+    }
+
+    return r.LoadLanguage(grammarName)
+}
+
+func (r *GrammarRegistry) loadGrammarLibrary(name, libPath string) (*Language, error) {
+    if err := Initialize(); err != nil {
+        return nil, err
+    }
+
+    handle, err := purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_LOCAL)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load %s: %w", libPath, err)
+    }
+
+    // Look for tree_sitter_<name> symbol
+    symbolName := "tree_sitter_" + name
+    var langFunc func() TSLanguage
+    purego.RegisterLibFunc(&langFunc, handle, symbolName)
+
+    langPtr := langFunc()
+    if langPtr == 0 {
+        purego.Dlclose(handle)
+        return nil, fmt.Errorf("failed to get language from %s", symbolName)
+    }
+
+    // Verify ABI compatibility
+    version := ts_language_version(langPtr)
+    if version < 13 || version > 14 {
+        purego.Dlclose(handle)
+        return nil, fmt.Errorf("incompatible grammar ABI version %d", version)
+    }
+
+    return &Language{
+        ptr:       langPtr,
+        name:      name,
+        libPath:   libPath,
+        libHandle: handle,
+    }, nil
+}
+```
+
+### Grammar Installation Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      GRAMMAR INSTALLATION STATE MACHINE                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────────┐                                                               │
+│  │  FILE_DETECTED   │  Agent encounters file with unknown extension                 │
+│  │  (initial state) │                                                               │
+│  └────────┬─────────┘                                                               │
+│           │                                                                         │
+│           ▼                                                                         │
+│  ┌──────────────────┐                                                               │
+│  │ GRAMMAR_LOOKUP   │  Check KnownGrammars registry                                 │
+│  └────────┬─────────┘                                                               │
+│           │                                                                         │
+│     ┌─────┴─────┐                                                                   │
+│     │           │                                                                   │
+│   [found]    [not found]                                                            │
+│     │           │                                                                   │
+│     ▼           ▼                                                                   │
+│  ┌──────────┐  ┌──────────────┐                                                     │
+│  │ CHECK    │  │ UNSUPPORTED  │  Log warning, use text-based fallback              │
+│  │ INSTALLED│  │ (terminal)   │                                                     │
+│  └────┬─────┘  └──────────────┘                                                     │
+│       │                                                                             │
+│   ┌───┴───┐                                                                         │
+│   │       │                                                                         │
+│ [yes]   [no]                                                                        │
+│   │       │                                                                         │
+│   │       ▼                                                                         │
+│   │  ┌────────────────┐                                                             │
+│   │  │ TRY_PREBUILT   │  Download from GitHub releases                              │
+│   │  └───────┬────────┘                                                             │
+│   │          │                                                                      │
+│   │    ┌─────┴─────┐                                                                │
+│   │    │           │                                                                │
+│   │ [success]   [fail]                                                              │
+│   │    │           │                                                                │
+│   │    │           ▼                                                                │
+│   │    │    ┌────────────────┐                                                      │
+│   │    │    │ TRY_COMPILE    │  Download source, compile with cc/clang              │
+│   │    │    └───────┬────────┘                                                      │
+│   │    │            │                                                               │
+│   │    │      ┌─────┴─────┐                                                         │
+│   │    │      │           │                                                         │
+│   │    │   [success]   [fail]                                                       │
+│   │    │      │           │                                                         │
+│   │    │      │           ▼                                                         │
+│   │    │      │    ┌─────────────────┐                                              │
+│   │    │      │    │ INSTALL_FAILED  │  Log error, suggest manual install           │
+│   │    │      │    │ (terminal)      │                                              │
+│   │    │      │    └─────────────────┘                                              │
+│   │    │      │                                                                     │
+│   └────┴──────┴──────┐                                                              │
+│                      ▼                                                              │
+│              ┌───────────────┐                                                      │
+│              │ LOAD_LIBRARY  │  purego.Dlopen(parser.so)                            │
+│              └───────┬───────┘                                                      │
+│                      │                                                              │
+│                ┌─────┴─────┐                                                        │
+│                │           │                                                        │
+│             [success]   [fail]                                                      │
+│                │           │                                                        │
+│                ▼           ▼                                                        │
+│        ┌────────────┐  ┌─────────────────┐                                          │
+│        │ READY      │  │ LOAD_FAILED     │                                          │
+│        │ (terminal) │  │ (terminal)      │                                          │
+│        └────────────┘  └─────────────────┘                                          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### TreeSitter Tool (Agent Interface)
+
+```go
+// core/treesitter/tool.go
+
+// TreeSitterTool provides AST parsing capabilities to all agents
+type TreeSitterTool struct {
+    registry    *GrammarRegistry
+    parserPool  *ParserPool
+}
+
+// ParseResult contains structured information from parsing
+type ParseResult struct {
+    Language    string         `json:"language"`
+    FilePath    string         `json:"file_path"`
+    RootNode    *NodeInfo      `json:"root_node"`
+    Functions   []FunctionInfo `json:"functions,omitempty"`
+    Types       []TypeInfo     `json:"types,omitempty"`
+    Imports     []ImportInfo   `json:"imports,omitempty"`
+    Errors      []ParseError   `json:"errors,omitempty"`
+    ParseTimeMs int64          `json:"parse_time_ms"`
+}
+
+type NodeInfo struct {
+    Type      string     `json:"type"`
+    StartLine uint32     `json:"start_line"`
+    EndLine   uint32     `json:"end_line"`
+    StartCol  uint32     `json:"start_col"`
+    EndCol    uint32     `json:"end_col"`
+    Content   string     `json:"content,omitempty"`
+    Children  []NodeInfo `json:"children,omitempty"`
+}
+
+type FunctionInfo struct {
+    Name       string `json:"name"`
+    StartLine  uint32 `json:"start_line"`
+    EndLine    uint32 `json:"end_line"`
+    Parameters string `json:"parameters"`
+    ReturnType string `json:"return_type,omitempty"`
+    IsMethod   bool   `json:"is_method"`
+    Receiver   string `json:"receiver,omitempty"`
+}
+
+type TypeInfo struct {
+    Name      string   `json:"name"`
+    Kind      string   `json:"kind"` // struct, interface, class, enum
+    StartLine uint32   `json:"start_line"`
+    EndLine   uint32   `json:"end_line"`
+    Fields    []string `json:"fields,omitempty"`
+}
+
+type ImportInfo struct {
+    Path  string `json:"path"`
+    Alias string `json:"alias,omitempty"`
+    Line  uint32 `json:"line"`
+}
+
+type ParseError struct {
+    Line    uint32 `json:"line"`
+    Column  uint32 `json:"column"`
+    Message string `json:"message"`
+}
+
+func NewTreeSitterTool(grammarDir string) (*TreeSitterTool, error) {
+    registry := NewGrammarRegistry(grammarDir)
+    return &TreeSitterTool{
+        registry:   registry,
+        parserPool: NewParserPool(registry),
+    }, nil
+}
+
+// Parse parses a file and returns structured information
+// Automatically installs grammar if needed
+func (t *TreeSitterTool) Parse(ctx context.Context, filePath string, content []byte) (*ParseResult, error) {
+    start := time.Now()
+
+    // Get/install language automatically
+    lang, err := t.registry.GetLanguageForFile(filePath)
+    if err != nil {
+        return nil, fmt.Errorf("no grammar for %s: %w", filepath.Ext(filePath), err)
+    }
+
+    // Get parser from pool
+    parser := t.parserPool.Get(lang.name)
+    defer t.parserPool.Put(parser)
+
+    // Parse
+    tree, err := parser.Parse(content)
+    if err != nil {
+        return nil, err
+    }
+    defer tree.Close()
+
+    result := &ParseResult{
+        Language:    lang.name,
+        FilePath:    filePath,
+        ParseTimeMs: time.Since(start).Milliseconds(),
+    }
+
+    // Extract semantic information
+    t.extractSemantics(tree, content, lang.name, result)
+    t.collectErrors(tree.RootNode(), result)
+
+    return result, nil
+}
+
+// Query runs a tree-sitter query and returns matches
+func (t *TreeSitterTool) Query(ctx context.Context, filePath string, content []byte, queryStr string) ([]QueryMatch, error) {
+    lang, err := t.registry.GetLanguageForFile(filePath)
+    if err != nil {
+        return nil, err
+    }
+
+    parser := t.parserPool.Get(lang.name)
+    defer t.parserPool.Put(parser)
+
+    tree, err := parser.Parse(content)
+    if err != nil {
+        return nil, err
+    }
+    defer tree.Close()
+
+    query, err := NewQuery(lang, queryStr)
+    if err != nil {
+        return nil, fmt.Errorf("invalid query: %w", err)
+    }
+    defer query.Close()
+
+    return query.Execute(tree.RootNode(), content), nil
+}
+
+// InstallGrammar explicitly installs a grammar
+func (t *TreeSitterTool) InstallGrammar(ctx context.Context, name string) error {
+    _, err := t.registry.LoadLanguage(name)
+    return err
+}
+
+// DetectLanguage identifies what grammar a file needs
+func (t *TreeSitterTool) DetectLanguage(filePath string) (string, bool) {
+    ext := filepath.Ext(filePath)
+    filename := filepath.Base(filePath)
+
+    for name, info := range KnownGrammars {
+        for _, e := range info.Extensions {
+            if e == ext {
+                return name, true
+            }
+        }
+        for _, f := range info.Filenames {
+            if f == filename {
+                return name, true
+            }
+        }
+    }
+    return "", false
+}
+
+// ListAvailableGrammars returns all grammars that can be installed
+func (t *TreeSitterTool) ListAvailableGrammars() []GrammarInfo {
+    var result []GrammarInfo
+    for _, info := range KnownGrammars {
+        info.Installed = t.registry.IsInstalled(info.Name)
+        result = append(result, info)
+    }
+    return result
+}
+
+type QueryMatch struct {
+    PatternIndex uint16    `json:"pattern_index"`
+    Captures     []Capture `json:"captures"`
+}
+
+type Capture struct {
+    Name    string    `json:"name"`
+    Node    *NodeInfo `json:"node"`
+    Content string    `json:"content"`
+}
+```
+
+### Integration with MVCC+OT Filesystem (FILESYSTEM.md)
+
+The tree-sitter infrastructure integrates with the MVCC+OT filesystem for AST-aware targeting:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    TREE-SITTER + MVCC/OT INTEGRATION                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │                        CENTRAL VERSION STORE (CVS)                          │    │
+│  │                                                                             │    │
+│  │  FileVersion {                                                              │    │
+│  │    ID:          VersionID                                                   │    │
+│  │    ContentHash: [32]byte                                                    │    │
+│  │    AST:         *SyntaxTree  ◄─── CACHED TREE-SITTER PARSE                 │    │
+│  │    TreeSitterVersion: uint32  ◄─── Grammar ABI version                     │    │
+│  │  }                                                                          │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                              │
+│                                      ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │                         AST-AWARE TARGETING                                 │    │
+│  │                                                                             │    │
+│  │  Target {                                                                   │    │
+│  │    // Tree-sitter node path (stable across refactors)                       │    │
+│  │    NodePath:  []string  // ["function_declaration", "HandleRequest", ...]   │    │
+│  │    NodeType:  string    // "function_declaration"                           │    │
+│  │    NodeID:    string    // Stable identifier                                │    │
+│  │                                                                             │    │
+│  │    // Fallback: byte offsets (for non-parseable files)                      │    │
+│  │    StartOffset: int                                                         │    │
+│  │    EndOffset:   int                                                         │    │
+│  │  }                                                                          │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                              │
+│                                      ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │                     INCREMENTAL PARSING                                     │    │
+│  │                                                                             │    │
+│  │  On Edit:                                                                   │    │
+│  │  1. Get cached tree from CVS                                                │    │
+│  │  2. Apply TSInputEdit to tree                                               │    │
+│  │  3. Re-parse ONLY changed region (O(edit_size) not O(file_size))           │    │
+│  │  4. Cache new tree in CVS                                                   │    │
+│  │                                                                             │    │
+│  │  Performance:                                                               │    │
+│  │  ┌──────────────────────────────────────────────────────────────────────┐   │    │
+│  │  │ Full Parse:        O(file_size)     ~50ms for 10k LOC                │   │    │
+│  │  │ Incremental Parse: O(edit_size)     ~0.5ms for typical edit          │   │    │
+│  │  │ Speedup:           100-1000x                                         │   │    │
+│  │  └──────────────────────────────────────────────────────────────────────┘   │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                              │
+│                                      ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │                    CONFLICT DETECTION (OT)                                  │    │
+│  │                                                                             │    │
+│  │  func TreeSitterAwareOverlaps(a, b Target) bool {                           │    │
+│  │      // Use tree-sitter node paths for precise detection                    │    │
+│  │      if a.NodePath != nil && b.NodePath != nil {                            │    │
+│  │          return nodePathOverlaps(a.NodePath, b.NodePath)                    │    │
+│  │      }                                                                      │    │
+│  │      // Fallback to byte offset comparison                                  │    │
+│  │      return a.StartOffset < b.EndOffset && b.StartOffset < a.EndOffset      │    │
+│  │  }                                                                          │    │
+│  │                                                                             │    │
+│  │  // No conflict: different functions                                        │    │
+│  │  Target A: ["func", "HandleRequest", "body"]                                │    │
+│  │  Target B: ["func", "ProcessData", "body"]                                  │    │
+│  │  Result:   NO OVERLAP ✓                                                     │    │
+│  │                                                                             │    │
+│  │  // Conflict: same function, different parts                                │    │
+│  │  Target A: ["func", "HandleRequest", "body", "if[0]"]                       │    │
+│  │  Target B: ["func", "HandleRequest", "body", "if[0]", "then"]               │    │
+│  │  Result:   OVERLAP (B is child of A) → needs OT                             │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// core/filesystem/treesitter_integration.go
+
+// TreeSitterManager provides AST caching and incremental parsing for CVS
+type TreeSitterManager struct {
+    tool       *TreeSitterTool
+    treeCache  *lru.Cache[VersionID, *CachedTree]
+    queryCache map[string]*CompiledQuery
+    mu         sync.RWMutex
+}
+
+type CachedTree struct {
+    Tree           *Tree
+    Language       string
+    ParsedAt       time.Time
+    GrammarVersion uint32
+}
+
+// GetOrParse returns cached tree or parses fresh
+func (m *TreeSitterManager) GetOrParse(version *FileVersion, content []byte) (*Tree, error) {
+    // Check cache
+    if cached, ok := m.treeCache.Get(version.ID); ok {
+        return cached.Tree, nil
+    }
+
+    // Parse fresh
+    result, err := m.tool.Parse(context.Background(), version.FilePath, content)
+    if err != nil {
+        return nil, err
+    }
+
+    // Cache for incremental parsing
+    m.treeCache.Add(version.ID, &CachedTree{
+        Tree:     result.tree,
+        Language: result.Language,
+        ParsedAt: time.Now(),
+    })
+
+    return result.tree, nil
+}
+
+// ParseIncremental re-parses after an edit using the cached tree
+func (m *TreeSitterManager) ParseIncremental(
+    oldVersion *FileVersion,
+    newContent []byte,
+    edit *InputEdit,
+) (*Tree, error) {
+    cached, ok := m.treeCache.Get(oldVersion.ID)
+    if !ok {
+        // No cached tree, full parse
+        return m.tool.Parse(context.Background(), oldVersion.FilePath, newContent)
+    }
+
+    // Apply edit to cached tree
+    oldTree := cached.Tree.Copy()
+    oldTree.Edit(edit)
+
+    // Incremental parse (only re-parses changed region)
+    parser := m.tool.parserPool.Get(cached.Language)
+    defer m.tool.parserPool.Put(parser)
+
+    newTree, err := parser.ParseWith(newContent, oldTree)
+    if err != nil {
+        return nil, err
+    }
+
+    return newTree, nil
+}
+
+// ComputeNodePath generates stable AST path for a position
+func (m *TreeSitterManager) ComputeNodePath(tree *Tree, offset uint32) []string {
+    node := tree.RootNode()
+    path := []string{}
+
+    for !node.IsNull() {
+        path = append(path, node.Type())
+
+        // Find child containing offset
+        found := false
+        for i := uint32(0); i < node.NamedChildCount(); i++ {
+            child := node.NamedChild(i)
+            if child.StartByte() <= offset && offset < child.EndByte() {
+                // Add identifier if named node
+                if name := m.extractNodeName(child); name != "" {
+                    path = append(path, name)
+                }
+                node = child
+                found = true
+                break
+            }
+        }
+        if !found {
+            break
+        }
+    }
+
+    return path
+}
+
+// ResolveNodePath finds node from path (reverse of ComputeNodePath)
+func (m *TreeSitterManager) ResolveNodePath(tree *Tree, path []string) (Node, error) {
+    node := tree.RootNode()
+
+    for i := 0; i < len(path); i++ {
+        pathPart := path[i]
+
+        // Find child matching type
+        found := false
+        for j := uint32(0); j < node.NamedChildCount(); j++ {
+            child := node.NamedChild(j)
+            if child.Type() == pathPart {
+                // Check if next part is name
+                if i+1 < len(path) && !isNodeType(path[i+1]) {
+                    name := m.extractNodeName(child)
+                    if name == path[i+1] {
+                        node = child
+                        i++ // Skip name in path
+                        found = true
+                        break
+                    }
+                } else {
+                    node = child
+                    found = true
+                    break
+                }
+            }
+        }
+
+        if !found {
+            return Node{}, fmt.Errorf("path not found: %v at %s", path, pathPart)
+        }
+    }
+
+    return node, nil
+}
+```
+
+### Agent-Specific Integration
+
+#### Librarian: Semantic Indexing
+
+```go
+// agents/librarian/indexer.go
+
+// IndexFile uses tree-sitter for semantic indexing
+func (l *Librarian) IndexFile(ctx context.Context, filePath string) (*FileIndex, error) {
+    content, err := os.ReadFile(filePath)
+    if err != nil {
+        return nil, err
+    }
+
+    result, err := l.tsTool.Parse(ctx, filePath, content)
+    if err != nil {
+        // Fallback to text-based indexing
+        return l.indexAsText(filePath, content)
+    }
+
+    index := &FileIndex{
+        Path:      filePath,
+        Language:  result.Language,
+        Functions: make(map[string]SymbolRef),
+        Types:     make(map[string]SymbolRef),
+        Imports:   result.Imports,
+        IndexedAt: time.Now(),
+    }
+
+    for _, fn := range result.Functions {
+        index.Functions[fn.Name] = SymbolRef{
+            Name:      fn.Name,
+            Line:      fn.StartLine,
+            EndLine:   fn.EndLine,
+            Signature: fn.Parameters,
+            Kind:      "function",
+        }
+    }
+
+    for _, typ := range result.Types {
+        index.Types[typ.Name] = SymbolRef{
+            Name:    typ.Name,
+            Line:    typ.StartLine,
+            EndLine: typ.EndLine,
+            Kind:    typ.Kind,
+        }
+    }
+
+    return index, nil
+}
+
+// FindReferences uses tree-sitter queries
+func (l *Librarian) FindReferences(ctx context.Context, symbol string) ([]Reference, error) {
+    query := fmt.Sprintf(`(identifier) @ref (#eq? @ref "%s")`, symbol)
+
+    var refs []Reference
+    for _, file := range l.indexedFiles {
+        content, _ := os.ReadFile(file)
+        matches, err := l.tsTool.Query(ctx, file, content, query)
+        if err != nil {
+            continue
+        }
+
+        for _, m := range matches {
+            for _, cap := range m.Captures {
+                refs = append(refs, Reference{
+                    File:   file,
+                    Line:   cap.Node.StartLine,
+                    Column: cap.Node.StartCol,
+                })
+            }
+        }
+    }
+
+    return refs, nil
+}
+```
+
+#### Engineer: Safe Refactoring
+
+```go
+// agents/engineer/refactor.go
+
+// RenameSymbol uses tree-sitter for safe, AST-aware renaming
+func (e *Engineer) RenameSymbol(ctx context.Context, filePath, oldName, newName string) ([]Edit, error) {
+    content, err := os.ReadFile(filePath)
+    if err != nil {
+        return nil, err
+    }
+
+    // Query for all references
+    query := fmt.Sprintf(`(identifier) @ref (#eq? @ref "%s")`, oldName)
+    matches, err := e.tsTool.Query(ctx, filePath, content, query)
+    if err != nil {
+        return nil, err
+    }
+
+    // Build edits in reverse order (preserve offsets)
+    var edits []Edit
+    for _, m := range matches {
+        for _, cap := range m.Captures {
+            edits = append(edits, Edit{
+                StartByte: cap.Node.StartByte,
+                EndByte:   cap.Node.EndByte,
+                NewText:   newName,
+            })
+        }
+    }
+
+    // Sort descending by offset
+    sort.Slice(edits, func(i, j int) bool {
+        return edits[i].StartByte > edits[j].StartByte
+    })
+
+    return edits, nil
+}
+
+// ExtractFunction extracts code into a new function using AST
+func (e *Engineer) ExtractFunction(ctx context.Context, file string, startLine, endLine uint32, newName string) (*ExtractResult, error) {
+    content, _ := os.ReadFile(file)
+    result, err := e.tsTool.Parse(ctx, file, content)
+    if err != nil {
+        return nil, err
+    }
+
+    // Find smallest AST node containing the range
+    // Determine variables that need to be parameters
+    // Generate function signature and call site
+    // ... (implementation details)
+}
+```
+
+#### Inspector: Complexity Analysis
+
+```go
+// agents/inspector/analyzer.go
+
+// AnalyzeComplexity uses tree-sitter for cyclomatic complexity
+func (i *Inspector) AnalyzeComplexity(ctx context.Context, filePath string) (*ComplexityReport, error) {
+    content, _ := os.ReadFile(filePath)
+    result, err := i.tsTool.Parse(ctx, filePath, content)
+    if err != nil {
+        return nil, err
+    }
+
+    report := &ComplexityReport{
+        File:      filePath,
+        Language:  result.Language,
+        Functions: make([]FunctionComplexity, 0),
+    }
+
+    // Query for complexity contributors
+    complexityQuery := `
+        (if_statement) @if
+        (for_statement) @for
+        (while_statement) @while
+        (switch_statement) @switch
+        (case_clause) @case
+        (binary_expression ["&&" "||"] @logical)
+        (conditional_expression) @ternary
+    `
+
+    for _, fn := range result.Functions {
+        fc := FunctionComplexity{
+            Name:      fn.Name,
+            StartLine: fn.StartLine,
+            EndLine:   fn.EndLine,
+            LineCount: fn.EndLine - fn.StartLine + 1,
+            Complexity: 1, // Base complexity
+        }
+
+        // Count complexity contributors within function
+        matches, _ := i.tsTool.Query(ctx, filePath, content, complexityQuery)
+        for _, m := range matches {
+            for _, cap := range m.Captures {
+                if cap.Node.StartLine >= fn.StartLine && cap.Node.EndLine <= fn.EndLine {
+                    fc.Complexity++
+                }
+            }
+        }
+
+        report.Functions = append(report.Functions, fc)
+    }
+
+    return report, nil
+}
+```
+
+#### Tester: Test Discovery
+
+```go
+// agents/tester/discovery.go
+
+// DiscoverTests uses tree-sitter to find test functions
+func (t *Tester) DiscoverTests(ctx context.Context, filePath string) ([]TestInfo, error) {
+    content, _ := os.ReadFile(filePath)
+    result, err := t.tsTool.Parse(ctx, filePath, content)
+    if err != nil {
+        return nil, err
+    }
+
+    var tests []TestInfo
+
+    // Language-specific test patterns
+    var query string
+    switch result.Language {
+    case "go":
+        query = `(function_declaration name: (identifier) @name (#match? @name "^Test"))`
+    case "python":
+        query = `(function_definition name: (identifier) @name (#match? @name "^test_"))`
+    case "javascript", "typescript":
+        query = `(call_expression function: (identifier) @fn (#match? @fn "^(describe|it|test)$"))`
+    case "rust":
+        query = `(attribute_item (attribute (identifier) @attr (#eq? @attr "test")))`
+    default:
+        return tests, nil
+    }
+
+    matches, err := t.tsTool.Query(ctx, filePath, content, query)
+    if err != nil {
+        return nil, err
+    }
+
+    for _, m := range matches {
+        for _, cap := range m.Captures {
+            tests = append(tests, TestInfo{
+                Name:     cap.Content,
+                File:     filePath,
+                Line:     cap.Node.StartLine,
+                Language: result.Language,
+            })
+        }
+    }
+
+    return tests, nil
+}
+```
+
+#### Designer: Component Extraction
+
+```go
+// agents/designer/components.go
+
+// ExtractComponents finds UI components using tree-sitter
+func (d *Designer) ExtractComponents(ctx context.Context, filePath string) ([]ComponentInfo, error) {
+    content, _ := os.ReadFile(filePath)
+    result, err := d.tsTool.Parse(ctx, filePath, content)
+    if err != nil {
+        return nil, err
+    }
+
+    var components []ComponentInfo
+
+    // Language-specific component patterns
+    var query string
+    switch result.Language {
+    case "tsx", "jsx":
+        query = `
+            (function_declaration
+                name: (identifier) @name
+                body: (statement_block (return_statement (jsx_element)))
+            )
+            (arrow_function
+                body: (jsx_element) @jsx
+            )
+        `
+    case "vue":
+        query = `(component (identifier) @name)`
+    case "svelte":
+        query = `(script (export_statement))`
+    default:
+        return components, nil
+    }
+
+    matches, _ := d.tsTool.Query(ctx, filePath, content, query)
+    for _, m := range matches {
+        // Extract component info from matches
+        // ...
+    }
+
+    return components, nil
+}
+```
+
+### User-Defined Grammar Support
+
+Users can add grammars for languages not shipped by default:
+
+```
+~/.sylk/grammars/
+├── config.yaml                    # Global grammar configuration
+│
+├── mylang/                        # User-defined language
+│   ├── grammar.yaml               # Language metadata
+│   ├── parser.so                  # Linux
+│   ├── parser.dylib               # macOS
+│   ├── parser.dll                 # Windows
+│   └── queries/
+│       ├── highlights.scm         # Syntax highlighting
+│       └── tags.scm               # Symbol extraction
+│
+└── customdsl/
+    ├── grammar.yaml
+    └── parser.dylib
+```
+
+```yaml
+# ~/.sylk/grammars/mylang/grammar.yaml
+name: mylang
+version: 1.0.0
+description: "My custom language parser"
+
+extensions:
+  - .mylang
+  - .ml
+
+filenames:
+  - Mylangfile
+
+shebangs:
+  - "#!/usr/bin/env mylang"
+
+parser:
+  prefer: native   # native | wasm
+```
+
+### CLI Commands
+
+```bash
+# List available grammars
+sylk grammar list
+
+# Install a specific grammar
+sylk grammar install rust
+
+# Install all common grammars
+sylk setup --grammars
+
+# Add custom grammar from GitHub
+sylk grammar add https://github.com/example/tree-sitter-mylang
+
+# Validate a grammar
+sylk grammar validate mylang
+
+# Remove a grammar
+sylk grammar remove mylang
+```
+
+---
+
 ## Storage & Configuration
 
 This section defines the storage layout, configuration schema, credential management, and database operations for Sylk.
@@ -9812,6 +11384,8 @@ Sylk uses XDG semantics with platform-native default paths. This provides consis
 |-----------|----------|-----------------|-------------------|
 | **config** | User settings, credentials (encrypted), provider config | HIGH | No |
 | **data** | Sessions, SQLite DBs, WAL, checkpoints, per-project knowledge | HIGH | No |
+| **data/lib** | Native libraries (libtree-sitter runtime) | LOW | Yes (re-downloaded on setup) |
+| **data/grammars** | Tree-sitter language grammars (built-in + user-defined) | MEDIUM | Yes (re-downloaded, but user grammars need backup) |
 | **cache** | Query cache, embeddings cache, tool output cache | LOW | Yes |
 | **state** | Logs, lock files, PID files, runtime signals, temp files | MEDIUM | Yes (after shutdown) |
 
@@ -9830,6 +11404,26 @@ config/
 data/
 ├── shared/
 │   └── system.db                  # GLOBAL: sessions, subscription_usage, circuit_breakers
+│
+├── lib/                           # Native libraries (tree-sitter runtime)
+│   ├── libtree-sitter.dylib       # macOS
+│   ├── libtree-sitter.so          # Linux
+│   └── tree-sitter.dll            # Windows
+│
+├── grammars/                      # Tree-sitter language grammars
+│   ├── config.yaml                # Grammar configuration
+│   ├── go/
+│   │   └── parser.{so,dylib,dll}  # Go grammar
+│   ├── python/
+│   │   └── parser.{so,dylib,dll}  # Python grammar
+│   ├── typescript/
+│   │   └── parser.{so,dylib,dll}  # TypeScript grammar
+│   └── <user-defined>/            # User-added grammars
+│       ├── grammar.yaml           # Language metadata
+│       ├── parser.{so,dylib,dll}  # Compiled parser
+│       └── queries/               # Optional query files
+│           ├── highlights.scm
+│           └── tags.scm
 │
 └── projects/
     └── {project_hash}/
@@ -13251,7 +14845,7 @@ func (s *Sandbox) generateSeatbeltProfile(cmd *exec.Cmd) string {
 #### Virtual Filesystem Layer
 
 ```go
-// VirtualFilesystem provides copy-on-write file operations
+// VirtualFilesystem provides copy-on-write file operations with MVCC versioning support
 type VirtualFilesystem struct {
     mu sync.RWMutex
 
@@ -13262,6 +14856,11 @@ type VirtualFilesystem struct {
     // Track modifications
     modifications map[string]*FileModification
 
+    // MVCC Versioning Integration (See: Central Version Store)
+    cvs           *CentralVersionStore      // Shared version store (nil if versioning disabled)
+    baseVersions  map[string]VersionID      // Starting versions for this VFS instance
+    clock         VectorClock               // Logical clock for causality
+
     auditLog *AuditLogger
 }
 
@@ -13270,6 +14869,11 @@ type FileModification struct {
     StagingPath  string
     Operation    string // "create", "modify", "delete"
     Timestamp    time.Time
+
+    // MVCC Versioning fields
+    ContentHash  ContentHash               // SHA-256 hash of content
+    BaseVersion  VersionID                 // Version this modification is based on
+    Operations   []Operation               // Operations that produced this modification
 }
 
 // PrepareForCommand sets up VFS for a command execution
@@ -13345,6 +14949,285 @@ func (vfs *VirtualFilesystem) MergeChanges(cmd *exec.Cmd) error {
     })
 }
 ```
+
+#### Central Version Store (CVS)
+
+The Central Version Store provides MVCC (Multi-Version Concurrency Control) with Operational Transformation for robust multi-session file versioning. See `FILESYSTEM.md` for complete specification.
+
+```go
+// VersionID is a content-addressable identifier (SHA-256 hash)
+type VersionID [32]byte
+
+// ContentHash is a SHA-256 hash of file contents
+type ContentHash [32]byte
+
+// VectorClock tracks causal ordering across sessions
+type VectorClock map[SessionID]uint64
+
+func (vc VectorClock) Increment(session SessionID) VectorClock
+func (vc VectorClock) Merge(other VectorClock) VectorClock
+func (vc VectorClock) HappensBefore(other VectorClock) bool
+func (vc VectorClock) Concurrent(other VectorClock) bool
+
+// CentralVersionStore is the single source of truth for all file versions
+type CentralVersionStore struct {
+    // Version DAG per file
+    Versions    map[string][]FileVersion
+
+    // Append-only operation log
+    Operations  OperationLog
+
+    // Content-addressable deduplicated storage
+    BlobStore   BlobStore
+
+    // Write-ahead log for crash recovery
+    WAL         *WriteAheadLog
+
+    // Global ordering
+    Clock       VectorClock
+
+    mu          sync.RWMutex
+    fileLocks   map[string]*sync.Mutex  // Per-file commit locks
+}
+
+// FileVersion represents a single version in the version DAG
+type FileVersion struct {
+    ID          VersionID
+    FilePath    string
+    Parents     []VersionID             // DAG - can have multiple (merge commits)
+    Operations  []OperationID           // Operations that produced this version
+    ContentHash ContentHash             // Reference to blob store
+    ContentSize int64
+    Clock       VectorClock
+    Timestamp   time.Time
+    PipelineID  PipelineID
+    SessionID   SessionID
+    IsMerge     bool                    // True if this is a merge commit
+
+    // Variant tracking (for Pipeline Variants)
+    VariantGroupID *string
+    VariantLabel   string               // "original", "variant-1", etc.
+}
+
+// Operation represents an atomic change to a file (not full rewrite)
+type Operation struct {
+    ID          OperationID
+    BaseVersion VersionID               // "I was looking at this version"
+    FilePath    string
+    Target      Target                  // WHAT I'm modifying (AST node or range)
+    Type        OpType                  // Insert | Delete | Replace | Move
+    Content     []byte                  // New content
+    OldContent  []byte                  // Previous content (for rollback)
+    PipelineID  PipelineID
+    SessionID   SessionID
+    AgentID     string
+    AgentRole   AgentRole               // Security: role that performed this operation
+    Clock       VectorClock
+    Timestamp   time.Time
+}
+
+type OpType int
+
+const (
+    OpInsert OpType = iota
+    OpDelete
+    OpReplace
+    OpMove
+)
+
+// Target identifies a location within a file using AST-aware targeting
+// AST targeting is stable across refactors (unlike line numbers)
+type Target struct {
+    // Primary: AST-based (stable across refactors)
+    NodePath    []string                // e.g., ["func", "HandleRequest", "body", "if[0]"]
+    NodeType    string                  // e.g., "FunctionDecl", "IfStmt"
+    NodeID      string                  // Unique identifier within file
+
+    // Fallback: character offsets (for non-parseable files)
+    StartOffset int
+    EndOffset   int
+
+    // Cached: line numbers (for display, not identity)
+    StartLine   int
+    EndLine     int
+
+    // Language hint for parser selection
+    Language    string                  // "go", "typescript", "python", etc.
+}
+
+// CVS Core Operations
+func (cvs *CentralVersionStore) Read(ctx context.Context, filePath string) ([]byte, error)
+func (cvs *CentralVersionStore) Write(ctx context.Context, filePath string, content []byte, meta WriteMetadata) (VersionID, error)
+func (cvs *CentralVersionStore) GetVersion(versionID VersionID) (*FileVersion, error)
+func (cvs *CentralVersionStore) GetHead(filePath string) (*FileVersion, error)
+func (cvs *CentralVersionStore) GetHistory(filePath string, opts HistoryOptions) ([]*FileVersion, error)
+
+// Pipeline Operations
+func (cvs *CentralVersionStore) BeginPipeline(cfg BeginPipelineConfig) (*PipelineVFS, error)
+func (cvs *CentralVersionStore) CommitPipeline(pipelineID PipelineID) ([]VersionID, error)
+func (cvs *CentralVersionStore) RollbackPipeline(pipelineID PipelineID) error
+
+// Merge with OT
+func (cvs *CentralVersionStore) Merge(ctx context.Context, v1, v2 VersionID, resolver ConflictResolver) (VersionID, error)
+func (cvs *CentralVersionStore) ThreeWayMerge(ctx context.Context, base, ours, theirs VersionID, resolver ConflictResolver) (VersionID, error)
+
+// Cross-Session Coordination
+func (cvs *CentralVersionStore) AcquireFileLock(filePath string, sessionID SessionID) (FileLock, error)
+func (cvs *CentralVersionStore) ReleaseFileLock(lock FileLock) error
+func (cvs *CentralVersionStore) Subscribe(filePath string, sessionID SessionID, cb FileChangeCallback) (SubscriptionID, error)
+func (cvs *CentralVersionStore) Unsubscribe(subID SubscriptionID) error
+```
+
+#### Operational Transformation Engine
+
+OT transforms concurrent operations to maintain convergence:
+
+```go
+// OTEngine handles operational transformation for concurrent edits
+type OTEngine interface {
+    // Transform transforms op1 against op2 that was applied concurrently
+    Transform(op1, op2 *Operation) (*Operation, error)
+
+    // TransformBatch transforms a batch of operations against another batch
+    TransformBatch(ops1, ops2 []*Operation) ([]*Operation, error)
+
+    // DetectConflict identifies conflicts between operations
+    DetectConflict(op1, op2 *Operation) *Conflict
+
+    // CanMergeAutomatically returns true if concurrent ops can be auto-merged
+    CanMergeAutomatically(op1, op2 *Operation) bool
+}
+
+// Conflict represents a conflict between two operations
+type Conflict struct {
+    Op1         *Operation
+    Op2         *Operation
+    Type        ConflictType
+    Description string
+    Resolutions []Resolution            // Possible resolutions
+}
+
+type ConflictType int
+
+const (
+    ConflictTypeOverlappingEdit ConflictType = iota  // Both edit same region
+    ConflictTypeDeleteEdit                            // One deletes, other edits
+    ConflictTypeMoveEdit                              // One moves, other edits
+    ConflictTypeSemanticConflict                      // AST-level conflict
+)
+
+// Resolution represents a possible conflict resolution
+type Resolution struct {
+    Label       string
+    Description string
+    ResultOp    *Operation              // Resulting operation if chosen
+}
+
+// ConflictResolver routes conflicts through Guide to user
+type ConflictResolver interface {
+    ResolveConflict(ctx context.Context, conflict *Conflict) (*Resolution, error)
+    AutoResolve(conflict *Conflict, policy AutoResolvePolicy) (*Resolution, bool)
+}
+
+type AutoResolvePolicy int
+
+const (
+    AutoResolvePolicyNone        AutoResolvePolicy = iota // Always prompt user
+    AutoResolvePolicyKeepNewest                            // Keep most recent
+    AutoResolvePolicyKeepOldest                            // Keep oldest
+    AutoResolvePolicyKeepBoth                              // Merge both changes
+)
+```
+
+**Why AST targeting is critical:**
+
+```
+Line-based (BREAKS):
+  Pipeline A: "Modify lines 50-60"
+  Pipeline B: "Insert 20 lines at line 10"
+  → Pipeline A's target is now wrong (should be 70-80)
+
+AST-based (STABLE):
+  Pipeline A: "Modify func:HandleRequest.body.if[0]"
+  Pipeline B: "Insert func:NewHelper before func:HandleRequest"
+  → Pipeline A's target unchanged - still func:HandleRequest.body.if[0]
+```
+
+#### Pipeline VFS (Dual VFS Approach)
+
+Each pipeline maintains two Virtual File Systems for isolation:
+
+```go
+// PipelineVFS provides versioned file operations scoped to a pipeline
+type PipelineVFS struct {
+    pipelineID    PipelineID
+    sessionID     SessionID
+    variantGroupID *string               // Set if part of variant execution
+
+    // Dual VFS: Pre-change (frozen) + Change (working)
+    preChangeVFS  *VFS                   // Frozen snapshot at task start
+    changeVFS     *VFS                   // Working copy where modifications happen
+
+    // Versioning
+    cvs           *CentralVersionStore
+    baseVersions  map[string]VersionID   // Starting versions
+    pendingOps    map[string][]Operation // Uncommitted operations
+    clock         VectorClock
+
+    // Security integration
+    permMgr       *PermissionManager
+    sanitizer     *SecretSanitizer
+    agentRole     AgentRole
+
+    mu            sync.RWMutex
+}
+
+// NewPipelineVFS creates a VFS for a pipeline
+func NewPipelineVFS(
+    pipelineID PipelineID,
+    sessionID SessionID,
+    baseVersion VersionID,
+    cvs *CentralVersionStore,
+    permMgr *PermissionManager,
+    agentRole AgentRole,
+) (*PipelineVFS, error)
+
+// Read reads from change VFS (or pre-change if not modified)
+func (vfs *PipelineVFS) Read(path string) ([]byte, error)
+
+// ReadAt reads file at specific version
+func (vfs *PipelineVFS) ReadAt(path string, version VersionID) ([]byte, error)
+
+// Write writes to change VFS and records operation
+func (vfs *PipelineVFS) Write(path string, content []byte) error
+
+// Delete marks file for deletion
+func (vfs *PipelineVFS) Delete(path string) error
+
+// History returns version history for a file
+func (vfs *PipelineVFS) History(path string, limit int) ([]*FileVersion, error)
+
+// Diff returns differences between two versions
+func (vfs *PipelineVFS) Diff(path string, v1, v2 VersionID) (*FileDiff, error)
+
+// Commit commits all pending operations to CVS
+func (vfs *PipelineVFS) Commit() ([]VersionID, error)
+
+// Rollback discards pending changes and restores from pre-change VFS
+func (vfs *PipelineVFS) Rollback() error
+
+// ForkVariant creates a variant VFS starting from pre-change state
+func (vfs *PipelineVFS) ForkVariant(variantGroupID string) *PipelineVFS
+
+// ChangedFiles returns files modified in this VFS
+func (vfs *PipelineVFS) ChangedFiles() []string
+```
+
+**Benefits of Dual VFS:**
+- **Temporal isolation**: Immune to external changes during work
+- **Instant operations**: Memory-to-memory diffs, reverts, forks
+- **Consistent comparison**: Stable baseline for showing changes
+- **Simple semantics**: No conditional logic for git vs uncommitted states
 
 #### Network Proxy
 
@@ -16013,6 +17896,361 @@ PROACTIVE STALENESS DETECTION:
 `
 ```
 
+#### Archivalist Knowledge Decay Protocol
+
+**CRITICAL: Historical information relevance decays over time. Weight accordingly.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        KNOWLEDGE DECAY PROTOCOL                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Old information is less relevant. Apply decay weighting.               │
+│                                                                                     │
+│  DECAY FACTORS:                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  TIME DECAY:                                                                 │   │
+│  │  - < 1 week: Weight 1.0 (full relevance)                                    │   │
+│  │  - 1-4 weeks: Weight 0.8                                                    │   │
+│  │  - 1-3 months: Weight 0.6                                                   │   │
+│  │  - 3-6 months: Weight 0.4                                                   │   │
+│  │  - 6-12 months: Weight 0.2                                                  │   │
+│  │  - > 12 months: Weight 0.1 (flag as potentially outdated)                   │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  DECAY MODIFIERS:                                                                   │
+│  ├── HIGH_VALUE: x1.5 weight (successful patterns, validated solutions)           │
+│  ├── REINFORCED: x2.0 weight (same pattern succeeded multiple times)              │
+│  ├── CONTRADICTED: x0.5 weight (newer info contradicts)                            │
+│  └── DEPRECATED: x0.1 weight (explicitly marked outdated)                          │
+│                                                                                     │
+│  QUERY RESULT ORDERING:                                                             │
+│  Results ordered by: relevance_score * decay_weight * modifier                     │
+│                                                                                     │
+│  RESPONSE ANNOTATION:                                                               │
+│  Include decay info in responses:                                                   │
+│  "Pattern from 3 months ago (weight: 0.6). Verify current applicability."         │
+│  "Failure pattern reinforced 4 times (weight: 2.0). High confidence warning."     │
+│                                                                                     │
+│  OLD ENTRY HANDLING:                                                                │
+│  ├── > 6 months: Add "AGING" flag to response                                     │
+│  ├── > 12 months: Add "VERIFY CURRENT" warning                                    │
+│  └── > 24 months: Consider archiving (move to cold storage)                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchivalistKnowledgeDecayPrompt = `
+KNOWLEDGE DECAY PROTOCOL:
+
+TIME DECAY WEIGHTS:
+- < 1 week: 1.0 (full)
+- 1-4 weeks: 0.8
+- 1-3 months: 0.6
+- 3-6 months: 0.4
+- 6-12 months: 0.2
+- > 12 months: 0.1
+
+MODIFIERS:
+- HIGH_VALUE (validated): x1.5
+- REINFORCED (multiple successes): x2.0
+- CONTRADICTED (newer info differs): x0.5
+- DEPRECATED: x0.1
+
+APPLY TO QUERIES:
+Order results by: relevance * decay_weight * modifier
+
+ANNOTATE RESPONSES:
+"Pattern from [age] (weight: [X]). [warning if old]"
+
+Examples:
+"3 months old (weight: 0.6). Verify current applicability."
+"Reinforced 4x (weight: 2.0). High confidence."
+
+OLD ENTRIES:
+- > 6 months: Add AGING flag
+- > 12 months: Add VERIFY warning
+- > 24 months: Archive to cold storage
+
+Recent info > old info. Weight accordingly.
+`
+```
+
+#### Archivalist Cross-Session Promotion Protocol
+
+**CRITICAL: Successful patterns should be automatically promoted for cross-session visibility.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     CROSS-SESSION PROMOTION PROTOCOL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Patterns that work repeatedly should be promoted for all sessions.     │
+│                                                                                     │
+│  PROMOTION CRITERIA:                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  AUTO-PROMOTE when:                                                          │   │
+│  │  1. Pattern succeeded in 2+ different sessions                               │   │
+│  │  2. Pattern succeeded 3+ times in same session                               │   │
+│  │  3. Pattern explicitly marked as "best practice"                             │   │
+│  │  4. Failure pattern recurring (promote as warning)                           │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  PROMOTION LEVELS:                                                                  │
+│  ├── SESSION_LOCAL: Only visible in originating session                           │
+│  ├── PROJECT_WIDE: Visible across sessions for same project                        │
+│  ├── GLOBAL: Visible across all projects (rare, general patterns)                  │
+│  └── PINNED: Always surface for relevant queries                                   │
+│                                                                                     │
+│  PROMOTION WORKFLOW:                                                                │
+│  1. Track pattern success across sessions                                          │
+│  2. When criteria met, auto-promote to next level                                  │
+│  3. Log promotion with justification                                               │
+│  4. Notify relevant agents of promoted pattern                                     │
+│                                                                                     │
+│  PROMOTION LOG:                                                                     │
+│  {                                                                                  │
+│    "pattern_id": "...",                                                            │
+│    "promoted_from": "SESSION_LOCAL",                                               │
+│    "promoted_to": "PROJECT_WIDE",                                                  │
+│    "reason": "Succeeded in 3 sessions",                                            │
+│    "success_count": 5,                                                             │
+│    "session_count": 3                                                              │
+│  }                                                                                  │
+│                                                                                     │
+│  DEMOTION:                                                                          │
+│  If promoted pattern starts failing:                                               │
+│  - Track failure rate post-promotion                                               │
+│  - If > 30% failure rate, demote one level                                         │
+│  - Add context note explaining when it works vs. doesn't                           │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchivalistCrossSessionPromotionPrompt = `
+CROSS-SESSION PROMOTION PROTOCOL:
+
+AUTO-PROMOTE WHEN:
+1. Pattern succeeded in 2+ different sessions
+2. Pattern succeeded 3+ times in same session
+3. Pattern marked "best practice"
+4. Failure pattern recurring (promote as warning)
+
+PROMOTION LEVELS:
+- SESSION_LOCAL: One session only
+- PROJECT_WIDE: All sessions, same project
+- GLOBAL: All projects (rare)
+- PINNED: Always surface
+
+ON PROMOTION:
+1. Log promotion with justification
+2. Update visibility level
+3. Notify relevant agents
+
+LOG FORMAT:
+{
+  "pattern_id": "...",
+  "promoted_from": "SESSION_LOCAL",
+  "promoted_to": "PROJECT_WIDE",
+  "reason": "Succeeded in 3 sessions",
+  "success_count": 5
+}
+
+DEMOTION:
+If failure rate > 30% post-promotion:
+- Demote one level
+- Add context note for when it works/doesn't
+
+Good patterns should spread automatically.
+`
+```
+
+#### Archivalist Conflict Detection & Resolution Protocol
+
+**CRITICAL: Detect conflicting entries and reconcile or flag for review.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                   CONFLICT DETECTION & RESOLUTION PROTOCOL                           │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Conflicting information confuses consumers. Detect and resolve.        │
+│                                                                                     │
+│  CONFLICT TYPES:                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. DIRECT_CONTRADICTION: Entry A says X, Entry B says not-X                │   │
+│  │  2. RECOMMENDATION_CONFLICT: Different approaches for same problem          │   │
+│  │  3. CONTEXT_OVERLAP: Same context has multiple different outcomes           │   │
+│  │  4. VERSION_CONFLICT: Old and new versions of same pattern                  │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  DETECTION:                                                                         │
+│  On store: Check for existing entries with similar signatures                      │
+│  - Semantic similarity > 0.8 AND different recommendations                         │
+│  - Same pattern signature AND different outcomes                                   │
+│  - Same error pattern AND different resolutions                                    │
+│                                                                                     │
+│  RESOLUTION STRATEGIES:                                                             │
+│  ├── NEWER_WINS: If clearly newer and contradicts, newer takes precedence         │
+│  ├── CONTEXT_SPLIT: If context differs, both valid in different contexts          │
+│  ├── MERGE: If complementary, merge into single comprehensive entry               │
+│  ├── FLAG_FOR_REVIEW: If can't auto-resolve, flag for human/Architect review      │
+│  └── KEEP_BOTH: If both valid alternatives, mark as "alternatives"                │
+│                                                                                     │
+│  CONFLICT RECORD:                                                                   │
+│  {                                                                                  │
+│    "conflict_id": "...",                                                           │
+│    "type": "RECOMMENDATION_CONFLICT",                                              │
+│    "entry_a": "...",                                                               │
+│    "entry_b": "...",                                                               │
+│    "resolution": "CONTEXT_SPLIT",                                                  │
+│    "resolution_note": "A applies to sync code, B applies to async"                │
+│  }                                                                                  │
+│                                                                                     │
+│  WHEN SURFACING CONFLICTING ENTRIES:                                                │
+│  Include conflict note: "Note: Alternative approach exists. See [ref]."           │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchivalistConflictResolutionPrompt = `
+CONFLICT DETECTION & RESOLUTION PROTOCOL:
+
+CONFLICT TYPES:
+1. DIRECT_CONTRADICTION: X vs not-X
+2. RECOMMENDATION_CONFLICT: Different approaches
+3. CONTEXT_OVERLAP: Same context, different outcomes
+4. VERSION_CONFLICT: Old vs new pattern
+
+DETECT ON STORE:
+- Similar signature (>0.8) + different recommendations
+- Same pattern + different outcomes
+- Same error + different resolutions
+
+RESOLUTION STRATEGIES:
+- NEWER_WINS: Newer clearly supersedes
+- CONTEXT_SPLIT: Both valid in different contexts
+- MERGE: Complementary, combine
+- FLAG_FOR_REVIEW: Can't auto-resolve
+- KEEP_BOTH: Valid alternatives, mark as such
+
+RECORD CONFLICTS:
+{
+  "conflict_id": "...",
+  "type": "...",
+  "entry_a": "...",
+  "entry_b": "...",
+  "resolution": "...",
+  "resolution_note": "explanation"
+}
+
+WHEN SURFACING:
+"Note: Alternative approach exists. See [ref]."
+
+Conflicting info confuses. Resolve or clarify.
+`
+```
+
+#### Archivalist Retrieval Quality Feedback Loop Protocol
+
+**CRITICAL: Use agent feedback to continuously improve retrieval quality.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                  RETRIEVAL QUALITY FEEDBACK LOOP PROTOCOL                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Agent feedback improves retrieval. Collect, analyze, act.              │
+│                                                                                     │
+│  FEEDBACK COLLECTION:                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  POSITIVE SIGNALS:                                                           │   │
+│  │  - Pattern used successfully                                                 │   │
+│  │  - Warning heeded, failure avoided                                          │   │
+│  │  - Resolution applied, problem solved                                        │   │
+│  │                                                                              │   │
+│  │  NEGATIVE SIGNALS:                                                           │   │
+│  │  - "Not relevant" from agent                                                 │   │
+│  │  - Pattern used, still failed                                               │   │
+│  │  - Resolution applied, didn't work                                          │   │
+│  │  - Agent asked follow-up (incomplete retrieval)                             │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  FEEDBACK ACTIONS:                                                                  │
+│  ├── POSITIVE: Boost entry weight, reinforce cross-references                      │
+│  ├── "NOT RELEVANT": Add negative example, improve similarity                      │
+│  ├── "DIDN'T WORK": Add context note, reduce weight                                │
+│  ├── "INCOMPLETE": Create cross-references to related entries                      │
+│  └── Multiple negatives: Review and potentially deprecate                          │
+│                                                                                     │
+│  QUALITY METRICS:                                                                   │
+│  {                                                                                  │
+│    "retrieval_quality": {                                                          │
+│      "total_retrievals": 1000,                                                     │
+│      "positive_feedback": 820,                                                     │
+│      "negative_feedback": 80,                                                      │
+│      "no_feedback": 100,                                                           │
+│      "quality_score": 0.91,                                                        │
+│      "trend": "improving|stable|declining"                                         │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  SELF-IMPROVEMENT LOOP:                                                             │
+│  1. Collect feedback on retrievals                                                 │
+│  2. Analyze patterns in negative feedback                                          │
+│  3. Adjust entry weights and relationships                                         │
+│  4. Measure improvement in quality score                                           │
+│  5. Repeat                                                                         │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchivalistRetrievalFeedbackPrompt = `
+RETRIEVAL QUALITY FEEDBACK LOOP PROTOCOL:
+
+COLLECT FEEDBACK:
+Positive:
+- Pattern used successfully
+- Warning heeded
+- Resolution worked
+
+Negative:
+- "Not relevant"
+- Pattern failed
+- Resolution didn't work
+- Follow-up needed (incomplete)
+
+ACTIONS ON FEEDBACK:
+- POSITIVE: Boost weight, reinforce links
+- NOT_RELEVANT: Add negative example
+- DIDNT_WORK: Add context, reduce weight
+- INCOMPLETE: Add cross-references
+- Multiple negatives: Review, potentially deprecate
+
+TRACK QUALITY:
+{
+  "total_retrievals": N,
+  "positive_feedback": X,
+  "negative_feedback": Y,
+  "quality_score": X/(X+Y),
+  "trend": "improving|stable|declining"
+}
+
+SELF-IMPROVEMENT LOOP:
+1. Collect feedback
+2. Analyze negative patterns
+3. Adjust weights/relationships
+4. Measure improvement
+5. Repeat
+
+Feedback drives improvement.
+`
+```
+
 ### Architect Skills
 
 ```go
@@ -16644,6 +18882,342 @@ architect_skills_planning := []Skill{
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+#### Architect Plan Complexity Discipline
+
+**CRITICAL: Architect must enforce complexity limits on generated plans to ensure manageability.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         PLAN COMPLEXITY DISCIPLINE                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Overly complex plans lead to failures. Constrain complexity.           │
+│                                                                                     │
+│  COMPLEXITY LIMITS:                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  MAX_TASKS: 20 tasks per workflow                                            │   │
+│  │  MAX_DEPTH: 5 dependency layers maximum                                      │   │
+│  │  MAX_PARALLEL: 8 concurrent tasks per layer                                  │   │
+│  │  MAX_ENGINEER_SCOPE: 12 todos per Engineer task                              │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  THRESHOLD ACTIONS:                                                                 │
+│  ├── Tasks > 10: WARN - consider decomposing into phases                           │
+│  ├── Tasks > 15: REQUIRE justification in plan                                     │
+│  ├── Tasks > 20: BLOCK - must split into multiple workflows                        │
+│  ├── Depth > 3: WARN - consider flattening dependencies                            │
+│  ├── Depth > 5: BLOCK - too sequential, redesign for parallelism                   │
+│  └── Any Engineer task > 12 todos: BLOCK - decompose further                       │
+│                                                                                     │
+│  COMPLEXITY REPORT:                                                                 │
+│  Every plan MUST include:                                                           │
+│  {                                                                                  │
+│    "complexity_metrics": {                                                         │
+│      "total_tasks": N,                                                             │
+│      "max_depth": N,                                                               │
+│      "max_parallel": N,                                                            │
+│      "critical_path_length": N,                                                    │
+│      "complexity_rating": "LOW|MEDIUM|HIGH|EXCESSIVE"                              │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  IF EXCESSIVE:                                                                      │
+│  - Split into Phase 1, Phase 2, ... workflows                                      │
+│  - Each phase is a complete, testable unit                                         │
+│  - User approves each phase completion before next                                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchitectPlanComplexityPrompt = `
+PLAN COMPLEXITY DISCIPLINE:
+
+ENFORCE LIMITS:
+- MAX_TASKS: 20 per workflow
+- MAX_DEPTH: 5 dependency layers
+- MAX_PARALLEL: 8 concurrent tasks per layer
+- MAX_ENGINEER_SCOPE: 12 todos per Engineer task
+
+THRESHOLD ACTIONS:
+- Tasks > 10: Warn, consider phasing
+- Tasks > 15: Require justification
+- Tasks > 20: BLOCK, split into phases
+- Depth > 3: Warn, flatten if possible
+- Depth > 5: BLOCK, redesign for parallelism
+
+EVERY PLAN MUST INCLUDE complexity_metrics:
+{
+  "total_tasks": N,
+  "max_depth": N,
+  "max_parallel": N,
+  "critical_path_length": N,
+  "complexity_rating": "LOW|MEDIUM|HIGH|EXCESSIVE"
+}
+
+IF EXCESSIVE:
+- Split into Phase 1, Phase 2, ... workflows
+- Each phase: independently testable
+- User approves phase completion before next phase
+
+COMPLEXITY IS THE ENEMY. Simpler plans succeed more often.
+`
+```
+
+#### Architect Assumption Documentation Protocol
+
+**CRITICAL: All implicit assumptions must be captured and documented in plan metadata.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      ASSUMPTION DOCUMENTATION PROTOCOL                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Unstated assumptions cause implementation failures. Document them.     │
+│                                                                                     │
+│  ASSUMPTION CATEGORIES:                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  ENVIRONMENTAL: Runtime, OS, dependencies, versions                          │   │
+│  │  CODEBASE: Existing patterns, architecture, conventions                       │   │
+│  │  BEHAVIORAL: Expected inputs, edge cases, error handling                      │   │
+│  │  PERFORMANCE: Load expectations, latency requirements                         │   │
+│  │  SECURITY: Trust boundaries, authentication, authorization                    │   │
+│  │  DATA: Schema, format, validation, integrity                                  │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  DOCUMENTATION FORMAT:                                                              │
+│  {                                                                                  │
+│    "assumptions": [                                                                │
+│      {                                                                             │
+│        "category": "CODEBASE",                                                     │
+│        "assumption": "Existing auth middleware handles JWT validation",            │
+│        "source": "librarian_query_id_123",                                         │
+│        "verified": true,                                                           │
+│        "risk_if_wrong": "Auth bypass vulnerability"                                │
+│      }                                                                             │
+│    ]                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  VERIFICATION REQUIREMENTS:                                                         │
+│  ├── ENVIRONMENTAL: Verify with Librarian (detect tools, versions)                 │
+│  ├── CODEBASE: Verify with Librarian (patterns, health)                            │
+│  ├── BEHAVIORAL: Verify with user if not in spec                                   │
+│  ├── PERFORMANCE: Verify with user or default to reasonable limits                 │
+│  ├── SECURITY: ALWAYS verify - never assume                                        │
+│  └── DATA: Verify with Librarian (existing schemas) or user                        │
+│                                                                                     │
+│  UNVERIFIED ASSUMPTIONS:                                                            │
+│  If assumption cannot be verified, mark "verified": false and include in plan      │
+│  for Inspector/Tester to validate during implementation.                           │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchitectAssumptionDocumentationPrompt = `
+ASSUMPTION DOCUMENTATION PROTOCOL:
+
+IDENTIFY ALL ASSUMPTIONS in your plan:
+- ENVIRONMENTAL: Runtime, OS, dependencies
+- CODEBASE: Patterns, architecture, conventions
+- BEHAVIORAL: Inputs, edge cases, error handling
+- PERFORMANCE: Load, latency requirements
+- SECURITY: Trust boundaries, auth
+- DATA: Schema, format, validation
+
+DOCUMENT EACH ASSUMPTION:
+{
+  "category": "CATEGORY_TYPE",
+  "assumption": "what you're assuming",
+  "source": "how you verified (librarian query, user input, spec)",
+  "verified": true|false,
+  "risk_if_wrong": "what breaks if assumption is wrong"
+}
+
+VERIFICATION REQUIREMENTS:
+- ENVIRONMENTAL: Query Librarian for tool detection
+- CODEBASE: Query Librarian for patterns
+- BEHAVIORAL: Check spec, ask user if unclear
+- SECURITY: ALWAYS verify explicitly - never assume
+
+UNVERIFIED ASSUMPTIONS:
+Mark "verified": false, include in plan for Inspector/Tester validation.
+These become explicit test cases.
+
+EVERY PLAN must have an "assumptions" section.
+Unstated assumptions are the #1 cause of implementation failures.
+`
+```
+
+#### Architect Historical Failure Integration Protocol
+
+**CRITICAL: All plans must incorporate failure warnings from Archivalist and include explicit mitigations.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    HISTORICAL FAILURE INTEGRATION PROTOCOL                           │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Past failures inform current planning. Don't repeat mistakes.          │
+│                                                                                     │
+│  MANDATORY ARCHIVALIST QUERY:                                                       │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  For EVERY task in the plan:                                                  │   │
+│  │  Query: "Any failure patterns for [approach/area/pattern]?"                  │   │
+│  │                                                                              │   │
+│  │  Response includes:                                                          │   │
+│  │  - similar_failures: [{approach, error, resolution, recurrence}]             │   │
+│  │  - success_rate: 0.0-1.0 for this approach type                             │   │
+│  │  - warnings: [explicit warnings to include]                                  │   │
+│  │  - recommended_mitigations: [what worked before]                             │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  FAILURE THRESHOLD ACTIONS:                                                         │
+│  ├── 0 failures: Proceed normally                                                  │
+│  ├── 1 failure: Include warning in task description                               │
+│  ├── 2 failures: REQUIRE explicit mitigation in task                              │
+│  ├── 3+ failures: REQUIRE alternative approach OR user acknowledgment             │
+│  └── Success rate < 50%: RED FLAG - strongly recommend alternative                │
+│                                                                                     │
+│  TASK ANNOTATION FORMAT:                                                            │
+│  {                                                                                  │
+│    "task_id": "...",                                                               │
+│    "historical_failures": {                                                        │
+│      "count": 2,                                                                   │
+│      "warnings": ["Previous attempts failed due to X"],                            │
+│      "mitigations": ["Add explicit null check", "Use mutex for shared state"],     │
+│      "alternative_considered": "None - mitigations address known issues"           │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  DO NOT suppress failure warnings to seem optimistic.                              │
+│  Engineer and Inspector need this information.                                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchitectHistoricalFailurePrompt = `
+HISTORICAL FAILURE INTEGRATION PROTOCOL:
+
+FOR EVERY TASK IN PLAN:
+Query Archivalist: "Failure patterns for [approach/area]?"
+
+THRESHOLD ACTIONS:
+- 0 failures: Proceed normally
+- 1 failure: Include WARNING in task description
+- 2 failures: REQUIRE explicit mitigation steps
+- 3+ failures: REQUIRE alternative approach OR user acknowledgment
+- Success rate < 50%: RED FLAG, recommend alternative
+
+ANNOTATE EVERY TASK with historical_failures:
+{
+  "count": N,
+  "warnings": ["what failed before"],
+  "mitigations": ["how to avoid this time"],
+  "alternative_considered": "why we're using this approach anyway OR alternative we chose"
+}
+
+EXAMPLES:
+- "⚠️ HISTORICAL: 2 previous failures with this pattern. Mitigation: [specific steps]"
+- "🚫 HIGH RISK: 4 failures, <40% success rate. Recommending alternative: [approach]"
+
+DO NOT suppress failure warnings.
+Engineer and Inspector NEED this information to succeed.
+`
+```
+
+#### Architect Scope Creep Detection Protocol
+
+**CRITICAL: During workflow execution, detect when scope expands beyond original plan boundaries.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       SCOPE CREEP DETECTION PROTOCOL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Scope creep causes timeline overruns and quality issues. Detect early. │
+│                                                                                     │
+│  SCOPE CREEP SIGNALS:                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. NEW_TASK_ADDED: Task not in original plan added during execution         │   │
+│  │  2. TASK_EXPANDED: Existing task scope increased significantly               │   │
+│  │  3. DEPENDENCY_DISCOVERED: New dependency not in original analysis           │   │
+│  │  4. REQUIREMENT_CHANGED: User changed requirements mid-execution             │   │
+│  │  5. FAILURE_WORKAROUND: Workaround adds complexity beyond original scope     │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  DETECTION METRICS:                                                                 │
+│  ├── Task count increase > 20%: WARN                                               │
+│  ├── Task count increase > 50%: BLOCK for re-plan                                  │
+│  ├── New dependencies > 2: WARN                                                    │
+│  ├── Engineer todos exceeding 12: BLOCK task, decompose                            │
+│  └── Execution time > 3x estimate: Review for scope creep                          │
+│                                                                                     │
+│  RESPONSE ACTIONS:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  WARN: Log scope creep, continue with monitoring                             │   │
+│  │  BLOCK: Pause execution, re-plan affected portion                            │   │
+│  │  RE-PLAN: Generate new plan for expanded scope, get user approval            │   │
+│  │  SPLIT: Move new scope to separate workflow for later                        │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  SCOPE BOUNDARY TRACKING:                                                           │
+│  {                                                                                  │
+│    "original_scope": {                                                             │
+│      "task_count": N,                                                              │
+│      "files_affected": [...],                                                      │
+│      "estimated_todos": M                                                          │
+│    },                                                                              │
+│    "current_scope": {                                                              │
+│      "task_count": N+X,                                                            │
+│      "files_affected": [...],                                                      │
+│      "actual_todos": M+Y                                                           │
+│    },                                                                              │
+│    "creep_detected": true|false,                                                   │
+│    "creep_severity": "NONE|WARN|BLOCK"                                             │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const ArchitectScopeCreepPrompt = `
+SCOPE CREEP DETECTION PROTOCOL:
+
+MONITOR DURING EXECUTION:
+1. NEW_TASK_ADDED: Tasks not in original plan
+2. TASK_EXPANDED: Scope increased significantly
+3. DEPENDENCY_DISCOVERED: New dependencies found
+4. REQUIREMENT_CHANGED: User changed requirements
+5. FAILURE_WORKAROUND: Workarounds adding complexity
+
+THRESHOLDS:
+- Task count +20%: WARN, log and monitor
+- Task count +50%: BLOCK, re-plan required
+- New dependencies > 2: WARN
+- Engineer todos > 12: BLOCK task, decompose
+- Execution time > 3x estimate: Review
+
+ACTIONS:
+- WARN: Log creep, continue with monitoring
+- BLOCK: Pause, re-plan affected portion
+- RE-PLAN: New plan for expanded scope, get approval
+- SPLIT: Move new scope to separate workflow
+
+TRACK BOUNDARIES:
+{
+  "original_scope": {"task_count": N, "files": [...], "estimated_todos": M},
+  "current_scope": {"task_count": N+X, "files": [...], "actual_todos": M+Y},
+  "creep_detected": true|false,
+  "creep_severity": "NONE|WARN|BLOCK"
+}
+
+Scope creep is NORMAL. Detecting it early is CRITICAL.
+Don't let plans silently grow - surface the growth.
+`
+```
+
 ### Engineer System Prompt
 
 ```go
@@ -17038,6 +19612,74 @@ engineer_skills_ast := []Skill{
     // Note: ast_grep_replace already defined in engineer_skills_contextual
 }
 
+// Tree-Sitter Skills (Tier 2 - Incremental AST Parsing for Refactoring)
+// Used for safe, AST-aware code modifications without cgo
+engineer_skills_treesitter := []Skill{
+    {
+        Name:        "ts_parse",
+        Description: "Parse file with tree-sitter for AST inspection before modification",
+        Domain:      "ast",
+        Keywords:    []string{"parse", "ast", "structure", "understand"},
+        LoadTrigger: "understand|structure|before edit",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+        },
+    },
+    {
+        Name:        "ts_rename_symbol",
+        Description: "Safely rename a symbol using tree-sitter AST analysis",
+        Domain:      "refactoring",
+        Keywords:    []string{"rename", "refactor", "symbol"},
+        LoadTrigger: "rename|refactor",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "old_name", Type: "string", Required: true},
+            {Name: "new_name", Type: "string", Required: true},
+            {Name: "scope", Type: "enum", Values: []string{"file", "function", "block"}, Required: false, Default: "file"},
+            {Name: "dry_run", Type: "bool", Required: false, Default: true},
+        },
+    },
+    {
+        Name:        "ts_extract_function",
+        Description: "Extract code range into a new function using AST analysis",
+        Domain:      "refactoring",
+        Keywords:    []string{"extract", "function", "refactor"},
+        LoadTrigger: "extract|new function|pull out",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "start_line", Type: "int", Required: true},
+            {Name: "end_line", Type: "int", Required: true},
+            {Name: "function_name", Type: "string", Required: true},
+            {Name: "dry_run", Type: "bool", Required: false, Default: true},
+        },
+    },
+    {
+        Name:        "ts_find_edit_targets",
+        Description: "Find AST nodes that match criteria for targeted editing",
+        Domain:      "refactoring",
+        Keywords:    []string{"find", "targets", "nodes", "edit"},
+        LoadTrigger: "find targets|nodes to edit|matching nodes",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "node_type", Type: "string", Required: true, Description: "AST node type (e.g., 'function_declaration', 'if_statement')"},
+            {Name: "name_pattern", Type: "string", Required: false, Description: "Regex for node name"},
+        },
+    },
+    {
+        Name:        "ts_get_node_at",
+        Description: "Get AST node at specific line/column for precise editing",
+        Domain:      "ast",
+        Keywords:    []string{"node at", "position", "cursor"},
+        LoadTrigger: "node at|position|what is at",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+            {Name: "include_parents", Type: "bool", Required: false, Default: true},
+        },
+    },
+}
+
 // LSP Integration Skills (Tier 2 - Language Server Protocol)
 engineer_skills_lsp := []Skill{
     {
@@ -17238,6 +19880,94 @@ engineer_skills_debug := []Skill{
 │  ├── Rename function: "func oldName($$$)" → "func newName($$$)"                    │
 │  ├── Add error check: "x, _ := foo()" → "x, err := foo(); if err != nil { ... }"   │
 │  └── Update import: 'import "old/pkg"' → 'import "new/pkg"'                        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+// Versioning Skills (Tier 2 - Loaded when CVS enabled)
+// See Central Version Store for implementation details
+engineer_skills_versioning := []Skill{
+    {
+        Name:        "versioned_read_file",
+        Description: "Read a file at a specific version or HEAD",
+        Domain:      "versioning",
+        Keywords:    []string{"read", "version", "history", "at version"},
+        LoadTrigger: "at version|old version|previous version",
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true, Description: "File path"},
+            {Name: "version", Type: "string", Required: false, Description: "Version ID (optional, defaults to HEAD)"},
+        },
+    },
+    {
+        Name:        "versioned_write_file",
+        Description: "Write content to a file (creates new version)",
+        Domain:      "versioning",
+        Keywords:    []string{"write", "save", "commit", "version"},
+        Priority:    100,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "content", Type: "string", Required: true},
+            {Name: "message", Type: "string", Required: false, Description: "Change description (commit message)"},
+        },
+    },
+    {
+        Name:        "versioned_file_history",
+        Description: "Get version history for a file",
+        Domain:      "versioning",
+        Keywords:    []string{"history", "versions", "changes", "log"},
+        LoadTrigger: "history|versions|when changed|who changed",
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "limit", Type: "integer", Required: false, Default: 10},
+        },
+    },
+    {
+        Name:        "versioned_file_diff",
+        Description: "Get diff between two versions of a file",
+        Domain:      "versioning",
+        Keywords:    []string{"diff", "compare", "changes", "between"},
+        LoadTrigger: "diff versions|compare versions|what changed between",
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "old_version", Type: "string", Required: true, Description: "Older version ID"},
+            {Name: "new_version", Type: "string", Required: false, Description: "Newer version ID (defaults to HEAD)"},
+        },
+    },
+    {
+        Name:        "versioned_rollback",
+        Description: "Rollback a file to a previous version",
+        Domain:      "versioning",
+        Keywords:    []string{"rollback", "revert", "undo", "restore"},
+        LoadTrigger: "rollback|revert|undo change|restore version",
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "version", Type: "string", Required: true, Description: "Version ID to restore"},
+        },
+    },
+}
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           VERSIONING SKILL INTEGRATION                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  WHEN CVS IS ENABLED:                                                               │
+│  ├── All file operations automatically route through PipelineVFS                    │
+│  ├── Write operations create new versions in version DAG                            │
+│  ├── Version history accessible via versioned_file_history skill                    │
+│  └── Rollback creates new version with previous content (forward-only history)      │
+│                                                                                     │
+│  SECURITY INTEGRATION:                                                              │
+│  ├── AgentRole checked before all write operations                                  │
+│  ├── SecretSanitizer applied before storing content                                 │
+│  ├── Path validation via VirtualFilesystem.ValidatePath                             │
+│  └── All operations recorded in audit log                                           │
+│                                                                                     │
+│  OT MERGE ON COMMIT:                                                                │
+│  ├── If no concurrent modifications: fast-path commit                               │
+│  ├── If concurrent modifications exist: automatic OT transform                      │
+│  ├── If OT detects conflict: surface to user via Guide                              │
+│  └── All operations are reversible via Invert() function                            │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -17678,6 +20408,76 @@ designer_skills_ast := []Skill{
     },
 }
 
+// Tree-Sitter Skills (Tier 2 - Component and Style Analysis)
+// Uses native tree-sitter for analyzing UI components, styles, and JSX/TSX
+designer_skills_treesitter := []Skill{
+    {
+        Name:        "ts_extract_components",
+        Description: "Extract React/Vue/Svelte components from files using tree-sitter",
+        Domain:      "ui",
+        Keywords:    []string{"components", "extract", "find components"},
+        LoadTrigger: "auto", // Always loaded for component work
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "framework", Type: "enum", Values: []string{"react", "vue", "svelte", "auto"}, Required: false, Default: "auto"},
+        },
+    },
+    {
+        Name:        "ts_analyze_jsx",
+        Description: "Analyze JSX/TSX structure for component hierarchy",
+        Domain:      "ui",
+        Keywords:    []string{"jsx", "tsx", "hierarchy", "structure"},
+        LoadTrigger: "jsx|tsx|component structure",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "include_props", Type: "bool", Required: false, Default: true},
+        },
+    },
+    {
+        Name:        "ts_find_styles",
+        Description: "Find all style definitions (CSS-in-JS, styled-components, etc.)",
+        Domain:      "styling",
+        Keywords:    []string{"styles", "css", "styled", "theme"},
+        LoadTrigger: "styles|css|styled|theme",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "style_type", Type: "enum", Values: []string{"css-modules", "styled-components", "emotion", "tailwind", "all"}, Required: false, Default: "all"},
+        },
+    },
+    {
+        Name:        "ts_extract_props",
+        Description: "Extract prop types and interfaces from components",
+        Domain:      "ui",
+        Keywords:    []string{"props", "types", "interfaces", "component api"},
+        LoadTrigger: "props|component api|interfaces",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "component_name", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "ts_find_hooks",
+        Description: "Find all React hooks usage in components",
+        Domain:      "ui",
+        Keywords:    []string{"hooks", "useState", "useEffect", "custom hooks"},
+        LoadTrigger: "hooks|useState|useEffect",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "include_custom", Type: "bool", Required: false, Default: true},
+        },
+    },
+    {
+        Name:        "ts_analyze_accessibility",
+        Description: "Find accessibility-related attributes and potential issues in JSX",
+        Domain:      "accessibility",
+        Keywords:    []string{"a11y", "accessibility", "aria", "alt"},
+        LoadTrigger: "accessibility|a11y|aria",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+        },
+    },
+}
+
 // LSP Integration Skills (Tier 2 - Language Server Protocol)
 designer_skills_lsp := []Skill{
     {
@@ -17811,6 +20611,372 @@ designer_skills_git := []Skill{
 /a11y <component>        → designer_check_accessibility
 /preview <component>     → designer_preview_component
 /tokens [category]       → designer_get_design_tokens
+```
+
+#### Designer Visual Regression Awareness Protocol
+
+**CRITICAL: Designer must consult Archivalist for components with visual regression history.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    VISUAL REGRESSION AWARENESS PROTOCOL                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Learn from past visual regressions. Extra caution for fragile areas.   │
+│                                                                                     │
+│  BEFORE MODIFYING ANY COMPONENT:                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  Query Archivalist: "Visual regression history for [component]?"             │   │
+│  │                                                                              │   │
+│  │  Response includes:                                                          │   │
+│  │  - regression_count: Number of past visual regressions                       │   │
+│  │  - regression_types: [layout_shift, color_change, spacing, responsiveness]  │   │
+│  │  - fragile_areas: Specific parts that regressed before                       │   │
+│  │  - safe_areas: Parts that haven't caused issues                             │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  REGRESSION RISK LEVELS:                                                            │
+│  ├── 0 regressions: Normal caution                                                 │
+│  ├── 1-2 regressions: Extra visual testing required                                │
+│  ├── 3+ regressions: FRAGILE COMPONENT                                             │
+│  │   - Must capture before/after screenshots                                       │
+│  │   - Must test at all breakpoints                                                │
+│  │   - Must run visual diff before completion                                      │
+│  └── Critical component (header, nav, checkout): Always treat as fragile          │
+│                                                                                     │
+│  DOCUMENTATION:                                                                     │
+│  {                                                                                  │
+│    "component": "Header",                                                          │
+│    "regression_risk": "HIGH",                                                      │
+│    "past_issues": ["logo alignment at mobile", "menu overflow"],                   │
+│    "extra_verification": ["screenshot at 320px", "screenshot at 768px"],           │
+│    "visual_diff_required": true                                                    │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const DesignerVisualRegressionPrompt = `
+VISUAL REGRESSION AWARENESS PROTOCOL:
+
+BEFORE MODIFYING ANY COMPONENT:
+Query Archivalist: "Visual regression history for [component]?"
+
+RISK LEVELS:
+- 0 regressions: Normal caution
+- 1-2 regressions: Extra visual testing required
+- 3+ regressions: FRAGILE - full visual verification
+
+FRAGILE COMPONENT REQUIREMENTS:
+- Capture before screenshot
+- Make changes
+- Capture after screenshot
+- Run visual diff
+- Test at ALL breakpoints (320, 768, 1024, 1440)
+
+ALWAYS FRAGILE (regardless of history):
+- Header/navigation
+- Footer
+- Checkout flow
+- Payment forms
+- Auth screens
+
+DOCUMENT:
+{
+  "component": "name",
+  "regression_risk": "LOW|MEDIUM|HIGH",
+  "past_issues": ["what broke before"],
+  "extra_verification": ["specific checks to run"],
+  "visual_diff_required": true|false
+}
+
+Learn from past regressions. Don't repeat them.
+`
+```
+
+#### Designer Token Validation Gate Protocol
+
+**CRITICAL: Token validation is a BLOCKING gate - no completion with hardcoded values.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       TOKEN VALIDATION GATE PROTOCOL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Design tokens are mandatory. Hardcoded values are forbidden.           │
+│                                                                                     │
+│  BLOCKING GATE:                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  designer_signal_complete is BLOCKED until:                                  │   │
+│  │  1. designer_validate_tokens has been called                                 │   │
+│  │  2. Zero hardcoded values detected                                           │   │
+│  │  3. All colors use token references                                          │   │
+│  │  4. All spacing uses token references                                        │   │
+│  │  5. All typography uses token references                                     │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  HARDCODED VALUE TYPES TO DETECT:                                                   │
+│  ├── COLORS: Hex (#fff), RGB, HSL values                                           │
+│  ├── SPACING: Pixel values (8px, 16px) not from tokens                             │
+│  ├── TYPOGRAPHY: Font sizes, weights, families not from tokens                     │
+│  ├── SHADOWS: Box-shadow with literal values                                       │
+│  ├── BORDERS: Border widths, radii not from tokens                                 │
+│  └── BREAKPOINTS: Media query values not from tokens                               │
+│                                                                                     │
+│  VALIDATION REPORT:                                                                 │
+│  {                                                                                  │
+│    "validation_passed": false,                                                     │
+│    "violations": [                                                                 │
+│      {"type": "color", "value": "#FF5733", "line": 42, "suggestion": "theme.error"}│
+│    ],                                                                              │
+│    "token_coverage": 0.85,                                                         │
+│    "blocking": true                                                                │
+│  }                                                                                  │
+│                                                                                     │
+│  EXCEPTION PROCESS:                                                                 │
+│  If hardcoded value is truly necessary:                                            │
+│  - Document why token doesn't exist                                                │
+│  - Request token creation as follow-up                                             │
+│  - Get explicit approval in task                                                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const DesignerTokenValidationPrompt = `
+TOKEN VALIDATION GATE PROTOCOL:
+
+THIS IS A BLOCKING GATE.
+You CANNOT mark work complete until tokens are validated.
+
+BEFORE designer_signal_complete:
+1. Call designer_validate_tokens
+2. All violations must be resolved
+3. Zero hardcoded values allowed
+
+HARDCODED VALUES (FORBIDDEN):
+- Colors: #fff, rgb(), hsl()
+- Spacing: 8px, 16px (use tokens.spacing.*)
+- Typography: 14px, 600 (use tokens.font.*)
+- Shadows: literal box-shadow values
+- Borders: literal border values
+- Breakpoints: literal media query values
+
+VALIDATION MUST PASS:
+{
+  "validation_passed": true,
+  "violations": [],
+  "token_coverage": 1.0,
+  "blocking": false
+}
+
+IF VIOLATIONS EXIST:
+- Replace with token reference
+- If token doesn't exist, flag for creation
+- NEVER leave hardcoded values
+
+EXCEPTIONS (rare, require approval):
+- Third-party component constraints
+- Dynamic values from data
+- Must document and get approval
+`
+```
+
+#### Designer Responsive Testing Discipline
+
+**CRITICAL: All components must be verified at defined breakpoints before completion.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       RESPONSIVE TESTING DISCIPLINE                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Every component must work at every breakpoint.                         │
+│                                                                                     │
+│  MANDATORY BREAKPOINTS:                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  SM (320px):  Mobile minimum - most constrained                              │   │
+│  │  MD (768px):  Tablet - layout transitions                                    │   │
+│  │  LG (1024px): Desktop small - full layout                                    │   │
+│  │  XL (1440px): Desktop large - ensure no excessive stretching                 │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  VERIFICATION REQUIREMENTS:                                                         │
+│  ├── SM: No horizontal scroll, text readable, touch targets 44px+                 │
+│  ├── MD: Layout transitions correctly, no orphaned elements                        │
+│  ├── LG: Full layout renders, no broken grids                                      │
+│  └── XL: Content doesn't stretch excessively, max-width respected                 │
+│                                                                                     │
+│  TESTING WORKFLOW:                                                                  │
+│  1. Implement component                                                            │
+│  2. Preview at SM - verify mobile works                                            │
+│  3. Preview at MD - verify tablet transition                                       │
+│  4. Preview at LG - verify desktop layout                                          │
+│  5. Document any breakpoint-specific behavior                                      │
+│                                                                                     │
+│  COMPLETION CHECKLIST:                                                              │
+│  {                                                                                  │
+│    "breakpoint_verification": {                                                    │
+│      "sm_320": {"verified": true, "issues": []},                                   │
+│      "md_768": {"verified": true, "issues": []},                                   │
+│      "lg_1024": {"verified": true, "issues": []},                                  │
+│      "xl_1440": {"verified": true, "issues": []}                                   │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  DO NOT mark complete without breakpoint verification.                              │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const DesignerResponsiveTestingPrompt = `
+RESPONSIVE TESTING DISCIPLINE:
+
+MANDATORY BREAKPOINTS (test ALL):
+- SM (320px): Mobile minimum
+- MD (768px): Tablet
+- LG (1024px): Desktop small
+- XL (1440px): Desktop large
+
+VERIFICATION AT EACH:
+SM (320px):
+- No horizontal scroll
+- Text readable (min 14px)
+- Touch targets 44px+
+- Critical content visible
+
+MD (768px):
+- Layout transitions correctly
+- No orphaned elements
+- Navigation adapts
+
+LG (1024px):
+- Full layout renders
+- Grids intact
+- Sidebar behavior correct
+
+XL (1440px):
+- No excessive stretching
+- Max-width respected
+- Content centered appropriately
+
+WORKFLOW:
+1. Implement component
+2. Preview at each breakpoint
+3. Fix issues at each size
+4. Document breakpoint-specific behavior
+
+COMPLETION REQUIRES:
+{
+  "breakpoint_verification": {
+    "sm_320": {"verified": true, "issues": []},
+    "md_768": {"verified": true, "issues": []},
+    "lg_1024": {"verified": true, "issues": []},
+    "xl_1440": {"verified": true, "issues": []}
+  }
+}
+
+Untested breakpoints = incomplete work.
+`
+```
+
+#### Designer Animation Performance Protocol
+
+**CRITICAL: Animations must meet performance budgets - 60fps target, no jank.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      ANIMATION PERFORMANCE PROTOCOL                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Smooth animations enhance UX. Janky animations destroy it.             │
+│                                                                                     │
+│  PERFORMANCE BUDGET:                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  TARGET: 60fps (16.67ms per frame)                                           │   │
+│  │  ACCEPTABLE: 30fps minimum (33.33ms per frame)                               │   │
+│  │  FAIL: <30fps or visible jank                                                │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  SAFE PROPERTIES (GPU-accelerated):                                                 │
+│  ├── transform (translate, scale, rotate)                                          │
+│  ├── opacity                                                                       │
+│  └── filter (with caution)                                                         │
+│                                                                                     │
+│  AVOID ANIMATING (cause layout thrash):                                             │
+│  ├── width, height                                                                 │
+│  ├── padding, margin                                                               │
+│  ├── top, left, right, bottom                                                      │
+│  ├── font-size                                                                     │
+│  └── border-width                                                                  │
+│                                                                                     │
+│  ANIMATION REVIEW CHECKLIST:                                                        │
+│  {                                                                                  │
+│    "animations": [                                                                 │
+│      {                                                                             │
+│        "name": "fadeIn",                                                           │
+│        "duration": "200ms",                                                        │
+│        "properties": ["opacity"],                                                  │
+│        "gpu_accelerated": true,                                                    │
+│        "performance_safe": true                                                    │
+│      }                                                                             │
+│    ],                                                                              │
+│    "layout_animations": [],                                                        │
+│    "will_change_used": true,                                                       │
+│    "reduced_motion_supported": true                                                │
+│  }                                                                                  │
+│                                                                                     │
+│  REQUIRED: prefers-reduced-motion support for all animations.                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const DesignerAnimationPerformancePrompt = `
+ANIMATION PERFORMANCE PROTOCOL:
+
+PERFORMANCE BUDGET:
+- TARGET: 60fps (16.67ms/frame)
+- MINIMUM: 30fps (33.33ms/frame)
+- FAIL: <30fps or visible jank
+
+SAFE TO ANIMATE (GPU-accelerated):
+- transform (translate, scale, rotate)
+- opacity
+- filter (use sparingly)
+
+AVOID ANIMATING (cause layout thrash):
+- width, height
+- padding, margin
+- top, left, right, bottom
+- font-size, border-width
+
+BEST PRACTICES:
+- Use transform instead of position changes
+- Use opacity instead of visibility/display
+- Add will-change for complex animations
+- Keep durations 100-300ms for UI feedback
+- Use ease-out for entrances, ease-in for exits
+
+REQUIRED FOR ALL ANIMATIONS:
+@media (prefers-reduced-motion: reduce) {
+  animation: none;
+  transition: none;
+}
+
+DOCUMENT ANIMATIONS:
+{
+  "name": "slideIn",
+  "duration": "200ms",
+  "properties": ["transform"],
+  "gpu_accelerated": true,
+  "reduced_motion_supported": true
+}
+
+Janky animations are worse than no animations.
+`
 ```
 
 ### Librarian System Prompt
@@ -17995,6 +21161,7 @@ When detecting tools, respond with structured format:
 Tier 1 (Core): search_code, get_context, list_files, get_structure
 Tier 2 (Contextual): analyze_dependencies, detect_patterns, assess_codebase_health, get_test_coverage, detect_technical_debt
 Tier 2 (AST): ast_grep_search, ast_grep_replace (via ast-grep CLI: ast-grep run -p '<pattern>' --lang <lang>)
+Tier 2 (Tree-Sitter): ts_parse, ts_query, ts_find_functions, ts_find_types, ts_find_imports, ts_find_references, ts_extract_symbols
 Tier 2 (Enhanced): codesearch, LSP integration (go_to_definition, find_references, hover, symbols, call_hierarchy)
 Tier 2 (Tool Discovery): detect_formatter, list_formatters, detect_linters, list_lsp_servers, detect_test_framework, list_test_frameworks, get_project_tools
 Git (Read-Only): git_status, git_diff, git_log, git_show, git_blame, git_ls_files, git_ls_tree, git_branch_list, git_tag_list, git_fetch, git_checkout_readonly
@@ -18172,6 +21339,90 @@ librarian_skills_ast := []Skill{
             {Name: "query", Type: "string", Required: true, Description: "Natural language or code query"},
             {Name: "include_tests", Type: "bool", Required: false, Default: false},
             {Name: "scope", Type: "enum", Values: []string{"project", "package", "file"}, Required: false},
+        },
+    },
+}
+
+// Tree-Sitter Skills (Tier 2 - Incremental AST Parsing via purego)
+// Uses native tree-sitter grammars loaded dynamically without cgo
+// See "Tree-Sitter Parsing Infrastructure" section for architecture details
+librarian_skills_treesitter := []Skill{
+    {
+        Name:        "ts_parse",
+        Description: "Parse file with tree-sitter and return structured AST information",
+        Domain:      "ast",
+        Keywords:    []string{"parse", "ast", "syntax tree", "structure"},
+        LoadTrigger: "parse|ast|syntax|structure",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true, Description: "File path to parse"},
+            {Name: "include_children", Type: "bool", Required: false, Default: false, Description: "Include full AST children (verbose)"},
+        },
+    },
+    {
+        Name:        "ts_query",
+        Description: "Run tree-sitter query pattern on file to find matching AST nodes",
+        Domain:      "ast",
+        Keywords:    []string{"query", "pattern", "find nodes", "ast query"},
+        LoadTrigger: "find all|query|pattern match|ast pattern",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "query", Type: "string", Required: true, Description: "Tree-sitter S-expression query"},
+            {Name: "capture", Type: "string", Required: false, Description: "Specific capture name to return"},
+        },
+    },
+    {
+        Name:        "ts_find_functions",
+        Description: "Find all functions/methods in file with signatures and locations",
+        Domain:      "ast",
+        Keywords:    []string{"functions", "methods", "definitions", "signatures"},
+        LoadTrigger: "functions|methods|what functions|list functions",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "include_body", Type: "bool", Required: false, Default: false},
+        },
+    },
+    {
+        Name:        "ts_find_types",
+        Description: "Find all type definitions (structs, interfaces, classes, enums)",
+        Domain:      "ast",
+        Keywords:    []string{"types", "structs", "interfaces", "classes", "enums"},
+        LoadTrigger: "types|structs|interfaces|classes|what types",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "include_fields", Type: "bool", Required: false, Default: true},
+        },
+    },
+    {
+        Name:        "ts_find_imports",
+        Description: "Find all imports/requires in file",
+        Domain:      "ast",
+        Keywords:    []string{"imports", "requires", "dependencies", "includes"},
+        LoadTrigger: "imports|requires|dependencies|what imports",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+        },
+    },
+    {
+        Name:        "ts_find_references",
+        Description: "Find all references to a symbol name in file using AST",
+        Domain:      "ast",
+        Keywords:    []string{"references", "usages", "occurrences", "uses of"},
+        LoadTrigger: "references|usages|occurrences|uses of",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "symbol", Type: "string", Required: true, Description: "Symbol name to find"},
+            {Name: "include_definitions", Type: "bool", Required: false, Default: true},
+        },
+    },
+    {
+        Name:        "ts_extract_symbols",
+        Description: "Extract all named symbols from file for indexing",
+        Domain:      "indexing",
+        Keywords:    []string{"symbols", "index", "extract", "catalog"},
+        LoadTrigger: "index|symbols|catalog|extract symbols",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "types", Type: "array", Required: false, Default: []string{"function", "type", "const", "var"}, Description: "Symbol types to extract"},
         },
     },
 }
@@ -18853,6 +22104,341 @@ CACHING:
 `
 ```
 
+#### Librarian Staleness Detection Discipline
+
+**CRITICAL: Knowledge about recently modified areas must be marked as potentially stale.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       STALENESS DETECTION DISCIPLINE                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Cached knowledge becomes stale. Detect and refresh proactively.        │
+│                                                                                     │
+│  STALENESS THRESHOLDS:                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  FRESH (< 5 minutes since file mod): Use cached, high confidence            │   │
+│  │  RECENT (5-30 minutes): Use cached, note "may be stale"                     │   │
+│  │  AGING (30-60 minutes): Verify critical facts before responding             │   │
+│  │  STALE (> 60 minutes): Full rescan before responding                        │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  STALENESS SIGNALS:                                                                 │
+│  ├── File modification time > cached knowledge time                               │
+│  ├── Git log shows recent commits to area                                          │
+│  ├── Other agent reported discrepancy                                              │
+│  ├── Engineer requested patterns that don't exist                                  │
+│  └── Inspector flagged pattern mismatch                                            │
+│                                                                                     │
+│  RESPONSE ANNOTATION:                                                               │
+│  {                                                                                  │
+│    "staleness_check": {                                                            │
+│      "files_checked": ["list"],                                                    │
+│      "last_modified": "timestamp",                                                 │
+│      "cache_age": "duration",                                                      │
+│      "status": "FRESH|RECENT|AGING|STALE",                                         │
+│      "action_taken": "used_cache|verified|rescanned"                               │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  ACTIVE REFRESHING:                                                                 │
+│  For frequently queried areas, proactively refresh:                                │
+│  - On file save events (if integrated)                                             │
+│  - On git commit events                                                            │
+│  - Periodically for hot paths                                                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const LibrarianStalenessDetectionPrompt = `
+STALENESS DETECTION DISCIPLINE:
+
+STALENESS THRESHOLDS:
+- FRESH (< 5 min): Use cache, high confidence
+- RECENT (5-30 min): Use cache, note "may be stale"
+- AGING (30-60 min): Verify critical facts first
+- STALE (> 60 min): Full rescan required
+
+BEFORE RESPONDING:
+1. Check file modification times for relevant files
+2. Compare to cache timestamp
+3. Determine staleness level
+4. Take appropriate action
+
+STALENESS SIGNALS:
+- File mtime > cache time
+- Recent git commits to area
+- Agent reported discrepancy
+- Pattern not found that should exist
+
+ANNOTATE RESPONSE:
+{
+  "staleness_check": {
+    "status": "FRESH|RECENT|AGING|STALE",
+    "cache_age": "X minutes",
+    "action_taken": "used_cache|verified|rescanned"
+  }
+}
+
+Stale knowledge causes implementation failures.
+When in doubt, rescan.
+`
+```
+
+#### Librarian Confidence Calibration Protocol
+
+**CRITICAL: Track confidence accuracy and adjust thresholds based on historical performance.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      CONFIDENCE CALIBRATION PROTOCOL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Confidence scores should match actual accuracy. Calibrate over time.   │
+│                                                                                     │
+│  CONFIDENCE TRACKING:                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  For each response with confidence score:                                    │   │
+│  │  1. Record: query_type, confidence_stated, timestamp                         │   │
+│  │  2. Track: outcome (used successfully, led to failure, was corrected)       │   │
+│  │  3. Calculate: accuracy = successful / total for confidence band            │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  CALIBRATION BANDS:                                                                 │
+│  ├── 0.9-1.0: Should be correct 90%+ of time                                      │
+│  ├── 0.7-0.9: Should be correct 70-90% of time                                    │
+│  ├── 0.5-0.7: Should be correct 50-70% of time                                    │
+│  └── <0.5: Low confidence, warn consumer                                          │
+│                                                                                     │
+│  ADJUSTMENT RULES:                                                                  │
+│  ├── If 0.9 confidence but <80% accurate: Recalibrate downward                    │
+│  ├── If 0.7 confidence but >90% accurate: Recalibrate upward                      │
+│  └── Track by query type - some types are harder than others                      │
+│                                                                                     │
+│  CALIBRATION REPORT:                                                                │
+│  {                                                                                  │
+│    "confidence_calibration": {                                                     │
+│      "band_0.9_1.0": {"stated": 100, "correct": 92, "accuracy": 0.92},            │
+│      "band_0.7_0.9": {"stated": 200, "correct": 164, "accuracy": 0.82},           │
+│      "calibration_status": "GOOD|NEEDS_ADJUSTMENT|POOR"                            │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  QUERY IN RESPONSE:                                                                 │
+│  "Confidence: 0.85 (historically 83% accurate for this query type)"               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const LibrarianConfidenceCalibrationPrompt = `
+CONFIDENCE CALIBRATION PROTOCOL:
+
+TRACK ALL CONFIDENCE SCORES:
+For each response, record:
+- query_type
+- confidence_stated
+- outcome (success/failure/corrected)
+
+CALIBRATION BANDS:
+- 0.9-1.0: Must be 90%+ accurate
+- 0.7-0.9: Must be 70-90% accurate
+- 0.5-0.7: Must be 50-70% accurate
+
+ADJUSTMENT:
+- If 0.9 conf but <80% accurate: Lower scores
+- If 0.7 conf but >90% accurate: Raise scores
+- Track per query type
+
+INCLUDE IN RESPONSE:
+"Confidence: 0.85 (historically 83% accurate for this query type)"
+
+QUERY ARCHIVALIST:
+Periodically get calibration report:
+{
+  "band_0.9_1.0": {"accuracy": 0.92},
+  "band_0.7_0.9": {"accuracy": 0.82}
+}
+
+Confidence should match reality.
+Track and adjust.
+`
+```
+
+#### Librarian Pattern Evolution Tracking Protocol
+
+**CRITICAL: Detect when codebase patterns are in transition between old and new approaches.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     PATTERN EVOLUTION TRACKING PROTOCOL                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Codebases evolve. Detect and communicate patterns in transition.       │
+│                                                                                     │
+│  EVOLUTION DETECTION:                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  When reporting patterns, check for:                                         │   │
+│  │  1. Old pattern exists in N files                                           │   │
+│  │  2. New pattern exists in M files                                           │   │
+│  │  3. If both N > 0 and M > 0 → TRANSITIONAL                                  │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  EVOLUTION STATES:                                                                  │
+│  ├── ESTABLISHED: Single pattern, >90% adoption                                   │
+│  ├── TRANSITIONAL: Two+ patterns coexist, each >10%                               │
+│  ├── EMERGING: New pattern in <10% of cases                                       │
+│  └── DEPRECATED: Old pattern in <10%, new is dominant                             │
+│                                                                                     │
+│  TRANSITIONAL RESPONSE FORMAT:                                                      │
+│  "Pattern: Error Handling                                                          │
+│   Status: TRANSITIONAL                                                             │
+│   Old Pattern: return err (45 files)                                              │
+│   New Pattern: return fmt.Errorf with wrap (32 files)                             │
+│   Recommendation: Use NEW pattern for consistency with recent code                 │
+│   Note: Some legacy code uses old pattern - don't refactor unless requested"      │
+│                                                                                     │
+│  EVOLUTION TRACKING:                                                                │
+│  {                                                                                  │
+│    "pattern": "error_handling",                                                    │
+│    "status": "TRANSITIONAL",                                                       │
+│    "old_pattern": {"description": "...", "count": 45},                            │
+│    "new_pattern": {"description": "...", "count": 32},                            │
+│    "recommendation": "new",                                                        │
+│    "migration_progress": 0.42                                                      │
+│  }                                                                                  │
+│                                                                                     │
+│  WARN CONSUMERS:                                                                    │
+│  When pattern is TRANSITIONAL, include warning so they don't assume uniformity.   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const LibrarianPatternEvolutionPrompt = `
+PATTERN EVOLUTION TRACKING PROTOCOL:
+
+DETECT EVOLUTION:
+When reporting patterns, check:
+1. How many files use old pattern?
+2. How many files use new pattern?
+3. If both > 0 → TRANSITIONAL
+
+EVOLUTION STATES:
+- ESTABLISHED: Single pattern, >90% adoption
+- TRANSITIONAL: Two+ patterns, each >10%
+- EMERGING: New pattern in <10%
+- DEPRECATED: Old pattern <10%
+
+TRANSITIONAL RESPONSE:
+"Pattern: [name]
+ Status: TRANSITIONAL
+ Old: [description] (N files)
+ New: [description] (M files)
+ Recommendation: Use [which] for new code
+ Note: Legacy code uses old - don't refactor unless asked"
+
+TRACK EVOLUTION:
+{
+  "pattern": "name",
+  "status": "TRANSITIONAL",
+  "old_pattern": {"desc": "...", "count": N},
+  "new_pattern": {"desc": "...", "count": M},
+  "migration_progress": M/(N+M)
+}
+
+WARN CONSUMERS:
+Transitional patterns need explicit guidance.
+Don't let them assume uniformity.
+`
+```
+
+#### Librarian Index Health Monitoring Protocol
+
+**CRITICAL: Monitor vector DB health and alert when index quality degrades.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      INDEX HEALTH MONITORING PROTOCOL                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Vector index quality affects all queries. Monitor and maintain.        │
+│                                                                                     │
+│  HEALTH METRICS:                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  FRESHNESS: Time since last full index                                       │   │
+│  │  COVERAGE: % of codebase files indexed                                       │   │
+│  │  LATENCY: Average query response time                                        │   │
+│  │  ACCURACY: Query result quality (tracked via feedback)                       │   │
+│  │  SIZE: Index size vs file count (detect bloat)                               │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  HEALTH THRESHOLDS:                                                                 │
+│  ├── FRESHNESS: >24h without update = WARN, >72h = CRITICAL                       │
+│  ├── COVERAGE: <80% = WARN, <50% = CRITICAL                                       │
+│  ├── LATENCY: >500ms = WARN, >2s = CRITICAL                                       │
+│  ├── ACCURACY: <70% positive feedback = WARN, <50% = CRITICAL                     │
+│  └── SIZE: >2x expected = WARN (potential duplicates)                              │
+│                                                                                     │
+│  HEALTH CHECK REPORT:                                                               │
+│  {                                                                                  │
+│    "index_health": {                                                               │
+│      "freshness": {"last_update": "...", "status": "OK"},                          │
+│      "coverage": {"indexed": 1234, "total": 1300, "percent": 95},                  │
+│      "latency": {"avg_ms": 120, "status": "OK"},                                   │
+│      "accuracy": {"positive_feedback": 85, "status": "OK"},                        │
+│      "overall": "HEALTHY|DEGRADED|CRITICAL"                                        │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+│  DEGRADED ACTIONS:                                                                  │
+│  ├── FRESHNESS degraded: Trigger incremental reindex                              │
+│  ├── COVERAGE degraded: Scan for unindexed files                                  │
+│  ├── LATENCY degraded: Alert, may need index optimization                         │
+│  └── ACCURACY degraded: Review feedback, adjust embedding strategy                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const LibrarianIndexHealthPrompt = `
+INDEX HEALTH MONITORING PROTOCOL:
+
+HEALTH METRICS:
+- FRESHNESS: Time since last update
+- COVERAGE: % files indexed
+- LATENCY: Query response time
+- ACCURACY: Feedback-based quality
+- SIZE: Index size vs expected
+
+THRESHOLDS:
+FRESHNESS: >24h = WARN, >72h = CRITICAL
+COVERAGE: <80% = WARN, <50% = CRITICAL
+LATENCY: >500ms = WARN, >2s = CRITICAL
+ACCURACY: <70% = WARN, <50% = CRITICAL
+
+PERIODIC HEALTH CHECK:
+{
+  "index_health": {
+    "freshness": {"status": "OK|WARN|CRITICAL"},
+    "coverage": {"percent": 95, "status": "OK"},
+    "latency": {"avg_ms": 120, "status": "OK"},
+    "accuracy": {"percent": 85, "status": "OK"},
+    "overall": "HEALTHY|DEGRADED|CRITICAL"
+  }
+}
+
+ON DEGRADED:
+- FRESHNESS: Trigger reindex
+- COVERAGE: Scan for unindexed
+- LATENCY: Alert for optimization
+- ACCURACY: Review feedback
+
+Healthy index = reliable answers.
+`
+```
+
 ### Academic System Prompt
 
 ```go
@@ -19349,6 +22935,242 @@ When Architect or Engineer reports outcome:
 - Match to original recommendation
 - Record outcome with full context
 - If FAILURE: analyze if issue was recommendation or implementation
+`
+```
+
+#### Academic Source Citation Discipline
+
+**CRITICAL: Academic must provide verifiable, traceable citations for all recommendations.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         SOURCE CITATION DISCIPLINE                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Every recommendation must be traceable to a verifiable source.         │
+│                                                                                     │
+│  CITATION REQUIREMENTS:                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. SOURCE TYPE: official_docs | blog_post | research_paper | community     │   │
+│  │  2. URL: Direct link to source (or "internal" for codebase references)      │   │
+│  │  3. FRESHNESS: Date of source, flagged if > 2 years old                     │   │
+│  │  4. VERIFICATION: "verified" | "unverified" | "deprecated"                  │   │
+│  │  5. CONFIDENCE: HIGH | MEDIUM | LOW based on source quality                 │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  CITATION FORMAT:                                                                   │
+│  {                                                                                  │
+│    "source_type": "official_docs",                                                 │
+│    "url": "https://go.dev/doc/effective_go#concurrency",                           │
+│    "title": "Effective Go - Concurrency",                                          │
+│    "date": "2024-01",                                                              │
+│    "freshness": "current",                                                         │
+│    "verification": "verified",                                                     │
+│    "confidence": "HIGH"                                                            │
+│  }                                                                                  │
+│                                                                                     │
+│  FRESHNESS RULES:                                                                   │
+│  ├── < 6 months: "current"                                                         │
+│  ├── 6-24 months: "recent" (acceptable)                                            │
+│  ├── 24-48 months: "aging" (flag for review)                                       │
+│  └── > 48 months: "stale" (warn, recommend verification)                           │
+│                                                                                     │
+│  NEVER FABRICATE SOURCES. If unsure, say "unverified recommendation based on       │
+│  general best practices" rather than inventing a citation.                         │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const AcademicSourceCitationPrompt = `
+SOURCE CITATION DISCIPLINE:
+
+ALL recommendations MUST include citations.
+
+CITATION FORMAT (for each source):
+- source_type: official_docs | blog_post | research_paper | community | internal
+- url: Direct link (or file path for internal references)
+- title: Human-readable title
+- date: Publication date (YYYY-MM or YYYY)
+- freshness: current (<6mo) | recent (6-24mo) | aging (24-48mo) | stale (>48mo)
+- verification: verified | unverified | deprecated
+- confidence: HIGH | MEDIUM | LOW
+
+FRESHNESS AFFECTS CONFIDENCE:
+- "stale" sources: MAXIMUM confidence is MEDIUM
+- "aging" sources: Note "verify current applicability"
+- Official docs always preferred over blog posts
+
+NEVER FABRICATE SOURCES:
+If you cannot cite a specific source, say:
+"Based on general [language/framework] best practices (unverified)"
+
+DO NOT invent URLs, paper titles, or authors.
+
+EXAMPLE:
+"Recommendation: Use sync.Pool for frequently allocated objects.
+Source: Effective Go - Concurrency (https://go.dev/doc/effective_go)
+Type: official_docs | Freshness: current | Confidence: HIGH"
+`
+```
+
+#### Academic Research Depth Calibration Protocol
+
+**CRITICAL: Academic must auto-calibrate research depth based on confidence and codebase compatibility.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      RESEARCH DEPTH CALIBRATION PROTOCOL                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Research depth should match the complexity and risk of the decision.   │
+│                                                                                     │
+│  DEPTH LEVELS:                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  QUICK (1-2 sources):                                                        │   │
+│  │    - Well-established best practice                                          │   │
+│  │    - Single authoritative source exists                                      │   │
+│  │    - Low risk if wrong                                                       │   │
+│  │                                                                              │   │
+│  │  STANDARD (3-5 sources):                                                     │   │
+│  │    - Multiple valid approaches exist                                         │   │
+│  │    - Trade-offs need evaluation                                              │   │
+│  │    - Moderate risk if wrong                                                  │   │
+│  │                                                                              │   │
+│  │  DEEP (5-10 sources):                                                        │   │
+│  │    - Complex architectural decision                                          │   │
+│  │    - Conflicting recommendations in community                                │   │
+│  │    - High risk if wrong (security, performance, data integrity)              │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  AUTO-ESCALATION TRIGGERS:                                                          │
+│  ├── Initial results have confidence < 0.7 → Escalate one level                   │
+│  ├── Sources conflict with each other → Escalate one level                        │
+│  ├── Librarian reports pattern incompatibility → Escalate one level               │
+│  ├── Similar recommendation failed before (Archivalist) → Escalate to DEEP        │
+│  └── Security/performance critical → Auto-start at STANDARD minimum               │
+│                                                                                     │
+│  DEPTH CALIBRATION REPORT:                                                          │
+│  Include in response: "Research depth: [LEVEL] because [reason]"                    │
+│  If escalated: "Escalated from [LEVEL] to [LEVEL] because [trigger]"               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const AcademicResearchDepthPrompt = `
+RESEARCH DEPTH CALIBRATION:
+
+SELECT INITIAL DEPTH:
+- QUICK: Established practice, single source, low risk
+- STANDARD: Multiple approaches, trade-offs, moderate risk
+- DEEP: Architectural, conflicting info, high risk
+
+AUTO-ESCALATE IF:
+1. Initial confidence < 0.7 → Escalate one level
+2. Sources conflict → Escalate one level
+3. Librarian says incompatible with codebase → Escalate one level
+4. Archivalist says similar approach failed → Escalate to DEEP
+5. Security or performance critical → Minimum STANDARD
+
+CRITICAL TOPICS (always DEEP):
+- Authentication/authorization patterns
+- Data encryption/security
+- Database schema design
+- Concurrency/parallelism patterns
+- Error handling architecture
+
+REPORT DEPTH:
+Always state: "Research depth: [LEVEL] - [reason]"
+If escalated: "Escalated from [original] to [new] because [trigger]"
+
+EXAMPLES:
+"Research depth: QUICK - established Go idiom for error wrapping"
+"Research depth: DEEP - conflicting patterns for connection pooling, escalated due to performance criticality"
+`
+```
+
+#### Academic Cross-Agent Research Synthesis Protocol
+
+**CRITICAL: When research spans both external knowledge AND codebase patterns, Academic must coordinate with Librarian.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                   CROSS-AGENT RESEARCH SYNTHESIS PROTOCOL                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Theory (Academic) + Reality (Librarian) = Actionable Recommendations.  │
+│                                                                                     │
+│  SYNTHESIS REQUIRED WHEN:                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. Recommendation involves code patterns (consult Librarian for existing)   │   │
+│  │  2. Best practice differs from codebase reality (need gap analysis)          │   │
+│  │  3. Multiple approaches exist (need codebase fit assessment)                 │   │
+│  │  4. Recommendation requires knowing tech stack details                       │   │
+│  │  5. User asks "how should WE do X" (not just "how to do X")                  │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  SYNTHESIS WORKFLOW:                                                                │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. Academic researches external best practices                              │   │
+│  │  2. Academic queries Librarian: "What patterns exist for [topic]?"          │   │
+│  │  3. Academic compares: theory vs reality                                     │   │
+│  │  4. Academic produces UNIFIED recommendation:                                │   │
+│  │     {                                                                        │   │
+│  │       "external_best_practice": <what industry recommends>,                  │   │
+│  │       "codebase_current_pattern": <what Librarian reports>,                  │   │
+│  │       "gap_analysis": <where they differ>,                                   │   │
+│  │       "unified_recommendation": <actionable advice>,                         │   │
+│  │       "adaptation_required": <what needs changing to apply>                  │   │
+│  │     }                                                                        │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  GAP TYPES:                                                                         │
+│  ├── ALIGNED: Codebase matches best practice (reinforce)                           │
+│  ├── MINOR_GAP: Small differences, easy to adapt                                   │
+│  ├── MAJOR_GAP: Significant differences, discuss trade-offs                        │
+│  ├── INCOMPATIBLE: Best practice conflicts with codebase architecture              │
+│  └── GREENFIELD: No existing pattern, can adopt best practice directly             │
+│                                                                                     │
+│  OUTPUT FORMAT:                                                                     │
+│  "Industry recommends [X]. Your codebase uses [Y]. Gap: [type].                    │
+│   Recommendation: [unified advice with specific adaptation steps]"                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const AcademicCrossAgentSynthesisPrompt = `
+CROSS-AGENT RESEARCH SYNTHESIS:
+
+ALWAYS SYNTHESIZE when recommendation involves:
+- Code patterns (how does OUR code do this?)
+- Approaches with multiple valid options (which fits US?)
+- Questions with "we/our" (user cares about THEIR codebase)
+
+SYNTHESIS WORKFLOW:
+1. Research external best practices (your core strength)
+2. Query Librarian: "What patterns exist for [topic]? What is maturity?"
+3. Compare theory vs reality
+4. Produce UNIFIED recommendation
+
+UNIFIED RESPONSE FORMAT:
+{
+  "external_best_practice": "<what industry/docs recommend>",
+  "codebase_current_pattern": "<Librarian's report>",
+  "gap_analysis": "ALIGNED | MINOR_GAP | MAJOR_GAP | INCOMPATIBLE | GREENFIELD",
+  "unified_recommendation": "<specific, actionable advice>",
+  "adaptation_required": "<steps to adapt best practice to this codebase>"
+}
+
+GAP HANDLING:
+- ALIGNED: "Your codebase already follows this pattern. Continue using [X]."
+- MINOR_GAP: "Recommendation [X], but adapt by [specific changes] to match your [Y]."
+- MAJOR_GAP: "Industry uses [X], you use [Y]. Trade-offs: [...]. Recommend [decision]."
+- INCOMPATIBLE: "Best practice [X] conflicts with your [Y]. Alternative: [Z]."
+- GREENFIELD: "No existing pattern. Recommend adopting [X] as-is."
+
+NEVER give pure theory without checking codebase reality.
 `
 ```
 
@@ -19936,6 +23758,66 @@ inspector_skills_lsp_ast := []Skill{
             {Name: "line", Type: "int", Required: true},
             {Name: "column", Type: "int", Required: true},
             {Name: "direction", Type: "enum", Values: []string{"incoming", "outgoing", "both"}, Required: true},
+        },
+    },
+}
+
+// Tree-Sitter Skills (Tier 2 - AST-based Code Quality Analysis)
+// Uses native tree-sitter for detailed structural analysis without cgo
+inspector_skills_treesitter := []Skill{
+    {
+        Name:        "ts_complexity_analysis",
+        Description: "Analyze cyclomatic/cognitive complexity using tree-sitter AST",
+        Domain:      "analysis",
+        Keywords:    []string{"complexity", "cyclomatic", "cognitive", "nesting"},
+        LoadTrigger: "auto", // Always loaded for quality checks
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "thresholds", Type: "object", Required: false, Default: map[string]int{"cyclomatic": 10, "cognitive": 15, "nesting": 4}},
+        },
+    },
+    {
+        Name:        "ts_find_code_smells",
+        Description: "Detect code smells using AST pattern analysis",
+        Domain:      "analysis",
+        Keywords:    []string{"smells", "anti-patterns", "violations"},
+        LoadTrigger: "smell|anti-pattern|violation",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "smell_types", Type: "array", Required: false, Default: []string{"long_method", "deep_nesting", "large_class", "long_parameter_list"}},
+        },
+    },
+    {
+        Name:        "ts_validate_structure",
+        Description: "Validate code structure against expected patterns",
+        Domain:      "validation",
+        Keywords:    []string{"structure", "pattern", "validate", "check"},
+        LoadTrigger: "validate|check structure|match pattern",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "expected_patterns", Type: "array", Required: true, Description: "Array of tree-sitter query patterns that should match"},
+            {Name: "forbidden_patterns", Type: "array", Required: false, Description: "Array of patterns that should NOT match"},
+        },
+    },
+    {
+        Name:        "ts_count_nodes",
+        Description: "Count AST nodes by type for metrics",
+        Domain:      "metrics",
+        Keywords:    []string{"count", "metrics", "statistics"},
+        LoadTrigger: "count|metrics|how many",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "node_types", Type: "array", Required: true, Description: "Node types to count (e.g., 'function_declaration', 'if_statement')"},
+        },
+    },
+    {
+        Name:        "ts_parse_errors",
+        Description: "Find syntax errors in files using tree-sitter",
+        Domain:      "validation",
+        Keywords:    []string{"syntax", "parse", "errors"},
+        LoadTrigger: "syntax error|parse error|invalid",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
         },
     },
 }
@@ -21350,6 +25232,65 @@ tester_skills_ast := []Skill{
     },
 }
 
+// Tree-Sitter Skills (Tier 2 - Test Discovery and Coverage Analysis)
+// Uses native tree-sitter for finding tests and analyzing test coverage
+tester_skills_treesitter := []Skill{
+    {
+        Name:        "ts_discover_tests",
+        Description: "Find all test functions in files using tree-sitter AST",
+        Domain:      "testing",
+        Keywords:    []string{"find tests", "discover", "test functions"},
+        LoadTrigger: "auto", // Always loaded for test discovery
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "include_subtests", Type: "bool", Required: false, Default: true},
+        },
+    },
+    {
+        Name:        "ts_find_testable_functions",
+        Description: "Find functions that need tests using AST analysis",
+        Domain:      "testing",
+        Keywords:    []string{"untested", "needs tests", "testable"},
+        LoadTrigger: "untested|needs test|missing coverage",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+            {Name: "exclude_private", Type: "bool", Required: false, Default: true},
+            {Name: "min_complexity", Type: "int", Required: false, Default: 2, Description: "Min cyclomatic complexity to suggest testing"},
+        },
+    },
+    {
+        Name:        "ts_analyze_test_structure",
+        Description: "Analyze test file structure and organization",
+        Domain:      "testing",
+        Keywords:    []string{"test structure", "organization", "arrangement"},
+        LoadTrigger: "test structure|organization",
+        Parameters: []Param{
+            {Name: "test_file", Type: "string", Required: true},
+        },
+    },
+    {
+        Name:        "ts_find_assertions",
+        Description: "Find all assertions in test files for coverage analysis",
+        Domain:      "testing",
+        Keywords:    []string{"assertions", "expects", "asserts"},
+        LoadTrigger: "assertions|what is tested|coverage",
+        Parameters: []Param{
+            {Name: "files", Type: "array", Required: true},
+        },
+    },
+    {
+        Name:        "ts_match_tests_to_functions",
+        Description: "Map test functions to the functions they test",
+        Domain:      "testing",
+        Keywords:    []string{"mapping", "coverage", "which test"},
+        LoadTrigger: "mapping|which test|test for function",
+        Parameters: []Param{
+            {Name: "source_file", Type: "string", Required: true},
+            {Name: "test_file", Type: "string", Required: true},
+        },
+    },
+}
+
 // LSP Integration Skills (Tier 2 - Language Server Protocol)
 tester_skills_lsp := []Skill{
     {
@@ -22354,6 +26295,661 @@ Before marking ANY task complete, you MUST:
    - Include test output and failure details
 
 EVIDENCE IS IMMUTABLE: Once stored, evidence cannot be modified.
+`
+```
+
+#### Inspector Historical Issue Cross-Reference Protocol
+
+**CRITICAL: Inspector must query Archivalist for patterns that have caused issues before.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                   HISTORICAL ISSUE CROSS-REFERENCE PROTOCOL                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Code may be correct but match historically problematic patterns.       │
+│                                                                                     │
+│  MANDATORY ARCHIVALIST QUERY:                                                       │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  For each file being validated:                                              │   │
+│  │  Query: "Have similar patterns caused issues before?"                        │   │
+│  │                                                                              │   │
+│  │  Response includes:                                                          │   │
+│  │  - pattern_matches: [{pattern, issue_count, severity}]                       │   │
+│  │  - historical_issues: [{description, resolution, recurrence}]                │   │
+│  │  - warnings: [specific warnings to add to validation]                        │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ISSUE THRESHOLD ACTIONS:                                                           │
+│  ├── 0 issues: Proceed with standard validation                                    │
+│  ├── 1-2 issues: Add WARNING to validation report                                  │
+│  ├── 3+ issues: Add ALERT - strongly consider flagging even if code passes        │
+│  └── Known critical pattern: BLOCK until explicit verification                     │
+│                                                                                     │
+│  CROSS-REFERENCE TYPES:                                                             │
+│  ├── ERROR_PATTERNS: Error handling that led to bugs                               │
+│  ├── CONCURRENCY_PATTERNS: Race conditions, deadlocks                              │
+│  ├── SECURITY_PATTERNS: Vulnerabilities, injection, auth issues                    │
+│  ├── PERFORMANCE_PATTERNS: Memory leaks, N+1 queries, unbounded growth            │
+│  └── INTEGRATION_PATTERNS: API compatibility, schema mismatches                    │
+│                                                                                     │
+│  REPORT ANNOTATION:                                                                 │
+│  Include historical cross-reference in validation report:                          │
+│  "⚠️ HISTORICAL: This pattern matched 2 past issues in [area]. Review required."  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const InspectorHistoricalCrossRefPrompt = `
+HISTORICAL ISSUE CROSS-REFERENCE PROTOCOL:
+
+FOR EACH FILE BEING VALIDATED:
+Query Archivalist: "Similar patterns that caused issues?"
+
+ISSUE THRESHOLDS:
+- 0 matches: Standard validation
+- 1-2 matches: Add WARNING to report
+- 3+ matches: Add ALERT, consider flagging
+- Known critical: BLOCK for verification
+
+PATTERN TYPES TO CHECK:
+- ERROR_PATTERNS: Bug-prone error handling
+- CONCURRENCY_PATTERNS: Race conditions, deadlocks
+- SECURITY_PATTERNS: Vulnerabilities
+- PERFORMANCE_PATTERNS: Leaks, N+1, unbounded growth
+- INTEGRATION_PATTERNS: API/schema issues
+
+ADD TO VALIDATION REPORT:
+{
+  "historical_cross_reference": {
+    "patterns_checked": N,
+    "matches_found": M,
+    "warnings": ["pattern X matched 2 past issues"],
+    "alerts": ["critical pattern matched"]
+  }
+}
+
+Code can be "correct" but match dangerous patterns.
+Historical context catches what static analysis misses.
+`
+```
+
+#### Inspector Validation Evidence Documentation Protocol
+
+**CRITICAL: Every validation issue must have precise, actionable evidence.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    VALIDATION EVIDENCE DOCUMENTATION PROTOCOL                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Evidence quality determines fix quality. Be precise.                   │
+│                                                                                     │
+│  EVIDENCE REQUIREMENTS FOR EVERY ISSUE:                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. FILE PATH: Exact file path, not relative                                 │   │
+│  │  2. LINE NUMBER: Exact line (or range) where issue occurs                    │   │
+│  │  3. CODE SNIPPET: The actual problematic code (5-10 lines context)           │   │
+│  │  4. ISSUE DESCRIPTION: Clear, specific explanation                           │   │
+│  │  5. SEVERITY: CRITICAL | HIGH | MEDIUM | LOW                                 │   │
+│  │  6. FIX SUGGESTION: How to resolve (code or approach)                        │   │
+│  │  7. REPRODUCTION: How to verify the issue exists                             │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  EVIDENCE FORMAT:                                                                   │
+│  {                                                                                  │
+│    "file": "core/auth/validator.go",                                               │
+│    "line": 142,                                                                    │
+│    "snippet": "if err != nil { return nil }  // swallowed error",                  │
+│    "issue": "Error swallowed without logging or handling",                         │
+│    "severity": "HIGH",                                                             │
+│    "category": "error_handling",                                                   │
+│    "fix": "Return error: return nil, fmt.Errorf(\"validation failed: %w\", err)", │
+│    "reproduction": "Call ValidateToken with invalid token, observe silent failure" │
+│  }                                                                                  │
+│                                                                                     │
+│  FORBIDDEN:                                                                         │
+│  ├── Vague issues: "Code could be better"                                          │
+│  ├── Missing line numbers: "Somewhere in auth.go"                                  │
+│  ├── No fix suggestion: "This is wrong"                                            │
+│  └── Missing severity: Unmarked issues                                             │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const InspectorEvidenceDocumentationPrompt = `
+VALIDATION EVIDENCE DOCUMENTATION PROTOCOL:
+
+EVERY ISSUE MUST INCLUDE:
+1. file: Exact file path
+2. line: Exact line number (or range)
+3. snippet: The problematic code (5-10 lines)
+4. issue: Clear description of the problem
+5. severity: CRITICAL | HIGH | MEDIUM | LOW
+6. category: What type of issue
+7. fix: Specific fix suggestion
+8. reproduction: How to verify issue exists
+
+EXAMPLE:
+{
+  "file": "core/auth/validator.go",
+  "line": 142,
+  "snippet": "if err != nil { return nil }",
+  "issue": "Error swallowed without logging",
+  "severity": "HIGH",
+  "category": "error_handling",
+  "fix": "return nil, fmt.Errorf(\"failed: %w\", err)",
+  "reproduction": "Call with invalid input"
+}
+
+FORBIDDEN:
+- "Code could be better" (vague)
+- "Somewhere in file" (no line number)
+- "This is wrong" (no fix suggestion)
+- Unmarked severity
+
+Engineers need PRECISE evidence to fix issues quickly.
+`
+```
+
+#### Inspector Progressive Validation Protocol
+
+**CRITICAL: Use fast-fail for obvious issues, deep validation for subtle problems.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       PROGRESSIVE VALIDATION PROTOCOL                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Don't spend time on deep validation if obvious issues exist.           │
+│                                                                                     │
+│  VALIDATION PHASES:                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  PHASE 1: FAST SCAN (< 5 seconds)                                            │   │
+│  │  - Build errors                                                              │   │
+│  │  - Type errors                                                               │   │
+│  │  - Obvious syntax issues                                                     │   │
+│  │  → If ANY fail, STOP and report. No deep validation.                        │   │
+│  │                                                                              │   │
+│  │  PHASE 2: STANDARD SCAN (if Phase 1 passes)                                  │   │
+│  │  - Lint errors/warnings                                                      │   │
+│  │  - Pattern compliance                                                        │   │
+│  │  - Basic security scan                                                       │   │
+│  │  → If CRITICAL issues, STOP. Otherwise continue.                            │   │
+│  │                                                                              │   │
+│  │  PHASE 3: DEEP SCAN (if Phase 2 passes with no criticals)                   │   │
+│  │  - Concurrency analysis                                                      │   │
+│  │  - Memory/resource analysis                                                  │   │
+│  │  - Complex pattern matching                                                  │   │
+│  │  - Historical cross-reference                                                │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  FAST-FAIL BENEFITS:                                                                │
+│  ├── Saves time on obviously broken code                                           │
+│  ├── Gives Engineer faster feedback                                                │
+│  ├── Reserves deep analysis for code worth analyzing                               │
+│  └── Reduces token usage on failed validations                                     │
+│                                                                                     │
+│  REPORT INDICATES PHASE:                                                            │
+│  "Validation stopped at Phase 1: Build failed. Fix build before resubmitting."    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const InspectorProgressiveValidationPrompt = `
+PROGRESSIVE VALIDATION PROTOCOL:
+
+PHASE 1: FAST SCAN (first, always)
+- Build errors?
+- Type errors?
+- Syntax issues?
+→ If ANY fail: STOP, report, skip deeper phases
+
+PHASE 2: STANDARD SCAN (if Phase 1 passes)
+- Lint errors
+- Pattern compliance
+- Basic security
+→ If CRITICAL: STOP. Otherwise continue.
+
+PHASE 3: DEEP SCAN (if Phase 2 has no criticals)
+- Concurrency analysis
+- Memory/resource analysis
+- Historical cross-reference
+- Complex pattern matching
+
+WHY PROGRESSIVE:
+- Saves time on broken code
+- Faster feedback to Engineer
+- Reserve deep analysis for worthy code
+- Reduces token usage
+
+REPORT FORMAT:
+{
+  "validation_depth": "PHASE_1|PHASE_2|PHASE_3",
+  "stopped_at": "PHASE_1",
+  "reason": "Build failed",
+  "message": "Fix build before resubmitting"
+}
+
+Don't analyze deeply what doesn't compile.
+`
+```
+
+#### Inspector False Positive Tracking Protocol
+
+**CRITICAL: Track when issues are marked as acceptable to reduce future false positives.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       FALSE POSITIVE TRACKING PROTOCOL                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Learn from overrides to improve future accuracy.                       │
+│                                                                                     │
+│  FALSE POSITIVE SIGNALS:                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. USER_OVERRIDE: User explicitly accepts flagged issue                     │   │
+│  │  2. ARCHITECT_DISMISS: Architect marks issue as not applicable               │   │
+│  │  3. PATTERN_EXCEPTION: Issue is known intentional deviation                  │   │
+│  │  4. EXTERNAL_CONSTRAINT: Third-party code, can't change                      │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  TRACKING FORMAT:                                                                   │
+│  {                                                                                  │
+│    "false_positive_id": "fp_abc123",                                               │
+│    "original_issue": {issue details},                                              │
+│    "override_type": "USER_OVERRIDE",                                               │
+│    "override_reason": "Intentional for backwards compatibility",                   │
+│    "pattern_signature": "naked_return_in_handler",                                 │
+│    "recurrence_count": 3                                                           │
+│  }                                                                                  │
+│                                                                                     │
+│  PATTERN LEARNING:                                                                  │
+│  ├── 1 override: Track, no action                                                  │
+│  ├── 2 overrides: Flag as potential false positive                                 │
+│  ├── 3+ overrides: Reduce severity for this pattern                                │
+│  └── 5+ overrides: Consider removing from default checks                           │
+│                                                                                     │
+│  QUERY DURING VALIDATION:                                                           │
+│  Before flagging issue, query Archivalist:                                         │
+│  "Has this pattern been overridden before?"                                        │
+│  If yes, note in report: "Previously overridden 3 times. Consider if applicable." │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const InspectorFalsePositivePrompt = `
+FALSE POSITIVE TRACKING PROTOCOL:
+
+TRACK WHEN ISSUES ARE OVERRIDDEN:
+- USER_OVERRIDE: User accepts issue
+- ARCHITECT_DISMISS: Architect says N/A
+- PATTERN_EXCEPTION: Intentional deviation
+- EXTERNAL_CONSTRAINT: Can't change (third-party)
+
+STORE IN ARCHIVALIST:
+{
+  "false_positive_id": "fp_xxx",
+  "original_issue": {...},
+  "override_type": "USER_OVERRIDE",
+  "override_reason": "why",
+  "pattern_signature": "pattern_name",
+  "recurrence_count": N
+}
+
+PATTERN LEARNING:
+- 1 override: Track only
+- 2 overrides: Flag as potential FP
+- 3+ overrides: Reduce severity
+- 5+ overrides: Consider removing check
+
+DURING VALIDATION:
+Query: "Has this pattern been overridden?"
+If yes, add note:
+"ℹ️ Pattern overridden 3 times before. May not apply here."
+
+Reduces noise over time.
+Improves accuracy through learning.
+`
+```
+
+#### Tester Existing Test Integration Protocol
+
+**CRITICAL: Tester must discover and integrate with existing tests, not duplicate.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    EXISTING TEST INTEGRATION PROTOCOL                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Build on existing tests, don't duplicate or conflict.                  │
+│                                                                                     │
+│  MANDATORY DISCOVERY:                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. Query Librarian: "What tests exist for [affected code]?"                 │   │
+│  │  2. Read existing test files for affected packages                           │   │
+│  │  3. Identify: existing fixtures, mocks, helpers                              │   │
+│  │  4. Identify: existing test patterns and naming                              │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  INTEGRATION REQUIREMENTS:                                                          │
+│  ├── REUSE existing fixtures - don't create duplicates                             │
+│  ├── REUSE existing mocks - extend if needed, don't recreate                       │
+│  ├── MATCH existing test naming conventions                                        │
+│  ├── MATCH existing assertion style                                                │
+│  ├── MATCH existing setup/teardown patterns                                        │
+│  └── ADD to existing test files when appropriate                                   │
+│                                                                                     │
+│  CONFLICT DETECTION:                                                                │
+│  ├── New tests must not duplicate existing test scenarios                          │
+│  ├── New tests must not conflict with existing assertions                          │
+│  ├── New mocks must not override existing mock behavior                            │
+│  └── New fixtures must not pollute shared test state                               │
+│                                                                                     │
+│  DOCUMENTATION:                                                                     │
+│  {                                                                                  │
+│    "existing_tests_found": ["TestAuth_Valid", "TestAuth_Invalid"],                 │
+│    "existing_fixtures_used": ["testUser", "testToken"],                            │
+│    "new_tests_added": ["TestAuth_Expired"],                                        │
+│    "conflicts_detected": [],                                                       │
+│    "integration_approach": "Added to existing auth_test.go"                        │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const TesterExistingTestIntegrationPrompt = `
+EXISTING TEST INTEGRATION PROTOCOL:
+
+BEFORE WRITING ANY TESTS:
+1. Query Librarian: "Tests for [affected code]?"
+2. Read existing test files in package
+3. Identify existing: fixtures, mocks, helpers
+4. Note test patterns and naming conventions
+
+INTEGRATION REQUIREMENTS:
+- REUSE existing fixtures (don't duplicate)
+- REUSE existing mocks (extend, don't recreate)
+- MATCH existing naming conventions
+- MATCH assertion style
+- ADD to existing files when appropriate
+
+CONFLICT CHECKS:
+- No duplicate test scenarios
+- No conflicting assertions
+- No mock behavior overrides
+- No shared state pollution
+
+DOCUMENT:
+{
+  "existing_tests_found": ["list"],
+  "fixtures_used": ["list"],
+  "new_tests_added": ["list"],
+  "conflicts_detected": [],
+  "integration_approach": "how you integrated"
+}
+
+BUILD ON what exists. DON'T duplicate.
+`
+```
+
+#### Tester Flaky Test Prevention Protocol
+
+**CRITICAL: Proactively detect flakiness patterns during test design.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      FLAKY TEST PREVENTION PROTOCOL                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Prevent flakiness at design time, not after it causes failures.        │
+│                                                                                     │
+│  FLAKINESS WARNING TRIGGERS:                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. TIME DEPENDENCY: Test uses time.Now(), sleep, or timeouts               │   │
+│  │  2. RANDOM DEPENDENCY: Test uses random values without seeding              │   │
+│  │  3. EXTERNAL SERVICE: Test calls real external service                       │   │
+│  │  4. SHARED STATE: Test uses global/shared mutable state                      │   │
+│  │  5. ORDER DEPENDENCY: Test assumes execution order                           │   │
+│  │  6. RESOURCE CONTENTION: Test competes for limited resources                 │   │
+│  │  7. ASYNC WITHOUT SYNC: Test has async operations without proper waits       │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  PREVENTION STRATEGIES:                                                             │
+│  ├── TIME: Inject clock, use frozen time                                           │
+│  ├── RANDOM: Seed random, or use deterministic values                              │
+│  ├── EXTERNAL: Mock external services                                              │
+│  ├── SHARED STATE: Isolate state per test, use t.Parallel() carefully             │
+│  ├── ORDER: Ensure tests are independent                                           │
+│  ├── RESOURCES: Use test-specific resources                                        │
+│  └── ASYNC: Use explicit synchronization (channels, WaitGroup)                     │
+│                                                                                     │
+│  VALIDATION CHECK:                                                                  │
+│  {                                                                                  │
+│    "flakiness_review": {                                                           │
+│      "time_dependencies": [],                                                      │
+│      "random_usage": [],                                                           │
+│      "external_calls": [],                                                         │
+│      "shared_state": [],                                                           │
+│      "async_patterns": [],                                                         │
+│      "risk_level": "LOW|MEDIUM|HIGH",                                              │
+│      "mitigations_applied": []                                                     │
+│    }                                                                               │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const TesterFlakyPreventionPrompt = `
+FLAKY TEST PREVENTION PROTOCOL:
+
+WATCH FOR FLAKINESS TRIGGERS:
+1. TIME: time.Now(), sleep, timeouts
+2. RANDOM: Unseeded random values
+3. EXTERNAL: Real external service calls
+4. SHARED STATE: Global/mutable state
+5. ORDER: Assumed execution order
+6. RESOURCES: Contention for limited resources
+7. ASYNC: Async without proper sync
+
+PREVENTION:
+- TIME: Inject clock, freeze time
+- RANDOM: Seed or use deterministic values
+- EXTERNAL: Mock all external services
+- SHARED STATE: Isolate per test
+- ORDER: Ensure independence
+- RESOURCES: Test-specific resources
+- ASYNC: Explicit sync (WaitGroup, channels)
+
+REVIEW EVERY TEST:
+{
+  "flakiness_review": {
+    "time_dependencies": ["list any"],
+    "random_usage": ["list any"],
+    "external_calls": ["list any"],
+    "shared_state": ["list any"],
+    "risk_level": "LOW|MEDIUM|HIGH",
+    "mitigations_applied": ["what you did"]
+  }
+}
+
+Flaky tests are worse than no tests.
+Prevent at design time.
+`
+```
+
+#### Tester Coverage Gap Prioritization Protocol
+
+**CRITICAL: Prioritize test coverage for high-risk areas first.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    COVERAGE GAP PRIORITIZATION PROTOCOL                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Test the riskiest code first, not the easiest code.                   │
+│                                                                                     │
+│  PRIORITY ORDER:                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  P0 (CRITICAL): Error paths - what happens when things go wrong             │   │
+│  │  P1 (HIGH): Boundary conditions - edge of valid input ranges                │   │
+│  │  P2 (HIGH): Integration points - where components connect                    │   │
+│  │  P3 (MEDIUM): Happy paths - normal successful operations                     │   │
+│  │  P4 (LOW): Convenience paths - alternative ways to do the same thing        │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ERROR PATH EXAMPLES:                                                               │
+│  ├── Network failure during operation                                              │
+│  ├── Invalid input handling                                                        │
+│  ├── Resource exhaustion                                                           │
+│  ├── Permission denied                                                             │
+│  ├── Timeout handling                                                              │
+│  └── Partial failure in batch operations                                           │
+│                                                                                     │
+│  COVERAGE PLAN FORMAT:                                                              │
+│  {                                                                                  │
+│    "coverage_priority": [                                                          │
+│      {"priority": "P0", "area": "error paths", "tests_planned": 5},                │
+│      {"priority": "P1", "area": "boundaries", "tests_planned": 3},                 │
+│      {"priority": "P2", "area": "integration", "tests_planned": 2},                │
+│      {"priority": "P3", "area": "happy paths", "tests_planned": 2}                 │
+│    ],                                                                              │
+│    "uncovered_risks": ["what still needs tests"]                                   │
+│  }                                                                                  │
+│                                                                                     │
+│  ANTI-PATTERN:                                                                      │
+│  Testing only happy paths because they're easy → FALSE sense of coverage.         │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const TesterCoveragePrioritizationPrompt = `
+COVERAGE GAP PRIORITIZATION PROTOCOL:
+
+PRIORITY ORDER (test these FIRST):
+P0 - Error paths (what breaks?)
+P1 - Boundary conditions (edge cases)
+P2 - Integration points (connections)
+P3 - Happy paths (normal flow)
+P4 - Convenience paths (alternatives)
+
+ERROR PATHS TO TEST:
+- Network failures
+- Invalid input
+- Resource exhaustion
+- Permission denied
+- Timeouts
+- Partial failures
+
+BEFORE WRITING TESTS:
+Plan coverage by priority:
+{
+  "coverage_priority": [
+    {"priority": "P0", "area": "error handling", "tests": 5},
+    {"priority": "P1", "area": "boundaries", "tests": 3},
+    {"priority": "P2", "area": "integration", "tests": 2}
+  ]
+}
+
+ANTI-PATTERN:
+Only testing happy paths = FALSE coverage.
+Easy-to-test ≠ important-to-test.
+
+Test the risky code first.
+`
+```
+
+#### Tester Test Maintenance Burden Protocol
+
+**CRITICAL: Assess test maintenance cost before writing - avoid high-churn tests.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     TEST MAINTENANCE BURDEN PROTOCOL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Every test has maintenance cost. High-churn tests are expensive.       │
+│                                                                                     │
+│  MAINTENANCE BURDEN FACTORS:                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  HIGH BURDEN (avoid):                                                        │   │
+│  │  - Tests implementation details, not behavior                                │   │
+│  │  - Brittle to unrelated changes                                              │   │
+│  │  - Requires complex setup                                                    │   │
+│  │  - Tests private methods directly                                            │   │
+│  │  - Mocks too many dependencies                                               │   │
+│  │                                                                              │   │
+│  │  LOW BURDEN (prefer):                                                        │   │
+│  │  - Tests public interface/behavior                                           │   │
+│  │  - Isolated from implementation changes                                      │   │
+│  │  - Simple, focused setup                                                     │   │
+│  │  - Uses real dependencies when fast                                          │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  BURDEN ASSESSMENT:                                                                 │
+│  {                                                                                  │
+│    "test": "TestUserAuth",                                                         │
+│    "burden_score": "LOW|MEDIUM|HIGH",                                              │
+│    "factors": {                                                                    │
+│      "tests_behavior": true,                                                       │
+│      "tests_implementation": false,                                                │
+│      "mock_count": 2,                                                              │
+│      "setup_complexity": "simple",                                                 │
+│      "change_sensitivity": "low"                                                   │
+│    },                                                                              │
+│    "justification": "Tests public API, minimal mocks"                              │
+│  }                                                                                  │
+│                                                                                     │
+│  HIGH BURDEN REQUIRES JUSTIFICATION:                                                │
+│  If burden is HIGH, document WHY test is still valuable:                           │
+│  "High burden justified: Tests critical security path, value outweighs cost."     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const TesterMaintenanceBurdenPrompt = `
+TEST MAINTENANCE BURDEN PROTOCOL:
+
+HIGH BURDEN (avoid if possible):
+- Tests implementation details
+- Brittle to unrelated changes
+- Complex setup
+- Tests private methods
+- Many mocks
+
+LOW BURDEN (prefer):
+- Tests public behavior
+- Isolated from implementation
+- Simple setup
+- Real deps when fast
+
+ASSESS EACH TEST:
+{
+  "test": "TestName",
+  "burden_score": "LOW|MEDIUM|HIGH",
+  "factors": {
+    "tests_behavior": true|false,
+    "tests_implementation": true|false,
+    "mock_count": N,
+    "setup_complexity": "simple|moderate|complex",
+    "change_sensitivity": "low|medium|high"
+  }
+}
+
+IF HIGH BURDEN:
+Document justification:
+"High burden justified: [why test value exceeds cost]"
+
+Tests have maintenance cost.
+High-churn tests waste engineering time.
 `
 ```
 
@@ -23624,6 +28220,359 @@ When trying something novel or risky:
 `
 ```
 
+#### Engineer Pre-Implementation Verification Protocol
+
+**CRITICAL: Engineer must verify environment and patterns before writing any code.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    PRE-IMPLEMENTATION VERIFICATION PROTOCOL                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Verify before you build. Assumptions cause failures.                   │
+│                                                                                     │
+│  MANDATORY VERIFICATIONS (before any code write):                                   │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. TARGET FILES EXIST: Verify files to modify actually exist                │   │
+│  │  2. PATTERNS MATCH: Confirm patterns from task match actual codebase         │   │
+│  │  3. DEPENDENCIES AVAILABLE: Verify required imports/packages exist           │   │
+│  │  4. BUILD PASSES: Run build before modifying to ensure clean state           │   │
+│  │  5. TESTS PASS: Run relevant tests before modifying                          │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  VERIFICATION CHECKLIST:                                                            │
+│  {                                                                                  │
+│    "target_files_verified": true|false,                                            │
+│    "patterns_match": true|false,                                                   │
+│    "dependencies_available": true|false,                                           │
+│    "build_passes": true|false,                                                     │
+│    "tests_pass": true|false,                                                       │
+│    "blocking_issues": [...]                                                        │
+│  }                                                                                  │
+│                                                                                     │
+│  IF ANY VERIFICATION FAILS:                                                         │
+│  ├── STOP - do not proceed with implementation                                     │
+│  ├── REPORT - log what failed and why                                              │
+│  ├── ESCALATE - send TASK_HELP if issue cannot be resolved                         │
+│  └── QUERY - consult Librarian for correct patterns/locations                      │
+│                                                                                     │
+│  NEVER proceed with unverified assumptions.                                         │
+│  "File not found" mid-implementation is a preventable failure.                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const EngineerPreImplementationPrompt = `
+PRE-IMPLEMENTATION VERIFICATION PROTOCOL:
+
+BEFORE writing ANY code, verify:
+
+1. TARGET FILES EXIST
+   - Read or Glob to confirm files mentioned in task exist
+   - If file not found, query Librarian for correct location
+
+2. PATTERNS MATCH
+   - Read existing code in target area
+   - Confirm patterns match what task describes
+   - If mismatch, query Librarian for actual patterns
+
+3. DEPENDENCIES AVAILABLE
+   - Check imports you plan to use exist
+   - Verify package versions if relevant
+   - If missing, flag before implementation
+
+4. BUILD PASSES
+   - Run build before modifying
+   - Ensure you're starting from clean state
+   - If build fails, fix or escalate before changes
+
+5. TESTS PASS
+   - Run tests for affected area
+   - Ensure baseline is green
+   - If tests fail, investigate before changing
+
+LOG VERIFICATION:
+{
+  "target_files_verified": true,
+  "patterns_match": true,
+  "dependencies_available": true,
+  "build_passes": true,
+  "tests_pass": true,
+  "blocking_issues": []
+}
+
+IF ANY FAILS:
+- STOP implementation
+- REPORT what failed
+- ESCALATE if cannot resolve
+- DO NOT guess and proceed
+`
+```
+
+#### Engineer Incremental Validation Protocol
+
+**CRITICAL: For complex tasks, validate incrementally rather than at the end.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      INCREMENTAL VALIDATION PROTOCOL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Catch errors early. Validate after each major subtask.                 │
+│                                                                                     │
+│  WHEN TO VALIDATE INCREMENTALLY:                                                    │
+│  ├── Task has > 5 steps                                                            │
+│  ├── Changes span multiple files                                                   │
+│  ├── Changes affect core/shared code                                               │
+│  ├── Changes involve refactoring                                                   │
+│  └── Risk is high (security, data, concurrency)                                    │
+│                                                                                     │
+│  VALIDATION CHECKPOINTS:                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  After each checkpoint:                                                       │   │
+│  │  1. Run build (must pass)                                                    │   │
+│  │  2. Run type check if applicable                                             │   │
+│  │  3. Run affected tests                                                       │   │
+│  │  4. If any fails, fix BEFORE continuing                                      │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  CHECKPOINT PLACEMENT:                                                              │
+│  ├── After completing each file modification                                       │
+│  ├── After adding new functions/types                                              │
+│  ├── After refactoring existing code                                               │
+│  ├── Before integrating components                                                 │
+│  └── Before marking task complete                                                  │
+│                                                                                     │
+│  VALIDATION LOG:                                                                    │
+│  [                                                                                  │
+│    {"checkpoint": "1", "build": "pass", "tests": "pass", "files": ["a.go"]},      │
+│    {"checkpoint": "2", "build": "pass", "tests": "fail", "fix": "added nil check"}│
+│  ]                                                                                  │
+│                                                                                     │
+│  BENEFITS:                                                                          │
+│  ├── Errors caught when context is fresh                                           │
+│  ├── Smaller scope to debug                                                        │
+│  ├── Avoids cascading failures at end                                              │
+│  └── Creates natural rollback points                                               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const EngineerIncrementalValidationPrompt = `
+INCREMENTAL VALIDATION PROTOCOL:
+
+FOR COMPLEX TASKS (>5 steps, multi-file, refactoring):
+Validate after each major subtask, not just at the end.
+
+VALIDATION CHECKPOINTS:
+After each file modification or major change:
+1. Run build - MUST pass before continuing
+2. Run type check - MUST pass
+3. Run affected tests - MUST pass
+4. If any fails, FIX before proceeding
+
+CHECKPOINT TRIGGERS:
+- Completed modifying a file
+- Added new function/type
+- Refactored existing code
+- Before integrating components
+- Before marking complete
+
+LOG EACH CHECKPOINT:
+{
+  "checkpoint": "1",
+  "action": "added ErrorHandler struct",
+  "build": "pass",
+  "tests": "pass|fail",
+  "fix_applied": "none|description"
+}
+
+BENEFITS:
+- Catch errors with fresh context
+- Smaller debug scope
+- Avoid cascading end-of-task failures
+- Natural rollback points
+
+DO NOT defer all validation to the end.
+Early failures are easier to fix.
+`
+```
+
+#### Engineer Pattern Adherence Discipline
+
+**CRITICAL: Engineer must match existing patterns exactly, with documented deviation justification.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        PATTERN ADHERENCE DISCIPLINE                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Consistency > Improvement. Match existing patterns.                    │
+│                                                                                     │
+│  PATTERN ADHERENCE WORKFLOW:                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. IDENTIFY: Query Librarian for canonical pattern in target area          │   │
+│  │  2. STUDY: Read 2-3 examples of the pattern in actual codebase              │   │
+│  │  3. MATCH: Use EXACTLY that pattern (naming, structure, error handling)     │   │
+│  │  4. DOCUMENT: If deviation required, document why with evidence             │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  PATTERN TYPES TO MATCH:                                                            │
+│  ├── NAMING: Function, variable, file naming conventions                           │
+│  ├── STRUCTURE: File organization, package layout                                  │
+│  ├── ERROR HANDLING: How errors are created, wrapped, returned                     │
+│  ├── LOGGING: Log format, levels, what gets logged                                 │
+│  ├── TESTING: Test naming, setup, assertions                                       │
+│  └── DOCUMENTATION: Comment style, docstring format                                │
+│                                                                                     │
+│  DEVIATION JUSTIFICATION (required for any deviation):                              │
+│  {                                                                                  │
+│    "pattern": "error handling",                                                    │
+│    "existing": "return fmt.Errorf(...)",                                           │
+│    "deviation": "return custom typed error",                                       │
+│    "justification": "Task explicitly requires typed errors for API response",     │
+│    "approved_by": "architect_task_123"                                             │
+│  }                                                                                  │
+│                                                                                     │
+│  FORBIDDEN without justification:                                                   │
+│  ├── Introducing new patterns when existing works                                  │
+│  ├── "Improving" existing patterns during implementation                           │
+│  ├── Using different naming than existing code                                     │
+│  └── Changing error handling style in one file                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const EngineerPatternAdherencePrompt = `
+PATTERN ADHERENCE DISCIPLINE:
+
+BEFORE IMPLEMENTING:
+1. Query Librarian: "What patterns exist for [area]?"
+2. Read 2-3 examples of the pattern in actual codebase
+3. Note: naming, structure, error handling, logging, testing
+
+DURING IMPLEMENTATION:
+- Use EXACTLY the existing patterns
+- Match naming conventions precisely
+- Follow error handling style of surrounding code
+- Use same logging format and levels
+- Match test structure and assertion style
+
+IF DEVIATION NEEDED:
+Document justification:
+{
+  "pattern": "what pattern",
+  "existing": "how codebase does it",
+  "deviation": "what you're doing differently",
+  "justification": "why (must reference task requirement)",
+  "approved_by": "task ID that requires this"
+}
+
+FORBIDDEN WITHOUT JUSTIFICATION:
+- New patterns when existing works
+- "Improving" patterns during implementation
+- Different naming than surrounding code
+- Inconsistent error handling
+
+CONSISTENCY > YOUR PREFERENCE.
+Match the codebase, don't reshape it.
+`
+```
+
+#### Engineer Rollback Documentation Protocol
+
+**CRITICAL: Document rollback steps for changes that might need reverting.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      ROLLBACK DOCUMENTATION PROTOCOL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Every change should be reversible. Document how.                       │
+│                                                                                     │
+│  WHEN ROLLBACK DOCS REQUIRED:                                                       │
+│  ├── Database schema changes                                                       │
+│  ├── API changes (breaking or non-breaking)                                        │
+│  ├── Configuration changes                                                         │
+│  ├── Dependency updates                                                            │
+│  ├── Refactoring that moves/renames                                                │
+│  └── Any change Inspector/Tester might flag                                        │
+│                                                                                     │
+│  ROLLBACK DOCUMENTATION FORMAT:                                                     │
+│  {                                                                                  │
+│    "change_id": "unique identifier",                                               │
+│    "change_summary": "what was changed",                                           │
+│    "files_modified": ["list of files"],                                            │
+│    "rollback_steps": [                                                             │
+│      "1. Revert commit abc123",                                                    │
+│      "2. Run migration down script",                                               │
+│      "3. Restart service"                                                          │
+│    ],                                                                              │
+│    "rollback_verified": true|false,                                                │
+│    "dependencies": "other changes that must rollback together",                    │
+│    "data_impact": "any data changes that cannot be automatically rolled back"      │
+│  }                                                                                  │
+│                                                                                     │
+│  AUTOMATIC ROLLBACK SCENARIOS:                                                      │
+│  ├── Inspector validation fails → revert to checkpoint                            │
+│  ├── Tester tests fail → revert to checkpoint                                     │
+│  ├── 3rd failure threshold → automatic revert                                     │
+│  └── User explicitly requests rollback                                             │
+│                                                                                     │
+│  STORE IN ARCHIVALIST:                                                              │
+│  Rollback docs stored for future reference with task correlation.                  │
+│  Enables learning from what needed reverting.                                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const EngineerRollbackDocumentationPrompt = `
+ROLLBACK DOCUMENTATION PROTOCOL:
+
+DOCUMENT ROLLBACK for:
+- Database schema changes
+- API changes
+- Configuration changes
+- Dependency updates
+- Refactoring (moves/renames)
+- Any change that might need reverting
+
+ROLLBACK DOC FORMAT:
+{
+  "change_id": "task_xyz_change_1",
+  "change_summary": "Added user preferences table",
+  "files_modified": ["migrations/003.sql", "models/user.go"],
+  "rollback_steps": [
+    "1. Run: go run migrations/rollback.go 003",
+    "2. Delete models/user_preferences.go",
+    "3. Restart service"
+  ],
+  "rollback_verified": false,
+  "dependencies": "Must rollback with API changes in task_abc",
+  "data_impact": "User preferences data will be lost"
+}
+
+STORE IN ARCHIVALIST:
+- Category: "rollback_documentation"
+- Correlation: task ID
+- Enables future reference
+
+AUTOMATIC ROLLBACK TRIGGERS:
+- Inspector validation fails
+- Tester tests fail
+- 3rd failure threshold hit
+- User explicit request
+
+CHANGES WITHOUT ROLLBACK DOCS:
+If you can't document how to rollback, reconsider the change.
+Irreversible changes need explicit approval.
+`
+```
+
 #### Designer Hooks
 
 ```go
@@ -23936,11 +28885,12 @@ type ToolDiscoveryRequest struct {
 type ToolCategory string
 
 const (
-    ToolCategoryLinter      ToolCategory = "linter"
-    ToolCategoryFormatter   ToolCategory = "formatter"
-    ToolCategoryTypeChecker ToolCategory = "type_checker"
+    ToolCategoryLinter        ToolCategory = "linter"
+    ToolCategoryFormatter     ToolCategory = "formatter"
+    ToolCategoryTypeChecker   ToolCategory = "type_checker"
     ToolCategoryTestFramework ToolCategory = "test_framework"
-    ToolCategoryLSP         ToolCategory = "lsp"
+    ToolCategoryLSP           ToolCategory = "lsp"
+    ToolCategoryParser        ToolCategory = "parser"  // Tree-sitter grammar for AST parsing
 )
 
 // ToolDiscoveryResponse returns discovered tools
@@ -24315,12 +29265,54 @@ type LanguageToolset struct {
     TypeChecker    ToolDefault
     LSP            ToolDefault
     TestFramework  ToolDefault
+    // Note: Parser (tree-sitter grammar) is NOT included here.
+    // Tree-sitter grammars are managed separately via GrammarRegistry
+    // and auto-installed on demand. See "Tree-Sitter Parsing Infrastructure" section.
 }
 
 type ToolDefault struct {
     Name       string
     InstallCmd string
 }
+```
+
+### Tree-Sitter Grammar Auto-Installation
+
+Unlike the tools above, tree-sitter grammars are managed separately and installed automatically:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    TREE-SITTER GRAMMAR AUTO-INSTALLATION                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Agent encounters file (e.g., handler.go)                                           │
+│       │                                                                             │
+│       ▼                                                                             │
+│  TreeSitterTool.Parse(ctx, "handler.go", content)                                   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  GrammarRegistry.GetLanguageForFile("handler.go")                                   │
+│       │                                                                             │
+│       ├── Extension .go → grammar "go"                                              │
+│       │                                                                             │
+│       ├── Check: Is "go" grammar installed?                                         │
+│       │       │                                                                     │
+│       │       ├── [YES] → Return cached Language                                    │
+│       │       │                                                                     │
+│       │       └── [NO] → Download from github.com/tree-sitter/tree-sitter-go       │
+│       │                       │                                                     │
+│       │                       ├── Try prebuilt binary (GitHub releases)             │
+│       │                       │                                                     │
+│       │                       └── Fallback: compile from source (cc/clang)          │
+│       │                                                                             │
+│       └── Load via purego.Dlopen() → tree_sitter_go() → TSLanguage                  │
+│                                                                                     │
+│  Result: Agent gets ParseResult with functions, types, imports                      │
+│                                                                                     │
+│  TRANSPARENCY: No user interaction required. Grammars are installed silently.       │
+│  PERSISTENCE: Installed grammars cached in ~/.sylk/data/grammars/                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Key Recommendations:**
@@ -28960,6 +33952,366 @@ AVAILABLE SKILLS:
 `
 ```
 
+#### Orchestrator Execution Anomaly Detection Protocol
+
+**CRITICAL: Detect execution anomalies and alert Architect before they cascade.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     EXECUTION ANOMALY DETECTION PROTOCOL                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Anomalies detected early can be addressed before cascade failures.     │
+│                                                                                     │
+│  ANOMALY TYPES:                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. TIME_ANOMALY: Task exceeds 3x expected duration                          │   │
+│  │  2. ERROR_SPIKE: Error rate > 50% in sliding window                          │   │
+│  │  3. TOOL_LOOP: Same tool called > 5 times without progress                   │   │
+│  │  4. RESOURCE_EXHAUSTION: Memory/tokens approaching limits                    │   │
+│  │  5. STALL_DETECTED: No progress for > 2 minutes                              │   │
+│  │  6. DEPENDENCY_TIMEOUT: Waiting on upstream task too long                    │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  DETECTION THRESHOLDS:                                                              │
+│  ├── TIME: Task duration > 3x similar tasks historically                          │
+│  ├── ERROR_RATE: > 3 errors in 5 consecutive operations                           │
+│  ├── TOOL_LOOP: Same tool > 5x with same/similar parameters                       │
+│  ├── STALL: No tool calls or messages for 120 seconds                             │
+│  └── DEPENDENCY: Waiting > 5 minutes on single upstream task                      │
+│                                                                                     │
+│  ALERT ACTIONS:                                                                     │
+│  ├── WARN (1st occurrence): Log anomaly, continue monitoring                      │
+│  ├── ALERT (2nd/persistent): Notify Architect, continue execution                 │
+│  ├── ESCALATE (critical): Pause task, await Architect decision                    │
+│  └── AUTO_CANCEL (timeout): Cancel after max threshold                            │
+│                                                                                     │
+│  ANOMALY REPORT:                                                                    │
+│  {                                                                                  │
+│    "anomaly_id": "...",                                                            │
+│    "type": "TIME_ANOMALY",                                                         │
+│    "task_id": "...",                                                               │
+│    "severity": "WARN|ALERT|CRITICAL",                                              │
+│    "details": {"expected": "2m", "actual": "8m"},                                  │
+│    "action_taken": "ALERT",                                                        │
+│    "architect_notified": true                                                      │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const OrchestratorAnomalyDetectionPrompt = `
+EXECUTION ANOMALY DETECTION PROTOCOL:
+
+MONITOR FOR ANOMALIES:
+1. TIME_ANOMALY: Task > 3x expected duration
+2. ERROR_SPIKE: Error rate > 50%
+3. TOOL_LOOP: Same tool > 5x without progress
+4. RESOURCE_EXHAUSTION: Near limits
+5. STALL_DETECTED: No progress > 2 min
+6. DEPENDENCY_TIMEOUT: Waiting too long
+
+THRESHOLDS:
+- TIME: > 3x historical average
+- ERROR_RATE: > 3 errors in 5 operations
+- TOOL_LOOP: > 5 same calls
+- STALL: > 120 seconds idle
+- DEPENDENCY: > 5 minutes waiting
+
+ACTIONS:
+- WARN: Log, continue monitoring
+- ALERT: Notify Architect, continue
+- ESCALATE: Pause, await Architect
+- AUTO_CANCEL: Timeout exceeded
+
+REPORT FORMAT:
+{
+  "anomaly_id": "...",
+  "type": "TYPE",
+  "task_id": "...",
+  "severity": "WARN|ALERT|CRITICAL",
+  "action_taken": "...",
+  "architect_notified": true|false
+}
+
+Catch anomalies early. Prevent cascade failures.
+`
+```
+
+#### Orchestrator Pipeline Health Monitoring Protocol
+
+**CRITICAL: Monitor pipeline-level health beyond individual task status.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     PIPELINE HEALTH MONITORING PROTOCOL                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Pipeline health is more than sum of task statuses. Monitor holistically.│
+│                                                                                     │
+│  HEALTH METRICS:                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  THROUGHPUT: Tasks completed per unit time                                   │   │
+│  │  PROGRESS_RATE: % completion over time (should be monotonic)                │   │
+│  │  ERROR_RATIO: Failed tasks / total tasks                                     │   │
+│  │  RETRY_RATIO: Retries / first attempts                                       │   │
+│  │  BOTTLENECK: Which task/layer is blocking progress                           │   │
+│  │  RESOURCE_UTILIZATION: Memory, tokens, concurrent pipelines                  │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  HEALTH STATES:                                                                     │
+│  ├── HEALTHY: All metrics in normal range                                         │
+│  ├── DEGRADED: 1-2 metrics out of range                                           │
+│  ├── UNHEALTHY: 3+ metrics out of range                                           │
+│  └── CRITICAL: Pipeline at risk of failure                                         │
+│                                                                                     │
+│  HEALTH CHECK FREQUENCY:                                                            │
+│  ├── Every task completion                                                         │
+│  ├── Every 30 seconds during active execution                                      │
+│  └── On any anomaly detection                                                      │
+│                                                                                     │
+│  HEALTH REPORT:                                                                     │
+│  {                                                                                  │
+│    "pipeline_id": "...",                                                           │
+│    "health_state": "HEALTHY|DEGRADED|UNHEALTHY|CRITICAL",                          │
+│    "metrics": {                                                                    │
+│      "throughput": {"value": 2.5, "unit": "tasks/min", "status": "OK"},           │
+│      "progress_rate": {"value": 0.65, "status": "OK"},                            │
+│      "error_ratio": {"value": 0.1, "status": "WARN"},                             │
+│      "bottleneck": "task_xyz (Inspector validation)"                              │
+│    },                                                                              │
+│    "recommendation": "Consider parallelizing Inspector checks"                     │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const OrchestratorPipelineHealthPrompt = `
+PIPELINE HEALTH MONITORING PROTOCOL:
+
+HEALTH METRICS:
+- THROUGHPUT: Tasks/time
+- PROGRESS_RATE: % completion over time
+- ERROR_RATIO: Failed/total
+- RETRY_RATIO: Retries/first attempts
+- BOTTLENECK: Blocking task/layer
+- RESOURCE_UTIL: Memory, tokens, pipelines
+
+HEALTH STATES:
+- HEALTHY: All normal
+- DEGRADED: 1-2 metrics out of range
+- UNHEALTHY: 3+ out of range
+- CRITICAL: At risk of failure
+
+CHECK FREQUENCY:
+- On every task completion
+- Every 30 seconds during execution
+- On any anomaly
+
+REPORT FORMAT:
+{
+  "pipeline_id": "...",
+  "health_state": "...",
+  "metrics": {
+    "throughput": {"value": N, "status": "OK|WARN|CRITICAL"},
+    "progress_rate": {"value": N, "status": "..."},
+    "error_ratio": {"value": N, "status": "..."},
+    "bottleneck": "task_id or null"
+  },
+  "recommendation": "actionable suggestion"
+}
+
+Report to Architect when health degrades.
+`
+```
+
+#### Orchestrator Completion Verification Protocol
+
+**CRITICAL: Verify task completions are real, not false positives.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      COMPLETION VERIFICATION PROTOCOL                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: "Complete" doesn't always mean complete. Verify before advancing.      │
+│                                                                                     │
+│  VERIFICATION CHECKS:                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. ARTIFACT_EXISTS: Expected outputs actually exist                         │   │
+│  │  2. NO_ERROR_INDICATORS: No error keywords in final output                   │   │
+│  │  3. DOWNSTREAM_READY: Dependencies for next tasks are satisfied              │   │
+│  │  4. EVIDENCE_STORED: Completion evidence in Archivalist                      │   │
+│  │  5. AGENT_CONFIRMED: Agent explicitly signaled completion                    │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  FALSE COMPLETION INDICATORS:                                                       │
+│  ├── Agent said "done" but no actual changes made                                 │
+│  ├── Build/test still failing                                                     │
+│  ├── Expected files don't exist                                                   │
+│  ├── Errors in last tool call result                                              │
+│  └── Agent asked for help but marked complete                                     │
+│                                                                                     │
+│  VERIFICATION WORKFLOW:                                                             │
+│  1. Agent signals completion                                                       │
+│  2. Orchestrator runs verification checks                                          │
+│  3. If all pass → Mark truly complete, proceed                                    │
+│  4. If any fail → Mark as FALSE_COMPLETION, alert Architect                       │
+│                                                                                     │
+│  VERIFICATION REPORT:                                                               │
+│  {                                                                                  │
+│    "task_id": "...",                                                               │
+│    "signaled_complete": true,                                                      │
+│    "verification_result": "VERIFIED|FALSE_COMPLETION",                             │
+│    "checks": {                                                                     │
+│      "artifact_exists": true,                                                      │
+│      "no_error_indicators": false,                                                 │
+│      "downstream_ready": true                                                      │
+│    },                                                                              │
+│    "failure_reason": "Error in final tool output"                                  │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const OrchestratorCompletionVerificationPrompt = `
+COMPLETION VERIFICATION PROTOCOL:
+
+VERIFY WHEN TASK SIGNALS COMPLETE:
+1. ARTIFACT_EXISTS: Output files exist
+2. NO_ERROR_INDICATORS: No errors in output
+3. DOWNSTREAM_READY: Next tasks can proceed
+4. EVIDENCE_STORED: Evidence in Archivalist
+5. AGENT_CONFIRMED: Explicit completion signal
+
+FALSE COMPLETION INDICATORS:
+- "Done" but no changes
+- Build/test still failing
+- Expected files missing
+- Errors in last tool result
+- Help requested but marked done
+
+WORKFLOW:
+1. Agent signals complete
+2. Run verification checks
+3. All pass → VERIFIED, proceed
+4. Any fail → FALSE_COMPLETION, alert Architect
+
+REPORT:
+{
+  "task_id": "...",
+  "signaled_complete": true,
+  "verification_result": "VERIFIED|FALSE_COMPLETION",
+  "checks": {
+    "artifact_exists": true|false,
+    "no_error_indicators": true|false,
+    "downstream_ready": true|false
+  },
+  "failure_reason": "why if false completion"
+}
+
+Don't advance on false completions.
+`
+```
+
+#### Orchestrator Graceful Degradation Protocol
+
+**CRITICAL: When failures cascade, isolate and continue where possible.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      GRACEFUL DEGRADATION PROTOCOL                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PRINCIPLE: Failure in one branch shouldn't stop independent work.                 │
+│                                                                                     │
+│  DEGRADATION TRIGGERS:                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. TASK_FAILURE: Single task fails after retries exhausted                  │   │
+│  │  2. BRANCH_FAILURE: Entire dependency branch fails                           │   │
+│  │  3. AGENT_UNAVAILABLE: Agent not responding                                  │   │
+│  │  4. RESOURCE_EXHAUSTED: Cannot allocate resources for task                   │   │
+│  │  5. TIMEOUT: Task or branch times out                                        │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  DEGRADATION ACTIONS:                                                               │
+│  ├── ISOLATE: Mark failed branch, prevent cascade                                 │
+│  ├── CONTINUE: Execute independent branches                                        │
+│  ├── PARTIAL_COMPLETE: Report what succeeded vs what failed                        │
+│  └── INFORM: Clear report to user/Architect of partial completion                 │
+│                                                                                     │
+│  ISOLATION RULES:                                                                   │
+│  ├── Failed task: Cancel all dependent tasks                                       │
+│  ├── Independent tasks: Continue execution                                         │
+│  ├── Downstream of failed: Mark BLOCKED, don't attempt                            │
+│  └── Optional tasks: Skip if dependency failed                                     │
+│                                                                                     │
+│  PARTIAL COMPLETION REPORT:                                                         │
+│  {                                                                                  │
+│    "workflow_id": "...",                                                           │
+│    "status": "PARTIAL",                                                            │
+│    "completed_branches": ["auth_impl", "tests_core"],                              │
+│    "failed_branches": ["ui_components"],                                           │
+│    "blocked_tasks": ["integration_tests"],                                         │
+│    "salvageable_work": "Core auth and tests complete. UI blocked on component fail.│
+│                        Recommend: merge auth, address UI separately.",             │
+│    "artifacts_produced": ["src/auth/*.go", "tests/auth_test.go"]                   │
+│  }                                                                                  │
+│                                                                                     │
+│  USER COMMUNICATION:                                                                │
+│  "Workflow partially complete. [X/Y] tasks succeeded. [Z] tasks blocked by [failure].│
+│   Completed work: [summary]. Would you like to proceed with partial results?"      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+const OrchestratorGracefulDegradationPrompt = `
+GRACEFUL DEGRADATION PROTOCOL:
+
+TRIGGERS:
+- TASK_FAILURE: Retries exhausted
+- BRANCH_FAILURE: Entire branch fails
+- AGENT_UNAVAILABLE: No response
+- RESOURCE_EXHAUSTED: Can't allocate
+- TIMEOUT: Time limit exceeded
+
+ACTIONS:
+- ISOLATE: Mark failed, prevent cascade
+- CONTINUE: Run independent branches
+- PARTIAL_COMPLETE: Report success vs failure
+- INFORM: Clear status to user/Architect
+
+ISOLATION RULES:
+- Failed task → Cancel dependents
+- Independent → Continue
+- Downstream → Mark BLOCKED
+- Optional → Skip if dependency failed
+
+PARTIAL COMPLETION REPORT:
+{
+  "workflow_id": "...",
+  "status": "PARTIAL",
+  "completed_branches": [...],
+  "failed_branches": [...],
+  "blocked_tasks": [...],
+  "salvageable_work": "what can be used",
+  "artifacts_produced": [...]
+}
+
+COMMUNICATE TO USER:
+"Workflow partially complete. X/Y succeeded.
+ Completed: [summary]
+ Blocked: [what and why]
+ Proceed with partial results?"
+
+Maximize value from partial execution.
+`
+```
+
 ### Orchestrator Skills
 
 ```go
@@ -29686,7 +35038,16 @@ type Pipeline struct {
 
     StartingPoint  string  `json:"starting_point"`            // Git HEAD when started
     VariantGroupID *string `json:"variant_group_id,omitempty"` // Non-nil if part of variant group
-    VFS            *VirtualFilesystem                         // Non-nil when isolated
+
+    // Versioned VFS Integration (See: Central Version Store)
+    // PipelineVFS provides versioned file operations with MVCC support
+    VFS            *PipelineVFS                               // Versioned VFS for isolation
+
+    // VFS provides:
+    // - preChangeVFS: Frozen snapshot at task start (actual content)
+    // - changeVFS: Working copy where modifications happen
+    // - pendingOps: Operations to commit to CVS on completion
+    // - Automatic OT merge on commit for concurrent modifications
 }
 
 // CachedDiff stores computed diff with TTL
@@ -29954,7 +35315,7 @@ func (o *Orchestrator) CancelVariantGroup(groupID string) error {
 | **User edits during variant execution** | Variants operate on S0 state. User edits go to working dir. Warn user that edits may conflict with variant selection. |
 | **Network/external state** | Variants share external state (databases, APIs). Document this limitation. Consider mock/replay for stateful operations. |
 | **VFS staging disk usage** | Periodic cleanup of old staging dirs. Auto-cleanup on variant group completion. Configurable staging location. |
-| **Selection timeout** | Optional timeout for pending groups. Configurable auto-select or auto-cancel policy. Default: wait indefinitely. |
+| **Selection timeout** | Optional timeout for pending groups. Configurable auto-CANCEL policy only (auto-select PROHIBITED). Default: wait indefinitely. User MUST explicitly select. |
 
 ### Guide Signaling Protocol
 
@@ -30138,6 +35499,178 @@ CLI COMMANDS
     Cancel a specific variant or entire group.
     If variant: cancels that variant, others continue.
     If group: cancels all variants, cleans up.
+```
+
+### Mandatory User Selection for Variants (CRITICAL)
+
+**When variant groups exist, user selection is REQUIRED before commit. No automatic selection is permitted.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    VARIANT SELECTION ENFORCEMENT PROTOCOL                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  INVARIANT: User MUST explicitly select which variant to commit.                    │
+│                                                                                     │
+│  RULES:                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. NO AUTO-SELECT: Automatic variant selection is PROHIBITED               │   │
+│  │     - Timeout policies may auto-CANCEL, never auto-SELECT                   │   │
+│  │     - No "default to original" behavior                                     │   │
+│  │     - No "select fastest" or "select first" policies                        │   │
+│  │                                                                             │   │
+│  │  2. BLOCKING REQUIREMENT: Pipeline execution BLOCKS at variant gate         │   │
+│  │     - Inspector/Tester phases wait for selection                            │   │
+│  │     - No partial commits allowed                                            │   │
+│  │     - Selection is atomic - one variant commits, all others discard         │   │
+│  │                                                                             │   │
+│  │  3. PRESENTATION REQUIREMENT: All variants MUST be presented with:          │   │
+│  │     - Original implementation (always shown first)                          │   │
+│  │     - Each variant with approach summary                                    │   │
+│  │     - Files modified per variant                                            │   │
+│  │     - Diff from original for each variant                                   │   │
+│  │     - Completion status and any errors                                      │   │
+│  │                                                                             │   │
+│  │  4. INFORMED DECISION: User must have sufficient information:               │   │
+│  │     - Side-by-side diff capability (/variants diff)                         │   │
+│  │     - Full preview capability (/variants preview)                           │   │
+│  │     - Approach descriptions from each Engineer pipeline                     │   │
+│  │     - Time taken for each variant (for performance comparison)              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  STATE MACHINE ENFORCEMENT:                                                         │
+│                                                                                     │
+│       ALL_VARIANTS_COMPLETE                                                         │
+│              │                                                                      │
+│              ▼                                                                      │
+│       ┌──────────────┐                                                              │
+│       │   PENDING    │◄─────────────────────────────┐                               │
+│       │ (user gate)  │                              │                               │
+│       └──────┬───────┘                              │                               │
+│              │                                      │                               │
+│       ┌──────┴──────────────┐                       │                               │
+│       │                     │                       │                               │
+│       ▼                     ▼                       │                               │
+│  /variants select     /variants cancel        (timeout)                             │
+│       │                     │                       │                               │
+│       ▼                     ▼                       │                               │
+│   SELECTED              CANCELLED              CANCELLED                            │
+│   (commit)              (discard)              (discard)                            │
+│       │                                                                             │
+│       ▼                                                                             │
+│   Continue to Inspector/Tester                                                      │
+│                                                                                     │
+│  NOTE: Timeout leads to CANCEL, never SELECT. User must actively choose.            │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Variant Presentation Format
+
+When user runs `/variants` or when variants complete, display:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  VARIANT GROUP: vg-abc123                                                           │
+│  Task: "Implement connection pooling for database layer"                            │
+│  Status: PENDING (awaiting selection)                                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  [1] ORIGINAL - Mutex-based synchronization                                         │
+│      ├── Approach: sync.Mutex with connection map                                   │
+│      ├── Files: pkg/db/pool.go (created), pkg/db/conn.go (modified)                 │
+│      ├── Lines changed: +142, -12                                                   │
+│      ├── Time: 45s                                                                  │
+│      └── Status: ✓ Ready                                                            │
+│                                                                                     │
+│  [2] VARIANT-1 - Channel-based synchronization                                      │
+│      ├── Approach: Buffered channel as semaphore                                    │
+│      ├── Files: pkg/db/pool.go (created), pkg/db/conn.go (modified)                 │
+│      ├── Lines changed: +98, -12                                                    │
+│      ├── Time: 38s                                                                  │
+│      └── Status: ✓ Ready                                                            │
+│                                                                                     │
+│  [3] VARIANT-2 - sync.Pool with lazy initialization                                 │
+│      ├── Approach: sync.Pool for connection reuse                                   │
+│      ├── Files: pkg/db/pool.go (created), pkg/db/conn.go (modified)                 │
+│      ├── Lines changed: +76, -12                                                    │
+│      ├── Time: 52s                                                                  │
+│      └── Status: ✓ Ready                                                            │
+│                                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│  Commands:                                                                          │
+│    /variants diff vg-abc123 1 2     Compare original with variant-1                 │
+│    /variants preview vg-abc123 2    Preview variant-1 full changes                  │
+│    /variants select vg-abc123 2     Select variant-1 for commit                     │
+│    /variants cancel vg-abc123       Cancel all variants                             │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Implementation Requirements
+
+```go
+// VariantSelectionPolicy enforces mandatory user selection
+type VariantSelectionPolicy struct {
+    // AllowAutoSelect MUST be false - automatic selection is prohibited
+    AllowAutoSelect bool `json:"allow_auto_select"` // ALWAYS false
+
+    // TimeoutAction can only be CANCEL, never SELECT
+    TimeoutAction   TimeoutAction `json:"timeout_action"` // CANCEL or NONE
+
+    // TimeoutDuration - 0 means wait indefinitely (default)
+    TimeoutDuration time.Duration `json:"timeout_duration"`
+}
+
+type TimeoutAction string
+
+const (
+    TimeoutActionNone   TimeoutAction = "none"   // Wait indefinitely (default)
+    TimeoutActionCancel TimeoutAction = "cancel" // Cancel group on timeout
+    // NOTE: No TimeoutActionSelect - this is intentionally omitted
+)
+
+// ValidatePolicy ensures no auto-select is configured
+func (p *VariantSelectionPolicy) Validate() error {
+    if p.AllowAutoSelect {
+        return fmt.Errorf("POLICY VIOLATION: AllowAutoSelect must be false")
+    }
+    if p.TimeoutAction != TimeoutActionNone && p.TimeoutAction != TimeoutActionCancel {
+        return fmt.Errorf("POLICY VIOLATION: TimeoutAction must be 'none' or 'cancel'")
+    }
+    return nil
+}
+
+// WaitForUserSelection blocks until user selects or cancels
+func (o *Orchestrator) WaitForUserSelection(ctx context.Context, groupID string) (*VariantSelection, error) {
+    group := o.variantGroups[groupID]
+
+    // Validate policy on every wait
+    if err := group.Policy.Validate(); err != nil {
+        return nil, err
+    }
+
+    // Present variants to user (REQUIRED)
+    if err := o.presentVariantsToUser(group); err != nil {
+        return nil, fmt.Errorf("failed to present variants: %w", err)
+    }
+
+    // Block until user decision
+    select {
+    case selection := <-group.SelectionChan:
+        return selection, nil
+    case <-group.CancelChan:
+        return nil, ErrVariantsCancelled
+    case <-time.After(group.Policy.TimeoutDuration):
+        if group.Policy.TimeoutAction == TimeoutActionCancel {
+            o.CancelVariantGroup(groupID)
+            return nil, ErrVariantsTimedOut
+        }
+        // TimeoutActionNone - continue waiting (recursive)
+        return o.WaitForUserSelection(ctx, groupID)
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    }
+}
 ```
 
 ### Status Line Integration

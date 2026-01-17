@@ -2,6 +2,7 @@ package dag
 
 import (
 	"encoding/json"
+	"maps"
 	"sync"
 
 	"github.com/google/uuid"
@@ -38,13 +39,13 @@ type DAG struct {
 
 // dagSnapshot is used for serialization
 type dagSnapshot struct {
-	ID             string            `json:"id"`
-	Name           string            `json:"name"`
-	Description    string            `json:"description"`
-	Nodes          []NodeConfig      `json:"nodes"`
-	Policy         ExecutionPolicy   `json:"policy"`
-	ExecutionOrder [][]string        `json:"execution_order"`
-	Metadata       map[string]any    `json:"metadata"`
+	ID             string          `json:"id"`
+	Name           string          `json:"name"`
+	Description    string          `json:"description"`
+	Nodes          []NodeConfig    `json:"nodes"`
+	Policy         ExecutionPolicy `json:"policy"`
+	ExecutionOrder [][]string      `json:"execution_order"`
+	Metadata       map[string]any  `json:"metadata"`
 }
 
 // NewDAG creates a new DAG

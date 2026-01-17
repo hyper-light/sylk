@@ -61,7 +61,7 @@ func (h *ResourceHandle) Release() {
 type CrossSessionPool struct {
 	config     CrossSessionPoolConfig
 	calculator *FairShareCalculator
-	dispatcher *SignalDispatcher
+	dispatcher *CrossSessionSignalDispatcher
 	registry   *Registry
 
 	mu              sync.RWMutex
@@ -85,7 +85,7 @@ type waiter struct {
 func NewCrossSessionPool(
 	cfg CrossSessionPoolConfig,
 	calculator *FairShareCalculator,
-	dispatcher *SignalDispatcher,
+	dispatcher *CrossSessionSignalDispatcher,
 	registry *Registry,
 ) *CrossSessionPool {
 	cfg = normalizeCrossSessionPoolConfig(cfg)

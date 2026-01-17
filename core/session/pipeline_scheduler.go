@@ -27,7 +27,7 @@ const (
 type PipelineSchedulerConfig struct {
 	MaxConcurrent    int
 	FairShare        *FairShareCalculator
-	SignalDispatcher *SignalDispatcher
+	SignalDispatcher *CrossSessionSignalDispatcher
 }
 
 type GlobalPipelineScheduler struct {
@@ -38,7 +38,7 @@ type GlobalPipelineScheduler struct {
 	sessionQueued map[string]*concurrency.PipelinePriorityQueue
 
 	fairShare        *FairShareCalculator
-	signalDispatcher *SignalDispatcher
+	signalDispatcher *CrossSessionSignalDispatcher
 
 	mu     sync.Mutex
 	closed bool

@@ -3,7 +3,6 @@ package resources
 import (
 	"context"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/adalundhe/sylk/core/signal"
@@ -86,12 +85,12 @@ func normalizeFileTimeout(timeout time.Duration) time.Duration {
 }
 
 func calculateFileLimit(usagePercent float64) int {
-	var rlimit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err != nil {
+	limitValue, err := getFileRlimit()
+	if err != nil {
 		return 256
 	}
 
-	limit := int(float64(rlimit.Cur) * usagePercent)
+	limit := int(float64(limitValue) * usagePercent)
 	if limit < 10 {
 		return 10
 	}

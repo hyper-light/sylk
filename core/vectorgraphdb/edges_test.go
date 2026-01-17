@@ -17,12 +17,11 @@ func TestEdgeStoreInsertAndGet(t *testing.T) {
 	ns.InsertNode(node2, []float32{0, 1, 0})
 
 	edge := &GraphEdge{
-		ID:         "edge1",
-		FromNodeID: "node1",
-		ToNodeID:   "node2",
-		EdgeType:   EdgeTypeDefines,
-		Weight:     0.9,
-		Metadata:   map[string]any{"line": 42},
+		SourceID: "node1",
+		TargetID: "node2",
+		EdgeType: EdgeTypeDefines,
+		Weight:   0.9,
+		Metadata: map[string]any{"line": 42},
 	}
 
 	err := es.InsertEdge(edge)
@@ -30,16 +29,16 @@ func TestEdgeStoreInsertAndGet(t *testing.T) {
 		t.Fatalf("InsertEdge: %v", err)
 	}
 
-	retrieved, err := es.GetEdge("edge1")
+	retrieved, err := es.GetEdge(edge.ID)
 	if err != nil {
 		t.Fatalf("GetEdge: %v", err)
 	}
 
 	if retrieved.ID != edge.ID {
-		t.Errorf("ID = %s, want %s", retrieved.ID, edge.ID)
+		t.Errorf("ID = %d, want %d", retrieved.ID, edge.ID)
 	}
-	if retrieved.FromNodeID != edge.FromNodeID {
-		t.Errorf("FromNodeID = %s, want %s", retrieved.FromNodeID, edge.FromNodeID)
+	if retrieved.SourceID != edge.SourceID {
+		t.Errorf("SourceID = %s, want %s", retrieved.SourceID, edge.SourceID)
 	}
 	if retrieved.EdgeType != edge.EdgeType {
 		t.Errorf("EdgeType = %s, want %s", retrieved.EdgeType, edge.EdgeType)
@@ -60,9 +59,9 @@ func TestEdgeStoreInsertAutoID(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0, 1, 0})
 
 	edge := &GraphEdge{
-		FromNodeID: "n1",
-		ToNodeID:   "n2",
-		EdgeType:   EdgeTypeCalls,
+		SourceID: "n1",
+		TargetID: "n2",
+		EdgeType: EdgeTypeCalls,
 	}
 
 	err := es.InsertEdge(edge)
@@ -70,7 +69,7 @@ func TestEdgeStoreInsertAutoID(t *testing.T) {
 		t.Fatalf("InsertEdge: %v", err)
 	}
 
-	if edge.ID == "" {
+	if edge.ID == 0 {
 		t.Error("Auto-generated ID should not be empty")
 	}
 }
@@ -82,9 +81,9 @@ func TestEdgeStoreInsertInvalidEdgeType(t *testing.T) {
 	es := NewEdgeStore(db)
 
 	edge := &GraphEdge{
-		FromNodeID: "n1",
-		ToNodeID:   "n2",
-		EdgeType:   EdgeType("invalid"),
+		SourceID: "n1",
+		TargetID: "n2",
+		EdgeType: EdgeType(-1),
 	}
 
 	err := es.InsertEdge(edge)
@@ -103,9 +102,9 @@ func TestEdgeStoreInsertMissingFromNode(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0, 1, 0})
 
 	edge := &GraphEdge{
-		FromNodeID: "nonexistent",
-		ToNodeID:   "n2",
-		EdgeType:   EdgeTypeCalls,
+		SourceID: "nonexistent",
+		TargetID: "n2",
+		EdgeType: EdgeTypeCalls,
 	}
 
 	err := es.InsertEdge(edge)
@@ -124,9 +123,9 @@ func TestEdgeStoreInsertMissingToNode(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0, 0})
 
 	edge := &GraphEdge{
-		FromNodeID: "n1",
-		ToNodeID:   "nonexistent",
-		EdgeType:   EdgeTypeCalls,
+		SourceID: "n1",
+		TargetID: "nonexistent",
+		EdgeType: EdgeTypeCalls,
 	}
 
 	err := es.InsertEdge(edge)
@@ -143,12 +142,12 @@ func TestEdgeStoreInsertValidCrossDomain(t *testing.T) {
 	es := NewEdgeStore(db)
 
 	ns.InsertNode(&GraphNode{ID: "code1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0, 0})
-	ns.InsertNode(&GraphNode{ID: "academic1", Domain: DomainAcademic, NodeType: NodeTypeDoc}, []float32{0, 1, 0})
+	ns.InsertNode(&GraphNode{ID: "academic1", Domain: DomainAcademic, NodeType: NodeTypeDocumentation}, []float32{0, 1, 0})
 
 	edge := &GraphEdge{
-		FromNodeID: "code1",
-		ToNodeID:   "academic1",
-		EdgeType:   EdgeTypeReferences,
+		SourceID: "code1",
+		TargetID: "academic1",
+		EdgeType: EdgeTypeReferences,
 	}
 
 	err := es.InsertEdge(edge)
@@ -165,12 +164,12 @@ func TestEdgeStoreInsertInvalidCrossDomain(t *testing.T) {
 	es := NewEdgeStore(db)
 
 	ns.InsertNode(&GraphNode{ID: "code1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0, 0})
-	ns.InsertNode(&GraphNode{ID: "academic1", Domain: DomainAcademic, NodeType: NodeTypeDoc}, []float32{0, 1, 0})
+	ns.InsertNode(&GraphNode{ID: "academic1", Domain: DomainAcademic, NodeType: NodeTypeDocumentation}, []float32{0, 1, 0})
 
 	edge := &GraphEdge{
-		FromNodeID: "code1",
-		ToNodeID:   "academic1",
-		EdgeType:   EdgeTypeCalls,
+		SourceID: "code1",
+		TargetID: "academic1",
+		EdgeType: EdgeTypeCalls,
 	}
 
 	err := es.InsertEdge(edge)
@@ -185,7 +184,7 @@ func TestEdgeStoreGetNotFound(t *testing.T) {
 
 	es := NewEdgeStore(db)
 
-	_, err := es.GetEdge("nonexistent")
+	_, err := es.GetEdge(0)
 	if err != ErrEdgeNotFound {
 		t.Errorf("GetEdge: got %v, want ErrEdgeNotFound", err)
 	}
@@ -201,9 +200,9 @@ func TestEdgeStoreGetEdgesBetween(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0, 0})
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 1, 0})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeDefines})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e3", FromNodeID: "n2", ToNodeID: "n1", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeDefines})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n2", TargetID: "n1", EdgeType: EdgeTypeCalls})
 
 	edges, err := es.GetEdgesBetween("n1", "n2")
 	if err != nil {
@@ -225,9 +224,9 @@ func TestEdgeStoreGetOutgoingEdges(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 1, 0})
 	ns.InsertNode(&GraphNode{ID: "n3", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 0, 1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeDefines})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "n1", ToNodeID: "n3", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e3", FromNodeID: "n2", ToNodeID: "n3", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeDefines})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n3", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n2", TargetID: "n3", EdgeType: EdgeTypeCalls})
 
 	edges, err := es.GetOutgoingEdges("n1")
 	if err != nil {
@@ -249,8 +248,8 @@ func TestEdgeStoreGetOutgoingEdgesFiltered(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 1, 0})
 	ns.InsertNode(&GraphNode{ID: "n3", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 0, 1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeDefines})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "n1", ToNodeID: "n3", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeDefines})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n3", EdgeType: EdgeTypeCalls})
 
 	edges, err := es.GetOutgoingEdges("n1", EdgeTypeDefines)
 	if err != nil {
@@ -275,8 +274,8 @@ func TestEdgeStoreGetIncomingEdges(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 1, 0})
 	ns.InsertNode(&GraphNode{ID: "n3", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 0, 1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n3", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "n2", ToNodeID: "n3", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n3", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n2", TargetID: "n3", EdgeType: EdgeTypeCalls})
 
 	edges, err := es.GetIncomingEdges("n3")
 	if err != nil {
@@ -298,8 +297,8 @@ func TestEdgeStoreGetIncomingEdgesFiltered(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0, 1, 0})
 	ns.InsertNode(&GraphNode{ID: "n3", Domain: DomainCode, NodeType: NodeTypeFunction}, []float32{0, 0, 1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n3", EdgeType: EdgeTypeDefines})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "n2", ToNodeID: "n3", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n3", EdgeType: EdgeTypeDefines})
+	es.InsertEdge(&GraphEdge{SourceID: "n2", TargetID: "n3", EdgeType: EdgeTypeCalls})
 
 	edges, err := es.GetIncomingEdges("n3", EdgeTypeDefines)
 	if err != nil {
@@ -320,14 +319,15 @@ func TestEdgeStoreDeleteEdge(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0, 0})
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0, 1, 0})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeCalls})
+	edge := &GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeCalls}
+	es.InsertEdge(edge)
 
-	err := es.DeleteEdge("e1")
+	err := es.DeleteEdge(edge.ID)
 	if err != nil {
 		t.Fatalf("DeleteEdge: %v", err)
 	}
 
-	_, err = es.GetEdge("e1")
+	_, err = es.GetEdge(edge.ID)
 	if err != ErrEdgeNotFound {
 		t.Error("Edge still exists after delete")
 	}
@@ -339,7 +339,7 @@ func TestEdgeStoreDeleteEdgeNotFound(t *testing.T) {
 
 	es := NewEdgeStore(db)
 
-	err := es.DeleteEdge("nonexistent")
+	err := es.DeleteEdge(0)
 	if err != ErrEdgeNotFound {
 		t.Errorf("DeleteEdge: got %v, want ErrEdgeNotFound", err)
 	}
@@ -355,8 +355,8 @@ func TestEdgeStoreDeleteEdgesBetween(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0, 0})
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0, 1, 0})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeDefines})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeDefines})
 
 	err := es.DeleteEdgesBetween("n1", "n2")
 	if err != nil {
@@ -379,11 +379,12 @@ func TestEdgeStoreCascadeDelete(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "n1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0, 0})
 	ns.InsertNode(&GraphNode{ID: "n2", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0, 1, 0})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "n1", ToNodeID: "n2", EdgeType: EdgeTypeCalls})
+	edge := &GraphEdge{SourceID: "n1", TargetID: "n2", EdgeType: EdgeTypeCalls}
+	es.InsertEdge(edge)
 
 	ns.DeleteNode("n1")
 
-	_, err := es.GetEdge("e1")
+	_, err := es.GetEdge(edge.ID)
 	if err != ErrEdgeNotFound {
 		t.Error("Edge should be cascade deleted when node is deleted")
 	}

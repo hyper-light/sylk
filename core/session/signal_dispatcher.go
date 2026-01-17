@@ -23,13 +23,13 @@ const (
 	signalFileSuffix     = ".signal"
 )
 
-type SignalDispatcherConfig struct {
+type CrossSessionSignalDispatcherConfig struct {
 	BaseDir   string
 	SessionID string
 }
 
-type SignalDispatcher struct {
-	config    SignalDispatcherConfig
+type CrossSessionSignalDispatcher struct {
+	config    CrossSessionSignalDispatcherConfig
 	sessionID string
 	signalDir string
 
@@ -44,7 +44,7 @@ type SignalDispatcher struct {
 	doneChan chan struct{}
 }
 
-func NewSignalDispatcher(cfg SignalDispatcherConfig) (*SignalDispatcher, error) {
+func NewCrossSessionSignalDispatcher(cfg CrossSessionSignalDispatcherConfig) (*CrossSessionSignalDispatcher, error) {
 	cfg = normalizeDispatcherConfig(cfg)
 
 	sessionDir := filepath.Join(cfg.BaseDir, cfg.SessionID)
@@ -57,7 +57,7 @@ func NewSignalDispatcher(cfg SignalDispatcherConfig) (*SignalDispatcher, error) 
 		return nil, fmt.Errorf("failed to create watcher: %w", err)
 	}
 
-	return &SignalDispatcher{
+	return &CrossSessionSignalDispatcher{
 		config:    cfg,
 		sessionID: cfg.SessionID,
 		signalDir: sessionDir,
@@ -68,21 +68,21 @@ func NewSignalDispatcher(cfg SignalDispatcherConfig) (*SignalDispatcher, error) 
 	}, nil
 }
 
-func normalizeDispatcherConfig(cfg SignalDispatcherConfig) SignalDispatcherConfig {
+func normalizeDispatcherConfig(cfg CrossSessionSignalDispatcherConfig) CrossSessionSignalDispatcherConfig {
 	if cfg.BaseDir == "" {
 		cfg.BaseDir = filepath.Join(os.Getenv("HOME"), DefaultSignalBaseDir)
 	}
 	return cfg
 }
 
-func (d *SignalDispatcher) RegisterHandler(signalType SignalType, handler SignalHandler) {
+func (d *CrossSessionSignalDispatcher) RegisterHandler(signalType SignalType, handler SignalHandler) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	d.handlers[signalType] = append(d.handlers[signalType], handler)
 }
 
-func (d *SignalDispatcher) Watch(ctx context.Context) error {
+func (d *CrossSessionSignalDispatcher) Watch(ctx context.Context) error {
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
@@ -103,7 +103,7 @@ func (d *SignalDispatcher) Watch(ctx context.Context) error {
 	return nil
 }
 
-func (d *SignalDispatcher) watchLoop(ctx context.Context) {
+func (d *CrossSessionSignalDispatcher) watchLoop(ctx context.Context) {
 	defer close(d.doneChan)
 
 	done := d.mergeStopChannels(ctx)
@@ -114,7 +114,7 @@ func (d *SignalDispatcher) watchLoop(ctx context.Context) {
 	}
 }
 
-func (d *SignalDispatcher) mergeStopChannels(ctx context.Context) <-chan struct{} {
+func (d *CrossSessionSignalDispatcher) mergeStopChannels(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -126,7 +126,7 @@ func (d *SignalDispatcher) mergeStopChannels(ctx context.Context) <-chan struct{
 	return done
 }
 
-func (d *SignalDispatcher) processNextEvent(done <-chan struct{}) bool {
+func (d *CrossSessionSignalDispatcher) processNextEvent(done <-chan struct{}) bool {
 	select {
 	case <-done:
 		return true
@@ -137,7 +137,7 @@ func (d *SignalDispatcher) processNextEvent(done <-chan struct{}) bool {
 	}
 }
 
-func (d *SignalDispatcher) onWatcherEvent(event fsnotify.Event, ok bool) bool {
+func (d *CrossSessionSignalDispatcher) onWatcherEvent(event fsnotify.Event, ok bool) bool {
 	if !ok {
 		return true
 	}
@@ -145,7 +145,7 @@ func (d *SignalDispatcher) onWatcherEvent(event fsnotify.Event, ok bool) bool {
 	return false
 }
 
-func (d *SignalDispatcher) handleWatchEvent(event fsnotify.Event) {
+func (d *CrossSessionSignalDispatcher) handleWatchEvent(event fsnotify.Event) {
 	if event.Op&fsnotify.Create == 0 {
 		return
 	}
@@ -159,7 +159,7 @@ func isSignalFile(path string) bool {
 	return filepath.Ext(path) == signalFileSuffix
 }
 
-func (d *SignalDispatcher) processSignalFile(path string) {
+func (d *CrossSessionSignalDispatcher) processSignalFile(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -175,7 +175,7 @@ func (d *SignalDispatcher) processSignalFile(path string) {
 	d.dispatchSignal(signal)
 }
 
-func (d *SignalDispatcher) dispatchSignal(signal CrossSessionSignal) {
+func (d *CrossSessionSignalDispatcher) dispatchSignal(signal CrossSessionSignal) {
 	d.mu.RLock()
 	handlers := d.handlers[signal.Type]
 	d.mu.RUnlock()
@@ -185,7 +185,7 @@ func (d *SignalDispatcher) dispatchSignal(signal CrossSessionSignal) {
 	}
 }
 
-func (d *SignalDispatcher) SendSignal(signal CrossSessionSignal) error {
+func (d *CrossSessionSignalDispatcher) SendSignal(signal CrossSessionSignal) error {
 	d.mu.RLock()
 	if d.closed {
 		d.mu.RUnlock()
@@ -204,12 +204,12 @@ func (d *SignalDispatcher) SendSignal(signal CrossSessionSignal) error {
 	return d.sendBroadcast(signal)
 }
 
-func (d *SignalDispatcher) sendTargeted(signal CrossSessionSignal) error {
+func (d *CrossSessionSignalDispatcher) sendTargeted(signal CrossSessionSignal) error {
 	targetDir := filepath.Join(d.config.BaseDir, signal.ToSession)
 	return d.writeSignalFile(targetDir, signal)
 }
 
-func (d *SignalDispatcher) sendBroadcast(signal CrossSessionSignal) error {
+func (d *CrossSessionSignalDispatcher) sendBroadcast(signal CrossSessionSignal) error {
 	entries, err := os.ReadDir(d.config.BaseDir)
 	if err != nil {
 		return fmt.Errorf("failed to read signal base dir: %w", err)
@@ -222,7 +222,7 @@ func (d *SignalDispatcher) sendBroadcast(signal CrossSessionSignal) error {
 	return nil
 }
 
-func (d *SignalDispatcher) sendToEntryIfValid(entry os.DirEntry, signal CrossSessionSignal) {
+func (d *CrossSessionSignalDispatcher) sendToEntryIfValid(entry os.DirEntry, signal CrossSessionSignal) {
 	if !entry.IsDir() || entry.Name() == d.sessionID {
 		return
 	}
@@ -230,7 +230,7 @@ func (d *SignalDispatcher) sendToEntryIfValid(entry os.DirEntry, signal CrossSes
 	d.writeSignalFile(targetDir, signal)
 }
 
-func (d *SignalDispatcher) writeSignalFile(targetDir string, signal CrossSessionSignal) error {
+func (d *CrossSessionSignalDispatcher) writeSignalFile(targetDir string, signal CrossSessionSignal) error {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return err
 	}
@@ -246,11 +246,11 @@ func (d *SignalDispatcher) writeSignalFile(targetDir string, signal CrossSession
 	return os.WriteFile(path, data, 0644)
 }
 
-func (d *SignalDispatcher) generateSignalFilename(signal CrossSessionSignal) string {
+func (d *CrossSessionSignalDispatcher) generateSignalFilename(signal CrossSessionSignal) string {
 	return fmt.Sprintf("%s-%d%s", signal.Type, signal.Timestamp.UnixNano(), signalFileSuffix)
 }
 
-func (d *SignalDispatcher) Close() error {
+func (d *CrossSessionSignalDispatcher) Close() error {
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
@@ -270,14 +270,14 @@ func (d *SignalDispatcher) Close() error {
 	return d.watcher.Close()
 }
 
-func (d *SignalDispatcher) cleanupSignalDir() {
+func (d *CrossSessionSignalDispatcher) cleanupSignalDir() {
 	os.RemoveAll(d.signalDir)
 }
 
-func (d *SignalDispatcher) SessionID() string {
+func (d *CrossSessionSignalDispatcher) SessionID() string {
 	return d.sessionID
 }
 
-func (d *SignalDispatcher) SignalDir() string {
+func (d *CrossSessionSignalDispatcher) SignalDir() string {
 	return d.signalDir
 }

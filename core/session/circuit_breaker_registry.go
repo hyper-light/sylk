@@ -66,13 +66,13 @@ func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
 
 type CircuitBreakerRegistryConfig struct {
 	DBDir            string
-	SignalDispatcher *SignalDispatcher
+	SignalDispatcher *CrossSessionSignalDispatcher
 	DefaultConfig    CircuitBreakerConfig
 }
 
 type GlobalCircuitBreakerRegistry struct {
 	db               *sql.DB
-	signalDispatcher *SignalDispatcher
+	signalDispatcher *CrossSessionSignalDispatcher
 	defaultConfig    CircuitBreakerConfig
 
 	localCache map[string]*CircuitBreakerState

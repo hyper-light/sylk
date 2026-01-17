@@ -15,7 +15,7 @@ func TestQueryEngineHybridQuery(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.5, 0.5, 0.5})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
 	mock.setResults([]HNSWSearchResult{
@@ -89,7 +89,7 @@ func TestQueryEngineQueryByContext(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "A", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
 	mock.setResults([]HNSWSearchResult{
@@ -122,7 +122,7 @@ func TestQueryEngineSemanticExpand(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "A", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
 	mock.addVector("A", []float32{1, 0.1, 0.1})
@@ -174,7 +174,7 @@ func TestQueryEngineRelatedInDomain(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "A", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
 	mock.addVector("A", []float32{1, 0.1, 0.1})
@@ -325,7 +325,7 @@ func TestQueryEngineHybridScoring(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "A", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
 	mock.setResults([]HNSWSearchResult{

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -54,13 +55,13 @@ type UsageStatus struct {
 type GlobalSubscriptionTrackerConfig struct {
 	DBPath           string
 	Config           SubscriptionConfig
-	SignalDispatcher *SignalDispatcher
+	SignalDispatcher *CrossSessionSignalDispatcher
 }
 
 type GlobalSubscriptionTracker struct {
 	db               *sql.DB
 	config           SubscriptionConfig
-	signalDispatcher *SignalDispatcher
+	signalDispatcher *CrossSessionSignalDispatcher
 
 	mu           sync.RWMutex
 	closed       bool
@@ -311,7 +312,11 @@ func (t *GlobalSubscriptionTracker) isTokensOverLimit(usage *UsageStatus, limit 
 }
 
 func (t *GlobalSubscriptionTracker) isOverThreshold(usage *UsageStatus, limit *SubscriptionLimit, threshold float64) bool {
-	return t.isRequestsOverThreshold(usage, limit, threshold) || t.isTokensOverThreshold(usage, limit, threshold)
+	checks := []bool{
+		t.isRequestsOverThreshold(usage, limit, threshold),
+		t.isTokensOverThreshold(usage, limit, threshold),
+	}
+	return slices.Contains(checks, true)
 }
 
 func (t *GlobalSubscriptionTracker) isRequestsOverThreshold(usage *UsageStatus, limit *SubscriptionLimit, threshold float64) bool {

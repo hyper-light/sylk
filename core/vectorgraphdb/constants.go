@@ -3,7 +3,7 @@ package vectorgraphdb
 import "time"
 
 const (
-	SchemaVersion = 1
+	SchemaVersion = 2
 
 	DefaultM           = 16
 	DefaultEfConstruct = 200
@@ -27,19 +27,18 @@ const (
 	DefaultCacheTTL          = 5 * time.Minute
 )
 
-var ValidSourceTypes = []string{
-	SourceTypeGit,
-	SourceTypeUser,
-	SourceTypeLLM,
-	SourceTypeWeb,
-	SourceTypeAPI,
+var ValidSourceTypes = []SourceType{
+	SourceTypeCode,
+	SourceTypeHistory,
+	SourceTypeAcademic,
+	SourceTypeLLMInference,
+	SourceTypeUserProvided,
 }
 
-var ValidConflictTypes = []string{
-	ConflictTypeSemanticContradiction,
-	ConflictTypeVersionMismatch,
-	ConflictTypeDuplicate,
-	ConflictTypeStale,
+var ValidConflictTypes = []ConflictType{
+	ConflictTypeTemporal,
+	ConflictTypeSourceMismatch,
+	ConflictTypeSemantic,
 }
 
 type CrossDomainEdgeRule struct {
@@ -51,9 +50,14 @@ type CrossDomainEdgeRule struct {
 var CrossDomainEdgeRules = []CrossDomainEdgeRule{
 	{EdgeTypeReferences, DomainCode, DomainAcademic},
 	{EdgeTypeReferences, DomainAcademic, DomainCode},
-	{EdgeTypeAppliesTo, DomainAcademic, DomainCode},
+	{EdgeTypeBasedOn, DomainHistory, DomainAcademic},
 	{EdgeTypeDocuments, DomainAcademic, DomainCode},
 	{EdgeTypeModified, DomainHistory, DomainCode},
+	{EdgeTypeCreated, DomainHistory, DomainCode},
+	{EdgeTypeDeleted, DomainHistory, DomainCode},
+	{EdgeTypeValidatedBy, DomainHistory, DomainAcademic},
+	{EdgeTypeUsesLibrary, DomainCode, DomainAcademic},
+	{EdgeTypeImplementsPattern, DomainCode, DomainAcademic},
 }
 
 func IsValidCrossDomainEdge(edgeType EdgeType, fromDomain, toDomain Domain) bool {
@@ -65,7 +69,7 @@ func IsValidCrossDomainEdge(edgeType EdgeType, fromDomain, toDomain Domain) bool
 	return false
 }
 
-func IsValidSourceType(sourceType string) bool {
+func IsValidSourceType(sourceType SourceType) bool {
 	for _, valid := range ValidSourceTypes {
 		if sourceType == valid {
 			return true
@@ -74,7 +78,7 @@ func IsValidSourceType(sourceType string) bool {
 	return false
 }
 
-func IsValidConflictType(conflictType string) bool {
+func IsValidConflictType(conflictType ConflictType) bool {
 	for _, valid := range ValidConflictTypes {
 		if conflictType == valid {
 			return true

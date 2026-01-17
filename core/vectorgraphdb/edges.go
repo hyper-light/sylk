@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 var (
@@ -34,9 +32,6 @@ func (es *EdgeStore) InsertEdge(edge *GraphEdge) error {
 		return err
 	}
 
-	if edge.ID == "" {
-		edge.ID = uuid.New().String()
-	}
 	edge.CreatedAt = time.Now()
 
 	return es.insertEdgeRow(edge)
@@ -50,12 +45,12 @@ func (es *EdgeStore) validateEdge(edge *GraphEdge) error {
 }
 
 func (es *EdgeStore) validateEndpoints(edge *GraphEdge) error {
-	fromDomain, err := es.getNodeDomain(edge.FromNodeID)
+	fromDomain, err := es.getNodeDomain(edge.SourceID)
 	if err != nil {
 		return fmt.Errorf("from node: %w", ErrEdgeEndpointMissing)
 	}
 
-	toDomain, err := es.getNodeDomain(edge.ToNodeID)
+	toDomain, err := es.getNodeDomain(edge.TargetID)
 	if err != nil {
 		return fmt.Errorf("to node: %w", ErrEdgeEndpointMissing)
 	}
@@ -67,15 +62,15 @@ func (es *EdgeStore) validateEndpoints(edge *GraphEdge) error {
 }
 
 func (es *EdgeStore) getNodeDomain(nodeID string) (Domain, error) {
-	var domain string
+	var domain Domain
 	err := es.db.db.QueryRow("SELECT domain FROM nodes WHERE id = ?", nodeID).Scan(&domain)
 	if err == sql.ErrNoRows {
-		return "", ErrEdgeEndpointMissing
+		return 0, ErrEdgeEndpointMissing
 	}
 	if err != nil {
-		return "", err
+		return 0, err
 	}
-	return Domain(domain), nil
+	return domain, nil
 }
 
 func (es *EdgeStore) validateCrossDomainEdge(edgeType EdgeType, from, to Domain) error {
@@ -87,20 +82,25 @@ func (es *EdgeStore) validateCrossDomainEdge(edgeType EdgeType, from, to Domain)
 
 func (es *EdgeStore) insertEdgeRow(edge *GraphEdge) error {
 	metadata, _ := json.Marshal(edge.Metadata)
-	_, err := es.db.db.Exec(`
-		INSERT INTO edges (id, from_node_id, to_node_id, edge_type, weight, metadata, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, edge.ID, edge.FromNodeID, edge.ToNodeID, edge.EdgeType, edge.Weight,
+	result, err := es.db.db.Exec(`
+		INSERT INTO edges (source_id, target_id, edge_type, weight, metadata, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, edge.SourceID, edge.TargetID, edge.EdgeType, edge.Weight,
 		string(metadata), edge.CreatedAt.Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("insert edge: %w", err)
 	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("fetch edge id: %w", err)
+	}
+	edge.ID = id
 	return nil
 }
 
-func (es *EdgeStore) GetEdge(id string) (*GraphEdge, error) {
+func (es *EdgeStore) GetEdge(id int64) (*GraphEdge, error) {
 	row := es.db.db.QueryRow(`
-		SELECT id, from_node_id, to_node_id, edge_type, weight, metadata, created_at
+		SELECT id, source_id, target_id, edge_type, weight, metadata, created_at
 		FROM edges WHERE id = ?
 	`, id)
 	return es.scanEdge(row)
@@ -110,7 +110,7 @@ func (es *EdgeStore) scanEdge(row *sql.Row) (*GraphEdge, error) {
 	var edge GraphEdge
 	var metadataJSON, createdAt string
 
-	err := row.Scan(&edge.ID, &edge.FromNodeID, &edge.ToNodeID, &edge.EdgeType,
+	err := row.Scan(&edge.ID, &edge.SourceID, &edge.TargetID, &edge.EdgeType,
 		&edge.Weight, &metadataJSON, &createdAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrEdgeNotFound
@@ -132,8 +132,8 @@ func (es *EdgeStore) parseEdge(edge *GraphEdge, metadataJSON, createdAt string) 
 
 func (es *EdgeStore) GetEdgesBetween(fromID, toID string) ([]*GraphEdge, error) {
 	rows, err := es.db.db.Query(`
-		SELECT id, from_node_id, to_node_id, edge_type, weight, metadata, created_at
-		FROM edges WHERE from_node_id = ? AND to_node_id = ?
+		SELECT id, source_id, target_id, edge_type, weight, metadata, created_at
+		FROM edges WHERE source_id = ? AND target_id = ?
 	`, fromID, toID)
 	if err != nil {
 		return nil, fmt.Errorf("query edges: %w", err)
@@ -159,7 +159,7 @@ func (es *EdgeStore) scanEdgeRow(rows *sql.Rows) (*GraphEdge, error) {
 	var edge GraphEdge
 	var metadataJSON, createdAt string
 
-	err := rows.Scan(&edge.ID, &edge.FromNodeID, &edge.ToNodeID, &edge.EdgeType,
+	err := rows.Scan(&edge.ID, &edge.SourceID, &edge.TargetID, &edge.EdgeType,
 		&edge.Weight, &metadataJSON, &createdAt)
 	if err != nil {
 		return nil, fmt.Errorf("scan edge row: %w", err)
@@ -177,8 +177,8 @@ func (es *EdgeStore) GetOutgoingEdges(nodeID string, edgeTypes ...EdgeType) ([]*
 
 func (es *EdgeStore) getOutgoingEdgesAll(nodeID string) ([]*GraphEdge, error) {
 	rows, err := es.db.db.Query(`
-		SELECT id, from_node_id, to_node_id, edge_type, weight, metadata, created_at
-		FROM edges WHERE from_node_id = ?
+		SELECT id, source_id, target_id, edge_type, weight, metadata, created_at
+		FROM edges WHERE source_id = ?
 	`, nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("query edges: %w", err)
@@ -190,8 +190,8 @@ func (es *EdgeStore) getOutgoingEdgesAll(nodeID string) ([]*GraphEdge, error) {
 
 func (es *EdgeStore) getOutgoingEdgesFiltered(nodeID string, edgeTypes []EdgeType) ([]*GraphEdge, error) {
 	query := `
-		SELECT id, from_node_id, to_node_id, edge_type, weight, metadata, created_at
-		FROM edges WHERE from_node_id = ? AND edge_type IN (`
+		SELECT id, source_id, target_id, edge_type, weight, metadata, created_at
+		FROM edges WHERE source_id = ? AND edge_type IN (`
 	args := make([]any, 0, len(edgeTypes)+1)
 	args = append(args, nodeID)
 
@@ -222,8 +222,8 @@ func (es *EdgeStore) GetIncomingEdges(nodeID string, edgeTypes ...EdgeType) ([]*
 
 func (es *EdgeStore) getIncomingEdgesAll(nodeID string) ([]*GraphEdge, error) {
 	rows, err := es.db.db.Query(`
-		SELECT id, from_node_id, to_node_id, edge_type, weight, metadata, created_at
-		FROM edges WHERE to_node_id = ?
+		SELECT id, source_id, target_id, edge_type, weight, metadata, created_at
+		FROM edges WHERE target_id = ?
 	`, nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("query edges: %w", err)
@@ -235,8 +235,8 @@ func (es *EdgeStore) getIncomingEdgesAll(nodeID string) ([]*GraphEdge, error) {
 
 func (es *EdgeStore) getIncomingEdgesFiltered(nodeID string, edgeTypes []EdgeType) ([]*GraphEdge, error) {
 	query := `
-		SELECT id, from_node_id, to_node_id, edge_type, weight, metadata, created_at
-		FROM edges WHERE to_node_id = ? AND edge_type IN (`
+		SELECT id, source_id, target_id, edge_type, weight, metadata, created_at
+		FROM edges WHERE target_id = ? AND edge_type IN (`
 	args := make([]any, 0, len(edgeTypes)+1)
 	args = append(args, nodeID)
 
@@ -258,7 +258,7 @@ func (es *EdgeStore) getIncomingEdgesFiltered(nodeID string, edgeTypes []EdgeTyp
 	return es.scanEdges(rows)
 }
 
-func (es *EdgeStore) DeleteEdge(id string) error {
+func (es *EdgeStore) DeleteEdge(id int64) error {
 	result, err := es.db.db.Exec("DELETE FROM edges WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("delete edge: %w", err)
@@ -272,7 +272,7 @@ func (es *EdgeStore) DeleteEdge(id string) error {
 }
 
 func (es *EdgeStore) DeleteEdgesBetween(fromID, toID string) error {
-	_, err := es.db.db.Exec("DELETE FROM edges WHERE from_node_id = ? AND to_node_id = ?", fromID, toID)
+	_, err := es.db.db.Exec("DELETE FROM edges WHERE source_id = ? AND target_id = ?", fromID, toID)
 	if err != nil {
 		return fmt.Errorf("delete edges: %w", err)
 	}

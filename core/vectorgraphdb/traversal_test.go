@@ -16,8 +16,8 @@ func TestGraphTraverserGetNeighbors(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "A", ToNodeID: "C", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "C", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	neighbors, err := gt.GetNeighbors("A", nil)
@@ -41,8 +41,8 @@ func TestGraphTraverserGetNeighborsOutgoing(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "C", ToNodeID: "A", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "C", TargetID: "A", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	neighbors, err := gt.GetNeighbors("A", &TraversalOptions{Direction: DirectionOutgoing})
@@ -69,8 +69,8 @@ func TestGraphTraverserGetNeighborsIncoming(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "C", ToNodeID: "A", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "C", TargetID: "A", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	neighbors, err := gt.GetNeighbors("A", &TraversalOptions{Direction: DirectionIncoming})
@@ -97,8 +97,8 @@ func TestGraphTraverserGetNeighborsFilterByEdgeType(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypePackage}, []float32{3, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "A", ToNodeID: "C", EdgeType: EdgeTypeImports})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "C", EdgeType: EdgeTypeImports})
 
 	gt := NewGraphTraverser(db)
 	neighbors, err := gt.GetNeighbors("A", &TraversalOptions{
@@ -125,8 +125,8 @@ func TestGraphTraverserShortestPath(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "B", ToNodeID: "C", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "B", TargetID: "C", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	p, err := gt.ShortestPath("A", "C", nil)
@@ -170,9 +170,9 @@ func TestGraphTraverserShortestPathMaxDepth(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "D", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{4, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "B", ToNodeID: "C", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e3", FromNodeID: "C", ToNodeID: "D", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "B", TargetID: "C", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "C", TargetID: "D", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	_, err := gt.ShortestPath("A", "D", &TraversalOptions{MaxDepth: 2})
@@ -193,8 +193,8 @@ func TestGraphTraverserGetConnectedComponent(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "D", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{4, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "B", ToNodeID: "C", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "B", TargetID: "C", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	component, err := gt.GetConnectedComponent("A", nil)
@@ -218,8 +218,8 @@ func TestGraphTraverserGetSubgraph(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "B", ToNodeID: "C", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "B", TargetID: "C", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	subgraph, err := gt.GetSubgraph("A", 2)
@@ -246,8 +246,8 @@ func TestGraphTraverserGetSubgraphLimitedDepth(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{3, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
-	es.InsertEdge(&GraphEdge{ID: "e2", FromNodeID: "B", ToNodeID: "C", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "B", TargetID: "C", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	subgraph, err := gt.GetSubgraph("A", 1)
@@ -277,10 +277,9 @@ func TestGraphTraverserConcurrent(t *testing.T) {
 
 	for i := 0; i < 9; i++ {
 		es.InsertEdge(&GraphEdge{
-			ID:         "e" + nodeID(i),
-			FromNodeID: nodeID(i),
-			ToNodeID:   nodeID(i + 1),
-			EdgeType:   EdgeTypeCalls,
+			SourceID: nodeID(i),
+			TargetID: nodeID(i + 1),
+			EdgeType: EdgeTypeCalls,
 		})
 	}
 
@@ -336,7 +335,7 @@ func TestGraphTraverserDirectPath(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "A", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{2, 0.1, 0.1})
 
-	es.InsertEdge(&GraphEdge{ID: "e1", FromNodeID: "A", ToNodeID: "B", EdgeType: EdgeTypeCalls})
+	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	gt := NewGraphTraverser(db)
 	p, err := gt.ShortestPath("A", "B", nil)

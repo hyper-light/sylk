@@ -404,18 +404,22 @@ func (d *ConflictDetector) ScanForConflicts(ctx context.Context, domain vectorgr
 	}
 
 	ns := vectorgraphdb.NewNodeStore(d.db, nil)
-	nodes, err := ns.GetNodesByType(domain, "", 1000)
-	if err != nil {
-		return nil, err
+	allTypes := vectorgraphdb.ValidNodeTypesForDomain(domain)
+	var nodes []*vectorgraphdb.GraphNode
+	for _, nodeType := range allTypes {
+		batch, err := ns.GetNodesByType(domain, nodeType, 1000)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, batch...)
 	}
-
 	return d.crossCheckNodes(ctx, nodes)
 }
 
 func (d *ConflictDetector) crossCheckNodes(ctx context.Context, nodes []*vectorgraphdb.GraphNode) ([]*Conflict, error) {
 	conflicts := make([]*Conflict, 0)
 
-	for i := 0; i < len(nodes); i++ {
+	for i := range nodes {
 		if err := ctx.Err(); err != nil {
 			return conflicts, err
 		}
@@ -426,8 +430,8 @@ func (d *ConflictDetector) crossCheckNodes(ctx context.Context, nodes []*vectorg
 }
 
 func (d *ConflictDetector) checkAgainstRemaining(nodes []*vectorgraphdb.GraphNode, i int, conflicts *[]*Conflict) {
-	for j := i + 1; j < len(nodes); j++ {
-		if conflict := d.detectConflict(nodes[i], nodes[j], 0.9); conflict != nil {
+	for _, node := range nodes[i+1:] {
+		if conflict := d.detectConflict(nodes[i], node, 0.9); conflict != nil {
 			*conflicts = append(*conflicts, conflict)
 			d.storeConflict(conflict)
 		}
