@@ -16050,6 +16050,44 @@ architect_skills_core := []Skill{
         Keywords:    []string{"approve", "review", "confirm"},
         Priority:    90,
     },
+    // File & Search Operations (required for planning context)
+    {
+        Name:        "read_file",
+        Description: "Read file contents to understand code before planning",
+        Domain:      "files",
+        Keywords:    []string{"read", "view", "show", "cat", "contents"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "start_line", Type: "integer", Required: false},
+            {Name: "end_line", Type: "integer", Required: false},
+        },
+    },
+    {
+        Name:        "glob",
+        Description: "Find files matching a glob pattern",
+        Domain:      "files",
+        Keywords:    []string{"find files", "glob", "pattern", "match files"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Glob pattern (e.g., '**/*.go', 'src/**/*.ts')"},
+            {Name: "path", Type: "string", Required: false, Description: "Base directory to search from"},
+        },
+    },
+    {
+        Name:        "grep",
+        Description: "Search file contents for pattern/text",
+        Domain:      "files",
+        Keywords:    []string{"search", "grep", "find text", "search content"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Search pattern (regex supported)"},
+            {Name: "path", Type: "string", Required: false, Description: "File or directory to search"},
+            {Name: "include", Type: "string", Required: false, Description: "File pattern to include (e.g., '*.go')"},
+            {Name: "ignore_case", Type: "boolean", Required: false},
+            {Name: "context_lines", Type: "integer", Required: false, Description: "Lines of context around matches"},
+        },
+    },
 }
 
 // Contextual Skills (Tier 2)
@@ -16187,6 +16225,191 @@ architect_skills_predelegation := []Skill{
         Priority:    100,
         Required:    true, // Cannot plan without this
     },
+}
+
+// Pre-Delegation Validation Hook (Enforces mandatory consultation)
+// This hook runs BEFORE any task dispatch and blocks if requirements not met
+type PreDelegationHook struct {
+    // RequiredConsultations lists knowledge agents that MUST be consulted
+    RequiredConsultations []string // ["librarian", "archivalist"]
+
+    // MinimumConsultationAge is the max staleness of consultation results
+    MinimumConsultationAge time.Duration // e.g., 5 minutes
+
+    // ValidationFunc is called before dispatch; returns error to block
+    ValidationFunc func(ctx context.Context, declaration *PreDelegationDeclaration) error
+}
+
+// PreDelegationDeclaration captures the formal declaration for audit
+type PreDelegationDeclaration struct {
+    DeclarationID     string    `json:"declaration_id"`
+    Timestamp         time.Time `json:"timestamp"`
+    TargetAgent       string    `json:"target_agent"`
+    TaskID            string    `json:"task_id"`
+
+    // Evidence of consultation (REQUIRED)
+    LibrarianConsultation  *ConsultationEvidence `json:"librarian_consultation"`
+    ArchivalistConsultation *ConsultationEvidence `json:"archivalist_consultation"`
+    AcademicConsultation    *ConsultationEvidence `json:"academic_consultation,omitempty"`
+
+    // Planning rationale (REQUIRED)
+    Reasoning         string   `json:"reasoning"`
+    RequiredSkills    []string `json:"required_skills"`
+    ExpectedOutcome   string   `json:"expected_outcome"`
+    FailureCriteria   string   `json:"failure_criteria"`
+
+    // Codebase context from Librarian (REQUIRED)
+    CodebaseHealth    *CodebaseHealthReport `json:"codebase_health"`
+
+    // Historical context from Archivalist (REQUIRED)
+    FailurePatterns   []FailurePattern `json:"failure_patterns"`
+    ApproachStatistics *ApproachStats  `json:"approach_statistics"`
+}
+
+// ConsultationEvidence proves an agent was consulted
+type ConsultationEvidence struct {
+    Agent       string    `json:"agent"`
+    QueryID     string    `json:"query_id"`
+    Timestamp   time.Time `json:"timestamp"`
+    Question    string    `json:"question"`
+    ResponseID  string    `json:"response_id"`
+    Stale       bool      `json:"stale"` // True if older than MinimumConsultationAge
+}
+
+// ValidatePreDelegation enforces mandatory consultation before dispatch
+func ValidatePreDelegation(ctx context.Context, decl *PreDelegationDeclaration) error {
+    // Check Librarian consultation
+    if decl.LibrarianConsultation == nil {
+        return fmt.Errorf("BLOCKED: Librarian consultation required before delegation")
+    }
+    if decl.LibrarianConsultation.Stale {
+        return fmt.Errorf("BLOCKED: Librarian consultation is stale (>5 min), re-consult required")
+    }
+
+    // Check Archivalist consultation
+    if decl.ArchivalistConsultation == nil {
+        return fmt.Errorf("BLOCKED: Archivalist consultation required before delegation")
+    }
+    if decl.ArchivalistConsultation.Stale {
+        return fmt.Errorf("BLOCKED: Archivalist consultation is stale (>5 min), re-consult required")
+    }
+
+    // Check codebase health
+    if decl.CodebaseHealth == nil {
+        return fmt.Errorf("BLOCKED: Codebase health assessment required before delegation")
+    }
+
+    // Check for known failure patterns
+    if len(decl.FailurePatterns) > 0 {
+        for _, fp := range decl.FailurePatterns {
+            if fp.RecurrenceCount >= 2 {
+                return fmt.Errorf("BLOCKED: Similar approach failed %d times before. Pattern: %s. Consider alternative.",
+                    fp.RecurrenceCount, fp.Description)
+            }
+        }
+    }
+
+    return nil
+}
+
+// AST-based Search Skills (Tier 2 - Structural Code Analysis)
+// Uses ast-grep CLI (https://ast-grep.github.io/) for AST-aware pattern matching
+architect_skills_ast := []Skill{
+    {
+        Name:        "ast_grep_search",
+        Description: "Search code using ast-grep CLI for AST-aware structural pattern matching",
+        Domain:      "ast",
+        Keywords:    []string{"ast", "structure", "pattern", "find all", "refactor"},
+        LoadTrigger: "pattern|structure|all occurrences|find all",
+        // CLI: ast-grep run -p <pattern> -l <lang> --json compact [paths...]
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern with meta-variables: $VAR (single node), $$$ (variadic)"},
+            {Name: "lang", Type: "enum", Required: true, Values: []string{"go", "typescript", "python", "rust", "java", "javascript"}},
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}},
+            {Name: "globs", Type: "array", Required: false, Description: "File patterns (prefix '!' to exclude)"},
+        },
+    },
+}
+
+// LSP Integration Skills (Tier 2 - Language Server Protocol)
+architect_skills_lsp := []Skill{
+    {
+        Name:        "lsp_go_to_definition",
+        Description: "Navigate to symbol definition using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"definition", "go to", "where defined"},
+        LoadTrigger: "definition|where is|source of",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_find_references",
+        Description: "Find all references to a symbol using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"references", "usages", "callers", "used by"},
+        LoadTrigger: "references|usages|who uses",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_hover",
+        Description: "Get type information and documentation for symbol",
+        Domain:      "lsp",
+        Keywords:    []string{"type", "docs", "signature"},
+        LoadTrigger: "what type|signature",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_symbols",
+        Description: "Get all symbols in file or workspace",
+        Domain:      "lsp",
+        Keywords:    []string{"symbols", "outline", "structure"},
+        LoadTrigger: "symbols|outline|structure",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: false, Description: "File path or empty for workspace"},
+            {Name: "query", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "lsp_call_hierarchy",
+        Description: "Get call hierarchy (incoming/outgoing calls) for a function",
+        Domain:      "lsp",
+        Keywords:    []string{"calls", "hierarchy", "callers", "callees"},
+        LoadTrigger: "who calls|calls what|call hierarchy",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+            {Name: "direction", Type: "enum", Values: []string{"incoming", "outgoing", "both"}, Required: true},
+        },
+    },
+}
+
+// Git Skills (Tier 2 - Read-Only for Context Gathering)
+architect_skills_git := []Skill{
+    {Name: "git_status", Description: "View repository status", Domain: "git_read", LoadTrigger: "status|changes|modified"},
+    {Name: "git_diff", Description: "View uncommitted changes", Domain: "git_read", LoadTrigger: "diff|changes|what changed"},
+    {Name: "git_log", Description: "View commit history", Domain: "git_read", LoadTrigger: "history|commits|log",
+        Parameters: []Param{
+            {Name: "count", Type: "int", Required: false, Default: 10},
+            {Name: "path", Type: "string", Required: false},
+        },
+    },
+    {Name: "git_show", Description: "Show commit details", Domain: "git_read", LoadTrigger: "commit details|show commit"},
+    {Name: "git_blame", Description: "Show line-by-line last modification info", Domain: "git_read", LoadTrigger: "blame|who changed|last modified"},
+    {Name: "git_ls_files", Description: "List tracked files", Domain: "git_read", LoadTrigger: "tracked files|list files"},
+    {Name: "git_branch_list", Description: "List all branches", Domain: "git_read", LoadTrigger: "branches"},
+    {Name: "git_fetch", Description: "Fetch updates without modifying working tree", Domain: "git_remote", LoadTrigger: "fetch|update remote"},
 }
 ```
 
@@ -16453,7 +16676,16 @@ BEFORE STARTING WORK:
 2. Break down the work into discrete steps/todos
 3. COUNT the steps required
 
-IF MORE THAN 12 TODOS ARE REQUIRED:
+TASK COUNT LIMIT OVERRIDE:
+If the task/prompt originates from INSPECTOR or TESTER (check source_agent field):
+- The 12-todo limit DOES NOT APPLY
+- Execute the full scope of work regardless of step count
+- This enables complete fix/remediation flows and test-driven corrections
+
+Rationale: Inspector-originated tasks are fix requests that must be completed atomically.
+Tester-originated tasks are test failure fixes that require full resolution.
+
+IF MORE THAN 12 TODOS ARE REQUIRED (and source_agent is NOT inspector/tester):
 - DO NOT start the implementation
 - Submit request to Architect to further decompose the work
 - Include your breakdown showing why the task is too large
@@ -16505,7 +16737,7 @@ WHEN TO CONSULT:
 
 ## Implementation Protocol
 
-1. SCOPE CHECK: Count required steps. If >12, request Architect decomposition.
+1. SCOPE CHECK: Count required steps. If >12 AND source_agent is not inspector/tester, request Architect decomposition.
 2. CONSULT LIBRARIAN: Understand existing code affected by changes
 3. REVIEW CRITERIA: Study implementation and acceptance criteria in task
 4. CONSULT ACADEMIC: If unclear on optimal approach, ask before implementing
@@ -16518,7 +16750,8 @@ WHEN TO CONSULT:
 
 CRITICAL:
 - Exhaust knowledge agents BEFORE requesting help from user
-- If task requires >12 steps, STOP and request Architect to break it down
+- If task requires >12 steps AND source_agent is not inspector/tester, STOP and request Architect to break it down
+- Tasks from inspector or tester bypass the step limit - execute fully
 - NEVER sacrifice correctness for speed
 - ALWAYS prefer existing patterns over novel implementations
 `
@@ -16570,6 +16803,32 @@ engineer_skills_core := []Skill{
         Domain:      "coordination",
         Keywords:    []string{"help", "unclear", "confused", "question"},
         Priority:    80,
+    },
+    // Search Operations (for locating code to modify)
+    {
+        Name:        "glob",
+        Description: "Find files matching a glob pattern",
+        Domain:      "files",
+        Keywords:    []string{"find files", "glob", "pattern", "match files"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Glob pattern (e.g., '**/*.go', 'src/**/*.ts')"},
+            {Name: "path", Type: "string", Required: false, Description: "Base directory to search from"},
+        },
+    },
+    {
+        Name:        "grep",
+        Description: "Search file contents for pattern/text",
+        Domain:      "files",
+        Keywords:    []string{"search", "grep", "find text", "search content"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Search pattern (regex supported)"},
+            {Name: "path", Type: "string", Required: false, Description: "File or directory to search"},
+            {Name: "include", Type: "string", Required: false, Description: "File pattern to include (e.g., '*.go')"},
+            {Name: "ignore_case", Type: "boolean", Required: false},
+            {Name: "context_lines", Type: "integer", Required: false, Description: "Lines of context around matches"},
+        },
     },
 }
 
@@ -16720,6 +16979,227 @@ engineer_skills_multiedit := []Skill{
             {Name: "timeout", Type: "duration", Required: false},
         },
     },
+    // Pipeline Context & Artifact Discovery
+    {
+        Name:        "read_pipeline_context",
+        Description: "Read artifacts and context from completed predecessor tasks in pipeline",
+        Domain:      "pipeline",
+        Keywords:    []string{"pipeline", "context", "artifacts", "predecessor", "designer output"},
+        LoadTrigger: "pipeline|predecessor|designer|artifacts|context",
+        Parameters: []Param{
+            {Name: "pipeline_id", Type: "string", Required: false, Description: "Current pipeline ID (defaults to active)"},
+            {Name: "predecessor_agent", Type: "enum", Values: []string{"designer", "engineer", "any"}, Required: false, Default: "any"},
+            {Name: "artifact_type", Type: "enum", Values: []string{"component", "type", "hook", "style", "all"}, Required: false, Default: "all"},
+        },
+        Returns: schema.Object{
+            "artifacts":    schema.Array("List of artifacts from predecessors"),
+            "types":        schema.Array("Type definitions emitted by predecessors"),
+            "hooks":        schema.Array("Hooks/callbacks defined by predecessors"),
+            "dependencies": schema.Array("Dependencies installed by predecessors"),
+            "context":      schema.Object{"summary": schema.String(), "decisions": schema.Array()},
+        },
+    },
+    {
+        Name:        "discover_artifacts",
+        Description: "Discover all artifacts produced in current workflow by any agent",
+        Domain:      "pipeline",
+        Keywords:    []string{"artifacts", "discover", "workflow", "produced", "created"},
+        LoadTrigger: "discover|artifacts|what was created|what exists",
+        Parameters: []Param{
+            {Name: "workflow_id", Type: "string", Required: false, Description: "Defaults to current workflow"},
+            {Name: "agent_filter", Type: "array", Required: false, Description: "Filter by producing agent(s)"},
+            {Name: "type_filter", Type: "array", Required: false, Description: "Filter by artifact type(s)"},
+        },
+        Returns: schema.Object{
+            "artifacts": schema.Array("All matching artifacts with metadata"),
+            "by_agent":  schema.Object{"designer": schema.Array(), "engineer": schema.Array()},
+            "by_type":   schema.Object{"component": schema.Array(), "type": schema.Array(), "hook": schema.Array()},
+        },
+    },
+}
+
+// AST-based Search Skills (Tier 2 - Structural Code Analysis)
+// Uses ast-grep CLI (https://ast-grep.github.io/) for AST-aware pattern matching
+engineer_skills_ast := []Skill{
+    {
+        Name:        "ast_grep_search",
+        Description: "Search code using ast-grep CLI for AST-aware structural pattern matching",
+        Domain:      "ast",
+        Keywords:    []string{"ast", "structure", "pattern", "find all"},
+        LoadTrigger: "pattern|structure|all occurrences|find all",
+        // CLI: ast-grep run -p <pattern> -l <lang> --json compact [paths...]
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern with meta-variables: $VAR (single node), $$$ (variadic)"},
+            {Name: "lang", Type: "enum", Required: true, Values: []string{"go", "typescript", "python", "rust", "java", "javascript"}},
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}},
+            {Name: "globs", Type: "array", Required: false},
+        },
+    },
+    // Note: ast_grep_replace already defined in engineer_skills_contextual
+}
+
+// LSP Integration Skills (Tier 2 - Language Server Protocol)
+engineer_skills_lsp := []Skill{
+    {
+        Name:        "lsp_go_to_definition",
+        Description: "Navigate to symbol definition using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"definition", "go to", "where defined"},
+        LoadTrigger: "definition|where is|source of",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_find_references",
+        Description: "Find all references to a symbol using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"references", "usages", "callers", "used by"},
+        LoadTrigger: "references|usages|who uses",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_hover",
+        Description: "Get type information and documentation for symbol",
+        Domain:      "lsp",
+        Keywords:    []string{"type", "docs", "signature"},
+        LoadTrigger: "what type|signature",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_symbols",
+        Description: "Get all symbols in file or workspace",
+        Domain:      "lsp",
+        Keywords:    []string{"symbols", "outline", "structure"},
+        LoadTrigger: "symbols|outline|structure",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: false},
+            {Name: "query", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "lsp_call_hierarchy",
+        Description: "Get call hierarchy (incoming/outgoing calls) for a function",
+        Domain:      "lsp",
+        Keywords:    []string{"calls", "hierarchy", "callers", "callees"},
+        LoadTrigger: "who calls|calls what|call hierarchy",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+            {Name: "direction", Type: "enum", Values: []string{"incoming", "outgoing", "both"}, Required: true},
+        },
+    },
+}
+
+// Git Skills (Tier 2 - Read-Only + Write for Implementation)
+engineer_skills_git := []Skill{
+    {Name: "git_status", Description: "View repository status", Domain: "git_read", LoadTrigger: "status|changes|modified"},
+    {Name: "git_diff", Description: "View uncommitted changes", Domain: "git_read", LoadTrigger: "diff|changes|what changed"},
+    {Name: "git_log", Description: "View commit history", Domain: "git_read", LoadTrigger: "history|commits|log",
+        Parameters: []Param{
+            {Name: "count", Type: "int", Required: false, Default: 10},
+            {Name: "path", Type: "string", Required: false},
+        },
+    },
+    {Name: "git_show", Description: "Show commit details", Domain: "git_read", LoadTrigger: "commit details|show commit"},
+    {Name: "git_blame", Description: "Show line-by-line last modification info", Domain: "git_read", LoadTrigger: "blame|who changed|last modified"},
+    {Name: "git_ls_files", Description: "List tracked files", Domain: "git_read", LoadTrigger: "tracked files|list files"},
+    {Name: "git_branch_list", Description: "List all branches", Domain: "git_read", LoadTrigger: "branches"},
+    {Name: "git_fetch", Description: "Fetch updates without modifying working tree", Domain: "git_remote", LoadTrigger: "fetch|update remote"},
+    // WIP Management
+    {
+        Name:        "git_stash",
+        Description: "Stash or restore work-in-progress changes",
+        Domain:      "git_write",
+        LoadTrigger: "stash|save wip|restore wip|switch context",
+        Parameters: []Param{
+            {Name: "action", Type: "enum", Required: true, Values: []string{"push", "pop", "list", "show", "drop"}, Description: "Stash action to perform"},
+            {Name: "message", Type: "string", Required: false, Description: "Stash message (for push)"},
+            {Name: "index", Type: "int", Required: false, Default: 0, Description: "Stash index (for pop/show/drop)"},
+            {Name: "include_untracked", Type: "bool", Required: false, Default: false, Description: "Include untracked files (for push)"},
+        },
+    },
+}
+
+// Debugging Skills (Tier 3 - Advanced Diagnostics)
+engineer_skills_debug := []Skill{
+    {
+        Name:        "debug_print",
+        Description: "Add temporary debug print statements to trace execution",
+        Domain:      "debugging",
+        Keywords:    []string{"debug", "print", "trace", "log"},
+        LoadTrigger: "debug|trace|why is|what value",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "expression", Type: "string", Required: true, Description: "Expression to print"},
+            {Name: "label", Type: "string", Required: false, Description: "Label for the debug output"},
+        },
+    },
+    {
+        Name:        "debug_breakpoint",
+        Description: "Set a breakpoint for interactive debugging",
+        Domain:      "debugging",
+        Keywords:    []string{"breakpoint", "pause", "stop"},
+        LoadTrigger: "breakpoint|stop at|pause at",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "condition", Type: "string", Required: false, Description: "Conditional expression for breakpoint"},
+        },
+    },
+    {
+        Name:        "debug_run",
+        Description: "Run program with debugger attached (delve/node-inspect/pdb)",
+        Domain:      "debugging",
+        Keywords:    []string{"debug run", "debugger", "step through"},
+        LoadTrigger: "debug run|step through|debugger",
+        Parameters: []Param{
+            {Name: "command", Type: "string", Required: true, Description: "Command to debug"},
+            {Name: "args", Type: "array", Required: false},
+            {Name: "breakpoints", Type: "array", Required: false, Description: "Initial breakpoints [{file, line}]"},
+            {Name: "env", Type: "object", Required: false, Description: "Environment variables"},
+        },
+    },
+    {
+        Name:        "debug_inspect",
+        Description: "Inspect variable/expression value at runtime",
+        Domain:      "debugging",
+        Keywords:    []string{"inspect", "value", "what is"},
+        LoadTrigger: "inspect|what is value|show value",
+        Parameters: []Param{
+            {Name: "expression", Type: "string", Required: true},
+            {Name: "depth", Type: "int", Required: false, Default: 2, Description: "Object inspection depth"},
+        },
+    },
+    {
+        Name:        "debug_stack",
+        Description: "Show current call stack",
+        Domain:      "debugging",
+        Keywords:    []string{"stack", "backtrace", "call stack"},
+        LoadTrigger: "stack|backtrace|how did we get here",
+    },
+    {
+        Name:        "debug_cleanup",
+        Description: "Remove all debug statements added by debug_print",
+        Domain:      "debugging",
+        Keywords:    []string{"cleanup", "remove debug", "clear debug"},
+        LoadTrigger: "cleanup|remove debug|clear",
+        Parameters: []Param{
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}, Description: "Paths to clean up"},
+        },
+    },
 }
 ```
 
@@ -16843,6 +17323,68 @@ designer_skills_core := []Skill{
             {Name: "component", Type: "string", Required: true},
             {Name: "viewport", Type: "enum", Values: []string{"mobile", "tablet", "desktop"}, Required: false},
             {Name: "theme", Type: "enum", Values: []string{"light", "dark"}, Required: false},
+        },
+    },
+    // File Operations (required for component implementation)
+    {
+        Name:        "read_file",
+        Description: "Read file contents to understand existing components/styles",
+        Domain:      "files",
+        Keywords:    []string{"read", "view", "show", "cat", "contents"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "start_line", Type: "integer", Required: false},
+            {Name: "end_line", Type: "integer", Required: false},
+        },
+    },
+    {
+        Name:        "write_file",
+        Description: "Write component/style file to disk",
+        Domain:      "files",
+        Keywords:    []string{"write", "create", "save"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "content", Type: "string", Required: true},
+        },
+    },
+    {
+        Name:        "edit_file",
+        Description: "Edit existing component/style file",
+        Domain:      "files",
+        Keywords:    []string{"edit", "modify", "change", "update"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "old_string", Type: "string", Required: true},
+            {Name: "new_string", Type: "string", Required: true},
+        },
+    },
+    // Search Operations
+    {
+        Name:        "glob",
+        Description: "Find component/style files matching a pattern",
+        Domain:      "files",
+        Keywords:    []string{"find files", "glob", "pattern", "match files"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Glob pattern (e.g., '**/*.tsx', 'src/components/**/*.css')"},
+            {Name: "path", Type: "string", Required: false, Description: "Base directory to search from"},
+        },
+    },
+    {
+        Name:        "grep",
+        Description: "Search file contents for pattern/text",
+        Domain:      "files",
+        Keywords:    []string{"search", "grep", "find text", "search content"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Search pattern (regex supported)"},
+            {Name: "path", Type: "string", Required: false, Description: "File or directory to search"},
+            {Name: "include", Type: "string", Required: false, Description: "File pattern to include (e.g., '*.tsx')"},
+            {Name: "ignore_case", Type: "boolean", Required: false},
+            {Name: "context_lines", Type: "integer", Required: false, Description: "Lines of context around matches"},
         },
     },
 }
@@ -17116,6 +17658,106 @@ designer_skills_vision := []Skill{
         },
     },
 }
+
+// AST-based Search Skills (Tier 2 - Structural Code Analysis)
+// Uses ast-grep CLI (https://ast-grep.github.io/) for AST-aware pattern matching
+designer_skills_ast := []Skill{
+    {
+        Name:        "ast_grep_search",
+        Description: "Search code using ast-grep CLI for AST-aware structural pattern matching",
+        Domain:      "ast",
+        Keywords:    []string{"ast", "structure", "pattern", "find all", "component"},
+        LoadTrigger: "pattern|structure|all occurrences|find all components",
+        // CLI: ast-grep run -p <pattern> -l <lang> --json compact [paths...]
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern with meta-variables: $VAR (single node), $$$ (variadic)"},
+            {Name: "lang", Type: "enum", Required: true, Values: []string{"typescript", "javascript", "tsx", "css", "html"}},
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}},
+            {Name: "globs", Type: "array", Required: false},
+        },
+    },
+}
+
+// LSP Integration Skills (Tier 2 - Language Server Protocol)
+designer_skills_lsp := []Skill{
+    {
+        Name:        "lsp_go_to_definition",
+        Description: "Navigate to symbol definition using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"definition", "go to", "where defined"},
+        LoadTrigger: "definition|where is|source of",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_find_references",
+        Description: "Find all references to a symbol using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"references", "usages", "used by"},
+        LoadTrigger: "references|usages|who uses",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_hover",
+        Description: "Get type information and documentation for symbol",
+        Domain:      "lsp",
+        Keywords:    []string{"type", "docs", "signature"},
+        LoadTrigger: "what type|signature",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_symbols",
+        Description: "Get all symbols in file or workspace",
+        Domain:      "lsp",
+        Keywords:    []string{"symbols", "outline", "structure"},
+        LoadTrigger: "symbols|outline|structure",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: false},
+            {Name: "query", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "lsp_call_hierarchy",
+        Description: "Get call hierarchy (incoming/outgoing calls) for a function",
+        Domain:      "lsp",
+        Keywords:    []string{"calls", "hierarchy", "callers", "callees"},
+        LoadTrigger: "who calls|calls what|call hierarchy",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+            {Name: "direction", Type: "enum", Values: []string{"incoming", "outgoing", "both"}, Required: true},
+        },
+    },
+}
+
+// Git Skills (Tier 2 - Read-Only for Context)
+designer_skills_git := []Skill{
+    {Name: "git_status", Description: "View repository status", Domain: "git_read", LoadTrigger: "status|changes|modified"},
+    {Name: "git_diff", Description: "View uncommitted changes", Domain: "git_read", LoadTrigger: "diff|changes|what changed"},
+    {Name: "git_log", Description: "View commit history", Domain: "git_read", LoadTrigger: "history|commits|log",
+        Parameters: []Param{
+            {Name: "count", Type: "int", Required: false, Default: 10},
+            {Name: "path", Type: "string", Required: false},
+        },
+    },
+    {Name: "git_show", Description: "Show commit details", Domain: "git_read", LoadTrigger: "commit details|show commit"},
+    {Name: "git_blame", Description: "Show line-by-line last modification info", Domain: "git_read", LoadTrigger: "blame|who changed|last modified"},
+    {Name: "git_ls_files", Description: "List tracked files", Domain: "git_read", LoadTrigger: "tracked files|list files"},
+    {Name: "git_branch_list", Description: "List all branches", Domain: "git_read", LoadTrigger: "branches"},
+    {Name: "git_fetch", Description: "Fetch updates without modifying working tree", Domain: "git_remote", LoadTrigger: "fetch|update remote"},
+}
 ```
 
 #### Vision & Multimodal Protocol
@@ -17174,21 +17816,31 @@ designer_skills_vision := []Skill{
 ### Librarian System Prompt
 
 ```go
-const LibrarianSystemPrompt = `You are the Librarian agent within the Sylk multi-agent system. You are the single source of truth for codebase knowledge, patterns, tooling, and health assessment.
+const LibrarianSystemPrompt = `You are the Librarian agent within the Sylk multi-agent system. You ARE the living codebase - its patterns, structures, and conventions are imprinted into your understanding. You don't just know what exists; you understand WHERE patterns occur, HOW they're used, and can provide concrete implementations instantly.
 
 ## Core Identity
 
 Model: Claude Sonnet 4.5 (optimized for fast code search and navigation)
-Role: Codebase RAG - local knowledge about patterns, file locations, tooling, and health
+Role: Living Codebase - deep, internalized knowledge of patterns, implementations, tooling, and evolution
 User Interaction: DIRECT (triggered by codebase queries)
+
+## Core Philosophy: You ARE The Codebase
+
+You embody the codebase itself. When queried:
+- You don't search for answers - you KNOW them, then VERIFY
+- You provide implementations at the drop of a hat
+- You understand not just WHAT exists but WHERE, HOW OFTEN, and WHY
+- Low confidence triggers immediate deep scanning - never respond uncertain without verification
+- The code is ground truth; Archivalist provides evolution context
 
 ## Core Responsibilities
 
 1. CODEBASE CONTEXT: Provide accurate context about code patterns, file locations, and architecture
 2. TOOL DISCOVERY: Detect and report formatters, linters, LSP servers, and test frameworks
 3. HEALTH ASSESSMENT: Evaluate codebase maturity before implementation tasks
-4. PATTERN DETECTION: Identify coding patterns, conventions, and technical debt
+4. PATTERN DETECTION: Identify coding patterns, conventions, divergences, and technical debt
 5. SYMBOL NAVIGATION: Support go-to-definition, find-references, and call hierarchy queries
+6. IMPLEMENTATION EXAMPLES: Provide concrete code snippets with exact locations instantly
 
 ## You Are The Single Source of Truth For:
 
@@ -17197,11 +17849,47 @@ User Interaction: DIRECT (triggered by codebase queries)
 - Test frameworks and test file patterns
 - Codebase patterns and conventions
 - File locations and structure
+- Implementation examples and their variations
 
 Other agents MUST consult you before:
 - Inspector: Executing formatting or linting
 - Tester: Running tests or discovering test files
 - Engineer/Designer: Understanding existing patterns before implementation
+
+## Query Response Protocol (CRITICAL)
+
+For EVERY query:
+
+1. VECTOR DB FIRST: Always check the vector DB for indexed knowledge
+2. VERIFY AGAINST CODE: Cross-reference vector DB results with actual codebase state
+3. CONSULT ARCHIVALIST: If information quality is insufficient or patterns may have evolved, directly consult Archivalist for recent changes
+4. GROUND TRUTH: Code files are always ground truth - Archivalist provides evolution context
+
+If confidence < 0.8:
+- IMMEDIATELY rescan the relevant codebase areas
+- DO NOT respond with uncertainty - verify first
+- Expand search scope if initial scan is inconclusive
+
+## Response Format: Detailed and Actionable
+
+Every response MUST include:
+- EXACT file paths with line numbers (e.g., core/pool/session_pool.go:142-156)
+- Implementation snippets showing the actual code
+- Pattern frequency: "Used in N locations: [list top 3-5]"
+- Pattern divergences: "Note: core/legacy/ uses older pattern [describe]"
+- Confidence score with basis: "Confidence: 0.95 (verified via AST search, 12 matches)"
+
+Example response format:
+"Pattern: Repository interface
+ Location: core/repository/interface.go:24-45
+ Frequency: 8 implementations across core/, agents/
+ Canonical example:
+   type Repository interface {
+       Get(ctx context.Context, id string) (*Entity, error)
+       Save(ctx context.Context, entity *Entity) error
+   }
+ Implementations: core/repository/memory.go:12, core/repository/postgres.go:18, agents/archivalist/store.go:34
+ Divergence: agents/guide/legacy_repo.go uses older Save() without context - LEGACY pattern, do not propagate"
 
 ## Health Assessment Protocol
 
@@ -17223,7 +17911,41 @@ Classify incoming queries by intent:
 - LOCATE: Find where something is (file, function, struct)
 - PATTERN: Ask about patterns, strategies, conventions
 - EXPLAIN: Understand how something works
+- IMPLEMENT: Need example implementation to follow
+- DIVERGENCE: Ask about pattern variations or inconsistencies
 - GENERAL: Other codebase questions
+
+## Self-Verification Protocol (CRITICAL)
+
+CONSTANTLY verify your own understanding:
+- Before responding, ask: "Is this still true?"
+- Check file modification times against your last scan
+- If responding about area not recently verified: rescan first
+- Track which areas you've verified and when
+- Proactively invalidate stale knowledge
+
+When uncertain:
+1. DO NOT respond with "I think" or "probably"
+2. IMMEDIATELY perform targeted search
+3. If still uncertain after search, expand scope
+4. Only respond when confidence >= 0.8
+
+## Archivalist Integration
+
+Treat Archivalist as your partner for understanding codebase EVOLUTION:
+- Code = what IS (ground truth)
+- Archivalist = what CHANGED and WHY (evolution context)
+
+Consult Archivalist when:
+- Pattern seems inconsistent (may be in transition)
+- Recent changes may have affected area
+- Need context on WHY a pattern exists
+- Historical decision context would help
+
+Do NOT consult Archivalist for:
+- Simple location queries
+- Well-established, consistent patterns
+- Tool detection (use direct scanning)
 
 ## Tool Detection Response Format
 
@@ -17234,31 +17956,61 @@ When detecting tools, respond with structured format:
   "name": "Human Name",
   "command": ["cmd", "args"],
   "confidence": 0.0-1.0,
-  "reason": "Why this was detected"
+  "reason": "Why this was detected",
+  "config_location": "path/to/config",
+  "usage_examples": ["where it's used in codebase"]
 }
 
 ## Communication Style
 
-- Be concise, direct, technical
-- Provide evidence: file paths, line numbers, confidence scores
-- If uncertain, say "I don't know" or "Low confidence"
-- NO status acknowledgments, flattery, or hedging
-- Challenge incorrect assumptions about codebase state
+- Be concise, direct, technical - but COMPLETE
+- ALWAYS provide: file paths, line numbers, code snippets
+- Include pattern frequencies and divergences
+- Confidence scores with verification basis
+- NO hedging - verify and be certain, or say "verifying..."
+- Challenge incorrect assumptions with evidence
 
 ## Critical Constraints
 
 - NEVER guess about codebase structure - search and verify
 - NEVER provide stale information - check modification times
-- ALWAYS include confidence scores for pattern detection
-- ALWAYS validate tool availability before reporting
+- NEVER respond with low confidence without first rescanning
+- ALWAYS include exact code references (path:line)
+- ALWAYS include implementation examples for pattern queries
+- ALWAYS note pattern frequencies and divergences
+- ALWAYS verify against code before responding
 - Cache results appropriately but invalidate on file changes
+
+## YOU DO NOT:
+
+- Respond with uncertainty when you could verify
+- Provide patterns without concrete examples
+- Skip the vector DB check
+- Ignore Archivalist when patterns seem inconsistent
+- Give vague locations ("somewhere in core/") - be exact
+- Assume your cached knowledge is current without verification
 
 ## Available Skills
 
 Tier 1 (Core): search_code, get_context, list_files, get_structure
-Tier 2 (Contextual): analyze_dependencies, detect_patterns, assess_codebase_health, get_test_coverage
-Tier 2 (Enhanced): ast_grep_search, codesearch, LSP integration (go_to_definition, find_references, hover, symbols, call_hierarchy)
+Tier 2 (Contextual): analyze_dependencies, detect_patterns, assess_codebase_health, get_test_coverage, detect_technical_debt
+Tier 2 (AST): ast_grep_search, ast_grep_replace (via ast-grep CLI: ast-grep run -p '<pattern>' --lang <lang>)
+Tier 2 (Enhanced): codesearch, LSP integration (go_to_definition, find_references, hover, symbols, call_hierarchy)
 Tier 2 (Tool Discovery): detect_formatter, list_formatters, detect_linters, list_lsp_servers, detect_test_framework, list_test_frameworks, get_project_tools
+Git (Read-Only): git_status, git_diff, git_log, git_show, git_blame, git_ls_files, git_ls_tree, git_branch_list, git_tag_list, git_fetch, git_checkout_readonly
+Direct Consultation: consult_archivalist (for evolution context)
+
+## Git Integration Protocol
+
+Use git skills to understand codebase evolution:
+- git_diff: See what's changed since last commit (detect active work areas)
+- git_log: Understand recent history and change patterns
+- git_blame: Identify who changed what and when (useful for pattern attribution)
+- git_show: Examine specific commits for context
+
+When to use git vs Archivalist:
+- git: Raw change data, recent uncommitted changes, blame information
+- Archivalist: Interpreted history, decisions context, failure patterns, why changes were made
 `
 ```
 
@@ -17299,6 +18051,19 @@ librarian_skills_core := []Skill{
         Domain:      "code",
         Keywords:    []string{"structure", "overview", "organization"},
         Priority:    80,
+    },
+    // File Operations (for providing code context)
+    {
+        Name:        "read_file",
+        Description: "Read full file contents to provide complete code context",
+        Domain:      "files",
+        Keywords:    []string{"read", "view", "show", "cat", "contents", "file"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "start_line", Type: "integer", Required: false},
+            {Name: "end_line", Type: "integer", Required: false},
+        },
     },
 }
 
@@ -17346,18 +18111,55 @@ librarian_skills_contextual := []Skill{
 }
 
 // Enhanced Search & AST Skills (Tier 2 - Structural Code Analysis)
-// Inspired by oh-my-opencode ast_grep and anomalyco/opencode codesearch
+// Uses ast-grep CLI (https://ast-grep.github.io/) for AST-aware pattern matching
+// CLI: ast-grep run [OPTIONS] --pattern <PATTERN> [PATHS]...
+// Reference: oh-my-opencode/src/tools/ast-grep implementation
 librarian_skills_ast := []Skill{
     {
         Name:        "ast_grep_search",
-        Description: "Search code using AST patterns for structural matching",
+        Description: "Search code using ast-grep CLI for AST-aware structural pattern matching",
         Domain:      "ast",
-        Keywords:    []string{"ast", "structure", "pattern", "syntax", "semantic"},
-        LoadTrigger: "refactor|rename|structure|pattern|all occurrences",
+        Keywords:    []string{"ast", "structure", "pattern", "syntax", "semantic", "refactor"},
+        LoadTrigger: "refactor|rename|structure|pattern|all occurrences|find all",
+        // CLI: ast-grep run -p <pattern> -l <lang> --json=compact [-C <n>] [--globs <glob>] [paths...]
         Parameters: []Param{
-            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern to match (e.g., 'func $NAME($ARGS) $RET { $$$BODY }')"},
-            {Name: "language", Type: "enum", Values: []string{"go", "typescript", "python", "rust", "java", "all"}, Required: false},
-            {Name: "path", Type: "string", Required: false, Description: "Path to search within"},
+            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern. Meta-variables: $VAR (single node, UPPERCASE), $$$ (zero or more nodes), $$$NAME (named variadic), $_VAR (non-capturing). Pattern must be valid parseable code."},
+            {Name: "lang", Type: "enum", Required: true, Values: []string{
+                "bash", "c", "cpp", "csharp", "css", "elixir", "go", "haskell", "html",
+                "java", "javascript", "json", "kotlin", "lua", "nix", "php", "python",
+                "ruby", "rust", "scala", "solidity", "swift", "typescript", "tsx", "yaml",
+            }, Description: "Target language (-l, --lang)"},
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}, Description: "Target directories [PATHS]..."},
+            {Name: "globs", Type: "array", Required: false, Description: "File patterns (--globs). Prefix '!' to exclude. E.g., ['*.go', '!*_test.go']"},
+            {Name: "context_before", Type: "int", Required: false, Description: "Lines before match (-B)"},
+            {Name: "context_after", Type: "int", Required: false, Description: "Lines after match (-A)"},
+            {Name: "context", Type: "int", Required: false, Default: 3, Description: "Lines around match (-C)"},
+            {Name: "strictness", Type: "enum", Required: false, Values: []string{"cst", "smart", "ast", "relaxed", "signature"}, Default: "smart", Description: "Match precision level (--strictness)"},
+            {Name: "selector", Type: "string", Required: false, Description: "CSS-like selector to extract sub-node from pattern match (--selector)"},
+            {Name: "json_format", Type: "enum", Required: false, Values: []string{"pretty", "stream", "compact"}, Default: "compact", Description: "JSON output format (--json)"},
+        },
+    },
+    {
+        Name:        "ast_grep_replace",
+        Description: "Rewrite matched code patterns using ast-grep CLI (preview-only by default for safety)",
+        Domain:      "ast",
+        Keywords:    []string{"rewrite", "replace", "refactor", "rename", "transform"},
+        LoadTrigger: "rewrite|replace|refactor|rename|transform",
+        RequiresExplicit: true, // Safety: requires explicit user request
+        // CLI: ast-grep run -p <pattern> -r <rewrite> -l <lang> [--update-all | -i] [paths...]
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern to match (-p, --pattern)"},
+            {Name: "rewrite", Type: "string", Required: true, Description: "Replacement pattern (-r, --rewrite). Can reference captured $VAR and $$$NAME meta-variables."},
+            {Name: "lang", Type: "enum", Required: true, Values: []string{
+                "bash", "c", "cpp", "csharp", "css", "elixir", "go", "haskell", "html",
+                "java", "javascript", "json", "kotlin", "lua", "nix", "php", "python",
+                "ruby", "rust", "scala", "solidity", "swift", "typescript", "tsx", "yaml",
+            }, Description: "Target language (-l, --lang)"},
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}},
+            {Name: "globs", Type: "array", Required: false, Description: "File patterns (--globs)"},
+            {Name: "strictness", Type: "enum", Required: false, Values: []string{"cst", "smart", "ast", "relaxed", "signature"}, Default: "smart"},
+            {Name: "update_all", Type: "bool", Required: false, Default: false, Description: "Apply all changes automatically (-U, --update-all). Default false = preview only."},
+            {Name: "interactive", Type: "bool", Required: false, Default: false, Description: "Confirm each edit manually (-i, --interactive)"},
         },
     },
     {
@@ -17441,46 +18243,196 @@ librarian_skills_lsp := []Skill{
         },
     },
 }
+
+// Git Skills (Tier 2 - Read-Only for Historical Context)
+librarian_skills_git := []Skill{
+    {
+        Name:        "git_log",
+        Description: "View commit history for understanding code evolution",
+        Domain:      "git_read",
+        LoadTrigger: "history|commits|log|when changed|who changed",
+        Parameters: []Param{
+            {Name: "count", Type: "int", Required: false, Default: 20},
+            {Name: "path", Type: "string", Required: false, Description: "Filter to specific file/directory"},
+            {Name: "since", Type: "string", Required: false, Description: "Date filter (e.g., '2 weeks ago')"},
+            {Name: "author", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "git_blame",
+        Description: "Show line-by-line authorship and modification history",
+        Domain:      "git_read",
+        LoadTrigger: "blame|who wrote|last modified|authorship",
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "start_line", Type: "int", Required: false},
+            {Name: "end_line", Type: "int", Required: false},
+        },
+    },
+    {
+        Name:        "git_show",
+        Description: "Show details of a specific commit",
+        Domain:      "git_read",
+        LoadTrigger: "commit details|show commit|what changed in",
+        Parameters: []Param{
+            {Name: "commit", Type: "string", Required: true, Description: "Commit hash or ref"},
+            {Name: "stat", Type: "bool", Required: false, Default: false, Description: "Show file stats only"},
+        },
+    },
+    {
+        Name:        "git_diff",
+        Description: "Show differences between commits or working tree",
+        Domain:      "git_read",
+        LoadTrigger: "diff|changes|what changed|compare",
+        Parameters: []Param{
+            {Name: "from", Type: "string", Required: false, Description: "Base commit (default: HEAD)"},
+            {Name: "to", Type: "string", Required: false, Description: "Target commit (default: working tree)"},
+            {Name: "path", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "git_branch_list",
+        Description: "List branches with last commit info",
+        Domain:      "git_read",
+        LoadTrigger: "branches|branch list",
+    },
+}
 ```
 
 #### Enhanced Search & AST Protocol
 
-**Librarian uses AST-based search for structural queries and LSP for precise navigation.**
+**Librarian uses ast-grep CLI (https://ast-grep.github.io/) for AST-aware structural pattern matching.**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      ENHANCED SEARCH STRATEGY                                        │
+│                      AST-GREP CLI INTEGRATION                                        │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                     │
-│  SEARCH TYPE SELECTION:                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
-│  │  Query Type              │ Recommended Tool                                  │   │
-│  ├──────────────────────────┼─────────────────────────────────────────────────┤   │
-│  │  "where is X defined"    │ lsp_go_to_definition (if position known)         │   │
-│  │                          │ OR search_code with symbol_type                  │   │
-│  ├──────────────────────────┼─────────────────────────────────────────────────┤   │
-│  │  "who uses X"            │ lsp_find_references (precise)                    │   │
-│  │                          │ OR codesearch for broader context                │   │
-│  ├──────────────────────────┼─────────────────────────────────────────────────┤   │
-│  │  "all functions that..." │ ast_grep_search with pattern                     │   │
-│  ├──────────────────────────┼─────────────────────────────────────────────────┤   │
-│  │  "how does X work"       │ codesearch + lsp_call_hierarchy                  │   │
-│  ├──────────────────────────┼─────────────────────────────────────────────────┤   │
-│  │  "rename X to Y"         │ lsp_find_references (to find all occurrences)    │   │
-│  │                          │ + ast_grep_search (to verify structural match)  │   │
-│  └──────────────────────────┴─────────────────────────────────────────────────┘   │
+│  CLI SYNTAX:                                                                        │
+│  ast-grep run [OPTIONS] --pattern <PATTERN> [PATHS]...                              │
 │                                                                                     │
-│  AST PATTERN EXAMPLES:                                                              │
-│  ├── Go: "func $NAME($ARGS) error { $$$ }" - Find all error-returning functions   │
-│  ├── Go: "if err != nil { return err }" - Find basic error handling              │
-│  ├── TS: "async function $NAME($$$) { $$$ }" - Find async functions               │
-│  └── Python: "def $NAME(self, $$$): $$$" - Find instance methods                  │
+│  SEARCH:                                                                            │
+│  ast-grep run -p '<pattern>' -l <lang> --json compact [paths...]                    │
 │                                                                                     │
-│  LSP FALLBACK:                                                                      │
-│  If LSP not available for language, fall back to:                                  │
-│  1. ast_grep_search for structural queries                                         │
-│  2. search_code with regex for text queries                                        │
-│  3. codesearch for semantic queries                                                │
+│  REPLACE (preview):                                                                 │
+│  ast-grep run -p '<pattern>' -r '<rewrite>' -l <lang> [paths...]                    │
+│                                                                                     │
+│  REPLACE (apply):                                                                   │
+│  ast-grep run -p '<pattern>' -r '<rewrite>' -l <lang> -U [paths...]                 │
+│                                                                                     │
+│  ESSENTIAL FLAGS:                                                                   │
+│  ├── -p, --pattern <PAT>  - AST pattern to match (required)                        │
+│  ├── -r, --rewrite <PAT>  - Replacement pattern (for transforms)                   │
+│  ├── -l, --lang <LANG>    - Target language (required)                             │
+│  ├── -U, --update-all     - Apply all replacements (without = preview only)        │
+│  ├── -i, --interactive    - Confirm each edit manually                             │
+│  ├── --json <FMT>         - Output format: pretty | stream | compact               │
+│  ├── --globs <PAT>        - File patterns (prefix '!' to exclude)                  │
+│  ├── --strictness <LVL>   - Match precision: cst|smart|ast|relaxed|signature       │
+│  ├── --selector <SEL>     - CSS-like selector to extract sub-node                  │
+│  ├── -A <N>               - Show N lines after match                               │
+│  ├── -B <N>               - Show N lines before match                              │
+│  └── -C <N>               - Show N lines around match (context)                    │
+│                                                                                     │
+│  SUPPORTED LANGUAGES (25):                                                          │
+│  bash, c, cpp, csharp, css, elixir, go, haskell, html, java, javascript, json,     │
+│  kotlin, lua, nix, php, python, ruby, rust, scala, solidity, swift, typescript,    │
+│  tsx, yaml                                                                          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      META-VARIABLE SYNTAX                                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PATTERN RULES:                                                                     │
+│  - Pattern must be valid, parseable code for the target language                   │
+│  - Meta-variable names: UPPERCASE letters, underscores, digits only                │
+│                                                                                     │
+│  SINGLE NODE:                                                                       │
+│  $VAR            - Matches exactly one AST node, captures as "VAR"                 │
+│  $_              - Matches one node, does not capture (wildcard)                   │
+│  $_VAR           - Matches one node, non-capturing (underscore prefix)             │
+│                                                                                     │
+│  MULTIPLE NODES:                                                                    │
+│  $$$             - Matches zero or more nodes (variadic, anonymous)                │
+│  $$$ARGS         - Matches zero or more nodes, captures as "ARGS"                  │
+│                                                                                     │
+│  REWRITE RULES:                                                                     │
+│  - Reference captured variables: $VAR, $$$ARGS in rewrite pattern                  │
+│  - Same variable name = must match same content (e.g., $A == $A)                   │
+│                                                                                     │
+│  EXAMPLES:                                                                          │
+│  console.log($MSG)           - Matches log with exactly 1 argument                 │
+│  console.log($$$ARGS)        - Matches log with any number of arguments            │
+│  func $NAME($$$) error       - Matches any Go function returning error             │
+│  $A == $A                    - Matches self-equality (a == a, not a == b)          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      AST-GREP PATTERN EXAMPLES                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  GO:                                                                                │
+│  ast-grep run -p 'func $NAME($$$) error' -l go                                     │
+│    → Functions returning error                                                      │
+│  ast-grep run -p 'if err != nil { return $$$REST }' -l go                          │
+│    → Error handling blocks                                                          │
+│  ast-grep run -p 'func ($R $T) $NAME($$$) $$$' -l go                               │
+│    → All methods on any receiver                                                    │
+│                                                                                     │
+│  TYPESCRIPT:                                                                        │
+│  ast-grep run -p 'async function $NAME($$$) { $$$ }' -l typescript                 │
+│    → Async function declarations                                                    │
+│  ast-grep run -p 'await $EXPR' -l typescript                                       │
+│    → All await expressions                                                          │
+│  ast-grep run -p 'interface $NAME { $$$ }' -l typescript                           │
+│    → Interface definitions                                                          │
+│                                                                                     │
+│  PYTHON:                                                                            │
+│  ast-grep run -p 'def $NAME(self, $$$)' -l python                                  │
+│    → Instance methods (NOTE: no trailing colon in pattern!)                        │
+│  ast-grep run -p '@$DEC' -l python                                                 │
+│    → Decorated definitions                                                          │
+│                                                                                     │
+│  REPLACE:                                                                           │
+│  ast-grep run -p 'fmt.Println($MSG)' -r 'log.Info($MSG)' -l go                     │
+│    → Println → structured logging (preview)                                        │
+│  ast-grep run -p 'fmt.Println($MSG)' -r 'log.Info($MSG)' -l go -U                  │
+│    → Same but apply changes                                                         │
+│                                                                                     │
+│  PATTERN GOTCHAS:                                                                   │
+│  - Python: Don't include trailing colon (def foo():  →  def foo())                 │
+│  - Whitespace: Generally ignored, but match structure matters                      │
+│  - Strict mode: Use --strictness cst for exact whitespace matching                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      SEARCH TOOL SELECTION GUIDE                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  QUERY TYPE                    │ RECOMMENDED APPROACH                               │
+│  ─────────────────────────────┼─────────────────────────────────────────────────── │
+│  "where is X defined"         │ lsp_go_to_definition (precise)                     │
+│                               │ OR search_code with symbol_type                    │
+│  ─────────────────────────────┼─────────────────────────────────────────────────── │
+│  "who uses X"                 │ lsp_find_references (all usages)                   │
+│                               │ OR ast_grep_search for structural usage            │
+│  ─────────────────────────────┼─────────────────────────────────────────────────── │
+│  "all functions that..."      │ ast_grep_search (structural pattern)               │
+│  ─────────────────────────────┼─────────────────────────────────────────────────── │
+│  "refactor X to Y"            │ ast_grep_replace (preview first, then -U)          │
+│  ─────────────────────────────┼─────────────────────────────────────────────────── │
+│  "find error handling"        │ ast_grep_search: 'if err != nil { $$$ }'           │
+│  ─────────────────────────────┼─────────────────────────────────────────────────── │
+│  "how does X work"            │ codesearch + lsp_call_hierarchy                    │
+│                                                                                     │
+│  FALLBACK STRATEGY:                                                                 │
+│  If LSP not available → ast_grep_search for structural queries                     │
+│  If ast-grep not available → search_code with regex patterns                       │
+│  For semantic queries → codesearch (embedding-based)                               │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -18661,6 +19613,57 @@ inspector_skills_core := []Skill{
         Keywords:    []string{"issues", "problems", "corrections"},
         Priority:    90,
     },
+    // File & Search Operations (required for code validation)
+    {
+        Name:        "read_file",
+        Description: "Read file contents for validation",
+        Domain:      "files",
+        Keywords:    []string{"read", "view", "show", "cat", "contents"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "start_line", Type: "integer", Required: false},
+            {Name: "end_line", Type: "integer", Required: false},
+        },
+    },
+    {
+        Name:        "glob",
+        Description: "Find files matching a glob pattern for validation",
+        Domain:      "files",
+        Keywords:    []string{"find files", "glob", "pattern", "match files"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Glob pattern (e.g., '**/*.go', 'src/**/*.ts')"},
+            {Name: "path", Type: "string", Required: false, Description: "Base directory to search from"},
+        },
+    },
+    {
+        Name:        "grep",
+        Description: "Search file contents for patterns/anti-patterns",
+        Domain:      "files",
+        Keywords:    []string{"search", "grep", "find text", "search content"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Search pattern (regex supported)"},
+            {Name: "path", Type: "string", Required: false, Description: "File or directory to search"},
+            {Name: "include", Type: "string", Required: false, Description: "File pattern to include (e.g., '*.go')"},
+            {Name: "ignore_case", Type: "boolean", Required: false},
+            {Name: "context_lines", Type: "integer", Required: false, Description: "Lines of context around matches"},
+        },
+    },
+    // Command Execution (for linters, formatters, security scanners)
+    {
+        Name:        "run_command",
+        Description: "Execute validation tools (linters, formatters, security scanners)",
+        Domain:      "execution",
+        Keywords:    []string{"run", "execute", "lint", "format", "scan"},
+        Priority:    90,
+        Parameters: []Param{
+            {Name: "command", Type: "string", Required: true},
+            {Name: "timeout", Type: "integer", Required: false, Default: 60},
+            {Name: "working_dir", Type: "string", Required: false},
+        },
+    },
 }
 
 // Contextual Skills (Tier 2)
@@ -18678,6 +19681,42 @@ inspector_skills_contextual := []Skill{
         Domain:      "validation",
         Keywords:    []string{"explain", "why", "what's wrong"},
         LoadTrigger: "explain|why|what",
+    },
+    // Auto-fix Capabilities (for fixable issues)
+    {
+        Name:        "auto_fix",
+        Description: "Automatically fix detected issues (formatting, imports, simple lint fixes)",
+        Domain:      "remediation",
+        Keywords:    []string{"fix", "auto fix", "correct", "repair"},
+        LoadTrigger: "fix|auto|correct|repair",
+        Parameters: []Param{
+            {Name: "issue_type", Type: "enum", Required: true, Values: []string{"formatting", "imports", "lint", "all"}, Description: "Type of issues to auto-fix"},
+            {Name: "paths", Type: "array", Required: true, Description: "Files or directories to fix"},
+            {Name: "dry_run", Type: "bool", Required: false, Default: true, Description: "Preview changes without applying"},
+        },
+    },
+    {
+        Name:        "format_file",
+        Description: "Format file using detected/configured formatter",
+        Domain:      "remediation",
+        Keywords:    []string{"format", "prettier", "gofmt", "black"},
+        LoadTrigger: "format|style|indent",
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true, Description: "File to format"},
+            {Name: "formatter", Type: "string", Required: false, Description: "Specific formatter (auto-detected if not specified)"},
+            {Name: "write", Type: "bool", Required: false, Default: false, Description: "Write changes to file (false = diff output)"},
+        },
+    },
+    {
+        Name:        "organize_imports",
+        Description: "Organize and sort imports in source file",
+        Domain:      "remediation",
+        Keywords:    []string{"imports", "organize", "sort imports"},
+        LoadTrigger: "import|organize|sort",
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "write", Type: "bool", Required: false, Default: false},
+        },
     },
 }
 
@@ -18748,6 +19787,20 @@ inspector_skills_consultation := []Skill{
             {Name: "time_range", Type: "string", Required: false, Description: "e.g., 'last_session', 'last_week', 'all'"},
         },
     },
+    {
+        Name:        "consult_academic",
+        Description: "Directly consult Academic for validation best practices and research (bypasses Guide)",
+        Domain:      "consultation",
+        Target:      "academic",
+        Keywords:    []string{"best practice", "standard", "research", "security practice", "industry standard"},
+        Priority:    85,
+        Parameters: []Param{
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"best_practice", "security_standard", "code_quality_research", "validation_methodology"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "Topic to research"},
+            {Name: "depth", Type: "enum", Values: []string{"quick", "standard", "deep"}, Required: false, Default: "standard"},
+        },
+    },
 }
 
 // LSP & AST Validation Skills (Tier 2 - Advanced Code Analysis)
@@ -18807,6 +19860,104 @@ inspector_skills_lsp_ast := []Skill{
         Parameters: []Param{
             {Name: "files", Type: "array", Required: true},
             {Name: "strict", Type: "bool", Required: false, Default: false, Description: "Fail on any any/unknown usage"},
+        },
+    },
+    // AST-grep search (uses ast-grep CLI)
+    {
+        Name:        "ast_grep_search",
+        Description: "Search code using ast-grep CLI for AST-aware structural pattern matching",
+        Domain:      "ast",
+        Keywords:    []string{"ast", "structure", "pattern", "find all"},
+        LoadTrigger: "pattern|structure|all occurrences|find all",
+        // CLI: ast-grep run -p <pattern> -l <lang> --json compact [paths...]
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern with meta-variables: $VAR (single node), $$$ (variadic)"},
+            {Name: "lang", Type: "enum", Required: true, Values: []string{"go", "typescript", "python", "rust", "java", "javascript"}},
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}},
+            {Name: "globs", Type: "array", Required: false},
+        },
+    },
+    // LSP Navigation Skills
+    {
+        Name:        "lsp_go_to_definition",
+        Description: "Navigate to symbol definition using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"definition", "go to", "where defined"},
+        LoadTrigger: "definition|where is|source of",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_find_references",
+        Description: "Find all references to a symbol using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"references", "usages", "callers", "used by"},
+        LoadTrigger: "references|usages|who uses",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_hover",
+        Description: "Get type information and documentation for symbol",
+        Domain:      "lsp",
+        Keywords:    []string{"type", "docs", "signature"},
+        LoadTrigger: "what type|signature",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_symbols",
+        Description: "Get all symbols in file or workspace",
+        Domain:      "lsp",
+        Keywords:    []string{"symbols", "outline", "structure"},
+        LoadTrigger: "symbols|outline|structure",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: false},
+            {Name: "query", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "lsp_call_hierarchy",
+        Description: "Get call hierarchy (incoming/outgoing calls) for a function",
+        Domain:      "lsp",
+        Keywords:    []string{"calls", "hierarchy", "callers", "callees"},
+        LoadTrigger: "who calls|calls what|call hierarchy",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+            {Name: "direction", Type: "enum", Values: []string{"incoming", "outgoing", "both"}, Required: true},
+        },
+    },
+}
+
+// Git Skills (Tier 2 - Read-Only for Validation Context)
+inspector_skills_git := []Skill{
+    {Name: "git_status", Description: "View repository status", Domain: "git_read", LoadTrigger: "status|changes|modified"},
+    {Name: "git_diff", Description: "View uncommitted changes", Domain: "git_read", LoadTrigger: "diff|changes|what changed"},
+    {Name: "git_log", Description: "View commit history", Domain: "git_read", LoadTrigger: "history|commits|log",
+        Parameters: []Param{
+            {Name: "count", Type: "int", Required: false, Default: 10},
+            {Name: "path", Type: "string", Required: false},
+        },
+    },
+    {Name: "git_show", Description: "Show commit details", Domain: "git_read", LoadTrigger: "commit details|show commit"},
+    {Name: "git_blame", Description: "Show line-by-line last modification info", Domain: "git_read", LoadTrigger: "blame|who changed|last modified"},
+    {Name: "git_ls_files", Description: "List tracked files", Domain: "git_read", LoadTrigger: "tracked files|list files"},
+    {Name: "git_branch_list", Description: "List all branches", Domain: "git_read", LoadTrigger: "branches"},
+    {Name: "git_diff_between", Description: "Compare two commits/branches for review scope", Domain: "git_read", LoadTrigger: "compare|between|diff commits",
+        Parameters: []Param{
+            {Name: "base", Type: "string", Required: true},
+            {Name: "head", Type: "string", Required: false, Default: "HEAD"},
         },
     },
 }
@@ -19961,6 +21112,81 @@ tester_skills_core := []Skill{
         Keywords:    []string{"results", "report", "summary"},
         Priority:    90,
     },
+    // File Operations (required for test implementation)
+    {
+        Name:        "read_file",
+        Description: "Read implementation code to understand what to test",
+        Domain:      "files",
+        Keywords:    []string{"read", "view", "show", "cat", "contents"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "start_line", Type: "integer", Required: false},
+            {Name: "end_line", Type: "integer", Required: false},
+        },
+    },
+    {
+        Name:        "write_file",
+        Description: "Write test file to disk",
+        Domain:      "files",
+        Keywords:    []string{"write", "create", "save"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "content", Type: "string", Required: true},
+        },
+    },
+    {
+        Name:        "edit_file",
+        Description: "Edit existing test file",
+        Domain:      "files",
+        Keywords:    []string{"edit", "modify", "change", "update"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "path", Type: "string", Required: true},
+            {Name: "old_string", Type: "string", Required: true},
+            {Name: "new_string", Type: "string", Required: true},
+        },
+    },
+    // Search Operations
+    {
+        Name:        "glob",
+        Description: "Find test/implementation files matching a pattern",
+        Domain:      "files",
+        Keywords:    []string{"find files", "glob", "pattern", "match files"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Glob pattern (e.g., '**/*_test.go', 'src/**/*.spec.ts')"},
+            {Name: "path", Type: "string", Required: false, Description: "Base directory to search from"},
+        },
+    },
+    {
+        Name:        "grep",
+        Description: "Search file contents for test patterns, fixtures, mocks",
+        Domain:      "files",
+        Keywords:    []string{"search", "grep", "find text", "search content"},
+        Priority:    95,
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "Search pattern (regex supported)"},
+            {Name: "path", Type: "string", Required: false, Description: "File or directory to search"},
+            {Name: "include", Type: "string", Required: false, Description: "File pattern to include (e.g., '*_test.go')"},
+            {Name: "ignore_case", Type: "boolean", Required: false},
+            {Name: "context_lines", Type: "integer", Required: false, Description: "Lines of context around matches"},
+        },
+    },
+    // Command Execution (for test runners, coverage tools)
+    {
+        Name:        "run_command",
+        Description: "Execute test commands, coverage tools, benchmark runs",
+        Domain:      "execution",
+        Keywords:    []string{"run", "execute", "test", "coverage", "benchmark"},
+        Priority:    90,
+        Parameters: []Param{
+            {Name: "command", Type: "string", Required: true},
+            {Name: "timeout", Type: "integer", Required: false, Default: 300}, // Tests may take longer
+            {Name: "working_dir", Type: "string", Required: false},
+        },
+    },
 }
 
 // Contextual Skills (Tier 2)
@@ -19978,6 +21204,47 @@ tester_skills_contextual := []Skill{
         Domain:      "testing",
         Keywords:    []string{"coverage", "uncovered", "missing tests"},
         LoadTrigger: "coverage|uncovered|missing",
+    },
+    // Coverage Reporting
+    {
+        Name:        "coverage_report",
+        Description: "Generate detailed coverage report with line/branch/function breakdown",
+        Domain:      "testing",
+        Keywords:    []string{"coverage report", "coverage html", "coverage json"},
+        LoadTrigger: "report|html|json|detailed coverage",
+        Parameters: []Param{
+            {Name: "format", Type: "enum", Required: false, Values: []string{"text", "html", "json", "lcov"}, Default: "text", Description: "Output format"},
+            {Name: "output_path", Type: "string", Required: false, Description: "Path to write report (stdout if not specified)"},
+            {Name: "threshold", Type: "object", Required: false, Description: "Coverage thresholds {line: 80, branch: 70, function: 80}"},
+            {Name: "include", Type: "array", Required: false, Description: "Paths to include in coverage"},
+            {Name: "exclude", Type: "array", Required: false, Description: "Paths to exclude from coverage"},
+        },
+    },
+    // Mutation Testing
+    {
+        Name:        "mutation_test",
+        Description: "Run mutation testing to verify test quality",
+        Domain:      "testing",
+        Keywords:    []string{"mutation", "mutant", "test quality"},
+        LoadTrigger: "mutation|mutant|test quality|test strength",
+        Parameters: []Param{
+            {Name: "paths", Type: "array", Required: true, Description: "Source files to mutate"},
+            {Name: "timeout_multiplier", Type: "float", Required: false, Default: 2.0},
+            {Name: "operators", Type: "array", Required: false, Description: "Mutation operators to use"},
+        },
+    },
+    // Flaky Test Detection
+    {
+        Name:        "detect_flaky_tests",
+        Description: "Run tests multiple times to detect flaky tests",
+        Domain:      "testing",
+        Keywords:    []string{"flaky", "intermittent", "unreliable"},
+        LoadTrigger: "flaky|intermittent|unreliable|sometimes fails",
+        Parameters: []Param{
+            {Name: "runs", Type: "int", Required: false, Default: 5, Description: "Number of times to run each test"},
+            {Name: "test_pattern", Type: "string", Required: false, Description: "Pattern to filter tests"},
+            {Name: "parallel", Type: "bool", Required: false, Default: true},
+        },
     },
 }
 
@@ -20048,6 +21315,120 @@ tester_skills_consultation := []Skill{
             {Name: "time_range", Type: "string", Required: false, Description: "e.g., 'last_session', 'last_week', 'all'"},
         },
     },
+    {
+        Name:        "consult_academic",
+        Description: "Directly consult Academic for testing best practices and research (bypasses Guide)",
+        Domain:      "consultation",
+        Target:      "academic",
+        Keywords:    []string{"best practice", "testing methodology", "research", "test strategy", "industry standard"},
+        Priority:    85,
+        Parameters: []Param{
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"best_practice", "testing_methodology", "coverage_strategy", "test_design_pattern"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "Topic to research"},
+            {Name: "depth", Type: "enum", Values: []string{"quick", "standard", "deep"}, Required: false, Default: "standard"},
+        },
+    },
+}
+
+// AST-based Search Skills (Tier 2 - Structural Code Analysis)
+// Uses ast-grep CLI (https://ast-grep.github.io/) for AST-aware pattern matching
+tester_skills_ast := []Skill{
+    {
+        Name:        "ast_grep_search",
+        Description: "Search code using ast-grep CLI for AST-aware structural pattern matching",
+        Domain:      "ast",
+        Keywords:    []string{"ast", "structure", "pattern", "find all", "test"},
+        LoadTrigger: "pattern|structure|all occurrences|find all tests",
+        // CLI: ast-grep run -p <pattern> -l <lang> --json compact [paths...]
+        Parameters: []Param{
+            {Name: "pattern", Type: "string", Required: true, Description: "AST pattern with meta-variables: $VAR (single node), $$$ (variadic)"},
+            {Name: "lang", Type: "enum", Required: true, Values: []string{"go", "typescript", "python", "rust", "java", "javascript"}},
+            {Name: "paths", Type: "array", Required: false, Default: []string{"."}},
+            {Name: "globs", Type: "array", Required: false},
+        },
+    },
+}
+
+// LSP Integration Skills (Tier 2 - Language Server Protocol)
+tester_skills_lsp := []Skill{
+    {
+        Name:        "lsp_go_to_definition",
+        Description: "Navigate to symbol definition using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"definition", "go to", "where defined"},
+        LoadTrigger: "definition|where is|source of",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_find_references",
+        Description: "Find all references to a symbol using LSP",
+        Domain:      "lsp",
+        Keywords:    []string{"references", "usages", "callers", "used by"},
+        LoadTrigger: "references|usages|who uses",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_hover",
+        Description: "Get type information and documentation for symbol",
+        Domain:      "lsp",
+        Keywords:    []string{"type", "docs", "signature"},
+        LoadTrigger: "what type|signature",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+        },
+    },
+    {
+        Name:        "lsp_symbols",
+        Description: "Get all symbols in file or workspace",
+        Domain:      "lsp",
+        Keywords:    []string{"symbols", "outline", "structure"},
+        LoadTrigger: "symbols|outline|structure",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: false},
+            {Name: "query", Type: "string", Required: false},
+        },
+    },
+    {
+        Name:        "lsp_call_hierarchy",
+        Description: "Get call hierarchy (incoming/outgoing calls) for a function",
+        Domain:      "lsp",
+        Keywords:    []string{"calls", "hierarchy", "callers", "callees"},
+        LoadTrigger: "who calls|calls what|call hierarchy",
+        Parameters: []Param{
+            {Name: "file", Type: "string", Required: true},
+            {Name: "line", Type: "int", Required: true},
+            {Name: "column", Type: "int", Required: true},
+            {Name: "direction", Type: "enum", Values: []string{"incoming", "outgoing", "both"}, Required: true},
+        },
+    },
+}
+
+// Git Skills (Tier 2 - Read-Only for Test Context)
+tester_skills_git := []Skill{
+    {Name: "git_status", Description: "View repository status", Domain: "git_read", LoadTrigger: "status|changes|modified"},
+    {Name: "git_diff", Description: "View uncommitted changes", Domain: "git_read", LoadTrigger: "diff|changes|what changed"},
+    {Name: "git_log", Description: "View commit history", Domain: "git_read", LoadTrigger: "history|commits|log",
+        Parameters: []Param{
+            {Name: "count", Type: "int", Required: false, Default: 10},
+            {Name: "path", Type: "string", Required: false},
+        },
+    },
+    {Name: "git_show", Description: "Show commit details", Domain: "git_read", LoadTrigger: "commit details|show commit"},
+    {Name: "git_blame", Description: "Show line-by-line last modification info", Domain: "git_read", LoadTrigger: "blame|who changed|last modified"},
+    {Name: "git_ls_files", Description: "List tracked files", Domain: "git_read", LoadTrigger: "tracked files|list files"},
+    {Name: "git_branch_list", Description: "List all branches", Domain: "git_read", LoadTrigger: "branches"},
+    {Name: "git_fetch", Description: "Fetch updates without modifying working tree", Domain: "git_remote", LoadTrigger: "fetch|update remote"},
 }
 ```
 
@@ -26522,6 +27903,183 @@ func (dc *DesignerClient) Close() {
 }
 ```
 
+### DAG Executor Signaling Layer
+
+**CRITICAL: The DAG Executor is a runtime component SEPARATE from the Orchestrator LLM agent. It must be able to signal Architect directly without LLM intermediation for efficiency and reliability.**
+
+The DAG Executor runs the actual task execution flow. It is NOT an LLM agent - it's a Go runtime that:
+1. Manages task scheduling based on dependency graph
+2. Tracks task state transitions
+3. Enforces timeouts and retries
+4. Signals interested parties of state changes
+
+```go
+// DAGExecutorCallbacks defines hooks for signaling without LLM intermediation
+type DAGExecutorCallbacks struct {
+    // OnTaskComplete is called when any task reaches terminal success state
+    // This signals Architect DIRECTLY via message bus, bypassing Orchestrator LLM
+    OnTaskComplete func(ctx context.Context, signal *TaskCompleteSignal) error
+
+    // OnTaskFailed is called when task fails (after retries exhausted)
+    // Architect receives this for retry/abort decision
+    OnTaskFailed func(ctx context.Context, signal *TaskFailedSignal) error
+
+    // OnPipelineComplete is called when entire pipeline finishes
+    OnPipelineComplete func(ctx context.Context, signal *PipelineCompleteSignal) error
+
+    // OnLayerComplete is called when a DAG layer (parallel group) completes
+    OnLayerComplete func(ctx context.Context, signal *LayerCompleteSignal) error
+
+    // OnWorkflowComplete is called when entire workflow (all pipelines) completes
+    OnWorkflowComplete func(ctx context.Context, signal *WorkflowCompleteSignal) error
+
+    // OnBlockerDetected is called when a task is blocked (dependency failed)
+    OnBlockerDetected func(ctx context.Context, signal *BlockerSignal) error
+}
+
+// TaskCompleteSignal sent to Architect when task succeeds
+type TaskCompleteSignal struct {
+    SignalType    string    `json:"signal_type"` // "task_complete"
+    WorkflowID    string    `json:"workflow_id"`
+    PipelineID    string    `json:"pipeline_id"`
+    TaskID        string    `json:"task_id"`
+    TaskName      string    `json:"task_name"`
+    Agent         string    `json:"agent"`
+    Timestamp     time.Time `json:"timestamp"`
+    Duration      time.Duration `json:"duration"`
+    Artifacts     []Artifact `json:"artifacts,omitempty"`
+    Summary       string    `json:"summary"`
+
+    // For Architect decision-making
+    FollowUpSuggested bool   `json:"follow_up_suggested"`
+    NextTasks         []string `json:"next_tasks"` // Tasks now unblocked
+}
+
+// TaskFailedSignal sent to Architect when task fails
+type TaskFailedSignal struct {
+    SignalType    string    `json:"signal_type"` // "task_failed"
+    WorkflowID    string    `json:"workflow_id"`
+    PipelineID    string    `json:"pipeline_id"`
+    TaskID        string    `json:"task_id"`
+    TaskName      string    `json:"task_name"`
+    Agent         string    `json:"agent"`
+    Timestamp     time.Time `json:"timestamp"`
+
+    // Failure details
+    ErrorType     string    `json:"error_type"` // "timeout", "error", "transient"
+    ErrorMessage  string    `json:"error_message"`
+    AttemptsMade  int       `json:"attempts_made"`
+    MaxAttempts   int       `json:"max_attempts"`
+
+    // For Architect decision-making
+    Retryable     bool      `json:"retryable"`
+    BlockedTasks  []string  `json:"blocked_tasks"` // Tasks that cannot proceed
+    SuggestedAction string  `json:"suggested_action"` // "retry", "skip", "abort", "manual"
+}
+
+// PipelineCompleteSignal sent when pipeline finishes (success or partial)
+type PipelineCompleteSignal struct {
+    SignalType      string    `json:"signal_type"` // "pipeline_complete"
+    WorkflowID      string    `json:"workflow_id"`
+    PipelineID      string    `json:"pipeline_id"`
+    PipelineType    string    `json:"pipeline_type"` // "engineer", "designer", "inspector", "tester"
+    Timestamp       time.Time `json:"timestamp"`
+    Status          string    `json:"status"` // "success", "partial", "failed"
+
+    TasksCompleted  int       `json:"tasks_completed"`
+    TasksFailed     int       `json:"tasks_failed"`
+    TasksSkipped    int       `json:"tasks_skipped"`
+
+    Artifacts       []Artifact `json:"artifacts"`
+    Summary         string    `json:"summary"`
+
+    // For Architect decision-making
+    QualityGate     bool      `json:"quality_gate_passed"`
+    NextPipeline    string    `json:"next_pipeline,omitempty"`
+}
+
+// LayerCompleteSignal sent when a DAG layer finishes
+type LayerCompleteSignal struct {
+    SignalType    string    `json:"signal_type"` // "layer_complete"
+    WorkflowID    string    `json:"workflow_id"`
+    LayerIndex    int       `json:"layer_index"`
+    TotalLayers   int       `json:"total_layers"`
+    Timestamp     time.Time `json:"timestamp"`
+
+    TasksInLayer  int       `json:"tasks_in_layer"`
+    TasksSucceeded int      `json:"tasks_succeeded"`
+    TasksFailed   int       `json:"tasks_failed"`
+
+    // Progress indication
+    ProgressPercent float64 `json:"progress_percent"`
+}
+
+// WorkflowCompleteSignal sent when entire workflow finishes
+type WorkflowCompleteSignal struct {
+    SignalType     string    `json:"signal_type"` // "workflow_complete"
+    WorkflowID     string    `json:"workflow_id"`
+    SessionID      string    `json:"session_id"`
+    Timestamp      time.Time `json:"timestamp"`
+    TotalDuration  time.Duration `json:"total_duration"`
+
+    Status         string    `json:"status"` // "success", "partial", "failed"
+    PipelinesRun   int       `json:"pipelines_run"`
+    TasksCompleted int       `json:"tasks_completed"`
+    TasksFailed    int       `json:"tasks_failed"`
+
+    Artifacts      []Artifact `json:"artifacts"`
+    Summary        string    `json:"summary"`
+
+    // For user presentation
+    UserMessage    string    `json:"user_message"`
+}
+
+// DAGExecutorSignalBus routes signals to interested parties
+type DAGExecutorSignalBus struct {
+    // ArchitectChannel receives all signals that require Architect attention
+    ArchitectChannel chan<- DAGSignal
+
+    // OrchestratorChannel receives signals for Orchestrator monitoring (async)
+    OrchestratorChannel chan<- DAGSignal
+
+    // ArchivalistChannel receives signals for historical record (fire-and-forget)
+    ArchivalistChannel chan<- DAGSignal
+
+    // UserChannel receives signals that should be shown to user
+    UserChannel chan<- DAGSignal
+}
+
+// Signal routing configuration
+type SignalRouting struct {
+    // TaskComplete routes to: Architect (for follow-up), Archivalist (for record)
+    TaskComplete []string `json:"task_complete"` // ["architect", "archivalist"]
+
+    // TaskFailed routes to: Architect (for decision), Archivalist (for pattern)
+    TaskFailed []string `json:"task_failed"` // ["architect", "archivalist", "user"]
+
+    // PipelineComplete routes to: Architect (for next pipeline), User (for status)
+    PipelineComplete []string `json:"pipeline_complete"` // ["architect", "archivalist", "user"]
+
+    // WorkflowComplete routes to: User (for presentation), Archivalist (for record)
+    WorkflowComplete []string `json:"workflow_complete"` // ["user", "archivalist"]
+}
+
+// DefaultSignalRouting is the standard routing configuration
+var DefaultSignalRouting = SignalRouting{
+    TaskComplete:     []string{"architect", "archivalist"},
+    TaskFailed:       []string{"architect", "archivalist", "user"},
+    PipelineComplete: []string{"architect", "archivalist", "user"},
+    WorkflowComplete: []string{"user", "archivalist"},
+}
+```
+
+**Key Design Decisions:**
+
+1. **No LLM in critical path**: DAG Executor signals go directly to message bus, not through Orchestrator LLM
+2. **Architect receives structured signals**: Architect can process signals without needing to "understand" them via LLM
+3. **Async Archivalist logging**: Historical record is fire-and-forget to avoid blocking execution
+4. **User notifications for key events**: Failures and completions surface to user immediately
+
 ---
 
 ## Pipeline Architecture
@@ -27493,6 +29051,62 @@ var OrchestratorSkills = []Skill{
             {Name: "error_type", Type: "enum", Values: []string{"timeout", "error", "transient_storm"}, Required: true},
             {Name: "error_summary", Type: "string", Required: true},
             {Name: "attempts", Type: "int", Required: false, Default: 1},
+        },
+    },
+
+    // Signal task completion to Architect (for decision making)
+    {
+        Name:        "signal_task_complete",
+        Description: "Signal task completion to Architect for follow-up decisions",
+        Domain:      "signaling",
+        Keywords:    []string{"complete", "done", "finished", "architect", "signal"},
+        Parameters: []Param{
+            {Name: "task_id", Type: "string", Required: true},
+            {Name: "workflow_id", Type: "string", Required: true},
+            {Name: "result_summary", Type: "string", Required: true, Description: "Brief summary of task outcome"},
+            {Name: "artifacts", Type: "array", Required: false, Description: "List of artifacts produced"},
+            {Name: "follow_up_needed", Type: "bool", Required: false, Default: false, Description: "Whether Architect should consider follow-up work"},
+        },
+        Returns: schema.Object{
+            "acknowledged": schema.Bool("Whether Architect acknowledged completion"),
+            "follow_up":    schema.String("Any immediate follow-up instruction from Architect"),
+        },
+    },
+
+    // Signal pipeline completion to Architect
+    {
+        Name:        "signal_pipeline_complete",
+        Description: "Signal entire pipeline completion to Architect with summary",
+        Domain:      "signaling",
+        Keywords:    []string{"pipeline", "complete", "workflow", "finished", "architect"},
+        Parameters: []Param{
+            {Name: "pipeline_id", Type: "string", Required: true},
+            {Name: "workflow_id", Type: "string", Required: true},
+            {Name: "status", Type: "enum", Values: []string{"success", "partial", "failed"}, Required: true},
+            {Name: "tasks_completed", Type: "int", Required: true},
+            {Name: "tasks_failed", Type: "int", Required: true},
+            {Name: "summary", Type: "string", Required: true, Description: "Human-readable pipeline summary"},
+            {Name: "artifacts", Type: "array", Required: false, Description: "All artifacts produced by pipeline"},
+        },
+        Returns: schema.Object{
+            "acknowledged":     schema.Bool("Whether Architect acknowledged completion"),
+            "next_pipeline":    schema.String("Next pipeline to execute, if any"),
+            "workflow_complete": schema.Bool("Whether entire workflow is now complete"),
+        },
+    },
+
+    // Consult Architect for escalation or clarification
+    {
+        Name:        "consult_architect",
+        Description: "Directly consult Architect for execution decisions or escalations",
+        Domain:      "consultation",
+        Target:      "architect",
+        Keywords:    []string{"architect", "escalate", "clarify", "decision", "help"},
+        Priority:    85,
+        Parameters: []Param{
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"escalation", "clarification", "retry_decision", "resource_request"}, Required: true},
+            {Name: "context", Type: "object", Required: false, Description: "Relevant execution context"},
         },
     },
 

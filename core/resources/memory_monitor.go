@@ -384,6 +384,19 @@ func (m *MemoryMonitor) GlobalUsagePercent() float64 {
 	return float64(m.GlobalUsage()) / float64(ceiling)
 }
 
+// CanAllocate checks if the requested bytes can be allocated without exceeding ceiling.
+func (m *MemoryMonitor) CanAllocate(bytes int64) bool {
+	if bytes <= 0 {
+		return true
+	}
+	m.mu.RLock()
+	ceiling := m.globalCeiling
+	m.mu.RUnlock()
+
+	currentUsage := m.GlobalUsage()
+	return currentUsage+bytes <= ceiling
+}
+
 // PipelinesPaused returns whether pipelines are paused.
 func (m *MemoryMonitor) PipelinesPaused() bool {
 	return m.pipelinesPaused.Load()

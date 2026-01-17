@@ -1,9 +1,13 @@
 package llm
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/signal"
 )
 
 type RateLimitState int
@@ -27,71 +31,41 @@ func (s RateLimitState) String() string {
 	}
 }
 
-type SignalBus interface {
-	Emit(signal string, payload any)
-}
-
-type SoftLimitConfig struct {
-	MaxRequests   int
-	MaxTokens     int
-	Period        time.Duration
-	WarnThreshold float64
-}
-
-func DefaultSoftLimitConfig() SoftLimitConfig {
-	return SoftLimitConfig{
-		MaxRequests:   1000,
-		MaxTokens:     100000,
-		Period:        time.Hour,
-		WarnThreshold: 0.8,
-	}
-}
-
-type ProviderRateLimiter struct {
-	mu sync.Mutex
-
-	state         RateLimitState
-	backoffConfig BackoffConfig
-	softLimit     SoftLimitConfig
-
-	attempt      int
-	backoffUntil time.Time
-
-	periodStart  time.Time
-	requestCount int
-	tokenCount   int
-
-	signalBus    SignalBus
-	providerName string
-}
-
 type RateLimiterOption func(*ProviderRateLimiter)
 
-func WithBackoffConfig(cfg BackoffConfig) RateLimiterOption {
-	return func(r *ProviderRateLimiter) {
-		r.backoffConfig = cfg
-	}
-}
-
-func WithSoftLimitConfig(cfg SoftLimitConfig) RateLimiterOption {
-	return func(r *ProviderRateLimiter) {
-		r.softLimit = cfg
-	}
-}
-
-func WithSignalBus(bus SignalBus) RateLimiterOption {
+func WithSignalBus(bus *signal.SignalBus) RateLimiterOption {
 	return func(r *ProviderRateLimiter) {
 		r.signalBus = bus
 	}
 }
 
-func NewProviderRateLimiter(providerName string, opts ...RateLimiterOption) *ProviderRateLimiter {
+func WithBaseBackoff(base time.Duration) RateLimiterOption {
+	return func(r *ProviderRateLimiter) {
+		r.baseBackoff = base
+	}
+}
+
+func WithMaxBackoff(max time.Duration) RateLimiterOption {
+	return func(r *ProviderRateLimiter) {
+		r.maxBackoff = max
+	}
+}
+
+func WithSoftLimit(limit *UsageLimit) RateLimiterOption {
+	return func(r *ProviderRateLimiter) {
+		r.softLimit = limit
+	}
+}
+
+func NewProviderRateLimiter(provider string, softLimit *UsageLimit, bus *signal.SignalBus, opts ...RateLimiterOption) *ProviderRateLimiter {
 	r := &ProviderRateLimiter{
-		state:         RateLimitOK,
-		backoffConfig: DefaultBackoffConfig(),
-		softLimit:     DefaultSoftLimitConfig(),
-		periodStart:   time.Now(),
-		providerName:  providerName,
+		provider:    provider,
+		state:       RateLimitOK,
+		baseBackoff: time.Second,
+		maxBackoff:  5 * time.Minute,
+		periodStart: time.Now(),
+		softLimit:   softLimit,
+		signalBus:   bus,
 	}
 
 	for _, opt := range opts {
@@ -101,35 +75,53 @@ func NewProviderRateLimiter(providerName string, opts ...RateLimiterOption) *Pro
 	return r
 }
 
+type ProviderRateLimiter struct {
+	mu sync.RWMutex
+
+	provider       string
+	state          RateLimitState
+	backoffUntil   time.Time
+	backoffAttempt int
+	baseBackoff    time.Duration
+	maxBackoff     time.Duration
+
+	requestCount int64
+	tokenCount   int64
+	periodStart  time.Time
+	softLimit    *UsageLimit
+
+	signalBus *signal.SignalBus
+}
+
 func (r *ProviderRateLimiter) OnResponse(statusCode int, headers http.Header) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if statusCode == http.StatusTooManyRequests {
-		r.handleRateLimitExceeded(headers)
+		r.state = RateLimitExceeded
+		r.backoffAttempt++
+
+		backoff := r.baseBackoff * time.Duration(1<<r.backoffAttempt)
+		if backoff > r.maxBackoff {
+			backoff = r.maxBackoff
+		}
+
+		if retryAfter := headers.Get("Retry-After"); retryAfter != "" {
+			if seconds, err := strconv.Atoi(retryAfter); err == nil {
+				backoff = time.Duration(seconds) * time.Second
+			}
+		}
+
+		r.backoffUntil = time.Now().Add(backoff)
+		r.broadcastPause(backoff)
 		return
 	}
 
 	if statusCode >= 200 && statusCode < 300 {
-		r.handleSuccess()
-	}
-}
-
-func (r *ProviderRateLimiter) handleRateLimitExceeded(headers http.Header) {
-	r.state = RateLimitExceeded
-	backoff := DetermineBackoff(r.backoffConfig, r.attempt, headers)
-	r.backoffUntil = time.Now().Add(backoff)
-	r.attempt++
-
-	r.emitPauseSignal(backoff)
-}
-
-func (r *ProviderRateLimiter) handleSuccess() {
-	r.attempt = 0
-
-	if r.state == RateLimitExceeded {
-		r.state = RateLimitOK
-		r.emitResumeSignal()
+		if r.backoffAttempt > 0 {
+			r.backoffAttempt = 0
+			r.state = RateLimitOK
+		}
 	}
 }
 
@@ -137,109 +129,124 @@ func (r *ProviderRateLimiter) CanProceed() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.state != RateLimitExceeded {
-		return true
+	if r.state == RateLimitExceeded {
+		if time.Now().After(r.backoffUntil) {
+			r.state = RateLimitOK
+			r.broadcastResume()
+			return true
+		}
+		return false
 	}
 
-	if time.Now().After(r.backoffUntil) {
+	if r.softLimit != nil {
+		r.checkSoftLimit()
+	}
+
+	return true
+}
+
+func (r *ProviderRateLimiter) checkSoftLimit() {
+	if r.softLimit == nil {
+		return
+	}
+
+	if time.Since(r.periodStart) > r.softLimit.Period {
+		r.requestCount = 0
+		r.tokenCount = 0
+		r.periodStart = time.Now()
+	}
+
+	if r.state == RateLimitExceeded {
+		return
+	}
+
+	if r.softLimit.Requests > 0 {
+		requestRatio := float64(r.requestCount) / float64(r.softLimit.Requests)
+		if requestRatio >= r.softLimit.WarnAt {
+			if r.state != RateLimitWarning {
+				r.state = RateLimitWarning
+			}
+			r.broadcastWarning(requestRatio, float64(r.tokenCount)/float64(maxInt64(int64(r.softLimit.Tokens))))
+			return
+		}
+	}
+
+	if r.softLimit.Tokens > 0 {
+		tokenRatio := float64(r.tokenCount) / float64(r.softLimit.Tokens)
+		if tokenRatio >= r.softLimit.WarnAt {
+			if r.state != RateLimitWarning {
+				r.state = RateLimitWarning
+			}
+			r.broadcastWarning(float64(r.requestCount)/float64(maxInt64(int64(r.softLimit.Requests))), tokenRatio)
+			return
+		}
+	}
+
+	if r.state == RateLimitWarning {
 		r.state = RateLimitOK
-		r.emitResumeSignal()
-		return true
 	}
-
-	return false
 }
 
 func (r *ProviderRateLimiter) RecordUsage(tokens int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.resetPeriodIfExpired()
-
 	r.requestCount++
-	r.tokenCount += tokens
+	r.tokenCount += int64(tokens)
 
-	r.updateWarningState()
-}
-
-func (r *ProviderRateLimiter) resetPeriodIfExpired() {
-	if time.Since(r.periodStart) >= r.softLimit.Period {
-		r.periodStart = time.Now()
-		r.requestCount = 0
-		r.tokenCount = 0
-		if r.state == RateLimitWarning {
-			r.state = RateLimitOK
-		}
-	}
-}
-
-func (r *ProviderRateLimiter) updateWarningState() {
-	if r.state == RateLimitExceeded {
-		return
-	}
-
-	requestRatio := float64(r.requestCount) / float64(r.softLimit.MaxRequests)
-	tokenRatio := float64(r.tokenCount) / float64(r.softLimit.MaxTokens)
-
-	if requestRatio >= r.softLimit.WarnThreshold || tokenRatio >= r.softLimit.WarnThreshold {
-		if r.state != RateLimitWarning {
-			r.state = RateLimitWarning
-			r.emitWarningSignal()
-		}
-	}
+	r.checkSoftLimit()
 }
 
 func (r *ProviderRateLimiter) State() RateLimitState {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.state
 }
 
-func (r *ProviderRateLimiter) BackoffRemaining() time.Duration {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.state != RateLimitExceeded {
-		return 0
-	}
-
-	remaining := time.Until(r.backoffUntil)
-	if remaining < 0 {
-		return 0
-	}
-	return remaining
-}
-
-func (r *ProviderRateLimiter) emitPauseSignal(backoff time.Duration) {
+func (r *ProviderRateLimiter) broadcastPause(backoff time.Duration) {
 	if r.signalBus == nil {
 		return
 	}
-	r.signalBus.Emit("SignalPauseAll", map[string]any{
-		"provider": r.providerName,
-		"resumeAt": r.backoffUntil,
-		"attempt":  r.attempt,
-		"backoff":  backoff,
-	})
+
+	msg := signal.NewSignalMessage(signal.PauseAll, "", true)
+	msg.Reason = fmt.Sprintf("Rate limited by %s", r.provider)
+	msg.Payload = signal.PausePayload{
+		Provider: r.provider,
+		ResumeAt: &r.backoffUntil,
+		Attempt:  r.backoffAttempt,
+	}
+	msg.Timeout = 5 * time.Second
+
+	_ = r.signalBus.Broadcast(*msg)
 }
 
-func (r *ProviderRateLimiter) emitResumeSignal() {
+func (r *ProviderRateLimiter) broadcastResume() {
 	if r.signalBus == nil {
 		return
 	}
-	r.signalBus.Emit("SignalResumeAll", map[string]any{
-		"provider": r.providerName,
-	})
+
+	msg := signal.NewSignalMessage(signal.ResumeAll, "", true)
+	msg.Reason = fmt.Sprintf("Rate limit backoff complete for %s", r.provider)
+	msg.Timeout = 5 * time.Second
+
+	_ = r.signalBus.Broadcast(*msg)
 }
 
-func (r *ProviderRateLimiter) emitWarningSignal() {
+func (r *ProviderRateLimiter) broadcastWarning(requestRatio, tokenRatio float64) {
 	if r.signalBus == nil {
 		return
 	}
-	r.signalBus.Emit("SignalQuotaWarning", map[string]any{
-		"provider":     r.providerName,
-		"requestCount": r.requestCount,
-		"tokenCount":   r.tokenCount,
-		"maxRequests":  r.softLimit.MaxRequests,
-		"maxTokens":    r.softLimit.MaxTokens,
-	})
+
+	msg := signal.NewSignalMessage(signal.QuotaWarning, "", false)
+	msg.Reason = fmt.Sprintf("Approaching %s quota: %.0f%% requests, %.0f%% tokens",
+		r.provider, requestRatio*100, tokenRatio*100)
+
+	_ = r.signalBus.Broadcast(*msg)
+}
+
+func maxInt64(value int64) int64 {
+	if value <= 0 {
+		return 1
+	}
+	return value
 }

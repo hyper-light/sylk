@@ -8,11 +8,13 @@ import (
 )
 
 type ToolResult struct {
-	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
-	Duration time.Duration
-	Partial  bool
+	ExitCode   int
+	Stdout     []byte
+	Stderr     []byte
+	Duration   time.Duration
+	Killed     bool
+	KillSignal string
+	Partial    bool
 }
 
 type CachePolicy struct {
@@ -204,6 +206,9 @@ type ToolInvocation struct {
 	Command    string
 	Args       []string
 	WorkingDir string
+	Env        map[string]string
+	Stdin      interface{}
+	Timeout    time.Duration
 }
 
 func (c *ToolOutputCache) ComputeInputHash(inv ToolInvocation) string {
