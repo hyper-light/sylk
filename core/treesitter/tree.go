@@ -144,10 +144,7 @@ func (n *Node) HasError() bool {
 
 func (n *Node) Content() string {
 	start := n.StartByte()
-	end := n.EndByte()
-	if end > uint(len(n.source)) {
-		end = uint(len(n.source))
-	}
+	end := min(n.EndByte(), uint(len(n.source)))
 	if start >= end {
 		return ""
 	}

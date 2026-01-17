@@ -33,6 +33,13 @@ type SanitizerMetrics struct {
 	TotalRedacted   int64
 }
 
+type SanitizerMetricsSnapshot struct {
+	RedactionCounts map[string]int64
+	SkippedFiles    map[string]int64
+	TotalScanned    int64
+	TotalRedacted   int64
+}
+
 type SecretSanitizer struct {
 	mu             sync.RWMutex
 	patterns       *PatternManager
@@ -192,11 +199,11 @@ func (s *SecretSanitizer) recordScanned() {
 	s.metrics.TotalScanned++
 }
 
-func (s *SecretSanitizer) GetMetrics() SanitizerMetrics {
+func (s *SecretSanitizer) GetMetrics() SanitizerMetricsSnapshot {
 	s.metrics.mu.RLock()
 	defer s.metrics.mu.RUnlock()
 
-	result := SanitizerMetrics{
+	result := SanitizerMetricsSnapshot{
 		RedactionCounts: make(map[string]int64),
 		SkippedFiles:    make(map[string]int64),
 		TotalScanned:    s.metrics.TotalScanned,
