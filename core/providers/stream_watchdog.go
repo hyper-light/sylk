@@ -188,6 +188,10 @@ func (w *StreamWatchdog) emitTimeout(watched *WatchedStream, eventType WatchdogE
 	watched.stopped = true
 	watched.mu.Unlock()
 
+	w.mu.Lock()
+	delete(w.streams, watched.streamID)
+	w.mu.Unlock()
+
 	watched.cancel()
 	w.notifyCallbacks(event)
 }

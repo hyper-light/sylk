@@ -27,22 +27,18 @@ type StreamMetrics struct {
 // StreamMetricsCollector manages metrics collection for a single stream.
 // Thread-safe for concurrent chunk processing.
 type StreamMetricsCollector struct {
-	mu sync.RWMutex
+	mu sync.Mutex
 
-	// Internal state
 	startTime      time.Time
 	firstTokenTime time.Time
 	firstToolTime  time.Time
 	chunksReceived int
 	lastUsage      *Usage
 	earlyAbort     bool
+	started        bool
+	stopped        bool
 
-	// Backpressure tracking
-	backpressureEvents int32 // atomic for lock-free increment
-
-	// Lifecycle
-	started atomic.Bool
-	stopped atomic.Bool
+	backpressureEvents int32
 }
 
 // NewStreamMetricsCollector creates a new collector.
@@ -52,34 +48,40 @@ func NewStreamMetricsCollector() *StreamMetricsCollector {
 
 // Start begins metrics collection. Must be called before processing chunks.
 func (c *StreamMetricsCollector) Start() {
-	if c.started.Swap(true) {
-		return // Already started
-	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		return
+	}
+	c.started = true
 	c.startTime = time.Now()
-	c.mu.Unlock()
 }
 
 // Stop marks the stream as completed or aborted.
 // Pass earlyAbort=true if stream was cancelled before ChunkTypeEnd.
 func (c *StreamMetricsCollector) Stop(earlyAbort bool) {
-	if c.stopped.Swap(true) {
-		return // Already stopped
-	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		return
+	}
+	c.stopped = true
 	c.earlyAbort = earlyAbort
-	c.mu.Unlock()
 }
 
 // RecordChunk processes a chunk and updates metrics.
 // Thread-safe for concurrent calls.
 func (c *StreamMetricsCollector) RecordChunk(chunk *StreamChunk) {
-	if chunk == nil || !c.started.Load() || c.stopped.Load() {
+	if chunk == nil {
 		return
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if !c.started || c.stopped {
+		return
+	}
 
 	c.chunksReceived++
 	c.recordChunkType(chunk)
@@ -131,22 +133,21 @@ func (c *StreamMetricsCollector) RecordBackpressure() {
 // GetMetrics returns a snapshot of current metrics.
 // Safe to call at any time, even during active collection.
 func (c *StreamMetricsCollector) GetMetrics() *StreamMetrics {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
 	metrics := &StreamMetrics{
-		ChunksReceived:     c.chunksReceived,
-		BackpressureEvents: int(atomic.LoadInt32(&c.backpressureEvents)),
+		ChunksReceived: c.chunksReceived,
 	}
-
 	c.populateTimingMetrics(metrics)
 	c.populateEfficiencyMetrics(metrics)
+	c.mu.Unlock()
+
+	metrics.BackpressureEvents = int(atomic.LoadInt32(&c.backpressureEvents))
 
 	return metrics
 }
 
 // populateTimingMetrics fills timing-related fields.
-// Caller must hold at least a read lock.
+// Caller must hold the mutex.
 func (c *StreamMetricsCollector) populateTimingMetrics(metrics *StreamMetrics) {
 	if c.startTime.IsZero() {
 		return
@@ -168,7 +169,7 @@ func (c *StreamMetricsCollector) populateTimingMetrics(metrics *StreamMetrics) {
 }
 
 // calculateDuration returns stream duration.
-// Caller must hold at least a read lock.
+// Caller must hold the mutex.
 func (c *StreamMetricsCollector) calculateDuration() time.Duration {
 	if c.startTime.IsZero() {
 		return 0
@@ -177,7 +178,7 @@ func (c *StreamMetricsCollector) calculateDuration() time.Duration {
 }
 
 // calculateTokensPerSecond computes generation speed.
-// Caller must hold at least a read lock.
+// Caller must hold the mutex.
 func (c *StreamMetricsCollector) calculateTokensPerSecond(duration time.Duration) float64 {
 	if c.lastUsage == nil || duration <= 0 {
 		return 0
@@ -190,7 +191,7 @@ func (c *StreamMetricsCollector) calculateTokensPerSecond(duration time.Duration
 }
 
 // populateEfficiencyMetrics fills efficiency-related fields.
-// Caller must hold at least a read lock.
+// Caller must hold the mutex.
 func (c *StreamMetricsCollector) populateEfficiencyMetrics(metrics *StreamMetrics) {
 	if !c.earlyAbort {
 		return
