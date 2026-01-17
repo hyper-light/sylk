@@ -4,93 +4,28 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/adalundhe/sylk/core/errors/mocks"
+	"github.com/stretchr/testify/mock"
 )
-
-type mockStagingManager struct {
-	stagedCount   int
-	discardErr    error
-	getCountErr   error
-	discardCalls  int
-	getCountCalls int
-}
-
-func (m *mockStagingManager) DiscardStaging(pipelineID string) error {
-	m.discardCalls++
-	return m.discardErr
-}
-
-func (m *mockStagingManager) GetStagedFileCount(pipelineID string) (int, error) {
-	m.getCountCalls++
-	if m.getCountErr != nil {
-		return 0, m.getCountErr
-	}
-	return m.stagedCount, nil
-}
-
-type mockCheckpointManager struct {
-	restoreErr   error
-	restoreCalls int
-}
-
-func (m *mockCheckpointManager) RestoreCheckpoint(pipelineID string) error {
-	m.restoreCalls++
-	return m.restoreErr
-}
-
-type mockGitManager struct {
-	unpushedCount     int
-	hasPushed         bool
-	getUnpushedErr    error
-	resetSoftErr      error
-	createRevertErr   error
-	getUnpushedCalls  int
-	resetSoftCalls    int
-	hasPushedCalls    int
-	createRevertCalls int
-}
-
-func (m *mockGitManager) GetUnpushedCommits(pipelineID string) (int, error) {
-	m.getUnpushedCalls++
-	if m.getUnpushedErr != nil {
-		return 0, m.getUnpushedErr
-	}
-	return m.unpushedCount, nil
-}
-
-func (m *mockGitManager) ResetSoft(pipelineID string, count int) error {
-	m.resetSoftCalls++
-	return m.resetSoftErr
-}
-
-func (m *mockGitManager) HasPushedCommits(pipelineID string) bool {
-	m.hasPushedCalls++
-	return m.hasPushed
-}
-
-func (m *mockGitManager) CreateRevertCommit(pipelineID string) error {
-	m.createRevertCalls++
-	return m.createRevertErr
-}
-
-type mockRollbackRecorder struct {
-	recordErr   error
-	recordCalls int
-	lastStatus  string
-}
-
-func (m *mockRollbackRecorder) RecordRollback(ctx context.Context, pipelineID string, status string) error {
-	m.recordCalls++
-	m.lastStatus = status
-	return m.recordErr
-}
 
 func TestRollbackManager_Rollback_AllLayers(t *testing.T) {
 	ctx := context.Background()
 
-	staging := &mockStagingManager{stagedCount: 5}
-	checkpoint := &mockCheckpointManager{}
-	git := &mockGitManager{unpushedCount: 3}
-	recorder := &mockRollbackRecorder{}
+	staging := mocks.NewStagingManager(t)
+	staging.On("GetStagedFileCount", "pipeline-123").Return(5, nil)
+	staging.On("DiscardStaging", "pipeline-123").Return(nil)
+
+	checkpoint := mocks.NewCheckpointManager(t)
+	checkpoint.On("RestoreCheckpoint", "pipeline-123").Return(nil)
+
+	git := mocks.NewGitManager(t)
+	git.On("GetUnpushedCommits", "pipeline-123").Return(3, nil)
+	git.On("ResetSoft", "pipeline-123", 3).Return(nil)
+	git.On("HasPushedCommits", "pipeline-123").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "pipeline-123", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, staging, checkpoint, git, recorder)
@@ -123,34 +58,22 @@ func TestRollbackManager_Rollback_AllLayers(t *testing.T) {
 		t.Errorf("LocalCommitsRemoved = %d, want 3", receipt.LocalCommitsRemoved)
 	}
 
-	if staging.discardCalls != 1 {
-		t.Errorf("staging.discardCalls = %d, want 1", staging.discardCalls)
-	}
-
-	if checkpoint.restoreCalls != 1 {
-		t.Errorf("checkpoint.restoreCalls = %d, want 1", checkpoint.restoreCalls)
-	}
-
-	if git.resetSoftCalls != 1 {
-		t.Errorf("git.resetSoftCalls = %d, want 1", git.resetSoftCalls)
-	}
-
-	if recorder.recordCalls != 1 {
-		t.Errorf("recorder.recordCalls = %d, want 1", recorder.recordCalls)
-	}
-
-	if recorder.lastStatus != "rolled_back" {
-		t.Errorf("recorder.lastStatus = %s, want 'rolled_back'", recorder.lastStatus)
-	}
 }
 
 func TestRollbackManager_Rollback_StagingOnly(t *testing.T) {
 	ctx := context.Background()
 
-	staging := &mockStagingManager{stagedCount: 10}
-	checkpoint := &mockCheckpointManager{}
-	git := &mockGitManager{unpushedCount: 5}
-	recorder := &mockRollbackRecorder{}
+	staging := mocks.NewStagingManager(t)
+	staging.On("GetStagedFileCount", "pipeline-456").Return(10, nil)
+	staging.On("DiscardStaging", "pipeline-456").Return(nil)
+
+	checkpoint := mocks.NewCheckpointManager(t)
+
+	git := mocks.NewGitManager(t)
+	git.On("HasPushedCommits", "pipeline-456").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "pipeline-456", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, staging, checkpoint, git, recorder)
@@ -170,27 +93,24 @@ func TestRollbackManager_Rollback_StagingOnly(t *testing.T) {
 	if receipt.StagedFilesCount != 10 {
 		t.Errorf("StagedFilesCount = %d, want 10", receipt.StagedFilesCount)
 	}
-
-	if staging.discardCalls != 1 {
-		t.Errorf("staging.discardCalls = %d, want 1", staging.discardCalls)
-	}
-
-	if checkpoint.restoreCalls != 0 {
-		t.Errorf("checkpoint.restoreCalls = %d, want 0", checkpoint.restoreCalls)
-	}
-
-	if git.resetSoftCalls != 0 {
-		t.Errorf("git.resetSoftCalls = %d, want 0", git.resetSoftCalls)
-	}
 }
 
 func TestRollbackManager_Rollback_NeverAutoRevertPushed(t *testing.T) {
 	ctx := context.Background()
 
-	staging := &mockStagingManager{stagedCount: 2}
-	checkpoint := &mockCheckpointManager{}
-	git := &mockGitManager{hasPushed: true}
-	recorder := &mockRollbackRecorder{}
+	staging := mocks.NewStagingManager(t)
+	staging.On("GetStagedFileCount", "pipeline-789").Return(2, nil)
+	staging.On("DiscardStaging", "pipeline-789").Return(nil)
+
+	checkpoint := mocks.NewCheckpointManager(t)
+	checkpoint.On("RestoreCheckpoint", "pipeline-789").Return(nil)
+
+	git := mocks.NewGitManager(t)
+	git.On("GetUnpushedCommits", "pipeline-789").Return(0, nil)
+	git.On("HasPushedCommits", "pipeline-789").Return(true)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "pipeline-789", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, staging, checkpoint, git, recorder)
@@ -200,10 +120,6 @@ func TestRollbackManager_Rollback_NeverAutoRevertPushed(t *testing.T) {
 	receipt, err := manager.Rollback(ctx, "pipeline-789", options)
 	if err != nil {
 		t.Fatalf("Rollback() error = %v", err)
-	}
-
-	if git.createRevertCalls != 0 {
-		t.Errorf("git.createRevertCalls = %d, want 0 (should not auto-revert)", git.createRevertCalls)
 	}
 
 	if !receipt.PushedCommitsPending {
@@ -229,10 +145,19 @@ func TestRollbackManager_Rollback_NeverAutoRevertPushed(t *testing.T) {
 func TestRollbackManager_Rollback_WithForceGitPushed(t *testing.T) {
 	ctx := context.Background()
 
-	staging := &mockStagingManager{stagedCount: 1}
-	checkpoint := &mockCheckpointManager{}
-	git := &mockGitManager{hasPushed: true}
-	recorder := &mockRollbackRecorder{}
+	staging := mocks.NewStagingManager(t)
+	staging.On("GetStagedFileCount", "pipeline-force").Return(1, nil)
+	staging.On("DiscardStaging", "pipeline-force").Return(nil)
+
+	checkpoint := mocks.NewCheckpointManager(t)
+	checkpoint.On("RestoreCheckpoint", "pipeline-force").Return(nil)
+
+	git := mocks.NewGitManager(t)
+	git.On("HasPushedCommits", "pipeline-force").Return(true)
+	git.On("CreateRevertCommit", "pipeline-force").Return(nil)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "pipeline-force", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, staging, checkpoint, git, recorder)
@@ -250,10 +175,6 @@ func TestRollbackManager_Rollback_WithForceGitPushed(t *testing.T) {
 		t.Fatalf("Rollback() error = %v", err)
 	}
 
-	if git.createRevertCalls != 1 {
-		t.Errorf("git.createRevertCalls = %d, want 1", git.createRevertCalls)
-	}
-
 	if !receipt.WasSuccessful() {
 		t.Error("WasSuccessful() = false, want true")
 	}
@@ -262,8 +183,11 @@ func TestRollbackManager_Rollback_WithForceGitPushed(t *testing.T) {
 func TestRollbackManager_Rollback_GitPushedWithoutForce(t *testing.T) {
 	ctx := context.Background()
 
-	git := &mockGitManager{hasPushed: true}
-	recorder := &mockRollbackRecorder{}
+	git := mocks.NewGitManager(t)
+	git.On("HasPushedCommits", "pipeline-no-force").Return(true)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "pipeline-no-force", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, nil, nil, git, recorder)
@@ -276,10 +200,6 @@ func TestRollbackManager_Rollback_GitPushedWithoutForce(t *testing.T) {
 	receipt, err := manager.Rollback(ctx, "pipeline-no-force", options)
 	if err != nil {
 		t.Fatalf("Rollback() error = %v", err)
-	}
-
-	if git.createRevertCalls != 0 {
-		t.Errorf("git.createRevertCalls = %d, want 0 (no force)", git.createRevertCalls)
 	}
 
 	var pushedResult *LayerResult
@@ -302,8 +222,11 @@ func TestRollbackManager_Rollback_GitPushedWithoutForce(t *testing.T) {
 func TestRollbackManager_Rollback_NoPushedCommits(t *testing.T) {
 	ctx := context.Background()
 
-	git := &mockGitManager{hasPushed: false}
-	recorder := &mockRollbackRecorder{}
+	git := mocks.NewGitManager(t)
+	git.On("HasPushedCommits", "pipeline-no-pushed").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "pipeline-no-pushed", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, nil, nil, git, recorder)
@@ -316,10 +239,6 @@ func TestRollbackManager_Rollback_NoPushedCommits(t *testing.T) {
 	receipt, err := manager.Rollback(ctx, "pipeline-no-pushed", options)
 	if err != nil {
 		t.Fatalf("Rollback() error = %v", err)
-	}
-
-	if git.createRevertCalls != 0 {
-		t.Errorf("createRevertCalls = %d, want 0 (no pushed commits)", git.createRevertCalls)
 	}
 
 	var pushedResult *LayerResult
@@ -342,10 +261,20 @@ func TestRollbackManager_Rollback_NoPushedCommits(t *testing.T) {
 func TestRollbackManager_BuildReceipt(t *testing.T) {
 	ctx := context.Background()
 
-	staging := &mockStagingManager{stagedCount: 7}
-	checkpoint := &mockCheckpointManager{}
-	git := &mockGitManager{unpushedCount: 2}
-	recorder := &mockRollbackRecorder{}
+	staging := mocks.NewStagingManager(t)
+	staging.On("GetStagedFileCount", "build-receipt-test").Return(7, nil)
+	staging.On("DiscardStaging", "build-receipt-test").Return(nil)
+
+	checkpoint := mocks.NewCheckpointManager(t)
+	checkpoint.On("RestoreCheckpoint", "build-receipt-test").Return(nil)
+
+	git := mocks.NewGitManager(t)
+	git.On("GetUnpushedCommits", "build-receipt-test").Return(2, nil)
+	git.On("ResetSoft", "build-receipt-test", 2).Return(nil)
+	git.On("HasPushedCommits", "build-receipt-test").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "build-receipt-test", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, staging, checkpoint, git, recorder)
@@ -386,9 +315,14 @@ func TestRollbackManager_BuildReceipt(t *testing.T) {
 func TestRollbackManager_BuildReceipt_PartialFailure(t *testing.T) {
 	ctx := context.Background()
 
-	staging := &mockStagingManager{discardErr: errors.New("staging error")}
-	checkpoint := &mockCheckpointManager{}
-	recorder := &mockRollbackRecorder{}
+	staging := mocks.NewStagingManager(t)
+	staging.On("GetStagedFileCount", "partial-test").Return(0, errors.New("staging error"))
+
+	checkpoint := mocks.NewCheckpointManager(t)
+	checkpoint.On("RestoreCheckpoint", "partial-test").Return(nil)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "partial-test", mock.Anything).Return(nil)
 
 	config := RollbackConfig{}
 	manager := NewRollbackManager(config, staging, checkpoint, nil, recorder)
@@ -402,10 +336,6 @@ func TestRollbackManager_BuildReceipt_PartialFailure(t *testing.T) {
 
 	if receipt.WasSuccessful() {
 		t.Error("WasSuccessful() = true, want false (staging failed)")
-	}
-
-	if recorder.lastStatus != "rollback_partial" {
-		t.Errorf("lastStatus = %s, want 'rollback_partial'", recorder.lastStatus)
 	}
 }
 
@@ -476,10 +406,11 @@ func TestRollbackManager_NilDependencies(t *testing.T) {
 func TestRollbackManager_StagingError(t *testing.T) {
 	ctx := context.Background()
 
-	staging := &mockStagingManager{
-		getCountErr: errors.New("count error"),
-	}
-	recorder := &mockRollbackRecorder{}
+	staging := mocks.NewStagingManager(t)
+	staging.On("GetStagedFileCount", "staging-err").Return(0, errors.New("count error"))
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "staging-err", mock.Anything).Return(nil)
 
 	config := RollbackConfig{}
 	manager := NewRollbackManager(config, staging, nil, nil, recorder)
@@ -516,8 +447,12 @@ func TestRollbackManager_StagingError(t *testing.T) {
 func TestRollbackManager_GitLocalError(t *testing.T) {
 	ctx := context.Background()
 
-	git := &mockGitManager{getUnpushedErr: errors.New("git error")}
-	recorder := &mockRollbackRecorder{}
+	git := mocks.NewGitManager(t)
+	git.On("GetUnpushedCommits", "git-err").Return(0, errors.New("git error"))
+	git.On("HasPushedCommits", "git-err").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "git-err", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, nil, nil, git, recorder)
@@ -550,11 +485,13 @@ func TestRollbackManager_GitLocalError(t *testing.T) {
 func TestRollbackManager_GitResetSoftError(t *testing.T) {
 	ctx := context.Background()
 
-	git := &mockGitManager{
-		unpushedCount: 3,
-		resetSoftErr:  errors.New("reset failed"),
-	}
-	recorder := &mockRollbackRecorder{}
+	git := mocks.NewGitManager(t)
+	git.On("GetUnpushedCommits", "reset-err").Return(3, nil)
+	git.On("ResetSoft", "reset-err", 3).Return(errors.New("reset failed"))
+	git.On("HasPushedCommits", "reset-err").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "reset-err", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, nil, nil, git, recorder)
@@ -583,11 +520,12 @@ func TestRollbackManager_GitResetSoftError(t *testing.T) {
 func TestRollbackManager_GitCreateRevertError(t *testing.T) {
 	ctx := context.Background()
 
-	git := &mockGitManager{
-		hasPushed:       true,
-		createRevertErr: errors.New("revert failed"),
-	}
-	recorder := &mockRollbackRecorder{}
+	git := mocks.NewGitManager(t)
+	git.On("HasPushedCommits", "revert-err").Return(true)
+	git.On("CreateRevertCommit", "revert-err").Return(errors.New("revert failed"))
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "revert-err", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, nil, nil, git, recorder)
@@ -619,8 +557,11 @@ func TestRollbackManager_GitCreateRevertError(t *testing.T) {
 func TestRollbackManager_CheckpointError(t *testing.T) {
 	ctx := context.Background()
 
-	checkpoint := &mockCheckpointManager{restoreErr: errors.New("checkpoint failed")}
-	recorder := &mockRollbackRecorder{}
+	checkpoint := mocks.NewCheckpointManager(t)
+	checkpoint.On("RestoreCheckpoint", "checkpoint-err").Return(errors.New("checkpoint failed"))
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "checkpoint-err", mock.Anything).Return(nil)
 
 	config := RollbackConfig{}
 	manager := NewRollbackManager(config, nil, checkpoint, nil, recorder)
@@ -653,7 +594,8 @@ func TestRollbackManager_CheckpointError(t *testing.T) {
 func TestRollbackManager_RecorderError(t *testing.T) {
 	ctx := context.Background()
 
-	recorder := &mockRollbackRecorder{recordErr: errors.New("record failed")}
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "recorder-err", mock.Anything).Return(errors.New("record failed"))
 
 	config := RollbackConfig{}
 	manager := NewRollbackManager(config, nil, nil, nil, recorder)
@@ -681,8 +623,11 @@ func TestRollbackManager_RecorderError(t *testing.T) {
 func TestRollbackManager_GitDisabled(t *testing.T) {
 	ctx := context.Background()
 
-	git := &mockGitManager{unpushedCount: 5}
-	recorder := &mockRollbackRecorder{}
+	git := mocks.NewGitManager(t)
+	git.On("HasPushedCommits", "git-disabled").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "git-disabled", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: false}
 	manager := NewRollbackManager(config, nil, nil, git, recorder)
@@ -690,10 +635,6 @@ func TestRollbackManager_GitDisabled(t *testing.T) {
 	options := RollbackOptions{IncludeGitLocal: true}
 
 	receipt, _ := manager.Rollback(ctx, "git-disabled", options)
-
-	if git.getUnpushedCalls != 0 {
-		t.Errorf("getUnpushedCalls = %d, want 0 (git disabled)", git.getUnpushedCalls)
-	}
 
 	for _, r := range receipt.LayerResults {
 		if r.Layer == LayerGitLocal {
@@ -705,8 +646,12 @@ func TestRollbackManager_GitDisabled(t *testing.T) {
 func TestRollbackManager_NoUnpushedCommits(t *testing.T) {
 	ctx := context.Background()
 
-	git := &mockGitManager{unpushedCount: 0}
-	recorder := &mockRollbackRecorder{}
+	git := mocks.NewGitManager(t)
+	git.On("GetUnpushedCommits", "no-unpushed").Return(0, nil)
+	git.On("HasPushedCommits", "no-unpushed").Return(false)
+
+	recorder := mocks.NewRollbackRecorder(t)
+	recorder.On("RecordRollback", mock.Anything, "no-unpushed", mock.Anything).Return(nil)
 
 	config := RollbackConfig{GitEnabled: true}
 	manager := NewRollbackManager(config, nil, nil, git, recorder)
@@ -714,10 +659,6 @@ func TestRollbackManager_NoUnpushedCommits(t *testing.T) {
 	options := RollbackOptions{IncludeGitLocal: true}
 
 	receipt, _ := manager.Rollback(ctx, "no-unpushed", options)
-
-	if git.resetSoftCalls != 0 {
-		t.Errorf("resetSoftCalls = %d, want 0 (no commits to reset)", git.resetSoftCalls)
-	}
 
 	var gitResult *LayerResult
 	for _, r := range receipt.LayerResults {

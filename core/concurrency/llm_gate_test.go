@@ -2,6 +2,7 @@ package concurrency
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -151,6 +152,27 @@ func (m *mockExecutor) Execute(ctx context.Context, req *LLMRequest) (any, error
 		return m.executeFunc(ctx, req)
 	}
 	return "response", nil
+}
+
+type mockBudgetChecker struct {
+	err error
+}
+
+func (m *mockBudgetChecker) CheckBudget(req *LLMRequest) error {
+	return m.err
+}
+
+type mockRateLimiter struct {
+	allow bool
+	last  atomic.Int32
+}
+
+func (m *mockRateLimiter) CanProceed() bool {
+	return m.allow
+}
+
+func (m *mockRateLimiter) RecordUsage(tokens int) {
+	m.last.Store(int32(tokens))
 }
 
 func TestNewDualQueueGate(t *testing.T) {
@@ -351,6 +373,63 @@ func TestDualQueueGate_Close(t *testing.T) {
 	err := gate.Submit(context.Background(), &LLMRequest{ID: "test"})
 	if err != ErrGateClosed {
 		t.Errorf("expected ErrGateClosed, got %v", err)
+	}
+}
+
+func TestDualQueueGate_BudgetCheck(t *testing.T) {
+	executor := &mockExecutor{}
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	checker := &mockBudgetChecker{err: ErrGateClosed}
+	gate.SetBudget(checker)
+
+	req := &LLMRequest{ID: "budget", AgentType: AgentTypeEngineer}
+	if err := gate.Submit(context.Background(), req); err != nil {
+		t.Fatalf("unexpected submit error: %v", err)
+	}
+
+	_, err := gate.SubmitAndWait(context.Background(), req)
+	if !errors.Is(err, ErrGateClosed) {
+		t.Errorf("expected budget error, got %v", err)
+	}
+}
+
+func TestDualQueueGate_RateLimit(t *testing.T) {
+	executor := &mockExecutor{}
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	limiter := &mockRateLimiter{allow: false}
+	gate.SetRateLimiter(limiter)
+
+	req := &LLMRequest{ID: "rate", AgentType: AgentTypeEngineer}
+	if err := gate.Submit(context.Background(), req); err != nil {
+		t.Fatalf("unexpected submit error: %v", err)
+	}
+
+	_, err := gate.SubmitAndWait(context.Background(), req)
+	if !errors.Is(err, ErrRateLimited) {
+		t.Errorf("expected ErrRateLimited, got %v", err)
+	}
+}
+
+func TestDualQueueGate_RecordsUsage(t *testing.T) {
+	executor := &mockExecutor{}
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	limiter := &mockRateLimiter{allow: true}
+	gate.SetRateLimiter(limiter)
+
+	req := &LLMRequest{ID: "tokens", AgentType: AgentTypeEngineer, TokenEstimate: 42}
+	_, err := gate.SubmitAndWait(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if limiter.last.Load() != 42 {
+		t.Errorf("expected tokens recorded, got %d", limiter.last.Load())
 	}
 }
 

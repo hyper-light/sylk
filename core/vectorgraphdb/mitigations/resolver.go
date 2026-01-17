@@ -210,7 +210,7 @@ func (r *UnifiedResolver) resolveUncached(ctx context.Context, query string, opt
 	}
 
 	searchResults := r.runSearchPipeline(embedding, opts, intent, metrics)
-	conflicts := r.detectConflicts(ctx, searchResults, metrics)
+	conflicts := r.detectConflictsIfEnabled(ctx, searchResults, opts.IncludeConflicts, metrics)
 	items, remaining := r.scoreAndSelect(searchResults, opts.TokenBudget, metrics)
 
 	llmContext, err := r.buildContext(items, metrics)
@@ -389,6 +389,13 @@ func (r *UnifiedResolver) applyTrust(results []vectorgraphdb.SearchResult, minTr
 
 	results = r.trust.ApplyTrust(results)
 	return r.trust.FilterByMinTrust(results, minTrust)
+}
+
+func (r *UnifiedResolver) detectConflictsIfEnabled(ctx context.Context, results []vectorgraphdb.SearchResult, include bool, metrics *PipelineMetrics) []*Conflict {
+	if !include {
+		return nil
+	}
+	return r.detectConflicts(ctx, results, metrics)
 }
 
 func (r *UnifiedResolver) detectConflicts(ctx context.Context, results []vectorgraphdb.SearchResult, metrics *PipelineMetrics) []*Conflict {

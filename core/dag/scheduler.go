@@ -279,7 +279,7 @@ func (s *Scheduler) emitEvent(event *Event) {
 
 	for _, handler := range handlers {
 		if handler != nil {
-			go handler(event)
+			handler(event)
 		}
 	}
 }

@@ -38,7 +38,7 @@ func TestAdaptiveChannel_SendReceive(t *testing.T) {
 }
 
 func TestAdaptiveChannel_SendTimeout(t *testing.T) {
-	config := AdaptiveChannelConfig{MinSize: 1, MaxSize: 1}
+	config := AdaptiveChannelConfig{MinSize: 1, MaxSize: 1, SendTimeout: 50 * time.Millisecond}
 	ch := NewAdaptiveChannel[int](config)
 	defer ch.Close()
 
@@ -47,6 +47,22 @@ func TestAdaptiveChannel_SendTimeout(t *testing.T) {
 	err := ch.SendTimeout(2, 50*time.Millisecond)
 	if err != ErrSendTimeout {
 		t.Errorf("got error %v, want %v", err, ErrSendTimeout)
+	}
+}
+
+func TestAdaptiveChannel_SendTimeout_OverflowAllowed(t *testing.T) {
+	config := AdaptiveChannelConfig{MinSize: 1, MaxSize: 1, AllowOverflow: true, SendTimeout: 50 * time.Millisecond}
+	ch := NewAdaptiveChannel[int](config)
+	defer ch.Close()
+
+	_ = ch.Send(1)
+
+	err := ch.SendTimeout(2, 50*time.Millisecond)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if ch.OverflowLen() == 0 {
+		t.Error("expected overflow to be used")
 	}
 }
 
@@ -94,13 +110,15 @@ func TestAdaptiveChannel_Close(t *testing.T) {
 }
 
 func TestAdaptiveChannel_ResizeUp(t *testing.T) {
-	config := AdaptiveChannelConfig{MinSize: 4, MaxSize: 32}
+	config := AdaptiveChannelConfig{MinSize: 4, MaxSize: 32, AllowOverflow: true, SendTimeout: 10 * time.Millisecond}
 	ch := NewAdaptiveChannel[int](config)
 	defer ch.Close()
 
 	for i := 0; i < 10; i++ {
-		_ = ch.Send(i)
+		_ = ch.SendTimeout(i, 10*time.Millisecond)
 	}
+
+	time.Sleep(AdaptInterval * 4)
 
 	stats := ch.Stats()
 	if stats.ResizeUpCount == 0 {
@@ -112,12 +130,12 @@ func TestAdaptiveChannel_ResizeUp(t *testing.T) {
 }
 
 func TestAdaptiveChannel_Overflow(t *testing.T) {
-	config := AdaptiveChannelConfig{MinSize: 2, MaxSize: 2, AllowOverflow: true}
+	config := AdaptiveChannelConfig{MinSize: 2, MaxSize: 2, AllowOverflow: true, SendTimeout: 10 * time.Millisecond}
 	ch := NewAdaptiveChannel[int](config)
 	defer ch.Close()
 
 	for i := 0; i < 5; i++ {
-		_ = ch.Send(i)
+		_ = ch.SendTimeout(i, 10*time.Millisecond)
 	}
 
 	if ch.OverflowLen() == 0 {
@@ -209,13 +227,15 @@ func receiveN(ch *AdaptiveChannel[int], n int, wg *sync.WaitGroup) {
 }
 
 func TestAdaptiveChannel_MaxSizeRespected(t *testing.T) {
-	config := AdaptiveChannelConfig{MinSize: 4, MaxSize: 8}
+	config := AdaptiveChannelConfig{MinSize: 4, MaxSize: 8, SendTimeout: time.Millisecond}
 	ch := NewAdaptiveChannel[int](config)
 	defer ch.Close()
 
 	for i := 0; i < 20; i++ {
 		ch.SendTimeout(i, time.Millisecond)
 	}
+
+	time.Sleep(AdaptInterval * 4)
 
 	if ch.Size() > 8 {
 		t.Errorf("got size %d, want <= 8", ch.Size())
