@@ -56,7 +56,7 @@ func (h *InterAgentSecretHookHandler) logRedaction(count int, data *DispatchHook
 
 	entry := NewAuditEntry(AuditCategorySecret, "secret_redacted_transit", "redact")
 	entry.SessionID = data.SessionID
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"source_agent":    data.SourceAgent,
 		"target_agent":    data.TargetAgent,
 		"redaction_count": count,

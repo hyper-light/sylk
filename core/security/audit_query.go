@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -150,24 +151,14 @@ func (q *AuditQuerier) matchesCategory(entry AuditEntry, filter QueryFilter) boo
 	if len(filter.Categories) == 0 {
 		return true
 	}
-	for _, c := range filter.Categories {
-		if entry.Category == c {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(filter.Categories, entry.Category)
 }
 
 func (q *AuditQuerier) matchesSeverity(entry AuditEntry, filter QueryFilter) bool {
 	if len(filter.Severities) == 0 {
 		return true
 	}
-	for _, s := range filter.Severities {
-		if entry.Severity == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(filter.Severities, entry.Severity)
 }
 
 func (q *AuditQuerier) matchesIdentifiers(entry AuditEntry, filter QueryFilter) bool {
@@ -345,7 +336,7 @@ func (q *AuditQuerier) logPurgeOperation(logger *AuditLogger, before time.Time, 
 		return
 	}
 	entry := NewAuditEntry(AuditCategoryConfig, "audit_purge", "purge")
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"purged_before":    before.Format(time.RFC3339),
 		"entries_retained": retained,
 	}

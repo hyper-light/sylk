@@ -28,6 +28,7 @@ type PipelineSchedulerConfig struct {
 	MaxConcurrent    int
 	FairShare        *FairShareCalculator
 	SignalDispatcher *CrossSessionSignalDispatcher
+	Registry         *Registry
 }
 
 type GlobalPipelineScheduler struct {
@@ -39,6 +40,7 @@ type GlobalPipelineScheduler struct {
 
 	fairShare        *FairShareCalculator
 	signalDispatcher *CrossSessionSignalDispatcher
+	registry         *Registry
 
 	mu     sync.Mutex
 	closed bool
@@ -50,6 +52,12 @@ type ScheduledPipelineInfo struct {
 	Priority   concurrency.PipelinePriority
 	SpawnTime  time.Time
 	Status     string
+}
+
+type pipelineUpdate struct {
+	sessionID string
+	running   int
+	queued    int
 }
 
 func NewGlobalPipelineScheduler(cfg PipelineSchedulerConfig) *GlobalPipelineScheduler {
@@ -64,14 +72,14 @@ func NewGlobalPipelineScheduler(cfg PipelineSchedulerConfig) *GlobalPipelineSche
 		sessionQueued:    make(map[string]*concurrency.PipelinePriorityQueue),
 		fairShare:        cfg.FairShare,
 		signalDispatcher: cfg.SignalDispatcher,
+		registry:         cfg.Registry,
 	}
 }
 
 func (s *GlobalPipelineScheduler) Schedule(ctx context.Context, sessionID string, p *concurrency.SchedulablePipeline) (bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.closed {
+		s.mu.Unlock()
 		return false, ErrSchedulerClosed
 	}
 
@@ -82,7 +90,12 @@ func (s *GlobalPipelineScheduler) Schedule(ctx context.Context, sessionID string
 		s.queuePipeline(sessionID, p)
 	}
 
+	running := s.sessionActive[sessionID]
+	queued := s.queueLength(sessionID)
+	s.mu.Unlock()
+
 	s.notifyScheduled(sessionID, p, scheduled)
+	s.heartbeatSession(sessionID, running, queued)
 	return scheduled, nil
 }
 
@@ -93,6 +106,9 @@ func (s *GlobalPipelineScheduler) ensureSessionQueue(sessionID string) {
 }
 
 func (s *GlobalPipelineScheduler) tryScheduleImmediate(sessionID string, p *concurrency.SchedulablePipeline) bool {
+	if p == nil {
+		return false
+	}
 	if !s.hasGlobalCapacity() {
 		return false
 	}
@@ -137,6 +153,31 @@ func (s *GlobalPipelineScheduler) queuePipeline(sessionID string, p *concurrency
 	s.sessionQueued[sessionID].Push(p)
 }
 
+func (s *GlobalPipelineScheduler) queueLength(sessionID string) int {
+	queue := s.sessionQueued[sessionID]
+	if queue == nil {
+		return 0
+	}
+	return queue.Len()
+}
+
+func (s *GlobalPipelineScheduler) heartbeatSession(sessionID string, running, queued int) {
+	if s.registry == nil {
+		return
+	}
+	if running == 0 && queued == 0 {
+		s.registry.Touch(sessionID)
+		return
+	}
+	s.registry.Heartbeat(sessionID, running, queued)
+}
+
+func (s *GlobalPipelineScheduler) applyPipelineUpdates(updates []pipelineUpdate) {
+	for _, update := range updates {
+		s.heartbeatSession(update.sessionID, update.running, update.queued)
+	}
+}
+
 func (s *GlobalPipelineScheduler) notifyScheduled(sessionID string, p *concurrency.SchedulablePipeline, immediate bool) {
 	if s.signalDispatcher == nil {
 		return
@@ -163,15 +204,20 @@ func (s *GlobalPipelineScheduler) notifyScheduled(sessionID string, p *concurren
 
 func (s *GlobalPipelineScheduler) OnPipelineComplete(sessionID string, pipelineID string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.closed {
+		s.mu.Unlock()
 		return ErrSchedulerClosed
 	}
 
 	s.decrementActive(sessionID)
+	updates := s.dispatchWaiting()
+	running := s.sessionActive[sessionID]
+	queued := s.queueLength(sessionID)
+	s.mu.Unlock()
+
 	s.notifyCompleted(sessionID, pipelineID)
-	s.dispatchWaiting()
+	s.heartbeatSession(sessionID, running, queued)
+	s.applyPipelineUpdates(updates)
 
 	return nil
 }
@@ -203,27 +249,36 @@ func (s *GlobalPipelineScheduler) notifyCompleted(sessionID string, pipelineID s
 	})
 }
 
-func (s *GlobalPipelineScheduler) dispatchWaiting() {
+func (s *GlobalPipelineScheduler) dispatchWaiting() []pipelineUpdate {
+	var updates []pipelineUpdate
 	for sessionID := range s.sessionQueued {
-		if s.tryDispatchFromSession(sessionID) {
-			return
+		update, dispatched := s.tryDispatchFromSession(sessionID)
+		if dispatched {
+			updates = append(updates, update)
+			break
 		}
 	}
+	return updates
 }
 
-func (s *GlobalPipelineScheduler) tryDispatchFromSession(sessionID string) bool {
+func (s *GlobalPipelineScheduler) tryDispatchFromSession(sessionID string) (pipelineUpdate, bool) {
 	if !s.canDispatchToSession(sessionID) {
-		return false
+		return pipelineUpdate{}, false
 	}
 
 	if !s.hasQueuedPipelines(sessionID) {
-		return false
+		return pipelineUpdate{}, false
 	}
 
 	s.sessionQueued[sessionID].Pop()
 	s.sessionActive[sessionID]++
 	s.totalActive++
-	return true
+
+	return pipelineUpdate{
+		sessionID: sessionID,
+		running:   s.sessionActive[sessionID],
+		queued:    s.queueLength(sessionID),
+	}, true
 }
 
 func (s *GlobalPipelineScheduler) canDispatchToSession(sessionID string) bool {

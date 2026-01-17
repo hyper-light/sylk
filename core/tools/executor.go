@@ -212,7 +212,7 @@ func (e *ToolExecutor) executeWithSlot(ctx context.Context, inv ToolInvocation) 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	return e.runAndWait(ctx, cmd, pg, inv, stdout, stderr)
+	return e.runAndWait(ctx, pg, inv, stdout, stderr)
 }
 
 func (e *ToolExecutor) buildCommand(ctx context.Context, inv ToolInvocation) *exec.Cmd {
@@ -272,11 +272,11 @@ func (e *ToolExecutor) filterBlocklist(env []string) []string {
 }
 
 func extractEnvKey(entry string) string {
-	idx := strings.Index(entry, "=")
-	if idx == -1 {
+	key, _, found := strings.Cut(entry, "=")
+	if !found {
 		return entry
 	}
-	return entry[:idx]
+	return key
 }
 
 func (e *ToolExecutor) matchesBlocklist(key string) bool {
@@ -361,7 +361,7 @@ func (e *ToolExecutor) setupOutputStreams(inv ToolInvocation) (io.Writer, io.Wri
 	return NewStreamWriter(streamTo, 1024*1024), NewStreamWriter(streamTo, 1024*1024)
 }
 
-func getStreamWriter(streamTo interface{}) io.Writer {
+func getStreamWriter(streamTo any) io.Writer {
 	if streamTo == nil {
 		return nil
 	}
@@ -371,7 +371,7 @@ func getStreamWriter(streamTo interface{}) io.Writer {
 	return nil
 }
 
-func getStdinReader(stdin interface{}) io.Reader {
+func getStdinReader(stdin any) io.Reader {
 	if stdin == nil {
 		return nil
 	}
@@ -381,7 +381,7 @@ func getStdinReader(stdin interface{}) io.Reader {
 	return nil
 }
 
-func (e *ToolExecutor) runAndWait(ctx context.Context, cmd *exec.Cmd, pg *ProcessGroup, inv ToolInvocation, stdout, stderr io.Writer) (*ToolResult, error) {
+func (e *ToolExecutor) runAndWait(ctx context.Context, pg *ProcessGroup, inv ToolInvocation, stdout, stderr io.Writer) (*ToolResult, error) {
 	startTime := time.Now()
 
 	if err := pg.Start(); err != nil {

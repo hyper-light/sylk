@@ -197,8 +197,9 @@ func TestAuditLogger_ConcurrentLogging(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			entry := NewAuditEntry(AuditCategorySession, "session_event", "event")
-			entry.Details = map[string]interface{}{"iteration": i}
+			entry.Details = map[string]any{"iteration": i}
 			_ = al.Log(entry)
+
 		}(i)
 	}
 	wg.Wait()
@@ -395,7 +396,7 @@ func TestAuditEntry_Builder(t *testing.T) {
 		WithOutcome("denied").
 		WithSessionID("sess-1").
 		WithAgentID("agent-1").
-		WithDetails(map[string]interface{}{"reason": "sensitive"})
+		WithDetails(map[string]any{"reason": "sensitive"})
 
 	assert.Equal(t, AuditCategoryFile, entry.Category)
 	assert.Equal(t, AuditSeverityWarning, entry.Severity)

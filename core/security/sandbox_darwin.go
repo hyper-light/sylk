@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 type DarwinOSWrapper struct {
@@ -61,38 +62,46 @@ func (w *DarwinOSWrapper) WrapCommand(cmd *exec.Cmd, workDir string, allowedPath
 }
 
 func (w *DarwinOSWrapper) generateProfile(workDir string, allowedPaths []string) string {
-	profile := "(version 1)\n"
-	profile += "(deny default)\n"
-	profile += "(allow process-fork)\n"
-	profile += "(allow process-exec)\n"
-	profile += "(allow sysctl-read)\n"
-	profile += "(allow mach-lookup)\n"
-	profile += "(allow signal)\n"
+	var builder strings.Builder
+	builder.Grow(512)
 
-	profile += "(allow file-read* (subpath \"/usr\"))\n"
-	profile += "(allow file-read* (subpath \"/bin\"))\n"
-	profile += "(allow file-read* (subpath \"/sbin\"))\n"
-	profile += "(allow file-read* (subpath \"/Library\"))\n"
-	profile += "(allow file-read* (subpath \"/System\"))\n"
-	profile += "(allow file-read* (literal \"/dev/null\"))\n"
-	profile += "(allow file-read* (literal \"/dev/urandom\"))\n"
-	profile += "(allow file-read* (literal \"/private/etc/resolv.conf\"))\n"
-	profile += "(allow file-read* (subpath \"/private/etc/ssl\"))\n"
-	profile += "(allow file-read-data (subpath \"/dev\"))\n"
-	profile += "(allow file-write-data (subpath \"/dev/null\"))\n"
+	builder.WriteString("(version 1)\n")
+	builder.WriteString("(deny default)\n")
+	builder.WriteString("(allow process*)\n")
+	builder.WriteString("(allow sysctl*)\n")
+	builder.WriteString("(allow file-read* (subpath \"/usr\"))\n")
+	builder.WriteString("(allow file-read* (subpath \"/bin\"))\n")
+	builder.WriteString("(allow file-read* (subpath \"/sbin\"))\n")
+	builder.WriteString("(allow file-read* (subpath \"/Library\"))\n")
+	builder.WriteString("(allow file-read* (subpath \"/System\"))\n")
+	builder.WriteString("(allow file-read* (literal \"/dev/null\"))\n")
+	builder.WriteString("(allow file-read* (literal \"/dev/urandom\"))\n")
+	builder.WriteString("(allow file-read* (literal \"/private/etc/resolv.conf\"))\n")
+	builder.WriteString("(allow file-read* (subpath \"/private/etc/ssl\"))\n")
+	builder.WriteString("(allow file-read-data (subpath \"/dev\"))\n")
+	builder.WriteString("(allow file-write-data (subpath \"/dev/null\"))\n")
 
 	if workDir != "" {
-		profile += "(allow file-read* (subpath \"" + workDir + "\"))\n"
-		profile += "(allow file-write* (subpath \"" + workDir + "\"))\n"
+		builder.WriteString("(allow file-read* (subpath \"")
+		builder.WriteString(workDir)
+		builder.WriteString("\"))\n")
+		builder.WriteString("(allow file-write* (subpath \"")
+		builder.WriteString(workDir)
+		builder.WriteString("\"))\n")
 	}
 
 	for _, path := range allowedPaths {
-		profile += "(allow file-read* (subpath \"" + path + "\"))\n"
-		profile += "(allow file-write* (subpath \"" + path + "\"))\n"
+		builder.WriteString("(allow file-read* (subpath \"")
+		builder.WriteString(path)
+		builder.WriteString("\"))\n")
+		builder.WriteString("(allow file-write* (subpath \"")
+		builder.WriteString(path)
+		builder.WriteString("\"))\n")
 	}
 
-	profile += "(allow network-outbound)\n"
-	profile += "(allow network-inbound)\n"
+	builder.WriteString("(allow network-outbound)\n")
+	builder.WriteString("(allow network-inbound)\n")
 
-	return profile
+	return builder.String()
+
 }

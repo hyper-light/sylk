@@ -2,6 +2,7 @@ package tools
 
 import (
 	"errors"
+	"slices"
 	"sync"
 )
 
@@ -109,11 +110,8 @@ func (r *ToolCredentialRegistry) ListToolsRequiringCredential(provider string) [
 
 	var tools []string
 	for name, meta := range r.tools {
-		for _, p := range meta.RequiredCredentials {
-			if p == provider {
-				tools = append(tools, name)
-				break
-			}
+		if slices.Contains(meta.RequiredCredentials, provider) {
+			tools = append(tools, name)
 		}
 	}
 	return tools

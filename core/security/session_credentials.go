@@ -2,6 +2,7 @@ package security
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"time"
 )
@@ -177,12 +178,7 @@ func (m *SessionCredentialManager) SetProfileOverride(profile string) error {
 }
 
 func containsProfile(profiles []string, target string) bool {
-	for _, p := range profiles {
-		if p == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(profiles, target)
 }
 
 func (m *SessionCredentialManager) ClearProfileOverride() {
@@ -276,7 +272,7 @@ func (m *SessionCredentialManager) logCredentialAccess(provider string, source C
 	entry.SessionID = m.sessionID
 	entry.Target = provider
 	entry.Outcome = outcome
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"source": string(source),
 	}
 	_ = m.auditLogger.Log(entry)
@@ -290,7 +286,7 @@ func (m *SessionCredentialManager) logTempCredentialSet(provider string, ttl tim
 	entry := NewAuditEntry(AuditCategoryPermission, "temp_credential_set", "set")
 	entry.SessionID = m.sessionID
 	entry.Target = provider
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"ttl_seconds": ttl.Seconds(),
 	}
 	_ = m.auditLogger.Log(entry)

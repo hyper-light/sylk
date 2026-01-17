@@ -243,11 +243,12 @@ func (s *Sandbox) logExecution(cmd *exec.Cmd, errs []error) {
 		for i, e := range errs {
 			errStrs[i] = e.Error()
 		}
-		entry.Details = map[string]interface{}{
+		entry.Details = map[string]any{
 			"errors": errStrs,
 		}
 	} else {
 		entry.Outcome = "success"
+		entry.Details = map[string]any{}
 	}
 	entry.Details["layers"] = s.activeLayers()
 	_ = s.auditLogger.Log(entry)

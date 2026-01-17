@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -177,7 +178,7 @@ func TestPostToolSecretHook_NoLeakedSecrets(t *testing.T) {
 
 	data := &ToolCallHookData{
 		ToolName: "test",
-		Output:   joinStrs(secrets, " "),
+		Output:   strings.Join(secrets, " "),
 	}
 
 	result, _ := hook.Handle(context.Background(), data)
@@ -203,40 +204,40 @@ func TestPreToolEnvVarHook_BlocksSecrets(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		params      map[string]interface{}
+		params      map[string]any
 		shouldError bool
 	}{
 		{
 			name: "connection_string",
-			params: map[string]interface{}{
+			params: map[string]any{
 				"database": "postgres://user:password123@localhost:5432/db",
 			},
 			shouldError: true,
 		},
 		{
 			name: "api_key_value",
-			params: map[string]interface{}{
+			params: map[string]any{
 				"token": "api_key = 'abc123def456ghi789jkl012mno'",
 			},
 			shouldError: true,
 		},
 		{
 			name: "normal_string",
-			params: map[string]interface{}{
+			params: map[string]any{
 				"path": "/home/user/file.txt",
 			},
 			shouldError: false,
 		},
 		{
 			name: "file_path",
-			params: map[string]interface{}{
+			params: map[string]any{
 				"file": "/etc/hosts",
 			},
 			shouldError: false,
 		},
 		{
 			name: "integer_param",
-			params: map[string]interface{}{
+			params: map[string]any{
 				"count": 42,
 			},
 			shouldError: false,
@@ -282,7 +283,7 @@ func TestPreToolEnvVarHook_ErrorMessage(t *testing.T) {
 
 	data := &ToolCallHookData{
 		ToolName: "database_tool",
-		Parameters: map[string]interface{}{
+		Parameters: map[string]any{
 			"connection": "postgres://user:secret@localhost/db",
 		},
 	}
@@ -373,10 +374,11 @@ func TestHooksAuditLogging(t *testing.T) {
 	preToolHook := NewPreToolEnvVarHook(sanitizer, logger)
 	envData := &ToolCallHookData{
 		ToolName: "db_tool",
-		Parameters: map[string]interface{}{
+		Parameters: map[string]any{
 			"conn": "postgres://u:p@host/db",
 		},
 	}
+
 	preToolHook.Handle(context.Background(), envData)
 
 	logger.Close()
@@ -391,21 +393,5 @@ func strContains(s, substr string) bool {
 }
 
 func findSubstr(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-func joinStrs(strs []string, sep string) string {
-	if len(strs) == 0 {
-		return ""
-	}
-	result := strs[0]
-	for i := 1; i < len(strs); i++ {
-		result += sep + strs[i]
-	}
-	return result
+	return strings.Contains(s, substr)
 }

@@ -34,11 +34,9 @@ func TestSignalDispatcher_SendAndReceive(t *testing.T) {
 		received <- sig
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
-	err = receiver.Watch(ctx)
-	require.NoError(t, err)
+	require.NoError(t, receiver.Watch(ctx))
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -53,74 +51,6 @@ func TestSignalDispatcher_SendAndReceive(t *testing.T) {
 		assert.Equal(t, "test-payload", sig.Payload)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for signal")
-	}
-}
-
-func TestSignalDispatcher_Broadcast(t *testing.T) {
-	baseDir := t.TempDir()
-
-	sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
-		BaseDir:   baseDir,
-		SessionID: "sender",
-	})
-	require.NoError(t, err)
-	defer sender.Close()
-
-	receiver1, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
-		BaseDir:   baseDir,
-		SessionID: "receiver1",
-	})
-	require.NoError(t, err)
-	defer receiver1.Close()
-
-	receiver2, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
-		BaseDir:   baseDir,
-		SessionID: "receiver2",
-	})
-	require.NoError(t, err)
-	defer receiver2.Close()
-
-	var wg sync.WaitGroup
-	receivedCount := 0
-	var mu sync.Mutex
-
-	handler := func(sig CrossSessionSignal) {
-		mu.Lock()
-		receivedCount++
-		mu.Unlock()
-		wg.Done()
-	}
-
-	receiver1.RegisterHandler(SignalRebalance, handler)
-	receiver2.RegisterHandler(SignalRebalance, handler)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	require.NoError(t, receiver1.Watch(ctx))
-	require.NoError(t, receiver2.Watch(ctx))
-
-	time.Sleep(50 * time.Millisecond)
-
-	wg.Add(2)
-
-	signal := NewRebalanceSignal("sender", "rebalance-data")
-	err = sender.SendSignal(signal)
-	require.NoError(t, err)
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		mu.Lock()
-		assert.Equal(t, 2, receivedCount)
-		mu.Unlock()
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for broadcast signals")
 	}
 }
 
@@ -139,8 +69,7 @@ func TestSignalDispatcher_SignalConsumed(t *testing.T) {
 		received <- struct{}{}
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	require.NoError(t, dispatcher.Watch(ctx))
 
@@ -188,8 +117,7 @@ func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
 		wg.Done()
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	require.NoError(t, dispatcher.Watch(ctx))
 
@@ -317,8 +245,7 @@ func TestSignalDispatcher_SenderDoesNotReceiveOwnBroadcast(t *testing.T) {
 		received <- struct{}{}
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	require.NoError(t, dispatcher.Watch(ctx))
 

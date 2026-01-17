@@ -39,10 +39,10 @@ type AuditEntry struct {
 	AgentID    string `json:"agent_id,omitempty"`
 	WorkflowID string `json:"workflow_id,omitempty"`
 
-	Action  string                 `json:"action"`
-	Target  string                 `json:"target,omitempty"`
-	Outcome string                 `json:"outcome"`
-	Details map[string]interface{} `json:"details,omitempty"`
+	Action  string         `json:"action"`
+	Target  string         `json:"target,omitempty"`
+	Outcome string         `json:"outcome"`
+	Details map[string]any `json:"details,omitempty"`
 
 	PreviousHash string `json:"previous_hash"`
 	EntryHash    string `json:"entry_hash"`
@@ -99,7 +99,7 @@ func (e *AuditEntry) WithAgentID(id string) *AuditEntry {
 	return e
 }
 
-func (e *AuditEntry) WithDetails(d map[string]interface{}) *AuditEntry {
+func (e *AuditEntry) WithDetails(d map[string]any) *AuditEntry {
 	e.Details = d
 	return e
 }

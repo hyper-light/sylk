@@ -236,6 +236,7 @@ func (m *MultiSessionWALManager) scanSessionInfoRows(rows *sql.Rows) ([]SessionW
 }
 
 func (m *MultiSessionWALManager) recoverSession(ctx context.Context, info SessionWALInfo) {
+	_ = ctx
 	_, err := m.createSessionWAL(info.SessionID)
 	if err != nil {
 		return

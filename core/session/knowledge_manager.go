@@ -230,10 +230,10 @@ func (m *SessionKnowledgeManager) queryDB(db *sql.DB, query string, opts QueryOp
 	return m.scanEntries(rows)
 }
 
-func (m *SessionKnowledgeManager) buildQuery(query string, opts QueryOpts) (string, []interface{}) {
+func (m *SessionKnowledgeManager) buildQuery(query string, opts QueryOpts) (string, []any) {
 	sql := `SELECT id, scope, session_id, type, key, value, metadata, created_at, updated_at
 		FROM knowledge WHERE (key LIKE ? OR value LIKE ?)`
-	args := []interface{}{"%" + query + "%", "%" + query + "%"}
+	args := []any{"%" + query + "%", "%" + query + "%"}
 
 	if opts.Type != "" {
 		sql += " AND type = ?"

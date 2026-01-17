@@ -174,7 +174,7 @@ func (al *AuditLogger) maybeSignAndRotate() error {
 
 func (al *AuditLogger) computeEntryHash(entry AuditEntry) string {
 	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%d", entry.Sequence)))
+	_, _ = fmt.Fprintf(h, "%d", entry.Sequence)
 	h.Write([]byte(entry.PreviousHash))
 	h.Write([]byte(entry.Timestamp.Format(time.RFC3339Nano)))
 	h.Write([]byte(entry.Category))
@@ -286,6 +286,7 @@ func (al *AuditLogger) verifyLine(line string, prevHash *string, lastSeq *uint64
 }
 
 func (al *AuditLogger) verifySignatureLine(sigJSON, prevHash string, report *IntegrityReport) {
+	_ = prevHash
 	var sig AuditSignature
 	if err := json.Unmarshal([]byte(sigJSON), &sig); err != nil {
 		report.Errors = append(report.Errors, "invalid signature format")
@@ -367,7 +368,7 @@ func (al *AuditLogger) LogPermissionGranted(agentID string, action PermissionAct
 	entry.AgentID = agentID
 	entry.Target = action.Target
 	entry.Outcome = "allowed"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"action_type": string(action.Type),
 		"source":      source,
 	}
@@ -380,7 +381,7 @@ func (al *AuditLogger) LogPermissionDenied(agentID string, action PermissionActi
 	entry.AgentID = agentID
 	entry.Target = action.Target
 	entry.Outcome = "denied"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"action_type": string(action.Type),
 		"reason":      reason,
 	}
@@ -392,7 +393,7 @@ func (al *AuditLogger) LogFileOperation(op, path, agentID string, size int64, ha
 	entry.AgentID = agentID
 	entry.Target = path
 	entry.Outcome = "success"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"size": size,
 		"hash": hash,
 	}
@@ -404,7 +405,7 @@ func (al *AuditLogger) LogProcessExecution(cmd, agentID string, exitCode int) {
 	entry.AgentID = agentID
 	entry.Target = cmd
 	entry.Outcome = fmt.Sprintf("exit_%d", exitCode)
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"exit_code": exitCode,
 	}
 	_ = al.Log(entry)
@@ -414,7 +415,7 @@ func (al *AuditLogger) LogNetworkAllowed(domain, url string) {
 	entry := NewAuditEntry(AuditCategoryNetwork, "network_allowed", "allow")
 	entry.Target = domain
 	entry.Outcome = "allowed"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"url": url,
 	}
 	_ = al.Log(entry)
@@ -425,7 +426,7 @@ func (al *AuditLogger) LogNetworkBlocked(domain, url string) {
 	entry.Severity = AuditSeveritySecurity
 	entry.Target = domain
 	entry.Outcome = "blocked"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"url": url,
 	}
 	_ = al.Log(entry)
@@ -435,7 +436,7 @@ func (al *AuditLogger) LogLLMCall(provider, model string, tokens int, cost float
 	entry := NewAuditEntry(AuditCategoryLLM, "llm_call", "call")
 	entry.Target = provider
 	entry.Outcome = "success"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"model":  model,
 		"tokens": tokens,
 		"cost":   cost,

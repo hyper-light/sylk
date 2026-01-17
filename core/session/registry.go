@@ -323,6 +323,23 @@ func (r *Registry) calculateActivityScore(runningPipelines, recentInvocations in
 	return float64(runningPipelines) + float64(recentInvocations)*r.config.ActivityDecayRate
 }
 
+func (r *Registry) Touch(sessionID string) error {
+	if err := r.checkClosed(); err != nil {
+		return err
+	}
+
+	result, err := r.db.Exec(`
+		UPDATE sessions
+		SET last_heartbeat = ?
+		WHERE session_id = ?
+	`, time.Now(), sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to touch session: %w", err)
+	}
+
+	return r.checkRowsAffected(result, ErrRegistrySessionNotFound)
+}
+
 // =============================================================================
 // Session Discovery
 // =============================================================================
