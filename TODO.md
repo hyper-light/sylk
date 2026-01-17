@@ -5498,37 +5498,37 @@ Implements N_CPU_CORES bounded pipeline scheduling with priority ordering.
 **Acceptance Criteria:**
 
 #### Scheduler Core
-- [ ] `PipelineScheduler` struct with configurable `maxConcurrent`
-- [ ] Default `maxConcurrent = runtime.NumCPU()`
-- [ ] Active map: `map[string]*Pipeline` (currently executing)
-- [ ] Ready queue: priority-ordered pipelines awaiting slots
-- [ ] Waiting map: pipelines blocked on dependencies
+- [x] `PipelineScheduler` struct with configurable `maxConcurrent`
+- [x] Default `maxConcurrent = runtime.NumCPU()`
+- [x] Active map: `map[string]*Pipeline` (currently executing)
+- [x] Ready queue: priority-ordered pipelines awaiting slots
+- [x] Waiting map: pipelines blocked on dependencies
 
 #### Priority Queue
-- [ ] Priority by: Architect-assigned priority (primary), spawn time (secondary)
-- [ ] `Push(pipeline *Pipeline)`
-- [ ] `Pop() *Pipeline` - returns highest priority
-- [ ] `Remove(pipelineID string)` - for cancellation
-- [ ] `Len() int`
+- [x] Priority by: Architect-assigned priority (primary), spawn time (secondary)
+- [x] `Push(pipeline *Pipeline)`
+- [x] `Pop() *Pipeline` - returns highest priority
+- [x] `Remove(pipelineID string)` - for cancellation
+- [x] `Len() int`
 
 #### Scheduling Logic
-- [ ] `Schedule(pipeline *Pipeline) error` - enqueue for execution
-- [ ] Eager scheduling: start immediately when slot available
-- [ ] `NotifyComplete(pipelineID string)` - release slot, schedule next
-- [ ] `Cancel(pipelineID string)` - remove from any queue/active
+- [x] `Schedule(pipeline *Pipeline) error` - enqueue for execution
+- [x] Eager scheduling: start immediately when slot available
+- [x] `NotifyComplete(pipelineID string)` - release slot, schedule next
+- [x] `Cancel(pipelineID string)` - remove from any queue/active
 
 #### Dependency Management
-- [ ] Pipelines specify dependencies (other pipeline IDs)
-- [ ] Pipeline moves ready → waiting if dependencies incomplete
-- [ ] Dependency completion triggers re-evaluation
-- [ ] Circular dependency detection with error
+- [x] Pipelines specify dependencies (other pipeline IDs)
+- [x] Pipeline moves ready → waiting if dependencies incomplete
+- [x] Dependency completion triggers re-evaluation
+- [x] Circular dependency detection with error
 
 **Tests:**
-- [ ] Respects maxConcurrent limit
-- [ ] Priority ordering correct
-- [ ] Dependencies block correctly
-- [ ] Completion triggers next pipeline
-- [ ] Cancellation cleans up properly
+- [x] Respects maxConcurrent limit
+- [x] Priority ordering correct
+- [x] Dependencies block correctly
+- [x] Completion triggers next pipeline
+- [x] Cancellation cleans up properly
 
 ---
 
@@ -6157,27 +6157,27 @@ Implements Archivalist-powered context briefing for retry attempts.
 **Acceptance Criteria:**
 
 #### Retry Briefing
-- [ ] `RetryBriefing` struct: prior attempts, failure analysis, suggested approach, avoid patterns
-- [ ] `AttemptSummary`: timestamp, approach, error, tokens spent, phases complete
+- [x] `RetryBriefing` struct: prior attempts, failure analysis, suggested approach, avoid patterns
+- [x] `AttemptSummary`: timestamp, approach, error, tokens spent, phases complete
 
 #### Briefing Preparation
-- [ ] `PrepareRetryBriefing(ctx, pipelineID, error) (*RetryBriefing, error)`
-- [ ] Query Archivalist for prior attempts on this task
-- [ ] Analyze failure patterns across attempts
-- [ ] Generate suggested approach avoiding prior failures
-- [ ] List explicit "avoid patterns" from failures
+- [x] `PrepareRetryBriefing(ctx, pipelineID, error) (*RetryBriefing, error)`
+- [x] Query Archivalist for prior attempts on this task
+- [x] Analyze failure patterns across attempts
+- [x] Generate suggested approach avoiding prior failures
+- [x] List explicit "avoid patterns" from failures
 
 #### Agent Integration
-- [ ] Briefing injected into agent context before retry
-- [ ] Agent sees: "Attempt 2. Prior attempt failed due to X. Avoid Y. Try Z."
-- [ ] Prevents token waste from rediscovery
-- [ ] Archivalist non-fatal: proceed without history if unavailable
+- [x] Briefing injected into agent context before retry
+- [x] Agent sees: "Attempt 2. Prior attempt failed due to X. Avoid Y. Try Z."
+- [x] Prevents token waste from rediscovery
+- [x] Archivalist non-fatal: proceed without history if unavailable
 
 **Tests:**
-- [ ] Briefing generated from Archivalist data
-- [ ] Avoid patterns extracted correctly
-- [ ] Suggested approach differs from failed attempts
-- [ ] Graceful degradation without Archivalist
+- [x] Briefing generated from Archivalist data
+- [x] Avoid patterns extracted correctly
+- [x] Suggested approach differs from failed attempts
+- [x] Graceful degradation without Archivalist
 
 ---
 
@@ -6194,44 +6194,44 @@ Implements multi-layer rollback with history preservation.
 **Acceptance Criteria:**
 
 #### Rollback Layers
-- [ ] Layer 1: File staging (discard staging dir)
-- [ ] Layer 2: Agent state (reset context to checkpoint)
-- [ ] Layer 3: Git state (local: reset --soft, pushed: user decision)
-- [ ] Layer 4: External state (log calls, flag as inconsistent)
+- [x] Layer 1: File staging (discard staging dir)
+- [x] Layer 2: Agent state (reset context to checkpoint)
+- [x] Layer 3: Git state (local: reset --soft, pushed: user decision)
+- [x] Layer 4: External state (log calls, flag as inconsistent)
 
 #### Rollback Execution
-- [ ] `RollbackManager` coordinates all layers
-- [ ] `Rollback(pipelineID, options) (*RollbackReceipt, error)`
-- [ ] Atomic where possible (staging, git local)
-- [ ] User decision required for pushed commits
-- [ ] Never auto-revert pushed changes
+- [x] `RollbackManager` coordinates all layers
+- [x] `Rollback(pipelineID, options) (*RollbackReceipt, error)`
+- [x] Atomic where possible (staging, git local)
+- [x] User decision required for pushed commits
+- [x] Never auto-revert pushed changes
 
 #### History Preservation
 - [ ] Archivalist marks attempt as "rolled_back" (doesn't forget)
-- [ ] Failure record preserved for learning
-- [ ] Queryable for future retry briefings
+- [x] Failure record preserved for learning
+- [x] Queryable for future retry briefings
 
 #### Rollback Receipt
 - [ ] `RollbackReceipt` struct: what was undone, what couldn't be undone
-- [ ] Staged files discarded (count)
-- [ ] Agent context reset (yes/no)
-- [ ] Local commits removed (count)
-- [ ] Pushed commits (user action needed)
-- [ ] External calls logged (cannot undo)
+- [x] Staged files discarded (count)
+- [x] Agent context reset (yes/no)
+- [x] Local commits removed (count)
+- [x] Pushed commits (user action needed)
+- [x] External calls logged (cannot undo)
 
 #### User Presentation
-- [ ] Receipt shown to user after rollback
-- [ ] Clear indication of what was undone
-- [ ] Warnings for external state inconsistency
-- [ ] Options for pushed commits
+- [x] Receipt shown to user after rollback
+- [x] Clear indication of what was undone
+- [x] Warnings for external state inconsistency
+- [x] Options for pushed commits
 
 **Tests:**
-- [ ] Staging rollback works
-- [ ] Agent state reset works
-- [ ] Local git rollback works
-- [ ] Pushed commits not auto-reverted
-- [ ] Receipt accurate
-- [ ] Archivalist records failure
+- [x] Staging rollback works
+- [x] Agent state reset works
+- [x] Local git rollback works
+- [x] Pushed commits not auto-reverted
+- [x] Receipt accurate
+- [x] Archivalist records failure
 
 ---
 
@@ -18187,10 +18187,27 @@ Main Orchestrator agent with system prompt and initialization.
 - [ ] Identity: Claude Haiku 4.5, read-only observer
 - [ ] No authority to modify, refuse, or dispute plans
 - [ ] User and Architect are ULTIMATE authority
-- [ ] Responsibilities: status queries, push updates, summaries, report failures
-- [ ] Non-responsibilities: modify order, retry policy, cancel tasks, allocate resources
+- [ ] Responsibilities:
+  - [ ] Status queries (query_task_status, query_workflow_status)
+  - [ ] Push updates (push_status_update)
+  - [ ] Generate summaries (generate_workflow_summary)
+  - [ ] Report failures (report_failure)
+  - [ ] **Submit task events to Archivalist for EVERY terminal state (CRITICAL)**
+  - [ ] **Query Archivalist for failure patterns when relevant**
+- [ ] Non-responsibilities: modify order, retry policy, cancel tasks, allocate resources, filter events
 - [ ] Communication style: concise, factual, status-focused
 - [ ] Status reporting format: "Task [ID] ([name]): [status] | Duration: [time] | Last activity: [description]"
+- [ ] Archivalist Integration section:
+  - [ ] MANDATORY event submission on completed/failed/cancelled
+  - [ ] Build TaskCompletionRecord, TaskFailureRecord, or TaskCancelRecord
+  - [ ] Submit via submit_task_event (non-blocking)
+  - [ ] Query patterns via archivalist_request (synchronous)
+- [ ] On Task Terminal State section:
+  - [ ] Detect terminal state
+  - [ ] Build TaskEvent with appropriate record
+  - [ ] Call submit_task_event (background, non-blocking)
+  - [ ] Log failures but continue workflow
+- [ ] Available Skills list: query_task_status, query_workflow_status, push_status_update, generate_workflow_summary, report_failure, submit_task_event, archivalist_request
 
 #### Orchestrator Struct
 - [ ] `Orchestrator` with bufferRegistry, healthMonitor, dagExecutor, variantManager, guide, archivalist
@@ -20528,14 +20545,14 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 2C: Error Handling & Recovery                                     ││
+│ │ PARALLEL GROUP 2C: Error Handling & Recovery (DONE)                              ││
 │ │ • 0.24 Recovery Manager (DONE)                                                   ││
 │ │ • 0.27 Transient Error Tracker (DONE)                                            ││
 │ │ • 0.28 Retry Policies (DONE)                                                     ││
 │ │ • 0.29 Circuit Breaker (DONE)                                                    ││
 │ │ • 0.30 Escalation Chain (DONE)                                                   ││
-│ │ • 0.31 Retry Briefing System                                                     ││
-│ │ • 0.32 Rollback Manager                                                          ││
+│ │ • 0.31 Retry Briefing System (DONE)                                              ││
+│ │ • 0.32 Rollback Manager (DONE)                                                   ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -20699,9 +20716,16 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • 6.134 Plan Modification Handling (add/cancel/modify tasks, variants)           ││
 │ │ • 6.135 Crash Recovery (checkpoint resume via Architect consultation)            ││
 │ │ • 6.136 Guide Routing Integration (5 route rules incl. Archivalist)              ││
-│ │ • 6.137 Orchestrator Agent Core (Claude Haiku 4.5, read-only observer)           ││
+│ │ • 6.137 Orchestrator Agent Core + System Prompt (Claude Haiku 4.5, Archivalist   ││
+│ │         integration, 7 skills, mandatory task event submission)                  ││
 │ │ • 6.138 Orchestrator Integration Tests                                           ││
 │ │ • 6.139 Task Completion Event Submission (Archivalist integration)               ││
+│ │                                                                                  ││
+│ │ SYSTEM PROMPT HIGHLIGHTS (6.137):                                                ││
+│ │   - Identity: Claude Haiku 4.5, read-only observer                               ││
+│ │   - CRITICAL: Submit task events to Archivalist for ALL terminal states          ││
+│ │   - Query Archivalist for failure patterns                                       ││
+│ │   - 7 skills available (incl. submit_task_event, archivalist_request)            ││
 │ │                                                                                  ││
 │ │ INTERNAL DEPENDENCIES:                                                           ││
 │ │   6.130 → 6.132, 6.133 (parallel) → 6.131, 6.134 (parallel) →                    ││
