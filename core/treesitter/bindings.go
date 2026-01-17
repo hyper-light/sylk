@@ -667,3 +667,10 @@ func cStringToGoN(ptr *byte, length int) string {
 func addOffset(ptr *byte, offset int) *byte {
 	return (*byte)(unsafe.Add(unsafe.Pointer(ptr), offset))
 }
+
+// readTSQueryCapture reads a TSQueryCapture from a captures array at the given index.
+func readTSQueryCapture(capturesPtr uintptr, index int) TSQueryCapture {
+	captureSize := unsafe.Sizeof(TSQueryCapture{})
+	addr := capturesPtr + uintptr(index)*captureSize
+	return *(*TSQueryCapture)(unsafe.Pointer(addr))
+}
