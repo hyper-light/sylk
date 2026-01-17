@@ -5474,7 +5474,7 @@ Implements the core goroutine architecture: one goroutine per standalone agent, 
 #### Lifecycle States
 - [x] States: `Created`, `Starting`, `Running`, `Stopping`, `Stopped`, `Failed`
 - [x] State transitions are atomic
-- [ ] State change events published to Signal Bus
+- [x] State change events published to Signal Bus
 - [x] `WaitForState(state, timeout) error` - blocking wait
 
 **Tests:**
@@ -5648,43 +5648,43 @@ Implements auto-resizing channels with overflow handling for user responsiveness
 **Acceptance Criteria:**
 
 #### Adaptive Channel Core
-- [ ] `AdaptiveChannel[T]` generic struct
-- [ ] `minSize`: minimum buffer (default: 16)
-- [ ] `maxSize`: maximum buffer (default: 4096)
-- [ ] `currentSize`: tracks current allocation
-- [ ] Overflow slice for beyond-max scenarios (user paths only)
+- [x] `AdaptiveChannel[T]` generic struct
+- [x] `minSize`: minimum buffer (default: 16)
+- [x] `maxSize`: maximum buffer (default: 4096)
+- [x] `currentSize`: tracks current allocation
+- [x] Overflow slice for beyond-max scenarios (user paths only)
 
 #### Send Operations
-- [ ] `Send(msg T) error` - sends with auto-resize
-- [ ] `SendTimeout(msg T, timeout time.Duration) error` - with timeout
-- [ ] If channel full and under maxSize: resize up (2x)
-- [ ] If at maxSize: use overflow (user channels) or timeout (other channels)
-- [ ] Never block indefinitely
+- [x] `Send(msg T) error` - sends with auto-resize
+- [x] `SendTimeout(msg T, timeout time.Duration) error` - with timeout
+- [x] If channel full and under maxSize: resize up (2x)
+- [x] If at maxSize: use overflow (user channels) or timeout (other channels)
+- [x] Never block indefinitely
 
 #### Receive Operations
-- [ ] `Receive() (T, error)` - blocking receive
-- [ ] `ReceiveTimeout(timeout time.Duration) (T, error)`
-- [ ] `TryReceive() (T, bool)` - non-blocking
-- [ ] Drain overflow before channel
+- [x] `Receive() (T, error)` - blocking receive
+- [x] `ReceiveTimeout(timeout time.Duration) (T, error)`
+- [x] `TryReceive() (T, bool)` - non-blocking
+- [x] Drain overflow before channel
 
 #### Auto-Resize Logic
-- [ ] Resize up: when >80% full
-- [ ] Resize down: when <20% full for sustained period (1 minute)
-- [ ] Minimum stays at minSize
-- [ ] Resize is transparent to senders/receivers
+- [x] Resize up: when >80% full
+- [x] Resize down: when <20% full for sustained period (1 minute)
+- [x] Minimum stays at minSize
+- [x] Resize is transparent to senders/receivers
 
 #### Metrics
-- [ ] `Size() int` - current buffer size
-- [ ] `Len() int` - current message count
-- [ ] `OverflowLen() int` - overflow queue length
-- [ ] `Stats() ChannelStats` - hit rates, resize counts
+- [x] `Size() int` - current buffer size
+- [x] `Len() int` - current message count
+- [x] `OverflowLen() int` - overflow queue length
+- [x] `Stats() ChannelStats` - hit rates, resize counts
 
 **Tests:**
-- [ ] Auto-resize up works
-- [ ] Auto-resize down works
-- [ ] Overflow handles burst
-- [ ] Timeout behavior correct
-- [ ] No message loss
+- [x] Auto-resize up works
+- [x] Auto-resize down works
+- [x] Overflow handles burst
+- [x] Timeout behavior correct
+- [x] No message loss
 
 ---
 
@@ -5803,47 +5803,47 @@ Implements crash recovery using WAL and checkpoints.
 **Acceptance Criteria:**
 
 #### Recovery Flow
-- [ ] `RecoveryManager` struct
-- [ ] `Recover() (*RecoveryResult, error)` - main entry point
-- [ ] Detect if recovery needed (unclean shutdown marker)
-- [ ] Load latest valid checkpoint
-- [ ] Replay WAL from checkpoint sequence
+- [x] `RecoveryManager` struct
+- [x] `Recover() (*RecoveryResult, error)` - main entry point
+- [x] Detect if recovery needed (unclean shutdown marker)
+- [x] Load latest valid checkpoint
+- [x] Replay WAL from checkpoint sequence
 
 #### Checkpoint Loading
-- [ ] Find latest checkpoint file
-- [ ] Validate checkpoint integrity
-- [ ] If corrupt, try previous checkpoint
-- [ ] If no valid checkpoint, start fresh with warning
+- [x] Find latest checkpoint file
+- [x] Validate checkpoint integrity
+- [x] If corrupt, try previous checkpoint
+- [x] If no valid checkpoint, start fresh with warning
 
 #### WAL Replay
-- [ ] Replay entries after checkpoint sequence
-- [ ] Apply state changes in order
-- [ ] Skip already-applied entries (idempotent replay)
-- [ ] Stop at end of WAL
+- [x] Replay entries after checkpoint sequence
+- [x] Apply state changes in order
+- [x] Skip already-applied entries (idempotent replay)
+- [x] Stop at end of WAL
 
 #### Pipeline Recovery
-- [ ] Completed pipelines: no action
-- [ ] In-progress pipelines: restart from last phase
-- [ ] Waiting pipelines: re-enqueue
-- [ ] Staging directories: validate or recreate
+- [x] Completed pipelines: no action
+- [x] In-progress pipelines: restart from last phase
+- [x] Waiting pipelines: re-enqueue
+- [x] Staging directories: validate or recreate
 
 #### Recovery Result
-- [ ] `RecoveryResult` struct with recovered state
-- [ ] List of recovered pipelines
-- [ ] List of failed recoveries (with reasons)
-- [ ] WAL entries replayed count
+- [x] `RecoveryResult` struct with recovered state
+- [x] List of recovered pipelines
+- [x] List of failed recoveries (with reasons)
+- [x] WAL entries replayed count
 
 #### Shutdown Marker
-- [ ] Write marker on startup
-- [ ] Remove marker on clean shutdown
-- [ ] Presence of marker = recovery needed
+- [x] Write marker on startup
+- [x] Remove marker on clean shutdown
+- [x] Presence of marker = recovery needed
 
 **Tests:**
-- [ ] Clean shutdown needs no recovery
-- [ ] Crash recovery restores state
-- [ ] Corrupt checkpoint handled
-- [ ] WAL replay idempotent
-- [ ] Pipeline recovery correct
+- [x] Clean shutdown needs no recovery
+- [x] Crash recovery restores state
+- [x] Corrupt checkpoint handled
+- [x] WAL replay idempotent
+- [x] Pipeline recovery correct
 
 ---
 
@@ -6110,38 +6110,38 @@ Implements Agent → Architect → User escalation with token-budgeted workaroun
 **Acceptance Criteria:**
 
 #### Workaround Budget
-- [ ] `WorkaroundBudget` struct tracks token spending
-- [ ] Configurable `max_tokens` (default: 1000)
-- [ ] `CanSpend(tokens int) bool`
-- [ ] `Spend(tokens int)`
-- [ ] `Reset()` on successful recovery
-- [ ] Per-error-type budget overrides (optional)
+- [x] `WorkaroundBudget` struct tracks token spending
+- [x] Configurable `max_tokens` (default: 1000)
+- [x] `CanSpend(tokens int) bool`
+- [x] `Spend(tokens int)`
+- [x] `Reset()` on successful recovery
+- [x] Per-error-type budget overrides (optional)
 
 #### Escalation Manager
-- [ ] `EscalationManager` coordinates escalation flow
-- [ ] `Escalate(error, context) (*Remedy, error)`
-- [ ] Level 1: Agent self-recovery (retry based on tier)
-- [ ] Level 2: Architect workaround (token-budgeted)
-- [ ] Level 3: User decision (present remedies)
+- [x] `EscalationManager` coordinates escalation flow
+- [x] `Escalate(error, context) (*Remedy, error)`
+- [x] Level 1: Agent self-recovery (retry based on tier)
+- [x] Level 2: Architect workaround (token-budgeted)
+- [x] Level 3: User decision (present remedies)
 
 #### Critical Error Fast-Path
-- [ ] ExternalDegrading errors skip Level 2
-- [ ] Immediately notify user + show "working on it"
-- [ ] Architect works in background while user informed
-- [ ] Present remedy when ready (or timeout)
+- [x] ExternalDegrading errors skip Level 2
+- [x] Immediately notify user + show "working on it"
+- [x] Architect works in background while user informed
+- [x] Present remedy when ready (or timeout)
 
 #### Remedy Structure
-- [ ] `Remedy` struct: description, action, confidence
-- [ ] Multiple remedies ranked by likelihood
-- [ ] User can accept, reject, modify, or abort
+- [x] `Remedy` struct: description, action, confidence
+- [x] Multiple remedies ranked by likelihood
+- [x] User can accept, reject, modify, or abort
 - [ ] Remedy execution tracked in Archivalist
 
 **Tests:**
-- [ ] Self-recovery works for transient
-- [ ] Architect workaround within budget works
-- [ ] Budget exceeded escalates to user
-- [ ] Critical errors fast-path to user
-- [ ] Remedy presentation correct
+- [x] Self-recovery works for transient
+- [x] Architect workaround within budget works
+- [x] Budget exceeded escalates to user
+- [x] Critical errors fast-path to user
+- [x] Remedy presentation correct
 
 ---
 
@@ -20519,21 +20519,21 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 2B: LLM Integration                                               ││
-│ │ • 0.15 LLM Request Gate (Integration)                                            ││
-│ │ • 0.19 Dual Queue LLM Gate                                                       ││
-│ │ • 0.10a.4 Stream Metrics Collection                                              ││
-│ │ • 0.10a.5 Stream Timeout Watchdog                                                ││
-│ │ • 0.7 Token Counter                                                              ││
+│ │ PARALLEL GROUP 2B: LLM Integration (DONE)                                         ││
+│ │ • 0.15 LLM Request Gate (Integration) (DONE)                                     ││
+│ │ • 0.19 Dual Queue LLM Gate (DONE)                                                ││
+│ │ • 0.10a.4 Stream Metrics Collection (DONE)                                       ││
+│ │ • 0.10a.5 Stream Timeout Watchdog (DONE)                                         ││
+│ │ • 0.7 Token Counter (DONE)                                                       ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 2C: Error Handling & Recovery                                     ││
-│ │ • 0.24 Recovery Manager                                                          ││
+│ │ • 0.24 Recovery Manager (DONE)                                                   ││
 │ │ • 0.27 Transient Error Tracker (DONE)                                            ││
 │ │ • 0.28 Retry Policies (DONE)                                                     ││
 │ │ • 0.29 Circuit Breaker (DONE)                                                    ││
-│ │ • 0.30 Escalation Chain                                                          ││
+│ │ • 0.30 Escalation Chain (DONE)                                                   ││
 │ │ • 0.31 Retry Briefing System                                                     ││
 │ │ • 0.32 Rollback Manager                                                          ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
