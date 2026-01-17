@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"sync"
+
+	"github.com/adalundhe/sylk/core/tools/parsers"
 )
 
 type OutputType string
@@ -44,14 +46,31 @@ type OutputParser interface {
 	Parse(stdout, stderr []byte) (any, error)
 }
 
-type OutputHandler struct {
-	config    OutputHandlerConfig
-	parsers   map[string]OutputParser
-	truncator *SmartTruncator
-	mu        sync.RWMutex
+// ParseCache provides access to LLM-learned parse templates
+type ParseCache interface {
+	Get(toolPattern string) *parsers.ParseTemplate
+	Apply(template *parsers.ParseTemplate, stdout, stderr []byte) (*parsers.TemplateResult, error)
 }
 
+type OutputHandler struct {
+	config     OutputHandlerConfig
+	parsers    map[string]OutputParser
+	parseCache ParseCache
+	truncator  *SmartTruncator
+	mu         sync.RWMutex
+}
+
+// NewOutputHandler creates a new output handler without parse cache
 func NewOutputHandler(config OutputHandlerConfig) *OutputHandler {
+	return newOutputHandlerWithCache(config, nil)
+}
+
+// NewOutputHandlerWithCache creates a new output handler with parse cache
+func NewOutputHandlerWithCache(config OutputHandlerConfig, cache ParseCache) *OutputHandler {
+	return newOutputHandlerWithCache(config, cache)
+}
+
+func newOutputHandlerWithCache(config OutputHandlerConfig, cache ParseCache) *OutputHandler {
 	detector := NewImportanceDetector(config.ImportancePatterns)
 	truncatorConfig := SmartTruncatorConfig{
 		KeepFirstLines: config.KeepFirstLines,
@@ -60,9 +79,10 @@ func NewOutputHandler(config OutputHandlerConfig) *OutputHandler {
 	}
 
 	return &OutputHandler{
-		config:    config,
-		parsers:   make(map[string]OutputParser),
-		truncator: NewSmartTruncator(truncatorConfig, detector),
+		config:     config,
+		parsers:    make(map[string]OutputParser),
+		parseCache: cache,
+		truncator:  NewSmartTruncator(truncatorConfig, detector),
 	}
 }
 
@@ -79,16 +99,58 @@ func (h *OutputHandler) getParser(tool string) OutputParser {
 }
 
 func (h *OutputHandler) ProcessOutput(tool string, stdout, stderr []byte) *ProcessedOutput {
-	if parser := h.getParser(tool); parser != nil {
-		if parsed, err := parser.Parse(stdout, stderr); err == nil {
-			return &ProcessedOutput{
-				Type:     OutputTypeParsed,
-				Parsed:   parsed,
-				FullSize: len(stdout) + len(stderr),
-			}
-		}
+	if output := h.tryToolParser(tool, stdout, stderr); output != nil {
+		return output
 	}
 
+	if output := h.tryParseCache(tool, stdout, stderr); output != nil {
+		return output
+	}
+
+	return h.createTruncatedOutput(stdout, stderr)
+}
+
+func (h *OutputHandler) tryToolParser(tool string, stdout, stderr []byte) *ProcessedOutput {
+	parser := h.getParser(tool)
+	if parser == nil {
+		return nil
+	}
+
+	parsed, err := parser.Parse(stdout, stderr)
+	if err != nil {
+		return nil
+	}
+
+	return &ProcessedOutput{
+		Type:     OutputTypeParsed,
+		Parsed:   parsed,
+		FullSize: len(stdout) + len(stderr),
+	}
+}
+
+func (h *OutputHandler) tryParseCache(tool string, stdout, stderr []byte) *ProcessedOutput {
+	if h.parseCache == nil {
+		return nil
+	}
+
+	template := h.parseCache.Get(tool)
+	if template == nil {
+		return nil
+	}
+
+	parsed, err := h.parseCache.Apply(template, stdout, stderr)
+	if err != nil {
+		return nil
+	}
+
+	return &ProcessedOutput{
+		Type:     OutputTypeParsed,
+		Parsed:   parsed,
+		FullSize: len(stdout) + len(stderr),
+	}
+}
+
+func (h *OutputHandler) createTruncatedOutput(stdout, stderr []byte) *ProcessedOutput {
 	truncated := h.truncator.Truncate(stdout, stderr)
 	return &ProcessedOutput{
 		Type:      OutputTypeTruncated,

@@ -1,6 +1,7 @@
 package resources
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,12 +35,26 @@ const (
 	LevelEmergency
 )
 
+type PipelineCheckpointer interface {
+	Checkpoint(pipelineID string) error
+}
+
+type PipelineResourceReleaser interface {
+	ReleaseBundleByID(pipelineID string) error
+}
+
+type UserNotifier interface {
+	NotifyPaused(pipelineID string, reason string)
+	NotifyResumed(pipelineID string)
+}
+
 type DegradationConfig struct {
 	WarningThreshold   float64
 	CriticalThreshold  float64
 	EmergencyThreshold float64
 	CheckInterval      time.Duration
 	ResumeHysteresis   float64
+	ResumeInterval     time.Duration
 }
 
 func DefaultDegradationConfig() DegradationConfig {
@@ -49,16 +64,19 @@ func DefaultDegradationConfig() DegradationConfig {
 		EmergencyThreshold: 0.95,
 		CheckInterval:      1 * time.Second,
 		ResumeHysteresis:   0.10,
+		ResumeInterval:     100 * time.Millisecond,
 	}
 }
 
 type PipelineEntry struct {
-	ID         string
-	Priority   PipelinePriority
-	State      atomic.Int32
-	PausedAt   time.Time
-	ResumedAt  time.Time
-	PauseCount int64
+	ID                string
+	Priority          PipelinePriority
+	State             atomic.Int32
+	IsUserInteractive bool
+	CreatedAt         time.Time
+	PausedAt          time.Time
+	ResumedAt         time.Time
+	PauseCount        int64
 }
 
 func (p *PipelineEntry) GetState() PipelineState {
@@ -70,14 +88,17 @@ func (p *PipelineEntry) SetState(state PipelineState) {
 }
 
 type DegradationController struct {
-	mu            sync.RWMutex
-	config        DegradationConfig
-	memoryMonitor *MemoryMonitor
-	signalBus     *signal.SignalBus
-	pipelines     map[string]*PipelineEntry
-	level         atomic.Int32
-	stopCh        chan struct{}
-	done          chan struct{}
+	mu               sync.RWMutex
+	config           DegradationConfig
+	memoryMonitor    *MemoryMonitor
+	signalBus        *signal.SignalBus
+	checkpointer     PipelineCheckpointer
+	resourceReleaser PipelineResourceReleaser
+	userNotifier     UserNotifier
+	pipelines        map[string]*PipelineEntry
+	level            atomic.Int32
+	stopCh           chan struct{}
+	done             chan struct{}
 }
 
 func NewDegradationController(
@@ -101,13 +122,40 @@ func NewDegradationController(
 	return dc
 }
 
+func (dc *DegradationController) SetCheckpointer(cp PipelineCheckpointer) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.checkpointer = cp
+}
+
+func (dc *DegradationController) SetResourceReleaser(rr PipelineResourceReleaser) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.resourceReleaser = rr
+}
+
+func (dc *DegradationController) SetUserNotifier(un UserNotifier) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.userNotifier = un
+}
+
 func (dc *DegradationController) RegisterPipeline(id string, priority PipelinePriority) {
+	dc.RegisterPipelineWithOptions(id, priority, false)
+}
+func (dc *DegradationController) RegisterPipelineWithOptions(
+	id string,
+	priority PipelinePriority,
+	isUserInteractive bool,
+) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
 	dc.pipelines[id] = &PipelineEntry{
-		ID:       id,
-		Priority: priority,
+		ID:                id,
+		Priority:          priority,
+		IsUserInteractive: isUserInteractive,
+		CreatedAt:         time.Now(),
 	}
 }
 
@@ -181,12 +229,43 @@ func (dc *DegradationController) handleEscalation(level DegradationLevel) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
+	candidates := dc.selectPauseablePipelines(level)
+	for _, entry := range candidates {
+		dc.pausePipelineInternal(entry, "resource pressure")
+	}
+}
+
+func (dc *DegradationController) selectPauseablePipelines(level DegradationLevel) []*PipelineEntry {
 	threshold := dc.levelToPriority(level)
+	candidates := make([]*PipelineEntry, 0)
+
 	for _, entry := range dc.pipelines {
-		if entry.Priority < threshold && entry.GetState() == StateRunning {
-			dc.pausePipeline(entry)
+		if dc.shouldPause(entry, threshold) {
+			candidates = append(candidates, entry)
 		}
 	}
+
+	sortPipelinesForPause(candidates)
+	return candidates
+}
+
+func (dc *DegradationController) shouldPause(entry *PipelineEntry, threshold PipelinePriority) bool {
+	if entry.IsUserInteractive {
+		return false
+	}
+	if entry.GetState() != StateRunning {
+		return false
+	}
+	return entry.Priority < threshold
+}
+
+func sortPipelinesForPause(entries []*PipelineEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Priority != entries[j].Priority {
+			return entries[i].Priority < entries[j].Priority
+		}
+		return entries[i].CreatedAt.After(entries[j].CreatedAt)
+	})
 }
 
 func (dc *DegradationController) handleDeescalation(level DegradationLevel, usage float64) {
@@ -198,10 +277,47 @@ func (dc *DegradationController) handleDeescalation(level DegradationLevel, usag
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
+	candidates := dc.selectResumablePipelines(level)
+	dc.resumeGradually(candidates)
+}
+
+func (dc *DegradationController) selectResumablePipelines(level DegradationLevel) []*PipelineEntry {
 	threshold := dc.levelToPriority(level)
+	candidates := make([]*PipelineEntry, 0)
+
 	for _, entry := range dc.pipelines {
-		if entry.Priority >= threshold && entry.GetState() == StatePaused {
-			dc.resumePipeline(entry)
+		if dc.shouldResume(entry, threshold) {
+			candidates = append(candidates, entry)
+		}
+	}
+
+	sortPipelinesForResume(candidates)
+	return candidates
+}
+
+func (dc *DegradationController) shouldResume(entry *PipelineEntry, threshold PipelinePriority) bool {
+	if entry.GetState() != StatePaused {
+		return false
+	}
+	return entry.Priority >= threshold
+}
+
+func sortPipelinesForResume(entries []*PipelineEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Priority != entries[j].Priority {
+			return entries[i].Priority > entries[j].Priority
+		}
+		return entries[i].PausedAt.Before(entries[j].PausedAt)
+	})
+}
+
+func (dc *DegradationController) resumeGradually(candidates []*PipelineEntry) {
+	for i, entry := range candidates {
+		dc.resumePipelineInternal(entry)
+		if i < len(candidates)-1 && dc.config.ResumeInterval > 0 {
+			dc.mu.Unlock()
+			time.Sleep(dc.config.ResumeInterval)
+			dc.mu.Lock()
 		}
 	}
 }
@@ -230,20 +346,52 @@ func (dc *DegradationController) levelToResumeThreshold(level DegradationLevel) 
 	}
 }
 
-func (dc *DegradationController) pausePipeline(entry *PipelineEntry) {
+func (dc *DegradationController) pausePipelineInternal(entry *PipelineEntry, reason string) {
 	entry.SetState(StatePaused)
 	entry.PausedAt = time.Now()
 	entry.PauseCount++
 
 	dc.sendPauseSignal(entry.ID)
+	dc.checkpointPipeline(entry.ID)
+	dc.releasePipelineResources(entry.ID)
+	dc.notifyUserPaused(entry.ID, reason)
 }
 
-func (dc *DegradationController) resumePipeline(entry *PipelineEntry) {
+func (dc *DegradationController) resumePipelineInternal(entry *PipelineEntry) {
 	entry.SetState(StateResuming)
 	entry.ResumedAt = time.Now()
 
 	dc.sendResumeSignal(entry.ID)
+	dc.notifyUserResumed(entry.ID)
 	entry.SetState(StateRunning)
+}
+
+func (dc *DegradationController) checkpointPipeline(pipelineID string) {
+	if dc.checkpointer == nil {
+		return
+	}
+	_ = dc.checkpointer.Checkpoint(pipelineID)
+}
+
+func (dc *DegradationController) releasePipelineResources(pipelineID string) {
+	if dc.resourceReleaser == nil {
+		return
+	}
+	_ = dc.resourceReleaser.ReleaseBundleByID(pipelineID)
+}
+
+func (dc *DegradationController) notifyUserPaused(pipelineID, reason string) {
+	if dc.userNotifier == nil {
+		return
+	}
+	dc.userNotifier.NotifyPaused(pipelineID, reason)
+}
+
+func (dc *DegradationController) notifyUserResumed(pipelineID string) {
+	if dc.userNotifier == nil {
+		return
+	}
+	dc.userNotifier.NotifyResumed(pipelineID)
 }
 
 func (dc *DegradationController) sendPauseSignal(pipelineID string) {
@@ -275,11 +423,15 @@ func (dc *DegradationController) PausePipeline(id string) bool {
 		return false
 	}
 
+	if entry.IsUserInteractive {
+		return false
+	}
+
 	if entry.GetState() != StateRunning {
 		return false
 	}
 
-	dc.pausePipeline(entry)
+	dc.pausePipelineInternal(entry, "manual pause")
 	return true
 }
 
@@ -296,7 +448,7 @@ func (dc *DegradationController) ResumePipeline(id string) bool {
 		return false
 	}
 
-	dc.resumePipeline(entry)
+	dc.resumePipelineInternal(entry)
 	return true
 }
 
@@ -312,10 +464,11 @@ func (dc *DegradationController) Stats() DegradationStats {
 
 	for _, entry := range dc.pipelines {
 		ps := PipelineStats{
-			ID:         entry.ID,
-			Priority:   entry.Priority,
-			State:      entry.GetState(),
-			PauseCount: entry.PauseCount,
+			ID:                entry.ID,
+			Priority:          entry.Priority,
+			State:             entry.GetState(),
+			IsUserInteractive: entry.IsUserInteractive,
+			PauseCount:        entry.PauseCount,
 		}
 		if entry.GetState() == StatePaused {
 			stats.PausedCount++
@@ -337,10 +490,11 @@ type DegradationStats struct {
 }
 
 type PipelineStats struct {
-	ID         string           `json:"id"`
-	Priority   PipelinePriority `json:"priority"`
-	State      PipelineState    `json:"state"`
-	PauseCount int64            `json:"pause_count"`
+	ID                string           `json:"id"`
+	Priority          PipelinePriority `json:"priority"`
+	State             PipelineState    `json:"state"`
+	IsUserInteractive bool             `json:"is_user_interactive"`
+	PauseCount        int64            `json:"pause_count"`
 }
 
 func (dc *DegradationController) Close() error {

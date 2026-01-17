@@ -2,11 +2,87 @@ package resources
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/core/signal"
 )
+
+type mockCheckpointer struct {
+	mu          sync.Mutex
+	checkpoints []string
+}
+
+func (m *mockCheckpointer) Checkpoint(pipelineID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkpoints = append(m.checkpoints, pipelineID)
+	return nil
+}
+
+func (m *mockCheckpointer) getCheckpoints() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]string, len(m.checkpoints))
+	copy(result, m.checkpoints)
+	return result
+}
+
+type mockResourceReleaser struct {
+	mu       sync.Mutex
+	released []string
+}
+
+func (m *mockResourceReleaser) ReleaseBundleByID(pipelineID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.released = append(m.released, pipelineID)
+	return nil
+}
+
+func (m *mockResourceReleaser) getReleased() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]string, len(m.released))
+	copy(result, m.released)
+	return result
+}
+
+type mockUserNotifier struct {
+	mu       sync.Mutex
+	paused   []string
+	resumed  []string
+	pauseErr atomic.Bool
+}
+
+func (m *mockUserNotifier) NotifyPaused(pipelineID string, _ string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.paused = append(m.paused, pipelineID)
+}
+
+func (m *mockUserNotifier) NotifyResumed(pipelineID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resumed = append(m.resumed, pipelineID)
+}
+
+func (m *mockUserNotifier) getPaused() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]string, len(m.paused))
+	copy(result, m.paused)
+	return result
+}
+
+func (m *mockUserNotifier) getResumed() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]string, len(m.resumed))
+	copy(result, m.resumed)
+	return result
+}
 
 func newTestDegradationController(t *testing.T) (*DegradationController, *MemoryMonitor) {
 	t.Helper()
@@ -323,6 +399,10 @@ func TestDegradationController_DefaultConfig(t *testing.T) {
 	if config.ResumeHysteresis != 0.10 {
 		t.Errorf("expected 0.10, got %f", config.ResumeHysteresis)
 	}
+
+	if config.ResumeInterval != 100*time.Millisecond {
+		t.Errorf("expected 100ms, got %v", config.ResumeInterval)
+	}
 }
 
 func TestPipelineEntry_StateOperations(t *testing.T) {
@@ -343,5 +423,289 @@ func TestPipelineEntry_StateOperations(t *testing.T) {
 	entry.SetState(StateResuming)
 	if entry.GetState() != StateResuming {
 		t.Error("state should be resuming")
+	}
+}
+
+func TestDegradationController_UserInteractiveNeverPaused(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	dc.RegisterPipelineWithOptions("interactive", PriorityLow, true)
+	dc.RegisterPipeline("background", PriorityLow)
+
+	ok := dc.PausePipeline("interactive")
+	if ok {
+		t.Error("user-interactive pipeline should not be pausable")
+	}
+
+	state, _ := dc.GetPipelineState("interactive")
+	if state != StateRunning {
+		t.Error("user-interactive should remain running")
+	}
+
+	ok = dc.PausePipeline("background")
+	if !ok {
+		t.Error("background pipeline should be pausable")
+	}
+}
+
+func TestDegradationController_UserInteractiveInStats(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	dc.RegisterPipelineWithOptions("interactive", PriorityHigh, true)
+	dc.RegisterPipeline("background", PriorityLow)
+
+	stats := dc.Stats()
+
+	var foundInteractive, foundBackground bool
+	for _, ps := range stats.Pipelines {
+		if ps.ID == "interactive" {
+			foundInteractive = true
+			if !ps.IsUserInteractive {
+				t.Error("interactive pipeline should be marked as user-interactive")
+			}
+		}
+		if ps.ID == "background" {
+			foundBackground = true
+			if ps.IsUserInteractive {
+				t.Error("background pipeline should not be user-interactive")
+			}
+		}
+	}
+
+	if !foundInteractive || !foundBackground {
+		t.Error("expected to find both pipelines in stats")
+	}
+}
+
+func TestDegradationController_CheckpointerIntegration(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	cp := &mockCheckpointer{}
+	dc.SetCheckpointer(cp)
+
+	dc.RegisterPipeline("p1", PriorityMedium)
+
+	dc.PausePipeline("p1")
+
+	checkpoints := cp.getCheckpoints()
+	if len(checkpoints) != 1 || checkpoints[0] != "p1" {
+		t.Errorf("expected checkpoint for p1, got %v", checkpoints)
+	}
+}
+
+func TestDegradationController_ResourceReleaserIntegration(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	rr := &mockResourceReleaser{}
+	dc.SetResourceReleaser(rr)
+
+	dc.RegisterPipeline("p1", PriorityMedium)
+
+	dc.PausePipeline("p1")
+
+	released := rr.getReleased()
+	if len(released) != 1 || released[0] != "p1" {
+		t.Errorf("expected release for p1, got %v", released)
+	}
+}
+
+func TestDegradationController_UserNotifierIntegration(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	notifier := &mockUserNotifier{}
+	dc.SetUserNotifier(notifier)
+
+	dc.RegisterPipeline("p1", PriorityMedium)
+
+	dc.PausePipeline("p1")
+	paused := notifier.getPaused()
+	if len(paused) != 1 || paused[0] != "p1" {
+		t.Errorf("expected pause notification for p1, got %v", paused)
+	}
+
+	dc.ResumePipeline("p1")
+	resumed := notifier.getResumed()
+	if len(resumed) != 1 || resumed[0] != "p1" {
+		t.Errorf("expected resume notification for p1, got %v", resumed)
+	}
+}
+
+func TestSortPipelinesForPause(t *testing.T) {
+	now := time.Now()
+
+	entries := []*PipelineEntry{
+		{ID: "high-old", Priority: PriorityHigh, CreatedAt: now.Add(-2 * time.Hour)},
+		{ID: "low-new", Priority: PriorityLow, CreatedAt: now.Add(-1 * time.Minute)},
+		{ID: "low-old", Priority: PriorityLow, CreatedAt: now.Add(-1 * time.Hour)},
+		{ID: "medium", Priority: PriorityMedium, CreatedAt: now},
+	}
+
+	sortPipelinesForPause(entries)
+
+	expected := []string{"low-new", "low-old", "medium", "high-old"}
+	for i, id := range expected {
+		if entries[i].ID != id {
+			t.Errorf("position %d: expected %s, got %s", i, id, entries[i].ID)
+		}
+	}
+}
+
+func TestSortPipelinesForResume(t *testing.T) {
+	now := time.Now()
+
+	entries := []*PipelineEntry{
+		{ID: "low", Priority: PriorityLow, PausedAt: now},
+		{ID: "high-new", Priority: PriorityHigh, PausedAt: now.Add(-1 * time.Minute)},
+		{ID: "high-old", Priority: PriorityHigh, PausedAt: now.Add(-1 * time.Hour)},
+		{ID: "medium", Priority: PriorityMedium, PausedAt: now},
+	}
+
+	sortPipelinesForResume(entries)
+
+	expected := []string{"high-old", "high-new", "medium", "low"}
+	for i, id := range expected {
+		if entries[i].ID != id {
+			t.Errorf("position %d: expected %s, got %s", i, id, entries[i].ID)
+		}
+	}
+}
+
+func TestDegradationController_SelectPauseablePipelines(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	dc.RegisterPipelineWithOptions("interactive-low", PriorityLow, true)
+	dc.RegisterPipeline("background-low", PriorityLow)
+	dc.RegisterPipeline("background-high", PriorityHigh)
+	dc.RegisterPipeline("background-critical", PriorityCritical)
+
+	dc.mu.Lock()
+	candidates := dc.selectPauseablePipelines(LevelCritical)
+	dc.mu.Unlock()
+
+	if len(candidates) != 2 {
+		t.Fatalf("expected 2 candidates, got %d", len(candidates))
+	}
+
+	for _, c := range candidates {
+		if c.IsUserInteractive {
+			t.Error("user-interactive should not be in candidates")
+		}
+		if c.Priority >= PriorityHigh {
+			t.Errorf("priority %d should not be in candidates for LevelCritical", c.Priority)
+		}
+	}
+}
+
+func TestDegradationController_NilIntegrations(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	dc.RegisterPipeline("p1", PriorityMedium)
+
+	dc.PausePipeline("p1")
+	dc.ResumePipeline("p1")
+}
+
+func TestDegradationController_ConcurrentSetters(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	var wg sync.WaitGroup
+
+	for range 10 {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			dc.SetCheckpointer(&mockCheckpointer{})
+		}()
+		go func() {
+			defer wg.Done()
+			dc.SetResourceReleaser(&mockResourceReleaser{})
+		}()
+		go func() {
+			defer wg.Done()
+			dc.SetUserNotifier(&mockUserNotifier{})
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestDegradationController_RegisterWithOptions(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	before := time.Now()
+	dc.RegisterPipelineWithOptions("test", PriorityHigh, true)
+	after := time.Now()
+
+	dc.mu.RLock()
+	entry := dc.pipelines["test"]
+	dc.mu.RUnlock()
+
+	if entry == nil {
+		t.Fatal("expected entry to exist")
+	}
+
+	if entry.Priority != PriorityHigh {
+		t.Errorf("expected PriorityHigh, got %d", entry.Priority)
+	}
+
+	if !entry.IsUserInteractive {
+		t.Error("expected IsUserInteractive to be true")
+	}
+
+	if entry.CreatedAt.Before(before) || entry.CreatedAt.After(after) {
+		t.Error("CreatedAt should be set to current time")
+	}
+}
+
+func TestDegradationController_FullPauseResumeIntegration(t *testing.T) {
+	dc := NewDegradationController(DefaultDegradationConfig(), nil, nil)
+	defer dc.Close()
+
+	cp := &mockCheckpointer{}
+	rr := &mockResourceReleaser{}
+	notifier := &mockUserNotifier{}
+
+	dc.SetCheckpointer(cp)
+	dc.SetResourceReleaser(rr)
+	dc.SetUserNotifier(notifier)
+
+	dc.RegisterPipeline("p1", PriorityMedium)
+	dc.RegisterPipeline("p2", PriorityLow)
+	dc.RegisterPipelineWithOptions("interactive", PriorityLow, true)
+
+	dc.PausePipeline("p1")
+	dc.PausePipeline("p2")
+	dc.PausePipeline("interactive")
+
+	checkpoints := cp.getCheckpoints()
+	if len(checkpoints) != 2 {
+		t.Errorf("expected 2 checkpoints, got %d", len(checkpoints))
+	}
+
+	released := rr.getReleased()
+	if len(released) != 2 {
+		t.Errorf("expected 2 releases, got %d", len(released))
+	}
+
+	paused := notifier.getPaused()
+	if len(paused) != 2 {
+		t.Errorf("expected 2 pause notifications, got %d", len(paused))
+	}
+
+	dc.ResumePipeline("p1")
+	dc.ResumePipeline("p2")
+
+	resumed := notifier.getResumed()
+	if len(resumed) != 2 {
+		t.Errorf("expected 2 resume notifications, got %d", len(resumed))
 	}
 }

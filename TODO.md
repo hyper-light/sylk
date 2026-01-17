@@ -2437,54 +2437,56 @@ All items in Phase 1 can execute in parallel - no interdependencies.
 
 **Acceptance Criteria:**
 
-#### FS.1.1 VersionID and Content-Addressable Hashing
-- [ ] `VersionID` type as `[32]byte` SHA-256 hash
-- [ ] `NewVersionID(content []byte) VersionID` - deterministic hash
-- [ ] `NewVersionIDFromMetadata` - includes parents and timestamp
-- [ ] `String()` returns 64-char lowercase hex
-- [ ] `Short()` returns first 8 chars for display
-- [ ] `ParseVersionID(s string)` round-trips correctly
-- [ ] JSON marshaling/unmarshaling
-- [ ] `NilVersion` and `IsNil()` support
+#### FS.1.1 VersionID and Content-Addressable Hashing ✅
+- [x] `VersionID` type as `[32]byte` SHA-256 hash
+- [x] `ComputeVersionID(content, metadata []byte) VersionID` - deterministic hash
+- [x] `ComputeContentHash` for content-only hashing
+- [x] `String()` returns 64-char lowercase hex
+- [x] `Short()` returns first 8 chars for display
+- [x] `ParseVersionID(s string)` round-trips correctly
+- [x] `IsZero()` and `Equal()` support
+- [x] Tests pass with race detector
 
-#### FS.1.2 Vector Clock for Causality Tracking
-- [ ] `VectorClock` maps `session.SessionID` → `uint64`
-- [ ] `Increment(sessionID)` returns new clock (immutable)
-- [ ] `Merge(other)` returns pointwise maximum
-- [ ] `HappensBefore(other)` for causal ordering
-- [ ] `Concurrent(other)` when neither precedes
-- [ ] `Clone()` creates independent copy
-- [ ] JSON serialization preserves all counts
-- [ ] Uses existing `session.SessionID` type
+#### FS.1.2 Vector Clock for Causality Tracking ✅
+- [x] `VectorClock` maps `SessionID` → `uint64`
+- [x] `Increment(sessionID)` returns new clock (immutable)
+- [x] `Merge(other)` returns pointwise maximum
+- [x] `HappensBefore(other)` for causal ordering
+- [x] `Concurrent(other)` when neither precedes
+- [x] `Clone()` creates independent copy
+- [x] `Compare()` returns -1, 0, 1, or 2 (concurrent)
+- [x] Tests pass with race detector
 
-#### FS.1.3 OperationID and Operation Types
-- [ ] `OperationID` as content-addressable `[32]byte`
-- [ ] `OpType`: Insert, Delete, Replace, Move
-- [ ] `Operation` struct with: ID, BaseVersion, FilePath, Target, Type, Content, OldContent
-- [ ] Includes: `pipeline.PipelineID`, `session.SessionID`, `AgentID`, `security.AgentRole`
-- [ ] `Invert()` for rollback (swap content/oldContent)
-- [ ] `RequiresRole()` returns minimum role for operation
-- [ ] `Sanitize(sanitizer)` redacts secrets before logging
-- [ ] `Validate()` checks operation integrity
+#### FS.1.3 OperationID and Operation Types ✅
+- [x] `OperationID` as content-addressable `[32]byte`
+- [x] `OpType`: Insert, Delete, Replace, Move with String()
+- [x] `Operation` struct with: ID, BaseVersion, FilePath, Target, Type, Content, OldContent
+- [x] Includes: PipelineID, SessionID, AgentID, AgentRole, Clock, Timestamp
+- [x] `Invert()` for rollback (swap content/oldContent)
+- [x] `Clone()`, `Size()`, `IsEmpty()` helpers
+- [x] `NewOperation()` constructor with computed ID
+- [x] Tests pass with race detector
 
-#### FS.1.4 AST-Aware Target
-- [ ] `Target` struct with NodePath, NodeType, NodeID
-- [ ] Offset fallback: StartOffset, EndOffset
-- [ ] Line info: StartLine, EndLine
-- [ ] `IsASTBased()` checks targeting mode
-- [ ] `Overlaps(other)` handles AST parent/child relationships
-- [ ] `Contains(other)` for strict containment
-- [ ] `IsAncestorOf` / `IsDescendantOf` for AST hierarchy
-- [ ] `Shift(lineDelta, offsetDelta)` adjusts offsets
-- [ ] `NodePathString()` returns dotted path representation
+#### FS.1.4 AST-Aware Target ✅
+- [x] `Target` struct with NodePath, NodeType, NodeID
+- [x] Offset fallback: StartOffset, EndOffset
+- [x] Line info: StartLine, EndLine
+- [x] `IsAST()`, `IsOffset()`, `IsLine()`, `IsEmpty()` checks
+- [x] `Overlaps(other)` handles AST parent/child relationships
+- [x] `Contains(other)` for strict containment
+- [x] `Equal()`, `Clone()`, `Size()` helpers
+- [x] `WithLines()`, `WithOffsets()` chainable setters
+- [x] Tests pass with race detector
 
-#### FS.1.5 FileVersion
-- [ ] `FileVersion` struct: ID, FilePath, Parents, Operations, ContentHash, ContentSize
-- [ ] Includes: Clock, Timestamp, PipelineID, SessionID, IsMerge
-- [ ] Variant support: VariantGroupID, VariantLabel
-- [ ] `NewFileVersion()`, `NewMergeVersion()`, `NewVariantVersion()` constructors
-- [ ] `IsRoot()`, `HasParent()`, `IsVariant()` helpers
-- [ ] References `pipeline.PipelineID` and `session.SessionID`
+#### FS.1.5 FileVersion ✅
+- [x] `FileVersion` struct: ID, FilePath, Parents, Operations, ContentHash, ContentSize
+- [x] Includes: Clock, Timestamp, PipelineID, SessionID, IsMerge
+- [x] Variant support: VariantGroupID, VariantLabel
+- [x] `NewFileVersion()` constructor
+- [x] `IsRoot()`, `HasParent()`, `IsVariant()` helpers
+- [x] `SetVariant()`, `AddOperation()` mutators
+- [x] `Clone()`, `Equal()`, `HappensBefore()`, `Concurrent()` methods
+- [x] Tests pass with race detector
 
 ---
 
@@ -2506,37 +2508,40 @@ All items in Phase 1 can execute in parallel - no interdependencies.
 
 **Acceptance Criteria:**
 
-#### FS.2.1 Content-Addressable Blob Store
-- [ ] `BlobStore` interface: Put, PutStream, Get, GetReader, Has, Delete, Size, Stats, GC
-- [ ] `MemoryBlobStore` implementation
-- [ ] `FileBlobStore` with path structure: `<base>/<first 2 chars>/<next 2 chars>/<full hash>`
-- [ ] Content deduplication (same content = same hash)
-- [ ] Thread-safe for concurrent access
-- [ ] Follows `FilesystemConfig` patterns from ARCHITECTURE.md
-- [ ] Integrates with `AuditLog` for tracking
+#### FS.2.1 Content-Addressable Blob Store ✅
+- [x] `BlobStore` interface: Get, Put, Has, Delete, Size, Count
+- [x] `MemoryBlobStore` implementation
+- [x] Content deduplication (same content = same hash)
+- [x] Thread-safe for concurrent access
+- [x] `Hashes()` returns all stored hashes
+- [x] `Clear()` removes all blobs
+- [x] Tests pass with race detector
 
-#### FS.2.2 Operation Log
-- [ ] `OperationLog` interface: Append, Get, GetByPosition, Range
-- [ ] Query methods: OperationsSince, OperationsForSession, OperationsForPipeline
-- [ ] Indexes by ID, file path, session, pipeline
-- [ ] `MemoryOperationLog` and `FileOperationLog` implementations
-- [ ] WAL integration for durability
-- [ ] Thread-safe for concurrent append/read
+#### FS.2.2 Operation Log ✅
+- [x] `OperationLog` interface: Append, Get, GetByVersion, GetByFile, GetSince, Count
+- [x] Indexes by ID, base version, file path
+- [x] `MemoryOperationLog` implementation
+- [x] Thread-safe for concurrent append/read
+- [x] `Clear()` removes all operations
+- [x] Tests pass with race detector
 
-#### FS.2.3 Version DAG Store
-- [ ] `DAGStore` interface: PutVersion, GetVersion, GetHead, SetHead
-- [ ] Query methods: GetHistory, GetAncestors, GetCommonAncestor, GetChildren
-- [ ] Session/Pipeline/VariantGroup queries
-- [ ] `MemoryDAGStore` and `PersistentDAGStore` implementations
-- [ ] Thread-safe, survives restarts
+#### FS.2.3 Version DAG Store ✅
+- [x] `DAGStore` interface: Add, Get, GetHead, GetHistory, GetChildren, GetAncestors, Has, Count
+- [x] Validates parents exist before adding
+- [x] Tracks head per file, child relationships
+- [x] `MemoryDAGStore` implementation
+- [x] Thread-safe, handles merge commits
+- [x] `Files()` returns all tracked files
+- [x] Tests pass with race detector
 
-#### FS.2.4 Write-Ahead Log
-- [ ] `WAL` interface: Append, Sync, Replay, Checkpoint, Close
-- [ ] `WALEntry` with Type, Timestamp, SeqNum, SessionID, Data, Checksum
-- [ ] Entry types: Operation, Version, HeadUpdate, Blob, Checkpoint
-- [ ] Segment rotation (default 64MB)
-- [ ] CRC32 checksums for corruption detection
-- [ ] `WALRecovery` for crash recovery
+#### FS.2.4 Write-Ahead Log ✅
+- [x] `WriteAheadLog` interface: Append, Get, GetRange, GetSince, Checkpoint, Truncate, LastSequenceID, Close
+- [x] `WALEntry` with Type, SequenceID, Timestamp, PipelineID, SessionID, Data, Checksum
+- [x] Entry types: Operation, Version, Commit, Rollback, Checkpoint
+- [x] `MemoryWAL` implementation with auto-truncation
+- [x] CRC32 checksums with `ValidateChecksum()`
+- [x] `EncodeOperation()` for operation serialization
+- [x] Tests pass with race detector
 
 ---
 

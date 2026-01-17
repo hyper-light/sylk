@@ -2,8 +2,11 @@ package tools
 
 import (
 	"bytes"
+	"errors"
 	"sync"
 	"testing"
+
+	"github.com/adalundhe/sylk/core/tools/parsers"
 )
 
 func TestNewOutputHandler(t *testing.T) {
@@ -233,3 +236,121 @@ var errMock = &mockError{}
 type mockError struct{}
 
 func (e *mockError) Error() string { return "mock error" }
+
+type mockParseCache struct {
+	template *parsers.ParseTemplate
+	result   *parsers.TemplateResult
+	err      error
+}
+
+func (m *mockParseCache) Get(toolPattern string) *parsers.ParseTemplate {
+	return m.template
+}
+
+func (m *mockParseCache) Apply(_ *parsers.ParseTemplate, _, _ []byte) (*parsers.TemplateResult, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.result, nil
+}
+
+func TestNewOutputHandlerWithCache(t *testing.T) {
+	config := DefaultOutputHandlerConfig()
+	cache := &mockParseCache{}
+
+	h := NewOutputHandlerWithCache(config, cache)
+
+	if h == nil {
+		t.Fatal("expected non-nil handler")
+	}
+	if h.parseCache == nil {
+		t.Error("expected non-nil parseCache")
+	}
+}
+
+func TestOutputHandler_ProcessOutput_WithParseCache(t *testing.T) {
+	config := DefaultOutputHandlerConfig()
+	template := &parsers.ParseTemplate{ToolPattern: "test-tool"}
+	result := &parsers.TemplateResult{Fields: map[string][]string{"key": {"value"}}}
+	cache := &mockParseCache{template: template, result: result}
+
+	h := NewOutputHandlerWithCache(config, cache)
+
+	output := h.ProcessOutput("test-tool", []byte("stdout"), []byte("stderr"))
+
+	if output.Type != OutputTypeParsed {
+		t.Errorf("expected OutputTypeParsed, got %v", output.Type)
+	}
+	if output.Parsed == nil {
+		t.Error("expected non-nil Parsed")
+	}
+}
+
+func TestOutputHandler_ProcessOutput_ParseCacheNoTemplate(t *testing.T) {
+	config := DefaultOutputHandlerConfig()
+	cache := &mockParseCache{template: nil}
+
+	h := NewOutputHandlerWithCache(config, cache)
+
+	output := h.ProcessOutput("unknown-tool", []byte("stdout"), nil)
+
+	if output.Type != OutputTypeTruncated {
+		t.Errorf("expected OutputTypeTruncated, got %v", output.Type)
+	}
+}
+
+func TestOutputHandler_ProcessOutput_ParseCacheError(t *testing.T) {
+	config := DefaultOutputHandlerConfig()
+	template := &parsers.ParseTemplate{ToolPattern: "test-tool"}
+	cache := &mockParseCache{template: template, err: errors.New("apply failed")}
+
+	h := NewOutputHandlerWithCache(config, cache)
+
+	output := h.ProcessOutput("test-tool", []byte("stdout"), nil)
+
+	if output.Type != OutputTypeTruncated {
+		t.Errorf("expected fallback to OutputTypeTruncated, got %v", output.Type)
+	}
+}
+
+func TestOutputHandler_ProcessOutput_ParserPrecedence(t *testing.T) {
+	config := DefaultOutputHandlerConfig()
+	template := &parsers.ParseTemplate{ToolPattern: "test-tool"}
+	cacheResult := &parsers.TemplateResult{Fields: map[string][]string{"cache": {"result"}}}
+	cache := &mockParseCache{template: template, result: cacheResult}
+
+	h := NewOutputHandlerWithCache(config, cache)
+
+	parser := &mockParser{result: "parser result"}
+	h.RegisterParser("test-tool", parser)
+
+	output := h.ProcessOutput("test-tool", []byte("stdout"), nil)
+
+	if output.Type != OutputTypeParsed {
+		t.Errorf("expected OutputTypeParsed, got %v", output.Type)
+	}
+	if output.Parsed != "parser result" {
+		t.Errorf("expected parser to take precedence, got %v", output.Parsed)
+	}
+}
+
+func TestOutputHandler_ProcessOutput_CacheFallbackWhenParserFails(t *testing.T) {
+	config := DefaultOutputHandlerConfig()
+	template := &parsers.ParseTemplate{ToolPattern: "test-tool"}
+	cacheResult := &parsers.TemplateResult{Fields: map[string][]string{"cache": {"result"}}}
+	cache := &mockParseCache{template: template, result: cacheResult}
+
+	h := NewOutputHandlerWithCache(config, cache)
+
+	parser := &mockParser{err: true}
+	h.RegisterParser("test-tool", parser)
+
+	output := h.ProcessOutput("test-tool", []byte("stdout"), nil)
+
+	if output.Type != OutputTypeParsed {
+		t.Errorf("expected OutputTypeParsed from cache fallback, got %v", output.Type)
+	}
+	if _, ok := output.Parsed.(*parsers.TemplateResult); !ok {
+		t.Errorf("expected cache result type, got %T", output.Parsed)
+	}
+}

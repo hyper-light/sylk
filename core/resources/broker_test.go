@@ -102,7 +102,7 @@ func TestResourceBroker_ReleaseBundle(t *testing.T) {
 	defer broker.Close()
 
 	bundle := ResourceBundle{FileHandles: 3}
-	_, err := broker.AcquireBundle(context.Background(), "pipeline-1", bundle, 1)
+	alloc, err := broker.AcquireBundle(context.Background(), "pipeline-1", bundle, 1)
 	if err != nil {
 		t.Fatalf("AcquireBundle failed: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestResourceBroker_ReleaseBundle(t *testing.T) {
 		t.Errorf("expected 1 active allocation, got %d", statsBefore.ActiveAllocations)
 	}
 
-	err = broker.ReleaseBundle("pipeline-1")
+	err = broker.ReleaseBundle(alloc)
 	if err != nil {
 		t.Fatalf("ReleaseBundle failed: %v", err)
 	}
@@ -123,11 +123,42 @@ func TestResourceBroker_ReleaseBundle(t *testing.T) {
 	}
 }
 
-func TestResourceBroker_ReleaseBundle_NotFound(t *testing.T) {
+func TestResourceBroker_ReleaseBundleByID(t *testing.T) {
 	broker := newTestBroker(t)
 	defer broker.Close()
 
-	err := broker.ReleaseBundle("nonexistent")
+	bundle := ResourceBundle{FileHandles: 3}
+	_, err := broker.AcquireBundle(context.Background(), "pipeline-1", bundle, 1)
+	if err != nil {
+		t.Fatalf("AcquireBundle failed: %v", err)
+	}
+
+	err = broker.ReleaseBundleByID("pipeline-1")
+	if err != nil {
+		t.Fatalf("ReleaseBundleByID failed: %v", err)
+	}
+
+	statsAfter := broker.Stats()
+	if statsAfter.ActiveAllocations != 0 {
+		t.Errorf("expected 0 active allocations, got %d", statsAfter.ActiveAllocations)
+	}
+}
+
+func TestResourceBroker_ReleaseBundle_Nil(t *testing.T) {
+	broker := newTestBroker(t)
+	defer broker.Close()
+
+	err := broker.ReleaseBundle(nil)
+	if err != nil {
+		t.Errorf("expected no error for nil release, got %v", err)
+	}
+}
+
+func TestResourceBroker_ReleaseBundleByID_NotFound(t *testing.T) {
+	broker := newTestBroker(t)
+	defer broker.Close()
+
+	err := broker.ReleaseBundleByID("nonexistent")
 	if err != nil {
 		t.Errorf("expected no error for nonexistent release, got %v", err)
 	}
@@ -160,6 +191,45 @@ func TestResourceBroker_AcquireBundle_Closed(t *testing.T) {
 
 	bundle := ResourceBundle{FileHandles: 1}
 	_, err := broker.AcquireBundle(context.Background(), "pipeline-1", bundle, 1)
+	if err == nil {
+		t.Fatal("expected error for closed broker")
+	}
+}
+
+func TestResourceBroker_AcquireUser_Success(t *testing.T) {
+	broker := newTestBroker(t)
+	defer broker.Close()
+
+	bundle := ResourceBundle{
+		FileHandles:  3,
+		NetworkConns: 2,
+		Subprocesses: 1,
+	}
+
+	alloc, err := broker.AcquireUser(context.Background(), bundle)
+	if err != nil {
+		t.Fatalf("AcquireUser failed: %v", err)
+	}
+
+	if alloc == nil {
+		t.Fatal("expected allocation")
+	}
+
+	if alloc.PipelineID != "user" {
+		t.Errorf("expected 'user', got %s", alloc.PipelineID)
+	}
+
+	if len(alloc.FileHandles) != 3 {
+		t.Errorf("expected 3 file handles, got %d", len(alloc.FileHandles))
+	}
+}
+
+func TestResourceBroker_AcquireUser_Closed(t *testing.T) {
+	broker := newTestBroker(t)
+	_ = broker.Close()
+
+	bundle := ResourceBundle{FileHandles: 1}
+	_, err := broker.AcquireUser(context.Background(), bundle)
 	if err == nil {
 		t.Fatal("expected error for closed broker")
 	}
@@ -238,7 +308,7 @@ func TestResourceBroker_ConcurrentAcquireRelease(t *testing.T) {
 				return
 			}
 			if alloc != nil {
-				_ = broker.ReleaseBundle(pipelineID)
+				_ = broker.ReleaseBundle(alloc)
 			}
 		}(i)
 	}
@@ -320,5 +390,59 @@ func TestResourceBroker_PartialAcquireRollback(t *testing.T) {
 	fileStats := filePool.Stats()
 	if fileStats.InUse != 0 {
 		t.Errorf("file handles not rolled back, %d still in use", fileStats.InUse)
+	}
+}
+
+func TestResourceBroker_WaitGraph(t *testing.T) {
+	broker := newTestBroker(t)
+	defer broker.Close()
+
+	broker.AddWaitEdge("pipeline-1", "pipeline-2")
+	broker.AddWaitEdge("pipeline-2", "pipeline-3")
+
+	stats := broker.Stats()
+	if stats.WaitGraphSize != 2 {
+		t.Errorf("expected wait graph size 2, got %d", stats.WaitGraphSize)
+	}
+
+	broker.RemoveWaitEdge("pipeline-1")
+
+	stats = broker.Stats()
+	if stats.WaitGraphSize != 1 {
+		t.Errorf("expected wait graph size 1, got %d", stats.WaitGraphSize)
+	}
+}
+
+func TestResourceBroker_DeadlockDetection(t *testing.T) {
+	memConfig := DefaultMemoryMonitorConfig()
+	memMon := NewMemoryMonitor(memConfig)
+	defer memMon.Close()
+
+	filePool := NewResourcePool(ResourceTypeFile, DefaultResourcePoolConfig(10))
+	defer filePool.Close()
+
+	config := DefaultBrokerConfig()
+	config.DeadlockDetection = true
+	config.DetectionInterval = 50 * time.Millisecond
+
+	broker := NewResourceBroker(memMon, filePool, nil, nil, nil, nil, config)
+	defer broker.Close()
+
+	broker.AddWaitEdge("A", "B")
+	broker.AddWaitEdge("B", "C")
+	broker.AddWaitEdge("C", "A")
+
+	time.Sleep(100 * time.Millisecond)
+}
+
+func TestResourceBroker_NoDeadlockDetection(t *testing.T) {
+	config := DefaultBrokerConfig()
+	config.DeadlockDetection = false
+
+	broker := NewResourceBroker(nil, nil, nil, nil, nil, nil, config)
+
+	err := broker.Close()
+	if err != nil {
+		t.Errorf("Close failed: %v", err)
 	}
 }

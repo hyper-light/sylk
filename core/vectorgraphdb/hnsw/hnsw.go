@@ -124,7 +124,7 @@ func (h *Index) ensureLayers(level int) {
 func (h *Index) initializeFirstNode(id string, level int) {
 	h.entryPoint = id
 	h.maxLevel = level
-	for l := 0; l <= level; l++ {
+	for l := range level + 1 {
 		h.layers[l].addNode(id)
 	}
 }
@@ -214,7 +214,7 @@ func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
 		maxConn = h.M * 2
 	}
 
-	for i := 0; i < min(len(neighbors), maxConn); i++ {
+	for i := range min(len(neighbors), maxConn) {
 		neighbor := neighbors[i]
 		h.layers[level].addNeighbor(id, neighbor.ID, maxConn)
 		h.layers[level].addNeighbor(neighbor.ID, id, maxConn)
