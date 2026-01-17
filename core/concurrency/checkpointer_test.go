@@ -339,44 +339,52 @@ func (p *testStateProvider) CollectState(cp *concurrency.Checkpoint) error {
 }
 
 func TestCheckpointer_ConcurrentAccess(t *testing.T) {
-	dir := t.TempDir()
-	config := concurrency.CheckpointerConfig{
-		Dir:            dir,
-		Interval:       time.Hour,
-		MaxCheckpoints: 100,
-	}
-
-	cp, err := concurrency.NewCheckpointer(config)
-	require.NoError(t, err)
+	cp := createConcurrentTestCheckpointer(t)
 	defer cp.Stop()
 
 	var wg sync.WaitGroup
+	runConcurrentCheckpointCreates(cp, &wg, 10, 5)
+	runConcurrentCheckpointLoads(cp, &wg, 5, 10)
+	wg.Wait()
 
-	for i := 0; i < 10; i++ {
+	_, err := cp.LoadLatest()
+	assert.NoError(t, err)
+}
+
+func createConcurrentTestCheckpointer(t *testing.T) *concurrency.Checkpointer {
+	config := concurrency.CheckpointerConfig{
+		Dir:            t.TempDir(),
+		Interval:       time.Hour,
+		MaxCheckpoints: 100,
+	}
+	cp, err := concurrency.NewCheckpointer(config)
+	require.NoError(t, err)
+	return cp
+}
+
+func runConcurrentCheckpointCreates(cp *concurrency.Checkpointer, wg *sync.WaitGroup, workers, iterations int) {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 5; j++ {
+			for j := 0; j < iterations; j++ {
 				_ = cp.CreateCheckpoint()
 			}
 		}()
 	}
+}
 
-	for i := 0; i < 5; i++ {
+func runConcurrentCheckpointLoads(cp *concurrency.Checkpointer, wg *sync.WaitGroup, workers, iterations int) {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 10; j++ {
+			for j := 0; j < iterations; j++ {
 				_, _ = cp.LoadLatest()
 				time.Sleep(time.Millisecond)
 			}
 		}()
 	}
-
-	wg.Wait()
-
-	_, err = cp.LoadLatest()
-	assert.NoError(t, err)
 }
 
 func TestCheckpointer_GracefulShutdown(t *testing.T) {

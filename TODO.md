@@ -214,6 +214,122 @@ Build a highly concurrent multi-agent system capable of:
 - [ ] Orchestrator validates declaration before dispatch
 - [ ] `ArchitectPreDelegationPrompt` added to system prompt
 
+### Architect: Atomic Task Generation System
+
+The Architect generates engineering "tickets" - atomic, hyper-detailed implementation tasks
+that pipeline agents execute. Quality of decomposition determines quality of implementation.
+
+**Files to modify/create:**
+- `agents/architect/task_generator.go`
+- `agents/architect/task_types.go`
+- `agents/architect/decomposition.go`
+- `agents/architect/workflow_dag.go`
+- `agents/architect/task_validator.go`
+
+#### Deep Decomposition Engine
+**Acceptance Criteria:**
+- [ ] `DecompositionEngine` struct for request analysis
+- [ ] `Decompose(request) DecompositionResult` method
+- [ ] Extract explicit requirements from request
+- [ ] Extract implicit assumptions (must be stated explicitly)
+- [ ] Identify ambiguities requiring clarification
+- [ ] Identify unknowns requiring agent consultation
+- [ ] Enumerate edge cases (boundaries, empty, null, max, concurrent)
+- [ ] Enumerate failure modes (what can go wrong)
+- [ ] Identify design mitigations (trade-offs, alternatives considered)
+- [ ] Map system context (how this fits into larger system)
+- [ ] `DecompositionResult` struct with all extracted elements
+
+#### Iterative Clarification Protocol
+**Acceptance Criteria:**
+- [ ] `ClarificationProtocol` struct for managing queries
+- [ ] Query agents (via Guide) until answers are COMPLETE
+- [ ] If agent answer incomplete, query again with more specificity
+- [ ] If agent answer raises new questions, query those too
+- [ ] Track all queries and responses for audit
+- [ ] Only ask user after ALL agents exhausted
+- [ ] User questions explain what was learned from agents
+- [ ] User questions ask for MINIMAL information needed
+
+#### Atomic Task Schema
+**Acceptance Criteria:**
+- [ ] `AtomicTask` struct with all required fields
+- [ ] Task ID generation (unique, sequential within workflow)
+- [ ] Title field (brief, descriptive)
+- [ ] Description field (maximally informative, includes WHY)
+- [ ] AcceptanceCriteria slice (specific, measurable, verifiable)
+- [ ] TestCaseProposals slice (happy path, errors, edge cases, category refs)
+- [ ] CodeReferences struct (files to create, patterns to follow, references)
+- [ ] Dependencies slice (task IDs this depends on)
+- [ ] FailureModes slice (what can go wrong, mitigations)
+- [ ] JSON serialization for Orchestrator consumption
+
+#### Task Field Requirements
+**Acceptance Criteria:**
+- [ ] AcceptanceCriterion struct: description, verifiable bool, category string
+- [ ] TestCaseProposal struct: scenario, category (1-6), expectedOutcome
+- [ ] CodeReference struct: path, action (create/modify/reference), pattern string
+- [ ] Dependency struct: taskID, type (hard/soft), reason
+- [ ] FailureMode struct: description, probability, mitigation
+- [ ] Validation that all required fields are populated
+
+#### Task Validator
+**Acceptance Criteria:**
+- [ ] `TaskValidator` struct for quality checks
+- [ ] `Validate(task) []ValidationError` method
+- [ ] Verify task is ATOMIC (cannot be split further)
+- [ ] Verify task is INDEPENDENT (no circular deps)
+- [ ] Verify task is TESTABLE (has verifiable criteria)
+- [ ] Verify task is SCOPED (clear boundaries)
+- [ ] Verify all 7 sections are populated
+- [ ] Verify acceptance criteria are specific (not vague)
+- [ ] Verify dependencies reference valid task IDs
+- [ ] Reject tasks with validation errors
+
+#### Workflow DAG Generator
+**Acceptance Criteria:**
+- [ ] `WorkflowDAG` struct for task organization
+- [ ] `GenerateDAG(tasks []AtomicTask) (*WorkflowDAG, error)` method
+- [ ] Topological sort of tasks by dependencies
+- [ ] Identify tasks with no dependencies (Wave 1 candidates)
+- [ ] Identify parallel execution groups (no conflicts)
+- [ ] Organize into Waves (Foundation → Core → Integration → Validation)
+- [ ] Detect circular dependencies (error if found)
+- [ ] Detect missing dependencies (error if referenced task doesn't exist)
+- [ ] Calculate critical path for estimation
+
+#### Wave Organization
+**Acceptance Criteria:**
+- [ ] `Wave` struct: number, name, taskIDs, parallel bool, dependsOnWave
+- [ ] Wave 1: Foundation (types, interfaces, shared utilities)
+- [ ] Wave 2+: Core implementation (parallelizable)
+- [ ] Later Waves: Integration (connect components)
+- [ ] Final Wave: Validation (end-to-end verification)
+- [ ] Tasks within a wave can execute in parallel unless noted
+- [ ] Cross-wave dependencies properly tracked
+
+#### Workflow Output Format
+**Acceptance Criteria:**
+- [ ] `WorkflowOutput` struct with JSON tags
+- [ ] workflow_id field (unique identifier)
+- [ ] total_tasks count
+- [ ] waves array with wave details
+- [ ] tasks map with full task specifications
+- [ ] critical_path for estimation
+- [ ] estimated_parallelism (max concurrent tasks)
+- [ ] JSON serialization for Orchestrator handoff
+
+#### Integration Tests
+**Acceptance Criteria:**
+- [ ] Test decomposition extracts all requirement types
+- [ ] Test clarification protocol queries until complete
+- [ ] Test task generation produces valid AtomicTasks
+- [ ] Test task validation catches incomplete tasks
+- [ ] Test DAG generation produces valid topological order
+- [ ] Test wave organization groups correctly
+- [ ] Test circular dependency detection
+- [ ] Test full pipeline from request to workflow
+
 ### Orchestrator: Execution Discipline Protocol
 
 **Files to modify/create:**
@@ -277,6 +393,164 @@ Build a highly concurrent multi-agent system capable of:
 - [ ] "NO EVIDENCE = NOT COMPLETE" principle enforced
 - [ ] `InspectorCompletionEvidencePrompt` added to system prompt
 
+### Inspector: 8-Phase Validation System
+
+The Inspector executes 8 sequential validation phases. ANY phase failure causes overall FAIL.
+Inspector is RUTHLESS, SPECIFIC, and DETAILED - code must meet the HIGHEST bar.
+
+**Files to modify/create:**
+- `agents/inspector/validation_phases.go`
+- `agents/inspector/phase_spec_compliance.go`
+- `agents/inspector/phase_concurrency.go`
+- `agents/inspector/phase_memory.go`
+- `agents/inspector/phase_type_safety.go`
+- `agents/inspector/phase_structure.go`
+- `agents/inspector/phase_idioms.go`
+- `agents/inspector/phase_documentation.go`
+- `agents/inspector/phase_design.go`
+- `agents/inspector/validation_report.go`
+
+#### Phase 1: Spec Compliance Validation
+**Acceptance Criteria:**
+- [ ] `ValidationPhase` interface with `Name()`, `Execute()`, `Result()` methods
+- [ ] `SpecCompliancePhase` struct implementing `ValidationPhase`
+- [ ] Read and enumerate ALL requirements from provided specification
+- [ ] Check each requirement against actual implementation
+- [ ] Verify all required functions, types, interfaces exist
+- [ ] Confirm error handling covers all specified error conditions
+- [ ] Validate all edge cases mentioned in spec are handled
+- [ ] FAIL if any required functionality missing
+- [ ] FAIL if any specified behavior not implemented
+- [ ] Report with exact file paths and line numbers for every check
+
+#### Phase 2: Concurrency & Safety Validation
+**Acceptance Criteria:**
+- [ ] `ConcurrencyPhase` struct implementing `ValidationPhase`
+- [ ] Detect race conditions in shared state access
+- [ ] Verify proper mutex/lock usage around critical sections
+- [ ] Detect potential deadlocks (lock ordering, nested locks)
+- [ ] Validate channel usage (unbuffered blocking, closed channel writes)
+- [ ] Check for goroutine leaks (goroutines that never terminate)
+- [ ] Verify atomic operations used correctly
+- [ ] Examine sync.WaitGroup, sync.Once, sync.Pool usage
+- [ ] FAIL if any race condition detected
+- [ ] FAIL if any deadlock potential identified
+- [ ] FAIL if any goroutine leak pattern found
+
+#### Phase 3: Memory & Resource Validation
+**Acceptance Criteria:**
+- [ ] `MemoryResourcePhase` struct implementing `ValidationPhase`
+- [ ] Check for memory leaks (unclosed resources, retained references)
+- [ ] Verify all opened resources properly closed (files, connections)
+- [ ] Detect unbounded growth patterns (maps/slices without limits)
+- [ ] Validate defer usage for cleanup
+- [ ] Check context propagation for cancellation
+- [ ] Verify error paths don't leak resources
+- [ ] FAIL if any resource leak detected
+- [ ] FAIL if unbounded memory growth pattern found
+- [ ] FAIL if missing cleanup on error paths
+
+#### Phase 4: Type Safety & Error Handling
+**Acceptance Criteria:**
+- [ ] `TypeSafetyPhase` struct implementing `ValidationPhase`
+- [ ] Verify type safety (generics, interfaces, type assertions)
+- [ ] Check for type hints/annotations (Python: required, TypeScript: required)
+- [ ] Validate error types are SPECIFIC, not generic
+- [ ] Ensure errors include context (wrapped with %w or equivalent)
+- [ ] Check error handling is exhaustive (no swallowed errors)
+- [ ] Verify sentinel errors used appropriately
+- [ ] Validate custom error types implement error interface correctly
+- [ ] FAIL if missing type annotations in typed languages
+- [ ] FAIL if generic error messages without context
+- [ ] FAIL if swallowed errors (caught but not handled/logged)
+
+#### Phase 5: Code Structure & Complexity
+**Acceptance Criteria:**
+- [ ] `CodeStructurePhase` struct implementing `ValidationPhase`
+- [ ] Check function length: FAIL if >100 lines, WARN if >50 lines
+- [ ] Validate loop nesting: FAIL if >3 levels, WARN if >2 levels
+- [ ] Check cyclomatic complexity: FAIL if >15, WARN if >10
+- [ ] Verify parameter count: FAIL if >7 params, WARN if >5 params
+- [ ] Detect god functions/methods (doing too many things)
+- [ ] Check for proper separation of concerns
+- [ ] Report line counts for every function exceeding thresholds
+- [ ] Report nesting depth for every deep loop
+
+#### Phase 6: Language Idioms & Modern Features
+**Acceptance Criteria:**
+- [ ] `LanguageIdiomsPhase` struct implementing `ValidationPhase`
+- [ ] Verify use of modern language features (Go 1.21+, Python 3.10+, etc.)
+- [ ] Check for outdated patterns with modern replacements
+- [ ] Validate use of built-in methods over manual implementations
+- [ ] Ensure idiomatic patterns for the language
+- [ ] Check for proper use of standard library over reinventing
+- [ ] FAIL if manual implementation of stdlib functionality
+- [ ] FAIL if deprecated patterns when modern alternatives exist
+- [ ] Language-specific ruleset registry
+
+#### Phase 7: Documentation & Readability
+**Acceptance Criteria:**
+- [ ] `DocumentationPhase` struct implementing `ValidationPhase`
+- [ ] Check all exported/public functions have documentation
+- [ ] Verify docstrings describe WHAT and WHY, not just HOW
+- [ ] Validate parameter and return value documentation
+- [ ] Check for misleading or outdated comments
+- [ ] Verify complex algorithms have explanatory comments
+- [ ] Ensure error conditions are documented
+- [ ] FAIL if exported function/type without documentation
+- [ ] FAIL if documentation doesn't match implementation
+
+#### Phase 8: Design & Architecture Smells
+**Acceptance Criteria:**
+- [ ] `DesignSmellsPhase` struct implementing `ValidationPhase`
+- [ ] Check for inheritance abuse (prefer composition)
+- [ ] Detect feature envy (method using more of another class's data)
+- [ ] Identify shotgun surgery patterns (changes requiring many edits)
+- [ ] Check for inappropriate intimacy between components
+- [ ] Verify single responsibility principle
+- [ ] Detect primitive obsession (using primitives vs small objects)
+- [ ] Check for data clumps (same data group appearing together)
+- [ ] FAIL if deep inheritance hierarchies (>3 levels)
+- [ ] FAIL if circular dependencies between packages
+- [ ] FAIL if tight coupling preventing testing
+
+#### Validation Orchestration
+**Acceptance Criteria:**
+- [ ] `ValidationOrchestrator` struct managing all 8 phases
+- [ ] `RegisterPhase(phase ValidationPhase)` method
+- [ ] `Execute(ctx, spec, code) ValidationReport` method
+- [ ] Sequential execution: stop at first phase failure
+- [ ] Aggregate code smell counts across phases
+- [ ] `ValidationReport` struct with per-phase results
+- [ ] Report includes overall_result, failed_phase, code_smells
+- [ ] Accumulator rules: 5+ minor OR 2+ moderate causes FAIL
+- [ ] Each issue cites exact file path, line number, code snippet
+- [ ] Knowledge agent consultation hooks (before Phase 1, during 2-3, for 6-8)
+
+#### Validation Report Schema
+**Acceptance Criteria:**
+- [ ] `ValidationReport` struct with JSON tags
+- [ ] `PhaseResult` struct: result, issues, evidence
+- [ ] `ValidationIssue` struct: severity, file, line, snippet, message, fix
+- [ ] `CodeSmell` struct: type, severity (minor/moderate/severe), location
+- [ ] JSON serialization for Archivalist storage
+- [ ] Human-readable rendering for CLI output
+- [ ] Summary generation for Architect reporting
+
+#### Integration Tests
+**Acceptance Criteria:**
+- [ ] Test Phase 1 with complete vs incomplete spec compliance
+- [ ] Test Phase 2 with race condition examples
+- [ ] Test Phase 3 with resource leak examples
+- [ ] Test Phase 4 with error handling edge cases
+- [ ] Test Phase 5 with complexity threshold violations
+- [ ] Test Phase 6 with outdated vs modern code patterns
+- [ ] Test Phase 7 with undocumented code
+- [ ] Test Phase 8 with design smell examples
+- [ ] Test accumulator thresholds (5 minor, 2 moderate, 1 severe)
+- [ ] Test full pipeline with passing code
+- [ ] Test full pipeline with failing code at each phase
+
 ### Tester: Completion Evidence Protocol
 
 **Files to modify/create:**
@@ -293,6 +567,178 @@ Build a highly concurrent multi-agent system capable of:
 - [ ] Evidence stored in Archivalist with task correlation
 - [ ] "NO EVIDENCE = NOT COMPLETE" principle enforced
 - [ ] `TesterCompletionEvidencePrompt` added to system prompt
+
+### Tester: 6-Category Test System
+
+The Tester generates THOROUGH tests across 6 categories. Tests code as if SYSTEM CRITICAL.
+Tester is a SEASONED QE/SDET - discerning, thorough, and focused on real value.
+
+**CRITICAL**: Tester MUST analyze implementation code BEFORE deciding what to test.
+Categories 5 (Concurrency) and 6 (Integration) are CONDITIONAL - only apply when implementation requires.
+
+**Files to modify/create:**
+- `agents/tester/test_categories.go`
+- `agents/tester/implementation_analyzer.go` (NEW - analyzes code to determine applicable categories)
+- `agents/tester/category_happy_path.go`
+- `agents/tester/category_negative_path.go`
+- `agents/tester/category_error_handling.go`
+- `agents/tester/category_edge_cases.go`
+- `agents/tester/category_concurrency.go`
+- `agents/tester/category_integration.go`
+- `agents/tester/test_quality.go`
+- `agents/tester/test_report.go`
+
+#### Implementation Analysis (MANDATORY FIRST STEP)
+**Acceptance Criteria:**
+- [ ] `ImplementationAnalyzer` struct for code examination
+- [ ] `Analyze(code) ImplementationProfile` method
+- [ ] Detect all public APIs and their contracts
+- [ ] Identify all error conditions and failure modes
+- [ ] Detect concurrency patterns (goroutines, channels, mutexes, atomics, sync.*)
+- [ ] Detect external dependencies (HTTP, DB, file I/O, network)
+- [ ] `ImplementationProfile` struct with: hasConcurrency, hasExternalDeps, errorPaths, publicAPIs
+- [ ] `DetermineApplicableCategories(profile) []CategoryType` method
+- [ ] Categories 1-4 always applicable, 5-6 conditional on profile
+- [ ] Analysis results stored for test plan justification
+
+#### Category 1: Happy Path Tests
+**Acceptance Criteria:**
+- [ ] `TestCategory` interface with `Name()`, `Generate()`, `Validate()` methods
+- [ ] `HappyPathCategory` struct implementing `TestCategory`
+- [ ] Test primary use case with valid inputs
+- [ ] Verify expected outputs and state changes
+- [ ] Cover the "golden path" users typically follow
+- [ ] Minimum 1 happy path test per public function/method enforced
+- [ ] Auto-detection of public functions requiring happy path tests
+
+#### Category 2: Negative Path Tests
+**Acceptance Criteria:**
+- [ ] `NegativePathCategory` struct implementing `TestCategory`
+- [ ] Test with invalid inputs (null, empty, malformed)
+- [ ] Test boundary violations (too large, too small, out of range)
+- [ ] Test type mismatches where language allows
+- [ ] Verify appropriate errors returned (not panics/crashes)
+- [ ] Minimum 2-3 negative cases per public function enforced
+- [ ] Input validation coverage tracking
+
+#### Category 3: Error Handling Tests
+**Acceptance Criteria:**
+- [ ] `ErrorHandlingCategory` struct implementing `TestCategory`
+- [ ] Test every error condition the code can produce
+- [ ] Verify error messages are informative
+- [ ] Verify error types are specific (not generic)
+- [ ] Test error propagation through call chains
+- [ ] Test cleanup/rollback on error paths
+- [ ] Minimum 1 test per distinct error condition enforced
+- [ ] Error path enumeration from code analysis
+
+#### Category 4: Edge Case Tests
+**Acceptance Criteria:**
+- [ ] `EdgeCaseCategory` struct implementing `TestCategory`
+- [ ] Test boundary values (0, 1, max-1, max, overflow)
+- [ ] Test empty collections, single items, large collections
+- [ ] Test unicode, special characters, very long strings
+- [ ] Test concurrent access patterns
+- [ ] Test timeout/cancellation scenarios
+- [ ] Minimum 3-5 edge cases per complex function enforced
+- [ ] Boundary value analysis integration
+
+#### Category 5: Concurrency Tests (CONDITIONAL)
+**PREREQUISITE**: ImplementationAnalyzer.hasConcurrency == true
+
+Only generate if implementation contains: goroutines, channels, sync.Mutex, sync.RWMutex,
+sync.WaitGroup, sync.Once, sync.Pool, sync.Map, sync/atomic, or shared state.
+
+Writing concurrency tests for synchronous code is JUNK TESTING - do not do it.
+
+**Acceptance Criteria:**
+- [ ] `ConcurrencyCategory` struct implementing `TestCategory`
+- [ ] `IsApplicable(profile ImplementationProfile) bool` method - checks hasConcurrency
+- [ ] SKIP generation entirely if IsApplicable returns false
+- [ ] Test for race conditions with parallel execution
+- [ ] Test for deadlocks with lock acquisition patterns
+- [ ] Test channel operations (send/receive, close, select)
+- [ ] Test goroutine lifecycle (creation, completion, leak prevention)
+- [ ] Use race detector during test execution (`go test -race`)
+- [ ] Verify proper cleanup and no goroutine leaks
+- [ ] Report in test plan WHY concurrency tests were included (cite specific patterns found)
+
+#### Category 6: Integration Tests (CONDITIONAL)
+**PREREQUISITE**: ImplementationAnalyzer.hasExternalDeps == true
+
+Only generate if implementation contains: HTTP clients, database connections, file I/O,
+network sockets, message queues, external service calls, or cross-component interactions.
+
+Writing integration tests for pure functions is JUNK TESTING - do not do it.
+
+**Acceptance Criteria:**
+- [ ] `IntegrationCategory` struct implementing `TestCategory`
+- [ ] `IsApplicable(profile ImplementationProfile) bool` method - checks hasExternalDeps
+- [ ] SKIP generation entirely if IsApplicable returns false
+- [ ] Test component interactions with realistic scenarios
+- [ ] Test with real dependencies OR realistic mocks (prefer real when fast)
+- [ ] Test end-to-end flows for critical paths
+- [ ] Test failure modes of dependencies (timeouts, errors, unavailability)
+- [ ] Test retry and recovery behavior
+- [ ] Report in test plan WHY integration tests were included (cite specific deps found)
+
+#### Test Quality Enforcement
+**Acceptance Criteria:**
+- [ ] `TestQualityChecker` struct for validation
+- [ ] Single assertion per test validation (cyclomatic complexity check)
+- [ ] Test naming convention enforcement: `Test<Function>_<Scenario>_<Expected>`
+- [ ] Arrange-Act-Assert pattern detection
+- [ ] Test independence validation (no shared mutable state)
+- [ ] Parallelization capability check
+- [ ] Flakiness detection (run 3x on uncertainty)
+
+#### Junk Test Prevention
+**Acceptance Criteria:**
+- [ ] `JunkTestDetector` struct for filtering
+- [ ] Detect tests of language built-ins (Go's append, Python's len, etc.)
+- [ ] Detect tests of third-party library internals
+- [ ] Detect tests of private implementation details
+- [ ] Detect tests that always pass regardless of implementation
+- [ ] Detect tests slower than code under test
+- [ ] Detect concurrency tests for synchronous code (no goroutines/channels/locks)
+- [ ] Detect integration tests for pure functions (no external deps)
+- [ ] Cross-reference with ImplementationProfile to catch category mismatches
+- [ ] Warning/rejection for junk test patterns
+- [ ] Configurable allowlist for intentional exceptions
+
+#### Test Report Generation
+**Acceptance Criteria:**
+- [ ] `TestReport` struct with JSON tags
+- [ ] Per-category breakdown (count, test names, results)
+- [ ] Coverage metrics (line coverage, branch coverage, uncovered lines)
+- [ ] Execution metrics (total, passed, failed, skipped, duration)
+- [ ] Quality assessment (all categories covered, no junk, independent, not flaky)
+- [ ] JSON serialization for Archivalist storage
+- [ ] Human-readable rendering for CLI output
+
+#### Test Orchestration
+**Acceptance Criteria:**
+- [ ] `TestOrchestrator` struct managing all 6 categories
+- [ ] `RegisterCategory(category TestCategory)` method
+- [ ] `Analyze(implementation) TestPlan` method
+- [ ] `Generate(plan) []TestFile` method
+- [ ] `Execute(tests) TestReport` method
+- [ ] Category applicability detection per implementation
+- [ ] Coverage threshold enforcement (80%+ line, 70%+ branch)
+- [ ] Knowledge agent consultation hooks (Librarian for patterns, Archivalist for history)
+
+#### Integration Tests for Tester
+**Acceptance Criteria:**
+- [ ] Test happy path category generation
+- [ ] Test negative path category with various invalid inputs
+- [ ] Test error handling category finds all error paths
+- [ ] Test edge case category boundary detection
+- [ ] Test concurrency category detects shared state
+- [ ] Test integration category dependency detection
+- [ ] Test junk test detector catches bad patterns
+- [ ] Test quality checker validates structure
+- [ ] Test full orchestration pipeline
+- [ ] Test report accuracy and completeness
 
 ### Cross-Agent Discipline Integration
 
@@ -2684,42 +3130,42 @@ Executes directed acyclic graph workflows with parallel layer execution.
 **Acceptance Criteria:**
 
 #### DAG Structure
-- [ ] `DAG` struct with nodes, edges, execution order, policy
-- [ ] `DAGNode` with Name (human-readable key, e.g. `create_dashboard`), agent type, prompt, context, dependencies, metadata
-- [ ] **Node names are human-readable, snake_case, unique within DAG** (generated by Architect)
-- [ ] `execution_order` as layered array (each layer runs in parallel)
-- [ ] Policy: `max_concurrency`, `fail_fast`, `default_retry`
+- [x] `DAG` struct with nodes, edges, execution order, policy
+- [x] `DAGNode` with Name (human-readable key, e.g. `create_dashboard`), agent type, prompt, context, dependencies, metadata
+- [x] **Node names are human-readable, snake_case, unique within DAG** (generated by Architect)
+- [x] `execution_order` as layered array (each layer runs in parallel)
+- [x] Policy: `max_concurrency`, `fail_fast`, `default_retry`
 
 #### Node State Machine
-- [ ] Node states: `Pending`, `Queued`, `Running`, `Succeeded`, `Failed`, `Blocked`, `Skipped`, `Cancelled`
-- [ ] State transitions with validation
-- [ ] State change events for observability
+- [x] Node states: `Pending`, `Queued`, `Running`, `Succeeded`, `Failed`, `Blocked`, `Skipped`, `Cancelled`
+- [x] State transitions with validation
+- [x] State change events for observability
 
 #### Validation
-- [ ] Topological sort validation (reject cycles)
-- [ ] Dependency validation (all deps exist)
+- [x] Topological sort validation (reject cycles)
+- [x] Dependency validation (all deps exist)
 - [ ] Agent type validation (agent exists)
 
 #### Execution
-- [ ] `DAGExecutor` executes layer-by-layer with bounded concurrency
-- [ ] Dependency resolution (node starts only when all deps succeed)
-- [ ] Result propagation from parent nodes to dependent nodes
-- [ ] `fail_fast` policy support (stop on first failure)
-- [ ] `continue_on_failure` policy support (mark deps as skipped)
-- [ ] Per-node timeout with cancellation
-- [ ] Per-node retry with backoff
-- [ ] Cancellation support (cancel all pending/running nodes)
+- [x] `DAGExecutor` executes layer-by-layer with bounded concurrency
+- [x] Dependency resolution (node starts only when all deps succeed)
+- [x] Result propagation from parent nodes to dependent nodes
+- [x] `fail_fast` policy support (stop on first failure)
+- [x] `continue_on_failure` policy support (mark deps as skipped)
+- [x] Per-node timeout with cancellation
+- [x] Per-node retry with backoff
+- [x] Cancellation support (cancel all pending/running nodes)
 
 #### Context Propagation
-- [ ] Node receives context from completed dependencies
-- [ ] Output artifacts from parent nodes available to children
+- [x] Node receives context from completed dependencies
+- [x] Output artifacts from parent nodes available to children
 - [ ] Session context available to all nodes
 
 **Tests:**
-- [ ] Execute 5-layer DAG with 20 nodes, verify correct ordering
-- [ ] Test fail_fast with mid-DAG failure
-- [ ] Test continue_on_failure with skipped nodes
-- [ ] Test cancellation mid-execution
+- [x] Execute 5-layer DAG with 20 nodes, verify correct ordering
+- [x] Test fail_fast with mid-DAG failure
+- [x] Test continue_on_failure with skipped nodes
+- [x] Test cancellation mid-execution
 
 ```go
 // Required interfaces
@@ -2753,33 +3199,33 @@ Extend existing worker pool for multi-session fair scheduling.
 **Acceptance Criteria:**
 
 #### Priority Pool
-- [ ] `PriorityWorkerPool` with priority lanes (Critical, High, Normal, Low, Background)
-- [ ] Priority-based job selection (higher priority first)
-- [ ] Job stealing between priority lanes when idle
-- [ ] Starvation prevention (age-based promotion)
+- [x] `PriorityWorkerPool` with priority lanes (Critical, High, Normal, Low, Background)
+- [x] Priority-based job selection (higher priority first)
+- [x] Job stealing between priority lanes when idle
+- [x] Starvation prevention (age-based promotion)
 
 #### Session-Aware Pool
-- [ ] `SessionAwarePool` with fair scheduling across sessions
-- [ ] Per-session job limits (prevent session starvation)
-- [ ] Per-session job queues
-- [ ] Round-robin or weighted-fair selection across sessions
-- [ ] Session job counts and wait times
+- [x] `SessionAwarePool` with fair scheduling across sessions
+- [x] Per-session job limits (prevent session starvation)
+- [x] Per-session job queues
+- [x] Round-robin or weighted-fair selection across sessions
+- [x] Session job counts and wait times
 
 #### Global Limits
-- [ ] Global concurrency cap across all sessions
-- [ ] Per-agent-type concurrency limits (e.g., max 10 Engineers)
-- [ ] Dynamic limit adjustment based on load
+- [x] Global concurrency cap across all sessions
+- [x] Per-agent-type concurrency limits (e.g., max 10 Engineers)
+- [x] Dynamic limit adjustment based on load
 
 #### Metrics
-- [ ] Jobs per session
-- [ ] Wait time per priority lane
-- [ ] Processing time distribution
-- [ ] Queue depths
+- [x] Jobs per session
+- [x] Wait time per priority lane
+- [x] Processing time distribution
+- [x] Queue depths
 
 **Tests:**
-- [ ] Submit 1000 jobs from 10 sessions, verify fair distribution
-- [ ] Verify priority ordering
-- [ ] Verify starvation prevention
+- [x] Submit 1000 jobs from 10 sessions, verify fair distribution
+- [x] Verify priority ordering
+- [x] Verify starvation prevention
 
 ### 0.4 Guide Enhancements
 
@@ -3862,6 +4308,83 @@ Extend Archivalist for multi-session support with shared historical access.
 - `agents/archivalist/skills.go`
 
 **Acceptance Criteria:**
+
+#### Archivalist System Prompt
+
+**Core Identity:**
+- [ ] Model: Claude Sonnet 4.5 (optimized for pattern matching and history queries)
+- [ ] Role: Historical RAG - cross-session memory of failures, decisions, and patterns
+- [ ] User Interaction: INDIRECT (triggered by history queries via Guide)
+
+**Core Responsibilities:**
+- [ ] FAILURE MEMORY: Track and recall failure patterns to prevent repetition
+- [ ] DECISION HISTORY: Store and retrieve past decisions with outcomes
+- [ ] PATTERN STORAGE: Maintain patterns that can be promoted to global knowledge
+- [ ] SESSION BRIEFINGS: Provide context briefings (micro, standard, full)
+- [ ] CROSS-SESSION LEARNING: Enable institutional learning across sessions
+
+**Failure Pattern Memory Protocol (CRITICAL):**
+- [ ] Track outcome field: success/failure/partial when storing decisions
+- [ ] If failure, extract approach_signature and error_pattern
+- [ ] Increment recurrence_count for similar failures
+- [ ] ALWAYS check failure_patterns first when queried about approaches
+- [ ] Include warning if similar failure exists (similarity > 0.7)
+- [ ] Format: "SIMILAR FAILURE DETECTED: [approach] failed [N] times. [error]. Resolution: [fix or 'unknown']"
+
+**Alert Thresholds:**
+- [ ] recurrence_count >= 2: "SIMILAR FAILURE DETECTED" warning
+- [ ] recurrence_count >= 5: "RECURRING FAILURE" - suggest different approach
+- [ ] Same session failure: "REPEATED FAILURE" - trigger escalation
+
+**Cross-Session Learning:**
+- [ ] Failure patterns are ALWAYS cross-session readable
+- [ ] A failure in session A MUST warn session B
+- [ ] Resolutions discovered later update all related failures
+
+**Retrieval Accuracy Protocol:**
+- [ ] STALE_RETRIEVAL: Mark "needs_review", add staleness warning
+- [ ] IRRELEVANT_RETRIEVAL: Add as negative example for similarity
+- [ ] INCOMPLETE_RETRIEVAL: Create cross-reference links
+- [ ] WRONG_RESOLUTION: Add "context_specific" flag
+- [ ] CONFLICTING_ENTRIES: Add reconciliation note
+
+**Storage Verification:**
+- [ ] Read-after-write verification after every store operation
+- [ ] Test retrieval with expected query patterns
+- [ ] Verify cross-references work both directions
+
+**Query Intent Classification:**
+- [ ] HISTORICAL: "What did we do before for X?", "Past solutions"
+- [ ] ACTIVITY: "What files changed?", "What happened in last task?"
+- [ ] OUTCOME: "Did tests pass?", "What was the result?"
+- [ ] SIMILAR: "Have we seen this error before?", "Similar past decisions"
+- [ ] RESUME: "Where did we leave off?", "Current status"
+- [ ] GENERAL: Other history questions
+
+**Storage Categories:**
+- [ ] decision, insight, pattern, failure, task_state, timeline
+- [ ] user_voice, hypothesis, open_thread, general
+
+**Communication Style:**
+- [ ] Be concise, direct, technical
+- [ ] Provide evidence: timestamps, session IDs, recurrence counts
+- [ ] If uncertain about retrieval accuracy, flag it
+- [ ] NO status acknowledgments, flattery, or hedging
+- [ ] Proactively warn about failure patterns
+
+**Critical Constraints:**
+- [ ] NEVER return stale information without flagging
+- [ ] NEVER ignore failure patterns when queried about approaches
+- [ ] ALWAYS verify storage after write operations
+- [ ] ALWAYS include recurrence counts for failure patterns
+- [ ] ALWAYS cross-reference related entries
+
+**YOU DO NOT:**
+- [ ] Suppress failure warnings to seem helpful
+- [ ] Return outdated information without staleness flags
+- [ ] Store without verification
+- [ ] Ignore accuracy issues reported by agents
+- [ ] Provide incomplete context when fuller context exists
 
 #### Session Isolation
 - [ ] Session ID on all stored entries
@@ -6563,36 +7086,36 @@ Implements SQLite-based cross-session coordination and discovery.
 **Acceptance Criteria:**
 
 #### Database Schema
-- [ ] SQLite database at `~/.sylk/state.db`
-- [ ] WAL mode enabled for concurrent access
-- [ ] Sessions table: session_id, pid, start_time, last_heartbeat, activity_score, running_pipelines, allocated_slots
-- [ ] Allocations table: session_id, resource_type, allocated_count
-- [ ] Migrations support for schema updates
+- [x] SQLite database at `~/.sylk/state.db`
+- [x] WAL mode enabled for concurrent access
+- [x] Sessions table: session_id, pid, start_time, last_heartbeat, activity_score, running_pipelines, allocated_slots
+- [x] Allocations table: session_id, resource_type, allocated_count
+- [x] Migrations support for schema updates
 
 #### Session Lifecycle
-- [ ] `Register(sessionID string) error` - add session to registry
-- [ ] `Unregister(sessionID string) error` - remove session
-- [ ] `Heartbeat(sessionID, runningPipelines, recentInvocations) error` - update liveness
-- [ ] Activity score calculation: `running_pipelines + recent_invocations × decay_rate`
-- [ ] Configurable heartbeat interval (default: 1s)
+- [x] `Register(sessionID string) error` - add session to registry
+- [x] `Unregister(sessionID string) error` - remove session
+- [x] `Heartbeat(sessionID, runningPipelines, recentInvocations) error` - update liveness
+- [x] Activity score calculation: `running_pipelines + recent_invocations × decay_rate`
+- [x] Configurable heartbeat interval (default: 1s)
 
 #### Session Discovery
-- [ ] `GetActiveSessions() ([]SessionRecord, error)` - all non-stale sessions
-- [ ] `GetSession(sessionID) (*SessionRecord, error)` - single session
-- [ ] Configurable stale threshold (default: 10s)
-- [ ] `CleanupStaleSessions() error` - remove dead sessions
+- [x] `GetActiveSessions() ([]SessionRecord, error)` - all non-stale sessions
+- [x] `GetSession(sessionID) (*SessionRecord, error)` - single session
+- [x] Configurable stale threshold (default: 10s)
+- [x] `CleanupStaleSessions() error` - remove dead sessions
 
 #### Process Validation
-- [ ] Verify PID still running on session lookup
-- [ ] Remove sessions with dead PIDs
-- [ ] Handle PID reuse (check start time)
+- [x] Verify PID still running on session lookup
+- [x] Remove sessions with dead PIDs
+- [x] Handle PID reuse (check start time)
 
 **Tests:**
-- [ ] Session registration works
-- [ ] Heartbeat updates activity score
-- [ ] Stale detection works
-- [ ] Concurrent access safe (WAL)
-- [ ] Dead PID detection works
+- [x] Session registration works
+- [x] Heartbeat updates activity score
+- [x] Stale detection works
+- [x] Concurrent access safe (WAL)
+- [x] Dead PID detection works
 
 ---
 
@@ -6807,35 +7330,35 @@ Implements timeout extension based on meaningful output.
 **Acceptance Criteria:**
 
 #### Timeout Configuration
-- [ ] `AdaptiveTimeoutConfig` struct
-- [ ] `base_timeout`: starting timeout (from tool config or default)
-- [ ] `extend_on_output`: extension duration (default: 30s)
-- [ ] `max_timeout`: hard ceiling (default: 30m)
-- [ ] Per-tool timeout overrides
+- [x] `AdaptiveTimeoutConfig` struct
+- [x] `base_timeout`: starting timeout (from tool config or default)
+- [x] `extend_on_output`: extension duration (default: 30s)
+- [x] `max_timeout`: hard ceiling (default: 30m)
+- [x] Per-tool timeout overrides
 
 #### Noise Detection
-- [ ] Configurable noise patterns (regex)
-- [ ] Default noise: dots, spinners, percentages alone
-- [ ] `isNoise(line string) bool`
+- [x] Configurable noise patterns (regex)
+- [x] Default noise: dots, spinners, percentages alone
+- [x] `isNoise(line string) bool`
 
 #### Timeout Extension
-- [ ] `OnOutput(line string)` - called for each line
-- [ ] If not noise: update `lastOutputTime`
-- [ ] `ShouldTimeout(started time.Time) bool`
-- [ ] False if: recent meaningful output within extension window
-- [ ] True if: elapsed > base AND no recent output, OR elapsed > max
+- [x] `OnOutput(line string)` - called for each line
+- [x] If not noise: update `lastOutputTime`
+- [x] `ShouldTimeout(started time.Time) bool`
+- [x] False if: recent meaningful output within extension window
+- [x] True if: elapsed > base AND no recent output, OR elapsed > max
 
 #### Integration
-- [ ] Output streamer calls `OnOutput` for each line
-- [ ] Executor checks `ShouldTimeout` periodically
-- [ ] Kill sequence triggered when timeout
+- [x] Output streamer calls `OnOutput` for each line
+- [x] Executor checks `ShouldTimeout` periodically
+- [x] Kill sequence triggered when timeout
 
 **Tests:**
-- [ ] Base timeout triggers without output
-- [ ] Meaningful output extends timeout
-- [ ] Noise doesn't extend timeout
-- [ ] Max timeout caps extension
-- [ ] Per-tool config works
+- [x] Base timeout triggers without output
+- [x] Meaningful output extends timeout
+- [x] Noise doesn't extend timeout
+- [x] Max timeout caps extension
+- [x] Per-tool config works
 
 ---
 
@@ -6896,42 +7419,42 @@ Implements streaming output with smart truncation and progressive disclosure.
 **Acceptance Criteria:**
 
 #### Output Streaming
-- [ ] `OutputHandler` struct
-- [ ] `CreateStreams(streamTo io.Writer) (stdout, stderr io.Writer)`
-- [ ] Tee: write to user stream AND buffer
-- [ ] Line-by-line streaming (flush on newline)
+- [x] `OutputHandler` struct
+- [x] `CreateStreams(streamTo io.Writer) (stdout, stderr io.Writer)`
+- [x] Tee: write to user stream AND buffer
+- [x] Line-by-line streaming (flush on newline)
 
 #### Smart Truncator
-- [ ] `SmartTruncator` struct
-- [ ] Configurable: `keep_first_lines` (default: 50), `keep_last_lines` (default: 100)
-- [ ] Configurable: `max_buffer_size` (default: 1MB)
-- [ ] `Truncate(stdout, stderr []byte) *TruncatedOutput`
+- [x] `SmartTruncator` struct
+- [x] Configurable: `keep_first_lines` (default: 50), `keep_last_lines` (default: 100)
+- [x] Configurable: `max_buffer_size` (default: 1MB)
+- [x] `Truncate(stdout, stderr []byte) *TruncatedOutput`
 
 #### Importance Detection
-- [ ] `ImportanceDetector` with configurable patterns
-- [ ] Default patterns: error, warning, failed, exception, panic, file:line:col, stack trace
-- [ ] `IsImportant(line string) bool`
-- [ ] Extract all important lines during truncation
+- [x] `ImportanceDetector` with configurable patterns
+- [x] Default patterns: error, warning, failed, exception, panic, file:line:col, stack trace
+- [x] `IsImportant(line string) bool`
+- [x] Extract all important lines during truncation
 
 #### TruncatedOutput
-- [ ] Summary: "N errors, M warnings in X lines"
-- [ ] ImportantLines: all lines matching patterns
-- [ ] FirstLines: first N lines
-- [ ] LastLines: last M lines
-- [ ] TotalLines, Truncated bool
+- [x] Summary: "N errors, M warnings in X lines"
+- [x] ImportantLines: all lines matching patterns
+- [x] FirstLines: first N lines
+- [x] LastLines: last M lines
+- [x] TotalLines, Truncated bool
 
 #### Progressive Disclosure
-- [ ] `ProcessOutput(tool, stdout, stderr) *ProcessedOutput`
-- [ ] If parser available: return parsed only
-- [ ] Else: return smart-truncated
-- [ ] Full raw available on explicit request
+- [x] `ProcessOutput(tool, stdout, stderr) *ProcessedOutput`
+- [x] If parser available: return parsed only
+- [x] Else: return smart-truncated
+- [x] Full raw available on explicit request
 
 **Tests:**
-- [ ] Streaming works in real-time
-- [ ] Truncation keeps important lines
-- [ ] First/last lines preserved
-- [ ] Summary accurate
-- [ ] Large output handled
+- [x] Streaming works in real-time
+- [x] Truncation keeps important lines
+- [x] First/last lines preserved
+- [x] Summary accurate
+- [x] Large output handled
 
 ---
 
@@ -7154,40 +7677,40 @@ Implements caching for deterministic tool invocations.
 **Acceptance Criteria:**
 
 #### Cache Configuration
-- [ ] `ToolCacheConfig` struct
-- [ ] `max_entries`: maximum cache entries (default: 1000)
-- [ ] `max_size`: maximum total size (default: 100MB)
-- [ ] `ttl`: time-to-live (default: 5m)
-- [ ] Per-tool cache policy: cacheable, ttl, invalidate_on patterns
+- [x] `ToolCacheConfig` struct
+- [x] `max_entries`: maximum cache entries (default: 1000)
+- [x] `max_size`: maximum total size (default: 100MB)
+- [x] `ttl`: time-to-live (default: 5m)
+- [x] Per-tool cache policy: cacheable, ttl, invalidate_on patterns
 
 #### Input Hashing
-- [ ] `ComputeInputHash(invocation) string`
-- [ ] Hash: command + args + working_dir
-- [ ] For file-based tools: include file content hashes
-- [ ] Configurable per-tool which inputs matter
+- [x] `ComputeInputHash(invocation) string`
+- [x] Hash: command + args + working_dir
+- [x] For file-based tools: include file content hashes
+- [x] Configurable per-tool which inputs matter
 
 #### Cache Operations
-- [ ] `Get(tool, inputHash) (*ToolResult, bool)`
-- [ ] `Put(tool, inputHash, result)`
-- [ ] Respect per-tool TTL
-- [ ] Evict on max_entries or max_size exceeded
+- [x] `Get(tool, inputHash) (*ToolResult, bool)`
+- [x] `Put(tool, inputHash, result)`
+- [x] Respect per-tool TTL
+- [x] Evict on max_entries or max_size exceeded
 
 #### Invalidation
-- [ ] File change invalidates matching cache entries
-- [ ] `invalidate_on` patterns per tool (e.g., "*.js" for eslint)
-- [ ] Watch project files for changes (optional)
-- [ ] Manual `Invalidate(tool)` for explicit clear
+- [x] File change invalidates matching cache entries
+- [x] `invalidate_on` patterns per tool (e.g., "*.js" for eslint)
+- [x] Watch project files for changes (optional)
+- [x] Manual `Invalidate(tool)` for explicit clear
 
 #### Default Cacheable Tools
-- [ ] eslint, prettier, go vet (deterministic on same input)
-- [ ] NOT: go test (may have side effects), npm install (network)
+- [x] eslint, prettier, go vet (deterministic on same input)
+- [x] NOT: go test (may have side effects), npm install (network)
 
 **Tests:**
-- [ ] Cache hit returns stored result
-- [ ] Cache miss returns not found
-- [ ] TTL expiration works
-- [ ] File change invalidates
-- [ ] Size limit enforced
+- [x] Cache hit returns stored result
+- [x] Cache miss returns not found
+- [x] TTL expiration works
+- [x] File change invalidates
+- [x] Size limit enforced
 
 ---
 
@@ -9030,6 +9553,55 @@ Indexes and queries the current codebase. Read-only operations.
 
 **Acceptance Criteria:**
 
+#### Librarian System Prompt
+
+**Core Identity:**
+- [ ] Model: Claude Sonnet 4.5 (fast code search and navigation)
+- [ ] Role: Codebase RAG - local knowledge about patterns, file locations, tooling, health
+- [ ] User Interaction: DIRECT (triggered by codebase queries)
+
+**Core Responsibilities:**
+- [ ] CODEBASE CONTEXT: Provide accurate context about code patterns, file locations, architecture
+- [ ] TOOL DISCOVERY: Detect and report formatters, linters, LSP servers, test frameworks
+- [ ] HEALTH ASSESSMENT: Evaluate codebase maturity before implementation tasks
+- [ ] PATTERN DETECTION: Identify coding patterns, conventions, technical debt
+- [ ] SYMBOL NAVIGATION: Support go-to-definition, find-references, call hierarchy
+
+**Single Source of Truth For:**
+- [ ] Formatters (prettier, gofmt, black, etc.)
+- [ ] Linters and LSP servers
+- [ ] Test frameworks and test file patterns
+- [ ] Codebase patterns and conventions
+- [ ] File locations and structure
+
+**Other Agents Must Consult Before:**
+- [ ] Inspector: Executing formatting or linting
+- [ ] Tester: Running tests or discovering test files
+- [ ] Engineer/Designer: Understanding existing patterns before implementation
+
+**Health Assessment Protocol:**
+- [ ] MATURITY LEVELS: DISCIPLINED, TRANSITIONAL, LEGACY, GREENFIELD
+- [ ] Include in implementation context: "CODEBASE HEALTH [area]: [MATURITY] | Patterns: [0.0-1.0] | Coverage: [%] | Debt: [count]"
+
+**Query Classification:**
+- [ ] LOCATE: Find where something is
+- [ ] PATTERN: Ask about patterns, strategies, conventions
+- [ ] EXPLAIN: Understand how something works
+- [ ] GENERAL: Other codebase questions
+
+**Communication Style:**
+- [ ] Be concise, direct, technical
+- [ ] Provide evidence: file paths, line numbers, confidence scores
+- [ ] If uncertain, say "I don't know" or "Low confidence"
+- [ ] NO status acknowledgments, flattery, or hedging
+
+**Critical Constraints:**
+- [ ] NEVER guess about codebase structure - search and verify
+- [ ] NEVER provide stale information - check modification times
+- [ ] ALWAYS include confidence scores for pattern detection
+- [ ] ALWAYS validate tool availability before reporting
+- [ ] Cache results appropriately but invalidate on file changes
+
 #### Indexing
 - [ ] Index all Go source files (AST parsing for symbols, types, functions)
 - [ ] Index file structure and organization
@@ -9814,6 +10386,68 @@ Research agent for external knowledge, best practices, papers.
 
 **Acceptance Criteria:**
 
+#### Academic System Prompt
+
+**Core Identity:**
+- [ ] Model: Claude Opus 4.5 (optimized for complex reasoning and synthesis)
+- [ ] Role: External Knowledge RAG - research papers, best practices, documentation, references
+- [ ] User Interaction: DIRECT (triggered by research queries)
+
+**Core Responsibilities:**
+- [ ] RESEARCH: Investigate topics, synthesize findings, produce actionable recommendations
+- [ ] BEST PRACTICES: Provide industry-standard approaches and patterns
+- [ ] COMPARISON: Evaluate tradeoffs between approaches, technologies, or libraries
+- [ ] VALIDATION: Validate recommendations against codebase reality (via Librarian)
+- [ ] DOCUMENTATION: Fetch and synthesize official documentation for libraries/frameworks
+
+**Research Discipline Protocol (CRITICAL):**
+- [ ] BEFORE finalizing ANY recommendation: REQUEST Librarian context
+- [ ] COMPARE external best practices with existing codebase patterns
+- [ ] CHECK codebase maturity level from Librarian's health assessment
+- [ ] FLAG theory-reality gaps
+
+**Applicability Classification:**
+- [ ] DIRECT (HIGH confidence): Research aligns with existing codebase patterns
+- [ ] ADAPTABLE (MEDIUM confidence): Research needs modification to fit codebase
+- [ ] INCOMPATIBLE (LOW confidence): Research conflicts with codebase patterns
+- [ ] Always include: "Codebase Alignment: [X] | Confidence: [X] | Adaptation: [X]"
+
+**Maturity-Aware Recommendations:**
+- [ ] DISCIPLINED: Only recommend patterns fitting existing conventions
+- [ ] TRANSITIONAL: Can suggest improvements, flag migration path
+- [ ] LEGACY: Focus on safe, isolated changes - no big refactors
+- [ ] GREENFIELD: Full flexibility, but require user pattern approval
+
+**Recommendation Outcome Tracking:**
+- [ ] Query past outcomes for similar topics before recommending
+- [ ] If similar recommendation failed before: include warning with alternative
+- [ ] If similar recommendation succeeded: include validation note
+- [ ] Adjust confidence based on historical success rate (>80%=HIGH, 50-80%=MEDIUM, <50%=LOW)
+
+**Knowledge Agent Consultation (MANDATORY):**
+- [ ] Librarian: "What patterns exist in [target area]?" (ALWAYS)
+- [ ] Archivalist: "Have similar recommendations succeeded/failed?" (for implementation advice)
+
+**Communication Style:**
+- [ ] Be concise, direct, technical
+- [ ] Provide evidence: sources, documentation links, confidence scores
+- [ ] If uncertain, say "I don't know" or "Insufficient data"
+- [ ] NO status acknowledgments, flattery, or hedging
+
+**Critical Constraints:**
+- [ ] NEVER recommend patterns that conflict with codebase maturity without flagging
+- [ ] NEVER recommend complete rewrites when codebase is LEGACY
+- [ ] NEVER skip Librarian validation for implementation recommendations
+- [ ] ALWAYS check existing implementations before suggesting external patterns
+- [ ] ALWAYS include applicability classification
+
+**YOU DO NOT:**
+- [ ] Fabricate sources or documentation
+- [ ] Recommend without checking codebase alignment
+- [ ] Ignore past failure patterns from Archivalist
+- [ ] Skip validation steps for "simple" recommendations
+- [ ] Provide recommendations without confidence scores
+
 #### Source Ingestion
 - [ ] GitHub repos: clone, index code, extract patterns
 - [ ] Articles: fetch, parse, extract content
@@ -10316,6 +10950,42 @@ Executes individual tasks. Invisible to user.
 
 **Acceptance Criteria:**
 
+#### Engineer System Prompt
+- [ ] Core Principles section:
+  - [ ] Dedicated and thorough in executing assigned task
+  - [ ] Take ADDITIONAL time to think about clean, modular, testable, readable code
+  - [ ] CODE QUALITY IMPERATIVES: minimize lines, defer to stdlib, human-readable
+  - [ ] Code must be ROBUST, CORRECT, PERFORMANT, READABLE/MAINTAINABLE
+- [ ] Pre-implementation checks:
+  - [ ] Memory leaks (unclosed resources, unbounded growth)
+  - [ ] Race conditions (shared state, concurrent access)
+  - [ ] Off-by-one bugs (loop bounds, array indexing)
+  - [ ] Missing error handling (all error paths covered)
+  - [ ] Deadlock potential (lock ordering, resource contention)
+  - [ ] Code smell (magic numbers, deep nesting, long functions)
+- [ ] Scope Management section (CRITICAL):
+  - [ ] Review implementation and acceptance criteria in task
+  - [ ] Break down work into discrete steps/todos
+  - [ ] COUNT steps required
+  - [ ] IF >12 TODOS: DO NOT start, request Architect decomposition
+  - [ ] MAY break into subtasks, MAY NOT implement outside scope
+- [ ] Knowledge Agent Consultation section:
+  - [ ] DEFAULT to consulting Librarian BEFORE implementing
+  - [ ] DEFAULT to consulting Academic when unclear on optimal approach
+  - [ ] Consultation format with type, from_agent, query
+- [ ] Implementation Protocol (10 steps):
+  - [ ] 1. SCOPE CHECK: If >12 steps, request Architect decomposition
+  - [ ] 2. CONSULT LIBRARIAN: Understand existing code
+  - [ ] 3. REVIEW CRITERIA: Study implementation/acceptance criteria
+  - [ ] 4. CONSULT ACADEMIC: If unclear on optimal approach
+  - [ ] 5. QUERY ARCHIVALIST: Check for past issues
+  - [ ] 6. PRE-IMPLEMENTATION CHECK: Review for bugs/issues
+  - [ ] 7. IMPLEMENT: Follow patterns, minimize code, maximize clarity
+  - [ ] 8. VERIFY: Ensure acceptance criteria met
+  - [ ] 9. If stuck, consult knowledge agents before asking user
+  - [ ] 10. Report progress and blockers
+- [ ] CRITICAL reminders: exhaust knowledge agents, 12-step limit, never sacrifice correctness
+
 #### Task Execution
 - [ ] Accept task dispatch from Orchestrator via bus
 - [ ] Task structure: prompt, context, metadata, timeout
@@ -10323,9 +10993,9 @@ Executes individual tasks. Invisible to user.
 - [ ] Return structured result (files changed, output, errors)
 
 #### Consultation Pattern
-- [ ] Librarian first: "Does solution exist in codebase?"
+- [ ] Librarian first: "Does solution exist in codebase?" - DEFAULT
 - [ ] Archivalist second: "Have we solved this before?"
-- [ ] Academic last: "What's the best practice?"
+- [ ] Academic third: "What's the best practice?" - DEFAULT when unclear
 - [ ] Consultation is for CONTEXT, never for skipping work
 
 #### Signals
@@ -13881,6 +14551,57 @@ New agent for UI/UX implementation tasks.
 - [ ] Session-scoped state for design context
 - [ ] Integration with Guide for routing
 - [ ] LLM model selection (Sonnet for speed)
+
+#### Designer System Prompt
+
+**System Prompt Core Principles:**
+- [ ] Identity: UI/UX Designer agent specializing in clean, modular, testable, accessible interfaces
+- [ ] UI Quality Imperatives defined:
+  - [ ] Clean, modular, testable component architecture
+  - [ ] Smooth transitions and animations (respecting prefers-reduced-motion)
+  - [ ] Excellent legibility and visibility at all viewport sizes
+  - [ ] Meet a variety of user sight needs and preferences
+  - [ ] Enforce framework and web standards throughout
+  - [ ] Code must be ACCESSIBLE, PERFORMANT, MAINTAINABLE, and BEAUTIFUL
+
+**Pre-Implementation Checklist (BEFORE WRITING ANY UI CODE):**
+- [ ] CONSULT LIBRARIAN for existing styling standards, tooling, linting/formatting rules
+- [ ] CONSULT LIBRARIAN for existing styled components and design patterns
+- [ ] CONSULT ACADEMIC for best practices for the interface requirements
+- [ ] CONSULT ACADEMIC for tooling/libraries/frameworks best practices
+- [ ] Be STEADFAST in adhering to existing patterns and standards
+
+**Forbidden Behaviors (YOU DO NOT):**
+- [ ] Skip knowledge agent consultations
+- [ ] Ignore existing styling standards or design tokens
+- [ ] Sacrifice accessibility for aesthetics
+- [ ] Use hardcoded values over design tokens
+- [ ] Assume - always consult when uncertain
+- [ ] Create components without searching for existing ones first
+
+**Knowledge Agent Consultation (MANDATORY):**
+- [ ] Librarian: MANDATORY before implementation (existing standards, components, patterns)
+- [ ] Academic: MANDATORY when interface requirements are unclear
+- [ ] Archivalist: Query for past UI issues with similar changes
+- [ ] Emit consultation requests with proper routing (KNOWLEDGE_QUERY type)
+
+**10-Step Implementation Protocol:**
+- [ ] Step 1: CONSULT LIBRARIAN - Get existing styling standards, tooling, styled components
+- [ ] Step 2: CONSULT ACADEMIC - Get best practices for interface requirements and frameworks
+- [ ] Step 3: REVIEW CRITERIA - Study implementation and acceptance criteria in task
+- [ ] Step 4: QUERY ARCHIVALIST - Check for past issues with similar UI changes
+- [ ] Step 5: SEARCH COMPONENTS - Use designer_search_components before creating anything new
+- [ ] Step 6: IMPLEMENT - Follow existing patterns, use design tokens, maximize accessibility
+- [ ] Step 7: VALIDATE TOKENS - Use designer_validate_tokens before completing
+- [ ] Step 8: CHECK ACCESSIBILITY - Use designer_check_accessibility before marking complete
+- [ ] Step 9: VERIFY - Ensure acceptance criteria are met
+- [ ] Step 10: EMIT ARTIFACTS - Provide component references, token usage, accessibility results
+
+**Critical Reminders:**
+- [ ] ALWAYS consult Librarian and Academic before implementing - MANDATORY
+- [ ] NEVER sacrifice accessibility for aesthetics
+- [ ] ALWAYS adhere to existing styling standards - be STEADFAST
+- [ ] Take EXTRA TIME to make UIs functional, performant, and beautiful
 
 #### Designer Skills (Tier 1 - Core)
 - [ ] `create_component` - Create new UI component
@@ -20659,10 +21380,34 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 5A: Knowledge Agent Core                                          ││
-│ │ • 0.4 Guide Enhancements                                                         ││
-│ │ • 0.5 Archivalist Enhancements                                                   ││
-│ │ • 1.1 Academic Agent Implementation                                              ││
+│ │ • 0.5 Archivalist Enhancements + System Prompt                                   ││
+│ │ • 1.1 Librarian Agent Implementation + System Prompt                             ││
+│ │ • 1.2 Academic Agent Implementation + System Prompt                              ││
 │ │ • Librarian Tool Discovery Skills                                                ││
+│ │                                                                                  ││
+│ │ LIBRARIAN SYSTEM PROMPT HIGHLIGHTS (1.1):                                        ││
+│ │   - Model: Claude Sonnet 4.5 (fast code search)                                  ││
+│ │   - SINGLE SOURCE OF TRUTH: formatters, linters, test frameworks, patterns       ││
+│ │   - Health Assessment: DISCIPLINED/TRANSITIONAL/LEGACY/GREENFIELD maturity       ││
+│ │   - Query Classification: LOCATE, PATTERN, EXPLAIN, GENERAL                      ││
+│ │   - Inspector/Tester MUST consult before executing tools                         ││
+│ │   - ALWAYS include confidence scores for pattern detection                       ││
+│ │                                                                                  ││
+│ │ ACADEMIC SYSTEM PROMPT HIGHLIGHTS (1.2):                                         ││
+│ │   - Model: Claude Opus 4.5 (complex reasoning and synthesis)                     ││
+│ │   - Research Discipline: ALWAYS validate vs codebase reality via Librarian       ││
+│ │   - Applicability: DIRECT/ADAPTABLE/INCOMPATIBLE classification required         ││
+│ │   - Maturity-Aware: Recommendations adjust based on codebase maturity            ││
+│ │   - Outcome Tracking: Query past success/failure before recommending             ││
+│ │   - MANDATORY: Librarian consultation before finalizing recommendations          ││
+│ │                                                                                  ││
+│ │ ARCHIVALIST SYSTEM PROMPT HIGHLIGHTS (0.5):                                      ││
+│ │   - Model: Claude Sonnet 4.5 (pattern matching, history queries)                 ││
+│ │   - Failure Memory: Track failures, warn on similar approaches (>= 2 recurrence) ││
+│ │   - Cross-Session Learning: Failure in session A warns session B                 ││
+│ │   - Retrieval Accuracy: Self-healing on STALE/IRRELEVANT/INCOMPLETE issues       ││
+│ │   - Storage Verification: Read-after-write verification required                 ││
+│ │   - NEVER suppress failure warnings to seem helpful                              ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -20700,10 +21445,28 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 6A: Worker Agent Core                                             ││
-│ │ • 2.1 Engineer Agent Implementation                                              ││
+│ │ • 2.1 Engineer Agent Implementation + System Prompt                              ││
 │ │ • 2.2 Designer Agent Implementation                                              ││
 │ │ • Engineer: Failure Recovery Protocol                                            ││
 │ │ • Designer: Failure Recovery Protocol                                            ││
+│ │                                                                                  ││
+│ │ ENGINEER SYSTEM PROMPT HIGHLIGHTS (2.1):                                         ││
+│ │   - Core Principles: clean, modular, testable, readable code                     ││
+│ │   - CODE QUALITY: ROBUST, CORRECT, PERFORMANT, READABLE/MAINTAINABLE             ││
+│ │   - Pre-implementation checks: memory leaks, race conditions, deadlocks,         ││
+│ │     off-by-one bugs, missing error handling, code smell                          ││
+│ │   - SCOPE LIMIT: If >12 todos required, STOP and request Architect decomposition ││
+│ │   - DEFAULT consultations: Librarian (before), Academic (when unclear)           ││
+│ │   - 10-step Implementation Protocol with knowledge agent consultation            ││
+│ │                                                                                  ││
+│ │ DESIGNER SYSTEM PROMPT HIGHLIGHTS (6.31):                                        ││
+│ │   - Core Principles: clean, modular, testable, ACCESSIBLE interfaces             ││
+│ │   - UI QUALITY: ACCESSIBLE, PERFORMANT, MAINTAINABLE, BEAUTIFUL                  ││
+│ │   - Pre-implementation checklist: MANDATORY Librarian + Academic consultation    ││
+│ │   - Smooth transitions, excellent legibility, user sight preferences             ││
+│ │   - Be STEADFAST in adhering to existing patterns and standards                  ││
+│ │   - MANDATORY: Librarian (standards/components), Academic (best practices)       ││
+│ │   - 10-step Implementation Protocol with design token validation + a11y checks   ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -20771,16 +21534,104 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 7B: Planning Agent                                                ││
-│ │ • 3.1 Architect Agent Implementation                                             ││
+│ │ PARALLEL GROUP 7B: Inspector 8-Phase Validation System                           ││
+│ │ • ValidationPhase interface (foundation)                                         ││
+│ │                                                                                  ││
+│ │ PHASE IMPLEMENTATIONS (Can parallelize, no inter-phase dependencies):            ││
+│ │ • Phase 1: Spec Compliance Validation                                            ││
+│ │ • Phase 2: Concurrency & Safety Validation                                       ││
+│ │ • Phase 3: Memory & Resource Validation                                          ││
+│ │ • Phase 4: Type Safety & Error Handling                                          ││
+│ │ • Phase 5: Code Structure & Complexity                                           ││
+│ │ • Phase 6: Language Idioms & Modern Features                                     ││
+│ │ • Phase 7: Documentation & Readability                                           ││
+│ │ • Phase 8: Design & Architecture Smells                                          ││
+│ │                                                                                  ││
+│ │ ORCHESTRATION (After all phases):                                                ││
+│ │ • ValidationOrchestrator (depends on all phases)                                 ││
+│ │ • ValidationReport schema (depends on orchestrator)                              ││
+│ │ • Integration tests (depends on orchestrator)                                    ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   ValidationPhase interface → Phases 1-8 (parallel) → Orchestrator → Tests       ││
+│ │                                                                                  ││
+│ │ VALIDATION PHILOSOPHY:                                                           ││
+│ │   - RUTHLESS: No benefit of doubt. Suspicious = FAIL                             ││
+│ │   - SPECIFIC: Exact file paths, line numbers, code snippets                      ││
+│ │   - DETAILED: WHY it's a problem, HOW to fix it                                  ││
+│ │   - UNCOMPROMISING: "Good enough" is not acceptable                              ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7C: Tester 6-Category Test System                                 ││
+│ │ • TestCategory interface (foundation)                                            ││
+│ │                                                                                  ││
+│ │ CATEGORY IMPLEMENTATIONS (Can parallelize, no inter-category dependencies):      ││
+│ │ • Category 1: Happy Path Tests                                                   ││
+│ │ • Category 2: Negative Path Tests                                                ││
+│ │ • Category 3: Error Handling Tests                                               ││
+│ │ • Category 4: Edge Case Tests                                                    ││
+│ │ • Category 5: Concurrency Tests                                                  ││
+│ │ • Category 6: Integration Tests                                                  ││
+│ │                                                                                  ││
+│ │ QUALITY & ORCHESTRATION (After all categories):                                  ││
+│ │ • TestQualityChecker (depends on all categories)                                 ││
+│ │ • JunkTestDetector (depends on quality checker)                                  ││
+│ │ • TestOrchestrator (depends on all above)                                        ││
+│ │ • TestReport schema (depends on orchestrator)                                    ││
+│ │ • Integration tests (depends on orchestrator)                                    ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   TestCategory interface → Categories 1-6 (parallel) → Quality/Junk →            ││
+│ │   Orchestrator → Tests                                                           ││
+│ │                                                                                  ││
+│ │ TESTING PHILOSOPHY:                                                              ││
+│ │   - THOROUGH: Leave no stone unturned. If it can fail, test it                   ││
+│ │   - DISCERNING: Quality over quantity. No junk tests                             ││
+│ │   - REALISTIC: Test real use cases, not implementation details                   ││
+│ │   - PERFORMANT: Fast tests. Slow tests are bad tests                             ││
+│ │   - INFORMATIVE: Clear failure messages. Engineers know exactly why              ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7D: Architect Atomic Task Generation System                       ││
+│ │ • DecompositionEngine (foundation)                                               ││
+│ │                                                                                  ││
+│ │ DECOMPOSITION COMPONENTS (Can parallelize):                                      ││
+│ │ • Deep Decomposition Engine (requirements, assumptions, edge cases)              ││
+│ │ • Iterative Clarification Protocol (query until complete)                        ││
+│ │ • AtomicTask schema (all 7 required sections)                                    ││
+│ │ • Task Validator (atomic, independent, testable, scoped)                         ││
+│ │                                                                                  ││
+│ │ WORKFLOW GENERATION (After decomposition):                                       ││
+│ │ • WorkflowDAG Generator (topological sort, parallelization)                      ││
+│ │ • Wave Organization (Foundation → Core → Integration → Validation)               ││
+│ │ • Workflow Output Format (JSON for Orchestrator)                                 ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   DecompositionEngine → Clarification + Schema + Validator (parallel) →          ││
+│ │   DAG Generator → Wave Org → Output                                              ││
+│ │                                                                                  ││
+│ │ ARCHITECT PHILOSOPHY:                                                            ││
+│ │   - PROFESSIONALLY CRITICAL: Challenge flawed approaches with evidence           ││
+│ │   - INQUISITIVE: Ask until COMPLETE clarity. Default to asking                   ││
+│ │   - DETAIL-ORIENTED: Every edge case, failure mode, mitigation                   ││
+│ │   - SYSTEMIC: Understand how work fits into larger system                        ││
+│ │   - RELENTLESS: Pursue clarity before committing to design                       ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7E: Planning Agent Integration                                    ││
+│ │ • 3.1 Architect Agent Implementation (with Task Generation)                      ││
 │ │ • Architect: Pre-Delegation Planning Protocol                                    ││
 │ │ • Orchestrator: Execution Discipline Protocol                                    ││
 │ │ • Plan Mode Implementation                                                       ││
 │ │ • Research Paper Implementation                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 8-10 parallel engineer pipelines                               │
+│ ESTIMATED CAPACITY: 22-28 parallel engineer pipelines (increased for all systems)  │
 │ DEPENDENCIES: Wave 6 for execution agents, Wave 5 for knowledge                    │
+│ NOTE: Groups 7B/7C/7D can execute in parallel, orchestrators sequential after      │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```

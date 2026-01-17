@@ -67,12 +67,17 @@ func (v *Validator) validateDependencies(d *DAG) error {
 
 // buildDependencyGraph builds reverse dependency mappings
 func (v *Validator) buildDependencyGraph(d *DAG) {
-	// Clear existing dependents
+	v.clearDependents(d)
+	v.populateDependents(d)
+}
+
+func (v *Validator) clearDependents(d *DAG) {
 	for _, node := range d.nodes {
 		node.dependents = []string{}
 	}
+}
 
-	// Build reverse mappings
+func (v *Validator) populateDependents(d *DAG) {
 	for id, node := range d.nodes {
 		for _, depID := range node.dependencies {
 			if depNode, exists := d.nodes[depID]; exists {

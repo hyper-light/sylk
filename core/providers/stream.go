@@ -7,31 +7,16 @@ import (
 	"time"
 )
 
-// StreamChunk represents a single chunk from a streaming response
 type StreamChunk struct {
-	// Index is the sequence number of this chunk
-	Index int `json:"index"`
-
-	// Text is the content delta
-	Text string `json:"text"`
-
-	// Type indicates the chunk type
-	Type StreamChunkType `json:"type"`
-
-	// ToolCall if this chunk contains tool use data
-	ToolCall *ToolCallChunk `json:"tool_call,omitempty"`
-
-	// Usage is populated on the final chunk (if available)
-	Usage *Usage `json:"usage,omitempty"`
-
-	// StopReason is populated on the final chunk
-	StopReason StopReason `json:"stop_reason,omitempty"`
-
-	// Timestamp when this chunk was received
-	Timestamp time.Time `json:"timestamp"`
+	Index      int             `json:"index"`
+	Text       string          `json:"text"`
+	Type       StreamChunkType `json:"type"`
+	ToolCall   *ToolCallChunk  `json:"tool_call,omitempty"`
+	Usage      *Usage          `json:"usage,omitempty"`
+	StopReason StopReason      `json:"stop_reason,omitempty"`
+	Timestamp  time.Time       `json:"timestamp"`
 }
 
-// StreamChunkType identifies what kind of content the chunk contains
 type StreamChunkType string
 
 const (
@@ -44,14 +29,12 @@ const (
 	ChunkTypeError     StreamChunkType = "error"
 )
 
-// ToolCallChunk contains incremental tool call data
 type ToolCallChunk struct {
 	ID             string `json:"id,omitempty"`
 	Name           string `json:"name,omitempty"`
 	ArgumentsDelta string `json:"arguments_delta,omitempty"`
 }
 
-// StreamAccumulator collects streaming chunks into a complete response
 type StreamAccumulator struct {
 	mu sync.Mutex
 
@@ -72,7 +55,6 @@ type accumulatedToolCall struct {
 	Arguments strings.Builder
 }
 
-// NewStreamAccumulator creates a new accumulator
 func NewStreamAccumulator() *StreamAccumulator {
 	return &StreamAccumulator{
 		chunks:    make([]StreamChunk, 0, 100),
@@ -81,7 +63,6 @@ func NewStreamAccumulator() *StreamAccumulator {
 	}
 }
 
-// Add accumulates a chunk
 func (a *StreamAccumulator) Add(chunk *StreamChunk) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -118,7 +99,6 @@ func (a *StreamAccumulator) Add(chunk *StreamChunk) {
 	}
 }
 
-// Response builds the final response from accumulated chunks
 func (a *StreamAccumulator) Response() *Response {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -145,53 +125,41 @@ func (a *StreamAccumulator) Response() *Response {
 	}
 }
 
-// Text returns the accumulated text so far
 func (a *StreamAccumulator) Text() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.text.String()
 }
 
-// ChunkCount returns the number of chunks received
 func (a *StreamAccumulator) ChunkCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return len(a.chunks)
 }
 
-// StreamCollector wraps StreamHandler with automatic accumulation
 type StreamCollector struct {
 	accumulator *StreamAccumulator
 	onChunk     func(chunk *StreamChunk)
-	onError     func(err error)
 }
 
-// NewStreamCollector creates a collector with optional callbacks
-func NewStreamCollector(onChunk func(chunk *StreamChunk), onError func(err error)) *StreamCollector {
+func NewStreamCollector(onChunk func(chunk *StreamChunk)) *StreamCollector {
 	return &StreamCollector{
 		accumulator: NewStreamAccumulator(),
 		onChunk:     onChunk,
-		onError:     onError,
 	}
 }
 
-// Handler returns a StreamHandler that accumulates and optionally forwards chunks
-func (c *StreamCollector) Handler() StreamHandler {
-	return func(chunk *StreamChunk) error {
-		c.accumulator.Add(chunk)
-		if c.onChunk != nil {
-			c.onChunk(chunk)
-		}
-		return nil
+func (c *StreamCollector) Add(chunk *StreamChunk) {
+	c.accumulator.Add(chunk)
+	if c.onChunk != nil {
+		c.onChunk(chunk)
 	}
 }
 
-// Response returns the accumulated response
 func (c *StreamCollector) Response() *Response {
 	return c.accumulator.Response()
 }
 
-// StreamWithCallback is a convenience function to stream with a simple text callback
 func StreamWithCallback(
 	ctx context.Context,
 	provider Provider,
@@ -202,16 +170,20 @@ func StreamWithCallback(
 		if chunk.Type == ChunkTypeText && onText != nil {
 			onText(chunk.Text)
 		}
-	}, nil)
+	})
 
-	if err := provider.Stream(ctx, req, collector.Handler()); err != nil {
+	chunks, err := provider.Stream(ctx, req)
+	if err != nil {
 		return nil, err
+	}
+
+	for chunk := range chunks {
+		collector.Add(chunk)
 	}
 
 	return collector.Response(), nil
 }
 
-// StreamToChannel streams chunks to a channel
 func StreamToChannel(
 	ctx context.Context,
 	provider Provider,
@@ -224,17 +196,33 @@ func StreamToChannel(
 		defer close(chunks)
 		defer close(errs)
 
-		err := provider.Stream(ctx, req, func(chunk *StreamChunk) error {
-			select {
-			case chunks <- chunk:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
+		if handlerProvider, ok := provider.(StreamHandlerProvider); ok {
+			err := handlerProvider.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
+				select {
+				case chunks <- chunk:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+			if err != nil {
+				errs <- err
 			}
-		})
+			return
+		}
 
+		stream, err := provider.Stream(ctx, req)
 		if err != nil {
 			errs <- err
+			return
+		}
+		for chunk := range stream {
+			select {
+			case chunks <- chunk:
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				return
+			}
 		}
 	}()
 

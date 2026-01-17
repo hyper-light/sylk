@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/messaging"
 )
 
 func TestNewStreamContext(t *testing.T) {
@@ -157,19 +159,17 @@ func TestWrapStreamChunk(t *testing.T) {
 	after := time.Now()
 
 	if msg == nil {
-		t.Fatal("expected non-nil StreamMessage")
+		t.Fatal("expected non-nil stream message")
 	}
 
-	// Verify ID is generated
 	if msg.ID == "" {
 		t.Error("ID should not be empty")
 	}
-	if len(msg.ID) != 32 {
-		t.Errorf("ID length = %d, want 32", len(msg.ID))
+	if len(msg.ID) != 36 {
+		t.Errorf("ID length = %d, want 36", len(msg.ID))
 	}
 
-	// Verify Type
-	if msg.Type != MessageTypeStream {
+	if msg.Type != messaging.MessageType(MessageTypeStream) {
 		t.Errorf("Type = %q, want %q", msg.Type, MessageTypeStream)
 	}
 
@@ -183,39 +183,35 @@ func TestWrapStreamChunk(t *testing.T) {
 		t.Errorf("ParentID = %q, want %q", msg.ParentID, ctx.RequestID)
 	}
 
-	// Verify payload
-	if msg.Payload != chunk {
+	if msg.Payload != *chunk {
 		t.Error("Payload should be the original chunk")
 	}
 
-	// Verify priority
-	if msg.Priority != ctx.Priority {
+	if int(msg.Priority) != ctx.Priority {
 		t.Errorf("Priority = %d, want %d", msg.Priority, ctx.Priority)
 	}
 
-	// Verify timestamp
 	if msg.Timestamp.Before(before) || msg.Timestamp.After(after) {
 		t.Errorf("Timestamp = %v, want between %v and %v", msg.Timestamp, before, after)
 	}
 
-	// Verify metadata
-	if msg.Metadata.Model != ctx.Model {
-		t.Errorf("Metadata.Model = %q, want %q", msg.Metadata.Model, ctx.Model)
+	if msg.Metadata["model"] != ctx.Model {
+		t.Errorf("Metadata.model = %v, want %q", msg.Metadata["model"], ctx.Model)
 	}
-	if msg.Metadata.AgentID != ctx.AgentID {
-		t.Errorf("Metadata.AgentID = %q, want %q", msg.Metadata.AgentID, ctx.AgentID)
+	if msg.Metadata["agent_id"] != ctx.AgentID {
+		t.Errorf("Metadata.agent_id = %v, want %q", msg.Metadata["agent_id"], ctx.AgentID)
 	}
-	if msg.Metadata.ChunkIndex != chunk.Index {
-		t.Errorf("Metadata.ChunkIndex = %d, want %d", msg.Metadata.ChunkIndex, chunk.Index)
+	if msg.Metadata["chunk_index"] != chunk.Index {
+		t.Errorf("Metadata.chunk_index = %v, want %d", msg.Metadata["chunk_index"], chunk.Index)
 	}
-	if msg.Metadata.ChunkType != chunk.Type {
-		t.Errorf("Metadata.ChunkType = %q, want %q", msg.Metadata.ChunkType, chunk.Type)
+	if msg.Metadata["chunk_type"] != chunk.Type {
+		t.Errorf("Metadata.chunk_type = %v, want %q", msg.Metadata["chunk_type"], chunk.Type)
 	}
-	if msg.Metadata.ProviderName != ctx.ProviderName {
-		t.Errorf("Metadata.ProviderName = %q, want %q", msg.Metadata.ProviderName, ctx.ProviderName)
+	if msg.Metadata["provider_name"] != ctx.ProviderName {
+		t.Errorf("Metadata.provider_name = %v, want %q", msg.Metadata["provider_name"], ctx.ProviderName)
 	}
-	if msg.Metadata.SessionID != ctx.SessionID {
-		t.Errorf("Metadata.SessionID = %q, want %q", msg.Metadata.SessionID, ctx.SessionID)
+	if msg.Metadata["session_id"] != ctx.SessionID {
+		t.Errorf("Metadata.session_id = %v, want %q", msg.Metadata["session_id"], ctx.SessionID)
 	}
 }
 
@@ -241,8 +237,8 @@ func TestWrapStreamChunk_AllChunkTypes(t *testing.T) {
 
 			msg := WrapStreamChunk(chunk, ctx)
 
-			if msg.Metadata.ChunkType != ct {
-				t.Errorf("ChunkType = %q, want %q", msg.Metadata.ChunkType, ct)
+			if msg.Metadata["chunk_type"] != ct {
+				t.Errorf("ChunkType = %q, want %q", msg.Metadata["chunk_type"], ct)
 			}
 		})
 	}
@@ -372,37 +368,22 @@ func TestStreamContext_JSONMarshal(t *testing.T) {
 	}
 }
 
-func TestStreamMessage_JSONMarshal(t *testing.T) {
+func TestWrappedStreamMessage_JSONMarshal(t *testing.T) {
+	ctx := NewStreamContext("session-123", "anthropic", "claude-3-opus", "agent-001")
 	chunk := &StreamChunk{
 		Index: 10,
 		Text:  "test content",
 		Type:  ChunkTypeText,
 	}
 
-	msg := &StreamMessage{
-		ID:            "msg-123",
-		Type:          MessageTypeStream,
-		CorrelationID: "corr-456",
-		ParentID:      "parent-789",
-		Payload:       chunk,
-		Metadata: StreamMessageMetadata{
-			Model:        "claude-3-opus",
-			AgentID:      "agent-001",
-			ChunkIndex:   10,
-			ChunkType:    ChunkTypeText,
-			ProviderName: "anthropic",
-			SessionID:    "session-123",
-		},
-		Priority:  3,
-		Timestamp: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC),
-	}
+	msg := WrapStreamChunk(chunk, ctx)
 
 	data, err := json.Marshal(msg)
 	if err != nil {
 		t.Fatalf("failed to marshal: %v", err)
 	}
 
-	var decoded StreamMessage
+	var decoded messaging.Message[StreamChunk]
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
@@ -416,8 +397,9 @@ func TestStreamMessage_JSONMarshal(t *testing.T) {
 	if decoded.CorrelationID != msg.CorrelationID {
 		t.Errorf("CorrelationID mismatch after roundtrip")
 	}
-	if decoded.Metadata.ChunkType != msg.Metadata.ChunkType {
-		t.Errorf("Metadata.ChunkType mismatch after roundtrip")
+	chunkType, _ := decoded.Metadata["chunk_type"].(string)
+	if chunkType != string(ChunkTypeText) {
+		t.Errorf("Metadata chunk_type = %q, want %q", chunkType, ChunkTypeText)
 	}
 }
 
@@ -507,7 +489,7 @@ func TestWrapStreamChunk_NilChunkFields(t *testing.T) {
 	msg := WrapStreamChunk(chunk, ctx)
 
 	if msg == nil {
-		t.Fatal("expected non-nil StreamMessage")
+		t.Fatal("expected non-nil stream message")
 	}
 
 	if msg.Payload.ToolCall != nil {

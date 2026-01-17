@@ -410,3 +410,79 @@ func TestTrackerEmptyStrings(t *testing.T) {
 		t.Errorf("expected empty provider tokens = 100, got %d", tracker.TokensByProvider(""))
 	}
 }
+
+func TestCalculateCostFromModel(t *testing.T) {
+	tests := []struct {
+		name         string
+		inputTokens  int64
+		outputTokens int64
+		modelInfo    ModelInfo
+		expectedCost float64
+	}{
+		{
+			name:         "claude-3-opus pricing",
+			inputTokens:  1000,
+			outputTokens: 500,
+			modelInfo:    ModelInfo{ID: "claude-3-opus", InputPricePerM: 15.0, OutputPricePerM: 75.0},
+			expectedCost: 0.0525,
+		},
+		{
+			name:         "gpt-4 pricing",
+			inputTokens:  10000,
+			outputTokens: 2000,
+			modelInfo:    ModelInfo{ID: "gpt-4", InputPricePerM: 30.0, OutputPricePerM: 60.0},
+			expectedCost: 0.42,
+		},
+		{
+			name:         "zero tokens",
+			inputTokens:  0,
+			outputTokens: 0,
+			modelInfo:    ModelInfo{ID: "test", InputPricePerM: 10.0, OutputPricePerM: 20.0},
+			expectedCost: 0,
+		},
+		{
+			name:         "free model",
+			inputTokens:  1_000_000,
+			outputTokens: 1_000_000,
+			modelInfo:    ModelInfo{ID: "free", InputPricePerM: 0, OutputPricePerM: 0},
+			expectedCost: 0,
+		},
+		{
+			name:         "million tokens",
+			inputTokens:  1_000_000,
+			outputTokens: 1_000_000,
+			modelInfo:    ModelInfo{ID: "test", InputPricePerM: 3.0, OutputPricePerM: 15.0},
+			expectedCost: 18.0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cost := CalculateCostFromModel(tc.inputTokens, tc.outputTokens, tc.modelInfo)
+			tolerance := 0.0001
+			if diff := cost - tc.expectedCost; diff > tolerance || diff < -tolerance {
+				t.Errorf("CalculateCostFromModel() = %f, want %f", cost, tc.expectedCost)
+			}
+		})
+	}
+}
+
+func TestCalculateCostFromModelMatchesCalculateCost(t *testing.T) {
+	inputTokens := int64(5000)
+	outputTokens := int64(2500)
+	inputPrice := 15.0
+	outputPrice := 75.0
+
+	modelInfo := ModelInfo{
+		ID:              "test-model",
+		InputPricePerM:  inputPrice,
+		OutputPricePerM: outputPrice,
+	}
+
+	costDirect := CalculateCost(inputTokens, outputTokens, inputPrice, outputPrice)
+	costFromModel := CalculateCostFromModel(inputTokens, outputTokens, modelInfo)
+
+	if costDirect != costFromModel {
+		t.Errorf("CalculateCostFromModel() = %f, CalculateCost() = %f, should be equal", costFromModel, costDirect)
+	}
+}

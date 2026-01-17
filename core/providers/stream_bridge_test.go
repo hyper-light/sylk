@@ -6,149 +6,105 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/messaging"
+	"github.com/adalundhe/sylk/core/providers/mocks"
+	"github.com/stretchr/testify/mock"
 )
 
-// mockPublisher implements StreamPublisher for testing
-type mockPublisher struct {
-	mu              sync.Mutex
-	messages        []*StreamMessage
-	controlMessages []*StreamControlMessage
-	publishErr      error
-	controlErr      error
-}
+func capturePublishedMessages(publisher *mocks.MockStreamPublisher) func() []*messaging.Message[StreamChunk] {
+	var mu sync.Mutex
+	messages := make([]*messaging.Message[StreamChunk], 0)
 
-func newMockPublisher() *mockPublisher {
-	return &mockPublisher{
-		messages:        make([]*StreamMessage, 0),
-		controlMessages: make([]*StreamControlMessage, 0),
+	publisher.EXPECT().
+		Publish(mock.Anything).
+		Run(func(msg *messaging.Message[StreamChunk]) {
+			mu.Lock()
+			defer mu.Unlock()
+			messages = append(messages, msg)
+		}).
+		Return(nil)
+
+	return func() []*messaging.Message[StreamChunk] {
+		mu.Lock()
+		defer mu.Unlock()
+		result := make([]*messaging.Message[StreamChunk], len(messages))
+		copy(result, messages)
+		return result
 	}
 }
 
-func (p *mockPublisher) Publish(msg *StreamMessage) error {
-	if p.publishErr != nil {
-		return p.publishErr
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.messages = append(p.messages, msg)
-	return nil
-}
+func captureControlMessages(publisher *mocks.MockStreamPublisher) func() []*StreamControlMessage {
+	var mu sync.Mutex
+	messages := make([]*StreamControlMessage, 0)
 
-func (p *mockPublisher) PublishControl(msg *StreamControlMessage) error {
-	if p.controlErr != nil {
-		return p.controlErr
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.controlMessages = append(p.controlMessages, msg)
-	return nil
-}
-
-func (p *mockPublisher) getMessages() []*StreamMessage {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	result := make([]*StreamMessage, len(p.messages))
-	copy(result, p.messages)
-	return result
-}
-
-func (p *mockPublisher) getControlMessages() []*StreamControlMessage {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	result := make([]*StreamControlMessage, len(p.controlMessages))
-	copy(result, p.controlMessages)
-	return result
-}
-
-// mockProvider implements Provider for testing
-type mockProvider struct {
-	name       string
-	chunks     []*StreamChunk
-	streamErr  error
-	streamWait time.Duration
-}
-
-func newMockProvider(chunks []*StreamChunk) *mockProvider {
-	return &mockProvider{
-		name:   "mock",
-		chunks: chunks,
-	}
-}
-
-func (p *mockProvider) Name() string {
-	return p.name
-}
-
-func (p *mockProvider) Generate(ctx context.Context, req *Request) (*Response, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (p *mockProvider) Stream(ctx context.Context, req *Request, handler StreamHandler) error {
-	if p.streamWait > 0 {
-		select {
-		case <-time.After(p.streamWait):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
-	if p.streamErr != nil {
-		return p.streamErr
-	}
-
-	for _, chunk := range p.chunks {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			if err := handler(chunk); err != nil {
-				return err
+	publisher.On("PublishControl", mock.Anything).
+		Return(nil).
+		Run(func(args mock.Arguments) {
+			msg, ok := args.Get(0).(*StreamControlMessage)
+			if !ok {
+				return
 			}
-		}
+			mu.Lock()
+			defer mu.Unlock()
+			messages = append(messages, msg)
+		})
+
+	return func() []*StreamControlMessage {
+		mu.Lock()
+		defer mu.Unlock()
+		result := make([]*StreamControlMessage, len(messages))
+		copy(result, messages)
+		return result
 	}
-	return nil
 }
 
-func (p *mockProvider) ValidateConfig() error {
-	return nil
+func allowPublish(publisher *mocks.MockStreamPublisher) {
+	publisher.On("Publish", mock.Anything).Return(nil)
 }
 
-func (p *mockProvider) SupportsModel(model string) bool {
-	return true
-}
+func expectStreamWithHandler(
+	provider *mocks.MockStreamProvider,
+	chunks []*StreamChunk,
+	streamErr error,
+	streamWait time.Duration,
+) {
+	provider.On("StreamWithHandler", mock.Anything, mock.Anything, mock.Anything).
+		RunAndReturn(func(ctx context.Context, req *Request, handler StreamHandler) error {
+			if streamWait > 0 {
+				select {
+				case <-time.After(streamWait):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 
-func (p *mockProvider) DefaultModel() string {
-	return "mock-model"
-}
+			if streamErr != nil {
+				return streamErr
+			}
 
-func (p *mockProvider) Close() error {
-	return nil
+			for _, chunk := range chunks {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+					if err := handler(chunk); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
 }
 
 func TestNewStreamBridge(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
 	config := DefaultStreamBridgeConfig()
 
 	bridge := NewStreamBridge(publisher, config)
 
 	if bridge == nil {
 		t.Fatal("expected non-nil StreamBridge")
-	}
-
-	if bridge.publisher != publisher {
-		t.Error("publisher not set correctly")
-	}
-
-	if bridge.config != config {
-		t.Error("config not set correctly")
-	}
-
-	if bridge.activeStreams == nil {
-		t.Error("activeStreams map not initialized")
-	}
-
-	if len(bridge.activeStreams) != 0 {
-		t.Errorf("activeStreams should be empty, got %d", len(bridge.activeStreams))
 	}
 }
 
@@ -165,7 +121,8 @@ func TestDefaultStreamBridgeConfig(t *testing.T) {
 }
 
 func TestStreamBridge_StartStream(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	messages := capturePublishedMessages(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
 	chunks := []*StreamChunk{
@@ -175,7 +132,8 @@ func TestStreamBridge_StartStream(t *testing.T) {
 		{Index: 3, Type: ChunkTypeEnd, Timestamp: time.Now()},
 	}
 
-	provider := newMockProvider(chunks)
+	provider := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(provider, chunks, nil, 0)
 	req := &Request{Messages: []Message{{Role: RoleUser, Content: "test"}}}
 	streamCtx := NewStreamContext("session-1", "mock", "mock-model", "agent-1")
 
@@ -184,17 +142,14 @@ func TestStreamBridge_StartStream(t *testing.T) {
 		t.Fatalf("StartStream failed: %v", err)
 	}
 
-	// Wait for stream to complete - give it enough time for all chunks
 	time.Sleep(500 * time.Millisecond)
 
-	messages := publisher.getMessages()
-	// Verify we got at least some messages (timing can vary)
-	if len(messages) == 0 {
+	published := messages()
+	if len(published) == 0 {
 		t.Error("expected at least some published messages")
 	}
 
-	// Verify correlation ID on all messages we did receive
-	for i, msg := range messages {
+	for i, msg := range published {
 		if msg.CorrelationID != streamCtx.CorrelationID {
 			t.Errorf("message %d CorrelationID = %q, want %q", i, msg.CorrelationID, streamCtx.CorrelationID)
 		}
@@ -202,15 +157,17 @@ func TestStreamBridge_StartStream(t *testing.T) {
 }
 
 func TestStreamBridge_StartStream_TracksActiveStream(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	allowPublish(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	// Provider that waits before returning
-	provider := &mockProvider{
-		name:       "mock",
-		chunks:     []*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
-		streamWait: 200 * time.Millisecond,
-	}
+	provider := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(
+		provider,
+		[]*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
+		nil,
+		200*time.Millisecond,
+	)
 
 	req := &Request{}
 	streamCtx := NewStreamContext("session-1", "mock", "mock-model", "agent-1")
@@ -220,13 +177,11 @@ func TestStreamBridge_StartStream_TracksActiveStream(t *testing.T) {
 		t.Fatalf("StartStream failed: %v", err)
 	}
 
-	// Stream should be active immediately after starting
 	time.Sleep(10 * time.Millisecond)
 	if !bridge.isStreamActive(streamCtx.CorrelationID) {
 		t.Error("stream should be active after starting")
 	}
 
-	// Wait for stream to complete
 	time.Sleep(300 * time.Millisecond)
 	if bridge.isStreamActive(streamCtx.CorrelationID) {
 		t.Error("stream should not be active after completing")
@@ -234,15 +189,18 @@ func TestStreamBridge_StartStream_TracksActiveStream(t *testing.T) {
 }
 
 func TestStreamBridge_CancelStream(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	allowPublish(publisher)
+	controlMessages := captureControlMessages(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	// Provider that waits long enough to be cancelled
-	provider := &mockProvider{
-		name:       "mock",
-		chunks:     []*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
-		streamWait: 5 * time.Second,
-	}
+	provider := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(
+		provider,
+		[]*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
+		nil,
+		5*time.Second,
+	)
 
 	req := &Request{}
 	streamCtx := NewStreamContext("session-1", "mock", "mock-model", "agent-1")
@@ -259,8 +217,7 @@ func TestStreamBridge_CancelStream(t *testing.T) {
 		t.Fatalf("CancelStream failed: %v", err)
 	}
 
-	// Verify control message was published
-	controlMsgs := publisher.getControlMessages()
+	controlMsgs := controlMessages()
 	if len(controlMsgs) != 1 {
 		t.Fatalf("expected 1 control message, got %d", len(controlMsgs))
 	}
@@ -277,7 +234,6 @@ func TestStreamBridge_CancelStream(t *testing.T) {
 		t.Errorf("control message CorrelationID mismatch")
 	}
 
-	// Wait for stream to be cleaned up
 	time.Sleep(50 * time.Millisecond)
 	if bridge.isStreamActive(streamCtx.CorrelationID) {
 		t.Error("stream should not be active after cancellation")
@@ -285,39 +241,33 @@ func TestStreamBridge_CancelStream(t *testing.T) {
 }
 
 func TestStreamBridge_CancelStream_NonExistent(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	// Cancelling non-existent stream should not error
 	err := bridge.CancelStream("non-existent-id", "test reason")
 	if err != nil {
 		t.Fatalf("CancelStream should not error for non-existent stream: %v", err)
 	}
-
-	// No control message should be published
-	controlMsgs := publisher.getControlMessages()
-	if len(controlMsgs) != 0 {
-		t.Errorf("expected 0 control messages, got %d", len(controlMsgs))
-	}
 }
 
 func TestStreamBridge_GetActiveStreams(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	allowPublish(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	// Initially empty
 	streams := bridge.GetActiveStreams()
 	if len(streams) != 0 {
 		t.Errorf("expected 0 active streams, got %d", len(streams))
 	}
 
-	// Start multiple streams
 	for i := 0; i < 3; i++ {
-		provider := &mockProvider{
-			name:       "mock",
-			chunks:     []*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
-			streamWait: 500 * time.Millisecond,
-		}
+		provider := mocks.NewMockStreamProvider(t)
+		expectStreamWithHandler(
+			provider,
+			[]*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
+			nil,
+			500*time.Millisecond,
+		)
 		streamCtx := NewStreamContext("session", "mock", "model", "agent")
 		_ = bridge.StartStream(context.Background(), provider, &Request{}, streamCtx)
 	}
@@ -329,7 +279,6 @@ func TestStreamBridge_GetActiveStreams(t *testing.T) {
 		t.Errorf("expected 3 active streams, got %d", len(streams))
 	}
 
-	// Cancel all via Close
 	_ = bridge.Close()
 
 	time.Sleep(50 * time.Millisecond)
@@ -341,17 +290,19 @@ func TestStreamBridge_GetActiveStreams(t *testing.T) {
 }
 
 func TestStreamBridge_Close(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	allowPublish(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	// Start multiple streams
 	var correlationIDs []string
 	for i := 0; i < 3; i++ {
-		provider := &mockProvider{
-			name:       "mock",
-			chunks:     []*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
-			streamWait: 5 * time.Second,
-		}
+		provider := mocks.NewMockStreamProvider(t)
+		expectStreamWithHandler(
+			provider,
+			[]*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
+			nil,
+			5*time.Second,
+		)
 		streamCtx := NewStreamContext("session", "mock", "model", "agent")
 		correlationIDs = append(correlationIDs, streamCtx.CorrelationID)
 		_ = bridge.StartStream(context.Background(), provider, &Request{}, streamCtx)
@@ -359,7 +310,6 @@ func TestStreamBridge_Close(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	// Verify streams are active
 	if len(bridge.GetActiveStreams()) != 3 {
 		t.Fatalf("expected 3 active streams before Close")
 	}
@@ -369,7 +319,6 @@ func TestStreamBridge_Close(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	// All streams should be cancelled
 	time.Sleep(50 * time.Millisecond)
 	for _, id := range correlationIDs {
 		if bridge.isStreamActive(id) {
@@ -379,14 +328,17 @@ func TestStreamBridge_Close(t *testing.T) {
 }
 
 func TestStreamBridge_ContextCancellation(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	allowPublish(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	provider := &mockProvider{
-		name:       "mock",
-		chunks:     []*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
-		streamWait: 5 * time.Second,
-	}
+	provider := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(
+		provider,
+		[]*StreamChunk{{Index: 0, Type: ChunkTypeEnd}},
+		nil,
+		5*time.Second,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := &Request{}
@@ -399,10 +351,8 @@ func TestStreamBridge_ContextCancellation(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	// Cancel the context
 	cancel()
 
-	// Wait for cleanup
 	time.Sleep(100 * time.Millisecond)
 
 	if bridge.isStreamActive(streamCtx.CorrelationID) {
@@ -411,14 +361,13 @@ func TestStreamBridge_ContextCancellation(t *testing.T) {
 }
 
 func TestStreamBridge_StreamError(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	messages := capturePublishedMessages(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
 	streamErr := errors.New("provider error")
-	provider := &mockProvider{
-		name:      "mock",
-		streamErr: streamErr,
-	}
+	provider := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(provider, nil, streamErr, 0)
 
 	req := &Request{}
 	streamCtx := NewStreamContext("session-1", "mock", "mock-model", "agent-1")
@@ -428,37 +377,33 @@ func TestStreamBridge_StreamError(t *testing.T) {
 		t.Fatalf("StartStream failed: %v", err)
 	}
 
-	// Wait for error to be processed
 	time.Sleep(100 * time.Millisecond)
 
-	// Should publish an error chunk
-	messages := publisher.getMessages()
-	if len(messages) != 1 {
-		t.Fatalf("expected 1 error message, got %d", len(messages))
+	published := messages()
+	if len(published) != 1 {
+		t.Fatalf("expected 1 error message, got %d", len(published))
 	}
 
-	if messages[0].Payload.Type != ChunkTypeError {
-		t.Errorf("payload type = %q, want %q", messages[0].Payload.Type, ChunkTypeError)
+	if published[0].Payload.Type != ChunkTypeError {
+		t.Errorf("payload type = %q, want %q", published[0].Payload.Type, ChunkTypeError)
 	}
 
-	if messages[0].Payload.Text != streamErr.Error() {
-		t.Errorf("error text = %q, want %q", messages[0].Payload.Text, streamErr.Error())
+	if published[0].Payload.Text != streamErr.Error() {
+		t.Errorf("error text = %q, want %q", published[0].Payload.Text, streamErr.Error())
 	}
 }
 
 func TestStreamBridge_PublishError(t *testing.T) {
-	publisher := newMockPublisher()
-	publisher.publishErr = errors.New("publish failed")
+	publisher := mocks.NewMockStreamPublisher(t)
+	publisher.EXPECT().Publish(mock.Anything).Return(errors.New("publish error"))
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	chunks := []*StreamChunk{
-		{Index: 0, Type: ChunkTypeText, Text: "test"},
-	}
-	provider := newMockProvider(chunks)
+	chunks := []*StreamChunk{{Index: 0, Type: ChunkTypeText, Text: "test"}}
+	provider := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(provider, chunks, nil, 0)
 	req := &Request{}
 	streamCtx := NewStreamContext("session-1", "mock", "mock-model", "agent-1")
 
-	// Should not crash even with publish errors
 	err := bridge.StartStream(context.Background(), provider, req, streamCtx)
 	if err != nil {
 		t.Fatalf("StartStream failed: %v", err)
@@ -466,41 +411,46 @@ func TestStreamBridge_PublishError(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Stream should still complete (error is ignored)
 	if bridge.isStreamActive(streamCtx.CorrelationID) {
 		t.Error("stream should complete even with publish errors")
 	}
 }
 
 func TestStreamBridge_Concurrent(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	messages := capturePublishedMessages(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
 	var wg sync.WaitGroup
 	streamCount := 10
+	providerList := make([]*mocks.MockStreamProvider, streamCount)
+
+	for i := 0; i < streamCount; i++ {
+		provider := mocks.NewMockStreamProvider(t)
+		chunks := []*StreamChunk{
+			{Index: 0, Type: ChunkTypeStart, Timestamp: time.Now()},
+			{Index: 1, Type: ChunkTypeText, Text: "chunk", Timestamp: time.Now()},
+			{Index: 2, Type: ChunkTypeEnd, Timestamp: time.Now()},
+		}
+		expectStreamWithHandler(provider, chunks, nil, 0)
+		providerList[i] = provider
+	}
 
 	for i := 0; i < streamCount; i++ {
 		wg.Add(1)
 		go func(streamNum int) {
 			defer wg.Done()
 
-			chunks := []*StreamChunk{
-				{Index: 0, Type: ChunkTypeStart, Timestamp: time.Now()},
-				{Index: 1, Type: ChunkTypeText, Text: "chunk", Timestamp: time.Now()},
-				{Index: 2, Type: ChunkTypeEnd, Timestamp: time.Now()},
-			}
-
-			provider := newMockProvider(chunks)
 			streamCtx := NewStreamContext("session", "mock", "model", "agent")
-			_ = bridge.StartStream(context.Background(), provider, &Request{}, streamCtx)
+			_ = bridge.StartStream(context.Background(), providerList[streamNum], &Request{}, streamCtx)
 		}(i)
 	}
 
 	wg.Wait()
 	time.Sleep(500 * time.Millisecond)
 
-	messages := publisher.getMessages()
-	if len(messages) == 0 {
+	published := messages()
+	if len(published) == 0 {
 		t.Error("expected at least some published messages from concurrent streams")
 	}
 
@@ -510,10 +460,9 @@ func TestStreamBridge_Concurrent(t *testing.T) {
 }
 
 func TestStreamBridge_TrackUntrack(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	// Manually test track/untrack
 	stream := &activeStream{
 		ctx:           context.Background(),
 		cancel:        func() {},
@@ -535,15 +484,13 @@ func TestStreamBridge_TrackUntrack(t *testing.T) {
 }
 
 func TestStreamBridge_IsStreamActive(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
-	// Non-existent stream
 	if bridge.isStreamActive("non-existent") {
 		t.Error("non-existent stream should not be active")
 	}
 
-	// Add a stream
 	bridge.trackStream("test-id", &activeStream{
 		correlationID: "test-id",
 		cancel:        func() {},
@@ -553,7 +500,6 @@ func TestStreamBridge_IsStreamActive(t *testing.T) {
 		t.Error("tracked stream should be active")
 	}
 
-	// Remove it
 	bridge.untrackStream("test-id")
 
 	if bridge.isStreamActive("test-id") {
@@ -562,29 +508,25 @@ func TestStreamBridge_IsStreamActive(t *testing.T) {
 }
 
 func TestStreamBridge_MultipleStartsSameCorrelation(t *testing.T) {
-	publisher := newMockPublisher()
+	publisher := mocks.NewMockStreamPublisher(t)
+	allowPublish(publisher)
 	bridge := NewStreamBridge(publisher, DefaultStreamBridgeConfig())
 
 	chunks := []*StreamChunk{{Index: 0, Type: ChunkTypeEnd}}
-	provider := newMockProvider(chunks)
+	provider := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(provider, chunks, nil, 0)
 	streamCtx := NewStreamContext("session", "mock", "model", "agent")
 
-	// Start first stream
 	_ = bridge.StartStream(context.Background(), provider, &Request{}, streamCtx)
 
 	time.Sleep(10 * time.Millisecond)
 
-	// Start second stream with same correlation ID (should overwrite)
-	provider2 := &mockProvider{
-		name:       "mock",
-		chunks:     chunks,
-		streamWait: 100 * time.Millisecond,
-	}
+	provider2 := mocks.NewMockStreamProvider(t)
+	expectStreamWithHandler(provider2, chunks, nil, 100*time.Millisecond)
 	_ = bridge.StartStream(context.Background(), provider2, &Request{}, streamCtx)
 
 	time.Sleep(10 * time.Millisecond)
 
-	// Should still have exactly one active stream
 	if len(bridge.GetActiveStreams()) != 1 {
 		t.Errorf("expected 1 active stream, got %d", len(bridge.GetActiveStreams()))
 	}

@@ -27,8 +27,10 @@ func (r *Registry) Register(providerType ProviderType, provider Provider) error 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if err := provider.ValidateConfig(); err != nil {
-		return fmt.Errorf("invalid provider config for %s: %w", providerType, err)
+	if validator, ok := provider.(ProviderValidator); ok {
+		if err := validator.ValidateConfig(); err != nil {
+			return fmt.Errorf("invalid provider config for %s: %w", providerType, err)
+		}
 	}
 
 	r.providers[providerType] = provider
@@ -130,7 +132,11 @@ func (r *Registry) GetForModel(model string) (Provider, error) {
 	defer r.mu.RUnlock()
 
 	for _, provider := range r.providers {
-		if provider.SupportsModel(model) {
+		supporter, ok := provider.(ProviderModelSupporter)
+		if !ok {
+			continue
+		}
+		if supporter.SupportsModel(model) {
 			return provider, nil
 		}
 	}
@@ -144,7 +150,11 @@ func (r *Registry) Close() error {
 
 	var errs []error
 	for name, provider := range r.providers {
-		if err := provider.Close(); err != nil {
+		closer, ok := provider.(ProviderCloser)
+		if !ok {
+			continue
+		}
+		if err := closer.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", name, err))
 		}
 	}

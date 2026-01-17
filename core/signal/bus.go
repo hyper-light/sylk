@@ -135,10 +135,14 @@ func (b *SignalBus) initPendingAck(signalID string, subscribers []*SignalSubscri
 
 func (b *SignalBus) sendToSubscribers(subscribers []*SignalSubscriber, msg SignalMessage) {
 	for _, sub := range subscribers {
-		select {
-		case sub.Channel <- msg:
-		default:
-		}
+		b.sendToSubscriber(sub, msg)
+	}
+}
+
+func (b *SignalBus) sendToSubscriber(sub *SignalSubscriber, msg SignalMessage) {
+	select {
+	case sub.Channel <- msg:
+	default:
 	}
 }
 

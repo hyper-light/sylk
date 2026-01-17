@@ -112,3 +112,8 @@ func CalculateCost(inputTokens, outputTokens int64, inputPrice, outputPrice floa
 	outputCost := float64(outputTokens) / 1_000_000 * outputPrice
 	return inputCost + outputCost
 }
+
+// CalculateCostFromModel computes the cost using pricing loaded from ModelInfo.
+func CalculateCostFromModel(inputTokens, outputTokens int64, info ModelInfo) float64 {
+	return CalculateCost(inputTokens, outputTokens, info.InputPricePerM, info.OutputPricePerM)
+}

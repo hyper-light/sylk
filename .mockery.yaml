@@ -164,3 +164,20 @@ packages:
       ClassifierClient:
         config:
           mockname: "MockClassifierClient"
+
+  github.com/adalundhe/sylk/core/providers:
+    config:
+      dir: "core/providers/mocks"
+      outpkg: "mocks"
+    interfaces:
+      StreamPublisher:
+        config:
+          mockname: "MockStreamPublisher"
+
+      StreamProvider:
+        config:
+          mockname: "MockStreamProvider"
+
+      ProviderAdapter:
+        config:
+          mockname: "MockProviderAdapter"

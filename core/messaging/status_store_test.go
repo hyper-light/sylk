@@ -56,13 +56,11 @@ func TestStatusStore_Track(t *testing.T) {
 	defer cleanup()
 
 	msg := New(TypeRequest, "source", "payload").
+		WithSession("session-1").
 		WithCorrelation("corr-123").
 		WithTarget("target")
 
 	Track(store, msg)
-
-	// Wait for Ristretto to process
-	time.Sleep(10 * time.Millisecond)
 
 	record, ok := store.Get(msg.ID)
 	if !ok {
@@ -89,10 +87,8 @@ func TestStatusStore_Get_HotCache(t *testing.T) {
 	store, cleanup := setupTestStatusStore(t)
 	defer cleanup()
 
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	Track(store, msg)
-
-	time.Sleep(10 * time.Millisecond)
 
 	// First get - should be in hot cache
 	record, ok := store.Get(msg.ID)
@@ -113,9 +109,8 @@ func TestStatusStore_UpdateStatus(t *testing.T) {
 	store, cleanup := setupTestStatusStore(t)
 	defer cleanup()
 
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	Track(store, msg)
-	time.Sleep(10 * time.Millisecond)
 
 	// Update status
 	err := store.UpdateStatus(msg.ID, StatusCompleted, "")
@@ -137,9 +132,8 @@ func TestStatusStore_UpdateStatus_WithError(t *testing.T) {
 	store, cleanup := setupTestStatusStore(t)
 	defer cleanup()
 
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	Track(store, msg)
-	time.Sleep(10 * time.Millisecond)
 
 	// Update status with error
 	err := store.UpdateStatus(msg.ID, StatusFailed, "something went wrong")
@@ -163,9 +157,8 @@ func TestStatusStore_Delete(t *testing.T) {
 	store, cleanup := setupTestStatusStore(t)
 	defer cleanup()
 
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	Track(store, msg)
-	time.Sleep(10 * time.Millisecond)
 
 	// Delete
 	err := store.Delete(msg.ID)
@@ -185,18 +178,13 @@ func TestStatusStore_GetByStatus(t *testing.T) {
 	defer cleanup()
 
 	// Create messages with different statuses
-	msg1 := New(TypeRequest, "source", "payload1")
-	msg2 := New(TypeRequest, "source", "payload2")
-	msg3 := New(TypeRequest, "source", "payload3")
+	msg1 := New(TypeRequest, "source", "payload1").WithSession("session-1")
+	msg2 := New(TypeRequest, "source", "payload2").WithSession("session-1")
+	msg3 := New(TypeRequest, "source", "payload3").WithSession("session-1")
 
 	Track(store, msg1)
-	time.Sleep(20 * time.Millisecond) // Stagger to avoid race
 	Track(store, msg2)
-	time.Sleep(20 * time.Millisecond)
 	Track(store, msg3)
-
-	// Wait for async persist to complete
-	time.Sleep(100 * time.Millisecond)
 
 	// Update statuses
 	store.UpdateStatus(msg1.ID, StatusCompleted, "")
@@ -227,18 +215,13 @@ func TestStatusStore_GetByCorrelation(t *testing.T) {
 	// Create messages with same correlation
 	correlationID := "corr-shared"
 
-	msg1 := New(TypeRequest, "source", "payload1").WithCorrelation(correlationID)
-	msg2 := New(TypeForward, "guide", "payload2").WithCorrelation(correlationID)
-	msg3 := New(TypeResponse, "target", "payload3").WithCorrelation(correlationID)
+	msg1 := New(TypeRequest, "source", "payload1").WithSession("session-1").WithCorrelation(correlationID)
+	msg2 := New(TypeForward, "guide", "payload2").WithSession("session-1").WithCorrelation(correlationID)
+	msg3 := New(TypeResponse, "target", "payload3").WithSession("session-1").WithCorrelation(correlationID)
 
 	Track(store, msg1)
-	time.Sleep(20 * time.Millisecond) // Stagger to avoid race
 	Track(store, msg2)
-	time.Sleep(20 * time.Millisecond)
 	Track(store, msg3)
-
-	// Wait for async persist to complete
-	time.Sleep(100 * time.Millisecond)
 
 	// Query by correlation
 	records, err := store.GetByCorrelation(correlationID)
@@ -256,21 +239,19 @@ func TestStatusStore_GetActive(t *testing.T) {
 	defer cleanup()
 
 	// Create messages with various statuses
-	msg1 := New(TypeRequest, "source", "payload1")
-	msg2 := New(TypeRequest, "source", "payload2")
-	msg3 := New(TypeRequest, "source", "payload3")
+	msg1 := New(TypeRequest, "source", "payload1").WithSession("session-1")
+	msg2 := New(TypeRequest, "source", "payload2").WithSession("session-1")
+	msg3 := New(TypeRequest, "source", "payload3").WithSession("session-1")
 
 	Track(store, msg1)
 	Track(store, msg2)
 	Track(store, msg3)
-	time.Sleep(10 * time.Millisecond)
 
 	// Complete one
 	store.UpdateStatus(msg1.ID, StatusCompleted, "")
 
 	// Flush to cold storage
 	store.Flush()
-	time.Sleep(50 * time.Millisecond)
 
 	// Query active (non-terminal)
 	active, err := store.GetActive(10)
@@ -290,9 +271,8 @@ func TestStatusStore_Flush(t *testing.T) {
 	store, cleanup := setupTestStatusStore(t)
 	defer cleanup()
 
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	Track(store, msg)
-	time.Sleep(10 * time.Millisecond)
 
 	err := store.Flush()
 	if err != nil {
@@ -316,14 +296,12 @@ func TestStatusStore_Cleanup(t *testing.T) {
 	// Set short TTL for cleanup
 	store.config.ColdStorageTTL = 50 * time.Millisecond
 
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	Track(store, msg)
-	time.Sleep(10 * time.Millisecond)
 
 	// Complete and archive
 	store.UpdateStatus(msg.ID, StatusCompleted, "")
 	store.Flush()
-	time.Sleep(10 * time.Millisecond)
 
 	// Force to cold storage
 	store.cache.Del(msg.ID)
@@ -339,8 +317,19 @@ func TestStatusStore_Cleanup(t *testing.T) {
 		Timestamp: msg.Timestamp,
 	})
 
-	// Wait for TTL to expire
-	time.Sleep(100 * time.Millisecond)
+	// Set TTL to 1 hour - record archived 2 hours ago should be cleaned
+	store.config.ColdStorageTTL = 1 * time.Hour
+	archivedAt := time.Now().Add(-2 * time.Hour)
+	store.archiveRecord(&StatusRecord{
+		ID:         msg.ID,
+		Source:     msg.Source,
+		Type:       msg.Type,
+		Status:     StatusCompleted,
+		Priority:   msg.Priority,
+		Attempt:    msg.Attempt,
+		Timestamp:  msg.Timestamp,
+		ArchivedAt: &archivedAt,
+	})
 
 	// Run cleanup
 	deleted, err := store.Cleanup()
@@ -348,10 +337,9 @@ func TestStatusStore_Cleanup(t *testing.T) {
 		t.Fatalf("cleanup failed: %v", err)
 	}
 
-	// Should have cleaned up the old completed record
+	// Should have cleaned up the old completed record (archived 2h ago, TTL is 1h)
 	if deleted == 0 {
-		// This is expected since we need proper archived_at timestamp
-		t.Log("cleanup returned 0 (expected for in-process archived records)")
+		t.Fatalf("expected cleanup to delete archived record")
 	}
 }
 
@@ -360,11 +348,10 @@ func TestStatusStore_Stats(t *testing.T) {
 	defer cleanup()
 
 	// Track some messages
-	msg1 := New(TypeRequest, "source", "payload1")
-	msg2 := New(TypeRequest, "source", "payload2")
+	msg1 := New(TypeRequest, "source", "payload1").WithSession("session-1")
+	msg2 := New(TypeRequest, "source", "payload2").WithSession("session-1")
 	Track(store, msg1)
 	Track(store, msg2)
-	time.Sleep(10 * time.Millisecond)
 
 	// Get to trigger hits
 	store.Get(msg1.ID)

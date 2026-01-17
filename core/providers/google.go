@@ -88,8 +88,7 @@ func (g *GoogleProvider) Generate(ctx context.Context, req *Request) (*Response,
 	return g.convertResponse(result, model), nil
 }
 
-// Stream performs a streaming completion request
-func (g *GoogleProvider) Stream(ctx context.Context, req *Request, handler StreamHandler) error {
+func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
 	model := req.Model
 	if model == "" {
 		model = g.config.Model
@@ -98,7 +97,6 @@ func (g *GoogleProvider) Stream(ctx context.Context, req *Request, handler Strea
 	contents := g.convertMessages(req.Messages)
 	genConfig := g.buildGenerateConfig(req)
 
-	// Send start chunk
 	if err := handler(&StreamChunk{
 		Index:     0,
 		Type:      ChunkTypeStart,
@@ -112,7 +110,6 @@ func (g *GoogleProvider) Stream(ctx context.Context, req *Request, handler Strea
 	var stopReason StopReason
 	toolCallsSeen := map[string]bool{}
 
-	// Use range-based iteration (Go 1.23+ iterator pattern)
 	for resp, err := range g.client.Models.GenerateContentStream(ctx, model, contents, genConfig) {
 		if err != nil {
 			handler(&StreamChunk{
@@ -126,7 +123,6 @@ func (g *GoogleProvider) Stream(ctx context.Context, req *Request, handler Strea
 
 		chunkIndex++
 
-		// Extract text from candidates
 		text := resp.Text()
 		if text != "" {
 			if err := handler(&StreamChunk{
@@ -139,7 +135,6 @@ func (g *GoogleProvider) Stream(ctx context.Context, req *Request, handler Strea
 			}
 		}
 
-		// Handle function calls
 		if resp.FunctionCalls() != nil {
 			for _, fc := range resp.FunctionCalls() {
 				argsJSON, _ := json.Marshal(fc.Args)
@@ -204,6 +199,22 @@ func (g *GoogleProvider) Stream(ctx context.Context, req *Request, handler Strea
 	})
 }
 
+func (g *GoogleProvider) Stream(ctx context.Context, req *Request) (<-chan *StreamChunk, error) {
+	chunks := make(chan *StreamChunk, 100)
+	go func() {
+		defer close(chunks)
+		_ = g.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
+			select {
+			case chunks <- chunk:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+	return chunks, nil
+}
+
 // ValidateConfig checks if the provider configuration is valid
 func (g *GoogleProvider) ValidateConfig() error {
 	return g.config.Validate()
@@ -221,7 +232,32 @@ func (g *GoogleProvider) DefaultModel() string {
 
 // Close cleans up any resources
 func (g *GoogleProvider) Close() error {
-	// genai.Client doesn't have a Close method in current SDK
+	return nil
+}
+
+func (g *GoogleProvider) Complete(ctx context.Context, req *Request) (*Response, error) {
+	return g.Generate(ctx, req)
+}
+
+func (g *GoogleProvider) SupportedModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "gemini-3-pro", Name: "Gemini 3 Pro", MaxContext: 200000},
+	}
+}
+
+func (g *GoogleProvider) CountTokens(messages []Message) (int, error) {
+	count := 0
+	for _, msg := range messages {
+		count += len(msg.Content) / 4
+	}
+	return count, nil
+}
+
+func (g *GoogleProvider) MaxContextTokens(model string) int {
+	return 200000
+}
+
+func (g *GoogleProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 

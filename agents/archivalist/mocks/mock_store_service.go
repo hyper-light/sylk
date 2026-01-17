@@ -228,6 +228,63 @@ func (_c *MockStore_InsertEntry_Call) RunAndReturn(run func(*archivalist.Entry) 
 	return _c
 }
 
+// InsertEntryInSession provides a mock function with given fields: sessionID, entry
+func (_m *MockStore) InsertEntryInSession(sessionID string, entry *archivalist.Entry) (string, error) {
+	ret := _m.Called(sessionID, entry)
+
+	if len(ret) == 0 {
+		panic("no return value specified for InsertEntryInSession")
+	}
+
+	var r0 string
+	var r1 error
+	if rf, ok := ret.Get(0).(func(string, *archivalist.Entry) (string, error)); ok {
+		return rf(sessionID, entry)
+	}
+	if rf, ok := ret.Get(0).(func(string, *archivalist.Entry) string); ok {
+		r0 = rf(sessionID, entry)
+	} else {
+		r0 = ret.Get(0).(string)
+	}
+
+	if rf, ok := ret.Get(1).(func(string, *archivalist.Entry) error); ok {
+		r1 = rf(sessionID, entry)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockStore_InsertEntryInSession_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'InsertEntryInSession'
+type MockStore_InsertEntryInSession_Call struct {
+	*mock.Call
+}
+
+// InsertEntryInSession is a helper method to define mock.On call
+//   - sessionID string
+//   - entry *archivalist.Entry
+func (_e *MockStore_Expecter) InsertEntryInSession(sessionID interface{}, entry interface{}) *MockStore_InsertEntryInSession_Call {
+	return &MockStore_InsertEntryInSession_Call{Call: _e.mock.On("InsertEntryInSession", sessionID, entry)}
+}
+
+func (_c *MockStore_InsertEntryInSession_Call) Run(run func(sessionID string, entry *archivalist.Entry)) *MockStore_InsertEntryInSession_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(string), args[1].(*archivalist.Entry))
+	})
+	return _c
+}
+
+func (_c *MockStore_InsertEntryInSession_Call) Return(_a0 string, _a1 error) *MockStore_InsertEntryInSession_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockStore_InsertEntryInSession_Call) RunAndReturn(run func(string, *archivalist.Entry) (string, error)) *MockStore_InsertEntryInSession_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // Query provides a mock function with given fields: q
 func (_m *MockStore) Query(q archivalist.ArchiveQuery) ([]*archivalist.Entry, error) {
 	ret := _m.Called(q)

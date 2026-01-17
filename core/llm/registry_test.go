@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-// mockAdapter is a test implementation of ProviderAdapter
 type mockAdapter struct {
 	name            string
 	supportedModels []string
+	modelInfos      []ModelInfo
 	initError       error
 	initialized     bool
 	initCount       int
@@ -20,6 +20,18 @@ func newMockAdapter(name string, models ...string) *mockAdapter {
 	return &mockAdapter{
 		name:            name,
 		supportedModels: models,
+	}
+}
+
+func newMockAdapterWithPricing(name string, infos []ModelInfo) *mockAdapter {
+	models := make([]string, len(infos))
+	for i, info := range infos {
+		models[i] = info.ID
+	}
+	return &mockAdapter{
+		name:            name,
+		supportedModels: models,
+		modelInfos:      infos,
 	}
 }
 
@@ -34,6 +46,17 @@ func (m *mockAdapter) SupportsModel(model string) bool {
 		}
 	}
 	return false
+}
+
+func (m *mockAdapter) SupportedModels() []ModelInfo {
+	if m.modelInfos != nil {
+		return m.modelInfos
+	}
+	infos := make([]ModelInfo, len(m.supportedModels))
+	for i, model := range m.supportedModels {
+		infos[i] = ModelInfo{ID: model, Name: model}
+	}
+	return infos
 }
 
 func (m *mockAdapter) Initialize() error {
@@ -402,5 +425,80 @@ func TestConcurrentAccess(t *testing.T) {
 	all := registry.List()
 	if len(all) == 0 {
 		t.Error("Expected some adapters to be registered")
+	}
+}
+
+func TestGetModelInfo(t *testing.T) {
+	registry := NewProviderRegistry()
+	adapter := newMockAdapterWithPricing("anthropic", []ModelInfo{
+		{ID: "claude-3-opus", Name: "Claude 3 Opus", MaxContext: 200000, InputPricePerM: 15.0, OutputPricePerM: 75.0},
+		{ID: "claude-3-sonnet", Name: "Claude 3 Sonnet", MaxContext: 200000, InputPricePerM: 3.0, OutputPricePerM: 15.0},
+	})
+
+	registry.Register(adapter)
+
+	t.Run("existing model", func(t *testing.T) {
+		info, ok := registry.GetModelInfo("claude-3-opus")
+		if !ok {
+			t.Fatal("GetModelInfo should return true for existing model")
+		}
+		if info.ID != "claude-3-opus" {
+			t.Errorf("ID = %v, want claude-3-opus", info.ID)
+		}
+		if info.InputPricePerM != 15.0 {
+			t.Errorf("InputPricePerM = %v, want 15.0", info.InputPricePerM)
+		}
+		if info.OutputPricePerM != 75.0 {
+			t.Errorf("OutputPricePerM = %v, want 75.0", info.OutputPricePerM)
+		}
+	})
+
+	t.Run("nonexistent model", func(t *testing.T) {
+		_, ok := registry.GetModelInfo("nonexistent")
+		if ok {
+			t.Error("GetModelInfo should return false for nonexistent model")
+		}
+	})
+
+	t.Run("multiple providers", func(t *testing.T) {
+		openai := newMockAdapterWithPricing("openai", []ModelInfo{
+			{ID: "gpt-4", Name: "GPT-4", InputPricePerM: 30.0, OutputPricePerM: 60.0},
+		})
+		registry.Register(openai)
+
+		info, ok := registry.GetModelInfo("gpt-4")
+		if !ok {
+			t.Fatal("GetModelInfo should find gpt-4")
+		}
+		if info.InputPricePerM != 30.0 {
+			t.Errorf("InputPricePerM = %v, want 30.0", info.InputPricePerM)
+		}
+	})
+}
+
+func TestModelPricesIndexedOnRegister(t *testing.T) {
+	registry := NewProviderRegistry()
+
+	if registry.modelPrices == nil {
+		t.Fatal("modelPrices map not initialized")
+	}
+
+	adapter := newMockAdapterWithPricing("test", []ModelInfo{
+		{ID: "model1", InputPricePerM: 1.0, OutputPricePerM: 2.0},
+		{ID: "model2", InputPricePerM: 3.0, OutputPricePerM: 4.0},
+	})
+
+	registry.Register(adapter)
+
+	if len(registry.modelPrices) != 2 {
+		t.Errorf("modelPrices should have 2 entries, got %d", len(registry.modelPrices))
+	}
+
+	info1, ok := registry.modelPrices["model1"]
+	if !ok {
+		t.Fatal("model1 not indexed")
+	}
+	if info1.InputPricePerM != 1.0 {
+		t.Errorf("model1 InputPricePerM = %v, want 1.0", info1.InputPricePerM)
 	}
 }

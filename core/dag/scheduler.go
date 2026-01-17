@@ -188,53 +188,26 @@ func (s *Scheduler) SubmitAndWait(ctx context.Context, dag *DAG, dispatcher Node
 		return nil, ErrExecutorClosed
 	}
 
-	// Acquire semaphore
-	select {
-	case s.dagSem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if err := s.acquireDAGSlot(ctx); err != nil {
+		return nil, err
 	}
-	defer func() {
-		<-s.dagSem
-	}()
+	defer s.releaseDAGSlot()
 
-	// Validate DAG
-	if !dag.IsValidated() {
-		if err := ValidateDAG(dag); err != nil {
-			return nil, err
-		}
+	if err := s.validateDAG(dag); err != nil {
+		return nil, err
 	}
 
-	// Create executor
-	policy := dag.Policy()
-	if policy.MaxConcurrency == 0 {
-		policy = s.defaultPolicy
-	}
+	executor := s.createExecutor(dag)
+	s.registerExecution(dag, executor)
+	defer s.unregisterExecution(dag.ID())
 
-	executor := NewExecutor(policy)
+	return executor.Execute(ctx, dag, dispatcher)
+}
 
-	// Forward events
-	executor.Subscribe(func(event *Event) {
-		s.emitEvent(event)
-	})
-
-	// Register execution
+func (s *Scheduler) unregisterExecution(dagID string) {
 	s.mu.Lock()
-	s.executions[dag.ID()] = &Execution{
-		DAG:      dag,
-		Executor: executor,
-	}
+	delete(s.executions, dagID)
 	s.mu.Unlock()
-
-	// Execute synchronously
-	result, err := executor.Execute(ctx, dag, dispatcher)
-
-	// Cleanup
-	s.mu.Lock()
-	delete(s.executions, dag.ID())
-	s.mu.Unlock()
-
-	return result, err
 }
 
 // Cancel cancels a DAG execution
@@ -343,20 +316,29 @@ func (s *Scheduler) Stats() SchedulerStats {
 	}
 
 	for _, exec := range s.executions {
-		status := exec.Executor.Status()
-		if status != nil {
-			switch status.State {
-			case DAGStateRunning:
-				stats.RunningDAGs++
-			case DAGStateSucceeded:
-				stats.CompletedDAGs++
-			case DAGStateFailed:
-				stats.FailedDAGs++
-			}
-		}
+		s.countExecutionState(exec, &stats)
 	}
 
 	return stats
+}
+
+func (s *Scheduler) countExecutionState(exec *Execution, stats *SchedulerStats) {
+	status := exec.Executor.Status()
+	if status == nil {
+		return
+	}
+	stats.countState(status.State)
+}
+
+func (stats *SchedulerStats) countState(state DAGState) {
+	switch state {
+	case DAGStateRunning:
+		stats.RunningDAGs++
+	case DAGStateSucceeded:
+		stats.CompletedDAGs++
+	case DAGStateFailed:
+		stats.FailedDAGs++
+	}
 }
 
 // SchedulerStats contains scheduler statistics

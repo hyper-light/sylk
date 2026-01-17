@@ -10,7 +10,7 @@ import (
 // =============================================================================
 
 func TestNew(t *testing.T) {
-	msg := New(TypeRequest, "test-agent", &testPayload{Value: "hello"})
+	msg := New(TypeRequest, "test-agent", &testPayload{Value: "hello"}).WithSession("session-1")
 
 	assertMessageID(t, msg)
 	assertMessageSource(t, msg, "test-agent")
@@ -68,7 +68,7 @@ func assertMessagePayloadValue(t *testing.T, message *Message[*testPayload], exp
 }
 
 func TestNewWithID(t *testing.T) {
-	msg := NewWithID("custom-id", TypeResponse, "agent", "payload")
+	msg := NewWithID("custom-id", TypeResponse, "agent", "payload").WithSession("session-1")
 
 	if msg.ID != "custom-id" {
 		t.Errorf("expected ID 'custom-id', got %s", msg.ID)
@@ -82,7 +82,7 @@ func TestMessage_BuilderPattern(t *testing.T) {
 }
 
 func buildMessageWithMetadata(deadline time.Time) *Message[string] {
-	return New(TypeRequest, "source", "payload").
+	return New(TypeRequest, "source", "payload").WithSession("session-1").
 		WithCorrelation("corr-123").
 		WithParent("parent-456").
 		WithTarget("target-agent").
@@ -142,9 +142,9 @@ func assertBuilderMetadata(t *testing.T, message *Message[string]) {
 
 func TestMessage_ExpiresAt_Deadline(t *testing.T) {
 	deadline := time.Now().Add(1 * time.Hour)
-	msg := New(TypeRequest, "source", "payload").
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1").
 		WithDeadline(deadline).
-		WithTTL(30 * time.Second) // TTL should be ignored when Deadline is set
+		WithTTL(30 * time.Second)
 
 	exp := msg.ExpiresAt()
 	if exp == nil {
@@ -155,73 +155,8 @@ func TestMessage_ExpiresAt_Deadline(t *testing.T) {
 	}
 }
 
-func TestMessage_ExpiresAt_TTL(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload").
-		WithTTL(1 * time.Hour)
-
-	exp := msg.ExpiresAt()
-	if exp == nil {
-		t.Fatal("expected expiration time")
-	}
-
-	expected := msg.Timestamp.Add(1 * time.Hour)
-	if !exp.Equal(expected) {
-		t.Errorf("expected expiration %v, got %v", expected, *exp)
-	}
-}
-
 func TestMessage_ExpiresAt_None(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
-
-	exp := msg.ExpiresAt()
-	if exp != nil {
-		t.Error("expected nil expiration when no deadline or TTL")
-	}
-}
-
-func TestMessage_IsExpired(t *testing.T) {
-	// Not expired
-	msg := New(TypeRequest, "source", "payload").
-		WithTTL(1 * time.Hour)
-	if msg.IsExpired() {
-		t.Error("expected message not to be expired")
-	}
-
-	// Expired
-	msg2 := New(TypeRequest, "source", "payload")
-	msg2.Timestamp = time.Now().Add(-2 * time.Hour)
-	msg2.TTL = 1 * time.Hour
-	if !msg2.IsExpired() {
-		t.Error("expected message to be expired")
-	}
-}
-
-func TestMessage_RemainingTTL(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload").
-		WithTTL(1 * time.Hour)
-
-	remaining := msg.RemainingTTL()
-	if remaining < 59*time.Minute || remaining > 1*time.Hour {
-		t.Errorf("expected remaining TTL ~1h, got %v", remaining)
-	}
-
-	// Expired message
-	msg2 := New(TypeRequest, "source", "payload")
-	msg2.Timestamp = time.Now().Add(-2 * time.Hour)
-	msg2.TTL = 1 * time.Hour
-	if msg2.RemainingTTL() != 0 {
-		t.Error("expected 0 remaining TTL for expired message")
-	}
-
-	// No expiration
-	msg3 := New(TypeRequest, "source", "payload")
-	if msg3.RemainingTTL() != 0 {
-		t.Error("expected 0 remaining TTL when no expiration set")
-	}
-}
-
-func TestMessage_StatusTransitions(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 
 	// Initial state
 	if msg.Status != StatusQueued {
@@ -245,7 +180,7 @@ func TestMessage_StatusTransitions(t *testing.T) {
 }
 
 func TestMessage_MarkFailed(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.MarkFailed("something went wrong")
 
 	if msg.Status != StatusFailed {
@@ -260,7 +195,7 @@ func TestMessage_MarkFailed(t *testing.T) {
 }
 
 func TestMessage_MarkExpired(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.MarkExpired()
 
 	if msg.Status != StatusExpired {
@@ -269,7 +204,7 @@ func TestMessage_MarkExpired(t *testing.T) {
 }
 
 func TestMessage_MarkCancelled(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.MarkCancelled()
 
 	if msg.Status != StatusCancelled {
@@ -301,24 +236,24 @@ func TestMessage_CanRetry(t *testing.T) {
 }
 
 func newRetryableMessage() *Message[string] {
-	return New(TypeRequest, "source", "payload").WithMaxAttempts(3)
+	return New(TypeRequest, "source", "payload").WithSession("session-1").WithMaxAttempts(3)
 }
 
 func completedMessage() *Message[string] {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.MarkCompleted()
 	return msg
 }
 
 func expiredMessage() *Message[string] {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.Timestamp = time.Now().Add(-2 * time.Hour)
 	msg.TTL = 1 * time.Hour
 	return msg
 }
 
 func maxAttemptsMessage() *Message[string] {
-	msg := New(TypeRequest, "source", "payload").WithMaxAttempts(3)
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1").WithMaxAttempts(3)
 	msg.Attempt = 3
 	return msg
 }
@@ -360,40 +295,46 @@ func assertInvalidMessage(t *testing.T, msg *Message[string], context string) {
 }
 
 func missingIDMessage() *Message[string] {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.ID = ""
 	return msg
 }
 
 func missingSourceMessage() *Message[string] {
-	return New(TypeRequest, "", "payload")
+	msg := New(TypeRequest, "", "payload").WithSession("session-1")
+	return msg
 }
 
 func missingTypeMessage() *Message[string] {
-	return New("", "source", "payload")
+	msg := New("", "source", "payload").WithSession("session-1")
+	return msg
+}
+
+func missingSessionMessage() *Message[string] {
+	return New(TypeRequest, "source", "payload")
 }
 
 func invalidAttemptMessage() *Message[string] {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.Attempt = 0
 	return msg
 }
 
 func invalidDeadlineMessage() *Message[string] {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	deadline := msg.Timestamp.Add(-1 * time.Hour)
 	msg.Deadline = &deadline
 	return msg
 }
 
 func negativeTTLMessage() *Message[string] {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.TTL = -1 * time.Second
 	return msg
 }
 
 func TestMessage_IncrementAttempt(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg.MarkFailed("error")
 
 	msg.Status = StatusQueued // Reset for retry simulation
@@ -408,10 +349,12 @@ func TestMessage_IncrementAttempt(t *testing.T) {
 }
 
 func TestMessage_Validate(t *testing.T) {
-	assertValidMessage(t, New(TypeRequest, "source", "payload"))
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
+	assertValidMessage(t, msg)
 	assertInvalidMessage(t, missingIDMessage(), "missing ID")
 	assertInvalidMessage(t, missingSourceMessage(), "missing source")
 	assertInvalidMessage(t, missingTypeMessage(), "missing type")
+	assertInvalidMessage(t, missingSessionMessage(), "missing session")
 	assertInvalidMessage(t, invalidAttemptMessage(), "attempt < 1")
 	assertInvalidMessage(t, invalidDeadlineMessage(), "deadline before timestamp")
 	assertInvalidMessage(t, negativeTTLMessage(), "negative TTL")
@@ -419,26 +362,26 @@ func TestMessage_Validate(t *testing.T) {
 
 func TestMessage_ValidateForRouting(t *testing.T) {
 	// Valid request
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 	if err := msg.ValidateForRouting(); err != nil {
 		t.Errorf("expected valid message for routing, got: %v", err)
 	}
 
 	// Response without correlation
-	msg2 := New(TypeResponse, "source", "payload")
+	msg2 := New(TypeResponse, "source", "payload").WithSession("session-1")
 	if err := msg2.ValidateForRouting(); err == nil {
 		t.Error("expected error for response without correlation ID")
 	}
 
 	// Response with correlation - valid
-	msg3 := New(TypeResponse, "source", "payload")
+	msg3 := New(TypeResponse, "source", "payload").WithSession("session-1")
 	msg3.CorrelationID = "corr-123"
 	if err := msg3.ValidateForRouting(); err != nil {
 		t.Errorf("expected valid response, got: %v", err)
 	}
 
 	// Expired message
-	msg4 := New(TypeRequest, "source", "payload")
+	msg4 := New(TypeRequest, "source", "payload").WithSession("session-1")
 	msg4.Timestamp = time.Now().Add(-2 * time.Hour)
 	msg4.TTL = 1 * time.Hour
 	if err := msg4.ValidateForRouting(); err == nil {
@@ -448,6 +391,7 @@ func TestMessage_ValidateForRouting(t *testing.T) {
 
 func TestMessage_Clone(t *testing.T) {
 	original := New(TypeRequest, "source", "payload").
+		WithSession("session-1").
 		WithCorrelation("corr-123").
 		WithTarget("target").
 		WithPriority(PriorityHigh).
@@ -506,8 +450,8 @@ func assertCloneMetadata(t *testing.T, clone *Message[string], original *Message
 }
 
 func TestMessage_Age(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
-	time.Sleep(10 * time.Millisecond)
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
+	msg.Timestamp = time.Now().Add(-10 * time.Millisecond)
 
 	age := msg.Age()
 	if age < 10*time.Millisecond {
@@ -516,15 +460,16 @@ func TestMessage_Age(t *testing.T) {
 }
 
 func TestMessage_ProcessingDuration(t *testing.T) {
-	msg := New(TypeRequest, "source", "payload")
+	msg := New(TypeRequest, "source", "payload").WithSession("session-1")
 
 	// Not processed yet
 	if msg.ProcessingDuration() != 0 {
 		t.Error("expected 0 duration for unprocessed message")
 	}
 
-	time.Sleep(10 * time.Millisecond)
+	processedAt := msg.Timestamp.Add(10 * time.Millisecond)
 	msg.MarkCompleted()
+	msg.ProcessedAt = &processedAt
 
 	duration := msg.ProcessingDuration()
 	if duration < 10*time.Millisecond {

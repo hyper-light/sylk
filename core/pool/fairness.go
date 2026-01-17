@@ -19,13 +19,13 @@ type FairnessController struct {
 	entities map[string]*entityState
 
 	// Global limits
-	globalLimit    int64
-	currentUsage   int64
+	globalLimit  int64
+	currentUsage int64
 
 	// Configuration
-	entityLimit    int64
-	decayInterval  time.Duration
-	decayFactor    float64
+	entityLimit   int64
+	decayInterval time.Duration
+	decayFactor   float64
 
 	// Closed
 	closed atomic.Bool
@@ -61,18 +61,7 @@ func DefaultFairnessConfig() FairnessConfig {
 
 // NewFairnessController creates a new fairness controller
 func NewFairnessController(cfg FairnessConfig) *FairnessController {
-	if cfg.GlobalLimit <= 0 {
-		cfg.GlobalLimit = 100
-	}
-	if cfg.EntityLimit <= 0 {
-		cfg.EntityLimit = 20
-	}
-	if cfg.DecayInterval <= 0 {
-		cfg.DecayInterval = 5 * time.Second
-	}
-	if cfg.DecayFactor <= 0 || cfg.DecayFactor > 1 {
-		cfg.DecayFactor = 0.9
-	}
+	cfg = normalizeFairnessConfig(cfg)
 
 	fc := &FairnessController{
 		entities:      make(map[string]*entityState),
@@ -82,10 +71,37 @@ func NewFairnessController(cfg FairnessConfig) *FairnessController {
 		decayFactor:   cfg.DecayFactor,
 	}
 
-	// Start decay worker
 	go fc.decayWorker()
-
 	return fc
+}
+
+func normalizeFairnessConfig(cfg FairnessConfig) FairnessConfig {
+	cfg.GlobalLimit = defaultInt64IfZero(cfg.GlobalLimit, 100)
+	cfg.EntityLimit = defaultInt64IfZero(cfg.EntityLimit, 20)
+	cfg.DecayInterval = defaultDurationIfZero(cfg.DecayInterval, 5*time.Second)
+	cfg.DecayFactor = normalizeDecayFactor(cfg.DecayFactor)
+	return cfg
+}
+
+func defaultInt64IfZero(val, def int64) int64 {
+	if val <= 0 {
+		return def
+	}
+	return val
+}
+
+func defaultDurationIfZero(val, def time.Duration) time.Duration {
+	if val <= 0 {
+		return def
+	}
+	return val
+}
+
+func normalizeDecayFactor(val float64) float64 {
+	if val <= 0 || val > 1 {
+		return 0.9
+	}
+	return val
 }
 
 // =============================================================================
@@ -97,41 +113,47 @@ func (fc *FairnessController) Acquire(entityID string) (bool, error) {
 	if fc.closed.Load() {
 		return false, ErrControllerClosed
 	}
-
-	// Check global limit
-	current := atomic.LoadInt64(&fc.currentUsage)
-	if current >= fc.globalLimit {
+	if !fc.hasGlobalCapacity() {
 		return false, nil
 	}
 
+	entity := fc.getOrCreateEntity(entityID)
+	if !fc.tryAcquireEntitySlot(entity) {
+		return false, nil
+	}
+
+	atomic.AddInt64(&fc.currentUsage, 1)
+	return true, nil
+}
+
+func (fc *FairnessController) hasGlobalCapacity() bool {
+	return atomic.LoadInt64(&fc.currentUsage) < fc.globalLimit
+}
+
+func (fc *FairnessController) getOrCreateEntity(entityID string) *entityState {
 	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
 	entity, ok := fc.entities[entityID]
 	if !ok {
-		entity = &entityState{
-			id:         entityID,
-			lastActive: time.Now(),
-			weight:     1.0,
-		}
+		entity = &entityState{id: entityID, lastActive: time.Now(), weight: 1.0}
 		fc.entities[entityID] = entity
 	}
-	fc.mu.Unlock()
+	return entity
+}
 
-	// Check entity limit
+func (fc *FairnessController) tryAcquireEntitySlot(entity *entityState) bool {
 	entity.mu.Lock()
+	defer entity.mu.Unlock()
+
 	if entity.currentUsage >= fc.entityLimit {
-		entity.mu.Unlock()
-		return false, nil
+		return false
 	}
 
-	// Acquire the slot
 	entity.currentUsage++
 	entity.totalUsage++
 	entity.lastActive = time.Now()
-	entity.mu.Unlock()
-
-	atomic.AddInt64(&fc.currentUsage, 1)
-
-	return true, nil
+	return true
 }
 
 // Release releases a resource slot for an entity
@@ -140,26 +162,39 @@ func (fc *FairnessController) Release(entityID string) error {
 		return ErrControllerClosed
 	}
 
+	entity, err := fc.findEntity(entityID)
+	if err != nil {
+		return err
+	}
+
+	fc.releaseEntitySlot(entity)
+	fc.decrementGlobalUsage()
+	return nil
+}
+
+func (fc *FairnessController) findEntity(entityID string) (*entityState, error) {
 	fc.mu.RLock()
 	entity, ok := fc.entities[entityID]
 	fc.mu.RUnlock()
 
 	if !ok {
-		return ErrEntityNotFound
+		return nil, ErrEntityNotFound
 	}
+	return entity, nil
+}
 
+func (fc *FairnessController) releaseEntitySlot(entity *entityState) {
 	entity.mu.Lock()
 	if entity.currentUsage > 0 {
 		entity.currentUsage--
 	}
 	entity.mu.Unlock()
+}
 
-	current := atomic.AddInt64(&fc.currentUsage, -1)
-	if current < 0 {
+func (fc *FairnessController) decrementGlobalUsage() {
+	if atomic.AddInt64(&fc.currentUsage, -1) < 0 {
 		atomic.StoreInt64(&fc.currentUsage, 0)
 	}
-
-	return nil
 }
 
 // =============================================================================
@@ -175,32 +210,42 @@ func (fc *FairnessController) SelectFairest(candidates []string) string {
 	fc.mu.RLock()
 	defer fc.mu.RUnlock()
 
+	return fc.findFairestCandidate(candidates)
+}
+
+func (fc *FairnessController) findFairestCandidate(candidates []string) string {
 	var fairest string
 	lowestScore := float64(-1)
 
 	for _, id := range candidates {
 		entity, ok := fc.entities[id]
 		if !ok {
-			// New entity gets priority
-			return id
+			return id // New entity gets priority
 		}
 
-		entity.mu.Lock()
-		// Score based on usage and wait time
-		// Lower usage and higher wait time = lower score = higher priority
-		score := float64(entity.totalUsage) / entity.weight
-		if entity.waitTime > 0 {
-			score -= float64(entity.waitTime.Seconds())
-		}
-		entity.mu.Unlock()
-
-		if lowestScore < 0 || score < lowestScore {
-			lowestScore = score
-			fairest = id
-		}
+		score := fc.computeEntityScore(entity)
+		fairest, lowestScore = updateFairest(id, score, fairest, lowestScore)
 	}
 
 	return fairest
+}
+
+func updateFairest(id string, score float64, current string, lowest float64) (string, float64) {
+	if lowest < 0 || score < lowest {
+		return id, score
+	}
+	return current, lowest
+}
+
+func (fc *FairnessController) computeEntityScore(entity *entityState) float64 {
+	entity.mu.Lock()
+	defer entity.mu.Unlock()
+
+	score := float64(entity.totalUsage) / entity.weight
+	if entity.waitTime > 0 {
+		score -= float64(entity.waitTime.Seconds())
+	}
+	return score
 }
 
 // =============================================================================

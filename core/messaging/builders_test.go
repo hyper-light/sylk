@@ -13,6 +13,7 @@ func TestNewRequestMessage(t *testing.T) {
 	}
 
 	msg := NewRequestMessage("source-agent", req)
+	msg.SessionID = "session-1"
 
 	if msg.Type != TypeRequest {
 		t.Errorf("expected type 'request', got %s", msg.Type)
@@ -31,6 +32,7 @@ func TestNewRequestMessage(t *testing.T) {
 func TestNewRequestMessageWithCorrelation(t *testing.T) {
 	req := &RouteRequest{Input: "test"}
 	msg := NewRequestMessageWithCorrelation("source", "corr-123", req)
+	msg.SessionID = "session-1"
 
 	if msg.CorrelationID != "corr-123" {
 		t.Errorf("expected correlation 'corr-123', got %s", msg.CorrelationID)
@@ -47,6 +49,7 @@ func TestNewForwardMessage(t *testing.T) {
 	}
 
 	msg := NewForwardMessage("guide", "archivalist", fwd)
+	msg.SessionID = "session-1"
 
 	if msg.Type != TypeForward {
 		t.Errorf("expected type 'forward', got %s", msg.Type)
@@ -71,6 +74,7 @@ func TestNewResponseMessage(t *testing.T) {
 	}
 
 	msg := NewResponseMessage("archivalist", "corr-123", resp)
+	msg.SessionID = "session-1"
 
 	if msg.Type != TypeResponse {
 		t.Errorf("expected type 'response', got %s", msg.Type)
@@ -85,6 +89,7 @@ func TestNewResponseMessage(t *testing.T) {
 
 func TestNewSuccessResponse(t *testing.T) {
 	msg := NewSuccessResponse("agent", "corr-123", "result data", 50*time.Millisecond)
+	msg.SessionID = "session-1"
 
 	if !msg.Payload.Success {
 		t.Error("expected success=true")
@@ -99,6 +104,7 @@ func TestNewSuccessResponse(t *testing.T) {
 
 func TestNewErrorResponse(t *testing.T) {
 	msg := NewErrorResponse("agent", "corr-123", "something failed")
+	msg.SessionID = "session-1"
 
 	if msg.Payload.Success {
 		t.Error("expected success=false")
@@ -117,6 +123,7 @@ func TestNewActionMessage(t *testing.T) {
 	}
 
 	msg := NewActionMessage("guide", "archivalist", action)
+	msg.SessionID = "session-1"
 
 	if msg.Type != TypeAction {
 		t.Errorf("expected type 'action', got %s", msg.Type)
@@ -128,6 +135,7 @@ func TestNewActionMessage(t *testing.T) {
 
 func TestNewAckMessage(t *testing.T) {
 	msg := NewAckMessage("archivalist", "corr-123")
+	msg.SessionID = "session-1"
 
 	if msg.Type != TypeAck {
 		t.Errorf("expected type 'ack', got %s", msg.Type)
@@ -145,6 +153,7 @@ func TestNewAckMessage(t *testing.T) {
 
 func TestNewNackMessage(t *testing.T) {
 	msg := NewNackMessage("archivalist", "corr-123", "rejected because reasons")
+	msg.SessionID = "session-1"
 
 	if msg.Payload.Received {
 		t.Error("expected received=false")
@@ -160,6 +169,7 @@ func TestNewErrorMessage(t *testing.T) {
 		Message: "something broke",
 		Details: map[string]string{"field": "value"},
 	})
+	msg.SessionID = "session-1"
 
 	if msg.Type != TypeError {
 		t.Errorf("expected type 'error', got %s", msg.Type)
@@ -174,6 +184,7 @@ func TestNewErrorMessage(t *testing.T) {
 
 func TestNewSimpleErrorMessage(t *testing.T) {
 	msg := NewSimpleErrorMessage("agent", "corr-123", "simple error")
+	msg.SessionID = "session-1"
 
 	if msg.Payload.Message != "simple error" {
 		t.Errorf("expected message 'simple error', got %s", msg.Payload.Message)
@@ -182,6 +193,7 @@ func TestNewSimpleErrorMessage(t *testing.T) {
 
 func TestNewHeartbeatMessage(t *testing.T) {
 	msg := NewHeartbeatMessage("agent-id", "Agent Name", "healthy")
+	msg.SessionID = "session-1"
 
 	if msg.Type != TypeHeartbeat {
 		t.Errorf("expected type 'heartbeat', got %s", msg.Type)
@@ -197,6 +209,7 @@ func TestNewHeartbeatMessage(t *testing.T) {
 func TestMessageOptionPattern(t *testing.T) {
 	deadline := time.Now().Add(1 * time.Hour)
 	message := buildOptionMessage(deadline)
+	message.SessionID = "session-1"
 	assertOptionMessage(t, message, deadline)
 }
 

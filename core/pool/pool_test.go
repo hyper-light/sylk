@@ -233,23 +233,20 @@ func TestPriorityPool_LatencyBuckets(t *testing.T) {
 	p.Start()
 	defer p.Stop()
 
-	done := make(chan struct{})
 	p.Submit(&pool.PriorityJob{
 		ID:        "latency",
 		Priority:  pool.PriorityNormal,
 		CreatedAt: time.Now().Add(-30 * time.Millisecond),
 		Execute: func(ctx context.Context) error {
 			time.Sleep(15 * time.Millisecond)
-			close(done)
 			return nil
 		},
 	})
 
-	<-done
-
-	stats := p.Stats()
-	assert.NotEmpty(t, stats.WaitBuckets)
-	assert.NotEmpty(t, stats.RunBuckets)
+	require.Eventually(t, func() bool {
+		stats := p.Stats()
+		return len(stats.WaitBuckets) > 0 && len(stats.RunBuckets) > 0
+	}, time.Second, 5*time.Millisecond)
 }
 
 func TestSessionPool_New(t *testing.T) {

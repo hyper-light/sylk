@@ -136,19 +136,18 @@ func ensureSessionPoolWorkerLimits(cfg SessionPoolConfig) SessionPoolConfig {
 }
 
 func ensureSessionPoolJobLimits(cfg SessionPoolConfig) SessionPoolConfig {
-	if cfg.MaxJobsPerSession <= 0 {
-		cfg.MaxJobsPerSession = 100
-	}
-	if cfg.MaxTotalJobs <= 0 {
-		cfg.MaxTotalJobs = 500
-	}
-	if cfg.MaxJobsPerSessionMax <= 0 {
-		cfg.MaxJobsPerSessionMax = cfg.MaxJobsPerSession
-	}
-	if cfg.MaxTotalJobsMax <= 0 {
-		cfg.MaxTotalJobsMax = cfg.MaxTotalJobs
-	}
+	cfg.MaxJobsPerSession = defaultIfZero(cfg.MaxJobsPerSession, 100)
+	cfg.MaxTotalJobs = defaultIfZero(cfg.MaxTotalJobs, 500)
+	cfg.MaxJobsPerSessionMax = defaultIfZero(cfg.MaxJobsPerSessionMax, cfg.MaxJobsPerSession)
+	cfg.MaxTotalJobsMax = defaultIfZero(cfg.MaxTotalJobsMax, cfg.MaxTotalJobs)
 	return cfg
+}
+
+func defaultIfZero(val, def int) int {
+	if val <= 0 {
+		return def
+	}
+	return val
 }
 
 func ensureSessionPoolTiming(cfg SessionPoolConfig) SessionPoolConfig {
@@ -196,14 +195,21 @@ func (p *SessionPool) Close() error {
 }
 
 func (p *SessionPool) Submit(job *SessionJob) bool {
-	if !p.running.Load() || p.closed.Load() {
+	if !p.canAcceptSessionJob() {
 		return false
 	}
 	p.ensureJobTimestamp(job)
 	if p.overTotalJobLimit() {
 		return p.dropJob()
 	}
+	return p.enqueueJob(job)
+}
 
+func (p *SessionPool) canAcceptSessionJob() bool {
+	return p.running.Load() && !p.closed.Load()
+}
+
+func (p *SessionPool) enqueueJob(job *SessionJob) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -223,11 +229,14 @@ func (p *SessionPool) Submit(job *SessionJob) bool {
 }
 
 func (p *SessionPool) SubmitBlocking(job *SessionJob) bool {
-	if !p.running.Load() || p.closed.Load() {
+	if !p.canAcceptSessionJob() {
 		return false
 	}
 	p.ensureJobTimestamp(job)
+	return p.spinSubmitSession(job)
+}
 
+func (p *SessionPool) spinSubmitSession(job *SessionJob) bool {
 	for {
 		if p.Submit(job) {
 			return true
@@ -254,19 +263,30 @@ func (p *SessionPool) scheduler() {
 	defer ticker.Stop()
 
 	for {
-		select {
-		case <-p.ctx.Done():
+		if !p.scheduleLoop(ticker) {
 			return
-		case <-ticker.C:
-			job := p.selectNextJob()
-			if job != nil {
-				select {
-				case p.jobs <- job:
-				case <-p.ctx.Done():
-					return
-				}
-			}
 		}
+	}
+}
+
+func (p *SessionPool) scheduleLoop(ticker *time.Ticker) bool {
+	select {
+	case <-p.ctx.Done():
+		return false
+	case <-ticker.C:
+		p.dispatchNextJob()
+		return true
+	}
+}
+
+func (p *SessionPool) dispatchNextJob() {
+	job := p.selectNextJob()
+	if job == nil {
+		return
+	}
+	select {
+	case p.jobs <- job:
+	case <-p.ctx.Done():
 	}
 }
 
@@ -527,17 +547,27 @@ func (p *SessionPool) untrackRunning(job *SessionJob) {
 	if job.AgentType == "" || p.maxAgents == nil {
 		return
 	}
+	p.decrementAgentCounts(job)
+}
 
+func (p *SessionPool) decrementAgentCounts(job *SessionJob) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.runningAgents[job.AgentType] > 0 {
 		p.runningAgents[job.AgentType]--
 	}
-	if sessions, ok := p.runningAgentsBySess[job.AgentType]; ok {
-		if sessions[job.SessionID] > 0 {
-			sessions[job.SessionID]--
-		}
+	p.decrementSessionCount(job)
+}
+
+func (p *SessionPool) decrementSessionCount(job *SessionJob) {
+	sessions, ok := p.runningAgentsBySess[job.AgentType]
+	if !ok {
+		return
 	}
-	p.mu.Unlock()
+	if sessions[job.SessionID] > 0 {
+		sessions[job.SessionID]--
+	}
 }
 
 func (p *SessionPool) executeJob(job *SessionJob) (err error) {
@@ -580,14 +610,20 @@ func (p *SessionPool) RemoveSession(sessionID string) {
 	defer p.mu.Unlock()
 
 	delete(p.sessionQueues, sessionID)
+	p.removeFromSessionOrder(sessionID)
+	p.normalizeCurrentIndex()
+}
 
+func (p *SessionPool) removeFromSessionOrder(sessionID string) {
 	for i, id := range p.sessionOrder {
 		if id == sessionID {
 			p.sessionOrder = append(p.sessionOrder[:i], p.sessionOrder[i+1:]...)
-			break
+			return
 		}
 	}
+}
 
+func (p *SessionPool) normalizeCurrentIndex() {
 	if p.currentIndex >= len(p.sessionOrder) && len(p.sessionOrder) > 0 {
 		p.currentIndex = 0
 	}

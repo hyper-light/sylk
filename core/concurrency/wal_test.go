@@ -234,39 +234,48 @@ func countLogFiles(entries []os.DirEntry) int {
 }
 
 func TestWriteAheadLog_Iterator(t *testing.T) {
-	dir := t.TempDir()
+	wal := createIteratorTestWAL(t)
+	defer wal.Close()
+
+	appendTestEntries(t, wal, 15)
+
+	entries := collectIteratorEntries(t, wal)
+
+	assert.Len(t, entries, 15)
+	verifySequentialEntries(t, entries)
+}
+
+func createIteratorTestWAL(t *testing.T) *concurrency.WriteAheadLog {
 	config := concurrency.WALConfig{
-		Dir:            dir,
+		Dir:            t.TempDir(),
 		MaxSegmentSize: 200,
 		SyncMode:       concurrency.SyncEveryWrite,
 		SyncInterval:   100 * time.Millisecond,
 	}
-
 	wal, err := concurrency.NewWriteAheadLog(config)
 	require.NoError(t, err)
-	defer wal.Close()
+	return wal
+}
 
-	for i := 0; i < 15; i++ {
-		_, err := wal.Append(&concurrency.WALEntry{
-			Type:    concurrency.EntryStateChange,
-			Payload: []byte{byte(i)},
-		})
+func appendTestEntries(t *testing.T, wal *concurrency.WriteAheadLog, n int) {
+	for i := 0; i < n; i++ {
+		_, err := wal.Append(&concurrency.WALEntry{Type: concurrency.EntryStateChange, Payload: []byte{byte(i)}})
 		require.NoError(t, err)
 	}
+}
 
+func collectIteratorEntries(t *testing.T, wal *concurrency.WriteAheadLog) []*concurrency.WALEntry {
 	iter, err := wal.Iterator()
 	require.NoError(t, err)
 
 	var entries []*concurrency.WALEntry
-	for {
-		entry, ok := iter.Next()
-		if !ok {
-			break
-		}
+	for entry, ok := iter.Next(); ok; entry, ok = iter.Next() {
 		entries = append(entries, entry)
 	}
+	return entries
+}
 
-	assert.Len(t, entries, 15)
+func verifySequentialEntries(t *testing.T, entries []*concurrency.WALEntry) {
 	for i, entry := range entries {
 		assert.Equal(t, uint64(i+1), entry.Sequence)
 	}
@@ -471,56 +480,72 @@ func TestWriteAheadLog_CurrentSequence(t *testing.T) {
 }
 
 func TestWriteAheadLog_RaceConditions(t *testing.T) {
-	dir := t.TempDir()
-	config := concurrency.WALConfig{
-		Dir:            dir,
-		MaxSegmentSize: 500,
-		SyncMode:       concurrency.SyncBatched,
-		SyncInterval:   10 * time.Millisecond,
-	}
-
-	wal, err := concurrency.NewWriteAheadLog(config)
-	require.NoError(t, err)
+	wal := createRaceTestWAL(t)
 
 	var wg sync.WaitGroup
-	var appendErrors int64
-	var readErrors int64
-
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				_, err := wal.Append(&concurrency.WALEntry{
-					Type:    concurrency.EntryStateChange,
-					Payload: make([]byte, 20),
-				})
-				if err != nil {
-					atomic.AddInt64(&appendErrors, 1)
-				}
-			}
-		}()
-	}
-
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 20; j++ {
-				_, err := wal.ReadAll()
-				if err != nil && err != concurrency.ErrWALClosed {
-					atomic.AddInt64(&readErrors, 1)
-				}
-				time.Sleep(time.Millisecond)
-			}
-		}()
-	}
+	appendErrors := runConcurrentAppends(wal, &wg, 5, 50)
+	readErrors := runConcurrentReads(wal, &wg, 3, 20)
 
 	wg.Wait()
 	wal.Close()
 
-	assert.Equal(t, int64(0), appendErrors)
-	assert.Equal(t, int64(0), readErrors)
+	assert.Equal(t, int64(0), atomic.LoadInt64(appendErrors))
+	assert.Equal(t, int64(0), atomic.LoadInt64(readErrors))
+}
+
+func createRaceTestWAL(t *testing.T) *concurrency.WriteAheadLog {
+	config := concurrency.WALConfig{
+		Dir:            t.TempDir(),
+		MaxSegmentSize: 500,
+		SyncMode:       concurrency.SyncBatched,
+		SyncInterval:   10 * time.Millisecond,
+	}
+	wal, err := concurrency.NewWriteAheadLog(config)
+	require.NoError(t, err)
+	return wal
+}
+
+func runConcurrentAppends(wal *concurrency.WriteAheadLog, wg *sync.WaitGroup, workers, iterations int) *int64 {
+	var errors int64
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			appendEntries(wal, iterations, &errors)
+		}()
+	}
+	return &errors
+}
+
+func appendEntries(wal *concurrency.WriteAheadLog, n int, errors *int64) {
+	for j := 0; j < n; j++ {
+		_, err := wal.Append(&concurrency.WALEntry{Type: concurrency.EntryStateChange, Payload: make([]byte, 20)})
+		if err != nil {
+			atomic.AddInt64(errors, 1)
+		}
+	}
+}
+
+func runConcurrentReads(wal *concurrency.WriteAheadLog, wg *sync.WaitGroup, workers, iterations int) *int64 {
+	var errors int64
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			readEntries(wal, iterations, &errors)
+		}()
+	}
+	return &errors
+}
+
+func readEntries(wal *concurrency.WriteAheadLog, n int, errors *int64) {
+	for j := 0; j < n; j++ {
+		_, err := wal.ReadAll()
+		if err != nil && err != concurrency.ErrWALClosed {
+			atomic.AddInt64(errors, 1)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestDefaultWALConfig(t *testing.T) {

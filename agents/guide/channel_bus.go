@@ -63,20 +63,32 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 		return nil
 	}
 
-	topicSubs.mu.RLock()
-	subs := append([]*channelSubscription(nil), topicSubs.subs...)
-	topicSubs.mu.RUnlock()
-
-	for _, sub := range subs {
-		if sub.active.Load() {
-			select {
-			case sub.ch <- msg:
-			default:
-			}
-		}
-	}
+	subs := b.snapshotSubscribers(topicSubs)
+	b.publishToSubscribers(subs, msg)
 
 	return nil
+}
+
+func (b *ChannelBus) snapshotSubscribers(topicSubs *topicSubscriptions) []*channelSubscription {
+	topicSubs.mu.RLock()
+	defer topicSubs.mu.RUnlock()
+	return append([]*channelSubscription(nil), topicSubs.subs...)
+}
+
+func (b *ChannelBus) publishToSubscribers(subs []*channelSubscription, msg *Message) {
+	for _, sub := range subs {
+		b.publishToSubscriber(sub, msg)
+	}
+}
+
+func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message) {
+	if !sub.active.Load() {
+		return
+	}
+	select {
+	case sub.ch <- msg:
+	default:
+	}
 }
 
 func (b *ChannelBus) Subscribe(topic string, handler MessageHandler) (Subscription, error) {
@@ -211,13 +223,14 @@ func (s *channelSubscription) run(wg *sync.WaitGroup) {
 }
 
 func (s *channelSubscription) handleMessage(msg *Message) {
-	defer func() {
-		if r := recover(); r != nil {
-			_ = r
-		}
-	}()
-
+	defer s.recoverPanic()
 	_ = s.handler(msg)
+}
+
+func (s *channelSubscription) recoverPanic() {
+	if r := recover(); r != nil {
+		_ = r
+	}
 }
 
 type ChannelBusStats struct {

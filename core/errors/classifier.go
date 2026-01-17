@@ -4,35 +4,49 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 )
 
+type patternSet struct {
+	transient   []*regexp.Regexp
+	permanent   []*regexp.Regexp
+	userFixable []*regexp.Regexp
+}
+
 type ErrorClassifier struct {
-	mu              sync.RWMutex
-	transientPats   []*regexp.Regexp
-	permanentPats   []*regexp.Regexp
-	userFixablePats []*regexp.Regexp
-	rateLimitCodes  map[int]struct{}
-	degradingCodes  map[int]struct{}
+	patterns       unsafe.Pointer
+	mu             sync.Mutex
+	rateLimitCodes []int
+	degradingCodes []int
 }
 
 func NewErrorClassifier() *ErrorClassifier {
-	return &ErrorClassifier{
-		transientPats:   make([]*regexp.Regexp, 0),
-		permanentPats:   make([]*regexp.Regexp, 0),
-		userFixablePats: make([]*regexp.Regexp, 0),
-		rateLimitCodes: map[int]struct{}{
-			http.StatusTooManyRequests: {},
-		},
-		degradingCodes: map[int]struct{}{
-			http.StatusInternalServerError: {},
-			http.StatusBadGateway:          {},
-			http.StatusServiceUnavailable:  {},
-			http.StatusGatewayTimeout:      {},
+	ps := &patternSet{
+		transient:   make([]*regexp.Regexp, 0),
+		permanent:   make([]*regexp.Regexp, 0),
+		userFixable: make([]*regexp.Regexp, 0),
+	}
+
+	c := &ErrorClassifier{
+		rateLimitCodes: []int{http.StatusTooManyRequests},
+		degradingCodes: []int{
+			http.StatusBadGateway,
+			http.StatusGatewayTimeout,
+			http.StatusInternalServerError,
+			http.StatusServiceUnavailable,
 		},
 	}
+	atomic.StorePointer(&c.patterns, unsafe.Pointer(ps))
+
+	sort.Ints(c.rateLimitCodes)
+	sort.Ints(c.degradingCodes)
+
+	return c
 }
 
 func NewErrorClassifierFromConfig(cfg *ErrorClassifierConfig) (*ErrorClassifier, error) {
@@ -44,52 +58,61 @@ func NewErrorClassifierFromConfig(cfg *ErrorClassifierConfig) (*ErrorClassifier,
 	return c, nil
 }
 
-type patternLoadSpec struct {
-	patterns []string
-	target   *[]*regexp.Regexp
-	name     string
+func (c *ErrorClassifier) loadAllPatterns(cfg *ErrorClassifierConfig) error {
+	ps := c.loadPatterns()
+
+	transient, err := compilePatterns(cfg.TransientPatterns)
+	if err != nil {
+		return WrapWithTier(TierPermanent, "invalid transient pattern", err)
+	}
+	permanent, err := compilePatterns(cfg.PermanentPatterns)
+	if err != nil {
+		return WrapWithTier(TierPermanent, "invalid permanent pattern", err)
+	}
+	userFixable, err := compilePatterns(cfg.UserFixablePatterns)
+	if err != nil {
+		return WrapWithTier(TierPermanent, "invalid user-fixable pattern", err)
+	}
+
+	newPS := &patternSet{
+		transient:   append(ps.transient, transient...),
+		permanent:   append(ps.permanent, permanent...),
+		userFixable: append(ps.userFixable, userFixable...),
+	}
+	atomic.StorePointer(&c.patterns, unsafe.Pointer(newPS))
+	return nil
 }
 
-func (c *ErrorClassifier) loadAllPatterns(cfg *ErrorClassifierConfig) error {
-	specs := []patternLoadSpec{
-		{cfg.TransientPatterns, &c.transientPats, "transient"},
-		{cfg.PermanentPatterns, &c.permanentPats, "permanent"},
-		{cfg.UserFixablePatterns, &c.userFixablePats, "user-fixable"},
-	}
-	for _, spec := range specs {
-		if err := c.loadPatterns(spec.patterns, spec.target); err != nil {
-			return WrapWithTier(TierPermanent, "invalid "+spec.name+" pattern", err)
+func compilePatterns(patterns []string) ([]*regexp.Regexp, error) {
+	result := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, err
 		}
+		result = append(result, re)
 	}
-	return nil
+	return result, nil
 }
 
 func (c *ErrorClassifier) loadStatusCodes(cfg *ErrorClassifierConfig) {
 	if len(cfg.RateLimitStatuses) > 0 {
-		c.rateLimitCodes = intSliceToSet(cfg.RateLimitStatuses)
+		c.rateLimitCodes = sortedCopy(cfg.RateLimitStatuses)
 	}
 	if len(cfg.DegradingStatuses) > 0 {
-		c.degradingCodes = intSliceToSet(cfg.DegradingStatuses)
+		c.degradingCodes = sortedCopy(cfg.DegradingStatuses)
 	}
 }
 
-func intSliceToSet(codes []int) map[int]struct{} {
-	set := make(map[int]struct{}, len(codes))
-	for _, code := range codes {
-		set[code] = struct{}{}
-	}
-	return set
+func sortedCopy(codes []int) []int {
+	result := make([]int, len(codes))
+	copy(result, codes)
+	sort.Ints(result)
+	return result
 }
 
-func (c *ErrorClassifier) loadPatterns(patterns []string, target *[]*regexp.Regexp) error {
-	for _, p := range patterns {
-		re, err := regexp.Compile(p)
-		if err != nil {
-			return err
-		}
-		*target = append(*target, re)
-	}
-	return nil
+func (c *ErrorClassifier) loadPatterns() *patternSet {
+	return (*patternSet)(atomic.LoadPointer(&c.patterns))
 }
 
 func (c *ErrorClassifier) Classify(err error) ErrorTier {
@@ -100,9 +123,6 @@ func (c *ErrorClassifier) Classify(err error) ErrorTier {
 	if tier, ok := c.extractExistingTier(err); ok {
 		return tier
 	}
-
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 
 	return c.classifyByContent(err.Error())
 }
@@ -135,23 +155,19 @@ func (c *ErrorClassifier) classifyByHTTPStatus(errStr string) (ErrorTier, bool) 
 	return TierPermanent, false
 }
 
-type patternTierPair struct {
-	patterns *[]*regexp.Regexp
-	tier     ErrorTier
-}
-
 func (c *ErrorClassifier) classifyByPatterns(errStr string) (ErrorTier, bool) {
-	pairs := []patternTierPair{
-		{&c.transientPats, TierTransient},
-		{&c.userFixablePats, TierUserFixable},
-		{&c.permanentPats, TierPermanent},
+	ps := c.loadPatterns()
+
+	if matchesPatterns(errStr, ps.transient) {
+		return TierTransient, true
 	}
-	for _, pair := range pairs {
-		if c.matchesPatterns(errStr, *pair.patterns) {
-			return pair.tier, true
-		}
+	if matchesPatterns(errStr, ps.userFixable) {
+		return TierUserFixable, true
 	}
-	if c.matchesTransientKeywords(errStr) {
+	if matchesPatterns(errStr, ps.permanent) {
+		return TierPermanent, true
+	}
+	if matchesTransientKeywords(errStr) {
 		return TierTransient, true
 	}
 	return TierPermanent, false
@@ -159,21 +175,18 @@ func (c *ErrorClassifier) classifyByPatterns(errStr string) (ErrorTier, bool) {
 
 func (c *ErrorClassifier) isRateLimitError(errStr string) bool {
 	lower := strings.ToLower(errStr)
-	if strings.Contains(lower, "rate limit") {
+	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests") {
 		return true
 	}
-	if strings.Contains(lower, "too many requests") {
-		return true
-	}
-	return c.containsAnyStatusCode(errStr, c.rateLimitCodes)
+	return containsAnyStatusCode(errStr, c.rateLimitCodes)
 }
 
 func (c *ErrorClassifier) isDegradingError(errStr string) bool {
-	return c.containsAnyStatusCode(errStr, c.degradingCodes)
+	return containsAnyStatusCode(errStr, c.degradingCodes)
 }
 
-func (c *ErrorClassifier) containsAnyStatusCode(errStr string, codes map[int]struct{}) bool {
-	for code := range codes {
+func containsAnyStatusCode(errStr string, codes []int) bool {
+	for _, code := range codes {
 		if strings.Contains(errStr, strconv.Itoa(code)) {
 			return true
 		}
@@ -181,7 +194,7 @@ func (c *ErrorClassifier) containsAnyStatusCode(errStr string, codes map[int]str
 	return false
 }
 
-func (c *ErrorClassifier) matchesPatterns(errStr string, patterns []*regexp.Regexp) bool {
+func matchesPatterns(errStr string, patterns []*regexp.Regexp) bool {
 	for _, p := range patterns {
 		if p.MatchString(errStr) {
 			return true
@@ -201,7 +214,7 @@ var transientKeywords = []string{
 	"no route to host",
 }
 
-func (c *ErrorClassifier) matchesTransientKeywords(errStr string) bool {
+func matchesTransientKeywords(errStr string) bool {
 	lower := strings.ToLower(errStr)
 	for _, kw := range transientKeywords {
 		if strings.Contains(lower, kw) {
@@ -212,24 +225,42 @@ func (c *ErrorClassifier) matchesTransientKeywords(errStr string) bool {
 }
 
 func (c *ErrorClassifier) AddTransientPattern(pattern string) error {
-	return c.addPattern(pattern, &c.transientPats)
+	return c.addPatternTo(pattern, "transient")
 }
 
 func (c *ErrorClassifier) AddPermanentPattern(pattern string) error {
-	return c.addPattern(pattern, &c.permanentPats)
+	return c.addPatternTo(pattern, "permanent")
 }
 
 func (c *ErrorClassifier) AddUserFixablePattern(pattern string) error {
-	return c.addPattern(pattern, &c.userFixablePats)
+	return c.addPatternTo(pattern, "userFixable")
 }
 
-func (c *ErrorClassifier) addPattern(pattern string, target *[]*regexp.Regexp) error {
+func (c *ErrorClassifier) addPatternTo(pattern string, target string) error {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return err
 	}
+
 	c.mu.Lock()
-	*target = append(*target, re)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+
+	ps := c.loadPatterns()
+	newPS := &patternSet{
+		transient:   ps.transient,
+		permanent:   ps.permanent,
+		userFixable: ps.userFixable,
+	}
+
+	switch target {
+	case "transient":
+		newPS.transient = append(newPS.transient[:len(newPS.transient):len(newPS.transient)], re)
+	case "permanent":
+		newPS.permanent = append(newPS.permanent[:len(newPS.permanent):len(newPS.permanent)], re)
+	case "userFixable":
+		newPS.userFixable = append(newPS.userFixable[:len(newPS.userFixable):len(newPS.userFixable)], re)
+	}
+
+	atomic.StorePointer(&c.patterns, unsafe.Pointer(newPS))
 	return nil
 }

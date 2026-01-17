@@ -93,8 +93,7 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req *Request) (*Respon
 	return p.convertResponse(msg), nil
 }
 
-// Stream performs a streaming completion request
-func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, handler StreamHandler) error {
+func (p *AnthropicProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
 	params := p.buildParams(req)
 
 	stream := p.client.Messages.NewStreaming(ctx, params)
@@ -177,6 +176,22 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, handler St
 
 }
 
+func (p *AnthropicProvider) Stream(ctx context.Context, req *Request) (<-chan *StreamChunk, error) {
+	chunks := make(chan *StreamChunk, 100)
+	go func() {
+		defer close(chunks)
+		_ = p.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
+			select {
+			case chunks <- chunk:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+	return chunks, nil
+}
+
 // ValidateConfig checks if the provider configuration is valid
 func (p *AnthropicProvider) ValidateConfig() error {
 	return p.config.Validate()
@@ -194,6 +209,37 @@ func (p *AnthropicProvider) DefaultModel() string {
 
 // Close cleans up any resources
 func (p *AnthropicProvider) Close() error {
+	return nil
+}
+
+func (p *AnthropicProvider) Complete(ctx context.Context, req *Request) (*Response, error) {
+	return p.Generate(ctx, req)
+}
+
+func (p *AnthropicProvider) SupportedModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "claude-opus-4-5-20251101", Name: "Claude Opus 4.5", MaxContext: 200000},
+		{ID: "claude-sonnet-4-5-20250901", Name: "Claude Sonnet 4.5", MaxContext: 1000000},
+		{ID: "claude-haiku-4-5-20251001", Name: "Claude Haiku 4.5", MaxContext: 200000},
+	}
+}
+
+func (p *AnthropicProvider) CountTokens(messages []Message) (int, error) {
+	count := 0
+	for _, msg := range messages {
+		count += len(msg.Content) / 4
+	}
+	return count, nil
+}
+
+func (p *AnthropicProvider) MaxContextTokens(model string) int {
+	if model == "claude-sonnet-4-5-20250901" {
+		return 1000000
+	}
+	return 200000
+}
+
+func (p *AnthropicProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 

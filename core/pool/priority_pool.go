@@ -18,21 +18,19 @@ const (
 	PriorityCritical
 )
 
+var priorityNames = map[Priority]string{
+	PriorityBackground: "background",
+	PriorityLow:        "low",
+	PriorityNormal:     "normal",
+	PriorityHigh:       "high",
+	PriorityCritical:   "critical",
+}
+
 func (p Priority) String() string {
-	switch p {
-	case PriorityBackground:
-		return "background"
-	case PriorityLow:
-		return "low"
-	case PriorityNormal:
-		return "normal"
-	case PriorityHigh:
-		return "high"
-	case PriorityCritical:
-		return "critical"
-	default:
-		return "unknown"
+	if name, ok := priorityNames[p]; ok {
+		return name
 	}
+	return "unknown"
 }
 
 type PriorityJob struct {
@@ -63,24 +61,24 @@ type PriorityPool struct {
 	running atomic.Bool
 	closed  atomic.Bool
 
-	jobsSubmitted int64
-	jobsCompleted int64
-	jobsFailed    int64
-	jobsDropped   int64
+	jobsSubmitted atomic.Int64
+	jobsCompleted atomic.Int64
+	jobsFailed    atomic.Int64
+	jobsDropped   atomic.Int64
 
 	priorityStats [5]priorityLevelStats
 
-	waitBuckets map[string]int64
-	runBuckets  map[string]int64
+	waitBuckets [7]atomic.Int64
+	runBuckets  [7]atomic.Int64
 
 	promotionInterval time.Duration
 	lastPromotion     time.Time
 }
 
 type priorityLevelStats struct {
-	submitted int64
-	completed int64
-	waitTime  int64
+	submitted atomic.Int64
+	completed atomic.Int64
+	waitTime  atomic.Int64
 }
 
 type PriorityPoolConfig struct {
@@ -121,8 +119,6 @@ func NewPriorityPool(cfg PriorityPoolConfig) *PriorityPool {
 		cancel:            cancel,
 		promotionInterval: cfg.PromotionInterval,
 		lastPromotion:     time.Now(),
-		waitBuckets:       make(map[string]int64),
-		runBuckets:        make(map[string]int64),
 	}
 
 	return pool
@@ -168,7 +164,7 @@ func (p *PriorityPool) Submit(job *PriorityJob) bool {
 
 	accepted := p.submitIfAvailable(job)
 	if !accepted {
-		atomic.AddInt64(&p.jobsDropped, 1)
+		p.jobsDropped.Add(1)
 	}
 	return accepted
 }
@@ -177,16 +173,17 @@ func (p *PriorityPool) SubmitBlocking(job *PriorityJob) bool {
 	if !p.canAcceptJob(job) {
 		return false
 	}
+	return p.spinSubmit(job, 10*time.Millisecond)
+}
 
+func (p *PriorityPool) spinSubmit(job *PriorityJob, wait time.Duration) bool {
 	for {
 		if p.submitIfAvailable(job) {
 			return true
 		}
-
-		if p.waitForCapacity(10 * time.Millisecond) {
-			continue
+		if !p.waitForCapacity(wait) {
+			return false
 		}
-		return false
 	}
 }
 
@@ -194,21 +191,22 @@ func (p *PriorityPool) SubmitWithTimeout(job *PriorityJob, timeout time.Duration
 	if !p.canAcceptJob(job) {
 		return false
 	}
+	if p.spinSubmitWithDeadline(job, time.Now().Add(timeout)) {
+		return true
+	}
+	p.jobsDropped.Add(1)
+	return false
+}
 
-	deadline := time.Now().Add(timeout)
+func (p *PriorityPool) spinSubmitWithDeadline(job *PriorityJob, deadline time.Time) bool {
 	for time.Now().Before(deadline) {
 		if p.submitIfAvailable(job) {
 			return true
 		}
-
-		remaining := time.Until(deadline)
-		if p.waitForCapacity(p.waitDuration(remaining)) {
-			continue
+		if !p.waitForCapacity(p.waitDuration(time.Until(deadline))) {
+			return false
 		}
-		return false
 	}
-
-	atomic.AddInt64(&p.jobsDropped, 1)
 	return false
 }
 
@@ -232,8 +230,8 @@ func (p *PriorityPool) submitIfAvailable(job *PriorityJob) bool {
 	lane := p.normalizeLane(job.Priority)
 	p.lanes[lane] = append(p.lanes[lane], job)
 	p.queueLen++
-	atomic.AddInt64(&p.jobsSubmitted, 1)
-	atomic.AddInt64(&p.priorityStats[lane].submitted, 1)
+	p.jobsSubmitted.Add(1)
+	p.priorityStats[lane].submitted.Add(1)
 	p.mu.Unlock()
 
 	p.signalJobReady()
@@ -306,7 +304,7 @@ func (p *PriorityPool) waitForJobReady() bool {
 
 func (p *PriorityPool) trackWaitTime(job *PriorityJob) {
 	waitTime := time.Since(job.CreatedAt)
-	atomic.AddInt64(&p.priorityStats[job.Priority].waitTime, int64(waitTime))
+	p.priorityStats[job.Priority].waitTime.Add(int64(waitTime))
 	p.recordWaitBucket(waitTime)
 }
 
@@ -318,15 +316,15 @@ func (p *PriorityPool) runJob(job *PriorityJob) (error, time.Duration) {
 
 func (p *PriorityPool) handleJobResult(job *PriorityJob, err error) {
 	if err != nil {
-		atomic.AddInt64(&p.jobsFailed, 1)
+		p.jobsFailed.Add(1)
 		if job.OnError != nil {
 			job.OnError(err)
 		}
 		return
 	}
 
-	atomic.AddInt64(&p.jobsCompleted, 1)
-	atomic.AddInt64(&p.priorityStats[job.Priority].completed, 1)
+	p.jobsCompleted.Add(1)
+	p.priorityStats[job.Priority].completed.Add(1)
 }
 
 func (p *PriorityPool) popJob() *PriorityJob {
@@ -378,61 +376,56 @@ func (p *PriorityPool) promoteAgedJobs() {
 	defer p.mu.Unlock()
 
 	threshold := time.Now().Add(-p.promotionInterval * 2)
-
 	for prio := PriorityBackground; prio < PriorityCritical; prio++ {
-		lane := int(prio)
-		if len(p.lanes[lane]) == 0 {
-			continue
-		}
-
-		keep := p.lanes[lane][:0]
-		for _, job := range p.lanes[lane] {
-			if job.CreatedAt.Before(threshold) {
-				p.lanes[lane+1] = append(p.lanes[lane+1], job)
-			} else {
-				keep = append(keep, job)
-			}
-		}
-		p.lanes[lane] = keep
+		p.promoteLane(int(prio), threshold)
 	}
-
 	p.lastPromotion = time.Now()
 }
 
+func (p *PriorityPool) promoteLane(lane int, threshold time.Time) {
+	if len(p.lanes[lane]) == 0 {
+		return
+	}
+
+	keep := p.lanes[lane][:0]
+	for _, job := range p.lanes[lane] {
+		if job.CreatedAt.Before(threshold) {
+			p.lanes[lane+1] = append(p.lanes[lane+1], job)
+		} else {
+			keep = append(keep, job)
+		}
+	}
+	p.lanes[lane] = keep
+}
+
 func (p *PriorityPool) recordWaitBucket(d time.Duration) {
-	bucket := latencyBucket(d)
-	p.mu.Lock()
-	p.waitBuckets[bucket]++
-	p.mu.Unlock()
+	idx := latencyBucketIndex(d)
+	p.waitBuckets[idx].Add(1)
 }
 
 func (p *PriorityPool) recordRunBucket(d time.Duration) {
-	bucket := latencyBucket(d)
-	p.mu.Lock()
-	p.runBuckets[bucket]++
-	p.mu.Unlock()
+	idx := latencyBucketIndex(d)
+	p.runBuckets[idx].Add(1)
 }
 
-func latencyBucket(d time.Duration) string {
-	if d <= 0 {
-		return "0"
+var latencyThresholds = []time.Duration{
+	0,
+	10 * time.Millisecond,
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	250 * time.Millisecond,
+	time.Second,
+}
+
+var bucketLabels = []string{"0", "<=10ms", "<=50ms", "<=100ms", "<=250ms", "<=1s", ">1s"}
+
+func latencyBucketIndex(d time.Duration) int {
+	for i, threshold := range latencyThresholds {
+		if d <= threshold {
+			return i
+		}
 	}
-	if d <= 10*time.Millisecond {
-		return "<=10ms"
-	}
-	if d <= 50*time.Millisecond {
-		return "<=50ms"
-	}
-	if d <= 100*time.Millisecond {
-		return "<=100ms"
-	}
-	if d <= 250*time.Millisecond {
-		return "<=250ms"
-	}
-	if d <= time.Second {
-		return "<=1s"
-	}
-	return ">1s"
+	return 6
 }
 
 func (p *PriorityPool) Stats() PriorityPoolStats {
@@ -446,29 +439,31 @@ func (p *PriorityPool) Stats() PriorityPoolStats {
 		MaxQueueSize:  p.maxQueueSize,
 		QueueLength:   queueLen,
 		Running:       p.running.Load(),
-		JobsSubmitted: atomic.LoadInt64(&p.jobsSubmitted),
-		JobsCompleted: atomic.LoadInt64(&p.jobsCompleted),
-		JobsFailed:    atomic.LoadInt64(&p.jobsFailed),
-		JobsDropped:   atomic.LoadInt64(&p.jobsDropped),
+		JobsSubmitted: p.jobsSubmitted.Load(),
+		JobsCompleted: p.jobsCompleted.Load(),
+		JobsFailed:    p.jobsFailed.Load(),
+		JobsDropped:   p.jobsDropped.Load(),
 		PriorityStats: make(map[string]PriorityLevelStats),
 		WaitBuckets:   make(map[string]int64),
 		RunBuckets:    make(map[string]int64),
 	}
 
-	for i, ps := range p.priorityStats {
+	for i := 0; i < len(p.priorityStats); i++ {
 		priority := Priority(i)
 		stats.PriorityStats[priority.String()] = PriorityLevelStats{
-			Submitted:   atomic.LoadInt64(&ps.submitted),
-			Completed:   atomic.LoadInt64(&ps.completed),
-			AvgWaitTime: time.Duration(atomic.LoadInt64(&ps.waitTime)),
+			Submitted:   p.priorityStats[i].submitted.Load(),
+			Completed:   p.priorityStats[i].completed.Load(),
+			AvgWaitTime: time.Duration(p.priorityStats[i].waitTime.Load()),
 		}
 	}
 
-	for key, value := range p.waitBuckets {
-		stats.WaitBuckets[key] = value
-	}
-	for key, value := range p.runBuckets {
-		stats.RunBuckets[key] = value
+	for i, label := range bucketLabels {
+		if i < len(p.waitBuckets) {
+			stats.WaitBuckets[label] = p.waitBuckets[i].Load()
+		}
+		if i < len(p.runBuckets) {
+			stats.RunBuckets[label] = p.runBuckets[i].Load()
+		}
 	}
 
 	return stats

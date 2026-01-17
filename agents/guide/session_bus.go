@@ -128,10 +128,13 @@ func (sb *SessionBus) Publish(topic string, msg *Message) error {
 		return err
 	}
 
-	atomic.AddInt64(&sb.stats.messagesPublished, 1)
-	sb.routeToWildcardsIfEnabled(fullTopic, msg)
-
+	sb.recordPublish(fullTopic, msg)
 	return nil
+}
+
+func (sb *SessionBus) recordPublish(topic string, msg *Message) {
+	atomic.AddInt64(&sb.stats.messagesPublished, 1)
+	sb.routeToWildcardsIfEnabled(topic, msg)
 }
 
 func (sb *SessionBus) addSessionMetadata(msg *Message) {
@@ -294,16 +297,22 @@ func (sb *SessionBus) wrapHandler(handler MessageHandler) MessageHandler {
 
 func (sb *SessionBus) routeToWildcardSubscribers(topic string, msg *Message) {
 	handlers := sb.router.MatchHandlers(topic)
-	for _, h := range handlers {
-		atomic.AddInt64(&sb.stats.wildcardMatches, 1)
-		go func(handler MessageHandler) {
-			defer func() {
-				if r := recover(); r != nil {
-					// Handler panicked - ignore
-				}
-			}()
-			_ = handler(msg)
-		}(h)
+	for _, handler := range handlers {
+		sb.runWildcardHandler(handler, msg)
+	}
+}
+
+func (sb *SessionBus) runWildcardHandler(handler MessageHandler, msg *Message) {
+	atomic.AddInt64(&sb.stats.wildcardMatches, 1)
+	go func() {
+		defer sb.recoverWildcardPanic()
+		_ = handler(msg)
+	}()
+}
+
+func (sb *SessionBus) recoverWildcardPanic() {
+	if r := recover(); r != nil {
+		// Handler panicked - ignore
 	}
 }
 

@@ -86,8 +86,7 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req *Request) (*Response,
 	return p.convertResponse(result), nil
 }
 
-// Stream performs a streaming completion request
-func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, handler StreamHandler) error {
+func (p *OpenAIProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
 	params := p.buildResponseParams(req)
 
 	stream := p.client.Responses.NewStreaming(ctx, params)
@@ -215,6 +214,22 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, handler Strea
 	})
 }
 
+func (p *OpenAIProvider) Stream(ctx context.Context, req *Request) (<-chan *StreamChunk, error) {
+	chunks := make(chan *StreamChunk, 100)
+	go func() {
+		defer close(chunks)
+		_ = p.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
+			select {
+			case chunks <- chunk:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+	return chunks, nil
+}
+
 // ValidateConfig checks if the provider configuration is valid
 func (p *OpenAIProvider) ValidateConfig() error {
 	return p.config.Validate()
@@ -232,6 +247,32 @@ func (p *OpenAIProvider) DefaultModel() string {
 
 // Close cleans up any resources
 func (p *OpenAIProvider) Close() error {
+	return nil
+}
+
+func (p *OpenAIProvider) Complete(ctx context.Context, req *Request) (*Response, error) {
+	return p.Generate(ctx, req)
+}
+
+func (p *OpenAIProvider) SupportedModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "gpt-5.2-codex", Name: "GPT-5.2 Codex", MaxContext: 200000},
+	}
+}
+
+func (p *OpenAIProvider) CountTokens(messages []Message) (int, error) {
+	count := 0
+	for _, msg := range messages {
+		count += len(msg.Content) / 4
+	}
+	return count, nil
+}
+
+func (p *OpenAIProvider) MaxContextTokens(model string) int {
+	return 200000
+}
+
+func (p *OpenAIProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 

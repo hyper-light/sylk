@@ -5,9 +5,19 @@ import (
 	"sync"
 )
 
+// ModelInfo contains metadata and pricing for a model.
+type ModelInfo struct {
+	ID              string
+	Name            string
+	MaxContext      int
+	InputPricePerM  float64 // Price per million input tokens
+	OutputPricePerM float64 // Price per million output tokens
+}
+
 type ProviderAdapter interface {
 	Name() string
 	SupportsModel(model string) bool
+	SupportedModels() []ModelInfo
 	Initialize() error
 	IsInitialized() bool
 }
@@ -16,6 +26,7 @@ type ProviderRegistry struct {
 	mu          sync.RWMutex
 	adapters    map[string]ProviderAdapter
 	modelIndex  map[string]string
+	modelPrices map[string]ModelInfo
 	initialized map[string]bool
 	configs     map[string]*ProviderConfig
 }
@@ -24,6 +35,7 @@ func NewProviderRegistry() *ProviderRegistry {
 	return &ProviderRegistry{
 		adapters:    make(map[string]ProviderAdapter),
 		modelIndex:  make(map[string]string),
+		modelPrices: make(map[string]ModelInfo),
 		initialized: make(map[string]bool),
 		configs:     make(map[string]*ProviderConfig),
 	}
@@ -40,7 +52,14 @@ func (r *ProviderRegistry) Register(adapter ProviderAdapter) error {
 
 	r.adapters[name] = adapter
 	r.initialized[name] = false
+	r.indexModelPrices(adapter)
 	return nil
+}
+
+func (r *ProviderRegistry) indexModelPrices(adapter ProviderAdapter) {
+	for _, model := range adapter.SupportedModels() {
+		r.modelPrices[model.ID] = model
+	}
 }
 
 func (r *ProviderRegistry) RegisterWithConfig(adapter ProviderAdapter, cfg *ProviderConfig) error {
@@ -168,4 +187,12 @@ func (r *ProviderRegistry) SetConfig(name string, cfg *ProviderConfig) {
 
 	r.configs[name] = cfg
 	r.indexModels(name, cfg)
+}
+
+func (r *ProviderRegistry) GetModelInfo(modelID string) (ModelInfo, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	info, ok := r.modelPrices[modelID]
+	return info, ok
 }

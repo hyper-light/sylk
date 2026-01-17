@@ -4,16 +4,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"time"
+
+	"github.com/adalundhe/sylk/core/messaging"
 )
 
-// Message type constants for event bus routing
 const (
 	MessageTypeStream        = "stream"
 	MessageTypeStreamControl = "stream_control"
 )
 
-// StreamContext tracks correlation and routing for stream chunks.
-// Links all chunks from one generation request for proper event bus routing.
 type StreamContext struct {
 	// CorrelationID uniquely identifies all chunks from one generation
 	CorrelationID string `json:"correlation_id"`
@@ -39,11 +38,9 @@ type StreamContext struct {
 	// Priority for message ordering
 	Priority int `json:"priority"`
 
-	// StartedAt is when the stream was initiated
 	StartedAt time.Time `json:"started_at"`
 }
 
-// NewStreamContext creates a new StreamContext with a generated CorrelationID.
 func NewStreamContext(sessionID, providerName, model, agentID string) *StreamContext {
 	return &StreamContext{
 		CorrelationID: generateID(),
@@ -55,77 +52,30 @@ func NewStreamContext(sessionID, providerName, model, agentID string) *StreamCon
 	}
 }
 
-// StreamMessage wraps a StreamChunk for event bus transmission.
-type StreamMessage struct {
-	// ID uniquely identifies this message
-	ID string `json:"id"`
-
-	// Type is always "stream" for stream messages
-	Type string `json:"type"`
-
-	// CorrelationID links this message to its stream context
-	CorrelationID string `json:"correlation_id"`
-
-	// ParentID is the RequestID that initiated the stream
-	ParentID string `json:"parent_id"`
-
-	// Payload contains the actual stream chunk
-	Payload *StreamChunk `json:"payload"`
-
-	// Metadata contains additional routing and tracking info
-	Metadata StreamMessageMetadata `json:"metadata"`
-
-	// Priority for message ordering
-	Priority int `json:"priority"`
-
-	// Timestamp when this message was created
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// StreamMessageMetadata contains routing and tracking information.
-type StreamMessageMetadata struct {
-	// Model being used for generation
-	Model string `json:"model"`
-
-	// AgentID of the requesting agent
-	AgentID string `json:"agent_id"`
-
-	// ChunkIndex is the sequence number of the chunk
-	ChunkIndex int `json:"chunk_index"`
-
-	// ChunkType indicates the type of chunk content
-	ChunkType StreamChunkType `json:"chunk_type"`
-
-	// ProviderName identifies the LLM provider
-	ProviderName string `json:"provider_name"`
-
-	// SessionID identifies the session
-	SessionID string `json:"session_id"`
-}
-
-// WrapStreamChunk creates a StreamMessage from a StreamChunk and context.
-func WrapStreamChunk(chunk *StreamChunk, ctx *StreamContext) *StreamMessage {
-	return &StreamMessage{
-		ID:            generateID(),
-		Type:          MessageTypeStream,
-		CorrelationID: ctx.CorrelationID,
-		ParentID:      ctx.RequestID,
-		Payload:       chunk,
-		Metadata:      buildMetadata(chunk, ctx),
-		Priority:      ctx.Priority,
-		Timestamp:     time.Now(),
+func WrapStreamChunk(chunk *StreamChunk, ctx *StreamContext) *messaging.Message[StreamChunk] {
+	if chunk == nil {
+		return nil
 	}
+
+	msg := messaging.New(messaging.MessageType(MessageTypeStream), ctx.AgentID, *chunk)
+	msg.SessionID = ctx.SessionID
+	msg.CorrelationID = ctx.CorrelationID
+	msg.ParentID = ctx.RequestID
+	msg.Target = ctx.TargetAgent
+	msg.Priority = messaging.Priority(ctx.Priority)
+	msg.Metadata = buildMetadata(chunk, ctx)
+	return msg
 }
 
-// buildMetadata creates StreamMessageMetadata from chunk and context.
-func buildMetadata(chunk *StreamChunk, ctx *StreamContext) StreamMessageMetadata {
-	return StreamMessageMetadata{
-		Model:        ctx.Model,
-		AgentID:      ctx.AgentID,
-		ChunkIndex:   chunk.Index,
-		ChunkType:    chunk.Type,
-		ProviderName: ctx.ProviderName,
-		SessionID:    ctx.SessionID,
+func buildMetadata(chunk *StreamChunk, ctx *StreamContext) map[string]any {
+	return map[string]any{
+		"model":         ctx.Model,
+		"agent_id":      ctx.AgentID,
+		"chunk_index":   chunk.Index,
+		"chunk_type":    chunk.Type,
+		"provider_name": ctx.ProviderName,
+		"session_id":    ctx.SessionID,
+		"request_id":    ctx.RequestID,
 	}
 }
 

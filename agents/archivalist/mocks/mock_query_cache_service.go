@@ -226,6 +226,52 @@ func (_c *MockQueryCache_Stats_Call) RunAndReturn(run func() archivalist.QueryCa
 	return _c
 }
 
+// StatsBySession provides a mock function with given fields: sessionID
+func (_m *MockQueryCache) StatsBySession(sessionID string) archivalist.QueryCacheStats {
+	ret := _m.Called(sessionID)
+
+	if len(ret) == 0 {
+		panic("no return value specified for StatsBySession")
+	}
+
+	var r0 archivalist.QueryCacheStats
+	if rf, ok := ret.Get(0).(func(string) archivalist.QueryCacheStats); ok {
+		r0 = rf(sessionID)
+	} else {
+		r0 = ret.Get(0).(archivalist.QueryCacheStats)
+	}
+
+	return r0
+}
+
+// MockQueryCache_StatsBySession_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'StatsBySession'
+type MockQueryCache_StatsBySession_Call struct {
+	*mock.Call
+}
+
+// StatsBySession is a helper method to define mock.On call
+//   - sessionID string
+func (_e *MockQueryCache_Expecter) StatsBySession(sessionID interface{}) *MockQueryCache_StatsBySession_Call {
+	return &MockQueryCache_StatsBySession_Call{Call: _e.mock.On("StatsBySession", sessionID)}
+}
+
+func (_c *MockQueryCache_StatsBySession_Call) Run(run func(sessionID string)) *MockQueryCache_StatsBySession_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(string))
+	})
+	return _c
+}
+
+func (_c *MockQueryCache_StatsBySession_Call) Return(_a0 archivalist.QueryCacheStats) *MockQueryCache_StatsBySession_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockQueryCache_StatsBySession_Call) RunAndReturn(run func(string) archivalist.QueryCacheStats) *MockQueryCache_StatsBySession_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // Store provides a mock function with given fields: ctx, query, sessionID, response, queryType
 func (_m *MockQueryCache) Store(ctx context.Context, query string, sessionID string, response []byte, queryType archivalist.QueryType) error {
 	ret := _m.Called(ctx, query, sessionID, response, queryType)

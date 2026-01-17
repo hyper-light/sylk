@@ -83,6 +83,7 @@ func (q *UnboundedQueue) Pop() *LLMRequest {
 		return nil
 	}
 	req := q.items[0]
+	q.items[0] = nil
 	q.items = q.items[1:]
 	return req
 }

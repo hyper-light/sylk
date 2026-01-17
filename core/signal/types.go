@@ -10,20 +10,14 @@ import (
 type Signal string
 
 const (
-	// PauseAll pauses all pipelines and agents.
-	PauseAll Signal = "pause_all"
-	// ResumeAll resumes all paused pipelines and agents.
-	ResumeAll Signal = "resume_all"
-	// PausePipeline pauses a specific pipeline.
-	PausePipeline Signal = "pause_pipeline"
-	// ResumePipeline resumes a specific pipeline.
+	PauseAll       Signal = "pause_all"
+	ResumeAll      Signal = "resume_all"
+	PausePipeline  Signal = "pause_pipeline"
 	ResumePipeline Signal = "resume_pipeline"
-	// CancelTask cancels a specific task.
-	CancelTask Signal = "cancel_task"
-	// AbortSession aborts an entire session.
-	AbortSession Signal = "abort_session"
-	// QuotaWarning indicates a quota limit is approaching.
-	QuotaWarning Signal = "quota_warning"
+	CancelTask     Signal = "cancel_task"
+	AbortSession   Signal = "abort_session"
+	QuotaWarning   Signal = "quota_warning"
+	StateChanged   Signal = "state_changed"
 )
 
 // SignalMessage represents a signal sent through the bus.
@@ -64,7 +58,6 @@ type SignalSubscriber struct {
 	Channel chan SignalMessage
 }
 
-// ValidSignals returns all valid signal types.
 func ValidSignals() []Signal {
 	return []Signal{
 		PauseAll,
@@ -74,7 +67,15 @@ func ValidSignals() []Signal {
 		CancelTask,
 		AbortSession,
 		QuotaWarning,
+		StateChanged,
 	}
+}
+
+type StateChangePayload struct {
+	RunnerID  string
+	FromState string
+	ToState   string
+	Error     error
 }
 
 // NewSignalMessage creates a new signal message with defaults.

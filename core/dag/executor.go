@@ -134,37 +134,45 @@ func (e *Executor) executeLayers() *DAGResult {
 		if e.cancelled.Load() {
 			break
 		}
-
-		e.mu.Lock()
-		e.currentLayer = layerIdx
-		e.mu.Unlock()
-
-		e.emitEvent(&Event{
-			Type:      EventLayerStarted,
-			DAGID:     e.dag.ID(),
-			Layer:     layerIdx,
-			Timestamp: time.Now(),
-			Data: map[string]any{
-				"node_count": len(layer),
-			},
-		})
-
-		if err := e.executeLayer(layer); err != nil {
-			if e.policy.FailurePolicy == FailurePolicyFailFast {
-				e.cancelRemainingNodes(false)
-				break
-			}
+		if e.executeAndCheckLayer(layerIdx, layer) {
+			break
 		}
-
-		e.emitEvent(&Event{
-			Type:      EventLayerCompleted,
-			DAGID:     e.dag.ID(),
-			Layer:     layerIdx,
-			Timestamp: time.Now(),
-		})
 	}
 
 	return e.buildResult()
+}
+
+func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) bool {
+	e.mu.Lock()
+	e.currentLayer = layerIdx
+	e.mu.Unlock()
+
+	e.emitLayerStarted(layerIdx, len(layer))
+	err := e.executeLayer(layer)
+	e.emitLayerCompleted(layerIdx)
+
+	return err != nil && e.policy.FailurePolicy == FailurePolicyFailFast
+}
+
+func (e *Executor) emitLayerStarted(layerIdx, nodeCount int) {
+	e.emitEvent(&Event{
+		Type:      EventLayerStarted,
+		DAGID:     e.dag.ID(),
+		Layer:     layerIdx,
+		Timestamp: time.Now(),
+		Data: map[string]any{
+			"node_count": nodeCount,
+		},
+	})
+}
+
+func (e *Executor) emitLayerCompleted(layerIdx int) {
+	e.emitEvent(&Event{
+		Type:      EventLayerCompleted,
+		DAGID:     e.dag.ID(),
+		Layer:     layerIdx,
+		Timestamp: time.Now(),
+	})
 }
 
 type layerAction int
@@ -194,24 +202,32 @@ func (e *Executor) executeLayer(nodeIDs []string) error {
 	var firstErr error
 	errState := &layerErrorState{firstErr: &firstErr}
 
-loop:
 	for _, nodeID := range nodeIDs {
-		action, node, err := e.layerAction(nodeID)
+		stop, err := e.processLayerNode(nodeID, &wg, errState)
 		if err != nil {
 			return err
 		}
-		switch action {
-		case layerActionStop:
-			break loop
-		case layerActionSkip:
-			continue
-		case layerActionRun:
-			e.launchNodeExecution(&wg, node, errState)
+		if stop {
+			break
 		}
 	}
 
 	wg.Wait()
 	return firstErr
+}
+
+func (e *Executor) processLayerNode(nodeID string, wg *sync.WaitGroup, errState *layerErrorState) (bool, error) {
+	action, node, err := e.layerAction(nodeID)
+	if err != nil {
+		return true, err
+	}
+	if action == layerActionStop {
+		return true, nil
+	}
+	if action == layerActionRun {
+		e.launchNodeExecution(wg, node, errState)
+	}
+	return false, nil
 }
 
 func (e *Executor) layerAction(nodeID string) (layerAction, *Node, error) {
@@ -485,23 +501,12 @@ func (e *Executor) recordNodeResult(node *Node, result *NodeResult) {
 	e.mu.Unlock()
 
 	node.SetResult(result)
+	e.emitNodeResultEvent(node, result)
+}
 
-	var eventType EventType
-	switch result.State {
-	case NodeStateSucceeded:
-		eventType = EventNodeCompleted
-	case NodeStateFailed:
-		eventType = EventNodeFailed
-	case NodeStateSkipped:
-		eventType = EventNodeSkipped
-	case NodeStateCancelled:
-		eventType = EventNodeCancelled
-	default:
-		eventType = EventNodeCompleted
-	}
-
+func (e *Executor) emitNodeResultEvent(node *Node, result *NodeResult) {
 	e.emitEvent(&Event{
-		Type:      eventType,
+		Type:      nodeResultEventType(result.State),
 		DAGID:     e.dag.ID(),
 		NodeID:    node.ID(),
 		Timestamp: time.Now(),
@@ -509,6 +514,20 @@ func (e *Executor) recordNodeResult(node *Node, result *NodeResult) {
 			"duration": result.Duration,
 		},
 	})
+}
+
+var nodeStateToEventType = map[NodeState]EventType{
+	NodeStateSucceeded: EventNodeCompleted,
+	NodeStateFailed:    EventNodeFailed,
+	NodeStateSkipped:   EventNodeSkipped,
+	NodeStateCancelled: EventNodeCancelled,
+}
+
+func nodeResultEventType(state NodeState) EventType {
+	if et, ok := nodeStateToEventType[state]; ok {
+		return et
+	}
+	return EventNodeCompleted
 }
 
 func (e *Executor) markNodeBlocked(node *Node) {
@@ -553,13 +572,14 @@ func (e *Executor) cancelRemainingNodes(markCancelled bool) {
 	if e.cancel != nil {
 		e.cancel()
 	}
+	e.cancelNonTerminalNodes()
+}
 
+func (e *Executor) cancelNonTerminalNodes() {
 	for _, node := range e.dag.Nodes() {
-		state := node.State()
-		if state.IsTerminal() {
-			continue
+		if !node.State().IsTerminal() {
+			e.markNodeCancelled(node)
 		}
-		e.markNodeCancelled(node)
 	}
 }
 
@@ -634,31 +654,38 @@ func (e *Executor) Status() *DAGStatus {
 	}
 
 	nodeStates := e.dag.GetNodeStates()
-	nodesCompleted := 0
-	for _, state := range nodeStates {
-		if state.IsTerminal() {
-			nodesCompleted++
-		}
-	}
-
+	nodesCompleted := countTerminalNodes(nodeStates)
 	totalNodes := e.dag.NodeCount()
-	progress := float64(0)
-	if totalNodes > 0 {
-		progress = float64(nodesCompleted) / float64(totalNodes)
-	}
 
 	return &DAGStatus{
 		ID:             e.dag.ID(),
 		State:          e.state,
 		CurrentLayer:   e.currentLayer,
 		TotalLayers:    e.dag.LayerCount(),
-		Progress:       progress,
+		Progress:       calcProgress(nodesCompleted, totalNodes),
 		NodesTotal:     totalNodes,
 		NodesCompleted: nodesCompleted,
 		NodesRunning:   int(atomic.LoadInt32(&e.nodesRunning)),
 		NodeStates:     nodeStates,
 		StartTime:      e.startTime,
 	}
+}
+
+func countTerminalNodes(nodeStates map[string]NodeState) int {
+	count := 0
+	for _, state := range nodeStates {
+		if state.IsTerminal() {
+			count++
+		}
+	}
+	return count
+}
+
+func calcProgress(completed, total int) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(completed) / float64(total)
 }
 
 func (e *Executor) Subscribe(handler EventHandler) func() {

@@ -25,10 +25,10 @@ type Node struct {
 	metadata     map[string]any
 
 	// Runtime state
-	state       NodeState
-	result      *NodeResult
-	startTime   time.Time
-	retryCount  int
+	state      NodeState
+	result     *NodeResult
+	startTime  time.Time
+	retryCount int
 
 	// Computed
 	dependents []string // Nodes that depend on this node
@@ -291,13 +291,21 @@ func (n *Node) IsBlocked(nodeStates map[string]NodeState) bool {
 	n.mu.RUnlock()
 
 	for _, depID := range deps {
-		state, ok := nodeStates[depID]
-		if ok && (state == NodeStateFailed || state == NodeStateBlocked ||
-			state == NodeStateCancelled || state == NodeStateSkipped) {
+		if n.isDependencyBlocked(nodeStates, depID) {
 			return true
 		}
 	}
 	return false
+}
+
+func (n *Node) isDependencyBlocked(nodeStates map[string]NodeState, depID string) bool {
+	state, ok := nodeStates[depID]
+	return ok && isBlockingState(state)
+}
+
+func isBlockingState(state NodeState) bool {
+	return state == NodeStateFailed || state == NodeStateBlocked ||
+		state == NodeStateCancelled || state == NodeStateSkipped
 }
 
 // CanRetry returns true if the node can be retried

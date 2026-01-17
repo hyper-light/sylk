@@ -4,27 +4,20 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/messaging"
 )
 
-// StreamPublisher defines the interface for publishing stream messages to an event bus.
 type StreamPublisher interface {
-	// Publish sends a stream message to the event bus
-	Publish(msg *StreamMessage) error
-
-	// PublishControl sends a control message to the event bus
+	Publish(msg *messaging.Message[StreamChunk]) error
 	PublishControl(msg *StreamControlMessage) error
 }
 
-// StreamBridgeConfig contains configuration for the StreamBridge.
 type StreamBridgeConfig struct {
-	// ChunkBufferSize is the buffer size for the chunk channel
 	ChunkBufferSize int
-
-	// PublishTimeout is the maximum time to wait for a publish operation
-	PublishTimeout time.Duration
+	PublishTimeout  time.Duration
 }
 
-// DefaultStreamBridgeConfig returns a StreamBridgeConfig with sensible defaults.
 func DefaultStreamBridgeConfig() StreamBridgeConfig {
 	return StreamBridgeConfig{
 		ChunkBufferSize: 100,
@@ -60,7 +53,7 @@ func NewStreamBridge(publisher StreamPublisher, config StreamBridgeConfig) *Stre
 // StartStream begins streaming from a provider and publishes chunks to the event bus.
 func (b *StreamBridge) StartStream(
 	ctx context.Context,
-	provider Provider,
+	provider StreamProvider,
 	req *Request,
 	streamCtx *StreamContext,
 ) error {
@@ -83,7 +76,7 @@ func (b *StreamBridge) StartStream(
 // runStreamLoop reads chunks from the provider and publishes them.
 func (b *StreamBridge) runStreamLoop(
 	ctx context.Context,
-	provider Provider,
+	provider StreamProvider,
 	req *Request,
 	streamCtx *StreamContext,
 ) {

@@ -4,79 +4,70 @@ import (
 	"context"
 )
 
-// Provider defines the interface all LLM providers must implement.
-// Each provider handles its own client initialization and streaming logic.
-type Provider interface {
-	// Name returns the provider identifier (e.g., "anthropic", "openai", "google")
+type ModelInfo struct {
+	ID              string
+	Name            string
+	MaxContext      int
+	InputPricePerM  float64
+	OutputPricePerM float64
+}
+
+type ProviderAdapter interface {
 	Name() string
+	SupportedModels() []ModelInfo
+	Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error)
+	Stream(ctx context.Context, req *CompletionRequest) (<-chan *StreamChunk, error)
+	CountTokens(messages []Message) (int, error)
+	MaxContextTokens(model string) int
+	HealthCheck(ctx context.Context) error
+}
 
-	// Generate performs a non-streaming completion request
-	Generate(ctx context.Context, req *Request) (*Response, error)
+type Provider = ProviderAdapter
 
-	// Stream performs a streaming completion request, calling the handler for each chunk
-	Stream(ctx context.Context, req *Request, handler StreamHandler) error
-
-	// ValidateConfig checks if the provider configuration is valid
+type ProviderValidator interface {
 	ValidateConfig() error
+}
 
-	// SupportsModel checks if the provider supports the given model
+type ProviderModelSupporter interface {
 	SupportsModel(model string) bool
+}
 
-	// DefaultModel returns the provider's default model
-	DefaultModel() string
-
-	// Close cleans up any resources held by the provider
+type ProviderCloser interface {
 	Close() error
 }
 
-// StreamHandler is called for each chunk during streaming
+type StreamHandlerProvider interface {
+	StreamWithHandler(ctx context.Context, req *StreamRequest, handler StreamHandler) error
+}
+
+type CompletionRequest = Request
+
+type CompletionResponse = Response
+
 type StreamHandler func(chunk *StreamChunk) error
 
-// Request represents a completion request to any provider
+type StreamRequest = Request
+
 type Request struct {
-	// Messages is the conversation history
-	Messages []Message `json:"messages"`
-
-	// Model overrides the provider's default model (optional)
-	Model string `json:"model,omitempty"`
-
-	// MaxTokens overrides the provider's default max tokens (optional)
-	MaxTokens int `json:"max_tokens,omitempty"`
-
-	// Temperature controls randomness (0.0-1.0)
-	Temperature *float64 `json:"temperature,omitempty"`
-
-	// TopP controls nucleus sampling
-	TopP *float64 `json:"top_p,omitempty"`
-
-	// StopSequences are strings that stop generation
-	StopSequences []string `json:"stop_sequences,omitempty"`
-
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-
-	// SystemPrompt is the system instruction (some providers handle differently)
-	SystemPrompt string `json:"system_prompt,omitempty"`
-
-	// Tools available for the model to use
-	Tools []Tool `json:"tools,omitempty"`
-
-	// Metadata for tracking and logging
-	Metadata map[string]any `json:"metadata,omitempty"`
+	Messages        []Message      `json:"messages"`
+	Model           string         `json:"model,omitempty"`
+	MaxTokens       int            `json:"max_tokens,omitempty"`
+	Temperature     *float64       `json:"temperature,omitempty"`
+	TopP            *float64       `json:"top_p,omitempty"`
+	StopSequences   []string       `json:"stop_sequences,omitempty"`
+	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
+	SystemPrompt    string         `json:"system_prompt,omitempty"`
+	Tools           []Tool         `json:"tools,omitempty"`
+	Metadata        map[string]any `json:"metadata,omitempty"`
 }
 
-// Message represents a single message in a conversation
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
-
-	// ToolCalls contains tool invocations (for assistant messages)
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-
-	// ToolCallID links a tool result to its call (for tool messages)
-	ToolCallID string `json:"tool_call_id,omitempty"`
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
-// Role represents the message sender
 type Role string
 
 const (
@@ -86,42 +77,27 @@ const (
 	RoleTool      Role = "tool"
 )
 
-// Tool represents a tool/function the model can call
 type Tool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"` // JSON Schema
+	Parameters  map[string]any `json:"parameters"`
 }
 
-// ToolCall represents a tool invocation by the model
 type ToolCall struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
-	Arguments string `json:"arguments"` // JSON string
+	Arguments string `json:"arguments"`
 }
 
-// Response represents a completion response from any provider
 type Response struct {
-	// Content is the generated text
-	Content string `json:"content"`
-
-	// Model is the actual model used
-	Model string `json:"model"`
-
-	// StopReason indicates why generation stopped
-	StopReason StopReason `json:"stop_reason"`
-
-	// Usage contains token counts
-	Usage Usage `json:"usage"`
-
-	// ToolCalls if the model invoked tools
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-
-	// ProviderMetadata contains provider-specific response data
+	Content          string         `json:"content"`
+	Model            string         `json:"model"`
+	StopReason       StopReason     `json:"stop_reason"`
+	Usage            Usage          `json:"usage"`
+	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
 	ProviderMetadata map[string]any `json:"provider_metadata,omitempty"`
 }
 
-// StopReason indicates why generation stopped
 type StopReason string
 
 const (
@@ -132,15 +108,10 @@ const (
 	StopReasonError        StopReason = "error"
 )
 
-// Usage contains token usage information
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
-
-	// CacheReadTokens for providers that support prompt caching
-	CacheReadTokens int `json:"cache_read_tokens,omitempty"`
-
-	// CacheWriteTokens for providers that support prompt caching
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }

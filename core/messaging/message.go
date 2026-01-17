@@ -42,6 +42,8 @@ type Message[T any] struct {
 	// Routing
 	// ==========================================================================
 
+	SessionID string `json:"session_id"`
+
 	// Source is the agent that created this message
 	Source string `json:"source"`
 
@@ -109,6 +111,10 @@ type Message[T any] struct {
 
 	// ProcessedAt is when the message finished processing (success or failure)
 	ProcessedAt *time.Time `json:"processed_at,omitempty"`
+
+	StructuredIntent *StructuredIntent `json:"structured_intent,omitempty"`
+	ConfidenceChain  []ConfidenceEntry `json:"confidence_chain,omitempty"`
+	RerouteHistory   []RerouteHop      `json:"reroute_history,omitempty"`
 }
 
 // =============================================================================
@@ -117,6 +123,25 @@ type Message[T any] struct {
 
 // MessageType indicates the kind of message
 type MessageType string
+
+type StructuredIntent struct {
+	OriginalRequest string   `json:"original_request"`
+	KeyConstraints  []string `json:"key_constraints"`
+	SuccessCriteria []string `json:"success_criteria"`
+	IntentType      string   `json:"intent_type"`
+}
+
+type ConfidenceEntry struct {
+	Agent      string  `json:"agent"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+}
+
+type RerouteHop struct {
+	From   string `json:"from"`
+	Reason string `json:"reason"`
+	To     string `json:"to"`
+}
 
 const (
 	// Request is a request to be routed
@@ -247,6 +272,12 @@ func New[T any](msgType MessageType, source string, payload T) *Message[T] {
 	}
 }
 
+func NewWithSession[T any](msgType MessageType, source, sessionID string, payload T) *Message[T] {
+	msg := New(msgType, source, payload)
+	msg.SessionID = sessionID
+	return msg
+}
+
 // NewWithID creates a new Message with a specific ID
 func NewWithID[T any](id string, msgType MessageType, source string, payload T) *Message[T] {
 	return &Message[T]{
@@ -261,6 +292,12 @@ func NewWithID[T any](id string, msgType MessageType, source string, payload T) 
 	}
 }
 
+func NewWithIDAndSession[T any](id string, msgType MessageType, source, sessionID string, payload T) *Message[T] {
+	msg := NewWithID(id, msgType, source, payload)
+	msg.SessionID = sessionID
+	return msg
+}
+
 // =============================================================================
 // Builder Pattern
 // =============================================================================
@@ -268,6 +305,11 @@ func NewWithID[T any](id string, msgType MessageType, source string, payload T) 
 // WithCorrelation sets the correlation ID (for request-response linking)
 func (m *Message[T]) WithCorrelation(correlationID string) *Message[T] {
 	m.CorrelationID = correlationID
+	return m
+}
+
+func (m *Message[T]) WithSession(sessionID string) *Message[T] {
+	m.SessionID = sessionID
 	return m
 }
 
@@ -447,6 +489,9 @@ func (m *Message[T]) validateRequiredFields() error {
 	}
 	if m.Source == "" {
 		return &ValidationError{Field: "source", Message: "required"}
+	}
+	if m.SessionID == "" {
+		return &ValidationError{Field: "session_id", Message: "required"}
 	}
 	if m.Type == "" {
 		return &ValidationError{Field: "type", Message: "required"}
