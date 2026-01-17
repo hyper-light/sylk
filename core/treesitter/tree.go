@@ -62,21 +62,32 @@ func computeChildIndex(node *Node) int {
 	if parent == nil {
 		return 0
 	}
+	return countTypeIndexAmongSiblings(parent, node)
+}
 
+func countTypeIndexAmongSiblings(parent, node *Node) int {
 	count := parent.NamedChildCount()
 	nodeType := node.Type()
 	typeIndex := 0
 
 	for i := uint32(0); i < count; i++ {
 		child := parent.NamedChild(i)
-		if child.Type() == nodeType {
-			if isSameNode(child, node) {
-				return typeIndex
-			}
-			typeIndex++
+		typeIndex = updateTypeIndex(child, node, nodeType, typeIndex)
+		if typeIndex < 0 {
+			return -typeIndex - 1
 		}
 	}
 	return 0
+}
+
+func updateTypeIndex(child, node *Node, nodeType string, typeIndex int) int {
+	if child.Type() != nodeType {
+		return typeIndex
+	}
+	if isSameNode(child, node) {
+		return -typeIndex - 1
+	}
+	return typeIndex + 1
 }
 
 func isSameNode(a, b *Node) bool {
@@ -92,16 +103,20 @@ func extractNodeName(node *Node) string {
 }
 
 func findNameNode(node *Node) *Node {
-	nameNode := node.ChildByFieldName("name")
-	if nameNode != nil && !nameNode.IsNull() {
+	if nameNode := tryFieldName(node, "name"); nameNode != nil {
 		return nameNode
 	}
-
-	nameNode = node.ChildByFieldName("declarator")
-	if nameNode != nil && !nameNode.IsNull() {
-		return findIdentifier(nameNode)
+	if declNode := tryFieldName(node, "declarator"); declNode != nil {
+		return findIdentifier(declNode)
 	}
+	return nil
+}
 
+func tryFieldName(node *Node, field string) *Node {
+	child := node.ChildByFieldName(field)
+	if child != nil && !child.IsNull() {
+		return child
+	}
 	return nil
 }
 
@@ -121,18 +136,23 @@ func findIdentifier(node *Node) *Node {
 }
 
 func ResolveNodePath(tree *Tree, path *NodePath) (*Node, error) {
-	if tree == nil || path == nil || len(path.Segments) == 0 {
+	if !isValidTreePath(tree, path) {
 		return nil, ErrInvalidPath
 	}
+	return resolvePathSegments(tree.RootNode(), path.Segments[1:])
+}
 
-	node := tree.RootNode()
-	for i := 1; i < len(path.Segments); i++ {
-		node = resolveSegment(node, path.Segments[i])
+func isValidTreePath(tree *Tree, path *NodePath) bool {
+	return tree != nil && path != nil && len(path.Segments) > 0
+}
+
+func resolvePathSegments(node *Node, segments []PathSegment) (*Node, error) {
+	for _, seg := range segments {
+		node = resolveSegment(node, seg)
 		if node == nil || node.IsNull() {
 			return nil, ErrPathNotFound
 		}
 	}
-
 	return node, nil
 }
 
@@ -254,18 +274,18 @@ func parseIndex(s string) int {
 }
 
 func NodePathEquals(a, b *NodePath) bool {
-	if a == nil && b == nil {
-		return true
-	}
 	if a == nil || b == nil {
-		return false
+		return a == nil && b == nil
 	}
-	if len(a.Segments) != len(b.Segments) {
-		return false
-	}
+	return segmentsEqual(a.Segments, b.Segments)
+}
 
-	for i := range a.Segments {
-		if !segmentEquals(a.Segments[i], b.Segments[i]) {
+func segmentsEqual(a, b []PathSegment) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !segmentEquals(a[i], b[i]) {
 			return false
 		}
 	}
@@ -280,30 +300,40 @@ func NodePathOverlaps(a, b *NodePath) bool {
 	if a == nil || b == nil {
 		return false
 	}
+	return segmentsPrefixMatch(a.Segments, b.Segments)
+}
 
-	minLen := len(a.Segments)
-	if len(b.Segments) < minLen {
-		minLen = len(b.Segments)
-	}
-
+func segmentsPrefixMatch(a, b []PathSegment) bool {
+	minLen := minInt(len(a), len(b))
 	for i := 0; i < minLen; i++ {
-		if !segmentEquals(a.Segments[i], b.Segments[i]) {
+		if !segmentEquals(a[i], b[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-func (p *NodePath) IsAncestorOf(other *NodePath) bool {
-	if p == nil || other == nil {
-		return false
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-	if len(p.Segments) >= len(other.Segments) {
-		return false
-	}
+	return b
+}
 
-	for i := range p.Segments {
-		if !segmentEquals(p.Segments[i], other.Segments[i]) {
+func (p *NodePath) IsAncestorOf(other *NodePath) bool {
+	if !isValidAncestorCandidate(p, other) {
+		return false
+	}
+	return isPrefixOf(p.Segments, other.Segments)
+}
+
+func isValidAncestorCandidate(p, other *NodePath) bool {
+	return p != nil && other != nil && len(p.Segments) < len(other.Segments)
+}
+
+func isPrefixOf(prefix, full []PathSegment) bool {
+	for i := range prefix {
+		if !segmentEquals(prefix[i], full[i]) {
 			return false
 		}
 	}
