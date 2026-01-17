@@ -2858,75 +2858,75 @@ Provides universal AST parsing for 30+ languages with incremental parsing and us
 
 ---
 
-#### TS.3.1 TreeSitterManager (CVS Integration)
-- [ ] `TreeSitterManager` struct with Parser pool
-- [ ] `ComputeNodePath(tree, offset)` returns stable AST path
-- [ ] `ResolveNodePath(tree, path)` finds node from path
-- [ ] `ParseIncremental(oldVersion, newContent, edit)` returns new Tree
-- [ ] `GetEditFromOperation(op)` converts VFS operation to InputEdit
-- [ ] Integration with `Target` struct from FS.1.4:
-  - [ ] `Target.NodePath` populated by ComputeNodePath
-  - [ ] `Target.NodeType` from tree-sitter node type
-- [ ] Caching of parsed trees per FileVersion
-- [ ] Automatic language detection from file extension
-- [ ] Fallback to offset-based targeting for unknown languages
+#### TS.3.1 TreeSitterManager (CVS Integration) ✅
+- [x] `TreeSitterManager` struct with Parser pool
+- [x] `ComputeNodePath(tree, offset)` returns stable AST path
+- [x] `ResolveNodePath(tree, path)` finds node from path
+- [x] `ParseIncremental(oldVersion, newContent, edit)` returns new Tree
+- [x] `GetEditFromOperation(op)` converts VFS operation to InputEdit
+- [x] Integration with `Target` struct from FS.1.4:
+  - [x] `Target.NodePath` populated by ComputeNodePath
+  - [x] `Target.NodeType` from tree-sitter node type
+- [x] Caching of parsed trees per FileVersion
+- [x] Automatic language detection from file extension
+- [x] Fallback to offset-based targeting for unknown languages
 
 ---
 
-#### TS.4.1 TreeSitterTool (Agent Interface)
-- [ ] `TreeSitterTool` implements `Tool` interface
-- [ ] Registered as `ts_*` skill family
-- [ ] Operations:
-  - [ ] `parse` - Parse file and return AST
-  - [ ] `query` - Execute S-expression query
-  - [ ] `find_node` - Find node at position or path
-  - [ ] `extract_symbols` - Get all definitions
-  - [ ] `get_node_path` - Get stable path for node
-- [ ] Automatic grammar installation on first use
-- [ ] Permission: Read (file access for parsing)
-- [ ] Output format: JSON with node details
+#### TS.4.1 TreeSitterTool (Agent Interface) ✅
+- [x] `TreeSitterTool` implements `Tool` interface
+- [x] Registered as `ts_*` skill family
+- [x] Operations:
+  - [x] `parse` - Parse file and return AST
+  - [x] `query` - Execute S-expression query
+  - [x] `find_node` - Find node at position or path
+  - [x] `extract_symbols` - Get all definitions
+  - [x] `get_node_path` - Get stable path for node
+- [x] Automatic grammar installation on first use
+- [x] Permission: Read (file access for parsing)
+- [x] Output format: JSON with node details
 
-#### TS.4.2 Librarian Tree-Sitter Skills
-- [ ] `ts_parse` - Parse file and cache AST
-- [ ] `ts_query` - Execute pattern query
-- [ ] `ts_find_functions` - Find function definitions
-- [ ] `ts_find_types` - Find type/class/interface definitions
-- [ ] `ts_find_imports` - Find import statements
-- [ ] `ts_find_references` - Find symbol references
-- [ ] `ts_extract_symbols` - Extract all symbols with metadata
-- [ ] Integration with indexing for semantic search
+#### TS.4.2 Librarian Tree-Sitter Skills ✅
+- [x] `ts_parse` - Parse file and cache AST
+- [x] `ts_query` - Execute pattern query
+- [x] `ts_find_functions` - Find function definitions
+- [x] `ts_find_types` - Find type/class/interface definitions
+- [x] `ts_find_imports` - Find import statements
+- [x] `ts_find_references` - Find symbol references
+- [x] `ts_extract_symbols` - Extract all symbols with metadata
+- [x] Integration with indexing for semantic search
 
-#### TS.4.3 Engineer Tree-Sitter Skills
-- [ ] `ts_parse` - Parse for structure understanding
-- [ ] `ts_rename_symbol` - Find all occurrences for rename
-- [ ] `ts_extract_function` - Identify extractable code blocks
-- [ ] `ts_find_edit_targets` - Get stable targets for edits
-- [ ] `ts_get_node_at` - Get node at cursor position
-- [ ] Integration with versioned_write_file for AST-aware edits
+#### TS.4.3 Engineer Tree-Sitter Skills ✅
+- [x] `ts_parse` - Parse for structure understanding
+- [x] `ts_rename_symbol` - Find all occurrences for rename
+- [x] `ts_extract_function` - Identify extractable code blocks
+- [x] `ts_find_edit_targets` - Get stable targets for edits
+- [x] `ts_get_node_at` - Get node at cursor position
+- [x] Integration with versioned_write_file for AST-aware edits
 
-#### TS.4.4 Inspector Tree-Sitter Skills
-- [ ] `ts_complexity_analysis` - Calculate cyclomatic complexity
-- [ ] `ts_find_code_smells` - Detect patterns like deep nesting
-- [ ] `ts_validate_structure` - Check AST for errors
-- [ ] `ts_count_nodes` - Count nodes by type (metrics)
-- [ ] `ts_parse_errors` - Find syntax errors and recovery points
-- [ ] Integration with 8-Phase Validation System
+#### TS.4.4 Inspector Tree-Sitter Skills ✅
+- [x] `ts_complexity_analysis` - Calculate cyclomatic complexity
+- [x] `ts_find_code_smells` - Detect patterns like deep nesting
+- [x] `ts_validate_structure` - Check AST for errors
+- [x] `ts_count_nodes` - Count nodes by type (metrics)
+- [x] `ts_parse_errors` - Find syntax errors and recovery points
+- [x] Integration with 8-Phase Validation System
 
-#### TS.4.5 Tester Tree-Sitter Skills
-- [ ] `ts_discover_tests` - Find test functions/classes
-- [ ] `ts_find_testable_functions` - Identify untested functions
-- [ ] `ts_analyze_test_structure` - Analyze test organization
-- [ ] `ts_find_assertions` - Find assertion statements
-- [ ] `ts_match_tests_to_functions` - Map tests to implementations
-- [ ] Integration with 6-Category Test System
+#### TS.4.5 Tester Tree-Sitter Skills ✅
+- [x] `ts_discover_tests` - Find test functions/classes
+- [x] `ts_find_testable_functions` - Identify untested functions
+- [x] `ts_analyze_test_structure` - Analyze test organization
+- [x] `ts_find_assertions` - Find assertion statements
+- [x] `ts_match_tests_to_functions` - Map tests to implementations
+- [x] Integration with 6-Category Test System
 
-#### TS.4.6 Designer Tree-Sitter Skills
-- [ ] `ts_extract_components` - Find React/Vue/Svelte components
-- [ ] `ts_analyze_jsx` - Analyze JSX structure
-- [ ] `ts_find_styles` - Find CSS-in-JS/styled components
-- [ ] `ts_extract_props` - Extract component props/interfaces
-- [ ] `ts_find_hooks` - Find React hooks usage
-- [ ] `ts_analyze_accessibility` - Find a11y attributes
+#### TS.4.6 Designer Tree-Sitter Skills ✅
+- [x] `ts_extract_components` - Find React/Vue/Svelte components
+- [x] `ts_analyze_jsx` - Analyze JSX structure
+- [x] `ts_find_styles` - Find CSS-in-JS/styled components
+- [x] `ts_extract_props` - Extract component props/interfaces
+- [x] `ts_find_hooks` - Find React hooks usage
+- [x] `ts_analyze_accessibility` - Find a11y attributes
 
 ---
 
