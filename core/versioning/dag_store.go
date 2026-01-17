@@ -124,17 +124,21 @@ func (s *MemoryDAGStore) GetHistory(filePath string, limit int) ([]*FileVersion,
 }
 
 func (s *MemoryDAGStore) collectVersionsReverse(ids []VersionID, limit int) []*FileVersion {
-	count := len(ids)
-	if limit > 0 && limit < count {
-		count = limit
-	}
-
+	count := s.effectiveLimit(len(ids), limit)
 	versions := make([]*FileVersion, 0, count)
+
 	for i := len(ids) - 1; i >= 0 && len(versions) < count; i-- {
 		clone := s.versions[ids[i]].Clone()
 		versions = append(versions, &clone)
 	}
 	return versions
+}
+
+func (s *MemoryDAGStore) effectiveLimit(total, limit int) int {
+	if limit > 0 && limit < total {
+		return limit
+	}
+	return total
 }
 
 func (s *MemoryDAGStore) GetChildren(id VersionID) ([]*FileVersion, error) {
@@ -173,30 +177,52 @@ func (s *MemoryDAGStore) traverseAncestors(start *FileVersion, depth int) []*Fil
 		return nil
 	}
 
-	ancestors := make([]*FileVersion, 0)
-	visited := make(map[VersionID]bool)
-	queue := start.Parents
-
-	for len(queue) > 0 && (depth < 0 || len(ancestors) < depth) {
-		parentID := queue[0]
-		queue = queue[1:]
-
-		if visited[parentID] {
-			continue
-		}
-		visited[parentID] = true
-
-		parent, ok := s.versions[parentID]
-		if !ok {
-			continue
-		}
-
-		clone := parent.Clone()
-		ancestors = append(ancestors, &clone)
-		queue = append(queue, parent.Parents...)
+	ctx := &ancestorContext{
+		ancestors: make([]*FileVersion, 0),
+		visited:   make(map[VersionID]bool),
+		queue:     start.Parents,
+		depth:     depth,
 	}
 
-	return ancestors
+	for ctx.hasWork() {
+		s.processNextAncestor(ctx)
+	}
+
+	return ctx.ancestors
+}
+
+type ancestorContext struct {
+	ancestors []*FileVersion
+	visited   map[VersionID]bool
+	queue     []VersionID
+	depth     int
+}
+
+func (c *ancestorContext) hasWork() bool {
+	return len(c.queue) > 0 && (c.depth < 0 || len(c.ancestors) < c.depth)
+}
+
+func (s *MemoryDAGStore) processNextAncestor(ctx *ancestorContext) {
+	parentID := ctx.queue[0]
+	ctx.queue = ctx.queue[1:]
+
+	if ctx.visited[parentID] {
+		return
+	}
+	ctx.visited[parentID] = true
+
+	s.addAncestorIfExists(ctx, parentID)
+}
+
+func (s *MemoryDAGStore) addAncestorIfExists(ctx *ancestorContext, parentID VersionID) {
+	parent, ok := s.versions[parentID]
+	if !ok {
+		return
+	}
+
+	clone := parent.Clone()
+	ctx.ancestors = append(ctx.ancestors, &clone)
+	ctx.queue = append(ctx.queue, parent.Parents...)
 }
 
 func (s *MemoryDAGStore) Has(id VersionID) bool {

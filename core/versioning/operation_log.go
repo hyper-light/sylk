@@ -90,17 +90,21 @@ func (l *MemoryOperationLog) GetByFile(filePath string, limit int) ([]*Operation
 }
 
 func (l *MemoryOperationLog) collectOperationsWithLimit(indices []int, limit int) []*Operation {
-	count := len(indices)
-	if limit > 0 && limit < count {
-		count = limit
-	}
-
+	count := effectiveOpLimit(len(indices), limit)
 	ops := make([]*Operation, 0, count)
+
 	for i := len(indices) - 1; i >= 0 && len(ops) < count; i-- {
 		op := l.operations[indices[i]].Clone()
 		ops = append(ops, &op)
 	}
 	return ops
+}
+
+func effectiveOpLimit(total, limit int) int {
+	if limit > 0 && limit < total {
+		return limit
+	}
+	return total
 }
 
 func (l *MemoryOperationLog) GetSince(versionID VersionID, filePath string) ([]*Operation, error) {

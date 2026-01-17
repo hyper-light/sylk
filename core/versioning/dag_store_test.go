@@ -216,11 +216,11 @@ func TestMemoryDAGStore_GetHistory(t *testing.T) {
 func TestMemoryDAGStore_GetChildren(t *testing.T) {
 	t.Run("returns child versions", func(t *testing.T) {
 		store := NewMemoryDAGStore()
-		parent := createTestVersion("test.go", nil)
+		parent := createTestVersionWithContent("test.go", nil, "parent")
 		store.Add(parent)
 
-		child1 := createTestVersion("test.go", []VersionID{parent.ID})
-		child2 := createTestVersion("test.go", []VersionID{parent.ID})
+		child1 := createTestVersionWithContent("test.go", []VersionID{parent.ID}, "child1")
+		child2 := createTestVersionWithContent("test.go", []VersionID{parent.ID}, "child2")
 		store.Add(child1)
 		store.Add(child2)
 
@@ -295,15 +295,15 @@ func TestMemoryDAGStore_GetAncestors(t *testing.T) {
 
 	t.Run("handles merge commits", func(t *testing.T) {
 		store := NewMemoryDAGStore()
-		v1 := createTestVersion("test.go", nil)
+		v1 := createTestVersionWithContent("test.go", nil, "v1")
 		store.Add(v1)
 
-		v2a := createTestVersion("test.go", []VersionID{v1.ID})
-		v2b := createTestVersion("test.go", []VersionID{v1.ID})
+		v2a := createTestVersionWithContent("test.go", []VersionID{v1.ID}, "v2a")
+		v2b := createTestVersionWithContent("test.go", []VersionID{v1.ID}, "v2b")
 		store.Add(v2a)
 		store.Add(v2b)
 
-		merge := createTestVersion("test.go", []VersionID{v2a.ID, v2b.ID})
+		merge := createTestVersionWithContent("test.go", []VersionID{v2a.ID, v2b.ID}, "merge")
 		store.Add(merge)
 
 		ancestors, _ := store.GetAncestors(merge.ID, -1)
@@ -386,6 +386,18 @@ func createTestVersion(filePath string, parents []VersionID) FileVersion {
 	return NewFileVersion(
 		filePath,
 		[]byte("content-"+filePath),
+		parents,
+		nil,
+		"pipeline-1",
+		"session-1",
+		VectorClock{"session-1": 1},
+	)
+}
+
+func createTestVersionWithContent(filePath string, parents []VersionID, content string) FileVersion {
+	return NewFileVersion(
+		filePath,
+		[]byte(content),
 		parents,
 		nil,
 		"pipeline-1",
