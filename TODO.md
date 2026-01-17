@@ -5075,43 +5075,43 @@ Hierarchical token budget enforcement with full attribution.
 **Acceptance Criteria:**
 
 #### Budget Hierarchy
-- [ ] `TokenBudget` struct with: GlobalLimit, SessionLimits map, TaskLimits map, ProviderLimits map
-- [ ] Limits are `int64` (-1 = unlimited)
-- [ ] `CheckBudget(req *LLMRequest) error` checks all applicable limits
-- [ ] Return specific error: ErrGlobalBudgetExceeded, ErrSessionBudgetExceeded, ErrTaskBudgetExceeded, ErrProviderBudgetExceeded
+- [x] `TokenBudget` struct with: GlobalLimit, SessionLimits map, TaskLimits map, ProviderLimits map
+- [x] Limits are `int64` (-1 = unlimited)
+- [x] `CheckBudget(req *LLMRequest) error` checks all applicable limits
+- [x] Return specific error: ErrGlobalBudgetExceeded, ErrSessionBudgetExceeded, ErrTaskBudgetExceeded, ErrProviderBudgetExceeded
 
 #### Usage Tracker
-- [ ] `UsageTracker` stores all usage records
-- [ ] `UsageRecord` struct: Timestamp, SessionID, PipelineID, TaskID, AgentID, AgentType, Provider, Model, InputTokens, OutputTokens, TotalTokens, Cost, Currency, Latency
-- [ ] `Record(record UsageRecord)` adds record
-- [ ] Thread-safe operations
+- [x] `UsageTracker` stores all usage records
+- [x] `UsageRecord` struct: Timestamp, SessionID, PipelineID, TaskID, AgentID, AgentType, Provider, Model, InputTokens, OutputTokens, TotalTokens, Cost, Currency, Latency
+- [x] `Record(record UsageRecord)` adds record
+- [x] Thread-safe operations
 
 #### Aggregation Queries
-- [ ] `TotalTokens() int64` - global total
-- [ ] `TokensBySession(sessionID string) int64`
-- [ ] `TokensByTask(taskID string) int64`
-- [ ] `TokensByProvider(provider string) int64`
-- [ ] `TokensByAgent(agentType AgentType) int64`
-- [ ] Use cached aggregates for O(1) lookups
+- [x] `TotalTokens() int64` - global total
+- [x] `TokensBySession(sessionID string) int64`
+- [x] `TokensByTask(taskID string) int64`
+- [x] `TokensByProvider(provider string) int64`
+- [x] `TokensByAgent(agentType AgentType) int64`
+- [x] Use cached aggregates for O(1) lookups
 
 #### Cost Calculation
-- [ ] Cost = (InputTokens / 1M * InputPrice) + (OutputTokens / 1M * OutputPrice)
+- [x] Cost = (InputTokens / 1M * InputPrice) + (OutputTokens / 1M * OutputPrice)
 - [ ] Price loaded from `ModelInfo` in adapter
-- [ ] Currency always USD
+- [x] Currency always USD
 
 #### Attribution Report
-- [ ] `AttributionReport` struct: SessionID, Period, TotalRequests, TotalTokens, TotalCost
-- [ ] Breakdown by: Provider, Agent, Pipeline, Task
-- [ ] Each breakdown includes: Requests, InputTokens, OutputTokens, TotalCost
-- [ ] `GenerateReport(filter UsageFilter) *AttributionReport`
+- [x] `AttributionReport` struct: SessionID, Period, TotalRequests, TotalTokens, TotalCost
+- [x] Breakdown by: Provider, Agent, Pipeline, Task
+- [x] Each breakdown includes: Requests, InputTokens, OutputTokens, TotalCost
+- [x] `GenerateReport(filter UsageFilter) *AttributionReport`
 
 **Tests:**
-- [ ] Budget check fails when limit exceeded
-- [ ] Hierarchical limits checked in order
-- [ ] Usage recorded correctly
-- [ ] Aggregates match sum of records
-- [ ] Cost calculation matches expected
-- [ ] Attribution report accurate
+- [x] Budget check fails when limit exceeded
+- [x] Hierarchical limits checked in order
+- [x] Usage recorded correctly
+- [x] Aggregates match sum of records
+- [x] Cost calculation matches expected
+- [x] Attribution report accurate
 
 ```go
 // Required interfaces
@@ -5150,39 +5150,39 @@ Smart context management with overflow handling.
 **Acceptance Criteria:**
 
 #### Context Manager
-- [ ] `ContextManager` struct: model, maxContextTokens, reserveTokens (for response)
-- [ ] `PrepareContext(messages []Message, query string) ([]Message, error)`
-- [ ] If fits → return as-is
-- [ ] If overflow → apply strategies in order
+- [x] `ContextManager` struct: model, maxContextTokens, reserveTokens (for response)
+- [x] `PrepareContext(messages []Message, query string) ([]Message, error)`
+- [x] If fits → return as-is
+- [x] If overflow → apply strategies in order
 
 #### Strategy 1: Smart Selection
-- [ ] `selectRelevant(messages, query, maxTokens)` keeps semantically relevant
-- [ ] Score messages by relevance to current query
-- [ ] Keep highest-scoring messages that fit budget
-- [ ] Preserve original message order in output
+- [x] `selectRelevant(messages, query, maxTokens)` keeps semantically relevant
+- [x] Score messages by relevance to current query
+- [x] Keep highest-scoring messages that fit budget
+- [x] Preserve original message order in output
 
 #### Strategy 2: Archivalist Handoff
-- [ ] Store overflow messages in Archivalist: `archivalist.StoreContextOverflow(messages)`
-- [ ] Messages available for RAG retrieval later
-- [ ] Log handoff for debugging
+- [x] Store overflow messages in Archivalist: `archivalist.StoreContextOverflow(messages)`
+- [x] Messages available for RAG retrieval later
+- [x] Log handoff for debugging
 
 #### Strategy 3: Summarization
-- [ ] Use agent compactor to summarize overflow
-- [ ] Insert summary as system message: "[Context summary of N earlier messages] ..."
-- [ ] Preserve recent messages after summary
+- [x] Use agent compactor to summarize overflow
+- [x] Insert summary as system message: "[Context summary of N earlier messages] ..."
+- [x] Preserve recent messages after summary
 
 #### Context Reconstruction
-- [ ] Final context: SystemPrompt + Summary (if any) + RecentMessages
-- [ ] Total tokens must fit within available budget
-- [ ] Return error if even minimal context exceeds budget
+- [x] Final context: SystemPrompt + Summary (if any) + RecentMessages
+- [x] Total tokens must fit within available budget
+- [x] Return error if even minimal context exceeds budget
 
 **Tests:**
-- [ ] Small context returned unchanged
-- [ ] Large context triggers smart selection
-- [ ] Overflow stored in Archivalist
-- [ ] Summary generated for excess
-- [ ] Final context within token budget
-- [ ] Message order preserved
+- [x] Small context returned unchanged
+- [x] Large context triggers smart selection
+- [x] Overflow stored in Archivalist
+- [x] Summary generated for excess
+- [x] Final context within token budget
+- [x] Message order preserved
 
 ```go
 // Required interface
@@ -6248,39 +6248,39 @@ Implements per-component memory budgets with token-weighted eviction.
 **Acceptance Criteria:**
 
 #### Per-Component Budgets
-- [ ] `MemoryMonitor` struct tracks all components
-- [ ] `ComponentMemory` struct per component
-- [ ] Configurable budgets: QueryCache, Staging, AgentContext, WAL
-- [ ] Defaults: 500MB, 1GB, 500MB, 200MB
+- [x] `MemoryMonitor` struct tracks all components
+- [x] `ComponentMemory` struct per component
+- [x] Configurable budgets: QueryCache, Staging, AgentContext, WAL
+- [x] Defaults: 500MB, 1GB, 500MB, 200MB
 
 #### Global Ceiling
-- [ ] Configurable global_ceiling_percent (default: 80%)
-- [ ] Calculate from system available memory
-- [ ] Query system memory periodically
+- [x] Configurable global_ceiling_percent (default: 80%)
+- [x] Calculate from system available memory
+- [x] Query system memory periodically
 
 #### Eviction Cascade
-- [ ] 70% component → LRU eviction
-- [ ] 90% component → aggressive eviction + warn user
-- [ ] 80% global → pause new pipelines + cross-component eviction
-- [ ] 95% global → pause ALL + emergency eviction + notify user
+- [x] 70% component → LRU eviction
+- [x] 90% component → aggressive eviction + warn user
+- [x] 80% global → pause new pipelines + cross-component eviction
+- [x] 95% global → pause ALL + emergency eviction + notify user
 
 #### Token-Weighted Eviction (QueryCache)
-- [ ] `EvictionScore = TokenCost / MemorySize * RecencyFactor`
-- [ ] High token cost entries evicted LAST
-- [ ] Recency factor decays over hours
-- [ ] Sort by score, evict lowest first
+- [x] `EvictionScore = TokenCost / MemorySize * RecencyFactor`
+- [x] High token cost entries evicted LAST
+- [x] Recency factor decays over hours
+- [x] Sort by score, evict lowest first
 
 #### Monitoring Loop
-- [ ] Background goroutine checks at configurable interval (default: 1s)
-- [ ] Publish signals on threshold crossings
-- [ ] Never crash, never OOM
+- [x] Background goroutine checks at configurable interval (default: 1s)
+- [x] Publish signals on threshold crossings
+- [x] Never crash, never OOM
 
 **Tests:**
-- [ ] Component budgets enforced
-- [ ] Global ceiling enforced
-- [ ] Token-weighted eviction correct
-- [ ] Eviction cascade triggers at thresholds
-- [ ] Signals published correctly
+- [x] Component budgets enforced
+- [x] Global ceiling enforced
+- [x] Token-weighted eviction correct
+- [x] Eviction cascade triggers at thresholds
+- [x] Signals published correctly
 
 ---
 
@@ -6299,42 +6299,42 @@ Implements file handle, network, and subprocess pools with user reservation.
 **Acceptance Criteria:**
 
 #### Generic Resource Pool
-- [ ] `ResourcePool` struct: total, userReserved, available, waitQueue
-- [ ] `AcquireUser(ctx) (*ResourceHandle, error)` - never fails
-- [ ] `AcquirePipeline(ctx, priority) (*ResourceHandle, error)` - may queue
-- [ ] `Release(handle)` - returns to pool
+- [x] `ResourcePool` struct: total, userReserved, available, waitQueue
+- [x] `AcquireUser(ctx) (*ResourceHandle, error)` - never fails
+- [x] `AcquirePipeline(ctx, priority) (*ResourceHandle, error)` - may queue
+- [x] `Release(handle)` - returns to pool
 
 #### User Reservation
-- [ ] Configurable user_reserved_percent (default: 20%)
-- [ ] User requests ALWAYS succeed (use reserved or preempt)
-- [ ] Preemption signals lowest-priority pipeline to pause
+- [x] Configurable user_reserved_percent (default: 20%)
+- [x] User requests ALWAYS succeed (use reserved or preempt)
+- [x] Preemption signals lowest-priority pipeline to pause
 
 #### Pipeline Queuing
-- [ ] Priority queue for waiting pipelines
-- [ ] Configurable pipeline_wait_timeout (default: 30s)
-- [ ] Timeout returns error (pipeline retries or fails)
+- [x] Priority queue for waiting pipelines
+- [x] Configurable pipeline_wait_timeout (default: 30s)
+- [x] Timeout returns error (pipeline retries or fails)
 
 #### File Handle Pool
-- [ ] Query OS ulimit on startup
-- [ ] Use configurable percentage (default: 50%)
-- [ ] Track per-handle for leak detection
+- [x] Query OS ulimit on startup
+- [x] Use configurable percentage (default: 50%)
+- [x] Track per-handle for leak detection
 
 #### Network Connection Pool
-- [ ] Per-provider limit (default: 10)
-- [ ] Global limit (default: 50)
-- [ ] Connection reuse where possible
+- [x] Per-provider limit (default: 10)
+- [x] Global limit (default: 50)
+- [x] Connection reuse where possible
 
 #### Subprocess Pool
-- [ ] Max = multiplier × N_CPU_CORES (default: 2×)
-- [ ] Track process IDs for cleanup
+- [x] Max = multiplier × N_CPU_CORES (default: 2×)
+- [x] Track process IDs for cleanup
 
 **Tests:**
-- [ ] User acquisition never fails
-- [ ] User preempts pipeline when needed
-- [ ] Pipeline queuing works
-- [ ] Timeout returns error
-- [ ] Pool sizes respect config
-- [ ] Release returns resources correctly
+- [x] User acquisition never fails
+- [x] User preempts pipeline when needed
+- [x] Pipeline queuing works
+- [x] Timeout returns error
+- [x] Pool sizes respect config
+- [x] Release returns resources correctly
 
 ---
 
@@ -6350,33 +6350,33 @@ Implements auto-scaling disk quota with bounded percentage.
 **Acceptance Criteria:**
 
 #### Quota Calculation
-- [ ] `DiskQuotaManager` struct
-- [ ] `CalculateQuota() int64` - returns effective quota
-- [ ] Formula: `max(quota_min, min(quota_max, free_space * quota_percent))`
-- [ ] Defaults: min=1GB, max=20GB, percent=10%
+- [x] `DiskQuotaManager` struct
+- [x] `CalculateQuota() int64` - returns effective quota
+- [x] Formula: `max(quota_min, min(quota_max, free_space * quota_percent))`
+- [x] Defaults: min=1GB, max=20GB, percent=10%
 
 #### Usage Tracking
-- [ ] `CanWrite(size int64) bool`
-- [ ] `RecordWrite(size int64) error`
-- [ ] `RecordDelete(size int64)`
-- [ ] Periodic disk scan to reconcile actual vs tracked
+- [x] `CanWrite(size int64) bool`
+- [x] `RecordWrite(size int64) error`
+- [x] `RecordDelete(size int64)`
+- [x] Periodic disk scan to reconcile actual vs tracked
 
 #### Thresholds
-- [ ] Warning at 80% (configurable)
-- [ ] Cleanup trigger at 90% (configurable)
-- [ ] Publish signals at thresholds
+- [x] Warning at 80% (configurable)
+- [x] Cleanup trigger at 90% (configurable)
+- [x] Publish signals at thresholds
 
 #### Cleanup
-- [ ] `TriggerCleanup()` - remove old data
-- [ ] Priority: temp files, old WAL segments, old checkpoints, old staging
-- [ ] Never delete active session data
+- [x] `TriggerCleanup()` - remove old data
+- [x] Priority: temp files, old WAL segments, old checkpoints, old staging
+- [x] Never delete active session data
 
 **Tests:**
-- [ ] Quota calculation respects bounds
-- [ ] Usage tracking accurate
-- [ ] Thresholds trigger signals
-- [ ] Cleanup removes correct files
-- [ ] Quota adjusts to available space
+- [x] Quota calculation respects bounds
+- [x] Usage tracking accurate
+- [x] Thresholds trigger signals
+- [x] Cleanup removes correct files
+- [x] Quota adjusts to available space
 
 ---
 
@@ -20481,12 +20481,12 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 1C: Resource Management                                           ││
-│ │ • 0.13 Token Budget Manager                                                      ││
-│ │ • 0.14 Context Window Manager                                                    ││
-│ │ • 0.33 Memory Monitor                                                            ││
-│ │ • 0.34 Resource Pools                                                            ││
-│ │ • 0.35 Disk Quota Manager                                                        ││
+│ │ PARALLEL GROUP 1C: Resource Management (DONE)                                    ││
+│ │ • 0.13 Token Budget Manager (DONE)                                               ││
+│ │ • 0.14 Context Window Manager (DONE)                                             ││
+│ │ • 0.33 Memory Monitor (DONE)                                                     ││
+│ │ • 0.34 Resource Pools (DONE)                                                     ││
+│ │ • 0.35 Disk Quota Manager (DONE)                                                 ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
