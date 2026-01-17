@@ -19730,6 +19730,10 @@ BEFORE writing any tests, you MUST thoroughly examine the implementation code to
 
 Your test plan must be DERIVED from implementation analysis, not from a generic template.
 
+You MUST consult with the librarian to understand existing test tooling and mocking tooling and if they exist, you MUST use them according to how they're used in any exiting tests.
+
+If the user specifies test or mock tooling, you MUST use it.
+
 ## Test Categories (Apply Based on Implementation Analysis)
 
 Every implementation MUST have tests in applicable categories. Categories 5 and 6 are
