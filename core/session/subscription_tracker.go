@@ -47,7 +47,7 @@ type UsageStatus struct {
 	RequestsRemaining    *int64    `json:"requests_remaining"`
 	TokensRemaining      *int64    `json:"tokens_remaining"`
 	WarningLevel         int       `json:"warning_level"`
-	PreviousWarningLevel int       `json:"-"`
+	PreviousWarningLevel int       `json:"previous_warning_level"`
 	PeriodEndsAt         time.Time `json:"period_ends_at"`
 }
 
@@ -62,8 +62,9 @@ type GlobalSubscriptionTracker struct {
 	config           SubscriptionConfig
 	signalDispatcher *SignalDispatcher
 
-	mu     sync.RWMutex
-	closed bool
+	mu           sync.RWMutex
+	closed       bool
+	lastWarnings map[string]int
 }
 
 func NewGlobalSubscriptionTracker(cfg GlobalSubscriptionTrackerConfig) (*GlobalSubscriptionTracker, error) {
@@ -87,6 +88,7 @@ func NewGlobalSubscriptionTracker(cfg GlobalSubscriptionTrackerConfig) (*GlobalS
 		db:               db,
 		config:           cfg.Config,
 		signalDispatcher: cfg.SignalDispatcher,
+		lastWarnings:     make(map[string]int),
 	}, nil
 }
 
@@ -153,6 +155,7 @@ func (t *GlobalSubscriptionTracker) RecordUsage(ctx context.Context, provider, s
 		return nil, err
 	}
 
+	t.updateWarningLevel(status)
 	t.maybeBroadcastWarning(status)
 	return status, nil
 }
@@ -325,6 +328,11 @@ func (t *GlobalSubscriptionTracker) isTokensOverThreshold(usage *UsageStatus, li
 	return float64(usage.TokensUsed) >= float64(*limit.MaxTokens)*threshold
 }
 
+func (t *GlobalSubscriptionTracker) updateWarningLevel(status *UsageStatus) {
+	status.PreviousWarningLevel = t.lastWarnings[status.Provider]
+	t.lastWarnings[status.Provider] = status.WarningLevel
+}
+
 func (t *GlobalSubscriptionTracker) maybeBroadcastWarning(status *UsageStatus) {
 	if status.WarningLevel <= status.PreviousWarningLevel {
 		return
@@ -371,6 +379,8 @@ func (t *GlobalSubscriptionTracker) ResetUsage(ctx context.Context, provider str
 	if err != nil {
 		return fmt.Errorf("failed to reset usage: %w", err)
 	}
+
+	delete(t.lastWarnings, provider)
 	return nil
 }
 
@@ -382,6 +392,9 @@ func (t *GlobalSubscriptionTracker) Close() error {
 		return ErrSubscriptionTrackerClosed
 	}
 	t.closed = true
+	for key := range t.lastWarnings {
+		delete(t.lastWarnings, key)
+	}
 
 	if t.db != nil {
 		return t.db.Close()
