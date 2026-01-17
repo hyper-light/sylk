@@ -281,8 +281,8 @@ const (
 	// MessageTypeForward is a classified request forwarded to target
 	MessageTypeForward MessageType = "forward"
 
-	// MessageTypeResponse is a response from a target agent
 	MessageTypeResponse MessageType = "response"
+	MessageTypeStream   MessageType = "stream"
 
 	// MessageTypeAck is a lightweight acknowledgment for fire-and-forget requests.
 	// Sent immediately upon receipt, before processing begins.
@@ -797,6 +797,11 @@ func (m *Message) GetForwardedRequest() (*ForwardedRequest, bool) {
 // GetRouteResponse extracts RouteResponse from message payload
 func (m *Message) GetRouteResponse() (*RouteResponse, bool) {
 	resp, ok := m.Payload.(*RouteResponse)
+	return resp, ok
+}
+
+func (m *Message) GetStreamResponse() (*StreamResponse, bool) {
+	resp, ok := m.Payload.(*StreamResponse)
 	return resp, ok
 }
 

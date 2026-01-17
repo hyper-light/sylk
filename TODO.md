@@ -875,6 +875,1170 @@ Phase 3 (AFTER Phase 2):
 - [ ] Multi-option question support
 - [ ] Integration with plan mode workflow
 
+---
+
+## Plan Mode Implementation
+
+**Reference**: See ARCHITECTURE.md "Plan Mode Architecture" section for detailed specifications.
+
+### PM.1 Core Plan Package Types
+
+**Files to create:**
+- `core/plan/types.go`
+
+**Acceptance Criteria:**
+
+- [ ] `PlanState` type with constants: `IDLE`, `EXPLORING`, `DRAFTING`, `AWAITING_APPROVAL`, `APPROVED`, `EXECUTING`, `COMPLETED`, `FAILED`
+- [ ] `PlanContext` struct with SessionID, State, CurrentPlan, Todos, PlanHistory, ExecutionState, CreatedAt, UpdatedAt
+- [ ] `Plan` struct with ID, Title, Overview, FilesToModify, Steps, Considerations, AllowedPrompts, Version, CreatedAt, CreatedBy
+- [ ] `FileChange` struct with Path, Action ("create", "modify", "delete"), Description
+- [ ] `PlanStep` struct with Index, Description, Agent, DependsOn ([]int), Layer (computed), Estimated
+- [ ] `TopologicalLayer` struct with Layer (int), Steps ([]PlanStep)
+- [ ] `AllowedPrompt` struct with Tool, Prompt
+- [ ] `PlanVersion` struct with Version, Plan, Reason, CreatedAt
+- [ ] `TodoItem` struct with Content, ActiveForm, Status, StepIndex
+- [ ] `TodoStatus` type with constants: `pending`, `in_progress`, `completed`
+- [ ] `ExecutionState` struct with DAGID, CompletedSteps, CurrentStep, FailedStep, FailureReason, StartedAt, StepResults
+- [ ] `StepResult` struct with StepIndex, Status, Output, Error, CompletedAt
+
+### PM.2 Topological Layer Computation
+
+**Files to create:**
+- `core/plan/topology.go`
+
+**Acceptance Criteria:**
+
+- [ ] `ComputeTopologicalLayers(steps []PlanStep) []TopologicalLayer` - Kahn's algorithm variant
+- [ ] `computeStepLayer(idx int, steps map[int]*PlanStep, computed map[int]int) int` - recursive layer computation
+- [ ] Layer 0 contains steps with no dependencies
+- [ ] Layer N contains steps whose dependencies are all in layers < N
+- [ ] Steps in same layer can execute concurrently
+- [ ] Function modifies step.Layer field in-place
+- [ ] Cycle detection returns error for circular dependencies
+- [ ] Unit test: linear chain (A→B→C) produces layers [0], [1], [2]
+- [ ] Unit test: parallel roots (A, B, C) produces single layer [0, 1, 2]
+- [ ] Unit test: diamond pattern (A→B, A→C, B→D, C→D) produces layers [0], [1, 2], [3]
+- [ ] Unit test: complex DAG with mixed dependencies
+- [ ] Unit test: cycle detection raises error
+
+### PM.3 Plan Storage
+
+**Files to create:**
+- `core/plan/storage.go`
+- `core/plan/slugify.go`
+
+**Storage Location:** `~/.sylk/projects/{project_hash}/plans/{plan_slug}/`
+
+Plans are stored in user space indexed by project hash. This ensures:
+- Plans persist across sessions (not tied to ephemeral session lifecycle)
+- No pollution of project directory (user-private, not committed to git)
+- Project-aware organization via consistent hashing
+
+**Directory Structure:**
+```
+~/.sylk/
+├── sessions/{session_id}/              ← Ephemeral (existing)
+│   └── active_plan.txt                 ← Pointer: "implement-user-auth"
+│
+└── projects/{project_hash}/            ← Persistent per-project
+    ├── project_info.json               ← { path, hash, created_at }
+    ├── plans/
+    │   └── {plan_slug}/                ← e.g., "implement-user-auth"
+    │       ├── metadata.json           ← Version history, change sets
+    │       ├── context.json            ← Current PlanContext
+    │       ├── todos.json              ← Todo list state
+    │       ├── current.md              ← Copy of HEAD version
+    │       ├── v1.md                   ← Version 1
+    │       ├── v2.md                   ← Version 2
+    │       └── checkpoints/
+    │           └── v1_step3.json       ← Execution snapshots
+    └── archived/
+        └── {old_plan_slug}/
+            ├── *.md, *.json
+            └── outcome.json            ← Final result
+```
+
+**Example Paths:**
+```
+~/.sylk/projects/a1b2c3d4/plans/implement-user-auth/v3.md
+~/.sylk/projects/a1b2c3d4/plans/implement-user-auth/metadata.json
+~/.sylk/projects/a1b2c3d4/plans/implement-user-auth/checkpoints/v2_step3.json
+~/.sylk/projects/a1b2c3d4/archived/fix-login-bug/outcome.json
+```
+
+**Implementation Guide:**
+
+1. **Project Hash Function** - Use existing `ProjectHash()` from `core/plan/storage.go`:
+   ```go
+   func ProjectHash(projectRoot string) string {
+       absPath, _ := filepath.Abs(projectRoot)
+       hash := sha256.Sum256([]byte(absPath))
+       return hex.EncodeToString(hash[:8]) // 16 chars
+   }
+   ```
+
+2. **Slugify Function** - Convert plan title to filesystem-safe slug:
+   ```go
+   func Slugify(title string) string {
+       slug := strings.ToLower(title)
+       reg := regexp.MustCompile(`[^a-z0-9]+`)
+       slug = reg.ReplaceAllString(slug, "-")
+       slug = strings.Trim(slug, "-")
+       if len(slug) > 50 { slug = slug[:50] }
+       return slug
+   }
+   ```
+
+3. **Storage Initialization** - On `NewStorage()`:
+   - Resolve `~/.sylk` from `os.UserHomeDir()`
+   - Compute project hash from provided project root
+   - Create `~/.sylk/projects/{hash}/plans/` and `archived/` directories
+   - Write `project_info.json` if not exists
+
+4. **Version File Naming** - Use `v{N}.md` format (v1.md, v2.md, ...)
+   - Include header comment: `<!-- Plan: {title} | Version: {N} | Created: {timestamp} -->`
+
+5. **Current Pointer** - `current.md` is a copy (not symlink) of HEAD version
+   - Symlinks can be problematic on Windows and some filesystems
+
+**Acceptance Criteria:**
+
+#### Storage Struct & Constructor
+- [ ] `Storage` struct with fields: `sylkRoot`, `projectHash`, `projectRoot`
+- [ ] `NewStorage(projectRoot string) (*Storage, error)` - initializes storage
+- [ ] Constructor calls `os.UserHomeDir()` to resolve `~/.sylk`
+- [ ] Constructor calls `ProjectHash()` to compute project identifier
+- [ ] Constructor creates directory structure via `initProjectDir()`
+- [ ] Constructor writes `project_info.json` with path, hash, created_at
+
+#### Path Resolution Functions
+- [ ] `projectDir() string` - returns `~/.sylk/projects/{hash}`
+- [ ] `planDir(planSlug string) string` - returns `{projectDir}/plans/{slug}`
+- [ ] `archivedDir() string` - returns `{projectDir}/archived`
+
+#### Slugify Function
+- [ ] `Slugify(title string) string` - converts title to filesystem-safe slug
+- [ ] Lowercase conversion
+- [ ] Replace non-alphanumeric with hyphens
+- [ ] Trim leading/trailing hyphens
+- [ ] Max length 50 characters
+- [ ] Unit test: "Implement User Auth!" → "implement-user-auth"
+- [ ] Unit test: "  Multiple   Spaces  " → "multiple-spaces"
+- [ ] Unit test: "UPPERCASE" → "uppercase"
+
+#### Plan Directory Management
+- [ ] `EnsurePlanDir(planSlug string) error` - creates plan directory + checkpoints/
+- [ ] `ListPlans() ([]string, error)` - returns all plan slugs for project
+- [ ] `ArchivePlan(planSlug string, outcome *PlanOutcome) error` - moves to archived/
+
+#### Context Persistence
+- [ ] `SaveContext(ctx *PlanContext) error` - saves context.json, version md, todos.json
+- [ ] `LoadContext(planSlug string) (*PlanContext, error)` - loads from context.json
+- [ ] `LoadContext` returns error (not empty context) for non-existent plans
+- [ ] `UpdatedAt` timestamp updated on every `SaveContext`
+
+#### Version Management
+- [ ] `saveVersionMarkdown(planSlug, plan) error` - writes v{N}.md with header
+- [ ] `updateCurrentPointer(planSlug, version) error` - copies v{N}.md to current.md
+- [ ] `LoadVersion(planSlug, version) (string, error)` - reads specific version
+- [ ] Version files include metadata header comment
+
+#### Metadata Persistence
+- [ ] `SaveMetadata(planSlug string, meta *PlanMetadata) error`
+- [ ] `LoadMetadata(planSlug string) (*PlanMetadata, error)`
+- [ ] Returns empty metadata (not error) for new plans
+
+#### Checkpoint Management
+- [ ] `SaveCheckpoint(planSlug, version, stepIndex, state) error`
+- [ ] Checkpoint filename: `v{version}_step{index}.json`
+- [ ] Checkpoints stored in `{planDir}/checkpoints/`
+
+#### Outcome Recording
+- [ ] `PlanOutcome` struct with: Result, CompletedAt, StepsComplete, StepsTotal, FailureReason, Duration
+- [ ] `outcome.json` written on archive
+
+#### Unit Tests
+- [ ] `ProjectHash` produces consistent 16-char hex string
+- [ ] `Slugify` handles edge cases (empty, special chars, long strings)
+- [ ] Save/Load context round-trip preserves all fields
+- [ ] Version files created with correct naming (v1.md, v2.md)
+- [ ] `current.md` updated when new version saved
+- [ ] `ListPlans` returns correct slugs
+- [ ] `ArchivePlan` moves directory and writes outcome
+- [ ] Checkpoint files created in correct location
+
+#### Integration Tests
+- [ ] Multiple plans for same project stored correctly
+- [ ] Plans persist after session ends and new session starts
+- [ ] Different projects (different hashes) isolated
+- [ ] Archived plans queryable but not in active list
+
+### PM.4 Plan Markdown Formatter
+
+**Files to create:**
+- `core/plan/formatter.go`
+
+**Acceptance Criteria:**
+
+- [ ] `formatPlanMarkdown(plan *Plan) string` - generates layered markdown output
+- [ ] Output includes: Title, Overview, Files to Modify, Execution Plan diagram, Detailed Steps by Layer, Sequential Step Reference, Considerations, Required Permissions
+- [ ] Execution Plan shows ASCII flow diagram with layers
+- [ ] Layers show "(parallel: N tasks)" when N > 1
+- [ ] Detailed Steps grouped by layer with concurrency indicator
+- [ ] Dependencies shown as "Depends on: steps [N, M]"
+- [ ] Sequential reference shows layer number: "[Layer N] [agent] description"
+- [ ] Unit test: single-step plan formats correctly
+- [ ] Unit test: multi-layer plan shows correct grouping
+- [ ] Unit test: parallel steps within layer show concurrency count
+
+### PM.5 Plan State Machine
+
+**Files to create:**
+- `core/plan/state_machine.go`
+
+**State Transitions:**
+```
+IDLE → EXPLORING (on enter_plan_mode)
+EXPLORING → DRAFTING (on begin drafting)
+DRAFTING → AWAITING_APPROVAL (on exit_plan_mode)
+AWAITING_APPROVAL → APPROVED (on user approval)
+AWAITING_APPROVAL → DRAFTING (on user rejection with feedback)
+AWAITING_APPROVAL → IDLE (on user cancel)
+APPROVED → EXECUTING (on execution start)
+EXECUTING → COMPLETED (on all steps done)
+EXECUTING → FAILED (on unrecoverable error)
+COMPLETED/FAILED → IDLE (on new task)
+```
+
+**Acceptance Criteria:**
+
+- [ ] `Transition(ctx *PlanContext, event PlanEvent) error` - validates and applies transition
+- [ ] `PlanEvent` type with constants: `EnterPlanMode`, `BeginDrafting`, `ExitPlanMode`, `UserApprove`, `UserReject`, `UserCancel`, `StartExecution`, `ExecutionComplete`, `ExecutionFailed`, `Reset`
+- [ ] Returns error for invalid transitions (e.g., IDLE → APPROVED)
+- [ ] `ValidTransitions(state PlanState) []PlanEvent` - returns valid events for state
+- [ ] `CanTransition(ctx *PlanContext, event PlanEvent) bool` - checks without applying
+- [ ] Unit test: all valid transitions succeed
+- [ ] Unit test: invalid transitions return error
+- [ ] Unit test: state unchanged on invalid transition
+
+### PM.6 Plan Mode Skills (Architect Agent)
+
+**Files to create:**
+- `agents/architect/plan_mode.go`
+
+**Acceptance Criteria:**
+
+#### enter_plan_mode skill
+- [ ] Creates new PlanContext if not exists
+- [ ] Transitions state IDLE → EXPLORING
+- [ ] Persists context to storage
+- [ ] Returns confirmation message
+- [ ] Rejects if already in plan mode (state != IDLE)
+
+#### exit_plan_mode skill
+- [ ] Parameters: allowedPrompts ([]AllowedPrompt)
+- [ ] Validates plan file exists and is complete
+- [ ] Computes topological layers for all steps
+- [ ] Transitions state DRAFTING → AWAITING_APPROVAL
+- [ ] Persists plan version to history
+- [ ] Returns plan summary for user review
+- [ ] Rejects if state != DRAFTING
+
+#### update_plan_file skill
+- [ ] Parameters: title, overview, files_to_modify, steps, considerations
+- [ ] Validates all required fields present
+- [ ] Validates step dependencies reference valid indices
+- [ ] Computes topological layers
+- [ ] Increments plan version
+- [ ] Transitions EXPLORING → DRAFTING if first update
+- [ ] Persists updated plan
+- [ ] Returns layer summary showing concurrency opportunities
+
+### PM.7 Todo Management Skills (Architect Agent)
+
+**Files to create:**
+- `agents/architect/todo.go`
+
+**Acceptance Criteria:**
+
+#### todo_write skill
+- [ ] Parameters: todos ([]TodoItem)
+- [ ] Validates each todo has content, activeForm, status
+- [ ] Only one todo can be in_progress at a time
+- [ ] Persists to todos.json
+- [ ] Returns formatted todo list
+
+#### todo_mark_complete skill (convenience wrapper)
+- [ ] Parameters: step_index (int)
+- [ ] Finds todo by step_index
+- [ ] Updates status to completed
+- [ ] Persists change
+- [ ] Returns updated list
+
+### PM.8 User Interaction Skill
+
+**Files to create:**
+- `agents/architect/questions.go`
+
+**Acceptance Criteria:**
+
+#### ask_user_question skill
+- [ ] Parameters: questions ([]Question), each with header, question, options, multiSelect
+- [ ] Maximum 4 questions per call
+- [ ] Each option has label, description
+- [ ] Automatically adds "Other" option for free-text input
+- [ ] Blocks until user responds
+- [ ] Returns map of question_id → selected_option(s)
+- [ ] Rejects if options < 2 or > 4 per question
+
+### PM.9 Orchestrator Plan Execution
+
+**Files to create:**
+- `agents/orchestrator/plan_executor.go`
+
+**Acceptance Criteria:**
+
+- [ ] `ExecutePlan(ctx context.Context, plan *Plan, planCtx *PlanContext) error`
+- [ ] Converts PlanStep[] to DAG nodes
+- [ ] Groups steps by topological layer
+- [ ] Executes layers sequentially
+- [ ] Executes steps within layer concurrently (up to worker pool limit)
+- [ ] Updates ExecutionState after each step
+- [ ] Calls StepResult callback for each completed step
+- [ ] Aborts remaining steps on failure (configurable)
+- [ ] Updates PlanContext state to COMPLETED or FAILED
+- [ ] **Emits `StepCompletedSignal` after each step for plan file sync**
+- [ ] **Marks dependent steps as `skipped` when a step fails**
+- [ ] Integration test: parallel steps in same layer run concurrently
+- [ ] Integration test: step failure aborts remaining execution
+- [ ] Integration test: dependency ordering enforced across layers
+- [ ] **Integration test: plan file updated with checkboxes after each step**
+
+### PM.9.1 Plan File Synchronization
+
+**Files to create:**
+- `agents/architect/step_handler.go`
+- `core/signals/step_completed.go`
+
+**Acceptance Criteria:**
+
+- [ ] `StepCompletedSignal` struct with SessionID, PlanID, StepIndex, Status, Output, Error, Duration, AgentID, Timestamp
+- [ ] Architect subscribes to `plan.step.completed` bus topic
+- [ ] `HandleStepCompleted(sig *StepCompletedSignal) error` updates plan on each signal
+- [ ] `updateStepStatus(plan, stepIndex, status)` modifies PlanStep.Status
+- [ ] `updateTodoForStep(todos, stepIndex, status)` syncs TodoItem status
+- [ ] `updateExecutionState(state, sig)` records step result
+- [ ] Plan markdown file regenerated on every status change
+- [ ] Status checkboxes: `[ ]` pending, `[~]` in_progress, `[x]` completed, `[!]` failed, `[-]` skipped
+- [ ] Progress counter updated: "Progress: N/M steps completed"
+- [ ] Unit test: step completion updates markdown file
+- [ ] Unit test: failure marks step with `[!]` and dependents with `[-]`
+
+### PM.9.2 Failure Recovery
+
+**Files to create:**
+- `agents/architect/recovery.go`
+
+**Acceptance Criteria:**
+
+- [ ] `HandleStepFailure(ctx *PlanContext, failedStep int, err error) error`
+- [ ] Failed step marked with `StepStatusFailed`
+- [ ] Dependent steps marked with `StepStatusSkipped`
+- [ ] ExecutionState updated with FailedStep and FailureReason
+- [ ] Plan file shows failure reason inline: `[!] Step N - **FAILED: reason**`
+- [ ] Recovery options: retry (reset to pending), skip (continue), abort (fail plan)
+- [ ] Unit test: failure cascades to dependent steps
+
+### PM.9.3 Plan Archival (Archivalist Integration)
+
+**Files to create:**
+- `agents/architect/archival.go`
+
+**Purpose:** Archive approved plans and outcomes to Archivalist for long-term storage and cross-session querying.
+
+**Implementation Guide:**
+
+1. **On User Approval** - Archive full plan to `approved_plans` category:
+   - Include complete markdown content for searchability
+   - Extract tags from file paths for categorization
+   - Record approval timestamp and approver
+
+2. **On Completion/Failure** - Archive outcome to `plan_outcomes` category:
+   - Include execution statistics (steps completed, failed, duration)
+   - Record failure reason if applicable
+   - Link to original approved plan entry
+
+**Acceptance Criteria:**
+
+#### Plan Approval Archival
+- [ ] `ArchivePlanOnApproval(ctx *PlanContext) error` - archives when user approves
+- [ ] Validates state is `PlanStateApproved` before archiving
+- [ ] Archives to Archivalist category `approved_plans`
+- [ ] Content includes full `formatPlanMarkdown()` output
+- [ ] Metadata includes:
+  - `plan_id`: Unique plan identifier
+  - `project_hash`: Links to project
+  - `plan_slug`: Filesystem slug
+  - `title`: Human-readable title
+  - `step_count`: Number of steps
+  - `layer_count`: Number of topological layers
+  - `files_count`: Number of files to modify
+  - `created_by`: Agent that created plan
+  - `approved_at`: Approval timestamp
+  - `tags`: Extracted from file paths (e.g., ["auth", "api", "handlers"])
+- [ ] `extractPlanTags(plan)` extracts unique directory names from file paths
+
+#### Outcome Archival
+- [ ] `ArchivePlanOutcome(ctx *PlanContext) error` - archives on completion/failure
+- [ ] Validates state is `PlanStateCompleted` or `PlanStateFailed`
+- [ ] Archives to Archivalist category `plan_outcomes`
+- [ ] Content includes:
+  - Plan title and result summary
+  - Execution statistics
+  - Full plan markdown with step statuses
+- [ ] Metadata includes:
+  - `plan_id`: Links to approved plan
+  - `project_hash`: Links to project
+  - `outcome`: "success" or "failure"
+  - `completed_steps`: Count of completed steps
+  - `failed_steps`: Count of failed steps
+  - `skipped_steps`: Count of skipped steps
+  - `total_steps`: Total step count
+  - `duration_seconds`: Total execution time
+  - `failure_reason`: Error message if failed
+  - `failed_step_index`: Which step failed (if applicable)
+  - `completed_at`: Completion timestamp
+
+#### Unit Tests
+- [ ] Approval archival includes all required metadata fields
+- [ ] Outcome archival correctly computes statistics
+- [ ] Tags extraction handles nested paths correctly
+- [ ] Error returned if archiving in wrong state
+
+#### Integration Tests
+- [ ] Approved plan queryable via Archivalist `search("approved_plans", ...)`
+- [ ] Plan outcomes searchable by success/failure filter
+- [ ] Can retrieve plan by project_hash + plan_slug
+- [ ] Outcome links correctly to original approved plan
+
+### PM.9.4 Plan Version Tracking (Archivalist)
+
+**Files to create:**
+- `agents/architect/version_tracker.go`
+- `agents/archivalist/plan_versions.go`
+
+**Purpose:** Enable Archivalist to track all plan versions and answer queries like "What changed between v2 and v4?"
+
+**Storage Categories:**
+- `plan_versions`: Each version stored as separate entry
+- `plan_change_sets`: Computed diffs between versions (cached)
+
+**Implementation Guide:**
+
+1. **On Each Version Save** - Archive version to `plan_versions`:
+   ```go
+   entry := &archivalist.Entry{
+       Category: "plan_versions",
+       Content:  versionMarkdown,
+       Metadata: map[string]any{
+           "project_hash": projectHash,
+           "plan_slug":    slug,
+           "version":      version,
+           "parent_version": parentVersion,
+           "step_count":   len(steps),
+           "layer_count":  countLayers(steps),
+           "created_at":   time.Now(),
+           "created_by":   agentID,
+           "reason":       reason,  // "initial", "user_feedback", "step_failure", etc.
+       },
+   }
+   ```
+
+2. **Change Set Computation** - When diff requested:
+   - Load both versions from Archivalist
+   - Compute structural diff (steps added/removed/modified)
+   - Cache result in `plan_change_sets` category
+   - Return human-readable diff summary
+
+3. **Query Interface** - Archivalist skill for version queries:
+   ```
+   User: "What changed between v2 and v4 of the auth plan?"
+
+   Archivalist receives:
+   {
+       "type": "version_diff",
+       "project_hash": "a1b2c3d4",
+       "plan_slug": "implement-user-auth",
+       "from_version": 2,
+       "to_version": 4
+   }
+   ```
+
+**Acceptance Criteria:**
+
+#### Version Archival
+- [ ] `ArchivePlanVersion(planSlug, plan, reason) error` - archives each version
+- [ ] Called automatically when `Storage.SaveContext()` creates new version
+- [ ] Archives to Archivalist category `plan_versions`
+- [ ] Metadata includes: project_hash, plan_slug, version, parent_version, reason, created_at
+- [ ] Content includes full version markdown
+
+#### Change Set Types
+- [ ] `ChangeSet` struct with: FromVersion, ToVersion, Summary, StepsAdded, StepsRemoved, StepsModified, FilesAdded, FilesRemoved, DependencyChanges
+- [ ] `StepSummary` struct with: Index, Description, Agent, Layer
+- [ ] `StepDiff` struct with: Index, Changes (map of field → {old, new})
+- [ ] `DepChange` struct with: StepIndex, OldDependsOn, NewDependsOn
+
+#### Diff Computation
+- [ ] `ComputeVersionDiff(planSlug, fromVersion, toVersion) (*ChangeSet, error)`
+- [ ] Correctly identifies added steps (in new, not in old)
+- [ ] Correctly identifies removed steps (in old, not in new)
+- [ ] Correctly identifies modified steps (same index, different content)
+- [ ] Tracks dependency changes separately
+- [ ] Tracks file list changes
+- [ ] Computes layer count changes
+
+#### Diff Formatting
+- [ ] `FormatChangeSetMarkdown(cs *ChangeSet) string` - human-readable diff
+- [ ] Output includes sections: Steps Added, Steps Removed, Steps Modified, Files Changed, Topology Changes
+- [ ] Modified steps show field-level diffs (e.g., "Description: old → new")
+
+#### Archivalist Query Skill
+- [ ] `query_plan_versions` skill in Archivalist
+- [ ] Accepts: project_hash, plan_slug, from_version, to_version
+- [ ] Returns formatted diff or error if versions not found
+- [ ] Caches computed diffs in `plan_change_sets` category
+
+#### Caching
+- [ ] Computed diffs cached with key `{project_hash}:{plan_slug}:v{from}→v{to}`
+- [ ] Cache checked before recomputing
+- [ ] Cache invalidated if new version added between from/to range
+
+#### Unit Tests
+- [ ] Diff correctly identifies step additions
+- [ ] Diff correctly identifies step removals
+- [ ] Diff correctly identifies step modifications
+- [ ] Diff handles dependency changes
+- [ ] Empty diff when versions identical
+- [ ] Error when version not found
+
+#### Integration Tests
+- [ ] Query "what changed v1→v3" returns correct diff
+- [ ] Query "what changed v2→v2" returns empty diff
+- [ ] Cache hit on repeated query
+- [ ] Version history query returns all versions for plan
+- [ ] Cross-session: version archived in session A queryable in session B
+
+#### Supported Queries (via Archivalist)
+- [ ] "What changed between v2 and v4?"
+- [ ] "Show version history for plan X"
+- [ ] "Which version added step N?"
+- [ ] "What was the original description of step 3?"
+- [ ] "How many times was this plan revised?"
+- [ ] "Compare topology between v1 and v5"
+
+### PM.10 Guide Plan Mode Routing
+
+**Files to modify:**
+- `agents/guide/router.go`
+
+**Acceptance Criteria:**
+
+- [ ] Detect plan mode triggers in user messages (complex multi-step tasks)
+- [ ] Route plan mode requests to Architect
+- [ ] Forward user approval/rejection to Architect
+- [ ] Route execution requests to Orchestrator
+- [ ] Maintain plan context reference for session
+- [ ] Unit test: plan trigger detection accuracy
+- [ ] Unit test: approval routing to correct agent
+
+### PM.11 Plan Mode SKILL.md Definitions
+
+**Files to create:**
+- `skills/plan_mode/SKILL.md`
+- `skills/todo_management/SKILL.md`
+- `skills/ask_user/SKILL.md`
+
+**Acceptance Criteria:**
+
+- [ ] Each skill file follows agentskills.io spec
+- [ ] YAML frontmatter with name, description, license, compatibility, allowed-tools
+- [ ] Markdown instructions for when/how to use
+- [ ] Skills discoverable via `skills.Discover()`
+- [ ] Skills loadable via `skills.ReadFull()`
+- [ ] Skills validate via `skills.Validate()`
+
+### PM.12 Integration Tests
+
+**Files to create:**
+- `tests/plan_mode_test.go`
+
+**Acceptance Criteria:**
+
+- [ ] Test: Full plan mode lifecycle (enter → draft → approve → execute → complete)
+- [ ] Test: Plan rejection and revision cycle
+- [ ] Test: Topological layer computation with complex dependencies
+- [ ] Test: Concurrent step execution within layers
+- [ ] Test: Step failure handling and state transitions
+- [ ] Test: Plan versioning and history
+- [ ] Test: Todo synchronization with plan steps
+- [ ] Test: Multi-session plan isolation
+- [ ] Test: Plan persistence across session restart
+- [ ] Test: Markdown output format matches specification
+
+### Plan Mode Parallelization Notes
+
+The following tasks can be executed concurrently:
+
+**Layer 0 (No Dependencies):**
+- PM.1 Core Plan Package Types
+- PM.2 Topological Layer Computation
+- PM.11 Plan Mode SKILL.md Definitions
+
+**Layer 1 (Depends on PM.1, PM.2):**
+- PM.3 Plan Storage
+- PM.4 Plan Markdown Formatter
+- PM.5 Plan State Machine
+
+**Layer 2 (Depends on PM.3, PM.4, PM.5):**
+- PM.6 Plan Mode Skills
+- PM.7 Todo Management Skills
+- PM.8 User Interaction Skill
+
+**Layer 3 (Depends on PM.6):**
+- PM.9 Orchestrator Plan Execution
+- PM.9.1 Plan File Synchronization
+- PM.9.2 Failure Recovery
+- PM.10 Guide Plan Mode Routing
+
+**Layer 4 (Depends on PM.9, PM.9.1):**
+- PM.9.3 Plan Archival (requires Archivalist integration)
+- PM.9.4 Plan Version Tracking (requires Archivalist integration)
+- PM.12 Integration Tests
+
+---
+
+## Research Paper Implementation
+
+**Reference**: See ARCHITECTURE.md "Research Paper Architecture" section for detailed specifications.
+
+Research papers are comprehensive technical documents produced by the Academic agent that bridge exploratory research and actionable plans. They follow the same storage pattern as plans.
+
+### AR.1 Research Paper Types
+
+**Files to create:**
+- `core/research/types.go`
+
+**Implementation Guide:**
+
+Define all types needed for research paper management, following the pattern established in `core/plan/types.go`.
+
+**Acceptance Criteria:**
+
+#### Status Types
+- [ ] `ResearchStatus` type with constants: `DRAFT`, `READY_FOR_REVIEW`, `READY_FOR_IMPLEMENTATION`, `APPROVED`, `SUPERSEDED`, `ARCHIVED`
+
+#### Metadata Types
+- [ ] `ResearchMetadata` struct with fields:
+  - `PaperID` (string): Unique identifier
+  - `Slug` (string): Filesystem-safe name
+  - `Title` (string): Human-readable title
+  - `Status` (ResearchStatus): Current status
+  - `Head` (int): Current version number
+  - `CreatedAt`, `UpdatedAt` (time.Time)
+  - `AcademicAgent` (string): Creating agent ID
+  - `SessionID` (string): Originating session
+  - `ProjectHash` (string): Project identifier
+  - `Tags` ([]string): Categorization tags
+  - `ApproachesEvaluated` (int): Count of approaches analyzed
+  - `RecommendedApproach` (string): Primary recommendation
+  - `EdgeCasesCount` (int): Number of edge cases identified
+  - `OpenQuestionsCount` (int): Unresolved questions
+  - `LinkedPlan` (string): Associated plan ID (if converted)
+  - `Versions` ([]VersionEntry): Version history
+  - `ChangeSets` (map[string]ChangeSet): Diffs between versions
+
+#### Decision Types
+- [ ] `ResearchDecisions` struct with PaperID, Decisions, OpenQuestionsResolved
+- [ ] `Decision` struct with ID, Title, Options, DecidedAt, DecidedBy
+- [ ] `DecisionOption` struct with ID, Description, Status (ACCEPTED/REJECTED/DEFERRED/IGNORED)
+- [ ] `ResolvedQuestion` struct with Question, Answer, ResolvedAt
+
+#### Document Types
+- [ ] `ResearchPaper` struct with Slug, Title, Version, Content, Sections, EdgeCases, etc.
+- [ ] `ParsedPaper` struct for extracted sections after parsing
+
+#### Unit Tests
+- [ ] All types serialize/deserialize correctly to JSON
+- [ ] Status constants have expected string values
+- [ ] Decision status validation
+
+### AR.2 Research Paper Storage
+
+**Files to create:**
+- `core/research/storage.go`
+
+**Storage Location:** `~/.sylk/projects/{project_hash}/research/{slug}/`
+
+**Directory Structure:**
+```
+~/.sylk/projects/{project_hash}/research/{slug}/
+├── metadata.json           ← Version history, status
+├── context.json            ← Current research context
+├── decisions.json          ← User decisions on recommendations
+├── sources.json            ← URLs, docs referenced
+├── current.md              ← Copy of HEAD version
+├── v1.md                   ← Version 1
+├── v2.md                   ← Version 2
+└── attachments/            ← Diagrams, benchmarks
+```
+
+**Implementation Guide:**
+
+Follow the same pattern as `core/plan/storage.go`, using `ProjectHash()` for project identification and `Slugify()` for paper naming.
+
+**Acceptance Criteria:**
+
+#### Storage Struct
+- [ ] `ResearchStorage` struct with `sylkRoot`, `projectHash`, `projectRoot`
+- [ ] `NewResearchStorage(projectRoot string) (*ResearchStorage, error)`
+- [ ] Constructor creates `~/.sylk/projects/{hash}/research/` directory
+
+#### Path Resolution
+- [ ] `projectDir() string` - returns `~/.sylk/projects/{hash}`
+- [ ] `researchDir(slug string) string` - returns `{projectDir}/research/{slug}`
+- [ ] `archivedDir() string` - returns `{projectDir}/archived/research`
+
+#### Paper Persistence
+- [ ] `SavePaper(paper *ResearchPaper) error` - saves paper and updates metadata
+- [ ] `LoadPaper(slug string) (*ResearchPaper, error)` - loads current paper
+- [ ] `SaveVersion(slug string, content string, reason string) error` - saves v{N}.md
+- [ ] `updateCurrentPointer(slug string, version int) error` - copies v{N}.md to current.md
+
+#### Metadata Management
+- [ ] `SaveMetadata(slug string, meta *ResearchMetadata) error`
+- [ ] `LoadMetadata(slug string) (*ResearchMetadata, error)`
+- [ ] `SaveDecisions(slug string, decisions *ResearchDecisions) error`
+- [ ] `LoadDecisions(slug string) (*ResearchDecisions, error)`
+
+#### Version Management
+- [ ] `ListVersions(slug string) ([]int, error)` - returns all version numbers
+- [ ] `ListPapers() ([]string, error)` - returns all paper slugs
+
+#### Archival
+- [ ] `ArchivePaper(slug string, reason string) error` - moves to archived/
+
+#### Unit Tests
+- [ ] Save/load paper round-trip
+- [ ] Version files created with correct naming
+- [ ] Metadata persists across operations
+- [ ] Decisions save and load correctly
+- [ ] Archive moves directory correctly
+
+### AR.3 PROPOSAL Message Type
+
+**Files to modify:**
+- `core/messages/types.go`
+
+**Implementation Guide:**
+
+Add the PROPOSAL message type used for Academic → Architect handoff.
+
+**Acceptance Criteria:**
+
+- [ ] `MessageTypeProposal MessageType = "PROPOSAL"` constant added
+- [ ] `ProposalMessage` struct with:
+  - `Type` (MessageType): Always "PROPOSAL"
+  - `From` (string): "academic"
+  - `SessionID` (string)
+  - `ProjectHash` (string)
+  - `ResearchSlug` (string)
+  - `PaperPath` (string): Full path to current.md
+  - `Version` (int)
+  - `Summary` (string): Brief description
+  - `Timestamp` (time.Time)
+- [ ] JSON serialization/deserialization works correctly
+- [ ] Unit test: message type matches expected value
+
+### AR.4 Revision Message Types
+
+**Files to modify:**
+- `core/messages/types.go`
+- `core/messages/revision.go` (create)
+
+**Implementation Guide:**
+
+Add message types for plan revision triggers from pipeline agents.
+
+**Acceptance Criteria:**
+
+#### Message Type Constants
+- [ ] `MessageTypeTaskModifiedByUser MessageType = "TASK_MODIFIED_BY_USER"`
+- [ ] `MessageTypeWorkflowChangeRequired MessageType = "WORKFLOW_CHANGE_REQUIRED"`
+
+#### TaskModifiedByUserMessage
+- [ ] Struct with: Type, From, SessionID, PlanSlug, StepIndex, Modification, Description, OriginalTask, ModifiedTask, Timestamp
+- [ ] `Modification` values: "scope_expanded", "scope_reduced", "requirements_changed", "task_deleted", "task_added"
+
+#### WorkflowChangeRequiredMessage
+- [ ] Struct with: Type, From, SessionID, PlanSlug, StepIndex, ChangeType, Reason, ProposedChange, Blocking, Timestamp
+- [ ] `ChangeType` values: "add_step", "delete_step", "split_step", "merge_steps", "change_deps", "modify_step"
+
+#### ProposedChange
+- [ ] Struct with: Action, TargetStep, NewStep, ModifiedStep, NewDeps
+- [ ] `Action` values: "insert_step", "delete_step", "modify_step", "change_dependencies"
+
+#### Unit Tests
+- [ ] All message types serialize correctly
+- [ ] Validation functions for required fields
+
+### AR.5 Academic: write_research_paper Skill
+
+**Files to create:**
+- `agents/academic/skills/write_research_paper.go`
+- `skills/write_research_paper/SKILL.md`
+
+**Trigger Conditions:**
+- User says "I'm ready to start implementing"
+- User says "Write up your findings"
+- User says "Create the research paper"
+- Academic determines research is complete and actionable
+
+**Implementation Guide:**
+
+```go
+func (s *WriteResearchPaperSkill) Execute(ctx context.Context, params map[string]any) error {
+    // 1. Aggregate findings from conversation
+    // 2. Structure into paper format
+    // 3. Generate diagrams
+    // 4. Compile edge cases with user decisions
+    // 5. Determine version number
+    // 6. Persist to storage
+    // 7. Archive to Archivalist
+    // 8. Send PROPOSAL to Architect via Guide
+}
+```
+
+**Acceptance Criteria:**
+
+#### Skill Registration
+- [ ] Skill registered with Academic agent
+- [ ] SKILL.md file created with proper frontmatter
+
+#### Trigger Detection
+- [ ] `detectWriteTrigger(message string) bool` - identifies trigger phrases
+- [ ] Does NOT trigger on casual conversation
+- [ ] Does NOT trigger on questions about research
+
+#### Paper Generation
+- [ ] `aggregateFindings(ctx) *Findings` - collects from conversation
+- [ ] `structurePaper(findings) *ResearchPaper` - formats into sections
+- [ ] `generateDiagrams(findings) []Diagram` - creates architecture/flow diagrams
+- [ ] `compileEdgeCases(findings) []EdgeCase` - extracts with user decisions
+
+#### Persistence
+- [ ] Paper saved to `~/.sylk/projects/{hash}/research/{slug}/v{N}.md`
+- [ ] Metadata updated with new version
+- [ ] Decisions saved to `decisions.json`
+- [ ] Sources saved to `sources.json`
+
+#### Archivalist Integration
+- [ ] Paper version archived to category `research_paper_versions`
+- [ ] Metadata includes: slug, version, status, tags
+
+#### PROPOSAL Message
+- [ ] Message sent via `bus.RouteToAgent("architect", "requests", proposal)`
+- [ ] Message includes: slug, paper_path, version, summary
+- [ ] Unit test: message reaches architect.requests channel
+
+### AR.6 Academic: fetch_version Skill
+
+**Files to create:**
+- `agents/academic/skills/fetch_version.go`
+
+**Implementation Guide:**
+
+Quick file search for research paper versions. Defaults to latest if no version specified.
+
+**Acceptance Criteria:**
+
+- [ ] `FetchVersion(slug string, version *int) (*VersionedDocument, error)`
+- [ ] `FetchLatest(slug string) (*VersionedDocument, error)` - convenience wrapper
+- [ ] `ListVersions(slug string) ([]int, error)`
+- [ ] Search path: `~/.sylk/projects/{hash}/research/{slug}/v*.md`
+- [ ] Glob pattern finds all version files
+- [ ] Returns highest version number when version is nil
+- [ ] Returns specific version when version is provided
+- [ ] Error when version not found
+- [ ] Loads metadata.json alongside content
+- [ ] Unit test: fetch latest returns highest version
+- [ ] Unit test: fetch specific returns exact version
+- [ ] Unit test: non-existent version returns error
+
+### AR.7 Academic: Revision Detection
+
+**Files to create:**
+- `agents/academic/revision_detector.go`
+
+**Implementation Guide:**
+
+Academic only revises when user EXPLICITLY requests modification.
+
+**Acceptance Criteria:**
+
+#### Detection Function
+- [ ] `detectRevisionIntent(message string) RevisionIntent`
+- [ ] `RevisionIntent` struct with: Detected, Action, Target, Description
+
+#### Explicit Patterns (TRIGGERS revision)
+- [ ] "update the research paper"
+- [ ] "revise the proposal"
+- [ ] "add X to the document"
+- [ ] "remove X from the paper"
+- [ ] "change the recommendation"
+- [ ] "modify the edge cases"
+- [ ] "I want to update the research"
+
+#### Non-Triggers (does NOT trigger revision)
+- [ ] Questions: "What did you find about X?"
+- [ ] Acknowledgments: "okay", "interesting", "got it"
+- [ ] Clarifications: "Can you explain that?"
+- [ ] Discussion: "What about Y approach?"
+
+#### Unit Tests
+- [ ] All explicit patterns detected
+- [ ] Non-trigger phrases return Detected=false
+- [ ] Action correctly extracted (add/remove/modify/replace)
+
+### AR.8 Architect: read_research_paper Skill
+
+**Files to create:**
+- `agents/architect/skills/read_research_paper.go`
+
+**Trigger:** Receives PROPOSAL message type on `architect.requests` channel
+
+**Implementation Guide:**
+
+```go
+func (s *ReadResearchPaperSkill) Execute(ctx context.Context, params map[string]any) error {
+    // 1. Fetch paper via fetch_version
+    // 2. Parse structured sections
+    // 3. Load decisions
+    // 4. Consult Librarian to verify file paths
+    // 5. Convert to Plan structure
+    // 6. Enter plan mode with draft
+    // 7. Present to user
+}
+```
+
+**Acceptance Criteria:**
+
+#### Skill Registration
+- [ ] Skill triggered when message type == "PROPOSAL"
+- [ ] Extracts research_slug, paper_path, version from message
+
+#### Paper Parsing
+- [ ] `parsePaper(content string) *ParsedPaper` - extracts sections
+- [ ] Extracts: title, summary, approaches, recommended, files_to_modify, implementation_steps, acceptance_criteria, edge_cases, open_questions
+
+#### Plan Conversion
+- [ ] `convertToPlan(parsed, decisions, verified) *Plan`
+- [ ] Implementation steps → PlanSteps with correct indices
+- [ ] Layer hints from paper ("Layer 0", "Layer 1") → DependsOn arrays
+- [ ] Accepted edge case mitigations → additional PlanSteps
+- [ ] Acceptance criteria attached to relevant steps
+- [ ] Plan.Metadata["source_research"] = paper slug
+- [ ] Plan.Metadata["research_version"] = version
+
+#### Librarian Consultation
+- [ ] Verify file paths exist in codebase
+- [ ] Identify additional files that may need changes
+- [ ] Flag missing files for creation
+
+#### Plan Mode Entry
+- [ ] Creates PlanContext with state DRAFTING
+- [ ] CurrentPlan populated from conversion
+- [ ] Presents plan to user with diff from research
+
+### AR.9 Architect: fetch_version Skill
+
+**Files to create:**
+- `agents/architect/skills/fetch_version.go`
+
+**Implementation Guide:**
+
+Identical to Academic's fetch_version but searches plans directory.
+
+**Acceptance Criteria:**
+
+- [ ] `FetchVersion(slug string, version *int) (*VersionedDocument, error)`
+- [ ] Search path: `~/.sylk/projects/{hash}/plans/{slug}/v*.md`
+- [ ] All same criteria as AR.6 but for plans
+- [ ] Unit test: fetch plan version works correctly
+
+### AR.10 Architect: Request Handler Updates
+
+**Files to modify:**
+- `agents/architect/handler.go`
+
+**Implementation Guide:**
+
+Update request handler to process PROPOSAL, TASK_MODIFIED_BY_USER, and WORKFLOW_CHANGE_REQUIRED messages.
+
+**Acceptance Criteria:**
+
+#### Message Routing
+- [ ] `handleRequest(msg) error` switches on msg.Type
+- [ ] `MessageTypeProposal` → `handleProposal(msg)`
+- [ ] `MessageTypeTaskModifiedByUser` → `handleUserTaskModification(msg)`
+- [ ] `MessageTypeWorkflowChangeRequired` → `handleWorkflowChangeRequest(msg)`
+
+#### Proposal Handling
+- [ ] Unmarshals ProposalMessage from payload
+- [ ] Triggers read_research_paper skill with params
+- [ ] Unit test: PROPOSAL triggers skill execution
+
+#### User Task Modification Handling
+- [ ] Unmarshals TaskModifiedByUserMessage
+- [ ] Loads current plan
+- [ ] Updates step description/criteria as needed
+- [ ] Creates new plan version
+- [ ] Archives and ingests
+
+#### Workflow Change Request Handling
+- [ ] Unmarshals WorkflowChangeRequiredMessage
+- [ ] If blocking: pauses orchestrator execution
+- [ ] Evaluates impact of proposed change
+- [ ] Presents to user for approval
+- [ ] If approved: applies change, creates new version, resumes
+- [ ] If rejected: notifies requesting agent, resumes without change
+
+### AR.11 Vector DB Incremental Ingestion
+
+**Files to create:**
+- `core/vectordb/ingestion.go`
+- `core/vectordb/chunking.go`
+
+**Implementation Guide:**
+
+Implement incremental ingestion that only embeds new/changed content.
+
+**Acceptance Criteria:**
+
+#### Document Chunking
+- [ ] `chunkDocument(doc) []DocumentChunk` - splits by section
+- [ ] `DocumentChunk` struct with: ChunkID, DocumentID, DocumentType, Content, ContentHash, ProjectHash, Slug, Version, Section, Embedding, IngestedAt
+- [ ] ChunkID format: `{doc_type}:{slug}:{section}:{index}`
+- [ ] Sections: executive_summary, problem_statement, approach_N, edge_case_N, step_N, etc.
+
+#### Hash-Based Diffing
+- [ ] `computeHash(content string) string` - SHA256
+- [ ] `getDocumentHashes(docID string) (map[string]string, error)` - loads from metadata
+- [ ] `updateDocumentHashes(docID string, hashes map[string]string) error` - saves to metadata
+
+#### Incremental Update
+- [ ] `IngestDocument(doc *ApprovedDocument) error`
+- [ ] Computes current chunk hashes
+- [ ] Loads existing hashes
+- [ ] Identifies: new chunks, removed chunks, unchanged chunks
+- [ ] Only embeds new chunks (saves compute)
+- [ ] Deletes vectors for removed chunks
+- [ ] Skips unchanged chunks
+- [ ] Updates metadata with current hashes
+
+#### Unit Tests
+- [ ] First ingestion embeds all chunks
+- [ ] Second ingestion with no changes embeds zero chunks
+- [ ] Modified section only re-embeds that chunk
+- [ ] Removed section deletes corresponding vectors
+
+### AR.12 Archivalist Version Tracking for Research
+
+**Files to modify:**
+- `agents/archivalist/research_versions.go` (create)
+
+**Implementation Guide:**
+
+Enable Archivalist to track research paper versions and answer diff queries.
+
+**Acceptance Criteria:**
+
+#### Categories
+- [ ] `research_paper_versions` - each version as entry
+- [ ] `approved_research_papers` - approved papers with decisions
+- [ ] `research_change_sets` - cached diffs
+
+#### Version Storage
+- [ ] Each version stored with: slug, version, content, status, tags
+- [ ] Change sets computed on demand or cached
+
+#### Query Support
+- [ ] "What changed between v2 and v4?" → computes/returns diff
+- [ ] "Show version history for paper X" → lists all versions
+- [ ] "Find research about caching" → semantic search
+
+### AR.13 Integration Tests
+
+**Files to create:**
+- `tests/research_paper_test.go`
+- `tests/research_handoff_test.go`
+
+**Acceptance Criteria:**
+
+#### Research Paper Tests
+- [ ] Full paper lifecycle: create → revise → approve → archive
+- [ ] Version persistence and retrieval
+- [ ] Decision tracking
+- [ ] Storage structure matches specification
+
+#### Handoff Tests
+- [ ] Academic write_research_paper → PROPOSAL → Architect read_research_paper
+- [ ] Plan correctly derived from research
+- [ ] Edge case mitigations become plan steps
+- [ ] Source research linked in plan metadata
+
+#### Vector DB Tests
+- [ ] Approved paper ingested correctly
+- [ ] Revision only ingests changed chunks
+- [ ] Semantic search finds relevant content
+
+#### Revision Trigger Tests
+- [ ] Academic only revises on explicit request
+- [ ] Architect revises on user request
+- [ ] Architect revises on TASK_MODIFIED_BY_USER
+- [ ] Architect handles WORKFLOW_CHANGE_REQUIRED correctly
+
+### Research Paper Parallelization Notes
+
+The following tasks can be executed concurrently:
+
+**Layer 0 (No Dependencies):**
+- AR.1 Research Paper Types
+- AR.3 PROPOSAL Message Type
+- AR.4 Revision Message Types
+
+**Layer 1 (Depends on AR.1):**
+- AR.2 Research Paper Storage
+- AR.7 Academic: Revision Detection
+
+**Layer 2 (Depends on AR.2):**
+- AR.5 Academic: write_research_paper Skill
+- AR.6 Academic: fetch_version Skill
+- AR.9 Architect: fetch_version Skill
+
+**Layer 3 (Depends on AR.3, AR.4, AR.5):**
+- AR.8 Architect: read_research_paper Skill
+- AR.10 Architect: Request Handler Updates
+
+**Layer 4 (Depends on AR.2, AR.8):**
+- AR.11 Vector DB Incremental Ingestion
+- AR.12 Archivalist Version Tracking
+
+**Layer 5 (Depends on all above):**
+- AR.13 Integration Tests
+
+---
+
 ### Knowledge Agent Consultation Protocol (All Agents via Guide)
 
 **Universal mechanism for implementation agents to consult knowledge agents.**
@@ -958,6 +2122,200 @@ Phase 3 (AFTER Phase 2):
 - [ ] Consultation latency (< 500ms for cached, < 2s for uncached)
 - [ ] Cache hit rate under typical workload
 - [ ] Concurrent consultations from multiple agents
+
+---
+
+### Direct Consultation Protocol (Token-Optimized Agent-to-Agent)
+
+**Purpose:** Token-efficient direct communication between agents with known targets, bypassing Guide routing overhead.
+
+**Problem:** When agents consult each other through Guide:
+- Guide's context accumulates ALL consultation traffic
+- At 100 consultations/session: Guide context grows by 50-100K tokens
+- This causes more frequent Guide compaction and higher per-turn costs
+- Estimated ~65% token reduction with direct consultation
+
+**Solution:** Direct consultation skills that bypass Guide for known targets, with async logging to Archivalist.
+
+**Files to create/modify:**
+- `core/messages/direct_consultation.go` (new) - Direct consultation types
+- `core/bus/direct.go` (new) - Direct message bus methods
+- `agents/*/consultation.go` (new for each agent) - Direct consultation skills
+- `agents/archivalist/consultation_log.go` (new) - Async consultation logging
+
+**Consultation Matrix (Who Can Directly Consult Whom):**
+
+| Agent | Direct Consultation Targets |
+|-------|---------------------------|
+| Guide | All agents (it's the universal router) |
+| Architect | Engineer, Designer, Inspector, Tester, Librarian, Archivalist, Academic |
+| Engineer | Architect, Designer, Inspector, Tester, Librarian, Archivalist, Academic |
+| Designer | Architect, Engineer, Inspector, Tester, Librarian, Archivalist, Academic |
+| Inspector | Architect, Engineer, Designer, Tester, Librarian, Archivalist |
+| Tester | Architect, Engineer, Designer, Inspector, Librarian, Archivalist |
+| Librarian | Archivalist, Academic |
+| Archivalist | Librarian, Academic |
+| Academic | Librarian, Archivalist |
+
+**Acceptance Criteria:**
+
+#### Phase 1: Direct Consultation Types
+
+**File: `core/messages/direct_consultation.go`**
+- [ ] `ConsultRequest` struct with question, context, priority, max_tokens
+- [ ] `ConsultResponse` struct with answer, confidence, references, suggestions
+- [ ] `ConsultationLog` struct with from, to, summary (truncated), timestamp, session_id
+- [ ] Priority enum: "blocking", "async"
+- [ ] Standard consultation parameters template
+
+```go
+type ConsultRequest struct {
+    Question   string         `json:"question"`
+    Context    map[string]any `json:"context,omitempty"`
+    Priority   string         `json:"priority,omitempty"`  // "blocking", "async"
+    MaxTokens  int            `json:"max_tokens,omitempty"`
+}
+
+type ConsultResponse struct {
+    Answer      string   `json:"answer"`
+    Confidence  float64  `json:"confidence,omitempty"`
+    References  []string `json:"references,omitempty"`
+    Suggestions []string `json:"suggestions,omitempty"`
+}
+
+type ConsultationLog struct {
+    From      string    `json:"from"`
+    To        string    `json:"to"`
+    Summary   string    `json:"summary"`    // Truncated (max 100 chars)
+    Timestamp time.Time `json:"timestamp"`
+    SessionID string    `json:"session_id"`
+}
+```
+
+#### Phase 2: Direct Message Bus
+
+**File: `core/bus/direct.go`**
+- [ ] `RequestDirect(ctx, target, msg) (*Response, error)` - Direct agent-to-agent
+- [ ] Session validation (both agents in same session)
+- [ ] Timeout handling
+- [ ] Circuit breaker for unavailable targets
+- [ ] Fallback to Guide routing if direct fails
+
+```go
+func (b *Bus) RequestDirect(ctx context.Context, target string, msg *Message) (*Message, error) {
+    // 1. Validate target agent exists and is in same session
+    // 2. Send directly to target agent's inbox
+    // 3. Wait for response with timeout
+    // 4. If fails, optionally fallback to Guide routing
+    return response, nil
+}
+```
+
+#### Phase 3: Async Consultation Logging
+
+**File: `agents/archivalist/consultation_log.go`**
+- [ ] `LogConsultation(log *ConsultationLog) error` - Async fire-and-forget
+- [ ] Truncate question to 100 chars for minimal storage
+- [ ] Category: `consultation_log`
+- [ ] Retention policy: 30 days default
+- [ ] Query API for consultation analytics
+
+#### Phase 4: Agent Consultation Skills Implementation
+
+**Guide Consultation Skills (`agents/guide/consultation.go`):**
+- [ ] `consult_architect` - Task decomposition and workflow questions
+- [ ] `consult_engineer` - Implementation questions
+- [ ] `consult_designer` - UI/UX questions
+- [ ] `consult_inspector` - Code quality questions
+- [ ] `consult_tester` - Testing questions
+- [ ] `consult_librarian` - Codebase questions
+- [ ] `consult_archivalist` - Historical context
+- [ ] `consult_academic` - Research and best practices
+
+**Architect Consultation Skills (`agents/architect/consultation.go`):**
+- [ ] `consult_engineer` - Implementation feasibility
+- [ ] `consult_designer` - UI/UX approach
+- [ ] `consult_inspector` - Quality considerations
+- [ ] `consult_tester` - Testing strategy
+- [ ] `consult_librarian` - Codebase patterns
+- [ ] `consult_archivalist` - Historical decisions
+- [ ] `consult_academic` - Best practices
+
+**Engineer Consultation Skills (`agents/engineer/consultation.go`):**
+- [ ] `consult_architect` - Task clarification
+- [ ] `consult_designer` - UI implementation guidance
+- [ ] `consult_inspector` - Code quality questions
+- [ ] `consult_tester` - Testing approach
+- [ ] `consult_librarian` - Codebase patterns
+- [ ] `consult_archivalist` - Historical issues
+- [ ] `consult_academic` - Best practices
+
+**Designer Consultation Skills (`agents/designer/consultation.go`):**
+- [ ] `consult_architect` - Design requirements
+- [ ] `consult_engineer` - Implementation feasibility
+- [ ] `consult_inspector` - UI quality (token validation)
+- [ ] `consult_tester` - Visual/a11y testing
+- [ ] `consult_librarian` - Component search
+- [ ] `consult_archivalist` - Design history
+- [ ] `consult_academic` - UX research
+
+**Inspector Consultation Skills (`agents/inspector/consultation.go`):**
+- [ ] `consult_architect` - Validation requirements
+- [ ] `consult_engineer` - Implementation clarification
+- [ ] `consult_designer` - UI validation questions
+- [ ] `consult_tester` - Test coverage questions
+- [ ] `consult_librarian` - Codebase patterns
+- [ ] `consult_archivalist` - Validation history
+
+**Tester Consultation Skills (`agents/tester/consultation.go`):**
+- [ ] `consult_architect` - Testing requirements
+- [ ] `consult_engineer` - Implementation details
+- [ ] `consult_designer` - UI testing questions
+- [ ] `consult_inspector` - Validation coordination
+- [ ] `consult_librarian` - Test patterns
+- [ ] `consult_archivalist` - Test history
+
+**Librarian Consultation Skills (`agents/librarian/consultation.go`):**
+- [ ] `consult_archivalist` - Historical code context
+- [ ] `consult_academic` - Pattern research
+
+**Archivalist Consultation Skills (`agents/archivalist/consultation.go`):**
+- [ ] `consult_librarian` - Current codebase state
+- [ ] `consult_academic` - Research context
+
+**Academic Consultation Skills (`agents/academic/consultation.go`):**
+- [ ] `consult_librarian` - Codebase patterns for validation
+- [ ] `consult_archivalist` - Historical research outcomes
+
+#### Phase 5: Testing
+
+**Unit Tests:**
+- [ ] Direct message routing
+- [ ] Session validation for direct messages
+- [ ] Consultation log truncation
+- [ ] Timeout handling
+- [ ] Fallback to Guide routing
+
+**Integration Tests:**
+- [ ] Engineer → Designer direct consultation
+- [ ] Architect → Librarian direct consultation
+- [ ] Inspector → Archivalist direct consultation
+- [ ] Consultation logging verification
+- [ ] Session isolation (cross-session blocked)
+
+**Performance Tests:**
+- [ ] Direct vs Guide-routed latency comparison
+- [ ] Token usage comparison (100 consultations)
+- [ ] Guide context growth comparison
+- [ ] Concurrent direct consultations
+
+**Expected Results:**
+- Direct consultation: ~1500 tokens per consultation
+- Guide-routed: ~3000+ tokens per consultation (Guide overhead)
+- 100 consultations: ~150K (direct) vs ~450K (Guide) tokens
+- ~65% token savings on consultation-heavy sessions
+
+---
 
 ### Session Recording & Replay (Guide + Archivalist)
 
@@ -2871,70 +4229,94 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 
 Abstract LLM provider interactions behind a common interface.
 
-**Files to create:**
-- `core/llm/types.go`
-- `core/llm/adapter.go`
-- `core/llm/anthropic.go`
-- `core/llm/openai.go`
-- `core/llm/google.go`
-- `core/llm/token_counter.go`
-- `core/llm/adapter_test.go`
+**Files:**
+- `core/providers/provider.go` (existing - DONE)
+- `core/providers/config.go` (existing - DONE)
+- `core/providers/stream.go` (existing - DONE)
+- `core/providers/anthropic.go` (existing - DONE)
+- `core/providers/openai.go` (existing - DONE)
+- `core/providers/google.go` (existing - DONE)
+- `core/providers/token_counter.go` (new - NOT DONE)
 
 **Parallelization:** Can execute in parallel with 0.8, 0.9, 0.10.
 
 **Acceptance Criteria:**
 
-#### Provider Interface
-- [ ] `ProviderAdapter` interface with `Name()`, `SupportedModels()`, `Complete()`, `Stream()`, `CountTokens()`, `MaxContextTokens()`, `HealthCheck()`
-- [ ] `CompletionRequest` struct: Model, Messages, MaxTokens, Temperature, Tools, attribution fields (SessionID, PipelineID, TaskID, AgentID)
-- [ ] `CompletionResponse` struct: Content, ToolCalls, InputTokens, OutputTokens, FinishReason, Provider, Model, Latency
-- [ ] `ModelInfo` struct: ID, Name, MaxContext, InputPricePerM, OutputPricePerM
+#### Provider Interface (DONE - core/providers/provider.go)
+- [x] `Provider` interface with `Name()`, `Generate()`, `Stream()`, `ValidateConfig()`, `SupportsModel()`, `DefaultModel()`, `Close()`
+- [x] `Request` struct: Model, Messages, MaxTokens, Temperature, TopP, Tools, StopSequences, SystemPrompt, ReasoningEffort
+- [x] `Response` struct: Content, Model, StopReason, Usage, ToolCalls, ProviderMetadata
+- [x] `Message` struct: Role, Content, ToolCalls, ToolCallID
+- [x] `Tool` struct: Name, Description, Parameters (JSON schema)
+- [x] `ToolCall` struct: ID, Name, Arguments
+- [x] `Usage` struct: InputTokens, OutputTokens, TotalTokens, CacheReadTokens, CacheWriteTokens
+- [x] `StopReason` constants: end_turn, max_tokens, stop_sequence, tool_use, error
+- [x] `StreamHandler` callback type for streaming
+- [ ] `SupportedModels() []ModelInfo` - returns available models with pricing info
+- [ ] `CountTokens(messages []Message) (int, error)` - pre-request token estimation
+- [ ] `MaxContextTokens(model string) int` - model context window size
+- [ ] `HealthCheck(ctx context.Context) error` - provider availability check
 
-#### Anthropic Adapter (`core/llm/anthropic.go`)
-- [ ] Implement `ProviderAdapter` for Anthropic API
-- [ ] Support Claude models: claude-sonnet-4-20250514, claude-opus-4-20250514, claude-haiku-3-5-20241022
-- [ ] Handle streaming responses via SSE
-- [ ] Parse usage from response for token tracking
-- [ ] Map tool_use blocks to `ToolCall` struct
+#### Anthropic Adapter (DONE - core/providers/anthropic.go)
+- [x] Implement `Provider` interface for Anthropic API
+- [x] Support Claude models: claude-opus-4-5-20251101, claude-sonnet-4-5-20250901, claude-haiku-4-5-20251001
+- [x] Handle streaming responses via SSE with NewStreaming()
+- [x] Parse usage from response for token tracking (InputTokens, OutputTokens, CacheReadTokens, CacheWriteTokens)
+- [x] Map tool_use blocks to `ToolCall` struct
+- [x] Beta headers for interleaved thinking and fine-grained tool streaming
+- [x] Long context support (1M tokens) for Sonnet
 
-#### OpenAI Adapter (`core/llm/openai.go`)
-- [ ] Implement `ProviderAdapter` for OpenAI API
-- [ ] Support GPT models: gpt-4o, gpt-4o-mini, o1, o1-mini
-- [ ] Handle streaming responses
-- [ ] Parse usage from response
-- [ ] Map function_call to `ToolCall` struct
+#### OpenAI Adapter (DONE - core/providers/openai.go)
+- [x] Implement `Provider` interface for OpenAI API
+- [x] Support models via Responses API: gpt-5.2-codex
+- [x] Handle streaming responses with ResponseTextDeltaEvent
+- [x] Parse usage from response
+- [x] Map function_call to `ToolCall` struct
+- [x] Support reasoning effort configuration (low, medium, high, xhigh)
+- [x] Organization and Project headers support
 
-#### Google Adapter (`core/llm/google.go`)
-- [ ] Implement `ProviderAdapter` for Google Generative AI API
-- [ ] Support Gemini models: gemini-2.0-flash, gemini-2.5-pro
-- [ ] Handle streaming responses
-- [ ] Parse usage metadata
-- [ ] Map function calls to `ToolCall` struct
+#### Google Adapter (DONE - core/providers/google.go)
+- [x] Implement `Provider` interface for Google Generative AI API
+- [x] Support Gemini models: gemini-3-pro-preview
+- [x] Handle streaming responses with GenerateContentStream iterator
+- [x] Parse UsageMetadata for token tracking
+- [x] Map FunctionCall to `ToolCall` struct
+- [x] Vertex AI support (project/location configuration)
+- [x] Safety settings configuration
+- [x] TopK parameter support
 
-#### Token Counter (`core/llm/token_counter.go`)
+#### Token Counter (NOT DONE - core/providers/token_counter.go)
 - [ ] `TokenCounter` interface with `Count(messages []Message) int`
 - [ ] Provider-specific implementations (tiktoken for OpenAI, approximation for others)
 - [ ] Cache tokenizer instances per model
 - [ ] Fallback to character-based estimation if tokenizer unavailable
+- [ ] Include tool definitions in token count
 
 **Tests:**
-- [ ] Each adapter correctly formats requests for its provider
-- [ ] Streaming responses parsed correctly
+- [x] Each adapter correctly formats requests for its provider
+- [x] Streaming responses parsed correctly
 - [ ] Token counts match provider response
 - [ ] HealthCheck returns provider status
 - [ ] Invalid API key returns clear error
+- [ ] Rate limit (429) handled correctly
 
 ```go
-// Required interface
-type ProviderAdapter interface {
+// Current interface (implemented)
+type Provider interface {
     Name() string
-    SupportedModels() []ModelInfo
-    Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error)
-    Stream(ctx context.Context, req *CompletionRequest) (<-chan StreamChunk, error)
-    CountTokens(messages []Message) (int, error)
-    MaxContextTokens(model string) int
-    HealthCheck(ctx context.Context) error
+    Generate(ctx context.Context, req *Request) (*Response, error)
+    Stream(ctx context.Context, req *Request, handler StreamHandler) error
+    ValidateConfig() error
+    SupportsModel(model string) bool
+    DefaultModel() string
+    Close() error
 }
+
+// Missing methods (to be added)
+// SupportedModels() []ModelInfo
+// CountTokens(messages []Message) (int, error)
+// MaxContextTokens(model string) int
+// HealthCheck(ctx context.Context) error
 ```
 
 ---
@@ -3115,6 +4497,162 @@ type RateLimiter interface {
     RecordUsage(tokens int)
     State() RateLimitState
     BackoffRemaining() time.Duration
+}
+```
+
+---
+
+### 0.10a Streaming + Event Bus Integration
+
+Real-time LLM streaming responses integrated with the event bus for reactive agent coordination.
+
+**Reference:** See ARCHITECTURE.md "Streaming + Event Bus Integration" section for detailed design.
+
+**Files:**
+- `core/providers/stream.go` (existing - enhance)
+- `core/providers/stream_bridge.go` (new)
+- `core/providers/stream_metrics.go` (new)
+- `core/providers/anthropic.go` (existing - done)
+- `core/providers/google.go` (existing - done)
+- `core/providers/openai.go` (existing - done)
+
+**Dependencies:** Requires 0.6 (Bus Enhancements), 0.11 (Signal Bus) for full integration.
+
+**Acceptance Criteria:**
+
+#### Core Streaming Types (DONE - core/providers/stream.go)
+
+- [x] `StreamChunk` struct with Index, Text, Type, ToolCall, Usage, StopReason, Timestamp
+- [x] `StreamChunkType` constants: text, tool_start, tool_delta, tool_end, start, end, error
+- [x] `ToolCallChunk` struct with ID, Name, ArgumentsDelta
+- [x] `StreamAccumulator` with thread-safe chunk collection
+- [x] `StreamAccumulator.Add()` handles all chunk types correctly
+- [x] `StreamAccumulator.Response()` builds complete Response from chunks
+- [x] `StreamCollector` wraps StreamHandler with optional callbacks
+- [x] `StreamToChannel()` converts callback-based streaming to Go channels
+- [x] `StreamWithCallback()` convenience function for simple text streaming
+- [x] Channel buffer size 100 for backpressure absorption
+
+#### Provider Streaming Implementations (DONE)
+
+- [x] Anthropic adapter: Stream() with event-based SSE handling
+- [x] Anthropic: Converts ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent to StreamChunk
+- [x] Anthropic: Tracks tool call IDs via toolCallIDForIndex map
+- [x] Anthropic: Sends ChunkTypeStart at stream beginning
+- [x] Anthropic: Sends ChunkTypeEnd with final Usage and StopReason
+- [x] Google adapter: Stream() with iterator-based API
+- [x] Google: Range-based iteration over GenerateContentStream
+- [x] Google: Handles function calls with toolCallsSeen deduplication
+- [x] OpenAI adapter: Stream() with Responses API events
+- [x] OpenAI: Handles ResponseTextDeltaEvent, ResponseFunctionCallArgumentsDeltaEvent
+- [x] OpenAI: Handles ResponseCompletedEvent, ResponseFailedEvent, ResponseIncompleteEvent
+- [x] All providers: Handler error return halts stream cleanly
+- [x] All providers: Context cancellation propagates correctly
+
+#### Event Bus Message Wrapping (NOT DONE - core/providers/stream_bridge.go)
+
+- [ ] `StreamContext` struct: CorrelationID, RequestID, SessionID, ProviderName, TargetAgent, Model, AgentID, Priority
+- [ ] `WrapStreamChunk(chunk *StreamChunk, ctx StreamContext) Message[StreamChunk]` function
+- [ ] Message includes CorrelationID linking all chunks from one generation
+- [ ] Message includes ParentID linking to triggering request
+- [ ] Message metadata includes model, agent_id, chunk_index, chunk_type
+- [ ] Priority inheritance from request context
+- [ ] MessageType constant: `MessageTypeStream = "stream"`
+
+#### Stream Bridge Service (NOT DONE - core/providers/stream_bridge.go)
+
+- [ ] `StreamBridge` struct manages streaming-to-eventbus conversion
+- [ ] `StartStream(ctx context.Context, provider Provider, req *Request, streamCtx StreamContext) error`
+- [ ] Goroutine reads from StreamToChannel, wraps chunks, publishes to event bus
+- [ ] Graceful shutdown on context cancellation
+- [ ] Error chunks converted to ChunkTypeError messages
+- [ ] `CancelStream(correlationID string)` sends cancellation signal via event bus
+- [ ] `StreamControl` message type: {Action: "cancel", Reason: string}
+
+#### Stream Metrics Collection (NOT DONE - core/providers/stream_metrics.go)
+
+- [ ] `StreamMetrics` struct: TimeToFirstToken, TimeToFirstToolCall, TotalDuration, TokensPerSecond, ChunksReceived, EarlyAborts, TokensSaved, BackpressureEvents
+- [ ] `CollectStreamMetrics(chunks <-chan *StreamChunk, done <-chan struct{}) *StreamMetrics`
+- [ ] Time to first token tracked from stream start
+- [ ] Time to first tool call tracked when ChunkTypeToolStart received
+- [ ] Tokens per second calculated from final Usage
+- [ ] Early aborts counted when stream cancelled before ChunkTypeEnd
+- [ ] Tokens saved estimated from aborted streams
+- [ ] Backpressure events counted when channel send blocks
+- [ ] Metrics exported via Prometheus-compatible interface
+
+#### Stream Timeout Watchdog (NOT DONE - core/providers/stream_bridge.go)
+
+- [ ] `StreamWatchdog` monitors streams for timeout
+- [ ] Configurable timeout duration (default: 60s between chunks)
+- [ ] Watchdog cancels context if no chunks received within timeout
+- [ ] Timeout events logged with stream metadata
+- [ ] Partial response preserved on timeout
+
+#### Agent Stream Integration Patterns (NOT DONE - documentation only)
+
+- [ ] Document pattern: Agent subscribes to MessageTypeStream with CorrelationID filter
+- [ ] Document pattern: Progressive UI rendering from ChunkTypeText
+- [ ] Document pattern: Real-time token budget checking
+- [ ] Document pattern: Early tool preparation from ChunkTypeToolStart
+- [ ] Document pattern: Validation-based early abort
+
+#### Backpressure Monitoring (NOT DONE - core/providers/stream_metrics.go)
+
+- [ ] Detect when channel send blocks (producer faster than consumer)
+- [ ] Track cumulative backpressure time per stream
+- [ ] Emit warning when backpressure exceeds threshold (configurable, default 5s cumulative)
+- [ ] Metrics include backpressure_events_total and backpressure_duration_seconds
+
+#### Edge Case Handling (PARTIALLY DONE)
+
+- [x] Network interruption: stream.Err() returns error, ChunkTypeError sent
+- [x] Context cancellation: ctx.Done() propagates, handler returns ctx.Err()
+- [x] Multiple tool calls: toolCallIDForIndex map handles correctly
+- [ ] Rate limit (429) during stream: Convert to ChunkTypeError, trigger RateLimiter.OnRateLimit()
+- [ ] Malformed tool arguments: Validation in accumulator, error in Response
+- [ ] Stream timeout: Watchdog cancels, partial response preserved
+
+**Tests:**
+
+- [ ] StreamToChannel correctly converts all chunk types
+- [ ] WrapStreamChunk creates valid Message[StreamChunk] with correct metadata
+- [ ] StreamBridge publishes chunks to event bus in order
+- [ ] CancelStream sends control message and halts stream
+- [ ] StreamMetrics accurately tracks all timing metrics
+- [ ] StreamWatchdog cancels stream after timeout
+- [ ] Backpressure events detected and counted
+- [ ] Edge cases (timeout, 429, cancellation) handled correctly
+- [ ] No goroutine leaks on stream completion or cancellation
+- [ ] Concurrent streams to same event bus work correctly
+
+```go
+// Required new types
+type StreamContext struct {
+    CorrelationID string
+    RequestID     string
+    SessionID     string
+    ProviderName  string
+    TargetAgent   string
+    Model         string
+    AgentID       string
+    Priority      Priority
+}
+
+type StreamControl struct {
+    Action string `json:"action"` // "cancel"
+    Reason string `json:"reason"`
+}
+
+type StreamMetrics struct {
+    TimeToFirstToken    time.Duration
+    TimeToFirstToolCall time.Duration
+    TotalDuration       time.Duration
+    TokensPerSecond     float64
+    ChunksReceived      int
+    EarlyAborts         int
+    TokensSaved         int
+    BackpressureEvents  int
 }
 ```
 
@@ -5427,6 +6965,1146 @@ Cross-group dependencies:
 - 0.42 needs 0.34 (Resource Pools from Tier 1)
 - 0.49 needs 0.20 (Staging from Concurrency)
 - 0.48 needs Archivalist agent
+
+---
+
+## Tier 1 Multi-Session Amendments
+
+These tasks amend the original Tier 1 components to support multi-session coordination.
+
+### 0.55 Global Subscription Tracker
+
+Cross-session usage tracking for subscription-based rate limiting (weekly/monthly quotas).
+
+**Files to create:**
+- `core/llm/subscription_tracker.go`
+
+**Dependencies:** Requires 0.39 (Session Registry) for shared SQLite.
+
+**Acceptance Criteria:**
+
+#### Schema
+- [ ] `subscription_usage` table: provider, period_start, period_end, requests_used, tokens_used
+- [ ] Atomic increment with SQLite transactions
+- [ ] Period auto-rotation (weekly/monthly boundary detection)
+
+#### Tracking
+- [ ] RecordUsage atomically updates global counts
+- [ ] Per-provider tracking (anthropic, openai, google)
+- [ ] Support for nil limits (unlimited - rely on 429)
+- [ ] Period configurable: week, month, day
+
+#### Warnings
+- [ ] Warn at configurable threshold (default 80%)
+- [ ] Broadcast warning to ALL sessions via Signal Dispatcher
+- [ ] Different warning levels: warning (80%), critical (95%), exceeded (100%)
+- [ ] Warning includes: provider, usage percent, period end date
+
+#### Configuration
+- [ ] `subscription.{provider}.period`: week | month | day
+- [ ] `subscription.{provider}.max_requests`: int or nil
+- [ ] `subscription.{provider}.max_tokens`: int or nil
+- [ ] `subscription.{provider}.warn_threshold`: float (0.8)
+
+**Tests:**
+- [ ] Two sessions increment same provider atomically
+- [ ] Warning broadcast reaches all sessions
+- [ ] Period rotation resets counters correctly
+- [ ] Nil limit means no blocking (only 429 handling)
+
+---
+
+### 0.56 Cross-Session Dual Queue Gate
+
+Multi-session LLM request queue with cross-session user preemption.
+
+**Files to create:**
+- `core/llm/cross_session_queue.go`
+
+**Dependencies:** Requires 0.39 (Session Registry), 0.41 (Signal Dispatcher), 0.55 (Subscription Tracker).
+
+**Acceptance Criteria:**
+
+#### Global Queues
+- [ ] Single global user-interactive queue (FIFO across sessions)
+- [ ] Single global pipeline queue (priority-ordered across sessions)
+- [ ] SQLite-backed queue persistence for crash recovery
+
+#### User Priority
+- [ ] User request from ANY session preempts pipeline from ANY session
+- [ ] User queue ALWAYS drains before pipeline queue
+- [ ] FIFO ordering among user requests (fair across sessions)
+
+#### Preemption
+- [ ] Find lowest-priority active pipeline request across ALL sessions
+- [ ] Cancel and notify owning session via Signal Dispatcher
+- [ ] Cancelled request re-queued automatically
+
+#### Per-Session State
+- [ ] Track active requests per session
+- [ ] Track queued requests per session
+- [ ] Fair share enforcement (sessions can't monopolize)
+
+#### Integration
+- [ ] Check GlobalSubscriptionTracker before accepting requests
+- [ ] Check GlobalCircuitBreakerRegistry before dispatching
+- [ ] Respect per-session fair share allocation
+
+**Tests:**
+- [ ] User in Session A preempts pipeline in Session B
+- [ ] Pipeline priority ordering works across sessions
+- [ ] Queue persistence survives crash
+- [ ] Fair share prevents session monopolization
+
+---
+
+### 0.57 Global Pipeline Scheduler
+
+Cross-session pipeline scheduling with global N_CPU_CORES limit.
+
+**Files to create:**
+- `core/pipeline/global_scheduler.go`
+
+**Dependencies:** Requires 0.39 (Session Registry), 0.40 (Fair Share Calculator), 0.41 (Signal Dispatcher).
+
+**Acceptance Criteria:**
+
+#### Global Limit
+- [ ] N_CPU_CORES is GLOBAL across all sessions
+- [ ] Track totalActive across all sessions
+- [ ] SQLite-backed for shared state
+
+#### Fair Share Integration
+- [ ] Use FairShareCalculator (0.40) for per-session allocation
+- [ ] Rebalance on session join/leave
+- [ ] Rebalance on allocation change signal
+
+#### Per-Session Tracking
+- [ ] Track sessionActive[sessionID] = running count
+- [ ] Track sessionQueued[sessionID] = priority queue
+- [ ] Session can only use up to its fair share allocation
+
+#### Scheduling
+- [ ] Schedule() respects both global limit and session fair share
+- [ ] OnPipelineComplete() triggers cross-session rebalancing
+- [ ] Queued pipelines dispatched fairly across sessions
+
+#### Preemption Support
+- [ ] User-invoked pipeline can preempt background pipeline
+- [ ] Preemption from any session's user activity
+- [ ] Notify preempted session via Signal Dispatcher
+
+**Tests:**
+- [ ] Two sessions share N_CPU_CORES fairly
+- [ ] Active session gets more slots than idle
+- [ ] Rebalancing works on session join/leave
+- [ ] No session exceeds its fair share allocation
+
+---
+
+### 0.58 Multi-Session WAL Manager
+
+Per-session WAL files with shared metadata for crash recovery.
+
+**Files to create:**
+- `core/state/multi_session_wal.go`
+
+**Dependencies:** Requires 0.22 (WAL), 0.39 (Session Registry).
+
+**Acceptance Criteria:**
+
+#### Directory Structure
+- [ ] Per-session: ~/.sylk/sessions/{sessionID}/wal/
+- [ ] Per-session: ~/.sylk/sessions/{sessionID}/checkpoints/
+- [ ] Shared: ~/.sylk/shared/sessions.db (metadata)
+
+#### WAL Management
+- [ ] GetOrCreateWAL(sessionID) creates/retrieves WAL
+- [ ] Each session has independent WAL (crash isolation)
+- [ ] Register session in shared DB on creation
+
+#### Recovery
+- [ ] RecoverAllSessions() on startup
+- [ ] Query shared DB for unrecovered sessions
+- [ ] Recover each session's WAL independently
+- [ ] Mark as recovered in shared DB
+
+#### Cleanup
+- [ ] Remove session directory on explicit cleanup
+- [ ] Retain WAL for configurable period (default 7 days)
+- [ ] Prune old sessions periodically
+
+**Tests:**
+- [ ] Session A crash doesn't affect Session B WAL
+- [ ] Recovery finds all unrecovered sessions
+- [ ] Cleanup removes old session data
+- [ ] Concurrent WAL writes don't conflict
+
+---
+
+### 0.59 Global Circuit Breaker Registry
+
+Shared circuit breaker state across all sessions.
+
+**Files to create:**
+- `core/errors/global_circuit_breaker.go`
+
+**Dependencies:** Requires 0.29 (Circuit Breaker), 0.39 (Session Registry), 0.41 (Signal Dispatcher).
+
+**Acceptance Criteria:**
+
+#### Shared State
+- [ ] `circuit_breakers` table: resource_id, state, failures, last_failure, last_state_change, cooldown_ends
+- [ ] Atomic state transitions in SQLite
+- [ ] Resource IDs: llm:anthropic, llm:openai, network, file, subprocess
+
+#### Local Cache
+- [ ] Each session maintains local cache of circuit states
+- [ ] Refresh cache on Signal Dispatcher notification
+- [ ] Allow() uses local cache (fast path)
+
+#### State Changes
+- [ ] RecordResult() updates shared state
+- [ ] Broadcast state change to ALL sessions via Signal Dispatcher
+- [ ] All sessions receive update within signal_debounce (default 100ms)
+
+#### Benefits
+- [ ] Session A hits 429 → ALL sessions know immediately
+- [ ] Shared cooldown prevents duplicate probes
+- [ ] Global half-open allows ONE probe across all sessions
+
+#### Manual Reset
+- [ ] ForceReset() updates shared state
+- [ ] Broadcasts reset to all sessions
+- [ ] All sessions resume immediately
+
+**Tests:**
+- [ ] Session A trips circuit → Session B sees OPEN
+- [ ] Cooldown shared (only one probe attempt globally)
+- [ ] State change broadcast reaches all sessions
+- [ ] Local cache provides fast Allow() checks
+
+---
+
+### 0.60 Tier 1 Multi-Session Integration Tests
+
+End-to-end tests for multi-session Tier 1 amendments.
+
+**Files to create:**
+- `core/llm/multi_session_test.go`
+- `core/pipeline/multi_session_test.go`
+- `core/state/multi_session_test.go`
+- `core/errors/multi_session_test.go`
+
+**Dependencies:** Requires 0.55-0.59.
+
+**Acceptance Criteria:**
+
+#### Subscription Tests
+- [ ] Two sessions share subscription quota correctly
+- [ ] Warning broadcasts to both sessions
+- [ ] Period rotation resets for all sessions
+
+#### Queue Tests
+- [ ] User preemption works across sessions
+- [ ] Pipeline priority ordering is global
+- [ ] Fair share prevents monopolization
+
+#### Scheduler Tests
+- [ ] N_CPU_CORES shared globally
+- [ ] Rebalancing works on session changes
+- [ ] Preemption notifications delivered
+
+#### WAL Tests
+- [ ] Session A crash recovery independent
+- [ ] Shared metadata consistent
+- [ ] Cleanup removes correct sessions
+
+#### Circuit Breaker Tests
+- [ ] Trip in one session affects all
+- [ ] Recovery synchronized across sessions
+- [ ] No stampede on recovery
+
+**Tests:**
+- [ ] All integration scenarios pass
+- [ ] No race conditions (run with -race)
+- [ ] SQLite contention handled gracefully
+
+---
+
+### Tier 1 Multi-Session Parallelization Notes
+
+The following tasks can be executed in parallel:
+- **Group M1**: 0.55 (depends on 0.39 only)
+- **Group M2**: 0.58 (depends on 0.22, 0.39)
+- **Group M3**: 0.59 (depends on 0.29, 0.39, 0.41)
+
+Sequential dependencies:
+- 0.55 → 0.56 (Queue needs Subscription Tracker)
+- 0.39, 0.40, 0.41 → 0.57 (Scheduler needs all session coordination)
+- 0.55-0.59 → 0.60 (Integration tests need all components)
+
+Optimal execution order:
+1. Ensure 0.39-0.41 complete (from Tier 2)
+2. Start 0.55, 0.58, 0.59 in parallel
+3. When 0.55 completes → start 0.56
+4. When 0.39-0.41 complete → start 0.57
+5. When all 0.55-0.59 complete → start 0.60
+
+---
+
+## Tier 3: Storage & Configuration
+
+Foundational storage layout, configuration management, credential handling, and database operations. **These tasks have NO dependencies on Tier 1 or Tier 2** and can be executed in parallel with all other work.
+
+### 0.61 Directory Manager
+
+Platform-native directory resolution with XDG support.
+
+**Files to create:**
+- `core/storage/dirs.go`
+- `core/storage/dirs_darwin.go`
+- `core/storage/dirs_linux.go`
+- `core/storage/dirs_windows.go`
+
+**Dependencies:** None (foundational).
+
+**Acceptance Criteria:**
+
+#### Directory Resolution
+- [ ] Check XDG environment variables first (all platforms)
+- [ ] Fall back to platform-native defaults:
+  - [ ] Linux: ~/.config, ~/.local/share, ~/.cache, ~/.local/state
+  - [ ] macOS: ~/Library/Preferences, ~/Library/Application Support, ~/Library/Caches, ~/Library/Logs
+  - [ ] Windows: %APPDATA%, %LOCALAPPDATA%
+- [ ] Create directories on first access if missing
+
+#### Directory Types
+- [ ] Config: user settings, credentials
+- [ ] Data: sessions, databases, per-project knowledge
+- [ ] Cache: regenerable (TTL-tiered: hot/warm/cold)
+- [ ] State: logs, runtime, temp, signals
+
+#### Project-Local
+- [ ] Detect .sylk/ in project root
+- [ ] Support config.yaml (committed) vs local/ (gitignored)
+- [ ] ProjectHash() for consistent project identification
+
+#### Helpers
+- [ ] EnsureDir() creates with correct permissions (0700 for sensitive)
+- [ ] CleanupDir() removes with validation
+- [ ] TempDir() returns OS-managed temp with sylk prefix
+
+**Tests:**
+- [ ] Platform detection works correctly
+- [ ] XDG override works on all platforms
+- [ ] Directory creation idempotent
+- [ ] Permissions correct on Unix
+
+---
+
+### 0.62 Configuration Manager
+
+YAML configuration with JSON Schema validation, layering, and hot reload.
+
+**Files to create:**
+- `core/config/manager.go`
+- `core/config/schema.go`
+- `core/config/merge.go`
+- `core/config/watcher.go`
+- `core/config/config.schema.json`
+
+**Dependencies:** 0.61 (Directory Manager).
+
+**Acceptance Criteria:**
+
+#### Config Loading
+- [ ] Load defaults from code
+- [ ] Deep merge project config (.sylk/config.yaml)
+- [ ] Deep merge user config (user wins over project)
+- [ ] Deep merge project-local overrides (.sylk/local/config.yaml)
+- [ ] Apply environment variables last
+
+#### Environment Variables
+- [ ] Simple values: SYLK_LLM_TIMEOUT → llm.timeout
+- [ ] File references: SYLK_LLM_PROVIDERS_FILE → load and merge
+- [ ] Document all supported variables
+
+#### Validation
+- [ ] JSON Schema validation
+- [ ] Warn on invalid values (don't refuse to start)
+- [ ] Use defaults for invalid fields
+- [ ] Emit summary of warnings
+
+#### Hot Reload
+- [ ] SIGHUP triggers reload
+- [ ] fsnotify watches config files
+- [ ] Debounce 500ms
+- [ ] Notify user on reload success/failure
+- [ ] Atomic config swap (no partial state)
+
+#### Schema
+- [ ] Complete JSON Schema for all config options
+- [ ] IDE autocomplete support
+- [ ] Default values documented in schema
+
+**Tests:**
+- [ ] Layering precedence correct
+- [ ] Deep merge works for nested maps
+- [ ] Invalid config doesn't crash startup
+- [ ] Hot reload applies changes correctly
+- [ ] Environment override works
+
+---
+
+### 0.63 Credential Manager
+
+Credential storage with keychain integration and encrypted fallback.
+
+**Files to create:**
+- `core/credentials/manager.go`
+- `core/credentials/keychain_darwin.go`
+- `core/credentials/keychain_linux.go`
+- `core/credentials/keychain_windows.go`
+- `core/credentials/encrypted_file.go`
+- `core/credentials/profiles.go`
+
+**Dependencies:** 0.61 (Directory Manager).
+
+**Acceptance Criteria:**
+
+#### Resolution Order
+- [ ] 1. Environment variable (ANTHROPIC_API_KEY, etc.)
+- [ ] 2. System keychain (if available)
+- [ ] 3. Encrypted file fallback
+
+#### Keychain Integration
+- [ ] macOS: Keychain Access API
+- [ ] Linux: Secret Service API (D-Bus)
+- [ ] Windows: Credential Manager API
+- [ ] Graceful fallback if unavailable
+
+#### Encrypted File Fallback
+- [ ] Hardware-backed key if available (TPM/Secure Enclave)
+- [ ] Machine-bound key derivation (Argon2id)
+- [ ] NOT portable between machines (intentional)
+- [ ] AES-256-GCM encryption
+
+#### Verification
+- [ ] Verify API key before storing (lightweight API call)
+- [ ] Clear error message on invalid key
+- [ ] Support --skip-verify flag for offline setup
+
+#### Named Profiles
+- [ ] Default profile used when unspecified
+- [ ] sylk auth <provider> --profile <name>
+- [ ] sylk --profile <name> to use profile
+- [ ] SYLK_PROFILE environment override
+- [ ] Project can specify profile in .sylk/config.yaml
+
+**Tests:**
+- [ ] Environment variable takes precedence
+- [ ] Keychain storage/retrieval works
+- [ ] Encrypted file works when keychain unavailable
+- [ ] Verification catches invalid keys
+- [ ] Profile switching works
+
+---
+
+### 0.64 Database Manager
+
+SQLite database management with WAL, connection pooling, and migrations.
+
+**Files to create:**
+- `core/database/manager.go`
+- `core/database/pool.go`
+- `core/database/migration.go`
+- `core/database/locks.go`
+- `core/database/migrations/system.go`
+- `core/database/migrations/knowledge.go`
+- `core/database/migrations/session.go`
+
+**Dependencies:** 0.61 (Directory Manager).
+
+**Acceptance Criteria:**
+
+#### Database Organization
+- [ ] system.db: GLOBAL (sessions, subscription, circuit breakers)
+- [ ] projects/{hash}/knowledge.db: PER-PROJECT knowledge
+- [ ] projects/{hash}/index.db: PER-PROJECT VectorGraphDB
+- [ ] sessions/{id}/session.db: PER-SESSION state
+
+#### SQLite Configuration
+- [ ] WAL mode for concurrent access
+- [ ] Configurable busy timeout (default 30s)
+- [ ] Foreign keys enabled
+- [ ] Appropriate cache size
+
+#### Connection Pooling
+- [ ] Per-database connection pool
+- [ ] Configurable pool size
+- [ ] Connection health checks
+- [ ] Graceful shutdown
+
+#### Migrations
+- [ ] Embedded schema versioning (PRAGMA user_version)
+- [ ] Additive migrations: apply directly
+- [ ] Destructive migrations: backup first
+- [ ] Transaction per migration
+- [ ] Rollback on failure
+
+#### Advisory Locks
+- [ ] Cross-process locks for critical operations
+- [ ] Lock files in state/locks/
+- [ ] Used for: migrations, rebuilds, backups
+- [ ] Timeout-aware acquisition
+
+**Tests:**
+- [ ] WAL mode enables concurrent reads
+- [ ] Migrations apply in order
+- [ ] Destructive migration creates backup
+- [ ] Advisory locks prevent conflicts
+- [ ] Pool handles connection failures
+
+---
+
+### 0.65 Backup Manager
+
+Database backup with periodic, pre-session, and pre-migration triggers.
+
+**Files to create:**
+- `core/backup/manager.go`
+- `core/backup/scheduler.go`
+- `core/backup/retention.go`
+
+**Dependencies:** 0.61 (Directory Manager), 0.64 (Database Manager).
+
+**Acceptance Criteria:**
+
+#### Backup Triggers
+- [ ] Periodic: configurable interval (default 24h)
+- [ ] Pre-session: before each new session starts
+- [ ] Pre-migration: before destructive schema changes
+
+#### Backup Implementation
+- [ ] SQLite Online Backup API (non-blocking)
+- [ ] Consistent snapshot
+- [ ] Timestamped filenames
+
+#### Backup Location
+- [ ] {data}/backups/system/
+- [ ] {data}/backups/projects/{hash}/
+
+#### Retention
+- [ ] Keep last N backups (configurable, default 10)
+- [ ] Automatic cleanup of older backups
+- [ ] Preserve pre-migration backups longer (configurable)
+
+#### Scheduler
+- [ ] Background goroutine for periodic backups
+- [ ] Configurable schedule
+- [ ] Skip if backup already recent
+
+**Tests:**
+- [ ] Periodic backup triggers on schedule
+- [ ] Pre-session backup created
+- [ ] Retention cleanup removes oldest
+- [ ] Online backup doesn't block reads
+
+---
+
+### 0.66 Integrity Monitor
+
+Database integrity checking with auto-recovery.
+
+**Files to create:**
+- `core/integrity/monitor.go`
+- `core/integrity/recovery.go`
+- `core/integrity/rebuild.go`
+
+**Dependencies:** 0.64 (Database Manager), 0.65 (Backup Manager).
+
+**Acceptance Criteria:**
+
+#### Detection
+- [ ] On startup: full PRAGMA integrity_check
+- [ ] Periodic: quick check every 5 minutes (configurable)
+- [ ] On error: check after unexpected SQL errors
+
+#### Recovery Flow
+- [ ] Log corruption details
+- [ ] Notify user
+- [ ] Attempt auto-restore from backup if available
+- [ ] Offer rebuild if database is rebuildable
+
+#### Rebuildable Databases
+- [ ] index.db: re-index codebase
+- [ ] knowledge.db: rebuild from logs + re-learn
+
+#### Non-Rebuildable
+- [ ] system.db: require backup
+- [ ] session.db: require backup
+
+#### Rebuild Process
+- [ ] Create fresh database
+- [ ] Re-run indexing (Librarian for index.db)
+- [ ] Mark as rebuilt (may have lost some data)
+
+**Tests:**
+- [ ] Startup check catches corruption
+- [ ] Periodic check runs on schedule
+- [ ] Auto-restore from backup works
+- [ ] Rebuild creates valid database
+- [ ] User notified of recovery actions
+
+---
+
+### 0.67 Tier 3 Integration Tests
+
+End-to-end tests for storage and configuration system.
+
+**Files to create:**
+- `core/storage/integration_test.go`
+- `core/config/integration_test.go`
+- `core/credentials/integration_test.go`
+- `core/database/integration_test.go`
+
+**Dependencies:** 0.61-0.66.
+
+**Acceptance Criteria:**
+
+#### Directory Tests
+- [ ] Platform-native paths correct
+- [ ] XDG override works
+- [ ] Project-local detection works
+
+#### Config Tests
+- [ ] Full layering scenario
+- [ ] Hot reload updates running system
+- [ ] Invalid config handled gracefully
+
+#### Credential Tests
+- [ ] Full resolution chain
+- [ ] Profile switching
+- [ ] Verification flow
+
+#### Database Tests
+- [ ] Multi-session concurrent access
+- [ ] Migration sequence
+- [ ] Backup and restore cycle
+- [ ] Corruption detection and recovery
+
+#### Stress Tests
+- [ ] Many concurrent DB operations
+- [ ] Rapid config reloads
+- [ ] Backup during heavy writes
+
+**Tests:**
+- [ ] All integration scenarios pass
+- [ ] No race conditions (run with -race)
+- [ ] Cross-platform CI passes
+
+---
+
+### Tier 3 Parallelization Notes
+
+**CRITICAL: Tier 3 has NO dependencies on Tier 1 or Tier 2.**
+
+These tasks can be executed in parallel with ALL other work:
+
+```
+Tier 3 (Storage & Config)     Tier 1 & 2 (Agent Infrastructure)
+═══════════════════════════   ═══════════════════════════════════
+
+0.61 Directory Manager ─┐     0.7-0.60 (all Tier 1 & 2 tasks)
+0.62 Config Manager ────┤         │
+0.63 Credential Manager ┼─────────┼───► Can run completely in parallel
+0.64 Database Manager ──┤         │
+0.65 Backup Manager ────┤         │
+0.66 Integrity Monitor ─┤         │
+0.67 Integration Tests ─┘         │
+```
+
+**Within Tier 3, dependencies:**
+```
+0.61 (Dirs) ─┬─► 0.62 (Config)
+             ├─► 0.63 (Credentials)
+             └─► 0.64 (Database) ─┬─► 0.65 (Backup)
+                                  └─► 0.66 (Integrity)
+                                           │
+All 0.61-0.66 ─────────────────────────────┴─► 0.67 (Integration)
+```
+
+**Optimal parallel execution:**
+1. Start 0.61 immediately (no dependencies)
+2. When 0.61 completes → start 0.62, 0.63, 0.64 in parallel
+3. When 0.64 completes → start 0.65, 0.66 in parallel
+4. When all 0.61-0.66 complete → start 0.67
+
+**Integration points (connect later):**
+- 0.39 (Session Registry) will USE 0.64 (Database Manager) for SQLite access
+- 0.55 (Subscription Tracker) will USE 0.64 for database, 0.61 for paths
+- VectorGraphDB will USE 0.64 for database management
+- All agents will USE 0.62 for configuration
+
+These integration points are wired up AFTER both sides complete - no blocking dependency.
+
+---
+
+## Tier 4: Security Model
+
+Security infrastructure providing defense-in-depth through permissions, sandboxing, audit logging, and session isolation.
+
+**CRITICAL: Tier 4 has NO dependencies on Tier 1, 2, or 3 core implementations.**
+
+Tier 4 can run in parallel with all other work. Integration points connect after both sides complete.
+
+---
+
+### 0.68 Permission Manager
+
+Role-based permission system with per-project persistent allowlists.
+
+**Files to create:**
+- `core/security/permission_manager.go`
+- `core/security/roles.go`
+- `core/security/allowlist.go`
+- `core/security/safe_defaults.go`
+
+**Dependencies:** None (foundational).
+
+**Acceptance Criteria:**
+
+#### Role System
+- [ ] `AgentRole` type with 6 levels: Observer, ObserverKnowledge, Worker, Supervisor, Orchestrator, Admin
+- [ ] `DefaultAgentRoles` mapping agent types to default roles
+- [ ] `roleHasCapability(role, action)` function
+- [ ] Role hierarchy enforced (higher roles have lower role permissions)
+
+#### Permission Actions
+- [ ] `PermissionAction` struct with Type, Target, PathPerm fields
+- [ ] Action types: Command, Network, Path, Config, Credential
+- [ ] `PathPerm` struct with Read, Write, Delete booleans
+
+#### Safe Defaults
+- [ ] `DefaultSafeCommands()` returns read-only and common build commands
+- [ ] `DefaultSafeDomains()` returns package registries and documentation sites
+- [ ] Configurable via `security.permissions.custom_safe_list` path
+
+#### Permission Checking
+- [ ] `CheckPermission(ctx, agentID, role, action)` returns `PermissionResult`
+- [ ] Check order: role → safe list → project allowlist → require approval
+- [ ] Command matching ignores arguments (allow `ls` = allow `ls -la`)
+- [ ] Domain matching is exact (no wildcards)
+
+#### Project Allowlists
+- [ ] Load/save from `.sylk/local/permissions.yaml` (gitignored)
+- [ ] `ApproveAndPersist(action)` adds to allowlist and saves
+- [ ] Separate maps: commandAllowlist, domainAllowlist, pathAllowlist
+- [ ] Special handling for .env and .gitignore (modify OK, delete requires approval)
+
+#### Pipeline Integration
+- [ ] `WorkflowPermissions` struct for pre-declared permissions
+- [ ] `PipelinePermissionManager` wraps base manager with workflow scope
+- [ ] Pre-declared permissions approved at workflow start
+- [ ] Runtime escalation support (if `AllowRuntimeEscalation` true)
+
+**Tests:**
+- [ ] Role capability checking correct
+- [ ] Safe defaults always allowed without prompt
+- [ ] Project allowlist persisted and reloaded
+- [ ] Command matching ignores arguments
+- [ ] Pipeline pre-declared permissions work
+- [ ] Runtime escalation queued correctly
+
+---
+
+### 0.69 Sandbox Manager
+
+Layered sandbox providing OS isolation, VFS, and network proxy.
+
+**Files to create:**
+- `core/security/sandbox.go`
+- `core/security/sandbox_linux.go` (bubblewrap)
+- `core/security/sandbox_darwin.go` (Seatbelt)
+- `core/security/sandbox_windows.go` (Job Objects)
+- `core/security/vfs.go`
+- `core/security/network_proxy.go`
+
+**Dependencies:** None (foundational).
+
+**Acceptance Criteria:**
+
+#### Sandbox Core
+- [ ] `SandboxConfig` struct with Enabled, OSIsolation, VFSLayer, NetworkProxy bools
+- [ ] Default: Enabled=false (OFF by default)
+- [ ] `Sandbox` struct with Execute method
+- [ ] Graceful degradation: if sandbox unavailable, warn and continue (configurable)
+
+#### OS Sandbox (Linux - bubblewrap)
+- [ ] Check `bwrap` available at startup
+- [ ] `wrapWithBubblewrap(cmd)` creates isolated command
+- [ ] Namespace isolation (--unshare-all)
+- [ ] Working directory bind-mounted read-write
+- [ ] System paths bind-mounted read-only
+- [ ] Resource limits (--die-with-parent)
+
+#### OS Sandbox (macOS - Seatbelt)
+- [ ] `wrapWithSeatbelt(cmd)` creates sandbox-exec command
+- [ ] Generate Seatbelt profile dynamically
+- [ ] Deny default, allow specific operations
+- [ ] Working directory allowed read-write
+- [ ] System paths allowed read-only
+
+#### OS Sandbox (Windows)
+- [ ] Job Objects for process containment
+- [ ] Resource limits via Job Object
+- [ ] Document limitations vs Unix sandboxes
+
+#### Virtual Filesystem Layer
+- [ ] `VirtualFilesystem` struct with staging directory
+- [ ] `PrepareForCommand(cmd)` sets up staging
+- [ ] `ValidatePath(path)` checks boundary violations
+- [ ] Symlink resolution to detect escapes
+- [ ] User-approved paths tracked in `approvedPaths`
+- [ ] `MergeChanges(cmd)` applies staged modifications
+- [ ] Copy-on-write semantics
+
+#### Network Proxy
+- [ ] `NetworkProxy` struct with HTTP proxy listener
+- [ ] `RouteCommand(cmd)` sets HTTP_PROXY env vars
+- [ ] Domain allowlist checking in handleRequest
+- [ ] Log allowed and blocked requests
+- [ ] Statistics tracking (requestsAllowed, requestsBlocked)
+
+#### CLI Commands
+- [ ] `/sandbox status` shows current configuration
+- [ ] `/sandbox enable` enables all layers
+- [ ] `/sandbox disable` disables with warning
+- [ ] `/sandbox enable vfs` enables specific layer
+- [ ] `/sandbox allow path /etc/hosts` adds path exception
+
+**Tests:**
+- [ ] Sandbox disabled by default
+- [ ] bubblewrap wrapping works on Linux
+- [ ] Seatbelt wrapping works on macOS
+- [ ] VFS prevents writes outside working dir
+- [ ] VFS merges changes correctly
+- [ ] Network proxy blocks unlisted domains
+- [ ] Graceful degradation when sandbox unavailable
+
+---
+
+### 0.70 Audit Logger
+
+Tamper-evident audit logging with cryptographic chaining.
+
+**Files to create:**
+- `core/security/audit_logger.go`
+- `core/security/audit_entry.go`
+- `core/security/audit_query.go`
+- `core/security/audit_integrity.go`
+
+**Dependencies:** None (foundational).
+
+**Acceptance Criteria:**
+
+#### Audit Entry Structure
+- [ ] `AuditEntry` struct with all fields from ARCHITECTURE.md
+- [ ] ID (UUID), Timestamp, Sequence (monotonic)
+- [ ] Category: permission, file, process, network, llm, session, config
+- [ ] Severity: info, warning, security, critical
+- [ ] Context: SessionID, ProjectID, AgentID, WorkflowID
+- [ ] Integrity: PreviousHash, EntryHash
+
+#### Logging Operations
+- [ ] `Log(entry)` writes tamper-evident entry
+- [ ] Automatic sequence numbering
+- [ ] Hash chain: each entry contains hash of previous
+- [ ] `computeEntryHash(entry)` uses SHA256
+- [ ] Append-only file writing
+- [ ] File rotation at configurable size
+
+#### Periodic Signatures
+- [ ] Ed25519 signing key generated/loaded at startup
+- [ ] `writeSignature()` every N entries (default: 100)
+- [ ] `AuditSignature` struct with SequenceFrom, SequenceTo, ChainHash, Signature
+- [ ] Signature lines prefixed with "SIG:"
+
+#### Integrity Verification
+- [ ] `VerifyIntegrity()` returns `IntegrityReport`
+- [ ] Check hash chain continuity
+- [ ] Check sequence continuity
+- [ ] Verify entry hashes match
+- [ ] Verify periodic signatures
+- [ ] Report errors without stopping on first
+
+#### Category-Specific Logging
+- [ ] `LogPermissionGranted/Denied(agentID, action, source/reason)`
+- [ ] `LogFileOperation(op, path, agentID, size, hash)`
+- [ ] `LogProcessExecution(cmd, agentID, exitCode)`
+- [ ] `LogNetworkAllowed/Blocked(domain, url)`
+- [ ] `LogLLMCall(provider, model, tokens, cost)`
+- [ ] `LogSessionEvent(event, sessionID)`
+
+#### Configuration
+- [ ] `AuditLogConfig` struct with all settings
+- [ ] Retention policy: "indefinite" (default)
+- [ ] Rotation size: 100MB default
+- [ ] Signature interval: 100 entries default
+
+**Tests:**
+- [ ] Entries have correct hash chain
+- [ ] Sequence numbers are continuous
+- [ ] Signature verification works
+- [ ] Tampering detected (modify entry, check fails)
+- [ ] File rotation works
+- [ ] All category loggers work
+
+---
+
+### 0.71 Audit Query Interface
+
+CLI and programmatic interface for querying audit logs.
+
+**Files to create:**
+- `core/security/audit_query.go` (extends 0.70)
+- `cmd/audit.go`
+
+**Dependencies:** 0.70.
+
+**Acceptance Criteria:**
+
+#### Query Filter
+- [ ] `QueryFilter` struct with all filter options
+- [ ] Time range: StartTime, EndTime
+- [ ] Category filter: []AuditCategory
+- [ ] Severity filter: []AuditSeverity
+- [ ] Session/Agent/Workflow ID filters
+- [ ] Action and outcome filters
+- [ ] Target pattern (regex) filter
+- [ ] Pagination: Limit, Offset
+
+#### Query Execution
+- [ ] `Query(filter)` returns matching entries
+- [ ] Efficient scanning (don't load entire file for recent queries)
+- [ ] Support querying across rotated log files
+
+#### Output Formats
+- [ ] Table format (default): human-readable columns
+- [ ] JSON format: machine-parseable
+- [ ] CSV format: spreadsheet-compatible
+
+#### CLI Commands
+- [ ] `sylk audit query --category permission --severity security --since 24h`
+- [ ] `sylk audit query --session abc123 --format json`
+- [ ] `sylk audit query --action "file_write" --target "*.go"`
+- [ ] `sylk audit verify` runs integrity check
+- [ ] `sylk audit export --since 7d` exports for external analysis
+- [ ] `sylk audit purge --before 90d` purges old entries (with confirmation)
+
+#### Purge Operation
+- [ ] Require explicit confirmation
+- [ ] Write final signature before purging
+- [ ] Create backup before purge (optional)
+- [ ] Log purge operation
+
+**Tests:**
+- [ ] Query by category works
+- [ ] Query by time range works
+- [ ] Query by target pattern works
+- [ ] All output formats correct
+- [ ] Purge requires confirmation
+- [ ] Purge creates backup
+
+---
+
+### 0.72 Session Credential Manager
+
+Session-scoped credential handling with profile overrides and temporary credentials.
+
+**Files to create:**
+- `core/security/session_credentials.go`
+
+**Dependencies:** 0.63 (Credential Manager).
+
+**Acceptance Criteria:**
+
+#### Credential Resolution
+- [ ] `SessionCredentialManager` wraps base `CredentialManager`
+- [ ] Resolution order: temp credentials → profile override → base manager
+- [ ] `GetAPIKey(provider)` follows resolution chain
+
+#### Profile Override
+- [ ] `SetProfileOverride(profile)` changes profile for session
+- [ ] Verify profile exists before setting
+- [ ] Override cleared on session end
+
+#### Temporary Credentials
+- [ ] `TempCredential` struct with Provider, APIKey, ExpiresAt, Source
+- [ ] `SetTemporaryCredential(provider, apiKey, ttl)` stores in memory
+- [ ] Temporary credentials never persisted to disk
+- [ ] Auto-expire based on TTL
+- [ ] Max TTL configurable (default: 24h)
+
+#### Session Cleanup
+- [ ] `ClearSession()` zeros and removes all temp credentials
+- [ ] Called automatically on session end
+- [ ] Profile override cleared
+
+#### Audit Integration
+- [ ] Log credential access events (not values)
+- [ ] Log profile override changes
+- [ ] Log temp credential usage (provider only, not key)
+
+**Tests:**
+- [ ] Resolution order correct
+- [ ] Profile override works
+- [ ] Temp credentials expire correctly
+- [ ] Session cleanup removes all credentials
+- [ ] Temp credentials not shared between sessions
+
+---
+
+### 0.73 Session Knowledge Manager
+
+Cross-session knowledge sharing with proper isolation.
+
+**Files to create:**
+- `core/security/session_knowledge.go`
+
+**Dependencies:** VectorGraphDB (existing).
+
+**Acceptance Criteria:**
+
+#### Knowledge Scoping
+- [ ] `SessionKnowledgeManager` with project and session knowledge DBs
+- [ ] `KnowledgeScope` enum: ScopeProject, ScopeSession
+- [ ] Project knowledge: shared, Archivalist write access
+- [ ] Session knowledge: session writes, others read-only
+
+#### Store Operations
+- [ ] `StoreKnowledge(entry)` routes to appropriate DB
+- [ ] Project scope: only Archivalist can write
+- [ ] Session scope: current session writes
+
+#### Query Operations
+- [ ] `QueryKnowledge(query, opts)` searches accessible DBs
+- [ ] Always includes project knowledge
+- [ ] Always includes own session knowledge
+- [ ] `IncludeOtherSessions` option for read-only access to other sessions
+- [ ] Deduplicate results
+
+#### Other Session Views
+- [ ] `otherSessionViews` map for read-only access
+- [ ] Views discovered via session registry
+- [ ] Read errors don't fail query
+
+**Tests:**
+- [ ] Project knowledge shared across sessions
+- [ ] Session knowledge isolated
+- [ ] Cross-session read-only works
+- [ ] Archivalist can write project knowledge
+- [ ] Non-Archivalist cannot write project knowledge
+
+---
+
+### 0.74 Tier 4 Integration Tests
+
+End-to-end tests for security system.
+
+**Files to create:**
+- `core/security/integration_test.go`
+- `core/security/permission_integration_test.go`
+- `core/security/sandbox_integration_test.go`
+- `core/security/audit_integration_test.go`
+
+**Dependencies:** 0.68-0.73.
+
+**Acceptance Criteria:**
+
+#### Permission Integration
+- [ ] Full permission check flow
+- [ ] Allowlist persistence and reload
+- [ ] Pipeline permission inheritance
+- [ ] Runtime escalation flow
+
+#### Sandbox Integration
+- [ ] Full sandbox execution (where available)
+- [ ] VFS staging and merge
+- [ ] Network proxy with allowlist
+- [ ] Graceful degradation
+
+#### Audit Integration
+- [ ] All event types logged
+- [ ] Integrity verification passes
+- [ ] Query filters work together
+- [ ] Cross-session queries
+
+#### Session Integration
+- [ ] Credential isolation between sessions
+- [ ] Knowledge sharing and isolation
+- [ ] Session cleanup complete
+
+#### Stress Tests
+- [ ] Many concurrent permission checks
+- [ ] Rapid sandbox executions
+- [ ] High-volume audit logging
+- [ ] Integrity check performance
+
+**Tests:**
+- [ ] All integration scenarios pass
+- [ ] No race conditions (run with -race)
+- [ ] Cross-platform CI passes
+
+---
+
+### Tier 4 Parallelization Notes
+
+**CRITICAL: Tier 4 has NO dependencies on Tier 1, 2, or 3.**
+
+These tasks can be executed in parallel with ALL other work:
+
+```
+Tier 4 (Security)             Tier 1, 2, 3 (All other work)
+═══════════════════════════   ═══════════════════════════════════
+
+0.68 Permission Manager ─┐    0.7-0.67 (all Tier 1, 2, 3 tasks)
+0.69 Sandbox Manager ────┤         │
+0.70 Audit Logger ───────┼─────────┼───► Can run completely in parallel
+0.71 Audit Query ────────┤         │
+0.72 Session Credentials ┤         │
+0.73 Session Knowledge ──┤         │
+0.74 Integration Tests ──┘         │
+```
+
+**Within Tier 4, dependencies:**
+```
+0.68 (Permissions) ──────────────────┐
+0.69 (Sandbox) ──────────────────────┤
+0.70 (Audit Logger) ─► 0.71 (Query)  │
+                                     ├──► 0.74 (Integration)
+0.72 (Session Creds) ────────────────┤
+     depends on 0.63                 │
+0.73 (Session Knowledge) ────────────┘
+     depends on VectorGraphDB
+```
+
+**Optimal parallel execution:**
+1. Start 0.68, 0.69, 0.70 immediately (no internal deps)
+2. When 0.70 completes → start 0.71
+3. When 0.63 completes → start 0.72
+4. When VectorGraphDB ready → start 0.73
+5. When all 0.68-0.73 complete → start 0.74
+
+**Integration points (connect later):**
+- 0.68 integrates with all agents (permission checks)
+- 0.69 integrates with subprocess execution (0.43)
+- 0.70 integrates with all components (logging)
+- 0.72 integrates with 0.63 (base credential manager)
+- 0.73 integrates with VectorGraphDB
+
+These integration points are wired up AFTER both sides complete - no blocking dependency.
 
 ---
 
@@ -10837,11 +13515,285 @@ New agent for UI/UX implementation tasks.
 - [ ] Keywords: "component", "ui", "style", "css", "tailwind", "design", "a11y"
 - [ ] Handoff patterns between Designer and Engineer
 
+#### Designer Hooks
+- [ ] Pre-execute hook: load relevant skills based on task
+- [ ] Post-execute hook: record result in Archivalist
+- [ ] Pre-component-create hook: search for existing similar component
+- [ ] Post-component-create hook: update component registry
+- [ ] Pre-styling hook: validate design token availability
+- [ ] Post-styling hook: trigger accessibility check
+
+#### Memory Management & Pipeline Handoff
+
+**Model**: Gemini 3 Pro
+
+**CRITICAL**: At 95%, Designer triggers PIPELINE HANDOFF, NOT local compaction.
+
+**Files to add:**
+- `agents/designer/memory.go`
+- `agents/designer/handoff.go`
+
+**Acceptance Criteria:**
+- [ ] Context usage monitoring (poll every response)
+- [ ] At 95% threshold: trigger pipeline handoff sequence
+- [ ] Bundle complete handoff state: original prompt + accomplished + remaining + components created/modified
+- [ ] Include design-specific state: token usage, component changes, a11y issues
+- [ ] Send `HANDOFF_REQUEST` to Architect (via Guide) with bundled state
+- [ ] Collect UIInspector state before handoff (token violations, a11y issues, responsive issues)
+- [ ] Collect UITester state before handoff (visual tests, a11y tests, responsive tests, keyboard tests)
+- [ ] Wait for `HANDOFF_ACK` confirming new pipeline created
+- [ ] Handoff state goes to Archivalist for persistence (category: `designer_pipeline_handoff`)
+- [ ] Retry logic: 3 attempts with exponential backoff
+- [ ] Fallback: if handoff fails after retries, summarize → Archivalist → compact locally
+
+```go
+// Designer handoff state (sent to Architect)
+type DesignerHandoffState struct {
+    PipelineID          PipelineID          `json:"pipeline_id"`
+    OriginalPrompt      string              `json:"original_prompt"`
+    Accomplished        []string            `json:"accomplished"`
+    ComponentsCreated   []ComponentInfo     `json:"components_created"`
+    ComponentsModified  []ComponentChange   `json:"components_modified"`
+    TokensUsed          []TokenUsage        `json:"tokens_used"`
+    Remaining           []string            `json:"remaining"`
+    ContextNotes        string              `json:"context_notes"`
+    ContextUsage        float64             `json:"context_usage"`
+    HandoffReason       string              `json:"handoff_reason"`
+}
+
+type ComponentInfo struct {
+    Name        string   `json:"name"`
+    Path        string   `json:"path"`
+    Type        string   `json:"type"`        // "component", "layout", "page"
+    Props       []string `json:"props"`
+    Exports     []string `json:"exports"`
+}
+
+type ComponentChange struct {
+    Name        string `json:"name"`
+    Path        string `json:"path"`
+    ChangeType  string `json:"change_type"` // "props", "styling", "structure", "a11y"
+    Description string `json:"description"`
+}
+
+type TokenUsage struct {
+    TokenName string `json:"token_name"`
+    Category  string `json:"category"`    // "color", "spacing", "typography"
+    UsedIn    string `json:"used_in"`
+}
+
+// UIInspector handoff state (when Designer triggers handoff)
+type UIInspectorHandoffState struct {
+    TokenViolations       []TokenViolation   `json:"token_violations"`
+    A11yIssuesFound       []A11yIssue        `json:"a11y_issues_found"`
+    A11yIssuesResolved    []A11yIssue        `json:"a11y_issues_resolved"`
+    A11yIssuesRemaining   []A11yIssue        `json:"a11y_issues_remaining"`
+    ResponsiveIssues      []ResponsiveIssue  `json:"responsive_issues"`
+    ComponentReuseConcerns []ReuseConcern    `json:"component_reuse_concerns"`
+    ValidationState       map[string]bool    `json:"validation_state"`
+}
+
+// UITester handoff state (when Designer triggers handoff)
+type UITesterHandoffState struct {
+    VisualTests      []VisualTestResult    `json:"visual_tests"`
+    A11yTests        []A11yTestResult      `json:"a11y_tests"`
+    ResponsiveTests  []ResponsiveTestResult `json:"responsive_tests"`
+    KeyboardNavTests []KeyboardTestResult  `json:"keyboard_nav_tests"`
+    ThemeTests       []ThemeTestResult     `json:"theme_tests"`
+    CoverageNeeded   []string              `json:"coverage_needed"`
+}
+
+// Designer context monitoring
+func (d *Designer) checkContextAndHandoff() error {
+    usage := d.getContextUsage()
+
+    if usage >= 0.95 {
+        // Trigger pipeline handoff (NOT local compaction)
+        return d.triggerPipelineHandoff()
+    }
+    return nil
+}
+
+func (d *Designer) triggerPipelineHandoff() error {
+    // Collect state from UIInspector and UITester
+    uiInspectorState := d.pipeline.Inspector.GetHandoffState()
+    uiTesterState := d.pipeline.Tester.GetHandoffState()
+
+    state := d.buildHandoffState()
+    bundledState := &DesignerPipelineHandoff{
+        DesignerState:    state,
+        UIInspectorState: uiInspectorState,
+        UITesterState:    uiTesterState,
+    }
+
+    // Send to Architect via Guide
+    msg := &Message{
+        Type:    "HANDOFF_REQUEST",
+        From:    d.ID,
+        To:      "architect",  // Routed through Guide
+        Payload: bundledState,
+    }
+
+    // Retry logic
+    for attempt := 0; attempt < 3; attempt++ {
+        if err := d.bus.Publish("guide.route", msg); err != nil {
+            time.Sleep(time.Duration(1<<attempt) * time.Second)
+            continue
+        }
+
+        // Wait for acknowledgment
+        select {
+        case ack := <-d.handoffAck:
+            return nil  // Handoff successful
+        case <-time.After(30 * time.Second):
+            continue  // Retry
+        }
+    }
+
+    // Fallback: summarize and compact locally
+    return d.fallbackCompact()
+}
+```
+
+**Handoff Flow:**
+```
+Designer (95%) ──────────────────────────────────────────────────────────────►
+    │
+    ▼
+[Build Handoff State]
+    │ - Original prompt
+    │ - Accomplished tasks
+    │ - Components created/modified
+    │ - Tokens used
+    │ - Remaining tasks
+    │ - Context notes
+    │
+    ▼
+[Collect UIInspector State]
+    │ - Token violations
+    │ - A11y issues (found/resolved/remaining)
+    │ - Responsive issues
+    │ - Component reuse concerns
+    │
+    ▼
+[Collect UITester State]
+    │ - Visual test results
+    │ - A11y test results
+    │ - Responsive test results
+    │ - Keyboard/theme test results
+    │
+    ▼
+[HANDOFF_REQUEST] ──► Guide ──► Architect
+                                   │
+                                   ▼
+                          [Examine state]
+                          [Adjust workflow if needed]
+                                   │
+                                   ▼
+               [CREATE_PIPELINE_WITH_STATE] ──► Guide ──► Orchestrator
+                                                            │
+                                                            ▼
+                                                    [Create new Designer pipeline]
+                                                    [Transfer D+UIInsp+UITest state]
+                                                    [Close old pipeline]
+                                                            │
+                                                            ▼
+                                                    [HANDOFF_COMPLETE] ──► Architect ──► Designer
+```
+
+#### UIInspector Memory Management
+
+**Model**: OpenAI Codex 5.2
+
+**Thresholds**: 85% (checkpoint) | 95% (compact locally)
+
+**NOTE**: UIInspector compacts LOCALLY. It does NOT trigger pipeline handoff (only Designer can).
+
+**Acceptance Criteria:**
+- [ ] Context usage monitoring (poll every response)
+- [ ] At 85% threshold: checkpoint summary to Archivalist
+- [ ] At 95% threshold: summarize + send to Archivalist + compact locally
+- [ ] If Designer triggers handoff, UIInspector participates in state transfer
+
+**Checkpoint Summary:**
+```go
+type UIInspectorFindingsSummary struct {
+    Timestamp           time.Time         `json:"timestamp"`
+    SessionID           string            `json:"session_id"`
+    PipelineID          string            `json:"pipeline_id,omitempty"`
+    ContextUsage        float64           `json:"context_usage"`
+
+    // Findings state
+    ChecksPerformed     []string          `json:"checks_performed"`
+    TokenViolationsFound int              `json:"token_violations_found"`
+    TokenViolationsFixed int              `json:"token_violations_fixed"`
+    TokenViolationsRemaining []TokenViolation `json:"token_violations_remaining"`
+    A11yIssuesFound     int               `json:"a11y_issues_found"`
+    A11yIssuesResolved  int               `json:"a11y_issues_resolved"`
+    A11yIssuesRemaining []A11yIssue       `json:"a11y_issues_remaining"`
+    ResponsiveIssues    []ResponsiveIssue `json:"responsive_issues"`
+    ComponentReuseConcerns []ReuseConcern `json:"component_reuse_concerns"`
+    ValidationState     map[string]bool   `json:"validation_state"` // category → pass
+}
+```
+
+**Archivalist Category**: `ui_inspector_findings`
+
+**Tests:**
+- [ ] Test checkpoint at 85% context
+- [ ] Test local compaction at 95% context
+- [ ] Test handoff state bundling when Designer triggers handoff
+
+#### UITester Memory Management
+
+**Model**: OpenAI Codex 5.2
+
+**Thresholds**: 85% (checkpoint) | 95% (compact locally)
+
+**NOTE**: UITester compacts LOCALLY. It does NOT trigger pipeline handoff (only Designer can).
+
+**Acceptance Criteria:**
+- [ ] Context usage monitoring (poll every response)
+- [ ] At 85% threshold: checkpoint summary to Archivalist
+- [ ] At 95% threshold: summarize + send to Archivalist + compact locally
+- [ ] If Designer triggers handoff, UITester participates in state transfer
+
+**Checkpoint Summary:**
+```go
+type UITesterSummary struct {
+    Timestamp           time.Time              `json:"timestamp"`
+    SessionID           string                 `json:"session_id"`
+    PipelineID          string                 `json:"pipeline_id,omitempty"`
+    ContextUsage        float64                `json:"context_usage"`
+
+    // Test state
+    VisualTestsRun      []VisualTestResult     `json:"visual_tests_run"`
+    VisualPassCount     int                    `json:"visual_pass_count"`
+    VisualFailCount     int                    `json:"visual_fail_count"`
+    A11yTestsRun        []A11yTestResult       `json:"a11y_tests_run"`
+    ResponsiveTestsRun  []ResponsiveTestResult `json:"responsive_tests_run"`
+    KeyboardTestsRun    []KeyboardTestResult   `json:"keyboard_tests_run"`
+    ThemeTestsRun       []ThemeTestResult      `json:"theme_tests_run"`
+    CoverageNeeded      []string               `json:"coverage_needed"`
+}
+```
+
+**Archivalist Category**: `ui_tester_summary`
+
+**Tests:**
+- [ ] Test checkpoint at 85% context
+- [ ] Test local compaction at 95% context
+- [ ] Test handoff state bundling when Designer triggers handoff
+
 **Tests:**
 - [ ] Designer agent responds to UI intents
 - [ ] All core skills work correctly
 - [ ] Guide routes to Designer appropriately
 - [ ] Designer/Engineer handoff works
+- [ ] Test handoff trigger at 95% context
+- [ ] Test handoff retry logic
+- [ ] Test handoff fallback to local compaction
+- [ ] Test handoff state bundling completeness (Designer + UIInspector + UITester)
 
 ---
 
@@ -12850,6 +15802,1540 @@ End-to-end tests for pipeline system.
 - [ ] Hybrid task decomposition and execution
 - [ ] Failure and retry flow
 - [ ] Parallel pipeline execution
+
+---
+
+## Pipeline Variants System
+
+Enables parallel exploration of alternative implementations through isolated variant pipelines.
+
+### 6.101 Variant Data Structures
+
+Core data structures for variant management.
+
+**Files to create:**
+- `core/pipeline/variant_types.go`
+- `core/pipeline/variant_types_test.go`
+
+**Acceptance Criteria:**
+
+#### Status Enums
+- [ ] `VariantGroupStatus` enum: `active`, `pending`, `selected`, `cancelled`
+- [ ] `VariantStatus` enum: `running`, `ready`, `selected`, `discarded`, `cancelled`, `failed`
+
+#### VariantGroup Struct
+- [ ] `VariantGroup` with ID, SessionID, OriginalStep, StartingPoint, Status, Variants map, SelectedID, timestamps
+- [ ] `NewVariantGroup(sessionID, stepID, startingPoint string)` constructor
+- [ ] `AddVariant(info *VariantInfo)` method
+- [ ] `AllTerminal() bool` method - checks if all variants reached terminal state
+- [ ] `ReadyCount() int` method - counts variants in ready state
+
+```go
+type VariantGroup struct {
+    ID            string                  `json:"id"`
+    SessionID     string                  `json:"session_id"`
+    OriginalStep  int                     `json:"original_step"`
+    StartingPoint string                  `json:"starting_point"`
+    Status        VariantGroupStatus      `json:"status"`
+    Variants      map[string]*VariantInfo `json:"variants"`
+    SelectedID    *string                 `json:"selected_id,omitempty"`
+    CreatedAt     time.Time               `json:"created_at"`
+    CompletedAt   *time.Time              `json:"completed_at,omitempty"`
+}
+```
+
+#### VariantInfo Struct
+- [ ] `VariantInfo` with ID, PipelineID, Label, Approach, Status, timestamps, Error
+- [ ] `IsTerminal() bool` method
+- [ ] `MarkReady()`, `MarkFailed(error)`, `MarkCancelled()` methods
+
+#### Pipeline Additions
+- [ ] Add `StartingPoint string` field to Pipeline struct
+- [ ] Add `VariantGroupID *string` field to Pipeline struct
+- [ ] Add `VFS *VirtualFilesystem` field to Pipeline struct
+- [ ] `IsVariant() bool` method
+- [ ] `UseVFS(vfs *VirtualFilesystem)` method
+
+**Tests:**
+- [ ] VariantGroup creation with correct defaults
+- [ ] Variant registration and lookup
+- [ ] AllTerminal() correctly evaluates all states
+- [ ] ReadyCount() accurate for mixed states
+- [ ] Pipeline variant field accessors
+
+---
+
+### 6.102 VFS Subprocess Interception
+
+VFS subprocess write interception via library injection.
+
+**Files to create:**
+- `core/sandbox/vfs_interception.go`
+- `core/sandbox/vfs_interception_darwin.go`
+- `core/sandbox/vfs_interception_linux.go`
+- `core/sandbox/vfs_interception_test.go`
+
+**Dependencies:** Existing `core/sandbox/vfs.go`
+
+**Acceptance Criteria:**
+
+#### Interception Library
+- [ ] Shared library that intercepts file write syscalls
+- [ ] Redirects writes to VFS staging directory
+- [ ] Reads fall through to original path if not in staging
+- [ ] Environment variable `SYLK_VFS_STAGING` sets staging root
+- [ ] Environment variable `SYLK_VFS_WORKDIR` sets original workdir
+
+#### Darwin Implementation
+- [ ] Use DYLD_INSERT_LIBRARIES for injection
+- [ ] Intercept: open, write, rename, unlink, mkdir
+- [ ] Path translation: workdir → staging dir
+
+#### Linux Implementation
+- [ ] Use LD_PRELOAD for injection
+- [ ] Same syscall interception as Darwin
+- [ ] Handle /proc/self/exe special case
+
+#### Integration
+- [ ] `VFS.WrapCommand(cmd *exec.Cmd)` adds injection env vars
+- [ ] Staging dir created with correct permissions
+- [ ] Cleanup removes interception artifacts
+
+**Tests:**
+- [ ] Subprocess writes go to staging, not workdir
+- [ ] Subprocess reads from staging when file exists
+- [ ] Subprocess reads fall through to workdir
+- [ ] Multiple subprocesses share same staging
+- [ ] Cleanup removes all staging files
+
+---
+
+### 6.103 Variant Injection Sequence
+
+Orchestrator logic for injecting variants into running pipelines.
+
+**Files to create:**
+- `core/pipeline/variant_injection.go`
+- `core/pipeline/variant_injection_test.go`
+
+**Dependencies:** 6.101 (Variant Data Structures), 6.102 (VFS Interception), existing VFS
+
+**Acceptance Criteria:**
+
+#### Git State Capture
+- [ ] `getStartingPoint()` returns git HEAD when pipeline started
+- [ ] `getChangedFiles(startingPoint string)` returns files changed since S0
+- [ ] Git operations locked during injection sequence
+- [ ] Handle dirty working directory (warn user, stash if needed)
+
+#### VFS Seeding
+- [ ] `seedVFS(vfs *VirtualFilesystem, files []string)` copies current disk state
+- [ ] Files streamed to staging, not buffered in memory
+- [ ] Only changed files seeded, unchanged files read from disk
+
+#### Injection Sequence
+- [ ] Validate original pipeline is running or pending
+- [ ] Create VariantGroup, register original as first variant
+- [ ] Seed original's VFS from current disk state
+- [ ] Rollback working directory: `git checkout {StartingPoint}`
+- [ ] Switch original pipeline to VFS mode (at tool boundary)
+- [ ] Create variant pipeline with modified prompt
+- [ ] Create variant's VFS staging directory
+- [ ] Start variant execution
+- [ ] Signal original: VARIANT_CREATED
+
+```go
+func (o *Orchestrator) InjectVariant(originalPipelineID string, modifiedPrompt string) (*VariantGroup, error) {
+    original := o.pipelines[originalPipelineID]
+
+    // 1. Get state
+    changedFiles := o.git.DiffNames(original.StartingPoint, "HEAD")
+
+    // 2. Create group
+    group := NewVariantGroup(original.SessionID, original.TaskID, original.StartingPoint)
+    group.AddVariant(&VariantInfo{
+        ID:         "original",
+        PipelineID: original.ID,
+        Label:      "original",
+        Status:     VariantRunning,
+    })
+
+    // 3. Seed original VFS
+    originalVFS := NewVFS(o.workDir, stagingPath(group.ID, "original"))
+    for _, path := range changedFiles {
+        content, _ := os.ReadFile(filepath.Join(o.workDir, path))
+        originalVFS.Seed(path, content)
+    }
+
+    // 4. Rollback
+    o.git.Checkout(original.StartingPoint)
+
+    // 5. Switch original to VFS
+    original.UseVFS(originalVFS)
+
+    // 6. Create variant
+    variant := o.createPipeline(modifiedPrompt, original.WorkerType)
+    variant.StartingPoint = original.StartingPoint
+    variantVFS := NewVFS(o.workDir, stagingPath(group.ID, "variant-1"))
+    variant.UseVFS(variantVFS)
+
+    group.AddVariant(&VariantInfo{
+        ID:         "variant-1",
+        PipelineID: variant.ID,
+        Label:      "variant-1",
+        Approach:   modifiedPrompt,
+        Status:     VariantRunning,
+    })
+
+    // 7. Start and signal
+    variant.Start()
+    o.signal(original.ID, SignalVariantCreated, group.ID)
+
+    return group, nil
+}
+```
+
+**Tests:**
+- [ ] Injection creates valid VariantGroup
+- [ ] Original VFS seeded with all changed files
+- [ ] Working dir at StartingPoint after injection
+- [ ] Variant starts with empty VFS
+- [ ] Both pipelines write to separate VFS staging
+- [ ] Error if original not running/pending
+- [ ] Git lock prevents concurrent injection
+
+---
+
+### 6.104 Variant Cancellation
+
+Independent cancellation of variants and groups.
+
+**Files to create:**
+- `core/pipeline/variant_cancel.go`
+- `core/pipeline/variant_cancel_test.go`
+
+**Dependencies:** 6.101 (Variant Data Structures), 6.103 (Variant Injection)
+
+**Acceptance Criteria:**
+
+#### Single Variant Cancellation
+- [ ] `CancelVariant(groupID, variantID)` cancels one variant
+- [ ] Pipeline receives cancel signal, stops execution
+- [ ] Variant status → cancelled
+- [ ] Other variants in group continue unaffected
+- [ ] Group status recalculated: pending if some ready, cancelled if all terminal with none ready
+
+#### Group Cancellation
+- [ ] `CancelVariantGroup(groupID)` cancels all variants
+- [ ] All running variants receive cancel signal
+- [ ] Group status → cancelled
+- [ ] Working dir restored if needed
+- [ ] Staging directories cleaned up
+
+#### Cleanup
+- [ ] `cleanupVariantGroup(group)` removes staging dirs
+- [ ] Safe removal even if some files locked
+- [ ] Idempotent (safe to call multiple times)
+
+**Tests:**
+- [ ] Cancel single variant, others continue
+- [ ] Cancel group, all variants stop
+- [ ] Staging dirs removed on cleanup
+- [ ] Group status transitions correct
+- [ ] Idempotent cleanup
+
+---
+
+### 6.105 Variant Selection and Commit
+
+User selection commits variant VFS to working directory.
+
+**Files to create:**
+- `core/pipeline/variant_commit.go`
+- `core/pipeline/variant_commit_test.go`
+
+**Dependencies:** 6.101, 6.103, 6.104
+
+**Acceptance Criteria:**
+
+#### VFS Commit
+- [ ] `CommitVariant(groupID, variantID)` writes VFS to disk
+- [ ] All changed files written to working directory
+- [ ] Directories created as needed
+- [ ] File permissions preserved
+
+#### Status Updates
+- [ ] Selected variant status → selected
+- [ ] Other ready variants status → discarded
+- [ ] Group status → selected
+- [ ] Group SelectedID set
+
+#### Pipeline Continuation
+- [ ] Selected pipeline continues to Inspector/Tester
+- [ ] Discarded pipeline resources released
+- [ ] Group completion timestamp set
+
+```go
+func (o *Orchestrator) CommitVariant(groupID, variantID string) error {
+    group := o.variantGroups[groupID]
+    variant := group.Variants[variantID]
+    pipeline := o.pipelines[variant.PipelineID]
+
+    // Write VFS to disk
+    for _, path := range pipeline.VFS.ChangedFiles() {
+        content, _ := pipeline.VFS.Read(path)
+        fullPath := filepath.Join(o.workDir, path)
+        os.MkdirAll(filepath.Dir(fullPath), 0755)
+        os.WriteFile(fullPath, content, 0644)
+    }
+
+    // Update statuses
+    variant.Status = VariantSelected
+    for _, v := range group.Variants {
+        if v.ID != variantID && v.Status == VariantReady {
+            v.Status = VariantDiscarded
+        }
+    }
+    group.SelectedID = &variantID
+    group.Status = VariantGroupSelected
+
+    // Cleanup and continue
+    o.cleanupVariantGroup(group)
+    o.resumePipeline(pipeline.ID)
+
+    return nil
+}
+```
+
+**Tests:**
+- [ ] VFS files written to working dir
+- [ ] Directories created for nested paths
+- [ ] Selected variant marked correctly
+- [ ] Discarded variants marked correctly
+- [ ] Pipeline resumes after commit
+- [ ] Staging cleaned up
+
+---
+
+### 6.106 Lazy Diff Computation and Cache
+
+On-demand diff computation with TTL caching.
+
+**Files to create:**
+- `core/pipeline/variant_diff.go`
+- `core/pipeline/variant_diff_test.go`
+
+**Dependencies:** 6.101 (Variant Data Structures)
+
+**Acceptance Criteria:**
+
+#### CachedDiff Struct
+- [ ] `CachedDiff` with GroupID, VariantID, Diff string, ComputedAt, ExpiresAt
+- [ ] Configurable TTL (default 30 seconds)
+
+#### VariantDiffCache
+- [ ] `VariantDiffCache` with RWMutex, diffs map, TTL
+- [ ] `NewVariantDiffCache(ttl time.Duration)` constructor
+- [ ] `GetDiff(groupID, variantID, computeFn)` returns cached or computes
+- [ ] Expired entries recomputed
+- [ ] Thread-safe access
+
+#### Diff Computation
+- [ ] `ComputeVariantDiff(groupID, variantID)` generates unified diff
+- [ ] Diff between variant VFS and StartingPoint
+- [ ] Uses git show for original content
+- [ ] Generates standard unified diff format
+
+#### Diff Between Variants
+- [ ] `ComputeVariantComparison(groupID, variantID1, variantID2)` compares two variants
+- [ ] Shows differences between two approaches
+
+**Tests:**
+- [ ] Cache hit returns existing diff
+- [ ] Cache miss computes diff
+- [ ] Expired entry recomputes
+- [ ] Concurrent access safe
+- [ ] Unified diff format correct
+- [ ] Variant comparison correct
+
+---
+
+### 6.107 Guide Variant Signal Hub
+
+Guide as central router for variant signals.
+
+**Files to create:**
+- `agents/guide/variant_signals.go`
+- `agents/guide/variant_signals_test.go`
+
+**Dependencies:** 6.101 (Variant Data Structures)
+
+**Acceptance Criteria:**
+
+#### Signal Types
+- [ ] `SignalVariantRequest` - user requests variant
+- [ ] `SignalVariantCreated` - variant successfully created
+- [ ] `SignalVariantReady` - single variant completed
+- [ ] `SignalAllReady` - all variants in group completed
+- [ ] `SignalVariantFailed` - variant execution failed
+- [ ] `SignalVariantSelected` - user selected a variant
+
+#### Signal Handler
+- [ ] `HandleVariantSignal(signal)` routes to appropriate handler
+- [ ] VARIANT_REQUEST → route to Architect
+- [ ] VARIANT_READY → add to notification aggregator
+- [ ] ALL_READY → immediate notification (bypass aggregator)
+- [ ] VARIANT_FAILED → add to notification aggregator
+
+#### Intent Classification
+- [ ] Extend Guide intent classifier for VARIANT_REQUEST
+- [ ] Extract target_task from user message
+- [ ] Extract modified_prompt from user message
+- [ ] Validate target task exists and is running/pending
+
+**Tests:**
+- [ ] Signal routing correct for each type
+- [ ] Intent classification extracts task reference
+- [ ] Intent classification extracts approach modification
+- [ ] Invalid variant requests rejected with error message
+
+---
+
+### 6.108 Notification Aggregation
+
+Batches variant notifications to prevent spam.
+
+**Files to create:**
+- `agents/guide/notification_aggregator.go`
+- `agents/guide/notification_aggregator_test.go`
+
+**Dependencies:** 6.107 (Guide Variant Signal Hub)
+
+**Acceptance Criteria:**
+
+#### Notification Struct
+- [ ] `Notification` with Type, GroupID, VariantID, Message, Timestamp
+- [ ] JSON serializable
+
+#### NotificationAggregator
+- [ ] `NotificationAggregator` with mutex, pending map, flushTimer, flushDelay
+- [ ] `NewNotificationAggregator(flushDelay, onFlush)` constructor
+- [ ] Default flushDelay: 100ms
+- [ ] `Add(sessionID, notification)` queues notification
+- [ ] Timer reset on each add
+- [ ] `flush()` calls onFlush for each session's batch
+
+#### Flush Behavior
+- [ ] Notifications batched per session
+- [ ] Single flush delivers all pending for session
+- [ ] Timer-based auto-flush after quiet period
+- [ ] Batched messages combine counts: "3 variants ready"
+
+**Tests:**
+- [ ] Single notification delivered after delay
+- [ ] Multiple notifications batched
+- [ ] Timer reset on rapid additions
+- [ ] Per-session isolation
+- [ ] Batch message formatting
+
+---
+
+### 6.109 Variant CLI Commands
+
+User commands for variant management.
+
+**Files to create:**
+- `cli/commands/variants.go`
+- `cli/commands/variants_test.go`
+
+**Dependencies:** 6.101-6.106
+
+**Acceptance Criteria:**
+
+#### /variants Command
+- [ ] Lists all pending variant groups for session
+- [ ] Shows: group ID, task description, variant count, status
+- [ ] Sorted by creation time (newest first)
+
+#### /variants show <group_id>
+- [ ] Shows all variants in group
+- [ ] Displays: label, approach, status, completion time
+- [ ] Highlights ready variants
+
+#### /variants diff <group_id> [variant1] [variant2]
+- [ ] Single variant: diff from StartingPoint
+- [ ] Two variants: diff between them
+- [ ] Paged output for large diffs
+- [ ] Syntax highlighting
+
+#### /variants preview <group_id> <variant_id>
+- [ ] Shows full file contents from variant VFS
+- [ ] Lists all changed files
+- [ ] Opens in pager if large
+
+#### /variants select <group_id> <variant_id>
+- [ ] Commits selected variant
+- [ ] Confirms selection to user
+- [ ] Shows next steps (Inspector/Tester will run)
+
+#### /variants cancel <group_id> [variant_id]
+- [ ] With variant_id: cancels single variant
+- [ ] Without variant_id: cancels entire group
+- [ ] Confirms cancellation
+
+**Tests:**
+- [ ] List shows correct groups
+- [ ] Show displays variant details
+- [ ] Diff computes and displays correctly
+- [ ] Preview shows file contents
+- [ ] Select commits and cleans up
+- [ ] Cancel handles both cases
+
+---
+
+### 6.110 Status Line Variant Integration
+
+Ambient variant status in session status line.
+
+**Files to create:**
+- `cli/status/variant_indicator.go`
+- `cli/status/variant_indicator_test.go`
+
+**Dependencies:** 6.101 (Variant Data Structures)
+
+**Acceptance Criteria:**
+
+#### Variant Status Component
+- [ ] `VariantStatusComponent` fetches current variant state
+- [ ] Shows count of pending variant groups
+- [ ] Shows which task has variants
+
+#### Display Formats
+- [ ] Running variants: "Variants: 2 pending (task-4)"
+- [ ] Ready variants: "Variants: 2 ready ◄── /variants"
+- [ ] No variants: component hidden
+
+#### Attention Indicators
+- [ ] Ready variants highlighted (color/icon)
+- [ ] Command hint shown when action needed
+- [ ] Subtle when just pending
+
+**Tests:**
+- [ ] Correct display for running variants
+- [ ] Correct display for ready variants
+- [ ] Hidden when no variants
+- [ ] Updates on status change
+
+---
+
+### 6.111 Layer Wait Semantics
+
+Topological layer waits for variant selection before proceeding.
+
+**Files to create:**
+- `core/pipeline/variant_layer_wait.go`
+- `core/pipeline/variant_layer_wait_test.go`
+
+**Dependencies:** 6.101, 6.103, 6.105, existing DAG executor
+
+**Acceptance Criteria:**
+
+#### Layer Completion Check
+- [ ] `checkLayerCompletion(layer)` considers variant groups
+- [ ] Normal task: check PipelineComplete status
+- [ ] Variant task: check VariantGroupSelected status
+- [ ] Layer incomplete if any variant group pending
+
+#### DAG Executor Integration
+- [ ] Executor pauses layer progression for pending variants
+- [ ] User notified that selection is blocking
+- [ ] Selection unblocks layer progression
+
+```go
+func (o *Orchestrator) checkLayerCompletion(layer int) bool {
+    for _, taskID := range o.dag.Layer(layer) {
+        pipeline := o.pipelines[taskID]
+
+        if pipeline.VariantGroupID != nil {
+            group := o.variantGroups[*pipeline.VariantGroupID]
+            if group.Status != VariantGroupSelected {
+                return false  // Waiting for selection
+            }
+        } else {
+            if pipeline.Status != PipelineComplete {
+                return false
+            }
+        }
+    }
+    return true
+}
+```
+
+**Tests:**
+- [ ] Layer waits for variant selection
+- [ ] Selection unblocks layer
+- [ ] Normal tasks unaffected
+- [ ] Multiple variant groups in layer handled
+- [ ] Cancelled variants don't block (if others ready)
+
+---
+
+### 6.112 Variant Integration Tests
+
+End-to-end tests for variant system.
+
+**Files to create:**
+- `tests/e2e/variant_system_test.go`
+- `tests/fixtures/variant_test_scenarios.go`
+
+**Dependencies:** 6.101-6.111
+
+**Test Scenarios:**
+
+#### Basic Variant Flow
+- [ ] Create variant mid-execution
+- [ ] Both variants complete
+- [ ] User selects one
+- [ ] Pipeline continues with selected
+
+#### Cancellation Scenarios
+- [ ] Cancel single variant, other completes
+- [ ] Cancel entire group
+- [ ] Cleanup verified
+
+#### Edge Cases
+- [ ] Variant requested at tool boundary (timing)
+- [ ] Variant requested for pending task
+- [ ] Multiple variant groups in same session
+- [ ] Variant for task in parallel layer
+
+#### UI/CLI Scenarios
+- [ ] /variants lists groups correctly
+- [ ] /variants diff shows correct output
+- [ ] /variants select commits correctly
+- [ ] Status line updates
+
+**Acceptance Criteria:**
+- [ ] All test scenarios passing
+- [ ] VFS isolation verified (no cross-contamination)
+- [ ] Git state correctly managed
+- [ ] Staging cleanup complete
+- [ ] No memory leaks (staging dirs cleaned)
+- [ ] Concurrent execution verified
+
+---
+
+## Secret Management System
+
+Foundational security layer for secret detection, redaction, and environment isolation. No dependencies on Pipeline Variants - can execute fully in parallel.
+
+### 6.113 Secret Pattern Definitions
+
+Configurable regex patterns for detecting secrets.
+
+**Files to create:**
+- `core/security/patterns.go`
+- `core/security/patterns_test.go`
+
+**Dependencies:** None (foundational)
+
+**Acceptance Criteria:**
+
+#### Pattern Types
+- [ ] `SecretPattern` struct with Name, Pattern (regex), Severity
+- [ ] `SecretSeverity` enum: `low`, `medium`, `high`, `critical`
+- [ ] Default patterns for: API keys, passwords, tokens, private keys, AWS creds, GitHub PAT, OpenAI key, Anthropic key, connection strings
+- [ ] `SensitiveFilePatterns` glob list: `.env*`, `*.pem`, `*.key`, `*credentials*`, etc.
+
+```go
+type SecretPattern struct {
+    Name     string
+    Pattern  *regexp.Regexp
+    Severity SecretSeverity
+}
+
+var SecretPatterns = []*SecretPattern{
+    {Name: "api_key_generic", Pattern: regexp.MustCompile(`(?i)(api[_-]?key|apikey)['":\s]*[=:]\s*['"]?[a-zA-Z0-9_\-]{20,}`), Severity: SeverityHigh},
+    {Name: "private_key", Pattern: regexp.MustCompile(`-----BEGIN\s+(RSA|DSA|EC|OPENSSH)?\s*PRIVATE KEY-----`), Severity: SeverityCritical},
+    // ... additional patterns
+}
+```
+
+#### Pattern Management
+- [ ] `LoadPatterns()` loads default + custom patterns
+- [ ] `AddPattern(pattern *SecretPattern)` adds custom pattern
+- [ ] `RemovePattern(name string)` removes pattern by name
+- [ ] Patterns compiled once at load time (performance)
+
+**Tests:**
+- [ ] All default patterns detect expected secrets
+- [ ] No false positives on common code patterns
+- [ ] Custom patterns can be added/removed
+- [ ] Pattern matching is case-insensitive where appropriate
+
+---
+
+### 6.114 SecretSanitizer Service
+
+Core sanitization service with context-aware handling.
+
+**Files to create:**
+- `core/security/sanitizer.go`
+- `core/security/sanitizer_test.go`
+
+**Dependencies:** 6.113 (Secret Pattern Definitions)
+
+**Acceptance Criteria:**
+
+#### SecretSanitizer Struct
+- [ ] `SecretSanitizer` with patterns, sensitiveFiles, redactText, metrics
+- [ ] `NewSecretSanitizer()` constructor with defaults
+- [ ] Thread-safe (RWMutex for metrics)
+- [ ] Configurable redaction text (default: "[REDACTED]")
+
+#### SanitizeForIndex (Librarian use)
+- [ ] Check file against sensitive file patterns → return stub
+- [ ] Stub preserves file existence: "# filename\n(contents not indexed for security)"
+- [ ] Scan content for secret patterns → redact in-place
+- [ ] Return `SanitizeResult` with counts and matched patterns
+- [ ] Stream-friendly (doesn't load entire file into memory)
+
+```go
+func (s *SecretSanitizer) SanitizeForIndex(path string, content []byte) ([]byte, *SanitizeResult)
+```
+
+#### CheckUserPrompt (Rejection mode)
+- [ ] Scan prompt for secret patterns
+- [ ] Return `SecretDetection` with findings
+- [ ] `maskContext()` shows location without revealing secret
+- [ ] Findings include pattern name, severity, position
+
+#### SanitizeToolOutput (Redaction mode)
+- [ ] Scan output string for secrets
+- [ ] Redact all matches
+- [ ] Return sanitized string and redaction count
+
+#### Metrics Tracking
+- [ ] Track redaction counts per pattern
+- [ ] Track skipped files per pattern
+- [ ] `GetMetrics()` returns current statistics
+
+**Tests:**
+- [ ] SanitizeForIndex skips sensitive files with stub
+- [ ] SanitizeForIndex redacts secrets in normal files
+- [ ] CheckUserPrompt detects all pattern types
+- [ ] SanitizeToolOutput handles multiple secrets
+- [ ] Metrics accurately tracked
+- [ ] Thread-safe under concurrent access
+
+---
+
+### 6.115 Pre-Prompt Secret Detection Hook
+
+Rejects user prompts containing secrets.
+
+**Files to create:**
+- `core/security/hooks.go`
+- `core/security/hooks_test.go`
+
+**Dependencies:** 6.114 (SecretSanitizer Service)
+
+**Acceptance Criteria:**
+
+#### PrePromptSecretHook
+- [ ] Hook type: PrePrompt, Priority: First
+- [ ] Calls `sanitizer.CheckUserPrompt()`
+- [ ] If secrets detected: return `SecretDetectedError`
+- [ ] Error message is user-friendly, doesn't reveal secret
+- [ ] Logs detection via AuditLogger (pattern name + count, not values)
+
+```go
+var PrePromptSecretHook = &Hook{
+    Name:     "secret_detection",
+    Type:     PrePrompt,
+    Priority: HookPriorityFirst,
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        // Implementation
+    },
+}
+```
+
+#### SecretDetectedError
+- [ ] Custom error type with Message, Findings
+- [ ] Implements `error` interface
+- [ ] User-facing message suggests using env vars
+
+**Tests:**
+- [ ] Prompt with API key is rejected
+- [ ] Prompt with password is rejected
+- [ ] Prompt with private key is rejected
+- [ ] Clean prompt passes through
+- [ ] Error message doesn't contain the secret
+- [ ] Audit log entry created
+
+---
+
+### 6.116 Tool Output Sanitization Hook
+
+Redacts secrets from tool output before LLM context.
+
+**Files to create:**
+- Extends `core/security/hooks.go`
+- Extends `core/security/hooks_test.go`
+
+**Dependencies:** 6.114 (SecretSanitizer Service)
+
+**Acceptance Criteria:**
+
+#### PostToolSecretHook
+- [ ] Hook type: PostTool, Priority: Last
+- [ ] Calls `sanitizer.SanitizeToolOutput()`
+- [ ] Modifies `data.Output` in-place with redacted version
+- [ ] Logs redaction count via AuditLogger
+- [ ] Skips empty output (short-circuit)
+
+```go
+var PostToolSecretHook = &Hook{
+    Name:     "secret_redaction_output",
+    Type:     PostTool,
+    Priority: HookPriorityLast,
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        // Implementation
+    },
+}
+```
+
+**Tests:**
+- [ ] Tool output with secrets is redacted
+- [ ] Multiple secrets in output all redacted
+- [ ] Output without secrets unchanged
+- [ ] Audit log entry for redaction
+- [ ] Empty output handled gracefully
+
+---
+
+### 6.117 Environment Variable Isolation Hook
+
+Prevents env vars from being passed as tool parameters.
+
+**Files to create:**
+- Extends `core/security/hooks.go`
+- Extends `core/security/hooks_test.go`
+
+**Dependencies:** 6.113 (Secret Pattern Definitions)
+
+**Acceptance Criteria:**
+
+#### EnvVarPattern
+- [ ] Regex to detect env var references: `\$\{?([A-Z_][A-Z0-9_]*)\}?`
+
+#### PreToolEnvVarHook
+- [ ] Hook type: PreTool, Priority: First
+- [ ] Iterates all string parameters
+- [ ] Checks for env var pattern + secret pattern match
+- [ ] If injection detected: return `EnvVarInjectionError`
+- [ ] Logs attempt via AuditLogger
+
+```go
+var PreToolEnvVarHook = &Hook{
+    Name:     "env_var_isolation",
+    Type:     PreTool,
+    Priority: HookPriorityFirst,
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        // Implementation
+    },
+}
+```
+
+#### EnvVarInjectionError
+- [ ] Custom error type with Message, ToolName, ParamName
+- [ ] User-facing message explains tools read env vars internally
+
+**Tests:**
+- [ ] Parameter with connection string rejected
+- [ ] Parameter with API key value rejected
+- [ ] Normal string parameters allowed
+- [ ] File paths allowed
+- [ ] Audit log entry for injection attempt
+
+---
+
+### 6.118 Librarian Pre-Index Hook
+
+Sanitizes content before vector DB storage.
+
+**Files to create:**
+- `agents/librarian/index_hooks.go`
+- `agents/librarian/index_hooks_test.go`
+
+**Dependencies:** 6.114 (SecretSanitizer Service), existing Librarian indexing
+
+**Acceptance Criteria:**
+
+#### IndexHookData
+- [ ] `IndexHookData` struct with FilePath, Content, Metadata
+- [ ] Used by Librarian pre-index hooks
+
+#### LibrarianPreIndexHook
+- [ ] Hook type: PreIndex (Librarian-specific), Priority: First
+- [ ] Calls `sanitizer.SanitizeForIndex()`
+- [ ] Replaces `data.Content` with sanitized version
+- [ ] Adds metadata: `sanitized`, `redaction_count`, `skipped`
+- [ ] Logs skipped files and redactions
+
+```go
+var LibrarianPreIndexHook = &Hook{
+    Name:     "secret_sanitization_index",
+    Type:     PreIndex,
+    Priority: HookPriorityFirst,
+    Handler: func(ctx context.Context, data *IndexHookData) (*IndexHookData, error) {
+        // Implementation
+    },
+}
+```
+
+#### Librarian Integration
+- [ ] Hook registered in Librarian indexing pipeline
+- [ ] Metadata stored with indexed content
+- [ ] Queries can filter by `sanitized` metadata
+
+**Tests:**
+- [ ] .env file replaced with stub
+- [ ] *.pem file replaced with stub
+- [ ] Config file with secrets has secrets redacted
+- [ ] Normal code file unchanged
+- [ ] Metadata correctly set
+- [ ] Indexing continues without errors
+
+---
+
+### 6.119 Inter-Agent Sanitization Hook
+
+Redacts secrets in agent-to-agent communication.
+
+**Files to create:**
+- `core/security/dispatch_hooks.go`
+- `core/security/dispatch_hooks_test.go`
+
+**Dependencies:** 6.114 (SecretSanitizer Service), existing dispatch system
+
+**Acceptance Criteria:**
+
+#### DispatchHookData
+- [ ] `DispatchHookData` struct with SourceAgent, TargetAgent, Message
+- [ ] Used by inter-agent dispatch hooks
+
+#### InterAgentSecretHook
+- [ ] Hook type: PreDispatch, Priority: Last
+- [ ] Calls `sanitizer.SanitizeToolOutput()` on message
+- [ ] Replaces `data.Message` with sanitized version
+- [ ] Logs redaction with source/target agent names
+
+```go
+var InterAgentSecretHook = &Hook{
+    Name:     "secret_sanitization_transit",
+    Type:     PreDispatch,
+    Priority: HookPriorityLast,
+    Handler: func(ctx context.Context, data *DispatchHookData) (*DispatchHookData, error) {
+        // Implementation
+    },
+}
+```
+
+**Tests:**
+- [ ] Message with secrets redacted before dispatch
+- [ ] Source and target agent logged
+- [ ] Clean message unchanged
+- [ ] All agent pairs covered
+
+---
+
+### 6.120 Proactive Validation Skills
+
+Skills for agents to actively validate content.
+
+**Files to create:**
+- `core/security/skills.go`
+- `core/security/skills_test.go`
+
+**Dependencies:** 6.114 (SecretSanitizer Service), skill system
+
+**Acceptance Criteria:**
+
+#### validate_content Skill
+- [ ] Domain: security
+- [ ] Input: content string
+- [ ] Output: safe (bool), findings (array), suggestion (string)
+- [ ] Calls `sanitizer.CheckUserPrompt()` internally
+- [ ] Returns actionable suggestion
+
+#### check_file_sensitivity Skill
+- [ ] Domain: security
+- [ ] Input: path string
+- [ ] Output: sensitive (bool), pattern (string), handling (string)
+- [ ] Checks against `SensitiveFilePatterns`
+- [ ] Returns handling recommendation: skip|redact|normal
+
+#### sanitize_for_display Skill
+- [ ] Domain: security
+- [ ] Input: content string
+- [ ] Output: sanitized (string), redaction_count (int)
+- [ ] Calls `sanitizer.SanitizeToolOutput()` internally
+- [ ] For agents that want to show content safely
+
+**Tests:**
+- [ ] validate_content detects secrets
+- [ ] check_file_sensitivity identifies .env
+- [ ] sanitize_for_display redacts correctly
+- [ ] Skills registered in skill registry
+
+---
+
+### 6.121 Secret Management Integration Tests
+
+End-to-end tests for secret management system.
+
+**Files to create:**
+- `tests/e2e/secret_management_test.go`
+- `tests/fixtures/secret_test_files/`
+
+**Dependencies:** 6.113-6.120
+
+**Test Scenarios:**
+
+#### User Prompt Flow
+- [ ] Prompt with API key → rejected with helpful message
+- [ ] Prompt with private key → rejected
+- [ ] Clean prompt → passes through
+
+#### Librarian Indexing Flow
+- [ ] Index .env file → stub stored, not content
+- [ ] Index config with secrets → secrets redacted in index
+- [ ] Query for .env → returns "exists but not indexed"
+- [ ] Normal code → indexed without changes
+
+#### Tool Output Flow
+- [ ] Tool returns connection string → redacted before context
+- [ ] Tool returns clean output → unchanged
+
+#### Agent-to-Agent Flow
+- [ ] Engineer sends message with secret → redacted in transit
+- [ ] Architect receives sanitized version
+
+#### Env Var Isolation Flow
+- [ ] Tool called with API key param → rejected
+- [ ] Tool called with normal param → allowed
+- [ ] Tool reads from os.Getenv internally → works
+
+**Acceptance Criteria:**
+- [ ] All test scenarios passing
+- [ ] No secrets leak to LLM context
+- [ ] Audit log entries for all security events
+- [ ] Metrics accurately tracked
+- [ ] No false positives on common code patterns
+- [ ] Performance: < 1ms per sanitization
+
+---
+
+## Secret Management Implementation Order
+
+1. **6.113** (Secret Patterns) - Foundation, no dependencies
+2. **6.113** → **6.114** (SecretSanitizer Service) - Core service
+3. **6.114** → **6.115, 6.116, 6.117** (Hooks: prompt, tool output, env var) - Can parallelize
+4. **6.114** → **6.118** (Librarian Pre-Index Hook) - Depends on sanitizer
+5. **6.114** → **6.119** (Inter-Agent Hook) - Depends on sanitizer
+6. **6.114** → **6.120** (Proactive Skills) - Depends on sanitizer
+7. **All** → **6.121** (Integration Tests) - Validates entire system
+
+**Parallel Execution Groups:**
+- Group A: 6.113 (no dependencies)
+- Group B: 6.114 (depends on A)
+- Group C: 6.115, 6.116, 6.117, 6.118, 6.119, 6.120 (all depend only on B, can parallelize)
+- Group D: 6.121 (depends on all)
+
+**Cross-System Parallelism:**
+Secret Management (6.113-6.121) has NO dependencies on:
+- Pipeline Variants (6.101-6.112)
+- VectorGraphDB (6.1-6.20)
+- Agent Efficiency (6.21-6.42)
+- Pipeline Core (6.43-6.49)
+
+All can execute fully in parallel.
+
+---
+
+## Credential Broker System
+
+Secure agent credential access through opaque handles and just-in-time injection. Integrates with Secret Management for defense-in-depth.
+
+### 6.122 Credential Scope Definitions
+
+Agent-to-credential permission mappings.
+
+**Files to create:**
+- `core/credentials/scopes.go`
+- `core/credentials/scopes_test.go`
+
+**Dependencies:** None (foundational)
+
+**Acceptance Criteria:**
+
+#### CredentialScope Struct
+- [ ] `CredentialScope` with AgentType, Allowed, Denied, RequireAuth
+- [ ] Allowed: list of provider names agent can access
+- [ ] Denied: explicit denials (override allowed, supports "*")
+- [ ] RequireAuth: boolean for first-time user confirmation
+
+#### Default Scopes
+- [ ] Librarian: openai, anthropic, voyage (NO github, aws)
+- [ ] Academic: openai, anthropic, google, serpapi (NO github, aws)
+- [ ] Archivalist: openai, anthropic (NO github, aws)
+- [ ] Engineer: openai, anthropic, github (RequireAuth for github)
+- [ ] Designer: openai, anthropic, figma (RequireAuth for figma)
+- [ ] Inspector/Tester: openai, anthropic (NO external mutations)
+- [ ] Guide/Architect: openai, anthropic only
+- [ ] Orchestrator: NO credentials (coordinates others)
+
+```go
+type CredentialScope struct {
+    AgentType   string   `yaml:"agent_type"`
+    Allowed     []string `yaml:"allowed"`
+    Denied      []string `yaml:"denied"`
+    RequireAuth bool     `yaml:"require_auth"`
+}
+```
+
+#### Project Overrides
+- [ ] `ProjectCredentialOverrides` struct
+- [ ] Loaded from `.sylk/config.yaml`
+- [ ] Merges with defaults (project can restrict, not expand)
+
+**Tests:**
+- [ ] Default scopes correctly defined for all agents
+- [ ] Deny list overrides allow list
+- [ ] Wildcard "*" deny blocks all
+- [ ] Project overrides merge correctly
+
+---
+
+### 6.123 Credential Handle System
+
+Opaque handles for single-use credential access.
+
+**Files to create:**
+- `core/credentials/handle.go`
+- `core/credentials/handle_test.go`
+
+**Dependencies:** 6.122 (Credential Scope Definitions)
+
+**Acceptance Criteria:**
+
+#### CredentialHandle Struct
+- [ ] ID, Provider, AgentID, AgentType, ToolCallID
+- [ ] CreatedAt, ExpiresAt timestamps
+- [ ] Used boolean (single-use enforcement)
+- [ ] value string (internal, never serialized)
+
+#### Handle Lifecycle
+- [ ] HandleLifetime constant (default 30 seconds)
+- [ ] `generateHandleID()` creates unique IDs
+- [ ] Handles expire automatically after lifetime
+- [ ] Handles invalidate after single use
+
+```go
+type CredentialHandle struct {
+    ID          string
+    Provider    string
+    AgentID     string
+    AgentType   string
+    ToolCallID  string
+    CreatedAt   time.Time
+    ExpiresAt   time.Time
+    Used        bool
+    value       string  // internal
+}
+```
+
+**Tests:**
+- [ ] Handle creation with correct expiry
+- [ ] Handle expires after lifetime
+- [ ] Handle invalidates after use
+- [ ] Cannot reuse handle
+- [ ] value never appears in JSON/YAML
+
+---
+
+### 6.124 Credential Broker Service
+
+Core broker managing credential access.
+
+**Files to create:**
+- `core/credentials/broker.go`
+- `core/credentials/broker_test.go`
+
+**Dependencies:** 6.122, 6.123, existing CredentialManager
+
+**Acceptance Criteria:**
+
+#### CredentialBroker Struct
+- [ ] References CredentialManager (fetches actual credentials)
+- [ ] Scopes map with defaults + project overrides
+- [ ] Active handles map with mutex
+- [ ] Audit log reference
+
+#### RequestCredential Method
+- [ ] Check scope permissions (isAllowed)
+- [ ] Check RequireAuth (first-time confirmation)
+- [ ] Fetch from CredentialManager
+- [ ] Create time-limited handle
+- [ ] Log GRANTED event
+- [ ] Return handle (NOT raw credential)
+
+#### ResolveHandle Method
+- [ ] Validate handle exists
+- [ ] Check not expired
+- [ ] Check not already used
+- [ ] Mark as used
+- [ ] Log RESOLVED event
+- [ ] Return actual credential value
+
+#### RevokeHandle Method
+- [ ] Remove handle from active map
+- [ ] Log REVOKED event
+
+#### Cleanup Goroutine
+- [ ] Periodic cleanup of expired handles (every 10s)
+- [ ] Thread-safe cleanup
+
+```go
+func (b *CredentialBroker) RequestCredential(
+    ctx context.Context,
+    agentID, agentType, provider, toolCallID, reason string,
+) (*CredentialHandle, error)
+
+func (b *CredentialBroker) ResolveHandle(handleID string) (string, error)
+```
+
+**Tests:**
+- [ ] Request for allowed provider succeeds
+- [ ] Request for denied provider fails with CredentialAccessDeniedError
+- [ ] Request for unknown provider fails (default deny)
+- [ ] RequireAuth triggers user confirmation
+- [ ] Handle resolves to correct credential
+- [ ] Expired handle resolution fails
+- [ ] Used handle resolution fails
+- [ ] Concurrent requests thread-safe
+
+---
+
+### 6.125 Just-in-Time Injection Hooks
+
+Pre/post tool hooks for credential injection.
+
+**Files to create:**
+- `core/credentials/hooks.go`
+- `core/credentials/hooks_test.go`
+
+**Dependencies:** 6.124 (Credential Broker), hook system
+
+**Acceptance Criteria:**
+
+#### CredentialContext Struct
+- [ ] Wraps broker + handleID
+- [ ] `Credential()` method resolves handle
+- [ ] Caches resolved value for single tool execution
+- [ ] Clears value on cleanup
+
+#### PreToolCredentialHook
+- [ ] Type: PreTool, Priority: Early (after env_var_isolation)
+- [ ] Look up tool metadata for RequiredCredentials
+- [ ] Skip if tool needs no credentials
+- [ ] Request handle for each required credential
+- [ ] Inject CredentialContext map into tool context
+- [ ] Fail tool call if any credential request fails
+
+#### PostToolCredentialHook
+- [ ] Type: PostTool, Priority: Last
+- [ ] Revoke any unused handles
+- [ ] Clear credential values from CredentialContext
+- [ ] Ensure no credential leakage
+
+#### Context Key
+- [ ] `credentialContextKey` for context value storage
+- [ ] Type-safe context accessor functions
+
+```go
+var PreToolCredentialHook = &Hook{
+    Name:     "credential_injection",
+    Type:     PreTool,
+    Priority: HookPriorityEarly,
+    Handler:  func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) { ... },
+}
+```
+
+**Tests:**
+- [ ] Tool with credential requirement gets injected context
+- [ ] Tool without requirements gets no injection
+- [ ] Multiple credentials injected correctly
+- [ ] Unused handles revoked on cleanup
+- [ ] Credential values cleared after execution
+- [ ] Hook ordering correct (after env_var_isolation)
+
+---
+
+### 6.126 Tool Credential Registry
+
+Metadata declaring tool credential requirements.
+
+**Files to create:**
+- `core/tools/credential_registry.go`
+- `core/tools/credential_registry_test.go`
+
+**Dependencies:** None (data definitions)
+
+**Acceptance Criteria:**
+
+#### ToolMetadata Struct
+- [ ] Name string
+- [ ] RequiredCredentials []string (provider names)
+
+#### ToolRegistry Map
+- [ ] Register all tools with credential requirements
+- [ ] generate_embeddings: ["openai"]
+- [ ] create_pr: ["github"]
+- [ ] web_search: ["serpapi"]
+- [ ] read_file, write_file: [] (no credentials)
+
+#### GetToolMetadata Function
+- [ ] Lookup by tool name
+- [ ] Returns nil for unknown tools (no credentials assumed)
+
+#### Validation
+- [ ] `ValidateToolRegistry()` ensures no tool has credential-like parameters
+- [ ] Fails build if tool declares both credentials AND credential params
+
+```go
+var ToolRegistry = map[string]*ToolMetadata{
+    "generate_embeddings": {RequiredCredentials: []string{"openai"}},
+    "create_pr":           {RequiredCredentials: []string{"github"}},
+}
+```
+
+**Tests:**
+- [ ] Registry contains all external API tools
+- [ ] Metadata lookup works
+- [ ] Unknown tool returns nil
+- [ ] Validation detects bad tool definitions
+
+---
+
+### 6.127 Credential Audit Log
+
+Tamper-evident logging of all credential access.
+
+**Files to create:**
+- `core/credentials/audit.go`
+- `core/credentials/audit_test.go`
+
+**Dependencies:** None (standalone)
+
+**Acceptance Criteria:**
+
+#### CredentialAuditEntry Struct
+- [ ] ID, Timestamp, Action, AgentID, AgentType, Provider
+- [ ] ToolCallID, HandleID, Reason (optional fields)
+- [ ] PrevHash, EntryHash (hash chain)
+
+#### CredentialAuditAction Enum
+- [ ] granted, denied, resolved, revoked, pending, expired
+
+#### CredentialAuditLog Struct
+- [ ] entries slice with mutex
+- [ ] hashChain string (running hash)
+- [ ] storage backend interface
+
+#### Log Methods
+- [ ] LogGranted, LogDenied, LogResolved, LogRevoked, LogPending
+- [ ] Each computes hash chain
+
+#### Hash Chain
+- [ ] SHA-256 of entry fields + previous hash
+- [ ] `Verify()` validates entire chain integrity
+- [ ] Detects tampering at any entry
+
+#### Query Method
+- [ ] Filter by AgentType, Provider, Action, time range
+- [ ] Returns matching entries
+
+```go
+type CredentialAuditEntry struct {
+    ID         string
+    Timestamp  time.Time
+    Action     CredentialAuditAction
+    AgentID    string
+    AgentType  string
+    Provider   string
+    PrevHash   string
+    EntryHash  string
+}
+```
+
+**Tests:**
+- [ ] Entries logged with correct action types
+- [ ] Hash chain computed correctly
+- [ ] Verify() passes for valid log
+- [ ] Verify() fails for tampered log
+- [ ] Query filters work correctly
+- [ ] Thread-safe logging
+
+---
+
+### 6.128 User Authorization Manager
+
+First-time credential access confirmations.
+
+**Files to create:**
+- `core/credentials/authorization.go`
+- `core/credentials/authorization_test.go`
+
+**Dependencies:** 6.124 (integrates with broker), Guide agent
+
+**Acceptance Criteria:**
+
+#### UserAuthorizationManager Struct
+- [ ] authorizations map (agentType:provider → bool)
+- [ ] storage backend for persistence
+- [ ] mutex for thread safety
+
+#### RequestAuthorization Method
+- [ ] Check if already authorized (fast path)
+- [ ] Prompt user via Guide agent
+- [ ] Options: "Allow", "Allow for session only", "Deny"
+- [ ] Persist "Allow" to storage
+- [ ] Session-only doesn't persist
+- [ ] Return error on deny
+
+#### Integration with Broker
+- [ ] Broker calls `hasUserAuthorization()` for RequireAuth scopes
+- [ ] Returns CredentialAuthRequiredError if not authorized
+- [ ] Error triggers authorization flow
+
+```go
+func (m *UserAuthorizationManager) RequestAuthorization(
+    ctx context.Context,
+    agentType, provider string,
+) error
+```
+
+**Tests:**
+- [ ] Already authorized returns immediately
+- [ ] "Allow" persists authorization
+- [ ] "Allow for session only" doesn't persist
+- [ ] "Deny" returns error
+- [ ] User prompt shows correct message
+- [ ] Concurrent authorization requests serialized
+
+---
+
+### 6.129 Credential Broker Integration Tests
+
+End-to-end tests for credential access system.
+
+**Files to create:**
+- `tests/e2e/credential_broker_test.go`
+- `tests/fixtures/credential_test_tools/`
+
+**Dependencies:** 6.122-6.128, Secret Management (6.113-6.121)
+
+**Test Scenarios:**
+
+#### Basic Access Flow
+- [ ] Engineer calls create_pr → credential injected → success
+- [ ] Librarian calls generate_embeddings → credential injected → success
+- [ ] Agent never sees raw credential value
+
+#### Scope Enforcement
+- [ ] Librarian tries github → denied (scope violation)
+- [ ] Orchestrator tries any credential → denied (no access)
+- [ ] Unknown provider → denied (default deny)
+
+#### Handle Lifecycle
+- [ ] Handle expires after 30 seconds
+- [ ] Handle invalidates after use
+- [ ] Unused handles revoked on cleanup
+
+#### User Authorization
+- [ ] First github access prompts user
+- [ ] "Allow" enables future access
+- [ ] "Deny" blocks access
+
+#### Secret Management Integration
+- [ ] Credential in tool output → redacted
+- [ ] Credential in agent message → redacted
+- [ ] Credential as parameter → blocked by env_var_isolation
+
+#### Audit Trail
+- [ ] All credential access logged
+- [ ] Hash chain verifies
+- [ ] Query returns correct entries
+
+**Acceptance Criteria:**
+- [ ] All scenarios passing
+- [ ] No credential leakage to LLM context
+- [ ] Audit log complete and tamper-evident
+- [ ] Performance: < 5ms overhead per tool call
+- [ ] Concurrent access thread-safe
+
+---
+
+## Credential Broker Implementation Order
+
+1. **6.122** (Credential Scopes) - Foundation, no dependencies
+2. **6.123** (Handle System) - Depends on 6.122
+3. **6.122** → **6.126** (Tool Registry) - Can parallelize, no deps on broker
+4. **6.127** (Audit Log) - No dependencies, can parallelize
+5. **6.123 + 6.127** → **6.124** (Broker Service) - Core implementation
+6. **6.124** → **6.125** (Injection Hooks) - Depends on broker
+7. **6.124** → **6.128** (User Authorization) - Depends on broker
+8. **All** → **6.129** (Integration Tests) - Validates entire system
+
+**Parallel Execution Groups:**
+- Group A: 6.122, 6.126, 6.127 (no dependencies on each other)
+- Group B: 6.123 (depends on 6.122)
+- Group C: 6.124 (depends on A + B)
+- Group D: 6.125, 6.128 (depend on C, can parallelize)
+- Group E: 6.129 (depends on all)
+
+**Cross-System Dependencies:**
+- Credential Broker depends on Secret Management hooks (6.115, 6.116, 6.117)
+- Integration tests require both systems operational
+- Can develop in parallel but integration tests last
+
+---
+
+## Pipeline Variants Implementation Order
+
+1. **6.101** (Variant Data Structures) - Foundation, no dependencies
+2. **6.102** (VFS Subprocess Interception) - Can parallelize with 6.101
+3. **6.101 + 6.102** → **6.103** (Variant Injection) - Core injection logic
+4. **6.103** → **6.104** (Variant Cancellation) - Depends on injection
+5. **6.103 + 6.104** → **6.105** (Variant Selection/Commit) - Depends on both
+6. **6.101** → **6.106** (Lazy Diff Cache) - Only needs types
+7. **6.101** → **6.107** (Guide Signal Hub) - Only needs types
+8. **6.107** → **6.108** (Notification Aggregation) - Depends on signals
+9. **6.105 + 6.106** → **6.109** (CLI Commands) - Needs commit and diff
+10. **6.101** → **6.110** (Status Line) - Only needs types
+11. **6.103 + 6.105** → **6.111** (Layer Wait) - Needs injection and commit
+12. **All** → **6.112** (Integration Tests) - Validates entire system
+
+**Parallel Execution Groups:**
+- Group A: 6.101, 6.102 (no dependencies)
+- Group B: 6.106, 6.107, 6.110 (only depend on 6.101)
+- Group C: 6.103 (depends on A)
+- Group D: 6.104, 6.108 (depend on C, B respectively)
+- Group E: 6.105, 6.111 (depend on C, D)
+- Group F: 6.109 (depends on E, B)
+- Group G: 6.112 (depends on all)
 
 ---
 

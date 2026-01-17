@@ -243,34 +243,54 @@ func (ps *PendingStore) Stats() PendingStats {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
-	stats := PendingStats{
+	stats := ps.basePendingStats()
+	ps.fillPendingSourceStats(&stats)
+	ps.fillPendingTargetStats(&stats)
+	ps.fillPendingTimeStats(&stats)
+
+	return stats
+}
+
+func (ps *PendingStore) basePendingStats() PendingStats {
+	return PendingStats{
 		TotalPending: len(ps.pending),
 		BySource:     make(map[string]int),
 		ByTarget:     make(map[string]int),
 	}
+}
 
+func (ps *PendingStore) fillPendingSourceStats(stats *PendingStats) {
 	for sourceID, corrIDs := range ps.bySource {
 		stats.BySource[sourceID] = len(corrIDs)
 	}
+}
 
+func (ps *PendingStore) fillPendingTargetStats(stats *PendingStats) {
 	for targetID, corrIDs := range ps.byTarget {
 		stats.ByTarget[targetID] = len(corrIDs)
 	}
+}
 
-	// Find oldest and next expiration
-	var oldest, nextExp time.Time
-	for _, pending := range ps.pending {
-		if oldest.IsZero() || pending.CreatedAt.Before(oldest) {
-			oldest = pending.CreatedAt
-		}
-		if nextExp.IsZero() || pending.ExpiresAt.Before(nextExp) {
-			nextExp = pending.ExpiresAt
-		}
-	}
+func (ps *PendingStore) fillPendingTimeStats(stats *PendingStats) {
+	oldest, nextExp := ps.pendingTimeBounds()
 	stats.OldestPending = oldest
 	stats.NextExpiration = nextExp
+}
 
-	return stats
+func (ps *PendingStore) pendingTimeBounds() (time.Time, time.Time) {
+	var oldest, nextExp time.Time
+	for _, pending := range ps.pending {
+		oldest = pickEarlier(oldest, pending.CreatedAt)
+		nextExp = pickEarlier(nextExp, pending.ExpiresAt)
+	}
+	return oldest, nextExp
+}
+
+func pickEarlier(current time.Time, candidate time.Time) time.Time {
+	if current.IsZero() || candidate.Before(current) {
+		return candidate
+	}
+	return current
 }
 
 // Count returns the number of pending requests

@@ -2006,7 +2006,7 @@ For multiple sessions operating on the same codebase:
 
 ## The Guide: Universal Message Router
 
-**CRITICAL: Every message between ANY two agents flows through the Guide. No agent communicates directly with another agent.**
+**CRITICAL: The Guide is the universal message router for ALL user messages and ambiguous inter-agent requests. For token-optimized direct consultations between agents with known targets, see [Direct Consultation Protocol](#direct-consultation-protocol).**
 
 ### Guide Responsibilities
 
@@ -2809,6 +2809,221 @@ At 75% cache hit rate (higher than Librarian due to immutable history):
 
 ---
 
+## Direct Consultation Protocol
+
+### Token Cost Problem
+
+When agents consult each other through Guide, the token cost accumulates:
+
+```
+Intent-Based Routing (via Guide):
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│  Agent A → Guide → Agent B → Guide → Agent A                                           │
+│                                                                                        │
+│  Step                    │ Tokens  │ Model        │ Cost Factor                        │
+│  ────────────────────────┼─────────┼──────────────┼────────────────                    │
+│  A → Guide (request)     │ ~500    │ Haiku        │ 1x                                 │
+│  Guide processes         │ ~500    │ Haiku        │ 1x                                 │
+│  Guide → B (forward)     │ ~500    │ Opus/Gemini  │ 10-15x                             │
+│  B responds              │ ~1000   │ Opus/Gemini  │ 10-15x                             │
+│  B → Guide (response)    │ ~1000   │ Haiku        │ 1x                                 │
+│  Guide → A (forward)     │ ~1000   │ Haiku        │ 1x                                 │
+│                                                                                        │
+│  HIDDEN COST: Guide's context accumulates ALL consultation traffic.                    │
+│  At 100 consultations/session: Guide context grows by 50-100K tokens.                  │
+│  This causes more frequent Guide compaction and higher per-turn costs.                 │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Solution: Direct Consultation for Known Targets
+
+When an agent knows exactly which agent it needs to consult, bypass Guide:
+
+```
+Direct Consultation:
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│  Agent A ────────────────────────▶ Agent B                                             │
+│           (direct, no Guide hop)      │                                                │
+│                                       │                                                │
+│  Agent A ◀────────────────────────────┘                                                │
+│                                                                                        │
+│  Step                    │ Tokens  │ Model        │ Cost Factor                        │
+│  ────────────────────────┼─────────┼──────────────┼────────────────                    │
+│  A → B (request)         │ ~500    │ Opus/Gemini  │ 10-15x                             │
+│  B responds              │ ~1000   │ Opus/Gemini  │ 10-15x                             │
+│                                                                                        │
+│  NO Guide overhead. Context growth isolated to participating agents only.              │
+│  Async logging to Archivalist for observability (fire-and-forget).                     │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### When to Use Each Approach
+
+| Scenario | Routing | Reason |
+|----------|---------|--------|
+| **Known target** ("Consult Engineer about X") | **Direct** | Agent knows exactly who to ask |
+| **Ambiguous request** ("I need help with this") | **Guide** | Guide determines best target |
+| **Fan-out to multiple agents** | **Guide** | Coordination needed |
+| **Policy check required** | **Guide** | Permissions, rate limiting |
+| **Blocking/urgent** | **Direct** | Skip routing overhead |
+
+### Direct Consultation Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      DIRECT CONSULTATION ARCHITECTURE                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  DIRECT PATH (95% of consultations):                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                              │   │
+│  │  ┌──────────┐    consult_engineer()    ┌──────────┐                         │   │
+│  │  │ Designer │ ────────────────────────▶│ Engineer │                         │   │
+│  │  └──────────┘                          └────┬─────┘                         │   │
+│  │       ▲                                     │                               │   │
+│  │       │         response                    │                               │   │
+│  │       └─────────────────────────────────────┘                               │   │
+│  │                                                                              │   │
+│  │       │ (async, fire-and-forget)                                            │   │
+│  │       ▼                                                                      │   │
+│  │  ┌─────────────┐                                                            │   │
+│  │  │ Archivalist │ ◀── Log: {from, to, question_summary, timestamp}           │   │
+│  │  └─────────────┘     (truncated, minimal tokens)                            │   │
+│  │                                                                              │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  GUIDE PATH (5% of consultations - ambiguous/policy-controlled):                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                              │   │
+│  │  ┌──────────┐   "I need help"   ┌───────┐   routes to   ┌──────────┐        │   │
+│  │  │ Designer │ ─────────────────▶│ Guide │ ─────────────▶│ ????     │        │   │
+│  │  └──────────┘                   └───────┘               └──────────┘        │   │
+│  │                                                                              │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Consultation Skills Pattern
+
+Each agent has direct consultation skills for agents it commonly consults:
+
+```go
+// Direct consultation skill pattern
+type ConsultSkill struct {
+    Name        string     // e.g., "consult_engineer"
+    Target      AgentType  // Explicit target agent
+    Description string
+    Parameters  []Param
+}
+
+// Implementation pattern
+func (d *Designer) consultEngineer(ctx context.Context, req *ConsultRequest) (*ConsultResponse, error) {
+    // Direct message to Engineer (no Guide hop)
+    resp, err := d.bus.RequestDirect(ctx, "engineer", &Message{
+        Type:      "CONSULT_REQUEST",
+        From:      d.ID,
+        SessionID: d.sessionID,
+        Payload:   req,
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    // Async log to Archivalist (fire-and-forget, doesn't block or grow Guide context)
+    go d.logConsultation(ctx, "engineer", req.Question)
+
+    return resp.(*ConsultResponse), nil
+}
+
+func (d *Designer) logConsultation(ctx context.Context, target, question string) {
+    // Truncate question for minimal storage
+    summary := question
+    if len(summary) > 100 {
+        summary = summary[:100] + "..."
+    }
+
+    d.bus.Publish("archivalist.log", &ConsultationLog{
+        From:      d.agentType,
+        To:        target,
+        Summary:   summary,
+        Timestamp: time.Now(),
+        SessionID: d.sessionID,
+    })
+}
+```
+
+### Consultation Request/Response Types
+
+```go
+// ConsultRequest is the standard consultation request
+type ConsultRequest struct {
+    Question    string         `json:"question"`
+    Context     map[string]any `json:"context,omitempty"`     // Relevant context
+    Priority    string         `json:"priority,omitempty"`    // "blocking", "async"
+    MaxTokens   int            `json:"max_tokens,omitempty"`  // Limit response size
+}
+
+// ConsultResponse is the standard consultation response
+type ConsultResponse struct {
+    Answer      string         `json:"answer"`
+    Confidence  float64        `json:"confidence,omitempty"`  // 0.0-1.0
+    References  []string       `json:"references,omitempty"`  // File paths, docs, etc.
+    Suggestions []string       `json:"suggestions,omitempty"` // Follow-up suggestions
+}
+
+// ConsultationLog for Archivalist (minimal footprint)
+type ConsultationLog struct {
+    From      string    `json:"from"`
+    To        string    `json:"to"`
+    Summary   string    `json:"summary"`    // Truncated question (max 100 chars)
+    Timestamp time.Time `json:"timestamp"`
+    SessionID string    `json:"session_id"`
+}
+```
+
+### Agent Consultation Matrix
+
+Which agents can directly consult which:
+
+| From \ To | Guide | Architect | Engineer | Designer | Inspector | Tester | Librarian | Archivalist | Academic |
+|-----------|-------|-----------|----------|----------|-----------|--------|-----------|-------------|----------|
+| **Guide** | - | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Architect** | ✓ | - | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Engineer** | ✓ | ✓ | - | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Designer** | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Inspector** | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ | - |
+| **Tester** | ✓ | ✓ | ✓ | ✓ | ✓ | - | ✓ | ✓ | - |
+| **Librarian** | ✓ | - | - | - | - | - | - | ✓ | ✓ |
+| **Archivalist** | ✓ | - | - | - | - | - | ✓ | - | ✓ |
+| **Academic** | ✓ | - | - | - | - | - | ✓ | ✓ | - |
+
+**Legend**: ✓ = Has direct consultation skill | - = Must route through Guide (or not applicable)
+
+### Token Savings Analysis
+
+```
+100 consultations/session comparison:
+
+INTENT-BASED (via Guide):
+├── Guide context growth: ~100K tokens (consultations accumulate)
+├── Guide compaction: 2-3 additional compactions
+├── Total Guide tokens: ~300K
+├── Total Worker tokens: ~150K
+└── TOTAL: ~450K tokens
+
+DIRECT CONSULTATION:
+├── Guide context growth: ~0 tokens (consultations bypass Guide)
+├── Guide compaction: 0 additional compactions
+├── Total Worker tokens: ~150K
+├── Archivalist logs: ~5K tokens (truncated summaries)
+└── TOTAL: ~155K tokens
+
+SAVINGS: ~65% reduction in consultation-related token usage
+```
+
+---
+
 ## LLM API Management
 
 All LLM requests flow through the Guide to a centralized **LLM Request Gate**. This layer handles provider management, rate limiting, token budgets, and context overflow—ensuring agents can function reliably without managing API complexities.
@@ -2927,6 +3142,780 @@ type CompletionResponse struct {
     Model        string
     Latency      time.Duration
 }
+```
+
+### Streaming + Event Bus Integration
+
+This section defines how streaming LLM responses integrate with the event bus for real-time, reactive agent coordination.
+
+#### Overview
+
+Traditional batch processing waits for complete LLM responses before acting. Sylk's streaming integration converts callback-based streaming into event bus messages, enabling:
+
+1. **Real-time token accounting** - Budget enforcement mid-generation
+2. **Progressive tool detection** - Prepare tool execution before arguments complete
+3. **Backpressure propagation** - Slow consumers block producers naturally
+4. **Context-aware interruption** - Clean abort on timeout/cancellation
+5. **Correlation chain preservation** - Trace individual chunks through the system
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    STREAMING + EVENT BUS ARCHITECTURE                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  BEFORE (Batch Mode):                                                               │
+│  ═══════════════════                                                                │
+│                                                                                     │
+│    Agent A                                                                          │
+│       │                                                                             │
+│       ▼                                                                             │
+│    Provider.Generate()                                                              │
+│       │                                                                             │
+│       │  ← [waits 30s for complete response]                                        │
+│       │                                                                             │
+│       ▼                                                                             │
+│    Complete Response                                                                │
+│       │                                                                             │
+│       ▼                                                                             │
+│    Event Bus → Agent B                                                              │
+│                                                                                     │
+│  AFTER (Streaming Mode):                                                            │
+│  ═══════════════════════                                                            │
+│                                                                                     │
+│    Agent A                                                                          │
+│       │                                                                             │
+│       ▼                                                                             │
+│    Provider.Stream()                                                                │
+│       │                                                                             │
+│       ├──► StreamChunk[0] ──► Event Bus ──► UI renders partial                     │
+│       ├──► StreamChunk[1] ──► Event Bus ──► Token counter updates                  │
+│       ├──► ChunkTypeToolStart ──► Event Bus ──► Agent B prepares                   │
+│       ├──► ChunkTypeToolDelta ──► Event Bus ──► Agent B accumulates args           │
+│       ├──► ChunkTypeToolEnd ──► Event Bus ──► Agent B executes immediately         │
+│       └──► ChunkTypeEnd ──► Event Bus ──► Final usage recorded                     │
+│                                                                                     │
+│  RESULT: Continuous flow, not request-response                                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### StreamChunk Type System
+
+The `StreamChunk` represents a single chunk from a streaming response, with rich type information for routing and processing.
+
+```go
+// core/providers/stream.go
+
+type StreamChunk struct {
+    // Index is the sequence number of this chunk
+    Index int `json:"index"`
+
+    // Text is the content delta
+    Text string `json:"text"`
+
+    // Type indicates the chunk type
+    Type StreamChunkType `json:"type"`
+
+    // ToolCall if this chunk contains tool use data
+    ToolCall *ToolCallChunk `json:"tool_call,omitempty"`
+
+    // Usage is populated on the final chunk (if available)
+    Usage *Usage `json:"usage,omitempty"`
+
+    // StopReason is populated on the final chunk
+    StopReason StopReason `json:"stop_reason,omitempty"`
+
+    // Timestamp when this chunk was received
+    Timestamp time.Time `json:"timestamp"`
+}
+
+type StreamChunkType string
+
+const (
+    ChunkTypeText      StreamChunkType = "text"       // Text content delta
+    ChunkTypeToolStart StreamChunkType = "tool_start" // Tool call beginning (ID + Name)
+    ChunkTypeToolDelta StreamChunkType = "tool_delta" // Tool arguments delta
+    ChunkTypeToolEnd   StreamChunkType = "tool_end"   // Tool call complete
+    ChunkTypeStart     StreamChunkType = "start"      // Stream started
+    ChunkTypeEnd       StreamChunkType = "end"        // Stream complete (has Usage)
+    ChunkTypeError     StreamChunkType = "error"      // Error occurred
+)
+
+type ToolCallChunk struct {
+    ID             string `json:"id,omitempty"`
+    Name           string `json:"name,omitempty"`
+    ArgumentsDelta string `json:"arguments_delta,omitempty"`
+}
+```
+
+#### Streaming State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         STREAMING STATE MACHINE                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                              ┌─────────┐                                            │
+│                              │  IDLE   │                                            │
+│                              └────┬────┘                                            │
+│                                   │ Provider.Stream() called                        │
+│                                   ▼                                                 │
+│                              ┌─────────┐                                            │
+│                       ┌──────│STARTING │──────┐                                     │
+│                       │      └────┬────┘      │                                     │
+│                       │           │           │ Error                               │
+│                       │           │ ChunkTypeStart                                  │
+│                       │           ▼           │                                     │
+│                       │      ┌─────────┐      │                                     │
+│       ChunkTypeText ──┼─────►│STREAMING│◄─────┼── ChunkTypeText (loop)              │
+│                       │      └────┬────┘      │                                     │
+│                       │           │           │                                     │
+│                       │           │ ChunkTypeToolStart                              │
+│                       │           ▼           │                                     │
+│                       │      ┌─────────┐      │                                     │
+│                       │      │TOOL_CALL│◄─────┼── ChunkTypeToolDelta (loop)         │
+│                       │      └────┬────┘      │                                     │
+│                       │           │           │                                     │
+│                       │           │ ChunkTypeToolEnd                                │
+│                       │           ▼           │                                     │
+│                       │      ┌─────────┐      │                                     │
+│                       │      │STREAMING│      │  (may return to streaming or        │
+│                       │      │  or END │      │   start another tool call)          │
+│                       │      └────┬────┘      │                                     │
+│                       │           │           │                                     │
+│                       │           │ ChunkTypeEnd or ChunkTypeError                  │
+│                       │           ▼           ▼                                     │
+│                       │      ┌─────────┐ ┌─────────┐                               │
+│                       └─────►│COMPLETE │ │  ERROR  │                               │
+│                              └─────────┘ └─────────┘                               │
+│                                                                                     │
+│  State Transitions:                                                                 │
+│  ─────────────────                                                                  │
+│  IDLE → STARTING: Stream initiated                                                  │
+│  STARTING → STREAMING: First content chunk received                                 │
+│  STREAMING → STREAMING: Text chunks accumulating                                    │
+│  STREAMING → TOOL_CALL: Tool use detected                                           │
+│  TOOL_CALL → TOOL_CALL: Tool arguments accumulating                                 │
+│  TOOL_CALL → STREAMING: Tool complete, more content follows                         │
+│  STREAMING → COMPLETE: End of turn or max tokens                                    │
+│  ANY → ERROR: Provider error or context cancellation                                │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Event Bus Message Wrapping
+
+StreamChunks are wrapped in the generic `Message[T]` envelope for event bus transmission, preserving correlation chains and enabling priority-based routing.
+
+```go
+// Wrapping StreamChunk for event bus transmission
+func WrapStreamChunk(chunk *StreamChunk, ctx StreamContext) Message[StreamChunk] {
+    return Message[StreamChunk]{
+        ID:            uuid.New().String(),
+        CorrelationID: ctx.CorrelationID,  // Links all chunks from one generation
+        ParentID:      ctx.RequestID,       // Links to triggering request
+        SessionID:     ctx.SessionID,
+        Source:        ctx.ProviderName,    // e.g., "anthropic-provider"
+        Target:        ctx.TargetAgent,     // e.g., "ui-renderer" or "agent-orchestrator"
+        Type:          MessageTypeStream,
+        Payload:       *chunk,
+        Timestamp:     chunk.Timestamp,
+        Priority:      ctx.Priority,
+        Metadata: map[string]any{
+            "model":       ctx.Model,
+            "agent_id":    ctx.AgentID,
+            "chunk_index": chunk.Index,
+            "chunk_type":  string(chunk.Type),
+        },
+    }
+}
+
+type StreamContext struct {
+    CorrelationID string
+    RequestID     string
+    SessionID     string
+    ProviderName  string
+    TargetAgent   string
+    Model         string
+    AgentID       string
+    Priority      Priority
+}
+```
+
+#### Stream Accumulation Patterns
+
+```go
+// StreamAccumulator collects streaming chunks into a complete response
+type StreamAccumulator struct {
+    mu sync.Mutex
+
+    chunks     []StreamChunk
+    text       strings.Builder
+    toolCalls  map[string]*accumulatedToolCall
+    usage      Usage
+    stopReason StopReason
+    model      string
+
+    startTime time.Time
+    endTime   time.Time
+}
+
+// Add accumulates a chunk (thread-safe)
+func (a *StreamAccumulator) Add(chunk *StreamChunk) {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+
+    a.chunks = append(a.chunks, *chunk)
+
+    switch chunk.Type {
+    case ChunkTypeText:
+        a.text.WriteString(chunk.Text)
+
+    case ChunkTypeToolStart:
+        if chunk.ToolCall != nil {
+            a.toolCalls[chunk.ToolCall.ID] = &accumulatedToolCall{
+                ID:   chunk.ToolCall.ID,
+                Name: chunk.ToolCall.Name,
+            }
+        }
+
+    case ChunkTypeToolDelta:
+        if chunk.ToolCall != nil {
+            if tc, ok := a.toolCalls[chunk.ToolCall.ID]; ok {
+                tc.Arguments.WriteString(chunk.ToolCall.ArgumentsDelta)
+            }
+        }
+
+    case ChunkTypeEnd:
+        a.endTime = time.Now()
+        if chunk.Usage != nil {
+            a.usage = *chunk.Usage
+        }
+        if chunk.StopReason != "" {
+            a.stopReason = chunk.StopReason
+        }
+    }
+}
+
+// Response builds the final response from accumulated chunks
+func (a *StreamAccumulator) Response() *Response {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+
+    var toolCalls []ToolCall
+    for _, tc := range a.toolCalls {
+        toolCalls = append(toolCalls, ToolCall{
+            ID:        tc.ID,
+            Name:      tc.Name,
+            Arguments: tc.Arguments.String(),
+        })
+    }
+
+    return &Response{
+        Content:    a.text.String(),
+        Model:      a.model,
+        StopReason: a.stopReason,
+        Usage:      a.usage,
+        ToolCalls:  toolCalls,
+        ProviderMetadata: map[string]any{
+            "chunk_count":     len(a.chunks),
+            "stream_duration": a.endTime.Sub(a.startTime).String(),
+        },
+    }
+}
+```
+
+#### Channel-Based Streaming (Event Bus Bridge)
+
+```go
+// StreamToChannel converts callback-based streaming to channels
+// This is the KEY BRIDGE between providers and the event bus
+func StreamToChannel(
+    ctx context.Context,
+    provider Provider,
+    req *Request,
+) (<-chan *StreamChunk, <-chan error) {
+    chunks := make(chan *StreamChunk, 100)  // Buffered for backpressure
+    errs := make(chan error, 1)
+
+    go func() {
+        defer close(chunks)
+        defer close(errs)
+
+        err := provider.Stream(ctx, req, func(chunk *StreamChunk) error {
+            select {
+            case chunks <- chunk:
+                return nil
+            case <-ctx.Done():
+                return ctx.Err()  // Clean abort on context cancellation
+            }
+        })
+
+        if err != nil {
+            errs <- err
+        }
+    }()
+
+    return chunks, errs
+}
+```
+
+#### Real-Time Capabilities Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      REAL-TIME STREAMING CAPABILITIES                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  1. PROGRESSIVE UI RENDERING                                                        │
+│  ═══════════════════════════                                                        │
+│                                                                                     │
+│     Provider ──► StreamChunk(text) ──► EventBus ──► UI Renderer                    │
+│                                            │                                        │
+│                                            └──► User sees text as it generates     │
+│                                                                                     │
+│  2. REAL-TIME TOKEN BUDGET ENFORCEMENT                                              │
+│  ═════════════════════════════════════                                              │
+│                                                                                     │
+│     Provider ──► StreamChunk(text) ──► EventBus ──► Token Monitor                  │
+│                                            │              │                         │
+│                                            │              ▼                         │
+│                                            │         Estimate tokens                │
+│                                            │              │                         │
+│                                            │              ▼                         │
+│                                            │         Budget exceeded?               │
+│                                            │              │                         │
+│                                            │      ┌───────┴───────┐                 │
+│                                            │      │ YES           │ NO              │
+│                                            │      ▼               ▼                 │
+│                                            │  ctx.Cancel()    Continue              │
+│                                            │      │                                 │
+│                                            │      ▼                                 │
+│                                            └──► Stream aborts cleanly               │
+│                                                                                     │
+│  3. PROGRESSIVE TOOL PREPARATION                                                    │
+│  ═══════════════════════════════                                                    │
+│                                                                                     │
+│     Provider ──► ChunkTypeToolStart ──► EventBus ──► Tool Executor                 │
+│                      (ID + Name)                          │                         │
+│                                                           ▼                         │
+│                                                    Prepare execution context        │
+│                                                    (load resources, validate)       │
+│                                                           │                         │
+│     Provider ──► ChunkTypeToolDelta ──► EventBus ────────►│                         │
+│                   (arguments delta)                       │                         │
+│                                                    Accumulate arguments             │
+│                                                           │                         │
+│     Provider ──► ChunkTypeToolEnd ──► EventBus ──────────►│                         │
+│                                                           ▼                         │
+│                                                    Execute IMMEDIATELY              │
+│                                                    (context already warm)           │
+│                                                                                     │
+│  4. VALIDATION EARLY ABORT                                                          │
+│  ═════════════════════════                                                          │
+│                                                                                     │
+│     Provider ──► StreamChunk(text) ──► EventBus ──► Validator                      │
+│                                            │              │                         │
+│                                            │              ▼                         │
+│                                            │         Detect issues                  │
+│                                            │         (syntax errors, security)      │
+│                                            │              │                         │
+│                                            │              ▼                         │
+│                                            │         Issue found?                   │
+│                                            │              │                         │
+│                                            │      ┌───────┴───────┐                 │
+│                                            │      │ YES           │ NO              │
+│                                            │      ▼               ▼                 │
+│                                            │  Abort + Feedback  Continue            │
+│                                            │  (save tokens)                         │
+│                                            │                                        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Backpressure Handling
+
+The streaming architecture handles backpressure at multiple levels:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         BACKPRESSURE PROPAGATION                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  LEVEL 1: Channel Buffer                                                            │
+│  ═══════════════════════                                                            │
+│                                                                                     │
+│     chunks := make(chan *StreamChunk, 100)  // 100-chunk buffer                     │
+│                                                                                     │
+│     • Buffer absorbs temporary consumer slowdowns                                   │
+│     • When buffer full, producer blocks                                             │
+│     • Prevents memory explosion from unbounded queues                               │
+│                                                                                     │
+│  LEVEL 2: Handler Error Return                                                      │
+│  ═════════════════════════════                                                      │
+│                                                                                     │
+│     err := provider.Stream(ctx, req, func(chunk *StreamChunk) error {               │
+│         // Handler can return error to halt stream                                  │
+│         if budgetExceeded {                                                         │
+│             return ErrBudgetExceeded  // Stops generation                           │
+│         }                                                                           │
+│         return nil                                                                  │
+│     })                                                                              │
+│                                                                                     │
+│     • Handler returning error halts generation immediately                          │
+│     • Provider stops calling LLM API                                                │
+│     • Partial response still usable via accumulator                                 │
+│                                                                                     │
+│  LEVEL 3: Context Cancellation                                                      │
+│  ════════════════════════════                                                       │
+│                                                                                     │
+│     ctx, cancel := context.WithCancel(parentCtx)                                    │
+│                                                                                     │
+│     // In token monitor goroutine:                                                  │
+│     if estimatedTokens > budget {                                                   │
+│         cancel()  // Cancels context                                                │
+│     }                                                                               │
+│                                                                                     │
+│     // In stream goroutine:                                                         │
+│     select {                                                                        │
+│     case chunks <- chunk:                                                           │
+│         return nil                                                                  │
+│     case <-ctx.Done():                                                              │
+│         return ctx.Err()  // Propagates cancellation                                │
+│     }                                                                               │
+│                                                                                     │
+│     • Cancellation propagates through entire call chain                             │
+│     • All goroutines clean up properly                                              │
+│     • No orphaned resources                                                         │
+│                                                                                     │
+│  LEVEL 4: Event Bus Priority                                                        │
+│  ══════════════════════════                                                         │
+│                                                                                     │
+│     Message[StreamChunk]{                                                           │
+│         Priority: PriorityHigh,  // User-interactive stream                         │
+│     }                                                                               │
+│                                                                                     │
+│     • High-priority streams processed first                                         │
+│     • Low-priority streams may be delayed                                           │
+│     • User-facing streams never starved                                             │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Provider-Specific Streaming Implementation
+
+Each provider implements streaming with provider-specific event handling:
+
+```go
+// Anthropic streaming (uses event-based API)
+func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, handler StreamHandler) error {
+    stream := p.client.Messages.NewStreaming(ctx, params)
+
+    // Send start chunk
+    handler(&StreamChunk{Type: ChunkTypeStart, Timestamp: time.Now()})
+
+    toolCallIDForIndex := map[int64]string{}
+
+    for stream.Next() {
+        event := stream.Current()
+
+        // Convert provider-specific events to generic StreamChunk
+        chunk := p.convertStreamEvent(event, chunkIndex, toolCallIDForIndex)
+        if chunk != nil {
+            if err := handler(chunk); err != nil {
+                return err  // Handler requested stop
+            }
+        }
+    }
+
+    // Send end chunk with final usage
+    return handler(&StreamChunk{
+        Type:       ChunkTypeEnd,
+        StopReason: stopReason,
+        Usage:      &finalUsage,
+        Timestamp:  time.Now(),
+    })
+}
+
+// Google streaming (uses iterator-based API)
+func (g *GoogleProvider) Stream(ctx context.Context, req *Request, handler StreamHandler) error {
+    handler(&StreamChunk{Type: ChunkTypeStart, Timestamp: time.Now()})
+
+    for resp, err := range g.client.Models.GenerateContentStream(ctx, model, contents, config) {
+        if err != nil {
+            handler(&StreamChunk{Type: ChunkTypeError, Text: err.Error()})
+            return err
+        }
+
+        // Extract text from response
+        if text := resp.Text(); text != "" {
+            handler(&StreamChunk{Type: ChunkTypeText, Text: text, Timestamp: time.Now()})
+        }
+
+        // Handle function calls
+        for _, fc := range resp.FunctionCalls() {
+            handler(&StreamChunk{
+                Type:     ChunkTypeToolStart,
+                ToolCall: &ToolCallChunk{ID: fc.ID, Name: fc.Name},
+            })
+            // ... tool delta and end chunks
+        }
+    }
+
+    return handler(&StreamChunk{Type: ChunkTypeEnd, Usage: &usage})
+}
+
+// OpenAI streaming (uses Responses API events)
+func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, handler StreamHandler) error {
+    stream := p.client.Responses.NewStreaming(ctx, params)
+
+    handler(&StreamChunk{Type: ChunkTypeStart})
+
+    for stream.Next() {
+        event := stream.Current()
+
+        switch ev := event.AsAny().(type) {
+        case responses.ResponseTextDeltaEvent:
+            handler(&StreamChunk{Type: ChunkTypeText, Text: ev.Delta})
+
+        case responses.ResponseFunctionCallArgumentsDeltaEvent:
+            handler(&StreamChunk{
+                Type:     ChunkTypeToolDelta,
+                ToolCall: &ToolCallChunk{ID: ev.ItemID, ArgumentsDelta: ev.Delta},
+            })
+
+        case responses.ResponseCompletedEvent:
+            // Final response
+        }
+    }
+
+    return handler(&StreamChunk{Type: ChunkTypeEnd, Usage: &usage})
+}
+```
+
+#### Agent Integration Example
+
+```go
+// Agent receives streaming responses via event bus
+func (a *Engineer) handleStreamingResponse(ctx context.Context, correlationID string) {
+    // Subscribe to stream chunks for this correlation
+    streamSub := a.eventBus.Subscribe(
+        MessageTypeStream,
+        WithCorrelation(correlationID),
+    )
+    defer streamSub.Close()
+
+    accumulator := NewStreamAccumulator()
+    var toolContext *ToolPreparationContext
+
+    for msg := range streamSub.Messages() {
+        chunk := msg.Payload  // StreamChunk
+
+        accumulator.Add(&chunk)
+
+        switch chunk.Type {
+        case ChunkTypeText:
+            // Progressive output to user
+            a.ui.AppendText(chunk.Text)
+
+            // Real-time validation
+            if issue := a.validator.CheckPartial(accumulator.Text()); issue != nil {
+                a.cancelStream(correlationID, issue)
+                return
+            }
+
+        case ChunkTypeToolStart:
+            // Prepare tool execution BEFORE arguments arrive
+            toolContext = a.toolExecutor.Prepare(chunk.ToolCall.Name)
+
+        case ChunkTypeToolDelta:
+            // Accumulate arguments (accumulator handles this)
+
+        case ChunkTypeToolEnd:
+            // Execute tool immediately - context already warm
+            if toolContext != nil {
+                tc := accumulator.GetToolCall(chunk.ToolCall.ID)
+                result := a.toolExecutor.Execute(toolContext, tc)
+                a.handleToolResult(result)
+            }
+
+        case ChunkTypeEnd:
+            // Final response ready
+            response := accumulator.Response()
+            a.processCompleteResponse(response)
+
+        case ChunkTypeError:
+            a.handleStreamError(chunk.Text)
+        }
+    }
+}
+
+// Cancel stream on validation failure
+func (a *Engineer) cancelStream(correlationID string, issue *ValidationIssue) {
+    a.eventBus.Publish(Message[StreamControl]{
+        Type:          MessageTypeStreamControl,
+        CorrelationID: correlationID,
+        Payload:       StreamControl{Action: "cancel", Reason: issue.Message},
+    })
+}
+```
+
+#### Streaming Metrics and Observability
+
+```go
+// StreamMetrics collects telemetry from streaming responses
+type StreamMetrics struct {
+    // Timing
+    TimeToFirstToken    time.Duration  // Latency until first content
+    TimeToFirstToolCall time.Duration  // Latency until tool detected
+    TotalDuration       time.Duration  // Total stream duration
+
+    // Throughput
+    TokensPerSecond     float64        // Average generation speed
+    ChunksReceived      int            // Total chunks processed
+
+    // Efficiency
+    EarlyAborts         int            // Streams cancelled before completion
+    TokensSaved         int            // Estimated tokens saved from early abort
+    BackpressureEvents  int            // Times producer blocked on full buffer
+}
+
+// Collect metrics from stream
+func CollectStreamMetrics(
+    chunks <-chan *StreamChunk,
+    done <-chan struct{},
+) *StreamMetrics {
+    metrics := &StreamMetrics{}
+    startTime := time.Now()
+    var firstTokenTime, firstToolTime time.Time
+
+    for {
+        select {
+        case chunk, ok := <-chunks:
+            if !ok {
+                metrics.TotalDuration = time.Since(startTime)
+                return metrics
+            }
+
+            metrics.ChunksReceived++
+
+            switch chunk.Type {
+            case ChunkTypeText:
+                if firstTokenTime.IsZero() {
+                    firstTokenTime = time.Now()
+                    metrics.TimeToFirstToken = firstTokenTime.Sub(startTime)
+                }
+
+            case ChunkTypeToolStart:
+                if firstToolTime.IsZero() {
+                    firstToolTime = time.Now()
+                    metrics.TimeToFirstToolCall = firstToolTime.Sub(startTime)
+                }
+
+            case ChunkTypeEnd:
+                if chunk.Usage != nil {
+                    elapsed := time.Since(startTime).Seconds()
+                    if elapsed > 0 {
+                        metrics.TokensPerSecond = float64(chunk.Usage.OutputTokens) / elapsed
+                    }
+                }
+            }
+
+        case <-done:
+            metrics.EarlyAborts++
+            metrics.TotalDuration = time.Since(startTime)
+            return metrics
+        }
+    }
+}
+```
+
+#### Edge Cases and Error Handling
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      STREAMING EDGE CASES AND ERROR HANDLING                         │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  1. NETWORK INTERRUPTION MID-STREAM                                                 │
+│  ══════════════════════════════════                                                 │
+│                                                                                     │
+│     Symptoms: Stream stops without ChunkTypeEnd                                     │
+│                                                                                     │
+│     Handling:                                                                       │
+│     • stream.Err() returns network error                                            │
+│     • Send ChunkTypeError to handler                                                │
+│     • Accumulator contains partial response (usable for retry)                      │
+│     • Agent decides: retry from scratch or resume from partial                      │
+│                                                                                     │
+│  2. RATE LIMIT (429) DURING STREAM                                                  │
+│  ═════════════════════════════════                                                  │
+│                                                                                     │
+│     Symptoms: Provider returns 429 mid-generation                                   │
+│                                                                                     │
+│     Handling:                                                                       │
+│     • Provider converts to ChunkTypeError                                           │
+│     • RateLimiter.OnRateLimit() called                                              │
+│     • ALL streams pause (global rate limit)                                         │
+│     • Partial response preserved for retry                                          │
+│                                                                                     │
+│  3. CONTEXT CANCELLED BY USER                                                       │
+│  ═══════════════════════════                                                        │
+│                                                                                     │
+│     Symptoms: User types Ctrl+C or sends interrupt                                  │
+│                                                                                     │
+│     Handling:                                                                       │
+│     • Context cancelled propagates to stream goroutine                              │
+│     • Handler returns ctx.Err() (context.Canceled)                                  │
+│     • Stream stops cleanly                                                          │
+│     • Partial response available if needed                                          │
+│     • No orphaned goroutines                                                        │
+│                                                                                     │
+│  4. TOOL CALL WITH MALFORMED ARGUMENTS                                              │
+│  ═════════════════════════════════════                                              │
+│                                                                                     │
+│     Symptoms: JSON parse fails on accumulated arguments                             │
+│                                                                                     │
+│     Handling:                                                                       │
+│     • ToolCall.Arguments contains invalid JSON                                      │
+│     • Tool executor returns validation error                                        │
+│     • Error result sent back to LLM (tool result message)                           │
+│     • LLM may retry with corrected arguments                                        │
+│                                                                                     │
+│  5. STREAM TIMEOUT                                                                  │
+│  ════════════════                                                                   │
+│                                                                                     │
+│     Symptoms: No chunks received for configurable duration                          │
+│                                                                                     │
+│     Handling:                                                                       │
+│     • StreamContext includes deadline                                               │
+│     • Watchdog goroutine monitors last chunk time                                   │
+│     • If exceeded, context cancelled                                                │
+│     • Partial response preserved                                                    │
+│                                                                                     │
+│  6. BUFFER OVERFLOW (Slow Consumer)                                                 │
+│  ═══════════════════════════════════                                                │
+│                                                                                     │
+│     Symptoms: Channel buffer full, producer blocks                                  │
+│                                                                                     │
+│     Handling:                                                                       │
+│     • Buffered channel (100 chunks) absorbs bursts                                  │
+│     • If full, select blocks until consumer catches up                              │
+│     • Context cancellation still respected (no deadlock)                            │
+│     • Metrics track backpressure events                                             │
+│                                                                                     │
+│  7. MULTIPLE TOOL CALLS IN ONE STREAM                                               │
+│  ═════════════════════════════════════                                              │
+│                                                                                     │
+│     Symptoms: LLM returns multiple tool calls before completion                     │
+│                                                                                     │
+│     Handling:                                                                       │
+│     • toolCallIDForIndex map tracks each tool call by index                         │
+│     • Accumulator maintains separate builder per tool call ID                       │
+│     • All tool calls available in final Response.ToolCalls                          │
+│     • Parallel tool execution possible if independent                               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Request Priority Queue
@@ -6483,6 +7472,838 @@ broker:
 
 ---
 
+## Tier 1 Multi-Session Amendments
+
+The original Tier 1 specifications were designed with single-session assumptions. This section documents the amendments required for multi-session coordination across all Tier 1 components.
+
+### 1.1 LLM API Management - Multi-Session
+
+#### Rate Limiting: Per-Session with Global Subscription Ceiling
+
+Users may use subscription plans (Max/Pro) with **weekly** or **monthly** usage limits. The rate limiter must track per-session usage while enforcing a global ceiling across all concurrent sessions.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    MULTI-SESSION RATE LIMITING                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                        GLOBAL SUBSCRIPTION TRACKER                            │  │
+│  │                                                                               │  │
+│  │  SQLite WAL (shared across sessions)                                          │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐ │  │
+│  │  │ provider | period_start | period_end | requests_used | tokens_used     │ │  │
+│  │  │ anthropic| 2025-01-13   | 2025-01-20 | 1,234         | 2,456,789       │ │  │
+│  │  │ openai   | 2025-01-01   | 2025-01-31 | 567           | 1,234,567       │ │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘ │  │
+│  │                                                                               │  │
+│  │  Soft Limits (from config):                                                   │  │
+│  │  • Weekly: 10,000 requests OR 50M tokens (configurable)                       │  │
+│  │  • Monthly: 40,000 requests OR 200M tokens (configurable)                     │  │
+│  │  • Warn at: 80% (configurable)                                                │  │
+│  │  • Period: week | month | day (configurable)                                  │  │
+│  │                                                                               │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                              │                                                      │
+│                              ▼                                                      │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                          │
+│  │  Session A    │  │  Session B    │  │  Session C    │                          │
+│  │               │  │               │  │               │                          │
+│  │ Per-session:  │  │ Per-session:  │  │ Per-session:  │                          │
+│  │ • Usage count │  │ • Usage count │  │ • Usage count │                          │
+│  │ • Rate state  │  │ • Rate state  │  │ • Rate state  │                          │
+│  │ • Backoff     │  │ • Backoff     │  │ • Backoff     │                          │
+│  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘                          │
+│          │                  │                  │                                   │
+│          └──────────────────┼──────────────────┘                                   │
+│                             ▼                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                         RATE LIMIT DECISION                                   │  │
+│  │                                                                               │  │
+│  │  1. Check global subscription ceiling:                                        │  │
+│  │     IF global_usage >= soft_limit THEN warn ALL sessions                      │  │
+│  │     IF global_usage >= hard_limit THEN block ALL sessions                     │  │
+│  │                                                                               │  │
+│  │  2. Check provider 429:                                                       │  │
+│  │     IF 429 received THEN backoff THIS session (provider may per-key limit)    │  │
+│  │     Broadcast warning to other sessions (they may hit same limit)             │  │
+│  │                                                                               │  │
+│  │  3. Per-session rate state:                                                   │  │
+│  │     Each session tracks its own backoff (may differ by timing)                │  │
+│  │     Global ceiling applies equally to all                                     │  │
+│  │                                                                               │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Implementation
+
+```go
+// GlobalSubscriptionTracker tracks usage across all sessions
+type GlobalSubscriptionTracker struct {
+    db        *sql.DB           // Shared SQLite WAL
+    mu        sync.RWMutex
+    config    SubscriptionConfig
+    signalBus *CrossSessionSignalDispatcher
+}
+
+type SubscriptionConfig struct {
+    // Per-provider limits (nil = no limit, rely on 429)
+    ProviderLimits map[string]*SubscriptionLimit `yaml:"provider_limits"`
+}
+
+type SubscriptionLimit struct {
+    Period        string  `yaml:"period"`          // "week", "month", "day"
+    MaxRequests   *int64  `yaml:"max_requests"`    // nil = unlimited
+    MaxTokens     *int64  `yaml:"max_tokens"`      // nil = unlimited
+    WarnThreshold float64 `yaml:"warn_threshold"`  // 0.8 = 80%
+}
+
+// RecordUsage atomically records usage and checks limits
+func (t *GlobalSubscriptionTracker) RecordUsage(
+    ctx context.Context,
+    provider string,
+    sessionID string,
+    tokens int,
+) (*UsageStatus, error) {
+    t.mu.Lock()
+    defer t.mu.Unlock()
+
+    // Atomic update in SQLite
+    _, err := t.db.ExecContext(ctx, `
+        INSERT INTO subscription_usage (provider, period_start, period_end, requests_used, tokens_used)
+        VALUES (?, ?, ?, 1, ?)
+        ON CONFLICT (provider, period_start) DO UPDATE SET
+            requests_used = requests_used + 1,
+            tokens_used = tokens_used + ?
+    `, provider, t.periodStart(provider), t.periodEnd(provider), tokens, tokens)
+    if err != nil {
+        return nil, err
+    }
+
+    // Check limits
+    status := t.checkLimits(ctx, provider)
+
+    // Broadcast warnings if needed
+    if status.WarningLevel > 0 && status.WarningLevel != status.PreviousWarningLevel {
+        t.signalBus.Broadcast(CrossSessionSignal{
+            Type:    SignalSubscriptionWarning,
+            Payload: status,
+        })
+    }
+
+    return status, nil
+}
+
+type UsageStatus struct {
+    Provider             string  `json:"provider"`
+    RequestsUsed         int64   `json:"requests_used"`
+    TokensUsed           int64   `json:"tokens_used"`
+    RequestsRemaining    *int64  `json:"requests_remaining"` // nil if unlimited
+    TokensRemaining      *int64  `json:"tokens_remaining"`   // nil if unlimited
+    WarningLevel         int     `json:"warning_level"`      // 0=ok, 1=warning, 2=critical
+    PreviousWarningLevel int     `json:"-"`
+    PeriodEndsAt         time.Time `json:"period_ends_at"`
+}
+```
+
+#### Token Budgets: Per-Session with Global Ceiling
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    TOKEN BUDGET HIERARCHY (MULTI-SESSION)                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Level 1: GLOBAL SUBSCRIPTION CEILING                                               │
+│  ═══════════════════════════════════                                                │
+│  • Enforced by GlobalSubscriptionTracker                                            │
+│  • Applies across ALL sessions                                                      │
+│  • Based on subscription plan (weekly/monthly)                                      │
+│                                                                                     │
+│          │                                                                          │
+│          ▼                                                                          │
+│                                                                                     │
+│  Level 2: PER-SESSION BUDGET                                                        │
+│  ═══════════════════════════                                                        │
+│  • Optional per-session limit (config or runtime)                                   │
+│  • Prevents runaway sessions                                                        │
+│  • Fair share: Global remaining ÷ active sessions                                   │
+│                                                                                     │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                     │
+│  │  Session A      │  │  Session B      │  │  Session C      │                     │
+│  │  Budget: 500K   │  │  Budget: 500K   │  │  Budget: 500K   │                     │
+│  │  Used: 123K     │  │  Used: 456K     │  │  Used: 78K      │                     │
+│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘                     │
+│           │                    │                    │                              │
+│           ▼                    ▼                    ▼                              │
+│                                                                                     │
+│  Level 3: PER-TASK BUDGET (unchanged)                                               │
+│  ═══════════════════════════════════                                                │
+│  • Architect assigns per-task budgets                                               │
+│  • Within session budget                                                            │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Priority Queue: Cross-Session User Preemption
+
+User-interactive requests from **ANY** session preempt pipeline requests from **ALL** sessions.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    CROSS-SESSION LLM QUEUE                                           │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │  GLOBAL USER-INTERACTIVE QUEUE (HIGHEST PRIORITY)                            │    │
+│  │                                                                              │    │
+│  │  Session A: User query  ───┐                                                 │    │
+│  │  Session B: User query  ───┼──► FIFO within user tier                        │    │
+│  │  Session C: User query  ───┘    (all have absolute priority)                 │    │
+│  │                                                                              │    │
+│  │  Properties:                                                                 │    │
+│  │  • Unbounded (never reject user)                                            │    │
+│  │  • ANY user request preempts ALL pipeline requests                          │    │
+│  │  • FIFO ordering among user requests (fair across sessions)                 │    │
+│  │                                                                              │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                      │                                                              │
+│                      │ Always drain user queue first                               │
+│                      ▼                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │  GLOBAL PIPELINE QUEUE (LOWER PRIORITY)                                       │    │
+│  │                                                                              │    │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐     │    │
+│  │  │ Session A: Pipeline 1 (priority 80)  ─┐                              │     │    │
+│  │  │ Session B: Pipeline 2 (priority 60)  ─┼─► Ordered by:                │     │    │
+│  │  │ Session A: Pipeline 3 (priority 60)  ─┤   1. Priority (higher first) │     │    │
+│  │  │ Session C: Pipeline 4 (priority 40)  ─┘   2. Spawn time (earlier)    │     │    │
+│  │  └─────────────────────────────────────────────────────────────────────┘     │    │
+│  │                                                                              │    │
+│  │  Properties:                                                                 │    │
+│  │  • Bounded by global fair share slots                                       │    │
+│  │  • Cross-session priority ordering                                          │    │
+│  │  • Can be preempted by ANY session's user request                           │    │
+│  │                                                                              │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// CrossSessionDualQueueGate extends DualQueueGate for multi-session
+type CrossSessionDualQueueGate struct {
+    // Shared across sessions (SQLite-backed)
+    globalUserQueue     *GlobalPriorityQueue  // User requests from all sessions
+    globalPipelineQueue *GlobalPriorityQueue  // Pipeline requests from all sessions
+
+    // Per-session state
+    sessionStates       map[string]*SessionQueueState
+
+    // Coordination
+    db                  *sql.DB
+    signalDispatcher    *CrossSessionSignalDispatcher
+    fairShare           *FairShareCalculator
+
+    mu                  sync.RWMutex
+}
+
+type SessionQueueState struct {
+    SessionID       string
+    ActiveRequests  int
+    QueuedRequests  int
+    LastActivity    time.Time
+}
+
+// Submit handles request from any session
+func (g *CrossSessionDualQueueGate) Submit(
+    ctx context.Context,
+    sessionID string,
+    req *LLMRequest,
+) (*CompletionResponse, error) {
+    isUser := g.isUserInteractive(req)
+
+    if isUser {
+        // User requests go to global user queue
+        g.globalUserQueue.Push(sessionID, req)
+        // Preempt ANY pipeline request if needed
+        g.maybePreemptAnyPipeline()
+    } else {
+        // Pipeline requests go to global pipeline queue
+        g.globalPipelineQueue.Push(sessionID, req)
+    }
+
+    return g.waitForCompletion(ctx, sessionID, req)
+}
+
+// maybePreemptAnyPipeline preempts lowest-priority pipeline from ANY session
+func (g *CrossSessionDualQueueGate) maybePreemptAnyPipeline() {
+    g.mu.Lock()
+    defer g.mu.Unlock()
+
+    // Find lowest-priority active pipeline request across ALL sessions
+    var lowestPriority *ActiveRequest
+    var lowestSession string
+
+    for sessionID, state := range g.sessionStates {
+        for _, ar := range state.ActiveRequests {
+            if !ar.IsUser {
+                if lowestPriority == nil || ar.Request.Priority < lowestPriority.Request.Priority {
+                    lowestPriority = ar
+                    lowestSession = sessionID
+                }
+            }
+        }
+    }
+
+    if lowestPriority != nil {
+        // Cancel and notify the session
+        lowestPriority.CancelFunc()
+        g.signalDispatcher.Send(lowestSession, CrossSessionSignal{
+            Type:    SignalRequestPreempted,
+            Payload: lowestPriority.Request.ID,
+        })
+    }
+}
+```
+
+### 1.2 Concurrency Model - Multi-Session
+
+#### Global N_CPU_CORES Pool
+
+The N_CPU_CORES limit for pipelines is **GLOBAL** across all sessions. Sessions share this pool via the Fair Share Calculator (TODO 0.40).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    GLOBAL PIPELINE SLOT ALLOCATION                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Total Pipeline Slots: N_CPU_CORES (e.g., 8)                                        │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                        FAIR SHARE ALLOCATION                                  │   │
+│  │                                                                               │   │
+│  │  Tier 1: User Reserved (20% = ~2 slots)                                       │   │
+│  │  ════════════════════════════════════════                                     │   │
+│  │  • Always available for user-invoked pipelines                                │   │
+│  │  • ANY session can use if they have user activity                             │   │
+│  │  • Preempts background pipelines if needed                                    │   │
+│  │                                                                               │   │
+│  │  Tier 2: Active Sessions (proportional)                                       │   │
+│  │  ══════════════════════════════════════                                       │   │
+│  │  • Remaining slots divided by activity score                                  │   │
+│  │  • Activity: running_pipelines + recent_invocations × decay                   │   │
+│  │                                                                               │   │
+│  │  Tier 3: Idle Sessions (baseline)                                             │   │
+│  │  ════════════════════════════════════                                         │   │
+│  │  • Minimum 1 slot if available                                                │   │
+│  │  • Can be preempted by active sessions                                        │   │
+│  │                                                                               │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  Example with 8 cores, 3 sessions:                                                  │
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │ Session A (active, user typing): 3 slots (reserved + activity share)        │    │
+│  │ Session B (active, pipelines):   3 slots (activity share)                   │    │
+│  │ Session C (idle):                1 slot (baseline)                          │    │
+│  │ Reserved for spikes:             1 slot (user buffer)                       │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Pipeline Scheduler Amendment
+
+```go
+// GlobalPipelineScheduler manages pipelines across all sessions
+type GlobalPipelineScheduler struct {
+    mu              sync.Mutex
+
+    // Global state
+    maxConcurrent   int                    // N_CPU_CORES (GLOBAL)
+    totalActive     int                    // Currently running across all sessions
+
+    // Per-session state
+    sessionActive   map[string]int         // Running pipelines per session
+    sessionQueued   map[string]*PriorityQueue // Queued pipelines per session
+
+    // Coordination
+    fairShare       *FairShareCalculator
+    signalDispatcher *CrossSessionSignalDispatcher
+    db              *sql.DB                // Shared state
+
+    slotAvailable   chan struct{}
+}
+
+func NewGlobalPipelineScheduler() *GlobalPipelineScheduler {
+    return &GlobalPipelineScheduler{
+        maxConcurrent:   runtime.NumCPU(), // GLOBAL limit
+        sessionActive:   make(map[string]int),
+        sessionQueued:   make(map[string]*PriorityQueue),
+        slotAvailable:   make(chan struct{}, 1),
+    }
+}
+
+// Schedule adds a pipeline respecting global limits and fair share
+func (s *GlobalPipelineScheduler) Schedule(sessionID string, p *Pipeline) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    // Get session's fair share allocation
+    allocations, _ := s.fairShare.Calculate(s.maxConcurrent)
+    sessionAlloc := allocations[sessionID]
+
+    // Check if session can run more
+    if s.sessionActive[sessionID] < sessionAlloc.PipelineSlots && s.totalActive < s.maxConcurrent {
+        s.sessionActive[sessionID]++
+        s.totalActive++
+        go s.runPipeline(sessionID, p)
+    } else {
+        // Queue for later
+        if s.sessionQueued[sessionID] == nil {
+            s.sessionQueued[sessionID] = NewPriorityQueue()
+        }
+        s.sessionQueued[sessionID].Push(p)
+    }
+}
+
+// OnPipelineComplete handles completion with cross-session rebalancing
+func (s *GlobalPipelineScheduler) OnPipelineComplete(sessionID string, pipelineID string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    s.sessionActive[sessionID]--
+    s.totalActive--
+
+    // Recalculate fair share and dispatch
+    allocations, _ := s.fairShare.Calculate(s.maxConcurrent)
+
+    // Try to dispatch from any session that has quota
+    for sid, alloc := range allocations {
+        if s.sessionActive[sid] < alloc.PipelineSlots && s.totalActive < s.maxConcurrent {
+            if queue := s.sessionQueued[sid]; queue != nil && queue.Len() > 0 {
+                p := queue.Pop()
+                s.sessionActive[sid]++
+                s.totalActive++
+                go s.runPipeline(sid, p)
+            }
+        }
+    }
+}
+```
+
+### 1.3 State Persistence - Multi-Session
+
+#### WAL: Per-Session Files with Shared Metadata
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    MULTI-SESSION WAL STRATEGY                                         │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ~/.sylk/                                                                           │
+│  ├── sessions/                                                                      │
+│  │   ├── session_a/                                                                 │
+│  │   │   ├── wal/                    ← Per-session WAL files                       │
+│  │   │   │   ├── 000001.wal                                                        │
+│  │   │   │   └── 000002.wal                                                        │
+│  │   │   └── checkpoints/            ← Per-session checkpoints                     │
+│  │   │       └── checkpoint_1234.json                                              │
+│  │   │                                                                              │
+│  │   ├── session_b/                                                                 │
+│  │   │   ├── wal/                                                                  │
+│  │   │   └── checkpoints/                                                          │
+│  │   │                                                                              │
+│  │   └── session_c/                                                                 │
+│  │       ├── wal/                                                                  │
+│  │       └── checkpoints/                                                          │
+│  │                                                                                  │
+│  └── shared/                                                                        │
+│      ├── sessions.db                 ← SQLite: session registry (TODO 0.39)        │
+│      ├── subscription.db             ← SQLite: global usage tracking               │
+│      └── circuit_breakers.db         ← SQLite: global circuit states               │
+│                                                                                     │
+│  Isolation:                                                                         │
+│  • WAL files: Per-session (crash recovery isolated)                                │
+│  • Checkpoints: Per-session (state snapshots isolated)                             │
+│  • Session metadata: Shared (cross-session coordination)                           │
+│  • Resource tracking: Shared (fair allocation)                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// MultiSessionWALManager handles per-session WAL with shared coordination
+type MultiSessionWALManager struct {
+    baseDir          string                      // ~/.sylk/sessions
+    sharedDB         *sql.DB                     // Shared metadata
+
+    sessionWALs      map[string]*WriteAheadLog   // Per-session WAL instances
+    mu               sync.RWMutex
+}
+
+// GetOrCreateWAL gets/creates WAL for a session
+func (m *MultiSessionWALManager) GetOrCreateWAL(sessionID string) (*WriteAheadLog, error) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    if wal, ok := m.sessionWALs[sessionID]; ok {
+        return wal, nil
+    }
+
+    // Create session directory
+    sessionDir := filepath.Join(m.baseDir, sessionID, "wal")
+    if err := os.MkdirAll(sessionDir, 0700); err != nil {
+        return nil, err
+    }
+
+    // Register in shared DB
+    _, err := m.sharedDB.Exec(`
+        INSERT INTO sessions (id, wal_dir, created_at, last_active)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET last_active = ?
+    `, sessionID, sessionDir, time.Now(), time.Now(), time.Now())
+    if err != nil {
+        return nil, err
+    }
+
+    wal, err := NewWriteAheadLog(sessionDir)
+    if err != nil {
+        return nil, err
+    }
+
+    m.sessionWALs[sessionID] = wal
+    return wal, nil
+}
+
+// RecoverAllSessions recovers all sessions on startup
+func (m *MultiSessionWALManager) RecoverAllSessions(ctx context.Context) error {
+    rows, err := m.sharedDB.QueryContext(ctx, `
+        SELECT id, wal_dir FROM sessions WHERE recovered = false
+    `)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+
+    for rows.Next() {
+        var sessionID, walDir string
+        if err := rows.Scan(&sessionID, &walDir); err != nil {
+            continue
+        }
+
+        wal, err := m.GetOrCreateWAL(sessionID)
+        if err != nil {
+            continue
+        }
+
+        // Recover this session
+        if err := wal.Recover(ctx); err != nil {
+            // Log but continue with other sessions
+            continue
+        }
+
+        // Mark as recovered
+        m.sharedDB.Exec(`UPDATE sessions SET recovered = true WHERE id = ?`, sessionID)
+    }
+
+    return nil
+}
+```
+
+### 1.4 Circuit Breakers - Global Per-Resource
+
+Circuit breakers are **GLOBAL** per resource type. If Anthropic is down, ALL sessions know immediately.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    GLOBAL CIRCUIT BREAKERS                                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                    SHARED CIRCUIT BREAKER STATE                               │   │
+│  │                                                                               │   │
+│  │  SQLite (circuit_breakers.db):                                                │   │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐ │   │
+│  │  │ resource_id | state      | failures | last_failure | last_state_change │ │   │
+│  │  │ llm:anthro  | OPEN       | 5        | 2025-01-16   | 2025-01-16 10:00  │ │   │
+│  │  │ llm:openai  | CLOSED     | 0        | NULL         | 2025-01-15 14:00  │ │   │
+│  │  │ network     | HALF-OPEN  | 2        | 2025-01-16   | 2025-01-16 10:05  │ │   │
+│  │  └─────────────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                               │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                              │                                                      │
+│                              │ fsnotify signals on state change                    │
+│                              ▼                                                      │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                          │
+│  │  Session A    │  │  Session B    │  │  Session C    │                          │
+│  │               │  │               │  │               │                          │
+│  │ Local cache:  │  │ Local cache:  │  │ Local cache:  │                          │
+│  │ llm:anthro=   │  │ llm:anthro=   │  │ llm:anthro=   │                          │
+│  │   OPEN        │  │   OPEN        │  │   OPEN        │                          │
+│  │               │  │               │  │               │                          │
+│  │ On state      │  │ On state      │  │ On state      │                          │
+│  │ change signal │  │ change signal │  │ change signal │                          │
+│  │ → refresh     │  │ → refresh     │  │ → refresh     │                          │
+│  │   cache       │  │   cache       │  │   cache       │                          │
+│  └───────────────┘  └───────────────┘  └───────────────┘                          │
+│                                                                                     │
+│  Benefits:                                                                          │
+│  • Session A hits 429 → ALL sessions immediately know                              │
+│  • Prevents stampede when provider recovers                                        │
+│  • Shared cooldown prevents duplicate probes                                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// GlobalCircuitBreakerRegistry manages circuit breakers across sessions
+type GlobalCircuitBreakerRegistry struct {
+    db              *sql.DB                     // Shared state
+    signalDispatcher *CrossSessionSignalDispatcher
+
+    // Local cache (refreshed on signals)
+    localCache      map[string]*CircuitBreakerState
+    cacheMu         sync.RWMutex
+}
+
+type CircuitBreakerState struct {
+    ResourceID      string        `json:"resource_id"`
+    State           CircuitState  `json:"state"`
+    Failures        int           `json:"failures"`
+    LastFailure     *time.Time    `json:"last_failure"`
+    LastStateChange time.Time     `json:"last_state_change"`
+    CooldownEnds    *time.Time    `json:"cooldown_ends"`
+}
+
+// RecordResult records result and broadcasts state changes
+func (r *GlobalCircuitBreakerRegistry) RecordResult(
+    resourceID string,
+    success bool,
+) (*CircuitBreakerState, error) {
+    r.cacheMu.Lock()
+    defer r.cacheMu.Unlock()
+
+    // Atomic update in SQLite
+    tx, err := r.db.Begin()
+    if err != nil {
+        return nil, err
+    }
+    defer tx.Rollback()
+
+    // Get current state
+    var state CircuitBreakerState
+    err = tx.QueryRow(`
+        SELECT resource_id, state, failures, last_failure, last_state_change
+        FROM circuit_breakers WHERE resource_id = ?
+    `, resourceID).Scan(&state.ResourceID, &state.State, &state.Failures,
+                        &state.LastFailure, &state.LastStateChange)
+
+    if err == sql.ErrNoRows {
+        state = CircuitBreakerState{
+            ResourceID: resourceID,
+            State:      CircuitClosed,
+        }
+    }
+
+    // Apply result
+    oldState := state.State
+    if success {
+        state.Failures = 0
+        if state.State == CircuitHalfOpen {
+            state.State = CircuitClosed
+        }
+    } else {
+        state.Failures++
+        now := time.Now()
+        state.LastFailure = &now
+
+        // Check if should trip
+        config := getCircuitConfig(resourceID)
+        if state.State == CircuitClosed && state.Failures >= config.ConsecutiveFailures {
+            state.State = CircuitOpen
+            cooldownEnd := now.Add(config.CooldownDuration)
+            state.CooldownEnds = &cooldownEnd
+        } else if state.State == CircuitHalfOpen {
+            state.State = CircuitOpen
+        }
+    }
+
+    if state.State != oldState {
+        state.LastStateChange = time.Now()
+    }
+
+    // Persist
+    _, err = tx.Exec(`
+        INSERT INTO circuit_breakers (resource_id, state, failures, last_failure, last_state_change, cooldown_ends)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (resource_id) DO UPDATE SET
+            state = ?, failures = ?, last_failure = ?, last_state_change = ?, cooldown_ends = ?
+    `, resourceID, state.State, state.Failures, state.LastFailure, state.LastStateChange, state.CooldownEnds,
+       state.State, state.Failures, state.LastFailure, state.LastStateChange, state.CooldownEnds)
+    if err != nil {
+        return nil, err
+    }
+
+    if err := tx.Commit(); err != nil {
+        return nil, err
+    }
+
+    // Update local cache
+    r.localCache[resourceID] = &state
+
+    // Broadcast state change to all sessions
+    if state.State != oldState {
+        r.signalDispatcher.Broadcast(CrossSessionSignal{
+            Type:    SignalCircuitStateChange,
+            Payload: state,
+        })
+    }
+
+    return &state, nil
+}
+
+// Allow checks if request should be allowed (uses local cache)
+func (r *GlobalCircuitBreakerRegistry) Allow(resourceID string) bool {
+    r.cacheMu.RLock()
+    state, ok := r.localCache[resourceID]
+    r.cacheMu.RUnlock()
+
+    if !ok {
+        // No state = allowed (first request)
+        return true
+    }
+
+    switch state.State {
+    case CircuitClosed:
+        return true
+    case CircuitOpen:
+        if state.CooldownEnds != nil && time.Now().After(*state.CooldownEnds) {
+            // Cooldown expired, allow probe
+            return true
+        }
+        return false
+    case CircuitHalfOpen:
+        return true
+    }
+
+    return false
+}
+
+// OnSignalReceived refreshes local cache when notified
+func (r *GlobalCircuitBreakerRegistry) OnSignalReceived(signal CrossSessionSignal) {
+    if signal.Type != SignalCircuitStateChange {
+        return
+    }
+
+    state := signal.Payload.(CircuitBreakerState)
+
+    r.cacheMu.Lock()
+    r.localCache[state.ResourceID] = &state
+    r.cacheMu.Unlock()
+}
+```
+
+### 1.5 Resource Constraints - Multi-Session
+
+Already addressed in Tier 2 with:
+- **TODO 0.39**: Session Registry (SQLite)
+- **TODO 0.40**: Fair Share Calculator
+- **TODO 0.41**: Signal Dispatcher
+- **TODO 0.42**: Cross-Session Resource Pool
+
+The original Tier 1 resource pool designs (TODO 0.34) are extended by the Cross-Session Resource Pool which wraps them with session awareness and fair allocation.
+
+### Multi-Session Configuration
+
+```yaml
+# ~/.sylk/config.yaml
+
+multi_session:
+  # Enable multi-session coordination
+  enabled: true
+
+  # Shared database locations
+  sessions_db: "~/.sylk/shared/sessions.db"
+  subscription_db: "~/.sylk/shared/subscription.db"
+  circuit_breakers_db: "~/.sylk/shared/circuit_breakers.db"
+
+  # Signal coordination
+  signal_dir: "~/.sylk/shared/signals"
+  signal_debounce: "100ms"
+
+  # Fair share defaults
+  fair_share:
+    user_reserved_percent: 0.2     # 20% reserved for user-interactive
+    idle_baseline_slots: 1         # Minimum slots for idle sessions
+    activity_decay_rate: 0.1       # Decay per minute for activity score
+    rebalance_interval: "5s"       # How often to recalculate allocations
+
+subscription:
+  # Provider-specific limits (optional - if not set, rely on 429)
+  anthropic:
+    period: "week"                 # week, month, day
+    max_requests: 10000            # nil = unlimited
+    max_tokens: 50000000           # 50M
+    warn_threshold: 0.8
+
+  openai:
+    period: "month"
+    max_requests: null             # Unlimited requests
+    max_tokens: 100000000          # 100M
+    warn_threshold: 0.8
+
+llm:
+  # Cross-session queue settings
+  cross_session_queue:
+    user_preemption: true          # User requests preempt pipelines
+    global_rate_limit: true        # Share rate limit state across sessions
+
+  # Per-session settings
+  per_session:
+    max_concurrent_requests: 10    # Per-session limit (within fair share)
+
+pipelines:
+  # Global settings
+  global_max_concurrent: 0         # 0 = N_CPU_CORES (auto-detect)
+
+  # Per-session settings
+  per_session:
+    max_concurrent: 0              # 0 = fair share allocation
+```
+
+### Integration with Existing TODO Tasks
+
+The multi-session amendments integrate with existing TODO items:
+
+```
+Tier 1 Multi-Session Dependencies:
+═══════════════════════════════════
+
+NEW TASKS:
+• TODO 0.55: GlobalSubscriptionTracker - Cross-session usage tracking
+• TODO 0.56: CrossSessionDualQueueGate - Multi-session LLM queue
+• TODO 0.57: GlobalPipelineScheduler - Cross-session pipeline slots
+• TODO 0.58: MultiSessionWALManager - Per-session WAL with shared metadata
+• TODO 0.59: GlobalCircuitBreakerRegistry - Shared circuit breaker state
+
+EXISTING TASK UPDATES:
+• TODO 0.39 (Session Registry) - Already covers session tracking
+• TODO 0.40 (Fair Share Calculator) - Already covers allocation
+• TODO 0.41 (Signal Dispatcher) - Already covers cross-session signals
+• TODO 0.42 (Cross-Session Resource Pool) - Already covers resource sharing
+
+INTEGRATION:
+• TODO 0.55-0.59 DEPEND ON 0.39-0.41 (must implement session coordination first)
+• TODO 0.56 (Queue) depends on 0.55 (Subscription) for budget checks
+• TODO 0.57 (Scheduler) depends on 0.40 (Fair Share) for allocation
+• TODO 0.59 (Circuit) depends on 0.41 (Signal) for state broadcasts
+```
+
+---
+
 ## Tool Execution Layer
 
 The Tool Execution Layer provides infrastructure for agents to execute external tools (compilers, linters, test runners, git, etc.) with proper process management, output handling, and multi-session coordination.
@@ -7941,6 +9762,4269 @@ filesystem:
 
 ---
 
+## Storage & Configuration
+
+This section defines the storage layout, configuration schema, credential management, and database operations for Sylk.
+
+### Directory Layout
+
+Sylk uses XDG semantics with platform-native default paths. This provides consistent internal structure while respecting each platform's conventions.
+
+#### Directory Resolution
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         DIRECTORY RESOLUTION ORDER                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  1. Check XDG environment variables (works on ALL platforms if user sets them):    │
+│     • $XDG_CONFIG_HOME/sylk  → config                                              │
+│     • $XDG_DATA_HOME/sylk    → data (sessions, DB)                                 │
+│     • $XDG_CACHE_HOME/sylk   → cache (regenerable)                                 │
+│     • $XDG_STATE_HOME/sylk   → state (logs, runtime)                               │
+│                                                                                     │
+│  2. Fall back to platform-native defaults:                                          │
+│                                                                                     │
+│     LINUX:                                                                          │
+│     • ~/.config/sylk         → config                                              │
+│     • ~/.local/share/sylk    → data                                                │
+│     • ~/.cache/sylk          → cache                                               │
+│     • ~/.local/state/sylk    → state                                               │
+│                                                                                     │
+│     MACOS:                                                                          │
+│     • ~/Library/Preferences/sylk           → config                                │
+│     • ~/Library/Application Support/sylk   → data                                  │
+│     • ~/Library/Caches/sylk                → cache                                 │
+│     • ~/Library/Logs/sylk                  → state                                 │
+│                                                                                     │
+│     WINDOWS:                                                                        │
+│     • %APPDATA%\sylk\config                → config                                │
+│     • %APPDATA%\sylk\data                  → data                                  │
+│     • %LOCALAPPDATA%\sylk\cache            → cache                                 │
+│     • %LOCALAPPDATA%\sylk\state            → state                                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Directory Purpose & Backup Priority
+
+| Directory | Contents | Backup Priority | Can Delete Safely? |
+|-----------|----------|-----------------|-------------------|
+| **config** | User settings, credentials (encrypted), provider config | HIGH | No |
+| **data** | Sessions, SQLite DBs, WAL, checkpoints, per-project knowledge | HIGH | No |
+| **cache** | Query cache, embeddings cache, tool output cache | LOW | Yes |
+| **state** | Logs, lock files, PID files, runtime signals, temp files | MEDIUM | Yes (after shutdown) |
+
+#### Complete Directory Structure
+
+```
+config/
+├── config.yaml                    # User configuration (YAML)
+├── config.schema.json             # JSON Schema for validation
+├── credentials.enc                # Encrypted credentials (fallback)
+└── profiles/
+    ├── default.yaml               # Default profile
+    ├── work.yaml                  # Named profile
+    └── personal.yaml              # Named profile
+
+data/
+├── shared/
+│   └── system.db                  # GLOBAL: sessions, subscription_usage, circuit_breakers
+│
+└── projects/
+    └── {project_hash}/
+        ├── knowledge.db           # PER-PROJECT: query_cache, failure_patterns, embeddings
+        └── index.db               # PER-PROJECT: Librarian codebase index (VectorGraphDB)
+
+data/sessions/{id}/
+├── session.db                     # Session-specific context, routing cache
+├── wal/                           # Write-ahead log files
+└── checkpoints/                   # Checkpoint files
+
+cache/
+├── shared/                        # Cross-session cache (deterministic tool output)
+│   ├── hot/                       # Frequently accessed, never auto-evict
+│   ├── warm/                      # Recent, evict under pressure
+│   └── cold/                      # Old, evict first
+│
+└── sessions/{id}/                 # Session-scoped cache (query cache)
+    ├── hot/
+    ├── warm/
+    └── cold/
+
+state/
+├── logs/
+│   ├── sessions/{id}/
+│   │   ├── session.log            # Human-readable, all components
+│   │   └── session.jsonl          # Structured JSONL, queryable
+│   │
+│   ├── global.jsonl               # ALL sessions, ALL components, structured
+│   └── recent.log                 # Rolling "last N minutes" human-readable
+│
+├── runtime/
+│   ├── sylk.pid                   # Process ID file
+│   └── locks/                     # Lock files
+│
+├── signals/                       # Cross-session signal files (fsnotify)
+│
+└── temp/
+    └── sessions/{id}/             # Controlled temp (staging, working files)
+
+$TMPDIR/sylk-{session_id}/         # OS-managed temp (large build artifacts)
+```
+
+#### Project-Local Directory
+
+Projects can have local configuration in `.sylk/`:
+
+```
+project_root/
+└── .sylk/
+    ├── config.yaml                # Committed - team settings
+    │                              # Provider preferences, tool configs
+    │
+    └── local/                     # Gitignored - personal overrides
+        ├── config.yaml            # Personal setting overrides
+        └── credentials.enc        # Project-specific credentials (encrypted)
+```
+
+**.gitignore entry:**
+```
+.sylk/local/
+```
+
+### Directory Manager Implementation
+
+```go
+// Dirs provides platform-native directory resolution with XDG support
+type Dirs struct {
+    Config string // User configuration
+    Data   string // Persistent data (sessions, databases)
+    Cache  string // Regenerable cache
+    State  string // Runtime state (logs, temp, locks)
+}
+
+// ResolveDirs returns platform-appropriate directories
+func ResolveDirs() (*Dirs, error) {
+    return &Dirs{
+        Config: resolveDir("XDG_CONFIG_HOME", platformConfigDefault()),
+        Data:   resolveDir("XDG_DATA_HOME", platformDataDefault()),
+        Cache:  resolveDir("XDG_CACHE_HOME", platformCacheDefault()),
+        State:  resolveDir("XDG_STATE_HOME", platformStateDefault()),
+    }, nil
+}
+
+func resolveDir(envVar, fallback string) string {
+    if dir := os.Getenv(envVar); dir != "" {
+        return filepath.Join(dir, "sylk")
+    }
+    return fallback
+}
+
+func platformConfigDefault() string {
+    switch runtime.GOOS {
+    case "darwin":
+        return filepath.Join(os.Getenv("HOME"), "Library", "Preferences", "sylk")
+    case "windows":
+        return filepath.Join(os.Getenv("APPDATA"), "sylk", "config")
+    default: // linux and others
+        return filepath.Join(os.Getenv("HOME"), ".config", "sylk")
+    }
+}
+
+func platformDataDefault() string {
+    switch runtime.GOOS {
+    case "darwin":
+        return filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "sylk")
+    case "windows":
+        return filepath.Join(os.Getenv("APPDATA"), "sylk", "data")
+    default:
+        return filepath.Join(os.Getenv("HOME"), ".local", "share", "sylk")
+    }
+}
+
+func platformCacheDefault() string {
+    switch runtime.GOOS {
+    case "darwin":
+        return filepath.Join(os.Getenv("HOME"), "Library", "Caches", "sylk")
+    case "windows":
+        return filepath.Join(os.Getenv("LOCALAPPDATA"), "sylk", "cache")
+    default:
+        return filepath.Join(os.Getenv("HOME"), ".cache", "sylk")
+    }
+}
+
+func platformStateDefault() string {
+    switch runtime.GOOS {
+    case "darwin":
+        return filepath.Join(os.Getenv("HOME"), "Library", "Logs", "sylk")
+    case "windows":
+        return filepath.Join(os.Getenv("LOCALAPPDATA"), "sylk", "state")
+    default:
+        return filepath.Join(os.Getenv("HOME"), ".local", "state", "sylk")
+    }
+}
+
+// ProjectDirs returns project-local directories
+type ProjectDirs struct {
+    Root      string // .sylk/
+    Config    string // .sylk/config.yaml (committed)
+    Local     string // .sylk/local/ (gitignored)
+}
+
+func ResolveProjectDirs(projectRoot string) *ProjectDirs {
+    sylkDir := filepath.Join(projectRoot, ".sylk")
+    return &ProjectDirs{
+        Root:   sylkDir,
+        Config: filepath.Join(sylkDir, "config.yaml"),
+        Local:  filepath.Join(sylkDir, "local"),
+    }
+}
+
+// ProjectHash generates consistent hash for project path
+func ProjectHash(projectRoot string) string {
+    absPath, _ := filepath.Abs(projectRoot)
+    hash := sha256.Sum256([]byte(absPath))
+    return hex.EncodeToString(hash[:8]) // 16 chars
+}
+```
+
+---
+
+### Configuration Schema
+
+#### Format & Validation
+
+Configuration uses YAML for human editing with JSON Schema for validation and IDE support.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         CONFIGURATION LAYERING                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Precedence (lowest to highest):                                                    │
+│                                                                                     │
+│  ┌─────────────┐                                                                    │
+│  │  DEFAULTS   │  Built-in defaults (in code)                                       │
+│  └──────┬──────┘                                                                    │
+│         │ deep merge                                                                │
+│         ▼                                                                           │
+│  ┌─────────────┐                                                                    │
+│  │   PROJECT   │  .sylk/config.yaml (team settings, committed)                      │
+│  └──────┬──────┘                                                                    │
+│         │ deep merge (USER WINS on conflict)                                        │
+│         ▼                                                                           │
+│  ┌─────────────┐                                                                    │
+│  │    USER     │  ~/Library/Preferences/sylk/config.yaml                            │
+│  │             │  + .sylk/local/config.yaml (personal project overrides)            │
+│  └──────┬──────┘                                                                    │
+│         │ override                                                                  │
+│         ▼                                                                           │
+│  ┌─────────────┐                                                                    │
+│  │ ENVIRONMENT │  SYLK_* environment variables                                      │
+│  └─────────────┘                                                                    │
+│                                                                                     │
+│  Deep merge: Maps are recursively merged, higher precedence wins on conflict        │
+│  User > Project: User preferences always override team settings                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Environment Variable Format
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         ENVIRONMENT VARIABLE MAPPING                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Simple values (flat with prefix):                                                  │
+│  ─────────────────────────────────                                                  │
+│  SYLK_LLM_TIMEOUT=30s              → llm.timeout: 30s                               │
+│  SYLK_LLM_DEFAULT_PROVIDER=openai  → llm.default_provider: openai                   │
+│  SYLK_LOG_LEVEL=debug              → log.level: debug                               │
+│                                                                                     │
+│  Complex values (file reference):                                                   │
+│  ────────────────────────────────                                                   │
+│  SYLK_LLM_PROVIDERS_FILE=/path/to/providers.yaml                                    │
+│  SYLK_SUBSCRIPTION_FILE=/etc/sylk/subscription.yaml                                 │
+│                                                                                     │
+│  File reference loads YAML and merges at that config path.                          │
+│                                                                                     │
+│  Provider credentials (standard env vars):                                          │
+│  ─────────────────────────────────────────                                          │
+│  ANTHROPIC_API_KEY=sk-...          → Checked first for Anthropic                    │
+│  OPENAI_API_KEY=sk-...             → Checked first for OpenAI                       │
+│  GOOGLE_API_KEY=...                → Checked first for Google                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Validation Strategy
+
+```
+On startup:
+1. Load all config sources (defaults → project → user → env)
+2. Deep merge with precedence rules
+3. Validate against JSON Schema
+4. For each validation error:
+   ├── Log warning with details
+   ├── Use default value for that field
+   └── Continue (do NOT refuse to start)
+5. Emit summary: "Config loaded with N warnings" (if any)
+```
+
+#### Hot Reload
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         CONFIG HOT RELOAD                                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Triggers:                                                                          │
+│  ─────────                                                                          │
+│  1. SIGHUP signal         → Explicit reload request                                 │
+│  2. File watch (fsnotify) → Auto-detect config file changes                         │
+│                                                                                     │
+│  On reload:                                                                         │
+│  ──────────                                                                         │
+│  1. Re-read all config sources                                                      │
+│  2. Validate new config                                                             │
+│  3. If valid:                                                                       │
+│     ├── Apply changes atomically                                                    │
+│     ├── Notify user: "Config reloaded"                                              │
+│     └── Broadcast to active sessions                                                │
+│  4. If invalid:                                                                     │
+│     ├── Keep current config                                                         │
+│     ├── Log errors                                                                  │
+│     └── Notify user: "Config reload failed: [errors]"                               │
+│                                                                                     │
+│  Watched files:                                                                     │
+│  ──────────────                                                                     │
+│  • {config}/config.yaml                                                             │
+│  • .sylk/config.yaml                                                                │
+│  • .sylk/local/config.yaml                                                          │
+│                                                                                     │
+│  Debounce: 500ms (prevent rapid reloads on editor save)                             │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Configuration Schema Definition
+
+```yaml
+# config.schema.json (JSON Schema)
+# Provides validation + IDE autocomplete
+
+# Example config.yaml with all sections:
+
+# Profile selection
+profile: default                     # Named credential profile to use
+
+# LLM Configuration
+llm:
+  default_provider: anthropic
+  timeout: 120s
+
+  providers:
+    anthropic:
+      enabled: true
+      models:
+        default: claude-sonnet-4-20250514
+        fast: claude-haiku-4-20250514
+        powerful: claude-opus-4-20250514
+
+    openai:
+      enabled: false
+      base_url: null                 # Optional proxy URL
+      models:
+        default: gpt-4o
+        fast: gpt-4o-mini
+
+# Subscription tracking (optional - if not set, rely on 429)
+subscription:
+  anthropic:
+    period: week                     # week | month | day
+    max_requests: 10000              # null = unlimited
+    max_tokens: 50000000             # 50M
+    warn_threshold: 0.8
+
+# Pipeline configuration
+pipelines:
+  global_max_concurrent: 0           # 0 = N_CPU_CORES
+  per_session_max: 0                 # 0 = fair share
+
+# Multi-session configuration
+multi_session:
+  enabled: true
+  fair_share:
+    user_reserved_percent: 0.2
+    idle_baseline_slots: 1
+    activity_decay_rate: 0.1
+    rebalance_interval: 5s
+
+# Resource constraints
+resources:
+  memory:
+    warning_threshold: 0.7
+    critical_threshold: 0.85
+  disk:
+    quota_min: 1GB
+    quota_max: 20GB
+    quota_percent: 0.1
+
+# Error handling
+errors:
+  transient:
+    max_retries: 3
+    high_frequency_threshold: 5
+    high_frequency_window: 1m
+  circuit_breaker:
+    llm:
+      consecutive_failures: 5
+      cooldown_duration: 30s
+
+# Tool execution
+tools:
+  subprocess:
+    default_timeout: 120s
+    max_output_size: 10MB
+  kill_sequence:
+    sigint_timeout: 5s
+    sigterm_timeout: 3s
+
+# Logging
+log:
+  level: info                        # debug | info | warn | error
+  format: text                       # text | json
+  retention_days: 30
+
+# Backup
+backup:
+  periodic:
+    enabled: true
+    interval: 24h
+  pre_session: true
+  pre_migration: true
+  retention_count: 10
+```
+
+#### Config Manager Implementation
+
+```go
+type ConfigManager struct {
+    mu            sync.RWMutex
+    current       *Config
+    schema        *jsonschema.Schema
+    watcher       *fsnotify.Watcher
+    dirs          *Dirs
+    projectDirs   *ProjectDirs
+    onChange      []func(*Config)
+}
+
+// Load loads and merges all config sources
+func (cm *ConfigManager) Load() (*Config, []ValidationWarning, error) {
+    // 1. Start with defaults
+    cfg := DefaultConfig()
+
+    // 2. Deep merge project config (.sylk/config.yaml)
+    if projectCfg, err := cm.loadYAML(cm.projectDirs.Config); err == nil {
+        cfg = deepMerge(cfg, projectCfg)
+    }
+
+    // 3. Deep merge user config (user wins over project)
+    if userCfg, err := cm.loadYAML(filepath.Join(cm.dirs.Config, "config.yaml")); err == nil {
+        cfg = deepMerge(cfg, userCfg)
+    }
+
+    // 4. Deep merge project-local user overrides
+    localConfig := filepath.Join(cm.projectDirs.Local, "config.yaml")
+    if localCfg, err := cm.loadYAML(localConfig); err == nil {
+        cfg = deepMerge(cfg, localCfg)
+    }
+
+    // 5. Apply environment variables
+    cfg = cm.applyEnvironment(cfg)
+
+    // 6. Validate against schema
+    warnings := cm.validate(cfg)
+
+    // 7. Apply defaults for invalid fields
+    cfg = cm.applyDefaults(cfg, warnings)
+
+    cm.mu.Lock()
+    cm.current = cfg
+    cm.mu.Unlock()
+
+    return cfg, warnings, nil
+}
+
+func (cm *ConfigManager) applyEnvironment(cfg *Config) *Config {
+    // Simple values: SYLK_LLM_TIMEOUT -> llm.timeout
+    if v := os.Getenv("SYLK_LLM_TIMEOUT"); v != "" {
+        if d, err := time.ParseDuration(v); err == nil {
+            cfg.LLM.Timeout = d
+        }
+    }
+
+    // File references: SYLK_LLM_PROVIDERS_FILE -> load and merge
+    if path := os.Getenv("SYLK_LLM_PROVIDERS_FILE"); path != "" {
+        if fileCfg, err := cm.loadYAML(path); err == nil {
+            cfg.LLM.Providers = deepMerge(cfg.LLM.Providers, fileCfg)
+        }
+    }
+
+    return cfg
+}
+
+// StartWatching starts file watch for hot reload
+func (cm *ConfigManager) StartWatching(ctx context.Context) error {
+    watcher, err := fsnotify.NewWatcher()
+    if err != nil {
+        return err
+    }
+    cm.watcher = watcher
+
+    // Watch config files
+    paths := []string{
+        filepath.Join(cm.dirs.Config, "config.yaml"),
+        cm.projectDirs.Config,
+        filepath.Join(cm.projectDirs.Local, "config.yaml"),
+    }
+
+    for _, p := range paths {
+        if _, err := os.Stat(p); err == nil {
+            watcher.Add(filepath.Dir(p))
+        }
+    }
+
+    go cm.watchLoop(ctx)
+    return nil
+}
+
+func (cm *ConfigManager) watchLoop(ctx context.Context) {
+    debounce := time.NewTimer(0)
+    <-debounce.C // Drain initial
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case event := <-cm.watcher.Events:
+            if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+                debounce.Reset(500 * time.Millisecond)
+            }
+        case <-debounce.C:
+            cm.reload()
+        }
+    }
+}
+
+func (cm *ConfigManager) reload() {
+    cfg, warnings, err := cm.Load()
+    if err != nil {
+        log.Warn("Config reload failed", "error", err)
+        return
+    }
+
+    if len(warnings) > 0 {
+        log.Info("Config reloaded with warnings", "count", len(warnings))
+    } else {
+        log.Info("Config reloaded")
+    }
+
+    // Notify listeners
+    for _, fn := range cm.onChange {
+        fn(cfg)
+    }
+}
+```
+
+---
+
+### Credential Storage
+
+#### Resolution Order
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         CREDENTIAL RESOLUTION ORDER                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  For each provider (anthropic, openai, google):                                     │
+│                                                                                     │
+│  1. ENVIRONMENT VARIABLE                                                            │
+│     ├── ANTHROPIC_API_KEY                                                           │
+│     ├── OPENAI_API_KEY                                                              │
+│     └── GOOGLE_API_KEY                                                              │
+│     Used by: CI/CD, containers, scripts                                             │
+│                                                                                     │
+│          │ not set                                                                  │
+│          ▼                                                                          │
+│                                                                                     │
+│  2. SYSTEM KEYCHAIN                                                                 │
+│     ├── macOS: Keychain Access (service: "sylk", account: "anthropic")              │
+│     ├── Linux: Secret Service API (GNOME Keyring, KWallet)                          │
+│     └── Windows: Credential Manager                                                 │
+│     Used by: Interactive users (most secure)                                        │
+│                                                                                     │
+│          │ not available / not found                                                │
+│          ▼                                                                          │
+│                                                                                     │
+│  3. ENCRYPTED FILE FALLBACK                                                         │
+│     └── {config}/credentials.enc                                                    │
+│     Used by: Headless servers, containers without keychain                          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Encryption Key Derivation (Fallback File)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         ENCRYPTION KEY DERIVATION                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Machine-bound, NOT portable (by design):                                           │
+│                                                                                     │
+│  1. HARDWARE-BACKED (if available)                                                  │
+│     ├── macOS: Secure Enclave                                                       │
+│     ├── Linux: TPM 2.0                                                              │
+│     └── Windows: TPM 2.0                                                            │
+│                                                                                     │
+│          │ not available                                                            │
+│          ▼                                                                          │
+│                                                                                     │
+│  2. MACHINE-BOUND KEY                                                               │
+│     ├── Inputs:                                                                     │
+│     │   • Machine ID (/etc/machine-id, IOPlatformUUID, MachineGuid)                 │
+│     │   • Install-time salt (generated once, stored in config dir)                  │
+│     │   • Username (additional entropy)                                             │
+│     │                                                                               │
+│     ├── Derivation: Argon2id(machine_id || salt || username)                        │
+│     │                                                                               │
+│     └── Properties:                                                                 │
+│         • No password required                                                      │
+│         • NOT portable between machines (intentional)                               │
+│         • User runs `sylk auth <provider>` on each machine                          │
+│                                                                                     │
+│  Encryption: AES-256-GCM with derived key                                           │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Credential Update Flow
+
+```
+sylk auth anthropic [--profile work]
+         │
+         ▼
+┌─────────────────┐
+│ Prompt for key  │ (or --api-key flag)
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Verify key      │ → Lightweight API call (e.g., list models)
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    │         │
+  Valid    Invalid
+    │         │
+    ▼         ▼
+┌─────────┐  ┌─────────────────────────┐
+│ Store   │  │ Error: "Invalid API key │
+│ key     │  │ for Anthropic"          │
+└─────────┘  └─────────────────────────┘
+```
+
+#### Named Profiles
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         NAMED CREDENTIAL PROFILES                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  User-level profiles ({config}/profiles/):                                          │
+│  ──────────────────────────────────────────                                         │
+│                                                                                     │
+│  profiles/                                                                          │
+│  ├── default.yaml     # Default profile (used when no --profile specified)          │
+│  ├── work.yaml        # Work account credentials                                    │
+│  └── personal.yaml    # Personal account credentials                                │
+│                                                                                     │
+│  Profile content:                                                                   │
+│  ────────────────                                                                   │
+│  # work.yaml (credentials stored in keychain/encrypted file, this just names it)   │
+│  name: work                                                                         │
+│  providers:                                                                         │
+│    anthropic: true     # Has credentials for this provider                          │
+│    openai: false       # No credentials                                             │
+│                                                                                     │
+│  Usage:                                                                             │
+│  ──────                                                                             │
+│  sylk auth anthropic --profile work     # Store key in "work" profile               │
+│  sylk --profile work                    # Use work profile for session              │
+│  SYLK_PROFILE=work sylk                 # Environment override                      │
+│                                                                                     │
+│  Project-scoped profile selection:                                                  │
+│  ─────────────────────────────────                                                  │
+│  # .sylk/config.yaml (committed - team default)                                     │
+│  profile: work                                                                      │
+│                                                                                     │
+│  # .sylk/local/config.yaml (gitignored - personal override)                         │
+│  profile: personal                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Credential Manager Implementation
+
+```go
+type CredentialManager struct {
+    dirs        *Dirs
+    keychain    KeychainProvider   // Platform-specific
+    encFile     *EncryptedFileStore
+    profile     string
+}
+
+type KeychainProvider interface {
+    Get(service, account string) (string, error)
+    Set(service, account, secret string) error
+    Delete(service, account string) error
+    Available() bool
+}
+
+// GetAPIKey retrieves API key with fallback chain
+func (cm *CredentialManager) GetAPIKey(provider string) (string, error) {
+    // 1. Environment variable
+    envVar := providerEnvVar(provider) // e.g., "ANTHROPIC_API_KEY"
+    if key := os.Getenv(envVar); key != "" {
+        return key, nil
+    }
+
+    // 2. System keychain
+    if cm.keychain.Available() {
+        service := fmt.Sprintf("sylk:%s", cm.profile)
+        if key, err := cm.keychain.Get(service, provider); err == nil && key != "" {
+            return key, nil
+        }
+    }
+
+    // 3. Encrypted file fallback
+    if key, err := cm.encFile.Get(cm.profile, provider); err == nil && key != "" {
+        return key, nil
+    }
+
+    return "", fmt.Errorf("no credentials found for %s", provider)
+}
+
+// SetAPIKey stores API key after verification
+func (cm *CredentialManager) SetAPIKey(ctx context.Context, provider, key string) error {
+    // Verify key first
+    if err := cm.verifyKey(ctx, provider, key); err != nil {
+        return fmt.Errorf("invalid API key: %w", err)
+    }
+
+    // Store in keychain if available, else encrypted file
+    if cm.keychain.Available() {
+        service := fmt.Sprintf("sylk:%s", cm.profile)
+        return cm.keychain.Set(service, provider, key)
+    }
+
+    return cm.encFile.Set(cm.profile, provider, key)
+}
+
+func (cm *CredentialManager) verifyKey(ctx context.Context, provider, key string) error {
+    ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+    defer cancel()
+
+    switch provider {
+    case "anthropic":
+        // Lightweight verification call
+        client := anthropic.NewClient(key)
+        _, err := client.ListModels(ctx)
+        return err
+    case "openai":
+        client := openai.NewClient(key)
+        _, err := client.ListModels(ctx)
+        return err
+    case "google":
+        // Similar verification
+        return nil
+    default:
+        return fmt.Errorf("unknown provider: %s", provider)
+    }
+}
+
+// EncryptedFileStore handles fallback encrypted storage
+type EncryptedFileStore struct {
+    path      string
+    keyDerive func() ([]byte, error)
+}
+
+func (e *EncryptedFileStore) deriveKey() ([]byte, error) {
+    // Try hardware-backed first
+    if key, err := hardwareKey(); err == nil {
+        return key, nil
+    }
+
+    // Fall back to machine-bound
+    machineID := getMachineID()
+    salt := getOrCreateSalt(e.path)
+    username := os.Getenv("USER")
+
+    return argon2.IDKey(
+        []byte(machineID+username),
+        salt,
+        1,      // time
+        64*1024, // memory (64MB)
+        4,      // parallelism
+        32,     // key length
+    ), nil
+}
+```
+
+#### Credential Broker (Secure Agent Access)
+
+Agents never see raw credentials. The Credential Broker provides secure, audited access through opaque handles and just-in-time injection.
+
+##### Design Principles
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    CREDENTIAL BROKER DESIGN PRINCIPLES                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  1. AGENTS NEVER SEE RAW VALUES                                                     │
+│     ├── Agents reference credentials by symbolic name ("openai", "github")          │
+│     ├── Broker returns opaque handles, not actual secrets                           │
+│     ├── Tools receive credentials via context injection, not parameters             │
+│     └── Credentials never appear in LLM-visible locations                           │
+│                                                                                     │
+│  2. SCOPED ACCESS                                                                   │
+│     ├── Each agent type has explicit credential permissions                         │
+│     ├── Permissions defined at system level, overridable per-project                │
+│     ├── Unknown credentials default to DENY                                         │
+│     └── Scope violations logged and rejected                                        │
+│                                                                                     │
+│  3. JUST-IN-TIME INJECTION                                                          │
+│     ├── Credentials resolved at tool execution boundary                             │
+│     ├── Tool implementation fetches from context, not parameters                    │
+│     ├── Credential lifetime scoped to single tool execution                         │
+│     └── No credential caching in agent memory                                       │
+│                                                                                     │
+│  4. COMPLETE AUDIT TRAIL                                                            │
+│     ├── Every credential access logged (who, what, when, why)                       │
+│     ├── Failed access attempts logged with reason                                   │
+│     ├── Audit log tamper-evident (hash chain)                                       │
+│     └── Queryable for security review                                               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Credential Broker Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         CREDENTIAL BROKER FLOW                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  AGENT PERSPECTIVE (What agents see)                                                │
+│  ══════════════════════════════════                                                 │
+│                                                                                     │
+│  Agent: "I need to call the OpenAI API to generate embeddings"                      │
+│         │                                                                           │
+│         ▼                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │  tool_call: generate_embeddings                                             │    │
+│  │  parameters: { text: "hello world", model: "text-embedding-3-small" }       │    │
+│  │                                                                             │    │
+│  │  NOTE: No API key in parameters! Agent doesn't know the key.                │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                     │
+│  SYSTEM PERSPECTIVE (What actually happens)                                         │
+│  ══════════════════════════════════════════                                         │
+│                                                                                     │
+│         Tool Call                                                                   │
+│             │                                                                       │
+│             ▼                                                                       │
+│  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐            │
+│  │   PreTool Hook   │────►│ Credential       │────►│ Scope Check      │            │
+│  │   (injection)    │     │ Broker           │     │                  │            │
+│  └──────────────────┘     └──────────────────┘     └────────┬─────────┘            │
+│                                                              │                      │
+│                                              ┌───────────────┴───────────────┐      │
+│                                              │                               │      │
+│                                           Allowed                         Denied    │
+│                                              │                               │      │
+│                                              ▼                               ▼      │
+│                                   ┌──────────────────┐           ┌──────────────┐   │
+│                                   │ Inject into      │           │ Reject with  │   │
+│                                   │ tool context     │           │ audit log    │   │
+│                                   └────────┬─────────┘           └──────────────┘   │
+│                                            │                                        │
+│                                            ▼                                        │
+│                                   ┌──────────────────┐                              │
+│                                   │ Tool Execution   │                              │
+│                                   │                  │                              │
+│                                   │ key := ctx.      │                              │
+│                                   │   Credential(    │                              │
+│                                   │   "openai")      │                              │
+│                                   └────────┬─────────┘                              │
+│                                            │                                        │
+│                                            ▼                                        │
+│                                   ┌──────────────────┐                              │
+│                                   │ PostTool Hook    │                              │
+│                                   │ (clear from ctx) │                              │
+│                                   └──────────────────┘                              │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Agent Credential Scopes
+
+```go
+// CredentialScope defines which credentials an agent can access
+type CredentialScope struct {
+    AgentType   string   `yaml:"agent_type"`
+    Allowed     []string `yaml:"allowed"`      // Provider names: "openai", "anthropic", etc.
+    Denied      []string `yaml:"denied"`       // Explicit denials (override allowed)
+    RequireAuth bool     `yaml:"require_auth"` // Require user confirmation for first use
+}
+
+// DefaultCredentialScopes defines system-wide defaults
+var DefaultCredentialScopes = map[string]*CredentialScope{
+    // Knowledge agents - need LLM access for embeddings/queries
+    "librarian": {
+        AgentType: "librarian",
+        Allowed:   []string{"openai", "anthropic", "voyage"},  // Embedding providers
+        Denied:    []string{"github", "aws"},                   // No repo/cloud access
+    },
+    "academic": {
+        AgentType: "academic",
+        Allowed:   []string{"openai", "anthropic", "google", "serpapi"}, // LLM + search
+        Denied:    []string{"github", "aws"},
+    },
+    "archivalist": {
+        AgentType: "archivalist",
+        Allowed:   []string{"openai", "anthropic"},  // For summarization
+        Denied:    []string{"github", "aws"},
+    },
+
+    // Execution agents - need LLM + potentially external services
+    "engineer": {
+        AgentType:   "engineer",
+        Allowed:     []string{"openai", "anthropic", "github"},
+        RequireAuth: true,  // Confirm before first GitHub access
+    },
+    "designer": {
+        AgentType:   "designer",
+        Allowed:     []string{"openai", "anthropic", "figma"},
+        RequireAuth: true,
+    },
+
+    // Quality agents - read-only, limited scope
+    "inspector": {
+        AgentType: "inspector",
+        Allowed:   []string{"openai", "anthropic"},
+        Denied:    []string{"github", "aws", "figma"},  // No external mutations
+    },
+    "tester": {
+        AgentType: "tester",
+        Allowed:   []string{"openai", "anthropic"},
+        Denied:    []string{"github", "aws"},
+    },
+
+    // Coordination agents - LLM only
+    "guide": {
+        AgentType: "guide",
+        Allowed:   []string{"openai", "anthropic"},
+        Denied:    []string{"github", "aws", "figma"},
+    },
+    "architect": {
+        AgentType: "architect",
+        Allowed:   []string{"openai", "anthropic"},
+        Denied:    []string{"github", "aws"},
+    },
+    "orchestrator": {
+        AgentType: "orchestrator",
+        Allowed:   []string{},  // No direct credential access - coordinates others
+        Denied:    []string{"*"},
+    },
+}
+
+// ProjectCredentialOverrides allows per-project customization
+// Stored in .sylk/config.yaml
+type ProjectCredentialOverrides struct {
+    Scopes map[string]*CredentialScope `yaml:"credential_scopes"`
+}
+```
+
+##### Credential Broker Implementation
+
+```go
+// CredentialBroker manages secure credential access for agents
+type CredentialBroker struct {
+    manager    *CredentialManager
+    scopes     map[string]*CredentialScope
+    overrides  *ProjectCredentialOverrides
+    auditLog   *CredentialAuditLog
+
+    // Active handles (short-lived, scoped to tool execution)
+    mu         sync.RWMutex
+    handles    map[string]*CredentialHandle  // handleID -> handle
+}
+
+// CredentialHandle is an opaque reference to a credential
+type CredentialHandle struct {
+    ID          string        `json:"id"`
+    Provider    string        `json:"provider"`
+    AgentID     string        `json:"agent_id"`
+    AgentType   string        `json:"agent_type"`
+    ToolCallID  string        `json:"tool_call_id"`
+    CreatedAt   time.Time     `json:"created_at"`
+    ExpiresAt   time.Time     `json:"expires_at"`
+    Used        bool          `json:"used"`
+
+    // Internal - never serialized
+    value       string
+}
+
+// HandleLifetime is how long a credential handle is valid
+const HandleLifetime = 30 * time.Second
+
+func NewCredentialBroker(manager *CredentialManager, projectOverrides *ProjectCredentialOverrides) *CredentialBroker {
+    broker := &CredentialBroker{
+        manager:   manager,
+        scopes:    DefaultCredentialScopes,
+        overrides: projectOverrides,
+        auditLog:  NewCredentialAuditLog(),
+        handles:   make(map[string]*CredentialHandle),
+    }
+
+    // Apply project overrides
+    if projectOverrides != nil {
+        for agentType, scope := range projectOverrides.Scopes {
+            broker.scopes[agentType] = scope
+        }
+    }
+
+    // Start handle cleanup goroutine
+    go broker.cleanupExpiredHandles()
+
+    return broker
+}
+
+// RequestCredential creates a handle for credential access
+func (b *CredentialBroker) RequestCredential(
+    ctx context.Context,
+    agentID string,
+    agentType string,
+    provider string,
+    toolCallID string,
+    reason string,
+) (*CredentialHandle, error) {
+
+    // 1. Check scope permissions
+    scope := b.getScope(agentType)
+    if !b.isAllowed(scope, provider) {
+        b.auditLog.LogDenied(agentID, agentType, provider, toolCallID, "scope_violation")
+        return nil, &CredentialAccessDeniedError{
+            AgentType: agentType,
+            Provider:  provider,
+            Reason:    fmt.Sprintf("agent type '%s' is not permitted to access '%s' credentials", agentType, provider),
+        }
+    }
+
+    // 2. Check if user confirmation required (first-time access)
+    if scope.RequireAuth && !b.hasUserAuthorization(agentType, provider) {
+        b.auditLog.LogPending(agentID, agentType, provider, toolCallID, "awaiting_user_auth")
+        return nil, &CredentialAuthRequiredError{
+            AgentType: agentType,
+            Provider:  provider,
+            Message:   fmt.Sprintf("First-time access to '%s' requires user confirmation", provider),
+        }
+    }
+
+    // 3. Fetch actual credential
+    value, err := b.manager.GetAPIKey(provider)
+    if err != nil {
+        b.auditLog.LogDenied(agentID, agentType, provider, toolCallID, "credential_not_found")
+        return nil, fmt.Errorf("credential not available: %w", err)
+    }
+
+    // 4. Create time-limited handle
+    handle := &CredentialHandle{
+        ID:         generateHandleID(),
+        Provider:   provider,
+        AgentID:    agentID,
+        AgentType:  agentType,
+        ToolCallID: toolCallID,
+        CreatedAt:  time.Now(),
+        ExpiresAt:  time.Now().Add(HandleLifetime),
+        Used:       false,
+        value:      value,
+    }
+
+    b.mu.Lock()
+    b.handles[handle.ID] = handle
+    b.mu.Unlock()
+
+    // 5. Log successful grant
+    b.auditLog.LogGranted(agentID, agentType, provider, toolCallID, handle.ID, reason)
+
+    return handle, nil
+}
+
+// ResolveHandle exchanges a handle for the actual credential value
+// Called by tool implementation, not by agent
+func (b *CredentialBroker) ResolveHandle(handleID string) (string, error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    handle, exists := b.handles[handleID]
+    if !exists {
+        return "", fmt.Errorf("invalid or expired credential handle")
+    }
+
+    if time.Now().After(handle.ExpiresAt) {
+        delete(b.handles, handleID)
+        return "", fmt.Errorf("credential handle expired")
+    }
+
+    if handle.Used {
+        return "", fmt.Errorf("credential handle already used")
+    }
+
+    // Mark as used (single-use)
+    handle.Used = true
+
+    // Log resolution
+    b.auditLog.LogResolved(handle.AgentID, handle.AgentType, handle.Provider, handle.ToolCallID, handleID)
+
+    return handle.value, nil
+}
+
+// RevokeHandle invalidates a handle before expiration
+func (b *CredentialBroker) RevokeHandle(handleID string) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    if handle, exists := b.handles[handleID]; exists {
+        b.auditLog.LogRevoked(handle.AgentID, handle.AgentType, handle.Provider, handle.ToolCallID, handleID)
+        delete(b.handles, handleID)
+    }
+}
+
+func (b *CredentialBroker) isAllowed(scope *CredentialScope, provider string) bool {
+    // Check explicit deny first
+    for _, denied := range scope.Denied {
+        if denied == "*" || denied == provider {
+            return false
+        }
+    }
+
+    // Check allow list
+    for _, allowed := range scope.Allowed {
+        if allowed == "*" || allowed == provider {
+            return true
+        }
+    }
+
+    return false  // Default deny
+}
+
+func (b *CredentialBroker) cleanupExpiredHandles() {
+    ticker := time.NewTicker(10 * time.Second)
+    for range ticker.C {
+        b.mu.Lock()
+        now := time.Now()
+        for id, handle := range b.handles {
+            if now.After(handle.ExpiresAt) {
+                delete(b.handles, id)
+            }
+        }
+        b.mu.Unlock()
+    }
+}
+```
+
+##### Just-in-Time Credential Injection
+
+```go
+// CredentialContext is injected into tool execution context
+type CredentialContext struct {
+    broker   *CredentialBroker
+    handleID string
+    provider string
+    resolved bool
+    value    string
+}
+
+// Credential retrieves the credential value (single use)
+func (cc *CredentialContext) Credential() (string, error) {
+    if cc.resolved {
+        return cc.value, nil
+    }
+
+    value, err := cc.broker.ResolveHandle(cc.handleID)
+    if err != nil {
+        return "", err
+    }
+
+    cc.resolved = true
+    cc.value = value
+    return value, nil
+}
+
+// PreToolCredentialHook injects credentials before tool execution
+var PreToolCredentialHook = &Hook{
+    Name:     "credential_injection",
+    Type:     PreTool,
+    Priority: HookPriorityEarly,  // After env var isolation, before execution
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        // Check if tool requires credentials
+        toolMeta := GetToolMetadata(data.ToolName)
+        if toolMeta == nil || len(toolMeta.RequiredCredentials) == 0 {
+            return data, nil  // Tool doesn't need credentials
+        }
+
+        broker := GetCredentialBroker(ctx)
+        agentID := GetAgentID(ctx)
+        agentType := GetAgentType(ctx)
+
+        // Request handles for each required credential
+        credCtxs := make(map[string]*CredentialContext)
+        for _, provider := range toolMeta.RequiredCredentials {
+            handle, err := broker.RequestCredential(
+                ctx,
+                agentID,
+                agentType,
+                provider,
+                data.ToolCallID,
+                fmt.Sprintf("Tool '%s' requires '%s' credential", data.ToolName, provider),
+            )
+            if err != nil {
+                return nil, err
+            }
+
+            credCtxs[provider] = &CredentialContext{
+                broker:   broker,
+                handleID: handle.ID,
+                provider: provider,
+            }
+        }
+
+        // Inject into context (not tool parameters!)
+        data.Context = context.WithValue(data.Context, credentialContextKey, credCtxs)
+
+        return data, nil
+    },
+}
+
+// PostToolCredentialHook cleans up after tool execution
+var PostToolCredentialHook = &Hook{
+    Name:     "credential_cleanup",
+    Type:     PostTool,
+    Priority: HookPriorityLast,
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        // Revoke any unused handles
+        credCtxs, ok := data.Context.Value(credentialContextKey).(map[string]*CredentialContext)
+        if !ok {
+            return data, nil
+        }
+
+        broker := GetCredentialBroker(ctx)
+        for _, cc := range credCtxs {
+            if !cc.resolved {
+                broker.RevokeHandle(cc.handleID)
+            }
+        }
+
+        // Clear credential values from memory
+        for _, cc := range credCtxs {
+            cc.value = ""
+        }
+
+        return data, nil
+    },
+}
+```
+
+##### Tool Implementation Pattern
+
+```go
+// ToolMetadata declares credential requirements
+type ToolMetadata struct {
+    Name                string
+    RequiredCredentials []string  // e.g., ["openai"] or ["github", "openai"]
+}
+
+// Tool registry with credential requirements
+var ToolRegistry = map[string]*ToolMetadata{
+    "generate_embeddings": {
+        Name:                "generate_embeddings",
+        RequiredCredentials: []string{"openai"},
+    },
+    "create_pr": {
+        Name:                "create_pr",
+        RequiredCredentials: []string{"github"},
+    },
+    "web_search": {
+        Name:                "web_search",
+        RequiredCredentials: []string{"serpapi"},
+    },
+    // Tools that don't need credentials
+    "read_file": {
+        Name:                "read_file",
+        RequiredCredentials: []string{},
+    },
+}
+
+// CORRECT: Tool implementation fetches from context
+func (t *GenerateEmbeddingsTool) Execute(ctx context.Context, params EmbeddingsParams) (*EmbeddingsResult, error) {
+    // Get credential from injected context - NEVER from params
+    credCtxs := ctx.Value(credentialContextKey).(map[string]*CredentialContext)
+    openaiCred := credCtxs["openai"]
+
+    apiKey, err := openaiCred.Credential()
+    if err != nil {
+        return nil, fmt.Errorf("failed to get OpenAI credential: %w", err)
+    }
+
+    // Use the credential
+    client := openai.NewClient(apiKey)
+    resp, err := client.CreateEmbedding(ctx, openai.EmbeddingRequest{
+        Model: params.Model,
+        Input: params.Text,
+    })
+
+    // Credential is automatically cleaned up by PostToolCredentialHook
+    return &EmbeddingsResult{Embedding: resp.Data[0].Embedding}, nil
+}
+
+// WRONG: Never accept credentials as parameters
+func (t *BadTool) Execute(ctx context.Context, params struct {
+    APIKey string `json:"api_key"`  // ❌ NEVER DO THIS
+    Text   string `json:"text"`
+}) (*Result, error) {
+    // This pattern is blocked by PreToolEnvVarHook
+}
+```
+
+##### Credential Audit Log
+
+```go
+// CredentialAuditLog provides tamper-evident logging of credential access
+type CredentialAuditLog struct {
+    mu       sync.Mutex
+    entries  []*CredentialAuditEntry
+    hashChain string  // Running hash for tamper detection
+    storage  AuditStorage
+}
+
+type CredentialAuditEntry struct {
+    ID          string                 `json:"id"`
+    Timestamp   time.Time              `json:"timestamp"`
+    Action      CredentialAuditAction  `json:"action"`
+    AgentID     string                 `json:"agent_id"`
+    AgentType   string                 `json:"agent_type"`
+    Provider    string                 `json:"provider"`
+    ToolCallID  string                 `json:"tool_call_id,omitempty"`
+    HandleID    string                 `json:"handle_id,omitempty"`
+    Reason      string                 `json:"reason,omitempty"`
+    PrevHash    string                 `json:"prev_hash"`
+    EntryHash   string                 `json:"entry_hash"`
+}
+
+type CredentialAuditAction string
+
+const (
+    AuditActionGranted  CredentialAuditAction = "granted"   // Handle created
+    AuditActionDenied   CredentialAuditAction = "denied"    // Access rejected
+    AuditActionResolved CredentialAuditAction = "resolved"  // Handle exchanged for value
+    AuditActionRevoked  CredentialAuditAction = "revoked"   // Handle invalidated
+    AuditActionPending  CredentialAuditAction = "pending"   // Awaiting user auth
+    AuditActionExpired  CredentialAuditAction = "expired"   // Handle timed out
+)
+
+func (l *CredentialAuditLog) log(action CredentialAuditAction, agentID, agentType, provider, toolCallID, handleID, reason string) {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+
+    entry := &CredentialAuditEntry{
+        ID:         generateAuditID(),
+        Timestamp:  time.Now().UTC(),
+        Action:     action,
+        AgentID:    agentID,
+        AgentType:  agentType,
+        Provider:   provider,
+        ToolCallID: toolCallID,
+        HandleID:   handleID,
+        Reason:     reason,
+        PrevHash:   l.hashChain,
+    }
+
+    // Compute entry hash for tamper detection
+    entry.EntryHash = l.computeHash(entry)
+    l.hashChain = entry.EntryHash
+
+    l.entries = append(l.entries, entry)
+    l.storage.Append(entry)
+}
+
+func (l *CredentialAuditLog) computeHash(entry *CredentialAuditEntry) string {
+    data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s",
+        entry.ID,
+        entry.Timestamp.Format(time.RFC3339Nano),
+        entry.Action,
+        entry.AgentID,
+        entry.AgentType,
+        entry.Provider,
+        entry.ToolCallID,
+        entry.HandleID,
+        entry.PrevHash,
+    )
+    hash := sha256.Sum256([]byte(data))
+    return hex.EncodeToString(hash[:])
+}
+
+// Verify checks the integrity of the audit log
+func (l *CredentialAuditLog) Verify() error {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+
+    prevHash := ""
+    for i, entry := range l.entries {
+        if entry.PrevHash != prevHash {
+            return fmt.Errorf("hash chain broken at entry %d", i)
+        }
+
+        expectedHash := l.computeHash(entry)
+        if entry.EntryHash != expectedHash {
+            return fmt.Errorf("entry %d has been tampered with", i)
+        }
+
+        prevHash = entry.EntryHash
+    }
+
+    return nil
+}
+
+// Query returns audit entries matching filters
+func (l *CredentialAuditLog) Query(filters AuditFilters) []*CredentialAuditEntry {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+
+    var results []*CredentialAuditEntry
+    for _, entry := range l.entries {
+        if filters.Match(entry) {
+            results = append(results, entry)
+        }
+    }
+    return results
+}
+
+type AuditFilters struct {
+    AgentType *string
+    Provider  *string
+    Action    *CredentialAuditAction
+    Since     *time.Time
+    Until     *time.Time
+}
+
+func (f *AuditFilters) Match(entry *CredentialAuditEntry) bool {
+    if f.AgentType != nil && entry.AgentType != *f.AgentType {
+        return false
+    }
+    if f.Provider != nil && entry.Provider != *f.Provider {
+        return false
+    }
+    if f.Action != nil && entry.Action != *f.Action {
+        return false
+    }
+    if f.Since != nil && entry.Timestamp.Before(*f.Since) {
+        return false
+    }
+    if f.Until != nil && entry.Timestamp.After(*f.Until) {
+        return false
+    }
+    return true
+}
+```
+
+##### User Authorization Flow
+
+```go
+// UserAuthorizationManager handles first-time credential access confirmations
+type UserAuthorizationManager struct {
+    mu            sync.RWMutex
+    authorizations map[string]bool  // "agentType:provider" -> authorized
+    storage       AuthStorage
+}
+
+// RequestAuthorization prompts user to approve first-time access
+func (m *UserAuthorizationManager) RequestAuthorization(
+    ctx context.Context,
+    agentType string,
+    provider string,
+) error {
+    key := fmt.Sprintf("%s:%s", agentType, provider)
+
+    m.mu.RLock()
+    if m.authorizations[key] {
+        m.mu.RUnlock()
+        return nil  // Already authorized
+    }
+    m.mu.RUnlock()
+
+    // Prompt user
+    guide := GetGuide(ctx)
+    approved, err := guide.PromptUserAuthorization(ctx, UserAuthRequest{
+        Message: fmt.Sprintf(
+            "Agent '%s' is requesting access to '%s' credentials for the first time.\n"+
+            "This will allow the agent to make API calls using your %s account.\n\n"+
+            "Allow this access?",
+            agentType, provider, provider,
+        ),
+        AgentType: agentType,
+        Provider:  provider,
+        Options:   []string{"Allow", "Allow for this session only", "Deny"},
+    })
+    if err != nil {
+        return err
+    }
+
+    switch approved {
+    case "Allow":
+        m.mu.Lock()
+        m.authorizations[key] = true
+        m.storage.Save(key, true)  // Persist
+        m.mu.Unlock()
+        return nil
+
+    case "Allow for this session only":
+        m.mu.Lock()
+        m.authorizations[key] = true  // Don't persist
+        m.mu.Unlock()
+        return nil
+
+    default:
+        return &CredentialAccessDeniedError{
+            AgentType: agentType,
+            Provider:  provider,
+            Reason:    "user denied access",
+        }
+    }
+}
+```
+
+##### Complete Flow Example
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETE CREDENTIAL ACCESS FLOW EXAMPLE                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  SCENARIO: Engineer agent needs to create a GitHub PR                               │
+│                                                                                     │
+│  1. AGENT MAKES TOOL CALL                                                           │
+│     ────────────────────────                                                        │
+│     Engineer: "Create a PR with these changes"                                      │
+│     Tool call: create_pr(title: "Fix bug", body: "...", branch: "fix-123")          │
+│                                                                                     │
+│     NOTE: No GitHub token in parameters!                                            │
+│                                                                                     │
+│  2. PRE-TOOL HOOK RUNS                                                              │
+│     ─────────────────────                                                           │
+│     PreToolCredentialHook:                                                          │
+│       ├── Looks up tool metadata: create_pr requires ["github"]                     │
+│       ├── Calls broker.RequestCredential("engineer", "github", toolCallID)          │
+│       │                                                                             │
+│       │   Broker:                                                                   │
+│       │     ├── Check scope: engineer allowed github? YES                           │
+│       │     ├── Check auth: first time? YES → prompt user                           │
+│       │     │                                                                       │
+│       │     │   User sees: "Engineer requesting GitHub access. Allow?"              │
+│       │     │   User clicks: "Allow"                                                │
+│       │     │                                                                       │
+│       │     ├── Fetch credential from CredentialManager                             │
+│       │     ├── Create handle (expires in 30s)                                      │
+│       │     ├── Log: GRANTED engineer→github handle=abc123                          │
+│       │     └── Return handle                                                       │
+│       │                                                                             │
+│       └── Inject CredentialContext into tool context                                │
+│                                                                                     │
+│  3. TOOL EXECUTES                                                                   │
+│     ─────────────────                                                               │
+│     create_pr tool:                                                                 │
+│       ├── credCtx := ctx.Value(credentialContextKey)["github"]                      │
+│       ├── token, _ := credCtx.Credential()  // Resolves handle                      │
+│       │                                                                             │
+│       │   Broker:                                                                   │
+│       │     ├── Validate handle exists, not expired, not used                       │
+│       │     ├── Mark handle as used                                                 │
+│       │     ├── Log: RESOLVED handle=abc123                                         │
+│       │     └── Return actual token value                                           │
+│       │                                                                             │
+│       ├── client := github.NewClient(token)                                         │
+│       ├── client.CreatePullRequest(...)                                             │
+│       └── Return result                                                             │
+│                                                                                     │
+│  4. POST-TOOL HOOK RUNS                                                             │
+│     ──────────────────────                                                          │
+│     PostToolCredentialHook:                                                         │
+│       ├── Check for unused handles → revoke                                         │
+│       └── Clear credential values from memory                                       │
+│                                                                                     │
+│  5. RESULT RETURNED TO AGENT                                                        │
+│     ──────────────────────────                                                      │
+│     Agent receives: { "pr_url": "https://github.com/...", "pr_number": 42 }         │
+│                                                                                     │
+│     NOTE: Agent never saw the GitHub token!                                         │
+│                                                                                     │
+│  AUDIT LOG ENTRIES:                                                                 │
+│  ──────────────────                                                                 │
+│  [2024-01-15T10:30:00Z] GRANTED  engineer github tool=create_pr handle=abc123       │
+│  [2024-01-15T10:30:01Z] RESOLVED engineer github tool=create_pr handle=abc123       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Integration with Secret Management
+
+The Credential Broker integrates with the Secret Management system (see Secret Management section):
+
+1. **PreToolEnvVarHook** blocks any attempt to pass credentials as parameters
+2. **PostToolSecretHook** redacts any credentials that leak into tool output
+3. **InterAgentSecretHook** redacts credentials in agent-to-agent messages
+4. **PrePromptSecretHook** rejects user prompts containing credentials
+
+```go
+// Integration verification
+func VerifySecurityIntegration() error {
+    // Ensure all credential-requiring tools are registered
+    for toolName, meta := range ToolRegistry {
+        if len(meta.RequiredCredentials) > 0 {
+            // Tool must NOT have credential-like parameters
+            if toolHasCredentialParams(toolName) {
+                return fmt.Errorf("tool %s has credential parameters but should use injection", toolName)
+            }
+        }
+    }
+
+    // Ensure all hooks are registered in correct order
+    hooks := GetRegisteredHooks()
+
+    // env_var_isolation must run before credential_injection
+    if hooks.IndexOf("env_var_isolation") > hooks.IndexOf("credential_injection") {
+        return fmt.Errorf("env_var_isolation must run before credential_injection")
+    }
+
+    // credential_cleanup must run before secret_redaction_output
+    if hooks.IndexOf("credential_cleanup") > hooks.IndexOf("secret_redaction_output") {
+        return fmt.Errorf("credential_cleanup must run before secret_redaction_output")
+    }
+
+    return nil
+}
+```
+
+---
+
+### Database Management
+
+#### Database Organization
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         DATABASE ORGANIZATION                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  data/shared/                                                                       │
+│  └── system.db                       # GLOBAL across all projects                   │
+│      ├── sessions                    # Session registry                             │
+│      ├── subscription_usage          # Global rate limit tracking                   │
+│      └── circuit_breakers            # Global circuit breaker state                 │
+│                                                                                     │
+│  data/projects/{project_hash}/                                                      │
+│  ├── knowledge.db                    # PER-PROJECT knowledge base                   │
+│  │   ├── query_cache                 # Cached query responses                       │
+│  │   ├── failure_patterns            # Error patterns + resolutions                 │
+│  │   ├── learned_patterns            # LLM-learned patterns                         │
+│  │   └── embeddings                  # Query embeddings for similarity              │
+│  │                                                                                  │
+│  └── index.db                        # PER-PROJECT VectorGraphDB                    │
+│      ├── nodes                       # Code, history, academic nodes                │
+│      ├── edges                       # Relationships between nodes                  │
+│      └── vectors                     # Embeddings as BLOBs                          │
+│                                                                                     │
+│  data/sessions/{id}/                                                                │
+│  └── session.db                      # PER-SESSION state                            │
+│      ├── context                     # Session context/preferences                  │
+│      └── routing_cache               # Guide routing cache                          │
+│                                                                                     │
+│  In-memory (rebuilt on startup):                                                    │
+│  ├── HNSW index                      # Built from vectors table                     │
+│  ├── XOR filters                     # Built from VectorGraphDB nodes               │
+│  └── Pending bloom filters           # Recent additions before XOR rebuild          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Migration Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         EMBEDDED SCHEMA VERSIONING                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  On startup (per database):                                                         │
+│                                                                                     │
+│  1. Read PRAGMA user_version                                                        │
+│  2. Compare to expected version in code                                             │
+│  3. If current < expected:                                                          │
+│                                                                                     │
+│     For each pending migration:                                                     │
+│     ┌─────────────────────────────────────────────────────────────────────┐         │
+│     │                                                                     │         │
+│     │  Additive change?                                                   │         │
+│     │  (new table, new column, new index)                                 │         │
+│     │       │                                                             │         │
+│     │   ┌───┴───┐                                                         │         │
+│     │   │       │                                                         │         │
+│     │  YES     NO (destructive)                                           │         │
+│     │   │       │                                                         │         │
+│     │   ▼       ▼                                                         │         │
+│     │ Apply   Backup DB first                                             │         │
+│     │ directly  │                                                         │         │
+│     │   │       ▼                                                         │         │
+│     │   │     Rebuild table / apply change                                │         │
+│     │   │       │                                                         │         │
+│     │   └───────┴──────────────────────────────────────────────┐          │         │
+│     │                                                          │          │         │
+│     │                                                          ▼          │         │
+│     │                                             Update PRAGMA user_version        │
+│     │                                                                     │         │
+│     └─────────────────────────────────────────────────────────────────────┘         │
+│                                                                                     │
+│  4. Rebuild in-memory structures (HNSW, XOR filters)                                │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Migration Implementation
+
+```go
+type Migration struct {
+    Version     int
+    Description string
+    Destructive bool
+    Up          func(tx *sql.Tx) error
+}
+
+type MigrationManager struct {
+    db         *sql.DB
+    dbPath     string
+    migrations []Migration
+    backupDir  string
+}
+
+func (m *MigrationManager) Migrate(ctx context.Context) error {
+    currentVersion, _ := m.getCurrentVersion()
+
+    for _, migration := range m.migrations {
+        if migration.Version <= currentVersion {
+            continue
+        }
+
+        // Backup before destructive migrations
+        if migration.Destructive {
+            if err := m.backupDatabase(); err != nil {
+                return fmt.Errorf("backup failed before migration %d: %w",
+                    migration.Version, err)
+            }
+        }
+
+        // Apply migration in transaction
+        tx, err := m.db.BeginTx(ctx, nil)
+        if err != nil {
+            return err
+        }
+
+        if err := migration.Up(tx); err != nil {
+            tx.Rollback()
+            return fmt.Errorf("migration %d failed: %w", migration.Version, err)
+        }
+
+        // Update version
+        if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", migration.Version)); err != nil {
+            tx.Rollback()
+            return err
+        }
+
+        if err := tx.Commit(); err != nil {
+            return err
+        }
+
+        log.Info("Applied migration", "version", migration.Version,
+            "description", migration.Description)
+    }
+
+    return nil
+}
+
+// Example migrations
+var SystemDBMigrations = []Migration{
+    {
+        Version:     1,
+        Description: "Initial schema",
+        Destructive: false,
+        Up: func(tx *sql.Tx) error {
+            _, err := tx.Exec(`
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    created_at TIMESTAMP,
+                    last_active TIMESTAMP,
+                    wal_dir TEXT,
+                    recovered BOOLEAN DEFAULT FALSE
+                );
+
+                CREATE TABLE subscription_usage (
+                    provider TEXT,
+                    period_start DATE,
+                    period_end DATE,
+                    requests_used INTEGER DEFAULT 0,
+                    tokens_used INTEGER DEFAULT 0,
+                    PRIMARY KEY (provider, period_start)
+                );
+
+                CREATE TABLE circuit_breakers (
+                    resource_id TEXT PRIMARY KEY,
+                    state INTEGER,
+                    failures INTEGER,
+                    last_failure TIMESTAMP,
+                    last_state_change TIMESTAMP,
+                    cooldown_ends TIMESTAMP
+                );
+            `)
+            return err
+        },
+    },
+    {
+        Version:     2,
+        Description: "Add session activity tracking",
+        Destructive: false,
+        Up: func(tx *sql.Tx) error {
+            _, err := tx.Exec(`
+                ALTER TABLE sessions ADD COLUMN activity_score REAL DEFAULT 0;
+                ALTER TABLE sessions ADD COLUMN running_pipelines INTEGER DEFAULT 0;
+            `)
+            return err
+        },
+    },
+}
+```
+
+#### Backup Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         BACKUP STRATEGY                                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Backup triggers:                                                                   │
+│  ────────────────                                                                   │
+│  1. PERIODIC         │ Configurable interval (default: 24h)                         │
+│  2. PRE-MIGRATION    │ Before any destructive schema change                         │
+│  3. PRE-SESSION      │ Before each new session starts                               │
+│                                                                                     │
+│  Backup location:                                                                   │
+│  ────────────────                                                                   │
+│  {data}/backups/                                                                    │
+│  ├── system/                                                                        │
+│  │   ├── system_20250116_100000.db                                                  │
+│  │   ├── system_20250115_100000.db                                                  │
+│  │   └── ...                                                                        │
+│  └── projects/{hash}/                                                               │
+│      ├── knowledge_20250116_100000.db                                               │
+│      ├── index_20250116_100000.db                                                   │
+│      └── ...                                                                        │
+│                                                                                     │
+│  Retention:                                                                         │
+│  ──────────                                                                         │
+│  • Keep last N backups (configurable, default: 10)                                  │
+│  • Automatic cleanup of older backups                                               │
+│                                                                                     │
+│  Backup method:                                                                     │
+│  ──────────────                                                                     │
+│  • SQLite Online Backup API (consistent snapshot)                                   │
+│  • Non-blocking (doesn't lock DB during backup)                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+type BackupManager struct {
+    dataDir    string
+    backupDir  string
+    config     BackupConfig
+    scheduler  *time.Ticker
+}
+
+type BackupConfig struct {
+    PeriodicEnabled   bool          `yaml:"periodic_enabled"`
+    PeriodicInterval  time.Duration `yaml:"periodic_interval"`
+    PreSession        bool          `yaml:"pre_session"`
+    PreMigration      bool          `yaml:"pre_migration"`
+    RetentionCount    int           `yaml:"retention_count"`
+}
+
+func (b *BackupManager) BackupDatabase(dbPath string) (string, error) {
+    // Generate backup path
+    dbName := filepath.Base(dbPath)
+    dbName = strings.TrimSuffix(dbName, ".db")
+    timestamp := time.Now().Format("20060102_150405")
+    backupPath := filepath.Join(b.backupDir, fmt.Sprintf("%s_%s.db", dbName, timestamp))
+
+    // Use SQLite Online Backup API
+    srcDB, err := sql.Open("sqlite3", dbPath)
+    if err != nil {
+        return "", err
+    }
+    defer srcDB.Close()
+
+    dstDB, err := sql.Open("sqlite3", backupPath)
+    if err != nil {
+        return "", err
+    }
+    defer dstDB.Close()
+
+    // Perform backup using SQLite backup API
+    if err := sqliteBackup(srcDB, dstDB); err != nil {
+        os.Remove(backupPath)
+        return "", err
+    }
+
+    // Cleanup old backups
+    b.cleanupOldBackups(dbName)
+
+    return backupPath, nil
+}
+
+func (b *BackupManager) cleanupOldBackups(dbName string) {
+    pattern := filepath.Join(b.backupDir, dbName+"_*.db")
+    matches, _ := filepath.Glob(pattern)
+
+    if len(matches) <= b.config.RetentionCount {
+        return
+    }
+
+    // Sort by modification time (oldest first)
+    sort.Slice(matches, func(i, j int) bool {
+        fi, _ := os.Stat(matches[i])
+        fj, _ := os.Stat(matches[j])
+        return fi.ModTime().Before(fj.ModTime())
+    })
+
+    // Remove oldest
+    toRemove := len(matches) - b.config.RetentionCount
+    for i := 0; i < toRemove; i++ {
+        os.Remove(matches[i])
+    }
+}
+```
+
+#### Corruption Detection & Recovery
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         CORRUPTION DETECTION & RECOVERY                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Detection:                                                                         │
+│  ──────────                                                                         │
+│  1. ON STARTUP    │ Full PRAGMA integrity_check                                     │
+│  2. PERIODIC      │ Quick check every 5 minutes (configurable)                      │
+│  3. ON ERROR      │ Check after unexpected SQL errors                               │
+│                                                                                     │
+│  On corruption detected:                                                            │
+│  ───────────────────────                                                            │
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────┐        │
+│  │ 1. Log corruption details                                               │        │
+│  │ 2. Notify user: "Database corruption detected in {db}"                  │        │
+│  │ 3. Attempt auto-restore:                                                │        │
+│  │                                                                         │        │
+│  │    Backup available?                                                    │        │
+│  │         │                                                               │        │
+│  │    ┌────┴────┐                                                          │        │
+│  │   YES       NO                                                          │        │
+│  │    │         │                                                          │        │
+│  │    ▼         ▼                                                          │        │
+│  │  Restore   Rebuildable?                                                 │        │
+│  │  from      (index.db, knowledge.db)                                     │        │
+│  │  backup         │                                                       │        │
+│  │    │       ┌────┴────┐                                                  │        │
+│  │    │      YES       NO                                                  │        │
+│  │    │       │         │                                                  │        │
+│  │    │       ▼         ▼                                                  │        │
+│  │    │    Rebuild   Fatal error                                           │        │
+│  │    │    from      "Cannot recover {db}"                                 │        │
+│  │    │    source                                                          │        │
+│  │    │       │                                                            │        │
+│  │    └───────┴────────────────────────────────────────────┐               │        │
+│  │                                                         │               │        │
+│  │                                                         ▼               │        │
+│  │                                              Verify restored/rebuilt    │        │
+│  │                                              Continue operation         │        │
+│  │                                                                         │        │
+│  └─────────────────────────────────────────────────────────────────────────┘        │
+│                                                                                     │
+│  Rebuildable databases:                                                             │
+│  ──────────────────────                                                             │
+│  • index.db      → Re-index codebase (Librarian)                                    │
+│  • knowledge.db  → Rebuild from session logs + re-learn patterns                    │
+│                                                                                     │
+│  Non-rebuildable (require backup):                                                  │
+│  ────────────────────────────────                                                   │
+│  • system.db     → Session registry, subscription tracking                          │
+│  • session.db    → Session-specific state                                           │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Concurrent Access
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         CONCURRENT DATABASE ACCESS                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  SQLite Configuration:                                                              │
+│  ─────────────────────                                                              │
+│  PRAGMA journal_mode = WAL;        -- Write-ahead logging                           │
+│  PRAGMA busy_timeout = 30000;      -- 30s busy timeout (configurable)               │
+│  PRAGMA synchronous = NORMAL;      -- Balance durability/performance                │
+│  PRAGMA cache_size = -64000;       -- 64MB cache                                    │
+│  PRAGMA foreign_keys = ON;         -- Enforce referential integrity                 │
+│                                                                                     │
+│  Connection Pooling:                                                                │
+│  ──────────────────                                                                 │
+│  • Per-database connection pool                                                     │
+│  • Read connections: unlimited (WAL allows concurrent reads)                        │
+│  • Write connections: 1 per database (SQLite limitation)                            │
+│  • Configurable pool size                                                           │
+│                                                                                     │
+│  Advisory Locks (cross-process):                                                    │
+│  ───────────────────────────────                                                    │
+│  For critical operations that need exclusive access:                                │
+│  • Database migrations                                                              │
+│  • HNSW index rebuild                                                               │
+│  • XOR filter rebuild                                                               │
+│  • Backup operations                                                                │
+│                                                                                     │
+│  Lock files: {state}/locks/{db_name}.lock                                           │
+│                                                                                     │
+│  Implementation: flock (Unix) / LockFileEx (Windows)                                │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+type DatabaseManager struct {
+    pools     map[string]*ConnectionPool
+    lockDir   string
+    mu        sync.RWMutex
+}
+
+type ConnectionPool struct {
+    db        *sql.DB
+    path      string
+    lockFile  string
+    config    PoolConfig
+}
+
+type PoolConfig struct {
+    MaxOpenConns    int           `yaml:"max_open_conns"`
+    MaxIdleConns    int           `yaml:"max_idle_conns"`
+    ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
+    BusyTimeout     time.Duration `yaml:"busy_timeout"`
+}
+
+func (dm *DatabaseManager) Open(dbPath string, config PoolConfig) (*ConnectionPool, error) {
+    dm.mu.Lock()
+    defer dm.mu.Unlock()
+
+    if pool, ok := dm.pools[dbPath]; ok {
+        return pool, nil
+    }
+
+    // Open with WAL mode
+    dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&_synchronous=NORMAL",
+        dbPath, config.BusyTimeout.Milliseconds())
+
+    db, err := sql.Open("sqlite3", dsn)
+    if err != nil {
+        return nil, err
+    }
+
+    // Configure pool
+    db.SetMaxOpenConns(config.MaxOpenConns)
+    db.SetMaxIdleConns(config.MaxIdleConns)
+    db.SetConnMaxLifetime(config.ConnMaxLifetime)
+
+    // Initialize pragmas
+    if _, err := db.Exec(`
+        PRAGMA foreign_keys = ON;
+        PRAGMA cache_size = -64000;
+    `); err != nil {
+        db.Close()
+        return nil, err
+    }
+
+    pool := &ConnectionPool{
+        db:       db,
+        path:     dbPath,
+        lockFile: filepath.Join(dm.lockDir, filepath.Base(dbPath)+".lock"),
+        config:   config,
+    }
+
+    dm.pools[dbPath] = pool
+    return pool, nil
+}
+
+// AcquireExclusiveLock gets cross-process lock for critical operations
+func (p *ConnectionPool) AcquireExclusiveLock(ctx context.Context) (func(), error) {
+    f, err := os.OpenFile(p.lockFile, os.O_CREATE|os.O_RDWR, 0600)
+    if err != nil {
+        return nil, err
+    }
+
+    // Try to acquire lock with context timeout
+    done := make(chan error, 1)
+    go func() {
+        done <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+    }()
+
+    select {
+    case err := <-done:
+        if err != nil {
+            f.Close()
+            return nil, err
+        }
+    case <-ctx.Done():
+        f.Close()
+        return nil, ctx.Err()
+    }
+
+    // Return release function
+    return func() {
+        syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+        f.Close()
+    }, nil
+}
+
+// IntegrityCheck runs periodic integrity verification
+func (p *ConnectionPool) IntegrityCheck(ctx context.Context, quick bool) error {
+    var query string
+    if quick {
+        query = "PRAGMA quick_check"
+    } else {
+        query = "PRAGMA integrity_check"
+    }
+
+    rows, err := p.db.QueryContext(ctx, query)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+
+    var result string
+    for rows.Next() {
+        if err := rows.Scan(&result); err != nil {
+            return err
+        }
+        if result != "ok" {
+            return fmt.Errorf("integrity check failed: %s", result)
+        }
+    }
+
+    return nil
+}
+```
+
+### Storage Configuration
+
+```yaml
+# ~/.sylk/config.yaml - Storage configuration
+
+storage:
+  # Database settings
+  database:
+    busy_timeout: 30s
+    max_open_conns: 10
+    max_idle_conns: 5
+    conn_max_lifetime: 1h
+
+  # Backup settings
+  backup:
+    periodic:
+      enabled: true
+      interval: 24h
+    pre_session: true
+    pre_migration: true
+    retention_count: 10
+
+  # Integrity check settings
+  integrity:
+    startup_check: true          # Full check on startup
+    periodic_check: true         # Quick checks during runtime
+    periodic_interval: 5m
+
+  # Cache TTL tiers
+  cache:
+    hot_ttl: 1h                  # Never auto-evict within TTL
+    warm_ttl: 24h                # Evict under pressure
+    cold_ttl: 168h               # 7 days, evict first
+
+credentials:
+  # Profile to use (can be overridden by SYLK_PROFILE)
+  profile: default
+
+  # Fallback encryption (when keychain unavailable)
+  encryption:
+    algorithm: aes-256-gcm
+    key_derivation: argon2id
+    argon2_time: 1
+    argon2_memory: 65536         # 64MB
+    argon2_parallelism: 4
+```
+
+---
+
+## Security Model
+
+The security model provides defense-in-depth through layered isolation, permission boundaries, and comprehensive audit logging. Security is designed to be robust without impeding developer workflow.
+
+### Design Philosophy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           SECURITY DESIGN PRINCIPLES                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  1. DEFENSE IN DEPTH                                                                │
+│     ├── Multiple independent layers of protection                                   │
+│     ├── Failure of one layer doesn't compromise system                              │
+│     └── Each layer assumes others may fail                                          │
+│                                                                                     │
+│  2. LEAST PRIVILEGE                                                                 │
+│     ├── Agents receive minimum permissions needed                                   │
+│     ├── Permissions granted just-in-time                                            │
+│     └── Escalation requires explicit approval                                       │
+│                                                                                     │
+│  3. USER SOVEREIGNTY                                                                │
+│     ├── User has final authority over all permissions                               │
+│     ├── Permissions adjustable at any time                                          │
+│     └── Clear visibility into what agents can do                                    │
+│                                                                                     │
+│  4. FAIL-SECURE                                                                     │
+│     ├── Deny by default                                                             │
+│     ├── Ambiguous situations → deny + ask                                           │
+│     └── Security failures → graceful degradation                                    │
+│                                                                                     │
+│  5. TRANSPARENCY                                                                    │
+│     ├── All security-relevant actions logged                                        │
+│     ├── Tamper-evident audit trail                                                  │
+│     └── User can query and review at any time                                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Agent Permission Boundaries
+
+Agents operate within role-based permission boundaries with explicit escalation paths.
+
+#### Role Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              AGENT ROLE HIERARCHY                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ADMIN (highest)                                                                    │
+│  │  ├── Full system access                                                          │
+│  │  ├── Credential management                                                       │
+│  │  ├── Configuration changes                                                       │
+│  │  └── Security policy modification                                                │
+│  │                                                                                  │
+│  ORCHESTRATOR                                                                       │
+│  │  ├── Pipeline creation and management                                            │
+│  │  ├── Cross-agent coordination                                                    │
+│  │  ├── Resource allocation decisions                                               │
+│  │  └── Workflow-level permissions                                                  │
+│  │                                                                                  │
+│  SUPERVISOR                                                                         │
+│  │  ├── Agent spawning and termination                                              │
+│  │  ├── Task delegation                                                             │
+│  │  ├── Result validation                                                           │
+│  │  └── Error escalation                                                            │
+│  │                                                                                  │
+│  WORKER                                                                             │
+│  │  ├── File read/write within scope                                                │
+│  │  ├── Process execution (allowlisted)                                             │
+│  │  ├── Network requests (allowlisted domains)                                      │
+│  │  └── Tool invocation                                                             │
+│  │                                                                                  │
+│  OBSERVER + KNOWLEDGE                                                               │
+│  │  ├── All Observer permissions                                                    │
+│  │  ├── Knowledge base write access                                                 │
+│  │  └── Cross-session knowledge sharing                                             │
+│  │                                                                                  │
+│  OBSERVER (lowest)                                                                  │
+│     ├── Read-only file access                                                       │
+│     ├── Query execution (read-only)                                                 │
+│     └── No external side effects                                                    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Agent Role Assignments
+
+```go
+// AgentRole defines the permission level for an agent
+type AgentRole string
+
+const (
+    RoleObserver           AgentRole = "observer"
+    RoleObserverKnowledge  AgentRole = "observer_knowledge"
+    RoleWorker             AgentRole = "worker"
+    RoleSupervisor         AgentRole = "supervisor"
+    RoleOrchestrator       AgentRole = "orchestrator"
+    RoleAdmin              AgentRole = "admin"
+)
+
+// DefaultAgentRoles maps agent types to their default roles
+var DefaultAgentRoles = map[string]AgentRole{
+    "guide":       RoleSupervisor,       // Coordinates user interaction
+    "architect":   RoleSupervisor,       // Plans workflows
+    "academic":    RoleObserver,         // Research only
+    "librarian":   RoleObserverKnowledge,// Reads + indexes knowledge
+    "archivalist": RoleObserverKnowledge,// Reads + stores knowledge
+    "specialist":  RoleWorker,           // Executes tasks
+    "critic":      RoleObserver,         // Reviews only
+    "scribe":      RoleWorker,           // Writes documentation
+}
+```
+
+#### Permission Enforcement
+
+```go
+// PermissionManager enforces agent permission boundaries
+type PermissionManager struct {
+    mu sync.RWMutex
+
+    projectPath    string
+    projectID      string
+
+    // Per-project persistent allowlists
+    commandAllowlist map[string]bool      // command name → allowed (ignores args)
+    domainAllowlist  map[string]bool      // domain → allowed
+    pathAllowlist    map[string]PathPerm  // path pattern → permission level
+
+    // Safe defaults (always allowed without prompting)
+    safeCommands     map[string]bool
+    safeDomains      map[string]bool
+    safePathPatterns []string
+
+    // Audit logger
+    auditLog *AuditLogger
+}
+
+type PathPerm struct {
+    Read   bool
+    Write  bool
+    Delete bool
+}
+
+// Permission file location: .sylk/local/permissions.yaml (gitignored)
+type ProjectPermissions struct {
+    Commands []string          `yaml:"commands"`        // Allowed commands
+    Domains  []string          `yaml:"domains"`         // Allowed network domains
+    Paths    map[string]string `yaml:"paths"`           // path → "read"|"write"|"delete"
+
+    // Special file handling
+    AllowModifyEnv       bool `yaml:"allow_modify_env"`       // .env modification
+    AllowModifyGitignore bool `yaml:"allow_modify_gitignore"` // .gitignore modification
+}
+
+func DefaultSafeCommands() map[string]bool {
+    return map[string]bool{
+        // Read-only inspection
+        "ls": true, "cat": true, "head": true, "tail": true,
+        "find": true, "grep": true, "rg": true, "fd": true,
+        "wc": true, "file": true, "stat": true, "which": true,
+
+        // Version control (read operations)
+        "git status": true, "git diff": true, "git log": true,
+        "git show": true, "git branch": true,
+
+        // Language tools (analysis)
+        "go vet": true, "go fmt": true, "gofmt": true,
+        "npm list": true, "npm outdated": true,
+        "python -m py_compile": true,
+
+        // Build tools (typically safe)
+        "make": true, "go build": true, "go test": true,
+        "npm test": true, "npm run build": true,
+        "cargo build": true, "cargo test": true,
+    }
+}
+
+func DefaultSafeDomains() map[string]bool {
+    return map[string]bool{
+        // Package registries
+        "pkg.go.dev": true, "proxy.golang.org": true,
+        "npmjs.com": true, "registry.npmjs.org": true,
+        "pypi.org": true, "crates.io": true,
+
+        // Documentation
+        "golang.org": true, "go.dev": true,
+        "docs.python.org": true, "nodejs.org": true,
+        "developer.mozilla.org": true,
+
+        // Version control
+        "github.com": true, "gitlab.com": true, "bitbucket.org": true,
+    }
+}
+```
+
+#### Permission Checking Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           PERMISSION CHECK FLOW                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Agent requests action                                                              │
+│         │                                                                           │
+│         ▼                                                                           │
+│  ┌──────────────────┐                                                               │
+│  │ Check agent role │                                                               │
+│  │ has capability   │                                                               │
+│  └────────┬─────────┘                                                               │
+│           │                                                                         │
+│           ▼                                                                         │
+│     Role allows?                                                                    │
+│      │       │                                                                      │
+│     No      Yes                                                                     │
+│      │       │                                                                      │
+│      ▼       ▼                                                                      │
+│   DENY   ┌──────────────────┐                                                       │
+│          │ Check safe list  │                                                       │
+│          │ (Sylk defaults)  │                                                       │
+│          └────────┬─────────┘                                                       │
+│                   │                                                                 │
+│                   ▼                                                                 │
+│             In safe list?                                                           │
+│              │       │                                                              │
+│             No      Yes                                                             │
+│              │       │                                                              │
+│              ▼       ▼                                                              │
+│  ┌─────────────────┐ ALLOW                                                          │
+│  │ Check project   │ (log action)                                                   │
+│  │ allowlist       │                                                                │
+│  └────────┬────────┘                                                                │
+│           │                                                                         │
+│           ▼                                                                         │
+│     In allowlist?                                                                   │
+│      │       │                                                                      │
+│     No      Yes                                                                     │
+│      │       │                                                                      │
+│      ▼       ▼                                                                      │
+│  ┌────────────┐ ALLOW                                                               │
+│  │ Prompt     │ (log action)                                                        │
+│  │ user       │                                                                     │
+│  └─────┬──────┘                                                                     │
+│        │                                                                            │
+│        ▼                                                                            │
+│   User approves?                                                                    │
+│    │        │                                                                       │
+│   No       Yes                                                                      │
+│    │        │                                                                       │
+│    ▼        ▼                                                                       │
+│  DENY   ┌──────────────────┐                                                        │
+│  (log)  │ Add to project   │                                                        │
+│         │ allowlist        │                                                        │
+│         └────────┬─────────┘                                                        │
+│                  │                                                                  │
+│                  ▼                                                                  │
+│               ALLOW                                                                 │
+│               (log + persist)                                                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// CheckPermission validates if an agent can perform an action
+func (pm *PermissionManager) CheckPermission(
+    ctx context.Context,
+    agentID string,
+    agentRole AgentRole,
+    action PermissionAction,
+) (PermissionResult, error) {
+    pm.mu.RLock()
+    defer pm.mu.RUnlock()
+
+    // Step 1: Check role capability
+    if !roleHasCapability(agentRole, action.Type) {
+        pm.auditLog.LogDenied(agentID, action, "role_insufficient")
+        return PermissionResult{Allowed: false, Reason: "role does not permit this action"}, nil
+    }
+
+    // Step 2: Check safe lists (always allowed)
+    if pm.isInSafeList(action) {
+        pm.auditLog.LogAllowed(agentID, action, "safe_list")
+        return PermissionResult{Allowed: true, Source: "safe_list"}, nil
+    }
+
+    // Step 3: Check project allowlist
+    if pm.isInProjectAllowlist(action) {
+        pm.auditLog.LogAllowed(agentID, action, "project_allowlist")
+        return PermissionResult{Allowed: true, Source: "project_allowlist"}, nil
+    }
+
+    // Step 4: Requires user approval
+    return PermissionResult{
+        Allowed:          false,
+        RequiresApproval: true,
+        ApprovalPrompt:   pm.formatApprovalPrompt(action),
+    }, nil
+}
+
+// Command matching ignores arguments
+func (pm *PermissionManager) isCommandAllowed(cmd string) bool {
+    // Extract base command (ignore arguments)
+    parts := strings.Fields(cmd)
+    if len(parts) == 0 {
+        return false
+    }
+    baseCmd := parts[0]
+
+    // Check safe commands
+    if pm.safeCommands[baseCmd] {
+        return true
+    }
+
+    // Check project allowlist (base command only)
+    return pm.commandAllowlist[baseCmd]
+}
+
+// ApproveAndPersist adds an action to the project allowlist
+func (pm *PermissionManager) ApproveAndPersist(action PermissionAction) error {
+    pm.mu.Lock()
+    defer pm.mu.Unlock()
+
+    switch action.Type {
+    case ActionTypeCommand:
+        // Store base command only (not full command with args)
+        baseCmd := strings.Fields(action.Target)[0]
+        pm.commandAllowlist[baseCmd] = true
+
+    case ActionTypeNetwork:
+        // Store domain only
+        pm.domainAllowlist[action.Target] = true
+
+    case ActionTypePath:
+        pm.pathAllowlist[action.Target] = action.PathPerm
+    }
+
+    return pm.persistAllowlists()
+}
+
+func (pm *PermissionManager) persistAllowlists() error {
+    perms := ProjectPermissions{
+        Commands: mapKeys(pm.commandAllowlist),
+        Domains:  mapKeys(pm.domainAllowlist),
+        Paths:    pm.serializePathPerms(),
+    }
+
+    data, err := yaml.Marshal(perms)
+    if err != nil {
+        return err
+    }
+
+    permPath := filepath.Join(pm.projectPath, ".sylk", "local", "permissions.yaml")
+    return os.WriteFile(permPath, data, 0600)
+}
+```
+
+#### Pipeline Permission Inheritance
+
+Pipelines declare required permissions upfront, with runtime escalation for unexpected needs.
+
+```go
+// WorkflowPermissions declares permissions needed by a workflow
+type WorkflowPermissions struct {
+    // Pre-declared permissions (shown to user before execution)
+    Commands []string `json:"commands"` // Commands workflow will run
+    Domains  []string `json:"domains"`  // Network domains needed
+    Paths    []string `json:"paths"`    // Paths to modify
+
+    // Permission inheritance mode
+    InheritFromParent bool `json:"inherit_from_parent"` // Inherit calling workflow's perms
+
+    // Allow runtime escalation prompts
+    AllowRuntimeEscalation bool `json:"allow_runtime_escalation"`
+}
+
+// PipelinePermissionManager manages permissions across pipeline stages
+type PipelinePermissionManager struct {
+    baseManager *PermissionManager
+
+    // Workflow-granted permissions (valid for workflow duration)
+    workflowPerms map[string]*WorkflowPermissions // workflowID → permissions
+
+    // Runtime escalations (require user approval)
+    pendingEscalations chan EscalationRequest
+}
+
+func (ppm *PipelinePermissionManager) CheckPipelinePermission(
+    ctx context.Context,
+    workflowID string,
+    agentID string,
+    action PermissionAction,
+) (PermissionResult, error) {
+    // Check workflow pre-declared permissions first
+    if perms, ok := ppm.workflowPerms[workflowID]; ok {
+        if ppm.actionInWorkflowPerms(action, perms) {
+            return PermissionResult{Allowed: true, Source: "workflow_declaration"}, nil
+        }
+    }
+
+    // Fall back to base permission check
+    result, err := ppm.baseManager.CheckPermission(ctx, agentID, RoleWorker, action)
+    if err != nil {
+        return result, err
+    }
+
+    // If base check requires approval and workflow allows runtime escalation
+    if result.RequiresApproval {
+        if perms, ok := ppm.workflowPerms[workflowID]; ok && perms.AllowRuntimeEscalation {
+            // Queue escalation request for user
+            return ppm.queueEscalation(ctx, workflowID, action)
+        }
+    }
+
+    return result, nil
+}
+```
+
+### Secret Management
+
+Protects against secret leakage through detection, redaction, and environment isolation. Uses a layered approach: hooks for enforcement, skills for proactive agent validation.
+
+#### Design Principles
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        SECRET MANAGEMENT PRINCIPLES                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  1. CONTEXT-AWARE HANDLING                                                          │
+│     ├── User prompts: REJECT (user is pasting secrets)                              │
+│     ├── Codebase scan: REDACT (preserve structure, hide values)                     │
+│     ├── Tool output: REDACT (before returning to LLM context)                       │
+│     └── Agent-to-agent: REDACT (in transit)                                         │
+│                                                                                     │
+│  2. ENVIRONMENT ISOLATION                                                           │
+│     ├── Tools read env vars from os.Getenv() ONLY                                   │
+│     ├── Env vars NEVER accepted as LLM-provided parameters                          │
+│     └── Prevents prompt injection of fake credentials                               │
+│                                                                                     │
+│  3. GRACEFUL DEGRADATION                                                            │
+│     ├── Librarian indexing continues with redacted content                          │
+│     ├── Sensitive files tracked (existence known, content hidden)                   │
+│     └── No arbitrary failures from encountering secrets                             │
+│                                                                                     │
+│  4. DEFENSE IN DEPTH                                                                │
+│     ├── Hooks: Automatic enforcement (can't bypass)                                 │
+│     ├── Skills: Proactive agent validation (opt-in)                                 │
+│     └── Tool design: Env vars read internally, not parameters                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Secret Patterns
+
+```go
+// SecretPatterns defines regex patterns for detecting secrets
+var SecretPatterns = []*SecretPattern{
+    // API Keys (generic)
+    {
+        Name:     "api_key_generic",
+        Pattern:  regexp.MustCompile(`(?i)(api[_-]?key|apikey)['":\s]*[=:]\s*['"]?[a-zA-Z0-9_\-]{20,}`),
+        Severity: SeverityHigh,
+    },
+    // Passwords and secrets
+    {
+        Name:     "password_generic",
+        Pattern:  regexp.MustCompile(`(?i)(secret|password|passwd|pwd)['":\s]*[=:]\s*['"]?[^\s'"]{8,}`),
+        Severity: SeverityHigh,
+    },
+    // Bearer tokens
+    {
+        Name:     "bearer_token",
+        Pattern:  regexp.MustCompile(`(?i)(bearer|token)['":\s]*[=:]\s*['"]?[a-zA-Z0-9_\-\.]{20,}`),
+        Severity: SeverityHigh,
+    },
+    // Private keys
+    {
+        Name:     "private_key",
+        Pattern:  regexp.MustCompile(`(?i)-----BEGIN\s+(RSA|DSA|EC|OPENSSH|PGP)?\s*PRIVATE KEY-----`),
+        Severity: SeverityCritical,
+    },
+    // AWS credentials
+    {
+        Name:     "aws_credentials",
+        Pattern:  regexp.MustCompile(`(?i)(aws_access_key_id|aws_secret)['":\s]*[=:]\s*['"]?[A-Z0-9]{16,}`),
+        Severity: SeverityCritical,
+    },
+    // GitHub PAT
+    {
+        Name:     "github_pat",
+        Pattern:  regexp.MustCompile(`ghp_[a-zA-Z0-9]{36}`),
+        Severity: SeverityHigh,
+    },
+    // OpenAI key
+    {
+        Name:     "openai_key",
+        Pattern:  regexp.MustCompile(`sk-[a-zA-Z0-9]{48}`),
+        Severity: SeverityHigh,
+    },
+    // Anthropic key
+    {
+        Name:     "anthropic_key",
+        Pattern:  regexp.MustCompile(`sk-ant-[a-zA-Z0-9\-]{80,}`),
+        Severity: SeverityHigh,
+    },
+    // Connection strings
+    {
+        Name:     "connection_string",
+        Pattern:  regexp.MustCompile(`(?i)(mongodb|postgres|mysql|redis)(\+srv)?://[^\s]+:[^\s]+@`),
+        Severity: SeverityCritical,
+    },
+    // Generic high-entropy (base64-ish long strings in assignments)
+    {
+        Name:     "high_entropy_assignment",
+        Pattern:  regexp.MustCompile(`(?i)(key|secret|token|credential)['":\s]*[=:]\s*['"]?[A-Za-z0-9+/=]{40,}`),
+        Severity: SeverityMedium,
+    },
+}
+
+// SensitiveFilePatterns defines files to skip or handle specially
+var SensitiveFilePatterns = []glob.Glob{
+    glob.MustCompile(".env"),
+    glob.MustCompile(".env.*"),
+    glob.MustCompile("*.pem"),
+    glob.MustCompile("*.key"),
+    glob.MustCompile("*.p12"),
+    glob.MustCompile("*.pfx"),
+    glob.MustCompile("*credentials*"),
+    glob.MustCompile("*secrets*"),
+    glob.MustCompile(".aws/credentials"),
+    glob.MustCompile(".ssh/*"),
+    glob.MustCompile("**/secrets.yaml"),
+    glob.MustCompile("**/secrets.json"),
+    glob.MustCompile("**/.npmrc"),
+    glob.MustCompile("**/.pypirc"),
+}
+
+// EnvVarPattern detects env var references that shouldn't be in LLM parameters
+var EnvVarPattern = regexp.MustCompile(`\$\{?([A-Z_][A-Z0-9_]*)\}?`)
+```
+
+#### SecretSanitizer Service
+
+```go
+// SecretSanitizer provides context-aware secret handling
+type SecretSanitizer struct {
+    patterns         []*SecretPattern
+    sensitiveFiles   []glob.Glob
+    redactText       string            // Default: "[REDACTED]"
+    redactFileText   string            // Default: "(contents not indexed for security)"
+
+    // Metrics
+    mu               sync.RWMutex
+    redactionCounts  map[string]int64  // pattern name → count
+    skippedFiles     map[string]int64  // file pattern → count
+}
+
+type SecretPattern struct {
+    Name     string
+    Pattern  *regexp.Regexp
+    Severity SecretSeverity
+}
+
+type SecretSeverity int
+
+const (
+    SeverityLow SecretSeverity = iota
+    SeverityMedium
+    SeverityHigh
+    SeverityCritical
+)
+
+type SanitizeResult struct {
+    Path            string
+    Skipped         bool
+    SkipReason      string
+    RedactionCount  int
+    PatternsMatched []string
+    OriginalSize    int
+    SanitizedSize   int
+}
+
+func NewSecretSanitizer() *SecretSanitizer {
+    return &SecretSanitizer{
+        patterns:        SecretPatterns,
+        sensitiveFiles:  SensitiveFilePatterns,
+        redactText:      "[REDACTED]",
+        redactFileText:  "(contents not indexed for security)",
+        redactionCounts: make(map[string]int64),
+        skippedFiles:    make(map[string]int64),
+    }
+}
+
+// SanitizeForIndex prepares content for vector DB storage (Librarian use)
+func (s *SecretSanitizer) SanitizeForIndex(path string, content []byte) ([]byte, *SanitizeResult) {
+    result := &SanitizeResult{
+        Path:         path,
+        OriginalSize: len(content),
+    }
+
+    // Check if entire file should be skipped
+    for _, pattern := range s.sensitiveFiles {
+        if pattern.Match(path) {
+            result.Skipped = true
+            result.SkipReason = "sensitive file pattern"
+            s.recordSkip(pattern.String())
+
+            // Return stub that preserves file existence without content
+            stub := fmt.Sprintf("# %s\n%s\n\nFile type: %s",
+                filepath.Base(path),
+                s.redactFileText,
+                filepath.Ext(path))
+            result.SanitizedSize = len(stub)
+            return []byte(stub), result
+        }
+    }
+
+    // Redact secrets in-place
+    sanitized := content
+    for _, pattern := range s.patterns {
+        matches := pattern.Pattern.FindAllIndex(sanitized, -1)
+        if len(matches) > 0 {
+            result.RedactionCount += len(matches)
+            result.PatternsMatched = append(result.PatternsMatched, pattern.Name)
+            s.recordRedaction(pattern.Name, len(matches))
+            sanitized = pattern.Pattern.ReplaceAll(sanitized, []byte(s.redactText))
+        }
+    }
+
+    result.SanitizedSize = len(sanitized)
+    return sanitized, result
+}
+
+// CheckUserPrompt validates user input for secrets (REJECT mode)
+func (s *SecretSanitizer) CheckUserPrompt(prompt string) *SecretDetection {
+    detection := &SecretDetection{
+        HasSecrets: false,
+        Findings:   make([]SecretFinding, 0),
+    }
+
+    for _, pattern := range s.patterns {
+        matches := pattern.Pattern.FindAllStringIndex(prompt, -1)
+        for _, match := range matches {
+            detection.HasSecrets = true
+            detection.Findings = append(detection.Findings, SecretFinding{
+                PatternName: pattern.Name,
+                Severity:    pattern.Severity,
+                StartPos:    match[0],
+                EndPos:      match[1],
+                // Don't include the actual secret in the finding!
+                Context:     maskContext(prompt, match[0], match[1]),
+            })
+        }
+    }
+
+    return detection
+}
+
+type SecretDetection struct {
+    HasSecrets bool
+    Findings   []SecretFinding
+}
+
+type SecretFinding struct {
+    PatternName string
+    Severity    SecretSeverity
+    StartPos    int
+    EndPos      int
+    Context     string  // Masked context showing location, not value
+}
+
+// SanitizeToolOutput redacts secrets from tool output before context
+func (s *SecretSanitizer) SanitizeToolOutput(output string) (string, int) {
+    redactionCount := 0
+    sanitized := output
+
+    for _, pattern := range s.patterns {
+        matches := pattern.Pattern.FindAllStringIndex(sanitized, -1)
+        if len(matches) > 0 {
+            redactionCount += len(matches)
+            sanitized = pattern.Pattern.ReplaceAllString(sanitized, s.redactText)
+        }
+    }
+
+    return sanitized, redactionCount
+}
+
+func maskContext(text string, start, end int) string {
+    // Show surrounding context with the secret masked
+    contextStart := max(0, start-20)
+    contextEnd := min(len(text), end+20)
+
+    masked := text[contextStart:start] + "[***]" + text[end:contextEnd]
+    if contextStart > 0 {
+        masked = "..." + masked
+    }
+    if contextEnd < len(text) {
+        masked = masked + "..."
+    }
+    return masked
+}
+```
+
+#### Security Hooks
+
+```go
+// PrePromptSecretHook rejects user prompts containing secrets
+var PrePromptSecretHook = &Hook{
+    Name:     "secret_detection",
+    Type:     PrePrompt,
+    Priority: HookPriorityFirst,  // Run before any processing
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        sanitizer := GetSecretSanitizer(ctx)
+        detection := sanitizer.CheckUserPrompt(data.UserMessage)
+
+        if detection.HasSecrets {
+            // Log the detection (not the secrets!)
+            GetAuditLogger(ctx).LogSecretDetection(
+                "user_prompt",
+                len(detection.Findings),
+                detection.Findings[0].Severity,
+            )
+
+            // Return user-friendly error
+            return nil, &SecretDetectedError{
+                Message: fmt.Sprintf(
+                    "Your message appears to contain %d secret(s) (e.g., %s). "+
+                    "Please remove sensitive values before sending. "+
+                    "Use environment variables or config files instead.",
+                    len(detection.Findings),
+                    detection.Findings[0].PatternName,
+                ),
+                Findings: detection.Findings,
+            }
+        }
+
+        return data, nil
+    },
+}
+
+// PostToolSecretHook redacts secrets from tool output
+var PostToolSecretHook = &Hook{
+    Name:     "secret_redaction_output",
+    Type:     PostTool,
+    Priority: HookPriorityLast,  // Run after tool completes
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        if data.Output == "" {
+            return data, nil
+        }
+
+        sanitizer := GetSecretSanitizer(ctx)
+        sanitized, count := sanitizer.SanitizeToolOutput(data.Output)
+
+        if count > 0 {
+            GetAuditLogger(ctx).LogSecretRedaction("tool_output", data.ToolName, count)
+            data.Output = sanitized
+        }
+
+        return data, nil
+    },
+}
+
+// PreToolEnvVarHook prevents env vars from being passed as parameters
+var PreToolEnvVarHook = &Hook{
+    Name:     "env_var_isolation",
+    Type:     PreTool,
+    Priority: HookPriorityFirst,
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        // Check all string parameters for env var patterns
+        for paramName, paramValue := range data.Parameters {
+            strValue, ok := paramValue.(string)
+            if !ok {
+                continue
+            }
+
+            // Check for env var references
+            if matches := EnvVarPattern.FindStringSubmatch(strValue); len(matches) > 0 {
+                envVarName := matches[1]
+
+                // Check if this looks like an attempt to inject an env var value
+                // (i.e., the parameter contains what looks like an actual credential)
+                for _, pattern := range SecretPatterns {
+                    if pattern.Pattern.MatchString(strValue) {
+                        GetAuditLogger(ctx).LogEnvVarInjectionAttempt(
+                            data.ToolName,
+                            paramName,
+                            envVarName,
+                        )
+                        return nil, &EnvVarInjectionError{
+                            Message: fmt.Sprintf(
+                                "Parameter '%s' contains what appears to be a secret value. "+
+                                "Tools read environment variables internally - do not pass them as parameters.",
+                                paramName,
+                            ),
+                            ToolName:  data.ToolName,
+                            ParamName: paramName,
+                        }
+                    }
+                }
+            }
+        }
+
+        return data, nil
+    },
+}
+```
+
+#### Librarian Pre-Index Hook
+
+```go
+// LibrarianPreIndexHook sanitizes content before vector DB storage
+var LibrarianPreIndexHook = &Hook{
+    Name:     "secret_sanitization_index",
+    Type:     PreIndex,  // Librarian-specific hook type
+    Priority: HookPriorityFirst,
+    Handler: func(ctx context.Context, data *IndexHookData) (*IndexHookData, error) {
+        sanitizer := GetSecretSanitizer(ctx)
+
+        sanitized, result := sanitizer.SanitizeForIndex(data.FilePath, data.Content)
+
+        if result.Skipped {
+            GetAuditLogger(ctx).LogSensitiveFileSkipped(data.FilePath, result.SkipReason)
+        } else if result.RedactionCount > 0 {
+            GetAuditLogger(ctx).LogSecretRedaction(
+                "index",
+                data.FilePath,
+                result.RedactionCount,
+            )
+        }
+
+        // Store sanitization metadata for transparency
+        data.Content = sanitized
+        data.Metadata["sanitized"] = result.RedactionCount > 0 || result.Skipped
+        data.Metadata["redaction_count"] = result.RedactionCount
+        data.Metadata["skipped"] = result.Skipped
+
+        return data, nil
+    },
+}
+```
+
+#### Agent-to-Agent Sanitization
+
+```go
+// InterAgentSecretHook sanitizes messages between agents
+var InterAgentSecretHook = &Hook{
+    Name:     "secret_sanitization_transit",
+    Type:     PreDispatch,  // Before message sent to another agent
+    Priority: HookPriorityLast,
+    Handler: func(ctx context.Context, data *DispatchHookData) (*DispatchHookData, error) {
+        sanitizer := GetSecretSanitizer(ctx)
+
+        // Sanitize the message content
+        sanitized, count := sanitizer.SanitizeToolOutput(data.Message)
+
+        if count > 0 {
+            GetAuditLogger(ctx).LogSecretRedaction(
+                "agent_dispatch",
+                fmt.Sprintf("%s->%s", data.SourceAgent, data.TargetAgent),
+                count,
+            )
+            data.Message = sanitized
+        }
+
+        return data, nil
+    },
+}
+```
+
+#### Proactive Validation Skills
+
+```go
+// validate_content - Proactive secret detection skill
+skills.NewSkill("validate_content").
+    Description("Check content for secrets before processing").
+    Domain("security").
+    Keywords("validate", "check", "secrets", "safe", "security").
+    StringParam("content", "Content to validate", true).
+    Returns(schema.Object{
+        "safe":       schema.Boolean("Whether content is safe to process"),
+        "findings":   schema.Array("List of detected issues"),
+        "suggestion": schema.String("Recommended action"),
+    })
+
+// check_file_sensitivity - Check if file should be handled specially
+skills.NewSkill("check_file_sensitivity").
+    Description("Check if a file path matches sensitive file patterns").
+    Domain("security").
+    Keywords("sensitive", "file", "check", "secret").
+    StringParam("path", "File path to check", true).
+    Returns(schema.Object{
+        "sensitive":  schema.Boolean("Whether file is sensitive"),
+        "pattern":    schema.String("Matching pattern if sensitive"),
+        "handling":   schema.String("Recommended handling: skip|redact|normal"),
+    })
+
+// sanitize_for_display - Redact secrets for safe display
+skills.NewSkill("sanitize_for_display").
+    Description("Redact secrets from content for safe display to user").
+    Domain("security").
+    Keywords("sanitize", "redact", "display", "safe").
+    StringParam("content", "Content to sanitize", true).
+    Returns(schema.Object{
+        "sanitized":       schema.String("Sanitized content"),
+        "redaction_count": schema.Integer("Number of redactions made"),
+    })
+```
+
+#### Tool Design Guidelines
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     TOOL DESIGN: ENVIRONMENT VARIABLE HANDLING                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  CORRECT: Tool reads env vars internally                                            │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                     │
+│  func (t *DatabaseTool) Execute(ctx context.Context, params Params) (Result, error) │
+│  {                                                                                  │
+│      // Read from environment - never from params                                   │
+│      connStr := os.Getenv("DATABASE_URL")                                           │
+│      if connStr == "" {                                                             │
+│          return Result{}, errors.New("DATABASE_URL not set")                        │
+│      }                                                                              │
+│      // ... use connStr                                                             │
+│  }                                                                                  │
+│                                                                                     │
+│  INCORRECT: Tool accepts connection string as parameter                             │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                     │
+│  func (t *DatabaseTool) Execute(ctx context.Context, params Params) (Result, error) │
+│  {                                                                                  │
+│      // WRONG: LLM could be tricked into passing malicious value                    │
+│      connStr := params.ConnectionString  // ❌ NEVER DO THIS                        │
+│      // ...                                                                         │
+│  }                                                                                  │
+│                                                                                     │
+│  TOOL PARAMETER RULES:                                                              │
+│  ├── NEVER accept: connection strings, API keys, tokens, passwords                  │
+│  ├── NEVER accept: paths to credential files                                        │
+│  ├── ALLOWED: database names, table names, query parameters                         │
+│  ├── ALLOWED: file paths (within project scope)                                     │
+│  └── ALLOWED: configuration keys (tool looks up value internally)                   │
+│                                                                                     │
+│  ENV VAR NAMING CONVENTION:                                                         │
+│  ├── SYLK_<SERVICE>_<CREDENTIAL_TYPE>                                               │
+│  ├── Example: SYLK_OPENAI_API_KEY                                                   │
+│  ├── Example: SYLK_DATABASE_URL                                                     │
+│  └── Example: SYLK_GITHUB_TOKEN                                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Secret Detection Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        SECRET HANDLING BY CONTEXT                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  USER PROMPT                                                                        │
+│  ───────────                                                                        │
+│      │                                                                              │
+│      ▼                                                                              │
+│  PrePromptSecretHook                                                                │
+│      │                                                                              │
+│      ├── Secrets detected? ──Yes──► REJECT with helpful message                     │
+│      │                              "Remove secrets, use env vars instead"          │
+│      │                                                                              │
+│      └── No secrets ──────────────► Continue to agent                               │
+│                                                                                     │
+│  LIBRARIAN INDEXING                                                                 │
+│  ─────────────────────                                                              │
+│      │                                                                              │
+│      ▼                                                                              │
+│  LibrarianPreIndexHook                                                              │
+│      │                                                                              │
+│      ├── Sensitive file pattern? ──Yes──► Return stub (file exists, content hidden) │
+│      │                                    "# .env\n(contents not indexed...)"       │
+│      │                                                                              │
+│      └── Scan content                                                               │
+│          │                                                                          │
+│          ├── Secrets found? ──Yes──► REDACT in-place, continue indexing             │
+│          │                           "api_key = [REDACTED]"                         │
+│          │                                                                          │
+│          └── No secrets ──────────► Index normally                                  │
+│                                                                                     │
+│  TOOL OUTPUT                                                                        │
+│  ───────────                                                                        │
+│      │                                                                              │
+│      ▼                                                                              │
+│  PostToolSecretHook                                                                 │
+│      │                                                                              │
+│      └── Always scan and REDACT before returning to LLM context                     │
+│                                                                                     │
+│  AGENT-TO-AGENT                                                                     │
+│  ──────────────                                                                     │
+│      │                                                                              │
+│      ▼                                                                              │
+│  InterAgentSecretHook                                                               │
+│      │                                                                              │
+│      └── Always scan and REDACT before dispatch                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Sandboxing Strategy
+
+Sandboxing provides defense-in-depth for subprocess execution. **Sandboxing is OFF by default** and can be enabled with `/sandbox enable`.
+
+#### Sandbox Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           SANDBOX ARCHITECTURE                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  LAYER 1: OS-Level Sandbox (bubblewrap/Seatbelt)                                    │
+│  ├── Process isolation from host system                                             │
+│  ├── Filesystem namespace restrictions                                              │
+│  ├── Network namespace isolation                                                    │
+│  └── Resource limits (CPU, memory, file descriptors)                                │
+│                                                                                     │
+│  LAYER 2: Virtual Filesystem (VFS) Layer                                            │
+│  ├── Copy-on-write for all file modifications                                       │
+│  ├── Working directory boundary enforcement                                         │
+│  ├── Path escape prevention (symlink, .., absolute paths)                           │
+│  └── User-approved exceptions for specific paths                                    │
+│                                                                                     │
+│  LAYER 3: Network Proxy                                                             │
+│  ├── All subprocess network traffic routed through Sylk                             │
+│  ├── Domain allowlist enforcement                                                   │
+│  ├── Request/response logging                                                       │
+│  └── Bandwidth and connection limits                                                │
+│                                                                                     │
+│  LAYER 4: Permission System                                                         │
+│  ├── Command allowlist (ignores arguments)                                          │
+│  ├── Per-project persistent permissions                                             │
+│  └── Sylk-specified safe defaults                                                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Platform-Native Sandbox Implementation
+
+```go
+// SandboxConfig configures sandbox behavior
+type SandboxConfig struct {
+    Enabled bool `yaml:"enabled"` // Default: false
+
+    // Layer controls
+    OSIsolation     bool `yaml:"os_isolation"`      // bubblewrap/Seatbelt
+    VFSLayer        bool `yaml:"vfs_layer"`         // Copy-on-write filesystem
+    NetworkProxy    bool `yaml:"network_proxy"`     // Domain-filtered proxy
+
+    // Resource limits
+    MaxCPUPercent   int           `yaml:"max_cpu_percent"`
+    MaxMemoryMB     int           `yaml:"max_memory_mb"`
+    MaxOpenFiles    int           `yaml:"max_open_files"`
+    MaxProcesses    int           `yaml:"max_processes"`
+    NetworkTimeout  time.Duration `yaml:"network_timeout"`
+
+    // Graceful degradation
+    FallbackOnError bool `yaml:"fallback_on_error"` // If sandbox fails, run unsandboxed with warning
+}
+
+func DefaultSandboxConfig() SandboxConfig {
+    return SandboxConfig{
+        Enabled:         false, // OFF by default
+        OSIsolation:     true,
+        VFSLayer:        true,
+        NetworkProxy:    true,
+        MaxCPUPercent:   80,
+        MaxMemoryMB:     1024,
+        MaxOpenFiles:    256,
+        MaxProcesses:    32,
+        NetworkTimeout:  30 * time.Second,
+        FallbackOnError: true,
+    }
+}
+
+// Sandbox provides layered process isolation
+type Sandbox struct {
+    config      SandboxConfig
+    vfs         *VirtualFilesystem
+    proxy       *NetworkProxy
+    permissions *PermissionManager
+    auditLog    *AuditLogger
+}
+
+// Execute runs a command within the sandbox
+func (s *Sandbox) Execute(ctx context.Context, cmd *exec.Cmd) (*SandboxResult, error) {
+    if !s.config.Enabled {
+        // Sandbox disabled - run directly with permission checks only
+        return s.executeUnsandboxed(ctx, cmd)
+    }
+
+    // Build sandboxed command based on platform
+    sandboxedCmd, err := s.wrapWithOSSandbox(cmd)
+    if err != nil {
+        if s.config.FallbackOnError {
+            s.auditLog.LogWarning("sandbox_fallback", "OS sandbox unavailable, running unsandboxed")
+            return s.executeUnsandboxed(ctx, cmd)
+        }
+        return nil, fmt.Errorf("sandbox setup failed: %w", err)
+    }
+
+    // Set up VFS layer
+    if s.config.VFSLayer {
+        if err := s.vfs.PrepareForCommand(cmd); err != nil {
+            return nil, fmt.Errorf("VFS setup failed: %w", err)
+        }
+        defer s.vfs.Cleanup(cmd)
+    }
+
+    // Set up network proxy
+    if s.config.NetworkProxy {
+        s.proxy.RouteCommand(sandboxedCmd)
+    }
+
+    // Execute
+    result, err := s.runWithLimits(ctx, sandboxedCmd)
+
+    // Merge VFS changes if successful
+    if err == nil && s.config.VFSLayer {
+        if err := s.vfs.MergeChanges(cmd); err != nil {
+            return result, fmt.Errorf("VFS merge failed: %w", err)
+        }
+    }
+
+    return result, err
+}
+```
+
+#### OS-Level Sandbox (Linux - bubblewrap)
+
+```go
+// wrapWithBubblewrap creates a sandboxed command using bubblewrap
+func (s *Sandbox) wrapWithBubblewrap(cmd *exec.Cmd) (*exec.Cmd, error) {
+    if _, err := exec.LookPath("bwrap"); err != nil {
+        return nil, fmt.Errorf("bubblewrap not installed")
+    }
+
+    args := []string{
+        // New namespaces
+        "--unshare-all",
+        "--share-net", // We control network via proxy
+
+        // Bind mount working directory read-write
+        "--bind", cmd.Dir, cmd.Dir,
+
+        // Read-only system paths
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/lib64", "/lib64",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+        "--ro-bind", "/etc/ssl", "/etc/ssl",
+
+        // Proc and dev
+        "--proc", "/proc",
+        "--dev", "/dev",
+
+        // Temp directory
+        "--tmpfs", "/tmp",
+
+        // Resource limits
+        "--die-with-parent",
+    }
+
+    // Add command and its arguments
+    args = append(args, cmd.Path)
+    args = append(args, cmd.Args[1:]...)
+
+    sandboxedCmd := exec.CommandContext(cmd.Context(), "bwrap", args...)
+    sandboxedCmd.Dir = cmd.Dir
+    sandboxedCmd.Env = cmd.Env
+    sandboxedCmd.Stdin = cmd.Stdin
+    sandboxedCmd.Stdout = cmd.Stdout
+    sandboxedCmd.Stderr = cmd.Stderr
+
+    return sandboxedCmd, nil
+}
+```
+
+#### OS-Level Sandbox (macOS - Seatbelt)
+
+```go
+// wrapWithSeatbelt creates a sandboxed command using macOS sandbox-exec
+func (s *Sandbox) wrapWithSeatbelt(cmd *exec.Cmd) (*exec.Cmd, error) {
+    // Generate sandbox profile
+    profile := s.generateSeatbeltProfile(cmd)
+
+    // Write profile to temp file
+    profilePath := filepath.Join(os.TempDir(), fmt.Sprintf("sylk-sandbox-%d.sb", os.Getpid()))
+    if err := os.WriteFile(profilePath, []byte(profile), 0600); err != nil {
+        return nil, err
+    }
+
+    args := []string{"-f", profilePath, cmd.Path}
+    args = append(args, cmd.Args[1:]...)
+
+    sandboxedCmd := exec.CommandContext(cmd.Context(), "sandbox-exec", args...)
+    sandboxedCmd.Dir = cmd.Dir
+    sandboxedCmd.Env = cmd.Env
+    sandboxedCmd.Stdin = cmd.Stdin
+    sandboxedCmd.Stdout = cmd.Stdout
+    sandboxedCmd.Stderr = cmd.Stderr
+
+    return sandboxedCmd, nil
+}
+
+func (s *Sandbox) generateSeatbeltProfile(cmd *exec.Cmd) string {
+    return fmt.Sprintf(`
+(version 1)
+(deny default)
+
+; Allow basic process operations
+(allow process-exec (literal "%s"))
+(allow process-fork)
+
+; Allow reading from system locations
+(allow file-read*
+    (subpath "/usr")
+    (subpath "/bin")
+    (subpath "/Library/Frameworks")
+    (subpath "/System/Library"))
+
+; Allow read-write to working directory
+(allow file-read* (subpath "%s"))
+(allow file-write* (subpath "%s"))
+
+; Allow network (controlled by proxy)
+(allow network*)
+
+; Allow temp files
+(allow file-read* (subpath "/tmp"))
+(allow file-write* (subpath "/tmp"))
+`, cmd.Path, cmd.Dir, cmd.Dir)
+}
+```
+
+#### Virtual Filesystem Layer
+
+```go
+// VirtualFilesystem provides copy-on-write file operations
+type VirtualFilesystem struct {
+    mu sync.RWMutex
+
+    workingDir      string
+    stagingDir      string
+    approvedPaths   map[string]bool // User-approved paths outside working dir
+
+    // Track modifications
+    modifications map[string]*FileModification
+
+    auditLog *AuditLogger
+}
+
+type FileModification struct {
+    OriginalPath string
+    StagingPath  string
+    Operation    string // "create", "modify", "delete"
+    Timestamp    time.Time
+}
+
+// PrepareForCommand sets up VFS for a command execution
+func (vfs *VirtualFilesystem) PrepareForCommand(cmd *exec.Cmd) error {
+    // Create staging directory for this command
+    stagingDir, err := os.MkdirTemp(vfs.stagingDir, "cmd-")
+    if err != nil {
+        return err
+    }
+
+    // Set environment to redirect writes to staging
+    cmd.Env = append(cmd.Env, fmt.Sprintf("SYLK_VFS_STAGING=%s", stagingDir))
+
+    return nil
+}
+
+// ValidatePath checks if a path is within allowed boundaries
+func (vfs *VirtualFilesystem) ValidatePath(path string) error {
+    // Resolve to absolute path
+    absPath, err := filepath.Abs(path)
+    if err != nil {
+        return err
+    }
+
+    // Resolve symlinks to detect escapes
+    realPath, err := filepath.EvalSymlinks(absPath)
+    if err != nil && !os.IsNotExist(err) {
+        return err
+    }
+    if realPath == "" {
+        realPath = absPath
+    }
+
+    // Check if within working directory
+    if strings.HasPrefix(realPath, vfs.workingDir) {
+        return nil
+    }
+
+    // Check if in approved paths
+    vfs.mu.RLock()
+    defer vfs.mu.RUnlock()
+
+    for approvedPath := range vfs.approvedPaths {
+        if strings.HasPrefix(realPath, approvedPath) {
+            return nil
+        }
+    }
+
+    return fmt.Errorf("path %q is outside allowed boundaries", path)
+}
+
+// MergeChanges applies staged modifications to the real filesystem
+func (vfs *VirtualFilesystem) MergeChanges(cmd *exec.Cmd) error {
+    stagingDir := vfs.getStagingDir(cmd)
+    if stagingDir == "" {
+        return nil
+    }
+
+    return filepath.Walk(stagingDir, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+
+        relPath, _ := filepath.Rel(stagingDir, path)
+        targetPath := filepath.Join(vfs.workingDir, relPath)
+
+        if info.IsDir() {
+            return os.MkdirAll(targetPath, info.Mode())
+        }
+
+        // Copy file from staging to working dir
+        return vfs.copyFile(path, targetPath, info.Mode())
+    })
+}
+```
+
+#### Network Proxy
+
+```go
+// NetworkProxy filters subprocess network traffic
+type NetworkProxy struct {
+    mu sync.RWMutex
+
+    listener      net.Listener
+    allowedDomains map[string]bool
+
+    // Statistics
+    requestsAllowed int64
+    requestsBlocked int64
+
+    auditLog *AuditLogger
+}
+
+// RouteCommand sets up environment for network proxy
+func (np *NetworkProxy) RouteCommand(cmd *exec.Cmd) {
+    proxyURL := fmt.Sprintf("http://127.0.0.1:%d", np.listener.Addr().(*net.TCPAddr).Port)
+
+    cmd.Env = append(cmd.Env,
+        fmt.Sprintf("HTTP_PROXY=%s", proxyURL),
+        fmt.Sprintf("HTTPS_PROXY=%s", proxyURL),
+        fmt.Sprintf("http_proxy=%s", proxyURL),
+        fmt.Sprintf("https_proxy=%s", proxyURL),
+    )
+}
+
+// handleRequest processes a proxied request
+func (np *NetworkProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
+    host := r.Host
+    if h, _, err := net.SplitHostPort(host); err == nil {
+        host = h
+    }
+
+    // Check domain allowlist
+    np.mu.RLock()
+    allowed := np.allowedDomains[host]
+    np.mu.RUnlock()
+
+    if !allowed {
+        atomic.AddInt64(&np.requestsBlocked, 1)
+        np.auditLog.LogNetworkBlocked(host, r.URL.String())
+        http.Error(w, "Domain not in allowlist", http.StatusForbidden)
+        return
+    }
+
+    atomic.AddInt64(&np.requestsAllowed, 1)
+    np.auditLog.LogNetworkAllowed(host, r.URL.String())
+
+    // Forward request
+    np.forwardRequest(w, r)
+}
+```
+
+#### Sandbox CLI Commands
+
+```
+/sandbox status          # Show sandbox status and configuration
+/sandbox enable          # Enable all sandbox layers
+/sandbox disable         # Disable sandbox (with warning)
+/sandbox enable vfs      # Enable specific layer
+/sandbox disable network # Disable specific layer
+/sandbox allow path /etc/hosts  # Allow specific path
+/sandbox deny path /etc/hosts   # Remove path allowance
+```
+
+### Audit Logging
+
+All security-relevant actions are logged in a tamper-evident format.
+
+#### What Gets Logged
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           AUDIT LOG CATEGORIES                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  PERMISSION EVENTS                                                                  │
+│  ├── Permission granted (agent, action, source)                                     │
+│  ├── Permission denied (agent, action, reason)                                      │
+│  ├── Permission escalation requested                                                │
+│  ├── Permission escalation approved/denied                                          │
+│  └── Allowlist modification                                                         │
+│                                                                                     │
+│  FILE OPERATIONS                                                                    │
+│  ├── File read (path, agent, size)                                                  │
+│  ├── File write (path, agent, size, hash)                                           │
+│  ├── File delete (path, agent)                                                      │
+│  └── Directory operations                                                           │
+│                                                                                     │
+│  PROCESS EXECUTION                                                                  │
+│  ├── Command executed (command, agent, exit_code)                                   │
+│  ├── Command blocked (command, reason)                                              │
+│  ├── Process killed (pid, reason)                                                   │
+│  └── Sandbox events (layer, action, outcome)                                        │
+│                                                                                     │
+│  NETWORK ACTIVITY                                                                   │
+│  ├── Request allowed (domain, url, agent)                                           │
+│  ├── Request blocked (domain, url, reason)                                          │
+│  └── Connection statistics                                                          │
+│                                                                                     │
+│  LLM INTERACTIONS                                                                   │
+│  ├── API call (provider, model, tokens, cost)                                       │
+│  ├── Tool invocation (tool, args, result_summary)                                   │
+│  └── Context window events                                                          │
+│                                                                                     │
+│  SESSION EVENTS                                                                     │
+│  ├── Session start/end                                                              │
+│  ├── Agent spawn/terminate                                                          │
+│  ├── Pipeline stage transitions                                                     │
+│  └── Error occurrences                                                              │
+│                                                                                     │
+│  CONFIGURATION CHANGES                                                              │
+│  ├── Permission changes                                                             │
+│  ├── Configuration file modifications                                               │
+│  └── Credential access (not values, just access events)                             │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Log Format and Storage
+
+```go
+// AuditEntry represents a single audit log entry
+type AuditEntry struct {
+    ID        string          `json:"id"`         // UUID
+    Timestamp time.Time       `json:"timestamp"`
+    Sequence  uint64          `json:"sequence"`   // Monotonic sequence number
+
+    // Event classification
+    Category  AuditCategory   `json:"category"`   // permission, file, process, network, llm, session, config
+    EventType string          `json:"event_type"` // Specific event within category
+    Severity  AuditSeverity   `json:"severity"`   // info, warning, security, critical
+
+    // Context
+    SessionID   string `json:"session_id"`
+    ProjectID   string `json:"project_id"`
+    AgentID     string `json:"agent_id,omitempty"`
+    WorkflowID  string `json:"workflow_id,omitempty"`
+
+    // Event details
+    Action    string                 `json:"action"`
+    Target    string                 `json:"target,omitempty"`
+    Outcome   string                 `json:"outcome"` // allowed, denied, error
+    Details   map[string]interface{} `json:"details,omitempty"`
+
+    // Integrity
+    PreviousHash string `json:"previous_hash"` // Hash of previous entry (chain)
+    EntryHash    string `json:"entry_hash"`    // Hash of this entry
+}
+
+type AuditCategory string
+
+const (
+    AuditCategoryPermission AuditCategory = "permission"
+    AuditCategoryFile       AuditCategory = "file"
+    AuditCategoryProcess    AuditCategory = "process"
+    AuditCategoryNetwork    AuditCategory = "network"
+    AuditCategoryLLM        AuditCategory = "llm"
+    AuditCategorySession    AuditCategory = "session"
+    AuditCategoryConfig     AuditCategory = "config"
+)
+
+type AuditSeverity string
+
+const (
+    AuditSeverityInfo     AuditSeverity = "info"
+    AuditSeverityWarning  AuditSeverity = "warning"
+    AuditSeveritySecurity AuditSeverity = "security"
+    AuditSeverityCritical AuditSeverity = "critical"
+)
+```
+
+#### Tamper-Evident Storage
+
+```go
+// AuditLogger provides tamper-evident audit logging
+type AuditLogger struct {
+    mu sync.Mutex
+
+    logFile      *os.File
+    sequence     uint64
+    previousHash string
+
+    // Signing key for periodic signatures
+    signingKey ed25519.PrivateKey
+
+    // Signature interval
+    signatureInterval int // Sign every N entries
+    entriesSinceSign  int
+
+    config AuditLogConfig
+}
+
+type AuditLogConfig struct {
+    LogPath           string        `yaml:"log_path"`           // ~/.sylk/state/logs/audit/
+    SignatureInterval int           `yaml:"signature_interval"` // Default: 100 entries
+    RotateSize        int64         `yaml:"rotate_size"`        // Rotate at N bytes
+    RetentionPolicy   string        `yaml:"retention_policy"`   // "indefinite" until explicit purge
+}
+
+func DefaultAuditLogConfig() AuditLogConfig {
+    return AuditLogConfig{
+        LogPath:           "", // Set by directory manager
+        SignatureInterval: 100,
+        RotateSize:        100 * 1024 * 1024, // 100MB per file
+        RetentionPolicy:   "indefinite",
+    }
+}
+
+// Log writes a tamper-evident audit entry
+func (al *AuditLogger) Log(entry AuditEntry) error {
+    al.mu.Lock()
+    defer al.mu.Unlock()
+
+    // Set sequence and chain hash
+    al.sequence++
+    entry.Sequence = al.sequence
+    entry.PreviousHash = al.previousHash
+    entry.ID = uuid.New().String()
+    entry.Timestamp = time.Now().UTC()
+
+    // Compute entry hash (excludes EntryHash field)
+    entry.EntryHash = al.computeEntryHash(entry)
+    al.previousHash = entry.EntryHash
+
+    // Write to append-only log
+    data, err := json.Marshal(entry)
+    if err != nil {
+        return err
+    }
+
+    if _, err := al.logFile.Write(append(data, '\n')); err != nil {
+        return err
+    }
+
+    // Periodic signature
+    al.entriesSinceSign++
+    if al.entriesSinceSign >= al.config.SignatureInterval {
+        if err := al.writeSignature(); err != nil {
+            return err
+        }
+        al.entriesSinceSign = 0
+    }
+
+    return nil
+}
+
+func (al *AuditLogger) computeEntryHash(entry AuditEntry) string {
+    // Hash everything except EntryHash
+    h := sha256.New()
+    h.Write([]byte(fmt.Sprintf("%d", entry.Sequence)))
+    h.Write([]byte(entry.PreviousHash))
+    h.Write([]byte(entry.Timestamp.Format(time.RFC3339Nano)))
+    h.Write([]byte(entry.Category))
+    h.Write([]byte(entry.EventType))
+    h.Write([]byte(entry.SessionID))
+    h.Write([]byte(entry.Action))
+    h.Write([]byte(entry.Target))
+    h.Write([]byte(entry.Outcome))
+
+    if entry.Details != nil {
+        detailsJSON, _ := json.Marshal(entry.Details)
+        h.Write(detailsJSON)
+    }
+
+    return hex.EncodeToString(h.Sum(nil))
+}
+
+// writeSignature writes a signature entry for tamper detection
+func (al *AuditLogger) writeSignature() error {
+    sigEntry := AuditSignature{
+        Timestamp:    time.Now().UTC(),
+        SequenceFrom: al.sequence - uint64(al.entriesSinceSign) + 1,
+        SequenceTo:   al.sequence,
+        ChainHash:    al.previousHash,
+    }
+
+    // Sign the chain hash
+    sigEntry.Signature = ed25519.Sign(al.signingKey, []byte(al.previousHash))
+
+    data, _ := json.Marshal(sigEntry)
+    _, err := al.logFile.Write(append([]byte("SIG:"), append(data, '\n')...))
+    return err
+}
+
+// VerifyIntegrity checks the audit log chain for tampering
+func (al *AuditLogger) VerifyIntegrity() (*IntegrityReport, error) {
+    al.mu.Lock()
+    defer al.mu.Unlock()
+
+    report := &IntegrityReport{
+        StartTime: time.Now(),
+    }
+
+    // Read and verify each entry
+    scanner := bufio.NewScanner(al.logFile)
+    var prevHash string
+    var lastSeq uint64
+
+    for scanner.Scan() {
+        line := scanner.Text()
+
+        // Check for signature line
+        if strings.HasPrefix(line, "SIG:") {
+            if err := al.verifySignature(line[4:], prevHash); err != nil {
+                report.Errors = append(report.Errors, err.Error())
+            }
+            report.SignaturesVerified++
+            continue
+        }
+
+        var entry AuditEntry
+        if err := json.Unmarshal([]byte(line), &entry); err != nil {
+            report.Errors = append(report.Errors, fmt.Sprintf("parse error at seq %d: %v", lastSeq+1, err))
+            continue
+        }
+
+        // Verify chain
+        if entry.PreviousHash != prevHash {
+            report.Errors = append(report.Errors, fmt.Sprintf("chain break at seq %d", entry.Sequence))
+        }
+
+        // Verify entry hash
+        computedHash := al.computeEntryHash(entry)
+        if entry.EntryHash != computedHash {
+            report.Errors = append(report.Errors, fmt.Sprintf("hash mismatch at seq %d", entry.Sequence))
+        }
+
+        // Verify sequence continuity
+        if entry.Sequence != lastSeq+1 {
+            report.Errors = append(report.Errors, fmt.Sprintf("sequence gap: %d to %d", lastSeq, entry.Sequence))
+        }
+
+        prevHash = entry.EntryHash
+        lastSeq = entry.Sequence
+        report.EntriesVerified++
+    }
+
+    report.EndTime = time.Now()
+    report.Valid = len(report.Errors) == 0
+
+    return report, nil
+}
+```
+
+#### Query Interface
+
+```go
+// AuditQuery provides CLI querying of audit logs
+type AuditQuery struct {
+    logger *AuditLogger
+}
+
+// QueryFilter defines audit log query parameters
+type QueryFilter struct {
+    // Time range
+    StartTime *time.Time
+    EndTime   *time.Time
+
+    // Filters
+    Categories []AuditCategory
+    Severities []AuditSeverity
+    SessionIDs []string
+    AgentIDs   []string
+    Actions    []string
+    Outcomes   []string
+
+    // Text search
+    TargetPattern string // Regex pattern for target field
+
+    // Pagination
+    Limit  int
+    Offset int
+
+    // Output format
+    Format string // "table", "json", "csv"
+}
+
+// Query searches audit logs with filters
+func (aq *AuditQuery) Query(filter QueryFilter) ([]AuditEntry, error) {
+    var results []AuditEntry
+
+    // ... implementation reads log file and applies filters ...
+
+    return results, nil
+}
+
+// CLI commands:
+// sylk audit query --category permission --severity security --since 24h
+// sylk audit query --session abc123 --format json
+// sylk audit query --action "file_write" --target "*.go"
+// sylk audit verify              # Verify integrity of audit logs
+// sylk audit export --since 7d   # Export for external analysis
+// sylk audit purge --before 90d  # Purge old entries (requires confirmation)
+```
+
+### Session Isolation
+
+Sessions are isolated for security while enabling controlled sharing.
+
+#### Session Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              SESSION ISOLATION MODEL                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  SINGLE-USER ASSUMPTION                                                             │
+│  ├── Sylk is designed for single-user, local execution                              │
+│  ├── No OS-level user isolation required                                            │
+│  └── All sessions belong to the same user                                           │
+│                                                                                     │
+│  PROJECT-SCOPED SHARING                                                             │
+│  ├── Sessions on same project share:                                                │
+│  │   ├── Project knowledge base (VectorGraphDB)                                     │
+│  │   ├── Project permissions (command/domain allowlists)                            │
+│  │   └── Project configuration                                                      │
+│  │                                                                                  │
+│  └── Sessions do NOT share:                                                         │
+│      ├── Active agent state                                                         │
+│      ├── Conversation context                                                       │
+│      └── In-flight tool executions                                                  │
+│                                                                                     │
+│  CROSS-SESSION KNOWLEDGE                                                            │
+│  ├── Each session has own session-scoped knowledge                                  │
+│  ├── Session knowledge is READ-ONLY to other sessions                               │
+│  └── Archivalist consolidates to project knowledge                                  │
+│                                                                                     │
+│  CREDENTIAL ISOLATION                                                               │
+│  ├── Sessions can override credential profile                                       │
+│  ├── Sessions can hold temporary credentials                                        │
+│  └── Temporary credentials expire with session, NOT shared                          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Session Credential Management
+
+```go
+// SessionCredentialManager handles session-scoped credentials
+type SessionCredentialManager struct {
+    mu sync.RWMutex
+
+    sessionID string
+
+    // Base credential manager
+    baseManager *CredentialManager
+
+    // Session overrides
+    profileOverride string                    // Different profile for this session
+    tempCredentials map[string]*TempCredential // Session-temporary credentials
+}
+
+type TempCredential struct {
+    Provider  string
+    APIKey    string    // In-memory only, never persisted
+    ExpiresAt time.Time
+    Source    string    // How obtained (e.g., "oauth_flow", "user_input")
+}
+
+// GetAPIKey resolves credentials with session overrides
+func (scm *SessionCredentialManager) GetAPIKey(provider string) (string, error) {
+    scm.mu.RLock()
+    defer scm.mu.RUnlock()
+
+    // 1. Check session temporary credentials first
+    if temp, ok := scm.tempCredentials[provider]; ok {
+        if time.Now().Before(temp.ExpiresAt) {
+            return temp.APIKey, nil
+        }
+        // Expired - remove it
+        delete(scm.tempCredentials, provider)
+    }
+
+    // 2. Use profile override if set
+    if scm.profileOverride != "" {
+        return scm.baseManager.GetAPIKeyForProfile(scm.profileOverride, provider)
+    }
+
+    // 3. Fall back to base manager
+    return scm.baseManager.GetAPIKey(provider)
+}
+
+// SetTemporaryCredential stores a session-scoped credential
+func (scm *SessionCredentialManager) SetTemporaryCredential(provider, apiKey string, ttl time.Duration) {
+    scm.mu.Lock()
+    defer scm.mu.Unlock()
+
+    scm.tempCredentials[provider] = &TempCredential{
+        Provider:  provider,
+        APIKey:    apiKey,
+        ExpiresAt: time.Now().Add(ttl),
+        Source:    "session_input",
+    }
+
+    // Log credential access (not the value)
+    // scm.auditLog.LogCredentialAccess(provider, "temp_set")
+}
+
+// SetProfileOverride changes the credential profile for this session only
+func (scm *SessionCredentialManager) SetProfileOverride(profile string) error {
+    scm.mu.Lock()
+    defer scm.mu.Unlock()
+
+    // Verify profile exists
+    if !scm.baseManager.ProfileExists(profile) {
+        return fmt.Errorf("profile %q does not exist", profile)
+    }
+
+    scm.profileOverride = profile
+    return nil
+}
+
+// ClearSession removes all session-scoped credentials (called on session end)
+func (scm *SessionCredentialManager) ClearSession() {
+    scm.mu.Lock()
+    defer scm.mu.Unlock()
+
+    // Clear temporary credentials from memory
+    for provider := range scm.tempCredentials {
+        scm.tempCredentials[provider].APIKey = "" // Zero out before delete
+        delete(scm.tempCredentials, provider)
+    }
+
+    scm.profileOverride = ""
+}
+```
+
+#### Cross-Session Knowledge Sharing
+
+```go
+// SessionKnowledgeManager coordinates knowledge across sessions
+type SessionKnowledgeManager struct {
+    mu sync.RWMutex
+
+    projectID string
+    sessionID string
+
+    // Project-level knowledge (shared, read-write for Archivalist)
+    projectKnowledge *VectorGraphDB
+
+    // Session-level knowledge (this session writes, others read-only)
+    sessionKnowledge *VectorGraphDB
+
+    // Read-only views of other sessions
+    otherSessionViews map[string]*VectorGraphDB
+}
+
+// StoreKnowledge stores knowledge with appropriate scoping
+func (skm *SessionKnowledgeManager) StoreKnowledge(entry KnowledgeEntry) error {
+    skm.mu.Lock()
+    defer skm.mu.Unlock()
+
+    switch entry.Scope {
+    case ScopeProject:
+        // Only Archivalist can write to project knowledge
+        return skm.projectKnowledge.Store(entry)
+
+    case ScopeSession:
+        // Current session's knowledge
+        return skm.sessionKnowledge.Store(entry)
+
+    default:
+        return fmt.Errorf("unknown knowledge scope: %s", entry.Scope)
+    }
+}
+
+// QueryKnowledge searches across accessible knowledge bases
+func (skm *SessionKnowledgeManager) QueryKnowledge(query string, opts QueryOpts) ([]KnowledgeEntry, error) {
+    skm.mu.RLock()
+    defer skm.mu.RUnlock()
+
+    var results []KnowledgeEntry
+
+    // Always search project knowledge
+    projectResults, err := skm.projectKnowledge.Query(query, opts)
+    if err != nil {
+        return nil, err
+    }
+    results = append(results, projectResults...)
+
+    // Search own session knowledge
+    sessionResults, err := skm.sessionKnowledge.Query(query, opts)
+    if err != nil {
+        return nil, err
+    }
+    results = append(results, sessionResults...)
+
+    // Optionally search other sessions (read-only)
+    if opts.IncludeOtherSessions {
+        for _, view := range skm.otherSessionViews {
+            otherResults, err := view.Query(query, opts)
+            if err != nil {
+                continue // Don't fail on other session errors
+            }
+            results = append(results, otherResults...)
+        }
+    }
+
+    return skm.deduplicateResults(results), nil
+}
+```
+
+### Security Configuration
+
+```yaml
+# ~/.sylk/config.yaml - Security configuration
+
+security:
+  # Permission system
+  permissions:
+    # Safe defaults (always allowed without prompting)
+    use_safe_defaults: true
+
+    # Path to additional safe commands/domains
+    custom_safe_list: null  # Optional: path to custom safe list
+
+    # Permission persistence
+    persist_permissions: true
+    permissions_location: ".sylk/local/permissions.yaml"
+
+  # Sandboxing (OFF by default)
+  sandbox:
+    enabled: false
+
+    # Layer controls
+    os_isolation: true       # bubblewrap/Seatbelt
+    vfs_layer: true          # Copy-on-write filesystem
+    network_proxy: true      # Domain-filtered proxy
+
+    # Resource limits
+    max_cpu_percent: 80
+    max_memory_mb: 1024
+    max_open_files: 256
+    max_processes: 32
+    network_timeout: 30s
+
+    # Graceful degradation
+    fallback_on_error: true  # If sandbox unavailable, warn and continue
+
+  # Audit logging
+  audit:
+    enabled: true
+
+    # What to log (all categories enabled by default)
+    log_permissions: true
+    log_file_ops: true
+    log_process_exec: true
+    log_network: true
+    log_llm: true
+    log_session: true
+    log_config: true
+
+    # Integrity
+    signature_interval: 100  # Sign every N entries
+
+    # Retention
+    retention_policy: indefinite  # Keep until explicit purge
+
+    # Rotation
+    rotate_size_mb: 100
+
+  # Session isolation
+  session:
+    # Knowledge sharing
+    share_project_knowledge: true
+    cross_session_readonly: true
+
+    # Credential handling
+    allow_profile_override: true
+    allow_temp_credentials: true
+    temp_credential_max_ttl: 24h
+```
+
+---
+
 ## The Architect: Request Decomposition & Workflow Planning
 
 **CRITICAL: Architect receives requests from Guide, decomposes them, gathers context through Guide, and creates actionable workflows. User clarification is a LAST RESORT.**
@@ -8750,6 +14834,48 @@ Each agent has skills that are loaded progressively based on context. Skills are
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Direct Consultation Skills (All Agents)
+
+Each agent has direct consultation skills for token-efficient inter-agent communication. These bypass Guide routing for known targets. See [Direct Consultation Protocol](#direct-consultation-protocol) for details.
+
+```go
+// Direct Consultation Skills - Added to each agent's Tier 1 (Core) skills
+// Pattern: consult_<target_agent>
+
+// Standard consultation skill template
+type ConsultationSkill struct {
+    Name        string   // consult_<agent>
+    Description string   // "Directly consult <Agent> for <domain> questions"
+    Domain      string   // "consultation"
+    Target      string   // Target agent type
+    Keywords    []string // Trigger keywords
+    Priority    int      // Usually 85 (high but below core function)
+    Parameters  []Param  // Standard: question, context, priority
+}
+
+// Standard parameters for all consultation skills
+var consultationParams = []Param{
+    {Name: "question", Type: "string", Required: true, Description: "The question to ask"},
+    {Name: "context", Type: "object", Required: false, Description: "Relevant context for the consultation"},
+    {Name: "priority", Type: "enum", Values: []string{"blocking", "async"}, Required: false, Default: "blocking"},
+    {Name: "max_tokens", Type: "int", Required: false, Default: 2000, Description: "Max response tokens"},
+}
+```
+
+**Consultation Skill Matrix by Agent:**
+
+| Agent | Has Direct Consultation Skills For |
+|-------|-----------------------------------|
+| **Guide** | All agents (architect, engineer, designer, inspector, tester, librarian, archivalist, academic) |
+| **Architect** | engineer, designer, inspector, tester, librarian, archivalist, academic |
+| **Engineer** | architect, designer, inspector, tester, librarian, archivalist, academic |
+| **Designer** | architect, engineer, inspector, tester, librarian, archivalist, academic |
+| **Inspector** | architect, engineer, designer, tester, librarian, archivalist |
+| **Tester** | architect, engineer, designer, inspector, librarian, archivalist |
+| **Librarian** | archivalist, academic |
+| **Archivalist** | librarian, academic |
+| **Academic** | librarian, archivalist |
+
 ### Guide Skills
 
 ```go
@@ -8812,6 +14938,83 @@ guide_skills_contextual := []Skill{
         Domain:      "routing",
         Keywords:    []string{"broadcast", "notify all", "announce"},
         LoadTrigger: "broadcast|notify|announce",
+    },
+}
+
+// Direct Consultation Skills (Tier 1 - Core)
+// Guide can directly consult ALL agents (it's the universal router)
+guide_skills_consultation := []Skill{
+    {
+        Name:        "consult_architect",
+        Description: "Directly consult Architect for workflow planning and task decomposition",
+        Domain:      "consultation",
+        Target:      "architect",
+        Keywords:    []string{"ask architect", "consult architect", "architect help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_engineer",
+        Description: "Directly consult Engineer for implementation questions",
+        Domain:      "consultation",
+        Target:      "engineer",
+        Keywords:    []string{"ask engineer", "consult engineer", "implementation help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_designer",
+        Description: "Directly consult Designer for UI/UX questions",
+        Domain:      "consultation",
+        Target:      "designer",
+        Keywords:    []string{"ask designer", "consult designer", "ui help", "ux help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_inspector",
+        Description: "Directly consult Inspector for code quality questions",
+        Domain:      "consultation",
+        Target:      "inspector",
+        Keywords:    []string{"ask inspector", "consult inspector", "quality help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_tester",
+        Description: "Directly consult Tester for testing questions",
+        Domain:      "consultation",
+        Target:      "tester",
+        Keywords:    []string{"ask tester", "consult tester", "testing help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for codebase questions",
+        Domain:      "consultation",
+        Target:      "librarian",
+        Keywords:    []string{"ask librarian", "consult librarian", "codebase help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_archivalist",
+        Description: "Directly consult Archivalist for historical context",
+        Domain:      "consultation",
+        Target:      "archivalist",
+        Keywords:    []string{"ask archivalist", "consult archivalist", "history help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_academic",
+        Description: "Directly consult Academic for research and best practices",
+        Domain:      "consultation",
+        Target:      "academic",
+        Keywords:    []string{"ask academic", "consult academic", "research help"},
+        Priority:    85,
+        Parameters:  consultationParams,
     },
 }
 
@@ -9086,6 +15289,29 @@ archivalist_skills_specialized := []Skill{
         Domain:      "concurrency",
         Keywords:    []string{"conflict", "resolve", "merge"},
         RequiresExplicit: true,
+    },
+}
+
+// Direct Consultation Skills (Tier 1 - Core)
+// Archivalist can directly consult knowledge agents
+archivalist_skills_consultation := []Skill{
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for current codebase state",
+        Domain:      "consultation",
+        Target:      "librarian",
+        Keywords:    []string{"ask librarian", "current code", "codebase state"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_academic",
+        Description: "Directly consult Academic for research context",
+        Domain:      "consultation",
+        Target:      "academic",
+        Keywords:    []string{"ask academic", "research context", "best practices"},
+        Priority:    85,
+        Parameters:  consultationParams,
     },
 }
 
@@ -9533,45 +15759,85 @@ architect_skills_contextual := []Skill{
     },
 }
 
-// Consultation Skills (Tier 2 - Knowledge Agent Access via Guide)
+// Direct Consultation Skills (Tier 1 - Core, bypasses Guide for token efficiency)
+// See Direct Consultation Protocol for details
 architect_skills_consultation := []Skill{
     {
-        Name:        "consult_librarian",
-        Description: "Query codebase context from Librarian via Guide",
+        Name:        "consult_engineer",
+        Description: "Directly consult Engineer for implementation feasibility",
         Domain:      "consultation",
+        Target:      "engineer",
+        Keywords:    []string{"can we implement", "feasibility", "implementation approach"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_designer",
+        Description: "Directly consult Designer for UI/UX approach",
+        Domain:      "consultation",
+        Target:      "designer",
+        Keywords:    []string{"ui approach", "ux design", "component design"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_inspector",
+        Description: "Directly consult Inspector for quality considerations",
+        Domain:      "consultation",
+        Target:      "inspector",
+        Keywords:    []string{"quality check", "code review", "validation approach"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_tester",
+        Description: "Directly consult Tester for testing strategy",
+        Domain:      "consultation",
+        Target:      "tester",
+        Keywords:    []string{"testing approach", "test coverage", "test strategy"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for codebase context (bypasses Guide)",
+        Domain:      "consultation",
+        Target:      "librarian",
         Keywords:    []string{"codebase", "pattern", "where", "how", "existing", "find"},
-        LoadTrigger: "where|how|find|existing|pattern|file|code",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "health_assessment"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Why we're asking"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "health_assessment"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "specificity", Type: "enum", Values: []string{"file_level", "function_level", "line_level"}, Required: false, Default: "file_level"},
         },
     },
     {
         Name:        "consult_archivalist",
-        Description: "Query historical context from Archivalist via Guide",
+        Description: "Directly consult Archivalist for historical context (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "archivalist",
         Keywords:    []string{"before", "last time", "previously", "history", "failed", "similar"},
-        LoadTrigger: "before|last|previous|history|failed|similar|did we",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "approach_statistics"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Current situation"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "approach_statistics"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "time_range", Type: "string", Required: false, Description: "e.g., 'last_session', 'last_week', 'all'"},
         },
     },
     {
         Name:        "consult_academic",
-        Description: "Query research and best practices from Academic via Guide",
+        Description: "Directly consult Academic for research and best practices (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "academic",
         Keywords:    []string{"best practice", "how should", "recommended", "standard", "research"},
-        LoadTrigger: "best practice|recommend|should|standard|research|how to",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "technology_comparison", "implementation_guidance"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "Topic to research"},
-            {Name: "context", Type: "string", Required: false, Description: "How this applies to current task"},
-            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true, Description: "Validate against Librarian context"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "technology_comparison", "implementation_guidance"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "Topic to research"},
+            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true},
         },
     },
 }
@@ -9943,45 +16209,85 @@ engineer_skills_core := []Skill{
     },
 }
 
-// Consultation Skills (Tier 2 - Knowledge Agent Access via Guide)
+// Direct Consultation Skills (Tier 1 - Core, bypasses Guide for token efficiency)
+// See Direct Consultation Protocol for details
 engineer_skills_consultation := []Skill{
     {
-        Name:        "consult_librarian",
-        Description: "Query codebase context from Librarian via Guide",
+        Name:        "consult_architect",
+        Description: "Directly consult Architect for task clarification or workflow questions",
         Domain:      "consultation",
+        Target:      "architect",
+        Keywords:    []string{"task unclear", "workflow question", "planning help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_designer",
+        Description: "Directly consult Designer for UI/UX implementation guidance",
+        Domain:      "consultation",
+        Target:      "designer",
+        Keywords:    []string{"ui implementation", "component styling", "design tokens"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_inspector",
+        Description: "Directly consult Inspector for code quality questions",
+        Domain:      "consultation",
+        Target:      "inspector",
+        Keywords:    []string{"quality check", "best practice", "code review"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_tester",
+        Description: "Directly consult Tester for testing approach questions",
+        Domain:      "consultation",
+        Target:      "tester",
+        Keywords:    []string{"testing approach", "test coverage", "test strategy"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for codebase context (bypasses Guide)",
+        Domain:      "consultation",
+        Target:      "librarian",
         Keywords:    []string{"codebase", "pattern", "where", "how", "existing", "find"},
-        LoadTrigger: "where|how|find|existing|pattern|file|code",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "health_assessment"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Why we're asking"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "health_assessment"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "specificity", Type: "enum", Values: []string{"file_level", "function_level", "line_level"}, Required: false, Default: "file_level"},
         },
     },
     {
         Name:        "consult_archivalist",
-        Description: "Query historical context from Archivalist via Guide",
+        Description: "Directly consult Archivalist for historical context (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "archivalist",
         Keywords:    []string{"before", "last time", "previously", "history", "failed", "similar"},
-        LoadTrigger: "before|last|previous|history|failed|similar|did we",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "approach_statistics"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Current situation"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "approach_statistics"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "time_range", Type: "string", Required: false, Description: "e.g., 'last_session', 'last_week', 'all'"},
         },
     },
     {
         Name:        "consult_academic",
-        Description: "Query research and best practices from Academic via Guide",
+        Description: "Directly consult Academic for research and best practices (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "academic",
         Keywords:    []string{"best practice", "how should", "recommended", "standard", "research"},
-        LoadTrigger: "best practice|recommend|should|standard|research|how to",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "technology_comparison", "implementation_guidance"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "Topic to research"},
-            {Name: "context", Type: "string", Required: false, Description: "How this applies to current task"},
-            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true, Description: "Validate against Librarian context"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "technology_comparison", "implementation_guidance"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "Topic to research"},
+            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true},
         },
     },
 }
@@ -10227,45 +16533,85 @@ designer_skills_contextual := []Skill{
     },
 }
 
-// Consultation Skills (Tier 2 - Knowledge Agent Access via Guide)
+// Direct Consultation Skills (Tier 1 - Core, bypasses Guide for token efficiency)
+// See Direct Consultation Protocol for details
 designer_skills_consultation := []Skill{
     {
-        Name:        "consult_librarian",
-        Description: "Query codebase context from Librarian via Guide",
+        Name:        "consult_architect",
+        Description: "Directly consult Architect for design requirements or workflow questions",
         Domain:      "consultation",
+        Target:      "architect",
+        Keywords:    []string{"design requirements", "workflow question", "planning help"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_engineer",
+        Description: "Directly consult Engineer for implementation feasibility",
+        Domain:      "consultation",
+        Target:      "engineer",
+        Keywords:    []string{"can implement", "technical feasibility", "state management"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_inspector",
+        Description: "Directly consult Inspector for UI quality questions",
+        Domain:      "consultation",
+        Target:      "inspector",
+        Keywords:    []string{"ui review", "component quality", "token validation"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_tester",
+        Description: "Directly consult Tester for visual/a11y testing questions",
+        Domain:      "consultation",
+        Target:      "tester",
+        Keywords:    []string{"visual testing", "a11y testing", "responsive testing"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for codebase/component search (bypasses Guide)",
+        Domain:      "consultation",
+        Target:      "librarian",
         Keywords:    []string{"codebase", "pattern", "where", "how", "existing", "find", "component"},
-        LoadTrigger: "where|how|find|existing|pattern|file|component",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "component_search"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Why we're asking"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "component_search"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "specificity", Type: "enum", Values: []string{"file_level", "function_level", "line_level"}, Required: false, Default: "file_level"},
         },
     },
     {
         Name:        "consult_archivalist",
-        Description: "Query historical context from Archivalist via Guide",
+        Description: "Directly consult Archivalist for design history (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "archivalist",
         Keywords:    []string{"before", "last time", "previously", "history", "failed", "similar", "design"},
-        LoadTrigger: "before|last|previous|history|failed|similar|did we",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "design_history"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Current situation"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "design_history"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "time_range", Type: "string", Required: false, Description: "e.g., 'last_session', 'last_week', 'all'"},
         },
     },
     {
         Name:        "consult_academic",
-        Description: "Query research and best practices from Academic via Guide",
+        Description: "Directly consult Academic for UX research and best practices (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "academic",
         Keywords:    []string{"best practice", "how should", "recommended", "standard", "research", "ux", "accessibility"},
-        LoadTrigger: "best practice|recommend|should|standard|research|ux|accessibility|guideline",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "ux_research", "accessibility_guidance"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "Topic to research"},
-            {Name: "context", Type: "string", Required: false, Description: "How this applies to current task"},
-            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true, Description: "Validate against Librarian context"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "ux_research", "accessibility_guidance"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "Topic to research"},
+            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true},
         },
     },
 }
@@ -10850,6 +17196,30 @@ librarian_skills_feedback := []Skill{
         Keywords:    []string{"metrics", "accuracy", "success rate"},
     },
 }
+
+// Direct Consultation Skills (Tier 1 - Core, bypasses Guide for token efficiency)
+// Librarian only consults other knowledge agents (limited scope)
+// See Direct Consultation Protocol for details
+librarian_skills_consultation := []Skill{
+    {
+        Name:        "consult_archivalist",
+        Description: "Directly consult Archivalist for historical code context",
+        Domain:      "consultation",
+        Target:      "archivalist",
+        Keywords:    []string{"history", "past changes", "previous version", "when changed"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_academic",
+        Description: "Directly consult Academic for research on code patterns",
+        Domain:      "consultation",
+        Target:      "academic",
+        Keywords:    []string{"best practice", "pattern research", "recommended approach"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+}
 ```
 
 #### Librarian Context Quality System Prompt Addition
@@ -11223,6 +17593,30 @@ academic_skills_discipline := []Skill{
         },
     },
 }
+
+// Direct Consultation Skills (Tier 1 - Core, bypasses Guide for token efficiency)
+// Academic only consults other knowledge agents (limited scope)
+// See Direct Consultation Protocol for details
+academic_skills_consultation := []Skill{
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for codebase patterns to validate research",
+        Domain:      "consultation",
+        Target:      "librarian",
+        Keywords:    []string{"codebase patterns", "existing code", "reality check"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_archivalist",
+        Description: "Directly consult Archivalist for historical research outcomes",
+        Domain:      "consultation",
+        Target:      "archivalist",
+        Keywords:    []string{"past research", "previous recommendations", "outcome history"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+}
 ```
 
 #### Research Discipline Protocol
@@ -11558,45 +17952,71 @@ inspector_skills_contextual := []Skill{
     },
 }
 
-// Consultation Skills (Tier 2 - Knowledge Agent Access via Guide)
+// Direct Consultation Skills (Tier 1 - Core, bypasses Guide for token efficiency)
+// See Direct Consultation Protocol for details
 inspector_skills_consultation := []Skill{
     {
-        Name:        "consult_librarian",
-        Description: "Query codebase context from Librarian via Guide",
+        Name:        "consult_architect",
+        Description: "Directly consult Architect for validation requirements",
         Domain:      "consultation",
+        Target:      "architect",
+        Keywords:    []string{"validation requirements", "task context", "workflow question"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_engineer",
+        Description: "Directly consult Engineer for implementation clarification",
+        Domain:      "consultation",
+        Target:      "engineer",
+        Keywords:    []string{"implementation detail", "code intent", "why this approach"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_designer",
+        Description: "Directly consult Designer for UI validation questions",
+        Domain:      "consultation",
+        Target:      "designer",
+        Keywords:    []string{"ui validation", "design intent", "token usage"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_tester",
+        Description: "Directly consult Tester for test coverage questions",
+        Domain:      "consultation",
+        Target:      "tester",
+        Keywords:    []string{"test coverage", "testing approach", "validation testing"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for codebase patterns (bypasses Guide)",
+        Domain:      "consultation",
+        Target:      "librarian",
         Keywords:    []string{"codebase", "pattern", "where", "how", "existing", "find"},
-        LoadTrigger: "where|how|find|existing|pattern|file|code",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "tool_detection"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Why we're asking"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "tool_detection"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "specificity", Type: "enum", Values: []string{"file_level", "function_level", "line_level"}, Required: false, Default: "file_level"},
         },
     },
     {
         Name:        "consult_archivalist",
-        Description: "Query historical context from Archivalist via Guide",
+        Description: "Directly consult Archivalist for validation history (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "archivalist",
         Keywords:    []string{"before", "last time", "previously", "history", "failed", "similar"},
-        LoadTrigger: "before|last|previous|history|failed|similar|did we",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "validation_history"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Current situation"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "validation_history"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "time_range", Type: "string", Required: false, Description: "e.g., 'last_session', 'last_week', 'all'"},
-        },
-    },
-    {
-        Name:        "consult_academic",
-        Description: "Query research and best practices from Academic via Guide",
-        Domain:      "consultation",
-        Keywords:    []string{"best practice", "how should", "recommended", "standard", "research"},
-        LoadTrigger: "best practice|recommend|should|standard|research|how to",
-        Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "security_guidance", "validation_standards"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "Topic to research"},
-            {Name: "context", Type: "string", Required: false, Description: "How this applies to current task"},
-            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true, Description: "Validate against Librarian context"},
         },
     },
 }
@@ -12642,45 +19062,71 @@ tester_skills_contextual := []Skill{
     },
 }
 
-// Consultation Skills (Tier 2 - Knowledge Agent Access via Guide)
+// Direct Consultation Skills (Tier 1 - Core, bypasses Guide for token efficiency)
+// See Direct Consultation Protocol for details
 tester_skills_consultation := []Skill{
     {
-        Name:        "consult_librarian",
-        Description: "Query codebase context from Librarian via Guide",
+        Name:        "consult_architect",
+        Description: "Directly consult Architect for testing requirements",
         Domain:      "consultation",
-        Keywords:    []string{"codebase", "pattern", "where", "how", "existing", "find"},
-        LoadTrigger: "where|how|find|existing|pattern|file|code|test",
+        Target:      "architect",
+        Keywords:    []string{"testing requirements", "task scope", "test plan approval"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_engineer",
+        Description: "Directly consult Engineer for implementation details",
+        Domain:      "consultation",
+        Target:      "engineer",
+        Keywords:    []string{"implementation detail", "code behavior", "edge cases"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_designer",
+        Description: "Directly consult Designer for UI testing questions",
+        Domain:      "consultation",
+        Target:      "designer",
+        Keywords:    []string{"ui testing", "visual testing", "component behavior"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_inspector",
+        Description: "Directly consult Inspector for validation coordination",
+        Domain:      "consultation",
+        Target:      "inspector",
+        Keywords:    []string{"validation results", "issue details", "code quality"},
+        Priority:    85,
+        Parameters:  consultationParams,
+    },
+    {
+        Name:        "consult_librarian",
+        Description: "Directly consult Librarian for test patterns (bypasses Guide)",
+        Domain:      "consultation",
+        Target:      "librarian",
+        Keywords:    []string{"codebase", "pattern", "where", "how", "existing", "find", "test"},
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "tool_detection"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Why we're asking"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"pattern_lookup", "file_location", "dependency_check", "tool_detection"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "specificity", Type: "enum", Values: []string{"file_level", "function_level", "line_level"}, Required: false, Default: "file_level"},
         },
     },
     {
         Name:        "consult_archivalist",
-        Description: "Query historical context from Archivalist via Guide",
+        Description: "Directly consult Archivalist for test history (bypasses Guide)",
         Domain:      "consultation",
+        Target:      "archivalist",
         Keywords:    []string{"before", "last time", "previously", "history", "failed", "similar", "flaky"},
-        LoadTrigger: "before|last|previous|history|failed|similar|flaky|did we",
+        Priority:    85,
         Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "flaky_test_history"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "What we're asking about"},
-            {Name: "context", Type: "string", Required: false, Description: "Current situation"},
+            {Name: "question", Type: "string", Required: true},
+            {Name: "intent", Type: "enum", Values: []string{"decision_lookup", "failure_check", "session_history", "flaky_test_history"}, Required: false},
+            {Name: "subject", Type: "string", Required: false, Description: "What we're asking about"},
             {Name: "time_range", Type: "string", Required: false, Description: "e.g., 'last_session', 'last_week', 'all'"},
-        },
-    },
-    {
-        Name:        "consult_academic",
-        Description: "Query research and best practices from Academic via Guide",
-        Domain:      "consultation",
-        Keywords:    []string{"best practice", "how should", "recommended", "standard", "research", "testing"},
-        LoadTrigger: "best practice|recommend|should|standard|research|testing|how to",
-        Parameters: []Param{
-            {Name: "intent", Type: "enum", Values: []string{"best_practice", "pattern_research", "testing_methodology", "coverage_standards"}, Required: true},
-            {Name: "subject", Type: "string", Required: true, Description: "Topic to research"},
-            {Name: "context", Type: "string", Required: false, Description: "How this applies to current task"},
-            {Name: "require_codebase_validation", Type: "bool", Required: false, Default: true, Description: "Validate against Librarian context"},
         },
     },
 }
@@ -19682,6 +26128,644 @@ orchestrator_skills_execution := []Skill{
 
 ---
 
+## Pipeline Variants
+
+Pipeline variants enable parallel exploration of alternative implementations. When a user requests a variant mid-execution, the system creates an isolated parallel pipeline starting from the same state as the original, allowing both to run concurrently with full isolation.
+
+### Core Concepts
+
+**Variant Group**: A collection of pipelines exploring the same task with different approaches. Contains the original pipeline plus one or more variant pipelines.
+
+**Starting Point**: The git HEAD commit when a pipeline begins execution. Captured once, used for:
+- Seeding VFS when switching to isolated mode
+- Rollback target for the working directory
+- Ensuring variants start from identical state
+
+**VFS Isolation**: When variants are created, all pipelines in the group switch to VFS mode. Each pipeline writes to its own staging directory while reading from a shared base (the starting point state).
+
+### Data Structures
+
+```go
+// VariantGroupStatus tracks the lifecycle of a variant group
+type VariantGroupStatus string
+
+const (
+    VariantGroupActive    VariantGroupStatus = "active"     // Variants still executing
+    VariantGroupPending   VariantGroupStatus = "pending"    // Awaiting user selection
+    VariantGroupSelected  VariantGroupStatus = "selected"   // User made selection
+    VariantGroupCancelled VariantGroupStatus = "cancelled"  // All variants cancelled
+)
+
+// VariantStatus tracks individual variant lifecycle
+type VariantStatus string
+
+const (
+    VariantRunning   VariantStatus = "running"    // Currently executing
+    VariantReady     VariantStatus = "ready"      // Completed, awaiting selection
+    VariantSelected  VariantStatus = "selected"   // User chose this variant
+    VariantDiscarded VariantStatus = "discarded"  // User chose different variant
+    VariantCancelled VariantStatus = "cancelled"  // Cancelled before completion
+    VariantFailed    VariantStatus = "failed"     // Execution failed
+)
+
+// VariantGroup manages a set of competing implementations
+type VariantGroup struct {
+    ID            string                  `json:"id"`
+    SessionID     string                  `json:"session_id"`
+    OriginalStep  int                     `json:"original_step"`     // DAG step that spawned variants
+    StartingPoint string                  `json:"starting_point"`    // Git HEAD when original started
+    Status        VariantGroupStatus      `json:"status"`
+    Variants      map[string]*VariantInfo `json:"variants"`          // variantID -> info
+    SelectedID    *string                 `json:"selected_id,omitempty"`
+    CreatedAt     time.Time               `json:"created_at"`
+    CompletedAt   *time.Time              `json:"completed_at,omitempty"`
+}
+
+// VariantInfo tracks a single variant within a group
+type VariantInfo struct {
+    ID          string        `json:"id"`
+    PipelineID  string        `json:"pipeline_id"`
+    Label       string        `json:"label"`         // User-friendly name ("original", "variant-1")
+    Approach    string        `json:"approach"`      // Description of this variant's approach
+    Status      VariantStatus `json:"status"`
+    StartedAt   time.Time     `json:"started_at"`
+    CompletedAt *time.Time    `json:"completed_at,omitempty"`
+    Error       string        `json:"error,omitempty"`
+}
+
+// Pipeline additions for variant support
+type Pipeline struct {
+    // ... existing fields ...
+
+    StartingPoint  string  `json:"starting_point"`            // Git HEAD when started
+    VariantGroupID *string `json:"variant_group_id,omitempty"` // Non-nil if part of variant group
+    VFS            *VirtualFilesystem                         // Non-nil when isolated
+}
+
+// CachedDiff stores computed diff with TTL
+type CachedDiff struct {
+    GroupID    string
+    VariantID  string
+    Diff       string
+    ComputedAt time.Time
+    ExpiresAt  time.Time
+}
+
+// VariantDiffCache provides lazy diff computation with caching
+type VariantDiffCache struct {
+    mu    sync.RWMutex
+    diffs map[string]*CachedDiff  // "groupID:variantID" -> diff
+    ttl   time.Duration           // Default: 30 seconds
+}
+
+// Notification represents a variant-related notification
+type Notification struct {
+    Type      string    `json:"type"`       // "variant_ready", "all_ready", "variant_failed"
+    GroupID   string    `json:"group_id"`
+    VariantID string    `json:"variant_id,omitempty"`
+    Message   string    `json:"message"`
+    Timestamp time.Time `json:"timestamp"`
+}
+
+// NotificationAggregator batches notifications to prevent spam
+type NotificationAggregator struct {
+    mu         sync.Mutex
+    pending    map[string][]Notification  // sessionID -> pending notifications
+    flushTimer *time.Timer
+    flushDelay time.Duration              // Default: 100ms
+    onFlush    func(sessionID string, notifications []Notification)
+}
+```
+
+### Variant Creation Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           VARIANT CREATION FLOW                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  USER REQUEST                                                                       │
+│  ════════════                                                                       │
+│  "Try this with a different approach: use channels instead of mutexes"              │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────┐                                                                        │
+│  │  Guide  │ ──── Intent Classification: VARIANT_REQUEST                            │
+│  └────┬────┘      Extracts: target_task, modified_prompt                            │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌───────────┐                                                                      │
+│  │ Architect │ ──── Validates variant is feasible                                   │
+│  └─────┬─────┘      Creates VARIANT_INJECT signal                                   │
+│        │                                                                            │
+│        ▼                                                                            │
+│  ┌──────────────┐                                                                   │
+│  │ Orchestrator │ ──── Receives VARIANT_INJECT                                      │
+│  └──────┬───────┘                                                                   │
+│         │                                                                           │
+│         ▼                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │                     VARIANT INJECTION SEQUENCE                               │    │
+│  ├─────────────────────────────────────────────────────────────────────────────┤    │
+│  │                                                                             │    │
+│  │  1. IDENTIFY STATE                                                          │    │
+│  │     ├── Locate original pipeline (must be running or pending)               │    │
+│  │     ├── Get StartingPoint (S0) from original                                │    │
+│  │     └── Query changed files: git diff --name-only {S0} HEAD                 │    │
+│  │                                                                             │    │
+│  │  2. CREATE VARIANT GROUP                                                    │    │
+│  │     ├── Generate group ID                                                   │    │
+│  │     ├── Register original as first variant                                  │    │
+│  │     └── Set group status = ACTIVE                                           │    │
+│  │                                                                             │    │
+│  │  3. SEED ORIGINAL VFS                                                       │    │
+│  │     ├── Create VFS with staging dir: /tmp/sylk/variants/{groupID}/original  │    │
+│  │     ├── For each changed file:                                              │    │
+│  │     │   └── vfs.Seed(path, currentDiskContent)                              │    │
+│  │     └── Original now writes to VFS, not disk                                │    │
+│  │                                                                             │    │
+│  │  4. ROLLBACK WORKING DIR                                                    │    │
+│  │     └── git checkout {S0}  // Instant, working dir now at S0                │    │
+│  │                                                                             │    │
+│  │  5. CREATE VARIANT PIPELINE                                                 │    │
+│  │     ├── Create new pipeline with modified prompt                            │    │
+│  │     ├── Set StartingPoint = S0                                              │    │
+│  │     ├── Create VFS: /tmp/sylk/variants/{groupID}/variant-1                  │    │
+│  │     ├── Register in variant group                                           │    │
+│  │     └── Start execution                                                     │    │
+│  │                                                                             │    │
+│  │  6. SIGNAL ORIGINAL                                                         │    │
+│  │     └── VARIANT_CREATED signal to original pipeline                         │    │
+│  │         (Original continues, now aware it's in a variant group)             │    │
+│  │                                                                             │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                     │
+│  PARALLEL EXECUTION                                                                 │
+│  ══════════════════                                                                 │
+│                                                                                     │
+│      Working Dir (at S0)           VFS: original              VFS: variant-1        │
+│      ┌──────────────────┐         ┌──────────────────┐       ┌──────────────────┐   │
+│      │ main.go (v0)     │ ◄─READ──│ main.go (v1)     │       │ main.go (v1')    │   │
+│      │ utils.go (v0)    │         │ utils.go (v1)    │       │ utils.go (v1')   │   │
+│      │ config.go (v0)   │         │                  │       │                  │   │
+│      └──────────────────┘         └──────────────────┘       └──────────────────┘   │
+│             │                            │                          │               │
+│             │                            │                          │               │
+│             └─────── Reads fall through to working dir ─────────────┘               │
+│                      (unchanged files read from S0)                                 │
+│                                                                                     │
+│  COMPLETION                                                                         │
+│  ══════════                                                                         │
+│                                                                                     │
+│      ┌─────────────┐                                                                │
+│      │ Variant     │ ──► VARIANT_READY signal to Guide                              │
+│      │ Completes   │     (includes: groupID, variantID, summary)                    │
+│      └─────────────┘                                                                │
+│                                                                                     │
+│      When ALL variants complete:                                                    │
+│      ┌─────────────┐                                                                │
+│      │   Guide     │ ──► Aggregated notification to user                            │
+│      │ (notifies)  │     "2 variants ready for task X"                              │
+│      └─────────────┘                                                                │
+│                                                                                     │
+│  USER SELECTION                                                                     │
+│  ══════════════                                                                     │
+│                                                                                     │
+│      User runs: /variants                                                           │
+│      ┌─────────────────────────────────────────────────────────────────────────┐    │
+│      │  Variant Group: abc123                                                  │    │
+│      │  Task: "Implement connection pooling"                                   │    │
+│      │                                                                         │    │
+│      │  [1] original - mutex-based synchronization (ready)                     │    │
+│      │  [2] variant-1 - channel-based synchronization (ready)                  │    │
+│      │                                                                         │    │
+│      │  Commands: /variants diff 1 2, /variants select 2                       │    │
+│      └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                     │
+│      User runs: /variants select 2                                                  │
+│      ┌─────────────┐                                                                │
+│      │ Orchestrator│ ──► Commit variant-1 VFS to working dir                        │
+│      │ (commits)   │     Delete variant group staging dirs                          │
+│      └─────────────┘     Continue pipeline (Inspector/Tester)                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### State Transitions
+
+#### VariantGroup State Machine
+
+```
+                    ┌──────────────────────────────────────────────────┐
+                    │                                                  │
+                    │            VariantGroup States                   │
+                    │                                                  │
+                    └──────────────────────────────────────────────────┘
+
+                              ACTIVE
+                                │
+                                │ (all variants complete OR fail)
+                                ▼
+        ┌─────────────────── PENDING ───────────────────┐
+        │                       │                       │
+        │ (user cancels all)    │ (user selects)        │ (timeout/abandon)
+        ▼                       ▼                       ▼
+    CANCELLED               SELECTED                CANCELLED
+```
+
+#### Individual Variant State Machine
+
+```
+                              RUNNING
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+            │ (error)           │ (complete)        │ (cancelled)
+            ▼                   ▼                   ▼
+          FAILED              READY             CANCELLED
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+                    │ (selected)            │ (other selected)
+                    ▼                       ▼
+                SELECTED                DISCARDED
+```
+
+### Cancellation Semantics
+
+Variants are independently cancellable. Cancelling one variant does not affect others.
+
+```go
+// CancelVariant cancels a single variant, others continue
+func (o *Orchestrator) CancelVariant(groupID, variantID string) error {
+    group := o.variantGroups[groupID]
+    variant := group.Variants[variantID]
+
+    // Signal pipeline to stop
+    pipeline := o.pipelines[variant.PipelineID]
+    pipeline.Cancel()
+
+    // Update variant status
+    variant.Status = VariantCancelled
+
+    // Check if all variants now terminal
+    allTerminal := true
+    for _, v := range group.Variants {
+        if v.Status == VariantRunning {
+            allTerminal = false
+            break
+        }
+    }
+
+    if allTerminal {
+        // Count ready variants
+        readyCount := 0
+        for _, v := range group.Variants {
+            if v.Status == VariantReady {
+                readyCount++
+            }
+        }
+
+        if readyCount > 0 {
+            group.Status = VariantGroupPending
+        } else {
+            group.Status = VariantGroupCancelled
+        }
+    }
+
+    return nil
+}
+
+// CancelVariantGroup cancels entire group
+func (o *Orchestrator) CancelVariantGroup(groupID string) error {
+    group := o.variantGroups[groupID]
+
+    for _, variant := range group.Variants {
+        if variant.Status == VariantRunning {
+            o.CancelVariant(groupID, variant.ID)
+        }
+    }
+
+    group.Status = VariantGroupCancelled
+
+    // Cleanup: restore working dir, delete staging dirs
+    o.cleanupVariantGroup(group)
+
+    return nil
+}
+```
+
+### Gotchas and Mitigations
+
+| Gotcha | Mitigation |
+|--------|------------|
+| **Dirty working dir at variant request** | Check for uncommitted changes. If dirty and not from our pipeline, warn user. Use `git stash` if needed before rollback. |
+| **VFS switch during tool execution** | Only switch at tool boundaries. Tool calls are atomic - wait for current tool to complete before switching pipeline to VFS. |
+| **Subprocesses bypass VFS** | VFS intercepts subprocess writes via LD_PRELOAD/DYLD_INSERT_LIBRARIES. Subprocesses write to VFS staging, not real disk. |
+| **Large file seeding** | Stream files to VFS staging rather than loading into memory. Seed lazily on first read if not yet written. |
+| **Concurrent git operations** | Lock git operations during variant injection. Only Orchestrator runs git commands during injection sequence. |
+| **User edits during variant execution** | Variants operate on S0 state. User edits go to working dir. Warn user that edits may conflict with variant selection. |
+| **Network/external state** | Variants share external state (databases, APIs). Document this limitation. Consider mock/replay for stateful operations. |
+| **VFS staging disk usage** | Periodic cleanup of old staging dirs. Auto-cleanup on variant group completion. Configurable staging location. |
+| **Selection timeout** | Optional timeout for pending groups. Configurable auto-select or auto-cancel policy. Default: wait indefinitely. |
+
+### Guide Signaling Protocol
+
+Guide acts as the central signal hub for variant-related messages, ensuring responsive UX at scale.
+
+```go
+// VariantSignal types routed through Guide
+const (
+    SignalVariantRequest  = "VARIANT_REQUEST"   // User requests variant
+    SignalVariantCreated  = "VARIANT_CREATED"   // Variant successfully created
+    SignalVariantReady    = "VARIANT_READY"     // Single variant completed
+    SignalAllReady        = "ALL_VARIANTS_READY" // All variants in group completed
+    SignalVariantFailed   = "VARIANT_FAILED"    // Variant execution failed
+    SignalVariantSelected = "VARIANT_SELECTED"  // User selected a variant
+)
+
+// Guide's variant signal handler
+func (g *Guide) HandleVariantSignal(signal Signal) {
+    switch signal.Type {
+    case SignalVariantReady:
+        g.aggregator.Add(signal.SessionID, Notification{
+            Type:      "variant_ready",
+            GroupID:   signal.GroupID,
+            VariantID: signal.VariantID,
+            Message:   fmt.Sprintf("Variant '%s' ready", signal.Label),
+            Timestamp: time.Now(),
+        })
+
+    case SignalAllReady:
+        // Immediate notification, bypass aggregator
+        g.notifyUser(signal.SessionID, Notification{
+            Type:    "all_ready",
+            GroupID: signal.GroupID,
+            Message: fmt.Sprintf("%d variants ready for review", signal.Count),
+        })
+
+    case SignalVariantFailed:
+        g.aggregator.Add(signal.SessionID, Notification{
+            Type:      "variant_failed",
+            GroupID:   signal.GroupID,
+            VariantID: signal.VariantID,
+            Message:   fmt.Sprintf("Variant '%s' failed: %s", signal.Label, signal.Error),
+        })
+    }
+}
+```
+
+### Notification Aggregation
+
+Prevents notification spam when multiple variants complete in rapid succession.
+
+```go
+func NewNotificationAggregator(flushDelay time.Duration, onFlush func(string, []Notification)) *NotificationAggregator {
+    return &NotificationAggregator{
+        pending:    make(map[string][]Notification),
+        flushDelay: flushDelay,  // Recommend: 100ms
+        onFlush:    onFlush,
+    }
+}
+
+func (a *NotificationAggregator) Add(sessionID string, n Notification) {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+
+    a.pending[sessionID] = append(a.pending[sessionID], n)
+
+    // Reset or start flush timer
+    if a.flushTimer != nil {
+        a.flushTimer.Stop()
+    }
+    a.flushTimer = time.AfterFunc(a.flushDelay, func() {
+        a.flush()
+    })
+}
+
+func (a *NotificationAggregator) flush() {
+    a.mu.Lock()
+    pending := a.pending
+    a.pending = make(map[string][]Notification)
+    a.mu.Unlock()
+
+    for sessionID, notifications := range pending {
+        a.onFlush(sessionID, notifications)
+    }
+}
+```
+
+### Lazy Diff Computation
+
+Diffs are computed on-demand and cached to avoid overhead for unused comparisons.
+
+```go
+func NewVariantDiffCache(ttl time.Duration) *VariantDiffCache {
+    return &VariantDiffCache{
+        diffs: make(map[string]*CachedDiff),
+        ttl:   ttl,  // Recommend: 30 seconds
+    }
+}
+
+func (c *VariantDiffCache) GetDiff(groupID, variantID string, computeFn func() string) string {
+    key := fmt.Sprintf("%s:%s", groupID, variantID)
+
+    c.mu.RLock()
+    if cached, ok := c.diffs[key]; ok && time.Now().Before(cached.ExpiresAt) {
+        c.mu.RUnlock()
+        return cached.Diff
+    }
+    c.mu.RUnlock()
+
+    // Compute diff
+    diff := computeFn()
+
+    c.mu.Lock()
+    c.diffs[key] = &CachedDiff{
+        GroupID:    groupID,
+        VariantID:  variantID,
+        Diff:       diff,
+        ComputedAt: time.Now(),
+        ExpiresAt:  time.Now().Add(c.ttl),
+    }
+    c.mu.Unlock()
+
+    return diff
+}
+
+// ComputeVariantDiff generates diff between variant VFS and starting point
+func (o *Orchestrator) ComputeVariantDiff(groupID, variantID string) string {
+    group := o.variantGroups[groupID]
+    variant := group.Variants[variantID]
+    pipeline := o.pipelines[variant.PipelineID]
+
+    return o.diffCache.GetDiff(groupID, variantID, func() string {
+        // Get files changed in this variant's VFS
+        changedFiles := pipeline.VFS.ChangedFiles()
+
+        var diff strings.Builder
+        for _, path := range changedFiles {
+            // Get original content (from git at StartingPoint)
+            original, _ := git.Show(group.StartingPoint, path)
+            // Get variant content (from VFS)
+            variant, _ := pipeline.VFS.Read(path)
+
+            // Generate unified diff
+            diff.WriteString(unifiedDiff(path, original, variant))
+        }
+        return diff.String()
+    })
+}
+```
+
+### Non-Blocking Selection UI
+
+User interacts with variants via commands, never blocking prompts.
+
+```
+CLI COMMANDS
+════════════
+
+/variants
+    List all pending variant groups for current session.
+    Shows: group ID, task description, variant count, status.
+
+/variants show <group_id>
+    Show details of specific variant group.
+    Shows: all variants with labels, approaches, status, completion time.
+
+/variants diff <group_id> [variant1] [variant2]
+    Show diff between variants or between variant and starting point.
+    If one variant: shows changes from starting point.
+    If two variants: shows diff between the two.
+
+/variants preview <group_id> <variant_id>
+    Preview full content of a variant's changes.
+    Opens in pager if large.
+
+/variants select <group_id> <variant_id>
+    Select a variant for commit. Commits VFS to working dir.
+    Other variants are discarded. Pipeline continues to Inspector/Tester.
+
+/variants cancel <group_id> [variant_id]
+    Cancel a specific variant or entire group.
+    If variant: cancels that variant, others continue.
+    If group: cancels all variants, cleans up.
+```
+
+### Status Line Integration
+
+Variant status appears in the session status line for ambient awareness.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  sylk > session abc123                                                      │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  Pipeline: running | Tasks: 3/5 | Variants: 2 pending (task-4)             │
+│                                           ▲                                 │
+│                                           │                                 │
+│                           Subtle indicator of pending variants              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+When variants complete:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  sylk > session abc123                                                      │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  Pipeline: waiting | Tasks: 3/5 | Variants: 2 ready ◄── /variants          │
+│                                                  ▲                          │
+│                                                  │                          │
+│                              Attention indicator + command hint             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### VFS Commit Protocol
+
+When user selects a variant, its VFS contents are committed to the working directory.
+
+```go
+func (o *Orchestrator) CommitVariant(groupID, variantID string) error {
+    group := o.variantGroups[groupID]
+    variant := group.Variants[variantID]
+    pipeline := o.pipelines[variant.PipelineID]
+
+    // 1. Get all files changed in this VFS
+    changedFiles := pipeline.VFS.ChangedFiles()
+
+    // 2. Write each to working directory
+    for _, path := range changedFiles {
+        content, err := pipeline.VFS.Read(path)
+        if err != nil {
+            return fmt.Errorf("read vfs file %s: %w", path, err)
+        }
+
+        fullPath := filepath.Join(o.workDir, path)
+        if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+            return fmt.Errorf("create dir for %s: %w", path, err)
+        }
+
+        if err := os.WriteFile(fullPath, content, 0644); err != nil {
+            return fmt.Errorf("write file %s: %w", path, err)
+        }
+    }
+
+    // 3. Update variant statuses
+    variant.Status = VariantSelected
+    for _, v := range group.Variants {
+        if v.ID != variantID && v.Status == VariantReady {
+            v.Status = VariantDiscarded
+        }
+    }
+    group.SelectedID = &variantID
+    group.Status = VariantGroupSelected
+    now := time.Now()
+    group.CompletedAt = &now
+
+    // 4. Cleanup staging directories
+    o.cleanupVariantGroup(group)
+
+    // 5. Continue pipeline (Inspector/Tester will run on committed changes)
+    o.resumePipeline(pipeline.ID)
+
+    return nil
+}
+
+func (o *Orchestrator) cleanupVariantGroup(group *VariantGroup) {
+    stagingBase := filepath.Join(os.TempDir(), "sylk", "variants", group.ID)
+    os.RemoveAll(stagingBase)
+}
+```
+
+### Layer Wait Semantics
+
+When a variant is injected, the topological layer containing the original task must wait for ALL variants to complete before the pipeline can proceed.
+
+```go
+func (o *Orchestrator) checkLayerCompletion(layer int) bool {
+    for _, taskID := range o.dag.Layer(layer) {
+        pipeline := o.pipelines[taskID]
+
+        // If part of variant group, check group status
+        if pipeline.VariantGroupID != nil {
+            group := o.variantGroups[*pipeline.VariantGroupID]
+            if group.Status != VariantGroupSelected {
+                return false  // Still waiting for selection
+            }
+        } else {
+            // Normal task, check individual completion
+            if pipeline.Status != PipelineComplete {
+                return false
+            }
+        }
+    }
+    return true
+}
+```
+
+---
+
 ## Agent Memory Management
 
 Each agent has specific memory management strategies based on their role, model, and context window characteristics. All checkpoints and compaction summaries are submitted to the Archivalist for persistence.
@@ -20958,6 +28042,255 @@ The new pipeline's agents start with full context:
 This minimizes re-learning and re-discovery.
 
 **Archivalist Category**: `pipeline_handoff`
+
+---
+
+### Designer Memory Management: Pipeline Handoff
+
+**CRITICAL**: The Designer does NOT compact locally. At 95% context, it triggers a **PIPELINE HANDOFF**.
+
+**Model**: Gemini 3 Pro
+
+**Threshold**: 95% → **PIPELINE HANDOFF**
+
+This mirrors the Engineer pipeline handoff mechanism. The entire Designer pipeline (Designer + UIInspector + UITester) transfers state to a new pipeline, minimizing re-learning for UI/UX work.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    PIPELINE HANDOFF (DESIGNER AT 95%)                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  OLD PIPELINE                                                         NEW PIPELINE  │
+│  (Des+UIInsp+UITest)     GUIDE          ARCHITECT       ORCHESTRATOR (Des+UIInsp+UT)│
+│       │                  │                │                │               │        │
+│  ┌────┴────┐             │                │                │               │        │
+│  │Designer │             │                │                │               │        │
+│  │ at 95%  │             │                │                │               │        │
+│  └────┬────┘             │                │                │               │        │
+│       │                  │                │                │               │        │
+│       │ Prepare state    │                │                │               │        │
+│       │ (D + UI + UT)    │                │                │               │        │
+│       │                  │                │                │               │        │
+│       │══"HANDOFF_REQ"══▶│                │                │               │        │
+│       │  + full state    │══════════════▶│                │               │        │
+│       │  (D+UI+UT summ)  │                │                │               │        │
+│       │                  │                │                │               │        │
+│       │                  │          ┌─────┴─────┐          │               │        │
+│       │                  │          │ Examine   │          │               │        │
+│       │                  │          │ state,    │          │               │        │
+│       │                  │          │ adjust    │          │               │        │
+│       │                  │          │ workflow  │          │               │        │
+│       │                  │          │ if needed │          │               │        │
+│       │                  │          └─────┬─────┘          │               │        │
+│       │                  │                │                │               │        │
+│       │                  │                │══"CREATE_NEW"═▶│               │        │
+│       │                  │                │  + state       │               │        │
+│       │                  │                │  + "close old" │               │        │
+│       │                  │                │                │               │        │
+│       │                  │                │                │──create──────▶│        │
+│       │                  │                │                │  (inject      │        │
+│       │                  │                │                │   state)      │        │
+│       │                  │                │                │               │        │
+│       │                  │                │                │◀──"STARTED"───│        │
+│       │                  │                │                │               │        │
+│       │◀══"CLOSE_NOW"════│◀═══════════════│◀═══════════════│               │        │
+│       │                  │                │                │               │        │
+│       X                  │                │                │         ┌─────┴─────┐  │
+│  (old closes)            │                │                │         │ EXECUTING │  │
+│                          │                │                │         │ (resumed) │  │
+│                          │                │                │         └───────────┘  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Designer Handoff State Structure
+
+```go
+type DesignerPipelineHandoff struct {
+    // Metadata
+    OldPipelineID   PipelineID    `json:"old_pipeline_id"`
+    SessionID       string        `json:"session_id"`
+    DAGID           string        `json:"dag_id"`
+    TaskID          string        `json:"task_id"`
+    HandoffReason   string        `json:"handoff_reason"` // "designer_context_95%"
+    Timestamp       time.Time     `json:"timestamp"`
+    HandoffIndex    int           `json:"handoff_index"`  // For chaining (1, 2, 3...)
+
+    // Bundled state from all three agents
+    DesignerState     *DesignerHandoffState     `json:"designer_state"`
+    UIInspectorState  *UIInspectorHandoffState  `json:"ui_inspector_state"`
+    UITesterState     *UITesterHandoffState     `json:"ui_tester_state"`
+}
+
+type DesignerHandoffState struct {
+    OriginalPrompt      string              `json:"original_prompt"`      // Verbatim
+    Accomplished        []string            `json:"accomplished"`         // What was done
+    ComponentsCreated   []ComponentInfo     `json:"components_created"`   // New components
+    ComponentsModified  []ComponentChange   `json:"components_modified"`  // Changed components
+    TokensUsed          []TokenUsage        `json:"tokens_used"`          // Design tokens applied
+    Remaining           []string            `json:"remaining"`            // TODOs to complete
+    ContextNotes        string              `json:"context_notes"`        // Critical context
+}
+
+type ComponentInfo struct {
+    Name        string   `json:"name"`
+    Path        string   `json:"path"`
+    Type        string   `json:"type"`        // "component", "layout", "page"
+    Props       []string `json:"props"`       // Prop names
+    Exports     []string `json:"exports"`     // Exported items
+}
+
+type ComponentChange struct {
+    Name        string   `json:"name"`
+    Path        string   `json:"path"`
+    ChangeType  string   `json:"change_type"` // "props", "styling", "structure", "a11y"
+    Description string   `json:"description"`
+}
+
+type TokenUsage struct {
+    TokenName   string `json:"token_name"`
+    Category    string `json:"category"`    // "color", "spacing", "typography"
+    UsedIn      string `json:"used_in"`     // File/component path
+}
+
+type UIInspectorHandoffState struct {
+    ChecksPerformed     []string              `json:"checks_performed"`
+    TokenViolations     []TokenViolation      `json:"token_violations"`
+    A11yIssuesFound     []A11yIssue           `json:"a11y_issues_found"`
+    A11yIssuesResolved  []A11yIssue           `json:"a11y_issues_resolved"`
+    A11yIssuesRemaining []A11yIssue           `json:"a11y_issues_remaining"`
+    ResponsiveIssues    []ResponsiveIssue     `json:"responsive_issues"`
+    ComponentReuseConcerns []ReuseConcern     `json:"component_reuse_concerns"`
+    ValidationState     map[string]bool       `json:"validation_state"`   // category → pass/fail
+}
+
+type TokenViolation struct {
+    File        string `json:"file"`
+    Line        int    `json:"line"`
+    Pattern     string `json:"pattern"`      // e.g., "#ff0000"
+    SuggestedFix string `json:"suggested_fix"` // e.g., "var(--color-error)"
+    Status      string `json:"status"`       // "pending", "fixed"
+}
+
+type A11yIssue struct {
+    File        string `json:"file"`
+    Component   string `json:"component"`
+    Rule        string `json:"rule"`         // WCAG rule ID
+    Severity    string `json:"severity"`     // "critical", "serious", "moderate", "minor"
+    Description string `json:"description"`
+    SuggestedFix string `json:"suggested_fix"`
+}
+
+type ResponsiveIssue struct {
+    File        string `json:"file"`
+    Breakpoint  string `json:"breakpoint"`   // "sm", "md", "lg"
+    Issue       string `json:"issue"`
+    SuggestedFix string `json:"suggested_fix"`
+}
+
+type ReuseConcern struct {
+    NewComponent      string `json:"new_component"`
+    SimilarExisting   string `json:"similar_existing"`
+    SimilarityPercent int    `json:"similarity_percent"`
+    Recommendation    string `json:"recommendation"`
+}
+
+type UITesterHandoffState struct {
+    VisualTests       []VisualTestResult    `json:"visual_tests"`
+    A11yTests         []A11yTestResult      `json:"a11y_tests"`
+    ResponsiveTests   []ResponsiveTestResult `json:"responsive_tests"`
+    KeyboardNavTests  []KeyboardTestResult  `json:"keyboard_nav_tests"`
+    ThemeTests        []ThemeTestResult     `json:"theme_tests"`
+    CoverageNeeded    []string              `json:"coverage_needed"`
+}
+
+type VisualTestResult struct {
+    Component   string  `json:"component"`
+    Viewport    string  `json:"viewport"`
+    Status      string  `json:"status"`      // "pass", "fail", "baseline"
+    DiffPercent float64 `json:"diff_percent,omitempty"`
+    SnapshotPath string `json:"snapshot_path"`
+}
+
+type A11yTestResult struct {
+    Component   string `json:"component"`
+    Tool        string `json:"tool"`        // "axe-core", "lighthouse"
+    Passed      int    `json:"passed"`
+    Failed      int    `json:"failed"`
+    Score       int    `json:"score,omitempty"`
+}
+
+type ResponsiveTestResult struct {
+    Component   string `json:"component"`
+    Breakpoint  string `json:"breakpoint"`
+    Status      string `json:"status"`
+    Issues      []string `json:"issues,omitempty"`
+}
+
+type KeyboardTestResult struct {
+    Component   string `json:"component"`
+    TestCase    string `json:"test_case"`   // "tab-order", "focus-visible", "escape-closes"
+    Status      string `json:"status"`
+}
+
+type ThemeTestResult struct {
+    Component   string `json:"component"`
+    Theme       string `json:"theme"`       // "light", "dark", "high-contrast"
+    Status      string `json:"status"`
+    Issues      []string `json:"issues,omitempty"`
+}
+```
+
+#### Designer Handoff Message Flow
+
+```
+1. Designer (old) prepares bundled state (Designer + UIInspector + UITester)
+
+2. Designer (old) ──GUIDE──▶ Architect    : "HANDOFF_REQUEST" + full state
+
+3. Architect examines state, adjusts workflow if necessary
+   - May rebalance remaining work
+   - May split into multiple smaller tasks
+   - May identify components that need different handling
+
+4. Architect ──GUIDE──▶ Orchestrator      : "CREATE_PIPELINE_WITH_STATE" {
+                                              state: <bundled state>,
+                                              close_pipeline: <old pipeline ID>
+                                            }
+
+5. Orchestrator:
+   - Creates new Designer pipeline
+   - Injects state into new pipeline (all three agents start with context)
+   - New pipeline starts executing
+   - Closes old pipeline
+
+6. Orchestrator ──GUIDE──▶ Architect      : "HANDOFF_COMPLETE"
+```
+
+#### Designer Handoff Rules
+
+| Rule | Description |
+|------|-------------|
+| **Trigger** | Designer at 95% OR user request |
+| **Who triggers** | Only Designer triggers handoff (UIInspector/UITester compact locally) |
+| **State bundling** | Designer collects state from UIInspector + UITester |
+| **Architect review** | Architect examines and may adjust workflow |
+| **Archivalist** | Handoff state also stored for audit/recovery |
+| **Retry** | If handoff fails, retry. If retries fail, fallback to summarize → Archivalist → compact |
+| **Chaining** | Handoffs can chain infinitely (tracked by HandoffIndex) |
+| **User control** | User can stop a handoff chain if desired |
+
+#### New Designer Pipeline Receives
+
+The new pipeline's agents start with full context:
+
+- **New Designer**: Knows original prompt, what was done (components, tokens), what remains
+- **New UIInspector**: Knows token violations, a11y issues (resolved/remaining), responsive issues, reuse concerns
+- **New UITester**: Knows visual regression state, a11y test results, responsive test results, keyboard/theme test state
+
+This minimizes re-learning and re-discovery for UI/UX work.
+
+**Archivalist Category**: `designer_pipeline_handoff`
 
 ---
 
@@ -27506,13 +34839,3510 @@ Each efficiency technique is applicable to specific agents based on their respon
 
 ---
 
+## Plan Mode Architecture
+
+Plan Mode is a structured workflow for complex tasks requiring user approval before implementation. Plans are stored **per-session** and **local to the project** to ensure isolation and reproducibility.
+
+### Plan Mode Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              PLAN MODE OVERVIEW                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  WHAT IS PLAN MODE?                                                                 │
+│  A structured workflow where agents explore, design, and get user approval          │
+│  before implementing complex changes. Prevents wasted effort and ensures            │
+│  alignment between user intent and implementation approach.                         │
+│                                                                                     │
+│  STORAGE MODEL:                                                                     │
+│  ├── Per-Session: Each session has isolated plan state                             │
+│  ├── Per-Project: Plans stored in .sylk/plans/{session_id}/                         │
+│  ├── Persistent: Plans survive session restarts                                    │
+│  └── Versioned: Plan modifications create new versions                             │
+│                                                                                     │
+│  PLAN FILE LOCATION:                                                                │
+│  .sylk/                                                                             │
+│  └── plans/                                                                         │
+│      └── {session_id}/                                                              │
+│          ├── current_plan.md          # Active plan                                 │
+│          ├── plan_history/            # Previous versions                           │
+│          │   ├── plan_v1.md                                                         │
+│          │   └── plan_v2.md                                                         │
+│          └── todos.json               # Task tracking                               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Plan State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              PLAN STATE MACHINE                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                          ┌──────────────┐                                           │
+│                          │    IDLE      │                                           │
+│                          │  (no plan)   │                                           │
+│                          └──────┬───────┘                                           │
+│                                 │                                                   │
+│                                 │ enter_plan_mode                                   │
+│                                 ▼                                                   │
+│                          ┌──────────────┐                                           │
+│                    ┌────►│  EXPLORING   │◄────┐                                     │
+│                    │     │              │     │                                     │
+│                    │     └──────┬───────┘     │                                     │
+│                    │            │             │                                     │
+│                    │            │ plan ready  │ needs more exploration              │
+│                    │            ▼             │                                     │
+│                    │     ┌──────────────┐     │                                     │
+│                    │     │   DRAFTING   │─────┘                                     │
+│                    │     │              │                                           │
+│                    │     └──────┬───────┘                                           │
+│                    │            │                                                   │
+│                    │            │ exit_plan_mode                                    │
+│                    │            ▼                                                   │
+│                    │     ┌──────────────┐                                           │
+│                    │     │  AWAITING    │                                           │
+│       user_modify  │     │  APPROVAL    │                                           │
+│                    │     └──────┬───────┘                                           │
+│                    │            │                                                   │
+│                    │     ┌──────┴──────┐                                            │
+│                    │     │             │                                            │
+│                    │   reject      approve                                          │
+│                    │     │             │                                            │
+│                    │     ▼             ▼                                            │
+│                    │  ┌──────┐   ┌──────────────┐                                   │
+│                    └──│MODIFY│   │  APPROVED    │                                   │
+│                       └──────┘   └──────┬───────┘                                   │
+│                                         │                                           │
+│                                         │ dispatch to Orchestrator                  │
+│                                         ▼                                           │
+│                                  ┌──────────────┐                                   │
+│                            ┌────►│  EXECUTING   │◄────┐                             │
+│                            │     └──────┬───────┘     │                             │
+│                            │            │             │                             │
+│                       step_fail    all_complete   step_complete                     │
+│                            │            │             │                             │
+│                            │            ▼             │                             │
+│                            │     ┌──────────────┐     │                             │
+│                            │     │  COMPLETED   │     │                             │
+│                            │     └──────────────┘     │                             │
+│                            │                                                        │
+│                            │            OR                                          │
+│                            │                                                        │
+│                            │     ┌──────────────┐                                   │
+│                            └────►│   FAILED     │                                   │
+│                                  │ (re-plan?)   │                                   │
+│                                  └──────────────┘                                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Plan State Definition
+
+```go
+// core/plan/state.go
+
+package plan
+
+import (
+    "time"
+)
+
+// PlanState represents the current state of plan mode
+type PlanState string
+
+const (
+    PlanStateIdle            PlanState = "idle"             // No active plan
+    PlanStateExploring       PlanState = "exploring"        // Gathering context
+    PlanStateDrafting        PlanState = "drafting"         // Writing plan
+    PlanStateAwaitingApproval PlanState = "awaiting_approval" // User decision pending
+    PlanStateApproved        PlanState = "approved"         // Ready for execution
+    PlanStateExecuting       PlanState = "executing"        // In progress
+    PlanStateCompleted       PlanState = "completed"        // Successfully finished
+    PlanStateFailed          PlanState = "failed"           // Execution failed
+)
+
+// PlanContext holds all plan-related state for a session
+type PlanContext struct {
+    SessionID       string            `json:"session_id"`
+    State           PlanState         `json:"state"`
+    CurrentPlan     *Plan             `json:"current_plan,omitempty"`
+    PlanHistory     []PlanVersion     `json:"plan_history,omitempty"`
+    Todos           []TodoItem        `json:"todos,omitempty"`
+    ExecutionState  *ExecutionState   `json:"execution_state,omitempty"`
+    CreatedAt       time.Time         `json:"created_at"`
+    UpdatedAt       time.Time         `json:"updated_at"`
+}
+
+// Plan represents a structured implementation plan
+type Plan struct {
+    ID              string            `json:"id"`
+    Title           string            `json:"title"`
+    Overview        string            `json:"overview"`
+    FilesToModify   []FileChange      `json:"files_to_modify"`
+    Steps           []PlanStep        `json:"steps"`
+    Considerations  []string          `json:"considerations"`
+    AllowedPrompts  []AllowedPrompt   `json:"allowed_prompts,omitempty"`
+    Version         int               `json:"version"`
+    CreatedAt       time.Time         `json:"created_at"`
+    CreatedBy       string            `json:"created_by"` // Agent that created
+}
+
+// FileChange describes a file modification
+type FileChange struct {
+    Path        string `json:"path"`
+    Action      string `json:"action"` // "create", "modify", "delete"
+    Description string `json:"description"`
+}
+
+// PlanStep is an atomic unit of work
+type PlanStep struct {
+    Index       int            `json:"index"`
+    Description string         `json:"description"`
+    Agent       string         `json:"agent"`      // Which agent executes
+    DependsOn   []int          `json:"depends_on"` // Step indices this depends on
+    Layer       int            `json:"layer"`      // Topological layer (computed)
+    Status      PlanStepStatus `json:"status"`     // Execution status (updated by Architect)
+    Estimated   string         `json:"estimated"`  // Optional complexity hint
+}
+
+// PlanStepStatus tracks individual step completion
+type PlanStepStatus string
+
+const (
+    StepStatusPending    PlanStepStatus = "pending"
+    StepStatusInProgress PlanStepStatus = "in_progress"
+    StepStatusCompleted  PlanStepStatus = "completed"
+    StepStatusFailed     PlanStepStatus = "failed"
+    StepStatusSkipped    PlanStepStatus = "skipped"
+)
+
+// TopologicalLayer groups steps that can execute concurrently
+type TopologicalLayer struct {
+    Layer int        `json:"layer"`
+    Steps []PlanStep `json:"steps"`
+}
+
+// ComputeTopologicalLayers organizes steps into concurrent execution layers.
+// Steps in the same layer have no dependencies on each other and can run in parallel.
+// Layer 0 contains steps with no dependencies.
+// Layer N contains steps whose dependencies are all in layers < N.
+func ComputeTopologicalLayers(steps []PlanStep) []TopologicalLayer {
+    if len(steps) == 0 {
+        return nil
+    }
+
+    // Build index lookup
+    stepByIndex := make(map[int]*PlanStep, len(steps))
+    for i := range steps {
+        stepByIndex[steps[i].Index] = &steps[i]
+    }
+
+    // Compute layer for each step using Kahn's algorithm variant
+    computed := make(map[int]int, len(steps))
+
+    for _, step := range steps {
+        computeStepLayer(step.Index, stepByIndex, computed)
+    }
+
+    // Update steps with computed layers
+    for i := range steps {
+        steps[i].Layer = computed[steps[i].Index]
+    }
+
+    // Group by layer
+    maxLayer := 0
+    for _, layer := range computed {
+        if layer > maxLayer {
+            maxLayer = layer
+        }
+    }
+
+    layers := make([]TopologicalLayer, maxLayer+1)
+    for i := range layers {
+        layers[i] = TopologicalLayer{Layer: i}
+    }
+
+    for _, step := range steps {
+        layer := computed[step.Index]
+        layers[layer].Steps = append(layers[layer].Steps, step)
+    }
+
+    return layers
+}
+
+// computeStepLayer recursively computes layer for a step
+func computeStepLayer(idx int, steps map[int]*PlanStep, computed map[int]int) int {
+    if layer, ok := computed[idx]; ok {
+        return layer
+    }
+
+    step := steps[idx]
+    if step == nil || len(step.DependsOn) == 0 {
+        computed[idx] = 0
+        return 0
+    }
+
+    maxDepLayer := 0
+    for _, depIdx := range step.DependsOn {
+        depLayer := computeStepLayer(depIdx, steps, computed)
+        if depLayer >= maxDepLayer {
+            maxDepLayer = depLayer + 1
+        }
+    }
+
+    computed[idx] = maxDepLayer
+    return maxDepLayer
+}
+
+// AllowedPrompt defines a bash permission for the plan
+type AllowedPrompt struct {
+    Tool   string `json:"tool"`
+    Prompt string `json:"prompt"`
+}
+
+// PlanVersion stores historical plan versions
+type PlanVersion struct {
+    Version   int       `json:"version"`
+    Plan      Plan      `json:"plan"`
+    Reason    string    `json:"reason"` // Why this version was created
+    CreatedAt time.Time `json:"created_at"`
+}
+
+// TodoItem tracks progress on plan steps
+type TodoItem struct {
+    Content    string     `json:"content"`
+    ActiveForm string     `json:"active_form"`
+    Status     TodoStatus `json:"status"`
+    StepIndex  int        `json:"step_index,omitempty"`
+}
+
+type TodoStatus string
+
+const (
+    TodoStatusPending    TodoStatus = "pending"
+    TodoStatusInProgress TodoStatus = "in_progress"
+    TodoStatusCompleted  TodoStatus = "completed"
+)
+
+// ExecutionState tracks DAG execution progress
+type ExecutionState struct {
+    DAGID           string                 `json:"dag_id"`
+    CompletedSteps  []int                  `json:"completed_steps"`
+    CurrentStep     int                    `json:"current_step"`
+    FailedStep      *int                   `json:"failed_step,omitempty"`
+    FailureReason   string                 `json:"failure_reason,omitempty"`
+    StartedAt       time.Time              `json:"started_at"`
+    StepResults     map[int]StepResult     `json:"step_results"`
+}
+
+type StepResult struct {
+    StepIndex   int       `json:"step_index"`
+    Status      string    `json:"status"` // "success", "failure", "skipped"
+    Output      string    `json:"output,omitempty"`
+    Error       string    `json:"error,omitempty"`
+    CompletedAt time.Time `json:"completed_at"`
+}
+```
+
+### Plan Storage Implementation
+
+Plans are stored in user space (`~/.sylk/`) indexed by project hash, ensuring:
+- Plans persist across sessions
+- No pollution of project directory
+- User-private storage (not committed to git)
+- Project-aware organization
+
+#### Directory Structure
+
+```
+~/.sylk/
+├── sessions/{session_id}/              ← Ephemeral session data
+│   ├── wal/
+│   ├── checkpoints/
+│   └── active_plan.txt                 ← Pointer to current plan slug
+│
+├── projects/{project_hash}/            ← Persistent per-project data
+│   ├── project_info.json               ← Project path, name, created_at
+│   ├── plans/
+│   │   ├── implement-user-auth/        ← Plan slug (derived from title)
+│   │   │   ├── metadata.json           ← Version history, change sets
+│   │   │   ├── context.json            ← Current execution context
+│   │   │   ├── todos.json              ← Todo list state
+│   │   │   ├── current.md              ← Symlink/copy to HEAD version
+│   │   │   ├── v1.md                   ← Version 1
+│   │   │   ├── v2.md                   ← Version 2
+│   │   │   ├── v3.md                   ← Version 3 (HEAD)
+│   │   │   └── checkpoints/            ← Execution state snapshots
+│   │   │       ├── v1_complete.json
+│   │   │       └── v2_step3.json
+│   │   │
+│   │   └── refactor-database/
+│   │       ├── metadata.json
+│   │       ├── context.json
+│   │       ├── current.md → v1.md
+│   │       └── v1.md
+│   │
+│   └── archived/                       ← Completed/abandoned plans
+│       └── fix-login-bug/
+│           ├── metadata.json
+│           ├── v1.md
+│           ├── v2.md
+│           └── outcome.json
+│
+└── shared/
+    └── sessions.db
+```
+
+#### Example File Paths
+
+```
+Plan version file:
+~/.sylk/projects/a1b2c3d4/plans/implement-user-auth/v3.md
+
+Breakdown:
+~/.sylk/              → User sylk root
+projects/             → Per-project persistent data
+a1b2c3d4/             → ProjectHash("/Users/ada/myproject") - first 8 bytes of SHA256
+plans/                → Plans directory
+implement-user-auth/  → Plan slug (slugified from title)
+v3.md                 → Version 3 of the plan
+
+Other paths:
+~/.sylk/projects/a1b2c3d4/plans/implement-user-auth/metadata.json
+~/.sylk/projects/a1b2c3d4/plans/implement-user-auth/context.json
+~/.sylk/projects/a1b2c3d4/plans/implement-user-auth/checkpoints/v2_step3.json
+~/.sylk/projects/a1b2c3d4/archived/fix-login-bug/outcome.json
+```
+
+#### Storage Implementation
+
+```go
+// core/plan/storage.go
+
+package plan
+
+import (
+    "crypto/sha256"
+    "encoding/hex"
+    "encoding/json"
+    "fmt"
+    "os"
+    "path/filepath"
+    "regexp"
+    "strings"
+    "time"
+)
+
+// Storage handles plan persistence in user space
+type Storage struct {
+    sylkRoot    string // ~/.sylk
+    projectHash string // Hash of project root path
+    projectRoot string // Original project path (for reference)
+}
+
+// NewStorage creates a storage instance for a project
+func NewStorage(projectRoot string) (*Storage, error) {
+    home, err := os.UserHomeDir()
+    if err != nil {
+        return nil, fmt.Errorf("get home dir: %w", err)
+    }
+
+    sylkRoot := filepath.Join(home, ".sylk")
+    projectHash := ProjectHash(projectRoot)
+
+    s := &Storage{
+        sylkRoot:    sylkRoot,
+        projectHash: projectHash,
+        projectRoot: projectRoot,
+    }
+
+    // Initialize project directory with info
+    if err := s.initProjectDir(); err != nil {
+        return nil, err
+    }
+
+    return s, nil
+}
+
+// ProjectHash generates consistent hash for project path
+func ProjectHash(projectRoot string) string {
+    absPath, _ := filepath.Abs(projectRoot)
+    hash := sha256.Sum256([]byte(absPath))
+    return hex.EncodeToString(hash[:8]) // 16 chars
+}
+
+// Slugify converts a plan title to a filesystem-safe slug
+func Slugify(title string) string {
+    // Lowercase
+    slug := strings.ToLower(title)
+    // Replace spaces and special chars with hyphens
+    reg := regexp.MustCompile(`[^a-z0-9]+`)
+    slug = reg.ReplaceAllString(slug, "-")
+    // Trim leading/trailing hyphens
+    slug = strings.Trim(slug, "-")
+    // Limit length
+    if len(slug) > 50 {
+        slug = slug[:50]
+    }
+    return slug
+}
+
+// projectDir returns the base directory for this project's data
+func (s *Storage) projectDir() string {
+    return filepath.Join(s.sylkRoot, "projects", s.projectHash)
+}
+
+// planDir returns the directory for a specific plan
+func (s *Storage) planDir(planSlug string) string {
+    return filepath.Join(s.projectDir(), "plans", planSlug)
+}
+
+// archivedDir returns the directory for archived plans
+func (s *Storage) archivedDir() string {
+    return filepath.Join(s.projectDir(), "archived")
+}
+
+// initProjectDir creates project directory and stores project info
+func (s *Storage) initProjectDir() error {
+    dir := s.projectDir()
+    if err := os.MkdirAll(filepath.Join(dir, "plans"), 0755); err != nil {
+        return fmt.Errorf("create project dir: %w", err)
+    }
+    if err := os.MkdirAll(filepath.Join(dir, "archived"), 0755); err != nil {
+        return fmt.Errorf("create archived dir: %w", err)
+    }
+
+    // Write project info if not exists
+    infoPath := filepath.Join(dir, "project_info.json")
+    if _, err := os.Stat(infoPath); os.IsNotExist(err) {
+        info := map[string]any{
+            "project_path": s.projectRoot,
+            "project_hash": s.projectHash,
+            "created_at":   time.Now(),
+        }
+        data, _ := json.MarshalIndent(info, "", "  ")
+        os.WriteFile(infoPath, data, 0644)
+    }
+
+    return nil
+}
+
+// EnsurePlanDir creates directory structure for a plan
+func (s *Storage) EnsurePlanDir(planSlug string) error {
+    dir := s.planDir(planSlug)
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        return fmt.Errorf("create plan dir: %w", err)
+    }
+    checkpointDir := filepath.Join(dir, "checkpoints")
+    return os.MkdirAll(checkpointDir, 0755)
+}
+
+// SaveContext persists the full plan context
+func (s *Storage) SaveContext(ctx *PlanContext) error {
+    if ctx.CurrentPlan == nil {
+        return fmt.Errorf("no current plan")
+    }
+
+    planSlug := Slugify(ctx.CurrentPlan.Title)
+    if err := s.EnsurePlanDir(planSlug); err != nil {
+        return err
+    }
+
+    ctx.UpdatedAt = time.Now()
+
+    // Save context.json
+    contextPath := filepath.Join(s.planDir(planSlug), "context.json")
+    data, err := json.MarshalIndent(ctx, "", "  ")
+    if err != nil {
+        return fmt.Errorf("marshal context: %w", err)
+    }
+    if err := os.WriteFile(contextPath, data, 0644); err != nil {
+        return fmt.Errorf("write context: %w", err)
+    }
+
+    // Save current version markdown
+    if err := s.saveVersionMarkdown(planSlug, ctx.CurrentPlan); err != nil {
+        return err
+    }
+
+    // Update current.md symlink/copy
+    if err := s.updateCurrentPointer(planSlug, ctx.CurrentPlan.Version); err != nil {
+        return err
+    }
+
+    // Save todos.json
+    return s.saveTodos(planSlug, ctx.Todos)
+}
+
+// LoadContext loads the plan context for a plan slug
+func (s *Storage) LoadContext(planSlug string) (*PlanContext, error) {
+    contextPath := filepath.Join(s.planDir(planSlug), "context.json")
+
+    data, err := os.ReadFile(contextPath)
+    if os.IsNotExist(err) {
+        return nil, fmt.Errorf("plan not found: %s", planSlug)
+    }
+    if err != nil {
+        return nil, fmt.Errorf("read context: %w", err)
+    }
+
+    var ctx PlanContext
+    if err := json.Unmarshal(data, &ctx); err != nil {
+        return nil, fmt.Errorf("unmarshal context: %w", err)
+    }
+
+    return &ctx, nil
+}
+
+// ListPlans returns all plan slugs for this project
+func (s *Storage) ListPlans() ([]string, error) {
+    plansDir := filepath.Join(s.projectDir(), "plans")
+    entries, err := os.ReadDir(plansDir)
+    if err != nil {
+        if os.IsNotExist(err) {
+            return nil, nil
+        }
+        return nil, err
+    }
+
+    var slugs []string
+    for _, e := range entries {
+        if e.IsDir() {
+            slugs = append(slugs, e.Name())
+        }
+    }
+    return slugs, nil
+}
+
+// saveVersionMarkdown writes plan as versioned markdown file
+func (s *Storage) saveVersionMarkdown(planSlug string, plan *Plan) error {
+    filename := fmt.Sprintf("v%d.md", plan.Version)
+    path := filepath.Join(s.planDir(planSlug), filename)
+
+    md := formatPlanMarkdown(plan)
+    header := fmt.Sprintf("<!-- Plan: %s | Version: %d | Created: %s -->\n\n",
+        plan.Title, plan.Version, time.Now().Format(time.RFC3339))
+
+    return os.WriteFile(path, []byte(header+md), 0644)
+}
+
+// updateCurrentPointer updates current.md to point to HEAD version
+func (s *Storage) updateCurrentPointer(planSlug string, version int) error {
+    currentPath := filepath.Join(s.planDir(planSlug), "current.md")
+    versionPath := filepath.Join(s.planDir(planSlug), fmt.Sprintf("v%d.md", version))
+
+    // Remove existing current.md
+    os.Remove(currentPath)
+
+    // Copy version file to current.md (symlinks can be problematic on some systems)
+    data, err := os.ReadFile(versionPath)
+    if err != nil {
+        return err
+    }
+    return os.WriteFile(currentPath, data, 0644)
+}
+
+// SaveMetadata saves the version history and change sets
+func (s *Storage) SaveMetadata(planSlug string, meta *PlanMetadata) error {
+    path := filepath.Join(s.planDir(planSlug), "metadata.json")
+    data, err := json.MarshalIndent(meta, "", "  ")
+    if err != nil {
+        return fmt.Errorf("marshal metadata: %w", err)
+    }
+    return os.WriteFile(path, data, 0644)
+}
+
+// LoadMetadata loads version history and change sets
+func (s *Storage) LoadMetadata(planSlug string) (*PlanMetadata, error) {
+    path := filepath.Join(s.planDir(planSlug), "metadata.json")
+    data, err := os.ReadFile(path)
+    if os.IsNotExist(err) {
+        return &PlanMetadata{Slug: planSlug}, nil
+    }
+    if err != nil {
+        return nil, err
+    }
+
+    var meta PlanMetadata
+    if err := json.Unmarshal(data, &meta); err != nil {
+        return nil, err
+    }
+    return &meta, nil
+}
+
+// LoadVersion loads a specific version of a plan
+func (s *Storage) LoadVersion(planSlug string, version int) (string, error) {
+    path := filepath.Join(s.planDir(planSlug), fmt.Sprintf("v%d.md", version))
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return "", err
+    }
+    return string(data), nil
+}
+
+// SaveCheckpoint saves execution state at a point in time
+func (s *Storage) SaveCheckpoint(planSlug string, version int, stepIndex int, state *ExecutionState) error {
+    filename := fmt.Sprintf("v%d_step%d.json", version, stepIndex)
+    path := filepath.Join(s.planDir(planSlug), "checkpoints", filename)
+
+    data, err := json.MarshalIndent(state, "", "  ")
+    if err != nil {
+        return err
+    }
+    return os.WriteFile(path, data, 0644)
+}
+
+// ArchivePlan moves a completed/abandoned plan to archived/
+func (s *Storage) ArchivePlan(planSlug string, outcome *PlanOutcome) error {
+    srcDir := s.planDir(planSlug)
+    dstDir := filepath.Join(s.archivedDir(), planSlug)
+
+    // Move plan directory
+    if err := os.Rename(srcDir, dstDir); err != nil {
+        return fmt.Errorf("archive plan: %w", err)
+    }
+
+    // Write outcome
+    outcomePath := filepath.Join(dstDir, "outcome.json")
+    data, err := json.MarshalIndent(outcome, "", "  ")
+    if err != nil {
+        return err
+    }
+    return os.WriteFile(outcomePath, data, 0644)
+}
+
+func (s *Storage) saveTodos(planSlug string, todos []TodoItem) error {
+    path := filepath.Join(s.planDir(planSlug), "todos.json")
+    data, err := json.MarshalIndent(todos, "", "  ")
+    if err != nil {
+        return fmt.Errorf("marshal todos: %w", err)
+    }
+    return os.WriteFile(path, data, 0644)
+}
+
+// PlanOutcome records final state of a completed/failed plan
+type PlanOutcome struct {
+    Result        string    `json:"result"` // "success", "failure", "abandoned"
+    CompletedAt   time.Time `json:"completed_at"`
+    StepsComplete int       `json:"steps_complete"`
+    StepsTotal    int       `json:"steps_total"`
+    FailureReason string    `json:"failure_reason,omitempty"`
+    Duration      string    `json:"duration"`
+}
+
+// formatPlanMarkdown converts a Plan to markdown format with topological layers
+func formatPlanMarkdown(plan *Plan) string {
+    var md string
+
+    md += fmt.Sprintf("# Plan: %s\n\n", plan.Title)
+    md += fmt.Sprintf("## Overview\n\n%s\n\n", plan.Overview)
+
+    md += "## Files to Modify\n\n"
+    for _, f := range plan.FilesToModify {
+        md += fmt.Sprintf("- `%s` (%s): %s\n", f.Path, f.Action, f.Description)
+    }
+    md += "\n"
+
+    // Compute topological layers for concurrent execution visualization
+    layers := ComputeTopologicalLayers(plan.Steps)
+
+    md += "## Execution Plan\n\n"
+    md += "Steps are organized by **execution layer**. "
+    md += "Steps within the same layer have no interdependencies and **can execute concurrently**.\n\n"
+
+    // Compute progress statistics
+    completed, total := countCompletedSteps(plan.Steps)
+    md += fmt.Sprintf("**Progress: %d/%d steps completed**\n\n", completed, total)
+
+    md += "```\n"
+    md += "Execution Flow:\n"
+    for i, layer := range layers {
+        if i > 0 {
+            md += "    │\n"
+            md += "    ▼\n"
+        }
+        md += fmt.Sprintf("┌─ Layer %d ", layer.Layer)
+        if len(layer.Steps) > 1 {
+            md += fmt.Sprintf("(parallel: %d tasks) ", len(layer.Steps))
+        }
+        md += fmt.Sprintf("[%s] ─┐\n", layerStatus(layer.Steps))
+        for _, step := range layer.Steps {
+            md += fmt.Sprintf("│  %s Step %d: [%s]       │\n",
+                statusIcon(step.Status), step.Index, step.Agent)
+        }
+        md += "└────────────────────────┘\n"
+    }
+    md += "```\n\n"
+
+    md += "### Detailed Steps by Layer\n\n"
+    for _, layer := range layers {
+        concurrency := "sequential"
+        if len(layer.Steps) > 1 {
+            concurrency = fmt.Sprintf("**%d concurrent**", len(layer.Steps))
+        }
+        md += fmt.Sprintf("#### Layer %d (%s)\n\n", layer.Layer, concurrency)
+
+        for _, step := range layer.Steps {
+            checkbox := statusCheckbox(step.Status)
+            deps := ""
+            if len(step.DependsOn) > 0 {
+                deps = fmt.Sprintf("\n   - *Depends on*: steps %v", step.DependsOn)
+            }
+            md += fmt.Sprintf("- %s **Step %d** [%s]: %s%s\n",
+                checkbox, step.Index, step.Agent, step.Description, deps)
+        }
+        md += "\n"
+    }
+
+    md += "### Sequential Step Reference\n\n"
+    for _, step := range plan.Steps {
+        checkbox := statusCheckbox(step.Status)
+        deps := ""
+        if len(step.DependsOn) > 0 {
+            deps = fmt.Sprintf(" (depends on: %v)", step.DependsOn)
+        }
+        md += fmt.Sprintf("%s %d. [Layer %d] [%s] %s%s\n",
+            checkbox, step.Index, step.Layer, step.Agent, step.Description, deps)
+    }
+    md += "\n"
+
+    if len(plan.Considerations) > 0 {
+        md += "## Considerations\n\n"
+        for _, c := range plan.Considerations {
+            md += fmt.Sprintf("- %s\n", c)
+        }
+        md += "\n"
+    }
+
+    if len(plan.AllowedPrompts) > 0 {
+        md += "## Required Permissions\n\n"
+        for _, p := range plan.AllowedPrompts {
+            md += fmt.Sprintf("- %s: %s\n", p.Tool, p.Prompt)
+        }
+    }
+
+    return md
+}
+
+// statusCheckbox returns a markdown checkbox based on step status
+func statusCheckbox(status PlanStepStatus) string {
+    switch status {
+    case StepStatusCompleted:
+        return "[x]"
+    case StepStatusFailed:
+        return "[!]"
+    case StepStatusSkipped:
+        return "[-]"
+    case StepStatusInProgress:
+        return "[~]"
+    default:
+        return "[ ]"
+    }
+}
+
+// statusIcon returns an icon for the execution flow diagram
+func statusIcon(status PlanStepStatus) string {
+    switch status {
+    case StepStatusCompleted:
+        return "✓"
+    case StepStatusFailed:
+        return "✗"
+    case StepStatusSkipped:
+        return "⊘"
+    case StepStatusInProgress:
+        return "►"
+    default:
+        return "○"
+    }
+}
+
+// layerStatus returns aggregate status for a layer
+func layerStatus(steps []PlanStep) string {
+    completed := 0
+    failed := 0
+    inProgress := 0
+    for _, s := range steps {
+        switch s.Status {
+        case StepStatusCompleted:
+            completed++
+        case StepStatusFailed:
+            failed++
+        case StepStatusInProgress:
+            inProgress++
+        }
+    }
+    if failed > 0 {
+        return "FAILED"
+    }
+    if completed == len(steps) {
+        return "DONE"
+    }
+    if inProgress > 0 || completed > 0 {
+        return fmt.Sprintf("%d/%d", completed, len(steps))
+    }
+    return "PENDING"
+}
+
+// countCompletedSteps returns (completed, total) step counts
+func countCompletedSteps(steps []PlanStep) (int, int) {
+    completed := 0
+    for _, s := range steps {
+        if s.Status == StepStatusCompleted {
+            completed++
+        }
+    }
+    return completed, len(steps)
+}
+
+// Example plan output with topological layers:
+//
+// # Plan: Implement User Authentication
+//
+// ## Overview
+//
+// Add JWT-based authentication with login, logout, and session management.
+//
+// ## Files to Modify
+//
+// - `core/auth/jwt.go` (create): JWT token generation and validation
+// - `core/auth/middleware.go` (create): Auth middleware for protected routes
+// - `api/handlers/auth.go` (create): Login/logout HTTP handlers
+// - `api/routes.go` (modify): Add auth routes
+// - `tests/auth_test.go` (create): Authentication tests
+//
+// ## Execution Plan
+//
+// Steps are organized by **execution layer**. Steps within the same layer
+// have no interdependencies and **can execute concurrently**.
+//
+// ```
+// Execution Flow:
+// ┌─ Layer 0 (parallel: 2 tasks) ─┐
+// │  Step 1: [engineer]           │
+// │  Step 2: [engineer]           │
+// └────────────────────────────────┘
+//     │
+//     ▼
+// ┌─ Layer 1 (parallel: 2 tasks) ─┐
+// │  Step 3: [engineer]           │
+// │  Step 4: [engineer]           │
+// └────────────────────────────────┘
+//     │
+//     ▼
+// ┌─ Layer 2 ─┐
+// │  Step 5: [engineer]           │
+// └────────────────────────────────┘
+//     │
+//     ▼
+// ┌─ Layer 3 ─┐
+// │  Step 6: [tester]             │
+// └────────────────────────────────┘
+// ```
+//
+// ### Detailed Steps by Layer
+//
+// #### Layer 0 (**2 concurrent**)
+//
+// - **Step 1** [engineer]: Create JWT token utilities in core/auth/jwt.go
+// - **Step 2** [engineer]: Create auth middleware in core/auth/middleware.go
+//
+// #### Layer 1 (**2 concurrent**)
+//
+// - **Step 3** [engineer]: Create login handler in api/handlers/auth.go
+//   - *Depends on*: steps [1]
+// - **Step 4** [engineer]: Create logout handler in api/handlers/auth.go
+//   - *Depends on*: steps [1]
+//
+// #### Layer 2 (sequential)
+//
+// - **Step 5** [engineer]: Update api/routes.go with auth endpoints
+//   - *Depends on*: steps [3, 4]
+//
+// #### Layer 3 (sequential)
+//
+// - **Step 6** [tester]: Write comprehensive auth tests
+//   - *Depends on*: steps [1, 2, 3, 4, 5]
+//
+// ### Sequential Step Reference
+//
+// 1. [Layer 0] [engineer] Create JWT token utilities in core/auth/jwt.go
+// 2. [Layer 0] [engineer] Create auth middleware in core/auth/middleware.go
+// 3. [Layer 1] [engineer] Create login handler (depends on: [1])
+// 4. [Layer 1] [engineer] Create logout handler (depends on: [1])
+// 5. [Layer 2] [engineer] Update routes (depends on: [3, 4])
+// 6. [Layer 3] [tester] Write tests (depends on: [1, 2, 3, 4, 5])
+//
+// ## Considerations
+//
+// - JWT secret must be loaded from environment variable
+// - Consider refresh token implementation for future iteration
+// - Rate limiting on login endpoint recommended
+//
+// ## Required Permissions
+//
+// - Bash: run tests
+// - Bash: install dependencies
+```
+
+### Plan File Synchronization on Step Completion
+
+When pipelines signal completion of their respective tasks, the Architect agent **must** update the plan file to reflect current progress. This ensures the plan file remains the source of truth for execution state.
+
+#### Synchronization Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PLAN FILE SYNCHRONIZATION FLOW                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────┐    step_completed     ┌──────────────┐                   │
+│  │  Pipeline    │ ──────────────────► │  Orchestrator │                   │
+│  │  (Engineer)  │    {step_index,       │              │                   │
+│  └──────────────┘     status, result}   └──────┬───────┘                   │
+│                                                │                            │
+│                                                │ update_step_status         │
+│                                                │ {step_index, status}       │
+│                                                ▼                            │
+│                                         ┌──────────────┐                   │
+│                                         │   Architect  │                   │
+│                                         │              │                   │
+│                                         └──────┬───────┘                   │
+│                                                │                            │
+│                            ┌───────────────────┼───────────────────┐       │
+│                            │                   │                   │       │
+│                            ▼                   ▼                   ▼       │
+│                     ┌────────────┐      ┌────────────┐      ┌──────────┐  │
+│                     │ Update     │      │ Update     │      │ Regenerate│  │
+│                     │ Plan.Steps │      │ Todos      │      │ Markdown  │  │
+│                     │ [].Status  │      │ [].Status  │      │ File      │  │
+│                     └────────────┘      └────────────┘      └──────────┘  │
+│                                                                             │
+│                                         ┌──────────────┐                   │
+│                                         │ .sylk/plans/ │                   │
+│                                         │ {session}/   │                   │
+│                                         │ current_     │                   │
+│                                         │ plan.md      │                   │
+│                                         └──────────────┘                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Step Completion Signal
+
+When a pipeline completes a step, it emits a `StepCompletedSignal`:
+
+```go
+// core/signals/step_completed.go
+
+type StepCompletedSignal struct {
+    SessionID  string         `json:"session_id"`
+    PlanID     string         `json:"plan_id"`
+    StepIndex  int            `json:"step_index"`
+    Status     PlanStepStatus `json:"status"`
+    Output     string         `json:"output,omitempty"`
+    Error      string         `json:"error,omitempty"`
+    Duration   time.Duration  `json:"duration"`
+    AgentID    string         `json:"agent_id"`
+    Timestamp  time.Time      `json:"timestamp"`
+}
+```
+
+#### Architect Step Update Handler
+
+The Architect agent subscribes to step completion signals and updates the plan:
+
+```go
+// agents/architect/step_handler.go
+
+// HandleStepCompleted processes step completion signals from pipelines
+func (a *ArchitectAgent) HandleStepCompleted(sig *StepCompletedSignal) error {
+    // Load current plan context
+    ctx, err := a.storage.LoadContext(sig.SessionID)
+    if err != nil {
+        return fmt.Errorf("load context: %w", err)
+    }
+
+    if ctx.CurrentPlan == nil || ctx.CurrentPlan.ID != sig.PlanID {
+        return fmt.Errorf("plan mismatch: expected %s, got %s", sig.PlanID, ctx.CurrentPlan.ID)
+    }
+
+    // Update step status
+    if err := updateStepStatus(ctx.CurrentPlan, sig.StepIndex, sig.Status); err != nil {
+        return err
+    }
+
+    // Update corresponding todo
+    updateTodoForStep(ctx.Todos, sig.StepIndex, sig.Status)
+
+    // Update execution state
+    updateExecutionState(ctx.ExecutionState, sig)
+
+    // Persist changes (regenerates markdown file)
+    return a.storage.SaveContext(ctx)
+}
+
+func updateStepStatus(plan *Plan, stepIndex int, status PlanStepStatus) error {
+    for i := range plan.Steps {
+        if plan.Steps[i].Index == stepIndex {
+            plan.Steps[i].Status = status
+            return nil
+        }
+    }
+    return fmt.Errorf("step %d not found", stepIndex)
+}
+
+func updateTodoForStep(todos []TodoItem, stepIndex int, status PlanStepStatus) {
+    for i := range todos {
+        if todos[i].StepIndex == stepIndex {
+            switch status {
+            case StepStatusCompleted:
+                todos[i].Status = TodoStatusCompleted
+            case StepStatusInProgress:
+                todos[i].Status = TodoStatusInProgress
+            case StepStatusFailed, StepStatusSkipped:
+                todos[i].Status = TodoStatusPending // Allow retry
+            }
+            return
+        }
+    }
+}
+
+func updateExecutionState(state *ExecutionState, sig *StepCompletedSignal) {
+    if state == nil {
+        return
+    }
+
+    state.StepResults[sig.StepIndex] = StepResult{
+        StepIndex:   sig.StepIndex,
+        Status:      string(sig.Status),
+        Output:      sig.Output,
+        Error:       sig.Error,
+        CompletedAt: sig.Timestamp,
+    }
+
+    if sig.Status == StepStatusCompleted {
+        state.CompletedSteps = append(state.CompletedSteps, sig.StepIndex)
+    }
+}
+```
+
+#### Automatic Plan File Regeneration
+
+When `SaveContext` is called, the plan markdown file is automatically regenerated with updated status:
+
+```go
+// In storage.go SaveContext method:
+
+// Save current_plan.md if plan exists
+if ctx.CurrentPlan != nil {
+    // formatPlanMarkdown now includes status checkboxes
+    if err := s.savePlanMarkdown(ctx.SessionID, ctx.CurrentPlan); err != nil {
+        return err
+    }
+}
+```
+
+#### Example: Plan File Before and After Step Completion
+
+**Before (step 1 in progress):**
+```markdown
+**Progress: 0/6 steps completed**
+
+### Sequential Step Reference
+
+[ ] 1. [Layer 0] [engineer] Create JWT token utilities
+[~] 2. [Layer 0] [engineer] Create auth middleware (in progress)
+[ ] 3. [Layer 1] [engineer] Create login handler
+[ ] 4. [Layer 1] [engineer] Create logout handler
+[ ] 5. [Layer 2] [engineer] Update routes
+[ ] 6. [Layer 3] [tester] Write tests
+```
+
+**After (steps 1 and 2 completed):**
+```markdown
+**Progress: 2/6 steps completed**
+
+### Sequential Step Reference
+
+[x] 1. [Layer 0] [engineer] Create JWT token utilities
+[x] 2. [Layer 0] [engineer] Create auth middleware
+[ ] 3. [Layer 1] [engineer] Create login handler
+[ ] 4. [Layer 1] [engineer] Create logout handler
+[ ] 5. [Layer 2] [engineer] Update routes
+[ ] 6. [Layer 3] [tester] Write tests
+```
+
+#### Orchestrator Integration
+
+The Orchestrator subscribes to step completion from executing pipelines and forwards to Architect:
+
+```go
+// agents/orchestrator/executor.go
+
+func (o *OrchestratorAgent) executeStep(ctx context.Context, step PlanStep, planCtx *PlanContext) error {
+    // Mark step in progress
+    o.emitStepSignal(planCtx, step.Index, StepStatusInProgress, "", "")
+
+    // Execute via appropriate agent
+    result, err := o.dispatchToAgent(ctx, step)
+
+    if err != nil {
+        o.emitStepSignal(planCtx, step.Index, StepStatusFailed, "", err.Error())
+        return err
+    }
+
+    // Mark step completed
+    o.emitStepSignal(planCtx, step.Index, StepStatusCompleted, result, "")
+    return nil
+}
+
+func (o *OrchestratorAgent) emitStepSignal(planCtx *PlanContext, stepIndex int, status PlanStepStatus, output, errMsg string) {
+    sig := &StepCompletedSignal{
+        SessionID:  planCtx.SessionID,
+        PlanID:     planCtx.CurrentPlan.ID,
+        StepIndex:  stepIndex,
+        Status:     status,
+        Output:     output,
+        Error:      errMsg,
+        Timestamp:  time.Now(),
+        AgentID:    o.ID(),
+    }
+
+    // Route to Architect via bus
+    o.bus.Publish("plan.step.completed", sig)
+}
+```
+
+### Plan Archival on Approval
+
+When a user approves a plan, the Architect **must** submit the plan to the Archivalist for long-term storage. This enables:
+- Future reference for similar tasks
+- Historical pattern analysis
+- Knowledge retrieval for new sessions
+
+#### Archival Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PLAN ARCHIVAL FLOW                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  User Approval                                                              │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌──────────────┐    archive_plan      ┌──────────────┐                    │
+│  │   Architect  │ ──────────────────► │  Archivalist │                    │
+│  │              │    {plan, metadata}  │              │                    │
+│  └──────────────┘                      └──────┬───────┘                    │
+│                                               │                             │
+│                                               │ store in category           │
+│                                               │ "approved_plans"            │
+│                                               ▼                             │
+│                                        ┌──────────────┐                    │
+│                                        │  Historical  │                    │
+│                                        │  Knowledge   │                    │
+│                                        │  Store       │                    │
+│                                        └──────────────┘                    │
+│                                                                             │
+│  Plan Completion                                                            │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌──────────────┐    archive_outcome   ┌──────────────┐                    │
+│  │   Architect  │ ──────────────────► │  Archivalist │                    │
+│  │              │    {plan, results,   │              │                    │
+│  └──────────────┘     success/failure} └──────────────┘                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Archive on Approval
+
+```go
+// agents/architect/archival.go
+
+// ArchivePlanOnApproval submits approved plan to Archivalist
+func (a *ArchitectAgent) ArchivePlanOnApproval(ctx *PlanContext) error {
+    if ctx.State != PlanStateApproved {
+        return fmt.Errorf("can only archive approved plans")
+    }
+
+    entry := &archivalist.Entry{
+        Category:  "approved_plans",
+        SessionID: ctx.SessionID,
+        Content:   formatPlanForArchival(ctx.CurrentPlan),
+        Metadata: map[string]any{
+            "plan_id":      ctx.CurrentPlan.ID,
+            "title":        ctx.CurrentPlan.Title,
+            "step_count":   len(ctx.CurrentPlan.Steps),
+            "files_count":  len(ctx.CurrentPlan.FilesToModify),
+            "created_by":   ctx.CurrentPlan.CreatedBy,
+            "approved_at":  time.Now(),
+            "layers":       countLayers(ctx.CurrentPlan.Steps),
+            "tags":         extractPlanTags(ctx.CurrentPlan),
+        },
+    }
+
+    return a.archivalist.Store(entry)
+}
+
+func formatPlanForArchival(plan *Plan) string {
+    // Include full plan markdown for searchability
+    return formatPlanMarkdown(plan)
+}
+
+func countLayers(steps []PlanStep) int {
+    maxLayer := 0
+    for _, s := range steps {
+        if s.Layer > maxLayer {
+            maxLayer = s.Layer
+        }
+    }
+    return maxLayer + 1
+}
+
+func extractPlanTags(plan *Plan) []string {
+    tags := []string{}
+    // Extract tags from file paths (e.g., "auth", "api", "tests")
+    for _, f := range plan.FilesToModify {
+        dir := filepath.Dir(f.Path)
+        if dir != "." && dir != "/" {
+            tags = append(tags, filepath.Base(dir))
+        }
+    }
+    // Deduplicate
+    return uniqueStrings(tags)
+}
+```
+
+#### Archive on Completion (Success or Failure)
+
+```go
+// ArchivePlanOutcome records final plan outcome for future learning
+func (a *ArchitectAgent) ArchivePlanOutcome(ctx *PlanContext) error {
+    if ctx.State != PlanStateCompleted && ctx.State != PlanStateFailed {
+        return fmt.Errorf("can only archive completed/failed plans")
+    }
+
+    outcome := "success"
+    if ctx.State == PlanStateFailed {
+        outcome = "failure"
+    }
+
+    // Compute execution statistics
+    stats := computeExecutionStats(ctx)
+
+    entry := &archivalist.Entry{
+        Category:  "plan_outcomes",
+        SessionID: ctx.SessionID,
+        Content:   formatOutcomeForArchival(ctx, stats),
+        Metadata: map[string]any{
+            "plan_id":           ctx.CurrentPlan.ID,
+            "title":             ctx.CurrentPlan.Title,
+            "outcome":           outcome,
+            "completed_steps":   stats.CompletedSteps,
+            "failed_steps":      stats.FailedSteps,
+            "skipped_steps":     stats.SkippedSteps,
+            "total_steps":       stats.TotalSteps,
+            "duration_seconds":  stats.Duration.Seconds(),
+            "failure_reason":    ctx.ExecutionState.FailureReason,
+            "completed_at":      time.Now(),
+        },
+    }
+
+    return a.archivalist.Store(entry)
+}
+
+type ExecutionStats struct {
+    CompletedSteps int
+    FailedSteps    int
+    SkippedSteps   int
+    TotalSteps     int
+    Duration       time.Duration
+}
+
+func computeExecutionStats(ctx *PlanContext) ExecutionStats {
+    stats := ExecutionStats{TotalSteps: len(ctx.CurrentPlan.Steps)}
+
+    for _, step := range ctx.CurrentPlan.Steps {
+        switch step.Status {
+        case StepStatusCompleted:
+            stats.CompletedSteps++
+        case StepStatusFailed:
+            stats.FailedSteps++
+        case StepStatusSkipped:
+            stats.SkippedSteps++
+        }
+    }
+
+    if ctx.ExecutionState != nil && !ctx.ExecutionState.StartedAt.IsZero() {
+        stats.Duration = time.Since(ctx.ExecutionState.StartedAt)
+    }
+
+    return stats
+}
+
+func formatOutcomeForArchival(ctx *PlanContext, stats ExecutionStats) string {
+    var sb strings.Builder
+
+    sb.WriteString(fmt.Sprintf("# Plan Outcome: %s\n\n", ctx.CurrentPlan.Title))
+    sb.WriteString(fmt.Sprintf("**Result**: %s\n\n", ctx.State))
+    sb.WriteString(fmt.Sprintf("**Statistics**:\n"))
+    sb.WriteString(fmt.Sprintf("- Completed: %d/%d steps\n", stats.CompletedSteps, stats.TotalSteps))
+    sb.WriteString(fmt.Sprintf("- Failed: %d steps\n", stats.FailedSteps))
+    sb.WriteString(fmt.Sprintf("- Skipped: %d steps\n", stats.SkippedSteps))
+    sb.WriteString(fmt.Sprintf("- Duration: %s\n\n", stats.Duration))
+
+    if ctx.State == PlanStateFailed && ctx.ExecutionState != nil {
+        sb.WriteString(fmt.Sprintf("**Failure Reason**: %s\n\n", ctx.ExecutionState.FailureReason))
+        if ctx.ExecutionState.FailedStep != nil {
+            failedIdx := *ctx.ExecutionState.FailedStep
+            for _, step := range ctx.CurrentPlan.Steps {
+                if step.Index == failedIdx {
+                    sb.WriteString(fmt.Sprintf("**Failed Step**: %d - %s\n\n", step.Index, step.Description))
+                    break
+                }
+            }
+        }
+    }
+
+    sb.WriteString("## Full Plan\n\n")
+    sb.WriteString(formatPlanMarkdown(ctx.CurrentPlan))
+
+    return sb.String()
+}
+```
+
+### Failure Handling and Plan File Updates
+
+When a step fails, the plan file is updated to clearly indicate the failure:
+
+#### Failure Status Indicators
+
+| Status | Checkbox | Icon | Meaning |
+|--------|----------|------|---------|
+| pending | `[ ]` | ○ | Not started |
+| in_progress | `[~]` | ► | Currently executing |
+| completed | `[x]` | ✓ | Successfully done |
+| failed | `[!]` | ✗ | Execution failed |
+| skipped | `[-]` | ⊘ | Skipped (dependency failed) |
+
+#### Example: Plan File with Failed Step
+
+```markdown
+**Progress: 2/6 steps completed**
+
+```
+Execution Flow:
+┌─ Layer 0 (parallel: 2 tasks) [DONE] ─┐
+│  ✓ Step 1: [engineer]                │
+│  ✓ Step 2: [engineer]                │
+└────────────────────────────────────────┘
+    │
+    ▼
+┌─ Layer 1 (parallel: 2 tasks) [FAILED] ─┐
+│  ✗ Step 3: [engineer]                  │
+│  ⊘ Step 4: [engineer]                  │
+└────────────────────────────────────────┘
+    │
+    ▼
+┌─ Layer 2 [PENDING] ─┐
+│  ○ Step 5: [engineer]                  │
+└────────────────────────────────────────┘
+```
+
+### Sequential Step Reference
+
+[x] 1. [Layer 0] [engineer] Create JWT token utilities
+[x] 2. [Layer 0] [engineer] Create auth middleware
+[!] 3. [Layer 1] [engineer] Create login handler - **FAILED: compilation error in auth.go:45**
+[-] 4. [Layer 1] [engineer] Create logout handler - *skipped due to step 3 failure*
+[ ] 5. [Layer 2] [engineer] Update routes
+[ ] 6. [Layer 3] [tester] Write tests
+```
+
+#### Failure Recovery
+
+When a step fails, the Architect can:
+1. **Retry**: Reset step status to `pending` and re-execute
+2. **Skip**: Mark step as `skipped` and continue with independent steps
+3. **Abort**: Mark plan as `failed` and archive outcome
+
+```go
+// agents/architect/recovery.go
+
+func (a *ArchitectAgent) HandleStepFailure(ctx *PlanContext, failedStep int, err error) error {
+    // Update step status
+    updateStepStatus(ctx.CurrentPlan, failedStep, StepStatusFailed)
+
+    // Mark dependent steps as skipped
+    for i := range ctx.CurrentPlan.Steps {
+        step := &ctx.CurrentPlan.Steps[i]
+        if containsInt(step.DependsOn, failedStep) {
+            step.Status = StepStatusSkipped
+        }
+    }
+
+    // Add failure reason to execution state
+    if ctx.ExecutionState == nil {
+        ctx.ExecutionState = &ExecutionState{}
+    }
+    ctx.ExecutionState.FailedStep = &failedStep
+    ctx.ExecutionState.FailureReason = err.Error()
+
+    // Persist updated plan file
+    return a.storage.SaveContext(ctx)
+}
+```
+
+### Agent Plan Mode Integration
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        AGENT PLAN MODE COMPATIBILITY                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ PRIMARY PLAN MODE USERS (Create and manage plans)                           │   │
+│  ├─────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                             │   │
+│  │  ARCHITECT                                                                  │   │
+│  │  ├── Role: Plan Mode Owner                                                  │   │
+│  │  ├── Skills: enter_plan_mode, exit_plan_mode, update_plan_file              │   │
+│  │  ├── Actions:                                                               │   │
+│  │  │   • Enters plan mode for non-trivial tasks                               │   │
+│  │  │   • Consults knowledge agents during exploration                         │   │
+│  │  │   • Writes structured implementation plans                               │   │
+│  │  │   • Requests user approval                                               │   │
+│  │  │   • Hands approved plans to Orchestrator                                 │   │
+│  │  └── State transitions: IDLE → EXPLORING → DRAFTING → AWAITING_APPROVAL    │   │
+│  │                                                                             │   │
+│  │  TESTER                                                                     │   │
+│  │  ├── Role: Test Plan Mode                                                   │   │
+│  │  ├── Skills: enter_test_plan_mode, exit_test_plan_mode                      │   │
+│  │  ├── Actions:                                                               │   │
+│  │  │   • Creates test strategy plans                                          │   │
+│  │  │   • Defines coverage targets and edge cases                              │   │
+│  │  │   • Gets approval before test execution                                  │   │
+│  │  └── Uses same state machine, different plan type                           │   │
+│  │                                                                             │   │
+│  │  DESIGNER                                                                   │   │
+│  │  ├── Role: Design Plan Mode                                                 │   │
+│  │  ├── Skills: enter_design_plan_mode, exit_design_plan_mode                  │   │
+│  │  ├── Actions:                                                               │   │
+│  │  │   • Creates design system change plans                                   │   │
+│  │  │   • Component architecture proposals                                     │   │
+│  │  │   • Visual/UX decision documentation                                     │   │
+│  │  └── Uses same state machine, design-focused content                        │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ PLAN MODE EXECUTORS (Receive and execute approved plans)                    │   │
+│  ├─────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                             │   │
+│  │  ORCHESTRATOR                                                               │   │
+│  │  ├── Role: Plan-to-DAG Converter                                            │   │
+│  │  ├── Receives: Approved Plan from Architect                                 │   │
+│  │  ├── Actions:                                                               │   │
+│  │  │   • Converts PlanStep[] → DAG nodes                                      │   │
+│  │  │   • Respects step dependencies                                           │   │
+│  │  │   • Dispatches to Engineers                                              │   │
+│  │  │   • Reports progress to Architect                                        │   │
+│  │  └── Never creates plans, only executes                                     │   │
+│  │                                                                             │   │
+│  │  ENGINEER                                                                   │   │
+│  │  ├── Role: Step Executor                                                    │   │
+│  │  ├── Receives: Single step from Orchestrator                                │   │
+│  │  ├── Actions:                                                               │   │
+│  │  │   • Has read-only access to full plan for context                        │   │
+│  │  │   • Executes assigned step                                               │   │
+│  │  │   • Reports completion/failure                                           │   │
+│  │  │   • Clarification requests bubble up through Orchestrator                │   │
+│  │  └── No plan mode skills, just execution                                    │   │
+│  │                                                                             │   │
+│  │  INSPECTOR                                                                  │   │
+│  │  ├── Role: Plan Compliance Validator                                        │   │
+│  │  ├── Receives: Completed work for validation                                │   │
+│  │  ├── Actions:                                                               │   │
+│  │  │   • Validates implementation matches plan intent                         │   │
+│  │  │   • Flags deviations: "Plan said X, implementation does Y"               │   │
+│  │  │   • May trigger re-planning for significant issues                       │   │
+│  │  └── Read-only plan access                                                  │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ PLAN MODE CONSULTANTS (Inform planning decisions)                           │   │
+│  ├─────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                             │   │
+│  │  LIBRARIAN                                                                  │   │
+│  │  ├── Role: Codebase Context Provider                                        │   │
+│  │  ├── Consulted during: EXPLORING phase                                      │   │
+│  │  ├── Provides:                                                              │   │
+│  │  │   • Existing patterns for similar functionality                          │   │
+│  │  │   • Code structure and conventions                                       │   │
+│  │  │   • Dependency information                                               │   │
+│  │  └── Query-response only, no plan skills                                    │   │
+│  │                                                                             │   │
+│  │  ARCHIVALIST                                                                │   │
+│  │  ├── Role: Historical Context Provider                                      │   │
+│  │  ├── Consulted during: EXPLORING phase                                      │   │
+│  │  ├── Provides:                                                              │   │
+│  │  │   • Past attempts at similar tasks                                       │   │
+│  │  │   • Previous failures and their causes                                   │   │
+│  │  │   • Successful approaches for similar problems                           │   │
+│  │  ├── Also:                                                                  │   │
+│  │  │   • Stores completed plans for future reference                          │   │
+│  │  │   • Records plan outcomes (success/failure)                              │   │
+│  │  └── Query-response + storage, no plan skills                               │   │
+│  │                                                                             │   │
+│  │  ACADEMIC                                                                   │   │
+│  │  ├── Role: External Knowledge Provider                                      │   │
+│  │  ├── Consulted during: EXPLORING phase                                      │   │
+│  │  ├── Provides:                                                              │   │
+│  │  │   • Best practices from external sources                                 │   │
+│  │  │   • Security considerations                                              │   │
+│  │  │   • Performance implications                                             │   │
+│  │  └── Query-response only, no plan skills                                    │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ PLAN MODE INFRASTRUCTURE (Routing and state management)                     │   │
+│  ├─────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                             │   │
+│  │  GUIDE                                                                      │   │
+│  │  ├── Role: Plan State Router                                                │   │
+│  │  ├── Responsibilities:                                                      │   │
+│  │  │   • Tracks plan state per session                                        │   │
+│  │  │   • Routes plan-related messages                                         │   │
+│  │  │   • Blocks non-plan actions during AWAITING_APPROVAL                     │   │
+│  │  │   • Notifies user of plan state changes                                  │   │
+│  │  ├── Message types:                                                         │   │
+│  │  │   • PLAN_ENTER, PLAN_EXIT                                                │   │
+│  │  │   • PLAN_APPROVAL_REQUEST, PLAN_APPROVED, PLAN_REJECTED                  │   │
+│  │  │   • PLAN_MODIFIED, PLAN_EXECUTION_UPDATE                                 │   │
+│  │  └── No plan skills, routing infrastructure only                            │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Plan Mode Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           COMPLETE PLAN MODE FLOW                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  USER REQUEST                                                                       │
+│       │                                                                             │
+│       │ "Add user authentication with OAuth"                                        │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  GUIDE: Intent Classification                                               │   │
+│  │  ├── Complexity: HIGH (multiple files, architectural decision)              │   │
+│  │  ├── Route to: ARCHITECT                                                    │   │
+│  │  └── Recommendation: PLAN_MODE                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  ARCHITECT: enter_plan_mode                                                 │   │
+│  │  State: IDLE → EXPLORING                                                    │   │
+│  │  Creates: .sylk/plans/{session_id}/                                         │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       │ Consultation Phase                                                          │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  EXPLORING PHASE                                                            │   │
+│  │                                                                             │   │
+│  │  Architect → Guide → Librarian:                                             │   │
+│  │    Q: "What authentication patterns exist in this codebase?"                │   │
+│  │    A: "Found JWT middleware in pkg/auth/jwt.go, session store in            │   │
+│  │        pkg/session/store.go. No OAuth implementation exists."               │   │
+│  │                                                                             │   │
+│  │  Architect → Guide → Archivalist:                                           │   │
+│  │    Q: "Any past OAuth implementations or attempts?"                         │   │
+│  │    A: "Session sess-abc attempted OAuth 3 months ago, abandoned due to      │   │
+│  │        callback URL issues. Recommendation: use established library."       │   │
+│  │                                                                             │   │
+│  │  Architect → Guide → Academic:                                              │   │
+│  │    Q: "Best practices for Go OAuth2 implementation?"                        │   │
+│  │    A: "Recommended: golang.org/x/oauth2 package. Security considerations:   │   │
+│  │        state parameter, PKCE for public clients, secure token storage."     │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       │ State: EXPLORING → DRAFTING                                                 │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  DRAFTING PHASE                                                             │   │
+│  │                                                                             │   │
+│  │  Architect writes to .sylk/plans/{session}/current_plan.md:                 │   │
+│  │                                                                             │   │
+│  │  ┌───────────────────────────────────────────────────────────────────────┐  │   │
+│  │  │ # Plan: Add OAuth Authentication                                     │  │   │
+│  │  │                                                                       │  │   │
+│  │  │ ## Overview                                                           │  │   │
+│  │  │ Implement OAuth 2.0 authentication using golang.org/x/oauth2         │  │   │
+│  │  │ with Google as the initial provider. Integrate with existing          │  │   │
+│  │  │ session management in pkg/session/.                                   │  │   │
+│  │  │                                                                       │  │   │
+│  │  │ ## Files to Modify                                                    │  │   │
+│  │  │ - `pkg/auth/oauth.go` (create): OAuth provider configuration          │  │   │
+│  │  │ - `pkg/auth/callback.go` (create): Callback handler                   │  │   │
+│  │  │ - `pkg/auth/middleware.go` (modify): Add OAuth token validation       │  │   │
+│  │  │ - `cmd/server/routes.go` (modify): Add OAuth routes                   │  │   │
+│  │  │ - `config/config.go` (modify): Add OAuth config fields                │  │   │
+│  │  │                                                                       │  │   │
+│  │  │ ## Implementation Steps                                               │  │   │
+│  │  │ 1. [Engineer] Add OAuth config fields to config struct               │  │   │
+│  │  │ 2. [Engineer] Create OAuth provider setup in pkg/auth/oauth.go       │  │   │
+│  │  │ 3. [Engineer] Implement callback handler (depends on: 1, 2)          │  │   │
+│  │  │ 4. [Engineer] Update middleware for OAuth tokens (depends on: 2)     │  │   │
+│  │  │ 5. [Engineer] Add routes to server (depends on: 3, 4)                │  │   │
+│  │  │ 6. [Tester] Write integration tests (depends on: 5)                  │  │   │
+│  │  │ 7. [Inspector] Security audit (depends on: 5)                        │  │   │
+│  │  │                                                                       │  │   │
+│  │  │ ## Considerations                                                     │  │   │
+│  │  │ - State parameter required for CSRF protection                       │  │   │
+│  │  │ - Token refresh needs background goroutine                           │  │   │
+│  │  │ - Consider PKCE for mobile/SPA clients in future                     │  │   │
+│  │  │                                                                       │  │   │
+│  │  │ ## Required Permissions                                               │  │   │
+│  │  │ - Bash: run tests                                                     │  │   │
+│  │  │ - Bash: install dependencies                                          │  │   │
+│  │  └───────────────────────────────────────────────────────────────────────┘  │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       │ exit_plan_mode                                                              │
+│       │ State: DRAFTING → AWAITING_APPROVAL                                         │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  USER APPROVAL                                                              │   │
+│  │                                                                             │   │
+│  │  Guide displays plan to user with options:                                  │   │
+│  │  ├── [Approve] - Proceed with execution                                     │   │
+│  │  ├── [Modify] - Request changes to plan                                     │   │
+│  │  └── [Reject] - Cancel and return to IDLE                                   │   │
+│  │                                                                             │   │
+│  │  BLOCKING: No other actions allowed until user responds                     │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       │ User: "Approve"                                                             │
+│       │ State: AWAITING_APPROVAL → APPROVED                                         │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  ARCHITECT → ORCHESTRATOR: Dispatch Plan                                    │   │
+│  │                                                                             │   │
+│  │  Message: {                                                                 │   │
+│  │    type: "PLAN_DISPATCH",                                                   │   │
+│  │    plan_id: "plan-123",                                                     │   │
+│  │    session_id: "sess-456",                                                  │   │
+│  │    steps: [...],                                                            │   │
+│  │    allowed_prompts: [...]                                                   │   │
+│  │  }                                                                          │   │
+│  │                                                                             │   │
+│  │  State: APPROVED → EXECUTING                                                │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  ORCHESTRATOR: DAG Execution                                                │   │
+│  │                                                                             │   │
+│  │  Converts steps to DAG:                                                     │   │
+│  │                                                                             │   │
+│  │       [Step 1]──┬──[Step 2]──┬──[Step 3]                                    │   │
+│  │                 │            │                                              │   │
+│  │                 │            └──[Step 4]──┬──[Step 5]──[Step 6]             │   │
+│  │                 │                         │            │                    │   │
+│  │                 └─────────────────────────┘            └──[Step 7]          │   │
+│  │                                                                             │   │
+│  │  Dispatches to Engineers (parallel where possible)                          │   │
+│  │  Updates todo list as steps complete                                        │   │
+│  │  Reports progress to Architect                                              │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       │ All steps complete                                                          │
+│       │ State: EXECUTING → COMPLETED                                                │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  COMPLETION                                                                 │   │
+│  │                                                                             │   │
+│  │  Architect → User: "OAuth authentication implementation complete.          │   │
+│  │                     All 7 steps executed successfully."                     │   │
+│  │                                                                             │   │
+│  │  Archivalist: Store plan outcome for future reference                       │   │
+│  │                                                                             │   │
+│  │  State: COMPLETED → IDLE (ready for next task)                              │   │
+│  │                                                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Plan Mode Skills Implementation
+
+```go
+// agents/architect/skills_plan.go
+
+package architect
+
+import (
+    "context"
+    "encoding/json"
+    "time"
+
+    "github.com/adalundhe/sylk/core/plan"
+    "github.com/adalundhe/sylk/core/skills"
+)
+
+// Plan mode skills for Architect agent
+
+func (a *Architect) registerPlanModeSkills() {
+    a.skills.Register(enterPlanModeSkill(a))
+    a.skills.Register(exitPlanModeSkill(a))
+    a.skills.Register(updatePlanFileSkill(a))
+    a.skills.Register(todoWriteSkill(a))
+    a.skills.Register(askUserQuestionSkill(a))
+}
+
+func enterPlanModeSkill(a *Architect) *skills.Skill {
+    return skills.NewSkill("enter_plan_mode").
+        Description("Enter plan mode for complex tasks requiring user approval before implementation").
+        Domain("planning").
+        Keywords("plan", "complex", "design", "architecture", "multi-step").
+        StringParam("task_description", "Description of the task to plan", true).
+        StringParam("plan_file", "Optional custom path for plan file", false).
+        Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+            var params struct {
+                TaskDescription string `json:"task_description"`
+                PlanFile        string `json:"plan_file"`
+            }
+            if err := json.Unmarshal(input, &params); err != nil {
+                return nil, err
+            }
+
+            // Get session from context
+            sessionID := ctx.Value("session_id").(string)
+
+            // Initialize plan context
+            planCtx := &plan.PlanContext{
+                SessionID: sessionID,
+                State:     plan.PlanStateExploring,
+                CurrentPlan: &plan.Plan{
+                    ID:        generatePlanID(),
+                    Title:     params.TaskDescription,
+                    Version:   1,
+                    CreatedAt: time.Now(),
+                    CreatedBy: "architect",
+                },
+                CreatedAt: time.Now(),
+                UpdatedAt: time.Now(),
+            }
+
+            // Persist plan context
+            if err := a.planStorage.SaveContext(planCtx); err != nil {
+                return nil, err
+            }
+
+            // Update session state
+            a.sessionState.SetPlanContext(sessionID, planCtx)
+
+            return map[string]any{
+                "status":     "entered_plan_mode",
+                "session_id": sessionID,
+                "plan_id":    planCtx.CurrentPlan.ID,
+                "state":      planCtx.State,
+                "message":    "Now in exploration phase. Query Librarian, Archivalist, and Academic for context.",
+            }, nil
+        }).
+        Build()
+}
+
+func exitPlanModeSkill(a *Architect) *skills.Skill {
+    return skills.NewSkill("exit_plan_mode").
+        Description("Exit plan mode and request user approval for the current plan").
+        Domain("planning").
+        Keywords("approve", "ready", "proceed", "submit").
+        ArrayParam("allowed_prompts", "Bash permissions needed for execution", false).
+        Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+            var params struct {
+                AllowedPrompts []plan.AllowedPrompt `json:"allowed_prompts"`
+            }
+            json.Unmarshal(input, &params) // Optional params
+
+            sessionID := ctx.Value("session_id").(string)
+
+            // Get current plan context
+            planCtx, err := a.planStorage.LoadContext(sessionID)
+            if err != nil {
+                return nil, err
+            }
+
+            if planCtx.State != plan.PlanStateDrafting && planCtx.State != plan.PlanStateExploring {
+                return nil, fmt.Errorf("cannot exit plan mode from state: %s", planCtx.State)
+            }
+
+            // Update allowed prompts
+            if len(params.AllowedPrompts) > 0 {
+                planCtx.CurrentPlan.AllowedPrompts = params.AllowedPrompts
+            }
+
+            // Transition to awaiting approval
+            planCtx.State = plan.PlanStateAwaitingApproval
+            planCtx.UpdatedAt = time.Now()
+
+            if err := a.planStorage.SaveContext(planCtx); err != nil {
+                return nil, err
+            }
+
+            // Send approval request through Guide
+            a.sendPlanApprovalRequest(sessionID, planCtx.CurrentPlan)
+
+            return map[string]any{
+                "status":  "awaiting_approval",
+                "plan_id": planCtx.CurrentPlan.ID,
+                "message": "Plan submitted for user approval. Waiting for response.",
+            }, nil
+        }).
+        Build()
+}
+
+func updatePlanFileSkill(a *Architect) *skills.Skill {
+    return skills.NewSkill("update_plan_file").
+        Description("Update the current plan with new content").
+        Domain("planning").
+        Keywords("update", "revise", "modify", "plan").
+        StringParam("overview", "Plan overview/summary", false).
+        ArrayParam("files_to_modify", "Files that will be changed", false).
+        ArrayParam("steps", "Implementation steps", false).
+        ArrayParam("considerations", "Trade-offs and risks", false).
+        Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+            var params struct {
+                Overview       string            `json:"overview"`
+                FilesToModify  []plan.FileChange `json:"files_to_modify"`
+                Steps          []plan.PlanStep   `json:"steps"`
+                Considerations []string          `json:"considerations"`
+            }
+            if err := json.Unmarshal(input, &params); err != nil {
+                return nil, err
+            }
+
+            sessionID := ctx.Value("session_id").(string)
+            planCtx, err := a.planStorage.LoadContext(sessionID)
+            if err != nil {
+                return nil, err
+            }
+
+            // Update plan fields if provided
+            if params.Overview != "" {
+                planCtx.CurrentPlan.Overview = params.Overview
+            }
+            if len(params.FilesToModify) > 0 {
+                planCtx.CurrentPlan.FilesToModify = params.FilesToModify
+            }
+            if len(params.Steps) > 0 {
+                planCtx.CurrentPlan.Steps = params.Steps
+            }
+            if len(params.Considerations) > 0 {
+                planCtx.CurrentPlan.Considerations = params.Considerations
+            }
+
+            // Move to drafting if still exploring
+            if planCtx.State == plan.PlanStateExploring {
+                planCtx.State = plan.PlanStateDrafting
+            }
+
+            planCtx.UpdatedAt = time.Now()
+
+            if err := a.planStorage.SaveContext(planCtx); err != nil {
+                return nil, err
+            }
+
+            return map[string]any{
+                "status":  "plan_updated",
+                "plan_id": planCtx.CurrentPlan.ID,
+                "state":   planCtx.State,
+            }, nil
+        }).
+        Build()
+}
+
+func todoWriteSkill(a *Architect) *skills.Skill {
+    return skills.NewSkill("todo_write").
+        Description("Manage task todo list for tracking progress").
+        Domain("tracking").
+        Keywords("todo", "task", "track", "progress").
+        ArrayParam("todos", "Array of {content, status, activeForm}", true).
+        Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+            var params struct {
+                Todos []plan.TodoItem `json:"todos"`
+            }
+            if err := json.Unmarshal(input, &params); err != nil {
+                return nil, err
+            }
+
+            sessionID := ctx.Value("session_id").(string)
+            planCtx, err := a.planStorage.LoadContext(sessionID)
+            if err != nil {
+                return nil, err
+            }
+
+            planCtx.Todos = params.Todos
+            planCtx.UpdatedAt = time.Now()
+
+            if err := a.planStorage.SaveContext(planCtx); err != nil {
+                return nil, err
+            }
+
+            return map[string]any{
+                "status":      "todos_updated",
+                "todo_count":  len(params.Todos),
+                "in_progress": countByStatus(params.Todos, plan.TodoStatusInProgress),
+                "completed":   countByStatus(params.Todos, plan.TodoStatusCompleted),
+            }, nil
+        }).
+        Build()
+}
+
+func askUserQuestionSkill(a *Architect) *skills.Skill {
+    return skills.NewSkill("ask_user_question").
+        Description("Ask user for clarification or decision during planning").
+        Domain("coordination").
+        Keywords("ask", "clarify", "question", "decide").
+        ArrayParam("questions", "Questions with options to present", true).
+        Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+            var params struct {
+                Questions []UserQuestion `json:"questions"`
+            }
+            if err := json.Unmarshal(input, &params); err != nil {
+                return nil, err
+            }
+
+            sessionID := ctx.Value("session_id").(string)
+
+            // Send questions to user through Guide
+            responseID := a.sendUserQuestions(sessionID, params.Questions)
+
+            return map[string]any{
+                "status":      "questions_sent",
+                "response_id": responseID,
+                "message":     "Waiting for user response to continue planning.",
+            }, nil
+        }).
+        Build()
+}
+
+// Helper types
+
+type UserQuestion struct {
+    Question    string           `json:"question"`
+    Header      string           `json:"header"`
+    Options     []QuestionOption `json:"options"`
+    MultiSelect bool             `json:"multi_select"`
+}
+
+type QuestionOption struct {
+    Label       string `json:"label"`
+    Description string `json:"description"`
+}
+
+func countByStatus(todos []plan.TodoItem, status plan.TodoStatus) int {
+    count := 0
+    for _, t := range todos {
+        if t.Status == status {
+            count++
+        }
+    }
+    return count
+}
+```
+
+### Guide Plan Mode Routing
+
+```go
+// agents/guide/plan_routing.go
+
+package guide
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/adalundhe/sylk/core/plan"
+)
+
+// Plan mode message types
+const (
+    MessageTypePlanEnter           MessageType = "plan_enter"
+    MessageTypePlanExit            MessageType = "plan_exit"
+    MessageTypePlanApprovalRequest MessageType = "plan_approval_request"
+    MessageTypePlanApproved        MessageType = "plan_approved"
+    MessageTypePlanRejected        MessageType = "plan_rejected"
+    MessageTypePlanModified        MessageType = "plan_modified"
+    MessageTypePlanDispatch        MessageType = "plan_dispatch"
+    MessageTypePlanProgress        MessageType = "plan_progress"
+    MessageTypePlanCompleted       MessageType = "plan_completed"
+    MessageTypePlanFailed          MessageType = "plan_failed"
+)
+
+// PlanStateTracker manages plan state per session
+type PlanStateTracker struct {
+    storage *plan.Storage
+    states  map[string]plan.PlanState // sessionID -> state
+}
+
+func NewPlanStateTracker(storage *plan.Storage) *PlanStateTracker {
+    return &PlanStateTracker{
+        storage: storage,
+        states:  make(map[string]plan.PlanState),
+    }
+}
+
+// GetState returns the current plan state for a session
+func (t *PlanStateTracker) GetState(sessionID string) plan.PlanState {
+    if state, ok := t.states[sessionID]; ok {
+        return state
+    }
+
+    // Load from storage
+    ctx, err := t.storage.LoadContext(sessionID)
+    if err != nil {
+        return plan.PlanStateIdle
+    }
+
+    t.states[sessionID] = ctx.State
+    return ctx.State
+}
+
+// SetState updates the plan state for a session
+func (t *PlanStateTracker) SetState(sessionID string, state plan.PlanState) {
+    t.states[sessionID] = state
+}
+
+// IsBlocking returns true if plan mode blocks other operations
+func (t *PlanStateTracker) IsBlocking(sessionID string) bool {
+    state := t.GetState(sessionID)
+    return state == plan.PlanStateAwaitingApproval
+}
+
+// CanRoute checks if a message can be routed given plan state
+func (t *PlanStateTracker) CanRoute(sessionID string, msgType MessageType) error {
+    state := t.GetState(sessionID)
+
+    // Allow plan-related messages always
+    if isPlanMessage(msgType) {
+        return nil
+    }
+
+    // Block non-plan messages during approval wait
+    if state == plan.PlanStateAwaitingApproval {
+        return fmt.Errorf("awaiting plan approval - respond to plan before continuing")
+    }
+
+    return nil
+}
+
+func isPlanMessage(msgType MessageType) bool {
+    switch msgType {
+    case MessageTypePlanEnter,
+        MessageTypePlanExit,
+        MessageTypePlanApprovalRequest,
+        MessageTypePlanApproved,
+        MessageTypePlanRejected,
+        MessageTypePlanModified,
+        MessageTypePlanDispatch,
+        MessageTypePlanProgress,
+        MessageTypePlanCompleted,
+        MessageTypePlanFailed:
+        return true
+    }
+    return false
+}
+
+// HandlePlanApproval processes user response to plan approval request
+func (g *Guide) HandlePlanApproval(ctx context.Context, sessionID string, approved bool, modifications string) error {
+    planCtx, err := g.planStorage.LoadContext(sessionID)
+    if err != nil {
+        return err
+    }
+
+    if planCtx.State != plan.PlanStateAwaitingApproval {
+        return fmt.Errorf("not awaiting approval, current state: %s", planCtx.State)
+    }
+
+    if approved {
+        // Transition to approved
+        planCtx.State = plan.PlanStateApproved
+
+        if err := g.planStorage.SaveContext(planCtx); err != nil {
+            return err
+        }
+
+        // Notify Architect to dispatch to Orchestrator
+        msg := NewMessage(MessageTypePlanApproved, map[string]any{
+            "session_id": sessionID,
+            "plan_id":    planCtx.CurrentPlan.ID,
+        })
+        g.bus.Publish(TopicArchitect, msg)
+
+        g.planTracker.SetState(sessionID, plan.PlanStateApproved)
+
+    } else if modifications != "" {
+        // User wants modifications
+        planCtx.State = plan.PlanStateExploring // Back to exploration
+
+        // Save current as version
+        if err := g.planStorage.SavePlanVersion(sessionID, planCtx.CurrentPlan, "user_modification_request"); err != nil {
+            return err
+        }
+
+        planCtx.CurrentPlan.Version++
+
+        if err := g.planStorage.SaveContext(planCtx); err != nil {
+            return err
+        }
+
+        // Notify Architect of modification request
+        msg := NewMessage(MessageTypePlanModified, map[string]any{
+            "session_id":    sessionID,
+            "plan_id":       planCtx.CurrentPlan.ID,
+            "modifications": modifications,
+        })
+        g.bus.Publish(TopicArchitect, msg)
+
+        g.planTracker.SetState(sessionID, plan.PlanStateExploring)
+
+    } else {
+        // Rejected entirely
+        planCtx.State = plan.PlanStateIdle
+
+        if err := g.planStorage.SaveContext(planCtx); err != nil {
+            return err
+        }
+
+        msg := NewMessage(MessageTypePlanRejected, map[string]any{
+            "session_id": sessionID,
+            "plan_id":    planCtx.CurrentPlan.ID,
+        })
+        g.bus.Publish(TopicArchitect, msg)
+
+        g.planTracker.SetState(sessionID, plan.PlanStateIdle)
+    }
+
+    return nil
+}
+```
+
+### Integration with Session Management
+
+```go
+// core/session/plan_integration.go
+
+package session
+
+import (
+    "github.com/adalundhe/sylk/core/plan"
+)
+
+// SessionPlanIntegration adds plan context to sessions
+type SessionPlanIntegration struct {
+    storage *plan.Storage
+}
+
+// InitPlanContext initializes plan context for a new session
+func (s *SessionPlanIntegration) InitPlanContext(sessionID string, projectRoot string) error {
+    storage := plan.NewStorage(projectRoot)
+    return storage.EnsureDir(sessionID)
+}
+
+// GetPlanContext retrieves plan context for a session
+func (s *SessionPlanIntegration) GetPlanContext(sessionID string) (*plan.PlanContext, error) {
+    return s.storage.LoadContext(sessionID)
+}
+
+// CleanupPlanContext removes plan data for a session (optional)
+func (s *SessionPlanIntegration) CleanupPlanContext(sessionID string, keepHistory bool) error {
+    if keepHistory {
+        // Archive to Archivalist before cleanup
+        return s.archivePlanHistory(sessionID)
+    }
+    // Remove plan directory
+    return s.storage.RemoveSession(sessionID)
+}
+
+func (s *SessionPlanIntegration) archivePlanHistory(sessionID string) error {
+    ctx, err := s.storage.LoadContext(sessionID)
+    if err != nil {
+        return err
+    }
+
+    // Store plan and outcome in Archivalist for cross-session learning
+    // Implementation depends on Archivalist API
+    return nil
+}
+```
+
+### Plan Mode Skill Definitions (SKILL.md Format)
+
+```
+agents/architect/skillfiles/
+├── enter-plan-mode/
+│   └── SKILL.md
+├── exit-plan-mode/
+│   └── SKILL.md
+├── update-plan-file/
+│   └── SKILL.md
+├── todo-write/
+│   └── SKILL.md
+└── ask-user-question/
+    └── SKILL.md
+```
+
+**agents/architect/skillfiles/enter-plan-mode/SKILL.md:**
+
+```markdown
+---
+name: enter-plan-mode
+description: Enter plan mode for complex tasks requiring user approval. Use when task involves multiple files, architectural decisions, or unclear requirements.
+---
+
+# Enter Plan Mode
+
+## When to Use
+- New feature implementation (non-trivial)
+- Multiple valid approaches exist
+- Architectural decisions required
+- Multi-file changes expected (>3 files)
+- Unclear requirements need exploration
+
+## When NOT to Use
+- Single-line fixes or typos
+- Adding comments or documentation
+- Simple bug fixes with obvious solution
+- User gave very specific instructions
+
+## Parameters
+- `task_description` (required): Clear description of what needs to be planned
+- `plan_file` (optional): Custom path for plan file
+
+## Workflow After Entering
+1. Query Librarian for existing patterns
+2. Query Archivalist for past attempts
+3. Query Academic for best practices
+4. Draft plan with update_plan_file
+5. Exit with exit_plan_mode for approval
+
+## Example
+```json
+{
+  "task_description": "Add OAuth authentication with Google provider"
+}
+```
+```
+
+**agents/architect/skillfiles/exit-plan-mode/SKILL.md:**
+
+```markdown
+---
+name: exit-plan-mode
+description: Exit plan mode and request user approval. Call after plan is complete and ready for review.
+---
+
+# Exit Plan Mode
+
+## When to Use
+- Plan is fully drafted with all steps
+- Files to modify are identified
+- Considerations are documented
+- Ready for user review
+
+## Parameters
+- `allowed_prompts` (optional): Bash permissions plan needs
+  - Example: `[{"tool": "Bash", "prompt": "run tests"}]`
+
+## What Happens
+1. Plan state changes to AWAITING_APPROVAL
+2. User sees plan and approval options
+3. Session blocks until user responds
+4. On approve: Plan dispatched to Orchestrator
+5. On modify: Return to exploration with feedback
+6. On reject: Return to idle state
+
+## Important
+- Ensure plan is complete before calling
+- User MUST respond before work continues
+- Use ask_user_question for pre-approval clarifications
+```
+
+---
+
+## Research Paper Architecture
+
+The Academic agent produces **research papers** - comprehensive technical documents that capture investigation findings, architectural recommendations, and implementation guidance. These papers serve as the bridge between exploratory research and actionable plans.
+
+### Research Paper Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    RESEARCH PAPER LIFECYCLE                                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  USER                    ACADEMIC                  ARCHITECT                    │
+│    │                        │                          │                        │
+│    │  "Research how to      │                          │                        │
+│    │   implement caching"   │                          │                        │
+│    │───────────────────────►│                          │                        │
+│    │                        │                          │                        │
+│    │                        │  [Investigates]          │                        │
+│    │                        │  • Web searches          │                        │
+│    │                        │  • Reads docs            │                        │
+│    │                        │  • Analyzes patterns     │                        │
+│    │                        │  • Consults Librarian    │                        │
+│    │                        │                          │                        │
+│    │◄───────────────────────│                          │                        │
+│    │  "I found 3 approaches │                          │                        │
+│    │   with tradeoffs..."   │                          │                        │
+│    │                        │                          │                        │
+│    │  "Let's go with Redis" │                          │                        │
+│    │───────────────────────►│                          │                        │
+│    │                        │                          │                        │
+│    │  "Ready to start work" │                          │                        │
+│    │───────────────────────►│                          │                        │
+│    │                        │                          │                        │
+│    │                        │  [write_research_paper]  │                        │
+│    │                        │  Sends PROPOSAL message  │                        │
+│    │                        │  via Guide ─────────────►│                        │
+│    │                        │                          │                        │
+│    │                        │                          │  [read_research_paper] │
+│    │                        │                          │  Triggered by PROPOSAL │
+│    │                        │                          │  message type          │
+│    │                        │                          │                        │
+│    │◄─────────────────────────────────────────────────│                        │
+│    │  "Based on the research, here's my proposed plan" │                        │
+│    │                                                   │                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Research Paper Storage
+
+Research papers follow the same project-hash storage pattern as plans:
+
+```
+~/.sylk/projects/{project_hash}/
+├── project_info.json
+│
+├── plans/                              ← Architect's domain
+│   └── {plan_slug}/
+│       └── ...
+│
+├── research/                           ← Academic's domain
+│   ├── implement-redis-caching/        ← Research slug
+│   │   ├── metadata.json               ← Research metadata & version history
+│   │   ├── context.json                ← Current research context
+│   │   ├── decisions.json              ← User decisions on recommendations
+│   │   ├── sources.json                ← URLs, docs referenced
+│   │   ├── current.md                  ← Copy of HEAD version
+│   │   ├── v1.md                       ← Version 1
+│   │   ├── v2.md                       ← Version 2
+│   │   └── attachments/                ← Diagrams, code samples
+│   │       ├── architecture.mermaid
+│   │       └── benchmark_results.json
+│   │
+│   └── evaluate-auth-libraries/
+│       └── ...
+│
+└── archived/
+    ├── plans/...
+    └── research/...                    ← Completed/superseded research
+```
+
+**Example paths:**
+```
+~/.sylk/projects/a1b2c3d4/research/implement-redis-caching/paper.md
+~/.sylk/projects/a1b2c3d4/research/implement-redis-caching/v2.md
+~/.sylk/projects/a1b2c3d4/research/implement-redis-caching/decisions.json
+```
+
+### Research Paper Document Structure
+
+```markdown
+<!-- Research Paper: Implement Redis Caching | Version: 2 | Status: READY_FOR_IMPLEMENTATION -->
+<!-- Academic: academic_agent_abc123 | Session: session_xyz789 -->
+
+# Research Paper: Implement Redis Caching
+
+## Executive Summary
+
+Brief overview of findings and recommended approach.
+
+- **Primary Recommendation**: Redis with read-through caching pattern
+- **Complexity**: Medium
+- **Estimated Scope**: 4-6 files, 3 topological layers
+- **Key Dependencies**: redis-go v9, connection pooling
+
+---
+
+## Problem Statement
+
+### Context
+What problem are we solving? Why does it matter?
+
+### Requirements
+- [ ] Cache API responses with configurable TTL
+- [ ] Support cache invalidation on data mutations
+- [ ] Handle cache failures gracefully (fallback to DB)
+- [ ] Provide cache hit/miss metrics
+
+### Constraints
+- Must work with existing PostgreSQL setup
+- Cannot exceed 512MB memory budget
+- Must support horizontal scaling
+
+---
+
+## Research Findings
+
+### Approach A: Redis (Recommended)
+
+#### Description
+Distributed in-memory cache with persistence options.
+
+#### Architecture
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Client    │────►│   API       │────►│   Redis     │
+│             │     │   Server    │     │   Cluster   │
+└─────────────┘     └──────┬──────┘     └─────────────┘
+                          │                    │
+                          │ cache miss         │ cache hit
+                          ▼                    │
+                   ┌─────────────┐             │
+                   │  PostgreSQL │◄────────────┘
+                   └─────────────┘   write-through
+```
+
+#### Implementation Pattern
+```go
+// Cache-aside pattern with fallback
+func (s *Service) GetUser(ctx context.Context, id string) (*User, error) {
+    // Try cache first
+    cached, err := s.cache.Get(ctx, userKey(id))
+    if err == nil {
+        return cached.(*User), nil
+    }
+
+    // Cache miss - fetch from DB
+    user, err := s.db.GetUser(ctx, id)
+    if err != nil {
+        return nil, err
+    }
+
+    // Populate cache (async)
+    go s.cache.Set(ctx, userKey(id), user, s.ttl)
+
+    return user, nil
+}
+```
+
+#### Pros
+- Battle-tested, widely adopted
+- Excellent performance (sub-millisecond reads)
+- Rich data structures
+- Built-in clustering
+
+#### Cons
+- Additional infrastructure
+- Memory-bound
+- Requires connection pooling
+
+### Approach B: In-Memory (go-cache)
+
+[... similar structure ...]
+
+### Approach C: PostgreSQL Materialized Views
+
+[... similar structure ...]
+
+---
+
+## Recommended Architecture
+
+### System Design
+[Detailed architecture diagram]
+
+### Data Flow
+[Step-by-step flow description]
+
+### State Machine
+[State diagram for relevant components]
+
+---
+
+## Implementation Guide
+
+### Files to Create/Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `core/cache/client.go` | create | Redis client wrapper |
+| `core/cache/config.go` | create | Cache configuration |
+| `core/cache/middleware.go` | create | HTTP middleware |
+| `services/user/service.go` | modify | Add cache integration |
+
+### Implementation Steps (Suggested Order)
+
+1. **[Layer 0]** Create cache client and config
+2. **[Layer 0]** Create key generation utilities
+3. **[Layer 1]** Create cache middleware (depends on client)
+4. **[Layer 2]** Integrate into user service (depends on middleware)
+5. **[Layer 3]** Write integration tests
+
+---
+
+## Acceptance Criteria
+
+### Functional
+- [ ] Cache hit returns response in < 5ms (p99)
+- [ ] Cache miss falls back to database successfully
+- [ ] Cache invalidation occurs within 100ms of mutation
+
+### Non-Functional
+- [ ] Memory usage stays under 512MB
+- [ ] Graceful degradation when Redis unavailable
+
+---
+
+## Edge Cases & Potential Problems
+
+### ⚠️ EC-1: Cache Stampede
+**Problem**: When a popular cache key expires, many requests simultaneously hit the database.
+
+**Mitigation Options**:
+```
+[x] ACCEPTED   - Implement distributed locking (singleflight pattern)
+[ ] REJECTED   - Use probabilistic early expiration
+[ ] DEFERRED   - Add request coalescing at load balancer
+```
+
+**Implementation Note**: Use `golang.org/x/sync/singleflight`
+
+### ⚠️ EC-2: Thundering Herd on Startup
+**Problem**: Cold cache after deployment causes all requests to hit database.
+
+**Mitigation Options**:
+```
+[x] ACCEPTED   - Implement cache warming on startup
+[ ] IGNORED    - Accept temporary latency spike
+```
+
+### ⚠️ EC-3: Stale Data After Partial Failure
+**Problem**: Database write succeeds but cache invalidation fails.
+
+**Mitigation Options**:
+```
+[x] ACCEPTED   - Use short TTL as safety net
+[x] ACCEPTED   - Implement retry with exponential backoff
+[ ] REJECTED   - Use transactional outbox pattern (too complex)
+```
+
+---
+
+## Open Questions
+
+1. **TTL Duration**: What's the acceptable staleness? (Suggested: 5 minutes)
+2. **Cache Scope**: Cache at API response level or entity level?
+
+---
+
+## References
+
+- [Redis Best Practices](https://redis.io/docs/manual/patterns/)
+- Internal: `services/session/cache.go` (existing pattern)
+```
+
+### Research Paper Metadata
+
+```go
+// core/research/types.go
+
+// ResearchStatus tracks paper lifecycle
+type ResearchStatus string
+
+const (
+    ResearchStatusDraft               ResearchStatus = "DRAFT"
+    ResearchStatusReadyForReview      ResearchStatus = "READY_FOR_REVIEW"
+    ResearchStatusReadyForImplementation ResearchStatus = "READY_FOR_IMPLEMENTATION"
+    ResearchStatusApproved            ResearchStatus = "APPROVED"
+    ResearchStatusSuperseded          ResearchStatus = "SUPERSEDED"
+    ResearchStatusArchived            ResearchStatus = "ARCHIVED"
+)
+
+// ResearchMetadata stored in metadata.json
+type ResearchMetadata struct {
+    PaperID         string            `json:"paper_id"`
+    Slug            string            `json:"slug"`
+    Title           string            `json:"title"`
+    Status          ResearchStatus    `json:"status"`
+    Head            int               `json:"head"`              // Current version
+    CreatedAt       time.Time         `json:"created_at"`
+    UpdatedAt       time.Time         `json:"updated_at"`
+    AcademicAgent   string            `json:"academic_agent"`
+    SessionID       string            `json:"session_id"`
+    ProjectHash     string            `json:"project_hash"`
+    Tags            []string          `json:"tags"`
+    ApproachesEval  int               `json:"approaches_evaluated"`
+    Recommended     string            `json:"recommended_approach"`
+    EdgeCasesCount  int               `json:"edge_cases_count"`
+    OpenQuestions   int               `json:"open_questions_count"`
+    LinkedPlan      string            `json:"linked_plan,omitempty"`
+    Versions        []VersionEntry    `json:"versions"`
+    ChangeSets      map[string]ChangeSet `json:"change_sets,omitempty"`
+}
+
+// ResearchDecisions stored in decisions.json
+type ResearchDecisions struct {
+    PaperID   string     `json:"paper_id"`
+    Decisions []Decision `json:"decisions"`
+    OpenQuestionsResolved []ResolvedQuestion `json:"open_questions_resolved"`
+}
+
+type Decision struct {
+    ID          string           `json:"id"`           // "EC-1", "EC-2", etc.
+    Title       string           `json:"title"`
+    Options     []DecisionOption `json:"options"`
+    DecidedAt   time.Time        `json:"decided_at"`
+    DecidedBy   string           `json:"decided_by"`   // "user" or agent ID
+}
+
+type DecisionOption struct {
+    ID          string `json:"id"`
+    Description string `json:"description"`
+    Status      string `json:"status"`  // "ACCEPTED", "REJECTED", "DEFERRED", "IGNORED"
+}
+
+type ResolvedQuestion struct {
+    Question   string    `json:"question"`
+    Answer     string    `json:"answer"`
+    ResolvedAt time.Time `json:"resolved_at"`
+}
+```
+
+### PROPOSAL Message Flow
+
+When Academic completes research, it sends a PROPOSAL message to Architect via Guide:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    PROPOSAL MESSAGE ROUTING                                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ACADEMIC                      GUIDE                      ARCHITECT             │
+│     │                           │                            │                  │
+│     │  write_research_paper     │                            │                  │
+│     │  skill completes          │                            │                  │
+│     │                           │                            │                  │
+│     │  SendMessage({            │                            │                  │
+│     │    to: "guide",           │                            │                  │
+│     │    type: "ROUTE_REQUEST", │                            │                  │
+│     │    payload: {             │                            │                  │
+│     │      target: "architect", │                            │                  │
+│     │      channel: "requests", │                            │                  │
+│     │      message: {           │                            │                  │
+│     │        type: "PROPOSAL",  │                            │                  │
+│     │        research_slug,     │                            │                  │
+│     │        paper_path,        │                            │                  │
+│     │        version,           │                            │                  │
+│     │        summary            │                            │                  │
+│     │      }                    │                            │                  │
+│     │    }                      │                            │                  │
+│     │  })                       │                            │                  │
+│     │ ─────────────────────────►│                            │                  │
+│     │                           │                            │                  │
+│     │                           │  Route to architect.requests                  │
+│     │                           │                            │                  │
+│     │                           │  PublishTo("architect.requests", {            │
+│     │                           │    type: "PROPOSAL",       │                  │
+│     │                           │    from: "academic",       │                  │
+│     │                           │    research_slug: "...",   │                  │
+│     │                           │    paper_path: "...",      │                  │
+│     │                           │    version: 2,             │                  │
+│     │                           │    summary: "..."          │                  │
+│     │                           │  })                        │                  │
+│     │                           │ ───────────────────────────►                  │
+│     │                           │                            │                  │
+│     │                           │                            │  handleRequest() │
+│     │                           │                            │  checks type     │
+│     │                           │                            │  == "PROPOSAL"   │
+│     │                           │                            │                  │
+│     │                           │                            │  Triggers        │
+│     │                           │                            │  read_research_  │
+│     │                           │                            │  paper skill     │
+│     │                           │                            │                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Message Types
+
+```go
+// core/messages/types.go
+
+type MessageType string
+
+const (
+    // Existing types
+    MessageTypeQuery      MessageType = "QUERY"
+    MessageTypeResponse   MessageType = "RESPONSE"
+    MessageTypeCommand    MessageType = "COMMAND"
+
+    // Research handoff
+    MessageTypeProposal   MessageType = "PROPOSAL"
+
+    // Revision triggers
+    MessageTypeTaskModifiedByUser     MessageType = "TASK_MODIFIED_BY_USER"
+    MessageTypeWorkflowChangeRequired MessageType = "WORKFLOW_CHANGE_REQUIRED"
+)
+
+// ProposalMessage sent when Academic completes research
+type ProposalMessage struct {
+    Type          MessageType `json:"type"`           // "PROPOSAL"
+    From          string      `json:"from"`           // "academic"
+    SessionID     string      `json:"session_id"`
+    ProjectHash   string      `json:"project_hash"`
+    ResearchSlug  string      `json:"research_slug"`
+    PaperPath     string      `json:"paper_path"`     // Full path to current.md
+    Version       int         `json:"version"`
+    Summary       string      `json:"summary"`        // Brief description
+    Timestamp     time.Time   `json:"timestamp"`
+}
+```
+
+### Architect Request Handler
+
+```go
+// agents/architect/handler.go
+
+func (a *ArchitectAgent) handleRequest(msg *messages.Message) error {
+    switch msg.Type {
+    case messages.MessageTypeProposal:
+        // Research paper ready from Academic
+        return a.handleProposal(msg)
+
+    case messages.MessageTypeTaskModifiedByUser:
+        // Pipeline agent reports user modified their task
+        return a.handleUserTaskModification(msg)
+
+    case messages.MessageTypeWorkflowChangeRequired:
+        // Pipeline agent needs workflow change
+        return a.handleWorkflowChangeRequest(msg)
+
+    case messages.MessageTypeCommand:
+        return a.handleCommand(msg)
+
+    default:
+        return a.handleDefault(msg)
+    }
+}
+
+func (a *ArchitectAgent) handleProposal(msg *messages.Message) error {
+    var proposal ProposalMessage
+    if err := json.Unmarshal(msg.Payload, &proposal); err != nil {
+        return err
+    }
+
+    // Trigger read_research_paper skill
+    return a.skills.Execute("read_research_paper", map[string]any{
+        "research_slug": proposal.ResearchSlug,
+        "paper_path":    proposal.PaperPath,
+        "version":       proposal.Version,
+    })
+}
+```
+
+### Research Paper Skills
+
+#### Academic: write_research_paper
+
+```go
+// agents/academic/skills/write_research_paper.go
+
+// Trigger conditions:
+// - User says "I'm ready to start implementing"
+// - User says "Let's build this"
+// - User says "Write up your findings"
+// - User says "Create the research paper"
+
+type WriteResearchPaperSkill struct {
+    storage    *research.Storage
+    archivalist *archivalist.Client
+    bus        *messaging.Bus
+}
+
+func (s *WriteResearchPaperSkill) Execute(ctx context.Context, params map[string]any) error {
+    // 1. Aggregate research findings from conversation context
+    findings := s.aggregateFindings(ctx)
+
+    // 2. Structure into standard paper format
+    paper := s.structurePaper(findings)
+
+    // 3. Generate diagrams
+    paper.Diagrams = s.generateDiagrams(findings)
+
+    // 4. Compile edge cases with user decisions
+    paper.EdgeCases = s.compileEdgeCases(findings)
+
+    // 5. Determine version number
+    meta, _ := s.storage.LoadMetadata(paper.Slug)
+    paper.Version = meta.Head + 1
+
+    // 6. Persist to storage
+    if err := s.storage.SavePaper(paper); err != nil {
+        return err
+    }
+
+    // 7. Archive version to Archivalist
+    if err := s.archivePaperVersion(paper); err != nil {
+        return err
+    }
+
+    // 8. Send PROPOSAL to Architect via Guide
+    proposal := &ProposalMessage{
+        Type:         messages.MessageTypeProposal,
+        From:         "academic",
+        SessionID:    ctx.Value("session_id").(string),
+        ProjectHash:  s.storage.ProjectHash(),
+        ResearchSlug: paper.Slug,
+        PaperPath:    s.storage.PaperPath(paper.Slug),
+        Version:      paper.Version,
+        Summary:      paper.Summary,
+        Timestamp:    time.Now(),
+    }
+
+    return s.bus.RouteToAgent("architect", "requests", proposal)
+}
+```
+
+#### Architect: read_research_paper
+
+```go
+// agents/architect/skills/read_research_paper.go
+
+// Triggered by: PROPOSAL message type on architect.requests channel
+
+type ReadResearchPaperSkill struct {
+    storage     *plan.Storage
+    researchDB  *research.Storage
+    librarian   *consultation.Client
+    vectorDB    *vectordb.Client
+}
+
+func (s *ReadResearchPaperSkill) Execute(ctx context.Context, params map[string]any) error {
+    slug := params["research_slug"].(string)
+    version := params["version"].(int)
+
+    // 1. Fetch the research paper
+    paper, err := s.researchDB.FetchVersion(slug, &version)
+    if err != nil {
+        return err
+    }
+
+    // 2. Parse structured sections
+    parsed := s.parsePaper(paper.Content)
+
+    // 3. Load decisions
+    decisions, _ := s.researchDB.LoadDecisions(slug)
+
+    // 4. Consult Librarian to verify file paths
+    verified := s.verifyFilePaths(parsed.FilesToModify)
+
+    // 5. Convert to Plan structure
+    plan := s.convertToPlan(parsed, decisions, verified)
+    plan.Metadata["source_research"] = slug
+    plan.Metadata["research_version"] = version
+
+    // 6. Enter plan mode with pre-populated draft
+    planCtx := &PlanContext{
+        SessionID:   ctx.Value("session_id").(string),
+        State:       PlanStateDrafting,
+        CurrentPlan: plan,
+        CreatedAt:   time.Now(),
+    }
+
+    if err := s.storage.SaveContext(planCtx); err != nil {
+        return err
+    }
+
+    // 7. Present to user for review
+    return s.presentPlanToUser(ctx, plan, paper.Summary)
+}
+
+func (s *ReadResearchPaperSkill) convertToPlan(parsed *ParsedPaper, decisions *ResearchDecisions, verified []VerifiedFile) *Plan {
+    steps := []PlanStep{}
+
+    // Convert implementation steps
+    for i, implStep := range parsed.ImplementationSteps {
+        step := PlanStep{
+            Index:       i + 1,
+            Description: implStep.Description,
+            Agent:       s.inferAgent(implStep),
+            DependsOn:   s.parseDependencies(implStep.Layer, steps),
+            Layer:       implStep.Layer,
+            Status:      StepStatusPending,
+        }
+
+        // Add acceptance criteria if available
+        if criteria := parsed.AcceptanceCriteria[implStep.ID]; criteria != nil {
+            step.AcceptanceCriteria = criteria
+        }
+
+        steps = append(steps, step)
+    }
+
+    // Add edge case mitigations as steps
+    for _, ec := range parsed.EdgeCases {
+        for _, opt := range decisions.GetDecision(ec.ID).Options {
+            if opt.Status == "ACCEPTED" {
+                steps = append(steps, PlanStep{
+                    Index:       len(steps) + 1,
+                    Description: fmt.Sprintf("Implement %s mitigation: %s", ec.ID, opt.Description),
+                    Agent:       "engineer",
+                    Source:      fmt.Sprintf("research:%s:%s:%s", parsed.Slug, ec.ID, opt.ID),
+                })
+            }
+        }
+    }
+
+    // Recompute layers
+    ComputeTopologicalLayers(steps)
+
+    return &Plan{
+        ID:            generatePlanID(),
+        Title:         parsed.Title,
+        Overview:      parsed.Summary,
+        FilesToModify: verified,
+        Steps:         steps,
+        Considerations: parsed.Considerations,
+    }
+}
+```
+
+### fetch_version Skill (Both Agents)
+
+Both Academic and Architect have a `fetch_version` skill for retrieving document versions:
+
+```go
+// Shared interface
+type VersionedDocumentFetcher interface {
+    FetchVersion(slug string, version *int) (*VersionedDocument, error)
+    FetchLatest(slug string) (*VersionedDocument, error)
+    ListVersions(slug string) ([]int, error)
+}
+
+type VersionedDocument struct {
+    Slug      string         `json:"slug"`
+    Version   int            `json:"version"`
+    Content   string         `json:"content"`
+    Path      string         `json:"path"`
+    Metadata  map[string]any `json:"metadata"`
+    CreatedAt time.Time      `json:"created_at"`
+}
+```
+
+#### Academic: fetch_version (Research Papers)
+
+```go
+// agents/academic/skills/fetch_version.go
+
+func (a *AcademicAgent) FetchVersion(slug string, version *int) (*VersionedDocument, error) {
+    baseDir := filepath.Join(a.storage.ProjectDir(), "research", slug)
+
+    if version == nil {
+        return a.fetchLatestVersion(baseDir, slug)
+    }
+    return a.fetchSpecificVersion(baseDir, slug, *version)
+}
+
+func (a *AcademicAgent) fetchLatestVersion(baseDir, slug string) (*VersionedDocument, error) {
+    // Quick file search: find all v*.md files
+    pattern := filepath.Join(baseDir, "v*.md")
+    matches, err := filepath.Glob(pattern)
+    if err != nil || len(matches) == 0 {
+        return nil, fmt.Errorf("no versions found for research: %s", slug)
+    }
+
+    // Find highest version number
+    maxVersion := 0
+    for _, match := range matches {
+        filename := filepath.Base(match)
+        var v int
+        if _, err := fmt.Sscanf(filename, "v%d.md", &v); err == nil {
+            if v > maxVersion {
+                maxVersion = v
+            }
+        }
+    }
+
+    return a.fetchSpecificVersion(baseDir, slug, maxVersion)
+}
+
+func (a *AcademicAgent) fetchSpecificVersion(baseDir, slug string, version int) (*VersionedDocument, error) {
+    path := filepath.Join(baseDir, fmt.Sprintf("v%d.md", version))
+
+    content, err := os.ReadFile(path)
+    if err != nil {
+        return nil, fmt.Errorf("version %d not found for research: %s", version, slug)
+    }
+
+    // Load metadata
+    metaPath := filepath.Join(baseDir, "metadata.json")
+    var metadata map[string]any
+    if data, err := os.ReadFile(metaPath); err == nil {
+        json.Unmarshal(data, &metadata)
+    }
+
+    info, _ := os.Stat(path)
+
+    return &VersionedDocument{
+        Slug:      slug,
+        Version:   version,
+        Content:   string(content),
+        Path:      path,
+        Metadata:  metadata,
+        CreatedAt: info.ModTime(),
+    }, nil
+}
+```
+
+#### Architect: fetch_version (Plans)
+
+```go
+// agents/architect/skills/fetch_version.go
+
+func (a *ArchitectAgent) FetchVersion(slug string, version *int) (*VersionedDocument, error) {
+    baseDir := filepath.Join(a.storage.ProjectDir(), "plans", slug)  // Different path
+
+    if version == nil {
+        return a.fetchLatestVersion(baseDir, slug)
+    }
+    return a.fetchSpecificVersion(baseDir, slug, *version)
+}
+
+// Implementation identical to Academic's, just different base path
+```
+
+---
+
+## Vector DB Ingestion
+
+Approved documents are chunked and embedded into the vector DB for semantic search. Only **new content** is ingested on version updates.
+
+### Ingestion Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    VECTOR DB INCREMENTAL INGESTION                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  DOCUMENT APPROVAL                                                              │
+│       │                                                                         │
+│       ▼                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │                     INGESTION PIPELINE                                   │   │
+│  ├─────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                          │   │
+│  │  1. CHUNK DOCUMENT BY SECTION                                            │   │
+│  │     ┌────────────────────────────────────────────────────────────┐      │   │
+│  │     │  paper.md / plan.md                                         │      │   │
+│  │     │  ════════════════════                                       │      │   │
+│  │     │  ## Executive Summary  ──────► Chunk 1                      │      │   │
+│  │     │  ## Problem Statement  ──────► Chunk 2                      │      │   │
+│  │     │  ## Research Findings  ──────► Chunk 3, 4, 5 (by approach) │      │   │
+│  │     │  ## Edge Cases  ─────────────► Chunk 6, 7, 8               │      │   │
+│  │     └────────────────────────────────────────────────────────────┘      │   │
+│  │                                                                          │   │
+│  │  2. COMPUTE CHUNK HASHES                                                 │   │
+│  │     chunk_hash = SHA256(chunk_content)                                   │   │
+│  │                                                                          │   │
+│  │  3. LOAD EXISTING HASHES FROM VECTOR DB METADATA                         │   │
+│  │     doc_id: "research:implement-redis-caching"                           │   │
+│  │     existing_hashes: [hash1, hash2, hash3]                               │   │
+│  │                                                                          │   │
+│  │  4. COMPUTE DIFF                                                         │   │
+│  │     new_chunks     = current_hashes - existing_hashes                    │   │
+│  │     removed_chunks = existing_hashes - current_hashes                    │   │
+│  │     unchanged      = current_hashes ∩ existing_hashes                    │   │
+│  │                                                                          │   │
+│  │  5. INCREMENTAL UPDATE                                                   │   │
+│  │     • Embed ONLY new_chunks (save compute)                               │   │
+│  │     • Delete vectors for removed_chunks                                  │   │
+│  │     • Skip unchanged chunks                                              │   │
+│  │     • Update metadata with current_hashes                                │   │
+│  │                                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Document Chunk Structure
+
+```go
+// core/vectordb/document.go
+
+type DocumentChunk struct {
+    // Identity
+    ChunkID      string `json:"chunk_id"`      // "{doc_type}:{slug}:{section}:{index}"
+    DocumentID   string `json:"document_id"`   // "{doc_type}:{slug}"
+    DocumentType string `json:"document_type"` // "research_paper" | "plan"
+
+    // Content
+    Content      string `json:"content"`
+    ContentHash  string `json:"content_hash"`  // SHA256 for dedup
+
+    // Metadata for filtering
+    ProjectHash  string `json:"project_hash"`
+    Slug         string `json:"slug"`
+    Version      int    `json:"version"`
+    Section      string `json:"section"`       // "executive_summary", "edge_cases", etc.
+
+    // Embedding
+    Embedding    []float32 `json:"embedding"`
+
+    // Timestamps
+    IngestedAt   time.Time `json:"ingested_at"`
+}
+
+// Example chunk IDs:
+// "research_paper:implement-redis-caching:executive_summary:0"
+// "research_paper:implement-redis-caching:edge_cases:2"
+// "plan:implement-redis-caching:step:5"
+```
+
+### Incremental Ingestion Implementation
+
+```go
+// core/vectordb/ingestion.go
+
+func (v *VectorDB) IngestDocument(doc *ApprovedDocument) error {
+    docID := fmt.Sprintf("%s:%s", doc.Type, doc.Slug)
+
+    // 1. Chunk the document by section
+    chunks := chunkDocument(doc)
+
+    // 2. Compute hashes for each chunk
+    currentHashes := make(map[string]string)
+    for _, chunk := range chunks {
+        chunk.ContentHash = sha256Hash(chunk.Content)
+        currentHashes[chunk.ChunkID] = chunk.ContentHash
+    }
+
+    // 3. Load existing hashes
+    existingHashes, _ := v.getDocumentHashes(docID)
+
+    // 4. Compute diff
+    var toAdd []DocumentChunk
+    var toRemove []string
+
+    for chunkID, hash := range currentHashes {
+        existingHash, exists := existingHashes[chunkID]
+        if !exists || existingHash != hash {
+            // New or modified chunk - needs embedding
+            toAdd = append(toAdd, findChunk(chunks, chunkID))
+        }
+    }
+
+    for chunkID := range existingHashes {
+        if _, exists := currentHashes[chunkID]; !exists {
+            // Chunk was removed
+            toRemove = append(toRemove, chunkID)
+        }
+    }
+
+    // 5. Apply incremental update
+    if len(toRemove) > 0 {
+        v.deleteChunks(toRemove)
+    }
+
+    if len(toAdd) > 0 {
+        // Embed only new chunks
+        for i := range toAdd {
+            toAdd[i].Embedding = v.embedder.Embed(toAdd[i].Content)
+            toAdd[i].IngestedAt = time.Now()
+        }
+        v.insertChunks(toAdd)
+    }
+
+    // 6. Update document metadata
+    return v.updateDocumentHashes(docID, currentHashes)
+}
+```
+
+### Ingestion Trigger Points
+
+| Event | Action |
+|-------|--------|
+| Research paper approved | Archive + Ingest (incremental) |
+| Research paper revised (v2, v3...) | Archive + Ingest (only new/changed chunks) |
+| Plan approved | Archive + Ingest (incremental) |
+| Plan revised | Archive + Ingest (only new/changed chunks) |
+
+---
+
+## Revision Triggers
+
+### Academic: Research Paper Revision
+
+The Academic **only** creates a new version when the user **explicitly** requests modification:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    ACADEMIC REVISION TRIGGERS                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ✓ TRIGGERS REVISION (Explicit User Request Only)                              │
+│  ════════════════════════════════════════════════                               │
+│                                                                                 │
+│  • "Update the research paper to include X"                                    │
+│  • "Add a section about Y to the proposal"                                     │
+│  • "Remove the materialized views approach"                                    │
+│  • "Change the recommendation from Redis to Memcached"                         │
+│  • "Revise the edge cases section"                                             │
+│  • "I want to modify the research document"                                    │
+│                                                                                 │
+│  ───────────────────────────────────────────────────────────────────────────   │
+│                                                                                 │
+│  ✗ DOES NOT TRIGGER REVISION                                                   │
+│  ═══════════════════════════                                                    │
+│                                                                                 │
+│  • Casual discussion about the research                                        │
+│  • Questions about the findings                                                │
+│  • User thinking out loud ("interesting", "okay")                              │
+│  • Academic providing clarification                                            │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Architect: Plan Revision
+
+The Architect creates a new version under **two scenarios**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    ARCHITECT REVISION TRIGGERS                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  SCENARIO A: USER-INITIATED CHANGES                                             │
+│  ═══════════════════════════════════                                            │
+│                                                                                 │
+│  1. Direct user request to modify plan:                                        │
+│     • "Add a step for database migration"                                      │
+│     • "Remove step 4 from the plan"                                            │
+│     • "I want to modify the workflow"                                          │
+│                                                                                 │
+│  2. Pipeline agent reports USER modified their task:                           │
+│                                                                                 │
+│     Message type: TASK_MODIFIED_BY_USER                                        │
+│     {                                                                           │
+│       type: "TASK_MODIFIED_BY_USER",                                           │
+│       from: "engineer_pipeline_3",                                             │
+│       step_index: 5,                                                           │
+│       modification: "scope_expanded",                                          │
+│       description: "User asked to also handle edge case X"                     │
+│     }                                                                           │
+│                                                                                 │
+│  ───────────────────────────────────────────────────────────────────────────   │
+│                                                                                 │
+│  SCENARIO B: AGENT-INITIATED WORKFLOW CHANGES                                   │
+│  ════════════════════════════════════════════                                   │
+│                                                                                 │
+│  Pipeline agent discovers they NEED to modify workflow:                        │
+│                                                                                 │
+│  • "I need to add a prerequisite step"                                         │
+│  • "This task should be split into two steps"                                  │
+│  • "Step 6 depends on step 3, not step 2"                                      │
+│                                                                                 │
+│     Message type: WORKFLOW_CHANGE_REQUIRED                                     │
+│     {                                                                           │
+│       type: "WORKFLOW_CHANGE_REQUIRED",                                        │
+│       from: "engineer_pipeline_5",                                             │
+│       step_index: 7,                                                           │
+│       change_type: "add_prerequisite",                                         │
+│       reason: "Discovered shared utility needed",                              │
+│       proposed_change: {                                                       │
+│         action: "insert_step",                                                 │
+│         before_step: 7,                                                        │
+│         new_step: { description: "Create shared utility", ... }               │
+│       },                                                                        │
+│       blocking: true                                                           │
+│     }                                                                           │
+│                                                                                 │
+│  For WORKFLOW_CHANGE_REQUIRED:                                                 │
+│  1. Architect PAUSES execution (if blocking)                                   │
+│  2. Architect presents change to user for approval                             │
+│  3. If approved → Create new version, resume                                   │
+│  4. If rejected → Notify agent to find alternative                             │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Revision Message Types
+
+```go
+// core/messages/revision.go
+
+// TaskModifiedByUserMessage - sent when user changes a task mid-execution
+type TaskModifiedByUserMessage struct {
+    Type          MessageType `json:"type"`  // "TASK_MODIFIED_BY_USER"
+    From          string      `json:"from"`
+    SessionID     string      `json:"session_id"`
+    PlanSlug      string      `json:"plan_slug"`
+    StepIndex     int         `json:"step_index"`
+    Modification  string      `json:"modification"`  // "scope_expanded", "requirements_changed"
+    Description   string      `json:"description"`
+    OriginalTask  string      `json:"original_task"`
+    ModifiedTask  string      `json:"modified_task"`
+    Timestamp     time.Time   `json:"timestamp"`
+}
+
+// WorkflowChangeRequiredMessage - sent when agent needs workflow change
+type WorkflowChangeRequiredMessage struct {
+    Type           MessageType    `json:"type"`  // "WORKFLOW_CHANGE_REQUIRED"
+    From           string         `json:"from"`
+    SessionID      string         `json:"session_id"`
+    PlanSlug       string         `json:"plan_slug"`
+    StepIndex      int            `json:"step_index"`
+    ChangeType     string         `json:"change_type"`  // "add_step", "split_step", "change_deps"
+    Reason         string         `json:"reason"`
+    ProposedChange ProposedChange `json:"proposed_change"`
+    Blocking       bool           `json:"blocking"`
+    Timestamp      time.Time      `json:"timestamp"`
+}
+
+type ProposedChange struct {
+    Action       string    `json:"action"`  // "insert_step", "delete_step", "modify_step"
+    TargetStep   int       `json:"target_step"`
+    NewStep      *PlanStep `json:"new_step,omitempty"`
+    ModifiedStep *PlanStep `json:"modified_step,omitempty"`
+    NewDeps      []int     `json:"new_deps,omitempty"`
+}
+```
+
+### Workflow Change Handling
+
+```go
+// agents/architect/revision.go
+
+func (a *ArchitectAgent) handleWorkflowChangeRequest(msg *messages.Message) error {
+    var req WorkflowChangeRequiredMessage
+    json.Unmarshal(msg.Payload, &req)
+
+    // 1. Pause execution if blocking
+    if req.Blocking {
+        a.orchestrator.PauseExecution(req.PlanSlug)
+    }
+
+    // 2. Evaluate impact
+    impact := a.evaluateChangeImpact(req.ProposedChange)
+
+    // 3. Present to user
+    approval := a.presentChangeToUser(req, impact)
+
+    if approval.Approved {
+        // 4. Create new plan version
+        newPlan := a.applyChange(req.ProposedChange)
+        a.storage.SaveContext(newPlan)
+
+        // 5. Archive and ingest (incremental)
+        a.archivePlanVersion(newPlan)
+        a.vectorDB.IngestDocument(newPlan)
+
+        // 6. Resume
+        if req.Blocking {
+            a.orchestrator.ResumeExecution(req.PlanSlug, newPlan)
+        }
+    } else {
+        // Notify agent to find alternative
+        a.notifyChangeRejected(req.From, req.StepIndex, approval.Reason)
+        if req.Blocking {
+            a.orchestrator.ResumeExecution(req.PlanSlug, nil)
+        }
+    }
+
+    return nil
+}
+```
+
+### Complete Handoff Sequence
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETE RESEARCH → PLAN → EXECUTION FLOW                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  RESEARCH PHASE                                                                 │
+│  ══════════════                                                                 │
+│  User: "Research how to add caching"                                           │
+│  Guide → Academic                                                              │
+│  Academic: [investigates, presents options]                                    │
+│  User: [makes decisions on edge cases]                                         │
+│  User: "I'm ready to implement"                                                │
+│                                                                                 │
+│  HANDOFF                                                                        │
+│  ════════                                                                       │
+│  Academic: [write_research_paper skill]                                        │
+│    • Persists paper to ~/.sylk/projects/{hash}/research/{slug}/v1.md           │
+│    • Archives to Archivalist                                                   │
+│    • Sends PROPOSAL via Guide → architect.requests                             │
+│                                                                                 │
+│  Architect: [receives PROPOSAL, triggers read_research_paper]                  │
+│    • Fetches paper via fetch_version skill                                     │
+│    • Parses sections, loads decisions                                          │
+│    • Consults Librarian for file verification                                  │
+│    • Converts to Plan structure                                                │
+│    • Enters plan mode with draft                                               │
+│                                                                                 │
+│  PLAN APPROVAL                                                                  │
+│  ═════════════                                                                  │
+│  Architect: [presents plan to user]                                            │
+│  User: "Looks good"                                                            │
+│  Architect:                                                                     │
+│    • Archives plan to Archivalist                                              │
+│    • Ingests to Vector DB (incremental)                                        │
+│    • Links plan to research: source_research = paper_id                        │
+│    • Archives research as APPROVED                                             │
+│    • Ingests research to Vector DB                                             │
+│                                                                                 │
+│  EXECUTION                                                                      │
+│  ═════════                                                                      │
+│  Orchestrator: [dispatches to Engineers]                                       │
+│                                                                                 │
+│  [If Engineer discovers workflow change needed]                                │
+│  Engineer → WORKFLOW_CHANGE_REQUIRED → architect.requests                      │
+│  Architect: [pauses, presents to user]                                         │
+│  User: [approves/rejects]                                                      │
+│  Architect: [creates v2 if approved, resumes]                                  │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Summary
 
 Sylk combines **DAG-based orchestration** with a **Guide-centered universal routing bus** and **LLM skill planning**.
 
 Key architectural principles:
 
-1. **Guide routes ALL messages** - No direct agent-to-agent communication
+1. **Guide routes user messages and ambiguous requests** - Direct consultation skills bypass Guide for known targets (token efficiency)
 2. **Sessions are the unit of isolation** - Context pollution prevention
 3. **Shared historical knowledge** - Cross-session learning via Archivalist
 4. **Architect is the user's primary interface** - All status, plans, and questions flow through Architect

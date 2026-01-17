@@ -90,10 +90,10 @@ type RequestBatch struct {
 
 // BatchedRequest wraps a request with its result channel
 type BatchedRequest struct {
-	Request  *RouteRequest    `json:"request"`
-	Result   chan *BatchResult `json:"-"`
-	Ctx      context.Context  `json:"-"`
-	AddedAt  time.Time        `json:"added_at"`
+	Request *RouteRequest     `json:"request"`
+	Result  chan *BatchResult `json:"-"`
+	Ctx     context.Context   `json:"-"`
+	AddedAt time.Time         `json:"added_at"`
 }
 
 // BatchResult contains the result of processing a batched request
@@ -106,12 +106,12 @@ type BatchResult struct {
 
 // BatchStats contains batch processor statistics
 type BatchStats struct {
-	TotalBatches     int64 `json:"total_batches"`
-	TotalRequests    int64 `json:"total_requests"`
-	ProcessedBatches int64 `json:"processed_batches"`
-	ProcessedReqs    int64 `json:"processed_requests"`
-	FailedRequests   int64 `json:"failed_requests"`
-	DroppedRequests  int64 `json:"dropped_requests"`
+	TotalBatches     int64   `json:"total_batches"`
+	TotalRequests    int64   `json:"total_requests"`
+	ProcessedBatches int64   `json:"processed_batches"`
+	ProcessedReqs    int64   `json:"processed_requests"`
+	FailedRequests   int64   `json:"failed_requests"`
+	DroppedRequests  int64   `json:"dropped_requests"`
 	AvgBatchSize     float64 `json:"avg_batch_size"`
 	AvgWaitTime      float64 `json:"avg_wait_time_ms"`
 }
@@ -291,43 +291,64 @@ func (bp *BatchProcessor) AddBatchSync(ctx context.Context, requests []*RouteReq
 
 // flushReady flushes batches that are ready
 func (bp *BatchProcessor) flushReady() {
+	readyBatches := bp.collectReadyBatches(time.Now())
+	bp.flushReadyBatches(readyBatches)
+}
+
+func (bp *BatchProcessor) collectReadyBatches(now time.Time) []string {
 	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
 	readyBatches := make([]string, 0)
-
-	now := time.Now()
 	for targetID, batch := range bp.batches {
-		batch.mu.Lock()
-		isReady := !batch.Processing &&
-			(len(batch.Requests) >= bp.config.MaxBatchSize ||
-				now.Sub(batch.CreatedAt) >= bp.config.MaxWaitTime)
-		batch.mu.Unlock()
-
-		if isReady {
+		if bp.batchReady(batch, now) {
 			readyBatches = append(readyBatches, targetID)
 		}
 	}
-	bp.mu.Unlock()
+	return readyBatches
+}
 
-	// Flush ready batches
+func (bp *BatchProcessor) batchReady(batch *RequestBatch, now time.Time) bool {
+	batch.mu.Lock()
+	defer batch.mu.Unlock()
+
+	if batch.Processing {
+		return false
+	}
+	if len(batch.Requests) >= bp.config.MaxBatchSize {
+		return true
+	}
+	return now.Sub(batch.CreatedAt) >= bp.config.MaxWaitTime
+}
+
+func (bp *BatchProcessor) flushReadyBatches(readyBatches []string) {
 	if bp.config.ParallelProcessing {
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, bp.config.MaxParallelBatches)
-		for _, targetID := range readyBatches {
-			sem <- struct{}{}
-			wg.Add(1)
-			go func(id string) {
-				defer func() {
-					<-sem
-					wg.Done()
-				}()
-				bp.flushBatch(id)
-			}(targetID)
-		}
-		wg.Wait()
-	} else {
-		for _, targetID := range readyBatches {
-			bp.flushBatch(targetID)
-		}
+		bp.flushReadyBatchesParallel(readyBatches)
+		return
+	}
+	bp.flushReadyBatchesSequential(readyBatches)
+}
+
+func (bp *BatchProcessor) flushReadyBatchesParallel(readyBatches []string) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, bp.config.MaxParallelBatches)
+	for _, targetID := range readyBatches {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(id string) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			bp.flushBatch(id)
+		}(targetID)
+	}
+	wg.Wait()
+}
+
+func (bp *BatchProcessor) flushReadyBatchesSequential(readyBatches []string) {
+	for _, targetID := range readyBatches {
+		bp.flushBatch(targetID)
 	}
 }
 

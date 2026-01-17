@@ -12,10 +12,10 @@ import (
 
 // SummaryGenerator creates hierarchical summaries from entries
 type SummaryGenerator struct {
-	client          *Client
-	archive         *Archive
-	factExtractor   *FactExtractor
-	maxEntriesPerSpan int
+	client              *Client
+	archive             *Archive
+	factExtractor       *FactExtractor
+	maxEntriesPerSpan   int
 	targetTokensPerSpan int
 }
 
@@ -147,28 +147,13 @@ func (g *SummaryGenerator) GenerateTaskSummary(ctx context.Context, taskEntries 
 		return nil, fmt.Errorf("no entries for task")
 	}
 
-	prompt := g.buildTaskPrompt(taskEntries)
-
-	generated, err := g.client.GenerateSummary(ctx, prompt)
+	generated, err := g.generateTaskSummary(ctx, taskEntries)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate task summary: %w", err)
+		return nil, err
 	}
 
-	sourceIDs := make([]string, len(taskEntries))
-	for i, e := range taskEntries {
-		sourceIDs[i] = e.ID
-	}
-
-	// Time range
-	var timeStart, timeEnd time.Time
-	for _, e := range taskEntries {
-		if timeStart.IsZero() || e.CreatedAt.Before(timeStart) {
-			timeStart = e.CreatedAt
-		}
-		if e.CreatedAt.After(timeEnd) {
-			timeEnd = e.CreatedAt
-		}
-	}
+	sourceIDs := taskEntryIDs(taskEntries)
+	timeStart, timeEnd := taskEntryTimeRange(taskEntries)
 
 	summary := &CompactedSummary{
 		ID:             uuid.New().String(),
@@ -186,6 +171,46 @@ func (g *SummaryGenerator) GenerateTaskSummary(ctx context.Context, taskEntries 
 	}
 
 	return summary, nil
+}
+
+func (g *SummaryGenerator) generateTaskSummary(ctx context.Context, taskEntries []*Entry) (*GeneratedSummary, error) {
+	prompt := g.buildTaskPrompt(taskEntries)
+	generated, err := g.client.GenerateSummary(ctx, prompt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate task summary: %w", err)
+	}
+	return generated, nil
+}
+
+func taskEntryIDs(entries []*Entry) []string {
+	ids := make([]string, len(entries))
+	for i, entry := range entries {
+		ids[i] = entry.ID
+	}
+	return ids
+}
+
+func taskEntryTimeRange(entries []*Entry) (time.Time, time.Time) {
+	var timeStart, timeEnd time.Time
+	for _, entry := range entries {
+		timeStart = pickEarlierTime(timeStart, entry.CreatedAt)
+		timeEnd = pickLaterTime(timeEnd, entry.CreatedAt)
+	}
+	return timeStart, timeEnd
+}
+
+func pickEarlierTime(current time.Time, candidate time.Time) time.Time {
+	if current.IsZero() || candidate.Before(current) {
+		return candidate
+	}
+	return current
+}
+
+func pickLaterTime(current time.Time, candidate time.Time) time.Time {
+	if current.IsZero() || candidate.After(current) {
+		return candidate
+	}
+	return current
 }
 
 // Prompt building helpers

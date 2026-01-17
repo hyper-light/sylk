@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -605,23 +606,21 @@ func (g *Guide) resolveToolName(agent *AgentRegistration, result *RouteResult) s
 
 // intentToAction maps intents to action verbs for tool names
 func (g *Guide) intentToAction(intent Intent) string {
-	switch intent {
-	case IntentRecall:
-		return "query"
-	case IntentStore:
-		return "record"
-	case IntentCheck:
-		return "check"
-	case IntentDeclare:
-		return "declare"
-	case IntentComplete:
-		return "complete"
-	case IntentHelp:
-		return "help"
-	case IntentStatus:
-		return "status"
-	default:
-		return string(intent)
+	if action, ok := intentActionMap()[intent]; ok {
+		return action
+	}
+	return string(intent)
+}
+
+func intentActionMap() map[Intent]string {
+	return map[Intent]string{
+		IntentRecall:   "query",
+		IntentStore:    "record",
+		IntentCheck:    "check",
+		IntentDeclare:  "declare",
+		IntentComplete: "complete",
+		IntentHelp:     "help",
+		IntentStatus:   "status",
 	}
 }
 
@@ -949,7 +948,7 @@ func (g *Guide) RouteCacheStats() RouteCacheStats {
 // handleRequestMessage processes incoming request messages from the event bus
 func (g *Guide) handleRequestMessage(msg *Message) error {
 	if msg.Type != MessageTypeRequest {
-		return nil // Ignore non-request messages
+		return nil
 	}
 
 	req, ok := msg.GetRouteRequest()
@@ -957,64 +956,54 @@ func (g *Guide) handleRequestMessage(msg *Message) error {
 		return fmt.Errorf("invalid request payload")
 	}
 
-	// Route the request
-	ctx := context.Background()
-	forwarded, err := g.Route(ctx, req)
+	forwarded, err := g.Route(context.Background(), req)
 	if err != nil {
-		// Publish error to source agent's responses channel
-		errMsg := NewErrorMessage(
-			generateMessageID(),
-			msg.CorrelationID,
-			g.agentID,
-			err.Error(),
-		)
-		// Use source agent's responses channel for errors from Guide
-		return g.bus.Publish(TopicResponses(req.SourceAgentID), errMsg)
+		return g.publishRouteError(msg.CorrelationID, req.SourceAgentID, err)
 	}
 
-	// Lookup actual target from pending
 	pending := g.pending.Get(forwarded.CorrelationID)
 	if pending == nil {
 		return fmt.Errorf("no pending request found for correlation ID: %s", forwarded.CorrelationID)
 	}
 
-	// Publish forwarded request to target agent's requests channel
-	targetTopic := TopicRequests(pending.TargetAgentID)
-
-	fwdMsg := NewForwardMessage(generateMessageID(), forwarded)
-	fwdMsg.TargetAgentID = pending.TargetAgentID
-
-	return g.bus.Publish(targetTopic, fwdMsg)
+	return g.publishForwardedRequest(pending.TargetAgentID, forwarded)
 }
 
-// handleResponseMessage processes incoming response messages from agent response channels
 func (g *Guide) handleResponseMessage(msg *Message) error {
-	if msg.Type != MessageTypeResponse {
-		return nil // Ignore non-response messages
-	}
+	switch msg.Type {
+	case MessageTypeResponse:
+		resp, ok := msg.GetRouteResponse()
+		if !ok {
+			return fmt.Errorf("invalid response payload")
+		}
 
-	resp, ok := msg.GetRouteResponse()
-	if !ok {
-		return fmt.Errorf("invalid response payload")
-	}
+		pending, err := g.HandleResponse(context.Background(), resp)
+		if err != nil {
+			return nil
+		}
 
-	// Handle the response - correlate and find source agent
-	ctx := context.Background()
-	pending, err := g.HandleResponse(ctx, resp)
-	if err != nil {
-		// No pending request found - log and drop
+		return g.publishResponseToSource(pending.SourceAgentID, resp)
+	case MessageTypeStream:
+		streamResp, ok := msg.GetStreamResponse()
+		if !ok {
+			return fmt.Errorf("invalid stream response payload")
+		}
+		pending := g.pending.Get(streamResp.CorrelationID)
+		if pending == nil {
+			return nil
+		}
+		streamResp.TargetAgentID = pending.SourceAgentID
+		streamResp.RespondingAgentID = pending.TargetAgentID
+		return g.publishStreamToSource(pending.SourceAgentID, streamResp)
+	default:
 		return nil
 	}
-
-	// Publish response to source agent's responses channel
-	respMsg := NewResponseMessage(generateMessageID(), resp)
-	return g.bus.Publish(TopicResponses(pending.SourceAgentID), respMsg)
 }
 
 // handleErrorMessage processes incoming error messages from agent error channels
 func (g *Guide) handleErrorMessage(msg *Message) error {
 	if msg.Type != MessageTypeError {
-		return nil // Ignore non-error messages
+		return nil
 	}
 
 	errStr, ok := msg.GetError()
@@ -1022,25 +1011,64 @@ func (g *Guide) handleErrorMessage(msg *Message) error {
 		return fmt.Errorf("invalid error payload")
 	}
 
-	// Convert error to response for correlation
-	resp := &RouteResponse{
+	resp := g.routeResponseFromError(msg, errStr)
+	pending, err := g.HandleResponse(context.Background(), resp)
+	if err != nil {
+		return nil
+	}
+
+	return g.publishErrorToSource(pending.SourceAgentID, msg.CorrelationID, msg.SourceAgentID, errStr)
+}
+
+func (g *Guide) publishRouteError(correlationID string, sourceAgentID string, err error) error {
+	errMsg := NewErrorMessage(generateMessageID(), correlationID, g.agentID, err.Error())
+	return g.bus.Publish(TopicResponses(sourceAgentID), errMsg)
+}
+
+func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *ForwardedRequest) error {
+	fwdMsg := g.forwardMessage(targetAgentID, forwarded)
+	return g.bus.Publish(TopicRequests(targetAgentID), fwdMsg)
+}
+
+func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest) *Message {
+	fwdMsg := NewForwardMessage(generateMessageID(), forwarded)
+	fwdMsg.TargetAgentID = targetAgentID
+	return fwdMsg
+}
+
+func (g *Guide) publishResponseToSource(sourceAgentID string, resp *RouteResponse) error {
+	respMsg := NewResponseMessage(generateMessageID(), resp)
+	return g.bus.Publish(TopicResponses(sourceAgentID), respMsg)
+}
+
+func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse) error {
+	msg := &Message{
+		ID:            generateMessageID(),
+		CorrelationID: resp.CorrelationID,
+		Type:          MessageTypeStream,
+		Payload:       resp,
+		SourceAgentID: resp.RespondingAgentID,
+		TargetAgentID: sourceAgentID,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+	return g.bus.Publish(TopicResponses(sourceAgentID), msg)
+}
+
+func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string) error {
+	errMsg := NewErrorMessage(generateMessageID(), correlationID, sourceAgent, errStr)
+	return g.bus.Publish(TopicResponses(sourceAgentID), errMsg)
+}
+
+func (g *Guide) routeResponseFromError(msg *Message, errStr string) *RouteResponse {
+	return &RouteResponse{
 		CorrelationID:     msg.CorrelationID,
 		Success:           false,
 		Error:             errStr,
 		RespondingAgentID: msg.SourceAgentID,
 	}
-
-	// Handle the response - correlate and find source agent
-	ctx := context.Background()
-	pending, err := g.HandleResponse(ctx, resp)
-	if err != nil {
-		// No pending request found - log and drop
-		return nil
-	}
-
-	// Publish error to source agent's responses channel (errors go to responses)
-	errMsg := NewErrorMessage(generateMessageID(), msg.CorrelationID, msg.SourceAgentID, errStr)
-	return g.bus.Publish(TopicResponses(pending.SourceAgentID), errMsg)
 }
 
 // PublishRequest publishes a route request to the event bus.

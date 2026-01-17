@@ -413,18 +413,23 @@ func (p *SessionPool) overAgentQueueLimit(job *SessionJob) bool {
 		return false
 	}
 
-	queued := p.countQueuedAgents(job.AgentType)
-	running := p.runningAgents[job.AgentType]
-	limit := p.maxAgents[job.AgentType]
+	queued, running, limit := p.agentQueueStats(job.AgentType)
+	if queued+running < limit {
+		return false
+	}
 
-	sameSession := p.sessionRunning(job.AgentType, job.SessionID) > 0
-	if sameSession {
-		return queued+running >= limit
+	if p.sessionRunning(job.AgentType, job.SessionID) > 0 {
+		return true
 	}
-	if !p.hasAvailableWorkers() {
-		return queued+running >= limit
-	}
-	return false
+
+	return !p.hasAvailableWorkers()
+}
+
+func (p *SessionPool) agentQueueStats(agentType string) (int, int, int) {
+	queued := p.countQueuedAgents(agentType)
+	running := p.runningAgents[agentType]
+	limit := p.maxAgents[agentType]
+	return queued, running, limit
 }
 
 func (p *SessionPool) hasAvailableWorkers() bool {
@@ -607,7 +612,14 @@ func (p *SessionPool) Stats() SessionPoolStats {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	stats := SessionPoolStats{
+	stats := p.baseStats()
+	p.fillSessionStats(&stats)
+	p.fillAgentStats(&stats)
+	return stats
+}
+
+func (p *SessionPool) baseStats() SessionPoolStats {
+	return SessionPoolStats{
 		Name:              p.name,
 		NumWorkers:        p.numWorkers,
 		MaxQueueSize:      p.maxQueueSize,
@@ -622,31 +634,31 @@ func (p *SessionPool) Stats() SessionPoolStats {
 		MaxJobsPerSession: p.maxJobsPerSession,
 		MaxTotalJobs:      p.maxTotalJobs,
 	}
+}
 
+func (p *SessionPool) fillSessionStats(stats *SessionPoolStats) {
 	for sessionID, sq := range p.sessionQueues {
-		sq.mu.Lock()
-		stats.SessionStats[sessionID] = SessionStats{
-			SessionID:   sessionID,
-			QueueLength: len(sq.jobs),
-			Submitted:   sq.submitted,
-			Completed:   sq.completed,
-			Failed:      sq.failed,
-		}
-		stats.TotalQueued += len(sq.jobs)
-		sq.mu.Unlock()
+		stats.TotalQueued += p.addSessionStats(stats, sessionID, sq)
 	}
+}
 
+func (p *SessionPool) addSessionStats(stats *SessionPoolStats, sessionID string, sq *sessionQueue) int {
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
+
+	stats.SessionStats[sessionID] = SessionStats{
+		SessionID:   sessionID,
+		QueueLength: len(sq.jobs),
+		Submitted:   sq.submitted,
+		Completed:   sq.completed,
+		Failed:      sq.failed,
+	}
+	return len(sq.jobs)
+}
+
+func (p *SessionPool) fillAgentStats(stats *SessionPoolStats) {
 	for agentType, limit := range p.maxAgents {
-		queued := 0
-		for _, sq := range p.sessionQueues {
-			sq.mu.Lock()
-			for _, job := range sq.jobs {
-				if job.AgentType == agentType {
-					queued++
-				}
-			}
-			sq.mu.Unlock()
-		}
+		queued := p.countQueuedAgentJobs(agentType)
 		stats.AgentStats[agentType] = AgentStats{
 			AgentType: agentType,
 			Limit:     limit,
@@ -654,8 +666,26 @@ func (p *SessionPool) Stats() SessionPoolStats {
 			Running:   p.runningAgents[agentType],
 		}
 	}
+}
 
-	return stats
+func (p *SessionPool) countQueuedAgentJobs(agentType string) int {
+	queued := 0
+	for _, sq := range p.sessionQueues {
+		sq.mu.Lock()
+		queued += p.countAgentJobsInQueue(sq, agentType)
+		sq.mu.Unlock()
+	}
+	return queued
+}
+
+func (p *SessionPool) countAgentJobsInQueue(sq *sessionQueue, agentType string) int {
+	queued := 0
+	for _, job := range sq.jobs {
+		if job.AgentType == agentType {
+			queued++
+		}
+	}
+	return queued
 }
 
 type SessionPoolStats struct {

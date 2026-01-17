@@ -169,32 +169,42 @@ const (
 func (qo *QueryOptimizer) Plan(query ArchiveQuery) *QueryPlan {
 	atomic.AddInt64(&qo.stats.totalQueries, 1)
 
-	// Check cache
 	cacheKey := qo.generateCacheKey(query)
-	qo.mu.RLock()
-	if plan, ok := qo.planCache[cacheKey]; ok {
-		if time.Since(plan.CreatedAt) < qo.config.PlanCacheTTL {
-			atomic.AddInt64(&qo.stats.cacheHits, 1)
-			qo.mu.RUnlock()
-			return plan
-		}
+	if plan, ok := qo.getCachedPlan(cacheKey); ok {
+		return plan
 	}
-	qo.mu.RUnlock()
 
 	atomic.AddInt64(&qo.stats.cacheMisses, 1)
 	atomic.AddInt64(&qo.stats.plannedQueries, 1)
 
-	// Generate new plan
 	plan := qo.generatePlan(query)
 	plan.CacheKey = cacheKey
+	qo.cachePlan(cacheKey, plan)
 
-	// Cache the plan
+	return plan
+}
+
+func (qo *QueryOptimizer) getCachedPlan(cacheKey string) (*QueryPlan, bool) {
+	qo.mu.RLock()
+	plan, ok := qo.planCache[cacheKey]
+	if !ok {
+		qo.mu.RUnlock()
+		return nil, false
+	}
+	isFresh := time.Since(plan.CreatedAt) < qo.config.PlanCacheTTL
+	qo.mu.RUnlock()
+	if !isFresh {
+		return nil, false
+	}
+	atomic.AddInt64(&qo.stats.cacheHits, 1)
+	return plan, true
+}
+
+func (qo *QueryOptimizer) cachePlan(cacheKey string, plan *QueryPlan) {
 	qo.mu.Lock()
 	qo.planCache[cacheKey] = plan
 	qo.evictOldPlansLocked()
 	qo.mu.Unlock()
-
-	return plan
 }
 
 // generatePlan creates a new query plan
@@ -327,64 +337,89 @@ func (qo *QueryOptimizer) trackParallel(parallel bool) {
 
 // selectPrimaryOperation chooses the best primary access method
 func (qo *QueryOptimizer) selectPrimaryOperation(query ArchiveQuery, totalEntries int64) QueryOperation {
-	candidates := make([]QueryOperation, 0)
-
-	// ID lookup is always fastest
-	if len(query.IDs) > 0 {
-		return QueryOperation{
-			Type:        OpIndexID,
-			Index:       "id",
-			Values:      query.IDs,
-			Selectivity: float64(len(query.IDs)) / float64(totalEntries),
-			Cost:        0.001 * float64(len(query.IDs)),
-		}
+	if op, ok := qo.fastIDLookup(query, totalEntries); ok {
+		return op
 	}
 
-	// Evaluate category index
-	if len(query.Categories) > 0 {
-		sel := qo.estimateCategorySelectivity(query.Categories)
-		candidates = append(candidates, QueryOperation{
-			Type:        OpIndexCategory,
-			Index:       "category",
-			Values:      categoriesToStrings(query.Categories),
-			Selectivity: sel,
-			Cost:        sel * 0.1,
-		})
-	}
-
-	// Evaluate source index
-	if len(query.Sources) > 0 {
-		sel := qo.estimateSourceSelectivity(query.Sources)
-		candidates = append(candidates, QueryOperation{
-			Type:        OpIndexSource,
-			Index:       "source",
-			Values:      sourcesToStrings(query.Sources),
-			Selectivity: sel,
-			Cost:        sel * 0.1,
-		})
-	}
-
-	// Evaluate session index
-	if len(query.SessionIDs) > 0 {
-		sel := qo.estimateSessionSelectivity(query.SessionIDs)
-		candidates = append(candidates, QueryOperation{
-			Type:        OpIndexSession,
-			Index:       "session",
-			Values:      query.SessionIDs,
-			Selectivity: sel,
-			Cost:        sel * 0.1,
-		})
-	}
-
-	// Select lowest cost operation
+	candidates := qo.collectPrimaryCandidates(query)
 	if len(candidates) > 0 {
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].Cost < candidates[j].Cost
-		})
-		return candidates[0]
+		return selectLowestCost(candidates)
 	}
 
-	// Default to full scan
+	return defaultScanOperation()
+}
+
+func (qo *QueryOptimizer) fastIDLookup(query ArchiveQuery, totalEntries int64) (QueryOperation, bool) {
+	if len(query.IDs) == 0 {
+		return QueryOperation{}, false
+	}
+	return QueryOperation{
+		Type:        OpIndexID,
+		Index:       "id",
+		Values:      query.IDs,
+		Selectivity: float64(len(query.IDs)) / float64(totalEntries),
+		Cost:        0.001 * float64(len(query.IDs)),
+	}, true
+}
+
+func (qo *QueryOptimizer) collectPrimaryCandidates(query ArchiveQuery) []QueryOperation {
+	candidates := make([]QueryOperation, 0)
+	candidates = qo.addCategoryCandidate(candidates, query)
+	candidates = qo.addSourceCandidate(candidates, query)
+	candidates = qo.addSessionCandidate(candidates, query)
+	return candidates
+}
+
+func (qo *QueryOptimizer) addCategoryCandidate(candidates []QueryOperation, query ArchiveQuery) []QueryOperation {
+	if len(query.Categories) == 0 {
+		return candidates
+	}
+	selectivity := qo.estimateCategorySelectivity(query.Categories)
+	return append(candidates, QueryOperation{
+		Type:        OpIndexCategory,
+		Index:       "category",
+		Values:      categoriesToStrings(query.Categories),
+		Selectivity: selectivity,
+		Cost:        selectivity * 0.1,
+	})
+}
+
+func (qo *QueryOptimizer) addSourceCandidate(candidates []QueryOperation, query ArchiveQuery) []QueryOperation {
+	if len(query.Sources) == 0 {
+		return candidates
+	}
+	selectivity := qo.estimateSourceSelectivity(query.Sources)
+	return append(candidates, QueryOperation{
+		Type:        OpIndexSource,
+		Index:       "source",
+		Values:      sourcesToStrings(query.Sources),
+		Selectivity: selectivity,
+		Cost:        selectivity * 0.1,
+	})
+}
+
+func (qo *QueryOptimizer) addSessionCandidate(candidates []QueryOperation, query ArchiveQuery) []QueryOperation {
+	if len(query.SessionIDs) == 0 {
+		return candidates
+	}
+	selectivity := qo.estimateSessionSelectivity(query.SessionIDs)
+	return append(candidates, QueryOperation{
+		Type:        OpIndexSession,
+		Index:       "session",
+		Values:      query.SessionIDs,
+		Selectivity: selectivity,
+		Cost:        selectivity * 0.1,
+	})
+}
+
+func selectLowestCost(candidates []QueryOperation) QueryOperation {
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Cost < candidates[j].Cost
+	})
+	return candidates[0]
+}
+
+func defaultScanOperation() QueryOperation {
 	return QueryOperation{
 		Type:        OpScanAll,
 		Selectivity: 1.0,

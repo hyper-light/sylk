@@ -446,35 +446,45 @@ func (s *StatusStore) persistRecord(record *StatusRecord) {
 // Get retrieves a status record by message ID.
 // Checks hot storage first, then cold storage.
 func (s *StatusStore) Get(id string) (*StatusRecord, bool) {
-	// Check hot storage
-	if val, ok := s.cache.Get(id); ok {
-		s.metrics.mu.Lock()
-		s.metrics.HotHits++
-		s.metrics.mu.Unlock()
-		return val.(*StatusRecord), true
-	}
-
-	s.metrics.mu.Lock()
-	s.metrics.HotMisses++
-	s.metrics.mu.Unlock()
-
-	// Check cold storage
-	record, err := s.getFromCold(id)
-	if err == nil && record != nil {
-		s.metrics.mu.Lock()
-		s.metrics.ColdHits++
-		s.metrics.mu.Unlock()
-
-		// Promote back to hot storage
-		s.cache.Set(id, record, record.Cost())
+	if record, ok := s.getFromHot(id); ok {
 		return record, true
 	}
 
-	s.metrics.mu.Lock()
-	s.metrics.ColdMisses++
-	s.metrics.mu.Unlock()
+	record, ok := s.getFromColdStore(id)
+	if ok {
+		return record, true
+	}
 
+	s.incrementMetric(&s.metrics.ColdMisses)
 	return nil, false
+}
+
+func (s *StatusStore) getFromHot(id string) (*StatusRecord, bool) {
+	val, ok := s.cache.Get(id)
+	if !ok {
+		s.incrementMetric(&s.metrics.HotMisses)
+		return nil, false
+	}
+
+	s.incrementMetric(&s.metrics.HotHits)
+	return val.(*StatusRecord), true
+}
+
+func (s *StatusStore) getFromColdStore(id string) (*StatusRecord, bool) {
+	record, err := s.getFromCold(id)
+	if err != nil || record == nil {
+		return nil, false
+	}
+
+	s.incrementMetric(&s.metrics.ColdHits)
+	s.cache.Set(id, record, record.Cost())
+	return record, true
+}
+
+func (s *StatusStore) incrementMetric(metric *int64) {
+	s.metrics.mu.Lock()
+	*metric = *metric + 1
+	s.metrics.mu.Unlock()
 }
 
 // getFromCold retrieves a record from SQLite

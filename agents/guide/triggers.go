@@ -136,64 +136,82 @@ func (td *TriggerDetector) Detect(input string) *TriggerResult {
 
 // detectDSLTrigger handles DSL command detection
 func (td *TriggerDetector) detectDSLTrigger(input string) *TriggerResult {
-	result := &TriggerResult{
+	result := newDSLTriggerResult()
+	input = strings.TrimPrefix(input, "@")
+	inputLower := strings.ToLower(input)
+
+	if td.applyDSLPrefix(result, input, inputLower) {
+		return result
+	}
+	if td.applyActionShortcut(result, inputLower) {
+		return result
+	}
+	return td.applyFullDSL(result, input)
+}
+
+func newDSLTriggerResult() *TriggerResult {
+	return &TriggerResult{
 		ShouldRoute: true,
 		Reason:      "DSL command detected",
 		TriggerType: TriggerTypeDSL,
 		IsDSL:       true,
 	}
+}
 
-	input = strings.TrimPrefix(input, "@")
-	inputLower := strings.ToLower(input)
-
-	// Check for new DSL patterns first
+func (td *TriggerDetector) applyDSLPrefix(result *TriggerResult, input string, inputLower string) bool {
 	switch {
 	case strings.HasPrefix(inputLower, "guide"):
-		// @guide <query> - intent-based routing
 		result.Reason = "Intent-based routing via @guide"
 		result.SuggestedTarget = TargetGuide
-		return result
-
+		return true
 	case strings.HasPrefix(inputLower, "to:"):
-		// @to:<agent> - direct routing
-		parts := strings.SplitN(input[3:], " ", 2)
-		agent := strings.ToLower(parts[0])
+		agent := td.parseDSLAgent(input, 3)
 		result.Reason = "Direct routing via @to:" + agent
 		result.SuggestedTarget = td.resolveTargetAgent(agent)
-		return result
-
+		return true
 	case strings.HasPrefix(inputLower, "from:"):
-		// @from:<agent> - response routing
-		parts := strings.SplitN(input[5:], " ", 2)
-		agent := strings.ToLower(parts[0])
+		agent := td.parseDSLAgent(input, 5)
 		result.Reason = "Response routing via @from:" + agent
 		result.SuggestedTarget = td.resolveTargetAgent(agent)
-		return result
+		return true
+	default:
+		return false
+	}
+}
+
+func (td *TriggerDetector) parseDSLAgent(input string, offset int) string {
+	parts := strings.SplitN(input[offset:], " ", 2)
+	return strings.ToLower(parts[0])
+}
+
+func (td *TriggerDetector) applyActionShortcut(result *TriggerResult, inputLower string) bool {
+	if td.routing == nil {
+		return false
 	}
 
-	// Check for registered action shortcuts
-	if td.routing != nil {
-		// Get the first word (potential action)
-		actionEnd := strings.IndexAny(input, " \t:")
-		action := inputLower
-		if actionEnd > 0 {
-			action = inputLower[:actionEnd]
-		}
-
-		if _, agentID, ok := td.routing.GetActionShortcut(action); ok {
-			result.Reason = "Action shortcut via @" + action
-			result.SuggestedTarget = TargetAgent(agentID)
-			return result
-		}
+	action := td.extractAction(inputLower)
+	if _, agentID, ok := td.routing.GetActionShortcut(action); ok {
+		result.Reason = "Action shortcut via @" + action
+		result.SuggestedTarget = TargetAgent(agentID)
+		return true
 	}
+	return false
+}
 
-	// Full DSL format: @agent:intent:domain...
+func (td *TriggerDetector) extractAction(inputLower string) string {
+	actionEnd := strings.IndexAny(inputLower, " \t:")
+	if actionEnd > 0 {
+		return inputLower[:actionEnd]
+	}
+	return inputLower
+}
+
+func (td *TriggerDetector) applyFullDSL(result *TriggerResult, input string) *TriggerResult {
 	parts := strings.SplitN(input, ":", 2)
 	if len(parts) > 0 {
 		agent := strings.ToLower(parts[0])
 		result.SuggestedTarget = td.resolveTargetAgent(agent)
 	}
-
 	return result
 }
 
@@ -220,7 +238,6 @@ func (td *TriggerDetector) resolveTargetAgent(agent string) TargetAgent {
 func DetectTrigger(input string) *TriggerResult {
 	return NewTriggerDetector(nil).Detect(input)
 }
-
 
 // matchTrigger checks if input contains any of the trigger phrases
 func matchTrigger(inputLower string, triggers []string) string {
@@ -309,39 +326,69 @@ func (tr *TriggerRegistry) Detect(input string) *TriggerResult {
 	input = strings.TrimSpace(input)
 	inputLower := strings.ToLower(input)
 
-	// Check for DSL first
 	if strings.HasPrefix(input, "@") {
-		detector := NewTriggerDetector(tr.routing)
-		return detector.detectDSLTrigger(input)
+		return tr.detectDSL(input)
 	}
 
-	// Check guide triggers
-	if trigger := matchTrigger(inputLower, tr.guide); trigger != "" {
-		return &TriggerResult{
-			ShouldRoute:     true,
-			Reason:          "Guide query detected",
-			TriggerType:     TriggerTypeGuide,
-			SuggestedTarget: TargetGuide,
-			MatchedTrigger:  trigger,
-		}
+	if result := tr.detectGuideTrigger(inputLower); result != nil {
+		return result
 	}
 
-	// Check registered agent triggers from routing
-	if tr.routing != nil {
-		for agentID, triggers := range tr.routing.GetAllStrongTriggers() {
-			if trigger := matchTrigger(inputLower, triggers); trigger != "" {
-				return &TriggerResult{
-					ShouldRoute:     true,
-					Reason:          "Agent trigger detected - route to " + agentID,
-					TriggerType:     TriggerTypeRetrospective,
-					SuggestedTarget: TargetAgent(agentID),
-					MatchedTrigger:  trigger,
-				}
+	if result := tr.detectRoutingTriggers(inputLower); result != nil {
+		return result
+	}
+
+	if result := tr.detectCustomTrigger(inputLower); result != nil {
+		return result
+	}
+
+	return &TriggerResult{
+		ShouldRoute: false,
+		Reason:      "No trigger detected",
+		TriggerType: TriggerTypeNone,
+	}
+}
+
+func (tr *TriggerRegistry) detectDSL(input string) *TriggerResult {
+	detector := NewTriggerDetector(tr.routing)
+	return detector.detectDSLTrigger(input)
+}
+
+func (tr *TriggerRegistry) detectGuideTrigger(inputLower string) *TriggerResult {
+	trigger := matchTrigger(inputLower, tr.guide)
+	if trigger == "" {
+		return nil
+	}
+	return &TriggerResult{
+		ShouldRoute:     true,
+		Reason:          "Guide query detected",
+		TriggerType:     TriggerTypeGuide,
+		SuggestedTarget: TargetGuide,
+		MatchedTrigger:  trigger,
+	}
+}
+
+func (tr *TriggerRegistry) detectRoutingTriggers(inputLower string) *TriggerResult {
+	if tr.routing == nil {
+		return nil
+	}
+
+	for agentID, triggers := range tr.routing.GetAllStrongTriggers() {
+		if trigger := matchTrigger(inputLower, triggers); trigger != "" {
+			return &TriggerResult{
+				ShouldRoute:     true,
+				Reason:          "Agent trigger detected - route to " + agentID,
+				TriggerType:     TriggerTypeRetrospective,
+				SuggestedTarget: TargetAgent(agentID),
+				MatchedTrigger:  trigger,
 			}
 		}
 	}
 
-	// Check custom triggers
+	return nil
+}
+
+func (tr *TriggerRegistry) detectCustomTrigger(inputLower string) *TriggerResult {
 	for target, triggers := range tr.custom {
 		if trigger := matchTrigger(inputLower, triggers); trigger != "" {
 			return &TriggerResult{
@@ -353,10 +400,5 @@ func (tr *TriggerRegistry) Detect(input string) *TriggerResult {
 			}
 		}
 	}
-
-	return &TriggerResult{
-		ShouldRoute: false,
-		Reason:      "No trigger detected",
-		TriggerType: TriggerTypeNone,
-	}
+	return nil
 }

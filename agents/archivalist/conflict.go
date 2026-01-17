@@ -134,19 +134,35 @@ func (cd *ConflictDetector) ruleForScope(scope Scope) (ResolutionRule, bool) {
 }
 
 func (cd *ConflictDetector) dispatchConflict(scope Scope, key string, incoming map[string]any, agentID string, rule ResolutionRule) *ConflictResult {
-	switch scope {
-	case ScopeFiles:
-		return cd.detectFileConflict(key, incoming, agentID)
-	case ScopePatterns:
-		return cd.detectPatternConflict(key, incoming, agentID, rule)
-	case ScopeFailures:
-		return cd.detectFailureConflict(key, incoming, agentID)
-	case ScopeIntents:
-		return cd.detectIntentConflict(key, incoming, agentID, rule)
-	case ScopeResume:
-		return cd.detectResumeConflict(incoming, agentID, rule)
-	default:
+	handlers := cd.conflictHandlers(key, incoming, agentID, rule)
+	handler, ok := handlers[scope]
+	if !ok {
 		return cd.acceptNoConflict()
+	}
+	return handler()
+}
+
+type conflictHandler func() *ConflictResult
+
+type conflictHandlers map[Scope]conflictHandler
+
+func (cd *ConflictDetector) conflictHandlers(key string, incoming map[string]any, agentID string, rule ResolutionRule) conflictHandlers {
+	return conflictHandlers{
+		ScopeFiles: func() *ConflictResult {
+			return cd.detectFileConflict(key, incoming, agentID)
+		},
+		ScopePatterns: func() *ConflictResult {
+			return cd.detectPatternConflict(key, incoming, agentID, rule)
+		},
+		ScopeFailures: func() *ConflictResult {
+			return cd.detectFailureConflict(key, incoming, agentID)
+		},
+		ScopeIntents: func() *ConflictResult {
+			return cd.detectIntentConflict(key, incoming, agentID, rule)
+		},
+		ScopeResume: func() *ConflictResult {
+			return cd.detectResumeConflict(incoming, agentID, rule)
+		},
 	}
 }
 

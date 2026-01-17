@@ -458,6 +458,10 @@ func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.Fo
 	if err != nil {
 		return nil, err
 	}
+	return a.executeForwarded(ctx, handler, fwd)
+}
+
+func (a *Archivalist) executeForwarded(ctx context.Context, handler forwardedHandler, fwd *guide.ForwardedRequest) (any, error) {
 	return handler(ctx, fwd)
 }
 
@@ -1258,19 +1262,25 @@ func (a *Archivalist) UnregisterAgent(agentID string) error {
 
 // HandleRequest processes a protocol request and returns a response
 func (a *Archivalist) HandleRequest(ctx context.Context, req *Request) Response {
-	switch req.GetMessageType() {
-	case MsgTypeRegister:
-		return a.handleRegister(ctx, req)
-	case MsgTypeWrite:
-		return a.handleWrite(ctx, req)
-	case MsgTypeBatch:
-		return a.handleBatch(ctx, req)
-	case MsgTypeRead:
-		return a.handleRead(ctx, req)
-	case MsgTypeBriefing:
-		return a.handleBriefing(ctx, req)
-	default:
+	handlers := a.requestHandlers(ctx, req)
+	handler, ok := handlers[req.GetMessageType()]
+	if !ok {
 		return ErrorResponse("unknown request type")
+	}
+	return handler()
+}
+
+type requestHandler func() Response
+
+type requestHandlers map[MessageType]requestHandler
+
+func (a *Archivalist) requestHandlers(ctx context.Context, req *Request) requestHandlers {
+	return requestHandlers{
+		MsgTypeRegister: func() Response { return a.handleRegister(ctx, req) },
+		MsgTypeWrite:    func() Response { return a.handleWrite(ctx, req) },
+		MsgTypeBatch:    func() Response { return a.handleBatch(ctx, req) },
+		MsgTypeRead:     func() Response { return a.handleRead(ctx, req) },
+		MsgTypeBriefing: func() Response { return a.handleBriefing(ctx, req) },
 	}
 }
 
@@ -1292,14 +1302,8 @@ func (a *Archivalist) handleRegister(ctx context.Context, req *Request) Response
 }
 
 func (a *Archivalist) handleWrite(ctx context.Context, req *Request) Response {
-	if err := a.validateWriteRequest(req); err != nil {
-		return ErrorResponse(err.Error())
-	}
-
-	a.registry.Touch(req.AgentID)
-	scope, key := ParseScope(req.Write.Scope)
-
-	if resp := a.checkVersionConflict(req); resp != nil {
+	scope, key, resp := a.prepareWrite(req)
+	if resp != nil {
 		return *resp
 	}
 
@@ -1309,6 +1313,22 @@ func (a *Archivalist) handleWrite(ctx context.Context, req *Request) Response {
 	}
 
 	return a.executeWrite(ctx, scope, key, req, conflictResult)
+}
+
+func (a *Archivalist) prepareWrite(req *Request) (Scope, string, *Response) {
+	if err := a.validateWriteRequest(req); err != nil {
+		resp := ErrorResponse(err.Error())
+		return "", "", &resp
+	}
+
+	a.registry.Touch(req.AgentID)
+	scope, key := ParseScope(req.Write.Scope)
+
+	if resp := a.checkVersionConflict(req); resp != nil {
+		return scope, key, resp
+	}
+
+	return scope, key, nil
 }
 
 func (a *Archivalist) validateWriteRequest(req *Request) error {

@@ -469,16 +469,31 @@ func (sc *StreamConsumer) CollectData() []any {
 		if !ok {
 			break
 		}
-		if event.Type == StreamEventData {
-			if event.Data != nil {
-				data = append(data, event.Data)
-			} else if event.Text != "" {
-				data = append(data, event.Text)
-			}
+
+		if sc.isDataEvent(event) {
+			data = sc.appendEventData(data, event)
 		}
-		if event.Type == StreamEventEnd || event.Type == StreamEventError {
+		if sc.isTerminalEvent(event) {
 			break
 		}
+	}
+	return data
+}
+
+func (sc *StreamConsumer) isDataEvent(event *StreamEvent) bool {
+	return event.Type == StreamEventData
+}
+
+func (sc *StreamConsumer) isTerminalEvent(event *StreamEvent) bool {
+	return event.Type == StreamEventEnd || event.Type == StreamEventError
+}
+
+func (sc *StreamConsumer) appendEventData(data []any, event *StreamEvent) []any {
+	if event.Data != nil {
+		return append(data, event.Data)
+	}
+	if event.Text != "" {
+		return append(data, event.Text)
 	}
 	return data
 }
@@ -491,14 +506,18 @@ func (sc *StreamConsumer) CollectText() string {
 		if !ok {
 			break
 		}
-		if event.Type == StreamEventData && event.Text != "" {
+		if sc.isTextEvent(event) {
 			text += event.Text
 		}
-		if event.Type == StreamEventEnd || event.Type == StreamEventError {
+		if sc.isTerminalEvent(event) {
 			break
 		}
 	}
 	return text
+}
+
+func (sc *StreamConsumer) isTextEvent(event *StreamEvent) bool {
+	return event.Type == StreamEventData && event.Text != ""
 }
 
 // =============================================================================

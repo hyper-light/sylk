@@ -162,27 +162,37 @@ func (r *TopicRouter) Match(topic string) []*topicSubscription {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var matches []*topicSubscription
-
-	// Check exact matches first (fast path)
-	if subs := r.exact[topic]; len(subs) > 0 {
-		atomic.AddInt64(&r.stats.exactHits, 1)
-		for _, sub := range subs {
-			if sub.active.Load() {
-				matches = append(matches, sub)
-			}
-		}
-	}
-
-	// Check wildcard patterns
-	segments := splitTopic(topic)
-	wildcardMatches := r.matchWildcards(segments)
-	if len(wildcardMatches) > 0 {
-		atomic.AddInt64(&r.stats.wildcardHits, 1)
-		matches = append(matches, wildcardMatches...)
-	}
+	matches := make([]*topicSubscription, 0)
+	matches = r.appendExactMatches(matches, topic)
+	matches = r.appendWildcardMatches(matches, topic)
 
 	return matches
+}
+
+func (r *TopicRouter) appendExactMatches(matches []*topicSubscription, topic string) []*topicSubscription {
+	subs := r.exact[topic]
+	if len(subs) == 0 {
+		return matches
+	}
+
+	atomic.AddInt64(&r.stats.exactHits, 1)
+	for _, sub := range subs {
+		if sub.active.Load() {
+			matches = append(matches, sub)
+		}
+	}
+	return matches
+}
+
+func (r *TopicRouter) appendWildcardMatches(matches []*topicSubscription, topic string) []*topicSubscription {
+	segments := splitTopic(topic)
+	wildcardMatches := r.matchWildcards(segments)
+	if len(wildcardMatches) == 0 {
+		return matches
+	}
+
+	atomic.AddInt64(&r.stats.wildcardHits, 1)
+	return append(matches, wildcardMatches...)
 }
 
 // MatchHandlers returns all handlers that match a topic
@@ -306,16 +316,33 @@ func (r *TopicRouter) matchRecursive(node *trieNode, segments []string, idx int,
 	if r.matchesAtEnd(node, segments, idx, seen) {
 		return
 	}
+
 	segment := segments[idx]
-	if child, ok := node.children[segment]; ok {
-		r.matchRecursive(child, segments, idx+1, seen)
+	r.matchExactChild(node, segment, segments, idx, seen)
+	r.matchSingleWildcard(node, segments, idx, seen)
+	r.matchMultiWildcardChild(node, segments, idx, seen)
+}
+
+func (r *TopicRouter) matchExactChild(node *trieNode, segment string, segments []string, idx int, seen map[int64]*topicSubscription) {
+	child, ok := node.children[segment]
+	if !ok {
+		return
 	}
-	if node.singleWildcard != nil {
-		r.matchRecursive(node.singleWildcard, segments, idx+1, seen)
+	r.matchRecursive(child, segments, idx+1, seen)
+}
+
+func (r *TopicRouter) matchSingleWildcard(node *trieNode, segments []string, idx int, seen map[int64]*topicSubscription) {
+	if node.singleWildcard == nil {
+		return
 	}
-	if node.multiWildcard != nil {
-		r.matchMultiWildcard(node.multiWildcard, segments, idx, seen)
+	r.matchRecursive(node.singleWildcard, segments, idx+1, seen)
+}
+
+func (r *TopicRouter) matchMultiWildcardChild(node *trieNode, segments []string, idx int, seen map[int64]*topicSubscription) {
+	if node.multiWildcard == nil {
+		return
 	}
+	r.matchMultiWildcard(node.multiWildcard, segments, idx, seen)
 }
 
 func (r *TopicRouter) matchesAtEnd(node *trieNode, segments []string, idx int, seen map[int64]*topicSubscription) bool {

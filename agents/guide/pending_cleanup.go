@@ -156,42 +156,61 @@ func (c *PendingCleanup) cleanup() {
 
 // handleExpired processes an expired entry
 func (c *PendingCleanup) handleExpired(entry *PendingEntry) {
-	// Remove from pending
+	c.removePendingEntry(entry)
+	c.recordExpiredFailure(entry)
+	c.markAgentDegraded(entry)
+	c.enqueueDeadLetter(entry)
+	c.notifyTimeout(entry)
+}
+
+func (c *PendingCleanup) removePendingEntry(entry *PendingEntry) {
 	c.pending.Delete(entry.CorrelationID)
 	c.totalExpired++
+}
 
-	// Record failure in circuit breaker
-	if c.circuits != nil && entry.TargetAgentID != "" {
-		c.circuits.RecordFailure(entry.TargetAgentID)
+func (c *PendingCleanup) recordExpiredFailure(entry *PendingEntry) {
+	if c.circuits == nil || entry.TargetAgentID == "" {
+		return
 	}
+	c.circuits.RecordFailure(entry.TargetAgentID)
+}
 
-	// Mark agent as degraded in health monitor
-	if c.health != nil && entry.TargetAgentID != "" {
-		if health, ok := c.health.agents.Get(entry.TargetAgentID); ok {
-			health.SetDegraded()
-		}
+func (c *PendingCleanup) markAgentDegraded(entry *PendingEntry) {
+	if c.health == nil || entry.TargetAgentID == "" {
+		return
 	}
+	if health, ok := c.health.agents.Get(entry.TargetAgentID); ok {
+		health.SetDegraded()
+	}
+}
 
-	// Add to DLQ if configured
-	if c.dlq != nil {
-		c.dlq.Add(&DeadLetter{
-			Message: &Message{
-				CorrelationID: entry.CorrelationID,
-				TargetAgentID: entry.TargetAgentID,
-				Timestamp:     entry.SentAt,
-			},
-			Reason:            DeadLetterReasonTimeout,
-			Error:             "request timed out",
-			Attempts:          1,
-			OriginalTimestamp: entry.SentAt,
-			TargetAgentID:     entry.TargetAgentID,
-		})
+func (c *PendingCleanup) enqueueDeadLetter(entry *PendingEntry) {
+	if c.dlq == nil {
+		return
 	}
+	c.dlq.Add(buildTimeoutDeadLetter(entry))
+}
 
-	// Call timeout callback
-	if entry.OnTimeout != nil {
-		go entry.OnTimeout(entry)
+func buildTimeoutDeadLetter(entry *PendingEntry) *DeadLetter {
+	return &DeadLetter{
+		Message: &Message{
+			CorrelationID: entry.CorrelationID,
+			TargetAgentID: entry.TargetAgentID,
+			Timestamp:     entry.SentAt,
+		},
+		Reason:            DeadLetterReasonTimeout,
+		Error:             "request timed out",
+		Attempts:          1,
+		OriginalTimestamp: entry.SentAt,
+		TargetAgentID:     entry.TargetAgentID,
 	}
+}
+
+func (c *PendingCleanup) notifyTimeout(entry *PendingEntry) {
+	if entry.OnTimeout == nil {
+		return
+	}
+	go entry.OnTimeout(entry)
 }
 
 // Len returns the number of pending requests

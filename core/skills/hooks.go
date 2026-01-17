@@ -596,30 +596,19 @@ func (r *HookRegistry) executeToolCallHooks(ctx context.Context, hooks []ToolCal
 
 func (r *HookRegistry) executeStoreHooks(ctx context.Context, hooks []StoreHook, data *StoreHookData) (*StoreHookData, HookResult, error) {
 	current := data
-	var lastResult HookResult
+	lastResult := HookResult{}
 
 	for _, hook := range hooks {
-		select {
-		case <-ctx.Done():
-			return current, lastResult, ctx.Err()
-		default:
+		result, err := executeStoreHook(ctx, hook, current)
+		if err != nil {
+			return current, lastResult, err
 		}
-
-		result := hook.Execute(ctx, current)
 		lastResult = result
 
-		if result.Error != nil {
-			return current, result, result.Error
-		}
-
+		current = updateStoreHookData(current, result)
 		if result.SkipExecution {
 			return current, result, nil
 		}
-
-		if result.ModifiedStoreData != nil {
-			current = result.ModifiedStoreData
-		}
-
 		if !result.Continue {
 			break
 		}
@@ -628,38 +617,67 @@ func (r *HookRegistry) executeStoreHooks(ctx context.Context, hooks []StoreHook,
 	return current, lastResult, nil
 }
 
+func executeStoreHook(ctx context.Context, hook StoreHook, current *StoreHookData) (HookResult, error) {
+	if err := ensureHookContext(ctx); err != nil {
+		return HookResult{}, err
+	}
+
+	result := hook.Execute(ctx, current)
+	if result.Error != nil {
+		return result, result.Error
+	}
+
+	return result, nil
+}
+
+func updateStoreHookData(current *StoreHookData, result HookResult) *StoreHookData {
+	if result.ModifiedStoreData != nil {
+		return result.ModifiedStoreData
+	}
+	return current
+}
+
 func (r *HookRegistry) executeQueryHooks(ctx context.Context, hooks []QueryHook, data *QueryHookData) (*QueryHookData, HookResult, error) {
 	current := data
-	var lastResult HookResult
+	lastResult := HookResult{}
 
 	for _, hook := range hooks {
-		select {
-		case <-ctx.Done():
-			return current, lastResult, ctx.Err()
-		default:
+		result, err := executeQueryHook(ctx, hook, current)
+		if err != nil {
+			return current, lastResult, err
 		}
-
-		result := hook.Execute(ctx, current)
 		lastResult = result
 
-		if result.Error != nil {
-			return current, result, result.Error
-		}
-
+		current = updateQueryHookData(current, result)
 		if result.SkipExecution {
 			return current, result, nil
 		}
-
-		if result.ModifiedQueryData != nil {
-			current = result.ModifiedQueryData
-		}
-
 		if !result.Continue {
 			break
 		}
 	}
 
 	return current, lastResult, nil
+}
+
+func executeQueryHook(ctx context.Context, hook QueryHook, current *QueryHookData) (HookResult, error) {
+	if err := ensureHookContext(ctx); err != nil {
+		return HookResult{}, err
+	}
+
+	result := hook.Execute(ctx, current)
+	if result.Error != nil {
+		return result, result.Error
+	}
+
+	return result, nil
+}
+
+func updateQueryHookData(current *QueryHookData, result HookResult) *QueryHookData {
+	if result.ModifiedQueryData != nil {
+		return result.ModifiedQueryData
+	}
+	return current
 }
 
 func insertPromptHookSorted(hooks []PromptHook, hook PromptHook) []PromptHook {

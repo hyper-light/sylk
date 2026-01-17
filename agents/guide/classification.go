@@ -354,37 +354,46 @@ func (c *Classifier) containsAny(textLower string, needles []string) bool {
 
 // parseToolUseResult parses the JSON input from tool use
 func (c *Classifier) parseToolUseResult(inputJSON []byte) (*ClassificationResult, error) {
-	var raw struct {
-		IsRetrospective bool   `json:"is_retrospective"`
-		RejectionReason string `json:"rejection_reason"`
-		Intent          string `json:"intent"`
-		Domain          string `json:"domain"`
-		TargetAgent     string `json:"target_agent"`
-		Entities        *struct {
-			Scope        string         `json:"scope"`
-			Timeframe    string         `json:"timeframe"`
-			AgentID      string         `json:"agent_id"`
-			AgentName    string         `json:"agent_name"`
-			FilePaths    []string       `json:"file_paths"`
-			ErrorType    string         `json:"error_type"`
-			ErrorMessage string         `json:"error_message"`
-			Data         map[string]any `json:"data"`
-			Query        string         `json:"query"`
-		} `json:"entities"`
-		Confidence  float64 `json:"confidence"`
-		MultiIntent bool    `json:"multi_intent"`
-		SubIntents  []struct {
-			Intent     string  `json:"intent"`
-			Domain     string  `json:"domain"`
-			Confidence float64 `json:"confidence"`
-		} `json:"sub_intents"`
-	}
-
+	var raw classifierRawResult
 	if err := json.Unmarshal(inputJSON, &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse classification result: %w", err)
 	}
 
-	result := &ClassificationResult{
+	result := c.baseClassificationResult(raw)
+	c.applyRawEntities(result, raw)
+	c.applyRawSubIntents(result, raw)
+
+	return result, nil
+}
+
+type classifierRawResult struct {
+	IsRetrospective bool   `json:"is_retrospective"`
+	RejectionReason string `json:"rejection_reason"`
+	Intent          string `json:"intent"`
+	Domain          string `json:"domain"`
+	TargetAgent     string `json:"target_agent"`
+	Entities        *struct {
+		Scope        string         `json:"scope"`
+		Timeframe    string         `json:"timeframe"`
+		AgentID      string         `json:"agent_id"`
+		AgentName    string         `json:"agent_name"`
+		FilePaths    []string       `json:"file_paths"`
+		ErrorType    string         `json:"error_type"`
+		ErrorMessage string         `json:"error_message"`
+		Data         map[string]any `json:"data"`
+		Query        string         `json:"query"`
+	} `json:"entities"`
+	Confidence  float64 `json:"confidence"`
+	MultiIntent bool    `json:"multi_intent"`
+	SubIntents  []struct {
+		Intent     string  `json:"intent"`
+		Domain     string  `json:"domain"`
+		Confidence float64 `json:"confidence"`
+	} `json:"sub_intents"`
+}
+
+func (c *Classifier) baseClassificationResult(raw classifierRawResult) *ClassificationResult {
+	return &ClassificationResult{
 		IsRetrospective: raw.IsRetrospective,
 		RejectionReason: raw.RejectionReason,
 		Intent:          Intent(raw.Intent),
@@ -392,36 +401,40 @@ func (c *Classifier) parseToolUseResult(inputJSON []byte) (*ClassificationResult
 		Confidence:      raw.Confidence,
 		MultiIntent:     raw.MultiIntent,
 	}
+}
 
-	// Convert entities
-	if raw.Entities != nil {
-		result.Entities = &ExtractedEntities{
-			Scope:        raw.Entities.Scope,
-			Timeframe:    raw.Entities.Timeframe,
-			AgentID:      raw.Entities.AgentID,
-			AgentName:    raw.Entities.AgentName,
-			FilePaths:    raw.Entities.FilePaths,
-			ErrorType:    raw.Entities.ErrorType,
-			ErrorMessage: raw.Entities.ErrorMessage,
-			Data:         raw.Entities.Data,
-			Query:        raw.Entities.Query,
-		}
+func (c *Classifier) applyRawEntities(result *ClassificationResult, raw classifierRawResult) {
+	if raw.Entities == nil {
+		return
 	}
 
-	// Convert sub-intents
-	if raw.MultiIntent && len(raw.SubIntents) > 0 {
-		result.SubResults = make([]*ClassificationResult, 0, len(raw.SubIntents))
-		for _, sub := range raw.SubIntents {
-			result.SubResults = append(result.SubResults, &ClassificationResult{
-				IsRetrospective: raw.IsRetrospective,
-				Intent:          Intent(sub.Intent),
-				Domain:          Domain(sub.Domain),
-				Confidence:      sub.Confidence,
-			})
-		}
+	result.Entities = &ExtractedEntities{
+		Scope:        raw.Entities.Scope,
+		Timeframe:    raw.Entities.Timeframe,
+		AgentID:      raw.Entities.AgentID,
+		AgentName:    raw.Entities.AgentName,
+		FilePaths:    raw.Entities.FilePaths,
+		ErrorType:    raw.Entities.ErrorType,
+		ErrorMessage: raw.Entities.ErrorMessage,
+		Data:         raw.Entities.Data,
+		Query:        raw.Entities.Query,
+	}
+}
+
+func (c *Classifier) applyRawSubIntents(result *ClassificationResult, raw classifierRawResult) {
+	if !raw.MultiIntent || len(raw.SubIntents) == 0 {
+		return
 	}
 
-	return result, nil
+	result.SubResults = make([]*ClassificationResult, 0, len(raw.SubIntents))
+	for _, sub := range raw.SubIntents {
+		result.SubResults = append(result.SubResults, &ClassificationResult{
+			IsRetrospective: raw.IsRetrospective,
+			Intent:          Intent(sub.Intent),
+			Domain:          Domain(sub.Domain),
+			Confidence:      sub.Confidence,
+		})
+	}
 }
 
 // AddCorrection adds a correction for learning

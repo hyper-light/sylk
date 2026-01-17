@@ -159,19 +159,7 @@ func (p *Parser) Parse(input string) (*DSLCommand, error) {
 		return nil, err
 	}
 
-	if cmd := p.parseDirectTo(input); cmd != nil {
-		return cmd, nil
-	}
-
-	if cmd := p.parseDirectFrom(input); cmd != nil {
-		return cmd, nil
-	}
-
-	if cmd := p.parseGuideIntent(input); cmd != nil {
-		return cmd, nil
-	}
-
-	if cmd := p.parseActionShortcut(input); cmd != nil {
+	if cmd := p.parseShortcutCommands(input); cmd != nil {
 		return cmd, nil
 	}
 
@@ -180,6 +168,19 @@ func (p *Parser) Parse(input string) (*DSLCommand, error) {
 	}
 
 	return p.unrecognizedDSL(input)
+}
+
+func (p *Parser) parseShortcutCommands(input string) *DSLCommand {
+	if cmd := p.parseDirectTo(input); cmd != nil {
+		return cmd
+	}
+	if cmd := p.parseDirectFrom(input); cmd != nil {
+		return cmd
+	}
+	if cmd := p.parseGuideIntent(input); cmd != nil {
+		return cmd
+	}
+	return p.parseActionShortcut(input)
 }
 
 func (p *Parser) validateDSLPrefix(input string) error {
@@ -291,77 +292,137 @@ func (p *Parser) unrecognizedDSL(input string) (*DSLCommand, error) {
 
 // parseFullDSL parses the full DSL format: @agent:intent:domain?params{data}
 func (p *Parser) parseFullDSL(input string, matches []string) (*DSLCommand, error) {
-	agentStr := strings.ToLower(matches[1])
-	intentStr := strings.ToLower(matches[2])
-	domainStr := strings.ToLower(matches[3])
+	agentStr, intentStr, domainStr := p.parseDSLParts(matches)
 	paramsStr := matches[4]
 	dataStr := matches[5]
 
-	// Resolve agent
-	agent, agentOk := p.agentShortcuts[agentStr]
-	if !agentOk {
-		return nil, &DSLParseError{
-			Input:    input,
-			Position: len(p.prefix),
-			Expected: "valid agent (arch, guide)",
-			Got:      agentStr,
-			Message:  "unknown agent: " + agentStr,
-		}
-	}
-
-	// Resolve intent
-	intent, intentOk := p.intentShortcuts[intentStr]
-	if !intentOk {
-		return nil, &DSLParseError{
-			Input:    input,
-			Position: len(p.prefix) + len(agentStr) + 1,
-			Expected: "valid intent (recall, store, check, declare, complete, help, status)",
-			Got:      intentStr,
-			Message:  "unknown intent: " + intentStr,
-		}
-	}
-
-	// Resolve domain
-	domain, domainOk := p.domainShortcuts[domainStr]
-	if !domainOk {
-		return nil, &DSLParseError{
-			Input:    input,
-			Position: len(p.prefix) + len(agentStr) + len(intentStr) + 2,
-			Expected: "valid domain (patterns, failures, decisions, files, learnings, system, agents)",
-			Got:      domainStr,
-			Message:  "unknown domain: " + domainStr,
-		}
+	resolved, err := p.resolveFullDSL(input, agentStr, intentStr, domainStr)
+	if err != nil {
+		return nil, err
 	}
 
 	cmd := &DSLCommand{
 		Type:        DSLCommandTypeFull,
-		TargetAgent: agent,
-		Intent:      intent,
-		Domain:      domain,
+		TargetAgent: resolved.agent,
+		Intent:      resolved.intent,
+		Domain:      resolved.domain,
 		Raw:         input,
 	}
 
-	// Parse parameters
-	if paramsStr != "" {
-		cmd.Params = p.parseParams(paramsStr)
-	}
-
-	// Parse data
-	if dataStr != "" {
-		data, err := p.parseData(dataStr)
-		if err != nil {
-			return nil, &DSLParseError{
-				Input:    input,
-				Position: strings.Index(input, "{"),
-				Expected: "valid JSON object",
-				Got:      dataStr,
-				Message:  "invalid JSON data: " + err.Error(),
-			}
-		}
-		cmd.Data = data
+	p.applyFullDSLParams(cmd, paramsStr)
+	if err := p.applyFullDSLData(cmd, input, dataStr); err != nil {
+		return nil, err
 	}
 
 	return cmd, nil
+}
+
+type resolvedFullDSL struct {
+	agent  string
+	intent Intent
+	domain Domain
+}
+
+func (p *Parser) parseDSLParts(matches []string) (string, string, string) {
+	agentStr := strings.ToLower(matches[1])
+	intentStr := strings.ToLower(matches[2])
+	domainStr := strings.ToLower(matches[3])
+	return agentStr, intentStr, domainStr
+}
+
+func (p *Parser) resolveFullDSL(input string, agentStr string, intentStr string, domainStr string) (resolvedFullDSL, error) {
+	resolved := resolvedFullDSL{}
+
+	agent, err := p.resolveFullDSLAgent(input, agentStr)
+	if err != nil {
+		return resolved, err
+	}
+	resolved.agent = agent
+
+	intent, err := p.resolveFullDSLIntent(input, agentStr, intentStr)
+	if err != nil {
+		return resolved, err
+	}
+	resolved.intent = intent
+
+	domain, err := p.resolveFullDSLDomain(input, agentStr, intentStr, domainStr)
+	if err != nil {
+		return resolved, err
+	}
+	resolved.domain = domain
+
+	return resolved, nil
+}
+
+func (p *Parser) resolveFullDSLAgent(input string, agentStr string) (string, error) {
+	agent, ok := p.agentShortcuts[agentStr]
+	if ok {
+		return agent, nil
+	}
+
+	return "", &DSLParseError{
+		Input:    input,
+		Position: len(p.prefix),
+		Expected: "valid agent (arch, guide)",
+		Got:      agentStr,
+		Message:  "unknown agent: " + agentStr,
+	}
+}
+
+func (p *Parser) resolveFullDSLIntent(input string, agentStr string, intentStr string) (Intent, error) {
+	intent, ok := p.intentShortcuts[intentStr]
+	if ok {
+		return intent, nil
+	}
+
+	return "", &DSLParseError{
+		Input:    input,
+		Position: len(p.prefix) + len(agentStr) + 1,
+		Expected: "valid intent (recall, store, check, declare, complete, help, status)",
+		Got:      intentStr,
+		Message:  "unknown intent: " + intentStr,
+	}
+}
+
+func (p *Parser) resolveFullDSLDomain(input string, agentStr string, intentStr string, domainStr string) (Domain, error) {
+	domain, ok := p.domainShortcuts[domainStr]
+	if ok {
+		return domain, nil
+	}
+
+	return "", &DSLParseError{
+		Input:    input,
+		Position: len(p.prefix) + len(agentStr) + len(intentStr) + 2,
+		Expected: "valid domain (patterns, failures, decisions, files, learnings, system, agents)",
+		Got:      domainStr,
+		Message:  "unknown domain: " + domainStr,
+	}
+}
+
+func (p *Parser) applyFullDSLParams(cmd *DSLCommand, paramsStr string) {
+	if paramsStr == "" {
+		return
+	}
+	cmd.Params = p.parseParams(paramsStr)
+}
+
+func (p *Parser) applyFullDSLData(cmd *DSLCommand, input string, dataStr string) error {
+	if dataStr == "" {
+		return nil
+	}
+
+	data, err := p.parseData(dataStr)
+	if err != nil {
+		return &DSLParseError{
+			Input:    input,
+			Position: strings.Index(input, "{"),
+			Expected: "valid JSON object",
+			Got:      dataStr,
+			Message:  "invalid JSON data: " + err.Error(),
+		}
+	}
+	cmd.Data = data
+	return nil
 }
 
 // resolveAgent resolves an agent shortcut to the full agent name
@@ -437,28 +498,36 @@ func (p *Parser) normalizeJSON(s string) string {
 
 // ParseMultiple parses multiple DSL commands separated by semicolons
 func (p *Parser) ParseMultiple(input string) ([]*DSLCommand, []error) {
-	input = strings.TrimSpace(input)
-
-	parts := strings.Split(input, ";")
-
-	var commands []*DSLCommand
+	parts := p.splitCommands(input)
+	commands := make([]*DSLCommand, 0, len(parts))
 	var errors []error
 
+	for _, part := range parts {
+		cmd, err := p.Parse(part)
+		if err != nil {
+			errors = append(errors, err)
+			continue
+		}
+		commands = append(commands, cmd)
+	}
+
+	return commands, errors
+}
+
+func (p *Parser) splitCommands(input string) []string {
+	input = strings.TrimSpace(input)
+	parts := strings.Split(input, ";")
+
+	commands := make([]string, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-
-		cmd, err := p.Parse(part)
-		if err != nil {
-			errors = append(errors, err)
-		} else {
-			commands = append(commands, cmd)
-		}
+		commands = append(commands, part)
 	}
 
-	return commands, errors
+	return commands
 }
 
 // =============================================================================
@@ -539,6 +608,10 @@ func (cmd *DSLCommand) assignParams(entities *ExtractedEntities) {
 	if cmd.Params == nil {
 		return
 	}
+	cmd.applyParamAssignments(entities)
+}
+
+func (cmd *DSLCommand) applyParamAssignments(entities *ExtractedEntities) {
 	cmd.assignParamScope(entities)
 	cmd.assignParamAgent(entities)
 	cmd.assignParamAgentID(entities)

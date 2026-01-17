@@ -59,6 +59,7 @@ type TieredRouter struct {
 
 	// Callbacks for handling responses
 	responseHandlers *ShardedMap[string, ResponseCallback]
+	streamHandlers   *ShardedMap[string, StreamCallback]
 
 	// Resilience components
 	circuits       *CircuitBreakerRegistry
@@ -81,6 +82,8 @@ type outboundRequest struct {
 
 // ResponseCallback is called when a response is received
 type ResponseCallback func(resp *RouteResponse, err error)
+
+type StreamCallback func(resp *StreamResponse) bool
 
 // TieredRouterConfig configures the agent router
 type TieredRouterConfig struct {
@@ -168,6 +171,7 @@ func NewTieredRouter(cfg TieredRouterConfig) (*TieredRouter, error) {
 		readyAgents:      NewStringMap[bool](DefaultShardCount),
 		pending:          NewPendingMap[*outboundRequest](DefaultShardCount),
 		responseHandlers: NewStringMap[ResponseCallback](DefaultShardCount),
+		streamHandlers:   NewStringMap[StreamCallback](DefaultShardCount),
 		circuits:         circuits,
 		pendingCleanup:   pendingCleanup,
 		dlq:              dlq,
@@ -299,30 +303,48 @@ func stopError(errs []error) error {
 //  3. Cache hit → direct route
 //  4. Fall back to Guide for LLM classification
 func (r *TieredRouter) Route(ctx context.Context, input string, opts ...RouteOption) (string, error) {
+	options := r.buildRouteOptions(opts)
+	correlationID := generateCorrelationID()
+
+	if targetAgentID := r.routeTargetForInput(input); targetAgentID != "" {
+		return r.routeDirect(ctx, correlationID, targetAgentID, input, options)
+	}
+
+	return r.routeViaGuide(ctx, correlationID, input, options)
+}
+
+func (r *TieredRouter) buildRouteOptions(opts []RouteOption) routeOptions {
 	options := defaultRouteOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
+	return options
+}
 
-	correlationID := generateCorrelationID()
-
-	// Tier 1: Try DSL parsing (direct routing)
-	if cmd, err := r.parser.Parse(input); err == nil && cmd.TargetAgent != "" {
-		return r.routeDirect(ctx, correlationID, cmd.TargetAgent, input, options)
+func (r *TieredRouter) routeTargetForInput(input string) string {
+	if target := r.routeTargetFromDSL(input); target != "" {
+		return target
 	}
-
-	// Tier 2: Check capability matching against known agents
-	if match := r.FindMatchingAgent(input); match != "" {
-		return r.routeDirect(ctx, correlationID, match, input, options)
+	if target := r.FindMatchingAgent(input); target != "" {
+		return target
 	}
+	return r.routeTargetFromCache(input)
+}
 
-	// Tier 3: Check local cache
-	if cached := r.cache.Get(input); cached != nil {
-		return r.routeDirect(ctx, correlationID, cached.TargetAgentID, input, options)
+func (r *TieredRouter) routeTargetFromDSL(input string) string {
+	cmd, err := r.parser.Parse(input)
+	if err != nil || cmd.TargetAgent == "" {
+		return ""
 	}
+	return cmd.TargetAgent
+}
 
-	// Tier 4: Fall back to Guide
-	return r.routeViaGuide(ctx, correlationID, input, options)
+func (r *TieredRouter) routeTargetFromCache(input string) string {
+	cached := r.cache.Get(input)
+	if cached == nil {
+		return ""
+	}
+	return cached.TargetAgentID
 }
 
 // =============================================================================
@@ -409,42 +431,46 @@ type capabilityMatch struct {
 //   - Capability patterns (regex)
 //   - Capability keywords
 func (r *TieredRouter) FindMatchingAgent(input string) string {
-	// Normalize input for matching
-	normalizedInput := normalizeInput(input)
-
-	// Collect all matches from ready agents only
-	var matches []capabilityMatch
-
-	r.knownAgents.Range(func(agentID string, ann *AgentAnnouncement) bool {
-		// Only consider ready agents
-		if ready, _ := r.readyAgents.Get(agentID); !ready {
-			return true // continue
-		}
-
-		// Check circuit breaker - skip failing agents
-		if !r.circuits.Allow(agentID) {
-			return true // continue
-		}
-
-		if match := r.findCapabilityMatch(normalizedInput, agentID, ann); match != nil {
-			matches = append(matches, *match)
-		}
-		return true // continue
-	})
-
+	matches := r.collectCapabilityMatches(input)
 	if len(matches) == 0 {
 		return ""
 	}
+	return r.bestMatch(matches).AgentID
+}
 
-	// Find best match
+func (r *TieredRouter) collectCapabilityMatches(input string) []capabilityMatch {
+	normalizedInput := normalizeInput(input)
+	matches := make([]capabilityMatch, 0)
+
+	r.knownAgents.Range(func(agentID string, ann *AgentAnnouncement) bool {
+		if !r.isAgentAvailable(agentID) {
+			return true
+		}
+		if match := r.findCapabilityMatch(normalizedInput, agentID, ann); match != nil {
+			matches = append(matches, *match)
+		}
+		return true
+	})
+
+	return matches
+}
+
+func (r *TieredRouter) isAgentAvailable(agentID string) bool {
+	ready, _ := r.readyAgents.Get(agentID)
+	if !ready {
+		return false
+	}
+	return r.circuits.Allow(agentID)
+}
+
+func (r *TieredRouter) bestMatch(matches []capabilityMatch) capabilityMatch {
 	best := matches[0]
-	for _, m := range matches[1:] {
-		if r.isBetterMatch(m, best) {
-			best = m
+	for _, candidate := range matches[1:] {
+		if r.isBetterMatch(candidate, best) {
+			best = candidate
 		}
 	}
-
-	return best.AgentID
+	return best
 }
 
 // findCapabilityMatch checks if input matches an agent's capabilities
@@ -655,26 +681,41 @@ func (r *TieredRouter) handleResponse(msg *Message) error {
 		return r.handleAck(msg)
 	}
 
-	if msg.Type != MessageTypeResponse {
+	switch msg.Type {
+	case MessageTypeResponse:
+		resp, ok := msg.GetRouteResponse()
+		if !ok {
+			return nil
+		}
+
+		pending, found := r.pending.Get(resp.CorrelationID)
+		if !found {
+			return nil
+		}
+
+		r.removeOutbound(resp.CorrelationID)
+		r.recordCircuitSuccess(pending.TargetAgentID)
+		r.invokeOutboundCallback(pending, resp, nil)
+		r.invokeResponseHandler(resp)
+
+		return nil
+	case MessageTypeStream:
+		streamResp, ok := msg.GetStreamResponse()
+		if !ok {
+			return nil
+		}
+		pending, found := r.pending.Get(streamResp.CorrelationID)
+		if !found {
+			return nil
+		}
+		r.recordCircuitSuccess(pending.TargetAgentID)
+		streamResp.TargetAgentID = pending.TargetAgentID
+		streamResp.RespondingAgentID = pending.TargetAgentID
+		r.invokeStreamHandler(streamResp)
+		return nil
+	default:
 		return nil
 	}
-
-	resp, ok := msg.GetRouteResponse()
-	if !ok {
-		return nil
-	}
-
-	pending, found := r.pending.Get(resp.CorrelationID)
-	if !found {
-		return nil
-	}
-
-	r.removeOutbound(resp.CorrelationID)
-	r.recordCircuitSuccess(pending.TargetAgentID)
-	r.invokeOutboundCallback(pending, resp, nil)
-	r.invokeResponseHandler(resp)
-
-	return nil
 }
 
 // handleAck processes acknowledgments for fire-and-forget requests
@@ -718,10 +759,10 @@ func (r *TieredRouter) recordAckCircuitResult(targetAgentID string, received boo
 }
 
 func (r *TieredRouter) invokeOutboundCallback(pending *outboundRequest, resp *RouteResponse, err error) {
-	if pending.callback == nil {
+	if pending.Callback == nil {
 		return
 	}
-	go pending.callback(resp, err)
+	go pending.Callback(resp, err)
 }
 
 func (r *TieredRouter) invokeResponseHandler(resp *RouteResponse) {
@@ -733,6 +774,17 @@ func (r *TieredRouter) invokeResponseHandler(resp *RouteResponse) {
 	go handler(resp, nil)
 }
 
+func (r *TieredRouter) invokeStreamHandler(resp *StreamResponse) {
+	handler, found := r.streamHandlers.Get(resp.CorrelationID)
+	if !found {
+		return
+	}
+	remove := handler(resp)
+	if remove {
+		r.streamHandlers.Delete(resp.CorrelationID)
+	}
+}
+
 func (r *TieredRouter) ackError(ack *AckPayload) error {
 	if ack.Received {
 		return nil
@@ -740,9 +792,14 @@ func (r *TieredRouter) ackError(ack *AckPayload) error {
 	return fmt.Errorf("request rejected: %s", ack.Message)
 }
 
-// RegisterResponseHandler registers a one-time callback for a specific correlation ID
 func (r *TieredRouter) RegisterResponseHandler(correlationID string, handler ResponseCallback) {
 	r.responseHandlers.Set(correlationID, handler)
+	r.streamHandlers.Delete(correlationID)
+}
+
+func (r *TieredRouter) RegisterStreamHandler(correlationID string, handler StreamCallback) {
+	r.streamHandlers.Set(correlationID, handler)
+	r.responseHandlers.Delete(correlationID)
 }
 
 // =============================================================================

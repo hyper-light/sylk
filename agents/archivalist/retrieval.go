@@ -14,10 +14,10 @@ import (
 type RetrievalResult struct {
 	ID       string         `json:"id"`
 	Content  string         `json:"content"`
-	Score    float64        `json:"score"`     // Combined relevance score
-	Source   string         `json:"source"`    // "fts", "embedding", "exact"
+	Score    float64        `json:"score"`  // Combined relevance score
+	Source   string         `json:"source"` // "fts", "embedding", "exact"
 	Category string         `json:"category"`
-	Type     string         `json:"type"`      // "pattern", "failure", "file", etc.
+	Type     string         `json:"type"` // "pattern", "failure", "file", etc.
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
@@ -38,7 +38,7 @@ type RetrievalOptions struct {
 	Types      []string // Filter by content types
 
 	// Output
-	TopK       int  // Final number of results to return
+	TopK        int  // Final number of results to return
 	UseReranker bool // Use re-ranking for precision
 }
 
@@ -163,17 +163,22 @@ func (sr *SemanticRetriever) Close() error {
 
 // Retrieve performs multi-source retrieval
 func (sr *SemanticRetriever) Retrieve(ctx context.Context, query string, opts RetrievalOptions) ([]*RetrievalResult, error) {
+	results, err := sr.collectRetrievalResults(ctx, query, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	results = deduplicateResults(results)
+	return sr.finalizeResults(query, results, opts), nil
+}
+
+func (sr *SemanticRetriever) collectRetrievalResults(ctx context.Context, query string, opts RetrievalOptions) ([]*RetrievalResult, error) {
 	results := sr.gatherResults(ctx, query, opts)
 	results, err := sr.applyFTSSearch(ctx, results, query, opts)
 	if err != nil {
 		return nil, err
 	}
-	results, err = sr.applyEmbeddingSearch(ctx, results, query, opts)
-	if err != nil {
-		return nil, err
-	}
-	results = deduplicateResults(results)
-	return sr.finalizeResults(query, results, opts), nil
+	return sr.applyEmbeddingSearch(ctx, results, query, opts)
 }
 
 func (sr *SemanticRetriever) gatherResults(ctx context.Context, query string, opts RetrievalOptions) []*RetrievalResult {
@@ -447,55 +452,73 @@ func (sr *SemanticRetriever) rerank(query string, results []*RetrievalResult, to
 	queryLower := strings.ToLower(query)
 	queryTerms := strings.Fields(queryLower)
 
-	// Score each result
-	type scoredResult struct {
-		result *RetrievalResult
-		score  float64
-	}
+	scored := sr.scoreResults(results, queryLower, queryTerms)
+	scored = selectTopResults(scored, topK)
+	return buildRerankedResults(scored)
+}
+
+type scoredResult struct {
+	result *RetrievalResult
+	score  float64
+}
+
+func (sr *SemanticRetriever) scoreResults(results []*RetrievalResult, queryLower string, queryTerms []string) []scoredResult {
 	scored := make([]scoredResult, len(results))
-
-	for i, r := range results {
-		// Base score from retrieval
-		score := r.Score
-
-		// Boost for exact query term matches
-		contentLower := strings.ToLower(r.Content)
-		for _, term := range queryTerms {
-			if strings.Contains(contentLower, term) {
-				score += 0.1
-			}
-		}
-
-		// Boost for category match if query mentions it
-		if strings.Contains(queryLower, strings.ToLower(r.Category)) {
-			score += 0.2
-		}
-
-		// Boost for source diversity (embedding matches often more relevant)
-		if r.Source == "embedding" {
-			score += 0.05
-		}
-
-		scored[i] = scoredResult{r, score}
+	for i, result := range results {
+		scored[i] = scoredResult{result: result, score: sr.scoreResult(result, queryLower, queryTerms)}
 	}
+	return scored
+}
 
-	// Sort by score
+func (sr *SemanticRetriever) scoreResult(result *RetrievalResult, queryLower string, queryTerms []string) float64 {
+	score := result.Score
+	score += sr.termMatchBoost(result.Content, queryTerms)
+	score += sr.categoryBoost(queryLower, result.Category)
+	score += sr.sourceBoost(result.Source)
+	return score
+}
+
+func (sr *SemanticRetriever) termMatchBoost(content string, queryTerms []string) float64 {
+	contentLower := strings.ToLower(content)
+	boost := 0.0
+	for _, term := range queryTerms {
+		if strings.Contains(contentLower, term) {
+			boost += 0.1
+		}
+	}
+	return boost
+}
+
+func (sr *SemanticRetriever) categoryBoost(queryLower string, category string) float64 {
+	if strings.Contains(queryLower, strings.ToLower(category)) {
+		return 0.2
+	}
+	return 0
+}
+
+func (sr *SemanticRetriever) sourceBoost(source string) float64 {
+	if source == "embedding" {
+		return 0.05
+	}
+	return 0
+}
+
+func selectTopResults(scored []scoredResult, topK int) []scoredResult {
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].score > scored[j].score
 	})
-
-	// Take top K
 	if len(scored) > topK {
-		scored = scored[:topK]
+		return scored[:topK]
 	}
+	return scored
+}
 
-	// Extract results
+func buildRerankedResults(scored []scoredResult) []*RetrievalResult {
 	reranked := make([]*RetrievalResult, len(scored))
-	for i, s := range scored {
-		s.result.Score = s.score
-		reranked[i] = s.result
+	for i, scoredResult := range scored {
+		scoredResult.result.Score = scoredResult.score
+		reranked[i] = scoredResult.result
 	}
-
 	return reranked
 }
 

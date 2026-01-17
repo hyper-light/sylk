@@ -275,17 +275,37 @@ func (sr *SessionRouter) cacheSessionResult(cache *RouteCache, hasCache bool, re
 }
 
 func (sr *SessionRouter) cacheGlobalResult(prefs *SessionRoutingPrefs, hasPrefs bool, request *RouteRequest, result *RouteResult) {
-	if !hasPrefs || !prefs.PopulateGlobalCache || sr.guide == nil {
-		return
-	}
-	if result.ClassificationMethod != "llm" {
+	if !sr.shouldCacheGlobal(prefs, hasPrefs, result) {
 		return
 	}
 	sr.guide.routeCache.Set(request.Input, result)
 }
 
+func (sr *SessionRouter) shouldCacheGlobal(prefs *SessionRoutingPrefs, hasPrefs bool, result *RouteResult) bool {
+	if !hasPrefs || sr.guide == nil {
+		return false
+	}
+	if !prefs.PopulateGlobalCache {
+		return false
+	}
+	return result.ClassificationMethod == "llm"
+}
+
 // matchRules tries to match input against session rules
 func (sr *SessionRouter) matchRules(input string, rules []SessionRoutingRule) *RouteResult {
+	bestMatch := sr.findBestRuleMatch(input, rules)
+	if bestMatch == nil {
+		return nil
+	}
+
+	return &RouteResult{
+		TargetAgent:          TargetAgent(bestMatch.TargetAgentID),
+		Confidence:           1.0,
+		ClassificationMethod: "session_rule",
+	}
+}
+
+func (sr *SessionRouter) findBestRuleMatch(input string, rules []SessionRoutingRule) *SessionRoutingRule {
 	var bestMatch *SessionRoutingRule
 	bestPriority := -1
 
@@ -295,30 +315,37 @@ func (sr *SessionRouter) matchRules(input string, rules []SessionRoutingRule) *R
 			continue
 		}
 
-		// Compile pattern if needed
-		if rule.compiled == nil {
-			compiled, err := NewCompiledPattern(rule.Pattern)
-			if err != nil {
-				continue
-			}
-			rule.compiled = compiled
+		if !sr.ensureRuleCompiled(rule) {
+			continue
 		}
 
-		if rule.compiled.MatchString(input) && rule.Priority > bestPriority {
-			bestMatch = rule
-			bestPriority = rule.Priority
+		if !rule.compiled.MatchString(input) {
+			continue
 		}
+
+		if rule.Priority <= bestPriority {
+			continue
+		}
+
+		bestMatch = rule
+		bestPriority = rule.Priority
 	}
 
-	if bestMatch != nil {
-		return &RouteResult{
-			TargetAgent:          TargetAgent(bestMatch.TargetAgentID),
-			Confidence:           1.0,
-			ClassificationMethod: "session_rule",
-		}
+	return bestMatch
+}
+
+func (sr *SessionRouter) ensureRuleCompiled(rule *SessionRoutingRule) bool {
+	if rule.compiled != nil {
+		return true
 	}
 
-	return nil
+	compiled, err := NewCompiledPattern(rule.Pattern)
+	if err != nil {
+		return false
+	}
+
+	rule.compiled = compiled
+	return true
 }
 
 // applyPreferences applies session preferences to a route result
@@ -342,10 +369,8 @@ func (sr *SessionRouter) isBlockedAgent(prefs *SessionRoutingPrefs, agentID stri
 }
 
 func (sr *SessionRouter) applyThresholds(result *RouteResult, prefs *SessionRoutingPrefs) {
-	if sr.applyExecuteThreshold(result, prefs) {
-		return
-	}
-	if sr.applyLogThreshold(result, prefs) {
+	handled := sr.applyExecuteThreshold(result, prefs) || sr.applyLogThreshold(result, prefs)
+	if handled {
 		return
 	}
 	sr.applySuggestThreshold(result, prefs)

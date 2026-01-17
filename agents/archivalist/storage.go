@@ -125,6 +125,16 @@ func (s *Store) InsertEntryInSession(sessionID string, entry *Entry) (string, er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.prepareEntryForInsert(sessionID, entry)
+	if err := s.ensureTokenCapacity(entry.TokensEstimate); err != nil {
+		return "", err
+	}
+
+	s.insertEntry(entry)
+	return entry.ID, nil
+}
+
+func (s *Store) prepareEntryForInsert(sessionID string, entry *Entry) {
 	if entry.ID == "" {
 		entry.ID = s.generateID("ent")
 	}
@@ -134,21 +144,25 @@ func (s *Store) InsertEntryInSession(sessionID string, entry *Entry) (string, er
 	entry.UpdatedAt = time.Now()
 	entry.SessionID = sessionID
 	entry.TokensEstimate = EstimateTokens(entry.Content + entry.Title)
+}
 
-	if s.totalTokens+entry.TokensEstimate > s.tokenThreshold {
-		if err := s.archiveOldestEntries(); err != nil {
-			return "", fmt.Errorf("failed to archive entries: %w", err)
-		}
+func (s *Store) ensureTokenCapacity(entryTokens int) error {
+	if s.totalTokens+entryTokens <= s.tokenThreshold {
+		return nil
 	}
+	if err := s.archiveOldestEntries(); err != nil {
+		return fmt.Errorf("failed to archive entries: %w", err)
+	}
+	return nil
+}
 
+func (s *Store) insertEntry(entry *Entry) {
 	s.entries[entry.ID] = entry
 	s.byCategory[entry.Category] = append(s.byCategory[entry.Category], entry.ID)
 	s.bySource[entry.Source] = append(s.bySource[entry.Source], entry.ID)
 	s.bySession[entry.SessionID] = append(s.bySession[entry.SessionID], entry.ID)
 	s.chronological = append(s.chronological, entry.ID)
 	s.totalTokens += entry.TokensEstimate
-
-	return entry.ID, nil
 }
 
 // UpdateEntry updates an existing entry
@@ -172,34 +186,44 @@ func (s *Store) UpdateEntry(id string, updates func(*Entry)) error {
 
 // GetEntry retrieves an entry by ID, checking L1 first then L2
 func (s *Store) GetEntry(id string) (*Entry, bool) {
+	if entry, ok := s.getEntryFromMemory(id); ok {
+		return entry, true
+	}
+	return s.getEntryFromArchive(id)
+}
+
+func (s *Store) getEntryFromMemory(id string) (*Entry, bool) {
 	s.mu.RLock()
 	entry, ok := s.entries[id]
 	s.mu.RUnlock()
+	return entry, ok
+}
 
-	if ok {
-		return entry, true
+func (s *Store) getEntryFromArchive(id string) (*Entry, bool) {
+	if s.archive == nil {
+		return nil, false
 	}
-
-	// Check archive if not in hot memory
-	if s.archive != nil {
-		archived, err := s.archive.GetEntry(id)
-		if err == nil && archived != nil {
-			return archived, true
-		}
+	archived, err := s.archive.GetEntry(id)
+	if err != nil || archived == nil {
+		return nil, false
 	}
-
-	return nil, false
+	return archived, true
 }
 
 // Query retrieves entries matching the query parameters
 func (s *Store) Query(q ArchiveQuery) ([]*Entry, error) {
-	results := s.queryHotMemory(q)
-	results, err := s.mergeArchivedQuery(results, q)
+	results, err := s.collectQueryResults(q)
 	if err != nil {
 		return nil, err
 	}
+
 	s.sortByCreatedDesc(results)
 	return s.applyResultLimit(results, q.Limit), nil
+}
+
+func (s *Store) collectQueryResults(q ArchiveQuery) ([]*Entry, error) {
+	results := s.queryHotMemory(q)
+	return s.mergeArchivedQuery(results, q)
 }
 
 func (s *Store) queryHotMemory(q ArchiveQuery) []*Entry {
@@ -491,11 +515,19 @@ func (s *Store) removeEntry(id string) {
 
 // matchesQuery checks if an entry matches the query parameters
 func (s *Store) matchesQuery(entry *Entry, q ArchiveQuery) bool {
-	return s.matchesCategoryFilter(entry, q.Categories) &&
-		s.matchesSourceFilter(entry, q.Sources) &&
-		s.matchesSessionFilter(entry, q.SessionIDs) &&
-		s.matchesIDFilter(entry, q.IDs) &&
-		s.matchesDateRange(entry, q.Since, q.Until)
+	if !s.matchesCategoryFilter(entry, q.Categories) {
+		return false
+	}
+	if !s.matchesSourceFilter(entry, q.Sources) {
+		return false
+	}
+	if !s.matchesSessionFilter(entry, q.SessionIDs) {
+		return false
+	}
+	if !s.matchesIDFilter(entry, q.IDs) {
+		return false
+	}
+	return s.matchesDateRange(entry, q.Since, q.Until)
 }
 
 func (s *Store) matchesCategoryFilter(entry *Entry, categories []Category) bool {

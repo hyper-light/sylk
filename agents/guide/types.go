@@ -264,6 +264,13 @@ type RouteResponse struct {
 	ProcessingTime time.Duration `json:"processing_time,omitempty"`
 }
 
+type StreamResponse struct {
+	CorrelationID     string       `json:"correlation_id"`
+	RespondingAgentID string       `json:"responding_agent_id"`
+	TargetAgentID     string       `json:"target_agent_id"`
+	Event             *StreamEvent `json:"event"`
+}
+
 // ForwardedRequest is what the Guide sends to the target agent
 type ForwardedRequest struct {
 	// Correlation ID (for response routing back through Guide)
@@ -293,14 +300,14 @@ type ForwardedRequest struct {
 
 // PendingRequest tracks a request awaiting response
 type PendingRequest struct {
-	CorrelationID   string       `json:"correlation_id"`
-	SourceAgentID   string       `json:"source_agent_id"`
-	SourceAgentName string       `json:"source_agent_name,omitempty"`
-	TargetAgentID   string       `json:"target_agent_id"`
+	CorrelationID   string        `json:"correlation_id"`
+	SourceAgentID   string        `json:"source_agent_id"`
+	SourceAgentName string        `json:"source_agent_name,omitempty"`
+	TargetAgentID   string        `json:"target_agent_id"`
 	Request         *RouteRequest `json:"request"`
-	Classification  *RouteResult `json:"classification,omitempty"`
-	CreatedAt       time.Time    `json:"created_at"`
-	ExpiresAt       time.Time    `json:"expires_at"`
+	Classification  *RouteResult  `json:"classification,omitempty"`
+	CreatedAt       time.Time     `json:"created_at"`
+	ExpiresAt       time.Time     `json:"expires_at"`
 }
 
 // RouteResult represents the result of routing a request
@@ -315,16 +322,16 @@ type RouteResult struct {
 	Entities *ExtractedEntities `json:"entities,omitempty"`
 
 	// Confidence and decision
-	Confidence float64      `json:"confidence"`
-	Action     RouteAction  `json:"action"`
-	Rejected   bool         `json:"rejected"`
-	Reason     string       `json:"reason,omitempty"`
+	Confidence float64     `json:"confidence"`
+	Action     RouteAction `json:"action"`
+	Rejected   bool        `json:"rejected"`
+	Reason     string      `json:"reason,omitempty"`
 
 	// For multi-intent queries
 	SubResults []*RouteResult `json:"sub_results,omitempty"`
 
 	// Metadata
-	ClassificationMethod string    `json:"classification_method"` // "dsl" or "llm"
+	ClassificationMethod string        `json:"classification_method"` // "dsl" or "llm"
 	ProcessingTime       time.Duration `json:"processing_time"`
 }
 
@@ -332,10 +339,10 @@ type RouteResult struct {
 type RouteAction string
 
 const (
-	RouteActionExecute  RouteAction = "execute"  // Execute immediately (confidence >= 0.90)
-	RouteActionLog      RouteAction = "log"      // Execute and log for review (0.75-0.89)
-	RouteActionSuggest  RouteAction = "suggest"  // Suggest interpretation (0.50-0.74)
-	RouteActionReject   RouteAction = "reject"   // Reject with explanation (< 0.50)
+	RouteActionExecute RouteAction = "execute" // Execute immediately (confidence >= 0.90)
+	RouteActionLog     RouteAction = "log"     // Execute and log for review (0.75-0.89)
+	RouteActionSuggest RouteAction = "suggest" // Suggest interpretation (0.50-0.74)
+	RouteActionReject  RouteAction = "reject"  // Reject with explanation (< 0.50)
 )
 
 // ExtractedEntities contains entities extracted from the query
@@ -399,13 +406,13 @@ type CorrectionRecord struct {
 	Input string `json:"input"`
 
 	// Wrong classification
-	WrongIntent Intent `json:"wrong_intent"`
-	WrongDomain Domain `json:"wrong_domain"`
+	WrongIntent Intent      `json:"wrong_intent"`
+	WrongDomain Domain      `json:"wrong_domain"`
 	WrongTarget TargetAgent `json:"wrong_target"`
 
 	// Correct classification
-	CorrectIntent Intent `json:"correct_intent"`
-	CorrectDomain Domain `json:"correct_domain"`
+	CorrectIntent Intent      `json:"correct_intent"`
+	CorrectDomain Domain      `json:"correct_domain"`
 	CorrectTarget TargetAgent `json:"correct_target"`
 
 	// Metadata

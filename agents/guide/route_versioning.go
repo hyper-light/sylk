@@ -349,19 +349,39 @@ func (rvs *RouteVersionStore) Migrate(migration *RouteMigration, createdBy strin
 	rvs.mu.Lock()
 	defer rvs.mu.Unlock()
 
-	if migration.FromVersion != rvs.currentVersion {
-		return fmt.Errorf("migration from version %d does not match current version %d",
-			migration.FromVersion, rvs.currentVersion)
+	if err := rvs.validateMigrationVersion(migration); err != nil {
+		return err
 	}
 
-	// Apply migration steps
+	if err := rvs.applyMigrationSteps(migration); err != nil {
+		return err
+	}
+
+	version := rvs.buildMigrationVersion(migration, createdBy)
+	rvs.appendMigrationVersion(version)
+	rvs.updateMigrationStats()
+
+	return nil
+}
+
+func (rvs *RouteVersionStore) validateMigrationVersion(migration *RouteMigration) error {
+	if migration.FromVersion == rvs.currentVersion {
+		return nil
+	}
+	return fmt.Errorf("migration from version %d does not match current version %d",
+		migration.FromVersion, rvs.currentVersion)
+}
+
+func (rvs *RouteVersionStore) applyMigrationSteps(migration *RouteMigration) error {
 	for _, step := range migration.Steps {
 		if err := rvs.applyMigrationStep(step); err != nil {
 			return fmt.Errorf("migration step failed: %w", err)
 		}
 	}
+	return nil
+}
 
-	// Create new version with migration reference
+func (rvs *RouteVersionStore) buildMigrationVersion(migration *RouteMigration, createdBy string) *RouteVersion {
 	rvs.currentVersion = migration.ToVersion
 	version := &RouteVersion{
 		Version:   rvs.currentVersion,
@@ -371,18 +391,21 @@ func (rvs *RouteVersionStore) Migrate(migration *RouteMigration, createdBy strin
 		Routes:    make([]VersionedRoute, 0, len(rvs.currentRoutes)),
 		Migration: migration,
 	}
-
 	for _, route := range rvs.currentRoutes {
 		version.Routes = append(version.Routes, *route)
 	}
+	return version
+}
 
+func (rvs *RouteVersionStore) appendMigrationVersion(version *RouteVersion) {
 	rvs.versions = append(rvs.versions, version)
+}
+
+func (rvs *RouteVersionStore) updateMigrationStats() {
 	rvs.stats.TotalVersions = len(rvs.versions)
 	rvs.stats.CurrentVersion = rvs.currentVersion
 	rvs.stats.LastMigration = time.Now()
 	rvs.stats.MigrationCount++
-
-	return nil
 }
 
 // applyMigrationStep applies a single migration step

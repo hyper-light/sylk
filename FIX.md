@@ -103,32 +103,32 @@ This document tracks gaps in ARCHITECTURE.md that need to be addressed, prioriti
 *Local storage layout and configuration*
 
 ### 3.1 Directory Layout
-- [ ] `~/.sylk/` structure definition
-- [ ] Session storage location
-- [ ] Cache directory
-- [ ] Log directory
-- [ ] Database location
-- [ ] Temp directory
+- [x] `~/.sylk/` structure definition → XDG semantics with platform-native defaults (TODO 0.61)
+- [x] Session storage location → data/sessions/{id}/ (TODO 0.61)
+- [x] Cache directory → cache/ with TTL tiers (hot/warm/cold) (TODO 0.61)
+- [x] Log directory → state/logs/ with dual-write (human + structured) (TODO 0.61)
+- [x] Database location → data/shared/ + data/projects/{hash}/ (TODO 0.64)
+- [x] Temp directory → state/temp/ + $TMPDIR/sylk-{id}/ hybrid (TODO 0.61)
 
 ### 3.2 Configuration Schema
-- [ ] Config file format (YAML/TOML/JSON)
-- [ ] Schema definition
-- [ ] Validation rules
-- [ ] Default values
-- [ ] Environment variable overrides
-- [ ] Project-local config (`.sylk/`)
+- [x] Config file format (YAML/TOML/JSON) → YAML with JSON Schema validation (TODO 0.62)
+- [x] Schema definition → Full JSON Schema with IDE autocomplete (TODO 0.62)
+- [x] Validation rules → Warn and use defaults (don't refuse to start) (TODO 0.62)
+- [x] Default values → Documented in schema, code defaults (TODO 0.62)
+- [x] Environment variable overrides → SYLK_* flat + _FILE for complex (TODO 0.62)
+- [x] Project-local config (`.sylk/`) → config.yaml (committed) + local/ (gitignored) (TODO 0.61, 0.62)
 
 ### 3.3 Credential Storage
-- [ ] API key encryption at rest
-- [ ] Keychain/credential manager integration
-- [ ] Key rotation support
-- [ ] Multiple provider credentials
+- [x] API key encryption at rest → AES-256-GCM with machine-bound key (TODO 0.63)
+- [x] Keychain/credential manager integration → Platform-native with encrypted fallback (TODO 0.63)
+- [x] Key rotation support → Verify before saving, no backup of old keys (TODO 0.63)
+- [x] Multiple provider credentials → Named profiles + project-scoped selection (TODO 0.63)
 
 ### 3.4 Database Management
-- [ ] SQLite location and naming
-- [ ] Migration strategy
-- [ ] Backup/restore
-- [ ] Corruption recovery
+- [x] SQLite location and naming → system.db (global), knowledge.db + index.db (per-project) (TODO 0.64)
+- [x] Migration strategy → Embedded versioning, backup before destructive (TODO 0.64)
+- [x] Backup/restore → Periodic + pre-session + pre-migration (TODO 0.65)
+- [x] Corruption recovery → Continuous integrity + auto-restore + rebuild (TODO 0.66)
 
 ---
 
@@ -136,27 +136,27 @@ This document tracks gaps in ARCHITECTURE.md that need to be addressed, prioriti
 *Security boundaries and audit*
 
 ### 4.1 Agent Permission Boundaries
-- [ ] File access restrictions per agent
-- [ ] Network access restrictions
-- [ ] Process execution restrictions
-- [ ] Permission inheritance in pipelines
+- [x] File access restrictions per agent → TODO 0.68 (PathPerm with Read/Write/Delete, role-based)
+- [x] Network access restrictions → TODO 0.68 (domain allowlist, per-project persistent)
+- [x] Process execution restrictions → TODO 0.68 (command allowlist, ignores args, safe defaults)
+- [x] Permission inheritance in pipelines → TODO 0.68 (WorkflowPermissions, pre-declared + runtime escalation)
 
 ### 4.2 Sandboxing Strategy
-- [ ] Generated code execution isolation
-- [ ] Resource limits for executed code
-- [ ] Filesystem isolation
-- [ ] Network isolation
+- [x] Generated code execution isolation → TODO 0.69 (OS sandbox: bubblewrap/Seatbelt, OFF by default)
+- [x] Resource limits for executed code → TODO 0.69 (CPU, memory, files, processes configurable)
+- [x] Filesystem isolation → TODO 0.69 (VFS layer with CoW, path boundary enforcement)
+- [x] Network isolation → TODO 0.69 (network proxy with domain allowlist)
 
 ### 4.3 Audit Logging
-- [ ] What actions to log
-- [ ] Log format and storage
-- [ ] Retention policy
-- [ ] Query interface
+- [x] What actions to log → TODO 0.70 (all: permission, file, process, network, llm, session, config)
+- [x] Log format and storage → TODO 0.70 (append-only JSONL with cryptographic chaining)
+- [x] Retention policy → TODO 0.70 (indefinite until explicit purge)
+- [x] Query interface → TODO 0.71 (CLI with rich filters: category, severity, time, target pattern)
 
 ### 4.4 Session Isolation
-- [ ] Multi-user considerations
-- [ ] Session data privacy
-- [ ] Credential isolation
+- [x] Multi-user considerations → ARCHITECTURE.md (single-user assumption, no OS-level isolation)
+- [x] Session data privacy → TODO 0.73 (project-scoped sharing, session knowledge read-only to others)
+- [x] Credential isolation → TODO 0.72 (profile override, temp credentials not shared)
 
 ---
 
@@ -228,9 +228,9 @@ This document tracks gaps in ARCHITECTURE.md that need to be addressed, prioriti
 
 | Tier | Status | Notes |
 |------|--------|-------|
-| 1. Agent Infrastructure | COMPLETE | 1.1 LLM API → 0.7-0.16; 1.2 Concurrency → 0.17-0.25; 1.3 State → 0.22-0.24; 1.4 Errors → 0.26-0.32; 1.5 Resources → 0.33-0.38 |
-| 2. Tool Execution | COMPLETE | 2.1-2.4 Subprocess/FS/Output/Cancel → 0.43-0.50; 2.5 Multi-Session → 0.39-0.42; 2.6 Optimization → 0.51-0.53 |
-| 3. Storage & Config | NOT STARTED | |
-| 4. Security Model | NOT STARTED | |
+| 1. Agent Infrastructure | COMPLETE | 1.1 LLM API → 0.7-0.16; 1.2 Concurrency → 0.17-0.25; 1.3 State → 0.22-0.24; 1.4 Errors → 0.26-0.32; 1.5 Resources → 0.33-0.38; **Multi-Session Amendments → 0.55-0.60** |
+| 2. Tool Execution | COMPLETE | 2.1-2.4 Subprocess/FS/Output/Cancel → 0.43-0.50; 2.5 Multi-Session → 0.39-0.42; 2.6 Optimization → 0.51-0.53, 0.54 |
+| 3. Storage & Config | COMPLETE | 3.1 Directory → 0.61; 3.2 Config → 0.62; 3.3 Credentials → 0.63; 3.4 Database → 0.64-0.66; Integration → 0.67. **NO DEPS on Tier 1/2 - fully parallel** |
+| 4. Security Model | COMPLETE | 4.1 Permissions → 0.68; 4.2 Sandboxing → 0.69; 4.3 Audit → 0.70-0.71; 4.4 Session → 0.72-0.73; Integration → 0.74. **NO DEPS on Tier 1/2/3 - fully parallel** |
 | 5. CLI/Terminal | NOT STARTED | |
 | 6. Polish | NOT STARTED | |

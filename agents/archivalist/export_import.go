@@ -486,15 +486,14 @@ func (i *Importer) ImportFromReader(r io.Reader, store *Store, archive *Archive)
 }
 
 func (i *Importer) importFromReader(r io.Reader, store *Store, archive *Archive) (*ImportResult, error) {
-	result := &ImportResult{
-		StartedAt: time.Now(),
-	}
+	result := newImportResult()
 
 	trimmed, err := readImportBytes(r)
 	if err != nil {
 		return nil, err
 	}
 	if len(trimmed) == 0 {
+		finalizeImportResult(result)
 		return result, nil
 	}
 
@@ -509,6 +508,10 @@ func (i *Importer) importFromReader(r io.Reader, store *Store, archive *Archive)
 
 	finalizeImportResult(result)
 	return result, nil
+}
+
+func newImportResult() *ImportResult {
+	return &ImportResult{StartedAt: time.Now()}
 }
 
 func readImportBytes(r io.Reader) ([]byte, error) {
@@ -753,15 +756,28 @@ func (i *Importer) importItem(item *ExportItem, store *Store, archive *Archive, 
 		return nil
 	}
 
-	handler := i.itemHandler(item.Type)
-	if handler == nil {
-		return fmt.Errorf("unknown item type: %s", item.Type)
+	handler, err := i.resolveItemHandler(item.Type)
+	if err != nil {
+		return err
 	}
 	return handler(item, store, archive, result)
 }
 
-func (i *Importer) itemHandler(itemType string) func(*ExportItem, *Store, *Archive, *ImportResult) error {
-	handlers := map[string]func(*ExportItem, *Store, *Archive, *ImportResult) error{
+type importItemHandler func(*ExportItem, *Store, *Archive, *ImportResult) error
+
+type importItemHandlers map[string]importItemHandler
+
+func (i *Importer) resolveItemHandler(itemType string) (importItemHandler, error) {
+	handlers := i.itemHandlers()
+	handler, ok := handlers[itemType]
+	if !ok {
+		return nil, fmt.Errorf("unknown item type: %s", itemType)
+	}
+	return handler, nil
+}
+
+func (i *Importer) itemHandlers() importItemHandlers {
+	return importItemHandlers{
 		"header":      i.handleHeader,
 		"session":     i.handleSession,
 		"entry":       i.handleEntry,
@@ -771,7 +787,6 @@ func (i *Importer) itemHandler(itemType string) func(*ExportItem, *Store, *Archi
 		"file_change": i.handleFileChange,
 		"summary":     i.handleSummary,
 	}
-	return handlers[itemType]
 }
 
 func (i *Importer) handleHeader(item *ExportItem, store *Store, archive *Archive, result *ImportResult) error {

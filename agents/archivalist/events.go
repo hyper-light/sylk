@@ -532,17 +532,17 @@ func (el *EventLog) Query(q EventQuery) []*Event {
 	el.eventsMu.RLock()
 	defer el.eventsMu.RUnlock()
 
-	var results []*Event
-	for i := 0; i < el.count; i++ {
-		idx := (el.tail + i) % el.maxEvents
-		e := el.events[idx]
-		if e != nil && el.matchesQuery(e, q) {
-			results = append(results, e)
-		}
-	}
+	results := el.collectMatchingEvents(q)
+	return applyQueryLimit(results, q.Limit)
+}
 
-	if q.Limit > 0 && len(results) > q.Limit {
-		results = results[len(results)-q.Limit:]
+func (el *EventLog) collectMatchingEvents(q EventQuery) []*Event {
+	results := make([]*Event, 0)
+	for i := 0; i < el.count; i++ {
+		event := el.eventAtIndex(i)
+		if event != nil && el.matchesQuery(event, q) {
+			results = append(results, event)
+		}
 	}
 	return results
 }
