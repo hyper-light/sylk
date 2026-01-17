@@ -4356,11 +4356,11 @@ Credential management and provider configuration.
 - [x] Lazy initialization of adapters (don't connect until first use)
 
 #### Auth CLI (`cmd/auth.go`)
-- [ ] `sylk auth <provider>` - interactive API key setup
-- [ ] `sylk auth <provider> --api-key <key>` - direct key input
-- [ ] `sylk auth google --credentials-file <path>` - service account JSON
-- [ ] `sylk auth status` - show configured providers and status
-- [ ] `sylk auth remove <provider>` - remove credentials
+- [x] `sylk auth <provider>` - interactive API key setup
+- [x] `sylk auth <provider> --api-key <key>` - direct key input
+- [x] `sylk auth google --credentials-file <path>` - service account JSON
+- [x] `sylk auth status` - show configured providers and status
+- [x] `sylk auth remove <provider>` - remove credentials
 - [ ] Validate key with provider health check before saving
 
 **Tests:**
