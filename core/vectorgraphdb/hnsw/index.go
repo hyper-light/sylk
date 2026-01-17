@@ -1,0 +1,411 @@
+package hnsw
+
+import (
+	"errors"
+	"sort"
+	"sync"
+
+	"github.com/adalundhe/sylk/core/vectorgraphdb"
+)
+
+var (
+	ErrNodeNotFound      = errors.New("node not found")
+	ErrEmptyVector       = errors.New("vector cannot be empty")
+	ErrDimensionMismatch = errors.New("vector dimension mismatch")
+	ErrIndexEmpty        = errors.New("index is empty")
+)
+
+type SearchResult struct {
+	ID         string
+	Similarity float64
+	Domain     vectorgraphdb.Domain
+	NodeType   vectorgraphdb.NodeType
+}
+
+type SearchFilter struct {
+	Domains       []vectorgraphdb.Domain
+	NodeTypes     []vectorgraphdb.NodeType
+	MinSimilarity float64
+}
+
+type Index struct {
+	mu          sync.RWMutex
+	layers      []*layer
+	vectors     map[string][]float32
+	magnitudes  map[string]float64
+	domains     map[string]vectorgraphdb.Domain
+	nodeTypes   map[string]vectorgraphdb.NodeType
+	M           int
+	efConstruct int
+	efSearch    int
+	levelMult   float64
+	maxLevel    int
+	entryPoint  string
+	dimension   int
+}
+
+type Config struct {
+	M           int
+	EfConstruct int
+	EfSearch    int
+	LevelMult   float64
+	Dimension   int
+}
+
+func DefaultConfig() Config {
+	return Config{
+		M:           vectorgraphdb.DefaultM,
+		EfConstruct: vectorgraphdb.DefaultEfConstruct,
+		EfSearch:    vectorgraphdb.DefaultEfSearch,
+		LevelMult:   vectorgraphdb.DefaultLevelMult,
+		Dimension:   0,
+	}
+}
+
+func New(cfg Config) *Index {
+	return &Index{
+		layers:      make([]*layer, 0),
+		vectors:     make(map[string][]float32),
+		magnitudes:  make(map[string]float64),
+		domains:     make(map[string]vectorgraphdb.Domain),
+		nodeTypes:   make(map[string]vectorgraphdb.NodeType),
+		M:           cfg.M,
+		efConstruct: cfg.EfConstruct,
+		efSearch:    cfg.EfSearch,
+		levelMult:   cfg.LevelMult,
+		dimension:   cfg.Dimension,
+		maxLevel:    -1,
+	}
+}
+
+func (h *Index) Insert(id string, vector []float32, domain vectorgraphdb.Domain, nodeType vectorgraphdb.NodeType) error {
+	if len(vector) == 0 {
+		return ErrEmptyVector
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.dimension == 0 {
+		h.dimension = len(vector)
+	} else if len(vector) != h.dimension {
+		return ErrDimensionMismatch
+	}
+
+	return h.insertLocked(id, vector, domain, nodeType)
+}
+
+func (h *Index) insertLocked(id string, vector []float32, domain vectorgraphdb.Domain, nodeType vectorgraphdb.NodeType) error {
+	mag := Magnitude(vector)
+	h.vectors[id] = vector
+	h.magnitudes[id] = mag
+	h.domains[id] = domain
+	h.nodeTypes[id] = nodeType
+
+	nodeLevel := randomLevel(h.levelMult)
+	h.ensureLayers(nodeLevel)
+
+	if h.entryPoint == "" {
+		h.initializeFirstNode(id, nodeLevel)
+		return nil
+	}
+
+	h.insertWithConnections(id, vector, mag, nodeLevel)
+	return nil
+}
+
+func (h *Index) ensureLayers(level int) {
+	for len(h.layers) <= level {
+		h.layers = append(h.layers, newLayer())
+	}
+}
+
+func (h *Index) initializeFirstNode(id string, level int) {
+	h.entryPoint = id
+	h.maxLevel = level
+	for l := 0; l <= level; l++ {
+		h.layers[l].addNode(id)
+	}
+}
+
+func (h *Index) insertWithConnections(id string, vector []float32, mag float64, nodeLevel int) {
+	currObj := h.entryPoint
+	currDist := 1.0 - CosineSimilarity(vector, h.vectors[currObj], mag, h.magnitudes[currObj])
+
+	for level := h.maxLevel; level > nodeLevel; level-- {
+		currObj, currDist = h.greedySearchLayer(vector, mag, currObj, currDist, level)
+	}
+
+	for level := min(nodeLevel, h.maxLevel); level >= 0; level-- {
+		h.layers[level].addNode(id)
+		neighbors := h.searchLayer(vector, mag, currObj, h.efConstruct, level)
+		h.connectNode(id, neighbors, level)
+		if len(neighbors) > 0 {
+			currObj = neighbors[0].ID
+			currDist = 1.0 - neighbors[0].Similarity
+		}
+	}
+
+	if nodeLevel > h.maxLevel {
+		h.maxLevel = nodeLevel
+		h.entryPoint = id
+	}
+}
+
+func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, epDist float64, level int) (string, float64) {
+	changed := true
+	for changed {
+		changed = false
+		neighbors := h.layers[level].getNeighbors(ep)
+		for _, neighbor := range neighbors {
+			if vec, exists := h.vectors[neighbor]; exists {
+				dist := 1.0 - CosineSimilarity(query, vec, queryMag, h.magnitudes[neighbor])
+				if dist < epDist {
+					ep = neighbor
+					epDist = dist
+					changed = true
+				}
+			}
+		}
+	}
+	return ep, epDist
+}
+
+func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int, level int) []SearchResult {
+	visited := make(map[string]bool)
+	visited[ep] = true
+
+	candidates := make([]SearchResult, 0, ef)
+	epSim := CosineSimilarity(query, h.vectors[ep], queryMag, h.magnitudes[ep])
+	candidates = append(candidates, SearchResult{ID: ep, Similarity: epSim})
+
+	for i := 0; i < len(candidates) && len(candidates) < ef*2; i++ {
+		curr := candidates[i]
+		neighbors := h.layers[level].getNeighbors(curr.ID)
+		for _, neighbor := range neighbors {
+			if visited[neighbor] {
+				continue
+			}
+			visited[neighbor] = true
+			if vec, exists := h.vectors[neighbor]; exists {
+				sim := CosineSimilarity(query, vec, queryMag, h.magnitudes[neighbor])
+				candidates = append(candidates, SearchResult{ID: neighbor, Similarity: sim})
+			}
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Similarity > candidates[j].Similarity
+	})
+
+	if len(candidates) > ef {
+		candidates = candidates[:ef]
+	}
+	return candidates
+}
+
+func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
+	maxConn := h.M
+	if level == 0 {
+		maxConn = h.M * 2
+	}
+
+	count := min(len(neighbors), maxConn)
+	for i := 0; i < count; i++ {
+		neighbor := neighbors[i]
+		h.layers[level].addNeighbor(id, neighbor.ID, maxConn)
+		h.layers[level].addNeighbor(neighbor.ID, id, maxConn)
+	}
+}
+
+func (h *Index) Search(query []float32, k int, filter *SearchFilter) []SearchResult {
+	if len(query) == 0 || k <= 0 {
+		return nil
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.entryPoint == "" {
+		return nil
+	}
+
+	queryMag := Magnitude(query)
+	if queryMag == 0 {
+		return nil
+	}
+
+	return h.searchLocked(query, queryMag, k, filter)
+}
+
+func (h *Index) searchLocked(query []float32, queryMag float64, k int, filter *SearchFilter) []SearchResult {
+	currObj := h.entryPoint
+	currDist := 1.0 - CosineSimilarity(query, h.vectors[currObj], queryMag, h.magnitudes[currObj])
+
+	for level := h.maxLevel; level > 0; level-- {
+		currObj, currDist = h.greedySearchLayer(query, queryMag, currObj, currDist, level)
+	}
+
+	candidates := h.searchLayer(query, queryMag, currObj, h.efSearch, 0)
+	return h.filterAndLimit(candidates, k, filter)
+}
+
+func (h *Index) filterAndLimit(candidates []SearchResult, k int, filter *SearchFilter) []SearchResult {
+	results := make([]SearchResult, 0, k)
+	for _, c := range candidates {
+		if !h.matchesFilter(c.ID, filter) {
+			continue
+		}
+		c.Domain = h.domains[c.ID]
+		c.NodeType = h.nodeTypes[c.ID]
+		results = append(results, c)
+		if len(results) >= k {
+			break
+		}
+	}
+	return results
+}
+
+func (h *Index) matchesFilter(id string, filter *SearchFilter) bool {
+	if filter == nil {
+		return true
+	}
+	if filter.MinSimilarity > 0 {
+		return true
+	}
+	if len(filter.Domains) > 0 {
+		if !h.containsDomain(filter.Domains, h.domains[id]) {
+			return false
+		}
+	}
+	if len(filter.NodeTypes) > 0 {
+		if !h.containsNodeType(filter.NodeTypes, h.nodeTypes[id]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Index) containsDomain(domains []vectorgraphdb.Domain, d vectorgraphdb.Domain) bool {
+	for _, domain := range domains {
+		if domain == d {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Index) containsNodeType(nodeTypes []vectorgraphdb.NodeType, nt vectorgraphdb.NodeType) bool {
+	for _, nodeType := range nodeTypes {
+		if nodeType == nt {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Index) Delete(id string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, exists := h.vectors[id]; !exists {
+		return ErrNodeNotFound
+	}
+
+	h.deleteLocked(id)
+	return nil
+}
+
+func (h *Index) deleteLocked(id string) {
+	for _, l := range h.layers {
+		if l.hasNode(id) {
+			h.removeNodeConnections(id, l)
+			l.removeNode(id)
+		}
+	}
+
+	delete(h.vectors, id)
+	delete(h.magnitudes, id)
+	delete(h.domains, id)
+	delete(h.nodeTypes, id)
+
+	if h.entryPoint == id {
+		h.selectNewEntryPoint()
+	}
+}
+
+func (h *Index) removeNodeConnections(id string, l *layer) {
+	neighbors := l.getNeighbors(id)
+	for _, neighbor := range neighbors {
+		l.removeNeighbor(neighbor, id)
+	}
+}
+
+func (h *Index) selectNewEntryPoint() {
+	h.entryPoint = ""
+	for level := h.maxLevel; level >= 0; level-- {
+		ids := h.layers[level].allNodeIDs()
+		if len(ids) > 0 {
+			h.entryPoint = ids[0]
+			h.maxLevel = level
+			return
+		}
+	}
+	h.maxLevel = -1
+}
+
+func (h *Index) Size() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.vectors)
+}
+
+func (h *Index) Contains(id string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, exists := h.vectors[id]
+	return exists
+}
+
+func (h *Index) GetVector(id string) ([]float32, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	vec, exists := h.vectors[id]
+	if !exists {
+		return nil, ErrNodeNotFound
+	}
+	result := make([]float32, len(vec))
+	copy(result, vec)
+	return result, nil
+}
+
+func (h *Index) GetMetadata(id string) (vectorgraphdb.Domain, vectorgraphdb.NodeType, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if _, exists := h.vectors[id]; !exists {
+		return "", "", ErrNodeNotFound
+	}
+	return h.domains[id], h.nodeTypes[id], nil
+}
+
+func (h *Index) Stats() IndexStats {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return IndexStats{
+		TotalNodes:  len(h.vectors),
+		MaxLevel:    h.maxLevel,
+		NumLayers:   len(h.layers),
+		M:           h.M,
+		EfConstruct: h.efConstruct,
+		EfSearch:    h.efSearch,
+	}
+}
+
+type IndexStats struct {
+	TotalNodes  int
+	MaxLevel    int
+	NumLayers   int
+	M           int
+	EfConstruct int
+	EfSearch    int
+}
