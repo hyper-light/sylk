@@ -241,8 +241,22 @@ func (g *DualQueueGate) Submit(ctx context.Context, req *LLMRequest) error {
 		}
 	}
 
+	if g.closed.Load() {
+		g.notifyClosedRequest(req)
+		return ErrGateClosed
+	}
+
 	g.signalWork()
 	return nil
+}
+
+func (g *DualQueueGate) notifyClosedRequest(req *LLMRequest) {
+	if req.ResultCh != nil {
+		select {
+		case req.ResultCh <- &LLMResult{RequestID: req.ID, Error: ErrGateClosed}:
+		default:
+		}
+	}
 }
 
 func (g *DualQueueGate) SubmitAndWait(ctx context.Context, req *LLMRequest) (any, error) {
@@ -411,6 +425,36 @@ func (g *DualQueueGate) Close() {
 		ar.CancelFunc()
 	}
 	g.mu.Unlock()
+
+	g.drainQueues()
+}
+
+func (g *DualQueueGate) drainQueues() {
+	for {
+		req := g.userQueue.Pop()
+		if req == nil {
+			break
+		}
+		if req.ResultCh != nil {
+			select {
+			case req.ResultCh <- &LLMResult{RequestID: req.ID, Error: ErrGateClosed}:
+			default:
+			}
+		}
+	}
+
+	for {
+		req := g.pipelineQueue.Pop()
+		if req == nil {
+			break
+		}
+		if req.ResultCh != nil {
+			select {
+			case req.ResultCh <- &LLMResult{RequestID: req.ID, Error: ErrGateClosed}:
+			default:
+			}
+		}
+	}
 }
 
 type GateStats struct {
