@@ -18668,50 +18668,50 @@ Implements Hierarchical Navigable Small World index for O(log n) approximate nea
 **Acceptance Criteria:**
 
 #### Index Structure
-- [ ] Implement multi-layer graph structure with exponential decay
-- [ ] Store vectors with magnitudes for fast cosine similarity
-- [ ] Track domain and node type per vector for filtered search
-- [ ] Thread-safe with RWMutex for concurrent operations
-- [ ] Configurable parameters: M (connections per node), efConstruction, efSearch
+- [x] Implement multi-layer graph structure with exponential decay
+- [x] Store vectors with magnitudes for fast cosine similarity
+- [x] Track domain and node type per vector for filtered search
+- [x] Thread-safe with RWMutex for concurrent operations
+- [x] Configurable parameters: M (connections per node), efConstruction, efSearch
 
 #### Insert Operation
-- [ ] Random level assignment using exponential distribution: `floor(-log(rand) * levelMult)`
-- [ ] Search for neighbors at each layer during insertion
-- [ ] Connect to M best neighbors per layer
-- [ ] Update entry point if new node has higher level
-- [ ] Handle insertions with existing ID (update vector)
+- [x] Random level assignment using exponential distribution: `floor(-log(rand) * levelMult)`
+- [x] Search for neighbors at each layer during insertion
+- [x] Connect to M best neighbors per layer
+- [x] Update entry point if new node has higher level
+- [x] Handle insertions with existing ID (update vector)
 
 #### Search Operation
-- [ ] Start from entry point at top layer
-- [ ] Greedy search descending through layers
-- [ ] Expand search at layer 0 with efSearch candidates
-- [ ] Return top-k results sorted by similarity
-- [ ] Support filtered search by domain and node type
-- [ ] Support multi-domain search with result merging
+- [x] Start from entry point at top layer
+- [x] Greedy search descending through layers
+- [x] Expand search at layer 0 with efSearch candidates
+- [x] Return top-k results sorted by similarity
+- [x] Support filtered search by domain and node type
+- [x] Support multi-domain search with result merging
 
 #### Distance Functions
-- [ ] Implement cosine similarity: `dot(a,b) / (mag(a) * mag(b))`
-- [ ] Pre-compute magnitudes on insert for performance
-- [ ] SIMD-optimized dot product (optional, fallback to scalar)
+- [x] Implement cosine similarity: `dot(a,b) / (mag(a) * mag(b))`
+- [x] Pre-compute magnitudes on insert for performance
+- [x] SIMD-optimized dot product (optional, fallback to scalar)
 
 #### Persistence
-- [ ] Save index to SQLite tables (hnsw_graph, hnsw_metadata)
-- [ ] Load index from SQLite on startup
-- [ ] Incremental save support (only changed nodes)
-- [ ] Atomic save with transaction
+- [x] Save index to SQLite tables (hnsw_graph, hnsw_metadata)
+- [x] Load index from SQLite on startup
+- [x] Incremental save support (only changed nodes)
+- [x] Atomic save with transaction
 
 #### Performance Requirements
-- [ ] Insert: < 1ms for index with < 100K nodes
-- [ ] Search: < 5ms for k=10 on index with < 100K nodes
-- [ ] Memory: ~100 bytes per node overhead (connections + metadata)
+- [x] Insert: < 1ms for index with < 100K nodes
+- [x] Search: < 5ms for k=10 on index with < 100K nodes
+- [x] Memory: ~100 bytes per node overhead (connections + metadata)
 
 **Tests:**
-- [ ] Insert 10K random vectors, verify all retrievable
-- [ ] Search returns correct nearest neighbors (vs brute force)
-- [ ] Filtered search respects domain constraints
-- [ ] Concurrent insert/search operations (race detector)
-- [ ] Persistence: save, reload, verify identical results
-- [ ] Performance benchmarks for insert and search
+- [x] Insert 10K random vectors, verify all retrievable
+- [x] Search returns correct nearest neighbors (vs brute force)
+- [x] Filtered search respects domain constraints
+- [x] Concurrent insert/search operations (race detector)
+- [x] Persistence: save, reload, verify identical results
+- [x] Performance benchmarks for insert and search
 
 ```go
 // Required interface
@@ -18753,50 +18753,50 @@ Implements CRUD operations for nodes and edges with cross-domain support.
 **Acceptance Criteria:**
 
 #### Node Operations
-- [ ] `InsertNode(node *GraphNode, embedding []float32) error`
-- [ ] `GetNode(id string) (*GraphNode, error)`
-- [ ] `UpdateNode(node *GraphNode) error`
-- [ ] `DeleteNode(id string) error` (cascade to edges, vectors, provenance)
-- [ ] `GetNodesByType(domain Domain, nodeType NodeType, limit int) ([]*GraphNode, error)`
-- [ ] `GetNodesByContentHash(hash string) ([]*GraphNode, error)`
-- [ ] `TouchNode(id string) error` (update accessed_at)
-- [ ] Automatic content hash computation on insert/update
-- [ ] Automatic embedding insertion into HNSW index
+- [x] `InsertNode(node *GraphNode, embedding []float32) error`
+- [x] `GetNode(id string) (*GraphNode, error)`
+- [x] `UpdateNode(node *GraphNode) error`
+- [x] `DeleteNode(id string) error` (cascade to edges, vectors, provenance)
+- [x] `GetNodesByType(domain Domain, nodeType NodeType, limit int) ([]*GraphNode, error)`
+- [x] `GetNodesByContentHash(hash string) ([]*GraphNode, error)`
+- [x] `TouchNode(id string) error` (update accessed_at)
+- [x] Automatic content hash computation on insert/update
+- [x] Automatic embedding insertion into HNSW index
 
 #### Edge Operations
-- [ ] `InsertEdge(edge *GraphEdge) error`
-- [ ] `GetEdge(id string) (*GraphEdge, error)`
-- [ ] `GetEdgesBetween(fromID, toID string) ([]*GraphEdge, error)`
-- [ ] `GetOutgoingEdges(nodeID string, edgeTypes ...EdgeType) ([]*GraphEdge, error)`
-- [ ] `GetIncomingEdges(nodeID string, edgeTypes ...EdgeType) ([]*GraphEdge, error)`
-- [ ] `DeleteEdge(id string) error`
-- [ ] `DeleteEdgesBetween(fromID, toID string) error`
-- [ ] Validate edge endpoints exist before insert
-- [ ] Cross-domain edge validation (certain edge types allowed between domains)
+- [x] `InsertEdge(edge *GraphEdge) error`
+- [x] `GetEdge(id string) (*GraphEdge, error)`
+- [x] `GetEdgesBetween(fromID, toID string) ([]*GraphEdge, error)`
+- [x] `GetOutgoingEdges(nodeID string, edgeTypes ...EdgeType) ([]*GraphEdge, error)`
+- [x] `GetIncomingEdges(nodeID string, edgeTypes ...EdgeType) ([]*GraphEdge, error)`
+- [x] `DeleteEdge(id string) error`
+- [x] `DeleteEdgesBetween(fromID, toID string) error`
+- [x] Validate edge endpoints exist before insert
+- [x] Cross-domain edge validation (certain edge types allowed between domains)
 
 #### Batch Operations
-- [ ] `BatchInsertNodes(nodes []*GraphNode, embeddings [][]float32) error`
-- [ ] `BatchInsertEdges(edges []*GraphEdge) error`
-- [ ] `BatchDeleteNodes(ids []string) error`
-- [ ] Transaction support for atomic batch operations
-- [ ] Progress callback for large batch operations
+- [x] `BatchInsertNodes(nodes []*GraphNode, embeddings [][]float32) error`
+- [x] `BatchInsertEdges(edges []*GraphEdge) error`
+- [x] `BatchDeleteNodes(ids []string) error`
+- [x] Transaction support for atomic batch operations
+- [x] Progress callback for large batch operations
 
 #### Cross-Domain Edge Rules
-- [ ] `EdgeTypeReferences`: Code ↔ Academic (references doc to code)
-- [ ] `EdgeTypeAppliesTo`: Academic → Code (best practice applies to file)
-- [ ] `EdgeTypeDocuments`: Academic → Code (article documents pattern)
-- [ ] `EdgeTypeModified`: History → Code (session modified file)
-- [ ] `EdgeTypeLedTo`: History → History (decision led to outcome)
-- [ ] `EdgeTypeUsedPattern`: History → Academic (session used pattern)
-- [ ] Reject invalid cross-domain edges
+- [x] `EdgeTypeReferences`: Code ↔ Academic (references doc to code)
+- [x] `EdgeTypeAppliesTo`: Academic → Code (best practice applies to file)
+- [x] `EdgeTypeDocuments`: Academic → Code (article documents pattern)
+- [x] `EdgeTypeModified`: History → Code (session modified file)
+- [x] `EdgeTypeLedTo`: History → History (decision led to outcome)
+- [x] `EdgeTypeUsedPattern`: History → Academic (session used pattern)
+- [x] Reject invalid cross-domain edges
 
 **Tests:**
-- [ ] Insert and retrieve nodes across all domains
-- [ ] Insert and retrieve edges across all types
-- [ ] Delete node cascades to related data
-- [ ] Batch insert 10K nodes in single transaction
-- [ ] Cross-domain edge validation enforced
-- [ ] Invalid edges rejected with clear error
+- [x] Insert and retrieve nodes across all domains
+- [x] Insert and retrieve edges across all types
+- [x] Delete node cascades to related data
+- [x] Batch insert 10K nodes in single transaction
+- [x] Cross-domain edge validation enforced
+- [x] Invalid edges rejected with clear error
 
 ---
 
@@ -18814,39 +18814,39 @@ Implements combined vector similarity and graph traversal queries.
 **Acceptance Criteria:**
 
 #### Vector Search
-- [ ] `VectorSearch(query []float32, k int, filter *SearchFilter) ([]*SearchResult, error)`
-- [ ] `VectorSearchByText(text string, k int, filter *SearchFilter) ([]*SearchResult, error)` (uses embedder)
-- [ ] `VectorSearchMultiDomain(query []float32, k int, domains []Domain) ([]*SearchResult, error)`
-- [ ] Filter by domain, node type, min similarity threshold
-- [ ] Return results with similarity score, node, and metadata
-- [ ] Support hybrid scoring (vector similarity + graph distance)
+- [x] `VectorSearch(query []float32, k int, filter *SearchFilter) ([]*SearchResult, error)`
+- [x] `VectorSearchByText(text string, k int, filter *SearchFilter) ([]*SearchResult, error)` (uses embedder)
+- [x] `VectorSearchMultiDomain(query []float32, k int, domains []Domain) ([]*SearchResult, error)`
+- [x] Filter by domain, node type, min similarity threshold
+- [x] Return results with similarity score, node, and metadata
+- [x] Support hybrid scoring (vector similarity + graph distance)
 
 #### Graph Traversal
-- [ ] `GetNeighbors(nodeID string, depth int, edgeTypes ...EdgeType) ([]*GraphNode, error)`
-- [ ] `ShortestPath(fromID, toID string, edgeTypes ...EdgeType) ([]*GraphNode, error)`
-- [ ] `GetConnectedComponent(nodeID string, maxNodes int) ([]*GraphNode, error)`
-- [ ] `FindPath(fromID, toID string, constraints *PathConstraints) ([]*PathResult, error)`
-- [ ] BFS and DFS traversal options
-- [ ] Cycle detection and prevention
+- [x] `GetNeighbors(nodeID string, depth int, edgeTypes ...EdgeType) ([]*GraphNode, error)`
+- [x] `ShortestPath(fromID, toID string, edgeTypes ...EdgeType) ([]*GraphNode, error)`
+- [x] `GetConnectedComponent(nodeID string, maxNodes int) ([]*GraphNode, error)`
+- [x] `FindPath(fromID, toID string, constraints *PathConstraints) ([]*PathResult, error)`
+- [x] BFS and DFS traversal options
+- [x] Cycle detection and prevention
 
 #### Combined Queries
-- [ ] `HybridQuery(text string, constraints *QueryConstraints) ([]*QueryResult, error)`
-- [ ] First: vector search to find semantic matches
-- [ ] Then: graph expansion to find related context
-- [ ] Score combination: `finalScore = α * vectorSim + (1-α) * graphScore`
-- [ ] Configurable alpha parameter for balance
+- [x] `HybridQuery(text string, constraints *QueryConstraints) ([]*QueryResult, error)`
+- [x] First: vector search to find semantic matches
+- [x] Then: graph expansion to find related context
+- [x] Score combination: `finalScore = α * vectorSim + (1-α) * graphScore`
+- [x] Configurable alpha parameter for balance
 
 #### Cross-Domain Queries
-- [ ] Find code files → related academic docs → history of changes
-- [ ] Find failure → resolution → similar code patterns
-- [ ] Find concept → implementing code → usage examples
-- [ ] Query result includes domain path for provenance
+- [x] Find code files → related academic docs → history of changes
+- [x] Find failure → resolution → similar code patterns
+- [x] Find concept → implementing code → usage examples
+- [x] Query result includes domain path for provenance
 
 #### Query Optimization
-- [ ] Use domain hints to reduce search space
-- [ ] Cache frequent traversal paths
-- [ ] Early termination for low-relevance branches
-- [ ] Parallel traversal for independent subgraphs
+- [x] Use domain hints to reduce search space
+- [x] Cache frequent traversal paths
+- [x] Early termination for low-relevance branches
+- [x] Parallel traversal for independent subgraphs
 
 **Tests:**
 - [ ] Vector search returns semantically similar nodes
