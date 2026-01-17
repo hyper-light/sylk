@@ -65,6 +65,13 @@ func (ns *NodeStore) computeContentHash(node *GraphNode) string {
 }
 
 func (ns *NodeStore) insertNodeTx(node *GraphNode, embedding []float32) error {
+	if err := ns.insertNodeToDB(node, embedding); err != nil {
+		return err
+	}
+	return ns.insertNodeToHNSW(node, embedding)
+}
+
+func (ns *NodeStore) insertNodeToDB(node *GraphNode, embedding []float32) error {
 	tx, err := ns.db.BeginTx()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -74,19 +81,17 @@ func (ns *NodeStore) insertNodeTx(node *GraphNode, embedding []float32) error {
 	if err := ns.insertNodeRow(tx, node); err != nil {
 		return err
 	}
-
 	if err := ns.insertEmbedding(tx, node.ID, embedding); err != nil {
 		return err
 	}
+	return tx.Commit()
+}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+func (ns *NodeStore) insertNodeToHNSW(node *GraphNode, embedding []float32) error {
+	if ns.hnsw == nil {
+		return nil
 	}
-
-	if ns.hnsw != nil {
-		return ns.hnsw.Insert(node.ID, embedding, node.Domain, node.NodeType)
-	}
-	return nil
+	return ns.hnsw.Insert(node.ID, embedding, node.Domain, node.NodeType)
 }
 
 func (ns *NodeStore) insertNodeRow(tx *sql.Tx, node *GraphNode) error {
