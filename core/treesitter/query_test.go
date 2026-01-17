@@ -154,10 +154,6 @@ func TestExtractQueryNames(t *testing.T) {
 }
 
 func TestQueryPatternMethod(t *testing.T) {
-	if err := Initialize(); err != nil {
-		t.Skipf("tree-sitter library not available: %v", err)
-	}
-
 	lang := &Language{name: "go"}
 	pattern := "(function_declaration)"
 	query := &Query{pattern: pattern, language: lang}
