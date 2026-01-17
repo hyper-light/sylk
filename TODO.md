@@ -23163,14 +23163,14 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 3B: Tool Output & Parsing                                         ││
-│ │ • 0.46 Output Handler                                                            ││
-│ │ • 0.47 Tool Output Parsers                                                       ││
-│ │ • 0.48 Parse Template Cache                                                      ││
-│ │ • 0.50 Tool Cancellation Manager ✅                                              ││
-│ │ • 0.51 Tool Output Cache ✅                                                      ││
-│ │ • 0.52 Tool Invocation Batcher ✅                                                ││
-│ │ • 0.53 Streaming Output Parser                                                   ││
+│ │ PARALLEL GROUP 3B: Tool Output & Parsing (DONE)                                  ││
+│ │ • 0.46 Output Handler (DONE)                                                     ││
+│ │ • 0.47 Tool Output Parsers (DONE)                                                ││
+│ │ • 0.48 Parse Template Cache (DONE)                                               ││
+│ │ • 0.50 Tool Cancellation Manager (DONE)                                          ││
+│ │ • 0.51 Tool Output Cache (DONE)                                                  ││
+│ │ • 0.52 Tool Invocation Batcher (DONE)                                            ││
+│ │ • 0.53 Streaming Output Parser (DONE)                                            ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
