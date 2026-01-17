@@ -4779,23 +4779,32 @@ type MemoryBounds struct {
 }
 ```
 
-#### Observability & Telemetry (NOT DONE - core/observability/stream_telemetry.go)
+#### Observability & Telemetry (NOT DONE - core/metrics/)
 
-- [ ] Prometheus metrics for streaming:
-  - `sylk_stream_duration_seconds` (histogram)
-  - `sylk_stream_time_to_first_token_seconds` (histogram)
-  - `sylk_stream_chunks_total` (counter by provider, model)
-  - `sylk_stream_tokens_total` (counter by provider, model, direction)
-  - `sylk_stream_errors_total` (counter by provider, error_type)
-  - `sylk_stream_early_aborts_total` (counter by provider, reason)
-  - `sylk_stream_backpressure_events_total` (counter)
-  - `sylk_stream_retries_total` (counter by provider)
-- [ ] OpenTelemetry tracing integration
-- [ ] Span per stream with chunk events as span events
-- [ ] Trace context propagation through event bus
-- [ ] Correlation ID as trace ID where applicable
-- [ ] Structured logging for stream lifecycle events
-- [ ] Debug mode: log every chunk (configurable)
+**Note:** Sylk is a terminal CLI application, NOT a distributed system. We use in-memory metrics with CLI display and optional file export - NOT Prometheus or OpenTelemetry.
+
+- [ ] `MetricsRegistry` singleton for in-memory metrics storage
+- [ ] `Counter` type with atomic increment and thread-safe read
+- [ ] `Gauge` type with atomic set/get
+- [ ] `Histogram` type with bucketed distribution (p50, p95, p99 calculation)
+- [ ] `Timer` type wrapping Histogram for duration tracking
+- [ ] Streaming metrics tracked:
+  - Stream duration (histogram)
+  - Time to first token (histogram)
+  - Chunks per stream (counter by provider, model)
+  - Tokens per stream (counter by provider, model, direction)
+  - Errors (counter by provider, error_type)
+  - Early aborts (counter by provider, reason)
+  - Backpressure events (counter)
+  - Retries (counter by provider)
+- [ ] `sylk metrics` CLI command displays current session metrics
+- [ ] `sylk metrics --json` exports metrics as JSON to stdout
+- [ ] `sylk metrics --export <file>` exports metrics to JSON file
+- [ ] Metrics reset on session start (session-scoped)
+- [ ] Optional: Historical metrics stored in SQLite for cross-session analysis
+- [ ] Structured logging for stream lifecycle events (slog integration)
+- [ ] Debug mode: log every chunk (configurable via `--verbose` or config)
+- [ ] Correlation ID propagated through all log entries
 
 #### Graceful Degradation (NOT DONE)
 
@@ -4889,7 +4898,8 @@ type MemoryBounds struct {
 - [ ] Retrier respects max attempts
 - [ ] Circuit breaker state transitions correct
 - [ ] Memory bounds trigger at correct thresholds
-- [ ] Prometheus metrics exported correctly
+- [ ] In-memory metrics tracked correctly
+- [ ] CLI metrics command displays correct values
 - [ ] Graceful degradation fallback works
 - [ ] Concurrent stream limits enforced
 - [ ] All provider-specific edge cases handled
@@ -5250,6 +5260,149 @@ type LLMGate interface {
     Stats() GateStats
     Close() error
 }
+```
+
+---
+
+### 0.15a CLI Metrics Infrastructure
+
+In-memory metrics system for terminal CLI application. NOT Prometheus/OpenTelemetry - those are for distributed systems with HTTP endpoints.
+
+**Files to create:**
+- `core/metrics/types.go`
+- `core/metrics/registry.go`
+- `core/metrics/counter.go`
+- `core/metrics/gauge.go`
+- `core/metrics/histogram.go`
+- `core/metrics/timer.go`
+- `core/metrics/export.go`
+- `core/metrics/storage.go`
+
+**Design Principles:**
+- All metrics are in-memory with atomic operations
+- No external dependencies (no Prometheus, no OpenTelemetry)
+- Metrics are session-scoped by default
+- Optional SQLite persistence for historical analysis
+- CLI commands for viewing and exporting
+
+**Acceptance Criteria:**
+
+#### Core Types (`core/metrics/types.go`)
+- [ ] `Metric` interface with `Name()`, `Type()`, `Value()`, `Labels()`, `Reset()`
+- [ ] `MetricType` enum: Counter, Gauge, Histogram, Timer
+- [ ] `Labels` map type for dimensional metrics
+- [ ] `MetricSnapshot` struct for point-in-time capture
+- [ ] `MetricsSummary` struct for CLI display
+
+#### Registry (`core/metrics/registry.go`)
+- [ ] `MetricsRegistry` singleton pattern
+- [ ] `Register(name string, metric Metric)` adds metric
+- [ ] `Get(name string) Metric` retrieves metric
+- [ ] `GetByPrefix(prefix string) []Metric` retrieves all with prefix
+- [ ] `Snapshot() map[string]MetricSnapshot` captures all metrics
+- [ ] `Reset()` clears all metrics (for new session)
+- [ ] Thread-safe operations throughout
+- [ ] Namespacing: metrics prefixed by subsystem (e.g., "stream.", "tool.", "llm.")
+
+#### Counter (`core/metrics/counter.go`)
+- [ ] `Counter` struct with atomic int64 value
+- [ ] `Inc()` increments by 1
+- [ ] `Add(delta int64)` increments by delta
+- [ ] `Value() int64` returns current value
+- [ ] `Reset()` sets to 0
+- [ ] Optional labels for dimensional counters
+- [ ] `NewCounter(name string, labels ...string) *Counter`
+
+#### Gauge (`core/metrics/gauge.go`)
+- [ ] `Gauge` struct with atomic float64 value
+- [ ] `Set(value float64)` sets value
+- [ ] `Inc()` / `Dec()` for convenience
+- [ ] `Add(delta float64)` / `Sub(delta float64)`
+- [ ] `Value() float64` returns current value
+- [ ] `NewGauge(name string, labels ...string) *Gauge`
+
+#### Histogram (`core/metrics/histogram.go`)
+- [ ] `Histogram` struct with sorted slice of observations
+- [ ] `Observe(value float64)` adds observation
+- [ ] `Count() int64` returns number of observations
+- [ ] `Sum() float64` returns sum of observations
+- [ ] `Percentile(p float64) float64` calculates percentile (0.5, 0.95, 0.99)
+- [ ] `Min() float64` / `Max() float64`
+- [ ] `Mean() float64`
+- [ ] Configurable max observations (default: 10000, FIFO eviction)
+- [ ] `NewHistogram(name string, labels ...string) *Histogram`
+
+#### Timer (`core/metrics/timer.go`)
+- [ ] `Timer` wraps Histogram for duration tracking
+- [ ] `Start() func()` returns stop function that records duration
+- [ ] `Record(d time.Duration)` records duration directly
+- [ ] `P50() time.Duration` / `P95()` / `P99()` convenience methods
+- [ ] `NewTimer(name string, labels ...string) *Timer`
+
+```go
+// Usage example
+timer := metrics.NewTimer("stream.duration")
+stop := timer.Start()
+// ... do work ...
+stop() // automatically records duration
+
+// Or manual
+timer.Record(time.Since(startTime))
+```
+
+#### Export (`core/metrics/export.go`)
+- [ ] `ExportJSON() ([]byte, error)` exports all metrics as JSON
+- [ ] `ExportToFile(path string) error` writes JSON to file
+- [ ] `FormatForCLI() string` formats metrics for terminal display
+- [ ] `FormatTable(metrics []Metric) string` tabular format
+- [ ] Histograms export with p50/p95/p99/min/max/mean
+
+#### SQLite Storage (`core/metrics/storage.go`)
+- [ ] `MetricsStore` interface for persistence
+- [ ] `SQLiteMetricsStore` implementation
+- [ ] `Save(sessionID string, snapshot map[string]MetricSnapshot) error`
+- [ ] `Load(sessionID string) (map[string]MetricSnapshot, error)`
+- [ ] `Query(filter MetricsFilter) ([]SessionMetrics, error)`
+- [ ] `Aggregate(metricName string, period time.Duration) []AggregatedMetric`
+- [ ] Schema migration on first run
+- [ ] Automatic cleanup of old data (configurable retention)
+
+#### Pre-Registered Metrics
+- [ ] `stream.duration` (timer) - LLM stream duration
+- [ ] `stream.time_to_first_token` (timer) - TTFT
+- [ ] `stream.chunks` (counter, labels: provider, model)
+- [ ] `stream.tokens` (counter, labels: provider, model, direction)
+- [ ] `stream.errors` (counter, labels: provider, error_type)
+- [ ] `stream.early_aborts` (counter, labels: provider, reason)
+- [ ] `llm.requests` (counter, labels: provider, model, agent)
+- [ ] `llm.tokens.input` (counter, labels: provider, model)
+- [ ] `llm.tokens.output` (counter, labels: provider, model)
+- [ ] `tool.loads` (counter, labels: agent, tool)
+- [ ] `tool.load_latency` (timer, labels: agent)
+- [ ] `tool.tokens_saved` (counter, labels: agent)
+- [ ] `session.duration` (gauge) - current session duration
+- [ ] `session.pipelines` (gauge) - active pipelines
+
+**Tests:**
+- [ ] Counter increments atomically under concurrent access
+- [ ] Gauge set/get is thread-safe
+- [ ] Histogram percentiles calculated correctly
+- [ ] Timer records durations accurately
+- [ ] Registry get/set is thread-safe
+- [ ] JSON export produces valid JSON
+- [ ] SQLite storage persists and retrieves correctly
+- [ ] CLI format is human-readable
+
+```go
+// Example metric registration
+func init() {
+    metrics.Register("stream.duration", metrics.NewTimer("stream.duration"))
+    metrics.Register("stream.tokens", metrics.NewCounter("stream.tokens", "provider", "model", "direction"))
+}
+
+// Example usage
+metrics.Get("stream.duration").(*metrics.Timer).Record(elapsed)
+metrics.Get("stream.tokens").(*metrics.Counter).Add(tokenCount)
 ```
 
 ---
@@ -14754,6 +14907,8 @@ func (p *PatternLearner) Import(data *PatternData)
 
 Metrics for monitoring lazy loading effectiveness.
 
+**Note:** Sylk is a terminal CLI application, NOT a distributed system. We use in-memory metrics with CLI display and optional file export - NOT Prometheus or Grafana.
+
 **Files to create:**
 - `core/tools/metrics.go`
 
@@ -14762,30 +14917,61 @@ Metrics for monitoring lazy loading effectiveness.
 ```go
 // core/tools/metrics.go
 type ToolLoadingMetrics struct {
-    BootstrapTokensSaved   prometheus.Counter
-    ToolsLoadedTotal       prometheus.Counter
-    BundlesLoadedTotal     prometheus.Counter
-    SuggestionsAccepted    prometheus.Counter
-    SuggestionsRejected    prometheus.Counter
-    CacheHitRate           prometheus.Gauge
-    AverageToolsPerTask    prometheus.Gauge
-    LoadLatencyHistogram   prometheus.Histogram
+    mu                     sync.RWMutex
+    BootstrapTokensSaved   int64                    // atomic counter
+    ToolsLoadedTotal       int64                    // atomic counter
+    BundlesLoadedTotal     int64                    // atomic counter
+    SuggestionsAccepted    int64                    // atomic counter
+    SuggestionsRejected    int64                    // atomic counter
+    CacheHits              int64                    // for rate calculation
+    CacheMisses            int64                    // for rate calculation
+    ToolsPerTask           []int                    // for average calculation
+    LoadLatencies          []time.Duration          // for histogram calculation
+    ByAgent                map[string]*AgentMetrics // per-agent breakdown
 }
 
-func RegisterToolLoadingMetrics(registry prometheus.Registerer)
+type AgentMetrics struct {
+    TokensSaved   int64
+    ToolsLoaded   int64
+    LoadLatencies []time.Duration
+}
+
+// Global singleton
+var toolMetrics = &ToolLoadingMetrics{
+    ByAgent: make(map[string]*AgentMetrics),
+}
+
 func RecordToolLoad(agentID string, toolCount int, latency time.Duration)
 func RecordTokenSavings(agentID string, savedTokens int)
+func RecordCacheHit()
+func RecordCacheMiss()
+func RecordSuggestionAccepted()
+func RecordSuggestionRejected()
+
+// For CLI display
+func GetMetricsSummary() *MetricsSummary
+func GetAgentMetrics(agentID string) *AgentMetrics
+func ExportMetricsJSON() ([]byte, error)
+
+// Histogram calculations
+func (m *ToolLoadingMetrics) LoadLatencyP50() time.Duration
+func (m *ToolLoadingMetrics) LoadLatencyP95() time.Duration
+func (m *ToolLoadingMetrics) LoadLatencyP99() time.Duration
+func (m *ToolLoadingMetrics) CacheHitRate() float64
+func (m *ToolLoadingMetrics) AverageToolsPerTask() float64
 ```
 
 **Acceptance Criteria:**
-- [ ] Prometheus metrics registered
+- [ ] In-memory metrics tracked with atomic operations
 - [ ] Token savings tracked per agent
-- [ ] Tool load count tracked
-- [ ] Cache hit rate tracked
+- [ ] Tool load count tracked per agent and total
+- [ ] Cache hit rate calculated from hits/misses
 - [ ] Suggestion acceptance rate tracked
-- [ ] Load latency histogram (p50, p95, p99)
-- [ ] Dashboard template for Grafana
-- [ ] Alerts for degraded performance
+- [ ] Load latency percentiles calculated (p50, p95, p99)
+- [ ] `sylk metrics tools` CLI command displays tool loading metrics
+- [ ] `sylk metrics tools --json` exports as JSON
+- [ ] Metrics persist to SQLite for cross-session analysis (optional)
+- [ ] Session summary includes tool loading efficiency stats
 
 ---
 
@@ -19479,11 +19665,11 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ PARALLEL GROUP 0A: Core Types & Interfaces                                       ││
 │ │ • 0.7 Provider Interface (DONE)                                                  ││
 │ │ • 0.10a.1 StreamChunk Types (DONE)                                               ││
-│ │ • 0.26 Error Type System                                                         ││
-│ │ • 1.1 Academic Types                                                             ││
-│ │ • 2.1 Engineer Types                                                             ││
-│ │ • 4.1 Inspector Types                                                            ││
-│ │ • 6.1 VectorGraphDB Schema                                                       ││
+│ │ • 0.26 Error Type System (DONE)                                                  ││
+│ │ • 1.1 Academic Types (DONE)                                                      ││
+│ │ • 2.1 Engineer Types (DONE)                                                      ││
+│ │ • 4.1 Inspector Types (DONE)                                                     ││
+│ │ • 6.1 VectorGraphDB Schema (DONE)                                                ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
