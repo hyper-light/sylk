@@ -1,0 +1,84 @@
+package vectorgraphdb
+
+import "time"
+
+const (
+	SchemaVersion = 1
+
+	DefaultM           = 16
+	DefaultEfConstruct = 200
+	DefaultEfSearch    = 50
+	DefaultLevelMult   = 0.36067977499789996
+
+	EmbeddingDimension = 768
+
+	DefaultMaxNodes          = 100000
+	DefaultStaleThreshold    = 30 * 24 * time.Hour
+	DefaultVacuumInterval    = 24 * time.Hour
+	DefaultBatchSize         = 1000
+	DefaultQueryTimeout      = 5 * time.Second
+	DefaultInsertTimeout     = 1 * time.Second
+	DefaultTraversalMaxDepth = 10
+	DefaultTraversalMaxNodes = 1000
+	DefaultHybridSearchAlpha = 0.7
+	DefaultMinSimilarity     = 0.5
+	DefaultMaxSearchResults  = 100
+	DefaultCacheSize         = 10000
+	DefaultCacheTTL          = 5 * time.Minute
+)
+
+var ValidSourceTypes = []string{
+	SourceTypeGit,
+	SourceTypeUser,
+	SourceTypeLLM,
+	SourceTypeWeb,
+	SourceTypeAPI,
+}
+
+var ValidConflictTypes = []string{
+	ConflictTypeSemanticContradiction,
+	ConflictTypeVersionMismatch,
+	ConflictTypeDuplicate,
+	ConflictTypeStale,
+}
+
+type CrossDomainEdgeRule struct {
+	EdgeType   EdgeType
+	FromDomain Domain
+	ToDomain   Domain
+}
+
+var CrossDomainEdgeRules = []CrossDomainEdgeRule{
+	{EdgeTypeReferences, DomainCode, DomainAcademic},
+	{EdgeTypeReferences, DomainAcademic, DomainCode},
+	{EdgeTypeAppliesTo, DomainAcademic, DomainCode},
+	{EdgeTypeDocuments, DomainAcademic, DomainCode},
+	{EdgeTypeModified, DomainHistory, DomainCode},
+}
+
+func IsValidCrossDomainEdge(edgeType EdgeType, fromDomain, toDomain Domain) bool {
+	for _, rule := range CrossDomainEdgeRules {
+		if rule.EdgeType == edgeType && rule.FromDomain == fromDomain && rule.ToDomain == toDomain {
+			return true
+		}
+	}
+	return false
+}
+
+func IsValidSourceType(sourceType string) bool {
+	for _, valid := range ValidSourceTypes {
+		if sourceType == valid {
+			return true
+		}
+	}
+	return false
+}
+
+func IsValidConflictType(conflictType string) bool {
+	for _, valid := range ValidConflictTypes {
+		if conflictType == valid {
+			return true
+		}
+	}
+	return false
+}
