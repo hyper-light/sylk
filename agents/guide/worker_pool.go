@@ -160,7 +160,7 @@ func (p *WorkerPool) SubmitWithTimeout(job *Job, timeout time.Duration) bool {
 }
 
 // worker processes jobs from the queue
-func (p *WorkerPool) worker(id int) {
+func (p *WorkerPool) worker(_ int) {
 	defer p.wg.Done()
 
 	for job := range p.jobs {
@@ -406,7 +406,7 @@ func (p *ClassificationWorkerPool) Stats() WorkerPoolStats {
 
 var ErrWorkerPoolFull = errorf("worker pool queue is full")
 
-func errorf(format string, args ...any) error {
+func errorf(format string, _ ...any) error {
 	return &poolError{msg: format}
 }
 

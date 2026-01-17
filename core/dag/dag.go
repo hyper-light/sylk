@@ -239,9 +239,7 @@ func (d *DAG) Metadata() map[string]any {
 	defer d.mu.RUnlock()
 
 	result := make(map[string]any, len(d.metadata))
-	for k, v := range d.metadata {
-		result[k] = v
-	}
+	maps.Copy(result, d.metadata)
 	return result
 }
 
@@ -269,14 +267,6 @@ func (d *DAG) IsValidated() bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.validated
-}
-
-// setValidated marks the DAG as validated with computed execution order
-func (d *DAG) setValidated(order [][]string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.executionOrder = order
-	d.validated = true
 }
 
 // =============================================================================

@@ -23,6 +23,8 @@ type ResourceBroker struct {
 	signalBus *signal.SignalBus
 	config    ResourceBrokerConfig
 	closed    bool
+	stopCh    chan struct{}
+	done      chan struct{}
 }
 
 type ResourceBrokerConfig struct {
@@ -64,7 +66,7 @@ func NewResourceBroker(
 	signalBus *signal.SignalBus,
 	config ResourceBrokerConfig,
 ) *ResourceBroker {
-	return &ResourceBroker{
+	b := &ResourceBroker{
 		memoryMonitor: memMon,
 		filePool:      filePool,
 		networkPool:   netPool,
@@ -74,7 +76,80 @@ func NewResourceBroker(
 		waitGraph:     make(map[string][]string),
 		signalBus:     signalBus,
 		config:        config,
+		stopCh:        make(chan struct{}),
+		done:          make(chan struct{}),
 	}
+
+	if config.DeadlockDetection {
+		go b.deadlockDetectionLoop()
+	}
+
+	return b
+}
+
+func (b *ResourceBroker) deadlockDetectionLoop() {
+	defer close(b.done)
+
+	ticker := time.NewTicker(b.config.DetectionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.stopCh:
+			return
+		case <-ticker.C:
+			b.detectDeadlocks()
+		}
+	}
+}
+
+func (b *ResourceBroker) detectDeadlocks() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.waitGraph) == 0 {
+		return
+	}
+
+	visited := make(map[string]bool)
+	recStack := make(map[string]bool)
+
+	for node := range b.waitGraph {
+		if b.hasCycle(node, visited, recStack) {
+			b.alertDeadlock(node)
+		}
+	}
+}
+
+func (b *ResourceBroker) hasCycle(node string, visited, recStack map[string]bool) bool {
+	if recStack[node] {
+		return true
+	}
+	if visited[node] {
+		return false
+	}
+
+	visited[node] = true
+	recStack[node] = true
+
+	for _, neighbor := range b.waitGraph[node] {
+		if b.hasCycle(neighbor, visited, recStack) {
+			return true
+		}
+	}
+
+	recStack[node] = false
+	return false
+}
+
+func (b *ResourceBroker) alertDeadlock(node string) {
+	if b.signalBus == nil {
+		return
+	}
+
+	msg := signal.NewSignalMessage(signal.QuotaWarning, node, false)
+	msg.Reason = "potential deadlock detected"
+	_ = b.signalBus.Broadcast(*msg)
 }
 
 func (b *ResourceBroker) AcquireBundle(
@@ -83,24 +158,54 @@ func (b *ResourceBroker) AcquireBundle(
 	bundle ResourceBundle,
 	priority int,
 ) (*AllocationSet, error) {
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return nil, fmt.Errorf("broker is closed")
-	}
-	b.mu.Unlock()
-
-	if b.memoryMonitor != nil && !b.memoryMonitor.CanAllocate(bundle.MemoryEstimate) {
-		return nil, fmt.Errorf("insufficient memory")
+	if err := b.checkClosed(); err != nil {
+		return nil, err
 	}
 
-	if b.diskQuota != nil && !b.diskQuota.CanWrite(bundle.DiskEstimate) {
-		return nil, fmt.Errorf("insufficient disk quota")
+	if err := b.checkResourceAvailability(bundle); err != nil {
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, b.config.AcquisitionTimeout)
 	defer cancel()
 
+	alloc, err := b.acquireAllResources(ctx, pipelineID, bundle, priority)
+	if err != nil {
+		return nil, err
+	}
+
+	b.trackAllocation(pipelineID, alloc)
+	return alloc, nil
+}
+
+func (b *ResourceBroker) checkClosed() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return fmt.Errorf("broker is closed")
+	}
+	return nil
+}
+
+func (b *ResourceBroker) checkResourceAvailability(bundle ResourceBundle) error {
+	if b.memoryMonitor != nil && !b.memoryMonitor.CanAllocate(bundle.MemoryEstimate) {
+		return fmt.Errorf("insufficient memory")
+	}
+
+	if b.diskQuota != nil && !b.diskQuota.CanWrite(bundle.DiskEstimate) {
+		return fmt.Errorf("insufficient disk quota")
+	}
+
+	return nil
+}
+
+func (b *ResourceBroker) acquireAllResources(
+	ctx context.Context,
+	pipelineID string,
+	bundle ResourceBundle,
+	priority int,
+) (*AllocationSet, error) {
 	alloc := &AllocationSet{
 		PipelineID: pipelineID,
 		AcquiredAt: time.Now(),
@@ -126,11 +231,65 @@ func (b *ResourceBroker) AcquireBundle(
 		return nil, fmt.Errorf("subprocesses: %w", err)
 	}
 
+	return alloc, nil
+}
+
+func (b *ResourceBroker) trackAllocation(pipelineID string, alloc *AllocationSet) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.allocations[pipelineID] = alloc
-	b.mu.Unlock()
+}
+
+func (b *ResourceBroker) AcquireUser(ctx context.Context, bundle ResourceBundle) (*AllocationSet, error) {
+	if err := b.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	alloc := &AllocationSet{
+		PipelineID: "user",
+		AcquiredAt: time.Now(),
+	}
+
+	var err error
+
+	alloc.FileHandles, err = b.acquireUserN(ctx, b.filePool, bundle.FileHandles)
+	if err != nil {
+		return nil, fmt.Errorf("file handles: %w", err)
+	}
+
+	alloc.NetworkConns, err = b.acquireUserN(ctx, b.networkPool, bundle.NetworkConns)
+	if err != nil {
+		b.releaseHandles(b.filePool, alloc.FileHandles)
+		return nil, fmt.Errorf("network connections: %w", err)
+	}
+
+	alloc.Subprocesses, err = b.acquireUserN(ctx, b.processPool, bundle.Subprocesses)
+	if err != nil {
+		b.releaseHandles(b.filePool, alloc.FileHandles)
+		b.releaseHandles(b.networkPool, alloc.NetworkConns)
+		return nil, fmt.Errorf("subprocesses: %w", err)
+	}
 
 	return alloc, nil
+}
+
+func (b *ResourceBroker) acquireUserN(ctx context.Context, pool *ResourcePool, count int) ([]*ResourceHandle, error) {
+	if count <= 0 || pool == nil {
+		return nil, nil
+	}
+
+	handles := make([]*ResourceHandle, 0, count)
+	for i := 0; i < count; i++ {
+		handle, err := pool.AcquireUser(ctx)
+		if err != nil {
+			for _, h := range handles {
+				_ = pool.Release(h)
+			}
+			return nil, err
+		}
+		handles = append(handles, handle)
+	}
+	return handles, nil
 }
 
 func (b *ResourceBroker) acquireN(ctx context.Context, pool *ResourcePool, count int, priority int) ([]*ResourceHandle, error) {
@@ -161,7 +320,23 @@ func (b *ResourceBroker) releaseHandles(pool *ResourcePool, handles []*ResourceH
 	}
 }
 
-func (b *ResourceBroker) ReleaseBundle(pipelineID string) error {
+func (b *ResourceBroker) ReleaseBundle(alloc *AllocationSet) error {
+	if alloc == nil {
+		return nil
+	}
+
+	b.mu.Lock()
+	delete(b.allocations, alloc.PipelineID)
+	b.mu.Unlock()
+
+	b.releaseHandles(b.filePool, alloc.FileHandles)
+	b.releaseHandles(b.networkPool, alloc.NetworkConns)
+	b.releaseHandles(b.processPool, alloc.Subprocesses)
+
+	return nil
+}
+
+func (b *ResourceBroker) ReleaseBundleByID(pipelineID string) error {
 	b.mu.Lock()
 	alloc, ok := b.allocations[pipelineID]
 	if !ok {
@@ -185,12 +360,25 @@ func (b *ResourceBroker) GetAllocation(pipelineID string) (*AllocationSet, bool)
 	return alloc, ok
 }
 
+func (b *ResourceBroker) AddWaitEdge(waiter, holder string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.waitGraph[waiter] = append(b.waitGraph[waiter], holder)
+}
+
+func (b *ResourceBroker) RemoveWaitEdge(waiter string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.waitGraph, waiter)
+}
+
 func (b *ResourceBroker) Stats() BrokerStats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	stats := BrokerStats{
 		ActiveAllocations: len(b.allocations),
+		WaitGraphSize:     len(b.waitGraph),
 	}
 
 	if b.filePool != nil {
@@ -208,9 +396,8 @@ func (b *ResourceBroker) Stats() BrokerStats {
 
 func (b *ResourceBroker) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if b.closed {
+		b.mu.Unlock()
 		return nil
 	}
 	b.closed = true
@@ -221,12 +408,19 @@ func (b *ResourceBroker) Close() error {
 		b.releaseHandles(b.processPool, alloc.Subprocesses)
 		delete(b.allocations, pipelineID)
 	}
+	b.mu.Unlock()
+
+	close(b.stopCh)
+	if b.config.DeadlockDetection {
+		<-b.done
+	}
 
 	return nil
 }
 
 type BrokerStats struct {
 	ActiveAllocations int       `json:"active_allocations"`
+	WaitGraphSize     int       `json:"wait_graph_size"`
 	FilePool          PoolStats `json:"file_pool"`
 	NetworkPool       PoolStats `json:"network_pool"`
 	ProcessPool       PoolStats `json:"process_pool"`

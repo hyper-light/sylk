@@ -2,6 +2,7 @@ package concurrency
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -131,12 +132,7 @@ func (lc *Lifecycle) isValidTransition(from, to LifecycleState) bool {
 	if !ok {
 		return false
 	}
-	for _, s := range allowed {
-		if s == to {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allowed, to)
 }
 
 func (lc *Lifecycle) notifyStateChange(from, to LifecycleState, err error) {
@@ -212,11 +208,11 @@ func (lc *Lifecycle) IsTerminal() bool {
 
 // SignalBusPublisher is the interface for publishing to a signal bus.
 type SignalBusPublisher interface {
-	Broadcast(msg interface{}) error
+	Broadcast(msg any) error
 }
 
 // ConnectToSignalBus registers a callback that publishes state changes to the signal bus.
-func (lc *Lifecycle) ConnectToSignalBus(publisher SignalBusPublisher, createMsg func(event StateChangeEvent) interface{}) {
+func (lc *Lifecycle) ConnectToSignalBus(publisher SignalBusPublisher, createMsg func(event StateChangeEvent) any) {
 	lc.OnStateChange(func(event StateChangeEvent) {
 		msg := createMsg(event)
 		_ = publisher.Broadcast(msg)

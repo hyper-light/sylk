@@ -8,13 +8,14 @@ import (
 )
 
 type ToolResult struct {
-	ExitCode   int
-	Stdout     []byte
-	Stderr     []byte
-	Duration   time.Duration
-	Killed     bool
-	KillSignal string
-	Partial    bool
+	ExitCode     int
+	Stdout       []byte
+	Stderr       []byte
+	Duration     time.Duration
+	Killed       bool
+	KillSignal   string
+	Partial      bool
+	ParsedOutput interface{}
 }
 
 type CachePolicy struct {
@@ -203,11 +204,13 @@ func (c *ToolOutputCache) TotalBytes() int64 {
 }
 
 type ToolInvocation struct {
+	Tool       string
 	Command    string
 	Args       []string
 	WorkingDir string
 	Env        map[string]string
 	Stdin      interface{}
+	StreamTo   interface{}
 	Timeout    time.Duration
 }
 

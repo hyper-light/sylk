@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -13,95 +12,145 @@ import (
 	"time"
 )
 
-func getStdinReader(stdin interface{}) io.Reader {
-	if stdin == nil {
-		return nil
-	}
-	if r, ok := stdin.(io.Reader); ok {
-		return r
-	}
-	return nil
-}
-
 var (
 	ErrExecutorClosed        = errors.New("executor is closed")
 	ErrInvalidWorkingDir     = errors.New("invalid working directory")
 	ErrWorkingDirNotAbsolute = errors.New("working directory must be absolute")
 	ErrWorkingDirOutside     = errors.New("working directory outside allowed boundaries")
+	ErrPoolExhausted         = errors.New("subprocess pool exhausted")
 )
+
+type ResourcePool interface {
+	Acquire(ctx context.Context, sessionID string, priority int) (ResourceHandle, error)
+}
+
+type ResourceHandle interface {
+	Release()
+}
+
+type OutputStreamer interface {
+	CreateStreams(streamTo io.Writer) (stdout, stderr *StreamWriter)
+	ProcessOutput(tool string, stdout, stderr []byte) *ProcessedOutput
+}
+
+type TimeoutChecker interface {
+	Start()
+	OnOutput(line string)
+	ShouldTimeout() bool
+	Reset()
+}
+
+type TimeoutFactory interface {
+	GetTimeoutForTool(toolName string) (TimeoutChecker, error)
+}
+
+type KillExecutor interface {
+	Execute(pg *ProcessGroup, waitDone <-chan struct{}) KillResult
+}
 
 var DefaultShellPatterns = []string{"|", "&&", "||", ";", "*", "?", "$", "`", "(", ")", "<", ">"}
 
 var DefaultEnvBlocklist = []string{
-	"*_API_KEY",
-	"*_SECRET",
-	"*_TOKEN",
-	"*_PASSWORD",
-	"*_CREDENTIAL",
-	"AWS_ACCESS_KEY_ID",
-	"AWS_SECRET_ACCESS_KEY",
-	"GITHUB_TOKEN",
-	"OPENAI_API_KEY",
-	"ANTHROPIC_API_KEY",
+	"*_API_KEY", "*_SECRET", "*_TOKEN", "*_PASSWORD", "*_CREDENTIAL",
+	"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+	"GITHUB_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
 }
 
 type ToolExecutorConfig struct {
 	ShellPatterns  []string
 	EnvBlocklist   []string
+	ProjectRoot    string
+	StagingRoot    string
+	TempRoot       string
 	AllowedDirs    []string
 	DefaultTimeout time.Duration
 	CheckInterval  time.Duration
+	ToolTimeouts   map[string]time.Duration
+	SIGINTGrace    time.Duration
+	SIGTERMGrace   time.Duration
+	SessionID      string
 }
 
 func DefaultToolExecutorConfig() ToolExecutorConfig {
 	return ToolExecutorConfig{
 		ShellPatterns:  DefaultShellPatterns,
 		EnvBlocklist:   DefaultEnvBlocklist,
-		AllowedDirs:    []string{},
 		DefaultTimeout: 60 * time.Second,
-		CheckInterval:  1 * time.Second,
+		CheckInterval:  time.Second,
+		ToolTimeouts:   make(map[string]time.Duration),
+		SIGINTGrace:    5 * time.Second,
+		SIGTERMGrace:   3 * time.Second,
 	}
 }
 
 type ToolExecutor struct {
-	config       ToolExecutorConfig
-	timeoutMgr   *ToolTimeoutManager
+	config         ToolExecutorConfig
+	resourcePool   ResourcePool
+	outputHandler  OutputStreamer
+	timeoutFactory TimeoutFactory
+	killManager    KillExecutor
+
 	mu           sync.RWMutex
 	activeGroups map[int]*ProcessGroup
 	closed       bool
 	groupCounter int
 }
 
-func NewToolExecutor(cfg ToolExecutorConfig) *ToolExecutor {
+type ToolExecutorDeps struct {
+	ResourcePool   ResourcePool
+	OutputHandler  OutputStreamer
+	TimeoutFactory TimeoutFactory
+	KillManager    KillExecutor
+}
+
+func NewToolExecutor(cfg ToolExecutorConfig, deps *ToolExecutorDeps) *ToolExecutor {
 	cfg = normalizeExecutorConfig(cfg)
 
-	return &ToolExecutor{
+	executor := &ToolExecutor{
 		config:       cfg,
-		timeoutMgr:   NewToolTimeoutManager(DefaultAdaptiveTimeoutConfig()),
 		activeGroups: make(map[int]*ProcessGroup),
 	}
+
+	if deps != nil {
+		executor.resourcePool = deps.ResourcePool
+		executor.outputHandler = deps.OutputHandler
+		executor.timeoutFactory = deps.TimeoutFactory
+		executor.killManager = deps.KillManager
+	}
+
+	return executor
 }
 
 func normalizeExecutorConfig(cfg ToolExecutorConfig) ToolExecutorConfig {
-	cfg.ShellPatterns = defaultSlice(cfg.ShellPatterns, DefaultShellPatterns)
-	cfg.EnvBlocklist = defaultSlice(cfg.EnvBlocklist, DefaultEnvBlocklist)
-	cfg.DefaultTimeout = defaultExecDuration(cfg.DefaultTimeout, 60*time.Second)
-	cfg.CheckInterval = defaultExecDuration(cfg.CheckInterval, 1*time.Second)
+	cfg = normalizePatterns(cfg)
+	cfg = normalizeTimeouts(cfg)
 	return cfg
 }
 
-func defaultSlice(val, def []string) []string {
-	if len(val) == 0 {
-		return def
+func normalizePatterns(cfg ToolExecutorConfig) ToolExecutorConfig {
+	if len(cfg.ShellPatterns) == 0 {
+		cfg.ShellPatterns = DefaultShellPatterns
 	}
-	return val
+	if len(cfg.EnvBlocklist) == 0 {
+		cfg.EnvBlocklist = DefaultEnvBlocklist
+	}
+	if cfg.ToolTimeouts == nil {
+		cfg.ToolTimeouts = make(map[string]time.Duration)
+	}
+	return cfg
 }
 
-func defaultExecDuration(val, def time.Duration) time.Duration {
-	if val == 0 {
-		return def
+func normalizeTimeouts(cfg ToolExecutorConfig) ToolExecutorConfig {
+	if cfg.DefaultTimeout == 0 {
+		cfg.DefaultTimeout = 60 * time.Second
 	}
-	return val
+	if cfg.SIGINTGrace == 0 {
+		cfg.SIGINTGrace = 5 * time.Second
+	}
+	if cfg.SIGTERMGrace == 0 {
+		cfg.SIGTERMGrace = 3 * time.Second
+	}
+	return cfg
 }
 
 func (e *ToolExecutor) Execute(ctx context.Context, inv ToolInvocation) (*ToolResult, error) {
@@ -109,16 +158,17 @@ func (e *ToolExecutor) Execute(ctx context.Context, inv ToolInvocation) (*ToolRe
 		return nil, err
 	}
 
-	if inv.WorkingDir != "" {
-		if err := e.validateWorkingDir(inv.WorkingDir); err != nil {
-			return nil, err
-		}
+	if err := e.validateInvocation(inv); err != nil {
+		return nil, err
 	}
 
-	cmd := e.buildCommand(ctx, inv)
-	pg := e.setupProcessGroup(cmd)
+	slot, err := e.acquireSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer e.releaseSlot(slot)
 
-	return e.executeWithTracking(ctx, cmd, pg, inv)
+	return e.executeWithSlot(ctx, inv)
 }
 
 func (e *ToolExecutor) checkClosed() error {
@@ -128,6 +178,41 @@ func (e *ToolExecutor) checkClosed() error {
 		return ErrExecutorClosed
 	}
 	return nil
+}
+
+func (e *ToolExecutor) validateInvocation(inv ToolInvocation) error {
+	if inv.WorkingDir == "" {
+		return nil
+	}
+	return e.validateWorkingDir(inv.WorkingDir)
+}
+
+func (e *ToolExecutor) acquireSlot(ctx context.Context) (ResourceHandle, error) {
+	if e.resourcePool == nil {
+		return nil, nil
+	}
+	handle, err := e.resourcePool.Acquire(ctx, e.config.SessionID, 1)
+	if err != nil {
+		return nil, ErrPoolExhausted
+	}
+	return handle, nil
+}
+
+func (e *ToolExecutor) releaseSlot(slot ResourceHandle) {
+	if slot != nil {
+		slot.Release()
+	}
+}
+
+func (e *ToolExecutor) executeWithSlot(ctx context.Context, inv ToolInvocation) (*ToolResult, error) {
+	cmd := e.buildCommand(ctx, inv)
+	pg := e.setupProcessGroup(cmd)
+
+	stdout, stderr := e.setupOutputStreams(inv)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	return e.runAndWait(ctx, cmd, pg, inv, stdout, stderr)
 }
 
 func (e *ToolExecutor) buildCommand(ctx context.Context, inv ToolInvocation) *exec.Cmd {
@@ -163,6 +248,10 @@ func (e *ToolExecutor) needsShell(command string) bool {
 		}
 	}
 	return false
+}
+
+func (e *ToolExecutor) NeedsShell(command string) bool {
+	return e.needsShell(command)
 }
 
 func (e *ToolExecutor) buildEnvironment(extra map[string]string) []string {
@@ -224,20 +313,36 @@ func (e *ToolExecutor) validateWorkingDir(dir string) error {
 		return ErrInvalidWorkingDir
 	}
 
-	if len(e.config.AllowedDirs) == 0 {
+	return e.checkBoundaries(resolved)
+}
+
+func (e *ToolExecutor) checkBoundaries(resolved string) error {
+	boundaries := e.getAllowedBoundaries()
+	if len(boundaries) == 0 {
 		return nil
 	}
 
-	return e.checkAllowedBoundaries(resolved)
-}
-
-func (e *ToolExecutor) checkAllowedBoundaries(resolved string) error {
-	for _, allowed := range e.config.AllowedDirs {
-		if strings.HasPrefix(resolved, allowed) {
+	for _, boundary := range boundaries {
+		if strings.HasPrefix(resolved, boundary) {
 			return nil
 		}
 	}
 	return ErrWorkingDirOutside
+}
+
+func (e *ToolExecutor) getAllowedBoundaries() []string {
+	var boundaries []string
+	if e.config.ProjectRoot != "" {
+		boundaries = append(boundaries, e.config.ProjectRoot)
+	}
+	if e.config.StagingRoot != "" {
+		boundaries = append(boundaries, e.config.StagingRoot)
+	}
+	if e.config.TempRoot != "" {
+		boundaries = append(boundaries, e.config.TempRoot)
+	}
+	boundaries = append(boundaries, e.config.AllowedDirs...)
+	return boundaries
 }
 
 func (e *ToolExecutor) setupProcessGroup(cmd *exec.Cmd) *ProcessGroup {
@@ -246,11 +351,37 @@ func (e *ToolExecutor) setupProcessGroup(cmd *exec.Cmd) *ProcessGroup {
 	return pg
 }
 
-func (e *ToolExecutor) executeWithTracking(ctx context.Context, cmd *exec.Cmd, pg *ProcessGroup, inv ToolInvocation) (*ToolResult, error) {
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+func (e *ToolExecutor) setupOutputStreams(inv ToolInvocation) (io.Writer, io.Writer) {
+	streamTo := getStreamWriter(inv.StreamTo)
 
+	if e.outputHandler != nil {
+		return e.outputHandler.CreateStreams(streamTo)
+	}
+
+	return NewStreamWriter(streamTo, 1024*1024), NewStreamWriter(streamTo, 1024*1024)
+}
+
+func getStreamWriter(streamTo interface{}) io.Writer {
+	if streamTo == nil {
+		return nil
+	}
+	if w, ok := streamTo.(io.Writer); ok {
+		return w
+	}
+	return nil
+}
+
+func getStdinReader(stdin interface{}) io.Reader {
+	if stdin == nil {
+		return nil
+	}
+	if r, ok := stdin.(io.Reader); ok {
+		return r
+	}
+	return nil
+}
+
+func (e *ToolExecutor) runAndWait(ctx context.Context, cmd *exec.Cmd, pg *ProcessGroup, inv ToolInvocation, stdout, stderr io.Writer) (*ToolResult, error) {
 	startTime := time.Now()
 
 	if err := pg.Start(); err != nil {
@@ -265,10 +396,11 @@ func (e *ToolExecutor) executeWithTracking(ctx context.Context, cmd *exec.Cmd, p
 		waitDone <- pg.Wait()
 	}()
 
-	result := e.waitForCompletion(ctx, pg, waitDone, inv.Timeout)
+	result := e.waitWithAdaptiveTimeout(ctx, pg, waitDone, inv)
 	result.Duration = time.Since(startTime)
-	result.Stdout = stdout.Bytes()
-	result.Stderr = stderr.Bytes()
+
+	e.collectOutput(result, stdout, stderr)
+	e.parseOutput(result, inv.Tool)
 
 	return result, nil
 }
@@ -291,42 +423,155 @@ func (e *ToolExecutor) untrackProcessGroup(pg *ProcessGroup) {
 	e.mu.Unlock()
 }
 
-func (e *ToolExecutor) waitForCompletion(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, timeout time.Duration) *ToolResult {
-	timeout = e.effectiveTimeout(timeout)
+func (e *ToolExecutor) waitWithAdaptiveTimeout(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, inv ToolInvocation) *ToolResult {
+	timeout := e.getTimeout(inv)
+	checker := e.getTimeoutChecker(inv.Tool)
+
+	if checker != nil {
+		checker.Start()
+		return e.waitWithChecker(ctx, pg, waitDone, timeout, checker)
+	}
+
+	return e.waitWithFixedTimeout(ctx, pg, waitDone, timeout)
+}
+
+func (e *ToolExecutor) getTimeout(inv ToolInvocation) time.Duration {
+	if inv.Timeout > 0 {
+		return inv.Timeout
+	}
+	if toolTimeout, ok := e.config.ToolTimeouts[inv.Tool]; ok {
+		return toolTimeout
+	}
+	return e.config.DefaultTimeout
+}
+
+func (e *ToolExecutor) getTimeoutChecker(tool string) TimeoutChecker {
+	if e.timeoutFactory == nil {
+		return nil
+	}
+	checker, err := e.timeoutFactory.GetTimeoutForTool(tool)
+	if err != nil {
+		return nil
+	}
+	return checker
+}
+
+func (e *ToolExecutor) waitWithChecker(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, maxTimeout time.Duration, checker TimeoutChecker) *ToolResult {
+	timers := newWaitTimers(maxTimeout)
+	defer timers.stop()
+
+	for {
+		result := e.selectWaitEvent(ctx, pg, waitDone, timers, checker)
+		if result != nil {
+			return result
+		}
+	}
+}
+
+type waitTimers struct {
+	ticker   *time.Ticker
+	maxTimer *time.Timer
+}
+
+func newWaitTimers(maxTimeout time.Duration) *waitTimers {
+	return &waitTimers{
+		ticker:   time.NewTicker(time.Second),
+		maxTimer: time.NewTimer(maxTimeout),
+	}
+}
+
+func (t *waitTimers) stop() {
+	t.ticker.Stop()
+	t.maxTimer.Stop()
+}
+
+func (e *ToolExecutor) selectWaitEvent(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, timers *waitTimers, checker TimeoutChecker) *ToolResult {
+	if result := e.checkImmediateEvents(pg, waitDone, ctx.Done()); result != nil {
+		return result
+	}
+	return e.checkTimerEvents(pg, waitDone, timers, checker)
+}
+
+func (e *ToolExecutor) checkImmediateEvents(pg *ProcessGroup, waitDone <-chan error, ctxDone <-chan struct{}) *ToolResult {
+	select {
+	case err := <-waitDone:
+		return e.buildNormalResult(err, pg)
+	case <-ctxDone:
+		return e.killAndBuildResult(pg, waitDone, "context")
+	default:
+		return nil
+	}
+}
+
+func (e *ToolExecutor) checkTimerEvents(pg *ProcessGroup, waitDone <-chan error, timers *waitTimers, checker TimeoutChecker) *ToolResult {
+	select {
+	case err := <-waitDone:
+		return e.buildNormalResult(err, pg)
+	case <-timers.maxTimer.C:
+		return e.killAndBuildResult(pg, waitDone, "timeout")
+	case <-timers.ticker.C:
+		return e.checkAdaptiveTimeout(pg, waitDone, checker)
+	}
+}
+
+func (e *ToolExecutor) checkAdaptiveTimeout(pg *ProcessGroup, waitDone <-chan error, checker TimeoutChecker) *ToolResult {
+	if checker.ShouldTimeout() {
+		return e.killAndBuildResult(pg, waitDone, "adaptive_timeout")
+	}
+	return nil
+}
+
+func (e *ToolExecutor) waitWithFixedTimeout(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, timeout time.Duration) *ToolResult {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	return e.selectWaitResult(ctx, pg, waitDone, timer.C)
-}
-
-func (e *ToolExecutor) effectiveTimeout(timeout time.Duration) time.Duration {
-	if timeout == 0 {
-		return e.config.DefaultTimeout
-	}
-	return timeout
-}
-
-func (e *ToolExecutor) selectWaitResult(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, timerC <-chan time.Time) *ToolResult {
 	select {
 	case err := <-waitDone:
-		return e.buildResult(err, pg)
+		return e.buildNormalResult(err, pg)
 	case <-ctx.Done():
-		return e.handleCancellation(pg, waitDone)
-	case <-timerC:
-		return e.handleTimeout(pg, waitDone)
+		return e.killAndBuildResult(pg, waitDone, "context")
+	case <-timer.C:
+		return e.killAndBuildResult(pg, waitDone, "timeout")
 	}
 }
 
-func (e *ToolExecutor) buildResult(err error, pg *ProcessGroup) *ToolResult {
+func (e *ToolExecutor) buildNormalResult(err error, pg *ProcessGroup) *ToolResult {
 	result := &ToolResult{
 		Killed: pg.IsKilled(),
 	}
-
 	if err != nil {
 		result.ExitCode = extractExitCode(err)
 	}
-
 	return result
+}
+
+func (e *ToolExecutor) killAndBuildResult(pg *ProcessGroup, waitDone <-chan error, signal string) *ToolResult {
+	e.executeKillSequence(pg, waitDone)
+	return &ToolResult{
+		ExitCode:   -1,
+		Killed:     true,
+		KillSignal: signal,
+		Partial:    true,
+	}
+}
+
+func (e *ToolExecutor) executeKillSequence(pg *ProcessGroup, waitDone <-chan error) {
+	if e.killManager != nil {
+		structDone := e.convertToStructChan(waitDone)
+		e.killManager.Execute(pg, structDone)
+		return
+	}
+	pg.Kill()
+	<-waitDone
+}
+
+func (e *ToolExecutor) convertToStructChan(errChan <-chan error) <-chan struct{} {
+	structChan := make(chan struct{})
+	go func() {
+		<-errChan
+		close(structChan)
+	}()
+	return structChan
 }
 
 func extractExitCode(err error) int {
@@ -337,32 +582,31 @@ func extractExitCode(err error) int {
 	return -1
 }
 
-func (e *ToolExecutor) handleCancellation(pg *ProcessGroup, waitDone <-chan error) *ToolResult {
-	pg.Kill()
-	<-waitDone
-
-	return &ToolResult{
-		ExitCode:   -1,
-		Killed:     true,
-		KillSignal: "context",
-		Partial:    true,
+func (e *ToolExecutor) collectOutput(result *ToolResult, stdout, stderr io.Writer) {
+	if sw, ok := stdout.(*StreamWriter); ok {
+		result.Stdout = sw.Bytes()
+	}
+	if sw, ok := stderr.(*StreamWriter); ok {
+		result.Stderr = sw.Bytes()
 	}
 }
 
-func (e *ToolExecutor) handleTimeout(pg *ProcessGroup, waitDone <-chan error) *ToolResult {
-	pg.Kill()
-	<-waitDone
-
-	return &ToolResult{
-		ExitCode:   -1,
-		Killed:     true,
-		KillSignal: "timeout",
-		Partial:    true,
+func (e *ToolExecutor) parseOutput(result *ToolResult, tool string) {
+	if !e.shouldParseOutput(tool) {
+		return
 	}
+	processed := e.outputHandler.ProcessOutput(tool, result.Stdout, result.Stderr)
+	e.applyParsedOutput(result, processed)
 }
 
-func (e *ToolExecutor) NeedsShell(command string) bool {
-	return e.needsShell(command)
+func (e *ToolExecutor) shouldParseOutput(tool string) bool {
+	return e.outputHandler != nil && tool != ""
+}
+
+func (e *ToolExecutor) applyParsedOutput(result *ToolResult, processed *ProcessedOutput) {
+	if processed != nil && processed.Type == OutputTypeParsed {
+		result.ParsedOutput = processed.Parsed
+	}
 }
 
 func (e *ToolExecutor) KillAll() {
@@ -400,6 +644,5 @@ func (e *ToolExecutor) Close() error {
 	for _, pg := range groups {
 		pg.Kill()
 	}
-
 	return nil
 }

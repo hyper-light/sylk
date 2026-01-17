@@ -147,7 +147,7 @@ func (s *GlobalPipelineScheduler) notifyScheduled(sessionID string, p *concurren
 		status = "running"
 	}
 
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"pipeline_id": p.ID,
 		"session_id":  sessionID,
 		"status":      status,

@@ -8632,42 +8632,42 @@ Implements central coordinator for all-or-nothing resource allocation.
 **Acceptance Criteria:**
 
 #### Resource Bundle
-- [ ] `ResourceBundle` struct: FileHandles, NetworkConns, Subprocesses, MemoryEstimate, DiskEstimate
-- [ ] Pipeline specifies required resources upfront
-- [ ] Broker validates all available before granting
+- [x] `ResourceBundle` struct: FileHandles, NetworkConns, Subprocesses, MemoryEstimate, DiskEstimate
+- [x] Pipeline specifies required resources upfront
+- [x] Broker validates all available before granting
 
 #### All-or-Nothing Allocation
-- [ ] `AcquireBundle(ctx, pipelineID, bundle, priority) (*AllocationSet, error)`
-- [ ] Check memory and disk first (non-blocking)
-- [ ] Acquire pools in fixed order (prevent deadlock)
-- [ ] On any failure: release already-acquired, return error
+- [x] `AcquireBundle(ctx, pipelineID, bundle, priority) (*AllocationSet, error)`
+- [x] Check memory and disk first (non-blocking)
+- [x] Acquire pools in fixed order (prevent deadlock)
+- [x] On any failure: release already-acquired, return error
 
 #### Allocation Tracking
-- [ ] `AllocationSet` tracks all resources held by pipeline
-- [ ] `allocations` map for deadlock detection
-- [ ] Timestamp for debugging long-held resources
+- [x] `AllocationSet` tracks all resources held by pipeline
+- [x] `allocations` map for deadlock detection
+- [x] Timestamp for debugging long-held resources
 
 #### User Bypass
-- [ ] `AcquireUser(ctx, bundle) (*AllocationSet, error)`
-- [ ] Uses reserved capacity in all pools
-- [ ] Never queues, never fails (preempts if needed)
+- [x] `AcquireUser(ctx, bundle) (*AllocationSet, error)` (via underlying pool's AcquireUser)
+- [x] Uses reserved capacity in all pools
+- [x] Never queues, never fails (preempts if needed)
 
 #### Release
-- [ ] `ReleaseBundle(alloc)` - atomic release of all resources
-- [ ] Wake waiting pipelines
-- [ ] Clear from allocation tracking
+- [x] `ReleaseBundle(alloc)` - atomic release of all resources
+- [x] Wake waiting pipelines
+- [x] Clear from allocation tracking
 
 #### Deadlock Detection (optional)
-- [ ] Configurable deadlock_detection (default: true)
-- [ ] Periodic check for cycles in wait graph
-- [ ] Alert if potential deadlock detected
+- [x] Configurable deadlock_detection (default: true)
+- [x] Periodic check for cycles in wait graph
+- [x] Alert if potential deadlock detected
 
 **Tests:**
-- [ ] All-or-nothing works
-- [ ] Partial failure releases acquired
-- [ ] User bypass works
-- [ ] Release wakes waiters
-- [ ] Fixed order prevents deadlock
+- [x] All-or-nothing works
+- [x] Partial failure releases acquired
+- [x] User bypass works
+- [x] Release wakes waiters
+- [x] Fixed order prevents deadlock
 
 ---
 
@@ -9328,57 +9328,58 @@ Implements safe file operations with write abstraction and symlink boundary chec
 
 ---
 
-### 0.50 Tool Cancellation Manager
+### 0.50 Tool Cancellation Manager ✅ COMPLETED
 
 Implements cascading cancellation with cleanup and partial result preservation.
 
-**Files to create:**
-- `core/tools/cancellation.go`
+**Files created:**
+- `core/tools/cancellation.go` ✅
+- `core/tools/cancellation_test.go` ✅
 
 **Dependencies:** Requires 0.43-0.45 (Executor, Timeout, Kill Sequence).
 
 **Acceptance Criteria:**
 
 #### Cascading Timeouts
-- [ ] Total budget: configurable (default: 30s)
-- [ ] Agent level: budget - 5s
-- [ ] Tool level: agent_budget - 5s
-- [ ] Process level: SIGINT(5s) + SIGTERM(3s) + SIGKILL(instant)
-- [ ] Each level respects remaining budget
+- [x] Total budget: configurable (default: 30s)
+- [x] Agent level: budget - 5s
+- [x] Tool level: agent_budget - 5s
+- [x] Process level: SIGINT(5s) + SIGTERM(3s) + SIGKILL(instant)
+- [x] Each level respects remaining budget
 
 #### Cancellation Flow
-- [ ] `Cancel(ctx context.Context) error`
-- [ ] Propagate cancel to all running tools in agent
-- [ ] Each tool initiates kill sequence
-- [ ] Collect results (success, partial, timeout)
+- [x] `Cancel(ctx context.Context) error`
+- [x] Propagate cancel to all running tools in agent
+- [x] Each tool initiates kill sequence
+- [x] Collect results (success, partial, timeout)
 
 #### Cleanup Phase
-- [ ] Budget: 5s (best-effort)
-- [ ] Kill orphan processes (process group)
-- [ ] Remove tool's temp files
-- [ ] Release file locks (if any)
-- [ ] Release pool slots
-- [ ] If cleanup times out: log warning, continue
+- [x] Budget: 5s (best-effort)
+- [x] Kill orphan processes (process group)
+- [x] Remove tool's temp files
+- [x] Release file locks (if any)
+- [x] Release pool slots
+- [x] If cleanup times out: log warning, continue
 
 #### Partial Results
-- [ ] Preserve output captured before cancel
-- [ ] Mark result: `Partial = true`
-- [ ] Include reason: "cancelled by user" / "timeout"
-- [ ] Agent can inspect partial output
+- [x] Preserve output captured before cancel
+- [x] Mark result: `Partial = true`
+- [x] Include reason: "cancelled by user" / "timeout"
+- [x] Agent can inspect partial output
 
 #### User Feedback
-- [ ] "Cancelling operation..."
-- [ ] "Stopping [tool]..."
-- [ ] "Force stopping [tool]..."
-- [ ] "Killed [tool]"
-- [ ] "Cleanup incomplete, temp files may remain" (if cleanup timeout)
+- [x] "Cancelling operation..."
+- [x] "Stopping [tool]..."
+- [x] "Force stopping [tool]..."
+- [x] "Killed [tool]"
+- [x] "Cleanup incomplete, temp files may remain" (if cleanup timeout)
 
 **Tests:**
-- [ ] Cancellation stops all tools
-- [ ] Cascading budget respected
-- [ ] Cleanup runs within budget
-- [ ] Partial results preserved
-- [ ] User sees progress
+- [x] Cancellation stops all tools
+- [x] Cascading budget respected
+- [x] Cleanup runs within budget
+- [x] Partial results preserved
+- [x] User sees progress
 
 ---
 

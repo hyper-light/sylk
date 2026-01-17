@@ -438,10 +438,7 @@ func (ac *AdaptiveChannel[T]) resizeUpIfNeeded() {
 		return
 	}
 
-	newSize := ac.currentSize * 2
-	if newSize > ac.config.MaxSize {
-		newSize = ac.config.MaxSize
-	}
+	newSize := min(ac.currentSize*2, ac.config.MaxSize)
 	ac.resizeLocked(newSize)
 	ac.resizeUp.Add(1)
 }
@@ -454,10 +451,7 @@ func (ac *AdaptiveChannel[T]) resizeDownIfNeeded() {
 		return
 	}
 
-	newSize := ac.currentSize / 2
-	if newSize < ac.config.MinSize {
-		newSize = ac.config.MinSize
-	}
+	newSize := max(ac.currentSize/2, ac.config.MinSize)
 	ac.resizeLocked(newSize)
 	ac.resizeDown.Add(1)
 }

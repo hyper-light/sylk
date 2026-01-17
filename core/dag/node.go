@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -96,9 +97,7 @@ func (n *Node) Context() map[string]any {
 	defer n.mu.RUnlock()
 
 	result := make(map[string]any, len(n.context))
-	for k, v := range n.context {
-		result[k] = v
-	}
+	maps.Copy(result, n.context)
 	return result
 }
 
@@ -156,9 +155,7 @@ func (n *Node) Metadata() map[string]any {
 	defer n.mu.RUnlock()
 
 	result := make(map[string]any, len(n.metadata))
-	for k, v := range n.metadata {
-		result[k] = v
-	}
+	maps.Copy(result, n.metadata)
 	return result
 }
 

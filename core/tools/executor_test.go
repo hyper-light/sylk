@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,7 @@ import (
 )
 
 func TestToolExecutor_DirectExecution(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -32,7 +33,7 @@ func TestToolExecutor_DirectExecution(t *testing.T) {
 }
 
 func TestToolExecutor_ShellExecution(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -50,7 +51,7 @@ func TestToolExecutor_ShellExecution(t *testing.T) {
 }
 
 func TestToolExecutor_ShellDetection(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	tests := []struct {
@@ -83,7 +84,7 @@ func TestToolExecutor_EnvBlocklist(t *testing.T) {
 	defer os.Unsetenv("TEST_API_KEY")
 	defer os.Unsetenv("TEST_NORMAL")
 
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -101,19 +102,17 @@ func TestToolExecutor_EnvBlocklist(t *testing.T) {
 }
 
 func TestToolExecutor_WorkingDirValidation(t *testing.T) {
-	// Create temp dir and resolve symlinks (macOS /tmp -> /private/tmp)
 	tempDir := t.TempDir()
 	resolvedTempDir, err := filepath.EvalSymlinks(tempDir)
 	require.NoError(t, err)
 
 	cfg := DefaultToolExecutorConfig()
 	cfg.AllowedDirs = []string{resolvedTempDir}
-	executor := NewToolExecutor(cfg)
+	executor := NewToolExecutor(cfg, nil)
 	defer executor.Close()
 
 	ctx := context.Background()
 
-	// Test valid working directory
 	inv := ToolInvocation{
 		Command:    "pwd",
 		WorkingDir: resolvedTempDir,
@@ -123,19 +122,17 @@ func TestToolExecutor_WorkingDirValidation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(result.Stdout), filepath.Base(resolvedTempDir))
 
-	// Test working directory outside allowed boundaries
 	inv.WorkingDir = "/usr"
 	_, err = executor.Execute(ctx, inv)
 	assert.ErrorIs(t, err, ErrWorkingDirOutside)
 
-	// Test relative path error
 	inv.WorkingDir = "relative/path"
 	_, err = executor.Execute(ctx, inv)
 	assert.ErrorIs(t, err, ErrWorkingDirNotAbsolute)
 }
 
 func TestToolExecutor_Timeout(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -154,7 +151,7 @@ func TestToolExecutor_Timeout(t *testing.T) {
 }
 
 func TestToolExecutor_ContextCancellation(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,7 +175,7 @@ func TestToolExecutor_ContextCancellation(t *testing.T) {
 }
 
 func TestToolExecutor_NonZeroExitCode(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -196,7 +193,7 @@ func TestToolExecutor_NonZeroExitCode(t *testing.T) {
 }
 
 func TestToolExecutor_Stderr(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -212,7 +209,7 @@ func TestToolExecutor_Stderr(t *testing.T) {
 }
 
 func TestToolExecutor_ExtraEnv(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -229,7 +226,7 @@ func TestToolExecutor_ExtraEnv(t *testing.T) {
 }
 
 func TestToolExecutor_ActiveCount(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	assert.Equal(t, 0, executor.ActiveCount())
@@ -257,7 +254,7 @@ func TestToolExecutor_ActiveCount(t *testing.T) {
 }
 
 func TestToolExecutor_ClosedOperations(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	require.NoError(t, executor.Close())
 
 	ctx := context.Background()
@@ -269,7 +266,7 @@ func TestToolExecutor_ClosedOperations(t *testing.T) {
 }
 
 func TestToolExecutor_Duration(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -287,7 +284,7 @@ func TestToolExecutor_Duration(t *testing.T) {
 }
 
 func TestToolExecutor_StdinReader(t *testing.T) {
-	executor := NewToolExecutor(DefaultToolExecutorConfig())
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), nil)
 	defer executor.Close()
 
 	ctx := context.Background()
@@ -311,4 +308,163 @@ func TestToolExecutor_DefaultConfig(t *testing.T) {
 	assert.Equal(t, DefaultEnvBlocklist, cfg.EnvBlocklist)
 	assert.Equal(t, 60*time.Second, cfg.DefaultTimeout)
 	assert.Equal(t, 1*time.Second, cfg.CheckInterval)
+}
+
+func TestToolExecutor_WithResourcePool(t *testing.T) {
+	pool := &mockResourcePool{}
+
+	deps := &ToolExecutorDeps{
+		ResourcePool: pool,
+	}
+
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), deps)
+	defer executor.Close()
+
+	ctx := context.Background()
+	inv := ToolInvocation{
+		Command: "echo",
+		Args:    []string{"hello"},
+		Timeout: 5 * time.Second,
+	}
+
+	result, err := executor.Execute(ctx, inv)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.ExitCode)
+	assert.True(t, pool.acquired)
+	assert.True(t, pool.released)
+}
+
+func TestToolExecutor_PoolExhausted(t *testing.T) {
+	pool := &mockResourcePool{shouldFail: true}
+	deps := &ToolExecutorDeps{
+		ResourcePool: pool,
+	}
+
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), deps)
+	defer executor.Close()
+
+	ctx := context.Background()
+	inv := ToolInvocation{
+		Command: "echo",
+		Args:    []string{"hello"},
+		Timeout: 5 * time.Second,
+	}
+
+	_, err := executor.Execute(ctx, inv)
+	assert.ErrorIs(t, err, ErrPoolExhausted)
+}
+
+func TestToolExecutor_ToolField(t *testing.T) {
+	cfg := DefaultToolExecutorConfig()
+	cfg.ToolTimeouts = map[string]time.Duration{
+		"slow_tool": 10 * time.Minute,
+	}
+
+	executor := NewToolExecutor(cfg, nil)
+	defer executor.Close()
+
+	timeout := executor.getTimeout(ToolInvocation{Tool: "slow_tool"})
+	assert.Equal(t, 10*time.Minute, timeout)
+
+	timeout = executor.getTimeout(ToolInvocation{Tool: "unknown"})
+	assert.Equal(t, 60*time.Second, timeout)
+
+	timeout = executor.getTimeout(ToolInvocation{Tool: "slow_tool", Timeout: 5 * time.Second})
+	assert.Equal(t, 5*time.Second, timeout)
+}
+
+func TestToolExecutor_ParsedOutput(t *testing.T) {
+	handler := &mockOutputStreamer{
+		parsedResult: map[string]string{"key": "value"},
+	}
+	deps := &ToolExecutorDeps{
+		OutputHandler: handler,
+	}
+
+	executor := NewToolExecutor(DefaultToolExecutorConfig(), deps)
+	defer executor.Close()
+
+	ctx := context.Background()
+	inv := ToolInvocation{
+		Tool:    "test_tool",
+		Command: "echo",
+		Args:    []string{"hello"},
+		Timeout: 5 * time.Second,
+	}
+
+	result, err := executor.Execute(ctx, inv)
+	require.NoError(t, err)
+	assert.NotNil(t, result.ParsedOutput)
+}
+
+func TestToolExecutor_BoundaryValidation(t *testing.T) {
+	tempDir := t.TempDir()
+	resolvedTempDir, err := filepath.EvalSymlinks(tempDir)
+	require.NoError(t, err)
+
+	cfg := DefaultToolExecutorConfig()
+	cfg.ProjectRoot = resolvedTempDir
+
+	executor := NewToolExecutor(cfg, nil)
+	defer executor.Close()
+
+	ctx := context.Background()
+
+	inv := ToolInvocation{
+		Command:    "pwd",
+		WorkingDir: resolvedTempDir,
+		Timeout:    5 * time.Second,
+	}
+	_, err = executor.Execute(ctx, inv)
+	require.NoError(t, err)
+
+	inv.WorkingDir = "/usr"
+	_, err = executor.Execute(ctx, inv)
+	assert.ErrorIs(t, err, ErrWorkingDirOutside)
+}
+
+type mockResourcePool struct {
+	shouldFail bool
+	acquired   bool
+	released   bool
+	handles    chan *mockHandle
+}
+
+func (m *mockResourcePool) Acquire(ctx context.Context, sessionID string, priority int) (ResourceHandle, error) {
+	if m.shouldFail {
+		return nil, ErrPoolExhausted
+	}
+	m.acquired = true
+	if m.handles != nil {
+		return <-m.handles, nil
+	}
+	return &mockHandle{pool: m}, nil
+}
+
+type mockHandle struct {
+	pool *mockResourcePool
+}
+
+func (m *mockHandle) Release() {
+	if m.pool != nil {
+		m.pool.released = true
+	}
+}
+
+type mockOutputStreamer struct {
+	parsedResult interface{}
+}
+
+func (m *mockOutputStreamer) CreateStreams(streamTo io.Writer) (stdout, stderr *StreamWriter) {
+	return NewStreamWriter(nil, 1024*1024), NewStreamWriter(nil, 1024*1024)
+}
+
+func (m *mockOutputStreamer) ProcessOutput(tool string, stdout, stderr []byte) *ProcessedOutput {
+	if m.parsedResult != nil {
+		return &ProcessedOutput{
+			Type:   OutputTypeParsed,
+			Parsed: m.parsedResult,
+		}
+	}
+	return nil
 }

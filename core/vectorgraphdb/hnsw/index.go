@@ -180,7 +180,10 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 	epSim := CosineSimilarity(query, h.vectors[ep], queryMag, h.magnitudes[ep])
 	candidates = append(candidates, SearchResult{ID: ep, Similarity: epSim})
 
-	for i := 0; i < len(candidates) && len(candidates) < ef*2; i++ {
+	for i := range candidates {
+		if len(candidates) >= ef*2 {
+			break
+		}
 		curr := candidates[i]
 		neighbors := h.layers[level].getNeighbors(curr.ID)
 		for _, neighbor := range neighbors {
@@ -211,7 +214,8 @@ func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
 		maxConn = h.M * 2
 	}
 
-	for _, neighbor := range neighbors[:min(len(neighbors), maxConn)] {
+	for i := 0; i < min(len(neighbors), maxConn); i++ {
+		neighbor := neighbors[i]
 		h.layers[level].addNeighbor(id, neighbor.ID, maxConn)
 		h.layers[level].addNeighbor(neighbor.ID, id, maxConn)
 	}
@@ -273,24 +277,16 @@ func (h *Index) matchesFilter(id string, filter *SearchFilter) bool {
 		return true
 	}
 	if len(filter.Domains) > 0 {
-		if !h.containsDomain(filter.Domains, h.domains[id]) {
+		if !slices.Contains(filter.Domains, h.domains[id]) {
 			return false
 		}
 	}
 	if len(filter.NodeTypes) > 0 {
-		if !h.containsNodeType(filter.NodeTypes, h.nodeTypes[id]) {
+		if !slices.Contains(filter.NodeTypes, h.nodeTypes[id]) {
 			return false
 		}
 	}
 	return true
-}
-
-func (h *Index) containsDomain(domains []vectorgraphdb.Domain, d vectorgraphdb.Domain) bool {
-	return slices.Contains(domains, d)
-}
-
-func (h *Index) containsNodeType(nodeTypes []vectorgraphdb.NodeType, nt vectorgraphdb.NodeType) bool {
-	return slices.Contains(nodeTypes, nt)
 }
 
 func (h *Index) Delete(id string) error {

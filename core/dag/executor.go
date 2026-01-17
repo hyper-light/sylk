@@ -549,22 +549,6 @@ func (e *Executor) markNodeCancelled(node *Node) {
 	e.recordNodeResult(node, result)
 }
 
-func (e *Executor) markNodeSkipped(node *Node) {
-	result := &NodeResult{
-		NodeID:  node.ID(),
-		State:   NodeStateSkipped,
-		EndTime: time.Now(),
-	}
-	e.recordNodeResult(node, result)
-
-	e.emitEvent(&Event{
-		Type:      EventNodeSkipped,
-		DAGID:     e.dag.ID(),
-		NodeID:    node.ID(),
-		Timestamp: time.Now(),
-	})
-}
-
 func (e *Executor) cancelRemainingNodes(markCancelled bool) {
 	if markCancelled {
 		e.cancelled.Store(true)
