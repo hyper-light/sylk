@@ -2556,30 +2556,30 @@ All items in Phase 1 can execute in parallel - no interdependencies.
 
 **Acceptance Criteria:**
 
-#### FS.3.1 VFS (Virtual File System)
-- [ ] `VFS` interface extends existing `VirtualFilesystem` patterns
-- [ ] Core ops: Read, Write, Delete, Exists, List
-- [ ] Versioned ops: ReadAt(version), History, Diff
-- [ ] Transaction support: BeginTransaction, Commit, Rollback
-- [ ] `PipelineVFS` scoped to pipeline with:
-  - [ ] Security: `PermissionManager`, `SecretSanitizer`, `AgentRole` checks
-  - [ ] Path validation via existing `VirtualFilesystem.ValidatePath`
-  - [ ] Staging directory isolation
-  - [ ] CVS integration for version coordination
-- [ ] `FileModification` tracking (OriginalPath, StagingPath, Operation, Timestamp, ContentHash, BaseVersion)
-- [ ] `FileDiff` with hunks for version comparison
+#### FS.3.1 VFS (Virtual File System) ✅
+- [x] `VFS` interface extends existing `VirtualFilesystem` patterns
+- [x] Core ops: Read, Write, Delete, Exists, List
+- [x] Versioned ops: ReadAt(version), History, Diff
+- [x] Transaction support: BeginTransaction, Commit, Rollback
+- [x] `PipelineVFS` scoped to pipeline with:
+  - [x] Security: `PermissionManager`, `SecretSanitizer`, `AgentRole` checks
+  - [x] Path validation via existing `VirtualFilesystem.ValidatePath`
+  - [x] Staging directory isolation
+  - [x] CVS integration for version coordination
+- [x] `FileModification` tracking (OriginalPath, StagingPath, Operation, Timestamp, ContentHash, BaseVersion)
+- [x] `FileDiff` with hunks for version comparison
 
-#### FS.3.2 Pipeline VFS Manager
-- [ ] `VFSManager` interface for managing VFS instances
-- [ ] `CreatePipelineVFS(cfg)`, `GetPipelineVFS(id)`, `ClosePipelineVFS(id)`
-- [ ] Variant group support:
-  - [ ] `CreateVariantGroup(cfg)` - from Pipeline Variants architecture
-  - [ ] `AddVariantToGroup(groupID, variantID, cfg)`
-  - [ ] `SelectVariant(groupID, variantID)` - commits chosen variant
-  - [ ] `CancelVariantGroup(groupID)`
-- [ ] Session queries: `GetSessionVFSes(sessionID)`
-- [ ] Cleanup: `CleanupSession`, `CleanupStaging`
-- [ ] Integrates with `pipeline.VariantGroup`
+#### FS.3.2 Pipeline VFS Manager ✅
+- [x] `VFSManager` interface for managing VFS instances
+- [x] `CreatePipelineVFS(cfg)`, `GetPipelineVFS(id)`, `ClosePipelineVFS(id)`
+- [x] Variant group support:
+  - [x] `CreateVariantGroup(cfg)` - from Pipeline Variants architecture
+  - [x] `AddVariantToGroup(groupID, variantID, cfg)`
+  - [x] `SelectVariant(groupID, variantID)` - commits chosen variant
+  - [x] `CancelVariantGroup(groupID)`
+- [x] Session queries: `GetSessionVFSes(sessionID)`
+- [x] Cleanup: `CleanupSession`, `CleanupStaging`
+- [x] Integrates with `pipeline.VariantGroup`
 
 ---
 
@@ -2601,27 +2601,27 @@ All items in Phase 1 can execute in parallel - no interdependencies.
 
 **Acceptance Criteria:**
 
-#### FS.4.1 Diff Algorithm
-- [ ] `Differ` interface: DiffBytes, DiffVersions, ToOperations, FromOperations
-- [ ] `MyersDiffer` with configurable context lines
-- [ ] `ASTDiffer` for semantic diffs
-- [ ] `ASTDiff` with changes: Added, Removed, Modified, Moved
-- [ ] Operations can reconstruct target from base
+#### FS.4.1 Diff Algorithm ✅
+- [x] `Differ` interface: DiffBytes, DiffVersions, ToOperations, FromOperations
+- [x] `MyersDiffer` with configurable context lines
+- [x] `ASTDiffer` for semantic diffs
+- [x] `ASTDiff` with changes: Added, Removed, Modified, Moved
+- [x] Operations can reconstruct target from base
 
-#### FS.4.2 Operational Transformation
-- [ ] `OTEngine` interface: Transform, TransformBatch, Compose, CanMergeAutomatically, DetectConflict
-- [ ] Transform matrix for all operation type pairs
-- [ ] `Conflict` struct with Op1, Op2, Type, Description, Resolutions
-- [ ] Conflict types: OverlappingEdit, DeleteEdit, MoveEdit, SemanticConflict
-- [ ] `Resolution` with Label, Description, ResultOp
-- [ ] Transform is symmetric (convergent)
+#### FS.4.2 Operational Transformation ✅
+- [x] `OTEngine` interface: Transform, TransformBatch, Compose, CanMergeAutomatically, DetectConflict
+- [x] Transform matrix for all operation type pairs
+- [x] `Conflict` struct with Op1, Op2, Type, Description, Resolutions
+- [x] Conflict types: OverlappingEdit, DeleteEdit, MoveEdit, SemanticConflict
+- [x] `Resolution` with Label, Description, ResultOp
+- [x] Transform is symmetric (convergent)
 
-#### FS.4.3 Conflict Resolution UI Integration
-- [ ] `ConflictResolver` interface: ResolveConflict, ResolveConflictBatch, AutoResolve
-- [ ] `GuideConflictResolver` routes through Guide
-- [ ] Auto-resolve policies: None, KeepNewest, KeepOldest, KeepBoth
-- [ ] `ConflictMessage` and `ConflictResponse` for Guide communication
-- [ ] Signal: CONFLICT_DETECTED for pipeline handling
+#### FS.4.3 Conflict Resolution UI Integration ✅
+- [x] `ConflictResolver` interface: ResolveConflict, ResolveConflictBatch, AutoResolve
+- [x] `GuideConflictResolver` routes through Guide
+- [x] Auto-resolve policies: None, KeepNewest, KeepOldest, KeepBoth
+- [x] `ConflictMessage` and `ConflictResponse` for Guide communication
+- [x] Signal: CONFLICT_DETECTED for pipeline handling
 
 ---
 
@@ -2634,25 +2634,25 @@ All items in Phase 1 can execute in parallel - no interdependencies.
 
 **Acceptance Criteria:**
 
-#### FS.5.1 Central Version Store
-- [ ] `CVS` interface - main coordinator for all versioning
-- [ ] File operations: Read, Write, Delete (versioned)
-- [ ] Version queries: GetVersion, GetHead, GetHistory
-- [ ] Pipeline operations:
-  - [ ] `BeginPipeline(cfg)` returns `PipelineVFS`
-  - [ ] `CommitPipeline(pipelineID)` creates new versions
-  - [ ] `RollbackPipeline(pipelineID)` discards changes
-- [ ] Merge operations: `Merge`, `ThreeWayMerge` with OT
-- [ ] Cross-session coordination:
-  - [ ] `AcquireFileLock(filePath, sessionID)` / `ReleaseFileLock`
-  - [ ] File locks with timeout to prevent deadlocks
-- [ ] Variant operations:
-  - [ ] `BeginVariantGroup`, `AddVariant`, `SelectVariant`
-- [ ] Subscriptions for file changes:
-  - [ ] `Subscribe(filePath, sessionID, callback)` / `Unsubscribe`
-- [ ] Security checks via `PermissionManager` and `SecretSanitizer`
-- [ ] WAL integration for crash recovery
-- [ ] `CVSStats`: TotalFiles, TotalVersions, TotalOperations, ActivePipelines, ActiveVariants, ActiveLocks
+#### FS.5.1 Central Version Store ✅
+- [x] `CVS` interface - main coordinator for all versioning
+- [x] File operations: Read, Write, Delete (versioned)
+- [x] Version queries: GetVersion, GetHead, GetHistory
+- [x] Pipeline operations:
+  - [x] `BeginPipeline(cfg)` returns `PipelineVFS`
+  - [x] `CommitPipeline(pipelineID)` creates new versions
+  - [x] `RollbackPipeline(pipelineID)` discards changes
+- [x] Merge operations: `Merge`, `ThreeWayMerge` with OT
+- [x] Cross-session coordination:
+  - [x] `AcquireFileLock(filePath, sessionID)` / `ReleaseFileLock`
+  - [x] File locks with timeout to prevent deadlocks
+- [x] Variant operations:
+  - [x] `BeginVariantGroup`, `AddVariant`, `SelectVariant`
+- [x] Subscriptions for file changes:
+  - [x] `Subscribe(filePath, sessionID, callback)` / `Unsubscribe`
+- [x] Security checks via `PermissionManager` and `SecretSanitizer`
+- [x] WAL integration for crash recovery
+- [x] `CVSStats`: TotalFiles, TotalVersions, TotalOperations, ActivePipelines, ActiveVariants, ActiveLocks
 
 ---
 
@@ -23279,20 +23279,20 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4C: FILESYSTEM Versioning Core (FS Phases 3-5)                    ││
+│ │ PARALLEL GROUP 4C: FILESYSTEM Versioning Core (FS Phases 3-5) ✅ COMPLETE        ││
 │ │ ** NEW: VFS, OT Engine, Central Version Store **                                 ││
 │ │                                                                                  ││
 │ │ PHASE 3 - VFS (After Wave 3D Phase 2):                                           ││
-│ │ • FS.3.1 VFS (Virtual File System) with security integration                     ││
-│ │ • FS.3.2 Pipeline VFS Manager (variant group support)                            ││
+│ │ • FS.3.1 VFS (Virtual File System) with security integration ✅                  ││
+│ │ • FS.3.2 Pipeline VFS Manager (variant group support) ✅                         ││
 │ │                                                                                  ││
 │ │ PHASE 4 - OT Engine (Can parallel with Phase 3):                                 ││
-│ │ • FS.4.1 Diff Algorithm (Myers + AST-aware)                                      ││
-│ │ • FS.4.2 Operational Transformation Engine                                       ││
-│ │ • FS.4.3 Conflict Resolution UI Integration (Guide routing)                      ││
+│ │ • FS.4.1 Diff Algorithm (Myers + AST-aware) ✅                                   ││
+│ │ • FS.4.2 Operational Transformation Engine ✅                                    ││
+│ │ • FS.4.3 Conflict Resolution UI Integration (Guide routing) ✅                   ││
 │ │                                                                                  ││
 │ │ PHASE 5 - CVS (After Phases 3-4):                                                ││
-│ │ • FS.5.1 Central Version Store (main coordinator)                                ││
+│ │ • FS.5.1 Central Version Store (main coordinator) ✅                             ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
 │ │   core/versioning/vfs.go, vfs_manager.go, diff.go, ot.go,                        ││
@@ -23303,15 +23303,15 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4D: FILESYSTEM Cross-Session Coordination (FS Phase 7)            ││
+│ │ PARALLEL GROUP 4D: FILESYSTEM Cross-Session Coordination (FS Phase 7) ✅ COMPLETE││
 │ │ ** NEW: File change signals and lock coordination **                             ││
 │ │                                                                                  ││
 │ │ PHASE 7 (After Phase 5 CVS):                                                     ││
-│ │ • FS.7.1 Signal Dispatcher for File Changes                                      ││
+│ │ • FS.7.1 Signal Dispatcher for File Changes ✅                                   ││
 │ │   - FILE_CREATED, FILE_MODIFIED, FILE_DELETED signals                            ││
 │ │   - FILE_LOCKED, FILE_UNLOCKED, MERGE_CONFLICT signals                           ││
 │ │   - Pattern-based subscriptions                                                  ││
-│ │ • FS.7.2 Cross-Session Pool for File Coordination                                ││
+│ │ • FS.7.2 Cross-Session Pool for File Coordination ✅                             ││
 │ │   - Read/write lock acquisition                                                  ││
 │ │   - Coordinated multi-file operations                                            ││
 │ │                                                                                  ││
