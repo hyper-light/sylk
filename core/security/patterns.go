@@ -176,24 +176,38 @@ func matchGlob(pattern, name string) (bool, error) {
 
 func matchGlobRecursive(pattern, name string) (bool, error) {
 	for len(pattern) > 0 {
-		switch pattern[0] {
-		case '*':
+		char := pattern[0]
+		if char == '*' {
 			return matchStar(pattern, name)
-		case '?':
-			if len(name) == 0 {
-				return false, nil
-			}
-			pattern = pattern[1:]
-			name = name[1:]
-		default:
-			if len(name) == 0 || pattern[0] != name[0] {
-				return false, nil
-			}
-			pattern = pattern[1:]
-			name = name[1:]
+		}
+		var ok bool
+		pattern, name, ok = matchSingleChar(char, pattern, name)
+		if !ok {
+			return false, nil
 		}
 	}
 	return len(name) == 0, nil
+}
+
+func matchSingleChar(char byte, pattern, name string) (string, string, bool) {
+	if char == '?' {
+		return matchWildcard(pattern, name)
+	}
+	return matchLiteral(char, pattern, name)
+}
+
+func matchWildcard(pattern, name string) (string, string, bool) {
+	if len(name) == 0 {
+		return pattern, name, false
+	}
+	return pattern[1:], name[1:], true
+}
+
+func matchLiteral(char byte, pattern, name string) (string, string, bool) {
+	if len(name) == 0 || char != name[0] {
+		return pattern, name, false
+	}
+	return pattern[1:], name[1:], true
 }
 
 func matchStar(pattern, name string) (bool, error) {

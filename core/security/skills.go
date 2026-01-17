@@ -87,21 +87,22 @@ func (s *SecuritySkills) CheckFileSensitivity(path string) *CheckFileSensitivity
 	}
 }
 
+var skipPatterns = map[string]bool{
+	".env": true, ".env.*": true, "*.env": true,
+	"id_rsa": true, "id_dsa": true, "id_ecdsa": true, "id_ed25519": true, "*.ppk": true,
+}
+
+var redactPatterns = map[string]bool{
+	"*credentials*": true, "*secret*": true, "*.pem": true, "*.key": true,
+}
+
 func determineHandling(pattern string) string {
-	skipPatterns := []string{".env", ".env.*", "*.env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "*.ppk"}
-	for _, skip := range skipPatterns {
-		if pattern == skip {
-			return "skip"
-		}
+	if skipPatterns[pattern] {
+		return "skip"
 	}
-
-	redactPatterns := []string{"*credentials*", "*secret*", "*.pem", "*.key"}
-	for _, redact := range redactPatterns {
-		if pattern == redact {
-			return "redact"
-		}
+	if redactPatterns[pattern] {
+		return "redact"
 	}
-
 	return "skip"
 }
 
@@ -130,19 +131,20 @@ type SkillInput struct {
 	Path    string `json:"path,omitempty"`
 }
 
-func (s *SecuritySkills) Execute(skillName string, input *SkillInput) interface{} {
+type skillExecutor func(*SecuritySkills, *SkillInput) any
+
+var skillExecutors = map[string]skillExecutor{
+	"validate_content":       func(s *SecuritySkills, i *SkillInput) any { return s.ValidateContent(i.Content) },
+	"check_file_sensitivity": func(s *SecuritySkills, i *SkillInput) any { return s.CheckFileSensitivity(i.Path) },
+	"sanitize_for_display":   func(s *SecuritySkills, i *SkillInput) any { return s.SanitizeForDisplay(i.Content) },
+}
+
+func (s *SecuritySkills) Execute(skillName string, input *SkillInput) any {
 	if input == nil {
 		return nil
 	}
-
-	switch skillName {
-	case "validate_content":
-		return s.ValidateContent(input.Content)
-	case "check_file_sensitivity":
-		return s.CheckFileSensitivity(input.Path)
-	case "sanitize_for_display":
-		return s.SanitizeForDisplay(input.Content)
-	default:
-		return nil
+	if executor, ok := skillExecutors[skillName]; ok {
+		return executor(s, input)
 	}
+	return nil
 }

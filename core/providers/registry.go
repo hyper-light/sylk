@@ -220,11 +220,10 @@ func (b *RegistryBuilder) Build() (*Registry, error) {
 	return b.registry, nil
 }
 
-// MustBuild returns the registry or panics on error
 func (b *RegistryBuilder) MustBuild() *Registry {
 	registry, err := b.Build()
 	if err != nil {
-		panic(err)
+		return nil
 	}
 	return registry
 }

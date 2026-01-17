@@ -2,233 +2,257 @@ package treesitter
 
 import (
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func TestNewQueryEngine(t *testing.T) {
-	engine := NewQueryEngine(100)
-	require.NotNil(t, engine)
-	assert.Equal(t, 0, engine.CacheSize())
+func getTestLanguage(t *testing.T) interface{} {
+	t.Helper()
+	skipIfNoGrammar(t, "go")
+
+	lang, err := LoadGrammar("go")
+	if err != nil {
+		t.Fatalf("LoadGrammar: %v", err)
+	}
+	return lang
 }
 
-func TestQueryEngineClose(t *testing.T) {
-	engine := NewQueryEngine(10)
-	engine.Close()
-	assert.Equal(t, 0, engine.CacheSize())
+func TestNewQueryCursor(t *testing.T) {
+	cursor := NewQueryCursor()
+	if cursor == nil {
+		t.Fatal("NewQueryCursor returned nil")
+	}
+	defer cursor.Close()
+
+	if cursor.inner == nil {
+		t.Error("cursor inner should not be nil")
+	}
 }
 
-func TestQueryBuilder(t *testing.T) {
-	t.Run("empty builder", func(t *testing.T) {
-		b := NewQueryBuilder()
-		assert.Equal(t, "", b.Build())
-	})
+func TestNewQueryInvalidPattern(t *testing.T) {
+	skipIfNoGrammar(t, "go")
 
-	t.Run("single pattern", func(t *testing.T) {
-		b := NewQueryBuilder().Add("(function_declaration)")
-		assert.Equal(t, "(function_declaration)", b.Build())
-	})
+	lang, err := LoadGrammar("go")
+	if err != nil {
+		t.Fatalf("LoadGrammar: %v", err)
+	}
 
-	t.Run("multiple patterns", func(t *testing.T) {
-		b := NewQueryBuilder().
-			Add("(function_declaration)").
-			Add("(method_declaration)")
-		result := b.Build()
-		assert.Contains(t, result, "(function_declaration)")
-		assert.Contains(t, result, "(method_declaration)")
-	})
+	_, err = NewQuery(lang, "((((invalid")
+	if err == nil {
+		t.Error("NewQuery should error on invalid pattern")
+	}
 }
 
-func TestQueryCacheKey(t *testing.T) {
-	key1 := queryCacheKey{language: "go", pattern: "(func)"}
-	key2 := queryCacheKey{language: "go", pattern: "(func)"}
-	key3 := queryCacheKey{language: "rust", pattern: "(func)"}
+func TestNewQueryValidPattern(t *testing.T) {
+	skipIfNoGrammar(t, "go")
 
-	assert.Equal(t, key1, key2)
-	assert.NotEqual(t, key1, key3)
+	lang, err := LoadGrammar("go")
+	if err != nil {
+		t.Fatalf("LoadGrammar: %v", err)
+	}
+
+	query, err := NewQuery(lang, "(identifier) @name")
+	if err != nil {
+		t.Fatalf("NewQuery: %v", err)
+	}
+	defer query.Close()
+
+	if query.PatternCount() != 1 {
+		t.Errorf("PatternCount = %d, want 1", query.PatternCount())
+	}
+
+	names := query.CaptureNames()
+	if len(names) != 1 || names[0] != "name" {
+		t.Errorf("CaptureNames = %v, want [name]", names)
+	}
 }
 
-func TestQueryResultZeroValue(t *testing.T) {
-	var result QueryResult
-	assert.Nil(t, result.Matches)
-	assert.Equal(t, uint32(0), result.PatternCount)
-	assert.Equal(t, uint32(0), result.CaptureCount)
+func TestQueryMatches(t *testing.T) {
+	skipIfNoGrammar(t, "go")
+
+	p := NewParser()
+	defer p.Close()
+
+	if err := p.SetLanguageByName("go"); err != nil {
+		t.Fatalf("SetLanguageByName: %v", err)
+	}
+
+	tree, err := p.ParseString(`package main
+
+func foo() {}
+func bar() {}
+`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer tree.Close()
+
+	lang, err := LoadGrammar("go")
+	if err != nil {
+		t.Fatalf("LoadGrammar: %v", err)
+	}
+
+	query, err := NewQuery(lang, "(function_declaration name: (identifier) @fn)")
+	if err != nil {
+		t.Fatalf("NewQuery: %v", err)
+	}
+	defer query.Close()
+
+	cursor := NewQueryCursor()
+	defer cursor.Close()
+
+	matches := cursor.Matches(query, tree.RootNode(), tree.Source())
+
+	if len(matches) < 2 {
+		t.Errorf("expected at least 2 matches, got %d", len(matches))
+	}
+
+	fnNames := make(map[string]bool)
+	for _, m := range matches {
+		for _, cap := range m.Captures {
+			if cap.Name == "fn" {
+				fnNames[cap.Node.Content()] = true
+			}
+		}
+	}
+
+	if !fnNames["foo"] || !fnNames["bar"] {
+		t.Errorf("expected foo and bar, got %v", fnNames)
+	}
 }
 
-func TestGetCommonQuery(t *testing.T) {
-	t.Run("go functions", func(t *testing.T) {
-		query, ok := GetCommonQuery("go", "functions")
-		assert.True(t, ok)
-		assert.Contains(t, query, "function_declaration")
-	})
+func TestQueryCaptures(t *testing.T) {
+	skipIfNoGrammar(t, "go")
 
-	t.Run("go methods", func(t *testing.T) {
-		query, ok := GetCommonQuery("go", "methods")
-		assert.True(t, ok)
-		assert.Contains(t, query, "method_declaration")
-	})
+	p := NewParser()
+	defer p.Close()
 
-	t.Run("python functions", func(t *testing.T) {
-		query, ok := GetCommonQuery("python", "functions")
-		assert.True(t, ok)
-		assert.Contains(t, query, "function_definition")
-	})
+	if err := p.SetLanguageByName("go"); err != nil {
+		t.Fatalf("SetLanguageByName: %v", err)
+	}
 
-	t.Run("unknown language", func(t *testing.T) {
-		_, ok := GetCommonQuery("unknown", "functions")
-		assert.False(t, ok)
-	})
+	tree, err := p.ParseString(`package main
 
-	t.Run("unknown query type", func(t *testing.T) {
-		_, ok := GetCommonQuery("go", "unknown")
-		assert.False(t, ok)
-	})
-}
+var x = 1
+var y = 2
+`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer tree.Close()
 
-func TestListCommonQueries(t *testing.T) {
-	t.Run("go queries", func(t *testing.T) {
-		names := ListCommonQueries("go")
-		assert.Contains(t, names, "functions")
-		assert.Contains(t, names, "methods")
-		assert.Contains(t, names, "types")
-	})
+	lang, err := LoadGrammar("go")
+	if err != nil {
+		t.Fatalf("LoadGrammar: %v", err)
+	}
 
-	t.Run("rust queries", func(t *testing.T) {
-		names := ListCommonQueries("rust")
-		assert.Contains(t, names, "functions")
-		assert.Contains(t, names, "structs")
-		assert.Contains(t, names, "traits")
-	})
+	query, err := NewQuery(lang, "(identifier) @id")
+	if err != nil {
+		t.Fatalf("NewQuery: %v", err)
+	}
+	defer query.Close()
 
-	t.Run("unknown language", func(t *testing.T) {
-		names := ListCommonQueries("unknown")
-		assert.Nil(t, names)
-	})
-}
+	cursor := NewQueryCursor()
+	defer cursor.Close()
 
-func TestCommonQueriesContent(t *testing.T) {
-	for lang, queries := range CommonQueries {
-		for name, pattern := range queries {
-			t.Run(lang+"_"+name, func(t *testing.T) {
-				assert.NotEmpty(t, pattern)
-				assert.Contains(t, pattern, "(")
-				assert.Contains(t, pattern, ")")
-			})
+	captures := cursor.Captures(query, tree.RootNode(), tree.Source())
+
+	if len(captures) < 2 {
+		t.Errorf("expected at least 2 captures, got %d", len(captures))
+	}
+
+	for _, cap := range captures {
+		if cap.Name != "id" {
+			t.Errorf("unexpected capture name: %s", cap.Name)
+		}
+		if cap.Node == nil {
+			t.Error("capture Node should not be nil")
 		}
 	}
 }
 
-func TestJoinPatterns(t *testing.T) {
-	t.Run("empty", func(t *testing.T) {
-		result := joinPatterns(nil)
-		assert.Equal(t, "", result)
-	})
-
-	t.Run("single", func(t *testing.T) {
-		result := joinPatterns([]string{"(a)"})
-		assert.Equal(t, "(a)", result)
-	})
-
-	t.Run("multiple", func(t *testing.T) {
-		result := joinPatterns([]string{"(a)", "(b)", "(c)"})
-		assert.Equal(t, "(a)\n(b)\n(c)", result)
-	})
-}
-
-func TestCalculateTotalLength(t *testing.T) {
-	assert.Equal(t, 0, calculateTotalLength(nil))
-	assert.Equal(t, 2, calculateTotalLength([]string{"a"}))
-	assert.Equal(t, 4, calculateTotalLength([]string{"a", "b"}))
-}
-
-func TestExtractQueryNames(t *testing.T) {
-	queries := map[string]string{
-		"a": "pattern_a",
-		"b": "pattern_b",
-	}
-	names := extractQueryNames(queries)
-	assert.Len(t, names, 2)
-	assert.Contains(t, names, "a")
-	assert.Contains(t, names, "b")
-}
-
-func TestQueryPatternMethod(t *testing.T) {
-	lang := &Language{name: "go"}
-	pattern := "(function_declaration)"
-	query := &Query{pattern: pattern, language: lang}
-
-	assert.Equal(t, pattern, query.Pattern())
-}
-
-func TestQueryEngineEviction(t *testing.T) {
-	engine := NewQueryEngine(2)
-	defer engine.Close()
-
-	engine.queryCache[queryCacheKey{language: "a", pattern: "1"}] = &Query{}
-	engine.queryCache[queryCacheKey{language: "b", pattern: "2"}] = &Query{}
-
-	assert.Equal(t, 2, engine.CacheSize())
-
-	engine.evictIfNeeded()
-	assert.Equal(t, 1, engine.CacheSize())
-}
-
-func TestCollectMatchesEmpty(t *testing.T) {
-	if err := Initialize(); err != nil {
-		t.Skipf("tree-sitter library not available: %v", err)
+func TestQueryMatchStruct(t *testing.T) {
+	m := QueryMatch{
+		PatternIndex: 0,
+		Captures:     []QueryCapture{},
 	}
 
-	cursor := &QueryCursor{ptr: 0}
-	query := &Query{ptr: 0}
-	node := &Node{}
-
-	matches := collectMatches(cursor, query, node)
-	assert.Empty(t, matches)
-}
-
-func TestExtractCapturesEmpty(t *testing.T) {
-	raw := &TSQueryMatch{CaptureCount: 0, Captures: 0}
-	query := &Query{}
-	node := &Node{}
-
-	captures := extractCaptures(raw, query, node)
-	assert.Nil(t, captures)
-}
-
-func TestWrapCapturedNode(t *testing.T) {
-	source := []byte("test content")
-	tree := &Tree{source: source}
-	parent := &Node{tree: tree, source: source}
-
-	raw := TSNode{}
-	wrapped := wrapCapturedNode(raw, parent)
-
-	assert.Same(t, tree, wrapped.tree)
-	assert.Equal(t, source, wrapped.source)
-}
-
-func BenchmarkQueryBuilder(b *testing.B) {
-	patterns := []string{
-		"(function_declaration)",
-		"(method_declaration)",
-		"(type_declaration)",
-		"(import_declaration)",
+	if m.PatternIndex != 0 {
+		t.Error("PatternIndex should be 0")
 	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		builder := NewQueryBuilder()
-		for _, p := range patterns {
-			builder.Add(p)
-		}
-		_ = builder.Build()
+	if m.Captures == nil {
+		t.Error("Captures should not be nil")
 	}
 }
 
-func BenchmarkGetCommonQuery(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = GetCommonQuery("go", "functions")
+func TestQueryCaptureStruct(t *testing.T) {
+	c := QueryCapture{
+		Name: "test",
+		Node: nil,
+	}
+
+	if c.Name != "test" {
+		t.Errorf("Name = %q, want test", c.Name)
+	}
+}
+
+func TestQueryMultiplePatterns(t *testing.T) {
+	skipIfNoGrammar(t, "go")
+
+	lang, err := LoadGrammar("go")
+	if err != nil {
+		t.Fatalf("LoadGrammar: %v", err)
+	}
+
+	query, err := NewQuery(lang, `
+(function_declaration name: (identifier) @fn)
+(type_declaration (type_spec name: (type_identifier) @type))
+`)
+	if err != nil {
+		t.Fatalf("NewQuery: %v", err)
+	}
+	defer query.Close()
+
+	if query.PatternCount() != 2 {
+		t.Errorf("PatternCount = %d, want 2", query.PatternCount())
+	}
+
+	names := query.CaptureNames()
+	if len(names) != 2 {
+		t.Errorf("CaptureNames length = %d, want 2", len(names))
+	}
+}
+
+func TestQueryEmptySource(t *testing.T) {
+	skipIfNoGrammar(t, "go")
+
+	p := NewParser()
+	defer p.Close()
+
+	if err := p.SetLanguageByName("go"); err != nil {
+		t.Fatalf("SetLanguageByName: %v", err)
+	}
+
+	tree, err := p.ParseString("")
+	if err != nil {
+		t.Fatalf("Parse empty: %v", err)
+	}
+	defer tree.Close()
+
+	lang, err := LoadGrammar("go")
+	if err != nil {
+		t.Fatalf("LoadGrammar: %v", err)
+	}
+
+	query, err := NewQuery(lang, "(identifier) @id")
+	if err != nil {
+		t.Fatalf("NewQuery: %v", err)
+	}
+	defer query.Close()
+
+	cursor := NewQueryCursor()
+	defer cursor.Close()
+
+	matches := cursor.Matches(query, tree.RootNode(), tree.Source())
+	if len(matches) != 0 {
+		t.Errorf("expected 0 matches for empty source, got %d", len(matches))
 	}
 }

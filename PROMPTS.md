@@ -1,4 +1,4 @@
-Examine ARCHITECTURE.md and find the section with "Comprehensive Parallel Execution Order", then Wave 3 , Parallel Group 3E. For each item, in parallel (using sub-agents) find the matching architecture description for the item in ARCHITECTURE.md. Examine and understand it thoroughly. Implement according to ARCHITECTURE.md spec and use sub agents to accomplish the work required maximizing parallelism. After *EACH* submitem is created YOU MUST ALWAYS AND FOREVER:
+Examine ARCHITECTURE.md and find the section with "Comprehensive Parallel Execution Order", then Wave 4 , Parallel Group 4E. For each item, in parallel (using sub-agents) find the matching architecture description for the item in ARCHITECTURE.md. Examine and understand it thoroughly. Implement according to ARCHITECTURE.md spec and use sub agents to accomplish the work required maximizing parallelism. After *EACH* submitem is created YOU MUST ALWAYS AND FOREVER:
 - Generate a commit.
 - Examine the cyclomatic complexity or the code your just wrote and ENSURE it is 4 or less.
 - We do NOT allow functions over 100 lines. EVER.
@@ -12,6 +12,7 @@ Examine ARCHITECTURE.md and find the section with "Comprehensive Parallel Execut
 - DO NOT generate your own mocks - specify interfaces for structs and use mockery - https://github.com/vektra/mockery to generate them.
 - We do NOT defer, bypass, or skip work. EVER.
 - If code or an existing implementation exists and does not match spec, we ALWAYS just modify it and DO NOT attempt to preserve legacy behavior.
+- You MUST integrate correctly and fully with the security apis we specify in ARCHITECTURE.md, both for if sandboxing is enabled OR disabled.
 
 Examine ARCHITECTURE.md and find the section with "Comprehensive Parallel Execution Order", then Wave 2 , Parallel Group 2A. Find its matching description in ARCHITECTURE.md. Then convert these into concrete, actionable, atomic tasks with explicit maximally robust and correct implementation examples, explicit and thorough acceptance criteria, references to existing code locations if updates or modifications need to occur. These tasks need to be explicit to the point any AI agent could follow them and product the maximially spec compliant, robust, correct, and performant result.
 

@@ -10413,8 +10413,8 @@ Layered sandbox providing OS isolation, VFS, and network proxy.
 - [x] `ValidatePath(path)` checks boundary violations
 - [x] Symlink resolution to detect escapes
 - [x] User-approved paths tracked in `approvedPaths`
-- [ ] `MergeChanges(cmd)` applies staged modifications (deferred - MVP uses boundary checking)
-- [ ] Copy-on-write semantics (deferred - MVP uses boundary checking)
+- [x] `MergeChanges(cmd)` applies staged modifications
+- [x] Copy-on-write semantics
 
 #### Network Proxy
 - [x] `NetworkProxy` struct with HTTP proxy listener
@@ -10435,7 +10435,7 @@ Layered sandbox providing OS isolation, VFS, and network proxy.
 - [x] bubblewrap wrapping works on Linux
 - [x] Seatbelt wrapping works on macOS
 - [x] VFS prevents writes outside working dir
-- [ ] VFS merges changes correctly (deferred with feature)
+- [x] VFS merges changes correctly
 - [x] Network proxy blocks unlisted domains
 - [x] Graceful degradation when sandbox unavailable
 
@@ -19436,23 +19436,23 @@ End-to-end tests for variant system.
 
 Foundational security layer for secret detection, redaction, and environment isolation. No dependencies on Pipeline Variants - can execute fully in parallel.
 
-### 6.113 Secret Pattern Definitions
+### 6.113 Secret Pattern Definitions ✅ COMPLETED
 
 Configurable regex patterns for detecting secrets.
 
-**Files to create:**
-- `core/security/patterns.go`
-- `core/security/patterns_test.go`
+**Files created:**
+- `core/security/patterns.go` ✅
+- `core/security/patterns_test.go` ✅
 
 **Dependencies:** None (foundational)
 
 **Acceptance Criteria:**
 
 #### Pattern Types
-- [ ] `SecretPattern` struct with Name, Pattern (regex), Severity
-- [ ] `SecretSeverity` enum: `low`, `medium`, `high`, `critical`
-- [ ] Default patterns for: API keys, passwords, tokens, private keys, AWS creds, GitHub PAT, OpenAI key, Anthropic key, connection strings
-- [ ] `SensitiveFilePatterns` glob list: `.env*`, `*.pem`, `*.key`, `*credentials*`, etc.
+- [x] `SecretPattern` struct with Name, Pattern (regex), Severity
+- [x] `SecretSeverity` enum: `low`, `medium`, `high`, `critical`
+- [x] Default patterns for: API keys, passwords, tokens, private keys, AWS creds, GitHub PAT, OpenAI key, Anthropic key, connection strings
+- [x] `SensitiveFilePatterns` glob list: `.env*`, `*.pem`, `*.key`, `*credentials*`, etc.
 
 ```go
 type SecretPattern struct {
@@ -19469,92 +19469,92 @@ var SecretPatterns = []*SecretPattern{
 ```
 
 #### Pattern Management
-- [ ] `LoadPatterns()` loads default + custom patterns
-- [ ] `AddPattern(pattern *SecretPattern)` adds custom pattern
-- [ ] `RemovePattern(name string)` removes pattern by name
-- [ ] Patterns compiled once at load time (performance)
+- [x] `LoadPatterns()` loads default + custom patterns (via NewPatternManager)
+- [x] `AddPattern(pattern *SecretPattern)` adds custom pattern
+- [x] `RemovePattern(name string)` removes pattern by name
+- [x] Patterns compiled once at load time (performance)
 
 **Tests:**
-- [ ] All default patterns detect expected secrets
-- [ ] No false positives on common code patterns
-- [ ] Custom patterns can be added/removed
-- [ ] Pattern matching is case-insensitive where appropriate
+- [x] All default patterns detect expected secrets
+- [x] No false positives on common code patterns
+- [x] Custom patterns can be added/removed
+- [x] Pattern matching is case-insensitive where appropriate
 
 ---
 
-### 6.114 SecretSanitizer Service
+### 6.114 SecretSanitizer Service ✅ COMPLETED
 
 Core sanitization service with context-aware handling.
 
-**Files to create:**
-- `core/security/sanitizer.go`
-- `core/security/sanitizer_test.go`
+**Files created:**
+- `core/security/sanitizer.go` ✅
+- `core/security/sanitizer_test.go` ✅
 
 **Dependencies:** 6.113 (Secret Pattern Definitions)
 
 **Acceptance Criteria:**
 
 #### SecretSanitizer Struct
-- [ ] `SecretSanitizer` with patterns, sensitiveFiles, redactText, metrics
-- [ ] `NewSecretSanitizer()` constructor with defaults
-- [ ] Thread-safe (RWMutex for metrics)
-- [ ] Configurable redaction text (default: "[REDACTED]")
+- [x] `SecretSanitizer` with patterns, sensitiveFiles, redactText, metrics
+- [x] `NewSecretSanitizer()` constructor with defaults
+- [x] Thread-safe (RWMutex for metrics)
+- [x] Configurable redaction text (default: "[REDACTED]")
 
 #### SanitizeForIndex (Librarian use)
-- [ ] Check file against sensitive file patterns → return stub
-- [ ] Stub preserves file existence: "# filename\n(contents not indexed for security)"
-- [ ] Scan content for secret patterns → redact in-place
-- [ ] Return `SanitizeResult` with counts and matched patterns
-- [ ] Stream-friendly (doesn't load entire file into memory)
+- [x] Check file against sensitive file patterns → return stub
+- [x] Stub preserves file existence: "# filename\n(contents not indexed for security)"
+- [x] Scan content for secret patterns → redact in-place
+- [x] Return `SanitizeResult` with counts and matched patterns
+- [x] Stream-friendly (doesn't load entire file into memory)
 
 ```go
 func (s *SecretSanitizer) SanitizeForIndex(path string, content []byte) ([]byte, *SanitizeResult)
 ```
 
 #### CheckUserPrompt (Rejection mode)
-- [ ] Scan prompt for secret patterns
-- [ ] Return `SecretDetection` with findings
-- [ ] `maskContext()` shows location without revealing secret
-- [ ] Findings include pattern name, severity, position
+- [x] Scan prompt for secret patterns
+- [x] Return `SecretDetection` with findings
+- [x] `maskContext()` shows location without revealing secret
+- [x] Findings include pattern name, severity, position
 
 #### SanitizeToolOutput (Redaction mode)
-- [ ] Scan output string for secrets
-- [ ] Redact all matches
-- [ ] Return sanitized string and redaction count
+- [x] Scan output string for secrets
+- [x] Redact all matches
+- [x] Return sanitized string and redaction count
 
 #### Metrics Tracking
-- [ ] Track redaction counts per pattern
-- [ ] Track skipped files per pattern
-- [ ] `GetMetrics()` returns current statistics
+- [x] Track redaction counts per pattern
+- [x] Track skipped files per pattern
+- [x] `GetMetrics()` returns current statistics
 
 **Tests:**
-- [ ] SanitizeForIndex skips sensitive files with stub
-- [ ] SanitizeForIndex redacts secrets in normal files
-- [ ] CheckUserPrompt detects all pattern types
-- [ ] SanitizeToolOutput handles multiple secrets
-- [ ] Metrics accurately tracked
-- [ ] Thread-safe under concurrent access
+- [x] SanitizeForIndex skips sensitive files with stub
+- [x] SanitizeForIndex redacts secrets in normal files
+- [x] CheckUserPrompt detects all pattern types
+- [x] SanitizeToolOutput handles multiple secrets
+- [x] Metrics accurately tracked
+- [x] Thread-safe under concurrent access
 
 ---
 
-### 6.115 Pre-Prompt Secret Detection Hook
+### 6.115 Pre-Prompt Secret Detection Hook ✅ COMPLETED
 
 Rejects user prompts containing secrets.
 
-**Files to create:**
-- `core/security/hooks.go`
-- `core/security/hooks_test.go`
+**Files created:**
+- `core/security/hooks.go` ✅
+- `core/security/hooks_test.go` ✅
 
 **Dependencies:** 6.114 (SecretSanitizer Service)
 
 **Acceptance Criteria:**
 
 #### PrePromptSecretHook
-- [ ] Hook type: PrePrompt, Priority: First
-- [ ] Calls `sanitizer.CheckUserPrompt()`
-- [ ] If secrets detected: return `SecretDetectedError`
-- [ ] Error message is user-friendly, doesn't reveal secret
-- [ ] Logs detection via AuditLogger (pattern name + count, not values)
+- [x] Hook type: PrePrompt, Priority: First
+- [x] Calls `sanitizer.CheckUserPrompt()`
+- [x] If secrets detected: return `SecretDetectedError`
+- [x] Error message is user-friendly, doesn't reveal secret
+- [x] Logs detection via AuditLogger (pattern name + count, not values)
 
 ```go
 var PrePromptSecretHook = &Hook{
@@ -19568,38 +19568,38 @@ var PrePromptSecretHook = &Hook{
 ```
 
 #### SecretDetectedError
-- [ ] Custom error type with Message, Findings
-- [ ] Implements `error` interface
-- [ ] User-facing message suggests using env vars
+- [x] Custom error type with Message, Findings
+- [x] Implements `error` interface
+- [x] User-facing message suggests using env vars
 
 **Tests:**
-- [ ] Prompt with API key is rejected
-- [ ] Prompt with password is rejected
-- [ ] Prompt with private key is rejected
-- [ ] Clean prompt passes through
-- [ ] Error message doesn't contain the secret
-- [ ] Audit log entry created
+- [x] Prompt with API key is rejected
+- [x] Prompt with password is rejected
+- [x] Prompt with private key is rejected
+- [x] Clean prompt passes through
+- [x] Error message doesn't contain the secret
+- [x] Audit log entry created
 
 ---
 
-### 6.116 Tool Output Sanitization Hook
+### 6.116 Tool Output Sanitization Hook ✅ COMPLETED
 
 Redacts secrets from tool output before LLM context.
 
-**Files to create:**
-- Extends `core/security/hooks.go`
-- Extends `core/security/hooks_test.go`
+**Files created:**
+- Extended `core/security/hooks.go` ✅
+- Extended `core/security/hooks_test.go` ✅
 
 **Dependencies:** 6.114 (SecretSanitizer Service)
 
 **Acceptance Criteria:**
 
 #### PostToolSecretHook
-- [ ] Hook type: PostTool, Priority: Last
-- [ ] Calls `sanitizer.SanitizeToolOutput()`
-- [ ] Modifies `data.Output` in-place with redacted version
-- [ ] Logs redaction count via AuditLogger
-- [ ] Skips empty output (short-circuit)
+- [x] Hook type: PostTool, Priority: Last
+- [x] Calls `sanitizer.SanitizeToolOutput()`
+- [x] Modifies `data.Output` in-place with redacted version
+- [x] Logs redaction count via AuditLogger
+- [x] Skips empty output (short-circuit)
 
 ```go
 var PostToolSecretHook = &Hook{
@@ -19613,35 +19613,35 @@ var PostToolSecretHook = &Hook{
 ```
 
 **Tests:**
-- [ ] Tool output with secrets is redacted
-- [ ] Multiple secrets in output all redacted
-- [ ] Output without secrets unchanged
-- [ ] Audit log entry for redaction
-- [ ] Empty output handled gracefully
+- [x] Tool output with secrets is redacted
+- [x] Multiple secrets in output all redacted
+- [x] Output without secrets unchanged
+- [x] Audit log entry for redaction
+- [x] Empty output handled gracefully
 
 ---
 
-### 6.117 Environment Variable Isolation Hook
+### 6.117 Environment Variable Isolation Hook ✅ COMPLETED
 
 Prevents env vars from being passed as tool parameters.
 
-**Files to create:**
-- Extends `core/security/hooks.go`
-- Extends `core/security/hooks_test.go`
+**Files created:**
+- Extended `core/security/hooks.go` ✅
+- Extended `core/security/hooks_test.go` ✅
 
 **Dependencies:** 6.113 (Secret Pattern Definitions)
 
 **Acceptance Criteria:**
 
 #### EnvVarPattern
-- [ ] Regex to detect env var references: `\$\{?([A-Z_][A-Z0-9_]*)\}?`
+- [x] Regex to detect env var references: `\$\{?([A-Z_][A-Z0-9_]*)\}?`
 
 #### PreToolEnvVarHook
-- [ ] Hook type: PreTool, Priority: First
-- [ ] Iterates all string parameters
-- [ ] Checks for env var pattern + secret pattern match
-- [ ] If injection detected: return `EnvVarInjectionError`
-- [ ] Logs attempt via AuditLogger
+- [x] Hook type: PreTool, Priority: First
+- [x] Iterates all string parameters
+- [x] Checks for env var pattern + secret pattern match
+- [x] If injection detected: return `EnvVarInjectionError`
+- [x] Logs attempt via AuditLogger
 
 ```go
 var PreToolEnvVarHook = &Hook{
@@ -19655,40 +19655,40 @@ var PreToolEnvVarHook = &Hook{
 ```
 
 #### EnvVarInjectionError
-- [ ] Custom error type with Message, ToolName, ParamName
-- [ ] User-facing message explains tools read env vars internally
+- [x] Custom error type with Message, ToolName, ParamName
+- [x] User-facing message explains tools read env vars internally
 
 **Tests:**
-- [ ] Parameter with connection string rejected
-- [ ] Parameter with API key value rejected
-- [ ] Normal string parameters allowed
-- [ ] File paths allowed
-- [ ] Audit log entry for injection attempt
+- [x] Parameter with connection string rejected
+- [x] Parameter with API key value rejected
+- [x] Normal string parameters allowed
+- [x] File paths allowed
+- [x] Audit log entry for injection attempt
 
 ---
 
-### 6.118 Librarian Pre-Index Hook
+### 6.118 Librarian Pre-Index Hook ✅ COMPLETED
 
 Sanitizes content before vector DB storage.
 
-**Files to create:**
-- `agents/librarian/index_hooks.go`
-- `agents/librarian/index_hooks_test.go`
+**Files created:**
+- `agents/librarian/index_hooks.go` ✅
+- `agents/librarian/index_hooks_test.go` ✅
 
 **Dependencies:** 6.114 (SecretSanitizer Service), existing Librarian indexing
 
 **Acceptance Criteria:**
 
 #### IndexHookData
-- [ ] `IndexHookData` struct with FilePath, Content, Metadata
-- [ ] Used by Librarian pre-index hooks
+- [x] `IndexHookData` struct with FilePath, Content, Metadata
+- [x] Used by Librarian pre-index hooks
 
 #### LibrarianPreIndexHook
-- [ ] Hook type: PreIndex (Librarian-specific), Priority: First
-- [ ] Calls `sanitizer.SanitizeForIndex()`
-- [ ] Replaces `data.Content` with sanitized version
-- [ ] Adds metadata: `sanitized`, `redaction_count`, `skipped`
-- [ ] Logs skipped files and redactions
+- [x] Hook type: PreIndex (Librarian-specific), Priority: First
+- [x] Calls `sanitizer.SanitizeForIndex()`
+- [x] Replaces `data.Content` with sanitized version
+- [x] Adds metadata: `sanitized`, `redaction_count`, `skipped`
+- [x] Logs skipped files and redactions
 
 ```go
 var LibrarianPreIndexHook = &Hook{
@@ -19702,41 +19702,41 @@ var LibrarianPreIndexHook = &Hook{
 ```
 
 #### Librarian Integration
-- [ ] Hook registered in Librarian indexing pipeline
-- [ ] Metadata stored with indexed content
-- [ ] Queries can filter by `sanitized` metadata
+- [x] Hook registered in Librarian indexing pipeline
+- [x] Metadata stored with indexed content
+- [x] Queries can filter by `sanitized` metadata
 
 **Tests:**
-- [ ] .env file replaced with stub
-- [ ] *.pem file replaced with stub
-- [ ] Config file with secrets has secrets redacted
-- [ ] Normal code file unchanged
-- [ ] Metadata correctly set
-- [ ] Indexing continues without errors
+- [x] .env file replaced with stub
+- [x] *.pem file replaced with stub
+- [x] Config file with secrets has secrets redacted
+- [x] Normal code file unchanged
+- [x] Metadata correctly set
+- [x] Indexing continues without errors
 
 ---
 
-### 6.119 Inter-Agent Sanitization Hook
+### 6.119 Inter-Agent Sanitization Hook ✅ COMPLETED
 
 Redacts secrets in agent-to-agent communication.
 
-**Files to create:**
-- `core/security/dispatch_hooks.go`
-- `core/security/dispatch_hooks_test.go`
+**Files created:**
+- `core/security/dispatch_hooks.go` ✅
+- `core/security/dispatch_hooks_test.go` ✅
 
 **Dependencies:** 6.114 (SecretSanitizer Service), existing dispatch system
 
 **Acceptance Criteria:**
 
 #### DispatchHookData
-- [ ] `DispatchHookData` struct with SourceAgent, TargetAgent, Message
-- [ ] Used by inter-agent dispatch hooks
+- [x] `DispatchHookData` struct with SourceAgent, TargetAgent, Message
+- [x] Used by inter-agent dispatch hooks
 
 #### InterAgentSecretHook
-- [ ] Hook type: PreDispatch, Priority: Last
-- [ ] Calls `sanitizer.SanitizeToolOutput()` on message
-- [ ] Replaces `data.Message` with sanitized version
-- [ ] Logs redaction with source/target agent names
+- [x] Hook type: PreDispatch, Priority: Last
+- [x] Calls `sanitizer.SanitizeToolOutput()` on message
+- [x] Replaces `data.Message` with sanitized version
+- [x] Logs redaction with source/target agent names
 
 ```go
 var InterAgentSecretHook = &Hook{
@@ -19750,97 +19750,97 @@ var InterAgentSecretHook = &Hook{
 ```
 
 **Tests:**
-- [ ] Message with secrets redacted before dispatch
-- [ ] Source and target agent logged
-- [ ] Clean message unchanged
-- [ ] All agent pairs covered
+- [x] Message with secrets redacted before dispatch
+- [x] Source and target agent logged
+- [x] Clean message unchanged
+- [x] All agent pairs covered
 
 ---
 
-### 6.120 Proactive Validation Skills
+### 6.120 Proactive Validation Skills ✅ COMPLETED
 
 Skills for agents to actively validate content.
 
-**Files to create:**
-- `core/security/skills.go`
-- `core/security/skills_test.go`
+**Files created:**
+- `core/security/skills.go` ✅
+- `core/security/skills_test.go` ✅
 
 **Dependencies:** 6.114 (SecretSanitizer Service), skill system
 
 **Acceptance Criteria:**
 
 #### validate_content Skill
-- [ ] Domain: security
-- [ ] Input: content string
-- [ ] Output: safe (bool), findings (array), suggestion (string)
-- [ ] Calls `sanitizer.CheckUserPrompt()` internally
-- [ ] Returns actionable suggestion
+- [x] Domain: security
+- [x] Input: content string
+- [x] Output: safe (bool), findings (array), suggestion (string)
+- [x] Calls `sanitizer.CheckUserPrompt()` internally
+- [x] Returns actionable suggestion
 
 #### check_file_sensitivity Skill
-- [ ] Domain: security
-- [ ] Input: path string
-- [ ] Output: sensitive (bool), pattern (string), handling (string)
-- [ ] Checks against `SensitiveFilePatterns`
-- [ ] Returns handling recommendation: skip|redact|normal
+- [x] Domain: security
+- [x] Input: path string
+- [x] Output: sensitive (bool), pattern (string), handling (string)
+- [x] Checks against `SensitiveFilePatterns`
+- [x] Returns handling recommendation: skip|redact|normal
 
 #### sanitize_for_display Skill
-- [ ] Domain: security
-- [ ] Input: content string
-- [ ] Output: sanitized (string), redaction_count (int)
-- [ ] Calls `sanitizer.SanitizeToolOutput()` internally
-- [ ] For agents that want to show content safely
+- [x] Domain: security
+- [x] Input: content string
+- [x] Output: sanitized (string), redaction_count (int)
+- [x] Calls `sanitizer.SanitizeToolOutput()` internally
+- [x] For agents that want to show content safely
 
 **Tests:**
-- [ ] validate_content detects secrets
-- [ ] check_file_sensitivity identifies .env
-- [ ] sanitize_for_display redacts correctly
-- [ ] Skills registered in skill registry
+- [x] validate_content detects secrets
+- [x] check_file_sensitivity identifies .env
+- [x] sanitize_for_display redacts correctly
+- [x] Skills registered in skill registry
 
 ---
 
-### 6.121 Secret Management Integration Tests
+### 6.121 Secret Management Integration Tests ✅ COMPLETED
 
 End-to-end tests for secret management system.
 
-**Files to create:**
-- `tests/e2e/secret_management_test.go`
-- `tests/fixtures/secret_test_files/`
+**Files created:**
+- `tests/e2e/secret_management_test.go` ✅
+- `tests/fixtures/secret_test_files/` ✅
 
 **Dependencies:** 6.113-6.120
 
 **Test Scenarios:**
 
 #### User Prompt Flow
-- [ ] Prompt with API key → rejected with helpful message
-- [ ] Prompt with private key → rejected
-- [ ] Clean prompt → passes through
+- [x] Prompt with API key → rejected with helpful message
+- [x] Prompt with private key → rejected
+- [x] Clean prompt → passes through
 
 #### Librarian Indexing Flow
-- [ ] Index .env file → stub stored, not content
-- [ ] Index config with secrets → secrets redacted in index
-- [ ] Query for .env → returns "exists but not indexed"
-- [ ] Normal code → indexed without changes
+- [x] Index .env file → stub stored, not content
+- [x] Index config with secrets → secrets redacted in index
+- [x] Query for .env → returns "exists but not indexed"
+- [x] Normal code → indexed without changes
 
 #### Tool Output Flow
-- [ ] Tool returns connection string → redacted before context
-- [ ] Tool returns clean output → unchanged
+- [x] Tool returns connection string → redacted before context
+- [x] Tool returns clean output → unchanged
 
 #### Agent-to-Agent Flow
-- [ ] Engineer sends message with secret → redacted in transit
-- [ ] Architect receives sanitized version
+- [x] Engineer sends message with secret → redacted in transit
+- [x] Architect receives sanitized version
 
 #### Env Var Isolation Flow
-- [ ] Tool called with API key param → rejected
-- [ ] Tool called with normal param → allowed
-- [ ] Tool reads from os.Getenv internally → works
+- [x] Tool called with API key param → rejected
+- [x] Tool called with normal param → allowed
+- [x] Tool reads from os.Getenv internally → works
 
 **Acceptance Criteria:**
-- [ ] All test scenarios passing
-- [ ] No secrets leak to LLM context
-- [ ] Audit log entries for all security events
-- [ ] Metrics accurately tracked
-- [ ] No false positives on common code patterns
-- [ ] Performance: < 1ms per sanitization
+- [x] All test scenarios passing
+- [x] No secrets leak to LLM context
+- [x] Audit log entries for all security events
+- [x] Metrics accurately tracked
+- [x] No false positives on common code patterns
+- [x] Performance: < 1ms per sanitization
 
 ---
 
@@ -19875,33 +19875,33 @@ All can execute fully in parallel.
 
 Secure agent credential access through opaque handles and just-in-time injection. Integrates with Secret Management for defense-in-depth.
 
-### 6.122 Credential Scope Definitions
+### 6.122 Credential Scope Definitions ✅ COMPLETED
 
 Agent-to-credential permission mappings.
 
-**Files to create:**
-- `core/credentials/scopes.go`
-- `core/credentials/scopes_test.go`
+**Files created:**
+- `core/credentials/scopes.go` ✅
+- `core/credentials/scopes_test.go` ✅
 
 **Dependencies:** None (foundational)
 
 **Acceptance Criteria:**
 
 #### CredentialScope Struct
-- [ ] `CredentialScope` with AgentType, Allowed, Denied, RequireAuth
-- [ ] Allowed: list of provider names agent can access
-- [ ] Denied: explicit denials (override allowed, supports "*")
-- [ ] RequireAuth: boolean for first-time user confirmation
+- [x] `CredentialScope` with AgentType, Allowed, Denied, RequireAuth
+- [x] Allowed: list of provider names agent can access
+- [x] Denied: explicit denials (override allowed, supports "*")
+- [x] RequireAuth: boolean for first-time user confirmation
 
 #### Default Scopes
-- [ ] Librarian: openai, anthropic, voyage (NO github, aws)
-- [ ] Academic: openai, anthropic, google, serpapi (NO github, aws)
-- [ ] Archivalist: openai, anthropic (NO github, aws)
-- [ ] Engineer: openai, anthropic, github (RequireAuth for github)
-- [ ] Designer: openai, anthropic, figma (RequireAuth for figma)
-- [ ] Inspector/Tester: openai, anthropic (NO external mutations)
-- [ ] Guide/Architect: openai, anthropic only
-- [ ] Orchestrator: NO credentials (coordinates others)
+- [x] Librarian: openai, anthropic, voyage (NO github, aws)
+- [x] Academic: openai, anthropic, google, serpapi (NO github, aws)
+- [x] Archivalist: openai, anthropic (NO github, aws)
+- [x] Engineer: openai, anthropic, github (RequireAuth for github)
+- [x] Designer: openai, anthropic, figma (RequireAuth for figma)
+- [x] Inspector/Tester: openai, anthropic (NO external mutations)
+- [x] Guide/Architect: openai, anthropic only
+- [x] Orchestrator: NO credentials (coordinates others)
 
 ```go
 type CredentialScope struct {
@@ -19913,41 +19913,41 @@ type CredentialScope struct {
 ```
 
 #### Project Overrides
-- [ ] `ProjectCredentialOverrides` struct
-- [ ] Loaded from `.sylk/config.yaml`
-- [ ] Merges with defaults (project can restrict, not expand)
+- [x] `ProjectCredentialOverrides` struct
+- [x] Loaded from `.sylk/config.yaml`
+- [x] Merges with defaults (project can restrict, not expand)
 
 **Tests:**
-- [ ] Default scopes correctly defined for all agents
-- [ ] Deny list overrides allow list
-- [ ] Wildcard "*" deny blocks all
-- [ ] Project overrides merge correctly
+- [x] Default scopes correctly defined for all agents
+- [x] Deny list overrides allow list
+- [x] Wildcard "*" deny blocks all
+- [x] Project overrides merge correctly
 
 ---
 
-### 6.123 Credential Handle System
+### 6.123 Credential Handle System ✅ COMPLETED
 
 Opaque handles for single-use credential access.
 
-**Files to create:**
-- `core/credentials/handle.go`
-- `core/credentials/handle_test.go`
+**Files created:**
+- `core/credentials/handle.go` ✅
+- `core/credentials/handle_test.go` ✅
 
 **Dependencies:** 6.122 (Credential Scope Definitions)
 
 **Acceptance Criteria:**
 
 #### CredentialHandle Struct
-- [ ] ID, Provider, AgentID, AgentType, ToolCallID
-- [ ] CreatedAt, ExpiresAt timestamps
-- [ ] Used boolean (single-use enforcement)
-- [ ] value string (internal, never serialized)
+- [x] ID, Provider, AgentID, AgentType, ToolCallID
+- [x] CreatedAt, ExpiresAt timestamps
+- [x] Used boolean (single-use enforcement)
+- [x] value string (internal, never serialized)
 
 #### Handle Lifecycle
-- [ ] HandleLifetime constant (default 30 seconds)
-- [ ] `generateHandleID()` creates unique IDs
-- [ ] Handles expire automatically after lifetime
-- [ ] Handles invalidate after single use
+- [x] HandleLifetime constant (default 30 seconds)
+- [x] `generateHandleID()` creates unique IDs
+- [x] Handles expire automatically after lifetime
+- [x] Handles invalidate after single use
 
 ```go
 type CredentialHandle struct {
@@ -19964,55 +19964,55 @@ type CredentialHandle struct {
 ```
 
 **Tests:**
-- [ ] Handle creation with correct expiry
-- [ ] Handle expires after lifetime
-- [ ] Handle invalidates after use
-- [ ] Cannot reuse handle
-- [ ] value never appears in JSON/YAML
+- [x] Handle creation with correct expiry
+- [x] Handle expires after lifetime
+- [x] Handle invalidates after use
+- [x] Cannot reuse handle
+- [x] value never appears in JSON/YAML
 
 ---
 
-### 6.124 Credential Broker Service
+### 6.124 Credential Broker Service ✅ COMPLETED
 
 Core broker managing credential access.
 
-**Files to create:**
-- `core/credentials/broker.go`
-- `core/credentials/broker_test.go`
+**Files created:**
+- `core/credentials/broker.go` ✅
+- `core/credentials/broker_test.go` ✅
 
 **Dependencies:** 6.122, 6.123, existing CredentialManager
 
 **Acceptance Criteria:**
 
 #### CredentialBroker Struct
-- [ ] References CredentialManager (fetches actual credentials)
-- [ ] Scopes map with defaults + project overrides
-- [ ] Active handles map with mutex
-- [ ] Audit log reference
+- [x] References CredentialManager (fetches actual credentials)
+- [x] Scopes map with defaults + project overrides
+- [x] Active handles map with mutex
+- [x] Audit log reference
 
 #### RequestCredential Method
-- [ ] Check scope permissions (isAllowed)
-- [ ] Check RequireAuth (first-time confirmation)
-- [ ] Fetch from CredentialManager
-- [ ] Create time-limited handle
-- [ ] Log GRANTED event
-- [ ] Return handle (NOT raw credential)
+- [x] Check scope permissions (isAllowed)
+- [x] Check RequireAuth (first-time confirmation)
+- [x] Fetch from CredentialManager
+- [x] Create time-limited handle
+- [x] Log GRANTED event
+- [x] Return handle (NOT raw credential)
 
 #### ResolveHandle Method
-- [ ] Validate handle exists
-- [ ] Check not expired
-- [ ] Check not already used
-- [ ] Mark as used
-- [ ] Log RESOLVED event
-- [ ] Return actual credential value
+- [x] Validate handle exists
+- [x] Check not expired
+- [x] Check not already used
+- [x] Mark as used
+- [x] Log RESOLVED event
+- [x] Return actual credential value
 
 #### RevokeHandle Method
-- [ ] Remove handle from active map
-- [ ] Log REVOKED event
+- [x] Remove handle from active map
+- [x] Log REVOKED event
 
 #### Cleanup Goroutine
-- [ ] Periodic cleanup of expired handles (every 10s)
-- [ ] Thread-safe cleanup
+- [x] Periodic cleanup of expired handles (every 10s)
+- [x] Thread-safe cleanup
 
 ```go
 func (b *CredentialBroker) RequestCredential(
@@ -20024,52 +20024,52 @@ func (b *CredentialBroker) ResolveHandle(handleID string) (string, error)
 ```
 
 **Tests:**
-- [ ] Request for allowed provider succeeds
-- [ ] Request for denied provider fails with CredentialAccessDeniedError
-- [ ] Request for unknown provider fails (default deny)
-- [ ] RequireAuth triggers user confirmation
-- [ ] Handle resolves to correct credential
-- [ ] Expired handle resolution fails
-- [ ] Used handle resolution fails
-- [ ] Concurrent requests thread-safe
+- [x] Request for allowed provider succeeds
+- [x] Request for denied provider fails with CredentialAccessDeniedError
+- [x] Request for unknown provider fails (default deny)
+- [x] RequireAuth triggers user confirmation
+- [x] Handle resolves to correct credential
+- [x] Expired handle resolution fails
+- [x] Used handle resolution fails
+- [x] Concurrent requests thread-safe
 
 ---
 
-### 6.125 Just-in-Time Injection Hooks
+### 6.125 Just-in-Time Injection Hooks ✅ COMPLETED
 
 Pre/post tool hooks for credential injection.
 
-**Files to create:**
-- `core/credentials/hooks.go`
-- `core/credentials/hooks_test.go`
+**Files created:**
+- `core/credentials/hooks.go` ✅
+- `core/credentials/hooks_test.go` ✅
 
 **Dependencies:** 6.124 (Credential Broker), hook system
 
 **Acceptance Criteria:**
 
 #### CredentialContext Struct
-- [ ] Wraps broker + handleID
-- [ ] `Credential()` method resolves handle
-- [ ] Caches resolved value for single tool execution
-- [ ] Clears value on cleanup
+- [x] Wraps broker + handleID
+- [x] `Credential()` method resolves handle
+- [x] Caches resolved value for single tool execution
+- [x] Clears value on cleanup
 
 #### PreToolCredentialHook
-- [ ] Type: PreTool, Priority: Early (after env_var_isolation)
-- [ ] Look up tool metadata for RequiredCredentials
-- [ ] Skip if tool needs no credentials
-- [ ] Request handle for each required credential
-- [ ] Inject CredentialContext map into tool context
-- [ ] Fail tool call if any credential request fails
+- [x] Type: PreTool, Priority: Early (after env_var_isolation)
+- [x] Look up tool metadata for RequiredCredentials
+- [x] Skip if tool needs no credentials
+- [x] Request handle for each required credential
+- [x] Inject CredentialContext map into tool context
+- [x] Fail tool call if any credential request fails
 
 #### PostToolCredentialHook
-- [ ] Type: PostTool, Priority: Last
-- [ ] Revoke any unused handles
-- [ ] Clear credential values from CredentialContext
-- [ ] Ensure no credential leakage
+- [x] Type: PostTool, Priority: Last
+- [x] Revoke any unused handles
+- [x] Clear credential values from CredentialContext
+- [x] Ensure no credential leakage
 
 #### Context Key
-- [ ] `credentialContextKey` for context value storage
-- [ ] Type-safe context accessor functions
+- [x] `credentialContextKey` for context value storage
+- [x] Type-safe context accessor functions
 
 ```go
 var PreToolCredentialHook = &Hook{
@@ -20081,12 +20081,12 @@ var PreToolCredentialHook = &Hook{
 ```
 
 **Tests:**
-- [ ] Tool with credential requirement gets injected context
-- [ ] Tool without requirements gets no injection
-- [ ] Multiple credentials injected correctly
-- [ ] Unused handles revoked on cleanup
-- [ ] Credential values cleared after execution
-- [ ] Hook ordering correct (after env_var_isolation)
+- [x] Tool with credential requirement gets injected context
+- [x] Tool without requirements gets no injection
+- [x] Multiple credentials injected correctly
+- [x] Unused handles revoked on cleanup
+- [x] Credential values cleared after execution
+- [x] Hook ordering correct (after env_var_isolation)
 
 ---
 
@@ -23603,14 +23603,168 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 6D: Git & Analysis Skills                                         ││
-│ │ • Git Tooling System                                                             ││
-│ │ • Analysis Skills Orchestration                                                  ││
-│ │ • Lazy Tool Loading                                                              ││
+│ │ PARALLEL GROUP 6D: Git Tooling System (EXPANDED)                                 ││
+│ │ ** FROM ARCHITECTURE.md lines 30068-30989 **                                     ││
+│ │                                                                                  ││
+│ │ GIT PERMISSION MATRIX:                                                           ││
+│ │ • Engineer: git_status, git_diff, git_log, git_show, git_blame, git_ls_files,   ││
+│ │             git_add, git_commit, git_stash (9 skills, conditional commit)        ││
+│ │ • Designer: Same as Engineer (9 skills, conditional commit)                      ││
+│ │ • Inspector: git_diff, git_log, git_show, git_blame (4 skills, read-only)       ││
+│ │ • Tester: git_diff, git_log, git_show, git_commit (4 skills, conditional)       ││
+│ │ • Architect: Full access including git_branch, git_merge, git_rebase,           ││
+│ │              git_push, git_fetch (11 skills)                                     ││
+│ │ • Librarian: git_log, git_show, git_diff, git_blame, git_ls_files (5 skills)    ││
+│ │                                                                                  ││
+│ │ HOOK IMPLEMENTATIONS:                                                            ││
+│ │ • Auto-Commit Hook (for Engineer/Designer when tests pass)                       ││
+│ │ • Permission Enforcement Hook (validate agent permissions)                       ││
+│ │ • Git Operation Audit Hook (log all git operations to Archivalist)               ││
+│ │ • Conditional Commit Hooks (Tester: only if tests pass)                          ││
+│ │                                                                                  ││
+│ │ TOTAL: 42+ Git skills across agents, 4 hooks                                     ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 6E: Core Agent Skill Gaps (Foundational)                          ││
+│ │ PARALLEL GROUP 6E: Analysis Skills Orchestration (EXPANDED)                      ││
+│ │ ** FROM ARCHITECTURE.md lines 31032-31850 **                                     ││
+│ │                                                                                  ││
+│ │ INSPECTOR ANALYSIS SKILLS:                                                       ││
+│ │ • assess_change_risk - Prioritized findings with context + history               ││
+│ │ • explain_finding - Semantic explanation with project-specific fix               ││
+│ │ • validate_architecture - Enforce project-specific arch rules                    ││
+│ │ • evaluate_blast_radius - Identify affected files when changing code             ││
+│ │                                                                                  ││
+│ │ TESTER ANALYSIS SKILLS:                                                          ││
+│ │ • prioritize_test_targets - Coverage + complexity + changes + bug history        ││
+│ │ • assess_test_quality - Evaluate tests beyond coverage (assertions, mutations)   ││
+│ │ • suggest_test_cases - Generate specific test cases from code analysis           ││
+│ │ • identify_coverage_gaps - Find uncovered code in changed lines                  ││
+│ │                                                                                  ││
+│ │ NON-REDUNDANCY PRINCIPLE:                                                        ││
+│ │ • Analysis skills ORCHESTRATE existing tools (LSP, lint, coverage)               ││
+│ │ • They ADD CONTEXT that static tools lack (task, history, patterns)              ││
+│ │ • They do NOT reimplement what tools already do                                  ││
+│ │                                                                                  ││
+│ │ SKILL BUNDLES for Lazy Loading:                                                  ││
+│ │ • inspector_analysis: 4 skills                                                   ││
+│ │ • tester_analysis: 4 skills                                                      ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6F: Lazy Tool Loading System (EXPANDED)                           ││
+│ │ ** FROM ARCHITECTURE.md lines 29341-30056 **                                     ││
+│ │                                                                                  ││
+│ │ ARCHITECTURE:                                                                    ││
+│ │ • ToolManifest: metadata, dependencies, categories, bundles                      ││
+│ │ • LazyToolRegistry: thread-safe registry with load-on-demand                     ││
+│ │ • request_tools skill: Universal meta-skill for on-demand loading                ││
+│ │                                                                                  ││
+│ │ DESIGNER TOOL BUNDLES:                                                           ││
+│ │ • component: component_search, component_create, component_modify                ││
+│ │ • design_system: token_validate, token_suggest, palette_generate                 ││
+│ │ • accessibility: a11y_audit, a11y_fix_suggest, contrast_check                    ││
+│ │ • layout: grid_analyze, responsive_check, spacing_audit                          ││
+│ │ • preview: screenshot, visual_diff, device_preview                               ││
+│ │                                                                                  ││
+│ │ ENGINEER TOOL BUNDLES:                                                           ││
+│ │ • file_ops: read_file, write_file, edit_file, glob, grep                         ││
+│ │ • execution: run_command, run_tests, build_project                               ││
+│ │ • refactoring: rename_symbol, extract_function, inline_function                  ││
+│ │                                                                                  ││
+│ │ HOOK INTEGRATION:                                                                ││
+│ │ • tool_access_hook: Inject tools based on detected needs                         ││
+│ │ • auto_suggest: Pattern learning for bundle recommendations                      ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6G: Hook System Foundation (NEW)                                  ││
+│ │ ** FROM ARCHITECTURE.md lines 27856-27916 **                                     ││
+│ │                                                                                  ││
+│ │ HOOK TYPES:                                                                      ││
+│ │ • HookPriority: HIGHEST=0, HIGH=25, NORMAL=50, LOW=75, LOWEST=100               ││
+│ │ • PromptHookFunc: Modify system prompt before LLM call                           ││
+│ │ • ToolCallHookFunc: Intercept/modify tool calls                                  ││
+│ │                                                                                  ││
+│ │ EXECUTION FLOW:                                                                  ││
+│ │ • Pre-Prompt Hooks: Context injection, cache lookup                              ││
+│ │ • Post-Prompt Hooks: Response logging, cache storage                             ││
+│ │ • Pre-Tool Hooks: Permission validation, operation tracking                      ││
+│ │ • Post-Tool Hooks: Result processing, audit logging                              ││
+│ │                                                                                  ││
+│ │ HOOK REGISTRY:                                                                   ││
+│ │ • Register by agent type + execution phase                                       ││
+│ │ • Priority-ordered execution                                                     ││
+│ │ • Chain-of-responsibility pattern                                                ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6H: Per-Agent Hooks (NEW)                                         ││
+│ │ ** FROM ARCHITECTURE.md lines 27920-28787 **                                     ││
+│ │                                                                                  ││
+│ │ GUIDE HOOKS:                                                                     ││
+│ │ • session_context_injection - Inject session state into prompt                   ││
+│ │ • route_cache_lookup - Check cache before classification                         ││
+│ │ • route_cache_store - Store classification in cache                              ││
+│ │                                                                                  ││
+│ │ ARCHIVALIST HOOKS:                                                               ││
+│ │ • cross_session_query_handler - Query across sessions                            ││
+│ │ • entry_session_tagging - Auto-tag entries with session ID                       ││
+│ │ • pattern_promotion_check - Check for cross-session promotion                    ││
+│ │                                                                                  ││
+│ │ ENGINEER HOOKS:                                                                  ││
+│ │ • file_operation_tracking - Track all file ops for Archivalist                   ││
+│ │ • consultation_logging - Log all agent consultations                             ││
+│ │ • failure_counter - Track consecutive failures                                   ││
+│ │ • failure_protocol_injection - Inject recovery protocol on failure               ││
+│ │ • checkpoint_creation - Create checkpoints before risky operations               ││
+│ │                                                                                  ││
+│ │ DESIGNER HOOKS:                                                                  ││
+│ │ • inject_pipeline_context - Add task/history context to prompt                   ││
+│ │ • inject_design_tokens - Inject current design token values                      ││
+│ │ • inject_component_index - Inject existing component list                        ││
+│ │ • validate_component_search_first - Block creation without search                ││
+│ │ • validate_accessibility_required - Block completion without a11y check          ││
+│ │ • validate_token_usage - Verify all values use tokens                            ││
+│ │ • auto_accessibility_check - Run a11y check on tool completion                   ││
+│ │ • record_component_creation - Record new components to Archivalist               ││
+│ │                                                                                  ││
+│ │ TOTAL: 19+ agent-specific hooks                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6I: Dynamic Tool Discovery Protocol (NEW)                         ││
+│ │ ** FROM ARCHITECTURE.md lines 28791-29340 **                                     ││
+│ │                                                                                  ││
+│ │ THREE-TIER DISCOVERY ESCALATION:                                                 ││
+│ │ • Tier 1: Librarian Detection (fast, local)                                      ││
+│ │   - Package manifest parsing (package.json, pyproject.toml, go.mod, etc.)        ││
+│ │   - Config file detection (.eslintrc, .prettierrc, tsconfig.json, etc.)          ││
+│ │   - Binary existence check (/usr/local/bin, ./node_modules/.bin, etc.)           ││
+│ │                                                                                  ││
+│ │ • Tier 2: Academic Research (if Librarian can't find)                            ││
+│ │   - Web search for language-specific tools                                       ││
+│ │   - Documentation lookup for alternatives                                        ││
+│ │   - Recommendation with install commands                                         ││
+│ │                                                                                  ││
+│ │ • Tier 3: User Prompt (if tool requires installation)                            ││
+│ │   - Present options with install commands                                        ││
+│ │   - Allow user to select or provide custom tool                                  ││
+│ │                                                                                  ││
+│ │ LANGUAGE DEFAULTS REGISTRY:                                                      ││
+│ │ • Go: gofmt, golangci-lint, gopls, go test                                       ││
+│ │ • TypeScript/JavaScript: prettier, eslint, typescript-language-server, jest     ││
+│ │ • Python: black, ruff, pyright, pytest                                           ││
+│ │ • Rust: rustfmt, clippy, rust-analyzer, cargo test                               ││
+│ │                                                                                  ││
+│ │ TREE-SITTER GRAMMAR AUTO-INSTALLATION:                                           ││
+│ │ • Detect file types in codebase                                                  ││
+│ │ • Auto-download missing grammars from GitHub releases                            ││
+│ │ • Fallback to compilation if no prebuilt available                               ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6J: Core Agent Skill Gaps (Foundational)                          ││
 │ │ All items in this group can execute in parallel - no interdependencies.          ││
 │ │                                                                                  ││
 │ │ • 6.150 Architect: File & Search Operations (read_file, glob, grep)              ││
@@ -23626,10 +23780,12 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ Specs added to ARCHITECTURE.md - implementation creates the actual skills.       ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 18-22 parallel engineer pipelines                              │
+│ ESTIMATED CAPACITY: 25-32 parallel engineer pipelines (increased for new groups)   │
 │ DEPENDENCIES: Wave 2-3 for tool execution, Wave 5 for knowledge consultation       │
 │ NOTE: Group 6B (Orchestrator) required before Pipeline Variants (6.101-6.112)      │
-│ NOTE: Group 6E items are prerequisites for Groups 6C and 6D effectiveness          │
+│ NOTE: Group 6J items are prerequisites for Groups 6C-6I effectiveness              │
+│ INTERNAL DEPENDENCIES:                                                             │
+│   6A, 6B → 6C, 6J (parallel) → 6D, 6E, 6F (parallel) → 6G → 6H, 6I (parallel)      │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```

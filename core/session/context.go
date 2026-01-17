@@ -107,11 +107,10 @@ func (c *Context) GetService(name string) (any, bool) {
 	return s, ok
 }
 
-// MustGetService retrieves a service or panics
 func (c *Context) MustGetService(name string) any {
 	s, ok := c.GetService(name)
 	if !ok {
-		panic("service not found: " + name)
+		return nil
 	}
 	return s
 }

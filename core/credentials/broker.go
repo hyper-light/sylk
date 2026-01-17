@@ -102,14 +102,20 @@ func (b *CredentialBroker) checkAuthorization(agentType, provider, reason string
 	}
 
 	authKey := agentType + ":" + provider
-	b.mu.RLock()
-	authorized := b.authorizedSet[authKey]
-	b.mu.RUnlock()
-
-	if authorized {
+	if b.isAlreadyAuthorized(authKey) {
 		return nil
 	}
 
+	return b.requestNewAuthorization(authKey, agentType, provider, reason)
+}
+
+func (b *CredentialBroker) isAlreadyAuthorized(authKey string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.authorizedSet[authKey]
+}
+
+func (b *CredentialBroker) requestNewAuthorization(authKey, agentType, provider, reason string) error {
 	if b.authCallback == nil {
 		return ErrAuthRequired
 	}

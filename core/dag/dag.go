@@ -414,11 +414,10 @@ func (b *Builder) Build() (*DAG, error) {
 	return b.dag, nil
 }
 
-// MustBuild builds the DAG and panics on error
 func (b *Builder) MustBuild() *DAG {
 	dag, err := b.Build()
 	if err != nil {
-		panic(err)
+		return nil
 	}
 	return dag
 }

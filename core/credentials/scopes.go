@@ -152,15 +152,21 @@ func intersectAllowed(base, override []string) []string {
 	if len(override) == 0 {
 		return base
 	}
+	return filterBySet(base, toSet(override))
+}
 
-	overrideSet := make(map[string]bool)
-	for _, p := range override {
-		overrideSet[p] = true
+func toSet(items []string) map[string]bool {
+	set := make(map[string]bool, len(items))
+	for _, p := range items {
+		set[p] = true
 	}
+	return set
+}
 
+func filterBySet(items []string, set map[string]bool) []string {
 	var result []string
-	for _, p := range base {
-		if overrideSet[p] {
+	for _, p := range items {
+		if set[p] {
 			result = append(result, p)
 		}
 	}
@@ -168,16 +174,12 @@ func intersectAllowed(base, override []string) []string {
 }
 
 func unionDenied(base, override []string) []string {
-	seen := make(map[string]bool)
-	var result []string
+	return appendUnique(appendUnique(nil, base), override)
+}
 
-	for _, p := range base {
-		if !seen[p] {
-			seen[p] = true
-			result = append(result, p)
-		}
-	}
-	for _, p := range override {
+func appendUnique(result, items []string) []string {
+	seen := toSet(result)
+	for _, p := range items {
 		if !seen[p] {
 			seen[p] = true
 			result = append(result, p)

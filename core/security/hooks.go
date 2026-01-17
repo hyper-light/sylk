@@ -3,7 +3,6 @@ package security
 import (
 	"context"
 	"fmt"
-	"regexp"
 )
 
 type HookType string
@@ -33,7 +32,7 @@ type PromptHookData struct {
 
 type ToolCallHookData struct {
 	ToolName   string
-	Parameters map[string]interface{}
+	Parameters map[string]any
 	Output     string
 	SessionID  string
 	AgentID    string
@@ -114,7 +113,7 @@ func (h *PrePromptSecretHookHandler) logSecretDetection(detection *SecretDetecti
 	entry.Severity = AuditSeveritySecurity
 	entry.SessionID = data.SessionID
 	entry.AgentID = data.AgentID
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"patterns_matched": patternNames,
 		"finding_count":    len(detection.Findings),
 	}
@@ -178,13 +177,11 @@ func (h *PostToolSecretHookHandler) logRedaction(count int, data *ToolCallHookDa
 	entry.SessionID = data.SessionID
 	entry.AgentID = data.AgentID
 	entry.Target = data.ToolName
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"redaction_count": count,
 	}
 	_ = h.auditLogger.Log(entry)
 }
-
-var envVarPattern = regexp.MustCompile(`\$\{?([A-Z_][A-Z0-9_]*)\}?`)
 
 type PreToolEnvVarHookHandler struct {
 	sanitizer   *SecretSanitizer
@@ -211,16 +208,22 @@ func (h *PreToolEnvVarHookHandler) Priority() HookPriority {
 }
 
 func (h *PreToolEnvVarHookHandler) Handle(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
-	if data == nil || data.Parameters == nil {
+	if !h.hasParameters(data) {
 		return data, nil
 	}
+	return h.validateParameters(data)
+}
 
+func (h *PreToolEnvVarHookHandler) hasParameters(data *ToolCallHookData) bool {
+	return data != nil && data.Parameters != nil
+}
+
+func (h *PreToolEnvVarHookHandler) validateParameters(data *ToolCallHookData) (*ToolCallHookData, error) {
 	for name, value := range data.Parameters {
 		if err := h.checkParameter(name, value, data); err != nil {
 			return nil, err
 		}
 	}
-
 	return data, nil
 }
 

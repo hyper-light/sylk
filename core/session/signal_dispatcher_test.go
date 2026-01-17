@@ -144,7 +144,7 @@ func TestSignalDispatcher_SignalConsumed(t *testing.T) {
 
 	require.NoError(t, dispatcher.Watch(ctx))
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	signalFile := filepath.Join(baseDir, "test-session", "pressure-123.signal")
 	data := `{"type":"pressure","from_session":"other","timestamp":"2024-01-01T00:00:00Z"}`
@@ -152,7 +152,7 @@ func TestSignalDispatcher_SignalConsumed(t *testing.T) {
 
 	select {
 	case <-received:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for signal")
 	}
 

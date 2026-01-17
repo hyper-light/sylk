@@ -581,6 +581,7 @@ func TestDegradationController_SelectPauseablePipelines(t *testing.T) {
 
 	dc.RegisterPipelineWithOptions("interactive-low", PriorityLow, true)
 	dc.RegisterPipeline("background-low", PriorityLow)
+	dc.RegisterPipeline("background-medium", PriorityMedium)
 	dc.RegisterPipeline("background-high", PriorityHigh)
 	dc.RegisterPipeline("background-critical", PriorityCritical)
 
@@ -588,8 +589,11 @@ func TestDegradationController_SelectPauseablePipelines(t *testing.T) {
 	candidates := dc.selectPauseablePipelines(LevelCritical)
 	dc.mu.Unlock()
 
+	// At LevelCritical, threshold is PriorityHigh.
+	// Only pipelines with Priority < PriorityHigh are candidates.
+	// That means Low and Medium (not user-interactive).
 	if len(candidates) != 2 {
-		t.Fatalf("expected 2 candidates, got %d", len(candidates))
+		t.Fatalf("expected 2 candidates (low and medium priority), got %d", len(candidates))
 	}
 
 	for _, c := range candidates {
