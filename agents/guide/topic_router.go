@@ -136,23 +136,33 @@ func (r *TopicRouter) Unsubscribe(sub *topicSubscription) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Check if it's an exact match subscription
-	if !hasWildcard(sub.pattern) {
-		subs := r.exact[sub.pattern]
-		for i, s := range subs {
-			if s.id == sub.id {
-				r.exact[sub.pattern] = append(subs[:i], subs[i+1:]...)
-				break
-			}
-		}
-		if len(r.exact[sub.pattern]) == 0 {
-			delete(r.exact, sub.pattern)
-		}
+	if hasWildcard(sub.pattern) {
+		r.unsubscribeWildcard(sub)
 	} else {
-		// Remove from trie
-		r.removePattern(sub.pattern, sub.id)
-		atomic.AddInt64(&r.stats.wildcardRoutes, -1)
+		r.unsubscribeExact(sub)
 	}
+}
+
+func (r *TopicRouter) unsubscribeExact(sub *topicSubscription) {
+	subs := r.exact[sub.pattern]
+	r.exact[sub.pattern] = r.removeSubByID(subs, sub.id)
+	if len(r.exact[sub.pattern]) == 0 {
+		delete(r.exact, sub.pattern)
+	}
+}
+
+func (r *TopicRouter) unsubscribeWildcard(sub *topicSubscription) {
+	r.removePattern(sub.pattern, sub.id)
+	atomic.AddInt64(&r.stats.wildcardRoutes, -1)
+}
+
+func (r *TopicRouter) removeSubByID(subs []*topicSubscription, id int64) []*topicSubscription {
+	for i, s := range subs {
+		if s.id == id {
+			return append(subs[:i], subs[i+1:]...)
+		}
+	}
+	return subs
 }
 
 // Match returns all subscriptions that match a topic
@@ -214,29 +224,45 @@ func (r *TopicRouter) insertPattern(pattern string, sub *topicSubscription) {
 	node := r.root
 
 	for _, seg := range segments {
-		switch seg {
-		case "*":
-			if node.singleWildcard == nil {
-				node.singleWildcard = newTrieNode()
-			}
-			node = node.singleWildcard
-		case "**":
-			if node.multiWildcard == nil {
-				node.multiWildcard = newTrieNode()
-			}
-			node = node.multiWildcard
-		default:
-			child, ok := node.children[seg]
-			if !ok {
-				child = newTrieNode()
-				node.children[seg] = child
-			}
-			node = child
-		}
+		node = r.getOrCreateNode(node, seg)
 	}
 
 	node.isTerminal = true
 	node.subscriptions = append(node.subscriptions, sub)
+}
+
+func (r *TopicRouter) getOrCreateNode(node *trieNode, seg string) *trieNode {
+	switch seg {
+	case "*":
+		return r.getOrCreateSingleWildcard(node)
+	case "**":
+		return r.getOrCreateMultiWildcard(node)
+	default:
+		return r.getOrCreateChildNode(node, seg)
+	}
+}
+
+func (r *TopicRouter) getOrCreateSingleWildcard(node *trieNode) *trieNode {
+	if node.singleWildcard == nil {
+		node.singleWildcard = newTrieNode()
+	}
+	return node.singleWildcard
+}
+
+func (r *TopicRouter) getOrCreateMultiWildcard(node *trieNode) *trieNode {
+	if node.multiWildcard == nil {
+		node.multiWildcard = newTrieNode()
+	}
+	return node.multiWildcard
+}
+
+func (r *TopicRouter) getOrCreateChildNode(node *trieNode, seg string) *trieNode {
+	child, ok := node.children[seg]
+	if !ok {
+		child = newTrieNode()
+		node.children[seg] = child
+	}
+	return child
 }
 
 func (r *TopicRouter) removePattern(pattern string, subID int64) {
@@ -269,22 +295,31 @@ func (r *TopicRouter) navigateToPatternNode(pattern string) (*trieNode, bool) {
 func (r *TopicRouter) nextPatternNode(node *trieNode, segment string) (*trieNode, bool) {
 	switch segment {
 	case "*":
-		if node.singleWildcard == nil {
-			return nil, false
-		}
-		return node.singleWildcard, true
+		return r.getSingleWildcardNode(node)
 	case "**":
-		if node.multiWildcard == nil {
-			return nil, false
-		}
-		return node.multiWildcard, true
+		return r.getMultiWildcardNode(node)
 	default:
-		child, ok := node.children[segment]
-		if !ok {
-			return nil, false
-		}
-		return child, true
+		return r.getChildNode(node, segment)
 	}
+}
+
+func (r *TopicRouter) getSingleWildcardNode(node *trieNode) (*trieNode, bool) {
+	if node.singleWildcard == nil {
+		return nil, false
+	}
+	return node.singleWildcard, true
+}
+
+func (r *TopicRouter) getMultiWildcardNode(node *trieNode) (*trieNode, bool) {
+	if node.multiWildcard == nil {
+		return nil, false
+	}
+	return node.multiWildcard, true
+}
+
+func (r *TopicRouter) getChildNode(node *trieNode, segment string) (*trieNode, bool) {
+	child, ok := node.children[segment]
+	return child, ok
 }
 
 func (r *TopicRouter) removeSubscription(node *trieNode, subID int64) {
@@ -487,22 +522,23 @@ func (f *MessageFilter) Matches(msg *Message) bool {
 	if msg == nil {
 		return false
 	}
-	if !f.matchesSession(msg) {
-		return false
-	}
-	if !f.matchesMessageType(msg) {
-		return false
-	}
-	if !f.matchesPriority(msg) {
-		return false
-	}
-	if !f.matchesSourceAgent(msg) {
-		return false
-	}
-	if !f.matchesTargetAgent(msg) {
-		return false
-	}
-	return f.matchesPredicate(msg)
+	return f.matchesAllCriteria(msg)
+}
+
+func (f *MessageFilter) matchesAllCriteria(msg *Message) bool {
+	return f.matchesBasicCriteria(msg) && f.matchesAdvancedCriteria(msg)
+}
+
+func (f *MessageFilter) matchesBasicCriteria(msg *Message) bool {
+	return f.matchesSession(msg) && f.matchesMessageType(msg) && f.matchesPriority(msg)
+}
+
+func (f *MessageFilter) matchesAdvancedCriteria(msg *Message) bool {
+	return f.matchesAgents(msg) && f.matchesPredicate(msg)
+}
+
+func (f *MessageFilter) matchesAgents(msg *Message) bool {
+	return f.matchesSourceAgent(msg) && f.matchesTargetAgent(msg)
 }
 
 func (f *MessageFilter) matchesSession(msg *Message) bool {
@@ -529,13 +565,21 @@ func (f *MessageFilter) matchesMessageType(msg *Message) bool {
 }
 
 func (f *MessageFilter) matchesPriority(msg *Message) bool {
-	if f.MinPriority != nil && msg.Priority < *f.MinPriority {
-		return false
+	return f.matchesMinPriority(msg) && f.matchesMaxPriority(msg)
+}
+
+func (f *MessageFilter) matchesMinPriority(msg *Message) bool {
+	if f.MinPriority == nil {
+		return true
 	}
-	if f.MaxPriority != nil && msg.Priority > *f.MaxPriority {
-		return false
+	return msg.Priority >= *f.MinPriority
+}
+
+func (f *MessageFilter) matchesMaxPriority(msg *Message) bool {
+	if f.MaxPriority == nil {
+		return true
 	}
-	return true
+	return msg.Priority <= *f.MaxPriority
 }
 
 func (f *MessageFilter) matchesSourceAgent(msg *Message) bool {

@@ -84,7 +84,7 @@ type sessionSubscription struct {
 	topic        string
 	pattern      string // Original pattern (may be wildcard)
 	isWildcard   bool
-	subscription Subscription    // From underlying bus
+	subscription Subscription       // From underlying bus
 	topicSub     *topicSubscription // From router (for wildcards)
 	active       atomic.Bool
 }
@@ -121,28 +121,30 @@ func (sb *SessionBus) Publish(topic string, msg *Message) error {
 		return ErrSessionClosed
 	}
 
-	// Auto-prefix with session ID for local topics
 	fullTopic := sb.resolveTopic(topic)
+	sb.addSessionMetadata(msg)
 
-	// Add session ID to message metadata
-	if msg.Metadata == nil {
-		msg.Metadata = make(map[string]any)
-	}
-	msg.Metadata["session_id"] = sb.sessionID
-
-	// Publish to underlying bus
 	if err := sb.bus.Publish(fullTopic, msg); err != nil {
 		return err
 	}
 
 	atomic.AddInt64(&sb.stats.messagesPublished, 1)
-
-	// If wildcards enabled, also route through topic router
-	if sb.router != nil {
-		sb.routeToWildcardSubscribers(fullTopic, msg)
-	}
+	sb.routeToWildcardsIfEnabled(fullTopic, msg)
 
 	return nil
+}
+
+func (sb *SessionBus) addSessionMetadata(msg *Message) {
+	if msg.Metadata == nil {
+		msg.Metadata = make(map[string]any)
+	}
+	msg.Metadata["session_id"] = sb.sessionID
+}
+
+func (sb *SessionBus) routeToWildcardsIfEnabled(topic string, msg *Message) {
+	if sb.router != nil {
+		sb.routeToWildcardSubscribers(topic, msg)
+	}
 }
 
 // PublishGlobal publishes to a global topic (not session-prefixed)
@@ -230,33 +232,37 @@ func (sb *SessionBus) SubscribeFiltered(topic string, filter *MessageFilter, han
 }
 
 func (sb *SessionBus) subscribe(topic string, handler MessageHandler, async bool) (Subscription, error) {
-	if sb.closed.Load() {
-		return nil, ErrSessionClosed
-	}
-	if handler == nil {
-		return nil, ErrInvalidHandler
+	if err := sb.validateSubscribe(handler); err != nil {
+		return nil, err
 	}
 
-	// Resolve topic (add session prefix)
 	fullTopic := sb.resolveTopic(topic)
-
-	// Wrap handler with session filter
 	filteredHandler := sb.wrapHandler(handler)
 
-	// Subscribe to underlying bus
-	var sub Subscription
-	var err error
-	if async {
-		sub, err = sb.bus.SubscribeAsync(fullTopic, filteredHandler)
-	} else {
-		sub, err = sb.bus.Subscribe(fullTopic, filteredHandler)
-	}
+	sub, err := sb.createBusSubscription(fullTopic, filteredHandler, async)
 	if err != nil {
 		return nil, err
 	}
 
 	sessSub := sb.trackSubscription(fullTopic, topic, false, sub, nil)
 	return sessSub, nil
+}
+
+func (sb *SessionBus) validateSubscribe(handler MessageHandler) error {
+	if sb.closed.Load() {
+		return ErrSessionClosed
+	}
+	if handler == nil {
+		return ErrInvalidHandler
+	}
+	return nil
+}
+
+func (sb *SessionBus) createBusSubscription(topic string, handler MessageHandler, async bool) (Subscription, error) {
+	if async {
+		return sb.bus.SubscribeAsync(topic, handler)
+	}
+	return sb.bus.Subscribe(topic, handler)
 }
 
 func (sb *SessionBus) trackSubscription(topic, pattern string, isWildcard bool, sub Subscription, topicSub *topicSubscription) *sessionSubscription {
@@ -324,15 +330,21 @@ func (sb *SessionBus) unsubscribeLocked(sub *sessionSubscription) {
 		return
 	}
 
+	sb.closeUnderlyingSubscription(sub)
+	sb.closeRouterSubscription(sub)
+	atomic.AddInt64(&sb.stats.subscriptionsActive, -1)
+}
+
+func (sb *SessionBus) closeUnderlyingSubscription(sub *sessionSubscription) {
 	if sub.subscription != nil {
 		_ = sub.subscription.Unsubscribe()
 	}
+}
 
+func (sb *SessionBus) closeRouterSubscription(sub *sessionSubscription) {
 	if sub.topicSub != nil && sb.router != nil {
 		sb.router.Unsubscribe(sub.topicSub)
 	}
-
-	atomic.AddInt64(&sb.stats.subscriptionsActive, -1)
 }
 
 // =============================================================================
@@ -352,21 +364,25 @@ func (sb *SessionBus) resolveTopic(topic string) string {
 
 // isGlobalTopic checks if topic should not be session-prefixed
 func (sb *SessionBus) isGlobalTopic(topic string) bool {
-	// Known global topics
-	switch topic {
-	case TopicAgentRegistry, TopicRoutesLearned:
-		return true
-	}
+	return sb.isKnownGlobalTopic(topic) || sb.hasGlobalPrefix(topic)
+}
 
-	// Topics that start with these prefixes are global
+func (sb *SessionBus) isKnownGlobalTopic(topic string) bool {
+	return topic == TopicAgentRegistry || topic == TopicRoutesLearned
+}
+
+func (sb *SessionBus) hasGlobalPrefix(topic string) bool {
 	globalPrefixes := []string{"agents.", "routes.", "system.", "guide."}
 	for _, prefix := range globalPrefixes {
-		if len(topic) >= len(prefix) && topic[:len(prefix)] == prefix {
+		if topicHasPrefix(topic, prefix) {
 			return true
 		}
 	}
-
 	return false
+}
+
+func topicHasPrefix(topic, prefix string) bool {
+	return len(topic) >= len(prefix) && topic[:len(prefix)] == prefix
 }
 
 func extractAgentFromTopic(topic string) string {
@@ -519,15 +535,20 @@ func (m *SessionBusManager) GetOrCreate(sessionID string) (*SessionBus, error) {
 		return nil, ErrInvalidSessionID
 	}
 
-	// Fast path: check if exists
-	m.mu.RLock()
-	if sb, ok := m.sessions[sessionID]; ok {
-		m.mu.RUnlock()
+	if sb := m.getExisting(sessionID); sb != nil {
 		return sb, nil
 	}
-	m.mu.RUnlock()
 
-	// Slow path: create new
+	return m.createNew(sessionID)
+}
+
+func (m *SessionBusManager) getExisting(sessionID string) *SessionBus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sessions[sessionID]
+}
+
+func (m *SessionBusManager) createNew(sessionID string) (*SessionBus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -536,22 +557,29 @@ func (m *SessionBusManager) GetOrCreate(sessionID string) (*SessionBus, error) {
 		return sb, nil
 	}
 
-	sb, err := NewSessionBus(m.bus, SessionBusConfig{
-		SessionID:       sessionID,
-		EnableWildcards: m.config.EnableWildcards,
-	})
+	sb, err := m.buildSessionBus(sessionID)
 	if err != nil {
 		return nil, err
 	}
 
 	m.sessions[sessionID] = sb
 	atomic.AddInt64(&m.stats.sessionsCreated, 1)
+	m.notifySessionCreated(sessionID, sb)
 
+	return sb, nil
+}
+
+func (m *SessionBusManager) buildSessionBus(sessionID string) (*SessionBus, error) {
+	return NewSessionBus(m.bus, SessionBusConfig{
+		SessionID:       sessionID,
+		EnableWildcards: m.config.EnableWildcards,
+	})
+}
+
+func (m *SessionBusManager) notifySessionCreated(sessionID string, sb *SessionBus) {
 	if m.config.OnSessionCreated != nil {
 		go m.config.OnSessionCreated(sessionID, sb)
 	}
-
-	return sb, nil
 }
 
 // Get returns an existing session bus or nil
@@ -634,9 +662,9 @@ type SessionStartedPayload struct {
 
 // SessionClosedPayload is the payload for session closed events
 type SessionClosedPayload struct {
-	SessionID string        `json:"session_id"`
-	ClosedAt  time.Time     `json:"closed_at"`
-	Duration  time.Duration `json:"duration"`
+	SessionID string          `json:"session_id"`
+	ClosedAt  time.Time       `json:"closed_at"`
+	Duration  time.Duration   `json:"duration"`
 	Stats     SessionBusStats `json:"stats"`
 }
 
