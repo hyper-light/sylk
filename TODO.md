@@ -17739,6 +17739,651 @@ End-to-end tests for credential access system.
 
 ---
 
+## Orchestrator Agent System
+
+The Orchestrator is a read-only intelligent query box for pipeline status and workflow progress. Uses Claude Haiku 4.5 for lightweight status queries and summarization. Faithfully executes Architect's plans with no authority to refuse or modify.
+
+### 6.130 Update Buffer Types
+
+Per-task bounded buffers for status updates with TTL eviction and backpressure.
+
+**Files to create:**
+- `agents/orchestrator/buffer.go`
+- `agents/orchestrator/buffer_test.go`
+- `agents/orchestrator/registry.go`
+- `agents/orchestrator/registry_test.go`
+
+**Dependencies:** None (foundational)
+
+**Acceptance Criteria:**
+
+#### TaskUpdate Struct
+- [ ] `TaskUpdate` with ID, Timestamp, Type, Payload, ExpiresAt
+- [ ] JSON serializable for storage and transmission
+- [ ] `TaskUpdateType` enum: `state_transition`, `tool_call`, `heartbeat`
+
+```go
+type TaskUpdate struct {
+    ID        string          `json:"id"`
+    Timestamp time.Time       `json:"timestamp"`
+    Type      TaskUpdateType  `json:"type"`
+    Payload   json.RawMessage `json:"payload"`
+    ExpiresAt time.Time       `json:"expires_at"`
+}
+```
+
+#### TaskUpdateBuffer Struct
+- [ ] `TaskUpdateBuffer` with mutex, taskID, updates slice, maxSize, ttl, lastUpdate
+- [ ] `Push(update)` adds update with TTL, returns false if full (backpressure)
+- [ ] `Query(since, types)` returns updates matching filter
+- [ ] `Clear()` removes all updates
+- [ ] `evictExpired()` removes entries past TTL
+- [ ] Thread-safe with RWMutex
+
+#### Backpressure Behavior
+- [ ] Evict expired entries before capacity check
+- [ ] Drop NEWEST update when full (preserve history)
+- [ ] Return boolean indicating acceptance
+
+#### BufferRegistry Struct
+- [ ] `BufferRegistry` with mutex, buffers map, config
+- [ ] `GetOrCreate(taskID)` returns or creates buffer
+- [ ] `Get(taskID)` returns buffer or nil
+- [ ] `Delete(taskID)` removes buffer
+- [ ] `Clear()` removes all buffers
+
+#### BufferConfig Struct
+- [ ] `BufferConfig` with DefaultMaxSize (100), DefaultTTL (5m), TaskOverrides map
+- [ ] `TaskBufferConfig` with per-task MaxSize and TTL
+- [ ] Configurable via terminal command
+
+**Tests:**
+- [ ] Push respects capacity limit
+- [ ] Backpressure drops newest (not oldest)
+- [ ] TTL eviction works correctly
+- [ ] Query filters by time and type
+- [ ] Thread-safe under concurrent access
+- [ ] Registry creates/retrieves buffers correctly
+- [ ] Per-task overrides apply correctly
+
+---
+
+### 6.131 Orchestrator Skills
+
+Read-only status query and push skills for the Orchestrator.
+
+**Files to create:**
+- `agents/orchestrator/skills/query_task.go`
+- `agents/orchestrator/skills/query_workflow.go`
+- `agents/orchestrator/skills/push_status.go`
+- `agents/orchestrator/skills/generate_summary.go`
+- `agents/orchestrator/skills/report_failure.go`
+- `agents/orchestrator/skills/*_test.go`
+
+**Dependencies:** 6.130 (Update Buffer Types)
+
+**Acceptance Criteria:**
+
+#### query_task_status Skill
+- [ ] Domain: status
+- [ ] Keywords: status, task, progress, what
+- [ ] Params: task_id (required), include_tool_calls (optional, default true), since (optional)
+- [ ] Returns: task_id, name, status, started_at, duration, tool_calls, last_activity, updates, health
+- [ ] Reads from BufferRegistry (read-only)
+- [ ] Includes health assessment from HealthMonitor
+
+#### query_workflow_status Skill
+- [ ] Domain: status
+- [ ] Keywords: workflow, all, tasks, progress, overview
+- [ ] Params: workflow_id (optional, defaults to current), verbose (optional)
+- [ ] Returns: workflow_id, plan_version, status, progress counts, current_layer, total_layers, tasks, wall_clock
+- [ ] Aggregates all task buffers for workflow
+
+#### push_status_update Skill
+- [ ] Domain: notification
+- [ ] Keywords: push, notify, update, user
+- [ ] Params: task_id (required), update_type (enum: state_change, tool_call, error, completion), message (required), priority (optional)
+- [ ] Routes via Guide to user immediately
+
+#### generate_workflow_summary Skill
+- [ ] Domain: summary
+- [ ] Keywords: summary, compact, archive
+- [ ] Params: workflow_id (optional), include_running (optional, default true)
+- [ ] Returns: OrchestratorSummary object
+- [ ] Generates structured summary for compaction
+
+#### report_failure Skill
+- [ ] Domain: failure
+- [ ] Keywords: failure, error, report, architect
+- [ ] Params: task_id (required), error_type (enum: timeout, error, transient_storm), error_summary (required), attempts (optional)
+- [ ] Routes to Architect via Guide
+
+#### submit_task_event Skill
+- [ ] Domain: archival
+- [ ] Keywords: archive, history, record, event, complete, fail
+- [ ] Params: task_id (required), event_type (enum: completed, failed, cancelled), event_data (object, required)
+- [ ] Returns: archived (bool), event_id (string)
+- [ ] Routes to Archivalist via Guide with ORCHESTRATOR_TASK_EVENT message type
+- [ ] CRITICAL: Called automatically after ANY task reaches terminal state
+
+#### archivalist_request Skill
+- [ ] Domain: archival
+- [ ] Keywords: archivalist, query, store, history, pattern
+- [ ] Params: request_type (enum: query, store, query_patterns, query_failures), payload (object, required), priority (optional)
+- [ ] Returns: response (ArchivalistResponse object), success (bool)
+- [ ] Routes to Archivalist via Guide with ORCHESTRATOR_ARCHIVALIST_REQUEST message type
+- [ ] Uses synchronous request-response pattern (WaitForResponse: true)
+- [ ] Enables pattern queries, failure lookups, decision history queries
+
+**Tests:**
+- [ ] query_task_status returns correct buffer contents
+- [ ] query_workflow_status aggregates all tasks
+- [ ] push_status_update routes via Guide
+- [ ] generate_workflow_summary produces valid schema
+- [ ] report_failure reaches Architect
+- [ ] submit_task_event routes to Archivalist
+- [ ] submit_task_event called for completed tasks
+- [ ] submit_task_event called for failed tasks
+- [ ] submit_task_event called for cancelled tasks
+- [ ] archivalist_request synchronous response works
+- [ ] archivalist_request query_failures returns patterns
+
+---
+
+### 6.132 Health Monitor
+
+Observes pipeline health signals without control authority.
+
+**Files to create:**
+- `agents/orchestrator/health.go`
+- `agents/orchestrator/health_test.go`
+
+**Dependencies:** 6.130 (Update Buffer Types)
+
+**Acceptance Criteria:**
+
+#### HealthConfig Struct
+- [ ] `HealthConfig` with DefaultTimeout (30m), HeartbeatInterval (30s), HeartbeatMissThreshold (3), ErrorRateThreshold (0.5), TransientStormThreshold (5 in 1min)
+- [ ] Loaded from config file, overridable per-session
+
+#### HealthSignal Types
+- [ ] `HealthSignalType` enum: timeout, heartbeat_miss, high_error_rate, transient_storm, non_transient
+- [ ] `HealthSignal` struct with TaskID, SignalType, Timestamp, Details map
+
+```go
+type HealthSignal struct {
+    TaskID    string
+    SignalType HealthSignalType
+    Timestamp time.Time
+    Details   map[string]interface{}
+}
+```
+
+#### HealthMonitor Struct
+- [ ] `HealthMonitor` with config reference
+- [ ] `CheckHealth(buffer, taskStart)` evaluates health from buffer contents
+- [ ] Returns nil if healthy, HealthSignal if issue detected
+
+#### Health Checks
+- [ ] Timeout: task duration exceeds DefaultTimeout
+- [ ] Heartbeat miss: last heartbeat older than interval * threshold
+- [ ] Error rate: errors/total > ErrorRateThreshold
+- [ ] Transient storm: transient errors > threshold in window
+
+#### Helper Methods
+- [ ] `findLastHeartbeat(updates)` extracts most recent heartbeat
+- [ ] `calculateErrorRate(updates)` computes error/total ratio
+- [ ] `countTransientErrors(updates, window)` counts transients in time window
+
+**Tests:**
+- [ ] Timeout detected correctly
+- [ ] Heartbeat miss detected after threshold
+- [ ] High error rate triggers signal
+- [ ] Transient storm detected within window
+- [ ] Healthy task returns nil
+- [ ] Edge cases (empty buffer, all heartbeats)
+
+---
+
+### 6.133 Orchestrator Summary Schema
+
+Structured summary types for compaction and archival.
+
+**Files to create:**
+- `agents/orchestrator/summary.go`
+- `agents/orchestrator/summary_test.go`
+
+**Dependencies:** 6.130, 6.131
+
+**Acceptance Criteria:**
+
+#### OrchestratorSummary Struct
+- [ ] `OrchestratorSummary` with Workflow, Completed, Failed, Cancelled, Pending, Running, Metrics, Compaction
+- [ ] JSON serializable for Archivalist storage
+
+#### WorkflowSummary Struct
+- [ ] ID, PlanVersion, StartedAt, Status, TotalTasks, CurrentLayer, TotalLayers
+
+#### TaskCompletionRecord Struct
+- [ ] TaskID, Name, Agent, Layer, StartedAt, CompletedAt, Duration, ToolCalls, Summary
+
+#### TaskFailureRecord Struct
+- [ ] TaskID, Name, Agent, Layer, StartedAt, FailedAt, Duration, ErrorType, ErrorSummary, Dependents
+
+#### TaskCancelRecord Struct
+- [ ] TaskID, Name, Layer, CancelledAt, Reason, UpstreamTask
+
+#### TaskPendingRecord Struct
+- [ ] TaskID, Name, Agent, Layer, WaitingSince, WaitDuration, BlockedBy
+
+#### TaskRunningRecord Struct
+- [ ] TaskID, Name, Agent, Layer, StartedAt, RunDuration, ToolCalls, LastHeartbeat, LastActivity
+
+#### SummaryMetrics Struct
+- [ ] TotalCompleted, TotalFailed, TotalCancelled, TotalPending, TotalRunning
+- [ ] WallClockDuration, TotalTaskTime, AvgTaskDuration
+- [ ] LongestTask, LongestDuration, ErrorRate, AvgHeartbeatDelay
+
+#### CompactionInfo Struct
+- [ ] Reason, CompactedAt, PreCompactTokens, PostCompactTokens, UpdatesDropped
+
+#### Summary Generation
+- [ ] `GenerateSummary(workflow, buffers)` builds OrchestratorSummary
+- [ ] Categorizes tasks by status
+- [ ] Computes aggregate metrics
+- [ ] Includes compaction metadata
+
+**Tests:**
+- [ ] All struct types JSON marshal/unmarshal correctly
+- [ ] GenerateSummary populates all fields
+- [ ] Metrics calculations accurate
+- [ ] Empty workflow handled gracefully
+
+---
+
+### 6.134 Plan Modification Handling
+
+Accepts all plan modifications from Architect without dispute.
+
+**Files to create:**
+- `agents/orchestrator/plan_mod.go`
+- `agents/orchestrator/plan_mod_test.go`
+
+**Dependencies:** 6.130, existing DAG executor
+
+**Acceptance Criteria:**
+
+#### PlanModificationType Enum
+- [ ] `add_task` - Add new task to DAG
+- [ ] `cancel_task` - Cancel pending task
+- [ ] `modify_task` - Modify pending task parameters
+- [ ] `launch_variant` - Create variant pipeline
+- [ ] `change_version` - Switch to different plan version
+
+#### PlanModification Struct
+- [ ] Type, Timestamp, TaskID (optional), Payload (json.RawMessage)
+
+```go
+type PlanModification struct {
+    Type      PlanModificationType `json:"type"`
+    Timestamp time.Time            `json:"timestamp"`
+    TaskID    string               `json:"task_id,omitempty"`
+    Payload   json.RawMessage      `json:"payload"`
+}
+```
+
+#### HandlePlanModification Method
+- [ ] NEVER refuses - trusts Architect completely
+- [ ] Routes to appropriate DAG/variant method
+- [ ] Logs unknown modification types but doesn't fail
+- [ ] Returns error only for execution failures (not permission)
+
+#### Modification Handlers
+- [ ] `addTask(payload)` → dagExecutor.AddTask
+- [ ] `cancelTask(taskID)` → dagExecutor.CancelTask
+- [ ] `modifyTask(taskID, payload)` → dagExecutor.ModifyTask
+- [ ] `launchVariant(payload)` → variantManager.LaunchVariant
+- [ ] `changeVersion(payload)` → loadPlanVersion
+
+**Tests:**
+- [ ] All modification types route correctly
+- [ ] Unknown types logged but don't fail
+- [ ] DAG executor methods called with correct params
+- [ ] Variant manager integration works
+- [ ] Concurrent modifications handled safely
+
+---
+
+### 6.135 Crash Recovery
+
+Resume from checkpointed plan file via Architect consultation.
+
+**Files to create:**
+- `agents/orchestrator/recovery.go`
+- `agents/orchestrator/recovery_test.go`
+
+**Dependencies:** 6.130, 6.134, existing checkpoint system
+
+**Acceptance Criteria:**
+
+#### ConsultRequest/Response
+- [ ] `ConsultRequest` with Query string
+- [ ] `ConsultResponse` with PlanID, Version, additional context
+
+#### RecoverFromCrash Method
+- [ ] Consult Architect: "What plan and version were we executing?"
+- [ ] Load checkpointed plan file from checkpoint directory
+- [ ] Query pipeline states to determine completed tasks
+- [ ] Resume DAG execution from current state
+
+```go
+func (o *Orchestrator) RecoverFromCrash(ctx context.Context) error {
+    // 1. Consult Architect
+    // 2. Load plan file
+    // 3. Query completed pipelines
+    // 4. Resume DAG
+}
+```
+
+#### Checkpoint Directory Structure
+- [ ] `{checkpointDir}/{planID}/{version}/plan.json`
+- [ ] Plan file contains full task graph
+- [ ] Versioned for plan modifications
+
+#### Pipeline State Query
+- [ ] `queryCompletedPipelines(ctx, taskIDs)` returns completed task IDs
+- [ ] Checks pipeline storage for terminal states
+- [ ] Handles partially completed workflows
+
+#### DAG Resume
+- [ ] `dagExecutor.ResumeFrom(plan, completedTasks)` resumes from state
+- [ ] Marks completed tasks as done
+- [ ] Continues with next DAG layer
+
+**Tests:**
+- [ ] Recovery consults Architect correctly
+- [ ] Plan file loaded and parsed
+- [ ] Completed tasks identified
+- [ ] DAG resumes from correct point
+- [ ] Missing checkpoint handled gracefully
+- [ ] Corrupted checkpoint detected
+
+---
+
+### 6.136 Guide Routing Integration
+
+Route rules for Orchestrator message types.
+
+**Files to create:**
+- `agents/orchestrator/routing.go`
+- `agents/guide/orchestrator_routes.go`
+
+**Dependencies:** 6.131, existing Guide routing system
+
+**Acceptance Criteria:**
+
+#### OrchestratorGuideRoutes
+- [ ] `ORCHESTRATOR_STATUS_PUSH` → RouteToUser, PriorityHigh
+- [ ] `ORCHESTRATOR_FAILURE_REPORT` → RouteToArchitect, PriorityUrgent
+- [ ] `ORCHESTRATOR_SUMMARY` → RouteToArchivalist, PriorityNormal
+- [ ] `ORCHESTRATOR_TASK_EVENT` → RouteToArchivalist, PriorityNormal (task completion/failure/cancellation)
+- [ ] `ORCHESTRATOR_ARCHIVALIST_REQUEST` → RouteToArchivalist, PriorityNormal, WaitForResponse: true (direct queries)
+
+```go
+var OrchestratorGuideRoutes = []RouteRule{
+    {MessageType: "ORCHESTRATOR_STATUS_PUSH", Target: RouteToUser, Priority: PriorityHigh},
+    {MessageType: "ORCHESTRATOR_FAILURE_REPORT", Target: RouteToArchitect, Priority: PriorityUrgent},
+    {MessageType: "ORCHESTRATOR_SUMMARY", Target: RouteToArchivalist, Priority: PriorityNormal},
+    {MessageType: "ORCHESTRATOR_TASK_EVENT", Target: RouteToArchivalist, Priority: PriorityNormal},
+    {MessageType: "ORCHESTRATOR_ARCHIVALIST_REQUEST", Target: RouteToArchivalist, Priority: PriorityNormal, WaitForResponse: true},
+}
+```
+
+#### Route Registration
+- [ ] Routes registered in Guide initialization
+- [ ] Priority ordering enforced
+- [ ] Unknown message types logged
+- [ ] WaitForResponse routes use synchronous request-response pattern
+
+#### Message Envelope
+- [ ] Standard envelope with Type, Source, Timestamp, Payload
+- [ ] Source always "orchestrator"
+- [ ] Type matches route rule MessageType
+
+#### TaskEvent Envelope (for ORCHESTRATOR_TASK_EVENT)
+- [ ] EventID, EventType, WorkflowID, TaskID, TaskName, Agent, Timestamp, SessionID
+- [ ] Polymorphic payload: Completion, Failure, or Cancellation record
+
+#### ArchivalistRequest Envelope (for ORCHESTRATOR_ARCHIVALIST_REQUEST)
+- [ ] RequestType, RequestID, Source, Timestamp, Payload
+- [ ] Synchronous response: ArchivalistResponse with Success, Data, Error
+
+**Tests:**
+- [ ] Status push routes to user
+- [ ] Failure report routes to Architect
+- [ ] Summary routes to Archivalist
+- [ ] Task event routes to Archivalist
+- [ ] Archivalist request routes and waits for response
+- [ ] Priority ordering correct
+- [ ] Unknown message type handling
+- [ ] WaitForResponse pattern works correctly
+
+---
+
+### 6.137 Orchestrator Agent Core
+
+Main Orchestrator agent with system prompt and initialization.
+
+**Files to create:**
+- `agents/orchestrator/agent.go`
+- `agents/orchestrator/agent_test.go`
+- `agents/orchestrator/prompt.go`
+
+**Dependencies:** 6.130-6.136
+
+**Acceptance Criteria:**
+
+#### Orchestrator System Prompt
+- [ ] Identity: Claude Haiku 4.5, read-only observer
+- [ ] No authority to modify, refuse, or dispute plans
+- [ ] User and Architect are ULTIMATE authority
+- [ ] Responsibilities: status queries, push updates, summaries, report failures
+- [ ] Non-responsibilities: modify order, retry policy, cancel tasks, allocate resources
+- [ ] Communication style: concise, factual, status-focused
+- [ ] Status reporting format: "Task [ID] ([name]): [status] | Duration: [time] | Last activity: [description]"
+
+#### Orchestrator Struct
+- [ ] `Orchestrator` with bufferRegistry, healthMonitor, dagExecutor, variantManager, guide, archivalist
+- [ ] Model: claude-haiku-4-5-20241230
+- [ ] Implements Agent interface
+
+#### Initialization
+- [ ] `NewOrchestrator(config, deps)` constructor
+- [ ] Loads buffer config
+- [ ] Initializes health monitor
+- [ ] Registers skills
+- [ ] Registers Guide routes
+
+#### Compaction Handling
+- [ ] Triggers at 95% context window OR workflow completion
+- [ ] DAG continues during compaction
+- [ ] LLM waits for compaction before new prompts
+- [ ] Generates OrchestratorSummary → Archivalist
+
+#### Core Properties
+- [ ] Read-only: only observes, doesn't control
+- [ ] No dispute: accepts all Architect decisions
+- [ ] Immediate push: state changes push via Guide
+- [ ] DAG executor handles auto-cancellation
+
+**Tests:**
+- [ ] Agent initializes with all dependencies
+- [ ] System prompt included in context
+- [ ] Skills registered and accessible
+- [ ] Guide routes registered
+- [ ] Compaction triggers correctly
+- [ ] Model is Haiku as specified
+
+---
+
+### 6.138 Orchestrator Integration Tests
+
+End-to-end tests for Orchestrator functionality.
+
+**Files to create:**
+- `tests/e2e/orchestrator_test.go`
+- `tests/fixtures/orchestrator_scenarios.go`
+
+**Dependencies:** 6.130-6.137
+
+**Test Scenarios:**
+
+#### Status Query Flow
+- [ ] User asks "What's the status?" → Orchestrator queries buffers → returns summary
+- [ ] Task-specific status query works
+- [ ] Workflow overview query works
+- [ ] Empty buffer handled gracefully
+
+#### Status Push Flow
+- [ ] Pipeline state change → buffer update → immediate push to user
+- [ ] Tool call → buffer update → push (if configured)
+- [ ] Heartbeat → buffer update (no push by default)
+
+#### Health Monitoring Flow
+- [ ] Task exceeds timeout → health signal → report to Architect
+- [ ] Missed heartbeats → health signal → report to Architect
+- [ ] High error rate → health signal → report to Architect
+- [ ] Transient storm → health signal → report to Architect
+
+#### Plan Modification Flow
+- [ ] Architect adds task → Orchestrator accepts → DAG updated
+- [ ] Architect cancels task → Orchestrator accepts → DAG updated
+- [ ] Architect launches variant → Orchestrator accepts → variant created
+
+#### Compaction Flow
+- [ ] Context reaches 95% → compaction triggers
+- [ ] DAG continues during compaction
+- [ ] Summary generated correctly
+- [ ] Summary reaches Archivalist
+
+#### Crash Recovery Flow
+- [ ] Orchestrator crashes → restart → consult Architect → resume
+- [ ] Completed tasks not re-executed
+- [ ] Pending tasks resume correctly
+
+**Acceptance Criteria:**
+- [ ] All test scenarios passing
+- [ ] No buffer leaks (cleared on completion)
+- [ ] Health signals accurate
+- [ ] Routing correct for all message types
+- [ ] Compaction doesn't lose running task data
+- [ ] Recovery resumes from correct state
+- [ ] Performance: status query < 10ms
+- [ ] Task events submitted to Archivalist on completion/failure/cancellation
+- [ ] Archivalist direct request pattern works
+
+---
+
+### 6.139 Task Completion Event Submission
+
+Automatic submission of task events to Archivalist after ANY task reaches terminal state.
+
+**Files to create:**
+- `agents/orchestrator/events.go`
+- `agents/orchestrator/events_test.go`
+- `agents/orchestrator/archivalist.go`
+- `agents/orchestrator/archivalist_test.go`
+
+**Dependencies:** 6.131 (Skills), 6.133 (Summary Schema), 6.136 (Guide Routing)
+
+**Acceptance Criteria:**
+
+#### TaskEvent Types
+- [ ] `TaskEventType` enum: completed, failed, cancelled
+- [ ] `TaskEvent` struct with EventID, EventType, WorkflowID, TaskID, TaskName, Agent, Timestamp, SessionID
+- [ ] Polymorphic payload: Completion, Failure, or Cancellation record
+
+```go
+type TaskEvent struct {
+    EventID      string          `json:"event_id"`
+    EventType    TaskEventType   `json:"event_type"`
+    WorkflowID   string          `json:"workflow_id"`
+    TaskID       string          `json:"task_id"`
+    TaskName     string          `json:"task_name"`
+    Agent        string          `json:"agent"`
+    Timestamp    time.Time       `json:"timestamp"`
+    SessionID    string          `json:"session_id"`
+    Completion   *TaskCompletionRecord `json:"completion,omitempty"`
+    Failure      *TaskFailureRecord    `json:"failure,omitempty"`
+    Cancellation *TaskCancelRecord     `json:"cancellation,omitempty"`
+}
+```
+
+#### OnTaskTerminal Hook
+- [ ] `OnTaskTerminal(ctx, taskID, status)` called by DAG executor
+- [ ] Builds appropriate record based on status (completed/failed/cancelled)
+- [ ] Submits event via Guide routing (non-blocking goroutine)
+- [ ] CRITICAL: Must be called for ALL terminal states
+
+#### Event Submission
+- [ ] `submitTaskEvent(ctx, event)` sends to Guide
+- [ ] Uses ORCHESTRATOR_TASK_EVENT message type
+- [ ] Non-blocking (fires and forgets)
+- [ ] Logs submission failures but doesn't block workflow
+
+#### ArchivalistRequest Types
+- [ ] `ArchivalistRequest` struct with RequestType, RequestID, Source, Timestamp, Payload
+- [ ] `ArchivalistResponse` struct with RequestID, Success, Data, Error
+- [ ] Request types: query, store, query_patterns, query_failures
+
+#### Direct Request Pattern
+- [ ] `queryFailurePatterns(ctx, taskName, approach)` for failure pattern lookup
+- [ ] Uses synchronous request-response via Guide.RouteAndWait
+- [ ] Returns parsed FailurePattern array
+
+**Tests:**
+- [ ] OnTaskTerminal called for completed task
+- [ ] OnTaskTerminal called for failed task
+- [ ] OnTaskTerminal called for cancelled task
+- [ ] Event contains correct polymorphic payload
+- [ ] Event submission is non-blocking
+- [ ] Failed submission doesn't crash workflow
+- [ ] Direct request receives response
+- [ ] Failure pattern query returns results
+
+---
+
+## Orchestrator Implementation Order
+
+1. **6.130** (Update Buffer Types) - Foundation, no dependencies
+2. **6.132** (Health Monitor) - Depends on 6.130
+3. **6.133** (Summary Schema) - Depends on 6.130
+4. **6.130 + 6.132 + 6.133** → **6.131** (Orchestrator Skills) - Core functionality
+5. **6.130** → **6.134** (Plan Modification) - Depends on buffer types
+6. **6.134** → **6.135** (Crash Recovery) - Depends on plan handling
+7. **6.131** → **6.136** (Guide Routing) - Depends on skills
+8. **6.131 + 6.133 + 6.136** → **6.139** (Task Event Submission) - Archivalist integration
+9. **All** → **6.137** (Agent Core) - Assembles all components
+10. **6.137** → **6.138** (Integration Tests) - Validates entire system
+
+**Parallel Execution Groups:**
+- Group A: 6.130 (no dependencies)
+- Group B: 6.132, 6.133 (depend only on 6.130, can parallelize)
+- Group C: 6.131, 6.134 (depend on A + B)
+- Group D: 6.135, 6.136 (depend on C)
+- Group E: 6.139 (depends on C + D, Archivalist integration)
+- Group F: 6.137 (depends on all)
+- Group G: 6.138 (integration tests)
+
+**Cross-System Dependencies:**
+- Orchestrator depends on DAG Executor (Phase 0.2)
+- Orchestrator depends on Guide routing (Phase 0.4)
+- Orchestrator sends summaries AND task events to Archivalist (Phase 0.5)
+- Orchestrator can query Archivalist for failure patterns
+- Pipeline Variants depend on Orchestrator for variant management
+
+---
+
 ## Pipeline Variants Implementation Order
 
 1. **6.101** (Variant Data Structures) - Foundation, no dependencies
@@ -17768,15 +18413,58 @@ End-to-end tests for credential access system.
 ## Execution Workflow
 
 ```
-Phase 0 (Foundation)              Phase 1 (Knowledge)      Phase 2 (Execution)           Phase 3         Phase 4 (Quality)      Phase 5
-┌─────────────────────────────┐   ┌─────────────────┐      ┌──────────────────────┐      ┌───────────┐   ┌────────────────┐      ┌──────────────────┐
-│ 0.1 Session Manager         │   │ 1.1 Librarian   │      │ 2.1 Engineer         │      │ 3.1       │   │ 4.1 Inspector  │      │ 5.1 Coordinator  │
-│ 0.2 DAG Engine              │   │ 1.2 Academic    │      │ 2.2 Orchestrator     │      │ Architect │   │ 4.2 Tester     │      │ 5.2 Integration  │
-│ 0.3 Worker Pool Enhancements│──▶│ 1.3 Tool Disc.  │─────▶│ 2.3 Pipeline Infra   │─────▶│           │──▶│                │─────▶│ 5.3 Benchmarks   │
-│ 0.4 Guide Enhancements      │   │                 │      │     (E + I + T)      │      │           │   │                │      │                  │
-│ 0.5 Archivalist Enhancements│   │                 │      │                      │      │           │   │                │      │                  │
-│ 0.6 Bus Enhancements        │   │                 │      │                      │      │           │   │                │      │                  │
-└─────────────────────────────┘   └─────────────────┘      └──────────────────────┘      └───────────┘   └────────────────┘      └──────────────────┘
+Phase 0 (Foundation)              Phase 1 (Knowledge)      Phase 2 (Execution)                   Phase 3         Phase 4 (Quality)      Phase 5
+┌─────────────────────────────┐   ┌─────────────────┐      ┌─────────────────────────────┐      ┌───────────┐   ┌────────────────┐      ┌──────────────────┐
+│ 0.1 Session Manager         │   │ 1.1 Librarian   │      │ 2.1 Engineer                │      │ 3.1       │   │ 4.1 Inspector  │      │ 5.1 Coordinator  │
+│ 0.2 DAG Engine              │   │ 1.2 Academic    │      │ 2.2 Orchestrator (6.130-139)│      │ Architect │   │ 4.2 Tester     │      │ 5.2 Integration  │
+│ 0.3 Worker Pool Enhancements│──▶│ 1.3 Tool Disc.  │─────▶│ 2.3 Pipeline Infra          │─────▶│           │──▶│                │─────▶│ 5.3 Benchmarks   │
+│ 0.4 Guide Enhancements      │   │                 │      │     (E + O + I + T)         │      │           │   │                │      │                  │
+│ 0.5 Archivalist Enhancements│   │                 │      │                             │      │           │   │                │      │                  │
+│ 0.6 Bus Enhancements        │   │                 │      │                             │      │           │   │                │      │                  │
+└─────────────────────────────┘   └─────────────────┘      └─────────────────────────────┘      └───────────┘   └────────────────┘      └──────────────────┘
+```
+
+### Phase 2.2 Orchestrator Detail
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         ORCHESTRATOR IMPLEMENTATION (Phase 2.2)                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Group A (Foundation)         Group B (Parallel)          Group C (Core)            │
+│  ┌───────────────────┐       ┌────────────────────┐      ┌────────────────────┐     │
+│  │ 6.130             │       │ 6.132              │      │ 6.131              │     │
+│  │ Update Buffer     │──────▶│ Health Monitor     │──┬──▶│ Orchestrator       │     │
+│  │ Types             │       │                    │  │   │ Skills             │     │
+│  └───────────────────┘       ├────────────────────┤  │   ├────────────────────┤     │
+│          │                   │ 6.133              │  │   │ 6.134              │     │
+│          └──────────────────▶│ Summary Schema     │──┘   │ Plan Modification  │     │
+│                              └────────────────────┘      └─────────┬──────────┘     │
+│                                                                    │                │
+│  Group D (Dependent)          Group E (Archivalist)                │                │
+│  ┌────────────────────┐      ┌────────────────────┐                │                │
+│  │ 6.135              │      │ 6.139              │◀───────────────┘                │
+│  │ Crash Recovery     │      │ Task Event         │                                 │
+│  ├────────────────────┤      │ Submission         │                                 │
+│  │ 6.136              │      │ (Archivalist Integ)│                                 │
+│  │ Guide Routing      │      └─────────┬──────────┘                                 │
+│  └─────────┬──────────┘                │                                            │
+│            │                           │                                            │
+│            └───────────────────────────┼────────────────────┐                       │
+│                                        │                    │                       │
+│  Group F (Assembly)                    │                    │                       │
+│  ┌────────────────────┐                │                    │                       │
+│  │ 6.137              │◀───────────────┴────────────────────┘                       │
+│  │ Agent Core         │                                                             │
+│  └─────────┬──────────┘                                                             │
+│            │                                                                        │
+│            ▼                                                                        │
+│  Group G (Validation)                   ┌────────────────────┐                      │
+│                                         │ 6.138              │                      │
+│                                         │ Integration Tests  │                      │
+│                                         └────────────────────┘                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Parallelization Summary
@@ -17786,16 +18474,88 @@ Phase 0 (Foundation)              Phase 1 (Knowledge)      Phase 2 (Execution)  
 | 0 | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 | All six in parallel |
 | 1 | 1.1, 1.2, 1.3 | 1.1 and 1.2 in parallel; 1.3 after 1.1+1.2 |
 | 2 | 2.1, 2.2, 2.3 | 2.1 and 2.2 in parallel; 2.3 after 2.1+2.2 |
+| 2.2 | 6.130-6.139 | See Orchestrator subphase table below |
 | 3 | 3.1 | Sequential (after Phase 2) |
 | 4 | 4.1, 4.2 | Both in parallel (after Phase 3) |
 | 5 | 5.1, 5.2, 5.3 | Sequential (after Phase 4) |
 
+### Orchestrator Subphase (2.2) Parallel Execution
+
+| Group | Tasks | Dependencies | Parallel Capacity |
+|-------|-------|--------------|-------------------|
+| A | 6.130 (Buffer Types) | None | 1 pipeline |
+| B | 6.132 (Health Monitor), 6.133 (Summary Schema) | Group A | 2 pipelines |
+| C | 6.131 (Skills), 6.134 (Plan Modification) | Groups A + B | 2 pipelines |
+| D | 6.135 (Recovery), 6.136 (Routing) | Group C | 2 pipelines |
+| E | 6.139 (Task Event Submission) | Groups C + D | 1 pipeline |
+| F | 6.137 (Agent Core) | Groups A-E | 1 pipeline |
+| G | 6.138 (Integration Tests) | Group F | 1 pipeline |
+
 **Note**: Phase 2.3 (Pipeline Infrastructure) depends on 2.1 (Engineer) and 2.2 (Orchestrator) as it combines them with Inspector and Tester instances into isolated execution contexts.
+
+### Cross-System Task Mapping
+
+| System | Tasks | Phase | Dependencies |
+|--------|-------|-------|--------------|
+| VectorGraphDB | 6.1-6.20 | Phase 6 | Phase 0, Phase 1 |
+| Agent Efficiency | 6.21-6.42 | Phase 6 | Phase 6.1-6.20 |
+| Pipeline Core | 6.43-6.49 | Phase 6 | Phase 2 |
+| Tool Execution | 6.50-6.80 | Phase 6 | Phase 6.43-6.49 |
+| Pipeline Variants | 6.101-6.112 | Phase 6 | Orchestrator (6.130-6.139) |
+| Secret Management | 6.113-6.121 | Phase 6 | None (parallel with all) |
+| Credential Broker | 6.122-6.129 | Phase 6 | 6.113-6.121 |
+| **Orchestrator** | **6.130-6.139** | **Phase 2.2** | **Phase 0.2 (DAG), 0.4 (Guide), 0.5 (Archivalist)** |
 
 ### Critical Path
 
 ```
-0.1 (Session) → 0.4 (Guide) → 2.2 (Orchestrator) → 2.3 (Pipeline) → 3.1 (Architect) → 5.1 (Coordinator)
+0.1 (Session) → 0.4 (Guide) → 6.130 (Buffer) → 6.131 (Skills) → 6.139 (Events) → 6.137 (Agent Core) → 2.3 (Pipeline) → 3.1 (Architect) → 5.1 (Coordinator)
+```
+
+### Orchestrator in Full System Context
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         ORCHESTRATOR INTEGRATION POINTS                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  UPSTREAM DEPENDENCIES                    ORCHESTRATOR                              │
+│  ────────────────────                    ────────────                               │
+│                                                                                     │
+│  ┌─────────────────┐                    ┌────────────────────────────────────────┐  │
+│  │ 0.2 DAG Engine  │───executes───────▶│                                        │  │
+│  └─────────────────┘                    │  Orchestrator Agent (Claude Haiku 4.5) │  │
+│  ┌─────────────────┐                    │  ─────────────────────────────────────  │  │
+│  │ 0.4 Guide       │◀──routes──────────│                                        │  │
+│  └─────────────────┘                    │  • Status queries (6.131)              │  │
+│                                         │  • Health monitoring (6.132)           │  │
+│  ┌─────────────────┐  task events       │  • Plan modifications (6.134)          │  │
+│  │                 │◀──────────────────│  • Crash recovery (6.135)              │  │
+│  │ 0.5 Archivalist │   (6.139)          │  • Task event submission (6.139)       │  │
+│  │                 │───patterns────────▶│  • Archivalist queries (6.139)         │  │
+│  │                 │◀──summaries───────│                                        │  │
+│  └─────────────────┘                    └────────────────────────────────────────┘  │
+│        ▲                                              │                             │
+│        │ BIDIRECTIONAL                               │                             │
+│        │ ────────────                                │                             │
+│        │ • ORCHESTRATOR_TASK_EVENT (completed/failed/cancelled)                     │
+│        │ • ORCHESTRATOR_ARCHIVALIST_REQUEST (query patterns, failures)              │
+│        │ • ORCHESTRATOR_SUMMARY (compaction summaries)                              │
+│        │                                             │                             │
+│  DOWNSTREAM DEPENDENTS                               ▼                             │
+│  ────────────────────                                                              │
+│                                                                                     │
+│  ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐                   │
+│  │ 2.3 Pipeline    │   │ 6.101-6.112     │   │ 3.1 Architect   │                   │
+│  │ Infrastructure  │   │ Pipeline        │   │                 │                   │
+│  │                 │   │ Variants        │   │ (receives       │                   │
+│  │ (orchestrates   │   │                 │   │  failure        │                   │
+│  │  task execution)│   │ (Orchestrator   │   │  reports)       │                   │
+│  │                 │   │  manages        │   │                 │                   │
+│  │                 │   │  variant groups)│   │                 │                   │
+│  └─────────────────┘   └─────────────────┘   └─────────────────┘                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -19705,11 +20465,11 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ═══════════════════════════                                                         │
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 1A: Messaging & Events                                            ││
-│ │ • 0.6 Bus Enhancements                                                           ││
-│ │ • 0.11 Signal Bus & Workflow Control                                             ││
-│ │ • 0.10a.2 Event Bus Message Wrapping                                             ││
-│ │ • 0.10a.3 Stream Bridge Service                                                  ││
+│ │ PARALLEL GROUP 1A: Messaging & Events (DONE)                                     ││
+│ │ • 0.6 Bus Enhancements (DONE)                                                    ││
+│ │ • 0.11 Signal Bus & Workflow Control (DONE)                                      ││
+│ │ • 0.10a.2 Event Bus Message Wrapping (DONE)                                      ││
+│ │ • 0.10a.3 Stream Bridge Service (DONE)                                           ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -19930,24 +20690,43 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 6B: Enhanced Agent Skills                                         ││
+│ │ PARALLEL GROUP 6B: Orchestrator Agent System (6.130-6.139)                       ││
+│ │ • 6.130 Update Buffer Types (Foundation)                                         ││
+│ │ • 6.131 Orchestrator Skills (query_task, query_workflow, push_status,            ││
+│ │         generate_summary, report_failure, submit_task_event, archivalist_request)││
+│ │ • 6.132 Health Monitor (timeout, heartbeat, error rate, transient storm)         ││
+│ │ • 6.133 Orchestrator Summary Schema (OrchestratorSummary, task records)          ││
+│ │ • 6.134 Plan Modification Handling (add/cancel/modify tasks, variants)           ││
+│ │ • 6.135 Crash Recovery (checkpoint resume via Architect consultation)            ││
+│ │ • 6.136 Guide Routing Integration (5 route rules incl. Archivalist)              ││
+│ │ • 6.137 Orchestrator Agent Core (Claude Haiku 4.5, read-only observer)           ││
+│ │ • 6.138 Orchestrator Integration Tests                                           ││
+│ │ • 6.139 Task Completion Event Submission (Archivalist integration)               ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   6.130 → 6.132, 6.133 (parallel) → 6.131, 6.134 (parallel) →                    ││
+│ │   6.135, 6.136 (parallel) → 6.139 → 6.137 → 6.138                                ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6C: Enhanced Agent Skills                                         ││
 │ │ • Engineer: Multi-Edit & Structural Refactoring                                  ││
 │ │ • Designer: Vision & Multimodal Skills                                           ││
 │ │ • Librarian: Enhanced Search & AST Skills                                        ││
 │ │ • Academic: Web Research & Documentation Skills                                  ││
-│ │ • Orchestrator: Batch & Parallel Execution Skills                                ││
 │ │ • Inspector: LSP & AST Validation Skills                                         ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 6C: Git & Analysis Skills                                         ││
+│ │ PARALLEL GROUP 6D: Git & Analysis Skills                                         ││
 │ │ • Git Tooling System                                                             ││
 │ │ • Analysis Skills Orchestration                                                  ││
 │ │ • Lazy Tool Loading                                                              ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 12-15 parallel engineer pipelines                              │
+│ ESTIMATED CAPACITY: 18-22 parallel engineer pipelines                              │
 │ DEPENDENCIES: Wave 2-3 for tool execution, Wave 5 for knowledge consultation       │
+│ NOTE: Group 6B (Orchestrator) required before Pipeline Variants (6.101-6.112)      │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -19982,7 +20761,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**WAVE 8: Pipeline System (Depends on Waves 5-7)**
+**WAVE 8: Pipeline System (Depends on Waves 5-7, Orchestrator 6.130-6.139)**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
@@ -19992,7 +20771,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 8A: Pipeline Core                                                 ││
 │ │ • 6.43 Single-Worker Pipeline System                                             ││
-│ │ • Pipeline Variants System Core                                                  ││
+│ │ • Pipeline Variants System Core (6.101-6.112) - REQUIRES Orchestrator (6.130-39) ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -20166,19 +20945,34 @@ All items in this wave have zero dependencies and can execute in full parallel.
 | 3 | Tool Execution | 24-30 | Wave 2 | 24-30 pipelines |
 | 4 | Security/Multi-Session | 12-15 | Wave 3 | 12-15 pipelines |
 | 5 | Knowledge Agents | 10-12 | Wave 1 (partial Wave 2) | 10-12 pipelines |
-| 6 | Execution Agents | 12-15 | Wave 2-3, Wave 5 | 12-15 pipelines |
+| 6 | Execution Agents | 18-22 | Wave 2-3, Wave 5 | 18-22 pipelines |
 | 7 | Quality/Planning | 8-10 | Wave 6, Wave 5 | 8-10 pipelines |
-| 8 | Pipeline System | 8-12 | Waves 5-7 | 8-12 pipelines |
+| 8 | Pipeline System | 8-12 | Waves 5-7, Orchestrator (6.130-39) | 8-12 pipelines |
 | 9 | Agent Efficiency | 15-20 | Wave 8 | 15-20 pipelines |
 | 10 | Validation | 10-15 | All Waves | 10-15 pipelines |
+
+**Wave 6 Orchestrator Breakdown (6.130-6.139):**
+| Group | Tasks | Internal Dependencies |
+|-------|-------|----------------------|
+| A | 6.130 (Buffer Types) | None |
+| B | 6.132, 6.133 (Health, Summary) | Group A |
+| C | 6.131, 6.134 (Skills, Plan Mod) | Groups A+B |
+| D | 6.135, 6.136 (Recovery, Routing) | Group C |
+| E | 6.139 (Task Events/Archivalist) | Groups C+D |
+| F | 6.137 (Agent Core) | Groups A-E |
+| G | 6.138 (Integration Tests) | Group F |
 
 **Key Parallelization Opportunities:**
 1. Wave 5 (Knowledge Agents) can START after Wave 1, running parallel with Waves 2-4
 2. Within each wave, groups A/B/C/D execute in parallel
 3. Agent efficiency techniques (Wave 9) highly parallelizable across all 9 agents
 4. Integration tests (Wave 10) can parallelize by subsystem
+5. **Orchestrator (6.130-6.139)** has 7 internal parallel groups, can parallelize within Wave 6
 
 **Critical Path:**
-Wave 0 → Wave 1 → Wave 2 → Wave 3 → Wave 6 → Wave 7 → Wave 8 → Wave 9 → Wave 10
+Wave 0 → Wave 1 → Wave 2 → Wave 3 → Wave 6 (incl. Orchestrator 6.130-39) → Wave 7 → Wave 8 → Wave 9 → Wave 10
 
-**Optimization Note:** Waves 5, 6, 7, 8, 9 have significant cross-dependencies but can overlap if carefully scheduled. The Orchestrator should monitor completion status and eagerly start downstream work as soon as dependencies are satisfied.
+**Orchestrator Critical Path (within Wave 6):**
+6.130 → 6.132/6.133 → 6.131/6.134 → 6.135/6.136 → 6.139 → 6.137 → 6.138
+
+**Optimization Note:** Waves 5, 6, 7, 8, 9 have significant cross-dependencies but can overlap if carefully scheduled. The Orchestrator (once implemented in Wave 6) monitors completion status and eagerly starts downstream work as soon as dependencies are satisfied. Pipeline Variants (6.101-6.112) in Wave 8 specifically requires Orchestrator completion.
