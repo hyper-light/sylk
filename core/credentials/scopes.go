@@ -1,6 +1,7 @@
 package credentials
 
 import (
+	"slices"
 	"sync"
 )
 
@@ -222,12 +223,7 @@ func isInDenyList(denied []string, provider string) bool {
 }
 
 func isInAllowList(allowed []string, provider string) bool {
-	for _, a := range allowed {
-		if a == provider {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allowed, provider)
 }
 
 func (sm *ScopeManager) RequiresAuth(agentType, provider string) bool {

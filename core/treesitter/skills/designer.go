@@ -68,22 +68,24 @@ func (d *DesignerSkills) extractFileComponents(ctx context.Context, filePath str
 		return FileComponents{}, err
 	}
 
-	fc := FileComponents{
+	return FileComponents{
 		FilePath:   filePath,
-		Components: make([]ComponentInfo, 0),
-	}
+		Components: filterComponentFunctions(parseResult.Functions),
+	}, nil
+}
 
-	for _, f := range parseResult.Functions {
+func filterComponentFunctions(functions []treesitter.FunctionInfo) []ComponentInfo {
+	components := make([]ComponentInfo, 0)
+	for _, f := range functions {
 		if isComponentFunction(f.Name) {
-			fc.Components = append(fc.Components, ComponentInfo{
+			components = append(components, ComponentInfo{
 				Name:      f.Name,
 				StartLine: f.StartLine,
 				EndLine:   f.EndLine,
 			})
 		}
 	}
-
-	return fc, nil
+	return components
 }
 
 func isComponentFunction(name string) bool {
@@ -122,22 +124,24 @@ func (d *DesignerSkills) TsAnalyzeJSX(ctx context.Context, filePath string, opts
 		return nil, err
 	}
 
-	result := &JSXAnalysisResult{
+	return &JSXAnalysisResult{
 		FilePath:  filePath,
-		Elements:  make([]JSXElement, 0),
+		Elements:  extractJSXElements(matches),
 		Hierarchy: make([]string, 0),
-	}
+	}, nil
+}
 
+func extractJSXElements(matches []treesitter.ToolQueryMatch) []JSXElement {
+	elements := make([]JSXElement, 0)
 	for _, m := range matches {
 		for _, c := range m.Captures {
-			result.Elements = append(result.Elements, JSXElement{
+			elements = append(elements, JSXElement{
 				TagName:   "element",
 				StartLine: c.Node.StartLine,
 			})
 		}
 	}
-
-	return result, nil
+	return elements
 }
 
 type StylesResult struct {
@@ -186,29 +190,35 @@ func (d *DesignerSkills) findFileStyles(ctx context.Context, filePath string, op
 		return FileStyles{}, err
 	}
 
-	fs := FileStyles{
-		FilePath: filePath,
-		Styles:   make([]StyleInfo, 0),
-	}
-
 	matches, err := d.tool.Query(ctx, filePath, content, `(call_expression function: (identifier) @func)`)
 	if err != nil {
-		return fs, nil
+		return FileStyles{FilePath: filePath, Styles: make([]StyleInfo, 0)}, nil
 	}
 
+	return FileStyles{
+		FilePath: filePath,
+		Styles:   extractStylesFromMatches(matches),
+	}, nil
+}
+
+func extractStylesFromMatches(matches []treesitter.ToolQueryMatch) []StyleInfo {
+	styles := make([]StyleInfo, 0)
 	for _, m := range matches {
-		for _, c := range m.Captures {
-			if isStyleFunction(c.Content) {
-				fs.Styles = append(fs.Styles, StyleInfo{
-					Type:      detectStyleType(c.Content),
-					Name:      c.Content,
-					StartLine: c.Node.StartLine,
-				})
-			}
+		collectStylesFromCaptures(m.Captures, &styles)
+	}
+	return styles
+}
+
+func collectStylesFromCaptures(captures []treesitter.ToolCapture, styles *[]StyleInfo) {
+	for _, c := range captures {
+		if isStyleFunction(c.Content) {
+			*styles = append(*styles, StyleInfo{
+				Type:      detectStyleType(c.Content),
+				Name:      c.Content,
+				StartLine: c.Node.StartLine,
+			})
 		}
 	}
-
-	return fs, nil
 }
 
 func isStyleFunction(name string) bool {
@@ -221,19 +231,19 @@ func isStyleFunction(name string) bool {
 	return false
 }
 
+var styleTypeMap = map[string]string{
+	"styled":       "styled-components",
+	"css":          "css-in-js",
+	"createStyles": "material-ui",
+	"makeStyles":   "material-ui",
+	"sx":           "emotion",
+}
+
 func detectStyleType(name string) string {
-	switch name {
-	case "styled":
-		return "styled-components"
-	case "css":
-		return "css-in-js"
-	case "createStyles", "makeStyles":
-		return "material-ui"
-	case "sx":
-		return "emotion"
-	default:
-		return "unknown"
+	if t, ok := styleTypeMap[name]; ok {
+		return t
 	}
+	return "unknown"
 }
 
 type PropsResult struct {
@@ -266,22 +276,30 @@ func (d *DesignerSkills) TsExtractProps(ctx context.Context, filePath string, co
 
 	result := &PropsResult{
 		FilePath:   filePath,
-		Components: make([]PropInfo, 0),
+		Components: extractPropsComponents(parseResult.Types, componentName),
 	}
 
-	for _, t := range parseResult.Types {
-		if strings.HasSuffix(t.Name, "Props") {
-			if componentName != "" && !strings.Contains(t.Name, componentName) {
-				continue
-			}
-			result.Components = append(result.Components, PropInfo{
+	return result, nil
+}
+
+func extractPropsComponents(types []treesitter.TypeInfo, componentName string) []PropInfo {
+	components := make([]PropInfo, 0)
+	for _, t := range types {
+		if !strings.HasSuffix(t.Name, "Props") {
+			continue
+		}
+		if matchesComponent(t.Name, componentName) {
+			components = append(components, PropInfo{
 				ComponentName: strings.TrimSuffix(t.Name, "Props"),
 				Props:         make([]PropDef, 0),
 			})
 		}
 	}
+	return components
+}
 
-	return result, nil
+func matchesComponent(typeName, componentName string) bool {
+	return componentName == "" || strings.Contains(typeName, componentName)
 }
 
 type HooksResult struct {
@@ -348,19 +366,25 @@ func (d *DesignerSkills) findFileHooks(ctx context.Context, filePath string, opt
 
 func collectHooksFromCaptures(captures []treesitter.ToolCapture, includeCustom bool, hooks *[]HookInfo) {
 	for _, c := range captures {
-		if !isHookCall(c.Content) {
-			continue
+		if hook, ok := makeHookInfo(c, includeCustom); ok {
+			*hooks = append(*hooks, hook)
 		}
-		isCustom := isCustomHook(c.Content)
-		if isCustom && !includeCustom {
-			continue
-		}
-		*hooks = append(*hooks, HookInfo{
-			Name:      c.Content,
-			StartLine: c.Node.StartLine,
-			IsCustom:  isCustom,
-		})
 	}
+}
+
+func makeHookInfo(c treesitter.ToolCapture, includeCustom bool) (HookInfo, bool) {
+	if !isHookCall(c.Content) {
+		return HookInfo{}, false
+	}
+	isCustom := isCustomHook(c.Content)
+	if isCustom && !includeCustom {
+		return HookInfo{}, false
+	}
+	return HookInfo{
+		Name:      c.Content,
+		StartLine: c.Node.StartLine,
+		IsCustom:  isCustom,
+	}, true
 }
 
 func isHookCall(name string) bool {
@@ -426,17 +450,20 @@ func (d *DesignerSkills) analyzeFileAccessibility(ctx context.Context, filePath 
 		return FileAccessibility{}, err
 	}
 
-	fa := FileAccessibility{
-		FilePath:  filePath,
-		Issues:    make([]AccessibilityIssue, 0),
-		AriaUsage: make([]AriaUsage, 0),
-	}
-
 	imgMatches, _ := d.tool.Query(ctx, filePath, content, `(jsx_element (jsx_opening_element name: (identifier) @tag))`)
-	for _, m := range imgMatches {
+	return FileAccessibility{
+		FilePath:  filePath,
+		Issues:    findImgAccessibilityIssues(imgMatches),
+		AriaUsage: make([]AriaUsage, 0),
+	}, nil
+}
+
+func findImgAccessibilityIssues(matches []treesitter.ToolQueryMatch) []AccessibilityIssue {
+	issues := make([]AccessibilityIssue, 0)
+	for _, m := range matches {
 		for _, c := range m.Captures {
 			if c.Content == "img" {
-				fa.Issues = append(fa.Issues, AccessibilityIssue{
+				issues = append(issues, AccessibilityIssue{
 					Type:      "missing_alt",
 					StartLine: c.Node.StartLine,
 					Message:   "img element may need alt attribute",
@@ -444,8 +471,7 @@ func (d *DesignerSkills) analyzeFileAccessibility(ctx context.Context, filePath 
 			}
 		}
 	}
-
-	return fa, nil
+	return issues
 }
 
 func (d *DesignerSkills) Close() {

@@ -227,7 +227,7 @@ func (h *PreToolEnvVarHookHandler) validateParameters(data *ToolCallHookData) (*
 	return data, nil
 }
 
-func (h *PreToolEnvVarHookHandler) checkParameter(name string, value interface{}, data *ToolCallHookData) error {
+func (h *PreToolEnvVarHookHandler) checkParameter(name string, value any, data *ToolCallHookData) error {
 	strValue, ok := value.(string)
 	if !ok {
 		return nil
@@ -257,7 +257,7 @@ func (h *PreToolEnvVarHookHandler) logInjectionAttempt(paramName string, data *T
 	entry.SessionID = data.SessionID
 	entry.AgentID = data.AgentID
 	entry.Target = data.ToolName
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"parameter_name": paramName,
 	}
 	_ = h.auditLogger.Log(entry)

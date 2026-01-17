@@ -197,7 +197,7 @@ func (b *CredentialBroker) logGranted(handle *CredentialHandle, reason string) {
 	entry.AgentID = handle.AgentID
 	entry.Target = handle.Provider
 	entry.Outcome = "granted"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"handle_id":  handle.ID,
 		"agent_type": handle.AgentType,
 		"tool_call":  handle.ToolCallID,
@@ -217,7 +217,7 @@ func (b *CredentialBroker) logDenied(agentID, agentType, provider, reason string
 	entry.AgentID = agentID
 	entry.Target = provider
 	entry.Outcome = "denied"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"agent_type": agentType,
 		"reason":     reason,
 	}
@@ -244,7 +244,7 @@ func (b *CredentialBroker) logResolveFailed(handleID string, err error) {
 	entry.Severity = security.AuditSeverityWarning
 	entry.Target = handleID
 	entry.Outcome = "failed"
-	entry.Details = map[string]interface{}{
+	entry.Details = map[string]any{
 		"error": err.Error(),
 	}
 	_ = b.auditLogger.Log(entry)

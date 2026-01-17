@@ -67,22 +67,24 @@ func (t *TesterSkills) discoverFileTests(ctx context.Context, filePath string, o
 		return FileTests{}, err
 	}
 
-	ft := FileTests{
+	return FileTests{
 		FilePath: filePath,
-		Tests:    make([]TestInfo, 0),
-	}
+		Tests:    filterTestFunctions(parseResult.Functions),
+	}, nil
+}
 
-	for _, f := range parseResult.Functions {
+func filterTestFunctions(functions []treesitter.FunctionInfo) []TestInfo {
+	tests := make([]TestInfo, 0)
+	for _, f := range functions {
 		if isTestFunction(f.Name) {
-			ft.Tests = append(ft.Tests, TestInfo{
+			tests = append(tests, TestInfo{
 				Name:      f.Name,
 				StartLine: f.StartLine,
 				EndLine:   f.EndLine,
 			})
 		}
 	}
-
-	return ft, nil
+	return tests
 }
 
 func isTestFunction(name string) bool {
@@ -116,20 +118,22 @@ func (t *TesterSkills) TsFindTestableFunctions(ctx context.Context, files []stri
 	}
 
 	for _, filePath := range files {
-		if strings.Contains(filePath, "_test.") {
-			continue
-		}
-
-		ftf, err := t.findFileTestableFunctions(ctx, filePath, opts)
-		if err != nil {
-			continue
-		}
-		if len(ftf.Functions) > 0 {
-			result.Files = append(result.Files, ftf)
-		}
+		t.appendTestableFunctions(ctx, filePath, opts, &result.Files)
 	}
 
 	return result, nil
+}
+
+func (t *TesterSkills) appendTestableFunctions(ctx context.Context, filePath string, opts TestableFunctionsOptions, files *[]FileTestableFunctions) {
+	if strings.Contains(filePath, "_test.") {
+		return
+	}
+
+	ftf, err := t.findFileTestableFunctions(ctx, filePath, opts)
+	if err != nil || len(ftf.Functions) == 0 {
+		return
+	}
+	*files = append(*files, ftf)
 }
 
 func (t *TesterSkills) findFileTestableFunctions(ctx context.Context, filePath string, opts TestableFunctionsOptions) (FileTestableFunctions, error) {
@@ -143,26 +147,33 @@ func (t *TesterSkills) findFileTestableFunctions(ctx context.Context, filePath s
 		return FileTestableFunctions{}, err
 	}
 
-	ftf := FileTestableFunctions{
+	return FileTestableFunctions{
 		FilePath:  filePath,
-		Functions: make([]TestableFunction, 0),
-	}
+		Functions: buildTestableFunctions(parseResult.Functions, opts.ExcludePrivate),
+	}, nil
+}
 
-	for _, f := range parseResult.Functions {
-		isPublic := isPublicFunction(f.Name)
-		if opts.ExcludePrivate && !isPublic {
-			continue
+func buildTestableFunctions(functions []treesitter.FunctionInfo, excludePrivate bool) []TestableFunction {
+	result := make([]TestableFunction, 0)
+	for _, f := range functions {
+		if tf, ok := makeTestableFunction(f, excludePrivate); ok {
+			result = append(result, tf)
 		}
-
-		ftf.Functions = append(ftf.Functions, TestableFunction{
-			Name:       f.Name,
-			StartLine:  f.StartLine,
-			Complexity: 1,
-			IsPublic:   isPublic,
-		})
 	}
+	return result
+}
 
-	return ftf, nil
+func makeTestableFunction(f treesitter.FunctionInfo, excludePrivate bool) (TestableFunction, bool) {
+	isPublic := isPublicFunction(f.Name)
+	if excludePrivate && !isPublic {
+		return TestableFunction{}, false
+	}
+	return TestableFunction{
+		Name:       f.Name,
+		StartLine:  f.StartLine,
+		Complexity: 1,
+		IsPublic:   isPublic,
+	}, true
 }
 
 func isPublicFunction(name string) bool {
@@ -200,27 +211,36 @@ func (t *TesterSkills) TsAnalyzeTestStructure(ctx context.Context, testFile stri
 		return nil, err
 	}
 
+	return buildTestStructureResult(testFile, parseResult.Functions), nil
+}
+
+func buildTestStructureResult(testFile string, functions []treesitter.FunctionInfo) *TestStructureResult {
 	result := &TestStructureResult{
 		FilePath: testFile,
 		Helpers:  make([]string, 0),
 		Tests:    make([]TestStructure, 0),
 	}
 
-	for _, f := range parseResult.Functions {
-		if isTestFunction(f.Name) {
-			result.TestCount++
-			result.Tests = append(result.Tests, TestStructure{
-				Name:      f.Name,
-				StartLine: f.StartLine,
-			})
-		} else if isHelperFunction(f.Name) {
-			result.Helpers = append(result.Helpers, f.Name)
-		} else if isSetupFunction(f.Name) {
-			result.SetupFuncs = append(result.SetupFuncs, f.Name)
-		}
+	for _, f := range functions {
+		classifyFunction(f, result)
 	}
 
-	return result, nil
+	return result
+}
+
+func classifyFunction(f treesitter.FunctionInfo, result *TestStructureResult) {
+	switch {
+	case isTestFunction(f.Name):
+		result.TestCount++
+		result.Tests = append(result.Tests, TestStructure{
+			Name:      f.Name,
+			StartLine: f.StartLine,
+		})
+	case isHelperFunction(f.Name):
+		result.Helpers = append(result.Helpers, f.Name)
+	case isSetupFunction(f.Name):
+		result.SetupFuncs = append(result.SetupFuncs, f.Name)
+	}
 }
 
 func isHelperFunction(name string) bool {
@@ -338,27 +358,25 @@ func (t *TesterSkills) TsMatchTestsToFunctions(ctx context.Context, sourceFile, 
 }
 
 func (t *TesterSkills) parseSourceAndTest(ctx context.Context, sourceFile, testFile string) (*treesitter.ParseResult, *treesitter.ParseResult, error) {
-	sourceContent, err := os.ReadFile(sourceFile)
+	sourceResult, err := t.parseFile(ctx, sourceFile)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	testContent, err := os.ReadFile(testFile)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	sourceResult, err := t.tool.Parse(ctx, sourceFile, sourceContent)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	testResult, err := t.tool.Parse(ctx, testFile, testContent)
+	testResult, err := t.parseFile(ctx, testFile)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return sourceResult, testResult, nil
+}
+
+func (t *TesterSkills) parseFile(ctx context.Context, filePath string) (*treesitter.ParseResult, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	return t.tool.Parse(ctx, filePath, content)
 }
 
 func buildTestMappingResult(sourceFile, testFile string, functions []treesitter.FunctionInfo, tests []string) *TestMappingResult {

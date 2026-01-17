@@ -108,15 +108,19 @@ func extractVariablesInRange(matches []treesitter.ToolQueryMatch, startLine, end
 	var variables []string
 
 	for _, m := range matches {
-		for _, c := range m.Captures {
-			if isInRange(c.Node, startLine, endLine) && !seen[c.Content] {
-				seen[c.Content] = true
-				variables = append(variables, c.Content)
-			}
-		}
+		collectVariablesFromCaptures(m.Captures, startLine, endLine, seen, &variables)
 	}
 
 	return variables
+}
+
+func collectVariablesFromCaptures(captures []treesitter.ToolCapture, startLine, endLine int, seen map[string]bool, variables *[]string) {
+	for _, c := range captures {
+		if isInRange(c.Node, startLine, endLine) && !seen[c.Content] {
+			seen[c.Content] = true
+			*variables = append(*variables, c.Content)
+		}
+	}
 }
 
 func isInRange(node *treesitter.NodeInfo, startLine, endLine int) bool {
@@ -151,20 +155,22 @@ func (e *EngineerSkills) TsFindEditTargets(ctx context.Context, filePath, nodeTy
 		return nil, err
 	}
 
+	return &FindEditTargetsResult{
+		Targets: buildEditTargets(matches, nodeType, opts.NamePattern),
+	}, nil
+}
+
+func buildEditTargets(matches []treesitter.ToolQueryMatch, nodeType, namePattern string) []EditTarget {
 	var nameRegex *regexp.Regexp
-	if opts.NamePattern != "" {
-		nameRegex, _ = regexp.Compile(opts.NamePattern)
+	if namePattern != "" {
+		nameRegex, _ = regexp.Compile(namePattern)
 	}
 
-	result := &FindEditTargetsResult{
-		Targets: make([]EditTarget, 0),
-	}
-
+	targets := make([]EditTarget, 0)
 	for _, m := range matches {
-		appendMatchingTargets(m.Captures, nodeType, nameRegex, &result.Targets)
+		appendMatchingTargets(m.Captures, nodeType, nameRegex, &targets)
 	}
-
-	return result, nil
+	return targets
 }
 
 func appendMatchingTargets(captures []treesitter.ToolCapture, nodeType string, nameRegex *regexp.Regexp, targets *[]EditTarget) {

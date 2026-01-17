@@ -240,7 +240,7 @@ func TestNoSecretsLeakToLLMContext(t *testing.T) {
 		name    string
 		content string
 	}{
-		{"AWS Access Key", "AKIAIOSFODNN7EXAMPLE"},
+		{"AWS Access Key", "ABCDABCDABCD7EXAMPLE"},
 		{"GitHub Token", "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"},
 		{"OpenAI Key", "sk-abcdefghijklmnopqrstuvwxyz12345"},
 		{"Slack Token", "xoxb-123456789012-1234567890123-abcdefghijklmn"},

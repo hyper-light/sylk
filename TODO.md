@@ -10565,50 +10565,51 @@ CLI and programmatic interface for querying audit logs.
 
 ---
 
-### 0.72 Session Credential Manager
+### 0.72 Session Credential Manager ✅ COMPLETED
 
 Session-scoped credential handling with profile overrides and temporary credentials.
 
-**Files to create:**
-- `core/security/session_credentials.go`
+**Files created:**
+- `core/security/session_credentials.go` ✅
+- `core/security/session_credentials_test.go` ✅
 
 **Dependencies:** 0.63 (Credential Manager).
 
 **Acceptance Criteria:**
 
 #### Credential Resolution
-- [ ] `SessionCredentialManager` wraps base `CredentialManager`
-- [ ] Resolution order: temp credentials → profile override → base manager
-- [ ] `GetAPIKey(provider)` follows resolution chain
+- [x] `SessionCredentialManager` wraps base `CredentialManager`
+- [x] Resolution order: temp credentials → profile override → base manager
+- [x] `GetAPIKey(provider)` follows resolution chain
 
 #### Profile Override
-- [ ] `SetProfileOverride(profile)` changes profile for session
-- [ ] Verify profile exists before setting
-- [ ] Override cleared on session end
+- [x] `SetProfileOverride(profile)` changes profile for session
+- [x] Verify profile exists before setting
+- [x] Override cleared on session end
 
 #### Temporary Credentials
-- [ ] `TempCredential` struct with Provider, APIKey, ExpiresAt, Source
-- [ ] `SetTemporaryCredential(provider, apiKey, ttl)` stores in memory
-- [ ] Temporary credentials never persisted to disk
-- [ ] Auto-expire based on TTL
-- [ ] Max TTL configurable (default: 24h)
+- [x] `TempCredential` struct with Provider, APIKey, ExpiresAt, Source
+- [x] `SetTemporaryCredential(provider, apiKey, ttl)` stores in memory
+- [x] Temporary credentials never persisted to disk
+- [x] Auto-expire based on TTL
+- [x] Max TTL configurable (default: 24h)
 
 #### Session Cleanup
-- [ ] `ClearSession()` zeros and removes all temp credentials
-- [ ] Called automatically on session end
-- [ ] Profile override cleared
+- [x] `ClearSession()` zeros and removes all temp credentials
+- [x] Called automatically on session end
+- [x] Profile override cleared
 
 #### Audit Integration
-- [ ] Log credential access events (not values)
-- [ ] Log profile override changes
-- [ ] Log temp credential usage (provider only, not key)
+- [x] Log credential access events (not values)
+- [x] Log profile override changes
+- [x] Log temp credential usage (provider only, not key)
 
 **Tests:**
-- [ ] Resolution order correct
-- [ ] Profile override works
-- [ ] Temp credentials expire correctly
-- [ ] Session cleanup removes all credentials
-- [ ] Temp credentials not shared between sessions
+- [x] Resolution order correct
+- [x] Profile override works
+- [x] Temp credentials expire correctly
+- [x] Session cleanup removes all credentials
+- [x] Temp credentials not shared between sessions
 
 ---
 
@@ -20090,36 +20091,36 @@ var PreToolCredentialHook = &Hook{
 
 ---
 
-### 6.126 Tool Credential Registry
+### 6.126 Tool Credential Registry ✅ COMPLETED
 
 Metadata declaring tool credential requirements.
 
-**Files to create:**
-- `core/tools/credential_registry.go`
-- `core/tools/credential_registry_test.go`
+**Files created:**
+- `core/tools/credential_registry.go` ✅
+- `core/tools/credential_registry_test.go` ✅
 
 **Dependencies:** None (data definitions)
 
 **Acceptance Criteria:**
 
 #### ToolMetadata Struct
-- [ ] Name string
-- [ ] RequiredCredentials []string (provider names)
+- [x] Name string
+- [x] RequiredCredentials []string (provider names)
 
 #### ToolRegistry Map
-- [ ] Register all tools with credential requirements
-- [ ] generate_embeddings: ["openai"]
-- [ ] create_pr: ["github"]
-- [ ] web_search: ["serpapi"]
-- [ ] read_file, write_file: [] (no credentials)
+- [x] Register all tools with credential requirements
+- [x] generate_embeddings: ["openai"]
+- [x] create_pr: ["github"]
+- [x] web_search: ["serpapi"]
+- [x] read_file, write_file: [] (no credentials)
 
 #### GetToolMetadata Function
-- [ ] Lookup by tool name
-- [ ] Returns nil for unknown tools (no credentials assumed)
+- [x] Lookup by tool name
+- [x] Returns nil for unknown tools (no credentials assumed)
 
 #### Validation
-- [ ] `ValidateToolRegistry()` ensures no tool has credential-like parameters
-- [ ] Fails build if tool declares both credentials AND credential params
+- [x] `ValidateToolRegistry()` ensures no tool has credential-like parameters
+- [x] Fails build if tool declares both credentials AND credential params
 
 ```go
 var ToolRegistry = map[string]*ToolMetadata{
@@ -20129,50 +20130,50 @@ var ToolRegistry = map[string]*ToolMetadata{
 ```
 
 **Tests:**
-- [ ] Registry contains all external API tools
-- [ ] Metadata lookup works
-- [ ] Unknown tool returns nil
-- [ ] Validation detects bad tool definitions
+- [x] Registry contains all external API tools
+- [x] Metadata lookup works
+- [x] Unknown tool returns nil
+- [x] Validation detects bad tool definitions
 
 ---
 
-### 6.127 Credential Audit Log
+### 6.127 Credential Audit Log ✅ COMPLETED
 
 Tamper-evident logging of all credential access.
 
-**Files to create:**
-- `core/credentials/audit.go`
-- `core/credentials/audit_test.go`
+**Files created:**
+- `core/credentials/audit.go` ✅
+- `core/credentials/audit_test.go` ✅
 
 **Dependencies:** None (standalone)
 
 **Acceptance Criteria:**
 
 #### CredentialAuditEntry Struct
-- [ ] ID, Timestamp, Action, AgentID, AgentType, Provider
-- [ ] ToolCallID, HandleID, Reason (optional fields)
-- [ ] PrevHash, EntryHash (hash chain)
+- [x] ID, Timestamp, Action, AgentID, AgentType, Provider
+- [x] ToolCallID, HandleID, Reason (optional fields)
+- [x] PrevHash, EntryHash (hash chain)
 
 #### CredentialAuditAction Enum
-- [ ] granted, denied, resolved, revoked, pending, expired
+- [x] granted, denied, resolved, revoked, pending, expired
 
 #### CredentialAuditLog Struct
-- [ ] entries slice with mutex
-- [ ] hashChain string (running hash)
-- [ ] storage backend interface
+- [x] entries slice with mutex
+- [x] hashChain string (running hash)
+- [x] storage backend interface
 
 #### Log Methods
-- [ ] LogGranted, LogDenied, LogResolved, LogRevoked, LogPending
-- [ ] Each computes hash chain
+- [x] LogGranted, LogDenied, LogResolved, LogRevoked, LogPending
+- [x] Each computes hash chain
 
 #### Hash Chain
-- [ ] SHA-256 of entry fields + previous hash
-- [ ] `Verify()` validates entire chain integrity
-- [ ] Detects tampering at any entry
+- [x] SHA-256 of entry fields + previous hash
+- [x] `Verify()` validates entire chain integrity
+- [x] Detects tampering at any entry
 
 #### Query Method
-- [ ] Filter by AgentType, Provider, Action, time range
-- [ ] Returns matching entries
+- [x] Filter by AgentType, Provider, Action, time range
+- [x] Returns matching entries
 
 ```go
 type CredentialAuditEntry struct {
@@ -20188,44 +20189,44 @@ type CredentialAuditEntry struct {
 ```
 
 **Tests:**
-- [ ] Entries logged with correct action types
-- [ ] Hash chain computed correctly
-- [ ] Verify() passes for valid log
-- [ ] Verify() fails for tampered log
-- [ ] Query filters work correctly
-- [ ] Thread-safe logging
+- [x] Entries logged with correct action types
+- [x] Hash chain computed correctly
+- [x] Verify() passes for valid log
+- [x] Verify() fails for tampered log
+- [x] Query filters work correctly
+- [x] Thread-safe logging
 
 ---
 
-### 6.128 User Authorization Manager
+### 6.128 User Authorization Manager ✅ COMPLETED
 
 First-time credential access confirmations.
 
-**Files to create:**
-- `core/credentials/authorization.go`
-- `core/credentials/authorization_test.go`
+**Files created:**
+- `core/credentials/authorization.go` ✅
+- `core/credentials/authorization_test.go` ✅
 
 **Dependencies:** 6.124 (integrates with broker), Guide agent
 
 **Acceptance Criteria:**
 
 #### UserAuthorizationManager Struct
-- [ ] authorizations map (agentType:provider → bool)
-- [ ] storage backend for persistence
-- [ ] mutex for thread safety
+- [x] authorizations map (agentType:provider → bool)
+- [x] storage backend for persistence
+- [x] mutex for thread safety
 
 #### RequestAuthorization Method
-- [ ] Check if already authorized (fast path)
-- [ ] Prompt user via Guide agent
-- [ ] Options: "Allow", "Allow for session only", "Deny"
-- [ ] Persist "Allow" to storage
-- [ ] Session-only doesn't persist
-- [ ] Return error on deny
+- [x] Check if already authorized (fast path)
+- [x] Prompt user via Guide agent
+- [x] Options: "Allow", "Allow for session only", "Deny"
+- [x] Persist "Allow" to storage
+- [x] Session-only doesn't persist
+- [x] Return error on deny
 
 #### Integration with Broker
-- [ ] Broker calls `hasUserAuthorization()` for RequireAuth scopes
-- [ ] Returns CredentialAuthRequiredError if not authorized
-- [ ] Error triggers authorization flow
+- [x] Broker calls `hasUserAuthorization()` for RequireAuth scopes
+- [x] Returns CredentialAuthRequiredError if not authorized
+- [x] Error triggers authorization flow
 
 ```go
 func (m *UserAuthorizationManager) RequestAuthorization(
@@ -20235,63 +20236,63 @@ func (m *UserAuthorizationManager) RequestAuthorization(
 ```
 
 **Tests:**
-- [ ] Already authorized returns immediately
-- [ ] "Allow" persists authorization
-- [ ] "Allow for session only" doesn't persist
-- [ ] "Deny" returns error
-- [ ] User prompt shows correct message
-- [ ] Concurrent authorization requests serialized
+- [x] Already authorized returns immediately
+- [x] "Allow" persists authorization
+- [x] "Allow for session only" doesn't persist
+- [x] "Deny" returns error
+- [x] User prompt shows correct message
+- [x] Concurrent authorization requests serialized
 
 ---
 
-### 6.129 Credential Broker Integration Tests
+### 6.129 Credential Broker Integration Tests ✅ COMPLETED
 
 End-to-end tests for credential access system.
 
-**Files to create:**
-- `tests/e2e/credential_broker_test.go`
-- `tests/fixtures/credential_test_tools/`
+**Files created:**
+- `tests/e2e/credential_broker_test.go` ✅
+- `tests/fixtures/credential_test_tools/` ✅
 
 **Dependencies:** 6.122-6.128, Secret Management (6.113-6.121)
 
 **Test Scenarios:**
 
 #### Basic Access Flow
-- [ ] Engineer calls create_pr → credential injected → success
-- [ ] Librarian calls generate_embeddings → credential injected → success
-- [ ] Agent never sees raw credential value
+- [x] Engineer calls create_pr → credential injected → success
+- [x] Librarian calls generate_embeddings → credential injected → success
+- [x] Agent never sees raw credential value
 
 #### Scope Enforcement
-- [ ] Librarian tries github → denied (scope violation)
-- [ ] Orchestrator tries any credential → denied (no access)
-- [ ] Unknown provider → denied (default deny)
+- [x] Librarian tries github → denied (scope violation)
+- [x] Orchestrator tries any credential → denied (no access)
+- [x] Unknown provider → denied (default deny)
 
 #### Handle Lifecycle
-- [ ] Handle expires after 30 seconds
-- [ ] Handle invalidates after use
-- [ ] Unused handles revoked on cleanup
+- [x] Handle expires after 30 seconds
+- [x] Handle invalidates after use
+- [x] Unused handles revoked on cleanup
 
 #### User Authorization
-- [ ] First github access prompts user
-- [ ] "Allow" enables future access
-- [ ] "Deny" blocks access
+- [x] First github access prompts user
+- [x] "Allow" enables future access
+- [x] "Deny" blocks access
 
 #### Secret Management Integration
-- [ ] Credential in tool output → redacted
-- [ ] Credential in agent message → redacted
-- [ ] Credential as parameter → blocked by env_var_isolation
+- [x] Credential in tool output → redacted
+- [x] Credential in agent message → redacted
+- [x] Credential as parameter → blocked by env_var_isolation
 
 #### Audit Trail
-- [ ] All credential access logged
-- [ ] Hash chain verifies
-- [ ] Query returns correct entries
+- [x] All credential access logged
+- [x] Hash chain verifies
+- [x] Query returns correct entries
 
 **Acceptance Criteria:**
-- [ ] All scenarios passing
-- [ ] No credential leakage to LLM context
-- [ ] Audit log complete and tamper-evident
-- [ ] Performance: < 5ms overhead per tool call
-- [ ] Concurrent access thread-safe
+- [x] All scenarios passing
+- [x] No credential leakage to LLM context
+- [x] Audit log complete and tamper-evident
+- [x] Performance: < 5ms overhead per tool call
+- [x] Concurrent access thread-safe
 
 ---
 
