@@ -10365,7 +10365,7 @@ Role-based permission system with per-project persistent allowlists.
 
 ---
 
-### 0.69 Sandbox Manager
+### 0.69 Sandbox Manager ✅ COMPLETED
 
 Layered sandbox providing OS isolation, VFS, and network proxy.
 
@@ -10441,7 +10441,7 @@ Layered sandbox providing OS isolation, VFS, and network proxy.
 
 ---
 
-### 0.70 Audit Logger
+### 0.70 Audit Logger ✅ COMPLETED
 
 Tamper-evident audit logging with cryptographic chaining.
 
@@ -10509,7 +10509,7 @@ Tamper-evident audit logging with cryptographic chaining.
 
 ---
 
-### 0.71 Audit Query Interface
+### 0.71 Audit Query Interface ✅ COMPLETED
 
 CLI and programmatic interface for querying audit logs.
 
@@ -23258,24 +23258,24 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ════════════════════════════════                                                    │
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4A: Security Model                                                ││
-│ │ • 0.68 Permission Manager                                                        ││
-│ │ • 0.69 Sandbox Manager                                                           ││
-│ │ • 0.70 Audit Logger                                                              ││
-│ │ • 0.71 Audit Query Interface                                                     ││
-│ │ • 0.72 Session Credential Manager                                                ││
-│ │ • Secret Management System (6.1-6.12)                                            ││
-│ │ • Credential Broker System                                                       ││
+│ │ PARALLEL GROUP 4A: Security Model ✅ COMPLETED                                   ││
+│ │ • 0.68 Permission Manager ✅                                                     ││
+│ │ • 0.69 Sandbox Manager ✅                                                        ││
+│ │ • 0.70 Audit Logger ✅                                                           ││
+│ │ • 0.71 Audit Query Interface ✅                                                  ││
+│ │ • 0.72 Session Credential Manager ✅                                             ││
+│ │ • Secret Management System (6.113-6.121) ✅                                      ││
+│ │ • Credential Broker System (6.122-6.129) ✅                                      ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4B: Multi-Session Coordination                                    ││
-│ │ • 0.55 Global Subscription Tracker                                               ││
-│ │ • 0.56 Cross-Session Dual Queue Gate                                             ││
-│ │ • 0.57 Global Pipeline Scheduler                                                 ││
-│ │ • 0.58 Multi-Session WAL Manager                                                 ││
-│ │ • 0.59 Global Circuit Breaker Registry                                           ││
-│ │ • 0.73 Session Knowledge Manager                                                 ││
+│ │ PARALLEL GROUP 4B: Multi-Session Coordination ✅ COMPLETED                       ││
+│ │ • 0.55 Global Subscription Tracker ✅                                            ││
+│ │ • 0.56 Cross-Session Dual Queue Gate ✅                                          ││
+│ │ • 0.57 Global Pipeline Scheduler ✅                                              ││
+│ │ • 0.58 Multi-Session WAL Manager ✅                                              ││
+│ │ • 0.59 Global Circuit Breaker Registry ✅                                        ││
+│ │ • 0.73 Session Knowledge Manager ✅                                              ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -23324,22 +23324,22 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4E: Tree-Sitter CVS Integration (TS Phases 3-4)                  ││
+│ │ PARALLEL GROUP 4E: Tree-Sitter CVS Integration (TS Phases 3-4) ✅ COMPLETE      ││
 │ │ ** NEW: CVS integration and agent tool interface **                              ││
 │ │                                                                                  ││
 │ │ TS PHASE 3 (After Wave 3E, depends on FS.5.1 CVS):                              ││
-│ │ • TS.3.1 TreeSitterManager (CVS integration)                                    ││
+│ │ • TS.3.1 TreeSitterManager (CVS integration) ✅                                 ││
 │ │   - ComputeNodePath, ResolveNodePath                                            ││
 │ │   - ParseIncremental for FileVersion                                            ││
 │ │   - Integration with Target struct from FS.1.4                                  ││
 │ │                                                                                  ││
 │ │ TS PHASE 4 (After Phase 3, all parallel):                                       ││
-│ │ • TS.4.1 TreeSitterTool (base agent interface)                                  ││
-│ │ • TS.4.2 Librarian Skills (ts_parse, ts_query, ts_find_*)                       ││
-│ │ • TS.4.3 Engineer Skills (ts_rename, ts_extract, ts_find_targets)               ││
-│ │ • TS.4.4 Inspector Skills (ts_complexity, ts_smells, ts_validate)               ││
-│ │ • TS.4.5 Tester Skills (ts_discover_tests, ts_find_testable)                    ││
-│ │ • TS.4.6 Designer Skills (ts_components, ts_jsx, ts_styles)                     ││
+│ │ • TS.4.1 TreeSitterTool (base agent interface) ✅                               ││
+│ │ • TS.4.2 Librarian Skills (ts_parse, ts_query, ts_find_*) ✅                    ││
+│ │ • TS.4.3 Engineer Skills (ts_rename, ts_extract, ts_find_targets) ✅            ││
+│ │ • TS.4.4 Inspector Skills (ts_complexity, ts_smells, ts_validate) ✅            ││
+│ │ • TS.4.5 Tester Skills (ts_discover_tests, ts_find_testable) ✅                 ││
+│ │ • TS.4.6 Designer Skills (ts_components, ts_jsx, ts_styles) ✅                  ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
 │ │   core/treesitter/manager.go, tool.go, skills/librarian.go,                     ││
