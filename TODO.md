@@ -4253,7 +4253,7 @@ Abstract LLM provider interactions behind a common interface.
 - [x] `Usage` struct: InputTokens, OutputTokens, TotalTokens, CacheReadTokens, CacheWriteTokens
 - [x] `StopReason` constants: end_turn, max_tokens, stop_sequence, tool_use, error
 - [x] `StreamHandler` callback type for streaming
-- [ ] `SupportedModels() []ModelInfo` - returns available models with pricing info
+- [x] `SupportedModels() []ModelInfo` - returns available models with pricing info
 - [ ] `CountTokens(messages []Message) (int, error)` - pre-request token estimation
 - [ ] `MaxContextTokens(model string) int` - model context window size
 - [ ] `HealthCheck(ctx context.Context) error` - provider availability check
@@ -5096,7 +5096,7 @@ Hierarchical token budget enforcement with full attribution.
 
 #### Cost Calculation
 - [x] Cost = (InputTokens / 1M * InputPrice) + (OutputTokens / 1M * OutputPrice)
-- [ ] Price loaded from `ModelInfo` in adapter
+- [x] Price loaded from `ModelInfo` in adapter
 - [x] Currency always USD
 
 #### Attribution Report
@@ -5457,31 +5457,31 @@ Implements the core goroutine architecture: one goroutine per standalone agent, 
 **Acceptance Criteria:**
 
 #### Standalone Agent Goroutines
-- [ ] `AgentRunner` struct manages goroutine lifecycle
-- [ ] `Start(ctx context.Context) error` - spawns goroutine
-- [ ] `Stop() error` - graceful shutdown with timeout
-- [ ] `IsRunning() bool` - status check
-- [ ] Standalone agents: Guide, Architect, Orchestrator, Librarian, Archivalist, Academic
-- [ ] No concurrency limit on standalone agents (they self-regulate via LLM queue)
+- [x] `AgentRunner` struct manages goroutine lifecycle
+- [x] `Start(ctx context.Context) error` - spawns goroutine
+- [x] `Stop() error` - graceful shutdown with timeout
+- [x] `IsRunning() bool` - status check
+- [x] Standalone agents: Guide, Architect, Orchestrator, Librarian, Archivalist, Academic
+- [x] No concurrency limit on standalone agents (they self-regulate via LLM queue)
 
 #### Pipeline Goroutines
-- [ ] Pipeline spawns single goroutine for all phases
-- [ ] Sequential internal execution: Inspector → Tester → Worker → Verify
-- [ ] `PipelineRunner` wraps pipeline lifecycle
-- [ ] Clean shutdown on context cancellation
-- [ ] Panic recovery with error reporting
+- [x] Pipeline spawns single goroutine for all phases
+- [x] Sequential internal execution: Inspector → Tester → Worker → Verify
+- [x] `PipelineRunner` wraps pipeline lifecycle
+- [x] Clean shutdown on context cancellation
+- [x] Panic recovery with error reporting
 
 #### Lifecycle States
-- [ ] States: `Created`, `Starting`, `Running`, `Stopping`, `Stopped`, `Failed`
-- [ ] State transitions are atomic
+- [x] States: `Created`, `Starting`, `Running`, `Stopping`, `Stopped`, `Failed`
+- [x] State transitions are atomic
 - [ ] State change events published to Signal Bus
-- [ ] `WaitForState(state, timeout) error` - blocking wait
+- [x] `WaitForState(state, timeout) error` - blocking wait
 
 **Tests:**
-- [ ] Agent starts and stops cleanly
-- [ ] Concurrent start/stop safe
-- [ ] Panic in goroutine captured and reported
-- [ ] Context cancellation triggers shutdown
+- [x] Agent starts and stops cleanly
+- [x] Concurrent start/stop safe
+- [x] Panic in goroutine captured and reported
+- [x] Context cancellation triggers shutdown
 
 ---
 
@@ -5966,29 +5966,29 @@ Implements silent retry with frequency-based notification for transient errors.
 **Acceptance Criteria:**
 
 #### Frequency Tracking
-- [ ] `TransientTracker` struct with sliding window
-- [ ] `Record(error) bool` - returns true if notification needed
-- [ ] Configurable `frequency_count` (default: 3)
-- [ ] Configurable `frequency_window` (default: 10s)
-- [ ] Configurable `notification_cooldown` (default: 60s)
+- [x] `TransientTracker` struct with sliding window
+- [x] `Record(error) bool` - returns true if notification needed
+- [x] Configurable `frequency_count` (default: 3)
+- [x] Configurable `frequency_window` (default: 10s)
+- [x] Configurable `notification_cooldown` (default: 60s)
 
 #### Sliding Window
-- [ ] Prune errors outside window on each record
-- [ ] Thread-safe with mutex
-- [ ] Memory-bounded (only track timestamps, not full errors)
+- [x] Prune errors outside window on each record
+- [x] Thread-safe with mutex
+- [x] Memory-bounded (only track timestamps, not full errors)
 
 #### Notification Logic
-- [ ] Return false (silent) for isolated transient errors
-- [ ] Return true when frequency threshold exceeded
-- [ ] Respect cooldown after notification
+- [x] Return false (silent) for isolated transient errors
+- [x] Return true when frequency threshold exceeded
+- [x] Respect cooldown after notification
 - [ ] Publish SignalTransientFrequencyAlert to Signal Bus when true
 
 **Tests:**
-- [ ] Single transient error is silent
-- [ ] N errors in window triggers notification
-- [ ] Errors outside window don't count
-- [ ] Cooldown prevents repeated notifications
-- [ ] Thread-safe under concurrent access
+- [x] Single transient error is silent
+- [x] N errors in window triggers notification
+- [x] Errors outside window don't count
+- [x] Cooldown prevents repeated notifications
+- [x] Thread-safe under concurrent access
 
 ---
 
@@ -6005,38 +6005,38 @@ Implements per-tier retry behavior with exponential backoff.
 **Acceptance Criteria:**
 
 #### Retry Policy
-- [ ] `RetryPolicy` struct per error tier
-- [ ] `max_attempts`: maximum retry count
-- [ ] `initial_delay`: starting backoff duration
-- [ ] `max_delay`: maximum backoff duration
-- [ ] `multiplier`: backoff multiplier (default: 2.0)
-- [ ] `use_retry_after`: respect Retry-After header (for RateLimit)
+- [x] `RetryPolicy` struct per error tier
+- [x] `max_attempts`: maximum retry count
+- [x] `initial_delay`: starting backoff duration
+- [x] `max_delay`: maximum backoff duration
+- [x] `multiplier`: backoff multiplier (default: 2.0)
+- [x] `use_retry_after`: respect Retry-After header (for RateLimit)
 
 #### Default Policies (all configurable)
-- [ ] Transient: 5 attempts, 100ms initial, 5s max, 2.0x
-- [ ] ExternalRateLimit: 10 attempts, 1s initial, 60s max, 2.0x, use Retry-After
-- [ ] ExternalDegrading: 3 attempts, 5s initial, 30s max, 2.0x
-- [ ] Permanent: 0 attempts (no retry)
-- [ ] UserFixable: 0 attempts (no retry)
+- [x] Transient: 5 attempts, 100ms initial, 5s max, 2.0x
+- [x] ExternalRateLimit: 10 attempts, 1s initial, 60s max, 2.0x, use Retry-After
+- [x] ExternalDegrading: 3 attempts, 5s initial, 30s max, 2.0x
+- [x] Permanent: 0 attempts (no retry)
+- [x] UserFixable: 0 attempts (no retry)
 
 #### Backoff Calculator
-- [ ] `CalculateDelay(attempt int, policy RetryPolicy) time.Duration`
-- [ ] Exponential: delay = initial * (multiplier ^ attempt)
-- [ ] Capped at max_delay
-- [ ] Jitter option (±10%) to prevent thundering herd
+- [x] `CalculateDelay(attempt int, policy RetryPolicy) time.Duration`
+- [x] Exponential: delay = initial * (multiplier ^ attempt)
+- [x] Capped at max_delay
+- [x] Jitter option (±10%) to prevent thundering herd
 
 #### Retry Executor
-- [ ] `RetryWithPolicy(ctx, fn, tier) (result, error)`
-- [ ] Respects context cancellation
-- [ ] Returns last error if all attempts fail
+- [x] `RetryWithPolicy(ctx, fn, tier) (result, error)`
+- [x] Respects context cancellation
+- [x] Returns last error if all attempts fail
 - [ ] Publishes retry events to Signal Bus (for UI countdown)
 
 **Tests:**
-- [ ] Exponential backoff calculates correctly
-- [ ] Max delay caps backoff
-- [ ] Jitter stays within bounds
-- [ ] Context cancellation stops retries
-- [ ] Retry-After header respected
+- [x] Exponential backoff calculates correctly
+- [x] Max delay caps backoff
+- [x] Jitter stays within bounds
+- [x] Context cancellation stops retries
+- [x] Retry-After header respected
 
 ---
 
@@ -6053,46 +6053,46 @@ Implements per-resource circuit breakers with configurable thresholds.
 **Acceptance Criteria:**
 
 #### Circuit States
-- [ ] `CircuitState` enum: Closed, Open, HalfOpen
-- [ ] State transitions are atomic
+- [x] `CircuitState` enum: Closed, Open, HalfOpen
+- [x] State transitions are atomic
 - [ ] State change publishes to Signal Bus
 
 #### Circuit Breaker
-- [ ] `CircuitBreaker` struct per resource
-- [ ] `RecordResult(success bool)` - tracks outcome
-- [ ] `Allow() bool` - checks if request should proceed
-- [ ] `ForceReset()` - manual reset (user override)
+- [x] `CircuitBreaker` struct per resource
+- [x] `RecordResult(success bool)` - tracks outcome
+- [x] `Allow() bool` - checks if request should proceed
+- [x] `ForceReset()` - manual reset (user override)
 
 #### Trip Conditions (configurable per resource)
-- [ ] Count-based: N consecutive failures
-- [ ] Rate-based: failure rate in sliding window
-- [ ] Trip on EITHER condition met
+- [x] Count-based: N consecutive failures
+- [x] Rate-based: failure rate in sliding window
+- [x] Trip on EITHER condition met
 
 #### Per-Resource Defaults
-- [ ] LLM: 5 consecutive, 50% rate, 20 window, 30s cooldown
-- [ ] File: 2 consecutive, 30% rate, 10 window, 10s cooldown
-- [ ] Network: 3 consecutive, 50% rate, 20 window, 30s cooldown
-- [ ] Subprocess: 3 consecutive, 40% rate, 15 window, 20s cooldown
+- [x] LLM: 5 consecutive, 50% rate, 20 window, 30s cooldown
+- [x] File: 2 consecutive, 30% rate, 10 window, 10s cooldown
+- [x] Network: 3 consecutive, 50% rate, 20 window, 30s cooldown
+- [x] Subprocess: 3 consecutive, 40% rate, 15 window, 20s cooldown
 
 #### Half-Open Probe
-- [ ] After cooldown, allow single probe request
-- [ ] Success → close circuit
-- [ ] Failure → back to open, reset cooldown
-- [ ] Configurable success_threshold for closing (default: 3)
+- [x] After cooldown, allow single probe request
+- [x] Success → close circuit
+- [x] Failure → back to open, reset cooldown
+- [x] Configurable success_threshold for closing (default: 3)
 
 #### Registry
-- [ ] `CircuitRegistry` manages all circuit breakers
-- [ ] `Get(resourceID string) *CircuitBreaker`
-- [ ] Lazy initialization with defaults
-- [ ] Status endpoint for all circuits
+- [x] `CircuitRegistry` manages all circuit breakers
+- [x] `Get(resourceID string) *CircuitBreaker`
+- [x] Lazy initialization with defaults
+- [x] Status endpoint for all circuits
 
 **Tests:**
-- [ ] Count-based trip works
-- [ ] Rate-based trip works
-- [ ] Half-open probe works
-- [ ] Manual reset works
-- [ ] Cooldown timing correct
-- [ ] Multiple circuits independent
+- [x] Count-based trip works
+- [x] Rate-based trip works
+- [x] Half-open probe works
+- [x] Manual reset works
+- [x] Cooldown timing correct
+- [x] Multiple circuits independent
 
 ---
 
@@ -20530,9 +20530,9 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 2C: Error Handling & Recovery                                     ││
 │ │ • 0.24 Recovery Manager                                                          ││
-│ │ • 0.27 Transient Error Tracker                                                   ││
-│ │ • 0.28 Retry Policies                                                            ││
-│ │ • 0.29 Circuit Breaker                                                           ││
+│ │ • 0.27 Transient Error Tracker (DONE)                                            ││
+│ │ • 0.28 Retry Policies (DONE)                                                     ││
+│ │ • 0.29 Circuit Breaker (DONE)                                                    ││
 │ │ • 0.30 Escalation Chain                                                          ││
 │ │ • 0.31 Retry Briefing System                                                     ││
 │ │ • 0.32 Rollback Manager                                                          ││
