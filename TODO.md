@@ -585,45 +585,46 @@ Phase 4 (AFTER Phase 3):
 #### Phase 1A: Detection Utilities (Shared)
 
 **File: `core/detect/which.go`**
-- [ ] `Which(binary string) string` - Find binary in PATH
-- [ ] Cross-platform support (Windows/Unix)
-- [ ] Caching of PATH lookups (invalidate on PATH change)
+- [x] `Which(binary string) string` - Find binary in PATH
+- [x] Cross-platform support (Windows/Unix)
+- [x] Caching of PATH lookups (invalidate on PATH change)
 
 **File: `core/detect/files.go`**
-- [ ] `FileExists(root string, files ...string) bool` - Check if any file exists
-- [ ] `FindUp(startDir string, filename string) (string, error)` - Search upward for file
-- [ ] `FindUpAny(startDir string, filenames ...string) (string, string, error)` - Search upward for any file
+- [x] `FileExists(root string, files ...string) bool` - Check if any file exists
+- [x] `FindUp(startDir string, filename string) (string, error)` - Search upward for file
+- [x] `FindUpAny(startDir string, filenames ...string) (string, string, error)` - Search upward for any file
 
 **File: `core/detect/dependencies.go`**
-- [ ] `HasDependency(root string, pkg string) (bool, error)` - Check package.json
-- [ ] `HasGemDependency(root string, gem string) (bool, error)` - Check Gemfile
-- [ ] `HasPythonDependency(root string, pkg string) (bool, error)` - Check requirements.txt/pyproject.toml
-- [ ] `HasCargoDependency(root string, crate string) (bool, error)` - Check Cargo.toml
+- [x] `HasDependency(root string, pkg string) (bool, error)` - Check package.json
+- [x] `HasGemDependency(root string, gem string) (bool, error)` - Check Gemfile
+- [x] `HasPythonDependency(root string, pkg string) (bool, error)` - Check requirements.txt/pyproject.toml
+- [x] `HasCargoDependency(root string, crate string) (bool, error)` - Check Cargo.toml
+- [x] `HasGoDependency(root string, pkg string) (bool, error)` - Check go.mod
 
 #### Phase 1B: Type Definitions (Shared)
 
 **File: `core/format/types.go`**
-- [ ] `FormatterID` type definition
-- [ ] `FormatterDefinition` struct with ID, Name, Command, Extensions, Enabled func
-- [ ] `FormatterRegistry` struct with thread-safe map
-- [ ] `FormatterResult` struct with FormatterID, FilePath, Success, Changed, Error, Duration
-- [ ] `FormatterConfig` struct for user overrides (disabled, command, extensions)
+- [x] `FormatterID` type definition
+- [x] `FormatterDefinition` struct with ID, Name, Command, Extensions, Enabled func
+- [x] `FormatterRegistry` struct with thread-safe map
+- [x] `FormatterResult` struct with FormatterID, FilePath, Success, Changed, Error, Duration
+- [x] `FormatterConfig` struct for user overrides (disabled, command, extensions)
 
 **File: `core/lsp/types.go`**
-- [ ] `ServerID` type definition
-- [ ] `LanguageServerDefinition` struct with ID, Name, Command, Extensions, LanguageIDs, RootMarkers, Enabled func, AutoDownload
-- [ ] `AutoDownloadConfig` struct with Source, Package, Binary
-- [ ] `LSPClient` struct with ID, ServerID, ProjectRoot, Process, Conn, Capabilities
-- [ ] `DiagnosticResult` struct with ServerID, FilePath, Diagnostics
-- [ ] `LSPConfig` struct for user overrides (disabled, command, auto_download)
+- [x] `ServerID` type definition
+- [x] `LanguageServerDefinition` struct with ID, Name, Command, Extensions, LanguageIDs, RootMarkers, Enabled func, AutoDownload
+- [x] `AutoDownloadConfig` struct with Source, Package, Binary
+- [x] `LSPClient` struct with ID, ServerID, ProjectRoot, Process, Conn, Capabilities
+- [x] `DiagnosticResult` struct with ServerID, FilePath, Diagnostics
+- [x] `LSPConfig` struct for user overrides (disabled, command, auto_download)
 
 **File: `core/test/types.go`**
-- [ ] `TestFrameworkID` type definition
-- [ ] `TestFrameworkDefinition` struct (see Tester section for full definition)
-- [ ] `TestFrameworkRegistry` struct with thread-safe map
-- [ ] `TestResult` struct with passed, failed, skipped, duration, failures, coverage
-- [ ] `TestFailure` struct with TestName, File, Line, Message, Expected, Actual, StackTrace
-- [ ] `TestConfig` struct for user overrides
+- [x] `TestFrameworkID` type definition
+- [x] `TestFrameworkDefinition` struct (see Tester section for full definition)
+- [x] `TestFrameworkRegistry` struct with thread-safe map
+- [x] `TestResult` struct with passed, failed, skipped, duration, failures, coverage
+- [x] `TestFailure` struct with TestName, File, Line, Message, Expected, Actual, StackTrace
+- [x] `TestConfig` struct for user overrides
 
 #### Phase 2A-2B: Formatter Detection (Librarian)
 
@@ -4579,7 +4580,7 @@ Real-time LLM streaming responses integrated with the event bus for reactive age
 - [ ] Early aborts counted when stream cancelled before ChunkTypeEnd
 - [ ] Tokens saved estimated from aborted streams
 - [ ] Backpressure events counted when channel send blocks
-- [ ] Metrics exported via Prometheus-compatible interface
+- [ ] Metrics accessible via `MetricsRegistry.Get("stream")` for CLI display
 
 #### Stream Timeout Watchdog (NOT DONE - core/providers/stream_bridge.go)
 
@@ -19487,12 +19488,12 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 0B: Detection & Utility Libraries                                 ││
-│ │ • core/detect/which.go (binary detection)                                        ││
-│ │ • core/detect/files.go (file detection)                                          ││
-│ │ • core/detect/dependencies.go (package detection)                                ││
-│ │ • core/format/types.go (formatter types)                                         ││
-│ │ • core/lsp/types.go (LSP types)                                                  ││
-│ │ • core/test/types.go (test framework types)                                      ││
+│ │ • core/detect/which.go (binary detection) (DONE)                                 ││
+│ │ • core/detect/files.go (file detection) (DONE)                                   ││
+│ │ • core/detect/dependencies.go (package detection) (DONE)                         ││
+│ │ • core/format/types.go (formatter types) (DONE)                                  ││
+│ │ • core/lsp/types.go (LSP types) (DONE)                                           ││
+│ │ • core/test/types.go (test framework types) (DONE)                               ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
