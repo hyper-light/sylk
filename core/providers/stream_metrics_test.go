@@ -20,27 +20,32 @@ func TestNewStreamMetricsCollector(t *testing.T) {
 func TestStreamMetricsCollector_StartStop(t *testing.T) {
 	collector := NewStreamMetricsCollector()
 
-	// Should start successfully
 	collector.Start()
-	if !collector.started.Load() {
-		t.Error("expected started to be true")
-	}
 
-	// Double start should be idempotent
-	collector.Start()
-	if !collector.started.Load() {
-		t.Error("expected started to still be true")
-	}
+	chunk := &StreamChunk{Type: ChunkTypeText, Text: "test"}
+	collector.RecordChunk(chunk)
 
-	// Stop without early abort
-	collector.Stop(false)
-	if !collector.stopped.Load() {
-		t.Error("expected stopped to be true")
-	}
-
-	// Double stop should be idempotent
-	collector.Stop(true) // Try to change earlyAbort
 	metrics := collector.GetMetrics()
+	if metrics.ChunksReceived != 1 {
+		t.Errorf("expected 1 chunk after start, got %d", metrics.ChunksReceived)
+	}
+
+	collector.Start()
+	collector.RecordChunk(chunk)
+	metrics = collector.GetMetrics()
+	if metrics.ChunksReceived != 2 {
+		t.Errorf("expected 2 chunks after double start, got %d", metrics.ChunksReceived)
+	}
+
+	collector.Stop(false)
+	collector.RecordChunk(chunk)
+	metrics = collector.GetMetrics()
+	if metrics.ChunksReceived != 2 {
+		t.Errorf("expected 2 chunks after stop (no new chunks), got %d", metrics.ChunksReceived)
+	}
+
+	collector.Stop(true)
+	metrics = collector.GetMetrics()
 	if metrics.EarlyAborts != 0 {
 		t.Error("expected no early aborts after first stop")
 	}
