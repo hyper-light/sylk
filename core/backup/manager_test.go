@@ -55,7 +55,7 @@ func TestBackupListAndLatest(t *testing.T) {
 	backupMgr := NewManager(dirs, DefaultConfig())
 
 	_, _ = backupMgr.Backup(ctx, pool, "system")
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	_, _ = backupMgr.Backup(ctx, pool, "system")
 
 	backups, err := backupMgr.ListBackups("system")
@@ -63,8 +63,8 @@ func TestBackupListAndLatest(t *testing.T) {
 		t.Fatalf("ListBackups failed: %v", err)
 	}
 
-	if len(backups) < 1 {
-		t.Errorf("Backup count: got %d, want at least 1", len(backups))
+	if len(backups) != 2 {
+		t.Errorf("Backup count: got %d, want 2", len(backups))
 	}
 
 	latest, err := backupMgr.LatestBackup("system")
@@ -74,6 +74,10 @@ func TestBackupListAndLatest(t *testing.T) {
 
 	if latest == nil {
 		t.Error("Latest backup should not be nil")
+	}
+
+	if backups[0].Name != latest.Name {
+		t.Error("Latest should match first in sorted list")
 	}
 }
 
@@ -95,12 +99,12 @@ func TestBackupRetention(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		_, _ = backupMgr.Backup(ctx, pool, "system")
-		time.Sleep(1100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	backups, _ := backupMgr.ListBackups("system")
-	if len(backups) > config.RetentionCount {
-		t.Errorf("Retention: got %d backups, want at most %d", len(backups), config.RetentionCount)
+	if len(backups) != 3 {
+		t.Errorf("Retention: got %d backups, want 3", len(backups))
 	}
 }
 

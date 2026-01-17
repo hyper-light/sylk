@@ -63,13 +63,6 @@ func captureControlMessages(publisher *mocks.MockStreamPublisher) func() []*prov
 	}
 }
 
-func newPublisherRecorder(t *testing.T) (*mocks.MockStreamPublisher, func() []*messaging.Message[providers.StreamChunk], func() []*providers.StreamControlMessage) {
-	publisher := mocks.NewMockStreamPublisher(t)
-	messages := capturePublishedMessages(publisher)
-	control := captureControlMessages(publisher)
-	return publisher, messages, control
-}
-
 func allowPublish(publisher *mocks.MockStreamPublisher) {
 	publisher.On("Publish", mock.Anything).Return(nil)
 }
