@@ -818,22 +818,31 @@ func (c *DefaultCVS) ThreeWayMerge(ctx context.Context, base, ours, theirs Versi
 		return VersionID{}, err
 	}
 
-	baseVer, err := c.dagStore.Get(base)
+	versions, err := c.getThreeVersions(base, ours, theirs)
 	if err != nil {
 		return VersionID{}, err
+	}
+
+	return c.performThreeWayMerge(ctx, versions[0], versions[1], versions[2], resolver)
+}
+
+func (c *DefaultCVS) getThreeVersions(base, ours, theirs VersionID) ([]*FileVersion, error) {
+	baseVer, err := c.dagStore.Get(base)
+	if err != nil {
+		return nil, err
 	}
 
 	oursVer, err := c.dagStore.Get(ours)
 	if err != nil {
-		return VersionID{}, err
+		return nil, err
 	}
 
 	theirsVer, err := c.dagStore.Get(theirs)
 	if err != nil {
-		return VersionID{}, err
+		return nil, err
 	}
 
-	return c.performThreeWayMerge(ctx, baseVer, oursVer, theirsVer, resolver)
+	return []*FileVersion{baseVer, oursVer, theirsVer}, nil
 }
 
 func (c *DefaultCVS) performThreeWayMerge(ctx context.Context, base, ours, theirs *FileVersion, resolver ConflictResolver) (VersionID, error) {
@@ -951,20 +960,21 @@ func (c *DefaultCVS) RefreshFileLock(lockID string, ttl time.Duration) error {
 		return err
 	}
 
-	if ttl == 0 {
-		ttl = c.defaultLockTTL
-	}
+	ttl = c.effectiveLockTTL(ttl)
 
 	c.lockMu.Lock()
 	defer c.lockMu.Unlock()
 
+	return c.refreshLockByID(lockID, ttl)
+}
+
+func (c *DefaultCVS) refreshLockByID(lockID string, ttl time.Duration) error {
 	for _, lock := range c.fileLocks {
 		if lock.ID == lockID {
 			lock.ExpiresAt = time.Now().Add(ttl)
 			return nil
 		}
 	}
-
 	return ErrCVSLockNotFound
 }
 
@@ -1037,18 +1047,26 @@ func (c *DefaultCVS) Unsubscribe(subID SubscriptionID) error {
 	c.subMu.Lock()
 	defer c.subMu.Unlock()
 
-	for path, subs := range c.subscriptions {
-		if _, ok := subs[subID]; ok {
-			delete(subs, subID)
-			if len(subs) == 0 {
-				delete(c.subscriptions, path)
-			}
-			c.incrementStats(func(s *CVSStats) { s.ActiveSubscribers-- })
-			return nil
-		}
-	}
+	return c.removeSubscription(subID)
+}
 
+func (c *DefaultCVS) removeSubscription(subID SubscriptionID) error {
+	for path, subs := range c.subscriptions {
+		if _, ok := subs[subID]; !ok {
+			continue
+		}
+		c.deleteSubscription(path, subID, subs)
+		return nil
+	}
 	return nil
+}
+
+func (c *DefaultCVS) deleteSubscription(path string, subID SubscriptionID, subs map[SubscriptionID]FileChangeCallback) {
+	delete(subs, subID)
+	if len(subs) == 0 {
+		delete(c.subscriptions, path)
+	}
+	c.incrementStats(func(s *CVSStats) { s.ActiveSubscribers-- })
 }
 
 func (c *DefaultCVS) notifySubscribers(filePath string, newVer, oldVer VersionID, changeType FileChangeType, meta WriteMetadata) {
