@@ -23188,21 +23188,21 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 3D: FILESYSTEM Versioning Foundation (FS Phases 1-2)              ││
+│ │ PARALLEL GROUP 3D: FILESYSTEM Versioning Foundation (FS Phases 1-2) (DONE)       ││
 │ │ ** NEW: MVCC + OT + AST-Aware VFS Foundation **                                  ││
 │ │                                                                                  ││
-│ │ PHASE 1 (All parallel - no interdependencies):                                   ││
-│ │ • FS.1.1 VersionID and Content-Addressable Hashing                               ││
-│ │ • FS.1.2 Vector Clock for Causality Tracking                                     ││
-│ │ • FS.1.3 OperationID and Operation Types                                         ││
-│ │ • FS.1.4 AST-Aware Target                                                        ││
-│ │ • FS.1.5 FileVersion                                                             ││
+│ │ PHASE 1 (All parallel - no interdependencies): (DONE)                            ││
+│ │ • FS.1.1 VersionID and Content-Addressable Hashing (DONE)                        ││
+│ │ • FS.1.2 Vector Clock for Causality Tracking (DONE)                              ││
+│ │ • FS.1.3 OperationID and Operation Types (DONE)                                  ││
+│ │ • FS.1.4 AST-Aware Target (DONE)                                                 ││
+│ │ • FS.1.5 FileVersion (DONE)                                                      ││
 │ │                                                                                  ││
-│ │ PHASE 2 (After Phase 1, items parallel):                                         ││
-│ │ • FS.2.1 Content-Addressable Blob Store                                          ││
-│ │ • FS.2.2 Operation Log                                                           ││
-│ │ • FS.2.3 Version DAG Store                                                       ││
-│ │ • FS.2.4 Write-Ahead Log (for versioning)                                        ││
+│ │ PHASE 2 (After Phase 1, items parallel): (DONE)                                  ││
+│ │ • FS.2.1 Content-Addressable Blob Store (DONE)                                   ││
+│ │ • FS.2.2 Operation Log (DONE)                                                    ││
+│ │ • FS.2.3 Version DAG Store (DONE)                                                ││
+│ │ • FS.2.4 Write-Ahead Log (for versioning) (DONE)                                 ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
 │ │   core/versioning/version_id.go, vector_clock.go, operation.go,                  ││
@@ -23214,19 +23214,19 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 3E: Tree-Sitter Parsing Infrastructure (TS Phases 1-2)           ││
+│ │ PARALLEL GROUP 3E: Tree-Sitter Parsing Infrastructure (TS Phases 1-2) (DONE)    ││
 │ │ ** NEW: Purego-based tree-sitter for universal AST parsing **                   ││
 │ │                                                                                  ││
-│ │ TS PHASE 1 (All parallel - foundation):                                         ││
-│ │ • TS.1.1 Purego Bindings (libtree-sitter dynamic loading)                       ││
-│ │ • TS.1.2 High-Level Go Types (Parser, Tree, Node, Query)                        ││
-│ │ • TS.1.3 Grammar Registry (30+ languages, extensions map)                       ││
+│ │ TS PHASE 1 (All parallel - foundation): (DONE)                                  ││
+│ │ • TS.1.1 Purego Bindings (libtree-sitter dynamic loading) (DONE)                ││
+│ │ • TS.1.2 High-Level Go Types (Parser, Tree, Node, Query) (DONE)                 ││
+│ │ • TS.1.3 Grammar Registry (30+ languages, extensions map) (DONE)                ││
 │ │                                                                                  ││
-│ │ TS PHASE 2 (After Phase 1, all parallel):                                       ││
-│ │ • TS.2.1 Parser Implementation (incremental parsing)                            ││
-│ │ • TS.2.2 Tree/Node Implementation (stable paths)                                ││
-│ │ • TS.2.3 Query Engine (S-expression patterns)                                   ││
-│ │ • TS.2.4 Grammar Downloader (prebuilt + compile fallback)                       ││
+│ │ TS PHASE 2 (After Phase 1, all parallel): (DONE)                                ││
+│ │ • TS.2.1 Parser Implementation (incremental parsing) (DONE)                     ││
+│ │ • TS.2.2 Tree/Node Implementation (stable paths) (DONE)                         ││
+│ │ • TS.2.3 Query Engine (S-expression patterns) (DONE)                            ││
+│ │ • TS.2.4 Grammar Downloader (prebuilt + compile fallback) (DONE)                ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
 │ │   core/treesitter/bindings.go, types.go, parser.go, tree.go,                    ││
