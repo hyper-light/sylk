@@ -100,6 +100,27 @@ func (g *CrossSessionDualQueueGate) Submit(ctx context.Context, sessionID string
 	return g.waitForResponse(cancelCtx, req)
 }
 
+func (g *CrossSessionDualQueueGate) SubmitAsync(ctx context.Context, sessionID string, req *QueuedRequest) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.closed {
+		return ErrDualQueueGateClosed
+	}
+
+	req.SessionID = sessionID
+	req.SpawnTime = time.Now()
+	req.ResponseChan = make(chan *QueuedResponse, 1)
+
+	_, cancel := context.WithCancel(ctx)
+	req.CancelFunc = cancel
+
+	g.ensureSessionState(sessionID)
+	g.enqueueRequest(req)
+
+	return nil
+}
+
 func (g *CrossSessionDualQueueGate) ensureSessionState(sessionID string) {
 	if g.sessionStates[sessionID] == nil {
 		g.sessionStates[sessionID] = &SessionQueueState{
