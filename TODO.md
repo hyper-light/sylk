@@ -4336,24 +4336,24 @@ Credential management and provider configuration.
 **Acceptance Criteria:**
 
 #### Credential Resolution
-- [ ] Load from environment variable first: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`
-- [ ] Fall back to config file: `~/.sylk/credentials.yaml`
+- [x] Load from environment variable first: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`
+- [x] Fall back to config file: `~/.sylk/credentials.yaml`
 - [ ] Credentials file encrypted at rest using OS keyring or AES-256
-- [ ] Never log or serialize API keys
+- [x] Never log or serialize API keys
 
 #### Provider Config (`core/llm/config.go`)
-- [ ] `ProviderConfig` struct: Provider, BaseURL (optional), Models map, SoftLimit, Enabled
-- [ ] `UsageLimit` struct: Requests, Tokens, Period, WarnAt threshold
-- [ ] Load config from `~/.sylk/config.yaml`
-- [ ] Validate config on load (required fields, valid values)
+- [x] `ProviderConfig` struct: Provider, BaseURL (optional), Models map, SoftLimit, Enabled
+- [x] `UsageLimit` struct: Requests, Tokens, Period, WarnAt threshold
+- [x] Load config from `~/.sylk/config.yaml`
+- [x] Validate config on load (required fields, valid values)
 
 #### Provider Registry (`core/llm/registry.go`)
-- [ ] `ProviderRegistry` manages all configured providers
-- [ ] `Register(adapter ProviderAdapter)` adds provider
-- [ ] `Get(name string) ProviderAdapter` retrieves provider
-- [ ] `GetForModel(model string) ProviderAdapter` finds provider supporting model
-- [ ] `ListEnabled() []ProviderAdapter` returns enabled providers
-- [ ] Lazy initialization of adapters (don't connect until first use)
+- [x] `ProviderRegistry` manages all configured providers
+- [x] `Register(adapter ProviderAdapter)` adds provider
+- [x] `Get(name string) ProviderAdapter` retrieves provider
+- [x] `GetForModel(model string) ProviderAdapter` finds provider supporting model
+- [x] `ListEnabled() []ProviderAdapter` returns enabled providers
+- [x] Lazy initialization of adapters (don't connect until first use)
 
 #### Auth CLI (`cmd/auth.go`)
 - [ ] `sylk auth <provider>` - interactive API key setup
@@ -4364,10 +4364,10 @@ Credential management and provider configuration.
 - [ ] Validate key with provider health check before saving
 
 **Tests:**
-- [ ] Environment variable takes precedence over config file
-- [ ] Invalid credentials rejected with clear error
-- [ ] Config validation catches missing required fields
-- [ ] Registry returns correct adapter for model
+- [x] Environment variable takes precedence over config file
+- [x] Invalid credentials rejected with clear error
+- [x] Config validation catches missing required fields
+- [x] Registry returns correct adapter for model
 - [ ] Auth command saves encrypted credentials
 
 ```go
@@ -4398,31 +4398,31 @@ Priority-based request queuing for LLM calls.
 **Acceptance Criteria:**
 
 #### Priority Levels
-- [ ] `RequestPriority` type with constants: UserInteractive (100), Planning (80), Execution (60), Validation (40), Background (20)
-- [ ] Priority determination function: if user-invoked → UserInteractive, else based on agent type
-- [ ] Architect → Planning, Engineer/Designer → Execution, Inspector/Tester → Validation, Archivalist/Librarian → Background
+- [x] `RequestPriority` type with constants: UserInteractive (100), Planning (80), Execution (60), Validation (40), Background (20)
+- [x] Priority determination function: if user-invoked → UserInteractive, else based on agent type
+- [x] Architect → Planning, Engineer/Designer → Execution, Inspector/Tester → Validation, Archivalist/Librarian → Background
 
 #### LLM Request
-- [ ] `LLMRequest` struct with: ID, SessionID, PipelineID, TaskID, AgentID, AgentType, Provider, Model, Messages, Priority, CreatedAt, TokenEstimate
-- [ ] Request ID generation (UUID)
+- [x] `LLMRequest` struct with: ID, SessionID, PipelineID, TaskID, AgentID, AgentType, Provider, Model, Messages, Priority, CreatedAt, TokenEstimate
+- [x] Request ID generation (UUID)
 - [ ] Token estimation before queuing (for budget checks)
 
 #### Priority Queue
-- [ ] `PriorityQueue` using heap-based implementation
-- [ ] Thread-safe Push/Pop operations
-- [ ] Pop blocks when queue empty (using sync.Cond)
-- [ ] Higher priority value = processed first
-- [ ] Within same priority, FIFO ordering (use CreatedAt as tiebreaker)
-- [ ] `Close()` method to unblock waiting consumers
-- [ ] `Len()` method for monitoring
+- [x] `PriorityQueue` using heap-based implementation
+- [x] Thread-safe Push/Pop operations
+- [x] Pop blocks when queue empty (using sync.Cond)
+- [x] Higher priority value = processed first
+- [x] Within same priority, FIFO ordering (use CreatedAt as tiebreaker)
+- [x] `Close()` method to unblock waiting consumers
+- [x] `Len()` method for monitoring
 
 **Tests:**
-- [ ] Higher priority requests dequeued first
-- [ ] Same priority maintains FIFO order
-- [ ] Pop blocks on empty queue
-- [ ] Close unblocks waiting Pop calls
-- [ ] Concurrent Push/Pop is thread-safe
-- [ ] 10,000 requests queued/dequeued correctly
+- [x] Higher priority requests dequeued first
+- [x] Same priority maintains FIFO order
+- [x] Pop blocks on empty queue
+- [x] Close unblocks waiting Pop calls
+- [x] Concurrent Push/Pop is thread-safe
+- [x] 10,000 requests queued/dequeued correctly
 
 ```go
 // Required interface
@@ -4452,42 +4452,42 @@ Exponential backoff rate limiting with workflow pause signaling.
 **Acceptance Criteria:**
 
 #### Rate Limit State
-- [ ] `RateLimitState` enum: OK, Warning, Exceeded
-- [ ] State transitions: OK → Warning (approaching soft limit), OK/Warning → Exceeded (429 received)
-- [ ] State recovery: Exceeded → OK (after backoff period)
+- [x] `RateLimitState` enum: OK, Warning, Exceeded
+- [x] State transitions: OK → Warning (approaching soft limit), OK/Warning → Exceeded (429 received)
+- [x] State recovery: Exceeded → OK (after backoff period)
 
 #### Exponential Backoff
-- [ ] Base backoff: 1 second
-- [ ] Max backoff: 5 minutes
-- [ ] Backoff formula: `min(baseBackoff * 2^attempt, maxBackoff)`
-- [ ] Parse `Retry-After` header if present and use instead
-- [ ] Reset backoff attempt counter on successful request
+- [x] Base backoff: 1 second
+- [x] Max backoff: 5 minutes
+- [x] Backoff formula: `min(baseBackoff * 2^attempt, maxBackoff)`
+- [x] Parse `Retry-After` header if present and use instead
+- [x] Reset backoff attempt counter on successful request
 
 #### Provider Rate Limiter
-- [ ] `ProviderRateLimiter` struct per provider
-- [ ] `OnResponse(statusCode int, headers http.Header)` - handle response
-- [ ] `CanProceed() bool` - check if requests allowed
-- [ ] `RecordUsage(tokens int)` - track for soft limits
-- [ ] Thread-safe operations
+- [x] `ProviderRateLimiter` struct per provider
+- [x] `OnResponse(statusCode int, headers http.Header)` - handle response
+- [x] `CanProceed() bool` - check if requests allowed
+- [x] `RecordUsage(tokens int)` - track for soft limits
+- [x] Thread-safe operations
 
 #### Soft Limit Tracking
-- [ ] Track requests and tokens per period
-- [ ] Reset counters when period expires
-- [ ] Emit `SignalQuotaWarning` at warn threshold (e.g., 80%)
-- [ ] Continue allowing requests (soft limit = warning only)
+- [x] Track requests and tokens per period
+- [x] Reset counters when period expires
+- [x] Emit `SignalQuotaWarning` at warn threshold (e.g., 80%)
+- [x] Continue allowing requests (soft limit = warning only)
 
 #### Workflow Pause Integration
-- [ ] On 429: broadcast `SignalPauseAll` via SignalBus
-- [ ] Include in payload: provider, resumeAt time, attempt count
-- [ ] On backoff complete: broadcast `SignalResumeAll`
+- [x] On 429: broadcast `SignalPauseAll` via SignalBus (stub interface)
+- [x] Include in payload: provider, resumeAt time, attempt count
+- [x] On backoff complete: broadcast `SignalResumeAll`
 
 **Tests:**
-- [ ] 429 response triggers exponential backoff
-- [ ] Backoff time doubles each attempt up to max
-- [ ] Retry-After header respected
-- [ ] Success resets backoff counter
-- [ ] Soft limit warning emitted at threshold
-- [ ] CanProceed returns false during backoff
+- [x] 429 response triggers exponential backoff
+- [x] Backoff time doubles each attempt up to max
+- [x] Retry-After header respected
+- [x] Success resets backoff counter
+- [x] Soft limit warning emitted at threshold
+- [x] CanProceed returns false during backoff
 
 ```go
 // Required interface
@@ -4655,6 +4655,245 @@ type StreamMetrics struct {
     BackpressureEvents  int
 }
 ```
+
+---
+
+### 0.10b Streaming Edge Cases & Cross-Cutting Concerns
+
+Comprehensive edge case handling, configuration, observability, and resilience patterns for the streaming system.
+
+**Reference:** See ARCHITECTURE.md "Streaming + Event Bus Integration" section for design context.
+
+**Files:**
+- `core/providers/stream_config.go` (new)
+- `core/providers/stream_resilience.go` (new)
+- `core/providers/stream_test.go` (new/enhance)
+- `core/observability/stream_telemetry.go` (new)
+
+**Dependencies:** Requires 0.10a (Streaming + Event Bus Integration), 0.11 (Signal Bus).
+
+**Acceptance Criteria:**
+
+#### Streaming Configuration (NOT DONE - core/providers/stream_config.go)
+
+- [ ] `StreamConfig` struct with all configurable parameters
+- [ ] `ChannelBufferSize` (default: 100) - buffer for backpressure absorption
+- [ ] `ChunkTimeoutDuration` (default: 60s) - max time between chunks before timeout
+- [ ] `MaxStreamDuration` (default: 10m) - maximum total stream duration
+- [ ] `BackpressureWarningThreshold` (default: 5s) - cumulative backpressure before warning
+- [ ] `EnableMetrics` (default: true) - toggle stream metrics collection
+- [ ] `EnableTracing` (default: true) - toggle distributed tracing
+- [ ] `RetryOnNetworkError` (default: true) - auto-retry on transient network failures
+- [ ] `MaxRetryAttempts` (default: 3) - max retries for recoverable errors
+- [ ] `RetryBackoffBase` (default: 1s) - base duration for exponential retry backoff
+- [ ] Configuration loaded from YAML with environment variable overrides
+- [ ] Validation on load (reasonable bounds, required fields)
+
+```go
+type StreamConfig struct {
+    ChannelBufferSize            int           `yaml:"channel_buffer_size"`
+    ChunkTimeoutDuration         time.Duration `yaml:"chunk_timeout_duration"`
+    MaxStreamDuration            time.Duration `yaml:"max_stream_duration"`
+    BackpressureWarningThreshold time.Duration `yaml:"backpressure_warning_threshold"`
+    EnableMetrics                bool          `yaml:"enable_metrics"`
+    EnableTracing                bool          `yaml:"enable_tracing"`
+    RetryOnNetworkError          bool          `yaml:"retry_on_network_error"`
+    MaxRetryAttempts             int           `yaml:"max_retry_attempts"`
+    RetryBackoffBase             time.Duration `yaml:"retry_backoff_base"`
+}
+```
+
+#### Stream Resilience Patterns (NOT DONE - core/providers/stream_resilience.go)
+
+- [ ] `StreamRetrier` handles recoverable stream failures
+- [ ] Retry on transient network errors (connection reset, timeout)
+- [ ] NO retry on authentication errors (401/403)
+- [ ] NO retry on rate limit (429) - defer to RateLimiter
+- [ ] NO retry on content policy violations
+- [ ] Exponential backoff between retries: `min(base * 2^attempt, 30s)`
+- [ ] Partial response preservation on retry (accumulator state saved)
+- [ ] Resume-from-partial capability (if provider supports)
+- [ ] `StreamCircuitBreaker` per-provider failure protection
+- [ ] Circuit opens after 5 consecutive stream failures
+- [ ] Half-open state after 30s, single probe request
+- [ ] Circuit closes after 3 successful probes
+- [ ] Circuit breaker events emitted to Signal Bus
+
+```go
+type StreamRetrier struct {
+    config      StreamConfig
+    accumulator *StreamAccumulator  // Preserved across retries
+    attempts    int
+    lastError   error
+}
+
+type StreamCircuitBreaker struct {
+    provider    string
+    state       CircuitState  // Closed, Open, HalfOpen
+    failures    int
+    lastFailure time.Time
+    signalBus   *SignalBus
+}
+```
+
+#### Provider-Specific Edge Cases (NOT DONE)
+
+**Anthropic-Specific:**
+- [ ] Handle `overloaded_error` (503) with retry + longer backoff
+- [ ] Handle `api_error` with error details extraction
+- [ ] Handle thinking block interleaving (beta feature)
+- [ ] Handle long context (1M tokens) streaming for Sonnet with adjusted timeout
+- [ ] Graceful handling of beta header deprecation warnings
+
+**OpenAI-Specific:**
+- [ ] Handle `server_error` events with retry
+- [ ] Handle `rate_limit_exceeded` with Retry-After header parsing
+- [ ] Handle reasoning token streaming for o1/o3 models
+- [ ] Handle function call parallel execution hints
+- [ ] Graceful fallback when Responses API unavailable
+
+**Google-Specific:**
+- [ ] Handle `SAFETY` finish reason (content blocked)
+- [ ] Handle `RECITATION` finish reason (citation required)
+- [ ] Handle Vertex AI authentication token refresh mid-stream
+- [ ] Handle quota exceeded with project-specific rate limiting
+- [ ] Graceful handling of model version deprecation
+
+#### Memory Management (NOT DONE)
+
+- [ ] `StreamAccumulator` memory bounds enforcement
+- [ ] Maximum accumulated text size (default: 10MB)
+- [ ] Maximum tool call arguments size (default: 1MB per call)
+- [ ] Memory warning emitted at 80% of bounds
+- [ ] Graceful abort with partial response at 100% bounds
+- [ ] Chunk slice pre-allocation based on model context window
+- [ ] Periodic GC hint during long streams (every 1000 chunks)
+- [ ] Memory metrics included in StreamMetrics
+
+```go
+type MemoryBounds struct {
+    MaxTextSize     int64 // bytes
+    MaxToolArgsSize int64 // bytes per tool call
+    WarnThreshold   float64 // 0.8 = 80%
+}
+```
+
+#### Observability & Telemetry (NOT DONE - core/observability/stream_telemetry.go)
+
+- [ ] Prometheus metrics for streaming:
+  - `sylk_stream_duration_seconds` (histogram)
+  - `sylk_stream_time_to_first_token_seconds` (histogram)
+  - `sylk_stream_chunks_total` (counter by provider, model)
+  - `sylk_stream_tokens_total` (counter by provider, model, direction)
+  - `sylk_stream_errors_total` (counter by provider, error_type)
+  - `sylk_stream_early_aborts_total` (counter by provider, reason)
+  - `sylk_stream_backpressure_events_total` (counter)
+  - `sylk_stream_retries_total` (counter by provider)
+- [ ] OpenTelemetry tracing integration
+- [ ] Span per stream with chunk events as span events
+- [ ] Trace context propagation through event bus
+- [ ] Correlation ID as trace ID where applicable
+- [ ] Structured logging for stream lifecycle events
+- [ ] Debug mode: log every chunk (configurable)
+
+#### Graceful Degradation (NOT DONE)
+
+- [ ] Fallback to non-streaming Generate() when Stream() fails repeatedly
+- [ ] Automatic fallback after circuit breaker opens
+- [ ] Fallback decision logged with reason
+- [ ] Metrics track fallback frequency
+- [ ] User notification when operating in degraded mode
+- [ ] Streaming auto-recovery probe (attempt streaming every 5 minutes when in fallback mode)
+
+#### Concurrent Stream Management (NOT DONE)
+
+- [ ] Maximum concurrent streams per session (default: N_CPU_CORES)
+- [ ] Maximum concurrent streams globally (default: N_CPU_CORES * 2)
+- [ ] Stream queuing when limits reached
+- [ ] Priority-based stream scheduling (user > pipeline)
+- [ ] Oldest stream preemption when at limit and high-priority arrives
+- [ ] Stream count metrics per session and global
+
+#### Testing Strategy (NOT DONE - core/providers/stream_test.go)
+
+**Unit Tests:**
+- [ ] StreamChunk serialization/deserialization
+- [ ] StreamAccumulator handles all chunk types correctly
+- [ ] StreamAccumulator thread-safety (concurrent Add calls)
+- [ ] StreamToChannel converts all chunk types
+- [ ] WrapStreamChunk creates valid messages
+- [ ] Memory bounds enforcement triggers at correct thresholds
+
+**Integration Tests:**
+- [ ] End-to-end streaming with mock provider
+- [ ] Backpressure simulation (slow consumer)
+- [ ] Timeout handling (no chunks for extended period)
+- [ ] Cancellation mid-stream
+- [ ] Network error recovery
+- [ ] Rate limit handling during stream
+- [ ] Multiple concurrent streams
+
+**Provider Tests (with mocked responses):**
+- [ ] Anthropic event parsing
+- [ ] OpenAI Responses API event parsing
+- [ ] Google GenerateContentStream parsing
+- [ ] Tool call accumulation across chunks
+- [ ] Usage extraction from final chunk
+
+**Stress Tests:**
+- [ ] 100 concurrent streams
+- [ ] Long-running stream (10 minutes)
+- [ ] High-frequency chunks (simulated fast model)
+- [ ] Memory usage under sustained load
+- [ ] No goroutine leaks (verify with runtime.NumGoroutine)
+
+**Chaos Tests:**
+- [ ] Random network failures mid-stream
+- [ ] Provider returning malformed JSON
+- [ ] Sudden context cancellation
+- [ ] Event bus congestion
+
+#### Cross-Cutting Concerns (NOT DONE)
+
+**Budget Integration:**
+- [ ] Real-time token estimation during stream (approximate from text length)
+- [ ] Budget check every N chunks (configurable, default: 10)
+- [ ] Soft budget warning emitted when approaching limit
+- [ ] Hard budget enforcement cancels stream
+- [ ] Partial response usable after budget cancel
+
+**Audit Trail:**
+- [ ] Stream start event logged with request metadata
+- [ ] Stream complete event logged with final metrics
+- [ ] Stream error events logged with error details
+- [ ] Tool calls logged with timing
+- [ ] All events include correlation ID for tracing
+
+**User Interrupt Handling:**
+- [ ] Ctrl+C propagates to stream context
+- [ ] Clean stream termination within 100ms of interrupt
+- [ ] Partial response available after interrupt
+- [ ] Interrupt event emitted to Signal Bus
+- [ ] UI acknowledges interrupt visually
+
+**Session Isolation:**
+- [ ] Stream context includes session ID
+- [ ] Streams routed only to same-session event bus subscribers
+- [ ] Cross-session stream isolation verified in tests
+- [ ] Session termination cancels all session streams
+
+**Tests:**
+- [ ] Configuration loads correctly from YAML
+- [ ] Configuration validates bounds
+- [ ] Retrier respects max attempts
+- [ ] Circuit breaker state transitions correct
+- [ ] Memory bounds trigger at correct thresholds
+- [ ] Prometheus metrics exported correctly
+- [ ] Graceful degradation fallback works
+- [ ] Concurrent stream limits enforced
+- [ ] All provider-specific edge cases handled
+- [ ] Budget integration cancels streams correctly
+- [ ] Audit trail complete and queryable
 
 ---
 
@@ -5533,31 +5772,31 @@ Implements 5-tier error taxonomy with classification and handling behavior.
 **Acceptance Criteria:**
 
 #### Error Tiers
-- [ ] `ErrorTier` enum: Transient, Permanent, UserFixable, ExternalRateLimit, ExternalDegrading
-- [ ] Each tier has defined behavior (retry policy, notification, escalation)
-- [ ] Error wrapping preserves tier through call stack
+- [x] `ErrorTier` enum: Transient, Permanent, UserFixable, ExternalRateLimit, ExternalDegrading
+- [x] Each tier has defined behavior (retry policy, notification, escalation)
+- [x] Error wrapping preserves tier through call stack
 
 #### Error Classifier
-- [ ] `ErrorClassifier` struct with configurable patterns
-- [ ] `Classify(error) ErrorTier` - determines tier from error
-- [ ] HTTP status code detection (429 → RateLimit, 5xx → Degrading)
-- [ ] Pattern matching for known error types (regex configurable)
-- [ ] Default to Permanent for unknown errors (fail fast, don't mask)
+- [x] `ErrorClassifier` struct with configurable patterns
+- [x] `Classify(error) ErrorTier` - determines tier from error
+- [x] HTTP status code detection (429 → RateLimit, 5xx → Degrading)
+- [x] Pattern matching for known error types (regex configurable)
+- [x] Default to Permanent for unknown errors (fail fast, don't mask)
 
 #### Configuration
-- [ ] `ErrorClassifierConfig` struct with YAML tags
-- [ ] `transient_patterns`: regex list for transient errors
-- [ ] `permanent_patterns`: regex list for permanent errors
-- [ ] `user_fixable_patterns`: regex list for user-fixable errors
-- [ ] `rate_limit_statuses`: HTTP codes (default: [429])
-- [ ] `degrading_statuses`: HTTP codes (default: [500, 502, 503, 504])
+- [x] `ErrorClassifierConfig` struct with YAML tags
+- [x] `transient_patterns`: regex list for transient errors
+- [x] `permanent_patterns`: regex list for permanent errors
+- [x] `user_fixable_patterns`: regex list for user-fixable errors
+- [x] `rate_limit_statuses`: HTTP codes (default: [429])
+- [x] `degrading_statuses`: HTTP codes (default: [500, 502, 503, 504])
 
 **Tests:**
-- [ ] All error tiers classified correctly
-- [ ] HTTP status codes map to correct tiers
-- [ ] Pattern matching works
-- [ ] Unknown errors default to Permanent
-- [ ] Configuration loading works
+- [x] All error tiers classified correctly
+- [x] HTTP status codes map to correct tiers
+- [x] Pattern matching works
+- [x] Unknown errors default to Permanent
+- [x] Configuration loading works
 
 ---
 
@@ -19191,3 +19430,568 @@ Before marking a phase complete:
 - 6.47 (Failure Routing) depends on 6.43
 - 6.48 (Task Commands) depends on 6.43
 - 6.49 (Integration Tests) depends on all pipeline sections
+
+---
+
+## Comprehensive Parallel Execution Order (Agent-Based)
+
+This section defines the optimal parallel execution order for ALL work areas, designed for agent-based implementation where agents can spawn subagents for parallel work.
+
+### Execution Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        AGENT-BASED PARALLEL EXECUTION MODEL                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ARCHITECT (Primary Coordinator)                                                    │
+│       │                                                                             │
+│       ├──► ORCHESTRATOR manages phases/waves                                        │
+│       │         │                                                                   │
+│       │         ├──► ENGINEER POOL (N_CPU_CORES concurrent)                         │
+│       │         │         │                                                         │
+│       │         │         ├──► Engineer-1: Phase 0 Core Infrastructure              │
+│       │         │         ├──► Engineer-2: Phase 0 Core Infrastructure              │
+│       │         │         ├──► Engineer-3: Phase 0 Core Infrastructure              │
+│       │         │         └──► ... (parallelized within phase)                      │
+│       │         │                                                                   │
+│       │         └──► INSPECTOR + TESTER validate each completed section             │
+│       │                                                                             │
+│       └──► LIBRARIAN tracks dependencies and completion state                       │
+│                                                                                     │
+│  Principle: Maximize parallelization, respect dependencies, validate continuously   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Wave-Based Execution
+
+**WAVE 0: Foundation (No Dependencies)**
+All items in this wave have zero dependencies and can execute in full parallel.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 0: FOUNDATION                                                                  │
+│ ══════════════════                                                                  │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 0A: Core Types & Interfaces                                       ││
+│ │ • 0.7 Provider Interface (DONE)                                                  ││
+│ │ • 0.10a.1 StreamChunk Types (DONE)                                               ││
+│ │ • 0.26 Error Type System                                                         ││
+│ │ • 1.1 Academic Types                                                             ││
+│ │ • 2.1 Engineer Types                                                             ││
+│ │ • 4.1 Inspector Types                                                            ││
+│ │ • 6.1 VectorGraphDB Schema                                                       ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 0B: Detection & Utility Libraries                                 ││
+│ │ • core/detect/which.go (binary detection)                                        ││
+│ │ • core/detect/files.go (file detection)                                          ││
+│ │ • core/detect/dependencies.go (package detection)                                ││
+│ │ • core/format/types.go (formatter types)                                         ││
+│ │ • core/lsp/types.go (LSP types)                                                  ││
+│ │ • core/test/types.go (test framework types)                                      ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 0C: Provider Adapters                                             ││
+│ │ • 0.7 Anthropic Adapter (DONE)                                                   ││
+│ │ • 0.7 OpenAI Adapter (DONE)                                                      ││
+│ │ • 0.7 Google Adapter (DONE)                                                      ││
+│ │ • 0.8 Provider Config (DONE)                                                     ││
+│ │ • 0.9 Priority Queue (DONE)                                                      ││
+│ │ • 0.10 Rate Limiter (DONE)                                                       ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 15-20 parallel engineer pipelines                              │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 1: Core Infrastructure (Depends on Wave 0)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 1: CORE INFRASTRUCTURE                                                         │
+│ ═══════════════════════════                                                         │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 1A: Messaging & Events                                            ││
+│ │ • 0.6 Bus Enhancements                                                           ││
+│ │ • 0.11 Signal Bus & Workflow Control                                             ││
+│ │ • 0.10a.2 Event Bus Message Wrapping                                             ││
+│ │ • 0.10a.3 Stream Bridge Service                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 1B: Session & State Management                                    ││
+│ │ • 0.1 Session Manager                                                            ││
+│ │ • 0.12 Agent Signal Handler & Checkpointing                                      ││
+│ │ • 0.22 Write-Ahead Log                                                           ││
+│ │ • 0.23 Checkpointer                                                              ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 1C: Resource Management                                           ││
+│ │ • 0.13 Token Budget Manager                                                      ││
+│ │ • 0.14 Context Window Manager                                                    ││
+│ │ • 0.33 Memory Monitor                                                            ││
+│ │ • 0.34 Resource Pools                                                            ││
+│ │ • 0.35 Disk Quota Manager                                                        ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 1D: VectorGraphDB Core                                            ││
+│ │ • 6.2 HNSW Vector Index                                                          ││
+│ │ • 6.3 Nodes & Edges                                                              ││
+│ │ • 6.4 Search & Traversal                                                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 12-16 parallel engineer pipelines                              │
+│ DEPENDENCIES: All items from Wave 0                                                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 2: Execution Framework (Depends on Wave 1)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 2: EXECUTION FRAMEWORK                                                         │
+│ ═══════════════════════════                                                         │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 2A: DAG & Pipeline Execution                                      ││
+│ │ • 0.2 DAG Engine                                                                 ││
+│ │ • 0.3 Worker Pool Enhancements                                                   ││
+│ │ • 0.17 Goroutine Model & Agent Lifecycle                                         ││
+│ │ • 0.18 Pipeline Scheduler                                                        ││
+│ │ • 0.21 Adaptive Channels                                                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 2B: LLM Integration                                               ││
+│ │ • 0.15 LLM Request Gate (Integration)                                            ││
+│ │ • 0.19 Dual Queue LLM Gate                                                       ││
+│ │ • 0.10a.4 Stream Metrics Collection                                              ││
+│ │ • 0.10a.5 Stream Timeout Watchdog                                                ││
+│ │ • 0.7 Token Counter                                                              ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 2C: Error Handling & Recovery                                     ││
+│ │ • 0.24 Recovery Manager                                                          ││
+│ │ • 0.27 Transient Error Tracker                                                   ││
+│ │ • 0.28 Retry Policies                                                            ││
+│ │ • 0.29 Circuit Breaker                                                           ││
+│ │ • 0.30 Escalation Chain                                                          ││
+│ │ • 0.31 Retry Briefing System                                                     ││
+│ │ • 0.32 Rollback Manager                                                          ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 2D: VectorGraphDB Mitigations                                     ││
+│ │ • 6.5-6.11 All Mitigations (7 items, can parallelize)                            ││
+│ │ • 6.12 Unified Resolver (depends on 6.5-6.11)                                    ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 18-22 parallel engineer pipelines                              │
+│ DEPENDENCIES: Wave 1 complete                                                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 3: Tool Execution & File Management (Depends on Wave 2)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 3: TOOL EXECUTION & FILE MANAGEMENT                                            │
+│ ════════════════════════════════════════                                            │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 3A: Tool System                                                   ││
+│ │ • 0.39 Session Registry                                                          ││
+│ │ • 0.40 Fair Share Calculator                                                     ││
+│ │ • 0.41 Signal Dispatcher                                                         ││
+│ │ • 0.42 Cross-Session Resource Pool                                               ││
+│ │ • 0.43 Tool Executor                                                             ││
+│ │ • 0.44 Adaptive Timeout                                                          ││
+│ │ • 0.45 Kill Sequence Manager                                                     ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 3B: Tool Output & Parsing                                         ││
+│ │ • 0.46 Output Handler                                                            ││
+│ │ • 0.47 Tool Output Parsers                                                       ││
+│ │ • 0.48 Parse Template Cache                                                      ││
+│ │ • 0.50 Tool Cancellation Manager                                                 ││
+│ │ • 0.51 Tool Output Cache                                                         ││
+│ │ • 0.52 Tool Invocation Batcher                                                   ││
+│ │ • 0.53 Streaming Output Parser                                                   ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 3C: Filesystem & Storage                                          ││
+│ │ • 0.20 Staging Manager                                                           ││
+│ │ • 0.36 Resource Broker                                                           ││
+│ │ • 0.37 Graceful Degradation Controller                                           ││
+│ │ • 0.49 Filesystem Manager                                                        ││
+│ │ • 0.61 Directory Manager                                                         ││
+│ │ • 0.62 Configuration Manager                                                     ││
+│ │ • 0.63 Credential Manager                                                        ││
+│ │ • 0.64 Database Manager                                                          ││
+│ │ • 0.65 Backup Manager                                                            ││
+│ │ • 0.66 Integrity Monitor                                                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 24-30 parallel engineer pipelines                              │
+│ DEPENDENCIES: Wave 2 complete                                                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 4: Security & Multi-Session (Depends on Wave 3)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 4: SECURITY & MULTI-SESSION                                                    │
+│ ════════════════════════════════                                                    │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4A: Security Model                                                ││
+│ │ • 0.68 Permission Manager                                                        ││
+│ │ • 0.69 Sandbox Manager                                                           ││
+│ │ • 0.70 Audit Logger                                                              ││
+│ │ • 0.71 Audit Query Interface                                                     ││
+│ │ • 0.72 Session Credential Manager                                                ││
+│ │ • Secret Management System (6.1-6.12)                                            ││
+│ │ • Credential Broker System                                                       ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4B: Multi-Session Coordination                                    ││
+│ │ • 0.55 Global Subscription Tracker                                               ││
+│ │ • 0.56 Cross-Session Dual Queue Gate                                             ││
+│ │ • 0.57 Global Pipeline Scheduler                                                 ││
+│ │ • 0.58 Multi-Session WAL Manager                                                 ││
+│ │ • 0.59 Global Circuit Breaker Registry                                           ││
+│ │ • 0.73 Session Knowledge Manager                                                 ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 12-15 parallel engineer pipelines                              │
+│ DEPENDENCIES: Wave 3 complete                                                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 5: Knowledge Agents (Depends on Wave 1, partially Wave 2)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 5: KNOWLEDGE AGENTS                                                            │
+│ ════════════════════════                                                            │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 5A: Knowledge Agent Core                                          ││
+│ │ • 0.4 Guide Enhancements                                                         ││
+│ │ • 0.5 Archivalist Enhancements                                                   ││
+│ │ • 1.1 Academic Agent Implementation                                              ││
+│ │ • Librarian Tool Discovery Skills                                                ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 5B: VectorGraphDB Agent Integration                               ││
+│ │ • 6.13 Librarian Integration                                                     ││
+│ │ • 6.14 Archivalist Integration                                                   ││
+│ │ • 6.15 Academic Integration                                                      ││
+│ │ • 6.16 Guide Integration                                                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 5C: Discipline Protocols                                          ││
+│ │ • Librarian: Codebase Health Assessment                                          ││
+│ │ • Librarian: Context Quality Feedback                                            ││
+│ │ • Archivalist: Failure Pattern Memory                                            ││
+│ │ • Archivalist: Retrieval Accuracy Tracking                                       ││
+│ │ • Academic: Research Discipline Protocol                                         ││
+│ │ • Academic: Recommendation Outcome Tracking                                      ││
+│ │ • Guide: Intent Gate Classification                                              ││
+│ │ • Guide: Routing Failure Tracking                                                ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ NOTE: Wave 5 can START after Wave 1 complete, runs in parallel with Waves 2-4      │
+│ ESTIMATED CAPACITY: 10-12 parallel engineer pipelines                              │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 6: Execution Agents (Depends on Wave 2-3)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 6: EXECUTION AGENTS                                                            │
+│ ════════════════════════                                                            │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6A: Worker Agent Core                                             ││
+│ │ • 2.1 Engineer Agent Implementation                                              ││
+│ │ • 2.2 Designer Agent Implementation                                              ││
+│ │ • Engineer: Failure Recovery Protocol                                            ││
+│ │ • Designer: Failure Recovery Protocol                                            ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6B: Enhanced Agent Skills                                         ││
+│ │ • Engineer: Multi-Edit & Structural Refactoring                                  ││
+│ │ • Designer: Vision & Multimodal Skills                                           ││
+│ │ • Librarian: Enhanced Search & AST Skills                                        ││
+│ │ • Academic: Web Research & Documentation Skills                                  ││
+│ │ • Orchestrator: Batch & Parallel Execution Skills                                ││
+│ │ • Inspector: LSP & AST Validation Skills                                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6C: Git & Analysis Skills                                         ││
+│ │ • Git Tooling System                                                             ││
+│ │ • Analysis Skills Orchestration                                                  ││
+│ │ • Lazy Tool Loading                                                              ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 12-15 parallel engineer pipelines                              │
+│ DEPENDENCIES: Wave 2-3 for tool execution, Wave 5 for knowledge consultation       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 7: Quality & Planning Agents (Depends on Wave 6)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 7: QUALITY & PLANNING AGENTS                                                   │
+│ ═════════════════════════════════                                                   │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7A: Quality Agent Core                                            ││
+│ │ • 4.1 Inspector Agent Implementation                                             ││
+│ │ • 4.2 Tester Agent Implementation                                                ││
+│ │ • Inspector: Completion Evidence Protocol                                        ││
+│ │ • Tester: Completion Evidence Protocol                                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7B: Planning Agent                                                ││
+│ │ • 3.1 Architect Agent Implementation                                             ││
+│ │ • Architect: Pre-Delegation Planning Protocol                                    ││
+│ │ • Orchestrator: Execution Discipline Protocol                                    ││
+│ │ • Plan Mode Implementation                                                       ││
+│ │ • Research Paper Implementation                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 8-10 parallel engineer pipelines                               │
+│ DEPENDENCIES: Wave 6 for execution agents, Wave 5 for knowledge                    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 8: Pipeline System (Depends on Waves 5-7)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 8: PIPELINE SYSTEM                                                             │
+│ ═══════════════════════                                                             │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 8A: Pipeline Core                                                 ││
+│ │ • 6.43 Single-Worker Pipeline System                                             ││
+│ │ • Pipeline Variants System Core                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 8B: Pipeline Agent Modes (after 8A)                               ││
+│ │ • 6.44 Inspector Pipeline Modes                                                  ││
+│ │ • 6.45 Tester Pipeline Modes                                                     ││
+│ │ • Engineer Pipeline Modes                                                        ││
+│ │ • Designer Pipeline Modes                                                        ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 8C: Pipeline Integration (after 8B)                               ││
+│ │ • 6.46 Architect Decomposition Strategy                                          ││
+│ │ • 6.47 Pipeline Failure Routing                                                  ││
+│ │ • 6.48 Task Completion Commands                                                  ││
+│ │ • Memory Management: Handoff Protocols                                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 8-12 parallel engineer pipelines                               │
+│ DEPENDENCIES: All agent implementations complete                                    │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 9: Agent Efficiency & Direct Consultation (Depends on Wave 8)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 9: AGENT EFFICIENCY & DIRECT CONSULTATION                                      │
+│ ══════════════════════════════════════════════                                      │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 9A: Efficiency Techniques                                         ││
+│ │ • 6.19 XOR Filter Optimization                                                   ││
+│ │ • 6.20 Architect Planning Preflight                                              ││
+│ │ • 6.21-6.24 Scratchpad, Style Inference, Component Registry, Mistake Memory      ││
+│ │ • 6.25-6.28 Diff Preview, Preferences, File Snapshot, Dependency Awareness       ││
+│ │ • 6.29-6.30 Task Continuity, Design Tokens                                       ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 9B: Direct Consultation Protocol                                  ││
+│ │ • Guide: Direct Consultation Skills                                              ││
+│ │ • Architect: Direct Consultation Skills                                          ││
+│ │ • Engineer: Direct Consultation Skills                                           ││
+│ │ • Designer: Direct Consultation Skills                                           ││
+│ │ • Inspector: Direct Consultation Skills                                          ││
+│ │ • Tester: Direct Consultation Skills                                             ││
+│ │ • Librarian: Direct Consultation Skills                                          ││
+│ │ • Archivalist: Direct Consultation Skills                                        ││
+│ │ • Academic: Direct Consultation Skills                                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 9C: Skill/Agent Integrations                                      ││
+│ │ • 6.33-6.42 All Agent Efficiency Integrations                                    ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 15-20 parallel engineer pipelines                              │
+│ DEPENDENCIES: Pipeline system complete, all agents operational                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**WAVE 10: Integration Testing & Validation (Final Wave)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ WAVE 10: INTEGRATION TESTING & VALIDATION                                           │
+│ ═════════════════════════════════════════                                           │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 10A: Component Integration Tests                                  ││
+│ │ • 0.25 Concurrency Integration Tests                                             ││
+│ │ • 0.38 Error & Resource Integration Tests                                        ││
+│ │ • 0.54 Tool Execution Integration Tests                                          ││
+│ │ • 0.60 Tier 1 Multi-Session Integration Tests                                    ││
+│ │ • 0.67 Tier 3 Integration Tests                                                  ││
+│ │ • 0.74 Tier 4 Integration Tests                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 10B: System-Wide Integration                                      ││
+│ │ • 6.17 Performance Benchmarks                                                    ││
+│ │ • 6.18 Integration Tests                                                         ││
+│ │ • 6.49 Pipeline Integration Tests                                                ││
+│ │ • Cross-Agent Discipline Integration                                             ││
+│ │ • Knowledge Agent Feedback Loops                                                 ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ SEQUENTIAL: Acceptance Verification                                              ││
+│ │ • Token Savings Targets Validation                                               ││
+│ │ • Latency Targets Validation                                                     ││
+│ │ • Memory Targets Validation                                                      ││
+│ │ • Full System Acceptance                                                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 10-15 parallel engineer pipelines                              │
+│ DEPENDENCIES: All implementation waves complete                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Wave Dependency Graph
+
+```
+                              ┌──────────┐
+                              │  WAVE 0  │
+                              │Foundation│
+                              └────┬─────┘
+                                   │
+                              ┌────▼─────┐
+                              │  WAVE 1  │
+                              │Core Infra│
+                              └────┬─────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              │                    │                    │
+         ┌────▼─────┐         ┌────▼─────┐        ┌────▼─────┐
+         │  WAVE 2  │         │  WAVE 5  │        │ (parallel)│
+         │ Exec Frm │         │Knowledge │        │           │
+         └────┬─────┘         │  Agents  │        │           │
+              │               └────┬─────┘        │           │
+         ┌────▼─────┐              │               │           │
+         │  WAVE 3  │              │               │           │
+         │Tool/File │              │               │           │
+         └────┬─────┘              │               │           │
+              │                    │               │           │
+         ┌────▼─────┐              │               │           │
+         │  WAVE 4  │              │               │           │
+         │Security  │              │               │           │
+         └────┬─────┘              │               │           │
+              │                    │               │           │
+              └──────────┬─────────┘               │           │
+                         │                         │           │
+                    ┌────▼─────┐                   │           │
+                    │  WAVE 6  │◄──────────────────┘           │
+                    │Exec Agts │                               │
+                    └────┬─────┘                               │
+                         │                                     │
+                    ┌────▼─────┐                               │
+                    │  WAVE 7  │                               │
+                    │Quality/  │                               │
+                    │Planning  │                               │
+                    └────┬─────┘                               │
+                         │                                     │
+                    ┌────▼─────┐                               │
+                    │  WAVE 8  │                               │
+                    │ Pipeline │                               │
+                    └────┬─────┘                               │
+                         │                                     │
+                    ┌────▼─────┐                               │
+                    │  WAVE 9  │◄──────────────────────────────┘
+                    │Efficiency│
+                    └────┬─────┘
+                         │
+                    ┌────▼─────┐
+                    │ WAVE 10  │
+                    │Validation│
+                    └──────────┘
+```
+
+### Parallel Execution Summary
+
+| Wave | Name | Parallel Items | Dependencies | Est. Capacity |
+|------|------|----------------|--------------|---------------|
+| 0 | Foundation | 15-20 | None | 15-20 pipelines |
+| 1 | Core Infrastructure | 12-16 | Wave 0 | 12-16 pipelines |
+| 2 | Execution Framework | 18-22 | Wave 1 | 18-22 pipelines |
+| 3 | Tool Execution | 24-30 | Wave 2 | 24-30 pipelines |
+| 4 | Security/Multi-Session | 12-15 | Wave 3 | 12-15 pipelines |
+| 5 | Knowledge Agents | 10-12 | Wave 1 (partial Wave 2) | 10-12 pipelines |
+| 6 | Execution Agents | 12-15 | Wave 2-3, Wave 5 | 12-15 pipelines |
+| 7 | Quality/Planning | 8-10 | Wave 6, Wave 5 | 8-10 pipelines |
+| 8 | Pipeline System | 8-12 | Waves 5-7 | 8-12 pipelines |
+| 9 | Agent Efficiency | 15-20 | Wave 8 | 15-20 pipelines |
+| 10 | Validation | 10-15 | All Waves | 10-15 pipelines |
+
+**Key Parallelization Opportunities:**
+1. Wave 5 (Knowledge Agents) can START after Wave 1, running parallel with Waves 2-4
+2. Within each wave, groups A/B/C/D execute in parallel
+3. Agent efficiency techniques (Wave 9) highly parallelizable across all 9 agents
+4. Integration tests (Wave 10) can parallelize by subsystem
+
+**Critical Path:**
+Wave 0 → Wave 1 → Wave 2 → Wave 3 → Wave 6 → Wave 7 → Wave 8 → Wave 9 → Wave 10
+
+**Optimization Note:** Waves 5, 6, 7, 8, 9 have significant cross-dependencies but can overlap if carefully scheduled. The Orchestrator should monitor completion status and eagerly start downstream work as soon as dependencies are satisfied.
