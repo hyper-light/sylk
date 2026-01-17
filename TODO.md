@@ -23174,17 +23174,17 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 3C: Filesystem & Storage                                          ││
-│ │ • 0.20 Staging Manager                                                           ││
-│ │ • 0.36 Resource Broker                                                           ││
-│ │ • 0.37 Graceful Degradation Controller                                           ││
-│ │ • 0.49 Filesystem Manager                                                        ││
-│ │ • 0.61 Directory Manager                                                         ││
-│ │ • 0.62 Configuration Manager                                                     ││
-│ │ • 0.63 Credential Manager                                                        ││
-│ │ • 0.64 Database Manager                                                          ││
-│ │ • 0.65 Backup Manager                                                            ││
-│ │ • 0.66 Integrity Monitor                                                         ││
+│ │ PARALLEL GROUP 3C: Filesystem & Storage (DONE)                                   ││
+│ │ • 0.20 Staging Manager (DONE)                                                    ││
+│ │ • 0.36 Resource Broker (DONE)                                                    ││
+│ │ • 0.37 Graceful Degradation Controller (DONE)                                    ││
+│ │ • 0.49 Filesystem Manager (DONE)                                                 ││
+│ │ • 0.61 Directory Manager (DONE)                                                  ││
+│ │ • 0.62 Configuration Manager (DONE)                                              ││
+│ │ • 0.63 Credential Manager (DONE)                                                 ││
+│ │ • 0.64 Database Manager (DONE)                                                   ││
+│ │ • 0.65 Backup Manager (DONE)                                                     ││
+│ │ • 0.66 Integrity Monitor (DONE)                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
