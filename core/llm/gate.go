@@ -128,32 +128,38 @@ func (g *RequestGate) processNext() {
 func (g *RequestGate) executeRequest(ctx context.Context, req *LLMRequest) *LLMResult {
 	result := &LLMResult{RequestID: req.ID}
 
-	if g.config.RateLimitEnabled && g.rateLimiter != nil {
-		if !g.rateLimiter.CanProceed() {
+	g.mu.Lock()
+	rateLimiter := g.rateLimiter
+	budget := g.budget
+	executor := g.executor
+	g.mu.Unlock()
+
+	if g.config.RateLimitEnabled && rateLimiter != nil {
+		if !rateLimiter.CanProceed() {
 			result.Error = ErrRateLimited
 			return result
 		}
 	}
 
-	if g.config.BudgetCheckEnabled && g.budget != nil {
-		if err := g.budget.CheckBudget(req); err != nil {
+	if g.config.BudgetCheckEnabled && budget != nil {
+		if err := budget.CheckBudget(req); err != nil {
 			result.Error = err
 			return result
 		}
 	}
 
-	if g.executor == nil {
+	if executor == nil {
 		result.Response = nil
 		return result
 	}
 
-	response, usage, err := g.executor.Execute(ctx, req)
+	response, usage, err := executor.Execute(ctx, req)
 	result.Response = response
 	result.Usage = usage
 	result.Error = err
 
-	if usage != nil && g.rateLimiter != nil {
-		g.rateLimiter.RecordUsage(usage.TotalTokens)
+	if usage != nil && rateLimiter != nil {
+		rateLimiter.RecordUsage(usage.TotalTokens)
 	}
 
 	return result
@@ -241,11 +247,16 @@ func (g *RequestGate) Close() error {
 	g.workerWg.Wait()
 
 	g.mu.Lock()
-	for _, ch := range g.pendingReqs {
-		close(ch)
-	}
-	g.pendingReqs = nil
+	pending := g.pendingReqs
+	g.pendingReqs = make(map[string]chan *LLMResult)
 	g.mu.Unlock()
+
+	for reqID, ch := range pending {
+		select {
+		case ch <- &LLMResult{RequestID: reqID, Error: ErrGateClosed}:
+		default:
+		}
+	}
 
 	return nil
 }

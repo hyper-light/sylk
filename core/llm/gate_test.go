@@ -149,9 +149,14 @@ func TestRequestGate_ContextCancellation(t *testing.T) {
 }
 
 func TestRequestGate_MaxQueueSize(t *testing.T) {
+	workerStarted := make(chan struct{})
 	blockCh := make(chan struct{})
 	executor := &mockLLMExecutor{
 		executeFunc: func(ctx context.Context, req *LLMRequest) (any, *TokenUsage, error) {
+			select {
+			case workerStarted <- struct{}{}:
+			default:
+			}
 			<-blockCh
 			return nil, nil, nil
 		},
@@ -168,15 +173,20 @@ func TestRequestGate_MaxQueueSize(t *testing.T) {
 		gate.Close()
 	}()
 
-	for i := 0; i < 3; i++ {
-		req := NewLLMRequest("", "", "", "", "", "", "", nil, 0, 0)
-		go gate.SubmitAsync(context.Background(), req)
-	}
+	// Submit first request and wait for worker to pick it up and block
+	req1 := NewLLMRequest("", "", "", "", "", "", "", nil, 0, 0)
+	go gate.SubmitAsync(context.Background(), req1)
+	<-workerStarted // Worker is now blocked
 
-	time.Sleep(50 * time.Millisecond)
+	// Now fill the queue with 2 more (MaxQueueSize=2)
+	req2 := NewLLMRequest("", "", "", "", "", "", "", nil, 0, 0)
+	req3 := NewLLMRequest("", "", "", "", "", "", "", nil, 0, 0)
+	gate.SubmitAsync(context.Background(), req2)
+	gate.SubmitAsync(context.Background(), req3)
 
-	req := NewLLMRequest("", "", "", "", "", "", "", nil, 0, 0)
-	_, err := gate.SubmitAsync(context.Background(), req)
+	// This should fail - queue is full
+	req4 := NewLLMRequest("", "", "", "", "", "", "", nil, 0, 0)
+	_, err := gate.SubmitAsync(context.Background(), req4)
 	if err != ErrWorkerPoolFull {
 		t.Errorf("expected ErrWorkerPoolFull, got %v", err)
 	}
