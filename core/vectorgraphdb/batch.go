@@ -48,33 +48,50 @@ func (bs *BatchStore) insertNodesToDB(nodes []*GraphNode, embeddings [][]float32
 }
 
 func (bs *BatchStore) insertNodesBatch(tx *sql.Tx, nodes []*GraphNode, embeddings [][]float32, progress BatchProgress) error {
+	nodeStmt, vecStmt, err := bs.prepareNodeStmts(tx)
+	if err != nil {
+		return err
+	}
+	defer nodeStmt.Close()
+	defer vecStmt.Close()
+
+	return bs.executeNodeInserts(nodeStmt, vecStmt, nodes, embeddings, progress)
+}
+
+func (bs *BatchStore) prepareNodeStmts(tx *sql.Tx) (*sql.Stmt, *sql.Stmt, error) {
 	nodeStmt, err := tx.Prepare(`
 		INSERT INTO nodes (id, domain, node_type, content_hash, metadata, created_at, updated_at, accessed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
-		return fmt.Errorf("prepare node stmt: %w", err)
+		return nil, nil, fmt.Errorf("prepare node stmt: %w", err)
 	}
-	defer nodeStmt.Close()
 
 	vecStmt, err := tx.Prepare(`
 		INSERT INTO vectors (id, node_id, embedding, magnitude, model_version)
 		VALUES (?, ?, ?, ?, ?)
 	`)
 	if err != nil {
-		return fmt.Errorf("prepare vec stmt: %w", err)
+		nodeStmt.Close()
+		return nil, nil, fmt.Errorf("prepare vec stmt: %w", err)
 	}
-	defer vecStmt.Close()
+	return nodeStmt, vecStmt, nil
+}
 
+func (bs *BatchStore) executeNodeInserts(nodeStmt, vecStmt *sql.Stmt, nodes []*GraphNode, embeddings [][]float32, progress BatchProgress) error {
 	for i, node := range nodes {
 		if err := bs.insertNodeBatchRow(nodeStmt, vecStmt, node, embeddings[i]); err != nil {
 			return err
 		}
-		if progress != nil {
-			progress(i+1, len(nodes))
-		}
+		bs.reportProgress(progress, i+1, len(nodes))
 	}
 	return nil
+}
+
+func (bs *BatchStore) reportProgress(progress BatchProgress, completed, total int) {
+	if progress != nil {
+		progress(completed, total)
+	}
 }
 
 func (bs *BatchStore) insertNodeBatchRow(nodeStmt, vecStmt *sql.Stmt, node *GraphNode, embedding []float32) error {
@@ -107,12 +124,17 @@ func (bs *BatchStore) insertNodesHNSW(nodes []*GraphNode, embeddings [][]float32
 	}
 
 	for i, node := range nodes {
-		if err := bs.hnsw.Insert(node.ID, embeddings[i], node.Domain, node.NodeType); err != nil {
-			return fmt.Errorf("hnsw insert %s: %w", node.ID, err)
+		if err := bs.insertNodeHNSW(node, embeddings[i]); err != nil {
+			return err
 		}
-		if progress != nil {
-			progress(i+1, len(nodes))
-		}
+		bs.reportProgress(progress, i+1, len(nodes))
+	}
+	return nil
+}
+
+func (bs *BatchStore) insertNodeHNSW(node *GraphNode, embedding []float32) error {
+	if err := bs.hnsw.Insert(node.ID, embedding, node.Domain, node.NodeType); err != nil {
+		return fmt.Errorf("hnsw insert %s: %w", node.ID, err)
 	}
 	return nil
 }
@@ -136,22 +158,32 @@ func (bs *BatchStore) BatchInsertEdgesWithProgress(edges []*GraphEdge, progress 
 }
 
 func (bs *BatchStore) insertEdgesBatch(tx *sql.Tx, edges []*GraphEdge, progress BatchProgress) error {
+	stmt, err := bs.prepareEdgeStmt(tx)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	return bs.executeEdgeInserts(stmt, edges, progress)
+}
+
+func (bs *BatchStore) prepareEdgeStmt(tx *sql.Tx) (*sql.Stmt, error) {
 	stmt, err := tx.Prepare(`
 		INSERT INTO edges (id, from_node_id, to_node_id, edge_type, weight, metadata, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
-		return fmt.Errorf("prepare edge stmt: %w", err)
+		return nil, fmt.Errorf("prepare edge stmt: %w", err)
 	}
-	defer stmt.Close()
+	return stmt, nil
+}
 
+func (bs *BatchStore) executeEdgeInserts(stmt *sql.Stmt, edges []*GraphEdge, progress BatchProgress) error {
 	for i, edge := range edges {
 		if err := bs.insertEdgeBatchRow(stmt, edge); err != nil {
 			return err
 		}
-		if progress != nil {
-			progress(i+1, len(edges))
-		}
+		bs.reportProgress(progress, i+1, len(edges))
 	}
 	return nil
 }
@@ -174,12 +206,26 @@ func (bs *BatchStore) BatchDeleteNodes(ids []string) error {
 }
 
 func (bs *BatchStore) BatchDeleteNodesWithProgress(ids []string, progress BatchProgress) error {
+	if err := bs.deleteNodesFromDB(ids, progress); err != nil {
+		return err
+	}
+	return bs.deleteNodesHNSW(ids)
+}
+
+func (bs *BatchStore) deleteNodesFromDB(ids []string, progress BatchProgress) error {
 	tx, err := bs.db.BeginTx()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	if err := bs.executeNodeDeletes(tx, ids, progress); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (bs *BatchStore) executeNodeDeletes(tx *sql.Tx, ids []string, progress BatchProgress) error {
 	stmt, err := tx.Prepare("DELETE FROM nodes WHERE id = ?")
 	if err != nil {
 		return fmt.Errorf("prepare delete stmt: %w", err)
@@ -190,16 +236,9 @@ func (bs *BatchStore) BatchDeleteNodesWithProgress(ids []string, progress BatchP
 		if _, err := stmt.Exec(id); err != nil {
 			return fmt.Errorf("delete node %s: %w", id, err)
 		}
-		if progress != nil {
-			progress(i+1, len(ids))
-		}
+		bs.reportProgress(progress, i+1, len(ids))
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
-	}
-
-	return bs.deleteNodesHNSW(ids)
+	return nil
 }
 
 func (bs *BatchStore) deleteNodesHNSW(ids []string) error {
