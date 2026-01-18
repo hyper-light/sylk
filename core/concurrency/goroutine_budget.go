@@ -235,17 +235,40 @@ func (b *GoroutineBudget) tryAcquireNonBlocking(state *agentBudgetState) error {
 }
 
 func (b *GoroutineBudget) acquireBlocking(ctx context.Context, state *agentBudgetState) error {
-	done := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done)
 
-	go func() {
-		done <- b.acquireSlot(state)
-	}()
+	go b.watchContextCancel(ctx, state, done)
 
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
+	state.cond.L.Lock()
+	defer state.cond.L.Unlock()
+
+	for state.active.Load() >= state.hardLimit {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		b.notifyBlocked(state)
+		state.waiters.Add(1)
+		state.cond.Wait()
+		state.waiters.Add(-1)
+	}
+
+	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+
+	b.incrementCounters(state)
+	b.checkSoftLimit(state)
+	return nil
+}
+
+func (b *GoroutineBudget) watchContextCancel(ctx context.Context, state *agentBudgetState, done <-chan struct{}) {
+	select {
+	case <-ctx.Done():
+		state.cond.L.Lock()
+		state.cond.Broadcast()
+		state.cond.L.Unlock()
+	case <-done:
 	}
 }
 
