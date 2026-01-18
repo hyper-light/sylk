@@ -12550,19 +12550,20 @@ ALL ─────────────────────────�
 
 ---
 
-### SC.2 HNSWSnapshotManager
+### SC.2 HNSWSnapshotManager ✅ COMPLETED
 
-**Files to create:**
+**Files created:**
 - `core/vectorgraphdb/hnsw/snapshot_manager.go`
+- `core/vectorgraphdb/hnsw/snapshot_manager_test.go`
 
 **Acceptance Criteria:**
-- [ ] `HNSWSnapshotManager` struct: index (*Index), currentSeqNum (atomic.Uint64), snapshots (sync.Map), gcInterval, retention, mu (sync.RWMutex)
-- [ ] `CreateSnapshot() *HNSWSnapshot`: acquire read lock, deep copy state, store in map, return snapshot
-- [ ] `ReleaseSnapshot(seqNum uint64)`: decrement readers count
-- [ ] `OnInsert()`: increment currentSeqNum (called after every insert)
-- [ ] `GCLoop(ctx context.Context)`: periodic cleanup of old snapshots with 0 readers
-- [ ] Configurable retention time (default: 5 minutes)
-- [ ] Configurable GC interval (default: 30 seconds)
+- [x] `HNSWSnapshotManager` struct: index (*Index), currentSeqNum (atomic.Uint64), snapshots (sync.Map), gcInterval, retention, mu (sync.RWMutex)
+- [x] `CreateSnapshot() *HNSWSnapshot`: acquire read lock, deep copy state, store in map, return snapshot
+- [x] `ReleaseSnapshot(seqNum uint64)`: decrement readers count
+- [x] `OnInsert()`: increment currentSeqNum (called after every insert)
+- [x] `GCLoop(ctx context.Context)`: periodic cleanup of old snapshots with 0 readers
+- [x] Configurable retention time (default: 5 minutes)
+- [x] Configurable GC interval (default: 30 seconds)
 
 **Implementation Guidelines:**
 - CreateSnapshot holds index.mu.RLock during copy
@@ -12571,11 +12572,11 @@ ALL ─────────────────────────�
 - Snapshots older than retention with 0 readers are deleted
 
 **Tests:**
-- [ ] CreateSnapshot returns consistent state
-- [ ] Multiple snapshots can coexist
-- [ ] GC cleans up old snapshots with 0 readers
-- [ ] GC preserves snapshots with active readers
-- [ ] OnInsert increments sequence number
+- [x] CreateSnapshot returns consistent state
+- [x] Multiple snapshots can coexist
+- [x] GC cleans up old snapshots with 0 readers
+- [x] GC preserves snapshots with active readers
+- [x] OnInsert increments sequence number
 
 ---
 
@@ -12812,19 +12813,20 @@ ALL ─────────────────────────�
 
 ---
 
-### SC.12 FileHandleBudgetPersistence
+### SC.12 FileHandleBudgetPersistence ✅ COMPLETED
 
-**Files to create:**
-- `core/resources/file_handle_persistence.go`
+**Files created:**
+- `core/lifecycle/budget_persistence.go`
+- `core/lifecycle/budget_persistence_test.go`
 
 **Acceptance Criteria:**
-- [ ] `FileHandleBudgetPersistence` struct: db (*sql.DB), budget (*FileHandleBudget), mu (sync.Mutex)
-- [ ] `NewFileHandleBudgetPersistence(db, budget)`: create table if not exists
-- [ ] Schema: `file_handle_budget (session_id TEXT PRIMARY KEY, allocated INTEGER, used INTEGER, updated_at TEXT)`
-- [ ] `Save() error`: atomically clear and rewrite all session budgets
-- [ ] `Restore() error`: load budget state from database
-- [ ] `PeriodicSave(ctx, interval)`: background goroutine for periodic saves
-- [ ] Final save on ctx.Done() (shutdown)
+- [x] `FileHandleBudgetPersistence` struct: db (*sql.DB), budget (FileHandleBudgetProvider), mu (sync.Mutex)
+- [x] `NewFileHandleBudgetPersistence(db, budget)`: create table if not exists
+- [x] Schema: `file_handle_budget (session_id TEXT PRIMARY KEY, allocated INTEGER, used INTEGER, updated_at TEXT)`
+- [x] `Save() error`: atomically clear and rewrite all session budgets
+- [x] `Restore() error`: load budget state from database
+- [x] `PeriodicSave(ctx, interval)`: background goroutine for periodic saves
+- [x] Final save on ctx.Done() (shutdown)
 
 **Implementation Guidelines:**
 - Use transaction for atomic clear+rewrite
@@ -12832,11 +12834,11 @@ ALL ─────────────────────────�
 - Restore populates getOrCreateSession for each row
 
 **Tests:**
-- [ ] Save persists all sessions
-- [ ] Restore loads all sessions
-- [ ] Atomic: partial save doesn't corrupt
-- [ ] PeriodicSave runs at interval
-- [ ] Final save on shutdown
+- [x] Save persists all sessions
+- [x] Restore loads all sessions
+- [x] Atomic: partial save doesn't corrupt
+- [x] PeriodicSave runs at interval
+- [x] Final save on shutdown
 
 ---
 
