@@ -528,3 +528,37 @@ func hashQuery(query string) string {
 	hash := sha256.Sum256([]byte(query))
 	return hex.EncodeToString(hash[:])
 }
+
+func (qc *QueryCache) Name() string {
+	return "query_cache"
+}
+
+func (qc *QueryCache) Size() int64 {
+	qc.mu.RLock()
+	defer qc.mu.RUnlock()
+	return qc.calculateSizeLocked()
+}
+
+func (qc *QueryCache) calculateSizeLocked() int64 {
+	responseBytes := int64(len(qc.responses)) * 1024
+	embeddingBytes := int64(len(qc.embeddings)) * 256 * 4
+	return responseBytes + embeddingBytes
+}
+
+func (qc *QueryCache) EvictPercent(percent float64) int64 {
+	qc.mu.Lock()
+	defer qc.mu.Unlock()
+
+	beforeSize := qc.calculateSizeLocked()
+	target := int(float64(len(qc.responses)) * percent)
+	if target < 1 && len(qc.responses) > 0 {
+		target = 1
+	}
+
+	entries := qc.collectEntries()
+	qc.sortEntriesByAge(entries)
+	removedHashes := qc.removeOldestResponses(entries, target)
+	qc.cleanEmbeddings(removedHashes)
+
+	return beforeSize - qc.calculateSizeLocked()
+}
