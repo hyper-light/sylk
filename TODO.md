@@ -3050,60 +3050,60 @@ For each file operation task:
 
 **Reference**: See `/SEARCH.md` for complete specification and `/ARCHITECTURE.md` "Document Search System" section.
 
-### DS.1.1 Base Document Types
+### DS.1.1 Base Document Types (COMPLETE)
 
-**Files to create:** `core/search/document.go`
-
-**Acceptance Criteria:**
-- [ ] `DocumentType` enum: `source_code`, `markdown`, `config`, `llm_prompt`, `llm_response`, `web_fetch`, `note`, `git_commit`
-- [ ] `Document` struct: ID (SHA-256), Path, Type, Language, Content, Symbols []string, Comments, Imports []string, Checksum, ModifiedAt, IndexedAt, GitCommit
-- [ ] `SymbolInfo` struct: Name, Kind (function/type/variable/const/interface), Signature, Line, Exported
-- [ ] `GenerateDocumentID(content []byte) string` using SHA-256
-- [ ] JSON tags with `omitempty` where appropriate
-
-### DS.1.2 LLM Communication Document Types
-
-**Files to create:** `core/search/llm_document.go`
+**Files created:** `core/search/document.go`, `core/search/document_test.go`
 
 **Acceptance Criteria:**
-- [ ] `LLMPromptDocument` embedding Document: SessionID, AgentID, AgentType, Model, TokenCount, TurnNumber, PrecedingFiles, FollowingFiles
-- [ ] `LLMResponseDocument` embedding Document: PromptID, SessionID, AgentID, Model, TokenCount, LatencyMs, StopReason, CodeBlocks, FilesModified, ToolsUsed
-- [ ] `CodeBlock` struct: Language, Content, LineNum
+- [x] `DocumentType` enum: `source_code`, `markdown`, `config`, `llm_prompt`, `llm_response`, `web_fetch`, `note`, `git_commit`
+- [x] `Document` struct: ID (SHA-256), Path, Type, Language, Content, Symbols []string, Comments, Imports []string, Checksum, ModifiedAt, IndexedAt, GitCommit
+- [x] `SymbolInfo` struct: Name, Kind (function/type/variable/const/interface), Signature, Line, Exported
+- [x] `GenerateDocumentID(content []byte) string` using SHA-256
+- [x] JSON tags with `omitempty` where appropriate
 
-### DS.1.3 Web Fetch Document Type
+### DS.1.2 LLM Communication Document Types (COMPLETE)
 
-**Files to create:** `core/search/web_document.go`
-
-**Acceptance Criteria:**
-- [ ] `WebFetchDocument` embedding Document: URL, FetchedAt, StatusCode, ContentType, Links, Headings, CodeSnippets
-- [ ] URL normalization for consistent ID generation
-
-### DS.1.4 Git Commit Document Type
-
-**Files to create:** `core/search/git_document.go`
+**Files created:** `core/search/llm_document.go`, `core/search/llm_document_test.go`
 
 **Acceptance Criteria:**
-- [ ] `GitCommitDocument` embedding Document: CommitHash, Author, AuthorEmail, AuthorDate, Committer, CommitterEmail, CommitDate, Message, FilesChanged, Diff, ParentHashes
+- [x] `LLMPromptDocument` embedding Document: SessionID, AgentID, AgentType, Model, TokenCount, TurnNumber, PrecedingFiles, FollowingFiles
+- [x] `LLMResponseDocument` embedding Document: PromptID, SessionID, AgentID, Model, TokenCount, LatencyMs, StopReason, CodeBlocks, FilesModified, ToolsUsed
+- [x] `CodeBlock` struct: Language, Content, LineNum
 
-### DS.1.5 Document Collection Types
+### DS.1.3 Web Fetch Document Type (COMPLETE)
 
-**Files to create:** `core/search/collection.go`
-
-**Acceptance Criteria:**
-- [ ] `DocumentBatch` struct: Documents []Document, TotalSize int64, IndexedCount int
-- [ ] `IndexingResult` struct: Indexed, Failed, Errors []IndexError, Duration
-- [ ] `IndexError` struct: DocumentID, Path, Error, Retryable bool
-- [ ] Constants: `MaxBatchSize = 100`, `MaxBatchBytes = 10MB`
-
-### DS.1.6 Search Result Types
-
-**Files to create:** `core/search/result.go`
+**Files created:** `core/search/web_document.go`, `core/search/web_document_test.go`
 
 **Acceptance Criteria:**
-- [ ] `SearchResult` struct: Documents []ScoredDocument, TotalHits, SearchTime, Query
-- [ ] `ScoredDocument` embedding Document: Score float64, Highlights map[string][]string, MatchedFields
-- [ ] `SearchRequest` struct: Query, Type, PathFilter, Limit, Offset, FuzzyLevel, IncludeHighlights
-- [ ] `HybridSearchResult` struct: BleveResults, VectorResults, FusedResults, FusionMethod
+- [x] `WebFetchDocument` embedding Document: URL, FetchedAt, StatusCode, ContentType, Links, Headings, CodeSnippets
+- [x] URL normalization for consistent ID generation
+
+### DS.1.4 Git Commit Document Type (COMPLETE)
+
+**Files created:** `core/search/git_document.go`, `core/search/git_document_test.go`
+
+**Acceptance Criteria:**
+- [x] `GitCommitDocument` embedding Document: CommitHash, Author, AuthorEmail, AuthorDate, Committer, CommitterEmail, CommitDate, Message, FilesChanged, Diff, ParentHashes
+
+### DS.1.5 Document Collection Types (COMPLETE)
+
+**Files created:** `core/search/collection.go`, `core/search/collection_test.go`
+
+**Acceptance Criteria:**
+- [x] `DocumentBatch` struct: Documents []Document, TotalSize int64, IndexedCount int
+- [x] `IndexingResult` struct: Indexed, Failed, Errors []IndexError, Duration
+- [x] `IndexError` struct: DocumentID, Path, Error, Retryable bool
+- [x] Constants: `MaxBatchSize = 100`, `MaxBatchBytes = 10MB`
+
+### DS.1.6 Search Result Types (COMPLETE)
+
+**Files created:** `core/search/result.go`, `core/search/result_test.go`
+
+**Acceptance Criteria:**
+- [x] `SearchResult` struct: Documents []ScoredDocument, TotalHits, SearchTime, Query
+- [x] `ScoredDocument` embedding Document: Score float64, Highlights map[string][]string, MatchedFields
+- [x] `SearchRequest` struct: Query, Type, PathFilter, Limit, Offset, FuzzyLevel, IncludeHighlights
+- [x] `HybridSearchResult` struct: BleveResults, VectorResults, FusedResults, FusionMethod
 
 ### DS.2.1 Custom Code Tokenizer
 
@@ -3693,6 +3693,2804 @@ For each file operation task:
 - [ ] CMT + Bleve + VectorDB integration
 - [ ] Resource budget enforcement tests
 - [ ] Cross-validation tests
+
+---
+
+## Adaptive Retrieval System
+
+**Reference**: See `CONTEXT.md` "Architecture Gap Analysis" and "Self-Tuning Adaptive System" sections for complete specification.
+
+**Overview**: Implements speculative parallel pre-fetch, tiered search with latency budgets, robust Bayesian learning, and full WAVE 4 integration for all agents.
+
+### AR.1.1 Adaptive State Types
+
+**Architectural Role**: Foundation types for the self-tuning Bayesian learning system that personalizes context retrieval. These types implement Thompson sampling with robust Bayesian updates to automatically learn optimal retrieval parameters (how much context to prefetch, confidence thresholds, waste penalties) from observed user behavior. The system adapts to individual users and task contexts without manual tuning.
+
+**Why This Exists**: Traditional context retrieval uses fixed heuristics that work poorly across different codebases, users, and task types. By using Beta distributions with Thompson sampling, the system explores different parameter configurations while exploiting known-good settings. The robust update mechanism (outlier rejection, exponential decay, cold start protection, prior drift) prevents catastrophic forgetting and handles non-stationary user preferences.
+
+**Relationship to Architecture**:
+- `EpisodeObservation` captures signals from each query-response cycle (see CONTEXT.md "Episode Observation" section)
+- `RobustWeightDistribution` implements the Bayesian update logic (see CONTEXT.md "Robust Update Algorithm")
+- `AdaptiveState` persists < 2KB per session for fast serialization to the observation WAL
+- Used by: TieredSearcher (AR.5.2), SpeculativePrefetcher (AR.5.3), QueryAugmenter (AR.5.4)
+
+**Dependencies**: None (pure types), but consumed by AR.3.x implementations and AR.7.x hooks
+
+**Files to create:** `core/context/adaptive_types.go`
+
+**Implementation Guide:**
+```go
+// RobustWeightDistribution represents a Beta distribution with robust update semantics
+// Uses Thompson sampling for exploration vs exploitation
+type RobustWeightDistribution struct {
+    Alpha            float64 `msgpack:"alpha"`            // Beta distribution alpha
+    Beta             float64 `msgpack:"beta"`             // Beta distribution beta
+    effectiveSamples float64 `msgpack:"effective_samples"` // Decay-weighted sample count
+    priorAlpha       float64 `msgpack:"prior_alpha"`      // Original prior for drift
+    priorBeta        float64 `msgpack:"prior_beta"`       // Original prior for drift
+}
+
+// AdaptiveState holds all adaptive parameters for a session
+type AdaptiveState struct {
+    Weights struct {
+        TaskSuccess     RobustWeightDistribution
+        RelevanceBonus  RobustWeightDistribution
+        StrugglePenalty RobustWeightDistribution
+        WastePenalty    RobustWeightDistribution
+    }
+    Thresholds struct {
+        Confidence RobustWeightDistribution
+        Excerpt    RobustWeightDistribution
+        Budget     RobustWeightDistribution
+    }
+    ContextDiscovery  *ContextDiscovery
+    UserProfile       UserWeightProfile
+    TotalObservations int64
+    LastUpdated       time.Time
+    config            *UpdateConfig
+}
+
+// UpdateConfig controls robust update behavior
+type UpdateConfig struct {
+    OutlierSigmas      float64       // Reject observations > N sigmas (default: 3.0)
+    DecayHalfLife      int           // Observations for 50% weight decay (default: 50)
+    MinEffectiveSamples float64      // Cold start protection minimum (default: 5.0)
+    PriorDriftRate     float64       // Rate of prior drift per observation (default: 0.001)
+}
+
+// TaskContext represents a discovered context cluster
+type TaskContext string
+
+// EpisodeObservation captures all signals from one query-response cycle
+type EpisodeObservation struct {
+    // Identity
+    AgentID     string
+    AgentType   string
+    TurnNumber  int
+    Timestamp   time.Time
+
+    // Sampled parameters (for credit assignment)
+    SampledWeights    RewardWeights
+    SampledThresholds ThresholdConfig
+    TaskContext       TaskContext
+    QueryEmbedding    []float32
+
+    // Behavioral signals
+    PrefetchedIDs     []string  // Content IDs from prefetch
+    UsedIDs           []string  // Content IDs referenced in response
+    SearchedAfter     []string  // Searches performed after prefetch
+    ToolCallCount     int
+
+    // Outcome signals
+    TaskCompleted     bool
+    HedgingDetected   bool
+    FollowUpRequired  bool
+    EditAfterResponse bool
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `RobustWeightDistribution` struct with Alpha, Beta, effectiveSamples, priorAlpha, priorBeta fields
+- [ ] `AdaptiveState` struct with Weights (4 distributions), Thresholds (3 distributions), ContextDiscovery, UserProfile
+- [ ] `UpdateConfig` struct with OutlierSigmas (default 3.0), DecayHalfLife (default 50), MinEffectiveSamples (default 5.0), PriorDriftRate (default 0.001)
+- [ ] `TaskContext` type alias for string (context cluster identifier)
+- [ ] `EpisodeObservation` struct with all fields per CONTEXT.md specification
+- [ ] `RewardWeights` struct: TaskSuccess, RelevanceBonus, StrugglePenalty, WastePenalty (all float64)
+- [ ] `ThresholdConfig` struct: Confidence, Excerpt, Budget (all float64)
+- [ ] All structs have `msgpack` tags for serialization
+- [ ] Default `UpdateConfig` values via `DefaultUpdateConfig` variable
+- [ ] Total serialized size of `AdaptiveState` < 2KB with 10 contexts
+
+### AR.1.2 Retrieval Result Types
+
+**Architectural Role**: Core data structures representing retrieval results from the tiered search system. These types bridge the Document Search System (SEARCH.md) with Context Virtualization (CONTEXT.md), providing a unified representation of content retrieved from Hot Cache (< 1ms), Warm Index (< 10ms), and Full Search (< 200ms) tiers.
+
+**Why This Exists**: The tiered search architecture needs result types that track provenance (which tier returned this result), latency (for adaptive budget allocation), and token cost (for context window management). `AugmentedQuery` packages prefetched content ready for prompt injection, while `RetrievalBudget` enforces per-session token limits to prevent context overflow.
+
+**Relationship to Architecture**:
+- `SearchTier` enum maps to CONTEXT.md "Tiered Search" latency targets: Hot (0) < 1ms, Warm (1) < 10ms, Full (2) < 200ms
+- `AugmentedQuery.Render()` produces the [AUTO-RETRIEVED] markdown format injected by SpeculativePrefetchHook
+- `RetrievalBudget` integrates with VectorGraphDB SessionScopedView for query limiting
+- `Excerpt` includes AccessedAt for LRU eviction in HotCache
+
+**Dependencies**: AR.1.1 (EpisodeObservation uses these for tracking), consumed by AR.5.x search components
+
+**Files to create:** `core/context/retrieval_types.go`
+
+**Implementation Guide:**
+```go
+// SearchTier represents the search tier that produced a result
+type SearchTier int
+
+const (
+    TierHotCache   SearchTier = 0  // < 1ms latency target
+    TierWarmIndex  SearchTier = 1  // < 10ms latency target
+    TierFullSearch SearchTier = 2  // < 200ms latency target
+)
+
+// AugmentedQuery represents prefetched context ready for injection
+type AugmentedQuery struct {
+    OriginalQuery   string
+    Excerpts        []Excerpt
+    Summaries       []Summary
+    TotalTokens     int
+    SourceTier      SearchTier
+    PrefetchLatency time.Duration
+    Confidence      float64
+}
+
+// Excerpt represents a code/content excerpt with metadata
+type Excerpt struct {
+    ContentID   string
+    Path        string
+    StartLine   int
+    EndLine     int
+    Content     string
+    TokenCount  int
+    Confidence  float64
+    Source      SearchTier
+    AccessedAt  time.Time
+}
+
+// RetrievalBudget tracks per-session retrieval limits
+type RetrievalBudget struct {
+    MaxTokensPerQuery int64
+    MaxQueriesPerTurn int64
+    MaxTotalTokens    int64
+    UsedTokens        atomic.Int64
+    UsedQueries       atomic.Int64
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `SearchTier` enum: `TierHotCache` (0), `TierWarmIndex` (1), `TierFullSearch` (2)
+- [ ] `AugmentedQuery` struct with OriginalQuery, Excerpts, Summaries, TotalTokens, SourceTier, PrefetchLatency, Confidence
+- [ ] `Excerpt` struct with ContentID, Path, StartLine, EndLine, Content, TokenCount, Confidence, Source, AccessedAt
+- [ ] `Summary` struct with ContentID, Description, TokenCount, Confidence
+- [ ] `RetrievalResult` struct with Entries, References, TotalTokens, Truncated, SearchLatency
+- [ ] `RetrievalBudget` struct with atomic counters for UsedTokens, UsedQueries
+- [ ] `(b *RetrievalBudget) CanQuery() bool` checks UsedQueries < MaxQueriesPerTurn
+- [ ] `(b *RetrievalBudget) CanRetrieve(tokens int64) bool` checks UsedTokens + tokens <= MaxTotalTokens
+- [ ] `(a *AugmentedQuery) Render() string` produces markdown-formatted output with [AUTO-RETRIEVED] markers
+- [ ] All structs have JSON tags for API serialization
+
+### AR.1.3 Protocol Types
+
+**Architectural Role**: Inter-agent communication protocols for context sharing. These types define how knowledge agents (Librarian, Archivalist, Academic) share retrieved context with pipeline agents (Engineer, Designer, Inspector) and each other, enabling the "no direct agent communication" architecture where Guide routes all messages.
+
+**Why This Exists**: In the lossless context virtualization model (CONTEXT.md), evicted content must be retrievable across agents. When an Engineer needs context that was evicted from its window, it sends a `ContextShareRequest` to the Librarian (routed through Guide) which responds with full content. `ConsultationRequest/Response` enables the mandatory pre-delegation consultations (Architect must consult Librarian for codebase health before delegating).
+
+**Relationship to Architecture**:
+- `ContextShareRequest` uses `ContextPriority` to implement WAVE 4 PriorityQueue integration
+- `ContextShareResponse.CacheHint` tells receivers whether to promote to hot cache
+- `PrefetchSharePayload` is how Guide shares speculative prefetch results with target agents
+- `HandoffContextPayload` carries adaptive state during pipeline agent handoff (see CONTEXT.md "Agent Handoff")
+- Integrates with existing message routing in `core/messaging/`
+
+**Dependencies**: Consumed by AR.8.x skills, AR.7.x hooks, AR.13.2 handoff integration
+
+**Files to create:** `core/context/protocol_types.go`
+
+**Implementation Guide:**
+```go
+// ContextPriority determines request urgency
+type ContextPriority int
+
+const (
+    ContextPriorityLow      ContextPriority = 0  // Background, can wait
+    ContextPriorityNormal   ContextPriority = 1  // Standard request
+    ContextPriorityHigh     ContextPriority = 2  // Time-sensitive
+    ContextPriorityCritical ContextPriority = 3  // Blocking operation
+)
+
+// ContextShareRequest represents inter-agent context request
+type ContextShareRequest struct {
+    RequestID           string            `json:"request_id"`
+    RequestingAgentID   string            `json:"requesting_agent_id"`
+    RequestingAgentType string            `json:"requesting_agent_type"`
+    TargetAgentType     string            `json:"target_agent_type"`
+    Timestamp           time.Time         `json:"timestamp"`
+    Query               string            `json:"query"`
+    MaxTokens           int               `json:"max_tokens"`
+    Priority            ContextPriority   `json:"priority"`
+    ContentTypes        []string          `json:"content_types,omitempty"`
+    SessionScope        string            `json:"session_scope"`
+    IncludeReferences   bool              `json:"include_references"`
+}
+
+// ContextShareResponse represents shared context from knowledge agent
+type ContextShareResponse struct {
+    RequestID       string              `json:"request_id"`
+    SourceAgentID   string              `json:"source_agent_id"`
+    SourceAgentType string              `json:"source_agent_type"`
+    Entries         []*ContentEntry     `json:"entries"`
+    References      []*ContextReference `json:"references,omitempty"`
+    TotalTokens     int                 `json:"total_tokens"`
+    Truncated       bool                `json:"truncated"`
+    CacheHint       string              `json:"cache_hint"`
+    Confidence      float64             `json:"confidence"`
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `ContextPriority` enum with Low (0), Normal (1), High (2), Critical (3)
+- [ ] `ContextShareRequest` struct with all fields per CONTEXT.md, JSON tags
+- [ ] `ContextShareResponse` struct with all fields per CONTEXT.md, JSON tags
+- [ ] `ConsultationRequest` struct for agent-to-agent consultation (bypasses Guide)
+- [ ] `ConsultationResponse` struct with Answer, Confidence, Sources, RelevantContent
+- [ ] `PrefetchSharePayload` struct for Guide → Target agent prefetch sharing
+- [ ] `HandoffContextPayload` struct for adaptive state in handoff
+- [ ] `NewContextShareRequest(agentID, agentType, target, query string) *ContextShareRequest` constructor
+- [ ] All timestamp fields use `time.Time` with proper JSON serialization
+
+### AR.1.4 Hook Data Types
+
+**Architectural Role**: Types for the hook system that intercepts LLM prompts/responses and tool calls to inject prefetched context, track episodes, and enforce pressure-driven eviction. Hooks execute in a priority-ordered pipeline (First=0 to Last=100) enabling multiple components to modify data without tight coupling.
+
+**Why This Exists**: The Adaptive Retrieval system needs to inject prefetched context before LLM calls (PrePrompt), track which content was used (PostPrompt), and observe tool execution patterns (PreTool/PostTool). Using a hook system instead of hard-coded calls allows independent development and testing of each component while maintaining deterministic execution order.
+
+**Relationship to Architecture**:
+- `HookPriority` values match ARCHITECTURE.md hook ordering: First(0), Early(25), Normal(50), Late(75), Last(100)
+- `HookType` enum aligns with existing `core/skills/hooks.go` patterns
+- `PromptHookData.InjectContext` is the field SpeculativePrefetchHook sets with augmented content
+- `PromptHookData.RemainingContext` used by PressureEvictionHook to decide eviction percentage
+- `ToolCallHookData` carries tool execution signals for EpisodeTracker observation
+
+**Dependencies**: Extends existing `core/skills/hooks.go`, consumed by all AR.7.x hook implementations
+
+**Files to create:** `core/context/hook_types.go`
+
+**Implementation Guide:**
+```go
+// HookPriority determines execution order (lower = earlier)
+type HookPriority int
+
+const (
+    HookPriorityFirst  HookPriority = 0   // Execute first (e.g., prefetch injection)
+    HookPriorityEarly  HookPriority = 25  // Early execution (e.g., episode init)
+    HookPriorityNormal HookPriority = 50  // Normal execution
+    HookPriorityLate   HookPriority = 75  // Late execution (e.g., observation recording)
+    HookPriorityLast   HookPriority = 100 // Execute last
+)
+
+// HookType distinguishes hook phases
+type HookType int
+
+const (
+    PrePrompt  HookType = iota  // Before LLM call
+    PostPrompt                   // After LLM response
+    PreTool                      // Before tool execution
+    PostTool                     // After tool execution
+)
+
+// PromptHookData carries data through prompt hooks
+type PromptHookData struct {
+    AgentID          string
+    AgentType        string
+    SessionID        string
+    UserQuery        string
+    SystemPrompt     string
+    Messages         []Message
+    RemainingContext int
+    InjectContext    string  // Modified by hooks
+    SkipLLM          bool    // Set to skip LLM call
+    CachedResult     any     // Result if SkipLLM
+    TurnNumber       int
+    Response         string  // Set after LLM call (PostPrompt)
+    ToolCalls        []ToolCall  // Set after LLM call (PostPrompt)
+}
+
+// Hook represents a registered hook
+type Hook struct {
+    Name     string
+    Type     HookType
+    Priority HookPriority
+    Agents   []string  // Empty = all agents, or specific agent types
+    Handler  func(ctx context.Context, data any) (any, error)
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `HookPriority` constants: First (0), Early (25), Normal (50), Late (75), Last (100)
+- [ ] `HookType` constants: PrePrompt, PostPrompt, PreTool, PostTool
+- [ ] `PromptHookData` struct with all fields per CONTEXT.md specification
+- [ ] `ToolCallHookData` struct with ToolName, ToolInput, ToolOutput, ToolError, Duration
+- [ ] `Hook` struct with Name, Type, Priority, Agents, Handler
+- [ ] `HookResult` struct with Continue (bool), Modified (bool), Error (error)
+- [ ] `PromptHookFunc` type: `func(ctx context.Context, data *PromptHookData) (*PromptHookData, error)`
+- [ ] `ToolCallHookFunc` type: `func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error)`
+- [ ] Hook types match ARCHITECTURE.md patterns (lines 32674-32687)
+
+### AR.2.1 SafeChan Observation Channel
+
+**Architectural Role**: WAVE 4 compliant channel wrapper for EpisodeObservation delivery. The observation system generates signals continuously (one EpisodeObservation per query-response cycle) that must be delivered to the learning system without blocking LLM execution or leaking goroutines on shutdown.
+
+**Why This Exists**: Raw Go channels cannot be safely closed while senders may still write, leading to panics. SafeChan provides context-cancellation-aware send/receive operations that gracefully handle shutdown. This is critical for the adaptive learning pipeline where observations arrive continuously but must never block the main LLM execution path.
+
+**Relationship to Architecture**:
+- Wraps `core/concurrency/safechan/safechan.go` - WAVE 4 compliant channel implementation
+- Used by ObservationLog (AR.4.2) for async observation processing
+- `TrySend` enables non-blocking observation recording when under pressure
+- Context cancellation ensures clean shutdown without observation loss
+- Buffer size 100 prevents backpressure under normal operation
+
+**WAVE 4 Compliance**: Uses SafeChan instead of raw `make(chan)` per WAVE 4 channel safety requirements. All channel operations respect context cancellation.
+
+**Dependencies**: `core/concurrency/safechan/safechan.go`, consumed by AR.4.2 ObservationLog
+
+**Files to create:** `core/context/observation_channel.go`
+
+**Existing code to reference:** `core/concurrency/safechan/safechan.go`
+
+**Implementation Guide:**
+```go
+// ObservationChannel wraps SafeChan for EpisodeObservation
+type ObservationChannel struct {
+    ch     *safechan.SafeChan[EpisodeObservation]
+    closed atomic.Bool
+}
+
+func NewObservationChannel(bufferSize int) *ObservationChannel {
+    return &ObservationChannel{
+        ch: safechan.New[EpisodeObservation](bufferSize),
+    }
+}
+
+// Send sends observation, respecting context cancellation
+func (c *ObservationChannel) Send(ctx context.Context, obs EpisodeObservation) error {
+    if c.closed.Load() {
+        return ErrChannelClosed
+    }
+    return c.ch.Send(ctx, obs)
+}
+
+// TrySend attempts non-blocking send, returns false if full/closed
+func (c *ObservationChannel) TrySend(ctx context.Context, obs EpisodeObservation) bool {
+    if c.closed.Load() {
+        return false
+    }
+    return c.ch.TrySend(ctx, obs)
+}
+
+// Receive receives observation, respecting context cancellation
+func (c *ObservationChannel) Receive(ctx context.Context) (EpisodeObservation, bool) {
+    return c.ch.Receive(ctx)
+}
+
+func (c *ObservationChannel) Close() {
+    c.closed.Store(true)
+    c.ch.Close()
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `ObservationChannel` struct wrapping `safechan.SafeChan[EpisodeObservation]`
+- [ ] `NewObservationChannel(bufferSize int)` constructor with default buffer 100
+- [ ] `Send(ctx, obs)` respects context cancellation, returns error on closed
+- [ ] `TrySend(ctx, obs)` non-blocking, returns false if full or closed
+- [ ] `Receive(ctx)` respects context cancellation, returns (obs, false) on closed
+- [ ] `Close()` idempotent, sets closed flag before closing underlying channel
+- [ ] NO raw `make(chan ...)` - must use SafeChan
+- [ ] Unit test: context cancellation stops blocked Send
+- [ ] Unit test: Close() unblocks waiting Receive
+- [ ] Unit test: TrySend returns false when buffer full
+
+### AR.2.2 GoroutineScope Prefetch Wrapper
+
+**Architectural Role**: WAVE 4 compliant goroutine management for speculative prefetch operations. Prefetch launches goroutines in parallel with user input processing - this component ensures those goroutines are tracked, budget-limited, and cleanly cancelled on shutdown.
+
+**Why This Exists**: Speculative prefetch starts searches before the LLM needs them, reducing perceived latency. However, uncontrolled goroutine spawning causes resource exhaustion under load. `PrefetchScope` wraps `GoroutineScope` to enforce per-session goroutine budgets, track in-flight operations for monitoring, and ensure all prefetch goroutines terminate on session end.
+
+**Relationship to Architecture**:
+- Wraps `core/concurrency/goroutine_scope.go` - WAVE 4 compliant goroutine lifecycle management
+- `GoroutineBudget` integration prevents goroutine explosion under heavy prefetch load
+- `ResourceTracker` integration enables monitoring of in-flight prefetch operations
+- `TrackedPrefetchFuture` provides async result with timeout via `GetIfReady(timeout)`
+- Inflight map enables deduplication (same query returns same future)
+
+**WAVE 4 Compliance**: All goroutines launched via `scope.Go()`, NEVER raw `go`. Budget exhaustion returns error instead of spawning unbounded goroutines. Operations tracked via `ResourceTracker`.
+
+**Dependencies**: `core/concurrency/goroutine_scope.go`, `core/concurrency/resource_tracker.go`, consumed by SpeculativePrefetcher (AR.5.3)
+
+**Files to create:** `core/context/prefetch_scope.go`
+
+**Existing code to reference:** `core/concurrency/goroutine_scope.go`, `core/concurrency/resource_tracker.go`
+
+**Implementation Guide:**
+```go
+// TrackedPrefetchFuture represents an in-flight prefetch operation
+type TrackedPrefetchFuture struct {
+    result    atomic.Pointer[AugmentedQuery]
+    done      chan struct{}
+    started   time.Time
+    operation *concurrency.Operation
+    err       atomic.Pointer[error]
+}
+
+// PrefetchScope manages prefetch goroutines via GoroutineScope
+type PrefetchScope struct {
+    scope     *concurrency.GoroutineScope
+    budget    *concurrency.GoroutineBudget
+    tracker   *concurrency.ResourceTracker
+    timeout   time.Duration  // Default 200ms
+    inflight  sync.Map       // queryHash → *TrackedPrefetchFuture
+}
+
+// StartPrefetch launches prefetch using scope.Go(), NOT raw go
+func (p *PrefetchScope) StartPrefetch(
+    ctx context.Context,
+    queryHash string,
+    searchFn func(context.Context) (*AugmentedQuery, error),
+) (*TrackedPrefetchFuture, error) {
+    // Create operation for tracking
+    op := concurrency.NewOperation(
+        ctx,
+        concurrency.OpTypeSearch,
+        p.scope.AgentID(),
+        fmt.Sprintf("prefetch:%s", queryHash[:min(20, len(queryHash))]),
+        p.timeout,
+    )
+
+    future := &TrackedPrefetchFuture{
+        done:      make(chan struct{}),
+        started:   time.Now(),
+        operation: op,
+    }
+
+    // Use scope.Go() - NEVER raw go
+    err := p.scope.Go("prefetch-"+queryHash[:8], p.timeout, func(ctx context.Context) error {
+        defer close(future.done)
+        defer op.MarkDone()
+
+        result, err := searchFn(ctx)
+        if err != nil {
+            future.err.Store(&err)
+            return err
+        }
+        future.result.Store(result)
+        return nil
+    })
+
+    if err != nil {
+        return nil, err  // Budget exhausted
+    }
+
+    p.tracker.Track(op, op.ID)
+    p.inflight.Store(queryHash, future)
+
+    return future, nil
+}
+
+// GetIfReady returns result if available within timeout, nil otherwise
+func (f *TrackedPrefetchFuture) GetIfReady(timeout time.Duration) *AugmentedQuery {
+    select {
+    case <-f.done:
+        return f.result.Load()
+    case <-time.After(timeout):
+        return nil
+    }
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `TrackedPrefetchFuture` struct with atomic result pointer, done channel, operation tracking
+- [ ] `PrefetchScope` struct with GoroutineScope, GoroutineBudget, ResourceTracker references
+- [ ] `NewPrefetchScope(scope, budget, tracker, timeout)` constructor
+- [ ] `StartPrefetch(ctx, queryHash, searchFn)` uses `scope.Go()`, NEVER raw `go`
+- [ ] `StartPrefetch` creates `concurrency.Operation` with `OpTypeSearch`
+- [ ] `StartPrefetch` returns error if goroutine budget exhausted
+- [ ] `GetIfReady(timeout)` returns nil if not ready within timeout
+- [ ] `GetOrStart(ctx, queryHash, searchFn)` deduplicates concurrent prefetches for same query
+- [ ] Inflight map cleanup when future completes
+- [ ] Unit test: budget exhaustion returns error (not panic)
+- [ ] Unit test: deduplication returns same future for same queryHash
+- [ ] Linter verification: no raw `go` statements in file
+
+### AR.2.3 FileHandleBudget Resource Wrapper
+
+**Architectural Role**: WAVE 4 compliant file handle management for adaptive retrieval persistence. The system maintains WAL files for observation durability and state files for adaptive parameters - these handles must be tracked to prevent file descriptor exhaustion across many concurrent sessions.
+
+**Why This Exists**: Each session's adaptive retrieval opens WAL (write-ahead log) and state files. Without centralized tracking, hundreds of sessions could exhaust OS file descriptor limits (typically 1024-4096). `RetrievalResources` acquires handles through `FileHandleBudget`, ensuring global limits are respected and handles are properly released on session end.
+
+**Relationship to Architecture**:
+- Wraps `core/resources/file_handle_budget.go` - WAVE 4 compliant file handle pool
+- `AgentFileBudget` provides per-agent handle limits within session
+- WAL handle used by ObservationLog (AR.4.2) for crash-safe observation recording
+- State handle used by AdaptiveState (AR.3.4) for periodic state persistence
+- Cleanup on error during construction prevents handle leaks on partial initialization
+
+**WAVE 4 Compliance**: All file handles acquired via `FileHandleBudget.Acquire()`, NEVER raw `os.Open()`. Handles tracked and released via `AgentBudget.Release()`. Idempotent `Close()` safe for multiple calls.
+
+**Dependencies**: `core/resources/file_handle_budget.go`, consumed by ObservationLog (AR.4.2), AdaptiveState (AR.3.4)
+
+**Files to create:** `core/context/retrieval_resources.go`
+
+**Existing code to reference:** `core/resources/file_handle_budget.go`
+
+**Implementation Guide:**
+```go
+// RetrievalResources manages file handles for adaptive retrieval
+type RetrievalResources struct {
+    fileBudget   *resources.FileHandleBudget
+    agentBudget  *resources.AgentFileBudget
+    handles      []resources.TrackedFileHandle
+    walFile      *os.File
+    stateFile    *os.File
+    mu           sync.Mutex
+    closed       bool
+}
+
+// NewRetrievalResources acquires all required file handles
+func NewRetrievalResources(
+    sessionID, agentID string,
+    fileBudget *resources.FileHandleBudget,
+    paths RetrievalPaths,
+) (*RetrievalResources, error) {
+    agentBudget, err := fileBudget.GetAgentBudget(sessionID, agentID)
+    if err != nil {
+        return nil, fmt.Errorf("get agent budget: %w", err)
+    }
+
+    r := &RetrievalResources{
+        fileBudget:  fileBudget,
+        agentBudget: agentBudget,
+    }
+
+    // Acquire WAL handle
+    walHandle, err := agentBudget.Acquire("adaptive-wal", paths.WAL)
+    if err != nil {
+        return nil, fmt.Errorf("acquire WAL handle: %w", err)
+    }
+    r.handles = append(r.handles, walHandle)
+    r.walFile = walHandle.File()
+
+    // Acquire state file handle
+    stateHandle, err := agentBudget.Acquire("adaptive-state", paths.State)
+    if err != nil {
+        r.Close()
+        return nil, fmt.Errorf("acquire state handle: %w", err)
+    }
+    r.handles = append(r.handles, stateHandle)
+    r.stateFile = stateHandle.File()
+
+    return r, nil
+}
+
+func (r *RetrievalResources) Close() error {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+
+    if r.closed {
+        return nil
+    }
+    r.closed = true
+
+    var errs []error
+    for _, h := range r.handles {
+        if err := r.agentBudget.Release(h); err != nil {
+            errs = append(errs, err)
+        }
+    }
+    r.handles = nil
+
+    if len(errs) > 0 {
+        return fmt.Errorf("release errors: %v", errs)
+    }
+    return nil
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `RetrievalResources` struct with fileBudget, agentBudget, handles slice
+- [ ] `RetrievalPaths` struct with WAL, State, Bleve, VectorDB paths
+- [ ] `NewRetrievalResources(sessionID, agentID, budget, paths)` constructor
+- [ ] Acquires WAL file handle via `agentBudget.Acquire("adaptive-wal", path)`
+- [ ] Acquires state file handle via `agentBudget.Acquire("adaptive-state", path)`
+- [ ] `Close()` releases all handles via `agentBudget.Release(handle)`
+- [ ] `Close()` is idempotent (safe to call multiple times)
+- [ ] Cleanup on error during construction (partial acquisition rolled back)
+- [ ] All file handles tracked - none opened without budget
+- [ ] Unit test: Close releases all handles
+- [ ] Unit test: construction failure cleans up partial acquisitions
+
+### AR.2.4 CircuitBreaker Registration
+
+**Architectural Role**: Failure isolation for search backends using the GlobalCircuitBreakerRegistry. When Bleve or VectorDB backends experience failures (disk I/O errors, index corruption, memory pressure), circuit breakers prevent cascading failures by temporarily disabling affected backends while allowing the system to continue with degraded functionality.
+
+**Why This Exists**: Tiered search (AR.5.2) queries multiple backends in parallel. Without circuit breakers, a failing backend causes request timeouts that block the entire search path. With circuit breakers, after 5 failures the backend is marked "open" for 30 seconds, allowing Hot Cache and healthy backends to continue serving results while the failed backend recovers.
+
+**Relationship to Architecture**:
+- Reuses `core/llm/global_circuit_breaker.go` - shared circuit breaker registry across LLM and search
+- `CBNameBleveSearch` and `CBNameVectorSearch` identify search-specific breakers
+- TieredSearcher (AR.5.2) wraps each backend call with `SearchWithCircuitBreaker`
+- 5-failure threshold matches LLM breaker defaults for consistent behavior
+- `ErrCircuitOpen` returned by TieredSearcher to indicate degraded mode
+
+**WAVE 4 Compliance**: Uses GlobalCircuitBreakerRegistry for system-wide failure tracking. No per-request circuit breaker allocation.
+
+**Dependencies**: `core/llm/circuit_breaker.go`, `core/llm/global_circuit_breaker.go`, consumed by TieredSearcher (AR.5.2)
+
+**Files to create:** `core/context/search_circuit_breakers.go`
+
+**Existing code to reference:** `core/llm/circuit_breaker.go`, `core/llm/global_circuit_breaker.go`
+
+**Implementation Guide:**
+```go
+// SearchCircuitBreakerNames defines circuit breaker identifiers
+const (
+    CBNameBleveSearch  = "bleve-search"
+    CBNameVectorSearch = "vector-search"
+)
+
+// DefaultSearchCBConfig returns config for search circuit breakers
+func DefaultSearchCBConfig() *llm.CircuitBreakerConfig {
+    return &llm.CircuitBreakerConfig{
+        FailureThreshold: 5,
+        ResetTimeout:     30 * time.Second,
+        HalfOpenMax:      2,
+    }
+}
+
+// RegisterSearchCircuitBreakers registers circuit breakers with global registry
+func RegisterSearchCircuitBreakers(registry *llm.GlobalCircuitBreakerRegistry) error {
+    config := DefaultSearchCBConfig()
+
+    if err := registry.Register(CBNameBleveSearch, config); err != nil {
+        return fmt.Errorf("register bleve-search: %w", err)
+    }
+
+    if err := registry.Register(CBNameVectorSearch, config); err != nil {
+        return fmt.Errorf("register vector-search: %w", err)
+    }
+
+    return nil
+}
+
+// SearchWithCircuitBreaker executes search with circuit breaker protection
+func SearchWithCircuitBreaker(
+    ctx context.Context,
+    registry *llm.GlobalCircuitBreakerRegistry,
+    cbName string,
+    searchFn func(context.Context) (any, error),
+) (any, error) {
+    if !registry.Allow(cbName) {
+        return nil, ErrCircuitOpen
+    }
+
+    result, err := searchFn(ctx)
+    if err != nil {
+        registry.RecordFailure(cbName)
+        return nil, err
+    }
+
+    registry.RecordSuccess(cbName)
+    return result, nil
+}
+```
+
+**Acceptance Criteria:**
+- [ ] Constants: `CBNameBleveSearch = "bleve-search"`, `CBNameVectorSearch = "vector-search"`
+- [ ] `DefaultSearchCBConfig()` returns config with FailureThreshold=5, ResetTimeout=30s, HalfOpenMax=2
+- [ ] `RegisterSearchCircuitBreakers(registry)` registers both circuit breakers
+- [ ] Uses `GlobalCircuitBreakerRegistry` from `core/llm/` - NOT new local breakers
+- [ ] `SearchWithCircuitBreaker(ctx, registry, name, fn)` wrapper for protected search
+- [ ] `ErrCircuitOpen` error type for when circuit is open
+- [ ] Registration is idempotent (re-registering same name doesn't error)
+- [ ] Unit test: circuit opens after FailureThreshold failures
+- [ ] Unit test: circuit resets after ResetTimeout
+- [ ] Unit test: SearchWithCircuitBreaker returns ErrCircuitOpen when open
+
+### AR.3.1 RobustWeightDistribution Implementation
+
+**Architectural Role**: Core Bayesian learning primitive using Beta distributions with Thompson sampling. This implements the "exploration vs exploitation" trade-off that allows the system to both try new parameter configurations and leverage known-good ones.
+
+**Why This Exists**: Fixed retrieval parameters fail across diverse users and tasks. Traditional A/B testing requires too many samples. Thompson sampling draws from a posterior distribution, naturally balancing exploration (sampling from uncertain regions) with exploitation (sampling from high-reward regions). The 5-step robust update prevents common Bayesian update failures: outlier sensitivity, recency bias, cold start instability, and prior forgetting.
+
+**Relationship to Architecture**:
+- Implements CONTEXT.md "Robust Update Algorithm" specification exactly
+- `Sample()` draws from Beta(α, β) using Thompson sampling for parameter selection
+- `Update()` executes 5-step robust update: outlier rejection → exponential decay → observation incorporation → cold start protection → prior drift
+- `Mean()` provides point estimate for handoff context serialization
+- Used by AdaptiveState (AR.3.4) for all 7 learned parameters (4 weights + 3 thresholds)
+
+**Mathematical Foundation**:
+- Beta(α, β) represents belief about probability of success
+- Mean = α/(α+β), variance decreases with more samples
+- Thompson sampling: sample from posterior, use sampled value, update based on outcome
+- Convergence: 100+ positive observations move mean toward 1.0
+
+**Dependencies**: None (pure implementation), consumed by AdaptiveState (AR.3.4)
+
+**Files to create:** `core/context/robust_weight.go`, `core/context/robust_weight_test.go`
+
+**Implementation Guide:**
+```go
+// Sample draws from Beta distribution using Thompson sampling
+func (w *RobustWeightDistribution) Sample() float64 {
+    // Use inverse CDF method or rejection sampling for Beta distribution
+    return betaSample(w.Alpha, w.Beta)
+}
+
+// Mean returns the mean of the distribution
+func (w *RobustWeightDistribution) Mean() float64 {
+    return w.Alpha / (w.Alpha + w.Beta)
+}
+
+// Update performs robust Bayesian update
+func (w *RobustWeightDistribution) Update(observation float64, satisfaction float64, config *UpdateConfig) {
+    // 1. Outlier detection - reject if > OutlierSigmas standard deviations
+    stdDev := w.StdDev()
+    mean := w.Mean()
+    if math.Abs(observation-mean) > config.OutlierSigmas*stdDev {
+        return // Reject outlier
+    }
+
+    // 2. Exponential decay - reduce effective samples
+    decayFactor := math.Pow(0.5, 1.0/float64(config.DecayHalfLife))
+    w.effectiveSamples *= decayFactor
+    w.Alpha *= decayFactor
+    w.Beta *= decayFactor
+
+    // 3. Add new observation
+    if satisfaction > 0 {
+        w.Alpha += satisfaction * observation
+    } else {
+        w.Beta += (-satisfaction) * (1 - observation)
+    }
+    w.effectiveSamples++
+
+    // 4. Cold start protection
+    if w.effectiveSamples < config.MinEffectiveSamples {
+        // Blend toward prior
+        blend := w.effectiveSamples / config.MinEffectiveSamples
+        w.Alpha = blend*w.Alpha + (1-blend)*w.priorAlpha
+        w.Beta = blend*w.Beta + (1-blend)*w.priorBeta
+    }
+
+    // 5. Prior drift - slowly drift back to prior
+    w.priorAlpha += config.PriorDriftRate * (w.Alpha - w.priorAlpha)
+    w.priorBeta += config.PriorDriftRate * (w.Beta - w.priorBeta)
+}
+
+func (w *RobustWeightDistribution) StdDev() float64 {
+    a, b := w.Alpha, w.Beta
+    return math.Sqrt((a * b) / ((a + b) * (a + b) * (a + b + 1)))
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `Sample()` returns value in [0, 1] using Beta distribution sampling
+- [ ] `Mean()` returns Alpha / (Alpha + Beta)
+- [ ] `StdDev()` returns standard deviation of Beta distribution
+- [ ] `Update()` implements 5-step robust update per CONTEXT.md specification
+- [ ] Step 1: Outlier rejection (> OutlierSigmas * stddev from mean)
+- [ ] Step 2: Exponential decay with configurable half-life
+- [ ] Step 3: Observation incorporation based on satisfaction sign
+- [ ] Step 4: Cold start protection (blend toward prior when effectiveSamples < min)
+- [ ] Step 5: Prior drift for non-stationarity adaptation
+- [ ] `NewRobustWeightDistribution(alpha, beta float64)` sets both current and prior values
+- [ ] Unit test: Sample() produces valid [0, 1] values
+- [ ] Unit test: Convergence test - 1000 positive updates move mean toward 1.0
+- [ ] Unit test: Outlier rejection - extreme values don't affect distribution
+- [ ] Unit test: Cold start - early observations blended with prior
+- [ ] Unit test: Decay - old observations have less weight than recent
+
+### AR.3.2 Context Discovery
+
+**Architectural Role**: Unsupervised task context clustering using query embeddings. The system discovers that "refactoring" queries have different optimal parameters than "debugging" queries, automatically learning context-specific weight biases without manual configuration.
+
+**Why This Exists**: A single set of retrieval weights is suboptimal across task types. Debugging tasks benefit from more historical context (higher RelevanceBonus for past errors), while refactoring tasks benefit from current codebase structure. ContextDiscovery clusters queries by embedding similarity, maintaining up to 10 context centroids with per-context weight biases.
+
+**Relationship to Architecture**:
+- `ClassifyQuery` provides < 1μs keyword cache lookup (fast path) or < 100μs centroid similarity (slow path)
+- `ContextWeightBias` multipliers applied after base weight sampling in AdaptiveState.SampleWeights()
+- Centroids stored as running average embeddings, updated with each classified query
+- Keywords extracted from queries populate cache for fast-path matching
+- Max 10 contexts enforced via LRU replacement of least-sampled centroids
+
+**Integration with VectorGraphDB**:
+- Query embeddings generated via VectorGraphDB.GenerateEmbedding()
+- Cosine similarity computed against stored centroid embeddings
+- Threshold 0.7 for classification, 0.8 for centroid update
+
+**Dependencies**: VectorGraphDB for embeddings, consumed by AdaptiveState (AR.3.4), EpisodeTrackerInitHook (AR.7.2)
+
+**Files to create:** `core/context/context_discovery.go`, `core/context/context_discovery_test.go`
+
+**Implementation Guide:**
+```go
+// ContextDiscovery manages embedding-based context clusters
+type ContextDiscovery struct {
+    centroids     []ContextCentroid
+    keywordCache  sync.Map  // keyword → TaskContext (fast path)
+    maxContexts   int
+    mu            sync.RWMutex
+}
+
+type ContextCentroid struct {
+    ID          TaskContext
+    Embedding   []float32
+    Keywords    []string
+    Bias        *ContextWeightBias
+    SampleCount int
+}
+
+type ContextWeightBias struct {
+    RelevanceMult    float64
+    StruggleMult     float64
+    WasteMult        float64
+    ObservationCount int
+}
+
+// ClassifyQuery finds the best matching context for a query
+func (c *ContextDiscovery) ClassifyQuery(query string, embedding []float32) TaskContext {
+    // Fast path: keyword cache lookup (< 1μs)
+    if cached, ok := c.keywordCache.Load(normalizeKeyword(query)); ok {
+        return cached.(TaskContext)
+    }
+
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+
+    if len(c.centroids) == 0 {
+        return TaskContext("general")
+    }
+
+    // Find nearest centroid by cosine similarity
+    var bestCtx TaskContext = "general"
+    var bestSim float64 = -1
+
+    for _, centroid := range c.centroids {
+        sim := cosineSimilarity(embedding, centroid.Embedding)
+        if sim > bestSim {
+            bestSim = sim
+            bestCtx = centroid.ID
+        }
+    }
+
+    // Only return context if similarity above threshold
+    if bestSim < 0.7 {
+        return TaskContext("general")
+    }
+
+    return bestCtx
+}
+
+// UpdateOrCreateContext updates existing or creates new context cluster
+func (c *ContextDiscovery) UpdateOrCreateContext(
+    query string,
+    embedding []float32,
+    satisfaction float64,
+) TaskContext {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    // Find nearest existing context
+    bestIdx := -1
+    bestSim := float64(0)
+    for i, centroid := range c.centroids {
+        sim := cosineSimilarity(embedding, centroid.Embedding)
+        if sim > bestSim {
+            bestSim = sim
+            bestIdx = i
+        }
+    }
+
+    // If close enough, update existing
+    if bestSim > 0.8 && bestIdx >= 0 {
+        c.updateCentroid(bestIdx, embedding, query)
+        return c.centroids[bestIdx].ID
+    }
+
+    // Create new context if under limit
+    if len(c.centroids) < c.maxContexts {
+        ctx := c.createContext(embedding, query)
+        return ctx
+    }
+
+    // Replace least-used context
+    return c.replaceWeakestContext(embedding, query)
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `ContextDiscovery` struct with centroids slice, keywordCache sync.Map, maxContexts (default 10)
+- [ ] `ContextCentroid` struct with ID, Embedding, Keywords, Bias, SampleCount
+- [ ] `ContextWeightBias` struct with RelevanceMult, StruggleMult, WasteMult, ObservationCount (all default 1.0)
+- [ ] `ClassifyQuery(query, embedding)` checks keyword cache first (< 1μs requirement)
+- [ ] `ClassifyQuery` falls back to nearest centroid by cosine similarity
+- [ ] `ClassifyQuery` returns "general" if no centroid similarity > 0.7
+- [ ] `UpdateOrCreateContext(query, embedding, satisfaction)` updates or creates context
+- [ ] `GetBias(ctx TaskContext) *ContextWeightBias` returns bias for context
+- [ ] `UpdateBias(ctx, satisfaction, obs)` updates context-specific bias
+- [ ] New context creation only if under maxContexts limit
+- [ ] Centroid embedding is running average of assigned queries
+- [ ] Keyword extraction adds to centroid Keywords for cache
+- [ ] Unit test: keyword cache lookup < 1μs for 1000 cached keywords
+- [ ] Unit test: centroid lookup < 100μs for 10 centroids
+- [ ] Unit test: maxContexts enforced, replaces weakest when full
+
+### AR.3.3 User Profile Learning
+
+**Architectural Role**: Individual user preference learning for retrieval behavior. Some users prefer thorough context (accept unused prefetch), others want minimal context (penalize waste). This component learns these preferences from behavioral signals without explicit user configuration.
+
+**Why This Exists**: Users have implicit preferences that affect satisfaction. A user who frequently succeeds despite excess prefetch is signaling verbosity tolerance (reduce WastePenalty). A user who fails after many post-prefetch searches is signaling insufficient prefetch (increase StrugglePenalty). Learning these preferences improves satisfaction without user-facing settings.
+
+**Relationship to Architecture**:
+- `UserWeightProfile` stored within AdaptiveState, persisted per session
+- `Adjust(base)` applies learned multipliers to base sampled weights
+- Never adjusts TaskSuccess weight (core objective function unchanged)
+- Learning rate 0.1 provides slow, stable preference drift
+- Requires minimum 5 observations before adjustments activate (cold start protection)
+
+**Behavioral Signals Learned**:
+- `PrefersThorough`: Positive satisfaction + excess prefetch → tolerates verbosity
+- `ToleratesSearches`: Negative satisfaction + many searches → dislikes insufficient prefetch
+- Multipliers clamped to [0.5, 2.0] to prevent extreme behavior
+
+**Dependencies**: EpisodeObservation for signals, consumed by AdaptiveState (AR.3.4)
+
+**Files to create:** `core/context/user_profile.go`, `core/context/user_profile_test.go`
+
+**Implementation Guide:**
+```go
+// UserWeightProfile tracks individual user preferences
+type UserWeightProfile struct {
+    PrefersThorough     float64 `msgpack:"prefers_thorough"`     // -1 = concise, +1 = thorough
+    ToleratesSearches   float64 `msgpack:"tolerates_searches"`   // -1 = hates, +1 = fine
+    WastePenaltyMult    float64 `msgpack:"waste_penalty_mult"`   // Multiplier [0.5, 2.0]
+    StrugglePenaltyMult float64 `msgpack:"struggle_penalty_mult"` // Multiplier [0.5, 2.0]
+    ObservationCount    int     `msgpack:"observation_count"`
+    LastUpdated         time.Time `msgpack:"last_updated"`
+}
+
+// NewUserWeightProfile returns default profile
+func NewUserWeightProfile() UserWeightProfile {
+    return UserWeightProfile{
+        PrefersThorough:     0.0,
+        ToleratesSearches:   0.0,
+        WastePenaltyMult:    1.0,
+        StrugglePenaltyMult: 1.0,
+    }
+}
+
+// Adjust modifies weights based on learned preferences
+func (p *UserWeightProfile) Adjust(base RewardWeights) RewardWeights {
+    if p.ObservationCount < 5 {
+        return base // Not enough data
+    }
+
+    return RewardWeights{
+        TaskSuccess:     base.TaskSuccess,  // Never adjust
+        RelevanceBonus:  base.RelevanceBonus,
+        StrugglePenalty: base.StrugglePenalty * p.StrugglePenaltyMult,
+        WastePenalty:    base.WastePenalty * p.WastePenaltyMult,
+    }
+}
+
+// Update learns from observation
+func (p *UserWeightProfile) Update(obs EpisodeObservation, satisfaction float64) {
+    p.ObservationCount++
+    p.LastUpdated = time.Now()
+
+    learningRate := 0.1
+
+    // Success with lots of unused prefetch → tolerates verbosity
+    if satisfaction > 0 && len(obs.PrefetchedIDs) > len(obs.UsedIDs)+2 {
+        p.PrefersThorough += learningRate
+        p.WastePenaltyMult *= 0.95
+    }
+
+    // Failure with many searches → dislikes searching
+    if satisfaction < 0 && len(obs.SearchedAfter) > 2 {
+        p.ToleratesSearches -= learningRate
+        p.StrugglePenaltyMult *= 1.05
+    }
+
+    // Clamp all values
+    p.PrefersThorough = clamp(p.PrefersThorough, -1, 1)
+    p.ToleratesSearches = clamp(p.ToleratesSearches, -1, 1)
+    p.WastePenaltyMult = clamp(p.WastePenaltyMult, 0.5, 2.0)
+    p.StrugglePenaltyMult = clamp(p.StrugglePenaltyMult, 0.5, 2.0)
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `UserWeightProfile` struct with PrefersThorough, ToleratesSearches, WastePenaltyMult, StrugglePenaltyMult
+- [ ] `NewUserWeightProfile()` returns defaults (0.0 preferences, 1.0 multipliers)
+- [ ] `Adjust(base)` returns base weights if ObservationCount < 5
+- [ ] `Adjust(base)` applies multipliers to StrugglePenalty and WastePenalty only
+- [ ] `Adjust(base)` never modifies TaskSuccess weight
+- [ ] `Update(obs, satisfaction)` increments ObservationCount and updates LastUpdated
+- [ ] Verbosity learning: positive satisfaction + excess prefetch → increase PrefersThorough
+- [ ] Search tolerance learning: negative satisfaction + many searches → decrease ToleratesSearches
+- [ ] All values clamped: preferences [-1, 1], multipliers [0.5, 2.0]
+- [ ] All fields have msgpack tags for serialization
+- [ ] Unit test: Adjust returns base unmodified when ObservationCount < 5
+- [ ] Unit test: 100 positive observations with excess prefetch reduces WastePenaltyMult
+- [ ] Unit test: clamping prevents values outside bounds
+
+### AR.3.4 AdaptiveState Implementation
+
+**Architectural Role**: Central coordinator for all adaptive learning state. This is the single source of truth for learned parameters, providing Thompson sampling, coordinating updates from observations, and managing persistence. All retrieval decisions flow through AdaptiveState.SampleWeights().
+
+**Why This Exists**: The system learns 7 independent parameters (4 reward weights + 3 thresholds), per-context biases, and user preferences. AdaptiveState provides a single interface for sampling these parameters together (maintaining correlations), updating them atomically from observations, and serializing/deserializing for persistence and handoff.
+
+**Relationship to Architecture**:
+- Composes RobustWeightDistribution (AR.3.1), ContextDiscovery (AR.3.2), UserWeightProfile (AR.3.3)
+- `SampleWeights(ctx)` draws from all distributions, applies user and context biases
+- `UpdateFromOutcome(obs)` propagates observation to all sub-components atomically
+- Serializes to < 2KB via msgpack for fast handoff context transfer
+- Persisted to WAL path managed by RetrievalResources (AR.2.3)
+
+**Default Priors (from CONTEXT.md)**:
+- TaskSuccess: Beta(8, 2) = 0.8 mean (task completion is primary objective)
+- RelevanceBonus: Beta(3, 7) = 0.3 mean (conservative relevance bonus)
+- StrugglePenalty: Beta(4, 6) = 0.4 mean (moderate struggle penalty)
+- WastePenalty: Beta(1, 9) = 0.1 mean (low initial waste sensitivity)
+- Confidence: Beta(8.5, 1.5) = 0.85 mean (high confidence threshold)
+- Excerpt: Beta(9, 1) = 0.9 mean (very high excerpt confidence)
+- Budget: Beta(1, 9) = 0.1 mean (low budget threshold)
+
+**Dependencies**: AR.3.1, AR.3.2, AR.3.3, consumed by QueryAugmenter (AR.5.4), all hooks
+
+**Files to create:** `core/context/adaptive_state.go`, `core/context/adaptive_state_test.go`
+
+**Implementation Guide:**
+```go
+// NewAdaptiveState creates state with default priors
+func NewAdaptiveState() *AdaptiveState {
+    return &AdaptiveState{
+        Weights: struct {
+            TaskSuccess     RobustWeightDistribution
+            RelevanceBonus  RobustWeightDistribution
+            StrugglePenalty RobustWeightDistribution
+            WastePenalty    RobustWeightDistribution
+        }{
+            TaskSuccess:     NewRobustWeightDistribution(8, 2),    // Prior: 0.8
+            RelevanceBonus:  NewRobustWeightDistribution(3, 7),    // Prior: 0.3
+            StrugglePenalty: NewRobustWeightDistribution(4, 6),    // Prior: 0.4
+            WastePenalty:    NewRobustWeightDistribution(1, 9),    // Prior: 0.1
+        },
+        Thresholds: struct {
+            Confidence RobustWeightDistribution
+            Excerpt    RobustWeightDistribution
+            Budget     RobustWeightDistribution
+        }{
+            Confidence: NewRobustWeightDistribution(8.5, 1.5),  // Prior: 0.85
+            Excerpt:    NewRobustWeightDistribution(9, 1),      // Prior: 0.9
+            Budget:     NewRobustWeightDistribution(1, 9),      // Prior: 0.1
+        },
+        ContextDiscovery: NewContextDiscovery(10),
+        UserProfile:      NewUserWeightProfile(),
+        config:           DefaultUpdateConfig(),
+    }
+}
+
+// SampleWeights draws from current distributions using Thompson sampling
+func (a *AdaptiveState) SampleWeights(ctx TaskContext) RewardWeights {
+    weights := RewardWeights{
+        TaskSuccess:     a.Weights.TaskSuccess.Sample(),
+        RelevanceBonus:  a.Weights.RelevanceBonus.Sample(),
+        StrugglePenalty: a.Weights.StrugglePenalty.Sample(),
+        WastePenalty:    a.Weights.WastePenalty.Sample(),
+    }
+
+    // Apply user profile adjustments
+    weights = a.UserProfile.Adjust(weights)
+
+    // Apply context-specific bias
+    if bias := a.ContextDiscovery.GetBias(ctx); bias != nil {
+        weights = bias.Adjust(weights)
+    }
+
+    return weights
+}
+
+// UpdateFromOutcome performs all updates from one episode
+func (a *AdaptiveState) UpdateFromOutcome(obs EpisodeObservation) {
+    satisfaction := obs.InferSatisfaction()
+
+    a.Weights.TaskSuccess.Update(obs.SampledWeights.TaskSuccess, satisfaction, a.config)
+    a.Weights.RelevanceBonus.Update(obs.SampledWeights.RelevanceBonus, satisfaction, a.config)
+    a.Weights.StrugglePenalty.Update(obs.SampledWeights.StrugglePenalty, satisfaction, a.config)
+    a.Weights.WastePenalty.Update(obs.SampledWeights.WastePenalty, satisfaction, a.config)
+
+    a.Thresholds.Confidence.Update(obs.SampledThresholds.Confidence, satisfaction, a.config)
+    a.Thresholds.Excerpt.Update(obs.SampledThresholds.Excerpt, satisfaction, a.config)
+    a.Thresholds.Budget.Update(obs.SampledThresholds.Budget, satisfaction, a.config)
+
+    a.ContextDiscovery.UpdateBias(obs.TaskContext, satisfaction, obs)
+    a.UserProfile.Update(obs, satisfaction)
+
+    a.TotalObservations++
+    a.LastUpdated = time.Now()
+}
+
+// MarshalBinary serializes state (< 2KB typically)
+func (a *AdaptiveState) MarshalBinary() ([]byte, error) {
+    return msgpack.Marshal(a)
+}
+
+// LoadOrInit loads from path or returns new state
+func LoadOrInit(path string) (*AdaptiveState, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return NewAdaptiveState(), nil
+    }
+
+    state := &AdaptiveState{}
+    if err := msgpack.Unmarshal(data, state); err != nil {
+        return NewAdaptiveState(), nil
+    }
+    state.config = DefaultUpdateConfig() // Config not serialized
+    return state, nil
+}
+```
+
+**Acceptance Criteria:**
+- [ ] `NewAdaptiveState()` initializes with priors per CONTEXT.md specification
+- [ ] Default priors: TaskSuccess 0.8, RelevanceBonus 0.3, StrugglePenalty 0.4, WastePenalty 0.1
+- [ ] Default thresholds: Confidence 0.85, Excerpt 0.9, Budget 0.1
+- [ ] `SampleWeights(ctx)` draws from all 4 weight distributions
+- [ ] `SampleWeights` applies UserProfile.Adjust
+- [ ] `SampleWeights` applies ContextDiscovery.GetBias
+- [ ] `SampleThresholds()` draws from all 3 threshold distributions
+- [ ] `UpdateFromOutcome(obs)` calls Update on all distributions
+- [ ] `UpdateFromOutcome` updates ContextDiscovery and UserProfile
+- [ ] `UpdateFromOutcome` increments TotalObservations and sets LastUpdated
+- [ ] `MarshalBinary()` produces < 2KB for state with 10 contexts
+- [ ] `UnmarshalBinary(data)` restores state correctly
+- [ ] `LoadOrInit(path)` returns new state on file not found or parse error
+- [ ] `Save(path)` atomically writes state to path
+- [ ] `SavePeriodically(path, interval)` saves in background using scope.Go()
+- [ ] Unit test: MarshalBinary/UnmarshalBinary round-trip preserves all values
+- [ ] Unit test: serialized size < 2KB with 10 contexts
+- [ ] Unit test: LoadOrInit returns new state on missing file
+
+### AR.4.1 Episode Tracker
+
+**Architectural Role**: In-memory state machine tracking the lifecycle of a single query-response "episode". Collects behavioral signals (prefetched IDs, used IDs, searches performed, tool calls) that feed into the Bayesian learning system after each turn completes.
+
+**Why This Exists**: The learning system needs to know: what was prefetched, what was actually used, what additional searches were needed, and whether the task succeeded. EpisodeTracker accumulates these signals during a turn, then produces a complete `EpisodeObservation` that can be used for credit assignment to the sampled parameters.
+
+**Relationship to Architecture**:
+- Initialized by EpisodeTrackerInitHook (AR.7.2) at PrePrompt
+- Receives signals from SearchToolObservationHook (AR.7.2) during tool execution
+- Finalized by EpisodeObservationHook (AR.7.2) at PostPrompt
+- `InferSatisfaction()` converts behavioral signals to [-1, +1] satisfaction score
+- One episode per turn - cleaned after finalization to prevent memory growth
+
+**Signal Collection**:
+- `RecordPrefetchedIDs`: What context was speculatively prefetched
+- `RecordUsedID`: What content IDs appeared in the LLM response
+- `RecordSearchAfterPrefetch`: Searches performed after prefetch (indicates insufficient prefetch)
+- `RecordToolCall`: Tool execution count for struggle detection
+
+**Dependencies**: AR.1.1 (EpisodeObservation type), consumed by AR.7.2 hooks, AR.4.2 ObservationLog
+
+**Files to create:** `core/context/episode_tracker.go`, `core/context/episode_tracker_test.go`
+
+**Acceptance Criteria:**
+- [ ] `EpisodeTracker` struct managing in-flight episodes
+- [ ] `StartEpisode(agentID, agentType string, turnNumber int) *EpisodeObservation`
+- [ ] `RecordPrefetchedIDs(ids []string)` adds to current episode
+- [ ] `RecordUsedID(id string)` tracks content referenced in response
+- [ ] `RecordSearchAfterPrefetch(query string)` tracks post-prefetch searches
+- [ ] `RecordToolCall(toolName string)` increments ToolCallCount
+- [ ] `FinalizeEpisode(response string, toolCalls []ToolCall) EpisodeObservation`
+- [ ] `InferSatisfaction()` on EpisodeObservation returns float64 [-1, 1]
+- [ ] Satisfaction inference: TaskCompleted = +0.5, HedgingDetected = -0.3, etc.
+- [ ] Thread-safe via mutex (multiple tools may record concurrently)
+- [ ] No unbounded growth - one episode per turn, cleaned after finalization
+- [ ] Unit test: concurrent RecordUsedID calls are safe
+- [ ] Unit test: InferSatisfaction produces expected values for test cases
+
+### AR.4.2 Observation Log (WAL)
+
+**Architectural Role**: Crash-safe write-ahead log for EpisodeObservations. Observations are written synchronously to disk before being processed asynchronously by the learning system. This ensures observations survive crashes and can be replayed on restart.
+
+**Why This Exists**: AdaptiveState updates are slow (file I/O) and must not block LLM execution. However, observations must not be lost on crash. The WAL provides durability: observations are appended to disk immediately (fsync), then queued for async processing. On restart, `Replay()` reprocesses any observations not yet applied to AdaptiveState.
+
+**Relationship to Architecture**:
+- File handle acquired via RetrievalResources (AR.2.3) FileHandleBudget
+- Background processor started via `scope.Go()` per WAVE 4 (no raw goroutines)
+- JSON-lines format: one EpisodeObservation per line for easy parsing
+- ObservationChannel (AR.2.1) queues observations for async processing
+- `Record()` writes to WAL sync, queues to channel async
+
+**Crash Recovery**:
+- WAL survives crash (fsync after each write)
+- `Replay(adaptive)` reads all observations, applies to AdaptiveState
+- Replay < 100ms for 1000 observations (fast restart)
+- Observations marked processed after AdaptiveState update
+
+**Dependencies**: AR.2.1 (ObservationChannel), AR.2.3 (RetrievalResources), AR.3.4 (AdaptiveState), consumed by AR.7.2 hooks
+
+**Files to create:** `core/context/observation_log.go`, `core/context/observation_log_test.go`
+
+**Acceptance Criteria:**
+- [ ] `ObservationLog` struct with file handle, encoder, SafeChan, scope
+- [ ] `NewObservationLog(ctx, path, adaptive, scope)` constructor
+- [ ] Opens WAL file via FileHandleBudget (from RetrievalResources)
+- [ ] Background processor started via `scope.Go()`, NOT raw go
+- [ ] `Record(ctx, obs)` writes to WAL synchronously, queues async update
+- [ ] WAL format: one JSON line per observation
+- [ ] `Replay(adaptive)` replays unprocessed observations on startup
+- [ ] `Close()` closes SafeChan and file handle
+- [ ] Observations survive crash - can replay on restart
+- [ ] Unit test: Record + crash + Replay applies observation
+- [ ] Unit test: Replay < 100ms for 1000 observations
+- [ ] Unit test: Close unblocks waiting processor
+
+### AR.4.3 Access Tracker (Bounded)
+
+**Architectural Role**: Bounded-memory access pattern tracking for hot cache promotion and eviction decisions. Tracks which content IDs are accessed frequently (candidates for hot cache) vs rarely (candidates for eviction) while ensuring memory usage remains constant regardless of session length.
+
+**Why This Exists**: The hot cache needs to know which content to keep (frequently accessed) and which to evict (rarely accessed). Unbounded tracking would grow linearly with session length. AccessTracker uses a sliding window for counts (last 100 turns), LRU eviction for lastAccess (max 10,000 entries), and a ring buffer for accessLog (max 1,000 events).
+
+**Relationship to Architecture**:
+- Implements `resources.EvictableCache` interface for PressureController integration
+- `GetMostAccessed(n)` returns hot cache promotion candidates
+- `Evict(percent)` reduces memory usage under pressure
+- Access recorded by AccessTrackingHook (AR.7.5) and ContentPromotionHook (AR.7.5)
+- Source tracking: "in_response", "tool_retrieved" for access pattern analysis
+
+**Memory Bounds**:
+- accessCounts: max 100 turns × ~1000 IDs per turn = ~100KB
+- lastAccess: max 10,000 entries × ~100 bytes = ~1MB
+- accessLog: max 1,000 events × ~200 bytes = ~200KB
+- Total: < 2MB regardless of session duration
+
+**Dependencies**: consumed by HotCache (AR.5.1), PressureAwareRetrieval (AR.6.1)
+
+**Files to create:** `core/context/access_tracker.go`, `core/context/access_tracker_test.go`
+
+**Acceptance Criteria:**
+- [ ] `AccessTracker` struct with sliding window for counts
+- [ ] `accessCounts` limited to last N turns (default 100)
+- [ ] `lastAccess` map with LRU eviction (max 10000 entries)
+- [ ] `accessLog` ring buffer (max 1000 events)
+- [ ] `RecordAccess(contentID string, turn int, source string)`
+- [ ] `GetAccessCount(contentID string) int` returns count in window
+- [ ] `GetMostAccessed(n int) []string` returns top N content IDs
+- [ ] Implements `resources.EvictableCache` interface
+- [ ] `Evict(percent float64)` removes oldest entries from all structures
+- [ ] `CurrentSize() int64` returns approximate memory usage
+- [ ] Memory bounded even with continuous access recording
+- [ ] Unit test: accessCounts respects window size
+- [ ] Unit test: lastAccess evicts LRU when full
+- [ ] Unit test: Evict reduces size by requested percent
+
+### AR.5.1 Hot Cache (EvictableCache)
+
+**Architectural Role**: Tier 0 (< 1ms) in-memory cache for frequently accessed content. Implements the `EvictableCache` interface allowing PressureController to evict entries under memory pressure, providing graceful degradation instead of OOM crashes.
+
+**Why This Exists**: Most queries reference a small set of frequently-accessed files (hot working set). Keeping these in memory eliminates Bleve/VectorDB latency for 60-80% of retrievals. The EvictableCache interface allows PressureController to reclaim memory by evicting old entries when system-wide memory pressure rises.
+
+**Relationship to Architecture**:
+- **Tier 0** in CONTEXT.md tiered search: < 1ms latency target
+- Implements `resources.EvictableCache` interface (Name, CurrentSize, Evict, SetMaxSize, DefaultMaxSize)
+- Registered with PressureController via PressureAwareRetrieval (AR.6.1)
+- LRU eviction order: least-recently-accessed entries evicted first
+- ContentPromotionHook (AR.7.5) adds entries after tool retrieval
+
+**Integration with SEARCH.md**:
+- Caches ContentEntry objects from UniversalContentStore
+- On hit: return immediately (< 1ms)
+- On miss: proceed to Tier 1 (Warm Index)
+- Populated from TieredSearcher results for frequently accessed content
+
+**Dependencies**: `core/resources/pressure_controller.go` (interface), consumed by TieredSearcher (AR.5.2)
+
+**Files to create:** `core/context/hot_cache.go`, `core/context/hot_cache_test.go`
+
+**Existing code to reference:** `core/resources/pressure_controller.go` (EvictableCache interface)
+
+**Acceptance Criteria:**
+- [ ] `HotCache` struct with entries sync.Map, LRU tracking
+- [ ] Implements `resources.EvictableCache` interface
+- [ ] `Name() string` returns "adaptive-hot-cache"
+- [ ] `CurrentSize() int64` returns sum of entry sizes
+- [ ] `Evict(percent float64) int64` evicts LRU entries, returns bytes evicted
+- [ ] `SetMaxSize(size int64)` adjusts max and triggers eviction if over
+- [ ] `DefaultMaxSize() int64` returns configured default
+- [ ] `Add(id string, entry *ContentEntry)` adds with LRU update
+- [ ] `Get(id string) *ContentEntry` returns entry and updates LRU
+- [ ] `Contains(id string) bool` checks existence without LRU update
+- [ ] Thread-safe via combination of sync.Map and mutex for LRU list
+- [ ] Unit test: Evict removes oldest entries first
+- [ ] Unit test: SetMaxSize triggers eviction when reducing
+- [ ] Unit test: concurrent Add/Get/Evict safe
+
+### AR.5.2 Tiered Searcher
+
+**Architectural Role**: Orchestrates multi-tier search with latency budget awareness. Queries are directed to appropriate tiers based on remaining time budget, providing predictable latency while maximizing result quality within constraints.
+
+**Why This Exists**: Different search backends have different latency/quality trade-offs: Hot Cache is fast but limited, Full Search is comprehensive but slow. TieredSearcher implements the budget-aware strategy from CONTEXT.md: always check hot cache, escalate to warm/full only if budget permits.
+
+**Relationship to Architecture**:
+- **Tier 0 Hot** (AR.5.1): Always searched, < 1ms target
+- **Tier 1 Warm**: SEARCH.md Bleve index with keyword filters, < 10ms target
+- **Tier 2 Full**: Parallel Bleve + VectorDB with RRF fusion (DS.9.3), < 200ms target
+- `SetMaxTier(tier)` called by PressureAwareRetrieval to limit search depth under pressure
+- Circuit breakers (AR.2.4) protect against backend failures
+
+**Budget-Aware Strategy**:
+- `SearchWithBudget(ctx, query, budget)` checks remaining time before each tier
+- Budget > 200ms: search all tiers
+- Budget 10-200ms: search Hot + Warm only
+- Budget < 10ms: Hot only (always returns results)
+
+**Integration with SEARCH.md**:
+- Tier 1 uses SEARCH.md IndexManager for Bleve queries
+- Tier 2 uses SEARCH.md SearchCoordinator for hybrid Bleve+Vector
+- RRF fusion per DS.9.3 merges results from multiple backends
+
+**Dependencies**: AR.5.1 (HotCache), AR.2.4 (CircuitBreakers), SEARCH.md components, consumed by SpeculativePrefetcher (AR.5.3)
+
+**Files to create:** `core/context/tiered_searcher.go`, `core/context/tiered_searcher_test.go`
+
+**Acceptance Criteria:**
+- [ ] `TieredSearcher` struct with HotCache, BleveIndex, VectorDB, CBRegistry
+- [ ] `SearchWithBudget(ctx, query string, budget time.Duration) *SearchResults`
+- [ ] Tier 0 (Hot): Always searched, < 1ms target
+- [ ] Tier 1 (Warm): Searched if budget > 10ms remaining, < 10ms target
+- [ ] Tier 2 (Full): Searched if budget > 200ms remaining, parallel Bleve + Vector
+- [ ] Uses circuit breakers for Bleve and Vector searches
+- [ ] `SetMaxTier(tier SearchTier)` limits maximum tier (for pressure response)
+- [ ] Results merged with RRF fusion (from DS.9.3)
+- [ ] Graceful degradation: return partial results if tier fails
+- [ ] Latency tracked per tier for monitoring
+- [ ] Unit test: respects budget (doesn't exceed)
+- [ ] Unit test: SetMaxTier limits search
+- [ ] Unit test: circuit breaker prevents hammering failed backend
+
+### AR.5.3 Speculative Prefetcher
+
+**Architectural Role**: Launches context retrieval in parallel with user input processing. When a user starts typing, prefetch begins speculatively - if the query matches prefetch, results are ready instantly; if not, the prefetch is discarded with minimal cost.
+
+**Why This Exists**: LLM latency is dominated by context retrieval when agents need codebase information. By starting retrieval before the LLM call (when Guide receives the query), we hide retrieval latency behind LLM thinking time. Speculative execution trades compute (some prefetches are wasted) for latency (useful prefetches are "free").
+
+**Relationship to Architecture**:
+- Uses PrefetchScope (AR.2.2) for WAVE 4 compliant goroutine management
+- `StartSpeculative(ctx, query)` launches background search via TieredSearcher
+- `GetInflight(query)` returns existing future for deduplication
+- `SetEnabled(false)` disables prefetch under PressureHigh/Critical
+- SpeculativePrefetchHook (AR.7.1) retrieves results at prompt time
+
+**Deduplication Strategy**:
+- Query normalized and hashed for identity
+- Same hash → return existing TrackedPrefetchFuture
+- Prevents duplicate work for similar queries
+- Cleanup: completed futures removed from inflight map
+
+**Pressure Response**:
+- Normal: All prefetch enabled
+- Elevated: Prefetch enabled, reduced tier depth
+- High/Critical: Prefetch DISABLED (SetEnabled(false))
+
+**Dependencies**: AR.2.2 (PrefetchScope), AR.5.2 (TieredSearcher), consumed by AR.7.1 (PrefetchHook)
+
+**Files to create:** `core/context/speculative_prefetcher.go`, `core/context/speculative_prefetcher_test.go`
+
+**Acceptance Criteria:**
+- [ ] `SpeculativePrefetcher` struct with TieredSearcher, HotCache, PrefetchScope
+- [ ] `StartSpeculative(ctx, query string) (*TrackedPrefetchFuture, error)`
+- [ ] `GetOrStart(ctx, query string) *TrackedPrefetchFuture` deduplicates
+- [ ] `GetInflight(query string) *TrackedPrefetchFuture` returns existing or nil
+- [ ] `SetEnabled(enabled bool)` for pressure-driven disable
+- [ ] Returns error when disabled or budget exhausted
+- [ ] Deduplication: same query hash returns same future
+- [ ] Cleanup: completed futures removed from inflight map
+- [ ] All goroutines via PrefetchScope (GoroutineScope), no raw go
+- [ ] Unit test: deduplication returns same future
+- [ ] Unit test: SetEnabled(false) prevents new prefetches
+- [ ] Unit test: cleanup removes completed futures
+
+### AR.5.4 Query Augmenter
+
+**Architectural Role**: Transforms search results into prompt-injectable context. Applies learned weights to prioritize excerpt selection, respects token budgets, and formats results as [AUTO-RETRIEVED] markdown blocks ready for injection.
+
+**Why This Exists**: Raw search results are not directly usable - they need filtering (confidence threshold), prioritization (relevance weighting), truncation (token budget), and formatting (markdown blocks). QueryAugmenter applies AdaptiveState weights to these decisions, producing personalized context augmentation.
+
+**Relationship to Architecture**:
+- Synchronous fallback when SpeculativePrefetcher has no ready result
+- Uses TieredSearcher (AR.5.2) for search execution
+- Uses AdaptiveState (AR.3.4) sampled weights for excerpt selection
+- Higher RelevanceBonus → include more excerpts even at lower confidence
+- Higher WastePenalty → include fewer, higher-confidence excerpts only
+
+**Token Budget Management**:
+- `Augment(ctx, query, tokenBudget)` respects provided budget
+- Excerpts truncated or omitted to fit budget
+- Summaries generated for large result sets that exceed budget
+- Budget from RetrievalBudget (AR.1.2) per session limits
+
+**Output Format**:
+- `Render()` produces markdown with [AUTO-RETRIEVED] markers
+- Format matches CONTEXT.md specification for prompt injection
+- Includes file paths, line numbers, confidence scores
+- Summaries flagged as [SUMMARY] vs [EXCERPT]
+
+**Dependencies**: AR.5.2 (TieredSearcher), AR.3.4 (AdaptiveState), consumed by AR.7.1 (PrefetchHook)
+
+**Files to create:** `core/context/query_augmenter.go`, `core/context/query_augmenter_test.go`
+
+**Acceptance Criteria:**
+- [ ] `QueryAugmenter` struct with TieredSearcher, AdaptiveState
+- [ ] `Augment(ctx, query string, tokenBudget int) (*AugmentedQuery, error)`
+- [ ] Synchronous search (for when prefetch not available)
+- [ ] Respects token budget - truncates excerpts to fit
+- [ ] Uses sampled weights to prioritize excerpt selection
+- [ ] Higher RelevanceBonus weight → include more relevant excerpts
+- [ ] Higher WastePenalty weight → include fewer but more confident excerpts
+- [ ] Generates summaries for large result sets
+- [ ] `Render()` produces [AUTO-RETRIEVED] markdown format
+- [ ] Unit test: respects token budget
+- [ ] Unit test: weights affect selection (mock different weights)
+
+### AR.6.1 Pressure-Aware Retrieval
+
+**Architectural Role**: Coordinates all adaptive retrieval components in response to system-wide memory pressure. Implements graceful degradation: as pressure increases, expensive operations are disabled while core functionality remains available.
+
+**Why This Exists**: Under memory pressure, speculative prefetch and large caches become liabilities rather than optimizations. PressureAwareRetrieval registers with PressureController and adjusts all components in response to pressure level changes, ensuring the system remains responsive even under extreme memory constraints.
+
+**Relationship to Architecture**:
+- Registers HotCache (AR.5.1) as EvictableCache with PressureController
+- `OnPressureChange(level)` callback propagates to all components
+- Normal → Elevated: Reduce hot cache to 75%, continue prefetch
+- Elevated → High: Disable prefetch, reduce cache to 50%, hot-only search
+- High → Critical: Immediate 50% eviction, 25% cache, emergency mode
+
+**Component Coordination**:
+- SpeculativePrefetcher.SetEnabled(level < PressureHigh)
+- TieredSearcher.SetMaxTier(levelToTier(level))
+- HotCache.SetMaxSize(levelToSize(level))
+- ObservationLog processor pause under Critical
+
+**WAVE 4 Integration**:
+- PressureController from `core/resources/pressure_controller.go`
+- PressureLevel enum: Normal, Elevated, High, Critical
+- Callback registered via `Register(pc)` on startup
+- EvictableCache registered via `pc.RegisterCache(cache)`
+
+**Dependencies**: `core/resources/pressure_controller.go`, AR.5.1-AR.5.4, consumed by AdaptiveRetrieval facade (AR.12.1)
+
+**Files to create:** `core/context/pressure_aware_retrieval.go`, `core/context/pressure_integration_test.go`
+
+**Existing code to reference:** `core/resources/pressure_controller.go`
+
+**Acceptance Criteria:**
+- [ ] `PressureAwareRetrieval` struct coordinating all components
+- [ ] `OnPressureChange(level resources.PressureLevel)` callback
+- [ ] Normal: Full prefetch, all tiers, 100% hot cache
+- [ ] Elevated: Prefetch enabled, skip full tier, 75% hot cache
+- [ ] High: Prefetch DISABLED, hot cache only, 50% cache size
+- [ ] Critical: Prefetch DISABLED, hot cache only, 25% cache + immediate eviction
+- [ ] `Register(pc *resources.PressureController)` registers callback and cache
+- [ ] Hot cache registered as EvictableCache with PressureController
+- [ ] Graceful transition between pressure levels
+- [ ] Unit test: pressure level changes propagate to all components
+- [ ] Unit test: Critical level triggers immediate eviction
+- [ ] Integration test: memory pressure recovery
+
+### AR.7.1 Prefetch Injection Hook
+
+**Architectural Role**: PrePrompt hook that injects speculatively prefetched context into the LLM prompt. This is where speculative execution "pays off" - if prefetch is ready, context is injected with zero additional latency; otherwise falls back to synchronous retrieval.
+
+**Why This Exists**: The speculative prefetch (AR.5.3) launches searches before the LLM call. This hook retrieves those results and injects them into the prompt. It must execute first (HookPriorityFirst=0) to ensure context is available for other hooks that may reference it.
+
+**Relationship to Architecture**:
+- Type: PrePrompt, Priority: HookPriorityFirst (0)
+- Agents: librarian, archivalist, academic, architect, guide (knowledge agents)
+- `prefetcher.GetInflight(data.UserQuery)` retrieves in-flight future
+- `future.GetIfReady(10ms)` non-blocking wait with timeout
+- Fallback: `augmenter.Augment()` if prefetch not ready
+- Sets `data.InjectContext = prefetch.Render()` for injection
+
+**Latency Budget**:
+- Target: < 15ms total hook execution time
+- 10ms timeout for prefetch retrieval
+- 5ms buffer for fallback decision and formatting
+- If neither completes in time: continue without injection (graceful degradation)
+
+**Dependencies**: AR.5.3 (SpeculativePrefetcher), AR.5.4 (QueryAugmenter), AR.1.4 (PromptHookData)
+
+**Files to create:** `core/context/hooks/prefetch_hook.go`, `core/context/hooks/prefetch_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `SpeculativePrefetchHook` with Type: PrePrompt, Priority: HookPriorityFirst (0)
+- [ ] Agents: librarian, archivalist, academic, architect, guide
+- [ ] Retrieves prefetch future via `prefetcher.GetInflight(data.UserQuery)`
+- [ ] Calls `future.GetIfReady(10ms)` - non-blocking with timeout
+- [ ] Falls back to `augmenter.Augment()` if no prefetch ready
+- [ ] Sets `data.InjectContext` to `prefetch.Render()`
+- [ ] Adds < 15ms latency in worst case
+- [ ] Unit test: prefetch ready → uses prefetch
+- [ ] Unit test: prefetch not ready → uses synchronous augment
+- [ ] Unit test: total latency < 15ms
+
+### AR.7.2 Episode Tracker Hooks
+
+**Architectural Role**: Hook pair that manages EpisodeObservation lifecycle - initializing at turn start (PrePrompt) and finalizing at turn end (PostPrompt). These hooks bridge the LLM execution pipeline with the Bayesian learning system.
+
+**Why This Exists**: The learning system needs structured observations from each turn. EpisodeTrackerInitHook starts tracking (samples weights, classifies context), while EpisodeObservationHook finalizes the observation (captures response signals, records to WAL). The pair ensures every turn produces exactly one observation.
+
+**Relationship to Architecture**:
+- `EpisodeTrackerInitHook`: Type: PrePrompt, Priority: HookPriorityEarly (25)
+  - Calls `tracker.StartEpisode(agentID, agentType, turnNumber)`
+  - Samples weights via `AdaptiveState.SampleWeights()`
+  - Classifies query via `ContextDiscovery.ClassifyQuery()`
+  - Stores sampled values in EpisodeObservation for credit assignment
+
+- `EpisodeObservationHook`: Type: PostPrompt, Priority: HookPriorityLate (75)
+  - Calls `tracker.FinalizeEpisode(response, toolCalls)`
+  - Extracts HedgingDetected, TaskCompleted from response analysis
+  - Records to ObservationLog (AR.4.2)
+
+- `SearchToolObservationHook`: Type: PostTool, Priority: HookPriorityNormal (50)
+  - Tracks searches performed after prefetch
+  - Calls `tracker.RecordSearchAfterPrefetch(query)` for search tools
+
+**Dependencies**: AR.4.1 (EpisodeTracker), AR.3.4 (AdaptiveState), AR.4.2 (ObservationLog), AR.3.2 (ContextDiscovery)
+
+**Files to create:** `core/context/hooks/episode_hooks.go`, `core/context/hooks/episode_hooks_test.go`
+
+**Acceptance Criteria:**
+- [ ] `EpisodeTrackerInitHook` with Type: PrePrompt, Priority: HookPriorityEarly (25)
+- [ ] Starts new episode via `tracker.StartEpisode()`
+- [ ] Samples weights and thresholds via AdaptiveState
+- [ ] Classifies query context via ContextDiscovery
+- [ ] `EpisodeObservationHook` with Type: PostPrompt, Priority: HookPriorityLate (75)
+- [ ] Finalizes episode via `tracker.FinalizeEpisode()`
+- [ ] Records to observation log
+- [ ] `SearchToolObservationHook` with Type: PostTool, Priority: HookPriorityNormal (50)
+- [ ] Tracks searches performed after prefetch
+- [ ] All hooks for Agents: ["*"] (all agents)
+- [ ] Unit test: episode starts on PrePrompt, finalizes on PostPrompt
+- [ ] Unit test: search tools trigger SearchAfterPrefetch recording
+
+### AR.7.3 Pressure Eviction Hook
+
+**Architectural Role**: PrePrompt hook that forces context eviction for knowledge agents under memory pressure. Implements CONTEXT.md agent-specific eviction thresholds, reducing agent context window usage before LLM calls to free system memory.
+
+**Why This Exists**: Knowledge agents (Librarian, Archivalist, Academic, Architect) can accumulate large contexts over many turns. Under memory pressure, this hook proactively evicts portions of their context, converting full content to compact references that can be retrieved on demand.
+
+**Relationship to Architecture**:
+- Type: PrePrompt, Priority: HookPriorityFirst (0) - runs before prefetch injection
+- Agents: librarian, archivalist, academic, architect (knowledge agents only)
+- Checks `pressure.CurrentLevel()` each turn
+- PressureHigh: Force 25% eviction if context > 50%
+- PressureCritical: Force 50% eviction if context > 50%
+- Uses `contextManager.ForceEvict(agentCtx, percent)` from CONTEXT.md
+
+**Eviction vs Pipeline Agents**:
+- Knowledge agents: Use eviction (this hook) - context can be retrieved
+- Pipeline agents: Use handoff (not eviction) - task state must transfer completely
+- This distinction is why hook only targets knowledge agent types
+
+**Dependencies**: `core/resources/pressure_controller.go`, CONTEXT.md VirtualContextManager, consumed by all knowledge agents
+
+**Files to create:** `core/context/hooks/eviction_hook.go`, `core/context/hooks/eviction_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `PressureEvictionHook` with Type: PrePrompt, Priority: HookPriorityFirst (0)
+- [ ] Agents: librarian, archivalist, academic, architect (knowledge agents)
+- [ ] Checks `pressure.CurrentLevel()` before each prompt
+- [ ] At PressureHigh: forces 25% eviction if agent context > 50%
+- [ ] At PressureCritical: forces 50% eviction if agent context > 50%
+- [ ] Uses `contextManager.ForceEvict(agentCtx, percent)`
+- [ ] Unit test: no eviction at Normal/Elevated
+- [ ] Unit test: eviction triggered at High
+- [ ] Unit test: larger eviction at Critical
+
+### AR.7.4 Failure Pattern Warning Hook
+
+**Architectural Role**: PrePrompt hook that queries Archivalist for similar past failures and injects warnings into agent context. Implements cross-session learning by surfacing failure patterns from historical sessions to prevent recurring mistakes.
+
+**Why This Exists**: Engineers often repeat the same mistakes across sessions. This hook queries Archivalist's failure pattern memory (see Discipline Protocols in TODO.md) for approaches similar to the current task, injecting warnings when a pattern has failed 2+ times before.
+
+**Relationship to Architecture**:
+- Type: PrePrompt, Priority: HookPriorityNormal (50) - after eviction/prefetch
+- Agents: engineer, designer, architect (implementation agents)
+- Queries `archivalist.QueryFailurePatterns(currentApproach)` with similarity > 0.7
+- If recurrence_count >= 2: injects [FAILURE_PATTERN_WARNING] block
+- Uses TieredSearcher for failure pattern similarity search
+
+**Warning Format**:
+```
+[FAILURE_PATTERN_WARNING]
+Approach: <approach_signature>
+Recurrence: <count> times
+Reason: <error_pattern>
+Resolution: <successful_resolution_if_any>
+```
+
+**Integration with Discipline Protocols**:
+- Complements Archivalist Failure Pattern Memory (TODO.md section)
+- `query_failure_patterns` skill provides underlying search
+- Warnings stored in Archivalist category "failure_pattern_warning"
+
+**Dependencies**: Archivalist agent, AR.5.2 (TieredSearcher for similarity), TODO.md Discipline Protocols
+
+**Files to create:** `core/context/hooks/failure_hook.go`, `core/context/hooks/failure_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `FailurePatternWarningHook` with Type: PrePrompt, Priority: HookPriorityNormal (50)
+- [ ] Agents: engineer, designer, architect
+- [ ] Queries Archivalist for similar failure patterns (similarity > 0.7)
+- [ ] If recurrence_count >= 2, injects [FAILURE_PATTERN_WARNING] block
+- [ ] Warning format includes approach, recurrence count, reason, resolution
+- [ ] Appends to system prompt via `appendSection()`
+- [ ] Unit test: no warning when no similar failures
+- [ ] Unit test: warning injected for recurring failure
+- [ ] Unit test: warning includes resolution if available
+
+### AR.7.5 Access Tracking Hook
+
+**Architectural Role**: PostPrompt and PostTool hooks that track which content IDs are accessed during agent execution. This data feeds into access patterns that drive hot cache promotion and eviction decisions.
+
+**Why This Exists**: The hot cache needs to know what content to keep (frequently accessed) and what to evict (rarely accessed). These hooks observe actual access patterns: which IDs appear in LLM responses and which are retrieved via tools, enabling data-driven cache management.
+
+**Relationship to Architecture**:
+- `AccessTrackingHook`: Type: PostPrompt, Priority: HookPriorityNormal (50)
+  - Extracts content IDs referenced in LLM response (via regex or parser)
+  - Calls `tracker.RecordAccess(id, turn, "in_response")`
+  - Enables learning which prefetched content was actually used
+
+- `ContentPromotionHook`: Type: PostTool, Priority: HookPriorityLate (75)
+  - Triggers after search/retrieval tool execution
+  - Promotes retrieved content to hot cache (AR.5.1)
+  - Calls `tracker.RecordAccess(id, turn, "tool_retrieved")`
+  - Agents: ["*"] (all agents)
+
+**Access Sources**:
+- "in_response": Content ID mentioned in LLM output (high signal)
+- "tool_retrieved": Content fetched via tool (moderate signal)
+- "prefetched": Content prefetched but not necessarily used (low signal)
+
+**Dependencies**: AR.4.3 (AccessTracker), AR.5.1 (HotCache), consumed by learning system
+
+**Files to create:** `core/context/hooks/access_hook.go`, `core/context/hooks/access_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `AccessTrackingHook` with Type: PostPrompt, Priority: HookPriorityNormal (50)
+- [ ] Extracts content IDs referenced in response (via regex or parser)
+- [ ] Calls `tracker.RecordAccess(id, turn, "in_response")`
+- [ ] `ContentPromotionHook` with Type: PostTool, Priority: HookPriorityLate (75)
+- [ ] Promotes retrieved content to hot cache
+- [ ] Calls `tracker.RecordAccess(id, turn, "tool_retrieved")`
+- [ ] Both hooks for Agents: ["*"]
+- [ ] Unit test: content references extracted from response
+- [ ] Unit test: retrieved content added to hot cache
+
+### AR.7.6 Guide Routing Cache Hook
+
+**Architectural Role**: PrePrompt hook for Guide agent that caches routing decisions and provides routing history context. Enables consistent routing for similar queries.
+
+**Why This Exists**: Per CONTEXT.md (line 5620), Guide agent needs routing history for consistent decision-making. This hook integrates routing cache with the hook system.
+
+**Relationship to Architecture**:
+- `GuideRoutingCacheHook`: Type: PrePrompt, Priority: HookPriorityNormal (50)
+- Only registers for Guide agent (Agents: ["guide"])
+- Injects recent routing decisions into context for consistency
+- Integrates with `guide_get_routing_history` skill (AR.8.5)
+
+**Files to create:**
+- `core/context/hooks/guide_routing_hook.go`
+- `core/context/hooks/guide_routing_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `GuideRoutingCacheHook` with Type: PrePrompt, Priority: HookPriorityNormal (50)
+- [ ] Agents: ["guide"] - only applies to Guide
+- [ ] Injects recent routing decisions into PromptHookData.InjectContext
+- [ ] Uses routing cache from HookDependencies
+- [ ] Unit test: routing history injected for Guide agent
+
+### AR.7.7 Workflow Context Hook
+
+**Architectural Role**: PrePrompt hook for Orchestrator agent that injects current workflow context before each LLM call. Enables Orchestrator to maintain awareness of ongoing workflows.
+
+**Why This Exists**: Per CONTEXT.md (lines 5589-5594, 5630), Orchestrator needs workflow state context for coordination decisions. This hook automatically injects workflow context.
+
+**Relationship to Architecture**:
+- `WorkflowContextHook`: Type: PrePrompt, Priority: HookPriorityNormal (50)
+- Only registers for Orchestrator agent (Agents: ["orchestrator"])
+- Injects current workflow state, pending tasks, active pipelines
+- Integrates with `orchestrator_get_workflow_context` skill (AR.8.6)
+
+**Files to create:**
+- `core/context/hooks/workflow_context_hook.go`
+- `core/context/hooks/workflow_context_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `WorkflowContextHook` with Type: PrePrompt, Priority: HookPriorityNormal (50)
+- [ ] Agents: ["orchestrator"] - only applies to Orchestrator
+- [ ] Injects current workflow state into context
+- [ ] Includes: WorkflowState, PendingTasks, ActivePipelines, AgentStates
+- [ ] Uses workflow store from HookDependencies
+- [ ] Unit test: workflow context injected for Orchestrator
+
+### AR.7.8 Focused Prefetch Hook
+
+**Architectural Role**: PrePrompt hook for pipeline agents (Engineer, Designer, Inspector, Tester) that performs limited, task-focused prefetch. Unlike full speculative prefetch for knowledge agents, this is constrained to current task scope.
+
+**Why This Exists**: Per CONTEXT.md (lines 5584-5587, 5626), pipeline agents need focused prefetch with smaller token budgets. They shouldn't do broad codebase searches - that's delegated to knowledge agents.
+
+**Relationship to Architecture**:
+- `FocusedPrefetchHook`: Type: PrePrompt, Priority: HookPriorityEarly (25)
+- Agents: ["engineer", "designer", "inspector", "tester"]
+- maxTokens: 1000 (much smaller than knowledge agents)
+- Uses same QueryAugmenter (AR.5.4) but with scope constraints
+
+**Files to create:**
+- `core/context/hooks/focused_prefetch_hook.go`
+- `core/context/hooks/focused_prefetch_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `FocusedPrefetchHook` with Type: PrePrompt, Priority: HookPriorityEarly (25)
+- [ ] Agents: ["engineer", "designer", "inspector", "tester"]
+- [ ] maxTokens: 1000 (per CONTEXT.md line 5587)
+- [ ] Constrains prefetch to current task/pipeline scope
+- [ ] Uses QueryAugmenter with reduced budget
+- [ ] Unit test: prefetch limited to 1000 tokens
+- [ ] Unit test: only pipeline agents receive this hook
+
+### AR.8.1 Universal Retrieval Skills
+
+**Architectural Role**: Core skills available to all knowledge agents for on-demand context retrieval. These complement automatic prefetch by allowing agents to explicitly request specific content, search history, or promote content to hot cache.
+
+**Why This Exists**: Automatic prefetch can't anticipate every context need. When an agent encounters a [CTX-REF-xxx] reference marker from eviction, it needs `retrieve_context` to get the full content. When researching past decisions, it needs `search_history`. These skills provide the manual retrieval path.
+
+**Relationship to Architecture**:
+- Implements InputSchema from CONTEXT.md exactly (Anthropic tool format)
+- `retrieve_context`: Retrieves full content by ref_id OR natural language query
+  - Used when agent encounters [CTX-REF-xxx] markers from eviction
+  - Uses TieredSearcher (AR.5.2) for query-based retrieval
+  - Respects max_tokens parameter for budget compliance
+
+- `search_history`: Searches UniversalContentStore with filters
+  - content_types, session_ids, cross_session, time_range filters
+  - Returns ContentEntry array with summaries
+  - Supports CONTEXT.md content types (prompts, responses, tools, etc.)
+
+- `promote_to_hot`: Manually promote content to hot cache
+  - For content the agent knows it will need again
+  - ttl_turns parameter controls eviction timing
+
+**Agents**: librarian, archivalist, academic, architect, guide (knowledge agents)
+
+**Dependencies**: AR.5.2 (TieredSearcher), AR.5.1 (HotCache), CONTEXT.md UniversalContentStore
+
+**Files to create:** `core/context/skills/universal_skills.go`, `core/context/skills/universal_skills_test.go`
+
+**Acceptance Criteria:**
+- [ ] `retrieve_context` skill handler per InputSchema in CONTEXT.md
+- [ ] Supports ref_id lookup or query-based retrieval
+- [ ] Respects max_tokens parameter
+- [ ] Returns ContentEntry array with full content
+- [ ] `search_history` skill handler per InputSchema
+- [ ] Supports content_types, session_ids, cross_session, time_range filters
+- [ ] Uses TieredSearcher for search
+- [ ] `promote_to_hot` skill handler per InputSchema
+- [ ] Promotes specified content_ids to hot cache
+- [ ] Respects ttl_turns parameter
+- [ ] All skills registered for: librarian, archivalist, academic, architect, guide
+- [ ] Unit test: retrieve_context by ref_id works
+- [ ] Unit test: search_history filters apply correctly
+
+### AR.8.2-AR.8.7 Agent-Specific Retrieval Skills
+
+**Architectural Role**: Specialized retrieval skills tailored to each agent type's domain expertise. While universal skills provide generic retrieval, these skills expose domain-specific search patterns optimized for each agent's responsibilities.
+
+**Why This Exists**: Different agents have different retrieval needs. Librarian needs symbol-aware codebase search, Archivalist needs decision history search, Academic needs research paper retrieval. Specialized skills provide optimized search patterns for each domain.
+
+**Relationship to Architecture**:
+- All skills implement CONTEXT.md InputSchema exactly (Anthropic tool format)
+- All handlers respect budgets and pressure limits via TieredSearcher
+- TIER 1 skills (always loaded) per CONTEXT.md skill classification
+
+**Agent-Specific Skills**:
+
+**Librarian** (AR.8.2): Codebase expertise
+- `librarian_search_codebase`: Symbol-aware code search with language filters
+- `librarian_get_symbol_context`: Get surrounding context for a symbol
+- `librarian_get_pattern_examples`: Find similar code patterns
+
+**Archivalist** (AR.8.3): Historical memory
+- `archivalist_search_decisions`: Search past architectural decisions
+- `archivalist_get_failure_patterns`: Retrieve failure patterns for approach
+- `archivalist_get_cross_session_learnings`: Cross-session query with permission
+
+**Academic** (AR.8.4): Research expertise
+- `academic_search_research`: Search research papers and best practices
+- `academic_cite_sources`: Get citations for recommendations
+- `academic_get_best_practices`: Language/framework specific patterns
+
+**Guide** (AR.8.5): Routing context
+- `guide_get_routing_history`: Past routing decisions for similar queries
+- `guide_get_user_preferences`: Learned user preferences from profile
+
+**Orchestrator** (AR.8.6): Workflow context
+- `orchestrator_get_workflow_context`: Current workflow state and history
+- `orchestrator_search_similar_workflows`: Find similar past workflows
+
+**Pipeline** (AR.8.7): Limited scope for Engineer/Designer/Inspector/Tester
+- `get_file_context`: Get context for specific files (limited to task scope)
+- `get_recent_changes`: Changes since workflow started
+
+**Dependencies**: AR.5.2 (TieredSearcher), agent-specific backends, existing skill registry
+
+**Files to create:**
+- `core/context/skills/librarian_skills.go`
+- `core/context/skills/archivalist_skills.go`
+- `core/context/skills/academic_skills.go`
+- `core/context/skills/guide_skills.go`
+- `core/context/skills/orchestrator_skills.go`
+- `core/context/skills/pipeline_skills.go`
+
+**Acceptance Criteria:**
+- [ ] All skills implement InputSchema per CONTEXT.md specification exactly
+- [ ] All handlers call appropriate retrieval components
+- [ ] All handlers respect budgets and pressure limits
+- [ ] Librarian skills: librarian_search_codebase, librarian_get_symbol_context, librarian_get_pattern_examples
+- [ ] Archivalist skills: archivalist_search_decisions, archivalist_get_failure_patterns, archivalist_get_cross_session_learnings
+- [ ] Academic skills: academic_search_research, academic_cite_sources, academic_get_best_practices
+- [ ] Guide skills: guide_get_routing_history, guide_get_user_preferences
+- [ ] Orchestrator skills: orchestrator_get_workflow_context, orchestrator_search_similar_workflows
+- [ ] Pipeline skills (shared): get_file_context, get_recent_changes (limited scope)
+- [ ] Inspector skills: get_validation_context, search_issues, get_test_coverage (per CONTEXT.md lines 4410-4414)
+- [ ] Tester skills: get_test_patterns, search_test_history, get_coverage_gaps (per CONTEXT.md lines 4415-4419)
+- [ ] Designer skills: get_component_patterns, search_styles, get_a11y_guidelines (per CONTEXT.md lines 4420-4424)
+- [ ] Unit tests for each skill handler
+
+### AR.9.1 Hook Registry
+
+**Architectural Role**: Central registry for all adaptive retrieval hooks, managing registration, priority ordering, and agent-specific filtering. Ensures hooks execute in deterministic order while supporting agent-specific hook targeting.
+
+**Why This Exists**: Multiple hooks (prefetch, episode tracking, pressure eviction, etc.) must execute in a specific order (by priority) and only for relevant agents. The registry provides this coordination, preventing ad-hoc hook management and ensuring consistent execution.
+
+**Relationship to Architecture**:
+- Extends existing `core/skills/hooks.go` hook system
+- `Register(agentType, hook)` for agent-specific hooks
+- `RegisterGlobal(hook)` for hooks applying to all agents (Agents: ["*"])
+- `GetHooks(agentType, hookType)` returns hooks sorted by Priority (ascending)
+- `RegisterAdaptiveRetrievalHooks(registry, deps)` convenience function registers all AR hooks
+
+**Hook Ordering Guarantee**:
+- Lower priority values execute first (First=0 before Last=100)
+- Same priority: registration order preserved
+- Agent filtering: hook.Agents=["*"] matches all, specific types filter
+
+**Integration**:
+- Called by agent execution pipeline before/after LLM calls and tools
+- Hooks receive PromptHookData or ToolCallHookData depending on Type
+- Return modified data flows to next hook in chain
+
+**Dependencies**: AR.1.4 (HookTypes), AR.7.x (all hooks), existing `core/skills/hooks.go`
+
+**Files to create:** `core/context/hook_registry.go`, `core/context/hook_registry_test.go`
+
+**Acceptance Criteria:**
+- [ ] `HookRegistry` struct managing all hooks
+- [ ] `Register(agentType string, hook Hook)` registers per-agent hook
+- [ ] `RegisterGlobal(hook Hook)` registers for all agents
+- [ ] `GetHooks(agentType string, hookType HookType) []Hook` returns sorted by priority
+- [ ] `RegisterAdaptiveRetrievalHooks(registry, deps)` registers all AR hooks
+- [ ] Priority ordering: lower priority executes first
+- [ ] Agent filtering: hook.Agents=["*"] matches all, otherwise specific types
+- [ ] Unit test: hooks execute in priority order
+- [ ] Unit test: agent-specific hooks only execute for that agent
+
+### AR.9.2 Skill Registry Integration
+
+**Architectural Role**: Integration point between adaptive retrieval skills and the existing skill registry system. Ensures all AR skills are properly registered with correct agent targeting and tier classification.
+
+**Why This Exists**: Skills must be registered with the skill system to appear in agent tool lists. This component bridges AR skills with the existing `core/skills/` infrastructure, maintaining consistency with the progressive skill disclosure model.
+
+**Relationship to Architecture**:
+- `RegisterAdaptiveRetrievalSkills(registry *skills.Registry)` function
+- Registers universal skills (AR.8.1) for knowledge agents
+- Registers agent-specific skills (AR.8.2-AR.8.7) per agent type
+- All skills classified as TIER 1 (always loaded) per CONTEXT.md
+- Skills appear in agent tool lists via existing skill loading mechanism
+
+**Integration with Progressive Skill Disclosure**:
+- TIER 1 (Core): Always loaded - all AR skills are TIER 1
+- TIER 2 (Extended): Loaded on demand - future AR skills may be TIER 2
+- Skills registered with InputSchema for LLM tool formatting
+
+**Dependencies**: `core/skills/registry.go`, AR.8.x skills
+
+**Files to create:** `core/context/skill_registry.go`
+
+**Acceptance Criteria:**
+- [ ] `RegisterAdaptiveRetrievalSkills(registry *skills.Registry)` function
+- [ ] Registers all universal skills
+- [ ] Registers agent-specific skills to appropriate agents
+- [ ] All skills classified as TIER 1 (always loaded)
+- [ ] Skills integrated with existing skill loading mechanism
+- [ ] Unit test: skills appear in agent tool lists
+
+### AR.10.1 System Prompt Injector
+
+**Architectural Role**: Injects agent-specific adaptive retrieval prompt additions into system prompts. Each agent type receives guidance on how to use retrieval skills and interpret auto-retrieved context.
+
+**Why This Exists**: Agents need instructions on how to work with the adaptive retrieval system: when to use retrieval skills, how to interpret [AUTO-RETRIEVED] blocks, and what the [CTX-REF-xxx] markers mean. These prompt additions provide that guidance in a consistent, agent-specific way.
+
+**Relationship to Architecture**:
+- `InjectAdaptiveRetrievalPrompt(agentType, systemPrompt string) string`
+- Agent-specific prompt additions from CONTEXT.md:
+  - LibrarianRetrievalPromptAddition: Codebase search guidance
+  - ArchivalistRetrievalPromptAddition: Historical retrieval guidance
+  - AcademicRetrievalPromptAddition: Research retrieval guidance
+  - GuideRetrievalPromptAddition: Routing context guidance
+  - EngineerRetrievalPromptAddition: Limited retrieval, focus on task
+  - OrchestratorRetrievalPromptAddition: Workflow context guidance
+- Generic addition for agents without specific guidance
+
+**Prompt Content**:
+- Explains [AUTO-RETRIEVED] blocks injected by prefetch
+- Explains [CTX-REF-xxx] markers from eviction
+- Lists available retrieval skills
+- Provides usage guidelines specific to agent role
+
+**Idempotency**: Injection is idempotent - re-injecting same agent type doesn't duplicate content
+
+**Dependencies**: CONTEXT.md prompt additions, agent system prompt infrastructure
+
+**Files to create:** `core/context/prompt_injector.go`, `core/context/prompt_injector_test.go`
+
+**Acceptance Criteria:**
+- [ ] `InjectAdaptiveRetrievalPrompt(agentType, systemPrompt string) string`
+- [ ] Injects agent-specific prompt addition per CONTEXT.md
+- [ ] LibrarianRetrievalPromptAddition for librarian
+- [ ] ArchivalistRetrievalPromptAddition for archivalist
+- [ ] AcademicRetrievalPromptAddition for academic
+- [ ] GuideRetrievalPromptAddition for guide
+- [ ] EngineerRetrievalPromptAddition for engineer
+- [ ] OrchestratorRetrievalPromptAddition for orchestrator
+- [ ] Generic addition for other agents (designer, inspector, tester)
+- [ ] Injection idempotent (no duplication on re-inject)
+- [ ] Unit test: correct prompt injected for each agent type
+- [ ] Unit test: idempotency
+
+### AR.11.1-AR.11.4 VectorGraphDB Extensions
+
+**Architectural Role**: Extensions to VectorGraphDB that integrate Document Search (SEARCH.md) with adaptive retrieval. Instead of duplicating search infrastructure, these extensions add Bleve integration, pressure awareness, and budget tracking directly to VectorGraphDB.
+
+**Why This Exists**: CONTEXT.md architecture gap analysis identified that UniversalContentStore should wrap VectorGraphDB rather than duplicate it. These extensions add the missing functionality: Bleve full-text search, hybrid result fusion, pressure-aware search limiting, and session-scoped budgets.
+
+**Relationship to Architecture**:
+
+**AR.11.1 BleveIntegratedDB** (`bleve_db.go`):
+- Wraps VectorGraphDB + SEARCH.md Bleve index
+- `HybridSearch(query, embedding, opts)` searches both backends
+- Uses RRF fusion from DS.9.3 for result merging
+- Uses circuit breakers from AR.2.4 for failure protection
+
+**AR.11.2 HybridResult Extensions** (`hybrid_result_ext.go`):
+- Extended HybridResult with: RetrievalCost, BleveScore, TierSource, AccessedAt
+- Enables tracking which tier (Hot/Warm/Full) produced each result
+- Supports learning by providing tier provenance
+
+**AR.11.3 PressureAwareSearcher** (`pressure_searcher.go`):
+- Wraps VectorGraphDB QueryEngine
+- `OnPressureChange(level)` adjusts maxTier
+- Integrates with PressureController from AR.6.1
+
+**AR.11.4 SessionScopedView with Budget** (`session_budget.go`):
+- Extends existing SessionScopedView with RetrievalBudget (AR.1.2)
+- `CanQuery()` checks budget before search
+- Prevents unbounded retrieval within session
+
+**Integration with Existing VectorGraphDB**:
+- Uses existing HNSWIndex, SessionScopedView, QueryEngine
+- Adds new capabilities without modifying core VectorGraphDB
+
+**Dependencies**: SEARCH.md components, existing VectorGraphDB, AR.1.2 (RetrievalBudget), AR.2.4 (CircuitBreakers)
+
+**Files to create:**
+- `core/vectorgraphdb/bleve_db.go`
+- `core/vectorgraphdb/hybrid_result_ext.go`
+- `core/vectorgraphdb/pressure_searcher.go`
+- `core/vectorgraphdb/session_budget.go`
+
+**Acceptance Criteria:**
+- [ ] `BleveIntegratedDB` wraps VectorGraphDB + Bleve index
+- [ ] `HybridSearch(query, embedding, opts)` searches both backends
+- [ ] Uses RRF fusion from DS.9.3
+- [ ] Uses circuit breakers per AR.2.4
+- [ ] Extended `HybridResult` fields: RetrievalCost, BleveScore, TierSource, AccessedAt
+- [ ] `PressureAwareSearcher` wraps QueryEngine
+- [ ] `OnPressureChange(level)` adjusts maxTier
+- [ ] `SessionScopedView` integrates RetrievalBudget
+- [ ] `CanQuery()` checks budget before search
+- [ ] Unit tests for each extension
+
+### AR.12.1 Adaptive Retrieval Facade
+
+**Architectural Role**: Top-level coordinator that initializes, starts, stops, and exposes all adaptive retrieval components. This is the single entry point for session manager and other consumers - they interact with AdaptiveRetrieval, not individual components.
+
+**Why This Exists**: The adaptive retrieval system has many interacting components (prefetcher, searcher, tracker, hooks, skills, pressure integration). The facade provides a clean interface for lifecycle management and component access, hiding internal complexity from consumers.
+
+**Relationship to Architecture**:
+- `New(config *Config, deps *Dependencies) (*AdaptiveRetrieval, error)`
+  - Dependencies include: VectorGraphDB, Bleve, PressureController, GoroutineBudget, FileHandleBudget
+  - Config includes: cache sizes, latency targets, learning parameters
+
+- `Start(ctx context.Context) error`
+  - Initializes all components in dependency order
+  - Registers hooks and skills
+  - Loads or initializes AdaptiveState
+  - Registers with PressureController
+
+- `Stop() error`
+  - Saves AdaptiveState
+  - Unregisters from PressureController
+  - Cancels in-flight prefetches
+  - Releases all resources
+
+**Component Accessors**:
+- `GetPrefetcher() *SpeculativePrefetcher`
+- `GetSearcher() *TieredSearcher`
+- `GetAdaptiveState() *AdaptiveState`
+
+**Integration Points**:
+- Session Manager (AR.13.1) uses this to initialize per-session retrieval
+- VirtualContextManager uses this for eviction/retrieval
+- HandoffManager (AR.13.2) uses this for state preservation
+
+**Dependencies**: All AR.1.x through AR.11.x components
+
+**Files to create:** `core/context/adaptive_retrieval.go`
+
+**Acceptance Criteria:**
+- [ ] `AdaptiveRetrieval` struct coordinating all components
+- [ ] `New(config *Config, deps *Dependencies) (*AdaptiveRetrieval, error)`
+- [ ] Dependencies: VectorGraphDB, Bleve, PressureController, GoroutineBudget, FileHandleBudget, etc.
+- [ ] `Start(ctx context.Context) error` initializes all components
+- [ ] `Stop() error` cleanly shuts down all components
+- [ ] `GetPrefetcher() *SpeculativePrefetcher`
+- [ ] `GetSearcher() *TieredSearcher`
+- [ ] `GetAdaptiveState() *AdaptiveState`
+- [ ] Integrates with VirtualContextManager
+- [ ] Integrates with HandoffManager
+- [ ] Unit test: Start/Stop lifecycle
+- [ ] Unit test: all components accessible
+
+### AR.13.1 Session Manager Integration
+
+**Architectural Role**: Integration between Session Manager and Adaptive Retrieval, ensuring each session has properly initialized retrieval capabilities with per-session isolation.
+
+**Why This Exists**: Each session needs its own adaptive retrieval instance with isolated state (one user's learned preferences shouldn't affect another's). This integration hooks into session lifecycle to initialize on start and cleanup on end.
+
+**Relationship to Architecture**:
+- `initAdaptiveRetrieval(session *Session) error`
+  - Called during session creation
+  - Creates AdaptiveRetrieval instance (AR.12.1)
+  - Loads or initializes session-specific AdaptiveState
+  - Registers hooks for all session agents
+  - Registers skills for all session agents
+
+- `cleanupAdaptiveRetrieval(session *Session) error`
+  - Called during session termination
+  - Saves AdaptiveState to persistent storage
+  - Releases all resources (file handles, goroutines)
+  - Unregisters hooks and skills
+
+**Session Isolation**:
+- Each session has separate AdaptiveState
+- No state leakage between sessions
+- Per-session file paths for WAL and state
+
+**Existing Code Modification**:
+- `core/session/manager.go`: Add hooks for adaptive retrieval init/cleanup
+- Session struct: Add field for AdaptiveRetrieval instance
+
+**Dependencies**: AR.12.1 (AdaptiveRetrieval), existing `core/session/manager.go`
+
+**Files to create:** `core/session/adaptive_integration.go`, `core/session/adaptive_integration_test.go`
+
+**Existing code to modify:** `core/session/manager.go`
+
+**Acceptance Criteria:**
+- [ ] `initAdaptiveRetrieval(session *Session) error` called on session start
+- [ ] Registers hooks for all session agents
+- [ ] Registers skills for all session agents
+- [ ] Loads or initializes AdaptiveState for session
+- [ ] `cleanupAdaptiveRetrieval(session *Session) error` called on session end
+- [ ] Saves AdaptiveState
+- [ ] Releases all resources
+- [ ] Per-session isolation (no state leakage between sessions)
+- [ ] Unit test: new session initializes adaptive retrieval
+- [ ] Unit test: session end saves state and cleans up
+
+### AR.13.2 Handoff Context Integration
+
+**Architectural Role**: Integration between pipeline agent handoff and adaptive retrieval state. When a pipeline agent (Engineer, Designer, etc.) hands off to a new instance at 75% context, learned adaptive state transfers to the new instance.
+
+**Why This Exists**: Pipeline agents use handoff instead of eviction (see CONTEXT.md). When an Engineer hands off, the new instance should benefit from the learned retrieval parameters and hot cache state of the old instance, maintaining continuity.
+
+**Relationship to Architecture**:
+- `BuildAdaptiveHandoffPayload(state *AdaptiveState, hotCache *HotCache) *HandoffContextPayload`
+  - Captures current AdaptiveState (weights mean, thresholds mean)
+  - Captures discovered contexts list (max 10)
+  - Captures hot content IDs with TTLs
+  - Captures current episode if in progress
+
+- `ApplyAdaptiveHandoffPayload(payload *HandoffContextPayload, newState *AdaptiveState)`
+  - Restores AdaptiveState on new instance
+  - Restores hot cache state
+  - Continues in-progress episode if one existed
+
+**Integration with CONTEXT.md Agent Handoff**:
+- Pipeline agents (Engineer, Designer, Inspector, Tester, Orchestrator, Guide) use handoff @ 75%
+- Knowledge agents (Librarian, Archivalist, Academic, Architect) use eviction, not handoff
+- HandoffContextPayload is serialized in existing handoff message format
+
+**Existing Code Modification**:
+- `core/pipeline/handoff.go`: Include adaptive context in handoff payload
+
+**Dependencies**: AR.3.4 (AdaptiveState), AR.5.1 (HotCache), existing `core/pipeline/handoff.go`
+
+**Files to create:** `core/pipeline/adaptive_handoff.go`, `core/pipeline/adaptive_handoff_test.go`
+
+**Existing code to modify:** `core/pipeline/handoff.go`
+
+**Acceptance Criteria:**
+- [ ] `BuildAdaptiveHandoffPayload(state *AdaptiveState, hotCache *HotCache) *HandoffContextPayload`
+- [ ] Includes AdaptiveState snapshot (weights mean, thresholds mean)
+- [ ] Includes discovered contexts list
+- [ ] Includes hot content IDs and TTLs
+- [ ] Includes current episode if in progress
+- [ ] `ApplyAdaptiveHandoffPayload(payload *HandoffContextPayload, newState *AdaptiveState)`
+- [ ] Restores hot cache state
+- [ ] Continues episode if one was in progress
+- [ ] Integration with existing handoff mechanism
+- [ ] Unit test: handoff preserves adaptive state
+- [ ] Unit test: hot cache restored after handoff
+
+### AR.14 Adaptive Retrieval Integration Tests
+
+**Architectural Role**: End-to-end integration tests verifying the complete adaptive retrieval system works correctly. These tests exercise the full path from query to prefetch to injection to learning.
+
+**Why This Exists**: Unit tests verify individual components, but the adaptive retrieval system's value comes from component integration. These tests verify: prefetch timing, tier latency targets, pressure response, learning convergence, handoff preservation, and cross-session learning.
+
+**Relationship to Architecture**:
+All tests verify CONTEXT.md and SEARCH.md specifications:
+
+**Flow Tests**:
+- End-to-end prefetch flow: query → prefetch starts → LLM receives augmented context
+- Verify [AUTO-RETRIEVED] blocks appear in prompt when prefetch succeeds
+- Verify fallback to synchronous retrieval when prefetch times out
+
+**Latency Tests**:
+- Tiered search latency: Hot < 1ms, Warm < 10ms, Full < 200ms
+- Prefetch injection hook < 15ms total latency
+- Verify budgets respected (searches terminate at budget)
+
+**Pressure Tests**:
+- Verify component behavior at each pressure level (Normal, Elevated, High, Critical)
+- Verify hot cache eviction under pressure
+- Verify prefetch disabled at High/Critical
+
+**Learning Tests**:
+- Learning convergence: 100 positive observations move weights toward 1.0
+- User profile learning: excess prefetch reduces WastePenalty
+- Context discovery: similar queries cluster together
+
+**Persistence Tests**:
+- Handoff state preservation: state survives pipeline agent handoff
+- Crash recovery: observations survive crash, replay on restart
+- Session persistence: AdaptiveState saved and restored
+
+**Cross-Session Tests**:
+- Cross-session learning: context discovered in session A available in session B
+- Failure patterns: failures recorded in session A warn in session B
+
+**Safety Tests**:
+- No goroutine leaks: verify all goroutines cleaned up on shutdown
+- No memory leaks: verify bounded memory usage over time
+- All tests pass with race detector enabled
+
+**Dependencies**: All AR.x components, test infrastructure
+
+**Files to create:** `core/context/integration_test.go`
+
+**Acceptance Criteria:**
+- [ ] End-to-end prefetch flow test: query → prefetch starts → LLM receives augmented context
+- [ ] Tiered search latency test: verify Hot < 1ms, Warm < 10ms, Full < 200ms
+- [ ] Pressure response test: verify component behavior at each pressure level
+- [ ] Learning convergence test: 100 positive observations move weights toward 1.0
+- [ ] Handoff state preservation test: state survives handoff
+- [ ] Cross-session learning test: context discovered in session A available in session B
+- [ ] Circuit breaker test: graceful degradation when backend fails
+- [ ] No goroutine leaks: verify all goroutines cleaned up on shutdown
+- [ ] No memory leaks: verify bounded memory usage over time
+- [ ] All tests pass with race detector enabled
+
+---
+
+## Context Virtualization System
+
+**Reference**: See CONTEXT.md for complete specification and ARCHITECTURE.md "Lossless Context Virtualization" section.
+
+This section implements the core Context Virtualization components that enable lossless context management across all agents. The AR (Adaptive Retrieval) items reference these components but do not implement them - this section provides the implementation.
+
+### CV.1 UniversalContentStore
+
+**Architectural Role**: Central storage for all content processed by Sylk - user prompts, agent responses, tool calls, file reads, web fetches, research papers, routing decisions, and handoff states. Wraps VectorGraphDB with Bleve full-text search integration.
+
+**Why This Exists**: CONTEXT.md architecture gap analysis (section 1.1) identified that UniversalContentStore should wrap VectorGraphDB rather than duplicate it. This implementation provides WAVE 4 compliant indexing with proper resource management.
+
+**Relationship to Architecture**:
+- Wraps existing VectorGraphDB for vector search
+- Integrates with Document Search System (DS.x) for Bleve indexing
+- Uses SafeChan for index queue (not raw channels)
+- Uses GoroutineScope for workers (not raw goroutines)
+- Tracks file handles via FileHandleBudget
+- Registers with PressureController for memory management
+
+**Files to create:**
+- `core/context/content_store.go`
+- `core/context/content_store_test.go`
+
+**Acceptance Criteria:**
+- [ ] `UniversalContentStore` struct wrapping VectorGraphDB + Bleve
+- [ ] `indexQueue *safechan.SafeChan[*ContentEntry]` (WAVE 4 compliant)
+- [ ] `scope *concurrency.GoroutineScope` for worker management
+- [ ] `fileBudget *resources.FileHandleBudget` tracking
+- [ ] `New(config *ContentStoreConfig, deps *ContentStoreDeps) (*UniversalContentStore, error)`
+- [ ] `IndexContent(entry *ContentEntry) error` - indexes in all backends
+- [ ] `Search(query string, opts *SearchOptions) ([]*ContentEntry, error)` - hybrid search
+- [ ] `GetByID(id string) (*ContentEntry, error)` - direct lookup
+- [ ] `GetBySessionID(sessionID string, opts *QueryOptions) ([]*ContentEntry, error)`
+- [ ] All file handles tracked and released on Close()
+- [ ] No raw goroutines - all workers via scope.Go()
+- [ ] Unit test: content indexed in both Bleve and VectorDB
+- [ ] Unit test: hybrid search returns merged results
+- [ ] Unit test: handles released on close
+
+### CV.2 StartupIndexer
+
+**Architectural Role**: Parallel file scanner that pre-indexes the entire codebase on startup with user permission. Uses GoroutineBudget for controlled parallelism and respects file handle limits.
+
+**Why This Exists**: CONTEXT.md architecture gap analysis (section 1.3) identified StartupIndexer WAVE 4 violations - raw goroutines in worker pool. This implementation uses proper resource management for safe parallel indexing.
+
+**Relationship to Architecture**:
+- Uses `GoroutineBudget.Acquire()` for worker slots
+- Uses `FileHandleBudget.Acquire()` for file reads
+- Respects `.gitignore` and security filters (.env, credentials, etc.)
+- Batches content for efficient indexing
+- Reports progress to user
+
+**Files to create:**
+- `core/context/startup_indexer.go`
+- `core/context/startup_indexer_test.go`
+
+**Acceptance Criteria:**
+- [ ] `StartupIndexer` struct with GoroutineBudget, FileHandleBudget integration
+- [ ] `Index(ctx context.Context, root string) error` - indexes codebase
+- [ ] Uses `budget.Acquire(ctx, "startup-indexer")` for each worker
+- [ ] Uses `fileBudget.Acquire(ctx, "file-scan")` for file reads
+- [ ] Respects `.gitignore` patterns via go-git
+- [ ] Security filter: never indexes .env, credentials.json, secrets/*, etc.
+- [ ] Progress callback: `OnProgress(func(indexed, total int))`
+- [ ] Batches 100 files per index operation for efficiency
+- [ ] Graceful cancellation via context
+- [ ] Unit test: respects goroutine budget limits
+- [ ] Unit test: respects file handle limits
+- [ ] Unit test: security filter works
+
+### CV.3 ContextReference System
+
+**Architectural Role**: Compact reference markers that replace evicted content in agent context windows. When content is evicted, a [CTX-REF-xxx] marker remains in context pointing to the full content in UniversalContentStore.
+
+**Why This Exists**: CONTEXT.md specifies that evicted content must be retrievable. References provide the bridge - they're small enough to remain in context but contain enough information to retrieve the full content.
+
+**Relationship to Architecture**:
+- References created during eviction (ES.x)
+- References resolved by `retrieve_context` skill (AR.8.1)
+- Format: `[CTX-REF-{id}] Summary: {brief description} (N tokens, turn T)`
+
+**Files to create:**
+- `core/context/context_reference.go`
+- `core/context/context_reference_test.go`
+
+**Acceptance Criteria:**
+- [ ] `ContextReference` struct with ID, OriginalEntryIDs, Summary, TokensSaved, TurnRange, CreatedAt
+- [ ] `Render() string` - produces `[CTX-REF-xxx]` format marker
+- [ ] `Parse(marker string) (*ContextReference, error)` - parses marker back to reference
+- [ ] Reference markers are < 100 tokens each
+- [ ] References stored in UniversalContentStore for durability
+- [ ] Unit test: render produces valid marker format
+- [ ] Unit test: parse extracts reference ID correctly
+
+### CV.4 ReferenceGenerator
+
+**Architectural Role**: Creates ContextReferences from evicted content entries. Generates summaries that preserve semantic meaning while drastically reducing token count.
+
+**Why This Exists**: When evicting content from agent context, we need a summary that helps the agent understand what was evicted and decide whether to retrieve it. The ReferenceGenerator creates these summaries.
+
+**Relationship to Architecture**:
+- Called by eviction strategies (ES.x) during eviction
+- Uses simple heuristics for summary generation (not LLM - too slow/expensive)
+- Summary quality affects agent's ability to know when to retrieve
+
+**Summary Strategy**:
+1. Extract key entities (file paths, function names, error types)
+2. Identify content type (prompt, response, tool result, etc.)
+3. Preserve action words (created, modified, searched, found)
+4. Truncate to 50 tokens max
+
+**Files to create:**
+- `core/context/reference_generator.go`
+- `core/context/reference_generator_test.go`
+
+**Acceptance Criteria:**
+- [ ] `ReferenceGenerator` struct with contentStore reference
+- [ ] `GenerateReference(entries []*ContentEntry) (*ContextReference, error)`
+- [ ] Summary extracts file paths mentioned in content
+- [ ] Summary extracts function/type names via simple regex
+- [ ] Summary preserves content type indicator
+- [ ] Summary limited to 50 tokens
+- [ ] TokensSaved calculated as sum of entry tokens - reference tokens
+- [ ] Unit test: summary extracts key entities
+- [ ] Unit test: summary stays under token limit
+
+### CV.5 VirtualContextManager
+
+**Architectural Role**: Central coordinator for context virtualization across all agents. Manages per-agent context state, triggers eviction for knowledge agents, coordinates handoff for pipeline agents.
+
+**Why This Exists**: AR.12.1 (Adaptive Retrieval Facade) references VirtualContextManager but doesn't implement it. This is the missing coordinator that ties together eviction strategies, content store, and agent context management.
+
+**Relationship to Architecture**:
+- Creates and manages AgentContext per agent
+- Routes to eviction (knowledge agents) or handoff (pipeline agents) at 75% context
+- Integrates with ContextRetriever for on-demand retrieval
+- Used by AR.12.1 AdaptiveRetrieval facade
+
+**Files to create:**
+- `core/context/virtual_context_manager.go`
+- `core/context/virtual_context_manager_test.go`
+
+**Acceptance Criteria:**
+- [ ] `VirtualContextManager` struct with contentStore, retriever, evictionConfigs, handoffManager
+- [ ] `AgentContext` struct with AgentID, AgentType, Entries, References, TotalTokens, MaxTokens
+- [ ] `RegisterAgent(agentID, agentType string, maxTokens int) error`
+- [ ] `OnMessage(agentID string, entry *ContentEntry) error` - processes new content
+- [ ] `GetContext(agentID string) *AgentContext` - returns current context
+- [ ] Knowledge agents (librarian, archivalist, academic, architect) trigger eviction at 75%
+- [ ] Pipeline agents (engineer, designer, inspector, tester) trigger handoff at 75%
+- [ ] `ForceEvict(agentCtx *AgentContext, percent float64) error` - for pressure response
+- [ ] `evictionConfigs` map with per-agent EvictionStrategy
+- [ ] Unit test: knowledge agent triggers eviction at 75%
+- [ ] Unit test: pipeline agent context tracked (handoff elsewhere)
+- [ ] Unit test: ForceEvict reduces context size
+
+---
+
+## Eviction Strategy System
+
+**Reference**: See CONTEXT.md "Agent-Specific Eviction Configurations" section.
+
+This section implements agent-specific eviction strategies for knowledge agents. Pipeline agents use handoff (not eviction) because their task state must transfer completely.
+
+### ES.1 EvictionStrategy Interface
+
+**Architectural Role**: Interface that all eviction strategies implement. Allows VirtualContextManager to use different strategies per agent type.
+
+**Files to create:**
+- `core/context/eviction_strategy.go`
+
+**Acceptance Criteria:**
+- [ ] `EvictionStrategy` interface with `SelectForEviction(ctx *AgentContext, targetPercent float64) ([]*ContentEntry, error)`
+- [ ] `SelectForEviction` returns entries to evict to reach targetPercent context usage
+- [ ] Strategy can access agent's full context to make selection
+- [ ] Strategy respects `PreserveRecent` and `PreserveTypes` constraints
+
+### ES.2 RecencyBasedEviction (Librarian, Archivalist)
+
+**Architectural Role**: Eviction strategy for Librarian and Archivalist that prioritizes recent content. Both agents maintain historical/codebase memory, so they preserve the most recent turns and evict oldest content first.
+
+**Why This Exists**: Per CONTEXT.md:
+- **Librarian**: threshold 75%, eviction 25%, preserve 5 recent turns
+- **Archivalist**: threshold 75%, eviction 25%, preserve 5 recent turns
+
+Recency-based selection ensures current conversation context remains while older history is evictable.
+
+**Files to create:**
+- `core/context/eviction_recency.go`
+- `core/context/eviction_recency_test.go`
+
+**Acceptance Criteria:**
+- [ ] `RecencyBasedEviction` struct implementing EvictionStrategy
+- [ ] `SelectForEviction` evicts oldest turns first
+- [ ] Preserves `PreserveRecent` most recent turns (default 5 for Librarian/Archivalist)
+- [ ] Preserves `PreserveTypes` content types (user prompts always preserved)
+- [ ] Returns entries sorted by turn number (oldest first)
+- [ ] Unit test: evicts oldest content
+- [ ] Unit test: preserves recent turns
+
+### ES.3 TopicClusterEviction (Academic)
+
+**Architectural Role**: Eviction strategy for Academic that clusters related research content and evicts entire clusters. Academic organizes research knowledge by topic, so eviction preserves topic coherence for research continuity.
+
+**Why This Exists**: Per CONTEXT.md, Academic's eviction config specifies: threshold 80%, eviction 30%, preserve 3 recent turns. Topic-based clustering ensures related research/responses stay together or are evicted together.
+
+**Topic Clustering**:
+1. Group entries by detected topic (file paths, function names, modules)
+2. Score clusters by recency and access frequency
+3. Evict lowest-scored clusters until target reached
+
+**Files to create:**
+- `core/context/eviction_topic.go`
+- `core/context/eviction_topic_test.go`
+
+**Acceptance Criteria:**
+- [ ] `TopicClusterEviction` struct implementing EvictionStrategy
+- [ ] `clusterByTopic(entries []*ContentEntry) []EntryCluster` - groups related entries
+- [ ] Topic detection via file path prefixes, module names, function names
+- [ ] `scoreCluster(cluster EntryCluster) float64` - recency + access weighted
+- [ ] Evicts lowest-scored clusters first
+- [ ] Never splits a cluster during eviction
+- [ ] Preserves `PreserveRecent` turns regardless of topic
+- [ ] Unit test: related entries cluster together
+- [ ] Unit test: evicts entire clusters atomically
+
+### ES.4 TaskCompletionEviction (Architect)
+
+**Architectural Role**: Eviction strategy for Architect that prioritizes completed task context for eviction. Architect plans and delegates - completed task context can be evicted while active task context must remain.
+
+**Why This Exists**: Per CONTEXT.md, Architect's eviction config specifies: threshold 85%, eviction 25%, preserve 5 recent turns. Task-based eviction preserves context for active/pending tasks while evicting completed task discussions.
+
+**Task State Detection**:
+1. Parse content for task references (task IDs, "completed", "done", etc.)
+2. Group entries by task affiliation
+3. Evict completed task clusters first, then oldest content
+
+**Files to create:**
+- `core/context/eviction_task.go`
+- `core/context/eviction_task_test.go`
+
+**Acceptance Criteria:**
+- [ ] `TaskCompletionEviction` struct implementing EvictionStrategy
+- [ ] `groupByTask(entries []*ContentEntry) map[string][]*ContentEntry`
+- [ ] Task detection via task ID patterns, completion keywords
+- [ ] `isTaskComplete(taskID string, entries []*ContentEntry) bool`
+- [ ] Evicts completed task entries first
+- [ ] Falls back to recency for non-task content
+- [ ] Preserves `PreserveRecent` turns
+- [ ] Unit test: completed task content evicted first
+- [ ] Unit test: active task content preserved
+
+### ES.5 AgentEvictionConfig
+
+**Architectural Role**: Configuration structs defining eviction behavior per agent type. Centralizes threshold, eviction percent, and strategy selection.
+
+**Files to create:**
+- `core/context/eviction_config.go`
+
+**Acceptance Criteria:**
+- [ ] `AgentEvictionConfig` struct with ThresholdPercent, EvictionPercent, Strategy, PreserveRecent, PreserveTypes
+- [ ] `EvictionConfigs` map with configs for: librarian, archivalist, academic, architect
+- [ ] **Librarian**: threshold 75%, eviction 25%, RecencyBasedEviction, preserve 5 (per CONTEXT.md)
+- [ ] **Archivalist**: threshold 75%, eviction 25%, RecencyBasedEviction, preserve 5 (per CONTEXT.md)
+- [ ] **Academic**: threshold 80%, eviction 30%, TopicClusterEviction, preserve 3 (per CONTEXT.md)
+- [ ] **Architect**: threshold 85%, eviction 25%, TaskCompletionEviction, preserve 5 (per CONTEXT.md)
+- [ ] All preserve user_prompt content type
+
+---
+
+## Pipeline Agent Handoff System
+
+**Reference**: See CONTEXT.md "Pipeline Agent Handoff" section.
+
+This section implements the HandoffManager and additional handoff state types for Orchestrator and Guide. The existing Pipeline Handoff items (Phase 2) cover Engineer/Inspector/Tester - this section adds the missing components.
+
+**IMPORTANT**: CONTEXT.md specifies 75% threshold for ALL pipeline agent handoff, not 95%. The existing Pipeline Handoff section (Phase 2) should be updated accordingly.
+
+### PH.1 HandoffManager Core
+
+**Architectural Role**: Central coordinator for all agent handoffs. Manages handoff lifecycle: building state, **archiving to both document DB and vector DB**, spawning new agent, injecting state, terminating old agent.
+
+**Why This Exists**: AR.13.2 references "core/pipeline/handoff.go" but HandoffManager itself is not implemented. This is the missing coordinator.
+
+**CRITICAL**: The **SAME handoff state** sent to the next agent instance must **ALSO be archived to Archivalist** for dual-storage ingest:
+1. **Bleve (Document DB)**: Text-searchable for audit trails, debugging, pattern analysis
+2. **VectorDB**: Semantic search for similar handoff patterns, learning from past handoffs
+
+**Relationship to Architecture**:
+- Called by VirtualContextManager when pipeline agent hits 75%
+- Archives handoff state to Archivalist for DUAL STORAGE (Bleve + VectorDB)
+- Stores handoff state in UniversalContentStore for audit/recovery
+- Creates new agent instance via pipeline
+- Injects handoff state as initial context
+
+**Files to create:**
+- `core/pipeline/handoff_manager.go`
+- `core/pipeline/handoff_manager_test.go`
+
+**Acceptance Criteria:**
+- [ ] `HandoffManager` struct with contentStore, archivalist references
+- [ ] `New(store *UniversalContentStore, archivalist *Archivalist) *HandoffManager`
+- [ ] `TriggerHandoff(agent PipelineAgent, pipeline *Pipeline) error`
+- [ ] Builds handoff state via `agent.BuildHandoffState()`
+- [ ] **CRITICAL**: Archives handoff state to Archivalist with `submit_handoff_record` skill:
+  - [ ] Category: `agent_handoff_{agent_type}` (e.g., `agent_handoff_engineer`)
+  - [ ] Full handoff state JSON stored in Bleve for text search
+  - [ ] Handoff state vectorized and stored in VectorDB for semantic search
+  - [ ] Tags: agent_type, session_id, pipeline_id, handoff_index, timestamp
+- [ ] Stores handoff state in contentStore (ContentType: "agent_handoff")
+- [ ] Creates new agent via `pipeline.CreateAgent(agent.Type())`
+- [ ] Injects state via `newAgent.InjectHandoffState(state)`
+- [ ] Replaces agent in pipeline
+- [ ] Terminates old agent
+- [ ] `ShouldHandoff(agent PipelineAgent) bool` - checks >= 75% context usage
+- [ ] Unit test: handoff triggered at 75%
+- [ ] Unit test: state archived to BOTH Bleve and VectorDB
+- [ ] Unit test: state stored for audit
+- [ ] Unit test: new agent receives state
+
+### PH.2 OrchestratorHandoffState
+
+**Architectural Role**: Handoff state structure for Orchestrator agent. Orchestrator coordinates all pipelines and workflows, so its handoff state includes workflow state, pipeline states, pending tasks, and coordination context.
+
+**Why This Exists**: CONTEXT.md (lines 3528-3554) defines OrchestratorHandoffState but it's not in TODO.md. When Orchestrator hits 75% context, it must hand off its coordination state to a new instance.
+
+**Files to create:**
+- `core/pipeline/orchestrator_handoff.go`
+
+**Acceptance Criteria:**
+- [ ] `OrchestratorHandoffState` struct per CONTEXT.md specification:
+  - SessionID, OriginalGoal
+  - CurrentWorkflow (*WorkflowState)
+  - PendingTasks, ActivePipelines, CompletedTasks
+  - AgentStates map, WaitingOn conditions, NextActions
+  - KeyDecisions, Blockers, ContextNotes
+  - HandoffIndex, HandoffReason, Timestamp
+- [ ] `WorkflowState` struct with ID, Name, Phase, Progress, StartTime
+- [ ] `OrchestratorTask` struct with ID, Description, AssignedTo, Status, Dependencies
+- [ ] `PipelineInfo` struct with ID, TaskID, Status, ActiveAgents
+- [ ] `AgentStateSnapshot` struct with AgentID, AgentType, ContextUsage, LastActivity
+- [ ] `WaitCondition` struct with Type, Target, Description
+- [ ] `PlannedAction` struct with Action, Target, Details
+- [ ] `(*Orchestrator) BuildHandoffState() *OrchestratorHandoffState`
+- [ ] `(*Orchestrator) InjectHandoffState(state *OrchestratorHandoffState) error`
+
+### PH.3 GuideHandoffState
+
+**Architectural Role**: Handoff state structure for Guide agent. Guide is the user-facing router, so its handoff state includes conversation history, routing decisions, user preferences, and current intent.
+
+**Why This Exists**: CONTEXT.md (lines 3556-3610) defines GuideHandoffState but it's not in TODO.md. When Guide hits 75% context, it must hand off routing context and user preferences to a new instance.
+
+**Files to create:**
+- `core/pipeline/guide_handoff.go`
+
+**Acceptance Criteria:**
+- [ ] `GuideHandoffState` struct per CONTEXT.md specification:
+  - SessionID, UserID
+  - ConversationHistory (summarized recent turns)
+  - CurrentIntent, ActiveTopics
+  - RecentRoutings, AgentAffinities map
+  - PendingFollowups, UserPreferences
+  - ActiveAgents, WaitingFor
+  - KeyContext, Assumptions
+  - HandoffIndex, HandoffReason, Timestamp
+- [ ] `ConversationTurn` struct with TurnNumber, Role, Summary, Intent, RoutedTo
+- [ ] `RoutingDecision` struct with TurnNumber, UserQuery, SelectedAgent, Confidence, Reasoning
+- [ ] `UserPreferences` struct with Verbosity, CodeStyle, ExplanationLevel, PreferredAgents
+- [ ] `(*Guide) BuildHandoffState() *GuideHandoffState`
+- [ ] `(*Guide) InjectHandoffState(state *GuideHandoffState) error`
+
+### PH.4 DesignerHandoffState
+
+**Architectural Role**: Handoff state structure for Designer agent. Designer handles UI/UX implementation, so its handoff state includes component state, design decisions, and accessibility considerations.
+
+**Why This Exists**: CONTEXT.md (lines 3505-3526) defines DesignerHandoffState. The existing Pipeline Handoff section mentions Designer briefly but doesn't include it in the Wave groups.
+
+**Files to create:**
+- `core/pipeline/designer_handoff.go`
+
+**Acceptance Criteria:**
+- [ ] `DesignerHandoffState` struct per CONTEXT.md specification:
+  - OriginalPrompt, TaskID, PipelineID
+  - Accomplished, ComponentsCreated, StylesApplied, Remaining
+  - DesignDecisions, TokensUsed (design tokens), A11yConsiderations
+  - HandoffIndex, HandoffReason, Timestamp
+- [ ] `(*Designer) BuildHandoffState() *DesignerHandoffState`
+- [ ] `(*Designer) InjectHandoffState(state *DesignerHandoffState) error`
+
+### PH.5 AgentContextCheck Hook
+
+**Architectural Role**: Post-turn hook that checks agent context usage and triggers handoff at 75% threshold for pipeline agents.
+
+**Why This Exists**: CONTEXT.md specifies handoff at 75% for all pipeline agents. This hook provides the trigger mechanism.
+
+**Files to create:**
+- `core/pipeline/context_check_hook.go`
+- `core/pipeline/context_check_hook_test.go`
+
+**Acceptance Criteria:**
+- [ ] `AgentContextCheckHook` with Type: PostPrompt, Priority: HookPriorityLast (100)
+- [ ] Agents: engineer, designer, inspector, tester, orchestrator, guide
+- [ ] Checks `agent.ContextUsagePercent()` after each turn
+- [ ] If >= 75%: calls `handoffManager.TriggerHandoff(agent, pipeline)`
+- [ ] Logs handoff trigger with agent type, context usage, handoff index
+- [ ] Unit test: handoff triggered at 75%
+- [ ] Unit test: no handoff below 75%
+
+### PH.6 Handoff State Archival System
+
+**Architectural Role**: Ensures ALL handoff states are archived to Archivalist for dual-storage ingest into both Document DB (Bleve) and Vector DB. This enables:
+- **Audit trail**: Full searchable history of all agent handoffs
+- **Pattern analysis**: Text search for debugging and understanding handoff patterns
+- **Semantic similarity**: Vector search for finding similar past handoffs
+- **Learning**: Future agents can learn from past handoff patterns
+
+**CRITICAL REQUIREMENT**: The **exact same handoff state** sent to the next agent instance must **also** be sent to Archivalist. This is not optional - all handoffs must be archived.
+
+**Files to create:**
+- `core/pipeline/handoff_archival.go`
+- `core/pipeline/handoff_archival_test.go`
+- `agents/archivalist/handoff_ingest.go`
+
+**Acceptance Criteria:**
+
+##### HandoffArchiver Component
+- [ ] `HandoffArchiver` struct with archivalist, vectorDB, blevIndex references
+- [ ] `Archive(state HandoffState, agentType string, metadata *HandoffMetadata) error`
+- [ ] Metadata includes: session_id, pipeline_id, handoff_index, agent_type, timestamp, context_usage_percent, handoff_reason
+
+##### Document DB (Bleve) Storage
+- [ ] Category: `agent_handoff_{agent_type}` (e.g., `agent_handoff_engineer`, `agent_handoff_guide`)
+- [ ] Full handoff state JSON stored as document
+- [ ] Indexed fields for text search:
+  - [ ] `original_prompt` - searchable for finding similar task contexts
+  - [ ] `accomplished` - searchable for finding completed work patterns
+  - [ ] `remaining` - searchable for finding incomplete work patterns
+  - [ ] `key_decisions` / `design_decisions` - searchable for decision patterns
+  - [ ] `context_notes` - searchable for context patterns
+- [ ] Facet fields: agent_type, session_id, pipeline_id, handoff_reason
+- [ ] Unit test: handoff state searchable by text query
+
+##### Vector DB Storage
+- [ ] Embedding generated from handoff state summary (original_prompt + accomplished + remaining)
+- [ ] Vector stored with same ID as Bleve document for correlation
+- [ ] Metadata attached: agent_type, session_id, pipeline_id, timestamp
+- [ ] Enables semantic search: "find handoffs similar to this task"
+- [ ] Unit test: similar handoffs retrieved via vector similarity
+
+##### Archivalist Integration
+- [ ] New skill: `submit_handoff_record` for receiving handoff states
+- [ ] Skill routes to both Bleve and VectorDB indexing
+- [ ] Async submission (non-blocking to handoff flow)
+- [ ] Retry logic: 3 attempts with exponential backoff
+- [ ] Failure logging (handoff proceeds even if archival fails)
+
+##### Query Capabilities
+- [ ] `QueryHandoffsByAgent(agentType string, limit int) ([]HandoffRecord, error)` - text search
+- [ ] `QueryHandoffsBySession(sessionID string) ([]HandoffRecord, error)` - text search
+- [ ] `QuerySimilarHandoffs(state HandoffState, limit int) ([]HandoffRecord, error)` - vector search
+- [ ] `QueryHandoffsByPattern(pattern string) ([]HandoffRecord, error)` - text search
+- [ ] Unit test: queries return expected results
+
+##### HandoffRecord Schema
+```go
+type HandoffRecord struct {
+    ID              string            `json:"id"`
+    AgentType       string            `json:"agent_type"`
+    SessionID       string            `json:"session_id"`
+    PipelineID      string            `json:"pipeline_id,omitempty"`
+    HandoffIndex    int               `json:"handoff_index"`
+    ContextUsage    float64           `json:"context_usage_percent"`
+    HandoffReason   string            `json:"handoff_reason"`
+    State           json.RawMessage   `json:"state"`  // Full handoff state
+    StateSummary    string            `json:"state_summary"`  // For vector embedding
+    Timestamp       time.Time         `json:"timestamp"`
+    // Denormalized for search
+    OriginalPrompt  string            `json:"original_prompt,omitempty"`
+    Accomplished    []string          `json:"accomplished,omitempty"`
+    Remaining       []string          `json:"remaining,omitempty"`
+}
+```
+
+**Tests:**
+- [ ] Handoff state archived to Bleve on every handoff
+- [ ] Handoff state archived to VectorDB on every handoff
+- [ ] Text search returns matching handoffs
+- [ ] Vector similarity search returns semantically similar handoffs
+- [ ] Async archival doesn't block handoff flow
+- [ ] Archival failure doesn't prevent handoff completion
+
+### PH.7 PipelineController Handoff Integration
+
+**Architectural Role**: Extends the existing `PipelineController` (GR.6) to integrate with the HandoffManager for agent context tracking and handoff triggering.
+
+**Why This Exists**: The current `PipelineController` manages `AgentSupervisor` instances but doesn't track agent context usage or trigger handoffs. This integration connects the pipeline lifecycle management with the handoff system.
+
+**Relationship to Architecture**:
+- Extends existing `core/concurrency/pipeline_controller.go`
+- Integrates with `HandoffManager` (PH.1)
+- Called by `AgentContextCheckHook` (PH.5) when handoff is needed
+- Coordinates with `AgentSupervisor` for agent replacement
+
+**Files to modify:**
+- `core/concurrency/pipeline_controller.go`
+- `core/concurrency/pipeline_controller_test.go`
+
+**Files to create:**
+- `core/concurrency/pipeline_handoff_integration.go`
+- `core/concurrency/pipeline_handoff_integration_test.go`
+
+**Acceptance Criteria:**
+
+##### PipelineController Extensions
+- [ ] Add `handoffManager *HandoffManager` to `PipelineController`
+- [ ] Add `contextUsage map[string]float64` to track per-agent context usage
+- [ ] `SetHandoffManager(manager *HandoffManager)` - dependency injection
+- [ ] `UpdateContextUsage(agentID string, usagePercent float64)` - called by agents after each turn
+- [ ] `ShouldHandoff(agentID string) bool` - checks if >= 75%
+
+##### Handoff Coordination
+- [ ] `TriggerAgentHandoff(ctx context.Context, agentID string) error`:
+  - Calls `handoffManager.TriggerHandoff(agent, pipeline)`
+  - Waits for new agent to be ready
+  - Updates supervisor registration
+  - Logs handoff completion
+- [ ] `ReplaceAgentSupervisor(oldAgentID, newAgentID string, newSupervisor *AgentSupervisor)`:
+  - Atomically replaces supervisor in map
+  - Transfers in-flight operation tracking
+  - Maintains pipeline state consistency
+
+##### Agent Interface Contract
+- [ ] Define `HandoffableAgent` interface:
+  ```go
+  type HandoffableAgent interface {
+      ID() string
+      Type() string
+      ContextUsagePercent() float64
+      BuildHandoffState() (json.RawMessage, error)
+      InjectHandoffState(state json.RawMessage) error
+      Terminate()
+  }
+  ```
+- [ ] All pipeline agents (Engineer, Designer, Inspector, Tester, Orchestrator, Guide) implement `HandoffableAgent`
+
+##### Session Integration
+- [ ] Session manager creates `HandoffManager` instance per session
+- [ ] Session manager injects `HandoffManager` into all `PipelineController` instances
+- [ ] Session cleanup terminates any pending handoffs
+
+**Tests:**
+- [ ] Context usage tracking updates correctly
+- [ ] Handoff triggered at exactly 75% threshold
+- [ ] Agent supervisor replaced atomically
+- [ ] Pipeline continues functioning after handoff
+- [ ] In-flight operations transfer to new agent
+- [ ] Session cleanup handles pending handoffs
 
 ---
 
@@ -4951,7 +7749,7 @@ The following tasks can be executed concurrently:
 **Problem:** When agents consult each other through Guide:
 - Guide's context accumulates ALL consultation traffic
 - At 100 consultations/session: Guide context grows by 50-100K tokens
-- This causes more frequent Guide compaction and higher per-turn costs
+- This causes more frequent Guide handoffs (at 75% per CONTEXT.md) and higher per-turn costs
 - Estimated ~65% token reduction with direct consultation
 
 **Solution:** Direct consultation skills that bypass Guide for known targets, with async logging to Archivalist.
@@ -5959,18 +8757,18 @@ PRE-ROUTING CONSULTATIONS (for implementation):
 
 #### Guide Memory Management
 
-**Thresholds**: 50%, 75%, 90% (checkpoint) | 95% (compact)
+**Thresholds**: 50%, 75% (handoff per CONTEXT.md)
 
 **Files to create:**
 - `agents/guide/memory.go`
-- `agents/guide/checkpoint.go`
+- `agents/guide/handoff.go`
 
 **Acceptance Criteria:**
 
 ##### Context Monitoring
 - [ ] Track context window usage percentage
-- [ ] Trigger checkpoint at 50%, 75%, 90%
-- [ ] Trigger compaction at 95%
+- [ ] Trigger checkpoint at 50%
+- [ ] **CRITICAL**: Trigger PIPELINE HANDOFF at 75% (per CONTEXT.md, NOT compaction)
 
 ##### Checkpoint Summaries (Routing Knowledge)
 - [ ] `GuideSummary` struct with routing information:
@@ -5997,28 +8795,29 @@ type GuideSummary struct {
 }
 ```
 
-##### Compaction at 95%
-- [ ] Create final checkpoint before compacting
-- [ ] Clear verbose routing logs from context
-- [ ] Retain merged routing knowledge
-- [ ] Target: ~30% context usage after compaction
+##### Handoff at 75% (per CONTEXT.md)
+- [ ] Build GuideHandoffState (PH.3) with routing context
+- [ ] Store handoff state in UniversalContentStore for audit
+- [ ] Spawn new Guide instance via HandoffManager (PH.1)
+- [ ] Inject handoff state to new instance
+- [ ] Terminate old Guide instance
 
 #### Guide Hooks
 - [ ] Pre-route hook: inject session context
 - [ ] Post-route hook: update session state
 - [ ] Pre-dispatch hook: validate target agent health
 - [ ] Post-dispatch hook: record routing decision
-- [ ] Context-threshold hook: trigger checkpoint at 50%, 75%, 90%
-- [ ] Context-threshold hook: trigger compaction at 95%
+- [ ] Context-threshold hook: trigger checkpoint at 50%
+- [ ] AgentContextCheckHook (PH.5): trigger HANDOFF at 75%
 
 **Tests:**
 - [ ] Route requests with session context
 - [ ] Verify session isolation in route cache
 - [ ] Test new message types round-trip
 - [ ] Test skill loading on demand
-- [ ] Test checkpoint creation at 50%, 75%, 90%
-- [ ] Test compaction at 95%
-- [ ] Test routing knowledge preservation after compaction
+- [ ] Test checkpoint creation at 50%
+- [ ] Test handoff trigger at 75% context (per CONTEXT.md)
+- [ ] Test routing knowledge preservation after handoff
 
 #### Intent Preservation & Confidence Propagation
 
@@ -11905,8 +14704,8 @@ Wire PressureController into application startup and existing components.
 - [ ] Handle admission rejection gracefully (queue or retry)
 
 #### Agent Context Integration
-- [ ] Agents subscribe to `CompactContexts` signal
-- [ ] Implement context compaction response
+- [ ] Agents subscribe to `EvictContexts` signal (knowledge agents) or `HandoffContexts` signal (pipeline agents)
+- [ ] Implement context eviction response (knowledge agents) or handoff response (pipeline agents)
 - [ ] Report context size to Registry
 
 #### Shutdown
@@ -11950,7 +14749,7 @@ Comprehensive tests for the memory pressure defense system.
 - [ ] Spike detection triggers immediate response
 - [ ] Cache eviction frees expected memory
 - [ ] Pipeline admission stops/resumes correctly
-- [ ] Context compaction signals delivered
+- [ ] Context eviction/handoff signals delivered (per CONTEXT.md)
 
 #### Stress Tests
 - [ ] High-frequency memory allocation doesn't cause flapping
@@ -15127,20 +17926,21 @@ var LibrarianTools = []ToolDefinition{
 }
 ```
 
-#### Memory Management
+#### Memory Management (Eviction per CONTEXT.md)
 
 **Files to create:**
 - `agents/librarian/memory.go`
 - `agents/librarian/checkpoint.go`
-- `agents/librarian/compaction.go`
+- `agents/librarian/eviction_config.go`
 
 **Acceptance Criteria:**
 
 ##### Context Monitoring
 - [ ] Track context window usage percentage
-- [ ] Configurable thresholds (default: 25%, 50%, 75%)
+- [ ] Configurable thresholds (default: 25%, 50%)
 - [ ] Trigger checkpoint at each threshold
-- [ ] Trigger compaction at 75%
+- [ ] **CRITICAL**: Trigger EVICTION at 75% (per CONTEXT.md, NOT compaction)
+- [ ] Use RecencyBasedEviction strategy (ES.2) - evict oldest content first
 
 ##### Checkpoint Summaries (Onboarding-Style)
 - [ ] `CodebaseSummary` struct with onboarding information:
@@ -15177,16 +17977,16 @@ type CodebaseSummary struct {
 }
 ```
 
-##### Compaction at 75%
-- [ ] Create final checkpoint summary before compacting
-- [ ] Submit final checkpoint to Archivalist
-- [ ] Clear detailed content from context:
-  - [ ] Remove detailed file contents
-  - [ ] Remove full AST analysis results
-  - [ ] Remove verbose query results
-- [ ] Retain merged summary from all checkpoints
-- [ ] Add index noting "detailed info in Archivalist"
-- [ ] Target: ~25% context usage after compaction
+##### Eviction at 75% (per CONTEXT.md - RecencyBasedEviction)
+- [ ] Create checkpoint summary before evicting
+- [ ] Submit checkpoint to Archivalist
+- [ ] Evict 25% of context using RecencyBasedEviction (ES.2):
+  - [ ] Sort entries by age (oldest first)
+  - [ ] Evict oldest entries until 25% of tokens removed
+  - [ ] Skip preserved content types (user prompts)
+- [ ] Generate [CTX-REF-xxx] markers for evicted content (CV.3)
+- [ ] Preserve 5 most recent turns always (per CONTEXT.md)
+- [ ] Target: ~50% context usage after eviction (75% - 25%)
 
 ##### Archivalist Consultation for Agent Activity
 - [ ] `getRecentChanges(sessionID)` queries Archivalist for `engineer_result` category
@@ -15195,7 +17995,8 @@ type CodebaseSummary struct {
   - [ ] "What files did we modify?" → query `engineer_result`
   - [ ] "What has changed?" → query all agent results with time filter
   - [ ] "What did the last task do?" → query `engineer_result` by task_id
-- [ ] When compacted, query Archivalist for `librarian_checkpoint` to answer structure questions
+- [ ] When evicted, use retrieve_context skill (AR.8.1) to retrieve evicted content
+- [ ] Parse [CTX-REF-xxx] markers to identify retrievable content
 
 ```go
 // Query Archivalist for agent activity (not own context)
@@ -15643,7 +18444,7 @@ type LibrarianCacheStats struct {
 - [ ] Pre-index hook: filter excluded paths
 - [ ] Post-index hook: notify index updated event
 - [ ] Context-threshold hook: trigger checkpoint at 25%, 50%
-- [ ] Context-threshold hook: trigger checkpoint + compaction at 75%
+- [ ] EvictionTriggerHook: trigger EVICTION at 75% (per CONTEXT.md)
 
 **Tests:**
 - [ ] Index a test codebase
@@ -15652,10 +18453,10 @@ type LibrarianCacheStats struct {
 - [ ] Test skill loading on demand
 - [ ] Test checkpoint creation at 25% threshold
 - [ ] Test checkpoint submission to Archivalist
-- [ ] Test compaction at 75% threshold
-- [ ] Test post-compaction context size (~25%)
+- [ ] Test eviction trigger at 75% (per CONTEXT.md)
+- [ ] Test post-eviction context size (~50%)
 - [ ] Test Archivalist consultation for agent activity
-- [ ] Test checkpoint retrieval after compaction
+- [ ] Test context retrieval after eviction via retrieve_context skill
 - [ ] Test query cache LOCATE intent hit/miss
 - [ ] Test query cache PATTERN intent hit/miss
 - [ ] Test query cache EXPLAIN intent hit/miss
@@ -15878,22 +18679,24 @@ var AcademicTools = []ToolDefinition{
 }
 ```
 
-#### Academic Memory Management
+#### Academic Memory Management (Eviction per CONTEXT.md)
 
 **Model**: Opus 4.5
 
-**Thresholds**: 85% (checkpoint) | 95% (compact)
+**Thresholds**: 50% (checkpoint) | 80% (eviction per CONTEXT.md)
 
 **Files to create:**
 - `agents/academic/memory.go`
 - `agents/academic/research_paper.go`
+- `agents/academic/eviction_config.go`
 
 **Acceptance Criteria:**
 
 ##### Context Monitoring
 - [ ] Track context window usage percentage
-- [ ] Trigger research paper generation at 85%
-- [ ] Trigger compaction at 95%
+- [ ] Trigger research paper generation at 50%
+- [ ] **CRITICAL**: Trigger EVICTION at 80% (per CONTEXT.md, NOT compaction)
+- [ ] Use TopicClusterEviction strategy (ES.3) - cluster research by topic
 
 ##### Research Paper Summary (at 85%)
 - [ ] `AcademicResearchPaper` struct:
@@ -15923,27 +18726,32 @@ type AcademicResearchPaper struct {
 }
 ```
 
-##### Compaction at 95%
-- [ ] Create final research paper before compacting
-- [ ] Clear detailed source content from context
-- [ ] Retain summarized findings
-- [ ] Target: ~30% context usage after compaction
+##### Eviction at 80% (per CONTEXT.md - TopicClusterEviction)
+- [ ] Create research paper summary before evicting
+- [ ] Evict 30% of context using TopicClusterEviction (ES.3):
+  - [ ] Cluster related research content by topic
+  - [ ] Score clusters by completion status and recency
+  - [ ] Evict lowest-scored complete topic clusters first
+  - [ ] Preserve research_paper content type
+- [ ] Generate [CTX-REF-xxx] markers for evicted content (CV.3)
+- [ ] Preserve 3 most recent turns always (per CONTEXT.md)
+- [ ] Target: ~50% context usage after eviction (80% - 30%)
 
 #### Academic Hooks
 - [ ] Pre-research hook: check Archivalist for cached research
 - [ ] Post-research hook: cache results in Archivalist
 - [ ] Pre-ingest hook: validate source accessibility
 - [ ] Post-ingest hook: trigger embedding generation
-- [ ] Context-threshold hook: generate research paper at 85%
-- [ ] Context-threshold hook: compact at 95%
+- [ ] Context-threshold hook: generate research paper at 50%
+- [ ] EvictionTriggerHook: trigger EVICTION at 80%
 
 **Tests:**
 - [ ] Ingest test sources
 - [ ] Research query, verify output
 - [ ] Test caching in Archivalist
-- [ ] Test research paper generation at 85%
-- [ ] Test compaction at 95%
-- [ ] Test research continuity after compaction
+- [ ] Test research paper generation at 50%
+- [ ] Test eviction trigger at 80% (per CONTEXT.md)
+- [ ] Test research continuity after eviction via retrieve_context skill
 
 ### 1.3 Dynamic Tool Discovery Protocol
 
@@ -16746,7 +19554,7 @@ func (e *Engineer) triggerPipelineHandoff() error {
 
 **Handoff Flow:**
 ```
-Engineer (95%) ──────────────────────────────────────────────────────────────►
+Engineer (75%) ──────────────────────────────────────────────────────────────►
     │
     ▼
 [Build Handoff State]
@@ -16779,9 +19587,9 @@ Engineer (95%) ─────────────────────�
 - [ ] Execute file read/write task
 - [ ] Test consultation flow
 - [ ] Test help request routing
-- [ ] Test handoff trigger at 95% context
+- [ ] Test handoff trigger at 75% context (per CONTEXT.md)
 - [ ] Test handoff retry logic
-- [ ] Test handoff fallback to local compaction
+- [ ] Test handoff error handling (retries, then fail gracefully)
 - [ ] Test handoff state bundling completeness
 
 ### 2.2 Orchestrator (DAG Execution Engine)
@@ -17279,7 +20087,7 @@ skills.NewSkill("task_interact").
 
 #### Pipeline Handoff Mechanism
 
-**CRITICAL**: When Engineer hits 95% context, triggers PIPELINE HANDOFF (not local compaction).
+**CRITICAL**: When Engineer hits 75% context, triggers PIPELINE HANDOFF (not local compaction). Per CONTEXT.md specification, ALL pipeline agents (Engineer, Designer, Inspector, Tester, Orchestrator, Guide) use 75% threshold.
 
 **Files to add:**
 - `core/pipeline/handoff.go`
@@ -17342,7 +20150,7 @@ type TesterHandoffState struct {
 ```
 
 ##### Handoff Flow
-- [ ] Engineer detects 95% context usage
+- [ ] Engineer detects 75% context usage (per CONTEXT.md)
 - [ ] Engineer builds `EngineerHandoffState` (original prompt, accomplished, remaining, files)
 - [ ] Engineer sends `HANDOFF_REQUEST` to Architect (via Guide)
 - [ ] Architect examines handoff state
@@ -17357,7 +20165,7 @@ type TesterHandoffState struct {
 
 ```
 Handoff Flow:
-Engineer (95%) ──────────────────────────────────────────────────────────────►
+Engineer (75%) ──────────────────────────────────────────────────────────────►
     │
     ▼
 [Build Handoff State]
@@ -17403,7 +20211,7 @@ Engineer (95%) ─────────────────────�
 - [ ] User can trigger handoff manually via `/task <name> handoff`
 - [ ] User can stop handoff chain via `/task <name> stop_handoff`
 - [ ] Each handoff increments index for traceability
-- [ ] User-triggered handoff uses same flow as automatic (Engineer 95%)
+- [ ] User-triggered handoff uses same flow as automatic (Engineer 75%)
 
 ##### PipelineManager Handoff Methods
 - [ ] `CreateWithState(ctx, cfg, handoffState) (*Pipeline, error)` - create pipeline with inherited state
@@ -17449,7 +20257,7 @@ type PipelineManager interface {
 - [ ] Test pipeline cancellation mid-phase
 
 **Handoff Tests (TDD-Aware):**
-- [ ] Test handoff trigger at Worker 95% context
+- [ ] Test handoff trigger at Worker 75% context (per CONTEXT.md)
 - [ ] Test handoff preserves TDD phase (resumes at correct phase)
 - [ ] Test handoff preserves loop count
 - [ ] Test handoff state bundling (Worker+Inspector+Tester combined)
@@ -17841,22 +20649,24 @@ var ArchitectTools = []ToolDefinition{
 }
 ```
 
-#### Architect Memory Management
+#### Architect Memory Management (Eviction per CONTEXT.md)
 
 **Model**: OpenAI Codex 5.2
 
-**Thresholds**: 85% (checkpoint) | 95% (compact)
+**Thresholds**: 50% (checkpoint) | 85% (eviction per CONTEXT.md)
 
 **Files to create:**
 - `agents/architect/memory.go`
 - `agents/architect/workflow_summary.go`
+- `agents/architect/eviction_config.go`
 
 **Acceptance Criteria:**
 
 ##### Context Monitoring
 - [ ] Track context window usage percentage
-- [ ] Trigger workflow summary at 85%
-- [ ] Trigger compaction at 95%
+- [ ] Trigger workflow summary at 50%
+- [ ] **CRITICAL**: Trigger EVICTION at 85% (per CONTEXT.md, NOT compaction)
+- [ ] Use TaskCompletionEviction strategy (ES.4) - completed task context first
 
 ##### Workflow Summary (at 85%)
 - [ ] `ArchitectWorkflowSummary` struct (retrievable/parseable by other Architects):
@@ -17888,13 +20698,19 @@ type ArchitectWorkflowSummary struct {
 }
 ```
 
-##### Compaction at 95%
-- [ ] Create final workflow summary before compacting
-- [ ] Clear verbose conversation history from context
-- [ ] Retain workflow state and decisions
-- [ ] Target: ~30% context usage after compaction
+##### Eviction at 85% (per CONTEXT.md - TaskCompletionEviction)
+- [ ] Create workflow summary before evicting
+- [ ] Evict 25% of context using TaskCompletionEviction (ES.4):
+  - [ ] Group entries by task affiliation (task IDs, completion markers)
+  - [ ] Evict completed task context first
+  - [ ] Preserve active/pending task context
+  - [ ] Fall back to recency for non-task content
+  - [ ] Preserve plan_workflow content type
+- [ ] Generate [CTX-REF-xxx] markers for evicted content (CV.3)
+- [ ] Preserve 5 most recent turns always (per CONTEXT.md)
+- [ ] Target: ~60% context usage after eviction (85% - 25%)
 
-##### Pipeline Handoff Handling
+##### Pipeline Handoff Handling (receiving from other agents)
 - [ ] Receive `HANDOFF_REQUEST` from Engineer (via Guide)
 - [ ] Examine handoff state, adjust workflow if needed
 - [ ] Send `CREATE_PIPELINE_WITH_STATE` to Orchestrator (via Guide)
@@ -17907,9 +20723,9 @@ type ArchitectWorkflowSummary struct {
 - [ ] Post-execute hook: update session state
 - [ ] Pre-interrupt hook: pause current work gracefully
 - [ ] Post-complete hook: generate and store summary
-- [ ] Context-threshold hook: generate workflow summary at 85%
-- [ ] Context-threshold hook: compact at 95%
-- [ ] Handoff hook: handle pipeline handoff requests
+- [ ] Context-threshold hook: generate workflow summary at 50%
+- [ ] EvictionTriggerHook: trigger EVICTION at 85%
+- [ ] Handoff hook: handle pipeline handoff requests from other agents
 
 **Tests:**
 - [ ] Generate plan from request
@@ -17917,8 +20733,8 @@ type ArchitectWorkflowSummary struct {
 - [ ] Test user modification flow
 - [ ] Test interrupt handling
 - [ ] Test clarification routing
-- [ ] Test workflow summary generation at 85%
-- [ ] Test compaction at 95%
+- [ ] Test workflow summary generation at 50%
+- [ ] Test eviction trigger at 85% (per CONTEXT.md)
 - [ ] Test pipeline handoff request handling
 
 ---
@@ -18366,21 +21182,23 @@ var InspectorTools = []ToolDefinition{
 - [ ] Pre-deep-analysis hook: check if analysis already cached
 - [ ] Post-corrections hook: format corrections for Architect
 
-#### Memory Management (Local Compaction)
+#### Memory Management (Handoff per CONTEXT.md)
 
 **Model**: OpenAI Codex 5.2
 
-**NOTE**: Inspector compacts LOCALLY. It does NOT trigger pipeline handoff (only Engineer can).
+**NOTE**: Per CONTEXT.md, Inspector triggers PIPELINE HANDOFF at 75% (not compaction). ALL pipeline agents use handoff.
 
 **Files to add:**
 - `agents/inspector/memory.go`
+- `agents/inspector/handoff_integration.go`
 
 **Acceptance Criteria:**
 - [ ] Context usage monitoring (poll every response)
-- [ ] At 85% threshold: checkpoint to Archivalist
-- [ ] At 95% threshold: compact locally (NOT trigger handoff)
+- [ ] At 50% threshold: checkpoint to Archivalist
+- [ ] **CRITICAL**: At 75% threshold: trigger PIPELINE HANDOFF (per CONTEXT.md)
+- [ ] Use InspectorHandoffState (defined in Phase 2 Pipeline Handoff section)
 - [ ] Checkpoint includes: findings summary, resolved issues, unresolved issues, priorities, fix references
-- [ ] If Engineer triggers handoff, Inspector participates in state transfer
+- [ ] Handoff preserves validation state for new Inspector instance
 
 ```go
 // Inspector checkpoint summary (sent to Archivalist at 85%)
@@ -18427,12 +21245,12 @@ type InspectorHandoffState struct {
 func (i *Inspector) checkContextAndManage() error {
     usage := i.getContextUsage()
 
-    if usage >= 0.95 {
-        // Compact locally - DO NOT trigger handoff
-        return i.compactLocally()
+    if usage >= 0.75 {
+        // CRITICAL: Trigger pipeline handoff (per CONTEXT.md)
+        return i.triggerPipelineHandoff()
     }
 
-    if usage >= 0.85 {
+    if usage >= 0.50 {
         // Checkpoint to Archivalist
         return i.submitCheckpoint()
     }
@@ -18446,9 +21264,9 @@ func (i *Inspector) checkContextAndManage() error {
 - [ ] Verify issue detection
 - [ ] Test override flow
 - [ ] Test corrections generation
-- [ ] Test checkpoint at 85% context
-- [ ] Test local compaction at 95% context
-- [ ] Test handoff state bundling when Engineer triggers handoff
+- [ ] Test checkpoint at 50% context
+- [ ] Test handoff trigger at 75% context (per CONTEXT.md)
+- [ ] Test handoff state preservation for new Inspector instance
 
 ### 4.2 Tester (Test Planner & Executor)
 
@@ -18941,21 +21759,23 @@ var TesterTools = []ToolDefinition{
 - [ ] Pre-analysis hook: load similar failures from Archivalist
 - [ ] Post-corrections hook: format for Architect
 
-#### Memory Management (Local Compaction)
+#### Memory Management (Handoff per CONTEXT.md)
 
 **Model**: OpenAI Codex 5.2
 
-**NOTE**: Tester compacts LOCALLY. It does NOT trigger pipeline handoff (only Engineer can).
+**NOTE**: Per CONTEXT.md, Tester triggers PIPELINE HANDOFF at 75% (not compaction). ALL pipeline agents use handoff.
 
 **Files to add:**
 - `agents/tester/memory.go`
+- `agents/tester/handoff_integration.go`
 
 **Acceptance Criteria:**
 - [ ] Context usage monitoring (poll every response)
-- [ ] At 85% threshold: checkpoint to Archivalist
-- [ ] At 95% threshold: compact locally (NOT trigger handoff)
+- [ ] At 50% threshold: checkpoint to Archivalist
+- [ ] **CRITICAL**: At 75% threshold: trigger PIPELINE HANDOFF (per CONTEXT.md)
+- [ ] Use TesterHandoffState (defined in Phase 2 Pipeline Handoff section)
 - [ ] Checkpoint includes: tests created, tests run, pass/fail status, failure descriptions
-- [ ] If Engineer triggers handoff, Tester participates in state transfer
+- [ ] Handoff preserves test state for new Tester instance
 
 ```go
 // Tester checkpoint summary (sent to Archivalist at 85%)
@@ -19013,12 +21833,12 @@ type TesterHandoffState struct {
 func (t *Tester) checkContextAndManage() error {
     usage := t.getContextUsage()
 
-    if usage >= 0.95 {
-        // Compact locally - DO NOT trigger handoff
-        return t.compactLocally()
+    if usage >= 0.75 {
+        // CRITICAL: Trigger pipeline handoff (per CONTEXT.md)
+        return t.triggerPipelineHandoff()
     }
 
-    if usage >= 0.85 {
+    if usage >= 0.50 {
         // Checkpoint to Archivalist
         return t.submitCheckpoint()
     }
@@ -19032,9 +21852,9 @@ func (t *Tester) checkContextAndManage() error {
 - [ ] Execute tests
 - [ ] Analyze failures
 - [ ] Test skip conditions
-- [ ] Test checkpoint at 85% context
-- [ ] Test local compaction at 95% context
-- [ ] Test handoff state bundling when Engineer triggers handoff
+- [ ] Test checkpoint at 50% context
+- [ ] Test handoff trigger at 75% context (per CONTEXT.md)
+- [ ] Test handoff state preservation for new Tester instance
 
 ---
 
@@ -19951,19 +22771,20 @@ New agent for UI/UX implementation tasks.
 - [ ] Pre-styling hook: validate design token availability
 - [ ] Post-styling hook: trigger accessibility check
 
-#### Memory Management & Pipeline Handoff
+#### Memory Management & Pipeline Handoff (per CONTEXT.md)
 
 **Model**: Gemini 3 Pro
 
-**CRITICAL**: At 95%, Designer triggers PIPELINE HANDOFF, NOT local compaction.
+**CRITICAL**: At 75%, Designer triggers PIPELINE HANDOFF (per CONTEXT.md specification).
 
 **Files to add:**
 - `agents/designer/memory.go`
 - `agents/designer/handoff.go`
+- `agents/designer/handoff_integration.go`
 
 **Acceptance Criteria:**
 - [ ] Context usage monitoring (poll every response)
-- [ ] At 95% threshold: trigger pipeline handoff sequence
+- [ ] **CRITICAL**: At 75% threshold: trigger pipeline handoff sequence (per CONTEXT.md)
 - [ ] Bundle complete handoff state: original prompt + accomplished + remaining + components created/modified
 - [ ] Include design-specific state: token usage, component changes, a11y issues
 - [ ] Send `HANDOFF_REQUEST` to Architect (via Guide) with bundled state
@@ -20129,19 +22950,19 @@ Designer (95%) ─────────────────────�
                                                     [HANDOFF_COMPLETE] ──► Architect ──► Designer
 ```
 
-#### UIInspector Memory Management
+#### UIInspector Memory Management (Handoff per CONTEXT.md)
 
 **Model**: OpenAI Codex 5.2
 
-**Thresholds**: 85% (checkpoint) | 95% (compact locally)
+**Thresholds**: 50% (checkpoint) | 75% (handoff per CONTEXT.md)
 
-**NOTE**: UIInspector compacts LOCALLY. It does NOT trigger pipeline handoff (only Designer can).
+**NOTE**: Per CONTEXT.md, UIInspector triggers PIPELINE HANDOFF at 75% (not compaction). ALL pipeline agents use handoff.
 
 **Acceptance Criteria:**
 - [ ] Context usage monitoring (poll every response)
-- [ ] At 85% threshold: checkpoint summary to Archivalist
-- [ ] At 95% threshold: summarize + send to Archivalist + compact locally
-- [ ] If Designer triggers handoff, UIInspector participates in state transfer
+- [ ] At 50% threshold: checkpoint summary to Archivalist
+- [ ] **CRITICAL**: At 75% threshold: trigger PIPELINE HANDOFF (per CONTEXT.md)
+- [ ] When Designer triggers handoff, UIInspector participates in state transfer
 
 **Checkpoint Summary:**
 ```go
@@ -20168,23 +22989,23 @@ type UIInspectorFindingsSummary struct {
 **Archivalist Category**: `ui_inspector_findings`
 
 **Tests:**
-- [ ] Test checkpoint at 85% context
-- [ ] Test local compaction at 95% context
+- [ ] Test checkpoint at 50% context
+- [ ] Test handoff trigger at 75% context (per CONTEXT.md)
 - [ ] Test handoff state bundling when Designer triggers handoff
 
-#### UITester Memory Management
+#### UITester Memory Management (Handoff per CONTEXT.md)
 
 **Model**: OpenAI Codex 5.2
 
-**Thresholds**: 85% (checkpoint) | 95% (compact locally)
+**Thresholds**: 50% (checkpoint) | 75% (handoff per CONTEXT.md)
 
-**NOTE**: UITester compacts LOCALLY. It does NOT trigger pipeline handoff (only Designer can).
+**NOTE**: Per CONTEXT.md, UITester triggers PIPELINE HANDOFF at 75% (not compaction). ALL pipeline agents use handoff.
 
 **Acceptance Criteria:**
 - [ ] Context usage monitoring (poll every response)
-- [ ] At 85% threshold: checkpoint summary to Archivalist
-- [ ] At 95% threshold: summarize + send to Archivalist + compact locally
-- [ ] If Designer triggers handoff, UITester participates in state transfer
+- [ ] At 50% threshold: checkpoint summary to Archivalist
+- [ ] **CRITICAL**: At 75% threshold: trigger PIPELINE HANDOFF (per CONTEXT.md)
+- [ ] When Designer triggers handoff, UITester participates in state transfer
 
 **Checkpoint Summary:**
 ```go
@@ -20209,8 +23030,8 @@ type UITesterSummary struct {
 **Archivalist Category**: `ui_tester_summary`
 
 **Tests:**
-- [ ] Test checkpoint at 85% context
-- [ ] Test local compaction at 95% context
+- [ ] Test checkpoint at 50% context
+- [ ] Test handoff trigger at 75% context (per CONTEXT.md)
 - [ ] Test handoff state bundling when Designer triggers handoff
 
 **Tests:**
@@ -20218,9 +23039,9 @@ type UITesterSummary struct {
 - [ ] All core skills work correctly
 - [ ] Guide routes to Designer appropriately
 - [ ] Designer/Engineer handoff works
-- [ ] Test handoff trigger at 95% context
+- [ ] Test handoff trigger at 75% context (per CONTEXT.md)
 - [ ] Test handoff retry logic
-- [ ] Test handoff fallback to local compaction
+- [ ] Test handoff state preservation for new Designer instance
 - [ ] Test handoff state bundling completeness (Designer + UIInspector + UITester)
 
 ---
@@ -24385,11 +27206,13 @@ Main Orchestrator agent with system prompt and initialization.
 - [ ] Registers skills
 - [ ] Registers Guide routes
 
-#### Compaction Handling
-- [ ] Triggers at 95% context window OR workflow completion
-- [ ] DAG continues during compaction
-- [ ] LLM waits for compaction before new prompts
-- [ ] Generates OrchestratorSummary → Archivalist
+#### Handoff Handling (per CONTEXT.md)
+- [ ] **CRITICAL**: Triggers PIPELINE HANDOFF at 75% context (per CONTEXT.md)
+- [ ] Uses OrchestratorHandoffState (PH.2) for state transfer
+- [ ] DAG continues during handoff transition
+- [ ] New Orchestrator instance receives injected state
+- [ ] Generates OrchestratorSummary → Archivalist before handoff
+- [ ] Workflow completion triggers summary (not handoff)
 
 #### Core Properties
 - [ ] Read-only: only observes, doesn't control
@@ -24402,7 +27225,7 @@ Main Orchestrator agent with system prompt and initialization.
 - [ ] System prompt included in context
 - [ ] Skills registered and accessible
 - [ ] Guide routes registered
-- [ ] Compaction triggers correctly
+- [ ] Handoff triggers at 75% context (per CONTEXT.md)
 - [ ] Model is Haiku as specified
 
 ---
@@ -24441,10 +27264,11 @@ End-to-end tests for Orchestrator functionality.
 - [ ] Architect cancels task → Orchestrator accepts → DAG updated
 - [ ] Architect launches variant → Orchestrator accepts → variant created
 
-#### Compaction Flow
-- [ ] Context reaches 95% → compaction triggers
-- [ ] DAG continues during compaction
-- [ ] Summary generated correctly
+#### Handoff Flow (per CONTEXT.md)
+- [ ] Context reaches 75% → handoff triggers (per CONTEXT.md)
+- [ ] DAG continues during handoff transition
+- [ ] OrchestratorHandoffState (PH.2) built correctly
+- [ ] New Orchestrator instance receives state
 - [ ] Summary reaches Archivalist
 
 #### Crash Recovery Flow
@@ -24457,7 +27281,7 @@ End-to-end tests for Orchestrator functionality.
 - [ ] No buffer leaks (cleared on completion)
 - [ ] Health signals accurate
 - [ ] Routing correct for all message types
-- [ ] Compaction doesn't lose running task data
+- [ ] Handoff doesn't lose running task data (per CONTEXT.md)
 - [ ] Recovery resumes from correct state
 - [ ] Performance: status query < 10ms
 - [ ] Task events submitted to Archivalist on completion/failure/cancellation
@@ -26975,7 +29799,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   - 4-level graduated response: NORMAL → ELEVATED → HIGH → CRITICAL             ││
 │ │   - Admission control (gate new pipelines under pressure)                       ││
 │ │   - Cache eviction by percentage                                                ││
-│ │   - LLM context compaction signaling                                            ││
+│ │   - LLM context eviction/handoff signaling (per CONTEXT.md)                     ││
 │ │   - Pipeline suspension by priority                                             ││
 │ │   - OS agnostic (runtime.MemStats only)                                         ││
 │ │                                                                                  ││
@@ -27302,8 +30126,839 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   - LLMRequestCoordinator becomes single entry point for all LLM requests       ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 60-70 parallel engineer pipelines (increased for CF system)    │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4L: Document Search System (DS.1-DS.13)                          ││
+│ │ ** REQUIRED: Foundation for Adaptive Retrieval System in CONTEXT.md **          ││
+│ │ ** Bleve full-text, CMT manifest, go-git, hybrid retrieval **                   ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - type definitions, no interdependencies):                ││
+│ │ • DS.1.1 Base Document Types (core/search/document.go)                          ││
+│ │ • DS.1.2 LLM Communication Document Types (core/search/llm_document.go)         ││
+│ │ • DS.1.3 Web Fetch Document Type (core/search/web_document.go)                  ││
+│ │ • DS.1.4 Git Commit Document Type (core/search/git_document.go)                 ││
+│ │ • DS.1.5 Document Collection Types (core/search/collection.go)                  ││
+│ │ • DS.1.6 Search Result Types (core/search/result.go)                            ││
+│ │                                                                                  ││
+│ │ PHASE 2 (All parallel - Bleve analyzers, no interdependencies):                 ││
+│ │ • DS.2.1 Custom Code Tokenizer (core/search/analyzer/tokenizer.go)              ││
+│ │ • DS.2.2 CamelCase Token Filter (core/search/analyzer/camel_case.go)            ││
+│ │ • DS.2.3 SnakeCase Token Filter (core/search/analyzer/snake_case.go)            ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After DS.2.1-2.3):                                                     ││
+│ │ • DS.2.4 Code Analyzer Assembly (core/search/analyzer/code_analyzer.go)         ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After DS.2.4 + DS.1.x):                                                ││
+│ │ • DS.2.5 Bleve Index Schema (core/search/bleve/schema.go)                       ││
+│ │ • DS.2.6 Bleve Index Manager (core/search/bleve/index_manager.go)               ││
+│ │                                                                                  ││
+│ │ PHASE 5 (All parallel - parsers, no interdependencies):                         ││
+│ │ • DS.3.1 File Scanner (core/search/indexer/scanner.go)                          ││
+│ │ • DS.3.2 Language-Specific Parsers (core/search/parser/*.go)                    ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After DS.3.1, DS.3.2, DS.2.6):                                         ││
+│ │ • DS.3.3 Document Builder (core/search/indexer/builder.go)                      ││
+│ │ • DS.3.4 Batch Indexer (core/search/indexer/batch_indexer.go)                   ││
+│ │ • DS.3.5 Incremental Indexer (core/search/indexer/incremental.go)               ││
+│ │ • DS.3.6 Full Reindex Pipeline (core/search/indexer/reindex.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 7 (All parallel - change detection, no interdependencies):                ││
+│ │ • DS.4.1 fsnotify Watcher (core/search/watcher/fsnotify.go)                     ││
+│ │ • DS.4.2 Git Hook Integration (core/search/watcher/git_hook.go)                 ││
+│ │ • DS.4.3 Checksum Validator (core/search/watcher/checksum.go)                   ││
+│ │ • DS.4.4 Periodic Scanner (core/search/watcher/periodic.go)                     ││
+│ │                                                                                  ││
+│ │ PHASE 8 (After DS.4.1-4.4):                                                     ││
+│ │ • DS.4.5 Change Detection Coordinator (core/search/watcher/coordinator.go)      ││
+│ │                                                                                  ││
+│ │ PHASE 9 (All parallel - CMT foundation, no interdependencies):                  ││
+│ │ • DS.5.1 CMT Node Types (core/search/cmt/types.go)                              ││
+│ │ • DS.5.5 CMT WAL (core/search/cmt/wal.go)                                       ││
+│ │ • DS.5.6 CMT SQLite Storage (core/search/cmt/sqlite_storage.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 10 (After DS.5.1):                                                        ││
+│ │ • DS.5.3 CMT Split and Merge (core/search/cmt/treap.go)                         ││
+│ │ • DS.5.4 CMT Merkle Hash Computation (core/search/cmt/merkle.go)                ││
+│ │                                                                                  ││
+│ │ PHASE 11 (After DS.5.3, DS.5.4, DS.5.5, DS.5.6):                                ││
+│ │ • DS.5.2 CMT Operations (core/search/cmt/cmt.go)                                ││
+│ │                                                                                  ││
+│ │ PHASE 12 (After DS.5.2):                                                        ││
+│ │ • DS.5.7 CMT Corruption Detection (core/search/cmt/integrity.go)                ││
+│ │ • DS.5.8 CMT Recovery (core/search/cmt/recovery.go)                             ││
+│ │                                                                                  ││
+│ │ PHASE 13 (All parallel - go-git, no interdependencies):                         ││
+│ │ • DS.6.1 Git Client Wrapper (core/search/git/client.go)                         ││
+│ │ • DS.6.2 Git File History (core/search/git/history.go)                          ││
+│ │ • DS.6.3 Git Blame Integration (core/search/git/blame.go)                       ││
+│ │ • DS.6.4 Git Diff Support (core/search/git/diff.go)                             ││
+│ │ • DS.6.5 Git Modified Files Detection (core/search/git/modified.go)             ││
+│ │                                                                                  ││
+│ │ PHASE 14 (After DS.6.1-6.5):                                                    ││
+│ │ • DS.6.6 Git Integration Manager (core/search/git/manager.go)                   ││
+│ │                                                                                  ││
+│ │ PHASE 15 (After DS.5.2, DS.6.6 - parallel):                                     ││
+│ │ • DS.7.1 Cross-Validator Types (core/search/validation/types.go)                ││
+│ │ • DS.7.2 Three-Source Validator (core/search/validation/validator.go)           ││
+│ │ • DS.7.3 Discrepancy Resolution (core/search/validation/resolution.go)          ││
+│ │ • DS.7.4 Validation Scheduler (core/search/validation/scheduler.go)             ││
+│ │                                                                                  ││
+│ │ PHASE 16 (After DS.5.2 - parallel with 15):                                     ││
+│ │ • DS.8.1 Staleness Types (core/search/staleness/types.go)                       ││
+│ │ • DS.8.2 Hybrid Staleness Detector (core/search/staleness/detector.go)          ││
+│ │ • DS.8.3 CMT Root Hash Check (core/search/staleness/cmt_check.go)               ││
+│ │ • DS.8.4 Mtime Sampling (core/search/staleness/mtime_sample.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 17 (After DS.2.6 - parallel):                                             ││
+│ │ • DS.9.1 Search Coordinator Types (core/search/coordinator/types.go)            ││
+│ │ • DS.9.3 Reciprocal Rank Fusion (core/search/coordinator/rrf.go)                ││
+│ │ • DS.9.4 Vector DB Adapter (core/search/coordinator/vector_adapter.go)          ││
+│ │ • DS.9.5 Search Cache (core/search/coordinator/cache.go)                        ││
+│ │                                                                                  ││
+│ │ PHASE 18 (After DS.9.1, DS.9.3, DS.9.4, DS.9.5):                                ││
+│ │ • DS.9.2 Search Coordinator (core/search/coordinator/coordinator.go)            ││
+│ │                                                                                  ││
+│ │ PHASE 19 (All parallel - resource integration):                                 ││
+│ │ • DS.10.1 GoroutineBudget Integration (core/search/resource/goroutine.go)       ││
+│ │ • DS.10.2 FileHandleBudget Integration (core/search/resource/filehandle.go)     ││
+│ │ • DS.10.3 PressureController Integration (core/search/resource/pressure.go)     ││
+│ │                                                                                  ││
+│ │ PHASE 20 (After all prior phases):                                              ││
+│ │ • DS.10.4 SearchSystem Facade (core/search/search_system.go)                    ││
+│ │                                                                                  ││
+│ │ PHASE 21 (After DS.10.4 - parallel):                                            ││
+│ │ • DS.11.1 Search Message Types (core/search/agent/messages.go)                  ││
+│ │ • DS.11.2 Guide Router Integration (agents/guide/router.go)                     ││
+│ │ • DS.11.3 Librarian Search Integration (agents/librarian/search.go)             ││
+│ │ • DS.11.4 Agent Search Skills (skills/search_skills.go)                         ││
+│ │ • DS.11.5 Session Context Integration (core/session/context.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 22 (After DS.10.4 - parallel):                                            ││
+│ │ • DS.12.1 Search CLI Command (cmd/sylk/search.go)                               ││
+│ │ • DS.12.2 Index CLI Command (cmd/sylk/index.go)                                 ││
+│ │ • DS.12.3 Git Search CLI Commands (cmd/sylk/git.go)                             ││
+│ │ • DS.12.4 Interactive Search Mode (cmd/sylk/interactive_search.go)              ││
+│ │                                                                                  ││
+│ │ PHASE 23 (After ALL complete):                                                  ││
+│ │ • DS.13 Document Search Integration Tests                                       ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/search/document.go, llm_document.go, web_document.go, git_document.go   ││
+│ │   core/search/collection.go, result.go, search_system.go                        ││
+│ │   core/search/analyzer/*.go (tokenizer, camel_case, snake_case, code_analyzer)  ││
+│ │   core/search/bleve/schema.go, index_manager.go                                 ││
+│ │   core/search/indexer/*.go (scanner, builder, batch_indexer, incremental)       ││
+│ │   core/search/parser/*.go (go, typescript, python, markdown, config)            ││
+│ │   core/search/watcher/*.go (fsnotify, git_hook, checksum, periodic, coordinator)││
+│ │   core/search/cmt/*.go (types, cmt, treap, merkle, wal, sqlite_storage)         ││
+│ │   core/search/git/*.go (client, history, blame, diff, modified, manager)        ││
+│ │   core/search/validation/*.go (types, validator, resolution, scheduler)         ││
+│ │   core/search/staleness/*.go (types, detector, cmt_check, mtime_sample)         ││
+│ │   core/search/coordinator/*.go (types, coordinator, rrf, vector_adapter, cache) ││
+│ │   core/search/resource/*.go (goroutine, filehandle, pressure)                   ││
+│ │   core/search/agent/messages.go                                                 ││
+│ │   skills/search_skills.go                                                       ││
+│ │   cmd/sylk/search.go, index.go, git.go, interactive_search.go                   ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - Bleve full-text search with code-aware tokenization                         ││
+│ │   - CamelCase and SnakeCase token splitting                                     ││
+│ │   - Cartesian Merkle Tree manifest for O(log n) updates, O(1) root verification ││
+│ │   - WAL for crash recovery                                                      ││
+│ │   - Pure-Go git integration via go-git/v5                                       ││
+│ │   - Three-source cross-validation (filesystem, CMT, git)                        ││
+│ │   - Hybrid staleness detection (CMT root, git commit, mtime, content hash)      ││
+│ │   - Reciprocal Rank Fusion for hybrid Bleve + Vector search                     ││
+│ │   - Resource budget integration (goroutine, file handle, pressure)              ││
+│ │   - Session-scoped search context                                               ││
+│ │   - CLI commands: sylk search, sylk index, sylk git                             ││
+│ │   - Interactive TUI search mode                                                 ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (6 parallel) → Phase 2 (3 parallel) → Phase 3 → Phase 4 (2 parallel)  ││
+│ │   Phase 5 (2 parallel) → Phase 6 (4 parallel) → Phase 7 (4 parallel) → Phase 8  ││
+│ │   Phase 9 (3 parallel) → Phase 10 (2 parallel) → Phase 11 → Phase 12 (2 par)    ││
+│ │   Phase 13 (5 parallel) → Phase 14                                              ││
+│ │   Phase 15 (4 par) + Phase 16 (4 par) + Phase 17 (4 par) can run in parallel    ││
+│ │   Phase 18 → Phase 19 (3 par) → Phase 20 → Phase 21 (5 par) + Phase 22 (4 par)  ││
+│ │   Phase 23 (tests) after all                                                    ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - github.com/blevesearch/bleve/v2 (full-text search)                          ││
+│ │   - github.com/go-git/go-git/v5 (pure-Go git)                                   ││
+│ │   - github.com/fsnotify/fsnotify (file system notifications)                    ││
+│ │   - Existing VectorGraphDB (for hybrid search)                                  ││
+│ │   - Existing GoroutineBudget, FileHandleBudget, PressureController (Wave 4)     ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Integrates with Librarian for codebase search queries                       ││
+│ │   - Integrates with Session Management for session-scoped context               ││
+│ │   - Integrates with VectorGraphDB for semantic search                           ││
+│ │   - Integrates with Resource Management (4G, 4H, 4F) for budgets/pressure       ││
+│ │   - REQUIRED FOR: Adaptive Retrieval System (see CONTEXT.md)                    ││
+│ │   - CLI integrates with existing cmd/sylk structure                             ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                      ││
+│ │   This was moved from Wave 5 because the Adaptive Retrieval System              ││
+│ │   (speculative prefetch, tiered search, hybrid Bleve+Vector) requires Bleve     ││
+│ │   as a foundation. The adaptive system integrates with WAVE 4 robustness        ││
+│ │   systems (GoroutineBudget, FileHandleBudget, PressureController, etc.)         ││
+│ │   and therefore Document Search must be implemented in Wave 4.                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 70-80 parallel engineer pipelines (increased for DS system)    │
 │ DEPENDENCIES: Wave 3 complete (including 3D FILESYSTEM and 3E Tree-Sitter)         │
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4M: Adaptive Retrieval System (AR.1-AR.14)                        ││
+│ │ ** DEPENDS ON: Group 4L (Document Search System) **                              ││
+│ │ ** ARCHITECTURE: See CONTEXT.md "Architecture Gap Analysis" section **           ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - type definitions, no interdependencies):                 ││
+│ │ • AR.1.1 Adaptive State Types (core/context/adaptive_types.go)                   ││
+│ │   - RobustWeightDistribution struct with Beta distribution                       ││
+│ │   - AdaptiveState struct (weights, thresholds, context discovery)                ││
+│ │   - EpisodeObservation struct for learning                                       ││
+│ │   - UpdateConfig for robust update parameters                                    ││
+│ │   - TaskContext, ContextBias, UserProfile types                                  ││
+│ │   ACCEPTANCE: All types compile, msgpack serializable, < 2KB serialized          ││
+│ │   FILES: core/context/adaptive_types.go                                          ││
+│ │                                                                                  ││
+│ │ • AR.1.2 Retrieval Result Types (core/context/retrieval_types.go)                ││
+│ │   - AugmentedQuery struct (excerpts, summaries, metadata)                        ││
+│ │   - Excerpt struct with confidence, source, tokens                               ││
+│ │   - RetrievalResult struct with entries, references                              ││
+│ │   - SearchTier enum (Hot, Warm, Full)                                            ││
+│ │   - RetrievalBudget struct for per-session limits                                ││
+│ │   ACCEPTANCE: Types compile, JSON serializable, documented                       ││
+│ │   FILES: core/context/retrieval_types.go                                         ││
+│ │                                                                                  ││
+│ │ • AR.1.3 Protocol Types (core/context/protocol_types.go)                         ││
+│ │   - ContextShareRequest/Response structs                                         ││
+│ │   - ConsultationRequest/Response structs                                         ││
+│ │   - PrefetchSharePayload struct                                                  ││
+│ │   - HandoffContextPayload struct                                                 ││
+│ │   - ContextPriority enum (Low, Normal, High, Critical)                           ││
+│ │   ACCEPTANCE: Types compile, all fields documented, JSON tags present            ││
+│ │   FILES: core/context/protocol_types.go                                          ││
+│ │                                                                                  ││
+│ │ • AR.1.4 Hook Data Types (core/context/hook_types.go)                            ││
+│ │   - PromptHookData struct with all fields from CONTEXT.md                        ││
+│ │   - ToolCallHookData struct with all fields                                      ││
+│ │   - HookPriority constants (First=0, Early=25, Normal=50, Late=75, Last=100)     ││
+│ │   - Hook interface and registration types                                        ││
+│ │   ACCEPTANCE: Types match ARCHITECTURE.md patterns, compile clean                ││
+│ │   FILES: core/context/hook_types.go                                              ││
+│ │                                                                                  ││
+│ │ PHASE 2 (All parallel - WAVE 4 integration wrappers):                            ││
+│ │ • AR.2.1 SafeChan Observation Channel (core/context/observation_channel.go)      ││
+│ │   - Wrap safechan.SafeChan[EpisodeObservation]                                   ││
+│ │   - Context-aware send/receive                                                   ││
+│ │   - Bounded buffer (100 observations)                                            ││
+│ │   - Graceful close handling                                                      ││
+│ │   ACCEPTANCE: Uses SafeChan (not raw channel), context cancellation works        ││
+│ │   EXISTING CODE: core/concurrency/safechan/safechan.go                           ││
+│ │   FILES: core/context/observation_channel.go                                     ││
+│ │                                                                                  ││
+│ │ • AR.2.2 GoroutineScope Prefetch Wrapper (core/context/prefetch_scope.go)        ││
+│ │   - TrackedPrefetchFuture with Operation tracking                                ││
+│ │   - StartSpeculative using scope.Go(), not raw go                                ││
+│ │   - Timeout enforcement (200ms budget)                                           ││
+│ │   - ResourceTracker integration                                                  ││
+│ │   ACCEPTANCE: No raw 'go' statements, linter passes, operations tracked          ││
+│ │   EXISTING CODE: core/concurrency/goroutine_scope.go, resource_tracker.go        ││
+│ │   FILES: core/context/prefetch_scope.go                                          ││
+│ │                                                                                  ││
+│ │ • AR.2.3 FileHandleBudget Resource Wrapper (core/context/retrieval_resources.go) ││
+│ │   - RetrievalResources struct wrapping file handles                              ││
+│ │   - Acquire/Release for WAL, state, Bleve, VectorDB handles                      ││
+│ │   - Integration with AgentFileBudget                                             ││
+│ │   - Proper cleanup on Close()                                                    ││
+│ │   ACCEPTANCE: All file handles tracked, no leaks on agent termination            ││
+│ │   EXISTING CODE: core/resources/file_handle_budget.go                            ││
+│ │   FILES: core/context/retrieval_resources.go                                     ││
+│ │                                                                                  ││
+│ │ • AR.2.4 CircuitBreaker Registration (core/context/search_circuit_breakers.go)   ││
+│ │   - Register "bleve-search" circuit breaker                                      ││
+│ │   - Register "vector-search" circuit breaker                                     ││
+│ │   - Config: FailureThreshold=5, ResetTimeout=30s, HalfOpenMax=2                  ││
+│ │   - Integration with GlobalCircuitBreakerRegistry                                ││
+│ │   ACCEPTANCE: Uses existing registry (not new breakers), state persists          ││
+│ │   EXISTING CODE: core/llm/circuit_breaker.go, global_circuit_breaker.go          ││
+│ │   FILES: core/context/search_circuit_breakers.go                                 ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After AR.1.x - Bayesian learning core):                                 ││
+│ │ • AR.3.1 RobustWeightDistribution Implementation (core/context/robust_weight.go) ││
+│ │   - Sample() using Thompson sampling (Beta distribution)                         ││
+│ │   - Update() with outlier rejection (> 3 sigma)                                  ││
+│ │   - Exponential decay (configurable half-life)                                   ││
+│ │   - Cold start protection (minimum effective samples)                            ││
+│ │   - Prior drift for non-stationarity                                             ││
+│ │   ACCEPTANCE: Unit tests pass, convergence test (1000 iterations < 5% error)     ││
+│ │   FILES: core/context/robust_weight.go, robust_weight_test.go                    ││
+│ │                                                                                  ││
+│ │ • AR.3.2 Context Discovery (core/context/context_discovery.go)                   ││
+│ │   - Embedding-based context classification                                       ││
+│ │   - Keyword cache for fast path (< 1μs)                                          ││
+│ │   - Centroid management (max 10 contexts)                                        ││
+│ │   - Context-specific bias learning                                               ││
+│ │   - Cosine similarity for nearest centroid                                       ││
+│ │   ACCEPTANCE: Keyword cache < 1μs, centroid lookup < 100μs, bounded memory       ││
+│ │   FILES: core/context/context_discovery.go, context_discovery_test.go            ││
+│ │                                                                                  ││
+│ │ • AR.3.3 User Profile Learning (core/context/user_profile.go)                    ││
+│ │   - PrefersThorough, ToleratesSearches tracking                                  ││
+│ │   - WastePenaltyMult, StrugglePenaltyMult adjustment                             ││
+│ │   - Minimum observation threshold (5) before applying                            ││
+│ │   - Clamping to safe ranges                                                      ││
+│ │   ACCEPTANCE: Values stay within bounds, no NaN/Inf, persistence works           ││
+│ │   FILES: core/context/user_profile.go, user_profile_test.go                      ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After AR.3.1-3.3):                                                      ││
+│ │ • AR.3.4 AdaptiveState Implementation (core/context/adaptive_state.go)           ││
+│ │   - NewAdaptiveState() with default priors                                       ││
+│ │   - SampleWeights() with Thompson sampling                                       ││
+│ │   - SampleThresholds() for dynamic thresholds                                    ││
+│ │   - UpdateFromOutcome() coordinating all updates                                 ││
+│ │   - MarshalBinary/UnmarshalBinary for persistence                                ││
+│ │   - LoadOrInit() for startup                                                     ││
+│ │   - SavePeriodically() background persistence                                    ││
+│ │   ACCEPTANCE: Serialized size < 2KB, load/save round-trip preserves state        ││
+│ │   FILES: core/context/adaptive_state.go, adaptive_state_test.go                  ││
+│ │                                                                                  ││
+│ │ PHASE 5 (All parallel - observation and tracking):                               ││
+│ │ • AR.4.1 Episode Tracker (core/context/episode_tracker.go)                       ││
+│ │   - StartEpisode() initializes observation                                       ││
+│ │   - RecordSearch() tracks post-prefetch searches                                 ││
+│ │   - RecordToolCall() tracks tool invocations                                     ││
+│ │   - FinalizeEpisode() computes behavioral signals                                ││
+│ │   - InferSatisfaction() from behavioral signals                                  ││
+│ │   ACCEPTANCE: All signals captured, thread-safe, no unbounded growth             ││
+│ │   FILES: core/context/episode_tracker.go, episode_tracker_test.go                ││
+│ │                                                                                  ││
+│ │ • AR.4.2 Observation Log (WAL) (core/context/observation_log.go)                 ││
+│ │   - Write-ahead log for crash recovery                                           ││
+│ │   - Uses SafeChan for async processing                                           ││
+│ │   - Background processor via scope.Go()                                          ││
+│ │   - File handle from FileHandleBudget                                            ││
+│ │   - Replay on startup for recovery                                               ││
+│ │   ACCEPTANCE: Observations survive crash, replay < 100ms for 1000 entries        ││
+│ │   FILES: core/context/observation_log.go, observation_log_test.go                ││
+│ │                                                                                  ││
+│ │ • AR.4.3 Access Tracker (Bounded) (core/context/access_tracker.go)               ││
+│ │   - Sliding window for access counts (last N turns)                              ││
+│ │   - LRU eviction for lastAccess map (max 10000 entries)                          ││
+│ │   - Bounded ring buffer for accessLog (max 1000 events)                          ││
+│ │   - RegisterEvictableCache interface implementation                              ││
+│ │   ACCEPTANCE: Memory bounded, PressureController integration works               ││
+│ │   FILES: core/context/access_tracker.go, access_tracker_test.go                  ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After DS.9.2 Search Coordinator + AR.2.x):                              ││
+│ │ • AR.5.1 Hot Cache (EvictableCache) (core/context/hot_cache.go)                  ││
+│ │   - Implements resources.EvictableCache interface                                ││
+│ │   - Name(), CurrentSize(), Evict(percent), SetMaxSize()                          ││
+│ │   - LRU tracking with accessOrder list                                           ││
+│ │   - PressureController registration                                              ││
+│ │   - Thread-safe operations                                                       ││
+│ │   ACCEPTANCE: Evict() removes LRU items, pressure callback works                 ││
+│ │   EXISTING CODE: core/resources/pressure_controller.go (EvictableCache interface)││
+│ │   FILES: core/context/hot_cache.go, hot_cache_test.go                            ││
+│ │                                                                                  ││
+│ │ • AR.5.2 Tiered Searcher (core/context/tiered_searcher.go)                       ││
+│ │   - Tier 0: Hot cache (< 1ms)                                                    ││
+│ │   - Tier 1: Warm Bleve index (< 10ms)                                            ││
+│ │   - Tier 2: Full Bleve + VectorDB (< 200ms)                                      ││
+│ │   - Circuit breaker integration per tier                                         ││
+│ │   - Latency budget enforcement                                                   ││
+│ │   - SetMaxTier() for pressure response                                           ││
+│ │   ACCEPTANCE: Respects latency budgets, graceful degradation on failure          ││
+│ │   DEPENDS ON: DS.9.2 (Search Coordinator), AR.2.4 (Circuit Breakers)             ││
+│ │   FILES: core/context/tiered_searcher.go, tiered_searcher_test.go                ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After AR.5.1, AR.5.2):                                                  ││
+│ │ • AR.5.3 Speculative Prefetcher (core/context/speculative_prefetcher.go)         ││
+│ │   - StartSpeculative() using GoroutineScope                                      ││
+│ │   - GetOrStart() for deduplication                                               ││
+│ │   - GetIfReady(timeout) non-blocking retrieval                                   ││
+│ │   - Inflight tracking with sync.Map                                              ││
+│ │   - SetEnabled() for pressure response                                           ││
+│ │   ACCEPTANCE: No raw goroutines, dedup works, disabled under pressure            ││
+│ │   FILES: core/context/speculative_prefetcher.go, speculative_prefetcher_test.go  ││
+│ │                                                                                  ││
+│ │ • AR.5.4 Query Augmenter (core/context/query_augmenter.go)                       ││
+│ │   - Augment() synchronous fallback when prefetch unavailable                     ││
+│ │   - Budget-aware retrieval (respects remaining context)                          ││
+│ │   - Excerpt selection based on sampled weights                                   ││
+│ │   - Summary generation for large results                                         ││
+│ │   ACCEPTANCE: Respects token budget, weights affect selection                    ││
+│ │   FILES: core/context/query_augmenter.go, query_augmenter_test.go                ││
+│ │                                                                                  ││
+│ │ PHASE 8 (After AR.5.x):                                                          ││
+│ │ • AR.6.1 Pressure-Aware Retrieval (core/context/pressure_aware_retrieval.go)     ││
+│ │   - OnPressureChange() callback implementation                                   ││
+│ │   - Pressure response matrix (Normal, Elevated, High, Critical)                  ││
+│ │   - Prefetcher enable/disable                                                    ││
+│ │   - Tier reduction                                                               ││
+│ │   - Cache size adjustment                                                        ││
+│ │   - Emergency eviction at Critical                                               ││
+│ │   ACCEPTANCE: All pressure levels handled correctly, no panics                   ││
+│ │   EXISTING CODE: core/resources/pressure_controller.go                           ││
+│ │   FILES: core/context/pressure_aware_retrieval.go, pressure_integration_test.go  ││
+│ │                                                                                  ││
+│ │ PHASE 9 (All parallel - hook implementations):                                   ││
+│ │ • AR.7.1 Prefetch Injection Hook (core/context/hooks/prefetch_hook.go)           ││
+│ │   - SpeculativePrefetchHook implementation                                       ││
+│ │   - Priority: HookPriorityFirst (0)                                              ││
+│ │   - Injects [AUTO-RETRIEVED] content                                             ││
+│ │   - 10ms timeout for prefetch ready check                                        ││
+│ │   - Fallback to synchronous augmentation                                         ││
+│ │   ACCEPTANCE: Adds < 15ms latency, content injected correctly                    ││
+│ │   FILES: core/context/hooks/prefetch_hook.go, prefetch_hook_test.go              ││
+│ │                                                                                  ││
+│ │ • AR.7.2 Episode Tracker Hooks (core/context/hooks/episode_hooks.go)             ││
+│ │   - EpisodeTrackerInitHook (PrePrompt, Priority 25)                              ││
+│ │   - EpisodeObservationHook (PostPrompt, Priority 75)                             ││
+│ │   - SearchToolObservationHook (PostTool, Priority 50)                            ││
+│ │   ACCEPTANCE: Episodes tracked correctly, signals captured                       ││
+│ │   FILES: core/context/hooks/episode_hooks.go, episode_hooks_test.go              ││
+│ │                                                                                  ││
+│ │ • AR.7.3 Pressure Eviction Hook (core/context/hooks/eviction_hook.go)            ││
+│ │   - PressureEvictionHook implementation                                          ││
+│ │   - Priority: HookPriorityFirst (0)                                              ││
+│ │   - Forces eviction at PressureHigh (25%) and Critical (50%)                     ││
+│ │   ACCEPTANCE: Eviction triggered correctly, no OOM under pressure                ││
+│ │   FILES: core/context/hooks/eviction_hook.go, eviction_hook_test.go              ││
+│ │                                                                                  ││
+│ │ • AR.7.4 Failure Pattern Warning Hook (core/context/hooks/failure_hook.go)       ││
+│ │   - FailurePatternWarningHook implementation                                     ││
+│ │   - Priority: HookPriorityNormal (50)                                            ││
+│ │   - Injects [FAILURE_PATTERN_WARNING] block                                      ││
+│ │   - Integrates with Archivalist failure memory                                   ││
+│ │   ACCEPTANCE: Warnings injected for recurrence >= 2                              ││
+│ │   FILES: core/context/hooks/failure_hook.go, failure_hook_test.go                ││
+│ │                                                                                  ││
+│ │ • AR.7.5 Access Tracking Hook (core/context/hooks/access_hook.go)                ││
+│ │   - AccessTrackingHook (PostPrompt, Priority 50)                                 ││
+│ │   - ContentPromotionHook (PostTool, Priority 75)                                 ││
+│ │   - Extracts content references from responses                                   ││
+│ │   - Promotes retrieved content to hot cache                                      ││
+│ │   ACCEPTANCE: Access tracked, hot cache populated                                ││
+│ │   FILES: core/context/hooks/access_hook.go, access_hook_test.go                  ││
+│ │                                                                                  ││
+│ │ • AR.7.6 Guide Routing Cache Hook (core/context/hooks/guide_routing_hook.go)     ││
+│ │   - GuideRoutingCacheHook (PrePrompt, Priority 50)                               ││
+│ │   - Agents: ["guide"] only                                                       ││
+│ │   - Injects routing history for consistent decisions                             ││
+│ │   ACCEPTANCE: Routing history injected for Guide agent                           ││
+│ │   FILES: core/context/hooks/guide_routing_hook.go, guide_routing_hook_test.go    ││
+│ │                                                                                  ││
+│ │ • AR.7.7 Workflow Context Hook (core/context/hooks/workflow_context_hook.go)     ││
+│ │   - WorkflowContextHook (PrePrompt, Priority 50)                                 ││
+│ │   - Agents: ["orchestrator"] only                                                ││
+│ │   - Injects current workflow state, pending tasks, active pipelines              ││
+│ │   ACCEPTANCE: Workflow context injected for Orchestrator                         ││
+│ │   FILES: core/context/hooks/workflow_context_hook.go, workflow_context_hook_test.go
+│ │                                                                                  ││
+│ │ • AR.7.8 Focused Prefetch Hook (core/context/hooks/focused_prefetch_hook.go)     ││
+│ │   - FocusedPrefetchHook (PrePrompt, Priority 25)                                 ││
+│ │   - Agents: ["engineer", "designer", "inspector", "tester"]                      ││
+│ │   - Limited prefetch with maxTokens: 1000 (per CONTEXT.md)                       ││
+│ │   - Task-scoped retrieval, not broad codebase search                             ││
+│ │   ACCEPTANCE: Prefetch limited to 1000 tokens, pipeline agents only              ││
+│ │   FILES: core/context/hooks/focused_prefetch_hook.go, focused_prefetch_hook_test.go
+│ │                                                                                  ││
+│ │ PHASE 10 (All parallel - skill implementations):                                 ││
+│ │ • AR.8.1 Universal Retrieval Skills (core/context/skills/universal_skills.go)    ││
+│ │   - retrieve_context skill handler                                               ││
+│ │   - search_history skill handler                                                 ││
+│ │   - promote_to_hot skill handler                                                 ││
+│ │   - InputSchema per CONTEXT.md specification                                     ││
+│ │   ACCEPTANCE: Skills callable, return correct types, handle errors               ││
+│ │   FILES: core/context/skills/universal_skills.go, universal_skills_test.go       ││
+│ │                                                                                  ││
+│ │ • AR.8.2 Librarian Retrieval Skills (core/context/skills/librarian_skills.go)    ││
+│ │   - librarian_search_codebase handler                                            ││
+│ │   - librarian_get_symbol_context handler                                         ││
+│ │   - librarian_get_pattern_examples handler                                       ││
+│ │   ACCEPTANCE: Integrated with TieredSearcher, respects budgets                   ││
+│ │   FILES: core/context/skills/librarian_skills.go, librarian_skills_test.go       ││
+│ │                                                                                  ││
+│ │ • AR.8.3 Archivalist Retrieval Skills (core/context/skills/archivalist_skills.go)││
+│ │   - archivalist_search_decisions handler                                         ││
+│ │   - archivalist_get_failure_patterns handler                                     ││
+│ │   - archivalist_get_cross_session_learnings handler                              ││
+│ │   ACCEPTANCE: Cross-session queries work, failure patterns returned              ││
+│ │   FILES: core/context/skills/archivalist_skills.go, archivalist_skills_test.go   ││
+│ │                                                                                  ││
+│ │ • AR.8.4 Academic Retrieval Skills (core/context/skills/academic_skills.go)      ││
+│ │   - academic_search_research handler                                             ││
+│ │   - academic_cite_sources handler                                                ││
+│ │   - academic_get_best_practices handler                                          ││
+│ │   ACCEPTANCE: Applicability analysis works, trust levels enforced                ││
+│ │   FILES: core/context/skills/academic_skills.go, academic_skills_test.go         ││
+│ │                                                                                  ││
+│ │ • AR.8.5 Guide Retrieval Skills (core/context/skills/guide_skills.go)            ││
+│ │   - guide_get_routing_history handler                                            ││
+│ │   - guide_get_user_preferences handler                                           ││
+│ │   ACCEPTANCE: Routing history accurate, preferences learned                      ││
+│ │   FILES: core/context/skills/guide_skills.go, guide_skills_test.go               ││
+│ │                                                                                  ││
+│ │ • AR.8.6 Orchestrator Retrieval Skills (core/context/skills/orchestrator.go)     ││
+│ │   - orchestrator_get_workflow_context handler                                    ││
+│ │   - orchestrator_search_similar_workflows handler                                ││
+│ │   ACCEPTANCE: Workflow context complete, similar workflow search works           ││
+│ │   FILES: core/context/skills/orchestrator_skills.go, orchestrator_skills_test.go ││
+│ │                                                                                  ││
+│ │ • AR.8.7 Pipeline Agent Skills (core/context/skills/pipeline_skills.go)          ││
+│ │   - get_file_context handler (shared by all pipeline agents)                     ││
+│ │   - get_recent_changes handler (shared by all pipeline agents)                   ││
+│ │   - Inspector: get_validation_context, search_issues, get_test_coverage          ││
+│ │   - Tester: get_test_patterns, search_test_history, get_coverage_gaps            ││
+│ │   - Designer: get_component_patterns, search_styles, get_a11y_guidelines         ││
+│ │   ACCEPTANCE: Agent-specific skills work, limited scope enforced                 ││
+│ │   FILES: core/context/skills/pipeline_skills.go, inspector_skills.go,            ││
+│ │          tester_skills.go, designer_skills.go, *_skills_test.go                  ││
+│ │                                                                                  ││
+│ │ PHASE 11 (After AR.7.x):                                                         ││
+│ │ • AR.9.1 Hook Registry (core/context/hook_registry.go)                           ││
+│ │   - RegisterAdaptiveRetrievalHooks() function                                    ││
+│ │   - Per-agent hook registration                                                  ││
+│ │   - Global hook registration                                                     ││
+│ │   - Priority ordering enforcement                                                ││
+│ │   ACCEPTANCE: Hooks execute in correct order, agent filtering works              ││
+│ │   FILES: core/context/hook_registry.go, hook_registry_test.go                    ││
+│ │                                                                                  ││
+│ │ PHASE 12 (After AR.8.x):                                                         ││
+│ │ • AR.9.2 Skill Registry Integration (core/context/skill_registry.go)             ││
+│ │   - RegisterAdaptiveRetrievalSkills() function                                   ││
+│ │   - Per-agent skill registration                                                 ││
+│ │   - Tier classification (TIER 1 core skills)                                     ││
+│ │   - Integration with existing skill registry                                     ││
+│ │   ACCEPTANCE: Skills appear in agent tool lists, handlers callable               ││
+│ │   FILES: core/context/skill_registry.go                                          ││
+│ │                                                                                  ││
+│ │ PHASE 13 (After AR.9.1, AR.9.2):                                                 ││
+│ │ • AR.10.1 System Prompt Injector (core/context/prompt_injector.go)               ││
+│ │   - Agent-specific prompt additions per CONTEXT.md                               ││
+│ │   - LibrarianRetrievalPromptAddition injection                                   ││
+│ │   - ArchivalistRetrievalPromptAddition injection                                 ││
+│ │   - AcademicRetrievalPromptAddition injection                                    ││
+│ │   - GuideRetrievalPromptAddition injection                                       ││
+│ │   - EngineerRetrievalPromptAddition injection                                    ││
+│ │   - OrchestratorRetrievalPromptAddition injection                                ││
+│ │   ACCEPTANCE: Prompts injected correctly, no duplication                         ││
+│ │   FILES: core/context/prompt_injector.go, prompt_injector_test.go                ││
+│ │                                                                                  ││
+│ │ PHASE 14 (After all prior phases):                                               ││
+│ │ • AR.11.1 VectorGraphDB Bleve Integration (core/vectorgraphdb/bleve_db.go)       ││
+│ │   - BleveIntegratedDB wrapper struct                                             ││
+│ │   - HybridSearch() combining Bleve + HNSW                                        ││
+│ │   - RRF fusion from DS.9.3                                                       ││
+│ │   - Circuit breaker integration                                                  ││
+│ │   - FileHandleBudget integration                                                 ││
+│ │   ACCEPTANCE: Hybrid search works, graceful degradation on failure               ││
+│ │   DEPENDS ON: DS.9.3 (RRF), DS.2.6 (Bleve Index Manager)                         ││
+│ │   FILES: core/vectorgraphdb/bleve_db.go, bleve_db_test.go                        ││
+│ │                                                                                  ││
+│ │ • AR.11.2 HybridResult Extension (core/vectorgraphdb/hybrid_result_ext.go)       ││
+│ │   - RetrievalCost field                                                          ││
+│ │   - BleveScore field                                                             ││
+│ │   - TierSource field                                                             ││
+│ │   - AccessedAt field                                                             ││
+│ │   ACCEPTANCE: Extended fields populated correctly                                ││
+│ │   EXISTING CODE: core/vectorgraphdb/query.go (HybridResult)                      ││
+│ │   FILES: core/vectorgraphdb/hybrid_result_ext.go                                 ││
+│ │                                                                                  ││
+│ │ • AR.11.3 PressureAwareSearcher (core/vectorgraphdb/pressure_searcher.go)        ││
+│ │   - Wraps QueryEngine                                                            ││
+│ │   - OnPressureChange() callback                                                  ││
+│ │   - maxTier atomic adjustment                                                    ││
+│ │   - Tier-limited search methods                                                  ││
+│ │   ACCEPTANCE: Pressure response works, tier limits enforced                      ││
+│ │   EXISTING CODE: core/vectorgraphdb/query.go (QueryEngine)                       ││
+│ │   FILES: core/vectorgraphdb/pressure_searcher.go, pressure_searcher_test.go      ││
+│ │                                                                                  ││
+│ │ • AR.11.4 SessionScopedView Budget (core/vectorgraphdb/session_budget.go)        ││
+│ │   - RetrievalBudget integration                                                  ││
+│ │   - CanQuery() check                                                             ││
+│ │   - Token tracking per query                                                     ││
+│ │   - Budget exhaustion handling                                                   ││
+│ │   ACCEPTANCE: Budget enforced, ErrBudgetExhausted returned correctly             ││
+│ │   EXISTING CODE: core/vectorgraphdb/session_view.go                              ││
+│ │   FILES: core/vectorgraphdb/session_budget.go, session_budget_test.go            ││
+│ │                                                                                  ││
+│ │ PHASE 15 (After AR.11.x):                                                        ││
+│ │ • AR.12.1 Adaptive Retrieval Facade (core/context/adaptive_retrieval.go)         ││
+│ │   - Coordinates all components                                                   ││
+│ │   - Initialization with all dependencies                                         ││
+│ │   - Start() / Stop() lifecycle                                                   ││
+│ │   - Integration with VirtualContextManager                                       ││
+│ │   - Integration with HandoffManager                                              ││
+│ │   ACCEPTANCE: Full system starts cleanly, all components wired                   ││
+│ │   FILES: core/context/adaptive_retrieval.go                                      ││
+│ │                                                                                  ││
+│ │ PHASE 16 (After AR.12.1):                                                        ││
+│ │ • AR.13.1 Session Manager Integration (core/session/adaptive_integration.go)     ││
+│ │   - AdaptiveRetrieval initialization on session start                            ││
+│ │   - Hook registration for session agents                                         ││
+│ │   - Skill registration for session agents                                        ││
+│ │   - Cleanup on session end                                                       ││
+│ │   ACCEPTANCE: Per-session isolation, clean teardown                              ││
+│ │   EXISTING CODE: core/session/manager.go                                         ││
+│ │   FILES: core/session/adaptive_integration.go, adaptive_integration_test.go      ││
+│ │                                                                                  ││
+│ │ • AR.13.2 Handoff Context Integration (core/pipeline/adaptive_handoff.go)        ││
+│ │   - HandoffContextPayload generation                                             ││
+│ │   - Adaptive state snapshot in handoff                                           ││
+│ │   - Hot cache state transfer                                                     ││
+│ │   - Current episode preservation                                                 ││
+│ │   ACCEPTANCE: Handoff preserves adaptive state, new agent resumes correctly      ││
+│ │   EXISTING CODE: core/pipeline/handoff.go                                        ││
+│ │   FILES: core/pipeline/adaptive_handoff.go, adaptive_handoff_test.go             ││
+│ │                                                                                  ││
+│ │ PHASE 17 (After AR.13.x - Integration tests):                                    ││
+│ │ • AR.14 Adaptive Retrieval Integration Tests                                     ││
+│ │   - End-to-end prefetch flow test                                                ││
+│ │   - Tiered search latency compliance test                                        ││
+│ │   - Pressure response integration test                                           ││
+│ │   - Learning convergence test (weights converge)                                 ││
+│ │   - Handoff state preservation test                                              ││
+│ │   - Cross-session learning test                                                  ││
+│ │   - Circuit breaker graceful degradation test                                    ││
+│ │   ACCEPTANCE: All integration tests pass, no goroutine leaks, no memory leaks    ││
+│ │   FILES: core/context/integration_test.go                                        ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                  ││
+│ │   core/context/adaptive_types.go, retrieval_types.go, protocol_types.go          ││
+│ │   core/context/hook_types.go, observation_channel.go, prefetch_scope.go          ││
+│ │   core/context/retrieval_resources.go, search_circuit_breakers.go                ││
+│ │   core/context/robust_weight.go, context_discovery.go, user_profile.go           ││
+│ │   core/context/adaptive_state.go, episode_tracker.go, observation_log.go         ││
+│ │   core/context/access_tracker.go, hot_cache.go, tiered_searcher.go               ││
+│ │   core/context/speculative_prefetcher.go, query_augmenter.go                     ││
+│ │   core/context/pressure_aware_retrieval.go, hook_registry.go, skill_registry.go  ││
+│ │   core/context/prompt_injector.go, adaptive_retrieval.go                         ││
+│ │   core/context/hooks/*.go (5 hook files)                                         ││
+│ │   core/context/skills/*.go (7 skill files)                                       ││
+│ │   core/vectorgraphdb/bleve_db.go, hybrid_result_ext.go, pressure_searcher.go     ││
+│ │   core/vectorgraphdb/session_budget.go                                           ││
+│ │   core/session/adaptive_integration.go                                           ││
+│ │   core/pipeline/adaptive_handoff.go                                              ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                         ││
+│ │   - Speculative parallel pre-fetch (0ms added latency)                           ││
+│ │   - Tiered search: Hot (<1ms) → Warm (<10ms) → Full (<200ms)                     ││
+│ │   - Robust Bayesian learning (outlier rejection, decay, cold start)              ││
+│ │   - Embedding-based context discovery (contexts emerge, not predefined)          ││
+│ │   - Write-ahead log for crash recovery                                           ││
+│ │   - Sufficient statistics only (O(contexts) memory, not O(observations))         ││
+│ │   - Full WAVE 4 integration (GoroutineBudget, SafeChan, FileHandleBudget)        ││
+│ │   - Pressure-aware degradation (Normal → Elevated → High → Critical)             ││
+│ │   - Per-agent skills with Anthropic tool format                                  ││
+│ │   - System prompt additions for all agent types                                  ││
+│ │   - Handoff state preservation for continuity                                    ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                            ││
+│ │   Phase 1 (4 parallel) → Phase 2 (4 parallel) → Phase 3 (3 parallel) → Phase 4   ││
+│ │   Phase 5 (3 parallel) → Phase 6 (2 parallel, after DS.9.2) → Phase 7 (2 par)    ││
+│ │   Phase 8 → Phase 9 (5 parallel) → Phase 10 (7 parallel)                         ││
+│ │   Phase 11 → Phase 12 → Phase 13 (2 parallel) → Phase 14 (4 parallel)            ││
+│ │   Phase 15 → Phase 16 (2 parallel) → Phase 17 (tests)                            ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                            ││
+│ │   - Group 4L: Document Search System (DS.1-DS.13) - provides Bleve integration   ││
+│ │   - Group 4G: Goroutine Budget (GoroutineBudget, GoroutineScope)                 ││
+│ │   - Group 4H: File Handle Budget (FileHandleBudget, AgentFileBudget)             ││
+│ │   - Group 4F: Pressure Controller (PressureController, EvictableCache)           ││
+│ │   - Group 4K: Circuit Breakers (GlobalCircuitBreakerRegistry)                    ││
+│ │   - Existing VectorGraphDB (QueryEngine, HybridResult, SessionScopedView)        ││
+│ │   - github.com/vmihailenco/msgpack/v5 (state serialization)                      ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                         ││
+│ │   - All agents receive retrieval skills and hooks                                ││
+│ │   - System prompts updated for all 10 agent types                                ││
+│ │   - VirtualContextManager uses adaptive retrieval for eviction/retrieval         ││
+│ │   - HandoffManager includes adaptive state in handoff payload                    ││
+│ │   - Session manager initializes adaptive retrieval per-session                   ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 85-95 parallel engineer pipelines (increased for AR system)    │
+│ DEPENDENCIES: Wave 3 complete, Group 4L (Document Search) complete                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4N: Context Virtualization System (CV.1-CV.5, ES.1-ES.5)          ││
+│ │ ** FROM CONTEXT.md - Lossless Context Virtualization Architecture **             ││
+│ │ ** REQUIRED BY: AR.12.1 (Adaptive Retrieval Facade) **                           ││
+│ │                                                                                  ││
+│ │ PHASE 1 (Foundation - all parallel):                                             ││
+│ │ • CV.1 UniversalContentStore (core/context/content_store.go)                     ││
+│ │   - Wraps VectorGraphDB + Bleve for hybrid search                                ││
+│ │   - SafeChan for index queue (WAVE 4 compliant)                                  ││
+│ │   - GoroutineScope for workers                                                   ││
+│ │   - FileHandleBudget tracking                                                    ││
+│ │   DEPENDS ON: DS.2.6 (Bleve Index Manager), VectorGraphDB                        ││
+│ │   FILES: core/context/content_store.go, content_store_test.go                    ││
+│ │                                                                                  ││
+│ │ • CV.2 StartupIndexer (core/context/startup_indexer.go)                          ││
+│ │   - Parallel codebase indexing on startup                                        ││
+│ │   - Uses GoroutineBudget.Acquire() for workers                                   ││
+│ │   - Uses FileHandleBudget.Acquire() for file reads                               ││
+│ │   - Respects .gitignore, security filters                                        ││
+│ │   DEPENDS ON: CV.1 (UniversalContentStore)                                       ││
+│ │   FILES: core/context/startup_indexer.go, startup_indexer_test.go                ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After CV.1):                                                            ││
+│ │ • CV.3 ContextReference System (core/context/context_reference.go)               ││
+│ │   - [CTX-REF-xxx] markers for evicted content                                    ││
+│ │   - Render() and Parse() methods                                                 ││
+│ │   - References stored in UniversalContentStore                                   ││
+│ │   FILES: core/context/context_reference.go, context_reference_test.go            ││
+│ │                                                                                  ││
+│ │ • CV.4 ReferenceGenerator (core/context/reference_generator.go)                  ││
+│ │   - Creates summaries for evicted content                                        ││
+│ │   - Entity extraction (file paths, function names)                               ││
+│ │   - 50-token limit for summaries                                                 ││
+│ │   DEPENDS ON: CV.3 (ContextReference)                                            ││
+│ │   FILES: core/context/reference_generator.go, reference_generator_test.go        ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After CV.3, CV.4 - Eviction strategies, all parallel):                  ││
+│ │ • ES.1 EvictionStrategy Interface (core/context/eviction_strategy.go)            ││
+│ │   - SelectForEviction(ctx *AgentContext, targetPercent float64) interface        ││
+│ │   FILES: core/context/eviction_strategy.go                                       ││
+│ │                                                                                  ││
+│ │ • ES.2 RecencyBasedEviction (core/context/eviction_recency.go)                   ││
+│ │   - Archivalist strategy: evict oldest first                                     ││
+│ │   - Preserve recent N turns                                                      ││
+│ │   - Config: threshold 85%, eviction 20%, preserve 3 turns                        ││
+│ │   FILES: core/context/eviction_recency.go, eviction_recency_test.go              ││
+│ │                                                                                  ││
+│ │ • ES.3 TopicClusterEviction (core/context/eviction_topic.go)                     ││
+│ │   - Librarian strategy: cluster by topic, evict clusters                         ││
+│ │   - Topic detection via file paths, module names                                 ││
+│ │   - Config: threshold 80%, eviction 25%, preserve 2 turns                        ││
+│ │   FILES: core/context/eviction_topic.go, eviction_topic_test.go                  ││
+│ │                                                                                  ││
+│ │ • ES.4 TaskCompletionEviction (core/context/eviction_task.go)                    ││
+│ │   - Architect strategy: evict completed task context first                       ││
+│ │   - Task detection via ID patterns, completion keywords                          ││
+│ │   - Config: threshold 75%, eviction 30%, preserve 2 turns                        ││
+│ │   FILES: core/context/eviction_task.go, eviction_task_test.go                    ││
+│ │                                                                                  ││
+│ │ • ES.5 AgentEvictionConfig (core/context/eviction_config.go)                     ││
+│ │   - Per-agent configuration structs                                              ││
+│ │   - EvictionConfigs map for librarian, archivalist, academic, architect          ││
+│ │   FILES: core/context/eviction_config.go                                         ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After ES.1-ES.5):                                                       ││
+│ │ • CV.5 VirtualContextManager (core/context/virtual_context_manager.go)           ││
+│ │   - Central coordinator for context virtualization                               ││
+│ │   - Routes knowledge agents to eviction, pipeline agents to handoff              ││
+│ │   - Per-agent context tracking                                                   ││
+│ │   - ForceEvict() for pressure response                                           ││
+│ │   DEPENDS ON: CV.1-CV.4, ES.1-ES.5                                               ││
+│ │   FILES: core/context/virtual_context_manager.go, virtual_context_manager_test.go││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                            ││
+│ │   Phase 1 (CV.1 parallel) → Phase 2 (CV.3, CV.4 parallel) →                      ││
+│ │   Phase 3 (ES.1-ES.5 parallel) → Phase 4 (CV.5)                                  ││
+│ │   CV.2 depends on CV.1, can start in Phase 2                                     ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                            ││
+│ │   - Group 4L: Document Search System (DS.2.6 Bleve Index Manager)                ││
+│ │   - Group 4G: Goroutine Budget (GoroutineBudget, GoroutineScope)                 ││
+│ │   - Group 4H: File Handle Budget (FileHandleBudget)                              ││
+│ │   - Group 4F: Pressure Controller (for ForceEvict integration)                   ││
+│ │   - Existing VectorGraphDB                                                       ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4O: Pipeline Agent Handoff System (PH.1-PH.6)                     ││
+│ │ ** FROM CONTEXT.md - Pipeline Agent Handoff Section **                           ││
+│ │ ** REQUIRED BY: AR.13.2 (Handoff Context Integration) **                         ││
+│ │                                                                                  ││
+│ │ PHASE 1 (Foundation):                                                            ││
+│ │ • PH.1 HandoffManager Core (core/pipeline/handoff_manager.go)                    ││
+│ │   - Central coordinator for all agent handoffs                                   ││
+│ │   - TriggerHandoff() method                                                      ││
+│ │   - ShouldHandoff() checks >= 75% context usage                                  ││
+│ │   - Archives handoff state to BOTH Bleve AND VectorDB                            ││
+│ │   - Stores handoff state for audit/recovery                                      ││
+│ │   DEPENDS ON: CV.1 (UniversalContentStore), Archivalist                          ││
+│ │   FILES: core/pipeline/handoff_manager.go, handoff_manager_test.go               ││
+│ │                                                                                  ││
+│ │ • PH.6 Handoff State Archival System (core/pipeline/handoff_archival.go)         ││
+│ │   ** CRITICAL: Same handoff state sent to next agent ALSO archived **            ││
+│ │   - HandoffArchiver component for dual-storage ingest                            ││
+│ │   - Bleve (Document DB): Text-searchable audit trail                             ││
+│ │   - VectorDB: Semantic search for similar handoff patterns                       ││
+│ │   - Category: agent_handoff_{agent_type}                                         ││
+│ │   - Async submission (non-blocking to handoff flow)                              ││
+│ │   - Query capabilities: by agent, session, pattern, similarity                   ││
+│ │   DEPENDS ON: Group 4L (Document Search), VectorGraphDB, Archivalist             ││
+│ │   FILES: core/pipeline/handoff_archival.go, handoff_archival_test.go             ││
+│ │          agents/archivalist/handoff_ingest.go                                    ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After PH.1, PH.6 - Handoff states, all parallel):                       ││
+│ │ • PH.2 OrchestratorHandoffState (core/pipeline/orchestrator_handoff.go)          ││
+│ │   - WorkflowState, PendingTasks, ActivePipelines, CompletedTasks                 ││
+│ │   - AgentStates map, WaitingOn conditions, NextActions                           ││
+│ │   - BuildHandoffState() and InjectHandoffState() methods                         ││
+│ │   FILES: core/pipeline/orchestrator_handoff.go                                   ││
+│ │                                                                                  ││
+│ │ • PH.3 GuideHandoffState (core/pipeline/guide_handoff.go)                        ││
+│ │   - ConversationHistory, CurrentIntent, ActiveTopics                             ││
+│ │   - RecentRoutings, AgentAffinities, UserPreferences                             ││
+│ │   - BuildHandoffState() and InjectHandoffState() methods                         ││
+│ │   FILES: core/pipeline/guide_handoff.go                                          ││
+│ │                                                                                  ││
+│ │ • PH.4 DesignerHandoffState (core/pipeline/designer_handoff.go)                  ││
+│ │   - ComponentsCreated, StylesApplied, DesignDecisions                            ││
+│ │   - TokensUsed (design tokens), A11yConsiderations                               ││
+│ │   - BuildHandoffState() and InjectHandoffState() methods                         ││
+│ │   FILES: core/pipeline/designer_handoff.go                                       ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After PH.2-PH.4):                                                       ││
+│ │ • PH.5 AgentContextCheck Hook (core/pipeline/context_check_hook.go)              ││
+│ │   - PostPrompt hook, Priority: HookPriorityLast (100)                            ││
+│ │   - Agents: engineer, designer, inspector, tester, orchestrator, guide           ││
+│ │   - Triggers handoff at 75% context usage                                        ││
+│ │   DEPENDS ON: PH.1, existing hook registry                                       ││
+│ │   FILES: core/pipeline/context_check_hook.go, context_check_hook_test.go         ││
+│ │                                                                                  ││
+│ │ • PH.7 PipelineController Handoff Integration                                    ││
+│ │   - Extends GR.6 PipelineController with HandoffManager integration              ││
+│ │   - Adds per-agent context tracking: UpdateContextUsage(), ShouldHandoff()       ││
+│ │   - Adds TriggerAgentHandoff(), ReplaceAgentSupervisor() methods                 ││
+│ │   - Defines HandoffableAgent interface for all pipeline agents                   ││
+│ │   - Session manager injects HandoffManager into all PipelineControllers          ││
+│ │   DEPENDS ON: PH.1, GR.6 (PipelineController)                                    ││
+│ │   FILES: core/concurrency/pipeline_handoff_integration.go, *_test.go             ││
+│ │                                                                                  ││
+│ │ NOTE: Engineer, Inspector, Tester handoff states already defined in Phase 2      ││
+│ │       Pipeline Handoff section. This group adds missing states and manager.      ││
+│ │                                                                                  ││
+│ │ CRITICAL THRESHOLD: 75% context triggers handoff (per CONTEXT.md)                ││
+│ │ CRITICAL ARCHIVAL: Handoff state archived to BOTH Bleve AND VectorDB             ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                            ││
+│ │   Phase 1 (PH.1, PH.6 parallel) → Phase 2 (PH.2-PH.4 parallel) →                 ││
+│ │   Phase 3 (PH.5, PH.7 parallel)                                                  ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                            ││
+│ │   - Group 4N: CV.1 (UniversalContentStore) for state storage                     ││
+│ │   - Group 4L: Document Search System (Bleve) for text indexing                   ││
+│ │   - VectorGraphDB for semantic indexing                                          ││
+│ │   - Archivalist agent for ingest coordination                                    ││
+│ │   - Phase 2 Pipeline Handoff section for Engineer/Inspector/Tester states        ││
+│ │   - Existing hook registry infrastructure                                        ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 95-110 parallel engineer pipelines (increased for CV+PH)       │
+│ DEPENDENCIES: Wave 3 complete, Group 4L (Document Search), Group 4M (partial)      │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -27471,180 +31126,84 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 5H: Document Search System (DS.1-DS.13)                           ││
-│ │ ** NEW: Bleve full-text, CMT manifest, go-git, hybrid retrieval **              ││
+│ │ PARALLEL GROUP 5H: Knowledge Agent Eviction Integration (NEW)                    ││
+│ │ ** FROM CONTEXT.md - Agent-Specific Eviction Configurations **                   ││
+│ │ ** DEPENDS ON: Group 4N (Context Virtualization System) **                       ││
 │ │                                                                                  ││
-│ │ PHASE 1 (All parallel - type definitions, no interdependencies):                ││
-│ │ • DS.1.1 Base Document Types (core/search/document.go)                          ││
-│ │ • DS.1.2 LLM Communication Document Types (core/search/llm_document.go)         ││
-│ │ • DS.1.3 Web Fetch Document Type (core/search/web_document.go)                  ││
-│ │ • DS.1.4 Git Commit Document Type (core/search/git_document.go)                 ││
-│ │ • DS.1.5 Document Collection Types (core/search/collection.go)                  ││
-│ │ • DS.1.6 Search Result Types (core/search/result.go)                            ││
+│ │ LIBRARIAN EVICTION INTEGRATION:                                                  ││
+│ │ • RecencyBasedEviction strategy (ES.2) integration                               ││
+│ │ • Threshold: 75% context triggers eviction                                       ││
+│ │ • Eviction: 25% of context converted to references                               ││
+│ │ • Preserve: 5 most recent turns always kept                                      ││
+│ │ • librarian_eviction_config.go - agent-specific settings                         ││
+│ │ • Unit test: eviction triggers at 75%, recency preserved                         ││
 │ │                                                                                  ││
-│ │ PHASE 2 (All parallel - Bleve analyzers, no interdependencies):                 ││
-│ │ • DS.2.1 Custom Code Tokenizer (core/search/analyzer/tokenizer.go)              ││
-│ │ • DS.2.2 CamelCase Token Filter (core/search/analyzer/camel_case.go)            ││
-│ │ • DS.2.3 SnakeCase Token Filter (core/search/analyzer/snake_case.go)            ││
+│ │ ARCHIVALIST EVICTION INTEGRATION:                                                ││
+│ │ • RecencyBasedEviction strategy (ES.2) integration                               ││
+│ │ • Threshold: 75% context triggers eviction (same as Librarian)                   ││
+│ │ • Eviction: 25% of context converted to references                               ││
+│ │ • Preserve: 5 most recent turns always kept                                      ││
+│ │ • archivalist_eviction_config.go - agent-specific settings                       ││
+│ │ • Unit test: eviction triggers at 75%, recency preserved                         ││
 │ │                                                                                  ││
-│ │ PHASE 3 (After DS.2.1-2.3):                                                     ││
-│ │ • DS.2.4 Code Analyzer Assembly (core/search/analyzer/code_analyzer.go)         ││
+│ │ ACADEMIC EVICTION INTEGRATION:                                                   ││
+│ │ • TopicClusterEviction strategy (ES.3) integration                               ││
+│ │ • Threshold: 80% context triggers eviction                                       ││
+│ │ • Eviction: 30% of context converted to references                               ││
+│ │ • Preserve: 3 most recent turns always kept                                      ││
+│ │ • academic_eviction_config.go - agent-specific settings                          ││
+│ │ • Unit test: eviction triggers at 80%, topic clusters preserved                  ││
 │ │                                                                                  ││
-│ │ PHASE 4 (After DS.2.4 + DS.1.x):                                                ││
-│ │ • DS.2.5 Bleve Index Schema (core/search/bleve/schema.go)                       ││
-│ │ • DS.2.6 Bleve Index Manager (core/search/bleve/index_manager.go)               ││
+│ │ ARCHITECT EVICTION INTEGRATION:                                                  ││
+│ │ • TaskCompletionEviction strategy (ES.4) integration                             ││
+│ │ • Threshold: 85% context triggers eviction                                       ││
+│ │ • Eviction: 25% of context converted to references                               ││
+│ │ • Preserve: 5 most recent turns always kept                                      ││
+│ │ • architect_eviction_config.go - agent-specific settings                         ││
+│ │ • Unit test: eviction triggers at 85%, completed tasks evicted first             ││
 │ │                                                                                  ││
-│ │ PHASE 5 (All parallel - parsers, no interdependencies):                         ││
-│ │ • DS.3.1 File Scanner (core/search/indexer/scanner.go)                          ││
-│ │ • DS.3.2 Language-Specific Parsers (core/search/parser/*.go)                    ││
+│ │ EVICTION HOOKS (For all knowledge agents):                                       ││
+│ │ • EvictionTriggerHook (PrePrompt, Priority: HookPriorityFirst)                   ││
+│ │   - Checks context usage after each turn                                         ││
+│ │   - Triggers eviction via VirtualContextManager                                  ││
+│ │   - Agents: librarian, archivalist, academic, architect                          ││
+│ │ • EvictionCompletionHook (PostPrompt, Priority: HookPriorityLate)                ││
+│ │   - Logs eviction metrics (tokens saved, entries evicted)                        ││
+│ │   - Agents: librarian, archivalist, academic, architect                          ││
 │ │                                                                                  ││
-│ │ PHASE 6 (After DS.3.1, DS.3.2, DS.2.6):                                         ││
-│ │ • DS.3.3 Document Builder (core/search/indexer/builder.go)                      ││
-│ │ • DS.3.4 Batch Indexer (core/search/indexer/batch_indexer.go)                   ││
-│ │ • DS.3.5 Incremental Indexer (core/search/indexer/incremental.go)               ││
-│ │ • DS.3.6 Full Reindex Pipeline (core/search/indexer/reindex.go)                 ││
+│ │ CONTEXT RETRIEVAL SKILLS (Universal for knowledge agents):                       ││
+│ │ • retrieve_context skill integration with agent skill registries                 ││
+│ │ • search_history skill integration                                               ││
+│ │ • promote_to_hot skill integration                                               ││
+│ │ • Skills registered via AR.9.2 Skill Registry Integration                        ││
 │ │                                                                                  ││
-│ │ PHASE 7 (All parallel - change detection, no interdependencies):                ││
-│ │ • DS.4.1 fsnotify Watcher (core/search/watcher/fsnotify.go)                     ││
-│ │ • DS.4.2 Git Hook Integration (core/search/watcher/git_hook.go)                 ││
-│ │ • DS.4.3 Checksum Validator (core/search/watcher/checksum.go)                   ││
-│ │ • DS.4.4 Periodic Scanner (core/search/watcher/periodic.go)                     ││
-│ │                                                                                  ││
-│ │ PHASE 8 (After DS.4.1-4.4):                                                     ││
-│ │ • DS.4.5 Change Detection Coordinator (core/search/watcher/coordinator.go)      ││
-│ │                                                                                  ││
-│ │ PHASE 9 (All parallel - CMT foundation, no interdependencies):                  ││
-│ │ • DS.5.1 CMT Node Types (core/search/cmt/types.go)                              ││
-│ │ • DS.5.5 CMT WAL (core/search/cmt/wal.go)                                       ││
-│ │ • DS.5.6 CMT SQLite Storage (core/search/cmt/sqlite_storage.go)                 ││
-│ │                                                                                  ││
-│ │ PHASE 10 (After DS.5.1):                                                        ││
-│ │ • DS.5.3 CMT Split and Merge (core/search/cmt/treap.go)                         ││
-│ │ • DS.5.4 CMT Merkle Hash Computation (core/search/cmt/merkle.go)                ││
-│ │                                                                                  ││
-│ │ PHASE 11 (After DS.5.3, DS.5.4, DS.5.5, DS.5.6):                                ││
-│ │ • DS.5.2 CMT Operations (core/search/cmt/cmt.go)                                ││
-│ │                                                                                  ││
-│ │ PHASE 12 (After DS.5.2):                                                        ││
-│ │ • DS.5.7 CMT Corruption Detection (core/search/cmt/integrity.go)                ││
-│ │ • DS.5.8 CMT Recovery (core/search/cmt/recovery.go)                             ││
-│ │                                                                                  ││
-│ │ PHASE 13 (All parallel - go-git, no interdependencies):                         ││
-│ │ • DS.6.1 Git Client Wrapper (core/search/git/client.go)                         ││
-│ │ • DS.6.2 Git File History (core/search/git/history.go)                          ││
-│ │ • DS.6.3 Git Blame Integration (core/search/git/blame.go)                       ││
-│ │ • DS.6.4 Git Diff Support (core/search/git/diff.go)                             ││
-│ │ • DS.6.5 Git Modified Files Detection (core/search/git/modified.go)             ││
-│ │                                                                                  ││
-│ │ PHASE 14 (After DS.6.1-6.5):                                                    ││
-│ │ • DS.6.6 Git Integration Manager (core/search/git/manager.go)                   ││
-│ │                                                                                  ││
-│ │ PHASE 15 (After DS.5.2, DS.6.6 - parallel):                                     ││
-│ │ • DS.7.1 Cross-Validator Types (core/search/validation/types.go)                ││
-│ │ • DS.7.2 Three-Source Validator (core/search/validation/validator.go)           ││
-│ │ • DS.7.3 Discrepancy Resolution (core/search/validation/resolution.go)          ││
-│ │ • DS.7.4 Validation Scheduler (core/search/validation/scheduler.go)             ││
-│ │                                                                                  ││
-│ │ PHASE 16 (After DS.5.2 - parallel with 15):                                     ││
-│ │ • DS.8.1 Staleness Types (core/search/staleness/types.go)                       ││
-│ │ • DS.8.2 Hybrid Staleness Detector (core/search/staleness/detector.go)          ││
-│ │ • DS.8.3 CMT Root Hash Check (core/search/staleness/cmt_check.go)               ││
-│ │ • DS.8.4 Mtime Sampling (core/search/staleness/mtime_sample.go)                 ││
-│ │                                                                                  ││
-│ │ PHASE 17 (After DS.2.6 - parallel):                                             ││
-│ │ • DS.9.1 Search Coordinator Types (core/search/coordinator/types.go)            ││
-│ │ • DS.9.3 Reciprocal Rank Fusion (core/search/coordinator/rrf.go)                ││
-│ │ • DS.9.4 Vector DB Adapter (core/search/coordinator/vector_adapter.go)          ││
-│ │ • DS.9.5 Search Cache (core/search/coordinator/cache.go)                        ││
-│ │                                                                                  ││
-│ │ PHASE 18 (After DS.9.1, DS.9.3, DS.9.4, DS.9.5):                                ││
-│ │ • DS.9.2 Search Coordinator (core/search/coordinator/coordinator.go)            ││
-│ │                                                                                  ││
-│ │ PHASE 19 (All parallel - resource integration):                                 ││
-│ │ • DS.10.1 GoroutineBudget Integration (core/search/resource/goroutine.go)       ││
-│ │ • DS.10.2 FileHandleBudget Integration (core/search/resource/filehandle.go)     ││
-│ │ • DS.10.3 PressureController Integration (core/search/resource/pressure.go)     ││
-│ │                                                                                  ││
-│ │ PHASE 20 (After all prior phases):                                              ││
-│ │ • DS.10.4 SearchSystem Facade (core/search/search_system.go)                    ││
-│ │                                                                                  ││
-│ │ PHASE 21 (After DS.10.4 - parallel):                                            ││
-│ │ • DS.11.1 Search Message Types (core/search/agent/messages.go)                  ││
-│ │ • DS.11.2 Guide Router Integration (agents/guide/router.go)                     ││
-│ │ • DS.11.3 Librarian Search Integration (agents/librarian/search.go)             ││
-│ │ • DS.11.4 Agent Search Skills (skills/search_skills.go)                         ││
-│ │ • DS.11.5 Session Context Integration (core/session/context.go)                 ││
-│ │                                                                                  ││
-│ │ PHASE 22 (After DS.10.4 - parallel):                                            ││
-│ │ • DS.12.1 Search CLI Command (cmd/sylk/search.go)                               ││
-│ │ • DS.12.2 Index CLI Command (cmd/sylk/index.go)                                 ││
-│ │ • DS.12.3 Git Search CLI Commands (cmd/sylk/git.go)                             ││
-│ │ • DS.12.4 Interactive Search Mode (cmd/sylk/interactive_search.go)              ││
-│ │                                                                                  ││
-│ │ PHASE 23 (After ALL complete):                                                  ││
-│ │ • DS.13 Document Search Integration Tests                                       ││
+│ │ SYSTEM PROMPT ADDITIONS:                                                         ││
+│ │ • Librarian: [CTX-REF-xxx] marker interpretation instructions                    ││
+│ │ • Archivalist: Cross-session context retrieval guidance                          ││
+│ │ • Academic: Research context preservation instructions                           ││
+│ │ • Architect: Task completion tracking and context preservation                   ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
-│ │   core/search/document.go, llm_document.go, web_document.go, git_document.go   ││
-│ │   core/search/collection.go, result.go, search_system.go                        ││
-│ │   core/search/analyzer/*.go (tokenizer, camel_case, snake_case, code_analyzer)  ││
-│ │   core/search/bleve/schema.go, index_manager.go                                 ││
-│ │   core/search/indexer/*.go (scanner, builder, batch_indexer, incremental)       ││
-│ │   core/search/parser/*.go (go, typescript, python, markdown, config)            ││
-│ │   core/search/watcher/*.go (fsnotify, git_hook, checksum, periodic, coordinator)││
-│ │   core/search/cmt/*.go (types, cmt, treap, merkle, wal, sqlite_storage)         ││
-│ │   core/search/git/*.go (client, history, blame, diff, modified, manager)        ││
-│ │   core/search/validation/*.go (types, validator, resolution, scheduler)         ││
-│ │   core/search/staleness/*.go (types, detector, cmt_check, mtime_sample)         ││
-│ │   core/search/coordinator/*.go (types, coordinator, rrf, vector_adapter, cache) ││
-│ │   core/search/resource/*.go (goroutine, filehandle, pressure)                   ││
-│ │   core/search/agent/messages.go                                                 ││
-│ │   skills/search_skills.go                                                       ││
-│ │   cmd/sylk/search.go, index.go, git.go, interactive_search.go                   ││
-│ │                                                                                  ││
-│ │ FEATURES:                                                                        ││
-│ │   - Bleve full-text search with code-aware tokenization                         ││
-│ │   - CamelCase and SnakeCase token splitting                                     ││
-│ │   - Cartesian Merkle Tree manifest for O(log n) updates, O(1) root verification ││
-│ │   - WAL for crash recovery                                                      ││
-│ │   - Pure-Go git integration via go-git/v5                                       ││
-│ │   - Three-source cross-validation (filesystem, CMT, git)                        ││
-│ │   - Hybrid staleness detection (CMT root, git commit, mtime, content hash)      ││
-│ │   - Reciprocal Rank Fusion for hybrid Bleve + Vector search                     ││
-│ │   - Resource budget integration (goroutine, file handle, pressure)              ││
-│ │   - Session-scoped search context                                               ││
-│ │   - CLI commands: sylk search, sylk index, sylk git                             ││
-│ │   - Interactive TUI search mode                                                 ││
+│ │   agents/librarian/eviction_config.go, agents/archivalist/eviction_config.go,    ││
+│ │   agents/academic/eviction_config.go, agents/architect/eviction_config.go,       ││
+│ │   core/context/hooks/eviction_trigger.go, agents/*/skill_integration.go          ││
 │ │                                                                                  ││
 │ │ INTERNAL DEPENDENCIES:                                                           ││
-│ │   Phase 1 (6 parallel) → Phase 2 (3 parallel) → Phase 3 → Phase 4 (2 parallel)  ││
-│ │   Phase 5 (2 parallel) → Phase 6 (4 parallel) → Phase 7 (4 parallel) → Phase 8  ││
-│ │   Phase 9 (3 parallel) → Phase 10 (2 parallel) → Phase 11 → Phase 12 (2 par)    ││
-│ │   Phase 13 (5 parallel) → Phase 14                                              ││
-│ │   Phase 15 (4 par) + Phase 16 (4 par) + Phase 17 (4 par) can run in parallel    ││
-│ │   Phase 18 → Phase 19 (3 par) → Phase 20 → Phase 21 (5 par) + Phase 22 (4 par)  ││
-│ │   Phase 23 (tests) after all                                                    ││
+│ │   Group 5A (agent cores) → Group 5H (eviction integration)                       ││
+│ │   Group 4N (CV.5 VirtualContextManager) → Group 5H                               ││
+│ │   Group 4M (AR.8.1 retrieval skills) → Group 5H (skill integration)              ││
 │ │                                                                                  ││
-│ │ EXTERNAL DEPENDENCIES:                                                           ││
-│ │   - github.com/blevesearch/bleve/v2 (full-text search)                          ││
-│ │   - github.com/go-git/go-git/v5 (pure-Go git)                                   ││
-│ │   - github.com/fsnotify/fsnotify (file system notifications)                    ││
-│ │   - Existing VectorGraphDB (for hybrid search)                                  ││
-│ │   - Existing GoroutineBudget, FileHandleBudget, PressureController              ││
-│ │                                                                                  ││
-│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
-│ │   - Integrates with Librarian (5A) for codebase search queries                  ││
-│ │   - Integrates with Session Management for session-scoped context               ││
-│ │   - Integrates with VectorGraphDB (5B) for semantic search                      ││
-│ │   - Integrates with Resource Management (4G, 4H, 4F) for budgets/pressure       ││
-│ │   - CLI integrates with existing cmd/sylk structure                             ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
+│ NOTE: Document Search System (DS.1-DS.13) has been MOVED to Wave 4 (Group 4L)      │
+│       because it is required for the Adaptive Retrieval System (see CONTEXT.md).   │
+│                                                                                     │
 │ NOTE: Wave 5 can START after Wave 1 complete, runs in parallel with Waves 2-4      │
-│ ESTIMATED CAPACITY: 20-26 parallel engineer pipelines (increased for DS system)    │
+│ ESTIMATED CAPACITY: 18-24 parallel engineer pipelines (increased for 5H)           │
 │ INTERNAL DEPENDENCIES:                                                             │
-│   5A → 5B, 5C (parallel) → 5D, 5E, 5F (parallel) → 5G                              │
-│   5H can run in parallel with 5A-5G (independent subsystem)                        │
+│   5A → 5B, 5C (parallel) → 5D, 5E, 5F (parallel) → 5G → 5H                          │
+│ EXTERNAL DEPENDENCIES:                                                             │
+│   Group 5H depends on: Group 4N (Context Virtualization), Group 4M (AR skills)     │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -27903,12 +31462,81 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ Specs added to ARCHITECTURE.md - implementation creates the actual skills.       ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 25-32 parallel engineer pipelines (increased for new groups)   │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 6K: Pipeline Agent Handoff Integration (NEW)                      ││
+│ │ ** FROM CONTEXT.md - Pipeline Agent Handoff Section **                           ││
+│ │ ** DEPENDS ON: Group 4O (Pipeline Agent Handoff System) **                       ││
+│ │                                                                                  ││
+│ │ ENGINEER HANDOFF INTEGRATION:                                                    ││
+│ │ • EngineerHandoffState from Phase 2 Pipeline Handoff section                     ││
+│ │ • Threshold: 75% context triggers handoff (CONTEXT.md spec)                      ││
+│ │ • BuildHandoffState() captures: accomplishments, modified files, pending work    ││
+│ │ • InjectHandoffState() restores context to new engineer instance                 ││
+│ │ • Integration with PH.1 HandoffManager                                           ││
+│ │ • Unit test: handoff triggers at 75%, state preserved                            ││
+│ │                                                                                  ││
+│ │ DESIGNER HANDOFF INTEGRATION:                                                    ││
+│ │ • DesignerHandoffState (PH.4) integration                                        ││
+│ │ • Threshold: 75% context triggers handoff                                        ││
+│ │ • BuildHandoffState() captures: components created, styles applied, design tokens││
+│ │ • InjectHandoffState() restores design context to new designer instance          ││
+│ │ • Integration with PH.1 HandoffManager                                           ││
+│ │ • Unit test: handoff triggers at 75%, design state preserved                     ││
+│ │                                                                                  ││
+│ │ ORCHESTRATOR HANDOFF INTEGRATION:                                                ││
+│ │ • OrchestratorHandoffState (PH.2) integration                                    ││
+│ │ • Threshold: 75% context triggers handoff                                        ││
+│ │ • BuildHandoffState() captures: workflow state, pending tasks, pipeline states   ││
+│ │ • InjectHandoffState() restores coordination state to new orchestrator           ││
+│ │ • Integration with PH.1 HandoffManager                                           ││
+│ │ • Unit test: handoff triggers at 75%, workflow state preserved                   ││
+│ │                                                                                  ││
+│ │ GUIDE HANDOFF INTEGRATION:                                                       ││
+│ │ • GuideHandoffState (PH.3) integration                                           ││
+│ │ • Threshold: 75% context triggers handoff                                        ││
+│ │ • BuildHandoffState() captures: conversation history, routing decisions,         ││
+│ │   user preferences, agent affinities                                             ││
+│ │ • InjectHandoffState() restores routing context to new guide instance            ││
+│ │ • Integration with PH.1 HandoffManager                                           ││
+│ │ • Unit test: handoff triggers at 75%, routing context preserved                  ││
+│ │                                                                                  ││
+│ │ HANDOFF HOOKS (For all pipeline agents in Wave 6):                               ││
+│ │ • AgentContextCheckHook (PH.5) registration for:                                 ││
+│ │   - engineer, designer, orchestrator, guide                                      ││
+│ │ • Hook checks context % after each turn                                          ││
+│ │ • Hook triggers HandoffManager.TriggerHandoff() at >= 75%                        ││
+│ │                                                                                  ││
+│ │ CONTEXT RETRIEVAL SKILLS (For pipeline agents):                                  ││
+│ │ • get_file_context skill integration (AR.8.7)                                    ││
+│ │ • get_recent_changes skill integration (AR.8.7)                                  ││
+│ │ • Limited scope: pipeline agents don't get full retrieval skills                 ││
+│ │                                                                                  ││
+│ │ SYSTEM PROMPT ADDITIONS:                                                         ││
+│ │ • Engineer: Handoff awareness, continuation instructions                         ││
+│ │ • Designer: Design token preservation across handoffs                            ││
+│ │ • Orchestrator: Workflow continuity instructions                                 ││
+│ │ • Guide: User preference preservation across handoffs                            ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   agents/engineer/handoff_integration.go, agents/designer/handoff_integration.go,││
+│ │   agents/orchestrator/handoff_integration.go, agents/guide/handoff_integration.go││
+│ │   core/pipeline/hooks/context_check_registration.go                              ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Groups 6A, 6B (agent cores) → Group 6K (handoff integration)                   ││
+│ │   Group 4O (PH.1-PH.5 HandoffManager) → Group 6K                                 ││
+│ │   Group 4M (AR.8.7 pipeline skills) → Group 6K (skill integration)               ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 28-36 parallel engineer pipelines (increased for 6K)           │
 │ DEPENDENCIES: Wave 2-3 for tool execution, Wave 5 for knowledge consultation       │
 │ NOTE: Group 6B (Orchestrator) required before Pipeline Variants (6.101-6.112)      │
 │ NOTE: Group 6J items are prerequisites for Groups 6C-6I effectiveness              │
 │ INTERNAL DEPENDENCIES:                                                             │
-│   6A, 6B → 6C, 6J (parallel) → 6D, 6E, 6F (parallel) → 6G → 6H, 6I (parallel)      │
+│   6A, 6B → 6C, 6J (parallel) → 6D, 6E, 6F (parallel) → 6G → 6H, 6I (parallel) → 6K │
+│ EXTERNAL DEPENDENCIES:                                                             │
+│   Group 6K depends on: Group 4O (Pipeline Agent Handoff), Group 4M (AR skills)     │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -28138,11 +31766,78 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   Depends on: Wave 4E (Tree-Sitter agent skills)                                ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 32-40 parallel engineer pipelines (increased for protocols+TS) │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 7H: Quality Agent Context Management Integration (NEW)            ││
+│ │ ** FROM CONTEXT.md - Pipeline Agent Handoff & Eviction Sections **               ││
+│ │ ** DEPENDS ON: Groups 4N (Context Virtualization) & 4O (Handoff System) **       ││
+│ │                                                                                  ││
+│ │ INSPECTOR HANDOFF INTEGRATION:                                                   ││
+│ │ • InspectorHandoffState from Phase 2 Pipeline Handoff section                    ││
+│ │ • Threshold: 75% context triggers handoff (CONTEXT.md spec)                      ││
+│ │ • BuildHandoffState() captures: validation progress, findings, checked files    ││
+│ │ • InjectHandoffState() restores validation state to new inspector instance       ││
+│ │ • Integration with PH.1 HandoffManager                                           ││
+│ │ • Unit test: handoff triggers at 75%, validation state preserved                 ││
+│ │                                                                                  ││
+│ │ TESTER HANDOFF INTEGRATION:                                                      ││
+│ │ • TesterHandoffState from Phase 2 Pipeline Handoff section                       ││
+│ │ • Threshold: 75% context triggers handoff (CONTEXT.md spec)                      ││
+│ │ • BuildHandoffState() captures: test progress, coverage, passing/failing tests   ││
+│ │ • InjectHandoffState() restores test state to new tester instance                ││
+│ │ • Integration with PH.1 HandoffManager                                           ││
+│ │ • Unit test: handoff triggers at 75%, test state preserved                       ││
+│ │                                                                                  ││
+│ │ ARCHITECT EVICTION INTEGRATION:                                                  ││
+│ │ • TaskCompletionEviction strategy (ES.4) integration                             ││
+│ │ • Threshold: 75% context triggers eviction                                       ││
+│ │ • Eviction: 30% of context converted to references                               ││
+│ │ • Preserve: 2 most recent turns always kept                                      ││
+│ │ • Completed task context evicted first, active tasks preserved                   ││
+│ │ • architect_eviction_config.go - agent-specific settings                         ││
+│ │ • Unit test: eviction triggers at 75%, active tasks preserved                    ││
+│ │                                                                                  ││
+│ │ HANDOFF HOOKS (For pipeline agents):                                             ││
+│ │ • AgentContextCheckHook (PH.5) registration for: inspector, tester               ││
+│ │ • Hook checks context % after each turn                                          ││
+│ │ • Hook triggers HandoffManager.TriggerHandoff() at >= 75%                        ││
+│ │                                                                                  ││
+│ │ EVICTION HOOKS (For Architect):                                                  ││
+│ │ • EvictionTriggerHook registration for: architect                                ││
+│ │ • Hook triggers VirtualContextManager eviction at >= 75%                         ││
+│ │                                                                                  ││
+│ │ CONTEXT RETRIEVAL SKILLS:                                                        ││
+│ │ • Inspector: get_file_context, get_recent_changes (limited pipeline scope)       ││
+│ │ • Tester: get_file_context, get_recent_changes (limited pipeline scope)          ││
+│ │ • Architect: Full retrieval skills (retrieve_context, search_history)            ││
+│ │   - Architect is a planning agent with broader context needs                     ││
+│ │                                                                                  ││
+│ │ SYSTEM PROMPT ADDITIONS:                                                         ││
+│ │ • Inspector: Validation state continuity across handoffs                         ││
+│ │ • Tester: Test progress preservation instructions                                ││
+│ │ • Architect: Task completion tracking, [CTX-REF-xxx] interpretation              ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   agents/inspector/handoff_integration.go, agents/tester/handoff_integration.go, ││
+│ │   agents/architect/eviction_config.go, core/pipeline/hooks/quality_agent_hooks.go││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Groups 7A, 7D, 7E (agent cores) → Group 7H (context management)                ││
+│ │   Group 4N (CV.5 VirtualContextManager) → Group 7H (Architect eviction)          ││
+│ │   Group 4O (PH.1-PH.5 HandoffManager) → Group 7H (Inspector/Tester handoff)      ││
+│ │   Group 4M (AR skills) → Group 7H (skill integration)                            ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 35-44 parallel engineer pipelines (increased for 7H)           │
 │ DEPENDENCIES: Wave 6 for execution agents, Wave 5 for knowledge, Wave 4E for TS    │
 │ NOTE: Groups 7B/7C/7D can execute in parallel, orchestrators sequential after      │
 │ NOTE: Group 7F can parallelize with 7B/7C/7D after agent cores are ready           │
 │ NOTE: Group 7G can parallelize with 7A-7F (independent CLI/setup work)             │
+│ NOTE: Group 7H depends on Groups 4N, 4O and agent cores (7A, 7D, 7E)               │
+│ INTERNAL DEPENDENCIES (updated):                                                   │
+│   7A → 7B, 7C, 7D (parallel) → 7E → 7F, 7G (parallel) → 7H                         │
+│ EXTERNAL DEPENDENCIES:                                                             │
+│   Group 7H depends on: Groups 4N, 4O (Context Virtualization & Handoff)            │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -28179,6 +31874,12 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • 6.47 Pipeline Failure Routing                                                  ││
 │ │ • 6.48 Task Completion Commands                                                  ││
 │ │ • Memory Management: Handoff Protocols                                           ││
+│ │   ** INTEGRATES WITH CONTEXT.md Handoff System **                                ││
+│ │   - Uses PH.1 HandoffManager from Group 4O                                       ││
+│ │   - Uses AgentContextCheckHook (PH.5) for 75% threshold detection                ││
+│ │   - Pipeline agents: Engineer, Designer, Inspector, Tester, Orchestrator, Guide  ││
+│ │   - Handoff state stored for audit and recovery                                  ││
+│ │   - See Groups 6K and 7H for agent-specific handoff integration                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
@@ -28223,8 +31924,13 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ NOTE: Can run in parallel with Groups 8A-8D                                      ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 14-20 parallel engineer pipelines (increased for FS)           │
+│ ESTIMATED CAPACITY: 16-22 parallel engineer pipelines (increased for handoff)      │
 │ DEPENDENCIES: All agent implementations complete, Wave 4C-4D FILESYSTEM complete   │
+│ HANDOFF INTEGRATION:                                                               │
+│   - Group 4O (PH.1 HandoffManager) provides core handoff infrastructure            │
+│   - Group 6K (Pipeline Agent Handoff) for Engineer, Designer, Orchestrator, Guide  │
+│   - Group 7H (Quality Agent Context) for Inspector, Tester, Architect              │
+│   - 75% context threshold triggers handoff (per CONTEXT.md specification)          │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
