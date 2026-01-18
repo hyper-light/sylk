@@ -158,8 +158,8 @@ func collectChildNodes(node *Node, maxDepth int) []NodeInfo {
 	}
 
 	children := make([]NodeInfo, 0, count)
-	for i := uint(0); i < count; i++ {
-		child := node.NamedChild(i)
+	for i := range count {
+		child := node.NamedChild(uint(i))
 		if childInfo := nodeToInfo(child, maxDepth); childInfo != nil {
 			children = append(children, *childInfo)
 		}
@@ -292,8 +292,8 @@ func parseImportDecl(node *Node) []ImportInfo {
 
 func walkAllNamedChildren(node *Node, fn func(*Node)) {
 	count := node.NamedChildCount()
-	for i := uint(0); i < count; i++ {
-		child := node.NamedChild(i)
+	for i := range count {
+		child := node.NamedChild(uint(i))
 		fn(child)
 		walkAllNamedChildren(child, fn)
 	}
@@ -331,15 +331,15 @@ func collectParseErrors(root *Node) []ParseError {
 
 func walkNamedChildren(node *Node, fn func(*Node)) {
 	count := node.NamedChildCount()
-	for i := uint(0); i < count; i++ {
-		fn(node.NamedChild(i))
+	for i := range count {
+		fn(node.NamedChild(uint(i)))
 	}
 }
 
 func walkAllChildren(node *Node, fn func(*Node)) {
 	count := node.ChildCount()
-	for i := uint(0); i < count; i++ {
-		child := node.Child(i)
+	for i := range count {
+		child := node.Child(uint(i))
 		fn(child)
 		walkAllChildren(child, fn)
 	}

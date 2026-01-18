@@ -110,26 +110,33 @@ func (p *FilePersister) LoadAll() ([]*Session, error) {
 		return nil, err
 	}
 
-	var sessions []*Session
-
+	sessions := make([]*Session, 0, len(entries))
 	for _, entry := range entries {
-		if p.shouldSkipEntry(entry) {
+		session, ok := p.loadSession(entry)
+		if !ok {
 			continue
 		}
-
-		session, id, err := p.loadSessionEntry(entry)
-		if err != nil {
-			continue
-		}
-
-		if session.ID() != id {
-			continue
-		}
-
 		sessions = append(sessions, session)
 	}
 
 	return sessions, nil
+}
+
+func (p *FilePersister) loadSession(entry os.DirEntry) (*Session, bool) {
+	if p.shouldSkipEntry(entry) {
+		return nil, false
+	}
+
+	session, id, err := p.loadSessionEntry(entry)
+	if err != nil {
+		return nil, false
+	}
+
+	if session.ID() != id {
+		return nil, false
+	}
+
+	return session, true
 }
 
 func (p *FilePersister) readEntries() ([]os.DirEntry, error) {
@@ -187,32 +194,43 @@ func (p *FilePersister) List() ([]string, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	entries, err := os.ReadDir(p.baseDir)
+	entries, err := p.listEntries()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to read persistence directory: %w", err)
+		return nil, err
 	}
 
-	var ids []string
-
+	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+		if id, ok := p.idFromEntry(entry); ok {
+			ids = append(ids, id)
 		}
-
-		name := entry.Name()
-		if filepath.Ext(name) != ".json" {
-			continue
-		}
-
-		// Remove .json extension to get ID
-		id := name[:len(name)-5]
-		ids = append(ids, id)
 	}
 
 	return ids, nil
+}
+
+func (p *FilePersister) listEntries() ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(p.baseDir)
+	if err == nil {
+		return entries, nil
+	}
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("failed to read persistence directory: %w", err)
+}
+
+func (p *FilePersister) idFromEntry(entry os.DirEntry) (string, bool) {
+	if entry.IsDir() {
+		return "", false
+	}
+
+	name := entry.Name()
+	if filepath.Ext(name) != ".json" {
+		return "", false
+	}
+
+	return name[:len(name)-5], true
 }
 
 // =============================================================================

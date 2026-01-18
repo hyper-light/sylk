@@ -10756,6 +10756,3203 @@ These integration points are wired up AFTER both sides complete - no blocking de
 
 ---
 
+## Memory Pressure Defense System
+
+**Reference:** `/MEMORY.md` for full design specification.
+
+This system provides a 7-layer defense against memory exhaustion, with spike detection, hysteresis-based state transitions, and graduated response actions.
+
+### MP.1 Memory Pressure Signals
+
+Add memory pressure signal types to the signal bus.
+
+**Files to modify:**
+- `core/signal/types.go` (lines 10-21)
+
+**Dependencies:** None (can start immediately, extends existing types).
+
+**Acceptance Criteria:**
+
+#### Signal Type Definitions
+- [ ] Add `EvictCaches Signal = "evict_caches"` constant
+- [ ] Add `CompactContexts Signal = "compact_contexts"` constant
+- [ ] Add `MemoryPressureChanged Signal = "memory_pressure_changed"` constant
+- [ ] Update `ValidSignals()` function to include new signals
+
+#### Signal Payload Types
+- [ ] `EvictCachesPayload` struct: `Percent float64, TargetBytes int64, Reason string`
+- [ ] `CompactContextsPayload` struct: `TargetID string, All bool, Reason string`
+- [ ] `MemoryPressurePayload` struct: `From string, To string, Usage float64, Timestamp time.Time`
+
+**Tests:**
+- [ ] New signals included in ValidSignals()
+- [ ] Payload structs serialize/deserialize correctly
+- [ ] Signal bus broadcasts new signal types
+
+---
+
+### MP.2 SignalBus Publisher Adapter
+
+Wire MemoryMonitor's SignalPublisher interface to the real SignalBus.
+
+**Files to create:**
+- `core/resources/signal_publisher.go`
+
+**Files to modify:**
+- `core/resources/memory_monitor.go` (lines 69-91, SignalPublisher interface section)
+
+**Dependencies:** MP.1 (Memory Pressure Signals).
+
+**Acceptance Criteria:**
+
+#### SignalBusPublisher Struct
+- [ ] `SignalBusPublisher` struct holds `*signal.SignalBus` reference
+- [ ] Implements `SignalPublisher` interface from memory_monitor.go
+- [ ] `PublishMemorySignal(sig MemorySignal, payload MemorySignalPayload) error` method
+
+#### Signal Translation
+- [ ] Map `MemorySignal` constants to `signal.Signal` constants
+- [ ] Convert `MemorySignalPayload` to appropriate signal payload type
+- [ ] Generate unique signal ID using `uuid.New().String()`
+
+#### Thread Safety
+- [ ] Publisher is safe for concurrent use
+- [ ] No blocking on signal publish (non-blocking channel send)
+
+**Tests:**
+- [ ] SignalBusPublisher satisfies SignalPublisher interface
+- [ ] Memory signals correctly broadcast via SignalBus
+- [ ] Subscribers receive memory signals with correct payload
+- [ ] Non-blocking when channel full (no deadlock)
+
+---
+
+### MP.3 Pressure State Machine
+
+Implement hysteresis-based state transitions with cooldown to prevent flapping.
+
+**Files to create:**
+- `core/resources/pressure_state.go`
+
+**Dependencies:** None (pure state machine, no external dependencies).
+
+**Acceptance Criteria:**
+
+#### Pressure Level Enum
+- [ ] `PressureLevel` type: `PressureNormal`, `PressureElevated`, `PressureHigh`, `PressureCritical`
+- [ ] `String()` method returns human-readable names
+- [ ] Constants: NORMAL (<50%), ELEVATED (50-70%), HIGH (70-85%), CRITICAL (>85%)
+
+#### Hysteresis Thresholds
+- [ ] Enter thresholds: `[0.50, 0.70, 0.85]` (configurable)
+- [ ] Exit thresholds: `[0.35, 0.55, 0.70]` (15% hysteresis gap)
+- [ ] Upward transition uses enter thresholds
+- [ ] Downward transition uses exit thresholds (must drop below to transition down)
+
+#### Cooldown Mechanism
+- [ ] Configurable cooldown duration (default: 3 seconds)
+- [ ] `lastChange time.Time` tracks last state transition
+- [ ] `Update(usage float64) bool` respects cooldown (returns false if in cooldown)
+- [ ] `BypassCooldown()` method for spike response
+
+#### State Machine Interface
+- [ ] `NewPressureStateMachine(config PressureStateConfig) *PressureStateMachine`
+- [ ] `Update(usage float64) (changed bool)` - evaluate and possibly transition
+- [ ] `Level() PressureLevel` - current level (thread-safe)
+- [ ] `OnTransition func(from, to PressureLevel, usage float64)` callback
+
+**Tests:**
+- [ ] Normal→Elevated at 50% usage
+- [ ] Elevated→Normal requires drop below 35% (not 50%)
+- [ ] Rapid oscillation blocked by cooldown
+- [ ] BypassCooldown allows immediate transition
+- [ ] Thread-safe concurrent Level() calls
+- [ ] All 4 levels reachable with correct thresholds
+
+---
+
+### MP.4 Spike Detection Monitor
+
+Implement 200ms sampling with rate-of-change spike detection.
+
+**Files to create:**
+- `core/resources/spike_monitor.go`
+
+**Dependencies:** None (uses runtime.MemStats directly).
+
+**Acceptance Criteria:**
+
+#### Sample Collection
+- [ ] `Sample` struct: `Timestamp time.Time, HeapAlloc uint64, Usage float64, Trend float64`
+- [ ] Ring buffer of 30 samples (6 seconds at 200ms interval)
+- [ ] `takeSample()` reads `runtime.MemStats` and calculates usage ratio
+
+#### Spike Detection
+- [ ] Trend = `(current.HeapAlloc - previous.HeapAlloc) / previous.HeapAlloc`
+- [ ] Spike threshold: +15% increase in single interval (configurable)
+- [ ] `isSpike(sample Sample) bool` method
+
+#### Callbacks
+- [ ] `onSample func(Sample)` called every sampling interval
+- [ ] `onSpike func(Sample)` called when spike detected
+- [ ] Callbacks executed asynchronously (non-blocking)
+
+#### Lifecycle
+- [ ] `Run(ctx context.Context)` starts monitoring goroutine
+- [ ] Respects context cancellation for clean shutdown
+- [ ] Configurable interval (default: 200ms)
+
+**Tests:**
+- [ ] Samples collected at configured interval
+- [ ] Trend calculated correctly
+- [ ] Spike detected at +15% threshold
+- [ ] Ring buffer wraps correctly
+- [ ] Clean shutdown on context cancel
+- [ ] Callbacks invoked correctly
+
+---
+
+### MP.5 Admission Controller
+
+Gate new pipeline scheduling based on memory pressure.
+
+**Files to create:**
+- `core/resources/admission_controller.go`
+
+**Files to modify:**
+- `core/session/pipeline_scheduler.go` (lines 79-100, Schedule method)
+
+**Dependencies:** MP.3 (Pressure State Machine).
+
+**Acceptance Criteria:**
+
+#### Admission Gate
+- [ ] `AdmissionController` struct holds reference to `*GlobalPipelineScheduler`
+- [ ] `admitting bool` atomic flag controls admission state
+- [ ] `queued []*Pipeline` holds pipelines waiting for admission
+
+#### TryAdmit Interface
+- [ ] `TryAdmit(p *Pipeline) bool` - attempt to admit pipeline
+- [ ] If admitting: call `scheduler.Schedule()` and return true
+- [ ] If not admitting: add to queue and return false
+
+#### Stop/Resume
+- [ ] `Stop()` - set admitting=false (no new pipelines)
+- [ ] `Resume()` - set admitting=true, drain queued pipelines
+- [ ] Drain preserves priority order
+
+#### Query Methods
+- [ ] `QueueLength() int` - number of queued pipelines
+- [ ] `IsAdmitting() bool` - current admission state
+
+**Tests:**
+- [ ] Pipelines admitted when admitting=true
+- [ ] Pipelines queued when admitting=false
+- [ ] Stop() prevents new admissions
+- [ ] Resume() drains queue to scheduler
+- [ ] Queue maintains priority order
+- [ ] Thread-safe concurrent operations
+
+---
+
+### MP.6 EvictableCache Interface & QueryCache Implementation
+
+Define cache interface for pressure-driven eviction and implement for QueryCache.
+
+**Files to create:**
+- `core/resources/evictable_cache.go`
+
+**Files to modify:**
+- `agents/archivalist/query_cache.go` (lines 85-98, add interface methods)
+
+**Dependencies:** None (interface definition + existing QueryCache).
+
+**Acceptance Criteria:**
+
+#### EvictableCache Interface
+- [ ] `EvictableCache` interface in `core/resources/evictable_cache.go`
+- [ ] `Name() string` - cache identifier
+- [ ] `Size() int64` - current memory usage in bytes
+- [ ] `EvictPercent(percent float64) int64` - evict percentage, return bytes freed
+
+#### QueryCache.Name()
+- [ ] Returns `"query_cache"`
+
+#### QueryCache.Size()
+- [ ] Estimate: `len(responses)*1024 + len(embeddings)*256*4` bytes
+- [ ] Thread-safe (uses existing mu lock)
+
+#### QueryCache.EvictPercent()
+- [ ] Calculate target entries: `int(len(responses) * percent)`
+- [ ] Reuse existing `evictOldestLocked()` logic
+- [ ] Return bytes freed: `beforeSize - afterSize`
+- [ ] Update memory monitor after eviction
+
+**Tests:**
+- [ ] QueryCache satisfies EvictableCache interface
+- [ ] Size() returns reasonable estimate
+- [ ] EvictPercent(0.25) removes ~25% of entries
+- [ ] Bytes freed returned correctly
+- [ ] Thread-safe under concurrent access
+
+---
+
+### MP.7 Cache Evictor
+
+Coordinate eviction across multiple caches.
+
+**Files to create:**
+- `core/resources/cache_evictor.go`
+
+**Dependencies:** MP.6 (EvictableCache Interface).
+
+**Acceptance Criteria:**
+
+#### CacheEvictor Struct
+- [ ] `CacheEvictor` struct holds `[]EvictableCache`
+- [ ] `NewCacheEvictor(caches ...EvictableCache) *CacheEvictor`
+
+#### Evict by Percentage
+- [ ] `Evict(percent float64) int64` - evict percentage from all caches
+- [ ] Returns total bytes freed across all caches
+- [ ] Iterates through all registered caches
+
+#### Evict by Bytes Target
+- [ ] `EvictBytes(targetBytes int64) int64` - evict until target bytes freed
+- [ ] Sort caches by size (largest first)
+- [ ] Evict 25% at a time from each cache until target met
+- [ ] Returns actual bytes freed
+
+#### Stats
+- [ ] `TotalSize() int64` - sum of all cache sizes
+- [ ] `CacheCount() int` - number of registered caches
+
+**Tests:**
+- [ ] Evict(0.25) evicts from all caches
+- [ ] EvictBytes stops when target reached
+- [ ] Largest caches evicted first for EvictBytes
+- [ ] Total bytes freed tracked correctly
+- [ ] Empty cache list handled gracefully
+
+---
+
+### MP.8 Context Compactor
+
+Signal agents to compact their LLM contexts under pressure.
+
+**Files to create:**
+- `core/resources/context_compactor.go`
+
+**Dependencies:** MP.1 (Memory Pressure Signals), MP.2 (SignalBus Publisher).
+
+**Acceptance Criteria:**
+
+#### ContextCompactor Struct
+- [ ] `ContextCompactor` struct holds `*signal.SignalBus`, `*UsageRegistry`
+- [ ] `NewContextCompactor(signalBus, registry) *ContextCompactor`
+
+#### CompactAll
+- [ ] `CompactAll()` broadcasts `CompactContexts` signal to all agents
+- [ ] Signal payload: `{All: true, Reason: "Memory pressure"}`
+- [ ] Non-blocking broadcast
+
+#### CompactLargest
+- [ ] `CompactLargest(n int)` - compact N largest context holders
+- [ ] Query registry for largest `UsageCategoryLLMBuffers` components
+- [ ] Send targeted signals with specific `TargetID`
+
+#### Signal Handling (Agent Side)
+- [ ] Document expected agent response to CompactContexts signal
+- [ ] Agents should summarize/truncate older context messages
+- [ ] Return freed bytes estimate
+
+**Tests:**
+- [ ] CompactAll broadcasts to signal bus
+- [ ] CompactLargest targets correct components
+- [ ] Registry query returns largest by category
+- [ ] Non-blocking even with slow subscribers
+
+---
+
+### MP.9 Pipeline Suspender
+
+Pause/resume pipelines by priority under memory pressure.
+
+**Files to create:**
+- `core/resources/pipeline_suspender.go`
+
+**Files to modify:**
+- `core/session/pipeline_scheduler.go` (add GetActiveSortedByPriority method)
+
+**Dependencies:** MP.1 (Memory Pressure Signals).
+
+**Acceptance Criteria:**
+
+#### GlobalPipelineScheduler Extensions
+- [ ] `GetActiveSortedByPriority() []*ScheduledPipelineInfo` - active pipelines sorted by priority (lowest first)
+- [ ] Track paused state per pipeline
+
+#### PipelineSuspender Struct
+- [ ] `PipelineSuspender` struct holds `*GlobalPipelineScheduler`, `*signal.SignalBus`
+- [ ] `paused map[string]*PausedPipeline` tracks suspended pipelines
+- [ ] `PausedPipeline` struct: `ID, Priority, PausedAt time.Time`
+
+#### Pause Operations
+- [ ] `PauseLowestPriority() *PausedPipeline` - pause single lowest priority
+- [ ] Send `PausePipeline` signal with `RequiresAck: true`
+- [ ] Track in paused map
+- [ ] Return paused pipeline info
+
+#### Resume Operations
+- [ ] `ResumeAll()` - resume all paused pipelines
+- [ ] `ResumeHighestPriority() *PausedPipeline` - resume single highest priority
+- [ ] Send `ResumePipeline` signal
+- [ ] Remove from paused map
+
+#### Query Methods
+- [ ] `PausedCount() int` - number of paused pipelines
+- [ ] `IsPaused(pipelineID string) bool`
+
+**Tests:**
+- [ ] GetActiveSortedByPriority returns correct order
+- [ ] Lowest priority paused first
+- [ ] Highest priority resumed first
+- [ ] ResumeAll clears all paused
+- [ ] Signals sent with correct payloads
+- [ ] Acknowledgment handling works
+
+---
+
+### MP.10 Usage Registry
+
+Track actual memory usage by category without upfront reservation.
+
+**Files to create:**
+- `core/resources/usage_registry.go`
+
+**Dependencies:** None (foundational tracking).
+
+**Acceptance Criteria:**
+
+#### Usage Categories
+- [ ] `UsageCategory` enum: `Caches`, `Pipelines`, `LLMBuffers`, `WAL`
+- [ ] Extensible for future categories
+
+#### ComponentUsage Struct
+- [ ] `ComponentUsage` struct: `ID, Category, Bytes, UpdatedAt time.Time`
+- [ ] Tracks per-component memory usage
+
+#### UsageRegistry Struct
+- [ ] `UsageRegistry` struct with `sync.RWMutex` for thread safety
+- [ ] `byCategory map[UsageCategory]int64` - totals per category
+- [ ] `byComponent map[string]*ComponentUsage` - per-component tracking
+
+#### Report/Release Interface
+- [ ] `Report(id string, category UsageCategory, bytes int64)` - update usage
+- [ ] `Release(id string)` - remove component from tracking
+- [ ] Both non-blocking, called by components
+
+#### Query Methods
+- [ ] `Total() int64` - sum across all categories
+- [ ] `ByCategory(cat UsageCategory) int64` - category total
+- [ ] `LargestComponents(n int, category UsageCategory) []*ComponentUsage`
+
+**Tests:**
+- [ ] Report adds/updates component usage
+- [ ] Release removes component
+- [ ] Category totals accurate
+- [ ] LargestComponents returns correct order
+- [ ] Thread-safe under concurrent access
+- [ ] No memory leaks on Report/Release cycles
+
+---
+
+### MP.11 Pressure Controller
+
+Main orchestrator that coordinates all memory pressure defense layers.
+
+**Files to create:**
+- `core/resources/pressure_controller.go`
+
+**Dependencies:** MP.2, MP.3, MP.4, MP.5, MP.7, MP.8, MP.9, MP.10 (all layers).
+
+**Acceptance Criteria:**
+
+#### PressureController Struct
+- [ ] Holds references to all layer components:
+  - `registry *UsageRegistry`
+  - `monitor *SpikeMonitor`
+  - `stateMachine *PressureStateMachine`
+  - `admission *AdmissionController`
+  - `evictor *CacheEvictor`
+  - `compactor *ContextCompactor`
+  - `suspender *PipelineSuspender`
+  - `signalBus *signal.SignalBus`
+
+#### Constructor
+- [ ] `NewPressureController(signalBus, scheduler, caches) *PressureController`
+- [ ] Wire all callbacks between components
+- [ ] Configure memory limit using `debug.SetMemoryLimit()`
+
+#### Run Loop
+- [ ] `Run(ctx context.Context)` starts monitoring
+- [ ] Wire `monitor.onSample` to `stateMachine.Update()`
+- [ ] Wire `monitor.onSpike` to spike handler
+- [ ] Wire `stateMachine.onTransition` to response handler
+
+#### Response Matrix
+- [ ] NORMAL: `admission.Resume()`, `suspender.ResumeAll()`
+- [ ] ELEVATED: `admission.Stop()`, `triggerGC()`
+- [ ] HIGH: + `evictor.Evict(0.25)`, `compactor.CompactAll()`
+- [ ] CRITICAL: + `evictor.Evict(0.50)`, `suspender.PauseLowestPriority()`
+- [ ] SPIKE: Immediate `triggerGC()` + `evictor.Evict(0.25)`, bypass cooldown
+
+#### GC Trigger
+- [ ] `triggerGC()` calls `runtime.GC()` + `debug.FreeOSMemory()`
+- [ ] Run in goroutine (non-blocking)
+
+#### Accessor Methods
+- [ ] `Registry() *UsageRegistry` - for component usage reporting
+- [ ] `Admission() *AdmissionController` - for pipeline creation
+
+**Tests:**
+- [ ] All components wired correctly
+- [ ] State transitions trigger correct responses
+- [ ] Spike detection bypasses cooldown
+- [ ] GC triggered at appropriate times
+- [ ] Clean shutdown on context cancel
+- [ ] End-to-end pressure response works
+
+---
+
+### MP.12 Memory Pressure Integration
+
+Wire PressureController into application startup and existing components.
+
+**Files to modify:**
+- `cmd/root.go` or application bootstrap
+- `agents/archivalist/archivalist.go` (wire QueryCache as EvictableCache)
+- `core/session/pipeline_scheduler.go` (use AdmissionController)
+
+**Dependencies:** MP.11 (Pressure Controller), all previous MP tasks.
+
+**Acceptance Criteria:**
+
+#### Startup Wiring
+- [ ] Create `PressureController` in application bootstrap
+- [ ] Pass real `SignalBus` instance
+- [ ] Pass `GlobalPipelineScheduler` instance
+- [ ] Pass all `EvictableCache` instances (QueryCache, etc.)
+- [ ] Start controller with `go pressureController.Run(ctx)`
+
+#### QueryCache Integration
+- [ ] Register QueryCache with PressureController's Registry
+- [ ] Report usage on Store/Evict operations
+- [ ] Subscribe to `EvictCaches` signal for external eviction requests
+
+#### PipelineScheduler Integration
+- [ ] Route `Schedule()` calls through AdmissionController
+- [ ] Handle admission rejection gracefully (queue or retry)
+
+#### Agent Context Integration
+- [ ] Agents subscribe to `CompactContexts` signal
+- [ ] Implement context compaction response
+- [ ] Report context size to Registry
+
+#### Shutdown
+- [ ] Clean shutdown of PressureController
+- [ ] Release all tracked resources
+- [ ] Cancel monitoring goroutine
+
+**Tests:**
+- [ ] PressureController starts with application
+- [ ] QueryCache eviction triggered by pressure
+- [ ] Pipeline admission gated by pressure
+- [ ] Agents respond to compact signals
+- [ ] Clean shutdown without leaks
+
+---
+
+### MP.13 Memory Pressure Defense Tests
+
+Comprehensive tests for the memory pressure defense system.
+
+**Files to create:**
+- `core/resources/pressure_controller_test.go`
+- `core/resources/pressure_state_test.go`
+- `core/resources/admission_controller_test.go`
+- `core/resources/integration_test.go`
+
+**Dependencies:** All MP.1-MP.12 tasks.
+
+**Acceptance Criteria:**
+
+#### Unit Tests
+- [ ] PressureStateMachine hysteresis works correctly
+- [ ] Cooldown prevents rapid transitions
+- [ ] SpikeMonitor detects +15% spikes
+- [ ] AdmissionController gates correctly
+- [ ] CacheEvictor evicts correct percentages
+- [ ] UsageRegistry tracks accurately
+
+#### Integration Tests
+- [ ] Full pressure response cycle: NORMAL→ELEVATED→HIGH→CRITICAL→NORMAL
+- [ ] Spike detection triggers immediate response
+- [ ] Cache eviction frees expected memory
+- [ ] Pipeline admission stops/resumes correctly
+- [ ] Context compaction signals delivered
+
+#### Stress Tests
+- [ ] High-frequency memory allocation doesn't cause flapping
+- [ ] Many concurrent pipelines handled correctly
+- [ ] No goroutine leaks under pressure
+- [ ] No deadlocks between components
+
+#### Benchmark Tests
+- [ ] Monitoring overhead < 1% CPU
+- [ ] 200ms sampling interval maintained
+- [ ] State machine transitions < 1ms
+- [ ] Eviction completes in reasonable time
+
+**Tests:**
+- [ ] All unit tests pass
+- [ ] All integration tests pass
+- [ ] All stress tests pass
+- [ ] Benchmarks meet performance targets
+- [ ] No race conditions (run with -race)
+
+---
+
+### Memory Pressure Parallelization Notes
+
+**Internal Dependencies:**
+```
+MP.1 (Signals) ────────────────────────┐
+MP.3 (State Machine) ──────────────────┤
+MP.4 (Spike Monitor) ──────────────────┤
+MP.10 (Usage Registry) ────────────────┼──► MP.11 (Controller) ──► MP.12 (Integration) ──► MP.13 (Tests)
+                                       │
+MP.2 (Publisher) ─► MP.8 (Compactor) ──┤
+                                       │
+MP.6 (Interface) ─► MP.7 (Evictor) ────┤
+                                       │
+MP.5 (Admission) ──────────────────────┤
+MP.9 (Suspender) ──────────────────────┘
+```
+
+**Optimal parallel execution:**
+1. Start MP.1, MP.3, MP.4, MP.6, MP.10 in parallel (no internal deps)
+2. When MP.1 completes → start MP.2
+3. When MP.2 completes → start MP.8
+4. When MP.6 completes → start MP.7
+5. When MP.3 completes → start MP.5
+6. When MP.1 completes → start MP.9
+7. When ALL MP.2-MP.10 complete → start MP.11
+8. When MP.11 completes → start MP.12
+9. When MP.12 completes → start MP.13
+
+**Cross-system dependencies:**
+- Depends on 0.11 (Signal Bus) - already complete
+- Depends on 0.33 (Memory Monitor) - already complete
+- Depends on 0.18 (Pipeline Scheduler) - already complete
+- Integrates with Archivalist QueryCache
+- Integrates with agent context management
+
+---
+
+## Goroutine & Operation Lifecycle Management System
+
+**Reference**: See `/GOROUTINE.md` for complete design specification and code implementations.
+
+**Goal**: Zero-leak goroutine management with user-controllable Stop/Pause/Kill commands, sandbox-agnostic process termination, and graceful degradation.
+
+### GR.1 NoGo Linter (Compile-Time Enforcement) ✅ COMPLETED
+
+**Files created:**
+- `cmd/nogo/main.go` ✅
+- `cmd/nogo/main_test.go` ✅
+- `cmd/nogo/testdata/` ✅
+
+**Acceptance Criteria:**
+- [x] `Analyzer` struct implementing `golang.org/x/tools/go/analysis.Analyzer`
+- [x] Forbids raw `go` statements outside `core/concurrency` package
+- [x] Pattern match: `^go\s+func` and `^go\s+\w+\(`
+- [x] Whitelist: `core/concurrency` package can use raw `go`
+- [x] Reports line number and file path for violations
+- [x] Integration with golangci-lint via forbidigo settings
+- [x] CI integration: fails build on violation
+- [x] Error message: "raw 'go' statement forbidden - use scope.Go() from core/concurrency"
+
+**Tests:**
+- [x] Linter catches raw `go func()` statements
+- [x] Linter catches raw `go someFunc()` statements
+- [x] Linter ignores `core/concurrency` package
+- [x] Linter works in golangci-lint context
+
+---
+
+### GR.2 GoroutineScope (Worker Management)
+
+**Files to create:**
+- `core/concurrency/goroutine_scope.go`
+- `core/concurrency/worker.go`
+
+**Acceptance Criteria:**
+- [ ] `WorkFunc` type: `func(ctx context.Context) error`
+- [ ] `GoroutineScope` struct with:
+  - [ ] `agentID string` - owning agent identifier
+  - [ ] `parentCtx context.Context` - cancellation propagation
+  - [ ] `cancel context.CancelFunc` - cancel all workers
+  - [ ] `workers map[uint64]*worker` - active workers
+  - [ ] `wg sync.WaitGroup` - shutdown coordination
+  - [ ] `budget *GoroutineBudget` - resource limits
+  - [ ] `maxLifetime time.Duration` - absolute maximum (default 5 min)
+  - [ ] `shutdownStarted bool`, `shutdownComplete chan struct{}` - shutdown state
+- [ ] `worker` struct with:
+  - [ ] `id`, `ctx`, `cancel`, `startedAt`, `deadline`, `description`, `done`, `err`
+- [ ] `NewGoroutineScope(ctx, agentID, budget) *GoroutineScope`
+- [ ] `Go(description string, timeout time.Duration, fn WorkFunc) error`
+  - [ ] Rejects if shutdown started (returns `ErrScopeShutdown`)
+  - [ ] Enforces `timeout <= maxLifetime`
+  - [ ] Calls `budget.Acquire()` before spawning
+  - [ ] Creates worker with dedicated context and deadline
+  - [ ] Tracks in `workers` map
+  - [ ] Spawns goroutine via internal `runWorker()`
+- [ ] `runWorker()` method:
+  - [ ] Recovers from panic, captures stack trace
+  - [ ] Cleans up: cancel context, close done channel, remove from map
+  - [ ] Calls `budget.Release()` on completion
+- [ ] `Shutdown(gracePeriod, hardDeadline time.Duration) error`
+  - [ ] Phase 1: Cancel parent context
+  - [ ] Phase 2: Wait for graceful termination (up to `gracePeriod`)
+  - [ ] Phase 3: Force cancel individual workers
+  - [ ] Phase 4: Wait until `hardDeadline`
+  - [ ] Returns `GoroutineLeakError` if workers remain
+  - [ ] Blocks until verified complete or error
+- [ ] `ErrScopeShutdown` sentinel error
+- [ ] `GoroutineLeakError` struct with `AgentID`, `LeakedCount`, `Workers`, `StackDump`
+
+**Tests:**
+- [ ] Go() spawns worker that executes and completes
+- [ ] Go() respects timeout, cancels at deadline
+- [ ] Go() blocks if budget exhausted, unblocks on release
+- [ ] Shutdown() waits for workers to complete
+- [ ] Shutdown() force-cancels after grace period
+- [ ] Shutdown() returns error if workers leak past hard deadline
+- [ ] Panic in worker is captured, doesn't crash scope
+- [ ] Context cancellation propagates to all workers
+
+---
+
+### GR.3 GoroutineBudget (Dynamic Limits)
+
+**Files to create:**
+- `core/concurrency/goroutine_budget.go`
+
+**Acceptance Criteria:**
+- [ ] `GoroutineBudget` struct with:
+  - [ ] `agents map[string]*agentBudgetState` - per-agent state
+  - [ ] `totalActive int64` - global counter
+  - [ ] `systemLimit int64` - based on `GOMAXPROCS * 1000`
+  - [ ] `pressureLevel *atomic.Int32` - from memory pressure system
+  - [ ] `burstMultiplier float64` - default 1.5
+  - [ ] `typeWeights map[string]float64` - agent type weights
+  - [ ] `onWarning`, `onBlocked` callbacks
+- [ ] `agentBudgetState` struct with:
+  - [ ] `agentID`, `agentType`, `active`, `peak`, `softLimit`, `hardLimit`
+  - [ ] `waiters int32`, `cond *sync.Cond`
+- [ ] `NewGoroutineBudget(pressureLevel *atomic.Int32) *GoroutineBudget`
+- [ ] `RegisterAgent(agentID, agentType string)`
+- [ ] `UnregisterAgent(agentID string)`
+- [ ] `Acquire(agentID string) error`
+  - [ ] Blocks if `active >= hardLimit` (calls `onBlocked`)
+  - [ ] Warns if `active > softLimit` (calls `onWarning`)
+  - [ ] Increments `active` and `totalActive`
+- [ ] `Release(agentID string)`
+  - [ ] Decrements `active` and `totalActive`
+  - [ ] Signals waiters via `cond.Signal()`
+- [ ] `OnPressureChange(level PressureLevel)`
+  - [ ] Updates `pressureLevel`
+  - [ ] Recalculates all limits via `recalculateLimitsLocked()`
+- [ ] `recalculateLimitsLocked()`
+  - [ ] NORMAL: 100%, ELEVATED: 75%, HIGH: 50%, CRITICAL: 25%
+  - [ ] `softLimit = baseBudget * pressureMultiplier`
+  - [ ] `hardLimit = softLimit * burstMultiplier`
+  - [ ] Minimum softLimit: 10, hardLimit: 15
+- [ ] Type weights: engineer=1.0, architect=0.5, librarian=0.3, etc.
+
+**Tests:**
+- [ ] Acquire succeeds when under softLimit
+- [ ] Acquire warns when over softLimit but under hardLimit
+- [ ] Acquire blocks when at hardLimit
+- [ ] Release unblocks waiting Acquire
+- [ ] OnPressureChange recalculates limits correctly
+- [ ] Budget distributes fairly based on type weights
+- [ ] Multiple agents share budget correctly
+
+---
+
+### GR.4 Safe Blocking Primitives
+
+**Files to create:**
+- `core/concurrency/safechan/safechan.go`
+- `core/concurrency/safelock/safelock.go`
+
+**Acceptance Criteria:**
+
+**safechan package:**
+- [ ] `Send[T any](ctx context.Context, ch chan<- T, value T) error`
+  - [ ] Returns `nil` on successful send
+  - [ ] Returns `ctx.Err()` if context cancelled
+- [ ] `Recv[T any](ctx context.Context, ch <-chan T) (T, error)`
+  - [ ] Returns value on successful receive
+  - [ ] Returns `ErrChannelClosed` if channel closed
+  - [ ] Returns `ctx.Err()` if context cancelled
+- [ ] `Sleep(ctx context.Context, d time.Duration) error`
+  - [ ] Returns `nil` after duration
+  - [ ] Returns `ctx.Err()` if context cancelled early
+- [ ] `ErrChannelClosed` sentinel error
+
+**safelock package:**
+- [ ] `Mutex` struct using `chan struct{}` (capacity 1)
+- [ ] `NewMutex() *Mutex`
+- [ ] `Lock(ctx context.Context) error`
+  - [ ] Returns `nil` on successful lock
+  - [ ] Returns `ctx.Err()` if context cancelled while waiting
+- [ ] `Unlock()`
+
+**Tests:**
+- [ ] safechan.Send succeeds on non-full channel
+- [ ] safechan.Send returns context error on cancellation
+- [ ] safechan.Recv succeeds on non-empty channel
+- [ ] safechan.Recv returns error on closed channel
+- [ ] safechan.Recv returns context error on cancellation
+- [ ] safechan.Sleep returns after duration
+- [ ] safechan.Sleep returns early on cancellation
+- [ ] safelock.Mutex locks and unlocks correctly
+- [ ] safelock.Mutex.Lock returns error on context cancellation
+
+---
+
+### GR.5 AgentSupervisor (Per-Agent Lifecycle)
+
+**Files to create:**
+- `core/concurrency/agent_supervisor.go`
+- `core/concurrency/operation.go`
+
+**Acceptance Criteria:**
+- [ ] `AgentSupervisor` struct with:
+  - [ ] `agentID`, `agentType`, `pipelineID`, `sessionID`
+  - [ ] `ctx context.Context`, `cancel context.CancelFunc`
+  - [ ] `state atomic.Int32` - current state
+  - [ ] `scope *GoroutineScope` - goroutine management
+  - [ ] `operations map[string]*Operation` - active operations
+  - [ ] `resources *ResourceTracker` - tracked resources
+  - [ ] `pauseBarrier *PauseBarrier` - pause coordination
+  - [ ] `checkpointer Checkpointer` - checkpoint interface
+  - [ ] `config AgentSupervisorConfig`
+- [ ] `AgentSupervisorConfig` struct:
+  - [ ] `MaxConcurrentOps int` (default 10)
+  - [ ] `DefaultOpTimeout time.Duration` (default 30s)
+  - [ ] `MaxOpTimeout time.Duration` (default 5m)
+  - [ ] `GracePeriod time.Duration` (default 5s)
+  - [ ] `ForceCloseDeadline time.Duration` (default 10s)
+- [ ] `Operation` struct:
+  - [ ] `ID`, `Type`, `AgentID`, `Description`
+  - [ ] `StartedAt`, `Deadline`
+  - [ ] `ctx`, `cancel`, `pauseCh`, `resumeCh`, `done`
+  - [ ] `resources []TrackedResource`
+  - [ ] `result any`, `err error`
+- [ ] `OperationType` enum: `OpTypeLLMCall`, `OpTypeToolExecution`, `OpTypeFileIO`, `OpTypeNetworkIO`
+- [ ] `NewAgentSupervisor(ctx, agentID, agentType, pipelineID, budget) *AgentSupervisor`
+- [ ] `BeginOperation(opType, description, timeout) (*Operation, error)`
+  - [ ] Blocks on `pauseBarrier.Wait()`
+  - [ ] Enforces `MaxConcurrentOps` limit
+  - [ ] Creates operation with scoped context and deadline
+  - [ ] Tracks in `operations` map
+- [ ] `EndOperation(op, result, err)`
+  - [ ] Sets result and error
+  - [ ] Cancels operation context
+  - [ ] Releases all tracked resources
+  - [ ] Removes from `operations` map
+- [ ] `TrackResource(op *Operation, res TrackedResource)`
+- [ ] `CancelAll()` - cancels supervisor and all operation contexts
+- [ ] `ForceCloseResources()` - force-closes all tracked resources
+- [ ] `StopAcceptingWork()` - prevents new operations
+- [ ] `WaitForCompletion(ctx)` - blocks until all operations complete
+- [ ] `SignalPause()`, `WaitForPause(ctx)`, `SignalResume()`
+- [ ] `MarkOrphansAndReport() []OrphanedOperation`
+
+**Tests:**
+- [ ] BeginOperation creates tracked operation
+- [ ] BeginOperation blocks when at max concurrent ops
+- [ ] BeginOperation blocks when paused
+- [ ] EndOperation cleans up resources
+- [ ] CancelAll cancels all operations
+- [ ] ForceCloseResources calls ForceClose on all resources
+- [ ] WaitForCompletion blocks until all done
+- [ ] Pause/Resume cycle works correctly
+
+---
+
+### GR.6 PipelineController (User Commands)
+
+**Files to create:**
+- `core/concurrency/pipeline_controller.go`
+
+**Acceptance Criteria:**
+- [ ] `PipelineController` struct with:
+  - [ ] `pipelineID string`
+  - [ ] `supervisors map[string]*AgentSupervisor`
+  - [ ] `state atomic.Int32` - pipeline state
+  - [ ] `config PipelineControllerConfig`
+- [ ] `PipelineControllerConfig` struct:
+  - [ ] `StopGracePeriod time.Duration` (default 30s)
+  - [ ] `PauseTimeout time.Duration` (default 5s)
+  - [ ] `KillGracePeriod time.Duration` (default 2s)
+  - [ ] `KillHardDeadline time.Duration` (default 5s)
+- [ ] `PipelineState` enum: `Running`, `Stopping`, `Stopped`, `Pausing`, `Paused`, `Killing`, `Killed`
+- [ ] `NewPipelineController(pipelineID string, config) *PipelineController`
+- [ ] `RegisterSupervisor(agentID string, supervisor *AgentSupervisor)`
+- [ ] `UnregisterSupervisor(agentID string)`
+- [ ] `Stop(ctx context.Context) error`
+  - [ ] Sets state to `Stopping`
+  - [ ] Calls `StopAcceptingWork()` on all supervisors
+  - [ ] Calls `WaitForCompletion()` on all supervisors (with deadline)
+  - [ ] Sets state to `Stopped`
+  - [ ] Returns `nil` on success
+- [ ] `Pause(ctx context.Context) error`
+  - [ ] Sets state to `Pausing`
+  - [ ] Calls `SignalPause()` on all supervisors
+  - [ ] Calls `WaitForPause()` on all supervisors (with timeout)
+  - [ ] Sets state to `Paused`
+- [ ] `Resume(ctx context.Context) error`
+  - [ ] Calls `SignalResume()` on all supervisors
+  - [ ] Sets state to `Running`
+- [ ] `Kill(ctx context.Context) error`
+  - [ ] Sets state to `Killing`
+  - [ ] Phase 1: `CancelAll()` on all supervisors
+  - [ ] Phase 2: Wait for voluntary termination (grace period)
+  - [ ] Phase 3: `ForceCloseResources()` on all supervisors
+  - [ ] Phase 4: Wait until hard deadline
+  - [ ] Phase 5: `MarkOrphansAndReport()` if still stuck
+  - [ ] Sets state to `Killed`
+  - [ ] Returns `PipelineKillOrphansError` if orphans remain
+- [ ] `State() PipelineState` - returns current state
+- [ ] `PipelineKillOrphansError` struct with `PipelineID`, `Orphans []OrphanedOperation`
+
+**Tests:**
+- [ ] Stop waits for all operations to complete
+- [ ] Stop respects grace period
+- [ ] Pause freezes all operations
+- [ ] Resume continues after pause
+- [ ] Kill force-terminates all operations
+- [ ] Kill escalates through all 5 phases
+- [ ] Kill returns error with orphan details if stuck
+
+---
+
+### GR.7 TrackedLLMClient (Boundary Interceptor)
+
+**Files to create:**
+- `core/llm/tracked_client.go`
+
+**Acceptance Criteria:**
+- [ ] `TrackedLLMClient` struct wrapping underlying `LLMClient`
+- [ ] `Complete(supervisor *AgentSupervisor, req *CompletionRequest) (*CompletionResponse, error)`
+  - [ ] Calls `supervisor.BeginOperation(OpTypeLLMCall, description, timeout)`
+  - [ ] Calls `underlying.CompleteWithContext(op.Context(), req)`
+  - [ ] Calls `supervisor.EndOperation(op, resp, err)`
+  - [ ] Returns response and error
+- [ ] `Stream(supervisor *AgentSupervisor, req *CompletionRequest) (<-chan StreamChunk, error)`
+  - [ ] Same operation tracking pattern
+  - [ ] EndOperation called when stream completes or errors
+
+**Tests:**
+- [ ] Complete tracks operation lifecycle
+- [ ] Complete respects operation timeout
+- [ ] Complete cancels on supervisor cancellation
+- [ ] Stream tracks operation until completion
+
+---
+
+### GR.8 TrackedToolExecutor (Sandbox-Agnostic)
+
+**Files to create:**
+- `core/tools/tracked_executor.go`
+
+**Acceptance Criteria:**
+- [ ] `TrackedToolExecutor` struct with:
+  - [ ] `permissionMgr *security.PermissionManager` (always active)
+  - [ ] `sandboxMgr *security.SandboxManager` (may be nil/disabled)
+  - [ ] `auditLogger *security.AuditLogger` (always active)
+  - [ ] `maxTimeout time.Duration`
+- [ ] `NewTrackedToolExecutor(permMgr, sandboxMgr, auditLogger, maxTimeout) *TrackedToolExecutor`
+- [ ] `Execute(supervisor *AgentSupervisor, tool Tool, args map[string]any) (any, error)`
+  - [ ] Calls `supervisor.BeginOperation(OpTypeToolExecution, description, timeout)`
+  - [ ] Permission check via `permissionMgr.CheckPermission()` - blocks if denied
+  - [ ] Audit log via `auditLogger.Log()` - always
+  - [ ] Creates `TrackedProcess` (sandbox-agnostic)
+  - [ ] Tracks process as resource via `supervisor.TrackResource()`
+  - [ ] Executes and parses output
+  - [ ] Calls `supervisor.EndOperation(op, result, err)`
+- [ ] Works correctly with sandbox OFF (default) - uses OS signals
+- [ ] Works correctly with sandbox ON - uses sandbox kill + OS fallback
+
+**Tests:**
+- [ ] Execute tracks operation lifecycle
+- [ ] Execute checks permissions (blocks if denied)
+- [ ] Execute logs to audit logger
+- [ ] Execute creates TrackedProcess
+- [ ] Execute works without sandbox (OS signals)
+- [ ] Execute works with sandbox (sandbox + OS fallback)
+
+---
+
+### GR.9 TrackedProcess (Sandbox-Agnostic)
+
+**Files to create:**
+- `core/tools/tracked_process.go`
+
+**Acceptance Criteria:**
+- [ ] `ProcessState` enum: `Created`, `Running`, `Terminating`, `Terminated`
+- [ ] `TrackedProcess` struct with:
+  - [ ] `cmd *exec.Cmd`
+  - [ ] `pid int`, `pgid int` (process group ID)
+  - [ ] `startedAt time.Time`
+  - [ ] `sandbox *security.SandboxManager` (nil if disabled)
+  - [ ] `state ProcessState`, `doneCh chan struct{}`, `exitErr error`
+- [ ] `NewTrackedProcess(ctx, command, args, sandbox) (*TrackedProcess, error)`
+  - [ ] Sets `cmd.SysProcAttr.Setpgid = true` for process group isolation
+  - [ ] Applies sandbox config if enabled via `sandbox.ConfigureCommand(cmd)`
+- [ ] `Run() ([]byte, error)`
+  - [ ] Starts process, records PID and PGID
+  - [ ] Waits for completion in background goroutine
+  - [ ] Returns output on success
+- [ ] `Type() string` returns "process"
+- [ ] `ID() string` returns `proc-{pid}`
+- [ ] `ForceClose() error`
+  - [ ] If already terminated, returns nil
+  - [ ] If sandbox enabled, tries `sandbox.ForceKill(pid)` first
+  - [ ] Falls back to `signalTerminationSequence()` (always works)
+- [ ] `signalTerminationSequence() error`
+  - [ ] Phase 1: SIGINT (100ms wait)
+  - [ ] Phase 2: SIGTERM (500ms wait)
+  - [ ] Phase 3: SIGKILL (100ms wait)
+- [ ] `signalGroup(sig syscall.Signal) error`
+  - [ ] Uses `syscall.Kill(-pgid, sig)` to signal entire process group
+  - [ ] Kills child processes spawned by the tool
+
+**Tests:**
+- [ ] NewTrackedProcess sets Setpgid=true
+- [ ] NewTrackedProcess applies sandbox config if enabled
+- [ ] Run executes command and returns output
+- [ ] ForceClose sends SIGINT first
+- [ ] ForceClose escalates to SIGTERM after 100ms
+- [ ] ForceClose escalates to SIGKILL after 500ms
+- [ ] signalGroup kills child processes via process group
+- [ ] Works without sandbox (OS signals only)
+- [ ] Works with sandbox (sandbox + OS fallback)
+
+---
+
+### GR.10 ResourceTracker
+
+**Files to create:**
+- `core/concurrency/resource_tracker.go`
+
+**Acceptance Criteria:**
+- [ ] `TrackedResource` interface:
+  - [ ] `Type() string`
+  - [ ] `ID() string`
+  - [ ] `ForceClose() error`
+- [ ] `ResourceTracker` struct with:
+  - [ ] `resources map[string]TrackedResource`
+  - [ ] `counts map[string]int64` - per-type counts
+- [ ] `NewResourceTracker() *ResourceTracker`
+- [ ] `Track(res TrackedResource)`
+  - [ ] Adds to map, increments type count
+- [ ] `Release(res TrackedResource)`
+  - [ ] Removes from map, decrements type count
+- [ ] `ForceCloseAll() []error`
+  - [ ] Calls `ForceClose()` on all resources
+  - [ ] Collects and returns all errors
+  - [ ] Clears maps
+- [ ] `Count(resType string) int64`
+- [ ] `TotalCount() int64`
+
+**Tests:**
+- [ ] Track adds resource to map
+- [ ] Release removes resource from map
+- [ ] ForceCloseAll calls ForceClose on all resources
+- [ ] ForceCloseAll collects all errors
+- [ ] Count returns correct per-type count
+
+---
+
+### GR.11 PauseBarrier
+
+**Files to create:**
+- `core/concurrency/pause_barrier.go`
+
+**Acceptance Criteria:**
+- [ ] `PauseBarrier` struct with:
+  - [ ] `engaged bool`
+  - [ ] `cond *sync.Cond`
+- [ ] `NewPauseBarrier() *PauseBarrier`
+- [ ] `Engage()` - sets engaged=true
+- [ ] `Release()` - sets engaged=false, broadcasts to all waiters
+- [ ] `Wait(ctx context.Context) error`
+  - [ ] If not engaged, returns immediately
+  - [ ] If engaged, blocks until released or context cancelled
+  - [ ] Returns `ctx.Err()` if cancelled while waiting
+- [ ] `IsEngaged() bool`
+
+**Tests:**
+- [ ] Wait returns immediately when not engaged
+- [ ] Wait blocks when engaged
+- [ ] Wait unblocks when Release called
+- [ ] Wait returns context error on cancellation
+- [ ] Multiple goroutines can wait and unblock together
+
+---
+
+### GR.12 Lifecycle State Extensions
+
+**Files to modify:**
+- `core/concurrency/lifecycle.go`
+
+**Acceptance Criteria:**
+- [ ] Add new states to `LifecycleState` enum:
+  - [ ] `StatePausing` = 10
+  - [ ] `StatePaused` = 11
+  - [ ] `StateResuming` = 12
+  - [ ] `StateKilling` = 13
+  - [ ] `StateKilled` = 14
+- [ ] Add new valid transitions:
+  - [ ] `{StateRunning, StatePausing}` → true
+  - [ ] `{StatePausing, StatePaused}` → true
+  - [ ] `{StatePaused, StateResuming}` → true
+  - [ ] `{StateResuming, StateRunning}` → true
+  - [ ] `{StateRunning, StateKilling}` → true
+  - [ ] `{StateKilling, StateKilled}` → true
+  - [ ] `{StatePausing, StateKilling}` → true (can kill while pausing)
+  - [ ] `{StatePaused, StateKilling}` → true (can kill while paused)
+- [ ] State names for logging/display
+
+**Tests:**
+- [ ] New states are valid
+- [ ] New transitions work correctly
+- [ ] Invalid transitions are rejected
+- [ ] State names render correctly
+
+---
+
+### GR.13 KillSequence Extension (5-Phase)
+
+**Files to modify:**
+- `core/tools/kill_sequence.go`
+
+**Acceptance Criteria:**
+- [ ] Add new phases to `KillPhase` enum:
+  - [ ] `KillPhaseForceCloseResources` = 10
+  - [ ] `KillPhaseOrphanTracking` = 11
+- [ ] Modify `ExecuteKillSequence(proc *TrackedProcess) error`:
+  - [ ] Phase 1-3: Existing SIGINT → SIGTERM → SIGKILL sequence
+  - [ ] Phase 4: Call `proc.ForceCloseResources()` if still running
+  - [ ] Phase 5: Call `orphanTracker.Track(proc)` if still stuck
+  - [ ] Return `OrphanedProcessError` if process remains
+- [ ] `OrphanTracker` struct for tracking orphaned processes
+- [ ] `OrphanedProcessError` struct with `PID int`
+
+**Tests:**
+- [ ] Phase 1-3 signal sequence works
+- [ ] Phase 4 force-closes resources
+- [ ] Phase 5 tracks orphan if still stuck
+- [ ] Returns OrphanedProcessError correctly
+
+---
+
+### GR.14 Signal Handler Integration
+
+**Files to modify:**
+- `core/signal/agent_handler.go`
+
+**Acceptance Criteria:**
+- [ ] `AgentHandler` struct with `pipelineController *PipelineController`
+- [ ] `handleSignal(sig os.Signal)`:
+  - [ ] `SIGINT` (first): call `pipelineController.Stop()`
+  - [ ] `SIGINT` (second): call `pipelineController.Kill()`
+  - [ ] `SIGTERM`: call `pipelineController.Kill()`
+  - [ ] `SIGTSTP` (Ctrl+Z): call `pipelineController.Pause()`
+- [ ] Track `interruptReceived bool` for SIGINT escalation
+- [ ] Reset `interruptReceived` after successful Stop
+
+**Tests:**
+- [ ] First SIGINT triggers Stop
+- [ ] Second SIGINT triggers Kill
+- [ ] SIGTERM triggers Kill
+- [ ] SIGTSTP triggers Pause
+- [ ] interruptReceived resets after Stop completes
+
+---
+
+### GR.15 UI Command Integration
+
+**Files to modify:**
+- Terminal UI command handler (location TBD based on UI architecture)
+
+**Acceptance Criteria:**
+- [ ] Command `stop` or `q`: triggers `pipelineController.Stop()`
+- [ ] Command `pause` or `p`: triggers `pipelineController.Pause()`
+- [ ] Command `resume` or `r`: triggers `pipelineController.Resume()`
+- [ ] Command `kill` or `k`: triggers `pipelineController.Kill()`
+- [ ] Commands execute in background goroutine (UI remains responsive <16ms)
+- [ ] Status message displayed: "Stopping...", "Pausing...", etc.
+- [ ] Completion/error feedback displayed to user
+
+**Tests:**
+- [ ] Stop command triggers Stop
+- [ ] Pause command triggers Pause
+- [ ] Resume command triggers Resume
+- [ ] Kill command triggers Kill
+- [ ] UI remains responsive during command execution
+
+---
+
+### GR.16 Memory Pressure Integration
+
+**Files to modify:**
+- `core/resources/pressure_controller.go`
+
+**Acceptance Criteria:**
+- [ ] `PressureController` holds reference to `GoroutineBudget`
+- [ ] On pressure level change, call `goroutineBudget.OnPressureChange(level)`
+- [ ] Budget adjusts limits: NORMAL→100%, ELEVATED→75%, HIGH→50%, CRITICAL→25%
+- [ ] Agents experience backpressure when budget limits reached
+
+**Tests:**
+- [ ] Pressure change propagates to GoroutineBudget
+- [ ] Budget limits adjust correctly per level
+- [ ] Agents block when budget exhausted under pressure
+
+---
+
+### GR.17 Goroutine Management Integration Tests
+
+**Files to create:**
+- `core/concurrency/goroutine_integration_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test full Stop lifecycle: start operations → Stop → verify clean shutdown
+- [ ] Test full Pause/Resume lifecycle: start operations → Pause → verify frozen → Resume → verify continues
+- [ ] Test full Kill lifecycle: start operations → Kill → verify force termination
+- [ ] Test tool execution with TrackedProcess: execute → ForceClose → verify process killed
+- [ ] Test goroutine budget under memory pressure: reduce capacity → verify backpressure
+- [ ] Test compile-time enforcement: verify linter catches raw `go` statements
+- [ ] Test cascade: Kill pipeline → verify all agents terminate → verify all processes killed
+- [ ] Stress test: many concurrent operations → Kill → verify zero leaks
+- [ ] Race condition test: run with `-race` flag
+
+**Tests:**
+- [ ] All integration tests pass
+- [ ] No race conditions detected
+- [ ] Zero goroutine leaks in all scenarios
+
+---
+
+### Goroutine Management Parallelization Notes
+
+**Internal Dependencies:**
+```
+GR.1 (Linter) ─────────────────────────────────────────────────────┐
+                                                                    │
+GR.4 (Safe Primitives) ────────────────────────────────────────────┤
+                                                                    │
+GR.3 (Budget) ─────────────────────────────────────────────────────┤
+                                                                    │
+GR.11 (PauseBarrier) ──────────────────────────────────────────────┤
+                                                                    │
+GR.10 (ResourceTracker) ───────────────────────────────────────────┤
+                                                                    ├──► GR.5 (Supervisor) ──► GR.6 (Controller) ──► GR.14, GR.15
+GR.2 (Scope) ──────────────────────────────────────────────────────┤
+       │                                                            │
+       └──► depends on GR.3, GR.4                                   │
+                                                                    │
+GR.9 (TrackedProcess) ─────────────────────────────────────────────┼──► GR.8 (TrackedToolExecutor) ──► GR.13 (KillSequence)
+                                                                    │
+GR.7 (TrackedLLMClient) ───────────────────────────────────────────┤
+                                                                    │
+GR.12 (Lifecycle States) ──────────────────────────────────────────┘
+
+GR.16 (Memory Integration) depends on GR.3 + MP.11 (Pressure Controller)
+GR.17 (Integration Tests) depends on ALL above
+```
+
+**Optimal parallel execution:**
+1. Start GR.1, GR.4, GR.10, GR.11 in parallel (no internal deps)
+2. When GR.4 completes → start GR.3 (needs safechan for condition variables)
+3. When GR.3, GR.4 complete → start GR.2 (needs Budget and safe primitives)
+4. When GR.10, GR.11, GR.2 complete → start GR.5 (needs all foundational components)
+5. Start GR.9 in parallel (independent TrackedProcess)
+6. When GR.5 completes → start GR.6 (Controller needs Supervisor)
+7. When GR.9 completes → start GR.8 (TrackedToolExecutor needs TrackedProcess)
+8. When GR.5, GR.8 complete → start GR.7 (TrackedLLMClient needs Supervisor)
+9. Start GR.12 in parallel (Lifecycle state extensions)
+10. When GR.9 completes → start GR.13 (KillSequence extension needs TrackedProcess)
+11. When GR.6 completes → start GR.14, GR.15 (Signal/UI integration)
+12. When GR.3, MP.11 complete → start GR.16 (Memory pressure integration)
+13. When ALL complete → start GR.17 (Integration tests)
+
+**Cross-system dependencies:**
+- Depends on MP.11 (Pressure Controller) for GR.16
+- Depends on existing Security Model (PermissionManager, AuditLogger) for GR.8
+- Depends on existing Lifecycle (0.17) for GR.12
+- Depends on existing KillSequenceManager (0.45) for GR.13
+- Integrates with UI command system for GR.15
+
+---
+
+## File Handle Management System
+
+**Goal**: Hierarchical work-stealing file handle allocation with proactive tracking, automatic cleanup, and user notification on wait/proceed.
+
+### FH.1 FileHandleBudget (Global Pool)
+
+**Files to create:**
+- `core/resources/file_handle_budget.go`
+
+**Acceptance Criteria:**
+- [ ] `FileHandleBudget` struct with:
+  - [ ] `globalLimit int` - detected from `ulimit -n` at startup
+  - [ ] `reserved int` - 20% reserved for system operations
+  - [ ] `globalAllocated atomic.Int64` - sum of session allocations
+  - [ ] `globalUsed atomic.Int64` - sum of actual open files
+  - [ ] `sessions sync.Map` - sessionID → *SessionFileBudget
+  - [ ] `pressureLevel *atomic.Int32` - from memory pressure system
+  - [ ] `notifier ResourceNotifier` - UI notification interface
+  - [ ] `logger *slog.Logger`
+- [ ] `NewFileHandleBudget(notifier, logger) *FileHandleBudget`
+  - [ ] Detect system limit via `syscall.Getrlimit(syscall.RLIMIT_NOFILE, ...)`
+  - [ ] Reserve 20% for system operations
+- [ ] `RegisterSession(sessionID string) *SessionFileBudget`
+  - [ ] Creates SessionFileBudget with fair-share allocation
+  - [ ] Rebalances other sessions if needed
+- [ ] `UnregisterSession(sessionID string)`
+  - [ ] Releases session's allocation back to global pool
+  - [ ] Signals all waiters (capacity now available)
+- [ ] `tryExpandSession(session *SessionFileBudget) bool`
+  - [ ] Attempts to allocate 1 more FD from global unallocated
+  - [ ] Returns true if successful, false if global exhausted
+- [ ] `signalAllWaiters()` - broadcasts to all sessions/agents
+- [ ] `OnPressureChange(level PressureLevel)` - reduce allocations under pressure
+- [ ] `Snapshot() FileHandleSnapshot` - monitoring view
+
+**Tests:**
+- [ ] NewFileHandleBudget detects system limit correctly
+- [ ] RegisterSession creates fair-share allocation
+- [ ] UnregisterSession releases allocation
+- [ ] tryExpandSession succeeds when global has capacity
+- [ ] tryExpandSession fails when global exhausted
+- [ ] OnPressureChange reduces allocations appropriately
+
+---
+
+### FH.2 SessionFileBudget (Per-Session Allocation)
+
+**Files to create:**
+- `core/resources/session_file_budget.go`
+
+**Acceptance Criteria:**
+- [ ] `SessionFileBudget` struct with:
+  - [ ] `sessionID string`
+  - [ ] `parent *FileHandleBudget`
+  - [ ] `allocated atomic.Int64` - claimed from global
+  - [ ] `used atomic.Int64` - actual usage by agents
+  - [ ] `agents sync.Map` - agentID → *AgentFileBudget
+  - [ ] `mu sync.Mutex`, `cond *sync.Cond`
+- [ ] `RegisterAgent(agentID, agentType string) *AgentFileBudget`
+  - [ ] Creates AgentFileBudget with base allocation by type
+  - [ ] Base allocations: engineer=50, architect=30, inspector=20, etc.
+- [ ] `UnregisterAgent(agentID string)`
+  - [ ] Releases agent's allocation back to session pool
+  - [ ] Signals waiters
+- [ ] `tryExpandAgent(agent *AgentFileBudget) bool`
+  - [ ] Attempts to allocate 1 more FD from session unallocated
+  - [ ] Returns true if successful
+- [ ] `signalWaiters()` - broadcasts to all agents in session
+- [ ] `sumAgentAllocations() int64` - total allocated to agents
+- [ ] `Unallocated() int64` - available for agent stealing
+
+**Tests:**
+- [ ] RegisterAgent creates allocation based on agent type
+- [ ] UnregisterAgent releases allocation
+- [ ] tryExpandAgent succeeds when session has capacity
+- [ ] tryExpandAgent fails when session exhausted
+- [ ] Unallocated returns correct available count
+
+---
+
+### FH.3 AgentFileBudget (Per-Agent Allocation)
+
+**Files to create:**
+- `core/resources/agent_file_budget.go`
+
+**Acceptance Criteria:**
+- [ ] `AgentFileBudget` struct with:
+  - [ ] `agentID string`, `agentType string`
+  - [ ] `parent *SessionFileBudget`
+  - [ ] `allocated atomic.Int64` - claimed from session
+  - [ ] `used atomic.Int64` - actual open files
+  - [ ] `baseAllocation int` - starting allocation by type
+  - [ ] `mu sync.Mutex`, `cond *sync.Cond`
+- [ ] `Acquire(ctx context.Context) error`
+  - [ ] Attempts hierarchical acquisition: agent → session → global
+  - [ ] If must wait: log "waiting", notify UI (ONCE)
+  - [ ] When acquired after wait: log "acquired", notify UI
+  - [ ] Context cancellation clears notification and returns error
+  - [ ] NO errors or warnings for normal waiting
+- [ ] `tryAcquire() (acquired bool, level string)`
+  - [ ] Level 1: Check agent capacity
+  - [ ] Level 2: Try steal from session (tryExpandAgent)
+  - [ ] Level 3: Session steals from global, then agent from session
+  - [ ] Returns acquisition level for logging ("agent", "session", "global")
+- [ ] `Release()`
+  - [ ] Decrements used at all levels (agent, session, global)
+  - [ ] Signals waiters at all levels
+- [ ] `signalWaiters()` - wakes waiting goroutines
+
+**Tests:**
+- [ ] Acquire succeeds when agent has capacity
+- [ ] Acquire steals from session when agent exhausted
+- [ ] Acquire steals from global when session exhausted
+- [ ] Acquire waits and logs when all exhausted
+- [ ] Acquire notifies UI once on wait, once on proceed
+- [ ] Release signals waiters at all levels
+- [ ] Context cancellation returns error and clears notification
+
+---
+
+### FH.4 TrackedFile (Implements TrackedResource)
+
+**Files to create:**
+- `core/resources/tracked_file.go`
+
+**Acceptance Criteria:**
+- [ ] `FileMode` enum: `ModeRead`, `ModeWrite`, `ModeReadWrite`, `ModeAppend`
+- [ ] `TrackedFile` struct with:
+  - [ ] `file *os.File`
+  - [ ] `path string`, `fd int`, `mode FileMode`
+  - [ ] `openedAt time.Time`
+  - [ ] `lastAccess atomic.Value` (time.Time)
+  - [ ] `sessionID string`, `agentID string`
+  - [ ] `agentBudget *AgentFileBudget`
+  - [ ] `mu sync.Mutex`, `closed bool`
+- [ ] Implements `TrackedResource` interface:
+  - [ ] `Type() string` returns "file"
+  - [ ] `ID() string` returns `file:{path}:{fd}`
+  - [ ] `ForceClose() error` - releases budget, closes file
+- [ ] `Read(p []byte) (int, error)` - wraps file.Read, updates lastAccess
+- [ ] `Write(p []byte) (int, error)` - wraps file.Write, updates lastAccess
+- [ ] `Close() error` - explicit close, same as ForceClose
+- [ ] `Path() string`, `Fd() int`, `Mode() FileMode` - getters
+- [ ] `OpenDuration() time.Duration` - time since opened
+- [ ] `IdleDuration() time.Duration` - time since last access
+
+**Tests:**
+- [ ] Type() returns "file"
+- [ ] ID() returns correct format
+- [ ] ForceClose releases budget and closes file
+- [ ] Read/Write update lastAccess
+- [ ] Double close is safe (idempotent)
+- [ ] OpenDuration and IdleDuration return correct values
+
+---
+
+### FH.5 ResourceNotifier Interface
+
+**Files to create:**
+- `core/resources/notifier.go`
+- `core/ui/resource_notifier.go`
+
+**Acceptance Criteria:**
+- [ ] `ResourceNotifier` interface:
+  - [ ] `AgentWaiting(sessionID, agentID, resource string)`
+  - [ ] `AgentProceeding(sessionID, agentID, resource string)`
+- [ ] `NoOpNotifier` struct - implements interface, does nothing (for testing)
+- [ ] `LoggingNotifier` struct - logs to slog.Logger
+- [ ] `UINotifier` struct - signals terminal UI
+  - [ ] Sends to UI channel without blocking (non-blocking send)
+  - [ ] UI displays "⏳ waiting for {resource}..." next to agent
+  - [ ] UI clears status when proceeding
+- [ ] `CompositeNotifier` struct - fans out to multiple notifiers
+
+**Tests:**
+- [ ] NoOpNotifier implements interface
+- [ ] LoggingNotifier logs correctly
+- [ ] UINotifier sends non-blocking
+- [ ] CompositeNotifier fans out to all children
+
+---
+
+### FH.6 AgentSupervisor.OpenFile Integration
+
+**Files to modify:**
+- `core/concurrency/agent_supervisor.go`
+
+**Acceptance Criteria:**
+- [ ] Add `fileBudget *AgentFileBudget` field to AgentSupervisor
+- [ ] Add `OpenFile(ctx context.Context, path string, mode FileMode) (*TrackedFile, error)`
+  - [ ] Calls `fileBudget.Acquire(ctx)` - may wait with notification
+  - [ ] Opens file via `os.OpenFile()`
+  - [ ] On open error: calls `fileBudget.Release()`, returns error
+  - [ ] Wraps as TrackedFile with budget reference
+  - [ ] Calls `resources.Track(tracked)` for auto-cleanup
+  - [ ] Returns TrackedFile
+- [ ] Add `CloseFile(file *TrackedFile) error` - explicit close helper
+- [ ] On supervisor cleanup: existing `ForceCloseResources()` handles files
+  - [ ] TrackedFile.ForceClose() releases budget automatically
+
+**Tests:**
+- [ ] OpenFile acquires from budget
+- [ ] OpenFile tracks via ResourceTracker
+- [ ] OpenFile waits and notifies when budget exhausted
+- [ ] Open error releases budget
+- [ ] Supervisor cleanup closes all tracked files
+- [ ] File close releases budget
+
+---
+
+### FH.7 FileHandleSnapshot (Monitoring)
+
+**Files to create:**
+- `core/resources/file_handle_snapshot.go`
+
+**Acceptance Criteria:**
+- [ ] `FileHandleSnapshot` struct with:
+  - [ ] `Global` struct: `Limit`, `Allocated`, `Used`, `Unallocated int`
+  - [ ] `Sessions []SessionSnapshot`
+- [ ] `SessionSnapshot` struct with:
+  - [ ] `SessionID string`
+  - [ ] `Allocated`, `Used`, `Unallocated int`
+  - [ ] `Agents []AgentSnapshot`
+- [ ] `AgentSnapshot` struct with:
+  - [ ] `AgentID string`, `AgentType string`
+  - [ ] `Allocated`, `Used int`
+  - [ ] `Waiting bool`
+- [ ] `FileHandleBudget.Snapshot() FileHandleSnapshot`
+  - [ ] Returns current state for monitoring/debugging
+  - [ ] Thread-safe (uses atomic loads)
+- [ ] JSON serialization for debugging/logging
+
+**Tests:**
+- [ ] Snapshot returns accurate counts
+- [ ] Snapshot is thread-safe
+- [ ] JSON serialization works
+
+---
+
+### FH.8 Memory Pressure Integration
+
+**Files to modify:**
+- `core/resources/pressure_controller.go`
+
+**Acceptance Criteria:**
+- [ ] `PressureController` holds reference to `FileHandleBudget`
+- [ ] On pressure level change, call `fileHandleBudget.OnPressureChange(level)`
+- [ ] Budget adjusts allocations:
+  - [ ] NORMAL: 100% of base allocations
+  - [ ] ELEVATED: 75% - reduce session/agent allocations
+  - [ ] HIGH: 50% - significant reduction
+  - [ ] CRITICAL: 25% - minimal allocations
+- [ ] Reclaim protocol when reducing:
+  - [ ] Sessions over new limit must release
+  - [ ] Priority: close idle files first, then read-only, then active
+
+**Tests:**
+- [ ] Pressure change propagates to FileHandleBudget
+- [ ] Allocations reduce correctly per level
+- [ ] Reclaim closes files when over new limit
+
+---
+
+### FH.9 File Handle Management Integration Tests
+
+**Files to create:**
+- `core/resources/file_handle_integration_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test hierarchical stealing: agent → session → global
+- [ ] Test wait + notification: exhaust pool, verify log + UI notification
+- [ ] Test proceed notification: release file, verify waiter notified
+- [ ] Test multi-session fair share: 2 sessions get equal allocation
+- [ ] Test work-stealing: idle session's capacity used by active session
+- [ ] Test cleanup on agent death: files auto-closed, budget released
+- [ ] Test cleanup on session death: all session files closed
+- [ ] Test memory pressure: allocations reduce, reclaim works
+- [ ] Test snapshot accuracy under concurrent operations
+- [ ] Race condition test: run with `-race` flag
+
+**Tests:**
+- [ ] All integration tests pass
+- [ ] No race conditions detected
+- [ ] Zero file handle leaks in all scenarios
+
+---
+
+### File Handle Management Parallelization Notes
+
+**Internal Dependencies:**
+```
+FH.5 (ResourceNotifier) ───────────────────────────────────────┐
+                                                                │
+FH.4 (TrackedFile) ────────────────────────────────────────────┤
+                                                                │
+FH.1 (FileHandleBudget) ───► FH.2 (SessionFileBudget) ───► FH.3 (AgentFileBudget)
+                                                                │
+                                                                ├──► FH.6 (Supervisor Integration)
+                                                                │
+FH.7 (Snapshot) ───────────────────────────────────────────────┤
+                                                                │
+FH.8 (Memory Pressure) depends on FH.1 + MP.11 ────────────────┘
+
+FH.9 (Integration Tests) depends on ALL above
+```
+
+**Optimal parallel execution:**
+1. Start FH.4, FH.5, FH.7 in parallel (no internal deps)
+2. Start FH.1 (no deps)
+3. When FH.1 completes → start FH.2
+4. When FH.2 completes → start FH.3
+5. When FH.3, FH.4, FH.5 complete → start FH.6 (needs all for integration)
+6. When FH.1, MP.11 complete → start FH.8
+7. When ALL complete → start FH.9
+
+**Cross-system dependencies:**
+- Depends on GR.10 (ResourceTracker) for FH.4 interface
+- Depends on GR.5 (AgentSupervisor) for FH.6 integration
+- Depends on MP.11 (Pressure Controller) for FH.8
+- Uses same ResourceNotifier pattern for GoroutineBudget (can share)
+
+---
+
+## Stuck Agent Detection & Recovery
+
+### SA.1 ProgressSignal and ProgressCollector
+
+**Files to create:**
+- `core/recovery/progress_signal.go`
+- `core/recovery/progress_collector.go`
+
+**Acceptance Criteria:**
+- [ ] `ProgressSignalType` enum: `SignalToolCompleted`, `SignalLLMResponse`, `SignalFileModified`, `SignalStateTransition`, `SignalAgentRequest`
+- [ ] `ProgressSignal` struct: AgentID, SessionID, SignalType, Timestamp, Operation (string), Hash (uint64), Details (map[string]any)
+- [ ] `AgentSignalBuffer`: ring buffer (100 signals), atomic lastSignal, atomic signalCount
+- [ ] `ProgressCollector.Signal(sig ProgressSignal)`: store in buffer, update lastSignal, increment count, notify subscribers
+- [ ] `ProgressCollector.LastSignalTime(agentID) (time.Time, bool)`: return last signal time
+- [ ] `ProgressCollector.RecentSignals(agentID, n) []ProgressSignal`: return last N signals
+- [ ] `ProgressCollector.SignalCount(agentID) int64`: return total signals (for victim selection)
+- [ ] `ProgressSubscriber` interface for subscribers
+- [ ] Thread-safe: all operations use sync.Map or atomic operations
+- [ ] Implement generic ring buffer or use `container/ring` with wrapper
+
+**Implementation Guidelines:**
+- User notification does NOT count as progress (not in enum)
+- Agent-to-agent communication (`SignalAgentRequest`) IS a sign of life
+- Use xxhash or FNV for Operation hash (fast, collision-resistant)
+- Buffer size 100 is configurable via config
+
+**Tests:**
+- [ ] Signal emission updates lastSignal and signalCount
+- [ ] RecentSignals returns correct sliding window
+- [ ] Concurrent signal emission is thread-safe
+- [ ] Subscribers receive all signals
+
+---
+
+### SA.2 HealthWeights and HealthThresholds
+
+**Files to create:**
+- `core/recovery/health_config.go`
+
+**Acceptance Criteria:**
+- [ ] `HealthWeights` struct: HeartbeatWeight (0.35), ProgressWeight (0.30), RepetitionWeight (0.20), ResourceWeight (0.15)
+- [ ] `HealthThresholds` struct: HeartbeatStaleAfter (30s), ProgressWindowSize (20), RepetitionMinCycles (3), HealthyThreshold (0.7), WarningThreshold (0.4), StuckThreshold (0.2), CriticalThreshold (0.2)
+- [ ] `AgentHealthStatus` enum: StatusHealthy, StatusWarning, StatusStuck, StatusCritical, StatusDeadlocked
+- [ ] Default values match architecture spec
+- [ ] Weights sum to 1.0 (validation)
+- [ ] Thresholds are in descending order (validation)
+- [ ] Configurable via YAML/env
+
+**Implementation Guidelines:**
+- Validate weights sum to 1.0 on construction
+- Validate threshold ordering: Healthy > Warning > Stuck >= Critical
+- Provide sensible defaults with `NewDefaultHealthWeights()` and `NewDefaultHealthThresholds()`
+
+**Tests:**
+- [ ] Default values match spec
+- [ ] Validation rejects invalid weights (sum != 1.0)
+- [ ] Validation rejects invalid threshold ordering
+
+---
+
+### SA.3 HealthScorer
+
+**Files to create:**
+- `core/recovery/health_scorer.go`
+
+**Acceptance Criteria:**
+- [ ] `HealthScorer` struct: collector, repetitionDet, resourceMon, weights, thresholds
+- [ ] `HealthAssessment` struct: AgentID, SessionID, OverallScore (0.0-1.0), HeartbeatScore, ProgressScore, RepetitionScore, ResourceScore, RepetitionConcern (bool), Status, LastProgress, StuckSince (*time.Time), AssessedAt
+- [ ] `Assess(agentID string) HealthAssessment`: compute all scores, weighted sum
+- [ ] `scoreHeartbeat(agentID, now)`: 1.0 if recent, linear decay to 0.3 at threshold, exponential decay after
+- [ ] `scoreProgress(agentID)`: variety of signal types and targets in window
+- [ ] `scoreRepetition(agentID)`: delegates to RepetitionDetector.Score()
+- [ ] `scoreResource(agentID)`: delegates to ResourceMonitor (CPU spinning, no I/O patterns)
+- [ ] **CRITICAL**: RepetitionConcern = repetition < 0.5 AND (heartbeat < 0.5 OR progress < 0.5)
+- [ ] If !RepetitionConcern, effectiveRepetition = 1.0 (don't penalize)
+- [ ] Status derived from overall score using thresholds
+
+**Implementation Guidelines:**
+- Repetition ONLY matters when combined with other bad signals
+- This prevents false positives on legitimate repetitive automation
+- Progress variety: count unique signal types (max 5) and unique operations (cap at 10)
+- Heartbeat decay: recent (<10s) = 1.0, linear decay to 0.3 at 30s, exponential after
+
+**Tests:**
+- [ ] Healthy agent (all scores good) → StatusHealthy
+- [ ] Repetitive but otherwise healthy agent → StatusHealthy (not penalized)
+- [ ] Repetitive AND stale heartbeat → StatusStuck (penalized)
+- [ ] Very stale heartbeat → StatusCritical
+- [ ] StuckSince is set when status >= StatusStuck
+
+---
+
+### SA.4 RepetitionDetector
+
+**Files to create:**
+- `core/recovery/repetition_detector.go`
+
+**Acceptance Criteria:**
+- [ ] `RepetitionConfig`: WindowSize (50), MaxCycleLength (5), MinRepetitions (3)
+- [ ] `OperationLog`: ring buffer of Operation, per-agent
+- [ ] `Operation` struct: Type, Action, Target, Timestamp, Hash
+- [ ] `Record(agentID, op Operation)`: add to agent's log
+- [ ] `Score(agentID) float64`: 1.0 = no repetition, 0.0 = definite loop
+- [ ] Detect cycles of length 1-5 (configurable)
+- [ ] Need MinRepetitions (3) cycles to be concerning
+- [ ] Score decreases with more repetitions detected
+- [ ] `countRepetitions(ops, cycleLen) int`: count consecutive cycle matches from end
+
+**Implementation Guidelines:**
+- Use hash comparison for speed (compute hash once on Record)
+- Check from longest cycle to shortest (break on first match)
+- Score formula: `1.0 - min(reps / (MinRepetitions + 3), 1.0)`
+- Only check from end of buffer (recent operations matter most)
+
+**Tests:**
+- [ ] No operations → score 1.0
+- [ ] Random operations → score 1.0
+- [ ] Single operation repeated 3x → score ~0.5
+- [ ] Pattern of 3 operations repeated 4x → score ~0.4
+- [ ] Long repetition (10x) → score ~0.0
+
+---
+
+### SA.5 DeadlockDetector
+
+**Files to create:**
+- `core/recovery/deadlock_detector.go`
+
+**Acceptance Criteria:**
+- [ ] `WaitEdge`: WaiterID, HolderID, ResourceType, ResourceID, WaitingSince
+- [ ] `DeadlockResult`: Detected, Type, Cycle ([]string), DeadHolder, WaitingAgents, ResourceType, ResourceID
+- [ ] `DeadlockType` enum: DeadlockNone, DeadlockCircular, DeadlockDeadHolder
+- [ ] `RegisterWait(waiter, holder, resourceType, resourceID)`: add edge to wait graph
+- [ ] `ClearWait(waiter, resourceID)`: remove edge when resource acquired
+- [ ] `Check() []DeadlockResult`: scan for deadlocks
+- [ ] Detect circular dependencies using DFS with recursion stack
+- [ ] Detect waiting on dead agent's resources via `agentStatus` callback
+- [ ] Thread-safe: use RWMutex for wait graph
+
+**Implementation Guidelines:**
+- Wait graph is `map[string][]WaitEdge` (waiterID → edges)
+- DFS uses visited + recStack maps for cycle detection
+- Extract cycle from path when recStack hit is found
+- agentStatus callback provided by AgentSupervisor
+
+**Tests:**
+- [ ] No edges → no deadlock
+- [ ] A waits on B (alive) → no deadlock
+- [ ] A waits on B (dead) → DeadlockDeadHolder detected
+- [ ] A→B→A cycle → DeadlockCircular detected
+- [ ] A→B→C→A cycle → DeadlockCircular detected
+- [ ] ClearWait removes edge correctly
+
+---
+
+### SA.6 RecoveryConfig and RecoveryState
+
+**Files to create:**
+- `core/recovery/recovery_config.go`
+- `core/recovery/recovery_state.go`
+
+**Acceptance Criteria:**
+- [ ] `RecoveryConfig`: SoftInterventionDelay (30s), UserEscalationDelay (60s), ForceKillDelay (120s), MaxSoftAttempts (2), MonitorInterval (5s)
+- [ ] `RecoveryLevel` enum: RecoveryNone, RecoverySoftIntervention, RecoveryUserEscalation, RecoveryForceKill
+- [ ] `RecoveryState`: agentID, sessionID, level, stuckSince, softAttempts, lastSoftIntervention, userEscalated, userEscalatedAt, userResponse, resourcesReleased, mu (sync.Mutex)
+- [ ] `UserRecoveryResponse`: Action, Timestamp
+- [ ] `UserRecoveryAction` enum: UserActionWait, UserActionKill, UserActionInspect
+- [ ] Configurable via YAML/env
+
+**Implementation Guidelines:**
+- RecoveryState is per-agent, stored in sync.Map
+- All RecoveryState modifications protected by mu
+- resourcesReleased tracks resources for recovery notification
+
+**Tests:**
+- [ ] Default config values match spec
+- [ ] RecoveryState properly tracks all fields
+- [ ] Concurrent access to RecoveryState is safe
+
+---
+
+### SA.7 RecoveryNotifier Interface
+
+**Files to create:**
+- `core/recovery/recovery_notifier.go`
+
+**Acceptance Criteria:**
+- [ ] `RecoveryNotifier` interface with methods:
+  - `InjectBreakoutPrompt(agentID, prompt string) error`
+  - `EscalateToUser(sessionID, agentID string, assessment HealthAssessment) error`
+  - `OnUserResponse(agentID string, response UserRecoveryResponse)`
+  - `NotifyForceKill(sessionID, agentID, reason string)`
+  - `NotifyReacquireResources(agentID string, resources []string)`
+- [ ] Interface defined in recovery package
+- [ ] UI implementation in ui package (implements interface)
+- [ ] LLM injection implementation in llm package (implements InjectBreakoutPrompt)
+
+**Implementation Guidelines:**
+- InjectBreakoutPrompt prepends system message to next LLM request
+- EscalateToUser shows modal: "Agent X appears stuck [Wait] [Kill] [Inspect]"
+- NotifyReacquireResources queues notification for agent's next operation
+- UI implementation uses tview modal for escalation
+
+**Tests:**
+- [ ] Mock implementation for testing
+- [ ] InjectBreakoutPrompt integrates with LLM client
+- [ ] EscalateToUser triggers UI modal
+
+---
+
+### SA.8 RecoveryOrchestrator
+
+**Files to create:**
+- `core/recovery/recovery_orchestrator.go`
+
+**Acceptance Criteria:**
+- [ ] `RecoveryOrchestrator`: supervisor, healthScorer, deadlockDet, resourceMgr, notifier, logger, recoveryState (sync.Map), config
+- [ ] `HandleStuckAgent(assessment HealthAssessment)`: hierarchical recovery logic
+- [ ] If StatusHealthy: clear state, notify re-acquire if resources were released
+- [ ] If stuck < SoftInterventionDelay: just monitor
+- [ ] If stuck < UserEscalationDelay: try soft intervention (up to MaxSoftAttempts)
+- [ ] If stuck < ForceKillDelay: escalate to user (once), handle user response
+- [ ] If stuck >= ForceKillDelay: force kill (unless user said Wait)
+- [ ] `trySoftIntervention(state, assessment)`: inject breakout prompt
+- [ ] `buildBreakoutPrompt(assessment)`: context-aware prompt (repetition vs general stuck)
+- [ ] `escalateToUser(state, assessment)`: show UI modal
+- [ ] `handleUserResponse(state, assessment)`: Wait/Kill/Inspect handling
+- [ ] `forceKill(state, assessment)`: release resources, notify, terminate via supervisor
+
+**Implementation Guidelines:**
+- State transitions: None → Soft → User → Kill
+- User can override: Wait prevents force kill, Inspect allows monitoring
+- On recovery (StatusHealthy), notify agent to re-acquire released resources
+- Force kill releases resources BEFORE terminating agent
+
+**Tests:**
+- [ ] Healthy agent clears recovery state
+- [ ] Stuck agent progresses through recovery levels
+- [ ] Soft intervention sent at correct threshold
+- [ ] User escalation sent at correct threshold
+- [ ] Force kill at correct threshold (unless user Wait)
+- [ ] User Wait prevents force kill
+- [ ] Recovered agent notified to re-acquire resources
+
+---
+
+### SA.9 DeadlockRecovery
+
+**Files to create:**
+- `core/recovery/deadlock_recovery.go`
+
+**Acceptance Criteria:**
+- [ ] `HandleDeadlock(result DeadlockResult)`: dispatch by type
+- [ ] `handleDeadHolderDeadlock(result)`: eager release, record resources, force kill dead holder
+- [ ] `handleCircularDeadlock(result)`: select victim (least progress), release, escalate to user
+- [ ] `selectDeadlockVictim(cycle []string) string`: return agent with minimum SignalCount
+- [ ] Released resources recorded in RecoveryState.resourcesReleased
+- [ ] On agent recovery, trigger re-acquisition
+
+**Implementation Guidelines:**
+- Dead holder: immediately release resources, then kill (unblock waiters fast)
+- Circular: pick victim with least work (minimize wasted computation)
+- Escalate circular to user (unusual condition, needs attention)
+- Resource release via ResourceManager.ForceReleaseByAgent()
+
+**Tests:**
+- [ ] Dead holder: resources released, holder killed
+- [ ] Circular: victim with least progress selected
+- [ ] Released resources recorded for recovery notification
+- [ ] User notified of circular deadlock
+
+---
+
+### SA.10 ResourceReacquisition
+
+**Files to create:**
+- `core/recovery/resource_reacquisition.go`
+
+**Acceptance Criteria:**
+- [ ] `ResourceReacquisition`: resourceMgr, notifier, logger
+- [ ] `ReacquireResources(agentID string, resources []string) error`: attempt to re-acquire each resource
+- [ ] Log warning for each failed re-acquisition
+- [ ] Return error listing failed resources
+- [ ] Log success when all re-acquired
+- [ ] Integrate with agent's operation loop (check for pending re-acquisition)
+
+**Implementation Guidelines:**
+- Called when RecoveryOrchestrator detects agent recovered (StatusHealthy after resources released)
+- Resources may have been claimed by other agents; failure is possible
+- Agent should handle re-acquisition failure gracefully (may need to request new resources)
+
+**Tests:**
+- [ ] All resources re-acquired → success
+- [ ] Some resources unavailable → partial failure with error
+- [ ] Zero resources → no-op success
+
+---
+
+### SA.11 AgentSupervisor Health Monitoring Integration
+
+**Files to create:**
+- `core/session/agent_supervisor_health.go` (or extend existing)
+
+**Acceptance Criteria:**
+- [ ] `MonitorHealth(ctx context.Context)` method on AgentSupervisor
+- [ ] Ticker at MonitorInterval (5s)
+- [ ] Range over all active agents, call healthScorer.Assess()
+- [ ] If status >= StatusStuck, call recovery.HandleStuckAgent()
+- [ ] Check deadlockDet.Check() and call recovery.HandleDeadlock() for each result
+- [ ] Goroutine exits on ctx.Done()
+- [ ] RecoveryOrchestrator injected into AgentSupervisor
+
+**Implementation Guidelines:**
+- MonitorHealth runs as background goroutine per AgentSupervisor
+- Uses agents.Range() to iterate (sync.Map)
+- StatusStuck threshold for intervention (not Warning)
+
+**Tests:**
+- [ ] MonitorHealth runs at correct interval
+- [ ] Stuck agents trigger HandleStuckAgent
+- [ ] Deadlocks trigger HandleDeadlock
+- [ ] Goroutine exits cleanly on context cancel
+
+---
+
+### SA.12 ToolExecutor Progress Signal Integration
+
+**Files to modify:**
+- `core/tools/executor.go`
+
+**Acceptance Criteria:**
+- [ ] ToolExecutor receives ProgressCollector dependency
+- [ ] After tool.Run(), emit ProgressSignal with SignalToolCompleted
+- [ ] Operation = fmt.Sprintf("%s:%s", tool.Name(), tool.Target())
+- [ ] Compute hash with hashOperation(name, target)
+- [ ] Also record Operation in RepetitionDetector
+- [ ] Signal emitted regardless of success/failure (activity is activity)
+
+**Implementation Guidelines:**
+- Use context to get agentID and sessionID
+- hashOperation can use xxhash or FNV
+- RepetitionDetector.Record() for each tool execution
+
+**Tests:**
+- [ ] Tool execution emits progress signal
+- [ ] Hash is consistent for same operation
+- [ ] RepetitionDetector receives operation
+
+---
+
+### SA.13 LLMClient Progress Signal Integration
+
+**Files to modify:**
+- `core/llm/client.go` (or equivalent)
+
+**Acceptance Criteria:**
+- [ ] LLMClient receives ProgressCollector dependency
+- [ ] On successful Complete(), emit ProgressSignal with SignalLLMResponse
+- [ ] Operation = "llm:complete" (or include model name)
+- [ ] Signal only on success (failed calls don't indicate progress)
+- [ ] Use context for agentID
+
+**Implementation Guidelines:**
+- Check err == nil before emitting signal
+- Could include model/provider in Operation for debugging
+
+**Tests:**
+- [ ] Successful LLM call emits signal
+- [ ] Failed LLM call does not emit signal
+
+---
+
+### SA.14 AgentRouter Progress Signal Integration
+
+**Files to modify:**
+- `core/routing/agent_router.go` (or equivalent)
+
+**Acceptance Criteria:**
+- [ ] AgentRouter receives ProgressCollector dependency
+- [ ] On Dispatch(from, to, msg), emit ProgressSignal with SignalAgentRequest
+- [ ] Operation = fmt.Sprintf("agent:%s", to)
+- [ ] Signal emitted for 'from' agent (sender shows activity)
+- [ ] Agent-to-agent communication is explicit sign of life
+
+**Implementation Guidelines:**
+- This is the critical "agent communication = alive" signal
+- Emit even if dispatch fails (attempt shows activity)
+
+**Tests:**
+- [ ] Agent dispatch emits signal for sender
+- [ ] Operation includes target agent ID
+
+---
+
+### SA.15 Stuck Agent Detection Integration Tests
+
+**Files to create:**
+- `core/recovery/stuck_agent_integration_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test healthy agent: continuous signals → StatusHealthy
+- [ ] Test stale agent: no signals for 30s → StatusStuck
+- [ ] Test repetitive automation: same ops but with signals → StatusHealthy
+- [ ] Test stuck loop: same ops AND stale → StatusStuck
+- [ ] Test soft intervention: verify breakout prompt injected
+- [ ] Test user escalation: verify UI modal triggered
+- [ ] Test force kill: verify resources released, agent terminated
+- [ ] Test user Wait: verify no force kill after timeout
+- [ ] Test deadlock detection: circular and dead holder
+- [ ] Test eager release: dead holder resources released immediately
+- [ ] Test recovery notification: agent notified to re-acquire
+- [ ] Race condition test: run with `-race` flag
+
+**Tests:**
+- [ ] All integration tests pass
+- [ ] No race conditions detected
+- [ ] Recovery hierarchy works correctly
+
+---
+
+### Stuck Agent Detection Parallelization Notes
+
+**Internal Dependencies:**
+```
+SA.1 (ProgressCollector) ─────────────────────────────────────────┐
+                                                                   │
+SA.2 (HealthConfig) ──────────────────────────────────────────────┤
+                                                                   │
+SA.4 (RepetitionDetector) ────────────────────────────────────────┼──► SA.3 (HealthScorer)
+                                                                   │
+SA.5 (DeadlockDetector) ──────────────────────────────────────────┤
+                                                                   │
+SA.6 (RecoveryConfig/State) ──────────────────────────────────────┤
+                                                                   │
+SA.7 (RecoveryNotifier) ──────────────────────────────────────────┼──► SA.8 (RecoveryOrchestrator)
+                                                                   │
+                                                       SA.3 + SA.5 ┼──► SA.9 (DeadlockRecovery)
+                                                                   │
+                                                              SA.8 ┼──► SA.10 (ResourceReacquisition)
+                                                                   │
+                                                       SA.3 + SA.8 ┼──► SA.11 (Supervisor Integration)
+                                                                   │
+SA.1 + SA.4 ──────────────────────────────────────────────────────┼──► SA.12, SA.13, SA.14 (Signal Integration)
+                                                                   │
+ALL ──────────────────────────────────────────────────────────────┴──► SA.15 (Integration Tests)
+```
+
+**Optimal parallel execution:**
+1. Start SA.1, SA.2, SA.4, SA.5, SA.6, SA.7 in parallel (no internal deps)
+2. When SA.1, SA.2, SA.4 complete → start SA.3
+3. When SA.3, SA.5, SA.6, SA.7 complete → start SA.8
+4. When SA.3, SA.5 complete → start SA.9
+5. When SA.8 complete → start SA.10
+6. When SA.3, SA.8 complete → start SA.11
+7. When SA.1, SA.4 complete → start SA.12, SA.13, SA.14 in parallel
+8. When ALL complete → start SA.15
+
+**Cross-system dependencies:**
+- Depends on GR.5 (AgentSupervisor) for SA.11 integration
+- Depends on existing ResourceManager for SA.9/SA.10 resource release
+- Uses same RecoveryNotifier pattern as FH (can share or extend)
+- Signal integration (SA.12-14) needs existing tool/llm/router infrastructure
+
+---
+
+## Shared State Corruption Prevention
+
+### SC.1 HNSWSnapshot and LayerSnapshot Types
+
+**Files to create:**
+- `core/vectorgraphdb/hnsw/snapshot.go`
+
+**Acceptance Criteria:**
+- [ ] `HNSWSnapshot` struct: SeqNum, CreatedAt, EntryPoint, MaxLevel, Layers ([]LayerSnapshot), Vectors (map[string][]float32), Magnitudes (map[string]float64), readers (atomic.Int32)
+- [ ] `LayerSnapshot` struct: Nodes (map[string][]string) - nodeID → neighbors (immutable copy)
+- [ ] Snapshot is fully immutable after creation
+- [ ] Deep copy of neighbor slices (not just map copy)
+- [ ] Vector map copies references ([]float32 not mutated after insert)
+- [ ] readers atomic counter for GC tracking
+
+**Implementation Guidelines:**
+- Snapshots are read-only after creation - no mutation methods
+- Deep copy is expensive but enables lock-free reads
+- Use sync.Map or regular map (immutable, no concurrent access)
+
+**Tests:**
+- [ ] Snapshot creation captures all HNSW state
+- [ ] Modifications to source HNSW don't affect snapshot
+- [ ] Neighbor slices are independent copies
+
+---
+
+### SC.2 HNSWSnapshotManager
+
+**Files to create:**
+- `core/vectorgraphdb/hnsw/snapshot_manager.go`
+
+**Acceptance Criteria:**
+- [ ] `HNSWSnapshotManager` struct: index (*Index), currentSeqNum (atomic.Uint64), snapshots (sync.Map), gcInterval, retention, mu (sync.RWMutex)
+- [ ] `CreateSnapshot() *HNSWSnapshot`: acquire read lock, deep copy state, store in map, return snapshot
+- [ ] `ReleaseSnapshot(seqNum uint64)`: decrement readers count
+- [ ] `OnInsert()`: increment currentSeqNum (called after every insert)
+- [ ] `GCLoop(ctx context.Context)`: periodic cleanup of old snapshots with 0 readers
+- [ ] Configurable retention time (default: 5 minutes)
+- [ ] Configurable GC interval (default: 30 seconds)
+
+**Implementation Guidelines:**
+- CreateSnapshot holds index.mu.RLock during copy
+- Each layer.mu.RLock acquired individually during layer copy
+- GCLoop runs as background goroutine, exits on ctx.Done()
+- Snapshots older than retention with 0 readers are deleted
+
+**Tests:**
+- [ ] CreateSnapshot returns consistent state
+- [ ] Multiple snapshots can coexist
+- [ ] GC cleans up old snapshots with 0 readers
+- [ ] GC preserves snapshots with active readers
+- [ ] OnInsert increments sequence number
+
+---
+
+### SC.3 HNSWSnapshot Search Implementation
+
+**Files to create:**
+- `core/vectorgraphdb/hnsw/snapshot_search.go`
+
+**Acceptance Criteria:**
+- [ ] `Search(query []float32, k int, filter *SearchFilter) []SearchResult`: search on frozen state
+- [ ] `searchFromEntry(query, queryMag, k, filter)`: navigate layers top-down
+- [ ] `greedySearchLayer(query, queryMag, entry, level)`: greedy search within layer
+- [ ] `searchLayer0(query, queryMag, entry, k, filter)`: beam search in layer 0
+- [ ] `distance(query, queryMag, nodeID)`: cosine distance using frozen vectors
+- [ ] All methods use snapshot's frozen Layers/Vectors/Magnitudes
+- [ ] No locks required during search (snapshot is immutable)
+
+**Implementation Guidelines:**
+- Port existing HNSW search logic to use LayerSnapshot.Nodes
+- Use snapshot.Vectors and snapshot.Magnitudes for distance calc
+- Return math.MaxFloat64 for missing vectors (defensive)
+- Filter support same as live search
+
+**Tests:**
+- [ ] Snapshot search returns same results as live search (quiescent)
+- [ ] Snapshot search unaffected by concurrent inserts
+- [ ] Filter correctly applied
+- [ ] Empty snapshot returns nil
+
+---
+
+### SC.4 Schema Migration for Version Column
+
+**Files to create:**
+- `core/vectorgraphdb/migrations/add_version_column.go`
+
+**Acceptance Criteria:**
+- [ ] Add migration: `ALTER TABLE nodes ADD COLUMN version INTEGER NOT NULL DEFAULT 1`
+- [ ] Migration runs idempotently (check if column exists first)
+- [ ] Existing rows get version=1
+- [ ] New schema includes version column
+- [ ] Index on (id, version) for CAS updates
+
+**Implementation Guidelines:**
+- Use existing migration framework pattern from db.go
+- Check column existence: `PRAGMA table_info(nodes)` before ALTER
+- SQLite doesn't support IF NOT EXISTS for ALTER, so check manually
+
+**Tests:**
+- [ ] Fresh database has version column
+- [ ] Existing database migration adds column
+- [ ] Migration is idempotent
+- [ ] Existing nodes have version=1
+
+---
+
+### SC.5 VersionedNodeStore
+
+**Files to create:**
+- `core/vectorgraphdb/versioned_nodes.go`
+
+**Acceptance Criteria:**
+- [ ] `VersionedNodeStore` wraps `*NodeStore` with version tracking
+- [ ] `versionCache sync.Map` for fast version lookups
+- [ ] `GetNodeWithVersion(nodeID) (*GraphNode, error)`: returns node with Version field populated
+- [ ] `GetNodeVersion(nodeID) (uint64, error)`: fast version lookup (cache or DB)
+- [ ] Cache updated on writes, invalidated on conflicts
+
+**Implementation Guidelines:**
+- Extend existing NodeStore, don't replace
+- Cache reduces DB queries for version checks
+- Version field added to GraphNode struct (if not present)
+
+**Tests:**
+- [ ] GetNodeWithVersion returns correct version
+- [ ] Cache populated after read
+- [ ] Cache updated after write
+
+---
+
+### SC.6 OptimisticTx
+
+**Files to create:**
+- `core/vectorgraphdb/optimistic_tx.go`
+
+**Acceptance Criteria:**
+- [ ] `OptimisticTx` struct: store, sessionID, readSet (map[string]uint64), writeSet (map[string]*GraphNode), committed, mu
+- [ ] `BeginOptimistic(sessionID) *OptimisticTx`: create new transaction
+- [ ] `Read(nodeID) (*GraphNode, error)`: fetch node, record version in readSet
+- [ ] `Write(node *GraphNode)`: buffer node in writeSet
+- [ ] `Commit() error`: validate readSet, apply writeSet with CAS
+- [ ] Phase 1: Validate all reads still current (SELECT version WHERE id=?)
+- [ ] Phase 2: Apply writes with version increment (UPDATE ... WHERE id=? AND version=?)
+- [ ] Return ConflictError if validation fails or CAS fails
+- [ ] Update versionCache on successful commit
+
+**Implementation Guidelines:**
+- Use SQL transaction for atomicity of Phase 2
+- Return ConflictStale if read version != current version
+- Return ConflictConcurrent if CAS fails (rows affected = 0)
+- Return ConflictDeleted if node not found during validation
+
+**Tests:**
+- [ ] Commit succeeds with no conflicts
+- [ ] Commit fails with stale read
+- [ ] Commit fails with concurrent modification
+- [ ] Commit fails if node deleted
+- [ ] Multiple reads tracked correctly
+- [ ] Multiple writes applied atomically
+
+---
+
+### SC.7 ConflictError
+
+**Files to create:**
+- `core/vectorgraphdb/conflict_error.go`
+
+**Acceptance Criteria:**
+- [ ] `ConflictError` struct: NodeID, ReadVersion, CurrVersion, Type, SessionID
+- [ ] `ConflictType` enum: ConflictStale, ConflictConcurrent, ConflictDeleted, ConflictIntegrity
+- [ ] `Error() string`: human-readable error message
+- [ ] `Is(target error) bool`: for errors.Is support
+- [ ] Sentinel errors: ErrAlreadyCommitted, ErrViewClosed
+
+**Implementation Guidelines:**
+- Implement error interface
+- Include enough context for retry logic
+
+**Tests:**
+- [ ] Error messages are descriptive
+- [ ] errors.Is works correctly
+
+---
+
+### SC.8 IsolationLevel and SessionScopedView
+
+**Files to create:**
+- `core/vectorgraphdb/session_view.go`
+
+**Acceptance Criteria:**
+- [ ] `IsolationLevel` enum: IsolationReadCommitted, IsolationRepeatableRead, IsolationSessionLocal
+- [ ] `SessionScopedView` struct: sessionID, db, snapshotMgr, snapshot, isolation, optTx, closed
+- [ ] `BeginSessionView(sessionID, isolation) *SessionScopedView`: create view, acquire snapshot if RepeatableRead
+- [ ] `QueryNodes(filter NodeFilter) ([]*GraphNode, error)`: filter by isolation level
+- [ ] `Search(query, k) []SearchResult`: search on snapshot or live index
+- [ ] `BeginWrite() *OptimisticTx`: start optimistic transaction
+- [ ] `CommitWrite() error`: commit pending writes
+- [ ] `Close() error`: release snapshot, cleanup
+
+**Implementation Guidelines:**
+- IsolationSessionLocal adds session_id filter to queries
+- IsolationRepeatableRead uses snapshot for vector search
+- IsolationReadCommitted uses live index
+- Close must release snapshot to enable GC
+
+**Tests:**
+- [ ] ReadCommitted sees all committed data
+- [ ] RepeatableRead sees snapshot-consistent data
+- [ ] SessionLocal only sees own session + global data
+- [ ] Close releases snapshot
+- [ ] Double-close is safe
+
+---
+
+### SC.9 IntegrityConfig and InvariantCheck Types
+
+**Files to create:**
+- `core/vectorgraphdb/integrity/config.go`
+
+**Acceptance Criteria:**
+- [ ] `IntegrityConfig` struct: ValidateOnRead, PeriodicInterval, AutoRepair, SampleSize
+- [ ] `DefaultIntegrityConfig()`: ValidateOnRead=false, PeriodicInterval=1h, AutoRepair=true, SampleSize=100
+- [ ] `InvariantCheck` struct: Name, Description, Query, Repair, Severity
+- [ ] `Severity` enum: SeverityWarning, SeverityError, SeverityCritical
+- [ ] `Violation` struct: Check, EntityID, Description, Severity, Repaired
+- [ ] Configurable via YAML/env
+
+**Implementation Guidelines:**
+- SeverityCritical halts startup if not repaired
+- SeverityError attempts auto-repair
+- SeverityWarning logs only
+
+**Tests:**
+- [ ] Default config has expected values
+- [ ] Config can be overridden
+
+---
+
+### SC.10 IntegrityValidator
+
+**Files to create:**
+- `core/vectorgraphdb/integrity/validator.go`
+
+**Acceptance Criteria:**
+- [ ] `IntegrityValidator` struct: db, logger, config
+- [ ] `standardChecks []InvariantCheck`: orphaned_vectors, orphaned_edges_source, orphaned_edges_target, invalid_hnsw_entry, dimension_mismatch, superseded_cycle, orphaned_provenance
+- [ ] `RunChecks() []Violation`: execute all checks, auto-repair if configured
+- [ ] `runSingleCheck(check) []Violation`: execute one check query
+- [ ] `validateHashSample() []Violation`: check content_hash on random sample
+- [ ] `ValidateNodeOnRead(node) error`: optional per-read validation
+- [ ] `BackgroundScanner(ctx context.Context)`: periodic integrity scans
+
+**Implementation Guidelines:**
+- Use existing SQLite queries from architecture spec
+- Auto-repair executes Repair query if configured and violations found
+- BackgroundScanner runs as goroutine, exits on ctx.Done()
+- Log summary after each scan
+
+**Tests:**
+- [ ] Orphaned vectors detected
+- [ ] Orphaned edges detected
+- [ ] Invalid HNSW entry detected
+- [ ] Auto-repair deletes orphaned records
+- [ ] Hash mismatch detected in sample
+- [ ] BackgroundScanner runs at interval
+
+---
+
+### SC.11 IntegrityError
+
+**Files to create:**
+- `core/vectorgraphdb/integrity/error.go`
+
+**Acceptance Criteria:**
+- [ ] `IntegrityError` struct: NodeID, ExpectedHash, ActualHash
+- [ ] `Error() string`: "integrity error: node X hash mismatch..."
+- [ ] Used when ValidateNodeOnRead detects corruption
+
+**Tests:**
+- [ ] Error message includes all fields
+
+---
+
+### SC.12 FileHandleBudgetPersistence
+
+**Files to create:**
+- `core/resources/file_handle_persistence.go`
+
+**Acceptance Criteria:**
+- [ ] `FileHandleBudgetPersistence` struct: db (*sql.DB), budget (*FileHandleBudget), mu (sync.Mutex)
+- [ ] `NewFileHandleBudgetPersistence(db, budget)`: create table if not exists
+- [ ] Schema: `file_handle_budget (session_id TEXT PRIMARY KEY, allocated INTEGER, used INTEGER, updated_at TEXT)`
+- [ ] `Save() error`: atomically clear and rewrite all session budgets
+- [ ] `Restore() error`: load budget state from database
+- [ ] `PeriodicSave(ctx, interval)`: background goroutine for periodic saves
+- [ ] Final save on ctx.Done() (shutdown)
+
+**Implementation Guidelines:**
+- Use transaction for atomic clear+rewrite
+- Range over budget.sessions sync.Map
+- Restore populates getOrCreateSession for each row
+
+**Tests:**
+- [ ] Save persists all sessions
+- [ ] Restore loads all sessions
+- [ ] Atomic: partial save doesn't corrupt
+- [ ] PeriodicSave runs at interval
+- [ ] Final save on shutdown
+
+---
+
+### SC.13 ProtectionConfig
+
+**Files to create:**
+- `core/vectorgraphdb/protection_config.go`
+
+**Acceptance Criteria:**
+- [ ] `ProtectionConfig` struct: DefaultIsolation, SnapshotRetention, SnapshotGCInterval, IntegrityInterval, BudgetSaveInterval, ValidateOnRead
+- [ ] `DefaultProtectionConfig()`: ReadCommitted, 5min retention, 30s GC, 1h integrity, 30s budget, ValidateOnRead=false
+- [ ] Configurable via YAML/env
+
+**Tests:**
+- [ ] Default config has expected values
+
+---
+
+### SC.14 ProtectedVectorDB
+
+**Files to create:**
+- `core/vectorgraphdb/protected_db.go`
+
+**Acceptance Criteria:**
+- [ ] `ProtectedVectorDB` struct: *VectorGraphDB, snapshotMgr, versionedNodes, validator, budgetPersist, config
+- [ ] `NewProtectedVectorDB(db, budget, config)`: initialize all components
+- [ ] `Startup(ctx) error`: run integrity checks, restore budget, start background goroutines
+- [ ] `BeginSession(sessionID) *SessionScopedView`: create view with default isolation
+- [ ] `BeginSessionWithIsolation(sessionID, isolation) *SessionScopedView`: create view with specific isolation
+- [ ] `Shutdown() error`: final budget save, close DB
+
+**Implementation Guidelines:**
+- Startup fails if critical integrity violations not repaired
+- Start 3 background goroutines: snapshot GC, integrity scanner, budget save
+- Shutdown saves budget before closing
+
+**Tests:**
+- [ ] Startup runs integrity checks
+- [ ] Startup restores budget
+- [ ] Startup starts background goroutines
+- [ ] BeginSession returns functional view
+- [ ] Shutdown saves budget
+
+---
+
+### SC.15 VectorGraphDB Integration
+
+**Files to modify:**
+- `core/vectorgraphdb/db.go`
+- `core/vectorgraphdb/nodes.go`
+
+**Acceptance Criteria:**
+- [ ] VectorGraphDB gains snapshotMgr field
+- [ ] VectorGraphDB.Insert calls snapshotMgr.OnInsert() after successful insert
+- [ ] VectorGraphDB.BeginSessionView method added
+- [ ] NodeStore extended with GetNodeWithVersion
+- [ ] GraphNode struct has Version field
+
+**Implementation Guidelines:**
+- Minimal changes to existing code
+- OnInsert called after HNSW insert completes
+- Version field defaults to 1 if missing from DB
+
+**Tests:**
+- [ ] Insert increments snapshot sequence
+- [ ] GetNodeWithVersion works with existing data
+
+---
+
+### SC.16 Shared State Corruption Prevention Integration Tests
+
+**Files to create:**
+- `core/vectorgraphdb/protection_integration_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test snapshot isolation: concurrent insert during search returns consistent results
+- [ ] Test OCC: concurrent writes to same node result in conflict
+- [ ] Test OCC retry: conflicted write can retry and succeed
+- [ ] Test session isolation: SessionLocal doesn't see other session's data
+- [ ] Test repeatable read: snapshot doesn't change during long operation
+- [ ] Test integrity check: detects orphaned vectors
+- [ ] Test auto-repair: orphaned vectors cleaned up
+- [ ] Test budget persistence: survives simulated crash
+- [ ] Test hash validation: detects corrupted content
+- [ ] Race condition test: run with `-race` flag
+
+**Tests:**
+- [ ] All integration tests pass
+- [ ] No race conditions detected
+- [ ] Corruption scenarios handled correctly
+
+---
+
+### Shared State Corruption Prevention Parallelization Notes
+
+**Internal Dependencies:**
+```
+SC.1 (HNSWSnapshot types) ──────────────────────────────────────────┐
+                                                                     │
+SC.2 (HNSWSnapshotManager) depends on SC.1 ─────────────────────────┤
+                                                                     │
+SC.3 (Snapshot Search) depends on SC.1 ─────────────────────────────┼──► SC.8 (SessionScopedView)
+                                                                     │
+SC.4 (Version Migration) ───────────────────────────────────────────┤
+                                                                     │
+SC.5 (VersionedNodeStore) depends on SC.4 ──────────────────────────┼──► SC.6 (OptimisticTx)
+                                                                     │
+SC.7 (ConflictError) ───────────────────────────────────────────────┤
+                                                                     │
+SC.9 (IntegrityConfig) ─────────────────────────────────────────────┼──► SC.10 (IntegrityValidator)
+                                                                     │
+SC.11 (IntegrityError) ─────────────────────────────────────────────┤
+                                                                     │
+SC.12 (BudgetPersistence) depends on FH.1 ──────────────────────────┤
+                                                                     │
+SC.13 (ProtectionConfig) ───────────────────────────────────────────┤
+                                                                     │
+SC.2, SC.5, SC.6, SC.8, SC.10, SC.12, SC.13 ────────────────────────┼──► SC.14 (ProtectedVectorDB)
+                                                                     │
+SC.14 ──────────────────────────────────────────────────────────────┼──► SC.15 (Integration)
+                                                                     │
+ALL ────────────────────────────────────────────────────────────────┴──► SC.16 (Integration Tests)
+```
+
+**Optimal parallel execution:**
+1. Start SC.1, SC.4, SC.7, SC.9, SC.11, SC.13 in parallel (no internal deps)
+2. When SC.1 complete → start SC.2, SC.3 in parallel
+3. When SC.4 complete → start SC.5
+4. When SC.5, SC.7 complete → start SC.6
+5. When SC.9, SC.11 complete → start SC.10
+6. When SC.2, SC.3, SC.6, SC.7 complete → start SC.8
+7. When FH.1 complete → start SC.12
+8. When SC.2, SC.5, SC.6, SC.8, SC.10, SC.12, SC.13 complete → start SC.14
+9. When SC.14 complete → start SC.15
+10. When ALL complete → start SC.16
+
+**Cross-system dependencies:**
+- Depends on FH.1 (FileHandleBudget) for SC.12 budget persistence
+- Depends on existing VectorGraphDB structure
+- Integrates with existing HNSW index code
+- Uses same SQLite connection as VectorGraphDB
+
+---
+
+## Cascading LLM Failure Prevention (CF.1-CF.21)
+
+**Purpose:** Prevent LLM failures from cascading across sessions/providers/models through hierarchical bulkheads, multi-layer rate limiting, cost-aware backpressure, and hybrid health monitoring.
+
+**Key Principles:**
+- Hierarchical isolation: session → provider → model
+- Multi-layer rate limiting: token bucket + sliding window + adaptive 429 learning (most restrictive wins)
+- Cost backpressure: exponential delays as budget approaches limit, rejection at 100%
+- NO model degradation: agents control their own model selection
+- Hybrid health: active probes + passive inference combined
+
+---
+
+### CF.1 Bulkhead Types and Config
+
+**Files to create:**
+- `core/llm/bulkhead/types.go`
+
+**Acceptance Criteria:**
+- [ ] `BulkheadLevel` enum: LevelSession, LevelProvider, LevelModel
+- [ ] `BulkheadConfig` struct with MaxConcurrent, MaxQueueSize, QueueTimeout, CircuitConfig
+- [ ] `CircuitConfig` struct with FailureThreshold, SuccessThreshold, Timeout
+- [ ] `DefaultBulkheadConfigs()` returns production defaults (5/3/2 for session/provider/model)
+- [ ] `AcquireResult` struct for async acquisition results
+- [ ] `BulkheadStats` struct for metrics exposure
+
+**Implementation Guidelines:**
+- Session: 5 concurrent, 50 queue, 30s timeout
+- Provider: 3 concurrent, 20 queue, 20s timeout
+- Model: 2 concurrent, 10 queue, 15s timeout
+- Total max concurrent per session: 5×3×2 = 30
+
+**Tests:**
+- [ ] Default configs return expected values
+- [ ] Configs are properly validated
+
+---
+
+### CF.2 Bulkhead Implementation
+
+**Files to create:**
+- `core/llm/bulkhead/bulkhead.go`
+
+**Acceptance Criteria:**
+- [ ] `Bulkhead` struct with semaphore (chan struct{}), queue, circuit state
+- [ ] `NewBulkhead(id, level, config)` constructor pre-fills semaphore
+- [ ] `Acquire(ctx)` checks circuit, tries immediate acquisition, falls back to queue
+- [ ] `Release()` returns slot to semaphore
+- [ ] `RecordSuccess()` updates circuit state (consecutive success tracking)
+- [ ] `RecordFailure()` updates circuit state (consecutive fail tracking, opens circuit)
+- [ ] Circuit states: closed (0), open (1), half-open (2) using atomic.Int32
+- [ ] Queue processing goroutine handles pending requests with timeout
+- [ ] `Stats()` returns current BulkheadStats
+
+**Implementation Guidelines:**
+- Use `chan struct{}` for semaphore (pre-filled to capacity)
+- Use `chan *pendingRequest` for queue (buffered to MaxQueueSize)
+- Circuit opens after FailureThreshold consecutive failures
+- Circuit transitions to half-open after Timeout elapsed
+- Circuit closes after SuccessThreshold consecutive successes in half-open
+
+**Errors:**
+- [ ] `ErrCircuitOpen` when circuit is open and timeout not elapsed
+- [ ] `ErrQueueFull` when queue is at capacity
+- [ ] `ErrQueueTimeout` when request times out in queue
+
+**Tests:**
+- [ ] Semaphore limits concurrent acquisitions
+- [ ] Queue handles overflow correctly
+- [ ] Circuit opens after threshold failures
+- [ ] Circuit half-opens after timeout
+- [ ] Circuit closes after threshold successes
+
+---
+
+### CF.3 Hierarchical Bulkhead
+
+**Files to create:**
+- `core/llm/bulkhead/hierarchy.go`
+
+**Acceptance Criteria:**
+- [ ] `HierarchicalBulkhead` struct with session bulkhead, provider map, model map
+- [ ] `NewHierarchicalBulkhead(sessionID, configs)` creates session-level bulkhead
+- [ ] `Acquire(ctx, provider, model)` acquires slots at all three levels atomically
+- [ ] On any level failure, releases already-acquired levels
+- [ ] `getOrCreateProvider(provider)` lazy-creates provider bulkheads
+- [ ] `getOrCreateModel(provider, model)` lazy-creates model bulkheads
+- [ ] `Stats()` returns HierarchyStats with all bulkhead states
+- [ ] Uses sync.Map for provider/model maps (concurrent access)
+
+**Implementation Guidelines:**
+- Acquire order: session → provider → model
+- Release order on failure: reverse (model → provider → session)
+- Use double-checked locking for lazy creation
+
+**Tests:**
+- [ ] Hierarchy correctly isolates sessions
+- [ ] Provider bulkheads created on demand
+- [ ] Model bulkheads created on demand
+- [ ] Partial acquisition failures release held slots
+
+---
+
+### CF.4 Hierarchical Slot
+
+**Files to create:**
+- `core/llm/bulkhead/slot.go`
+
+**Acceptance Criteria:**
+- [ ] `HierarchicalSlot` struct holds references to all three bulkheads
+- [ ] `Release()` releases slots at all levels (idempotent via atomic.Bool)
+- [ ] `RecordSuccess()` records success at all levels
+- [ ] `RecordFailure()` records failure at all levels
+- [ ] Released flag prevents double-release
+
+**Tests:**
+- [ ] Release is idempotent
+- [ ] Success/failure propagates to all levels
+
+---
+
+### CF.5 Rate Limit Types
+
+**Files to create:**
+- `core/llm/ratelimit/types.go`
+
+**Acceptance Criteria:**
+- [ ] `RateLimitDecision` struct: Allowed, WaitTime, Reason, Limiter, Confidence
+- [ ] `MultiLayerConfig` struct with TokenBucket, SlidingWindow, Adaptive configs
+- [ ] `TokenBucketConfig` struct: Capacity, RefillRate
+- [ ] `SlidingWindowConfig` struct: WindowSize, MaxRequests
+- [ ] `Adaptive429Config` struct: InitialLimit, DecayFactor, GrowthFactor, MinLimit, MaxLimit
+- [ ] `DefaultMultiLayerConfig()` returns production defaults
+
+**Implementation Guidelines:**
+- Token bucket: 100 capacity, 10/sec refill
+- Sliding window: 60s window, 60 max requests
+- Adaptive: 50 initial, 0.95 decay, 1.05 growth, 5 min, 200 max
+
+**Tests:**
+- [ ] Default configs return expected values
+
+---
+
+### CF.6 Token Bucket Limiter
+
+**Files to create:**
+- `core/llm/ratelimit/token_bucket.go`
+
+**Acceptance Criteria:**
+- [ ] `TokenBucketLimiter` struct with tokens (float64), lastRefill, mutex
+- [ ] `NewTokenBucketLimiter(config)` starts with full capacity
+- [ ] `Check()` refills tokens, returns RateLimitDecision
+- [ ] `Consume(n)` deducts tokens after refill
+- [ ] Refill adds `elapsed.Seconds() * RefillRate` tokens, capped at capacity
+- [ ] WaitTime calculated as `tokensNeeded / RefillRate`
+
+**Implementation Guidelines:**
+- Use float64 for fractional tokens
+- Mutex protects tokens and lastRefill
+- Confidence always 1.0 (deterministic)
+
+**Tests:**
+- [ ] Tokens refill over time
+- [ ] Check returns correct wait time when exhausted
+- [ ] Consume correctly deducts tokens
+
+---
+
+### CF.7 Sliding Window Limiter
+
+**Files to create:**
+- `core/llm/ratelimit/sliding_window.go`
+
+**Acceptance Criteria:**
+- [ ] `SlidingWindowLimiter` with circular buffer of timestamps
+- [ ] `NewSlidingWindowLimiter(config)` allocates buffer
+- [ ] `Check()` cleans up old entries, returns decision
+- [ ] `Record()` adds current timestamp to buffer
+- [ ] Cleanup removes entries older than WindowSize
+- [ ] WaitTime calculated from oldest entry aging out
+
+**Implementation Guidelines:**
+- Circular buffer with head/count tracking
+- Mutex protects buffer state
+
+**Tests:**
+- [ ] Old entries cleaned up
+- [ ] Limit enforced after MaxRequests
+- [ ] Wait time correctly calculated
+
+---
+
+### CF.8 Adaptive 429 Limiter
+
+**Files to create:**
+- `core/llm/ratelimit/adaptive_429.go`
+
+**Acceptance Criteria:**
+- [ ] `Adaptive429Limiter` with currentLimit, confidence, last429, successRun
+- [ ] `NewAdaptive429Limiter(config)` starts at InitialLimit with 0.5 confidence
+- [ ] `Check()` returns not-allowed if recent 429 (within 5s)
+- [ ] `Record429(retryAfter)` decreases limit by DecayFactor, increases confidence
+- [ ] `RecordSuccess()` increments successRun, increases limit after 10 consecutive
+- [ ] Limit clamped between MinLimit and MaxLimit
+- [ ] last429 cleared after 5 consecutive successes
+
+**Implementation Guidelines:**
+- RWMutex for read-heavy access pattern
+- Confidence increases by 0.1 on each 429 (real data)
+
+**Tests:**
+- [ ] Limit decreases on 429
+- [ ] Limit increases after consecutive successes
+- [ ] Backoff enforced after recent 429
+
+---
+
+### CF.9 Multi-Layer Rate Limiter
+
+**Files to create:**
+- `core/llm/ratelimit/multi_layer.go`
+
+**Acceptance Criteria:**
+- [ ] `MultiLayerRateLimiter` combines all three limiters
+- [ ] `NewMultiLayerRateLimiter(provider, config)` creates all three
+- [ ] `Check()` queries all three, returns most restrictive decision
+- [ ] Most restrictive = longest WaitTime if not allowed
+- [ ] `RecordRequest()` calls Consume on token bucket, Record on sliding window
+- [ ] `Record429(retryAfter)` forwards to adaptive limiter
+- [ ] `RecordSuccess()` forwards to adaptive limiter
+
+**Implementation Guidelines:**
+- Per-provider rate limiter (not global)
+- Most restrictive wins ensures safety
+
+**Tests:**
+- [ ] Most restrictive decision returned
+- [ ] All limiters updated on request
+
+---
+
+### CF.10 Cost Backpressure Types
+
+**Files to create:**
+- `core/llm/backpressure/types.go`
+
+**Acceptance Criteria:**
+- [ ] `CostBackpressureConfig` with DelayThresholds, RejectNewAt, BaseDelay
+- [ ] `DelayThreshold` struct: UsagePercent, Multiplier
+- [ ] `BackpressureDecision` struct: Delay, Reject, UsagePercent, Reason
+- [ ] `DefaultCostBackpressureConfig()` returns production defaults
+- [ ] NO model degradation fields (SuggestModel, EnforceModel, etc.)
+
+**Implementation Guidelines:**
+- 80%: 1.5x, 90%: 2x, 95%: 4x, 98%: 8x delays
+- RejectNewAt: 1.0 (100%)
+- BaseDelay: 100ms
+
+**Tests:**
+- [ ] Default config has correct thresholds
+
+---
+
+### CF.11 Budget Getter Interface
+
+**Files to create:**
+- `core/llm/backpressure/budget.go`
+
+**Acceptance Criteria:**
+- [ ] `BudgetGetter` interface with GetUsagePercent, GetTaskUsagePercent
+- [ ] Interface allows integration with existing budget tracking
+
+**Tests:**
+- [ ] Mock implementation for testing
+
+---
+
+### CF.12 Cost Backpressure Implementation
+
+**Files to create:**
+- `core/llm/backpressure/cost_aware.go`
+
+**Acceptance Criteria:**
+- [ ] `CostBackpressure` struct with config and budgetGetter
+- [ ] `NewCostBackpressure(config, budget)` constructor (NO modelRanker)
+- [ ] `Evaluate(sessionID, taskID)` returns BackpressureDecision (NO model parameter)
+- [ ] Uses max of session and task usage
+- [ ] Returns Reject=true at RejectNewAt threshold
+- [ ] Calculates delay based on thresholds
+- [ ] NO model degradation logic
+
+**Implementation Guidelines:**
+- Iterate thresholds, use highest matching multiplier
+- Return 0 delay if below first threshold
+
+**Tests:**
+- [ ] Correct delay at each threshold
+- [ ] Reject at 100%
+- [ ] Uses max of session/task usage
+
+---
+
+### CF.13 Health Monitor Types
+
+**Files to create:**
+- `core/llm/health/types.go`
+
+**Acceptance Criteria:**
+- [ ] `HealthConfig` with ProbeInterval, ProbeTimeout, WindowSize, MinSamples, weights, thresholds
+- [ ] `HealthDecision` struct: Proceed, Score, Status, Reason
+- [ ] `HealthStatus` enum: HealthHealthy, HealthMonitored, HealthDegraded, HealthDead
+- [ ] `DefaultHealthConfig()` returns production defaults
+
+**Implementation Guidelines:**
+- ProbeInterval: 30s, ProbeTimeout: 5s
+- ActiveWeight: 0.4, PassiveWeight: 0.6
+- Thresholds: 0.3 reject, 0.5 warn, 0.7 monitor
+
+**Tests:**
+- [ ] Default config has correct values
+
+---
+
+### CF.14 Active Prober
+
+**Files to create:**
+- `core/llm/health/active_prober.go`
+
+**Acceptance Criteria:**
+- [ ] `ProbeFunc` type: `func(ctx context.Context) error`
+- [ ] `ActiveProber` with interval, timeout, probe func, success/failure tracking
+- [ ] `NewActiveProber(provider, interval, timeout, probe)` starts probe loop
+- [ ] Probe loop runs on ticker, calls probe func with timeout context
+- [ ] `Score()` returns 0-1 based on last success/failure and consecutive counts
+- [ ] `Stop()` stops the probe loop
+
+**Implementation Guidelines:**
+- Assume healthy at start (lastSuccess = now)
+- Score decay based on time since last success
+- 5+ consecutive failures = 0.0 score
+
+**Tests:**
+- [ ] Probe runs on interval
+- [ ] Score reflects probe outcomes
+- [ ] Stop terminates loop
+
+---
+
+### CF.15 Passive Monitor
+
+**Files to create:**
+- `core/llm/health/passive_monitor.go`
+
+**Acceptance Criteria:**
+- [ ] `PassiveMonitor` with ring buffer of outcomes
+- [ ] `outcome` struct: timestamp, success, latency, errorType
+- [ ] `errorCategory` enum: errNone, errTransient, errRateLimit, errAuth, errPermanent
+- [ ] `NewPassiveMonitor(windowSize, minSamples)` allocates buffer
+- [ ] `RecordSuccess(latency)` adds success outcome
+- [ ] `RecordFailure(err)` categorizes error and adds failure outcome
+- [ ] `Score()` calculates success rate within window, penalizes high latency
+- [ ] `categorizeError(err)` categorizes by error string patterns
+
+**Implementation Guidelines:**
+- Ring buffer size = minSamples * 10
+- Return 0.8 if < minSamples (not enough data)
+- 20% penalty for avg latency > 10s, 10% for > 5s
+
+**Tests:**
+- [ ] Success rate calculated correctly
+- [ ] Latency penalty applied
+- [ ] Error categorization works
+
+---
+
+### CF.16 Hybrid Health Monitor
+
+**Files to create:**
+- `core/llm/health/hybrid_monitor.go`
+
+**Acceptance Criteria:**
+- [ ] `HybridHealthMonitor` combines ActiveProber and PassiveMonitor
+- [ ] `NewHybridHealthMonitor(provider, config, probeFunc)` creates both
+- [ ] Score updater goroutine runs every 5s
+- [ ] Combined score = active * ActiveWeight + passive * PassiveWeight
+- [ ] `Score()` returns combined score (0-1)
+- [ ] `Check()` returns HealthDecision based on thresholds
+- [ ] `RecordSuccess(latency)` and `RecordFailure(err)` forward to passive
+
+**Implementation Guidelines:**
+- Use atomic.Int64 for combined score (fixed-point * 1000)
+- Start healthy (score = 1000)
+
+**Tests:**
+- [ ] Combined score weighted correctly
+- [ ] Thresholds applied in Check()
+
+---
+
+### CF.17 Streaming Timeout Types
+
+**Files to create:**
+- `core/llm/timeout/types.go`
+
+**Acceptance Criteria:**
+- [ ] `StreamingTimeoutConfig` with FirstTokenTimeout, InterTokenTimeout, TotalTimeout
+- [ ] `StreamingStats` struct: Started, FirstTokenAt, LastTokenAt, TimeToFirstToken, TotalDuration
+- [ ] `DefaultStreamingTimeoutConfig()` returns production defaults
+
+**Implementation Guidelines:**
+- FirstToken: 30s, InterToken: 10s, Total: 5m
+
+**Tests:**
+- [ ] Default config has correct values
+
+---
+
+### CF.18 Streaming Timeout Monitor
+
+**Files to create:**
+- `core/llm/timeout/streaming.go`
+
+**Acceptance Criteria:**
+- [ ] `StreamingTimeoutMonitor` tracks streaming response timeouts
+- [ ] `NewStreamingTimeoutMonitor(ctx, config)` creates monitor, starts timeout loop
+- [ ] First token timer fires ErrFirstTokenTimeout if no token received
+- [ ] Inter-token timer resets on each token, fires ErrInterTokenTimeout
+- [ ] Total timeout wraps parent context
+- [ ] `RecordToken()` signals token received (non-blocking)
+- [ ] `Done()` cancels total context
+- [ ] `Errors()` returns error channel
+- [ ] `Context()` returns total timeout context
+- [ ] `Stats()` returns StreamingStats
+
+**Errors:**
+- [ ] `ErrFirstTokenTimeout`
+- [ ] `ErrInterTokenTimeout`
+
+**Tests:**
+- [ ] First token timeout fires correctly
+- [ ] Inter-token timeout fires on gap
+- [ ] Token recording resets timer
+
+---
+
+### CF.19 Jittered Backoff
+
+**Files to create:**
+- `core/llm/timeout/jittered_backoff.go`
+
+**Acceptance Criteria:**
+- [ ] `JitteredBackoff` with base, max, attempt, jitter range, rng
+- [ ] `NewJitteredBackoff(base, max)` creates with [0.5, 1.5] jitter range
+- [ ] `Next()` returns `base * 2^attempt * random(0.5, 1.5)`, capped at max
+- [ ] `Reset()` resets attempt counter
+- [ ] `Attempt()` returns current attempt number
+- [ ] Thread-safe with mutex
+
+**Implementation Guidelines:**
+- Jitter prevents thundering herd
+- Use math/rand with per-instance seed
+
+**Tests:**
+- [ ] Backoff increases exponentially
+- [ ] Jitter applied within range
+- [ ] Max cap enforced
+
+---
+
+### CF.20 Failure Correlation Types
+
+**Files to create:**
+- `core/llm/correlation/types.go`
+
+**Acceptance Criteria:**
+- [ ] `CorrelationConfig` with CorrelationWindow, MinFailuresForGlobal, GlobalBackoffBase, GlobalBackoffMax, RecoveryRampUp
+- [ ] `failureTracker` with failures slice, mutex
+- [ ] `failureEvent` struct: timestamp, sessionID, errorType
+- [ ] `globalBackoff` with active, until, attempt, trafficRatio atomics
+- [ ] `DefaultCorrelationConfig()` returns production defaults
+
+**Implementation Guidelines:**
+- CorrelationWindow: 10s
+- MinFailuresForGlobal: 3 unique sessions
+- GlobalBackoffBase: 5s, Max: 60s
+- RecoveryRampUp: 0.1 (10% increments)
+
+**Tests:**
+- [ ] Default config has correct values
+
+---
+
+### CF.21 Failure Correlation Engine
+
+**Files to create:**
+- `core/llm/correlation/failure_engine.go`
+
+**Acceptance Criteria:**
+- [ ] `FailureCorrelationEngine` with providerFailures, globalBackoffs maps
+- [ ] `NewFailureCorrelationEngine(config, dispatcher)` constructor
+- [ ] `RecordFailure(provider, sessionID, err)` records and checks for correlation
+- [ ] Correlation detected when >= MinFailuresForGlobal unique sessions fail in window
+- [ ] `triggerGlobalBackoff(provider)` sets global backoff, schedules recovery
+- [ ] `scheduleRecovery(provider, backoff, duration)` gradually ramps up traffic
+- [ ] `ShouldAllow(provider)` returns false during active backoff (probabilistic based on trafficRatio)
+- [ ] Broadcasts GlobalBackoffSignal and GlobalRecoverySignal via dispatcher
+
+**Implementation Guidelines:**
+- Use sync.Map for concurrent access
+- Probabilistic allow: rand.Float64() < trafficRatio
+- Recovery ramps 10% every 5s
+
+**Tests:**
+- [ ] Correlation detected across sessions
+- [ ] Global backoff triggered
+- [ ] Traffic gradually restored
+- [ ] Probabilistic allow works
+
+---
+
+### CF.22 Coordinator Types
+
+**Files to create:**
+- `core/llm/coordinator/types.go`
+
+**Acceptance Criteria:**
+- [ ] `CoordinatorConfig` aggregates all sub-configs (Bulkhead, RateLimit, Health, Backpressure, Correlation, StreamTimeout)
+- [ ] `LLMRequest` struct: SessionID, TaskID, Provider, Model, Messages, Stream
+- [ ] `LLMResponse` struct: Content, Chunks (chan string), Latency, Usage
+- [ ] `TokenUsage` struct: InputTokens, OutputTokens
+- [ ] `CoordinatorStats` for metrics
+- [ ] `ProviderStats` for per-provider metrics
+- [ ] `DefaultCoordinatorConfig()` combines all defaults
+
+**Tests:**
+- [ ] Default config aggregates correctly
+
+---
+
+### CF.23 LLM Request Coordinator
+
+**Files to create:**
+- `core/llm/coordinator/coordinator.go`
+
+**Acceptance Criteria:**
+- [ ] `LLMRequestCoordinator` orchestrates all protection layers
+- [ ] Per-session bulkheads (sync.Map)
+- [ ] Per-provider rate limiters (sync.Map)
+- [ ] Per-provider health monitors (sync.Map)
+- [ ] `ExecuteRequest(ctx, req)` orchestrates: health → global backoff → rate limits → cost backpressure → bulkhead → execute → record outcome
+- [ ] Cost backpressure applies delay, rejects at limit
+- [ ] NO model enforcement (removed)
+- [ ] `recordOutcome` updates all systems based on success/failure
+- [ ] `Stats()` returns CoordinatorStats
+- [ ] Lazy creation of bulkheads, limiters, monitors
+
+**Errors:**
+- [ ] `ErrGlobalBackoff`
+- [ ] `ErrProviderUnhealthy`
+- [ ] `ErrRateLimited`
+- [ ] `ErrBudgetExhausted`
+
+**Tests:**
+- [ ] Full request flow works
+- [ ] Each protection layer consulted
+- [ ] Outcomes recorded correctly
+
+---
+
+### CF.24 LLM Client Integration
+
+**Files to modify:**
+- `core/llm/client.go` (or appropriate existing file)
+
+**Acceptance Criteria:**
+- [ ] Existing LLM client uses LLMRequestCoordinator
+- [ ] All LLM requests flow through coordinator
+- [ ] Streaming responses use StreamingTimeoutMonitor
+- [ ] Non-streaming uses TotalTimeout
+
+**Implementation Guidelines:**
+- Wrap existing provider calls with coordinator
+- Integrate with existing retry logic
+
+**Tests:**
+- [ ] Integration with existing client works
+- [ ] All protection applied to real requests
+
+---
+
+### CF.25 Cascading Failure Prevention Integration Tests
+
+**Files to create:**
+- `core/llm/cascade_integration_test.go`
+
+**Acceptance Criteria:**
+- [ ] Test session isolation: session A failure doesn't affect session B slots
+- [ ] Test provider isolation: provider A failure doesn't affect provider B
+- [ ] Test model isolation: model A failure doesn't affect model B
+- [ ] Test multi-layer rate limiting: most restrictive wins
+- [ ] Test cost backpressure delays: delays applied at thresholds
+- [ ] Test cost backpressure rejection: rejected at 100%
+- [ ] Test health monitoring: unhealthy provider rejected
+- [ ] Test failure correlation: global backoff triggered on multi-session failure
+- [ ] Test staggered recovery: traffic gradually restored
+- [ ] Test streaming timeouts: first-token and inter-token timeouts work
+- [ ] Test jittered backoff: delays have jitter applied
+- [ ] Race condition test: run with `-race` flag
+
+**Tests:**
+- [ ] All integration tests pass
+- [ ] No race conditions detected
+
+---
+
+### Cascading Failure Prevention Parallelization Notes
+
+**Internal Dependencies:**
+```
+CF.1 (Bulkhead Types) ──────────────────────────────────────────┐
+                                                                 │
+CF.2 (Bulkhead) depends on CF.1 ────────────────────────────────┤
+                                                                 │
+CF.3 (HierarchicalBulkhead) depends on CF.2 ────────────────────┤
+                                                                 │
+CF.4 (HierarchicalSlot) depends on CF.2, CF.3 ──────────────────┤
+                                                                 │
+CF.5 (RateLimit Types) ─────────────────────────────────────────┤ (standalone)
+                                                                 │
+CF.6 (TokenBucket) depends on CF.5 ─────────────────────────────┤
+                                                                 │
+CF.7 (SlidingWindow) depends on CF.5 ───────────────────────────┤
+                                                                 │
+CF.8 (Adaptive429) depends on CF.5 ─────────────────────────────┤
+                                                                 │
+CF.9 (MultiLayer) depends on CF.6, CF.7, CF.8 ──────────────────┤
+                                                                 │
+CF.10 (Backpressure Types) ─────────────────────────────────────┤ (standalone)
+                                                                 │
+CF.11 (BudgetGetter) depends on CF.10 ──────────────────────────┤
+                                                                 │
+CF.12 (CostBackpressure) depends on CF.10, CF.11 ───────────────┤
+                                                                 │
+CF.13 (Health Types) ───────────────────────────────────────────┤ (standalone)
+                                                                 │
+CF.14 (ActiveProber) depends on CF.13 ──────────────────────────┤
+                                                                 │
+CF.15 (PassiveMonitor) depends on CF.13 ────────────────────────┤
+                                                                 │
+CF.16 (HybridHealthMonitor) depends on CF.14, CF.15 ────────────┤
+                                                                 │
+CF.17 (Timeout Types) ──────────────────────────────────────────┤ (standalone)
+                                                                 │
+CF.18 (StreamingTimeoutMonitor) depends on CF.17 ───────────────┤
+                                                                 │
+CF.19 (JitteredBackoff) depends on CF.17 ───────────────────────┤
+                                                                 │
+CF.20 (Correlation Types) ──────────────────────────────────────┤ (standalone)
+                                                                 │
+CF.21 (FailureCorrelationEngine) depends on CF.20 ──────────────┤
+                                                                 │
+CF.22 (Coordinator Types) depends on CF.1, CF.5, CF.10, CF.13, CF.17, CF.20
+                                                                 │
+CF.23 (Coordinator) depends on CF.4, CF.9, CF.12, CF.16, CF.18, CF.19, CF.21, CF.22
+                                                                 │
+CF.24 (Integration) depends on CF.23 ───────────────────────────┤
+                                                                 │
+ALL ────────────────────────────────────────────────────────────┴──► CF.25 (Integration Tests)
+```
+
+**Optimal parallel execution:**
+1. Start CF.1, CF.5, CF.10, CF.13, CF.17, CF.20 in parallel (no internal deps - all type definitions)
+2. When CF.1 complete → start CF.2
+3. When CF.5 complete → start CF.6, CF.7, CF.8 in parallel
+4. When CF.10 complete → start CF.11
+5. When CF.13 complete → start CF.14, CF.15 in parallel
+6. When CF.17 complete → start CF.18, CF.19 in parallel
+7. When CF.20 complete → start CF.21
+8. When CF.2 complete → start CF.3
+9. When CF.3, CF.2 complete → start CF.4
+10. When CF.6, CF.7, CF.8 complete → start CF.9
+11. When CF.11 complete → start CF.12
+12. When CF.14, CF.15 complete → start CF.16
+13. When all type deps complete → start CF.22
+14. When CF.4, CF.9, CF.12, CF.16, CF.18, CF.19, CF.21, CF.22 complete → start CF.23
+15. When CF.23 complete → start CF.24
+16. When ALL complete → start CF.25
+
+**Cross-system dependencies:**
+- Integrates with existing LLM client infrastructure
+- Uses existing SignalDispatcher for global backoff signals
+- BudgetGetter integrates with existing token budget tracking
+- No model degradation (agents control their own models)
+
+---
+
 ## Session Architecture
 
 ### Session Isolation Model
@@ -23351,7 +26548,419 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   Depends on: Wave 3E (TS Phases 1-2), FS.5.1 (CVS)                             ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 26-32 parallel engineer pipelines (increased for FS + TS)      │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4F: Memory Pressure Defense System (MP.1-MP.13)                  ││
+│ │ ** NEW: 7-layer defense against memory exhaustion **                            ││
+│ │ ** Reference: /MEMORY.md for full design specification **                       ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - foundation, no interdependencies):                      ││
+│ │ • MP.1 Memory Pressure Signals (core/signal/types.go)                           ││
+│ │ • MP.3 Pressure State Machine (core/resources/pressure_state.go)                ││
+│ │ • MP.4 Spike Detection Monitor (core/resources/spike_monitor.go)                ││
+│ │ • MP.6 EvictableCache Interface (core/resources/evictable_cache.go)             ││
+│ │ • MP.10 Usage Registry (core/resources/usage_registry.go)                       ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After Phase 1 items complete):                                         ││
+│ │ • MP.2 SignalBus Publisher Adapter (depends on MP.1)                            ││
+│ │ • MP.5 Admission Controller (depends on MP.3)                                   ││
+│ │ • MP.7 Cache Evictor (depends on MP.6)                                          ││
+│ │ • MP.9 Pipeline Suspender (depends on MP.1)                                     ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After Phase 2):                                                        ││
+│ │ • MP.8 Context Compactor (depends on MP.2)                                      ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After ALL Phase 1-3 complete):                                         ││
+│ │ • MP.11 Pressure Controller (orchestrates all layers)                           ││
+│ │                                                                                  ││
+│ │ PHASE 5 (Sequential, after Phase 4):                                            ││
+│ │ • MP.12 Memory Pressure Integration (wires into app bootstrap)                  ││
+│ │ • MP.13 Memory Pressure Defense Tests (comprehensive tests)                     ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/signal/types.go (modify)                                                 ││
+│ │   core/resources/pressure_state.go, spike_monitor.go, evictable_cache.go        ││
+│ │   core/resources/usage_registry.go, signal_publisher.go, admission_controller.go││
+│ │   core/resources/cache_evictor.go, context_compactor.go, pipeline_suspender.go  ││
+│ │   core/resources/pressure_controller.go                                         ││
+│ │   agents/archivalist/query_cache.go (modify - implement EvictableCache)         ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - 200ms sampling with spike detection (+15% threshold)                        ││
+│ │   - Hysteresis-based state machine (prevents flapping)                          ││
+│ │   - 4-level graduated response: NORMAL → ELEVATED → HIGH → CRITICAL             ││
+│ │   - Admission control (gate new pipelines under pressure)                       ││
+│ │   - Cache eviction by percentage                                                ││
+│ │   - LLM context compaction signaling                                            ││
+│ │   - Pipeline suspension by priority                                             ││
+│ │   - OS agnostic (runtime.MemStats only)                                         ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (all parallel) → Phase 2 (parallel after deps) → Phase 3 →            ││
+│ │   Phase 4 (Controller) → Phase 5 (Integration + Tests)                          ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES (all already complete):                                    ││
+│ │   - 0.11 Signal Bus ✅                                                          ││
+│ │   - 0.33 Memory Monitor ✅                                                       ││
+│ │   - 0.18 Pipeline Scheduler ✅                                                   ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4G: Goroutine & Operation Lifecycle Management (GR.1-GR.17)      ││
+│ │ ** NEW: Zero-leak goroutine management, user-controllable pipelines **          ││
+│ │ ** Reference: /GOROUTINE.md for full design specification **                    ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - foundation, no interdependencies):                      ││
+│ │ • GR.1 NoGo Linter (cmd/nogo/main.go, .golangci.yml)                            ││
+│ │ • GR.4 Safe Blocking Primitives (core/concurrency/safechan/, safelock/)         ││
+│ │ • GR.10 ResourceTracker (core/concurrency/resource_tracker.go)                  ││
+│ │ • GR.11 PauseBarrier (core/concurrency/pause_barrier.go)                        ││
+│ │ • GR.12 Lifecycle State Extensions (core/concurrency/lifecycle.go - modify)     ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After Phase 1 items complete):                                         ││
+│ │ • GR.3 GoroutineBudget (depends on GR.4 for condition variables)                ││
+│ │ • GR.9 TrackedProcess (independent, can start with Phase 1)                     ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After Phase 2):                                                        ││
+│ │ • GR.2 GoroutineScope (depends on GR.3, GR.4)                                   ││
+│ │ • GR.8 TrackedToolExecutor (depends on GR.9)                                    ││
+│ │ • GR.13 KillSequence Extension (depends on GR.9)                                ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After Phase 3):                                                        ││
+│ │ • GR.5 AgentSupervisor (depends on GR.2, GR.10, GR.11)                          ││
+│ │ • GR.7 TrackedLLMClient (depends on GR.5)                                       ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After Phase 4):                                                        ││
+│ │ • GR.6 PipelineController (depends on GR.5)                                     ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After Phase 5):                                                        ││
+│ │ • GR.14 Signal Handler Integration (depends on GR.6)                            ││
+│ │ • GR.15 UI Command Integration (depends on GR.6)                                ││
+│ │ • GR.16 Memory Pressure Integration (depends on GR.3, MP.11)                    ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After ALL complete):                                                   ││
+│ │ • GR.17 Goroutine Management Integration Tests                                  ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   cmd/nogo/main.go                                                              ││
+│ │   core/concurrency/goroutine_scope.go, worker.go, goroutine_budget.go           ││
+│ │   core/concurrency/safechan/safechan.go, safelock/safelock.go                   ││
+│ │   core/concurrency/agent_supervisor.go, operation.go, pipeline_controller.go    ││
+│ │   core/concurrency/resource_tracker.go, pause_barrier.go, lifecycle.go (modify) ││
+│ │   core/tools/tracked_executor.go, tracked_process.go, kill_sequence.go (modify) ││
+│ │   core/llm/tracked_client.go                                                    ││
+│ │   core/signal/agent_handler.go (modify)                                         ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - Compile-time enforcement (linter forbids raw 'go' statements)               ││
+│ │   - Zero-leak guarantees (all goroutines tracked, bounded, terminable)          ││
+│ │   - User commands: Stop (graceful), Pause (checkpoint), Kill (immediate)        ││
+│ │   - 5-phase termination escalation: cancel → wait → force-close → orphan → restart ││
+│ │   - Sandbox-agnostic: works with sandbox OFF (default) using OS signals         ││
+│ │   - Process group isolation: kills child processes via -pgid                    ││
+│ │   - Dynamic goroutine budget based on memory pressure                           ││
+│ │   - Safe blocking primitives (safechan, safelock) - all context-aware           ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (all parallel) → Phase 2 → Phase 3 → Phase 4 → Phase 5 →              ││
+│ │   Phase 6 (integrations parallel) → Phase 7 (tests)                             ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - 0.17 Goroutine Model & Agent Lifecycle ✅ (foundation)                       ││
+│ │   - 0.45 Kill Sequence Manager ✅ (extend)                                       ││
+│ │   - 0.68 Permission Manager ✅ (use in TrackedToolExecutor)                      ││
+│ │   - 0.70 Audit Logger ✅ (use in TrackedToolExecutor)                            ││
+│ │   - MP.11 Pressure Controller (for GR.16 memory integration)                     ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Integrates with Memory Pressure (4F) via GR.16                              ││
+│ │   - Integrates with Security Model (4A) via TrackedToolExecutor                 ││
+│ │   - Extends existing Lifecycle (0.17) with pause/kill states                    ││
+│ │   - Extends existing KillSequence (0.45) with 5-phase escalation                ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4H: File Handle Management System (FH.1-FH.9)                    ││
+│ │ ** NEW: Hierarchical work-stealing file handle allocation **                    ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - foundation, no interdependencies):                      ││
+│ │ • FH.1 FileHandleBudget - global pool (core/resources/file_handle_budget.go)    ││
+│ │ • FH.4 TrackedFile - implements TrackedResource (core/resources/tracked_file.go)││
+│ │ • FH.5 ResourceNotifier - UI notification interface (core/resources/notifier.go)││
+│ │ • FH.7 FileHandleSnapshot - monitoring (core/resources/file_handle_snapshot.go) ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After FH.1):                                                           ││
+│ │ • FH.2 SessionFileBudget - per-session allocation (depends on FH.1)             ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After FH.2):                                                           ││
+│ │ • FH.3 AgentFileBudget - per-agent allocation (depends on FH.2)                 ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After FH.3, FH.4, FH.5):                                               ││
+│ │ • FH.6 AgentSupervisor.OpenFile - integration (modify agent_supervisor.go)      ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After FH.1, MP.11):                                                    ││
+│ │ • FH.8 Memory Pressure Integration (core/resources/pressure_controller.go)      ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After ALL complete):                                                   ││
+│ │ • FH.9 File Handle Integration Tests                                            ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/resources/file_handle_budget.go, session_file_budget.go                  ││
+│ │   core/resources/agent_file_budget.go, tracked_file.go                          ││
+│ │   core/resources/notifier.go, file_handle_snapshot.go                           ││
+│ │   core/ui/resource_notifier.go                                                  ││
+│ │   core/concurrency/agent_supervisor.go (modify)                                 ││
+│ │   core/resources/pressure_controller.go (modify)                                ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - Hierarchical: Global → Session → Agent with work-stealing                   ││
+│ │   - Proactive tracking via existing ResourceTracker (no scanning)               ││
+│ │   - No errors on wait: log + notify UI, proceed when available                  ││
+│ │   - Automatic cleanup via ownership (ForceCloseAll on death)                    ││
+│ │   - Memory pressure aware: reduce allocations under pressure                    ││
+│ │   - System limit detection via ulimit at startup                                ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (parallel) → Phase 2 → Phase 3 → Phase 4 →                            ││
+│ │   Phase 5 (parallel with 4) → Phase 6 (tests)                                   ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - GR.10 ResourceTracker (TrackedResource interface)                           ││
+│ │   - GR.5 AgentSupervisor (for FH.6 integration)                                 ││
+│ │   - MP.11 Pressure Controller (for FH.8 memory integration)                     ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Integrates with Goroutine Management (4G) via shared ResourceTracker        ││
+│ │   - Integrates with Memory Pressure (4F) via FH.8                               ││
+│ │   - Uses same notification pattern as GoroutineBudget                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4I: Stuck Agent Detection & Recovery (SA.1-SA.15)                ││
+│ │ ** NEW: Livelock/deadlock detection with hierarchical recovery **               ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - foundation, no interdependencies):                      ││
+│ │ • SA.1 ProgressSignal/Collector - signal types, buffer (core/recovery/)         ││
+│ │ • SA.2 HealthWeights/Thresholds - config (core/recovery/health_config.go)       ││
+│ │ • SA.4 RepetitionDetector - cycle detection (core/recovery/repetition.go)       ││
+│ │ • SA.5 DeadlockDetector - wait graph DFS (core/recovery/deadlock.go)            ││
+│ │ • SA.6 RecoveryConfig/State - recovery tracking (core/recovery/recovery.go)     ││
+│ │ • SA.7 RecoveryNotifier - interface (core/recovery/recovery_notifier.go)        ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After SA.1, SA.2, SA.4):                                               ││
+│ │ • SA.3 HealthScorer - weighted multi-signal scoring (core/recovery/)            ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After SA.3, SA.5, SA.6, SA.7):                                         ││
+│ │ • SA.8 RecoveryOrchestrator - hierarchical recovery (core/recovery/)            ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After SA.3, SA.5):                                                     ││
+│ │ • SA.9 DeadlockRecovery - eager release, victim selection (core/recovery/)      ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After SA.8):                                                           ││
+│ │ • SA.10 ResourceReacquisition - recovery notification (core/recovery/)          ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After SA.3, SA.8):                                                     ││
+│ │ • SA.11 AgentSupervisor MonitorHealth - integration (core/session/)             ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After SA.1, SA.4 - parallel with phases 2-6):                          ││
+│ │ • SA.12 ToolExecutor signal integration (modify core/tools/executor.go)         ││
+│ │ • SA.13 LLMClient signal integration (modify core/llm/client.go)                ││
+│ │ • SA.14 AgentRouter signal integration (modify core/routing/agent_router.go)    ││
+│ │                                                                                  ││
+│ │ PHASE 8 (After ALL complete):                                                   ││
+│ │ • SA.15 Stuck Agent Integration Tests                                           ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/recovery/progress_signal.go, progress_collector.go                       ││
+│ │   core/recovery/health_config.go, health_scorer.go                              ││
+│ │   core/recovery/repetition_detector.go, deadlock_detector.go                    ││
+│ │   core/recovery/recovery_config.go, recovery_state.go                           ││
+│ │   core/recovery/recovery_notifier.go, recovery_orchestrator.go                  ││
+│ │   core/recovery/deadlock_recovery.go, resource_reacquisition.go                 ││
+│ │   core/session/agent_supervisor_health.go                                       ││
+│ │   core/tools/executor.go, core/llm/client.go, core/routing/agent_router.go      ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - Compound detection: repetition only matters with stale heartbeat/progress   ││
+│ │   - Hierarchical recovery: soft intervention → user escalation → force kill     ││
+│ │   - Deadlock detection: circular (DFS) and dead-holder                          ││
+│ │   - Eager resource release on deadlock (unblock waiters immediately)            ││
+│ │   - Recovery notification: agent notified to re-acquire released resources      ││
+│ │   - User control: Wait/Kill/Inspect options on escalation                       ││
+│ │   - Agent-to-agent requests count as "sign of life"                             ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (6 parallel) → Phase 2 → Phase 3/4 (parallel) →                       ││
+│ │   Phase 5/6 (parallel) → Phase 8 (tests)                                        ││
+│ │   Phase 7 runs parallel with phases 2-6                                         ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - GR.5 AgentSupervisor (for SA.11 integration)                                ││
+│ │   - Existing ResourceManager (for SA.9/SA.10 resource release)                  ││
+│ │   - Existing ToolExecutor, LLMClient, AgentRouter (for SA.12-14)                ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Integrates with Goroutine Management (4G) via shared RecoveryNotifier       ││
+│ │   - Integrates with File Handle Management (4H) via ResourceManager             ││
+│ │   - Uses same notification pattern as FH (can share RecoveryNotifier)           ││
+│ │   - Extends AgentSupervisor with health monitoring loop                         ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4J: Shared State Corruption Prevention (SC.1-SC.16)              ││
+│ │ ** NEW: HNSW snapshot isolation, OCC, session views, integrity validation **    ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - foundation types, no interdependencies):                ││
+│ │ • SC.1 HNSWSnapshot/LayerSnapshot types (core/vectorgraphdb/hnsw/snapshot.go)   ││
+│ │ • SC.4 Schema Migration - version column (core/vectorgraphdb/migrations/)       ││
+│ │ • SC.7 ConflictError type (core/vectorgraphdb/conflict_error.go)                ││
+│ │ • SC.9 Invariant/ValidationResult types (core/vectorgraphdb/integrity_types.go) ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After SC.1):                                                           ││
+│ │ • SC.2 HNSWSnapshotManager - CoW snapshots (core/vectorgraphdb/hnsw/)           ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After SC.2):                                                           ││
+│ │ • SC.3 Snapshot Search Implementation (modify HNSW search to use snapshots)     ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After SC.4, SC.7):                                                     ││
+│ │ • SC.5 VersionedNodeStore (core/vectorgraphdb/versioned_nodes.go)               ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After SC.5):                                                           ││
+│ │ • SC.6 OptimisticTx (core/vectorgraphdb/optimistic_tx.go)                       ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After SC.2, SC.6):                                                     ││
+│ │ • SC.8 SessionScopedView (core/vectorgraphdb/session_view.go)                   ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After SC.9 - parallel):                                                ││
+│ │ • SC.10 IntegrityValidator (core/vectorgraphdb/integrity_validator.go)          ││
+│ │ • SC.11 Auto-Repair Implementation (core/vectorgraphdb/integrity_repair.go)     ││
+│ │                                                                                  ││
+│ │ PHASE 8 (Standalone - parallel with phases 1-7):                                ││
+│ │ • SC.12 FileHandleBudgetPersistence (core/lifecycle/budget_persistence.go)      ││
+│ │                                                                                  ││
+│ │ PHASE 9 (After ALL prior phases):                                               ││
+│ │ • SC.13 ProtectionConfig (core/vectorgraphdb/protection_config.go)              ││
+│ │ • SC.14 ProtectedVectorDB wrapper (core/vectorgraphdb/protected_db.go)          ││
+│ │                                                                                  ││
+│ │ PHASE 10 (After SC.14):                                                         ││
+│ │ • SC.15 VectorGraphDB Integration (modify NewVectorGraphDB to use protection)   ││
+│ │                                                                                  ││
+│ │ PHASE 11 (After ALL complete):                                                  ││
+│ │ • SC.16 Shared State Integration Tests                                          ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/vectorgraphdb/hnsw/snapshot.go, snapshot_manager.go                      ││
+│ │   core/vectorgraphdb/migrations/add_version_column.go                           ││
+│ │   core/vectorgraphdb/versioned_nodes.go, optimistic_tx.go                       ││
+│ │   core/vectorgraphdb/conflict_error.go, session_view.go                         ││
+│ │   core/vectorgraphdb/integrity_types.go, integrity_validator.go                 ││
+│ │   core/vectorgraphdb/integrity_repair.go, protection_config.go                  ││
+│ │   core/vectorgraphdb/protected_db.go                                            ││
+│ │   core/lifecycle/budget_persistence.go                                          ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - HNSW Snapshot Isolation: CoW deep-copy for consistent reads during writes   ││
+│ │   - Version-Based OCC: CAS conflict detection, automatic retry with backoff     ││
+│ │   - Session-Scoped Views: ReadCommitted, RepeatableRead, SessionLocal isolation ││
+│ │   - Integrity Validation: orphan detection, dimension mismatch, cycle detection ││
+│ │   - Auto-Repair: quarantine corrupt, delete orphans, rebuild from SQLite        ││
+│ │   - File Handle Budget Persistence: crash recovery via SQLite-backed state      ││
+│ │   - Unified Protection: ProtectedVectorDB wraps all layers                      ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (4 parallel) → Phase 2 → Phase 3 → (phases 4-7 can overlap)           ││
+│ │   Phase 8 runs standalone parallel with all others                              ││
+│ │   Phase 9 → Phase 10 → Phase 11 (tests)                                         ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - Existing VectorGraphDB with SQLite WAL mode (leveraged, not replaced)       ││
+│ │   - Existing HNSW index (extended with snapshot capability)                     ││
+│ │   - FH.x File Handle Management (for SC.12 budget integration)                  ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Integrates with File Handle Management (4H) via budget persistence          ││
+│ │   - Integrates with Stuck Agent Detection (4I) for corruption on agent death    ││
+│ │   - SessionScopedView ties to session lifecycle in core/session/                ││
+│ │   - ProtectedVectorDB becomes the standard DB interface for all agents          ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4K: Cascading LLM Failure Prevention (CF.1-CF.25)                ││
+│ │ ** NEW: Hierarchical bulkheads, multi-layer rate limiting, hybrid health **     ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - type definitions, no interdependencies):                ││
+│ │ • CF.1 Bulkhead Types (core/llm/bulkhead/types.go)                              ││
+│ │ • CF.5 Rate Limit Types (core/llm/ratelimit/types.go)                           ││
+│ │ • CF.10 Backpressure Types (core/llm/backpressure/types.go)                     ││
+│ │ • CF.13 Health Monitor Types (core/llm/health/types.go)                         ││
+│ │ • CF.17 Streaming Timeout Types (core/llm/timeout/types.go)                     ││
+│ │ • CF.20 Failure Correlation Types (core/llm/correlation/types.go)               ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After respective type phases):                                         ││
+│ │ • CF.2 Bulkhead Implementation (depends on CF.1)                                ││
+│ │ • CF.6, CF.7, CF.8 Rate Limiters (parallel, depend on CF.5)                     ││
+│ │ • CF.11 BudgetGetter (depends on CF.10)                                         ││
+│ │ • CF.14, CF.15 Active/Passive Monitors (parallel, depend on CF.13)              ││
+│ │ • CF.18, CF.19 Streaming/Jitter (parallel, depend on CF.17)                     ││
+│ │ • CF.21 Failure Correlation Engine (depends on CF.20)                           ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After phase 2 completions):                                            ││
+│ │ • CF.3 Hierarchical Bulkhead (depends on CF.2)                                  ││
+│ │ • CF.9 Multi-Layer Rate Limiter (depends on CF.6, CF.7, CF.8)                   ││
+│ │ • CF.12 Cost Backpressure (depends on CF.10, CF.11)                             ││
+│ │ • CF.16 Hybrid Health Monitor (depends on CF.14, CF.15)                         ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After phase 3):                                                        ││
+│ │ • CF.4 Hierarchical Slot (depends on CF.2, CF.3)                                ││
+│ │ • CF.22 Coordinator Types (depends on all type phases)                          ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After all prior phases):                                               ││
+│ │ • CF.23 LLM Request Coordinator (depends on CF.4, CF.9, CF.12, CF.16, etc.)     ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After CF.23):                                                          ││
+│ │ • CF.24 LLM Client Integration                                                  ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After ALL complete):                                                   ││
+│ │ • CF.25 Cascading Failure Integration Tests                                     ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/llm/bulkhead/types.go, bulkhead.go, hierarchy.go, slot.go                ││
+│ │   core/llm/ratelimit/types.go, token_bucket.go, sliding_window.go               ││
+│ │   core/llm/ratelimit/adaptive_429.go, multi_layer.go                            ││
+│ │   core/llm/backpressure/types.go, budget.go, cost_aware.go                      ││
+│ │   core/llm/health/types.go, active_prober.go, passive_monitor.go                ││
+│ │   core/llm/health/hybrid_monitor.go                                             ││
+│ │   core/llm/timeout/types.go, streaming.go, jittered_backoff.go                  ││
+│ │   core/llm/correlation/types.go, failure_engine.go                              ││
+│ │   core/llm/coordinator/types.go, coordinator.go                                 ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - Hierarchical Bulkheads: session→provider→model isolation (5×3×2 = 30 max)   ││
+│ │   - Multi-Layer Rate Limiting: token bucket + sliding window + adaptive 429     ││
+│ │   - Most restrictive wins across all limiters                                   ││
+│ │   - Cost Backpressure: exponential delays (80%→1.5x to 98%→8x), reject at 100%  ││
+│ │   - NO model degradation: agents control their own model selection              ││
+│ │   - Hybrid Health: 40% active probes + 60% passive inference                    ││
+│ │   - Failure Correlation: global backoff when 3+ sessions fail same provider     ││
+│ │   - Staggered Recovery: 10% traffic increments after backoff                    ││
+│ │   - Streaming Timeouts: first-token (30s), inter-token (10s), total (5m)        ││
+│ │   - Jittered Backoff: prevents thundering herd with [0.5, 1.5] random jitter    ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (6 parallel) → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Phase 6 → 7    ││
+│ │   High parallelism in phases 1-3                                                ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - Existing LLM client infrastructure (for CF.24 integration)                  ││
+│ │   - Existing SignalDispatcher (for global backoff signals)                      ││
+│ │   - Existing token budget tracking (for BudgetGetter)                           ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Can run parallel with 4G (Goroutine), 4H (File Handle), 4I (Stuck Agent)    ││
+│ │   - Integrates with 4J (Shared State) via session lifecycle                     ││
+│ │   - LLMRequestCoordinator becomes single entry point for all LLM requests       ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 60-70 parallel engineer pipelines (increased for CF system)    │
 │ DEPENDENCIES: Wave 3 complete (including 3D FILESYSTEM and 3E Tree-Sitter)         │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘

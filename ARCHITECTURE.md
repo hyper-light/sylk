@@ -6039,6 +6039,4698 @@ func (rm *RecoveryManager) Recover() (*SessionState, error) {
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Goroutine & Operation Lifecycle Management System
+
+**Zero-leak guarantee, user-controllable, boundary-enforced**
+
+**Reference**: See `/GOROUTINE.md` for complete specification including all code implementations.
+
+#### Design Principles
+
+1. **Zero leaks** - Goroutines cannot leak; all are tracked, bounded, and terminable
+2. **User control** - Stop/Pause/Kill commands work immediately and completely
+3. **Boundary enforcement** - All external operations (LLM, tools, files, network) go through tracked interceptors
+4. **Graceful degradation** - Escalating termination: cancel → force-close → orphan-track → restart
+5. **Sandbox-agnostic** - Works with sandbox OFF (default) using OS-level primitives
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    OPERATION LIFECYCLE MANAGEMENT SYSTEM                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  USER COMMANDS                                                                      │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│  STOP:  Signal completion → wait for clean shutdown → verify zero operations       │
+│  PAUSE: Checkpoint state → stop new work → suspend in-flight → verify frozen       │
+│  KILL:  Cancel all contexts → force deadline → orphan tracking → restart if stuck  │
+│                                                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐ │
+│  │                        PIPELINE CONTROLLER                                     │ │
+│  │   Receives user commands, orchestrates response across all agents              │ │
+│  └───────────────────────────────────────────────────────────────────────────────┘ │
+│                                       │                                             │
+│           ┌───────────────────────────┼───────────────────────────────────────┐    │
+│           ▼                           ▼                           ▼            │    │
+│  ┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐  │    │
+│  │   AGENT SUPERVISOR  │   │   AGENT SUPERVISOR  │   │   AGENT SUPERVISOR  │  │    │
+│  │   (per agent)       │   │   (per agent)       │   │   (per agent)       │  │    │
+│  │                     │   │                     │   │                     │  │    │
+│  │   ┌─────────────┐   │   │   ┌─────────────┐   │   │   ┌─────────────┐   │  │    │
+│  │   │ Goroutine   │   │   │   │ Goroutine   │   │   │   │ Goroutine   │   │  │    │
+│  │   │ Scope       │   │   │   │ Scope       │   │   │   │ Scope       │   │  │    │
+│  │   └─────────────┘   │   │   └─────────────┘   │   │   └─────────────┘   │  │    │
+│  │   ┌─────────────┐   │   │   ┌─────────────┐   │   │   ┌─────────────┐   │  │    │
+│  │   │ Operation   │   │   │   │ Operation   │   │   │   │ Operation   │   │  │    │
+│  │   │ Tracker     │   │   │   │ Tracker     │   │   │   │ Tracker     │   │  │    │
+│  │   └─────────────┘   │   │   └─────────────┘   │   │   └─────────────┘   │  │    │
+│  │   ┌─────────────┐   │   │   ┌─────────────┐   │   │   ┌─────────────┐   │  │    │
+│  │   │ Resource    │   │   │   │ Resource    │   │   │   │ Resource    │   │  │    │
+│  │   │ Tracker     │   │   │   │ Tracker     │   │   │   │ Tracker     │   │  │    │
+│  │   └─────────────┘   │   │   └─────────────┘   │   │   └─────────────┘   │  │    │
+│  └─────────────────────┘   └─────────────────────┘   └─────────────────────┘  │    │
+│           │                           │                           │            │    │
+│           └───────────────────────────┼───────────────────────────┘            │    │
+│                                       ▼                                         │    │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐ │
+│  │                      BOUNDARY INTERCEPTORS                                     │ │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐          │ │
+│  │  │ LLM Client   │ │ Tool Executor│ │ VFS Layer    │ │ Network Pool │          │ │
+│  │  │              │ │              │ │              │ │              │          │ │
+│  │  │ • Timeout    │ │ • Subprocess │ │ • Handle     │ │ • Conn       │          │ │
+│  │  │ • Cancel     │ │ • Timeout    │ │   tracking   │ │   tracking   │          │ │
+│  │  │ • Track      │ │ • Sandbox    │ │ • Force      │ │ • Force      │          │ │
+│  │  │              │ │ • Track      │ │   close      │ │   close      │          │ │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘          │ │
+│  └───────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+│  TERMINATION ESCALATION:                                                            │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│  1. Cancel context (signal all operations to stop)                    [0-100ms]    │
+│  2. Wait for voluntary termination                                    [100ms-1s]   │
+│  3. Force-close all boundary resources (connections, handles)         [1s-2s]      │
+│  4. If still stuck: mark agent tainted, isolate, restart             [2s-5s]      │
+│  5. If restart fails: orphan tracking, continue degraded             [5s+]        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4-Layer Defense System
+
+| Layer | Mechanism | Guarantee |
+|-------|-----------|-----------|
+| **1. Compile-Time** | Custom linter forbids raw `go` statements | Structural enforcement |
+| **2. Structural** | `scope.Go()` requires `func(ctx context.Context) error` | Context awareness |
+| **3. Runtime** | GoroutineBudget with soft/hard limits + burst | Resource bounds |
+| **4. Termination** | 5-phase escalation with force-close | Zero orphans |
+
+#### Key Components
+
+**GoroutineScope**: Per-agent goroutine manager
+- All goroutines spawned via `scope.Go(description, timeout, func)`
+- Maximum lifetime enforced (default 5 minutes)
+- Shutdown blocks until all workers terminated
+
+**GoroutineBudget**: Dynamic limits based on memory pressure
+- NORMAL: 100% capacity
+- ELEVATED: 75% capacity
+- HIGH: 50% capacity
+- CRITICAL: 25% capacity
+- Burst multiplier: 1.5x (soft → hard limit)
+
+**AgentSupervisor**: Per-agent lifecycle manager
+- Owns GoroutineScope, OperationTracker, ResourceTracker
+- Handles Stop/Pause/Kill commands
+- Enforces max concurrent operations
+
+**PipelineController**: User command handler
+- Routes Stop/Pause/Kill to all AgentSupervisors
+- Coordinates termination across pipeline
+- Returns only after verified clean shutdown
+
+**TrackedProcess** (Sandbox-Agnostic):
+- Works with or without sandbox enabled
+- Uses OS signals: SIGINT → SIGTERM → SIGKILL
+- Process groups (`Setpgid: true`) for killing child processes
+
+#### Zero-Leak Guarantees
+
+| Layer | Guarantee |
+|-------|-----------|
+| **Compile-time** | Raw `go` forbidden by linter |
+| **Structural** | All goroutines MUST accept context |
+| **Timeouts** | All goroutines have max lifetime |
+| **Primitives** | All blocking ops context-aware (`safechan`, `safelock`) |
+| **Termination** | Shutdown blocks until verified |
+| **Escalation** | Leak → force-close → orphan-track → restart |
+
+#### User Commands
+
+| Command | Behavior | Use Case |
+|---------|----------|----------|
+| **Stop** | Wait for completion | Graceful end of work |
+| **Pause** | Checkpoint + freeze | Temporary suspension |
+| **Resume** | Continue from checkpoint | After pause |
+| **Kill** | Immediate termination | Emergency stop |
+
+#### Integration Points (Sandbox-Agnostic)
+
+| # | Component | File | Change |
+|---|-----------|------|--------|
+| 1 | AgentRunner | `core/concurrency/agent_runner.go` | Replace raw `go` with `scope.Go()` |
+| 2 | Lifecycle | `core/concurrency/lifecycle.go` | Add Pausing/Paused/Resuming/Killing states |
+| 3 | KillSequenceManager | `core/tools/kill_sequence.go` | Extend 3-phase → 5-phase |
+| 4 | PermissionManager | `core/security/permission_manager.go` | Use in TrackedToolExecutor |
+| 5 | Signal Handler | `core/signal/agent_handler.go` | Route SIGINT/SIGTERM → PipelineController |
+| 6 | UI Commands | Terminal UI | Route stop/pause/kill → PipelineController |
+| 7 | Memory Pressure | MEMORY.md integration | Connect GoroutineBudget to pressure levels |
+| 8 | Tool Executor | `core/tools/executor.go` | Wrap with TrackedToolExecutor |
+
+#### Capability Matrix (Sandbox ON vs OFF)
+
+| Capability | Sandbox OFF (default) | Sandbox ON |
+|------------|----------------------|------------|
+| Process termination | OS signals (SIGINT→SIGTERM→SIGKILL) | Sandbox kill + OS fallback |
+| Child process killing | Process groups (`-pgid`) | Container/namespace + groups |
+| Permission checks | PermissionManager | PermissionManager + policies |
+| Audit logging | AuditLogger | AuditLogger + sandbox trail |
+| Resource tracking | ResourceTracker | ResourceTracker + quotas |
+
+### File Handle Management System
+
+**Hierarchical work-stealing with proactive tracking and user notification**
+
+#### Design Principles
+
+1. **Hierarchical allocation** - Global → Session → Agent with work-stealing at each level
+2. **Proactive tracking** - Via existing ResourceTracker, no scanning needed
+3. **No errors on wait** - Log + notify user, proceed when available
+4. **Automatic cleanup** - Ownership-based lifecycle via existing infrastructure
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    HIERARCHICAL WORK-STEALING MODEL                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  GLOBAL POOL (e.g., 820 FDs after 20% system reserve)                               │
+│  ═══════════════════════════════════════════════════════════════════════════════   │
+│  │                                                                                 │
+│  │  Unallocated: available for session stealing                                   │
+│  │                                                                                 │
+│  ├── SESSION A POOL (allocated from global)                                       │
+│  │   │                                                                            │
+│  │   │  Unallocated: available for agent stealing                                │
+│  │   │                                                                            │
+│  │   ├── Agent: Engineer-1    [using X/Y allocated]                              │
+│  │   ├── Agent: Engineer-2    [using X/Y allocated]                              │
+│  │   └── Agent: Inspector     [using X/Y allocated]                              │
+│  │                                                                                 │
+│  ├── SESSION B POOL (allocated from global)                                       │
+│  │   │                                                                            │
+│  │   ├── Agent: Engineer-1    [using X/Y allocated]                              │
+│  │   └── Agent: Architect     [using X/Y allocated]                              │
+│  │                                                                                 │
+│  └───────────────────────────────────────────────────────────────────────────────  │
+│                                                                                     │
+│  STEALING HIERARCHY:                                                                │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                     │
+│    Agent needs FD → Agent has capacity? ──yes──► Acquire ✓                         │
+│                         │ no                                                       │
+│                         ▼                                                          │
+│                     Session pool has ──yes──► Agent steals from session ✓          │
+│                     unallocated?                                                   │
+│                         │ no                                                       │
+│                         ▼                                                          │
+│                     Global pool has ──yes──► Session steals from global,           │
+│                     unallocated?              then agent steals from session ✓     │
+│                         │ no                                                       │
+│                         ▼                                                          │
+│                     WAIT (no error)                                                │
+│                     • Log: "Agent X waiting for file handle"                       │
+│                     • Notify UI: show waiting status                               │
+│                     • When available: Log + Notify proceeding                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key Components
+
+**FileHandleBudget**: Global pool with hierarchical allocation
+```go
+type FileHandleBudget struct {
+    globalLimit     int              // from ulimit -n
+    globalAllocated atomic.Int64     // sum of session allocations
+    globalUsed      atomic.Int64     // sum of actual usage
+
+    sessions        sync.Map         // sessionID → *SessionFileBudget
+    pressureLevel   *atomic.Int32    // from memory pressure system
+
+    notifier        ResourceNotifier // signals UI about waiting/proceeding
+    logger          *slog.Logger
+}
+```
+
+**SessionFileBudget**: Per-session allocation from global
+```go
+type SessionFileBudget struct {
+    sessionID       string
+    parent          *FileHandleBudget
+
+    allocated       atomic.Int64     // claimed from global
+    used            atomic.Int64     // actual usage by agents
+
+    agents          sync.Map         // agentID → *AgentFileBudget
+}
+```
+
+**AgentFileBudget**: Per-agent allocation from session
+```go
+type AgentFileBudget struct {
+    agentID         string
+    agentType       string
+    parent          *SessionFileBudget
+
+    allocated       atomic.Int64     // claimed from session
+    used            atomic.Int64     // actual open files
+    baseAllocation  int              // starting allocation by agent type
+
+    cond            *sync.Cond       // for blocking when exhausted
+}
+```
+
+**TrackedFile**: Implements TrackedResource interface
+```go
+type TrackedFile struct {
+    file        *os.File
+    path        string
+    fd          int
+    mode        FileMode
+
+    openedAt    time.Time
+    lastAccess  atomic.Value     // time.Time
+
+    sessionID   string
+    agentID     string
+    agentBudget *AgentFileBudget
+
+    closed      bool
+}
+
+func (f *TrackedFile) Type() string { return "file" }
+func (f *TrackedFile) ID() string   { return fmt.Sprintf("file:%s:%d", f.path, f.fd) }
+func (f *TrackedFile) ForceClose() error {
+    // Release from budget (enables others to acquire)
+    f.agentBudget.Release()
+    return f.file.Close()
+}
+```
+
+**ResourceNotifier**: UI notification interface
+```go
+type ResourceNotifier interface {
+    AgentWaiting(sessionID, agentID, resource string)
+    AgentProceeding(sessionID, agentID, resource string)
+}
+```
+
+#### Acquire with Hierarchical Stealing
+
+```go
+func (a *AgentFileBudget) Acquire(ctx context.Context) error {
+    startWait := time.Time{}
+    notified := false
+
+    for {
+        acquired, level := a.tryAcquire()
+
+        if acquired {
+            if notified {
+                // Log + notify we're proceeding
+                a.parent.parent.logger.Info("agent acquired file handle",
+                    "agent", a.agentID,
+                    "waited", time.Since(startWait),
+                    "level", level,
+                )
+                a.parent.parent.notifier.AgentProceeding(
+                    a.parent.sessionID, a.agentID, "file_handle",
+                )
+            }
+            return nil
+        }
+
+        // Must wait - log + notify (once)
+        if !notified {
+            startWait = time.Now()
+            notified = true
+            a.parent.parent.logger.Info("agent waiting for file handle",
+                "agent", a.agentID,
+                "session", a.parent.sessionID,
+            )
+            a.parent.parent.notifier.AgentWaiting(
+                a.parent.sessionID, a.agentID, "file_handle",
+            )
+        }
+
+        // Wait for signal (context-aware)
+        a.mu.Lock()
+        select {
+        case <-ctx.Done():
+            a.mu.Unlock()
+            if notified {
+                a.parent.parent.notifier.AgentProceeding(
+                    a.parent.sessionID, a.agentID, "file_handle",
+                )
+            }
+            return ctx.Err()
+        default:
+            a.cond.Wait()
+        }
+        a.mu.Unlock()
+    }
+}
+
+func (a *AgentFileBudget) tryAcquire() (acquired bool, level string) {
+    // Level 1: Agent has capacity
+    if a.used.Load() < a.allocated.Load() {
+        a.used.Add(1)
+        a.parent.used.Add(1)
+        a.parent.parent.globalUsed.Add(1)
+        return true, "agent"
+    }
+
+    // Level 2: Steal from session pool
+    if a.parent.tryExpandAgent(a) {
+        a.used.Add(1)
+        a.parent.used.Add(1)
+        a.parent.parent.globalUsed.Add(1)
+        return true, "session"
+    }
+
+    // Level 3: Session steals from global, then agent from session
+    if a.parent.parent.tryExpandSession(a.parent) {
+        if a.parent.tryExpandAgent(a) {
+            a.used.Add(1)
+            a.parent.used.Add(1)
+            a.parent.parent.globalUsed.Add(1)
+            return true, "global"
+        }
+    }
+
+    return false, ""
+}
+```
+
+#### Release with Signal Propagation
+
+```go
+func (a *AgentFileBudget) Release() {
+    a.used.Add(-1)
+    a.parent.used.Add(-1)
+    a.parent.parent.globalUsed.Add(-1)
+
+    // Signal all levels - someone might be waiting
+    a.signalWaiters()
+    a.parent.signalWaiters()
+    a.parent.parent.signalAllWaiters()
+}
+```
+
+#### Integration with Existing Infrastructure
+
+| Component | Integration |
+|-----------|-------------|
+| **ResourceTracker** | TrackedFile implements TrackedResource |
+| **AgentSupervisor** | `supervisor.OpenFile()` acquires + tracks |
+| **PipelineController** | Kill → ForceCloseAll → files closed |
+| **Memory Pressure** | Reduce allocations under pressure |
+| **GoroutineBudget** | Same pattern, shared pressure level |
+
+#### AgentSupervisor.OpenFile Integration
+
+```go
+func (s *AgentSupervisor) OpenFile(ctx context.Context, path string, mode FileMode) (*TrackedFile, error) {
+    // Acquire from budget (waits with logging/notification if needed)
+    if err := s.fileBudget.Acquire(ctx); err != nil {
+        return nil, err
+    }
+
+    osFile, err := os.OpenFile(path, modeToFlags(mode), 0644)
+    if err != nil {
+        s.fileBudget.Release()
+        return nil, err
+    }
+
+    tracked := &TrackedFile{
+        file:        osFile,
+        path:        path,
+        fd:          int(osFile.Fd()),
+        mode:        mode,
+        openedAt:    time.Now(),
+        sessionID:   s.sessionID,
+        agentID:     s.agentID,
+        agentBudget: s.fileBudget,
+    }
+
+    // Track via ResourceTracker (auto-cleanup on death)
+    s.resources.Track(tracked)
+
+    return tracked, nil
+}
+```
+
+#### Monitoring Snapshot
+
+```go
+type FileHandleSnapshot struct {
+    Global struct {
+        Limit       int
+        Allocated   int
+        Used        int
+        Unallocated int
+    }
+    Sessions []SessionSnapshot
+}
+
+type SessionSnapshot struct {
+    SessionID   string
+    Allocated   int
+    Used        int
+    Unallocated int
+    Agents      []AgentSnapshot
+}
+
+type AgentSnapshot struct {
+    AgentID   string
+    Allocated int
+    Used      int
+    Waiting   bool
+}
+```
+
+#### Guarantees
+
+| Guarantee | Mechanism |
+|-----------|-----------|
+| **No orphaned handles** | Ownership via ResourceTracker, ForceCloseAll on death |
+| **No exhaustion errors** | Wait with notification, never error |
+| **Fair sharing** | Hierarchical allocation with work-stealing |
+| **User visibility** | Log + UI notification on wait/proceed |
+| **Memory pressure aware** | Reduce allocations under pressure |
+
+---
+
+## Stuck Agent Detection & Recovery System
+
+Multi-agent systems face two critical liveness risks: **livelock** (agent running but making no meaningful progress) and **deadlock** (agent blocked waiting on something that will never happen). Sylk implements a comprehensive detection and hierarchical recovery system.
+
+### Design Philosophy
+
+1. **Compound Detection** - Single signals (e.g., repetitive operations) don't indicate stuck state; only the combination of multiple concerning signals triggers intervention
+2. **Hierarchical Recovery** - Soft intervention first, then user escalation, then force kill
+3. **Eager Resource Release** - When deadlock detected on dead agent's resources, release immediately
+4. **Recovery Notification** - If a "dead" agent recovers, notify it to re-acquire resources
+
+### Layer 1: Progress Signal Collector
+
+All meaningful agent activity emits progress signals. These signals serve as heartbeats and progress indicators.
+
+```go
+type ProgressSignalType int
+const (
+    SignalToolCompleted ProgressSignalType = iota  // tool finished execution
+    SignalLLMResponse                               // received LLM response
+    SignalFileModified                              // file was written/edited
+    SignalStateTransition                           // agent state changed
+    SignalAgentRequest                              // agent-to-agent communication (sign of life)
+    // Note: User notification does NOT count as progress
+)
+
+type ProgressSignal struct {
+    AgentID     string
+    SessionID   string
+    SignalType  ProgressSignalType
+    Timestamp   time.Time
+    Operation   string              // e.g., "Read:/foo/bar.go", "Edit:/src/main.go"
+    Hash        uint64              // for repetition detection
+    Details     map[string]any
+}
+
+type ProgressCollector struct {
+    signals     sync.Map               // agentID → *AgentSignalBuffer
+    subscribers []ProgressSubscriber   // listeners for signal events
+    mu          sync.RWMutex
+}
+
+type AgentSignalBuffer struct {
+    agentID      string
+    sessionID    string
+    buffer       *ring.Buffer[ProgressSignal]  // sliding window (last 100 signals)
+    lastSignal   atomic.Value                  // time.Time of most recent signal
+    signalCount  atomic.Int64                  // total signals emitted
+    mu           sync.RWMutex
+}
+
+// Signal emits a progress signal for an agent
+func (c *ProgressCollector) Signal(sig ProgressSignal) {
+    buf := c.getOrCreateBuffer(sig.AgentID, sig.SessionID)
+    buf.mu.Lock()
+    buf.buffer.Push(sig)
+    buf.lastSignal.Store(sig.Timestamp)
+    buf.signalCount.Add(1)
+    buf.mu.Unlock()
+
+    // Notify subscribers (health scorer, etc.)
+    c.notifySubscribers(sig)
+}
+
+// LastSignalTime returns when the agent last showed activity
+func (c *ProgressCollector) LastSignalTime(agentID string) (time.Time, bool) {
+    if buf, ok := c.signals.Load(agentID); ok {
+        return buf.(*AgentSignalBuffer).lastSignal.Load().(time.Time), true
+    }
+    return time.Time{}, false
+}
+
+// RecentSignals returns the last N signals for an agent
+func (c *ProgressCollector) RecentSignals(agentID string, n int) []ProgressSignal {
+    if buf, ok := c.signals.Load(agentID); ok {
+        return buf.(*AgentSignalBuffer).buffer.Last(n)
+    }
+    return nil
+}
+
+// SignalCount returns total signals emitted by agent (for victim selection)
+func (c *ProgressCollector) SignalCount(agentID string) int64 {
+    if buf, ok := c.signals.Load(agentID); ok {
+        return buf.(*AgentSignalBuffer).signalCount.Load()
+    }
+    return 0
+}
+```
+
+### Layer 2: Multi-Signal Health Scorer
+
+Health is assessed using weighted combination of multiple signals. **Critically, repetition only contributes when other signals are already concerning**.
+
+```go
+type HealthScorer struct {
+    collector       *ProgressCollector
+    repetitionDet   *RepetitionDetector
+    resourceMon     *ResourceMonitor
+    weights         HealthWeights
+    thresholds      HealthThresholds
+}
+
+type HealthWeights struct {
+    HeartbeatWeight    float64  // 0.35 - most important signal
+    ProgressWeight     float64  // 0.30 - meaningful progress rate
+    RepetitionWeight   float64  // 0.20 - only applies if OTHER signals are bad
+    ResourceWeight     float64  // 0.15 - CPU spinning, no I/O patterns
+}
+
+type HealthThresholds struct {
+    HeartbeatStaleAfter   time.Duration  // 30s without signal = stale
+    ProgressWindowSize    int            // assess progress over last 20 signals
+    RepetitionMinCycles   int            // need 3+ repetitions to be concerning
+    HealthyThreshold      float64        // > 0.7 = healthy
+    WarningThreshold      float64        // 0.4-0.7 = warning
+    StuckThreshold        float64        // 0.2-0.4 = stuck
+    CriticalThreshold     float64        // < 0.2 = critical
+}
+
+type HealthAssessment struct {
+    AgentID           string
+    SessionID         string
+    OverallScore      float64           // 0.0 (dead) → 1.0 (healthy)
+
+    // Individual component scores (all 0.0-1.0, higher = healthier)
+    HeartbeatScore    float64           // based on time since last signal
+    ProgressScore     float64           // variety of operations, forward movement
+    RepetitionScore   float64           // inverted: 0=loops detected, 1=no loops
+    ResourceScore     float64           // based on resource consumption patterns
+
+    // Compound detection flag
+    RepetitionConcern bool              // true only if repetition + other bad signals
+
+    // Status derived from score
+    Status            AgentHealthStatus
+
+    // Timing
+    LastProgress      time.Time
+    StuckSince        *time.Time        // nil if not stuck
+    AssessedAt        time.Time
+}
+
+type AgentHealthStatus int
+const (
+    StatusHealthy AgentHealthStatus = iota    // score > 0.7
+    StatusWarning                              // score 0.4-0.7
+    StatusStuck                                // score 0.2-0.4
+    StatusCritical                             // score < 0.2
+    StatusDeadlocked                           // waiting on unreachable resource
+)
+
+func (h *HealthScorer) Assess(agentID string) HealthAssessment {
+    now := time.Now()
+
+    // Score individual components
+    heartbeat := h.scoreHeartbeat(agentID, now)
+    progress := h.scoreProgress(agentID)
+    repetition := h.scoreRepetition(agentID)
+    resource := h.scoreResource(agentID)
+
+    // CRITICAL: Repetition only contributes if other signals are concerning
+    // This prevents killing agents doing legitimate repetitive automation
+    otherSignalsConcerning := heartbeat < 0.5 || progress < 0.5
+    repetitionConcern := repetition < 0.5 && otherSignalsConcerning
+
+    var effectiveRepetition float64
+    if repetitionConcern {
+        effectiveRepetition = repetition
+    } else {
+        effectiveRepetition = 1.0  // don't penalize if agent otherwise healthy
+    }
+
+    overall := h.weights.HeartbeatWeight*heartbeat +
+               h.weights.ProgressWeight*progress +
+               h.weights.RepetitionWeight*effectiveRepetition +
+               h.weights.ResourceWeight*resource
+
+    assessment := HealthAssessment{
+        AgentID:           agentID,
+        OverallScore:      overall,
+        HeartbeatScore:    heartbeat,
+        ProgressScore:     progress,
+        RepetitionScore:   repetition,
+        ResourceScore:     resource,
+        RepetitionConcern: repetitionConcern,
+        Status:            h.statusFromScore(overall),
+        AssessedAt:        now,
+    }
+
+    if last, ok := h.collector.LastSignalTime(agentID); ok {
+        assessment.LastProgress = last
+    }
+
+    if assessment.Status >= StatusStuck {
+        stuckTime := now.Add(-h.thresholds.HeartbeatStaleAfter)
+        assessment.StuckSince = &stuckTime
+    }
+
+    return assessment
+}
+
+func (h *HealthScorer) scoreHeartbeat(agentID string, now time.Time) float64 {
+    last, ok := h.collector.LastSignalTime(agentID)
+    if !ok {
+        return 0.0  // no signals ever = very unhealthy
+    }
+
+    elapsed := now.Sub(last)
+    staleAfter := h.thresholds.HeartbeatStaleAfter
+
+    if elapsed < staleAfter/3 {
+        return 1.0  // very recent = fully healthy
+    } else if elapsed < staleAfter {
+        // Linear decay from 1.0 to 0.3
+        return 1.0 - 0.7*(float64(elapsed)/float64(staleAfter))
+    } else {
+        // Exponential decay below 0.3
+        overdue := elapsed - staleAfter
+        return 0.3 * math.Exp(-float64(overdue)/float64(staleAfter))
+    }
+}
+
+func (h *HealthScorer) scoreProgress(agentID string) float64 {
+    signals := h.collector.RecentSignals(agentID, h.thresholds.ProgressWindowSize)
+    if len(signals) < 3 {
+        return 0.5  // not enough data, neutral
+    }
+
+    // Measure variety of operations (different types, different targets)
+    typeSet := make(map[ProgressSignalType]bool)
+    targetSet := make(map[string]bool)
+
+    for _, sig := range signals {
+        typeSet[sig.SignalType] = true
+        targetSet[sig.Operation] = true
+    }
+
+    // More variety = more progress
+    typeVariety := float64(len(typeSet)) / 5.0  // 5 signal types max
+    targetVariety := math.Min(float64(len(targetSet))/10.0, 1.0)  // cap at 10
+
+    return 0.5*typeVariety + 0.5*targetVariety
+}
+
+func (h *HealthScorer) statusFromScore(score float64) AgentHealthStatus {
+    switch {
+    case score > h.thresholds.HealthyThreshold:
+        return StatusHealthy
+    case score > h.thresholds.WarningThreshold:
+        return StatusWarning
+    case score > h.thresholds.CriticalThreshold:
+        return StatusStuck
+    default:
+        return StatusCritical
+    }
+}
+```
+
+### Layer 3: Repetition Detector
+
+Detects when an agent is repeating the same operations. **Only triggers concern when combined with other negative signals**.
+
+```go
+type RepetitionDetector struct {
+    operationLogs sync.Map              // agentID → *OperationLog
+    config        RepetitionConfig
+}
+
+type RepetitionConfig struct {
+    WindowSize     int  // check last N operations (default: 50)
+    MaxCycleLength int  // detect cycles up to length N (default: 5)
+    MinRepetitions int  // need at least N repetitions (default: 3)
+}
+
+type OperationLog struct {
+    agentID    string
+    operations *ring.Buffer[Operation]  // sliding window
+    mu         sync.RWMutex
+}
+
+type Operation struct {
+    Type      string    // "tool", "llm", "file", "agent_request"
+    Action    string    // "Read", "Write", "Edit", "Glob", etc.
+    Target    string    // file path, tool name, agent ID
+    Timestamp time.Time
+    Hash      uint64    // for quick comparison
+}
+
+// Record logs an operation for repetition detection
+func (r *RepetitionDetector) Record(agentID string, op Operation) {
+    log := r.getOrCreateLog(agentID)
+    log.mu.Lock()
+    log.operations.Push(op)
+    log.mu.Unlock()
+}
+
+// Score returns repetition score: 1.0 = no repetition, 0.0 = definite loop
+func (r *RepetitionDetector) Score(agentID string) float64 {
+    log, ok := r.operationLogs.Load(agentID)
+    if !ok {
+        return 1.0  // no operations = no repetition
+    }
+
+    ops := log.(*OperationLog).Recent(r.config.WindowSize)
+    if len(ops) < r.config.MaxCycleLength*r.config.MinRepetitions {
+        return 1.0  // not enough data
+    }
+
+    // Check for cycles of length 1 to MaxCycleLength
+    for cycleLen := 1; cycleLen <= r.config.MaxCycleLength; cycleLen++ {
+        if reps := r.countRepetitions(ops, cycleLen); reps >= r.config.MinRepetitions {
+            // More repetitions = lower score (more concerning)
+            confidence := math.Min(float64(reps)/float64(r.config.MinRepetitions+3), 1.0)
+            return 1.0 - confidence
+        }
+    }
+
+    return 1.0  // no cycles detected
+}
+
+func (r *RepetitionDetector) countRepetitions(ops []Operation, cycleLen int) int {
+    if len(ops) < cycleLen*2 {
+        return 0
+    }
+
+    // Extract the last cycleLen operations as the pattern
+    pattern := ops[len(ops)-cycleLen:]
+    patternHashes := make([]uint64, cycleLen)
+    for i, op := range pattern {
+        patternHashes[i] = op.Hash
+    }
+
+    // Count how many times this pattern appears
+    repetitions := 1  // the pattern itself counts as 1
+
+    for i := len(ops) - cycleLen*2; i >= 0; i -= cycleLen {
+        match := true
+        for j := 0; j < cycleLen && i+j < len(ops); j++ {
+            if ops[i+j].Hash != patternHashes[j] {
+                match = false
+                break
+            }
+        }
+        if match {
+            repetitions++
+        } else {
+            break  // pattern broken, stop counting
+        }
+    }
+
+    return repetitions
+}
+```
+
+### Layer 4: Deadlock Detector
+
+Detects two types of deadlock:
+1. **Circular** - A waits on B, B waits on C, C waits on A
+2. **Dead Holder** - A waits on resource held by dead/unresponsive agent B
+
+```go
+type DeadlockDetector struct {
+    waitGraph    map[string][]WaitEdge   // waiterID → edges
+    agentStatus  func(string) bool       // returns true if agent alive
+    mu           sync.RWMutex
+}
+
+type WaitEdge struct {
+    WaiterID     string
+    HolderID     string
+    ResourceType string     // "file", "goroutine_budget", "file_handle", etc.
+    ResourceID   string
+    WaitingSince time.Time
+}
+
+type DeadlockResult struct {
+    Detected      bool
+    Type          DeadlockType
+    Cycle         []string        // agent IDs forming cycle (for circular)
+    DeadHolder    string          // dead agent holding resource
+    WaitingAgents []string        // agents waiting on the resource
+    ResourceType  string
+    ResourceID    string
+}
+
+type DeadlockType int
+const (
+    DeadlockNone DeadlockType = iota
+    DeadlockCircular          // A→B→C→A cycle
+    DeadlockDeadHolder        // waiting on dead agent's resource
+)
+
+// RegisterWait records that waiter is waiting on resource held by holder
+func (d *DeadlockDetector) RegisterWait(waiter, holder, resourceType, resourceID string) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+
+    d.waitGraph[waiter] = append(d.waitGraph[waiter], WaitEdge{
+        WaiterID:     waiter,
+        HolderID:     holder,
+        ResourceType: resourceType,
+        ResourceID:   resourceID,
+        WaitingSince: time.Now(),
+    })
+}
+
+// ClearWait removes wait edge when resource is acquired
+func (d *DeadlockDetector) ClearWait(waiter, resourceID string) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+
+    edges := d.waitGraph[waiter]
+    filtered := edges[:0]
+    for _, e := range edges {
+        if e.ResourceID != resourceID {
+            filtered = append(filtered, e)
+        }
+    }
+    d.waitGraph[waiter] = filtered
+}
+
+// Check scans for deadlock conditions
+func (d *DeadlockDetector) Check() []DeadlockResult {
+    d.mu.RLock()
+    defer d.mu.RUnlock()
+
+    var results []DeadlockResult
+
+    // Check 1: Circular dependencies using DFS
+    visited := make(map[string]bool)
+    recStack := make(map[string]bool)
+
+    for agentID := range d.waitGraph {
+        if cycle := d.findCycleDFS(agentID, visited, recStack, nil); len(cycle) > 0 {
+            results = append(results, DeadlockResult{
+                Detected: true,
+                Type:     DeadlockCircular,
+                Cycle:    cycle,
+            })
+        }
+    }
+
+    // Check 2: Waiting on dead agent's resources
+    for waiter, edges := range d.waitGraph {
+        for _, edge := range edges {
+            if !d.agentStatus(edge.HolderID) {  // holder is dead
+                results = append(results, DeadlockResult{
+                    Detected:      true,
+                    Type:          DeadlockDeadHolder,
+                    DeadHolder:    edge.HolderID,
+                    WaitingAgents: []string{waiter},
+                    ResourceType:  edge.ResourceType,
+                    ResourceID:    edge.ResourceID,
+                })
+            }
+        }
+    }
+
+    return results
+}
+
+func (d *DeadlockDetector) findCycleDFS(node string, visited, recStack map[string]bool, path []string) []string {
+    if recStack[node] {
+        // Found cycle - extract it from path
+        cycleStart := -1
+        for i, n := range path {
+            if n == node {
+                cycleStart = i
+                break
+            }
+        }
+        if cycleStart >= 0 {
+            return append(path[cycleStart:], node)
+        }
+        return nil
+    }
+
+    if visited[node] {
+        return nil
+    }
+
+    visited[node] = true
+    recStack[node] = true
+    path = append(path, node)
+
+    for _, edge := range d.waitGraph[node] {
+        if cycle := d.findCycleDFS(edge.HolderID, visited, recStack, path); len(cycle) > 0 {
+            return cycle
+        }
+    }
+
+    recStack[node] = false
+    return nil
+}
+```
+
+### Layer 5: Recovery Orchestrator (Hierarchical)
+
+Implements the 3-level recovery hierarchy:
+1. **Soft Intervention** - Inject "break out" prompt into LLM context
+2. **User Escalation** - Present options: [Wait] [Kill] [Inspect]
+3. **Force Kill** - Terminate agent and release resources
+
+```go
+type RecoveryOrchestrator struct {
+    supervisor     *AgentSupervisor
+    healthScorer   *HealthScorer
+    deadlockDet    *DeadlockDetector
+    resourceMgr    *ResourceManager       // for eager release
+    notifier       RecoveryNotifier
+    logger         *slog.Logger
+
+    recoveryState  sync.Map               // agentID → *RecoveryState
+    config         RecoveryConfig
+}
+
+type RecoveryConfig struct {
+    SoftInterventionDelay  time.Duration  // 30s stuck → try soft intervention
+    UserEscalationDelay    time.Duration  // 60s stuck → escalate to user
+    ForceKillDelay         time.Duration  // 120s stuck → force kill
+    MaxSoftAttempts        int            // try soft intervention up to 2 times
+    MonitorInterval        time.Duration  // check health every 5s
+}
+
+type RecoveryState struct {
+    agentID              string
+    sessionID            string
+    level                RecoveryLevel
+    stuckSince           time.Time
+    softAttempts         int
+    lastSoftIntervention time.Time
+    userEscalated        bool
+    userEscalatedAt      time.Time
+    userResponse         *UserRecoveryResponse
+    resourcesReleased    []string          // resources released during recovery
+    mu                   sync.Mutex
+}
+
+type RecoveryLevel int
+const (
+    RecoveryNone RecoveryLevel = iota
+    RecoverySoftIntervention
+    RecoveryUserEscalation
+    RecoveryForceKill
+)
+
+type RecoveryNotifier interface {
+    // Soft intervention - prepend to next LLM request
+    InjectBreakoutPrompt(agentID string, prompt string) error
+
+    // User escalation - show modal with options
+    EscalateToUser(sessionID, agentID string, assessment HealthAssessment) error
+
+    // User responded to escalation
+    OnUserResponse(agentID string, response UserRecoveryResponse)
+
+    // Notify force kill
+    NotifyForceKill(sessionID, agentID string, reason string)
+
+    // Notify agent it needs to re-acquire resources (after recovery)
+    NotifyReacquireResources(agentID string, resources []string)
+}
+
+type UserRecoveryResponse struct {
+    Action    UserRecoveryAction
+    Timestamp time.Time
+}
+
+type UserRecoveryAction int
+const (
+    UserActionWait UserRecoveryAction = iota   // "Keep waiting, it's fine"
+    UserActionKill                              // "Kill it"
+    UserActionInspect                           // "Let me see what's happening"
+)
+
+func (r *RecoveryOrchestrator) HandleStuckAgent(assessment HealthAssessment) {
+    state := r.getOrCreateState(assessment.AgentID, assessment.SessionID)
+    state.mu.Lock()
+    defer state.mu.Unlock()
+
+    // If agent recovered, clear state and notify to re-acquire resources
+    if assessment.Status == StatusHealthy {
+        if len(state.resourcesReleased) > 0 {
+            r.notifier.NotifyReacquireResources(assessment.AgentID, state.resourcesReleased)
+            r.logger.Info("agent recovered, notified to re-acquire resources",
+                "agent", assessment.AgentID,
+                "resources", state.resourcesReleased,
+            )
+        }
+        r.clearState(assessment.AgentID)
+        return
+    }
+
+    stuckDuration := time.Since(*assessment.StuckSince)
+
+    switch {
+    case stuckDuration < r.config.SoftInterventionDelay:
+        // Not stuck long enough yet - just monitor
+        return
+
+    case stuckDuration < r.config.UserEscalationDelay:
+        // Level 1: Soft intervention
+        if state.softAttempts < r.config.MaxSoftAttempts {
+            r.trySoftIntervention(state, assessment)
+        }
+
+    case stuckDuration < r.config.ForceKillDelay:
+        // Level 2: Escalate to user
+        if !state.userEscalated {
+            r.escalateToUser(state, assessment)
+        } else if state.userResponse != nil {
+            r.handleUserResponse(state, assessment)
+        }
+        // If user escalated but no response yet, keep waiting
+
+    default:
+        // Level 3: Force kill (unless user explicitly said wait)
+        if state.userResponse == nil || state.userResponse.Action != UserActionWait {
+            r.forceKill(state, assessment)
+        }
+    }
+}
+
+func (r *RecoveryOrchestrator) trySoftIntervention(state *RecoveryState, assessment HealthAssessment) {
+    prompt := r.buildBreakoutPrompt(assessment)
+
+    if err := r.notifier.InjectBreakoutPrompt(state.agentID, prompt); err != nil {
+        r.logger.Warn("soft intervention failed",
+            "agent", state.agentID,
+            "error", err,
+        )
+        return
+    }
+
+    state.softAttempts++
+    state.lastSoftIntervention = time.Now()
+    state.level = RecoverySoftIntervention
+
+    r.logger.Info("soft intervention sent",
+        "agent", state.agentID,
+        "attempt", state.softAttempts,
+        "max_attempts", r.config.MaxSoftAttempts,
+    )
+}
+
+func (r *RecoveryOrchestrator) buildBreakoutPrompt(assessment HealthAssessment) string {
+    if assessment.RepetitionConcern {
+        return "[SYSTEM] You appear to be repeating similar operations without making progress. " +
+               "Please analyze what's blocking you and try a different approach, or explain " +
+               "why these repeated operations are necessary."
+    }
+    return "[SYSTEM] You haven't made observable progress recently. Please provide a status " +
+           "update on your current task, explain any blockers, or try an alternative approach."
+}
+
+func (r *RecoveryOrchestrator) escalateToUser(state *RecoveryState, assessment HealthAssessment) {
+    if err := r.notifier.EscalateToUser(state.sessionID, state.agentID, assessment); err != nil {
+        r.logger.Warn("user escalation failed",
+            "agent", state.agentID,
+            "error", err,
+        )
+        return
+    }
+
+    state.userEscalated = true
+    state.userEscalatedAt = time.Now()
+    state.level = RecoveryUserEscalation
+
+    r.logger.Info("escalated to user",
+        "agent", state.agentID,
+        "stuck_duration", time.Since(*assessment.StuckSince),
+    )
+}
+
+func (r *RecoveryOrchestrator) handleUserResponse(state *RecoveryState, assessment HealthAssessment) {
+    switch state.userResponse.Action {
+    case UserActionWait:
+        // User says keep waiting - reset stuck timer
+        r.logger.Info("user chose to wait", "agent", state.agentID)
+        // Don't force kill even after ForceKillDelay
+
+    case UserActionKill:
+        r.forceKill(state, assessment)
+
+    case UserActionInspect:
+        // User wants to inspect - keep monitoring but don't auto-kill
+        r.logger.Info("user inspecting agent", "agent", state.agentID)
+    }
+}
+
+func (r *RecoveryOrchestrator) forceKill(state *RecoveryState, assessment HealthAssessment) {
+    state.level = RecoveryForceKill
+
+    // Release all resources held by this agent
+    released := r.resourceMgr.ForceReleaseByAgent(state.agentID)
+    state.resourcesReleased = released
+
+    // Notify user
+    reason := fmt.Sprintf("Agent stuck for %s without progress",
+        time.Since(*assessment.StuckSince).Round(time.Second))
+    r.notifier.NotifyForceKill(state.sessionID, state.agentID, reason)
+
+    // Kill the agent via supervisor
+    r.supervisor.TerminateAgent(state.agentID, reason)
+
+    r.logger.Warn("force killed stuck agent",
+        "agent", state.agentID,
+        "stuck_duration", time.Since(*assessment.StuckSince),
+        "released_resources", len(released),
+    )
+}
+```
+
+### Layer 6: Deadlock Recovery (Eager Release)
+
+When deadlock is detected, immediately release resources and escalate.
+
+```go
+func (r *RecoveryOrchestrator) HandleDeadlock(result DeadlockResult) {
+    switch result.Type {
+    case DeadlockDeadHolder:
+        r.handleDeadHolderDeadlock(result)
+
+    case DeadlockCircular:
+        r.handleCircularDeadlock(result)
+    }
+}
+
+func (r *RecoveryOrchestrator) handleDeadHolderDeadlock(result DeadlockResult) {
+    r.logger.Info("deadlock detected: agent waiting on dead holder",
+        "dead_agent", result.DeadHolder,
+        "waiting_agents", result.WaitingAgents,
+        "resource_type", result.ResourceType,
+        "resource_id", result.ResourceID,
+    )
+
+    // Step 1: Eager release of resources held by dead agent
+    released := r.resourceMgr.ForceReleaseByAgent(result.DeadHolder)
+
+    // Step 2: Record released resources in case agent recovers
+    if state, ok := r.recoveryState.Load(result.DeadHolder); ok {
+        rs := state.(*RecoveryState)
+        rs.mu.Lock()
+        rs.resourcesReleased = append(rs.resourcesReleased, released...)
+        rs.mu.Unlock()
+    }
+
+    // Step 3: Escalate dead agent through recovery process
+    r.forceKill(&RecoveryState{
+        agentID:    result.DeadHolder,
+        level:      RecoveryForceKill,
+        stuckSince: time.Now(),
+    }, HealthAssessment{
+        AgentID: result.DeadHolder,
+        Status:  StatusCritical,
+    })
+
+    r.logger.Info("released dead agent resources",
+        "dead_agent", result.DeadHolder,
+        "released", released,
+    )
+}
+
+func (r *RecoveryOrchestrator) handleCircularDeadlock(result DeadlockResult) {
+    // Select victim: agent with least progress (minimize wasted work)
+    victim := r.selectDeadlockVictim(result.Cycle)
+
+    r.logger.Warn("circular deadlock detected: breaking cycle",
+        "cycle", result.Cycle,
+        "victim", victim,
+    )
+
+    // Release victim's resources to break cycle
+    released := r.resourceMgr.ForceReleaseByAgent(victim)
+
+    // Record for recovery notification
+    if state, ok := r.recoveryState.Load(victim); ok {
+        rs := state.(*RecoveryState)
+        rs.mu.Lock()
+        rs.resourcesReleased = append(rs.resourcesReleased, released...)
+        rs.mu.Unlock()
+    }
+
+    // Escalate to user (circular deadlock is unusual, user should know)
+    state := r.getOrCreateState(victim, "")
+    r.escalateToUser(state, HealthAssessment{
+        AgentID: victim,
+        Status:  StatusDeadlocked,
+    })
+}
+
+func (r *RecoveryOrchestrator) selectDeadlockVictim(cycle []string) string {
+    // Select agent that has done the least work
+    // This minimizes wasted computation when we break the cycle
+    var victim string
+    var minProgress int64 = math.MaxInt64
+
+    for _, agentID := range cycle {
+        progress := r.healthScorer.collector.SignalCount(agentID)
+        if progress < minProgress {
+            minProgress = progress
+            victim = agentID
+        }
+    }
+    return victim
+}
+```
+
+### Layer 7: Agent Recovery Notification
+
+When an agent that had its resources released recovers, it must re-acquire those resources.
+
+```go
+// ResourceReacquisition handles the case where a "dead" agent recovers
+type ResourceReacquisition struct {
+    resourceMgr    *ResourceManager
+    notifier       RecoveryNotifier
+    logger         *slog.Logger
+}
+
+// ReacquireResources attempts to re-acquire resources that were released during recovery
+func (rr *ResourceReacquisition) ReacquireResources(agentID string, resources []string) error {
+    var failed []string
+
+    for _, resourceID := range resources {
+        if err := rr.resourceMgr.Acquire(agentID, resourceID); err != nil {
+            failed = append(failed, resourceID)
+            rr.logger.Warn("failed to re-acquire resource",
+                "agent", agentID,
+                "resource", resourceID,
+                "error", err,
+            )
+        }
+    }
+
+    if len(failed) > 0 {
+        return fmt.Errorf("failed to re-acquire %d resources: %v", len(failed), failed)
+    }
+
+    rr.logger.Info("agent re-acquired all resources",
+        "agent", agentID,
+        "count", len(resources),
+    )
+    return nil
+}
+
+// NotifyReacquireResources is called when RecoveryOrchestrator detects agent recovery
+func (r *RecoveryOrchestrator) notifyAgentRecovery(agentID string, resources []string) {
+    // The agent's next operation will see this notification
+    // and should attempt to re-acquire the listed resources
+    r.notifier.NotifyReacquireResources(agentID, resources)
+}
+```
+
+### Integration with Existing Systems
+
+```go
+// Hook into AgentSupervisor for health monitoring
+func (s *AgentSupervisor) MonitorHealth(ctx context.Context) {
+    ticker := time.NewTicker(s.recovery.config.MonitorInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            // Assess all active agents
+            s.agents.Range(func(id string, agent *Agent) bool {
+                assessment := s.recovery.healthScorer.Assess(id)
+                if assessment.Status >= StatusStuck {
+                    s.recovery.HandleStuckAgent(assessment)
+                }
+                return true
+            })
+
+            // Check for deadlocks
+            for _, result := range s.recovery.deadlockDet.Check() {
+                if result.Detected {
+                    s.recovery.HandleDeadlock(result)
+                }
+            }
+        }
+    }
+}
+
+// Emit progress signals from ToolExecutor
+func (e *ToolExecutor) Execute(ctx context.Context, tool Tool) (Result, error) {
+    result, err := tool.Run(ctx)
+
+    // Emit progress signal regardless of success/failure
+    agentID := ctx.Value(agentIDKey).(string)
+    sessionID := ctx.Value(sessionIDKey).(string)
+
+    e.progressCollector.Signal(ProgressSignal{
+        AgentID:    agentID,
+        SessionID:  sessionID,
+        SignalType: SignalToolCompleted,
+        Operation:  fmt.Sprintf("%s:%s", tool.Name(), tool.Target()),
+        Timestamp:  time.Now(),
+        Hash:       hashOperation(tool.Name(), tool.Target()),
+    })
+
+    // Also record for repetition detection
+    e.repetitionDet.Record(agentID, Operation{
+        Type:      "tool",
+        Action:    tool.Name(),
+        Target:    tool.Target(),
+        Timestamp: time.Now(),
+        Hash:      hashOperation(tool.Name(), tool.Target()),
+    })
+
+    return result, err
+}
+
+// Emit progress signals from LLM client
+func (c *LLMClient) Complete(ctx context.Context, req Request) (Response, error) {
+    resp, err := c.provider.Complete(ctx, req)
+    if err == nil {
+        agentID := ctx.Value(agentIDKey).(string)
+        c.progressCollector.Signal(ProgressSignal{
+            AgentID:    agentID,
+            SignalType: SignalLLMResponse,
+            Operation:  "llm:complete",
+            Timestamp:  time.Now(),
+        })
+    }
+    return resp, err
+}
+
+// Emit progress signals from AgentRouter (agent-to-agent)
+func (r *AgentRouter) Dispatch(ctx context.Context, from, to string, msg Message) error {
+    err := r.sendToAgent(to, msg)
+
+    // Agent-to-agent communication is a sign of life
+    r.progressCollector.Signal(ProgressSignal{
+        AgentID:    from,
+        SignalType: SignalAgentRequest,
+        Operation:  fmt.Sprintf("agent:%s", to),
+        Timestamp:  time.Now(),
+    })
+
+    return err
+}
+```
+
+### Guarantees
+
+| Guarantee | Mechanism |
+|-----------|-----------|
+| **No false positives on repetition** | Repetition only counts when combined with heartbeat/progress issues |
+| **Hierarchical recovery** | Soft intervention (30s) → User escalation (60s) → Force kill (120s) |
+| **Eager deadlock resolution** | Immediately release dead holder's resources, don't wait |
+| **Recovery notification** | Recovered agent notified to re-acquire released resources |
+| **Minimal waste on deadlock** | Victim selection picks agent with least progress |
+| **User control** | User can choose Wait/Kill/Inspect; Wait prevents auto-kill |
+
+---
+
+## Shared State Corruption Prevention System
+
+Multi-session, multi-agent systems require robust protection against shared state corruption. Sylk implements a comprehensive corruption prevention system covering the VectorGraphDB and File Handle Budget.
+
+### Design Philosophy
+
+1. **Leverage existing SQLite ACID** - SQLite provides transactional guarantees; we extend rather than replace
+2. **Snapshot isolation for HNSW** - Readers never see partial mutations during index updates
+3. **Version-based optimistic concurrency** - Detect and reject conflicting updates
+4. **Session-scoped views** - Configurable isolation levels prevent cross-session pollution
+5. **Proactive integrity validation** - Detect corruption before it causes failures
+
+### Shared State Inventory
+
+| State | Location | Protection Required |
+|-------|----------|---------------------|
+| **VectorGraphDB** | SQLite + HNSW in-memory | Snapshot isolation, OCC, integrity validation |
+| **File Handle Budget** | In-memory (cross-session) | Persistence for crash recovery |
+| **Session data** | Per-session (isolated) | Already isolated via session_id |
+
+### Layer 1: HNSW Snapshot Isolation (Copy-on-Write)
+
+The HNSW index presents a challenge: readers during writes may see partially-linked nodes, incomplete neighbor lists, or miss nodes entirely. Snapshot isolation provides consistent read views.
+
+```go
+// HNSWSnapshotManager provides consistent read views of HNSW index
+type HNSWSnapshotManager struct {
+    index         *hnsw.Index
+    currentSeqNum atomic.Uint64      // incremented on every write
+    snapshots     sync.Map           // seqNum → *HNSWSnapshot
+    gcInterval    time.Duration      // snapshot cleanup interval
+    retention     time.Duration      // how long to keep old snapshots
+    mu            sync.RWMutex
+}
+
+type HNSWSnapshot struct {
+    SeqNum      uint64
+    CreatedAt   time.Time
+    EntryPoint  string
+    MaxLevel    int
+    Layers      []LayerSnapshot        // frozen layer state (copied)
+    Vectors     map[string][]float32   // frozen vector cache
+    Magnitudes  map[string]float64     // frozen magnitudes
+    readers     atomic.Int32           // active reader count
+}
+
+type LayerSnapshot struct {
+    Nodes map[string][]string  // nodeID → neighbors (deep copied, immutable)
+}
+
+// CreateSnapshot captures current HNSW state for consistent reads
+func (sm *HNSWSnapshotManager) CreateSnapshot() *HNSWSnapshot {
+    sm.index.mu.RLock()
+    defer sm.index.mu.RUnlock()
+
+    seqNum := sm.currentSeqNum.Load()
+
+    snap := &HNSWSnapshot{
+        SeqNum:     seqNum,
+        CreatedAt:  time.Now(),
+        EntryPoint: sm.index.entryPoint,
+        MaxLevel:   sm.index.maxLevel,
+        Layers:     make([]LayerSnapshot, len(sm.index.layers)),
+        Vectors:    make(map[string][]float32, len(sm.index.vectors)),
+        Magnitudes: make(map[string]float64, len(sm.index.magnitudes)),
+    }
+
+    // Deep copy layers - expensive but readers never block writers
+    for i, layer := range sm.index.layers {
+        layer.mu.RLock()
+        snap.Layers[i] = LayerSnapshot{
+            Nodes: make(map[string][]string, len(layer.nodes)),
+        }
+        for nodeID, node := range layer.nodes {
+            // Copy neighbor slice to ensure immutability
+            neighbors := make([]string, len(node.neighbors))
+            copy(neighbors, node.neighbors)
+            snap.Layers[i].Nodes[nodeID] = neighbors
+        }
+        layer.mu.RUnlock()
+    }
+
+    // Copy vector references ([]float32 values are not mutated after insert)
+    for k, v := range sm.index.vectors {
+        snap.Vectors[k] = v
+    }
+    for k, v := range sm.index.magnitudes {
+        snap.Magnitudes[k] = v
+    }
+
+    snap.readers.Add(1)
+    sm.snapshots.Store(seqNum, snap)
+    return snap
+}
+
+// ReleaseSnapshot decrements reader count for GC
+func (sm *HNSWSnapshotManager) ReleaseSnapshot(seqNum uint64) {
+    if snap, ok := sm.snapshots.Load(seqNum); ok {
+        s := snap.(*HNSWSnapshot)
+        s.readers.Add(-1)
+    }
+}
+
+// Search on frozen snapshot - never sees partial mutations
+func (snap *HNSWSnapshot) Search(query []float32, k int, filter *SearchFilter) []SearchResult {
+    if snap.EntryPoint == "" {
+        return nil
+    }
+
+    queryMag := computeMagnitude(query)
+    return snap.searchFromEntry(query, queryMag, k, filter)
+}
+
+func (snap *HNSWSnapshot) searchFromEntry(query []float32, queryMag float64, k int, filter *SearchFilter) []SearchResult {
+    // Navigate layers top-down using frozen state
+    currentNode := snap.EntryPoint
+
+    for level := snap.MaxLevel; level > 0; level-- {
+        currentNode = snap.greedySearchLayer(query, queryMag, currentNode, level)
+    }
+
+    // Search layer 0 for k nearest
+    candidates := snap.searchLayer0(query, queryMag, currentNode, k, filter)
+    return candidates
+}
+
+func (snap *HNSWSnapshot) greedySearchLayer(query []float32, queryMag float64, entry string, level int) string {
+    if level >= len(snap.Layers) {
+        return entry
+    }
+
+    current := entry
+    currentDist := snap.distance(query, queryMag, current)
+
+    for {
+        neighbors, ok := snap.Layers[level].Nodes[current]
+        if !ok {
+            break
+        }
+
+        improved := false
+        for _, neighbor := range neighbors {
+            dist := snap.distance(query, queryMag, neighbor)
+            if dist < currentDist {
+                current = neighbor
+                currentDist = dist
+                improved = true
+            }
+        }
+
+        if !improved {
+            break
+        }
+    }
+
+    return current
+}
+
+func (snap *HNSWSnapshot) distance(query []float32, queryMag float64, nodeID string) float64 {
+    vec, ok := snap.Vectors[nodeID]
+    if !ok {
+        return math.MaxFloat64
+    }
+    mag, ok := snap.Magnitudes[nodeID]
+    if !ok {
+        return math.MaxFloat64
+    }
+    return 1.0 - cosineSimilarity(query, vec, queryMag, mag)
+}
+
+// OnInsert increments sequence number so new snapshots see new data
+func (sm *HNSWSnapshotManager) OnInsert() {
+    sm.currentSeqNum.Add(1)
+}
+
+// GCLoop cleans up old snapshots with no active readers
+func (sm *HNSWSnapshotManager) GCLoop(ctx context.Context) {
+    ticker := time.NewTicker(sm.gcInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            cutoff := time.Now().Add(-sm.retention)
+            sm.snapshots.Range(func(seqNum uint64, snap interface{}) bool {
+                s := snap.(*HNSWSnapshot)
+                if s.CreatedAt.Before(cutoff) && s.readers.Load() == 0 {
+                    sm.snapshots.Delete(seqNum)
+                }
+                return true
+            })
+        }
+    }
+}
+```
+
+### Layer 2: Version-Based Optimistic Concurrency Control
+
+Prevents lost updates when multiple sessions modify the same node concurrently.
+
+```go
+// Schema addition for version tracking:
+// ALTER TABLE nodes ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+
+// VersionedNodeStore wraps NodeStore with optimistic concurrency control
+type VersionedNodeStore struct {
+    *NodeStore
+    versionCache sync.Map  // nodeID → uint64 (cached for fast validation)
+}
+
+// OptimisticTx provides read-set validation before commit
+type OptimisticTx struct {
+    store       *VersionedNodeStore
+    sessionID   string
+    readSet     map[string]uint64      // nodeID → version when read
+    writeSet    map[string]*GraphNode  // nodeID → pending write
+    committed   bool
+    mu          sync.Mutex
+}
+
+// BeginOptimistic starts a new optimistic transaction
+func (store *VersionedNodeStore) BeginOptimistic(sessionID string) *OptimisticTx {
+    return &OptimisticTx{
+        store:     store,
+        sessionID: sessionID,
+        readSet:   make(map[string]uint64),
+        writeSet:  make(map[string]*GraphNode),
+    }
+}
+
+// Read fetches a node and records its version in the read-set
+func (tx *OptimisticTx) Read(nodeID string) (*GraphNode, error) {
+    node, err := tx.store.GetNodeWithVersion(nodeID)
+    if err != nil {
+        return nil, err
+    }
+
+    tx.mu.Lock()
+    tx.readSet[nodeID] = node.Version
+    tx.mu.Unlock()
+
+    return node, nil
+}
+
+// Write buffers a node modification for commit
+func (tx *OptimisticTx) Write(node *GraphNode) {
+    tx.mu.Lock()
+    tx.writeSet[node.ID] = node
+    tx.mu.Unlock()
+}
+
+// Commit validates read-set and applies writes atomically
+func (tx *OptimisticTx) Commit() error {
+    tx.mu.Lock()
+    defer tx.mu.Unlock()
+
+    if tx.committed {
+        return ErrAlreadyCommitted
+    }
+
+    // Begin SQL transaction for atomicity
+    sqlTx, err := tx.store.db.BeginTx()
+    if err != nil {
+        return fmt.Errorf("begin tx: %w", err)
+    }
+    defer sqlTx.Rollback()
+
+    // Phase 1: Validate all reads are still current
+    for nodeID, readVersion := range tx.readSet {
+        var currentVersion uint64
+        err := sqlTx.QueryRow(
+            "SELECT version FROM nodes WHERE id = ?", nodeID,
+        ).Scan(&currentVersion)
+
+        if err == sql.ErrNoRows {
+            return &ConflictError{
+                NodeID:    nodeID,
+                Type:      ConflictDeleted,
+                SessionID: tx.sessionID,
+            }
+        }
+        if err != nil {
+            return fmt.Errorf("validate read %s: %w", nodeID, err)
+        }
+        if currentVersion != readVersion {
+            return &ConflictError{
+                NodeID:      nodeID,
+                ReadVersion: readVersion,
+                CurrVersion: currentVersion,
+                Type:        ConflictStale,
+                SessionID:   tx.sessionID,
+            }
+        }
+    }
+
+    // Phase 2: Apply all writes with version increment and CAS
+    for _, node := range tx.writeSet {
+        newVersion := node.Version + 1
+        node.UpdatedAt = time.Now()
+        node.ContentHash = computeContentHash(node)
+
+        result, err := sqlTx.Exec(`
+            UPDATE nodes SET
+                version = ?,
+                updated_at = ?,
+                content = ?,
+                content_hash = ?,
+                metadata = ?
+            WHERE id = ? AND version = ?
+        `, newVersion, node.UpdatedAt.Format(time.RFC3339),
+           node.Content, node.ContentHash, node.Metadata,
+           node.ID, node.Version)
+
+        if err != nil {
+            return fmt.Errorf("update node %s: %w", node.ID, err)
+        }
+
+        rows, _ := result.RowsAffected()
+        if rows == 0 {
+            // Version changed between read and write - concurrent modification
+            return &ConflictError{
+                NodeID:    node.ID,
+                Type:      ConflictConcurrent,
+                SessionID: tx.sessionID,
+            }
+        }
+
+        node.Version = newVersion
+    }
+
+    if err := sqlTx.Commit(); err != nil {
+        return fmt.Errorf("commit: %w", err)
+    }
+
+    // Update version cache
+    for _, node := range tx.writeSet {
+        tx.store.versionCache.Store(node.ID, node.Version)
+    }
+
+    tx.committed = true
+    return nil
+}
+
+// ConflictError represents a concurrency conflict
+type ConflictError struct {
+    NodeID      string
+    ReadVersion uint64
+    CurrVersion uint64
+    Type        ConflictType
+    SessionID   string
+}
+
+func (e *ConflictError) Error() string {
+    switch e.Type {
+    case ConflictStale:
+        return fmt.Sprintf("stale read: node %s version %d, now %d",
+            e.NodeID, e.ReadVersion, e.CurrVersion)
+    case ConflictConcurrent:
+        return fmt.Sprintf("concurrent modification: node %s", e.NodeID)
+    case ConflictDeleted:
+        return fmt.Sprintf("node deleted: %s", e.NodeID)
+    default:
+        return fmt.Sprintf("conflict on node %s", e.NodeID)
+    }
+}
+
+type ConflictType int
+const (
+    ConflictStale ConflictType = iota      // read outdated version
+    ConflictConcurrent                      // concurrent write detected
+    ConflictDeleted                         // node was deleted
+    ConflictIntegrity                       // hash mismatch
+)
+```
+
+### Layer 3: Session-Scoped Views
+
+Provides configurable isolation levels for cross-session data access.
+
+```go
+// IsolationLevel controls what data a session can see
+type IsolationLevel int
+const (
+    // IsolationReadCommitted - see all committed data from all sessions
+    IsolationReadCommitted IsolationLevel = iota
+
+    // IsolationRepeatableRead - snapshot at view creation, consistent reads
+    IsolationRepeatableRead
+
+    // IsolationSessionLocal - only see own session's data + global data
+    IsolationSessionLocal
+)
+
+// SessionScopedView provides isolated access to VectorGraphDB
+type SessionScopedView struct {
+    sessionID     string
+    db            *VectorGraphDB
+    snapshotMgr   *HNSWSnapshotManager
+    snapshot      *HNSWSnapshot           // for repeatable reads
+    isolation     IsolationLevel
+    optTx         *OptimisticTx           // for write operations
+    closed        bool
+}
+
+// BeginSessionView creates an isolated view for a session
+func (db *VectorGraphDB) BeginSessionView(sessionID string, isolation IsolationLevel) *SessionScopedView {
+    view := &SessionScopedView{
+        sessionID: sessionID,
+        db:        db,
+        isolation: isolation,
+    }
+
+    // For repeatable read, capture snapshot at view creation
+    if isolation == IsolationRepeatableRead {
+        view.snapshot = db.snapshotMgr.CreateSnapshot()
+    }
+
+    return view
+}
+
+// QueryNodes returns nodes filtered by isolation level
+func (v *SessionScopedView) QueryNodes(filter NodeFilter) ([]*GraphNode, error) {
+    if v.closed {
+        return nil, ErrViewClosed
+    }
+
+    switch v.isolation {
+    case IsolationSessionLocal:
+        // Only return nodes belonging to this session or global (no session)
+        if filter.SessionIDs == nil {
+            filter.SessionIDs = []string{v.sessionID, ""}
+        }
+        return v.db.QueryNodes(filter)
+
+    case IsolationRepeatableRead:
+        // For vector search, use snapshot; for other queries, use DB
+        if filter.Vector != nil && v.snapshot != nil {
+            results := v.snapshot.Search(filter.Vector, filter.Limit, filter.SearchFilter)
+            nodeIDs := make([]string, len(results))
+            for i, r := range results {
+                nodeIDs[i] = r.NodeID
+            }
+            return v.db.GetNodesByIDs(nodeIDs)
+        }
+        return v.db.QueryNodes(filter)
+
+    default: // IsolationReadCommitted
+        return v.db.QueryNodes(filter)
+    }
+}
+
+// Search performs vector similarity search with isolation
+func (v *SessionScopedView) Search(query []float32, k int) []SearchResult {
+    if v.closed {
+        return nil
+    }
+
+    if v.snapshot != nil {
+        // Search on frozen snapshot - consistent with view creation time
+        return v.snapshot.Search(query, k, nil)
+    }
+
+    // Live search on current index
+    return v.db.hnsw.Search(query, k, nil)
+}
+
+// BeginWrite starts an optimistic transaction for writes
+func (v *SessionScopedView) BeginWrite() *OptimisticTx {
+    if v.optTx == nil {
+        v.optTx = v.db.versionedNodes.BeginOptimistic(v.sessionID)
+    }
+    return v.optTx
+}
+
+// CommitWrite commits any pending writes
+func (v *SessionScopedView) CommitWrite() error {
+    if v.optTx == nil {
+        return nil // nothing to commit
+    }
+    err := v.optTx.Commit()
+    v.optTx = nil
+    return err
+}
+
+// Close releases resources held by the view
+func (v *SessionScopedView) Close() error {
+    if v.closed {
+        return nil
+    }
+    v.closed = true
+
+    if v.snapshot != nil {
+        v.db.snapshotMgr.ReleaseSnapshot(v.snapshot.SeqNum)
+        v.snapshot = nil
+    }
+
+    return nil
+}
+```
+
+### Layer 4: Integrity Validation
+
+Proactive detection and repair of data corruption.
+
+```go
+// IntegrityValidator provides proactive corruption detection
+type IntegrityValidator struct {
+    db        *VectorGraphDB
+    logger    *slog.Logger
+    config    IntegrityConfig
+}
+
+type IntegrityConfig struct {
+    ValidateOnRead     bool           // check hash on every read
+    PeriodicInterval   time.Duration  // background scan interval (default: 1 hour)
+    AutoRepair         bool           // fix minor issues automatically
+    SampleSize         int            // nodes to check per scan (default: 100)
+}
+
+func DefaultIntegrityConfig() IntegrityConfig {
+    return IntegrityConfig{
+        ValidateOnRead:   false,       // too expensive for every read
+        PeriodicInterval: time.Hour,
+        AutoRepair:       true,
+        SampleSize:       100,
+    }
+}
+
+// InvariantCheck defines a consistency rule
+type InvariantCheck struct {
+    Name        string
+    Description string
+    Query       string  // SQL that returns violating rows
+    Repair      string  // SQL to fix violations (optional)
+    Severity    Severity
+}
+
+type Severity int
+const (
+    SeverityWarning Severity = iota  // log and continue
+    SeverityError                     // log, attempt repair
+    SeverityCritical                  // halt operation
+)
+
+// Violation represents a detected integrity issue
+type Violation struct {
+    Check       string
+    EntityID    string
+    Description string
+    Severity    Severity
+    Repaired    bool
+}
+
+// Standard invariant checks
+var standardChecks = []InvariantCheck{
+    {
+        Name:        "orphaned_vectors",
+        Description: "Vectors without corresponding nodes",
+        Query:       "SELECT node_id FROM vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
+        Repair:      "DELETE FROM vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
+        Severity:    SeverityError,
+    },
+    {
+        Name:        "orphaned_edges_source",
+        Description: "Edges with missing source node",
+        Query:       "SELECT id FROM edges WHERE source_id NOT IN (SELECT id FROM nodes)",
+        Repair:      "DELETE FROM edges WHERE source_id NOT IN (SELECT id FROM nodes)",
+        Severity:    SeverityError,
+    },
+    {
+        Name:        "orphaned_edges_target",
+        Description: "Edges with missing target node",
+        Query:       "SELECT id FROM edges WHERE target_id NOT IN (SELECT id FROM nodes)",
+        Repair:      "DELETE FROM edges WHERE target_id NOT IN (SELECT id FROM nodes)",
+        Severity:    SeverityError,
+    },
+    {
+        Name:        "invalid_hnsw_entry",
+        Description: "HNSW entry point references missing node",
+        Query:       "SELECT value FROM hnsw_meta WHERE key='entry_point' AND value != '' AND value NOT IN (SELECT id FROM nodes)",
+        Repair:      "UPDATE hnsw_meta SET value='' WHERE key='entry_point' AND value NOT IN (SELECT id FROM nodes)",
+        Severity:    SeverityCritical,
+    },
+    {
+        Name:        "dimension_mismatch",
+        Description: "Vectors with incorrect dimensions",
+        Query:       "SELECT node_id FROM vectors WHERE dimensions != 768",
+        Severity:    SeverityCritical,  // no auto-repair, requires re-embedding
+    },
+    {
+        Name:        "superseded_cycle",
+        Description: "Circular supersession chain detected",
+        Query: `WITH RECURSIVE chain(id, superseded_by, depth) AS (
+            SELECT id, superseded_by, 1 FROM nodes WHERE superseded_by IS NOT NULL
+            UNION ALL
+            SELECT chain.id, n.superseded_by, chain.depth + 1
+            FROM chain JOIN nodes n ON chain.superseded_by = n.id
+            WHERE chain.depth < 100 AND n.superseded_by IS NOT NULL
+        ) SELECT DISTINCT id FROM chain WHERE depth >= 100`,
+        Severity: SeverityCritical,  // requires manual resolution
+    },
+    {
+        Name:        "orphaned_provenance",
+        Description: "Provenance records without corresponding nodes",
+        Query:       "SELECT id FROM provenance WHERE node_id NOT IN (SELECT id FROM nodes)",
+        Repair:      "DELETE FROM provenance WHERE node_id NOT IN (SELECT id FROM nodes)",
+        Severity:    SeverityError,
+    },
+}
+
+// RunChecks executes all invariant checks
+func (iv *IntegrityValidator) RunChecks() []Violation {
+    var violations []Violation
+
+    for _, check := range standardChecks {
+        checkViolations := iv.runSingleCheck(check)
+        violations = append(violations, checkViolations...)
+
+        // Auto-repair if configured
+        if iv.config.AutoRepair && check.Repair != "" && len(checkViolations) > 0 {
+            result, err := iv.db.Exec(check.Repair)
+            if err != nil {
+                iv.logger.Error("auto-repair failed",
+                    "check", check.Name,
+                    "error", err,
+                )
+            } else {
+                rows, _ := result.RowsAffected()
+                iv.logger.Info("auto-repaired violations",
+                    "check", check.Name,
+                    "repaired", rows,
+                )
+                for i := range checkViolations {
+                    checkViolations[i].Repaired = true
+                }
+            }
+        }
+    }
+
+    // Run hash validation on sample
+    hashViolations := iv.validateHashSample()
+    violations = append(violations, hashViolations...)
+
+    return violations
+}
+
+func (iv *IntegrityValidator) runSingleCheck(check InvariantCheck) []Violation {
+    var violations []Violation
+
+    rows, err := iv.db.Query(check.Query)
+    if err != nil {
+        iv.logger.Error("check query failed",
+            "check", check.Name,
+            "error", err,
+        )
+        return nil
+    }
+    defer rows.Close()
+
+    for rows.Next() {
+        var id string
+        if err := rows.Scan(&id); err != nil {
+            continue
+        }
+        violations = append(violations, Violation{
+            Check:       check.Name,
+            EntityID:    id,
+            Description: check.Description,
+            Severity:    check.Severity,
+        })
+    }
+
+    if len(violations) > 0 {
+        iv.logger.Warn("integrity violations found",
+            "check", check.Name,
+            "count", len(violations),
+            "severity", check.Severity,
+        )
+    }
+
+    return violations
+}
+
+// validateHashSample checks content hashes on a random sample of nodes
+func (iv *IntegrityValidator) validateHashSample() []Violation {
+    var violations []Violation
+
+    rows, err := iv.db.Query(`
+        SELECT id, content, content_hash
+        FROM nodes
+        WHERE content IS NOT NULL AND content_hash IS NOT NULL
+        ORDER BY RANDOM()
+        LIMIT ?
+    `, iv.config.SampleSize)
+    if err != nil {
+        return nil
+    }
+    defer rows.Close()
+
+    for rows.Next() {
+        var id, content, storedHash string
+        if err := rows.Scan(&id, &content, &storedHash); err != nil {
+            continue
+        }
+
+        computed := computeSHA256(content)
+        if computed != storedHash {
+            violations = append(violations, Violation{
+                Check:       "hash_mismatch",
+                EntityID:    id,
+                Description: fmt.Sprintf("expected %s, got %s", storedHash, computed),
+                Severity:    SeverityCritical,
+            })
+        }
+    }
+
+    return violations
+}
+
+// ValidateNodeOnRead checks a single node's integrity (if enabled)
+func (iv *IntegrityValidator) ValidateNodeOnRead(node *GraphNode) error {
+    if !iv.config.ValidateOnRead {
+        return nil
+    }
+
+    if node.Content == "" || node.ContentHash == "" {
+        return nil  // nothing to validate
+    }
+
+    computed := computeSHA256(node.Content)
+    if computed != node.ContentHash {
+        return &IntegrityError{
+            NodeID:       node.ID,
+            ExpectedHash: node.ContentHash,
+            ActualHash:   computed,
+        }
+    }
+
+    return nil
+}
+
+// BackgroundScanner runs periodic integrity checks
+func (iv *IntegrityValidator) BackgroundScanner(ctx context.Context) {
+    ticker := time.NewTicker(iv.config.PeriodicInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            violations := iv.RunChecks()
+
+            // Log summary
+            critical := 0
+            for _, v := range violations {
+                if v.Severity == SeverityCritical && !v.Repaired {
+                    critical++
+                }
+            }
+
+            if critical > 0 {
+                iv.logger.Error("critical integrity violations detected",
+                    "total", len(violations),
+                    "critical", critical,
+                )
+            } else if len(violations) > 0 {
+                iv.logger.Info("integrity scan complete",
+                    "violations", len(violations),
+                    "all_repaired", true,
+                )
+            }
+        }
+    }
+}
+
+type IntegrityError struct {
+    NodeID       string
+    ExpectedHash string
+    ActualHash   string
+}
+
+func (e *IntegrityError) Error() string {
+    return fmt.Sprintf("integrity error: node %s hash mismatch (expected %s, got %s)",
+        e.NodeID, e.ExpectedHash, e.ActualHash)
+}
+```
+
+### Layer 5: File Handle Budget Persistence
+
+Persists cross-session budget state for crash recovery.
+
+```go
+// FileHandleBudgetPersistence saves/restores budget state to SQLite
+type FileHandleBudgetPersistence struct {
+    db     *sql.DB
+    budget *FileHandleBudget
+    mu     sync.Mutex
+}
+
+// Schema for budget persistence:
+// CREATE TABLE IF NOT EXISTS file_handle_budget (
+//     session_id TEXT PRIMARY KEY,
+//     allocated INTEGER NOT NULL,
+//     used INTEGER NOT NULL,
+//     updated_at TEXT NOT NULL
+// );
+
+func NewFileHandleBudgetPersistence(db *sql.DB, budget *FileHandleBudget) (*FileHandleBudgetPersistence, error) {
+    // Ensure table exists
+    _, err := db.Exec(`
+        CREATE TABLE IF NOT EXISTS file_handle_budget (
+            session_id TEXT PRIMARY KEY,
+            allocated INTEGER NOT NULL,
+            used INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    `)
+    if err != nil {
+        return nil, fmt.Errorf("create budget table: %w", err)
+    }
+
+    return &FileHandleBudgetPersistence{
+        db:     db,
+        budget: budget,
+    }, nil
+}
+
+// Save persists current budget state atomically
+func (p *FileHandleBudgetPersistence) Save() error {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    tx, err := p.db.Begin()
+    if err != nil {
+        return fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback()
+
+    // Clear and rewrite atomically
+    if _, err := tx.Exec("DELETE FROM file_handle_budget"); err != nil {
+        return fmt.Errorf("clear budget: %w", err)
+    }
+
+    stmt, err := tx.Prepare(`
+        INSERT INTO file_handle_budget (session_id, allocated, used, updated_at)
+        VALUES (?, ?, ?, ?)
+    `)
+    if err != nil {
+        return fmt.Errorf("prepare insert: %w", err)
+    }
+    defer stmt.Close()
+
+    now := time.Now().Format(time.RFC3339)
+    var insertErr error
+
+    p.budget.sessions.Range(func(id string, sb *SessionFileBudget) bool {
+        _, err := stmt.Exec(id, sb.allocated.Load(), sb.used.Load(), now)
+        if err != nil {
+            insertErr = err
+            return false
+        }
+        return true
+    })
+
+    if insertErr != nil {
+        return fmt.Errorf("insert budget: %w", insertErr)
+    }
+
+    return tx.Commit()
+}
+
+// Restore loads budget state from database on startup
+func (p *FileHandleBudgetPersistence) Restore() error {
+    rows, err := p.db.Query(`
+        SELECT session_id, allocated, used FROM file_handle_budget
+    `)
+    if err != nil {
+        return fmt.Errorf("query budget: %w", err)
+    }
+    defer rows.Close()
+
+    for rows.Next() {
+        var sessionID string
+        var allocated, used int64
+
+        if err := rows.Scan(&sessionID, &allocated, &used); err != nil {
+            return fmt.Errorf("scan budget: %w", err)
+        }
+
+        sb := p.budget.getOrCreateSession(sessionID)
+        sb.allocated.Store(allocated)
+        sb.used.Store(used)
+    }
+
+    return rows.Err()
+}
+
+// PeriodicSave saves budget state at regular intervals
+func (p *FileHandleBudgetPersistence) PeriodicSave(ctx context.Context, interval time.Duration) {
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            // Final save on shutdown
+            p.Save()
+            return
+        case <-ticker.C:
+            if err := p.Save(); err != nil {
+                // Log but continue
+                slog.Error("budget save failed", "error", err)
+            }
+        }
+    }
+}
+```
+
+### Layer 6: Transactional VectorDB Wrapper
+
+Integrates all protection layers into a unified interface.
+
+```go
+// ProtectedVectorDB wraps VectorGraphDB with full corruption protection
+type ProtectedVectorDB struct {
+    *VectorGraphDB
+    snapshotMgr     *HNSWSnapshotManager
+    versionedNodes  *VersionedNodeStore
+    validator       *IntegrityValidator
+    budgetPersist   *FileHandleBudgetPersistence
+    config          ProtectionConfig
+}
+
+type ProtectionConfig struct {
+    DefaultIsolation    IsolationLevel
+    SnapshotRetention   time.Duration     // how long to keep old snapshots
+    SnapshotGCInterval  time.Duration     // GC check interval
+    IntegrityInterval   time.Duration     // integrity scan interval
+    BudgetSaveInterval  time.Duration     // budget persistence interval
+    ValidateOnRead      bool              // check hash on every read
+}
+
+func DefaultProtectionConfig() ProtectionConfig {
+    return ProtectionConfig{
+        DefaultIsolation:   IsolationReadCommitted,
+        SnapshotRetention:  5 * time.Minute,
+        SnapshotGCInterval: 30 * time.Second,
+        IntegrityInterval:  time.Hour,
+        BudgetSaveInterval: 30 * time.Second,
+        ValidateOnRead:     false,
+    }
+}
+
+// NewProtectedVectorDB creates a protected wrapper
+func NewProtectedVectorDB(db *VectorGraphDB, budget *FileHandleBudget, config ProtectionConfig) (*ProtectedVectorDB, error) {
+    pdb := &ProtectedVectorDB{
+        VectorGraphDB: db,
+        config:        config,
+    }
+
+    // Initialize snapshot manager
+    pdb.snapshotMgr = &HNSWSnapshotManager{
+        index:      db.hnsw,
+        gcInterval: config.SnapshotGCInterval,
+        retention:  config.SnapshotRetention,
+    }
+
+    // Initialize versioned node store
+    pdb.versionedNodes = &VersionedNodeStore{
+        NodeStore: db.nodes,
+    }
+
+    // Initialize integrity validator
+    pdb.validator = &IntegrityValidator{
+        db:     db,
+        logger: slog.Default(),
+        config: IntegrityConfig{
+            ValidateOnRead:   config.ValidateOnRead,
+            PeriodicInterval: config.IntegrityInterval,
+            AutoRepair:       true,
+            SampleSize:       100,
+        },
+    }
+
+    // Initialize budget persistence
+    if budget != nil {
+        bp, err := NewFileHandleBudgetPersistence(db.db, budget)
+        if err != nil {
+            return nil, fmt.Errorf("budget persistence: %w", err)
+        }
+        pdb.budgetPersist = bp
+    }
+
+    return pdb, nil
+}
+
+// Startup runs initialization and recovery
+func (pdb *ProtectedVectorDB) Startup(ctx context.Context) error {
+    // 1. Run integrity checks
+    violations := pdb.validator.RunChecks()
+    for _, v := range violations {
+        if v.Severity == SeverityCritical && !v.Repaired {
+            return fmt.Errorf("critical integrity violation: %s on %s", v.Check, v.EntityID)
+        }
+    }
+
+    // 2. Restore file handle budget
+    if pdb.budgetPersist != nil {
+        if err := pdb.budgetPersist.Restore(); err != nil {
+            return fmt.Errorf("budget restore: %w", err)
+        }
+    }
+
+    // 3. Start background goroutines
+    go pdb.snapshotMgr.GCLoop(ctx)
+    go pdb.validator.BackgroundScanner(ctx)
+    if pdb.budgetPersist != nil {
+        go pdb.budgetPersist.PeriodicSave(ctx, pdb.config.BudgetSaveInterval)
+    }
+
+    return nil
+}
+
+// BeginSession creates an isolated session view
+func (pdb *ProtectedVectorDB) BeginSession(sessionID string) *SessionScopedView {
+    return pdb.VectorGraphDB.BeginSessionView(sessionID, pdb.config.DefaultIsolation)
+}
+
+// BeginSessionWithIsolation creates a view with specific isolation level
+func (pdb *ProtectedVectorDB) BeginSessionWithIsolation(sessionID string, isolation IsolationLevel) *SessionScopedView {
+    return pdb.VectorGraphDB.BeginSessionView(sessionID, isolation)
+}
+
+// Shutdown performs cleanup
+func (pdb *ProtectedVectorDB) Shutdown() error {
+    // Save final budget state
+    if pdb.budgetPersist != nil {
+        if err := pdb.budgetPersist.Save(); err != nil {
+            slog.Error("final budget save failed", "error", err)
+        }
+    }
+
+    return pdb.VectorGraphDB.Close()
+}
+```
+
+### Guarantees
+
+| Guarantee | Mechanism |
+|-----------|-----------|
+| **No partial HNSW reads** | Snapshot isolation with deep-copied layer state |
+| **No lost updates** | Optimistic concurrency with version-based CAS |
+| **No cross-session pollution** | SessionScopedView with isolation levels |
+| **Crash recovery for budgets** | FileHandleBudgetPersistence with periodic save |
+| **Proactive corruption detection** | IntegrityValidator with invariant checks |
+| **Hash-based integrity** | Content hash validation (optional on read) |
+| **Auto-repair for minor issues** | Orphaned vectors/edges automatically deleted |
+| **Background monitoring** | Periodic integrity scans + snapshot GC |
+
+---
+
+## Cascading LLM Failure Prevention System
+
+**Hierarchical bulkheads, multi-layer rate limiting, cost-aware backpressure, hybrid health monitoring**
+
+### Design Principles
+
+1. **Hierarchical Isolation** - Failures in one session/provider/model cannot cascade to others
+2. **Proactive Prevention** - Anticipate and prevent failures before they occur
+3. **Most Restrictive Wins** - When multiple limiters disagree, the strictest limit applies
+4. **Graceful Degradation** - Slowdown before failure, rejection at limit
+5. **Agent Autonomy** - Agents control their own retry/fallback strategy; system provides signals only
+
+---
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                   CASCADING LLM FAILURE PREVENTION SYSTEM                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  INCOMING LLM REQUEST                                                               │
+│         │                                                                           │
+│         ▼                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │                    LLM REQUEST COORDINATOR                                   │    │
+│  │    Single entry point - orchestrates all protection layers                  │    │
+│  │                                                                             │    │
+│  │    1. Check Health (Hybrid Monitor)                                         │    │
+│  │    2. Check Rate Limits (Multi-Layer)                                       │    │
+│  │    3. Check Bulkhead Capacity (Hierarchical)                                │    │
+│  │    4. Apply Cost Backpressure (if approaching limits)                       │    │
+│  │    5. Acquire Bulkhead Slot                                                 │    │
+│  │    6. Execute with Timeout Monitoring                                       │    │
+│  │    7. Record Outcome (update all systems)                                   │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│         │                                                                           │
+│         ├─────────────────────────────────────────────────────────────────────┐     │
+│         │                                                                     │     │
+│         ▼                                                                     ▼     │
+│  ┌─────────────────────────────┐                    ┌─────────────────────────────┐ │
+│  │   HIERARCHICAL BULKHEADS   │                    │   MULTI-LAYER RATE LIMITER  │ │
+│  │                            │                    │                             │ │
+│  │  ┌──────────────────────┐  │                    │  ┌───────────────────────┐  │ │
+│  │  │  SESSION BULKHEAD    │  │                    │  │  TOKEN BUCKET LIMITER │  │ │
+│  │  │  ├─ Semaphore (5)    │  │                    │  │  ├─ Capacity: N       │  │ │
+│  │  │  ├─ Queue            │  │                    │  │  ├─ Refill: R/sec     │  │ │
+│  │  │  └─ Circuit State    │  │                    │  │  └─ Per-provider      │  │ │
+│  │  └──────────────────────┘  │                    │  └───────────────────────┘  │ │
+│  │           │                │                    │             │               │ │
+│  │           ▼                │                    │             ▼               │ │
+│  │  ┌──────────────────────┐  │                    │  ┌───────────────────────┐  │ │
+│  │  │  PROVIDER BULKHEAD   │  │                    │  │  SLIDING WINDOW       │  │ │
+│  │  │  ├─ Semaphore (3)    │  │                    │  │  ├─ Window: 60s       │  │ │
+│  │  │  ├─ Queue            │  │                    │  │  ├─ Max: M requests   │  │ │
+│  │  │  └─ Circuit State    │  │                    │  │  └─ Per-provider      │  │ │
+│  │  └──────────────────────┘  │                    │  └───────────────────────┘  │ │
+│  │           │                │                    │             │               │ │
+│  │           ▼                │                    │             ▼               │ │
+│  │  ┌──────────────────────┐  │                    │  ┌───────────────────────┐  │ │
+│  │  │  MODEL BULKHEAD      │  │                    │  │  ADAPTIVE 429 LIMITER │  │ │
+│  │  │  ├─ Semaphore (2)    │  │                    │  │  ├─ Learns from 429s  │  │ │
+│  │  │  ├─ Queue            │  │                    │  │  ├─ Decay factor      │  │ │
+│  │  │  └─ Circuit State    │  │                    │  │  └─ Confidence score  │  │ │
+│  │  └──────────────────────┘  │                    │  └───────────────────────┘  │ │
+│  │                            │                    │             │               │ │
+│  │  TOTAL: 5×3×2 = 30 max     │                    │             ▼               │ │
+│  │  concurrent per session    │                    │  ┌───────────────────────┐  │ │
+│  │                            │                    │  │  UNIFIED DECISION     │  │ │
+│  │  ISOLATION:                │                    │  │  min(TB, SW, A429)    │  │ │
+│  │  Session A failure cannot  │                    │  │  Most restrictive     │  │ │
+│  │  consume Session B slots   │                    │  │  wins                 │  │ │
+│  │                            │                    │  └───────────────────────┘  │ │
+│  └─────────────────────────────┘                    └─────────────────────────────┘ │
+│         │                                                                     │     │
+│         └─────────────────────────────────────────────────────────────────────┘     │
+│                                           │                                         │
+│         ┌─────────────────────────────────┼─────────────────────────────────────┐   │
+│         ▼                                 ▼                                     ▼   │
+│  ┌─────────────────────────┐   ┌─────────────────────────┐   ┌─────────────────────┐│
+│  │  COST BACKPRESSURE      │   │  HYBRID HEALTH MONITOR  │   │  TIMEOUT MONITOR    ││
+│  │                         │   │                         │   │                     ││
+│  │  Budget Thresholds:     │   │  ┌───────────────────┐  │   │  First Token: 30s   ││
+│  │  ├─ 80%: 1.5x delay     │   │  │  ACTIVE PROBER    │  │   │  Inter-Token: 10s   ││
+│  │  ├─ 90%: 2x delay       │   │  │  ├─ Ping: 30s     │  │   │  Total: 5m          ││
+│  │  ├─ 95%: 4x delay       │   │  │  ├─ Lightweight   │  │   │                     ││
+│  │  ├─ 98%: 8x delay       │   │  │  └─ Per-provider  │  │   │  Streaming:         ││
+│  │  └─ 100%: reject        │   │  └───────────────────┘  │   │  ├─ Chunk timeout   ││
+│  │                         │   │           │             │   │  ├─ Progress track  ││
+│  │  Agent Autonomy:        │   │           ▼             │   │  └─ Early abort     ││
+│  │  ├─ NO auto-downgrade   │   │  ┌───────────────────┐  │   │                     ││
+│  │  ├─ NO provider switch  │   │  │  PASSIVE MONITOR  │  │   │  Jittered Backoff:  ││
+│  │  └─ Agents control own  │   │  │  ├─ Success rate  │  │   │  base × 2^n × rand  ││
+│  │                         │   │  │  ├─ Latency P99   │  │   │  [0.5, 1.5]         ││
+│  │                         │   │  │  └─ Error types   │  │   │                     ││
+│  │                         │   │  └───────────────────┘  │   │                     ││
+│  │                         │   │           │             │   │                     ││
+│  │                         │   │           ▼             │   │                     ││
+│  │                         │   │  ┌───────────────────┐  │   │                     ││
+│  │                         │   │  │  HEALTH SCORE     │  │   │                     ││
+│  │                         │   │  │  0.0 (dead) to    │  │   │                     ││
+│  │                         │   │  │  1.0 (healthy)    │  │   │                     ││
+│  │                         │   │  │                   │  │   │                     ││
+│  │                         │   │  │  < 0.3: reject    │  │   │                     ││
+│  │                         │   │  │  < 0.5: warn      │  │   │                     ││
+│  │                         │   │  │  < 0.7: monitor   │  │   │                     ││
+│  │                         │   │  └───────────────────┘  │   │                     ││
+│  └─────────────────────────┘   └─────────────────────────┘   └─────────────────────┘│
+│                                                                                     │
+│  FAILURE CORRELATION ENGINE                                                         │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│  Detects correlated failures across sessions (shared provider issue)                │
+│  ├─ If >3 sessions fail same provider in 10s → global provider backoff             │
+│  ├─ Global backoff: exponential with jitter, shared across all sessions            │
+│  ├─ Staggered recovery: when circuit closes, gradual traffic ramp-up               │
+│  └─ Prevents thundering herd on provider recovery                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Layer 1: Hierarchical Bulkhead System
+
+Provides complete isolation between sessions, providers, and models. Each level has its own semaphore, queue, and circuit breaker state.
+
+```go
+// core/llm/bulkhead/types.go
+
+// BulkheadLevel represents the isolation hierarchy
+type BulkheadLevel int
+
+const (
+    LevelSession BulkheadLevel = iota
+    LevelProvider
+    LevelModel
+)
+
+// BulkheadConfig configures a single bulkhead level
+type BulkheadConfig struct {
+    MaxConcurrent   int           // Semaphore size
+    MaxQueueSize    int           // Max pending requests
+    QueueTimeout    time.Duration // Max time in queue
+    CircuitConfig   CircuitConfig // Circuit breaker config for this level
+}
+
+// DefaultBulkheadConfigs returns production defaults
+func DefaultBulkheadConfigs() map[BulkheadLevel]BulkheadConfig {
+    return map[BulkheadLevel]BulkheadConfig{
+        LevelSession: {
+            MaxConcurrent: 5,
+            MaxQueueSize:  50,
+            QueueTimeout:  30 * time.Second,
+            CircuitConfig: CircuitConfig{
+                FailureThreshold: 10,
+                SuccessThreshold: 5,
+                Timeout:          60 * time.Second,
+            },
+        },
+        LevelProvider: {
+            MaxConcurrent: 3,
+            MaxQueueSize:  20,
+            QueueTimeout:  20 * time.Second,
+            CircuitConfig: CircuitConfig{
+                FailureThreshold: 5,
+                SuccessThreshold: 3,
+                Timeout:          45 * time.Second,
+            },
+        },
+        LevelModel: {
+            MaxConcurrent: 2,
+            MaxQueueSize:  10,
+            QueueTimeout:  15 * time.Second,
+            CircuitConfig: CircuitConfig{
+                FailureThreshold: 3,
+                SuccessThreshold: 2,
+                Timeout:          30 * time.Second,
+            },
+        },
+    }
+}
+
+// CircuitConfig for per-bulkhead circuit breakers
+type CircuitConfig struct {
+    FailureThreshold int           // Consecutive failures to open
+    SuccessThreshold int           // Successes in half-open to close
+    Timeout          time.Duration // Time before half-open
+}
+```
+
+```go
+// core/llm/bulkhead/bulkhead.go
+
+// Bulkhead represents a single isolation unit with semaphore, queue, and circuit
+type Bulkhead struct {
+    id       string
+    level    BulkheadLevel
+    config   BulkheadConfig
+
+    // Concurrency control
+    semaphore chan struct{}
+    queue     chan *pendingRequest
+
+    // Circuit breaker state
+    circuitState   atomic.Int32  // 0=closed, 1=open, 2=half-open
+    consecutiveFail atomic.Int32
+    consecutiveSuccess atomic.Int32
+    lastFailure    atomic.Int64  // Unix nano
+
+    // Metrics
+    activeCount    atomic.Int32
+    queuedCount    atomic.Int32
+    totalRequests  atomic.Int64
+    totalFailures  atomic.Int64
+
+    mu sync.RWMutex
+}
+
+type pendingRequest struct {
+    ctx      context.Context
+    resultCh chan AcquireResult
+    enqueued time.Time
+}
+
+type AcquireResult struct {
+    Acquired bool
+    Error    error
+}
+
+// NewBulkhead creates a new bulkhead with the given config
+func NewBulkhead(id string, level BulkheadLevel, config BulkheadConfig) *Bulkhead {
+    b := &Bulkhead{
+        id:        id,
+        level:     level,
+        config:    config,
+        semaphore: make(chan struct{}, config.MaxConcurrent),
+        queue:     make(chan *pendingRequest, config.MaxQueueSize),
+    }
+
+    // Pre-fill semaphore
+    for i := 0; i < config.MaxConcurrent; i++ {
+        b.semaphore <- struct{}{}
+    }
+
+    go b.processQueue()
+    return b
+}
+
+// Acquire attempts to acquire a slot, blocking if necessary
+func (b *Bulkhead) Acquire(ctx context.Context) error {
+    b.totalRequests.Add(1)
+
+    // Check circuit breaker first
+    if err := b.checkCircuit(); err != nil {
+        return err
+    }
+
+    // Try immediate acquisition
+    select {
+    case <-b.semaphore:
+        b.activeCount.Add(1)
+        return nil
+    default:
+    }
+
+    // Queue the request
+    return b.enqueue(ctx)
+}
+
+func (b *Bulkhead) checkCircuit() error {
+    state := b.circuitState.Load()
+
+    switch state {
+    case 0: // Closed - normal operation
+        return nil
+    case 1: // Open - check if timeout elapsed
+        lastFail := b.lastFailure.Load()
+        if time.Since(time.Unix(0, lastFail)) > b.config.CircuitConfig.Timeout {
+            // Transition to half-open
+            if b.circuitState.CompareAndSwap(1, 2) {
+                b.consecutiveSuccess.Store(0)
+            }
+            return nil
+        }
+        return ErrCircuitOpen
+    case 2: // Half-open - allow limited traffic
+        return nil
+    }
+    return nil
+}
+
+func (b *Bulkhead) enqueue(ctx context.Context) error {
+    req := &pendingRequest{
+        ctx:      ctx,
+        resultCh: make(chan AcquireResult, 1),
+        enqueued: time.Now(),
+    }
+
+    select {
+    case b.queue <- req:
+        b.queuedCount.Add(1)
+    default:
+        return ErrQueueFull
+    }
+
+    // Wait for result
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case result := <-req.resultCh:
+        if result.Acquired {
+            b.activeCount.Add(1)
+            return nil
+        }
+        return result.Error
+    }
+}
+
+func (b *Bulkhead) processQueue() {
+    for req := range b.queue {
+        b.queuedCount.Add(-1)
+
+        // Check if request already timed out
+        if req.ctx.Err() != nil {
+            req.resultCh <- AcquireResult{Error: req.ctx.Err()}
+            continue
+        }
+
+        // Check queue timeout
+        if time.Since(req.enqueued) > b.config.QueueTimeout {
+            req.resultCh <- AcquireResult{Error: ErrQueueTimeout}
+            continue
+        }
+
+        // Wait for semaphore slot
+        select {
+        case <-req.ctx.Done():
+            req.resultCh <- AcquireResult{Error: req.ctx.Err()}
+        case <-b.semaphore:
+            req.resultCh <- AcquireResult{Acquired: true}
+        }
+    }
+}
+
+// Release returns a slot to the bulkhead
+func (b *Bulkhead) Release() {
+    b.activeCount.Add(-1)
+    b.semaphore <- struct{}{}
+}
+
+// RecordSuccess records a successful request outcome
+func (b *Bulkhead) RecordSuccess() {
+    b.consecutiveFail.Store(0)
+
+    if b.circuitState.Load() == 2 { // Half-open
+        newCount := b.consecutiveSuccess.Add(1)
+        if int(newCount) >= b.config.CircuitConfig.SuccessThreshold {
+            b.circuitState.Store(0) // Close circuit
+        }
+    }
+}
+
+// RecordFailure records a failed request outcome
+func (b *Bulkhead) RecordFailure() {
+    b.totalFailures.Add(1)
+    b.consecutiveSuccess.Store(0)
+    b.lastFailure.Store(time.Now().UnixNano())
+
+    newCount := b.consecutiveFail.Add(1)
+
+    state := b.circuitState.Load()
+    if state == 2 { // Half-open - single failure opens
+        b.circuitState.Store(1)
+    } else if state == 0 && int(newCount) >= b.config.CircuitConfig.FailureThreshold {
+        b.circuitState.Store(1) // Open circuit
+    }
+}
+
+// Stats returns current bulkhead statistics
+func (b *Bulkhead) Stats() BulkheadStats {
+    return BulkheadStats{
+        ID:            b.id,
+        Level:         b.level,
+        Active:        int(b.activeCount.Load()),
+        Queued:        int(b.queuedCount.Load()),
+        Available:     len(b.semaphore),
+        CircuitState:  CircuitState(b.circuitState.Load()),
+        TotalRequests: b.totalRequests.Load(),
+        TotalFailures: b.totalFailures.Load(),
+    }
+}
+
+type BulkheadStats struct {
+    ID            string
+    Level         BulkheadLevel
+    Active        int
+    Queued        int
+    Available     int
+    CircuitState  CircuitState
+    TotalRequests int64
+    TotalFailures int64
+}
+
+type CircuitState int
+
+const (
+    CircuitClosed CircuitState = iota
+    CircuitOpen
+    CircuitHalfOpen
+)
+
+var (
+    ErrCircuitOpen  = errors.New("circuit breaker is open")
+    ErrQueueFull    = errors.New("bulkhead queue is full")
+    ErrQueueTimeout = errors.New("request timed out in queue")
+)
+```
+
+```go
+// core/llm/bulkhead/hierarchy.go
+
+// HierarchicalBulkhead manages the session→provider→model hierarchy
+type HierarchicalBulkhead struct {
+    sessionID string
+    configs   map[BulkheadLevel]BulkheadConfig
+
+    session   *Bulkhead
+    providers sync.Map // provider -> *Bulkhead
+    models    sync.Map // "provider:model" -> *Bulkhead
+
+    mu sync.RWMutex
+}
+
+// NewHierarchicalBulkhead creates a complete bulkhead hierarchy for a session
+func NewHierarchicalBulkhead(sessionID string, configs map[BulkheadLevel]BulkheadConfig) *HierarchicalBulkhead {
+    if configs == nil {
+        configs = DefaultBulkheadConfigs()
+    }
+
+    return &HierarchicalBulkhead{
+        sessionID: sessionID,
+        configs:   configs,
+        session:   NewBulkhead(sessionID, LevelSession, configs[LevelSession]),
+    }
+}
+
+// Acquire acquires slots at all three levels (session, provider, model)
+func (hb *HierarchicalBulkhead) Acquire(ctx context.Context, provider, model string) (*HierarchicalSlot, error) {
+    // Level 1: Session
+    if err := hb.session.Acquire(ctx); err != nil {
+        return nil, fmt.Errorf("session bulkhead: %w", err)
+    }
+
+    // Level 2: Provider
+    providerBulk := hb.getOrCreateProvider(provider)
+    if err := providerBulk.Acquire(ctx); err != nil {
+        hb.session.Release()
+        return nil, fmt.Errorf("provider bulkhead: %w", err)
+    }
+
+    // Level 3: Model
+    modelBulk := hb.getOrCreateModel(provider, model)
+    if err := modelBulk.Acquire(ctx); err != nil {
+        providerBulk.Release()
+        hb.session.Release()
+        return nil, fmt.Errorf("model bulkhead: %w", err)
+    }
+
+    return &HierarchicalSlot{
+        hierarchy: hb,
+        provider:  provider,
+        model:     model,
+        session:   hb.session,
+        provBulk:  providerBulk,
+        modelBulk: modelBulk,
+    }, nil
+}
+
+func (hb *HierarchicalBulkhead) getOrCreateProvider(provider string) *Bulkhead {
+    if v, ok := hb.providers.Load(provider); ok {
+        return v.(*Bulkhead)
+    }
+
+    hb.mu.Lock()
+    defer hb.mu.Unlock()
+
+    if v, ok := hb.providers.Load(provider); ok {
+        return v.(*Bulkhead)
+    }
+
+    bulk := NewBulkhead(
+        hb.sessionID+":"+provider,
+        LevelProvider,
+        hb.configs[LevelProvider],
+    )
+    hb.providers.Store(provider, bulk)
+    return bulk
+}
+
+func (hb *HierarchicalBulkhead) getOrCreateModel(provider, model string) *Bulkhead {
+    key := provider + ":" + model
+    if v, ok := hb.models.Load(key); ok {
+        return v.(*Bulkhead)
+    }
+
+    hb.mu.Lock()
+    defer hb.mu.Unlock()
+
+    if v, ok := hb.models.Load(key); ok {
+        return v.(*Bulkhead)
+    }
+
+    bulk := NewBulkhead(
+        hb.sessionID+":"+key,
+        LevelModel,
+        hb.configs[LevelModel],
+    )
+    hb.models.Store(key, bulk)
+    return bulk
+}
+
+// Stats returns statistics for all bulkheads in the hierarchy
+func (hb *HierarchicalBulkhead) Stats() HierarchyStats {
+    stats := HierarchyStats{
+        SessionID: hb.sessionID,
+        Session:   hb.session.Stats(),
+        Providers: make(map[string]BulkheadStats),
+        Models:    make(map[string]BulkheadStats),
+    }
+
+    hb.providers.Range(func(key, value any) bool {
+        stats.Providers[key.(string)] = value.(*Bulkhead).Stats()
+        return true
+    })
+
+    hb.models.Range(func(key, value any) bool {
+        stats.Models[key.(string)] = value.(*Bulkhead).Stats()
+        return true
+    })
+
+    return stats
+}
+
+type HierarchyStats struct {
+    SessionID string
+    Session   BulkheadStats
+    Providers map[string]BulkheadStats
+    Models    map[string]BulkheadStats
+}
+
+// HierarchicalSlot represents acquired slots at all levels
+type HierarchicalSlot struct {
+    hierarchy *HierarchicalBulkhead
+    provider  string
+    model     string
+    session   *Bulkhead
+    provBulk  *Bulkhead
+    modelBulk *Bulkhead
+    released  atomic.Bool
+}
+
+// Release returns slots at all levels
+func (hs *HierarchicalSlot) Release() {
+    if hs.released.CompareAndSwap(false, true) {
+        hs.modelBulk.Release()
+        hs.provBulk.Release()
+        hs.session.Release()
+    }
+}
+
+// RecordSuccess records success at all levels
+func (hs *HierarchicalSlot) RecordSuccess() {
+    hs.modelBulk.RecordSuccess()
+    hs.provBulk.RecordSuccess()
+    hs.session.RecordSuccess()
+}
+
+// RecordFailure records failure at all levels
+func (hs *HierarchicalSlot) RecordFailure() {
+    hs.modelBulk.RecordFailure()
+    hs.provBulk.RecordFailure()
+    hs.session.RecordFailure()
+}
+```
+
+---
+
+### Layer 2: Multi-Layer Proactive Rate Limiting
+
+Three independent rate limiters combined with most-restrictive-wins policy.
+
+```go
+// core/llm/ratelimit/multi_layer.go
+
+// RateLimitDecision represents the decision from a single limiter
+type RateLimitDecision struct {
+    Allowed     bool
+    WaitTime    time.Duration
+    Reason      string
+    Limiter     string
+    Confidence  float64 // 0-1, how confident is this decision
+}
+
+// MultiLayerRateLimiter combines multiple rate limiting strategies
+type MultiLayerRateLimiter struct {
+    provider string
+
+    tokenBucket   *TokenBucketLimiter
+    slidingWindow *SlidingWindowLimiter
+    adaptive429   *Adaptive429Limiter
+
+    mu sync.RWMutex
+}
+
+// NewMultiLayerRateLimiter creates a rate limiter with all three strategies
+func NewMultiLayerRateLimiter(provider string, config MultiLayerConfig) *MultiLayerRateLimiter {
+    return &MultiLayerRateLimiter{
+        provider:      provider,
+        tokenBucket:   NewTokenBucketLimiter(config.TokenBucket),
+        slidingWindow: NewSlidingWindowLimiter(config.SlidingWindow),
+        adaptive429:   NewAdaptive429Limiter(config.Adaptive),
+    }
+}
+
+type MultiLayerConfig struct {
+    TokenBucket   TokenBucketConfig
+    SlidingWindow SlidingWindowConfig
+    Adaptive      Adaptive429Config
+}
+
+// DefaultMultiLayerConfig returns production defaults
+func DefaultMultiLayerConfig() MultiLayerConfig {
+    return MultiLayerConfig{
+        TokenBucket: TokenBucketConfig{
+            Capacity:   100,           // Tokens
+            RefillRate: 10,            // Tokens per second
+        },
+        SlidingWindow: SlidingWindowConfig{
+            WindowSize:  60 * time.Second,
+            MaxRequests: 60,           // 1 req/sec average
+        },
+        Adaptive: Adaptive429Config{
+            InitialLimit:  50,          // Start conservative
+            DecayFactor:   0.95,        // Slow recovery
+            GrowthFactor:  1.05,        // Faster limit increase
+            MinLimit:      5,           // Never go below
+            MaxLimit:      200,         // Never go above
+        },
+    }
+}
+
+// Check returns the most restrictive decision from all limiters
+func (ml *MultiLayerRateLimiter) Check() RateLimitDecision {
+    decisions := []RateLimitDecision{
+        ml.tokenBucket.Check(),
+        ml.slidingWindow.Check(),
+        ml.adaptive429.Check(),
+    }
+
+    // Find most restrictive (longest wait time if not allowed)
+    var mostRestrictive RateLimitDecision
+    mostRestrictive.Allowed = true
+
+    for _, d := range decisions {
+        if !d.Allowed {
+            if mostRestrictive.Allowed || d.WaitTime > mostRestrictive.WaitTime {
+                mostRestrictive = d
+            }
+        }
+    }
+
+    return mostRestrictive
+}
+
+// RecordRequest records a request attempt
+func (ml *MultiLayerRateLimiter) RecordRequest() {
+    ml.tokenBucket.Consume(1)
+    ml.slidingWindow.Record()
+}
+
+// Record429 records a 429 response for adaptive learning
+func (ml *MultiLayerRateLimiter) Record429(retryAfter time.Duration) {
+    ml.adaptive429.Record429(retryAfter)
+}
+
+// RecordSuccess records a successful request (helps adaptive limiter)
+func (ml *MultiLayerRateLimiter) RecordSuccess() {
+    ml.adaptive429.RecordSuccess()
+}
+```
+
+```go
+// core/llm/ratelimit/token_bucket.go
+
+// TokenBucketLimiter implements classic token bucket algorithm
+type TokenBucketLimiter struct {
+    config TokenBucketConfig
+
+    tokens     float64
+    lastRefill time.Time
+
+    mu sync.Mutex
+}
+
+type TokenBucketConfig struct {
+    Capacity   float64       // Maximum tokens
+    RefillRate float64       // Tokens per second
+}
+
+func NewTokenBucketLimiter(config TokenBucketConfig) *TokenBucketLimiter {
+    return &TokenBucketLimiter{
+        config:     config,
+        tokens:     config.Capacity,
+        lastRefill: time.Now(),
+    }
+}
+
+func (tb *TokenBucketLimiter) Check() RateLimitDecision {
+    tb.mu.Lock()
+    defer tb.mu.Unlock()
+
+    tb.refill()
+
+    if tb.tokens >= 1 {
+        return RateLimitDecision{
+            Allowed:    true,
+            Limiter:    "token_bucket",
+            Confidence: 1.0,
+        }
+    }
+
+    // Calculate wait time until 1 token available
+    tokensNeeded := 1 - tb.tokens
+    waitTime := time.Duration(tokensNeeded / tb.config.RefillRate * float64(time.Second))
+
+    return RateLimitDecision{
+        Allowed:    false,
+        WaitTime:   waitTime,
+        Reason:     "token bucket exhausted",
+        Limiter:    "token_bucket",
+        Confidence: 1.0,
+    }
+}
+
+func (tb *TokenBucketLimiter) Consume(n float64) {
+    tb.mu.Lock()
+    defer tb.mu.Unlock()
+
+    tb.refill()
+    tb.tokens -= n
+    if tb.tokens < 0 {
+        tb.tokens = 0
+    }
+}
+
+func (tb *TokenBucketLimiter) refill() {
+    now := time.Now()
+    elapsed := now.Sub(tb.lastRefill)
+    tb.lastRefill = now
+
+    tb.tokens += elapsed.Seconds() * tb.config.RefillRate
+    if tb.tokens > tb.config.Capacity {
+        tb.tokens = tb.config.Capacity
+    }
+}
+```
+
+```go
+// core/llm/ratelimit/sliding_window.go
+
+// SlidingWindowLimiter implements rolling window rate limiting
+type SlidingWindowLimiter struct {
+    config SlidingWindowConfig
+
+    // Circular buffer of request timestamps
+    timestamps []time.Time
+    head       int
+    count      int
+
+    mu sync.Mutex
+}
+
+type SlidingWindowConfig struct {
+    WindowSize  time.Duration
+    MaxRequests int
+}
+
+func NewSlidingWindowLimiter(config SlidingWindowConfig) *SlidingWindowLimiter {
+    return &SlidingWindowLimiter{
+        config:     config,
+        timestamps: make([]time.Time, config.MaxRequests),
+    }
+}
+
+func (sw *SlidingWindowLimiter) Check() RateLimitDecision {
+    sw.mu.Lock()
+    defer sw.mu.Unlock()
+
+    sw.cleanup()
+
+    if sw.count < sw.config.MaxRequests {
+        return RateLimitDecision{
+            Allowed:    true,
+            Limiter:    "sliding_window",
+            Confidence: 1.0,
+        }
+    }
+
+    // Find oldest timestamp that will age out
+    oldest := sw.timestamps[sw.head]
+    waitTime := oldest.Add(sw.config.WindowSize).Sub(time.Now())
+    if waitTime < 0 {
+        waitTime = 0
+    }
+
+    return RateLimitDecision{
+        Allowed:    false,
+        WaitTime:   waitTime,
+        Reason:     fmt.Sprintf("sliding window limit (%d/%d)", sw.count, sw.config.MaxRequests),
+        Limiter:    "sliding_window",
+        Confidence: 1.0,
+    }
+}
+
+func (sw *SlidingWindowLimiter) Record() {
+    sw.mu.Lock()
+    defer sw.mu.Unlock()
+
+    sw.cleanup()
+
+    if sw.count < sw.config.MaxRequests {
+        idx := (sw.head + sw.count) % len(sw.timestamps)
+        sw.timestamps[idx] = time.Now()
+        sw.count++
+    }
+}
+
+func (sw *SlidingWindowLimiter) cleanup() {
+    cutoff := time.Now().Add(-sw.config.WindowSize)
+
+    for sw.count > 0 {
+        if sw.timestamps[sw.head].After(cutoff) {
+            break
+        }
+        sw.head = (sw.head + 1) % len(sw.timestamps)
+        sw.count--
+    }
+}
+```
+
+```go
+// core/llm/ratelimit/adaptive_429.go
+
+// Adaptive429Limiter learns from actual 429 responses
+type Adaptive429Limiter struct {
+    config Adaptive429Config
+
+    currentLimit float64    // Inferred requests/minute we can make
+    confidence   float64    // How confident are we in this limit
+    last429      time.Time  // Last 429 received
+    successRun   int        // Consecutive successes
+
+    mu sync.RWMutex
+}
+
+type Adaptive429Config struct {
+    InitialLimit float64
+    DecayFactor  float64 // Multiply limit by this on 429 (< 1)
+    GrowthFactor float64 // Multiply limit by this on success (> 1)
+    MinLimit     float64
+    MaxLimit     float64
+}
+
+func NewAdaptive429Limiter(config Adaptive429Config) *Adaptive429Limiter {
+    return &Adaptive429Limiter{
+        config:       config,
+        currentLimit: config.InitialLimit,
+        confidence:   0.5, // Start with moderate confidence
+    }
+}
+
+func (al *Adaptive429Limiter) Check() RateLimitDecision {
+    al.mu.RLock()
+    defer al.mu.RUnlock()
+
+    // If we got a 429 recently, apply backoff
+    if !al.last429.IsZero() {
+        elapsed := time.Since(al.last429)
+
+        // Exponential backoff based on how recent the 429 was
+        if elapsed < 5*time.Second {
+            return RateLimitDecision{
+                Allowed:    false,
+                WaitTime:   5*time.Second - elapsed,
+                Reason:     "recent 429, backing off",
+                Limiter:    "adaptive_429",
+                Confidence: al.confidence,
+            }
+        }
+    }
+
+    return RateLimitDecision{
+        Allowed:    true,
+        Limiter:    "adaptive_429",
+        Confidence: al.confidence,
+    }
+}
+
+func (al *Adaptive429Limiter) Record429(retryAfter time.Duration) {
+    al.mu.Lock()
+    defer al.mu.Unlock()
+
+    al.last429 = time.Now()
+    al.successRun = 0
+
+    // Decrease limit
+    al.currentLimit *= al.config.DecayFactor
+    if al.currentLimit < al.config.MinLimit {
+        al.currentLimit = al.config.MinLimit
+    }
+
+    // Increase confidence (we now have real data)
+    al.confidence = min(1.0, al.confidence+0.1)
+}
+
+func (al *Adaptive429Limiter) RecordSuccess() {
+    al.mu.Lock()
+    defer al.mu.Unlock()
+
+    al.successRun++
+
+    // After 10 consecutive successes, try increasing limit
+    if al.successRun >= 10 {
+        al.currentLimit *= al.config.GrowthFactor
+        if al.currentLimit > al.config.MaxLimit {
+            al.currentLimit = al.config.MaxLimit
+        }
+        al.successRun = 0
+    }
+
+    // Clear 429 state after enough successes
+    if al.successRun >= 5 {
+        al.last429 = time.Time{}
+    }
+}
+
+func (al *Adaptive429Limiter) CurrentLimit() float64 {
+    al.mu.RLock()
+    defer al.mu.RUnlock()
+    return al.currentLimit
+}
+```
+
+---
+
+### Layer 3: Cost-Aware Backpressure System
+
+Applies exponential delays as budget limits approach. NO model degradation - agents control their own model selection.
+
+```go
+// core/llm/backpressure/cost_aware.go
+
+// CostBackpressureConfig configures backpressure thresholds
+type CostBackpressureConfig struct {
+    // Delay thresholds (budget usage % -> delay multiplier)
+    DelayThresholds []DelayThreshold
+
+    // Rejection threshold
+    RejectNewAt float64 // Reject new requests at this % (e.g., 1.0)
+
+    // Base delay for calculations
+    BaseDelay time.Duration
+}
+
+type DelayThreshold struct {
+    UsagePercent float64
+    Multiplier   float64
+}
+
+// DefaultCostBackpressureConfig returns production defaults
+func DefaultCostBackpressureConfig() CostBackpressureConfig {
+    return CostBackpressureConfig{
+        DelayThresholds: []DelayThreshold{
+            {UsagePercent: 0.80, Multiplier: 1.5},
+            {UsagePercent: 0.90, Multiplier: 2.0},
+            {UsagePercent: 0.95, Multiplier: 4.0},
+            {UsagePercent: 0.98, Multiplier: 8.0},
+        },
+        RejectNewAt: 1.0,
+        BaseDelay:   100 * time.Millisecond,
+    }
+}
+
+// CostBackpressure applies cost-aware slowdown
+type CostBackpressure struct {
+    config       CostBackpressureConfig
+    budgetGetter BudgetGetter
+}
+
+// BudgetGetter retrieves current budget usage
+type BudgetGetter interface {
+    GetUsagePercent(sessionID string) float64
+    GetTaskUsagePercent(sessionID, taskID string) float64
+}
+
+func NewCostBackpressure(config CostBackpressureConfig, budget BudgetGetter) *CostBackpressure {
+    return &CostBackpressure{
+        config:       config,
+        budgetGetter: budget,
+    }
+}
+
+// BackpressureDecision represents the backpressure to apply
+type BackpressureDecision struct {
+    Delay        time.Duration
+    Reject       bool    // Reject the request entirely
+    UsagePercent float64
+    Reason       string
+}
+
+// Evaluate returns the backpressure decision for a request
+func (cb *CostBackpressure) Evaluate(sessionID, taskID string) BackpressureDecision {
+    usage := cb.budgetGetter.GetUsagePercent(sessionID)
+    if taskID != "" {
+        taskUsage := cb.budgetGetter.GetTaskUsagePercent(sessionID, taskID)
+        if taskUsage > usage {
+            usage = taskUsage
+        }
+    }
+
+    decision := BackpressureDecision{
+        UsagePercent: usage,
+    }
+
+    // Check rejection threshold
+    if usage >= cb.config.RejectNewAt {
+        decision.Reject = true
+        decision.Reason = fmt.Sprintf("budget exhausted (%.1f%%)", usage*100)
+        return decision
+    }
+
+    // Calculate delay based on usage thresholds
+    decision.Delay = cb.calculateDelay(usage)
+
+    if decision.Delay > 0 {
+        decision.Reason = fmt.Sprintf("budget at %.1f%%, applying %.0fms delay",
+            usage*100, float64(decision.Delay)/float64(time.Millisecond))
+    }
+
+    return decision
+}
+
+func (cb *CostBackpressure) calculateDelay(usage float64) time.Duration {
+    var multiplier float64 = 1.0
+
+    for _, threshold := range cb.config.DelayThresholds {
+        if usage >= threshold.UsagePercent {
+            multiplier = threshold.Multiplier
+        }
+    }
+
+    if multiplier == 1.0 {
+        return 0 // No delay below first threshold
+    }
+
+    return time.Duration(float64(cb.config.BaseDelay) * multiplier)
+}
+```
+
+---
+
+### Layer 4: Hybrid Health Monitoring
+
+Combines active probing with passive inference for comprehensive health assessment.
+
+```go
+// core/llm/health/hybrid_monitor.go
+
+// HybridHealthMonitor combines active and passive health monitoring
+type HybridHealthMonitor struct {
+    provider string
+    config   HealthConfig
+
+    // Active prober
+    prober   *ActiveProber
+
+    // Passive monitor
+    passive  *PassiveMonitor
+
+    // Combined health score
+    health   atomic.Int64 // Fixed-point: score * 1000
+
+    mu sync.RWMutex
+}
+
+type HealthConfig struct {
+    // Active probing
+    ProbeInterval    time.Duration
+    ProbeTimeout     time.Duration
+    ProbeEndpoint    string // Lightweight endpoint to probe
+
+    // Passive monitoring
+    WindowSize       time.Duration
+    MinSamples       int
+
+    // Score weights
+    ActiveWeight     float64 // 0-1
+    PassiveWeight    float64 // 0-1, should sum to 1 with ActiveWeight
+
+    // Thresholds
+    RejectThreshold  float64 // Score below this -> reject requests
+    WarnThreshold    float64 // Score below this -> warn
+    MonitorThreshold float64 // Score below this -> increased monitoring
+}
+
+func DefaultHealthConfig() HealthConfig {
+    return HealthConfig{
+        ProbeInterval:    30 * time.Second,
+        ProbeTimeout:     5 * time.Second,
+        ActiveWeight:     0.4,
+        PassiveWeight:    0.6,
+        WindowSize:       5 * time.Minute,
+        MinSamples:       10,
+        RejectThreshold:  0.3,
+        WarnThreshold:    0.5,
+        MonitorThreshold: 0.7,
+    }
+}
+
+func NewHybridHealthMonitor(provider string, config HealthConfig, probeFunc ProbeFunc) *HybridHealthMonitor {
+    hm := &HybridHealthMonitor{
+        provider: provider,
+        config:   config,
+        prober:   NewActiveProber(provider, config.ProbeInterval, config.ProbeTimeout, probeFunc),
+        passive:  NewPassiveMonitor(config.WindowSize, config.MinSamples),
+    }
+    hm.health.Store(1000) // Start healthy
+
+    go hm.runScoreUpdater()
+    return hm
+}
+
+func (hm *HybridHealthMonitor) runScoreUpdater() {
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        hm.updateCombinedScore()
+    }
+}
+
+func (hm *HybridHealthMonitor) updateCombinedScore() {
+    activeScore := hm.prober.Score()
+    passiveScore := hm.passive.Score()
+
+    combined := activeScore*hm.config.ActiveWeight + passiveScore*hm.config.PassiveWeight
+    hm.health.Store(int64(combined * 1000))
+}
+
+// Score returns the current health score (0.0 to 1.0)
+func (hm *HybridHealthMonitor) Score() float64 {
+    return float64(hm.health.Load()) / 1000.0
+}
+
+// Check returns whether requests should proceed
+func (hm *HybridHealthMonitor) Check() HealthDecision {
+    score := hm.Score()
+
+    if score < hm.config.RejectThreshold {
+        return HealthDecision{
+            Proceed: false,
+            Score:   score,
+            Status:  HealthDead,
+            Reason:  fmt.Sprintf("provider health critical: %.2f", score),
+        }
+    }
+
+    status := HealthHealthy
+    if score < hm.config.WarnThreshold {
+        status = HealthDegraded
+    } else if score < hm.config.MonitorThreshold {
+        status = HealthMonitored
+    }
+
+    return HealthDecision{
+        Proceed: true,
+        Score:   score,
+        Status:  status,
+    }
+}
+
+// RecordSuccess records a successful request
+func (hm *HybridHealthMonitor) RecordSuccess(latency time.Duration) {
+    hm.passive.RecordSuccess(latency)
+}
+
+// RecordFailure records a failed request
+func (hm *HybridHealthMonitor) RecordFailure(err error) {
+    hm.passive.RecordFailure(err)
+}
+
+type HealthDecision struct {
+    Proceed bool
+    Score   float64
+    Status  HealthStatus
+    Reason  string
+}
+
+type HealthStatus int
+
+const (
+    HealthHealthy HealthStatus = iota
+    HealthMonitored
+    HealthDegraded
+    HealthDead
+)
+```
+
+```go
+// core/llm/health/active_prober.go
+
+// ProbeFunc performs a lightweight health check
+type ProbeFunc func(ctx context.Context) error
+
+// ActiveProber performs periodic health probes
+type ActiveProber struct {
+    provider     string
+    interval     time.Duration
+    timeout      time.Duration
+    probe        ProbeFunc
+
+    lastSuccess  atomic.Int64 // Unix nano
+    lastFailure  atomic.Int64 // Unix nano
+    consecutiveFail atomic.Int32
+    consecutiveSuccess atomic.Int32
+
+    stopCh chan struct{}
+}
+
+func NewActiveProber(provider string, interval, timeout time.Duration, probe ProbeFunc) *ActiveProber {
+    ap := &ActiveProber{
+        provider: provider,
+        interval: interval,
+        timeout:  timeout,
+        probe:    probe,
+        stopCh:   make(chan struct{}),
+    }
+    ap.lastSuccess.Store(time.Now().UnixNano()) // Assume healthy at start
+
+    go ap.run()
+    return ap
+}
+
+func (ap *ActiveProber) run() {
+    ticker := time.NewTicker(ap.interval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ap.stopCh:
+            return
+        case <-ticker.C:
+            ap.doProbe()
+        }
+    }
+}
+
+func (ap *ActiveProber) doProbe() {
+    ctx, cancel := context.WithTimeout(context.Background(), ap.timeout)
+    defer cancel()
+
+    err := ap.probe(ctx)
+    now := time.Now().UnixNano()
+
+    if err == nil {
+        ap.lastSuccess.Store(now)
+        ap.consecutiveFail.Store(0)
+        ap.consecutiveSuccess.Add(1)
+    } else {
+        ap.lastFailure.Store(now)
+        ap.consecutiveSuccess.Store(0)
+        ap.consecutiveFail.Add(1)
+    }
+}
+
+// Score returns active probe health score (0-1)
+func (ap *ActiveProber) Score() float64 {
+    lastSuccess := time.Unix(0, ap.lastSuccess.Load())
+    lastFailure := time.Unix(0, ap.lastFailure.Load())
+
+    // If last event was success, high score
+    if lastSuccess.After(lastFailure) {
+        // Decay based on time since last success
+        elapsed := time.Since(lastSuccess)
+        if elapsed < ap.interval*2 {
+            return 1.0
+        }
+        // Gradual decay
+        decay := float64(elapsed) / float64(ap.interval*10)
+        return max(0.5, 1.0-decay)
+    }
+
+    // Last event was failure
+    consecutiveFails := int(ap.consecutiveFail.Load())
+    switch {
+    case consecutiveFails >= 5:
+        return 0.0
+    case consecutiveFails >= 3:
+        return 0.2
+    case consecutiveFails >= 1:
+        return 0.4
+    default:
+        return 0.5
+    }
+}
+
+func (ap *ActiveProber) Stop() {
+    close(ap.stopCh)
+}
+```
+
+```go
+// core/llm/health/passive_monitor.go
+
+// PassiveMonitor infers health from actual request outcomes
+type PassiveMonitor struct {
+    windowSize time.Duration
+    minSamples int
+
+    // Ring buffer of recent outcomes
+    outcomes   []outcome
+    head       int
+    count      int
+
+    mu sync.Mutex
+}
+
+type outcome struct {
+    timestamp time.Time
+    success   bool
+    latency   time.Duration
+    errorType errorCategory
+}
+
+type errorCategory int
+
+const (
+    errNone errorCategory = iota
+    errTransient
+    errRateLimit
+    errAuth
+    errPermanent
+)
+
+func NewPassiveMonitor(windowSize time.Duration, minSamples int) *PassiveMonitor {
+    bufSize := minSamples * 10 // Keep 10x min samples
+    return &PassiveMonitor{
+        windowSize: windowSize,
+        minSamples: minSamples,
+        outcomes:   make([]outcome, bufSize),
+    }
+}
+
+func (pm *PassiveMonitor) RecordSuccess(latency time.Duration) {
+    pm.record(outcome{
+        timestamp: time.Now(),
+        success:   true,
+        latency:   latency,
+    })
+}
+
+func (pm *PassiveMonitor) RecordFailure(err error) {
+    pm.record(outcome{
+        timestamp: time.Now(),
+        success:   false,
+        errorType: categorizeError(err),
+    })
+}
+
+func (pm *PassiveMonitor) record(o outcome) {
+    pm.mu.Lock()
+    defer pm.mu.Unlock()
+
+    idx := (pm.head + pm.count) % len(pm.outcomes)
+    pm.outcomes[idx] = o
+
+    if pm.count < len(pm.outcomes) {
+        pm.count++
+    } else {
+        pm.head = (pm.head + 1) % len(pm.outcomes)
+    }
+}
+
+// Score returns passive health score (0-1)
+func (pm *PassiveMonitor) Score() float64 {
+    pm.mu.Lock()
+    defer pm.mu.Unlock()
+
+    cutoff := time.Now().Add(-pm.windowSize)
+
+    var successes, failures int
+    var totalLatency time.Duration
+
+    for i := 0; i < pm.count; i++ {
+        idx := (pm.head + i) % len(pm.outcomes)
+        o := pm.outcomes[idx]
+
+        if o.timestamp.Before(cutoff) {
+            continue
+        }
+
+        if o.success {
+            successes++
+            totalLatency += o.latency
+        } else {
+            failures++
+        }
+    }
+
+    total := successes + failures
+    if total < pm.minSamples {
+        return 0.8 // Not enough data, assume mostly healthy
+    }
+
+    successRate := float64(successes) / float64(total)
+
+    // Penalize high latency
+    if successes > 0 {
+        avgLatency := totalLatency / time.Duration(successes)
+        if avgLatency > 10*time.Second {
+            successRate *= 0.8 // 20% penalty for slow responses
+        } else if avgLatency > 5*time.Second {
+            successRate *= 0.9 // 10% penalty
+        }
+    }
+
+    return successRate
+}
+
+func categorizeError(err error) errorCategory {
+    if err == nil {
+        return errNone
+    }
+
+    errStr := err.Error()
+
+    // Check for rate limiting
+    if strings.Contains(errStr, "429") || strings.Contains(errStr, "rate") {
+        return errRateLimit
+    }
+
+    // Check for auth
+    if strings.Contains(errStr, "401") || strings.Contains(errStr, "403") ||
+       strings.Contains(errStr, "auth") || strings.Contains(errStr, "key") {
+        return errAuth
+    }
+
+    // Check for transient
+    if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "connection") ||
+       strings.Contains(errStr, "temporary") || strings.Contains(errStr, "503") {
+        return errTransient
+    }
+
+    return errPermanent
+}
+```
+
+---
+
+### Layer 5: LLM-Specific Timeout Management
+
+Handles streaming timeouts, first-token delays, and inter-token gaps.
+
+```go
+// core/llm/timeout/streaming.go
+
+// StreamingTimeoutConfig configures timeout behavior for streaming responses
+type StreamingTimeoutConfig struct {
+    FirstTokenTimeout time.Duration // Max wait for first token
+    InterTokenTimeout time.Duration // Max gap between tokens
+    TotalTimeout      time.Duration // Hard cap on entire request
+}
+
+func DefaultStreamingTimeoutConfig() StreamingTimeoutConfig {
+    return StreamingTimeoutConfig{
+        FirstTokenTimeout: 30 * time.Second,
+        InterTokenTimeout: 10 * time.Second,
+        TotalTimeout:      5 * time.Minute,
+    }
+}
+
+// StreamingTimeoutMonitor monitors streaming response timeouts
+type StreamingTimeoutMonitor struct {
+    config      StreamingTimeoutConfig
+
+    started     time.Time
+    firstToken  time.Time
+    lastToken   time.Time
+
+    totalCtx    context.Context
+    totalCancel context.CancelFunc
+
+    tokenCh     chan struct{} // Signal when token received
+    errorCh     chan error    // Signal timeout errors
+
+    mu sync.Mutex
+}
+
+func NewStreamingTimeoutMonitor(ctx context.Context, config StreamingTimeoutConfig) *StreamingTimeoutMonitor {
+    totalCtx, totalCancel := context.WithTimeout(ctx, config.TotalTimeout)
+
+    stm := &StreamingTimeoutMonitor{
+        config:      config,
+        started:     time.Now(),
+        totalCtx:    totalCtx,
+        totalCancel: totalCancel,
+        tokenCh:     make(chan struct{}, 1),
+        errorCh:     make(chan error, 1),
+    }
+
+    go stm.monitorTimeouts()
+    return stm
+}
+
+func (stm *StreamingTimeoutMonitor) monitorTimeouts() {
+    defer stm.totalCancel()
+
+    // Wait for first token
+    firstTokenTimer := time.NewTimer(stm.config.FirstTokenTimeout)
+    defer firstTokenTimer.Stop()
+
+    select {
+    case <-stm.totalCtx.Done():
+        stm.sendError(stm.totalCtx.Err())
+        return
+    case <-firstTokenTimer.C:
+        stm.sendError(ErrFirstTokenTimeout)
+        return
+    case <-stm.tokenCh:
+        stm.mu.Lock()
+        stm.firstToken = time.Now()
+        stm.lastToken = stm.firstToken
+        stm.mu.Unlock()
+    }
+
+    // Monitor inter-token gaps
+    for {
+        interTokenTimer := time.NewTimer(stm.config.InterTokenTimeout)
+
+        select {
+        case <-stm.totalCtx.Done():
+            interTokenTimer.Stop()
+            stm.sendError(stm.totalCtx.Err())
+            return
+        case <-interTokenTimer.C:
+            stm.sendError(ErrInterTokenTimeout)
+            return
+        case <-stm.tokenCh:
+            interTokenTimer.Stop()
+            stm.mu.Lock()
+            stm.lastToken = time.Now()
+            stm.mu.Unlock()
+        }
+    }
+}
+
+// RecordToken signals that a token was received
+func (stm *StreamingTimeoutMonitor) RecordToken() {
+    select {
+    case stm.tokenCh <- struct{}{}:
+    default:
+    }
+}
+
+// Done signals the stream completed successfully
+func (stm *StreamingTimeoutMonitor) Done() {
+    stm.totalCancel()
+}
+
+// Errors returns the error channel
+func (stm *StreamingTimeoutMonitor) Errors() <-chan error {
+    return stm.errorCh
+}
+
+// Context returns the total timeout context
+func (stm *StreamingTimeoutMonitor) Context() context.Context {
+    return stm.totalCtx
+}
+
+func (stm *StreamingTimeoutMonitor) sendError(err error) {
+    select {
+    case stm.errorCh <- err:
+    default:
+    }
+}
+
+// Stats returns timing statistics
+func (stm *StreamingTimeoutMonitor) Stats() StreamingStats {
+    stm.mu.Lock()
+    defer stm.mu.Unlock()
+
+    return StreamingStats{
+        Started:           stm.started,
+        FirstTokenAt:      stm.firstToken,
+        LastTokenAt:       stm.lastToken,
+        TimeToFirstToken:  stm.firstToken.Sub(stm.started),
+        TotalDuration:     time.Since(stm.started),
+    }
+}
+
+type StreamingStats struct {
+    Started          time.Time
+    FirstTokenAt     time.Time
+    LastTokenAt      time.Time
+    TimeToFirstToken time.Duration
+    TotalDuration    time.Duration
+}
+
+var (
+    ErrFirstTokenTimeout = errors.New("timeout waiting for first token")
+    ErrInterTokenTimeout = errors.New("timeout waiting for next token")
+)
+```
+
+```go
+// core/llm/timeout/jittered_backoff.go
+
+// JitteredBackoff implements exponential backoff with jitter
+type JitteredBackoff struct {
+    base    time.Duration
+    max     time.Duration
+    attempt int
+
+    // Jitter range [minJitter, maxJitter] as multipliers
+    minJitter float64
+    maxJitter float64
+
+    rng *rand.Rand
+    mu  sync.Mutex
+}
+
+func NewJitteredBackoff(base, max time.Duration) *JitteredBackoff {
+    return &JitteredBackoff{
+        base:      base,
+        max:       max,
+        minJitter: 0.5,
+        maxJitter: 1.5,
+        rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+    }
+}
+
+// Next returns the next backoff duration with jitter
+func (jb *JitteredBackoff) Next() time.Duration {
+    jb.mu.Lock()
+    defer jb.mu.Unlock()
+
+    // Calculate base exponential backoff
+    backoff := jb.base * time.Duration(1<<jb.attempt)
+    if backoff > jb.max {
+        backoff = jb.max
+    }
+
+    // Apply jitter
+    jitter := jb.minJitter + jb.rng.Float64()*(jb.maxJitter-jb.minJitter)
+    jittered := time.Duration(float64(backoff) * jitter)
+
+    jb.attempt++
+    return jittered
+}
+
+// Reset resets the backoff counter
+func (jb *JitteredBackoff) Reset() {
+    jb.mu.Lock()
+    defer jb.mu.Unlock()
+    jb.attempt = 0
+}
+
+// Attempt returns the current attempt number
+func (jb *JitteredBackoff) Attempt() int {
+    jb.mu.Lock()
+    defer jb.mu.Unlock()
+    return jb.attempt
+}
+```
+
+---
+
+### Layer 6: Failure Correlation Engine
+
+Detects correlated failures across sessions and applies global backoff.
+
+```go
+// core/llm/correlation/failure_engine.go
+
+// FailureCorrelationEngine detects provider-wide failures across sessions
+type FailureCorrelationEngine struct {
+    config CorrelationConfig
+
+    // Per-provider failure tracking
+    providerFailures sync.Map // provider -> *failureTracker
+
+    // Global backoff state per provider
+    globalBackoffs sync.Map // provider -> *globalBackoff
+
+    dispatcher SignalDispatcher // For broadcasting
+}
+
+type CorrelationConfig struct {
+    CorrelationWindow   time.Duration // Time window to detect correlation
+    MinFailuresForGlobal int          // Min failures across sessions to trigger global
+    GlobalBackoffBase   time.Duration // Base duration for global backoff
+    GlobalBackoffMax    time.Duration // Max global backoff
+    RecoveryRampUp      float64       // Percentage of traffic to allow after backoff
+}
+
+func DefaultCorrelationConfig() CorrelationConfig {
+    return CorrelationConfig{
+        CorrelationWindow:    10 * time.Second,
+        MinFailuresForGlobal: 3,
+        GlobalBackoffBase:    5 * time.Second,
+        GlobalBackoffMax:     60 * time.Second,
+        RecoveryRampUp:       0.1, // Allow 10% of traffic initially
+    }
+}
+
+type failureTracker struct {
+    failures   []failureEvent
+    mu         sync.Mutex
+}
+
+type failureEvent struct {
+    timestamp time.Time
+    sessionID string
+    errorType errorCategory
+}
+
+type globalBackoff struct {
+    active       atomic.Bool
+    until        atomic.Int64 // Unix nano
+    attempt      atomic.Int32
+    trafficRatio atomic.Int64 // Fixed-point: ratio * 1000
+}
+
+func NewFailureCorrelationEngine(config CorrelationConfig, dispatcher SignalDispatcher) *FailureCorrelationEngine {
+    return &FailureCorrelationEngine{
+        config:     config,
+        dispatcher: dispatcher,
+    }
+}
+
+// RecordFailure records a failure and checks for correlation
+func (fce *FailureCorrelationEngine) RecordFailure(provider, sessionID string, err error) {
+    tracker := fce.getOrCreateTracker(provider)
+
+    tracker.mu.Lock()
+    tracker.failures = append(tracker.failures, failureEvent{
+        timestamp: time.Now(),
+        sessionID: sessionID,
+        errorType: categorizeError(err),
+    })
+    tracker.mu.Unlock()
+
+    // Check for correlated failures
+    if fce.detectCorrelation(provider, tracker) {
+        fce.triggerGlobalBackoff(provider)
+    }
+}
+
+func (fce *FailureCorrelationEngine) getOrCreateTracker(provider string) *failureTracker {
+    if v, ok := fce.providerFailures.Load(provider); ok {
+        return v.(*failureTracker)
+    }
+
+    tracker := &failureTracker{}
+    actual, _ := fce.providerFailures.LoadOrStore(provider, tracker)
+    return actual.(*failureTracker)
+}
+
+func (fce *FailureCorrelationEngine) detectCorrelation(provider string, tracker *failureTracker) bool {
+    tracker.mu.Lock()
+    defer tracker.mu.Unlock()
+
+    cutoff := time.Now().Add(-fce.config.CorrelationWindow)
+
+    // Count failures within window, grouped by session
+    sessionFailures := make(map[string]int)
+
+    for _, f := range tracker.failures {
+        if f.timestamp.After(cutoff) {
+            sessionFailures[f.sessionID]++
+        }
+    }
+
+    // Correlation detected if multiple sessions failed
+    uniqueSessions := len(sessionFailures)
+    return uniqueSessions >= fce.config.MinFailuresForGlobal
+}
+
+func (fce *FailureCorrelationEngine) triggerGlobalBackoff(provider string) {
+    backoff := fce.getOrCreateBackoff(provider)
+
+    if backoff.active.CompareAndSwap(false, true) {
+        attempt := backoff.attempt.Add(1)
+
+        // Calculate backoff duration with exponential increase
+        duration := fce.config.GlobalBackoffBase * time.Duration(1<<(attempt-1))
+        if duration > fce.config.GlobalBackoffMax {
+            duration = fce.config.GlobalBackoffMax
+        }
+
+        backoff.until.Store(time.Now().Add(duration).UnixNano())
+        backoff.trafficRatio.Store(0) // Initially block all traffic
+
+        // Broadcast global backoff signal
+        if fce.dispatcher != nil {
+            fce.dispatcher.SendSignal(NewGlobalBackoffSignal(provider, duration))
+        }
+
+        // Schedule recovery
+        go fce.scheduleRecovery(provider, backoff, duration)
+    }
+}
+
+func (fce *FailureCorrelationEngine) getOrCreateBackoff(provider string) *globalBackoff {
+    if v, ok := fce.globalBackoffs.Load(provider); ok {
+        return v.(*globalBackoff)
+    }
+
+    backoff := &globalBackoff{}
+    actual, _ := fce.globalBackoffs.LoadOrStore(provider, backoff)
+    return actual.(*globalBackoff)
+}
+
+func (fce *FailureCorrelationEngine) scheduleRecovery(provider string, backoff *globalBackoff, duration time.Duration) {
+    time.Sleep(duration)
+
+    // Gradual traffic ramp-up
+    ratio := fce.config.RecoveryRampUp
+    for ratio < 1.0 {
+        backoff.trafficRatio.Store(int64(ratio * 1000))
+
+        time.Sleep(5 * time.Second)
+        ratio += fce.config.RecoveryRampUp
+    }
+
+    // Fully recovered
+    backoff.active.Store(false)
+    backoff.trafficRatio.Store(1000)
+    backoff.attempt.Store(0)
+
+    if fce.dispatcher != nil {
+        fce.dispatcher.SendSignal(NewGlobalRecoverySignal(provider))
+    }
+}
+
+// ShouldAllow returns whether a request should be allowed during global backoff
+func (fce *FailureCorrelationEngine) ShouldAllow(provider string) bool {
+    v, ok := fce.globalBackoffs.Load(provider)
+    if !ok {
+        return true
+    }
+
+    backoff := v.(*globalBackoff)
+    if !backoff.active.Load() {
+        return true
+    }
+
+    // Check if backoff expired
+    if time.Now().UnixNano() > backoff.until.Load() {
+        return true
+    }
+
+    // Probabilistic allow based on traffic ratio
+    ratio := float64(backoff.trafficRatio.Load()) / 1000.0
+    return rand.Float64() < ratio
+}
+```
+
+---
+
+### Layer 7: LLM Request Coordinator
+
+Single entry point that orchestrates all protection layers.
+
+```go
+// core/llm/coordinator.go
+
+// LLMRequestCoordinator orchestrates all protection layers
+type LLMRequestCoordinator struct {
+    config CoordinatorConfig
+
+    // Per-session bulkheads
+    sessionBulkheads sync.Map // sessionID -> *HierarchicalBulkhead
+
+    // Per-provider rate limiters
+    rateLimiters sync.Map // provider -> *MultiLayerRateLimiter
+
+    // Per-provider health monitors
+    healthMonitors sync.Map // provider -> *HybridHealthMonitor
+
+    // Shared components
+    costBackpressure   *CostBackpressure
+    correlationEngine  *FailureCorrelationEngine
+    streamTimeoutCfg   StreamingTimeoutConfig
+
+    logger *slog.Logger
+}
+
+type CoordinatorConfig struct {
+    BulkheadConfigs   map[BulkheadLevel]BulkheadConfig
+    RateLimitConfig   MultiLayerConfig
+    HealthConfig      HealthConfig
+    BackpressureConfig CostBackpressureConfig
+    CorrelationConfig CorrelationConfig
+    StreamTimeoutConfig StreamingTimeoutConfig
+}
+
+func DefaultCoordinatorConfig() CoordinatorConfig {
+    return CoordinatorConfig{
+        BulkheadConfigs:    DefaultBulkheadConfigs(),
+        RateLimitConfig:    DefaultMultiLayerConfig(),
+        HealthConfig:       DefaultHealthConfig(),
+        BackpressureConfig: DefaultCostBackpressureConfig(),
+        CorrelationConfig:  DefaultCorrelationConfig(),
+        StreamTimeoutConfig: DefaultStreamingTimeoutConfig(),
+    }
+}
+
+// ExecuteRequest executes an LLM request with all protections
+func (c *LLMRequestCoordinator) ExecuteRequest(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+    // 1. Check provider health
+    if err := c.checkHealth(req.Provider); err != nil {
+        return nil, err
+    }
+
+    // 2. Check global backoff (failure correlation)
+    if !c.correlationEngine.ShouldAllow(req.Provider) {
+        return nil, ErrGlobalBackoff
+    }
+
+    // 3. Check rate limits
+    if err := c.checkRateLimits(ctx, req.Provider); err != nil {
+        return nil, err
+    }
+
+    // 4. Apply cost backpressure
+    bpDecision := c.costBackpressure.Evaluate(req.SessionID, req.TaskID)
+    if bpDecision.Reject {
+        return nil, fmt.Errorf("%w: %s", ErrBudgetExhausted, bpDecision.Reason)
+    }
+
+    // Apply delay if needed
+    if bpDecision.Delay > 0 {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case <-time.After(bpDecision.Delay):
+        }
+    }
+
+    // 5. Acquire bulkhead slot
+    bulkhead := c.getOrCreateBulkhead(req.SessionID)
+    slot, err := bulkhead.Acquire(ctx, req.Provider, req.Model)
+    if err != nil {
+        return nil, fmt.Errorf("bulkhead acquisition: %w", err)
+    }
+    defer slot.Release()
+
+    // 6. Execute with timeout monitoring
+    resp, err := c.executeWithTimeouts(ctx, req)
+
+    // 7. Record outcome
+    c.recordOutcome(req, resp, err, slot)
+
+    return resp, err
+}
+
+func (c *LLMRequestCoordinator) checkHealth(provider string) error {
+    monitor := c.getOrCreateHealthMonitor(provider)
+    decision := monitor.Check()
+
+    if !decision.Proceed {
+        return fmt.Errorf("%w: %s", ErrProviderUnhealthy, decision.Reason)
+    }
+    return nil
+}
+
+func (c *LLMRequestCoordinator) checkRateLimits(ctx context.Context, provider string) error {
+    limiter := c.getOrCreateRateLimiter(provider)
+    decision := limiter.Check()
+
+    if !decision.Allowed {
+        // Wait or reject based on wait time
+        if decision.WaitTime > 30*time.Second {
+            return fmt.Errorf("%w: %s (wait: %v)", ErrRateLimited, decision.Reason, decision.WaitTime)
+        }
+
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-time.After(decision.WaitTime):
+        }
+    }
+
+    limiter.RecordRequest()
+    return nil
+}
+
+func (c *LLMRequestCoordinator) executeWithTimeouts(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+    if req.Stream {
+        return c.executeStreaming(ctx, req)
+    }
+    return c.executeNonStreaming(ctx, req)
+}
+
+func (c *LLMRequestCoordinator) executeStreaming(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+    monitor := NewStreamingTimeoutMonitor(ctx, c.streamTimeoutCfg)
+    defer monitor.Done()
+
+    resp := &LLMResponse{
+        Chunks: make(chan string, 100),
+    }
+
+    go func() {
+        defer close(resp.Chunks)
+
+        for chunk := range req.Provider.Stream(monitor.Context(), req) {
+            monitor.RecordToken()
+            resp.Chunks <- chunk
+        }
+    }()
+
+    // Wait for either completion or timeout error
+    select {
+    case err := <-monitor.Errors():
+        return nil, err
+    case <-monitor.Context().Done():
+        return resp, nil
+    }
+}
+
+func (c *LLMRequestCoordinator) executeNonStreaming(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+    // Non-streaming uses simple timeout
+    reqCtx, cancel := context.WithTimeout(ctx, c.streamTimeoutCfg.TotalTimeout)
+    defer cancel()
+
+    return req.Provider.Complete(reqCtx, req)
+}
+
+func (c *LLMRequestCoordinator) recordOutcome(req *LLMRequest, resp *LLMResponse, err error, slot *HierarchicalSlot) {
+    rateLimiter := c.getOrCreateRateLimiter(req.Provider)
+    healthMonitor := c.getOrCreateHealthMonitor(req.Provider)
+
+    if err != nil {
+        slot.RecordFailure()
+        healthMonitor.RecordFailure(err)
+        c.correlationEngine.RecordFailure(req.Provider, req.SessionID, err)
+
+        // Check for rate limit error
+        if isRateLimitError(err) {
+            rateLimiter.Record429(parseRetryAfter(err))
+        }
+    } else {
+        slot.RecordSuccess()
+        healthMonitor.RecordSuccess(resp.Latency)
+        rateLimiter.RecordSuccess()
+    }
+}
+
+func (c *LLMRequestCoordinator) getOrCreateBulkhead(sessionID string) *HierarchicalBulkhead {
+    if v, ok := c.sessionBulkheads.Load(sessionID); ok {
+        return v.(*HierarchicalBulkhead)
+    }
+
+    bulk := NewHierarchicalBulkhead(sessionID, c.config.BulkheadConfigs)
+    actual, _ := c.sessionBulkheads.LoadOrStore(sessionID, bulk)
+    return actual.(*HierarchicalBulkhead)
+}
+
+func (c *LLMRequestCoordinator) getOrCreateRateLimiter(provider string) *MultiLayerRateLimiter {
+    if v, ok := c.rateLimiters.Load(provider); ok {
+        return v.(*MultiLayerRateLimiter)
+    }
+
+    limiter := NewMultiLayerRateLimiter(provider, c.config.RateLimitConfig)
+    actual, _ := c.rateLimiters.LoadOrStore(provider, limiter)
+    return actual.(*MultiLayerRateLimiter)
+}
+
+func (c *LLMRequestCoordinator) getOrCreateHealthMonitor(provider string) *HybridHealthMonitor {
+    if v, ok := c.healthMonitors.Load(provider); ok {
+        return v.(*HybridHealthMonitor)
+    }
+
+    // Create probe function for this provider
+    probeFunc := func(ctx context.Context) error {
+        // Lightweight probe - could be a simple API ping
+        return nil // TODO: Implement provider-specific probe
+    }
+
+    monitor := NewHybridHealthMonitor(provider, c.config.HealthConfig, probeFunc)
+    actual, _ := c.healthMonitors.LoadOrStore(provider, monitor)
+    return actual.(*HybridHealthMonitor)
+}
+
+// Stats returns coordinator-wide statistics
+func (c *LLMRequestCoordinator) Stats() CoordinatorStats {
+    stats := CoordinatorStats{
+        Sessions:  make(map[string]HierarchyStats),
+        Providers: make(map[string]ProviderStats),
+    }
+
+    c.sessionBulkheads.Range(func(key, value any) bool {
+        stats.Sessions[key.(string)] = value.(*HierarchicalBulkhead).Stats()
+        return true
+    })
+
+    c.healthMonitors.Range(func(key, value any) bool {
+        provider := key.(string)
+        stats.Providers[provider] = ProviderStats{
+            HealthScore: value.(*HybridHealthMonitor).Score(),
+        }
+        return true
+    })
+
+    return stats
+}
+
+type CoordinatorStats struct {
+    Sessions  map[string]HierarchyStats
+    Providers map[string]ProviderStats
+}
+
+type ProviderStats struct {
+    HealthScore float64
+}
+
+// LLMRequest represents an LLM request
+type LLMRequest struct {
+    SessionID string
+    TaskID    string
+    Provider  string
+    Model     string
+    Messages  []Message
+    Stream    bool
+}
+
+// LLMResponse represents an LLM response
+type LLMResponse struct {
+    Content string
+    Chunks  chan string // For streaming
+    Latency time.Duration
+    Usage   TokenUsage
+}
+
+type TokenUsage struct {
+    InputTokens  int
+    OutputTokens int
+}
+
+var (
+    ErrGlobalBackoff    = errors.New("global backoff active for provider")
+    ErrProviderUnhealthy = errors.New("provider health check failed")
+    ErrRateLimited      = errors.New("rate limited")
+    ErrBudgetExhausted  = errors.New("budget exhausted")
+)
+```
+
+---
+
+### Guarantees
+
+| Guarantee | Mechanism |
+|-----------|-----------|
+| **Session isolation** | Hierarchical bulkheads - session A failure cannot consume session B slots |
+| **Provider isolation** | Per-provider bulkheads, rate limiters, health monitors |
+| **Model isolation** | Per-model bulkheads within provider |
+| **No thundering herd** | Jittered backoff + staggered recovery after global backoff |
+| **Proactive prevention** | Multi-layer rate limiting predicts limits before 429s |
+| **Graceful degradation** | Cost backpressure applies exponential delays before rejection |
+| **Fast failure detection** | Hybrid health: active probes + passive inference |
+| **Correlated failure handling** | Global backoff when multiple sessions fail same provider |
+| **Streaming protection** | First-token, inter-token, and total timeouts |
+| **Agent autonomy** | System provides signals; agents control their own retry strategy |
+
 ---
 
 ## Error Propagation & Recovery
@@ -7211,6 +11903,130 @@ func (p *ResourcePool) Release(h *ResourceHandle) {
         close(waiter.ready)
     }
 }
+```
+
+### Memory Pressure Defense System
+
+**Reference:** `/MEMORY.md` for full implementation details.
+
+The Memory Pressure Defense System provides a 7-layer defense against memory exhaustion with spike detection, hysteresis-based state transitions, and graduated response actions.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       MEMORY PRESSURE DEFENSE SYSTEM                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐ │
+│  │ LAYER 1: USAGE REGISTRY                                                       │ │
+│  │          Track actual usage by category — no upfront reservation              │ │
+│  └───────────────────────────────────────────────────────────────────────────────┘ │
+│                                       │                                             │
+│                                       ▼                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐ │
+│  │ LAYER 2: MEMORY MONITOR                                                       │ │
+│  │          200ms sampling, trend detection, spike detection                     │ │
+│  └───────────────────────────────────────────────────────────────────────────────┘ │
+│                                       │                                             │
+│                                       ▼                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐ │
+│  │ LAYER 3: PRESSURE STATE MACHINE                                               │ │
+│  │          NORMAL → ELEVATED → HIGH → CRITICAL (hysteresis + cooldown)          │ │
+│  └───────────────────────────────────────────────────────────────────────────────┘ │
+│                                       │                                             │
+│           ┌───────────────┬───────────┴───────────┬───────────────┐                │
+│           ▼               ▼                       ▼               ▼                │
+│  ┌─────────────┐ ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐      │
+│  │  LAYER 4:   │ │    LAYER 5:     │ │    LAYER 6:     │ │    LAYER 7:     │      │
+│  │  Admission  │ │  Cache Evictor  │ │    Context      │ │    Pipeline     │      │
+│  │  Controller │ │                 │ │   Compactor     │ │    Suspender    │      │
+│  │             │ │                 │ │                 │ │                 │      │
+│  │ Gate new    │ │ LRU eviction    │ │ Trigger early   │ │ Pause/resume    │      │
+│  │ pipelines   │ │ from caches     │ │ LLM compaction  │ │ by priority     │      │
+│  └─────────────┘ └─────────────────┘ └─────────────────┘ └─────────────────┘      │
+│                                                                                     │
+│  RESPONSE MATRIX:                                                                   │
+│  ───────────────────────────────────────────────────────────────────────────────── │
+│  NORMAL (< 50%):     Resume admissions, resume pipelines                           │
+│  ELEVATED (50-70%):  Stop admissions, GC                                           │
+│  HIGH (70-85%):      + Evict caches 25%, compact contexts                          │
+│  CRITICAL (> 85%):   + Evict caches 50%, pause pipelines                           │
+│  SPIKE (+15%):       Immediate GC + evict (bypasses cooldown)                      │
+│                                                                                     │
+│  ANTI-FLAP:                                                                         │
+│  ───────────────────────────────────────────────────────────────────────────────── │
+│  Hysteresis: exit threshold = enter - 15%                                          │
+│  Cooldown: 3s between state changes (spike bypasses)                               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **UsageRegistry** | `core/resources/usage_registry.go` | Track actual memory usage by category (Caches, Pipelines, LLMBuffers, WAL) |
+| **SpikeMonitor** | `core/resources/spike_monitor.go` | 200ms sampling with +15% spike detection |
+| **PressureStateMachine** | `core/resources/pressure_state.go` | 4-level state machine with hysteresis + cooldown |
+| **AdmissionController** | `core/resources/admission_controller.go` | Gate new pipelines based on pressure level |
+| **CacheEvictor** | `core/resources/cache_evictor.go` | Coordinate LRU eviction across caches |
+| **ContextCompactor** | `core/resources/context_compactor.go` | Signal agents to compact LLM contexts |
+| **PipelineSuspender** | `core/resources/pipeline_suspender.go` | Pause/resume pipelines by priority |
+| **PressureController** | `core/resources/pressure_controller.go` | Orchestrates all layers |
+
+#### Properties
+
+| Property | Mechanism |
+|----------|-----------|
+| **Responsive** | 200ms sampling, tracked usage (not reserved) |
+| **Proactive** | Admission control stops new work before critical |
+| **Graduated** | 4 levels with increasing severity |
+| **Anti-flap** | 15% hysteresis + 3s cooldown |
+| **Spike-aware** | Rate detection bypasses cooldown |
+| **OS agnostic** | `runtime.MemStats`, `runtime.GC`, `debug.SetMemoryLimit` |
+| **Non-blocking** | All components report, never wait |
+
+#### Thresholds
+
+```
+Usage %    State        Actions
+────────────────────────────────────────────────────────────────
+< 35%      NORMAL       Resume admissions, resume pipelines
+35-50%     NORMAL       (hysteresis zone)
+50-55%     ELEVATED     Stop admissions, GC
+55-70%     ELEVATED     (hysteresis zone)
+70-85%     HIGH         + Evict 25%, compact contexts
+> 85%      CRITICAL     + Evict 50%, pause pipelines
+
+SPIKE (+15% in one tick): Immediate GC + evict (bypasses cooldown)
+```
+
+#### Integration with Existing Code
+
+```go
+// Startup integration
+func initPressureController(
+    signalBus *signal.SignalBus,
+    scheduler *session.GlobalPipelineScheduler,
+    queryCache *archivalist.QueryCache,
+) *resources.PressureController {
+    caches := []resources.EvictableCache{queryCache}
+    return resources.NewPressureController(signalBus, scheduler, caches)
+}
+
+// Components report usage (non-blocking)
+queryCache.registry.Report("query-cache", UsageCategoryCaches, size)
+pipeline.registry.Report(p.ID, UsageCategoryPipelines, estimatedSize)
+streamBuffer.registry.Report(requestID, UsageCategoryLLMBuffers, size)
+```
+
+#### New Signal Types
+
+```go
+const (
+    EvictCaches           Signal = "evict_caches"
+    CompactContexts       Signal = "compact_contexts"
+    MemoryPressureChanged Signal = "memory_pressure_changed"
+)
 ```
 
 ### Disk Quota Management

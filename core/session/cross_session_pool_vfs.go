@@ -82,6 +82,21 @@ func (p *CrossSessionPoolVFS) AcquireFileAccess(
 		return nil, err
 	}
 
+	locks, err := p.acquireFiles(ctx, sessionID, files, mode)
+	if err != nil {
+		return nil, err
+	}
+
+	p.broadcastLockSignals(locks)
+	return locks, nil
+}
+
+func (p *CrossSessionPoolVFS) acquireFiles(
+	ctx context.Context,
+	sessionID string,
+	files []string,
+	mode FileAccessMode,
+) ([]FileLock, error) {
 	locks := make([]FileLock, 0, len(files))
 	for _, file := range files {
 		lock, err := p.acquireSingleFile(ctx, sessionID, file, mode)
@@ -91,8 +106,6 @@ func (p *CrossSessionPoolVFS) AcquireFileAccess(
 		}
 		locks = append(locks, lock)
 	}
-
-	p.broadcastLockSignals(locks)
 	return locks, nil
 }
 
@@ -262,10 +275,10 @@ func (p *CrossSessionPoolVFS) doRelease(lock FileLock) bool {
 		return false
 	}
 
-	if lock.Mode == FileAccessRead {
-		return p.releaseReadLock(lock.FilePath, lock.SessionID, ownership)
+	if lock.Mode != FileAccessRead {
+		return p.releaseWriteLock(lock.FilePath, lock.SessionID, ownership)
 	}
-	return p.releaseWriteLock(lock.FilePath, lock.SessionID, ownership)
+	return p.releaseReadLock(lock.FilePath, lock.SessionID, ownership)
 }
 
 func (p *CrossSessionPoolVFS) releaseReadLock(filePath, sessionID string, ownership *fileOwnership) bool {
@@ -333,7 +346,11 @@ func (p *CrossSessionPoolVFS) getOwnerFromOwnership(ownership *fileOwnership) st
 	if ownership.sessionID != "" {
 		return ownership.sessionID
 	}
-	for sessionID := range ownership.readers {
+	return firstReader(ownership.readers)
+}
+
+func firstReader(readers map[string]time.Time) string {
+	for sessionID := range readers {
 		return sessionID
 	}
 	return ""
@@ -394,11 +411,8 @@ func (op *CoordinatedFileOperation) Complete() error {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 
-	if op.completed {
-		return ErrOperationCompleted
-	}
-	if op.aborted {
-		return ErrOperationAborted
+	if err := op.ensureOpState(); err != nil {
+		return err
 	}
 
 	op.completed = true
@@ -409,15 +423,22 @@ func (op *CoordinatedFileOperation) Abort() error {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 
+	if err := op.ensureOpState(); err != nil {
+		return err
+	}
+
+	op.aborted = true
+	return op.pool.ReleaseFileAccess(op.locks)
+}
+
+func (op *CoordinatedFileOperation) ensureOpState() error {
 	if op.completed {
 		return ErrOperationCompleted
 	}
 	if op.aborted {
 		return ErrOperationAborted
 	}
-
-	op.aborted = true
-	return op.pool.ReleaseFileAccess(op.locks)
+	return nil
 }
 
 func (op *CoordinatedFileOperation) Locks() []FileLock {

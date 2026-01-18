@@ -214,19 +214,16 @@ func (m *Manager) Count() int {
 
 // Switch switches to a different session
 func (m *Manager) Switch(id string) error {
-	if m.closed.Load() {
-		return ErrManagerClosed
-	}
-
-	session, ok := m.Get(id)
-	if !ok {
-		return ErrSessionNotFound
-	}
-
-	if err := m.pauseActiveSession(id); err != nil {
+	if err := m.ensureOpen(); err != nil {
 		return err
 	}
-	if err := m.activateSession(session); err != nil {
+
+	session, err := m.getSessionOrErr(id)
+	if err != nil {
+		return err
+	}
+
+	if err := m.switchToSession(id, session); err != nil {
 		return err
 	}
 
@@ -234,6 +231,28 @@ func (m *Manager) Switch(id string) error {
 	m.emitSwitchEvent(id)
 
 	return nil
+}
+
+func (m *Manager) ensureOpen() error {
+	if m.closed.Load() {
+		return ErrManagerClosed
+	}
+	return nil
+}
+
+func (m *Manager) getSessionOrErr(id string) (*Session, error) {
+	session, ok := m.Get(id)
+	if !ok {
+		return nil, ErrSessionNotFound
+	}
+	return session, nil
+}
+
+func (m *Manager) switchToSession(id string, session *Session) error {
+	if err := m.pauseActiveSession(id); err != nil {
+		return err
+	}
+	return m.activateSession(session)
 }
 
 func (m *Manager) pauseActiveSession(targetID string) error {
@@ -290,34 +309,38 @@ func (m *Manager) emitSwitchEvent(id string) {
 
 // Pause pauses a session
 func (m *Manager) Pause(id string) error {
-	if m.closed.Load() {
-		return ErrManagerClosed
+	if err := m.ensureOpen(); err != nil {
+		return err
 	}
 
-	session, ok := m.Get(id)
-	if !ok {
-		return ErrSessionNotFound
+	session, err := m.getSessionOrErr(id)
+	if err != nil {
+		return err
 	}
 
 	if err := session.Pause(); err != nil {
 		return err
 	}
 
-	// Persist if enabled
-	if m.persister != nil && session.Config().PersistenceEnabled {
-		if err := m.persister.Save(session); err != nil {
-			// Log but don't fail
-		}
-	}
+	m.persistSessionIfEnabled(session)
+	m.emitPauseEvent(id)
 
-	// Emit event
+	return nil
+}
+
+func (m *Manager) persistSessionIfEnabled(session *Session) {
+	if m.persister == nil || !session.Config().PersistenceEnabled {
+		return
+	}
+	_ = m.persister.Save(session)
+}
+
+func (m *Manager) emitPauseEvent(id string) {
 	m.emitEvent(&Event{
 		Type:      EventPaused,
 		SessionID: id,
 		Timestamp: time.Now(),
 	})
-
-	return nil
 }
 
 // Resume resumes a paused session
@@ -347,74 +370,100 @@ func (m *Manager) Resume(id string) error {
 
 // Suspend suspends a session to disk
 func (m *Manager) Suspend(id string) error {
-	if m.closed.Load() {
-		return ErrManagerClosed
-	}
-
-	session, ok := m.Get(id)
-	if !ok {
-		return ErrSessionNotFound
-	}
-
-	if err := session.Suspend(); err != nil {
+	if err := m.ensureOpen(); err != nil {
 		return err
 	}
 
-	// Persist session state
-	if m.persister != nil {
-		if err := m.persister.Save(session); err != nil {
-			return err
-		}
+	session, err := m.getSessionOrErr(id)
+	if err != nil {
+		return err
 	}
 
-	// Emit event
+	return m.suspendSession(session, id)
+}
+
+func (m *Manager) suspendSession(session *Session, id string) error {
+	if err := session.Suspend(); err != nil {
+		return err
+	}
+	if err := m.persistSession(session); err != nil {
+		return err
+	}
+
+	m.emitSuspendEvent(id)
+	return nil
+}
+
+func (m *Manager) persistSession(session *Session) error {
+	if m.persister == nil {
+		return nil
+	}
+	return m.persister.Save(session)
+}
+
+func (m *Manager) emitSuspendEvent(id string) {
 	m.emitEvent(&Event{
 		Type:      EventSuspended,
 		SessionID: id,
 		Timestamp: time.Now(),
 	})
-
-	return nil
 }
 
 // Restore restores a suspended session
 func (m *Manager) Restore(id string) error {
-	if m.closed.Load() {
-		return ErrManagerClosed
+	if err := m.ensureOpen(); err != nil {
+		return err
 	}
 
-	session, ok := m.Get(id)
-	if !ok {
-		// Try to load from persistence
-		if m.persister != nil {
-			loaded, err := m.persister.Load(id)
-			if err != nil {
-				return ErrSessionNotFound
-			}
-			session = loaded
-
-			// Add to manager
-			shard := m.getShard(id)
-			shard.mu.Lock()
-			shard.sessions[id] = session
-			shard.mu.Unlock()
-		} else {
-			return ErrSessionNotFound
-		}
+	session, err := m.getOrLoadSession(id)
+	if err != nil {
+		return err
 	}
 
 	if err := session.Resume(); err != nil {
 		return err
 	}
 
-	// Emit event
+	m.emitRestoreEvent(id)
+
+	return nil
+}
+
+func (m *Manager) getOrLoadSession(id string) (*Session, error) {
+	session, ok := m.Get(id)
+	if ok {
+		return session, nil
+	}
+	return m.loadSession(id)
+}
+
+func (m *Manager) loadSession(id string) (*Session, error) {
+	if m.persister == nil {
+		return nil, ErrSessionNotFound
+	}
+
+	loaded, err := m.persister.Load(id)
+	if err != nil {
+		return nil, ErrSessionNotFound
+	}
+
+	m.addSession(id, loaded)
+	return loaded, nil
+}
+
+func (m *Manager) addSession(id string, session *Session) {
+	shard := m.getShard(id)
+	shard.mu.Lock()
+	shard.sessions[id] = session
+	shard.mu.Unlock()
+}
+
+func (m *Manager) emitRestoreEvent(id string) {
 	m.emitEvent(&Event{
 		Type:      EventRestored,
 		SessionID: id,
 		Timestamp: time.Now(),
 	})
-
-	return nil
 }
 
 // Close closes and removes a session
@@ -628,15 +677,14 @@ func (m *Manager) Stats() ManagerStats {
 }
 
 func applySessionStateStats(stats *ManagerStats, state State) {
-	switch state {
-	case StateActive:
-		stats.ActiveSessions++
-	case StatePaused:
-		stats.PausedSessions++
-	case StateCompleted:
-		stats.CompletedSessions++
-	case StateFailed:
-		stats.FailedSessions++
+	updaters := map[State]func(){
+		StateActive:    func() { stats.ActiveSessions++ },
+		StatePaused:    func() { stats.PausedSessions++ },
+		StateCompleted: func() { stats.CompletedSessions++ },
+		StateFailed:    func() { stats.FailedSessions++ },
+	}
+	if update, ok := updaters[state]; ok {
+		update()
 	}
 }
 

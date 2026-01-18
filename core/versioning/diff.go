@@ -189,9 +189,6 @@ func (d *MyersDiffer) extendDiagonal(base, target []string, x, y, n, m int) (int
 	return x, y
 }
 
-func (d *MyersDiffer) _ignoreParams() {
-}
-
 func (d *MyersDiffer) backtrackArray(trace [][]int, n, m, offset int) []editOp {
 	ops := make([]editOp, 0)
 	x, y := n, m
@@ -354,7 +351,7 @@ func (d *MyersDiffer) clampEnd(end, total int) int {
 
 func (d *MyersDiffer) findStartPositions(ops []editOp, contextStart int) (int, int) {
 	oldStart, newStart := 0, 0
-	for i := 0; i < contextStart; i++ {
+	for i := range contextStart {
 		op := ops[i]
 		if op.opType != DiffLineAdd {
 			oldStart++
@@ -440,9 +437,10 @@ func (d *MyersDiffer) countHunkStats(stats *DiffStats, hunk DiffHunk) {
 }
 
 func (d *MyersDiffer) countLineType(stats *DiffStats, lineType DiffLineType) {
-	if lineType == DiffLineAdd {
+	switch lineType {
+	case DiffLineAdd:
 		stats.Additions++
-	} else if lineType == DiffLineDelete {
+	case DiffLineDelete:
 		stats.Deletions++
 	}
 }

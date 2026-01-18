@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,7 +83,7 @@ type sessionSnapshot struct {
 // NewSession creates a new session with the given configuration
 func NewSession(cfg Config) *Session {
 	now := time.Now()
-	id := uuid.New().String()
+	id := uuid.NewString()
 
 	if cfg.Name == "" {
 		cfg.Name = "session-" + id[:8]
@@ -179,13 +180,28 @@ func (s *Session) trackActiveDuration(oldState, newState State) {
 }
 
 func (s *Session) recordStateTiming(oldState, newState State) {
-	switch newState {
-	case StateActive:
-		if oldState == StateCreated || oldState == StatePaused || oldState == StateSuspended {
-			s.startedAt = time.Now()
-		}
-	case StatePaused:
+	if newState == StatePaused {
 		s.pausedAt = time.Now()
+		return
+	}
+
+	if !s.shouldStartTiming(oldState, newState) {
+		return
+	}
+
+	s.startedAt = time.Now()
+}
+
+func (s *Session) shouldStartTiming(oldState, newState State) bool {
+	if newState != StateActive {
+		return false
+	}
+
+	switch oldState {
+	case StateCreated, StatePaused, StateSuspended:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -260,9 +276,7 @@ func (s *Session) Metadata() map[string]any {
 	defer s.mu.RUnlock()
 
 	result := make(map[string]any, len(s.metadata))
-	for k, v := range s.metadata {
-		result[k] = v
-	}
+	maps.Copy(result, s.metadata)
 	return result
 }
 
