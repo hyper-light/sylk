@@ -12361,13 +12361,13 @@ FH.9 (Integration Tests) depends on ALL above
 - `core/session/agent_supervisor_health.go` (or extend existing)
 
 **Acceptance Criteria:**
-- [ ] `MonitorHealth(ctx context.Context)` method on AgentSupervisor
-- [ ] Ticker at MonitorInterval (5s)
-- [ ] Range over all active agents, call healthScorer.Assess()
-- [ ] If status >= StatusStuck, call recovery.HandleStuckAgent()
-- [ ] Check deadlockDet.Check() and call recovery.HandleDeadlock() for each result
-- [ ] Goroutine exits on ctx.Done()
-- [ ] RecoveryOrchestrator injected into AgentSupervisor
+- [x] `MonitorHealth(ctx context.Context)` method on AgentSupervisor
+- [x] Ticker at MonitorInterval (5s)
+- [x] Range over all active agents, call healthScorer.Assess()
+- [x] If status >= StatusStuck, call recovery.HandleStuckAgent()
+- [x] Check deadlockDet.Check() and call recovery.HandleDeadlock() for each result
+- [x] Goroutine exits on ctx.Done()
+- [x] RecoveryOrchestrator injected into AgentSupervisor
 
 **Implementation Guidelines:**
 - MonitorHealth runs as background goroutine per AgentSupervisor
@@ -12375,10 +12375,10 @@ FH.9 (Integration Tests) depends on ALL above
 - StatusStuck threshold for intervention (not Warning)
 
 **Tests:**
-- [ ] MonitorHealth runs at correct interval
-- [ ] Stuck agents trigger HandleStuckAgent
-- [ ] Deadlocks trigger HandleDeadlock
-- [ ] Goroutine exits cleanly on context cancel
+- [x] MonitorHealth runs at correct interval
+- [x] Stuck agents trigger HandleStuckAgent
+- [x] Deadlocks trigger HandleDeadlock
+- [x] Goroutine exits cleanly on context cancel
 
 ---
 
@@ -12388,12 +12388,12 @@ FH.9 (Integration Tests) depends on ALL above
 - `core/tools/executor.go`
 
 **Acceptance Criteria:**
-- [ ] ToolExecutor receives ProgressCollector dependency
-- [ ] After tool.Run(), emit ProgressSignal with SignalToolCompleted
-- [ ] Operation = fmt.Sprintf("%s:%s", tool.Name(), tool.Target())
-- [ ] Compute hash with hashOperation(name, target)
-- [ ] Also record Operation in RepetitionDetector
-- [ ] Signal emitted regardless of success/failure (activity is activity)
+- [x] ToolExecutor receives ProgressCollector dependency
+- [x] After tool.Run(), emit ProgressSignal with SignalToolCompleted
+- [x] Operation = fmt.Sprintf("%s:%s", tool.Name(), tool.Target())
+- [x] Compute hash with hashOperation(name, target)
+- [x] Also record Operation in RepetitionDetector
+- [x] Signal emitted regardless of success/failure (activity is activity)
 
 **Implementation Guidelines:**
 - Use context to get agentID and sessionID
@@ -12401,9 +12401,9 @@ FH.9 (Integration Tests) depends on ALL above
 - RepetitionDetector.Record() for each tool execution
 
 **Tests:**
-- [ ] Tool execution emits progress signal
-- [ ] Hash is consistent for same operation
-- [ ] RepetitionDetector receives operation
+- [x] Tool execution emits progress signal
+- [x] Hash is consistent for same operation
+- [x] RepetitionDetector receives operation
 
 ---
 
@@ -12413,19 +12413,19 @@ FH.9 (Integration Tests) depends on ALL above
 - `core/llm/client.go` (or equivalent)
 
 **Acceptance Criteria:**
-- [ ] LLMClient receives ProgressCollector dependency
-- [ ] On successful Complete(), emit ProgressSignal with SignalLLMResponse
-- [ ] Operation = "llm:complete" (or include model name)
-- [ ] Signal only on success (failed calls don't indicate progress)
-- [ ] Use context for agentID
+- [x] LLMClient receives ProgressCollector dependency
+- [x] On successful Complete(), emit ProgressSignal with SignalLLMResponse
+- [x] Operation = "llm:complete" (or include model name)
+- [x] Signal only on success (failed calls don't indicate progress)
+- [x] Use context for agentID
 
 **Implementation Guidelines:**
 - Check err == nil before emitting signal
 - Could include model/provider in Operation for debugging
 
 **Tests:**
-- [ ] Successful LLM call emits signal
-- [ ] Failed LLM call does not emit signal
+- [x] Successful LLM call emits signal
+- [x] Failed LLM call does not emit signal
 
 ---
 
@@ -12435,19 +12435,19 @@ FH.9 (Integration Tests) depends on ALL above
 - `core/routing/agent_router.go` (or equivalent)
 
 **Acceptance Criteria:**
-- [ ] AgentRouter receives ProgressCollector dependency
-- [ ] On Dispatch(from, to, msg), emit ProgressSignal with SignalAgentRequest
-- [ ] Operation = fmt.Sprintf("agent:%s", to)
-- [ ] Signal emitted for 'from' agent (sender shows activity)
-- [ ] Agent-to-agent communication is explicit sign of life
+- [x] AgentRouter receives ProgressCollector dependency
+- [x] On Dispatch(from, to, msg), emit ProgressSignal with SignalAgentRequest
+- [x] Operation = fmt.Sprintf("agent:%s", to)
+- [x] Signal emitted for 'from' agent (sender shows activity)
+- [x] Agent-to-agent communication is explicit sign of life
 
 **Implementation Guidelines:**
 - This is the critical "agent communication = alive" signal
 - Emit even if dispatch fails (attempt shows activity)
 
 **Tests:**
-- [ ] Agent dispatch emits signal for sender
-- [ ] Operation includes target agent ID
+- [x] Agent dispatch emits signal for sender
+- [x] Operation includes target agent ID
 
 ---
 
@@ -12457,23 +12457,23 @@ FH.9 (Integration Tests) depends on ALL above
 - `core/recovery/stuck_agent_integration_test.go`
 
 **Acceptance Criteria:**
-- [ ] Test healthy agent: continuous signals → StatusHealthy
-- [ ] Test stale agent: no signals for 30s → StatusStuck
-- [ ] Test repetitive automation: same ops but with signals → StatusHealthy
-- [ ] Test stuck loop: same ops AND stale → StatusStuck
-- [ ] Test soft intervention: verify breakout prompt injected
-- [ ] Test user escalation: verify UI modal triggered
-- [ ] Test force kill: verify resources released, agent terminated
-- [ ] Test user Wait: verify no force kill after timeout
-- [ ] Test deadlock detection: circular and dead holder
-- [ ] Test eager release: dead holder resources released immediately
-- [ ] Test recovery notification: agent notified to re-acquire
-- [ ] Race condition test: run with `-race` flag
+- [x] Test healthy agent: continuous signals → StatusHealthy
+- [x] Test stale agent: no signals for 30s → StatusStuck
+- [x] Test repetitive automation: same ops but with signals → StatusHealthy
+- [x] Test stuck loop: same ops AND stale → StatusStuck
+- [x] Test soft intervention: verify breakout prompt injected
+- [x] Test user escalation: verify UI modal triggered
+- [x] Test force kill: verify resources released, agent terminated
+- [x] Test user Wait: verify no force kill after timeout
+- [x] Test deadlock detection: circular and dead holder
+- [x] Test eager release: dead holder resources released immediately
+- [x] Test recovery notification: agent notified to re-acquire
+- [x] Race condition test: run with `-race` flag
 
 **Tests:**
-- [ ] All integration tests pass
-- [ ] No race conditions detected
-- [ ] Recovery hierarchy works correctly
+- [x] All integration tests pass
+- [x] No race conditions detected
+- [x] Recovery hierarchy works correctly
 
 ---
 
