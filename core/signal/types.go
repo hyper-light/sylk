@@ -18,6 +18,11 @@ const (
 	AbortSession   Signal = "abort_session"
 	QuotaWarning   Signal = "quota_warning"
 	StateChanged   Signal = "state_changed"
+
+	// Memory pressure signals
+	EvictCaches           Signal = "evict_caches"
+	CompactContexts       Signal = "compact_contexts"
+	MemoryPressureChanged Signal = "memory_pressure_changed"
 )
 
 // SignalMessage represents a signal sent through the bus.
@@ -68,6 +73,9 @@ func ValidSignals() []Signal {
 		AbortSession,
 		QuotaWarning,
 		StateChanged,
+		EvictCaches,
+		CompactContexts,
+		MemoryPressureChanged,
 	}
 }
 
@@ -76,6 +84,25 @@ type StateChangePayload struct {
 	FromState string
 	ToState   string
 	Error     error
+}
+
+type EvictCachesPayload struct {
+	Percent     float64
+	TargetBytes int64
+	Reason      string
+}
+
+type CompactContextsPayload struct {
+	TargetID string
+	All      bool
+	Reason   string
+}
+
+type MemoryPressurePayload struct {
+	From      string
+	To        string
+	Usage     float64
+	Timestamp time.Time
 }
 
 // NewSignalMessage creates a new signal message with defaults.
