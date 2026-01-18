@@ -432,42 +432,6 @@ func TestBackpressureDecisionZeroValue(t *testing.T) {
 	}
 }
 
-// MockBudgetGetter is a mock implementation of BudgetGetter for testing.
-type MockBudgetGetter struct {
-	sessionUsage map[string]float64
-	taskUsage    map[string]float64
-}
-
-// NewMockBudgetGetter creates a new mock budget getter.
-func NewMockBudgetGetter() *MockBudgetGetter {
-	return &MockBudgetGetter{
-		sessionUsage: make(map[string]float64),
-		taskUsage:    make(map[string]float64),
-	}
-}
-
-// SetSessionUsage sets the usage for a session.
-func (m *MockBudgetGetter) SetSessionUsage(sessionID string, usage float64) {
-	m.sessionUsage[sessionID] = usage
-}
-
-// SetTaskUsage sets the usage for a task.
-func (m *MockBudgetGetter) SetTaskUsage(sessionID, taskID string, usage float64) {
-	key := sessionID + ":" + taskID
-	m.taskUsage[key] = usage
-}
-
-// GetUsagePercent implements BudgetGetter.
-func (m *MockBudgetGetter) GetUsagePercent(sessionID string) float64 {
-	return m.sessionUsage[sessionID]
-}
-
-// GetTaskUsagePercent implements BudgetGetter.
-func (m *MockBudgetGetter) GetTaskUsagePercent(sessionID, taskID string) float64 {
-	key := sessionID + ":" + taskID
-	return m.taskUsage[key]
-}
-
 // TestBudgetGetterInterface verifies the BudgetGetter interface.
 func TestBudgetGetterInterface(t *testing.T) {
 	mock := NewMockBudgetGetter()
