@@ -90,6 +90,7 @@ type ToolExecutor struct {
 	timeoutFactory TimeoutFactory
 	killManager    KillExecutor
 	cleanupManager *CancellationManager
+	signalHolder   *signalEmitterHolder
 
 	mu           sync.RWMutex
 	activeGroups map[int]*ProcessGroup
@@ -100,6 +101,8 @@ type ToolExecutor struct {
 	cleanupMu     sync.Mutex
 	cleanupOnce   sync.Once
 	cleanupByTool map[string]func(context.Context) error
+
+	waitSem chan struct{}
 }
 
 type ToolExecutorDeps struct {
@@ -116,6 +119,7 @@ func NewToolExecutor(cfg ToolExecutorConfig, deps *ToolExecutorDeps) *ToolExecut
 		config:        cfg,
 		activeGroups:  make(map[int]*ProcessGroup),
 		cleanupByTool: make(map[string]func(context.Context) error),
+		waitSem:       make(chan struct{}, 1),
 	}
 
 	if deps != nil {
@@ -469,9 +473,9 @@ func (e *ToolExecutor) runAndWait(ctx context.Context, toolID string, pg *Proces
 	}
 
 	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- pg.Wait()
-	}()
+	if err := e.waitWithContext(pg, waitDone); err != nil {
+		return nil, err
+	}
 
 	result := e.waitWithAdaptiveTimeout(ctx, toolID, pg, waitDone, inv, stdout, stderr)
 	result.Duration = time.Since(startTime)
@@ -488,6 +492,20 @@ func (e *ToolExecutor) trackProcessGroup(pg *ProcessGroup) {
 	e.groupCounter++
 	e.activeGroups[e.groupCounter] = pg
 	e.mu.Unlock()
+}
+
+func (e *ToolExecutor) waitWithContext(pg *ProcessGroup, waitDone chan<- error) error {
+	select {
+	case e.waitSem <- struct{}{}:
+		defer func() { <-e.waitSem }()
+	default:
+		return ErrPoolExhausted
+	}
+
+	go func() {
+		waitDone <- pg.Wait()
+	}()
+	return nil
 }
 
 func (e *ToolExecutor) untrackProcessGroup(pg *ProcessGroup) {
