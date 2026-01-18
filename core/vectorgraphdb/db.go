@@ -238,3 +238,28 @@ func (v *VectorGraphDB) GetSchemaVersion() (int, error) {
 	}
 	return version, nil
 }
+
+// WithProtection wraps VectorGraphDB with full protection mechanisms.
+// It creates a ProtectedVectorDB with the provided vector index, snapshot manager,
+// and protection configuration. The caller is responsible for providing properly
+// initialized dependencies to avoid circular imports with the hnsw package.
+func (v *VectorGraphDB) WithProtection(
+	vectorIndex VectorIndex,
+	snapshotMgr SnapshotManager,
+	cfg ProtectionConfig,
+) (*ProtectedVectorDB, error) {
+	return NewProtectedVectorDB(ProtectedDBDeps{
+		DB:          v,
+		VectorIndex: vectorIndex,
+		SnapshotMgr: snapshotMgr,
+	}, cfg)
+}
+
+// WithDefaultProtection creates a protected DB with default configuration.
+// The caller must provide the vector index and snapshot manager implementations.
+func (v *VectorGraphDB) WithDefaultProtection(
+	vectorIndex VectorIndex,
+	snapshotMgr SnapshotManager,
+) (*ProtectedVectorDB, error) {
+	return v.WithProtection(vectorIndex, snapshotMgr, DefaultProtectionConfig())
+}

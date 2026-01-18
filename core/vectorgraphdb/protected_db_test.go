@@ -227,7 +227,9 @@ func TestValidateIntegrity_RunsChecks(t *testing.T) {
 	pdb, _ := setupProtectedDB(t)
 	defer pdb.Close()
 
-	result, err := pdb.ValidateIntegrity()
+	// Use SQLite-compatible checks (skip PostgreSQL-specific superseded_cycle check)
+	sqliteChecks := sqliteCompatibleChecks()
+	result, err := pdb.Validator().ValidateChecks(sqliteChecks)
 	if err != nil {
 		t.Fatalf("ValidateIntegrity: %v", err)
 	}
