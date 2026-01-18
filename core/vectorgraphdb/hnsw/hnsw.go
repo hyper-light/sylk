@@ -435,3 +435,15 @@ func (h *Index) GetEntryPoint() string {
 func (h *Index) GetMaxLevel() int {
 	return h.maxLevel
 }
+
+// GetDomains returns the domains map for snapshot creation.
+// Caller must hold at least a read lock.
+func (h *Index) GetDomains() map[string]vectorgraphdb.Domain {
+	return h.domains
+}
+
+// GetNodeTypes returns the node types map for snapshot creation.
+// Caller must hold at least a read lock.
+func (h *Index) GetNodeTypes() map[string]vectorgraphdb.NodeType {
+	return h.nodeTypes
+}

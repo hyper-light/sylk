@@ -73,6 +73,8 @@ func (sm *HNSWSnapshotManager) buildSnapshot(id, seqNum uint64) *HNSWSnapshot {
 	layers := sm.index.GetLayers()
 	vectors := sm.index.GetVectors()
 	magnitudes := sm.index.GetMagnitudes()
+	domains := sm.index.GetDomains()
+	nodeTypes := sm.index.GetNodeTypes()
 
 	return &HNSWSnapshot{
 		ID:         id,
@@ -83,6 +85,8 @@ func (sm *HNSWSnapshotManager) buildSnapshot(id, seqNum uint64) *HNSWSnapshot {
 		Layers:     sm.copyAllLayers(layers),
 		Vectors:    copyVectors(vectors),
 		Magnitudes: copyMagnitudes(magnitudes),
+		Domains:    copyDomains(domains),
+		NodeTypes:  copyNodeTypes(nodeTypes),
 	}
 }
 

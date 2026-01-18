@@ -1,0 +1,515 @@
+package hnsw
+
+import (
+	"math"
+	"sync"
+	"testing"
+
+	"github.com/adalundhe/sylk/core/vectorgraphdb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func createTestIndex(t *testing.T) *Index {
+	t.Helper()
+	idx := New(DefaultConfig())
+	return idx
+}
+
+func createPopulatedIndex(t *testing.T) *Index {
+	t.Helper()
+	idx := New(DefaultConfig())
+
+	vectors := []struct {
+		id       string
+		vec      []float32
+		domain   vectorgraphdb.Domain
+		nodeType vectorgraphdb.NodeType
+	}{
+		{"vec1", []float32{1.0, 0.0, 0.0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFunction},
+		{"vec2", []float32{0.9, 0.1, 0.0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFunction},
+		{"vec3", []float32{0.0, 1.0, 0.0}, vectorgraphdb.DomainHistory, vectorgraphdb.NodeTypeHistoryEntry},
+		{"vec4", []float32{0.0, 0.9, 0.1}, vectorgraphdb.DomainHistory, vectorgraphdb.NodeTypeSession},
+		{"vec5", []float32{0.0, 0.0, 1.0}, vectorgraphdb.DomainAcademic, vectorgraphdb.NodeTypePaper},
+	}
+
+	for _, v := range vectors {
+		err := idx.Insert(v.id, v.vec, v.domain, v.nodeType)
+		require.NoError(t, err)
+	}
+
+	return idx
+}
+
+func TestSnapshot_Search_EmptySnapshot(t *testing.T) {
+	snap := NewHNSWSnapshot(nil, 1)
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, 5, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_KZero(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, 0, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_NegativeK(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, -1, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_EmptyQuery(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{}, 5, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_NilQuery(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search(nil, 5, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_ZeroMagnitudeQuery(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{0.0, 0.0, 0.0}, 5, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_BasicSearch(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, 2, nil)
+
+	require.NotNil(t, results)
+	require.Len(t, results, 2)
+	// vec1 should be the closest (exact match)
+	assert.Equal(t, "vec1", results[0].ID)
+	// vec2 should be second (0.9, 0.1, 0.0) is close to (1.0, 0.0, 0.0)
+	assert.Equal(t, "vec2", results[1].ID)
+}
+
+func TestSnapshot_Search_ReturnsMetadata(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, 1, nil)
+
+	require.Len(t, results, 1)
+	assert.Equal(t, vectorgraphdb.DomainCode, results[0].Domain)
+	assert.Equal(t, vectorgraphdb.NodeTypeFunction, results[0].NodeType)
+}
+
+func TestSnapshot_Search_SameResultsAsLiveSearch_Quiescent(t *testing.T) {
+	idx := createPopulatedIndex(t)
+
+	// Get live search results
+	liveResults := idx.Search([]float32{1.0, 0.0, 0.0}, 5, nil)
+
+	// Get snapshot search results
+	snap := NewHNSWSnapshot(idx, 1)
+	snapResults := snap.Search([]float32{1.0, 0.0, 0.0}, 5, nil)
+
+	require.Equal(t, len(liveResults), len(snapResults))
+	for i := range liveResults {
+		assert.Equal(t, liveResults[i].ID, snapResults[i].ID)
+		assert.InDelta(t, liveResults[i].Similarity, snapResults[i].Similarity, 0.0001)
+	}
+}
+
+func TestSnapshot_Search_UnaffectedByConcurrentInserts(t *testing.T) {
+	idx := createPopulatedIndex(t)
+
+	// Create snapshot before concurrent inserts
+	snap := NewHNSWSnapshot(idx, 1)
+	initialSize := snap.Size()
+
+	// Perform concurrent inserts
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			vec := []float32{float32(id) * 0.1, 0.5, 0.5}
+			err := idx.Insert(
+				"concurrent"+string(rune('A'+id)),
+				vec,
+				vectorgraphdb.DomainCode,
+				vectorgraphdb.NodeTypeFunction,
+			)
+			assert.NoError(t, err)
+		}(i)
+	}
+	wg.Wait()
+
+	// Verify snapshot size unchanged
+	assert.Equal(t, initialSize, snap.Size())
+
+	// Verify snapshot search still works and doesn't see new inserts
+	results := snap.Search([]float32{0.5, 0.5, 0.5}, 10, nil)
+	for _, r := range results {
+		assert.NotContains(t, r.ID, "concurrent")
+	}
+
+	// Verify live index sees the new inserts
+	assert.Greater(t, idx.Size(), initialSize)
+}
+
+func TestSnapshot_Search_FilterByDomain(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	filter := &SearchFilter{
+		Domains: []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+	}
+
+	results := snap.Search([]float32{0.5, 0.5, 0.5}, 10, filter)
+
+	for _, r := range results {
+		assert.Equal(t, vectorgraphdb.DomainCode, r.Domain)
+	}
+}
+
+func TestSnapshot_Search_FilterByNodeType(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	filter := &SearchFilter{
+		NodeTypes: []vectorgraphdb.NodeType{vectorgraphdb.NodeTypeFunction},
+	}
+
+	results := snap.Search([]float32{0.5, 0.5, 0.5}, 10, filter)
+
+	for _, r := range results {
+		assert.Equal(t, vectorgraphdb.NodeTypeFunction, r.NodeType)
+	}
+}
+
+func TestSnapshot_Search_FilterByMinSimilarity(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	filter := &SearchFilter{
+		MinSimilarity: 0.9,
+	}
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, 10, filter)
+
+	for _, r := range results {
+		assert.GreaterOrEqual(t, r.Similarity, 0.9)
+	}
+}
+
+func TestSnapshot_Search_FilterCombined(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	filter := &SearchFilter{
+		Domains:       []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		NodeTypes:     []vectorgraphdb.NodeType{vectorgraphdb.NodeTypeFunction},
+		MinSimilarity: 0.5,
+	}
+
+	results := snap.Search([]float32{0.5, 0.5, 0.5}, 10, filter)
+
+	for _, r := range results {
+		assert.Equal(t, vectorgraphdb.DomainCode, r.Domain)
+		assert.Equal(t, vectorgraphdb.NodeTypeFunction, r.NodeType)
+		assert.GreaterOrEqual(t, r.Similarity, 0.5)
+	}
+}
+
+func TestSnapshot_Search_FilterExcludesAll(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	// Filter for a domain that doesn't exist in results
+	filter := &SearchFilter{
+		MinSimilarity: 0.999,
+	}
+
+	// Search for something that won't have exact matches
+	results := snap.Search([]float32{0.33, 0.33, 0.33}, 10, filter)
+
+	// Should have no results since nothing has similarity >= 0.999
+	assert.Empty(t, results)
+}
+
+func TestSnapshot_Search_KLargerThanResults(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, 100, nil)
+
+	// Should return all vectors (5 in test index)
+	assert.LessOrEqual(t, len(results), 5)
+}
+
+func TestSnapshot_greedySearchLayer_OutOfBoundsLevel(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	// Try to search at level beyond what exists
+	result := snap.greedySearchLayer([]float32{1.0, 0.0, 0.0}, 1.0, snap.EntryPoint, 100)
+	assert.Equal(t, snap.EntryPoint, result)
+}
+
+func TestSnapshot_distance_MissingVector(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Vectors:    make(map[string][]float32),
+		Magnitudes: make(map[string]float64),
+	}
+
+	dist := snap.distance([]float32{1.0, 0.0}, 1.0, "nonexistent")
+	assert.Equal(t, math.MaxFloat64, dist)
+}
+
+func TestSnapshot_distance_MissingMagnitude(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Vectors:    map[string][]float32{"test": {1.0, 0.0}},
+		Magnitudes: make(map[string]float64),
+	}
+
+	dist := snap.distance([]float32{1.0, 0.0}, 1.0, "test")
+	assert.Equal(t, math.MaxFloat64, dist)
+}
+
+func TestSnapshot_Search_ConcurrentReads(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	var wg sync.WaitGroup
+	numReaders := 100
+
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results := snap.Search([]float32{1.0, 0.0, 0.0}, 5, nil)
+			assert.NotNil(t, results)
+			assert.NotEmpty(t, results)
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestSnapshot_getDomain_NilDomainsMap(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: nil,
+	}
+
+	domain := snap.getDomain("any")
+	assert.Equal(t, vectorgraphdb.DomainCode, domain)
+}
+
+func TestSnapshot_getNodeType_NilNodeTypesMap(t *testing.T) {
+	snap := &HNSWSnapshot{
+		NodeTypes: nil,
+	}
+
+	nodeType := snap.getNodeType("any")
+	assert.Equal(t, vectorgraphdb.NodeTypeFile, nodeType)
+}
+
+func TestSnapshot_getDomain_MissingID(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: map[string]vectorgraphdb.Domain{
+			"exists": vectorgraphdb.DomainHistory,
+		},
+	}
+
+	domain := snap.getDomain("nonexistent")
+	assert.Equal(t, vectorgraphdb.DomainCode, domain)
+}
+
+func TestSnapshot_getNodeType_MissingID(t *testing.T) {
+	snap := &HNSWSnapshot{
+		NodeTypes: map[string]vectorgraphdb.NodeType{
+			"exists": vectorgraphdb.NodeTypeFunction,
+		},
+	}
+
+	nodeType := snap.getNodeType("nonexistent")
+	assert.Equal(t, vectorgraphdb.NodeTypeFile, nodeType)
+}
+
+func TestSnapshot_Search_NoEntryPoint(t *testing.T) {
+	snap := &HNSWSnapshot{
+		EntryPoint: "",
+		MaxLevel:   0,
+		Vectors:    map[string][]float32{"vec1": {1.0, 0.0}},
+		Magnitudes: map[string]float64{"vec1": 1.0},
+		Layers:     []LayerSnapshot{{Nodes: map[string][]string{"vec1": {}}}},
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 5, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_isValidSearchInput(t *testing.T) {
+	tests := []struct {
+		name       string
+		entryPoint string
+		query      []float32
+		k          int
+		expected   bool
+	}{
+		{"empty entry point", "", []float32{1.0}, 5, false},
+		{"empty query", "ep", []float32{}, 5, false},
+		{"nil query", "ep", nil, 5, false},
+		{"k zero", "ep", []float32{1.0}, 0, false},
+		{"k negative", "ep", []float32{1.0}, -1, false},
+		{"valid", "ep", []float32{1.0}, 5, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := &HNSWSnapshot{EntryPoint: tc.entryPoint}
+			result := snap.isValidSearchInput(tc.query, tc.k)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestSnapshot_getLayerNeighbors(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {"neighbor1", "neighbor2"}}},
+		},
+	}
+
+	t.Run("valid level and node", func(t *testing.T) {
+		neighbors := snap.getLayerNeighbors("node1", 0)
+		assert.Equal(t, []string{"neighbor1", "neighbor2"}, neighbors)
+	})
+
+	t.Run("level out of bounds", func(t *testing.T) {
+		neighbors := snap.getLayerNeighbors("node1", 5)
+		assert.Nil(t, neighbors)
+	})
+
+	t.Run("missing node", func(t *testing.T) {
+		neighbors := snap.getLayerNeighbors("nonexistent", 0)
+		assert.Nil(t, neighbors)
+	})
+}
+
+func TestSnapshot_findCloserNeighbor(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Vectors:    map[string][]float32{"n1": {1.0, 0.0}, "n2": {0.5, 0.5}},
+		Magnitudes: map[string]float64{"n1": 1.0, "n2": 0.707},
+	}
+
+	query := []float32{1.0, 0.0}
+	queryMag := 1.0
+
+	t.Run("finds closer neighbor", func(t *testing.T) {
+		improved, newNode, newDist := snap.findCloserNeighbor(query, queryMag, []string{"n1"}, 1.0)
+		assert.True(t, improved)
+		assert.Equal(t, "n1", newNode)
+		assert.Less(t, newDist, 1.0)
+	})
+
+	t.Run("no improvement", func(t *testing.T) {
+		improved, _, _ := snap.findCloserNeighbor(query, queryMag, []string{"n2"}, 0.0)
+		assert.False(t, improved)
+	})
+
+	t.Run("empty neighbors", func(t *testing.T) {
+		improved, _, _ := snap.findCloserNeighbor(query, queryMag, []string{}, 0.5)
+		assert.False(t, improved)
+	})
+}
+
+func TestSnapshot_passesMinSimilarity(t *testing.T) {
+	snap := &HNSWSnapshot{}
+
+	assert.True(t, snap.passesMinSimilarity(0.8, 0))
+	assert.True(t, snap.passesMinSimilarity(0.8, -1))
+	assert.True(t, snap.passesMinSimilarity(0.8, 0.8))
+	assert.True(t, snap.passesMinSimilarity(0.9, 0.8))
+	assert.False(t, snap.passesMinSimilarity(0.7, 0.8))
+}
+
+func TestSnapshot_passesDomainFilter(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: map[string]vectorgraphdb.Domain{
+			"code":    vectorgraphdb.DomainCode,
+			"history": vectorgraphdb.DomainHistory,
+		},
+	}
+
+	assert.True(t, snap.passesDomainFilter("code", nil))
+	assert.True(t, snap.passesDomainFilter("code", []vectorgraphdb.Domain{}))
+	assert.True(t, snap.passesDomainFilter("code", []vectorgraphdb.Domain{vectorgraphdb.DomainCode}))
+	assert.False(t, snap.passesDomainFilter("code", []vectorgraphdb.Domain{vectorgraphdb.DomainHistory}))
+}
+
+func TestSnapshot_passesNodeTypeFilter(t *testing.T) {
+	snap := &HNSWSnapshot{
+		NodeTypes: map[string]vectorgraphdb.NodeType{
+			"func":  vectorgraphdb.NodeTypeFunction,
+			"paper": vectorgraphdb.NodeTypePaper,
+		},
+	}
+
+	assert.True(t, snap.passesNodeTypeFilter("func", nil))
+	assert.True(t, snap.passesNodeTypeFilter("func", []vectorgraphdb.NodeType{}))
+	assert.True(t, snap.passesNodeTypeFilter("func", []vectorgraphdb.NodeType{vectorgraphdb.NodeTypeFunction}))
+	assert.False(t, snap.passesNodeTypeFilter("func", []vectorgraphdb.NodeType{vectorgraphdb.NodeTypePaper}))
+}
+
+func TestSnapshot_createSearchResult(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Vectors:    map[string][]float32{"exists": {1.0, 0.0}},
+		Magnitudes: map[string]float64{"exists": 1.0},
+	}
+
+	t.Run("existing vector", func(t *testing.T) {
+		result := snap.createSearchResult([]float32{1.0, 0.0}, 1.0, "exists")
+		require.NotNil(t, result)
+		assert.Equal(t, "exists", result.ID)
+		assert.InDelta(t, 1.0, result.Similarity, 0.0001)
+	})
+
+	t.Run("missing vector", func(t *testing.T) {
+		result := snap.createSearchResult([]float32{1.0, 0.0}, 1.0, "missing")
+		assert.Nil(t, result)
+	})
+
+	t.Run("missing magnitude", func(t *testing.T) {
+		snap.Vectors["nomag"] = []float32{1.0, 0.0}
+		result := snap.createSearchResult([]float32{1.0, 0.0}, 1.0, "nomag")
+		assert.Nil(t, result)
+	})
+}
+
+func TestSnapshot_sortCandidates(t *testing.T) {
+	snap := &HNSWSnapshot{}
+
+	candidates := []SearchResult{
+		{ID: "low", Similarity: 0.3},
+		{ID: "high", Similarity: 0.9},
+		{ID: "mid", Similarity: 0.6},
+	}
+
+	sorted := snap.sortCandidates(candidates)
+
+	assert.Equal(t, "high", sorted[0].ID)
+	assert.Equal(t, "mid", sorted[1].ID)
+	assert.Equal(t, "low", sorted[2].ID)
+}

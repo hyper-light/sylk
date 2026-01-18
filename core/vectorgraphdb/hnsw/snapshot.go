@@ -3,6 +3,8 @@ package hnsw
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
 
 // LayerSnapshot represents an immutable snapshot of a layer's state.
@@ -19,10 +21,12 @@ type HNSWSnapshot struct {
 	CreatedAt  time.Time
 	EntryPoint string
 	MaxLevel   int
-	Layers     []LayerSnapshot      // frozen layer state (copied)
-	Vectors    map[string][]float32 // frozen vector cache
-	Magnitudes map[string]float64   // frozen magnitudes
-	readers    atomic.Int32         // active reader count
+	Layers     []LayerSnapshot                    // frozen layer state (copied)
+	Vectors    map[string][]float32               // frozen vector cache
+	Magnitudes map[string]float64                 // frozen magnitudes
+	Domains    map[string]vectorgraphdb.Domain    // frozen domain metadata
+	NodeTypes  map[string]vectorgraphdb.NodeType  // frozen node type metadata
+	readers    atomic.Int32                       // active reader count
 }
 
 // NewLayerSnapshot creates a deep copy of a layer's nodes.
@@ -87,6 +91,8 @@ func NewHNSWSnapshot(idx *Index, seqNum uint64) *HNSWSnapshot {
 			Layers:     make([]LayerSnapshot, 0),
 			Vectors:    make(map[string][]float32),
 			Magnitudes: make(map[string]float64),
+			Domains:    make(map[string]vectorgraphdb.Domain),
+			NodeTypes:  make(map[string]vectorgraphdb.NodeType),
 		}
 	}
 	return createSnapshotFromIndex(idx, seqNum)
@@ -102,6 +108,8 @@ func createSnapshotFromIndex(idx *Index, seqNum uint64) *HNSWSnapshot {
 		Layers:     copyLayers(idx.layers),
 		Vectors:    copyVectors(idx.vectors),
 		Magnitudes: copyMagnitudes(idx.magnitudes),
+		Domains:    copyDomains(idx.domains),
+		NodeTypes:  copyNodeTypes(idx.nodeTypes),
 	}
 }
 
@@ -138,6 +146,24 @@ func copyMagnitudes(magnitudes map[string]float64) map[string]float64 {
 	result := make(map[string]float64, len(magnitudes))
 	for id, mag := range magnitudes {
 		result[id] = mag
+	}
+	return result
+}
+
+// copyDomains creates a copy of the domains map.
+func copyDomains(domains map[string]vectorgraphdb.Domain) map[string]vectorgraphdb.Domain {
+	result := make(map[string]vectorgraphdb.Domain, len(domains))
+	for id, domain := range domains {
+		result[id] = domain
+	}
+	return result
+}
+
+// copyNodeTypes creates a copy of the node types map.
+func copyNodeTypes(nodeTypes map[string]vectorgraphdb.NodeType) map[string]vectorgraphdb.NodeType {
+	result := make(map[string]vectorgraphdb.NodeType, len(nodeTypes))
+	for id, nodeType := range nodeTypes {
+		result[id] = nodeType
 	}
 	return result
 }

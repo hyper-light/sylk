@@ -703,6 +703,10 @@ type GraphNode struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 	ExpiresAt    time.Time `json:"expires_at,omitempty"`
 	SupersededBy string    `json:"superseded_by,omitempty"`
+
+	// Version is used for optimistic concurrency control.
+	// It is incremented on each update and checked during writes.
+	Version uint64 `json:"version,omitempty"`
 }
 
 // GraphEdge represents a directed edge between two nodes in the knowledge graph.
