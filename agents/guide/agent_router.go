@@ -67,6 +67,9 @@ type TieredRouter struct {
 	dlq            *DeadLetterQueue
 	retryQueue     *RetryQueue
 
+	// Signal emission for progress tracking
+	signals *routerSignals
+
 	// Running state
 	running bool
 }
@@ -176,6 +179,7 @@ func NewTieredRouter(cfg TieredRouterConfig) (*TieredRouter, error) {
 		pendingCleanup:   pendingCleanup,
 		dlq:              dlq,
 		retryQueue:       retryQueue,
+		signals:          newRouterSignals(),
 	}, nil
 }
 
@@ -397,6 +401,9 @@ func (r *TieredRouter) TriggerAction(ctx context.Context, targetAgentID, action 
 		r.removeOutbound(correlationID)
 		return "", fmt.Errorf("failed to publish action to %s: %w", targetTopic, err)
 	}
+
+	// Emit progress signal - programmatic action is agent-to-agent communication
+	r.emitActionSignal(targetAgentID)
 
 	return correlationID, nil
 }
@@ -635,6 +642,9 @@ func (r *TieredRouter) routeDirect(ctx context.Context, correlationID, targetAge
 		return "", fmt.Errorf("failed to publish to %s: %w", targetTopic, err)
 	}
 
+	// Emit progress signal - agent-to-agent communication is a sign of life
+	r.emitDirectRouteSignal(targetAgentID)
+
 	return correlationID, nil
 }
 
@@ -667,6 +677,9 @@ func (r *TieredRouter) routeViaGuide(ctx context.Context, correlationID, input s
 		r.circuits.RecordFailure("guide")
 		return "", fmt.Errorf("failed to publish to guide: %w", err)
 	}
+
+	// Emit progress signal - routing to Guide is agent-to-agent communication
+	r.emitGuideRouteSignal()
 
 	return correlationID, nil
 }
