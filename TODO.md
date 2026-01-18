@@ -12580,19 +12580,20 @@ ALL ─────────────────────────�
 
 ---
 
-### SC.3 HNSWSnapshot Search Implementation
+### SC.3 HNSWSnapshot Search Implementation ✅ COMPLETED
 
-**Files to create:**
+**Files created:**
 - `core/vectorgraphdb/hnsw/snapshot_search.go`
+- `core/vectorgraphdb/hnsw/snapshot_search_test.go`
 
 **Acceptance Criteria:**
-- [ ] `Search(query []float32, k int, filter *SearchFilter) []SearchResult`: search on frozen state
-- [ ] `searchFromEntry(query, queryMag, k, filter)`: navigate layers top-down
-- [ ] `greedySearchLayer(query, queryMag, entry, level)`: greedy search within layer
-- [ ] `searchLayer0(query, queryMag, entry, k, filter)`: beam search in layer 0
-- [ ] `distance(query, queryMag, nodeID)`: cosine distance using frozen vectors
-- [ ] All methods use snapshot's frozen Layers/Vectors/Magnitudes
-- [ ] No locks required during search (snapshot is immutable)
+- [x] `Search(query []float32, k int, filter *SearchFilter) []SearchResult`: search on frozen state
+- [x] `searchFromEntry(query, queryMag, k, filter)`: navigate layers top-down
+- [x] `greedySearchLayer(query, queryMag, entry, level)`: greedy search within layer
+- [x] `searchLayer0(query, queryMag, entry, k, filter)`: beam search in layer 0
+- [x] `distance(query, queryMag, nodeID)`: cosine distance using frozen vectors
+- [x] All methods use snapshot's frozen Layers/Vectors/Magnitudes
+- [x] No locks required during search (snapshot is immutable)
 
 **Implementation Guidelines:**
 - Port existing HNSW search logic to use LayerSnapshot.Nodes
@@ -12601,10 +12602,10 @@ ALL ─────────────────────────�
 - Filter support same as live search
 
 **Tests:**
-- [ ] Snapshot search returns same results as live search (quiescent)
-- [ ] Snapshot search unaffected by concurrent inserts
-- [ ] Filter correctly applied
-- [ ] Empty snapshot returns nil
+- [x] Snapshot search returns same results as live search (quiescent)
+- [x] Snapshot search unaffected by concurrent inserts
+- [x] Filter correctly applied
+- [x] Empty snapshot returns nil
 
 ---
 
@@ -12634,17 +12635,18 @@ ALL ─────────────────────────�
 
 ---
 
-### SC.5 VersionedNodeStore
+### SC.5 VersionedNodeStore ✅ COMPLETED
 
-**Files to create:**
+**Files created:**
 - `core/vectorgraphdb/versioned_nodes.go`
+- `core/vectorgraphdb/versioned_nodes_test.go`
 
 **Acceptance Criteria:**
-- [ ] `VersionedNodeStore` wraps `*NodeStore` with version tracking
-- [ ] `versionCache sync.Map` for fast version lookups
-- [ ] `GetNodeWithVersion(nodeID) (*GraphNode, error)`: returns node with Version field populated
-- [ ] `GetNodeVersion(nodeID) (uint64, error)`: fast version lookup (cache or DB)
-- [ ] Cache updated on writes, invalidated on conflicts
+- [x] `VersionedNodeStore` wraps `*NodeStore` with version tracking
+- [x] `versionCache sync.Map` for fast version lookups
+- [x] `GetNodeWithVersion(nodeID) (*GraphNode, error)`: returns node with Version field populated
+- [x] `GetNodeVersion(nodeID) (uint64, error)`: fast version lookup (cache or DB)
+- [x] Cache updated on writes, invalidated on conflicts (InvalidateVersionCache)
 
 **Implementation Guidelines:**
 - Extend existing NodeStore, don't replace
@@ -12652,9 +12654,9 @@ ALL ─────────────────────────�
 - Version field added to GraphNode struct (if not present)
 
 **Tests:**
-- [ ] GetNodeWithVersion returns correct version
-- [ ] Cache populated after read
-- [ ] Cache updated after write
+- [x] GetNodeWithVersion returns correct version
+- [x] Cache populated after read
+- [x] Cache updated after write
 
 ---
 
