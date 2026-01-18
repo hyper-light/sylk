@@ -2,6 +2,7 @@ package guide_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -273,9 +274,9 @@ func TestHeartbeatSender_StartStop(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	var received int
+	var received int64
 	_, err := bus.Subscribe("agents.heartbeat", func(msg *guide.Message) error {
-		received++
+		atomic.AddInt64(&received, 1)
 		return nil
 	})
 	require.NoError(t, err)
@@ -289,7 +290,7 @@ func TestHeartbeatSender_StartStop(t *testing.T) {
 	sender.Stop()
 
 	// Should have received multiple heartbeats
-	assert.Greater(t, received, 1)
+	assert.Greater(t, atomic.LoadInt64(&received), int64(1))
 
 	// Double stop should be safe
 	sender.Stop()

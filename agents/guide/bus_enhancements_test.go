@@ -383,6 +383,7 @@ func setupSessionBus(t *testing.T) (*ChannelBus, *SessionBus) {
 	sb, err := NewSessionBus(bus, SessionBusConfig{
 		SessionID:       "test-session",
 		EnableWildcards: true,
+		Scope:           nil,
 	})
 	if err != nil {
 		t.Fatalf("failed to create session bus: %v", err)
@@ -487,6 +488,7 @@ func TestSessionBus_Close(t *testing.T) {
 	sb, err := NewSessionBus(bus, SessionBusConfig{
 		SessionID:       "test-session",
 		EnableWildcards: false,
+		Scope:           nil,
 	})
 	if err != nil {
 		t.Fatalf("failed to create session bus: %v", err)
@@ -520,6 +522,7 @@ func TestSessionBus_GlobalTopics(t *testing.T) {
 	sb, err := NewSessionBus(bus, SessionBusConfig{
 		SessionID:       "test-session",
 		EnableWildcards: false,
+		Scope:           nil,
 	})
 	if err != nil {
 		t.Fatalf("failed to create session bus: %v", err)
@@ -577,7 +580,7 @@ func TestSessionBusManager_GetOrCreate(t *testing.T) {
 	assertActiveSessionCount(t, manager, 2)
 }
 
-func newSessionBusManager(t *testing.T, cfg SessionBusManagerConfig) (*SessionBusManager, func()) {
+func newSessionBusManager(_ *testing.T, cfg SessionBusManagerConfig) (*SessionBusManager, func()) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	manager := NewSessionBusManager(bus, cfg)
 	return manager, func() {
@@ -632,6 +635,7 @@ func TestSessionBusManager_Close(t *testing.T) {
 			closedSessions = append(closedSessions, sessionID)
 			mu.Unlock()
 		},
+		Scope: nil,
 	})
 
 	// Create sessions
@@ -666,7 +670,7 @@ func TestSessionBusManager_CloseAll(t *testing.T) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	defer bus.Close()
 
-	manager := NewSessionBusManager(bus, SessionBusManagerConfig{})
+	manager := NewSessionBusManager(bus, SessionBusManagerConfig{Scope: nil})
 
 	// Create sessions
 	_, _ = manager.GetOrCreate("session-1")
@@ -689,7 +693,7 @@ func TestSessionBusManager_ActiveSessionIDs(t *testing.T) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	defer bus.Close()
 
-	manager := NewSessionBusManager(bus, SessionBusManagerConfig{})
+	manager := NewSessionBusManager(bus, SessionBusManagerConfig{Scope: nil})
 
 	_, _ = manager.GetOrCreate("session-a")
 	_, _ = manager.GetOrCreate("session-b")
@@ -723,7 +727,7 @@ func TestTopicRouter_Concurrent(t *testing.T) {
 	handler := func(msg *Message) error { return nil }
 
 	// Concurrent subscriptions and matches
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		wg.Add(2)
 
 		go func(i int) {
@@ -746,12 +750,12 @@ func TestSessionBusManager_Concurrent(t *testing.T) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	defer bus.Close()
 
-	manager := NewSessionBusManager(bus, SessionBusManagerConfig{})
+	manager := NewSessionBusManager(bus, SessionBusManagerConfig{Scope: nil})
 
 	var wg sync.WaitGroup
 
 	// Concurrent GetOrCreate
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

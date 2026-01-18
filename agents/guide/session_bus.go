@@ -1,10 +1,13 @@
 package guide
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 // =============================================================================
@@ -48,6 +51,10 @@ type SessionBus struct {
 	// State
 	closed atomic.Bool
 
+	wildcardSem chan struct{}
+	scope       *concurrency.GoroutineScope
+	wildcardTTL time.Duration
+
 	// Statistics
 	stats sessionBusStats
 }
@@ -76,6 +83,9 @@ type SessionBusConfig struct {
 
 	// EnableWildcards enables wildcard topic matching
 	EnableWildcards bool
+	Scope           *concurrency.GoroutineScope
+	WildcardTimeout time.Duration
+	NotifyTimeout   time.Duration
 }
 
 // sessionSubscription tracks a session-scoped subscription
@@ -102,6 +112,9 @@ func NewSessionBus(bus EventBus, cfg SessionBusConfig) (*SessionBus, error) {
 		bus:           bus,
 		sessionID:     cfg.SessionID,
 		subscriptions: make([]*sessionSubscription, 0),
+		wildcardSem:   make(chan struct{}, 32),
+		scope:         cfg.Scope,
+		wildcardTTL:   cfg.WildcardTimeout,
 	}
 
 	if cfg.EnableWildcards {
@@ -304,16 +317,49 @@ func (sb *SessionBus) routeToWildcardSubscribers(topic string, msg *Message) {
 
 func (sb *SessionBus) runWildcardHandler(handler MessageHandler, msg *Message) {
 	atomic.AddInt64(&sb.stats.wildcardMatches, 1)
+	if sb.scope == nil {
+		sb.runWildcardHandlerDirect(handler, msg)
+		return
+	}
+	sb.runWildcardHandlerWithScope(handler, msg)
+}
+
+func (sb *SessionBus) runWildcardHandlerDirect(handler MessageHandler, msg *Message) {
 	go func() {
 		defer sb.recoverWildcardPanic()
 		_ = handler(msg)
 	}()
 }
 
+func (sb *SessionBus) runWildcardHandlerWithScope(handler MessageHandler, msg *Message) {
+	select {
+	case sb.wildcardSem <- struct{}{}:
+		_ = sb.scope.Go("guide.sessionbus.wildcard_handler", sb.wildcardTimeout(), func(ctx context.Context) error {
+			defer func() {
+				<-sb.wildcardSem
+				sb.recoverWildcardPanic()
+			}()
+			_ = handler(msg)
+			return nil
+		})
+	default:
+	}
+}
+
 func (sb *SessionBus) recoverWildcardPanic() {
 	if r := recover(); r != nil {
 		// Handler panicked - ignore
 	}
+}
+
+func (sb *SessionBus) wildcardTimeout() time.Duration {
+	if sb.scope == nil {
+		return 0
+	}
+	if sb.wildcardTTL != 0 {
+		return sb.wildcardTTL
+	}
+	return 5 * time.Second
 }
 
 // Close closes the session bus and all session-scoped subscriptions
@@ -501,6 +547,8 @@ type SessionBusManager struct {
 	// Configuration
 	config SessionBusManagerConfig
 
+	scope *concurrency.GoroutineScope
+
 	// Statistics
 	stats sessionBusManagerStats
 }
@@ -514,6 +562,9 @@ type sessionBusManagerStats struct {
 type SessionBusManagerConfig struct {
 	// EnableWildcards enables wildcard matching for all session buses
 	EnableWildcards bool
+
+	Scope         *concurrency.GoroutineScope
+	NotifyTimeout time.Duration
 
 	// OnSessionCreated is called when a session bus is created
 	OnSessionCreated func(sessionID string, bus *SessionBus)
@@ -535,6 +586,7 @@ func NewSessionBusManager(bus EventBus, cfg SessionBusManagerConfig) *SessionBus
 		sessions: make(map[string]*SessionBus),
 		bus:      bus,
 		config:   cfg,
+		scope:    cfg.Scope,
 	}
 }
 
@@ -582,13 +634,16 @@ func (m *SessionBusManager) buildSessionBus(sessionID string) (*SessionBus, erro
 	return NewSessionBus(m.bus, SessionBusConfig{
 		SessionID:       sessionID,
 		EnableWildcards: m.config.EnableWildcards,
+		Scope:           m.scope,
+		WildcardTimeout: m.config.NotifyTimeout,
 	})
 }
 
 func (m *SessionBusManager) notifySessionCreated(sessionID string, sb *SessionBus) {
-	if m.config.OnSessionCreated != nil {
-		go m.config.OnSessionCreated(sessionID, sb)
+	if m.config.OnSessionCreated == nil {
+		return
 	}
+	m.runNotify("guide.sessionbus.session_created", m.config.OnSessionCreated, sessionID, sb)
 }
 
 // Get returns an existing session bus or nil
@@ -612,7 +667,9 @@ func (m *SessionBusManager) Close(sessionID string) error {
 	atomic.AddInt64(&m.stats.sessionsClosed, 1)
 
 	if m.config.OnSessionClosed != nil {
-		go m.config.OnSessionClosed(sessionID)
+		m.runNotify("guide.sessionbus.session_closed", func(id string, _ *SessionBus) {
+			m.config.OnSessionClosed(id)
+		}, sessionID, nil)
 	}
 
 	return sb.Close()
@@ -656,6 +713,24 @@ func (m *SessionBusManager) ActiveSessionIDs() []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+func (m *SessionBusManager) runNotify(desc string, handler func(string, *SessionBus), sessionID string, sb *SessionBus) {
+	if m.scope == nil {
+		handler(sessionID, sb)
+		return
+	}
+	_ = m.scope.Go(desc, m.notifyTimeout(), func(ctx context.Context) error {
+		handler(sessionID, sb)
+		return nil
+	})
+}
+
+func (m *SessionBusManager) notifyTimeout() time.Duration {
+	if m.config.NotifyTimeout != 0 {
+		return m.config.NotifyTimeout
+	}
+	return 5 * time.Second
 }
 
 // =============================================================================

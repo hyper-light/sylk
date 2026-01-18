@@ -1,6 +1,7 @@
 package guide
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -263,11 +264,11 @@ func TestDeadLetterQueue_Stats(t *testing.T) {
 }
 
 func TestDeadLetterQueue_OnAddCallback(t *testing.T) {
-	called := false
+	var called int32
 	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{
 		MaxSize: 100,
 		OnAdd: func(letter *DeadLetter) {
-			called = true
+			atomic.StoreInt32(&called, 1)
 		},
 	})
 
@@ -278,7 +279,7 @@ func TestDeadLetterQueue_OnAddCallback(t *testing.T) {
 	// Give callback goroutine time to run
 	time.Sleep(10 * time.Millisecond)
 
-	if !called {
+	if atomic.LoadInt32(&called) != 1 {
 		t.Error("expected OnAdd callback to be called")
 	}
 }
