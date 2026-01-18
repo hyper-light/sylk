@@ -194,3 +194,104 @@ func TestProcessGroup_WaitWithoutStart(t *testing.T) {
 	err := pg.Wait()
 	require.NoError(t, err)
 }
+
+func TestOrphanTracker_Track(t *testing.T) {
+	tracker := NewOrphanTracker(time.Minute)
+
+	entry := tracker.Track(1234, "test-proc")
+
+	assert.Equal(t, 1234, entry.PID)
+	assert.Equal(t, "test-proc", entry.Description)
+	assert.True(t, entry.StillAlive)
+	assert.Equal(t, 1, tracker.Count())
+}
+
+func TestOrphanTracker_Remove(t *testing.T) {
+	tracker := NewOrphanTracker(time.Minute)
+
+	tracker.Track(1234, "test-proc")
+	assert.Equal(t, 1, tracker.Count())
+
+	tracker.Remove(1234)
+	assert.Equal(t, 0, tracker.Count())
+}
+
+func TestOrphanTracker_Get(t *testing.T) {
+	tracker := NewOrphanTracker(time.Minute)
+
+	tracker.Track(1234, "test-proc")
+
+	entry, ok := tracker.Get(1234)
+	assert.True(t, ok)
+	assert.Equal(t, 1234, entry.PID)
+
+	_, ok = tracker.Get(9999)
+	assert.False(t, ok)
+}
+
+func TestOrphanTracker_List(t *testing.T) {
+	tracker := NewOrphanTracker(time.Minute)
+
+	tracker.Track(1, "proc-1")
+	tracker.Track(2, "proc-2")
+	tracker.Track(3, "proc-3")
+
+	list := tracker.List()
+	assert.Len(t, list, 3)
+}
+
+func TestOrphanTracker_OnOrphan(t *testing.T) {
+	tracker := NewOrphanTracker(time.Minute)
+
+	var callbackEntry *OrphanEntry
+	tracker.OnOrphan(func(entry *OrphanEntry) {
+		callbackEntry = entry
+	})
+
+	tracker.Track(5678, "callback-test")
+
+	assert.NotNil(t, callbackEntry)
+	assert.Equal(t, 5678, callbackEntry.PID)
+}
+
+func TestOrphanedProcessError_Error(t *testing.T) {
+	err := &OrphanedProcessError{PID: 1234, Description: "test-process"}
+
+	msg := err.Error()
+	assert.Contains(t, msg, "orphaned process")
+	assert.Contains(t, msg, "1234")
+	assert.Contains(t, msg, "test-process")
+}
+
+func TestExtendedKillSequenceManager_DefaultConfig(t *testing.T) {
+	cfg := DefaultExtendedKillSequenceConfig()
+
+	assert.Equal(t, DefaultSIGINTGrace, cfg.SIGINTGrace)
+	assert.Equal(t, DefaultSIGTERMGrace, cfg.SIGTERMGrace)
+	assert.Equal(t, 500*time.Millisecond, cfg.ForceCloseWait)
+}
+
+func TestExtendedKillSequenceManager_HasOrphanTracker(t *testing.T) {
+	mgr := NewExtendedKillSequenceManager(DefaultExtendedKillSequenceConfig())
+
+	assert.NotNil(t, mgr.OrphanTracker())
+}
+
+func TestExtendedKillSequenceManager_CustomOrphanTracker(t *testing.T) {
+	tracker := NewOrphanTracker(time.Hour)
+
+	cfg := DefaultExtendedKillSequenceConfig()
+	cfg.OrphanTracker = tracker
+
+	mgr := NewExtendedKillSequenceManager(cfg)
+
+	assert.Same(t, tracker, mgr.OrphanTracker())
+}
+
+func TestKillPhase_Values(t *testing.T) {
+	assert.Equal(t, KillPhase(0), KillPhaseSIGINT)
+	assert.Equal(t, KillPhase(1), KillPhaseSIGTERM)
+	assert.Equal(t, KillPhase(2), KillPhaseSIGKILL)
+	assert.Equal(t, KillPhase(3), KillPhaseForceCloseResources)
+	assert.Equal(t, KillPhase(4), KillPhaseOrphanTracking)
+}

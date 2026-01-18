@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"fmt"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -8,6 +10,16 @@ import (
 const (
 	DefaultSIGINTGrace  = 5 * time.Second
 	DefaultSIGTERMGrace = 3 * time.Second
+)
+
+type KillPhase int
+
+const (
+	KillPhaseSIGINT KillPhase = iota
+	KillPhaseSIGTERM
+	KillPhaseSIGKILL
+	KillPhaseForceCloseResources
+	KillPhaseOrphanTracking
 )
 
 type KillSequenceConfig struct {
@@ -151,4 +163,202 @@ func (m *KillSequenceManager) SIGTERMGrace() time.Duration {
 
 func (m *KillSequenceManager) TotalGrace() time.Duration {
 	return m.config.SIGINTGrace + m.config.SIGTERMGrace
+}
+
+type OrphanedProcessError struct {
+	PID         int
+	Description string
+}
+
+func (e *OrphanedProcessError) Error() string {
+	return fmt.Sprintf("orphaned process: pid=%d desc=%s", e.PID, e.Description)
+}
+
+type OrphanTracker struct {
+	mu       sync.RWMutex
+	orphans  map[int]*OrphanEntry
+	maxAge   time.Duration
+	onOrphan func(entry *OrphanEntry)
+}
+
+type OrphanEntry struct {
+	PID         int
+	Description string
+	TrackedAt   time.Time
+	LastChecked time.Time
+	StillAlive  bool
+}
+
+func NewOrphanTracker(maxAge time.Duration) *OrphanTracker {
+	if maxAge <= 0 {
+		maxAge = 30 * time.Minute
+	}
+	return &OrphanTracker{
+		orphans: make(map[int]*OrphanEntry),
+		maxAge:  maxAge,
+	}
+}
+
+func (t *OrphanTracker) Track(pid int, description string) *OrphanEntry {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	entry := &OrphanEntry{
+		PID:         pid,
+		Description: description,
+		TrackedAt:   time.Now(),
+		LastChecked: time.Now(),
+		StillAlive:  true,
+	}
+	t.orphans[pid] = entry
+
+	if t.onOrphan != nil {
+		t.onOrphan(entry)
+	}
+
+	return entry
+}
+
+func (t *OrphanTracker) Remove(pid int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.orphans, pid)
+}
+
+func (t *OrphanTracker) Get(pid int) (*OrphanEntry, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	entry, ok := t.orphans[pid]
+	return entry, ok
+}
+
+func (t *OrphanTracker) List() []*OrphanEntry {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	entries := make([]*OrphanEntry, 0, len(t.orphans))
+	for _, e := range t.orphans {
+		entries = append(entries, e)
+	}
+	return entries
+}
+
+func (t *OrphanTracker) Count() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.orphans)
+}
+
+func (t *OrphanTracker) OnOrphan(fn func(entry *OrphanEntry)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.onOrphan = fn
+}
+
+type ExtendedKillResult struct {
+	KillResult
+	ForcedClose   bool
+	OrphanTracked bool
+	OrphanPID     int
+	Phase         KillPhase
+}
+
+type ExtendedKillSequenceConfig struct {
+	KillSequenceConfig
+	ForceCloseWait time.Duration
+	OrphanTracker  *OrphanTracker
+}
+
+func DefaultExtendedKillSequenceConfig() ExtendedKillSequenceConfig {
+	return ExtendedKillSequenceConfig{
+		KillSequenceConfig: DefaultKillSequenceConfig(),
+		ForceCloseWait:     500 * time.Millisecond,
+	}
+}
+
+type ExtendedKillSequenceManager struct {
+	config        ExtendedKillSequenceConfig
+	orphanTracker *OrphanTracker
+}
+
+func NewExtendedKillSequenceManager(cfg ExtendedKillSequenceConfig) *ExtendedKillSequenceManager {
+	cfg.KillSequenceConfig = normalizeKillSequenceConfig(cfg.KillSequenceConfig)
+	if cfg.ForceCloseWait <= 0 {
+		cfg.ForceCloseWait = 500 * time.Millisecond
+	}
+
+	tracker := cfg.OrphanTracker
+	if tracker == nil {
+		tracker = NewOrphanTracker(30 * time.Minute)
+	}
+
+	return &ExtendedKillSequenceManager{
+		config:        cfg,
+		orphanTracker: tracker,
+	}
+}
+
+func (m *ExtendedKillSequenceManager) ExecuteOnProcess(proc *TrackedProcess) (*ExtendedKillResult, error) {
+	startTime := time.Now()
+	result := &ExtendedKillResult{}
+
+	if m.trySignalSequence(proc, result) {
+		return m.finishExtendedResult(result, startTime), nil
+	}
+
+	if m.tryForceClose(proc, result) {
+		return m.finishExtendedResult(result, startTime), nil
+	}
+
+	return m.handleOrphan(proc, result, startTime)
+}
+
+func (m *ExtendedKillSequenceManager) trySignalSequence(proc *TrackedProcess, result *ExtendedKillResult) bool {
+	err := proc.ForceClose()
+	if err == nil {
+		result.Phase = KillPhaseSIGKILL
+		result.SentSIGKILL = true
+		result.ExitedAfter = "signal_sequence"
+		return true
+	}
+	return false
+}
+
+func (m *ExtendedKillSequenceManager) tryForceClose(proc *TrackedProcess, result *ExtendedKillResult) bool {
+	result.ForcedClose = true
+	result.Phase = KillPhaseForceCloseResources
+
+	select {
+	case <-proc.Done():
+		result.ExitedAfter = "force_close"
+		return true
+	case <-time.After(m.config.ForceCloseWait):
+		return false
+	}
+}
+
+func (m *ExtendedKillSequenceManager) handleOrphan(
+	proc *TrackedProcess,
+	result *ExtendedKillResult,
+	startTime time.Time,
+) (*ExtendedKillResult, error) {
+	result.Phase = KillPhaseOrphanTracking
+	result.OrphanTracked = true
+
+	pid := proc.Pid()
+	result.OrphanPID = pid
+
+	m.orphanTracker.Track(pid, proc.ID())
+
+	finalResult := m.finishExtendedResult(result, startTime)
+	return finalResult, &OrphanedProcessError{PID: pid, Description: proc.ID()}
+}
+
+func (m *ExtendedKillSequenceManager) finishExtendedResult(result *ExtendedKillResult, startTime time.Time) *ExtendedKillResult {
+	result.Duration = time.Since(startTime)
+	return result
+}
+
+func (m *ExtendedKillSequenceManager) OrphanTracker() *OrphanTracker {
+	return m.orphanTracker
 }
