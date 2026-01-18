@@ -3,6 +3,7 @@ package skills
 import (
 	"context"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/adalundhe/sylk/core/treesitter"
@@ -37,13 +38,13 @@ type DiscoverTestsOptions struct {
 	IncludeSubtests bool
 }
 
-func (t *TesterSkills) TsDiscoverTests(ctx context.Context, files []string, opts DiscoverTestsOptions) (*DiscoverTestsResult, error) {
+func (t *TesterSkills) TsDiscoverTests(ctx context.Context, files []string, _ DiscoverTestsOptions) (*DiscoverTestsResult, error) {
 	result := &DiscoverTestsResult{
 		Files: make([]FileTests, 0, len(files)),
 	}
 
 	for _, filePath := range files {
-		ft, err := t.discoverFileTests(ctx, filePath, opts)
+		ft, err := t.discoverFileTests(ctx, filePath)
 		if err != nil {
 			continue
 		}
@@ -56,7 +57,7 @@ func (t *TesterSkills) TsDiscoverTests(ctx context.Context, files []string, opts
 	return result, nil
 }
 
-func (t *TesterSkills) discoverFileTests(ctx context.Context, filePath string, opts DiscoverTestsOptions) (FileTests, error) {
+func (t *TesterSkills) discoverFileTests(ctx context.Context, filePath string) (FileTests, error) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return FileTests{}, err
@@ -88,7 +89,9 @@ func filterTestFunctions(functions []treesitter.FunctionInfo) []TestInfo {
 }
 
 func isTestFunction(name string) bool {
-	return strings.HasPrefix(name, "Test") || strings.HasPrefix(name, "test_")
+	return slices.ContainsFunc([]string{"Test", "test_"}, func(prefix string) bool {
+		return strings.HasPrefix(name, prefix)
+	})
 }
 
 type TestableFunctionsResult struct {
@@ -244,12 +247,19 @@ func classifyFunction(f treesitter.FunctionInfo, result *TestStructureResult) {
 }
 
 func isHelperFunction(name string) bool {
-	return strings.HasSuffix(name, "Helper") || strings.HasPrefix(name, "helper")
+	return slices.ContainsFunc([]string{"Helper", "helper"}, func(token string) bool {
+		if token == "Helper" {
+			return strings.HasSuffix(name, token)
+		}
+		return strings.HasPrefix(name, token)
+	})
 }
 
 func isSetupFunction(name string) bool {
 	lower := strings.ToLower(name)
-	return strings.Contains(lower, "setup") || strings.Contains(lower, "teardown")
+	return slices.ContainsFunc([]string{"setup", "teardown"}, func(token string) bool {
+		return strings.Contains(lower, token)
+	})
 }
 
 type AssertionsResult struct {
@@ -327,12 +337,7 @@ func isAssertionMethod(name string) bool {
 		"Equal", "NotEqual", "True", "False",
 		"Nil", "NotNil", "Contains", "Fail",
 	}
-	for _, m := range assertMethods {
-		if name == m {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(assertMethods, name)
 }
 
 type TestMappingResult struct {

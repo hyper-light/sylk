@@ -212,8 +212,8 @@ func extractNodeIdentifier(node *Node) string {
 
 func findChildContaining(parent *Node, offset uint) *Node {
 	count := parent.NamedChildCount()
-	for i := uint(0); i < count; i++ {
-		child := parent.NamedChild(i)
+	for i := range count {
+		child := parent.NamedChild(uint(i))
 		if childContainsOffset(child, offset) {
 			return child
 		}
@@ -229,10 +229,10 @@ func (m *TreeSitterManager) ResolveNodePath(tree *Tree, path []string) (*Node, e
 	if tree == nil || len(path) == 0 {
 		return nil, ErrInvalidPath
 	}
-	return resolveFromRoot(tree.RootNode(), tree.Source(), path)
+	return resolveFromRoot(tree.RootNode(), path)
 }
 
-func resolveFromRoot(root *Node, source []byte, path []string) (*Node, error) {
+func resolveFromRoot(root *Node, path []string) (*Node, error) {
 	current := root
 	i := 0
 
@@ -267,8 +267,8 @@ func extractNameFromPath(path []string, i int) (string, int) {
 
 func findMatchingChild(parent *Node, nodeType, name string) *Node {
 	count := parent.NamedChildCount()
-	for i := uint(0); i < count; i++ {
-		child := parent.NamedChild(i)
+	for i := range count {
+		child := parent.NamedChild(uint(i))
 		if matchesTypeAndName(child, nodeType, name) {
 			return child
 		}

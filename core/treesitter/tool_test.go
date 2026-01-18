@@ -2,6 +2,7 @@ package treesitter
 
 import (
 	"context"
+	"slices"
 	"testing"
 )
 
@@ -52,14 +53,7 @@ func TestToolListAvailableGrammars(t *testing.T) {
 		t.Error("expected at least one available grammar")
 	}
 
-	hasGo := false
-	for _, g := range grammars {
-		if g == "go" {
-			hasGo = true
-			break
-		}
-	}
-	if !hasGo {
+	if !slices.Contains(grammars, "go") {
 		t.Error("expected 'go' in available grammars")
 	}
 }

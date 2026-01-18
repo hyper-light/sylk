@@ -3,6 +3,7 @@ package skills
 import (
 	"context"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/adalundhe/sylk/core/treesitter"
@@ -57,7 +58,7 @@ func (d *DesignerSkills) TsExtractComponents(ctx context.Context, files []string
 	return result, nil
 }
 
-func (d *DesignerSkills) extractFileComponents(ctx context.Context, filePath string, opts ExtractComponentsOptions) (FileComponents, error) {
+func (d *DesignerSkills) extractFileComponents(ctx context.Context, filePath string, _ ExtractComponentsOptions) (FileComponents, error) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return FileComponents{}, err
@@ -184,7 +185,7 @@ func (d *DesignerSkills) TsFindStyles(ctx context.Context, files []string, opts 
 	return result, nil
 }
 
-func (d *DesignerSkills) findFileStyles(ctx context.Context, filePath string, opts FindStylesOptions) (FileStyles, error) {
+func (d *DesignerSkills) findFileStyles(ctx context.Context, filePath string, _ FindStylesOptions) (FileStyles, error) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return FileStyles{}, err
@@ -222,13 +223,7 @@ func collectStylesFromCaptures(captures []treesitter.ToolCapture, styles *[]Styl
 }
 
 func isStyleFunction(name string) bool {
-	styleFuncs := []string{"styled", "css", "createStyles", "makeStyles", "sx"}
-	for _, sf := range styleFuncs {
-		if name == sf {
-			return true
-		}
-	}
-	return false
+	return slices.Contains([]string{"styled", "css", "createStyles", "makeStyles", "sx"}, name)
 }
 
 var styleTypeMap = map[string]string{
@@ -397,12 +392,7 @@ func isCustomHook(name string) bool {
 		"useCallback", "useMemo", "useRef", "useLayoutEffect",
 		"useImperativeHandle", "useDebugValue",
 	}
-	for _, h := range standardHooks {
-		if name == h {
-			return false
-		}
-	}
-	return true
+	return !slices.Contains(standardHooks, name)
 }
 
 type AccessibilityResult struct {

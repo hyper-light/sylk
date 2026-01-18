@@ -188,7 +188,7 @@ func TestTreeCacheOperations(t *testing.T) {
 		defer m.Close()
 
 		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
@@ -644,7 +644,7 @@ func TestConcurrentParseVersion(t *testing.T) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -697,7 +697,7 @@ func foo() {}
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
