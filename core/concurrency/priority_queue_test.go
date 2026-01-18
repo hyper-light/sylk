@@ -165,3 +165,56 @@ func TestPipelinePriorityQueue_HeapProperty(t *testing.T) {
 func pipelineIDFromInt(i int) string {
 	return "p" + itoa(i)
 }
+
+func TestPipelinePriorityQueue_All(t *testing.T) {
+	pq := NewPipelinePriorityQueue()
+
+	now := time.Now()
+	pq.Push(&SchedulablePipeline{ID: "p1", Priority: PriorityHigh, SpawnTime: now})
+	pq.Push(&SchedulablePipeline{ID: "p2", Priority: PriorityLow, SpawnTime: now})
+	pq.Push(&SchedulablePipeline{ID: "p3", Priority: PriorityNormal, SpawnTime: now})
+
+	all := pq.All()
+
+	if len(all) != 3 {
+		t.Errorf("All() should return 3 items, got %d", len(all))
+	}
+
+	ids := make(map[string]bool)
+	for _, p := range all {
+		ids[p.ID] = true
+	}
+
+	if !ids["p1"] || !ids["p2"] || !ids["p3"] {
+		t.Error("All() should contain all pushed items")
+	}
+}
+
+func TestPipelinePriorityQueue_All_Empty(t *testing.T) {
+	pq := NewPipelinePriorityQueue()
+
+	all := pq.All()
+
+	if len(all) != 0 {
+		t.Errorf("All() on empty queue should return empty slice, got %d items", len(all))
+	}
+}
+
+func TestPipelinePriorityQueue_All_DoesNotModifyQueue(t *testing.T) {
+	pq := NewPipelinePriorityQueue()
+
+	now := time.Now()
+	pq.Push(&SchedulablePipeline{ID: "p1", Priority: PriorityHigh, SpawnTime: now})
+	pq.Push(&SchedulablePipeline{ID: "p2", Priority: PriorityLow, SpawnTime: now})
+
+	all := pq.All()
+	all[0] = nil
+
+	if pq.Len() != 2 {
+		t.Error("Modifying All() result should not affect queue")
+	}
+
+	if pq.Peek() == nil {
+		t.Error("Queue should still have items after modifying All() result")
+	}
+}

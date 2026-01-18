@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 // =============================================================================
@@ -32,6 +34,8 @@ type Scheduler struct {
 
 	// Closed
 	closed atomic.Bool
+
+	scope *concurrency.GoroutineScope
 }
 
 // Execution represents an active DAG execution
@@ -48,6 +52,8 @@ type SchedulerConfig struct {
 
 	// DefaultPolicy is the default execution policy
 	DefaultPolicy ExecutionPolicy
+
+	Scope *concurrency.GoroutineScope
 }
 
 // DefaultSchedulerConfig returns sensible defaults
@@ -59,9 +65,13 @@ func DefaultSchedulerConfig() SchedulerConfig {
 }
 
 // NewScheduler creates a new DAG scheduler
-func NewScheduler(cfg SchedulerConfig) *Scheduler {
+func NewScheduler(cfg SchedulerConfig, scope *concurrency.GoroutineScope) *Scheduler {
 	if cfg.MaxConcurrentDAGs <= 0 {
 		cfg.MaxConcurrentDAGs = 10
+	}
+
+	if scope == nil {
+		scope = cfg.Scope
 	}
 
 	return &Scheduler{
@@ -70,6 +80,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		dagSem:            make(chan struct{}, cfg.MaxConcurrentDAGs),
 		defaultPolicy:     cfg.DefaultPolicy,
 		handlers:          make([]EventHandler, 0),
+		scope:             scope,
 	}
 }
 
@@ -94,6 +105,15 @@ func (s *Scheduler) Submit(ctx context.Context, dag *DAG, dispatcher NodeDispatc
 
 	executor := s.createExecutor(dag)
 	s.registerExecution(dag, executor)
+
+	if s.scope != nil {
+		_ = s.scope.Go("dag.scheduler.run_execution", 0, func(ctx context.Context) error {
+			s.runExecution(ctx, dag, dispatcher, executor)
+			return nil
+		})
+		return dag.ID(), nil
+	}
+
 	s.runExecution(ctx, dag, dispatcher, executor)
 	return dag.ID(), nil
 }
@@ -123,7 +143,7 @@ func (s *Scheduler) createExecutor(dag *DAG) *Executor {
 	if policy.MaxConcurrency == 0 {
 		policy = s.defaultPolicy
 	}
-	executor := NewExecutor(policy)
+	executor := NewExecutor(policy, s.scope)
 	executor.Subscribe(func(event *Event) {
 		s.emitEvent(event)
 	})
@@ -137,13 +157,11 @@ func (s *Scheduler) registerExecution(dag *DAG, executor *Executor) {
 }
 
 func (s *Scheduler) runExecution(ctx context.Context, dag *DAG, dispatcher NodeDispatcher, executor *Executor) {
-	go func() {
-		defer s.releaseDAGSlot()
+	defer s.releaseDAGSlot()
 
-		result, err := executor.Execute(ctx, dag, dispatcher)
-		s.updateExecutionStatus(dag, result)
-		s.emitExecutionFailure(dag, result, err)
-	}()
+	result, err := executor.Execute(ctx, dag, dispatcher)
+	s.updateExecutionStatus(dag, result)
+	s.emitExecutionFailure(dag, result, err)
 }
 
 func (s *Scheduler) updateExecutionStatus(dag *DAG, result *DAGResult) {

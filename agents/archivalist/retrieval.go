@@ -57,7 +57,7 @@ func DefaultRetrievalOptions() RetrievalOptions {
 
 // SemanticRetriever provides multi-source retrieval for RAG
 type SemanticRetriever struct {
-	// SQLite with FTS5 for keyword search
+	// SQLite for relational storage (full-text search handled by Bleve)
 	db *sql.DB
 
 	// Embedding store for semantic search
@@ -89,10 +89,10 @@ func NewSemanticRetriever(cfg SemanticRetrieverConfig) (*SemanticRetriever, erro
 			return nil, fmt.Errorf("failed to open database: %w", err)
 		}
 
-		// Enable FTS5
-		if err := initFTS(db); err != nil {
+		// Initialize relational schema (full-text search handled by Bleve)
+		if err := initRetrievalSchema(db); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("failed to initialize FTS: %w", err)
+			return nil, fmt.Errorf("failed to initialize schema: %w", err)
 		}
 	}
 
@@ -104,10 +104,11 @@ func NewSemanticRetriever(cfg SemanticRetrieverConfig) (*SemanticRetriever, erro
 	}, nil
 }
 
-// initFTS initializes FTS5 tables
-func initFTS(db *sql.DB) error {
+// initRetrievalSchema initializes relational tables for content storage
+// NOTE: Full-text search is handled by Bleve, not SQLite FTS
+func initRetrievalSchema(db *sql.DB) error {
 	_, err := db.Exec(`
-		-- Main content table
+		-- Main content table (relational storage only)
 		CREATE TABLE IF NOT EXISTS retrieval_content (
 			id TEXT PRIMARY KEY,
 			content TEXT NOT NULL,
@@ -118,34 +119,7 @@ func initFTS(db *sql.DB) error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
-		-- FTS5 virtual table for full-text search
-		CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
-			content,
-			category,
-			type,
-			content='retrieval_content',
-			content_rowid='rowid'
-		);
-
-		-- Triggers to keep FTS in sync
-		CREATE TRIGGER IF NOT EXISTS content_ai AFTER INSERT ON retrieval_content BEGIN
-			INSERT INTO content_fts(rowid, content, category, type)
-			VALUES (new.rowid, new.content, new.category, new.type);
-		END;
-
-		CREATE TRIGGER IF NOT EXISTS content_ad AFTER DELETE ON retrieval_content BEGIN
-			INSERT INTO content_fts(content_fts, rowid, content, category, type)
-			VALUES ('delete', old.rowid, old.content, old.category, old.type);
-		END;
-
-		CREATE TRIGGER IF NOT EXISTS content_au AFTER UPDATE ON retrieval_content BEGIN
-			INSERT INTO content_fts(content_fts, rowid, content, category, type)
-			VALUES ('delete', old.rowid, old.content, old.category, old.type);
-			INSERT INTO content_fts(rowid, content, category, type)
-			VALUES (new.rowid, new.content, new.category, new.type);
-		END;
-
-		-- Indexes
+		-- Indexes for relational queries
 		CREATE INDEX IF NOT EXISTS idx_content_category ON retrieval_content(category);
 		CREATE INDEX IF NOT EXISTS idx_content_type ON retrieval_content(type);
 		CREATE INDEX IF NOT EXISTS idx_content_session ON retrieval_content(session_id);

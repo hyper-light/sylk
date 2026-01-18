@@ -110,33 +110,8 @@ func (a *Archive) initSchema() error {
 		FOREIGN KEY (session_id) REFERENCES sessions(id)
 	);
 
-	-- Full-text search index
-	CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-		id,
-		title,
-		content,
-		category,
-		content='entries',
-		content_rowid='rowid'
-	);
-
-	-- Triggers to keep FTS index in sync
-	CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
-		INSERT INTO entries_fts(id, title, content, category)
-		VALUES (new.id, new.title, new.content, new.category);
-	END;
-
-	CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
-		INSERT INTO entries_fts(entries_fts, id, title, content, category)
-		VALUES ('delete', old.id, old.title, old.content, old.category);
-	END;
-
-	CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
-		INSERT INTO entries_fts(entries_fts, id, title, content, category)
-		VALUES ('delete', old.id, old.title, old.content, old.category);
-		INSERT INTO entries_fts(id, title, content, category)
-		VALUES (new.id, new.title, new.content, new.category);
-	END;
+	-- NOTE: Full-text search is handled by Bleve, not SQLite FTS
+	-- SQLite is used for relational storage only
 
 	-- Entry links table for relationships
 	CREATE TABLE IF NOT EXISTS entry_links (
@@ -247,33 +222,7 @@ func (a *Archive) initSchema() error {
 		FOREIGN KEY (session_id) REFERENCES sessions(id)
 	);
 
-	-- Full-text search on summaries
-	CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(
-		id,
-		content,
-		scope,
-		level,
-		content='summaries',
-		content_rowid='rowid'
-	);
-
-	-- Triggers to keep summaries FTS in sync
-	CREATE TRIGGER IF NOT EXISTS summaries_ai AFTER INSERT ON summaries BEGIN
-		INSERT INTO summaries_fts(id, content, scope, level)
-		VALUES (new.id, new.content, new.scope, new.level);
-	END;
-
-	CREATE TRIGGER IF NOT EXISTS summaries_ad AFTER DELETE ON summaries BEGIN
-		INSERT INTO summaries_fts(summaries_fts, id, content, scope, level)
-		VALUES ('delete', old.id, old.content, old.scope, old.level);
-	END;
-
-	CREATE TRIGGER IF NOT EXISTS summaries_au AFTER UPDATE ON summaries BEGIN
-		INSERT INTO summaries_fts(summaries_fts, id, content, scope, level)
-		VALUES ('delete', old.id, old.content, old.scope, old.level);
-		INSERT INTO summaries_fts(id, content, scope, level)
-		VALUES (new.id, new.content, new.scope, new.level);
-	END;
+	-- NOTE: Full-text search on summaries is handled by Bleve, not SQLite FTS
 
 	-- Indexes for summaries
 	CREATE INDEX IF NOT EXISTS idx_summaries_level ON summaries(level);

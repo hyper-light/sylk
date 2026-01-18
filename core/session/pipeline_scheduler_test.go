@@ -392,3 +392,52 @@ func TestGlobalPipelineScheduler_CancelPipeline_Closed(t *testing.T) {
 		t.Error("expected false when closed")
 	}
 }
+
+func TestGlobalPipelineScheduler_GetActivePipelines(t *testing.T) {
+	scheduler := NewGlobalPipelineScheduler(PipelineSchedulerConfig{
+		MaxConcurrent: 1,
+	})
+	defer scheduler.Close()
+
+	ctx := context.Background()
+
+	p1 := &concurrency.SchedulablePipeline{
+		ID:       "p1",
+		Priority: concurrency.PriorityLow,
+	}
+	p2 := &concurrency.SchedulablePipeline{
+		ID:       "p2",
+		Priority: concurrency.PriorityHigh,
+	}
+	p3 := &concurrency.SchedulablePipeline{
+		ID:       "p3",
+		Priority: concurrency.PriorityNormal,
+	}
+
+	scheduler.Schedule(ctx, "s1", p1)
+	scheduler.Schedule(ctx, "s1", p2)
+	scheduler.Schedule(ctx, "s2", p3)
+
+	active := scheduler.GetActivePipelines()
+
+	if len(active) < 2 {
+		t.Errorf("expected at least 2 queued pipelines, got %d", len(active))
+	}
+
+	for i := 1; i < len(active); i++ {
+		if active[i].Priority < active[i-1].Priority {
+			t.Error("pipelines should be sorted by priority ascending")
+		}
+	}
+}
+
+func TestGlobalPipelineScheduler_GetActivePipelines_Empty(t *testing.T) {
+	scheduler := NewGlobalPipelineScheduler(PipelineSchedulerConfig{})
+	defer scheduler.Close()
+
+	active := scheduler.GetActivePipelines()
+
+	if len(active) != 0 {
+		t.Errorf("expected empty list, got %d items", len(active))
+	}
+}

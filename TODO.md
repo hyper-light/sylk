@@ -3046,6 +3046,656 @@ For each file operation task:
 
 ---
 
+## Document Search System
+
+**Reference**: See `/SEARCH.md` for complete specification and `/ARCHITECTURE.md` "Document Search System" section.
+
+### DS.1.1 Base Document Types
+
+**Files to create:** `core/search/document.go`
+
+**Acceptance Criteria:**
+- [ ] `DocumentType` enum: `source_code`, `markdown`, `config`, `llm_prompt`, `llm_response`, `web_fetch`, `note`, `git_commit`
+- [ ] `Document` struct: ID (SHA-256), Path, Type, Language, Content, Symbols []string, Comments, Imports []string, Checksum, ModifiedAt, IndexedAt, GitCommit
+- [ ] `SymbolInfo` struct: Name, Kind (function/type/variable/const/interface), Signature, Line, Exported
+- [ ] `GenerateDocumentID(content []byte) string` using SHA-256
+- [ ] JSON tags with `omitempty` where appropriate
+
+### DS.1.2 LLM Communication Document Types
+
+**Files to create:** `core/search/llm_document.go`
+
+**Acceptance Criteria:**
+- [ ] `LLMPromptDocument` embedding Document: SessionID, AgentID, AgentType, Model, TokenCount, TurnNumber, PrecedingFiles, FollowingFiles
+- [ ] `LLMResponseDocument` embedding Document: PromptID, SessionID, AgentID, Model, TokenCount, LatencyMs, StopReason, CodeBlocks, FilesModified, ToolsUsed
+- [ ] `CodeBlock` struct: Language, Content, LineNum
+
+### DS.1.3 Web Fetch Document Type
+
+**Files to create:** `core/search/web_document.go`
+
+**Acceptance Criteria:**
+- [ ] `WebFetchDocument` embedding Document: URL, FetchedAt, StatusCode, ContentType, Links, Headings, CodeSnippets
+- [ ] URL normalization for consistent ID generation
+
+### DS.1.4 Git Commit Document Type
+
+**Files to create:** `core/search/git_document.go`
+
+**Acceptance Criteria:**
+- [ ] `GitCommitDocument` embedding Document: CommitHash, Author, AuthorEmail, AuthorDate, Committer, CommitterEmail, CommitDate, Message, FilesChanged, Diff, ParentHashes
+
+### DS.1.5 Document Collection Types
+
+**Files to create:** `core/search/collection.go`
+
+**Acceptance Criteria:**
+- [ ] `DocumentBatch` struct: Documents []Document, TotalSize int64, IndexedCount int
+- [ ] `IndexingResult` struct: Indexed, Failed, Errors []IndexError, Duration
+- [ ] `IndexError` struct: DocumentID, Path, Error, Retryable bool
+- [ ] Constants: `MaxBatchSize = 100`, `MaxBatchBytes = 10MB`
+
+### DS.1.6 Search Result Types
+
+**Files to create:** `core/search/result.go`
+
+**Acceptance Criteria:**
+- [ ] `SearchResult` struct: Documents []ScoredDocument, TotalHits, SearchTime, Query
+- [ ] `ScoredDocument` embedding Document: Score float64, Highlights map[string][]string, MatchedFields
+- [ ] `SearchRequest` struct: Query, Type, PathFilter, Limit, Offset, FuzzyLevel, IncludeHighlights
+- [ ] `HybridSearchResult` struct: BleveResults, VectorResults, FusedResults, FusionMethod
+
+### DS.2.1 Custom Code Tokenizer
+
+**Files to create:** `core/search/analyzer/tokenizer.go`
+
+**Acceptance Criteria:**
+- [ ] `CodeTokenizer` implementing Bleve `analysis.Tokenizer` interface
+- [ ] Handles string literals (preserves as single token)
+- [ ] Handles operators (splits around `->`, `::`, `=>`, `...`)
+- [ ] Handles numeric literals (hex, binary, octal)
+- [ ] Unicode-aware for identifiers
+- [ ] Registers with Bleve registry as `code_tokenizer`
+
+### DS.2.2 CamelCase Token Filter
+
+**Files to create:** `core/search/analyzer/camel_case.go`
+
+**Acceptance Criteria:**
+- [ ] `CamelCaseFilter` implementing `analysis.TokenFilter`
+- [ ] Splits `handleHTTPError` → `["handle", "HTTP", "Error", "handleHTTPError"]`
+- [ ] Handles consecutive uppercase: `XMLHTTPRequest` → `["XML", "HTTP", "Request", "XMLHTTPRequest"]`
+- [ ] Preserves original token
+- [ ] Registers as `camel_case`
+- [ ] 20+ edge case unit tests
+
+### DS.2.3 SnakeCase Token Filter
+
+**Files to create:** `core/search/analyzer/snake_case.go`
+
+**Acceptance Criteria:**
+- [ ] `SnakeCaseFilter` implementing `analysis.TokenFilter`
+- [ ] Splits `get_user_by_id` → `["get", "user", "by", "id", "get_user_by_id"]`
+- [ ] Handles `__init__` → `["init", "__init__"]`
+- [ ] Handles kebab-case: `get-user-id` → `["get", "user", "id", "get-user-id"]`
+- [ ] Registers as `snake_case`
+
+### DS.2.4 Code Analyzer Assembly
+
+**Files to create:** `core/search/analyzer/code_analyzer.go`
+
+**Acceptance Criteria:**
+- [ ] `BuildCodeAnalyzer()` returns `*analysis.Analyzer`
+- [ ] Chain: code_tokenizer → camel_case → snake_case → lowercase
+- [ ] Registers as `code`
+- [ ] Separate comment analyzer (with stemming)
+- [ ] Separate symbol analyzer (no lowercase)
+
+### DS.2.5 Bleve Index Schema
+
+**Files to create:** `core/search/bleve/schema.go`
+
+**Acceptance Criteria:**
+- [ ] `BuildDocumentMapping()` returns `*mapping.DocumentMapping`
+- [ ] Content: code analyzer, store=true
+- [ ] Symbols: symbol analyzer, store=true
+- [ ] Path, Type, Language: keyword analyzer
+- [ ] ModifiedAt, IndexedAt: datetime mapping
+
+### DS.2.6 Bleve Index Manager
+
+**Files to create:** `core/search/bleve/index_manager.go`
+
+**Acceptance Criteria:**
+- [ ] `IndexManager` struct managing Bleve lifecycle
+- [ ] `Open()`, `Close()` with proper flush
+- [ ] `Index(doc)`, `IndexBatch(docs)`, `Delete(id)`
+- [ ] `Search(req) (*SearchResult, error)`
+- [ ] Thread-safe via mutex
+- [ ] Path: `~/.sylk/projects/<hash>/documents.bleve/`
+
+### DS.3.1 File Scanner
+
+**Files to create:** `core/search/indexer/scanner.go`
+
+**Acceptance Criteria:**
+- [ ] `Scanner` with configurable patterns/exclusions
+- [ ] `ScanConfig`: RootPath, IncludePatterns, ExcludePatterns, MaxFileSize, FollowSymlinks
+- [ ] Default exclusions: `.git`, `node_modules`, `vendor`, `__pycache__`, `.next`, `dist`, `build`
+- [ ] `Scan(ctx) (<-chan *FileInfo, error)` returns channel
+- [ ] Respects context cancellation
+
+### DS.3.2 Language-Specific Parsers
+
+**Files to create:** `core/search/parser/parser.go`, `go_parser.go`, `typescript_parser.go`, `python_parser.go`, `markdown_parser.go`, `config_parser.go`
+
+**Acceptance Criteria:**
+- [ ] `Parser` interface: `Parse(content, path) (*ParseResult, error)`
+- [ ] `ParseResult`: Symbols, Comments, Imports, Metadata
+- [ ] Go parser: functions, types, interfaces, constants, variables
+- [ ] TypeScript parser: functions, classes, interfaces, types, exports
+- [ ] Python parser: functions, classes, decorators, imports
+- [ ] Markdown parser: headings, code blocks, links
+- [ ] `ParserRegistry` maps extension to parser
+
+### DS.3.3 Document Builder
+
+**Files to create:** `core/search/indexer/builder.go`
+
+**Acceptance Criteria:**
+- [ ] `DocumentBuilder` transforms FileInfo + content → Document
+- [ ] `Build(info, content) (*Document, error)`
+- [ ] Detects DocumentType from extension/content
+- [ ] Invokes parser for symbol extraction
+- [ ] Generates ID from content hash
+
+### DS.3.4 Batch Indexer
+
+**Files to create:** `core/search/indexer/batch_indexer.go`
+
+**Acceptance Criteria:**
+- [ ] `BatchIndexer` with concurrent indexing
+- [ ] `IndexerConfig`: BatchSize, MaxConcurrency, ProgressCallback
+- [ ] `Run(ctx, files) (*IndexingResult, error)`
+- [ ] Worker pool pattern
+- [ ] Integrates with GoroutineBudget
+- [ ] Integrates with FileHandleBudget
+
+### DS.3.5 Incremental Indexer
+
+**Files to create:** `core/search/indexer/incremental.go`
+
+**Acceptance Criteria:**
+- [ ] `IncrementalIndexer` only indexes changed files
+- [ ] `Index(ctx, changedFiles) (*IndexingResult, error)`
+- [ ] Checks Checksum to detect changes
+- [ ] Handles deletions and renames
+- [ ] Updates CMT manifest after success
+
+### DS.3.6 Full Reindex Pipeline
+
+**Files to create:** `core/search/indexer/reindex.go`
+
+**Acceptance Criteria:**
+- [ ] `FullReindexer` for complete rebuild
+- [ ] `Reindex(ctx) (*IndexingResult, error)`
+- [ ] Deletes existing, creates fresh
+- [ ] Progress reporting
+- [ ] Memory-bounded (streaming)
+
+### DS.4.1 fsnotify Watcher
+
+**Files to create:** `core/search/watcher/fsnotify.go`
+
+**Acceptance Criteria:**
+- [ ] `FSWatcher` wraps fsnotify
+- [ ] `WatchConfig`: Paths, ExcludePatterns, Debounce
+- [ ] `Start(ctx) (<-chan *FileEvent, error)`
+- [ ] `FileEvent`: Path, Operation, Time
+- [ ] Debounces rapid changes (100ms)
+- [ ] Recursive directory watching
+
+### DS.4.2 Git Hook Integration
+
+**Files to create:** `core/search/watcher/git_hook.go`
+
+**Acceptance Criteria:**
+- [ ] `GitHookWatcher` for git operations
+- [ ] Installs `post-commit`, `post-checkout`, `post-merge` hooks
+- [ ] `ParseHookEvent(args) (*GitEvent, error)`
+- [ ] Non-invasive: appends to existing hooks
+
+### DS.4.3 Checksum Validator
+
+**Files to create:** `core/search/watcher/checksum.go`
+
+**Acceptance Criteria:**
+- [ ] `ChecksumValidator` verifies via content hash
+- [ ] `Validate(path) (*ValidationResult, error)`
+- [ ] `ValidateBatch(paths) ([]*ValidationResult, error)`
+- [ ] SHA-256, streaming (memory-efficient)
+
+### DS.4.4 Periodic Scanner
+
+**Files to create:** `core/search/watcher/periodic.go`
+
+**Acceptance Criteria:**
+- [ ] `PeriodicScanner` for scheduled scans
+- [ ] `ScannerConfig`: Interval, SampleRate
+- [ ] Compares against CMT manifest
+- [ ] Low priority: yields to active operations
+
+### DS.4.5 Change Detection Coordinator
+
+**Files to create:** `core/search/watcher/coordinator.go`
+
+**Acceptance Criteria:**
+- [ ] `ChangeDetector` coordinates all sources
+- [ ] `Start(ctx) (<-chan *ChangeEvent, error)`
+- [ ] Deduplicates events
+- [ ] Priority: fsnotify > git_hook > periodic
+- [ ] Rate limiting
+
+### DS.5.1 CMT Node Types
+
+**Files to create:** `core/search/cmt/types.go`
+
+**Acceptance Criteria:**
+- [ ] `Node`: Key, Priority (SHAKE-128), Left/Right, Hash [32]byte, FileInfo
+- [ ] `FileInfo`: Path, ContentHash, Size, ModTime, Permissions, Indexed
+- [ ] Merkle hash: `H(left.Hash || Key || FileInfo.ContentHash || right.Hash)`
+
+### DS.5.2 CMT Operations
+
+**Files to create:** `core/search/cmt/cmt.go`
+
+**Acceptance Criteria:**
+- [ ] `CMT` struct: root, size, storage, wal
+- [ ] `Insert`, `Delete`, `Get`, `Update` - O(log n)
+- [ ] `RootHash()` - O(1)
+- [ ] `Walk(fn)` - in-order traversal
+- [ ] All mutations logged to WAL
+
+### DS.5.3 CMT Split and Merge
+
+**Files to create:** `core/search/cmt/treap.go`
+
+**Acceptance Criteria:**
+- [ ] `split(node, key) (*Node, *Node)`
+- [ ] `merge(left, right) *Node`
+- [ ] Priority maintains heap property
+- [ ] Key maintains BST property
+- [ ] Recalculates Merkle hashes on path
+
+### DS.5.4 CMT Merkle Hash Computation
+
+**Files to create:** `core/search/cmt/merkle.go`
+
+**Acceptance Criteria:**
+- [ ] `computeHash(node) [32]byte`
+- [ ] `updatePathHashes(path []*Node)`
+- [ ] `verifyHash(node) bool`
+- [ ] `verifyTree() (bool, []string)`
+- [ ] SHA-256 for all hashes
+
+### DS.5.5 CMT WAL
+
+**Files to create:** `core/search/cmt/wal.go`
+
+**Acceptance Criteria:**
+- [ ] `WAL` struct: append-only log
+- [ ] Operations: INSERT, DELETE, CHECKPOINT, TRUNCATE
+- [ ] `LogInsert`, `LogDelete`, `Checkpoint`, `Recover`
+- [ ] Binary format, fsync after write
+
+### DS.5.6 CMT SQLite Storage
+
+**Files to create:** `core/search/cmt/sqlite_storage.go`
+
+**Acceptance Criteria:**
+- [ ] `SQLiteStorage` implements `Storage` interface
+- [ ] Table: `cmt_nodes` with path, priority, hashes, etc.
+- [ ] `Save(tree)`, `Load()`, `SaveNode`, `LoadNode`
+
+### DS.5.7 CMT Corruption Detection
+
+**Files to create:** `core/search/cmt/integrity.go`
+
+**Acceptance Criteria:**
+- [ ] `IntegrityChecker` validates CMT vs filesystem
+- [ ] `Check(ctx) (*IntegrityReport, error)`
+- [ ] Detects: missing, extra, modified files
+- [ ] Detects: Merkle hash corruption
+- [ ] Parallel checking
+
+### DS.5.8 CMT Recovery
+
+**Files to create:** `core/search/cmt/recovery.go`
+
+**Acceptance Criteria:**
+- [ ] `CMTRecovery` rebuilds from WAL/filesystem/git
+- [ ] `RecoverFromWAL()`, `RecoverFromFilesystem()`, `RecoverFromGit()`
+- [ ] Priority: WAL > Filesystem > Git
+
+### DS.6.1 Git Client Wrapper
+
+**Files to create:** `core/search/git/client.go`
+
+**Acceptance Criteria:**
+- [ ] `GitClient` wraps go-git/v5
+- [ ] `NewGitClient(repoPath) (*GitClient, error)`
+- [ ] `IsGitRepo()`, `GetHead()`, `GetBranch()`, `GetRemote()`
+- [ ] Thread-safe, graceful non-git handling
+
+### DS.6.2 Git File History
+
+**Files to create:** `core/search/git/history.go`
+
+**Acceptance Criteria:**
+- [ ] `GetFileHistory(path, limit) ([]*CommitInfo, error)`
+- [ ] `CommitInfo`: Hash, Author, Date, Message, FilesChanged
+- [ ] `GetFileAtCommit(path, hash) ([]byte, error)`
+- [ ] Follows renames
+
+### DS.6.3 Git Blame Integration
+
+**Files to create:** `core/search/git/blame.go`
+
+**Acceptance Criteria:**
+- [ ] `GetBlameInfo(path) ([]*BlameEntry, error)`
+- [ ] `BlameEntry`: Line, CommitHash, Author, Date, Content
+- [ ] `GetBlameRange(path, start, end)`
+- [ ] Caches results
+
+### DS.6.4 Git Diff Support
+
+**Files to create:** `core/search/git/diff.go`
+
+**Acceptance Criteria:**
+- [ ] `GetDiff(from, to) ([]*FileDiff, error)`
+- [ ] `FileDiff`: Path, Status, Hunks
+- [ ] `GetWorkingTreeDiff()`, `GetStagedDiff()`
+
+### DS.6.5 Git Modified Files Detection
+
+**Files to create:** `core/search/git/modified.go`
+
+**Acceptance Criteria:**
+- [ ] `ListModifiedFiles(since) ([]string, error)`
+- [ ] `ListModifiedFilesSinceCommit(hash)`
+- [ ] `GetCommitsSince(since)`
+- [ ] `GetFilesInCommit(hash)`
+
+### DS.6.6 Git Integration Manager
+
+**Files to create:** `core/search/git/manager.go`
+
+**Acceptance Criteria:**
+- [ ] `GitManager` coordinates all git operations
+- [ ] Lazy initialization
+- [ ] Caches repository object
+- [ ] Integrates with FileHandleBudget
+
+### DS.7.1 Cross-Validator Types
+
+**Files to create:** `core/search/validation/types.go`
+
+**Acceptance Criteria:**
+- [ ] `ValidationSource` enum: FILESYSTEM, CMT, GIT
+- [ ] `FileState`: Path, Source, Exists, ContentHash, ModTime, Size
+- [ ] `Discrepancy`: Path, Sources, States, Type
+- [ ] `ValidationReport`: CheckedAt, TotalFiles, Discrepancies, Duration
+
+### DS.7.2 Three-Source Validator
+
+**Files to create:** `core/search/validation/validator.go`
+
+**Acceptance Criteria:**
+- [ ] `CrossValidator` compares filesystem, CMT, git
+- [ ] `Validate(ctx) (*ValidationReport, error)`
+- [ ] Parallel validation
+- [ ] Configurable path subset
+
+### DS.7.3 Discrepancy Resolution
+
+**Files to create:** `core/search/validation/resolution.go`
+
+**Acceptance Criteria:**
+- [ ] `DiscrepancyResolver` resolves discrepancies
+- [ ] Priority: Filesystem > Git > CMT
+- [ ] `Resolve(discrepancies) ([]*Resolution, error)`
+- [ ] Dry-run and apply modes
+
+### DS.7.4 Validation Scheduler
+
+**Files to create:** `core/search/validation/scheduler.go`
+
+**Acceptance Criteria:**
+- [ ] `ValidationScheduler` runs periodic validation
+- [ ] Low priority, yields to active ops
+- [ ] Auto-resolves minor discrepancies
+
+### DS.8.1 Staleness Types
+
+**Files to create:** `core/search/staleness/types.go`
+
+**Acceptance Criteria:**
+- [ ] `StalenessLevel`: FRESH, SLIGHTLY_STALE, MODERATELY_STALE, SEVERELY_STALE, UNKNOWN
+- [ ] `StalenessReport`: Level, StaleFiles, StaleSince, Confidence
+- [ ] `DetectionStrategy`: CMT_ROOT, GIT_COMMIT, MTIME_SAMPLE, CONTENT_HASH
+
+### DS.8.2 Hybrid Staleness Detector
+
+**Files to create:** `core/search/staleness/detector.go`
+
+**Acceptance Criteria:**
+- [ ] `HybridStalenessDetector` uses multiple strategies
+- [ ] Order: CMT root → Git commit → mtime sample → content hash
+- [ ] `Detect(ctx) (*StalenessReport, error)`
+- [ ] Early exit on freshness
+
+### DS.8.3 CMT Root Hash Check
+
+**Files to create:** `core/search/staleness/cmt_check.go`
+
+**Acceptance Criteria:**
+- [ ] `CMTRootCheck` compares stored vs computed root hash
+- [ ] `Check() (*DetectionResult, error)` - O(1)
+- [ ] Thread-safe
+
+### DS.8.4 Mtime Sampling
+
+**Files to create:** `core/search/staleness/mtime_sample.go`
+
+**Acceptance Criteria:**
+- [ ] `MtimeSampler` samples file modification times
+- [ ] `SampleConfig`: SampleSize, SampleStrategy
+- [ ] Only stats files, doesn't read content
+
+### DS.9.1 Search Coordinator Types
+
+**Files to create:** `core/search/coordinator/types.go`
+
+**Acceptance Criteria:**
+- [ ] `HybridSearchRequest`: Query, BleveWeight, VectorWeight, Limit, Filters
+- [ ] `HybridSearchResult`: BleveResults, VectorResults, FusedResults, Metadata
+- [ ] `FusionMethod`: RRF, LINEAR, MAX
+
+### DS.9.2 Search Coordinator
+
+**Files to create:** `core/search/coordinator/coordinator.go`
+
+**Acceptance Criteria:**
+- [ ] `SearchCoordinator` orchestrates Bleve + VectorDB
+- [ ] `Search(ctx, req) (*HybridSearchResult, error)`
+- [ ] Parallel Bleve and Vector searches
+- [ ] Timeout handling, fallback
+
+### DS.9.3 Reciprocal Rank Fusion
+
+**Files to create:** `core/search/coordinator/rrf.go`
+
+**Acceptance Criteria:**
+- [ ] `RRFMerger` implements RRF algorithm
+- [ ] `Merge(results1, results2, k) []*ScoredDocument`
+- [ ] Formula: `score = Σ 1/(k + rank_i)`, k=60
+- [ ] Deduplicates by ID
+
+### DS.9.4 Vector DB Adapter
+
+**Files to create:** `core/search/coordinator/vector_adapter.go`
+
+**Acceptance Criteria:**
+- [ ] `VectorDBAdapter` wraps VectorGraphDB
+- [ ] `Search(ctx, query, limit) ([]*ScoredDocument, error)`
+- [ ] Uses existing embedding pipeline
+- [ ] Graceful failure handling
+
+### DS.9.5 Search Cache
+
+**Files to create:** `core/search/coordinator/cache.go`
+
+**Acceptance Criteria:**
+- [ ] `SearchCache` with LRU eviction, TTL (5min default)
+- [ ] `Get(key)`, `Set(key, result)`
+- [ ] Thread-safe
+- [ ] Invalidation on index update
+
+### DS.10.1 GoroutineBudget Integration
+
+**Files to create:** `core/search/resource/goroutine.go`
+
+**Acceptance Criteria:**
+- [ ] All concurrent search ops acquire budget
+- [ ] `AcquireForIndexing(count)`, `AcquireForSearch()`
+- [ ] Graceful degradation when exhausted
+- [ ] Integrates with core/concurrency/GoroutineBudget
+
+### DS.10.2 FileHandleBudget Integration
+
+**Files to create:** `core/search/resource/filehandle.go`
+
+**Acceptance Criteria:**
+- [ ] All file ops acquire budget
+- [ ] `AcquireForRead(path)`, `AcquireForIndex(path)`
+- [ ] Bleve, SQLite tracked as handles
+- [ ] Integrates with core/resources/FileHandleBudget
+
+### DS.10.3 PressureController Integration
+
+**Files to create:** `core/search/resource/pressure.go`
+
+**Acceptance Criteria:**
+- [ ] Search responds to memory pressure
+- [ ] High pressure: reduce concurrency, prefer cache
+- [ ] Critical pressure: pause indexing
+- [ ] `SearchWithDegradation(ctx, req, pressure)`
+
+### DS.10.4 SearchSystem Facade
+
+**Files to create:** `core/search/search_system.go`
+
+**Acceptance Criteria:**
+- [ ] `SearchSystem` integrates all components
+- [ ] `Start(ctx)`, `Stop()`
+- [ ] `Search(ctx, req)`, `Index(ctx, paths)`
+- [ ] `GetStatus() *SearchSystemStatus`
+
+### DS.11.1 Search Message Types
+
+**Files to create:** `core/search/agent/messages.go`
+
+**Acceptance Criteria:**
+- [ ] `MessageTypeSearchRequest`, `MessageTypeSearchResponse`
+- [ ] `MessageTypeIndexRequest`, `MessageTypeIndexStatus`
+- [ ] Integration with core/messaging
+
+### DS.11.2 Guide Router Integration
+
+**Files to modify:** `agents/guide/router.go`, `agents/guide/prompts.go`
+
+**Acceptance Criteria:**
+- [ ] Guide routes search queries to Librarian
+- [ ] Intent detection: "find", "search", "locate", "where is"
+- [ ] Updated Guide prompt
+
+### DS.11.3 Librarian Search Integration
+
+**Files to modify:** `agents/librarian/skills.go`, create `agents/librarian/search.go`
+
+**Acceptance Criteria:**
+- [ ] Librarian uses SearchSystem for queries
+- [ ] `search_code` skill wraps SearchSystem.Search
+- [ ] Enriches results with codebase knowledge
+
+### DS.11.4 Agent Search Skills
+
+**Files to create:** `skills/search_skills.go`
+
+**Acceptance Criteria:**
+- [ ] `search_code`: full-text + semantic search
+- [ ] `git_diff`: changes between commits
+- [ ] `git_log`: commit history
+- [ ] `git_blame`: line authorship
+- [ ] SKILL.md definitions
+
+### DS.11.5 Session Context Integration
+
+**Files to modify:** `core/session/context.go`
+
+**Acceptance Criteria:**
+- [ ] `SessionContext` includes: RecentSearches, RecentFiles, SearchPreferences
+- [ ] Search results scoped to session
+
+### DS.12.1 Search CLI Command
+
+**Files to create:** `cmd/sylk/search.go`
+
+**Acceptance Criteria:**
+- [ ] `sylk search <query>`
+- [ ] Flags: `--fuzzy`, `--type`, `--path`, `--limit`, `--interactive`
+- [ ] Rich output with highlights
+- [ ] JSON mode
+
+### DS.12.2 Index CLI Command
+
+**Files to create:** `cmd/sylk/index.go`
+
+**Acceptance Criteria:**
+- [ ] `sylk index`, `sylk index status`, `sylk index rebuild`, `sylk index verify`
+- [ ] Progress bar
+- [ ] `--watch` for continuous mode
+
+### DS.12.3 Git Search CLI Commands
+
+**Files to create:** `cmd/sylk/git.go`
+
+**Acceptance Criteria:**
+- [ ] `sylk git diff`, `sylk git log`, `sylk git blame`
+- [ ] `--format`, `--since`, `--until`, `--author` flags
+
+### DS.12.4 Interactive Search Mode
+
+**Files to create:** `cmd/sylk/interactive_search.go`
+
+**Acceptance Criteria:**
+- [ ] Interactive TUI for search
+- [ ] Real-time search as you type
+- [ ] File preview, keyboard navigation
+- [ ] Integrates with ui/ patterns
+
+### DS.13 Document Search Integration Tests
+
+**Files to create:** `core/search/integration_test.go`
+
+**Acceptance Criteria:**
+- [ ] End-to-end indexing + search tests
+- [ ] CMT + Bleve + VectorDB integration
+- [ ] Resource budget enforcement tests
+- [ ] Cross-validation tests
+
+---
+
 ## Plan Mode Implementation
 
 **Reference**: See ARCHITECTURE.md "Plan Mode Architecture" section for detailed specifications.
@@ -26820,10 +27470,181 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   Group 5D (Guide recording) → Group 5G (recording storage)                      ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 5H: Document Search System (DS.1-DS.13)                           ││
+│ │ ** NEW: Bleve full-text, CMT manifest, go-git, hybrid retrieval **              ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - type definitions, no interdependencies):                ││
+│ │ • DS.1.1 Base Document Types (core/search/document.go)                          ││
+│ │ • DS.1.2 LLM Communication Document Types (core/search/llm_document.go)         ││
+│ │ • DS.1.3 Web Fetch Document Type (core/search/web_document.go)                  ││
+│ │ • DS.1.4 Git Commit Document Type (core/search/git_document.go)                 ││
+│ │ • DS.1.5 Document Collection Types (core/search/collection.go)                  ││
+│ │ • DS.1.6 Search Result Types (core/search/result.go)                            ││
+│ │                                                                                  ││
+│ │ PHASE 2 (All parallel - Bleve analyzers, no interdependencies):                 ││
+│ │ • DS.2.1 Custom Code Tokenizer (core/search/analyzer/tokenizer.go)              ││
+│ │ • DS.2.2 CamelCase Token Filter (core/search/analyzer/camel_case.go)            ││
+│ │ • DS.2.3 SnakeCase Token Filter (core/search/analyzer/snake_case.go)            ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After DS.2.1-2.3):                                                     ││
+│ │ • DS.2.4 Code Analyzer Assembly (core/search/analyzer/code_analyzer.go)         ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After DS.2.4 + DS.1.x):                                                ││
+│ │ • DS.2.5 Bleve Index Schema (core/search/bleve/schema.go)                       ││
+│ │ • DS.2.6 Bleve Index Manager (core/search/bleve/index_manager.go)               ││
+│ │                                                                                  ││
+│ │ PHASE 5 (All parallel - parsers, no interdependencies):                         ││
+│ │ • DS.3.1 File Scanner (core/search/indexer/scanner.go)                          ││
+│ │ • DS.3.2 Language-Specific Parsers (core/search/parser/*.go)                    ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After DS.3.1, DS.3.2, DS.2.6):                                         ││
+│ │ • DS.3.3 Document Builder (core/search/indexer/builder.go)                      ││
+│ │ • DS.3.4 Batch Indexer (core/search/indexer/batch_indexer.go)                   ││
+│ │ • DS.3.5 Incremental Indexer (core/search/indexer/incremental.go)               ││
+│ │ • DS.3.6 Full Reindex Pipeline (core/search/indexer/reindex.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 7 (All parallel - change detection, no interdependencies):                ││
+│ │ • DS.4.1 fsnotify Watcher (core/search/watcher/fsnotify.go)                     ││
+│ │ • DS.4.2 Git Hook Integration (core/search/watcher/git_hook.go)                 ││
+│ │ • DS.4.3 Checksum Validator (core/search/watcher/checksum.go)                   ││
+│ │ • DS.4.4 Periodic Scanner (core/search/watcher/periodic.go)                     ││
+│ │                                                                                  ││
+│ │ PHASE 8 (After DS.4.1-4.4):                                                     ││
+│ │ • DS.4.5 Change Detection Coordinator (core/search/watcher/coordinator.go)      ││
+│ │                                                                                  ││
+│ │ PHASE 9 (All parallel - CMT foundation, no interdependencies):                  ││
+│ │ • DS.5.1 CMT Node Types (core/search/cmt/types.go)                              ││
+│ │ • DS.5.5 CMT WAL (core/search/cmt/wal.go)                                       ││
+│ │ • DS.5.6 CMT SQLite Storage (core/search/cmt/sqlite_storage.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 10 (After DS.5.1):                                                        ││
+│ │ • DS.5.3 CMT Split and Merge (core/search/cmt/treap.go)                         ││
+│ │ • DS.5.4 CMT Merkle Hash Computation (core/search/cmt/merkle.go)                ││
+│ │                                                                                  ││
+│ │ PHASE 11 (After DS.5.3, DS.5.4, DS.5.5, DS.5.6):                                ││
+│ │ • DS.5.2 CMT Operations (core/search/cmt/cmt.go)                                ││
+│ │                                                                                  ││
+│ │ PHASE 12 (After DS.5.2):                                                        ││
+│ │ • DS.5.7 CMT Corruption Detection (core/search/cmt/integrity.go)                ││
+│ │ • DS.5.8 CMT Recovery (core/search/cmt/recovery.go)                             ││
+│ │                                                                                  ││
+│ │ PHASE 13 (All parallel - go-git, no interdependencies):                         ││
+│ │ • DS.6.1 Git Client Wrapper (core/search/git/client.go)                         ││
+│ │ • DS.6.2 Git File History (core/search/git/history.go)                          ││
+│ │ • DS.6.3 Git Blame Integration (core/search/git/blame.go)                       ││
+│ │ • DS.6.4 Git Diff Support (core/search/git/diff.go)                             ││
+│ │ • DS.6.5 Git Modified Files Detection (core/search/git/modified.go)             ││
+│ │                                                                                  ││
+│ │ PHASE 14 (After DS.6.1-6.5):                                                    ││
+│ │ • DS.6.6 Git Integration Manager (core/search/git/manager.go)                   ││
+│ │                                                                                  ││
+│ │ PHASE 15 (After DS.5.2, DS.6.6 - parallel):                                     ││
+│ │ • DS.7.1 Cross-Validator Types (core/search/validation/types.go)                ││
+│ │ • DS.7.2 Three-Source Validator (core/search/validation/validator.go)           ││
+│ │ • DS.7.3 Discrepancy Resolution (core/search/validation/resolution.go)          ││
+│ │ • DS.7.4 Validation Scheduler (core/search/validation/scheduler.go)             ││
+│ │                                                                                  ││
+│ │ PHASE 16 (After DS.5.2 - parallel with 15):                                     ││
+│ │ • DS.8.1 Staleness Types (core/search/staleness/types.go)                       ││
+│ │ • DS.8.2 Hybrid Staleness Detector (core/search/staleness/detector.go)          ││
+│ │ • DS.8.3 CMT Root Hash Check (core/search/staleness/cmt_check.go)               ││
+│ │ • DS.8.4 Mtime Sampling (core/search/staleness/mtime_sample.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 17 (After DS.2.6 - parallel):                                             ││
+│ │ • DS.9.1 Search Coordinator Types (core/search/coordinator/types.go)            ││
+│ │ • DS.9.3 Reciprocal Rank Fusion (core/search/coordinator/rrf.go)                ││
+│ │ • DS.9.4 Vector DB Adapter (core/search/coordinator/vector_adapter.go)          ││
+│ │ • DS.9.5 Search Cache (core/search/coordinator/cache.go)                        ││
+│ │                                                                                  ││
+│ │ PHASE 18 (After DS.9.1, DS.9.3, DS.9.4, DS.9.5):                                ││
+│ │ • DS.9.2 Search Coordinator (core/search/coordinator/coordinator.go)            ││
+│ │                                                                                  ││
+│ │ PHASE 19 (All parallel - resource integration):                                 ││
+│ │ • DS.10.1 GoroutineBudget Integration (core/search/resource/goroutine.go)       ││
+│ │ • DS.10.2 FileHandleBudget Integration (core/search/resource/filehandle.go)     ││
+│ │ • DS.10.3 PressureController Integration (core/search/resource/pressure.go)     ││
+│ │                                                                                  ││
+│ │ PHASE 20 (After all prior phases):                                              ││
+│ │ • DS.10.4 SearchSystem Facade (core/search/search_system.go)                    ││
+│ │                                                                                  ││
+│ │ PHASE 21 (After DS.10.4 - parallel):                                            ││
+│ │ • DS.11.1 Search Message Types (core/search/agent/messages.go)                  ││
+│ │ • DS.11.2 Guide Router Integration (agents/guide/router.go)                     ││
+│ │ • DS.11.3 Librarian Search Integration (agents/librarian/search.go)             ││
+│ │ • DS.11.4 Agent Search Skills (skills/search_skills.go)                         ││
+│ │ • DS.11.5 Session Context Integration (core/session/context.go)                 ││
+│ │                                                                                  ││
+│ │ PHASE 22 (After DS.10.4 - parallel):                                            ││
+│ │ • DS.12.1 Search CLI Command (cmd/sylk/search.go)                               ││
+│ │ • DS.12.2 Index CLI Command (cmd/sylk/index.go)                                 ││
+│ │ • DS.12.3 Git Search CLI Commands (cmd/sylk/git.go)                             ││
+│ │ • DS.12.4 Interactive Search Mode (cmd/sylk/interactive_search.go)              ││
+│ │                                                                                  ││
+│ │ PHASE 23 (After ALL complete):                                                  ││
+│ │ • DS.13 Document Search Integration Tests                                       ││
+│ │                                                                                  ││
+│ │ FILES:                                                                           ││
+│ │   core/search/document.go, llm_document.go, web_document.go, git_document.go   ││
+│ │   core/search/collection.go, result.go, search_system.go                        ││
+│ │   core/search/analyzer/*.go (tokenizer, camel_case, snake_case, code_analyzer)  ││
+│ │   core/search/bleve/schema.go, index_manager.go                                 ││
+│ │   core/search/indexer/*.go (scanner, builder, batch_indexer, incremental)       ││
+│ │   core/search/parser/*.go (go, typescript, python, markdown, config)            ││
+│ │   core/search/watcher/*.go (fsnotify, git_hook, checksum, periodic, coordinator)││
+│ │   core/search/cmt/*.go (types, cmt, treap, merkle, wal, sqlite_storage)         ││
+│ │   core/search/git/*.go (client, history, blame, diff, modified, manager)        ││
+│ │   core/search/validation/*.go (types, validator, resolution, scheduler)         ││
+│ │   core/search/staleness/*.go (types, detector, cmt_check, mtime_sample)         ││
+│ │   core/search/coordinator/*.go (types, coordinator, rrf, vector_adapter, cache) ││
+│ │   core/search/resource/*.go (goroutine, filehandle, pressure)                   ││
+│ │   core/search/agent/messages.go                                                 ││
+│ │   skills/search_skills.go                                                       ││
+│ │   cmd/sylk/search.go, index.go, git.go, interactive_search.go                   ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - Bleve full-text search with code-aware tokenization                         ││
+│ │   - CamelCase and SnakeCase token splitting                                     ││
+│ │   - Cartesian Merkle Tree manifest for O(log n) updates, O(1) root verification ││
+│ │   - WAL for crash recovery                                                      ││
+│ │   - Pure-Go git integration via go-git/v5                                       ││
+│ │   - Three-source cross-validation (filesystem, CMT, git)                        ││
+│ │   - Hybrid staleness detection (CMT root, git commit, mtime, content hash)      ││
+│ │   - Reciprocal Rank Fusion for hybrid Bleve + Vector search                     ││
+│ │   - Resource budget integration (goroutine, file handle, pressure)              ││
+│ │   - Session-scoped search context                                               ││
+│ │   - CLI commands: sylk search, sylk index, sylk git                             ││
+│ │   - Interactive TUI search mode                                                 ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (6 parallel) → Phase 2 (3 parallel) → Phase 3 → Phase 4 (2 parallel)  ││
+│ │   Phase 5 (2 parallel) → Phase 6 (4 parallel) → Phase 7 (4 parallel) → Phase 8  ││
+│ │   Phase 9 (3 parallel) → Phase 10 (2 parallel) → Phase 11 → Phase 12 (2 par)    ││
+│ │   Phase 13 (5 parallel) → Phase 14                                              ││
+│ │   Phase 15 (4 par) + Phase 16 (4 par) + Phase 17 (4 par) can run in parallel    ││
+│ │   Phase 18 → Phase 19 (3 par) → Phase 20 → Phase 21 (5 par) + Phase 22 (4 par)  ││
+│ │   Phase 23 (tests) after all                                                    ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - github.com/blevesearch/bleve/v2 (full-text search)                          ││
+│ │   - github.com/go-git/go-git/v5 (pure-Go git)                                   ││
+│ │   - github.com/fsnotify/fsnotify (file system notifications)                    ││
+│ │   - Existing VectorGraphDB (for hybrid search)                                  ││
+│ │   - Existing GoroutineBudget, FileHandleBudget, PressureController              ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Integrates with Librarian (5A) for codebase search queries                  ││
+│ │   - Integrates with Session Management for session-scoped context               ││
+│ │   - Integrates with VectorGraphDB (5B) for semantic search                      ││
+│ │   - Integrates with Resource Management (4G, 4H, 4F) for budgets/pressure       ││
+│ │   - CLI integrates with existing cmd/sylk structure                             ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
 │ NOTE: Wave 5 can START after Wave 1 complete, runs in parallel with Waves 2-4      │
-│ ESTIMATED CAPACITY: 14-18 parallel engineer pipelines (increased for new groups)   │
+│ ESTIMATED CAPACITY: 20-26 parallel engineer pipelines (increased for DS system)    │
 │ INTERNAL DEPENDENCIES:                                                             │
 │   5A → 5B, 5C (parallel) → 5D, 5E, 5F (parallel) → 5G                              │
+│   5H can run in parallel with 5A-5G (independent subsystem)                        │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```

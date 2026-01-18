@@ -93,6 +93,14 @@ func (pq *PipelinePriorityQueue) Contains(id string) bool {
 	return exists
 }
 
+func (pq *PipelinePriorityQueue) All() []*SchedulablePipeline {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	result := make([]*SchedulablePipeline, len(pq.items))
+	copy(result, pq.items)
+	return result
+}
+
 func (pq *PipelinePriorityQueue) removeAtIndex(idx int) {
 	lastIdx := len(pq.items) - 1
 	delete(pq.index, pq.items[idx].ID)

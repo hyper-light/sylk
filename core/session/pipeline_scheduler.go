@@ -392,6 +392,40 @@ func (s *GlobalPipelineScheduler) notifyRebalanced() {
 	})
 }
 
+type ActivePipelineInfo struct {
+	PipelineID string
+	SessionID  string
+	Priority   concurrency.PipelinePriority
+}
+
+func (s *GlobalPipelineScheduler) GetActivePipelines() []ActivePipelineInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var active []ActivePipelineInfo
+	for sessionID, queue := range s.sessionQueued {
+		items := queue.All()
+		for _, p := range items {
+			active = append(active, ActivePipelineInfo{
+				PipelineID: p.ID,
+				SessionID:  sessionID,
+				Priority:   p.Priority,
+			})
+		}
+	}
+
+	sortActivePipelinesByPriorityAsc(active)
+	return active
+}
+
+func sortActivePipelinesByPriorityAsc(pipelines []ActivePipelineInfo) {
+	for i := 1; i < len(pipelines); i++ {
+		for j := i; j > 0 && pipelines[j].Priority < pipelines[j-1].Priority; j-- {
+			pipelines[j], pipelines[j-1] = pipelines[j-1], pipelines[j]
+		}
+	}
+}
+
 func (s *GlobalPipelineScheduler) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

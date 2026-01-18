@@ -259,3 +259,145 @@ func (r *testTrackedResource) ForceClose() error {
 	r.closed.Store(true)
 	return nil
 }
+
+type mockFileBudget struct {
+	acquireCalls atomic.Int32
+	releaseCalls atomic.Int32
+	acquireErr   error
+}
+
+func (m *mockFileBudget) Acquire(ctx context.Context) error {
+	m.acquireCalls.Add(1)
+	return m.acquireErr
+}
+
+func (m *mockFileBudget) Release() {
+	m.releaseCalls.Add(1)
+}
+
+func TestAgentSupervisor_OpenFile_AcquiresBudget(t *testing.T) {
+	s := newTestSupervisor(t)
+	tmpDir := t.TempDir()
+	tmpFile := tmpDir + "/test.txt"
+
+	budget := &mockFileBudget{}
+	s.SetFileBudget(budget)
+
+	handle, err := s.OpenFile(context.Background(), tmpFile, FileModeWrite)
+	require.NoError(t, err)
+	require.NotNil(t, handle)
+
+	assert.Equal(t, int32(1), budget.acquireCalls.Load())
+	assert.Equal(t, 1, s.resources.Count())
+
+	err = s.CloseFile(handle)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), budget.releaseCalls.Load())
+}
+
+func TestAgentSupervisor_OpenFile_NoFileBudget(t *testing.T) {
+	s := newTestSupervisor(t)
+	tmpDir := t.TempDir()
+	tmpFile := tmpDir + "/test.txt"
+
+	handle, err := s.OpenFile(context.Background(), tmpFile, FileModeWrite)
+	require.NoError(t, err)
+	require.NotNil(t, handle)
+
+	assert.Equal(t, 1, s.resources.Count())
+	s.CloseFile(handle)
+}
+
+func TestAgentSupervisor_OpenFile_AcquireError(t *testing.T) {
+	s := newTestSupervisor(t)
+
+	budget := &mockFileBudget{acquireErr: context.DeadlineExceeded}
+	s.SetFileBudget(budget)
+
+	handle, err := s.OpenFile(context.Background(), "/any/path", FileModeRead)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Nil(t, handle)
+}
+
+func TestAgentSupervisor_OpenFile_FileOpenError(t *testing.T) {
+	s := newTestSupervisor(t)
+
+	budget := &mockFileBudget{}
+	s.SetFileBudget(budget)
+
+	handle, err := s.OpenFile(context.Background(), "/nonexistent/path/file.txt", FileModeRead)
+	assert.Error(t, err)
+	assert.Nil(t, handle)
+	assert.Equal(t, int32(1), budget.releaseCalls.Load(), "budget should be released on file open error")
+}
+
+func TestAgentSupervisor_ForceCloseResources_ClosesFiles(t *testing.T) {
+	s := newTestSupervisor(t)
+	tmpDir := t.TempDir()
+
+	budget := &mockFileBudget{}
+	s.SetFileBudget(budget)
+
+	for i := 0; i < 3; i++ {
+		tmpFile := tmpDir + "/test" + string(rune('0'+i)) + ".txt"
+		_, err := s.OpenFile(context.Background(), tmpFile, FileModeWrite)
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, 3, s.resources.Count())
+
+	errs := s.ForceCloseResources()
+	assert.Empty(t, errs)
+	assert.Equal(t, 0, s.resources.Count())
+	assert.Equal(t, int32(3), budget.releaseCalls.Load())
+}
+
+func TestTrackedFileHandle_ReadWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := tmpDir + "/test.txt"
+
+	s := newTestSupervisor(t)
+	handle, err := s.OpenFile(context.Background(), tmpFile, FileModeReadWrite)
+	require.NoError(t, err)
+
+	_, err = handle.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	_, err = handle.File().Seek(0, 0)
+	require.NoError(t, err)
+
+	buf := make([]byte, 5)
+	n, err := handle.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+	assert.Equal(t, "hello", string(buf))
+
+	s.CloseFile(handle)
+}
+
+func TestTrackedFileHandle_DoubleCloseSafe(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := tmpDir + "/test.txt"
+
+	budget := &mockFileBudget{}
+	s := newTestSupervisor(t)
+	s.SetFileBudget(budget)
+
+	handle, err := s.OpenFile(context.Background(), tmpFile, FileModeWrite)
+	require.NoError(t, err)
+
+	err = handle.ForceClose()
+	require.NoError(t, err)
+
+	err = handle.ForceClose()
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(1), budget.releaseCalls.Load(), "budget should only be released once")
+}
+
+func TestFileMode_ToOSFlags(t *testing.T) {
+	assert.Equal(t, 0, FileModeRead.ToOSFlags())
+	assert.NotEqual(t, 0, FileModeWrite.ToOSFlags())
+	assert.NotEqual(t, 0, FileModeReadWrite.ToOSFlags())
+	assert.NotEqual(t, 0, FileModeAppend.ToOSFlags())
+}

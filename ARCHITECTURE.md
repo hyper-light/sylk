@@ -52172,6 +52172,337 @@ func (a *ArchitectAgent) handleWorkflowChangeRequest(msg *messages.Message) erro
 
 ---
 
+## Document Search System
+
+**Local full-text search with Bleve, hybrid retrieval with Vector DB, corruption-resistant manifest with Cartesian Merkle Tree, and pure-Go git integration.**
+
+For the complete specification, see `/SEARCH.md`.
+
+### Design Principles
+
+1. **Local-first** - All data stays on disk, no external services, portable with the project
+2. **Code-aware** - Tokenization understands camelCase, snake_case, and language constructs
+3. **Hybrid retrieval** - Lexical precision (Bleve) + semantic understanding (Vector DB)
+4. **Standalone usable** - Terminal users get powerful search without agents
+5. **Agent-enhanced** - Agents leverage advanced queries, facets, and custom scoring
+6. **Corruption-resistant** - Cartesian Merkle Tree manifest with WAL for crash recovery
+7. **Git-integrated** - Pure-Go go-git for git operations, no external git binary dependency
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         DOCUMENT SEARCH SYSTEM                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  STORAGE (~/.sylk/projects/<project-hash>/)                                    │
+│  ├── vector.db              # SQLite - vector embeddings (existing)            │
+│  ├── documents.bleve/       # Bleve index directory                            │
+│  ├── manifest.cmt           # Cartesian Merkle Tree manifest                   │
+│  └── manifest.cmt.wal       # WAL for crash recovery                           │
+│                                                                                 │
+│  DOCUMENT TYPES                                                                 │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐          │
+│  │ Source Code  │ │  Markdown    │ │   Config     │ │  LLM Comms   │          │
+│  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘          │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                           │
+│  │ Web Fetches  │ │   Notes      │ │  Git Commits │                           │
+│  └──────────────┘ └──────────────┘ └──────────────┘                           │
+│                                                                                 │
+│  COMPONENTS                                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │ INDEXING PIPELINE                                                          │ │
+│  │ Scanner ──► Parser ──► Analyzer ──► Indexer                                │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │ CHANGE DETECTION                                                           │ │
+│  │ fsnotify (realtime) │ Git Hooks │ Checksum (on-access) │ Periodic          │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │ SEARCH COORDINATOR                                                         │ │
+│  │          │                               │                                  │ │
+│  │          ▼                               ▼                                  │ │
+│  │    ┌──────────┐                   ┌──────────┐                             │ │
+│  │    │  BLEVE   │                   │ VECTOR DB│                             │ │
+│  │    │ Full-text│                   │ Semantic │                             │ │
+│  │    │ Fuzzy    │                   │ k-NN     │                             │ │
+│  │    │ Faceted  │                   │          │                             │ │
+│  │    └──────────┘                   └──────────┘                             │ │
+│  │          └────────────┬────────────┘                                       │ │
+│  │                       ▼                                                    │ │
+│  │              RRF Rank Fusion                                               │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Document Model
+
+```go
+// core/search/document.go
+
+type DocumentType string
+
+const (
+    DocTypeSourceCode   DocumentType = "source_code"
+    DocTypeMarkdown     DocumentType = "markdown"
+    DocTypeConfig       DocumentType = "config"
+    DocTypeLLMPrompt    DocumentType = "llm_prompt"
+    DocTypeLLMResponse  DocumentType = "llm_response"
+    DocTypeWebFetch     DocumentType = "web_fetch"
+    DocTypeNote         DocumentType = "note"
+    DocTypeGitCommit    DocumentType = "git_commit"
+)
+
+type Document struct {
+    ID          string            `json:"id"`          // Content hash (SHA-256)
+    Path        string            `json:"path"`        // File path or virtual path
+    Type        DocumentType      `json:"type"`
+    Language    string            `json:"language,omitempty"`
+    Content     string            `json:"content"`
+    Symbols     []string          `json:"symbols,omitempty"`
+    Comments    string            `json:"comments,omitempty"`
+    Imports     []string          `json:"imports,omitempty"`
+    Checksum    string            `json:"checksum"`
+    ModifiedAt  time.Time         `json:"modified_at"`
+    IndexedAt   time.Time         `json:"indexed_at"`
+    GitCommit   string            `json:"git_commit,omitempty"`
+}
+```
+
+### Bleve Index Configuration
+
+Custom code-aware analyzer with:
+- **CamelCaseFilter**: Splits `handleHTTPError` → `["handle", "HTTP", "Error", "handleHTTPError"]`
+- **SnakeCaseFilter**: Splits `get_user_by_id` → `["get", "user", "by", "id", "get_user_by_id"]`
+- **CodeTokenizer**: Handles operators, string literals, and code constructs
+
+```go
+// Analyzer chain: code_tokenizer → camel_case → snake_case → lowercase
+func BuildCodeAnalyzer() *analysis.Analyzer {
+    return &analysis.Analyzer{
+        Tokenizer: CodeTokenizer,
+        TokenFilters: []analysis.TokenFilter{
+            CamelCaseFilter,
+            SnakeCaseFilter,
+            LowercaseFilter,
+        },
+    }
+}
+```
+
+### Cartesian Merkle Tree Manifest
+
+CMT provides O(log n) updates, O(1) root hash verification, and corruption-resistant storage:
+
+```go
+// core/search/cmt/cmt.go
+
+type CMT struct {
+    root    *Node
+    size    int
+    storage Storage  // SQLite-backed
+    wal     *WAL     // Write-ahead log
+}
+
+type Node struct {
+    Key      string   // file path
+    Priority uint64   // SHAKE-128 of key (treap ordering)
+    Left     *Node
+    Right    *Node
+    Hash     [32]byte // Merkle hash: H(left.Hash || self.data || right.Hash)
+    FileInfo FileInfo
+}
+
+type FileInfo struct {
+    Path        string
+    ContentHash [32]byte
+    Size        int64
+    ModTime     time.Time
+    Permissions uint32
+    Indexed     bool
+}
+```
+
+### go-git Integration
+
+Pure-Go git implementation (github.com/go-git/go-git/v5):
+
+```go
+// core/search/git/git.go
+
+type GitClient struct {
+    repo       *git.Repository
+    worktree   *git.Worktree
+}
+
+// Operations
+func (g *GitClient) GetFileAtCommit(path, commitHash string) ([]byte, error)
+func (g *GitClient) GetFileHistory(path string, limit int) ([]*CommitInfo, error)
+func (g *GitClient) GetBlameInfo(path string) ([]*BlameEntry, error)
+func (g *GitClient) ListModifiedFiles(since time.Time) ([]string, error)
+func (g *GitClient) GetLastCommitForFile(path string) (*CommitInfo, error)
+```
+
+### Cross-Validation System
+
+Three-source validation for corruption detection:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                       CROSS-VALIDATION SYSTEM                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                          │
+│  │ FILESYSTEM  │   │     CMT     │   │     GIT     │                          │
+│  │ (Canonical) │   │ (Manifest)  │   │ (History)   │                          │
+│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘                          │
+│         │                 │                 │                                  │
+│         └────────────┬────┴────────────────┘                                  │
+│                      ▼                                                         │
+│         ┌────────────────────────┐                                            │
+│         │     VALIDATOR          │                                            │
+│         │ Compare all 3 sources  │                                            │
+│         └────────────────────────┘                                            │
+│                      │                                                         │
+│         ┌────────────┴────────────┐                                           │
+│         ▼                         ▼                                           │
+│  ┌─────────────┐          ┌─────────────┐                                     │
+│  │  CONSISTENT │          │ DISCREPANCY │                                     │
+│  │  (proceed)  │          │ (resolve)   │                                     │
+│  └─────────────┘          └─────────────┘                                     │
+│                                                                                 │
+│  Resolution Priority: Filesystem > Git > CMT                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Hybrid Staleness Detection
+
+```go
+// core/search/staleness/detector.go
+
+type HybridStalenessDetector struct {
+    cmt       *cmt.CMT
+    git       *git.GitClient
+    vectorDB  VectorDB
+    bleve     bleve.Index
+}
+
+// Detection strategies (in order of preference):
+// 1. CMT root hash comparison (instant, catch-all)
+// 2. Git commit check (fast, covers committed changes)
+// 3. Filesystem mtime sampling (periodic, catches uncommitted)
+// 4. Content hash spot-check (deep verification)
+
+func (d *HybridStalenessDetector) Detect(ctx context.Context) (*StalenessReport, error)
+```
+
+### Resource Budget Integration
+
+The search system integrates with existing Sylk resource management:
+
+```go
+// core/search/search_system.go
+
+type SearchSystem struct {
+    bleveIndex     bleve.Index
+    cmt            *cmt.CMT
+    git            *git.GitClient
+    vectorDB       VectorDB
+
+    // Resource integration
+    goroutineBudget *concurrency.GoroutineBudget
+    fileHandleBudget *resources.FileHandleBudget
+    pressureController *resources.PressureController
+
+    // Session integration
+    sessionManager *session.Manager
+}
+
+// Pressure-responsive operations
+func (s *SearchSystem) Search(ctx context.Context, req *SearchRequest) (*SearchResult, error) {
+    pressure := s.pressureController.CurrentPressure()
+    if pressure >= resources.PressureHigh {
+        // Reduce concurrent indexing, prefer cached results
+        return s.searchWithDegradation(ctx, req, pressure)
+    }
+    return s.searchNormal(ctx, req)
+}
+```
+
+### Agent Integration
+
+```go
+// Message types for Guide routing
+const (
+    MessageTypeSearchRequest  = "SEARCH_REQUEST"
+    MessageTypeSearchResponse = "SEARCH_RESPONSE"
+    MessageTypeIndexRequest   = "INDEX_REQUEST"
+    MessageTypeIndexStatus    = "INDEX_STATUS"
+)
+
+// Guide routing: search queries → Librarian agent
+// Librarian uses SearchSystem for codebase queries
+// Agent-specific search strategies:
+// - Librarian: Pattern discovery, code structure, health assessment
+// - Archivalist: Historical search, session replay, failure patterns
+// - Academic: Research synthesis, external knowledge integration
+// - Engineer: Implementation context, similar code patterns
+// - Inspector: Validation patterns, historical issues
+```
+
+### Skills Registration
+
+```go
+// skills/search_skills.go
+
+var SearchSkills = []skills.SkillDefinition{
+    {
+        Name:        "search_code",
+        Description: "Search codebase using full-text and semantic search",
+        Agent:       "librarian",
+        Params:      []string{"query", "type", "path_filter", "limit"},
+    },
+    {
+        Name:        "git_diff",
+        Description: "Show changes between commits or current state",
+        Agent:       "librarian",
+        Params:      []string{"from", "to", "path"},
+    },
+    {
+        Name:        "git_log",
+        Description: "Show commit history for file or repository",
+        Agent:       "librarian",
+        Params:      []string{"path", "limit", "author", "since"},
+    },
+    {
+        Name:        "git_blame",
+        Description: "Show line-by-line authorship for file",
+        Agent:       "librarian",
+        Params:      []string{"path", "line_start", "line_end"},
+    },
+}
+```
+
+### Implementation Phases
+
+| Phase | Focus | Key Deliverables |
+|-------|-------|------------------|
+| 1 | Document Model & Types | Document, LLMDocument, WebFetchDocument types |
+| 2 | Bleve Integration | Custom analyzer, index configuration, basic search |
+| 3 | Indexing Pipeline | Scanner, Parser, Analyzer, batch indexing |
+| 4 | Change Detection | fsnotify, git hooks, checksum verification |
+| 5 | CMT Manifest | Treap+Merkle, WAL, SQLite storage |
+| 6 | go-git Integration | Pure-Go git client, history, blame |
+| 7 | Cross-Validation | Three-source validation, resolution |
+| 8 | Hybrid Staleness | Multi-strategy detection |
+| 9 | Search Coordinator | RRF fusion, hybrid retrieval |
+| 10 | Resource Integration | Budget integration, pressure response |
+| 11 | Agent Integration | Guide routing, Librarian skills |
+| 12 | CLI Commands | Terminal interface, interactive mode |
+
+---
+
 ## Summary
 
 Sylk combines **DAG-based orchestration** with a **Guide-centered universal routing bus** and **LLM skill planning**.

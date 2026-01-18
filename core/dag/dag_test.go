@@ -340,7 +340,7 @@ func TestExecutor_SimpleDAG(t *testing.T) {
 		Build()
 
 	dispatcher := newMockDispatcher()
-	executor := dag.NewExecutor(dag.DefaultExecutionPolicy())
+	executor := dag.NewExecutor(dag.DefaultExecutionPolicy(), nil)
 
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
@@ -362,7 +362,7 @@ func TestExecutor_LayeredDAG(t *testing.T) {
 		Build()
 
 	dispatcher := newMockDispatcher()
-	executor := dag.NewExecutor(dag.DefaultExecutionPolicy())
+	executor := dag.NewExecutor(dag.DefaultExecutionPolicy(), nil)
 
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
@@ -409,7 +409,7 @@ func TestExecutor_FailFast(t *testing.T) {
 	dispatcher := newMockDispatcher()
 	dispatcher.setFail("node-2")
 
-	executor := dag.NewExecutor(d.Policy())
+	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
 	require.NoError(t, err)
@@ -434,7 +434,7 @@ func TestExecutor_ContinueOnFailure(t *testing.T) {
 	dispatcher := newMockDispatcher()
 	dispatcher.setFail("node-1")
 
-	executor := dag.NewExecutor(d.Policy())
+	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
 	require.NoError(t, err)
@@ -460,7 +460,7 @@ func TestExecutor_Cancel(t *testing.T) {
 	dispatcher := newMockDispatcher()
 	dispatcher.executionTime = 200 * time.Millisecond
 
-	executor := dag.NewExecutor(d.Policy())
+	executor := dag.NewExecutor(d.Policy(), nil)
 
 	// Start execution in background
 	started := make(chan struct{})
@@ -489,7 +489,7 @@ func TestExecutor_Events(t *testing.T) {
 		Build()
 
 	dispatcher := newMockDispatcher()
-	executor := dag.NewExecutor(dag.DefaultExecutionPolicy())
+	executor := dag.NewExecutor(dag.DefaultExecutionPolicy(), nil)
 
 	var events []dag.Event
 	var mu sync.Mutex
@@ -539,7 +539,7 @@ func TestExecutor_Concurrency(t *testing.T) {
 	dispatcher := newMockDispatcher()
 	dispatcher.executionTime = 20 * time.Millisecond
 
-	executor := dag.NewExecutor(d.Policy())
+	executor := dag.NewExecutor(d.Policy(), nil)
 
 	var maxConcurrent int32
 	var currentConcurrent int32
@@ -587,7 +587,7 @@ func (d *concurrencyTrackingDispatcher) Dispatch(ctx context.Context, node *dag.
 }
 
 func TestScheduler_Submit(t *testing.T) {
-	scheduler := dag.NewScheduler(dag.DefaultSchedulerConfig())
+	scheduler := dag.NewScheduler(dag.DefaultSchedulerConfig(), nil)
 	defer scheduler.Close()
 
 	d, _ := dag.NewBuilder("test").
@@ -605,7 +605,7 @@ func TestScheduler_Submit(t *testing.T) {
 }
 
 func TestScheduler_SubmitAndWait(t *testing.T) {
-	scheduler := dag.NewScheduler(dag.DefaultSchedulerConfig())
+	scheduler := dag.NewScheduler(dag.DefaultSchedulerConfig(), nil)
 	defer scheduler.Close()
 
 	d, _ := dag.NewBuilder("test").
@@ -625,13 +625,13 @@ func TestScheduler_SubmitAndWait(t *testing.T) {
 func TestScheduler_ConcurrentDAGs(t *testing.T) {
 	scheduler := dag.NewScheduler(dag.SchedulerConfig{
 		MaxConcurrentDAGs: 3,
-	})
+	}, nil)
 	defer scheduler.Close()
 
 	var wg sync.WaitGroup
 	var completed int32
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -668,7 +668,7 @@ func TestExecutor_RetryBackoff(t *testing.T) {
 	dispatcher := newMockDispatcher()
 	dispatcher.setFailCount("node-1", 2)
 
-	executor := dag.NewExecutor(d.Policy())
+	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
 	require.NoError(t, err)
@@ -689,7 +689,7 @@ func TestExecutor_Timeout(t *testing.T) {
 	dispatcher := newMockDispatcher()
 	dispatcher.executionTime = 100 * time.Millisecond
 
-	executor := dag.NewExecutor(d.Policy())
+	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
 	require.NoError(t, err)
@@ -711,7 +711,7 @@ func TestExecutor_ConcurrentCancel(t *testing.T) {
 	dispatcher := newMockDispatcher()
 	dispatcher.executionTime = 50 * time.Millisecond
 
-	executor := dag.NewExecutor(d.Policy())
+	executor := dag.NewExecutor(d.Policy(), nil)
 
 	var wg sync.WaitGroup
 	wg.Add(2)

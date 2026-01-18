@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 // =============================================================================
@@ -35,6 +37,8 @@ type Manager struct {
 	// State
 	closed atomic.Bool
 
+	scope *concurrency.GoroutineScope
+
 	// Statistics
 	totalCreated   int64
 	totalCompleted int64
@@ -57,6 +61,8 @@ type ManagerConfig struct {
 
 	// Persister handles session persistence (optional)
 	Persister Persister
+
+	Scope *concurrency.GoroutineScope
 }
 
 // DefaultManagerConfig returns default manager configuration
@@ -89,6 +95,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		maxSessions: cfg.MaxSessions,
 		persister:   cfg.Persister,
 		handlers:    make([]EventHandler, 0),
+		scope:       cfg.Scope,
 	}
 }
 
@@ -644,9 +651,21 @@ func (m *Manager) emitEvent(event *Event) {
 
 	for _, handler := range handlers {
 		if handler != nil {
-			go handler(event)
+			m.dispatchHandler(handler, event)
 		}
 	}
+}
+
+func (m *Manager) dispatchHandler(handler EventHandler, event *Event) {
+	if m.scope == nil {
+		handler(event)
+		return
+	}
+
+	_ = m.scope.Go("session.manager.event_handler", 5*time.Second, func(ctx context.Context) error {
+		handler(event)
+		return nil
+	})
 }
 
 // =============================================================================

@@ -296,3 +296,95 @@ func TestPressureController_GoroutineBudgetNil(t *testing.T) {
 		pc.handleTransition(PressureNormal, PressureElevated, 0.55)
 	})
 }
+
+type mockFileHandleBudget struct {
+	mu    sync.Mutex
+	level int32
+}
+
+func (m *mockFileHandleBudget) SetPressureLevel(level int32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.level = level
+}
+
+func (m *mockFileHandleBudget) PressureLevel() int32 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.level
+}
+
+func TestPressureController_FileHandleBudgetIntegration(t *testing.T) {
+	bus := signal.NewSignalBus(signal.DefaultSignalBusConfig())
+	defer bus.Close()
+
+	budget := &mockFileHandleBudget{}
+
+	cfg := PressureControllerConfig{
+		SignalBus:        bus,
+		SpikeConfig:      SpikeMonitorConfig{Interval: 50 * time.Millisecond},
+		StateConfig:      DefaultPressureStateConfig(),
+		Scheduler:        &mockPressureScheduler{},
+		PipelineInfo:     &emptyPipelineProvider{},
+		FileHandleBudget: budget,
+	}
+
+	pc := NewPressureController(cfg)
+
+	pc.handleTransition(PressureNormal, PressureElevated, 0.55)
+	assert.Equal(t, int32(PressureElevated), budget.PressureLevel())
+
+	pc.handleTransition(PressureElevated, PressureHigh, 0.75)
+	assert.Equal(t, int32(PressureHigh), budget.PressureLevel())
+
+	pc.handleTransition(PressureHigh, PressureCritical, 0.90)
+	assert.Equal(t, int32(PressureCritical), budget.PressureLevel())
+
+	pc.handleTransition(PressureCritical, PressureNormal, 0.30)
+	assert.Equal(t, int32(PressureNormal), budget.PressureLevel())
+}
+
+func TestPressureController_FileHandleBudgetNil(t *testing.T) {
+	bus := signal.NewSignalBus(signal.DefaultSignalBusConfig())
+	defer bus.Close()
+
+	cfg := PressureControllerConfig{
+		SignalBus:        bus,
+		SpikeConfig:      SpikeMonitorConfig{Interval: 50 * time.Millisecond},
+		StateConfig:      DefaultPressureStateConfig(),
+		Scheduler:        &mockPressureScheduler{},
+		PipelineInfo:     &emptyPipelineProvider{},
+		FileHandleBudget: nil,
+	}
+
+	pc := NewPressureController(cfg)
+
+	assert.NotPanics(t, func() {
+		pc.handleTransition(PressureNormal, PressureElevated, 0.55)
+	})
+}
+
+func TestPressureController_BothBudgetsIntegration(t *testing.T) {
+	bus := signal.NewSignalBus(signal.DefaultSignalBusConfig())
+	defer bus.Close()
+
+	goroutineBudget := &mockGoroutineBudget{}
+	fileHandleBudget := &mockFileHandleBudget{}
+
+	cfg := PressureControllerConfig{
+		SignalBus:        bus,
+		SpikeConfig:      SpikeMonitorConfig{Interval: 50 * time.Millisecond},
+		StateConfig:      DefaultPressureStateConfig(),
+		Scheduler:        &mockPressureScheduler{},
+		PipelineInfo:     &emptyPipelineProvider{},
+		GoroutineBudget:  goroutineBudget,
+		FileHandleBudget: fileHandleBudget,
+	}
+
+	pc := NewPressureController(cfg)
+
+	pc.handleTransition(PressureNormal, PressureCritical, 0.90)
+
+	assert.Equal(t, int32(PressureCritical), goroutineBudget.Level())
+	assert.Equal(t, int32(PressureCritical), fileHandleBudget.PressureLevel())
+}

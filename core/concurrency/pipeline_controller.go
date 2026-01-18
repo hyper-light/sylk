@@ -228,8 +228,8 @@ func (c *PipelineController) waitForVoluntaryTermination(
 	allDone := waitForTerminationAsync(supervisors, c.config.KillGracePeriod)
 
 	select {
-	case <-allDone:
-		return true
+	case allOk := <-allDone:
+		return allOk
 	case <-time.After(c.config.KillGracePeriod):
 		return false
 	}
@@ -238,21 +238,24 @@ func (c *PipelineController) waitForVoluntaryTermination(
 func waitForTerminationAsync(
 	supervisors []*AgentSupervisor,
 	timeout time.Duration,
-) <-chan struct{} {
-	allDone := make(chan struct{})
+) <-chan bool {
+	allDone := make(chan bool, 1)
 	go func() {
+		allOk := true
 		for _, s := range supervisors {
-			waitForTermination(s, timeout)
+			if !waitForTermination(s, timeout) {
+				allOk = false
+			}
 		}
-		close(allDone)
+		allDone <- allOk
 	}()
 	return allDone
 }
 
-func waitForTermination(s *AgentSupervisor, timeout time.Duration) {
+func waitForTermination(s *AgentSupervisor, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_ = s.WaitForCompletion(ctx)
+	return s.WaitForCompletion(ctx) == nil
 }
 
 func forceCloseResources(supervisors []*AgentSupervisor) {
@@ -265,11 +268,14 @@ func (c *PipelineController) waitForHardDeadline(
 	supervisors []*AgentSupervisor,
 ) bool {
 	remaining := c.config.KillHardDeadline - c.config.KillGracePeriod
+	if remaining <= 0 {
+		return false
+	}
 	allDone := waitForTerminationAsync(supervisors, remaining)
 
 	select {
-	case <-allDone:
-		return true
+	case allOk := <-allDone:
+		return allOk
 	case <-time.After(remaining):
 		return false
 	}

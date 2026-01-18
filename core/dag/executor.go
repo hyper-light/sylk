@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 type NodeDispatcher interface {
@@ -32,13 +34,16 @@ type Executor struct {
 	handlers   []EventHandler
 	dispatcher NodeDispatcher
 	closed     atomic.Bool
+
+	scope *concurrency.GoroutineScope
 }
 
-func NewExecutor(policy ExecutionPolicy) *Executor {
+func NewExecutor(policy ExecutionPolicy, scope *concurrency.GoroutineScope) *Executor {
 	return &Executor{
 		policy:      policy,
 		nodeResults: make(map[string]*NodeResult),
 		handlers:    make([]EventHandler, 0),
+		scope:       scope,
 	}
 }
 
@@ -290,13 +295,28 @@ func (e *Executor) launchNodeExecution(wg *sync.WaitGroup, node *Node, errState 
 	wg.Add(1)
 	atomic.AddInt32(&e.nodesRunning, 1)
 
-	go func(n *Node) {
+	e.dispatchNodeExecution(wg, node, errState)
+}
+
+func (e *Executor) dispatchNodeExecution(wg *sync.WaitGroup, node *Node, errState *layerErrorState) {
+	nodeRef := node
+	if e.scope == nil {
 		defer wg.Done()
 		defer atomic.AddInt32(&e.nodesRunning, -1)
 		defer e.releaseLayerSlot()
 
-		errState.record(e.executeNode(n))
-	}(node)
+		errState.record(e.executeNode(nodeRef))
+		return
+	}
+
+	_ = e.scope.Go("dag.executor.node", e.resolveNodeTimeout(nodeRef), func(ctx context.Context) error {
+		defer wg.Done()
+		defer atomic.AddInt32(&e.nodesRunning, -1)
+		defer e.releaseLayerSlot()
+
+		errState.record(e.executeNode(nodeRef))
+		return nil
+	})
 }
 
 func (e *Executor) executeNode(node *Node) error {
@@ -695,7 +715,7 @@ func (e *Executor) emitEvent(event *Event) {
 
 	for _, handler := range handlers {
 		if handler != nil {
-			go handler(event)
+			handler(event)
 		}
 	}
 }

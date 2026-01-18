@@ -13,27 +13,34 @@ type GoroutineBudgetIntegration interface {
 	OnPressureChange(level int32)
 }
 
+type FileHandleBudgetIntegration interface {
+	SetPressureLevel(level int32)
+	PressureLevel() int32
+}
+
 type PressureControllerConfig struct {
-	MemoryLimit     int64
-	Caches          []EvictableCache
-	SignalBus       *signal.SignalBus
-	SpikeConfig     SpikeMonitorConfig
-	StateConfig     PressureStateConfig
-	Scheduler       PipelineScheduler
-	PipelineInfo    ActivePipelineProvider
-	GoroutineBudget GoroutineBudgetIntegration
+	MemoryLimit      int64
+	Caches           []EvictableCache
+	SignalBus        *signal.SignalBus
+	SpikeConfig      SpikeMonitorConfig
+	StateConfig      PressureStateConfig
+	Scheduler        PipelineScheduler
+	PipelineInfo     ActivePipelineProvider
+	GoroutineBudget  GoroutineBudgetIntegration
+	FileHandleBudget FileHandleBudgetIntegration
 }
 
 type PressureController struct {
-	registry        *UsageRegistry
-	monitor         *SpikeMonitor
-	stateMachine    *PressureStateMachine
-	admission       *AdmissionController
-	evictor         *CacheEvictor
-	compactor       *ContextCompactor
-	suspender       *PipelineSuspender
-	signalBus       *signal.SignalBus
-	goroutineBudget GoroutineBudgetIntegration
+	registry         *UsageRegistry
+	monitor          *SpikeMonitor
+	stateMachine     *PressureStateMachine
+	admission        *AdmissionController
+	evictor          *CacheEvictor
+	compactor        *ContextCompactor
+	suspender        *PipelineSuspender
+	signalBus        *signal.SignalBus
+	goroutineBudget  GoroutineBudgetIntegration
+	fileHandleBudget FileHandleBudgetIntegration
 
 	mu      sync.RWMutex
 	running bool
@@ -44,15 +51,16 @@ func NewPressureController(cfg PressureControllerConfig) *PressureController {
 	evictor := NewCacheEvictor(cfg.Caches...)
 
 	pc := &PressureController{
-		registry:        registry,
-		monitor:         NewSpikeMonitor(cfg.SpikeConfig),
-		stateMachine:    NewPressureStateMachine(cfg.StateConfig),
-		admission:       NewAdmissionController(cfg.Scheduler),
-		evictor:         evictor,
-		compactor:       NewContextCompactor(cfg.SignalBus, registry),
-		suspender:       NewPipelineSuspender(cfg.PipelineInfo, cfg.SignalBus),
-		signalBus:       cfg.SignalBus,
-		goroutineBudget: cfg.GoroutineBudget,
+		registry:         registry,
+		monitor:          NewSpikeMonitor(cfg.SpikeConfig),
+		stateMachine:     NewPressureStateMachine(cfg.StateConfig),
+		admission:        NewAdmissionController(cfg.Scheduler),
+		evictor:          evictor,
+		compactor:        NewContextCompactor(cfg.SignalBus, registry),
+		suspender:        NewPipelineSuspender(cfg.PipelineInfo, cfg.SignalBus),
+		signalBus:        cfg.SignalBus,
+		goroutineBudget:  cfg.GoroutineBudget,
+		fileHandleBudget: cfg.FileHandleBudget,
 	}
 
 	pc.wireCallbacks()
@@ -85,6 +93,7 @@ func (pc *PressureController) handleSpike(_ Sample) {
 
 func (pc *PressureController) handleTransition(from, to PressureLevel, _ float64) {
 	pc.notifyGoroutineBudget(to)
+	pc.notifyFileHandleBudget(to)
 	handlers := pc.levelHandlers()
 	if handler, ok := handlers[to]; ok {
 		handler()
@@ -94,6 +103,12 @@ func (pc *PressureController) handleTransition(from, to PressureLevel, _ float64
 func (pc *PressureController) notifyGoroutineBudget(level PressureLevel) {
 	if pc.goroutineBudget != nil {
 		pc.goroutineBudget.OnPressureChange(int32(level))
+	}
+}
+
+func (pc *PressureController) notifyFileHandleBudget(level PressureLevel) {
+	if pc.fileHandleBudget != nil {
+		pc.fileHandleBudget.SetPressureLevel(int32(level))
 	}
 }
 

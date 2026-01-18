@@ -3,6 +3,7 @@ package concurrency
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,35 @@ const (
 type CheckpointProvider interface {
 	SaveCheckpoint(agentID string, state any) error
 	LoadCheckpoint(agentID string) (any, error)
+}
+
+type FileBudgetProvider interface {
+	Acquire(ctx context.Context) error
+	Release()
+}
+
+type FileMode int
+
+const (
+	FileModeRead FileMode = iota
+	FileModeWrite
+	FileModeReadWrite
+	FileModeAppend
+)
+
+func (m FileMode) ToOSFlags() int {
+	switch m {
+	case FileModeRead:
+		return os.O_RDONLY
+	case FileModeWrite:
+		return os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	case FileModeReadWrite:
+		return os.O_RDWR | os.O_CREATE
+	case FileModeAppend:
+		return os.O_WRONLY | os.O_CREATE | os.O_APPEND
+	default:
+		return os.O_RDONLY
+	}
 }
 
 type AgentSupervisorConfig struct {
@@ -64,6 +94,7 @@ type AgentSupervisor struct {
 
 	pauseBarrier *PauseBarrier
 	checkpointer CheckpointProvider
+	fileBudget   FileBudgetProvider
 
 	config     AgentSupervisorConfig
 	opSem      chan struct{}
@@ -350,4 +381,108 @@ func (s *AgentSupervisor) Scope() *GoroutineScope {
 
 func (s *AgentSupervisor) Resources() *ResourceTracker {
 	return s.resources
+}
+
+func (s *AgentSupervisor) SetFileBudget(budget FileBudgetProvider) {
+	s.fileBudget = budget
+}
+
+func (s *AgentSupervisor) OpenFile(ctx context.Context, path string, mode FileMode) (*TrackedFileHandle, error) {
+	if s.fileBudget != nil {
+		if err := s.fileBudget.Acquire(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	file, err := os.OpenFile(path, mode.ToOSFlags(), 0644)
+	if err != nil {
+		if s.fileBudget != nil {
+			s.fileBudget.Release()
+		}
+		return nil, err
+	}
+
+	handle := NewTrackedFileHandle(file, path, s.sessionID, s.agentID, s.fileBudget)
+	s.resources.Track(handle)
+	return handle, nil
+}
+
+func (s *AgentSupervisor) CloseFile(handle *TrackedFileHandle) error {
+	if handle == nil {
+		return nil
+	}
+	s.resources.Release(handle)
+	return handle.ForceClose()
+}
+
+type TrackedFileHandle struct {
+	file      *os.File
+	path      string
+	fd        int
+	sessionID string
+	agentID   string
+	budget    FileBudgetProvider
+	mu        sync.Mutex
+	closed    bool
+}
+
+func NewTrackedFileHandle(
+	file *os.File,
+	path string,
+	sessionID, agentID string,
+	budget FileBudgetProvider,
+) *TrackedFileHandle {
+	return &TrackedFileHandle{
+		file:      file,
+		path:      path,
+		fd:        int(file.Fd()),
+		sessionID: sessionID,
+		agentID:   agentID,
+		budget:    budget,
+	}
+}
+
+func (h *TrackedFileHandle) ID() string {
+	return "file:" + h.path
+}
+
+func (h *TrackedFileHandle) Type() ResourceType {
+	return ResourceTypeFile
+}
+
+func (h *TrackedFileHandle) ForceClose() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+
+	if h.budget != nil {
+		h.budget.Release()
+	}
+	return h.file.Close()
+}
+
+func (h *TrackedFileHandle) IsClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
+}
+
+func (h *TrackedFileHandle) File() *os.File {
+	return h.file
+}
+
+func (h *TrackedFileHandle) Path() string {
+	return h.path
+}
+
+func (h *TrackedFileHandle) Read(p []byte) (int, error) {
+	return h.file.Read(p)
+}
+
+func (h *TrackedFileHandle) Write(p []byte) (int, error) {
+	return h.file.Write(p)
 }

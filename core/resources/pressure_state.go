@@ -119,7 +119,7 @@ func (sm *PressureStateMachine) transition(newLevel PressureLevel, usage float64
 	sm.lastChange = time.Now()
 
 	if sm.onTransition != nil {
-		go sm.onTransition(from, newLevel, usage)
+		sm.onTransition(from, newLevel, usage)
 	}
 
 	return true
