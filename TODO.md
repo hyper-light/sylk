@@ -3050,6 +3050,12 @@ For each file operation task:
 
 **Reference**: See `/SEARCH.md` for complete specification and `/ARCHITECTURE.md` "Document Search System" section.
 
+**Storage Architecture**:
+- **Bleve** (`documents.bleve/`): File-based full-text search index with code-aware tokenization
+- **VectorGraphDB** (`vector.db`): SQLite-based semantic search with HNSW index and graph relationships
+
+Note: VectorGraphDB uses SQLite internally - there is no separate SQLite database for the Document Search System. The `vector.db` file contains both vector embeddings and relational metadata.
+
 ### DS.1.1 Base Document Types (COMPLETE)
 
 **Files created:** `core/search/document.go`, `core/search/document_test.go`
@@ -3105,143 +3111,143 @@ For each file operation task:
 - [x] `SearchRequest` struct: Query, Type, PathFilter, Limit, Offset, FuzzyLevel, IncludeHighlights
 - [x] `HybridSearchResult` struct: BleveResults, VectorResults, FusedResults, FusionMethod
 
-### DS.2.1 Custom Code Tokenizer
+### DS.2.1 Custom Code Tokenizer (COMPLETE)
 
-**Files to create:** `core/search/analyzer/tokenizer.go`
-
-**Acceptance Criteria:**
-- [ ] `CodeTokenizer` implementing Bleve `analysis.Tokenizer` interface
-- [ ] Handles string literals (preserves as single token)
-- [ ] Handles operators (splits around `->`, `::`, `=>`, `...`)
-- [ ] Handles numeric literals (hex, binary, octal)
-- [ ] Unicode-aware for identifiers
-- [ ] Registers with Bleve registry as `code_tokenizer`
-
-### DS.2.2 CamelCase Token Filter
-
-**Files to create:** `core/search/analyzer/camel_case.go`
+**Files created:** `core/search/analyzer/tokenizer.go`, `core/search/analyzer/tokenizer_test.go`
 
 **Acceptance Criteria:**
-- [ ] `CamelCaseFilter` implementing `analysis.TokenFilter`
-- [ ] Splits `handleHTTPError` → `["handle", "HTTP", "Error", "handleHTTPError"]`
-- [ ] Handles consecutive uppercase: `XMLHTTPRequest` → `["XML", "HTTP", "Request", "XMLHTTPRequest"]`
-- [ ] Preserves original token
-- [ ] Registers as `camel_case`
-- [ ] 20+ edge case unit tests
+- [x] `CodeTokenizer` implementing Bleve `analysis.Tokenizer` interface
+- [x] Handles string literals (preserves as single token)
+- [x] Handles operators (splits around `->`, `::`, `=>`, `...`)
+- [x] Handles numeric literals (hex, binary, octal)
+- [x] Unicode-aware for identifiers
+- [x] Registers with Bleve registry as `code_tokenizer`
 
-### DS.2.3 SnakeCase Token Filter
+### DS.2.2 CamelCase Token Filter (COMPLETE)
 
-**Files to create:** `core/search/analyzer/snake_case.go`
-
-**Acceptance Criteria:**
-- [ ] `SnakeCaseFilter` implementing `analysis.TokenFilter`
-- [ ] Splits `get_user_by_id` → `["get", "user", "by", "id", "get_user_by_id"]`
-- [ ] Handles `__init__` → `["init", "__init__"]`
-- [ ] Handles kebab-case: `get-user-id` → `["get", "user", "id", "get-user-id"]`
-- [ ] Registers as `snake_case`
-
-### DS.2.4 Code Analyzer Assembly
-
-**Files to create:** `core/search/analyzer/code_analyzer.go`
+**Files created:** `core/search/analyzer/camel_case.go`, `core/search/analyzer/camel_case_test.go`
 
 **Acceptance Criteria:**
-- [ ] `BuildCodeAnalyzer()` returns `*analysis.Analyzer`
-- [ ] Chain: code_tokenizer → camel_case → snake_case → lowercase
-- [ ] Registers as `code`
-- [ ] Separate comment analyzer (with stemming)
-- [ ] Separate symbol analyzer (no lowercase)
+- [x] `CamelCaseFilter` implementing `analysis.TokenFilter`
+- [x] Splits `handleHTTPError` → `["handle", "HTTP", "Error", "handleHTTPError"]`
+- [x] Handles consecutive uppercase: `XMLHTTPRequest` → `["XML", "HTTP", "Request", "XMLHTTPRequest"]`
+- [x] Preserves original token
+- [x] Registers as `camel_case`
+- [x] 57 edge case unit tests (exceeds requirement of 20+)
 
-### DS.2.5 Bleve Index Schema
+### DS.2.3 SnakeCase Token Filter (COMPLETE)
 
-**Files to create:** `core/search/bleve/schema.go`
-
-**Acceptance Criteria:**
-- [ ] `BuildDocumentMapping()` returns `*mapping.DocumentMapping`
-- [ ] Content: code analyzer, store=true
-- [ ] Symbols: symbol analyzer, store=true
-- [ ] Path, Type, Language: keyword analyzer
-- [ ] ModifiedAt, IndexedAt: datetime mapping
-
-### DS.2.6 Bleve Index Manager
-
-**Files to create:** `core/search/bleve/index_manager.go`
+**Files created:** `core/search/analyzer/snake_case.go`, `core/search/analyzer/snake_case_test.go`
 
 **Acceptance Criteria:**
-- [ ] `IndexManager` struct managing Bleve lifecycle
-- [ ] `Open()`, `Close()` with proper flush
-- [ ] `Index(doc)`, `IndexBatch(docs)`, `Delete(id)`
-- [ ] `Search(req) (*SearchResult, error)`
-- [ ] Thread-safe via mutex
-- [ ] Path: `~/.sylk/projects/<hash>/documents.bleve/`
+- [x] `SnakeCaseFilter` implementing `analysis.TokenFilter`
+- [x] Splits `get_user_by_id` → `["get", "user", "by", "id", "get_user_by_id"]`
+- [x] Handles `__init__` → `["init", "__init__"]`
+- [x] Handles kebab-case: `get-user-id` → `["get", "user", "id", "get-user-id"]`
+- [x] Registers as `snake_case`
 
-### DS.3.1 File Scanner
+### DS.2.4 Code Analyzer Assembly (COMPLETE)
 
-**Files to create:** `core/search/indexer/scanner.go`
-
-**Acceptance Criteria:**
-- [ ] `Scanner` with configurable patterns/exclusions
-- [ ] `ScanConfig`: RootPath, IncludePatterns, ExcludePatterns, MaxFileSize, FollowSymlinks
-- [ ] Default exclusions: `.git`, `node_modules`, `vendor`, `__pycache__`, `.next`, `dist`, `build`
-- [ ] `Scan(ctx) (<-chan *FileInfo, error)` returns channel
-- [ ] Respects context cancellation
-
-### DS.3.2 Language-Specific Parsers
-
-**Files to create:** `core/search/parser/parser.go`, `go_parser.go`, `typescript_parser.go`, `python_parser.go`, `markdown_parser.go`, `config_parser.go`
+**Files created:** `core/search/analyzer/code_analyzer.go`, `core/search/analyzer/code_analyzer_test.go`
 
 **Acceptance Criteria:**
-- [ ] `Parser` interface: `Parse(content, path) (*ParseResult, error)`
-- [ ] `ParseResult`: Symbols, Comments, Imports, Metadata
-- [ ] Go parser: functions, types, interfaces, constants, variables
-- [ ] TypeScript parser: functions, classes, interfaces, types, exports
-- [ ] Python parser: functions, classes, decorators, imports
-- [ ] Markdown parser: headings, code blocks, links
-- [ ] `ParserRegistry` maps extension to parser
+- [x] `NewCodeAnalyzer()` returns `*analysis.DefaultAnalyzer`
+- [x] Chain: code_tokenizer → camel_case → snake_case → lowercase
+- [x] Registers as `code`
+- [x] Separate comment analyzer (with stemming) - registered as `comment`
+- [x] Separate symbol analyzer (no lowercase) - registered as `symbol`
 
-### DS.3.3 Document Builder
+### DS.2.5 Bleve Index Schema (COMPLETE)
 
-**Files to create:** `core/search/indexer/builder.go`
+**Files created:** `core/search/bleve/schema.go`, `core/search/bleve/schema_test.go`
 
 **Acceptance Criteria:**
-- [ ] `DocumentBuilder` transforms FileInfo + content → Document
-- [ ] `Build(info, content) (*Document, error)`
-- [ ] Detects DocumentType from extension/content
-- [ ] Invokes parser for symbol extraction
-- [ ] Generates ID from content hash
+- [x] `BuildDocumentMapping()` returns `*mapping.DocumentMapping`
+- [x] Content: code analyzer, store=true
+- [x] Symbols: symbol analyzer, store=true
+- [x] Path, Type, Language: keyword analyzer
+- [x] ModifiedAt, IndexedAt: datetime mapping
 
-### DS.3.4 Batch Indexer
+### DS.2.6 Bleve Index Manager (COMPLETE)
 
-**Files to create:** `core/search/indexer/batch_indexer.go`
-
-**Acceptance Criteria:**
-- [ ] `BatchIndexer` with concurrent indexing
-- [ ] `IndexerConfig`: BatchSize, MaxConcurrency, ProgressCallback
-- [ ] `Run(ctx, files) (*IndexingResult, error)`
-- [ ] Worker pool pattern
-- [ ] Integrates with GoroutineBudget
-- [ ] Integrates with FileHandleBudget
-
-### DS.3.5 Incremental Indexer
-
-**Files to create:** `core/search/indexer/incremental.go`
+**Files created:** `core/search/bleve/index_manager.go`, `core/search/bleve/index_manager_test.go`
 
 **Acceptance Criteria:**
-- [ ] `IncrementalIndexer` only indexes changed files
-- [ ] `Index(ctx, changedFiles) (*IndexingResult, error)`
-- [ ] Checks Checksum to detect changes
-- [ ] Handles deletions and renames
-- [ ] Updates CMT manifest after success
+- [x] `IndexManager` struct managing Bleve lifecycle
+- [x] `Open()`, `Close()` with proper flush
+- [x] `Index(ctx, doc)`, `IndexBatch(ctx, docs)`, `Delete(ctx, id)` with context support
+- [x] `Search(ctx, req) (*SearchResult, error)` with highlighting
+- [x] Thread-safe via RWMutex
+- [x] Path: `~/.sylk/projects/<hash>/documents.bleve/`
 
-### DS.3.6 Full Reindex Pipeline
+### DS.3.1 File Scanner (COMPLETE)
 
-**Files to create:** `core/search/indexer/reindex.go`
+**Files created:** `core/search/indexer/scanner.go`, `core/search/indexer/scanner_test.go`
 
 **Acceptance Criteria:**
-- [ ] `FullReindexer` for complete rebuild
-- [ ] `Reindex(ctx) (*IndexingResult, error)`
-- [ ] Deletes existing, creates fresh
-- [ ] Progress reporting
-- [ ] Memory-bounded (streaming)
+- [x] `Scanner` with configurable patterns/exclusions
+- [x] `ScanConfig`: RootPath, IncludePatterns, ExcludePatterns, MaxFileSize, FollowSymlinks
+- [x] Default exclusions: `.git`, `node_modules`, `vendor`, `__pycache__`, `.next`, `dist`, `build`
+- [x] `Scan(ctx) (<-chan *FileInfo, error)` returns channel
+- [x] Respects context cancellation
+
+### DS.3.2 Language-Specific Parsers (COMPLETE)
+
+**Files created:** `core/search/parser/parser.go`, `go_parser.go`, `typescript_parser.go`, `python_parser.go`, `markdown_parser.go`, `config_parser.go` (all with tests)
+
+**Acceptance Criteria:**
+- [x] `Parser` interface: `Parse(content, path) (*ParseResult, error)`
+- [x] `ParseResult`: Symbols, Comments, Imports, Metadata
+- [x] Go parser: functions, types, interfaces, constants, variables
+- [x] TypeScript parser: functions, classes, interfaces, types, exports
+- [x] Python parser: functions, classes, decorators, imports
+- [x] Markdown parser: headings, code blocks, links
+- [x] `ParserRegistry` maps extension to parser (thread-safe)
+
+### DS.3.3 Document Builder (COMPLETE)
+
+**Files created:** `core/search/indexer/builder.go`, `core/search/indexer/builder_test.go`
+
+**Acceptance Criteria:**
+- [x] `DocumentBuilder` transforms FileInfo + content → Document
+- [x] `Build(info, content) (*Document, error)`
+- [x] Detects DocumentType from extension/content
+- [x] Invokes parser for symbol extraction
+- [x] Generates ID from content hash
+
+### DS.3.4 Batch Indexer (COMPLETE)
+
+**Files created:** `core/search/indexer/batch_indexer.go`, `core/search/indexer/batch_indexer_test.go`
+
+**Acceptance Criteria:**
+- [x] `BatchIndexer` with concurrent indexing
+- [x] `IndexerConfig`: BatchSize, MaxConcurrency, ProgressCallback
+- [x] `Run(ctx, files) (*IndexingResult, error)`
+- [x] Worker pool pattern
+- [x] Integrates with GoroutineBudget
+- [x] Integrates with FileHandleBudget
+
+### DS.3.5 Incremental Indexer (COMPLETE)
+
+**Files created:** `core/search/indexer/incremental.go`, `core/search/indexer/incremental_test.go`
+
+**Acceptance Criteria:**
+- [x] `IncrementalIndexer` only indexes changed files
+- [x] `Index(ctx, changedFiles) (*IndexingResult, error)`
+- [x] Checks Checksum to detect changes
+- [x] Handles deletions and renames
+- [x] Updates CMT manifest after success
+
+### DS.3.6 Full Reindex Pipeline (COMPLETE)
+
+**Files created:** `core/search/indexer/reindex.go`, `core/search/indexer/reindex_test.go`
+
+**Acceptance Criteria:**
+- [x] `FullReindexer` for complete rebuild
+- [x] `Reindex(ctx) (*IndexingResult, error)`
+- [x] Deletes existing, creates fresh
+- [x] Progress reporting
+- [x] Memory-bounded (streaming)
 
 ### DS.4.1 fsnotify Watcher
 
@@ -5941,13 +5947,19 @@ This section implements the core Context Virtualization components that enable l
 
 ### CV.1 UniversalContentStore
 
-**Architectural Role**: Central storage for all content processed by Sylk - user prompts, agent responses, tool calls, file reads, web fetches, research papers, routing decisions, and handoff states. Wraps VectorGraphDB with Bleve full-text search integration.
+**Architectural Role**: Central storage for all content processed by Sylk - user prompts, agent responses, tool calls, file reads, web fetches, research papers, routing decisions, and handoff states. Wraps VectorGraphDB (SQLite-based) with Bleve full-text search integration.
 
 **Why This Exists**: CONTEXT.md architecture gap analysis (section 1.1) identified that UniversalContentStore should wrap VectorGraphDB rather than duplicate it. This implementation provides WAVE 4 compliant indexing with proper resource management.
 
+**Storage Architecture**:
+- **VectorGraphDB** (`vector.db`): SQLite-based storage for embeddings, graph edges, HNSW index, AND content entry metadata (extends existing schema)
+- **Bleve** (`documents.bleve/`): File-based full-text search index
+
+Note: There is no separate `content.db` - content entry metadata is stored in VectorGraphDB by extending its node schema. VectorGraphDB already uses SQLite internally.
+
 **Relationship to Architecture**:
-- Wraps existing VectorGraphDB for vector search
-- Integrates with Document Search System (DS.x) for Bleve indexing
+- Wraps existing VectorGraphDB for vector/semantic search AND content metadata (SQLite-based)
+- Integrates with Document Search System (DS.x) for Bleve indexing (file-based)
 - Uses SafeChan for index queue (not raw channels)
 - Uses GoroutineScope for workers (not raw goroutines)
 - Tracks file handles via FileHandleBudget
@@ -5958,7 +5970,10 @@ This section implements the core Context Virtualization components that enable l
 - `core/context/content_store_test.go`
 
 **Acceptance Criteria:**
-- [ ] `UniversalContentStore` struct wrapping VectorGraphDB + Bleve
+- [ ] `UniversalContentStore` struct wrapping VectorGraphDB (SQLite) + Bleve (file-based)
+- [ ] `vectorDB *vectorgraphdb.DB` for semantic search AND content metadata (uses vector.db)
+- [ ] `bleveIndex bleve.Index` for full-text search (uses documents.bleve/)
+- [ ] VectorGraphDB schema extended for ContentEntry storage (no separate content.db)
 - [ ] `indexQueue *safechan.SafeChan[*ContentEntry]` (WAVE 4 compliant)
 - [ ] `scope *concurrency.GoroutineScope` for worker management
 - [ ] `fileBudget *resources.FileHandleBudget` tracking
@@ -5969,7 +5984,7 @@ This section implements the core Context Virtualization components that enable l
 - [ ] `GetBySessionID(sessionID string, opts *QueryOptions) ([]*ContentEntry, error)`
 - [ ] All file handles tracked and released on Close()
 - [ ] No raw goroutines - all workers via scope.Go()
-- [ ] Unit test: content indexed in both Bleve and VectorDB
+- [ ] Unit test: content indexed in both Bleve and VectorGraphDB
 - [ ] Unit test: hybrid search returns merged results
 - [ ] Unit test: handles released on close
 
@@ -30957,7 +30972,493 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 95-110 parallel engineer pipelines (increased for CV+PH)       │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4P: Domain Expertise System (DE.1-DE.10)                          ││
+│ │ ** ARCHITECTURE: See ARCHITECTURE.md "Domain Expertise System" section **        ││
+│ │ ** SOLVES: Domain contamination in knowledge agent DB queries **                 ││
+│ │                                                                                  ││
+│ │ PROBLEM STATEMENT:                                                               ││
+│ │   Engineer → Librarian query → Librarian returns Academic's research papers     ││
+│ │   instead of codebase files. Without domain separation, DB queries return       ││
+│ │   results from wrong knowledge domains, confusing requesting agents.            ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES:                                                               ││
+│ │   1. Domain as first-class citizen with mandatory tagging                        ││
+│ │   2. Agent identity = implicit domain filter for agent-initiated searches        ││
+│ │   3. Classification at Guide layer for prefetch (before agent routing)           ││
+│ │   4. Cross-domain routes to Architect for coordination (unless explicit addr)    ││
+│ │   5. Explicit @agent address always honored, even for cross-domain               ││
+│ │   6. Original query NEVER modified - classification is metadata only             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - type definitions, no interdependencies):                 ││
+│ │                                                                                  ││
+│ │ • DE.1.1 Domain Enum Extension (core/domain/domain.go)                           ││
+│ │   - Extend existing Domain enum with all 10 agent domains                        ││
+│ │   - DomainLibrarian (codebase: files, patterns, structure, conventions)          ││
+│ │   - DomainAcademic (external: research, documentation, RFCs, best practices)     ││
+│ │   - DomainArchivalist (historical: sessions, decisions, failures, handoffs)      ││
+│ │   - DomainArchitect (planning: DAGs, task decomposition, architectural)          ││
+│ │   - DomainEngineer (execution: implementation notes, code changes)               ││
+│ │   - DomainDesigner (UI: components, styles, design tokens, accessibility)        ││
+│ │   - DomainInspector (quality: validation results, issues, review findings)       ││
+│ │   - DomainTester (testing: test patterns, coverage, test history)                ││
+│ │   - DomainOrchestrator (workflow: pipeline states, task coordination)            ││
+│ │   - DomainGuide (routing: conversation history, routing decisions)               ││
+│ │   - AgentToDomain map[AgentType]Domain for implicit filtering                    ││
+│ │   - DomainToAgent map[Domain]AgentType for reverse lookup                        ││
+│ │   - Domain.String(), Domain.IsValid() methods                                    ││
+│ │   ACCEPTANCE: All 10 domains defined, bidirectional maps compile, test coverage  ││
+│ │   MODIFY: core/vectorgraphdb/types.go (existing Domain enum has 3 values)        ││
+│ │   FILES: core/domain/domain.go, core/domain/domain_test.go                       ││
+│ │                                                                                  ││
+│ │ • DE.1.2 DomainContext Type (core/domain/context.go)                             ││
+│ │   - DomainContext struct for carrying classification through system              ││
+│ │   - OriginalQuery string (NEVER modified - classification is metadata only)      ││
+│ │   - DetectedDomains []Domain with confidence scores                              ││
+│ │   - DomainConfidences map[Domain]float64                                         ││
+│ │   - IsCrossDomain bool (true if multiple domains above threshold)                ││
+│ │   - PrimaryDomain Domain (highest confidence)                                    ││
+│ │   - SecondaryDomains []Domain (for cross-domain coordination)                    ││
+│ │   - ClassificationMethod string (cache/lexical/embedding/context/llm)            ││
+│ │   - Signals map[Domain][]string (matched keywords/patterns per domain)           ││
+│ │   - Confidence float64 (overall classification confidence)                       ││
+│ │   - CacheHit bool, CacheKey string (for cache metrics)                           ││
+│ │   - AllowedDomains() []Domain method for filtering                               ││
+│ │   - HighestConfidenceDomain() Domain method                                      ││
+│ │   ACCEPTANCE: All fields present, JSON serializable, methods compile             ││
+│ │   FILES: core/domain/context.go, core/domain/context_test.go                     ││
+│ │                                                                                  ││
+│ │ • DE.1.3 Domain Configuration (core/domain/config.go)                            ││
+│ │   - DomainConfig struct for classification thresholds                            ││
+│ │   - CrossDomainThreshold float64 (default 0.65 - routes to Architect)            ││
+│ │   - SingleDomainThreshold float64 (default 0.75 - confident single domain)       ││
+│ │   - CacheMaxSize int (default 10000 entries)                                     ││
+│ │   - CacheTTL time.Duration (default 5 minutes)                                   ││
+│ │   - LexicalKeywords map[Domain][]string (keyword patterns per domain)            ││
+│ │   - EmbeddingThreshold float64 (min similarity for embedding match)              ││
+│ │   - LLMFallbackEnabled bool (default true)                                       ││
+│ │   - DefaultDomains []Domain (fallback when classification fails)                 ││
+│ │   ACCEPTANCE: Config loads from YAML, defaults are sensible, test coverage       ││
+│ │   FILES: core/domain/config.go, core/domain/config_test.go                       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (All parallel - Classification stages, depend on DE.1.x):                ││
+│ │                                                                                  ││
+│ │ • DE.2.1 Classification Stage Interface (core/domain/classifier/stage.go)        ││
+│ │   - ClassificationStage interface with Classify method                           ││
+│ │   - StageResult struct with domains, confidences, signals, should_continue       ││
+│ │   - StageName() string method for logging/metrics                                ││
+│ │   - Priority() int method for cascade ordering                                   ││
+│ │   - IsTerminal(confidence float64) bool for early exit detection                 ││
+│ │   ACCEPTANCE: Interface compiles, StageResult is msgpack serializable            ││
+│ │   FILES: core/domain/classifier/stage.go, core/domain/classifier/stage_test.go  ││
+│ │                                                                                  ││
+│ │ • DE.2.2 Lexical Classifier (core/domain/classifier/lexical.go)                  ││
+│ │   - Implements ClassificationStage interface                                     ││
+│ │   - Pattern-based domain detection using keyword lists from config               ││
+│ │   - Librarian patterns: "file", "function", "class", "import", code patterns     ││
+│ │   - Academic patterns: "research", "paper", "RFC", "best practice", "according"  ││
+│ │   - Archivalist patterns: "previous", "history", "decision", "session"           ││
+│ │   - Returns early if single domain with high confidence (>0.85)                  ││
+│ │   - O(n) where n = query length, uses compiled regex                             ││
+│ │   ACCEPTANCE: Sub-1ms classification, 80%+ accuracy on test corpus               ││
+│ │   FILES: core/domain/classifier/lexical.go, lexical_test.go                      ││
+│ │                                                                                  ││
+│ │ • DE.2.3 Embedding Classifier (core/domain/classifier/embedding.go)              ││
+│ │   - Implements ClassificationStage interface                                     ││
+│ │   - Uses VectorDB query against domain exemplar vectors                          ││
+│ │   - Pre-computed domain centroids from curated exemplar queries                  ││
+│ │   - Cosine similarity against each domain centroid                               ││
+│ │   - Returns domain(s) above EmbeddingThreshold                                   ││
+│ │   - Uses existing VectorGraphDB infrastructure                                   ││
+│ │   ACCEPTANCE: Uses existing embedder, <50ms latency, test coverage               ││
+│ │   DEPENDS ON: Existing VectorGraphDB, embedding infrastructure                   ││
+│ │   FILES: core/domain/classifier/embedding.go, embedding_test.go                  ││
+│ │                                                                                  ││
+│ │ • DE.2.4 Context Classifier (core/domain/classifier/context.go)                  ││
+│ │   - Implements ClassificationStage interface                                     ││
+│ │   - Analyzes conversation history for domain affinity                            ││
+│ │   - Tracks recent agent interactions in session                                  ││
+│ │   - Weights recent context higher (exponential decay)                            ││
+│ │   - Boosts domain confidence if matches recent conversation pattern              ││
+│ │   ACCEPTANCE: Session-aware, handles cold start, test coverage                   ││
+│ │   DEPENDS ON: Session management infrastructure                                  ││
+│ │   FILES: core/domain/classifier/context.go, context_test.go                      ││
+│ │                                                                                  ││
+│ │ • DE.2.5 LLM Classifier (core/domain/classifier/llm.go)                          ││
+│ │   - Implements ClassificationStage interface                                     ││
+│ │   - FALLBACK ONLY: Used when other stages are inconclusive                       ││
+│ │   - Small, fast model call (e.g., haiku-equivalent)                              ││
+│ │   - Structured output: { domains: [...], confidences: {...} }                    ││
+│ │   - Caches results aggressively (same query → same classification)               ││
+│ │   - Timeout: 500ms max, falls back to default domains on timeout                 ││
+│ │   ACCEPTANCE: <500ms P99 latency, graceful degradation, test coverage            ││
+│ │   FILES: core/domain/classifier/llm.go, llm_test.go                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After DE.2.1-DE.2.5 - Classification cascade):                          ││
+│ │                                                                                  ││
+│ │ • DE.2.6 Classification Cascade (core/domain/classifier/cascade.go)              ││
+│ │   - DomainClassifier struct orchestrating all stages                             ││
+│ │   - Classify(ctx, query, callerAgent) → DomainContext                            ││
+│ │   - Stage order: Cache → Lexical → Embedding → Context → LLM                     ││
+│ │   - Early exit when confidence exceeds SingleDomainThreshold                     ││
+│ │   - Cross-domain detection when multiple domains > CrossDomainThreshold          ││
+│ │   - Populates DomainContext.Signals for all matching domains                     ││
+│ │   - Metrics: stage_latency, cache_hit_rate, cross_domain_rate                    ││
+│ │   ACCEPTANCE: Cascade completes <100ms P50, <500ms P99, test coverage            ││
+│ │   DEPENDS ON: DE.2.1-DE.2.5, DE.3.1 (cache)                                      ││
+│ │   FILES: core/domain/classifier/cascade.go, cascade_test.go                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (All parallel - Cache integration, depend on DE.1.x):                    ││
+│ │                                                                                  ││
+│ │ • DE.3.1 Ristretto Cache Wrapper (core/domain/cache/cache.go)                    ││
+│ │   - DomainCache struct wrapping github.com/dgraph-io/ristretto                   ││
+│ │   - Get(key string) (*DomainContext, bool)                                       ││
+│ │   - Set(key string, ctx *DomainContext, ttl time.Duration)                       ││
+│ │   - Delete(key string) for cache invalidation                                    ││
+│ │   - Clear() for full cache reset                                                 ││
+│ │   - Configurable max size (default 10000 entries)                                ││
+│ │   - Cost function based on DomainContext size                                    ││
+│ │   ACCEPTANCE: Ristretto integration works, TTL eviction, test coverage           ││
+│ │   EXTERNAL DEP: github.com/dgraph-io/ristretto                                   ││
+│ │   FILES: core/domain/cache/cache.go, cache_test.go                               ││
+│ │                                                                                  ││
+│ │ • DE.3.2 Cache Key Generation (core/domain/cache/keys.go)                        ││
+│ │   - GenerateCacheKey(query, callerAgent) → string                                ││
+│ │   - Key = SHA256(normalize(query) + callerAgent.String())                        ││
+│ │   - Query normalization: lowercase, trim, collapse whitespace                    ││
+│ │   - CallerAgent included to handle agent-specific classification                 ││
+│ │   - Deterministic: same inputs → same key                                        ││
+│ │   ACCEPTANCE: Deterministic, no collisions in test corpus, fast (<1μs)           ││
+│ │   FILES: core/domain/cache/keys.go, keys_test.go                                 ││
+│ │                                                                                  ││
+│ │ • DE.3.3 Cache Statistics (core/domain/cache/stats.go)                           ││
+│ │   - CacheStats struct for monitoring                                             ││
+│ │   - HitCount, MissCount, HitRate float64                                         ││
+│ │   - EvictionCount, ExpirationCount                                               ││
+│ │   - AverageEntryAge time.Duration                                                ││
+│ │   - GetStats() method, ResetStats() method                                       ││
+│ │   - Prometheus metrics export (domain_cache_hits_total, etc.)                    ││
+│ │   ACCEPTANCE: Stats are accurate, Prometheus integration, test coverage          ││
+│ │   FILES: core/domain/cache/stats.go, stats_test.go                               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After DE.2.6, DE.3.x - Guide integration):                              ││
+│ │                                                                                  ││
+│ │ • DE.4.1 Domain Classifier Integration (agents/guide/domain_classifier.go)       ││
+│ │   - Guide.classifier *classifier.DomainClassifier field                          ││
+│ │   - Initialize classifier in Guide.New()                                         ││
+│ │   - ClassifyQuery(ctx, query, callerAgent) → *DomainContext                      ││
+│ │   - Integration with existing Guide.HandleMessage flow                           ││
+│ │   - Metrics: classification_latency, domain_distribution                         ││
+│ │   ACCEPTANCE: Guide can classify queries, metrics exported, test coverage        ││
+│ │   DEPENDS ON: DE.2.6, existing Guide infrastructure                              ││
+│ │   MODIFY: agents/guide/guide.go (add classifier field)                           ││
+│ │   FILES: agents/guide/domain_classifier.go, domain_classifier_test.go            ││
+│ │                                                                                  ││
+│ │ • DE.4.2 Prefetch Domain Filter (agents/guide/prefetch_domain.go)                ││
+│ │   - PrefetchDomainFilter struct for speculative prefetch                         ││
+│ │   - FilterPrefetch(ctx, query, domainContext) → filteredQuery                    ││
+│ │   - Applies domain filter BEFORE prefetch searches DB                            ││
+│ │   - Integrates with SpeculativePrefetcher from CONTEXT.md                        ││
+│ │   - Only fetches documents from AllowedDomains()                                 ││
+│ │   ACCEPTANCE: Prefetch respects domains, no cross-domain leakage, test coverage  ││
+│ │   DEPENDS ON: DE.4.1, SpeculativePrefetcher (CONTEXT.md)                         ││
+│ │   MODIFY: core/context/speculative_prefetch.go (add domain filtering)            ││
+│ │   FILES: agents/guide/prefetch_domain.go, prefetch_domain_test.go                ││
+│ │                                                                                  ││
+│ │ • DE.4.3 Direct Address Detector (agents/guide/direct_address.go)                ││
+│ │   - DetectDirectAddress(query) → (AgentType, cleanedQuery, bool)                 ││
+│ │   - Patterns: "@Librarian", "@Academic", "@Archivalist", etc.                    ││
+│ │   - Case-insensitive matching                                                    ││
+│ │   - Extracts agent type and returns query without the address prefix             ││
+│ │   - Returns false if no explicit address detected                                ││
+│ │   ACCEPTANCE: All agent names detected, cleaned query preserves intent           ││
+│ │   FILES: agents/guide/direct_address.go, direct_address_test.go                  ││
+│ │                                                                                  ││
+│ │ • DE.4.4 Cross-Domain Router (agents/guide/crossdomain_router.go)                ││
+│ │   - HandleCrossDomain(ctx, query, domainContext) → routingDecision               ││
+│ │   - If explicit address: honor it, attach DomainContext for agent awareness      ││
+│ │   - If cross-domain without address: route to Architect for coordination         ││
+│ │   - If single domain: route to corresponding knowledge agent                     ││
+│ │   - DomainRoutingDecision struct with target, domains, explicit_address bool     ││
+│ │   ACCEPTANCE: Routing matches ARCHITECTURE.md decision matrix, test coverage     ││
+│ │   DEPENDS ON: DE.4.1, DE.4.3                                                     ││
+│ │   FILES: agents/guide/crossdomain_router.go, crossdomain_router_test.go          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (All parallel - VectorDB integration, depend on DE.1.x):                 ││
+│ │                                                                                  ││
+│ │ • DE.5.1 VectorDB Domain Enum Extension (core/vectorgraphdb/types.go)            ││
+│ │   - Extend existing Domain enum (currently: Code, History, Academic)             ││
+│ │   - Add remaining 7 domains to match DE.1.1 taxonomy                             ││
+│ │   - Ensure backward compatibility with existing stored vectors                   ││
+│ │   - DomainFromString() and Domain.String() methods                               ││
+│ │   ACCEPTANCE: All 10 domains defined, existing vectors still queryable           ││
+│ │   MODIFY: core/vectorgraphdb/types.go (extend Domain enum)                       ││
+│ │   FILES: core/vectorgraphdb/types.go (modify), types_test.go (extend)            ││
+│ │                                                                                  ││
+│ │ • DE.5.2 VectorDB Domain Filter (core/vectorgraphdb/domain_filter.go)            ││
+│ │   - DomainFilter struct for query-time domain filtering                          ││
+│ │   - ApplyFilter(query, allowedDomains) → filteredQuery                           ││
+│ │   - Adds domain constraint to HNSW search                                        ││
+│ │   - Optimized: uses domain index for pre-filtering                               ││
+│ │   ACCEPTANCE: Filter reduces result set correctly, sub-1ms overhead              ││
+│ │   MODIFY: core/vectorgraphdb/query.go (add domain filter parameter)              ││
+│ │   FILES: core/vectorgraphdb/domain_filter.go, domain_filter_test.go              ││
+│ │                                                                                  ││
+│ │ • DE.5.3 VectorDB Domain Indexing (core/vectorgraphdb/domain_index.go)           ││
+│ │   - Secondary index for domain → vector IDs mapping                              ││
+│ │   - IndexByDomain(vectorID, domain) for ingestion                                ││
+│ │   - GetVectorsByDomain(domain) → []VectorID for pre-filtering                    ││
+│ │   - Uses existing B-tree or inverted index infrastructure                        ││
+│ │   ACCEPTANCE: Index maintains consistency, O(log n) lookups                      ││
+│ │   FILES: core/vectorgraphdb/domain_index.go, domain_index_test.go                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (All parallel - Bleve integration, depend on DE.1.x, Group 4L):          ││
+│ │                                                                                  ││
+│ │ • DE.6.1 Bleve Domain Field (core/search/bleve/domain_field.go)                  ││
+│ │   - Add "domain" field to Bleve document schema                                  ││
+│ │   - DomainFieldMapping for keyword-type indexing                                 ││
+│ │   - Integrate with existing document indexing pipeline                           ││
+│ │   - Migration: add domain field to existing documents (default: infer from path) ││
+│ │   ACCEPTANCE: Domain field indexed, existing docs migrated, test coverage        ││
+│ │   DEPENDS ON: Group 4L (DS.2.5 Bleve Schema)                                     ││
+│ │   MODIFY: core/search/bleve/schema.go (add domain field)                         ││
+│ │   FILES: core/search/bleve/domain_field.go, domain_field_test.go                 ││
+│ │                                                                                  ││
+│ │ • DE.6.2 Bleve Domain Query (core/search/bleve/domain_query.go)                  ││
+│ │   - DomainQuery struct for domain-filtered searches                              ││
+│ │   - BuildDomainQuery(textQuery, allowedDomains) → bleve.Query                    ││
+│ │   - Combines text query with domain term query using AND                         ││
+│ │   - Optimized: domain filter applied before text search                          ││
+│ │   ACCEPTANCE: Query returns only matching domains, <5ms overhead                 ││
+│ │   DEPENDS ON: DE.6.1, Group 4L (DS.2.6 Index Manager)                            ││
+│ │   FILES: core/search/bleve/domain_query.go, domain_query_test.go                 ││
+│ │                                                                                  ││
+│ │ • DE.6.3 Bleve Domain Faceting (core/search/bleve/domain_facet.go)               ││
+│ │   - DomainFacet for aggregating results by domain                                ││
+│ │   - GetDomainDistribution(results) → map[Domain]int                              ││
+│ │   - Useful for cross-domain result synthesis                                     ││
+│ │   - Integrates with search result types                                          ││
+│ │   ACCEPTANCE: Facet counts accurate, sub-1ms computation                         ││
+│ │   DEPENDS ON: DE.6.1, Group 4L (DS.1.6 Search Result Types)                      ││
+│ │   FILES: core/search/bleve/domain_facet.go, domain_facet_test.go                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 8 (After DE.4.x, DE.5.x, DE.6.x - Knowledge agent integration):            ││
+│ │                                                                                  ││
+│ │ • DE.7.1 Librarian Domain Filter (agents/librarian/domain_filter.go)             ││
+│ │   - LibrarianDomainFilter for implicit domain filtering                          ││
+│ │   - All Librarian queries automatically filter to DomainLibrarian                ││
+│ │   - WrapQuery(query) → domainFilteredQuery                                       ││
+│ │   - Integrates with Librarian's existing search methods                          ││
+│ │   - Logs when cross-domain query received (from DomainContext)                   ││
+│ │   ACCEPTANCE: Librarian only returns codebase content, test coverage             ││
+│ │   MODIFY: agents/librarian/librarian.go (add domain filter)                      ││
+│ │   FILES: agents/librarian/domain_filter.go, domain_filter_test.go                ││
+│ │                                                                                  ││
+│ │ • DE.7.2 Academic Domain Filter (agents/academic/domain_filter.go)               ││
+│ │   - AcademicDomainFilter for implicit domain filtering                           ││
+│ │   - All Academic queries automatically filter to DomainAcademic                  ││
+│ │   - WrapQuery(query) → domainFilteredQuery                                       ││
+│ │   - Integrates with Academic's existing search methods                           ││
+│ │   - Can request cross-domain consultation from Librarian if needed               ││
+│ │   ACCEPTANCE: Academic only returns research content, test coverage              ││
+│ │   MODIFY: agents/academic/academic.go (add domain filter)                        ││
+│ │   FILES: agents/academic/domain_filter.go, domain_filter_test.go                 ││
+│ │                                                                                  ││
+│ │ • DE.7.3 Archivalist Domain Filter (agents/archivalist/domain_filter.go)         ││
+│ │   - ArchivalistDomainFilter for implicit domain filtering                        ││
+│ │   - All Archivalist queries automatically filter to DomainArchivalist            ││
+│ │   - WrapQuery(query) → domainFilteredQuery                                       ││
+│ │   - Integrates with Archivalist's existing search methods                        ││
+│ │   - Historical content includes handoffs, sessions, decisions                    ││
+│ │   ACCEPTANCE: Archivalist only returns historical content, test coverage         ││
+│ │   MODIFY: agents/archivalist/archivalist.go (add domain filter)                  ││
+│ │   FILES: agents/archivalist/domain_filter.go, domain_filter_test.go              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 9 (After DE.7.x - Cross-domain coordination):                              ││
+│ │                                                                                  ││
+│ │ • DE.8.1 Architect Cross-Domain Handler (agents/architect/crossdomain.go)        ││
+│ │   - ArchitectCrossDomainHandler for coordinating multi-domain queries            ││
+│ │   - HandleCrossDomain(ctx, query, domainContext) → synthesizedResult             ││
+│ │   - Dispatches sub-queries to relevant knowledge agents in parallel              ││
+│ │   - Collects and synthesizes results from multiple domains                       ││
+│ │   - Maintains source attribution for each result component                       ││
+│ │   ACCEPTANCE: Parallel dispatch, proper synthesis, source tracking               ││
+│ │   DEPENDS ON: DE.7.x, existing Architect infrastructure                          ││
+│ │   MODIFY: agents/architect/architect.go (add cross-domain handler)               ││
+│ │   FILES: agents/architect/crossdomain.go, crossdomain_test.go                    ││
+│ │                                                                                  ││
+│ │ • DE.8.2 Cross-Domain Message Types (core/messages/crossdomain.go)               ││
+│ │   - CrossDomainRequest struct with query, source_domains, target_domains         ││
+│ │   - CrossDomainResponse struct with results, sources, synthesis_notes            ││
+│ │   - CrossDomainConsultation struct for agent-to-agent consultation               ││
+│ │   - Integrates with existing message infrastructure                              ││
+│ │   ACCEPTANCE: Message types compile, JSON serializable, test coverage            ││
+│ │   FILES: core/messages/crossdomain.go, crossdomain_test.go                       ││
+│ │                                                                                  ││
+│ │ • DE.8.3 Cross-Domain Result Synthesis (agents/architect/synthesis.go)           ││
+│ │   - ResultSynthesizer for combining multi-domain results                         ││
+│ │   - SynthesizeResults(results []DomainResult) → UnifiedResult                    ││
+│ │   - Deduplication: removes redundant information across domains                  ││
+│ │   - Conflict resolution: flags contradictory information                         ││
+│ │   - Source attribution: tracks origin domain for each piece                      ││
+│ │   ACCEPTANCE: Proper dedup, conflict flagging, source tracking, test coverage    ││
+│ │   DEPENDS ON: DE.8.2                                                             ││
+│ │   FILES: agents/architect/synthesis.go, synthesis_test.go                        ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 10 (After DE.4.x - System prompt updates):                                 ││
+│ │                                                                                  ││
+│ │ • DE.9.1 Guide Domain Prompt Additions (prompts/guide_domain.md)                 ││
+│ │   - Add domain classification explanation to Guide system prompt                 ││
+│ │   - Document cross-domain routing behavior                                       ││
+│ │   - Explain explicit @agent addressing                                           ││
+│ │   - Include DomainContext structure explanation                                  ││
+│ │   ACCEPTANCE: Prompt additions match ARCHITECTURE.md, clear instructions         ││
+│ │   MODIFY: prompts/guide.md (add domain section)                                  ││
+│ │   FILES: prompts/guide_domain.md (template for inclusion)                        ││
+│ │                                                                                  ││
+│ │ • DE.9.2 Knowledge Agent Domain Prompts (prompts/knowledge_domain.md)            ││
+│ │   - Add domain awareness to Librarian, Academic, Archivalist prompts             ││
+│ │   - Explain implicit domain filtering                                            ││
+│ │   - Document cross-domain consultation protocol                                  ││
+│ │   - Include handling for cross-domain queries routed via DomainContext           ││
+│ │   ACCEPTANCE: All knowledge agent prompts updated, consistent format             ││
+│ │   MODIFY: prompts/librarian.md, prompts/academic.md, prompts/archivalist.md      ││
+│ │   FILES: prompts/knowledge_domain.md (template for inclusion)                    ││
+│ │                                                                                  ││
+│ │ • DE.9.3 Architect Cross-Domain Prompts (prompts/architect_crossdomain.md)       ││
+│ │   - Add cross-domain coordination explanation to Architect prompt                ││
+│ │   - Document multi-domain query handling                                         ││
+│ │   - Explain result synthesis responsibilities                                    ││
+│ │   - Include conflict resolution guidelines                                       ││
+│ │   ACCEPTANCE: Architect prompt updated, coordination clear                       ││
+│ │   MODIFY: prompts/architect.md (add cross-domain section)                        ││
+│ │   FILES: prompts/architect_crossdomain.md (template for inclusion)               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 11 (After ALL complete - Integration tests):                               ││
+│ │                                                                                  ││
+│ │ • DE.10.1 Domain Classification Tests (tests/integration/domain_classify_test.go)││
+│ │   - Test lexical classification accuracy on curated corpus                       ││
+│ │   - Test embedding classification with edge cases                                ││
+│ │   - Test cascade early exit behavior                                             ││
+│ │   - Test cross-domain detection threshold                                        ││
+│ │   - Test cache hit/miss behavior                                                 ││
+│ │   ACCEPTANCE: 90%+ accuracy on test corpus, all edge cases covered               ││
+│ │   FILES: tests/integration/domain_classify_test.go                               ││
+│ │                                                                                  ││
+│ │ • DE.10.2 Domain Routing Tests (tests/integration/domain_routing_test.go)        ││
+│ │   - Test explicit @agent addressing                                              ││
+│ │   - Test cross-domain → Architect routing                                        ││
+│ │   - Test single-domain → knowledge agent routing                                 ││
+│ │   - Test prefetch domain filtering                                               ││
+│ │   - Test DomainContext propagation through system                                ││
+│ │   ACCEPTANCE: All routing paths tested, DomainContext preserved                  ││
+│ │   FILES: tests/integration/domain_routing_test.go                                ││
+│ │                                                                                  ││
+│ │ • DE.10.3 End-to-End Domain Isolation Tests (tests/e2e/domain_isolation_test.go) ││
+│ │   - Test: Engineer query to Librarian returns ONLY codebase content              ││
+│ │   - Test: Academic research papers NEVER returned for code queries               ││
+│ │   - Test: Cross-domain query properly synthesized by Architect                   ││
+│ │   - Test: Direct @Librarian for research query honors address                    ││
+│ │   - Test: Domain contamination scenarios from problem statement                  ││
+│ │   ACCEPTANCE: No domain contamination, proper synthesis, explicit honor          ││
+│ │   FILES: tests/e2e/domain_isolation_test.go                                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES SUMMARY:                                                                   ││
+│ │   core/domain/domain.go, context.go, config.go + tests                           ││
+│ │   core/domain/classifier/*.go (stage, lexical, embedding, context, llm, cascade) ││
+│ │   core/domain/cache/*.go (cache, keys, stats) + tests                            ││
+│ │   agents/guide/domain_classifier.go, prefetch_domain.go, direct_address.go       ││
+│ │   agents/guide/crossdomain_router.go + tests                                     ││
+│ │   core/vectorgraphdb/domain_filter.go, domain_index.go + tests                   ││
+│ │   core/search/bleve/domain_field.go, domain_query.go, domain_facet.go + tests    ││
+│ │   agents/librarian/domain_filter.go + test                                       ││
+│ │   agents/academic/domain_filter.go + test                                        ││
+│ │   agents/archivalist/domain_filter.go + test                                     ││
+│ │   agents/architect/crossdomain.go, synthesis.go + tests                          ││
+│ │   core/messages/crossdomain.go + test                                            ││
+│ │   prompts/guide_domain.md, knowledge_domain.md, architect_crossdomain.md         ││
+│ │   tests/integration/domain_classify_test.go, domain_routing_test.go              ││
+│ │   tests/e2e/domain_isolation_test.go                                             ││
+│ │                                                                                  ││
+│ │ MODIFY (existing files):                                                         ││
+│ │   core/vectorgraphdb/types.go (extend Domain enum)                               ││
+│ │   core/vectorgraphdb/query.go (add domain filter parameter)                      ││
+│ │   core/search/bleve/schema.go (add domain field)                                 ││
+│ │   core/context/speculative_prefetch.go (add domain filtering)                    ││
+│ │   agents/guide/guide.go (add classifier field)                                   ││
+│ │   agents/librarian/librarian.go (add domain filter)                              ││
+│ │   agents/academic/academic.go (add domain filter)                                ││
+│ │   agents/archivalist/archivalist.go (add domain filter)                          ││
+│ │   agents/architect/architect.go (add cross-domain handler)                       ││
+│ │   prompts/guide.md, librarian.md, academic.md, archivalist.md, architect.md      ││
+│ │                                                                                  ││
+│ │ FEATURES:                                                                        ││
+│ │   - 10-domain taxonomy covering all agent specializations                        ││
+│ │   - Multi-stage classification cascade with early exit                           ││
+│ │   - Ristretto caching for classification results                                 ││
+│ │   - Implicit domain filtering (agent identity = domain filter)                   ││
+│ │   - Explicit @agent addressing (always honored, even for cross-domain)           ││
+│ │   - Cross-domain → Architect coordination                                        ││
+│ │   - VectorDB and Bleve domain integration                                        ││
+│ │   - Prefetch domain filtering                                                    ││
+│ │   - System prompt updates for domain awareness                                   ││
+│ │   - Comprehensive integration and E2E tests                                      ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (3 parallel) → Phase 2 (5 parallel) → Phase 3 → Phase 4 (3 parallel)   ││
+│ │   Phase 5 (4 parallel) → Phase 6 (3 parallel) + Phase 7 (3 parallel)             ││
+│ │   Phase 8 (3 parallel) → Phase 9 (3 parallel) → Phase 10 (3 parallel)            ││
+│ │   Phase 11 (3 parallel tests) after all                                          ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - github.com/dgraph-io/ristretto (caching)                                     ││
+│ │   - Group 4L: Document Search System (Bleve integration)                         ││
+│ │   - Existing VectorGraphDB (vector search, domain indexing)                      ││
+│ │   - Existing Guide, Librarian, Academic, Archivalist, Architect agents           ││
+│ │   - CONTEXT.md: SpeculativePrefetcher infrastructure                             ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Integrates with Guide for query classification and routing                   ││
+│ │   - Integrates with SpeculativePrefetcher for domain-filtered prefetch           ││
+│ │   - Integrates with VectorGraphDB for domain-aware vector search                 ││
+│ │   - Integrates with Bleve for domain-filtered text search                        ││
+│ │   - Integrates with knowledge agents for implicit filtering                      ││
+│ │   - Integrates with Architect for cross-domain coordination                      ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                      ││
+│ │   Domain Expertise System is required for proper knowledge agent isolation.      ││
+│ │   Without domain separation, DB queries return results from wrong domains,       ││
+│ │   confusing agents and degrading response quality. This system integrates        ││
+│ │   with Document Search (Group 4L) and VectorDB, both Wave 4 components.          ││
+│ │   Must be implemented alongside other Wave 4 robustness systems.                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 100-120 parallel engineer pipelines (increased for DE system)  │
 │ DEPENDENCIES: Wave 3 complete, Group 4L (Document Search), Group 4M (partial)      │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
