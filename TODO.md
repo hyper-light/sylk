@@ -13010,12 +13010,12 @@ ALL ─────────────────────────�
 - `core/llm/bulkhead/types.go`
 
 **Acceptance Criteria:**
-- [ ] `BulkheadLevel` enum: LevelSession, LevelProvider, LevelModel
-- [ ] `BulkheadConfig` struct with MaxConcurrent, MaxQueueSize, QueueTimeout, CircuitConfig
-- [ ] `CircuitConfig` struct with FailureThreshold, SuccessThreshold, Timeout
-- [ ] `DefaultBulkheadConfigs()` returns production defaults (5/3/2 for session/provider/model)
-- [ ] `AcquireResult` struct for async acquisition results
-- [ ] `BulkheadStats` struct for metrics exposure
+- [x] `BulkheadLevel` enum: LevelSession, LevelProvider, LevelModel
+- [x] `BulkheadConfig` struct with MaxConcurrent, MaxQueueSize, QueueTimeout, CircuitConfig
+- [x] `CircuitConfig` struct with FailureThreshold, SuccessThreshold, Timeout
+- [x] `DefaultBulkheadConfigs()` returns production defaults (5/3/2 for session/provider/model)
+- [x] `AcquireResult` struct for async acquisition results
+- [x] `BulkheadStats` struct for metrics exposure
 
 **Implementation Guidelines:**
 - Session: 5 concurrent, 50 queue, 30s timeout
@@ -13024,8 +13024,8 @@ ALL ─────────────────────────�
 - Total max concurrent per session: 5×3×2 = 30
 
 **Tests:**
-- [ ] Default configs return expected values
-- [ ] Configs are properly validated
+- [x] Default configs return expected values
+- [x] Configs are properly validated
 
 ---
 
@@ -13035,15 +13035,15 @@ ALL ─────────────────────────�
 - `core/llm/bulkhead/bulkhead.go`
 
 **Acceptance Criteria:**
-- [ ] `Bulkhead` struct with semaphore (chan struct{}), queue, circuit state
-- [ ] `NewBulkhead(id, level, config)` constructor pre-fills semaphore
-- [ ] `Acquire(ctx)` checks circuit, tries immediate acquisition, falls back to queue
-- [ ] `Release()` returns slot to semaphore
-- [ ] `RecordSuccess()` updates circuit state (consecutive success tracking)
-- [ ] `RecordFailure()` updates circuit state (consecutive fail tracking, opens circuit)
-- [ ] Circuit states: closed (0), open (1), half-open (2) using atomic.Int32
-- [ ] Queue processing goroutine handles pending requests with timeout
-- [ ] `Stats()` returns current BulkheadStats
+- [x] `Bulkhead` struct with semaphore (chan struct{}), queue, circuit state
+- [x] `NewBulkhead(id, level, config)` constructor pre-fills semaphore
+- [x] `Acquire(ctx)` checks circuit, tries immediate acquisition, falls back to queue
+- [x] `Release()` returns slot to semaphore
+- [x] `RecordSuccess()` updates circuit state (consecutive success tracking)
+- [x] `RecordFailure()` updates circuit state (consecutive fail tracking, opens circuit)
+- [x] Circuit states: closed (0), open (1), half-open (2) using atomic.Int32
+- [x] Queue processing goroutine handles pending requests with timeout
+- [x] `Stats()` returns current BulkheadStats
 
 **Implementation Guidelines:**
 - Use `chan struct{}` for semaphore (pre-filled to capacity)
@@ -13053,16 +13053,16 @@ ALL ─────────────────────────�
 - Circuit closes after SuccessThreshold consecutive successes in half-open
 
 **Errors:**
-- [ ] `ErrCircuitOpen` when circuit is open and timeout not elapsed
-- [ ] `ErrQueueFull` when queue is at capacity
-- [ ] `ErrQueueTimeout` when request times out in queue
+- [x] `ErrCircuitOpen` when circuit is open and timeout not elapsed
+- [x] `ErrQueueFull` when queue is at capacity
+- [x] `ErrQueueTimeout` when request times out in queue
 
 **Tests:**
-- [ ] Semaphore limits concurrent acquisitions
-- [ ] Queue handles overflow correctly
-- [ ] Circuit opens after threshold failures
-- [ ] Circuit half-opens after timeout
-- [ ] Circuit closes after threshold successes
+- [x] Semaphore limits concurrent acquisitions
+- [x] Queue handles overflow correctly
+- [x] Circuit opens after threshold failures
+- [x] Circuit half-opens after timeout
+- [x] Circuit closes after threshold successes
 
 ---
 
@@ -13072,14 +13072,14 @@ ALL ─────────────────────────�
 - `core/llm/bulkhead/hierarchy.go`
 
 **Acceptance Criteria:**
-- [ ] `HierarchicalBulkhead` struct with session bulkhead, provider map, model map
-- [ ] `NewHierarchicalBulkhead(sessionID, configs)` creates session-level bulkhead
-- [ ] `Acquire(ctx, provider, model)` acquires slots at all three levels atomically
-- [ ] On any level failure, releases already-acquired levels
-- [ ] `getOrCreateProvider(provider)` lazy-creates provider bulkheads
-- [ ] `getOrCreateModel(provider, model)` lazy-creates model bulkheads
-- [ ] `Stats()` returns HierarchyStats with all bulkhead states
-- [ ] Uses sync.Map for provider/model maps (concurrent access)
+- [x] `HierarchicalBulkhead` struct with session bulkhead, provider map, model map
+- [x] `NewHierarchicalBulkhead(sessionID, configs)` creates session-level bulkhead
+- [x] `Acquire(ctx, provider, model)` acquires slots at all three levels atomically
+- [x] On any level failure, releases already-acquired levels
+- [x] `getOrCreateProvider(provider)` lazy-creates provider bulkheads
+- [x] `getOrCreateModel(provider, model)` lazy-creates model bulkheads
+- [x] `Stats()` returns HierarchyStats with all bulkhead states
+- [x] Uses sync.Map for provider/model maps (concurrent access)
 
 **Implementation Guidelines:**
 - Acquire order: session → provider → model
@@ -13087,10 +13087,10 @@ ALL ─────────────────────────�
 - Use double-checked locking for lazy creation
 
 **Tests:**
-- [ ] Hierarchy correctly isolates sessions
-- [ ] Provider bulkheads created on demand
-- [ ] Model bulkheads created on demand
-- [ ] Partial acquisition failures release held slots
+- [x] Hierarchy correctly isolates sessions
+- [x] Provider bulkheads created on demand
+- [x] Model bulkheads created on demand
+- [x] Partial acquisition failures release held slots
 
 ---
 
@@ -13100,15 +13100,15 @@ ALL ─────────────────────────�
 - `core/llm/bulkhead/slot.go`
 
 **Acceptance Criteria:**
-- [ ] `HierarchicalSlot` struct holds references to all three bulkheads
-- [ ] `Release()` releases slots at all levels (idempotent via atomic.Bool)
-- [ ] `RecordSuccess()` records success at all levels
-- [ ] `RecordFailure()` records failure at all levels
-- [ ] Released flag prevents double-release
+- [x] `HierarchicalSlot` struct holds references to all three bulkheads
+- [x] `Release()` releases slots at all levels (idempotent via atomic.Bool)
+- [x] `RecordSuccess()` records success at all levels
+- [x] `RecordFailure()` records failure at all levels
+- [x] Released flag prevents double-release
 
 **Tests:**
-- [ ] Release is idempotent
-- [ ] Success/failure propagates to all levels
+- [x] Release is idempotent
+- [x] Success/failure propagates to all levels
 
 ---
 
@@ -13118,12 +13118,12 @@ ALL ─────────────────────────�
 - `core/llm/ratelimit/types.go`
 
 **Acceptance Criteria:**
-- [ ] `RateLimitDecision` struct: Allowed, WaitTime, Reason, Limiter, Confidence
-- [ ] `MultiLayerConfig` struct with TokenBucket, SlidingWindow, Adaptive configs
-- [ ] `TokenBucketConfig` struct: Capacity, RefillRate
-- [ ] `SlidingWindowConfig` struct: WindowSize, MaxRequests
-- [ ] `Adaptive429Config` struct: InitialLimit, DecayFactor, GrowthFactor, MinLimit, MaxLimit
-- [ ] `DefaultMultiLayerConfig()` returns production defaults
+- [x] `RateLimitDecision` struct: Allowed, WaitTime, Reason, Limiter, Confidence
+- [x] `MultiLayerConfig` struct with TokenBucket, SlidingWindow, Adaptive configs
+- [x] `TokenBucketConfig` struct: Capacity, RefillRate
+- [x] `SlidingWindowConfig` struct: WindowSize, MaxRequests
+- [x] `Adaptive429Config` struct: InitialLimit, DecayFactor, GrowthFactor, MinLimit, MaxLimit
+- [x] `DefaultMultiLayerConfig()` returns production defaults
 
 **Implementation Guidelines:**
 - Token bucket: 100 capacity, 10/sec refill
@@ -13131,7 +13131,7 @@ ALL ─────────────────────────�
 - Adaptive: 50 initial, 0.95 decay, 1.05 growth, 5 min, 200 max
 
 **Tests:**
-- [ ] Default configs return expected values
+- [x] Default configs return expected values
 
 ---
 
@@ -13141,12 +13141,12 @@ ALL ─────────────────────────�
 - `core/llm/ratelimit/token_bucket.go`
 
 **Acceptance Criteria:**
-- [ ] `TokenBucketLimiter` struct with tokens (float64), lastRefill, mutex
-- [ ] `NewTokenBucketLimiter(config)` starts with full capacity
-- [ ] `Check()` refills tokens, returns RateLimitDecision
-- [ ] `Consume(n)` deducts tokens after refill
-- [ ] Refill adds `elapsed.Seconds() * RefillRate` tokens, capped at capacity
-- [ ] WaitTime calculated as `tokensNeeded / RefillRate`
+- [x] `TokenBucketLimiter` struct with tokens (float64), lastRefill, mutex
+- [x] `NewTokenBucketLimiter(config)` starts with full capacity
+- [x] `Check()` refills tokens, returns RateLimitDecision
+- [x] `Consume(n)` deducts tokens after refill
+- [x] Refill adds `elapsed.Seconds() * RefillRate` tokens, capped at capacity
+- [x] WaitTime calculated as `tokensNeeded / RefillRate`
 
 **Implementation Guidelines:**
 - Use float64 for fractional tokens
@@ -13154,9 +13154,9 @@ ALL ─────────────────────────�
 - Confidence always 1.0 (deterministic)
 
 **Tests:**
-- [ ] Tokens refill over time
-- [ ] Check returns correct wait time when exhausted
-- [ ] Consume correctly deducts tokens
+- [x] Tokens refill over time
+- [x] Check returns correct wait time when exhausted
+- [x] Consume correctly deducts tokens
 
 ---
 
@@ -13166,21 +13166,21 @@ ALL ─────────────────────────�
 - `core/llm/ratelimit/sliding_window.go`
 
 **Acceptance Criteria:**
-- [ ] `SlidingWindowLimiter` with circular buffer of timestamps
-- [ ] `NewSlidingWindowLimiter(config)` allocates buffer
-- [ ] `Check()` cleans up old entries, returns decision
-- [ ] `Record()` adds current timestamp to buffer
-- [ ] Cleanup removes entries older than WindowSize
-- [ ] WaitTime calculated from oldest entry aging out
+- [x] `SlidingWindowLimiter` with circular buffer of timestamps
+- [x] `NewSlidingWindowLimiter(config)` allocates buffer
+- [x] `Check()` cleans up old entries, returns decision
+- [x] `Record()` adds current timestamp to buffer
+- [x] Cleanup removes entries older than WindowSize
+- [x] WaitTime calculated from oldest entry aging out
 
 **Implementation Guidelines:**
 - Circular buffer with head/count tracking
 - Mutex protects buffer state
 
 **Tests:**
-- [ ] Old entries cleaned up
-- [ ] Limit enforced after MaxRequests
-- [ ] Wait time correctly calculated
+- [x] Old entries cleaned up
+- [x] Limit enforced after MaxRequests
+- [x] Wait time correctly calculated
 
 ---
 
@@ -13190,22 +13190,22 @@ ALL ─────────────────────────�
 - `core/llm/ratelimit/adaptive_429.go`
 
 **Acceptance Criteria:**
-- [ ] `Adaptive429Limiter` with currentLimit, confidence, last429, successRun
-- [ ] `NewAdaptive429Limiter(config)` starts at InitialLimit with 0.5 confidence
-- [ ] `Check()` returns not-allowed if recent 429 (within 5s)
-- [ ] `Record429(retryAfter)` decreases limit by DecayFactor, increases confidence
-- [ ] `RecordSuccess()` increments successRun, increases limit after 10 consecutive
-- [ ] Limit clamped between MinLimit and MaxLimit
-- [ ] last429 cleared after 5 consecutive successes
+- [x] `Adaptive429Limiter` with currentLimit, confidence, last429, successRun
+- [x] `NewAdaptive429Limiter(config)` starts at InitialLimit with 0.5 confidence
+- [x] `Check()` returns not-allowed if recent 429 (within 5s)
+- [x] `Record429(retryAfter)` decreases limit by DecayFactor, increases confidence
+- [x] `RecordSuccess()` increments successRun, increases limit after 10 consecutive
+- [x] Limit clamped between MinLimit and MaxLimit
+- [x] last429 cleared after 5 consecutive successes
 
 **Implementation Guidelines:**
 - RWMutex for read-heavy access pattern
 - Confidence increases by 0.1 on each 429 (real data)
 
 **Tests:**
-- [ ] Limit decreases on 429
-- [ ] Limit increases after consecutive successes
-- [ ] Backoff enforced after recent 429
+- [x] Limit decreases on 429
+- [x] Limit increases after consecutive successes
+- [x] Backoff enforced after recent 429
 
 ---
 
@@ -13215,21 +13215,21 @@ ALL ─────────────────────────�
 - `core/llm/ratelimit/multi_layer.go`
 
 **Acceptance Criteria:**
-- [ ] `MultiLayerRateLimiter` combines all three limiters
-- [ ] `NewMultiLayerRateLimiter(provider, config)` creates all three
-- [ ] `Check()` queries all three, returns most restrictive decision
-- [ ] Most restrictive = longest WaitTime if not allowed
-- [ ] `RecordRequest()` calls Consume on token bucket, Record on sliding window
-- [ ] `Record429(retryAfter)` forwards to adaptive limiter
-- [ ] `RecordSuccess()` forwards to adaptive limiter
+- [x] `MultiLayerRateLimiter` combines all three limiters
+- [x] `NewMultiLayerRateLimiter(provider, config)` creates all three
+- [x] `Check()` queries all three, returns most restrictive decision
+- [x] Most restrictive = longest WaitTime if not allowed
+- [x] `RecordRequest()` calls Consume on token bucket, Record on sliding window
+- [x] `Record429(retryAfter)` forwards to adaptive limiter
+- [x] `RecordSuccess()` forwards to adaptive limiter
 
 **Implementation Guidelines:**
 - Per-provider rate limiter (not global)
 - Most restrictive wins ensures safety
 
 **Tests:**
-- [ ] Most restrictive decision returned
-- [ ] All limiters updated on request
+- [x] Most restrictive decision returned
+- [x] All limiters updated on request
 
 ---
 
@@ -13239,11 +13239,11 @@ ALL ─────────────────────────�
 - `core/llm/backpressure/types.go`
 
 **Acceptance Criteria:**
-- [ ] `CostBackpressureConfig` with DelayThresholds, RejectNewAt, BaseDelay
-- [ ] `DelayThreshold` struct: UsagePercent, Multiplier
-- [ ] `BackpressureDecision` struct: Delay, Reject, UsagePercent, Reason
-- [ ] `DefaultCostBackpressureConfig()` returns production defaults
-- [ ] NO model degradation fields (SuggestModel, EnforceModel, etc.)
+- [x] `CostBackpressureConfig` with DelayThresholds, RejectNewAt, BaseDelay
+- [x] `DelayThreshold` struct: UsagePercent, Multiplier
+- [x] `BackpressureDecision` struct: Delay, Reject, UsagePercent, Reason
+- [x] `DefaultCostBackpressureConfig()` returns production defaults
+- [x] NO model degradation fields (SuggestModel, EnforceModel, etc.)
 
 **Implementation Guidelines:**
 - 80%: 1.5x, 90%: 2x, 95%: 4x, 98%: 8x delays
@@ -13251,7 +13251,7 @@ ALL ─────────────────────────�
 - BaseDelay: 100ms
 
 **Tests:**
-- [ ] Default config has correct thresholds
+- [x] Default config has correct thresholds
 
 ---
 
@@ -13261,11 +13261,11 @@ ALL ─────────────────────────�
 - `core/llm/backpressure/budget.go`
 
 **Acceptance Criteria:**
-- [ ] `BudgetGetter` interface with GetUsagePercent, GetTaskUsagePercent
-- [ ] Interface allows integration with existing budget tracking
+- [x] `BudgetGetter` interface with GetUsagePercent, GetTaskUsagePercent
+- [x] Interface allows integration with existing budget tracking
 
 **Tests:**
-- [ ] Mock implementation for testing
+- [x] Mock implementation for testing
 
 ---
 
@@ -13275,22 +13275,22 @@ ALL ─────────────────────────�
 - `core/llm/backpressure/cost_aware.go`
 
 **Acceptance Criteria:**
-- [ ] `CostBackpressure` struct with config and budgetGetter
-- [ ] `NewCostBackpressure(config, budget)` constructor (NO modelRanker)
-- [ ] `Evaluate(sessionID, taskID)` returns BackpressureDecision (NO model parameter)
-- [ ] Uses max of session and task usage
-- [ ] Returns Reject=true at RejectNewAt threshold
-- [ ] Calculates delay based on thresholds
-- [ ] NO model degradation logic
+- [x] `CostBackpressure` struct with config and budgetGetter
+- [x] `NewCostBackpressure(config, budget)` constructor (NO modelRanker)
+- [x] `Evaluate(sessionID, taskID)` returns BackpressureDecision (NO model parameter)
+- [x] Uses max of session and task usage
+- [x] Returns Reject=true at RejectNewAt threshold
+- [x] Calculates delay based on thresholds
+- [x] NO model degradation logic
 
 **Implementation Guidelines:**
 - Iterate thresholds, use highest matching multiplier
 - Return 0 delay if below first threshold
 
 **Tests:**
-- [ ] Correct delay at each threshold
-- [ ] Reject at 100%
-- [ ] Uses max of session/task usage
+- [x] Correct delay at each threshold
+- [x] Reject at 100%
+- [x] Uses max of session/task usage
 
 ---
 
@@ -13300,10 +13300,10 @@ ALL ─────────────────────────�
 - `core/llm/health/types.go`
 
 **Acceptance Criteria:**
-- [ ] `HealthConfig` with ProbeInterval, ProbeTimeout, WindowSize, MinSamples, weights, thresholds
-- [ ] `HealthDecision` struct: Proceed, Score, Status, Reason
-- [ ] `HealthStatus` enum: HealthHealthy, HealthMonitored, HealthDegraded, HealthDead
-- [ ] `DefaultHealthConfig()` returns production defaults
+- [x] `HealthConfig` with ProbeInterval, ProbeTimeout, WindowSize, MinSamples, weights, thresholds
+- [x] `HealthDecision` struct: Proceed, Score, Status, Reason
+- [x] `HealthStatus` enum: HealthHealthy, HealthMonitored, HealthDegraded, HealthDead
+- [x] `DefaultHealthConfig()` returns production defaults
 
 **Implementation Guidelines:**
 - ProbeInterval: 30s, ProbeTimeout: 5s
@@ -13311,7 +13311,7 @@ ALL ─────────────────────────�
 - Thresholds: 0.3 reject, 0.5 warn, 0.7 monitor
 
 **Tests:**
-- [ ] Default config has correct values
+- [x] Default config has correct values
 
 ---
 
@@ -13321,12 +13321,12 @@ ALL ─────────────────────────�
 - `core/llm/health/active_prober.go`
 
 **Acceptance Criteria:**
-- [ ] `ProbeFunc` type: `func(ctx context.Context) error`
-- [ ] `ActiveProber` with interval, timeout, probe func, success/failure tracking
-- [ ] `NewActiveProber(provider, interval, timeout, probe)` starts probe loop
-- [ ] Probe loop runs on ticker, calls probe func with timeout context
-- [ ] `Score()` returns 0-1 based on last success/failure and consecutive counts
-- [ ] `Stop()` stops the probe loop
+- [x] `ProbeFunc` type: `func(ctx context.Context) error`
+- [x] `ActiveProber` with interval, timeout, probe func, success/failure tracking
+- [x] `NewActiveProber(provider, interval, timeout, probe)` starts probe loop
+- [x] Probe loop runs on ticker, calls probe func with timeout context
+- [x] `Score()` returns 0-1 based on last success/failure and consecutive counts
+- [x] `Stop()` stops the probe loop
 
 **Implementation Guidelines:**
 - Assume healthy at start (lastSuccess = now)
@@ -13334,9 +13334,9 @@ ALL ─────────────────────────�
 - 5+ consecutive failures = 0.0 score
 
 **Tests:**
-- [ ] Probe runs on interval
-- [ ] Score reflects probe outcomes
-- [ ] Stop terminates loop
+- [x] Probe runs on interval
+- [x] Score reflects probe outcomes
+- [x] Stop terminates loop
 
 ---
 
@@ -13346,14 +13346,14 @@ ALL ─────────────────────────�
 - `core/llm/health/passive_monitor.go`
 
 **Acceptance Criteria:**
-- [ ] `PassiveMonitor` with ring buffer of outcomes
-- [ ] `outcome` struct: timestamp, success, latency, errorType
-- [ ] `errorCategory` enum: errNone, errTransient, errRateLimit, errAuth, errPermanent
-- [ ] `NewPassiveMonitor(windowSize, minSamples)` allocates buffer
-- [ ] `RecordSuccess(latency)` adds success outcome
-- [ ] `RecordFailure(err)` categorizes error and adds failure outcome
-- [ ] `Score()` calculates success rate within window, penalizes high latency
-- [ ] `categorizeError(err)` categorizes by error string patterns
+- [x] `PassiveMonitor` with ring buffer of outcomes
+- [x] `outcome` struct: timestamp, success, latency, errorType
+- [x] `errorCategory` enum: errNone, errTransient, errRateLimit, errAuth, errPermanent
+- [x] `NewPassiveMonitor(windowSize, minSamples)` allocates buffer
+- [x] `RecordSuccess(latency)` adds success outcome
+- [x] `RecordFailure(err)` categorizes error and adds failure outcome
+- [x] `Score()` calculates success rate within window, penalizes high latency
+- [x] `categorizeError(err)` categorizes by error string patterns
 
 **Implementation Guidelines:**
 - Ring buffer size = minSamples * 10
@@ -13361,9 +13361,9 @@ ALL ─────────────────────────�
 - 20% penalty for avg latency > 10s, 10% for > 5s
 
 **Tests:**
-- [ ] Success rate calculated correctly
-- [ ] Latency penalty applied
-- [ ] Error categorization works
+- [x] Success rate calculated correctly
+- [x] Latency penalty applied
+- [x] Error categorization works
 
 ---
 
@@ -13373,21 +13373,21 @@ ALL ─────────────────────────�
 - `core/llm/health/hybrid_monitor.go`
 
 **Acceptance Criteria:**
-- [ ] `HybridHealthMonitor` combines ActiveProber and PassiveMonitor
-- [ ] `NewHybridHealthMonitor(provider, config, probeFunc)` creates both
-- [ ] Score updater goroutine runs every 5s
-- [ ] Combined score = active * ActiveWeight + passive * PassiveWeight
-- [ ] `Score()` returns combined score (0-1)
-- [ ] `Check()` returns HealthDecision based on thresholds
-- [ ] `RecordSuccess(latency)` and `RecordFailure(err)` forward to passive
+- [x] `HybridHealthMonitor` combines ActiveProber and PassiveMonitor
+- [x] `NewHybridHealthMonitor(provider, config, probeFunc)` creates both
+- [x] Score updater goroutine runs every 5s
+- [x] Combined score = active * ActiveWeight + passive * PassiveWeight
+- [x] `Score()` returns combined score (0-1)
+- [x] `Check()` returns HealthDecision based on thresholds
+- [x] `RecordSuccess(latency)` and `RecordFailure(err)` forward to passive
 
 **Implementation Guidelines:**
 - Use atomic.Int64 for combined score (fixed-point * 1000)
 - Start healthy (score = 1000)
 
 **Tests:**
-- [ ] Combined score weighted correctly
-- [ ] Thresholds applied in Check()
+- [x] Combined score weighted correctly
+- [x] Thresholds applied in Check()
 
 ---
 
@@ -13397,15 +13397,15 @@ ALL ─────────────────────────�
 - `core/llm/timeout/types.go`
 
 **Acceptance Criteria:**
-- [ ] `StreamingTimeoutConfig` with FirstTokenTimeout, InterTokenTimeout, TotalTimeout
-- [ ] `StreamingStats` struct: Started, FirstTokenAt, LastTokenAt, TimeToFirstToken, TotalDuration
-- [ ] `DefaultStreamingTimeoutConfig()` returns production defaults
+- [x] `StreamingTimeoutConfig` with FirstTokenTimeout, InterTokenTimeout, TotalTimeout
+- [x] `StreamingStats` struct: Started, FirstTokenAt, LastTokenAt, TimeToFirstToken, TotalDuration
+- [x] `DefaultStreamingTimeoutConfig()` returns production defaults
 
 **Implementation Guidelines:**
 - FirstToken: 30s, InterToken: 10s, Total: 5m
 
 **Tests:**
-- [ ] Default config has correct values
+- [x] Default config has correct values
 
 ---
 
@@ -13415,25 +13415,25 @@ ALL ─────────────────────────�
 - `core/llm/timeout/streaming.go`
 
 **Acceptance Criteria:**
-- [ ] `StreamingTimeoutMonitor` tracks streaming response timeouts
-- [ ] `NewStreamingTimeoutMonitor(ctx, config)` creates monitor, starts timeout loop
-- [ ] First token timer fires ErrFirstTokenTimeout if no token received
-- [ ] Inter-token timer resets on each token, fires ErrInterTokenTimeout
-- [ ] Total timeout wraps parent context
-- [ ] `RecordToken()` signals token received (non-blocking)
-- [ ] `Done()` cancels total context
-- [ ] `Errors()` returns error channel
-- [ ] `Context()` returns total timeout context
-- [ ] `Stats()` returns StreamingStats
+- [x] `StreamingTimeoutMonitor` tracks streaming response timeouts
+- [x] `NewStreamingTimeoutMonitor(ctx, config)` creates monitor, starts timeout loop
+- [x] First token timer fires ErrFirstTokenTimeout if no token received
+- [x] Inter-token timer resets on each token, fires ErrInterTokenTimeout
+- [x] Total timeout wraps parent context
+- [x] `RecordToken()` signals token received (non-blocking)
+- [x] `Done()` cancels total context
+- [x] `Errors()` returns error channel
+- [x] `Context()` returns total timeout context
+- [x] `Stats()` returns StreamingStats
 
 **Errors:**
-- [ ] `ErrFirstTokenTimeout`
-- [ ] `ErrInterTokenTimeout`
+- [x] `ErrFirstTokenTimeout`
+- [x] `ErrInterTokenTimeout`
 
 **Tests:**
-- [ ] First token timeout fires correctly
-- [ ] Inter-token timeout fires on gap
-- [ ] Token recording resets timer
+- [x] First token timeout fires correctly
+- [x] Inter-token timeout fires on gap
+- [x] Token recording resets timer
 
 ---
 
@@ -13443,21 +13443,21 @@ ALL ─────────────────────────�
 - `core/llm/timeout/jittered_backoff.go`
 
 **Acceptance Criteria:**
-- [ ] `JitteredBackoff` with base, max, attempt, jitter range, rng
-- [ ] `NewJitteredBackoff(base, max)` creates with [0.5, 1.5] jitter range
-- [ ] `Next()` returns `base * 2^attempt * random(0.5, 1.5)`, capped at max
-- [ ] `Reset()` resets attempt counter
-- [ ] `Attempt()` returns current attempt number
-- [ ] Thread-safe with mutex
+- [x] `JitteredBackoff` with base, max, attempt, jitter range, rng
+- [x] `NewJitteredBackoff(base, max)` creates with [0.5, 1.5] jitter range
+- [x] `Next()` returns `base * 2^attempt * random(0.5, 1.5)`, capped at max
+- [x] `Reset()` resets attempt counter
+- [x] `Attempt()` returns current attempt number
+- [x] Thread-safe with mutex
 
 **Implementation Guidelines:**
 - Jitter prevents thundering herd
 - Use math/rand with per-instance seed
 
 **Tests:**
-- [ ] Backoff increases exponentially
-- [ ] Jitter applied within range
-- [ ] Max cap enforced
+- [x] Backoff increases exponentially
+- [x] Jitter applied within range
+- [x] Max cap enforced
 
 ---
 
@@ -13467,11 +13467,11 @@ ALL ─────────────────────────�
 - `core/llm/correlation/types.go`
 
 **Acceptance Criteria:**
-- [ ] `CorrelationConfig` with CorrelationWindow, MinFailuresForGlobal, GlobalBackoffBase, GlobalBackoffMax, RecoveryRampUp
-- [ ] `failureTracker` with failures slice, mutex
-- [ ] `failureEvent` struct: timestamp, sessionID, errorType
-- [ ] `globalBackoff` with active, until, attempt, trafficRatio atomics
-- [ ] `DefaultCorrelationConfig()` returns production defaults
+- [x] `CorrelationConfig` with CorrelationWindow, MinFailuresForGlobal, GlobalBackoffBase, GlobalBackoffMax, RecoveryRampUp
+- [x] `failureTracker` with failures slice, mutex
+- [x] `failureEvent` struct: timestamp, sessionID, errorType
+- [x] `globalBackoff` with active, until, attempt, trafficRatio atomics
+- [x] `DefaultCorrelationConfig()` returns production defaults
 
 **Implementation Guidelines:**
 - CorrelationWindow: 10s
@@ -13480,7 +13480,7 @@ ALL ─────────────────────────�
 - RecoveryRampUp: 0.1 (10% increments)
 
 **Tests:**
-- [ ] Default config has correct values
+- [x] Default config has correct values
 
 ---
 
@@ -13490,14 +13490,14 @@ ALL ─────────────────────────�
 - `core/llm/correlation/failure_engine.go`
 
 **Acceptance Criteria:**
-- [ ] `FailureCorrelationEngine` with providerFailures, globalBackoffs maps
-- [ ] `NewFailureCorrelationEngine(config, dispatcher)` constructor
-- [ ] `RecordFailure(provider, sessionID, err)` records and checks for correlation
-- [ ] Correlation detected when >= MinFailuresForGlobal unique sessions fail in window
-- [ ] `triggerGlobalBackoff(provider)` sets global backoff, schedules recovery
-- [ ] `scheduleRecovery(provider, backoff, duration)` gradually ramps up traffic
-- [ ] `ShouldAllow(provider)` returns false during active backoff (probabilistic based on trafficRatio)
-- [ ] Broadcasts GlobalBackoffSignal and GlobalRecoverySignal via dispatcher
+- [x] `FailureCorrelationEngine` with providerFailures, globalBackoffs maps
+- [x] `NewFailureCorrelationEngine(config, dispatcher)` constructor
+- [x] `RecordFailure(provider, sessionID, err)` records and checks for correlation
+- [x] Correlation detected when >= MinFailuresForGlobal unique sessions fail in window
+- [x] `triggerGlobalBackoff(provider)` sets global backoff, schedules recovery
+- [x] `scheduleRecovery(provider, backoff, duration)` gradually ramps up traffic
+- [x] `ShouldAllow(provider)` returns false during active backoff (probabilistic based on trafficRatio)
+- [x] Broadcasts GlobalBackoffSignal and GlobalRecoverySignal via dispatcher
 
 **Implementation Guidelines:**
 - Use sync.Map for concurrent access
@@ -13505,10 +13505,10 @@ ALL ─────────────────────────�
 - Recovery ramps 10% every 5s
 
 **Tests:**
-- [ ] Correlation detected across sessions
-- [ ] Global backoff triggered
-- [ ] Traffic gradually restored
-- [ ] Probabilistic allow works
+- [x] Correlation detected across sessions
+- [x] Global backoff triggered
+- [x] Traffic gradually restored
+- [x] Probabilistic allow works
 
 ---
 
@@ -13518,16 +13518,16 @@ ALL ─────────────────────────�
 - `core/llm/coordinator/types.go`
 
 **Acceptance Criteria:**
-- [ ] `CoordinatorConfig` aggregates all sub-configs (Bulkhead, RateLimit, Health, Backpressure, Correlation, StreamTimeout)
-- [ ] `LLMRequest` struct: SessionID, TaskID, Provider, Model, Messages, Stream
-- [ ] `LLMResponse` struct: Content, Chunks (chan string), Latency, Usage
-- [ ] `TokenUsage` struct: InputTokens, OutputTokens
-- [ ] `CoordinatorStats` for metrics
-- [ ] `ProviderStats` for per-provider metrics
-- [ ] `DefaultCoordinatorConfig()` combines all defaults
+- [x] `CoordinatorConfig` aggregates all sub-configs (Bulkhead, RateLimit, Health, Backpressure, Correlation, StreamTimeout)
+- [x] `LLMRequest` struct: SessionID, TaskID, Provider, Model, Messages, Stream
+- [x] `LLMResponse` struct: Content, Chunks (chan string), Latency, Usage
+- [x] `TokenUsage` struct: InputTokens, OutputTokens
+- [x] `CoordinatorStats` for metrics
+- [x] `ProviderStats` for per-provider metrics
+- [x] `DefaultCoordinatorConfig()` combines all defaults
 
 **Tests:**
-- [ ] Default config aggregates correctly
+- [x] Default config aggregates correctly
 
 ---
 
@@ -13537,27 +13537,27 @@ ALL ─────────────────────────�
 - `core/llm/coordinator/coordinator.go`
 
 **Acceptance Criteria:**
-- [ ] `LLMRequestCoordinator` orchestrates all protection layers
-- [ ] Per-session bulkheads (sync.Map)
-- [ ] Per-provider rate limiters (sync.Map)
-- [ ] Per-provider health monitors (sync.Map)
-- [ ] `ExecuteRequest(ctx, req)` orchestrates: health → global backoff → rate limits → cost backpressure → bulkhead → execute → record outcome
-- [ ] Cost backpressure applies delay, rejects at limit
-- [ ] NO model enforcement (removed)
-- [ ] `recordOutcome` updates all systems based on success/failure
-- [ ] `Stats()` returns CoordinatorStats
-- [ ] Lazy creation of bulkheads, limiters, monitors
+- [x] `LLMRequestCoordinator` orchestrates all protection layers
+- [x] Per-session bulkheads (sync.Map)
+- [x] Per-provider rate limiters (sync.Map)
+- [x] Per-provider health monitors (sync.Map)
+- [x] `ExecuteRequest(ctx, req)` orchestrates: health → global backoff → rate limits → cost backpressure → bulkhead → execute → record outcome
+- [x] Cost backpressure applies delay, rejects at limit
+- [x] NO model enforcement (removed)
+- [x] `recordOutcome` updates all systems based on success/failure
+- [x] `Stats()` returns CoordinatorStats
+- [x] Lazy creation of bulkheads, limiters, monitors
 
 **Errors:**
-- [ ] `ErrGlobalBackoff`
-- [ ] `ErrProviderUnhealthy`
-- [ ] `ErrRateLimited`
-- [ ] `ErrBudgetExhausted`
+- [x] `ErrGlobalBackoff`
+- [x] `ErrProviderUnhealthy`
+- [x] `ErrRateLimited`
+- [x] `ErrBudgetExhausted`
 
 **Tests:**
-- [ ] Full request flow works
-- [ ] Each protection layer consulted
-- [ ] Outcomes recorded correctly
+- [x] Full request flow works
+- [x] Each protection layer consulted
+- [x] Outcomes recorded correctly
 
 ---
 
@@ -13567,18 +13567,18 @@ ALL ─────────────────────────�
 - `core/llm/client.go` (or appropriate existing file)
 
 **Acceptance Criteria:**
-- [ ] Existing LLM client uses LLMRequestCoordinator
-- [ ] All LLM requests flow through coordinator
-- [ ] Streaming responses use StreamingTimeoutMonitor
-- [ ] Non-streaming uses TotalTimeout
+- [x] Existing LLM client uses LLMRequestCoordinator
+- [x] All LLM requests flow through coordinator
+- [x] Streaming responses use StreamingTimeoutMonitor
+- [x] Non-streaming uses TotalTimeout
 
 **Implementation Guidelines:**
 - Wrap existing provider calls with coordinator
 - Integrate with existing retry logic
 
 **Tests:**
-- [ ] Integration with existing client works
-- [ ] All protection applied to real requests
+- [x] Integration with existing client works
+- [x] All protection applied to real requests
 
 ---
 
@@ -13588,22 +13588,22 @@ ALL ─────────────────────────�
 - `core/llm/cascade_integration_test.go`
 
 **Acceptance Criteria:**
-- [ ] Test session isolation: session A failure doesn't affect session B slots
-- [ ] Test provider isolation: provider A failure doesn't affect provider B
-- [ ] Test model isolation: model A failure doesn't affect model B
-- [ ] Test multi-layer rate limiting: most restrictive wins
-- [ ] Test cost backpressure delays: delays applied at thresholds
-- [ ] Test cost backpressure rejection: rejected at 100%
-- [ ] Test health monitoring: unhealthy provider rejected
-- [ ] Test failure correlation: global backoff triggered on multi-session failure
-- [ ] Test staggered recovery: traffic gradually restored
-- [ ] Test streaming timeouts: first-token and inter-token timeouts work
-- [ ] Test jittered backoff: delays have jitter applied
-- [ ] Race condition test: run with `-race` flag
+- [x] Test session isolation: session A failure doesn't affect session B slots
+- [x] Test provider isolation: provider A failure doesn't affect provider B
+- [x] Test model isolation: model A failure doesn't affect model B
+- [x] Test multi-layer rate limiting: most restrictive wins
+- [x] Test cost backpressure delays: delays applied at thresholds
+- [x] Test cost backpressure rejection: rejected at 100%
+- [x] Test health monitoring: unhealthy provider rejected
+- [x] Test failure correlation: global backoff triggered on multi-session failure
+- [x] Test staggered recovery: traffic gradually restored
+- [x] Test streaming timeouts: first-token and inter-token timeouts work
+- [x] Test jittered backoff: delays have jitter applied
+- [x] Race condition test: run with `-race` flag
 
 **Tests:**
-- [ ] All integration tests pass
-- [ ] No race conditions detected
+- [x] All integration tests pass
+- [x] No race conditions detected
 
 ---
 
@@ -26376,45 +26376,43 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4H: File Handle Management System (FH.1-FH.9)                    ││
-│ │ ** NEW: Hierarchical work-stealing file handle allocation **                    ││
+│ │ PARALLEL GROUP 4H: File Handle Management System (FH.1-FH.9) ✅ COMPLETE        ││
+│ │ ** Hierarchical work-stealing file handle allocation **                         ││
 │ │                                                                                  ││
 │ │ PHASE 1 (All parallel - foundation, no interdependencies):                      ││
-│ │ • FH.1 FileHandleBudget - global pool (core/resources/file_handle_budget.go)    ││
-│ │ • FH.4 TrackedFile - implements TrackedResource (core/resources/tracked_file.go)││
-│ │ • FH.5 ResourceNotifier - UI notification interface (core/resources/notifier.go)││
-│ │ • FH.7 FileHandleSnapshot - monitoring (core/resources/file_handle_snapshot.go) ││
+│ │ ✅ FH.1 FileHandleBudget - global pool (core/resources/file_handle_budget.go)   ││
+│ │ ✅ FH.4 TrackedFile - implements TrackedResource (core/resources/tracked_file.go││
+│ │ ✅ FH.5 ResourceNotifier - UI notification interface (core/resources/notifier.go││
+│ │ ✅ FH.7 FileHandleSnapshot - monitoring (core/resources/file_handle_snapshot.go)││
 │ │                                                                                  ││
 │ │ PHASE 2 (After FH.1):                                                           ││
-│ │ • FH.2 SessionFileBudget - per-session allocation (depends on FH.1)             ││
+│ │ ✅ FH.2 SessionFileBudget - per-session allocation (depends on FH.1)            ││
 │ │                                                                                  ││
 │ │ PHASE 3 (After FH.2):                                                           ││
-│ │ • FH.3 AgentFileBudget - per-agent allocation (depends on FH.2)                 ││
+│ │ ✅ FH.3 AgentFileBudget - per-agent allocation (depends on FH.2)                ││
 │ │                                                                                  ││
 │ │ PHASE 4 (After FH.3, FH.4, FH.5):                                               ││
-│ │ • FH.6 AgentSupervisor.OpenFile - integration (modify agent_supervisor.go)      ││
+│ │ ✅ FH.6 AgentSupervisor.OpenFile - integration (modify agent_supervisor.go)     ││
 │ │                                                                                  ││
 │ │ PHASE 5 (After FH.1, MP.11):                                                    ││
-│ │ • FH.8 Memory Pressure Integration (core/resources/pressure_controller.go)      ││
+│ │ ✅ FH.8 Memory Pressure Integration (core/resources/pressure_controller.go)     ││
 │ │                                                                                  ││
 │ │ PHASE 6 (After ALL complete):                                                   ││
-│ │ • FH.9 File Handle Integration Tests                                            ││
+│ │ ✅ FH.9 File Handle Integration Tests                                           ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
-│ │   core/resources/file_handle_budget.go, session_file_budget.go                  ││
-│ │   core/resources/agent_file_budget.go, tracked_file.go                          ││
-│ │   core/resources/notifier.go, file_handle_snapshot.go                           ││
-│ │   core/ui/resource_notifier.go                                                  ││
-│ │   core/concurrency/agent_supervisor.go (modify)                                 ││
-│ │   core/resources/pressure_controller.go (modify)                                ││
+│ │   core/resources/file_handle_budget.go (contains FH.1, FH.2, FH.3)              ││
+│ │   core/resources/tracked_file.go, notifier.go, file_handle_snapshot.go          ││
+│ │   core/concurrency/agent_supervisor.go (modified for FH.6)                      ││
+│ │   core/resources/pressure_controller.go (modified for FH.8)                     ││
 │ │                                                                                  ││
 │ │ FEATURES:                                                                        ││
-│ │   - Hierarchical: Global → Session → Agent with work-stealing                   ││
-│ │   - Proactive tracking via existing ResourceTracker (no scanning)               ││
-│ │   - No errors on wait: log + notify UI, proceed when available                  ││
-│ │   - Automatic cleanup via ownership (ForceCloseAll on death)                    ││
-│ │   - Memory pressure aware: reduce allocations under pressure                    ││
-│ │   - System limit detection via ulimit at startup                                ││
+│ │   ✅ Hierarchical: Global → Session → Agent with work-stealing                  ││
+│ │   ✅ Proactive tracking via existing ResourceTracker (no scanning)              ││
+│ │   ✅ No errors on wait: log + notify UI, proceed when available                 ││
+│ │   ✅ Automatic cleanup via ownership (ForceCloseAll on death)                   ││
+│ │   ✅ Memory pressure aware: reduce allocations under pressure                   ││
+│ │   ✅ System limit detection via ulimit at startup                               ││
 │ │                                                                                  ││
 │ │ INTERNAL DEPENDENCIES:                                                           ││
 │ │   Phase 1 (parallel) → Phase 2 → Phase 3 → Phase 4 →                            ││
