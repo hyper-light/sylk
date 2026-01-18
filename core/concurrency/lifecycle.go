@@ -24,6 +24,11 @@ const (
 	StateStopping
 	StateStopped
 	StateFailed
+	StatePausing
+	StatePaused
+	StateResuming
+	StateKilling
+	StateKilled
 )
 
 // stateNames maps lifecycle states to their string representation.
@@ -34,6 +39,11 @@ var stateNames = map[LifecycleState]string{
 	StateStopping: "stopping",
 	StateStopped:  "stopped",
 	StateFailed:   "failed",
+	StatePausing:  "pausing",
+	StatePaused:   "paused",
+	StateResuming: "resuming",
+	StateKilling:  "killing",
+	StateKilled:   "killed",
 }
 
 // String returns the string representation of a lifecycle state.
@@ -48,10 +58,15 @@ func (s LifecycleState) String() string {
 var validTransitions = map[LifecycleState][]LifecycleState{
 	StateCreated:  {StateStarting, StateFailed},
 	StateStarting: {StateRunning, StateFailed, StateStopping},
-	StateRunning:  {StateStopping, StateFailed},
+	StateRunning:  {StateStopping, StateFailed, StatePausing, StateKilling},
 	StateStopping: {StateStopped, StateFailed},
 	StateStopped:  {},
 	StateFailed:   {},
+	StatePausing:  {StatePaused, StateKilling, StateFailed},
+	StatePaused:   {StateResuming, StateKilling},
+	StateResuming: {StateRunning, StateFailed},
+	StateKilling:  {StateKilled, StateFailed},
+	StateKilled:   {},
 }
 
 // StateChangeEvent represents a state transition event.
@@ -203,7 +218,7 @@ func (lc *Lifecycle) removeWaiter(target LifecycleState, ch chan struct{}) {
 // IsTerminal returns true if the lifecycle is in a terminal state.
 func (lc *Lifecycle) IsTerminal() bool {
 	state := lc.State()
-	return state == StateStopped || state == StateFailed
+	return state == StateStopped || state == StateFailed || state == StateKilled
 }
 
 // SignalBusPublisher is the interface for publishing to a signal bus.

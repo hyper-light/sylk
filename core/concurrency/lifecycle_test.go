@@ -18,6 +18,11 @@ func TestLifecycleState_String(t *testing.T) {
 		{StateStopping, "stopping"},
 		{StateStopped, "stopped"},
 		{StateFailed, "failed"},
+		{StatePausing, "pausing"},
+		{StatePaused, "paused"},
+		{StateResuming, "resuming"},
+		{StateKilling, "killing"},
+		{StateKilled, "killed"},
 		{LifecycleState(99), "unknown"},
 	}
 
@@ -55,8 +60,19 @@ func TestLifecycle_ValidTransitions(t *testing.T) {
 		{"starting->stopping", StateStarting, StateStopping},
 		{"running->stopping", StateRunning, StateStopping},
 		{"running->failed", StateRunning, StateFailed},
+		{"running->pausing", StateRunning, StatePausing},
+		{"running->killing", StateRunning, StateKilling},
 		{"stopping->stopped", StateStopping, StateStopped},
 		{"stopping->failed", StateStopping, StateFailed},
+		{"pausing->paused", StatePausing, StatePaused},
+		{"pausing->killing", StatePausing, StateKilling},
+		{"pausing->failed", StatePausing, StateFailed},
+		{"paused->resuming", StatePaused, StateResuming},
+		{"paused->killing", StatePaused, StateKilling},
+		{"resuming->running", StateResuming, StateRunning},
+		{"resuming->failed", StateResuming, StateFailed},
+		{"killing->killed", StateKilling, StateKilled},
+		{"killing->failed", StateKilling, StateFailed},
 	}
 
 	for _, tt := range tests {
@@ -89,6 +105,8 @@ func TestLifecycle_InvalidTransitions(t *testing.T) {
 		{"running->starting", StateRunning, StateStarting},
 		{"stopped->anything", StateStopped, StateRunning},
 		{"failed->anything", StateFailed, StateRunning},
+		{"paused->running_direct", StatePaused, StateRunning},
+		{"killed->anything", StateKilled, StateRunning},
 	}
 
 	for _, tt := range tests {
@@ -207,6 +225,11 @@ func TestLifecycle_IsTerminal(t *testing.T) {
 		{StateStopping, false},
 		{StateStopped, true},
 		{StateFailed, true},
+		{StatePausing, false},
+		{StatePaused, false},
+		{StateResuming, false},
+		{StateKilling, false},
+		{StateKilled, true},
 	}
 
 	for _, tt := range tests {
