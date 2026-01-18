@@ -89,11 +89,17 @@ type ToolExecutor struct {
 	outputHandler  OutputStreamer
 	timeoutFactory TimeoutFactory
 	killManager    KillExecutor
+	cleanupManager *CancellationManager
 
 	mu           sync.RWMutex
 	activeGroups map[int]*ProcessGroup
 	closed       bool
 	groupCounter int
+	toolCounter  int
+
+	cleanupMu     sync.Mutex
+	cleanupOnce   sync.Once
+	cleanupByTool map[string]func(context.Context) error
 }
 
 type ToolExecutorDeps struct {
@@ -107,8 +113,9 @@ func NewToolExecutor(cfg ToolExecutorConfig, deps *ToolExecutorDeps) *ToolExecut
 	cfg = normalizeExecutorConfig(cfg)
 
 	executor := &ToolExecutor{
-		config:       cfg,
-		activeGroups: make(map[int]*ProcessGroup),
+		config:        cfg,
+		activeGroups:  make(map[int]*ProcessGroup),
+		cleanupByTool: make(map[string]func(context.Context) error),
 	}
 
 	if deps != nil {
@@ -117,6 +124,17 @@ func NewToolExecutor(cfg ToolExecutorConfig, deps *ToolExecutorDeps) *ToolExecut
 		executor.timeoutFactory = deps.TimeoutFactory
 		executor.killManager = deps.KillManager
 	}
+
+	executor.cleanupManager = NewCancellationManager(DefaultCancellationConfig())
+	executor.cleanupManager.AddCleanupHandler(func(ctx context.Context, toolID string) error {
+		executor.cleanupMu.Lock()
+		cleanup := executor.cleanupByTool[toolID]
+		executor.cleanupMu.Unlock()
+		if cleanup == nil {
+			return nil
+		}
+		return cleanup(ctx)
+	})
 
 	return executor
 }
@@ -168,7 +186,15 @@ func (e *ToolExecutor) Execute(ctx context.Context, inv ToolInvocation) (*ToolRe
 	}
 	defer e.releaseSlot(slot)
 
-	return e.executeWithSlot(ctx, inv)
+	toolID := e.newToolID()
+	cleanup := e.registerInvocationCleanup(toolID, inv)
+	defer cleanup()
+
+	if e.cleanupManager == nil {
+		return e.executeWithSlot(ctx, toolID, inv)
+	}
+
+	return e.executeWithSlot(ctx, toolID, inv)
 }
 
 func (e *ToolExecutor) checkClosed() error {
@@ -204,7 +230,7 @@ func (e *ToolExecutor) releaseSlot(slot ResourceHandle) {
 	}
 }
 
-func (e *ToolExecutor) executeWithSlot(ctx context.Context, inv ToolInvocation) (*ToolResult, error) {
+func (e *ToolExecutor) executeWithSlot(ctx context.Context, toolID string, inv ToolInvocation) (*ToolResult, error) {
 	cmd := e.buildCommand(ctx, inv)
 	pg := e.setupProcessGroup(cmd)
 
@@ -212,7 +238,7 @@ func (e *ToolExecutor) executeWithSlot(ctx context.Context, inv ToolInvocation) 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	return e.runAndWait(ctx, pg, inv, stdout, stderr)
+	return e.runAndWait(ctx, toolID, pg, inv, stdout, stderr)
 }
 
 func (e *ToolExecutor) buildCommand(ctx context.Context, inv ToolInvocation) *exec.Cmd {
@@ -345,6 +371,52 @@ func (e *ToolExecutor) getAllowedBoundaries() []string {
 	return boundaries
 }
 
+func (e *ToolExecutor) newToolID() string {
+	e.mu.Lock()
+	e.toolCounter++
+	id := "tool-" + formatInt(e.toolCounter)
+	e.mu.Unlock()
+	return id
+}
+
+func formatInt(val int) string {
+	if val == 0 {
+		return "0"
+	}
+
+	var digits [20]byte
+	i := len(digits)
+
+	for val > 0 {
+		i--
+		digits[i] = byte('0' + val%10)
+		val /= 10
+	}
+
+	return string(digits[i:])
+}
+
+func (e *ToolExecutor) registerInvocationCleanup(toolID string, inv ToolInvocation) func() {
+	if inv.Cleanup == nil {
+		return func() {}
+	}
+	e.cleanupMu.Lock()
+	e.cleanupByTool[toolID] = inv.Cleanup
+	e.cleanupMu.Unlock()
+	return func() {
+		e.cleanupMu.Lock()
+		delete(e.cleanupByTool, toolID)
+		e.cleanupMu.Unlock()
+	}
+}
+
+func (e *ToolExecutor) setPartialOutput(toolID string, result *ToolResult) {
+	if e.cleanupManager == nil || result == nil {
+		return
+	}
+	e.cleanupManager.SetPartialOutput(toolID, result.Stdout, result.Stderr)
+}
+
 func (e *ToolExecutor) setupProcessGroup(cmd *exec.Cmd) *ProcessGroup {
 	pg := NewProcessGroup()
 	pg.Setup(cmd)
@@ -381,7 +453,7 @@ func getStdinReader(stdin any) io.Reader {
 	return nil
 }
 
-func (e *ToolExecutor) runAndWait(ctx context.Context, pg *ProcessGroup, inv ToolInvocation, stdout, stderr io.Writer) (*ToolResult, error) {
+func (e *ToolExecutor) runAndWait(ctx context.Context, toolID string, pg *ProcessGroup, inv ToolInvocation, stdout, stderr io.Writer) (*ToolResult, error) {
 	startTime := time.Now()
 
 	if err := pg.Start(); err != nil {
@@ -391,17 +463,23 @@ func (e *ToolExecutor) runAndWait(ctx context.Context, pg *ProcessGroup, inv Too
 	e.trackProcessGroup(pg)
 	defer e.untrackProcessGroup(pg)
 
+	if e.cleanupManager != nil {
+		e.cleanupManager.RegisterTool(toolID, inv.Tool, pg)
+		defer e.cleanupManager.UnregisterTool(toolID)
+	}
+
 	waitDone := make(chan error, 1)
 	go func() {
 		waitDone <- pg.Wait()
 	}()
 
-	result := e.waitWithAdaptiveTimeout(ctx, pg, waitDone, inv)
+	result := e.waitWithAdaptiveTimeout(ctx, toolID, pg, waitDone, inv, stdout, stderr)
 	result.Duration = time.Since(startTime)
 
 	e.collectOutput(result, stdout, stderr)
 	e.parseOutput(result, inv.Tool)
 
+	e.setPartialOutput(toolID, result)
 	return result, nil
 }
 
@@ -423,16 +501,16 @@ func (e *ToolExecutor) untrackProcessGroup(pg *ProcessGroup) {
 	e.mu.Unlock()
 }
 
-func (e *ToolExecutor) waitWithAdaptiveTimeout(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, inv ToolInvocation) *ToolResult {
+func (e *ToolExecutor) waitWithAdaptiveTimeout(ctx context.Context, toolID string, pg *ProcessGroup, waitDone <-chan error, inv ToolInvocation, stdout, stderr io.Writer) *ToolResult {
 	timeout := e.getTimeout(inv)
 	checker := e.getTimeoutChecker(inv.Tool)
 
 	if checker != nil {
 		checker.Start()
-		return e.waitWithChecker(ctx, pg, waitDone, timeout, checker)
+		return e.waitWithChecker(ctx, toolID, pg, waitDone, timeout, checker, stdout, stderr)
 	}
 
-	return e.waitWithFixedTimeout(ctx, pg, waitDone, timeout)
+	return e.waitWithFixedTimeout(ctx, toolID, pg, waitDone, timeout, stdout, stderr)
 }
 
 func (e *ToolExecutor) getTimeout(inv ToolInvocation) time.Duration {
@@ -456,12 +534,12 @@ func (e *ToolExecutor) getTimeoutChecker(tool string) TimeoutChecker {
 	return checker
 }
 
-func (e *ToolExecutor) waitWithChecker(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, maxTimeout time.Duration, checker TimeoutChecker) *ToolResult {
+func (e *ToolExecutor) waitWithChecker(ctx context.Context, toolID string, pg *ProcessGroup, waitDone <-chan error, maxTimeout time.Duration, checker TimeoutChecker, stdout, stderr io.Writer) *ToolResult {
 	timers := newWaitTimers(maxTimeout)
 	defer timers.stop()
 
 	for {
-		result := e.selectWaitEvent(ctx, pg, waitDone, timers, checker)
+		result := e.selectWaitEvent(ctx, toolID, pg, waitDone, timers, checker, stdout, stderr)
 		if result != nil {
 			return result
 		}
@@ -485,43 +563,43 @@ func (t *waitTimers) stop() {
 	t.maxTimer.Stop()
 }
 
-func (e *ToolExecutor) selectWaitEvent(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, timers *waitTimers, checker TimeoutChecker) *ToolResult {
-	if result := e.checkImmediateEvents(pg, waitDone, ctx.Done()); result != nil {
+func (e *ToolExecutor) selectWaitEvent(ctx context.Context, toolID string, pg *ProcessGroup, waitDone <-chan error, timers *waitTimers, checker TimeoutChecker, stdout, stderr io.Writer) *ToolResult {
+	if result := e.checkImmediateEvents(toolID, pg, waitDone, ctx.Done(), stdout, stderr); result != nil {
 		return result
 	}
-	return e.checkTimerEvents(pg, waitDone, timers, checker)
+	return e.checkTimerEvents(toolID, pg, waitDone, timers, checker, stdout, stderr)
 }
 
-func (e *ToolExecutor) checkImmediateEvents(pg *ProcessGroup, waitDone <-chan error, ctxDone <-chan struct{}) *ToolResult {
+func (e *ToolExecutor) checkImmediateEvents(toolID string, pg *ProcessGroup, waitDone <-chan error, ctxDone <-chan struct{}, stdout, stderr io.Writer) *ToolResult {
 	select {
 	case err := <-waitDone:
 		return e.buildNormalResult(err, pg)
 	case <-ctxDone:
-		return e.killAndBuildResult(pg, waitDone, "context")
+		return e.killAndBuildResult(toolID, pg, waitDone, "context", stdout, stderr)
 	default:
 		return nil
 	}
 }
 
-func (e *ToolExecutor) checkTimerEvents(pg *ProcessGroup, waitDone <-chan error, timers *waitTimers, checker TimeoutChecker) *ToolResult {
+func (e *ToolExecutor) checkTimerEvents(toolID string, pg *ProcessGroup, waitDone <-chan error, timers *waitTimers, checker TimeoutChecker, stdout, stderr io.Writer) *ToolResult {
 	select {
 	case err := <-waitDone:
 		return e.buildNormalResult(err, pg)
 	case <-timers.maxTimer.C:
-		return e.killAndBuildResult(pg, waitDone, "timeout")
+		return e.killAndBuildResult(toolID, pg, waitDone, "timeout", stdout, stderr)
 	case <-timers.ticker.C:
-		return e.checkAdaptiveTimeout(pg, waitDone, checker)
+		return e.checkAdaptiveTimeout(toolID, pg, waitDone, checker, stdout, stderr)
 	}
 }
 
-func (e *ToolExecutor) checkAdaptiveTimeout(pg *ProcessGroup, waitDone <-chan error, checker TimeoutChecker) *ToolResult {
+func (e *ToolExecutor) checkAdaptiveTimeout(toolID string, pg *ProcessGroup, waitDone <-chan error, checker TimeoutChecker, stdout, stderr io.Writer) *ToolResult {
 	if checker.ShouldTimeout() {
-		return e.killAndBuildResult(pg, waitDone, "adaptive_timeout")
+		return e.killAndBuildResult(toolID, pg, waitDone, "adaptive_timeout", stdout, stderr)
 	}
 	return nil
 }
 
-func (e *ToolExecutor) waitWithFixedTimeout(ctx context.Context, pg *ProcessGroup, waitDone <-chan error, timeout time.Duration) *ToolResult {
+func (e *ToolExecutor) waitWithFixedTimeout(ctx context.Context, toolID string, pg *ProcessGroup, waitDone <-chan error, timeout time.Duration, stdout, stderr io.Writer) *ToolResult {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
@@ -529,9 +607,9 @@ func (e *ToolExecutor) waitWithFixedTimeout(ctx context.Context, pg *ProcessGrou
 	case err := <-waitDone:
 		return e.buildNormalResult(err, pg)
 	case <-ctx.Done():
-		return e.killAndBuildResult(pg, waitDone, "context")
+		return e.killAndBuildResult(toolID, pg, waitDone, "context", stdout, stderr)
 	case <-timer.C:
-		return e.killAndBuildResult(pg, waitDone, "timeout")
+		return e.killAndBuildResult(toolID, pg, waitDone, "timeout", stdout, stderr)
 	}
 }
 
@@ -545,14 +623,22 @@ func (e *ToolExecutor) buildNormalResult(err error, pg *ProcessGroup) *ToolResul
 	return result
 }
 
-func (e *ToolExecutor) killAndBuildResult(pg *ProcessGroup, waitDone <-chan error, signal string) *ToolResult {
+func (e *ToolExecutor) killAndBuildResult(toolID string, pg *ProcessGroup, waitDone <-chan error, signal string, stdout, stderr io.Writer) *ToolResult {
 	e.executeKillSequence(pg, waitDone)
-	return &ToolResult{
+	result := &ToolResult{
 		ExitCode:   -1,
 		Killed:     true,
 		KillSignal: signal,
 		Partial:    true,
 	}
+	e.collectOutput(result, stdout, stderr)
+	e.setPartialOutput(toolID, result)
+	if e.cleanupManager != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), e.cleanupManager.Config().CleanupBudget)
+		defer cancel()
+		e.cleanupManager.RunToolCleanup(cleanupCtx, toolID)
+	}
+	return result
 }
 
 func (e *ToolExecutor) executeKillSequence(pg *ProcessGroup, waitDone <-chan error) {

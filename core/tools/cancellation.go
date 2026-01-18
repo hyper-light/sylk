@@ -241,6 +241,13 @@ func (m *CancellationManager) getRunningTools() []*RunningTool {
 	return tools
 }
 
+func (m *CancellationManager) getRunningTool(toolID string) *RunningTool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.runningTools[toolID]
+}
+
 func (m *CancellationManager) cancelAllTools(ctx context.Context, tools []*RunningTool, result *CancellationResult) {
 	var wg sync.WaitGroup
 
@@ -368,6 +375,26 @@ func (m *CancellationManager) executeToolCleanups(ctx context.Context, tool *Run
 			m.mu.Unlock()
 		}
 	}
+}
+
+func (m *CancellationManager) RunToolCleanup(ctx context.Context, toolID string) []error {
+	tool := m.getRunningTool(toolID)
+	if tool == nil {
+		return nil
+	}
+	handlers := m.getCleanupHandlers()
+	if len(handlers) == 0 {
+		return nil
+	}
+
+	var errs []error
+	for _, handler := range handlers {
+		if err := handler(ctx, tool.ID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errs
 }
 
 // =============================================================================

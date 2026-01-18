@@ -206,18 +206,18 @@ func (gl *GrammarLoader) loadLibrarySafe(name string) (*GrammarHandle, error) {
 		return nil, fmt.Errorf("dlopen %s: %w", libPath, err)
 	}
 
-	var langFunc func() uintptr
+	var langFunc func() unsafe.Pointer
 	purego.RegisterLibFunc(&langFunc, lib, "tree_sitter_"+name)
 
 	ptr := langFunc()
-	if ptr == 0 {
+	if ptr == nil {
 		purego.Dlclose(lib)
 		return nil, fmt.Errorf("tree_sitter_%s returned null", name)
 	}
 
 	return &GrammarHandle{
 		libHandle: lib,
-		langPtr:   unsafe.Pointer(ptr),
+		langPtr:   ptr,
 		name:      name,
 		checksum:  checksum,
 	}, nil

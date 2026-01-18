@@ -1,6 +1,7 @@
 package session
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -41,6 +42,10 @@ type ResourceTotals struct {
 	FileHandleSlots int
 	NetworkSlots    int
 	MemoryBudget    int64
+}
+
+type allocationTotals struct {
+	forActive ResourceTotals
 }
 
 type FairShareCalculator struct {
@@ -110,19 +115,24 @@ func (f *FairShareCalculator) classifySessions(sessions []SessionRecord) ([]Sess
 
 func (f *FairShareCalculator) computeAllocations(totals ResourceTotals, active, idle []SessionRecord) map[string]SessionAllocation {
 	allocations := make(map[string]SessionAllocation)
-
-	userReserved := f.computeUserReserved(totals)
-	remaining := f.subtractReserved(totals, userReserved)
-
-	idleReserved := f.computeIdleReserved(remaining, len(idle))
-	forActive := f.subtractReserved(remaining, idleReserved)
+	allocationTotals := f.prepareAllocationTotals(totals, len(idle))
 
 	totalScore := f.sumActivityScores(active)
 
-	f.allocateActiveSessions(allocations, active, forActive, totalScore)
+	f.allocateActiveSessions(allocations, active, allocationTotals.forActive, totalScore)
 	f.allocateIdleSessions(allocations, idle)
 
 	return allocations
+}
+
+func (f *FairShareCalculator) prepareAllocationTotals(totals ResourceTotals, idleCount int) allocationTotals {
+	userReserved := f.computeUserReserved(totals)
+	remaining := f.subtractReserved(totals, userReserved)
+	idleReserved := f.computeIdleReserved(remaining, idleCount)
+
+	return allocationTotals{
+		forActive: f.subtractReserved(remaining, idleReserved),
+	}
 }
 
 func (f *FairShareCalculator) computeUserReserved(totals ResourceTotals) ResourceTotals {
@@ -241,9 +251,7 @@ func (f *FairShareCalculator) UpdateLastAllocation(allocs map[string]SessionAllo
 	defer f.mu.Unlock()
 
 	f.lastAllocation = make(map[string]SessionAllocation, len(allocs))
-	for k, v := range allocs {
-		f.lastAllocation[k] = v
-	}
+	maps.Copy(f.lastAllocation, allocs)
 }
 
 func (f *FairShareCalculator) GetLastAllocation() map[string]SessionAllocation {
@@ -251,9 +259,7 @@ func (f *FairShareCalculator) GetLastAllocation() map[string]SessionAllocation {
 	defer f.mu.RUnlock()
 
 	result := make(map[string]SessionAllocation, len(f.lastAllocation))
-	for k, v := range f.lastAllocation {
-		result[k] = v
-	}
+	maps.Copy(result, f.lastAllocation)
 	return result
 }
 

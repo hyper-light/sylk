@@ -54,18 +54,15 @@ func (m *KillSequenceManager) Execute(pg *ProcessGroup, waitDone <-chan struct{}
 	result := KillResult{}
 
 	if m.trySIGINT(pg, waitDone, &result) {
-		result.Duration = time.Since(startTime)
-		return result
+		return m.finishResult(result, startTime)
 	}
 
 	if m.trySIGTERM(pg, waitDone, &result) {
-		result.Duration = time.Since(startTime)
-		return result
+		return m.finishResult(result, startTime)
 	}
 
 	m.forceSIGKILL(pg, &result)
-	result.Duration = time.Since(startTime)
-	return result
+	return m.finishResult(result, startTime)
 }
 
 func (m *KillSequenceManager) trySIGINT(pg *ProcessGroup, waitDone <-chan struct{}, result *KillResult) bool {
@@ -118,6 +115,11 @@ func (m *KillSequenceManager) ExecuteAsync(pg *ProcessGroup, done chan<- KillRes
 	done <- result
 }
 
+func (m *KillSequenceManager) finishResult(result KillResult, startTime time.Time) KillResult {
+	result.Duration = time.Since(startTime)
+	return result
+}
+
 type ProgressCallback func(stage string)
 
 func (m *KillSequenceManager) ExecuteWithProgress(pg *ProcessGroup, waitDone <-chan struct{}, onProgress ProgressCallback) KillResult {
@@ -126,20 +128,17 @@ func (m *KillSequenceManager) ExecuteWithProgress(pg *ProcessGroup, waitDone <-c
 
 	onProgress("stopping")
 	if m.trySIGINT(pg, waitDone, &result) {
-		result.Duration = time.Since(startTime)
-		return result
+		return m.finishResult(result, startTime)
 	}
 
 	onProgress("force_stopping")
 	if m.trySIGTERM(pg, waitDone, &result) {
-		result.Duration = time.Since(startTime)
-		return result
+		return m.finishResult(result, startTime)
 	}
 
 	onProgress("killed")
 	m.forceSIGKILL(pg, &result)
-	result.Duration = time.Since(startTime)
-	return result
+	return m.finishResult(result, startTime)
 }
 
 func (m *KillSequenceManager) SIGINTGrace() time.Duration {

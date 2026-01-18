@@ -171,11 +171,7 @@ func (a *AdaptiveTimeout) isNoise(line string) bool {
 
 // ShouldTimeout checks if the process should be timed out
 func (a *AdaptiveTimeout) ShouldTimeout() bool {
-	a.mu.Lock()
-	started := a.started
-	lastOutput := a.lastOutputTime
-	a.mu.Unlock()
-
+	started, lastOutput := a.snapshotTimes()
 	return a.checkTimeout(started, lastOutput)
 }
 
@@ -196,12 +192,17 @@ func (a *AdaptiveTimeout) checkTimeout(started, lastOutput time.Time) bool {
 	return elapsed > a.baseTimeout
 }
 
-// ShouldTimeoutAt checks if the process should be timed out given a specific start time
-func (a *AdaptiveTimeout) ShouldTimeoutAt(started time.Time) bool {
+func (a *AdaptiveTimeout) snapshotTimes() (time.Time, time.Time) {
 	a.mu.Lock()
+	started := a.started
 	lastOutput := a.lastOutputTime
 	a.mu.Unlock()
+	return started, lastOutput
+}
 
+// ShouldTimeoutAt checks if the process should be timed out given a specific start time
+func (a *AdaptiveTimeout) ShouldTimeoutAt(started time.Time) bool {
+	_, lastOutput := a.snapshotTimes()
 	return a.checkTimeout(started, lastOutput)
 }
 
@@ -211,10 +212,7 @@ func (a *AdaptiveTimeout) ShouldTimeoutAt(started time.Time) bool {
 
 // Elapsed returns the time elapsed since start
 func (a *AdaptiveTimeout) Elapsed() time.Duration {
-	a.mu.Lock()
-	started := a.started
-	a.mu.Unlock()
-
+	started, _ := a.snapshotTimes()
 	if started.IsZero() {
 		return 0
 	}
@@ -223,10 +221,7 @@ func (a *AdaptiveTimeout) Elapsed() time.Duration {
 
 // TimeSinceLastOutput returns the time since last meaningful output
 func (a *AdaptiveTimeout) TimeSinceLastOutput() time.Duration {
-	a.mu.Lock()
-	lastOutput := a.lastOutputTime
-	a.mu.Unlock()
-
+	_, lastOutput := a.snapshotTimes()
 	if lastOutput.IsZero() {
 		return 0
 	}
@@ -242,11 +237,7 @@ func (a *AdaptiveTimeout) OutputCount() int64 {
 
 // RemainingTime returns the estimated remaining time before timeout
 func (a *AdaptiveTimeout) RemainingTime() time.Duration {
-	a.mu.Lock()
-	started := a.started
-	lastOutput := a.lastOutputTime
-	a.mu.Unlock()
-
+	started, lastOutput := a.snapshotTimes()
 	return a.calculateRemaining(started, lastOutput)
 }
 

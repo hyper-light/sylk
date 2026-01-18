@@ -157,11 +157,10 @@ func (p *CrossSessionPool) tryAcquire(sessionID string, priority Priority) (*Res
 		return nil, false
 	}
 
-	handle := p.allocateHandle(sessionID, priority)
+	handle, count := p.allocateHandle(sessionID, priority)
 	p.mu.Unlock()
 
-	p.updateRegistryAllocation(sessionID)
-	p.touchRegistry(sessionID)
+	p.applyAllocationUpdates([]allocationUpdate{{sessionID: sessionID, count: count}})
 
 	return handle, true
 }
@@ -185,12 +184,7 @@ func (p *CrossSessionPool) getSessionLimit(sessionID string) int {
 	return 1
 }
 
-func (p *CrossSessionPool) allocateHandle(sessionID string, priority Priority) *ResourceHandle {
-	handle, _ := p.allocateHandleWithCount(sessionID, priority)
-	return handle
-}
-
-func (p *CrossSessionPool) allocateHandleWithCount(sessionID string, priority Priority) (*ResourceHandle, int) {
+func (p *CrossSessionPool) allocateHandle(sessionID string, priority Priority) (*ResourceHandle, int) {
 	p.handleIDCounter++
 	id := generateHandleID(p.handleIDCounter)
 
@@ -229,33 +223,18 @@ func formatInt64(n int64) string {
 	return string(digits[i:])
 }
 
-func (p *CrossSessionPool) updateRegistryAllocation(sessionID string) {
-	if p.registry == nil {
-		return
-	}
-	count := p.allocations[sessionID]
-	p.registry.UpdateAllocatedSlots(sessionID, count)
-}
-
-func (p *CrossSessionPool) updateRegistryAllocationCount(sessionID string, count int) {
-	if p.registry == nil {
-		return
-	}
-	p.registry.UpdateAllocatedSlots(sessionID, count)
-}
-
-func (p *CrossSessionPool) touchRegistry(sessionID string) {
-	if p.registry == nil {
-		return
-	}
-	p.registry.Touch(sessionID)
-}
-
 func (p *CrossSessionPool) applyAllocationUpdates(updates []allocationUpdate) {
 	for _, update := range updates {
-		p.updateRegistryAllocationCount(update.sessionID, update.count)
-		p.touchRegistry(update.sessionID)
+		p.updateRegistryAllocation(update.sessionID, update.count)
 	}
+}
+
+func (p *CrossSessionPool) updateRegistryAllocation(sessionID string, count int) {
+	if p.registry == nil {
+		return
+	}
+	p.registry.UpdateAllocatedSlots(sessionID, count)
+	p.registry.Touch(sessionID)
 }
 
 func (p *CrossSessionPool) acquireWithPreemption(ctx context.Context, sessionID string) (*ResourceHandle, error) {
@@ -364,7 +343,7 @@ func (p *CrossSessionPool) tryWakeWaiter(w *waiter) (allocationUpdate, bool) {
 		return allocationUpdate{}, false
 	}
 
-	handle, count := p.allocateHandleWithCount(w.sessionID, w.priority)
+	handle, count := p.allocateHandle(w.sessionID, w.priority)
 
 	select {
 	case w.result <- handle:

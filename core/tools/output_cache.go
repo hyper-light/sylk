@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"sync"
@@ -15,7 +16,7 @@ type ToolResult struct {
 	Killed       bool
 	KillSignal   string
 	Partial      bool
-	ParsedOutput interface{}
+	ParsedOutput any
 }
 
 type CachePolicy struct {
@@ -209,9 +210,10 @@ type ToolInvocation struct {
 	Args       []string
 	WorkingDir string
 	Env        map[string]string
-	Stdin      interface{}
-	StreamTo   interface{}
+	Stdin      any
+	StreamTo   any
 	Timeout    time.Duration
+	Cleanup    func(context.Context) error
 }
 
 func (c *ToolOutputCache) ComputeInputHash(inv ToolInvocation) string {
