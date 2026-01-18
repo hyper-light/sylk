@@ -3249,58 +3249,58 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 - [x] Progress reporting
 - [x] Memory-bounded (streaming)
 
-### DS.4.1 fsnotify Watcher
+### DS.4.1 fsnotify Watcher (COMPLETE)
 
-**Files to create:** `core/search/watcher/fsnotify.go`
-
-**Acceptance Criteria:**
-- [ ] `FSWatcher` wraps fsnotify
-- [ ] `WatchConfig`: Paths, ExcludePatterns, Debounce
-- [ ] `Start(ctx) (<-chan *FileEvent, error)`
-- [ ] `FileEvent`: Path, Operation, Time
-- [ ] Debounces rapid changes (100ms)
-- [ ] Recursive directory watching
-
-### DS.4.2 Git Hook Integration
-
-**Files to create:** `core/search/watcher/git_hook.go`
+**Files created:** `core/search/watcher/fsnotify.go`, `core/search/watcher/fsnotify_test.go`
 
 **Acceptance Criteria:**
-- [ ] `GitHookWatcher` for git operations
-- [ ] Installs `post-commit`, `post-checkout`, `post-merge` hooks
-- [ ] `ParseHookEvent(args) (*GitEvent, error)`
-- [ ] Non-invasive: appends to existing hooks
+- [x] `FSWatcher` wraps fsnotify
+- [x] `WatchConfig`: Paths, ExcludePatterns, Debounce
+- [x] `Start(ctx) (<-chan *FileEvent, error)`
+- [x] `FileEvent`: Path, Operation, Time
+- [x] Debounces rapid changes (100ms)
+- [x] Recursive directory watching
 
-### DS.4.3 Checksum Validator
+### DS.4.2 Git Hook Integration (COMPLETE)
 
-**Files to create:** `core/search/watcher/checksum.go`
-
-**Acceptance Criteria:**
-- [ ] `ChecksumValidator` verifies via content hash
-- [ ] `Validate(path) (*ValidationResult, error)`
-- [ ] `ValidateBatch(paths) ([]*ValidationResult, error)`
-- [ ] SHA-256, streaming (memory-efficient)
-
-### DS.4.4 Periodic Scanner
-
-**Files to create:** `core/search/watcher/periodic.go`
+**Files created:** `core/search/watcher/git_hook.go`, `core/search/watcher/git_hook_test.go`
 
 **Acceptance Criteria:**
-- [ ] `PeriodicScanner` for scheduled scans
-- [ ] `ScannerConfig`: Interval, SampleRate
-- [ ] Compares against CMT manifest
-- [ ] Low priority: yields to active operations
+- [x] `GitHookWatcher` for git operations
+- [x] Installs `post-commit`, `post-checkout`, `post-merge` hooks
+- [x] `ParseHookEvent(args) (*GitEvent, error)`
+- [x] Non-invasive: appends to existing hooks
 
-### DS.4.5 Change Detection Coordinator
+### DS.4.3 Checksum Validator (COMPLETE)
 
-**Files to create:** `core/search/watcher/coordinator.go`
+**Files created:** `core/search/watcher/checksum.go`, `core/search/watcher/checksum_test.go`
 
 **Acceptance Criteria:**
-- [ ] `ChangeDetector` coordinates all sources
-- [ ] `Start(ctx) (<-chan *ChangeEvent, error)`
-- [ ] Deduplicates events
-- [ ] Priority: fsnotify > git_hook > periodic
-- [ ] Rate limiting
+- [x] `ChecksumValidator` verifies via content hash
+- [x] `Validate(path) (*ValidationResult, error)`
+- [x] `ValidateBatch(paths) ([]*ValidationResult, error)`
+- [x] SHA-256, streaming (memory-efficient)
+
+### DS.4.4 Periodic Scanner (COMPLETE)
+
+**Files created:** `core/search/watcher/periodic.go`, `core/search/watcher/periodic_test.go`
+
+**Acceptance Criteria:**
+- [x] `PeriodicScanner` for scheduled scans
+- [x] `ScannerConfig`: Interval, SampleRate
+- [x] Compares against CMT manifest
+- [x] Low priority: yields to active operations
+
+### DS.4.5 Change Detection Coordinator (COMPLETE)
+
+**Files created:** `core/search/watcher/coordinator.go`, `core/search/watcher/coordinator_test.go`, `core/search/watcher/types.go`
+
+**Acceptance Criteria:**
+- [x] `ChangeDetector` coordinates all sources
+- [x] `Start(ctx) (<-chan *ChangeEvent, error)`
+- [x] Deduplicates events
+- [x] Priority: fsnotify > git_hook > periodic
+- [x] Rate limiting
 
 ### DS.5.1 CMT Node Types
 
