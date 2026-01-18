@@ -53,29 +53,52 @@ func DefaultFileHandleBudgetConfig() FileHandleBudgetConfig {
 }
 
 func NewFileHandleBudget(cfg FileHandleBudgetConfig) *FileHandleBudget {
-	if cfg.GlobalLimit <= 0 {
-		cfg.GlobalLimit = DefaultGlobalLimit
-	}
-	if cfg.ReservedRatio <= 0 || cfg.ReservedRatio >= 1 {
-		cfg.ReservedRatio = DefaultReservedRatio
-	}
-	if cfg.Notifier == nil {
-		cfg.Notifier = &NoOpNotifier{}
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
-	}
-
-	pressureLevel := &atomic.Int32{}
+	cfg = normalizeFileHandleBudgetConfig(cfg)
 	reserved := int64(float64(cfg.GlobalLimit) * cfg.ReservedRatio)
 
 	return &FileHandleBudget{
 		globalLimit:   cfg.GlobalLimit,
 		reserved:      reserved,
-		pressureLevel: pressureLevel,
+		pressureLevel: &atomic.Int32{},
 		notifier:      cfg.Notifier,
 		logger:        cfg.Logger,
 	}
+}
+
+func normalizeFileHandleBudgetConfig(cfg FileHandleBudgetConfig) FileHandleBudgetConfig {
+	cfg.GlobalLimit = normalizeGlobalLimit(cfg.GlobalLimit)
+	cfg.ReservedRatio = normalizeReservedRatio(cfg.ReservedRatio)
+	cfg.Notifier = normalizeNotifier(cfg.Notifier)
+	cfg.Logger = normalizeLogger(cfg.Logger)
+	return cfg
+}
+
+func normalizeGlobalLimit(limit int64) int64 {
+	if limit <= 0 {
+		return DefaultGlobalLimit
+	}
+	return limit
+}
+
+func normalizeReservedRatio(ratio float64) float64 {
+	if ratio <= 0 || ratio >= 1 {
+		return DefaultReservedRatio
+	}
+	return ratio
+}
+
+func normalizeNotifier(notifier ResourceNotifier) ResourceNotifier {
+	if notifier == nil {
+		return &NoOpNotifier{}
+	}
+	return notifier
+}
+
+func normalizeLogger(logger *slog.Logger) *slog.Logger {
+	if logger == nil {
+		return slog.Default()
+	}
+	return logger
 }
 
 func (b *FileHandleBudget) Available() int64 {
@@ -380,30 +403,58 @@ func (a *AgentFileBudget) IsWaiting() bool {
 }
 
 func (a *AgentFileBudget) Acquire(ctx context.Context) error {
-	notified := false
+	state := &acquireState{}
 
 	for {
-		if ctx.Err() != nil {
-			a.clearWaiting(notified)
-			return ctx.Err()
-		}
-
-		acquired, level := a.tryAcquire()
-		if acquired {
-			a.handleAcquired(notified, level)
-			return nil
-		}
-
-		if !notified {
-			a.startWaiting()
-			notified = true
-		}
-
-		if err := a.waitWithContext(ctx); err != nil {
-			a.clearWaiting(notified)
-			return err
+		result := a.acquireIteration(ctx, state)
+		if result.done {
+			return result.err
 		}
 	}
+}
+
+type acquireState struct {
+	notified bool
+}
+
+type acquireResult struct {
+	done bool
+	err  error
+}
+
+func (a *AgentFileBudget) acquireIteration(ctx context.Context, state *acquireState) acquireResult {
+	if err := a.checkContextAndCleanup(ctx, state.notified); err != nil {
+		return acquireResult{done: true, err: err}
+	}
+
+	if acquired, level := a.tryAcquire(); acquired {
+		a.handleAcquired(state.notified, level)
+		return acquireResult{done: true, err: nil}
+	}
+
+	state.notified = a.ensureWaitingNotified(state.notified)
+
+	if err := a.waitWithContext(ctx); err != nil {
+		a.clearWaiting(state.notified)
+		return acquireResult{done: true, err: err}
+	}
+	return acquireResult{done: false}
+}
+
+func (a *AgentFileBudget) checkContextAndCleanup(ctx context.Context, notified bool) error {
+	if ctx.Err() != nil {
+		a.clearWaiting(notified)
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (a *AgentFileBudget) ensureWaitingNotified(notified bool) bool {
+	if !notified {
+		a.startWaiting()
+		return true
+	}
+	return notified
 }
 
 func (a *AgentFileBudget) tryAcquire() (acquired bool, level string) {
@@ -489,6 +540,11 @@ func (a *AgentFileBudget) clearWaiting(wasWaiting bool) {
 }
 
 func (a *AgentFileBudget) waitWithContext(ctx context.Context) error {
+	done := make(chan struct{})
+	defer close(done)
+
+	go a.signalOnContextDone(ctx, done)
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -500,6 +556,14 @@ func (a *AgentFileBudget) waitWithContext(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (a *AgentFileBudget) signalOnContextDone(ctx context.Context, done <-chan struct{}) {
+	select {
+	case <-ctx.Done():
+		a.cond.Broadcast()
+	case <-done:
+	}
 }
 
 func (a *AgentFileBudget) Release() {
