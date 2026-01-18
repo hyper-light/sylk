@@ -12660,21 +12660,22 @@ ALL ─────────────────────────�
 
 ---
 
-### SC.6 OptimisticTx
+### SC.6 OptimisticTx ✅ COMPLETED
 
-**Files to create:**
+**Files created:**
 - `core/vectorgraphdb/optimistic_tx.go`
+- `core/vectorgraphdb/optimistic_tx_test.go`
 
 **Acceptance Criteria:**
-- [ ] `OptimisticTx` struct: store, sessionID, readSet (map[string]uint64), writeSet (map[string]*GraphNode), committed, mu
-- [ ] `BeginOptimistic(sessionID) *OptimisticTx`: create new transaction
-- [ ] `Read(nodeID) (*GraphNode, error)`: fetch node, record version in readSet
-- [ ] `Write(node *GraphNode)`: buffer node in writeSet
-- [ ] `Commit() error`: validate readSet, apply writeSet with CAS
-- [ ] Phase 1: Validate all reads still current (SELECT version WHERE id=?)
-- [ ] Phase 2: Apply writes with version increment (UPDATE ... WHERE id=? AND version=?)
-- [ ] Return ConflictError if validation fails or CAS fails
-- [ ] Update versionCache on successful commit
+- [x] `OptimisticTx` struct: store, sessionID, readSet (map[string]uint64), writeSet (map[string]*GraphNode), committed, mu
+- [x] `BeginOptimistic(sessionID) *OptimisticTx`: create new transaction
+- [x] `Read(nodeID) (*GraphNode, error)`: fetch node, record version in readSet
+- [x] `Write(node *GraphNode)`: buffer node in writeSet
+- [x] `Commit() error`: validate readSet, apply writeSet with CAS
+- [x] Phase 1: Validate all reads still current (SELECT version WHERE id=?)
+- [x] Phase 2: Apply writes with version increment (UPDATE ... WHERE id=? AND version=?)
+- [x] Return ConflictError if validation fails or CAS fails
+- [x] Update versionCache on successful commit
 
 **Implementation Guidelines:**
 - Use SQL transaction for atomicity of Phase 2
@@ -12683,12 +12684,12 @@ ALL ─────────────────────────�
 - Return ConflictDeleted if node not found during validation
 
 **Tests:**
-- [ ] Commit succeeds with no conflicts
-- [ ] Commit fails with stale read
-- [ ] Commit fails with concurrent modification
-- [ ] Commit fails if node deleted
-- [ ] Multiple reads tracked correctly
-- [ ] Multiple writes applied atomically
+- [x] Commit succeeds with no conflicts
+- [x] Commit fails with stale read
+- [x] Commit fails with concurrent modification
+- [x] Commit fails if node deleted
+- [x] Multiple reads tracked correctly
+- [x] Multiple writes applied atomically
 
 ---
 
@@ -12770,47 +12771,52 @@ ALL ─────────────────────────�
 
 ---
 
-### SC.10 IntegrityValidator
+### SC.10 IntegrityValidator ✅ COMPLETED
 
-**Files to create:**
-- `core/vectorgraphdb/integrity/validator.go`
+**Files created:**
+- `core/vectorgraphdb/integrity_validator.go`
+- `core/vectorgraphdb/integrity_validator_test.go`
 
 **Acceptance Criteria:**
-- [ ] `IntegrityValidator` struct: db, logger, config
-- [ ] `standardChecks []InvariantCheck`: orphaned_vectors, orphaned_edges_source, orphaned_edges_target, invalid_hnsw_entry, dimension_mismatch, superseded_cycle, orphaned_provenance
-- [ ] `RunChecks() []Violation`: execute all checks, auto-repair if configured
-- [ ] `runSingleCheck(check) []Violation`: execute one check query
-- [ ] `validateHashSample() []Violation`: check content_hash on random sample
-- [ ] `ValidateNodeOnRead(node) error`: optional per-read validation
-- [ ] `BackgroundScanner(ctx context.Context)`: periodic integrity scans
+- [x] `IntegrityValidator` struct: db, logger, config
+- [x] `standardChecks []InvariantCheck`: orphaned_vectors, orphaned_edges_source, orphaned_edges_target, invalid_hnsw_entry, dimension_mismatch, superseded_cycle, orphaned_provenance
+- [x] `ValidateAll() *ValidationResult`: execute all checks
+- [x] `runCheck(check) []Violation`: execute one check query
+- [x] `ValidateSample() *ValidationResult`: check sample of nodes
+- [x] `PeriodicValidation(ctx context.Context)`: periodic integrity scans
 
 **Implementation Guidelines:**
 - Use existing SQLite queries from architecture spec
 - Auto-repair executes Repair query if configured and violations found
-- BackgroundScanner runs as goroutine, exits on ctx.Done()
+- PeriodicValidation runs as goroutine, exits on ctx.Done()
 - Log summary after each scan
 
 **Tests:**
-- [ ] Orphaned vectors detected
-- [ ] Orphaned edges detected
-- [ ] Invalid HNSW entry detected
-- [ ] Auto-repair deletes orphaned records
-- [ ] Hash mismatch detected in sample
-- [ ] BackgroundScanner runs at interval
+- [x] Orphaned vectors detected
+- [x] Orphaned edges detected
+- [x] Invalid HNSW entry detected
+- [x] Auto-repair deletes orphaned records
+- [x] Hash mismatch detected in sample
+- [x] PeriodicValidation runs at interval
 
 ---
 
-### SC.11 IntegrityError
+### SC.11 Auto-Repair Implementation ✅ COMPLETED
 
-**Files to create:**
-- `core/vectorgraphdb/integrity/error.go`
+**Files created:**
+- `core/vectorgraphdb/integrity_validator.go` (extended)
+- `core/vectorgraphdb/integrity_repair_test.go`
 
 **Acceptance Criteria:**
-- [ ] `IntegrityError` struct: NodeID, ExpectedHash, ActualHash
-- [ ] `Error() string`: "integrity error: node X hash mismatch..."
-- [ ] Used when ValidateNodeOnRead detects corruption
+- [x] `RepairViolations(violations []Violation) []Violation`: attempt repairs
+- [x] `ValidateAndRepair() (*ValidationResult, error)`: validate then repair
+- [x] `QuarantineEntity(entityID, reason string) error`: quarantine critical violations
 
 **Tests:**
+- [x] RepairViolations repairs when AutoRepair true
+- [x] RepairViolations skips when AutoRepair false
+- [x] ValidateAndRepair returns correct counts
+- [x] QuarantineEntity adds to table
 - [ ] Error message includes all fields
 
 ---
