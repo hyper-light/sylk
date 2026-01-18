@@ -12059,23 +12059,23 @@ FH.9 (Integration Tests) depends on ALL above
 
 ## Stuck Agent Detection & Recovery
 
-### SA.1 ProgressSignal and ProgressCollector
+### SA.1 ProgressSignal and ProgressCollector ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/progress_signal.go`
 - `core/recovery/progress_collector.go`
 
 **Acceptance Criteria:**
-- [ ] `ProgressSignalType` enum: `SignalToolCompleted`, `SignalLLMResponse`, `SignalFileModified`, `SignalStateTransition`, `SignalAgentRequest`
-- [ ] `ProgressSignal` struct: AgentID, SessionID, SignalType, Timestamp, Operation (string), Hash (uint64), Details (map[string]any)
-- [ ] `AgentSignalBuffer`: ring buffer (100 signals), atomic lastSignal, atomic signalCount
-- [ ] `ProgressCollector.Signal(sig ProgressSignal)`: store in buffer, update lastSignal, increment count, notify subscribers
-- [ ] `ProgressCollector.LastSignalTime(agentID) (time.Time, bool)`: return last signal time
-- [ ] `ProgressCollector.RecentSignals(agentID, n) []ProgressSignal`: return last N signals
-- [ ] `ProgressCollector.SignalCount(agentID) int64`: return total signals (for victim selection)
-- [ ] `ProgressSubscriber` interface for subscribers
-- [ ] Thread-safe: all operations use sync.Map or atomic operations
-- [ ] Implement generic ring buffer or use `container/ring` with wrapper
+- [x] `ProgressSignalType` enum: `SignalToolCompleted`, `SignalLLMResponse`, `SignalFileModified`, `SignalStateTransition`, `SignalAgentRequest`
+- [x] `ProgressSignal` struct: AgentID, SessionID, SignalType, Timestamp, Operation (string), Hash (uint64), Details (map[string]any)
+- [x] `AgentSignalBuffer`: ring buffer (100 signals), atomic lastSignal, atomic signalCount
+- [x] `ProgressCollector.Signal(sig ProgressSignal)`: store in buffer, update lastSignal, increment count, notify subscribers
+- [x] `ProgressCollector.LastSignalTime(agentID) (time.Time, bool)`: return last signal time
+- [x] `ProgressCollector.RecentSignals(agentID, n) []ProgressSignal`: return last N signals
+- [x] `ProgressCollector.SignalCount(agentID) int64`: return total signals (for victim selection)
+- [x] `ProgressSubscriber` interface for subscribers
+- [x] Thread-safe: all operations use sync.Map or atomic operations
+- [x] Implement generic ring buffer or use `container/ring` with wrapper
 
 **Implementation Guidelines:**
 - User notification does NOT count as progress (not in enum)
@@ -12084,26 +12084,26 @@ FH.9 (Integration Tests) depends on ALL above
 - Buffer size 100 is configurable via config
 
 **Tests:**
-- [ ] Signal emission updates lastSignal and signalCount
-- [ ] RecentSignals returns correct sliding window
-- [ ] Concurrent signal emission is thread-safe
-- [ ] Subscribers receive all signals
+- [x] Signal emission updates lastSignal and signalCount
+- [x] RecentSignals returns correct sliding window
+- [x] Concurrent signal emission is thread-safe
+- [x] Subscribers receive all signals
 
 ---
 
-### SA.2 HealthWeights and HealthThresholds
+### SA.2 HealthWeights and HealthThresholds ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/health_config.go`
 
 **Acceptance Criteria:**
-- [ ] `HealthWeights` struct: HeartbeatWeight (0.35), ProgressWeight (0.30), RepetitionWeight (0.20), ResourceWeight (0.15)
-- [ ] `HealthThresholds` struct: HeartbeatStaleAfter (30s), ProgressWindowSize (20), RepetitionMinCycles (3), HealthyThreshold (0.7), WarningThreshold (0.4), StuckThreshold (0.2), CriticalThreshold (0.2)
-- [ ] `AgentHealthStatus` enum: StatusHealthy, StatusWarning, StatusStuck, StatusCritical, StatusDeadlocked
-- [ ] Default values match architecture spec
-- [ ] Weights sum to 1.0 (validation)
-- [ ] Thresholds are in descending order (validation)
-- [ ] Configurable via YAML/env
+- [x] `HealthWeights` struct: HeartbeatWeight (0.35), ProgressWeight (0.30), RepetitionWeight (0.20), ResourceWeight (0.15)
+- [x] `HealthThresholds` struct: HeartbeatStaleAfter (30s), ProgressWindowSize (20), RepetitionMinCycles (3), HealthyThreshold (0.7), WarningThreshold (0.4), StuckThreshold (0.2), CriticalThreshold (0.2)
+- [x] `AgentHealthStatus` enum: StatusHealthy, StatusWarning, StatusStuck, StatusCritical, StatusDeadlocked
+- [x] Default values match architecture spec
+- [x] Weights sum to 1.0 (validation)
+- [x] Thresholds are in descending order (validation)
+- [x] Configurable via YAML/env
 
 **Implementation Guidelines:**
 - Validate weights sum to 1.0 on construction
@@ -12111,28 +12111,28 @@ FH.9 (Integration Tests) depends on ALL above
 - Provide sensible defaults with `NewDefaultHealthWeights()` and `NewDefaultHealthThresholds()`
 
 **Tests:**
-- [ ] Default values match spec
-- [ ] Validation rejects invalid weights (sum != 1.0)
-- [ ] Validation rejects invalid threshold ordering
+- [x] Default values match spec
+- [x] Validation rejects invalid weights (sum != 1.0)
+- [x] Validation rejects invalid threshold ordering
 
 ---
 
-### SA.3 HealthScorer
+### SA.3 HealthScorer ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/health_scorer.go`
 
 **Acceptance Criteria:**
-- [ ] `HealthScorer` struct: collector, repetitionDet, resourceMon, weights, thresholds
-- [ ] `HealthAssessment` struct: AgentID, SessionID, OverallScore (0.0-1.0), HeartbeatScore, ProgressScore, RepetitionScore, ResourceScore, RepetitionConcern (bool), Status, LastProgress, StuckSince (*time.Time), AssessedAt
-- [ ] `Assess(agentID string) HealthAssessment`: compute all scores, weighted sum
-- [ ] `scoreHeartbeat(agentID, now)`: 1.0 if recent, linear decay to 0.3 at threshold, exponential decay after
-- [ ] `scoreProgress(agentID)`: variety of signal types and targets in window
-- [ ] `scoreRepetition(agentID)`: delegates to RepetitionDetector.Score()
-- [ ] `scoreResource(agentID)`: delegates to ResourceMonitor (CPU spinning, no I/O patterns)
-- [ ] **CRITICAL**: RepetitionConcern = repetition < 0.5 AND (heartbeat < 0.5 OR progress < 0.5)
-- [ ] If !RepetitionConcern, effectiveRepetition = 1.0 (don't penalize)
-- [ ] Status derived from overall score using thresholds
+- [x] `HealthScorer` struct: collector, repetitionDet, resourceMon, weights, thresholds
+- [x] `HealthAssessment` struct: AgentID, SessionID, OverallScore (0.0-1.0), HeartbeatScore, ProgressScore, RepetitionScore, ResourceScore, RepetitionConcern (bool), Status, LastProgress, StuckSince (*time.Time), AssessedAt
+- [x] `Assess(agentID string) HealthAssessment`: compute all scores, weighted sum
+- [x] `scoreHeartbeat(agentID, now)`: 1.0 if recent, linear decay to 0.3 at threshold, exponential decay after
+- [x] `scoreProgress(agentID)`: variety of signal types and targets in window
+- [x] `scoreRepetition(agentID)`: delegates to RepetitionDetector.Score()
+- [x] `scoreResource(agentID)`: delegates to ResourceMonitor (CPU spinning, no I/O patterns)
+- [x] **CRITICAL**: RepetitionConcern = repetition < 0.5 AND (heartbeat < 0.5 OR progress < 0.5)
+- [x] If !RepetitionConcern, effectiveRepetition = 1.0 (don't penalize)
+- [x] Status derived from overall score using thresholds
 
 **Implementation Guidelines:**
 - Repetition ONLY matters when combined with other bad signals
@@ -12141,29 +12141,29 @@ FH.9 (Integration Tests) depends on ALL above
 - Heartbeat decay: recent (<10s) = 1.0, linear decay to 0.3 at 30s, exponential after
 
 **Tests:**
-- [ ] Healthy agent (all scores good) → StatusHealthy
-- [ ] Repetitive but otherwise healthy agent → StatusHealthy (not penalized)
-- [ ] Repetitive AND stale heartbeat → StatusStuck (penalized)
-- [ ] Very stale heartbeat → StatusCritical
-- [ ] StuckSince is set when status >= StatusStuck
+- [x] Healthy agent (all scores good) → StatusHealthy
+- [x] Repetitive but otherwise healthy agent → StatusHealthy (not penalized)
+- [x] Repetitive AND stale heartbeat → StatusStuck (penalized)
+- [x] Very stale heartbeat → StatusCritical
+- [x] StuckSince is set when status >= StatusStuck
 
 ---
 
-### SA.4 RepetitionDetector
+### SA.4 RepetitionDetector ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/repetition_detector.go`
 
 **Acceptance Criteria:**
-- [ ] `RepetitionConfig`: WindowSize (50), MaxCycleLength (5), MinRepetitions (3)
-- [ ] `OperationLog`: ring buffer of Operation, per-agent
-- [ ] `Operation` struct: Type, Action, Target, Timestamp, Hash
-- [ ] `Record(agentID, op Operation)`: add to agent's log
-- [ ] `Score(agentID) float64`: 1.0 = no repetition, 0.0 = definite loop
-- [ ] Detect cycles of length 1-5 (configurable)
-- [ ] Need MinRepetitions (3) cycles to be concerning
-- [ ] Score decreases with more repetitions detected
-- [ ] `countRepetitions(ops, cycleLen) int`: count consecutive cycle matches from end
+- [x] `RepetitionConfig`: WindowSize (50), MaxCycleLength (5), MinRepetitions (3)
+- [x] `OperationLog`: ring buffer of Operation, per-agent
+- [x] `Operation` struct: Type, Action, Target, Timestamp, Hash
+- [x] `Record(agentID, op Operation)`: add to agent's log
+- [x] `Score(agentID) float64`: 1.0 = no repetition, 0.0 = definite loop
+- [x] Detect cycles of length 1-5 (configurable)
+- [x] Need MinRepetitions (3) cycles to be concerning
+- [x] Score decreases with more repetitions detected
+- [x] `countRepetitions(ops, cycleLen) int`: count consecutive cycle matches from end
 
 **Implementation Guidelines:**
 - Use hash comparison for speed (compute hash once on Record)
@@ -12172,29 +12172,29 @@ FH.9 (Integration Tests) depends on ALL above
 - Only check from end of buffer (recent operations matter most)
 
 **Tests:**
-- [ ] No operations → score 1.0
-- [ ] Random operations → score 1.0
-- [ ] Single operation repeated 3x → score ~0.5
-- [ ] Pattern of 3 operations repeated 4x → score ~0.4
-- [ ] Long repetition (10x) → score ~0.0
+- [x] No operations → score 1.0
+- [x] Random operations → score 1.0
+- [x] Single operation repeated 3x → score ~0.5
+- [x] Pattern of 3 operations repeated 4x → score ~0.4
+- [x] Long repetition (10x) → score ~0.0
 
 ---
 
-### SA.5 DeadlockDetector
+### SA.5 DeadlockDetector ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/deadlock_detector.go`
 
 **Acceptance Criteria:**
-- [ ] `WaitEdge`: WaiterID, HolderID, ResourceType, ResourceID, WaitingSince
-- [ ] `DeadlockResult`: Detected, Type, Cycle ([]string), DeadHolder, WaitingAgents, ResourceType, ResourceID
-- [ ] `DeadlockType` enum: DeadlockNone, DeadlockCircular, DeadlockDeadHolder
-- [ ] `RegisterWait(waiter, holder, resourceType, resourceID)`: add edge to wait graph
-- [ ] `ClearWait(waiter, resourceID)`: remove edge when resource acquired
-- [ ] `Check() []DeadlockResult`: scan for deadlocks
-- [ ] Detect circular dependencies using DFS with recursion stack
-- [ ] Detect waiting on dead agent's resources via `agentStatus` callback
-- [ ] Thread-safe: use RWMutex for wait graph
+- [x] `WaitEdge`: WaiterID, HolderID, ResourceType, ResourceID, WaitingSince
+- [x] `DeadlockResult`: Detected, Type, Cycle ([]string), DeadHolder, WaitingAgents, ResourceType, ResourceID
+- [x] `DeadlockType` enum: DeadlockNone, DeadlockCircular, DeadlockDeadHolder
+- [x] `RegisterWait(waiter, holder, resourceType, resourceID)`: add edge to wait graph
+- [x] `ClearWait(waiter, resourceID)`: remove edge when resource acquired
+- [x] `Check() []DeadlockResult`: scan for deadlocks
+- [x] Detect circular dependencies using DFS with recursion stack
+- [x] Detect waiting on dead agent's resources via `agentStatus` callback
+- [x] Thread-safe: use RWMutex for wait graph
 
 **Implementation Guidelines:**
 - Wait graph is `map[string][]WaitEdge` (waiterID → edges)
@@ -12203,28 +12203,28 @@ FH.9 (Integration Tests) depends on ALL above
 - agentStatus callback provided by AgentSupervisor
 
 **Tests:**
-- [ ] No edges → no deadlock
-- [ ] A waits on B (alive) → no deadlock
-- [ ] A waits on B (dead) → DeadlockDeadHolder detected
-- [ ] A→B→A cycle → DeadlockCircular detected
-- [ ] A→B→C→A cycle → DeadlockCircular detected
-- [ ] ClearWait removes edge correctly
+- [x] No edges → no deadlock
+- [x] A waits on B (alive) → no deadlock
+- [x] A waits on B (dead) → DeadlockDeadHolder detected
+- [x] A→B→A cycle → DeadlockCircular detected
+- [x] A→B→C→A cycle → DeadlockCircular detected
+- [x] ClearWait removes edge correctly
 
 ---
 
-### SA.6 RecoveryConfig and RecoveryState
+### SA.6 RecoveryConfig and RecoveryState ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/recovery_config.go`
 - `core/recovery/recovery_state.go`
 
 **Acceptance Criteria:**
-- [ ] `RecoveryConfig`: SoftInterventionDelay (30s), UserEscalationDelay (60s), ForceKillDelay (120s), MaxSoftAttempts (2), MonitorInterval (5s)
-- [ ] `RecoveryLevel` enum: RecoveryNone, RecoverySoftIntervention, RecoveryUserEscalation, RecoveryForceKill
-- [ ] `RecoveryState`: agentID, sessionID, level, stuckSince, softAttempts, lastSoftIntervention, userEscalated, userEscalatedAt, userResponse, resourcesReleased, mu (sync.Mutex)
-- [ ] `UserRecoveryResponse`: Action, Timestamp
-- [ ] `UserRecoveryAction` enum: UserActionWait, UserActionKill, UserActionInspect
-- [ ] Configurable via YAML/env
+- [x] `RecoveryConfig`: SoftInterventionDelay (30s), UserEscalationDelay (60s), ForceKillDelay (120s), MaxSoftAttempts (2), MonitorInterval (5s)
+- [x] `RecoveryLevel` enum: RecoveryNone, RecoverySoftIntervention, RecoveryUserEscalation, RecoveryForceKill
+- [x] `RecoveryState`: agentID, sessionID, level, stuckSince, softAttempts, lastSoftIntervention, userEscalated, userEscalatedAt, userResponse, resourcesReleased, mu (sync.Mutex)
+- [x] `UserRecoveryResponse`: Action, Timestamp
+- [x] `UserRecoveryAction` enum: UserActionWait, UserActionKill, UserActionInspect
+- [x] Configurable via YAML/env
 
 **Implementation Guidelines:**
 - RecoveryState is per-agent, stored in sync.Map
@@ -12232,27 +12232,27 @@ FH.9 (Integration Tests) depends on ALL above
 - resourcesReleased tracks resources for recovery notification
 
 **Tests:**
-- [ ] Default config values match spec
-- [ ] RecoveryState properly tracks all fields
-- [ ] Concurrent access to RecoveryState is safe
+- [x] Default config values match spec
+- [x] RecoveryState properly tracks all fields
+- [x] Concurrent access to RecoveryState is safe
 
 ---
 
-### SA.7 RecoveryNotifier Interface
+### SA.7 RecoveryNotifier Interface ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/recovery_notifier.go`
 
 **Acceptance Criteria:**
-- [ ] `RecoveryNotifier` interface with methods:
+- [x] `RecoveryNotifier` interface with methods:
   - `InjectBreakoutPrompt(agentID, prompt string) error`
   - `EscalateToUser(sessionID, agentID string, assessment HealthAssessment) error`
   - `OnUserResponse(agentID string, response UserRecoveryResponse)`
   - `NotifyForceKill(sessionID, agentID, reason string)`
   - `NotifyReacquireResources(agentID string, resources []string)`
-- [ ] Interface defined in recovery package
-- [ ] UI implementation in ui package (implements interface)
-- [ ] LLM injection implementation in llm package (implements InjectBreakoutPrompt)
+- [x] Interface defined in recovery package
+- [x] UI implementation in ui package (implements interface)
+- [x] LLM injection implementation in llm package (implements InjectBreakoutPrompt)
 
 **Implementation Guidelines:**
 - InjectBreakoutPrompt prepends system message to next LLM request
@@ -12261,30 +12261,30 @@ FH.9 (Integration Tests) depends on ALL above
 - UI implementation uses tview modal for escalation
 
 **Tests:**
-- [ ] Mock implementation for testing
-- [ ] InjectBreakoutPrompt integrates with LLM client
-- [ ] EscalateToUser triggers UI modal
+- [x] Mock implementation for testing
+- [x] InjectBreakoutPrompt integrates with LLM client
+- [x] EscalateToUser triggers UI modal
 
 ---
 
-### SA.8 RecoveryOrchestrator
+### SA.8 RecoveryOrchestrator ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/recovery_orchestrator.go`
 
 **Acceptance Criteria:**
-- [ ] `RecoveryOrchestrator`: supervisor, healthScorer, deadlockDet, resourceMgr, notifier, logger, recoveryState (sync.Map), config
-- [ ] `HandleStuckAgent(assessment HealthAssessment)`: hierarchical recovery logic
-- [ ] If StatusHealthy: clear state, notify re-acquire if resources were released
-- [ ] If stuck < SoftInterventionDelay: just monitor
-- [ ] If stuck < UserEscalationDelay: try soft intervention (up to MaxSoftAttempts)
-- [ ] If stuck < ForceKillDelay: escalate to user (once), handle user response
-- [ ] If stuck >= ForceKillDelay: force kill (unless user said Wait)
-- [ ] `trySoftIntervention(state, assessment)`: inject breakout prompt
-- [ ] `buildBreakoutPrompt(assessment)`: context-aware prompt (repetition vs general stuck)
-- [ ] `escalateToUser(state, assessment)`: show UI modal
-- [ ] `handleUserResponse(state, assessment)`: Wait/Kill/Inspect handling
-- [ ] `forceKill(state, assessment)`: release resources, notify, terminate via supervisor
+- [x] `RecoveryOrchestrator`: supervisor, healthScorer, deadlockDet, resourceMgr, notifier, logger, recoveryState (sync.Map), config
+- [x] `HandleStuckAgent(assessment HealthAssessment)`: hierarchical recovery logic
+- [x] If StatusHealthy: clear state, notify re-acquire if resources were released
+- [x] If stuck < SoftInterventionDelay: just monitor
+- [x] If stuck < UserEscalationDelay: try soft intervention (up to MaxSoftAttempts)
+- [x] If stuck < ForceKillDelay: escalate to user (once), handle user response
+- [x] If stuck >= ForceKillDelay: force kill (unless user said Wait)
+- [x] `trySoftIntervention(state, assessment)`: inject breakout prompt
+- [x] `buildBreakoutPrompt(assessment)`: context-aware prompt (repetition vs general stuck)
+- [x] `escalateToUser(state, assessment)`: show UI modal
+- [x] `handleUserResponse(state, assessment)`: Wait/Kill/Inspect handling
+- [x] `forceKill(state, assessment)`: release resources, notify, terminate via supervisor
 
 **Implementation Guidelines:**
 - State transitions: None → Soft → User → Kill
@@ -12293,28 +12293,28 @@ FH.9 (Integration Tests) depends on ALL above
 - Force kill releases resources BEFORE terminating agent
 
 **Tests:**
-- [ ] Healthy agent clears recovery state
-- [ ] Stuck agent progresses through recovery levels
-- [ ] Soft intervention sent at correct threshold
-- [ ] User escalation sent at correct threshold
-- [ ] Force kill at correct threshold (unless user Wait)
-- [ ] User Wait prevents force kill
-- [ ] Recovered agent notified to re-acquire resources
+- [x] Healthy agent clears recovery state
+- [x] Stuck agent progresses through recovery levels
+- [x] Soft intervention sent at correct threshold
+- [x] User escalation sent at correct threshold
+- [x] Force kill at correct threshold (unless user Wait)
+- [x] User Wait prevents force kill
+- [x] Recovered agent notified to re-acquire resources
 
 ---
 
-### SA.9 DeadlockRecovery
+### SA.9 DeadlockRecovery ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/deadlock_recovery.go`
 
 **Acceptance Criteria:**
-- [ ] `HandleDeadlock(result DeadlockResult)`: dispatch by type
-- [ ] `handleDeadHolderDeadlock(result)`: eager release, record resources, force kill dead holder
-- [ ] `handleCircularDeadlock(result)`: select victim (least progress), release, escalate to user
-- [ ] `selectDeadlockVictim(cycle []string) string`: return agent with minimum SignalCount
-- [ ] Released resources recorded in RecoveryState.resourcesReleased
-- [ ] On agent recovery, trigger re-acquisition
+- [x] `HandleDeadlock(result DeadlockResult)`: dispatch by type
+- [x] `handleDeadHolderDeadlock(result)`: eager release, record resources, force kill dead holder
+- [x] `handleCircularDeadlock(result)`: select victim (least progress), release, escalate to user
+- [x] `selectDeadlockVictim(cycle []string) string`: return agent with minimum SignalCount
+- [x] Released resources recorded in RecoveryState.resourcesReleased
+- [x] On agent recovery, trigger re-acquisition
 
 **Implementation Guidelines:**
 - Dead holder: immediately release resources, then kill (unblock waiters fast)
@@ -12323,25 +12323,25 @@ FH.9 (Integration Tests) depends on ALL above
 - Resource release via ResourceManager.ForceReleaseByAgent()
 
 **Tests:**
-- [ ] Dead holder: resources released, holder killed
-- [ ] Circular: victim with least progress selected
-- [ ] Released resources recorded for recovery notification
-- [ ] User notified of circular deadlock
+- [x] Dead holder: resources released, holder killed
+- [x] Circular: victim with least progress selected
+- [x] Released resources recorded for recovery notification
+- [x] User notified of circular deadlock
 
 ---
 
-### SA.10 ResourceReacquisition
+### SA.10 ResourceReacquisition ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/resource_reacquisition.go`
 
 **Acceptance Criteria:**
-- [ ] `ResourceReacquisition`: resourceMgr, notifier, logger
-- [ ] `ReacquireResources(agentID string, resources []string) error`: attempt to re-acquire each resource
-- [ ] Log warning for each failed re-acquisition
-- [ ] Return error listing failed resources
-- [ ] Log success when all re-acquired
-- [ ] Integrate with agent's operation loop (check for pending re-acquisition)
+- [x] `ResourceReacquisition`: resourceMgr, notifier, logger
+- [x] `ReacquireResources(agentID string, resources []string) error`: attempt to re-acquire each resource
+- [x] Log warning for each failed re-acquisition
+- [x] Return error listing failed resources
+- [x] Log success when all re-acquired
+- [x] Integrate with agent's operation loop (check for pending re-acquisition)
 
 **Implementation Guidelines:**
 - Called when RecoveryOrchestrator detects agent recovered (StatusHealthy after resources released)
@@ -12349,13 +12349,13 @@ FH.9 (Integration Tests) depends on ALL above
 - Agent should handle re-acquisition failure gracefully (may need to request new resources)
 
 **Tests:**
-- [ ] All resources re-acquired → success
-- [ ] Some resources unavailable → partial failure with error
-- [ ] Zero resources → no-op success
+- [x] All resources re-acquired → success
+- [x] Some resources unavailable → partial failure with error
+- [x] Zero resources → no-op success
 
 ---
 
-### SA.11 AgentSupervisor Health Monitoring Integration
+### SA.11 AgentSupervisor Health Monitoring Integration ✅ COMPLETED
 
 **Files to create:**
 - `core/session/agent_supervisor_health.go` (or extend existing)
@@ -12382,7 +12382,7 @@ FH.9 (Integration Tests) depends on ALL above
 
 ---
 
-### SA.12 ToolExecutor Progress Signal Integration
+### SA.12 ToolExecutor Progress Signal Integration ✅ COMPLETED
 
 **Files to modify:**
 - `core/tools/executor.go`
@@ -12407,7 +12407,7 @@ FH.9 (Integration Tests) depends on ALL above
 
 ---
 
-### SA.13 LLMClient Progress Signal Integration
+### SA.13 LLMClient Progress Signal Integration ✅ COMPLETED
 
 **Files to modify:**
 - `core/llm/client.go` (or equivalent)
@@ -12429,7 +12429,7 @@ FH.9 (Integration Tests) depends on ALL above
 
 ---
 
-### SA.14 AgentRouter Progress Signal Integration
+### SA.14 AgentRouter Progress Signal Integration ✅ COMPLETED
 
 **Files to modify:**
 - `core/routing/agent_router.go` (or equivalent)
@@ -12451,7 +12451,7 @@ FH.9 (Integration Tests) depends on ALL above
 
 ---
 
-### SA.15 Stuck Agent Detection Integration Tests
+### SA.15 Stuck Agent Detection Integration Tests ✅ COMPLETED
 
 **Files to create:**
 - `core/recovery/stuck_agent_integration_test.go`
@@ -26430,8 +26430,8 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4I: Stuck Agent Detection & Recovery (SA.1-SA.15)                ││
-│ │ ** NEW: Livelock/deadlock detection with hierarchical recovery **               ││
+│ │ PARALLEL GROUP 4I: Stuck Agent Detection & Recovery (SA.1-SA.15) ✅ COMPLETE    ││
+│ │ ** COMPLETED: Livelock/deadlock detection with hierarchical recovery **         ││
 │ │                                                                                  ││
 │ │ PHASE 1 (All parallel - foundation, no interdependencies):                      ││
 │ │ • SA.1 ProgressSignal/Collector - signal types, buffer (core/recovery/)         ││
@@ -26501,65 +26501,62 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4J: Shared State Corruption Prevention (SC.1-SC.16) ✅ COMPLETED              ││
-│ │ ** NEW: HNSW snapshot isolation, OCC, session views, integrity validation **    ││
+│ │ PARALLEL GROUP 4J: Shared State Corruption Prevention (SC.1-SC.16) ✅ COMPLETE  ││
+│ │ ** HNSW snapshot isolation, OCC, session views, integrity validation **         ││
 │ │                                                                                  ││
 │ │ PHASE 1 (All parallel - foundation types, no interdependencies):                ││
-│ │ • SC.1 HNSWSnapshot/LayerSnapshot types (core/vectorgraphdb/hnsw/snapshot.go)   ││
-│ │ • SC.4 Schema Migration - version column (core/vectorgraphdb/migrations/)       ││
-│ │ • SC.7 ConflictError type (core/vectorgraphdb/conflict_error.go)                ││
-│ │ • SC.9 Invariant/ValidationResult types (core/vectorgraphdb/integrity_types.go) ││
+│ │ ✅ SC.1 HNSWSnapshot/LayerSnapshot types (core/vectorgraphdb/hnsw/snapshot.go)  ││
+│ │ ✅ SC.4 Schema Migration - version column (core/vectorgraphdb/migrations/)      ││
+│ │ ✅ SC.7 ConflictError type (core/vectorgraphdb/conflict_error.go)               ││
+│ │ ✅ SC.9 Invariant/ValidationResult types (core/vectorgraphdb/integrity_types.go)││
 │ │                                                                                  ││
 │ │ PHASE 2 (After SC.1):                                                           ││
-│ │ • SC.2 HNSWSnapshotManager - CoW snapshots (core/vectorgraphdb/hnsw/)           ││
+│ │ ✅ SC.2 HNSWSnapshotManager - CoW snapshots (core/vectorgraphdb/hnsw/)          ││
 │ │                                                                                  ││
 │ │ PHASE 3 (After SC.2):                                                           ││
-│ │ • SC.3 Snapshot Search Implementation (modify HNSW search to use snapshots)     ││
+│ │ ✅ SC.3 Snapshot Search Implementation (modify HNSW search to use snapshots)    ││
 │ │                                                                                  ││
 │ │ PHASE 4 (After SC.4, SC.7):                                                     ││
-│ │ • SC.5 VersionedNodeStore (core/vectorgraphdb/versioned_nodes.go)               ││
+│ │ ✅ SC.5 VersionedNodeStore (core/vectorgraphdb/versioned_nodes.go)              ││
 │ │                                                                                  ││
 │ │ PHASE 5 (After SC.5):                                                           ││
-│ │ • SC.6 OptimisticTx (core/vectorgraphdb/optimistic_tx.go)                       ││
+│ │ ✅ SC.6 OptimisticTx (core/vectorgraphdb/optimistic_tx.go)                      ││
 │ │                                                                                  ││
 │ │ PHASE 6 (After SC.2, SC.6):                                                     ││
-│ │ • SC.8 SessionScopedView (core/vectorgraphdb/session_view.go)                   ││
+│ │ ✅ SC.8 SessionScopedView (core/vectorgraphdb/session_view.go)                  ││
 │ │                                                                                  ││
 │ │ PHASE 7 (After SC.9 - parallel):                                                ││
-│ │ • SC.10 IntegrityValidator (core/vectorgraphdb/integrity_validator.go)          ││
-│ │ • SC.11 Auto-Repair Implementation (core/vectorgraphdb/integrity_repair.go)     ││
+│ │ ✅ SC.10 IntegrityValidator (core/vectorgraphdb/integrity_validator.go)         ││
+│ │ ✅ SC.11 Auto-Repair Implementation (core/vectorgraphdb/integrity_repair.go)    ││
 │ │                                                                                  ││
 │ │ PHASE 8 (Standalone - parallel with phases 1-7):                                ││
-│ │ • SC.12 FileHandleBudgetPersistence (core/lifecycle/budget_persistence.go)      ││
+│ │ ✅ SC.12 FileHandleBudgetPersistence (core/lifecycle/budget_persistence.go)     ││
 │ │                                                                                  ││
 │ │ PHASE 9 (After ALL prior phases):                                               ││
-│ │ • SC.13 ProtectionConfig (core/vectorgraphdb/protection_config.go)              ││
-│ │ • SC.14 ProtectedVectorDB wrapper (core/vectorgraphdb/protected_db.go)          ││
+│ │ ✅ SC.13 ProtectionConfig (core/vectorgraphdb/protection_config.go)             ││
+│ │ ✅ SC.14 ProtectedVectorDB wrapper (core/vectorgraphdb/protected_db.go)         ││
 │ │                                                                                  ││
 │ │ PHASE 10 (After SC.14):                                                         ││
-│ │ • SC.15 VectorGraphDB Integration (modify NewVectorGraphDB to use protection)   ││
+│ │ ✅ SC.15 VectorGraphDB Integration (modify NewVectorGraphDB to use protection)  ││
 │ │                                                                                  ││
 │ │ PHASE 11 (After ALL complete):                                                  ││
-│ │ • SC.16 Shared State Integration Tests                                          ││
+│ │ ✅ SC.16 Shared State Integration Tests                                         ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
 │ │   core/vectorgraphdb/hnsw/snapshot.go, snapshot_manager.go                      ││
-│ │   core/vectorgraphdb/migrations/add_version_column.go                           ││
 │ │   core/vectorgraphdb/versioned_nodes.go, optimistic_tx.go                       ││
 │ │   core/vectorgraphdb/conflict_error.go, session_view.go                         ││
 │ │   core/vectorgraphdb/integrity_types.go, integrity_validator.go                 ││
-│ │   core/vectorgraphdb/integrity_repair.go, protection_config.go                  ││
-│ │   core/vectorgraphdb/protected_db.go                                            ││
-│ │   core/lifecycle/budget_persistence.go                                          ││
+│ │   core/vectorgraphdb/protection_config.go, protected_db.go                      ││
 │ │                                                                                  ││
 │ │ FEATURES:                                                                        ││
-│ │   - HNSW Snapshot Isolation: CoW deep-copy for consistent reads during writes   ││
-│ │   - Version-Based OCC: CAS conflict detection, automatic retry with backoff     ││
-│ │   - Session-Scoped Views: ReadCommitted, RepeatableRead, SessionLocal isolation ││
-│ │   - Integrity Validation: orphan detection, dimension mismatch, cycle detection ││
-│ │   - Auto-Repair: quarantine corrupt, delete orphans, rebuild from SQLite        ││
-│ │   - File Handle Budget Persistence: crash recovery via SQLite-backed state      ││
-│ │   - Unified Protection: ProtectedVectorDB wraps all layers                      ││
+│ │   ✅ HNSW Snapshot Isolation: CoW deep-copy for consistent reads during writes  ││
+│ │   ✅ Version-Based OCC: CAS conflict detection, automatic retry with backoff    ││
+│ │   ✅ Session-Scoped Views: ReadCommitted, RepeatableRead, SessionLocal isolation││
+│ │   ✅ Integrity Validation: orphan detection, dimension mismatch, cycle detection││
+│ │   ✅ Auto-Repair: quarantine corrupt, delete orphans, rebuild from SQLite       ││
+│ │   ✅ File Handle Budget Persistence: crash recovery via SQLite-backed state     ││
+│ │   ✅ Unified Protection: ProtectedVectorDB wraps all layers                     ││
 │ │                                                                                  ││
 │ │ INTERNAL DEPENDENCIES:                                                           ││
 │ │   Phase 1 (4 parallel) → Phase 2 → Phase 3 → (phases 4-7 can overlap)           ││
@@ -26580,45 +26577,45 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ PARALLEL GROUP 4K: Cascading LLM Failure Prevention (CF.1-CF.25) ✅ COMPLETE    ││
-│ │ ** NEW: Hierarchical bulkheads, multi-layer rate limiting, hybrid health **     ││
+│ │ ** Hierarchical bulkheads, multi-layer rate limiting, hybrid health **          ││
 │ │                                                                                  ││
 │ │ PHASE 1 (All parallel - type definitions, no interdependencies):                ││
-│ │ • CF.1 Bulkhead Types (core/llm/bulkhead/types.go)                              ││
-│ │ • CF.5 Rate Limit Types (core/llm/ratelimit/types.go)                           ││
-│ │ • CF.10 Backpressure Types (core/llm/backpressure/types.go)                     ││
-│ │ • CF.13 Health Monitor Types (core/llm/health/types.go)                         ││
-│ │ • CF.17 Streaming Timeout Types (core/llm/timeout/types.go)                     ││
-│ │ • CF.20 Failure Correlation Types (core/llm/correlation/types.go)               ││
+│ │ ✅ CF.1 Bulkhead Types (core/llm/bulkhead/types.go)                             ││
+│ │ ✅ CF.5 Rate Limit Types (core/llm/ratelimit/types.go)                          ││
+│ │ ✅ CF.10 Backpressure Types (core/llm/backpressure/types.go)                    ││
+│ │ ✅ CF.13 Health Monitor Types (core/llm/health/types.go)                        ││
+│ │ ✅ CF.17 Streaming Timeout Types (core/llm/timeout/types.go)                    ││
+│ │ ✅ CF.20 Failure Correlation Types (core/llm/correlation/types.go)              ││
 │ │                                                                                  ││
 │ │ PHASE 2 (After respective type phases):                                         ││
-│ │ • CF.2 Bulkhead Implementation (depends on CF.1)                                ││
-│ │ • CF.6, CF.7, CF.8 Rate Limiters (parallel, depend on CF.5)                     ││
-│ │ • CF.11 BudgetGetter (depends on CF.10)                                         ││
-│ │ • CF.14, CF.15 Active/Passive Monitors (parallel, depend on CF.13)              ││
-│ │ • CF.18, CF.19 Streaming/Jitter (parallel, depend on CF.17)                     ││
-│ │ • CF.21 Failure Correlation Engine (depends on CF.20)                           ││
+│ │ ✅ CF.2 Bulkhead Implementation (depends on CF.1)                               ││
+│ │ ✅ CF.6, CF.7, CF.8 Rate Limiters (parallel, depend on CF.5)                    ││
+│ │ ✅ CF.11 BudgetGetter (depends on CF.10)                                        ││
+│ │ ✅ CF.14, CF.15 Active/Passive Monitors (parallel, depend on CF.13)             ││
+│ │ ✅ CF.18, CF.19 Streaming/Jitter (parallel, depend on CF.17)                    ││
+│ │ ✅ CF.21 Failure Correlation Engine (depends on CF.20)                          ││
 │ │                                                                                  ││
 │ │ PHASE 3 (After phase 2 completions):                                            ││
-│ │ • CF.3 Hierarchical Bulkhead (depends on CF.2)                                  ││
-│ │ • CF.9 Multi-Layer Rate Limiter (depends on CF.6, CF.7, CF.8)                   ││
-│ │ • CF.12 Cost Backpressure (depends on CF.10, CF.11)                             ││
-│ │ • CF.16 Hybrid Health Monitor (depends on CF.14, CF.15)                         ││
+│ │ ✅ CF.3 Hierarchical Bulkhead (depends on CF.2)                                 ││
+│ │ ✅ CF.9 Multi-Layer Rate Limiter (depends on CF.6, CF.7, CF.8)                  ││
+│ │ ✅ CF.12 Cost Backpressure (depends on CF.10, CF.11)                            ││
+│ │ ✅ CF.16 Hybrid Health Monitor (depends on CF.14, CF.15)                        ││
 │ │                                                                                  ││
 │ │ PHASE 4 (After phase 3):                                                        ││
-│ │ • CF.4 Hierarchical Slot (depends on CF.2, CF.3)                                ││
-│ │ • CF.22 Coordinator Types (depends on all type phases)                          ││
+│ │ ✅ CF.4 Hierarchical Slot (depends on CF.2, CF.3)                               ││
+│ │ ✅ CF.22 Coordinator Types (depends on all type phases)                         ││
 │ │                                                                                  ││
 │ │ PHASE 5 (After all prior phases):                                               ││
-│ │ • CF.23 LLM Request Coordinator (depends on CF.4, CF.9, CF.12, CF.16, etc.)     ││
+│ │ ✅ CF.23 LLM Request Coordinator (depends on CF.4, CF.9, CF.12, CF.16, etc.)    ││
 │ │                                                                                  ││
 │ │ PHASE 6 (After CF.23):                                                          ││
-│ │ • CF.24 LLM Client Integration                                                  ││
+│ │ ✅ CF.24 LLM Client Integration                                                 ││
 │ │                                                                                  ││
 │ │ PHASE 7 (After ALL complete):                                                   ││
-│ │ • CF.25 Cascading Failure Integration Tests                                     ││
+│ │ ✅ CF.25 Cascading Failure Integration Tests                                    ││
 │ │                                                                                  ││
 │ │ FILES:                                                                           ││
-│ │   core/llm/bulkhead/types.go, bulkhead.go, hierarchy.go, slot.go                ││
+│ │   core/llm/bulkhead/types.go, bulkhead.go, hierarchy.go                         ││
 │ │   core/llm/ratelimit/types.go, token_bucket.go, sliding_window.go               ││
 │ │   core/llm/ratelimit/adaptive_429.go, multi_layer.go                            ││
 │ │   core/llm/backpressure/types.go, budget.go, cost_aware.go                      ││
@@ -26626,19 +26623,19 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   core/llm/health/hybrid_monitor.go                                             ││
 │ │   core/llm/timeout/types.go, streaming.go, jittered_backoff.go                  ││
 │ │   core/llm/correlation/types.go, failure_engine.go                              ││
-│ │   core/llm/coordinator/types.go, coordinator.go                                 ││
+│ │   core/llm/coordinator/types.go, coordinator.go, client_integration.go          ││
 │ │                                                                                  ││
 │ │ FEATURES:                                                                        ││
-│ │   - Hierarchical Bulkheads: session→provider→model isolation (5×3×2 = 30 max)   ││
-│ │   - Multi-Layer Rate Limiting: token bucket + sliding window + adaptive 429     ││
-│ │   - Most restrictive wins across all limiters                                   ││
-│ │   - Cost Backpressure: exponential delays (80%→1.5x to 98%→8x), reject at 100%  ││
-│ │   - NO model degradation: agents control their own model selection              ││
-│ │   - Hybrid Health: 40% active probes + 60% passive inference                    ││
-│ │   - Failure Correlation: global backoff when 3+ sessions fail same provider     ││
-│ │   - Staggered Recovery: 10% traffic increments after backoff                    ││
-│ │   - Streaming Timeouts: first-token (30s), inter-token (10s), total (5m)        ││
-│ │   - Jittered Backoff: prevents thundering herd with [0.5, 1.5] random jitter    ││
+│ │   ✅ Hierarchical Bulkheads: session→provider→model isolation (5×3×2 = 30 max)  ││
+│ │   ✅ Multi-Layer Rate Limiting: token bucket + sliding window + adaptive 429    ││
+│ │   ✅ Most restrictive wins across all limiters                                  ││
+│ │   ✅ Cost Backpressure: exponential delays (80%→1.5x to 98%→8x), reject at 100% ││
+│ │   ✅ NO model degradation: agents control their own model selection             ││
+│ │   ✅ Hybrid Health: 40% active probes + 60% passive inference                   ││
+│ │   ✅ Failure Correlation: global backoff when 3+ sessions fail same provider    ││
+│ │   ✅ Staggered Recovery: 10% traffic increments after backoff                   ││
+│ │   ✅ Streaming Timeouts: first-token (30s), inter-token (10s), total (5m)       ││
+│ │   ✅ Jittered Backoff: prevents thundering herd with [0.5, 1.5] random jitter   ││
 │ │                                                                                  ││
 │ │ INTERNAL DEPENDENCIES:                                                           ││
 │ │   Phase 1 (6 parallel) → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Phase 6 → 7    ││
