@@ -11738,286 +11738,286 @@ GR.17 (Integration Tests) depends on ALL above
 
 **Goal**: Hierarchical work-stealing file handle allocation with proactive tracking, automatic cleanup, and user notification on wait/proceed.
 
-### FH.1 FileHandleBudget (Global Pool)
+### FH.1 FileHandleBudget (Global Pool) ✅ COMPLETE
 
 **Files to create:**
 - `core/resources/file_handle_budget.go`
 
 **Acceptance Criteria:**
-- [ ] `FileHandleBudget` struct with:
-  - [ ] `globalLimit int` - detected from `ulimit -n` at startup
-  - [ ] `reserved int` - 20% reserved for system operations
-  - [ ] `globalAllocated atomic.Int64` - sum of session allocations
-  - [ ] `globalUsed atomic.Int64` - sum of actual open files
-  - [ ] `sessions sync.Map` - sessionID → *SessionFileBudget
-  - [ ] `pressureLevel *atomic.Int32` - from memory pressure system
-  - [ ] `notifier ResourceNotifier` - UI notification interface
-  - [ ] `logger *slog.Logger`
-- [ ] `NewFileHandleBudget(notifier, logger) *FileHandleBudget`
-  - [ ] Detect system limit via `syscall.Getrlimit(syscall.RLIMIT_NOFILE, ...)`
-  - [ ] Reserve 20% for system operations
-- [ ] `RegisterSession(sessionID string) *SessionFileBudget`
-  - [ ] Creates SessionFileBudget with fair-share allocation
-  - [ ] Rebalances other sessions if needed
-- [ ] `UnregisterSession(sessionID string)`
-  - [ ] Releases session's allocation back to global pool
-  - [ ] Signals all waiters (capacity now available)
-- [ ] `tryExpandSession(session *SessionFileBudget) bool`
-  - [ ] Attempts to allocate 1 more FD from global unallocated
-  - [ ] Returns true if successful, false if global exhausted
-- [ ] `signalAllWaiters()` - broadcasts to all sessions/agents
-- [ ] `OnPressureChange(level PressureLevel)` - reduce allocations under pressure
-- [ ] `Snapshot() FileHandleSnapshot` - monitoring view
+- [x] `FileHandleBudget` struct with:
+  - [x] `globalLimit int` - detected from `ulimit -n` at startup
+  - [x] `reserved int` - 20% reserved for system operations
+  - [x] `globalAllocated atomic.Int64` - sum of session allocations
+  - [x] `globalUsed atomic.Int64` - sum of actual open files
+  - [x] `sessions sync.Map` - sessionID → *SessionFileBudget
+  - [x] `pressureLevel *atomic.Int32` - from memory pressure system
+  - [x] `notifier ResourceNotifier` - UI notification interface
+  - [x] `logger *slog.Logger`
+- [x] `NewFileHandleBudget(notifier, logger) *FileHandleBudget`
+  - [x] Detect system limit via `syscall.Getrlimit(syscall.RLIMIT_NOFILE, ...)`
+  - [x] Reserve 20% for system operations
+- [x] `RegisterSession(sessionID string) *SessionFileBudget`
+  - [x] Creates SessionFileBudget with fair-share allocation
+  - [x] Rebalances other sessions if needed
+- [x] `UnregisterSession(sessionID string)`
+  - [x] Releases session's allocation back to global pool
+  - [x] Signals all waiters (capacity now available)
+- [x] `tryExpandSession(session *SessionFileBudget) bool`
+  - [x] Attempts to allocate 1 more FD from global unallocated
+  - [x] Returns true if successful, false if global exhausted
+- [x] `signalAllWaiters()` - broadcasts to all sessions/agents
+- [x] `OnPressureChange(level PressureLevel)` - reduce allocations under pressure
+- [x] `Snapshot() FileHandleSnapshot` - monitoring view
 
 **Tests:**
-- [ ] NewFileHandleBudget detects system limit correctly
-- [ ] RegisterSession creates fair-share allocation
-- [ ] UnregisterSession releases allocation
-- [ ] tryExpandSession succeeds when global has capacity
-- [ ] tryExpandSession fails when global exhausted
-- [ ] OnPressureChange reduces allocations appropriately
+- [x] NewFileHandleBudget detects system limit correctly
+- [x] RegisterSession creates fair-share allocation
+- [x] UnregisterSession releases allocation
+- [x] tryExpandSession succeeds when global has capacity
+- [x] tryExpandSession fails when global exhausted
+- [x] OnPressureChange reduces allocations appropriately
 
 ---
 
-### FH.2 SessionFileBudget (Per-Session Allocation)
+### FH.2 SessionFileBudget (Per-Session Allocation) ✅ COMPLETE
 
 **Files to create:**
 - `core/resources/session_file_budget.go`
 
 **Acceptance Criteria:**
-- [ ] `SessionFileBudget` struct with:
-  - [ ] `sessionID string`
-  - [ ] `parent *FileHandleBudget`
-  - [ ] `allocated atomic.Int64` - claimed from global
-  - [ ] `used atomic.Int64` - actual usage by agents
-  - [ ] `agents sync.Map` - agentID → *AgentFileBudget
-  - [ ] `mu sync.Mutex`, `cond *sync.Cond`
-- [ ] `RegisterAgent(agentID, agentType string) *AgentFileBudget`
-  - [ ] Creates AgentFileBudget with base allocation by type
-  - [ ] Base allocations: engineer=50, architect=30, inspector=20, etc.
-- [ ] `UnregisterAgent(agentID string)`
-  - [ ] Releases agent's allocation back to session pool
-  - [ ] Signals waiters
-- [ ] `tryExpandAgent(agent *AgentFileBudget) bool`
-  - [ ] Attempts to allocate 1 more FD from session unallocated
-  - [ ] Returns true if successful
-- [ ] `signalWaiters()` - broadcasts to all agents in session
-- [ ] `sumAgentAllocations() int64` - total allocated to agents
-- [ ] `Unallocated() int64` - available for agent stealing
+- [x] `SessionFileBudget` struct with:
+  - [x] `sessionID string`
+  - [x] `parent *FileHandleBudget`
+  - [x] `allocated atomic.Int64` - claimed from global
+  - [x] `used atomic.Int64` - actual usage by agents
+  - [x] `agents sync.Map` - agentID → *AgentFileBudget
+  - [x] `mu sync.Mutex`, `cond *sync.Cond`
+- [x] `RegisterAgent(agentID, agentType string) *AgentFileBudget`
+  - [x] Creates AgentFileBudget with base allocation by type
+  - [x] Base allocations: engineer=50, architect=30, inspector=20, etc.
+- [x] `UnregisterAgent(agentID string)`
+  - [x] Releases agent's allocation back to session pool
+  - [x] Signals waiters
+- [x] `tryExpandAgent(agent *AgentFileBudget) bool`
+  - [x] Attempts to allocate 1 more FD from session unallocated
+  - [x] Returns true if successful
+- [x] `signalWaiters()` - broadcasts to all agents in session
+- [x] `sumAgentAllocations() int64` - total allocated to agents
+- [x] `Unallocated() int64` - available for agent stealing
 
 **Tests:**
-- [ ] RegisterAgent creates allocation based on agent type
-- [ ] UnregisterAgent releases allocation
-- [ ] tryExpandAgent succeeds when session has capacity
-- [ ] tryExpandAgent fails when session exhausted
-- [ ] Unallocated returns correct available count
+- [x] RegisterAgent creates allocation based on agent type
+- [x] UnregisterAgent releases allocation
+- [x] tryExpandAgent succeeds when session has capacity
+- [x] tryExpandAgent fails when session exhausted
+- [x] Unallocated returns correct available count
 
 ---
 
-### FH.3 AgentFileBudget (Per-Agent Allocation)
+### FH.3 AgentFileBudget (Per-Agent Allocation) ✅ COMPLETE
 
 **Files to create:**
 - `core/resources/agent_file_budget.go`
 
 **Acceptance Criteria:**
-- [ ] `AgentFileBudget` struct with:
-  - [ ] `agentID string`, `agentType string`
-  - [ ] `parent *SessionFileBudget`
-  - [ ] `allocated atomic.Int64` - claimed from session
-  - [ ] `used atomic.Int64` - actual open files
-  - [ ] `baseAllocation int` - starting allocation by type
-  - [ ] `mu sync.Mutex`, `cond *sync.Cond`
-- [ ] `Acquire(ctx context.Context) error`
-  - [ ] Attempts hierarchical acquisition: agent → session → global
-  - [ ] If must wait: log "waiting", notify UI (ONCE)
-  - [ ] When acquired after wait: log "acquired", notify UI
-  - [ ] Context cancellation clears notification and returns error
-  - [ ] NO errors or warnings for normal waiting
-- [ ] `tryAcquire() (acquired bool, level string)`
-  - [ ] Level 1: Check agent capacity
-  - [ ] Level 2: Try steal from session (tryExpandAgent)
-  - [ ] Level 3: Session steals from global, then agent from session
-  - [ ] Returns acquisition level for logging ("agent", "session", "global")
-- [ ] `Release()`
-  - [ ] Decrements used at all levels (agent, session, global)
-  - [ ] Signals waiters at all levels
-- [ ] `signalWaiters()` - wakes waiting goroutines
+- [x] `AgentFileBudget` struct with:
+  - [x] `agentID string`, `agentType string`
+  - [x] `parent *SessionFileBudget`
+  - [x] `allocated atomic.Int64` - claimed from session
+  - [x] `used atomic.Int64` - actual open files
+  - [x] `baseAllocation int` - starting allocation by type
+  - [x] `mu sync.Mutex`, `cond *sync.Cond`
+- [x] `Acquire(ctx context.Context) error`
+  - [x] Attempts hierarchical acquisition: agent → session → global
+  - [x] If must wait: log "waiting", notify UI (ONCE)
+  - [x] When acquired after wait: log "acquired", notify UI
+  - [x] Context cancellation clears notification and returns error
+  - [x] NO errors or warnings for normal waiting
+- [x] `tryAcquire() (acquired bool, level string)`
+  - [x] Level 1: Check agent capacity
+  - [x] Level 2: Try steal from session (tryExpandAgent)
+  - [x] Level 3: Session steals from global, then agent from session
+  - [x] Returns acquisition level for logging ("agent", "session", "global")
+- [x] `Release()`
+  - [x] Decrements used at all levels (agent, session, global)
+  - [x] Signals waiters at all levels
+- [x] `signalWaiters()` - wakes waiting goroutines
 
 **Tests:**
-- [ ] Acquire succeeds when agent has capacity
-- [ ] Acquire steals from session when agent exhausted
-- [ ] Acquire steals from global when session exhausted
-- [ ] Acquire waits and logs when all exhausted
-- [ ] Acquire notifies UI once on wait, once on proceed
-- [ ] Release signals waiters at all levels
-- [ ] Context cancellation returns error and clears notification
+- [x] Acquire succeeds when agent has capacity
+- [x] Acquire steals from session when agent exhausted
+- [x] Acquire steals from global when session exhausted
+- [x] Acquire waits and logs when all exhausted
+- [x] Acquire notifies UI once on wait, once on proceed
+- [x] Release signals waiters at all levels
+- [x] Context cancellation returns error and clears notification
 
 ---
 
-### FH.4 TrackedFile (Implements TrackedResource)
+### FH.4 TrackedFile (Implements TrackedResource) ✅ COMPLETE
 
 **Files to create:**
 - `core/resources/tracked_file.go`
 
 **Acceptance Criteria:**
-- [ ] `FileMode` enum: `ModeRead`, `ModeWrite`, `ModeReadWrite`, `ModeAppend`
-- [ ] `TrackedFile` struct with:
-  - [ ] `file *os.File`
-  - [ ] `path string`, `fd int`, `mode FileMode`
-  - [ ] `openedAt time.Time`
-  - [ ] `lastAccess atomic.Value` (time.Time)
-  - [ ] `sessionID string`, `agentID string`
-  - [ ] `agentBudget *AgentFileBudget`
-  - [ ] `mu sync.Mutex`, `closed bool`
-- [ ] Implements `TrackedResource` interface:
-  - [ ] `Type() string` returns "file"
-  - [ ] `ID() string` returns `file:{path}:{fd}`
-  - [ ] `ForceClose() error` - releases budget, closes file
-- [ ] `Read(p []byte) (int, error)` - wraps file.Read, updates lastAccess
-- [ ] `Write(p []byte) (int, error)` - wraps file.Write, updates lastAccess
-- [ ] `Close() error` - explicit close, same as ForceClose
-- [ ] `Path() string`, `Fd() int`, `Mode() FileMode` - getters
-- [ ] `OpenDuration() time.Duration` - time since opened
-- [ ] `IdleDuration() time.Duration` - time since last access
+- [x] `FileMode` enum: `ModeRead`, `ModeWrite`, `ModeReadWrite`, `ModeAppend`
+- [x] `TrackedFile` struct with:
+  - [x] `file *os.File`
+  - [x] `path string`, `fd int`, `mode FileMode`
+  - [x] `openedAt time.Time`
+  - [x] `lastAccess atomic.Value` (time.Time)
+  - [x] `sessionID string`, `agentID string`
+  - [x] `agentBudget *AgentFileBudget`
+  - [x] `mu sync.Mutex`, `closed bool`
+- [x] Implements `TrackedResource` interface:
+  - [x] `Type() string` returns "file"
+  - [x] `ID() string` returns `file:{path}:{fd}`
+  - [x] `ForceClose() error` - releases budget, closes file
+- [x] `Read(p []byte) (int, error)` - wraps file.Read, updates lastAccess
+- [x] `Write(p []byte) (int, error)` - wraps file.Write, updates lastAccess
+- [x] `Close() error` - explicit close, same as ForceClose
+- [x] `Path() string`, `Fd() int`, `Mode() FileMode` - getters
+- [x] `OpenDuration() time.Duration` - time since opened
+- [x] `IdleDuration() time.Duration` - time since last access
 
 **Tests:**
-- [ ] Type() returns "file"
-- [ ] ID() returns correct format
-- [ ] ForceClose releases budget and closes file
-- [ ] Read/Write update lastAccess
-- [ ] Double close is safe (idempotent)
-- [ ] OpenDuration and IdleDuration return correct values
+- [x] Type() returns "file"
+- [x] ID() returns correct format
+- [x] ForceClose releases budget and closes file
+- [x] Read/Write update lastAccess
+- [x] Double close is safe (idempotent)
+- [x] OpenDuration and IdleDuration return correct values
 
 ---
 
-### FH.5 ResourceNotifier Interface
+### FH.5 ResourceNotifier Interface ✅ COMPLETE
 
 **Files to create:**
 - `core/resources/notifier.go`
 - `core/ui/resource_notifier.go`
 
 **Acceptance Criteria:**
-- [ ] `ResourceNotifier` interface:
-  - [ ] `AgentWaiting(sessionID, agentID, resource string)`
-  - [ ] `AgentProceeding(sessionID, agentID, resource string)`
-- [ ] `NoOpNotifier` struct - implements interface, does nothing (for testing)
-- [ ] `LoggingNotifier` struct - logs to slog.Logger
-- [ ] `UINotifier` struct - signals terminal UI
-  - [ ] Sends to UI channel without blocking (non-blocking send)
-  - [ ] UI displays "⏳ waiting for {resource}..." next to agent
-  - [ ] UI clears status when proceeding
-- [ ] `CompositeNotifier` struct - fans out to multiple notifiers
+- [x] `ResourceNotifier` interface:
+  - [x] `AgentWaiting(sessionID, agentID, resource string)`
+  - [x] `AgentProceeding(sessionID, agentID, resource string)`
+- [x] `NoOpNotifier` struct - implements interface, does nothing (for testing)
+- [x] `LoggingNotifier` struct - logs to slog.Logger
+- [x] `UINotifier` struct - signals terminal UI
+  - [x] Sends to UI channel without blocking (non-blocking send)
+  - [x] UI displays "⏳ waiting for {resource}..." next to agent
+  - [x] UI clears status when proceeding
+- [x] `CompositeNotifier` struct - fans out to multiple notifiers
 
 **Tests:**
-- [ ] NoOpNotifier implements interface
-- [ ] LoggingNotifier logs correctly
-- [ ] UINotifier sends non-blocking
-- [ ] CompositeNotifier fans out to all children
+- [x] NoOpNotifier implements interface
+- [x] LoggingNotifier logs correctly
+- [x] UINotifier sends non-blocking
+- [x] CompositeNotifier fans out to all children
 
 ---
 
-### FH.6 AgentSupervisor.OpenFile Integration
+### FH.6 AgentSupervisor.OpenFile Integration ✅ COMPLETE
 
 **Files to modify:**
 - `core/concurrency/agent_supervisor.go`
 
 **Acceptance Criteria:**
-- [ ] Add `fileBudget *AgentFileBudget` field to AgentSupervisor
-- [ ] Add `OpenFile(ctx context.Context, path string, mode FileMode) (*TrackedFile, error)`
-  - [ ] Calls `fileBudget.Acquire(ctx)` - may wait with notification
-  - [ ] Opens file via `os.OpenFile()`
-  - [ ] On open error: calls `fileBudget.Release()`, returns error
-  - [ ] Wraps as TrackedFile with budget reference
-  - [ ] Calls `resources.Track(tracked)` for auto-cleanup
-  - [ ] Returns TrackedFile
-- [ ] Add `CloseFile(file *TrackedFile) error` - explicit close helper
-- [ ] On supervisor cleanup: existing `ForceCloseResources()` handles files
-  - [ ] TrackedFile.ForceClose() releases budget automatically
+- [x] Add `fileBudget *AgentFileBudget` field to AgentSupervisor
+- [x] Add `OpenFile(ctx context.Context, path string, mode FileMode) (*TrackedFile, error)`
+  - [x] Calls `fileBudget.Acquire(ctx)` - may wait with notification
+  - [x] Opens file via `os.OpenFile()`
+  - [x] On open error: calls `fileBudget.Release()`, returns error
+  - [x] Wraps as TrackedFile with budget reference
+  - [x] Calls `resources.Track(tracked)` for auto-cleanup
+  - [x] Returns TrackedFile
+- [x] Add `CloseFile(file *TrackedFile) error` - explicit close helper
+- [x] On supervisor cleanup: existing `ForceCloseResources()` handles files
+  - [x] TrackedFile.ForceClose() releases budget automatically
 
 **Tests:**
-- [ ] OpenFile acquires from budget
-- [ ] OpenFile tracks via ResourceTracker
-- [ ] OpenFile waits and notifies when budget exhausted
-- [ ] Open error releases budget
-- [ ] Supervisor cleanup closes all tracked files
-- [ ] File close releases budget
+- [x] OpenFile acquires from budget
+- [x] OpenFile tracks via ResourceTracker
+- [x] OpenFile waits and notifies when budget exhausted
+- [x] Open error releases budget
+- [x] Supervisor cleanup closes all tracked files
+- [x] File close releases budget
 
 ---
 
-### FH.7 FileHandleSnapshot (Monitoring)
+### FH.7 FileHandleSnapshot (Monitoring) ✅ COMPLETE
 
 **Files to create:**
 - `core/resources/file_handle_snapshot.go`
 
 **Acceptance Criteria:**
-- [ ] `FileHandleSnapshot` struct with:
-  - [ ] `Global` struct: `Limit`, `Allocated`, `Used`, `Unallocated int`
-  - [ ] `Sessions []SessionSnapshot`
-- [ ] `SessionSnapshot` struct with:
-  - [ ] `SessionID string`
-  - [ ] `Allocated`, `Used`, `Unallocated int`
-  - [ ] `Agents []AgentSnapshot`
-- [ ] `AgentSnapshot` struct with:
-  - [ ] `AgentID string`, `AgentType string`
-  - [ ] `Allocated`, `Used int`
-  - [ ] `Waiting bool`
-- [ ] `FileHandleBudget.Snapshot() FileHandleSnapshot`
-  - [ ] Returns current state for monitoring/debugging
-  - [ ] Thread-safe (uses atomic loads)
-- [ ] JSON serialization for debugging/logging
+- [x] `FileHandleSnapshot` struct with:
+  - [x] `Global` struct: `Limit`, `Allocated`, `Used`, `Unallocated int`
+  - [x] `Sessions []SessionSnapshot`
+- [x] `SessionSnapshot` struct with:
+  - [x] `SessionID string`
+  - [x] `Allocated`, `Used`, `Unallocated int`
+  - [x] `Agents []AgentSnapshot`
+- [x] `AgentSnapshot` struct with:
+  - [x] `AgentID string`, `AgentType string`
+  - [x] `Allocated`, `Used int`
+  - [x] `Waiting bool`
+- [x] `FileHandleBudget.Snapshot() FileHandleSnapshot`
+  - [x] Returns current state for monitoring/debugging
+  - [x] Thread-safe (uses atomic loads)
+- [x] JSON serialization for debugging/logging
 
 **Tests:**
-- [ ] Snapshot returns accurate counts
-- [ ] Snapshot is thread-safe
-- [ ] JSON serialization works
+- [x] Snapshot returns accurate counts
+- [x] Snapshot is thread-safe
+- [x] JSON serialization works
 
 ---
 
-### FH.8 Memory Pressure Integration
+### FH.8 Memory Pressure Integration ✅ COMPLETE
 
 **Files to modify:**
 - `core/resources/pressure_controller.go`
 
 **Acceptance Criteria:**
-- [ ] `PressureController` holds reference to `FileHandleBudget`
-- [ ] On pressure level change, call `fileHandleBudget.OnPressureChange(level)`
-- [ ] Budget adjusts allocations:
-  - [ ] NORMAL: 100% of base allocations
-  - [ ] ELEVATED: 75% - reduce session/agent allocations
-  - [ ] HIGH: 50% - significant reduction
-  - [ ] CRITICAL: 25% - minimal allocations
-- [ ] Reclaim protocol when reducing:
-  - [ ] Sessions over new limit must release
-  - [ ] Priority: close idle files first, then read-only, then active
+- [x] `PressureController` holds reference to `FileHandleBudget`
+- [x] On pressure level change, call `fileHandleBudget.OnPressureChange(level)`
+- [x] Budget adjusts allocations:
+  - [x] NORMAL: 100% of base allocations
+  - [x] ELEVATED: 75% - reduce session/agent allocations
+  - [x] HIGH: 50% - significant reduction
+  - [x] CRITICAL: 25% - minimal allocations
+- [x] Reclaim protocol when reducing:
+  - [x] Sessions over new limit must release
+  - [x] Priority: close idle files first, then read-only, then active
 
 **Tests:**
-- [ ] Pressure change propagates to FileHandleBudget
-- [ ] Allocations reduce correctly per level
-- [ ] Reclaim closes files when over new limit
+- [x] Pressure change propagates to FileHandleBudget
+- [x] Allocations reduce correctly per level
+- [x] Reclaim closes files when over new limit
 
 ---
 
-### FH.9 File Handle Management Integration Tests
+### FH.9 File Handle Management Integration Tests ✅ COMPLETE
 
 **Files to create:**
 - `core/resources/file_handle_integration_test.go`
 
 **Acceptance Criteria:**
-- [ ] Test hierarchical stealing: agent → session → global
-- [ ] Test wait + notification: exhaust pool, verify log + UI notification
-- [ ] Test proceed notification: release file, verify waiter notified
-- [ ] Test multi-session fair share: 2 sessions get equal allocation
-- [ ] Test work-stealing: idle session's capacity used by active session
-- [ ] Test cleanup on agent death: files auto-closed, budget released
-- [ ] Test cleanup on session death: all session files closed
-- [ ] Test memory pressure: allocations reduce, reclaim works
-- [ ] Test snapshot accuracy under concurrent operations
-- [ ] Race condition test: run with `-race` flag
+- [x] Test hierarchical stealing: agent → session → global
+- [x] Test wait + notification: exhaust pool, verify log + UI notification
+- [x] Test proceed notification: release file, verify waiter notified
+- [x] Test multi-session fair share: 2 sessions get equal allocation
+- [x] Test work-stealing: idle session's capacity used by active session
+- [x] Test cleanup on agent death: files auto-closed, budget released
+- [x] Test cleanup on session death: all session files closed
+- [x] Test memory pressure: allocations reduce, reclaim works
+- [x] Test snapshot accuracy under concurrent operations
+- [x] Race condition test: run with `-race` flag
 
 **Tests:**
-- [ ] All integration tests pass
-- [ ] No race conditions detected
-- [ ] Zero file handle leaks in all scenarios
+- [x] All integration tests pass
+- [x] No race conditions detected
+- [x] Zero file handle leaks in all scenarios
 
 ---
 
