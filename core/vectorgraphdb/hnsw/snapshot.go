@@ -14,7 +14,8 @@ type LayerSnapshot struct {
 // HNSWSnapshot represents a point-in-time frozen state of the HNSW index.
 // It provides thread-safe read access through atomic reader counting.
 type HNSWSnapshot struct {
-	SeqNum     uint64
+	ID         uint64               // unique snapshot ID
+	SeqNum     uint64               // index sequence number at snapshot time
 	CreatedAt  time.Time
 	EntryPoint string
 	MaxLevel   int

@@ -162,6 +162,14 @@ func (b *FileHandleBudget) Logger() *slog.Logger {
 	return b.logger
 }
 
+// RangeSessions iterates over all sessions, calling fn for each.
+// If fn returns false, iteration stops.
+func (b *FileHandleBudget) RangeSessions(fn func(sessionID string, session *SessionFileBudget) bool) {
+	b.sessions.Range(func(key, value any) bool {
+		return fn(key.(string), value.(*SessionFileBudget))
+	})
+}
+
 func (b *FileHandleBudget) Snapshot() FileHandleSnapshot {
 	snapshot := FileHandleSnapshot{
 		Global: GlobalSnapshot{
@@ -481,21 +489,17 @@ func (a *AgentFileBudget) clearWaiting(wasWaiting bool) {
 }
 
 func (a *AgentFileBudget) waitWithContext(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() {
-		a.mu.Lock()
-		a.cond.Wait()
-		a.mu.Unlock()
-		close(done)
-	}()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	select {
-	case <-ctx.Done():
-		a.cond.Signal()
-		return ctx.Err()
-	case <-done:
-		return nil
+	for a.Available() <= 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.cond.Wait()
 	}
+
+	return nil
 }
 
 func (a *AgentFileBudget) Release() {

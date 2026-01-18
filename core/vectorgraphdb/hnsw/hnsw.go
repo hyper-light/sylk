@@ -394,3 +394,44 @@ type IndexStats struct {
 	EfConstruct int
 	EfSearch    int
 }
+
+// RLock acquires a read lock on the index.
+// Used by snapshot manager to ensure consistent reads.
+func (h *Index) RLock() {
+	h.mu.RLock()
+}
+
+// RUnlock releases the read lock on the index.
+func (h *Index) RUnlock() {
+	h.mu.RUnlock()
+}
+
+// GetLayers returns the layers slice for snapshot creation.
+// Caller must hold at least a read lock.
+func (h *Index) GetLayers() []*layer {
+	return h.layers
+}
+
+// GetVectors returns the vectors map for snapshot creation.
+// Caller must hold at least a read lock.
+func (h *Index) GetVectors() map[string][]float32 {
+	return h.vectors
+}
+
+// GetMagnitudes returns the magnitudes map for snapshot creation.
+// Caller must hold at least a read lock.
+func (h *Index) GetMagnitudes() map[string]float64 {
+	return h.magnitudes
+}
+
+// GetEntryPoint returns the current entry point node ID.
+// Caller must hold at least a read lock.
+func (h *Index) GetEntryPoint() string {
+	return h.entryPoint
+}
+
+// GetMaxLevel returns the current maximum level of the index.
+// Caller must hold at least a read lock.
+func (h *Index) GetMaxLevel() int {
+	return h.maxLevel
+}
