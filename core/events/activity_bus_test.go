@@ -1,0 +1,603 @@
+package events
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+// =============================================================================
+// EventSubscriber Interface Tests
+// =============================================================================
+
+// mockSubscriber implements EventSubscriber interface for testing
+type mockSubscriber struct {
+	id         string
+	eventTypes []EventType
+	events     []*ActivityEvent
+	mu         sync.Mutex
+}
+
+func (m *mockSubscriber) ID() string {
+	return m.id
+}
+
+func (m *mockSubscriber) EventTypes() []EventType {
+	return m.eventTypes
+}
+
+func (m *mockSubscriber) OnEvent(event *ActivityEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, event)
+	return nil
+}
+
+func (m *mockSubscriber) getEvents() []*ActivityEvent {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]*ActivityEvent{}, m.events...)
+}
+
+func TestEventSubscriber_Interface(t *testing.T) {
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction, EventTypeToolCall},
+	}
+
+	if sub.ID() != "test-sub" {
+		t.Errorf("ID() = %q, want %q", sub.ID(), "test-sub")
+	}
+
+	types := sub.EventTypes()
+	if len(types) != 2 {
+		t.Errorf("len(EventTypes()) = %d, want 2", len(types))
+	}
+
+	event := NewActivityEvent(EventTypeAgentAction, "session-1", "test content")
+	if err := sub.OnEvent(event); err != nil {
+		t.Errorf("OnEvent() error = %v", err)
+	}
+
+	events := sub.getEvents()
+	if len(events) != 1 {
+		t.Errorf("len(events) = %d, want 1", len(events))
+	}
+}
+
+func TestEventSubscriber_WildcardSubscription(t *testing.T) {
+	// Wildcard subscriber has empty EventTypes
+	sub := &mockSubscriber{
+		id:         "wildcard-sub",
+		eventTypes: []EventType{},
+	}
+
+	if len(sub.EventTypes()) != 0 {
+		t.Errorf("Wildcard subscriber should have empty EventTypes, got %d", len(sub.EventTypes()))
+	}
+}
+
+func TestEventSubscriber_SpecificEventTypes(t *testing.T) {
+	sub := &mockSubscriber{
+		id: "specific-sub",
+		eventTypes: []EventType{
+			EventTypeUserPrompt,
+			EventTypeAgentDecision,
+			EventTypeToolCall,
+		},
+	}
+
+	types := sub.EventTypes()
+	if len(types) != 3 {
+		t.Errorf("len(EventTypes()) = %d, want 3", len(types))
+	}
+
+	// Verify specific event types
+	expectedTypes := map[EventType]bool{
+		EventTypeUserPrompt:    true,
+		EventTypeAgentDecision: true,
+		EventTypeToolCall:      true,
+	}
+
+	for _, et := range types {
+		if !expectedTypes[et] {
+			t.Errorf("Unexpected event type: %v", et)
+		}
+	}
+}
+
+// =============================================================================
+// EventDebouncer Tests
+// =============================================================================
+
+func TestNewEventDebouncer(t *testing.T) {
+	debouncer := NewEventDebouncer(5 * time.Second)
+
+	if debouncer.window != 5*time.Second {
+		t.Errorf("window = %v, want %v", debouncer.window, 5*time.Second)
+	}
+
+	if debouncer.seen == nil {
+		t.Error("seen map should not be nil")
+	}
+}
+
+func TestNewEventDebouncer_DefaultWindow(t *testing.T) {
+	// Zero or negative window should default to 5 seconds
+	tests := []struct {
+		input    time.Duration
+		expected time.Duration
+	}{
+		{0, 5 * time.Second},
+		{-1 * time.Second, 5 * time.Second},
+	}
+
+	for _, tt := range tests {
+		debouncer := NewEventDebouncer(tt.input)
+		if debouncer.window != tt.expected {
+			t.Errorf("NewEventDebouncer(%v).window = %v, want %v", tt.input, debouncer.window, tt.expected)
+		}
+	}
+}
+
+func TestEventDebouncer_ShouldSkip_FirstEvent(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event.AgentID = "agent-1"
+
+	// First event should not be skipped
+	if debouncer.ShouldSkip(event) {
+		t.Error("First event should not be skipped")
+	}
+}
+
+func TestEventDebouncer_ShouldSkip_DuplicateWithinWindow(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event1.AgentID = "agent-1"
+
+	event2 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event2.AgentID = "agent-1"
+
+	// First event should not be skipped
+	if debouncer.ShouldSkip(event1) {
+		t.Error("First event should not be skipped")
+	}
+
+	// Duplicate within window should be skipped
+	if !debouncer.ShouldSkip(event2) {
+		t.Error("Duplicate event within window should be skipped")
+	}
+}
+
+func TestEventDebouncer_ShouldSkip_DuplicateAfterWindow(t *testing.T) {
+	debouncer := NewEventDebouncer(50 * time.Millisecond)
+
+	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event1.AgentID = "agent-1"
+
+	event2 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event2.AgentID = "agent-1"
+
+	// First event
+	if debouncer.ShouldSkip(event1) {
+		t.Error("First event should not be skipped")
+	}
+
+	// Wait for window to expire
+	time.Sleep(60 * time.Millisecond)
+
+	// Event after window should not be skipped
+	if debouncer.ShouldSkip(event2) {
+		t.Error("Event after window expiry should not be skipped")
+	}
+}
+
+func TestEventDebouncer_ShouldSkip_DifferentEventTypes(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event1.AgentID = "agent-1"
+
+	event2 := NewActivityEvent(EventTypeToolCall, "session-1", "test")
+	event2.AgentID = "agent-1"
+
+	// First event
+	if debouncer.ShouldSkip(event1) {
+		t.Error("First event should not be skipped")
+	}
+
+	// Different event type should not be skipped (different signature)
+	if debouncer.ShouldSkip(event2) {
+		t.Error("Different event type should not be skipped")
+	}
+}
+
+func TestEventDebouncer_ShouldSkip_DifferentAgents(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event1.AgentID = "agent-1"
+
+	event2 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event2.AgentID = "agent-2"
+
+	// First event
+	if debouncer.ShouldSkip(event1) {
+		t.Error("First event should not be skipped")
+	}
+
+	// Different agent should not be skipped (different signature)
+	if debouncer.ShouldSkip(event2) {
+		t.Error("Different agent should not be skipped")
+	}
+}
+
+func TestEventDebouncer_ShouldSkip_DifferentSessions(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event1.AgentID = "agent-1"
+
+	event2 := NewActivityEvent(EventTypeAgentAction, "session-2", "test")
+	event2.AgentID = "agent-1"
+
+	// First event
+	if debouncer.ShouldSkip(event1) {
+		t.Error("First event should not be skipped")
+	}
+
+	// Different session should not be skipped (different signature)
+	if debouncer.ShouldSkip(event2) {
+		t.Error("Different session should not be skipped")
+	}
+}
+
+func TestEventDebouncer_Signature(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	event.AgentID = "agent-1"
+
+	// Signature format should be: "eventType:agentID:sessionID"
+	expected := "agent_action:agent-1:session-1"
+	signature := debouncer.signature(event)
+
+	if signature != expected {
+		t.Errorf("signature() = %q, want %q", signature, expected)
+	}
+}
+
+func TestEventDebouncer_Cleanup(t *testing.T) {
+	debouncer := NewEventDebouncer(50 * time.Millisecond)
+
+	// Add some events
+	for i := 0; i < 5; i++ {
+		event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+		event.AgentID = "agent-1"
+		debouncer.ShouldSkip(event)
+	}
+
+	// Verify events are recorded
+	debouncer.mu.RLock()
+	initialCount := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	if initialCount == 0 {
+		t.Error("Expected some events to be recorded")
+	}
+
+	// Wait for entries to expire
+	time.Sleep(60 * time.Millisecond)
+
+	// Run cleanup
+	debouncer.Cleanup()
+
+	// Verify old entries were removed
+	debouncer.mu.RLock()
+	finalCount := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	if finalCount != 0 {
+		t.Errorf("Cleanup() should remove expired entries, got %d remaining", finalCount)
+	}
+}
+
+func TestEventDebouncer_ConcurrentAccess(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	wg := sync.WaitGroup{}
+	goroutines := 10
+	eventsPerGoroutine := 100
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < eventsPerGoroutine; j++ {
+				event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+				event.AgentID = "agent-1"
+				debouncer.ShouldSkip(event)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Should not panic and should have recorded events
+	debouncer.mu.RLock()
+	count := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	if count == 0 {
+		t.Error("Expected some events to be recorded")
+	}
+}
+
+func TestEventDebouncer_EmptyAgentID(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+	// AgentID is empty
+
+	signature := debouncer.signature(event)
+	expected := "agent_action::session-1"
+
+	if signature != expected {
+		t.Errorf("signature() with empty AgentID = %q, want %q", signature, expected)
+	}
+}
+
+// =============================================================================
+// ActivityEventBus Tests
+// =============================================================================
+
+func TestNewActivityEventBus(t *testing.T) {
+	bus := NewActivityEventBus(100)
+
+	if bus == nil {
+		t.Fatal("Expected non-nil bus")
+	}
+
+	if cap(bus.buffer) != 100 {
+		t.Errorf("Expected buffer size 100, got %d", cap(bus.buffer))
+	}
+
+	bus.Close()
+}
+
+func TestNewActivityEventBus_DefaultBufferSize(t *testing.T) {
+	bus := NewActivityEventBus(0)
+
+	if cap(bus.buffer) != 1000 {
+		t.Errorf("Expected default buffer size 1000, got %d", cap(bus.buffer))
+	}
+
+	bus.Close()
+}
+
+func TestActivityEventBus_PublishAndSubscribe(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	// Create subscriber
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+
+	bus.Subscribe(sub)
+
+	// Publish event
+	event := NewActivityEvent(EventTypeAgentAction, "test-session", "test action")
+	event.AgentID = "test-agent"
+
+	bus.Publish(event)
+
+	// Wait for event delivery
+	time.Sleep(100 * time.Millisecond)
+
+	events := sub.getEvents()
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event, got %d", len(events))
+	}
+	if len(events) > 0 && events[0].EventType != EventTypeAgentAction {
+		t.Errorf("Expected event type %s, got %s", EventTypeAgentAction, events[0].EventType)
+	}
+}
+
+func TestActivityEventBus_WildcardSubscriber(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	// Create wildcard subscriber (empty EventTypes)
+	sub := &mockSubscriber{
+		id:         "wildcard-sub",
+		eventTypes: []EventType{},
+	}
+
+	bus.Subscribe(sub)
+
+	// Publish different event types
+	events := []*ActivityEvent{
+		NewActivityEvent(EventTypeAgentAction, "s1", "action1"),
+		NewActivityEvent(EventTypeToolCall, "s2", "call1"),
+		NewActivityEvent(EventTypeUserPrompt, "s3", "prompt1"),
+	}
+
+	for _, event := range events {
+		bus.Publish(event)
+	}
+
+	// Wait for event delivery
+	time.Sleep(200 * time.Millisecond)
+
+	receivedEvents := sub.getEvents()
+	if len(receivedEvents) < 3 {
+		t.Errorf("Expected at least 3 events, got %d", len(receivedEvents))
+	}
+}
+
+func TestActivityEventBus_MultipleSubscribers(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	// Create multiple subscribers for same event
+	sub1 := &mockSubscriber{
+		id:         "sub1",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+
+	sub2 := &mockSubscriber{
+		id:         "sub2",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+
+	bus.Subscribe(sub1)
+	bus.Subscribe(sub2)
+
+	// Publish event
+	event := NewActivityEvent(EventTypeAgentAction, "test", "test action")
+
+	bus.Publish(event)
+
+	// Wait for event delivery
+	time.Sleep(100 * time.Millisecond)
+
+	events1 := sub1.getEvents()
+	events2 := sub2.getEvents()
+
+	if len(events1) != 1 {
+		t.Errorf("sub1 expected 1 event, got %d", len(events1))
+	}
+
+	if len(events2) != 1 {
+		t.Errorf("sub2 expected 1 event, got %d", len(events2))
+	}
+}
+
+func TestActivityEventBus_Unsubscribe(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+
+	bus.Subscribe(sub)
+	bus.Unsubscribe("test-sub")
+
+	// Publish event
+	event := NewActivityEvent(EventTypeAgentAction, "test", "test action")
+
+	bus.Publish(event)
+
+	// Wait
+	time.Sleep(100 * time.Millisecond)
+
+	events := sub.getEvents()
+	if len(events) != 0 {
+		t.Errorf("Should not receive event after unsubscribe, got %d events", len(events))
+	}
+}
+
+func TestActivityEventBus_BufferOverflow(t *testing.T) {
+	bus := NewActivityEventBus(2) // Small buffer
+	// Don't start dispatch - this will fill the buffer
+	defer bus.Close()
+
+	// Fill buffer beyond capacity
+	for i := 0; i < 10; i++ {
+		event := NewActivityEvent(EventTypeAgentAction, "test", "action")
+		bus.Publish(event)
+	}
+
+	// Bus should not block or panic
+	// Excess events should be dropped silently
+}
+
+func TestActivityEventBus_ConcurrentPublish(t *testing.T) {
+	bus := NewActivityEventBus(1000)
+	bus.Start()
+	defer bus.Close()
+
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{},
+	}
+
+	bus.Subscribe(sub)
+
+	// Publish from multiple goroutines
+	wg := sync.WaitGroup{}
+	publishers := 10
+	eventsPerPublisher := 10
+
+	for i := 0; i < publishers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < eventsPerPublisher; j++ {
+				event := NewActivityEvent(EventTypeAgentAction, "test", "action")
+				bus.Publish(event)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Wait for event delivery
+	time.Sleep(500 * time.Millisecond)
+
+	events := sub.getEvents()
+	if len(events) == 0 {
+		t.Error("Should receive at least some events")
+	}
+}
+
+func TestActivityEventBus_Close(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+
+	bus.Subscribe(sub)
+	bus.Close()
+
+	// Publish after close should not panic
+	event := NewActivityEvent(EventTypeAgentAction, "test", "action")
+	bus.Publish(event)
+
+	// Wait
+	time.Sleep(100 * time.Millisecond)
+
+	// Should not have received the event
+	events := sub.getEvents()
+	if len(events) != 0 {
+		t.Errorf("Should not receive events after close, got %d", len(events))
+	}
+}
+
+func TestActivityEventBus_SubscribeAfterClose(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	bus.Close()
+
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+
+	// Subscribe after close should not panic
+	bus.Subscribe(sub)
+}
