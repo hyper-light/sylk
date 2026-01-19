@@ -1,4 +1,4 @@
-Examine TODO.md and find the section with "Comprehensive Parallel Execution Order", then Wave 4 , Parallel Group 4M. For each item, in parallel (using sub-agents) find the matching architecture description for the item in ARCHITECTURE.md. Examine and understand it thoroughly. Implement according to ARCHITECTURE.md spec and use sub agents to accomplish the work required maximizing parallelism. After *EACH* submitem is created YOU MUST ALWAYS AND FOREVER:
+Examine TODO.md and find the section with "Comprehensive Parallel Execution Order", then Wave 4 , Parallel Group 4Q. For each item, in parallel (using sub-agents) find the matching architecture description for the item in ARCHITECTURE.md. Examine and understand it thoroughly. Implement according to ARCHITECTURE.md spec and use sub agents to accomplish the work required maximizing parallelism. After *EACH* submitem is created YOU MUST ALWAYS AND FOREVER:
 - Generate a commit.
 - Examine the cyclomatic complexity or the code your just wrote and ENSURE it is 4 or less.
 - We do NOT allow functions over 100 lines. EVER.
@@ -15,6 +15,7 @@ Examine TODO.md and find the section with "Comprehensive Parallel Execution Orde
 - You MUST integrate correctly and fully with the security apis we specify in ARCHITECTURE.md, both for if sandboxing is enabled OR disabled.
 - MAXIMIZE USE OF SUBAGENTS TO PARALLELIZE WHEREVER ORDERING ALLOWS DO NOT JUST WORK SERIALLY.
 - You MUST update the Wave and Parallel Group items as done once they are done in TODO.md. ALWAYS.
+- ALWAYS run tests with a timeout. ALWAYS
 
 Repeat this process for the rest of the remaining Wave 4 items to (including) 4R. YOU ARE TO FOLLOW ALL THESE INSTRUCTIONS PRECISELY FOR EACH PARALLEL GROUP DO NOT SKIP DO NOT DEFER WORK IF YOU ENCOUNTER BUGS YOU FIX THEM IF YOU ENCOUNTER LSP ISSUES YOU FIX THEM IF YOU ENCOUNTER TEST ISSUES YOU FIX THEM ALWAYS FOREVER PERIOD.
 

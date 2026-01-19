@@ -524,7 +524,7 @@ func TestStats_TracksHits(t *testing.T) {
 	}
 }
 
-func TestResetStats(t *testing.T) {
+func TestSpeculativePrefetcher_ResetStats(t *testing.T) {
 	sp, _ := createTestPrefetcher(t)
 
 	ctx := context.Background()
