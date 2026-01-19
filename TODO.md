@@ -3695,10 +3695,10 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to create:** `core/search/integration_test.go`
 
 **Acceptance Criteria:**
-- [ ] End-to-end indexing + search tests
-- [ ] CMT + Bleve + VectorDB integration
-- [ ] Resource budget enforcement tests
-- [ ] Cross-validation tests
+- [x] End-to-end indexing + search tests
+- [x] CMT + Bleve + VectorDB integration
+- [x] Resource budget enforcement tests
+- [x] Cross-validation tests
 
 ---
 
