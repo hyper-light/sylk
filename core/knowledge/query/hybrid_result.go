@@ -127,6 +127,10 @@ type HybridResult struct {
 
 	// Source attribution
 	Source Source `json:"source"`
+
+	// Memory integration fields (populated by HybridQueryWithMemory)
+	MemoryActivation float64 `json:"memory_activation,omitempty"`
+	MemoryFactor     float64 `json:"memory_factor,omitempty"`
 }
 
 // Validate checks if the result is well-formed.
