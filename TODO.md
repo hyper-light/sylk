@@ -3302,86 +3302,86 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 - [x] Priority: fsnotify > git_hook > periodic
 - [x] Rate limiting
 
-### DS.5.1 CMT Node Types
+### DS.5.1 CMT Node Types (COMPLETE)
 
-**Files to create:** `core/search/cmt/types.go`
-
-**Acceptance Criteria:**
-- [ ] `Node`: Key, Priority (SHAKE-128), Left/Right, Hash [32]byte, FileInfo
-- [ ] `FileInfo`: Path, ContentHash, Size, ModTime, Permissions, Indexed
-- [ ] Merkle hash: `H(left.Hash || Key || FileInfo.ContentHash || right.Hash)`
-
-### DS.5.2 CMT Operations
-
-**Files to create:** `core/search/cmt/cmt.go`
+**Files created:** `core/search/cmt/types.go`, `core/search/cmt/types_test.go`
 
 **Acceptance Criteria:**
-- [ ] `CMT` struct: root, size, storage, wal
-- [ ] `Insert`, `Delete`, `Get`, `Update` - O(log n)
-- [ ] `RootHash()` - O(1)
-- [ ] `Walk(fn)` - in-order traversal
-- [ ] All mutations logged to WAL
+- [x] `Node`: Key, Priority (SHAKE-128), Left/Right, Hash [32]byte, FileInfo
+- [x] `FileInfo`: Path, ContentHash, Size, ModTime, Permissions, Indexed
+- [x] Merkle hash: `H(left.Hash || Key || FileInfo.ContentHash || right.Hash)`
 
-### DS.5.3 CMT Split and Merge
+### DS.5.2 CMT Operations (COMPLETE)
 
-**Files to create:** `core/search/cmt/treap.go`
+**Files created:** `core/search/cmt/cmt.go`, `core/search/cmt/cmt_test.go`
 
 **Acceptance Criteria:**
-- [ ] `split(node, key) (*Node, *Node)`
-- [ ] `merge(left, right) *Node`
-- [ ] Priority maintains heap property
-- [ ] Key maintains BST property
-- [ ] Recalculates Merkle hashes on path
+- [x] `CMT` struct: root, size, storage, wal
+- [x] `Insert`, `Delete`, `Get`, `Update` - O(log n)
+- [x] `RootHash()` - O(1)
+- [x] `Walk(fn)` - in-order traversal
+- [x] All mutations logged to WAL
 
-### DS.5.4 CMT Merkle Hash Computation
+### DS.5.3 CMT Split and Merge (COMPLETE)
 
-**Files to create:** `core/search/cmt/merkle.go`
-
-**Acceptance Criteria:**
-- [ ] `computeHash(node) [32]byte`
-- [ ] `updatePathHashes(path []*Node)`
-- [ ] `verifyHash(node) bool`
-- [ ] `verifyTree() (bool, []string)`
-- [ ] SHA-256 for all hashes
-
-### DS.5.5 CMT WAL
-
-**Files to create:** `core/search/cmt/wal.go`
+**Files created:** `core/search/cmt/treap.go`, `core/search/cmt/treap_test.go`
 
 **Acceptance Criteria:**
-- [ ] `WAL` struct: append-only log
-- [ ] Operations: INSERT, DELETE, CHECKPOINT, TRUNCATE
-- [ ] `LogInsert`, `LogDelete`, `Checkpoint`, `Recover`
-- [ ] Binary format, fsync after write
+- [x] `split(node, key) (*Node, *Node)`
+- [x] `merge(left, right) *Node`
+- [x] Priority maintains heap property
+- [x] Key maintains BST property
+- [x] Recalculates Merkle hashes on path
 
-### DS.5.6 CMT SQLite Storage
+### DS.5.4 CMT Merkle Hash Computation (COMPLETE)
 
-**Files to create:** `core/search/cmt/sqlite_storage.go`
-
-**Acceptance Criteria:**
-- [ ] `SQLiteStorage` implements `Storage` interface
-- [ ] Table: `cmt_nodes` with path, priority, hashes, etc.
-- [ ] `Save(tree)`, `Load()`, `SaveNode`, `LoadNode`
-
-### DS.5.7 CMT Corruption Detection
-
-**Files to create:** `core/search/cmt/integrity.go`
+**Files created:** `core/search/cmt/merkle.go`, `core/search/cmt/merkle_test.go`
 
 **Acceptance Criteria:**
-- [ ] `IntegrityChecker` validates CMT vs filesystem
-- [ ] `Check(ctx) (*IntegrityReport, error)`
-- [ ] Detects: missing, extra, modified files
-- [ ] Detects: Merkle hash corruption
-- [ ] Parallel checking
+- [x] `computeHash(node) [32]byte`
+- [x] `updatePathHashes(path []*Node)`
+- [x] `verifyHash(node) bool`
+- [x] `verifyTree() (bool, []string)`
+- [x] SHA-256 for all hashes
 
-### DS.5.8 CMT Recovery
+### DS.5.5 CMT WAL (COMPLETE)
 
-**Files to create:** `core/search/cmt/recovery.go`
+**Files created:** `core/search/cmt/wal.go`, `core/search/cmt/wal_test.go`
 
 **Acceptance Criteria:**
-- [ ] `CMTRecovery` rebuilds from WAL/filesystem/git
-- [ ] `RecoverFromWAL()`, `RecoverFromFilesystem()`, `RecoverFromGit()`
-- [ ] Priority: WAL > Filesystem > Git
+- [x] `WAL` struct: append-only log
+- [x] Operations: INSERT, DELETE, CHECKPOINT, TRUNCATE
+- [x] `LogInsert`, `LogDelete`, `Checkpoint`, `Recover`
+- [x] Binary format, fsync after write
+
+### DS.5.6 CMT SQLite Storage (COMPLETE)
+
+**Files created:** `core/search/cmt/sqlite_storage.go`, `core/search/cmt/sqlite_storage_test.go`
+
+**Acceptance Criteria:**
+- [x] `SQLiteStorage` implements `Storage` interface
+- [x] Table: `cmt_nodes` with path, priority, hashes, etc.
+- [x] `Save(tree)`, `Load()`, `SaveNode`, `LoadNode`
+
+### DS.5.7 CMT Corruption Detection (COMPLETE)
+
+**Files created:** `core/search/cmt/integrity.go`, `core/search/cmt/integrity_test.go`
+
+**Acceptance Criteria:**
+- [x] `IntegrityChecker` validates CMT vs filesystem
+- [x] `Check(ctx) (*IntegrityReport, error)`
+- [x] Detects: missing, extra, modified files
+- [x] Detects: Merkle hash corruption
+- [x] Parallel checking
+
+### DS.5.8 CMT Recovery (COMPLETE)
+
+**Files created:** `core/search/cmt/recovery.go`, `core/search/cmt/recovery_test.go`
+
+**Acceptance Criteria:**
+- [x] `CMTRecovery` rebuilds from WAL/filesystem/git
+- [x] `RecoverFromWAL()`, `RecoverFromFilesystem()`, `RecoverFromGit()`
+- [x] Priority: WAL > Filesystem > Git
 
 ### DS.6.1 Git Client Wrapper
 
