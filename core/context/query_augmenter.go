@@ -483,6 +483,16 @@ func (qa *QueryAugmenter) renderSummary(sb *strings.Builder, summary Summary) {
 }
 
 // =============================================================================
+// Accessors
+// =============================================================================
+
+// Searcher returns the underlying tiered searcher.
+// This is exposed primarily for testing purposes.
+func (qa *QueryAugmenter) Searcher() *TieredSearcher {
+	return qa.searcher
+}
+
+// =============================================================================
 // Statistics
 // =============================================================================
 
