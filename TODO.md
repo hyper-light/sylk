@@ -3523,89 +3523,89 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to create:** `core/search/coordinator/types.go`
 
 **Acceptance Criteria:**
-- [ ] `HybridSearchRequest`: Query, BleveWeight, VectorWeight, Limit, Filters
-- [ ] `HybridSearchResult`: BleveResults, VectorResults, FusedResults, Metadata
-- [ ] `FusionMethod`: RRF, LINEAR, MAX
+- [x] `HybridSearchRequest`: Query, BleveWeight, VectorWeight, Limit, Filters
+- [x] `HybridSearchResult`: BleveResults, VectorResults, FusedResults, Metadata
+- [x] `FusionMethod`: RRF, LINEAR, MAX
 
 ### DS.9.2 Search Coordinator
 
 **Files to create:** `core/search/coordinator/coordinator.go`
 
 **Acceptance Criteria:**
-- [ ] `SearchCoordinator` orchestrates Bleve + VectorDB
-- [ ] `Search(ctx, req) (*HybridSearchResult, error)`
-- [ ] Parallel Bleve and Vector searches
-- [ ] Timeout handling, fallback
+- [x] `SearchCoordinator` orchestrates Bleve + VectorDB
+- [x] `Search(ctx, req) (*HybridSearchResult, error)`
+- [x] Parallel Bleve and Vector searches
+- [x] Timeout handling, fallback
 
 ### DS.9.3 Reciprocal Rank Fusion
 
 **Files to create:** `core/search/coordinator/rrf.go`
 
 **Acceptance Criteria:**
-- [ ] `RRFMerger` implements RRF algorithm
-- [ ] `Merge(results1, results2, k) []*ScoredDocument`
-- [ ] Formula: `score = Σ 1/(k + rank_i)`, k=60
-- [ ] Deduplicates by ID
+- [x] `RRFMerger` implements RRF algorithm
+- [x] `Merge(results1, results2, k) []*ScoredDocument`
+- [x] Formula: `score = Σ 1/(k + rank_i)`, k=60
+- [x] Deduplicates by ID
 
 ### DS.9.4 Vector DB Adapter
 
 **Files to create:** `core/search/coordinator/vector_adapter.go`
 
 **Acceptance Criteria:**
-- [ ] `VectorDBAdapter` wraps VectorGraphDB
-- [ ] `Search(ctx, query, limit) ([]*ScoredDocument, error)`
-- [ ] Uses existing embedding pipeline
-- [ ] Graceful failure handling
+- [x] `VectorDBAdapter` wraps VectorGraphDB
+- [x] `Search(ctx, query, limit) ([]*ScoredDocument, error)`
+- [x] Uses existing embedding pipeline
+- [x] Graceful failure handling
 
 ### DS.9.5 Search Cache
 
 **Files to create:** `core/search/coordinator/cache.go`
 
 **Acceptance Criteria:**
-- [ ] `SearchCache` with LRU eviction, TTL (5min default)
-- [ ] `Get(key)`, `Set(key, result)`
-- [ ] Thread-safe
-- [ ] Invalidation on index update
+- [x] `SearchCache` with LRU eviction, TTL (5min default)
+- [x] `Get(key)`, `Set(key, result)`
+- [x] Thread-safe
+- [x] Invalidation on index update
 
 ### DS.10.1 GoroutineBudget Integration
 
 **Files to create:** `core/search/resource/goroutine.go`
 
 **Acceptance Criteria:**
-- [ ] All concurrent search ops acquire budget
-- [ ] `AcquireForIndexing(count)`, `AcquireForSearch()`
-- [ ] Graceful degradation when exhausted
-- [ ] Integrates with core/concurrency/GoroutineBudget
+- [x] All concurrent search ops acquire budget
+- [x] `AcquireForIndexing(count)`, `AcquireForSearch()`
+- [x] Graceful degradation when exhausted
+- [x] Integrates with core/concurrency/GoroutineBudget
 
 ### DS.10.2 FileHandleBudget Integration
 
 **Files to create:** `core/search/resource/filehandle.go`
 
 **Acceptance Criteria:**
-- [ ] All file ops acquire budget
-- [ ] `AcquireForRead(path)`, `AcquireForIndex(path)`
-- [ ] Bleve, SQLite tracked as handles
-- [ ] Integrates with core/resources/FileHandleBudget
+- [x] All file ops acquire budget
+- [x] `AcquireForRead(path)`, `AcquireForIndex(path)`
+- [x] Bleve, SQLite tracked as handles
+- [x] Integrates with core/resources/FileHandleBudget
 
 ### DS.10.3 PressureController Integration
 
 **Files to create:** `core/search/resource/pressure.go`
 
 **Acceptance Criteria:**
-- [ ] Search responds to memory pressure
-- [ ] High pressure: reduce concurrency, prefer cache
-- [ ] Critical pressure: pause indexing
-- [ ] `SearchWithDegradation(ctx, req, pressure)`
+- [x] Search responds to memory pressure
+- [x] High pressure: reduce concurrency, prefer cache
+- [x] Critical pressure: pause indexing
+- [x] `SearchWithDegradation(ctx, req, pressure)`
 
 ### DS.10.4 SearchSystem Facade
 
 **Files to create:** `core/search/search_system.go`
 
 **Acceptance Criteria:**
-- [ ] `SearchSystem` integrates all components
-- [ ] `Start(ctx)`, `Stop()`
-- [ ] `Search(ctx, req)`, `Index(ctx, paths)`
-- [ ] `GetStatus() *SearchSystemStatus`
+- [x] `SearchSystem` integrates all components
+- [x] `Start(ctx)`, `Stop()`
+- [x] `Search(ctx, req)`, `Index(ctx, paths)`
+- [x] `GetStatus() *SearchSystemStatus`
 
 ### DS.11.1 Search Message Types
 
