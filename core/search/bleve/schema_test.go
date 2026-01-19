@@ -41,6 +41,7 @@ func TestBuildDocumentMapping_HasAllExpectedFields(t *testing.T) {
 		"modified_at",
 		"indexed_at",
 		"git_commit",
+		"domain",
 	}
 
 	for _, field := range expectedFields {
@@ -390,7 +391,7 @@ func TestDocumentMapping_SearchableFieldsAreIndexed(t *testing.T) {
 	// Fields that should be searchable
 	searchableFields := []string{
 		"path", "type", "language", "content", "symbols",
-		"comments", "imports", "modified_at", "indexed_at", "git_commit",
+		"comments", "imports", "modified_at", "indexed_at", "git_commit", "domain",
 	}
 
 	for _, fieldName := range searchableFields {
@@ -426,7 +427,7 @@ func TestFieldMappingTypes_TextFields(t *testing.T) {
 
 	textFields := []string{
 		"id", "path", "type", "language", "content",
-		"symbols", "comments", "imports", "checksum", "git_commit",
+		"symbols", "comments", "imports", "checksum", "git_commit", "domain",
 	}
 
 	for _, fieldName := range textFields {
@@ -469,7 +470,7 @@ func TestDocumentMapping_AllFieldInclusion(t *testing.T) {
 	// Fields that should NOT be included in _all (metadata/exact match)
 	notIncludedInAll := []string{
 		"id", "path", "type", "language", "imports",
-		"checksum", "modified_at", "indexed_at", "git_commit",
+		"checksum", "modified_at", "indexed_at", "git_commit", "domain",
 	}
 
 	for _, fieldName := range includedInAll {
@@ -508,6 +509,7 @@ func TestDocumentMapping_AnalyzerAssignments(t *testing.T) {
 		{"comments", analyzer.CommentAnalyzerName},
 		{"imports", KeywordAnalyzerName},
 		{"git_commit", KeywordAnalyzerName},
+		{"domain", KeywordAnalyzerName},
 	}
 
 	for _, tc := range testCases {
@@ -528,8 +530,8 @@ func TestDocumentMapping_AnalyzerAssignments(t *testing.T) {
 func TestBuildDocumentMapping_HasCorrectFieldCount(t *testing.T) {
 	docMapping := BuildDocumentMapping()
 
-	// Should have exactly 12 fields as specified in the Document struct
-	expectedFieldCount := 12
+	// 12 base document fields + 1 domain field = 13
+	expectedFieldCount := 13
 	actualFieldCount := len(docMapping.Properties)
 
 	assert.Equal(t, expectedFieldCount, actualFieldCount,

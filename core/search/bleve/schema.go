@@ -71,6 +71,9 @@ func BuildDocumentMapping() *mapping.DocumentMapping {
 	// GitCommit field - keyword analyzer for exact commit hash matching
 	docMapping.AddFieldMappingsAt("git_commit", buildKeywordField())
 
+	// Domain field - keyword analyzer for domain-filtered searches
+	docMapping.AddFieldMappingsAt(DomainFieldName, buildKeywordField())
+
 	return docMapping
 }
 
@@ -96,6 +99,13 @@ func BuildIndexMapping() (*mapping.IndexMappingImpl, error) {
 
 	return indexMapping, nil
 }
+
+// =============================================================================
+// Domain Field Constants
+// =============================================================================
+
+// DomainFieldName is the field name used for domain filtering in the index.
+const DomainFieldName = "domain"
 
 // =============================================================================
 // Field Mapping Builders
