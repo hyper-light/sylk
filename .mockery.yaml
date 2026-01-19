@@ -181,3 +181,38 @@ packages:
       ProviderAdapter:
         config:
           mockname: "MockProviderAdapter"
+
+  github.com/adalundhe/sylk/core/pipeline:
+    config:
+      dir: "core/pipeline/mocks"
+      outpkg: "mocks"
+    interfaces:
+      # PH.6 Handoff Archival interfaces
+      BleveStore:
+        config:
+          mockname: "MockBleveStore"
+
+      VectorStore:
+        config:
+          mockname: "MockVectorStore"
+
+      ArchivalEmbedder:
+        config:
+          mockname: "MockArchivalEmbedder"
+
+      ArchivableHandoffState:
+        config:
+          mockname: "MockArchivableHandoffState"
+
+      # PH.1 Handoff Manager interfaces
+      HandoffArchiverService:
+        config:
+          mockname: "MockHandoffArchiverService"
+
+      AgentFactoryService:
+        config:
+          mockname: "MockAgentFactoryService"
+
+      AgentService:
+        config:
+          mockname: "MockAgentService"
