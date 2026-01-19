@@ -3612,9 +3612,9 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to create:** `core/search/agent/messages.go`
 
 **Acceptance Criteria:**
-- [ ] `MessageTypeSearchRequest`, `MessageTypeSearchResponse`
-- [ ] `MessageTypeIndexRequest`, `MessageTypeIndexStatus`
-- [ ] Integration with core/messaging
+- [x] `MessageTypeSearchRequest`, `MessageTypeSearchResponse`
+- [x] `MessageTypeIndexRequest`, `MessageTypeIndexStatus`
+- [x] Integration with core/messaging
 
 ### DS.11.2 Guide Router Integration
 
@@ -3639,11 +3639,11 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to create:** `skills/search_skills.go`
 
 **Acceptance Criteria:**
-- [ ] `search_code`: full-text + semantic search
-- [ ] `git_diff`: changes between commits
-- [ ] `git_log`: commit history
-- [ ] `git_blame`: line authorship
-- [ ] SKILL.md definitions
+- [x] `search_code`: full-text + semantic search
+- [x] `git_diff`: changes between commits
+- [x] `git_log`: commit history
+- [x] `git_blame`: line authorship
+- [x] SKILL.md definitions
 
 ### DS.11.5 Session Context Integration
 
@@ -3658,37 +3658,37 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to create:** `cmd/sylk/search.go`
 
 **Acceptance Criteria:**
-- [ ] `sylk search <query>`
-- [ ] Flags: `--fuzzy`, `--type`, `--path`, `--limit`, `--interactive`
-- [ ] Rich output with highlights
-- [ ] JSON mode
+- [x] `sylk search <query>`
+- [x] Flags: `--fuzzy`, `--type`, `--path`, `--limit`, `--interactive`
+- [x] Rich output with highlights
+- [x] JSON mode
 
 ### DS.12.2 Index CLI Command
 
 **Files to create:** `cmd/sylk/index.go`
 
 **Acceptance Criteria:**
-- [ ] `sylk index`, `sylk index status`, `sylk index rebuild`, `sylk index verify`
-- [ ] Progress bar
-- [ ] `--watch` for continuous mode
+- [x] `sylk index`, `sylk index status`, `sylk index rebuild`, `sylk index verify`
+- [x] Progress bar
+- [x] `--watch` for continuous mode
 
 ### DS.12.3 Git Search CLI Commands
 
 **Files to create:** `cmd/sylk/git.go`
 
 **Acceptance Criteria:**
-- [ ] `sylk git diff`, `sylk git log`, `sylk git blame`
-- [ ] `--format`, `--since`, `--until`, `--author` flags
+- [x] `sylk git diff`, `sylk git log`, `sylk git blame`
+- [x] `--format`, `--since`, `--until`, `--author` flags
 
 ### DS.12.4 Interactive Search Mode
 
 **Files to create:** `cmd/sylk/interactive_search.go`
 
 **Acceptance Criteria:**
-- [ ] Interactive TUI for search
-- [ ] Real-time search as you type
-- [ ] File preview, keyboard navigation
-- [ ] Integrates with ui/ patterns
+- [x] Interactive TUI for search
+- [x] Real-time search as you type
+- [x] File preview, keyboard navigation
+- [x] Integrates with ui/ patterns
 
 ### DS.13 Document Search Integration Tests
 
