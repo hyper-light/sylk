@@ -285,13 +285,18 @@ type ContextDiscovery struct {
 	Centroids    []ContextCentroid `json:"centroids"`
 	MaxContexts  int               `json:"max_contexts"`
 	keywordCache sync.Map          `json:"-"`
+	mu           sync.RWMutex      `json:"-"`
 }
 
 // GetBias returns the bias for a given context, or nil if not found.
 func (c *ContextDiscovery) GetBias(ctx TaskContext) *ContextBias {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	for i := range c.Centroids {
 		if c.Centroids[i].ID == ctx {
-			return &c.Centroids[i].Bias
+			bias := c.Centroids[i].Bias
+			return &bias
 		}
 	}
 	return nil
@@ -299,6 +304,9 @@ func (c *ContextDiscovery) GetBias(ctx TaskContext) *ContextBias {
 
 // AddOrUpdateCentroid adds a new centroid or updates an existing one by ID.
 func (c *ContextDiscovery) AddOrUpdateCentroid(centroid ContextCentroid) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	for i := range c.Centroids {
 		if c.Centroids[i].ID == centroid.ID {
 			c.Centroids[i] = centroid
