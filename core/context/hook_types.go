@@ -115,6 +115,12 @@ type PromptHookData struct {
 	// PressureLevel indicates the current resource pressure (0=Normal to 3=Critical).
 	PressureLevel int
 
+	// Response is the LLM's response (populated for PostPrompt hooks).
+	Response string
+
+	// ToolCalls contains tool calls from the response (populated for PostPrompt hooks).
+	ToolCalls []ToolCall
+
 	// Timestamp is when this hook data was created.
 	Timestamp time.Time
 }
