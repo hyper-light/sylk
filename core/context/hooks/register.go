@@ -178,26 +178,24 @@ func registerGlobalHooks(registry *ctxpkg.AdaptiveHookRegistry, deps *HookDepend
 
 // registerKnowledgeAgentHooks registers hooks for knowledge agents.
 func registerKnowledgeAgentHooks(registry *ctxpkg.AdaptiveHookRegistry, deps *HookDependencies) error {
-	for _, agentType := range knowledgeAgentTypes {
-		// AR.7.1: Speculative Prefetch Hook (PrePrompt, First priority)
-		if deps.Prefetcher != nil || deps.Augmenter != nil {
-			hook := NewSpeculativePrefetchHook(PrefetchHookConfig{
-				Prefetcher: deps.Prefetcher,
-				Augmenter:  deps.Augmenter,
-			})
-			if err := registry.RegisterPromptHookForAgent(agentType, hook.ToPromptHook()); err != nil {
-				return err
-			}
+	// AR.7.1: Speculative Prefetch Hook (PrePrompt, First priority)
+	if deps.Prefetcher != nil || deps.Augmenter != nil {
+		hook := NewSpeculativePrefetchHook(PrefetchHookConfig{
+			Prefetcher: deps.Prefetcher,
+			Augmenter:  deps.Augmenter,
+		})
+		if err := registry.RegisterPromptHookForAgents(knowledgeAgentTypes, hook.ToPromptHook()); err != nil {
+			return err
 		}
+	}
 
-		// AR.7.3: Pressure Eviction Hook (PrePrompt, First priority)
-		if deps.ContextManager != nil {
-			hook := NewPressureEvictionHook(PressureEvictionHookConfig{
-				ContextManager: deps.ContextManager,
-			})
-			if err := registry.RegisterPromptHookForAgent(agentType, hook.ToPromptHook()); err != nil {
-				return err
-			}
+	// AR.7.3: Pressure Eviction Hook (PrePrompt, First priority)
+	if deps.ContextManager != nil {
+		hook := NewPressureEvictionHook(PressureEvictionHookConfig{
+			ContextManager: deps.ContextManager,
+		})
+		if err := registry.RegisterPromptHookForAgents(knowledgeAgentTypes, hook.ToPromptHook()); err != nil {
+			return err
 		}
 	}
 
@@ -206,16 +204,14 @@ func registerKnowledgeAgentHooks(registry *ctxpkg.AdaptiveHookRegistry, deps *Ho
 
 // registerPipelineAgentHooks registers hooks for pipeline agents.
 func registerPipelineAgentHooks(registry *ctxpkg.AdaptiveHookRegistry, deps *HookDependencies) error {
-	for _, agentType := range pipelineAgentTypesForReg {
-		// AR.7.8: Focused Prefetch Hook (PrePrompt, Early priority)
-		if deps.FocusedAugmenter != nil {
-			hook := NewFocusedPrefetchHook(FocusedPrefetchHookConfig{
-				Augmenter: deps.FocusedAugmenter,
-				MaxTokens: 1000, // Per CONTEXT.md specification
-			})
-			if err := registry.RegisterPromptHookForAgent(agentType, hook.ToPromptHook()); err != nil {
-				return err
-			}
+	// AR.7.8: Focused Prefetch Hook (PrePrompt, Early priority)
+	if deps.FocusedAugmenter != nil {
+		hook := NewFocusedPrefetchHook(FocusedPrefetchHookConfig{
+			Augmenter: deps.FocusedAugmenter,
+			MaxTokens: 1000, // Per CONTEXT.md specification
+		})
+		if err := registry.RegisterPromptHookForAgents(pipelineAgentTypesForReg, hook.ToPromptHook()); err != nil {
+			return err
 		}
 	}
 

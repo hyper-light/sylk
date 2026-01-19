@@ -4,7 +4,6 @@ package hooks
 import (
 	"context"
 	"testing"
-	"time"
 
 	ctxpkg "github.com/adalundhe/sylk/core/context"
 )
@@ -16,41 +15,50 @@ import (
 // mockAccessTracker implements AccessTracker for testing.
 type mockAccessTracker struct{}
 
-func (m *mockAccessTracker) RecordAccess(source, target string, accessType string, turn int) {}
-func (m *mockAccessTracker) GetAccessCount(source string) int                                { return 0 }
-func (m *mockAccessTracker) GetLastAccessed(source string) time.Time                         { return time.Time{} }
-func (m *mockAccessTracker) GetMostAccessed(n int) []string                                  { return nil }
-func (m *mockAccessTracker) GetRecentEvents(n int) []AccessEvent                             { return nil }
+func (m *mockAccessTracker) RecordAccess(id string, turn int, source string) error { return nil }
 
 // mockContentPromoter implements ContentPromoter for testing.
 type mockContentPromoter struct{}
 
-func (m *mockContentPromoter) PromoteToHot(contentID string) error { return nil }
+func (m *mockContentPromoter) Promote(entry *ctxpkg.ContentEntry) error { return nil }
 
 // mockFailureQuerier implements FailurePatternQuerier for testing.
 type mockFailureQuerier struct{}
 
-func (m *mockFailureQuerier) GetRecentFailures(ctx context.Context, sessionID string, limit int) ([]FailurePattern, error) {
-	return nil, nil
-}
-func (m *mockFailureQuerier) GetFailuresForPattern(ctx context.Context, pattern string, limit int) ([]FailurePattern, error) {
+func (m *mockFailureQuerier) QuerySimilarFailures(
+	ctx context.Context,
+	query string,
+	threshold float64,
+) ([]FailurePattern, error) {
 	return nil, nil
 }
 
 // mockRoutingProvider implements RoutingHistoryProvider for testing.
 type mockRoutingProvider struct{}
 
-func (m *mockRoutingProvider) GetRecentRoutings(ctx context.Context, sessionID string, limit int) ([]RoutingDecision, error) {
+func (m *mockRoutingProvider) GetRecentRoutings(
+	ctx context.Context,
+	sessionID string,
+	limit int,
+) ([]RoutingDecision, error) {
 	return nil, nil
 }
-func (m *mockRoutingProvider) GetRoutingsForPattern(ctx context.Context, pattern string, limit int) ([]RoutingDecision, error) {
+
+func (m *mockRoutingProvider) GetRoutingsForPattern(
+	ctx context.Context,
+	pattern string,
+	limit int,
+) ([]RoutingDecision, error) {
 	return nil, nil
 }
 
 // mockWorkflowProvider implements WorkflowContextProvider for testing.
 type mockWorkflowProvider struct{}
 
-func (m *mockWorkflowProvider) GetWorkflowContext(ctx context.Context, sessionID string) (*WorkflowContext, error) {
+func (m *mockWorkflowProvider) GetWorkflowContext(
+	ctx context.Context,
+	sessionID string,
+) (*WorkflowContext, error) {
 	return nil, nil
 }
 
@@ -69,17 +77,14 @@ func (m *mockFocusedAugmenter) AugmentWithBudget(
 // mockEvictableContextManager implements EvictableContextManager for testing.
 type mockEvictableContextManager struct{}
 
-func (m *mockEvictableContextManager) GetCurrentPressure() float64        { return 0.5 }
-func (m *mockEvictableContextManager) GetEvictionThreshold() float64      { return 0.8 }
-func (m *mockEvictableContextManager) EvictLeastValuable(count int) error { return nil }
-func (m *mockEvictableContextManager) GetEvictionCandidates(n int) []string {
-	return nil
+func (m *mockEvictableContextManager) ForceEvict(agentID string, percent float64) (int, error) {
+	return 0, nil
 }
 
 // mockObservationLogger implements ObservationLogger for testing.
 type mockObservationLogger struct{}
 
-func (m *mockObservationLogger) LogObservation(obs *ctxpkg.EpisodeObservation) error { return nil }
+func (m *mockObservationLogger) Log(obs ctxpkg.EpisodeObservation) error { return nil }
 
 // =============================================================================
 // Test: RegisterAdaptiveRetrievalHooks
@@ -150,7 +155,7 @@ func TestRegisterAdaptiveRetrievalHooks_GlobalHooks_FailureQuerier(t *testing.T)
 	hooks := registry.GetPromptHooksForAgent("*", ctxpkg.HookPhasePrePrompt)
 	found := false
 	for _, h := range hooks {
-		if h.Name() == FailurePatternWarningHookName {
+		if h.Name() == FailurePatternHookName {
 			found = true
 			break
 		}
@@ -234,7 +239,7 @@ func TestRegisterAdaptiveRetrievalHooks_GlobalHooks_EpisodeTracker(t *testing.T)
 	prePromptHooks := registry.GetPromptHooksForAgent("*", ctxpkg.HookPhasePrePrompt)
 	foundInit := false
 	for _, h := range prePromptHooks {
-		if h.Name() == EpisodeTrackerInitHookName {
+		if h.Name() == EpisodeInitHookName {
 			foundInit = true
 			break
 		}
@@ -308,7 +313,7 @@ func TestRegisterAdaptiveRetrievalHooks_KnowledgeAgents_SpeculativePrefetch(t *t
 
 	// Create a prefetcher for testing
 	prefetcher := ctxpkg.NewSpeculativePrefetcher(ctxpkg.SpeculativePrefetcherConfig{
-		MaxResults: 10,
+		Searcher: nil, // Nil searcher is acceptable for test
 	})
 
 	registry := ctxpkg.NewAdaptiveHookRegistry()
@@ -326,7 +331,7 @@ func TestRegisterAdaptiveRetrievalHooks_KnowledgeAgents_SpeculativePrefetch(t *t
 		hooks := registry.GetPromptHooksForAgent(agentType, ctxpkg.HookPhasePrePrompt)
 		found := false
 		for _, h := range hooks {
-			if h.Name() == SpeculativePrefetchHookName {
+			if h.Name() == PrefetchHookName {
 				found = true
 				break
 			}
@@ -374,7 +379,7 @@ func TestRegisterAdaptiveRetrievalHooks_PipelineAgents_NoKnowledgeHooks(t *testi
 	t.Parallel()
 
 	prefetcher := ctxpkg.NewSpeculativePrefetcher(ctxpkg.SpeculativePrefetcherConfig{
-		MaxResults: 10,
+		Searcher: nil, // Nil searcher is acceptable for test
 	})
 
 	registry := ctxpkg.NewAdaptiveHookRegistry()
@@ -393,7 +398,7 @@ func TestRegisterAdaptiveRetrievalHooks_PipelineAgents_NoKnowledgeHooks(t *testi
 		hooks := registry.GetPromptHooksForAgent(agentType, ctxpkg.HookPhasePrePrompt)
 		for _, h := range hooks {
 			// Speculative prefetch is for knowledge agents only
-			if h.Name() == SpeculativePrefetchHookName {
+			if h.Name() == PrefetchHookName {
 				t.Errorf("pipeline agent %s should not have speculative prefetch hook", agentType)
 			}
 			// Pressure eviction is for knowledge agents only
@@ -425,7 +430,7 @@ func TestRegisterAdaptiveRetrievalHooks_Guide_RoutingCache(t *testing.T) {
 	hooks := registry.GetPromptHooksForAgent("guide", ctxpkg.HookPhasePrePrompt)
 	found := false
 	for _, h := range hooks {
-		if h.Name() == GuideRoutingCacheHookName {
+		if h.Name() == GuideRoutingHookName {
 			found = true
 			break
 		}
@@ -453,7 +458,7 @@ func TestRegisterAdaptiveRetrievalHooks_NonGuide_NoRoutingCache(t *testing.T) {
 	for _, agentType := range nonGuideAgents {
 		hooks := registry.GetPromptHooksForAgent(agentType, ctxpkg.HookPhasePrePrompt)
 		for _, h := range hooks {
-			if h.Name() == GuideRoutingCacheHookName {
+			if h.Name() == GuideRoutingHookName {
 				t.Errorf("agent %s should not have guide routing cache hook", agentType)
 			}
 		}
@@ -524,7 +529,7 @@ func TestRegisterAdaptiveRetrievalHooks_AllDependencies(t *testing.T) {
 	t.Parallel()
 
 	prefetcher := ctxpkg.NewSpeculativePrefetcher(ctxpkg.SpeculativePrefetcherConfig{
-		MaxResults: 10,
+		Searcher: nil, // Nil searcher is acceptable for test
 	})
 	tracker := ctxpkg.NewEpisodeTracker()
 
@@ -554,13 +559,14 @@ func TestRegisterAdaptiveRetrievalHooks_AllDependencies(t *testing.T) {
 	t.Logf("Tool call hooks: %d", registry.ToolCallHookCount())
 
 	// Expect a minimum number based on configuration
+	// With RegisterPromptHookForAgents, one hook instance is shared across agents
 	// Global: 4 prompt + 2 tool call = 6
-	// Knowledge agents (5): 2 each (prefetch + eviction) = 10
-	// Pipeline agents (4): 1 each (focused prefetch) = 4
-	// Guide: 1 (routing cache) - counted in knowledge
+	// Knowledge agents: 2 hooks (prefetch + eviction) shared across 5 agents = 2
+	// Pipeline agents: 1 hook (focused prefetch) shared across 4 agents = 1
+	// Guide: 1 (routing cache)
 	// Orchestrator: 1 (workflow context)
-	// Total minimum expected: ~17
-	minExpected := 15
+	// Total expected: ~11
+	minExpected := 10
 	if totalHooks < minExpected {
 		t.Errorf("expected at least %d hooks, got %d", minExpected, totalHooks)
 	}

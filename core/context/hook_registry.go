@@ -178,6 +178,73 @@ func (r *AdaptiveHookRegistry) RegisterGlobalToolCallHook(hook *ToolCallHook) er
 	return r.RegisterToolCallHookForAgent(GlobalAgentType, hook)
 }
 
+// RegisterPromptHookForAgents registers a prompt hook for multiple agent types.
+// This allows the same hook to be registered for multiple agents at once.
+func (r *AdaptiveHookRegistry) RegisterPromptHookForAgents(agentTypes []string, hook *PromptHook) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check for duplicate
+	if _, exists := r.promptHooksByName[hook.Name()]; exists {
+		return ErrHookAlreadyExists
+	}
+
+	// Register for each agent type
+	phase := hook.Phase()
+	for _, agentType := range agentTypes {
+		// Initialize agent map if needed
+		if r.promptHooks[agentType] == nil {
+			r.promptHooks[agentType] = make(map[HookPhase][]*PromptHook)
+		}
+
+		// Insert hook sorted by priority
+		hooks := r.promptHooks[agentType][phase]
+		hooks = r.insertPromptHookSorted(hooks, hook)
+		r.promptHooks[agentType][phase] = hooks
+
+		// Track agent type
+		r.hookAgentTypes[hook.Name()] = append(r.hookAgentTypes[hook.Name()], agentType)
+	}
+
+	// Track hook by name
+	r.promptHooksByName[hook.Name()] = hook
+
+	return nil
+}
+
+// RegisterToolCallHookForAgents registers a tool call hook for multiple agent types.
+func (r *AdaptiveHookRegistry) RegisterToolCallHookForAgents(agentTypes []string, hook *ToolCallHook) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check for duplicate
+	if _, exists := r.toolCallHooksByName[hook.Name()]; exists {
+		return ErrHookAlreadyExists
+	}
+
+	// Register for each agent type
+	phase := hook.Phase()
+	for _, agentType := range agentTypes {
+		// Initialize agent map if needed
+		if r.toolCallHooks[agentType] == nil {
+			r.toolCallHooks[agentType] = make(map[HookPhase][]*ToolCallHook)
+		}
+
+		// Insert hook sorted by priority
+		hooks := r.toolCallHooks[agentType][phase]
+		hooks = r.insertToolCallHookSorted(hooks, hook)
+		r.toolCallHooks[agentType][phase] = hooks
+
+		// Track agent type
+		r.hookAgentTypes[hook.Name()] = append(r.hookAgentTypes[hook.Name()], agentType)
+	}
+
+	// Track hook by name
+	r.toolCallHooksByName[hook.Name()] = hook
+
+	return nil
+}
+
 // =============================================================================
 // Agent-Specific Retrieval
 // =============================================================================
