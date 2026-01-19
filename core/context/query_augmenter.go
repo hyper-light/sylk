@@ -267,19 +267,19 @@ func (qa *QueryAugmenter) calculateConfidence(
 	position int,
 	total int,
 ) float64 {
-	// Base confidence from position (earlier = higher)
-	positionFactor := 1.0 - (float64(position) / float64(total+1))
+	// Base confidence from position (earlier = higher), max 0.9 to leave room for bonuses
+	positionFactor := 0.9 * (1.0 - (float64(position) / float64(total+1)))
 
-	// Content quality factors
-	contentFactor := 1.0
-	if len(entry.Content) < 50 {
-		contentFactor = 0.7 // Penalize very short content
+	// Content quality factors (additive bonuses)
+	bonus := 0.0
+	if len(entry.Content) >= 50 {
+		bonus += 0.05 // Bonus for sufficient content length
 	}
 	if len(entry.Keywords) > 0 {
-		contentFactor *= 1.1 // Bonus for keyword-rich content
+		bonus += 0.05 // Bonus for keyword-rich content
 	}
 
-	return clamp(positionFactor*contentFactor, 0.0, 1.0)
+	return clamp(positionFactor+bonus, 0.0, 1.0)
 }
 
 func (qa *QueryAugmenter) calculateScore(
