@@ -786,7 +786,6 @@ func TestContentEntry_ZeroValue(t *testing.T) {
 	assert.Nil(t, ce.Keywords)
 	assert.Nil(t, ce.Entities)
 	assert.Empty(t, ce.ParentID)
-	assert.Nil(t, ce.ChildIDs)
 	assert.Nil(t, ce.RelatedFiles)
 	assert.Nil(t, ce.Metadata)
 }
@@ -798,11 +797,10 @@ func TestContentEntry_FullPopulation(t *testing.T) {
 	embedding := []float32{0.1, 0.2, 0.3, 0.4, 0.5}
 	keywords := []string{"func", "main", "go"}
 	entities := []string{"function", "entry_point"}
-	childIDs := []string{"child1", "child2"}
 	relatedFiles := []string{"/path/to/file1.go", "/path/to/file2.go"}
-	metadata := map[string]any{
+	metadata := map[string]string{
 		"key1": "value1",
-		"key2": 42,
+		"key2": "42",
 	}
 
 	ce := ContentEntry{
@@ -819,7 +817,6 @@ func TestContentEntry_FullPopulation(t *testing.T) {
 		Keywords:     keywords,
 		Entities:     entities,
 		ParentID:     "parent-789",
-		ChildIDs:     childIDs,
 		RelatedFiles: relatedFiles,
 		Metadata:     metadata,
 	}
@@ -837,7 +834,6 @@ func TestContentEntry_FullPopulation(t *testing.T) {
 	assert.Equal(t, keywords, ce.Keywords)
 	assert.Equal(t, entities, ce.Entities)
 	assert.Equal(t, "parent-789", ce.ParentID)
-	assert.Equal(t, childIDs, ce.ChildIDs)
 	assert.Equal(t, relatedFiles, ce.RelatedFiles)
 	assert.Equal(t, metadata, ce.Metadata)
 }
@@ -849,19 +845,16 @@ func TestContentEntry_EmptySlices(t *testing.T) {
 		ID:           "test",
 		Keywords:     []string{},
 		Entities:     []string{},
-		ChildIDs:     []string{},
 		RelatedFiles: []string{},
 		Embedding:    []float32{},
 	}
 
 	assert.NotNil(t, ce.Keywords)
 	assert.NotNil(t, ce.Entities)
-	assert.NotNil(t, ce.ChildIDs)
 	assert.NotNil(t, ce.RelatedFiles)
 	assert.NotNil(t, ce.Embedding)
 	assert.Len(t, ce.Keywords, 0)
 	assert.Len(t, ce.Entities, 0)
-	assert.Len(t, ce.ChildIDs, 0)
 	assert.Len(t, ce.RelatedFiles, 0)
 	assert.Len(t, ce.Embedding, 0)
 }
@@ -887,36 +880,32 @@ func TestContentEntry_EmptyMetadata(t *testing.T) {
 
 	ce := ContentEntry{
 		ID:       "test",
-		Metadata: map[string]any{},
+		Metadata: map[string]string{},
 	}
 
 	assert.NotNil(t, ce.Metadata)
 	assert.Len(t, ce.Metadata, 0)
 }
 
-func TestContentEntry_MetadataWithVariousTypes(t *testing.T) {
+func TestContentEntry_MetadataWithVariousValues(t *testing.T) {
 	t.Parallel()
 
 	ce := ContentEntry{
 		ID: "test",
-		Metadata: map[string]any{
-			"string":  "value",
-			"int":     42,
-			"float":   3.14,
-			"bool":    true,
-			"nil":     nil,
-			"slice":   []string{"a", "b"},
-			"nested":  map[string]any{"key": "value"},
+		Metadata: map[string]string{
+			"string": "value",
+			"int":    "42",
+			"float":  "3.14",
+			"bool":   "true",
+			"empty":  "",
 		},
 	}
 
 	assert.Equal(t, "value", ce.Metadata["string"])
-	assert.Equal(t, 42, ce.Metadata["int"])
-	assert.Equal(t, 3.14, ce.Metadata["float"])
-	assert.Equal(t, true, ce.Metadata["bool"])
-	assert.Nil(t, ce.Metadata["nil"])
-	assert.Equal(t, []string{"a", "b"}, ce.Metadata["slice"])
-	assert.Equal(t, map[string]any{"key": "value"}, ce.Metadata["nested"])
+	assert.Equal(t, "42", ce.Metadata["int"])
+	assert.Equal(t, "3.14", ce.Metadata["float"])
+	assert.Equal(t, "true", ce.Metadata["bool"])
+	assert.Equal(t, "", ce.Metadata["empty"])
 }
 
 // =============================================================================

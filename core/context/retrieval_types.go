@@ -142,58 +142,15 @@ func (b *RetrievalBudget) RecordUsage(tokens int) {
 	b.UsedQueries.Add(1)
 }
 
-// ContentType represents the type of content stored in the Universal Content Store.
-type ContentType string
-
+// Note: ContentType and ContentEntry are defined in content_entry.go
+// Additional ContentType constants for retrieval:
 const (
-	// ContentTypeUserPrompt represents user input prompts.
-	ContentTypeUserPrompt ContentType = "user_prompt"
 	// ContentTypeAgentResponse represents agent-generated responses.
 	ContentTypeAgentResponse ContentType = "agent_response"
-	// ContentTypeToolCall represents tool invocation requests.
-	ContentTypeToolCall ContentType = "tool_call"
-	// ContentTypeToolResult represents tool execution results.
-	ContentTypeToolResult ContentType = "tool_result"
-	// ContentTypeCodeFile represents indexed code files.
-	ContentTypeCodeFile ContentType = "code_file"
-	// ContentTypeWebFetch represents fetched web content.
-	ContentTypeWebFetch ContentType = "web_fetch"
-	// ContentTypeResearchPaper represents academic or research content.
-	ContentTypeResearchPaper ContentType = "research_paper"
 	// ContentTypeAgentMessage represents inter-agent communication.
 	ContentTypeAgentMessage ContentType = "agent_message"
-	// ContentTypePlanWorkflow represents planning and workflow definitions.
-	ContentTypePlanWorkflow ContentType = "plan_workflow"
 	// ContentTypeTestResult represents test execution results.
 	ContentTypeTestResult ContentType = "test_result"
 	// ContentTypeInspectorFinding represents code inspection findings.
 	ContentTypeInspectorFinding ContentType = "inspector_finding"
 )
-
-// ContentEntry represents a single piece of content in the Universal Content Store.
-// All prompts, responses, tool results, fetched content, and code analysis are
-// stored as ContentEntry records for later retrieval.
-type ContentEntry struct {
-	ID          string            `json:"id"`           // SHA-256 of content
-	SessionID   string            `json:"session_id"`   // session this belongs to
-	AgentID     string            `json:"agent_id"`     // agent that created this
-	AgentType   string            `json:"agent_type"`   // type of creating agent
-	ContentType ContentType       `json:"content_type"` // type of content
-	Content     string            `json:"content"`      // full original content
-	TokenCount  int               `json:"token_count"`  // estimated token count
-	Timestamp   time.Time         `json:"timestamp"`    // when created
-	TurnNumber  int               `json:"turn_number"`  // conversation turn number
-
-	// Retrieval fields
-	Embedding []float32 `json:"-"`        // vector embedding (not serialized)
-	Keywords  []string  `json:"keywords"` // extracted keywords
-	Entities  []string  `json:"entities"` // named entities
-
-	// Relationships
-	ParentID     string   `json:"parent_id,omitempty"`     // what prompted this
-	ChildIDs     []string `json:"child_ids,omitempty"`     // what this generated
-	RelatedFiles []string `json:"related_files,omitempty"` // files referenced
-
-	// Metadata
-	Metadata map[string]any `json:"metadata,omitempty"`
-}
