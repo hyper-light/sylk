@@ -93,6 +93,27 @@ func (w *RobustWeightDistribution) CredibleInterval(level float64) (float64, flo
 	return low, high
 }
 
+// SetMean sets the distribution to have the given mean while preserving effective samples.
+// Used for handoff to restore learned values to a new agent.
+func (w *RobustWeightDistribution) SetMean(mean float64) {
+	if mean < 0 {
+		mean = 0
+	}
+	if mean > 1 {
+		mean = 1
+	}
+
+	// Preserve total samples (alpha + beta)
+	total := w.Alpha + w.Beta
+	if total < 2 {
+		total = 2 // Minimum for meaningful distribution
+	}
+
+	// Set alpha and beta to achieve the target mean
+	w.Alpha = mean * total
+	w.Beta = (1 - mean) * total
+}
+
 // Update performs a robust Bayesian update with outlier rejection and decay.
 func (w *RobustWeightDistribution) Update(observation float64, config *UpdateConfig) {
 	if config == nil {
@@ -274,6 +295,21 @@ func (c *ContextDiscovery) GetBias(ctx TaskContext) *ContextBias {
 		}
 	}
 	return nil
+}
+
+// AddOrUpdateCentroid adds a new centroid or updates an existing one by ID.
+func (c *ContextDiscovery) AddOrUpdateCentroid(centroid ContextCentroid) {
+	for i := range c.Centroids {
+		if c.Centroids[i].ID == centroid.ID {
+			c.Centroids[i] = centroid
+			return
+		}
+	}
+	// Not found, add new (respecting MaxContexts)
+	if c.MaxContexts > 0 && len(c.Centroids) >= c.MaxContexts {
+		return // At capacity, don't add
+	}
+	c.Centroids = append(c.Centroids, centroid)
 }
 
 // AdaptiveState stores sufficient statistics for adaptive learning.

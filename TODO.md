@@ -32860,10 +32860,11 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4X: Memory Decay System - ACT-R (MD.1-MD.8, 21 tasks)            ││
+│ │ PARALLEL GROUP 4X: Memory Decay System - ACT-R + Cold RAG (MD.1-MD.9, 32 tasks) ││
 │ │ ** ARCHITECTURE: GRAPH.md Section 10 "Memory Decay Model (ACT-R)" **            ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 11 "Cold-Start Retrieval (Cold RAG)" **       ││
 │ │ ** REPLACES: Exponential decay with ACT-R power law (cognitive science) **      ││
-│ │ ** COGNITIVE SCIENCE: Anderson 1990, validated in 30+ years of research **      ││
+│ │ ** COLD-START: Structure-based priors from codebase indexing (arXiv:2505.20773)**││
 │ │                                                                                  ││
 │ │ DESIGN PRINCIPLES (Cognitive Science Based):                                    ││
 │ │   1. Power law decay: R(t) = t^(-d), NOT exponential e^(-λt)                    ││
@@ -33100,6 +33101,102 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
+│ │ PHASE 9 (Cold-Start Retrieval - Cold RAG):                                      ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 11 "Cold-Start Retrieval (Cold RAG)" **       ││
+│ │ ** REFERENCE: arXiv:2505.20773 - Cold RAG for recommendation systems **         ││
+│ │                                                                                  ││
+│ │ • MD.9.1 NodeColdStartSignals Type (core/knowledge/coldstart/node_signals.go)   ││
+│ │   - NodeID, EntityType, Domain fields                                           ││
+│ │   - Structural: InDegree, OutDegree, PageRank, ClusterCoeff, Betweenness        ││
+│ │   - Content: NameSalience, DocCoverage, Complexity                              ││
+│ │   - Distributional: TypeFrequency, TypeRarity                                   ││
+│ │   ACCEPTANCE: All signals populated during indexing                             ││
+│ │   FILES: core/knowledge/coldstart/node_signals.go                               ││
+│ │                                                                                  ││
+│ │ • MD.9.2 CodebaseProfile Type (core/knowledge/coldstart/profile.go)             ││
+│ │   - TotalNodes, EntityCounts map[EntityType]int                                 ││
+│ │   - DomainCounts map[Domain]int                                                 ││
+│ │   - AvgInDegree, AvgOutDegree, MaxPageRank, PageRankSum, BetweennessMax        ││
+│ │   - Persists to SQLite codebase_profile table                                   ││
+│ │   ACCEPTANCE: Profile computed after indexing, persisted correctly              ││
+│ │   FILES: core/knowledge/coldstart/profile.go                                    ││
+│ │                                                                                  ││
+│ │ • MD.9.3 ColdPriorWeights Config (core/knowledge/coldstart/weights.go)          ││
+│ │   - StructuralWeight (0.40), PageRankWeight, DegreeWeight, ClusterWeight        ││
+│ │   - ContentWeight (0.35), EntityTypeWeight, NameWeight, DocWeight               ││
+│ │   - DistributionalWeight (0.25), FrequencyWeight, RarityWeight                  ││
+│ │   - DefaultColdPriorWeights() with empirically-tuned defaults                   ││
+│ │   ACCEPTANCE: Weights configurable, defaults produce valid 0-1 priors           ││
+│ │   FILES: core/knowledge/coldstart/weights.go                                    ││
+│ │                                                                                  ││
+│ │ • MD.9.4 ColdPriorCalculator (core/knowledge/coldstart/calculator.go)           ││
+│ │   - profile *CodebaseProfile, weights *ColdPriorWeights                         ││
+│ │   - entityBasePriors map[EntityType]float64 (hardcoded baseline)                ││
+│ │   - ComputeColdPrior(signals *NodeColdStartSignals) float64                     ││
+│ │   - computeStructuralScore(), computeContentScore(), computeDistributionalScore()││
+│ │   ACCEPTANCE: Cold prior in [0,1], combines all three signal types              ││
+│ │   FILES: core/knowledge/coldstart/calculator.go, calculator_test.go             ││
+│ │                                                                                  ││
+│ │ • MD.9.5 PriorBlender (core/knowledge/coldstart/blender.go)                     ││
+│ │   - coldCalculator *ColdPriorCalculator, memoryStore *MemoryStore               ││
+│ │   - minTracesForWarm (3), fullWarmTraces (20) - transition thresholds           ││
+│ │   - EffectivePrior(ctx, nodeID, signals, now) (float64, error)                  ││
+│ │   - computeConfidence(traceCount) float64 (linear interpolation)                ││
+│ │   - ExplainBlend(nodeID, signals, memory, now) string                           ││
+│ │   ACCEPTANCE: Smooth transition cold→warm, explains its reasoning               ││
+│ │   DEPENDS ON: MD.3.1 (MemoryStore), MD.9.4 (ColdPriorCalculator)                ││
+│ │   FILES: core/knowledge/coldstart/blender.go, blender_test.go                   ││
+│ │                                                                                  ││
+│ │ • MD.9.6 ColdStartBuilder (core/context/cold_start_builder.go)                  ││
+│ │   - Accumulates signals during CV.2 StartupIndexer                              ││
+│ │   - nodeSignals map[string]*NodeColdStartSignals                                ││
+│ │   - entityCounts, domainCounts, totalNodes                                      ││
+│ │   - inDegrees, outDegrees maps for edge accumulation                            ││
+│ │   - BuildProfile() *CodebaseProfile                                             ││
+│ │   ACCEPTANCE: Signals accumulated correctly during indexing                     ││
+│ │   FILES: core/context/cold_start_builder.go                                     ││
+│ │                                                                                  ││
+│ │ • MD.9.7 PageRank & Centrality Computation (core/knowledge/coldstart/graph.go)  ││
+│ │   - buildAdjacencyGraph(edges) - builds adjacency from VectorGraphDB edges      ││
+│ │   - computePageRank(graph, damping, maxIter) map[string]float64                 ││
+│ │   - computeClusteringCoefficients(graph) map[string]float64                     ││
+│ │   - Power iteration algorithm, damping=0.85, maxIter=100                        ││
+│ │   ACCEPTANCE: PageRank converges, clustering coefficients in [0,1]              ││
+│ │   FILES: core/knowledge/coldstart/graph.go, graph_test.go                       ││
+│ │                                                                                  ││
+│ │ • MD.9.8 Schema Migration (core/vectorgraphdb/migrations/011_cold_start.go)     ││
+│ │   - CREATE TABLE node_cold_signals (node_id, structural fields, content fields) ││
+│ │   - CREATE TABLE codebase_profile (singleton, aggregate statistics)             ││
+│ │   - CREATE INDEX idx_cold_signals_prior (for ranked retrieval)                  ││
+│ │   ACCEPTANCE: Tables created, indexes work, FK to nodes                         ││
+│ │   FILES: core/vectorgraphdb/migrations/011_cold_start_signals.go                ││
+│ │                                                                                  ││
+│ │ • MD.9.9 CV.2 StartupIndexer Enhancement (core/context/startup_indexer.go)      ││
+│ │   - Add coldStartBuilder *ColdStartBuilder to StartupIndexer struct             ││
+│ │   - indexFileWithSignals() - accumulates entity/edge signals during indexing    ││
+│ │   - computeGraphMetrics() - runs PageRank after indexing complete               ││
+│ │   - persistProfile() - saves CodebaseProfile and NodeColdStartSignals           ││
+│ │   DEPENDS ON: MD.9.6, MD.9.7, MD.9.8, CV.2 (existing)                           ││
+│ │   ACCEPTANCE: Cold signals computed during startup, persisted to SQLite         ││
+│ │   FILES: core/context/startup_indexer.go (MODIFY)                               ││
+│ │                                                                                  ││
+│ │ • MD.9.10 HybridScorer Cold-Start Integration (core/knowledge/query/scorer.go)  ││
+│ │   - Integrate PriorBlender into HybridScorer                                    ││
+│ │   - GetNodePrior(nodeID) uses blended cold/ACT-R prior                          ││
+│ │   - Cold prior affects ranking when no usage data exists                        ││
+│ │   DEPENDS ON: MD.9.5 (PriorBlender), HQ.3.1 (HybridScorer)                      ││
+│ │   ACCEPTANCE: New nodes ranked by structural importance, not random             ││
+│ │   FILES: core/knowledge/query/scorer.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • MD.9.11 Cold-Start Integration Tests                                          ││
+│ │   - Test: New codebase indexing produces valid CodebaseProfile                  ││
+│ │   - Test: PageRank ranks central functions higher                               ││
+│ │   - Test: Cold prior → ACT-R transition with trace accumulation                 ││
+│ │   - Test: High PageRank nodes retrieved preferentially on cold start            ││
+│ │   FILES: core/knowledge/coldstart/integration_test.go                           ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
 │ │ FILES (SUMMARY):                                                                ││
 │ │   core/vectorgraphdb/migrations/010_memory_decay.go - MD.1.1-1.5                ││
 │ │   core/knowledge/memory/actr_types.go - MD.2.1-2.3                              ││
@@ -33111,13 +33208,26 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   core/vectorgraphdb/mitigations/freshness.go - MD.8.1 (MODIFY)                 ││
 │ │   core/vectorgraphdb/mitigations/types.go - MD.8.1 (MODIFY)                     ││
 │ │   core/domain/classifier/session_context.go - MD.8.2 (MODIFY)                   ││
+│ │   core/knowledge/coldstart/node_signals.go - MD.9.1                             ││
+│ │   core/knowledge/coldstart/profile.go - MD.9.2                                  ││
+│ │   core/knowledge/coldstart/weights.go - MD.9.3                                  ││
+│ │   core/knowledge/coldstart/calculator.go - MD.9.4                               ││
+│ │   core/knowledge/coldstart/blender.go - MD.9.5                                  ││
+│ │   core/context/cold_start_builder.go - MD.9.6                                   ││
+│ │   core/knowledge/coldstart/graph.go - MD.9.7                                    ││
+│ │   core/vectorgraphdb/migrations/011_cold_start_signals.go - MD.9.8              ││
+│ │   core/context/startup_indexer.go - MD.9.9 (MODIFY)                             ││
+│ │   core/knowledge/query/scorer.go - MD.9.10 (MODIFY)                             ││
 │ │                                                                                  ││
 │ │ INTERNAL DEPENDENCIES:                                                          ││
 │ │   Phase 1 (5 parallel) → Phase 2 (3 parallel) → Phase 3 (2 parallel) →          ││
 │ │   Phase 4 (2 parallel) → Phase 5 → Phase 6 → Phase 7 (4 parallel tests) →       ││
 │ │   Phase 8 (3 parallel - can run alongside Phase 2+, no ACT-R type deps)         ││
-│ │   NOTE: Phase 8 migrations can start early since they only modify existing      ││
-│ │         files to change exponential→power law (no new ACT-R types needed)       ││
+│ │   Phase 9 (11 tasks - depends on MD.3.1, integrates with CV.2)                  ││
+│ │   NOTE: Phase 8 migrations can start early (no new ACT-R types needed)          ││
+│ │   NOTE: Phase 9 can start after Phase 3 (needs MemoryStore for blending)        ││
+│ │         MD.9.1-9.4, MD.9.6-9.8 can run in parallel (types + migrations)         ││
+│ │         MD.9.5 needs MD.9.4; MD.9.9-9.10 need MD.9.5; MD.9.11 needs all         ││
 │ │                                                                                  ││
 │ │ EXTERNAL DEPENDENCIES:                                                          ││
 │ │   - Group 4Q: LearnedWeight pattern (reuse for memory weights)                  ││

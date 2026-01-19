@@ -472,3 +472,38 @@ func (a *AdaptiveState) isConvergedUnsafe(threshold float64) bool {
 		a.Weights.StrugglePenalty.Variance() < threshold &&
 		a.Weights.WastePenalty.Variance() < threshold
 }
+
+// =============================================================================
+// State Restoration (for handoff)
+// =============================================================================
+
+// SetMeanWeights sets the weight distributions to have the given means.
+// Used during handoff to restore learned weights.
+func (a *AdaptiveState) SetMeanWeights(weights RewardWeights) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.Weights.TaskSuccess.SetMean(weights.TaskSuccess)
+	a.Weights.RelevanceBonus.SetMean(weights.RelevanceBonus)
+	a.Weights.StrugglePenalty.SetMean(weights.StrugglePenalty)
+	a.Weights.WastePenalty.SetMean(weights.WastePenalty)
+}
+
+// SetMeanThresholds sets the threshold distributions to have the given means.
+// Used during handoff to restore learned thresholds.
+func (a *AdaptiveState) SetMeanThresholds(thresholds ThresholdConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.Thresholds.Confidence.SetMean(thresholds.Confidence)
+	a.Thresholds.Excerpt.SetMean(thresholds.Excerpt)
+	a.Thresholds.Budget.SetMean(thresholds.Budget)
+}
+
+// SetUserProfile sets the user profile.
+// Used during handoff to restore user preferences.
+func (a *AdaptiveState) SetUserProfile(profile UserWeightProfile) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.UserProfile = profile
+}

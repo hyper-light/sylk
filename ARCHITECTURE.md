@@ -4146,6 +4146,58 @@ Reference markers are < 100 tokens but enable full content retrieval via `retrie
 | Topic Cluster | Academic | Evict complete research topics together |
 | Task Completion | Architect | Evict completed task context, preserve active |
 
+### Cold-Start Retrieval (Cold RAG)
+
+**Reference**: See `/GRAPH.md` Section 11 "Cold-Start Retrieval (Cold RAG)" for complete specification.
+
+When Sylk starts on a **new codebase for the first time**, knowledge agents face the cold-start problem: no usage history exists to inform retrieval ranking. We employ a multi-signal strategy based on Cold RAG research (arXiv:2505.20773).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    COLD-START STRATEGY BY AGENT                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  AGENT       │ COLD-START SOURCE        │ SIGNALS USED                     │
+│  ────────────┼──────────────────────────┼────────────────────────────────  │
+│  Librarian   │ CV.2 StartupIndexer      │ PageRank, degree, entity type,  │
+│              │ (codebase structure)     │ frequency distribution           │
+│  ────────────┼──────────────────────────┼────────────────────────────────  │
+│  Academic    │ Query embedding only     │ Semantic similarity, source      │
+│              │ (no codebase relevance)  │ authority, recency               │
+│  ────────────┼──────────────────────────┼────────────────────────────────  │
+│  Archivalist │ None (records actions)   │ Action-type priors, session     │
+│              │                          │ recency only                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Librarian Cold-Start Flow**:
+
+1. **CV.2 StartupIndexer** scans codebase on startup (with user permission)
+2. During indexing, computes **structural metrics**: PageRank, in/out degree, clustering coefficient
+3. Computes **CodebaseProfile**: entity type frequency, domain distribution
+4. **ColdPriorCalculator** combines signals: `ColdPrior = 0.4×Structural + 0.35×Content + 0.25×Distributional`
+5. As usage accumulates, **PriorBlender** transitions from cold prior to ACT-R activation
+
+```
+COLD (0 traces)          TRANSITIONING (3-20 traces)       WARM (20+ traces)
+────────────────         ──────────────────────────        ─────────────────
+ColdPrior only     →     Blend: (1-conf)×Cold + conf×ACT-R  →  ACT-R only
+
+conf = (traceCount - 3) / 17   (linear interpolation)
+```
+
+**Key Types** (from GRAPH.md):
+
+| Type | Purpose |
+|------|---------|
+| `NodeColdStartSignals` | Per-node structural/content/distributional signals |
+| `CodebaseProfile` | Codebase-wide statistics (entity counts, avg degree, max PageRank) |
+| `ColdPriorCalculator` | Computes cold prior from signals |
+| `PriorBlender` | Transitions from cold → warm as usage accumulates |
+
+**Schema**: `node_cold_signals` table stores computed signals per node; `codebase_profile` stores aggregate statistics.
+
 ### Integration with Document Search
 
 The Document Search System (SEARCH.md) and Context Virtualization (CONTEXT.md) share infrastructure:

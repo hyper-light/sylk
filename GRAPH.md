@@ -20,12 +20,13 @@ This document specifies the architecture for transforming Sylk's existing Vector
 8. [Inference Engine](#inference-engine)
 9. [Temporal Graph Support](#temporal-graph-support)
 10. [Memory Decay Model (ACT-R)](#memory-decay-model-act-r)
-11. [Domain Partitioning](#domain-partitioning)
-12. [Multi-Session Coordination](#multi-session-coordination)
-13. [Integration with Wave 4 Groups](#integration-with-wave-4-groups)
-14. [Implementation Phases](#implementation-phases)
-15. [Acceptance Criteria](#acceptance-criteria)
-16. [Edge Cases and Mitigations](#edge-cases-and-mitigations)
+11. [Cold-Start Retrieval (Cold RAG)](#cold-start-retrieval-cold-rag)
+12. [Domain Partitioning](#domain-partitioning)
+13. [Multi-Session Coordination](#multi-session-coordination)
+14. [Integration with Wave 4 Groups](#integration-with-wave-4-groups)
+15. [Implementation Phases](#implementation-phases)
+16. [Acceptance Criteria](#acceptance-criteria)
+17. [Edge Cases and Mitigations](#edge-cases-and-mitigations)
 
 ---
 
@@ -4210,6 +4211,1060 @@ func isRetrievalTool(name string) bool {
 - [ ] Memory state persists across restarts via SQLite
 - [ ] Access tracking hooks fire on retrieval/reference
 - [ ] Memory-weighted scoring integrates with HybridQueryCoordinator
+
+---
+
+## Cold-Start Retrieval (Cold RAG)
+
+### The Cold-Start Problem
+
+When Sylk starts on a new codebase for the first time, knowledge agents face the **cold-start problem**: no usage history exists to inform retrieval ranking.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           COLD-START SCENARIOS                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  AGENT         │ COLD-START SITUATION          │ AVAILABLE SIGNALS                 │
+│  ──────────────┼───────────────────────────────┼─────────────────────────────────  │
+│  Librarian     │ New codebase, never indexed   │ Codebase structure (from indexing)│
+│                │                               │ Entity types, KG topology         │
+│  ──────────────┼───────────────────────────────┼─────────────────────────────────  │
+│  Academic      │ First research query          │ Query embedding only              │
+│                │                               │ No codebase knowledge relevant    │
+│  ──────────────┼───────────────────────────────┼─────────────────────────────────  │
+│  Archivalist   │ No prior actions recorded     │ Nothing - records what we DO      │
+│                │                               │ Cannot bootstrap from structure   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cold RAG Approach
+
+Based on research in cold-start recommendation systems (arXiv:2505.20773), we employ a **multi-signal integration** strategy that uses knowledge graph structure as a primary signal when usage data is unavailable.
+
+**Core Insight**: The **structure** of the knowledge graph itself encodes importance, even before any user interaction.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         COLD RAG MULTI-SIGNAL FRAMEWORK                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐                  │
+│  │  STRUCTURAL     │    │  CONTENT-BASED  │    │ DISTRIBUTIONAL  │                  │
+│  │  SIGNALS        │    │  SIGNALS        │    │ SIGNALS         │                  │
+│  ├─────────────────┤    ├─────────────────┤    ├─────────────────┤                  │
+│  │ • InDegree      │    │ • EntityType    │    │ • TypeFrequency │                  │
+│  │ • OutDegree     │    │ • Domain        │    │ • Rarity score  │                  │
+│  │ • PageRank      │    │ • NameSalience  │    │ • IDF-style     │                  │
+│  │ • ClusterCoeff  │    │ • DocQuality    │    │   weighting     │                  │
+│  │ • Betweenness   │    │ • CodeComplexity│    │                 │                  │
+│  └────────┬────────┘    └────────┬────────┘    └────────┬────────┘                  │
+│           │                      │                      │                           │
+│           └──────────────────────┼──────────────────────┘                           │
+│                                  ▼                                                  │
+│                    ┌─────────────────────────┐                                      │
+│                    │   COLD-START PRIOR      │                                      │
+│                    │   ColdPrior(node) =     │                                      │
+│                    │   w₁·Structural +       │                                      │
+│                    │   w₂·ContentBased +     │                                      │
+│                    │   w₃·Distributional     │                                      │
+│                    └─────────────────────────┘                                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Librarian Cold-Start: Structure-Based Priors
+
+The Librarian benefits most from cold-start signals because CV.2 StartupIndexer already scans the codebase on startup. During indexing, we compute structural metrics.
+
+#### Signals Computed During Indexing
+
+```go
+// core/knowledge/coldstart/node_signals.go
+
+// NodeColdStartSignals computed during CV.2 StartupIndexer
+type NodeColdStartSignals struct {
+    NodeID       string
+    EntityType   EntityType
+    Domain       Domain
+
+    // Structural signals (from KG topology)
+    InDegree     int       // Nodes pointing TO this node (callers, importers)
+    OutDegree    int       // Nodes this points to (callees, imports)
+    PageRank     float64   // Eigenvector centrality (0-1 normalized)
+    ClusterCoeff float64   // Local clustering coefficient
+    Betweenness  float64   // Betweenness centrality (bridge nodes)
+
+    // Content-based signals
+    NameSalience float64   // Descriptive name score (0-1)
+    DocCoverage  float64   // Has docstring/comments (0-1)
+    Complexity   float64   // Cyclomatic complexity normalized
+
+    // Distributional signals
+    TypeFrequency float64  // How common is this EntityType in codebase
+    TypeRarity    float64  // IDF-style: log(N / count(type))
+}
+
+// CodebaseProfile aggregates codebase-wide statistics
+type CodebaseProfile struct {
+    TotalNodes      int
+    EntityCounts    map[EntityType]int
+    DomainCounts    map[Domain]int
+
+    // Graph statistics
+    AvgInDegree     float64
+    AvgOutDegree    float64
+    MaxPageRank     float64
+
+    // For normalization
+    PageRankSum     float64
+    BetweennessMax  float64
+}
+```
+
+#### Cold Prior Computation
+
+```go
+// core/knowledge/coldstart/cold_prior.go
+
+// ColdPriorWeights configurable weights for cold-start signals
+type ColdPriorWeights struct {
+    // Structural weight: 0.4 default
+    StructuralWeight float64
+    PageRankWeight   float64  // Within structural
+    DegreeWeight     float64
+    ClusterWeight    float64
+
+    // Content-based weight: 0.35 default
+    ContentWeight    float64
+    EntityTypeWeight float64
+    NameWeight       float64
+    DocWeight        float64
+
+    // Distributional weight: 0.25 default
+    DistributionalWeight float64
+    FrequencyWeight      float64
+    RarityWeight         float64
+}
+
+// DefaultColdPriorWeights returns empirically-tuned defaults
+func DefaultColdPriorWeights() *ColdPriorWeights {
+    return &ColdPriorWeights{
+        StructuralWeight: 0.40,
+        PageRankWeight:   0.50,
+        DegreeWeight:     0.30,
+        ClusterWeight:    0.20,
+
+        ContentWeight:    0.35,
+        EntityTypeWeight: 0.40,
+        NameWeight:       0.35,
+        DocWeight:        0.25,
+
+        DistributionalWeight: 0.25,
+        FrequencyWeight:      0.60,
+        RarityWeight:         0.40,
+    }
+}
+
+// ColdPriorCalculator computes cold-start priors for nodes
+type ColdPriorCalculator struct {
+    profile *CodebaseProfile
+    weights *ColdPriorWeights
+
+    // Entity type base priors (hardcoded baseline)
+    entityBasePriors map[EntityType]float64
+}
+
+// NewColdPriorCalculator creates calculator with codebase profile
+func NewColdPriorCalculator(profile *CodebaseProfile, weights *ColdPriorWeights) *ColdPriorCalculator {
+    if weights == nil {
+        weights = DefaultColdPriorWeights()
+    }
+
+    return &ColdPriorCalculator{
+        profile: profile,
+        weights: weights,
+        entityBasePriors: defaultEntityBasePriors(),
+    }
+}
+
+// defaultEntityBasePriors returns hardcoded baseline priors
+// Used when no other signal is available
+func defaultEntityBasePriors() map[EntityType]float64 {
+    return map[EntityType]float64{
+        EntityFunction:    0.75,  // Functions usually relevant
+        EntityMethod:      0.75,
+        EntityClass:       0.70,
+        EntityStruct:      0.70,
+        EntityInterface:   0.65,
+        EntityType:        0.60,
+        EntityVariable:    0.45,
+        EntityConstant:    0.50,
+        EntityPackage:     0.55,
+        EntityModule:      0.55,
+        EntityFile:        0.40,
+        EntityComment:     0.25,
+        EntityImport:      0.20,
+    }
+}
+
+// ComputeColdPrior calculates the cold-start prior for a node
+func (c *ColdPriorCalculator) ComputeColdPrior(signals *NodeColdStartSignals) float64 {
+    structural := c.computeStructuralScore(signals)
+    contentBased := c.computeContentScore(signals)
+    distributional := c.computeDistributionalScore(signals)
+
+    return c.weights.StructuralWeight*structural +
+           c.weights.ContentWeight*contentBased +
+           c.weights.DistributionalWeight*distributional
+}
+
+func (c *ColdPriorCalculator) computeStructuralScore(s *NodeColdStartSignals) float64 {
+    // Normalize PageRank
+    pageRank := s.PageRank / math.Max(c.profile.MaxPageRank, 1e-10)
+
+    // Normalize degree (log scale to handle high-degree nodes)
+    avgDegree := (c.profile.AvgInDegree + c.profile.AvgOutDegree) / 2
+    degreeScore := math.Log1p(float64(s.InDegree+s.OutDegree)) /
+                   math.Log1p(avgDegree*4) // 4x avg as ceiling
+    degreeScore = math.Min(degreeScore, 1.0)
+
+    // Cluster coefficient already 0-1
+    cluster := s.ClusterCoeff
+
+    return c.weights.PageRankWeight*pageRank +
+           c.weights.DegreeWeight*degreeScore +
+           c.weights.ClusterWeight*cluster
+}
+
+func (c *ColdPriorCalculator) computeContentScore(s *NodeColdStartSignals) float64 {
+    // Entity type base prior
+    entityScore := c.entityBasePriors[s.EntityType]
+
+    // Name salience already 0-1
+    nameScore := s.NameSalience
+
+    // Doc coverage already 0-1
+    docScore := s.DocCoverage
+
+    return c.weights.EntityTypeWeight*entityScore +
+           c.weights.NameWeight*nameScore +
+           c.weights.DocWeight*docScore
+}
+
+func (c *ColdPriorCalculator) computeDistributionalScore(s *NodeColdStartSignals) float64 {
+    // Type frequency: common types may be more relevant in aggregate
+    freqScore := s.TypeFrequency
+
+    // Rarity: rare types may be more significant when found
+    // Balance: not too rare (noise) but not too common (generic)
+    // Optimal around 5-15% frequency
+    rarityScore := 1.0 - math.Abs(s.TypeFrequency - 0.10) / 0.10
+    rarityScore = math.Max(0, math.Min(1, rarityScore))
+
+    return c.weights.FrequencyWeight*freqScore +
+           c.weights.RarityWeight*rarityScore
+}
+```
+
+### Blending Cold Prior with ACT-R Activation
+
+As usage data accumulates, the system transitions from cold prior to ACT-R activation.
+
+```go
+// core/knowledge/coldstart/blender.go
+
+// PriorBlender transitions from cold-start to warm retrieval
+type PriorBlender struct {
+    coldCalculator *ColdPriorCalculator
+    memoryStore    *MemoryStore
+
+    // Transition parameters
+    minTracesForWarm int     // Traces needed to start blending (default: 3)
+    fullWarmTraces   int     // Traces for full ACT-R reliance (default: 20)
+}
+
+// EffectivePrior computes the blended prior for retrieval scoring
+func (b *PriorBlender) EffectivePrior(
+    ctx context.Context,
+    nodeID string,
+    signals *NodeColdStartSignals,
+    now time.Time,
+) (float64, error) {
+
+    // Get ACT-R memory state
+    memory, err := b.memoryStore.GetMemory(ctx, nodeID, signals.Domain)
+    if err != nil {
+        // No memory state - pure cold start
+        return b.coldCalculator.ComputeColdPrior(signals), nil
+    }
+
+    // Compute ACT-R activation
+    activation := memory.Activation(now)
+
+    // Compute confidence based on trace count
+    traceCount := len(memory.Traces)
+    confidence := b.computeConfidence(traceCount)
+
+    // Compute cold prior
+    coldPrior := b.coldCalculator.ComputeColdPrior(signals)
+
+    // Blend: confidence-weighted combination
+    // High confidence → ACT-R dominates
+    // Low confidence → Cold prior dominates
+    return confidence*activation + (1-confidence)*coldPrior, nil
+}
+
+// computeConfidence returns 0-1 based on trace count
+func (b *PriorBlender) computeConfidence(traceCount int) float64 {
+    if traceCount < b.minTracesForWarm {
+        return 0.0 // Pure cold start
+    }
+    if traceCount >= b.fullWarmTraces {
+        return 1.0 // Full ACT-R
+    }
+
+    // Linear interpolation
+    progress := float64(traceCount - b.minTracesForWarm) /
+                float64(b.fullWarmTraces - b.minTracesForWarm)
+    return progress
+}
+
+// ExplainBlend returns human-readable explanation of the blend
+func (b *PriorBlender) ExplainBlend(
+    nodeID string,
+    signals *NodeColdStartSignals,
+    memory *ACTRMemory,
+    now time.Time,
+) string {
+    traceCount := 0
+    if memory != nil {
+        traceCount = len(memory.Traces)
+    }
+    confidence := b.computeConfidence(traceCount)
+
+    switch {
+    case confidence == 0:
+        return fmt.Sprintf(
+            "COLD: Using structural prior (PageRank=%.2f, InDegree=%d, Type=%s)",
+            signals.PageRank, signals.InDegree, signals.EntityType,
+        )
+    case confidence == 1:
+        return fmt.Sprintf(
+            "WARM: Full ACT-R (traces=%d, activation=%.2f)",
+            traceCount, memory.Activation(now),
+        )
+    default:
+        return fmt.Sprintf(
+            "TRANSITIONING: %.0f%% ACT-R + %.0f%% cold (traces=%d)",
+            confidence*100, (1-confidence)*100, traceCount,
+        )
+    }
+}
+```
+
+### Integration with StartupIndexer (CV.2)
+
+The CV.2 StartupIndexer is enhanced to compute cold-start signals during indexing.
+
+```go
+// core/context/startup_indexer.go (enhanced)
+
+// StartupIndexer parallel codebase indexer with cold-start signal computation
+type StartupIndexer struct {
+    contentStore     *UniversalContentStore
+    goroutineBudget  *concurrency.GoroutineBudget
+    fileBudget       *resources.FileHandleBudget
+
+    // NEW: Cold-start computation
+    coldStartBuilder *ColdStartBuilder
+
+    // Progress tracking
+    onProgress       func(indexed, total int)
+}
+
+// ColdStartBuilder accumulates signals during indexing
+type ColdStartBuilder struct {
+    mu sync.Mutex
+
+    // Accumulated during indexing
+    nodeSignals  map[string]*NodeColdStartSignals
+    entityCounts map[EntityType]int
+    domainCounts map[Domain]int
+    totalNodes   int
+
+    // Edge accumulation for structural metrics
+    inDegrees    map[string]int
+    outDegrees   map[string]int
+}
+
+// Index indexes the codebase and computes cold-start signals
+func (s *StartupIndexer) Index(ctx context.Context, root string) (*CodebaseProfile, error) {
+    // Phase 1: Scan and index files (existing)
+    files, err := s.scanFiles(ctx, root)
+    if err != nil {
+        return nil, err
+    }
+
+    // Phase 2: Index content and accumulate cold-start signals
+    for i, file := range files {
+        if err := s.indexFileWithSignals(ctx, file); err != nil {
+            // Log but continue
+            continue
+        }
+        if s.onProgress != nil {
+            s.onProgress(i+1, len(files))
+        }
+    }
+
+    // Phase 3: Compute graph metrics (PageRank, etc.)
+    if err := s.computeGraphMetrics(ctx); err != nil {
+        return nil, err
+    }
+
+    // Phase 4: Build and persist CodebaseProfile
+    profile := s.coldStartBuilder.BuildProfile()
+    if err := s.persistProfile(ctx, profile); err != nil {
+        return nil, err
+    }
+
+    return profile, nil
+}
+
+// computeGraphMetrics runs PageRank and other centrality algorithms
+func (s *StartupIndexer) computeGraphMetrics(ctx context.Context) error {
+    // Load edges from VectorGraphDB
+    edges, err := s.contentStore.vectorDB.GetAllEdges(ctx)
+    if err != nil {
+        return err
+    }
+
+    // Build adjacency for PageRank
+    graph := buildAdjacencyGraph(edges)
+
+    // Compute PageRank (power iteration)
+    pageRanks := computePageRank(graph, 0.85, 100) // damping=0.85, maxIter=100
+
+    // Compute clustering coefficients
+    clusterCoeffs := computeClusteringCoefficients(graph)
+
+    // Update node signals
+    s.coldStartBuilder.mu.Lock()
+    defer s.coldStartBuilder.mu.Unlock()
+
+    for nodeID, rank := range pageRanks {
+        if signals, ok := s.coldStartBuilder.nodeSignals[nodeID]; ok {
+            signals.PageRank = rank
+            signals.ClusterCoeff = clusterCoeffs[nodeID]
+        }
+    }
+
+    return nil
+}
+```
+
+### Schema Extension for Cold-Start Signals
+
+```sql
+-- Migration: 011_cold_start_signals.go
+
+-- Store computed cold-start signals per node
+CREATE TABLE IF NOT EXISTS node_cold_signals (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+
+    -- Structural signals
+    in_degree INTEGER DEFAULT 0,
+    out_degree INTEGER DEFAULT 0,
+    page_rank REAL DEFAULT 0.0,
+    cluster_coeff REAL DEFAULT 0.0,
+    betweenness REAL DEFAULT 0.0,
+
+    -- Content signals
+    name_salience REAL DEFAULT 0.5,
+    doc_coverage REAL DEFAULT 0.0,
+    complexity REAL DEFAULT 0.0,
+
+    -- Distributional signals
+    type_frequency REAL DEFAULT 0.0,
+    type_rarity REAL DEFAULT 0.0,
+
+    -- Computed cold prior (cached)
+    cold_prior REAL DEFAULT 0.5,
+
+    -- Metadata
+    computed_at TEXT DEFAULT (datetime('now')),
+    profile_version INTEGER DEFAULT 1
+);
+
+CREATE INDEX idx_cold_signals_prior ON node_cold_signals(cold_prior DESC);
+
+-- Store codebase-wide profile
+CREATE TABLE IF NOT EXISTS codebase_profile (
+    id INTEGER PRIMARY KEY CHECK (id = 1),  -- Singleton
+
+    total_nodes INTEGER DEFAULT 0,
+    entity_counts_json TEXT DEFAULT '{}',
+    domain_counts_json TEXT DEFAULT '{}',
+
+    avg_in_degree REAL DEFAULT 0.0,
+    avg_out_degree REAL DEFAULT 0.0,
+    max_page_rank REAL DEFAULT 0.0,
+
+    computed_at TEXT DEFAULT (datetime('now')),
+    version INTEGER DEFAULT 1
+);
+```
+
+### Agent-Specific Cold-Start Strategies
+
+Different agents have fundamentally different cold-start situations:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    AGENT-SPECIFIC COLD-START STRATEGIES                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ LIBRARIAN (Codebase Expert)                                                  │   │
+│  │                                                                               │   │
+│  │ Cold-Start Source: CV.2 StartupIndexer                                       │   │
+│  │                                                                               │   │
+│  │ Available Signals:                                                           │   │
+│  │   ✓ KG structure (PageRank, degree, clustering)                             │   │
+│  │   ✓ Entity types (function, class, interface)                               │   │
+│  │   ✓ Frequency distribution (common vs rare types)                           │   │
+│  │   ✓ Content features (names, documentation)                                 │   │
+│  │                                                                               │   │
+│  │ Strategy: Full Cold RAG with structural + content + distributional signals  │   │
+│  │                                                                               │   │
+│  │ Warm-up: Fast (usage data accumulates with every codebase query)            │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ ACADEMIC (Research Expert) - TWO-LAYER MODEL                                │   │
+│  │                                                                               │   │
+│  │ LAYER 1: Cross-Agent Awareness (Project Fact Registry)                       │   │
+│  │   ✓ Reads CODEBASE facts from Librarian (what tech stack we use)            │   │
+│  │   ✓ Reads HISTORY facts from Archivalist (what we've tried)                 │   │
+│  │   ✓ Reads TASK facts from Architect (current goals)                         │   │
+│  │   → No cold start: facts are known or not known                             │   │
+│  │   → Informs JUDGMENT, not retrieval ranking                                 │   │
+│  │                                                                               │   │
+│  │ LAYER 2: Own Domain Retrieval (Research Index)                               │   │
+│  │   Cold-Start (0 retrieval traces):                                          │   │
+│  │     Score = 0.45×SourceAuthority + 0.20×PublicationRecency + 0.35×Semantic  │   │
+│  │     • SourceAuthority: arXiv=0.85, docs=0.80, SO=0.65, blog=0.40           │   │
+│  │     • PublicationRecency: gentle exp decay (halfLife=5yr, not aggressive)   │   │
+│  │     • SemanticSimilarity: embedding match to query                          │   │
+│  │                                                                               │   │
+│  │   Warm (has retrieval traces):                                              │   │
+│  │     Score = ACT-R activation (power law on RETRIEVAL history)               │   │
+│  │     "When did we find this source useful?" (not when published)             │   │
+│  │                                                                               │   │
+│  │ Warm-up: Medium (research queries accumulate over session)                  │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ ARCHIVALIST (History Expert)                                                 │   │
+│  │                                                                               │   │
+│  │ Cold-Start Source: None (records actions, cannot bootstrap)                  │   │
+│  │                                                                               │   │
+│  │ Available Signals:                                                           │   │
+│  │   ✗ No codebase structure (records what we DO, not what EXISTS)             │   │
+│  │   ✗ No prior actions on new project                                         │   │
+│  │   ✓ Action type priors (commits > reads, failures memorable)                │   │
+│  │   ✓ Recency within session                                                  │   │
+│  │                                                                               │   │
+│  │ Strategy: Hardcoded action-type priors + session recency                    │   │
+│  │                                                                               │   │
+│  │ Warm-up: Medium (accumulates as session progresses)                         │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Project Fact Registry (Cross-Agent Awareness)
+
+The Project Fact Registry provides **factual context** that all agents can read, enabling cross-agent awareness without domain corruption. Facts are not weighted - they're either known or not known.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           PROJECT FACT REGISTRY                                      │
+│                    (Shared Context, Domain-Protected)                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  OWNERSHIP MODEL:                                                                   │
+│  ────────────────                                                                   │
+│  • Each fact has an OWNER AGENT who can create/update it                           │
+│  • All agents can READ all facts (cross-agent awareness)                           │
+│  • No agent can WRITE facts outside their domain                                   │
+│  • Facts are IMMUTABLE once written (new versions supersede old)                   │
+│                                                                                     │
+│  FACT TYPES BY OWNER:                                                               │
+│  ────────────────────                                                               │
+│  LIBRARIAN owns CODEBASE facts:                                                     │
+│    • technology.cache = "Redis"                                                    │
+│    • primary_language = "Go"                                                       │
+│    • framework.web = "gin"                                                         │
+│    • maturity = "DISCIPLINED"                                                      │
+│                                                                                     │
+│  ACADEMIC owns RESEARCH facts:                                                      │
+│    • memory_model = "ACT-R_power_law"                                              │
+│    • rejected_approach = "exponential_decay"                                       │
+│    • reference.cold_start = "arXiv:2505.20773"                                    │
+│                                                                                     │
+│  ARCHIVALIST owns HISTORY facts:                                                    │
+│    • decision.memory_model = "chose_ACT-R_over_exponential"                        │
+│    • implementation.status = "GRAPH.md_updated"                                    │
+│    • failure.attempted = "hardcoded_weights_rejected"                              │
+│                                                                                     │
+│  ARCHITECT owns TASK facts:                                                         │
+│    • current_goal = "implement_cold_start_retrieval"                               │
+│    • active_files = ["GRAPH.md", "TODO.md"]                                        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Project Fact Schema
+
+```go
+// core/knowledge/facts/project_fact.go
+
+// ProjectFact represents a factual assertion about the project
+// Owned by one agent, readable by all
+type ProjectFact struct {
+    ID            string       `json:"id"`
+    FactType      FactType     `json:"fact_type"`       // CODEBASE | RESEARCH | HISTORY | TASK
+    OwnerAgent    AgentType    `json:"owner_agent"`     // Who can update this
+
+    // The assertion
+    Category      string       `json:"category"`        // e.g., "technology", "decision"
+    Subject       string       `json:"subject"`         // e.g., "cache", "memory_model"
+    Assertion     string       `json:"assertion"`       // e.g., "Redis", "ACT-R"
+
+    // Metadata
+    Confidence    float64      `json:"confidence"`      // Owner's confidence (0-1)
+    Provenance    string       `json:"provenance"`      // "indexing", "research", "user_stated"
+    EstablishedAt time.Time    `json:"established_at"`
+    UpdatedAt     time.Time    `json:"updated_at"`
+
+    // Temporal tracking
+    SupersededBy  *string      `json:"superseded_by,omitempty"`
+    ValidUntil    *time.Time   `json:"valid_until,omitempty"`
+}
+
+type FactType string
+
+const (
+    FactTypeCodebase FactType = "CODEBASE"  // Librarian owns
+    FactTypeResearch FactType = "RESEARCH"  // Academic owns
+    FactTypeHistory  FactType = "HISTORY"   // Archivalist owns
+    FactTypeTask     FactType = "TASK"      // Architect owns
+)
+
+// FactRegistry manages project facts with domain protection
+type FactRegistry struct {
+    db        *sql.DB
+    cache     map[string]*ProjectFact
+    mu        sync.RWMutex
+}
+
+// WriteFact creates/updates a fact (enforces ownership)
+func (r *FactRegistry) WriteFact(fact *ProjectFact, writer AgentType) error {
+    // STRICT: Only owner can write to their fact type
+    if !canAgentWriteFactType(writer, fact.FactType) {
+        return fmt.Errorf("agent %s cannot write %s facts", writer, fact.FactType)
+    }
+
+    fact.OwnerAgent = writer
+    fact.UpdatedAt = time.Now()
+
+    return r.store(fact)
+}
+
+// ReadFacts returns all facts of a type (any agent can read)
+func (r *FactRegistry) ReadFacts(factType FactType) ([]*ProjectFact, error) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+
+    // All agents can read all facts - this enables cross-agent awareness
+    return r.queryByType(factType)
+}
+
+// GetFact returns a specific fact by category/subject
+func (r *FactRegistry) GetFact(factType FactType, category, subject string) *ProjectFact {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+
+    key := fmt.Sprintf("%s:%s:%s", factType, category, subject)
+    return r.cache[key]
+}
+
+// GetFactHistory returns all versions of a fact over time
+func (r *FactRegistry) GetFactHistory(factType FactType, category, subject string) []*ProjectFact {
+    // Returns temporal evolution of this fact
+    // Enables agents to understand how understanding has evolved
+    return r.queryHistory(factType, category, subject)
+}
+
+func canAgentWriteFactType(agent AgentType, factType FactType) bool {
+    switch factType {
+    case FactTypeCodebase:
+        return agent == AgentLibrarian
+    case FactTypeResearch:
+        return agent == AgentAcademic
+    case FactTypeHistory:
+        return agent == AgentArchivalist
+    case FactTypeTask:
+        return agent == AgentArchitect || agent == AgentOrchestrator
+    default:
+        return false
+    }
+}
+```
+
+#### Fact Registry SQL Schema
+
+```sql
+-- Migration: 012_project_facts.go
+
+CREATE TABLE IF NOT EXISTS project_facts (
+    id TEXT PRIMARY KEY,
+    fact_type TEXT NOT NULL CHECK (fact_type IN ('CODEBASE', 'RESEARCH', 'HISTORY', 'TASK')),
+    owner_agent TEXT NOT NULL,
+
+    category TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    assertion TEXT NOT NULL,
+
+    confidence REAL DEFAULT 1.0,
+    provenance TEXT NOT NULL,
+    established_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    superseded_by TEXT REFERENCES project_facts(id),
+    valid_until TEXT,
+
+    UNIQUE(fact_type, category, subject, updated_at)
+);
+
+CREATE INDEX idx_facts_type ON project_facts(fact_type);
+CREATE INDEX idx_facts_lookup ON project_facts(fact_type, category, subject);
+CREATE INDEX idx_facts_current ON project_facts(fact_type, category, subject)
+    WHERE superseded_by IS NULL;
+```
+
+### Academic Cold-Start: Two-Layer Model
+
+The Academic agent uses a two-layer architecture that separates cross-agent awareness from domain-specific retrieval.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      ACADEMIC TWO-LAYER ARCHITECTURE                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ LAYER 1: CROSS-AGENT AWARENESS                                               │   │
+│  │ (Project Fact Registry - No Cold Start)                                      │   │
+│  │                                                                               │   │
+│  │ Academic READS (never writes):                                               │   │
+│  │   • CODEBASE facts: "This is a Go project using Redis"                      │   │
+│  │   • HISTORY facts: "We tried X and rejected it"                             │   │
+│  │   • TASK facts: "Currently implementing knowledge graph"                     │   │
+│  │                                                                               │   │
+│  │ Purpose: INFORM JUDGMENT about relevance of research                        │   │
+│  │ Cold Start: NONE - facts are either known or not known                      │   │
+│  │                                                                               │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                                │
+│                                    ▼                                                │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ LAYER 2: OWN DOMAIN RETRIEVAL                                                │   │
+│  │ (Research Index - Has Cold Start, Uses ACT-R)                                │   │
+│  │                                                                               │   │
+│  │ Academic OWNS this index (papers, docs, external knowledge)                  │   │
+│  │                                                                               │   │
+│  │ COLD (0 retrieval traces):                                                   │   │
+│  │   Score = w₁·SourceAuthority + w₂·PublicationRecency + w₃·SemanticSim       │   │
+│  │                                                                               │   │
+│  │ WARM (has retrieval traces):                                                 │   │
+│  │   Score = ACT-R activation based on RETRIEVAL history                        │   │
+│  │   B = ln(Σtⱼ^(-d)) + β  where tⱼ = time since retrieval j                   │   │
+│  │                                                                               │   │
+│  │ KEY DISTINCTION:                                                             │   │
+│  │   • Publication recency: When was it WRITTEN (gentle exp decay)             │   │
+│  │   • Retrieval recency: When did WE FIND IT USEFUL (ACT-R power law)         │   │
+│  │                                                                               │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Academic Source Prior (Cold Start)
+
+```go
+// core/knowledge/coldstart/academic_prior.go
+
+// AcademicSourcePrior handles cold-start for research sources
+type AcademicSourcePrior struct {
+    // Source authority - stable facts about source types (not learned)
+    SourceAuthority map[SourceType]float64
+
+    // Publication recency - gentle exponential (data staleness, not memory)
+    // Foundational papers remain valuable, so half-life is long
+    PublicationHalfLife time.Duration
+
+    // Component weights
+    AuthorityWeight float64
+    RecencyWeight   float64
+    SemanticWeight  float64
+}
+
+// SourceType represents the authority level of a research source
+type SourceType string
+
+const (
+    SourceArxivPeerReviewed    SourceType = "arxiv_peer_reviewed"
+    SourceOfficialDocs         SourceType = "official_docs"
+    SourceArxivPreprint        SourceType = "arxiv_preprint"
+    SourceStackOverflowAccepted SourceType = "stackoverflow_accepted"
+    SourceStackOverflow        SourceType = "stackoverflow"
+    SourceBlogEstablished      SourceType = "blog_established"
+    SourceBlogGeneral          SourceType = "blog_general"
+    SourceForumPost            SourceType = "forum_post"
+)
+
+// DefaultAcademicSourcePrior returns empirically-tuned defaults
+func DefaultAcademicSourcePrior() *AcademicSourcePrior {
+    return &AcademicSourcePrior{
+        SourceAuthority: map[SourceType]float64{
+            SourceArxivPeerReviewed:     0.85,  // Peer-reviewed research
+            SourceOfficialDocs:          0.80,  // Official documentation
+            SourceArxivPreprint:         0.70,  // Preprints (not yet reviewed)
+            SourceStackOverflowAccepted: 0.65,  // Community-validated answers
+            SourceStackOverflow:         0.50,  // General SO answers
+            SourceBlogEstablished:       0.50,  // Known quality blogs
+            SourceBlogGeneral:           0.40,  // General blog posts
+            SourceForumPost:             0.35,  // Forum discussions
+        },
+        // 5-year half-life: foundational papers (ACT-R 1990) remain valuable
+        PublicationHalfLife: 5 * 365 * 24 * time.Hour,
+        AuthorityWeight:     0.45,
+        RecencyWeight:       0.20,
+        SemanticWeight:      0.35,
+    }
+}
+
+// ComputeColdScore calculates score for source with no retrieval history
+func (p *AcademicSourcePrior) ComputeColdScore(
+    source *ResearchSource,
+    queryEmbedding []float32,
+) float64 {
+    // 1. Source authority (stable, no cold start needed)
+    authority := p.SourceAuthority[source.SourceType]
+    if authority == 0 {
+        authority = 0.30 // Unknown source type default
+    }
+
+    // 2. Publication recency (gentle exponential - appropriate for data staleness)
+    // Unlike memory, old research CAN become stale (outdated techniques)
+    // But half-life is long because foundational work remains valuable
+    age := time.Since(source.PublishedAt)
+    recency := math.Exp(-age.Hours() / p.PublicationHalfLife.Hours())
+
+    // 3. Semantic similarity (always available)
+    semantic := cosineSimilarity(source.Embedding, queryEmbedding)
+
+    return p.AuthorityWeight*authority +
+           p.RecencyWeight*recency +
+           p.SemanticWeight*semantic
+}
+```
+
+#### Academic Retriever (Cold + Warm Blending)
+
+```go
+// core/knowledge/coldstart/academic_retriever.go
+
+// AcademicRetriever combines cold-start priors with ACT-R memory
+type AcademicRetriever struct {
+    coldPrior    *AcademicSourcePrior
+    memoryStore  *MemoryStore           // ACT-R traces for research sources
+    factRegistry *FactRegistry          // Cross-agent awareness
+
+    // Transition thresholds
+    minTracesForWarm int  // 3 - start blending after 3 retrievals
+    fullWarmTraces   int  // 15 - full ACT-R after 15 retrievals
+}
+
+// NewAcademicRetriever creates retriever with both layers
+func NewAcademicRetriever(
+    memoryStore *MemoryStore,
+    factRegistry *FactRegistry,
+) *AcademicRetriever {
+    return &AcademicRetriever{
+        coldPrior:        DefaultAcademicSourcePrior(),
+        memoryStore:      memoryStore,
+        factRegistry:     factRegistry,
+        minTracesForWarm: 3,
+        fullWarmTraces:   15,
+    }
+}
+
+// Search retrieves and ranks research sources
+func (r *AcademicRetriever) Search(
+    ctx context.Context,
+    query string,
+    queryEmbedding []float32,
+    now time.Time,
+) ([]*RankedResearchSource, error) {
+
+    // Layer 1: Read project facts for context (no cold start)
+    projectContext := r.gatherProjectContext()
+
+    // Layer 2: Retrieve from own domain (research index)
+    sources, err := r.searchResearchIndex(ctx, queryEmbedding)
+    if err != nil {
+        return nil, err
+    }
+
+    // Score each source using cold/warm blending
+    ranked := make([]*RankedResearchSource, 0, len(sources))
+    for _, source := range sources {
+        score := r.scoreSource(ctx, source, queryEmbedding, now)
+        explanation := r.explainRelevance(source, projectContext)
+
+        ranked = append(ranked, &RankedResearchSource{
+            Source:      source,
+            Score:       score,
+            Explanation: explanation,
+        })
+    }
+
+    // Sort by score descending
+    sort.Slice(ranked, func(i, j int) bool {
+        return ranked[i].Score > ranked[j].Score
+    })
+
+    return ranked, nil
+}
+
+// scoreSource blends cold prior with ACT-R based on retrieval history
+func (r *AcademicRetriever) scoreSource(
+    ctx context.Context,
+    source *ResearchSource,
+    queryEmbedding []float32,
+    now time.Time,
+) float64 {
+    // Get ACT-R memory for this source
+    memory, _ := r.memoryStore.GetMemory(ctx, source.ID, DomainResearch)
+
+    traceCount := 0
+    if memory != nil {
+        traceCount = len(memory.Traces)
+    }
+
+    // Pure cold start
+    if traceCount < r.minTracesForWarm {
+        return r.coldPrior.ComputeColdScore(source, queryEmbedding)
+    }
+
+    // Compute ACT-R activation
+    activation := memory.Activation(now)
+    warmScore := 1.0 / (1.0 + math.Exp(-activation)) // Softmax to 0-1
+
+    // Full warm (ACT-R dominates)
+    if traceCount >= r.fullWarmTraces {
+        return warmScore
+    }
+
+    // Transitioning: linear blend
+    confidence := float64(traceCount-r.minTracesForWarm) /
+                  float64(r.fullWarmTraces-r.minTracesForWarm)
+
+    coldScore := r.coldPrior.ComputeColdScore(source, queryEmbedding)
+
+    return confidence*warmScore + (1-confidence)*coldScore
+}
+
+// gatherProjectContext reads facts from other agents (Layer 1)
+func (r *AcademicRetriever) gatherProjectContext() *ProjectContext {
+    return &ProjectContext{
+        // Read CODEBASE facts (from Librarian)
+        Languages:    r.getFactValue(FactTypeCodebase, "primary_language"),
+        Frameworks:   r.getFactValues(FactTypeCodebase, "framework"),
+        Technologies: r.getFactValues(FactTypeCodebase, "technology"),
+
+        // Read HISTORY facts (from Archivalist)
+        Decisions:    r.getFactValues(FactTypeHistory, "decision"),
+        Failures:     r.getFactValues(FactTypeHistory, "failure"),
+
+        // Read TASK facts (from Architect)
+        CurrentGoal:  r.getFactValue(FactTypeTask, "current_goal"),
+    }
+}
+
+// explainRelevance uses project context to explain why source is relevant
+func (r *AcademicRetriever) explainRelevance(
+    source *ResearchSource,
+    ctx *ProjectContext,
+) string {
+    var reasons []string
+
+    // Check technology match
+    for _, tech := range ctx.Technologies {
+        if source.MentionsTechnology(tech) {
+            reasons = append(reasons,
+                fmt.Sprintf("Directly applicable: covers %s which this project uses", tech))
+        }
+    }
+
+    // Check if addresses a known decision
+    for _, decision := range ctx.Decisions {
+        if source.RelatesTo(decision) {
+            reasons = append(reasons,
+                fmt.Sprintf("Context: relates to prior decision '%s'", decision))
+        }
+    }
+
+    // Check current goal alignment
+    if ctx.CurrentGoal != "" && source.RelatesTo(ctx.CurrentGoal) {
+        reasons = append(reasons,
+            fmt.Sprintf("Goal-aligned: relates to current goal '%s'", ctx.CurrentGoal))
+    }
+
+    if len(reasons) == 0 {
+        return "General relevance based on query similarity"
+    }
+
+    return strings.Join(reasons, "; ")
+}
+
+// RecordRetrieval records that a source was retrieved (for ACT-R)
+func (r *AcademicRetriever) RecordRetrieval(
+    ctx context.Context,
+    sourceID string,
+    wasUseful bool,
+) error {
+    return r.memoryStore.RecordAccess(ctx, sourceID, DomainResearch, wasUseful)
+}
+```
+
+### Acceptance Criteria - Cold-Start Retrieval
+
+**ACCEPTANCE CRITERIA - Cold-Start Retrieval (Cold RAG):**
+- [ ] NodeColdStartSignals computed during CV.2 StartupIndexer
+- [ ] PageRank computed for all nodes after indexing
+- [ ] Clustering coefficient computed for graph topology
+- [ ] CodebaseProfile persisted to SQLite
+- [ ] ColdPriorCalculator produces valid 0-1 scores
+- [ ] PriorBlender transitions smoothly from cold → warm
+- [ ] Librarian uses structural priors on new codebase
+- [ ] Academic uses embedding + source authority (no codebase signals)
+- [ ] Archivalist uses action-type priors (no codebase signals)
+- [ ] Cold prior explains its reasoning (ExplainBlend)
+- [ ] Structural metrics update on incremental re-index
 
 ---
 
