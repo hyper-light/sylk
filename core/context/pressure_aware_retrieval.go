@@ -41,11 +41,8 @@ type PressureAwareRetrievalConfig struct {
 	// Prefetcher is the speculative prefetcher to manage
 	Prefetcher *SpeculativePrefetcher
 
-	// PressureController is the system pressure controller to register with
-	PressureController *resources.PressureController
-
-	// InitialCacheSize is the initial max size for the hot cache (in entries)
-	InitialCacheSize int
+	// InitialCacheSize is the initial max size for the hot cache (in bytes)
+	InitialCacheSize int64
 }
 
 // =============================================================================
@@ -54,32 +51,39 @@ type PressureAwareRetrievalConfig struct {
 
 // PressureAwareRetrieval coordinates adaptive retrieval components in response
 // to memory pressure. It implements graceful degradation as pressure increases.
+//
+// NOTE: The HotCache should also be registered with PressureController's config
+// (via PressureControllerConfig.Caches) to enable automatic eviction during
+// pressure events. This component handles coordinated response across all
+// retrieval components.
 type PressureAwareRetrieval struct {
 	hotCache   *HotCache
 	searcher   *TieredSearcher
 	prefetcher *SpeculativePrefetcher
 
-	initialCacheSize int
+	initialCacheSize int64
 	currentLevel     atomic.Int32
 
 	mu sync.RWMutex
 }
 
 // NewPressureAwareRetrieval creates a new pressure-aware retrieval coordinator.
+// The returned instance implements resources.GoroutineBudgetIntegration and can
+// be passed to PressureController for automatic pressure notifications.
 func NewPressureAwareRetrieval(config PressureAwareRetrievalConfig) *PressureAwareRetrieval {
+	initialSize := config.InitialCacheSize
+	if initialSize <= 0 && config.HotCache != nil {
+		initialSize = config.HotCache.MaxSize()
+	}
+
 	par := &PressureAwareRetrieval{
 		hotCache:         config.HotCache,
 		searcher:         config.Searcher,
 		prefetcher:       config.Prefetcher,
-		initialCacheSize: config.InitialCacheSize,
+		initialCacheSize: initialSize,
 	}
 
 	par.currentLevel.Store(int32(resources.PressureNormal))
-
-	// Register hot cache with pressure controller if both available
-	if config.PressureController != nil && config.HotCache != nil {
-		config.PressureController.RegisterCache(config.HotCache)
-	}
 
 	return par
 }
@@ -179,7 +183,7 @@ func (par *PressureAwareRetrieval) setSearcherMaxTier(tier SearchTier) {
 
 func (par *PressureAwareRetrieval) setCacheSize(factor float64) {
 	if par.hotCache != nil && par.initialCacheSize > 0 {
-		newSize := int(float64(par.initialCacheSize) * factor)
+		newSize := int64(float64(par.initialCacheSize) * factor)
 		if newSize < 1 {
 			newSize = 1
 		}
@@ -224,8 +228,8 @@ func (par *PressureAwareRetrieval) CurrentMaxTier() SearchTier {
 	return par.searcher.MaxTier()
 }
 
-// CurrentCacheSize returns the current cache max size.
-func (par *PressureAwareRetrieval) CurrentCacheSize() int {
+// CurrentCacheSize returns the current cache max size in bytes.
+func (par *PressureAwareRetrieval) CurrentCacheSize() int64 {
 	if par.hotCache == nil {
 		return 0
 	}
@@ -241,8 +245,8 @@ type PressureRetrievalStats struct {
 	CurrentLevel     resources.PressureLevel
 	PrefetchEnabled  bool
 	MaxSearchTier    SearchTier
-	CacheMaxSize     int
-	CacheCurrentSize int
+	CacheMaxSize     int64
+	CacheCurrentSize int64
 }
 
 // Stats returns current statistics.
