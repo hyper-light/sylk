@@ -324,11 +324,12 @@ func TestCalculateConfidence_KeywordBonus(t *testing.T) {
 		Keywords: []string{"important", "relevant"},
 	}
 
-	confNoKw := qa.calculateConfidence(noKeywords, 0, 10)
-	confWithKw := qa.calculateConfidence(withKeywords, 0, 10)
+	// Use position 5 so base confidence isn't already at max (would be clamped)
+	confNoKw := qa.calculateConfidence(noKeywords, 5, 10)
+	confWithKw := qa.calculateConfidence(withKeywords, 5, 10)
 
 	if confWithKw <= confNoKw {
-		t.Errorf("Entry with keywords (%f) should have >= confidence than without (%f)", confWithKw, confNoKw)
+		t.Errorf("Entry with keywords (%f) should have > confidence than without (%f)", confWithKw, confNoKw)
 	}
 }
 
