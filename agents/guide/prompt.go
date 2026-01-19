@@ -33,15 +33,24 @@ Agents register with capabilities and constraints. Route based on these:
 - **Domains**: system, agents
 - **Use for**: System status, agent registry, help with routing
 
+### Librarian (ID: librarian, aliases: lib)
+- **Capabilities**: find, search, locate intents
+- **Domains**: code
+- **Constraint**: NONE - handles any temporal focus for search queries
+- **Use for**: Code search, file location, symbol lookup, semantic search
+
 ## INTENT CLASSIFICATION
 
 | Intent | Purpose | Trigger Words |
 |--------|---------|---------------|
-| recall | Retrieve existing data | get, find, search, query, what, which, retrieve, look up |
+| recall | Retrieve existing data | get, query, what, which, retrieve, look up |
 | store | Record new data | save, log, record, store, remember, note, add |
 | check | Verify against data | check, verify, confirm, validate, test, have we |
 | declare | Announce an intention | declare, announce, starting, working on, beginning |
 | complete | Mark as done | complete, done, finished, completed, mark |
+| find | Find code or files | find, search, locate, where is |
+| search | Search codebase | search, grep, look for |
+| locate | Locate specific items | locate, where, which file |
 | help | Request assistance | help, how, explain, what is, guide |
 | status | Query current state | status, state, stats, health, current |
 
@@ -55,6 +64,7 @@ Agents register with capabilities and constraints. Route based on these:
 | files | File states | file, path, directory, modified, changed |
 | learnings | Lessons, insights | learned, lesson, insight, realized |
 | intents | Work intentions | intent, working on, task, goal |
+| code | Code search | code, function, class, method, symbol, definition, implementation |
 | system | System state | system, health, status |
 | agents | Agent registry | agent, agents, registered |
 
@@ -99,7 +109,7 @@ Return a JSON object with:
 - is_retrospective: boolean (CRITICAL for Archivalist routing)
 - intent: string
 - domain: string
-- target_agent: "archivalist" | "guide" | "unknown"
+- target_agent: "archivalist" | "guide" | "librarian" | "unknown"
 - entities: extracted parameters
 - confidence: 0.0-1.0
 - multi_intent: boolean
@@ -171,6 +181,19 @@ AgentRegistration {
         TemporalFocus: "past"
     }
 }
+
+AgentRegistration {
+    ID:           "librarian"
+    Name:         "librarian"
+    Aliases:      ["lib"]
+    Capabilities: {
+        Intents: [find, search, locate]
+        Domains: [code]
+    }
+    Constraints: {
+        // No temporal constraints - search works for any time focus
+    }
+}
 ` + "```" + `
 
 ### Matching Algorithm
@@ -228,6 +251,9 @@ For natural language requests, classify:
 | check | Verify against existing data |
 | declare | Announce an intention |
 | complete | Mark something as done |
+| find | Find code or files |
+| search | Search codebase |
+| locate | Locate specific items |
 | help | Request assistance |
 | status | Query current state |
 
@@ -241,6 +267,7 @@ For natural language requests, classify:
 | files | File states, modifications |
 | learnings | Lessons, insights |
 | intents | Work intentions |
+| code | Code search, symbols |
 | system | System state |
 | agents | Agent registry |
 
@@ -249,8 +276,9 @@ For natural language requests, classify:
 | Focus | Route To |
 |-------|----------|
 | Past (retrospective) | Archivalist (if domain matches) |
-| Present | Guide for status, otherwise depends |
+| Present | Guide for status, Librarian for code search |
 | Future (prospective) | NOT Archivalist - reject or route elsewhere |
+| Any (search) | Librarian for code/file search queries |
 
 ### Confidence Thresholds
 
@@ -439,6 +467,7 @@ Explicit agent, intent, and domain specification.
 |-------|------|
 | arch | archivalist |
 | g | guide |
+| lib | librarian |
 
 ### Intent Shortcuts
 | Short | Full |
@@ -447,6 +476,8 @@ Explicit agent, intent, and domain specification.
 | s | store |
 | c | check |
 | d | declare |
+| f | find |
+| l | locate |
 | ? | help |
 | ! | status |
 

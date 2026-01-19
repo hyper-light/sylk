@@ -96,6 +96,11 @@ const (
 	IntentDeclare  Intent = "declare"  // Announce intent to work on something
 	IntentComplete Intent = "complete" // Mark work as completed
 
+	// Search intents (handled by Librarian)
+	IntentFind   Intent = "find"   // Find code, files, or symbols
+	IntentSearch Intent = "search" // Search codebase
+	IntentLocate Intent = "locate" // Locate specific items
+
 	// Meta intents
 	IntentHelp    Intent = "help"    // Request help/guidance
 	IntentStatus  Intent = "status"  // Check system status
@@ -110,6 +115,9 @@ func AllIntents() []Intent {
 		IntentStore,
 		IntentDeclare,
 		IntentComplete,
+		IntentFind,
+		IntentSearch,
+		IntentLocate,
 		IntentHelp,
 		IntentStatus,
 	}
@@ -128,6 +136,11 @@ func (i Intent) IsStoreIntent() bool {
 // IsCoordinationIntent returns true if the intent is for coordination
 func (i Intent) IsCoordinationIntent() bool {
 	return i == IntentDeclare || i == IntentComplete
+}
+
+// IsSearchIntent returns true if the intent is for search operations
+func (i Intent) IsSearchIntent() bool {
+	return i == IntentFind || i == IntentSearch || i == IntentLocate
 }
 
 // =============================================================================
@@ -149,6 +162,9 @@ const (
 	DomainIntents Domain = "intents" // Work intentions, declarations
 	DomainAgents  Domain = "agents"  // Agent status, registry
 
+	// Search domains (handled by Librarian)
+	DomainCode Domain = "code" // Code search, symbols, definitions
+
 	// Meta domains
 	DomainSystem  Domain = "system"  // System status, health
 	DomainUnknown Domain = "unknown" // Could not classify
@@ -164,6 +180,7 @@ func AllDomains() []Domain {
 		DomainLearnings,
 		DomainIntents,
 		DomainAgents,
+		DomainCode,
 		DomainSystem,
 	}
 }
@@ -188,6 +205,7 @@ type TargetAgent string
 const (
 	TargetArchivalist TargetAgent = "archivalist" // Historical data, patterns, failures
 	TargetGuide       TargetAgent = "guide"       // Routing, help, status
+	TargetLibrarian   TargetAgent = "librarian"   // Code search, file location, semantic search
 	TargetUnknown     TargetAgent = "unknown"     // Could not determine target
 )
 
@@ -196,6 +214,7 @@ func AllTargetAgents() []TargetAgent {
 	return []TargetAgent{
 		TargetArchivalist,
 		TargetGuide,
+		TargetLibrarian,
 	}
 }
 

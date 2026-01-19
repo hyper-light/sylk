@@ -3621,18 +3621,18 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to modify:** `agents/guide/router.go`, `agents/guide/prompts.go`
 
 **Acceptance Criteria:**
-- [ ] Guide routes search queries to Librarian
-- [ ] Intent detection: "find", "search", "locate", "where is"
-- [ ] Updated Guide prompt
+- [x] Guide routes search queries to Librarian
+- [x] Intent detection: "find", "search", "locate", "where is"
+- [x] Updated Guide prompt
 
 ### DS.11.3 Librarian Search Integration
 
 **Files to modify:** `agents/librarian/skills.go`, create `agents/librarian/search.go`
 
 **Acceptance Criteria:**
-- [ ] Librarian uses SearchSystem for queries
-- [ ] `search_code` skill wraps SearchSystem.Search
-- [ ] Enriches results with codebase knowledge
+- [x] Librarian uses SearchSystem for queries
+- [x] `search_code` skill wraps SearchSystem.Search
+- [x] Enriches results with codebase knowledge
 
 ### DS.11.4 Agent Search Skills
 
@@ -3650,8 +3650,8 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to modify:** `core/session/context.go`
 
 **Acceptance Criteria:**
-- [ ] `SessionContext` includes: RecentSearches, RecentFiles, SearchPreferences
-- [ ] Search results scoped to session
+- [x] `SessionContext` includes: RecentSearches, RecentFiles, SearchPreferences
+- [x] Search results scoped to session
 
 ### DS.12.1 Search CLI Command
 
