@@ -221,7 +221,7 @@ func TestComputeMetrics(t *testing.T) {
 	}
 
 	expectedAvgScore := (0.9 + 0.7 + 0.5) / 3.0
-	if metrics.AverageScore != expectedAvgScore {
+	if diff := metrics.AverageScore - expectedAvgScore; diff > 1e-9 || diff < -1e-9 {
 		t.Errorf("AverageScore = %v, want %v", metrics.AverageScore, expectedAvgScore)
 	}
 }

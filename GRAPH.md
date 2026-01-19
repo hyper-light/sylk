@@ -5251,6 +5251,1093 @@ func (r *AcademicRetriever) RecordRetrieval(
 }
 ```
 
+### Activity Event Stream (System-Wide Event Capture)
+
+The Activity Event Stream captures **all significant events** across the system, enabling the Archivalist to maintain a complete record of what happened, when, and why.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         ACTIVITY EVENT STREAM                                        │
+│                    (System-Wide Event Capture for Archivalist)                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  EVENT FLOW:                                                                        │
+│  ───────────                                                                        │
+│                                                                                     │
+│    ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐                │
+│    │   User   │     │  Agent   │     │   Tool   │     │  Index   │                │
+│    │  Prompt  │     │  Action  │     │   Call   │     │  Event   │                │
+│    └────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘                │
+│         │                │                │                │                        │
+│         └────────────────┴────────────────┴────────────────┘                        │
+│                                    │                                                │
+│                                    ▼                                                │
+│                          ┌─────────────────┐                                        │
+│                          │ ActivityEventBus │                                       │
+│                          │   (Fan-out)      │                                       │
+│                          └────────┬────────┘                                        │
+│                                   │                                                 │
+│                    ┌──────────────┼──────────────┐                                  │
+│                    ▼              ▼              ▼                                  │
+│             ┌───────────┐  ┌───────────┐  ┌───────────┐                            │
+│             │ Archivalist│  │  Metrics  │  │  Audit   │                            │
+│             │ Subscriber │  │ Collector │  │  Logger  │                            │
+│             └───────────┘  └───────────┘  └───────────┘                            │
+│                                                                                     │
+│  PUBLISHERS (Who emits events):                                                     │
+│  ──────────────────────────────                                                     │
+│    • Guide: user_prompt, routing_decision, clarification_request                   │
+│    • All Agents: action_start, action_complete, decision_made, error_encountered   │
+│    • Tool Executor: tool_call, tool_result, tool_timeout                           │
+│    • Librarian: index_start, index_complete, file_indexed, file_removed            │
+│    • VirtualContextManager: eviction_triggered, context_restored                   │
+│    • HandoffManager: handoff_triggered, handoff_complete (existing)                │
+│    • LLM Provider: llm_request, llm_response, token_usage                          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### ActivityEvent Type
+
+```go
+// core/events/activity_types.go
+
+// EventType categorizes system events
+type EventType string
+
+const (
+    // User interaction events
+    EventTypeUserPrompt          EventType = "user_prompt"
+    EventTypeUserClarification   EventType = "user_clarification"
+
+    // Agent events
+    EventTypeAgentAction         EventType = "agent_action"
+    EventTypeAgentDecision       EventType = "agent_decision"
+    EventTypeAgentError          EventType = "agent_error"
+    EventTypeAgentHandoff        EventType = "agent_handoff"
+
+    // Tool events
+    EventTypeToolCall            EventType = "tool_call"
+    EventTypeToolResult          EventType = "tool_result"
+    EventTypeToolTimeout         EventType = "tool_timeout"
+
+    // LLM events
+    EventTypeLLMRequest          EventType = "llm_request"
+    EventTypeLLMResponse         EventType = "llm_response"
+
+    // Index events
+    EventTypeIndexStart          EventType = "index_start"
+    EventTypeIndexComplete       EventType = "index_complete"
+    EventTypeIndexFileAdded      EventType = "index_file_added"
+    EventTypeIndexFileRemoved    EventType = "index_file_removed"
+
+    // Context events
+    EventTypeContextEviction     EventType = "context_eviction"
+    EventTypeContextRestore      EventType = "context_restore"
+
+    // Outcome events
+    EventTypeSuccess             EventType = "success"
+    EventTypeFailure             EventType = "failure"
+)
+
+// ActivityEvent represents any significant system event
+type ActivityEvent struct {
+    ID          string            `json:"id"`
+    EventType   EventType         `json:"event_type"`
+    Timestamp   time.Time         `json:"timestamp"`
+    SessionID   string            `json:"session_id"`
+    AgentID     string            `json:"agent_id,omitempty"`
+
+    // Content
+    Content     string            `json:"content"`              // Main text (prompt, response, description)
+    Summary     string            `json:"summary,omitempty"`    // Short summary for embedding
+
+    // Metadata for structured queries
+    Category    string            `json:"category,omitempty"`   // decision, pattern, failure, etc.
+    FilePaths   []string          `json:"file_paths,omitempty"` // Related files
+    Keywords    []string          `json:"keywords,omitempty"`   // Extracted keywords
+    RelatedIDs  []string          `json:"related_ids,omitempty"`// Links to other events
+
+    // Outcome tracking
+    Outcome     EventOutcome      `json:"outcome"`              // success, failure, pending
+    Importance  float64           `json:"importance"`           // 0-1, for ranking
+
+    // Structured data (type-specific)
+    Data        map[string]any    `json:"data,omitempty"`
+}
+
+type EventOutcome string
+
+const (
+    OutcomeSuccess EventOutcome = "success"
+    OutcomeFailure EventOutcome = "failure"
+    OutcomePending EventOutcome = "pending"
+)
+
+// NewActivityEvent creates a new event with defaults
+func NewActivityEvent(eventType EventType, sessionID, content string) *ActivityEvent {
+    return &ActivityEvent{
+        ID:        generateEventID(),
+        EventType: eventType,
+        Timestamp: time.Now(),
+        SessionID: sessionID,
+        Content:   content,
+        Outcome:   OutcomePending,
+        Importance: defaultImportance(eventType),
+    }
+}
+
+// defaultImportance returns action-type priors for cold-start ranking
+func defaultImportance(eventType EventType) float64 {
+    switch eventType {
+    case EventTypeAgentDecision:
+        return 0.90  // Decisions always relevant
+    case EventTypeFailure, EventTypeAgentError:
+        return 0.85  // Failures are memorable
+    case EventTypeSuccess:
+        return 0.75  // Validates approaches
+    case EventTypeIndexComplete:
+        return 0.70  // Important temporal marker
+    case EventTypeAgentHandoff:
+        return 0.65  // Context continuity
+    case EventTypeToolCall, EventTypeToolResult:
+        return 0.50  // Useful but noisy
+    case EventTypeLLMResponse:
+        return 0.45  // High volume
+    case EventTypeUserPrompt:
+        return 0.40  // Needs synthesis
+    default:
+        return 0.30  // Default low
+    }
+}
+```
+
+#### ActivityEventBus
+
+```go
+// core/events/activity_bus.go
+
+// ActivityEventBus provides pub/sub for system-wide events
+type ActivityEventBus struct {
+    subscribers map[string][]EventSubscriber
+    mu          sync.RWMutex
+    buffer      chan *ActivityEvent
+    done        chan struct{}
+
+    // Debouncing
+    debouncer   *EventDebouncer
+}
+
+// EventSubscriber receives events of interest
+type EventSubscriber interface {
+    ID() string
+    EventTypes() []EventType  // Which events to receive (empty = all)
+    OnEvent(event *ActivityEvent) error
+}
+
+// NewActivityEventBus creates a new event bus
+func NewActivityEventBus(bufferSize int) *ActivityEventBus {
+    bus := &ActivityEventBus{
+        subscribers: make(map[string][]EventSubscriber),
+        buffer:      make(chan *ActivityEvent, bufferSize),
+        done:        make(chan struct{}),
+        debouncer:   NewEventDebouncer(5 * time.Second),
+    }
+    go bus.dispatch()
+    return bus
+}
+
+// Publish sends an event to all interested subscribers
+func (b *ActivityEventBus) Publish(event *ActivityEvent) {
+    // Debounce similar events
+    if b.debouncer.ShouldSkip(event) {
+        return
+    }
+
+    select {
+    case b.buffer <- event:
+    default:
+        // Buffer full, drop event (log warning)
+    }
+}
+
+// Subscribe registers a subscriber for events
+func (b *ActivityEventBus) Subscribe(sub EventSubscriber) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    types := sub.EventTypes()
+    if len(types) == 0 {
+        // Subscribe to all
+        b.subscribers["*"] = append(b.subscribers["*"], sub)
+    } else {
+        for _, t := range types {
+            key := string(t)
+            b.subscribers[key] = append(b.subscribers[key], sub)
+        }
+    }
+}
+
+func (b *ActivityEventBus) dispatch() {
+    for {
+        select {
+        case event := <-b.buffer:
+            b.deliverEvent(event)
+        case <-b.done:
+            return
+        }
+    }
+}
+
+func (b *ActivityEventBus) deliverEvent(event *ActivityEvent) {
+    b.mu.RLock()
+    defer b.mu.RUnlock()
+
+    // Deliver to type-specific subscribers
+    key := string(event.EventType)
+    for _, sub := range b.subscribers[key] {
+        go sub.OnEvent(event)
+    }
+
+    // Deliver to wildcard subscribers
+    for _, sub := range b.subscribers["*"] {
+        go sub.OnEvent(event)
+    }
+}
+
+// EventDebouncer prevents duplicate events within a time window
+type EventDebouncer struct {
+    window    time.Duration
+    seen      map[string]time.Time
+    mu        sync.Mutex
+}
+
+func NewEventDebouncer(window time.Duration) *EventDebouncer {
+    return &EventDebouncer{
+        window: window,
+        seen:   make(map[string]time.Time),
+    }
+}
+
+func (d *EventDebouncer) ShouldSkip(event *ActivityEvent) bool {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+
+    // Create signature for deduplication
+    sig := fmt.Sprintf("%s:%s:%s", event.EventType, event.AgentID, event.SessionID)
+
+    if lastSeen, ok := d.seen[sig]; ok {
+        if time.Since(lastSeen) < d.window {
+            return true  // Skip duplicate
+        }
+    }
+
+    d.seen[sig] = time.Now()
+    return false
+}
+```
+
+### Index Event Stream
+
+The Index Event Stream specifically captures indexing operations, enabling the Archivalist to know **when** knowledge was added to the system and correlate queries with available context.
+
+```go
+// core/events/index_events.go
+
+// IndexEvent captures indexing operations
+type IndexEvent struct {
+    ID            string         `json:"id"`
+    EventType     IndexEventType `json:"event_type"`
+    Timestamp     time.Time      `json:"timestamp"`
+    SessionID     string         `json:"session_id"`
+
+    // Index metadata
+    IndexType     IndexType      `json:"index_type"`      // full, incremental, file_change
+    IndexVersion  int64          `json:"index_version"`
+    PrevVersion   int64          `json:"prev_version,omitempty"`
+
+    // Scope
+    RootPath      string         `json:"root_path"`
+    Duration      time.Duration  `json:"duration"`
+
+    // Statistics
+    FilesIndexed  int            `json:"files_indexed"`
+    FilesRemoved  int            `json:"files_removed"`
+    FilesUpdated  int            `json:"files_updated"`
+    EntitiesFound int            `json:"entities_found"`
+    EdgesCreated  int            `json:"edges_created"`
+
+    // Error tracking
+    Errors        []IndexError   `json:"errors,omitempty"`
+}
+
+type IndexEventType string
+
+const (
+    IndexEventTypeStart      IndexEventType = "start"
+    IndexEventTypeComplete   IndexEventType = "complete"
+    IndexEventTypeFileAdd    IndexEventType = "file_add"
+    IndexEventTypeFileRemove IndexEventType = "file_remove"
+    IndexEventTypeError      IndexEventType = "error"
+)
+
+type IndexType string
+
+const (
+    IndexTypeFull        IndexType = "full"
+    IndexTypeIncremental IndexType = "incremental"
+    IndexTypeFileChange  IndexType = "file_change"
+)
+
+type IndexError struct {
+    FilePath string `json:"file_path"`
+    Error    string `json:"error"`
+}
+
+// IndexEventPublisher publishes index events to the ActivityEventBus
+type IndexEventPublisher struct {
+    bus       *ActivityEventBus
+    sessionID string
+}
+
+func NewIndexEventPublisher(bus *ActivityEventBus, sessionID string) *IndexEventPublisher {
+    return &IndexEventPublisher{bus: bus, sessionID: sessionID}
+}
+
+func (p *IndexEventPublisher) PublishIndexStart(indexType IndexType, rootPath string) {
+    event := &IndexEvent{
+        ID:        generateEventID(),
+        EventType: IndexEventTypeStart,
+        Timestamp: time.Now(),
+        SessionID: p.sessionID,
+        IndexType: indexType,
+        RootPath:  rootPath,
+    }
+
+    p.bus.Publish(&ActivityEvent{
+        ID:        event.ID,
+        EventType: EventTypeIndexStart,
+        Timestamp: event.Timestamp,
+        SessionID: event.SessionID,
+        Content:   fmt.Sprintf("Starting %s index of %s", indexType, rootPath),
+        Importance: 0.60,
+        Data:      map[string]any{"index_event": event},
+    })
+}
+
+func (p *IndexEventPublisher) PublishIndexComplete(event *IndexEvent) {
+    p.bus.Publish(&ActivityEvent{
+        ID:        event.ID,
+        EventType: EventTypeIndexComplete,
+        Timestamp: event.Timestamp,
+        SessionID: event.SessionID,
+        Content: fmt.Sprintf("Completed %s index: %d files, %d entities, %d edges",
+            event.IndexType, event.FilesIndexed, event.EntitiesFound, event.EdgesCreated),
+        Summary:    fmt.Sprintf("Index complete: %d files", event.FilesIndexed),
+        Importance: 0.70,
+        Data:       map[string]any{"index_event": event},
+    })
+}
+```
+
+### Archivalist Dual-Write Ingestion
+
+The Archivalist ingests events into **both** Document DB (Bleve) and Vector DB (HNSW) with different representations optimized for different query types.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         ARCHIVALIST DUAL-WRITE ARCHITECTURE                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────────┐                                                               │
+│  │  ActivityEvent   │                                                               │
+│  │ (from EventBus)  │                                                               │
+│  └────────┬─────────┘                                                               │
+│           │                                                                         │
+│           ▼                                                                         │
+│  ┌──────────────────┐                                                               │
+│  │ Event Classifier │ ──► Determines: write_strategy, importance, category         │
+│  └────────┬─────────┘                                                               │
+│           │                                                                         │
+│           ▼                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                        DUAL-WRITE STRATEGY                                    │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                               │  │
+│  │  Event Type          Document DB (Bleve)    Vector DB (HNSW)    Rationale    │  │
+│  │  ─────────────────────────────────────────────────────────────────────────── │  │
+│  │  user_prompt         ✓ metadata            ✓ full text         Semantic      │  │
+│  │  llm_response        ✓ metadata            ✓ full text         Semantic      │  │
+│  │  agent_decision      ✓ full + keywords     ✓ full text         Both needed   │  │
+│  │  failure             ✓ full + keywords     ✓ full text         Both needed   │  │
+│  │  success             ✓ metadata            ✓ description       Light weight  │  │
+│  │  tool_call           ✓ structured only     ✗ skip              Too noisy     │  │
+│  │  tool_result         ✓ structured only     ✗ skip              Too noisy     │  │
+│  │  index_complete      ✓ structured only     ✗ skip              Structured    │  │
+│  │  agent_handoff       ✓ full + keywords     ✓ summary           Important     │  │
+│  │  context_eviction    ✓ metadata            ✗ skip              Structured    │  │
+│  │                                                                               │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│           │                                                                         │
+│     ┌─────┴─────┐                                                                   │
+│     ▼           ▼                                                                   │
+│  ┌──────────┐ ┌──────────┐                                                         │
+│  │  Bleve   │ │  HNSW    │                                                         │
+│  │ Indexer  │ │ Embedder │                                                         │
+│  └──────────┘ └──────────┘                                                         │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Dual-Write Implementation
+
+```go
+// agents/archivalist/dual_writer.go
+
+// DualWriteStrategy determines how an event is stored
+type DualWriteStrategy struct {
+    WriteBleve     bool
+    WriteVector    bool
+    BleveFields    []string  // Which fields to index in Bleve
+    VectorContent  string    // What to embed (full, summary, keywords)
+    Aggregate      bool      // Aggregate with similar recent events
+}
+
+// EventClassifier determines dual-write strategy per event type
+type EventClassifier struct {
+    strategies map[EventType]*DualWriteStrategy
+}
+
+func NewEventClassifier() *EventClassifier {
+    return &EventClassifier{
+        strategies: map[EventType]*DualWriteStrategy{
+            // High-value events: both stores, full content
+            EventTypeAgentDecision: {
+                WriteBleve:    true,
+                WriteVector:   true,
+                BleveFields:   []string{"content", "keywords", "category", "agent_id"},
+                VectorContent: "full",
+            },
+            EventTypeFailure: {
+                WriteBleve:    true,
+                WriteVector:   true,
+                BleveFields:   []string{"content", "keywords", "category", "file_paths"},
+                VectorContent: "full",
+            },
+            EventTypeAgentError: {
+                WriteBleve:    true,
+                WriteVector:   true,
+                BleveFields:   []string{"content", "keywords", "category"},
+                VectorContent: "full",
+            },
+
+            // User interaction: both stores for semantic search
+            EventTypeUserPrompt: {
+                WriteBleve:    true,
+                WriteVector:   true,
+                BleveFields:   []string{"content", "session_id"},
+                VectorContent: "full",
+            },
+            EventTypeLLMResponse: {
+                WriteBleve:    true,
+                WriteVector:   true,
+                BleveFields:   []string{"summary", "agent_id"},
+                VectorContent: "summary",  // Responses can be long
+            },
+
+            // Handoffs: important for continuity
+            EventTypeAgentHandoff: {
+                WriteBleve:    true,
+                WriteVector:   true,
+                BleveFields:   []string{"content", "agent_id", "keywords"},
+                VectorContent: "summary",
+            },
+
+            // Success: lighter weight
+            EventTypeSuccess: {
+                WriteBleve:    true,
+                WriteVector:   true,
+                BleveFields:   []string{"summary", "category"},
+                VectorContent: "summary",
+            },
+
+            // Tool events: structured only (high volume, low semantic value)
+            EventTypeToolCall: {
+                WriteBleve:    true,
+                WriteVector:   false,
+                BleveFields:   []string{"agent_id", "data"},
+                Aggregate:     true,  // Aggregate multiple tool calls
+            },
+            EventTypeToolResult: {
+                WriteBleve:    true,
+                WriteVector:   false,
+                BleveFields:   []string{"agent_id", "outcome"},
+                Aggregate:     true,
+            },
+
+            // Index events: structured metadata only
+            EventTypeIndexStart: {
+                WriteBleve:    true,
+                WriteVector:   false,
+                BleveFields:   []string{"data"},
+            },
+            EventTypeIndexComplete: {
+                WriteBleve:    true,
+                WriteVector:   false,
+                BleveFields:   []string{"content", "data"},
+            },
+
+            // Context events: metadata only
+            EventTypeContextEviction: {
+                WriteBleve:    true,
+                WriteVector:   false,
+                BleveFields:   []string{"data"},
+            },
+        },
+    }
+}
+
+// DualWriter writes events to both Bleve and VectorDB
+type DualWriter struct {
+    bleveIndex   *BleveEventIndex
+    vectorStore  *VectorEventStore
+    classifier   *EventClassifier
+    aggregator   *EventAggregator
+}
+
+func NewDualWriter(
+    bleveIndex *BleveEventIndex,
+    vectorStore *VectorEventStore,
+) *DualWriter {
+    return &DualWriter{
+        bleveIndex:  bleveIndex,
+        vectorStore: vectorStore,
+        classifier:  NewEventClassifier(),
+        aggregator:  NewEventAggregator(5 * time.Second),
+    }
+}
+
+// Write stores an event according to its dual-write strategy
+func (w *DualWriter) Write(ctx context.Context, event *ActivityEvent) error {
+    strategy := w.classifier.GetStrategy(event.EventType)
+
+    // Handle aggregation for high-volume events
+    if strategy.Aggregate {
+        aggregated := w.aggregator.Add(event)
+        if aggregated == nil {
+            return nil  // Buffered for aggregation
+        }
+        event = aggregated
+    }
+
+    var wg sync.WaitGroup
+    var bleveErr, vectorErr error
+
+    // Write to Bleve (Document DB)
+    if strategy.WriteBleve {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            bleveErr = w.bleveIndex.IndexEvent(ctx, event, strategy.BleveFields)
+        }()
+    }
+
+    // Write to VectorDB
+    if strategy.WriteVector {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            vectorErr = w.vectorStore.EmbedEvent(ctx, event, strategy.VectorContent)
+        }()
+    }
+
+    wg.Wait()
+
+    // Return first error (could enhance to return both)
+    if bleveErr != nil {
+        return bleveErr
+    }
+    return vectorErr
+}
+```
+
+### Archivalist Cold-Start: Two-Layer Model
+
+Like the Academic, the Archivalist uses a two-layer model separating cross-agent awareness from own-domain retrieval.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    ARCHIVALIST COLD-START: TWO-LAYER MODEL                           │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ LAYER 1: CROSS-AGENT AWARENESS                                               │   │
+│  │ (Project Fact Registry - No Cold Start)                                      │   │
+│  │                                                                               │   │
+│  │ Archivalist READS (from other agents):                                       │   │
+│  │   • CODEBASE facts: "This is a Go project using Redis, gin"                 │   │
+│  │   • RESEARCH facts: "We chose ACT-R over exponential decay"                 │   │
+│  │   • TASK facts: "Currently implementing knowledge graph"                     │   │
+│  │                                                                               │   │
+│  │ Archivalist WRITES (its domain - HISTORY facts):                             │   │
+│  │   • decision.memory_model = "chose_ACT-R_over_exponential"                  │   │
+│  │   • failure.attempted = "hardcoded_weights_rejected"                        │   │
+│  │   • implementation.status = "cold_start_complete"                           │   │
+│  │                                                                               │   │
+│  │ Purpose: CONTEXTUAL GROUNDING for answering queries                          │   │
+│  │ Cold Start: NONE - facts are either known or not known                       │   │
+│  │                                                                               │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                                │
+│                                    ▼                                                │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ LAYER 2: OWN DOMAIN RETRIEVAL                                                │   │
+│  │ (Activity History - Has Cold Start)                                          │   │
+│  │                                                                               │   │
+│  │ ═══════════════════════════════════════════════════════════════════════════ │   │
+│  │ SCENARIO A: Cold (New Project, First Session)                                │   │
+│  │ ═══════════════════════════════════════════════════════════════════════════ │   │
+│  │                                                                               │   │
+│  │   Score = w₁×ActionTypePrior + w₂×SessionRecency + w₃×SemanticSimilarity    │   │
+│  │                                                                               │   │
+│  │   ActionTypePrior (Inherent event importance):                               │   │
+│  │     • decision=0.90, failure=0.85, success=0.75, file_change=0.70           │   │
+│  │     • handoff=0.65, index=0.60, tool_call=0.50, response=0.45               │   │
+│  │     • prompt=0.40, file_read=0.20                                           │   │
+│  │                                                                               │   │
+│  │   SessionRecency (Within-session position):                                  │   │
+│  │     Recency = 1 / (1 + turns_since_event/10)                                │   │
+│  │     • Recent events rank higher for "what did we just do?"                  │   │
+│  │                                                                               │   │
+│  │   Component Weights (Cold): Action=0.40, Recency=0.25, Semantic=0.35        │   │
+│  │                                                                               │   │
+│  │ ═══════════════════════════════════════════════════════════════════════════ │   │
+│  │ SCENARIO B: Warm (Session Has Accumulated Events)                            │   │
+│  │ ═══════════════════════════════════════════════════════════════════════════ │   │
+│  │                                                                               │   │
+│  │   Score = ACT-R_activation(event) × SemanticSimilarity                      │   │
+│  │                                                                               │   │
+│  │   ACT-R: B = ln(Σtⱼ^(-d)) + β                                               │   │
+│  │     • d = 0.4 (slower decay - history stays useful longer)                  │   │
+│  │     • β = learned base offset per event type                                │   │
+│  │     • "Events we've found useful before rank higher"                        │   │
+│  │                                                                               │   │
+│  │   Transition: minTracesForWarm=3, fullWarmTraces=15                         │   │
+│  │                                                                               │   │
+│  │ ═══════════════════════════════════════════════════════════════════════════ │   │
+│  │ SCENARIO C: Cross-Session Bootstrap (Returning Project)                      │   │
+│  │ ═══════════════════════════════════════════════════════════════════════════ │   │
+│  │                                                                               │   │
+│  │   If prior sessions exist:                                                   │   │
+│  │     1. Load session summaries (compressed historical knowledge)              │   │
+│  │     2. Inherit ACT-R traces with cross-session decay                        │   │
+│  │        Cross-session decay: activation × e^(-days_away/7)                   │   │
+│  │     3. Index events tell us "when was this project last indexed?"           │   │
+│  │                                                                               │   │
+│  │   Query: "What did we do last time?"                                        │   │
+│  │     → Retrieves prior session summaries + high-activation events            │   │
+│  │                                                                               │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Archivalist Cold-Start Implementation
+
+```go
+// core/knowledge/coldstart/archivalist_prior.go
+
+// ActionTypePrior provides cold-start priors based on event type importance
+type ActionTypePrior struct {
+    // Event type importance (stable, not learned)
+    TypeImportance map[EventType]float64
+
+    // Component weights for cold scoring
+    ActionWeight   float64  // 0.40
+    RecencyWeight  float64  // 0.25
+    SemanticWeight float64  // 0.35
+}
+
+// DefaultActionTypePrior returns empirically-tuned defaults
+func DefaultActionTypePrior() *ActionTypePrior {
+    return &ActionTypePrior{
+        TypeImportance: map[EventType]float64{
+            EventTypeAgentDecision:  0.90,  // Decisions always relevant
+            EventTypeFailure:        0.85,  // Failures are memorable
+            EventTypeAgentError:     0.85,  // Errors need tracking
+            EventTypeSuccess:        0.75,  // Validates approaches
+            EventTypeIndexComplete:  0.70,  // Important temporal marker
+            EventTypeAgentHandoff:   0.65,  // Context continuity
+            EventTypeIndexStart:     0.60,  // Temporal context
+            EventTypeToolCall:       0.50,  // Useful but noisy
+            EventTypeLLMResponse:    0.45,  // High volume
+            EventTypeUserPrompt:     0.40,  // Needs synthesis
+            EventTypeToolResult:     0.35,  // Usually tool_call is enough
+            EventTypeContextEviction: 0.30, // Rare query target
+        },
+        ActionWeight:   0.40,
+        RecencyWeight:  0.25,
+        SemanticWeight: 0.35,
+    }
+}
+
+// ComputeColdScore calculates score for event with no retrieval history
+func (p *ActionTypePrior) ComputeColdScore(
+    event *ActivityEvent,
+    queryEmbedding []float32,
+    eventEmbedding []float32,
+    currentTurn int,
+    eventTurn int,
+) float64 {
+    // 1. Action type importance (stable prior)
+    actionScore := p.TypeImportance[event.EventType]
+    if actionScore == 0 {
+        actionScore = 0.30  // Default for unknown types
+    }
+
+    // 2. Session recency (within-session position)
+    turnsSince := float64(currentTurn - eventTurn)
+    recencyScore := 1.0 / (1.0 + turnsSince/10.0)
+
+    // 3. Semantic similarity (always available)
+    semanticScore := cosineSimilarity(queryEmbedding, eventEmbedding)
+
+    return p.ActionWeight*actionScore +
+           p.RecencyWeight*recencyScore +
+           p.SemanticWeight*semanticScore
+}
+```
+
+#### Archivalist Retriever (Two-Layer)
+
+```go
+// core/knowledge/coldstart/archivalist_retriever.go
+
+// ArchivalistRetriever combines cold-start priors with ACT-R memory
+type ArchivalistRetriever struct {
+    coldPrior    *ActionTypePrior
+    memoryStore  *MemoryStore
+    factRegistry *FactRegistry
+    dualWriter   *DualWriter
+    bleveIndex   *BleveEventIndex
+    vectorStore  *VectorEventStore
+
+    // Transition thresholds
+    minTracesForWarm int  // 3 - start blending after 3 retrievals
+    fullWarmTraces   int  // 15 - full ACT-R after 15 retrievals
+
+    // Cross-session settings
+    crossSessionDecayDays float64  // 7 - half-life for cross-session decay
+}
+
+// NewArchivalistRetriever creates retriever with both layers
+func NewArchivalistRetriever(
+    memoryStore *MemoryStore,
+    factRegistry *FactRegistry,
+    dualWriter *DualWriter,
+    bleveIndex *BleveEventIndex,
+    vectorStore *VectorEventStore,
+) *ArchivalistRetriever {
+    return &ArchivalistRetriever{
+        coldPrior:             DefaultActionTypePrior(),
+        memoryStore:           memoryStore,
+        factRegistry:          factRegistry,
+        dualWriter:            dualWriter,
+        bleveIndex:            bleveIndex,
+        vectorStore:           vectorStore,
+        minTracesForWarm:      3,
+        fullWarmTraces:        15,
+        crossSessionDecayDays: 7.0,
+    }
+}
+
+// Search retrieves and ranks historical events
+func (r *ArchivalistRetriever) Search(
+    ctx context.Context,
+    query string,
+    queryEmbedding []float32,
+    opts *ArchivalistSearchOptions,
+) ([]*RankedActivityEvent, error) {
+
+    // Layer 1: Gather project context (no cold start)
+    projectContext := r.gatherProjectContext()
+
+    // Layer 2: Retrieve from both stores
+    // Parallel search: Bleve (structured) + VectorDB (semantic)
+    var wg sync.WaitGroup
+    var bleveResults []*ActivityEvent
+    var vectorResults []*ActivityEvent
+
+    wg.Add(2)
+    go func() {
+        defer wg.Done()
+        bleveResults, _ = r.bleveIndex.Search(ctx, query, opts)
+    }()
+    go func() {
+        defer wg.Done()
+        vectorResults, _ = r.vectorStore.Search(ctx, queryEmbedding, opts)
+    }()
+    wg.Wait()
+
+    // Merge and deduplicate
+    events := r.mergeResults(bleveResults, vectorResults)
+
+    // Score each event using cold/warm blending
+    ranked := make([]*RankedActivityEvent, 0, len(events))
+    for _, event := range events {
+        score := r.scoreEvent(ctx, event, queryEmbedding, opts.CurrentTurn, opts.Now)
+        explanation := r.explainRelevance(event, projectContext, query)
+
+        ranked = append(ranked, &RankedActivityEvent{
+            Event:       event,
+            Score:       score,
+            Explanation: explanation,
+        })
+    }
+
+    // Sort by score descending
+    sort.Slice(ranked, func(i, j int) bool {
+        return ranked[i].Score > ranked[j].Score
+    })
+
+    return ranked, nil
+}
+
+// scoreEvent blends cold prior with ACT-R based on retrieval history
+func (r *ArchivalistRetriever) scoreEvent(
+    ctx context.Context,
+    event *ActivityEvent,
+    queryEmbedding []float32,
+    currentTurn int,
+    now time.Time,
+) float64 {
+    // Get ACT-R memory for this event
+    memory, _ := r.memoryStore.GetMemory(ctx, event.ID, DomainHistory)
+
+    traceCount := 0
+    if memory != nil {
+        traceCount = len(memory.Traces)
+    }
+
+    // Get event embedding for semantic scoring
+    eventEmbedding := r.vectorStore.GetEmbedding(event.ID)
+    eventTurn := r.getTurnForEvent(event)
+
+    // Pure cold start
+    if traceCount < r.minTracesForWarm {
+        return r.coldPrior.ComputeColdScore(event, queryEmbedding, eventEmbedding, currentTurn, eventTurn)
+    }
+
+    // Compute ACT-R activation
+    activation := memory.Activation(now)
+    warmScore := 1.0 / (1.0 + math.Exp(-activation))  // Softmax to 0-1
+
+    // Add semantic similarity
+    semantic := cosineSimilarity(queryEmbedding, eventEmbedding)
+    warmScore = 0.7*warmScore + 0.3*semantic
+
+    // Full warm (ACT-R dominates)
+    if traceCount >= r.fullWarmTraces {
+        return warmScore
+    }
+
+    // Transitioning: linear blend
+    confidence := float64(traceCount-r.minTracesForWarm) /
+                  float64(r.fullWarmTraces-r.minTracesForWarm)
+
+    coldScore := r.coldPrior.ComputeColdScore(event, queryEmbedding, eventEmbedding, currentTurn, eventTurn)
+
+    return confidence*warmScore + (1-confidence)*coldScore
+}
+
+// LoadCrossSessionState loads prior session state with decay
+func (r *ArchivalistRetriever) LoadCrossSessionState(
+    ctx context.Context,
+    projectID string,
+    daysSinceLastSession float64,
+) error {
+    // Load prior session summaries
+    summaries, err := r.loadSessionSummaries(ctx, projectID)
+    if err != nil {
+        return err
+    }
+
+    // Apply cross-session decay to ACT-R traces
+    decayFactor := math.Exp(-daysSinceLastSession / r.crossSessionDecayDays)
+
+    for _, summary := range summaries {
+        // Inherit important events with decayed activation
+        for _, eventID := range summary.HighValueEventIDs {
+            memory, _ := r.memoryStore.GetMemory(ctx, eventID, DomainHistory)
+            if memory != nil {
+                // Apply decay to all trace times (makes them appear older)
+                memory.ApplyCrossSessionDecay(decayFactor)
+                r.memoryStore.SaveMemory(ctx, memory)
+            }
+        }
+    }
+
+    return nil
+}
+
+// gatherProjectContext reads facts from other agents (Layer 1)
+func (r *ArchivalistRetriever) gatherProjectContext() *ProjectContext {
+    return &ProjectContext{
+        // Read CODEBASE facts (from Librarian)
+        Languages:    r.factRegistry.GetFactValue(FactTypeCodebase, "primary_language"),
+        Frameworks:   r.factRegistry.GetFactValues(FactTypeCodebase, "framework"),
+        Technologies: r.factRegistry.GetFactValues(FactTypeCodebase, "technology"),
+
+        // Read RESEARCH facts (from Academic)
+        ApproachesChosen:   r.factRegistry.GetFactValues(FactTypeResearch, "approach"),
+        ApproachesRejected: r.factRegistry.GetFactValues(FactTypeResearch, "rejected_approach"),
+
+        // Read TASK facts (from Architect)
+        CurrentGoal: r.factRegistry.GetFactValue(FactTypeTask, "current_goal"),
+    }
+}
+
+// explainRelevance uses project context to explain why event is relevant
+func (r *ArchivalistRetriever) explainRelevance(
+    event *ActivityEvent,
+    ctx *ProjectContext,
+    query string,
+) string {
+    var reasons []string
+
+    // Check event type relevance
+    switch event.EventType {
+    case EventTypeAgentDecision:
+        reasons = append(reasons, "This was a decision point")
+    case EventTypeFailure, EventTypeAgentError:
+        reasons = append(reasons, "This was a failure that may inform current work")
+    case EventTypeSuccess:
+        reasons = append(reasons, "This approach succeeded previously")
+    }
+
+    // Check technology match
+    for _, tech := range ctx.Technologies {
+        if containsIgnoreCase(event.Content, tech) {
+            reasons = append(reasons,
+                fmt.Sprintf("Relates to %s which this project uses", tech))
+        }
+    }
+
+    // Check if addresses a known decision
+    for _, approach := range ctx.ApproachesChosen {
+        if containsIgnoreCase(event.Content, approach) {
+            reasons = append(reasons,
+                fmt.Sprintf("Relates to chosen approach '%s'", approach))
+        }
+    }
+
+    if len(reasons) == 0 {
+        return "General relevance based on query similarity"
+    }
+
+    return strings.Join(reasons, "; ")
+}
+
+// RecordRetrieval records that an event was retrieved (for ACT-R learning)
+func (r *ArchivalistRetriever) RecordRetrieval(
+    ctx context.Context,
+    eventID string,
+    wasUseful bool,
+) error {
+    return r.memoryStore.RecordAccess(ctx, eventID, DomainHistory, wasUseful)
+}
+```
+
+#### Schema Extension for Archivalist Events
+
+```sql
+-- Migration: 013_archivalist_events.go
+
+-- Activity events table (Document DB backing store)
+CREATE TABLE IF NOT EXISTS activity_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    agent_id TEXT,
+
+    content TEXT NOT NULL,
+    summary TEXT,
+    category TEXT,
+
+    file_paths_json TEXT DEFAULT '[]',
+    keywords_json TEXT DEFAULT '[]',
+    related_ids_json TEXT DEFAULT '[]',
+
+    outcome TEXT DEFAULT 'pending',
+    importance REAL DEFAULT 0.5,
+
+    data_json TEXT DEFAULT '{}',
+
+    -- For efficient queries
+    turn_number INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_events_session ON activity_events(session_id, timestamp DESC);
+CREATE INDEX idx_events_type ON activity_events(event_type, timestamp DESC);
+CREATE INDEX idx_events_agent ON activity_events(agent_id, timestamp DESC);
+CREATE INDEX idx_events_category ON activity_events(category, timestamp DESC);
+CREATE INDEX idx_events_outcome ON activity_events(outcome);
+
+-- Index events table
+CREATE TABLE IF NOT EXISTS index_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+
+    index_type TEXT NOT NULL,
+    index_version INTEGER NOT NULL,
+    prev_version INTEGER,
+
+    root_path TEXT NOT NULL,
+    duration_ms INTEGER,
+
+    files_indexed INTEGER DEFAULT 0,
+    files_removed INTEGER DEFAULT 0,
+    files_updated INTEGER DEFAULT 0,
+    entities_found INTEGER DEFAULT 0,
+    edges_created INTEGER DEFAULT 0,
+
+    errors_json TEXT DEFAULT '[]',
+
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_index_events_session ON index_events(session_id, timestamp DESC);
+CREATE INDEX idx_index_events_version ON index_events(index_version DESC);
+
+-- Session summaries for cross-session bootstrap
+CREATE TABLE IF NOT EXISTS session_summaries (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL UNIQUE,
+    project_id TEXT NOT NULL,
+
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_seconds INTEGER,
+
+    summary TEXT NOT NULL,
+    key_decisions_json TEXT DEFAULT '[]',
+    key_failures_json TEXT DEFAULT '[]',
+    high_value_event_ids_json TEXT DEFAULT '[]',
+
+    event_count INTEGER DEFAULT 0,
+    decision_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_session_summaries_project ON session_summaries(project_id, ended_at DESC);
+```
+
 ### Acceptance Criteria - Cold-Start Retrieval
 
 **ACCEPTANCE CRITERIA - Cold-Start Retrieval (Cold RAG):**
@@ -5265,6 +6352,42 @@ func (r *AcademicRetriever) RecordRetrieval(
 - [ ] Archivalist uses action-type priors (no codebase signals)
 - [ ] Cold prior explains its reasoning (ExplainBlend)
 - [ ] Structural metrics update on incremental re-index
+
+**ACCEPTANCE CRITERIA - Activity Event Stream (Group 4Y):**
+- [ ] ActivityEventBus created and running on session start
+- [ ] All event types (user_prompt, llm_response, tool_call, etc.) captured
+- [ ] Event debouncing prevents duplicate events within 5s window
+- [ ] Guide publishes user_prompt events
+- [ ] Tool Executor publishes tool_call and tool_result events
+- [ ] All agents publish action_start, action_complete, decision_made events
+- [ ] Archivalist subscribes and receives all events
+
+**ACCEPTANCE CRITERIA - Index Event Stream (Group 4Y):**
+- [ ] IndexEventPublisher created with ActivityEventBus reference
+- [ ] StartupIndexer publishes index_start on IndexProject()
+- [ ] StartupIndexer publishes index_complete with statistics
+- [ ] IncrementalIndex publishes index events
+- [ ] Index events include file counts, entity counts, edge counts
+- [ ] Archivalist can query "when was this project last indexed?"
+
+**ACCEPTANCE CRITERIA - Archivalist Dual-Write (Group 4Y):**
+- [ ] DualWriter receives events from ActivityEventBus subscription
+- [ ] EventClassifier determines write strategy per event type
+- [ ] High-value events (decisions, failures) written to BOTH stores
+- [ ] Tool events written to Bleve only (structured)
+- [ ] Event aggregation reduces volume for high-frequency events
+- [ ] Parallel writes to Bleve and VectorDB
+- [ ] Write failures logged and retried (WAL pattern)
+
+**ACCEPTANCE CRITERIA - Archivalist Cold-Start (Group 4Y):**
+- [ ] ActionTypePrior provides stable importance scores per event type
+- [ ] Cold scoring uses action + recency + semantic (0.40/0.25/0.35)
+- [ ] Warm scoring transitions to ACT-R after 3 retrievals
+- [ ] Full ACT-R scoring after 15 retrievals
+- [ ] Cross-session bootstrap loads prior session summaries
+- [ ] Cross-session decay applied (7-day half-life)
+- [ ] Two-layer model: Project Facts (Layer 1) + Activity History (Layer 2)
+- [ ] Query fusion: Bleve + VectorDB results merged and ranked
 
 ---
 

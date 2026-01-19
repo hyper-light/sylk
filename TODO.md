@@ -20,6 +20,9 @@ Build a highly concurrent multi-agent system capable of:
 | Core Skills | Complete | `core/skills/` |
 | Tree-Sitter (AST Parsing) | Complete | `core/treesitter/` |
 | Document Search System (DS.1-DS.13) | Complete | `core/search/` |
+| Adaptive Retrieval System (AR.1-AR.14) | Complete | `core/context/` |
+| Context Virtualization (CV.1-CV.5, ES.1-ES.5) | Complete | `core/context/` |
+| Pipeline Handoff System (PH.1-PH.7) | Complete | `core/pipeline/` |
 | Session Manager | Not Started | - |
 | DAG Engine | Not Started | - |
 | Academic | Not Started | - |
@@ -3703,7 +3706,7 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 
 ---
 
-## Adaptive Retrieval System
+## Adaptive Retrieval System (COMPLETE)
 
 **Reference**: See `CONTEXT.md` "Architecture Gap Analysis" and "Self-Tuning Adaptive System" sections for complete specification.
 
@@ -5940,7 +5943,7 @@ All tests verify CONTEXT.md and SEARCH.md specifications:
 
 ---
 
-## Context Virtualization System
+## Context Virtualization System (COMPLETE)
 
 **Reference**: See CONTEXT.md for complete specification and ARCHITECTURE.md "Lossless Context Virtualization" section.
 
@@ -6220,7 +6223,7 @@ Recency-based selection ensures current conversation context remains while older
 
 ---
 
-## Pipeline Agent Handoff System
+## Pipeline Agent Handoff System (COMPLETE)
 
 **Reference**: See CONTEXT.md "Pipeline Agent Handoff" section.
 
@@ -30325,7 +30328,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ DEPENDENCIES: Wave 3 complete (including 3D FILESYSTEM and 3E Tree-Sitter)         │
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4M: Adaptive Retrieval System (AR.1-AR.14)                        ││
+│ │ PARALLEL GROUP 4M: Adaptive Retrieval System (AR.1-AR.14) ✓ COMPLETE             ││
 │ │ ** DEPENDS ON: Group 4L (Document Search System) **                              ││
 │ │ ** ARCHITECTURE: See CONTEXT.md "Architecture Gap Analysis" section **           ││
 │ │                                                                                  ││
@@ -30804,7 +30807,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 └─────────────────────────────────────────────────────────────────────────────────────┘
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4N: Context Virtualization System (CV.1-CV.5, ES.1-ES.5)          ││
+│ │ PARALLEL GROUP 4N: Context Virtualization System (CV.1-CV.5, ES.1-ES.5) ✓ COMPLETE││
 │ │ ** FROM CONTEXT.md - Lossless Context Virtualization Architecture **             ││
 │ │ ** REQUIRED BY: AR.12.1 (Adaptive Retrieval Facade) **                           ││
 │ │                                                                                  ││
@@ -33255,6 +33258,488 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   - Anderson, J. R. (1990). The Adaptive Character of Thought                   ││
 │ │   - Wixted, J. T. (2004). The psychology and neuroscience of forgetting         ││
 │ │   - ACT-R Cognitive Architecture: http://act-r.psy.cmu.edu/                     ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4Y: Archivalist Event System (AE.1-AE.7, 42 tasks)               ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 11 "Activity Event Stream" **                 ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 11 "Archivalist Dual-Write" **                ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 11 "Archivalist Cold-Start" **                ││
+│ │ ** ENABLES: Complete activity capture + historical retrieval + cold-start **    ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES:                                                              ││
+│ │   1. Activity Event Stream: Captures ALL significant system events              ││
+│ │   2. Index Event Stream: Archivalist knows when/what was indexed               ││
+│ │   3. Dual-Write: Events stored in BOTH Bleve (structured) AND VectorDB (semantic)││
+│ │   4. Query-Time Fusion: Bleve × VectorDB × ACT-R memory for ranking            ││
+│ │   5. Two-Layer Cold-Start: Project Facts (no cold) + Activity History (has cold)││
+│ │   6. Action-Type Priors: decision=0.90, failure=0.85, success=0.75, etc.       ││
+│ │   7. Cross-Session Bootstrap: Load prior session summaries with decay          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (Activity Event Bus Infrastructure):                                    ││
+│ │                                                                                  ││
+│ │ • AE.1.1 EventType Enum (core/events/activity_types.go)                         ││
+│ │   - EventTypeUserPrompt, EventTypeUserClarification                             ││
+│ │   - EventTypeAgentAction, EventTypeAgentDecision, EventTypeAgentError           ││
+│ │   - EventTypeToolCall, EventTypeToolResult, EventTypeToolTimeout                ││
+│ │   - EventTypeLLMRequest, EventTypeLLMResponse                                   ││
+│ │   - EventTypeIndexStart, EventTypeIndexComplete, EventTypeIndexFileAdded        ││
+│ │   - EventTypeContextEviction, EventTypeContextRestore                           ││
+│ │   - EventTypeSuccess, EventTypeFailure                                          ││
+│ │   ACCEPTANCE: All event types defined, string representations available         ││
+│ │   FILES: core/events/activity_types.go (NEW)                                    ││
+│ │                                                                                  ││
+│ │ • AE.1.2 EventOutcome Enum (core/events/activity_types.go)                      ││
+│ │   - OutcomeSuccess, OutcomeFailure, OutcomePending                              ││
+│ │   ACCEPTANCE: All outcomes representable                                        ││
+│ │   FILES: core/events/activity_types.go (same file)                              ││
+│ │                                                                                  ││
+│ │ • AE.1.3 ActivityEvent Type (core/events/activity_types.go)                     ││
+│ │   - ID, EventType, Timestamp, SessionID, AgentID                                ││
+│ │   - Content, Summary, Category, FilePaths, Keywords, RelatedIDs                 ││
+│ │   - Outcome, Importance, Data map[string]any                                    ││
+│ │   - NewActivityEvent(eventType, sessionID, content) constructor                 ││
+│ │   - defaultImportance(eventType) returns action-type priors                     ││
+│ │   ACCEPTANCE: All fields serializable, importance defaults correct              ││
+│ │   FILES: core/events/activity_types.go (same file)                              ││
+│ │                                                                                  ││
+│ │ • AE.1.4 EventSubscriber Interface (core/events/activity_bus.go)                ││
+│ │   - ID() string                                                                 ││
+│ │   - EventTypes() []EventType (empty = all events)                               ││
+│ │   - OnEvent(event *ActivityEvent) error                                         ││
+│ │   ACCEPTANCE: Interface matches GRAPH.md specification                          ││
+│ │   FILES: core/events/activity_bus.go (NEW)                                      ││
+│ │                                                                                  ││
+│ │ • AE.1.5 EventDebouncer (core/events/activity_bus.go)                           ││
+│ │   - window time.Duration (default: 5s)                                          ││
+│ │   - seen map[string]time.Time                                                   ││
+│ │   - NewEventDebouncer(window) constructor                                       ││
+│ │   - ShouldSkip(event) bool - signature: "eventType:agentID:sessionID"           ││
+│ │   ACCEPTANCE: Duplicate events within window are skipped                        ││
+│ │   FILES: core/events/activity_bus.go (same file)                                ││
+│ │                                                                                  ││
+│ │ • AE.1.6 ActivityEventBus (core/events/activity_bus.go)                         ││
+│ │   - subscribers map[string][]EventSubscriber                                    ││
+│ │   - buffer chan *ActivityEvent (configurable size)                              ││
+│ │   - debouncer *EventDebouncer                                                   ││
+│ │   - NewActivityEventBus(bufferSize) constructor                                 ││
+│ │   - Publish(event) - debounces, buffers, non-blocking                           ││
+│ │   - Subscribe(sub) - registers by event type or wildcard                        ││
+│ │   - dispatch() goroutine - delivers events to subscribers                       ││
+│ │   - Close() - graceful shutdown                                                 ││
+│ │   ACCEPTANCE: Events delivered to correct subscribers, buffer overflow handled  ││
+│ │   DEPENDS ON: AE.1.3, AE.1.4, AE.1.5                                            ││
+│ │   FILES: core/events/activity_bus.go (same file)                                ││
+│ │                                                                                  ││
+│ │ • AE.1.7 Activity Event Bus Unit Tests                                          ││
+│ │   - Test: Publish delivers to type-specific subscribers                         ││
+│ │   - Test: Wildcard subscribers receive all events                               ││
+│ │   - Test: Debouncer skips duplicates within window                              ││
+│ │   - Test: Buffer overflow drops events (doesn't block)                          ││
+│ │   - Test: Close() completes pending deliveries                                  ││
+│ │   FILES: core/events/activity_bus_test.go (NEW)                                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (Index Event Stream):                                                   ││
+│ │                                                                                  ││
+│ │ • AE.2.1 IndexEventType Enum (core/events/index_events.go)                      ││
+│ │   - IndexEventTypeStart, IndexEventTypeComplete                                 ││
+│ │   - IndexEventTypeFileAdd, IndexEventTypeFileRemove, IndexEventTypeError        ││
+│ │   ACCEPTANCE: All index event types defined                                     ││
+│ │   FILES: core/events/index_events.go (NEW)                                      ││
+│ │                                                                                  ││
+│ │ • AE.2.2 IndexType Enum (core/events/index_events.go)                           ││
+│ │   - IndexTypeFull, IndexTypeIncremental, IndexTypeFileChange                    ││
+│ │   ACCEPTANCE: All index types representable                                     ││
+│ │   FILES: core/events/index_events.go (same file)                                ││
+│ │                                                                                  ││
+│ │ • AE.2.3 IndexEvent Type (core/events/index_events.go)                          ││
+│ │   - ID, EventType, Timestamp, SessionID                                         ││
+│ │   - IndexType, IndexVersion, PrevVersion                                        ││
+│ │   - RootPath, Duration                                                          ││
+│ │   - FilesIndexed, FilesRemoved, FilesUpdated, EntitiesFound, EdgesCreated       ││
+│ │   - Errors []IndexError                                                         ││
+│ │   ACCEPTANCE: All index statistics captured                                     ││
+│ │   FILES: core/events/index_events.go (same file)                                ││
+│ │                                                                                  ││
+│ │ • AE.2.4 IndexEventPublisher (core/events/index_events.go)                      ││
+│ │   - bus *ActivityEventBus, sessionID string                                     ││
+│ │   - NewIndexEventPublisher(bus, sessionID) constructor                          ││
+│ │   - PublishIndexStart(indexType, rootPath)                                      ││
+│ │   - PublishIndexComplete(event *IndexEvent)                                     ││
+│ │   - PublishFileAdd(filePath), PublishFileRemove(filePath)                       ││
+│ │   ACCEPTANCE: Index events published to ActivityEventBus                        ││
+│ │   DEPENDS ON: AE.1.6 (ActivityEventBus)                                         ││
+│ │   FILES: core/events/index_events.go (same file)                                ││
+│ │                                                                                  ││
+│ │ • AE.2.5 StartupIndexer Event Publishing (core/context/startup_indexer.go)      ││
+│ │   - Add publisher *IndexEventPublisher field                                    ││
+│ │   - IndexProject() calls publisher.PublishIndexStart() at start                 ││
+│ │   - IndexProject() calls publisher.PublishIndexComplete() at end                ││
+│ │   - Collect statistics during indexing for event payload                        ││
+│ │   ACCEPTANCE: Index events emitted during startup indexing                      ││
+│ │   DEPENDS ON: AE.2.4, CV.2 (StartupIndexer)                                     ││
+│ │   FILES: core/context/startup_indexer.go (MODIFY)                               ││
+│ │                                                                                  ││
+│ │ • AE.2.6 Index Event Unit Tests                                                 ││
+│ │   - Test: PublishIndexStart creates correct ActivityEvent                       ││
+│ │   - Test: PublishIndexComplete includes statistics                              ││
+│ │   - Test: StartupIndexer emits start and complete events                        ││
+│ │   FILES: core/events/index_events_test.go (NEW)                                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (Event Publishers - System-Wide Integration):                           ││
+│ │                                                                                  ││
+│ │ • AE.3.1 Guide Event Publisher (agents/guide/event_publisher.go)                ││
+│ │   - PublishUserPrompt(sessionID, content, agentID)                              ││
+│ │   - PublishRoutingDecision(sessionID, fromAgent, toAgent, reason)               ││
+│ │   - PublishClarificationRequest(sessionID, question)                            ││
+│ │   ACCEPTANCE: Guide emits events for user prompts and routing                   ││
+│ │   DEPENDS ON: AE.1.6                                                            ││
+│ │   FILES: agents/guide/event_publisher.go (NEW)                                  ││
+│ │                                                                                  ││
+│ │ • AE.3.2 Tool Executor Event Publisher (core/tools/event_publisher.go)          ││
+│ │   - PublishToolCall(sessionID, agentID, toolName, params)                       ││
+│ │   - PublishToolResult(sessionID, agentID, toolName, result, outcome)            ││
+│ │   - PublishToolTimeout(sessionID, agentID, toolName, timeout)                   ││
+│ │   ACCEPTANCE: Tool executor emits events for all tool calls                     ││
+│ │   DEPENDS ON: AE.1.6                                                            ││
+│ │   FILES: core/tools/event_publisher.go (NEW)                                    ││
+│ │                                                                                  ││
+│ │ • AE.3.3 TrackedToolExecutor Integration (core/tools/tracked_executor.go)       ││
+│ │   - Add eventPublisher field                                                    ││
+│ │   - Execute() calls PublishToolCall before execution                            ││
+│ │   - Execute() calls PublishToolResult after execution                           ││
+│ │   ACCEPTANCE: All tracked tool executions emit events                           ││
+│ │   DEPENDS ON: AE.3.2                                                            ││
+│ │   FILES: core/tools/tracked_executor.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • AE.3.4 Agent Base Event Publisher (core/agents/event_publisher.go)            ││
+│ │   - PublishAgentAction(sessionID, agentID, action, details)                     ││
+│ │   - PublishAgentDecision(sessionID, agentID, decision, rationale)               ││
+│ │   - PublishAgentError(sessionID, agentID, error, context)                       ││
+│ │   - PublishSuccess(sessionID, agentID, description)                             ││
+│ │   - PublishFailure(sessionID, agentID, description, error)                      ││
+│ │   ACCEPTANCE: All agents can emit action/decision/error events                  ││
+│ │   DEPENDS ON: AE.1.6                                                            ││
+│ │   FILES: core/agents/event_publisher.go (NEW)                                   ││
+│ │                                                                                  ││
+│ │ • AE.3.5 VirtualContextManager Eviction Publisher                               ││
+│ │   - Add eventPublisher field to VirtualContextManager                           ││
+│ │   - Evict() calls PublishContextEviction with evicted content IDs               ││
+│ │   - Restore() calls PublishContextRestore                                       ││
+│ │   ACCEPTANCE: Context eviction events captured                                  ││
+│ │   DEPENDS ON: AE.1.6, 4N (VirtualContextManager)                                ││
+│ │   FILES: core/context/virtual_context_manager.go (MODIFY - when 4N implemented) ││
+│ │                                                                                  ││
+│ │ • AE.3.6 LLM Provider Event Publisher (core/providers/event_publisher.go)       ││
+│ │   - PublishLLMRequest(sessionID, agentID, model, tokenCount)                    ││
+│ │   - PublishLLMResponse(sessionID, agentID, model, tokenCount, duration)         ││
+│ │   ACCEPTANCE: LLM calls emit request/response events                            ││
+│ │   DEPENDS ON: AE.1.6                                                            ││
+│ │   FILES: core/providers/event_publisher.go (NEW)                                ││
+│ │                                                                                  ││
+│ │ • AE.3.7 Event Publisher Unit Tests                                             ││
+│ │   - Test: Guide publisher creates correct event types                           ││
+│ │   - Test: Tool publisher captures params and results                            ││
+│ │   - Test: Agent publisher includes rationale for decisions                      ││
+│ │   FILES: core/events/publishers_test.go (NEW)                                   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (Archivalist Dual-Write Ingestion):                                     ││
+│ │                                                                                  ││
+│ │ • AE.4.1 DualWriteStrategy Type (agents/archivalist/dual_writer.go)             ││
+│ │   - WriteBleve bool, WriteVector bool                                           ││
+│ │   - BleveFields []string, VectorContent string                                  ││
+│ │   - Aggregate bool                                                              ││
+│ │   ACCEPTANCE: Strategy determines per-event storage behavior                    ││
+│ │   FILES: agents/archivalist/dual_writer.go (NEW)                                ││
+│ │                                                                                  ││
+│ │ • AE.4.2 EventClassifier (agents/archivalist/dual_writer.go)                    ││
+│ │   - strategies map[EventType]*DualWriteStrategy                                 ││
+│ │   - NewEventClassifier() with default strategies per GRAPH.md                   ││
+│ │   - GetStrategy(eventType) *DualWriteStrategy                                   ││
+│ │   - Decisions/failures: both stores, full content                               ││
+│ │   - Tool events: Bleve only, aggregated                                         ││
+│ │   - Index events: Bleve only, structured                                        ││
+│ │   ACCEPTANCE: Strategies match GRAPH.md dual-write table                        ││
+│ │   FILES: agents/archivalist/dual_writer.go (same file)                          ││
+│ │                                                                                  ││
+│ │ • AE.4.3 EventAggregator (agents/archivalist/event_aggregator.go)               ││
+│ │   - window time.Duration (default: 5s)                                          ││
+│ │   - pending map[string]*AggregatedEvent                                         ││
+│ │   - Add(event) *ActivityEvent - returns nil if buffered, aggregated if flushed  ││
+│ │   - Flush() []*ActivityEvent - returns all pending aggregates                   ││
+│ │   - Aggregates by: eventType + agentID + sessionID                              ││
+│ │   ACCEPTANCE: High-volume events aggregated correctly                           ││
+│ │   FILES: agents/archivalist/event_aggregator.go (NEW)                           ││
+│ │                                                                                  ││
+│ │ • AE.4.4 BleveEventIndex (agents/archivalist/bleve_index.go)                    ││
+│ │   - index bleve.Index                                                           ││
+│ │   - IndexEvent(ctx, event, fields) error - indexes specified fields             ││
+│ │   - Search(ctx, query, opts) ([]*ActivityEvent, error)                          ││
+│ │   - Uses existing 4L Bleve integration                                          ││
+│ │   ACCEPTANCE: Events indexed in Bleve with correct field mapping                ││
+│ │   DEPENDS ON: 4L (Bleve integration)                                            ││
+│ │   FILES: agents/archivalist/bleve_index.go (NEW)                                ││
+│ │                                                                                  ││
+│ │ • AE.4.5 VectorEventStore (agents/archivalist/vector_store.go)                  ││
+│ │   - vectorDB *VectorGraphDB                                                     ││
+│ │   - embedder Embedder                                                           ││
+│ │   - EmbedEvent(ctx, event, contentType) error - embeds and stores               ││
+│ │   - Search(ctx, embedding, opts) ([]*ActivityEvent, error)                      ││
+│ │   - GetEmbedding(eventID) []float32                                             ││
+│ │   ACCEPTANCE: Events embedded and stored in VectorDB                            ││
+│ │   DEPENDS ON: VectorGraphDB (existing)                                          ││
+│ │   FILES: agents/archivalist/vector_store.go (NEW)                               ││
+│ │                                                                                  ││
+│ │ • AE.4.6 DualWriter (agents/archivalist/dual_writer.go)                         ││
+│ │   - bleveIndex *BleveEventIndex, vectorStore *VectorEventStore                  ││
+│ │   - classifier *EventClassifier, aggregator *EventAggregator                    ││
+│ │   - NewDualWriter(bleveIndex, vectorStore) constructor                          ││
+│ │   - Write(ctx, event) error - parallel writes to both stores                    ││
+│ │   - Handles aggregation for high-volume events                                  ││
+│ │   ACCEPTANCE: Events written to correct stores per strategy                     ││
+│ │   DEPENDS ON: AE.4.2, AE.4.3, AE.4.4, AE.4.5                                    ││
+│ │   FILES: agents/archivalist/dual_writer.go (same file)                          ││
+│ │                                                                                  ││
+│ │ • AE.4.7 ArchivalistEventSubscriber (agents/archivalist/event_subscriber.go)    ││
+│ │   - Implements EventSubscriber interface                                        ││
+│ │   - dualWriter *DualWriter                                                      ││
+│ │   - ID() returns "archivalist"                                                  ││
+│ │   - EventTypes() returns empty (subscribes to all)                              ││
+│ │   - OnEvent(event) calls dualWriter.Write()                                     ││
+│ │   ACCEPTANCE: Archivalist receives and ingests all events                       ││
+│ │   DEPENDS ON: AE.1.4, AE.4.6                                                    ││
+│ │   FILES: agents/archivalist/event_subscriber.go (NEW)                           ││
+│ │                                                                                  ││
+│ │ • AE.4.8 Dual-Write Unit Tests                                                  ││
+│ │   - Test: EventClassifier returns correct strategy per event type               ││
+│ │   - Test: Aggregator buffers and flushes correctly                              ││
+│ │   - Test: DualWriter writes to both stores in parallel                          ││
+│ │   - Test: Write failures don't block other writes                               ││
+│ │   FILES: agents/archivalist/dual_writer_test.go (NEW)                           ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (Archivalist Cold-Start Prior):                                         ││
+│ │                                                                                  ││
+│ │ • AE.5.1 ActionTypePrior Type (core/knowledge/coldstart/archivalist_prior.go)   ││
+│ │   - TypeImportance map[EventType]float64                                        ││
+│ │   - ActionWeight=0.40, RecencyWeight=0.25, SemanticWeight=0.35                  ││
+│ │   - DefaultActionTypePrior() with empirically-tuned values per GRAPH.md         ││
+│ │   ACCEPTANCE: All event types have importance values                            ││
+│ │   FILES: core/knowledge/coldstart/archivalist_prior.go (NEW)                    ││
+│ │                                                                                  ││
+│ │ • AE.5.2 ComputeColdScore Method (core/knowledge/coldstart/archivalist_prior.go)││
+│ │   - ComputeColdScore(event, queryEmbed, eventEmbed, currentTurn, eventTurn)     ││
+│ │   - actionScore from TypeImportance                                             ││
+│ │   - recencyScore = 1 / (1 + turnsSince/10)                                      ││
+│ │   - semanticScore = cosineSimilarity(queryEmbed, eventEmbed)                    ││
+│ │   - Returns weighted sum                                                        ││
+│ │   ACCEPTANCE: Cold score in [0,1], weights sum to 1.0                           ││
+│ │   FILES: core/knowledge/coldstart/archivalist_prior.go (same file)              ││
+│ │                                                                                  ││
+│ │ • AE.5.3 SessionRecencyCalculator (core/knowledge/coldstart/archivalist_prior.go)││
+│ │   - CalculateRecency(currentTurn, eventTurn) float64                            ││
+│ │   - Formula: 1 / (1 + turnsSince/10)                                            ││
+│ │   ACCEPTANCE: Recent events score higher, decay is gentle                       ││
+│ │   FILES: core/knowledge/coldstart/archivalist_prior.go (same file)              ││
+│ │                                                                                  ││
+│ │ • AE.5.4 ArchivalistRetriever (core/knowledge/coldstart/archivalist_retriever.go)││
+│ │   - coldPrior *ActionTypePrior, memoryStore *MemoryStore                        ││
+│ │   - factRegistry *FactRegistry (from Project Fact Registry)                     ││
+│ │   - bleveIndex *BleveEventIndex, vectorStore *VectorEventStore                  ││
+│ │   - minTracesForWarm=3, fullWarmTraces=15                                       ││
+│ │   - crossSessionDecayDays=7.0                                                   ││
+│ │   - NewArchivalistRetriever() constructor                                       ││
+│ │   ACCEPTANCE: Two-layer retriever created with all dependencies                 ││
+│ │   DEPENDS ON: AE.5.1, MD.3.1 (MemoryStore), Project Fact Registry               ││
+│ │   FILES: core/knowledge/coldstart/archivalist_retriever.go (NEW)                ││
+│ │                                                                                  ││
+│ │ • AE.5.5 Search Method (core/knowledge/coldstart/archivalist_retriever.go)      ││
+│ │   - Search(ctx, query, queryEmbed, opts) ([]*RankedActivityEvent, error)        ││
+│ │   - Layer 1: gatherProjectContext() reads cross-agent facts                     ││
+│ │   - Layer 2: Parallel search Bleve + VectorDB                                   ││
+│ │   - mergeResults() deduplicates                                                 ││
+│ │   - scoreEvent() blends cold/warm                                               ││
+│ │   - explainRelevance() uses project context                                     ││
+│ │   ACCEPTANCE: Returns ranked events with explanations                           ││
+│ │   DEPENDS ON: AE.5.4, AE.4.4, AE.4.5                                            ││
+│ │   FILES: core/knowledge/coldstart/archivalist_retriever.go (same file)          ││
+│ │                                                                                  ││
+│ │ • AE.5.6 scoreEvent Method (core/knowledge/coldstart/archivalist_retriever.go)  ││
+│ │   - Gets ACT-R memory for event                                                 ││
+│ │   - traceCount < minTracesForWarm: pure cold score                              ││
+│ │   - traceCount >= fullWarmTraces: pure ACT-R score                              ││
+│ │   - Otherwise: linear blend cold→warm                                           ││
+│ │   ACCEPTANCE: Smooth transition cold→warm as traces accumulate                  ││
+│ │   DEPENDS ON: MD.2.2 (ACTRMemory), AE.5.2                                       ││
+│ │   FILES: core/knowledge/coldstart/archivalist_retriever.go (same file)          ││
+│ │                                                                                  ││
+│ │ • AE.5.7 LoadCrossSessionState (core/knowledge/coldstart/archivalist_retriever.go)││
+│ │   - LoadCrossSessionState(ctx, projectID, daysSinceLastSession) error           ││
+│ │   - Loads prior session summaries                                               ││
+│ │   - Applies cross-session decay: e^(-days/7)                                    ││
+│ │   - Inherits high-value event ACT-R traces with decay                           ││
+│ │   ACCEPTANCE: Prior sessions bootstrap new session with decayed activation      ││
+│ │   FILES: core/knowledge/coldstart/archivalist_retriever.go (same file)          ││
+│ │                                                                                  ││
+│ │ • AE.5.8 RecordRetrieval (core/knowledge/coldstart/archivalist_retriever.go)    ││
+│ │   - RecordRetrieval(ctx, eventID, wasUseful) error                              ││
+│ │   - Delegates to memoryStore.RecordAccess()                                     ││
+│ │   ACCEPTANCE: Retrieval outcomes recorded for ACT-R learning                    ││
+│ │   DEPENDS ON: MD.3.1 (MemoryStore)                                              ││
+│ │   FILES: core/knowledge/coldstart/archivalist_retriever.go (same file)          ││
+│ │                                                                                  ││
+│ │ • AE.5.9 Cold-Start Prior Unit Tests                                            ││
+│ │   - Test: ActionTypePrior returns correct importance per event type             ││
+│ │   - Test: ComputeColdScore weights sum correctly                                ││
+│ │   - Test: scoreEvent uses pure cold when traceCount < 3                         ││
+│ │   - Test: scoreEvent uses pure warm when traceCount >= 15                       ││
+│ │   - Test: scoreEvent blends linearly for 3 <= traceCount < 15                   ││
+│ │   - Test: LoadCrossSessionState applies decay correctly                         ││
+│ │   FILES: core/knowledge/coldstart/archivalist_prior_test.go (NEW)               ││
+│ │          core/knowledge/coldstart/archivalist_retriever_test.go (NEW)           ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (Schema Migrations):                                                    ││
+│ │                                                                                  ││
+│ │ • AE.6.1 Activity Events Table (core/vectorgraphdb/migrations/013_archivalist.go)││
+│ │   - CREATE TABLE activity_events with all fields per GRAPH.md schema            ││
+│ │   - Indexes: session+timestamp, type+timestamp, agent+timestamp, category       ││
+│ │   ACCEPTANCE: Table created, indexes work                                       ││
+│ │   FILES: core/vectorgraphdb/migrations/013_archivalist_events.go (NEW)          ││
+│ │                                                                                  ││
+│ │ • AE.6.2 Index Events Table (core/vectorgraphdb/migrations/013_archivalist.go)  ││
+│ │   - CREATE TABLE index_events with all fields per GRAPH.md schema               ││
+│ │   - Indexes: session+timestamp, version DESC                                    ││
+│ │   ACCEPTANCE: Table created, version ordering works                             ││
+│ │   FILES: core/vectorgraphdb/migrations/013_archivalist_events.go (same file)    ││
+│ │                                                                                  ││
+│ │ • AE.6.3 Session Summaries Table (core/vectorgraphdb/migrations/013_archivalist.go)││
+│ │   - CREATE TABLE session_summaries with all fields per GRAPH.md schema          ││
+│ │   - Indexes: project+ended_at DESC                                              ││
+│ │   ACCEPTANCE: Table created, cross-session queries work                         ││
+│ │   FILES: core/vectorgraphdb/migrations/013_archivalist_events.go (same file)    ││
+│ │                                                                                  ││
+│ │ • AE.6.4 Migration Test                                                         ││
+│ │   - Test: All tables created with correct schema                                ││
+│ │   - Test: Indexes created and queryable                                         ││
+│ │   - Test: Foreign key constraints work (if any)                                 ││
+│ │   FILES: core/vectorgraphdb/migrations/013_archivalist_events_test.go (NEW)     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (Integration Tests):                                                    ││
+│ │                                                                                  ││
+│ │ • AE.7.1 Event Capture Integration Test                                         ││
+│ │   - Test: User prompt flows through Guide → EventBus → Archivalist              ││
+│ │   - Test: Tool call flows through Executor → EventBus → Archivalist             ││
+│ │   - Test: Index complete flows through Librarian → EventBus → Archivalist       ││
+│ │   - Test: All event types reach Archivalist subscriber                          ││
+│ │   FILES: agents/archivalist/event_capture_integration_test.go (NEW)             ││
+│ │                                                                                  ││
+│ │ • AE.7.2 Dual-Write Integration Test                                            ││
+│ │   - Test: Decision event written to both Bleve and VectorDB                     ││
+│ │   - Test: Tool event written to Bleve only                                      ││
+│ │   - Test: High-volume events aggregated before write                            ││
+│ │   - Test: Searchable in both stores after write                                 ││
+│ │   FILES: agents/archivalist/dual_write_integration_test.go (NEW)                ││
+│ │                                                                                  ││
+│ │ • AE.7.3 Cold-Start Integration Test                                            ││
+│ │   - Test: New session with zero events uses action-type priors                  ││
+│ │   - Test: After 3 retrievals, blending begins                                   ││
+│ │   - Test: After 15 retrievals, pure ACT-R scoring                               ││
+│ │   - Test: Cross-session bootstrap loads prior summaries                         ││
+│ │   - Test: Cross-session decay applied correctly                                 ││
+│ │   FILES: agents/archivalist/cold_start_integration_test.go (NEW)                ││
+│ │                                                                                  ││
+│ │ • AE.7.4 Query Fusion Integration Test                                          ││
+│ │   - Test: "How did we implement X?" returns decisions and patterns              ││
+│ │   - Test: "What failed recently?" returns failure events                        ││
+│ │   - Test: "Similar to this error" uses semantic search                          ││
+│ │   - Test: Results ranked by blended cold/warm score                             ││
+│ │   - Test: Explanations reference project context                                ││
+│ │   FILES: agents/archivalist/query_fusion_integration_test.go (NEW)              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/events/activity_types.go - AE.1.1-1.3 (NEW)                              ││
+│ │   core/events/activity_bus.go - AE.1.4-1.6 (NEW)                                ││
+│ │   core/events/activity_bus_test.go - AE.1.7 (NEW)                               ││
+│ │   core/events/index_events.go - AE.2.1-2.4 (NEW)                                ││
+│ │   core/events/index_events_test.go - AE.2.6 (NEW)                               ││
+│ │   core/context/startup_indexer.go - AE.2.5 (MODIFY)                             ││
+│ │   agents/guide/event_publisher.go - AE.3.1 (NEW)                                ││
+│ │   core/tools/event_publisher.go - AE.3.2 (NEW)                                  ││
+│ │   core/tools/tracked_executor.go - AE.3.3 (MODIFY)                              ││
+│ │   core/agents/event_publisher.go - AE.3.4 (NEW)                                 ││
+│ │   core/context/virtual_context_manager.go - AE.3.5 (MODIFY when 4N ready)       ││
+│ │   core/providers/event_publisher.go - AE.3.6 (NEW)                              ││
+│ │   core/events/publishers_test.go - AE.3.7 (NEW)                                 ││
+│ │   agents/archivalist/dual_writer.go - AE.4.1, AE.4.2, AE.4.6 (NEW)              ││
+│ │   agents/archivalist/event_aggregator.go - AE.4.3 (NEW)                         ││
+│ │   agents/archivalist/bleve_index.go - AE.4.4 (NEW)                              ││
+│ │   agents/archivalist/vector_store.go - AE.4.5 (NEW)                             ││
+│ │   agents/archivalist/event_subscriber.go - AE.4.7 (NEW)                         ││
+│ │   agents/archivalist/dual_writer_test.go - AE.4.8 (NEW)                         ││
+│ │   core/knowledge/coldstart/archivalist_prior.go - AE.5.1-5.3 (NEW)              ││
+│ │   core/knowledge/coldstart/archivalist_retriever.go - AE.5.4-5.8 (NEW)          ││
+│ │   core/knowledge/coldstart/archivalist_prior_test.go - AE.5.9 (NEW)             ││
+│ │   core/knowledge/coldstart/archivalist_retriever_test.go - AE.5.9 (NEW)         ││
+│ │   core/vectorgraphdb/migrations/013_archivalist_events.go - AE.6.1-6.3 (NEW)    ││
+│ │   core/vectorgraphdb/migrations/013_archivalist_events_test.go - AE.6.4 (NEW)   ││
+│ │   agents/archivalist/event_capture_integration_test.go - AE.7.1 (NEW)           ││
+│ │   agents/archivalist/dual_write_integration_test.go - AE.7.2 (NEW)              ││
+│ │   agents/archivalist/cold_start_integration_test.go - AE.7.3 (NEW)              ││
+│ │   agents/archivalist/query_fusion_integration_test.go - AE.7.4 (NEW)            ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (7 parallel) → Phase 2 (6 parallel, depends on AE.1.6) →              ││
+│ │   Phase 3 (7 parallel, depends on AE.1.6) →                                     ││
+│ │   Phase 4 (8 tasks, AE.4.1-4.3 parallel, then AE.4.4-4.7 depend on earlier) →   ││
+│ │   Phase 5 (9 tasks, AE.5.1-5.3 parallel, then AE.5.4-5.8 sequential) →          ││
+│ │   Phase 6 (4 parallel) → Phase 7 (4 parallel integration tests)                 ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Group 4L: Bleve integration (for BleveEventIndex)                           ││
+│ │   - Group 4N: VirtualContextManager (for eviction events - can stub initially)  ││
+│ │   - Group 4X: MD.2.2 ACTRMemory, MD.3.1 MemoryStore (for cold-start blending)   ││
+│ │   - Project Fact Registry (GRAPH.md Section 11 - for cross-agent awareness)     ││
+│ │   - Existing VectorGraphDB infrastructure                                       ││
+│ │                                                                                  ││
+│ │ MEMORY COST:                                                                    ││
+│ │   - EventBus buffer: ~10 KB (1000 events × 10 bytes pointer)                    ││
+│ │   - Debouncer map: ~5 KB (500 signatures × 10 bytes)                            ││
+│ │   - Per-event in Bleve: ~500 bytes (indexed fields)                             ││
+│ │   - Per-event in VectorDB: ~3 KB (embedding + metadata)                         ││
+│ │                                                                                  ││
+│ │ CPU COST:                                                                       ││
+│ │   - Event publish: ~0.01 ms (channel send)                                      ││
+│ │   - Dual-write: ~5-10 ms (Bleve index + embedding)                              ││
+│ │   - Cold score: ~0.1 ms (cosine similarity + weighted sum)                      ││
+│ │   - Query fusion: ~20-50 ms (parallel Bleve + VectorDB + ranking)               ││
+│ │                                                                                  ││
+│ │ WHY DUAL-WRITE:                                                                 ││
+│ │   - Bleve: Fast structured queries ("failures in last hour", "by agent X")      ││
+│ │   - VectorDB: Semantic queries ("similar to this error", "how did we...")       ││
+│ │   - Query-time fusion: Best of both worlds, no query-time translation           ││
+│ │   - Action-type priors: No cold-start bootstrap needed for event importance     ││
+│ │                                                                                  ││
+│ │ REFERENCES:                                                                     ││
+│ │   - GRAPH.md Section 11 "Activity Event Stream"                                 ││
+│ │   - GRAPH.md Section 11 "Index Event Stream"                                    ││
+│ │   - GRAPH.md Section 11 "Archivalist Dual-Write Ingestion"                      ││
+│ │   - GRAPH.md Section 11 "Archivalist Cold-Start: Two-Layer Model"               ││
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
