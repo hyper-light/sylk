@@ -11,36 +11,44 @@ import (
 // =============================================================================
 
 // Domain represents the knowledge domain a node belongs to.
-// VectorGraphDB operates across three distinct domains that can be linked
-// through cross-domain edges.
+// VectorGraphDB operates across multiple distinct domains that can be linked
+// through cross-domain edges. The first three domains (Code, History, Academic)
+// maintain backward compatibility with existing stored vectors.
 type Domain int
 
 const (
 	DomainCode     Domain = 0
 	DomainHistory  Domain = 1
 	DomainAcademic Domain = 2
+
+	DomainArchitect    Domain = 3
+	DomainEngineer     Domain = 4
+	DomainDesigner     Domain = 5
+	DomainInspector    Domain = 6
+	DomainTester       Domain = 7
+	DomainOrchestrator Domain = 8
+	DomainGuide        Domain = 9
 )
 
-// ValidDomains returns all valid Domain values.
 func ValidDomains() []Domain {
 	return []Domain{
 		DomainCode,
 		DomainHistory,
 		DomainAcademic,
+		DomainArchitect,
+		DomainEngineer,
+		DomainDesigner,
+		DomainInspector,
+		DomainTester,
+		DomainOrchestrator,
+		DomainGuide,
 	}
 }
 
-// IsValid returns true if the domain is a recognized value.
 func (d Domain) IsValid() bool {
-	switch d {
-	case DomainCode, DomainHistory, DomainAcademic:
-		return true
-	default:
-		return false
-	}
+	return d >= DomainCode && d <= DomainGuide
 }
 
-// String returns the string representation of the domain.
 func (d Domain) String() string {
 	switch d {
 	case DomainCode:
@@ -49,6 +57,20 @@ func (d Domain) String() string {
 		return "history"
 	case DomainAcademic:
 		return "academic"
+	case DomainArchitect:
+		return "architect"
+	case DomainEngineer:
+		return "engineer"
+	case DomainDesigner:
+		return "designer"
+	case DomainInspector:
+		return "inspector"
+	case DomainTester:
+		return "tester"
+	case DomainOrchestrator:
+		return "orchestrator"
+	case DomainGuide:
+		return "guide"
 	default:
 		return fmt.Sprintf("domain(%d)", d)
 	}
@@ -62,8 +84,61 @@ func ParseDomain(value string) (Domain, bool) {
 		return DomainHistory, true
 	case "academic":
 		return DomainAcademic, true
+	case "architect":
+		return DomainArchitect, true
+	case "engineer":
+		return DomainEngineer, true
+	case "designer":
+		return DomainDesigner, true
+	case "inspector":
+		return DomainInspector, true
+	case "tester":
+		return DomainTester, true
+	case "orchestrator":
+		return DomainOrchestrator, true
+	case "guide":
+		return DomainGuide, true
 	default:
 		return Domain(0), false
+	}
+}
+
+func KnowledgeDomains() []Domain {
+	return []Domain{DomainCode, DomainHistory, DomainAcademic, DomainArchitect}
+}
+
+func PipelineDomains() []Domain {
+	return []Domain{DomainEngineer, DomainDesigner, DomainInspector, DomainTester}
+}
+
+func ControlDomains() []Domain {
+	return []Domain{DomainOrchestrator, DomainGuide}
+}
+
+func (d Domain) IsKnowledge() bool {
+	switch d {
+	case DomainCode, DomainHistory, DomainAcademic, DomainArchitect:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d Domain) IsPipeline() bool {
+	switch d {
+	case DomainEngineer, DomainDesigner, DomainInspector, DomainTester:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d Domain) IsControl() bool {
+	switch d {
+	case DomainOrchestrator, DomainGuide:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -128,7 +203,48 @@ const (
 	NodeTypeTutorial      NodeType = 206
 )
 
-// ValidNodeTypes returns all valid NodeType values.
+const (
+	NodeTypeArchitectureDecision NodeType = 300
+	NodeTypeDesignPattern        NodeType = 301
+	NodeTypeSystemDiagram        NodeType = 302
+)
+
+const (
+	NodeTypeTask           NodeType = 400
+	NodeTypeImplementation NodeType = 401
+	NodeTypeCodeChange     NodeType = 402
+)
+
+const (
+	NodeTypeUIComponent NodeType = 500
+	NodeTypeStyleGuide  NodeType = 501
+	NodeTypeDesignAsset NodeType = 502
+)
+
+const (
+	NodeTypeInspection    NodeType = 600
+	NodeTypeCodeReview    NodeType = 601
+	NodeTypeQualityMetric NodeType = 602
+)
+
+const (
+	NodeTypeTestCase   NodeType = 700
+	NodeTypeTestSuite  NodeType = 701
+	NodeTypeTestResult NodeType = 702
+)
+
+const (
+	NodeTypeWorkflowDef NodeType = 800
+	NodeTypeAgentConfig NodeType = 801
+	NodeTypePipeline    NodeType = 802
+)
+
+const (
+	NodeTypeRoutingRule   NodeType = 900
+	NodeTypeIntentPattern NodeType = 901
+	NodeTypeUserQuery     NodeType = 902
+)
+
 func ValidNodeTypes() []NodeType {
 	return []NodeType{
 		NodeTypeFile,
@@ -152,10 +268,30 @@ func ValidNodeTypes() []NodeType {
 		NodeTypeStackOverflow,
 		NodeTypeBlogPost,
 		NodeTypeTutorial,
+		NodeTypeArchitectureDecision,
+		NodeTypeDesignPattern,
+		NodeTypeSystemDiagram,
+		NodeTypeTask,
+		NodeTypeImplementation,
+		NodeTypeCodeChange,
+		NodeTypeUIComponent,
+		NodeTypeStyleGuide,
+		NodeTypeDesignAsset,
+		NodeTypeInspection,
+		NodeTypeCodeReview,
+		NodeTypeQualityMetric,
+		NodeTypeTestCase,
+		NodeTypeTestSuite,
+		NodeTypeTestResult,
+		NodeTypeWorkflowDef,
+		NodeTypeAgentConfig,
+		NodeTypePipeline,
+		NodeTypeRoutingRule,
+		NodeTypeIntentPattern,
+		NodeTypeUserQuery,
 	}
 }
 
-// ValidNodeTypesForDomain returns all valid NodeType values for a specific domain.
 func ValidNodeTypesForDomain(domain Domain) []NodeType {
 	switch domain {
 	case DomainCode:
@@ -188,6 +324,48 @@ func ValidNodeTypesForDomain(domain Domain) []NodeType {
 			NodeTypeBlogPost,
 			NodeTypeTutorial,
 		}
+	case DomainArchitect:
+		return []NodeType{
+			NodeTypeArchitectureDecision,
+			NodeTypeDesignPattern,
+			NodeTypeSystemDiagram,
+		}
+	case DomainEngineer:
+		return []NodeType{
+			NodeTypeTask,
+			NodeTypeImplementation,
+			NodeTypeCodeChange,
+		}
+	case DomainDesigner:
+		return []NodeType{
+			NodeTypeUIComponent,
+			NodeTypeStyleGuide,
+			NodeTypeDesignAsset,
+		}
+	case DomainInspector:
+		return []NodeType{
+			NodeTypeInspection,
+			NodeTypeCodeReview,
+			NodeTypeQualityMetric,
+		}
+	case DomainTester:
+		return []NodeType{
+			NodeTypeTestCase,
+			NodeTypeTestSuite,
+			NodeTypeTestResult,
+		}
+	case DomainOrchestrator:
+		return []NodeType{
+			NodeTypeWorkflowDef,
+			NodeTypeAgentConfig,
+			NodeTypePipeline,
+		}
+	case DomainGuide:
+		return []NodeType{
+			NodeTypeRoutingRule,
+			NodeTypeIntentPattern,
+			NodeTypeUserQuery,
+		}
 	default:
 		return nil
 	}
@@ -214,7 +392,6 @@ func (nt NodeType) IsValidForDomain(domain Domain) bool {
 	return false
 }
 
-// String returns the string representation of the node type.
 func (nt NodeType) String() string {
 	switch nt {
 	case NodeTypeFile:
@@ -259,6 +436,48 @@ func (nt NodeType) String() string {
 		return "blog_post"
 	case NodeTypeTutorial:
 		return "tutorial"
+	case NodeTypeArchitectureDecision:
+		return "architecture_decision"
+	case NodeTypeDesignPattern:
+		return "design_pattern"
+	case NodeTypeSystemDiagram:
+		return "system_diagram"
+	case NodeTypeTask:
+		return "task"
+	case NodeTypeImplementation:
+		return "implementation"
+	case NodeTypeCodeChange:
+		return "code_change"
+	case NodeTypeUIComponent:
+		return "ui_component"
+	case NodeTypeStyleGuide:
+		return "style_guide"
+	case NodeTypeDesignAsset:
+		return "design_asset"
+	case NodeTypeInspection:
+		return "inspection"
+	case NodeTypeCodeReview:
+		return "code_review"
+	case NodeTypeQualityMetric:
+		return "quality_metric"
+	case NodeTypeTestCase:
+		return "test_case"
+	case NodeTypeTestSuite:
+		return "test_suite"
+	case NodeTypeTestResult:
+		return "test_result"
+	case NodeTypeWorkflowDef:
+		return "workflow_def"
+	case NodeTypeAgentConfig:
+		return "agent_config"
+	case NodeTypePipeline:
+		return "pipeline"
+	case NodeTypeRoutingRule:
+		return "routing_rule"
+	case NodeTypeIntentPattern:
+		return "intent_pattern"
+	case NodeTypeUserQuery:
+		return "user_query"
 	default:
 		return fmt.Sprintf("node_type(%d)", nt)
 	}
@@ -308,6 +527,48 @@ func ParseNodeType(value string) (NodeType, bool) {
 		return NodeTypeBlogPost, true
 	case "tutorial":
 		return NodeTypeTutorial, true
+	case "architecture_decision":
+		return NodeTypeArchitectureDecision, true
+	case "design_pattern":
+		return NodeTypeDesignPattern, true
+	case "system_diagram":
+		return NodeTypeSystemDiagram, true
+	case "task":
+		return NodeTypeTask, true
+	case "implementation":
+		return NodeTypeImplementation, true
+	case "code_change":
+		return NodeTypeCodeChange, true
+	case "ui_component":
+		return NodeTypeUIComponent, true
+	case "style_guide":
+		return NodeTypeStyleGuide, true
+	case "design_asset":
+		return NodeTypeDesignAsset, true
+	case "inspection":
+		return NodeTypeInspection, true
+	case "code_review":
+		return NodeTypeCodeReview, true
+	case "quality_metric":
+		return NodeTypeQualityMetric, true
+	case "test_case":
+		return NodeTypeTestCase, true
+	case "test_suite":
+		return NodeTypeTestSuite, true
+	case "test_result":
+		return NodeTypeTestResult, true
+	case "workflow_def":
+		return NodeTypeWorkflowDef, true
+	case "agent_config":
+		return NodeTypeAgentConfig, true
+	case "pipeline":
+		return NodeTypePipeline, true
+	case "routing_rule":
+		return NodeTypeRoutingRule, true
+	case "intent_pattern":
+		return NodeTypeIntentPattern, true
+	case "user_query":
+		return NodeTypeUserQuery, true
 	default:
 		return NodeType(0), false
 	}

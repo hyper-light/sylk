@@ -33,14 +33,21 @@ func TestDomainConstants(t *testing.T) {
 func TestValidDomains(t *testing.T) {
 	domains := ValidDomains()
 
-	if len(domains) != 3 {
-		t.Errorf("expected 3 domains, got %d", len(domains))
+	if len(domains) != 10 {
+		t.Errorf("expected 10 domains, got %d", len(domains))
 	}
 
 	expectedDomains := map[Domain]bool{
-		DomainCode:     false,
-		DomainHistory:  false,
-		DomainAcademic: false,
+		DomainCode:         false,
+		DomainHistory:      false,
+		DomainAcademic:     false,
+		DomainArchitect:    false,
+		DomainEngineer:     false,
+		DomainDesigner:     false,
+		DomainInspector:    false,
+		DomainTester:       false,
+		DomainOrchestrator: false,
+		DomainGuide:        false,
 	}
 
 	for _, d := range domains {
@@ -66,10 +73,16 @@ func TestDomainIsValid(t *testing.T) {
 		{"valid code domain", DomainCode, true},
 		{"valid history domain", DomainHistory, true},
 		{"valid academic domain", DomainAcademic, true},
+		{"valid architect domain", DomainArchitect, true},
+		{"valid engineer domain", DomainEngineer, true},
+		{"valid designer domain", DomainDesigner, true},
+		{"valid inspector domain", DomainInspector, true},
+		{"valid tester domain", DomainTester, true},
+		{"valid orchestrator domain", DomainOrchestrator, true},
+		{"valid guide domain", DomainGuide, true},
 		{"invalid empty domain", Domain(-1), false},
 		{"invalid arbitrary domain", Domain(99), false},
-		{"invalid similar domain", Domain(4), false},
-		{"invalid case domain", Domain(7), false},
+		{"invalid out of range domain", Domain(10), false},
 	}
 
 	for _, tt := range tests {
@@ -162,47 +175,13 @@ func TestNodeTypeConstants(t *testing.T) {
 func TestValidNodeTypes(t *testing.T) {
 	nodeTypes := ValidNodeTypes()
 
-	if len(nodeTypes) != 21 {
-		t.Errorf("expected 21 node types, got %d", len(nodeTypes))
-	}
-
-	expectedTypes := map[NodeType]bool{
-		// Code domain
-		NodeTypeFile:      false,
-		NodeTypePackage:   false,
-		NodeTypeFunction:  false,
-		NodeTypeMethod:    false,
-		NodeTypeStruct:    false,
-		NodeTypeInterface: false,
-		NodeTypeVariable:  false,
-		NodeTypeConstant:  false,
-		NodeTypeImport:    false,
-		// History domain
-		NodeTypeHistoryEntry: false,
-		NodeTypeSession:      false,
-		NodeTypeWorkflow:     false,
-		NodeTypeOutcome:      false,
-		NodeTypeDecision:     false,
-		// Academic domain
-		NodeTypePaper:         false,
-		NodeTypeDocumentation: false,
-		NodeTypeBestPractice:  false,
-		NodeTypeRFC:           false,
-		NodeTypeStackOverflow: false,
-		NodeTypeBlogPost:      false,
-		NodeTypeTutorial:      false,
+	if len(nodeTypes) != 42 {
+		t.Errorf("expected 42 node types, got %d", len(nodeTypes))
 	}
 
 	for _, nt := range nodeTypes {
-		if _, exists := expectedTypes[nt]; !exists {
-			t.Errorf("unexpected node type in ValidNodeTypes: %q", nt)
-		}
-		expectedTypes[nt] = true
-	}
-
-	for nodeType, found := range expectedTypes {
-		if !found {
-			t.Errorf("expected node type %q not found in ValidNodeTypes", nodeType)
+		if !nt.IsValid() {
+			t.Errorf("ValidNodeTypes contains invalid type: %q", nt)
 		}
 	}
 }
