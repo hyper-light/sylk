@@ -255,15 +255,25 @@ type DomainDecayParams struct {
 	EffectiveSamples  float64 `json:"effective_samples"`
 }
 
+// Domain constants matching core/domain package for decay parameter mapping.
+// These are duplicated here to avoid circular imports.
+const (
+	domainLibrarian   = 0
+	domainAcademic    = 1
+	domainArchivalist = 2
+	domainArchitect   = 3
+	domainEngineer    = 4
+)
+
 // DefaultDomainDecay returns the default decay parameters for each domain.
 // These priors are based on cognitive expectations for different knowledge types:
-//   - Domain 2 (Academic): Beta(3,7) → E[d]=0.3 (slower decay, longer retention)
-//   - Domain 3 (Architect): Beta(4,6) → E[d]=0.4 (moderate decay)
-//   - Domain 4 (Engineer): Beta(6,4) → E[d]=0.6 (faster decay, task-specific)
+//   - Academic (1): Beta(3,7) → E[d]=0.3 (slower decay, longer retention)
+//   - Architect (3): Beta(4,6) → E[d]=0.4 (moderate decay)
+//   - Engineer (4): Beta(6,4) → E[d]=0.6 (faster decay, task-specific)
 //   - Other domains: Beta(5,5) → E[d]=0.5 (standard ACT-R default)
 func DefaultDomainDecay(domain int) DomainDecayParams {
 	switch domain {
-	case 2: // Academic
+	case domainAcademic: // Academic - slower decay for long-term knowledge
 		return DomainDecayParams{
 			DecayAlpha:       3.0,
 			DecayBeta:        7.0,
@@ -271,7 +281,7 @@ func DefaultDomainDecay(domain int) DomainDecayParams {
 			BaseOffsetVar:    1.0,
 			EffectiveSamples: 10.0,
 		}
-	case 3: // Architect
+	case domainArchitect: // Architect - moderate decay for design patterns
 		return DomainDecayParams{
 			DecayAlpha:       4.0,
 			DecayBeta:        6.0,
@@ -279,7 +289,7 @@ func DefaultDomainDecay(domain int) DomainDecayParams {
 			BaseOffsetVar:    1.0,
 			EffectiveSamples: 10.0,
 		}
-	case 4: // Engineer
+	case domainEngineer: // Engineer - faster decay for task-specific info
 		return DomainDecayParams{
 			DecayAlpha:       6.0,
 			DecayBeta:        4.0,
@@ -287,7 +297,7 @@ func DefaultDomainDecay(domain int) DomainDecayParams {
 			BaseOffsetVar:    1.0,
 			EffectiveSamples: 10.0,
 		}
-	default:
+	default: // Librarian, Archivalist, and others
 		return DomainDecayParams{
 			DecayAlpha:       5.0,
 			DecayBeta:        5.0,

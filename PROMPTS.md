@@ -1,4 +1,4 @@
-Examine TODO.md and find the section with "Comprehensive Parallel Execution Order", then Wave 4 , Parallel Group 4Q. For each item, in parallel (using sub-agents) find the matching architecture description for the item in ARCHITECTURE.md. Examine and understand it thoroughly. Implement according to ARCHITECTURE.md spec and use sub agents to accomplish the work required maximizing parallelism. After *EACH* submitem is created YOU MUST ALWAYS AND FOREVER:
+Examine TODO.md and find the section with "Comprehensive Parallel Execution Order", then Wave 4 , Parallel Group <INSERT_HERE>. For each item, in parallel (using sub-agents) find the matching architecture description for the item in ARCHITECTURE.md. Examine and understand it thoroughly. Implement according to ARCHITECTURE.md spec and use sub agents to accomplish the work required maximizing parallelism. After *EACH* submitem is created YOU MUST ALWAYS AND FOREVER:
 - Generate a commit.
 - Examine the cyclomatic complexity or the code your just wrote and ENSURE it is 4 or less.
 - We do NOT allow functions over 100 lines. EVER.

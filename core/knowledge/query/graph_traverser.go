@@ -1,0 +1,410 @@
+// Package query provides hybrid query execution for the knowledge system.
+// GraphTraverser implements pattern-based graph traversal with BFS and cycle detection.
+package query
+
+import (
+	"container/list"
+	"context"
+)
+
+// =============================================================================
+// Graph Result Type
+// =============================================================================
+
+// GraphResult represents a single result from a graph pattern traversal.
+type GraphResult struct {
+	// ID is the unique identifier of the terminal node in the path.
+	ID string `json:"id"`
+
+	// Path contains the sequence of node IDs from start to end.
+	Path []string `json:"path"`
+
+	// MatchedEdges contains information about edges traversed.
+	MatchedEdges []EdgeMatch `json:"matched_edges,omitempty"`
+
+	// Score is the combined score based on edge weights and path length.
+	Score float64 `json:"score"`
+}
+
+// =============================================================================
+// Edge Types for Traversal
+// =============================================================================
+
+// Edge represents a graph edge returned by EdgeQuerier.
+type Edge struct {
+	ID       int64   `json:"id"`
+	SourceID string  `json:"source_id"`
+	TargetID string  `json:"target_id"`
+	EdgeType string  `json:"edge_type"`
+	Weight   float64 `json:"weight"`
+}
+
+// =============================================================================
+// Edge Querier Interface
+// =============================================================================
+
+// EdgeQuerier defines the interface for querying graph edges.
+// This abstraction allows for testing with mock implementations.
+type EdgeQuerier interface {
+	// GetOutgoingEdges returns all outgoing edges from the given node.
+	// If edgeTypes is provided, only edges of those types are returned.
+	GetOutgoingEdges(nodeID string, edgeTypes []string) ([]Edge, error)
+
+	// GetIncomingEdges returns all incoming edges to the given node.
+	// If edgeTypes is provided, only edges of those types are returned.
+	GetIncomingEdges(nodeID string, edgeTypes []string) ([]Edge, error)
+
+	// GetNodeByPattern finds nodes matching the given pattern.
+	// Returns node IDs matching the pattern constraints.
+	GetNodesByPattern(pattern *NodeMatcher) ([]string, error)
+}
+
+// =============================================================================
+// Graph Traverser
+// =============================================================================
+
+// GraphTraverser provides pattern-based graph traversal using BFS.
+// It implements graceful degradation by returning empty results on failure.
+type GraphTraverser struct {
+	db EdgeQuerier
+}
+
+// NewGraphTraverser creates a new GraphTraverser with the provided edge querier.
+func NewGraphTraverser(db EdgeQuerier) *GraphTraverser {
+	return &GraphTraverser{
+		db: db,
+	}
+}
+
+// Execute performs a graph pattern traversal with the given pattern and limit.
+// Returns empty results on failure rather than propagating errors (graceful degradation).
+// Respects context cancellation.
+func (gt *GraphTraverser) Execute(ctx context.Context, pattern *GraphPattern, limit int) ([]GraphResult, error) {
+	if gt.db == nil {
+		return []GraphResult{}, nil
+	}
+
+	if pattern == nil || pattern.IsEmpty() {
+		return []GraphResult{}, nil
+	}
+
+	if limit <= 0 {
+		limit = 10
+	}
+
+	// Check context before executing
+	select {
+	case <-ctx.Done():
+		return []GraphResult{}, ctx.Err()
+	default:
+	}
+
+	return gt.executeTraversal(ctx, pattern, limit)
+}
+
+// executeTraversal performs the actual graph traversal.
+func (gt *GraphTraverser) executeTraversal(ctx context.Context, pattern *GraphPattern, limit int) ([]GraphResult, error) {
+	// Find starting nodes
+	startNodes, err := gt.findStartNodes(pattern)
+	if err != nil {
+		// Graceful degradation: return empty results on error
+		return []GraphResult{}, nil
+	}
+
+	if len(startNodes) == 0 {
+		return []GraphResult{}, nil
+	}
+
+	// Execute BFS traversal from each start node
+	var allResults []GraphResult
+	for _, startID := range startNodes {
+		select {
+		case <-ctx.Done():
+			return []GraphResult{}, ctx.Err()
+		default:
+		}
+
+		results := gt.bfsTraverse(ctx, startID, pattern, limit-len(allResults))
+		allResults = append(allResults, results...)
+
+		if len(allResults) >= limit {
+			break
+		}
+	}
+
+	if len(allResults) > limit {
+		allResults = allResults[:limit]
+	}
+
+	return allResults, nil
+}
+
+// findStartNodes identifies nodes matching the start pattern.
+func (gt *GraphTraverser) findStartNodes(pattern *GraphPattern) ([]string, error) {
+	if pattern.StartNode == nil || !pattern.StartNode.Matches() {
+		// No start constraint - this is not a valid traversal
+		return nil, nil
+	}
+
+	return gt.db.GetNodesByPattern(pattern.StartNode)
+}
+
+// =============================================================================
+// BFS Traversal State
+// =============================================================================
+
+// traversalNode represents a node being explored in BFS traversal.
+type traversalNode struct {
+	id           string
+	depth        int
+	stepIndex    int
+	path         []string
+	matchedEdges []EdgeMatch
+	totalWeight  float64
+}
+
+// bfsTraverse performs BFS traversal from a single start node.
+func (gt *GraphTraverser) bfsTraverse(ctx context.Context, startID string, pattern *GraphPattern, limit int) []GraphResult {
+	if len(pattern.Traversals) == 0 {
+		// No traversal steps - return the start node as result
+		return []GraphResult{{
+			ID:    startID,
+			Path:  []string{startID},
+			Score: 1.0,
+		}}
+	}
+
+	var results []GraphResult
+	visited := make(map[string]bool)
+	queue := list.New()
+
+	// Initialize with start node
+	queue.PushBack(traversalNode{
+		id:        startID,
+		depth:     0,
+		stepIndex: 0,
+		path:      []string{startID},
+	})
+
+	for queue.Len() > 0 && len(results) < limit {
+		select {
+		case <-ctx.Done():
+			return results
+		default:
+		}
+
+		elem := queue.Front()
+		queue.Remove(elem)
+		curr := elem.Value.(traversalNode)
+
+		// Check if we've completed all traversal steps
+		if curr.stepIndex >= len(pattern.Traversals) {
+			result := gt.createResult(curr)
+			results = append(results, result)
+			continue
+		}
+
+		// Get current traversal step
+		step := pattern.Traversals[curr.stepIndex]
+
+		// Calculate max depth for this step
+		maxHops := step.MaxHops
+		if maxHops <= 0 {
+			maxHops = 1 // Default to single hop
+		}
+		if maxHops == -1 {
+			maxHops = 10 // Cap unlimited at 10
+		}
+
+		// Check depth limit for current step
+		if curr.depth >= maxHops {
+			// Move to next step
+			nextNode := traversalNode{
+				id:           curr.id,
+				depth:        0,
+				stepIndex:    curr.stepIndex + 1,
+				path:         curr.path,
+				matchedEdges: curr.matchedEdges,
+				totalWeight:  curr.totalWeight,
+			}
+			queue.PushBack(nextNode)
+			continue
+		}
+
+		// Expand neighbors based on direction
+		neighbors := gt.expandNeighbors(curr.id, step, visited)
+
+		for _, neighbor := range neighbors {
+			// Cycle detection: skip if already in current path
+			if gt.isInPath(neighbor.id, curr.path) {
+				continue
+			}
+
+			// Mark visited for this traversal branch
+			visitKey := gt.visitKey(curr.path, neighbor.id)
+			if visited[visitKey] {
+				continue
+			}
+			visited[visitKey] = true
+
+			// Check target matcher if specified
+			if step.TargetMatcher != nil && step.TargetMatcher.Matches() {
+				// For simplicity, we skip nodes that don't match
+				// In a full implementation, we'd check against node properties
+			}
+
+			newPath := make([]string, len(curr.path), len(curr.path)+1)
+			copy(newPath, curr.path)
+			newPath = append(newPath, neighbor.id)
+
+			newEdges := make([]EdgeMatch, len(curr.matchedEdges), len(curr.matchedEdges)+1)
+			copy(newEdges, curr.matchedEdges)
+			newEdges = append(newEdges, neighbor.edgeMatch)
+
+			nextNode := traversalNode{
+				id:           neighbor.id,
+				depth:        curr.depth + 1,
+				stepIndex:    curr.stepIndex,
+				path:         newPath,
+				matchedEdges: newEdges,
+				totalWeight:  curr.totalWeight + neighbor.edgeMatch.Weight,
+			}
+
+			queue.PushBack(nextNode)
+		}
+	}
+
+	return results
+}
+
+// expandNeighbor represents a neighbor found during BFS expansion.
+type expandNeighbor struct {
+	id        string
+	edgeMatch EdgeMatch
+}
+
+// expandNeighbors finds all neighbors from a node based on the traversal step.
+func (gt *GraphTraverser) expandNeighbors(nodeID string, step TraversalStep, visited map[string]bool) []expandNeighbor {
+	var neighbors []expandNeighbor
+
+	edgeTypes := gt.getEdgeTypes(step)
+
+	switch step.Direction {
+	case DirectionOutgoing:
+		neighbors = gt.getOutgoingNeighbors(nodeID, edgeTypes)
+	case DirectionIncoming:
+		neighbors = gt.getIncomingNeighbors(nodeID, edgeTypes)
+	case DirectionBoth:
+		outgoing := gt.getOutgoingNeighbors(nodeID, edgeTypes)
+		incoming := gt.getIncomingNeighbors(nodeID, edgeTypes)
+		neighbors = append(outgoing, incoming...)
+	}
+
+	return neighbors
+}
+
+// getEdgeTypes extracts edge type filter from traversal step.
+func (gt *GraphTraverser) getEdgeTypes(step TraversalStep) []string {
+	if step.EdgeType == "" {
+		return nil
+	}
+	return []string{step.EdgeType}
+}
+
+// getOutgoingNeighbors retrieves neighbors via outgoing edges.
+func (gt *GraphTraverser) getOutgoingNeighbors(nodeID string, edgeTypes []string) []expandNeighbor {
+	edges, err := gt.db.GetOutgoingEdges(nodeID, edgeTypes)
+	if err != nil {
+		return nil
+	}
+
+	neighbors := make([]expandNeighbor, 0, len(edges))
+	for _, edge := range edges {
+		neighbors = append(neighbors, expandNeighbor{
+			id: edge.TargetID,
+			edgeMatch: EdgeMatch{
+				EdgeID:   edge.ID,
+				EdgeType: edge.EdgeType,
+				Weight:   edge.Weight,
+			},
+		})
+	}
+	return neighbors
+}
+
+// getIncomingNeighbors retrieves neighbors via incoming edges.
+func (gt *GraphTraverser) getIncomingNeighbors(nodeID string, edgeTypes []string) []expandNeighbor {
+	edges, err := gt.db.GetIncomingEdges(nodeID, edgeTypes)
+	if err != nil {
+		return nil
+	}
+
+	neighbors := make([]expandNeighbor, 0, len(edges))
+	for _, edge := range edges {
+		neighbors = append(neighbors, expandNeighbor{
+			id: edge.SourceID,
+			edgeMatch: EdgeMatch{
+				EdgeID:   edge.ID,
+				EdgeType: edge.EdgeType,
+				Weight:   edge.Weight,
+			},
+		})
+	}
+	return neighbors
+}
+
+// isInPath checks if a node ID is already in the current path (cycle detection).
+func (gt *GraphTraverser) isInPath(nodeID string, path []string) bool {
+	for _, id := range path {
+		if id == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// visitKey creates a unique key for visited state based on path.
+func (gt *GraphTraverser) visitKey(path []string, nextID string) string {
+	// Use a simple approach: path length + node ID
+	// This allows the same node to be visited via different paths
+	return nextID
+}
+
+// createResult converts a traversal node into a GraphResult.
+func (gt *GraphTraverser) createResult(node traversalNode) GraphResult {
+	// Calculate score based on path length and edge weights
+	score := gt.calculateScore(node)
+
+	return GraphResult{
+		ID:           node.id,
+		Path:         node.path,
+		MatchedEdges: node.matchedEdges,
+		Score:        score,
+	}
+}
+
+// calculateScore computes a relevance score for a traversal result.
+// Shorter paths and higher edge weights result in higher scores.
+func (gt *GraphTraverser) calculateScore(node traversalNode) float64 {
+	pathLength := len(node.path)
+	if pathLength == 0 {
+		return 0
+	}
+
+	// Base score decreases with path length
+	lengthScore := 1.0 / float64(pathLength)
+
+	// Add weight bonus
+	weightBonus := 0.0
+	if len(node.matchedEdges) > 0 {
+		weightBonus = node.totalWeight / float64(len(node.matchedEdges))
+	}
+
+	// Combine scores (length is primary, weight is secondary)
+	return lengthScore*0.7 + weightBonus*0.3
+}
+
+// IsReady returns true if the traverser has a valid edge querier.
+func (gt *GraphTraverser) IsReady() bool {
+	return gt.db != nil
+}

@@ -1,6 +1,12 @@
 package events
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // =============================================================================
 // IndexEventType - Type of index event
@@ -117,4 +123,293 @@ type IndexEvent struct {
 
 	// Errors contains any errors that occurred during indexing
 	Errors []IndexError `json:"errors,omitempty"`
+}
+
+// =============================================================================
+// IndexEventPublisher - Publishes index events to the ActivityEventBus
+// =============================================================================
+
+// IndexEventPublisher publishes index-related events to the activity event bus.
+// It bridges the gap between the indexing system and the event-driven architecture.
+type IndexEventPublisher struct {
+	// bus is the activity event bus to publish events to
+	bus *ActivityEventBus
+
+	// sessionID is the session this publisher is associated with
+	sessionID string
+}
+
+// NewIndexEventPublisher creates a new IndexEventPublisher.
+func NewIndexEventPublisher(bus *ActivityEventBus, sessionID string) *IndexEventPublisher {
+	return &IndexEventPublisher{
+		bus:       bus,
+		sessionID: sessionID,
+	}
+}
+
+// PublishIndexStart publishes an index start event.
+func (p *IndexEventPublisher) PublishIndexStart(indexType IndexType, rootPath string) error {
+	if p.bus == nil {
+		return fmt.Errorf("event bus is nil")
+	}
+
+	content := fmt.Sprintf("Index started: type=%s, path=%s", indexType.String(), rootPath)
+
+	event := NewActivityEvent(EventTypeIndexStart, p.sessionID, content)
+	event.Category = "indexing"
+	event.FilePaths = []string{rootPath}
+	event.Keywords = []string{"index", indexType.String(), "start"}
+
+	// Store structured data
+	event.Data["index_type"] = indexType.String()
+	event.Data["root_path"] = rootPath
+
+	p.bus.Publish(event)
+	return nil
+}
+
+// PublishIndexComplete publishes an index complete event with statistics.
+func (p *IndexEventPublisher) PublishIndexComplete(indexEvent *IndexEvent) error {
+	if p.bus == nil {
+		return fmt.Errorf("event bus is nil")
+	}
+
+	if indexEvent == nil {
+		return fmt.Errorf("index event is nil")
+	}
+
+	content := fmt.Sprintf("Index completed: type=%s, files_indexed=%d, files_removed=%d, files_updated=%d, entities=%d, edges=%d, duration=%v",
+		indexEvent.IndexType.String(),
+		indexEvent.FilesIndexed,
+		indexEvent.FilesRemoved,
+		indexEvent.FilesUpdated,
+		indexEvent.EntitiesFound,
+		indexEvent.EdgesCreated,
+		indexEvent.Duration,
+	)
+
+	event := NewActivityEvent(EventTypeIndexComplete, p.sessionID, content)
+	event.Category = "indexing"
+	event.FilePaths = []string{indexEvent.RootPath}
+	event.Keywords = []string{"index", indexEvent.IndexType.String(), "complete"}
+
+	// Determine outcome based on errors
+	if len(indexEvent.Errors) > 0 {
+		event.Outcome = OutcomeFailure
+	} else {
+		event.Outcome = OutcomeSuccess
+	}
+
+	// Store statistics in data
+	event.Data["index_type"] = indexEvent.IndexType.String()
+	event.Data["root_path"] = indexEvent.RootPath
+	event.Data["duration_ms"] = indexEvent.Duration.Milliseconds()
+	event.Data["files_indexed"] = indexEvent.FilesIndexed
+	event.Data["files_removed"] = indexEvent.FilesRemoved
+	event.Data["files_updated"] = indexEvent.FilesUpdated
+	event.Data["entities_found"] = indexEvent.EntitiesFound
+	event.Data["edges_created"] = indexEvent.EdgesCreated
+	event.Data["index_version"] = indexEvent.IndexVersion
+	event.Data["prev_version"] = indexEvent.PrevVersion
+
+	// Include error details if present
+	if len(indexEvent.Errors) > 0 {
+		errorData, _ := json.Marshal(indexEvent.Errors)
+		event.Data["errors"] = string(errorData)
+		event.Data["error_count"] = len(indexEvent.Errors)
+	}
+
+	p.bus.Publish(event)
+	return nil
+}
+
+// PublishFileAdd publishes an event for a file being added to the index.
+func (p *IndexEventPublisher) PublishFileAdd(filePath string) error {
+	if p.bus == nil {
+		return fmt.Errorf("event bus is nil")
+	}
+
+	content := fmt.Sprintf("File added to index: %s", filePath)
+
+	event := NewActivityEvent(EventTypeIndexFileAdded, p.sessionID, content)
+	event.Category = "indexing"
+	event.FilePaths = []string{filePath}
+	event.Keywords = []string{"index", "file", "add"}
+	event.Outcome = OutcomeSuccess
+
+	event.Data["file_path"] = filePath
+	event.Data["operation"] = "add"
+
+	p.bus.Publish(event)
+	return nil
+}
+
+// PublishFileRemove publishes an event for a file being removed from the index.
+func (p *IndexEventPublisher) PublishFileRemove(filePath string) error {
+	if p.bus == nil {
+		return fmt.Errorf("event bus is nil")
+	}
+
+	content := fmt.Sprintf("File removed from index: %s", filePath)
+
+	event := NewActivityEvent(EventTypeIndexFileRemoved, p.sessionID, content)
+	event.Category = "indexing"
+	event.FilePaths = []string{filePath}
+	event.Keywords = []string{"index", "file", "remove"}
+	event.Outcome = OutcomeSuccess
+
+	event.Data["file_path"] = filePath
+	event.Data["operation"] = "remove"
+
+	p.bus.Publish(event)
+	return nil
+}
+
+// PublishError publishes an indexing error event.
+func (p *IndexEventPublisher) PublishError(err error, filePath string) error {
+	if p.bus == nil {
+		return fmt.Errorf("event bus is nil")
+	}
+
+	if err == nil {
+		return fmt.Errorf("error is nil")
+	}
+
+	content := fmt.Sprintf("Index error for %s: %s", filePath, err.Error())
+
+	event := NewActivityEvent(EventTypeIndexError, p.sessionID, content)
+	event.Category = "indexing"
+	event.Outcome = OutcomeFailure
+	event.Keywords = []string{"index", "error"}
+
+	if filePath != "" {
+		event.FilePaths = []string{filePath}
+	}
+
+	event.Data["error_message"] = err.Error()
+	event.Data["file_path"] = filePath
+
+	p.bus.Publish(event)
+	return nil
+}
+
+// =============================================================================
+// IndexerEventHook - Interface for StartupIndexer integration
+// =============================================================================
+
+// IndexerEventHook defines the interface for receiving indexing events.
+// This interface can be implemented by components that need to react to
+// indexing operations, such as the StartupIndexer.
+type IndexerEventHook interface {
+	// OnIndexStart is called when indexing starts.
+	OnIndexStart(indexType IndexType, rootPath string)
+
+	// OnIndexComplete is called when indexing completes.
+	OnIndexComplete(event *IndexEvent)
+
+	// OnFileAdd is called when a file is added to the index.
+	OnFileAdd(filePath string)
+
+	// OnFileRemove is called when a file is removed from the index.
+	OnFileRemove(filePath string)
+
+	// OnError is called when an error occurs during indexing.
+	OnError(err error, filePath string)
+}
+
+// =============================================================================
+// IndexEventPublisherHook - Adapter implementing IndexerEventHook
+// =============================================================================
+
+// IndexEventPublisherHook adapts IndexEventPublisher to the IndexerEventHook interface.
+// This allows the IndexEventPublisher to be used as a hook in the StartupIndexer.
+type IndexEventPublisherHook struct {
+	publisher *IndexEventPublisher
+}
+
+// NewIndexEventPublisherHook creates a new IndexEventPublisherHook.
+func NewIndexEventPublisherHook(publisher *IndexEventPublisher) *IndexEventPublisherHook {
+	return &IndexEventPublisherHook{
+		publisher: publisher,
+	}
+}
+
+// OnIndexStart implements IndexerEventHook.
+func (h *IndexEventPublisherHook) OnIndexStart(indexType IndexType, rootPath string) {
+	if h.publisher != nil {
+		_ = h.publisher.PublishIndexStart(indexType, rootPath)
+	}
+}
+
+// OnIndexComplete implements IndexerEventHook.
+func (h *IndexEventPublisherHook) OnIndexComplete(event *IndexEvent) {
+	if h.publisher != nil {
+		_ = h.publisher.PublishIndexComplete(event)
+	}
+}
+
+// OnFileAdd implements IndexerEventHook.
+func (h *IndexEventPublisherHook) OnFileAdd(filePath string) {
+	if h.publisher != nil {
+		_ = h.publisher.PublishFileAdd(filePath)
+	}
+}
+
+// OnFileRemove implements IndexerEventHook.
+func (h *IndexEventPublisherHook) OnFileRemove(filePath string) {
+	if h.publisher != nil {
+		_ = h.publisher.PublishFileRemove(filePath)
+	}
+}
+
+// OnError implements IndexerEventHook.
+func (h *IndexEventPublisherHook) OnError(err error, filePath string) {
+	if h.publisher != nil {
+		_ = h.publisher.PublishError(err, filePath)
+	}
+}
+
+// =============================================================================
+// NoOpIndexerEventHook - No-operation implementation
+// =============================================================================
+
+// NoOpIndexerEventHook is a no-operation implementation of IndexerEventHook.
+// Use this when you don't need to handle indexing events.
+type NoOpIndexerEventHook struct{}
+
+// NewNoOpIndexerEventHook creates a new NoOpIndexerEventHook.
+func NewNoOpIndexerEventHook() *NoOpIndexerEventHook {
+	return &NoOpIndexerEventHook{}
+}
+
+// OnIndexStart implements IndexerEventHook (no-op).
+func (h *NoOpIndexerEventHook) OnIndexStart(indexType IndexType, rootPath string) {}
+
+// OnIndexComplete implements IndexerEventHook (no-op).
+func (h *NoOpIndexerEventHook) OnIndexComplete(event *IndexEvent) {}
+
+// OnFileAdd implements IndexerEventHook (no-op).
+func (h *NoOpIndexerEventHook) OnFileAdd(filePath string) {}
+
+// OnFileRemove implements IndexerEventHook (no-op).
+func (h *NoOpIndexerEventHook) OnFileRemove(filePath string) {}
+
+// OnError implements IndexerEventHook (no-op).
+func (h *NoOpIndexerEventHook) OnError(err error, filePath string) {}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+// NewIndexEvent creates a new IndexEvent with generated ID and timestamp.
+func NewIndexEvent(eventType IndexEventType, sessionID string, indexType IndexType, rootPath string) *IndexEvent {
+	return &IndexEvent{
+		ID:        uuid.New().String(),
+		EventType: eventType,
+		Timestamp: time.Now(),
+		SessionID: sessionID,
+		IndexType: indexType,
+		RootPath:  rootPath,
+		Errors:    make([]IndexError, 0),
+	}
 }

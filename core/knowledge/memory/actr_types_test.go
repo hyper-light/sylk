@@ -406,11 +406,11 @@ func TestDefaultDomainDecay(t *testing.T) {
 		alpha        float64
 		beta         float64
 	}{
-		{"academic", 2, 0.3, 3.0, 7.0},
+		{"academic", 1, 0.3, 3.0, 7.0},
 		{"architect", 3, 0.4, 4.0, 6.0},
 		{"engineer", 4, 0.6, 6.0, 4.0},
-		{"standard", 0, 0.5, 5.0, 5.0},
-		{"code", 1, 0.5, 5.0, 5.0},
+		{"librarian", 0, 0.5, 5.0, 5.0},
+		{"archivalist", 2, 0.5, 5.0, 5.0},
 	}
 
 	for _, tt := range tests {
@@ -448,8 +448,9 @@ func TestDomainDecayParams_Mean(t *testing.T) {
 
 func TestDomainDecayParams_CognitiveExpectations(t *testing.T) {
 	// Academic knowledge should decay slower than engineering tasks
-	academic := DefaultDomainDecay(2)
-	engineer := DefaultDomainDecay(4)
+	// Using domain constants: Academic=1, Architect=3, Engineer=4
+	academic := DefaultDomainDecay(1) // DomainAcademic
+	engineer := DefaultDomainDecay(4) // DomainEngineer
 
 	if academic.Mean() >= engineer.Mean() {
 		t.Errorf("academic decay (%f) should be slower than engineer (%f)",
@@ -457,7 +458,7 @@ func TestDomainDecayParams_CognitiveExpectations(t *testing.T) {
 	}
 
 	// Architect should be between academic and engineer
-	architect := DefaultDomainDecay(3)
+	architect := DefaultDomainDecay(3) // DomainArchitect
 
 	if architect.Mean() <= academic.Mean() || architect.Mean() >= engineer.Mean() {
 		t.Errorf("architect decay (%f) should be between academic (%f) and engineer (%f)",

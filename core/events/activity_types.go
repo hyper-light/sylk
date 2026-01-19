@@ -35,9 +35,11 @@ const (
 	EventTypeLLMResponse EventType = 9
 
 	// Indexing events
-	EventTypeIndexStart     EventType = 10
-	EventTypeIndexComplete  EventType = 11
-	EventTypeIndexFileAdded EventType = 12
+	EventTypeIndexStart       EventType = 10
+	EventTypeIndexComplete    EventType = 11
+	EventTypeIndexFileAdded   EventType = 12
+	EventTypeIndexFileRemoved EventType = 17
+	EventTypeIndexError       EventType = 18
 
 	// Context management events
 	EventTypeContextEviction EventType = 13
@@ -64,6 +66,8 @@ func ValidEventTypes() []EventType {
 		EventTypeIndexStart,
 		EventTypeIndexComplete,
 		EventTypeIndexFileAdded,
+		EventTypeIndexFileRemoved,
+		EventTypeIndexError,
 		EventTypeContextEviction,
 		EventTypeContextRestore,
 		EventTypeSuccess,
@@ -109,6 +113,10 @@ func (et EventType) String() string {
 		return "index_complete"
 	case EventTypeIndexFileAdded:
 		return "index_file_added"
+	case EventTypeIndexFileRemoved:
+		return "index_file_removed"
+	case EventTypeIndexError:
+		return "index_error"
 	case EventTypeContextEviction:
 		return "context_eviction"
 	case EventTypeContextRestore:
@@ -150,6 +158,10 @@ func ParseEventType(value string) (EventType, bool) {
 		return EventTypeIndexComplete, true
 	case "index_file_added":
 		return EventTypeIndexFileAdded, true
+	case "index_file_removed":
+		return EventTypeIndexFileRemoved, true
+	case "index_error":
+		return EventTypeIndexError, true
 	case "context_eviction":
 		return EventTypeContextEviction, true
 	case "context_restore":
@@ -330,8 +342,10 @@ func defaultImportance(eventType EventType) float64 {
 		return 0.40
 	case EventTypeIndexStart:
 		return 0.35
-	case EventTypeIndexFileAdded:
+	case EventTypeIndexFileAdded, EventTypeIndexFileRemoved:
 		return 0.30
+	case EventTypeIndexError:
+		return 0.80
 	default:
 		return 0.50
 	}
