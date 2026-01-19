@@ -3388,59 +3388,59 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to create:** `core/search/git/client.go`
 
 **Acceptance Criteria:**
-- [ ] `GitClient` wraps go-git/v5
-- [ ] `NewGitClient(repoPath) (*GitClient, error)`
-- [ ] `IsGitRepo()`, `GetHead()`, `GetBranch()`, `GetRemote()`
-- [ ] Thread-safe, graceful non-git handling
+- [x] `GitClient` wraps go-git/v5
+- [x] `NewGitClient(repoPath) (*GitClient, error)`
+- [x] `IsGitRepo()`, `GetHead()`, `GetBranch()`, `GetRemote()`
+- [x] Thread-safe, graceful non-git handling
 
 ### DS.6.2 Git File History
 
 **Files to create:** `core/search/git/history.go`
 
 **Acceptance Criteria:**
-- [ ] `GetFileHistory(path, limit) ([]*CommitInfo, error)`
-- [ ] `CommitInfo`: Hash, Author, Date, Message, FilesChanged
-- [ ] `GetFileAtCommit(path, hash) ([]byte, error)`
-- [ ] Follows renames
+- [x] `GetFileHistory(path, limit) ([]*CommitInfo, error)`
+- [x] `CommitInfo`: Hash, Author, Date, Message, FilesChanged
+- [x] `GetFileAtCommit(path, hash) ([]byte, error)`
+- [x] Follows renames
 
 ### DS.6.3 Git Blame Integration
 
 **Files to create:** `core/search/git/blame.go`
 
 **Acceptance Criteria:**
-- [ ] `GetBlameInfo(path) ([]*BlameEntry, error)`
-- [ ] `BlameEntry`: Line, CommitHash, Author, Date, Content
-- [ ] `GetBlameRange(path, start, end)`
-- [ ] Caches results
+- [x] `GetBlameInfo(path) ([]*BlameEntry, error)`
+- [x] `BlameEntry`: Line, CommitHash, Author, Date, Content
+- [x] `GetBlameRange(path, start, end)`
+- [x] Caches results
 
 ### DS.6.4 Git Diff Support
 
 **Files to create:** `core/search/git/diff.go`
 
 **Acceptance Criteria:**
-- [ ] `GetDiff(from, to) ([]*FileDiff, error)`
-- [ ] `FileDiff`: Path, Status, Hunks
-- [ ] `GetWorkingTreeDiff()`, `GetStagedDiff()`
+- [x] `GetDiff(from, to) ([]*FileDiff, error)`
+- [x] `FileDiff`: Path, Status, Hunks
+- [x] `GetWorkingTreeDiff()`, `GetStagedDiff()`
 
 ### DS.6.5 Git Modified Files Detection
 
 **Files to create:** `core/search/git/modified.go`
 
 **Acceptance Criteria:**
-- [ ] `ListModifiedFiles(since) ([]string, error)`
-- [ ] `ListModifiedFilesSinceCommit(hash)`
-- [ ] `GetCommitsSince(since)`
-- [ ] `GetFilesInCommit(hash)`
+- [x] `ListModifiedFiles(since) ([]string, error)`
+- [x] `ListModifiedFilesSinceCommit(hash)`
+- [x] `GetCommitsSince(since)`
+- [x] `GetFilesInCommit(hash)`
 
 ### DS.6.6 Git Integration Manager
 
 **Files to create:** `core/search/git/manager.go`
 
 **Acceptance Criteria:**
-- [ ] `GitManager` coordinates all git operations
-- [ ] Lazy initialization
-- [ ] Caches repository object
-- [ ] Integrates with FileHandleBudget
+- [x] `GitManager` coordinates all git operations
+- [x] Lazy initialization
+- [x] Caches repository object
+- [x] Integrates with FileHandleBudget
 
 ### DS.7.1 Cross-Validator Types
 
