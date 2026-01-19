@@ -32070,8 +32070,1086 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 100-120 parallel engineer pipelines (increased for DE system)  │
-│ DEPENDENCIES: Wave 3 complete, Group 4L (Document Search), Group 4M (partial)      │
+│ ════════════════════════════════════════════════════════════════════════════════════│
+│ KNOWLEDGE GRAPH EXTENSION GROUPS (4S-4X)                                            │
+│ ** ARCHITECTURE: See GRAPH.md for full specification **                             │
+│ ** BUILDS ON: VectorGraphDB (SQLite + HNSW) + Bleve **                              │
+│ ════════════════════════════════════════════════════════════════════════════════════│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4S: Knowledge Graph Schema Extensions (KG.1-KG.8)                ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 3 "Storage Layer Integration" **              ││
+│ │ ** EXTENDS: VectorGraphDB SQLite schema with KG capabilities **                 ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES:                                                              ││
+│ │   1. Bi-temporal edge model (valid-time + transaction-time)                     ││
+│ │   2. Entity table for canonical code entities                                   ││
+│ │   3. Alias table for name resolution                                            ││
+│ │   4. Ontology tables for constraint validation                                  ││
+│ │   5. Inference rule storage for Horn clauses                                    ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - Schema migrations):                                     ││
+│ │                                                                                  ││
+│ │ • KG.1.1 Temporal Edge Columns (core/vectorgraphdb/migrations/)                 ││
+│ │   - ALTER edges: valid_from, valid_to, tx_start, tx_end INTEGER columns         ││
+│ │   - Bi-temporal model: valid-time (when true) + transaction-time (when known)   ││
+│ │   - Index: idx_edges_valid_time(source_id, valid_from, valid_to)                ││
+│ │   - Index: idx_edges_tx_time(source_id, tx_start, tx_end)                       ││
+│ │   - Partial index: idx_edges_current WHERE valid_to IS NULL                     ││
+│ │   ACCEPTANCE: Migration runs, temporal queries work, indexes used               ││
+│ │   FILES: core/vectorgraphdb/migrations/005_temporal_edges.go                    ││
+│ │                                                                                  ││
+│ │ • KG.1.2 Entity Table (core/vectorgraphdb/migrations/)                          ││
+│ │   - CREATE TABLE entities(id TEXT PK, canonical_name TEXT, entity_type INT,     ││
+│ │     source_node_id TEXT FK, created_at TEXT, updated_at TEXT)                   ││
+│ │   - Entity types: Function(0), Type(1), Variable(2), Import(3), File(4),        ││
+│ │     Module(5), Package(6), Interface(7), Method(8), Constant(9)                 ││
+│ │   - Foreign key to nodes table                                                  ││
+│ │   - Index: idx_entities_canonical(canonical_name, entity_type)                  ││
+│ │   ACCEPTANCE: Entity table created, FK constraints work                         ││
+│ │   FILES: core/vectorgraphdb/migrations/006_entity_table.go                      ││
+│ │                                                                                  ││
+│ │ • KG.1.3 Alias Table (core/vectorgraphdb/migrations/)                           ││
+│ │   - CREATE TABLE entity_aliases(id INTEGER PK, entity_id TEXT FK,               ││
+│ │     alias TEXT, alias_type TEXT, confidence REAL, created_at TEXT)              ││
+│ │   - Alias types: canonical, import_alias, type_alias, shorthand, qualified      ││
+│ │   - Index: idx_aliases_lookup(alias, entity_id)                                 ││
+│ │   ACCEPTANCE: Alias resolution works, confidence scores stored                  ││
+│ │   FILES: core/vectorgraphdb/migrations/007_alias_table.go                       ││
+│ │                                                                                  ││
+│ │ • KG.1.4 Ontology Tables (core/vectorgraphdb/migrations/)                       ││
+│ │   - CREATE TABLE ontology_classes(id TEXT PK, name TEXT, parent_id TEXT FK,     ││
+│ │     description TEXT, created_at TEXT)                                          ││
+│ │   - CREATE TABLE ontology_constraints(id INTEGER PK, class_id TEXT FK,          ││
+│ │     constraint_type TEXT, constraint_value TEXT)                                ││
+│ │   - Constraint types: allowed_edges, required_properties, cardinality           ││
+│ │   - Index: idx_ontology_hierarchy(parent_id)                                    ││
+│ │   ACCEPTANCE: Ontology hierarchy navigable, constraints validate                ││
+│ │   FILES: core/vectorgraphdb/migrations/008_ontology_tables.go                   ││
+│ │                                                                                  ││
+│ │ • KG.1.5 Inference Rule Table (core/vectorgraphdb/migrations/)                  ││
+│ │   - CREATE TABLE inference_rules(id TEXT PK, name TEXT, head_subject TEXT,      ││
+│ │     head_predicate TEXT, head_object TEXT, body_json TEXT, priority INT,        ││
+│ │     enabled INT DEFAULT 1, created_at TEXT)                                     ││
+│ │   - Horn clause storage: body = JSON array of {subject, predicate, object}      ││
+│ │   - CREATE TABLE materialized_edges(id INTEGER PK, rule_id TEXT FK,             ││
+│ │     edge_id INTEGER FK, derived_at TEXT)                                        ││
+│ │   - Index: idx_inference_enabled(enabled, priority)                             ││
+│ │   ACCEPTANCE: Rules stored, materialized edges tracked                          ││
+│ │   FILES: core/vectorgraphdb/migrations/009_inference_rules.go                   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After KG.1.x - Go types):                                              ││
+│ │                                                                                  ││
+│ │ • KG.2.1 Temporal Edge Types (core/vectorgraphdb/temporal_types.go)             ││
+│ │   - TemporalEdge struct: embeds Edge, adds ValidFrom, ValidTo, TxStart, TxEnd   ││
+│ │   - TimeRange struct: Start, End time.Time for query predicates                 ││
+│ │   - TemporalQueryOptions: AsOf, Between, ValidAt query modes                    ││
+│ │   - IsValidAt(t time.Time) bool, OverlapsWith(other TimeRange) bool methods     ││
+│ │   ACCEPTANCE: Types compile, JSON serializable, temporal predicates work        ││
+│ │   FILES: core/vectorgraphdb/temporal_types.go, temporal_types_test.go           ││
+│ │                                                                                  ││
+│ │ • KG.2.2 Entity Types (core/vectorgraphdb/entity_types.go)                      ││
+│ │   - Entity struct: ID, CanonicalName, EntityType, SourceNodeID, Aliases []Alias ││
+│ │   - EntityType enum with String() method and ParseEntityType(s string)          ││
+│ │   - EntityAlias struct: Alias, AliasType, Confidence float64                    ││
+│ │   - AliasType enum: AliasCanonical, AliasImport, AliasType, AliasShorthand      ││
+│ │   ACCEPTANCE: Types compile, all entity types represented, JSON works           ││
+│ │   FILES: core/vectorgraphdb/entity_types.go, entity_types_test.go               ││
+│ │                                                                                  ││
+│ │ • KG.2.3 Ontology Types (core/vectorgraphdb/ontology_types.go)                  ││
+│ │   - OntologyClass struct: ID, Name, ParentID, Description, Children []*Class    ││
+│ │   - OntologyConstraint struct: ID, ClassID, Type, Value                         ││
+│ │   - ConstraintType enum: AllowedEdges, RequiredProperties, Cardinality          ││
+│ │   - IsChildOf(classID string) bool, GetAllowedEdges() []EdgeType methods        ││
+│ │   ACCEPTANCE: Types compile, hierarchy navigable, constraints queryable         ││
+│ │   FILES: core/vectorgraphdb/ontology_types.go, ontology_types_test.go           ││
+│ │                                                                                  ││
+│ │ • KG.2.4 Inference Rule Types (core/vectorgraphdb/inference_types.go)           ││
+│ │   - InferenceRule struct: ID, Name, Head RuleAtom, Body []RuleAtom, Priority    ││
+│ │   - RuleAtom struct: Subject, Predicate, Object (can be variables: ?x, ?y)      ││
+│ │   - IsVariable(term string) bool, GetVariables() []string methods               ││
+│ │   - MaterializedEdge struct: RuleID, EdgeID, DerivedAt time.Time                ││
+│ │   ACCEPTANCE: Horn clauses representable, variables bindable, JSON works        ││
+│ │   FILES: core/vectorgraphdb/inference_types.go, inference_types_test.go         ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/vectorgraphdb/migrations/005_temporal_edges.go - KG.1.1                  ││
+│ │   core/vectorgraphdb/migrations/006_entity_table.go - KG.1.2                    ││
+│ │   core/vectorgraphdb/migrations/007_alias_table.go - KG.1.3                     ││
+│ │   core/vectorgraphdb/migrations/008_ontology_tables.go - KG.1.4                 ││
+│ │   core/vectorgraphdb/migrations/009_inference_rules.go - KG.1.5                 ││
+│ │   core/vectorgraphdb/temporal_types.go - KG.2.1                                 ││
+│ │   core/vectorgraphdb/entity_types.go - KG.2.2                                   ││
+│ │   core/vectorgraphdb/ontology_types.go - KG.2.3                                 ││
+│ │   core/vectorgraphdb/inference_types.go - KG.2.4                                ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (5 parallel migrations) → Phase 2 (4 parallel type definitions)       ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Existing VectorGraphDB SQLite infrastructure                                ││
+│ │   - Existing migration framework                                                ││
+│ │   - No external Go packages required                                            ││
+│ │                                                                                  ││
+│ │ MEMORY COST: Negligible (schema only, no runtime memory)                        ││
+│ │ CPU COST: Migration is one-time                                                 ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                     ││
+│ │   Schema foundation must exist before entity extraction (4T), inference (4V),   ││
+│ │   and temporal queries (4W) can be implemented.                                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4T: Entity & Relation Extraction (ER.1-ER.14)                    ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 4-5 "Entity/Relation Extraction Pipeline" ** ││
+│ │ ** USES: Tree-Sitter from Group 4E for AST parsing **                           ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES:                                                              ││
+│ │   1. Extract entities from AST via Tree-Sitter (reuse 4E infrastructure)        ││
+│ │   2. Build symbol table for cross-file resolution                               ││
+│ │   3. Extract relations (calls, imports, extends, implements)                    ││
+│ │   4. Validate relations against ontology constraints                            ││
+│ │   5. Incremental extraction on file changes                                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - Type definitions):                                      ││
+│ │                                                                                  ││
+│ │ • ER.1.1 ExtractedEntity Type (core/knowledge/entity_types.go)                  ││
+│ │   - Name, Kind EntityKind, FilePath, StartLine, EndLine, Signature string       ││
+│ │   - Scope (ScopeGlobal, ScopeModule, ScopeFunction, ScopeBlock)                 ││
+│ │   - Visibility (VisibilityPublic, VisibilityPrivate, VisibilityInternal)        ││
+│ │   - References []EntityReference for usage tracking                             ││
+│ │   - EntityKind enum: Function, Type, Variable, Import, Constant, Interface...   ││
+│ │   ACCEPTANCE: All Go/TS/Python entities representable, JSON serializable        ││
+│ │   FILES: core/knowledge/entity_types.go, entity_types_test.go                   ││
+│ │                                                                                  ││
+│ │ • ER.1.2 ExtractedRelation Type (core/knowledge/relation_types.go)              ││
+│ │   - SourceEntity, TargetEntity *ExtractedEntity                                 ││
+│ │   - RelationType (RelCalls, RelImports, RelExtends, RelImplements, RelUses...)  ││
+│ │   - Evidence []EvidenceSpan (line numbers, snippets proving relation)           ││
+│ │   - Confidence float64, ExtractedAt time.Time                                   ││
+│ │   ACCEPTANCE: Relations capture all 29 edge types, evidence tracked             ││
+│ │   FILES: core/knowledge/relation_types.go, relation_types_test.go               ││
+│ │                                                                                  ││
+│ │ • ER.1.3 ExtractionContext Type (core/knowledge/extraction_context.go)          ││
+│ │   - FilePath, Language string, ParseTree *sitter.Tree                           ││
+│ │   - SymbolTable *SymbolTable, ParentScope string, ImportMap map[string]string   ││
+│ │   - WithScope(name string) *ExtractionContext for nested scopes                 ││
+│ │   ACCEPTANCE: Context carries all extraction state, scopes chainable            ││
+│ │   FILES: core/knowledge/extraction_context.go                                   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After ER.1.x - Symbol table):                                          ││
+│ │                                                                                  ││
+│ │ • ER.2.1 SymbolTable (core/knowledge/symbol_table.go)                           ││
+│ │   - Scopes map[string]*Scope, CurrentScope *Scope, RootScope *Scope             ││
+│ │   - Scope struct: Name, Parent *Scope, Symbols map[string]*Entity               ││
+│ │   - Define(name string, entity *ExtractedEntity) error                          ││
+│ │   - Resolve(name string) (*ExtractedEntity, bool) with scope chain walk         ││
+│ │   - EnterScope(name string), ExitScope() for AST traversal                      ││
+│ │   - ResolveQualified(pkg, name string) for cross-package resolution             ││
+│ │   ACCEPTANCE: Symbol resolution works across scopes, shadowing handled          ││
+│ │   FILES: core/knowledge/symbol_table.go, symbol_table_test.go                   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (All parallel - Language extractors, depend on ER.2.1):                 ││
+│ │                                                                                  ││
+│ │ • ER.3.1 Go Entity Extractor (core/knowledge/extractors/go_extractor.go)        ││
+│ │   - Uses Tree-Sitter Go grammar from Group 4E                                   ││
+│ │   - Extracts: functions, methods, types, interfaces, structs, consts, vars      ││
+│ │   - Handles: embedded types, interface composition, method receivers            ││
+│ │   - ExtractEntities(ctx *ExtractionContext) ([]ExtractedEntity, error)          ││
+│ │   - ExtractRelations(ctx, entities) ([]ExtractedRelation, error)                ││
+│ │   ACCEPTANCE: All Go entities extracted, test coverage > 90%                    ││
+│ │   DEPENDS ON: Group 4E (Tree-Sitter), ER.2.1 (SymbolTable)                      ││
+│ │   FILES: core/knowledge/extractors/go_extractor.go, go_extractor_test.go        ││
+│ │                                                                                  ││
+│ │ • ER.3.2 TypeScript Extractor (core/knowledge/extractors/ts_extractor.go)       ││
+│ │   - Uses Tree-Sitter TypeScript grammar from Group 4E                           ││
+│ │   - Extracts: functions, classes, interfaces, types, enums, React components    ││
+│ │   - Handles: generics, decorators, JSX, module re-exports                       ││
+│ │   ACCEPTANCE: All TS/TSX entities extracted, test coverage > 90%                ││
+│ │   FILES: core/knowledge/extractors/ts_extractor.go, ts_extractor_test.go        ││
+│ │                                                                                  ││
+│ │ • ER.3.3 Python Entity Extractor (core/knowledge/extractors/py_extractor.go)    ││
+│ │   - Uses Tree-Sitter Python grammar from Group 4E                               ││
+│ │   - Extracts: functions, classes, methods, modules, decorators                  ││
+│ │   - Handles: dataclasses, type hints, __init__.py modules                       ││
+│ │   ACCEPTANCE: All Python entities extracted, test coverage > 90%                ││
+│ │   FILES: core/knowledge/extractors/py_extractor.go, py_extractor_test.go        ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After ER.3.x - Relation extraction):                                   ││
+│ │                                                                                  ││
+│ │ • ER.4.1 CallGraphExtractor (core/knowledge/relations/call_graph.go)            ││
+│ │   - Extract function call relationships from AST                                ││
+│ │   - Handle: direct calls, method calls, interface dispatch, closures            ││
+│ │   - Track call sites with line numbers for evidence                             ││
+│ │   - Mark indirect calls (via interface) with lower confidence                   ││
+│ │   ACCEPTANCE: Call graph accurate, indirect calls marked uncertain              ││
+│ │   FILES: core/knowledge/relations/call_graph.go, call_graph_test.go             ││
+│ │                                                                                  ││
+│ │ • ER.4.2 ImportGraphExtractor (core/knowledge/relations/import_graph.go)        ││
+│ │   - Extract import/require relationships                                        ││
+│ │   - Handle: aliased imports, re-exports, circular detection                     ││
+│ │   - Resolve relative imports to absolute paths                                  ││
+│ │   ACCEPTANCE: Import graph complete, aliases resolved, cycles detected          ││
+│ │   FILES: core/knowledge/relations/import_graph.go, import_graph_test.go         ││
+│ │                                                                                  ││
+│ │ • ER.4.3 TypeRelationExtractor (core/knowledge/relations/type_relations.go)     ││
+│ │   - Extract: extends, implements, embeds relationships                          ││
+│ │   - Handle: generics, type parameters, interface satisfaction                   ││
+│ │   - Track inheritance hierarchy depth                                           ││
+│ │   ACCEPTANCE: Type hierarchy accurate, generics handled                         ││
+│ │   FILES: core/knowledge/relations/type_relations.go, type_relations_test.go     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After ER.4.x - Entity linker & validator):                             ││
+│ │                                                                                  ││
+│ │ • ER.5.1 EntityLinker (core/knowledge/entity_linker.go)                         ││
+│ │   - Link extracted entities to VectorGraphDB nodes                              ││
+│ │   - Resolve aliases to canonical entities                                       ││
+│ │   - Handle cross-file references via symbol table                               ││
+│ │   - CreateOrUpdate(entity) with deduplication by content hash                   ││
+│ │   - LinkRelation(relation) creates edge in VectorGraphDB                        ││
+│ │   ACCEPTANCE: Entities linked correctly, no duplicates, aliases resolved        ││
+│ │   FILES: core/knowledge/entity_linker.go, entity_linker_test.go                 ││
+│ │                                                                                  ││
+│ │ • ER.5.2 RelationValidator (core/knowledge/relation_validator.go)               ││
+│ │   - Validate relations against ontology constraints (from KG.1.4)               ││
+│ │   - Check: allowed edge types between entity kinds                              ││
+│ │   - Check: cardinality constraints (e.g., max 1 extends for class)              ││
+│ │   - Validate(relation) (bool, []ValidationError)                                ││
+│ │   ACCEPTANCE: Invalid relations rejected, violations logged with reasons        ││
+│ │   DEPENDS ON: Group 4S (KG.1.4 Ontology Tables)                                 ││
+│ │   FILES: core/knowledge/relation_validator.go, relation_validator_test.go       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After ER.5.x - Pipeline orchestration):                                ││
+│ │                                                                                  ││
+│ │ • ER.6.1 ExtractionPipeline (core/knowledge/extraction_pipeline.go)             ││
+│ │   - Orchestrates extraction on file changes                                     ││
+│ │   - Incremental: only re-extract changed files + dependents                     ││
+│ │   - Uses GoroutineScope for parallel extraction (Wave 4 4G compliant)           ││
+│ │   - Integrates with DS.4.5 Change Detection Coordinator from 4L                 ││
+│ │   - ExtractFile(path) error, ExtractProject(root) error                         ││
+│ │   - OnFileChanged(path) error (incremental trigger)                             ││
+│ │   ACCEPTANCE: Extraction triggers on changes, incremental < 100ms for 1 file    ││
+│ │   DEPENDS ON: Group 4G (GoroutineScope), Group 4L (DS.4.5)                      ││
+│ │   FILES: core/knowledge/extraction_pipeline.go, extraction_pipeline_test.go     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (Integration tests):                                                    ││
+│ │                                                                                  ││
+│ │ • ER.7.1 Go extraction integration tests                                        ││
+│ │ • ER.7.2 TypeScript extraction integration tests                                ││
+│ │ • ER.7.3 Python extraction integration tests                                    ││
+│ │ • ER.7.4 Cross-file symbol resolution tests                                     ││
+│ │ • ER.7.5 Incremental extraction tests                                           ││
+│ │   FILES: core/knowledge/extractors/integration_test.go                          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/knowledge/entity_types.go - ER.1.1                                       ││
+│ │   core/knowledge/relation_types.go - ER.1.2                                     ││
+│ │   core/knowledge/extraction_context.go - ER.1.3                                 ││
+│ │   core/knowledge/symbol_table.go - ER.2.1                                       ││
+│ │   core/knowledge/extractors/go_extractor.go - ER.3.1                            ││
+│ │   core/knowledge/extractors/ts_extractor.go - ER.3.2                            ││
+│ │   core/knowledge/extractors/py_extractor.go - ER.3.3                            ││
+│ │   core/knowledge/relations/call_graph.go - ER.4.1                               ││
+│ │   core/knowledge/relations/import_graph.go - ER.4.2                             ││
+│ │   core/knowledge/relations/type_relations.go - ER.4.3                           ││
+│ │   core/knowledge/entity_linker.go - ER.5.1                                      ││
+│ │   core/knowledge/relation_validator.go - ER.5.2                                 ││
+│ │   core/knowledge/extraction_pipeline.go - ER.6.1                                ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (3 parallel) → Phase 2 → Phase 3 (3 parallel) →                       ││
+│ │   Phase 4 (3 parallel) → Phase 5 (2 parallel) → Phase 6 → Phase 7               ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Group 4E: Tree-Sitter CVS Integration (AST parsing)                         ││
+│ │   - Group 4G: Goroutine Management (parallel extraction)                        ││
+│ │   - Group 4L: Document Search (change detection)                                ││
+│ │   - Group 4S: Schema Extensions (ontology tables for validation)                ││
+│ │                                                                                  ││
+│ │ MEMORY COST: ~50 MB per project (symbol tables, in-flight extractions)          ││
+│ │ CPU COST: Initial extraction ~5s for 10K files, incremental <100ms              ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                     ││
+│ │   Entity extraction builds the knowledge graph foundation.                      ││
+│ │   Depends on Tree-Sitter (4E) and change detection (4L).                        ││
+│ │   Required before inference (4V) or hybrid queries (4U) can work.               ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4U: Hybrid Query Coordinator (HQ.1-HQ.12)                        ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 6 "Hybrid Query Coordinator" **               ││
+│ │ ** COORDINATES: Bleve (text) × HNSW (semantic) × Graph (traversal) **           ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES:                                                              ││
+│ │   1. Three-way parallel search: Bleve, HNSW, Graph traversal                    ││
+│ │   2. RRF (Reciprocal Rank Fusion) for score combination                         ││
+│ │   3. Learned weights via Thompson Sampling (reuse 4Q pattern)                   ││
+│ │   4. Domain filtering integration with 4P                                       ││
+│ │   5. Timeout handling with partial results                                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - Type definitions):                                      ││
+│ │                                                                                  ││
+│ │ • HQ.1.1 HybridQuery Type (core/knowledge/query/hybrid_query.go)                ││
+│ │   - TextQuery string (for Bleve), SemanticVector []float32 (for HNSW)           ││
+│ │   - GraphPattern *GraphPattern (for traversal)                                  ││
+│ │   - Filters []QueryFilter (domain, entity type, time range)                     ││
+│ │   - Weights: TextWeight, SemanticWeight, GraphWeight *LearnedWeight             ││
+│ │   - Limit int, Timeout time.Duration                                            ││
+│ │   ACCEPTANCE: All query modalities representable, weights learnable             ││
+│ │   FILES: core/knowledge/query/hybrid_query.go                                   ││
+│ │                                                                                  ││
+│ │ • HQ.1.2 GraphPattern Type (core/knowledge/query/graph_pattern.go)              ││
+│ │   - StartNode *NodeMatcher (entity type, name pattern, properties)              ││
+│ │   - Traversals []TraversalStep                                                  ││
+│ │   - TraversalStep: EdgeType, Direction, TargetMatcher, MaxHops int              ││
+│ │   - NodeMatcher: EntityType, NamePattern (regex), PropertyFilters               ││
+│ │   ACCEPTANCE: Pattern expresses multi-hop graph queries                         ││
+│ │   FILES: core/knowledge/query/graph_pattern.go                                  ││
+│ │                                                                                  ││
+│ │ • HQ.1.3 HybridResult Type (core/knowledge/query/hybrid_result.go)              ││
+│ │   - ID, Content string, Score float64                                           ││
+│ │   - TextScore, SemanticScore, GraphScore float64 (component breakdown)          ││
+│ │   - MatchedEdges []EdgeMatch, TraversalPath []string (for graph matches)        ││
+│ │   - Source enum: SourceBleve, SourceHNSW, SourceGraph, SourceCombined           ││
+│ │   - MemoryActivation, MemoryFactor float64 (from 4X integration)                ││
+│ │   ACCEPTANCE: Result tracks score breakdown, source attribution complete        ││
+│ │   FILES: core/knowledge/query/hybrid_result.go                                  ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After HQ.1.x - Individual searchers):                                  ││
+│ │                                                                                  ││
+│ │ • HQ.2.1 BleveSearcher (core/knowledge/query/bleve_searcher.go)                 ││
+│ │   - Execute(textQuery string, limit int) ([]TextResult, error)                  ││
+│ │   - Wraps Bleve index from Group 4L                                             ││
+│ │   - Circuit breaker integration from Group 4K                                   ││
+│ │   - Graceful degradation: return empty on Bleve failure, don't block            ││
+│ │   ACCEPTANCE: Text search works, graceful degradation, <10ms p99               ││
+│ │   DEPENDS ON: Group 4L (Bleve), Group 4K (Circuit Breakers)                     ││
+│ │   FILES: core/knowledge/query/bleve_searcher.go, bleve_searcher_test.go         ││
+│ │                                                                                  ││
+│ │ • HQ.2.2 VectorSearcher (core/knowledge/query/vector_searcher.go)               ││
+│ │   - Execute(vector []float32, limit int) ([]VectorResult, error)                ││
+│ │   - Wraps HNSW from VectorGraphDB                                               ││
+│ │   - Circuit breaker integration from Group 4K                                   ││
+│ │   - Graceful degradation: return empty on HNSW failure                          ││
+│ │   ACCEPTANCE: Semantic search works, graceful degradation, <20ms p99           ││
+│ │   DEPENDS ON: VectorGraphDB HNSW, Group 4K (Circuit Breakers)                   ││
+│ │   FILES: core/knowledge/query/vector_searcher.go, vector_searcher_test.go       ││
+│ │                                                                                  ││
+│ │ • HQ.2.3 GraphTraverser (core/knowledge/query/graph_traverser.go)               ││
+│ │   - Execute(pattern *GraphPattern, limit int) ([]GraphResult, error)            ││
+│ │   - Multi-hop traversal with edge type filtering                                ││
+│ │   - Depth-limited BFS with cycle detection                                      ││
+│ │   - Returns matched subgraphs with paths                                        ││
+│ │   ACCEPTANCE: Graph patterns resolve, cycles handled, <50ms p99                ││
+│ │   DEPENDS ON: VectorGraphDB edge storage                                        ││
+│ │   FILES: core/knowledge/query/graph_traverser.go, graph_traverser_test.go       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After HQ.2.x - Fusion & scoring):                                      ││
+│ │                                                                                  ││
+│ │ • HQ.3.1 RRFFusion (core/knowledge/query/rrf_fusion.go)                         ││
+│ │   - Fuse(text, semantic, graph []Result, weights) []HybridResult                ││
+│ │   - Reciprocal Rank Fusion: score = Σ 1/(k + rank_i) * weight_i                 ││
+│ │   - k parameter configurable (default: 60)                                      ││
+│ │   - Handles missing results from any source gracefully                          ││
+│ │   ACCEPTANCE: Fusion produces ranked list, weights affect ranking               ││
+│ │   FILES: core/knowledge/query/rrf_fusion.go, rrf_fusion_test.go                 ││
+│ │                                                                                  ││
+│ │ • HQ.3.2 LearnedQueryWeights (core/knowledge/query/learned_weights.go)          ││
+│ │   - TextWeight, SemanticWeight, GraphWeight as *LearnedWeight                   ││
+│ │   - Reuses LearnedWeight from Group 4Q (Beta distribution + Thompson)           ││
+│ │   - Update(queryID, clickedResult, weights) for learning from clicks            ││
+│ │   - Per-domain weight learning                                                  ││
+│ │   ACCEPTANCE: Weights adapt based on user behavior, per-domain works            ││
+│ │   DEPENDS ON: Group 4Q pattern (LearnedWeight type)                             ││
+│ │   FILES: core/knowledge/query/learned_weights.go, learned_weights_test.go       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After HQ.3.x - Coordinator):                                           ││
+│ │                                                                                  ││
+│ │ • HQ.4.1 HybridQueryCoordinator (core/knowledge/query/coordinator.go)           ││
+│ │   - Execute(query *HybridQuery) ([]HybridResult, error)                         ││
+│ │   - Parallel execution of all three searchers via goroutines                    ││
+│ │   - Timeout enforcement: return partial results after timeout                   ││
+│ │   - Metrics: latency per source, fusion time, timeout rate                      ││
+│ │   - Uses GoroutineScope from 4G for safe parallel execution                     ││
+│ │   ACCEPTANCE: Full hybrid query works, respects timeouts, metrics collected     ││
+│ │   DEPENDS ON: HQ.2.x, HQ.3.x, Group 4G (GoroutineScope)                         ││
+│ │   FILES: core/knowledge/query/coordinator.go, coordinator_test.go               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After HQ.4.1 - Integration):                                           ││
+│ │                                                                                  ││
+│ │ • HQ.5.1 VectorGraphDB Integration (core/vectorgraphdb/hybrid_query.go)         ││
+│ │   - VectorGraphDB.HybridQuery(query *HybridQuery) ([]HybridResult, error)       ││
+│ │   - Wraps HybridQueryCoordinator                                                ││
+│ │   - Integrates with existing VectorGraphDB.Query() methods                      ││
+│ │   ACCEPTANCE: Unified query interface, backward compatible                      ││
+│ │   MODIFY: core/vectorgraphdb/query.go (add HybridQuery method)                  ││
+│ │   FILES: core/vectorgraphdb/hybrid_query.go                                     ││
+│ │                                                                                  ││
+│ │ • HQ.5.2 Domain-Filtered Hybrid Query (core/knowledge/query/domain_filter.go)   ││
+│ │   - FilterByDomain(query *HybridQuery, domains []Domain) *HybridQuery           ││
+│ │   - Integrates with Group 4P Domain Expertise System                            ││
+│ │   - Applies domain filter to all three search sources                           ││
+│ │   ACCEPTANCE: Domain filtering works across all sources                         ││
+│ │   DEPENDS ON: Group 4P (Domain Expertise)                                       ││
+│ │   FILES: core/knowledge/query/domain_filter.go                                  ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (Integration tests):                                                    ││
+│ │                                                                                  ││
+│ │ • HQ.6.1 RRF fusion tests with known rankings                                   ││
+│ │ • HQ.6.2 Learned weight convergence tests                                       ││
+│ │ • HQ.6.3 Timeout and partial result tests                                       ││
+│ │ • HQ.6.4 Domain filter tests                                                    ││
+│ │   FILES: core/knowledge/query/integration_test.go                               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/knowledge/query/hybrid_query.go - HQ.1.1                                 ││
+│ │   core/knowledge/query/graph_pattern.go - HQ.1.2                                ││
+│ │   core/knowledge/query/hybrid_result.go - HQ.1.3                                ││
+│ │   core/knowledge/query/bleve_searcher.go - HQ.2.1                               ││
+│ │   core/knowledge/query/vector_searcher.go - HQ.2.2                              ││
+│ │   core/knowledge/query/graph_traverser.go - HQ.2.3                              ││
+│ │   core/knowledge/query/rrf_fusion.go - HQ.3.1                                   ││
+│ │   core/knowledge/query/learned_weights.go - HQ.3.2                              ││
+│ │   core/knowledge/query/coordinator.go - HQ.4.1                                  ││
+│ │   core/vectorgraphdb/hybrid_query.go - HQ.5.1                                   ││
+│ │   core/knowledge/query/domain_filter.go - HQ.5.2                                ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (3 parallel) → Phase 2 (3 parallel) → Phase 3 (2 parallel) →          ││
+│ │   Phase 4 → Phase 5 (2 parallel) → Phase 6 (4 parallel tests)                   ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Group 4G: Goroutine Management (parallel execution)                         ││
+│ │   - Group 4K: Cascading LLM Failure Prevention (circuit breakers)               ││
+│ │   - Group 4L: Document Search System (Bleve)                                    ││
+│ │   - Group 4P: Domain Expertise System (domain filtering)                        ││
+│ │   - Group 4Q: GP-Based Handoff (LearnedWeight pattern)                          ││
+│ │   - Existing VectorGraphDB (HNSW, edge storage)                                 ││
+│ │                                                                                  ││
+│ │ MEMORY COST: ~10 MB (query caches, learned weights)                             ││
+│ │ CPU COST: Hybrid query <100ms p99 (parallel execution)                          ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                     ││
+│ │   Hybrid query is the primary interface for knowledge graph retrieval.          ││
+│ │   Depends on Bleve (4L), circuit breakers (4K), and domain expertise (4P).      ││
+│ │   Integrates with memory decay (4X) for memory-weighted ranking.                ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4V: Inference Engine (IE.1-IE.10)                                ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 8 "Inference Engine" **                       ││
+│ │ ** DERIVES: New edges from existing edges via Horn clause rules **              ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES:                                                              ││
+│ │   1. Horn clause rules: IF body THEN head                                       ││
+│ │   2. Forward chaining to fixpoint                                               ││
+│ │   3. Incremental inference on edge changes                                      ││
+│ │   4. Materialized views for common derived edges                                ││
+│ │   5. Bounded transitive closure (max depth)                                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - Type definitions):                                      ││
+│ │                                                                                  ││
+│ │ • IE.1.1 RuleCondition Type (core/knowledge/inference/condition.go)             ││
+│ │   - Subject, Predicate, Object string (can be variables: ?x, ?y, ?z)            ││
+│ │   - IsVariable(term string) bool helper                                         ││
+│ │   - Unify(bindings map[string]string, edge Edge) (map[string]string, bool)      ││
+│ │   - Substitute(bindings map[string]string) RuleCondition                        ││
+│ │   ACCEPTANCE: Unification works, variables bind correctly                       ││
+│ │   FILES: core/knowledge/inference/condition.go, condition_test.go               ││
+│ │                                                                                  ││
+│ │ • IE.1.2 InferenceRule Type (core/knowledge/inference/rule.go)                  ││
+│ │   - ID, Name string, Head RuleCondition, Body []RuleCondition                   ││
+│ │   - Priority int (lower = higher priority), Enabled bool                        ││
+│ │   - Validate() error - checks rule is well-formed (all head vars in body)       ││
+│ │   - GetVariables() []string - returns all variables in rule                     ││
+│ │   ACCEPTANCE: Rules validate, malformed rules rejected with reason              ││
+│ │   FILES: core/knowledge/inference/rule.go, rule_test.go                         ││
+│ │                                                                                  ││
+│ │ • IE.1.3 InferenceResult Type (core/knowledge/inference/result.go)              ││
+│ │   - DerivedEdge Edge, RuleID string                                             ││
+│ │   - Evidence []Edge (body edges that triggered rule)                            ││
+│ │   - DerivedAt time.Time, Confidence float64                                     ││
+│ │   - Provenance string (human-readable explanation)                              ││
+│ │   ACCEPTANCE: Results track provenance, evidence complete                       ││
+│ │   FILES: core/knowledge/inference/result.go                                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After IE.1.x - Rule storage):                                          ││
+│ │                                                                                  ││
+│ │ • IE.2.1 RuleStore (core/knowledge/inference/rule_store.go)                     ││
+│ │   - LoadRules(ctx) ([]InferenceRule, error) from SQLite                         ││
+│ │   - SaveRule(ctx, rule InferenceRule) error                                     ││
+│ │   - DeleteRule(ctx, id string) error                                            ││
+│ │   - GetRulesByPriority(ctx) []InferenceRule (sorted by priority)                ││
+│ │   - GetEnabledRules(ctx) []InferenceRule                                        ││
+│ │   ACCEPTANCE: CRUD works, priority ordering correct                             ││
+│ │   DEPENDS ON: Group 4S (KG.1.5 Inference Rule Table)                            ││
+│ │   FILES: core/knowledge/inference/rule_store.go, rule_store_test.go             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After IE.2.1 - Evaluation engine):                                     ││
+│ │                                                                                  ││
+│ │ • IE.3.1 ForwardChainer (core/knowledge/inference/forward_chain.go)             ││
+│ │   - Evaluate(ctx, rules []InferenceRule) ([]InferenceResult, error)             ││
+│ │   - Iterate until fixpoint (no new edges derived)                               ││
+│ │   - MaxIterations limit to prevent infinite loops (default: 100)                ││
+│ │   - IterateOnce(ctx, rules) ([]InferenceResult, bool) returns (results, done)   ││
+│ │   ACCEPTANCE: Fixpoint reached, new edges derived correctly                     ││
+│ │   FILES: core/knowledge/inference/forward_chain.go, forward_chain_test.go       ││
+│ │                                                                                  ││
+│ │ • IE.3.2 RuleEvaluator (core/knowledge/inference/rule_evaluator.go)             ││
+│ │   - EvaluateRule(ctx, rule, edges []Edge) []InferenceResult                     ││
+│ │   - Pattern matching with backtracking                                          ││
+│ │   - Binding propagation through body conditions                                 ││
+│ │   - findBindings(ctx, conditions, edges) []map[string]string                    ││
+│ │   ACCEPTANCE: Single rule evaluation correct, backtracking works                ││
+│ │   FILES: core/knowledge/inference/rule_evaluator.go, rule_evaluator_test.go     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After IE.3.x - Materialization):                                       ││
+│ │                                                                                  ││
+│ │ • IE.4.1 MaterializationManager (core/knowledge/inference/materialization.go)   ││
+│ │   - Materialize(ctx, results []InferenceResult) error                           ││
+│ │   - Store derived edges with rule_id reference in materialized_edges table      ││
+│ │   - Track materialized edges for invalidation                                   ││
+│ │   - IsMaterialized(ctx, edgeID) bool                                            ││
+│ │   ACCEPTANCE: Derived edges queryable, tracked for updates                      ││
+│ │   DEPENDS ON: Group 4S (materialized_edges table)                               ││
+│ │   FILES: core/knowledge/inference/materialization.go, materialization_test.go   ││
+│ │                                                                                  ││
+│ │ • IE.4.2 InvalidationManager (core/knowledge/inference/invalidation.go)         ││
+│ │   - OnEdgeChange(ctx, edge Edge, changeType ChangeType) error                   ││
+│ │   - Cascade invalidation for dependent derived edges                            ││
+│ │   - Incremental re-materialization (only affected rules)                        ││
+│ │   - ChangeType enum: EdgeAdded, EdgeRemoved, EdgeModified                       ││
+│ │   ACCEPTANCE: Changes cascade correctly, no stale derived edges                 ││
+│ │   FILES: core/knowledge/inference/invalidation.go, invalidation_test.go         ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After IE.4.x - Engine facade):                                         ││
+│ │                                                                                  ││
+│ │ • IE.5.1 InferenceEngine (core/knowledge/inference/engine.go)                   ││
+│ │   - NewInferenceEngine(db *VectorGraphDB) *InferenceEngine                      ││
+│ │   - RunInference(ctx) error - full forward chaining pass                        ││
+│ │   - OnEdgeAdded(ctx, edge Edge) error - incremental inference                   ││
+│ │   - OnEdgeRemoved(ctx, edge Edge) error - incremental invalidation              ││
+│ │   - GetDerivedEdges(ctx, nodeID string) ([]Edge, error)                         ││
+│ │   - GetProvenance(ctx, edgeID int64) (*InferenceResult, error)                  ││
+│ │   ACCEPTANCE: Full and incremental inference work                               ││
+│ │   FILES: core/knowledge/inference/engine.go, engine_test.go                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After IE.5.1 - Built-in rules):                                        ││
+│ │                                                                                  ││
+│ │ • IE.6.1 Built-in Inference Rules (core/knowledge/inference/builtin_rules.go)   ││
+│ │   - TransitiveImport: A imports B, B imports C → A indirectly_imports C         ││
+│ │   - InheritedMethod: A extends B, B has_method M → A has_method M               ││
+│ │   - InterfaceSatisfaction: A implements all methods of I → A satisfies I        ││
+│ │   - CallChain: A calls B, B calls C → A transitively_calls C (max depth 3)      ││
+│ │   - ReferenceClosure: A references B, B references C → A transitively_refs C    ││
+│ │   - LoadBuiltinRules(ctx, engine *InferenceEngine) error                        ││
+│ │   ACCEPTANCE: Built-in rules load by default, produce expected edges            ││
+│ │   FILES: core/knowledge/inference/builtin_rules.go                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (Integration tests):                                                    ││
+│ │                                                                                  ││
+│ │ • IE.7.1 Forward chaining fixpoint tests                                        ││
+│ │ • IE.7.2 Incremental inference tests (edge added/removed)                       ││
+│ │ • IE.7.3 Circular rule detection tests                                          ││
+│ │ • IE.7.4 Built-in rule correctness tests                                        ││
+│ │   FILES: core/knowledge/inference/integration_test.go                           ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/knowledge/inference/condition.go - IE.1.1                                ││
+│ │   core/knowledge/inference/rule.go - IE.1.2                                     ││
+│ │   core/knowledge/inference/result.go - IE.1.3                                   ││
+│ │   core/knowledge/inference/rule_store.go - IE.2.1                               ││
+│ │   core/knowledge/inference/forward_chain.go - IE.3.1                            ││
+│ │   core/knowledge/inference/rule_evaluator.go - IE.3.2                           ││
+│ │   core/knowledge/inference/materialization.go - IE.4.1                          ││
+│ │   core/knowledge/inference/invalidation.go - IE.4.2                             ││
+│ │   core/knowledge/inference/engine.go - IE.5.1                                   ││
+│ │   core/knowledge/inference/builtin_rules.go - IE.6.1                            ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (3 parallel) → Phase 2 → Phase 3 (2 parallel) →                       ││
+│ │   Phase 4 (2 parallel) → Phase 5 → Phase 6 → Phase 7 (4 parallel tests)         ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Group 4S: Schema Extensions (inference_rules, materialized_edges tables)    ││
+│ │   - VectorGraphDB (edge storage, queries)                                       ││
+│ │                                                                                  ││
+│ │ MEMORY COST: ~5 MB (rule cache, binding tables during evaluation)               ││
+│ │ CPU COST: Initial inference ~10s for 100K edges, incremental <100ms             ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                     ││
+│ │   Inference derives new knowledge from existing edges.                          ││
+│ │   Requires schema (4S) and extraction (4T) to populate edges first.             ││
+│ │   Derived edges enable powerful queries via hybrid search (4U).                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4W: Temporal Graph Support (TG.1-TG.12)                          ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 9 "Temporal Graph Support" **                 ││
+│ │ ** ENABLES: Point-in-time queries, edge history, bi-temporal model **           ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES:                                                              ││
+│ │   1. Bi-temporal: valid-time (when true) + transaction-time (when known)        ││
+│ │   2. AsOf queries for point-in-time graph state                                 ││
+│ │   3. Edge history for audit trails                                              ││
+│ │   4. Temporal traversal (graph at specific time)                                ││
+│ │   5. Optimized indexes for current-state queries                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (After 4S KG.1.1 - Temporal query types):                               ││
+│ │                                                                                  ││
+│ │ • TG.1.1 AsOfQuery (core/vectorgraphdb/temporal/as_of.go)                       ││
+│ │   - GetEdgesAsOf(ctx, nodeID string, asOf time.Time) ([]TemporalEdge, error)    ││
+│ │   - Returns edges valid at specified point in time                              ││
+│ │   - SQL: WHERE valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)           ││
+│ │   ACCEPTANCE: Point-in-time queries work correctly, uses index                  ││
+│ │   FILES: core/vectorgraphdb/temporal/as_of.go, as_of_test.go                    ││
+│ │                                                                                  ││
+│ │ • TG.1.2 BetweenQuery (core/vectorgraphdb/temporal/between.go)                  ││
+│ │   - GetEdgesBetween(ctx, nodeID, start, end time.Time) ([]TemporalEdge, error)  ││
+│ │   - Returns edges that were valid during time range (any overlap)               ││
+│ │   - Handles edge creation, modification, deletion in range                      ││
+│ │   ACCEPTANCE: Range queries work, edge lifecycle tracked                        ││
+│ │   FILES: core/vectorgraphdb/temporal/between.go, between_test.go                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After TG.1.x - Edge history):                                          ││
+│ │                                                                                  ││
+│ │ • TG.2.1 EdgeHistory (core/vectorgraphdb/temporal/history.go)                   ││
+│ │   - GetEdgeHistory(ctx, edgeID int64) ([]TemporalEdge, error)                   ││
+│ │   - Returns all versions of an edge over time (by transaction-time)             ││
+│ │   - Tracks creation, modifications, soft-delete                                 ││
+│ │   ACCEPTANCE: Full edge history retrievable                                     ││
+│ │   FILES: core/vectorgraphdb/temporal/history.go, history_test.go                ││
+│ │                                                                                  ││
+│ │ • TG.2.2 TemporalDiff (core/vectorgraphdb/temporal/diff.go)                     ││
+│ │   - DiffGraph(ctx, t1, t2 time.Time) (*GraphDiff, error)                        ││
+│ │   - GraphDiff struct: Added, Removed, Modified []TemporalEdge                   ││
+│ │   - Returns edges added, removed, modified between timestamps                   ││
+│ │   ACCEPTANCE: Diff correctly identifies all changes                             ││
+│ │   FILES: core/vectorgraphdb/temporal/diff.go, diff_test.go                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After TG.2.x - Temporal write operations):                             ││
+│ │                                                                                  ││
+│ │ • TG.3.1 TemporalEdgeWriter (core/vectorgraphdb/temporal/writer.go)             ││
+│ │   - CreateEdge(ctx, edge Edge, validFrom, validTo *time.Time) error             ││
+│ │   - UpdateEdge(ctx, edgeID, newData, validFrom) error (creates new version)     ││
+│ │   - DeleteEdge(ctx, edgeID int64, deletedAt time.Time) error (soft delete)      ││
+│ │   - Auto-sets tx_start/tx_end for transaction time                              ││
+│ │   ACCEPTANCE: Write operations maintain temporal integrity                      ││
+│ │   FILES: core/vectorgraphdb/temporal/writer.go, writer_test.go                  ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After TG.3.1 - VectorGraphDB integration):                             ││
+│ │                                                                                  ││
+│ │ • TG.4.1 VectorGraphDB Temporal Integration                                     ││
+│ │   - VectorGraphDB.GetEdgesAsOf(ctx, nodeID, time.Time) method                   ││
+│ │   - VectorGraphDB.GetEdgeHistory(ctx, edgeID) method                            ││
+│ │   - VectorGraphDB.DiffGraph(ctx, t1, t2) method                                 ││
+│ │   - Backward compatible: non-temporal queries still work                        ││
+│ │   ACCEPTANCE: Temporal API exposed on VectorGraphDB, backward compatible        ││
+│ │   MODIFY: core/vectorgraphdb/db.go (add temporal methods)                       ││
+│ │   FILES: core/vectorgraphdb/temporal_integration.go                             ││
+│ │                                                                                  ││
+│ │ • TG.4.2 Temporal Index Optimization (core/vectorgraphdb/temporal/index.go)     ││
+│ │   - Verify composite index on (node_id, valid_from, valid_to) is used           ││
+│ │   - Verify partial index for current state WHERE valid_to IS NULL is used       ││
+│ │   - Query planner hints for temporal predicates                                 ││
+│ │   - EXPLAIN QUERY PLAN verification in tests                                    ││
+│ │   ACCEPTANCE: Temporal queries use indexes, O(log n) lookup                     ││
+│ │   FILES: core/vectorgraphdb/temporal/index.go, index_test.go                    ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (Integration tests):                                                    ││
+│ │                                                                                  ││
+│ │ • TG.5.1 AsOf query correctness tests                                           ││
+│ │ • TG.5.2 Edge history completeness tests                                        ││
+│ │ • TG.5.3 GraphDiff accuracy tests                                               ││
+│ │ • TG.5.4 Index usage verification tests (EXPLAIN QUERY PLAN)                    ││
+│ │   FILES: core/vectorgraphdb/temporal/integration_test.go                        ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/vectorgraphdb/temporal/as_of.go - TG.1.1                                 ││
+│ │   core/vectorgraphdb/temporal/between.go - TG.1.2                               ││
+│ │   core/vectorgraphdb/temporal/history.go - TG.2.1                               ││
+│ │   core/vectorgraphdb/temporal/diff.go - TG.2.2                                  ││
+│ │   core/vectorgraphdb/temporal/writer.go - TG.3.1                                ││
+│ │   core/vectorgraphdb/temporal_integration.go - TG.4.1                           ││
+│ │   core/vectorgraphdb/temporal/index.go - TG.4.2                                 ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (2 parallel) → Phase 2 (2 parallel) → Phase 3 →                       ││
+│ │   Phase 4 (2 parallel) → Phase 5 (4 parallel tests)                             ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Group 4S: KG.1.1 (Temporal Edge Columns migration)                          ││
+│ │   - Group 4S: KG.2.1 (TemporalEdge type)                                        ││
+│ │                                                                                  ││
+│ │ MEMORY COST: Negligible (queries only, no caching)                              ││
+│ │ CPU COST: Temporal queries <10ms with proper indexes                            ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                     ││
+│ │   Temporal queries enable "time travel" through knowledge graph history.        ││
+│ │   Requires schema extensions (4S) for temporal columns.                         ││
+│ │   Useful for debugging, auditing, and understanding code evolution.             ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4X: Memory Decay System - ACT-R (MD.1-MD.8, 21 tasks)            ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 10 "Memory Decay Model (ACT-R)" **            ││
+│ │ ** REPLACES: Exponential decay with ACT-R power law (cognitive science) **      ││
+│ │ ** COGNITIVE SCIENCE: Anderson 1990, validated in 30+ years of research **      ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES (Cognitive Science Based):                                    ││
+│ │   1. Power law decay: R(t) = t^(-d), NOT exponential e^(-λt)                    ││
+│ │   2. ACT-R base-level activation: B = ln(Σtⱼ^(-d)) + β                          ││
+│ │   3. Access traces stored for each node/edge (bounded to 100)                   ││
+│ │   4. Spacing effect: spaced retrieval strengthens memory MORE than massed       ││
+│ │   5. Decay parameter d (~0.5) learned per domain via Bayesian updates           ││
+│ │   6. Memory activation affects retrieval ranking in hybrid queries              ││
+│ │                                                                                  ││
+│ │ WHY POWER LAW OVER EXPONENTIAL:                                                 ││
+│ │   | Time      | Exponential | Power Law | Human Data |                          ││
+│ │   |-----------|-------------|-----------|------------|                          ││
+│ │   | 1 day     | 90%         | 100%      | ~95%       |                          ││
+│ │   | 7 days    | 50%         | 38%       | ~40%       |                          ││
+│ │   | 30 days   | 5%          | 18%       | ~20%       |                          ││
+│ │   | 365 days  | ~0%         | 5%        | ~8%        |                          ││
+│ │   Exponential decays too fast. Power law matches human memory.                  ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (Schema migration):                                                     ││
+│ │                                                                                  ││
+│ │ • MD.1.1 Memory Columns - Nodes (core/vectorgraphdb/migrations/)                ││
+│ │   - ALTER nodes ADD memory_activation REAL DEFAULT 0.0                          ││
+│ │   - ALTER nodes ADD last_accessed_at INTEGER (Unix timestamp in hours)          ││
+│ │   - ALTER nodes ADD access_count INTEGER DEFAULT 0                              ││
+│ │   - ALTER nodes ADD base_offset REAL DEFAULT 0.0                                ││
+│ │   FILES: core/vectorgraphdb/migrations/010_memory_decay.go                      ││
+│ │                                                                                  ││
+│ │ • MD.1.2 Memory Columns - Edges (core/vectorgraphdb/migrations/)                ││
+│ │   - Same columns as MD.1.1 for edges table                                      ││
+│ │   FILES: core/vectorgraphdb/migrations/010_memory_decay.go (same file)          ││
+│ │                                                                                  ││
+│ │ • MD.1.3 Node Access Traces Table                                               ││
+│ │   - CREATE TABLE node_access_traces(id INTEGER PK, node_id TEXT FK,             ││
+│ │     accessed_at INTEGER, access_type TEXT, context TEXT)                        ││
+│ │   - Index: idx_access_traces_node(node_id, accessed_at DESC)                    ││
+│ │   FILES: core/vectorgraphdb/migrations/010_memory_decay.go                      ││
+│ │                                                                                  ││
+│ │ • MD.1.4 Edge Access Traces Table                                               ││
+│ │   - Same structure as MD.1.3 for edges                                          ││
+│ │   FILES: core/vectorgraphdb/migrations/010_memory_decay.go                      ││
+│ │                                                                                  ││
+│ │ • MD.1.5 Domain Decay Parameters Table                                          ││
+│ │   - CREATE TABLE decay_parameters(domain INTEGER PK, decay_exponent_alpha REAL, ││
+│ │     decay_exponent_beta REAL, base_offset_mean REAL, base_offset_variance REAL, ││
+│ │     effective_samples REAL, updated_at TEXT)                                    ││
+│ │   ACCEPTANCE: All migrations run, indexes created                               ││
+│ │   FILES: core/vectorgraphdb/migrations/010_memory_decay.go                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (Core types):                                                           ││
+│ │                                                                                  ││
+│ │ • MD.2.1 AccessTrace Type (core/knowledge/memory/actr_types.go)                 ││
+│ │   - AccessedAt time.Time, AccessType AccessType, Context string                 ││
+│ │   - AccessType enum: AccessRetrieval, AccessReinforcement, AccessCreation,      ││
+│ │     AccessReference                                                             ││
+│ │   ACCEPTANCE: All access types representable, JSON serializable                 ││
+│ │   FILES: core/knowledge/memory/actr_types.go                                    ││
+│ │                                                                                  ││
+│ │ • MD.2.2 ACTRMemory Type (core/knowledge/memory/actr_types.go)                  ││
+│ │   - NodeID string, Domain Domain                                                ││
+│ │   - Traces []AccessTrace, MaxTraces int (default: 100)                          ││
+│ │   - DecayAlpha, DecayBeta float64 (Beta distribution for d parameter)           ││
+│ │   - BaseOffsetMean, BaseOffsetVariance float64                                  ││
+│ │   - CreatedAt time.Time, AccessCount int                                        ││
+│ │   - Activation(now time.Time) float64 implementing B = ln(Σtⱼ^(-d)) + β        ││
+│ │   - DecayMean() float64 returns E[d] = α/(α+β)                                  ││
+│ │   - DecaySample() float64 for Thompson Sampling                                 ││
+│ │   - RetrievalProbability(now, threshold) float64 using softmax                  ││
+│ │   - Reinforce(now, accessType, context) adds new trace                          ││
+│ │   - UpdateDecay(ageAtRetrieval, wasUseful) learns decay parameter               ││
+│ │   ACCEPTANCE: ACT-R equation correct, power law decay verified in tests         ││
+│ │   FILES: core/knowledge/memory/actr_types.go, actr_types_test.go                ││
+│ │                                                                                  ││
+│ │ • MD.2.3 DomainDecayParams Type (core/knowledge/memory/actr_types.go)           ││
+│ │   - DecayAlpha, DecayBeta, BaseOffsetMean, BaseOffsetVar, EffectiveSamples      ││
+│ │   - DefaultDomainDecay(domain Domain) returns per-domain priors:                ││
+│ │     - Librarian: Beta(5,5) → E[d]=0.5 (standard)                                ││
+│ │     - Academic: Beta(3,7) → E[d]=0.3 (slower decay, longer retention)           ││
+│ │     - Archivalist: Beta(4,6) → E[d]=0.4 (moderate)                              ││
+│ │     - Engineer: Beta(6,4) → E[d]=0.6 (faster decay, context-dependent)          ││
+│ │   ACCEPTANCE: Per-domain priors match cognitive expectations                    ││
+│ │   FILES: core/knowledge/memory/actr_types.go                                    ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (Storage):                                                              ││
+│ │                                                                                  ││
+│ │ • MD.3.1 MemoryStore (core/knowledge/memory/store.go)                           ││
+│ │   - db *sql.DB, domainDecay map[Domain]*DomainDecayParams, maxTraces int        ││
+│ │   - GetMemory(ctx, nodeID, domain) (*ACTRMemory, error)                         ││
+│ │   - RecordAccess(ctx, nodeID, accessType, context) error                        ││
+│ │   - ComputeActivation(ctx, nodeID) (float64, error)                             ││
+│ │   - loadMemory(ctx, nodeID) (*ACTRMemory, error) from SQLite                    ││
+│ │   - saveMemory(ctx, memory *ACTRMemory) error to SQLite                         ││
+│ │   ACCEPTANCE: Memory state persists across restarts                             ││
+│ │   FILES: core/knowledge/memory/store.go, store_test.go                          ││
+│ │                                                                                  ││
+│ │ • MD.3.2 Trace Pruning (core/knowledge/memory/store.go)                         ││
+│ │   - Bounded trace storage: max 100 traces per node                              ││
+│ │   - Debouncing: skip traces within 1 minute of previous                         ││
+│ │   - LRU eviction: keep most recent traces when over limit                       ││
+│ │   ACCEPTANCE: Traces bounded at 100, debouncing works                           ││
+│ │   FILES: core/knowledge/memory/store.go (same file)                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (Scoring integration):                                                  ││
+│ │                                                                                  ││
+│ │ • MD.4.1 MemoryWeightedScorer (core/knowledge/memory/scorer.go)                 ││
+│ │   - store *MemoryStore                                                          ││
+│ │   - ActivationWeight, RecencyBonus, FrequencyBonus *LearnedWeight (from 4Q)     ││
+│ │   - RetrievalThreshold *LearnedWeight                                           ││
+│ │   - MinActivation float64 (floor, default: -10.0)                               ││
+│ │   - ApplyMemoryWeighting(ctx, results []HybridResult, explore bool)             ││
+│ │   - FilterByRetrievalProbability(ctx, results, explore)                         ││
+│ │   - RecordRetrievalOutcome(ctx, nodeID, wasUseful, ageAtRetrieval)              ││
+│ │   ACCEPTANCE: Memory weighting affects result ranking measurably                ││
+│ │   DEPENDS ON: Group 4Q (LearnedWeight pattern)                                  ││
+│ │   FILES: core/knowledge/memory/scorer.go, scorer_test.go                        ││
+│ │                                                                                  ││
+│ │ • MD.4.2 HybridQueryWithMemory (core/knowledge/query/memory_integration.go)     ││
+│ │   - Wraps HybridQuery with memory-weighted scoring                              ││
+│ │   - ApplyMemoryWeighting, FilterByRetrieval, Explore options                    ││
+│ │   - Execute(ctx) calls base HybridQuery then applies memory weighting           ││
+│ │   ACCEPTANCE: Memory-weighted queries work end-to-end                           ││
+│ │   DEPENDS ON: Group 4U (HybridQuery)                                            ││
+│ │   FILES: core/knowledge/query/memory_integration.go                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (Spacing effect):                                                       ││
+│ │                                                                                  ││
+│ │ • MD.5.1 SpacingAnalyzer (core/knowledge/memory/spacing.go)                     ││
+│ │   - targetRetention float64 (default: 0.9)                                      ││
+│ │   - OptimalReviewTime(memory *ACTRMemory) time.Duration                         ││
+│ │   - computeStability(memory) float64 based on spacing history                   ││
+│ │   - Pimsleur graduated interval recall integration                              ││
+│ │   ACCEPTANCE: Spaced retrieval strengthens memory more than massed              ││
+│ │   FILES: core/knowledge/memory/spacing.go, spacing_test.go                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (Hooks):                                                                ││
+│ │                                                                                  ││
+│ │ • MD.6.1 MemoryReinforcementHook (core/knowledge/memory/hooks.go)               ││
+│ │   - Name() = "memory_reinforcement", Priority() = HookPriorityLate              ││
+│ │   - Agents() = nil (all agents)                                                 ││
+│ │   - OnPostPrompt: reinforce memories referenced in response                     ││
+│ │   - OnToolResult: reinforce memories retrieved by search tools                  ││
+│ │   - extractReferencedNodes(response) []string                                   ││
+│ │   - extractRetrievedNodes(result) []string                                      ││
+│ │   - isRetrievalTool(name) bool checks search_codebase, retrieve_context, etc.   ││
+│ │   ACCEPTANCE: Hooks fire on retrieval, reinforcement recorded in DB             ││
+│ │   FILES: core/knowledge/memory/hooks.go, hooks_test.go                          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (Integration tests):                                                    ││
+│ │                                                                                  ││
+│ │ • MD.7.1 ACT-R Equation Verification Tests                                      ││
+│ │   - Power law decay matches theoretical curve B = ln(Σtⱼ^(-d)) + β              ││
+│ │   - Multiple traces sum correctly                                               ││
+│ │   - Activation decreases over time as expected                                  ││
+│ │                                                                                  ││
+│ │ • MD.7.2 Spacing Effect Tests                                                   ││
+│ │   - Spaced access (1h, 1d, 1w intervals) → higher stability than massed         ││
+│ │   - Memory with 10 accesses over 10 days beats 10 accesses in 1 hour            ││
+│ │                                                                                  ││
+│ │ • MD.7.3 Memory-Weighted Retrieval Tests                                        ││
+│ │   - Old unused content (30 days, 0 accesses) ranks lower                        ││
+│ │   - Recently accessed content (1 hour ago) ranks higher                         ││
+│ │   - Frequently accessed content (50 accesses) ranks higher                      ││
+│ │                                                                                  ││
+│ │ • MD.7.4 Domain-Specific Decay Tests                                            ││
+│ │   - Academic domain (d=0.3) retains longer than Engineer (d=0.6)                ││
+│ │   - Same content, different domains, verify activation difference               ││
+│ │   FILES: core/knowledge/memory/integration_test.go                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 8 (Legacy exponential decay migration):                                   ││
+│ │                                                                                  ││
+│ │ • MD.8.1 Migrate FreshnessTracker to ACT-R Power Law                            ││
+│ │   LOCATION: core/vectorgraphdb/mitigations/freshness.go:84-92                   ││
+│ │   CURRENT: math.Exp(-decayRate * ageHours) - exponential decay                  ││
+│ │   TARGET: math.Pow(math.Max(1.0, ageHours), -decayExponent) - power law         ││
+│ │   CHANGES:                                                                      ││
+│ │     - Update DecayConfig to use decay exponents instead of rates                ││
+│ │     - DecayConfig.CodeDecayRate → CodeDecayExponent (default: 0.6)              ││
+│ │     - DecayConfig.HistoryDecayRate → HistoryDecayExponent (default: 0.5)        ││
+│ │     - DecayConfig.AcademicDecayRate → AcademicDecayExponent (default: 0.3)      ││
+│ │     - Update computeScore() to use power law decay                              ││
+│ │     - Update FreshnessInfo to track decay exponent instead of rate              ││
+│ │   WHY: Knowledge freshness follows human memory patterns - power law gives      ││
+│ │        long tail retention for frequently accessed knowledge                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] DecayConfig uses exponents, not rates                                 ││
+│ │     - [ ] computeScore uses math.Pow(t, -d) not math.Exp(-λt)                   ││
+│ │     - [ ] 30-day-old knowledge retains ~18% (not ~5% from exponential)          ││
+│ │     - [ ] All existing tests updated and passing                                ││
+│ │   FILES: core/vectorgraphdb/mitigations/freshness.go                            ││
+│ │          core/vectorgraphdb/mitigations/freshness_test.go                       ││
+│ │          core/vectorgraphdb/mitigations/types.go (DecayConfig)                  ││
+│ │                                                                                  ││
+│ │ • MD.8.2 Migrate ContextClassifier to ACT-R Power Law                           ││
+│ │   LOCATION: core/domain/classifier/session_context.go:150-156                   ││
+│ │   CURRENT: math.Exp(-rate * float64(position)) - exponential decay              ││
+│ │   TARGET: math.Pow(math.Max(1.0, float64(position)), -decayExponent)            ││
+│ │   CHANGES:                                                                      ││
+│ │     - Update ContextClassifierConfig.DecayRate → DecayExponent (default: 0.5)   ││
+│ │     - Update defaultDecayRate constant → defaultDecayExponent = 0.5             ││
+│ │     - Update calculateWeight() to use power law decay                           ││
+│ │     - Position 1 = full weight, position 10 = ~32%, position 50 = ~14%          ││
+│ │       (vs exponential: position 10 = ~37%, position 50 = ~0.7%)                 ││
+│ │   WHY: Conversation memory follows human patterns - we remember context         ││
+│ │        from earlier in conversation with power law decay, not exponential       ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Config uses DecayExponent, not DecayRate                              ││
+│ │     - [ ] calculateWeight uses math.Pow(pos, -d) not math.Exp(-λ*pos)           ││
+│ │     - [ ] Message 50 positions ago retains ~14% weight (not ~0.7%)              ││
+│ │     - [ ] All existing tests updated and passing                                ││
+│ │   FILES: core/domain/classifier/session_context.go                              ││
+│ │          core/domain/classifier/session_context_test.go                         ││
+│ │                                                                                  ││
+│ │ • MD.8.3 Migration Verification Tests                                           ││
+│ │   - Compare exponential vs power law decay curves at key time points            ││
+│ │   - Verify power law matches expected retention percentages                     ││
+│ │   - Test backward compatibility (old configs with rates → convert to exponents) ││
+│ │   FILES: core/vectorgraphdb/mitigations/freshness_migration_test.go             ││
+│ │          core/domain/classifier/session_context_migration_test.go               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/vectorgraphdb/migrations/010_memory_decay.go - MD.1.1-1.5                ││
+│ │   core/knowledge/memory/actr_types.go - MD.2.1-2.3                              ││
+│ │   core/knowledge/memory/store.go - MD.3.1-3.2                                   ││
+│ │   core/knowledge/memory/scorer.go - MD.4.1                                      ││
+│ │   core/knowledge/query/memory_integration.go - MD.4.2                           ││
+│ │   core/knowledge/memory/spacing.go - MD.5.1                                     ││
+│ │   core/knowledge/memory/hooks.go - MD.6.1                                       ││
+│ │   core/vectorgraphdb/mitigations/freshness.go - MD.8.1 (MODIFY)                 ││
+│ │   core/vectorgraphdb/mitigations/types.go - MD.8.1 (MODIFY)                     ││
+│ │   core/domain/classifier/session_context.go - MD.8.2 (MODIFY)                   ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (5 parallel) → Phase 2 (3 parallel) → Phase 3 (2 parallel) →          ││
+│ │   Phase 4 (2 parallel) → Phase 5 → Phase 6 → Phase 7 (4 parallel tests) →       ││
+│ │   Phase 8 (3 parallel - can run alongside Phase 2+, no ACT-R type deps)         ││
+│ │   NOTE: Phase 8 migrations can start early since they only modify existing      ││
+│ │         files to change exponential→power law (no new ACT-R types needed)       ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Group 4Q: LearnedWeight pattern (reuse for memory weights)                  ││
+│ │   - Group 4U: Hybrid Query Coordinator (HybridQuery integration)                ││
+│ │   - Existing VectorGraphDB SQLite infrastructure                                ││
+│ │   - Existing hook registry (core/context/hooks)                                 ││
+│ │                                                                                  ││
+│ │ MEMORY COST:                                                                    ││
+│ │   - Per-node: ~4 KB (100 traces × 40 bytes + overhead)                          ││
+│ │   - Per-edge: ~4 KB (same)                                                      ││
+│ │   - Global decay params: ~500 bytes (10 domains × 50 bytes)                     ││
+│ │                                                                                  ││
+│ │ CPU COST:                                                                       ││
+│ │   - Activation computation: ~0.1 ms (100 trace summation)                       ││
+│ │   - Memory weighting: ~1 ms per query (batch activation lookup)                 ││
+│ │   - Trace insertion: ~0.05 ms (append + potential prune)                        ││
+│ │                                                                                  ││
+│ │ WHY ACT-R OVER EXPONENTIAL:                                                     ││
+│ │   - Exponential: R = e^(-λt) → reaches 0 too quickly, doesn't match humans      ││
+│ │   - Power Law: R = t^(-d) → long tail, matches human forgetting curves          ││
+│ │   - ACT-R: B = ln(Σtⱼ^(-d)) + β → handles BOTH recency AND frequency            ││
+│ │   - Validated in 30+ years of cognitive science research (Anderson 1990+)       ││
+│ │                                                                                  ││
+│ │ REFERENCES:                                                                     ││
+│ │   - Anderson, J. R. (1990). The Adaptive Character of Thought                   ││
+│ │   - Wixted, J. T. (2004). The psychology and neuroscience of forgetting         ││
+│ │   - ACT-R Cognitive Architecture: http://act-r.psy.cmu.edu/                     ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 130-150 parallel engineer pipelines (increased for KG groups)  │
+│ DEPENDENCIES: Wave 3 complete, Groups 4E, 4G, 4K, 4L, 4P, 4Q complete              │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
