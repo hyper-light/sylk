@@ -3447,76 +3447,76 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 **Files to create:** `core/search/validation/types.go`
 
 **Acceptance Criteria:**
-- [ ] `ValidationSource` enum: FILESYSTEM, CMT, GIT
-- [ ] `FileState`: Path, Source, Exists, ContentHash, ModTime, Size
-- [ ] `Discrepancy`: Path, Sources, States, Type
-- [ ] `ValidationReport`: CheckedAt, TotalFiles, Discrepancies, Duration
+- [x] `ValidationSource` enum: FILESYSTEM, CMT, GIT
+- [x] `FileState`: Path, Source, Exists, ContentHash, ModTime, Size
+- [x] `Discrepancy`: Path, Sources, States, Type
+- [x] `ValidationReport`: CheckedAt, TotalFiles, Discrepancies, Duration
 
 ### DS.7.2 Three-Source Validator
 
 **Files to create:** `core/search/validation/validator.go`
 
 **Acceptance Criteria:**
-- [ ] `CrossValidator` compares filesystem, CMT, git
-- [ ] `Validate(ctx) (*ValidationReport, error)`
-- [ ] Parallel validation
-- [ ] Configurable path subset
+- [x] `CrossValidator` compares filesystem, CMT, git
+- [x] `Validate(ctx) (*ValidationReport, error)`
+- [x] Parallel validation
+- [x] Configurable path subset
 
 ### DS.7.3 Discrepancy Resolution
 
 **Files to create:** `core/search/validation/resolution.go`
 
 **Acceptance Criteria:**
-- [ ] `DiscrepancyResolver` resolves discrepancies
-- [ ] Priority: Filesystem > Git > CMT
-- [ ] `Resolve(discrepancies) ([]*Resolution, error)`
-- [ ] Dry-run and apply modes
+- [x] `DiscrepancyResolver` resolves discrepancies
+- [x] Priority: Filesystem > Git > CMT
+- [x] `Resolve(discrepancies) ([]*Resolution, error)`
+- [x] Dry-run and apply modes
 
 ### DS.7.4 Validation Scheduler
 
 **Files to create:** `core/search/validation/scheduler.go`
 
 **Acceptance Criteria:**
-- [ ] `ValidationScheduler` runs periodic validation
-- [ ] Low priority, yields to active ops
-- [ ] Auto-resolves minor discrepancies
+- [x] `ValidationScheduler` runs periodic validation
+- [x] Low priority, yields to active ops
+- [x] Auto-resolves minor discrepancies
 
 ### DS.8.1 Staleness Types
 
 **Files to create:** `core/search/staleness/types.go`
 
 **Acceptance Criteria:**
-- [ ] `StalenessLevel`: FRESH, SLIGHTLY_STALE, MODERATELY_STALE, SEVERELY_STALE, UNKNOWN
-- [ ] `StalenessReport`: Level, StaleFiles, StaleSince, Confidence
-- [ ] `DetectionStrategy`: CMT_ROOT, GIT_COMMIT, MTIME_SAMPLE, CONTENT_HASH
+- [x] `StalenessLevel`: FRESH, SLIGHTLY_STALE, MODERATELY_STALE, SEVERELY_STALE, UNKNOWN
+- [x] `StalenessReport`: Level, StaleFiles, StaleSince, Confidence
+- [x] `DetectionStrategy`: CMT_ROOT, GIT_COMMIT, MTIME_SAMPLE, CONTENT_HASH
 
 ### DS.8.2 Hybrid Staleness Detector
 
 **Files to create:** `core/search/staleness/detector.go`
 
 **Acceptance Criteria:**
-- [ ] `HybridStalenessDetector` uses multiple strategies
-- [ ] Order: CMT root → Git commit → mtime sample → content hash
-- [ ] `Detect(ctx) (*StalenessReport, error)`
-- [ ] Early exit on freshness
+- [x] `HybridStalenessDetector` uses multiple strategies
+- [x] Order: CMT root → Git commit → mtime sample → content hash
+- [x] `Detect(ctx) (*StalenessReport, error)`
+- [x] Early exit on freshness
 
 ### DS.8.3 CMT Root Hash Check
 
 **Files to create:** `core/search/staleness/cmt_check.go`
 
 **Acceptance Criteria:**
-- [ ] `CMTRootCheck` compares stored vs computed root hash
-- [ ] `Check() (*DetectionResult, error)` - O(1)
-- [ ] Thread-safe
+- [x] `CMTRootCheck` compares stored vs computed root hash
+- [x] `Check() (*DetectionResult, error)` - O(1)
+- [x] Thread-safe
 
 ### DS.8.4 Mtime Sampling
 
 **Files to create:** `core/search/staleness/mtime_sample.go`
 
 **Acceptance Criteria:**
-- [ ] `MtimeSampler` samples file modification times
-- [ ] `SampleConfig`: SampleSize, SampleStrategy
-- [ ] Only stats files, doesn't read content
+- [x] `MtimeSampler` samples file modification times
+- [x] `SampleConfig`: SampleSize, SampleStrategy
+- [x] Only stats files, doesn't read content
 
 ### DS.9.1 Search Coordinator Types
 
