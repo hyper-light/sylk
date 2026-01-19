@@ -413,31 +413,44 @@ func betaSample(alpha, beta float64) float64 {
 // Uses Marsaglia and Tsang's method for shape >= 1.
 func gammaSample(shape float64) float64 {
 	if shape < 1 {
-		return gammaSample(shape+1) * math.Pow(rand.Float64(), 1.0/shape)
+		return gammaSampleSmall(shape)
 	}
+	return gammaSampleLarge(shape)
+}
 
+func gammaSampleSmall(shape float64) float64 {
+	return gammaSample(shape+1) * math.Pow(rand.Float64(), 1.0/shape)
+}
+
+func gammaSampleLarge(shape float64) float64 {
 	d := shape - 1.0/3.0
 	c := 1.0 / math.Sqrt(9.0*d)
 
 	for {
-		var x, v float64
-		for {
-			x = rand.NormFloat64()
-			v = 1 + c*x
-			if v > 0 {
-				break
-			}
-		}
-		v = v * v * v
-		u := rand.Float64()
-
-		if u < 1-0.0331*(x*x)*(x*x) {
-			return d * v
-		}
-		if math.Log(u) < 0.5*x*x+d*(1-v+math.Log(v)) {
+		x, v := gammaSampleCandidate(c)
+		if gammaSampleAccept(d, x, v) {
 			return d * v
 		}
 	}
+}
+
+func gammaSampleCandidate(c float64) (float64, float64) {
+	for {
+		x := rand.NormFloat64()
+		v := 1 + c*x
+		if v > 0 {
+			return x, v * v * v
+		}
+	}
+}
+
+func gammaSampleAccept(d, x, v float64) bool {
+	u := rand.Float64()
+	xSq := x * x
+	if u < 1-0.0331*xSq*xSq {
+		return true
+	}
+	return math.Log(u) < 0.5*xSq+d*(1-v+math.Log(v))
 }
 
 // betaQuantile approximates the quantile function of Beta distribution.
@@ -449,18 +462,24 @@ func betaQuantile(alpha, beta, p float64) float64 {
 	if p >= 1 {
 		return 1
 	}
+	return betaQuantileBisect(alpha, beta, p)
+}
 
+func betaQuantileBisect(alpha, beta, p float64) float64 {
 	low, high := 0.0, 1.0
 	for i := 0; i < 50; i++ {
-		mid := (low + high) / 2
-		cdf := betaIncomplete(alpha, beta, mid)
-		if cdf < p {
-			low = mid
-		} else {
-			high = mid
-		}
+		low, high = betaQuantileStep(alpha, beta, p, low, high)
 	}
 	return (low + high) / 2
+}
+
+func betaQuantileStep(alpha, beta, p, low, high float64) (float64, float64) {
+	mid := (low + high) / 2
+	cdf := betaIncomplete(alpha, beta, mid)
+	if cdf < p {
+		return mid, high
+	}
+	return low, mid
 }
 
 // betaIncomplete computes the regularized incomplete beta function.
@@ -481,54 +500,76 @@ func betaIncomplete(a, b, x float64) float64 {
 	return 1 - bt*betaCF(b, a, 1-x)/b
 }
 
+// betaCFState holds iteration state for continued fraction computation.
+type betaCFState struct {
+	a, b, x      float64
+	qab, qap, qam float64
+	c, d, h      float64
+}
+
 // betaCF computes continued fraction for incomplete beta function.
 func betaCF(a, b, x float64) float64 {
+	s := newBetaCFState(a, b, x)
+	return s.compute()
+}
+
+func newBetaCFState(a, b, x float64) *betaCFState {
+	qab := a + b
+	qap := a + 1
+	d := 1 - qab*x/qap
+	d = clampSmall(d)
+	return &betaCFState{
+		a: a, b: b, x: x,
+		qab: qab, qap: qap, qam: a - 1,
+		c: 1.0, d: 1 / d, h: 1 / d,
+	}
+}
+
+func (s *betaCFState) compute() float64 {
 	const maxIter = 100
 	const eps = 3e-7
 
-	qab := a + b
-	qap := a + 1
-	qam := a - 1
-	c := 1.0
-	d := 1 - qab*x/qap
-	if math.Abs(d) < 1e-30 {
-		d = 1e-30
-	}
-	d = 1 / d
-	h := d
-
 	for m := 1; m <= maxIter; m++ {
-		m2 := 2 * m
-		aa := float64(m) * (b - float64(m)) * x / ((qam + float64(m2)) * (a + float64(m2)))
-		d = 1 + aa*d
-		if math.Abs(d) < 1e-30 {
-			d = 1e-30
-		}
-		c = 1 + aa/c
-		if math.Abs(c) < 1e-30 {
-			c = 1e-30
-		}
-		d = 1 / d
-		h *= d * c
-
-		aa = -(a + float64(m)) * (qab + float64(m)) * x / ((a + float64(m2)) * (qap + float64(m2)))
-		d = 1 + aa*d
-		if math.Abs(d) < 1e-30 {
-			d = 1e-30
-		}
-		c = 1 + aa/c
-		if math.Abs(c) < 1e-30 {
-			c = 1e-30
-		}
-		d = 1 / d
-		del := d * c
-		h *= del
-
+		del := s.iterate(m)
 		if math.Abs(del-1) < eps {
 			break
 		}
 	}
-	return h
+	return s.h
+}
+
+func (s *betaCFState) iterate(m int) float64 {
+	m2 := float64(2 * m)
+	mf := float64(m)
+
+	s.applyFirstTerm(mf, m2)
+	s.applySecondTerm(mf, m2)
+
+	return s.d * s.c
+}
+
+func (s *betaCFState) applyFirstTerm(mf, m2 float64) {
+	aa := mf * (s.b - mf) * s.x / ((s.qam + m2) * (s.a + m2))
+	s.d, s.c = updateDC(s.d, s.c, aa)
+	s.h *= s.d * s.c
+}
+
+func (s *betaCFState) applySecondTerm(mf, m2 float64) {
+	aa := -(s.a + mf) * (s.qab + mf) * s.x / ((s.a + m2) * (s.qap + m2))
+	s.d, s.c = updateDC(s.d, s.c, aa)
+}
+
+func updateDC(d, c, aa float64) (float64, float64) {
+	d = clampSmall(1 + aa*d)
+	c = clampSmall(1 + aa/c)
+	return 1 / d, c
+}
+
+func clampSmall(v float64) float64 {
+	if math.Abs(v) < 1e-30 {
+		return 1e-30
+	}
+	return v
 }
 
 // lgamma returns the natural log of Gamma(x).

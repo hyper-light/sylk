@@ -28,20 +28,20 @@ const (
 	ContextPriorityCritical ContextPriority = 100
 )
 
+// contextPriorityNames maps ContextPriority values to their string representations.
+var contextPriorityNames = map[ContextPriority]string{
+	ContextPriorityLow:      "low",
+	ContextPriorityNormal:   "normal",
+	ContextPriorityHigh:     "high",
+	ContextPriorityCritical: "critical",
+}
+
 // String returns the string representation of the priority level.
 func (p ContextPriority) String() string {
-	switch p {
-	case ContextPriorityLow:
-		return "low"
-	case ContextPriorityNormal:
-		return "normal"
-	case ContextPriorityHigh:
-		return "high"
-	case ContextPriorityCritical:
-		return "critical"
-	default:
-		return "unknown"
+	if name, ok := contextPriorityNames[p]; ok {
+		return name
 	}
+	return "unknown"
 }
 
 // =============================================================================

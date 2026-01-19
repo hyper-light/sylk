@@ -23,20 +23,20 @@ const (
 	TierFullSearch SearchTier = 3
 )
 
+// searchTierNames maps SearchTier values to their string representations.
+var searchTierNames = map[SearchTier]string{
+	TierNone:       "none",
+	TierHotCache:   "hot_cache",
+	TierWarmIndex:  "warm_index",
+	TierFullSearch: "full_search",
+}
+
 // String returns a human-readable name for the search tier.
 func (t SearchTier) String() string {
-	switch t {
-	case TierNone:
-		return "none"
-	case TierHotCache:
-		return "hot_cache"
-	case TierWarmIndex:
-		return "warm_index"
-	case TierFullSearch:
-		return "full_search"
-	default:
-		return "unknown"
+	if name, ok := searchTierNames[t]; ok {
+		return name
 	}
+	return "unknown"
 }
 
 // Excerpt represents a full content excerpt (Tier A) with high confidence.
