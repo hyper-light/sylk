@@ -3730,11 +3730,11 @@ Note: VectorGraphDB uses SQLite internally - there is no separate SQLite databas
 // RobustWeightDistribution represents a Beta distribution with robust update semantics
 // Uses Thompson sampling for exploration vs exploitation
 type RobustWeightDistribution struct {
-    Alpha            float64 `msgpack:"alpha"`            // Beta distribution alpha
-    Beta             float64 `msgpack:"beta"`             // Beta distribution beta
-    effectiveSamples float64 `msgpack:"effective_samples"` // Decay-weighted sample count
-    priorAlpha       float64 `msgpack:"prior_alpha"`      // Original prior for drift
-    priorBeta        float64 `msgpack:"prior_beta"`       // Original prior for drift
+    Alpha            float64 `json:"alpha"`            // Beta distribution alpha
+    Beta             float64 `json:"beta"`             // Beta distribution beta
+    effectiveSamples float64 `json:"effective_samples"` // Decay-weighted sample count
+    priorAlpha       float64 `json:"prior_alpha"`      // Original prior for drift
+    priorBeta        float64 `json:"prior_beta"`       // Original prior for drift
 }
 
 // AdaptiveState holds all adaptive parameters for a session
@@ -3804,7 +3804,7 @@ type EpisodeObservation struct {
 - [ ] `EpisodeObservation` struct with all fields per CONTEXT.md specification
 - [ ] `RewardWeights` struct: TaskSuccess, RelevanceBonus, StrugglePenalty, WastePenalty (all float64)
 - [ ] `ThresholdConfig` struct: Confidence, Excerpt, Budget (all float64)
-- [ ] All structs have `msgpack` tags for serialization
+- [ ] All structs have `json` tags for serialization
 - [ ] Default `UpdateConfig` values via `DefaultUpdateConfig` variable
 - [ ] Total serialized size of `AdaptiveState` < 2KB with 10 contexts
 
@@ -4663,12 +4663,12 @@ func (c *ContextDiscovery) UpdateOrCreateContext(
 ```go
 // UserWeightProfile tracks individual user preferences
 type UserWeightProfile struct {
-    PrefersThorough     float64 `msgpack:"prefers_thorough"`     // -1 = concise, +1 = thorough
-    ToleratesSearches   float64 `msgpack:"tolerates_searches"`   // -1 = hates, +1 = fine
-    WastePenaltyMult    float64 `msgpack:"waste_penalty_mult"`   // Multiplier [0.5, 2.0]
-    StrugglePenaltyMult float64 `msgpack:"struggle_penalty_mult"` // Multiplier [0.5, 2.0]
-    ObservationCount    int     `msgpack:"observation_count"`
-    LastUpdated         time.Time `msgpack:"last_updated"`
+    PrefersThorough     float64 `json:"prefers_thorough"`     // -1 = concise, +1 = thorough
+    ToleratesSearches   float64 `json:"tolerates_searches"`   // -1 = hates, +1 = fine
+    WastePenaltyMult    float64 `json:"waste_penalty_mult"`   // Multiplier [0.5, 2.0]
+    StrugglePenaltyMult float64 `json:"struggle_penalty_mult"` // Multiplier [0.5, 2.0]
+    ObservationCount    int     `json:"observation_count"`
+    LastUpdated         time.Time `json:"last_updated"`
 }
 
 // NewUserWeightProfile returns default profile
@@ -4732,7 +4732,7 @@ func (p *UserWeightProfile) Update(obs EpisodeObservation, satisfaction float64)
 - [ ] Verbosity learning: positive satisfaction + excess prefetch → increase PrefersThorough
 - [ ] Search tolerance learning: negative satisfaction + many searches → decrease ToleratesSearches
 - [ ] All values clamped: preferences [-1, 1], multipliers [0.5, 2.0]
-- [ ] All fields have msgpack tags for serialization
+- [ ] All fields have json tags for serialization
 - [ ] Unit test: Adjust returns base unmodified when ObservationCount < 5
 - [ ] Unit test: 100 positive observations with excess prefetch reduces WastePenaltyMult
 - [ ] Unit test: clamping prevents values outside bounds
@@ -4747,7 +4747,7 @@ func (p *UserWeightProfile) Update(obs EpisodeObservation, satisfaction float64)
 - Composes RobustWeightDistribution (AR.3.1), ContextDiscovery (AR.3.2), UserWeightProfile (AR.3.3)
 - `SampleWeights(ctx)` draws from all distributions, applies user and context biases
 - `UpdateFromOutcome(obs)` propagates observation to all sub-components atomically
-- Serializes to < 2KB via msgpack for fast handoff context transfer
+- Serializes to < 2KB via json for fast handoff context transfer
 - Persisted to WAL path managed by RetrievalResources (AR.2.3)
 
 **Default Priors (from CONTEXT.md)**:
@@ -4836,7 +4836,7 @@ func (a *AdaptiveState) UpdateFromOutcome(obs EpisodeObservation) {
 
 // MarshalBinary serializes state (< 2KB typically)
 func (a *AdaptiveState) MarshalBinary() ([]byte, error) {
-    return msgpack.Marshal(a)
+    return json.Marshal(a)
 }
 
 // LoadOrInit loads from path or returns new state
@@ -4847,7 +4847,7 @@ func LoadOrInit(path string) (*AdaptiveState, error) {
     }
 
     state := &AdaptiveState{}
-    if err := msgpack.Unmarshal(data, state); err != nil {
+    if err := json.Unmarshal(data, state); err != nil {
         return NewAdaptiveState(), nil
     }
     state.config = DefaultUpdateConfig() // Config not serialized
@@ -30336,7 +30336,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   - EpisodeObservation struct for learning                                       ││
 │ │   - UpdateConfig for robust update parameters                                    ││
 │ │   - TaskContext, ContextBias, UserProfile types                                  ││
-│ │   ACCEPTANCE: All types compile, msgpack serializable, < 2KB serialized          ││
+│ │   ACCEPTANCE: All types compile, json serializable, < 2KB serialized          ││
 │ │   FILES: core/context/adaptive_types.go                                          ││
 │ │                                                                                  ││
 │ │ • AR.1.2 Retrieval Result Types (core/context/retrieval_types.go)                ││
@@ -30787,7 +30787,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   - Group 4F: Pressure Controller (PressureController, EvictableCache)           ││
 │ │   - Group 4K: Circuit Breakers (GlobalCircuitBreakerRegistry)                    ││
 │ │   - Existing VectorGraphDB (QueryEngine, HybridResult, SessionScopedView)        ││
-│ │   - github.com/vmihailenco/msgpack/v5 (state serialization)                      ││
+│ │   - github.com/vmihailenco/json/v5 (state serialization)                      ││
 │ │                                                                                  ││
 │ │ CROSS-SYSTEM INTEGRATION:                                                         ││
 │ │   - All agents receive retrieval skills and hooks                                ││
@@ -31055,7 +31055,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   - StageName() string method for logging/metrics                                ││
 │ │   - Priority() int method for cascade ordering                                   ││
 │ │   - IsTerminal(confidence float64) bool for early exit detection                 ││
-│ │   ACCEPTANCE: Interface compiles, StageResult is msgpack serializable            ││
+│ │   ACCEPTANCE: Interface compiles, StageResult is json serializable            ││
 │ │   FILES: core/domain/classifier/stage.go, core/domain/classifier/stage_test.go  ││
 │ │                                                                                  ││
 │ │ • DE.2.2 Lexical Classifier (core/domain/classifier/lexical.go)                  ││

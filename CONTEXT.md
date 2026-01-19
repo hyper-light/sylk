@@ -2536,11 +2536,11 @@ func (a *AdaptiveState) UpdateFromOutcome(obs EpisodeObservation) {
 
 // Persistence - serialize only sufficient statistics (< 1KB typically)
 func (a *AdaptiveState) MarshalBinary() ([]byte, error) {
-    return msgpack.Marshal(a)
+    return json.Marshal(a)
 }
 
 func (a *AdaptiveState) UnmarshalBinary(data []byte) error {
-    return msgpack.Unmarshal(data, a)
+    return json.Unmarshal(data, a)
 }
 
 // LoadOrInit loads persisted state or initializes with priors
