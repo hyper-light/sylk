@@ -827,7 +827,6 @@ func TestRetrievalResources_StressTest(t *testing.T) {
 	t.Parallel()
 
 	rr := createTestResources(t, 2000)
-	ctx := context.Background()
 
 	const (
 		numAcquirers  = 20
@@ -837,14 +836,17 @@ func TestRetrievalResources_StressTest(t *testing.T) {
 
 	var wg sync.WaitGroup
 	releases := make(chan func(), numAcquirers*opsPerRoutine)
+	done := make(chan struct{})
 
-	// Acquirers
+	// Acquirers - use timeout context to prevent indefinite blocking
 	wg.Add(numAcquirers)
 	for i := 0; i < numAcquirers; i++ {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < opsPerRoutine; j++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 				release, err := rr.Acquire(ctx, "stress")
+				cancel()
 				if err == nil {
 					select {
 					case releases <- release:
@@ -856,21 +858,28 @@ func TestRetrievalResources_StressTest(t *testing.T) {
 		}()
 	}
 
-	// Releasers
+	// Releasers - keep releasing until done signal
 	wg.Add(numReleasers)
 	for i := 0; i < numReleasers; i++ {
 		go func() {
 			defer wg.Done()
-			for j := 0; j < opsPerRoutine; j++ {
+			for {
 				select {
 				case release := <-releases:
 					release()
-				default:
-					time.Sleep(time.Microsecond)
+				case <-done:
+					return
 				}
 			}
 		}()
 	}
+
+	// Wait for acquirers to finish, then signal releasers to stop
+	go func() {
+		// Give acquirers time to complete
+		time.Sleep(500 * time.Millisecond)
+		close(done)
+	}()
 
 	wg.Wait()
 	close(releases)
