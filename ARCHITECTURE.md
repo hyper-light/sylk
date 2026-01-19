@@ -3049,7 +3049,7 @@ Intent-Based Routing (via Guide):
 │                                                                                        │
 │  HIDDEN COST: Guide's context accumulates ALL consultation traffic.                    │
 │  At 100 consultations/session: Guide context grows by 50-100K tokens.                  │
-│  This causes more frequent Guide compaction and higher per-turn costs.                 │
+│  This causes more frequent Guide handoffs and higher per-turn costs.                   │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -3225,19 +3225,970 @@ Which agents can directly consult which:
 
 INTENT-BASED (via Guide):
 ├── Guide context growth: ~100K tokens (consultations accumulate)
-├── Guide compaction: 2-3 additional compactions
+├── Guide handoffs: 2-3 additional handoffs at 75% threshold
 ├── Total Guide tokens: ~300K
 ├── Total Worker tokens: ~150K
 └── TOTAL: ~450K tokens
 
 DIRECT CONSULTATION:
 ├── Guide context growth: ~0 tokens (consultations bypass Guide)
-├── Guide compaction: 0 additional compactions
+├── Guide handoffs: 0 additional handoffs
 ├── Total Worker tokens: ~150K
 ├── Archivalist logs: ~5K tokens (truncated summaries)
 └── TOTAL: ~155K tokens
 
 SAVINGS: ~65% reduction in consultation-related token usage
+```
+
+---
+
+## Domain Expertise System
+
+**Robust domain isolation for VectorDB and Document DB queries, preventing cross-domain contamination in search results.**
+
+### Problem Statement
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         THE DOMAIN CONTAMINATION PROBLEM                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  SCENARIO:                                                                          │
+│  Engineer → Librarian: "How does our auth work?"                                    │
+│       │                                                                             │
+│       ▼                                                                             │
+│  Librarian searches DB (no domain filter)                                           │
+│       │                                                                             │
+│       ▼                                                                             │
+│  DB returns highest-scoring result: OAuth2 RFC documentation                        │
+│  (indexed by Academic agent, high relevance score for "auth")                       │
+│       │                                                                             │
+│       ▼                                                                             │
+│  Librarian returns: "Authentication follows RFC 6749..."                            │
+│       │                                                                             │
+│       ▼                                                                             │
+│  Engineer thinks this describes OUR codebase ← WRONG!                               │
+│                                                                                     │
+│  ROOT CAUSE: DB search returned Academic's external research when Engineer          │
+│              expected Librarian's codebase knowledge. No domain isolation.          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Design Principles
+
+1. **Domain as First-Class Citizen** - Every indexed document and vector has a mandatory domain tag
+2. **Agent Identity = Domain Filter** - When an agent searches, it implicitly filters to its home domain
+3. **Cross-Domain is Explicit** - Multi-domain queries require explicit classification and coordination
+4. **Original Query Preserved** - Classification is metadata, never transforms the original query
+5. **Prefetch Integration** - Domain classification happens before speculative prefetch to filter results
+
+### Domain Taxonomy
+
+Each agent owns a knowledge domain. Content indexed by an agent belongs to that agent's domain.
+
+```go
+// core/domain/domain.go
+
+type Domain int
+
+const (
+    DomainLibrarian   Domain = iota  // Codebase: files, patterns, structure, conventions
+    DomainAcademic                    // External: research, documentation, RFCs, best practices
+    DomainArchivalist                 // Historical: sessions, decisions, failures, handoffs
+    DomainArchitect                   // Planning: DAGs, task decomposition, architectural decisions
+    DomainEngineer                    // Execution: implementation notes, code changes (rarely queried)
+    DomainDesigner                    // UI: components, styles, design tokens, accessibility
+    DomainInspector                   // Quality: validation results, issues, review findings
+    DomainTester                      // Testing: test patterns, coverage, test history
+    DomainOrchestrator                // Workflow: pipeline states, task coordination
+    DomainGuide                       // Routing: conversation history, routing decisions
+)
+
+// AgentToDomain maps agent types to their home domain
+var AgentToDomain = map[AgentType]Domain{
+    AgentLibrarian:   DomainLibrarian,
+    AgentAcademic:    DomainAcademic,
+    AgentArchivalist: DomainArchivalist,
+    AgentArchitect:   DomainArchitect,
+    AgentEngineer:    DomainEngineer,
+    AgentDesigner:    DomainDesigner,
+    AgentInspector:   DomainInspector,
+    AgentTester:      DomainTester,
+    AgentOrchestrator: DomainOrchestrator,
+    AgentGuide:       DomainGuide,
+}
+
+// DomainToAgent maps domains to their owning agent
+var DomainToAgent = map[Domain]AgentType{
+    DomainLibrarian:   AgentLibrarian,
+    DomainAcademic:    AgentAcademic,
+    DomainArchivalist: AgentArchivalist,
+    DomainArchitect:   AgentArchitect,
+    DomainEngineer:    AgentEngineer,
+    DomainDesigner:    AgentDesigner,
+    DomainInspector:   AgentInspector,
+    DomainTester:      AgentTester,
+    DomainOrchestrator: AgentOrchestrator,
+    DomainGuide:       AgentGuide,
+}
+```
+
+### Domain Classification System
+
+Classification determines which domain(s) a query targets. This happens at Guide level, before both routing and prefetch.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      DOMAIN CLASSIFICATION FLOW                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  User Query: "Compare our auth implementation to OAuth2 best practices"             │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ STAGE 0: CACHE LOOKUP (Ristretto, < 1ms)                                     │   │
+│  │                                                                              │   │
+│  │ Key: hash(query + caller_agent)                                              │   │
+│  │ → CACHE HIT: Return cached DomainContext                                     │   │
+│  │ → CACHE MISS: Continue to Stage 1                                            │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │ miss                                                                        │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ STAGE 1: LEXICAL SIGNAL DETECTION (< 1ms, 0 tokens)                          │   │
+│  │                                                                              │   │
+│  │ CODEBASE signals: "our code", "this repo", "our implementation",             │   │
+│  │                   "in the codebase", "this function", "our pattern"          │   │
+│  │                                                                              │   │
+│  │ EXTERNAL signals: "best practice", "documentation", "RFC", "spec",           │   │
+│  │                   "standard approach", "according to"                        │   │
+│  │                                                                              │   │
+│  │ HISTORICAL signals: "we decided", "last session", "previously",              │   │
+│  │                     "why did we", "the decision was"                         │   │
+│  │                                                                              │   │
+│  │ PLANNING signals: "the plan", "current task", "next step", "DAG"             │   │
+│  │                                                                              │   │
+│  │ CROSS-DOMAIN signals: "compare X to Y", "how does X differ from",            │   │
+│  │                       "does X match Y", "X versus Y"                         │   │
+│  │                                                                              │   │
+│  │ Query: "Compare our auth implementation to OAuth2 best practices"            │   │
+│  │ Detected: "our implementation" → LIBRARIAN                                   │   │
+│  │           "best practices" → ACADEMIC                                        │   │
+│  │           "Compare X to Y" → CROSS-DOMAIN pattern                            │   │
+│  │                                                                              │   │
+│  │ Result: {Domains: [LIBRARIAN, ACADEMIC], IsCrossDomain: true}                │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ STAGE 2: EMBEDDING AFFINITY (5-20ms, 0 tokens) [if Stage 1 inconclusive]     │   │
+│  │                                                                              │   │
+│  │ • Embed query using local embedding model                                    │   │
+│  │ • Compare to pre-computed domain centroids (cluster centers)                 │   │
+│  │ • Each domain has K=5-10 centroids from its indexed content                  │   │
+│  │ • DomainScore[d] = max(similarity(query, centroid) for centroid in d)        │   │
+│  │                                                                              │   │
+│  │ Decision:                                                                    │   │
+│  │   IF max_score - second_max > 0.15: Single domain, high confidence           │   │
+│  │   ELIF max_score > 0.8 AND second_max > 0.75: Potential cross-domain         │   │
+│  │   ELSE: Ambiguous, continue to Stage 3                                       │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ STAGE 3: CONTEXTUAL DISAMBIGUATION (< 1ms, 0 tokens)                         │   │
+│  │                                                                              │   │
+│  │ • Caller agent bias: +0.15 to caller's home domain                           │   │
+│  │ • Task context bias: "implementation" task → +0.10 to CODEBASE               │   │
+│  │ • Session continuity: Recent queries in same domain → +0.10                  │   │
+│  │ • Skill context: search_code skill → +0.20 to CODEBASE                       │   │
+│  │                                                                              │   │
+│  │ Re-evaluate decision logic with adjusted scores                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │ still ambiguous                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ STAGE 4: LLM CLASSIFICATION (100-500ms, ~300 tokens) [RARE - <5% of queries] │   │
+│  │                                                                              │   │
+│  │ Structured prompt → LLM → JSON output                                        │   │
+│  │ Result cached to improve future Stage 1 patterns                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ OUTPUT: DomainContext                                                        │   │
+│  │                                                                              │   │
+│  │ {                                                                            │   │
+│  │   OriginalQuery: "Compare our auth implementation to OAuth2 best practices", │   │
+│  │   DetectedDomains: [LIBRARIAN, ACADEMIC],                                    │   │
+│  │   DomainConfidences: {LIBRARIAN: 0.89, ACADEMIC: 0.85},                      │   │
+│  │   IsCrossDomain: true,                                                       │   │
+│  │   PrimaryDomain: LIBRARIAN,                                                  │   │
+│  │   SecondaryDomains: [ACADEMIC],                                              │   │
+│  │   ClassificationMethod: "lexical",                                           │   │
+│  │   Signals: {LIBRARIAN: ["our implementation"], ACADEMIC: ["best practices"]},│   │
+│  │   CacheHit: false                                                            │   │
+│  │ }                                                                            │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### DomainContext Data Structure
+
+```go
+// core/domain/context.go
+
+// DomainContext carries domain classification through the system.
+// The OriginalQuery is NEVER modified - classification is metadata only.
+type DomainContext struct {
+    // Original query (NEVER modified, ALWAYS preserved)
+    OriginalQuery string `json:"original_query"`
+
+    // Classification results
+    DetectedDomains   []Domain           `json:"detected_domains"`
+    DomainConfidences map[Domain]float64 `json:"domain_confidences"`
+    IsCrossDomain     bool               `json:"is_cross_domain"`
+
+    // Primary/secondary for routing decisions
+    PrimaryDomain    Domain   `json:"primary_domain"`
+    SecondaryDomains []Domain `json:"secondary_domains,omitempty"`
+
+    // Classification provenance
+    ClassificationMethod string              `json:"classification_method"` // "lexical", "embedding", "context", "llm"
+    Signals              map[Domain][]string `json:"signals"`               // What triggered each domain
+    Confidence           float64             `json:"confidence"`            // Overall classification confidence
+
+    // Cache metadata
+    CacheHit bool   `json:"cache_hit"`
+    CacheKey string `json:"cache_key,omitempty"`
+}
+
+// AllowedDomains returns the domains that should be searched.
+// For single-domain, returns [PrimaryDomain].
+// For cross-domain, returns all DetectedDomains.
+func (dc *DomainContext) AllowedDomains() []Domain {
+    if dc.IsCrossDomain {
+        return dc.DetectedDomains
+    }
+    return []Domain{dc.PrimaryDomain}
+}
+```
+
+### Guide Integration: Routing + Prefetch
+
+Domain classification happens ONCE at Guide, used for BOTH routing and prefetch filtering.
+
+```go
+// core/guide/domain_integration.go
+
+func (g *Guide) HandleUserQuery(ctx context.Context, query string, callerAgent AgentType) error {
+    // 1. Classify domain (cached via Ristretto)
+    domainContext := g.classifier.Classify(ctx, query, callerAgent)
+
+    // 2. Check for explicit agent address (@Librarian, etc.)
+    explicitTarget := g.detectExplicitAddress(query)
+
+    // 3. Start speculative prefetch WITH domain filter
+    prefetchFuture := g.prefetcher.StartSpeculative(ctx, query, domainContext.AllowedDomains())
+
+    // 4. Determine routing target
+    var targetAgent AgentType
+    if explicitTarget != "" {
+        // Explicit address always honored
+        targetAgent = explicitTarget
+    } else if domainContext.IsCrossDomain {
+        // Cross-domain without explicit address → Architect coordinates
+        targetAgent = AgentArchitect
+    } else {
+        // Single domain → that domain's agent
+        targetAgent = DomainToAgent[domainContext.PrimaryDomain]
+    }
+
+    // 5. Forward with full context
+    return g.forward(ctx, ForwardedMessage{
+        Query:          query,
+        Target:         targetAgent,
+        DomainContext:  domainContext,
+        PrefetchFuture: prefetchFuture,
+        ExplicitTarget: explicitTarget != "",
+    })
+}
+```
+
+### Speculative Prefetch with Domain Filtering
+
+The existing SpeculativePrefetcher is extended to accept domain filters.
+
+```go
+// core/context/speculative_prefetch.go (MODIFIED)
+
+func (p *SpeculativePrefetcher) StartSpeculative(
+    ctx context.Context,
+    query string,
+    allowedDomains []Domain,  // NEW: Domain filter from classification
+) (*TrackedPrefetchFuture, error) {
+
+    op := concurrency.NewOperation(
+        ctx,
+        concurrency.OpTypeSearch,
+        p.scope.AgentID(),
+        fmt.Sprintf("prefetch:%s", query[:min(50, len(query))]),
+        200*time.Millisecond,
+    )
+
+    future := &TrackedPrefetchFuture{
+        done:      make(chan struct{}),
+        started:   time.Now(),
+        operation: op,
+    }
+
+    err := p.scope.Go("speculative-prefetch", 200*time.Millisecond, func(ctx context.Context) error {
+        defer close(future.done)
+        defer op.MarkDone()
+
+        // Search with domain filter - CRITICAL CHANGE
+        result := p.searcher.SearchWithDomainFilter(ctx, query, allowedDomains, 200*time.Millisecond)
+        future.result.Store(result.ToAugmentedQuery())
+
+        op.SetResult(result, nil)
+        return nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    return future, nil
+}
+```
+
+### Direct Address Handling
+
+When a user explicitly addresses an agent, that choice is honored even for cross-domain queries.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      DIRECT ADDRESS + CROSS-DOMAIN HANDLING                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  User: "@Librarian, compare our auth to OAuth2 best practices"                      │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ GUIDE                                                                        │   │
+│  │                                                                              │   │
+│  │ 1. Detect explicit address: @Librarian → ExplicitTarget = LIBRARIAN          │   │
+│  │ 2. Classify domains: [LIBRARIAN, ACADEMIC] (cross-domain)                    │   │
+│  │ 3. Prefetch with domain filter: [LIBRARIAN, ACADEMIC]                        │   │
+│  │ 4. Route to: LIBRARIAN (explicit address honored)                            │   │
+│  │                                                                              │   │
+│  │ ForwardedMessage {                                                           │   │
+│  │   Query: "compare our auth to OAuth2 best practices",                        │   │
+│  │   Target: LIBRARIAN,                                                         │   │
+│  │   ExplicitTarget: true,                                                      │   │
+│  │   DomainContext: {                                                           │   │
+│  │     DetectedDomains: [LIBRARIAN, ACADEMIC],                                  │   │
+│  │     IsCrossDomain: true,                                                     │   │
+│  │     PrimaryDomain: LIBRARIAN,                                                │   │
+│  │     SecondaryDomains: [ACADEMIC],                                            │   │
+│  │   }                                                                          │   │
+│  │ }                                                                            │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ LIBRARIAN (receives cross-domain query with explicit address)                │   │
+│  │                                                                              │   │
+│  │ 1. Sees: DomainContext.IsCrossDomain = true                                  │   │
+│  │ 2. Sees: DomainContext.SecondaryDomains = [ACADEMIC]                         │   │
+│  │                                                                              │   │
+│  │ 3. OPTIONS:                                                                  │   │
+│  │                                                                              │   │
+│  │    OPTION A: Consult Academic (recommended for synthesis queries)            │   │
+│  │    ───────────────────────────────────────────────────────────               │   │
+│  │    • Librarian searches LIBRARIAN domain: gets auth implementation           │   │
+│  │    • Librarian consults Academic: "What are OAuth2 best practices?"          │   │
+│  │    • Academic searches ACADEMIC domain: returns RFC 6749, etc.               │   │
+│  │    • Librarian synthesizes comparison from both                              │   │
+│  │                                                                              │   │
+│  │    OPTION B: Partial answer with referral                                    │   │
+│  │    ───────────────────────────────────────────────────────────               │   │
+│  │    • Librarian: "Our auth uses JWT middleware at /auth/login.                │   │
+│  │      For OAuth2 best practices comparison, I recommend also                  │   │
+│  │      consulting Academic."                                                   │   │
+│  │                                                                              │   │
+│  │    OPTION C: Use prefetch context (if available)                             │   │
+│  │    ───────────────────────────────────────────────────────────               │   │
+│  │    • Prefetch already contains ACADEMIC domain results                       │   │
+│  │    • Librarian can reference prefetched OAuth2 info                          │   │
+│  │    • Still clearly attributes: "According to OAuth2 specs (ACADEMIC)..."     │   │
+│  │                                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  KEY PRINCIPLE: Explicit address is HONORED. Agent is INFORMED of cross-domain.     │
+│                 Agent CHOOSES how to handle (consult, partial answer, or prefetch). │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Implicit Domain Filtering (Agent Searches)
+
+When a knowledge agent searches the DB, it implicitly filters to its home domain.
+
+```go
+// core/search/domain_filtered_search.go
+
+// AgentSearch performs a domain-filtered search for an agent.
+// The agent's home domain is used as the implicit filter.
+func (s *SearchSystem) AgentSearch(
+    ctx context.Context,
+    agent AgentType,
+    query string,
+) (*SearchResult, error) {
+    // Implicit domain filter based on agent identity
+    homeDomain := AgentToDomain[agent]
+
+    return s.SearchWithDomainFilter(ctx, query, []Domain{homeDomain})
+}
+
+// SearchWithDomainFilter performs a domain-filtered search.
+// Used by both AgentSearch (implicit) and Prefetch (explicit).
+func (s *SearchSystem) SearchWithDomainFilter(
+    ctx context.Context,
+    query string,
+    domains []Domain,
+) (*SearchResult, error) {
+    // Parallel search: Bleve + VectorDB, both with domain filter
+    var wg sync.WaitGroup
+    var bleveResults, vectorResults []SearchHit
+
+    wg.Add(2)
+    go func() {
+        defer wg.Done()
+        bleveResults = s.bleveIndex.SearchWithDomainFilter(query, domains)
+    }()
+    go func() {
+        defer wg.Done()
+        vectorResults = s.vectorDB.SearchWithDomainFilter(query, domains)
+    }()
+    wg.Wait()
+
+    // RRF fusion with domain tags preserved
+    merged := s.rrfFusion(bleveResults, vectorResults)
+
+    return &SearchResult{
+        Hits:            merged,
+        DomainsSearched: domains,
+        OriginalQuery:   query,
+    }, nil
+}
+```
+
+### Cross-Domain Consultation Protocol
+
+When Architect coordinates a cross-domain query (no explicit address):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      ARCHITECT CROSS-DOMAIN COORDINATION                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  User: "Compare our auth implementation to OAuth2 best practices"                   │
+│  (No explicit address, Guide routes to Architect)                                   │
+│       │                                                                             │
+│       ▼                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │ ARCHITECT                                                                    │   │
+│  │                                                                              │   │
+│  │ 1. Receives: DomainContext.DetectedDomains = [LIBRARIAN, ACADEMIC]           │   │
+│  │                                                                              │   │
+│  │ 2. Decomposes into domain-specific sub-queries:                              │   │
+│  │    • LIBRARIAN: "Describe our authentication implementation"                 │   │
+│  │    • ACADEMIC: "What are OAuth2 best practices for auth?"                    │   │
+│  │                                                                              │   │
+│  │ 3. Consults domain experts (PARALLEL):                                       │   │
+│  │    ┌────────────────────────┐    ┌────────────────────────┐                 │   │
+│  │    │ Librarian              │    │ Academic               │                 │   │
+│  │    │                        │    │                        │                 │   │
+│  │    │ Query: "Describe our   │    │ Query: "OAuth2 best    │                 │   │
+│  │    │ auth implementation"   │    │ practices for auth"    │                 │   │
+│  │    │                        │    │                        │                 │   │
+│  │    │ Domain: LIBRARIAN      │    │ Domain: ACADEMIC       │                 │   │
+│  │    │ (implicit filter)      │    │ (implicit filter)      │                 │   │
+│  │    └──────────┬─────────────┘    └──────────┬─────────────┘                 │   │
+│  │               │                             │                                │   │
+│  │               ▼                             ▼                                │   │
+│  │    ┌────────────────────────┐    ┌────────────────────────┐                 │   │
+│  │    │ Results:               │    │ Results:               │                 │   │
+│  │    │ - JWT middleware       │    │ - RFC 6749 (OAuth2)    │                 │   │
+│  │    │ - Session handler      │    │ - Token rotation       │                 │   │
+│  │    │ - /auth/login route    │    │ - PKCE for public      │                 │   │
+│  │    │ - No refresh tokens    │    │ - Short-lived tokens   │                 │   │
+│  │    └────────────────────────┘    └────────────────────────┘                 │   │
+│  │                                                                              │   │
+│  │ 4. Synthesizes comparison:                                                   │   │
+│  │    "COMPARISON: Our Auth vs OAuth2 Best Practices                            │   │
+│  │                                                                              │   │
+│  │     Our Implementation (from Librarian):                                     │   │
+│  │     - Uses JWT with session fallback                                         │   │
+│  │     - Single token, no refresh mechanism                                     │   │
+│  │                                                                              │   │
+│  │     OAuth2 Best Practices (from Academic):                                   │   │
+│  │     - Recommends PKCE for public clients                                     │   │
+│  │     - Short-lived access tokens + refresh tokens                             │   │
+│  │                                                                              │   │
+│  │     Gap Analysis:                                                            │   │
+│  │     - ❌ Missing: Token rotation                                             │   │
+│  │     - ❌ Missing: Refresh token support                                      │   │
+│  │     - ⚠️ Consider: PKCE if supporting public clients"                        │   │
+│  │                                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Domain Classification Caching (Ristretto)
+
+```go
+// core/domain/cache.go
+
+type DomainClassificationCache struct {
+    cache *ristretto.Cache
+}
+
+func NewDomainClassificationCache() (*DomainClassificationCache, error) {
+    cache, err := ristretto.NewCache(&ristretto.Config{
+        NumCounters: 1e6,     // 1M counters for admission policy
+        MaxCost:     1 << 26, // 64MB max cache size
+        BufferItems: 64,      // Number of keys per Get buffer
+    })
+    if err != nil {
+        return nil, fmt.Errorf("create ristretto cache: %w", err)
+    }
+
+    return &DomainClassificationCache{cache: cache}, nil
+}
+
+// CacheKey generates a cache key from query and caller agent.
+// Including caller agent prevents cross-agent cache pollution.
+func CacheKey(query string, callerAgent AgentType) string {
+    h := sha256.Sum256([]byte(query + ":" + string(callerAgent)))
+    return hex.EncodeToString(h[:16]) // 128-bit key
+}
+
+func (c *DomainClassificationCache) Get(query string, caller AgentType) (*DomainContext, bool) {
+    key := CacheKey(query, caller)
+    if val, found := c.cache.Get(key); found {
+        dc := val.(*DomainContext)
+        dc.CacheHit = true
+        dc.CacheKey = key
+        return dc, true
+    }
+    return nil, false
+}
+
+func (c *DomainClassificationCache) Set(query string, caller AgentType, dc *DomainContext) {
+    key := CacheKey(query, caller)
+    dc.CacheKey = key
+    // Cost = 1 per entry (count-based eviction)
+    c.cache.Set(key, dc, 1)
+}
+```
+
+### VectorDB Domain Integration
+
+The existing VectorGraphDB already has a Domain field. Ensure it's used consistently:
+
+```go
+// core/vectorgraphdb/types.go (EXISTING - verify alignment)
+
+// Extend existing Domain enum to include all agent domains
+const (
+    DomainCode     Domain = 0  // Maps to DomainLibrarian
+    DomainHistory  Domain = 1  // Maps to DomainArchivalist
+    DomainAcademic Domain = 2  // Maps to DomainAcademic
+    // ADD: New domains for other agents
+    DomainPlanning Domain = 3  // Maps to DomainArchitect
+    DomainExecution Domain = 4 // Maps to DomainEngineer
+    DomainUI       Domain = 5  // Maps to DomainDesigner
+    DomainQuality  Domain = 6  // Maps to DomainInspector
+    DomainTesting  Domain = 7  // Maps to DomainTester
+    DomainWorkflow Domain = 8  // Maps to DomainOrchestrator
+    DomainRouting  Domain = 9  // Maps to DomainGuide
+)
+
+// SearchWithDomainFilter filters vector search to specific domains
+func (db *VectorGraphDB) SearchWithDomainFilter(
+    query []float32,
+    k int,
+    domains []Domain,
+) []SearchResult {
+    // Use existing HNSW search with domain filter
+    filter := &SearchFilter{
+        Domains: domains,
+    }
+    return db.hnsw.Search(query, k, filter)
+}
+```
+
+### Document DB (Bleve) Domain Integration
+
+The Document struct needs a Domain field for filtering:
+
+```go
+// core/search/document.go (MODIFY)
+
+type Document struct {
+    ID          string       `json:"id"`
+    Path        string       `json:"path"`
+    Type        DocumentType `json:"type"`
+
+    // NEW: Domain ownership - which agent indexed this content
+    Domain      Domain       `json:"domain"`
+    SourceAgent AgentType    `json:"source_agent"`
+
+    // Existing fields...
+    Language    string       `json:"language,omitempty"`
+    Content     string       `json:"content"`
+    // ...
+}
+
+// Bleve index mapping includes domain field for filtering
+func BuildBleveMapping() mapping.IndexMapping {
+    docMapping := bleve.NewDocumentMapping()
+
+    // Domain field - keyword, not analyzed, for exact filtering
+    domainFieldMapping := bleve.NewKeywordFieldMapping()
+    docMapping.AddFieldMappingsAt("domain", domainFieldMapping)
+
+    // SourceAgent field - keyword, for provenance tracking
+    agentFieldMapping := bleve.NewKeywordFieldMapping()
+    docMapping.AddFieldMappingsAt("source_agent", agentFieldMapping)
+
+    // ... existing field mappings ...
+
+    return mapping
+}
+```
+
+### Routing Decision Matrix
+
+| Scenario | Explicit Address | Cross-Domain | Route To | Prefetch Domains |
+|----------|------------------|--------------|----------|------------------|
+| Single domain, no address | No | No | Domain's agent | [PrimaryDomain] |
+| Cross-domain, no address | No | Yes | Architect | [All detected] |
+| Single domain, explicit | Yes | No | Addressed agent | [PrimaryDomain] |
+| Cross-domain, explicit | Yes | Yes | Addressed agent | [All detected] |
+
+### System Prompt Additions
+
+**Guide System Prompt Addition:**
+
+```markdown
+## Domain Classification
+
+Before routing queries, detect domain signals:
+
+CODEBASE: "our code", "this repo", "our implementation", "in the codebase"
+EXTERNAL: "best practice", "documentation", "RFC", "spec", "standard"
+HISTORICAL: "we decided", "last session", "previously", "why did we"
+PLANNING: "the plan", "current task", "next step", "DAG"
+
+Cross-domain patterns: "compare X to Y", "how does X differ from", "does X match Y"
+
+If cross-domain AND no explicit @agent address:
+→ Route to Architect for coordination
+
+If cross-domain AND explicit @agent address:
+→ Honor the address, include DomainContext.IsCrossDomain = true
+```
+
+**Architect System Prompt Addition:**
+
+```markdown
+## Cross-Domain Query Handling
+
+When DomainContext.IsCrossDomain = true and you are the target:
+
+1. DECOMPOSE the query into domain-specific sub-queries
+2. CONSULT domain experts IN PARALLEL:
+   - CODEBASE → Librarian
+   - EXTERNAL → Academic
+   - HISTORICAL → Archivalist
+3. SYNTHESIZE results with clear domain attribution
+4. IDENTIFY gaps, conflicts, or connections between domains
+```
+
+**Knowledge Agent System Prompt Addition (Librarian, Academic, Archivalist):**
+
+```markdown
+## Cross-Domain Awareness
+
+When DomainContext.IsCrossDomain = true:
+
+You may receive queries that span multiple domains. You have three options:
+
+1. CONSULT: Ask other domain experts for their portion
+   "I'll handle the codebase part and consult Academic for best practices"
+
+2. PARTIAL: Answer your domain's portion, recommend consultation
+   "Our auth uses JWT. For OAuth2 best practices, consult Academic."
+
+3. PREFETCH: Use prefetched cross-domain context if available
+   "According to prefetched OAuth2 specs (Academic domain)..."
+
+Always attribute information to its source domain.
+```
+
+---
+
+## Document Search System
+
+**Reference**: See `/SEARCH.md` for complete specification with code examples.
+
+The Document Search System provides local full-text search with Bleve and hybrid retrieval combining lexical precision with semantic understanding via VectorDB.
+
+### Design Principles
+
+1. **Local-first** - All data stays on disk, no external services, portable with the project
+2. **Code-aware** - Tokenization understands camelCase, snake_case, and language constructs
+3. **Hybrid retrieval** - Lexical precision (Bleve) + semantic understanding (VectorDB)
+4. **Standalone usable** - Terminal users get powerful search without agents
+5. **Agent-enhanced** - Agents leverage advanced queries, facets, and custom scoring
+
+### Storage Architecture
+
+```
+~/.sylk/projects/<project-hash>/
+├── vector.db              # SQLite - vector embeddings (existing VectorGraphDB)
+├── documents.bleve/       # Bleve index directory
+│   ├── index_meta.json    # Index metadata
+│   └── store/             # Scorch segment files
+├── manifest.cmt           # Cartesian Merkle Tree manifest
+└── manifest.cmt.wal       # WAL for crash recovery
+```
+
+### Document Types
+
+| Type | Content | Examples |
+|------|---------|----------|
+| `source_code` | Go, TypeScript, Python, etc. | `.go`, `.ts`, `.py` |
+| `markdown` | Documentation | `.md`, `README` |
+| `config` | Configuration files | `.yaml`, `.json`, `.toml` |
+| `llm_prompt` | Agent prompts | Session transcripts |
+| `llm_response` | Agent responses | Session transcripts |
+| `web_fetch` | Cached web pages | Fetched documentation |
+| `note` | User-created notes | Project notes |
+| `git_commit` | Commit messages | Git history |
+
+### Search Layer Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SEARCH COORDINATOR                                    │
+│              Orchestrates Bleve + VectorGraphDB + RRF Fusion                │
+└─────────────────────────────────────────────────────────────────────────────┘
+          │                                           │
+          ▼                                           ▼
+┌─────────────────────┐                 ┌─────────────────────────────┐
+│      BLEVE          │                 │     VECTORGRAPHDB           │
+│   (File-based)      │                 │     (SQLite-based)          │
+│                     │                 │                             │
+│  • Full-text search │                 │  • Semantic search (HNSW)   │
+│  • Fuzzy matching   │                 │  • k-NN similarity          │
+│  • Faceted search   │                 │  • Conceptual match         │
+│  • Boolean queries  │                 │  • Graph relationships      │
+│  • Range queries    │                 │  • Metadata storage         │
+│                     │                 │                             │
+│  documents.bleve/   │                 │  vector.db (SQLite file)    │
+└─────────────────────┘                 └─────────────────────────────┘
+```
+
+**Storage Implementation**:
+- **Bleve**: File-based index in `documents.bleve/` directory (Scorch segments)
+- **VectorGraphDB**: Single SQLite file `vector.db` storing embeddings, graph edges, and metadata
+
+### Hybrid Search with RRF
+
+The SearchCoordinator executes parallel Bleve and VectorDB queries, then fuses results using Reciprocal Rank Fusion (RRF):
+
+```go
+// RRF formula: score = Σ(1/(k + rank)) for each ranking
+// Higher score = better combined relevance
+
+// Example weights (configurable):
+// Lexical: 0.4, Semantic: 0.6
+
+rrfScore = lexicalWeight * (1.0 / (k + lexicalRank)) +
+           semanticWeight * (1.0 / (k + semanticRank))
+```
+
+### Code-Aware Tokenization
+
+Custom analyzers handle code patterns:
+
+| Filter | Input | Output |
+|--------|-------|--------|
+| CamelCase | `handleHTTPError` | `["handle", "HTTP", "Error", "handleHTTPError"]` |
+| SnakeCase | `get_user_by_id` | `["get", "user", "by", "id", "get_user_by_id"]` |
+
+### Agent Integration
+
+Agents access search via typed messages:
+
+| Message Type | Direction | Purpose |
+|-------------|-----------|---------|
+| `SEARCH_REQUEST` | Agent → Guide → Librarian | Query codebase |
+| `SEARCH_RESPONSE` | Librarian → Guide → Agent | Return results |
+
+Librarian wraps SearchCoordinator with agent-aware features:
+- Query expansion using session context
+- Result ranking based on task relevance
+- Caching with session-scoped TTL
+
+---
+
+## Context Virtualization System
+
+**Reference**: See `/CONTEXT.md` for complete specification with code examples.
+
+The Context Virtualization System implements lossless context management, treating the LLM context window like a CPU cache backed by infinite storage. Content can be "evicted" from active context but remains fully retrievable.
+
+### Design Principles
+
+1. **Universal Indexing** - All prompts, responses, tool results, and fetched content stored immediately
+2. **Immediate Repo Scan** - On startup (with user permission), parallel scan indexes entire project
+3. **No Compaction** - Knowledge agents use eviction + retrieval; pipeline agents use handoff
+4. **Lossless Access** - Evicted content replaced with references that enable full retrieval
+5. **Smart Eviction** - Per-agent strategies based on role and access patterns
+
+### Traditional vs Virtualized Context
+
+```
+TRADITIONAL COMPACTION (Lossy)          CONTEXT VIRTUALIZATION (Lossless)
+════════════════════════════           ═══════════════════════════════════
+
+[Full Context] ─► [Summary] ─► [Summary²]    [Full Context] ─► [References]
+      │                  │              │            │                  │
+   10,000            2,000            400        10,000            ~200
+   tokens            tokens          tokens       tokens           tokens
+      │                  │              │            │                  │
+      ▼                  ▼              ▼            ▼                  ▼
+ Information         ~80% loss      ~96% loss   Information      0% loss
+                                                 in DB/VDB       (retrievable)
+
+After 3 compactions: unrecoverable    After any eviction: fully recoverable
+```
+
+### Universal Content Store
+
+Central storage wrapping VectorGraphDB (SQLite-based) + Bleve:
+
+```go
+type UniversalContentStore struct {
+    bleveIndex   bleve.Index           // Full-text search (file-based index)
+    vectorDB     *vectorgraphdb.DB     // Semantic search + relational (SQLite-based)
+    indexQueue   chan *ContentEntry    // Async indexing
+}
+```
+
+**Note**: VectorGraphDB uses SQLite internally for all storage - vector embeddings, graph edges, and metadata are stored in a single SQLite database file. There is no separate SQLite connection.
+
+### Content Types (Conversation-Based)
+
+| Type | Description |
+|------|-------------|
+| `user_prompt` | User messages |
+| `agent_response` | Agent replies |
+| `tool_call` | Tool invocations |
+| `tool_result` | Tool outputs |
+| `code_file` | Indexed source files |
+| `web_fetch` | Fetched web content |
+| `research_paper` | Academic findings |
+| `agent_message` | Inter-agent communication |
+| `plan_workflow` | Architect plans |
+| `test_result` | Tester outputs |
+| `inspector_finding` | Inspector reports |
+
+### Agent Memory Management
+
+**IMPORTANT**: Triggers are GP-detected degradation (NOT fixed percentages). See HANDOFF.md for full architecture.
+
+| Agent | Model | Context | Category | Strategy | Trigger |
+|-------|-------|---------|----------|----------|---------|
+| Librarian | Sonnet 4.5 | **1M** | Knowledge | Tiered Eviction | GP-detected |
+| Archivalist | Sonnet 4.5 | **1M** | Knowledge | Tiered Eviction | GP-detected |
+| Academic | Opus 4.5 | 200K | Knowledge | Topic Cluster Eviction | GP-detected |
+| Architect | Opus 4.5 | 200K | Knowledge | Task Completion Eviction | GP-detected |
+| Engineer | Opus 4.5 | 200K | Pipeline | **Same-Type Handoff** | GP-detected |
+| Designer | Sonnet 4.5 | 200K | Pipeline | **Same-Type Handoff** | GP-detected |
+| Inspector | Sonnet/Haiku | 200K | Pipeline/Standalone | **Same-Type Handoff** | GP-detected |
+| Tester | Sonnet/Haiku | 200K | Pipeline/Standalone | **Same-Type Handoff** | GP-detected |
+
+### Context Reference Markers
+
+When content is evicted, compact reference markers remain:
+
+```
+[CTX-REF:conversation | 15 turns (4,200 tokens) @ 14:23 |
+ Topics: auth flow, JWT, middleware | retrieve_context(ref_id="abc123")]
+```
+
+Reference markers are < 100 tokens but enable full content retrieval via `retrieve_context` skill.
+
+### Eviction Strategies
+
+| Strategy | Used By | Behavior |
+|----------|---------|----------|
+| Recency-Based | Librarian, Archivalist | Evict oldest turns first, preserve recent |
+| Topic Cluster | Academic | Evict complete research topics together |
+| Task Completion | Architect | Evict completed task context, preserve active |
+
+### Integration with Document Search
+
+The Document Search System (SEARCH.md) and Context Virtualization (CONTEXT.md) share infrastructure:
+
+1. **Bleve Index**: File-based full-text search for lexical queries
+2. **VectorGraphDB**: SQLite-based semantic search + graph relationships + metadata
+3. **SearchCoordinator**: Unified query interface with RRF fusion
+4. **Domain Filtering**: Queries scoped by agent domain
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    UNIFIED STORAGE ARCHITECTURE                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   Document Search (SEARCH.md)    Context Virtualization (CONTEXT.md)│
+│   ─────────────────────────      ────────────────────────────────── │
+│   • File-based documents         • Conversation-based entries       │
+│   • Codebase indexing            • Session content indexing         │
+│   • Symbol extraction            • Entity extraction                │
+│                                                                     │
+│                    ┌─────────────────────┐                          │
+│                    │  SearchCoordinator  │                          │
+│                    │   (RRF Fusion)      │                          │
+│                    └─────────┬───────────┘                          │
+│                              │                                      │
+│              ┌───────────────┴───────────────┐                      │
+│              ▼                               ▼                      │
+│   ┌────────────────────┐        ┌────────────────────────────┐     │
+│   │       BLEVE        │        │      VECTORGRAPHDB         │     │
+│   │    (File-based)    │        │      (SQLite-based)        │     │
+│   │                    │        │                            │     │
+│   │  • Lexical search  │        │  • Semantic search (HNSW)  │     │
+│   │  • Fuzzy matching  │        │  • Graph relationships     │     │
+│   │  • Faceted results │        │  • Metadata & embeddings   │     │
+│   │                    │        │  • Relational queries      │     │
+│   │  documents.bleve/  │        │  vector.db                 │     │
+│   └────────────────────┘        └────────────────────────────┘     │
+│                                                                     │
+│   NOTE: VectorGraphDB uses SQLite internally - there is no         │
+│   separate SQLite database. All relational data, embeddings,       │
+│   and graph edges are stored in the single vector.db file.         │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -4527,7 +5478,11 @@ func (t *UsageTracker) TotalCost(filter UsageFilter) float64
 
 ### Context Window Management
 
-Context overflow is handled via smart selection, Archivalist handoff, and summarization—leveraging existing agent compaction mechanisms.
+Context overflow is handled via smart selection, Archivalist storage, and eviction/handoff—leveraging the context virtualization system.
+
+**Knowledge agents** (Librarian, Archivalist, Academic, Architect) use **eviction**: content is replaced with [CTX-REF-xxx] references that can be retrieved on demand.
+
+**Pipeline agents** (Engineer, Designer, Inspector, Tester, Orchestrator, Guide) use **handoff**: a new agent instance is spawned with transferred state.
 
 ```go
 type ContextManager struct {
@@ -4536,8 +5491,9 @@ type ContextManager struct {
     reserveTokens    int  // Reserve for response (e.g., 4096)
 
     // Integration points
-    compactor        AgentCompactor  // Agent-specific compaction
-    archivalist      *Archivalist    // For context handoff
+    evictor          EvictionStrategy  // Agent-specific eviction (knowledge agents)
+    handoffManager   *HandoffManager   // For agent handoff (pipeline agents)
+    archivalist      *Archivalist      // For storing evicted content + handoff states
     tokenCounter     TokenCounter
 }
 
@@ -4574,20 +5530,20 @@ func (cm *ContextManager) PrepareContext(messages []Message, query string) ([]Me
         // Log but continue - summarization fallback
     }
 
-    // Strategy 3: Summarize what won't fit
-    summary, err := cm.compactor.CompactMessages(overflow)
+    // Strategy 3: Evict and create references
+    references, err := cm.evictor.EvictToReferences(overflow)
     if err != nil {
         // Last resort: truncate oldest
         return append(systemPrompt, recent...), nil
     }
 
-    // Reconstruct: system + summary + recent
-    summaryMsg := Message{
+    // Reconstruct: system + references + recent
+    refMsg := Message{
         Role:    "system",
-        Content: fmt.Sprintf("[Context summary of %d earlier messages]\n%s", len(overflow), summary),
+        Content: fmt.Sprintf("[Context references for %d earlier messages]\n%s", len(overflow), references.Render()),
     }
 
-    result := append(systemPrompt, summaryMsg)
+    result := append(systemPrompt, refMsg)
     result = append(result, recent...)
 
     return result, nil
@@ -11938,17 +12894,17 @@ The Memory Pressure Defense System provides a 7-layer defense against memory exh
 │  ┌─────────────┐ ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐      │
 │  │  LAYER 4:   │ │    LAYER 5:     │ │    LAYER 6:     │ │    LAYER 7:     │      │
 │  │  Admission  │ │  Cache Evictor  │ │    Context      │ │    Pipeline     │      │
-│  │  Controller │ │                 │ │   Compactor     │ │    Suspender    │      │
+│  │  Controller │ │                 │ │   Evictor       │ │    Suspender    │      │
 │  │             │ │                 │ │                 │ │                 │      │
 │  │ Gate new    │ │ LRU eviction    │ │ Trigger early   │ │ Pause/resume    │      │
-│  │ pipelines   │ │ from caches     │ │ LLM compaction  │ │ by priority     │      │
+│  │ pipelines   │ │ from caches     │ │ context eviction│ │ by priority     │      │
 │  └─────────────┘ └─────────────────┘ └─────────────────┘ └─────────────────┘      │
 │                                                                                     │
 │  RESPONSE MATRIX:                                                                   │
 │  ───────────────────────────────────────────────────────────────────────────────── │
 │  NORMAL (< 50%):     Resume admissions, resume pipelines                           │
 │  ELEVATED (50-70%):  Stop admissions, GC                                           │
-│  HIGH (70-85%):      + Evict caches 25%, compact contexts                          │
+│  HIGH (70-85%):      + Evict caches 25%, trigger agent eviction                    │
 │  CRITICAL (> 85%):   + Evict caches 50%, pause pipelines                           │
 │  SPIKE (+15%):       Immediate GC + evict (bypasses cooldown)                      │
 │                                                                                     │
@@ -11969,7 +12925,7 @@ The Memory Pressure Defense System provides a 7-layer defense against memory exh
 | **PressureStateMachine** | `core/resources/pressure_state.go` | 4-level state machine with hysteresis + cooldown |
 | **AdmissionController** | `core/resources/admission_controller.go` | Gate new pipelines based on pressure level |
 | **CacheEvictor** | `core/resources/cache_evictor.go` | Coordinate LRU eviction across caches |
-| **ContextCompactor** | `core/resources/context_compactor.go` | Signal agents to compact LLM contexts |
+| **ContextEvictor** | `core/resources/context_evictor.go` | Signal knowledge agents to evict context, pipeline agents to handoff |
 | **PipelineSuspender** | `core/resources/pipeline_suspender.go` | Pause/resume pipelines by priority |
 | **PressureController** | `core/resources/pressure_controller.go` | Orchestrates all layers |
 
@@ -11994,7 +12950,7 @@ Usage %    State        Actions
 35-50%     NORMAL       (hysteresis zone)
 50-55%     ELEVATED     Stop admissions, GC
 55-70%     ELEVATED     (hysteresis zone)
-70-85%     HIGH         + Evict 25%, compact contexts
+70-85%     HIGH         + Evict 25%, trigger agent context eviction
 > 85%      CRITICAL     + Evict 50%, pause pipelines
 
 SPIKE (+15% in one tick): Immediate GC + evict (bypasses cooldown)
@@ -12024,7 +12980,8 @@ streamBuffer.registry.Report(requestID, UsageCategoryLLMBuffers, size)
 ```go
 const (
     EvictCaches           Signal = "evict_caches"
-    CompactContexts       Signal = "compact_contexts"
+    EvictContexts         Signal = "evict_contexts"  // Triggers eviction for knowledge agents
+    TriggerHandoffs       Signal = "trigger_handoffs" // Triggers handoff for pipeline agents
     MemoryPressureChanged Signal = "memory_pressure_changed"
 )
 ```
@@ -38490,7 +39447,7 @@ The Orchestrator is a **read-only intelligent query box** for pipeline status an
 │  ├── Execute workflows in strict topological order                                  │
 │  ├── Monitor pipeline health (error rate, timeout, heartbeat)                       │
 │  ├── Buffer and forward status updates to user via Guide                            │
-│  ├── Generate structured summaries on compaction                                    │
+│  ├── Build handoff state on context threshold                                       │
 │  └── Report failures to Architect (no retry authority)                              │
 │                                                                                     │
 │  NON-RESPONSIBILITIES (Handled by DAG Executor Layer)                               │
@@ -38499,11 +39456,12 @@ The Orchestrator is a **read-only intelligent query box** for pipeline status an
 │  ├── Dependent task cancellation (DAG layer auto-cancels)                           │
 │  └── Resource allocation (PipelineScheduler handles)                                │
 │                                                                                     │
-│  COMPACTION                                                                         │
-│  ├── Triggers at: 95% context window OR workflow completion                         │
-│  ├── DAG execution continues during compaction                                      │
-│  ├── Orchestrator LLM waits for compaction before new prompts                       │
-│  └── Generates OrchestratorSummary → Archivalist                                    │
+│  HANDOFF (at 75% context threshold)                                                 │
+│  ├── Triggers at: 75% context window                                                │
+│  ├── DAG execution continues during handoff                                         │
+│  ├── Old Orchestrator builds OrchestratorHandoffState                               │
+│  ├── New Orchestrator receives state and continues coordination                     │
+│  └── Handoff state archived to Archivalist (Bleve + VectorDB)                       │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -38680,18 +39638,18 @@ type TaskBufferConfig struct {
 │         ▼                                                                           │
 │     Guide routes → User (immediate, no buffering)                                   │
 │                                                                                     │
-│  4. WORKFLOW SUMMARY (On compaction)                                                │
-│     ───────────────────────────────                                                 │
-│     Orchestrator reaches 95% context OR workflow completes                          │
+│  4. HANDOFF (At 75% context threshold)                                              │
+│     ──────────────────────────────────                                              │
+│     Orchestrator reaches 75% context                                                │
 │         │                                                                           │
 │         ▼                                                                           │
-│     Orchestrator invokes: generate_workflow_summary()                               │
+│     Orchestrator invokes: build_handoff_state()                                     │
 │         │                                                                           │
 │         ▼                                                                           │
-│     Produces OrchestratorSummary → sends to Archivalist                             │
+│     Produces OrchestratorHandoffState → sends to HandoffManager                     │
 │         │                                                                           │
 │         ▼                                                                           │
-│     Compacts context, continues with summary as history                             │
+│     New Orchestrator receives state and continues coordination                      │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -38710,7 +39668,7 @@ IDENTITY:
 RESPONSIBILITIES:
 1. Answer user queries about task status, duration, and progress
 2. Push status updates to user immediately on pipeline state changes
-3. Generate structured summaries when compacting context
+3. Build handoff state when context reaches 75% threshold
 4. Report failures to Architect (you do NOT decide retry strategy)
 5. Submit task completion events to Archivalist for EVERY terminal task state
 6. Query Archivalist for failure patterns when relevant
@@ -38761,7 +39719,7 @@ AVAILABLE SKILLS:
 - query_task_status: Query single task status and updates
 - query_workflow_status: Query overall workflow progress
 - push_status_update: Push immediate update to user via Guide
-- generate_workflow_summary: Generate structured summary for compaction
+- build_handoff_state: Build handoff state at 75% context threshold
 - report_failure: Report failure to Architect for retry decision
 - submit_task_event: Submit task completion/failure/cancel to Archivalist
 - archivalist_request: Direct query to Archivalist (synchronous)
@@ -39193,18 +40151,18 @@ var OrchestratorSkills = []Skill{
         },
     },
 
-    // Generate workflow summary for compaction
+    // Build handoff state at 75% context threshold
     {
-        Name:        "generate_workflow_summary",
-        Description: "Generate structured summary for compaction and archival",
-        Domain:      "summary",
-        Keywords:    []string{"summary", "compact", "archive"},
+        Name:        "build_handoff_state",
+        Description: "Build handoff state for transferring coordination context to new Orchestrator",
+        Domain:      "handoff",
+        Keywords:    []string{"handoff", "state", "archive"},
         Parameters: []Param{
             {Name: "workflow_id", Type: "string", Required: false},
             {Name: "include_running", Type: "bool", Required: false, Default: true},
         },
         Returns: schema.Object{
-            "summary": schema.Object{"type": "OrchestratorSummary"},
+            "handoff_state": schema.Object{"type": "OrchestratorHandoffState"},
         },
     },
 
@@ -39550,14 +40508,14 @@ func (m *HealthMonitor) CheckHealth(buffer *TaskUpdateBuffer, taskStart time.Tim
 }
 ```
 
-### Orchestrator Summary Schema
+### Orchestrator Handoff State Schema
 
-Generated on compaction, sent to Archivalist for historical record.
+Generated at 75% context threshold, sent to HandoffManager, archived to Archivalist (Bleve + VectorDB).
 
 ```go
-// OrchestratorSummary is the payload for compaction summaries
-// Sent via Message envelope with Type: "ORCHESTRATOR_SUMMARY"
-type OrchestratorSummary struct {
+// OrchestratorHandoffState is the payload for handoff to new Orchestrator
+// Archived to Archivalist with dual storage (Bleve text search + VectorDB semantic search)
+type OrchestratorHandoffState struct {
     // Workflow identification
     Workflow WorkflowSummary `json:"workflow"`
 
@@ -39571,8 +40529,8 @@ type OrchestratorSummary struct {
     // Aggregate metrics
     Metrics SummaryMetrics `json:"metrics"`
 
-    // Compaction metadata
-    Compaction CompactionInfo `json:"compaction"`
+    // Handoff metadata
+    Handoff HandoffInfo `json:"handoff"`
 }
 
 type WorkflowSummary struct {
@@ -39656,12 +40614,12 @@ type SummaryMetrics struct {
     AvgHeartbeatDelay time.Duration `json:"avg_heartbeat_delay"`
 }
 
-type CompactionInfo struct {
-    Reason            string    `json:"reason"`
-    CompactedAt       time.Time `json:"compacted_at"`
-    PreCompactTokens  int       `json:"pre_compact_tokens"`
-    PostCompactTokens int       `json:"post_compact_tokens"`
-    UpdatesDropped    int       `json:"updates_dropped"`
+type HandoffInfo struct {
+    Reason           string    `json:"reason"`
+    HandoffAt        time.Time `json:"handoff_at"`
+    HandoffIndex     int       `json:"handoff_index"`      // 1, 2, 3... for chained handoffs
+    ContextUsage     float64   `json:"context_usage_pct"`  // 75% threshold
+    TokensTransferred int      `json:"tokens_transferred"`
 }
 ```
 
@@ -39760,10 +40718,10 @@ var OrchestratorGuideRoutes = []RouteRule{
         Description: "Failure reports for retry decisions",
     },
     {
-        MessageType: "ORCHESTRATOR_SUMMARY",
+        MessageType: "ORCHESTRATOR_HANDOFF",
         Target:      RouteToArchivalist,
         Priority:    PriorityNormal,
-        Description: "Compaction summaries for archival",
+        Description: "Handoff states for archival (Bleve + VectorDB)",
     },
     {
         MessageType: "ORCHESTRATOR_TASK_EVENT",
@@ -40602,70 +41560,1781 @@ func (o *Orchestrator) checkLayerCompletion(layer int) bool {
 
 ---
 
-## Agent Memory Management
+## Dynamic Quality-Based Handoff
 
-Each agent has specific memory management strategies based on their role, model, and context window characteristics. All checkpoints and compaction summaries are submitted to the Archivalist for persistence.
+**NOTE**: Fixed percentage thresholds (75%, 80%, 85%) have been replaced with **GP-based dynamic triggers**. See **HANDOFF.md** for the complete implementation with learned distributions and hierarchical Bayesian priors. The diagrams below illustrate *why* the GP-based system was designed - they show the problems with fixed thresholds that the GP system solves.
 
-### Agent Model Assignments
+### Integration with Existing Infrastructure
 
-| Agent | Model | Context Strategy |
-|-------|-------|------------------|
-| **Librarian** | (TBD) | Frequent checkpoints (25%, 50%, 75%), compact at 75% |
-| **Guide** | (TBD) | Routing-focused checkpoints (50%, 75%, 90%), compact at 95% |
-| **Academic** | Opus 4.5 | Research paper at 85%, compact at 95% |
-| **Architect** | OpenAI Codex 5.2 | Workflow/plan at 85%, compact at 95% |
-| **Engineer** | Opus 4.5 | **PIPELINE HANDOFF at 95%** (special case) |
-| **Inspector** | OpenAI Codex 5.2 | Findings summary at 85%, compact at 95% |
-| **Tester** | OpenAI Codex 5.2 | Test summary at 85%, compact at 95% |
+This system integrates with the existing handoff infrastructure documented above:
 
-### Memory Management Summary
+| Existing Component | Integration Point | Change Required |
+|--------------------|-------------------|-----------------|
+| `HandoffManager` | Receives `HandoffDecision` instead of threshold trigger | Add `DecisionType` field to handoff request |
+| `*HandoffState` types | No change - same state structures | None |
+| `ContextManager` | Replace threshold check with `HandoffDecisionEngine.Evaluate()` | New dependency injection |
+| `Archivalist` | Store `HandoffEvaluation` alongside `HandoffState` | Add evaluation category |
+| Agent system prompts | Add quality signal extraction instructions | New skill: `report_quality_signals` |
+
+### The Problem with Fixed Thresholds
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                     AGENT MEMORY MANAGEMENT THRESHOLDS                               │
+│                     WHY FIXED THRESHOLDS FAIL                                        │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                     │
-│  LIBRARIAN:    25%──────50%──────75%                                                │
-│                 │        │        │                                                 │
-│                 ▼        ▼        ▼                                                 │
-│              CKPT     CKPT    CKPT+COMPACT                                          │
+│  SCENARIO A: Agent degrades BEFORE 75%                                              │
+│  ──────────────────────────────────────                                             │
 │                                                                                     │
-│  GUIDE:                 50%──────75%──────90%──────95%                              │
-│                          │        │        │        │                               │
-│                          ▼        ▼        ▼        ▼                               │
-│                        CKPT     CKPT     CKPT    COMPACT                            │
+│    0%        25%        50%        75%       100%                                   │
+│    │          │          │          │          │                                    │
+│    ▼──────────▼──────────▼──────────▼──────────▼                                    │
+│    [████████████████████░░░░░░░░░░░░░░░░░░░░░░░░]                                   │
+│                    ▲                 ▲                                              │
+│                    │                 │                                              │
+│            Quality degrades    Fixed threshold                                      │
+│            here (40%)          triggers handoff                                     │
 │                                                                                     │
-│  ACADEMIC:                               85%──────95%                               │
-│  (Opus 4.5)                               │        │                                │
-│                                           ▼        ▼                                │
-│                                      RESEARCH   COMPACT                             │
-│                                       PAPER                                         │
+│    Problem: Agent produces poor output for 35% of context window                    │
 │                                                                                     │
-│  ARCHITECT:                              85%──────95%                               │
-│  (Codex 5.2)                              │        │                                │
-│                                           ▼        ▼                                │
-│                                       WORKFLOW  COMPACT                             │
-│                                        + PLAN                                       │
+│  SCENARIO B: Agent remains excellent BEYOND 75%                                     │
+│  ──────────────────────────────────────────────                                     │
 │                                                                                     │
-│  ENGINEER:                                       95%                                │
-│  (Opus 4.5)                                       │                                 │
-│                                                   ▼                                 │
-│                                           *** PIPELINE ***                          │
-│                                           *** HANDOFF  ***                          │
+│    0%        25%        50%        75%       100%                                   │
+│    │          │          │          │          │                                    │
+│    ▼──────────▼──────────▼──────────▼──────────▼                                    │
+│    [████████████████████████████████████████████]                                   │
+│                                      ▲          ▲                                   │
+│                                      │          │                                   │
+│                           Fixed threshold   Quality still                           │
+│                           triggers handoff  excellent (95%)                         │
 │                                                                                     │
-│  INSPECTOR:                              85%──────95%                               │
-│  (Codex 5.2)                              │        │                                │
-│                                           ▼        ▼                                │
-│                                       FINDINGS  COMPACT                             │
-│                                       SUMMARY   (local)                             │
+│    Problem: Unnecessary handoff wastes resources and loses context                  │
 │                                                                                     │
-│  TESTER:                                 85%──────95%                               │
-│  (Codex 5.2)                              │        │                                │
-│                                           ▼        ▼                                │
-│                                         TEST    COMPACT                             │
-│                                       SUMMARY   (local)                             │
+│  SCENARIO C: Poor INPUT causes poor output (not agent's fault)                      │
+│  ─────────────────────────────────────────────────────────────                      │
 │                                                                                     │
-│  All checkpoints/summaries → ARCHIVALIST (persistent storage)                       │
+│    User prompt: "fix the thing"        Agent prompt: "implement solution"           │
+│           │                                    │                                    │
+│           ▼                                    ▼                                    │
+│    [Ambiguous input]                  [Vague delegation]                            │
+│           │                                    │                                    │
+│           ▼                                    ▼                                    │
+│    [Poor agent output]                [Poor agent output]                           │
+│           │                                    │                                    │
+│           ▼                                    ▼                                    │
+│    WRONG: Trigger handoff             WRONG: Trigger handoff                        │
+│    RIGHT: Request clarification       RIGHT: Escalate to Architect                  │
+│                                                                                     │
+│    Problem: Handoff won't help if the INPUT is the problem                          │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Quality-Based Handoff Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    DYNAMIC QUALITY-BASED HANDOFF ENGINE                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                              ┌─────────────────────┐                                │
+│                              │    Agent Output     │                                │
+│                              │    (response/action)│                                │
+│                              └──────────┬──────────┘                                │
+│                                         │                                           │
+│                    ┌────────────────────┼────────────────────┐                      │
+│                    │                    │                    │                      │
+│                    ▼                    ▼                    ▼                      │
+│           ┌────────────────┐   ┌────────────────┐   ┌────────────────┐             │
+│           │ INPUT QUALITY  │   │ OUTPUT QUALITY │   │ CONTEXT STATE  │             │
+│           │ ASSESSOR       │   │ ASSESSOR       │   │ ASSESSOR       │             │
+│           │                │   │                │   │                │             │
+│           │ • Prompt       │   │ • Agent-       │   │ • Usage %      │             │
+│           │   completeness │   │   specific     │   │ • Fragmentation│             │
+│           │ • Clarity      │   │   criteria     │   │ • Topic drift  │             │
+│           │ • Specificity  │   │ • Task success │   │ • Reference    │             │
+│           │ • Coherence    │   │ • Error rate   │   │   density      │             │
+│           └───────┬────────┘   └───────┬────────┘   └───────┬────────┘             │
+│                   │                    │                    │                      │
+│                   └────────────────────┼────────────────────┘                      │
+│                                        │                                           │
+│                                        ▼                                           │
+│                         ┌──────────────────────────┐                               │
+│                         │   CAUSAL ATTRIBUTOR      │                               │
+│                         │                          │                               │
+│                         │  P(agent_degraded |      │                               │
+│                         │    poor_output,          │                               │
+│                         │    input_quality,        │                               │
+│                         │    context_state)        │                               │
+│                         │                          │                               │
+│                         │  Attribution:            │                               │
+│                         │  • AGENT_DEGRADATION     │                               │
+│                         │  • INPUT_QUALITY_ISSUE   │                               │
+│                         │  • CONTEXT_EXHAUSTION    │                               │
+│                         │  • TASK_COMPLEXITY       │                               │
+│                         │  • ENVIRONMENTAL_FACTOR  │                               │
+│                         └───────────┬──────────────┘                               │
+│                                     │                                              │
+│                                     ▼                                              │
+│                         ┌──────────────────────────┐                               │
+│                         │   HYSTERESIS CONTROLLER  │                               │
+│                         │                          │                               │
+│                         │  • Cold-start gate       │                               │
+│                         │  • Trend analysis        │                               │
+│                         │  • Debouncing            │                               │
+│                         │  • Asymmetric EWMA       │                               │
+│                         └───────────┬──────────────┘                               │
+│                                     │                                              │
+│                                     ▼                                              │
+│                         ┌──────────────────────────┐                               │
+│                         │   HANDOFF DECISION       │                               │
+│                         │                          │                               │
+│                         │  • CONTINUE              │──▶ Normal operation           │
+│                         │  • REQUEST_CLARIFICATION │──▶ Ask user/upstream          │
+│                         │  • SOFT_HANDOFF          │──▶ Prepare handoff state      │
+│                         │  • HARD_HANDOFF          │──▶ Immediate handoff          │
+│                         │  • ESCALATE              │──▶ Route to Architect         │
+│                         └──────────────────────────┘                               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Core Design Principles
+
+| Principle | Description |
+|-----------|-------------|
+| **Bayesian Foundation** | Uses Beta distributions for uncertainty-aware quality tracking (same as SCORING.md) |
+| **Cold-Start Tolerance** | Suppresses handoff decisions until sufficient observations accumulate |
+| **Input-Output Attribution** | Distinguishes agent problems from upstream problems |
+| **Hysteresis** | Requires sustained degradation before triggering handoff |
+| **Domain-Specificity** | Different quality criteria for different agent types and contexts |
+| **Pipeline vs Workflow** | Fundamentally different parameters for pipeline and workflow agents |
+
+### Cold-Start Handling
+
+New agents or agents in new contexts naturally have uncertain performance. We MUST NOT penalize agents during this learning period.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       COLD-START UNCERTAINTY HANDLING                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Using Beta Distribution (same as SCORING.md weight learning):                      │
+│                                                                                     │
+│  Initial state: α=1, β=1 (uniform prior - complete uncertainty)                     │
+│  Effective samples: n = α + β = 2                                                   │
+│                                                                                     │
+│  95% Credible Interval Width: CI_width ≈ 1.96 × √(αβ / ((α+β)²(α+β+1)))            │
+│                                                                                     │
+│  HANDOFF DECISION GATE:                                                             │
+│  ─────────────────────                                                              │
+│                                                                                     │
+│    if CI_width > UNCERTAINTY_THRESHOLD:                                             │
+│        return CONTINUE  // Not enough data to make decision                         │
+│                                                                                     │
+│    // Only proceed with handoff decision if uncertainty is low enough               │
+│                                                                                     │
+│  BURN-IN PERIOD:                                                                    │
+│  ───────────────                                                                    │
+│                                                                                     │
+│  Pipeline agents: 3-5 turns (fast feedback)                                         │
+│  Workflow agents: 8-12 turns (slower, user-facing)                                  │
+│                                                                                     │
+│  During burn-in:                                                                    │
+│    • Handoff ONLY if context exceeds 90% (safety limit)                             │
+│    • Quality observations recorded but don't trigger handoff                        │
+│    • Build baseline for agent's expected performance                                │
+│                                                                                     │
+│  VISUALIZATION:                                                                     │
+│                                                                                     │
+│       Quality                                                                       │
+│         ▲                                                                           │
+│    1.0  │                     ┌─────────────┐                                       │
+│         │     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│  Confident  │▓▓▓▓▓▓▓▓▓▓▓                           │
+│         │   ▓▓               └─────────────┘           ▓▓                           │
+│    0.5  │  ▓▓   ┌───────────────────────────────────┐   ▓▓                          │
+│         │ ▓▓    │       UNCERTAINTY ZONE            │    ▓▓                         │
+│         │▓▓     │     (NO HANDOFF DECISIONS)        │     ▓▓                        │
+│    0.0  │▓      └───────────────────────────────────┘      ▓                        │
+│         └───────────────────────────────────────────────────▶                       │
+│              Turn 1    Turn 5         Turn 10        Turn 15                        │
+│              ◄─────────────────►                                                    │
+│                 BURN-IN PERIOD                                                      │
+│              (handoff suppressed)                                                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// core/handoff/cold_start.go
+
+// ColdStartGate determines if we have enough data to make handoff decisions.
+type ColdStartGate struct {
+    minTurns              int     // Minimum turns before decisions
+    uncertaintyThreshold  float64 // Max CI width to allow decisions
+    safetyContextLimit    float64 // Context % that overrides burn-in
+}
+
+// AgentQualityTracker tracks quality using Beta distribution.
+type AgentQualityTracker struct {
+    alpha           float64 // Success pseudo-counts
+    beta            float64 // Failure pseudo-counts
+    turnsObserved   int
+    burnInComplete  bool
+}
+
+// DefaultColdStartConfig returns config based on agent type.
+func DefaultColdStartConfig(agentType AgentType) ColdStartGate {
+    switch agentType {
+    case AgentTypePipeline:
+        return ColdStartGate{
+            minTurns:             3,
+            uncertaintyThreshold: 0.3, // Tighter - faster feedback
+            safetyContextLimit:   0.90,
+        }
+    case AgentTypeWorkflow:
+        return ColdStartGate{
+            minTurns:             8,
+            uncertaintyThreshold: 0.25, // Looser - need more confidence
+            safetyContextLimit:   0.90,
+        }
+    default:
+        return ColdStartGate{
+            minTurns:             5,
+            uncertaintyThreshold: 0.28,
+            safetyContextLimit:   0.90,
+        }
+    }
+}
+
+// CanMakeDecision returns true if we have enough data.
+func (g *ColdStartGate) CanMakeDecision(tracker *AgentQualityTracker, contextUsage float64) bool {
+    // Safety override: always allow handoff near context limit
+    if contextUsage >= g.safetyContextLimit {
+        return true
+    }
+
+    // Minimum turns check
+    if tracker.turnsObserved < g.minTurns {
+        return false
+    }
+
+    // Uncertainty check
+    ciWidth := tracker.CredibleIntervalWidth()
+    return ciWidth <= g.uncertaintyThreshold
+}
+
+// CredibleIntervalWidth returns 95% credible interval width.
+func (t *AgentQualityTracker) CredibleIntervalWidth() float64 {
+    a, b := t.alpha, t.beta
+    n := a + b
+
+    // Approximation: CI width ≈ 1.96 × σ, where σ = √(ab / (n²(n+1)))
+    variance := (a * b) / (n * n * (n + 1))
+    return 1.96 * math.Sqrt(variance)
+}
+```
+
+### Input Quality Attribution
+
+A critical insight: **poor agent output may not be the agent's fault**. We must distinguish:
+
+1. **Agent degradation** - The agent is performing poorly due to context exhaustion or model limitations
+2. **Input quality issue** - The prompt/delegation was unclear, incomplete, or ambiguous
+3. **Task complexity** - The task is inherently difficult, not an agent failure
+4. **Environmental factors** - API latency, rate limits, tool failures
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       INPUT QUALITY ATTRIBUTION                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  BAYESIAN ATTRIBUTION:                                                              │
+│  ─────────────────────                                                              │
+│                                                                                     │
+│  P(agent_degraded | poor_output) =                                                  │
+│                                                                                     │
+│      P(poor_output | agent_degraded) × P(agent_degraded)                            │
+│    ────────────────────────────────────────────────────────                         │
+│                        P(poor_output)                                               │
+│                                                                                     │
+│  Where:                                                                             │
+│                                                                                     │
+│  P(poor_output) = P(poor_output | agent_degraded) × P(agent_degraded)               │
+│                 + P(poor_output | poor_input) × P(poor_input)                       │
+│                 + P(poor_output | high_complexity) × P(high_complexity)             │
+│                 + P(poor_output | environmental) × P(environmental)                 │
+│                                                                                     │
+│  KEY INSIGHT:                                                                       │
+│  ────────────                                                                       │
+│  If input_quality is LOW, then P(poor_input) is HIGH,                               │
+│  which REDUCES P(agent_degraded | poor_output).                                     │
+│                                                                                     │
+│  → Don't blame the agent for bad prompts!                                           │
+│                                                                                     │
+│  INPUT QUALITY SIGNALS:                                                             │
+│  ──────────────────────                                                             │
+│                                                                                     │
+│  From User:                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐              │
+│  │ Signal          │ Weight │ Detection                             │              │
+│  ├──────────────────────────────────────────────────────────────────┤              │
+│  │ Completeness    │ 0.25   │ Contains subject, action, constraints │              │
+│  │ Specificity     │ 0.25   │ Concrete nouns, measurable goals      │              │
+│  │ Clarity         │ 0.20   │ No ambiguous pronouns, clear refs     │              │
+│  │ Coherence       │ 0.15   │ Logically consistent, no contradictions│             │
+│  │ Context         │ 0.15   │ Sufficient background provided        │              │
+│  └──────────────────────────────────────────────────────────────────┘              │
+│                                                                                     │
+│  From Other Agents (Delegation):                                                    │
+│  ┌──────────────────────────────────────────────────────────────────┐              │
+│  │ Signal          │ Weight │ Detection                             │              │
+│  ├──────────────────────────────────────────────────────────────────┤              │
+│  │ Task definition │ 0.30   │ Clear acceptance criteria             │              │
+│  │ Context depth   │ 0.25   │ Sufficient handoff state              │              │
+│  │ Scope bounds    │ 0.20   │ Clear boundaries, no scope creep      │              │
+│  │ Dependency info │ 0.15   │ Required inputs/outputs specified     │              │
+│  │ Priority signal │ 0.10   │ Urgency and importance clear          │              │
+│  └──────────────────────────────────────────────────────────────────┘              │
+│                                                                                     │
+│  ATTRIBUTION DECISION MATRIX:                                                       │
+│  ────────────────────────────                                                       │
+│                                                                                     │
+│             │ Input Quality │ Input Quality │ Input Quality │                       │
+│             │    HIGH       │    MEDIUM     │    LOW        │                       │
+│  ───────────┼───────────────┼───────────────┼───────────────┤                       │
+│  Output     │               │               │               │                       │
+│  Quality    │  Normal       │  Investigate  │  Likely       │                       │
+│  HIGH       │  operation    │  (unexpected) │  good agent   │                       │
+│  ───────────┼───────────────┼───────────────┼───────────────┤                       │
+│  Output     │               │               │               │                       │
+│  Quality    │  Possible     │  Mixed        │  Likely       │                       │
+│  MEDIUM     │  degradation  │  causes       │  input issue  │                       │
+│  ───────────┼───────────────┼───────────────┼───────────────┤                       │
+│  Output     │               │               │               │                       │
+│  Quality    │  LIKELY       │  Investigate  │  DEFINITELY   │                       │
+│  LOW        │  DEGRADATION  │  both         │  INPUT ISSUE  │                       │
+│  ───────────┴───────────────┴───────────────┴───────────────┘                       │
+│                                                                                     │
+│  RESPONSE TO ATTRIBUTION:                                                           │
+│  ────────────────────────                                                           │
+│                                                                                     │
+│  • AGENT_DEGRADATION → Consider handoff (after hysteresis check)                    │
+│  • INPUT_QUALITY_ISSUE → Request clarification (not handoff!)                       │
+│  • TASK_COMPLEXITY → May need Architect re-planning                                 │
+│  • ENVIRONMENTAL → Retry with backoff, not handoff                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// core/handoff/attribution.go
+
+// CausalAttributor determines the cause of poor output.
+type CausalAttributor struct {
+    inputAssessor   *InputQualityAssessor
+    outputAssessor  *OutputQualityAssessor
+    contextAssessor *ContextStateAssessor
+}
+
+// Attribution represents the determined cause of poor output.
+type Attribution string
+
+const (
+    AttrAgentDegradation   Attribution = "agent_degradation"
+    AttrInputQualityIssue  Attribution = "input_quality_issue"
+    AttrTaskComplexity     Attribution = "task_complexity"
+    AttrEnvironmentalFactor Attribution = "environmental_factor"
+    AttrMixedCauses        Attribution = "mixed_causes"
+)
+
+// AttributionResult contains the attribution decision and confidence.
+type AttributionResult struct {
+    PrimaryAttribution Attribution
+    Confidence         float64  // 0-1
+    Probabilities      map[Attribution]float64
+    Recommendation     HandoffRecommendation
+}
+
+// Attribute determines the cause of poor output using Bayesian inference.
+func (a *CausalAttributor) Attribute(
+    input *Input,
+    output *Output,
+    contextState *ContextState,
+) *AttributionResult {
+
+    inputQuality := a.inputAssessor.Assess(input)
+    outputQuality := a.outputAssessor.Assess(output)
+
+    // Prior probabilities (can be tuned based on historical data)
+    priors := map[Attribution]float64{
+        AttrAgentDegradation:    0.25,
+        AttrInputQualityIssue:   0.30,  // Input problems are common
+        AttrTaskComplexity:      0.25,
+        AttrEnvironmentalFactor: 0.20,
+    }
+
+    // Likelihoods: P(poor_output | cause)
+    // Adjusted based on input quality
+    likelihoods := a.computeLikelihoods(inputQuality, outputQuality, contextState)
+
+    // Bayes' theorem
+    posteriors := a.computePosteriors(priors, likelihoods)
+
+    // Find highest probability cause
+    primary, confidence := a.findPrimaryCause(posteriors)
+
+    return &AttributionResult{
+        PrimaryAttribution: primary,
+        Confidence:         confidence,
+        Probabilities:      posteriors,
+        Recommendation:     a.recommend(primary, confidence, inputQuality),
+    }
+}
+
+// computeLikelihoods returns P(poor_output | cause) for each cause.
+func (a *CausalAttributor) computeLikelihoods(
+    inputQuality, outputQuality float64,
+    contextState *ContextState,
+) map[Attribution]float64 {
+
+    likelihoods := make(map[Attribution]float64)
+
+    // If input quality is low, poor output is very likely due to input
+    // P(poor_output | poor_input) increases as input quality decreases
+    likelihoods[AttrInputQualityIssue] = 1.0 - inputQuality
+
+    // If context is highly used, agent degradation is more likely
+    // P(poor_output | agent_degradation) increases with context usage
+    likelihoods[AttrAgentDegradation] = contextState.UsagePercent *
+        (1.0 - inputQuality*0.5) // Discount if input was bad
+
+    // Task complexity likelihood based on task characteristics
+    likelihoods[AttrTaskComplexity] = a.assessTaskComplexity(contextState)
+
+    // Environmental factors (API errors, timeouts, etc.)
+    likelihoods[AttrEnvironmentalFactor] = contextState.EnvironmentalStress
+
+    return likelihoods
+}
+
+// recommend determines the appropriate response.
+func (a *CausalAttributor) recommend(
+    primary Attribution,
+    confidence float64,
+    inputQuality float64,
+) HandoffRecommendation {
+
+    switch primary {
+    case AttrAgentDegradation:
+        if confidence > 0.7 {
+            return RecommendSoftHandoff
+        }
+        return RecommendContinueMonitor
+
+    case AttrInputQualityIssue:
+        if inputQuality < 0.4 {
+            return RecommendRequestClarification
+        }
+        return RecommendContinueMonitor
+
+    case AttrTaskComplexity:
+        return RecommendEscalateToArchitect
+
+    case AttrEnvironmentalFactor:
+        return RecommendRetryWithBackoff
+
+    default:
+        return RecommendContinueMonitor
+    }
+}
+```
+
+### Hysteresis Controller
+
+To prevent flapping (rapid handoff/return cycles) and false positives, we use hysteresis with asymmetric response times.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       HYSTERESIS CONTROLLER                                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ASYMMETRIC EWMA:                                                                   │
+│  ────────────────                                                                   │
+│                                                                                     │
+│  When quality IMPROVES:  score = λ_up × current + (1 - λ_up) × prev                 │
+│  When quality DECLINES:  score = λ_down × current + (1 - λ_down) × prev             │
+│                                                                                     │
+│  λ_up = 0.4    (fast to recognize improvement - reward good performance)            │
+│  λ_down = 0.15 (slow to recognize decline - avoid premature handoff)                │
+│                                                                                     │
+│  This creates ASYMMETRIC RESPONSE:                                                  │
+│  • 4 consecutive good turns to recover from "poor" state                            │
+│  • 8 consecutive poor turns to trigger handoff from "good" state                    │
+│                                                                                     │
+│  VISUALIZATION:                                                                     │
+│                                                                                     │
+│    Smoothed                                                                         │
+│    Quality                                                                          │
+│      ▲                                                                              │
+│  1.0 │         ○ Raw observation                                                    │
+│      │         ━ Smoothed score                                                     │
+│  0.8 │    ○                                                                         │
+│      │   ━━○━━━━━━━━○                                                               │
+│  0.6 │  ━━        ━━━━○━━━━━━━━━━━━━━○                                              │
+│      │ ━              ━━━━━━━━━━━━━━━━━○                                            │
+│  0.4 │━                               ━━━○━━━━━━━━━━━━━○                            │
+│      │                                        ━━━━━━━━━━                            │
+│  0.2 │                                                  ━━━━━ HANDOFF THRESHOLD     │
+│      │─────────────────────────────────────────────────────────────────────────▶    │
+│         Turn 1    Turn 5     Turn 10    Turn 15    Turn 20    Turn 25               │
+│                                                                                     │
+│         │         │          │          │          │                                │
+│         │  Quick  │  Temporary dip      │  Sustained decline                        │
+│         │  start  │  (smoothed out)     │  (triggers handoff)                       │
+│                                                                                     │
+│  TREND DETECTION:                                                                   │
+│  ────────────────                                                                   │
+│                                                                                     │
+│  Handoff requires SUSTAINED decline, not just low score:                            │
+│                                                                                     │
+│    trend = Σ(score[i] - score[i-1]) for i in [now-window, now]                      │
+│                                                                                     │
+│    if trend < NEGATIVE_TREND_THRESHOLD AND score < QUALITY_THRESHOLD:               │
+│        trigger_handoff()                                                            │
+│                                                                                     │
+│  This prevents handoff when:                                                        │
+│  • Agent had one bad turn but is recovering                                         │
+│  • Score is low but stable (might be task-specific)                                 │
+│  • Score dipped temporarily due to external factors                                 │
+│                                                                                     │
+│  DEBOUNCING:                                                                        │
+│  ──────────                                                                         │
+│                                                                                     │
+│  Minimum time between handoff decisions: 30 seconds                                 │
+│  Minimum turns between handoff decisions: 5 turns                                   │
+│                                                                                     │
+│  After a handoff, new agent gets full burn-in period before next evaluation.        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// core/handoff/hysteresis.go
+
+// HysteresisController prevents flapping with asymmetric smoothing.
+type HysteresisController struct {
+    lambdaUp             float64       // Fast response to improvement
+    lambdaDown           float64       // Slow response to decline
+    trendWindow          int           // Turns to consider for trend
+    negativeTrendThresh  float64       // Threshold for sustained decline
+    qualityThreshold     float64       // Score below which handoff considered
+    debounceTime         time.Duration // Min time between decisions
+    debounceTurns        int           // Min turns between decisions
+
+    smoothedScore        float64
+    scoreHistory         []float64
+    lastDecisionTime     time.Time
+    lastDecisionTurn     int
+}
+
+// DefaultHysteresisConfig returns config based on agent type.
+func DefaultHysteresisConfig(agentType AgentType) *HysteresisController {
+    switch agentType {
+    case AgentTypePipeline:
+        return &HysteresisController{
+            lambdaUp:            0.5,  // Very responsive to improvement
+            lambdaDown:          0.2,  // Faster decline detection (shorter tasks)
+            trendWindow:         5,
+            negativeTrendThresh: -0.15,
+            qualityThreshold:    0.4,
+            debounceTime:        15 * time.Second,
+            debounceTurns:       3,
+            smoothedScore:       0.7, // Optimistic initial
+        }
+    case AgentTypeWorkflow:
+        return &HysteresisController{
+            lambdaUp:            0.4,  // Fast improvement recognition
+            lambdaDown:          0.15, // Very slow decline (user-facing)
+            trendWindow:         8,
+            negativeTrendThresh: -0.1,
+            qualityThreshold:    0.35,
+            debounceTime:        30 * time.Second,
+            debounceTurns:       5,
+            smoothedScore:       0.7,
+        }
+    default:
+        return &HysteresisController{
+            lambdaUp:            0.4,
+            lambdaDown:          0.15,
+            trendWindow:         6,
+            negativeTrendThresh: -0.12,
+            qualityThreshold:    0.38,
+            debounceTime:        20 * time.Second,
+            debounceTurns:       4,
+            smoothedScore:       0.7,
+        }
+    }
+}
+
+// Update processes a new quality observation.
+func (h *HysteresisController) Update(rawScore float64, turn int) {
+    // Choose lambda based on direction
+    lambda := h.lambdaDown
+    if rawScore > h.smoothedScore {
+        lambda = h.lambdaUp
+    }
+
+    // Exponential weighted moving average
+    h.smoothedScore = lambda*rawScore + (1-lambda)*h.smoothedScore
+
+    // Track history for trend analysis
+    h.scoreHistory = append(h.scoreHistory, h.smoothedScore)
+    if len(h.scoreHistory) > h.trendWindow*2 {
+        h.scoreHistory = h.scoreHistory[1:]
+    }
+}
+
+// ShouldTriggerHandoff determines if handoff should occur.
+func (h *HysteresisController) ShouldTriggerHandoff(turn int) (bool, string) {
+    // Debouncing checks
+    if time.Since(h.lastDecisionTime) < h.debounceTime {
+        return false, "debounce_time"
+    }
+    if turn-h.lastDecisionTurn < h.debounceTurns {
+        return false, "debounce_turns"
+    }
+
+    // Quality threshold check
+    if h.smoothedScore >= h.qualityThreshold {
+        return false, "above_threshold"
+    }
+
+    // Trend check - need sustained decline, not just low score
+    trend := h.computeTrend()
+    if trend >= h.negativeTrendThresh {
+        return false, "no_negative_trend"
+    }
+
+    // All checks passed - trigger handoff
+    h.lastDecisionTime = time.Now()
+    h.lastDecisionTurn = turn
+    return true, "quality_degradation"
+}
+
+// computeTrend calculates the quality trend over the window.
+func (h *HysteresisController) computeTrend() float64 {
+    if len(h.scoreHistory) < h.trendWindow {
+        return 0 // Not enough data
+    }
+
+    recent := h.scoreHistory[len(h.scoreHistory)-h.trendWindow:]
+    var trend float64
+    for i := 1; i < len(recent); i++ {
+        trend += recent[i] - recent[i-1]
+    }
+    return trend / float64(len(recent)-1)
+}
+```
+
+### Agent-Specific Quality Criteria
+
+Different agents have fundamentally different success criteria. Additionally, **pipeline variants** of agents operate differently than their **workflow counterparts**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    AGENT-SPECIFIC QUALITY CRITERIA                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  KNOWLEDGE AGENTS (Workflow-Oriented)                                               │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  LIBRARIAN                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Code accuracy       │ 0.30   │ Generated code compiles, passes lint          │  │
+│  │ Pattern adherence   │ 0.25   │ Follows codebase conventions                  │  │
+│  │ Staleness awareness │ 0.20   │ References current code, not outdated         │  │
+│  │ Query relevance     │ 0.15   │ Results match query intent                    │  │
+│  │ Response coherence  │ 0.10   │ Clear, consistent explanations               │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ACADEMIC                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Citation relevance  │ 0.30   │ Sources support claims                        │  │
+│  │ Applicability       │ 0.25   │ Recommendations fit codebase context          │  │
+│  │ Research depth      │ 0.20   │ Comprehensive coverage of topic               │  │
+│  │ Accuracy            │ 0.15   │ Factually correct information                 │  │
+│  │ Clarity             │ 0.10   │ Understandable explanations                   │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ARCHIVALIST                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Retrieval relevance │ 0.35   │ Retrieved content matches query               │  │
+│  │ Historical accuracy │ 0.25   │ Correct recall of past events                 │  │
+│  │ Context awareness   │ 0.20   │ Understands session/conversation context      │  │
+│  │ Completeness        │ 0.20   │ Doesn't miss relevant history                 │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ARCHITECT                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Plan completeness   │ 0.30   │ All requirements addressed                    │  │
+│  │ Task atomicity      │ 0.25   │ Tasks are appropriately scoped                │  │
+│  │ Dependency accuracy │ 0.20   │ DAG correctly models dependencies             │  │
+│  │ Risk identification │ 0.15   │ Edge cases and failures considered            │  │
+│  │ Clarity             │ 0.10   │ Clear communication of plan                   │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  PIPELINE AGENTS (Task-Oriented)                                                    │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  ENGINEER                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Task completion     │ 0.35   │ Acceptance criteria met                       │  │
+│  │ Code quality        │ 0.25   │ Compiles, passes lint, follows patterns       │  │
+│  │ Test coverage       │ 0.20   │ Tests written for new code                    │  │
+│  │ Error rate          │ 0.15   │ Few retries, no repeated failures             │  │
+│  │ Throughput          │ 0.05   │ Reasonable time per task                      │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  INSPECTOR                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Issue detection     │ 0.35   │ Finds real issues, not false positives        │  │
+│  │ Fix accuracy        │ 0.30   │ Suggested fixes actually work                 │  │
+│  │ Coverage            │ 0.20   │ All files/patterns checked                    │  │
+│  │ False positive rate │ 0.15   │ Low rate of invalid issue reports             │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  TESTER                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Test effectiveness  │ 0.35   │ Tests find real bugs                          │  │
+│  │ Test quality        │ 0.25   │ Tests are maintainable, not flaky             │  │
+│  │ Coverage adequacy   │ 0.20   │ Appropriate coverage for risk level           │  │
+│  │ Execution success   │ 0.20   │ Tests run without infrastructure issues       │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ORCHESTRATOR                                                                       │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Workflow progress   │ 0.35   │ Tasks completing on schedule                  │  │
+│  │ Status accuracy     │ 0.25   │ Reported status matches reality               │  │
+│  │ Failure handling    │ 0.20   │ Appropriate response to failures              │  │
+│  │ Communication       │ 0.20   │ Clear updates to user via Guide               │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  GUIDE                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Quality Signal      │ Weight │ Measurement                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────────────┤  │
+│  │ Routing accuracy    │ 0.35   │ Messages reach correct agent                  │  │
+│  │ User satisfaction   │ 0.25   │ No user redirections/corrections              │  │
+│  │ Response latency    │ 0.20   │ Quick routing decisions                       │  │
+│  │ Clarification qual  │ 0.20   │ Good questions when needed                    │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pipeline vs Workflow Agent Distinctions
+
+Pipeline agents and workflow agents operate fundamentally differently and require different handoff parameters.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    PIPELINE VS WORKFLOW DISTINCTIONS                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  CHARACTERISTIC COMPARISON:                                                         │
+│  ──────────────────────────                                                         │
+│                                                                                     │
+│  │ Characteristic    │ Pipeline Agents          │ Workflow Agents              │    │
+│  ├───────────────────┼──────────────────────────┼──────────────────────────────┤    │
+│  │ Task scope        │ Bounded, atomic tasks    │ Extended conversations       │    │
+│  │ Feedback speed    │ Fast (per task)          │ Slow (per turn)              │    │
+│  │ User visibility   │ Internal/hidden          │ User-facing                  │    │
+│  │ Failure impact    │ Recoverable (batch)      │ Visible to user              │    │
+│  │ Context growth    │ Predictable              │ Variable                     │    │
+│  │ Quality signals   │ Objective (pass/fail)    │ Subjective (satisfaction)    │    │
+│  │ Handoff cost      │ Low (state is compact)   │ High (conversation context)  │    │
+│  │ Recovery time     │ Short (fresh start)      │ Long (rebuild rapport)       │    │
+│                                                                                     │
+│  PARAMETER DIFFERENCES:                                                             │
+│  ──────────────────────                                                             │
+│                                                                                     │
+│  │ Parameter              │ Pipeline    │ Workflow    │ Reason                  │   │
+│  ├────────────────────────┼─────────────┼─────────────┼─────────────────────────┤   │
+│  │ Burn-in turns          │ 3-5         │ 8-12        │ Faster feedback         │   │
+│  │ λ_down (decline EWMA)  │ 0.20        │ 0.15        │ Less flap-sensitive     │   │
+│  │ Quality threshold      │ 0.40        │ 0.35        │ Tighter pipeline QA     │   │
+│  │ Trend window           │ 5 turns     │ 8 turns     │ Faster trend detection  │   │
+│  │ Debounce time          │ 15s         │ 30s         │ Faster cycle times      │   │
+│  │ Debounce turns         │ 3           │ 5           │ Faster response         │   │
+│  │ Safety context limit   │ 85%         │ 90%         │ Earlier safety margin   │   │
+│                                                                                     │
+│  SPECIAL CONSIDERATIONS:                                                            │
+│  ───────────────────────                                                            │
+│                                                                                     │
+│  Pipeline Agents:                                                                   │
+│  • Can tolerate individual task failures (batch averaging)                          │
+│  • Quality measured per-task, aggregated over batch                                 │
+│  • Handoff is relatively cheap - state is structured                                │
+│  • Can use more aggressive handoff for quality maintenance                          │
+│                                                                                     │
+│  Workflow Agents:                                                                   │
+│  • Individual failures visible to user                                              │
+│  • Quality measured over conversation arc                                           │
+│  • Handoff is expensive - loses conversation context                                │
+│  • Should bias toward repair over handoff                                           │
+│                                                                                     │
+│  PIPELINE AGENT VARIANTS:                                                           │
+│  ────────────────────────                                                           │
+│                                                                                     │
+│  Some agents have BOTH pipeline and workflow variants:                              │
+│                                                                                     │
+│  │ Agent       │ Workflow Variant      │ Pipeline Variant              │            │
+│  ├─────────────┼───────────────────────┼───────────────────────────────┤            │
+│  │ Engineer    │ N/A                   │ PipelineEngineer (DAG tasks)  │            │
+│  │ Librarian   │ LibrarianWorkflow     │ LibrarianPipeline (indexing)  │            │
+│  │ Academic    │ AcademicWorkflow      │ AcademicPipeline (bulk fetch) │            │
+│  │ Archivalist │ ArchivalistWorkflow   │ ArchivalistPipeline (storage) │            │
+│                                                                                     │
+│  Pipeline variants have:                                                            │
+│  • Tighter quality thresholds                                                       │
+│  • Faster handoff response                                                          │
+│  • Shorter burn-in periods                                                          │
+│  • Task completion as primary metric                                                │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Handoff Decision Engine
+
+The final component combines all signals into a handoff decision.
+
+```go
+// core/handoff/decision_engine.go
+
+// HandoffDecision represents the outcome of handoff evaluation.
+type HandoffDecision string
+
+const (
+    DecisionContinue             HandoffDecision = "continue"
+    DecisionRequestClarification HandoffDecision = "request_clarification"
+    DecisionSoftHandoff          HandoffDecision = "soft_handoff"
+    DecisionHardHandoff          HandoffDecision = "hard_handoff"
+    DecisionEscalate             HandoffDecision = "escalate"
+)
+
+// HandoffDecisionEngine makes handoff decisions based on quality signals.
+type HandoffDecisionEngine struct {
+    coldStartGate       *ColdStartGate
+    inputAssessor       *InputQualityAssessor
+    outputAssessor      *OutputQualityAssessor
+    causalAttributor    *CausalAttributor
+    hysteresisController *HysteresisController
+    qualityTracker      *AgentQualityTracker
+    agentType           AgentType
+    agentDomain         Domain
+}
+
+// NewHandoffDecisionEngine creates an engine configured for the agent.
+func NewHandoffDecisionEngine(agentType AgentType, domain Domain) *HandoffDecisionEngine {
+    return &HandoffDecisionEngine{
+        coldStartGate:        DefaultColdStartConfig(agentType),
+        outputAssessor:       NewOutputAssessor(domain),
+        inputAssessor:        NewInputAssessor(),
+        causalAttributor:     NewCausalAttributor(),
+        hysteresisController: DefaultHysteresisConfig(agentType),
+        qualityTracker:       &AgentQualityTracker{alpha: 1, beta: 1},
+        agentType:            agentType,
+        agentDomain:          domain,
+    }
+}
+
+// Evaluate processes an agent turn and returns a handoff decision.
+func (e *HandoffDecisionEngine) Evaluate(
+    input *Input,
+    output *Output,
+    contextState *ContextState,
+    turn int,
+) *HandoffEvaluation {
+
+    // 1. Assess input and output quality
+    inputQuality := e.inputAssessor.Assess(input)
+    outputQuality := e.outputAssessor.Assess(output)
+
+    // 2. Update quality tracker (Beta distribution)
+    e.qualityTracker.Observe(outputQuality)
+
+    // 3. Update hysteresis controller
+    e.hysteresisController.Update(outputQuality, turn)
+
+    // 4. Check cold-start gate
+    if !e.coldStartGate.CanMakeDecision(e.qualityTracker, contextState.UsagePercent) {
+        return &HandoffEvaluation{
+            Decision:    DecisionContinue,
+            Reason:      "cold_start_period",
+            Confidence:  0.0,
+            InputQuality:  inputQuality,
+            OutputQuality: outputQuality,
+        }
+    }
+
+    // 5. If output quality is good, continue
+    if outputQuality >= 0.6 {
+        return &HandoffEvaluation{
+            Decision:    DecisionContinue,
+            Reason:      "output_quality_good",
+            Confidence:  outputQuality,
+            InputQuality:  inputQuality,
+            OutputQuality: outputQuality,
+        }
+    }
+
+    // 6. Output quality is poor - determine cause
+    attribution := e.causalAttributor.Attribute(input, output, contextState)
+
+    // 7. Respond based on attribution
+    switch attribution.PrimaryAttribution {
+    case AttrInputQualityIssue:
+        return &HandoffEvaluation{
+            Decision:    DecisionRequestClarification,
+            Reason:      "input_quality_issue",
+            Confidence:  attribution.Confidence,
+            Attribution: attribution,
+            InputQuality:  inputQuality,
+            OutputQuality: outputQuality,
+        }
+
+    case AttrTaskComplexity:
+        return &HandoffEvaluation{
+            Decision:    DecisionEscalate,
+            Reason:      "task_too_complex",
+            Confidence:  attribution.Confidence,
+            Attribution: attribution,
+            InputQuality:  inputQuality,
+            OutputQuality: outputQuality,
+        }
+
+    case AttrEnvironmentalFactor:
+        return &HandoffEvaluation{
+            Decision:    DecisionContinue, // Will retry
+            Reason:      "environmental_issue",
+            Confidence:  attribution.Confidence,
+            Attribution: attribution,
+            InputQuality:  inputQuality,
+            OutputQuality: outputQuality,
+        }
+
+    case AttrAgentDegradation:
+        // Check hysteresis - need sustained decline
+        shouldHandoff, hysteresisReason := e.hysteresisController.ShouldTriggerHandoff(turn)
+
+        if !shouldHandoff {
+            return &HandoffEvaluation{
+                Decision:    DecisionContinue,
+                Reason:      "hysteresis_" + hysteresisReason,
+                Confidence:  attribution.Confidence,
+                Attribution: attribution,
+                InputQuality:  inputQuality,
+                OutputQuality: outputQuality,
+            }
+        }
+
+        // Determine soft vs hard handoff
+        decision := DecisionSoftHandoff
+        if contextState.UsagePercent >= 0.85 || e.qualityTracker.Mean() < 0.25 {
+            decision = DecisionHardHandoff
+        }
+
+        return &HandoffEvaluation{
+            Decision:    decision,
+            Reason:      "agent_degradation_confirmed",
+            Confidence:  attribution.Confidence,
+            Attribution: attribution,
+            InputQuality:  inputQuality,
+            OutputQuality: outputQuality,
+        }
+
+    default:
+        return &HandoffEvaluation{
+            Decision:    DecisionContinue,
+            Reason:      "attribution_uncertain",
+            Confidence:  0.5,
+            Attribution: attribution,
+            InputQuality:  inputQuality,
+            OutputQuality: outputQuality,
+        }
+    }
+}
+
+// HandoffEvaluation contains the evaluation result.
+type HandoffEvaluation struct {
+    Decision      HandoffDecision
+    Reason        string
+    Confidence    float64
+    Attribution   *AttributionResult
+    InputQuality  float64
+    OutputQuality float64
+}
+```
+
+### Integration with Existing Handoff Infrastructure
+
+The quality-based handoff system integrates with the existing `HandoffManager` and agent handoff states.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    INTEGRATION WITH EXISTING INFRASTRUCTURE                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  BEFORE (Fixed 75% Threshold):                                                      │
+│  ─────────────────────────────                                                      │
+│                                                                                     │
+│    Agent Context Usage ───────▶ 75% Threshold ───────▶ Trigger Handoff              │
+│                                     │                                               │
+│                                     │                                               │
+│                                     ▼                                               │
+│                              HandoffManager                                         │
+│                                     │                                               │
+│                                     ▼                                               │
+│                            *HandoffState                                            │
+│                                                                                     │
+│  AFTER (Quality-Based):                                                             │
+│  ──────────────────────                                                             │
+│                                                                                     │
+│    Agent Turn ──┬──▶ InputQualityAssessor ──────────────┐                           │
+│                 │                                        │                          │
+│                 ├──▶ OutputQualityAssessor ─────────────┼──▶ CausalAttributor       │
+│                 │                                        │         │                │
+│                 └──▶ ContextStateAssessor ──────────────┘         │                │
+│                                                                    │                │
+│                                                                    ▼                │
+│                                                        HysteresisController         │
+│                                                                    │                │
+│                                                                    ▼                │
+│                                                        HandoffDecisionEngine        │
+│                                                                    │                │
+│                                    ┌───────────────────────────────┴─────┐          │
+│                                    │                                     │          │
+│                                    ▼                                     ▼          │
+│                            CONTINUE/CLARIFY                    SOFT/HARD HANDOFF    │
+│                                                                          │          │
+│                                                                          ▼          │
+│                                                                  HandoffManager     │
+│                                                                   (existing)        │
+│                                                                          │          │
+│                                                                          ▼          │
+│                                                                  *HandoffState      │
+│                                                                   (existing)        │
+│                                                                                     │
+│  MODIFIED COMPONENTS:                                                               │
+│  ───────────────────                                                                │
+│                                                                                     │
+│  │ Component              │ Change                                              │   │
+│  ├────────────────────────┼─────────────────────────────────────────────────────┤   │
+│  │ ContextManager         │ Replace threshold check with DecisionEngine call    │   │
+│  │ Agent base class       │ Implement QualityAssessable interface               │   │
+│  │ HandoffManager         │ Accept DecisionContinue/SoftHandoff/HardHandoff     │   │
+│  │ Archivalist            │ Store HandoffEvaluation with HandoffState           │   │
+│  │ Checkpointer           │ Include quality tracker state in checkpoints        │   │
+│                                                                                     │
+│  NEW INTERFACES:                                                                    │
+│  ───────────────                                                                    │
+│                                                                                     │
+│  // Implemented by all agents                                                       │
+│  type QualityAssessable interface {                                                 │
+│      GetQualitySignals(turn *Turn) *QualitySignals                                 │
+│      GetQualityCriteria() *QualityCriteria                                         │
+│  }                                                                                  │
+│                                                                                     │
+│  // Implemented by agents that receive delegations                                  │
+│  type InputReceiver interface {                                                     │
+│      GetInputQuality(input *Input) float64                                         │
+│  }                                                                                  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Handoff Decision State Machine
+
+The HandoffDecisionEngine operates as a state machine with the following states and transitions:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    HANDOFF DECISION STATE MACHINE                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                              ┌────────────────┐                                     │
+│                              │   BURN_IN      │                                     │
+│                              │                │                                     │
+│                              │ turns < min OR │                                     │
+│                              │ CI_width > thresh                                    │
+│                              └───────┬────────┘                                     │
+│                                      │                                              │
+│               turns >= min AND CI_width <= thresh                                   │
+│                                      │                                              │
+│                                      ▼                                              │
+│                              ┌────────────────┐                                     │
+│                              │   MONITORING   │◀─────────────────────────┐          │
+│                              │                │                          │          │
+│                              │ quality >= 0.6 │    quality improves OR   │          │
+│                              │ (normal ops)   │    debounce active       │          │
+│                              └───────┬────────┘                          │          │
+│                                      │                                   │          │
+│                       quality < 0.6 AND CI confident                     │          │
+│                                      │                                   │          │
+│                                      ▼                                   │          │
+│                              ┌────────────────┐                          │          │
+│                              │  ATTRIBUTING   │                          │          │
+│                              │                │                          │          │
+│                              │ Determine cause│                          │          │
+│                              │ of poor output │                          │          │
+│                              └───────┬────────┘                          │          │
+│                                      │                                   │          │
+│              ┌───────────────────────┼───────────────────────┐           │          │
+│              │                       │                       │           │          │
+│              ▼                       ▼                       ▼           │          │
+│     ┌────────────────┐     ┌────────────────┐     ┌────────────────┐     │          │
+│     │ INPUT_ISSUE    │     │ AGENT_DEGRADE  │     │ ENVIRONMENTAL  │     │          │
+│     │                │     │                │     │                │     │          │
+│     │ Request        │     │ Check          │     │ Retry with     │     │          │
+│     │ clarification  │     │ hysteresis     │     │ backoff        │     │          │
+│     └───────┬────────┘     └───────┬────────┘     └───────┬────────┘     │          │
+│             │                      │                      │              │          │
+│             │                      ▼                      │              │          │
+│             │              ┌────────────────┐             │              │          │
+│             │              │  HYSTERESIS    │             │              │          │
+│             │              │                │             │              │          │
+│             │              │ Sustained      │             │              │          │
+│             │              │ decline check  │             │              │          │
+│             │              └───────┬────────┘             │              │          │
+│             │                      │                      │              │          │
+│             │        ┌─────────────┴─────────────┐        │              │          │
+│             │        │                           │        │              │          │
+│             │   no trend OR                 sustained     │              │          │
+│             │   debounced                   decline       │              │          │
+│             │        │                           │        │              │          │
+│             │        │                           ▼        │              │          │
+│             │        │               ┌────────────────┐   │              │          │
+│             │        │               │ HANDOFF_READY  │   │              │          │
+│             │        │               │                │   │              │          │
+│             │        │               │ ctx < 85%: SOFT│   │              │          │
+│             │        │               │ ctx >= 85%: HARD   │              │          │
+│             │        │               └───────┬────────┘   │              │          │
+│             │        │                       │            │              │          │
+│             │        │                       ▼            │              │          │
+│             │        │               ┌────────────────┐   │              │          │
+│             │        │               │   HANDOFF      │   │              │          │
+│             │        │               │   EXECUTING    │   │              │          │
+│             │        │               │                │   │              │          │
+│             │        │               │ → HandoffMgr   │   │              │          │
+│             │        │               └───────┬────────┘   │              │          │
+│             │        │                       │            │              │          │
+│             └────────┴───────────────────────┴────────────┴──────────────┘          │
+│                                              │                                       │
+│                                              ▼                                       │
+│                                      NEW AGENT STARTS                               │
+│                                      (BURN_IN state)                                │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Worked Example: Engineer Pipeline Agent
+
+The following example shows the HandoffDecisionEngine processing 15 turns of an Engineer agent working on a complex refactoring task.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    WORKED EXAMPLE: ENGINEER AGENT OVER 15 TURNS                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  CONFIG: Pipeline agent, burn-in=5, λ_up=0.5, λ_down=0.2, threshold=0.4            │
+│  INITIAL: α=1, β=1, smoothed=0.7                                                   │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  TURN 1: First interaction                                                          │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  Input:  "Refactor the auth module to use JWT"                                      │
+│  Output: Created plan, identified 5 files to modify                                 │
+│                                                                                     │
+│  Assessments:                                                                       │
+│    Input quality:  0.85 (clear task, specific module, clear goal)                   │
+│    Output quality: 0.78 (good plan, reasonable scope)                               │
+│                                                                                     │
+│  Quality Tracker Update:                                                            │
+│    α = 1 + 0.78 = 1.78                                                              │
+│    β = 1 + 0.22 = 1.22                                                              │
+│    Mean = 1.78 / 3.00 = 0.59                                                        │
+│    CI_width = 0.52 (HIGH - uncertain)                                               │
+│                                                                                     │
+│  Hysteresis: smoothed = 0.5*0.78 + 0.5*0.7 = 0.74 (λ_up, improving)                │
+│                                                                                     │
+│  Cold-Start Gate: turns=1 < min=5 → BLOCKED                                         │
+│  Decision: CONTINUE (burn-in period, reason="cold_start_period")                    │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  TURNS 2-4: Good progress (burn-in continues)                                       │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  Turn 2: Output quality 0.82 → α=2.60, β=1.40, CI_width=0.41                        │
+│  Turn 3: Output quality 0.75 → α=3.35, β=1.65, CI_width=0.36                        │
+│  Turn 4: Output quality 0.80 → α=4.15, β=1.85, CI_width=0.32                        │
+│                                                                                     │
+│  All CONTINUE (burn-in period)                                                      │
+│  Smoothed score: 0.74 → 0.78 → 0.77 → 0.78                                          │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  TURN 5: Burn-in completes, first real evaluation                                   │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  Input:  "Continue with JWT implementation"                                          │
+│  Output: Implemented token generation, good code quality                            │
+│                                                                                     │
+│  Assessments:                                                                       │
+│    Input quality:  0.70 (somewhat vague "continue")                                 │
+│    Output quality: 0.85 (excellent implementation)                                  │
+│                                                                                     │
+│  Quality Tracker: α=4.95, β=2.0, CI_width=0.29                                      │
+│                                                                                     │
+│  Cold-Start Gate: turns=5 >= min=5, CI_width=0.29 < thresh=0.30 → PASSED           │
+│                                                                                     │
+│  Output quality 0.85 >= 0.6 → CONTINUE (reason="output_quality_good")              │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  TURNS 6-8: Gradual decline (complex merge conflicts)                               │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  Turn 6: Output quality 0.65 → smoothed = 0.2*0.65 + 0.8*0.81 = 0.78               │
+│          Decision: CONTINUE (above threshold)                                       │
+│                                                                                     │
+│  Turn 7: Output quality 0.55 → smoothed = 0.2*0.55 + 0.8*0.78 = 0.73               │
+│          Output < 0.6, trigger attribution                                          │
+│          Attribution: INPUT_QUALITY_ISSUE (user said "fix the conflicts")           │
+│          Decision: REQUEST_CLARIFICATION                                            │
+│                                                                                     │
+│  Turn 8: User provides detailed clarification                                       │
+│          Input quality: 0.90, Output quality: 0.72                                  │
+│          smoothed = 0.5*0.72 + 0.5*0.73 = 0.73 (λ_up, improving)                   │
+│          Decision: CONTINUE                                                         │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  TURNS 9-12: Context pressure causes real degradation                               │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  Context usage: 45% → 55% → 62% → 68%                                               │
+│                                                                                     │
+│  Turn 9:  Output quality 0.58 → smoothed = 0.2*0.58 + 0.8*0.73 = 0.70              │
+│           Attribution: AGENT_DEGRADATION (input was good, context growing)          │
+│           Hysteresis: trend = -0.03, threshold = -0.15 → no sustained decline       │
+│           Decision: CONTINUE (reason="hysteresis_no_negative_trend")               │
+│                                                                                     │
+│  Turn 10: Output quality 0.52 → smoothed = 0.2*0.52 + 0.8*0.70 = 0.66              │
+│           Attribution: AGENT_DEGRADATION (P=0.72)                                   │
+│           Hysteresis: trend = -0.06 → no sustained decline                          │
+│           Decision: CONTINUE                                                        │
+│                                                                                     │
+│  Turn 11: Output quality 0.45 → smoothed = 0.2*0.45 + 0.8*0.66 = 0.62              │
+│           Attribution: AGENT_DEGRADATION (P=0.78)                                   │
+│           Hysteresis: trend = -0.10 → approaching threshold                         │
+│           Decision: CONTINUE                                                        │
+│                                                                                     │
+│  Turn 12: Output quality 0.38 → smoothed = 0.2*0.38 + 0.8*0.62 = 0.57              │
+│           Attribution: AGENT_DEGRADATION (P=0.85)                                   │
+│           Hysteresis: trend = -0.16 < -0.15 → SUSTAINED DECLINE CONFIRMED          │
+│           Smoothed 0.57 > threshold 0.4 → BUT TREND IS NEGATIVE                     │
+│           Context 68% < 85% → SOFT_HANDOFF                                          │
+│                                                                                     │
+│           Decision: SOFT_HANDOFF (reason="agent_degradation_confirmed")            │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  HANDOFF EXECUTION                                                                  │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  1. Engineer builds EngineerHandoffState:                                           │
+│     - OriginalPrompt: "Refactor the auth module to use JWT"                         │
+│     - Accomplished: ["Created plan", "Implemented token generation", ...]           │
+│     - FilesChanged: [auth/token.go, auth/validator.go, ...]                         │
+│     - Remaining: ["Complete refresh token", "Add tests", "Fix merge conflicts"]     │
+│     - ContextNotes: "Merge conflicts in auth/middleware.go need resolution"         │
+│                                                                                     │
+│  2. HandoffDecisionEngine bundles:                                                  │
+│     - HandoffEvaluation (decision, reason, confidence, quality scores)              │
+│     - QualityTracker state (α=7.82, β=4.18, smoothed=0.57)                          │
+│                                                                                     │
+│  3. HandoffManager:                                                                 │
+│     - Archives state to Archivalist (Bleve + VectorDB)                              │
+│     - Creates new Engineer instance                                                 │
+│     - Injects EngineerHandoffState                                                  │
+│     - Terminates old Engineer                                                       │
+│                                                                                     │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  TURNS 13-15: New Engineer (fresh context, new burn-in)                             │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                     │
+│  New agent starts with:                                                             │
+│    - Context usage: ~15% (handoff state only)                                       │
+│    - Quality tracker: α=1, β=1 (fresh start)                                        │
+│    - Smoothed score: 0.7 (optimistic initial)                                       │
+│    - State: BURN_IN                                                                 │
+│                                                                                     │
+│  Turn 13: Resolves merge conflicts (good context, fresh start)                      │
+│           Output quality: 0.82                                                      │
+│           Decision: CONTINUE (burn-in)                                              │
+│                                                                                     │
+│  Turn 14: Completes refresh token implementation                                    │
+│           Output quality: 0.88                                                      │
+│           Decision: CONTINUE (burn-in)                                              │
+│                                                                                     │
+│  Turn 15: Adds comprehensive tests                                                  │
+│           Output quality: 0.85                                                      │
+│           CI_width now 0.31 > 0.30 → still in burn-in                              │
+│           Decision: CONTINUE                                                        │
+│                                                                                     │
+│  OUTCOME: Task completed successfully with one handoff at turn 12                   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Failure Mode Analysis
+
+The quality-based handoff system can fail in several ways. Each failure mode requires specific mitigations.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    FAILURE MODES AND MITIGATIONS                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ FAILURE MODE 1: Quality Assessor Miscalibration                              │   │
+│  ├──────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                              │   │
+│  │ Description: Output quality assessor systematically over/underestimates      │   │
+│  │              quality, causing premature or delayed handoffs                  │   │
+│  │                                                                              │   │
+│  │ Symptoms:                                                                    │   │
+│  │   • High false positive rate (unnecessary handoffs)                          │   │
+│  │   • High false negative rate (degraded agent continues)                      │   │
+│  │   • Inconsistent decisions across similar situations                         │   │
+│  │                                                                              │   │
+│  │ Root Causes:                                                                 │   │
+│  │   • Agent-specific criteria poorly calibrated                                │   │
+│  │   • Signal weights don't match actual importance                             │   │
+│  │   • Task complexity not properly accounted for                               │   │
+│  │                                                                              │   │
+│  │ Mitigations:                                                                 │   │
+│  │   ✓ Archivalist stores all HandoffEvaluations for offline analysis          │   │
+│  │   ✓ Weekly calibration reviews using Archivalist queries                    │   │
+│  │   ✓ A/B testing of threshold adjustments                                    │   │
+│  │   ✓ User feedback loop ("Was this handoff helpful?")                        │   │
+│  │   ✓ Safety limit (85-90% context) always triggers regardless of quality     │   │
+│  │                                                                              │   │
+│  │ Severity: MEDIUM | Detection: Post-hoc analysis | Recovery: Recalibration   │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ FAILURE MODE 2: Attribution Error (Blaming Agent for Bad Input)              │   │
+│  ├──────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                              │   │
+│  │ Description: CausalAttributor incorrectly attributes poor output to          │   │
+│  │              agent degradation when the real cause is input quality          │   │
+│  │                                                                              │   │
+│  │ Symptoms:                                                                    │   │
+│  │   • Handoff occurs, new agent has same problem                               │   │
+│  │   • Repeated handoffs in quick succession                                    │   │
+│  │   • User frustration (problem not solved by handoff)                         │   │
+│  │                                                                              │   │
+│  │ Root Causes:                                                                 │   │
+│  │   • Input quality assessment too generous                                    │   │
+│  │   • Priors biased toward agent degradation                                   │   │
+│  │   • Subtle input problems not detected (implicit assumptions)                │   │
+│  │                                                                              │   │
+│  │ Mitigations:                                                                 │   │
+│  │   ✓ If new agent shows same problem within 3 turns → INPUT_ISSUE likely     │   │
+│  │   ✓ Track "handoff effectiveness" (did new agent perform better?)            │   │
+│  │   ✓ Increase P(input_issue) prior if recent clarification requests           │   │
+│  │   ✓ REQUEST_CLARIFICATION before SOFT_HANDOFF if confidence < 0.7           │   │
+│  │                                                                              │   │
+│  │ Severity: HIGH | Detection: Post-handoff monitoring | Recovery: Auto-adjust │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ FAILURE MODE 3: Hysteresis Too Slow (Degraded Agent Persists)                │   │
+│  ├──────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                              │   │
+│  │ Description: λ_down too low or trend threshold too strict, allowing          │   │
+│  │              degraded agent to continue producing poor output                │   │
+│  │                                                                              │   │
+│  │ Symptoms:                                                                    │   │
+│  │   • Extended periods of poor output before handoff                           │   │
+│  │   • User notices degradation before system responds                          │   │
+│  │   • Safety limit triggers instead of quality-based handoff                   │   │
+│  │                                                                              │   │
+│  │ Root Causes:                                                                 │   │
+│  │   • λ_down tuned for flapping prevention, not responsiveness                 │   │
+│  │   • Trend window too long for task duration                                  │   │
+│  │   • Agent shows intermittent recovery (resets trend)                         │   │
+│  │                                                                              │   │
+│  │ Mitigations:                                                                 │   │
+│  │   ✓ Pipeline agents: shorter trend window (5 vs 8 turns)                    │   │
+│  │   ✓ "Consecutive poor" counter in addition to trend                         │   │
+│  │   ✓ If 5 consecutive outputs below 0.5 → trigger regardless of trend        │   │
+│  │   ✓ User can force handoff via terminal command                             │   │
+│  │                                                                              │   │
+│  │ Severity: MEDIUM | Detection: Real-time monitoring | Recovery: Config adj   │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ FAILURE MODE 4: Flapping (Rapid Handoff Cycles)                              │   │
+│  ├──────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                              │   │
+│  │ Description: System triggers handoffs too frequently, wasting resources      │   │
+│  │              and causing context loss without improvement                    │   │
+│  │                                                                              │   │
+│  │ Symptoms:                                                                    │   │
+│  │   • Multiple handoffs per task                                               │   │
+│  │   • HandoffIndex climbing rapidly (3, 4, 5...)                               │   │
+│  │   • Task never completes                                                     │   │
+│  │                                                                              │   │
+│  │ Root Causes:                                                                 │   │
+│  │   • Debounce too short                                                       │   │
+│  │   • Quality threshold too high for task complexity                           │   │
+│  │   • Inherently difficult task mistaken for agent degradation                 │   │
+│  │                                                                              │   │
+│  │ Mitigations:                                                                 │   │
+│  │   ✓ Track HandoffIndex → if > 3 for same task, ESCALATE to Architect        │   │
+│  │   ✓ Increase debounce exponentially: 15s → 30s → 60s → 120s                 │   │
+│  │   ✓ After 2nd handoff, require TASK_COMPLEXITY attribution check            │   │
+│  │   ✓ New agent inherits partial quality tracker (α/2, β/2) to avoid          │   │
+│  │     immediate re-triggering                                                  │   │
+│  │                                                                              │   │
+│  │ Severity: HIGH | Detection: HandoffIndex monitoring | Recovery: Exponential │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ FAILURE MODE 5: Cold-Start False Confidence                                  │   │
+│  ├──────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                              │   │
+│  │ Description: Agent has very good or very bad first few turns, CI width       │   │
+│  │              drops below threshold, and system makes premature decision      │   │
+│  │                                                                              │   │
+│  │ Symptoms:                                                                    │   │
+│  │   • Handoff triggered at turn 5-6 despite good underlying agent              │   │
+│  │   • Agent continues despite early warning signs                              │   │
+│  │                                                                              │   │
+│  │ Root Causes:                                                                 │   │
+│  │   • CI width formula sensitive to extreme values                             │   │
+│  │   • minTurns satisfied but sample not representative                         │   │
+│  │                                                                              │   │
+│  │ Mitigations:                                                                 │   │
+│  │   ✓ Require BOTH minTurns AND CI_width threshold                            │   │
+│  │   ✓ First 3 turns weighted 0.5x in quality tracker                          │   │
+│  │   ✓ Use robust estimator (median instead of mean) for early turns           │   │
+│  │   ✓ Never trigger handoff before turn 5 (pipeline) or 8 (workflow)          │   │
+│  │     regardless of CI width                                                   │   │
+│  │                                                                              │   │
+│  │ Severity: LOW | Detection: Early handoff rate | Recovery: Adjust minTurns   │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ FAILURE MODE 6: Cascading Handoffs Across Pipeline                           │   │
+│  ├──────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                              │   │
+│  │ Description: One agent's handoff causes dependent agents to receive          │   │
+│  │              poor input, triggering their own handoffs                       │   │
+│  │                                                                              │   │
+│  │ Symptoms:                                                                    │   │
+│  │   • Engineer handoff → Inspector receives incomplete code → Inspector        │   │
+│  │     shows poor quality → Inspector handoff                                   │   │
+│  │   • Multiple simultaneous handoffs in pipeline                               │   │
+│  │   • Resource exhaustion from parallel handoff processing                     │   │
+│  │                                                                              │   │
+│  │ Root Causes:                                                                 │   │
+│  │   • Handoff state incomplete or poorly structured                            │   │
+│  │   • Downstream agents don't account for upstream handoff                     │   │
+│  │   • No coordination between agent handoff decisions                          │   │
+│  │                                                                              │   │
+│  │ Mitigations:                                                                 │   │
+│  │   ✓ HandoffManager tracks "pipeline handoff in progress" flag               │   │
+│  │   ✓ During upstream handoff, downstream agents enter PAUSE state            │   │
+│  │   ✓ Downstream agents reset to BURN_IN when upstream hands off              │   │
+│  │   ✓ Bundled handoff state (Engineer + Inspector + Tester together)          │   │
+│  │   ✓ Max 1 handoff per pipeline per 30 seconds                               │   │
+│  │                                                                              │   │
+│  │ Severity: HIGH | Detection: Concurrent handoff counter | Recovery: Pause    │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Limits, Constraints, and Tradeoffs
+
+| Dimension | Limit | Rationale | Consequence if Exceeded |
+|-----------|-------|-----------|-------------------------|
+| **Burn-in minimum (pipeline)** | 3 turns | Need statistical significance | Premature handoff decisions |
+| **Burn-in minimum (workflow)** | 8 turns | User-facing, need stability | Unnecessary handoffs visible to user |
+| **CI width threshold** | 0.25-0.30 | Balance confidence vs responsiveness | Too tight: long burn-in; Too loose: uncertain decisions |
+| **λ_down (decline EWMA)** | 0.15-0.20 | Prevent flapping | Too low: slow response; Too high: flapping |
+| **Trend window** | 5-8 turns | Detect sustained vs temporary decline | Too short: noise; Too long: slow response |
+| **Debounce time** | 15-30s | Prevent rapid re-triggering | Too short: flapping; Too long: extended poor output |
+| **Debounce turns** | 3-5 | Minimum recovery period | Too few: flapping; Too many: stuck in poor state |
+| **Quality threshold** | 0.35-0.40 | Below = poor output | Too high: frequent handoffs; Too low: poor quality tolerated |
+| **Safety context limit** | 85-90% | Hard ceiling regardless of quality | Too low: unnecessary handoffs; Too high: context exhaustion |
+| **Max HandoffIndex** | 3 per task | Prevent infinite handoff loops | Exceeded: task should be re-planned by Architect |
+
+### Computational Cost Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    COMPUTATIONAL COST PER TURN                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Component                    │ Cost      │ Notes                                   │
+│  ────────────────────────────────────────────────────────────────────────────────   │
+│  Input Quality Assessment     │ O(n)      │ n = input token count, simple heuristics│
+│  Output Quality Assessment    │ O(m)      │ m = output token count, domain-specific │
+│  Quality Tracker Update       │ O(1)      │ Two floating point additions            │
+│  CI Width Calculation         │ O(1)      │ Single formula evaluation               │
+│  Hysteresis Update            │ O(1)      │ EWMA calculation                        │
+│  Trend Calculation            │ O(w)      │ w = trend window (5-8)                  │
+│  Causal Attribution           │ O(1)      │ Bayesian posterior calculation          │
+│  Cold-Start Gate Check        │ O(1)      │ Three comparisons                       │
+│  Debounce Check               │ O(1)      │ Two comparisons                         │
+│  ────────────────────────────────────────────────────────────────────────────────   │
+│  TOTAL PER TURN               │ O(n + m)  │ Dominated by quality assessment         │
+│                                                                                     │
+│  MEMORY OVERHEAD PER AGENT:                                                         │
+│  ────────────────────────────────────────────────────────────────────────────────   │
+│  Quality Tracker              │ 24 bytes  │ α, β, turns (3 floats)                  │
+│  Hysteresis Controller        │ 128 bytes │ Config + score history (16 floats)     │
+│  Cold-Start Gate              │ 24 bytes  │ Config (3 values)                       │
+│  ────────────────────────────────────────────────────────────────────────────────   │
+│  TOTAL PER AGENT              │ ~176 bytes│ Negligible                              │
+│                                                                                     │
+│  HANDOFF COST (when triggered):                                                     │
+│  ────────────────────────────────────────────────────────────────────────────────   │
+│  Build HandoffState           │ O(k)      │ k = number of items to serialize        │
+│  Archive to Bleve             │ O(log N)  │ N = total archived documents            │
+│  Archive to VectorDB          │ O(log N)  │ HNSW insertion                          │
+│  Spawn new agent              │ O(1)      │ Goroutine creation                      │
+│  Inject handoff state         │ O(k)      │ Deserialize and inject                  │
+│  ────────────────────────────────────────────────────────────────────────────────   │
+│  TOTAL HANDOFF                │ O(k + log N)│ ~50-100ms typical                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Edge Cases and Special Handling
+
+| Edge Case | Detection | Handling |
+|-----------|-----------|----------|
+| **First turn of session** | turn == 1 | Always CONTINUE, skip all evaluation |
+| **Empty input** | len(input) == 0 | Input quality = 0, attribution = INPUT_QUALITY_ISSUE |
+| **Tool error (not agent's fault)** | output.HasToolError | Environmental factor, not degradation |
+| **Rate limit during turn** | RateLimitError in output | Environmental factor, retry with backoff |
+| **User interrupts agent** | InterruptSignal received | Pause evaluation, resume on continue |
+| **Context at 95%+ (critical)** | contextUsage >= 0.95 | HARD_HANDOFF regardless of quality |
+| **Agent requests own handoff** | output.RequestsHandoff | Honor request, SOFT_HANDOFF |
+| **Concurrent modification** | race on quality tracker | RWMutex protects tracker state |
+| **NaN/Inf in calculations** | math.IsNaN or math.IsInf | Reset to default values, log warning |
+| **Clock skew in debounce** | time.Since returns negative | Use monotonic clock, ignore negative |
+
+### Modified ContextManager Integration
+
+The existing `ContextManager.PrepareContext` is modified to integrate quality-based decisions:
+
+```go
+// core/llm/context_quality.go
+
+// QualityAwareContextManager extends ContextManager with quality-based handoff.
+type QualityAwareContextManager struct {
+    *ContextManager
+    decisionEngine *HandoffDecisionEngine
+    handoffManager *HandoffManager
+    archivalist    *Archivalist
+}
+
+// PrepareContextWithQuality adds quality evaluation to context preparation.
+func (qcm *QualityAwareContextManager) PrepareContextWithQuality(
+    messages []Message,
+    query string,
+    input *Input,
+    output *Output,
+    turn int,
+) ([]Message, *HandoffEvaluation, error) {
+
+    // Calculate context usage
+    totalTokens := qcm.countTokens(messages)
+    available := qcm.maxContextTokens - qcm.reserveTokens
+    contextUsage := float64(totalTokens) / float64(qcm.maxContextTokens)
+
+    contextState := &ContextState{
+        UsagePercent:        contextUsage,
+        TotalTokens:         totalTokens,
+        AvailableTokens:     available,
+        EnvironmentalStress: qcm.calculateEnvironmentalStress(),
+    }
+
+    // Evaluate quality and get handoff decision
+    evaluation := qcm.decisionEngine.Evaluate(input, output, contextState, turn)
+
+    // Handle decision
+    switch evaluation.Decision {
+    case DecisionHardHandoff, DecisionSoftHandoff:
+        // Trigger handoff through existing HandoffManager
+        handoffReq := &HandoffRequest{
+            DecisionType: evaluation.Decision,
+            Evaluation:   evaluation,
+            Reason:       evaluation.Reason,
+        }
+        if err := qcm.handoffManager.TriggerHandoff(handoffReq); err != nil {
+            // Log but continue - handoff failure shouldn't block operation
+            log.Printf("handoff trigger failed: %v", err)
+        }
+
+        // Archive evaluation
+        qcm.archivalist.StoreHandoffEvaluation(evaluation)
+
+    case DecisionRequestClarification:
+        // Return special marker that Guide should request clarification
+        // This is handled by the calling agent's response processing
+
+    case DecisionEscalate:
+        // Route to Architect for re-planning
+        // This is handled via Guide's message routing
+    }
+
+    // Proceed with normal context preparation
+    prepared, err := qcm.PrepareContext(messages, query)
+    return prepared, evaluation, err
+}
+
+// calculateEnvironmentalStress returns a 0-1 value based on recent errors.
+func (qcm *QualityAwareContextManager) calculateEnvironmentalStress() float64 {
+    // Check recent API errors, rate limits, tool failures
+    // This integrates with the existing error tracking
+    recentErrors := qcm.getRecentErrorCount(5 * time.Minute)
+    if recentErrors == 0 {
+        return 0.0
+    }
+    // Sigmoid-like scaling: 1 error = 0.2, 3 errors = 0.6, 5+ errors = 0.9
+    return math.Min(0.9, float64(recentErrors)*0.2)
+}
+```
+
+### Updated Agent Context Strategies
+
+The fixed thresholds are now replaced with quality-based decisions, but context limits still exist as a safety mechanism.
+
+| Agent | Type | Strategy | Quality Threshold | Safety Limit | Burn-in |
+|-------|------|----------|-------------------|--------------|---------|
+| **Librarian** | Knowledge | **Eviction** | Quality-based | 90% | 8 turns |
+| **Archivalist** | Knowledge | **Eviction** | Quality-based | 90% | 8 turns |
+| **Academic** | Knowledge | **Eviction** | Quality-based | 90% | 10 turns |
+| **Architect** | Knowledge | **Eviction** | Quality-based | 95% | 10 turns |
+| **Engineer** | Pipeline | **Quality Handoff** | 0.40 | 85% | 5 turns |
+| **Designer** | Pipeline | **Quality Handoff** | 0.40 | 85% | 5 turns |
+| **Inspector** | Pipeline | **Quality Handoff** | 0.40 | 85% | 4 turns |
+| **Tester** | Pipeline | **Quality Handoff** | 0.40 | 85% | 4 turns |
+| **Orchestrator** | Pipeline | **Quality Handoff** | 0.38 | 85% | 5 turns |
+| **Guide** | Pipeline | **Quality Handoff** | 0.35 | 90% | 6 turns |
+
+---
+
+## Agent Memory Management
+
+Each agent has specific memory management strategies based on their role. **Knowledge agents** (Librarian, Archivalist, Academic, Architect) use **eviction** to replace context with compact references. **Pipeline agents** (Engineer, Designer, Inspector, Tester, Orchestrator, Guide) use **handoff** to spawn a fresh agent instance with transferred state. All evicted content and handoff states are archived to both Bleve (text search) and VectorDB (semantic search).
+
+### Agent Context Strategies (GP-Based Dynamic Triggers)
+
+**IMPORTANT**: Triggers are NOT hardcoded percentages. Each agent instance learns its own performance degradation curve via Gaussian Process observations. See **HANDOFF.md** for full architecture.
+
+| Agent | Model | Context | Category | Strategy | Trigger |
+|-------|-------|---------|----------|----------|---------|
+| **Librarian** | Sonnet 4.5 | **1M** | Knowledge | RecencyBasedEviction | GP-detected degradation |
+| **Archivalist** | Sonnet 4.5 | **1M** | Knowledge | RecencyBasedEviction | GP-detected degradation |
+| **Academic** | Opus 4.5 | 200K | Knowledge | TopicClusterEviction | GP-detected degradation |
+| **Architect** | Opus 4.5 | 200K | Knowledge | TaskCompletionEviction | GP-detected degradation |
+| **Engineer** | Opus 4.5 | 200K | Pipeline | Same-Type Handoff | GP-detected degradation |
+| **Designer** | Sonnet 4.5 | 200K | Pipeline | Same-Type Handoff | GP-detected degradation |
+| **Inspector** (standalone) | Sonnet 4.5 | 200K | Standalone | Same-Type Handoff | GP-detected degradation |
+| **Inspector** (pipeline) | Haiku 4.5 | 200K | Pipeline | Same-Type Handoff | GP-detected degradation |
+| **Tester** (standalone) | Sonnet 4.5 | 200K | Standalone | Same-Type Handoff | GP-detected degradation |
+| **Tester** (pipeline) | Haiku 4.5 | 200K | Pipeline | Same-Type Handoff | GP-detected degradation |
+| **Orchestrator** | Haiku 4.5 | 200K | Standalone | Same-Type Handoff | GP-detected degradation |
+| **Guide** | Haiku 4.5 | 200K | Standalone | Same-Type Handoff | GP-detected degradation |
+
+**Key Insight**: Librarian and Archivalist use Sonnet 4.5's **1M token context window**, meaning their peak zones span 200K-800K+ tokens before degradation triggers eviction.
+
+### Memory Management Summary (GP-Based Dynamic Triggers)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    GP-BASED DYNAMIC MEMORY MANAGEMENT                                │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  TRIGGER: GP-detected performance degradation (NOT fixed % threshold)               │
+│  See HANDOFF.md for full architecture and learned parameter specifications          │
+│                                                                                     │
+│  KNOWLEDGE AGENTS → GRADUAL TIERED EVICTION                                         │
+│  ═══════════════════════════════════════════                                        │
+│  Librarian (Sonnet-1M), Archivalist (Sonnet-1M), Academic (Opus), Architect (Opus) │
+│                                                                                     │
+│  • Own goroutine (long-lived, standalone)                                           │
+│  • GP detects degradation → tiered eviction (HOT → WARM → COLD → [CTX-REF-xxx])    │
+│  • Agent CONTINUES (same instance, reduced context)                                 │
+│  • Evicted content retrievable on demand via CONTEXT.md tiered system              │
+│  • Librarian/Archivalist: 1M context means MUCH longer before eviction needed      │
+│                                                                                     │
+│  ───────────────────────────────────────────────────────────────────────────────    │
+│                                                                                     │
+│  STANDALONE AGENTS → SAME-TYPE HANDOFF                                              │
+│  ════════════════════════════════════════                                           │
+│  Guide (Haiku), Orchestrator (Haiku), Inspector-Standalone (Sonnet),               │
+│  Tester-Standalone (Sonnet)                                                         │
+│                                                                                     │
+│  • Own goroutine (long-lived, standalone)                                           │
+│  • GP detects degradation → handoff to new instance of SAME (AgentType, Model)     │
+│  • PreparedContext trimmed to OptimalPreparedSize (learned for this agent+model)   │
+│  • Old instance TERMINATES, new instance continues                                  │
+│                                                                                     │
+│  ───────────────────────────────────────────────────────────────────────────────    │
+│                                                                                     │
+│  PIPELINE AGENTS → SAME-TYPE HANDOFF (within pipeline)                              │
+│  ═════════════════════════════════════════════════════                              │
+│  Engineer (Opus), Designer (Sonnet), Inspector-Pipeline (Haiku),                   │
+│  Tester-Pipeline (Haiku)                                                            │
+│                                                                                     │
+│  • Execute sequentially within pipeline goroutine                                   │
+│  • GP detects degradation → handoff to new instance of SAME (AgentType, Model)     │
+│  • Pipeline continues with swapped agent reference                                  │
+│  • PreparedContext trimmed to OptimalPreparedSize (learned for this agent+model)   │
+│                                                                                     │
+│  ───────────────────────────────────────────────────────────────────────────────    │
+│                                                                                     │
+│  PREPARED CONTEXT: Maintained continuously during normal operation                  │
+│  HANDOFF LATENCY: ~1-2ms (pointer swap + trim)                                      │
+│  ALL PARAMETERS: Learned distributions with hierarchical Bayesian priors           │
+│                                                                                     │
+│  All evicted content + handoff states → ARCHIVALIST (Bleve + VectorDB)              │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -40674,9 +43343,13 @@ Each agent has specific memory management strategies based on their role, model,
 
 ### Librarian Memory Management
 
-The Librarian continuously learns about the codebase through indexing and queries. This knowledge must be persisted to survive context window limits.
+The Librarian (Sonnet 4.5 with **1M token context window**) continuously learns about the codebase through indexing and queries. This knowledge must be persisted to survive context window limits. Uses **RecencyBasedEviction** with GP-detected degradation triggers.
 
-**Thresholds**: 25%, 50%, 75% (checkpoint) | 75% (compact)
+**Strategy**: RecencyBasedEviction with GP-based triggers (see HANDOFF.md)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Peak Zone**: ~200K-800K tokens (learned per instance)
+- **PreserveRecent**: Learned via `profile.GetEffectiveRecentTurnsNeeded()`
+- **PreserveTypes**: User prompts never evicted
 
 **Checkpoint Summary (Onboarding-Style)**:
 
@@ -41264,9 +43937,14 @@ func (l *Librarian) HandleQuery(req *LibrarianRequest) (*Response, error) {
 
 ### Guide Memory Management
 
-The Guide tracks routing decisions, matches, and request patterns. This information helps optimize future routing.
+The Guide (Haiku 4.5, 200K context) tracks routing decisions, matches, and request patterns. This information helps optimize future routing. As a **standalone agent**, Guide uses **same-type handoff** when GP detects quality degradation.
 
-**Thresholds**: 50%, 75%, 90% (checkpoint) | 95% (compact)
+**Strategy**: Same-Type Handoff with GP-based triggers (see HANDOFF.md)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Peak Zone**: ~10K-60K tokens (learned per instance)
+- **Handoff State**: GuideHandoffState containing conversation history, routing decisions, user preferences, agent affinities
+- **New Instance**: Fresh Guide receives PreparedContext trimmed to OptimalPreparedSize (learned)
+- **Archival**: Same handoff state archived to both Bleve and VectorDB
 
 **Checkpoint Summary**:
 
@@ -41537,11 +44215,14 @@ type ArchivalistRequest struct {
 
 ### Academic Memory Management
 
-The Academic researches topics and produces findings. At checkpoint, it produces a "research paper" summarizing its findings.
+The Academic (Opus 4.5, 200K context) researches topics and produces findings. As a **knowledge agent**, Academic uses **TopicClusterEviction** with GP-detected degradation triggers.
 
-**Model**: Opus 4.5
-
-**Thresholds**: 85% (checkpoint) | 95% (compact)
+**Strategy**: TopicClusterEviction with GP-based triggers (see HANDOFF.md)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Peak Zone**: ~30K-120K tokens (learned per instance)
+- **PreserveRecent**: Learned via `profile.GetEffectiveRecentTurnsNeeded()`
+- **PreserveTypes**: Research papers never evicted
+- **Cluster Logic**: Related research entries evicted together to maintain coherence
 
 **Checkpoint Summary (Research Paper Format)**:
 
@@ -41576,11 +44257,14 @@ type Finding struct {
 
 ### Architect Memory Management
 
-The Architect creates implementation plans and DAGs. At checkpoint, it produces a retrievable workflow/plan document.
+The Architect (Opus 4.5 with 200K context window) creates implementation plans and DAGs. As a **knowledge agent**, Architect uses **TaskCompletionEviction** with GP-detected degradation triggers.
 
-**Model**: OpenAI Codex 5.2
-
-**Thresholds**: 85% (checkpoint) | 95% (compact)
+**Strategy**: TaskCompletionEviction with GP-based triggers (see HANDOFF.md)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Peak Zone**: ~30K-120K tokens (learned per instance)
+- **PreserveRecent**: Learned via `profile.GetEffectiveRecentTurnsNeeded()`
+- **PreserveTypes**: User prompts, plan/workflow entries never evicted
+- **Task Logic**: Completed task entries evicted first, active tasks preserved
 
 **Checkpoint Summary (Retrievable Workflow Format)**:
 
@@ -41623,15 +44307,16 @@ type TaskSummary struct {
 
 ---
 
-### Inspector Memory Management
+### Inspector Memory Management: Pipeline Handoff
 
-The Inspector validates code and tracks issues. At checkpoint, it summarizes findings, fixes, and priorities.
+The Inspector validates code and tracks issues. As a **standalone/pipeline agent**, Inspector uses **same-type handoff** when GP detects quality degradation.
 
-**Model**: OpenAI Codex 5.2
-
-**Thresholds**: 85% (checkpoint) | 95% (compact locally)
-
-**Note**: Inspector compacts locally at 95%. Does NOT trigger pipeline handoff.
+**Strategy**: Same-Type Handoff with GP-based triggers (see HANDOFF.md)
+- **Models**: Sonnet 4.5 (standalone) or Haiku 4.5 (pipeline)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Handoff State**: InspectorHandoffState containing checks performed, issues found, fixes completed, fixes remaining, validation state
+- **New Instance**: Fresh Inspector (same model) receives PreparedContext trimmed to OptimalPreparedSize
+- **Archival**: Same handoff state archived to both Bleve (text search) and VectorDB (semantic search)
 
 **Checkpoint Summary**:
 
@@ -41676,15 +44361,16 @@ type PendingFix struct {
 
 ---
 
-### Tester Memory Management
+### Tester Memory Management: Pipeline Handoff
 
-The Tester creates and runs tests. At checkpoint, it summarizes test state and results.
+The Tester creates and runs tests. As a **standalone/pipeline agent**, Tester uses **same-type handoff** when GP detects quality degradation.
 
-**Model**: OpenAI Codex 5.2
-
-**Thresholds**: 85% (checkpoint) | 95% (compact locally)
-
-**Note**: Tester compacts locally at 95%. Does NOT trigger pipeline handoff.
+**Strategy**: Same-Type Handoff with GP-based triggers (see HANDOFF.md)
+- **Models**: Sonnet 4.5 (standalone) or Haiku 4.5 (pipeline)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Handoff State**: TesterHandoffState containing tests created, test results, failure descriptions, coverage needed
+- **New Instance**: Fresh Tester (same model) receives PreparedContext trimmed to OptimalPreparedSize
+- **Archival**: Same handoff state archived to both Bleve (text search) and VectorDB (semantic search)
 
 **Checkpoint Summary**:
 
@@ -41733,58 +44419,56 @@ type FailureDesc struct {
 
 ### Engineer Memory Management: Pipeline Handoff
 
-**CRITICAL**: The Engineer does NOT compact locally. At 95% context, it triggers a **PIPELINE HANDOFF**.
+**CRITICAL**: The Engineer (Opus 4.5, 200K context) does NOT use eviction. When GP detects quality degradation, it triggers a **SAME-TYPE HANDOFF**.
 
-**Model**: Opus 4.5
+**Strategy**: Same-Type Handoff with GP-based triggers (see HANDOFF.md)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Peak Zone**: ~30K-120K tokens (learned per instance)
+- **Handoff State**: EngineerHandoffState containing original prompt, accomplishments, files changed, remaining work, context notes
+- **New Instance**: Fresh Engineer receives PreparedContext trimmed to OptimalPreparedSize (learned)
+- **Archival**: Same handoff state archived to both Bleve (text search) and VectorDB (semantic search)
 
-**Threshold**: 95% → **PIPELINE HANDOFF**
-
-This is a special mechanism where the entire pipeline (Engineer + Inspector + Tester) transfers state to a new pipeline, minimizing re-learning.
+This mechanism ensures task continuity by transferring complete state to a new Engineer instance.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                    PIPELINE HANDOFF (ENGINEER AT 95%)                                │
+│                    PIPELINE HANDOFF (ENGINEER - GP-TRIGGERED)                        │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                     │
-│  OLD PIPELINE                                                         NEW PIPELINE  │
-│  (Eng+Insp+Test)       GUIDE          ARCHITECT       ORCHESTRATOR   (Eng+Insp+Test)│
-│       │                  │                │                │               │        │
-│  ┌────┴────┐             │                │                │               │        │
-│  │Engineer │             │                │                │               │        │
-│  │ at 95%  │             │                │                │               │        │
-│  └────┬────┘             │                │                │               │        │
-│       │                  │                │                │               │        │
-│       │ Prepare state    │                │                │               │        │
-│       │ (E + I + T)      │                │                │               │        │
-│       │                  │                │                │               │        │
-│       │══"HANDOFF_REQ"══▶│                │                │               │        │
-│       │  + full state    │══════════════▶│                │               │        │
-│       │  (E+I+T summary) │                │                │               │        │
-│       │                  │                │                │               │        │
-│       │                  │          ┌─────┴─────┐          │               │        │
-│       │                  │          │ Examine   │          │               │        │
-│       │                  │          │ state,    │          │               │        │
-│       │                  │          │ adjust    │          │               │        │
-│       │                  │          │ workflow  │          │               │        │
-│       │                  │          │ if needed │          │               │        │
-│       │                  │          └─────┬─────┘          │               │        │
-│       │                  │                │                │               │        │
-│       │                  │                │══"CREATE_NEW"═▶│               │        │
-│       │                  │                │  + state       │               │        │
-│       │                  │                │  + "close old" │               │        │
-│       │                  │                │                │               │        │
-│       │                  │                │                │──create──────▶│        │
-│       │                  │                │                │  (inject      │        │
-│       │                  │                │                │   state)      │        │
-│       │                  │                │                │               │        │
-│       │                  │                │                │◀──"STARTED"───│        │
-│       │                  │                │                │               │        │
-│       │◀══"CLOSE_NOW"════│◀═══════════════│◀═══════════════│               │        │
-│       │                  │                │                │               │        │
-│       X                  │                │                │         ┌─────┴─────┐  │
-│  (old closes)            │                │                │         │ EXECUTING │  │
-│                          │                │                │         │ (resumed) │  │
-│                          │                │                │         └───────────┘  │
+│  OLD ENGINEER                                                         NEW ENGINEER  │
+│                        HANDOFF                                                       │
+│       │               MANAGER                                               │        │
+│  ┌────┴────┐             │                                                  │        │
+│  │Engineer │             │                                                  │        │
+│  │GP-trig  │             │                                                  │        │
+│  └────┬────┘             │                                                  │        │
+│       │                  │                                                  │        │
+│       │ Build handoff    │                                                  │        │
+│       │ state            │                                                  │        │
+│       │                  │                                                  │        │
+│       │══"HANDOFF"══════▶│                                                  │        │
+│       │  + EngineerHandoffState                                             │        │
+│       │                  │                                                  │        │
+│       │                  │ ┌─────────────────────────────────────────┐      │        │
+│       │                  │ │ 1. Archive to Archivalist               │      │        │
+│       │                  │ │    (Bleve + VectorDB)                   │      │        │
+│       │                  │ │ 2. Create new Engineer                  │      │        │
+│       │                  │ │ 3. Inject handoff state                 │      │        │
+│       │                  │ │ 4. Register with pipeline               │      │        │
+│       │                  │ │ 5. Terminate old Engineer               │      │        │
+│       │                  │ └─────────────────────────────────────────┘      │        │
+│       │                  │                                                  │        │
+│       │                  │──────────────────────────────────────────create─▶│        │
+│       │                  │              (inject handoff state)              │        │
+│       │                  │                                                  │        │
+│       │                  │◀───────────────────────────────────"READY"───────│        │
+│       │                  │                                                  │        │
+│       │◀══"TERMINATE"════│                                                  │        │
+│       │                  │                                                  │        │
+│       X                  │                                            ┌─────┴─────┐  │
+│  (old terminates)        │                                            │ EXECUTING │  │
+│                          │                                            │ (resumed) │  │
+│                          │                                            └───────────┘  │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -41798,7 +44482,7 @@ type PipelineHandoff struct {
     SessionID       string        `json:"session_id"`
     DAGID           string        `json:"dag_id"`
     TaskID          string        `json:"task_id"`
-    HandoffReason   string        `json:"handoff_reason"` // "engineer_context_95%"
+    HandoffReason   string        `json:"handoff_reason"` // "engineer_context_75%"
     Timestamp       time.Time     `json:"timestamp"`
     HandoffIndex    int           `json:"handoff_index"`  // For chaining (1, 2, 3...)
 
@@ -41858,12 +44542,12 @@ type TesterHandoffState struct {
 
 | Rule | Description |
 |------|-------------|
-| **Trigger** | Engineer at 95% OR user request |
-| **Who triggers** | Only Engineer triggers handoff (Inspector/Tester compact locally) |
-| **State bundling** | Engineer collects state from Inspector + Tester |
-| **Architect review** | Architect examines and may adjust workflow |
-| **Archivalist** | Handoff state also stored for audit/recovery |
-| **Retry** | If handoff fails, retry. If retries fail, fallback to summarize → Archivalist → compact |
+| **Trigger** | Any pipeline agent at 75% context |
+| **Who triggers** | Each pipeline agent independently triggers its own handoff |
+| **State** | Agent builds its own handoff state (EngineerHandoffState, InspectorHandoffState, etc.) |
+| **HandoffManager** | Coordinates handoff: archive state, spawn new agent, inject state, terminate old |
+| **Archivalist** | Handoff state archived to BOTH Bleve (text search) AND VectorDB (semantic search) |
+| **Retry** | If handoff fails, retry with exponential backoff |
 | **Chaining** | Handoffs can chain infinitely (tracked by HandoffIndex) |
 | **User control** | User can stop a handoff chain if desired |
 
@@ -41883,58 +44567,56 @@ This minimizes re-learning and re-discovery.
 
 ### Designer Memory Management: Pipeline Handoff
 
-**CRITICAL**: The Designer does NOT compact locally. At 95% context, it triggers a **PIPELINE HANDOFF**.
+**CRITICAL**: The Designer (Sonnet 4.5, 200K context) does NOT use eviction. When GP detects quality degradation, it triggers a **SAME-TYPE HANDOFF**.
 
-**Model**: Gemini 3 Pro
+**Strategy**: Same-Type Handoff with GP-based triggers (see HANDOFF.md)
+- **Trigger**: GP detects quality degradation, NOT fixed percentage
+- **Peak Zone**: ~30K-140K tokens (learned per instance)
+- **Handoff State**: DesignerHandoffState containing original prompt, components created, styles applied, remaining work, design decisions, design tokens used, a11y considerations
+- **New Instance**: Fresh Designer receives PreparedContext trimmed to OptimalPreparedSize (learned)
+- **Archival**: Same handoff state archived to both Bleve (text search) and VectorDB (semantic search)
 
-**Threshold**: 95% → **PIPELINE HANDOFF**
-
-This mirrors the Engineer pipeline handoff mechanism. The entire Designer pipeline (Designer + UIInspector + UITester) transfers state to a new pipeline, minimizing re-learning for UI/UX work.
+This mirrors the Engineer pipeline handoff mechanism.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                    PIPELINE HANDOFF (DESIGNER AT 95%)                                │
+│                    PIPELINE HANDOFF (DESIGNER - GP-TRIGGERED)                        │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                     │
-│  OLD PIPELINE                                                         NEW PIPELINE  │
-│  (Des+UIInsp+UITest)     GUIDE          ARCHITECT       ORCHESTRATOR (Des+UIInsp+UT)│
-│       │                  │                │                │               │        │
-│  ┌────┴────┐             │                │                │               │        │
-│  │Designer │             │                │                │               │        │
-│  │ at 95%  │             │                │                │               │        │
-│  └────┬────┘             │                │                │               │        │
-│       │                  │                │                │               │        │
-│       │ Prepare state    │                │                │               │        │
-│       │ (D + UI + UT)    │                │                │               │        │
-│       │                  │                │                │               │        │
-│       │══"HANDOFF_REQ"══▶│                │                │               │        │
-│       │  + full state    │══════════════▶│                │               │        │
-│       │  (D+UI+UT summ)  │                │                │               │        │
-│       │                  │                │                │               │        │
-│       │                  │          ┌─────┴─────┐          │               │        │
-│       │                  │          │ Examine   │          │               │        │
-│       │                  │          │ state,    │          │               │        │
-│       │                  │          │ adjust    │          │               │        │
-│       │                  │          │ workflow  │          │               │        │
-│       │                  │          │ if needed │          │               │        │
-│       │                  │          └─────┬─────┘          │               │        │
-│       │                  │                │                │               │        │
-│       │                  │                │══"CREATE_NEW"═▶│               │        │
-│       │                  │                │  + state       │               │        │
-│       │                  │                │  + "close old" │               │        │
-│       │                  │                │                │               │        │
-│       │                  │                │                │──create──────▶│        │
-│       │                  │                │                │  (inject      │        │
-│       │                  │                │                │   state)      │        │
-│       │                  │                │                │               │        │
-│       │                  │                │                │◀──"STARTED"───│        │
-│       │                  │                │                │               │        │
-│       │◀══"CLOSE_NOW"════│◀═══════════════│◀═══════════════│               │        │
-│       │                  │                │                │               │        │
-│       X                  │                │                │         ┌─────┴─────┐  │
-│  (old closes)            │                │                │         │ EXECUTING │  │
-│                          │                │                │         │ (resumed) │  │
-│                          │                │                │         └───────────┘  │
+│  OLD DESIGNER                                                         NEW DESIGNER  │
+│                        HANDOFF                                                       │
+│       │               MANAGER                                               │        │
+│  ┌────┴────┐             │                                                  │        │
+│  │Designer │             │                                                  │        │
+│  │GP-trig  │             │                                                  │        │
+│  └────┬────┘             │                                                  │        │
+│       │                  │                                                  │        │
+│       │ Build handoff    │                                                  │        │
+│       │ state            │                                                  │        │
+│       │                  │                                                  │        │
+│       │══"HANDOFF"══════▶│                                                  │        │
+│       │  + DesignerHandoffState                                             │        │
+│       │                  │                                                  │        │
+│       │                  │ ┌─────────────────────────────────────────┐      │        │
+│       │                  │ │ 1. Archive to Archivalist               │      │        │
+│       │                  │ │    (Bleve + VectorDB)                   │      │        │
+│       │                  │ │ 2. Create new Designer                  │      │        │
+│       │                  │ │ 3. Inject handoff state                 │      │        │
+│       │                  │ │ 4. Register with pipeline               │      │        │
+│       │                  │ │ 5. Terminate old Designer               │      │        │
+│       │                  │ └─────────────────────────────────────────┘      │        │
+│       │                  │                                                  │        │
+│       │                  │──────────────────────────────────────────create─▶│        │
+│       │                  │              (inject handoff state)              │        │
+│       │                  │                                                  │        │
+│       │                  │◀───────────────────────────────────"READY"───────│        │
+│       │                  │                                                  │        │
+│       │◀══"TERMINATE"════│                                                  │        │
+│       │                  │                                                  │        │
+│       X                  │                                            ┌─────┴─────┐  │
+│  (old terminates)        │                                            │ EXECUTING │  │
+│                          │                                            │ (resumed) │  │
+│                          │                                            └───────────┘  │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -41948,7 +44630,7 @@ type DesignerPipelineHandoff struct {
     SessionID       string        `json:"session_id"`
     DAGID           string        `json:"dag_id"`
     TaskID          string        `json:"task_id"`
-    HandoffReason   string        `json:"handoff_reason"` // "designer_context_95%"
+    HandoffReason   string        `json:"handoff_reason"` // "gp_degradation_detected"
     Timestamp       time.Time     `json:"timestamp"`
     HandoffIndex    int           `json:"handoff_index"`  // For chaining (1, 2, 3...)
 
@@ -42107,12 +44789,12 @@ type ThemeTestResult struct {
 
 | Rule | Description |
 |------|-------------|
-| **Trigger** | Designer at 95% OR user request |
-| **Who triggers** | Only Designer triggers handoff (UIInspector/UITester compact locally) |
-| **State bundling** | Designer collects state from UIInspector + UITester |
-| **Architect review** | Architect examines and may adjust workflow |
-| **Archivalist** | Handoff state also stored for audit/recovery |
-| **Retry** | If handoff fails, retry. If retries fail, fallback to summarize → Archivalist → compact |
+| **Trigger** | Any UI pipeline agent at 75% context |
+| **Who triggers** | Each pipeline agent independently triggers its own handoff |
+| **State** | Agent builds its own handoff state (DesignerHandoffState, UIInspectorHandoffState, etc.) |
+| **HandoffManager** | Coordinates handoff: archive state, spawn new agent, inject state, terminate old |
+| **Archivalist** | Handoff state archived to BOTH Bleve (text search) AND VectorDB (semantic search) |
+| **Retry** | If handoff fails, retry with exponential backoff |
 | **Chaining** | Handoffs can chain infinitely (tracked by HandoffIndex) |
 | **User control** | User can stop a handoff chain if desired |
 
@@ -42130,11 +44812,99 @@ This minimizes re-learning and re-discovery for UI/UX work.
 
 ---
 
+## Lossless Context Virtualization
+
+The context virtualization system enables agents to operate beyond their context window limits by replacing evicted content with compact references that can be retrieved on demand. Full specification in CONTEXT.md.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     LOSSLESS CONTEXT VIRTUALIZATION                                   │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  KNOWLEDGE AGENTS                          PIPELINE AGENTS                          │
+│  (Librarian, Archivalist,                  (Engineer, Designer, Inspector,          │
+│   Academic, Architect)                      Tester, Orchestrator, Guide)            │
+│        │                                           │                                │
+│        ▼                                           ▼                                │
+│  ┌─────────────────┐                      ┌─────────────────┐                       │
+│  │   EVICTION      │                      │    HANDOFF      │                       │
+│  │   at threshold  │                      │   at 75%        │                       │
+│  │                 │                      │                 │                       │
+│  │  • Librarian:   │                      │  • Build state  │                       │
+│  │    75%, Recency │                      │  • Archive to   │                       │
+│  │  • Archivalist: │                      │    Archivalist  │                       │
+│  │    75%, Recency │                      │  • Spawn new    │                       │
+│  │  • Academic:    │                      │    instance     │                       │
+│  │    80%, Topic   │                      │  • Inject state │                       │
+│  │  • Architect:   │                      │  • Terminate    │                       │
+│  │    85%, Task    │                      │    old instance │                       │
+│  └────────┬────────┘                      └────────┬────────┘                       │
+│           │                                        │                                │
+│           ▼                                        ▼                                │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                       ARCHIVALIST (Dual Storage)                             │   │
+│  │  ┌────────────────────────────┐  ┌────────────────────────────┐             │   │
+│  │  │         BLEVE              │  │        VECTORDB            │             │   │
+│  │  │    (Text Search)           │  │    (Semantic Search)       │             │   │
+│  │  │                            │  │                            │             │   │
+│  │  │  • Evicted content         │  │  • Evicted content         │             │   │
+│  │  │  • Handoff states          │  │    embeddings              │             │   │
+│  │  │  • Full-text searchable    │  │  • Handoff state           │             │   │
+│  │  │  • Audit trail             │  │    embeddings              │             │   │
+│  │  └────────────────────────────┘  │  • Similarity search       │             │   │
+│  │                                   └────────────────────────────┘             │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  REFERENCE RETRIEVAL                                                                │
+│  ───────────────────                                                                │
+│  When agent encounters [CTX-REF-xxx] marker:                                        │
+│  1. Agent calls retrieve_context(ref_id) skill                                      │
+│  2. VirtualContextManager resolves reference                                        │
+│  3. Full content retrieved from UniversalContentStore                               │
+│  4. Content injected back into context window                                       │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | Purpose |
+|-----------|---------|
+| **UniversalContentStore** | Central storage for all content (wraps VectorGraphDB + Bleve) |
+| **StartupIndexer** | Parallel codebase indexer with resource management |
+| **ContextReference** | Compact [CTX-REF-xxx] markers replacing evicted content |
+| **ReferenceGenerator** | Creates summaries for evicted content |
+| **VirtualContextManager** | Coordinates eviction/handoff per agent |
+| **EvictionStrategy** | Interface for agent-specific eviction logic |
+| **HandoffManager** | Coordinates pipeline agent handoffs |
+
+### Eviction Strategies
+
+| Strategy | Agent | Behavior |
+|----------|-------|----------|
+| **RecencyBasedEviction** | Librarian, Archivalist | Evict oldest content first, preserve recent turns |
+| **TopicClusterEviction** | Academic | Evict entire topic clusters together |
+| **TaskCompletionEviction** | Architect | Evict completed task context first |
+
+### Reference Format
+
+```
+[CTX-REF-abc123] Summary: Discussed auth.go login flow and JWT validation. (1,500 tokens, turns 5-8)
+```
+
+See CONTEXT.md for full implementation specification.
+
+---
+
 ## VectorGraphDB: Unified Knowledge Graph
 
 ### Overview
 
 The VectorGraphDB is a unified, embedded knowledge graph that combines **vector similarity search** with **graph-based structural queries** across three domains: Code (Librarian), History (Archivalist), and Academic (external knowledge). It uses SQLite as the storage backend with in-memory HNSW indexes for fast vector search - no external dependencies required.
+
+**Chunking Architecture**: See [CHUNKING.md](./CHUNKING.md) for the Semantic-Aware Hierarchical Chunking system that breaks documents into semantically coherent units for vector embedding. Chunk sizing parameters (TargetTokens, MinTokens, ContextTokens) are **learned from retrieval feedback**, not hardcoded - following the same Bayesian learning patterns as SCORING.md.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -51830,6 +54600,13 @@ Approved documents are chunked and embedded into the vector DB for semantic sear
 ```
 
 ### Document Chunk Structure
+
+**Full Chunking Architecture**: See [CHUNKING.md](./CHUNKING.md) for the complete Semantic-Aware Hierarchical Chunking system, including:
+- AST-based code chunking, header-based markdown chunking, section-based academic chunking
+- **Learned chunk sizing** (TargetTokens, MinTokens, ContextTokens are Gamma-distributed posteriors)
+- Hierarchical chunk structure with cross-references
+- Quality integration via content_hash
+- Chunk parameter learning from retrieval feedback
 
 ```go
 // core/vectordb/document.go

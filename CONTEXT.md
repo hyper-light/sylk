@@ -2,7 +2,9 @@
 
 ## Overview
 
-Sylk implements a **lossless context virtualization** system that eliminates information loss from traditional compaction. Instead of summarizing and discarding context, all content is stored in a Universal Content Store (Document DB + Vector DB) and can be retrieved on demand.
+Sylk implements a **lossless context virtualization** system that eliminates information loss from traditional compaction. Instead of summarizing and discarding context, all content is stored in a Universal Content Store backed by Bleve (full-text search) and VectorGraphDB (SQLite-based semantic search) and can be retrieved on demand.
+
+**Storage Architecture Note**: VectorGraphDB uses SQLite internally (`vector.db`) for embeddings, graph relationships, AND content metadata. Bleve is file-based (`documents.bleve/`) for full-text search. There is no separate content database - all relational data is stored in VectorGraphDB.
 
 **Core Principle**: The context window is treated like a CPU's L1 cache backed by infinite storage. Content can be "evicted" from active context but remains fully retrievable.
 
@@ -40,63 +42,89 @@ Sylk implements a **lossless context virtualization** system that eliminates inf
 
 ---
 
-## Memory Management Thresholds
+## Memory Management: GP-Based Dynamic Triggers
 
 ### Agent Classification
 
-| Agent | Category | Strategy | Threshold |
-|-------|----------|----------|-----------|
-| **Librarian** | Knowledge | Eviction + Reference | 75% |
-| **Archivalist** | Knowledge | Eviction + Reference | 75% |
-| **Academic** | Knowledge | Eviction + Reference | 80% |
-| **Architect** | Knowledge | Eviction + Reference | 85% |
-| **Engineer** | Pipeline | **Agent Handoff** | **75%** |
-| **Designer** | Pipeline | **Agent Handoff** | **75%** |
-| **Inspector** | Pipeline | **Agent Handoff** | **75%** |
-| **Tester** | Pipeline | **Agent Handoff** | **75%** |
-| **Orchestrator** | Pipeline | **Agent Handoff** | **75%** |
-| **Guide** | Pipeline | **Agent Handoff** | **75%** |
+Memory management triggers are **not hardcoded percentages**. Each agent instance learns its own degradation curve via Gaussian Process observations. When degradation is detected, the action depends on agent category.
+
+| Agent | Model | Context Window | Category | Strategy |
+|-------|-------|----------------|----------|----------|
+| **Librarian** | Sonnet 4.5 | **1M tokens** | Knowledge | Tiered Eviction |
+| **Archivalist** | Sonnet 4.5 | **1M tokens** | Knowledge | Tiered Eviction |
+| **Academic** | Opus 4.5 | 200K tokens | Knowledge | Tiered Eviction |
+| **Architect** | Opus 4.5 | 200K tokens | Knowledge | Tiered Eviction |
+| **Engineer** | Opus 4.5 | 200K tokens | Pipeline | **Same-Type Handoff** |
+| **Designer** | Sonnet 4.5 | 200K tokens | Pipeline | **Same-Type Handoff** |
+| **Inspector** (standalone) | Sonnet 4.5 | 200K tokens | Standalone | **Same-Type Handoff** |
+| **Inspector** (pipeline) | Haiku 4.5 | 200K tokens | Pipeline | **Same-Type Handoff** |
+| **Tester** (standalone) | Sonnet 4.5 | 200K tokens | Standalone | **Same-Type Handoff** |
+| **Tester** (pipeline) | Haiku 4.5 | 200K tokens | Pipeline | **Same-Type Handoff** |
+| **Orchestrator** | Haiku 4.5 | 200K tokens | Standalone | **Same-Type Handoff** |
+| **Guide** | Haiku 4.5 | 200K tokens | Standalone | **Same-Type Handoff** |
+
+### Trigger Mechanism: GP-Based Degradation Detection
+
+**No fixed percentage thresholds.** Each agent instance learns its own performance curve:
+
+1. **Quality Observations**: After each turn, quality is assessed and recorded
+2. **GP Prediction**: Gaussian Process predicts quality at current + lookahead context size
+3. **Degradation Detection**: Action triggered when:
+   - Predicted quality drops below learned peak quality threshold
+   - Quality trend shows significant decline
+   - High uncertainty + past burn-in phase
+4. **Action Type**: Knowledge agents → eviction; Others → same-type handoff
+
+See **HANDOFF.md** for full GP architecture and learned parameter specifications.
 
 ### Visual Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                         MEMORY MANAGEMENT THRESHOLDS                                 │
+│                    GP-BASED DYNAMIC MEMORY MANAGEMENT                                │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                     │
-│  KNOWLEDGE AGENTS (Eviction + Reference)                                           │
-│  ═══════════════════════════════════════                                           │
+│  TRIGGER: GP-detected performance degradation (NOT fixed % threshold)               │
 │                                                                                     │
-│  LIBRARIAN:      25%──────50%──────75%                                             │
-│  ARCHIVALIST:    25%──────50%──────75%                                             │
-│                   │        │        │                                              │
-│                   ▼        ▼        ▼                                              │
-│                 CKPT     CKPT    EVICT+REF                                         │
+│  KNOWLEDGE AGENTS → GRADUAL TIERED EVICTION                                         │
+│  ═══════════════════════════════════════════                                        │
+│  Librarian (Sonnet-1M), Archivalist (Sonnet-1M), Academic (Opus), Architect (Opus) │
 │                                                                                     │
-│  ACADEMIC:                         80%                                             │
-│  ARCHITECT:                              85%                                       │
-│                                     │     │                                        │
-│                                     ▼     ▼                                        │
-│                                EVICT+REF EVICT+REF                                 │
+│  • Own goroutine (long-lived, standalone)                                           │
+│  • GP detects degradation → tiered eviction (HOT → WARM → COLD → [CTX-REF-xxx])    │
+│  • Agent CONTINUES (same instance, reduced context)                                 │
+│  • Evicted content retrievable on demand via tiered retrieval system               │
+│  • Librarian/Archivalist: 1M context means MUCH longer before eviction needed      │
 │                                                                                     │
-│  PIPELINE AGENTS (Agent Handoff @ 75%)                                             │
-│  ═════════════════════════════════════                                             │
+│  ───────────────────────────────────────────────────────────────────────────────    │
 │                                                                                     │
-│  ENGINEER:                         75%                                             │
-│  DESIGNER:                         75%                                             │
-│  INSPECTOR:                        75%                                             │
-│  TESTER:                           75%                                             │
-│  ORCHESTRATOR:                     75%                                             │
-│  GUIDE:                            75%                                             │
-│                                     │                                              │
-│                                     ▼                                              │
-│                              *** AGENT ***                                         │
-│                              *** HANDOFF ***                                       │
+│  STANDALONE AGENTS → SAME-TYPE HANDOFF                                              │
+│  ════════════════════════════════════════                                           │
+│  Guide (Haiku), Orchestrator (Haiku), Inspector-Standalone (Sonnet),               │
+│  Tester-Standalone (Sonnet)                                                         │
 │                                                                                     │
-│  Agent at 75% → new instance of THAT agent in same pipeline/session                │
-│  Pipeline/session persists, only the specific agent is replaced                    │
-│  Orchestrator hands off current workflow + state to new Orchestrator instance      │
-│  Guide hands off routing context + conversation state to new Guide instance        │
+│  • Own goroutine (long-lived, standalone)                                           │
+│  • GP detects degradation → handoff to new instance of SAME (AgentType, Model)     │
+│  • PreparedContext trimmed to OptimalPreparedSize (learned for this agent+model)   │
+│  • Old instance TERMINATES, new instance continues                                  │
+│                                                                                     │
+│  ───────────────────────────────────────────────────────────────────────────────    │
+│                                                                                     │
+│  PIPELINE AGENTS → SAME-TYPE HANDOFF (within pipeline)                              │
+│  ═════════════════════════════════════════════════════                              │
+│  Engineer (Opus), Designer (Sonnet), Inspector-Pipeline (Haiku),                   │
+│  Tester-Pipeline (Haiku)                                                            │
+│                                                                                     │
+│  • Execute sequentially within pipeline goroutine                                   │
+│  • GP detects degradation → handoff to new instance of SAME (AgentType, Model)     │
+│  • Pipeline continues with swapped agent reference                                  │
+│  • PreparedContext trimmed to OptimalPreparedSize (learned for this agent+model)   │
+│                                                                                     │
+│  ───────────────────────────────────────────────────────────────────────────────    │
+│                                                                                     │
+│  PREPARED CONTEXT: Maintained continuously during normal operation                  │
+│  HANDOFF LATENCY: ~1-2ms (pointer swap + trim)                                      │
+│  ALL PARAMETERS: Learned distributions with hierarchical Bayesian pooling           │
 │                                                                                     │
 │  All checkpoints → Archivalist (persistent storage)                                │
 │  All content → Universal Content Store (lossless retrieval)                        │
@@ -175,9 +203,8 @@ func GenerateContentID(content []byte) string {
 // core/context/content_store.go
 
 type UniversalContentStore struct {
-    bleveIndex   bleve.Index           // Full-text search
-    vectorDB     *vectorgraphdb.DB     // Semantic search
-    sqliteDB     *sql.DB               // Relational queries
+    bleveIndex   bleve.Index           // Full-text search (file-based: documents.bleve/)
+    vectorDB     *vectorgraphdb.DB     // Semantic search + content metadata (SQLite-based: vector.db)
 
     // Real-time indexing
     indexQueue   chan *ContentEntry
@@ -187,6 +214,12 @@ type UniversalContentStore struct {
     goroutineBudget  *concurrency.GoroutineBudget
     fileHandleBudget *resources.FileHandleBudget
 }
+
+// NOTE: VectorGraphDB uses SQLite internally (vector.db) for ALL storage:
+// - Vector embeddings and HNSW index for semantic search
+// - Graph edges for relationships
+// - Content entry metadata (extends existing node schema)
+// There is no separate content database - VectorGraphDB handles all relational queries.
 
 func NewUniversalContentStore(config *ContentStoreConfig) (*UniversalContentStore, error) {
     store := &UniversalContentStore{
@@ -208,8 +241,8 @@ func NewUniversalContentStore(config *ContentStoreConfig) (*UniversalContentStor
     // Initialize VectorDB connection
     store.vectorDB = config.VectorDB
 
-    // Initialize SQLite
-    store.sqliteDB = config.SQLiteDB
+    // VectorDB handles both semantic search and content metadata storage
+    // No separate content database needed - VectorGraphDB is SQLite-based
     if err := store.initSchema(); err != nil {
         return nil, fmt.Errorf("init schema: %w", err)
     }
@@ -242,8 +275,8 @@ func (s *UniversalContentStore) IndexContent(entry *ContentEntry) error {
         return fmt.Errorf("bleve index: %w", err)
     }
 
-    // Store in SQLite for relational queries
-    return s.storeInSQLite(entry)
+    // Store content metadata in VectorGraphDB (extends node schema)
+    return s.storeContentEntry(entry)
 }
 
 func (s *UniversalContentStore) indexWorker() {
@@ -295,7 +328,7 @@ func (s *UniversalContentStore) GetByIDs(ids []string) ([]*ContentEntry, error) 
     entries := make([]*ContentEntry, 0, len(ids))
 
     for _, id := range ids {
-        entry, err := s.getFromSQLite(id)
+        entry, err := s.getContentEntry(id)
         if err != nil {
             return nil, fmt.Errorf("get entry %s: %w", id, err)
         }
@@ -402,11 +435,11 @@ On terminal app start, with user permission, immediately scan and index the enti
 │     ▼                                                                              │
 │  4. Parallel scan begins                                                           │
 │     ┌─────────────────────────────────────────────────────────────────┐           │
-│     │  [Scanner] ──► [Parser] ──► [Indexer] ──► [VectorDB]           │           │
+│     │  [Scanner] ──► [Parser] ──► [Indexer] ──► [VectorGraphDB]      │           │
 │     │      │             │            │              │                │           │
 │     │      ▼             ▼            ▼              ▼                │           │
 │     │   Files        Symbols      Bleve         Embeddings           │           │
-│     │   found        extracted   indexed        generated            │           │
+│     │   found        extracted   indexed       (SQLite-based)        │           │
 │     └─────────────────────────────────────────────────────────────────┘           │
 │     │                                                                              │
 │     ▼                                                                              │
@@ -889,85 +922,98 @@ Different agents have different access patterns and need different eviction stra
 
 ### Eviction Interface
 
+**Note**: Eviction triggers are **not hardcoded percentages**. Each agent learns its own degradation curve via Gaussian Process observations (see HANDOFF.md). The `EvictionStrategy` interface below operates on learned parameters from `AgentHandoffProfile`.
+
 ```go
 // core/context/eviction.go
 
 type EvictionStrategy interface {
-    // Select entries for eviction to reduce context by targetReduction (0.0-1.0)
-    SelectForEviction(ctx *AgentContext, targetReduction float64) ([]*ContentEntry, error)
+    // Select entries for eviction based on GP-detected degradation
+    // targetTokens is learned per-agent from AgentHandoffProfile
+    SelectForEviction(ctx *AgentContext, targetTokens int) ([]*ContentEntry, error)
 }
 
+// AgentEvictionConfig uses learned parameters from AgentHandoffProfile
+// NO hardcoded thresholds - all values are distributions
 type AgentEvictionConfig struct {
-    AgentType        string
-    ThresholdPercent float64           // When to start eviction (e.g., 75%)
-    EvictionPercent  float64           // How much to evict (e.g., 25%)
-    Strategy         EvictionStrategy
-    PreserveRecent   int               // Always keep last N turns
-    PreserveTypes    []ContentType     // Never evict these types
+    AgentType     AgentType
+    Strategy      EvictionStrategy
+    PreserveTypes []ContentType  // Never evict these types
+    // All other parameters come from AgentHandoffProfile:
+    // - PreserveRecent → profile.GetEffectiveRecentTurnsNeeded(explore)
+    // - Trigger → GP-detected degradation via profile.QualityGP
+    // - EvictionAmount → calculated to return to learned OptimalPreparedSize
 }
 
-var EvictionConfigs = map[string]*AgentEvictionConfig{
-    "librarian": {
-        ThresholdPercent: 75,
-        EvictionPercent:  25,
-        Strategy:         &RecencyBasedEviction{},
-        PreserveRecent:   5,
-        PreserveTypes:    []ContentType{ContentTypeUserPrompt},
-    },
-    "archivalist": {
-        ThresholdPercent: 75,
-        EvictionPercent:  25,
-        Strategy:         &RecencyBasedEviction{},
-        PreserveRecent:   5,
-        PreserveTypes:    []ContentType{ContentTypeUserPrompt},
-    },
-    "academic": {
-        ThresholdPercent: 80,
-        EvictionPercent:  30,
-        Strategy:         &TopicClusterEviction{},
-        PreserveRecent:   3,
-        PreserveTypes:    []ContentType{ContentTypeResearchPaper},
-    },
-    "architect": {
-        ThresholdPercent: 85,
-        EvictionPercent:  25,
-        Strategy:         &TaskCompletionEviction{},
-        PreserveRecent:   5,
-        PreserveTypes:    []ContentType{ContentTypePlanWorkflow},
-    },
-    // NOTE: Guide, Orchestrator, Engineer, Designer, Inspector, and Tester
-    // use Agent Handoff instead of eviction - see HandoffManager
+// GetEvictionConfig returns config with learned parameters for knowledge agents
+// Only Librarian, Archivalist, Academic, and Architect use eviction
+// All other agents use same-type handoff (see HandoffController)
+func GetEvictionConfig(profile *AgentHandoffProfile) *AgentEvictionConfig {
+    if !profile.IsKnowledgeAgent() {
+        return nil // Non-knowledge agents use handoff, not eviction
+    }
+
+    switch profile.AgentType {
+    case AgentTypeLibrarian, AgentTypeArchivalist:
+        return &AgentEvictionConfig{
+            AgentType:     profile.AgentType,
+            Strategy:      &RecencyBasedEviction{profile: profile},
+            PreserveTypes: []ContentType{ContentTypeUserPrompt},
+        }
+    case AgentTypeAcademic:
+        return &AgentEvictionConfig{
+            AgentType:     profile.AgentType,
+            Strategy:      &TopicClusterEviction{profile: profile},
+            PreserveTypes: []ContentType{ContentTypeResearchPaper},
+        }
+    case AgentTypeArchitect:
+        return &AgentEvictionConfig{
+            AgentType:     profile.AgentType,
+            Strategy:      &TaskCompletionEviction{profile: profile},
+            PreserveTypes: []ContentType{ContentTypePlanWorkflow},
+        }
+    default:
+        return nil
+    }
 }
+
+// NOTE: Guide, Orchestrator, Engineer, Designer, Inspector, and Tester
+// use Same-Type Handoff instead of eviction - see HandoffController in HANDOFF.md
 ```
 
 ### Recency-Based Eviction
 
-Simple strategy: evict oldest content first.
+Simple strategy: evict oldest content first. Used by Librarian and Archivalist (1M context knowledge agents).
 
 ```go
 // core/context/eviction_recency.go
 
-type RecencyBasedEviction struct{}
+type RecencyBasedEviction struct {
+    profile *AgentHandoffProfile  // Provides learned parameters
+}
 
-func (e *RecencyBasedEviction) SelectForEviction(ctx *AgentContext, targetReduction float64) ([]*ContentEntry, error) {
+func (e *RecencyBasedEviction) SelectForEviction(ctx *AgentContext, targetTokens int) ([]*ContentEntry, error) {
     entries := ctx.GetEntriesByAge() // Oldest first, excluding preserved
+
+    // Get learned preserve-recent count via hierarchical blending
+    // explore=false for exploitation (use mean)
+    preserveRecent := e.profile.GetEffectiveRecentTurnsNeeded(false)
 
     var selected []*ContentEntry
     var tokensSelected int
-    targetTokens := int(float64(ctx.TotalTokens()) * targetReduction)
 
     for _, entry := range entries {
         if tokensSelected >= targetTokens {
             break
         }
 
-        // Skip preserved types
+        // Skip preserved types (configured per-agent)
         if ctx.IsPreservedType(entry.ContentType) {
             continue
         }
 
-        // Skip recent turns
-        if entry.TurnNumber > ctx.CurrentTurn()-ctx.PreserveRecent {
+        // Skip recent turns (learned per agent instance)
+        if entry.TurnNumber > ctx.CurrentTurn()-preserveRecent {
             continue
         }
 
@@ -981,13 +1027,14 @@ func (e *RecencyBasedEviction) SelectForEviction(ctx *AgentContext, targetReduct
 
 ### Topic Cluster Eviction
 
-For Academic: evict complete research topics together.
+For Academic: evict complete research topics together. Scoring weights are learned distributions.
 
 ```go
 // core/context/eviction_topic.go
 
 type TopicClusterEviction struct {
     embedder EmbeddingGenerator
+    profile  *AgentHandoffProfile  // Provides learned parameters
 }
 
 type TopicCluster struct {
@@ -999,13 +1046,16 @@ type TopicCluster struct {
     Coherence   float64 // How related are entries?
 }
 
-func (e *TopicClusterEviction) SelectForEviction(ctx *AgentContext, targetReduction float64) ([]*ContentEntry, error) {
+func (e *TopicClusterEviction) SelectForEviction(ctx *AgentContext, targetTokens int) ([]*ContentEntry, error) {
     entries := ctx.GetEntries()
 
-    // Cluster entries by topic using embeddings
-    clusters := e.clusterByTopic(entries)
+    // Get learned preserve-recent count
+    preserveRecent := e.profile.GetEffectiveRecentTurnsNeeded(false)
 
-    // Score clusters for eviction
+    // Cluster entries by topic using embeddings
+    clusters := e.clusterByTopic(entries, preserveRecent)
+
+    // Score clusters for eviction using learned weights
     for _, cluster := range clusters {
         cluster.IsComplete = e.isTopicComplete(cluster)
         cluster.AvgAge = e.calculateAvgAge(cluster.Entries)
@@ -1022,7 +1072,6 @@ func (e *TopicClusterEviction) SelectForEviction(ctx *AgentContext, targetReduct
     // Select clusters until we hit target
     var selected []*ContentEntry
     var tokensSelected int
-    targetTokens := int(float64(ctx.TotalTokens()) * targetReduction)
 
     for _, cluster := range clusters {
         if tokensSelected >= targetTokens {
@@ -1038,18 +1087,24 @@ func (e *TopicClusterEviction) SelectForEviction(ctx *AgentContext, targetReduct
 }
 
 func (e *TopicClusterEviction) evictionScore(c *TopicCluster) float64 {
+    // All scoring weights could be learned distributions
+    // For now, use reasonable defaults that could be promoted to LearnedWeight
+    completionWeight := 50.0
+    ageWeight := 10.0        // points per day
+    coherenceWeight := 20.0
+
     score := 0.0
 
     // Completed topics are safe to evict
     if c.IsComplete {
-        score += 50
+        score += completionWeight
     }
 
     // Older clusters preferred
-    score += c.AvgAge / (24 * float64(time.Hour)) * 10 // 10 points per day old
+    score += c.AvgAge / (24 * float64(time.Hour)) * ageWeight
 
     // Coherent clusters make better references
-    score += c.Coherence * 20
+    score += c.Coherence * coherenceWeight
 
     return score
 }
@@ -1081,14 +1136,16 @@ func (e *TopicClusterEviction) isTopicComplete(c *TopicCluster) bool {
 
 ### Task Completion Eviction
 
-For Architect: evict completed task discussions.
+For Architect: evict completed task discussions. Uses learned parameters from profile.
 
 ```go
 // core/context/eviction_task.go
 
-type TaskCompletionEviction struct{}
+type TaskCompletionEviction struct {
+    profile *AgentHandoffProfile  // Provides learned parameters
+}
 
-func (e *TaskCompletionEviction) SelectForEviction(ctx *AgentContext, targetReduction float64) ([]*ContentEntry, error) {
+func (e *TaskCompletionEviction) SelectForEviction(ctx *AgentContext, targetTokens int) ([]*ContentEntry, error) {
     entries := ctx.GetEntries()
 
     // Group entries by task (using metadata or heuristics)
@@ -1110,7 +1167,6 @@ func (e *TaskCompletionEviction) SelectForEviction(ctx *AgentContext, targetRedu
     // Select until target reached
     var selected []*ContentEntry
     var tokensSelected int
-    targetTokens := int(float64(ctx.TotalTokens()) * targetReduction)
 
     for _, task := range completedTasks {
         if tokensSelected >= targetTokens {
@@ -1120,11 +1176,11 @@ func (e *TaskCompletionEviction) SelectForEviction(ctx *AgentContext, targetRedu
         tokensSelected += task.TotalTokens
     }
 
-    // If not enough from completed tasks, fall back to recency
+    // If not enough from completed tasks, fall back to recency with learned params
     if tokensSelected < targetTokens {
-        recency := &RecencyBasedEviction{}
+        recency := &RecencyBasedEviction{profile: e.profile}
         remaining := targetTokens - tokensSelected
-        additional, _ := recency.SelectForEviction(ctx, float64(remaining)/float64(ctx.TotalTokens()))
+        additional, _ := recency.SelectForEviction(ctx, remaining)
         selected = append(selected, additional...)
     }
 
@@ -4001,11 +4057,11 @@ func (ctx *AgentContext) ReplaceWithReference(entries []*ContentEntry, ref *Cont
 │  │  Terminal   │──[User Permission]──► StartupIndexer ──► ContentStore             │
 │  │   Starts    │                            │                   │                  │
 │  └─────────────┘                            │                   ▼                  │
-│                                      ┌──────┴──────┐    ┌─────────────┐           │
-│                                      │ Parallel    │    │ Bleve Index │           │
-│                                      │ File Scan   │    │ Vector DB   │           │
-│                                      │ (all code)  │    │ SQLite      │           │
-│                                      └─────────────┘    └─────────────┘           │
+│                                      ┌──────┴──────┐    ┌──────────────────┐      │
+│                                      │ Parallel    │    │ Bleve (file-based)│      │
+│                                      │ File Scan   │    │ VectorGraphDB     │      │
+│                                      │ (all code)  │    │ (SQLite-based)    │      │
+│                                      └─────────────┘    └──────────────────┘      │
 │                                                                                     │
 │  RUNTIME                                                                           │
 │  ═══════                                                                           │
@@ -4051,11 +4107,14 @@ func (ctx *AgentContext) ReplaceWithReference(entries []*ContentEntry, ref *Cont
 │  │  │                                                                      │    │   │
 │  │  └─────────────────────────────────────────────────────────────────────┘    │   │
 │  │                                                                              │   │
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐            │   │
-│  │  │   BLEVE    │  │  VECTOR    │  │   SQLite   │  │    CMT     │            │   │
-│  │  │ Full-text  │  │  Semantic  │  │ Relational │  │  Manifest  │            │   │
-│  │  │  Search    │  │   Search   │  │  Queries   │  │            │            │   │
-│  │  └────────────┘  └────────────┘  └────────────┘  └────────────┘            │   │
+│  │  ┌────────────┐  ┌─────────────────────────┐  ┌────────────┐             │   │
+│  │  │   BLEVE    │  │   VECTORGRAPHDB         │  │    CMT     │             │   │
+│  │  │ (file dir) │  │   (SQLite: vector.db)   │  │  Manifest  │             │   │
+│  │  │            │  │                         │  │            │             │   │
+│  │  │ Full-text  │  │  • Embeddings (HNSW)    │  │            │             │   │
+│  │  │  Search    │  │  • Graph relationships  │  │            │             │   │
+│  │  │            │  │  • Content metadata     │  │            │             │   │
+│  │  └────────────┘  └─────────────────────────┘  └────────────┘             │   │
 │  │                                                                              │   │
 │  └─────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                     │
@@ -4112,12 +4171,16 @@ func (ctx *AgentContext) ReplaceWithReference(entries []*ContentEntry, ref *Cont
 
 ```
 ~/.sylk/projects/<project-hash>/
-├── vector.db              # SQLite - vector embeddings (existing VectorGraphDB)
-├── documents.bleve/       # Bleve full-text search index
-├── content.db             # SQLite - content entries and references
+├── vector.db              # VectorGraphDB (SQLite) - embeddings, graph, content metadata
+├── documents.bleve/       # Bleve full-text search index (file-based directory)
 ├── manifest.cmt           # Cartesian Merkle Tree manifest
 └── manifest.cmt.wal       # WAL for crash recovery
 ```
+
+**Storage Notes**:
+- **vector.db**: VectorGraphDB uses SQLite internally for ALL storage - embeddings, graph edges, HNSW index, AND content entry metadata. No separate content database exists.
+- **documents.bleve/**: Bleve index is file-based (not SQLite). Contains Scorch segments for full-text search.
+- VectorGraphDB's schema can be extended to store ContentEntry records alongside existing node types.
 
 ---
 
@@ -4128,3 +4191,1915 @@ func (ctx *AgentContext) ReplaceWithReference(entries []*ContentEntry, ref *Cont
 3. **Audit Trail** - All retrievals logged for debugging
 4. **Data Isolation** - Per-project storage, no cross-project leakage
 5. **User Consent** - Startup indexing requires explicit user permission
+
+---
+
+## Architecture Gap Analysis
+
+This section identifies issues with the current architecture and required changes for full integration with the Adaptive Retrieval System and WAVE 4 robustness systems.
+
+### 1. Critical Issues in Current Architecture
+
+#### 1.1 UniversalContentStore WAVE 4 Violations
+
+The current `UniversalContentStore` (lines 177-322) has several WAVE 4 violations:
+
+```go
+// PROBLEM 1: Raw channel (must use SafeChan)
+indexQueue   chan *ContentEntry  // ← VIOLATION
+
+// PROBLEM 2: Raw goroutines in worker pool (must use GoroutineScope.Go())
+for i := 0; i < store.workers; i++ {
+    go store.indexWorker()  // ← VIOLATION
+}
+
+// PROBLEM 3: No file handle tracking for Bleve/SQLite
+bleveIndex, err := bleve.Open(config.BlevePath)  // ← No FileHandleBudget
+```
+
+**REQUIRED CHANGES**:
+```go
+type UniversalContentStore struct {
+    bleveIndex   bleve.Index            // Full-text search (file-based: documents.bleve/)
+    vectorDB     *vectorgraphdb.DB      // Semantic search + content metadata (SQLite: vector.db)
+
+    // WAVE 4 REQUIRED:
+    indexQueue   *safechan.SafeChan[*ContentEntry]  // Context-aware channel
+    scope        *concurrency.GoroutineScope        // Managed goroutines
+    fileBudget   *resources.FileHandleBudget        // File handle tracking
+    handles      []resources.TrackedFileHandle      // Acquired handles
+}
+// NOTE: VectorGraphDB (vector.db) is SQLite-based and stores ALL data:
+// embeddings, graph relationships, AND content entry metadata.
+// No separate content database - extend VectorGraphDB's schema for content entries.
+```
+
+#### 1.2 Duplicate Functionality with VectorGraphDB
+
+The current architecture defines a **new** `UniversalContentStore` that duplicates existing `VectorGraphDB` functionality:
+
+| UniversalContentStore | VectorGraphDB Equivalent |
+|-----------------------|--------------------------|
+| `searchVector()` | `VectorSearcher.Search()` |
+| `searchBleve()` | N/A (Bleve integration needed) |
+| `fuseResults()` | `QueryEngine.HybridQuery()` |
+| `storeContent()` | `NodeStore.InsertNode()` (extend schema for content entries) |
+| Session tracking | `SessionScopedView` |
+
+**REQUIRED CHANGES**:
+- `UniversalContentStore` should **wrap** `VectorGraphDB`, not duplicate it
+- Add Bleve integration to `VectorGraphDB` rather than parallel implementation
+- Use existing `QueryEngine.HybridQuery()` with RRF fusion
+
+#### 1.3 StartupIndexer WAVE 4 Violations
+
+```go
+// PROBLEM: Raw goroutines in worker pool
+go func(f *FileInfo) {
+    defer wg.Done()  // ← Raw go, not tracked
+    ...
+}(file)
+```
+
+**REQUIRED**: Use `GoroutineBudget` with configurable limits for startup indexing.
+
+#### 1.4 AccessTracker Unbounded Growth
+
+```go
+type AccessTracker struct {
+    accessCounts map[string]int       // ← Unbounded, never cleaned
+    lastAccess   map[string]int       // ← Unbounded, never cleaned
+    accessLog    []AccessEvent        // ← Unbounded, grows forever
+}
+```
+
+**REQUIRED CHANGES**:
+- Implement sliding window or decay for `accessCounts`
+- LRU eviction for `lastAccess` map
+- Bounded ring buffer for `accessLog`
+- Register with `PressureController` for emergency eviction
+
+#### 1.5 Eviction Strategies Missing Pressure Response
+
+Current eviction strategies are triggered **only** by context threshold (75-85%). They should **also** respond to memory pressure.
+
+**REQUIRED**: Add `OnPressureChange()` callback to trigger proactive eviction at `PressureHigh`.
+
+#### 1.6 Handoff State Not Indexed for Retrieval
+
+Handoff states are stored in `ContentStore` but not properly indexed for semantic search. A new agent can't find relevant handoff history.
+
+**REQUIRED**: Add `ContentTypeAgentHandoff` with proper embedding generation.
+
+### 2. VectorGraphDB Changes Required
+
+#### 2.1 Add Bleve Integration
+
+The existing `VectorGraphDB` handles vector search but lacks full-text search. Rather than duplicating in `UniversalContentStore`, extend `VectorGraphDB`:
+
+```go
+// core/vectorgraphdb/bleve_integration.go
+
+type BleveIntegratedDB struct {
+    *VectorGraphDB
+    bleveIndex   bleve.Index
+    blevePath    string
+
+    // WAVE 4 integration
+    cbRegistry   *llm.GlobalCircuitBreakerRegistry
+    fileBudget   *resources.FileHandleBudget
+}
+
+func (db *BleveIntegratedDB) HybridSearch(
+    query string,
+    embedding []float32,
+    opts *HybridSearchOptions,
+) ([]HybridSearchResult, error) {
+    // Parallel search with circuit breakers
+    // RRF fusion of Bleve + HNSW results
+    // Respect latency budget
+}
+```
+
+#### 2.2 Extend HybridResult for Adaptive Retrieval
+
+```go
+// core/vectorgraphdb/query.go
+
+type HybridResult struct {
+    Node            *GraphNode
+    VectorScore     float64
+    GraphScore      float64
+    CombinedScore   float64
+    ConnectionCount int
+
+    // NEW: Adaptive retrieval fields
+    RetrievalCost   float64    // Compute cost for this result
+    BleveScore      float64    // Full-text score (NEW)
+    TierSource      SearchTier // Which tier found this (hot/warm/full)
+    AccessedAt      time.Time  // For cache prediction
+}
+```
+
+#### 2.3 Add Pressure-Aware Search Methods
+
+```go
+// core/vectorgraphdb/pressure_search.go
+
+type PressureAwareSearcher struct {
+    qe         *QueryEngine
+    pressure   *resources.PressureController
+    maxTier    atomic.Int32  // Reduced under pressure
+}
+
+func (s *PressureAwareSearcher) Search(ctx context.Context, query string, opts *SearchOptions) ([]HybridResult, error) {
+    maxTier := SearchTier(s.maxTier.Load())
+
+    switch maxTier {
+    case TierHotCache:
+        return s.searchHotOnly(ctx, query)
+    case TierWarmIndex:
+        return s.searchUpToWarm(ctx, query, opts)
+    case TierFullSearch:
+        return s.searchFull(ctx, query, opts)
+    }
+    return nil, nil
+}
+
+func (s *PressureAwareSearcher) OnPressureChange(level resources.PressureLevel) {
+    switch level {
+    case resources.PressureNormal:
+        s.maxTier.Store(int32(TierFullSearch))
+    case resources.PressureElevated:
+        s.maxTier.Store(int32(TierWarmIndex))
+    case resources.PressureHigh, resources.PressureCritical:
+        s.maxTier.Store(int32(TierHotCache))
+    }
+}
+```
+
+#### 2.4 Session Views Need Retrieval Budgets
+
+```go
+// core/vectorgraphdb/session_view.go
+
+type SessionScopedView struct {
+    // ... existing fields ...
+
+    // NEW: Retrieval budget tracking
+    retrievalBudget *RetrievalBudget
+}
+
+type RetrievalBudget struct {
+    MaxTokensPerQuery   int
+    MaxQueriesPerTurn   int
+    MaxTotalTokens      int
+    UsedTokens          atomic.Int64
+    UsedQueries         atomic.Int64
+}
+
+func (v *SessionScopedView) Search(query string, opts *SearchOptions) ([]HybridResult, error) {
+    if !v.retrievalBudget.CanQuery() {
+        return nil, ErrBudgetExhausted
+    }
+
+    results, err := v.searcher.Search(query, opts)
+    if err != nil {
+        return nil, err
+    }
+
+    // Track budget
+    totalTokens := 0
+    for _, r := range results {
+        totalTokens += r.Node.TokenCount
+    }
+    v.retrievalBudget.UsedTokens.Add(int64(totalTokens))
+    v.retrievalBudget.UsedQueries.Add(1)
+
+    return results, nil
+}
+```
+
+### 3. Agent Skills, Hooks, Tools, and Protocols
+
+Each agent needs specific capabilities to maximize the Adaptive Retrieval System.
+
+#### 3.1 Skills by Agent Type
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    AGENT RETRIEVAL SKILLS MATRIX                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  KNOWLEDGE AGENTS (use eviction + retrieval)                                        │
+│  ════════════════════════════════════════════                                       │
+│                                                                                     │
+│  LIBRARIAN:                                                                         │
+│  ├── retrieve_context(ref_id, query, max_tokens)  [CTX-REF expansion]              │
+│  ├── search_codebase(query, filters)              [Code-specific search]           │
+│  ├── get_symbol_context(symbol, depth)            [Symbol + related code]          │
+│  ├── search_history(query, session_id)            [Historical content]             │
+│  └── promote_to_hot(content_ids)                  [Mark content as frequently used]│
+│                                                                                     │
+│  ARCHIVALIST:                                                                       │
+│  ├── retrieve_context(ref_id, query, max_tokens)                                   │
+│  ├── search_history(query, session_id, category)  [Session history search]         │
+│  ├── get_chronicle_entries(timerange, category)   [Temporal retrieval]             │
+│  ├── search_decisions(query)                      [Decision history]               │
+│  └── get_cross_session_patterns()                 [Cross-session learning]         │
+│                                                                                     │
+│  ACADEMIC:                                                                          │
+│  ├── retrieve_context(ref_id, query, max_tokens)                                   │
+│  ├── search_research(query, source_types)         [Papers, RFCs, docs]             │
+│  ├── get_related_research(topic)                  [Semantic expansion]             │
+│  ├── validate_sources(content_ids)                [Trust verification]             │
+│  └── cite_sources(claim)                          [Find supporting sources]        │
+│                                                                                     │
+│  ARCHITECT:                                                                         │
+│  ├── retrieve_context(ref_id, query, max_tokens)                                   │
+│  ├── search_patterns(query)                       [Architecture patterns]          │
+│  ├── get_system_context(component)                [Related components]             │
+│  └── search_decisions(query)                      [Past architectural decisions]   │
+│                                                                                     │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                     │
+│  PIPELINE AGENTS (use handoff, limited retrieval)                                   │
+│  ═════════════════════════════════════════════════                                  │
+│                                                                                     │
+│  ENGINEER:                                                                          │
+│  ├── get_file_context(path, line_range)           [Focused file retrieval]         │
+│  ├── search_codebase(query, max_results=5)        [Limited code search]            │
+│  ├── get_recent_changes(path)                     [Recent modifications]           │
+│  └── consult_*() → routes to knowledge agents     [Delegate complex retrieval]     │
+│                                                                                     │
+│  INSPECTOR:                                                                         │
+│  ├── get_validation_context(issue_type)           [Past similar issues]            │
+│  ├── search_issues(query)                         [Historical issues]              │
+│  └── get_test_coverage(path)                      [Coverage context]               │
+│                                                                                     │
+│  TESTER:                                                                            │
+│  ├── get_test_patterns(function_signature)        [Similar test examples]          │
+│  ├── search_test_history(query)                   [Past test results]              │
+│  └── get_coverage_gaps()                          [Uncovered code]                 │
+│                                                                                     │
+│  DESIGNER:                                                                          │
+│  ├── get_component_patterns(component_type)       [UI pattern examples]            │
+│  ├── search_styles(query)                         [Style definitions]              │
+│  └── get_a11y_guidelines(component)               [Accessibility context]          │
+│                                                                                     │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                     │
+│  COORDINATION AGENTS (orchestration + routing)                                      │
+│  ═════════════════════════════════════════════                                      │
+│                                                                                     │
+│  ORCHESTRATOR:                                                                      │
+│  ├── get_workflow_context(workflow_id)            [Workflow state retrieval]       │
+│  ├── get_agent_history(agent_id)                  [Agent performance history]      │
+│  ├── search_similar_workflows(query)              [Past similar workflows]         │
+│  └── get_pending_context()                        [Context for pending tasks]      │
+│                                                                                     │
+│  GUIDE:                                                                             │
+│  ├── get_routing_history(query_pattern)           [Past routing decisions]         │
+│  ├── get_user_preferences()                       [Learned user preferences]       │
+│  ├── search_conversations(query)                  [Past conversations]             │
+│  └── get_agent_capabilities()                     [Agent registry + capabilities]  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.2 Hook Definitions
+
+```go
+// core/context/retrieval_hooks.go
+
+// PrePromptPrefetchHook - Inject prefetched content before LLM sees query
+type PrePromptPrefetchHook struct {
+    prefetcher *SpeculativePrefetcher
+    augmenter  *QueryAugmenter
+}
+
+func (h *PrePromptPrefetchHook) Phase() HookPhase { return HookPhasePrePrompt }
+func (h *PrePromptPrefetchHook) Priority() int    { return HookPriorityHigh }
+
+func (h *PrePromptPrefetchHook) Execute(ctx context.Context, data *HookData) (*HookResult, error) {
+    query := data.UserQuery
+    remainingTokens := data.RemainingContext
+
+    // Get speculative prefetch result (started earlier)
+    future := h.prefetcher.GetOrStart(query)
+    prefetch := future.GetIfReady(10 * time.Millisecond)
+
+    if prefetch == nil {
+        // Prefetch not ready - do quick synchronous augmentation
+        prefetch, _ = h.augmenter.Augment(ctx, query, remainingTokens)
+    }
+
+    if prefetch != nil && len(prefetch.Excerpts) > 0 {
+        data.InjectContext = prefetch.Render()
+    }
+
+    return &HookResult{Continue: true}, nil
+}
+
+// PostToolObservationHook - Record retrieval outcomes for adaptive learning
+type PostToolObservationHook struct {
+    observationLog *ObservationLog
+    tracker        *EpisodeTracker
+}
+
+func (h *PostToolObservationHook) Phase() HookPhase { return HookPhasePostToolCall }
+func (h *PostToolObservationHook) Priority() int    { return HookPriorityNormal }
+
+func (h *PostToolObservationHook) Execute(ctx context.Context, data *HookData) (*HookResult, error) {
+    if data.ToolName == "search" || data.ToolName == "retrieve_context" {
+        // Record that content was actively retrieved (not from prefetch)
+        h.tracker.RecordSearch(data.ToolInput, data.ToolOutput)
+    }
+
+    return &HookResult{Continue: true}, nil
+}
+
+// PostResponseCompletionHook - Finalize episode observation
+type PostResponseCompletionHook struct {
+    observationLog *ObservationLog
+    tracker        *EpisodeTracker
+    adaptive       *AdaptiveState
+}
+
+func (h *PostResponseCompletionHook) Phase() HookPhase { return HookPhasePostPrompt }
+func (h *PostResponseCompletionHook) Priority() int    { return HookPriorityLow }
+
+func (h *PostResponseCompletionHook) Execute(ctx context.Context, data *HookData) (*HookResult, error) {
+    // Build episode observation
+    obs := h.tracker.FinalizeEpisode(data.Response, data.ToolCalls)
+
+    // Record to WAL (async processing)
+    h.observationLog.Record(ctx, obs)
+
+    return &HookResult{Continue: true}, nil
+}
+
+// EvictionPressureHook - Trigger proactive eviction under memory pressure
+type EvictionPressureHook struct {
+    contextManager *VirtualContextManager
+    pressure       *resources.PressureController
+}
+
+func (h *EvictionPressureHook) Phase() HookPhase { return HookPhasePrePrompt }
+func (h *EvictionPressureHook) Priority() int    { return HookPriorityHigh + 10 } // Before prefetch
+
+func (h *EvictionPressureHook) Execute(ctx context.Context, data *HookData) (*HookResult, error) {
+    level := h.pressure.CurrentLevel()
+
+    if level >= resources.PressureHigh {
+        // Force eviction to free memory before processing
+        agentCtx := h.contextManager.GetAgentContext(data.AgentID)
+        if agentCtx.UsagePercent() > 50 {
+            h.contextManager.ForceEvict(agentCtx, 0.25) // Evict 25%
+        }
+    }
+
+    return &HookResult{Continue: true}, nil
+}
+```
+
+#### 3.3 Hook Registration by Agent
+
+```go
+// core/context/hook_registry.go
+
+func RegisterAgentHooks(agentType string, registry *HookRegistry, deps *HookDependencies) {
+    // Common hooks for all agents
+    registry.Register(agentType, &PostResponseCompletionHook{
+        observationLog: deps.ObservationLog,
+        tracker:        deps.EpisodeTracker,
+        adaptive:       deps.AdaptiveState,
+    })
+
+    registry.Register(agentType, &EvictionPressureHook{
+        contextManager: deps.ContextManager,
+        pressure:       deps.PressureController,
+    })
+
+    // Agent-specific hooks
+    switch agentType {
+    case "librarian", "archivalist", "academic", "architect":
+        // Knowledge agents get full prefetch
+        registry.Register(agentType, &PrePromptPrefetchHook{
+            prefetcher: deps.Prefetcher,
+            augmenter:  deps.Augmenter,
+        })
+        registry.Register(agentType, &PostToolObservationHook{
+            observationLog: deps.ObservationLog,
+            tracker:        deps.EpisodeTracker,
+        })
+
+    case "guide":
+        // Guide gets prefetch for routing decisions
+        registry.Register(agentType, &PrePromptPrefetchHook{
+            prefetcher: deps.Prefetcher,
+            augmenter:  deps.Augmenter,
+        })
+        registry.Register(agentType, &RoutingHistoryHook{
+            routingCache: deps.RoutingCache,
+        })
+
+    case "engineer", "designer", "inspector", "tester":
+        // Pipeline agents get limited prefetch (focused, not broad)
+        registry.Register(agentType, &FocusedPrefetchHook{
+            augmenter: deps.Augmenter,
+            maxTokens: 1000, // Much smaller budget
+        })
+
+    case "orchestrator":
+        // Orchestrator gets workflow-focused prefetch
+        registry.Register(agentType, &WorkflowContextHook{
+            workflowStore: deps.WorkflowStore,
+        })
+    }
+}
+```
+
+#### 3.4 Inter-Agent Context Protocols
+
+```go
+// core/context/agent_protocols.go
+
+// ContextShareRequest - Agent requests context from another agent
+type ContextShareRequest struct {
+    RequestingAgentID   string
+    RequestingAgentType string
+    TargetAgentType     string
+    Query               string
+    MaxTokens           int
+    Priority            ContextPriority
+    Filters             *ContextFilters
+}
+
+type ContextPriority int
+const (
+    ContextPriorityLow    ContextPriority = 0
+    ContextPriorityNormal ContextPriority = 1
+    ContextPriorityHigh   ContextPriority = 2
+    ContextPriorityCritical ContextPriority = 3
+)
+
+// ContextShareResponse - Shared context from knowledge agent
+type ContextShareResponse struct {
+    SourceAgentID   string
+    SourceAgentType string
+    Entries         []*ContentEntry
+    References      []*ContextReference
+    TokenCount      int
+    Truncated       bool
+    CacheHint       string  // "hot", "warm", "cold" - for recipient's cache
+}
+
+// Protocol: Engineer → Librarian consultation
+func (e *Engineer) ConsultLibrarian(query string) (*ConsultResponse, error) {
+    req := &ContextShareRequest{
+        RequestingAgentID:   e.ID(),
+        RequestingAgentType: "engineer",
+        TargetAgentType:     "librarian",
+        Query:               query,
+        MaxTokens:           2000,
+        Priority:            ContextPriorityNormal,
+        Filters: &ContextFilters{
+            ContentTypes: []ContentType{ContentTypeCodeFile},
+            Domains:      []Domain{DomainCode},
+        },
+    }
+
+    resp := e.router.RequestContext(req)
+
+    // Promote received content to engineer's hot cache
+    for _, entry := range resp.Entries {
+        e.hotCache.Add(entry.ID, entry)
+    }
+
+    return &ConsultResponse{
+        RelevantFiles: extractFiles(resp.Entries),
+        Suggestions:   extractSuggestions(resp.References),
+    }, nil
+}
+
+// Protocol: Guide → Any agent routing
+func (g *Guide) RouteWithContext(userQuery string, targetAgent string) error {
+    // 1. Get prefetched context relevant to query
+    prefetch := g.prefetcher.GetIfReady(userQuery)
+
+    // 2. Include relevant context in routing payload
+    routing := &ForwardedRequest{
+        UserQuery:     userQuery,
+        Classification: g.classify(userQuery),
+        PrefetchedContext: prefetch, // Share prefetch with target
+    }
+
+    // 3. Target agent receives prefetch, promotes to hot cache
+    return g.router.Forward(routing, targetAgent)
+}
+
+// Protocol: Orchestrator → Pipeline agents workflow context
+func (o *Orchestrator) DispatchWithContext(task *OrchestratorTask, pipeline *Pipeline) error {
+    // 1. Get workflow context
+    workflowCtx := o.workflowStore.GetContext(o.currentWorkflow.ID)
+
+    // 2. Get relevant historical context for this task type
+    historical := o.contextManager.SearchSimilarTasks(task.Description, 3)
+
+    // 3. Build dispatch context
+    dispatch := &TaskDispatch{
+        Task:              task,
+        WorkflowContext:   workflowCtx,
+        HistoricalContext: historical,
+        Dependencies:      o.resolveDependencies(task),
+    }
+
+    // 4. Pipeline agents receive full context
+    return pipeline.Execute(dispatch)
+}
+```
+
+#### 3.5 Complete Skill Definitions (Anthropic Tool Format)
+
+```go
+// core/context/retrieval_skills.go
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIVERSAL RETRIEVAL SKILLS (Knowledge Agents: Librarian, Archivalist, Academic, Architect)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var UniversalRetrievalSkills = []SkillDefinition{
+    {
+        Name:        "retrieve_context",
+        Description: "Retrieve full content for an evicted context reference. Use when you see [CTX-REF:...] markers and need the original content. Returns the complete content that was evicted.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "ref_id": {
+                    "type":        "string",
+                    "description": "Reference ID from CTX-REF marker (e.g., 'abc123' from [CTX-REF:conversation | ... | retrieve_context(ref_id=\"abc123\")])",
+                },
+                "query": {
+                    "type":        "string",
+                    "description": "Natural language query for semantic search if ref_id not available",
+                },
+                "max_tokens": {
+                    "type":        "integer",
+                    "description": "Maximum tokens to retrieve (default: 2000, max: 10000)",
+                    "default":     2000,
+                    "minimum":     100,
+                    "maximum":     10000,
+                },
+                "include_related": {
+                    "type":        "boolean",
+                    "description": "Include semantically related content beyond the exact reference",
+                    "default":     false,
+                },
+            },
+            "oneOf": []map[string]any{
+                {"required": []string{"ref_id"}},
+                {"required": []string{"query"}},
+            },
+        },
+        Handler: handleRetrieveContext,
+    },
+    {
+        Name:        "search_history",
+        Description: "Search all historical context across current and past sessions. Uses hybrid Bleve full-text + VectorDB semantic search with RRF fusion.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "query": {
+                    "type":        "string",
+                    "description": "Natural language search query",
+                },
+                "content_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"user_prompt", "agent_response", "tool_call", "tool_result", "code_file", "web_fetch", "research_paper", "agent_message", "plan_workflow", "test_result", "inspector_finding"},
+                    },
+                    "description": "Filter by content types",
+                },
+                "session_ids": {
+                    "type":        "array",
+                    "items":       {"type": "string"},
+                    "description": "Limit to specific sessions (empty = current session only)",
+                },
+                "cross_session": {
+                    "type":        "boolean",
+                    "description": "Search across ALL sessions (overrides session_ids)",
+                    "default":     false,
+                },
+                "time_range": {
+                    "type": "object",
+                    "properties": map[string]any{
+                        "start": {"type": "string", "format": "date-time"},
+                        "end":   {"type": "string", "format": "date-time"},
+                    },
+                    "description": "Filter by time range (ISO 8601 format)",
+                },
+                "max_results": {
+                    "type":        "integer",
+                    "description": "Maximum results to return",
+                    "default":     10,
+                    "minimum":     1,
+                    "maximum":     50,
+                },
+            },
+            "required": []string{"query"},
+        },
+        Handler: handleSearchHistory,
+    },
+    {
+        Name:        "promote_to_hot",
+        Description: "Mark content as frequently accessed to keep in hot cache. Use when you know content will be needed repeatedly.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "content_ids": {
+                    "type":        "array",
+                    "items":       {"type": "string"},
+                    "description": "Content IDs to promote to hot cache",
+                    "minItems":    1,
+                    "maxItems":    20,
+                },
+                "ttl_turns": {
+                    "type":        "integer",
+                    "description": "Number of turns to keep hot (default: 10)",
+                    "default":     10,
+                    "minimum":     1,
+                    "maximum":     50,
+                },
+            },
+            "required": []string{"content_ids"},
+        },
+        Handler: handlePromoteToHot,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIBRARIAN-SPECIFIC RETRIEVAL SKILLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var LibrarianRetrievalSkills = []SkillDefinition{
+    {
+        Name:        "librarian_search_codebase",
+        Description: "Search the indexed codebase using hybrid Bleve + VectorDB search. Returns code snippets with file paths and line numbers.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "query": {
+                    "type":        "string",
+                    "description": "Code search query (natural language or code pattern)",
+                },
+                "languages": {
+                    "type":  "array",
+                    "items": {"type": "string"},
+                    "description": "Filter by programming languages (e.g., ['go', 'typescript'])",
+                },
+                "path_pattern": {
+                    "type":        "string",
+                    "description": "Glob pattern for file paths (e.g., 'core/**/*.go')",
+                },
+                "symbol_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"function", "method", "struct", "interface", "type", "const", "var", "class", "all"},
+                    },
+                    "description": "Filter by symbol types",
+                },
+                "include_tests": {
+                    "type":        "boolean",
+                    "description": "Include test files in results",
+                    "default":     false,
+                },
+                "max_results": {
+                    "type":    "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+                "context_lines": {
+                    "type":        "integer",
+                    "description": "Lines of context around matches",
+                    "default":     3,
+                    "minimum":     0,
+                    "maximum":     20,
+                },
+            },
+            "required": []string{"query"},
+        },
+        Handler: handleLibrarianSearchCodebase,
+    },
+    {
+        Name:        "librarian_get_symbol_context",
+        Description: "Get a symbol and its full context including callers, callees, type definitions, and usage examples.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "symbol": {
+                    "type":        "string",
+                    "description": "Symbol name to look up (e.g., 'HandleRequest', 'UserService')",
+                },
+                "file": {
+                    "type":        "string",
+                    "description": "File path containing the symbol (helps disambiguate)",
+                },
+                "depth": {
+                    "type":        "integer",
+                    "description": "Levels of related symbols to include (1=direct, 2=transitive)",
+                    "default":     1,
+                    "minimum":     1,
+                    "maximum":     3,
+                },
+                "include": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"callers", "callees", "types", "implementations", "tests", "docs"},
+                    },
+                    "description": "What related context to include",
+                    "default":     []string{"callers", "callees", "types"},
+                },
+            },
+            "required": []string{"symbol"},
+        },
+        Handler: handleLibrarianGetSymbolContext,
+    },
+    {
+        Name:        "librarian_get_pattern_examples",
+        Description: "Get examples of a specific coding pattern from the codebase. Use to show how patterns are implemented in this project.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "pattern": {
+                    "type":        "string",
+                    "description": "Pattern name or description (e.g., 'error handling', 'dependency injection', 'repository pattern')",
+                },
+                "language": {
+                    "type":        "string",
+                    "description": "Programming language to search in",
+                },
+                "max_examples": {
+                    "type":    "integer",
+                    "default": 3,
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": []string{"pattern"},
+        },
+        Handler: handleLibrarianGetPatternExamples,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARCHIVALIST-SPECIFIC RETRIEVAL SKILLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var ArchivalistRetrievalSkills = []SkillDefinition{
+    {
+        Name:        "archivalist_search_decisions",
+        Description: "Search past decisions, their rationale, and outcomes. Critical for avoiding repeated mistakes.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "query": {
+                    "type":        "string",
+                    "description": "Search query for decisions",
+                },
+                "categories": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"architecture", "implementation", "tooling", "testing", "security", "performance", "ux", "all"},
+                    },
+                    "description": "Decision categories to search",
+                },
+                "outcome_filter": {
+                    "type": "string",
+                    "enum": []string{"successful", "failed", "pending", "all"},
+                    "description": "Filter by decision outcome",
+                    "default":     "all",
+                },
+                "time_range": {
+                    "type":        "string",
+                    "description": "Time range (e.g., '7d', '30d', '90d', 'all')",
+                    "default":     "all",
+                },
+                "cross_session": {
+                    "type":        "boolean",
+                    "description": "Include decisions from other sessions",
+                    "default":     true,
+                },
+            },
+            "required": []string{"query"},
+        },
+        Handler: handleArchivalistSearchDecisions,
+    },
+    {
+        Name:        "archivalist_get_failure_patterns",
+        Description: "Get failure patterns similar to current approach. CRITICAL: Call before attempting approaches that have failed before.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "approach_description": {
+                    "type":        "string",
+                    "description": "Description of the approach being considered",
+                },
+                "context": {
+                    "type":        "string",
+                    "description": "Current context (files, task, constraints)",
+                },
+                "similarity_threshold": {
+                    "type":        "number",
+                    "description": "Minimum similarity score (0.0-1.0) to consider a match",
+                    "default":     0.7,
+                    "minimum":     0.0,
+                    "maximum":     1.0,
+                },
+            },
+            "required": []string{"approach_description"},
+        },
+        Handler: handleArchivalistGetFailurePatterns,
+    },
+    {
+        Name:        "archivalist_get_cross_session_learnings",
+        Description: "Get learnings from other sessions that apply to current context. Surfaces patterns across the user's history.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "context_query": {
+                    "type":        "string",
+                    "description": "Current context to find relevant learnings for",
+                },
+                "learning_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"pattern", "failure", "decision", "insight", "all"},
+                    },
+                    "default": []string{"all"},
+                },
+                "min_recurrence": {
+                    "type":        "integer",
+                    "description": "Minimum times pattern must have occurred",
+                    "default":     2,
+                },
+            },
+            "required": []string{"context_query"},
+        },
+        Handler: handleArchivalistGetCrossSessionLearnings,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ACADEMIC-SPECIFIC RETRIEVAL SKILLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var AcademicRetrievalSkills = []SkillDefinition{
+    {
+        Name:        "academic_search_research",
+        Description: "Search indexed research papers, RFCs, documentation, and best practices. Results include applicability assessment.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "query": {
+                    "type":        "string",
+                    "description": "Research query",
+                },
+                "source_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"paper", "rfc", "documentation", "blog", "stackoverflow", "tutorial", "book", "all"},
+                    },
+                    "default": []string{"all"},
+                },
+                "min_trust_level": {
+                    "type": "string",
+                    "enum": []string{"verified", "high", "medium", "low"},
+                    "description": "Minimum trust level for sources",
+                    "default":     "medium",
+                },
+                "recency": {
+                    "type": "string",
+                    "enum": []string{"latest", "last_year", "last_3_years", "all"},
+                    "description": "How recent sources should be",
+                    "default":     "all",
+                },
+                "include_applicability": {
+                    "type":        "boolean",
+                    "description": "Include applicability analysis for current codebase",
+                    "default":     true,
+                },
+            },
+            "required": []string{"query"},
+        },
+        Handler: handleAcademicSearchResearch,
+    },
+    {
+        Name:        "academic_cite_sources",
+        Description: "Find sources that support or refute a technical claim. Use to validate recommendations.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "claim": {
+                    "type":        "string",
+                    "description": "Technical claim to find sources for",
+                },
+                "stance": {
+                    "type": "string",
+                    "enum": []string{"support", "refute", "both"},
+                    "description": "Whether to find supporting, refuting, or both types of sources",
+                    "default":     "both",
+                },
+                "min_sources": {
+                    "type":        "integer",
+                    "description": "Minimum number of sources to find",
+                    "default":     2,
+                    "minimum":     1,
+                    "maximum":     10,
+                },
+            },
+            "required": []string{"claim"},
+        },
+        Handler: handleAcademicCiteSources,
+    },
+    {
+        Name:        "academic_get_best_practices",
+        Description: "Get best practices for a specific technology or pattern, tailored to codebase maturity level.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "topic": {
+                    "type":        "string",
+                    "description": "Topic to get best practices for (e.g., 'error handling in Go', 'React state management')",
+                },
+                "codebase_maturity": {
+                    "type": "string",
+                    "enum": []string{"greenfield", "legacy", "transitional", "disciplined", "auto"},
+                    "description": "Codebase maturity level (auto = ask Librarian)",
+                    "default":     "auto",
+                },
+                "constraints": {
+                    "type":        "array",
+                    "items":       {"type": "string"},
+                    "description": "Constraints to consider (e.g., ['no external dependencies', 'must support Go 1.18'])",
+                },
+            },
+            "required": []string{"topic"},
+        },
+        Handler: handleAcademicGetBestPractices,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GUIDE-SPECIFIC RETRIEVAL SKILLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var GuideRetrievalSkills = []SkillDefinition{
+    {
+        Name:        "guide_get_routing_history",
+        Description: "Get past routing decisions for similar queries. Use to maintain consistency in routing.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "query_pattern": {
+                    "type":        "string",
+                    "description": "Current query or pattern to match against",
+                },
+                "include_outcomes": {
+                    "type":        "boolean",
+                    "description": "Include success/failure outcomes of past routings",
+                    "default":     true,
+                },
+                "limit": {
+                    "type":    "integer",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+            },
+            "required": []string{"query_pattern"},
+        },
+        Handler: handleGuideGetRoutingHistory,
+    },
+    {
+        Name:        "guide_get_user_preferences",
+        Description: "Get learned user preferences for routing and response style.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "preference_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"verbosity", "agent_affinity", "topic_routing", "response_style", "all"},
+                    },
+                    "default": []string{"all"},
+                },
+            },
+        },
+        Handler: handleGuideGetUserPreferences,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORCHESTRATOR-SPECIFIC RETRIEVAL SKILLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var OrchestratorRetrievalSkills = []SkillDefinition{
+    {
+        Name:        "orchestrator_get_workflow_context",
+        Description: "Get full context for a workflow including history and current state.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "workflow_id": {
+                    "type":        "string",
+                    "description": "Workflow ID (omit for current workflow)",
+                },
+                "include": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": []string{"history", "decisions", "blockers", "artifacts", "agent_states", "all"},
+                    },
+                    "default": []string{"all"},
+                },
+            },
+        },
+        Handler: handleOrchestratorGetWorkflowContext,
+    },
+    {
+        Name:        "orchestrator_search_similar_workflows",
+        Description: "Find past workflows similar to current task. Use to learn from previous approaches.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "description": {
+                    "type":        "string",
+                    "description": "Current task or workflow description",
+                },
+                "outcome_filter": {
+                    "type": "string",
+                    "enum": []string{"successful", "failed", "all"},
+                    "description": "Filter by workflow outcome",
+                    "default":     "successful",
+                },
+                "limit": {
+                    "type":    "integer",
+                    "default": 3,
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": []string{"description"},
+        },
+        Handler: handleOrchestratorSearchSimilarWorkflows,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PIPELINE AGENT RETRIEVAL SKILLS (Engineer, Designer, Inspector, Tester)
+// Limited retrieval - prefer consultation with knowledge agents
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var PipelineAgentRetrievalSkills = []SkillDefinition{
+    {
+        Name:        "get_file_context",
+        Description: "Get focused context for a specific file. Use for quick lookups; consult Librarian for broader searches.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "path": {
+                    "type":        "string",
+                    "description": "File path to get context for",
+                },
+                "start_line": {
+                    "type":        "integer",
+                    "description": "Start line (optional, defaults to beginning)",
+                },
+                "end_line": {
+                    "type":        "integer",
+                    "description": "End line (optional, defaults to end)",
+                },
+                "include_imports": {
+                    "type":        "boolean",
+                    "description": "Include imported/required files",
+                    "default":     false,
+                },
+                "include_symbols": {
+                    "type":        "boolean",
+                    "description": "Include symbol definitions in file",
+                    "default":     true,
+                },
+            },
+            "required": []string{"path"},
+        },
+        Handler: handleGetFileContext,
+    },
+    {
+        Name:        "get_recent_changes",
+        Description: "Get recent changes to a file or directory. Useful for understanding current state.",
+        InputSchema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "path": {
+                    "type":        "string",
+                    "description": "File or directory path",
+                },
+                "limit": {
+                    "type":        "integer",
+                    "description": "Number of recent changes",
+                    "default":     5,
+                    "minimum":     1,
+                    "maximum":     20,
+                },
+                "include_diffs": {
+                    "type":        "boolean",
+                    "description": "Include actual diff content",
+                    "default":     false,
+                },
+            },
+            "required": []string{"path"},
+        },
+        Handler: handleGetRecentChanges,
+    },
+}
+```
+
+#### 3.6 Complete Hook Definitions
+
+```go
+// core/context/retrieval_hooks.go
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HOOK DATA STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type PromptHookData struct {
+    // Input
+    AgentID       string
+    AgentType     string
+    SessionID     string
+    UserQuery     string
+    SystemPrompt  string
+    Messages      []Message
+    RemainingContext int  // Remaining tokens in context window
+
+    // Modifiable by hooks
+    InjectContext string   // Context to inject before user query
+    SkipLLM       bool     // Skip LLM call (use cached result)
+    CachedResult  any      // Cached result if SkipLLM=true
+
+    // Metadata
+    TurnNumber    int
+    Timestamp     time.Time
+}
+
+type ToolCallHookData struct {
+    // Input
+    AgentID     string
+    AgentType   string
+    SessionID   string
+    ToolName    string
+    ToolInput   map[string]any
+    TurnNumber  int
+
+    // Output (set by tool execution)
+    ToolOutput  any
+    ToolError   error
+    Duration    time.Duration
+
+    // Modifiable
+    SkipExecution bool  // Skip actual tool execution
+    ModifiedInput map[string]any  // Modified parameters
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRE-PROMPT HOOKS: Execute before LLM call
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Hook: Speculative Prefetch Injection
+// Priority: HookPriorityFirst (0) - runs before all other hooks
+// Agents: librarian, archivalist, academic, architect, guide
+var SpeculativePrefetchHook = Hook{
+    Name:     "speculative_prefetch_injection",
+    Type:     PrePrompt,
+    Priority: HookPriorityFirst,
+    Agents:   []string{"librarian", "archivalist", "academic", "architect", "guide"},
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        prefetcher := ctx.Value(prefetcherKey).(*SpeculativePrefetcher)
+        augmenter := ctx.Value(augmenterKey).(*QueryAugmenter)
+
+        // Check if speculative prefetch was started earlier
+        future := prefetcher.GetInflight(data.UserQuery)
+        var prefetch *AugmentedQuery
+
+        if future != nil {
+            // Speculative prefetch was started - get result with short timeout
+            prefetch = future.GetIfReady(10 * time.Millisecond)
+        }
+
+        if prefetch == nil {
+            // No speculative prefetch available - do quick synchronous augmentation
+            prefetch, _ = augmenter.Augment(ctx, data.UserQuery, data.RemainingContext)
+        }
+
+        if prefetch != nil && (len(prefetch.Excerpts) > 0 || len(prefetch.Summaries) > 0) {
+            // Inject prefetched context before user query
+            data.InjectContext = prefetch.Render()
+        }
+
+        return data, nil
+    },
+}
+
+// Hook: Episode Tracker Initialization
+// Priority: HookPriorityEarly (25)
+// Agents: ALL (tracks observations for adaptive learning)
+var EpisodeTrackerInitHook = Hook{
+    Name:     "episode_tracker_init",
+    Type:     PrePrompt,
+    Priority: HookPriorityEarly,
+    Agents:   []string{"*"}, // All agents
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        tracker := ctx.Value(episodeTrackerKey).(*EpisodeTracker)
+        adaptive := ctx.Value(adaptiveStateKey).(*AdaptiveState)
+
+        // Start new episode observation
+        episode := tracker.StartEpisode(data.AgentID, data.AgentType, data.TurnNumber)
+
+        // Sample weights for this episode (Thompson sampling)
+        queryEmbedding := ctx.Value(queryEmbeddingKey).([]float32)
+        taskContext := adaptive.ContextDiscovery.ClassifyQuery(data.UserQuery, queryEmbedding)
+        episode.TaskContext = taskContext
+        episode.QueryEmbedding = queryEmbedding
+        episode.SampledWeights = adaptive.SampleWeights(taskContext)
+        episode.SampledThresholds = adaptive.SampleThresholds()
+
+        return data, nil
+    },
+}
+
+// Hook: Pressure-Driven Preemptive Eviction
+// Priority: HookPriorityFirst (0) - before prefetch
+// Agents: Knowledge agents only
+var PressureEvictionHook = Hook{
+    Name:     "pressure_preemptive_eviction",
+    Type:     PrePrompt,
+    Priority: HookPriorityFirst,
+    Agents:   []string{"librarian", "archivalist", "academic", "architect"},
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        pressure := ctx.Value(pressureControllerKey).(*resources.PressureController)
+        contextMgr := ctx.Value(contextManagerKey).(*VirtualContextManager)
+
+        level := pressure.CurrentLevel()
+        if level >= resources.PressureHigh {
+            // Force eviction to free memory before processing
+            agentCtx := contextMgr.GetAgentContext(data.AgentID)
+            if agentCtx != nil && agentCtx.UsagePercent() > 50 {
+                evictPercent := 0.25 // 25% eviction
+                if level == resources.PressureCritical {
+                    evictPercent = 0.50 // 50% eviction at critical
+                }
+                contextMgr.ForceEvict(agentCtx, evictPercent)
+            }
+        }
+
+        return data, nil
+    },
+}
+
+// Hook: Failure Pattern Warning Injection
+// Priority: HookPriorityNormal (50)
+// Agents: engineer, designer, architect
+var FailurePatternWarningHook = Hook{
+    Name:     "failure_pattern_warning",
+    Type:     PrePrompt,
+    Priority: HookPriorityNormal,
+    Agents:   []string{"engineer", "designer", "architect"},
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        archivalist := ctx.Value(archivalistClientKey).(*ArchivalistClient)
+
+        // Check for similar failure patterns
+        failures, err := archivalist.GetFailurePatterns(ctx, data.UserQuery, 0.7)
+        if err != nil || len(failures) == 0 {
+            return data, nil
+        }
+
+        // Inject warning into context
+        var warning strings.Builder
+        warning.WriteString("\n\n[FAILURE_PATTERN_WARNING]\n")
+        warning.WriteString("Similar approaches have failed before:\n")
+        for _, f := range failures {
+            warning.WriteString(fmt.Sprintf("- %s (recurrence: %d): %s\n", f.Approach, f.RecurrenceCount, f.Reason))
+            if f.Resolution != "" {
+                warning.WriteString(fmt.Sprintf("  Resolution: %s\n", f.Resolution))
+            }
+        }
+        warning.WriteString("[/FAILURE_PATTERN_WARNING]\n")
+
+        data.SystemPrompt = appendSection(data.SystemPrompt, "FAILURE_WARNING", warning.String())
+        return data, nil
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POST-PROMPT HOOKS: Execute after LLM response
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Hook: Episode Observation Recording
+// Priority: HookPriorityLate (75)
+// Agents: ALL
+var EpisodeObservationHook = Hook{
+    Name:     "episode_observation_recording",
+    Type:     PostPrompt,
+    Priority: HookPriorityLate,
+    Agents:   []string{"*"},
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        tracker := ctx.Value(episodeTrackerKey).(*EpisodeTracker)
+        observationLog := ctx.Value(observationLogKey).(*ObservationLog)
+
+        // Finalize episode with response data
+        episode := tracker.FinalizeEpisode(data.Response, data.ToolCalls)
+
+        // Infer behavioral signals
+        episode.TaskCompleted = inferTaskCompletion(data.Response)
+        episode.HedgingDetected = detectHedging(data.Response)
+        episode.ToolCallCount = len(data.ToolCalls)
+
+        // Record to WAL (async processing)
+        observationLog.Record(ctx, episode)
+
+        return data, nil
+    },
+}
+
+// Hook: Access Tracking Update
+// Priority: HookPriorityNormal (50)
+// Agents: ALL
+var AccessTrackingHook = Hook{
+    Name:     "access_tracking_update",
+    Type:     PostPrompt,
+    Priority: HookPriorityNormal,
+    Agents:   []string{"*"},
+    Handler: func(ctx context.Context, data *PromptHookData) (*PromptHookData, error) {
+        tracker := ctx.Value(accessTrackerKey).(*AccessTracker)
+
+        // Extract content IDs referenced in response
+        contentIDs := extractContentReferences(data.Response)
+
+        for _, id := range contentIDs {
+            tracker.RecordAccess(id, data.TurnNumber, "in_response")
+        }
+
+        return data, nil
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POST-TOOL HOOKS: Execute after tool calls
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Hook: Search Tool Observation
+// Priority: HookPriorityNormal (50)
+// Agents: ALL
+var SearchToolObservationHook = Hook{
+    Name:     "search_tool_observation",
+    Type:     PostTool,
+    Priority: HookPriorityNormal,
+    Agents:   []string{"*"},
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        tracker := ctx.Value(episodeTrackerKey).(*EpisodeTracker)
+
+        // Track searches performed after prefetch
+        searchTools := []string{
+            "retrieve_context", "search_history", "librarian_search_codebase",
+            "academic_search_research", "archivalist_search_decisions",
+        }
+
+        for _, tool := range searchTools {
+            if data.ToolName == tool {
+                // This search was NOT from prefetch - LLM had to search
+                query := data.ToolInput["query"].(string)
+                tracker.RecordSearchAfterPrefetch(query)
+                break
+            }
+        }
+
+        return data, nil
+    },
+}
+
+// Hook: Retrieved Content Promotion
+// Priority: HookPriorityLate (75)
+// Agents: ALL
+var ContentPromotionHook = Hook{
+    Name:     "retrieved_content_promotion",
+    Type:     PostTool,
+    Priority: HookPriorityLate,
+    Agents:   []string{"*"},
+    Handler: func(ctx context.Context, data *ToolCallHookData) (*ToolCallHookData, error) {
+        accessTracker := ctx.Value(accessTrackerKey).(*AccessTracker)
+        hotCache := ctx.Value(hotCacheKey).(*HotCache)
+
+        // Promote retrieved content to hot cache
+        if results, ok := data.ToolOutput.(*RetrievalResult); ok {
+            for _, entry := range results.Entries {
+                accessTracker.RecordAccess(entry.ID, data.TurnNumber, "tool_retrieved")
+                hotCache.Add(entry.ID, entry)
+            }
+        }
+
+        return data, nil
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HOOK REGISTRATION BY AGENT TYPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func RegisterAdaptiveRetrievalHooks(registry *HookRegistry, deps *HookDependencies) {
+    // Universal hooks (all agents)
+    registry.RegisterGlobal(EpisodeTrackerInitHook)
+    registry.RegisterGlobal(EpisodeObservationHook)
+    registry.RegisterGlobal(AccessTrackingHook)
+    registry.RegisterGlobal(SearchToolObservationHook)
+    registry.RegisterGlobal(ContentPromotionHook)
+
+    // Knowledge agent hooks
+    knowledgeAgents := []string{"librarian", "archivalist", "academic", "architect"}
+    for _, agent := range knowledgeAgents {
+        registry.Register(agent, SpeculativePrefetchHook)
+        registry.Register(agent, PressureEvictionHook)
+    }
+
+    // Guide hooks
+    registry.Register("guide", SpeculativePrefetchHook)
+    registry.Register("guide", GuideRoutingCacheHook)
+
+    // Pipeline agent hooks
+    pipelineAgents := []string{"engineer", "designer", "inspector", "tester"}
+    for _, agent := range pipelineAgents {
+        registry.Register(agent, FailurePatternWarningHook)
+        registry.Register(agent, FocusedPrefetchHook) // Limited prefetch
+    }
+
+    // Orchestrator hooks
+    registry.Register("orchestrator", WorkflowContextHook)
+}
+```
+
+#### 3.7 System Prompt Additions
+
+Each agent requires system prompt additions to leverage the Adaptive Retrieval System:
+
+```go
+// core/context/system_prompt_additions.go
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIBRARIAN SYSTEM PROMPT ADDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const LibrarianRetrievalPromptAddition = `
+## ADAPTIVE RETRIEVAL INTEGRATION
+
+You have access to an adaptive retrieval system that learns from your behavior. The system
+automatically prefetches relevant code before you see queries.
+
+### Context Reference Markers
+When you see [CTX-REF:...] markers, these represent evicted context. Example:
+[CTX-REF:code_analysis | 15 turns (4,200 tokens) @ 14:23 | Topics: auth flow, JWT | retrieve_context(ref_id="abc123")]
+
+To retrieve the full content: call retrieve_context(ref_id="abc123")
+
+### Auto-Retrieved Content
+Content marked [AUTO-RETRIEVED: file:lines | confidence: X.XX] was automatically fetched
+based on the query. This content is highly relevant - use it directly.
+
+Content marked [RELATED: file - description, N lines] indicates potentially relevant files.
+Only retrieve if the auto-retrieved content is insufficient.
+
+### Search Priority
+1. Use prefetched [AUTO-RETRIEVED] content first
+2. Use librarian_search_codebase for additional code searches
+3. Use librarian_get_symbol_context for deep symbol exploration
+4. Use search_history for historical context
+
+### Hot Cache Promotion
+When you repeatedly access the same files, call promote_to_hot(content_ids) to keep them
+readily available. The system tracks access patterns and optimizes automatically.
+`
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARCHIVALIST SYSTEM PROMPT ADDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const ArchivalistRetrievalPromptAddition = `
+## ADAPTIVE RETRIEVAL INTEGRATION
+
+### Failure Pattern Memory
+Before storing new failures, the system automatically checks for similar past failures.
+You will see [FAILURE_PATTERN_WARNING] blocks when similar approaches have failed before.
+
+CRITICAL: When you see recurrence_count >= 2, this is a RECURRING failure. You MUST:
+1. Surface this warning to the requesting agent
+2. Include the resolution if one exists
+3. Track if the same approach is attempted anyway
+
+### Cross-Session Learning
+Use archivalist_get_cross_session_learnings to surface patterns across the user's history.
+This is especially valuable for:
+- Recurring mistakes (same error in different contexts)
+- Successful patterns (approaches that worked before)
+- User preferences (how they like things done)
+
+### Decision Search
+Use archivalist_search_decisions with outcome_filter to find:
+- "successful": Decisions that worked well
+- "failed": Decisions that caused problems
+- "all": Both (for comprehensive analysis)
+
+### Context Reference Markers
+When you see [CTX-REF:...] markers in your context, retrieve the full content using
+retrieve_context(ref_id="...") before responding to queries about that content.
+`
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ACADEMIC SYSTEM PROMPT ADDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const AcademicRetrievalPromptAddition = `
+## ADAPTIVE RETRIEVAL INTEGRATION
+
+### Research Search
+Use academic_search_research with appropriate filters:
+- source_types: Filter by paper, rfc, documentation, etc.
+- min_trust_level: Prefer "verified" or "high" for critical recommendations
+- recency: Use "latest" for rapidly-evolving topics
+
+### Applicability Analysis
+When include_applicability=true, results include:
+- DIRECT: Can be applied as-is to this codebase
+- ADAPTABLE: Requires modifications for this codebase
+- INCOMPATIBLE: Not suitable for this codebase
+
+ALWAYS check applicability before recommending. Consult Librarian for codebase context.
+
+### Source Citation
+Use academic_cite_sources to validate claims before presenting them:
+- Find at least 2 sources supporting critical claims
+- Note any refuting sources
+- Include trust levels in your response
+
+### Best Practices Lookup
+Use academic_get_best_practices with codebase_maturity:
+- "auto": System asks Librarian for maturity assessment
+- "greenfield": New project, flexible
+- "legacy": Established patterns, careful changes
+- "transitional": Moving between styles
+- "disciplined": Strict standards
+`
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GUIDE SYSTEM PROMPT ADDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const GuideRetrievalPromptAddition = `
+## ADAPTIVE RETRIEVAL INTEGRATION
+
+### Prefetch Sharing
+When routing queries to other agents, prefetched context is automatically shared.
+The target agent receives [AUTO-RETRIEVED] content without additional latency.
+
+### Routing History
+Use guide_get_routing_history to maintain consistency:
+- Check how similar queries were routed before
+- Note which routings were successful vs failed
+- Learn from routing mistakes
+
+### User Preferences
+The system learns user preferences automatically. Use guide_get_user_preferences to:
+- Check preferred verbosity level
+- See agent affinities (which agents for which topics)
+- Understand response style preferences
+
+### Context References
+When forwarding queries that contain [CTX-REF:...] markers, the full content
+will be automatically retrieved and included in the forwarded context.
+`
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENGINEER SYSTEM PROMPT ADDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const EngineerRetrievalPromptAddition = `
+## ADAPTIVE RETRIEVAL INTEGRATION
+
+### Limited Direct Retrieval
+As a pipeline agent, you have LIMITED retrieval capabilities:
+- get_file_context: Quick file lookups
+- get_recent_changes: Recent modifications
+
+For broader searches, consult knowledge agents:
+- consult_librarian: Codebase patterns, file locations, symbols
+- consult_archivalist: Past decisions, failure patterns
+- consult_academic: Best practices, research
+
+### Failure Pattern Warnings
+When you see [FAILURE_PATTERN_WARNING] blocks, STOP and:
+1. Read the warning carefully
+2. If recurrence_count >= 2, this approach has failed REPEATEDLY
+3. Consider the suggested resolution
+4. If you proceed with the same approach anyway, document why
+
+### Auto-Retrieved Context
+You may see [AUTO-RETRIEVED] content injected by the system. This is
+highly relevant to your current task - use it directly.
+`
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORCHESTRATOR SYSTEM PROMPT ADDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const OrchestratorRetrievalPromptAddition = `
+## ADAPTIVE RETRIEVAL INTEGRATION
+
+### Workflow Context
+Use orchestrator_get_workflow_context to retrieve:
+- Current workflow state and progress
+- Past decisions and blockers
+- Agent states and artifacts
+
+### Similar Workflow Learning
+Use orchestrator_search_similar_workflows BEFORE starting new workflows:
+- Find past workflows with similar goals
+- Learn from successful approaches
+- Avoid approaches that failed
+
+### Context Handoff
+When performing Orchestrator handoff at 75% context:
+- Workflow context is automatically preserved
+- Agent states are captured and transferred
+- New Orchestrator receives full context via handoff state
+`
+```
+
+#### 3.8 Inter-Agent Context Protocols
+
+```go
+// core/context/protocols.go
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTEXT SHARE PROTOCOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ContextShareRequest represents a request from one agent to share context
+type ContextShareRequest struct {
+    // Request metadata
+    RequestID           string    `json:"request_id"`
+    RequestingAgentID   string    `json:"requesting_agent_id"`
+    RequestingAgentType string    `json:"requesting_agent_type"`
+    TargetAgentType     string    `json:"target_agent_type"`
+    Timestamp           time.Time `json:"timestamp"`
+
+    // Query specification
+    Query               string            `json:"query"`
+    MaxTokens           int               `json:"max_tokens"`
+    Priority            ContextPriority   `json:"priority"`
+
+    // Filters
+    ContentTypes        []ContentType     `json:"content_types,omitempty"`
+    Domains             []Domain          `json:"domains,omitempty"`
+    TimeRange           *TimeRange        `json:"time_range,omitempty"`
+    SessionScope        string            `json:"session_scope"` // "current", "cross_session", "specific"
+    SessionIDs          []string          `json:"session_ids,omitempty"`
+
+    // Response preferences
+    IncludeReferences   bool              `json:"include_references"`
+    IncludeMetadata     bool              `json:"include_metadata"`
+}
+
+type ContextPriority int
+const (
+    ContextPriorityLow      ContextPriority = 0  // Background, can wait
+    ContextPriorityNormal   ContextPriority = 1  // Standard request
+    ContextPriorityHigh     ContextPriority = 2  // Time-sensitive
+    ContextPriorityCritical ContextPriority = 3  // Blocking operation
+)
+
+// ContextShareResponse represents shared context from a knowledge agent
+type ContextShareResponse struct {
+    // Response metadata
+    RequestID       string    `json:"request_id"`
+    SourceAgentID   string    `json:"source_agent_id"`
+    SourceAgentType string    `json:"source_agent_type"`
+    Timestamp       time.Time `json:"timestamp"`
+    Duration        time.Duration `json:"duration"`
+
+    // Content
+    Entries         []*ContentEntry     `json:"entries"`
+    References      []*ContextReference `json:"references,omitempty"`
+    TotalTokens     int                 `json:"total_tokens"`
+    Truncated       bool                `json:"truncated"`
+
+    // Cache hints for recipient
+    CacheHint       string              `json:"cache_hint"` // "hot", "warm", "cold"
+    SuggestedTTL    time.Duration       `json:"suggested_ttl"`
+
+    // Quality indicators
+    Confidence      float64             `json:"confidence"`
+    Completeness    float64             `json:"completeness"` // 0-1, how complete the response is
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSULTATION PROTOCOL (Agent-to-Agent via Guide bypass)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type ConsultationRequest struct {
+    // Routing
+    SourceAgent     string    `json:"source_agent"`
+    TargetAgent     string    `json:"target_agent"`
+    CorrelationID   string    `json:"correlation_id"`
+
+    // Query
+    Question        string    `json:"question"`
+    Intent          string    `json:"intent"` // e.g., "pattern_lookup", "failure_check", "research"
+    Context         string    `json:"context"`
+
+    // Constraints
+    MaxTokens       int       `json:"max_tokens"`
+    Timeout         time.Duration `json:"timeout"`
+    Priority        ContextPriority `json:"priority"`
+
+    // Adaptive retrieval hints
+    IncludePrefetch bool      `json:"include_prefetch"` // Share prefetched content
+    ShareHotCache   bool      `json:"share_hot_cache"`  // Share hot cache state
+}
+
+type ConsultationResponse struct {
+    // Metadata
+    CorrelationID   string    `json:"correlation_id"`
+    RespondingAgent string    `json:"responding_agent"`
+    Duration        time.Duration `json:"duration"`
+
+    // Response content
+    Answer          string    `json:"answer"`
+    Confidence      float64   `json:"confidence"`
+    Sources         []string  `json:"sources"` // Content IDs used
+
+    // Shared context
+    RelevantContent []*ContentEntry `json:"relevant_content,omitempty"`
+    SharedPrefetch  *AugmentedQuery `json:"shared_prefetch,omitempty"`
+
+    // Follow-up suggestions
+    SuggestedActions []string `json:"suggested_actions,omitempty"`
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREFETCH SHARING PROTOCOL (Guide → Target Agent)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type PrefetchSharePayload struct {
+    // Source
+    OriginatingQuery string          `json:"originating_query"`
+    SourceAgent      string          `json:"source_agent"`
+
+    // Prefetched content
+    Excerpts         []Excerpt       `json:"excerpts"`
+    Summaries        []Summary       `json:"summaries"`
+    TotalTokens      int             `json:"total_tokens"`
+
+    // Adaptive metadata
+    SampledWeights   RewardWeights   `json:"sampled_weights"`
+    TaskContext      TaskContext     `json:"task_context"`
+    Confidence       float64         `json:"confidence"`
+
+    // Cache state
+    HotContentIDs    []string        `json:"hot_content_ids"`
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HANDOFF CONTEXT PROTOCOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type HandoffContextPayload struct {
+    // Handoff metadata
+    HandoffType     string    `json:"handoff_type"` // "agent", "orchestrator", "guide"
+    HandoffIndex    int       `json:"handoff_index"`
+    HandoffReason   string    `json:"handoff_reason"`
+
+    // Adaptive state snapshot
+    AdaptiveStateSnapshot struct {
+        WeightsMean     RewardWeights   `json:"weights_mean"`
+        ThresholdsMean  ThresholdConfig `json:"thresholds_mean"`
+        TotalObservations int64         `json:"total_observations"`
+        DiscoveredContexts []TaskContext `json:"discovered_contexts"`
+    } `json:"adaptive_state_snapshot"`
+
+    // Hot cache state
+    HotContentIDs   []string  `json:"hot_content_ids"`
+    HotContentTTLs  map[string]int `json:"hot_content_ttls"` // ID → remaining turns
+
+    // Episode in progress
+    CurrentEpisode  *EpisodeObservation `json:"current_episode,omitempty"`
+}
+```
+
+### 4. Required Architecture Updates Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    REQUIRED ARCHITECTURE UPDATES                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  1. UNIFY STORAGE LAYER                                                             │
+│  ════════════════════════                                                           │
+│  • UniversalContentStore wraps VectorGraphDB (not parallel implementation)          │
+│  • Add Bleve integration to VectorGraphDB                                           │
+│  • Single source of truth for all content                                           │
+│                                                                                     │
+│  2. WAVE 4 COMPLIANCE                                                               │
+│  ═════════════════════                                                              │
+│  • Replace raw channels with SafeChan                                               │
+│  • Replace raw go with GoroutineScope.Go()                                          │
+│  • Track file handles through FileHandleBudget                                      │
+│  • Use GlobalCircuitBreakerRegistry                                                 │
+│  • Register caches with PressureController                                          │
+│                                                                                     │
+│  3. VECTORGRAPHDB EXTENSIONS                                                        │
+│  ═══════════════════════════                                                        │
+│  • BleveIntegratedDB for hybrid search                                              │
+│  • PressureAwareSearcher for adaptive tier selection                                │
+│  • Extended HybridResult for adaptive retrieval fields                              │
+│  • SessionScopedView retrieval budget tracking                                      │
+│                                                                                     │
+│  4. AGENT CAPABILITIES                                                              │
+│  ═════════════════════                                                              │
+│  • Agent-specific retrieval skills (see matrix above)                               │
+│  • Hook registration by agent type                                                  │
+│  • Inter-agent context protocols                                                    │
+│  • Tool definitions for Anthropic API                                               │
+│                                                                                     │
+│  5. ADAPTIVE LEARNING INTEGRATION                                                   │
+│  ═════════════════════════════════                                                  │
+│  • PrePromptPrefetchHook for knowledge agents                                       │
+│  • PostToolObservationHook for learning                                             │
+│  • PostResponseCompletionHook for episode finalization                              │
+│  • EvictionPressureHook for proactive eviction                                      │
+│                                                                                     │
+│  6. BOUNDED DATA STRUCTURES                                                         │
+│  ══════════════════════════                                                         │
+│  • AccessTracker with sliding window                                                │
+│  • Bounded ring buffer for observation log                                          │
+│  • LRU eviction for caches                                                          │
+│  • Sufficient statistics only (no raw history)                                      │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```

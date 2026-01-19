@@ -30899,7 +30899,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • PH.1 HandoffManager Core (core/pipeline/handoff_manager.go)                    ││
 │ │   - Central coordinator for all agent handoffs                                   ││
 │ │   - TriggerHandoff() method                                                      ││
-│ │   - ShouldHandoff() checks >= 75% context usage                                  ││
+│ │   - ShouldHandoff() initial impl uses 75% (replaced by Group 4Q GP-based)       ││
 │ │   - Archives handoff state to BOTH Bleve AND VectorDB                            ││
 │ │   - Stores handoff state for audit/recovery                                      ││
 │ │   DEPENDS ON: CV.1 (UniversalContentStore), Archivalist                          ││
@@ -30940,7 +30940,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ • PH.5 AgentContextCheck Hook (core/pipeline/context_check_hook.go)              ││
 │ │   - PostPrompt hook, Priority: HookPriorityLast (100)                            ││
 │ │   - Agents: engineer, designer, inspector, tester, orchestrator, guide           ││
-│ │   - Triggers handoff at 75% context usage                                        ││
+│ │   - Initial trigger at 75% (replaced by Group 4Q GP-based triggers)             ││
 │ │   DEPENDS ON: PH.1, existing hook registry                                       ││
 │ │   FILES: core/pipeline/context_check_hook.go, context_check_hook_test.go         ││
 │ │                                                                                  ││
@@ -30956,7 +30956,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ NOTE: Engineer, Inspector, Tester handoff states already defined in Phase 2      ││
 │ │       Pipeline Handoff section. This group adds missing states and manager.      ││
 │ │                                                                                  ││
-│ │ CRITICAL THRESHOLD: 75% context triggers handoff (per CONTEXT.md)                ││
+│ │ ** THRESHOLD NOTE: Initial 75% is a placeholder - replaced by Group 4Q GP-based **││
 │ │ CRITICAL ARCHIVAL: Handoff state archived to BOTH Bleve AND VectorDB             ││
 │ │                                                                                  ││
 │ │ INTERNAL DEPENDENCIES:                                                            ││
@@ -30970,6 +30970,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   - Archivalist agent for ingest coordination                                    ││
 │ │   - Phase 2 Pipeline Handoff section for Engineer/Inspector/Tester states        ││
 │ │   - Existing hook registry infrastructure                                        ││
+│ │   - ** Group 4Q: GP-Based Handoff replaces fixed 75% thresholds (HO.11.x) **     ││
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
@@ -31456,6 +31457,616 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   confusing agents and degrading response quality. This system integrates        ││
 │ │   with Document Search (Group 4L) and VectorDB, both Wave 4 components.          ││
 │ │   Must be implemented alongside other Wave 4 robustness systems.                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4Q: GP-Based Dynamic Handoff System (HO.1-HO.22)                 ││
+│ │ ** ARCHITECTURE: See HANDOFF.md for full specification **                        ││
+│ │ ** REPLACES: Fixed 75%/80%/85% thresholds with GP-learned triggers **           ││
+│ │ ** REQUIRED BY: Group 4O (Pipeline Handoff) - updates trigger mechanism **       ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES (from HANDOFF.md):                                             ││
+│ │   1. ALL parameters are learned distributions - NO hardcoded values              ││
+│ │   2. Hierarchical Bayesian pooling handles cold start automatically              ││
+│ │   3. Per-agent-instance learning - each (AgentType, Model) learns its own curves││
+│ │   4. PreparedContext maintained continuously - handoff is pointer swap + trim    ││
+│ │   5. GP detects degradation - replaces fixed % thresholds                        ││
+│ │   6. Knowledge agents EVICT, others HANDOFF - different strategies               ││
+│ │   7. 1M context for Librarian/Archivalist - fundamentally different curves       ││
+│ │                                                                                  ││
+│ │ AGENT MODEL ASSIGNMENTS:                                                         ││
+│ │   | Agent                 | Model       | Context  | Category   | Strategy      |││
+│ │   |-----------------------|-------------|----------|------------|---------------|││
+│ │   | Librarian             | Sonnet 4.5  | **1M**   | Knowledge  | Eviction      |││
+│ │   | Archivalist           | Sonnet 4.5  | **1M**   | Knowledge  | Eviction      |││
+│ │   | Academic              | Opus 4.5    | 200K     | Knowledge  | Eviction      |││
+│ │   | Architect             | Opus 4.5    | 200K     | Knowledge  | Eviction      |││
+│ │   | Engineer              | Opus 4.5    | 200K     | Pipeline   | Same-Type HO  |││
+│ │   | Designer              | Sonnet 4.5  | 200K     | Pipeline   | Same-Type HO  |││
+│ │   | Inspector-standalone  | Sonnet 4.5  | 200K     | Standalone | Same-Type HO  |││
+│ │   | Inspector-pipeline    | Haiku 4.5   | 200K     | Pipeline   | Same-Type HO  |││
+│ │   | Tester-standalone     | Sonnet 4.5  | 200K     | Standalone | Same-Type HO  |││
+│ │   | Tester-pipeline       | Haiku 4.5   | 200K     | Pipeline   | Same-Type HO  |││
+│ │   | Orchestrator          | Haiku 4.5   | 200K     | Standalone | Same-Type HO  |││
+│ │   | Guide                 | Haiku 4.5   | 200K     | Standalone | Same-Type HO  |││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - Learned distribution types, no interdependencies):       ││
+│ │                                                                                  ││
+│ │ • HO.1.1 LearnedWeight Type (core/handoff/learned_params.go)                     ││
+│ │   - Beta distribution for weights/thresholds in [0,1]                            ││
+│ │   - Alpha, Beta, EffectiveSamples, PriorAlpha, PriorBeta fields                  ││
+│ │   - Mean(), Variance(), Sample(), Confidence(), CredibleInterval() methods       ││
+│ │   - Update(observation, config) with exponential decay                           ││
+│ │   - Drift protection: blend toward prior if too confident                        ││
+│ │   ACCEPTANCE: Unit tests for mean/variance, update converges, no NaN/Inf        ││
+│ │   FILES: core/handoff/learned_params.go, learned_params_test.go                  ││
+│ │                                                                                  ││
+│ │ • HO.1.2 LearnedContextSize Type (core/handoff/learned_params.go)                ││
+│ │   - Gamma distribution for positive context sizes (integers)                     ││
+│ │   - Alpha, Beta, EffectiveSamples, PriorAlpha, PriorBeta fields                  ││
+│ │   - Mean() int, Sample() int, Confidence() methods                               ││
+│ │   - Update(observed int, config) with exponential decay                          ││
+│ │   ACCEPTANCE: Mean returns int, Sample generates valid sizes                     ││
+│ │   FILES: core/handoff/learned_params.go (extend)                                 ││
+│ │                                                                                  ││
+│ │ • HO.1.3 LearnedCount Type (core/handoff/learned_params.go)                      ││
+│ │   - Poisson-Gamma conjugate for count data                                       ││
+│ │   - Alpha, Beta, EffectiveSamples, PriorAlpha, PriorBeta fields                  ││
+│ │   - Mean() int, Sample() int, Confidence() methods                               ││
+│ │   - Update with Poisson likelihood                                               ││
+│ │   ACCEPTANCE: Sample generates valid counts, update converges                    ││
+│ │   FILES: core/handoff/learned_params.go (extend)                                 ││
+│ │                                                                                  ││
+│ │ • HO.1.4 UpdateConfig Type (core/handoff/learned_params.go)                      ││
+│ │   - DecayFactor, MaxEffectiveSamples, DriftRate fields                           ││
+│ │   - DefaultUpdateConfig() function                                               ││
+│ │   ACCEPTANCE: Config applied correctly in all Update methods                     ││
+│ │   FILES: core/handoff/learned_params.go (extend)                                 ││
+│ │                                                                                  ││
+│ │ • HO.1.5 Statistical Helpers (core/handoff/stats_helpers.go)                     ││
+│ │   - betaSample(alpha, beta) float64                                              ││
+│ │   - betaQuantile(p, alpha, beta) float64                                         ││
+│ │   - gammaSample(alpha, beta) float64                                             ││
+│ │   - poissonSample(lambda) int                                                    ││
+│ │   - dotProduct(a, b []float64) float64                                           ││
+│ │   ACCEPTANCE: Statistical tests pass (KS test for distributions)                 ││
+│ │   FILES: core/handoff/stats_helpers.go, stats_helpers_test.go                    ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After HO.1.x - Hierarchical blending):                                  ││
+│ │                                                                                  ││
+│ │ • HO.2.1 Hierarchical Blending Types (core/handoff/hierarchical.go)              ││
+│ │   - leveledParam struct { param interface{}, confidence float64 }                ││
+│ │   - blendWeight(levels []leveledParam, explore bool) float64                     ││
+│ │   - blendContextSize(levels []leveledParam, explore bool) int                    ││
+│ │   - blendCount(levels []leveledParam, explore bool) int                          ││
+│ │   - Weighted blend across hierarchy: Instance → AgentModel → Model → Global      ││
+│ │   ACCEPTANCE: Cold start works (instance=0 confidence), blend is correct         ││
+│ │   FILES: core/handoff/hierarchical.go, hierarchical_test.go                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After HO.2.1 - Agent profile with ALL learned parameters):              ││
+│ │                                                                                  ││
+│ │ • HO.3.1 AgentHandoffProfile (core/handoff/agent_profile.go)                     ││
+│ │   - Identity: AgentID, AgentType, ModelID, ContextWindow, SessionID              ││
+│ │   - GP: *AgentGaussianProcess for quality prediction                             ││
+│ │   - Profile points (all LearnedContextSize):                                     ││
+│ │     BurnInEnd, PeakZoneStart, PeakZoneEnd, OptimalPreparedSize                   ││
+│ │   - Decision thresholds:                                                         ││
+│ │     PeakQualityRatio (*LearnedWeight), DegradationThreshold (*LearnedWeight)     ││
+│ │     LookaheadTokens (*LearnedContextSize), UncertaintyThreshold (*LearnedWeight) ││
+│ │   - Continuity: RecentTurnsNeeded (*LearnedCount), CompressionTolerance (*LW)    ││
+│ │   - Budget: SummaryBudgetWeight, FileBudgetWeight, DecisionBudgetWeight (*LW)    ││
+│ │            MaxDecisionsToKeep (*LearnedCount)                                    ││
+│ │   - Hierarchical priors: AgentModelPrior, ModelPrior, GlobalPrior                ││
+│ │   - GetEffective* methods for all params with hierarchical blending              ││
+│ │   - IsKnowledgeAgent() bool                                                      ││
+│ │   ACCEPTANCE: All params learned, no hardcoded values, blending works            ││
+│ │   FILES: core/handoff/agent_profile.go, agent_profile_test.go                    ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After HO.1.x - GP for quality prediction):                              ││
+│ │                                                                                  ││
+│ │ • HO.4.1 GPObservation Type (core/handoff/agent_gp.go)                           ││
+│ │   - ContextSize int, Quality float64, Timestamp time.Time                        ││
+│ │   - TurnNumber int, Weight float64                                               ││
+│ │   FILES: core/handoff/agent_gp.go                                                ││
+│ │                                                                                  ││
+│ │ • HO.4.2 GPHyperparams Type (core/handoff/agent_gp.go)                           ││
+│ │   - LengthScale, OutputVariance, NoiseVariance (*LearnedWeight)                  ││
+│ │   - PriorBaseline, PriorDecay (*LearnedWeight)                                   ││
+│ │   FILES: core/handoff/agent_gp.go (extend)                                       ││
+│ │                                                                                  ││
+│ │ • HO.4.3 AgentGaussianProcess (core/handoff/agent_gp.go)                         ││
+│ │   - AgentID, ModelID, ContextWindow fields                                       ││
+│ │   - Observations []GPObservation, MaxObservations int                            ││
+│ │   - InducingPoints []GPObservation, MaxInducing int                              ││
+│ │   - GP Hyperparams (all LearnedWeight): LengthScale, OutputVariance, etc.        ││
+│ │   - Hierarchical priors: AgentModelPrior, ModelPrior, GlobalPrior (*GPHyperparams)│
+│ │   - Cached Cholesky: choleskyL *mat.Cholesky, choleskyValid bool                 ││
+│ │   - PredictAtContextSize(ctx int, explore bool) (mean, variance float64)         ││
+│ │   - AddObservation(obs GPObservation)                                            ││
+│ │   - compressOldObservations() for bounded storage                                ││
+│ │   ACCEPTANCE: GP prediction works, Cholesky stable, bounded memory               ││
+│ │   EXTERNAL DEP: gonum.org/v1/gonum/mat (Cholesky factorization)                  ││
+│ │   FILES: core/handoff/agent_gp.go, agent_gp_test.go                              ││
+│ │                                                                                  ││
+│ │ • HO.4.4 Matern 2.5 Kernel (core/handoff/agent_gp.go)                            ││
+│ │   - matern25(x1, x2 int, lengthScale, outputVar float64) float64                 ││
+│ │   - Better than RBF for smooth degradation curves                                ││
+│ │   - computeKernelVector(ctx int, lengthScale, outputVar float64) []float64       ││
+│ │   ACCEPTANCE: Kernel positive definite, matches theoretical formula              ││
+│ │   FILES: core/handoff/agent_gp.go (extend)                                       ││
+│ │                                                                                  ││
+│ │ • HO.4.5 Prior Mean Function (core/handoff/agent_gp.go)                          ││
+│ │   - priorMean(ctx int, explore bool) float64                                     ││
+│ │   - priorVariance(explore bool) float64                                          ││
+│ │   - Uses effective baseline and decay from hierarchical blending                 ││
+│ │   - Formula: baseline - decay * ctx / contextWindow                              ││
+│ │   ACCEPTANCE: Prior reflects expected degradation pattern                        ││
+│ │   FILES: core/handoff/agent_gp.go (extend)                                       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After HO.3.1, HO.4.3 - Decision logic):                                 ││
+│ │                                                                                  ││
+│ │ • HO.5.1 Handoff Decision Types (core/handoff/decision.go)                       ││
+│ │   - ActionType enum: ActionNone, ActionHandoff, ActionEviction                   ││
+│ │   - HandoffDecision struct with action, reason, metrics                          ││
+│ │   FILES: core/handoff/decision.go                                                ││
+│ │                                                                                  ││
+│ │ • HO.5.2 HandoffController (core/handoff/decision.go)                            ││
+│ │   - ShouldTakeAction(profile, currentCtxSize, explore) (bool, ActionType)        ││
+│ │   - Uses ALL values from hierarchical blending                                   ││
+│ │   - Conditions checked:                                                          ││
+│ │     - pastPeakZone: currentCtxSize > peakZoneEnd                                 ││
+│ │     - qualityDropping: (current - future) > dropThresh                           ││
+│ │     - qualityBelowThreshold: current < peakQuality * qualityRatio                ││
+│ │     - highUncertainty: uncertainty > thresh && ctx > burnInEnd                   ││
+│ │   - Action type: IsKnowledgeAgent() ? ActionEviction : ActionHandoff             ││
+│ │   ACCEPTANCE: Decision matches HANDOFF.md logic, no hardcoded values             ││
+│ │   FILES: core/handoff/decision.go (extend), decision_test.go                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After HO.3.1 - PreparedContext maintained continuously):                ││
+│ │                                                                                  ││
+│ │ • HO.6.1 PreparedContext (core/handoff/prepared_context.go)                      ││
+│ │   - Target config: TargetModel, TargetTokens, RecentTurnsCount                   ││
+│ │   - Continuously updated: Summary (*RollingSummary), RecentTurns (*CircularBuffer)│
+│ │   - ActiveFiles map[string]*FileState, TaskState *TaskState                      ││
+│ │   - KeyDecisions []Decision, QualityObservations []GPObservation                 ││
+│ │   - WeightOverlay *SessionOverlayState                                           ││
+│ │   - Learned budget allocations: SummaryBudgetWeight, FileBudgetWeight, etc.      ││
+│ │   - Hierarchical priors for budget                                               ││
+│ │   - Update(turn, files) - called after EVERY agent turn                          ││
+│ │   - Clone() - copy-on-write for handoff (non-blocking)                           ││
+│ │   - TrimToSize(targetTokens, explore) - trims to learned budget                  ││
+│ │   - EstimateTokens() int                                                         ││
+│ │   ACCEPTANCE: Update is fast (<1ms), Clone doesn't block, TrimToSize correct     ││
+│ │   FILES: core/handoff/prepared_context.go, prepared_context_test.go              ││
+│ │                                                                                  ││
+│ │ • HO.6.2 RollingSummary (core/handoff/rolling_summary.go)                        ││
+│ │   - Incorporate(turn *ConversationTurn)                                          ││
+│ │   - Clone() *RollingSummary                                                      ││
+│ │   - CompressTo(budgetTokens int)                                                 ││
+│ │   - EstimateTokens() int                                                         ││
+│ │   ACCEPTANCE: Summary compresses correctly, maintains key info                   ││
+│ │   FILES: core/handoff/rolling_summary.go, rolling_summary_test.go                ││
+│ │                                                                                  ││
+│ │ • HO.6.3 CircularBuffer[T] (core/handoff/circular_buffer.go)                     ││
+│ │   - Generic circular buffer for recent turns                                     ││
+│ │   - Push(item T), TruncateTo(n int), Clone() *CircularBuffer[T]                  ││
+│ │   - EstimateTokens() int (for ConversationTurn)                                  ││
+│ │   ACCEPTANCE: Push is O(1), TruncateTo works, Clone is deep copy                 ││
+│ │   FILES: core/handoff/circular_buffer.go, circular_buffer_test.go                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (All parallel - Global priors):                                          ││
+│ │                                                                                  ││
+│ │ • HO.7.1 Global Priors (core/handoff/priors.go)                                  ││
+│ │   - InitGlobalPriors() *AgentHandoffProfile                                      ││
+│ │   - Weakly informative priors for cold start                                     ││
+│ │   - Wide uncertainty on all learned params                                       ││
+│ │   ACCEPTANCE: Priors are weakly informative, cold start works                    ││
+│ │   FILES: core/handoff/priors.go, priors_test.go                                  ││
+│ │                                                                                  ││
+│ │ • HO.7.2 Model Priors (core/handoff/priors.go)                                   ││
+│ │   - InitModelPriors(modelID, contextWindow) *AgentHandoffProfile                 ││
+│ │   - Scale priors based on context window (relative to 200K baseline)             ││
+│ │   - 1M context: BurnInEnd, PeakZone*, LookaheadTokens scaled 5x                  ││
+│ │   ACCEPTANCE: 1M context agents have correctly scaled priors                     ││
+│ │   FILES: core/handoff/priors.go (extend)                                         ││
+│ │                                                                                  ││
+│ │ • HO.7.3 AgentModel Priors (core/handoff/priors.go)                              ││
+│ │   - InitAgentModelPriors(agentType, modelID, contextWindow) *AgentHandoffProfile ││
+│ │   - Agent-type specific adjustments (starting points)                            ││
+│ │   - Engineer: more RecentTurnsNeeded (5 vs 4)                                    ││
+│ │   - Guide/Orchestrator: faster degradation (PeakZoneEnd * 0.6)                   ││
+│ │   ACCEPTANCE: Agent-specific priors reasonable, will be learned                  ││
+│ │   FILES: core/handoff/priors.go (extend)                                         ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 8 (After HO.5.2, HO.6.1 - Handoff execution):                              ││
+│ │                                                                                  ││
+│ │ • HO.8.1 HandoffExecutor (core/handoff/executor.go)                              ││
+│ │   - ExecuteHandoff(ctx, oldAgent, profile, preparedContext) (Agent, error)       ││
+│ │   - Steps:                                                                       ││
+│ │     1. Clone PreparedContext (copy-on-write, non-blocking)                       ││
+│ │     2. Trim to learned OptimalPreparedSize                                       ││
+│ │     3. Create new agent instance (same type, same model)                         ││
+│ │     4. Inject PreparedContext via agent.InjectHandoffState()                     ││
+│ │     5. Archive old agent state (async, non-blocking)                             ││
+│ │     6. Terminate old agent                                                       ││
+│ │   - Handoff latency: ~1-2ms (pointer swap + trim)                                ││
+│ │   ACCEPTANCE: Handoff < 5ms, old agent archived, new agent functional            ││
+│ │   DEPENDS ON: Agent factory, Archivalist client                                  ││
+│ │   FILES: core/handoff/executor.go, executor_test.go                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 9 (All parallel - WAL persistence):                                        ││
+│ │                                                                                  ││
+│ │ • HO.9.1 WAL Entry Types (core/handoff/persistence.go)                           ││
+│ │   - EntryGPObservation, EntryProfileUpdate, EntryHandoffEvent, EntryEvictionEvent││
+│ │   - GPObservationEntry, ProfileUpdateEntry, HandoffEventEntry structs            ││
+│ │   - JSON serialization for all entry types                                       ││
+│ │   FILES: core/handoff/persistence.go                                             ││
+│ │                                                                                  ││
+│ │ • HO.9.2 WAL Recovery (core/handoff/persistence.go)                              ││
+│ │   - ProfileLearner.RecoverFromWAL(wal *WriteAheadLog) error                      ││
+│ │   - Replay GP observations to restore state                                      ││
+│ │   - Replay profile updates to restore learned params                             ││
+│ │   - replayGPObservation(), replayProfileUpdate() methods                         ││
+│ │   ACCEPTANCE: Recovery restores GP and profile state exactly                     ││
+│ │   DEPENDS ON: Existing WAL infrastructure (0.22)                                 ││
+│ │   FILES: core/handoff/persistence.go (extend), persistence_test.go               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 10 (After HO.3.1 - Profile learner and manager):                           ││
+│ │                                                                                  ││
+│ │ • HO.10.1 ProfileLearner (core/handoff/profile_learner.go)                       ││
+│ │   - Manages profiles per (AgentType, ModelID) combination                        ││
+│ │   - getOrCreateProfile(agentType, modelID) *AgentHandoffProfile                  ││
+│ │   - RecordObservation(agentID, contextSize, quality, turnNumber)                 ││
+│ │   - UpdateProfile(agentType, modelID, paramName, alpha, beta)                    ││
+│ │   - WAL integration for crash recovery                                           ││
+│ │   ACCEPTANCE: Profiles persist across restarts, learning accumulates             ││
+│ │   FILES: core/handoff/profile_learner.go, profile_learner_test.go                ││
+│ │                                                                                  ││
+│ │ • HO.10.2 HandoffManager (core/handoff/manager.go)                               ││
+│ │   - Central coordinator replacing fixed-threshold HandoffManager                 ││
+│ │   - RegisterAgent(agent, profile) - register agent for monitoring                ││
+│ │   - CheckAndTrigger(agentID) (bool, ActionType) - called after each turn         ││
+│ │   - TriggerHandoff(agentID) error - execute handoff via HandoffExecutor          ││
+│ │   - TriggerEviction(agentID, targetTokens) error - for knowledge agents          ││
+│ │   - Integration with existing PH.1 interface                                     ││
+│ │   ACCEPTANCE: Replaces fixed thresholds, GP-based decisions                      ││
+│ │   DEPENDS ON: HO.5.2, HO.8.1, PH.1 interface                                     ││
+│ │   FILES: core/handoff/manager.go, manager_test.go                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 11 (After HO.10.2 - Integration with Group 4O):                            ││
+│ │                                                                                  ││
+│ │ • HO.11.1 Update PH.1 HandoffManager (modify core/pipeline/handoff_manager.go)   ││
+│ │   - Replace ShouldHandoff() fixed 75% check with HandoffController.ShouldTakeAction│
+│ │   - Inject HO.10.2 HandoffManager as dependency                                  ││
+│ │   - Update TriggerHandoff() to use HO.8.1 HandoffExecutor                        ││
+│ │   ACCEPTANCE: Fixed thresholds removed, GP-based decisions active                ││
+│ │   DEPENDS ON: HO.10.2, PH.1 existing code                                        ││
+│ │   MODIFY: core/pipeline/handoff_manager.go                                       ││
+│ │   FILES: core/pipeline/handoff_manager_gp.go (extensions)                        ││
+│ │                                                                                  ││
+│ │ • HO.11.2 Update PH.5 AgentContextCheck Hook                                     ││
+│ │   - Replace 75% threshold check with HandoffController.ShouldTakeAction call     ││
+│ │   - Remove hardcoded ContextUsageThreshold constant                              ││
+│ │   ACCEPTANCE: Hook uses GP-based trigger                                         ││
+│ │   MODIFY: core/pipeline/context_check_hook.go                                    ││
+│ │                                                                                  ││
+│ │ • HO.11.3 Update CONTEXT.md Eviction Strategies                                  ││
+│ │   - AgentEvictionConfig uses learned params from AgentHandoffProfile             ││
+│ │   - RecencyBasedEviction, TopicClusterEviction, TaskCompletionEviction updated   ││
+│ │   - All strategies receive *AgentHandoffProfile for learned parameters           ││
+│ │   ACCEPTANCE: Eviction uses learned PreserveRecent, no hardcoded values          ││
+│ │   MODIFY: core/context/eviction.go, eviction_recency.go, eviction_topic.go       ││
+│ │           core/context/eviction_task.go                                          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 12 (After HO.10.1 - Quality assessment integration):                       ││
+│ │                                                                                  ││
+│ │ • HO.12.1 QualityAssessor Hook (core/handoff/quality_hook.go)                    ││
+│ │   - PostPrompt hook, Priority: HookPriorityNormal (50)                           ││
+│ │   - Extracts quality signals from agent responses                                ││
+│ │   - Records observation to ProfileLearner                                        ││
+│ │   - Quality heuristics: response completeness, tool success, user feedback       ││
+│ │   ACCEPTANCE: Quality observations recorded after each turn                      ││
+│ │   FILES: core/handoff/quality_hook.go, quality_hook_test.go                      ││
+│ │                                                                                  ││
+│ │ • HO.12.2 Quality Assessment Metrics (core/handoff/quality_metrics.go)           ││
+│ │   - QualitySignals struct: completeness, toolSuccess, userFeedback, etc.         ││
+│ │   - ComputeQuality(signals) float64 - composite quality score [0,1]              ││
+│ │   - Weights are learned per agent type                                           ││
+│ │   ACCEPTANCE: Quality score correlates with actual performance                   ││
+│ │   FILES: core/handoff/quality_metrics.go, quality_metrics_test.go                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 13 (After ALL prior phases - Integration tests):                           ││
+│ │                                                                                  ││
+│ │ • HO.13.1 Hierarchical Blending Tests                                            ││
+│ │   - Cold start: instance=0 → uses AgentModel/Model/Global priors                 ││
+│ │   - Warm: instance confidence grows, dominates over time                         ││
+│ │   - Cross-model: different models have different learned curves                  ││
+│ │   FILES: core/handoff/hierarchical_integration_test.go                           ││
+│ │                                                                                  ││
+│ │ • HO.13.2 GP Prediction Tests                                                    ││
+│ │   - Prediction accuracy with known degradation curves                            ││
+│ │   - Sparse GP compression maintains prediction quality                           ││
+│ │   - Cholesky stability under various conditions                                  ││
+│ │   FILES: core/handoff/agent_gp_integration_test.go                               ││
+│ │                                                                                  ││
+│ │ • HO.13.3 Handoff Execution Tests                                                ││
+│ │   - Handoff latency < 5ms                                                        ││
+│ │   - PreparedContext correctly transferred                                        ││
+│ │   - Old agent archived, new agent functional                                     ││
+│ │   FILES: core/handoff/executor_integration_test.go                               ││
+│ │                                                                                  ││
+│ │ • HO.13.4 End-to-End Learning Tests                                              ││
+│ │   - GP learns from observations over time                                        ││
+│ │   - Handoff triggers at appropriate times (not too early, not too late)          ││
+│ │   - Different agents learn different curves                                      ││
+│ │   - WAL recovery preserves learned state                                         ││
+│ │   FILES: core/handoff/e2e_integration_test.go                                    ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                 ││
+│ │   core/handoff/learned_params.go - HO.1.1-HO.1.4                                 ││
+│ │   core/handoff/stats_helpers.go - HO.1.5                                         ││
+│ │   core/handoff/hierarchical.go - HO.2.1                                          ││
+│ │   core/handoff/agent_profile.go - HO.3.1                                         ││
+│ │   core/handoff/agent_gp.go - HO.4.1-HO.4.5                                       ││
+│ │   core/handoff/decision.go - HO.5.1-HO.5.2                                       ││
+│ │   core/handoff/prepared_context.go - HO.6.1                                      ││
+│ │   core/handoff/rolling_summary.go - HO.6.2                                       ││
+│ │   core/handoff/circular_buffer.go - HO.6.3                                       ││
+│ │   core/handoff/priors.go - HO.7.1-HO.7.3                                         ││
+│ │   core/handoff/executor.go - HO.8.1                                              ││
+│ │   core/handoff/persistence.go - HO.9.1-HO.9.2                                    ││
+│ │   core/handoff/profile_learner.go - HO.10.1                                      ││
+│ │   core/handoff/manager.go - HO.10.2                                              ││
+│ │   core/handoff/quality_hook.go - HO.12.1                                         ││
+│ │   core/handoff/quality_metrics.go - HO.12.2                                      ││
+│ │   core/pipeline/handoff_manager_gp.go - HO.11.1 (modify)                         ││
+│ │   core/pipeline/context_check_hook.go - HO.11.2 (modify)                         ││
+│ │   core/context/eviction*.go - HO.11.3 (modify)                                   ││
+│ │                                                                                  ││
+│ │ MEMORY COST (per active agent):                                                  ││
+│ │   - GP: ~45 KB (sparse GP, bounded inducing points)                              ││
+│ │   - Profile: ~2 KB (all learned distributions)                                   ││
+│ │   - PreparedContext: 10-90 KB (maintained continuously)                          ││
+│ │   - Total: ~60-140 KB per agent (negligible)                                     ││
+│ │                                                                                  ││
+│ │ CPU COST:                                                                        ││
+│ │   - PreparedContext.Update(): ~0.2 ms (every turn)                               ││
+│ │   - GP prediction: ~1-2 ms (every turn)                                          ││
+│ │   - Hierarchical blending: ~0.1 ms (every decision)                              ││
+│ │   - Cholesky recomputation: ~5-10 ms (every ~10 observations)                    ││
+│ │   - Handoff execution: ~1-2 ms (on trigger)                                      ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (5 parallel) → Phase 2 → Phase 3 & Phase 4 (parallel) →                ││
+│ │   Phase 5 → Phase 6 (3 parallel) → Phase 7 (3 parallel) → Phase 8 →              ││
+│ │   Phase 9 (2 parallel) → Phase 10 (2 parallel) → Phase 11 (3 parallel) →         ││
+│ │   Phase 12 (2 parallel) → Phase 13 (4 parallel tests)                            ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - gonum.org/v1/gonum/mat (Cholesky factorization for GP)                       ││
+│ │   - Group 4O: Pipeline Agent Handoff System (PH.1-PH.7) - provides interface     ││
+│ │   - Wave 1: Session & State Management (0.1, 0.22 WAL)                           ││
+│ │   - Existing Agent factory infrastructure                                        ││
+│ │   - Archivalist for state archival                                               ││
+│ │                                                                                  ││
+│ │ CROSS-SYSTEM INTEGRATION:                                                        ││
+│ │   - Replaces fixed thresholds in Group 4O with GP-based triggers                 ││
+│ │   - Updates CONTEXT.md eviction strategies with learned parameters               ││
+│ │   - Integrates with existing hook registry for quality assessment                ││
+│ │   - Uses existing WAL infrastructure for crash recovery                          ││
+│ │   - Profile learning persists across sessions                                    ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                      ││
+│ │   GP-Based Handoff replaces hardcoded thresholds with learned triggers.          ││
+│ │   Must be implemented alongside Group 4O (Pipeline Handoff) to provide           ││
+│ │   the trigger mechanism. Depends on Session/State Management from Wave 1         ││
+│ │   and integrates with Memory Pressure Defense (4F) for coordination.             ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4R: Chunk Parameter Learning System (CK.1-CK.10)                 ││
+│ │ ** ARCHITECTURE: See CHUNKING.md Section 8 "Chunk Parameter Learning" **        ││
+│ │ ** REPLACES: Fixed chunk sizes with learned Gamma distributions **              ││
+│ │ ** PATTERN: Same Bayesian learning as Group 4Q (GP-Based Handoff) **            ││
+│ │                                                                                  ││
+│ │ DESIGN PRINCIPLES (from CHUNKING.md):                                           ││
+│ │   1. Soft targets (TargetTokens, MinTokens, ContextTokens) are LEARNED          ││
+│ │   2. MaxTokens stays hardcoded (true embedding model constraint)                ││
+│ │   3. OverflowStrategy learned via Dirichlet-Multinomial                         ││
+│ │   4. Feedback loop: chunk retrieved → was it useful? → update posteriors        ││
+│ │   5. Per-domain learning (Code, Academic, History have different optima)        ││
+│ │   6. WAL persistence for crash recovery                                         ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - Type definitions, no interdependencies):                ││
+│ │                                                                                  ││
+│ │ • CK.1.1 LearnedContextSize Type (core/chunking/learned_params.go)              ││
+│ │   - Gamma distribution for positive integer parameters                          ││
+│ │   - Alpha, Beta, EffectiveSamples, PriorAlpha, PriorBeta fields                 ││
+│ │   - Mean() int, Sample() int, Confidence() methods                              ││
+│ │   - Identical to HO.1.2 but in chunking package for separation                  ││
+│ │   ACCEPTANCE: Mean returns int, Sample generates valid sizes, tests pass        ││
+│ │   FILES: core/chunking/learned_params.go, learned_params_test.go                ││
+│ │                                                                                  ││
+│ │ • CK.1.2 LearnedOverflowWeights Type (core/chunking/learned_params.go)          ││
+│ │   - Dirichlet-Multinomial for categorical overflow strategy learning            ││
+│ │   - RecursiveCount, SentenceCount, TruncateCount fields                         ││
+│ │   - BestStrategy() OverflowStrategy, Sample() OverflowStrategy methods          ││
+│ │   ACCEPTANCE: Thompson Sampling works, strategy selection correct               ││
+│ │   FILES: core/chunking/learned_params.go (extend)                               ││
+│ │                                                                                  ││
+│ │ • CK.1.3 ChunkConfig with Learned Params (core/chunking/config.go)              ││
+│ │   - MaxTokens int (fixed, embedding model constraint)                           ││
+│ │   - TargetTokens *LearnedContextSize                                            ││
+│ │   - MinTokens *LearnedContextSize                                               ││
+│ │   - ContextTokensBefore *LearnedContextSize                                     ││
+│ │   - ContextTokensAfter *LearnedContextSize                                      ││
+│ │   - OverflowStrategyWeights *LearnedOverflowWeights                             ││
+│ │   - GetEffective* methods for all params with Thompson Sampling                 ││
+│ │   ACCEPTANCE: All soft params learned, GetEffective* works with explore flag    ││
+│ │   FILES: core/chunking/config.go, config_test.go                                ││
+│ │                                                                                  ││
+│ │ • CK.1.4 PriorChunkConfig Function (core/chunking/config.go)                    ││
+│ │   - Returns weakly informative priors per domain                                ││
+│ │   - DomainCode: Prior mean 300 tokens, high staleness weight                    ││
+│ │   - DomainAcademic: Prior mean 500 tokens, sentence overflow preferred          ││
+│ │   - DomainHistory: Prior mean 400 tokens, low context after                     ││
+│ │   ACCEPTANCE: Priors are sensible starting points, wide uncertainty             ││
+│ │   FILES: core/chunking/config.go (extend)                                       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After CK.1.x - Observation and learning):                              ││
+│ │                                                                                  ││
+│ │ • CK.2.1 ChunkUsageObservation Type (core/chunking/config_learner.go)           ││
+│ │   - Domain, TokenCount, ContextBefore, ContextAfter, WasUseful                  ││
+│ │   - OverflowStrategy *OverflowStrategy (non-nil if chunk was overflow result)   ││
+│ │   - Timestamp time.Time                                                         ││
+│ │   ACCEPTANCE: Observation captures all relevant feedback signals                ││
+│ │   FILES: core/chunking/config_learner.go                                        ││
+│ │                                                                                  ││
+│ │ • CK.2.2 ChunkConfigLearner (core/chunking/config_learner.go)                   ││
+│ │   - DomainConfigs map[Domain]*ChunkConfig (learned per domain)                  ││
+│ │   - GlobalPriors *ChunkConfig (for cold start)                                  ││
+│ │   - DomainConfidence map[Domain]float64 (for hierarchical blending)             ││
+│ │   - RecordObservation(obs ChunkUsageObservation)                                ││
+│ │   - GetConfig(domain Domain, explore bool) *ChunkConfig                         ││
+│ │   - applyDecay(config, decayFactor) for recency weighting                       ││
+│ │   - updateGammaPosterior(param, observed, weight)                               ││
+│ │   - blendConfigs(prior, domain, weight) for hierarchical blending               ││
+│ │   ACCEPTANCE: Learning accumulates, cold start works, decay applied             ││
+│ │   FILES: core/chunking/config_learner.go, config_learner_test.go                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (After CK.2.2 - WAL persistence):                                       ││
+│ │                                                                                  ││
+│ │ • CK.3.1 WAL Entry Type (core/chunking/config_persistence.go)                   ││
+│ │   - EntryChunkConfigObservation = 0x30                                          ││
+│ │   - ChunkConfigObservationEntry struct (JSON serializable)                      ││
+│ │   - LogChunkConfigObservation(obs) method on WAL                                ││
+│ │   ACCEPTANCE: Observations logged to WAL, serialization works                   ││
+│ │   FILES: core/chunking/config_persistence.go                                    ││
+│ │                                                                                  ││
+│ │ • CK.3.2 WAL Recovery (core/chunking/config_persistence.go)                     ││
+│ │   - ChunkConfigLearner.RecoverFromWAL(wal *WriteAheadLog) error                 ││
+│ │   - Replay observations to restore learned state                                ││
+│ │   ACCEPTANCE: Recovery restores exact learned state from WAL                    ││
+│ │   DEPENDS ON: Existing WAL infrastructure (0.22)                                ││
+│ │   FILES: core/chunking/config_persistence.go (extend), persistence_test.go      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After CK.2.2 - Integration with retrieval):                            ││
+│ │                                                                                  ││
+│ │ • CK.4.1 SemanticSplitter Integration (modify core/chunking/splitter.go)        ││
+│ │   - Inject ChunkConfigLearner as dependency                                     ││
+│ │   - Replace fixed config with learner.GetConfig(domain, explore)                ││
+│ │   - Record ConfigSnapshot on each chunk for later feedback attribution          ││
+│ │   ACCEPTANCE: Splitter uses learned configs, snapshot recorded                  ││
+│ │   MODIFY: core/chunking/splitter.go                                             ││
+│ │   FILES: core/chunking/splitter_learned.go (extensions)                         ││
+│ │                                                                                  ││
+│ │ • CK.4.2 ChunkRetriever Feedback Hook (modify core/chunking/retrieval.go)       ││
+│ │   - After retrieval, track which chunks were returned                           ││
+│ │   - RecordChunkUsage(chunkID, wasUseful) calls learner.RecordObservation        ││
+│ │   - Integrate with existing quality.go RecordChunkUsage                         ││
+│ │   ACCEPTANCE: Usage feedback flows to ChunkConfigLearner                        ││
+│ │   MODIFY: core/chunking/retrieval.go, quality.go                                ││
+│ │                                                                                  ││
+│ │ • CK.4.3 Citation Detection for Feedback (core/chunking/citation_detector.go)   ││
+│ │   - Detect when agent response cites/uses retrieved chunk                       ││
+│ │   - Signal types: cited, used_code, ignored, explicitly_irrelevant              ││
+│ │   - Hook into agent response processing                                         ││
+│ │   ACCEPTANCE: Citation detection works, signals flow to learner                 ││
+│ │   FILES: core/chunking/citation_detector.go, citation_detector_test.go          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After ALL prior phases - Integration tests):                           ││
+│ │                                                                                  ││
+│ │ • CK.5.1 Learning Convergence Tests                                             ││
+│ │   - Given consistent feedback, posteriors converge to expected values           ││
+│ │   - Different domains learn different optima                                    ││
+│ │   - Cold start uses global priors correctly                                     ││
+│ │   FILES: core/chunking/config_learner_integration_test.go                       ││
+│ │                                                                                  ││
+│ │ • CK.5.2 WAL Recovery Tests                                                     ││
+│ │   - Crash simulation: observations → crash → recovery → same state              ││
+│ │   - Large observation history replays correctly                                 ││
+│ │   FILES: core/chunking/persistence_integration_test.go                          ││
+│ │                                                                                  ││
+│ │ • CK.5.3 End-to-End Retrieval Quality Tests                                     ││
+│ │   - Index content → retrieve → simulate feedback → verify learning              ││
+│ │   - Learned chunk sizes improve retrieval quality over time                     ││
+│ │   FILES: core/chunking/e2e_integration_test.go                                  ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                ││
+│ │   core/chunking/learned_params.go - CK.1.1, CK.1.2                              ││
+│ │   core/chunking/config.go - CK.1.3, CK.1.4                                      ││
+│ │   core/chunking/config_learner.go - CK.2.1, CK.2.2                              ││
+│ │   core/chunking/config_persistence.go - CK.3.1, CK.3.2                          ││
+│ │   core/chunking/splitter_learned.go - CK.4.1 (modify splitter.go)               ││
+│ │   core/chunking/retrieval.go - CK.4.2 (modify)                                  ││
+│ │   core/chunking/quality.go - CK.4.2 (modify)                                    ││
+│ │   core/chunking/citation_detector.go - CK.4.3                                   ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                          ││
+│ │   Phase 1 (4 parallel) → Phase 2 (2 parallel) → Phase 3 (2 parallel) →          ││
+│ │   Phase 4 (3 parallel) → Phase 5 (3 parallel tests)                             ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                          ││
+│ │   - Existing WAL infrastructure (0.22) for persistence                          ││
+│ │   - Group 4Q: Shares LearnedContextSize pattern (can share code or duplicate)   ││
+│ │   - Existing ChunkStore, SemanticSplitter, ChunkRetriever infrastructure        ││
+│ │   - Quality signal store (content_hash linkage)                                 ││
+│ │                                                                                  ││
+│ │ MEMORY COST:                                                                    ││
+│ │   - Per-domain config: ~500 bytes (5 learned params × ~100 bytes each)          ││
+│ │   - Total for 3 domains: ~1.5 KB (negligible)                                   ││
+│ │                                                                                  ││
+│ │ CPU COST:                                                                       ││
+│ │   - Posterior update: ~0.01 ms (simple arithmetic)                              ││
+│ │   - Config lookup: ~0.01 ms (map lookup + blending)                             ││
+│ │   - WAL logging: ~0.1 ms (JSON serialization + write)                           ││
+│ │                                                                                  ││
+│ │ WHY WAVE 4:                                                                     ││
+│ │   Chunk parameter learning follows same Bayesian pattern as Group 4Q.           ││
+│ │   Depends on existing chunking infrastructure and WAL from Wave 1.              ││
+│ │   Provides foundation for retrieval quality improvement across all domains.     ││
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
