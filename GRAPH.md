@@ -19,12 +19,13 @@ This document specifies the architecture for transforming Sylk's existing Vector
 7. [Graph Query Language](#graph-query-language)
 8. [Inference Engine](#inference-engine)
 9. [Temporal Graph Support](#temporal-graph-support)
-10. [Domain Partitioning](#domain-partitioning)
-11. [Multi-Session Coordination](#multi-session-coordination)
-12. [Integration with Wave 4 Groups](#integration-with-wave-4-groups)
-13. [Implementation Phases](#implementation-phases)
-14. [Acceptance Criteria](#acceptance-criteria)
-15. [Edge Cases and Mitigations](#edge-cases-and-mitigations)
+10. [Memory Decay Model (ACT-R)](#memory-decay-model-act-r)
+11. [Domain Partitioning](#domain-partitioning)
+12. [Multi-Session Coordination](#multi-session-coordination)
+13. [Integration with Wave 4 Groups](#integration-with-wave-4-groups)
+14. [Implementation Phases](#implementation-phases)
+15. [Acceptance Criteria](#acceptance-criteria)
+16. [Edge Cases and Mitigations](#edge-cases-and-mitigations)
 
 ---
 
