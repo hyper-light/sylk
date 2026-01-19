@@ -472,6 +472,12 @@ func (ts *TieredSearcher) ResetMaxTier() {
 	ts.maxTier.Store(int32(TierFullSearch))
 }
 
+// HotCache returns the underlying hot cache.
+// This is exposed primarily for testing purposes.
+func (ts *TieredSearcher) HotCache() *HotCache {
+	return ts.hotCache
+}
+
 // =============================================================================
 // Circuit Breaker Access
 // =============================================================================

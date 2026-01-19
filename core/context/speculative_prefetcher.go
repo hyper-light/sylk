@@ -387,6 +387,12 @@ func (sp *SpeculativePrefetcher) IsEnabled() bool {
 	return sp.enabled.Load()
 }
 
+// Searcher returns the underlying tiered searcher.
+// This is exposed primarily for testing purposes.
+func (sp *SpeculativePrefetcher) Searcher() *TieredSearcher {
+	return sp.searcher
+}
+
 // =============================================================================
 // Query Hashing
 // =============================================================================
