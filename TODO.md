@@ -35369,29 +35369,33 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ EXECUTION WAVE 3: Search/Gate Layer (4 parallel - depends on Wave 1)            ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ [ ] W4N.9 - SearchCoordinator Parallel Goroutines Untracked                     ││
+│ │ [x] W4N.9 - SearchCoordinator Parallel Goroutines Untracked                     ││
 │ │   FILE: core/search/coordinator/coordinator.go:156-168                          ││
 │ │   ISSUE: Parallel search goroutines use WaitGroup but not GoroutineScope        ││
 │ │   FIX: Pass GoroutineScope to coordinator, use scope.Go() for searches          ││
 │ │   SEVERITY: HIGH - WAVE 4 tracking violation                                    ││
+│ │   STATUS: DONE - Commit d171ca4                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.10 - SpeculativePrefetcher CancelAll Race Condition                     ││
+│ │ [x] W4N.10 - SpeculativePrefetcher CancelAll Race Condition                     ││
 │ │   FILE: core/context/speculative_prefetcher.go:539-549                          ││
 │ │   ISSUE: inflightCount.Store(0) races with concurrent cleanup's Add(-1)         ││
 │ │   FIX: Cancel via context, let normal cleanup handle count                      ││
 │ │   SEVERITY: HIGH - Counter can go negative                                      ││
+│ │   STATUS: DONE - Commit e170e7c                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.11 - LLMGate RejectPolicyBlock Sleep Loop                               ││
+│ │ [x] W4N.11 - LLMGate RejectPolicyBlock Sleep Loop                               ││
 │ │   FILE: core/concurrency/llm_gate.go:206-218                                    ││
 │ │   ISSUE: Releases mutex, sleeps, reacquires - queue state can change            ││
 │ │   FIX: Use proper condition variable wait instead of sleep loop                 ││
 │ │   SEVERITY: MEDIUM - Inefficient and potentially incorrect                      ││
+│ │   STATUS: DONE - Commit ef7cc9a                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.12 - DualQueueGate Shutdown Drain Timeout                               ││
+│ │ [x] W4N.12 - DualQueueGate Shutdown Drain Timeout                               ││
 │ │   FILE: core/concurrency/llm_gate.go:906-920                                    ││
 │ │   ISSUE: No hard deadline - orphaned requests can hang forever                  ││
 │ │   FIX: Add hard deadline, force-cancel and log orphaned requests                ││
 │ │   SEVERITY: MEDIUM - Shutdown can hang indefinitely                             ││
+│ │   STATUS: DONE - Commit 452a133                                                 ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │ EXECUTION WAVE 4: Data Layer (4 parallel - depends on Wave 2, 3)                ││
