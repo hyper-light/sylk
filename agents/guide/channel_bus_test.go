@@ -254,3 +254,162 @@ func TestChannelBus_HandlerPanicRecovery(t *testing.T) {
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(&afterPanic))
 }
+
+// =============================================================================
+// W12.3 Tests - Async Handler Tracking
+// =============================================================================
+
+func TestChannelBus_AsyncHandler_TrackedOnShutdown(t *testing.T) {
+	// Test that async handlers are properly tracked and waited for on shutdown
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 100})
+
+	var handlerStarted int64
+	var handlerFinished int64
+	handlerRunning := make(chan struct{})
+	handlerCanFinish := make(chan struct{})
+
+	_, err := bus.SubscribeAsync("async-topic", func(msg *guide.Message) error {
+		atomic.AddInt64(&handlerStarted, 1)
+		close(handlerRunning)
+		<-handlerCanFinish // Block until signaled
+		atomic.AddInt64(&handlerFinished, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Publish a message to trigger the async handler
+	err = bus.Publish("async-topic", &guide.Message{ID: "msg-1"})
+	require.NoError(t, err)
+
+	// Wait for handler to start
+	select {
+	case <-handlerRunning:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for handler to start")
+	}
+
+	// Verify handler started but not finished
+	assert.Equal(t, int64(1), atomic.LoadInt64(&handlerStarted))
+	assert.Equal(t, int64(0), atomic.LoadInt64(&handlerFinished))
+
+	// Start Close() in a goroutine (it should block until handler finishes)
+	closeDone := make(chan struct{})
+	go func() {
+		bus.Close()
+		close(closeDone)
+	}()
+
+	// Verify Close() is blocking (handler still running)
+	select {
+	case <-closeDone:
+		t.Fatal("Close() returned before handler finished")
+	case <-time.After(50 * time.Millisecond):
+		// Expected - Close() is blocking
+	}
+
+	// Signal handler to finish
+	close(handlerCanFinish)
+
+	// Now Close() should complete
+	select {
+	case <-closeDone:
+		// Success - Close() waited for handler
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for Close() to complete")
+	}
+
+	// Verify handler finished
+	assert.Equal(t, int64(1), atomic.LoadInt64(&handlerFinished))
+}
+
+func TestChannelBus_AsyncHandler_MultipleHandlersTracked(t *testing.T) {
+	// Test that multiple concurrent async handlers are all tracked
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 1000})
+
+	var handlersFinished int64
+	const numMessages = 50
+
+	_, err := bus.SubscribeAsync("multi-async", func(msg *guide.Message) error {
+		time.Sleep(10 * time.Millisecond) // Simulate work
+		atomic.AddInt64(&handlersFinished, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Publish many messages rapidly
+	for i := 0; i < numMessages; i++ {
+		bus.Publish("multi-async", &guide.Message{ID: "msg"})
+	}
+
+	// Close should wait for all handlers
+	err = bus.Close()
+	require.NoError(t, err)
+
+	// All handlers should have finished by now
+	assert.Equal(t, int64(numMessages), atomic.LoadInt64(&handlersFinished))
+}
+
+func TestChannelBus_AsyncHandler_PanicRecovery(t *testing.T) {
+	// Test that panicking async handlers don't prevent shutdown
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 100})
+
+	var goodHandlerCount int64
+
+	// Panicking async handler
+	_, err := bus.SubscribeAsync("panic-async", func(msg *guide.Message) error {
+		panic("intentional panic")
+	})
+	require.NoError(t, err)
+
+	// Good async handler
+	_, err = bus.SubscribeAsync("good-async", func(msg *guide.Message) error {
+		time.Sleep(5 * time.Millisecond)
+		atomic.AddInt64(&goodHandlerCount, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Publish to both
+	for i := 0; i < 10; i++ {
+		bus.Publish("panic-async", &guide.Message{ID: "panic-msg"})
+		bus.Publish("good-async", &guide.Message{ID: "good-msg"})
+	}
+
+	// Close should complete despite panics
+	done := make(chan struct{})
+	go func() {
+		bus.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() timed out - possible goroutine leak")
+	}
+
+	// Good handler should have processed messages
+	assert.GreaterOrEqual(t, atomic.LoadInt64(&goodHandlerCount), int64(1))
+}
+
+func TestChannelBus_SyncHandler_NotAffectedByFix(t *testing.T) {
+	// Verify synchronous handlers still work correctly
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	var count int64
+
+	_, err := bus.Subscribe("sync-topic", func(msg *guide.Message) error {
+		atomic.AddInt64(&count, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		bus.Publish("sync-topic", &guide.Message{ID: "msg"})
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int64(10), atomic.LoadInt64(&count))
+}

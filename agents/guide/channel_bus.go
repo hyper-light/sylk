@@ -215,11 +215,20 @@ func (s *channelSubscription) run(wg *sync.WaitGroup) {
 		}
 
 		if s.async {
-			go s.handleMessage(msg)
+			// Track async handler goroutines for proper shutdown
+			wg.Add(1)
+			go s.handleMessageAsync(wg, msg)
 		} else {
 			s.handleMessage(msg)
 		}
 	}
+}
+
+// handleMessageAsync wraps handleMessage with WaitGroup tracking for async handlers.
+// This ensures the bus waits for all async handlers to complete during shutdown.
+func (s *channelSubscription) handleMessageAsync(wg *sync.WaitGroup, msg *Message) {
+	defer wg.Done()
+	s.handleMessage(msg)
 }
 
 func (s *channelSubscription) handleMessage(msg *Message) {
