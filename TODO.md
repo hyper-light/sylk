@@ -37538,7 +37538,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Track and cleanup all intermediate resources                             ││
 │ │   SEVERITY: HIGH - Resource leak                                                ││
 │ │                                                                                  ││
-│ │ [ ] W12.52 - Deadlock Detector False Positives                                  ││
+│ │ [x] W12.52 - Deadlock Detector False Positives                                  ││
 │ │   FILE: core/recovery/deadlock.go:88-124                                        ││
 │ │   ISSUE: Deadlock detection can trigger false positives                         ││
 │ │   FIX: Add confirmation checks before declaring deadlock                        ││
@@ -37549,7 +37549,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 2D - VECTORGRAPHDB MITIGATIONS (4 HIGH)                                   ││
 │ │                                                                                  ││
-│ │ [ ] W12.53 - Quality Race in applyRedundancyPenalty                             ││
+│ │ [x] W12.53 - Quality Race in applyRedundancyPenalty                             ││
 │ │   FILE: core/vectorgraphdb/mitigations/quality.go:200-210                       ││
 │ │   ISSUE: Score modification without synchronization                             ││
 │ │   FIX: Add mutex protection for score updates                                   ││
