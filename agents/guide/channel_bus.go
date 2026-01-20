@@ -116,7 +116,12 @@ func (b *ChannelBus) subscribe(topic string, handler MessageHandler, async bool)
 	}
 	sub.active.Store(true)
 
-	topicSubs, _ := b.subscriptions.GetOrSet(topic, &topicSubscriptions{})
+	// W12.27: Use GetOrCreate with factory to avoid check-then-act race.
+	// The factory is only called if the topic doesn't exist, and the entire
+	// operation is atomic (factory runs under shard lock).
+	topicSubs, _ := b.subscriptions.GetOrCreate(topic, func() *topicSubscriptions {
+		return &topicSubscriptions{}
+	})
 	topicSubs.mu.Lock()
 	topicSubs.subs = append(topicSubs.subs, sub)
 	topicSubs.mu.Unlock()

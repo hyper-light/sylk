@@ -413,3 +413,125 @@ func TestChannelBus_SyncHandler_NotAffectedByFix(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, int64(10), atomic.LoadInt64(&count))
 }
+
+// =============================================================================
+// W12.27 Tests - Topic Registration Race Prevention
+// =============================================================================
+
+func TestChannelBus_W12_27_ConcurrentTopicRegistration(t *testing.T) {
+	// W12.27: Test that concurrent subscriptions to the same topic don't race
+	// when registering the topic for the first time.
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 100})
+	defer bus.Close()
+
+	const goroutines = 100
+	const topic = "concurrent-topic"
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	var subscribeErrors int64
+	var successfulSubs int64
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			sub, err := bus.Subscribe(topic, func(msg *guide.Message) error {
+				return nil
+			})
+			if err != nil {
+				atomic.AddInt64(&subscribeErrors, 1)
+				return
+			}
+			atomic.AddInt64(&successfulSubs, 1)
+			// Keep subscription alive until test ends
+			_ = sub
+		}()
+	}
+
+	wg.Wait()
+
+	// All subscriptions should succeed
+	assert.Equal(t, int64(0), subscribeErrors)
+	assert.Equal(t, int64(goroutines), successfulSubs)
+
+	// Verify all subscribers are registered
+	count := bus.TopicSubscriberCount(topic)
+	assert.Equal(t, goroutines, count)
+}
+
+func TestChannelBus_W12_27_ConcurrentNewTopics(t *testing.T) {
+	// W12.27: Test concurrent creation of many different topics
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 100, ShardCount: 64})
+	defer bus.Close()
+
+	const goroutines = 100
+	const topicsPerGoroutine = 10
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func(gid int) {
+			defer wg.Done()
+			for j := 0; j < topicsPerGoroutine; j++ {
+				topic := string(rune('A'+gid%26)) + "-topic-" + string(rune('0'+j%10))
+				_, err := bus.Subscribe(topic, func(msg *guide.Message) error {
+					return nil
+				})
+				if err != nil {
+					t.Errorf("subscribe failed: %v", err)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify stats show subscriptions
+	stats := bus.Stats()
+	assert.GreaterOrEqual(t, stats.Subscriptions, 1)
+}
+
+func TestChannelBus_W12_27_ConcurrentSubscribeAndPublish(t *testing.T) {
+	// W12.27: Test that subscribing and publishing to the same topic concurrently is safe
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 1000})
+	defer bus.Close()
+
+	const topic = "subscribe-publish-topic"
+	var received int64
+
+	var wg sync.WaitGroup
+
+	// Start publishers
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				bus.Publish(topic, &guide.Message{ID: "msg"})
+			}
+		}()
+	}
+
+	// Start subscribers
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := bus.Subscribe(topic, func(msg *guide.Message) error {
+				atomic.AddInt64(&received, 1)
+				return nil
+			})
+			if err != nil {
+				t.Errorf("subscribe failed: %v", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond)
+
+	// Just verify no crashes/races - exact count depends on timing
+	t.Logf("Received %d messages", atomic.LoadInt64(&received))
+}

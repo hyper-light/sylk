@@ -2,6 +2,7 @@ package guide
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -55,6 +56,58 @@ func TestShardedMap_GetOrSet(t *testing.T) {
 	val, existed = m.GetOrSet("key", 100)
 	if !existed || val != 42 {
 		t.Errorf("expected (42, true), got (%d, %v)", val, existed)
+	}
+}
+
+func TestShardedMap_GetOrCreate(t *testing.T) {
+	m := NewStringMap[int](32)
+	factoryCalls := 0
+
+	factory := func() int {
+		factoryCalls++
+		return 42
+	}
+
+	// First call should create
+	val, existed := m.GetOrCreate("key", factory)
+	if existed || val != 42 || factoryCalls != 1 {
+		t.Errorf("expected (42, false, calls=1), got (%d, %v, calls=%d)", val, existed, factoryCalls)
+	}
+
+	// Second call should return existing without calling factory
+	val, existed = m.GetOrCreate("key", factory)
+	if !existed || val != 42 || factoryCalls != 1 {
+		t.Errorf("expected (42, true, calls=1), got (%d, %v, calls=%d)", val, existed, factoryCalls)
+	}
+}
+
+func TestShardedMap_GetOrCreate_Concurrent(t *testing.T) {
+	m := NewStringMap[*int](32)
+	var factoryCalls int64
+	const goroutines = 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			val, _ := m.GetOrCreate("same-key", func() *int {
+				atomic.AddInt64(&factoryCalls, 1)
+				n := 42
+				return &n
+			})
+			if *val != 42 {
+				t.Errorf("expected 42, got %d", *val)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Factory should only be called once despite concurrent access
+	if factoryCalls != 1 {
+		t.Errorf("expected factory to be called once, got %d", factoryCalls)
 	}
 }
 

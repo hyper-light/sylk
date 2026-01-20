@@ -93,7 +93,8 @@ func (m *ShardedMap[K, V]) Delete(key K) {
 	shard.mu.Unlock()
 }
 
-// GetOrSet returns the existing value for a key, or sets and returns the new value
+// GetOrSet returns the existing value for a key, or sets and returns the new value.
+// The value is created before acquiring the lock, so use GetOrCreate for expensive values.
 func (m *ShardedMap[K, V]) GetOrSet(key K, value V) (V, bool) {
 	shard := m.getShard(key)
 	shard.mu.Lock()
@@ -102,6 +103,24 @@ func (m *ShardedMap[K, V]) GetOrSet(key K, value V) (V, bool) {
 		shard.mu.Unlock()
 		return existing, true
 	}
+	shard.items[key] = value
+	shard.mu.Unlock()
+	return value, false
+}
+
+// GetOrCreate returns the existing value for a key, or creates and returns a new value.
+// The factory function is only called if the key doesn't exist, making this more efficient
+// than GetOrSet when value creation is expensive.
+// This operation is atomic - the factory is called under the lock.
+func (m *ShardedMap[K, V]) GetOrCreate(key K, factory func() V) (V, bool) {
+	shard := m.getShard(key)
+	shard.mu.Lock()
+	existing, ok := shard.items[key]
+	if ok {
+		shard.mu.Unlock()
+		return existing, true
+	}
+	value := factory()
 	shard.items[key] = value
 	shard.mu.Unlock()
 	return value, false
