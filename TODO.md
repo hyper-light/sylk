@@ -35401,29 +35401,33 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ EXECUTION WAVE 4: Data Layer (4 parallel - depends on Wave 2, 3)                ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ [ ] W4N.13 - HNSW GetVectors/GetMagnitudes Expose Internal State                ││
+│ │ [x] W4N.13 - HNSW GetVectors/GetMagnitudes Expose Internal State                ││
 │ │   FILE: core/vectorgraphdb/hnsw/hnsw.go (GetVectors, GetMagnitudes methods)     ││
 │ │   ISSUE: Returns actual internal maps, caller can corrupt state                 ││
 │ │   FIX: Return deep copies of maps                                               ││
 │ │   SEVERITY: MEDIUM - Potential data corruption                                  ││
+│ │   STATUS: DONE - Commit e873b22                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.14 - HandoffManager MarshalJSON Sequential Lock Acquisition             ││
+│ │ [x] W4N.14 - HandoffManager MarshalJSON Sequential Lock Acquisition             ││
 │ │   FILE: core/handoff/manager.go:831-853                                         ││
 │ │   ISSUE: Acquires mu.RLock then contextMu.RLock - inconsistent state possible   ││
 │ │   FIX: Use single lock for entire marshal or accept eventual consistency        ││
 │ │   SEVERITY: MEDIUM - Inconsistent serialization during updates                  ││
+│ │   STATUS: DONE - Commit 2d0b52b                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.15 - AsyncRetrievalFeedbackHook Untracked Background Worker             ││
+│ │ [x] W4N.15 - AsyncRetrievalFeedbackHook Untracked Background Worker             ││
 │ │   FILE: core/chunking/retrieval_feedback.go:199-200                             ││
 │ │   ISSUE: processLoop goroutine tracked via WaitGroup but not GoroutineScope     ││
 │ │   FIX: Accept GoroutineScope in config and use if provided                      ││
 │ │   SEVERITY: LOW - WAVE 4 tracking incomplete                                    ││
+│ │   STATUS: DONE - Commit 635da81                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.16 - ObservationLog Sequence Number Overflow Protection                 ││
+│ │ [x] W4N.16 - ObservationLog Sequence Number Overflow Protection                 ││
 │ │   FILE: core/context/observation_log.go:445                                     ││
 │ │   ISSUE: uint64 sequence can overflow after ~18.4 quintillion observations      ││
 │ │   FIX: Document limitation or implement reset during compaction                 ││
 │ │   SEVERITY: LOW - Theoretical but should be addressed                           ││
+│ │   STATUS: DONE - Commit 13499bc                                                 ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │ EXECUTION WAVE 5: Performance/Polish (2 parallel - depends on Wave 4)           ││
