@@ -1303,3 +1303,296 @@ func BenchmarkHandoffManager_Concurrent(b *testing.B) {
 		}
 	})
 }
+
+// =============================================================================
+// W4H.4 Channel Double-Close Prevention Tests
+// =============================================================================
+// These tests verify that the sync.Once-based closeDoneCh() prevents panic
+// from double-close of the doneCh channel.
+
+func TestHandoffManager_StopNeverStarted_NoPanic(t *testing.T) {
+	// Test Stop() on a manager that was never started
+	// This exercises the path where Stop() closes doneCh directly
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation: false,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	// Stop without starting - should not panic
+	err := manager.Stop()
+	if err != nil {
+		t.Errorf("Stop on never-started manager should succeed, got: %v", err)
+	}
+
+	if !manager.IsClosed() {
+		t.Error("Manager should be closed after Stop")
+	}
+}
+
+func TestHandoffManager_StopStartedManager_NoPanic(t *testing.T) {
+	// Test Stop() on a manager that was started
+	// This exercises the path where backgroundLoop closes doneCh via defer
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation:    false,
+		GracefulShutdownTimeout: 5 * time.Second,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	if err := manager.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Give the background goroutine time to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Stop should not panic - backgroundLoop will close doneCh via closeDoneCh()
+	err := manager.Stop()
+	if err != nil {
+		t.Errorf("Stop on started manager should succeed, got: %v", err)
+	}
+
+	if !manager.IsClosed() {
+		t.Error("Manager should be closed after Stop")
+	}
+}
+
+func TestHandoffManager_DoubleStop_NoPanic(t *testing.T) {
+	// Test calling Stop() twice - should return error, not panic
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation: false,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	// First stop
+	err1 := manager.Stop()
+	if err1 != nil {
+		t.Errorf("First Stop should succeed, got: %v", err1)
+	}
+
+	// Second stop should return ErrManagerClosed, not panic
+	err2 := manager.Stop()
+	if err2 != ErrManagerClosed {
+		t.Errorf("Second Stop should return ErrManagerClosed, got: %v", err2)
+	}
+}
+
+func TestHandoffManager_DoubleStop_AfterStart_NoPanic(t *testing.T) {
+	// Test calling Stop() twice after starting
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation:    false,
+		GracefulShutdownTimeout: 5 * time.Second,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	if err := manager.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	// First stop
+	err1 := manager.Stop()
+	if err1 != nil {
+		t.Errorf("First Stop should succeed, got: %v", err1)
+	}
+
+	// Second stop should return ErrManagerClosed, not panic
+	err2 := manager.Stop()
+	if err2 != ErrManagerClosed {
+		t.Errorf("Second Stop should return ErrManagerClosed, got: %v", err2)
+	}
+}
+
+func TestHandoffManager_ConcurrentStop_NoPanic(t *testing.T) {
+	// Test concurrent Stop() calls - should not panic due to double-close
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation:    true,
+		EvaluationInterval:      50 * time.Millisecond,
+		GracefulShutdownTimeout: 5 * time.Second,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	if err := manager.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Give the background goroutine time to start
+	time.Sleep(20 * time.Millisecond)
+
+	// Launch multiple goroutines trying to stop concurrently
+	var wg sync.WaitGroup
+	numGoroutines := 10
+	errors := make([]error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errors[idx] = manager.Stop()
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Exactly one should succeed, rest should return ErrManagerClosed
+	successCount := 0
+	closedCount := 0
+	for _, err := range errors {
+		if err == nil {
+			successCount++
+		} else if err == ErrManagerClosed {
+			closedCount++
+		} else {
+			t.Errorf("Unexpected error: %v", err)
+		}
+	}
+
+	if successCount != 1 {
+		t.Errorf("Expected exactly 1 success, got %d", successCount)
+	}
+	if closedCount != numGoroutines-1 {
+		t.Errorf("Expected %d ErrManagerClosed, got %d", numGoroutines-1, closedCount)
+	}
+
+	if !manager.IsClosed() {
+		t.Error("Manager should be closed after concurrent Stop calls")
+	}
+}
+
+func TestHandoffManager_StopDuringBackgroundEvaluation_NoPanic(t *testing.T) {
+	// Test stopping while background evaluation is in progress
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation:    true,
+		EvaluationInterval:      10 * time.Millisecond,
+		MinEvaluationInterval:   1 * time.Millisecond,
+		DefaultTimeout:          5 * time.Second,
+		GracefulShutdownTimeout: 5 * time.Second,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	if err := manager.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Wait for at least one evaluation to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop while potentially in the middle of evaluation
+	err := manager.Stop()
+	if err != nil {
+		t.Errorf("Stop should succeed, got: %v", err)
+	}
+
+	if !manager.IsClosed() {
+		t.Error("Manager should be closed")
+	}
+}
+
+func TestHandoffManager_RapidStartStop_NoPanic(t *testing.T) {
+	// Test rapid start/stop cycles - each manager gets its own lifecycle
+	for i := 0; i < 20; i++ {
+		config := &HandoffManagerConfig{
+			EnableAutoEvaluation:    true,
+			EvaluationInterval:      10 * time.Millisecond,
+			GracefulShutdownTimeout: 1 * time.Second,
+		}
+		manager := NewHandoffManager(config, nil, nil, nil)
+
+		if err := manager.Start(); err != nil {
+			t.Fatalf("Iteration %d: Start failed: %v", i, err)
+		}
+
+		// Minimal delay
+		time.Sleep(5 * time.Millisecond)
+
+		if err := manager.Stop(); err != nil {
+			t.Errorf("Iteration %d: Stop failed: %v", i, err)
+		}
+	}
+}
+
+func TestHandoffManager_CloseDoneCh_Idempotent(t *testing.T) {
+	// Test that closeDoneCh can be called multiple times safely
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation: false,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	// Call closeDoneCh multiple times - should not panic
+	for i := 0; i < 10; i++ {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("closeDoneCh panicked on call %d: %v", i, r)
+				}
+			}()
+			manager.closeDoneCh()
+		}()
+	}
+
+	// Verify channel is closed by checking if receive returns immediately
+	select {
+	case <-manager.doneCh:
+		// Expected - channel is closed
+	case <-time.After(100 * time.Millisecond):
+		t.Error("doneCh should be closed and receivable")
+	}
+}
+
+func TestHandoffManager_ConcurrentCloseDoneCh_NoPanic(t *testing.T) {
+	// Test concurrent calls to closeDoneCh
+	config := &HandoffManagerConfig{
+		EnableAutoEvaluation: false,
+	}
+	manager := NewHandoffManager(config, nil, nil, nil)
+
+	var wg sync.WaitGroup
+	numGoroutines := 100
+
+	// Launch many goroutines all trying to close at once
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("closeDoneCh panicked: %v", r)
+				}
+			}()
+			manager.closeDoneCh()
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify channel is closed
+	select {
+	case <-manager.doneCh:
+		// Expected
+	default:
+		t.Error("doneCh should be closed")
+	}
+}
+
+func TestHandoffManager_BackgroundLoopAndStopRace_NoPanic(t *testing.T) {
+	// Test the specific race condition between backgroundLoop defer and Stop
+	// This tests the original bug scenario
+	for i := 0; i < 50; i++ {
+		config := &HandoffManagerConfig{
+			EnableAutoEvaluation:    true,
+			EvaluationInterval:      1 * time.Millisecond,
+			GracefulShutdownTimeout: 100 * time.Millisecond,
+		}
+		manager := NewHandoffManager(config, nil, nil, nil)
+
+		if err := manager.Start(); err != nil {
+			t.Fatalf("Iteration %d: Start failed: %v", i, err)
+		}
+
+		// Immediately stop to create race with backgroundLoop startup
+		err := manager.Stop()
+		if err != nil {
+			t.Errorf("Iteration %d: Stop failed: %v", i, err)
+		}
+	}
+}

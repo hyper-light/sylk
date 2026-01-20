@@ -171,15 +171,16 @@ type HandoffManager struct {
 	contextMu       sync.RWMutex
 
 	// Status tracking
-	status        atomic.Int32
+	status         atomic.Int32
 	lastEvaluation time.Time
 	lastHandoff    time.Time
 
 	// Lifecycle management
-	stopCh  chan struct{}
-	doneCh  chan struct{}
-	started atomic.Bool
-	closed  atomic.Bool
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	doneOnce sync.Once
+	started  atomic.Bool
+	closed   atomic.Bool
 
 	// Statistics
 	evaluations      atomic.Int64
@@ -228,6 +229,15 @@ func NewHandoffManager(
 	return manager
 }
 
+// closeDoneCh safely closes the doneCh channel exactly once.
+// This prevents panic from double-close when both Stop() and backgroundLoop()
+// might attempt to close the channel.
+func (m *HandoffManager) closeDoneCh() {
+	m.doneOnce.Do(func() {
+		close(m.doneCh)
+	})
+}
+
 // =============================================================================
 // Lifecycle Management
 // =============================================================================
@@ -259,7 +269,7 @@ func (m *HandoffManager) Stop() error {
 	}
 
 	if !m.started.Load() {
-		close(m.doneCh)
+		m.closeDoneCh()
 		return nil
 	}
 
@@ -584,7 +594,7 @@ func (m *HandoffManager) learnFromOutcome(result *HandoffResult, preparedCtx *Pr
 
 // backgroundLoop runs periodic evaluation and maintenance.
 func (m *HandoffManager) backgroundLoop() {
-	defer close(m.doneCh)
+	defer m.closeDoneCh()
 
 	if !m.config.EnableAutoEvaluation || m.config.EvaluationInterval <= 0 {
 		// No automatic evaluation, just wait for stop signal
