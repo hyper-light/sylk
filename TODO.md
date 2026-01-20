@@ -37338,13 +37338,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add TTL-based cleanup for pending ACKs                                   ││
 │ │   SEVERITY: HIGH - Memory leak                                                  ││
 │ │                                                                                  ││
-│ │ [ ] W12.26 - SessionBus Lock Ordering Deadlock Risk                             ││
+│ │ [x] W12.26 - SessionBus Lock Ordering Deadlock Risk                             ││
 │ │   FILE: agents/guide/session_bus.go:528-549                                     ││
 │ │   ISSUE: Inconsistent lock ordering between Subscribe and Unsubscribe           ││
 │ │   FIX: Establish and document consistent lock ordering                          ││
 │ │   SEVERITY: HIGH - Potential deadlock                                           ││
 │ │                                                                                  ││
-│ │ [ ] W12.27 - ChannelBus Race in Topic Registration                              ││
+│ │ [x] W12.27 - ChannelBus Race in Topic Registration                              ││
 │ │   FILE: agents/guide/channel_bus.go:84-92                                       ││
 │ │   ISSUE: Check-then-act race when registering new topics                        ││
 │ │   FIX: Use sync.Map or lock entire operation                                    ││
@@ -37442,17 +37442,19 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 2A - DAG & PIPELINE EXECUTION (3 HIGH)                                    ││
 │ │                                                                                  ││
-│ │ [ ] W12.40 - LLMGate Goroutine Leak in waitWithSoftTimeout                      ││
+│ │ [x] W12.40 - LLMGate Goroutine Leak in waitWithSoftTimeout                      ││
 │ │   FILE: core/concurrency/llm_gate.go:1065-1077                                  ││
 │ │   ISSUE: Goroutine blocks forever if timeout never fires                        ││
 │ │   FIX: Add context cancellation to timeout goroutine                            ││
 │ │   SEVERITY: HIGH - Goroutine leak                                               ││
+│ │   RESOLUTION: Refactored to use single shared waiter goroutine pattern          ││
 │ │                                                                                  ││
-│ │ [ ] W12.41 - LLMGate Goroutine Leak in waitWithHardDeadline                     ││
+│ │ [x] W12.41 - LLMGate Goroutine Leak in waitWithHardDeadline                     ││
 │ │   FILE: core/concurrency/llm_gate.go:1081-1100                                  ││
 │ │   ISSUE: Similar goroutine leak pattern as waitWithSoftTimeout                  ││
 │ │   FIX: Add context cancellation to deadline goroutine                           ││
 │ │   SEVERITY: HIGH - Goroutine leak                                               ││
+│ │   RESOLUTION: Unified with W12.40 fix using single waiter goroutine             ││
 │ │                                                                                  ││
 │ │ [ ] W12.42 - Scheduler DAG Slot Leak                                            ││
 │ │   FILE: core/dag/scheduler.go:110                                               ││
