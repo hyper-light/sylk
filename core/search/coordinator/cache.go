@@ -278,9 +278,11 @@ func GenerateCacheKey(query string, filters map[string]string, limit, offset int
 		h.Write([]byte(filters[k]))
 	}
 
-	// Include pagination parameters
-	binary.Write(h, binary.LittleEndian, int32(limit))
-	binary.Write(h, binary.LittleEndian, int32(offset))
+	// W4L.18: Include pagination parameters with proper error handling.
+	// These writes to a hash.Hash cannot fail (hash.Hash.Write always returns nil error),
+	// but we explicitly ignore them to satisfy linters and document the intent.
+	_ = binary.Write(h, binary.LittleEndian, int32(limit))
+	_ = binary.Write(h, binary.LittleEndian, int32(offset))
 
 	return hex.EncodeToString(h.Sum(nil))
 }

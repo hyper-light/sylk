@@ -3,6 +3,7 @@ package coordinator
 import (
 	"container/heap"
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -167,6 +168,7 @@ func (c *SearchCoordinator) searchParallel(
 }
 
 // searchBleve performs the Bleve full-text search.
+// W4L.17: Includes query context in error messages for debugging.
 func (c *SearchCoordinator) searchBleve(
 	ctx context.Context,
 	req *HybridSearchRequest,
@@ -174,13 +176,16 @@ func (c *SearchCoordinator) searchBleve(
 	startTime := time.Now()
 
 	if c.bleve == nil || !c.bleve.IsOpen() {
-		return searchResult{err: ErrCoordinatorClosed}
+		return searchResult{
+			duration: time.Since(startTime),
+			err:      fmt.Errorf("bleve search for query %q: %w", req.Query, ErrCoordinatorClosed),
+		}
 	}
 
 	bleveReq := c.buildBleveRequest(req)
 	result, err := c.bleve.Search(ctx, bleveReq)
 
-	return c.processBleveResult(result, err, startTime)
+	return c.processBleveResult(result, err, req.Query, startTime)
 }
 
 // buildBleveRequest creates a Bleve search request from the hybrid request.
@@ -211,15 +216,17 @@ func capFusionLimit(limit int) int {
 }
 
 // processBleveResult converts Bleve results to the internal format.
+// W4L.17: Wraps errors with query context for better diagnostics.
 func (c *SearchCoordinator) processBleveResult(
 	result *search.SearchResult,
 	err error,
+	query string,
 	startTime time.Time,
 ) searchResult {
 	if err != nil {
 		return searchResult{
 			duration: time.Since(startTime),
-			err:      err,
+			err:      fmt.Errorf("bleve search for query %q: %w", query, err),
 		}
 	}
 
@@ -230,6 +237,7 @@ func (c *SearchCoordinator) processBleveResult(
 }
 
 // searchVector performs the Vector semantic search.
+// W4L.17: Includes query context in error messages for debugging.
 func (c *SearchCoordinator) searchVector(
 	ctx context.Context,
 	req *HybridSearchRequest,
@@ -237,15 +245,21 @@ func (c *SearchCoordinator) searchVector(
 	startTime := time.Now()
 
 	if c.vector == nil {
-		return searchResult{err: ErrCoordinatorClosed}
+		return searchResult{
+			duration: time.Since(startTime),
+			err:      fmt.Errorf("vector search for query %q: %w", req.Query, ErrCoordinatorClosed),
+		}
 	}
 
 	queryVector, err := c.getQueryVector(ctx, req)
 	if err != nil {
-		return searchResult{duration: time.Since(startTime), err: err}
+		return searchResult{
+			duration: time.Since(startTime),
+			err:      fmt.Errorf("vector search embedding for query %q: %w", req.Query, err),
+		}
 	}
 
-	return c.executeVectorSearch(ctx, queryVector, capFusionLimit(req.Limit), startTime)
+	return c.executeVectorSearch(ctx, queryVector, capFusionLimit(req.Limit), req.Query, startTime)
 }
 
 // getQueryVector gets or generates the query embedding.
@@ -265,17 +279,23 @@ func (c *SearchCoordinator) getQueryVector(
 }
 
 // executeVectorSearch runs the vector search and processes results.
+// W4L.17: Wraps errors with query context for better diagnostics.
 func (c *SearchCoordinator) executeVectorSearch(
 	ctx context.Context,
 	queryVector []float32,
 	limit int,
+	query string,
 	startTime time.Time,
 ) searchResult {
 	results, err := c.vector.Search(ctx, queryVector, limit)
 	if err != nil {
-		return searchResult{duration: time.Since(startTime), err: err}
+		return searchResult{
+			duration: time.Since(startTime),
+			err:      fmt.Errorf("vector search for query %q: %w", query, err),
+		}
 	}
 
+	// W4L.17: Pre-allocate slice with known capacity for efficiency
 	docs := make([]search.ScoredDocument, 0, len(results))
 	for _, r := range results {
 		docs = append(docs, r.ToScoredDocument())

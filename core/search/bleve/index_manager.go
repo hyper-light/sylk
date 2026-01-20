@@ -533,7 +533,8 @@ func (m *IndexManager) Index(ctx context.Context, doc *search.Document) error {
 	}
 
 	if err := m.index.Index(doc.ID, doc); err != nil {
-		return err
+		// W4L.16: Add document context to error for debugging
+		return fmt.Errorf("index document %q: %w", doc.ID, err)
 	}
 
 	// Update path index (PF.3.3)
