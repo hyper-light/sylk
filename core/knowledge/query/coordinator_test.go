@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -813,6 +814,7 @@ func TestExecuteWithMetrics_TracksTiming(t *testing.T) {
 
 func TestRecordMetrics(t *testing.T) {
 	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	defer coord.Close()
 
 	metrics := &QueryMetrics{
 		TextLatency:         10 * time.Millisecond,
@@ -836,6 +838,7 @@ func TestRecordMetrics(t *testing.T) {
 
 func TestGetAverageMetrics(t *testing.T) {
 	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	defer coord.Close()
 
 	// Record multiple metrics
 	coord.RecordMetrics("q1", &QueryMetrics{
@@ -862,6 +865,7 @@ func TestGetAverageMetrics(t *testing.T) {
 
 func TestGetAverageMetrics_Empty(t *testing.T) {
 	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	defer coord.Close()
 
 	avg := coord.GetAverageMetrics()
 
@@ -1197,6 +1201,7 @@ func TestConcurrentExecute(t *testing.T) {
 
 func TestConcurrentSetTimeout(t *testing.T) {
 	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	defer coord.Close()
 
 	// Concurrent timeout updates
 	const numUpdates = 100
@@ -1215,4 +1220,310 @@ func TestConcurrentSetTimeout(t *testing.T) {
 	}
 
 	// Should complete without race conditions
+}
+
+// =============================================================================
+// Bounded Metrics Tracker Tests
+// =============================================================================
+
+func TestMetricsTracker_RecordAndRetrieve(t *testing.T) {
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      100,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 1 * time.Hour, // Long interval to avoid cleanup during test
+	})
+	defer mt.Close()
+
+	metrics := &QueryMetrics{
+		TextLatency:     10 * time.Millisecond,
+		TotalLatency:    20 * time.Millisecond,
+		TextContributed: true,
+	}
+
+	mt.Record("query-1", metrics)
+
+	retrieved, ok := mt.GetMetrics("query-1")
+	if !ok {
+		t.Fatal("expected to find metrics for query-1")
+	}
+
+	if retrieved.TextLatency != 10*time.Millisecond {
+		t.Errorf("TextLatency = %v, want 10ms", retrieved.TextLatency)
+	}
+	if retrieved.TotalLatency != 20*time.Millisecond {
+		t.Errorf("TotalLatency = %v, want 20ms", retrieved.TotalLatency)
+	}
+}
+
+func TestMetricsTracker_NotFound(t *testing.T) {
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      100,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer mt.Close()
+
+	_, ok := mt.GetMetrics("nonexistent")
+	if ok {
+		t.Error("expected not to find nonexistent query")
+	}
+}
+
+func TestMetricsTracker_MaxEntriesEviction(t *testing.T) {
+	const maxEntries = 5
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      maxEntries,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer mt.Close()
+
+	// Record more entries than max
+	for i := 0; i < maxEntries+10; i++ {
+		mt.Record(
+			string(rune('a'+i)),
+			&QueryMetrics{TotalLatency: time.Duration(i) * time.Millisecond},
+		)
+	}
+
+	// Verify entry count does not exceed max
+	count := mt.EntryCount()
+	if count > maxEntries {
+		t.Errorf("entry count = %d, want <= %d", count, maxEntries)
+	}
+
+	// Most recent entries should still be present
+	for i := maxEntries + 10 - 1; i >= maxEntries+10-maxEntries; i-- {
+		_, ok := mt.GetMetrics(string(rune('a' + i)))
+		if !ok {
+			t.Errorf("expected recent entry %c to be present", rune('a'+i))
+		}
+	}
+}
+
+func TestMetricsTracker_TTLExpiration(t *testing.T) {
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      100,
+		TTL:             50 * time.Millisecond, // Short TTL for testing
+		CleanupInterval: 10 * time.Millisecond, // Fast cleanup
+	})
+	defer mt.Close()
+
+	// Record an entry
+	mt.Record("query-1", &QueryMetrics{TotalLatency: 10 * time.Millisecond})
+
+	// Entry should be present initially
+	_, ok := mt.GetMetrics("query-1")
+	if !ok {
+		t.Fatal("expected to find metrics immediately after recording")
+	}
+
+	// Wait for TTL to expire and cleanup to run
+	time.Sleep(100 * time.Millisecond)
+
+	// Entry should be cleaned up
+	_, ok = mt.GetMetrics("query-1")
+	if ok {
+		t.Error("expected entry to be expired and cleaned up")
+	}
+}
+
+func TestMetricsTracker_BoundedGrowth(t *testing.T) {
+	const maxEntries = 100
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      maxEntries,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer mt.Close()
+
+	// Record many entries
+	for i := 0; i < 1000; i++ {
+		mt.Record(
+			string(rune(i)),
+			&QueryMetrics{TotalLatency: time.Duration(i) * time.Millisecond},
+		)
+	}
+
+	// Verify bounded growth
+	count := mt.EntryCount()
+	if count > maxEntries {
+		t.Errorf("entry count = %d, exceeds max %d", count, maxEntries)
+	}
+}
+
+func TestMetricsTracker_AggregatesPreserved(t *testing.T) {
+	const maxEntries = 3
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      maxEntries,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer mt.Close()
+
+	// Record entries that will be evicted
+	for i := 0; i < 10; i++ {
+		mt.Record(
+			string(rune('a'+i)),
+			&QueryMetrics{
+				TotalLatency:    time.Duration(10*(i+1)) * time.Millisecond,
+				TextContributed: true,
+				TextLatency:     time.Duration(5*(i+1)) * time.Millisecond,
+			},
+		)
+	}
+
+	// Aggregates should reflect all recorded entries, not just retained ones
+	avg := mt.GetAverageMetrics()
+
+	// Total latency sum: 10+20+30+...+100 = 550ms, count = 10, avg = 55ms
+	expectedAvg := 55 * time.Millisecond
+	if avg.TotalLatency != expectedAvg {
+		t.Errorf("average TotalLatency = %v, want %v", avg.TotalLatency, expectedAvg)
+	}
+}
+
+func TestMetricsTracker_ConcurrentAccess(t *testing.T) {
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      100,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer mt.Close()
+
+	const numGoroutines = 50
+	const opsPerGoroutine = 100
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines * 2) // Writers + readers
+
+	// Writers
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				queryID := string(rune(goroutineID*1000 + i))
+				mt.Record(queryID, &QueryMetrics{
+					TotalLatency: time.Duration(i) * time.Millisecond,
+				})
+			}
+		}(g)
+	}
+
+	// Readers
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				queryID := string(rune(goroutineID*1000 + i))
+				mt.GetMetrics(queryID)
+				mt.GetAverageMetrics()
+				mt.EntryCount()
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Should complete without race conditions
+	count := mt.EntryCount()
+	if count > mt.MaxEntries() {
+		t.Errorf("entry count %d exceeds max %d", count, mt.MaxEntries())
+	}
+}
+
+func TestMetricsTracker_DefaultConfig(t *testing.T) {
+	config := DefaultMetricsTrackerConfig()
+
+	if config.MaxEntries != DefaultMetricsMaxEntries {
+		t.Errorf("MaxEntries = %d, want %d", config.MaxEntries, DefaultMetricsMaxEntries)
+	}
+	if config.TTL != DefaultMetricsTTL {
+		t.Errorf("TTL = %v, want %v", config.TTL, DefaultMetricsTTL)
+	}
+	if config.CleanupInterval != DefaultCleanupInterval {
+		t.Errorf("CleanupInterval = %v, want %v", config.CleanupInterval, DefaultCleanupInterval)
+	}
+}
+
+func TestMetricsTracker_ConfigDefaults(t *testing.T) {
+	// Test that invalid config values get defaults
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      0,  // Should default
+		TTL:             0,  // Should default
+		CleanupInterval: 0,  // Should default
+	})
+	defer mt.Close()
+
+	if mt.MaxEntries() != DefaultMetricsMaxEntries {
+		t.Errorf("MaxEntries = %d, want %d", mt.MaxEntries(), DefaultMetricsMaxEntries)
+	}
+	if mt.TTL() != DefaultMetricsTTL {
+		t.Errorf("TTL = %v, want %v", mt.TTL(), DefaultMetricsTTL)
+	}
+}
+
+func TestMetricsTracker_Close(t *testing.T) {
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      100,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 10 * time.Millisecond,
+	})
+
+	// Record some entries
+	mt.Record("query-1", &QueryMetrics{TotalLatency: 10 * time.Millisecond})
+
+	// Close should stop the cleanup goroutine
+	mt.Close()
+
+	// After close, the tracker is not usable but should not panic
+	// This test verifies graceful shutdown
+}
+
+func TestCoordinator_Close(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	// Record some metrics
+	coord.RecordMetrics("q1", &QueryMetrics{TotalLatency: 10 * time.Millisecond})
+
+	// Close should clean up the metrics tracker
+	coord.Close()
+
+	// After close, coordinator operations may not work correctly,
+	// but this test ensures Close doesn't panic
+}
+
+func TestMetricsTracker_EvictionOrder(t *testing.T) {
+	const maxEntries = 3
+	mt := newMetricsTrackerWithConfig(MetricsTrackerConfig{
+		MaxEntries:      maxEntries,
+		TTL:             1 * time.Hour,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer mt.Close()
+
+	// Record entries with delays to ensure different timestamps
+	mt.Record("first", &QueryMetrics{TotalLatency: 1 * time.Millisecond})
+	time.Sleep(1 * time.Millisecond)
+	mt.Record("second", &QueryMetrics{TotalLatency: 2 * time.Millisecond})
+	time.Sleep(1 * time.Millisecond)
+	mt.Record("third", &QueryMetrics{TotalLatency: 3 * time.Millisecond})
+	time.Sleep(1 * time.Millisecond)
+
+	// Add one more, should evict "first" (oldest)
+	mt.Record("fourth", &QueryMetrics{TotalLatency: 4 * time.Millisecond})
+
+	// "first" should be evicted
+	_, ok := mt.GetMetrics("first")
+	if ok {
+		t.Error("expected 'first' to be evicted")
+	}
+
+	// "second", "third", "fourth" should still be present
+	for _, id := range []string{"second", "third", "fourth"} {
+		_, ok := mt.GetMetrics(id)
+		if !ok {
+			t.Errorf("expected '%s' to be present", id)
+		}
+	}
 }

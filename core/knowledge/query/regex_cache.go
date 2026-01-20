@@ -139,13 +139,57 @@ func (rc *RegexCache) GetOrCompile(pattern string) (*regexp.Regexp, error) {
 }
 
 // MustGetOrCompile is like GetOrCompile but panics if the pattern is invalid.
-// Use this only for patterns that are known to be valid at compile time.
+//
+// Deprecated: This function can crash the application when called from
+// background goroutines with invalid patterns. Use GetOrCompile instead,
+// which returns an error that can be handled gracefully. If you must use
+// this function, wrap calls with SafeGetOrCompile for panic recovery.
+//
+// This function should only be used during initialization with patterns
+// that are known to be valid at compile time.
 func (rc *RegexCache) MustGetOrCompile(pattern string) *regexp.Regexp {
 	re, err := rc.GetOrCompile(pattern)
 	if err != nil {
 		panic("regex_cache: invalid pattern: " + err.Error())
 	}
 	return re
+}
+
+// SafeGetOrCompile wraps GetOrCompile with panic recovery for use cases
+// where patterns may be invalid and panics must be prevented. This is
+// useful for background goroutines or when processing untrusted patterns.
+//
+// Returns the compiled regex and nil error on success, nil and error on
+// compilation failure, or nil and a recovered panic error if a panic occurs.
+func (rc *RegexCache) SafeGetOrCompile(pattern string) (re *regexp.Regexp, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			re = nil
+			err = recoverToError(r)
+		}
+	}()
+	return rc.GetOrCompile(pattern)
+}
+
+// recoverToError converts a recovered panic value to an error.
+func recoverToError(r interface{}) error {
+	switch v := r.(type) {
+	case error:
+		return v
+	case string:
+		return &RegexPanicError{Message: v}
+	default:
+		return &RegexPanicError{Message: "unknown panic in regex compilation"}
+	}
+}
+
+// RegexPanicError represents a recovered panic from regex operations.
+type RegexPanicError struct {
+	Message string
+}
+
+func (e *RegexPanicError) Error() string {
+	return "regex_cache: recovered panic: " + e.Message
 }
 
 // Contains checks if a pattern is already cached without compiling it.
@@ -201,8 +245,19 @@ func GetOrCompileGlobal(pattern string) (*regexp.Regexp, error) {
 }
 
 // MustGetOrCompileGlobal is like GetOrCompileGlobal but panics on invalid patterns.
+//
+// Deprecated: This function can crash the application when called from
+// background goroutines with invalid patterns. Use GetOrCompileGlobal instead,
+// which returns an error that can be handled gracefully. For background
+// goroutines, use SafeGetOrCompileGlobal which includes panic recovery.
 func MustGetOrCompileGlobal(pattern string) *regexp.Regexp {
 	return globalRegexCache.MustGetOrCompile(pattern)
+}
+
+// SafeGetOrCompileGlobal compiles or retrieves a pattern from the global cache
+// with panic recovery. This is safe to use in background goroutines.
+func SafeGetOrCompileGlobal(pattern string) (*regexp.Regexp, error) {
+	return globalRegexCache.SafeGetOrCompile(pattern)
 }
 
 // PrecompileGlobal precompiles patterns into the global cache.
@@ -315,12 +370,29 @@ func (pb *PatternBuilder) BuildCached(cache *RegexCache) (*regexp.Regexp, error)
 }
 
 // MustBuild compiles the pattern and panics on error.
+//
+// Deprecated: This function can crash the application when called from
+// background goroutines with invalid patterns. Use Build instead, which
+// returns an error that can be handled gracefully. For background goroutines,
+// use SafeBuild which includes panic recovery.
 func (pb *PatternBuilder) MustBuild() *regexp.Regexp {
 	re, err := pb.Build()
 	if err != nil {
 		panic("PatternBuilder: invalid pattern: " + err.Error())
 	}
 	return re
+}
+
+// SafeBuild compiles the pattern with panic recovery for use in background
+// goroutines or when processing untrusted patterns.
+func (pb *PatternBuilder) SafeBuild() (re *regexp.Regexp, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			re = nil
+			err = recoverToError(r)
+		}
+	}()
+	return pb.Build()
 }
 
 // =============================================================================

@@ -274,6 +274,88 @@ func TestRegexCache_MustGetOrCompile(t *testing.T) {
 	})
 }
 
+func TestRegexCache_SafeGetOrCompile(t *testing.T) {
+	cache := NewRegexCache()
+
+	t.Run("returns compiled regex for valid pattern", func(t *testing.T) {
+		re, err := cache.SafeGetOrCompile(`\d+`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if re == nil {
+			t.Fatal("expected non-nil regex")
+		}
+		if !re.MatchString("123") {
+			t.Error("regex should match digits")
+		}
+	})
+
+	t.Run("returns error for invalid pattern without panic", func(t *testing.T) {
+		re, err := cache.SafeGetOrCompile(`[invalid`)
+		if err == nil {
+			t.Error("expected error for invalid pattern")
+		}
+		if re != nil {
+			t.Error("expected nil regex for invalid pattern")
+		}
+	})
+
+	t.Run("handles empty pattern", func(t *testing.T) {
+		re, err := cache.SafeGetOrCompile(``)
+		if err != nil {
+			t.Fatalf("unexpected error for empty pattern: %v", err)
+		}
+		if re == nil {
+			t.Fatal("expected non-nil regex for empty pattern")
+		}
+	})
+
+	t.Run("caches valid patterns", func(t *testing.T) {
+		re1, err1 := cache.SafeGetOrCompile(`safe-[a-z]+`)
+		if err1 != nil {
+			t.Fatalf("unexpected error: %v", err1)
+		}
+
+		re2, err2 := cache.SafeGetOrCompile(`safe-[a-z]+`)
+		if err2 != nil {
+			t.Fatalf("unexpected error: %v", err2)
+		}
+
+		if re1 != re2 {
+			t.Error("expected same regex instance for same pattern")
+		}
+	})
+
+	t.Run("concurrent safe access", func(t *testing.T) {
+		patterns := []string{`safe-\d+`, `safe-\w+`, `[a-z]+`, `[invalid`, `\s+`}
+		var wg sync.WaitGroup
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				pattern := patterns[idx%len(patterns)]
+				for j := 0; j < 20; j++ {
+					re, err := cache.SafeGetOrCompile(pattern)
+					// Invalid patterns should return error
+					if pattern == `[invalid` {
+						if err == nil {
+							t.Error("expected error for invalid pattern")
+						}
+					} else {
+						if err != nil {
+							t.Errorf("unexpected error for %q: %v", pattern, err)
+						}
+						if re == nil {
+							t.Errorf("expected non-nil regex for %q", pattern)
+						}
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
+}
+
 func TestRegexCache_Contains(t *testing.T) {
 	cache := NewRegexCache()
 
@@ -420,6 +502,26 @@ func TestGlobalCacheFunctions(t *testing.T) {
 			t.Error("expected non-zero global cache size")
 		}
 	})
+
+	t.Run("SafeGetOrCompileGlobal works with valid pattern", func(t *testing.T) {
+		re, err := SafeGetOrCompileGlobal(`global-safe-\d+`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if re == nil {
+			t.Fatal("expected non-nil regex")
+		}
+	})
+
+	t.Run("SafeGetOrCompileGlobal returns error for invalid pattern", func(t *testing.T) {
+		re, err := SafeGetOrCompileGlobal(`[invalid-global`)
+		if err == nil {
+			t.Error("expected error for invalid pattern")
+		}
+		if re != nil {
+			t.Error("expected nil regex for invalid pattern")
+		}
+	})
 }
 
 // =============================================================================
@@ -541,6 +643,162 @@ func TestPatternBuilder(t *testing.T) {
 
 		if re1 != re2 {
 			t.Error("expected same cached regex")
+		}
+	})
+
+	t.Run("SafeBuild returns error for invalid pattern", func(t *testing.T) {
+		pb := NewPatternBuilder()
+		re, err := pb.Raw(`[invalid`).SafeBuild()
+
+		if err == nil {
+			t.Error("expected error for invalid pattern")
+		}
+		if re != nil {
+			t.Error("expected nil regex for invalid pattern")
+		}
+	})
+
+	t.Run("SafeBuild succeeds for valid pattern", func(t *testing.T) {
+		pb := NewPatternBuilder()
+		re, err := pb.Raw(`\d+`).SafeBuild()
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if re == nil {
+			t.Fatal("expected non-nil regex")
+		}
+		if !re.MatchString("456") {
+			t.Error("regex should match digits")
+		}
+	})
+}
+
+// =============================================================================
+// RegexPanicError Tests
+// =============================================================================
+
+func TestRegexPanicError(t *testing.T) {
+	t.Run("Error returns formatted message", func(t *testing.T) {
+		err := &RegexPanicError{Message: "test panic"}
+		expected := "regex_cache: recovered panic: test panic"
+		if err.Error() != expected {
+			t.Errorf("Error() = %q, want %q", err.Error(), expected)
+		}
+	})
+
+	t.Run("implements error interface", func(t *testing.T) {
+		var err error = &RegexPanicError{Message: "test"}
+		if err == nil {
+			t.Error("expected non-nil error")
+		}
+	})
+}
+
+// =============================================================================
+// Panic Recovery Tests (simulating background goroutine scenarios)
+// =============================================================================
+
+func TestPanicRecoveryInGoroutines(t *testing.T) {
+	cache := NewRegexCache()
+
+	t.Run("SafeGetOrCompile prevents goroutine crash", func(t *testing.T) {
+		errChan := make(chan error, 10)
+		var wg sync.WaitGroup
+
+		// Simulate background goroutines with potentially invalid patterns
+		patterns := []string{`\d+`, `[invalid`, `[a-z]+`, `(unclosed`, `valid\w+`}
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				pattern := patterns[idx%len(patterns)]
+
+				// This should never panic
+				re, err := cache.SafeGetOrCompile(pattern)
+				if err != nil {
+					errChan <- err
+				} else if re == nil {
+					errChan <- &RegexPanicError{Message: "unexpected nil regex for: " + pattern}
+				}
+			}(i)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		// Count errors - we expect some for invalid patterns
+		errorCount := 0
+		for range errChan {
+			errorCount++
+		}
+
+		// We have 2 invalid patterns out of 5, so expect 4 errors from 10 goroutines
+		if errorCount != 4 {
+			t.Logf("got %d errors (expected 4 for invalid patterns)", errorCount)
+		}
+	})
+
+	t.Run("SafeGetOrCompileGlobal prevents goroutine crash", func(t *testing.T) {
+		done := make(chan bool, 5)
+		var wg sync.WaitGroup
+
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				pattern := `[unclosed-` + string(rune('a'+idx))
+
+				// This should never panic
+				_, err := SafeGetOrCompileGlobal(pattern)
+				if err == nil {
+					t.Error("expected error for invalid pattern")
+				}
+				done <- true
+			}(i)
+		}
+
+		wg.Wait()
+		close(done)
+
+		completedCount := 0
+		for range done {
+			completedCount++
+		}
+
+		if completedCount != 5 {
+			t.Errorf("expected 5 goroutines to complete safely, got %d", completedCount)
+		}
+	})
+
+	t.Run("SafeBuild prevents goroutine crash", func(t *testing.T) {
+		done := make(chan bool, 5)
+		var wg sync.WaitGroup
+
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pb := NewPatternBuilder()
+				_, err := pb.Raw(`[invalid-pattern`).SafeBuild()
+				if err == nil {
+					t.Error("expected error for invalid pattern")
+				}
+				done <- true
+			}()
+		}
+
+		wg.Wait()
+		close(done)
+
+		completedCount := 0
+		for range done {
+			completedCount++
+		}
+
+		if completedCount != 5 {
+			t.Errorf("expected 5 goroutines to complete safely, got %d", completedCount)
 		}
 	})
 }
