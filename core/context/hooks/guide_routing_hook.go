@@ -242,8 +242,11 @@ func (h *GuideRoutingCacheHook) injectRoutingContext(
 		TokenCount: len(routingContent) / 4, // Rough estimate
 	}
 
-	// Prepend routing context to excerpts
-	existing.Excerpts = append([]ctxpkg.Excerpt{routingExcerpt}, existing.Excerpts...)
+	// Prepend routing context to excerpts using race-safe copy pattern
+	newExcerpts := make([]ctxpkg.Excerpt, len(existing.Excerpts)+1)
+	newExcerpts[0] = routingExcerpt
+	copy(newExcerpts[1:], existing.Excerpts)
+	existing.Excerpts = newExcerpts
 
 	return existing
 }

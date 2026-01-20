@@ -395,8 +395,11 @@ func (h *WorkflowContextHook) injectWorkflowContext(
 		TokenCount: len(workflowContent) / 4, // Rough estimate
 	}
 
-	// Prepend workflow context to excerpts
-	existing.Excerpts = append([]ctxpkg.Excerpt{workflowExcerpt}, existing.Excerpts...)
+	// Prepend workflow context to excerpts using race-safe copy pattern
+	newExcerpts := make([]ctxpkg.Excerpt, len(existing.Excerpts)+1)
+	newExcerpts[0] = workflowExcerpt
+	copy(newExcerpts[1:], existing.Excerpts)
+	existing.Excerpts = newExcerpts
 
 	return existing
 }

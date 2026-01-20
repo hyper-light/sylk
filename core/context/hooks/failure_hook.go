@@ -255,8 +255,11 @@ func (h *FailurePatternWarningHook) injectWarning(
 		TokenCount: len(warning) / 4, // Rough estimate
 	}
 
-	// Prepend warning to excerpts
-	existing.Excerpts = append([]ctxpkg.Excerpt{warningExcerpt}, existing.Excerpts...)
+	// Prepend warning to excerpts using race-safe copy pattern
+	newExcerpts := make([]ctxpkg.Excerpt, len(existing.Excerpts)+1)
+	newExcerpts[0] = warningExcerpt
+	copy(newExcerpts[1:], existing.Excerpts)
+	existing.Excerpts = newExcerpts
 
 	return existing
 }
