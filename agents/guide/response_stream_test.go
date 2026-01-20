@@ -269,7 +269,7 @@ func TestStreamManager_MaxStreamsPerSession(t *testing.T) {
 	assert.Equal(t, guide.ErrTooManyStreams, err)
 }
 
-func TestStreamManager_Stats(t *testing.T) {
+func TestStreamManager_Stats_W12Fix(t *testing.T) {
 	sm := guide.NewStreamManager(guide.DefaultStreamConfig())
 
 	stream1, _ := sm.CreateStream("corr-1", "sess-1")
@@ -364,7 +364,7 @@ func TestStreamConsumer_Collect(t *testing.T) {
 	assert.GreaterOrEqual(t, len(events), 4)
 }
 
-func TestStreamConsumer_CollectText(t *testing.T) {
+func TestStreamConsumer_CollectText_W12Fix(t *testing.T) {
 	sm := guide.NewStreamManager(guide.StreamConfig{
 		MaxBufferSize:        100,
 		StreamTimeout:        5 * time.Minute,

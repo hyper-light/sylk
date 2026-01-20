@@ -365,20 +365,23 @@ func (rs *ResponseStream) sendEvent(event *StreamEvent) bool {
 // Close closes the stream safely. Multiple calls to Close are safe
 // and will not panic. Uses sync.Once to ensure the channel is closed
 // exactly once, preventing send-on-closed-channel panics.
+// The close operation is synchronized with sendEvent to prevent races.
 func (rs *ResponseStream) Close() {
-	// Mark as closed first to reject new sends immediately
-	if rs.closed.Swap(true) {
-		return // Already marked closed, but closeOnce handles the actual close
-	}
-
 	rs.closeOnce.Do(func() {
 		rs.closeInternal()
 	})
 }
 
 // closeInternal performs the actual close operation. Must only be called
-// via closeOnce.Do to ensure it executes exactly once.
+// via closeOnce.Do to ensure it executes exactly once. Acquires the lock
+// to synchronize with sendEvent and prevent send-on-closed-channel races.
 func (rs *ResponseStream) closeInternal() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	// Mark as closed under lock so sendEvent sees consistent state
+	rs.closed.Store(true)
+
 	// Send end event (non-blocking since buffer might be full)
 	event := &StreamEvent{
 		Type:      StreamEventEnd,
