@@ -313,9 +313,16 @@ func (g *CrossSessionDualQueueGate) CompleteRequest(req *QueuedRequest, result a
 	}
 	g.mu.Unlock()
 
+	// Send response first to ensure waitForResponse receives it
 	select {
 	case req.ResponseChan <- &QueuedResponse{Result: result, Error: err}:
 	default:
+	}
+
+	// Always call cancel to prevent context leak (W3M.7 fix)
+	// Called after sending response to avoid race with waitForResponse
+	if req.CancelFunc != nil {
+		req.CancelFunc()
 	}
 }
 

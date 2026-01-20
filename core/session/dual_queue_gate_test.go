@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -458,4 +459,240 @@ func TestCrossSessionDualQueueGate_CrossSessionPreemption(t *testing.T) {
 	if first.ID != "user-1" {
 		t.Errorf("expected user request from session-B to preempt, got %s", first.ID)
 	}
+}
+
+// W3M.7 Tests: Context Cancel Leak Prevention
+
+func TestCrossSessionDualQueueGate_NormalCompletionCallsCancel(t *testing.T) {
+	gate := NewCrossSessionDualQueueGate(CrossSessionDualQueueGateConfig{})
+	defer gate.Close()
+
+	ctx := context.Background()
+	cancelCalled := false
+	var mu sync.Mutex
+
+	req := &QueuedRequest{
+		ID:          "req-1",
+		RequestType: RequestTypeUser,
+	}
+
+	// Submit async
+	err := gate.SubmitAsync(ctx, "session-1", req)
+	if err != nil {
+		t.Fatalf("SubmitAsync failed: %v", err)
+	}
+
+	// Replace CancelFunc with our tracking version
+	originalCancel := req.CancelFunc
+	req.CancelFunc = func() {
+		mu.Lock()
+		cancelCalled = true
+		mu.Unlock()
+		if originalCancel != nil {
+			originalCancel()
+		}
+	}
+
+	// Process and complete
+	processed, ok := gate.ProcessNext()
+	if !ok {
+		t.Fatal("expected to process a request")
+	}
+
+	gate.CompleteRequest(processed, "result", nil)
+
+	mu.Lock()
+	wasCalled := cancelCalled
+	mu.Unlock()
+
+	if !wasCalled {
+		t.Error("expected cancel to be called on normal completion")
+	}
+}
+
+func TestCrossSessionDualQueueGate_ErrorPathCallsCancel(t *testing.T) {
+	gate := NewCrossSessionDualQueueGate(CrossSessionDualQueueGateConfig{})
+	defer gate.Close()
+
+	ctx := context.Background()
+	cancelCalled := false
+	var mu sync.Mutex
+
+	req := &QueuedRequest{
+		ID:          "req-1",
+		RequestType: RequestTypeUser,
+	}
+
+	err := gate.SubmitAsync(ctx, "session-1", req)
+	if err != nil {
+		t.Fatalf("SubmitAsync failed: %v", err)
+	}
+
+	// Replace CancelFunc with our tracking version
+	originalCancel := req.CancelFunc
+	req.CancelFunc = func() {
+		mu.Lock()
+		cancelCalled = true
+		mu.Unlock()
+		if originalCancel != nil {
+			originalCancel()
+		}
+	}
+
+	processed, ok := gate.ProcessNext()
+	if !ok {
+		t.Fatal("expected to process a request")
+	}
+
+	// Complete with error
+	gate.CompleteRequest(processed, nil, errors.New("test error"))
+
+	mu.Lock()
+	wasCalled := cancelCalled
+	mu.Unlock()
+
+	if !wasCalled {
+		t.Error("expected cancel to be called on error completion")
+	}
+}
+
+func TestCrossSessionDualQueueGate_CloseCallsCancel(t *testing.T) {
+	gate := NewCrossSessionDualQueueGate(CrossSessionDualQueueGateConfig{})
+
+	ctx := context.Background()
+	cancelCalled := false
+	var mu sync.Mutex
+
+	req := &QueuedRequest{
+		ID:          "req-1",
+		RequestType: RequestTypeUser,
+	}
+
+	err := gate.SubmitAsync(ctx, "session-1", req)
+	if err != nil {
+		t.Fatalf("SubmitAsync failed: %v", err)
+	}
+
+	// Replace CancelFunc with our tracking version
+	originalCancel := req.CancelFunc
+	req.CancelFunc = func() {
+		mu.Lock()
+		cancelCalled = true
+		mu.Unlock()
+		if originalCancel != nil {
+			originalCancel()
+		}
+	}
+
+	// Close the gate - should call cancel for all queued requests
+	gate.Close()
+
+	mu.Lock()
+	wasCalled := cancelCalled
+	mu.Unlock()
+
+	if !wasCalled {
+		t.Error("expected cancel to be called when gate is closed")
+	}
+}
+
+func TestCrossSessionDualQueueGate_PreemptionCallsCancel(t *testing.T) {
+	gate := NewCrossSessionDualQueueGate(CrossSessionDualQueueGateConfig{})
+	defer gate.Close()
+
+	ctx := context.Background()
+	cancelCalled := false
+	var mu sync.Mutex
+
+	pipelineReq := &QueuedRequest{
+		ID:          "pipeline-1",
+		RequestType: RequestTypePipeline,
+		Priority:    1,
+	}
+
+	err := gate.SubmitAsync(ctx, "session-1", pipelineReq)
+	if err != nil {
+		t.Fatalf("SubmitAsync failed: %v", err)
+	}
+
+	// Replace CancelFunc with our tracking version
+	originalCancel := pipelineReq.CancelFunc
+	pipelineReq.CancelFunc = func() {
+		mu.Lock()
+		cancelCalled = true
+		mu.Unlock()
+		if originalCancel != nil {
+			originalCancel()
+		}
+	}
+
+	// Submit a user request - should preempt pipeline
+	userReq := &QueuedRequest{
+		ID:          "user-1",
+		RequestType: RequestTypeUser,
+	}
+	err = gate.SubmitAsync(ctx, "session-2", userReq)
+	if err != nil {
+		t.Fatalf("SubmitAsync failed: %v", err)
+	}
+
+	mu.Lock()
+	wasCalled := cancelCalled
+	mu.Unlock()
+
+	if !wasCalled {
+		t.Error("expected cancel to be called when request is preempted")
+	}
+}
+
+func TestCrossSessionDualQueueGate_NilCancelFuncSafe(t *testing.T) {
+	gate := NewCrossSessionDualQueueGate(CrossSessionDualQueueGateConfig{})
+	defer gate.Close()
+
+	// Create a request without going through Submit/SubmitAsync
+	// This tests that CompleteRequest handles nil CancelFunc safely
+	req := &QueuedRequest{
+		ID:           "req-1",
+		SessionID:    "session-1",
+		RequestType:  RequestTypeUser,
+		ResponseChan: make(chan *QueuedResponse, 1),
+		CancelFunc:   nil, // Explicitly nil
+	}
+
+	// This should not panic even with nil CancelFunc
+	gate.CompleteRequest(req, "result", nil)
+}
+
+func TestCrossSessionDualQueueGate_SubmitAsyncContextCancelDoesNotLeak(t *testing.T) {
+	gate := NewCrossSessionDualQueueGate(CrossSessionDualQueueGateConfig{})
+	defer gate.Close()
+
+	// Use a parent context we can track
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
+	// Submit multiple async requests
+	for i := 0; i < 100; i++ {
+		req := &QueuedRequest{
+			ID:          "req-" + string(rune(i)),
+			RequestType: RequestType(i % 2),
+			Priority:    i % 10,
+		}
+		err := gate.SubmitAsync(parentCtx, "session-1", req)
+		if err != nil {
+			t.Fatalf("SubmitAsync failed: %v", err)
+		}
+	}
+
+	// Process and complete all requests
+	for {
+		req, ok := gate.ProcessNext()
+		if !ok {
+			break
+		}
+		gate.CompleteRequest(req, "done", nil)
+	}
+
+	// If we get here without hanging or goroutine leaks, the test passes
+	// The race detector will catch any issues with the context handling
 }
