@@ -377,8 +377,11 @@ func (sp *SpeculativePrefetcher) entriesToExcerpts(entries []*ContentEntry) []Ex
 }
 
 func (sp *SpeculativePrefetcher) cleanup(hash string) {
-	sp.inflight.Delete(hash)
-	sp.inflightCount.Add(-1)
+	// Only decrement if we actually deleted an entry.
+	// This makes cleanup idempotent and prevents negative counter.
+	if _, loaded := sp.inflight.LoadAndDelete(hash); loaded {
+		sp.inflightCount.Add(-1)
+	}
 }
 
 // =============================================================================
@@ -536,16 +539,22 @@ func (sp *SpeculativePrefetcher) MapSize() int {
 
 // CancelAll cancels all in-flight prefetches.
 // Used during shutdown or pressure response.
+// Note: This method marks futures as canceled but lets normal cleanup
+// handle count decrement to avoid race conditions with concurrent cleanup calls.
 func (sp *SpeculativePrefetcher) CancelAll() {
 	sp.inflight.Range(func(key, value any) bool {
 		future := value.(*TrackedPrefetchFuture)
-		err := context.Canceled
-		future.err.Store(&err)
-		future.closeOnce.Do(func() { close(future.done) })
-		sp.inflight.Delete(key)
+		sp.cancelFuture(future)
 		return true
 	})
-	sp.inflightCount.Store(0)
+}
+
+// cancelFuture marks a single future as canceled.
+// The future will be cleaned up by the normal cleanup path.
+func (sp *SpeculativePrefetcher) cancelFuture(future *TrackedPrefetchFuture) {
+	err := context.Canceled
+	future.err.Store(&err)
+	future.closeOnce.Do(func() { close(future.done) })
 }
 
 // StartCleanupWorker starts a background goroutine that periodically
