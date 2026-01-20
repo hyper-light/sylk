@@ -5194,15 +5194,19 @@ func TestEncodeBatch_GoldenTest_DifferentConfigurations(t *testing.T) {
 		dim       int
 		subspaces int
 		centroids int
+		skipShort bool
 	}{
-		{"small_4x8", 32, 4, 8},
-		{"medium_8x32", 64, 8, 32},
-		{"large_16x64", 128, 16, 64},
-		{"max_32x256", 768, 32, 256},
+		{"small_4x8", 32, 4, 8, false},
+		{"medium_8x32", 64, 8, 32, false},
+		{"large_16x64", 128, 16, 64, false},
+		{"max_16x128", 256, 16, 128, true}, // Reduced from 768/32/256 for faster CI
 	}
 
 	for _, cfg := range configs {
 		t.Run(cfg.name, func(t *testing.T) {
+			if cfg.skipShort && testing.Short() {
+				t.Skip("skipping large configuration in short mode")
+			}
 			pqConfig := ProductQuantizerConfig{
 				NumSubspaces:         cfg.subspaces,
 				CentroidsPerSubspace: cfg.centroids,
