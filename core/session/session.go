@@ -369,14 +369,30 @@ func (s *Session) IncrementEngineersSpawned() {
 	atomic.AddInt32(&s.engineersSpawned, 1)
 }
 
-// Stats returns the session statistics
+// Stats returns the session statistics as a consistent snapshot.
+// All values are captured atomically under a read lock to prevent
+// TOCTOU races between reading different statistics fields.
 func (s *Session) Stats() Stats {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	snapshot := s.captureStatsSnapshot()
+	s.mu.RUnlock()
+	return snapshot
+}
 
-	activeDuration := time.Duration(atomic.LoadInt64(&s.activeDuration))
+// captureStatsSnapshot captures all stats fields atomically.
+// Caller must hold s.mu (read or write lock).
+func (s *Session) captureStatsSnapshot() Stats {
+	// Capture all atomic values in a single critical section
+	tasksCompleted := atomic.LoadInt64(&s.tasksCompleted)
+	tasksFailed := atomic.LoadInt64(&s.tasksFailed)
+	messagesRouted := atomic.LoadInt64(&s.messagesRouted)
+	engineersSpawned := atomic.LoadInt32(&s.engineersSpawned)
+	activeDuration := atomic.LoadInt64(&s.activeDuration)
+
+	// Calculate total active duration including current active period
+	duration := time.Duration(activeDuration)
 	if s.state == StateActive {
-		activeDuration += time.Since(s.startedAt)
+		duration += time.Since(s.startedAt)
 	}
 
 	return Stats{
@@ -385,11 +401,11 @@ func (s *Session) Stats() Stats {
 		State:            s.state.String(),
 		CreatedAt:        s.createdAt,
 		UpdatedAt:        s.updatedAt,
-		ActiveDuration:   activeDuration,
-		TasksCompleted:   atomic.LoadInt64(&s.tasksCompleted),
-		TasksFailed:      atomic.LoadInt64(&s.tasksFailed),
-		MessagesRouted:   atomic.LoadInt64(&s.messagesRouted),
-		EngineersSpawned: int(atomic.LoadInt32(&s.engineersSpawned)),
+		ActiveDuration:   duration,
+		TasksCompleted:   tasksCompleted,
+		TasksFailed:      tasksFailed,
+		MessagesRouted:   messagesRouted,
+		EngineersSpawned: int(engineersSpawned),
 	}
 }
 

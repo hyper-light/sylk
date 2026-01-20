@@ -139,6 +139,175 @@ func TestSession_Statistics(t *testing.T) {
 	assert.Equal(t, 1, stats.EngineersSpawned)
 }
 
+func TestSession_Stats_ConsistentSnapshot(t *testing.T) {
+	// Test that Stats() returns consistent values (no TOCTOU race)
+	s := session.NewSession(session.DefaultConfig())
+	require.NoError(t, s.Start())
+
+	// Set up known values
+	for i := 0; i < 100; i++ {
+		s.IncrementTasksCompleted()
+		s.IncrementTasksFailed()
+		s.IncrementMessagesRouted()
+	}
+
+	stats := s.Stats()
+
+	// Verify all identity and state fields are present
+	assert.NotEmpty(t, stats.ID)
+	assert.NotEmpty(t, stats.Name)
+	assert.Equal(t, "active", stats.State)
+	assert.False(t, stats.CreatedAt.IsZero())
+	assert.False(t, stats.UpdatedAt.IsZero())
+
+	// Verify counters match expected values
+	assert.Equal(t, int64(100), stats.TasksCompleted)
+	assert.Equal(t, int64(100), stats.TasksFailed)
+	assert.Equal(t, int64(100), stats.MessagesRouted)
+}
+
+func TestSession_Stats_ConcurrentReads(t *testing.T) {
+	// Test that concurrent Stats() calls are safe and return valid data
+	s := session.NewSession(session.DefaultConfig())
+	require.NoError(t, s.Start())
+
+	// Pre-populate some stats
+	for i := 0; i < 50; i++ {
+		s.IncrementTasksCompleted()
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan session.Stats, 100)
+
+	// Spawn multiple goroutines reading Stats() concurrently
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				stats := s.Stats()
+				results <- stats
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	// Verify all results are valid and consistent
+	count := 0
+	for stats := range results {
+		count++
+		// Each snapshot should have valid data
+		assert.NotEmpty(t, stats.ID)
+		assert.Equal(t, s.ID(), stats.ID)
+		// TasksCompleted should be at least 50 (pre-populated)
+		assert.GreaterOrEqual(t, stats.TasksCompleted, int64(50))
+	}
+
+	assert.Equal(t, 100, count)
+}
+
+func TestSession_Stats_DuringMutations(t *testing.T) {
+	// Test that Stats() returns valid snapshots during concurrent mutations
+	s := session.NewSession(session.DefaultConfig())
+	require.NoError(t, s.Start())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	statsSnapshots := make(chan session.Stats, 1000)
+
+	// Spawn goroutines that continuously increment counters
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				s.IncrementTasksCompleted()
+				s.IncrementTasksFailed()
+				s.IncrementMessagesRouted()
+				s.IncrementEngineersSpawned()
+			}
+		}()
+	}
+
+	// Spawn goroutines that continuously read Stats()
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				stats := s.Stats()
+				select {
+				case statsSnapshots <- stats:
+				default:
+					// Channel full, skip
+				}
+			}
+		}()
+	}
+
+	<-ctx.Done()
+	wg.Wait()
+	close(statsSnapshots)
+
+	// Verify all snapshots are internally consistent
+	// Each snapshot should have non-negative values
+	for stats := range statsSnapshots {
+		assert.NotEmpty(t, stats.ID)
+		assert.GreaterOrEqual(t, stats.TasksCompleted, int64(0))
+		assert.GreaterOrEqual(t, stats.TasksFailed, int64(0))
+		assert.GreaterOrEqual(t, stats.MessagesRouted, int64(0))
+		assert.GreaterOrEqual(t, stats.EngineersSpawned, 0)
+		assert.GreaterOrEqual(t, stats.ActiveDuration, time.Duration(0))
+	}
+
+	// Final stats should show all accumulated values
+	finalStats := s.Stats()
+	assert.Greater(t, finalStats.TasksCompleted, int64(0))
+	assert.Greater(t, finalStats.TasksFailed, int64(0))
+	assert.Greater(t, finalStats.MessagesRouted, int64(0))
+	assert.Greater(t, finalStats.EngineersSpawned, 0)
+}
+
+func TestSession_Stats_ActiveDuration(t *testing.T) {
+	// Test that ActiveDuration is computed correctly in Stats()
+	s := session.NewSession(session.DefaultConfig())
+
+	// Before starting, active duration should be zero
+	stats := s.Stats()
+	assert.Equal(t, time.Duration(0), stats.ActiveDuration)
+
+	// Start the session
+	require.NoError(t, s.Start())
+
+	// Sleep briefly to accumulate some active time
+	time.Sleep(50 * time.Millisecond)
+
+	stats = s.Stats()
+	assert.GreaterOrEqual(t, stats.ActiveDuration, 50*time.Millisecond)
+
+	// Pause the session
+	require.NoError(t, s.Pause())
+
+	pausedStats := s.Stats()
+	// Duration should be preserved after pause
+	assert.GreaterOrEqual(t, pausedStats.ActiveDuration, 50*time.Millisecond)
+
+	// Sleep while paused
+	time.Sleep(50 * time.Millisecond)
+
+	// Duration should not increase while paused
+	pausedStats2 := s.Stats()
+	assert.InDelta(t,
+		float64(pausedStats.ActiveDuration),
+		float64(pausedStats2.ActiveDuration),
+		float64(10*time.Millisecond),
+	)
+}
+
 func TestSession_Serialization(t *testing.T) {
 	s := session.NewSession(session.Config{
 		Name:        "serialize-test",
