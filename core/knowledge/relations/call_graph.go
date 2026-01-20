@@ -74,6 +74,28 @@ type CallRelation struct {
 // Call Graph Extractor
 // =============================================================================
 
+// scopeTracker tracks the depth of conditional scopes during AST traversal.
+type scopeTracker struct {
+	conditionalDepth int
+}
+
+// inConditional returns true if currently inside a conditional scope.
+func (s *scopeTracker) inConditional() bool {
+	return s.conditionalDepth > 0
+}
+
+// enterConditional increments the conditional depth.
+func (s *scopeTracker) enterConditional() {
+	s.conditionalDepth++
+}
+
+// exitConditional decrements the conditional depth.
+func (s *scopeTracker) exitConditional() {
+	if s.conditionalDepth > 0 {
+		s.conditionalDepth--
+	}
+}
+
 // CallGraphExtractor extracts function call relationships from source code.
 type CallGraphExtractor struct {
 	// Regex patterns for non-Go languages
@@ -191,38 +213,443 @@ func (e *CallGraphExtractor) extractGoCallGraph(
 			continue
 		}
 
-		// Track if we're inside a conditional
-		var inConditional bool
+		// Extract calls with proper scope tracking
+		scope := &scopeTracker{}
+		fnRelations := e.extractCallsFromFuncBody(fn.Body, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, fnRelations...)
+	}
 
-		// Walk the function body
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			switch node := n.(type) {
-			case *ast.IfStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt:
-				inConditional = true
-			case *ast.CallExpr:
-				calleeName, callType := e.extractGoCallee(node, inConditional)
-				if calleeName == "" {
-					return true
-				}
+	return relations
+}
 
-				// Find matching callee entities
-				callees, found := entityByName[calleeName]
-				if !found {
-					return true
-				}
+// extractCallsFromFuncBody extracts call relations from a function body with scope tracking.
+func (e *CallGraphExtractor) extractCallsFromFuncBody(
+	body *ast.BlockStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
 
-				for _, callee := range callees {
-					if callee.Kind != knowledge.EntityKindFunction && callee.Kind != knowledge.EntityKindMethod {
-						continue
-					}
+	for _, stmt := range body.List {
+		stmtRels := e.extractCallsFromStmt(stmt, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, stmtRels...)
+	}
 
-					line := fset.Position(node.Pos()).Line
-					rel := e.createCallRelation(caller, callee, callType, filePath, line, content)
-					relations = append(relations, rel)
-				}
+	return relations
+}
+
+// stmtContext holds common parameters for statement extraction to reduce parameter passing.
+type stmtContext struct {
+	caller       extractors.Entity
+	fset         *token.FileSet
+	entityByName map[string][]extractors.Entity
+	filePath     string
+	content      []byte
+	scope        *scopeTracker
+}
+
+// extractCallsFromStmt extracts call relations from a single statement.
+func (e *CallGraphExtractor) extractCallsFromStmt(
+	stmt ast.Stmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	ctx := &stmtContext{caller, fset, entityByName, filePath, content, scope}
+	return e.dispatchStmt(stmt, ctx)
+}
+
+// dispatchStmt dispatches statement to appropriate handler.
+func (e *CallGraphExtractor) dispatchStmt(stmt ast.Stmt, ctx *stmtContext) []knowledge.ExtractedRelation {
+	switch s := stmt.(type) {
+	case *ast.IfStmt:
+		return e.extractCallsFromIfStmt(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.SwitchStmt:
+		return e.extractCallsFromSwitchStmt(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.TypeSwitchStmt:
+		return e.extractCallsFromTypeSwitchStmt(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.SelectStmt:
+		return e.extractCallsFromSelectStmt(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.ForStmt:
+		return e.extractCallsFromForStmt(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.RangeStmt:
+		return e.extractCallsFromRangeStmt(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.BlockStmt:
+		return e.extractCallsFromFuncBody(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	default:
+		return e.dispatchSimpleStmt(stmt, ctx)
+	}
+}
+
+// dispatchSimpleStmt handles simpler statement types.
+func (e *CallGraphExtractor) dispatchSimpleStmt(stmt ast.Stmt, ctx *stmtContext) []knowledge.ExtractedRelation {
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		return e.extractCallsFromExpr(s.X, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.AssignStmt:
+		return e.extractCallsFromAssignStmt(s, ctx)
+	case *ast.ReturnStmt:
+		return e.extractCallsFromReturnStmt(s, ctx)
+	case *ast.DeclStmt:
+		return e.extractCallsFromDeclStmt(s, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.DeferStmt:
+		return e.extractCallsFromExpr(s.Call, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.GoStmt:
+		return e.extractCallsFromExpr(s.Call, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+	case *ast.CaseClause:
+		return e.extractCallsFromCaseClause(s, ctx)
+	case *ast.CommClause:
+		return e.extractCallsFromCommClause(s, ctx)
+	default:
+		return nil
+	}
+}
+
+// extractCallsFromAssignStmt extracts calls from assignment statements.
+func (e *CallGraphExtractor) extractCallsFromAssignStmt(s *ast.AssignStmt, ctx *stmtContext) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+	for _, expr := range s.Rhs {
+		exprRels := e.extractCallsFromExpr(expr, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+		relations = append(relations, exprRels...)
+	}
+	return relations
+}
+
+// extractCallsFromReturnStmt extracts calls from return statements.
+func (e *CallGraphExtractor) extractCallsFromReturnStmt(s *ast.ReturnStmt, ctx *stmtContext) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+	for _, expr := range s.Results {
+		exprRels := e.extractCallsFromExpr(expr, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+		relations = append(relations, exprRels...)
+	}
+	return relations
+}
+
+// extractCallsFromCaseClause extracts calls from switch case clauses.
+func (e *CallGraphExtractor) extractCallsFromCaseClause(s *ast.CaseClause, ctx *stmtContext) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+	for _, expr := range s.List {
+		exprRels := e.extractCallsFromExpr(expr, ctx.caller, ctx.fset, ctx.entityByName, ctx.filePath, ctx.content, ctx.scope)
+		relations = append(relations, exprRels...)
+	}
+	for _, bodyStmt := range s.Body {
+		bodyRels := e.dispatchStmt(bodyStmt, ctx)
+		relations = append(relations, bodyRels...)
+	}
+	return relations
+}
+
+// extractCallsFromCommClause extracts calls from select comm clauses.
+func (e *CallGraphExtractor) extractCallsFromCommClause(s *ast.CommClause, ctx *stmtContext) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+	if s.Comm != nil {
+		commRels := e.dispatchStmt(s.Comm, ctx)
+		relations = append(relations, commRels...)
+	}
+	for _, bodyStmt := range s.Body {
+		bodyRels := e.dispatchStmt(bodyStmt, ctx)
+		relations = append(relations, bodyRels...)
+	}
+	return relations
+}
+
+// extractCallsFromIfStmt extracts calls from an if statement (conditional scope).
+func (e *CallGraphExtractor) extractCallsFromIfStmt(
+	s *ast.IfStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	// Condition is evaluated before entering conditional scope
+	condRels := e.extractCallsFromExpr(s.Cond, caller, fset, entityByName, filePath, content, scope)
+	relations = append(relations, condRels...)
+
+	// Init statement is also outside conditional scope
+	if s.Init != nil {
+		initRels := e.extractCallsFromStmt(s.Init, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, initRels...)
+	}
+
+	// Body is inside conditional scope
+	scope.enterConditional()
+	bodyRels := e.extractCallsFromFuncBody(s.Body, caller, fset, entityByName, filePath, content, scope)
+	relations = append(relations, bodyRels...)
+	scope.exitConditional()
+
+	// Else branch is also conditional
+	if s.Else != nil {
+		scope.enterConditional()
+		elseRels := e.extractCallsFromStmt(s.Else, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, elseRels...)
+		scope.exitConditional()
+	}
+
+	return relations
+}
+
+// extractCallsFromSwitchStmt extracts calls from a switch statement.
+func (e *CallGraphExtractor) extractCallsFromSwitchStmt(
+	s *ast.SwitchStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	// Init and tag are outside conditional scope
+	if s.Init != nil {
+		initRels := e.extractCallsFromStmt(s.Init, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, initRels...)
+	}
+	if s.Tag != nil {
+		tagRels := e.extractCallsFromExpr(s.Tag, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, tagRels...)
+	}
+
+	// Case bodies are conditional
+	scope.enterConditional()
+	bodyRels := e.extractCallsFromFuncBody(s.Body, caller, fset, entityByName, filePath, content, scope)
+	relations = append(relations, bodyRels...)
+	scope.exitConditional()
+
+	return relations
+}
+
+// extractCallsFromTypeSwitchStmt extracts calls from a type switch statement.
+func (e *CallGraphExtractor) extractCallsFromTypeSwitchStmt(
+	s *ast.TypeSwitchStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	if s.Init != nil {
+		initRels := e.extractCallsFromStmt(s.Init, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, initRels...)
+	}
+	if s.Assign != nil {
+		assignRels := e.extractCallsFromStmt(s.Assign, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, assignRels...)
+	}
+
+	scope.enterConditional()
+	bodyRels := e.extractCallsFromFuncBody(s.Body, caller, fset, entityByName, filePath, content, scope)
+	relations = append(relations, bodyRels...)
+	scope.exitConditional()
+
+	return relations
+}
+
+// extractCallsFromSelectStmt extracts calls from a select statement.
+func (e *CallGraphExtractor) extractCallsFromSelectStmt(
+	s *ast.SelectStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	scope.enterConditional()
+	relations := e.extractCallsFromFuncBody(s.Body, caller, fset, entityByName, filePath, content, scope)
+	scope.exitConditional()
+	return relations
+}
+
+// extractCallsFromForStmt extracts calls from a for statement.
+func (e *CallGraphExtractor) extractCallsFromForStmt(
+	s *ast.ForStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	// Init, condition, and post are outside the conditional loop body
+	if s.Init != nil {
+		initRels := e.extractCallsFromStmt(s.Init, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, initRels...)
+	}
+	if s.Cond != nil {
+		condRels := e.extractCallsFromExpr(s.Cond, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, condRels...)
+	}
+	if s.Post != nil {
+		postRels := e.extractCallsFromStmt(s.Post, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, postRels...)
+	}
+
+	// Loop body is conditional
+	scope.enterConditional()
+	bodyRels := e.extractCallsFromFuncBody(s.Body, caller, fset, entityByName, filePath, content, scope)
+	relations = append(relations, bodyRels...)
+	scope.exitConditional()
+
+	return relations
+}
+
+// extractCallsFromRangeStmt extracts calls from a range statement.
+func (e *CallGraphExtractor) extractCallsFromRangeStmt(
+	s *ast.RangeStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	// Range expression is outside conditional scope
+	if s.X != nil {
+		rangeRels := e.extractCallsFromExpr(s.X, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, rangeRels...)
+	}
+
+	// Loop body is conditional
+	scope.enterConditional()
+	bodyRels := e.extractCallsFromFuncBody(s.Body, caller, fset, entityByName, filePath, content, scope)
+	relations = append(relations, bodyRels...)
+	scope.exitConditional()
+
+	return relations
+}
+
+// extractCallsFromDeclStmt extracts calls from declaration statements.
+func (e *CallGraphExtractor) extractCallsFromDeclStmt(
+	s *ast.DeclStmt,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	genDecl, ok := s.Decl.(*ast.GenDecl)
+	if !ok {
+		return relations
+	}
+
+	for _, spec := range genDecl.Specs {
+		if valueSpec, ok := spec.(*ast.ValueSpec); ok {
+			for _, value := range valueSpec.Values {
+				exprRels := e.extractCallsFromExpr(value, caller, fset, entityByName, filePath, content, scope)
+				relations = append(relations, exprRels...)
 			}
-			return true
-		})
+		}
+	}
+
+	return relations
+}
+
+// extractCallsFromExpr extracts call relations from an expression.
+func (e *CallGraphExtractor) extractCallsFromExpr(
+	expr ast.Expr,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	switch x := expr.(type) {
+	case *ast.CallExpr:
+		// Extract the call itself
+		callRels := e.extractSingleCall(x, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, callRels...)
+		// Also extract calls in arguments
+		for _, arg := range x.Args {
+			argRels := e.extractCallsFromExpr(arg, caller, fset, entityByName, filePath, content, scope)
+			relations = append(relations, argRels...)
+		}
+		// Extract calls in the function expression itself (e.g., for method chains)
+		funRels := e.extractCallsFromExpr(x.Fun, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, funRels...)
+	case *ast.BinaryExpr:
+		leftRels := e.extractCallsFromExpr(x.X, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, leftRels...)
+		rightRels := e.extractCallsFromExpr(x.Y, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, rightRels...)
+	case *ast.UnaryExpr:
+		relations = e.extractCallsFromExpr(x.X, caller, fset, entityByName, filePath, content, scope)
+	case *ast.ParenExpr:
+		relations = e.extractCallsFromExpr(x.X, caller, fset, entityByName, filePath, content, scope)
+	case *ast.SelectorExpr:
+		relations = e.extractCallsFromExpr(x.X, caller, fset, entityByName, filePath, content, scope)
+	case *ast.IndexExpr:
+		xRels := e.extractCallsFromExpr(x.X, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, xRels...)
+		idxRels := e.extractCallsFromExpr(x.Index, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, idxRels...)
+	case *ast.CompositeLit:
+		for _, elt := range x.Elts {
+			eltRels := e.extractCallsFromExpr(elt, caller, fset, entityByName, filePath, content, scope)
+			relations = append(relations, eltRels...)
+		}
+	case *ast.KeyValueExpr:
+		valRels := e.extractCallsFromExpr(x.Value, caller, fset, entityByName, filePath, content, scope)
+		relations = append(relations, valRels...)
+	}
+
+	return relations
+}
+
+// extractSingleCall extracts a single call relation.
+func (e *CallGraphExtractor) extractSingleCall(
+	call *ast.CallExpr,
+	caller extractors.Entity,
+	fset *token.FileSet,
+	entityByName map[string][]extractors.Entity,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	calleeName, callType := e.extractGoCallee(call, scope.inConditional())
+	if calleeName == "" {
+		return relations
+	}
+
+	callees, found := entityByName[calleeName]
+	if !found {
+		return relations
+	}
+
+	for _, callee := range callees {
+		if callee.Kind != knowledge.EntityKindFunction && callee.Kind != knowledge.EntityKindMethod {
+			continue
+		}
+
+		line := fset.Position(call.Pos()).Line
+		rel := e.createCallRelation(caller, callee, callType, filePath, line, content)
+		relations = append(relations, rel)
 	}
 
 	return relations
@@ -284,9 +711,19 @@ func (e *CallGraphExtractor) extractCallsWithRegex(
 	var relations []knowledge.ExtractedRelation
 	source := string(content)
 	lines := strings.Split(source, "\n")
+	keywords := e.getKeywords()
 
-	// Keywords to exclude from call detection
-	keywords := map[string]bool{
+	for _, caller := range funcsInFile {
+		callerRels := e.extractCallsForCaller(caller, lines, entityByName, pattern, keywords, filePath, content)
+		relations = append(relations, callerRels...)
+	}
+
+	return relations
+}
+
+// getKeywords returns keywords to exclude from call detection.
+func (e *CallGraphExtractor) getKeywords() map[string]bool {
+	return map[string]bool{
 		"if": true, "else": true, "for": true, "while": true, "switch": true,
 		"case": true, "return": true, "class": true, "function": true, "def": true,
 		"import": true, "from": true, "export": true, "const": true, "let": true,
@@ -297,70 +734,124 @@ func (e *CallGraphExtractor) extractCallsWithRegex(
 		"with": true, "as": true, "pass": true, "break": true, "continue": true,
 		"yield": true, "lambda": true, "elif": true, "except": true, "raise": true,
 	}
+}
 
-	// For each function in the file, find calls within its body
-	for _, caller := range funcsInFile {
-		// Get the lines within this function
-		startIdx := caller.StartLine - 1
-		endIdx := caller.EndLine
-		if startIdx < 0 {
-			startIdx = 0
+// extractCallsForCaller extracts calls for a single caller function.
+func (e *CallGraphExtractor) extractCallsForCaller(
+	caller extractors.Entity,
+	lines []string,
+	entityByName map[string][]extractors.Entity,
+	pattern *regexp.Regexp,
+	keywords map[string]bool,
+	filePath string,
+	content []byte,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
+
+	startIdx := caller.StartLine - 1
+	endIdx := caller.EndLine
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx > len(lines) {
+		endIdx = len(lines)
+	}
+
+	// Track conditional depth using brace counting
+	scope := &scopeTracker{}
+	conditionalBraceStack := []int{} // Stack of brace depths where conditionals started
+
+	for lineIdx := startIdx; lineIdx < endIdx; lineIdx++ {
+		line := lines[lineIdx]
+		e.updateRegexScope(line, scope, &conditionalBraceStack)
+		lineRels := e.extractCallsFromLine(line, lineIdx+1, caller, entityByName, pattern, keywords, filePath, content, scope)
+		relations = append(relations, lineRels...)
+	}
+
+	return relations
+}
+
+// updateRegexScope updates scope tracking based on line content.
+func (e *CallGraphExtractor) updateRegexScope(line string, scope *scopeTracker, conditionalBraceStack *[]int) {
+	trimmed := strings.TrimSpace(line)
+	conditionalKeywords := []string{"if ", "if(", "else ", "else{", "elif ", "switch ", "switch(", "for ", "for(", "while ", "while("}
+
+	// Check for closing braces first (before checking for new conditionals)
+	// This handles cases like "} else {" properly
+	openBraces := strings.Count(line, "{")
+	closeBraces := strings.Count(line, "}")
+
+	// Process closing braces - exit conditional scopes
+	for i := 0; i < closeBraces; i++ {
+		if len(*conditionalBraceStack) > 0 {
+			// Pop from stack and exit conditional
+			*conditionalBraceStack = (*conditionalBraceStack)[:len(*conditionalBraceStack)-1]
+			scope.exitConditional()
 		}
-		if endIdx > len(lines) {
-			endIdx = len(lines)
+	}
+
+	// Check if line starts a new conditional
+	startsConditional := false
+	for _, kw := range conditionalKeywords {
+		if strings.Contains(trimmed, kw) {
+			startsConditional = true
+			break
 		}
+	}
 
-		// Track if we're in a conditional
-		inConditional := false
-		conditionalKeywords := []string{"if ", "if(", "else ", "else{", "elif ", "switch ", "switch("}
+	// Process opening braces - enter conditional scopes if this is a conditional line
+	if startsConditional {
+		for i := 0; i < openBraces; i++ {
+			scope.enterConditional()
+			*conditionalBraceStack = append(*conditionalBraceStack, 1)
+		}
+	}
+}
 
-		for lineIdx := startIdx; lineIdx < endIdx; lineIdx++ {
-			line := lines[lineIdx]
+// extractCallsFromLine extracts function calls from a single line.
+func (e *CallGraphExtractor) extractCallsFromLine(
+	line string,
+	lineNum int,
+	caller extractors.Entity,
+	entityByName map[string][]extractors.Entity,
+	pattern *regexp.Regexp,
+	keywords map[string]bool,
+	filePath string,
+	content []byte,
+	scope *scopeTracker,
+) []knowledge.ExtractedRelation {
+	var relations []knowledge.ExtractedRelation
 
-			// Check if line contains conditional
-			for _, kw := range conditionalKeywords {
-				if strings.Contains(line, kw) {
-					inConditional = true
-					break
-				}
+	matches := pattern.FindAllStringSubmatchIndex(line, -1)
+	for _, match := range matches {
+		if len(match) >= 4 {
+			calleeName := line[match[2]:match[3]]
+
+			if keywords[calleeName] {
+				continue
 			}
 
-			// Find all function calls in this line
-			matches := pattern.FindAllStringSubmatchIndex(line, -1)
-			for _, match := range matches {
-				if len(match) >= 4 {
-					calleeName := line[match[2]:match[3]]
+			callees, found := entityByName[calleeName]
+			if !found {
+				continue
+			}
 
-					// Skip keywords
-					if keywords[calleeName] {
-						continue
-					}
-
-					// Find matching callee entities
-					callees, found := entityByName[calleeName]
-					if !found {
-						continue
-					}
-
-					for _, callee := range callees {
-						if callee.Kind != knowledge.EntityKindFunction && callee.Kind != knowledge.EntityKindMethod {
-							continue
-						}
-
-						// Skip self-reference in same file and same entity
-						if callee.ID == caller.ID {
-							continue
-						}
-
-						callType := CallTypeDirect
-						if inConditional {
-							callType = CallTypeConditional
-						}
-
-						rel := e.createCallRelation(caller, callee, callType, filePath, lineIdx+1, content)
-						relations = append(relations, rel)
-					}
+			for _, callee := range callees {
+				if callee.Kind != knowledge.EntityKindFunction && callee.Kind != knowledge.EntityKindMethod {
+					continue
 				}
+
+				if callee.ID == caller.ID {
+					continue
+				}
+
+				callType := CallTypeDirect
+				if scope.inConditional() {
+					callType = CallTypeConditional
+				}
+
+				rel := e.createCallRelation(caller, callee, callType, filePath, lineNum, content)
+				relations = append(relations, rel)
 			}
 		}
 	}

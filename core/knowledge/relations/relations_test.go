@@ -132,6 +132,370 @@ func process(flag bool) {
 	assert.True(t, foundConditionalCall, "Should find conditional calls")
 }
 
+// TestCallGraphExtractor_Go_CallsAfterConditional verifies that calls AFTER
+// a conditional block are correctly marked as direct (not conditional).
+// This is the primary test for the W4C.3 bug fix.
+func TestCallGraphExtractor_Go_CallsAfterConditional(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func helperBefore() {}
+func helperInside() {}
+func helperAfter() {}
+
+func process(flag bool) {
+	helperBefore()
+	if flag {
+		helperInside()
+	}
+	helperAfter()
+}
+`
+
+	content := map[string][]byte{
+		"/test/scope.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/scope.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	// Track calls and their types
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	// helperBefore should be direct (confidence 1.0)
+	assert.Equal(t, 1.0, callTypes["helperBefore"], "helperBefore should be direct call (before conditional)")
+
+	// helperInside should be conditional (confidence 0.8)
+	assert.Equal(t, 0.8, callTypes["helperInside"], "helperInside should be conditional call (inside if)")
+
+	// helperAfter should be direct (confidence 1.0) - THIS IS THE KEY BUG FIX TEST
+	assert.Equal(t, 1.0, callTypes["helperAfter"], "helperAfter should be direct call (after conditional exits)")
+}
+
+// TestCallGraphExtractor_Go_NestedConditionals verifies nested conditional tracking.
+func TestCallGraphExtractor_Go_NestedConditionals(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func outerCall() {}
+func innerCall() {}
+func afterInner() {}
+func afterOuter() {}
+
+func process(a, b bool) {
+	if a {
+		outerCall()
+		if b {
+			innerCall()
+		}
+		afterInner()
+	}
+	afterOuter()
+}
+`
+
+	content := map[string][]byte{
+		"/test/nested.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/nested.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	// All calls inside outer if should be conditional
+	assert.Equal(t, 0.8, callTypes["outerCall"], "outerCall should be conditional (inside outer if)")
+	assert.Equal(t, 0.8, callTypes["innerCall"], "innerCall should be conditional (inside nested if)")
+	assert.Equal(t, 0.8, callTypes["afterInner"], "afterInner should be conditional (still inside outer if)")
+
+	// Call after outer if should be direct
+	assert.Equal(t, 1.0, callTypes["afterOuter"], "afterOuter should be direct (after all conditionals)")
+}
+
+// TestCallGraphExtractor_Go_SwitchConditional verifies switch statement tracking.
+func TestCallGraphExtractor_Go_SwitchConditional(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func beforeSwitch() {}
+func inCase() {}
+func afterSwitch() {}
+
+func process(x int) {
+	beforeSwitch()
+	switch x {
+	case 1:
+		inCase()
+	}
+	afterSwitch()
+}
+`
+
+	content := map[string][]byte{
+		"/test/switch.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/switch.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	assert.Equal(t, 1.0, callTypes["beforeSwitch"], "beforeSwitch should be direct")
+	assert.Equal(t, 0.8, callTypes["inCase"], "inCase should be conditional (inside switch)")
+	assert.Equal(t, 1.0, callTypes["afterSwitch"], "afterSwitch should be direct (after switch)")
+}
+
+// TestCallGraphExtractor_Go_ForLoopConditional verifies for loop tracking.
+func TestCallGraphExtractor_Go_ForLoopConditional(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func beforeLoop() {}
+func inLoop() {}
+func afterLoop() {}
+
+func process() {
+	beforeLoop()
+	for i := 0; i < 10; i++ {
+		inLoop()
+	}
+	afterLoop()
+}
+`
+
+	content := map[string][]byte{
+		"/test/forloop.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/forloop.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	assert.Equal(t, 1.0, callTypes["beforeLoop"], "beforeLoop should be direct")
+	assert.Equal(t, 0.8, callTypes["inLoop"], "inLoop should be conditional (inside for loop)")
+	assert.Equal(t, 1.0, callTypes["afterLoop"], "afterLoop should be direct (after loop)")
+}
+
+// TestCallGraphExtractor_Go_RangeLoopConditional verifies range loop tracking.
+func TestCallGraphExtractor_Go_RangeLoopConditional(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func beforeRange() {}
+func inRange() {}
+func afterRange() {}
+
+func process(items []int) {
+	beforeRange()
+	for _, item := range items {
+		_ = item
+		inRange()
+	}
+	afterRange()
+}
+`
+
+	content := map[string][]byte{
+		"/test/range.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/range.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	assert.Equal(t, 1.0, callTypes["beforeRange"], "beforeRange should be direct")
+	assert.Equal(t, 0.8, callTypes["inRange"], "inRange should be conditional (inside range loop)")
+	assert.Equal(t, 1.0, callTypes["afterRange"], "afterRange should be direct (after range)")
+}
+
+// TestCallGraphExtractor_Go_SelectConditional verifies select statement tracking.
+func TestCallGraphExtractor_Go_SelectConditional(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func beforeSelect() {}
+func inSelect() {}
+func afterSelect() {}
+
+func process(ch chan int) {
+	beforeSelect()
+	select {
+	case <-ch:
+		inSelect()
+	}
+	afterSelect()
+}
+`
+
+	content := map[string][]byte{
+		"/test/select.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/select.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	assert.Equal(t, 1.0, callTypes["beforeSelect"], "beforeSelect should be direct")
+	assert.Equal(t, 0.8, callTypes["inSelect"], "inSelect should be conditional (inside select)")
+	assert.Equal(t, 1.0, callTypes["afterSelect"], "afterSelect should be direct (after select)")
+}
+
+// TestCallGraphExtractor_Go_TypeSwitchConditional verifies type switch tracking.
+func TestCallGraphExtractor_Go_TypeSwitchConditional(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func beforeTypeSwitch() {}
+func inTypeSwitch() {}
+func afterTypeSwitch() {}
+
+func process(x interface{}) {
+	beforeTypeSwitch()
+	switch x.(type) {
+	case int:
+		inTypeSwitch()
+	}
+	afterTypeSwitch()
+}
+`
+
+	content := map[string][]byte{
+		"/test/typeswitch.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/typeswitch.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	assert.Equal(t, 1.0, callTypes["beforeTypeSwitch"], "beforeTypeSwitch should be direct")
+	assert.Equal(t, 0.8, callTypes["inTypeSwitch"], "inTypeSwitch should be conditional (inside type switch)")
+	assert.Equal(t, 1.0, callTypes["afterTypeSwitch"], "afterTypeSwitch should be direct (after type switch)")
+}
+
+// TestCallGraphExtractor_Go_MultipleConditionalBlocks verifies multiple sequential conditionals.
+func TestCallGraphExtractor_Go_MultipleConditionalBlocks(t *testing.T) {
+	extractor := NewCallGraphExtractor()
+	goExtractor := extractors.NewGoExtractor()
+
+	source := `package main
+
+func before() {}
+func inFirst() {}
+func between() {}
+func inSecond() {}
+func after() {}
+
+func process(a, b bool) {
+	before()
+	if a {
+		inFirst()
+	}
+	between()
+	if b {
+		inSecond()
+	}
+	after()
+}
+`
+
+	content := map[string][]byte{
+		"/test/multiple.go": []byte(source),
+	}
+
+	entities, err := goExtractor.Extract("/test/multiple.go", []byte(source))
+	require.NoError(t, err)
+
+	relations, err := extractor.ExtractRelations(entities, content)
+	require.NoError(t, err)
+
+	callTypes := make(map[string]float64)
+	for _, rel := range relations {
+		if rel.SourceEntity.Name == "process" {
+			callTypes[rel.TargetEntity.Name] = rel.Confidence
+		}
+	}
+
+	assert.Equal(t, 1.0, callTypes["before"], "before should be direct")
+	assert.Equal(t, 0.8, callTypes["inFirst"], "inFirst should be conditional")
+	assert.Equal(t, 1.0, callTypes["between"], "between should be direct (between conditionals)")
+	assert.Equal(t, 0.8, callTypes["inSecond"], "inSecond should be conditional")
+	assert.Equal(t, 1.0, callTypes["after"], "after should be direct (after all conditionals)")
+}
+
 func TestCallGraphExtractor_Go_MultipleCalls(t *testing.T) {
 	extractor := NewCallGraphExtractor()
 	goExtractor := extractors.NewGoExtractor()
