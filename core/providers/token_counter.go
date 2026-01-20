@@ -2,8 +2,19 @@ package providers
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 )
+
+// Token count validation errors.
+var (
+	ErrNegativeTokenCount = errors.New("token count cannot be negative")
+	ErrTokenCountOverflow = errors.New("token count exceeds maximum safe value")
+)
+
+// MaxSafeTokenCount is the maximum token count that can be safely processed.
+// This prevents overflow issues and unrealistic token counts.
+const MaxSafeTokenCount = 100_000_000
 
 type TokenCounter interface {
 	Count(messages []Message) (int, error)
@@ -145,6 +156,100 @@ func (p *ProviderTokenCounter) RegisterCounter(model string, counter TokenCounte
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.counters[model] = counter
+}
+
+// ValidateTokenCount checks if a token count is within valid bounds.
+// Returns an error if the count is negative or exceeds MaxSafeTokenCount.
+func ValidateTokenCount(count int) error {
+	if count < 0 {
+		return ErrNegativeTokenCount
+	}
+	if count > MaxSafeTokenCount {
+		return ErrTokenCountOverflow
+	}
+	return nil
+}
+
+// ValidatedCount counts tokens and validates the result is within bounds.
+func (p *ProviderTokenCounter) ValidatedCount(messages []Message) (int, error) {
+	count, err := p.Count(messages)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateTokenCount(count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ValidatedCountText counts text tokens and validates the result is within bounds.
+func (p *ProviderTokenCounter) ValidatedCountText(text string) (int, error) {
+	count, err := p.CountText(text)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateTokenCount(count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ValidatedCountWithTools counts tokens including tool definitions and validates bounds.
+func (p *ProviderTokenCounter) ValidatedCountWithTools(messages []Message, tools []Tool) (int, error) {
+	count, err := p.CountWithTools(messages, tools)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateTokenCount(count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ValidatingCounter wraps a TokenCounter and validates all returned counts.
+// W12.47: Ensures token counts are within valid bounds.
+type ValidatingCounter struct {
+	inner TokenCounter
+}
+
+// NewValidatingCounter creates a counter that validates all token counts.
+func NewValidatingCounter(inner TokenCounter) *ValidatingCounter {
+	return &ValidatingCounter{inner: inner}
+}
+
+// Count returns validated token count for messages.
+func (v *ValidatingCounter) Count(messages []Message) (int, error) {
+	count, err := v.inner.Count(messages)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateTokenCount(count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// CountText returns validated token count for text.
+func (v *ValidatingCounter) CountText(text string) (int, error) {
+	count, err := v.inner.CountText(text)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateTokenCount(count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// MaxContextTokens returns the maximum context tokens for a model.
+func (v *ValidatingCounter) MaxContextTokens(model string) int {
+	return v.inner.MaxContextTokens(model)
+}
+
+// GetValidatedCounter returns a counter wrapped with validation for the given model.
+func (p *ProviderTokenCounter) GetValidatedCounter(model string) TokenCounter {
+	counter := p.GetCounter(model)
+	return NewValidatingCounter(counter)
 }
 
 var modelContextLimits = map[string]int{

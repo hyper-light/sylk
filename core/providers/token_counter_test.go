@@ -329,6 +329,170 @@ func TestProviderTokenCounter_NilParameters(t *testing.T) {
 }
 
 // =============================================================================
+// Token Validation Tests (W12.47)
+// =============================================================================
+
+func TestValidateTokenCount(t *testing.T) {
+	tests := []struct {
+		name    string
+		count   int
+		wantErr error
+	}{
+		{"zero is valid", 0, nil},
+		{"positive is valid", 1000, nil},
+		{"max context is valid", 2000000, nil},
+		{"max safe is valid", MaxSafeTokenCount, nil},
+		{"negative is invalid", -1, ErrNegativeTokenCount},
+		{"large negative is invalid", -1000000, ErrNegativeTokenCount},
+		{"overflow is invalid", MaxSafeTokenCount + 1, ErrTokenCountOverflow},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateTokenCount(tt.count)
+			if err != tt.wantErr {
+				t.Errorf("ValidateTokenCount(%d) = %v, want %v", tt.count, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidatingCounter_Count(t *testing.T) {
+	// Valid count
+	mock := &mockTokenCounter{fixedCount: 100}
+	vc := NewValidatingCounter(mock)
+
+	count, err := vc.Count(nil)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if count != 100 {
+		t.Errorf("expected 100, got %d", count)
+	}
+
+	// Invalid negative count
+	mock.fixedCount = -1
+	_, err = vc.Count(nil)
+	if err != ErrNegativeTokenCount {
+		t.Errorf("expected ErrNegativeTokenCount, got %v", err)
+	}
+
+	// Invalid overflow count
+	mock.fixedCount = MaxSafeTokenCount + 1
+	_, err = vc.Count(nil)
+	if err != ErrTokenCountOverflow {
+		t.Errorf("expected ErrTokenCountOverflow, got %v", err)
+	}
+}
+
+func TestValidatingCounter_CountText(t *testing.T) {
+	mock := &mockTokenCounter{fixedCount: 50}
+	vc := NewValidatingCounter(mock)
+
+	count, err := vc.CountText("test")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if count != 50 {
+		t.Errorf("expected 50, got %d", count)
+	}
+
+	// Invalid count
+	mock.fixedCount = -100
+	_, err = vc.CountText("test")
+	if err != ErrNegativeTokenCount {
+		t.Errorf("expected ErrNegativeTokenCount, got %v", err)
+	}
+}
+
+func TestValidatingCounter_MaxContextTokens(t *testing.T) {
+	mock := &mockTokenCounter{fixedCount: 100}
+	vc := NewValidatingCounter(mock)
+
+	// Should delegate to inner counter
+	limit := vc.MaxContextTokens("test-model")
+	if limit != 100000 {
+		t.Errorf("expected 100000, got %d", limit)
+	}
+}
+
+func TestProviderTokenCounter_ValidatedCount(t *testing.T) {
+	counter := NewProviderTokenCounter(DefaultTokenCounterConfig())
+
+	messages := []Message{
+		{Role: RoleUser, Content: "Hello"},
+	}
+
+	count, err := counter.ValidatedCount(messages)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if count <= 0 {
+		t.Errorf("expected positive count, got %d", count)
+	}
+}
+
+func TestProviderTokenCounter_ValidatedCountText(t *testing.T) {
+	counter := NewProviderTokenCounter(DefaultTokenCounterConfig())
+
+	count, err := counter.ValidatedCountText("Hello world")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if count <= 0 {
+		t.Errorf("expected positive count, got %d", count)
+	}
+}
+
+func TestProviderTokenCounter_ValidatedCountWithTools(t *testing.T) {
+	counter := NewProviderTokenCounter(DefaultTokenCounterConfig())
+
+	messages := []Message{{Role: RoleUser, Content: "Test"}}
+	tools := []Tool{{Name: "test", Description: "test tool"}}
+
+	count, err := counter.ValidatedCountWithTools(messages, tools)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if count <= 0 {
+		t.Errorf("expected positive count, got %d", count)
+	}
+}
+
+func TestProviderTokenCounter_GetValidatedCounter(t *testing.T) {
+	counter := NewProviderTokenCounter(DefaultTokenCounterConfig())
+
+	// Register a mock that returns negative (invalid) counts
+	mock := &mockTokenCounter{fixedCount: -1}
+	counter.RegisterCounter("bad-model", mock)
+
+	// GetValidatedCounter should wrap with validation
+	vc := counter.GetValidatedCounter("bad-model")
+
+	_, err := vc.Count(nil)
+	if err != ErrNegativeTokenCount {
+		t.Errorf("expected ErrNegativeTokenCount, got %v", err)
+	}
+}
+
+func TestValidatingCounter_Concurrent(t *testing.T) {
+	mock := &mockTokenCounter{fixedCount: 100}
+	vc := NewValidatingCounter(mock)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = vc.Count(nil)
+			_, _ = vc.CountText("test")
+			_ = vc.MaxContextTokens("model")
+		}()
+	}
+	wg.Wait()
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
