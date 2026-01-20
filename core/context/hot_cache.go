@@ -248,7 +248,8 @@ func (c *HotCache) Size() int64 {
 }
 
 // EvictPercent evicts the given percentage of entries (by size).
-// Returns the number of bytes evicted. Uses batch eviction with callbacks.
+// Returns the number of bytes evicted. Uses single-pass eviction with callbacks.
+// Cyclomatic complexity: 4 (if percent<=0, if percent>1, if currentSize==0, loop)
 func (c *HotCache) EvictPercent(percent float64) int64 {
 	if percent <= 0 {
 		return 0
@@ -265,23 +266,55 @@ func (c *HotCache) EvictPercent(percent float64) int64 {
 	}
 
 	targetEviction := int64(float64(currentSize) * percent)
-	evicted, evictedSize := c.evictBatch(c.evictionBatchSize, targetEviction)
-
-	// If we haven't evicted enough and there are more entries, keep evicting
-	for evictedSize < targetEviction && c.lruList.Len() > 0 {
-		moreEvicted, moreSize := c.evictBatch(c.evictionBatchSize, targetEviction-evictedSize)
-		evicted = append(evicted, moreEvicted...)
-		evictedSize += moreSize
-		if len(moreEvicted) == 0 {
-			break
-		}
-	}
+	evicted, evictedSize := c.evictSinglePass(targetEviction)
 	c.mu.Unlock()
 
 	// Invoke callbacks outside lock
 	c.invokeEvictionCallbacks(evicted)
 
 	return evictedSize
+}
+
+// evictSinglePass evicts entries in a single pass until targetBytes have been evicted.
+// This is optimized for EvictPercent where we want to evict without batch size limits.
+// Must be called with mu held. Returns evicted entries and total bytes evicted.
+// Cyclomatic complexity: 2 (loop condition, nil check)
+func (c *HotCache) evictSinglePass(targetBytes int64) ([]evictedEntry, int64) {
+	// Pre-allocate with estimated capacity based on average entry size
+	estimatedCount := c.lruList.Len()
+	if estimatedCount > 1000 {
+		estimatedCount = 1000 // Cap initial allocation
+	}
+	evicted := make([]evictedEntry, 0, estimatedCount)
+	var evictedSize int64
+
+	// Single pass through LRU list tail until target reached
+	for evictedSize < targetBytes {
+		back := c.lruList.Back()
+		if back == nil {
+			break
+		}
+
+		entry := back.Value.(*lruEntry)
+		entrySize := entry.size
+
+		// Collect entry info before removal
+		evicted = append(evicted, evictedEntry{
+			id:    entry.id,
+			entry: entry.entry,
+		})
+
+		// Remove from LRU list and map (O(1) operations)
+		c.lruList.Remove(entry.element)
+		delete(c.entries, entry.id)
+
+		// Update atomics
+		c.currentSize.Add(-entrySize)
+		evictedSize += entrySize
+		c.evictions.Add(1)
+	}
+
+	return evicted, evictedSize
 }
 
 // evictBytes evicts entries until targetBytes have been evicted.
