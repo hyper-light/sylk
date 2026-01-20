@@ -171,3 +171,43 @@ func TestComputeScanInterval(t *testing.T) {
 		})
 	}
 }
+
+func TestFreshnessTracker_Close(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	tracker := NewFreshnessTracker(db, DefaultDecayConfig())
+
+	// Add some stale nodes
+	ns := vectorgraphdb.NewNodeStore(db, nil)
+	node := &vectorgraphdb.GraphNode{
+		ID:       "close-test-node",
+		Domain:   vectorgraphdb.DomainCode,
+		NodeType: vectorgraphdb.NodeTypeFile,
+		Metadata: map[string]any{},
+	}
+	require.NoError(t, ns.InsertNode(node, makeTestEmbedding()))
+	require.NoError(t, tracker.MarkStale("close-test-node"))
+
+	assert.Equal(t, 1, tracker.GetStaleCount())
+
+	// Close should not block and should clear state
+	tracker.Close()
+
+	assert.Equal(t, 0, tracker.GetStaleCount())
+}
+
+func TestFreshnessTracker_StopScanner_MultipleCalls(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	tracker := NewFreshnessTracker(db, DefaultDecayConfig())
+
+	// Multiple calls to StopScanner should be safe
+	tracker.StopScanner()
+	tracker.StopScanner()
+	tracker.StopScanner()
+
+	// Should not panic
+	tracker.Close()
+}

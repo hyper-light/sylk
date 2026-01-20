@@ -17,7 +17,6 @@ type FreshnessTracker struct {
 	staleNodes  map[string]*FreshnessInfo
 	maxStale    int
 	staleOrder  []string
-	refreshChan chan string
 	stopChan    chan struct{}
 	stopOnce    sync.Once
 }
@@ -30,7 +29,6 @@ func NewFreshnessTracker(db *vectorgraphdb.VectorGraphDB, config DecayConfig) *F
 		staleNodes:  make(map[string]*FreshnessInfo),
 		maxStale:    10000,
 		staleOrder:  make([]string, 0),
-		refreshChan: make(chan string, 100),
 		stopChan:    make(chan struct{}),
 	}
 }
