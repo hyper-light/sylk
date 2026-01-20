@@ -138,3 +138,34 @@ func TestProvenanceTracker_InvalidateCache(t *testing.T) {
 	assert.False(t, exists1)
 	assert.True(t, exists2)
 }
+
+func TestProvenanceTracker_GetProvenance_ReturnsCopy(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	tracker := NewProvenanceTracker(db)
+	defer tracker.Close()
+
+	// Populate cache with test data
+	original := []*Provenance{
+		{ID: "1", NodeID: "copy-test", Confidence: 0.9},
+		{ID: "2", NodeID: "copy-test", Confidence: 0.8},
+	}
+	tracker.cacheMu.Lock()
+	tracker.provenanceCache["copy-test"] = original
+	tracker.cacheOrder = []string{"copy-test"}
+	tracker.cacheMu.Unlock()
+
+	// Get provenance (should return a copy)
+	result, err := tracker.GetProvenance("copy-test")
+	assert.NoError(t, err)
+	assert.Len(t, result, 2)
+
+	// Modifying the result should not affect the cache
+	result[0] = &Provenance{ID: "modified"}
+
+	// Get again and verify original is unchanged
+	result2, err := tracker.GetProvenance("copy-test")
+	assert.NoError(t, err)
+	assert.Equal(t, "1", result2[0].ID)
+}
