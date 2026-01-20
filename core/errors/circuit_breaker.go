@@ -110,6 +110,8 @@ func (cb *CircuitBreaker) checkCooldownExpired() bool {
 		return false
 	}
 
+	// Use CAS to atomically transition Open -> HalfOpen.
+	// Only one goroutine wins; others see the transition already happened.
 	if atomic.CompareAndSwapInt32(&cb.state, int32(CircuitOpen), int32(CircuitHalfOpen)) {
 		atomic.StoreInt64(&cb.lastStateChange, time.Now().UnixNano())
 		atomic.StoreInt32(&cb.successes, 0)
@@ -117,16 +119,20 @@ func (cb *CircuitBreaker) checkCooldownExpired() bool {
 	return true
 }
 
+// RecordResult records the result of an operation and updates circuit state.
+// W12.49 fix: Hold lock for the entire operation to prevent concurrent
+// state transitions between window update and state change decisions.
 func (cb *CircuitBreaker) RecordResult(success bool) {
 	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
 	cb.recordToWindow(success)
 	failureRate := cb.calculateFailureRate()
-	cb.mu.Unlock()
 
 	if success {
-		cb.recordSuccess()
+		cb.recordSuccessLocked()
 	} else {
-		cb.recordFailure(failureRate)
+		cb.recordFailureLocked(failureRate)
 	}
 }
 
@@ -135,30 +141,32 @@ func (cb *CircuitBreaker) recordToWindow(success bool) {
 	cb.windowIndex = (cb.windowIndex + 1) % len(cb.recentResults)
 }
 
-func (cb *CircuitBreaker) recordSuccess() {
+// recordSuccessLocked updates state on success. Caller must hold cb.mu.
+func (cb *CircuitBreaker) recordSuccessLocked() {
 	atomic.StoreInt32(&cb.failures, 0)
 
 	state := CircuitState(atomic.LoadInt32(&cb.state))
 	if state == CircuitHalfOpen {
 		newSuccesses := atomic.AddInt32(&cb.successes, 1)
 		if int(newSuccesses) >= cb.config.SuccessThreshold {
-			cb.transitionTo(CircuitClosed)
+			cb.transitionToCAS(CircuitHalfOpen, CircuitClosed)
 		}
 	}
 }
 
-func (cb *CircuitBreaker) recordFailure(failureRate float64) {
+// recordFailureLocked updates state on failure. Caller must hold cb.mu.
+func (cb *CircuitBreaker) recordFailureLocked(failureRate float64) {
 	newFailures := atomic.AddInt32(&cb.failures, 1)
 	atomic.StoreInt32(&cb.successes, 0)
 
 	state := CircuitState(atomic.LoadInt32(&cb.state))
 	if state == CircuitHalfOpen {
-		cb.transitionTo(CircuitOpen)
+		cb.transitionToCAS(CircuitHalfOpen, CircuitOpen)
 		return
 	}
 
-	if state != CircuitOpen && cb.shouldTrip(int(newFailures), failureRate) {
-		cb.transitionTo(CircuitOpen)
+	if state == CircuitClosed && cb.shouldTrip(int(newFailures), failureRate) {
+		cb.transitionToCAS(CircuitClosed, CircuitOpen)
 	}
 }
 
@@ -184,10 +192,28 @@ func (cb *CircuitBreaker) calculateFailureRate() float64 {
 	return float64(failures) / float64(len(cb.recentResults))
 }
 
-func (cb *CircuitBreaker) transitionTo(state CircuitState) {
+// transitionToCAS attempts an atomic state transition using CAS.
+// Returns true if the transition succeeded, false if the current state
+// didn't match fromState (another goroutine transitioned first).
+func (cb *CircuitBreaker) transitionToCAS(fromState, toState CircuitState) bool {
+	if !atomic.CompareAndSwapInt32(&cb.state, int32(fromState), int32(toState)) {
+		return false
+	}
+	atomic.StoreInt64(&cb.lastStateChange, time.Now().UnixNano())
+	if toState == CircuitClosed {
+		atomic.StoreInt32(&cb.failures, 0)
+		atomic.StoreInt32(&cb.successes, 0)
+	} else if toState == CircuitHalfOpen {
+		atomic.StoreInt32(&cb.successes, 0)
+	}
+	return true
+}
+
+// transitionToForced forces a state transition regardless of current state.
+// Used only by ForceReset for manual intervention.
+func (cb *CircuitBreaker) transitionToForced(state CircuitState) {
 	atomic.StoreInt32(&cb.state, int32(state))
 	atomic.StoreInt64(&cb.lastStateChange, time.Now().UnixNano())
-
 	if state == CircuitClosed {
 		atomic.StoreInt32(&cb.failures, 0)
 		atomic.StoreInt32(&cb.successes, 0)
@@ -201,7 +227,7 @@ func (cb *CircuitBreaker) ForceReset() {
 	cb.initializeWindow()
 	cb.mu.Unlock()
 
-	cb.transitionTo(CircuitClosed)
+	cb.transitionToForced(CircuitClosed)
 }
 
 func (cb *CircuitBreaker) GetResourceID() string {

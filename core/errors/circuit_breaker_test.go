@@ -525,3 +525,91 @@ func TestDefaultCircuitBreakerConfig(t *testing.T) {
 		t.Error("expected NotifyOnStateChange=true")
 	}
 }
+
+// =============================================================================
+// W12.49 Fix: Concurrent State Transition Tests
+// =============================================================================
+
+func TestCircuitBreaker_ConcurrentRecordAndAllow(t *testing.T) {
+	// This test verifies W12.49 fix: concurrent RecordResult and Allow calls
+	// should not cause race conditions or invalid state transitions.
+	config := DefaultCircuitBreakerConfig()
+	config.ConsecutiveFailures = 3
+	config.CooldownDuration = 5 * time.Millisecond
+	config.SuccessThreshold = 2
+	cb := NewCircuitBreaker("test-resource", config)
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// Writers recording results
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					cb.RecordResult(id%2 == 0) // Alternate success/failure
+				}
+			}
+		}(i)
+	}
+
+	// Readers calling Allow
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					cb.Allow()
+				}
+			}
+		}()
+	}
+
+	// Let it run for a bit
+	time.Sleep(50 * time.Millisecond)
+	close(done)
+	wg.Wait()
+
+	// Verify final state is valid
+	state := cb.State()
+	if state != CircuitClosed && state != CircuitOpen && state != CircuitHalfOpen {
+		t.Errorf("invalid circuit state after concurrent operations: %v", state)
+	}
+}
+
+func TestCircuitBreaker_CASStateTransition(t *testing.T) {
+	// Test that CAS-based transitions work correctly
+	config := DefaultCircuitBreakerConfig()
+	config.ConsecutiveFailures = 1
+	config.CooldownDuration = 5 * time.Millisecond
+	config.SuccessThreshold = 1
+	cb := NewCircuitBreaker("test-resource", config)
+
+	// Trip the circuit
+	cb.RecordResult(false)
+	if cb.State() != CircuitOpen {
+		t.Fatalf("expected open state after failure, got %v", cb.State())
+	}
+
+	// Wait for cooldown and transition to half-open
+	time.Sleep(10 * time.Millisecond)
+	cb.Allow()
+	if cb.State() != CircuitHalfOpen {
+		t.Fatalf("expected half-open state, got %v", cb.State())
+	}
+
+	// Record success to close
+	cb.RecordResult(true)
+	if cb.State() != CircuitClosed {
+		t.Errorf("expected closed state after success in half-open, got %v", cb.State())
+	}
+}
