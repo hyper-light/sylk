@@ -34,6 +34,10 @@ type IndexConfig struct {
 	AsyncQueueSize     int
 	AsyncBatchSize     int
 	AsyncFlushInterval time.Duration
+
+	// Path index cache configuration (W4P.12)
+	// Controls the bounded cache for path-to-docID mappings.
+	PathIndexCache PathIndexCacheConfig
 }
 
 // DefaultBatchTimeout is the default timeout for batch commit operations.
@@ -241,8 +245,8 @@ type IndexManager struct {
 	useAsync   bool
 
 	// Path index for O(1) DeleteByPath lookup (PF.3.3)
-	pathIndex map[string]string // path -> docID
-	pathMu    sync.RWMutex
+	// W4P.12: Uses bounded LRU cache to prevent unbounded memory growth.
+	pathCache *PathIndexCache
 
 	// Health tracking for corruption detection (W4P.6)
 	lastHealth  IndexHealthResult
@@ -261,19 +265,24 @@ type IndexManager struct {
 func NewIndexManager(path string) *IndexManager {
 	return &IndexManager{
 		config: IndexConfig{
-			Path:         path,
-			BatchSize:    100,
-			BatchTimeout: DefaultBatchTimeout,
+			Path:           path,
+			BatchSize:      100,
+			BatchTimeout:   DefaultBatchTimeout,
+			PathIndexCache: DefaultPathIndexCacheConfig(),
 		},
-		pathIndex: make(map[string]string),
+		pathCache: NewPathIndexCache(DefaultPathIndexCacheConfig()),
 	}
 }
 
 // NewIndexManagerWithConfig creates an IndexManager with full configuration.
 func NewIndexManagerWithConfig(config IndexConfig) *IndexManager {
+	// Use default path cache config if not specified
+	if config.PathIndexCache.MaxEntries <= 0 {
+		config.PathIndexCache = DefaultPathIndexCacheConfig()
+	}
 	return &IndexManager{
 		config:    config,
-		pathIndex: make(map[string]string),
+		pathCache: NewPathIndexCache(config.PathIndexCache),
 	}
 }
 
@@ -523,10 +532,10 @@ func (m *IndexManager) Close() error {
 	m.batchSem = nil
 	m.batchSemMu.Unlock()
 
-	// Clear path index (PF.3.3)
-	m.pathMu.Lock()
-	m.pathIndex = make(map[string]string)
-	m.pathMu.Unlock()
+	// Close path cache (PF.3.3, W4P.12)
+	if m.pathCache != nil {
+		m.pathCache.Close()
+	}
 
 	return err
 }
@@ -553,33 +562,31 @@ func (m *IndexManager) Config() IndexConfig {
 // =============================================================================
 
 // UpdatePathIndex adds or updates a path to docID mapping.
+// W4P.12: Uses bounded LRU cache to prevent unbounded memory growth.
 func (m *IndexManager) UpdatePathIndex(path, docID string) {
-	m.pathMu.Lock()
-	m.pathIndex[path] = docID
-	m.pathMu.Unlock()
+	m.pathCache.Put(path, docID)
 }
 
 // RemovePathIndex removes a path from the index.
 func (m *IndexManager) RemovePathIndex(path string) {
-	m.pathMu.Lock()
-	delete(m.pathIndex, path)
-	m.pathMu.Unlock()
+	m.pathCache.Delete(path)
 }
 
 // GetDocIDByPath returns the docID for a given path.
 // Returns empty string and false if not found.
 func (m *IndexManager) GetDocIDByPath(path string) (string, bool) {
-	m.pathMu.RLock()
-	docID, exists := m.pathIndex[path]
-	m.pathMu.RUnlock()
-	return docID, exists
+	return m.pathCache.Get(path)
 }
 
 // PathIndexSize returns the number of entries in the path index.
 func (m *IndexManager) PathIndexSize() int {
-	m.pathMu.RLock()
-	defer m.pathMu.RUnlock()
-	return len(m.pathIndex)
+	return m.pathCache.Size()
+}
+
+// PathIndexStats returns statistics about the path index cache.
+// W4P.12: Provides visibility into cache usage and eviction.
+func (m *IndexManager) PathIndexStats() PathIndexCacheStats {
+	return m.pathCache.Stats()
 }
 
 // =============================================================================
@@ -614,13 +621,8 @@ func (m *IndexManager) ValidatePathIndexSync(ctx context.Context) (*PathIndexDes
 func (m *IndexManager) validateSyncLocked(ctx context.Context) (*PathIndexDesyncResult, error) {
 	result := &PathIndexDesyncResult{IsSynced: true}
 
-	// Get snapshot of path index
-	m.pathMu.RLock()
-	pathSnapshot := make(map[string]string, len(m.pathIndex))
-	for path, docID := range m.pathIndex {
-		pathSnapshot[path] = docID
-	}
-	m.pathMu.RUnlock()
+	// Get snapshot of path index (W4P.12: uses cache snapshot)
+	pathSnapshot := m.pathCache.Snapshot()
 
 	// Check for phantom paths (in path index but not in Bleve)
 	phantoms, err := m.findPhantomPaths(ctx, pathSnapshot)
@@ -692,13 +694,8 @@ func (m *IndexManager) RepairPathIndex(ctx context.Context) (int, error) {
 
 // repairPathIndexLocked removes phantom entries. Must be called with read lock held.
 func (m *IndexManager) repairPathIndexLocked(ctx context.Context) (int, error) {
-	// Get snapshot of path index
-	m.pathMu.RLock()
-	pathSnapshot := make(map[string]string, len(m.pathIndex))
-	for path, docID := range m.pathIndex {
-		pathSnapshot[path] = docID
-	}
-	m.pathMu.RUnlock()
+	// Get snapshot of path index (W4P.12: uses cache snapshot)
+	pathSnapshot := m.pathCache.Snapshot()
 
 	// Find phantom paths
 	phantoms, err := m.findPhantomPaths(ctx, pathSnapshot)
@@ -707,12 +704,8 @@ func (m *IndexManager) repairPathIndexLocked(ctx context.Context) (int, error) {
 	}
 
 	// Remove phantom entries
-	if len(phantoms) > 0 {
-		m.pathMu.Lock()
-		for _, path := range phantoms {
-			delete(m.pathIndex, path)
-		}
-		m.pathMu.Unlock()
+	for _, path := range phantoms {
+		m.pathCache.Delete(path)
 	}
 
 	return len(phantoms), nil
@@ -832,10 +825,8 @@ func (m *IndexManager) RebuildIndex() (uint64, error) {
 		return docCount, fmt.Errorf("%w: %v", ErrRebuildFailed, err)
 	}
 
-	// Clear path index since we're starting fresh
-	m.pathMu.Lock()
-	m.pathIndex = make(map[string]string)
-	m.pathMu.Unlock()
+	// Clear path cache since we're starting fresh (W4P.12)
+	m.pathCache.Clear()
 
 	// Update health status
 	m.updateLastHealth(IndexHealthResult{
@@ -954,11 +945,9 @@ func (m *IndexManager) Index(ctx context.Context, doc *search.Document) error {
 		return fmt.Errorf("index document %q: %w", doc.ID, err)
 	}
 
-	// Update path index (PF.3.3)
+	// Update path cache (PF.3.3, W4P.12)
 	if doc.Path != "" {
-		m.pathMu.Lock()
-		m.pathIndex[doc.Path] = doc.ID
-		m.pathMu.Unlock()
+		m.pathCache.Put(doc.Path, doc.ID)
 	}
 
 	return nil
@@ -1072,13 +1061,9 @@ func (m *IndexManager) indexBatchLocked(ctx context.Context, docs []*search.Docu
 		}
 	}
 
-	// Update path index (PF.3.3)
-	if len(pathsToUpdate) > 0 {
-		m.pathMu.Lock()
-		for path, docID := range pathsToUpdate {
-			m.pathIndex[path] = docID
-		}
-		m.pathMu.Unlock()
+	// Update path cache (PF.3.3, W4P.12)
+	for path, docID := range pathsToUpdate {
+		m.pathCache.Put(path, docID)
 	}
 
 	return nil
@@ -1210,29 +1195,24 @@ func (m *IndexManager) Delete(ctx context.Context, id string) error {
 }
 
 // DeleteByPath removes a document from the index by path.
-// Uses O(1) path index lookup when available, falls back to search.
+// Uses O(1) path cache lookup when available, falls back to search.
 // Returns nil if the document is not found.
 // Returns ErrIndexClosed if the index is not open.
 // W4P.4: Operations are ordered to maintain consistency - Bleve delete happens
-// first, path index removal only occurs on success.
+// first, path cache removal only occurs on success.
 func (m *IndexManager) DeleteByPath(ctx context.Context, path string) error {
-	// First, try O(1) lookup from path index (PF.3.3)
-	m.pathMu.RLock()
-	docID, exists := m.pathIndex[path]
-	m.pathMu.RUnlock()
+	// First, try O(1) lookup from path cache (PF.3.3, W4P.12)
+	docID, exists := m.pathCache.Get(path)
 
 	if exists {
-		// W4P.4: Delete from Bleve FIRST, then remove from path index only on success.
-		// This prevents phantom entries where path index points to non-existent doc.
+		// W4P.4: Delete from Bleve FIRST, then remove from cache only on success.
+		// This prevents phantom entries where cache points to non-existent doc.
 		if err := m.Delete(ctx, docID); err != nil {
 			return err
 		}
 
-		// Remove from path index only after successful Bleve delete
-		m.pathMu.Lock()
-		delete(m.pathIndex, path)
-		m.pathMu.Unlock()
-
+		// Remove from path cache only after successful Bleve delete
+		m.pathCache.Delete(path)
 		return nil
 	}
 
@@ -1296,11 +1276,9 @@ func (m *IndexManager) Update(ctx context.Context, doc *search.Document) error {
 		return err
 	}
 
-	// Update path index (PF.3.3)
+	// Update path cache (PF.3.3, W4P.12)
 	if doc.Path != "" {
-		m.pathMu.Lock()
-		m.pathIndex[doc.Path] = doc.ID
-		m.pathMu.Unlock()
+		m.pathCache.Put(doc.Path, doc.ID)
 	}
 
 	return nil
