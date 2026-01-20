@@ -828,28 +828,38 @@ type handoffManagerJSON struct {
 }
 
 // MarshalJSON implements json.Marshaler.
+// W4N.14: Uses atomic snapshot approach - acquires both locks before collecting
+// any data to ensure consistent JSON representation.
 func (m *HandoffManager) MarshalJSON() ([]byte, error) {
+	snapshot := m.collectAtomicSnapshot()
+	return json.Marshal(snapshot)
+}
+
+// collectAtomicSnapshot collects all state under a single atomic operation.
+// Both mu and contextMu are held simultaneously to ensure consistency.
+func (m *HandoffManager) collectAtomicSnapshot() handoffManagerJSON {
+	// Acquire both locks atomically before collecting any data
 	m.mu.RLock()
-	lastEval := m.lastEvaluation
-	lastHandoff := m.lastHandoff
-	config := m.config
-	m.mu.RUnlock()
-
 	m.contextMu.RLock()
-	preparedCtx := m.preparedContext
-	m.contextMu.RUnlock()
 
-	return json.Marshal(handoffManagerJSON{
-		Config:          config,
-		PreparedContext: preparedCtx,
-		LastEvaluation:  lastEval.Format(time.RFC3339Nano),
-		LastHandoff:     lastHandoff.Format(time.RFC3339Nano),
+	// Collect all data while holding both locks
+	snapshot := handoffManagerJSON{
+		Config:          m.config,
+		PreparedContext: m.preparedContext,
+		LastEvaluation:  m.lastEvaluation.Format(time.RFC3339Nano),
+		LastHandoff:     m.lastHandoff.Format(time.RFC3339Nano),
 		Evaluations:     m.evaluations.Load(),
 		Executed:        m.handoffsExecuted.Load(),
 		Forced:          m.handoffsForced.Load(),
 		Failed:          m.handoffsFailed.Load(),
 		Status:          HandoffStatus(m.status.Load()).String(),
-	})
+	}
+
+	// Release both locks after all data is collected
+	m.contextMu.RUnlock()
+	m.mu.RUnlock()
+
+	return snapshot
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
