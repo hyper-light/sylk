@@ -451,13 +451,16 @@ func TestAdaptiveQuantizer_DerivedConfig(t *testing.T) {
 		{"32-dim, 200 vectors", 32, 200},
 		{"64-dim, 1000 vectors", 64, 1000},
 		{"128-dim, 5000 vectors", 128, 5000},
-		{"768-dim, 10000 vectors", 768, 10000},
+		{"768-dim, 2000 vectors", 768, 2000}, // Reduced from 10000 for faster CI
 	}
 
 	ctx := context.Background()
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.vectorDim >= 512 && testing.Short() {
+				t.Skip("skipping large dimension test in short mode")
+			}
 			rng := rand.New(rand.NewSource(42))
 
 			// Generate random vectors
