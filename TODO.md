@@ -37555,19 +37555,19 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add mutex protection for score updates                                   ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.54 - Resolver Missing Error Propagation                                 ││
+│ │ [x] W12.54 - Resolver Missing Error Propagation                                 ││
 │ │   FILE: core/vectorgraphdb/mitigations/resolver.go:156-189                      ││
 │ │   ISSUE: Resolution errors swallowed, caller not notified                       ││
 │ │   FIX: Return errors to caller                                                  ││
 │ │   SEVERITY: HIGH - Silent failures                                              ││
 │ │                                                                                  ││
-│ │ [ ] W12.55 - Trust Missing Bounds Checking                                      ││
+│ │ [x] W12.55 - Trust Missing Bounds Checking                                      ││
 │ │   FILE: core/vectorgraphdb/mitigations/trust.go:78-95                           ││
 │ │   ISSUE: Trust scores accepted without validation                               ││
 │ │   FIX: Add bounds checking for trust values                                     ││
 │ │   SEVERITY: HIGH - Invalid data acceptance                                      ││
 │ │                                                                                  ││
-│ │ [ ] W12.56 - Prompt Missing Sanitization                                        ││
+│ │ [x] W12.56 - Prompt Missing Sanitization                                        ││
 │ │   FILE: core/vectorgraphdb/mitigations/prompt.go:123-156                        ││
 │ │   ISSUE: Prompt inputs not sanitized before use                                 ││
 │ │   FIX: Add input sanitization                                                   ││
