@@ -34,7 +34,14 @@ const DefaultFlushInterval = 100 * time.Millisecond
 var (
 	ErrObservationLogClosed = errors.New("observation log is closed")
 	ErrInvalidObservation   = errors.New("invalid observation")
+	ErrWriteQueueFull       = errors.New("write queue is full")
 )
+
+// DefaultWriteQueueSize is the default size of the async write queue.
+const DefaultWriteQueueSize = 1000
+
+// DefaultSyncInterval is the default interval for syncing the WAL to disk.
+const DefaultSyncInterval = 100 * time.Millisecond
 
 // =============================================================================
 // Logged Observation
@@ -42,10 +49,17 @@ var (
 
 // LoggedObservation wraps an observation with WAL metadata.
 type LoggedObservation struct {
-	Sequence    uint64            `json:"sequence"`
-	Timestamp   time.Time         `json:"timestamp"`
+	Sequence    uint64             `json:"sequence"`
+	Timestamp   time.Time          `json:"timestamp"`
 	Observation EpisodeObservation `json:"observation"`
-	Processed   bool              `json:"processed"`
+	Processed   bool               `json:"processed"`
+}
+
+// writeRequest represents an async write request.
+type writeRequest struct {
+	data     []byte
+	sequence uint64
+	resultCh chan error
 }
 
 // =============================================================================
@@ -53,7 +67,8 @@ type LoggedObservation struct {
 // =============================================================================
 
 // ObservationLog provides crash-safe logging of EpisodeObservations.
-// Observations are written synchronously to disk, then queued for async processing.
+// Observations are serialized outside the critical section, then written via async queue.
+// This reduces lock contention by moving expensive I/O operations to a dedicated writer goroutine.
 type ObservationLog struct {
 	mu sync.Mutex
 
@@ -62,9 +77,17 @@ type ObservationLog struct {
 	writer   *bufio.Writer
 	sequence uint64
 
-	obsChannel chan *EpisodeObservation
-	closed     atomic.Bool
-	closeDone  chan struct{}
+	// Async write queue - decouples serialization from I/O
+	writeQueue      chan *writeRequest
+	writeDone       chan struct{}
+	writeQueueClose sync.Once
+	syncInterval    time.Duration
+	lastSync        time.Time
+
+	obsChannel     chan *EpisodeObservation
+	obsChannelOnce sync.Once
+	closed         atomic.Bool
+	closeDone      chan struct{}
 
 	adaptive *AdaptiveState
 	scope    *concurrency.GoroutineScope
@@ -72,16 +95,24 @@ type ObservationLog struct {
 
 // ObservationLogConfig holds configuration for the observation log.
 type ObservationLogConfig struct {
-	Path         string
-	BufferSize   int
-	Adaptive     *AdaptiveState
-	Scope        *concurrency.GoroutineScope
+	Path           string
+	BufferSize     int
+	WriteQueueSize int           // Size of async write queue (default: 1000)
+	SyncInterval   time.Duration // Interval between fsync calls (default: 100ms)
+	Adaptive       *AdaptiveState
+	Scope          *concurrency.GoroutineScope
 }
 
 // NewObservationLog creates a new observation log.
 func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*ObservationLog, error) {
 	if config.BufferSize <= 0 {
 		config.BufferSize = DefaultObservationBufferSize
+	}
+	if config.WriteQueueSize <= 0 {
+		config.WriteQueueSize = DefaultWriteQueueSize
+	}
+	if config.SyncInterval <= 0 {
+		config.SyncInterval = DefaultSyncInterval
 	}
 
 	file, err := openWALFile(config.Path)
@@ -90,16 +121,26 @@ func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*Obser
 	}
 
 	log := &ObservationLog{
-		path:       config.Path,
-		file:       file,
-		writer:     bufio.NewWriter(file),
-		obsChannel: make(chan *EpisodeObservation, config.BufferSize),
-		closeDone:  make(chan struct{}),
-		adaptive:   config.Adaptive,
-		scope:      config.Scope,
+		path:         config.Path,
+		file:         file,
+		writer:       bufio.NewWriter(file),
+		writeQueue:   make(chan *writeRequest, config.WriteQueueSize),
+		writeDone:    make(chan struct{}),
+		syncInterval: config.SyncInterval,
+		lastSync:     time.Now(),
+		obsChannel:   make(chan *EpisodeObservation, config.BufferSize),
+		closeDone:    make(chan struct{}),
+		adaptive:     config.Adaptive,
+		scope:        config.Scope,
 	}
 
 	if err := log.loadSequence(); err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// Start async writer goroutine
+	if err := log.startAsyncWriter(ctx); err != nil {
 		file.Close()
 		return nil, err
 	}
@@ -169,6 +210,102 @@ func (l *ObservationLog) startProcessor(ctx context.Context) error {
 	})
 }
 
+// startAsyncWriter starts the async writer goroutine.
+func (l *ObservationLog) startAsyncWriter(ctx context.Context) error {
+	if l.scope == nil {
+		go l.asyncWriteLoop(ctx)
+		return nil
+	}
+
+	return l.scope.Go("observation-log-writer", 0, func(innerCtx context.Context) error {
+		l.asyncWriteLoop(innerCtx)
+		return nil
+	})
+}
+
+// asyncWriteLoop is the main loop for the async writer goroutine.
+// It processes write requests from the queue and performs actual I/O.
+func (l *ObservationLog) asyncWriteLoop(ctx context.Context) {
+	defer close(l.writeDone)
+
+	// Ticker for periodic sync
+	ticker := time.NewTicker(l.syncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			l.flushPendingWrites()
+			return
+		case req, ok := <-l.writeQueue:
+			if !ok {
+				// Channel closed, flush and exit
+				l.flushPendingWrites()
+				return
+			}
+			err := l.performWrite(req.data)
+			if req.resultCh != nil {
+				req.resultCh <- err
+			}
+		case <-ticker.C:
+			// Periodic sync to ensure durability
+			l.periodicSync()
+		}
+	}
+}
+
+// performWrite executes the actual write to the file.
+// This runs in the single writer goroutine, so no lock is needed for I/O.
+func (l *ObservationLog) performWrite(data []byte) error {
+	if _, err := l.writer.Write(data); err != nil {
+		return err
+	}
+	// Flush buffer to OS (but don't sync yet for performance)
+	return l.writer.Flush()
+}
+
+// periodicSync syncs to disk if enough time has passed.
+func (l *ObservationLog) periodicSync() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if time.Since(l.lastSync) >= l.syncInterval {
+		l.file.Sync()
+		l.lastSync = time.Now()
+	}
+}
+
+// flushPendingWrites drains the write queue and flushes to disk.
+func (l *ObservationLog) flushPendingWrites() {
+	// Drain any remaining writes from the queue
+	for {
+		select {
+		case req, ok := <-l.writeQueue:
+			if !ok {
+				// Channel closed
+				l.finalSync()
+				return
+			}
+			err := l.performWrite(req.data)
+			if req.resultCh != nil {
+				req.resultCh <- err
+			}
+		default:
+			// Queue empty
+			l.finalSync()
+			return
+		}
+	}
+}
+
+// finalSync performs final flush and sync.
+func (l *ObservationLog) finalSync() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.writer.Flush()
+	l.file.Sync()
+}
+
 func (l *ObservationLog) processLoop(ctx context.Context) {
 	defer close(l.closeDone)
 
@@ -214,6 +351,46 @@ func (l *ObservationLog) Record(ctx context.Context, obs *EpisodeObservation) er
 }
 
 func (l *ObservationLog) writeToWAL(obs *EpisodeObservation) error {
+	// Step 1: Assign sequence under lock (fast)
+	l.mu.Lock()
+	seq := l.sequence + 1
+	l.sequence = seq
+	l.mu.Unlock()
+
+	// Step 2: Serialize outside lock (can be slow, doesn't block other operations)
+	logged := LoggedObservation{
+		Sequence:    seq,
+		Timestamp:   time.Now(),
+		Observation: *obs,
+		Processed:   false,
+	}
+
+	data, err := json.Marshal(logged)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	// Step 3: Queue for async write
+	req := &writeRequest{
+		data:     data,
+		sequence: seq,
+		resultCh: make(chan error, 1),
+	}
+
+	select {
+	case l.writeQueue <- req:
+		// Wait for write to complete to ensure durability
+		return <-req.resultCh
+	default:
+		// Queue is full - apply backpressure
+		return ErrWriteQueueFull
+	}
+}
+
+// writeToWALSync writes synchronously to WAL, bypassing the async queue.
+// Used for operations that require immediate durability (e.g., shutdown).
+func (l *ObservationLog) writeToWALSync(obs *EpisodeObservation) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -453,16 +630,37 @@ func (l *ObservationLog) Close() error {
 		return nil
 	}
 
-	// Close channel to stop processor
-	close(l.obsChannel)
+	// Close write queue using sync.Once for panic-safe close
+	l.writeQueueClose.Do(func() {
+		close(l.writeQueue)
+	})
+
+	// Wait for async writer to finish (it will flush pending writes)
+	<-l.writeDone
+
+	// Close observation channel using sync.Once for panic-safe close
+	l.obsChannelOnce.Do(func() {
+		close(l.obsChannel)
+	})
 
 	// Wait for processor to finish
 	<-l.closeDone
 
+	return l.closeFile()
+}
+
+// closeFile performs final flush and file close.
+func (l *ObservationLog) closeFile() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// Final flush and sync (should be no-op if async writer did its job)
 	if err := l.writer.Flush(); err != nil {
+		l.file.Close()
+		return err
+	}
+
+	if err := l.file.Sync(); err != nil {
 		l.file.Close()
 		return err
 	}

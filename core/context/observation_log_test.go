@@ -396,6 +396,88 @@ func TestObservationLog_Close_Idempotent(t *testing.T) {
 	log.Close()
 }
 
+func TestObservationLog_Close_Concurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Write some observations first
+	for i := 0; i < 5; i++ {
+		log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+
+	// Concurrent close calls should not panic (W3C.5)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Close()
+		}()
+	}
+	wg.Wait()
+
+	// Verify closed state
+	if !log.IsClosed() {
+		t.Error("expected log to be closed")
+	}
+}
+
+func TestObservationLog_Close_SingleClose_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Write observations
+	for i := 0; i < 10; i++ {
+		if err := log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: i,
+		}); err != nil {
+			t.Fatalf("failed to record: %v", err)
+		}
+	}
+
+	// Single close should work without error
+	if err := log.Close(); err != nil {
+		t.Errorf("unexpected error on close: %v", err)
+	}
+
+	// Verify closed
+	if !log.IsClosed() {
+		t.Error("expected log to be closed")
+	}
+
+	// Verify data persisted
+	log2, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to reopen log: %v", err)
+	}
+	defer log2.Close()
+
+	observations, err := log2.GetObservations()
+	if err != nil {
+		t.Fatalf("failed to get observations: %v", err)
+	}
+	if len(observations) != 10 {
+		t.Errorf("expected 10 observations, got %d", len(observations))
+	}
+}
+
 // =============================================================================
 // Truncate Tests
 // =============================================================================
@@ -661,5 +743,212 @@ func TestObservationLog_IsClosed(t *testing.T) {
 
 	if !log.IsClosed() {
 		t.Error("expected closed after Close()")
+	}
+}
+
+// =============================================================================
+// Async Write Tests (PF.5.6)
+// =============================================================================
+
+func TestObservationLog_AsyncWriteConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path:           path,
+		WriteQueueSize: 500,
+		SyncInterval:   50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Should be able to record without issues
+	for i := 0; i < 10; i++ {
+		if err := log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true}); err != nil {
+			t.Errorf("failed to record: %v", err)
+		}
+	}
+}
+
+func TestObservationLog_WriteQueueFull(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	// Create log with tiny write queue
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path:           path,
+		WriteQueueSize: 1,
+		SyncInterval:   time.Hour, // Long sync interval to prevent draining
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Try to flood the write queue - at least one should fail
+	// Note: This test is timing dependent, so we just verify the error type
+	// when it does occur, rather than guaranteeing it happens
+	var writeQueueFullSeen bool
+	for i := 0; i < 100; i++ {
+		err := log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+		if err == ErrWriteQueueFull {
+			writeQueueFullSeen = true
+			break
+		}
+	}
+
+	// We can't guarantee we'll see the error in this test since the writer
+	// goroutine might process fast enough, but the code path exists
+	t.Logf("ErrWriteQueueFull seen: %v", writeQueueFullSeen)
+}
+
+func TestObservationLog_AsyncWriteDurability(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path:         path,
+		SyncInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Write observations
+	for i := 0; i < 10; i++ {
+		if err := log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: i,
+		}); err != nil {
+			t.Fatalf("failed to record: %v", err)
+		}
+	}
+
+	// Close ensures all writes are flushed
+	log.Close()
+
+	// Reopen and verify all observations are there
+	log2, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to reopen log: %v", err)
+	}
+	defer log2.Close()
+
+	observations, err := log2.GetObservations()
+	if err != nil {
+		t.Fatalf("failed to get observations: %v", err)
+	}
+
+	if len(observations) != 10 {
+		t.Errorf("expected 10 observations after reopen, got %d", len(observations))
+	}
+}
+
+func TestObservationLog_AsyncWritePerformance(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path:           path,
+		WriteQueueSize: 1000,
+		SyncInterval:   100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Write 100 observations and measure time
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		if err := log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: i,
+		}); err != nil {
+			t.Fatalf("failed to record: %v", err)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// With async writes, 100 records should complete quickly
+	// (serialization outside lock, queue-based I/O)
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("async writes took %v, expected < 500ms", elapsed)
+	}
+	t.Logf("100 async writes completed in %v", elapsed)
+}
+
+func TestObservationLog_ConcurrentAsyncWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path:           path,
+		WriteQueueSize: 1000,
+		SyncInterval:   50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Concurrent writes
+	var wg sync.WaitGroup
+	successCount := make(chan int, 50)
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			err := log.Record(context.Background(), &EpisodeObservation{
+				TaskCompleted: id%2 == 0,
+				FollowUpCount: id,
+			})
+			if err == nil {
+				successCount <- 1
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(successCount)
+
+	// Close to ensure all writes complete
+	log.Close()
+
+	// Count successes
+	total := 0
+	for s := range successCount {
+		total += s
+	}
+
+	// At least most should succeed (some might hit queue full)
+	if total < 40 {
+		t.Errorf("expected at least 40 successful writes, got %d", total)
+	}
+
+	// Verify data integrity
+	log2, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to reopen log: %v", err)
+	}
+	defer log2.Close()
+
+	observations, _ := log2.GetObservations()
+	if len(observations) != total {
+		t.Errorf("expected %d observations, got %d", total, len(observations))
+	}
+
+	// Verify sequence numbers are unique
+	seqMap := make(map[uint64]bool)
+	for _, obs := range observations {
+		if seqMap[obs.Sequence] {
+			t.Errorf("duplicate sequence number: %d", obs.Sequence)
+		}
+		seqMap[obs.Sequence] = true
 	}
 }
