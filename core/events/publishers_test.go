@@ -980,8 +980,8 @@ func TestLLMPublisher_PublishLLMError(t *testing.T) {
 		t.Errorf("Expected error 'rate limit exceeded', got '%v'", event.Data["error"])
 	}
 
-	if event.Data["context"] != "Token generation" {
-		t.Errorf("Expected context 'Token generation', got '%v'", event.Data["context"])
+	if event.Data["error_context"] != "Token generation" {
+		t.Errorf("Expected error_context 'Token generation', got '%v'", event.Data["error_context"])
 	}
 }
 
@@ -1004,9 +1004,9 @@ func TestLLMPublisher_PublishLLMError_NilError(t *testing.T) {
 		t.Fatal("Expected to receive event")
 	}
 
-	// Verify error is empty string
-	if event.Data["error"] != "" {
-		t.Errorf("Expected empty error for nil error, got '%v'", event.Data["error"])
+	// Verify error is "unknown error" when nil error is passed
+	if event.Data["error"] != "unknown error" {
+		t.Errorf("Expected 'unknown error' for nil error, got '%v'", event.Data["error"])
 	}
 }
 
