@@ -548,3 +548,222 @@ func itoa(i int) string {
 	}
 	return result
 }
+
+// =============================================================================
+// W12.25 - Pending ACK TTL Cleanup Tests
+// =============================================================================
+
+func TestSignalBus_PendingAckTTLCleanup(t *testing.T) {
+	// Create bus with short TTL for testing
+	config := signal.SignalBusConfig{
+		DefaultTimeout:    5 * time.Second,
+		RetryCount:        1,
+		ChannelBufferSize: 100,
+		PendingAckTTL:     50 * time.Millisecond,
+		CleanupInterval:   20 * time.Millisecond,
+	}
+	bus := signal.NewSignalBus(config)
+	defer bus.Close()
+
+	ch := make(chan signal.SignalMessage, 10)
+	sub := signal.SignalSubscriber{
+		ID:      "sub-1",
+		AgentID: "agent-1",
+		Signals: []signal.Signal{signal.PauseAll},
+		Channel: ch,
+	}
+
+	require.NoError(t, bus.Subscribe(sub))
+
+	// Broadcast a message requiring ACK but don't acknowledge it
+	msg := signal.SignalMessage{
+		ID:          "msg-ttl-test",
+		Signal:      signal.PauseAll,
+		RequiresAck: true,
+		Timeout:     100 * time.Millisecond,
+	}
+
+	err := bus.Broadcast(msg)
+	require.NoError(t, err)
+
+	// Consume the message
+	select {
+	case <-ch:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("did not receive message")
+	}
+
+	// Verify pending entry exists
+	assert.Equal(t, 1, bus.PendingCount(), "Should have 1 pending ACK entry")
+
+	// Wait for TTL to expire and cleanup to run
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify pending entry was cleaned up
+	assert.Equal(t, 0, bus.PendingCount(), "Pending ACK should be cleaned up after TTL")
+}
+
+func TestSignalBus_PendingAckNotCleanedBeforeTTL(t *testing.T) {
+	// Create bus with longer TTL
+	config := signal.SignalBusConfig{
+		DefaultTimeout:    5 * time.Second,
+		RetryCount:        1,
+		ChannelBufferSize: 100,
+		PendingAckTTL:     500 * time.Millisecond,
+		CleanupInterval:   20 * time.Millisecond,
+	}
+	bus := signal.NewSignalBus(config)
+	defer bus.Close()
+
+	ch := make(chan signal.SignalMessage, 10)
+	sub := signal.SignalSubscriber{
+		ID:      "sub-1",
+		AgentID: "agent-1",
+		Signals: []signal.Signal{signal.PauseAll},
+		Channel: ch,
+	}
+
+	require.NoError(t, bus.Subscribe(sub))
+
+	// Broadcast a message requiring ACK
+	msg := signal.SignalMessage{
+		ID:          "msg-ttl-test-2",
+		Signal:      signal.PauseAll,
+		RequiresAck: true,
+	}
+
+	err := bus.Broadcast(msg)
+	require.NoError(t, err)
+
+	// Consume the message
+	<-ch
+
+	// Wait for cleanup to run but TTL not yet expired
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify pending entry still exists (TTL not expired)
+	assert.Equal(t, 1, bus.PendingCount(), "Pending ACK should still exist before TTL")
+}
+
+func TestSignalBus_CloseCleansPendingAcks(t *testing.T) {
+	config := signal.SignalBusConfig{
+		DefaultTimeout:    5 * time.Second,
+		RetryCount:        1,
+		ChannelBufferSize: 100,
+		PendingAckTTL:     1 * time.Minute, // Long TTL
+		CleanupInterval:   1 * time.Minute,
+	}
+	bus := signal.NewSignalBus(config)
+
+	ch := make(chan signal.SignalMessage, 10)
+	sub := signal.SignalSubscriber{
+		ID:      "sub-1",
+		AgentID: "agent-1",
+		Signals: []signal.Signal{signal.PauseAll},
+		Channel: ch,
+	}
+
+	require.NoError(t, bus.Subscribe(sub))
+
+	// Create multiple pending ACKs
+	for i := 0; i < 5; i++ {
+		msg := signal.SignalMessage{
+			ID:          formatMsgID(i),
+			Signal:      signal.PauseAll,
+			RequiresAck: true,
+		}
+		require.NoError(t, bus.Broadcast(msg))
+		<-ch
+	}
+
+	assert.Equal(t, 5, bus.PendingCount(), "Should have 5 pending ACK entries")
+
+	// Close should clean up all pending entries
+	bus.Close()
+
+	assert.Equal(t, 0, bus.PendingCount(), "Close should clear all pending ACKs")
+}
+
+func TestSignalBus_ConcurrentAckAndCleanup(t *testing.T) {
+	config := signal.SignalBusConfig{
+		DefaultTimeout:    5 * time.Second,
+		RetryCount:        1,
+		ChannelBufferSize: 100,
+		PendingAckTTL:     30 * time.Millisecond,
+		CleanupInterval:   10 * time.Millisecond,
+	}
+	bus := signal.NewSignalBus(config)
+	defer bus.Close()
+
+	ch := make(chan signal.SignalMessage, 100)
+	sub := signal.SignalSubscriber{
+		ID:      "sub-1",
+		AgentID: "agent-1",
+		Signals: []signal.Signal{signal.PauseAll},
+		Channel: ch,
+	}
+
+	require.NoError(t, bus.Subscribe(sub))
+
+	var wg sync.WaitGroup
+
+	// Broadcast many messages requiring ACK
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			msg := signal.SignalMessage{
+				ID:          "concurrent-msg-" + itoa(idx),
+				Signal:      signal.PauseAll,
+				RequiresAck: true,
+			}
+			_ = bus.Broadcast(msg)
+		}(i)
+	}
+
+	// Concurrently acknowledge some messages
+	for i := 0; i < 25; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			time.Sleep(time.Duration(idx) * time.Millisecond)
+			ack := signal.SignalAck{
+				SignalID:     "concurrent-msg-" + itoa(idx),
+				SubscriberID: "sub-1",
+				AgentID:      "agent-1",
+				ReceivedAt:   time.Now(),
+				State:        "acked",
+			}
+			_ = bus.Acknowledge(ack)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Drain the channel
+	for len(ch) > 0 {
+		<-ch
+	}
+
+	// Wait for TTL cleanup
+	time.Sleep(100 * time.Millisecond)
+
+	// All entries should be cleaned up eventually
+	assert.Equal(t, 0, bus.PendingCount(), "All pending ACKs should be cleaned up")
+}
+
+func TestSignalBus_MultipleCloseIsSafe(t *testing.T) {
+	bus := signal.NewSignalBus(signal.DefaultSignalBusConfig())
+
+	// Multiple Close calls should be safe
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			bus.Close()
+		}()
+	}
+	wg.Wait()
+	// Should not panic
+}

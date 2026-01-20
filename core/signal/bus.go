@@ -17,6 +17,8 @@ type SignalBusConfig struct {
 	DefaultTimeout    time.Duration
 	RetryCount        int
 	ChannelBufferSize int
+	PendingAckTTL     time.Duration // TTL for pending ACK entries (default: 30s)
+	CleanupInterval   time.Duration // Interval for cleanup goroutine (default: 10s)
 }
 
 func DefaultSignalBusConfig() SignalBusConfig {
@@ -24,6 +26,8 @@ func DefaultSignalBusConfig() SignalBusConfig {
 		DefaultTimeout:    5 * time.Second,
 		RetryCount:        1,
 		ChannelBufferSize: 100,
+		PendingAckTTL:     30 * time.Second,
+		CleanupInterval:   10 * time.Second,
 	}
 }
 
@@ -33,6 +37,7 @@ type pendingAck struct {
 	done      chan struct{}
 	mu        sync.Mutex
 	completed bool
+	createdAt time.Time // Timestamp for TTL-based cleanup
 }
 
 type SignalBus struct {
@@ -41,14 +46,30 @@ type SignalBus struct {
 	pending     map[string]*pendingAck
 	mu          sync.RWMutex
 	closed      bool
+	done        chan struct{}
+	stopOnce    sync.Once
 }
 
 func NewSignalBus(config SignalBusConfig) *SignalBus {
-	return &SignalBus{
+	config = normalizeSignalBusConfig(config)
+	b := &SignalBus{
 		config:      config,
 		subscribers: make(map[string]*SignalSubscriber),
 		pending:     make(map[string]*pendingAck),
+		done:        make(chan struct{}),
 	}
+	go b.cleanupLoop()
+	return b
+}
+
+func normalizeSignalBusConfig(config SignalBusConfig) SignalBusConfig {
+	if config.PendingAckTTL <= 0 {
+		config.PendingAckTTL = 30 * time.Second
+	}
+	if config.CleanupInterval <= 0 {
+		config.CleanupInterval = 10 * time.Second
+	}
+	return config
 }
 
 func (b *SignalBus) Subscribe(sub SignalSubscriber) error {
@@ -121,9 +142,10 @@ func (b *SignalBus) initPendingAck(signalID string, subscribers []*SignalSubscri
 	defer b.mu.Unlock()
 
 	pa := &pendingAck{
-		expected: make(map[string]bool),
-		received: make([]SignalAck, 0),
-		done:     make(chan struct{}),
+		expected:  make(map[string]bool),
+		received:  make([]SignalAck, 0),
+		done:      make(chan struct{}),
+		createdAt: time.Now(),
 	}
 
 	for _, sub := range subscribers {
@@ -216,17 +238,82 @@ func (b *SignalBus) collectAcks(signalID string) ([]SignalAck, error) {
 }
 
 func (b *SignalBus) Close() {
+	b.stopOnce.Do(func() {
+		close(b.done)
+	})
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	b.closed = true
 
-	for _, pa := range b.pending {
+	for signalID, pa := range b.pending {
 		pa.mu.Lock()
 		if !pa.completed {
 			pa.completed = true
 			close(pa.done)
 		}
 		pa.mu.Unlock()
+		delete(b.pending, signalID)
 	}
+}
+
+// cleanupLoop periodically removes expired pending ACK entries.
+func (b *SignalBus) cleanupLoop() {
+	ticker := time.NewTicker(b.config.CleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.cleanupExpiredPendingAcks()
+		case <-b.done:
+			return
+		}
+	}
+}
+
+// cleanupExpiredPendingAcks removes pending ACK entries that have exceeded TTL.
+func (b *SignalBus) cleanupExpiredPendingAcks() {
+	cutoff := time.Now().Add(-b.config.PendingAckTTL)
+	var expired []string
+
+	b.mu.RLock()
+	for signalID, pa := range b.pending {
+		if pa.createdAt.Before(cutoff) {
+			expired = append(expired, signalID)
+		}
+	}
+	b.mu.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for _, signalID := range expired {
+		pa, exists := b.pending[signalID]
+		if !exists {
+			continue
+		}
+		// Re-check under write lock to avoid race condition
+		if pa.createdAt.Before(cutoff) {
+			pa.mu.Lock()
+			if !pa.completed {
+				pa.completed = true
+				close(pa.done)
+			}
+			pa.mu.Unlock()
+			delete(b.pending, signalID)
+		}
+	}
+}
+
+// PendingCount returns the number of pending ACK entries (for testing/monitoring).
+func (b *SignalBus) PendingCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.pending)
 }
