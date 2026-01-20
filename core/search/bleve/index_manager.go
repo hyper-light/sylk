@@ -26,6 +26,114 @@ type IndexConfig struct {
 	Path          string
 	BatchSize     int
 	MaxConcurrent int
+	BatchTimeout  time.Duration // Timeout for batch commit operations. Default: 30s
+
+	// Async indexing configuration
+	AsyncEnabled       bool
+	AsyncQueueSize     int
+	AsyncBatchSize     int
+	AsyncFlushInterval time.Duration
+}
+
+// DefaultBatchTimeout is the default timeout for batch commit operations.
+const DefaultBatchTimeout = 30 * time.Second
+
+// =============================================================================
+// Batch Size Validation (PF.3.10)
+// =============================================================================
+
+const (
+	// MinBatchSize is the minimum allowed batch size to prevent excessive commit overhead.
+	MinBatchSize = 10
+
+	// MaxBatchSize is the maximum allowed batch size to prevent OOM from large batches.
+	MaxBatchSize = 10000
+
+	// DefaultBatchSize is the default batch size when not specified.
+	DefaultBatchSize = 100
+)
+
+// ValidateBatchSize ensures batch size is within acceptable range.
+// Returns MinBatchSize if size is too small, MaxBatchSize if too large,
+// or the original size if within bounds.
+func ValidateBatchSize(size int) int {
+	if size < MinBatchSize {
+		return MinBatchSize
+	}
+	if size > MaxBatchSize {
+		return MaxBatchSize
+	}
+	return size
+}
+
+// =============================================================================
+// Field Configuration for Selective Loading
+// =============================================================================
+
+// FieldConfig specifies which fields to load during search operations.
+// This enables selective field loading to reduce memory usage and improve
+// performance when full document content is not needed.
+type FieldConfig struct {
+	// LoadContent indicates whether to load the full content field (expensive).
+	// When false, content must be lazy-loaded via GetDocumentContent if needed.
+	LoadContent bool
+
+	// Fields specifies the list of fields to load.
+	// If nil and LoadContent is true, all fields are loaded ("*").
+	// If empty slice, only document ID and score are returned.
+	Fields []string
+}
+
+// DefaultMetadataFields are the fields loaded by default (excluding content).
+var DefaultMetadataFields = []string{
+	"path",
+	"type",
+	"title",
+	"modified_at",
+	"indexed_at",
+	"language",
+	"symbols",
+	"imports",
+	"checksum",
+	"git_commit",
+	"comments",
+}
+
+// DefaultFieldConfig returns a FieldConfig for metadata-only loading.
+// This is the recommended default for most search operations as it
+// avoids loading potentially large Content fields.
+func DefaultFieldConfig() FieldConfig {
+	return FieldConfig{
+		LoadContent: false,
+		Fields:      DefaultMetadataFields,
+	}
+}
+
+// FullFieldConfig returns a FieldConfig for loading all fields including content.
+// Use this when you need the full document content in search results.
+func FullFieldConfig() FieldConfig {
+	return FieldConfig{
+		LoadContent: true,
+		Fields:      nil, // nil signals all fields
+	}
+}
+
+// MetadataOnlyFieldConfig returns a FieldConfig that loads only essential metadata.
+// This is the most performant option when you only need paths and types.
+func MetadataOnlyFieldConfig() FieldConfig {
+	return FieldConfig{
+		LoadContent: false,
+		Fields:      []string{"path", "type", "language", "modified_at"},
+	}
+}
+
+// CustomFieldConfig creates a FieldConfig with a custom set of fields.
+// Set loadContent to true to also include the content field.
+func CustomFieldConfig(fields []string, loadContent bool) FieldConfig {
+	return FieldConfig{
+		LoadContent: loadContent,
+		Fields:      fields,
+	}
 }
 
 // DefaultIndexConfig returns sensible defaults for the given base path.
@@ -34,6 +142,7 @@ func DefaultIndexConfig(basePath string) IndexConfig {
 		Path:          basePath + "/documents.bleve",
 		BatchSize:     100,
 		MaxConcurrent: 4,
+		BatchTimeout:  DefaultBatchTimeout,
 	}
 }
 
@@ -56,6 +165,9 @@ var (
 
 	// ErrEmptyBatch indicates an empty batch was provided.
 	ErrEmptyBatch = errors.New("batch cannot be empty")
+
+	// ErrBatchTimeout indicates a batch commit operation timed out.
+	ErrBatchTimeout = errors.New("batch commit timeout")
 )
 
 // =============================================================================
@@ -69,6 +181,14 @@ type IndexManager struct {
 	config IndexConfig
 	mu     sync.RWMutex
 	closed bool
+
+	// Async indexing support (PF.3.2)
+	asyncQueue *AsyncIndexQueue
+	useAsync   bool
+
+	// Path index for O(1) DeleteByPath lookup (PF.3.3)
+	pathIndex map[string]string // path -> docID
+	pathMu    sync.RWMutex
 }
 
 // NewIndexManager creates a new IndexManager for the given path.
@@ -76,16 +196,19 @@ type IndexManager struct {
 func NewIndexManager(path string) *IndexManager {
 	return &IndexManager{
 		config: IndexConfig{
-			Path:      path,
-			BatchSize: 100,
+			Path:         path,
+			BatchSize:    100,
+			BatchTimeout: DefaultBatchTimeout,
 		},
+		pathIndex: make(map[string]string),
 	}
 }
 
 // NewIndexManagerWithConfig creates an IndexManager with full configuration.
 func NewIndexManagerWithConfig(config IndexConfig) *IndexManager {
 	return &IndexManager{
-		config: config,
+		config:    config,
+		pathIndex: make(map[string]string),
 	}
 }
 
@@ -104,7 +227,94 @@ func (m *IndexManager) Open() error {
 		return ErrIndexAlreadyOpen
 	}
 
-	return m.openOrCreate()
+	if err := m.openOrCreate(); err != nil {
+		return err
+	}
+
+	// Initialize async queue if enabled (PF.3.2)
+	if m.config.AsyncEnabled {
+		m.initAsyncQueue()
+	}
+
+	return nil
+}
+
+// initAsyncQueue initializes the async indexing queue.
+// Must be called with write lock held.
+func (m *IndexManager) initAsyncQueue() {
+	asyncCfg := AsyncIndexQueueConfig{
+		MaxQueueSize:  m.config.AsyncQueueSize,
+		BatchSize:     m.config.AsyncBatchSize,
+		FlushInterval: m.config.AsyncFlushInterval,
+	}
+
+	// Apply defaults if not specified
+	if asyncCfg.MaxQueueSize <= 0 {
+		asyncCfg.MaxQueueSize = 10000
+	}
+	if asyncCfg.BatchSize <= 0 {
+		asyncCfg.BatchSize = 100
+	}
+	if asyncCfg.FlushInterval <= 0 {
+		asyncCfg.FlushInterval = 100 * time.Millisecond
+	}
+
+	m.asyncQueue = NewAsyncIndexQueue(
+		context.Background(),
+		asyncCfg,
+		m.indexFunc,
+		m.deleteFunc,
+		m.batchFunc,
+	)
+	m.useAsync = true
+}
+
+// indexFunc is a callback for async queue single document indexing.
+func (m *IndexManager) indexFunc(docID string, doc interface{}) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed || m.index == nil {
+		return ErrIndexClosed
+	}
+
+	return m.index.Index(docID, doc)
+}
+
+// deleteFunc is a callback for async queue single document deletion.
+func (m *IndexManager) deleteFunc(docID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed || m.index == nil {
+		return ErrIndexClosed
+	}
+
+	return m.index.Delete(docID)
+}
+
+// batchFunc is a callback for async queue batch operations.
+func (m *IndexManager) batchFunc(ops []*IndexOperation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed || m.index == nil {
+		return ErrIndexClosed
+	}
+
+	batch := m.index.NewBatch()
+	for _, op := range ops {
+		switch op.Type {
+		case OpIndex:
+			if err := batch.Index(op.DocID, op.Document); err != nil {
+				return err
+			}
+		case OpDelete:
+			batch.Delete(op.DocID)
+		}
+	}
+
+	return m.index.Batch(batch)
 }
 
 // openOrCreate attempts to open existing index, falls back to creating new one.
@@ -141,6 +351,15 @@ func (m *IndexManager) createNewIndex() error {
 // Close flushes and closes the Bleve index.
 // Returns nil if the index is already closed.
 func (m *IndexManager) Close() error {
+	// Close async queue first if active (PF.3.2)
+	if m.asyncQueue != nil {
+		if err := m.asyncQueue.Close(); err != nil {
+			return fmt.Errorf("close async queue: %w", err)
+		}
+		m.asyncQueue = nil
+		m.useAsync = false
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -151,6 +370,12 @@ func (m *IndexManager) Close() error {
 	m.closed = true
 	err := m.index.Close()
 	m.index = nil
+
+	// Clear path index (PF.3.3)
+	m.pathMu.Lock()
+	m.pathIndex = make(map[string]string)
+	m.pathMu.Unlock()
+
 	return err
 }
 
@@ -169,6 +394,116 @@ func (m *IndexManager) Path() string {
 // Config returns the index configuration.
 func (m *IndexManager) Config() IndexConfig {
 	return m.config
+}
+
+// =============================================================================
+// Path Index Methods (PF.3.3)
+// =============================================================================
+
+// UpdatePathIndex adds or updates a path to docID mapping.
+func (m *IndexManager) UpdatePathIndex(path, docID string) {
+	m.pathMu.Lock()
+	m.pathIndex[path] = docID
+	m.pathMu.Unlock()
+}
+
+// RemovePathIndex removes a path from the index.
+func (m *IndexManager) RemovePathIndex(path string) {
+	m.pathMu.Lock()
+	delete(m.pathIndex, path)
+	m.pathMu.Unlock()
+}
+
+// GetDocIDByPath returns the docID for a given path.
+// Returns empty string and false if not found.
+func (m *IndexManager) GetDocIDByPath(path string) (string, bool) {
+	m.pathMu.RLock()
+	docID, exists := m.pathIndex[path]
+	m.pathMu.RUnlock()
+	return docID, exists
+}
+
+// PathIndexSize returns the number of entries in the path index.
+func (m *IndexManager) PathIndexSize() int {
+	m.pathMu.RLock()
+	defer m.pathMu.RUnlock()
+	return len(m.pathIndex)
+}
+
+// =============================================================================
+// Async Indexing Methods (PF.3.2)
+// =============================================================================
+
+// IndexAsync adds document to index asynchronously.
+// Returns a channel that will receive the result error (or nil on success).
+// Falls back to sync if async queue is not enabled.
+func (m *IndexManager) IndexAsync(ctx context.Context, doc *search.Document) <-chan error {
+	if err := m.validateDocument(doc); err != nil {
+		ch := make(chan error, 1)
+		ch <- err
+		close(ch)
+		return ch
+	}
+
+	if m.asyncQueue == nil {
+		// Fallback to sync
+		ch := make(chan error, 1)
+		ch <- m.Index(ctx, doc)
+		close(ch)
+		return ch
+	}
+
+	// Update path index for async operations
+	if doc.Path != "" {
+		m.UpdatePathIndex(doc.Path, doc.ID)
+	}
+
+	return m.asyncQueue.SubmitIndex(doc.ID, doc)
+}
+
+// DeleteAsync removes document asynchronously.
+// Returns a channel that will receive the result error (or nil on success).
+// Falls back to sync if async queue is not enabled.
+func (m *IndexManager) DeleteAsync(ctx context.Context, docID string) <-chan error {
+	if docID == "" {
+		ch := make(chan error, 1)
+		ch <- ErrEmptyDocumentID
+		close(ch)
+		return ch
+	}
+
+	if m.asyncQueue == nil {
+		// Fallback to sync
+		ch := make(chan error, 1)
+		ch <- m.Delete(ctx, docID)
+		close(ch)
+		return ch
+	}
+
+	return m.asyncQueue.SubmitDelete(docID)
+}
+
+// FlushAsync forces immediate processing of all pending async operations.
+// Blocks until all currently queued operations are processed.
+func (m *IndexManager) FlushAsync(ctx context.Context) error {
+	if m.asyncQueue == nil {
+		return nil
+	}
+	return m.asyncQueue.Flush(ctx)
+}
+
+// AsyncStats returns statistics about the async queue.
+// Returns zero values if async is not enabled.
+func (m *IndexManager) AsyncStats() AsyncIndexQueueStats {
+	if m.asyncQueue == nil {
+		return AsyncIndexQueueStats{}
+	}
+	return m.asyncQueue.Stats()
+}
+
+// IsAsyncEnabled returns true if async indexing is enabled.
+func (m *IndexManager) IsAsyncEnabled() bool {
+	return m.useAsync && m.asyncQueue != nil
 }
 
 // =============================================================================
@@ -197,7 +532,18 @@ func (m *IndexManager) Index(ctx context.Context, doc *search.Document) error {
 	default:
 	}
 
-	return m.index.Index(doc.ID, doc)
+	if err := m.index.Index(doc.ID, doc); err != nil {
+		return err
+	}
+
+	// Update path index (PF.3.3)
+	if doc.Path != "" {
+		m.pathMu.Lock()
+		m.pathIndex[doc.Path] = doc.ID
+		m.pathMu.Unlock()
+	}
+
+	return nil
 }
 
 // validateDocument checks that a document is valid for indexing.
@@ -214,6 +560,8 @@ func (m *IndexManager) validateDocument(doc *search.Document) error {
 // IndexBatch indexes multiple documents in a single batch operation.
 // This is more efficient than indexing documents individually.
 // Commits batches at the configured BatchSize for memory efficiency.
+// If the number of documents exceeds the effective batch size, documents
+// are automatically chunked to prevent OOM issues (PF.3.10).
 // Returns ErrIndexClosed if the index is not open.
 // Returns ErrEmptyBatch if docs is empty.
 func (m *IndexManager) IndexBatch(ctx context.Context, docs []*search.Document) error {
@@ -228,10 +576,41 @@ func (m *IndexManager) IndexBatch(ctx context.Context, docs []*search.Document) 
 		return ErrIndexClosed
 	}
 
+	// Validate and apply batch size bounds (PF.3.10)
+	effectiveBatchSize := ValidateBatchSize(m.config.BatchSize)
+
+	// If docs exceed effective batch size, chunk them to prevent OOM
+	if len(docs) > effectiveBatchSize {
+		return m.indexBatchChunked(ctx, docs, effectiveBatchSize)
+	}
+
 	return m.indexBatchLocked(ctx, docs)
 }
 
+// indexBatchChunked processes large batches in smaller chunks to prevent OOM.
+// Must be called with write lock held.
+func (m *IndexManager) indexBatchChunked(ctx context.Context, docs []*search.Document, chunkSize int) error {
+	for i := 0; i < len(docs); i += chunkSize {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		end := i + chunkSize
+		if end > len(docs) {
+			end = len(docs)
+		}
+
+		if err := m.indexBatchLocked(ctx, docs[i:end]); err != nil {
+			return fmt.Errorf("chunk %d: %w", i/chunkSize, err)
+		}
+	}
+	return nil
+}
+
 // indexBatchLocked performs batch indexing with configurable batch size.
+// Uses timeout-protected batch commits to prevent hanging.
 // Must be called with write lock held.
 func (m *IndexManager) indexBatchLocked(ctx context.Context, docs []*search.Document) error {
 	batch := m.index.NewBatch()
@@ -239,6 +618,9 @@ func (m *IndexManager) indexBatchLocked(ctx context.Context, docs []*search.Docu
 	if batchSize <= 0 {
 		batchSize = 100
 	}
+
+	// Collect paths for batch path index update (PF.3.3)
+	pathsToUpdate := make(map[string]string)
 
 	for _, doc := range docs {
 		select {
@@ -251,20 +633,34 @@ func (m *IndexManager) indexBatchLocked(ctx context.Context, docs []*search.Docu
 			return err
 		}
 
-		// Commit batch at configured size
+		// Collect path mappings
+		if doc.Path != "" {
+			pathsToUpdate[doc.Path] = doc.ID
+		}
+
+		// Commit batch at configured size with timeout protection
 		if batch.Size() >= batchSize {
-			if err := m.index.Batch(batch); err != nil {
+			if err := m.BatchWithTimeout(ctx, batch); err != nil {
 				return fmt.Errorf("commit batch: %w", err)
 			}
 			batch = m.index.NewBatch()
 		}
 	}
 
-	// Commit remaining documents
+	// Commit remaining documents with timeout protection
 	if batch.Size() > 0 {
-		if err := m.index.Batch(batch); err != nil {
+		if err := m.BatchWithTimeout(ctx, batch); err != nil {
 			return fmt.Errorf("commit final batch: %w", err)
 		}
+	}
+
+	// Update path index (PF.3.3)
+	if len(pathsToUpdate) > 0 {
+		m.pathMu.Lock()
+		for path, docID := range pathsToUpdate {
+			m.pathIndex[path] = docID
+		}
+		m.pathMu.Unlock()
 	}
 
 	return nil
@@ -276,6 +672,38 @@ func (m *IndexManager) addToBatch(batch *bleve.Batch, doc *search.Document) erro
 		return err
 	}
 	return batch.Index(doc.ID, doc)
+}
+
+// BatchWithTimeout wraps batch commit with context timeout protection.
+// If the context doesn't already have a deadline, it applies the configured BatchTimeout.
+// This prevents batch commits from hanging indefinitely if Bleve experiences issues.
+// Must be called with appropriate lock held (caller's responsibility).
+func (m *IndexManager) BatchWithTimeout(ctx context.Context, batch *bleve.Batch) error {
+	// Determine the timeout to use
+	timeout := m.config.BatchTimeout
+	if timeout <= 0 {
+		timeout = DefaultBatchTimeout
+	}
+
+	// Create timeout context if not already present
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	// Use channel to capture result from goroutine
+	done := make(chan error, 1)
+	go func() {
+		done <- m.index.Batch(batch)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %v", ErrBatchTimeout, ctx.Err())
+	}
 }
 
 // Delete removes a document from the index by ID.
@@ -303,9 +731,31 @@ func (m *IndexManager) Delete(ctx context.Context, id string) error {
 }
 
 // DeleteByPath removes a document from the index by path.
+// Uses O(1) path index lookup when available, falls back to search.
 // Returns nil if the document is not found.
 // Returns ErrIndexClosed if the index is not open.
 func (m *IndexManager) DeleteByPath(ctx context.Context, path string) error {
+	// First, try O(1) lookup from path index (PF.3.3)
+	m.pathMu.RLock()
+	docID, exists := m.pathIndex[path]
+	m.pathMu.RUnlock()
+
+	if exists {
+		// Remove from path index
+		m.pathMu.Lock()
+		delete(m.pathIndex, path)
+		m.pathMu.Unlock()
+
+		return m.Delete(ctx, docID)
+	}
+
+	// Fall back to search if not in cache
+	return m.deleteByPathSlow(ctx, path)
+}
+
+// deleteByPathSlow performs DeleteByPath using a search query.
+// Used as fallback when path is not in the path index.
+func (m *IndexManager) deleteByPathSlow(ctx context.Context, path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -355,7 +805,18 @@ func (m *IndexManager) Update(ctx context.Context, doc *search.Document) error {
 	default:
 	}
 
-	return m.updateLocked(doc)
+	if err := m.updateLocked(doc); err != nil {
+		return err
+	}
+
+	// Update path index (PF.3.3)
+	if doc.Path != "" {
+		m.pathMu.Lock()
+		m.pathIndex[doc.Path] = doc.ID
+		m.pathMu.Unlock()
+	}
+
+	return nil
 }
 
 // updateLocked performs delete + index. Must be called with write lock held.
@@ -388,9 +849,19 @@ func (m *IndexManager) DocumentCount() (uint64, error) {
 // =============================================================================
 
 // Search executes a search query and returns matching documents.
+// Uses DefaultFieldConfig which loads metadata but not content for efficiency.
 // Supports query string search with optional highlighting.
 // Returns ErrIndexClosed if the index is not open.
 func (m *IndexManager) Search(ctx context.Context, req *search.SearchRequest) (*search.SearchResult, error) {
+	return m.SearchWithFields(ctx, req, DefaultFieldConfig())
+}
+
+// SearchWithFields executes a search query with configurable field loading.
+// Use this method when you need control over which fields are loaded.
+// Pass FullFieldConfig() to load all fields including content.
+// Pass DefaultFieldConfig() to load only metadata (more efficient).
+// Returns ErrIndexClosed if the index is not open.
+func (m *IndexManager) SearchWithFields(ctx context.Context, req *search.SearchRequest, fieldCfg FieldConfig) (*search.SearchResult, error) {
 	if err := req.ValidateAndNormalize(); err != nil {
 		return nil, err
 	}
@@ -402,13 +873,13 @@ func (m *IndexManager) Search(ctx context.Context, req *search.SearchRequest) (*
 		return nil, ErrIndexClosed
 	}
 
-	return m.executeSearch(ctx, req)
+	return m.executeSearchWithFields(ctx, req, fieldCfg)
 }
 
-// executeSearch builds and executes the Bleve search request.
+// executeSearchWithFields builds and executes the Bleve search request with field config.
 // Must be called with read lock held.
-func (m *IndexManager) executeSearch(ctx context.Context, req *search.SearchRequest) (*search.SearchResult, error) {
-	bleveReq := m.buildBleveRequest(req)
+func (m *IndexManager) executeSearchWithFields(ctx context.Context, req *search.SearchRequest, fieldCfg FieldConfig) (*search.SearchResult, error) {
+	bleveReq := m.buildBleveRequestWithFields(req, fieldCfg)
 
 	startTime := time.Now()
 	bleveResult, err := m.index.SearchInContext(ctx, bleveReq)
@@ -419,17 +890,84 @@ func (m *IndexManager) executeSearch(ctx context.Context, req *search.SearchRequ
 	return m.convertSearchResult(bleveResult, req.Query, startTime), nil
 }
 
-// buildBleveRequest constructs a Bleve SearchRequest from our SearchRequest.
-func (m *IndexManager) buildBleveRequest(req *search.SearchRequest) *bleve.SearchRequest {
+// executeSearch builds and executes the Bleve search request.
+// Must be called with read lock held.
+// Deprecated: Use executeSearchWithFields for better control over field loading.
+func (m *IndexManager) executeSearch(ctx context.Context, req *search.SearchRequest) (*search.SearchResult, error) {
+	return m.executeSearchWithFields(ctx, req, DefaultFieldConfig())
+}
+
+// buildBleveRequestWithFields constructs a Bleve SearchRequest with configurable fields.
+func (m *IndexManager) buildBleveRequestWithFields(req *search.SearchRequest, fieldCfg FieldConfig) *bleve.SearchRequest {
 	query := bleve.NewQueryStringQuery(req.Query)
 	bleveReq := bleve.NewSearchRequestOptions(query, req.Limit, req.Offset, false)
-	bleveReq.Fields = []string{"*"}
+
+	// Configure field loading based on FieldConfig
+	if fieldCfg.Fields == nil || fieldCfg.LoadContent {
+		// Load all fields when Fields is nil and LoadContent is true
+		bleveReq.Fields = []string{"*"}
+	} else if len(fieldCfg.Fields) == 0 {
+		// Empty slice means no stored fields, only ID and score
+		bleveReq.Fields = []string{}
+	} else {
+		// Load only specified fields
+		if fieldCfg.LoadContent {
+			// Add content to specified fields if requested
+			fields := make([]string, len(fieldCfg.Fields)+1)
+			copy(fields, fieldCfg.Fields)
+			fields[len(fields)-1] = "content"
+			bleveReq.Fields = fields
+		} else {
+			bleveReq.Fields = fieldCfg.Fields
+		}
+	}
 
 	if req.IncludeHighlights {
 		bleveReq.Highlight = bleve.NewHighlightWithStyle(ansi.Name)
 	}
 
 	return bleveReq
+}
+
+// buildBleveRequest constructs a Bleve SearchRequest from our SearchRequest.
+// Deprecated: Use buildBleveRequestWithFields for better control over field loading.
+func (m *IndexManager) buildBleveRequest(req *search.SearchRequest) *bleve.SearchRequest {
+	return m.buildBleveRequestWithFields(req, DefaultFieldConfig())
+}
+
+// GetDocumentContent retrieves only the content field for a document by ID.
+// This enables lazy-loading of content when SearchWithFields was used with
+// DefaultFieldConfig (metadata-only). Returns empty string if document not found.
+// Returns ErrIndexClosed if the index is not open.
+// Returns ErrEmptyDocumentID if docID is empty.
+func (m *IndexManager) GetDocumentContent(ctx context.Context, docID string) (string, error) {
+	if docID == "" {
+		return "", ErrEmptyDocumentID
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.closed || m.index == nil {
+		return "", ErrIndexClosed
+	}
+
+	// Use a search request for the specific document to retrieve content field
+	query := bleve.NewDocIDQuery([]string{docID})
+	searchReq := bleve.NewSearchRequest(query)
+	searchReq.Fields = []string{"content"}
+	searchReq.Size = 1
+
+	result, err := m.index.SearchInContext(ctx, searchReq)
+	if err != nil {
+		return "", fmt.Errorf("search for content: %w", err)
+	}
+
+	if len(result.Hits) == 0 {
+		return "", nil // Document not found
+	}
+
+	return getStringField(result.Hits[0].Fields, "content"), nil
 }
 
 // convertSearchResult converts Bleve results to our SearchResult format.

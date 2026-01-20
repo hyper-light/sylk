@@ -29670,6 +29670,130 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   Provides: AST foundation for FS.1.4 (AST-Aware Target)                        ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 3F: Wave 3 Critical Bug Fixes                                     ││
+│ │ ** FROM FIX.md "Wave 3 Implementation Analysis - Critical Fixes" **              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 1: CRITICAL FIXES (Must fix immediately - panics/data corruption)          ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W3C.1 - Channel Double-Close in SpeculativePrefetcher.CancelAll()                ││
+│ │   FILE: core/context/speculative_prefetcher.go                                   ││
+│ │   ISSUE: IsDone() check and close() not atomic → double-close panic              ││
+│ │   FIX: Use sync.Once for channel close                                           ││
+│ │   ACCEPTANCE: No panics during concurrent prefetch cancellation                  ││
+│ │                                                                                  ││
+│ │ W3C.2 - TOCTOU Race in ActivityEventBus.Publish()                                ││
+│ │   FILE: core/events/activity_bus.go                                              ││
+│ │   ISSUE: Lock released before channel send → send on closed channel panic        ││
+│ │   FIX: Hold RLock through channel send operation                                 ││
+│ │   ACCEPTANCE: No panics during concurrent publish/close                          ││
+│ │                                                                                  ││
+│ │ W3C.3 - Multiple Start() Causes WaitGroup Deadlock                               ││
+│ │   FILE: core/events/activity_bus.go                                              ││
+│ │   ISSUE: wg.Add(1) called multiple times → Wait() deadlocks                      ││
+│ │   FIX: Add atomic.Bool started flag                                              ││
+│ │   ACCEPTANCE: Multiple Start() calls are safely idempotent                       ││
+│ │                                                                                  ││
+│ │ W3C.4 - Pointer Aliasing Bug in RuleStore.updateCache()                          ││
+│ │   FILE: core/knowledge/inference/rule_store.go                                   ││
+│ │   ISSUE: &rules[i] in loop → all cache entries point to last element             ││
+│ │   FIX: Create copy before storing pointer                                        ││
+│ │   ACCEPTANCE: Cache lookups return correct rules                                 ││
+│ │                                                                                  ││
+│ │ W3C.5 - ObservationLog Channel Double-Close                                      ││
+│ │   FILE: core/context/observation_log.go                                          ││
+│ │   ISSUE: No mutex protection on close → double-close panic                       ││
+│ │   FIX: Add sync.Once or mutex-protected chanClosed flag                          ││
+│ │   ACCEPTANCE: Concurrent Close() calls don't panic                               ││
+│ │                                                                                  ││
+│ │ W3C.6 - Slice Data Race in Hook Injection                                        ││
+│ │   FILE: core/context/hooks/*.go                                                  ││
+│ │   ISSUE: Multiple hooks modify same Excerpts slice concurrently                  ││
+│ │   FIX: Create new slice and copy instead of append                               ││
+│ │   ACCEPTANCE: Concurrent hook execution doesn't corrupt data                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 2: HIGH SEVERITY FIXES (Memory safety/deadlocks)                           ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W3H.1 - Manager.activeID Pointer Race                                            ││
+│ │   FILE: core/session/manager.go                                                  ││
+│ │   ISSUE: Stores pointer to stack-local variable → use-after-free                 ││
+│ │   FIX: Store copy of ID before taking address                                    ││
+│ │                                                                                  ││
+│ │ W3H.2 - InvalidateDependents Infinite Recursion                                  ││
+│ │   FILE: core/knowledge/inference/invalidation.go                                 ││
+│ │   ISSUE: No cycle detection → stack overflow on circular deps                    ││
+│ │   FIX: Add visited map for cycle detection                                       ││
+│ │                                                                                  ││
+│ │ W3H.3 - EventDebouncer TOCTOU Bug                                                ││
+│ │   FILE: core/events/activity_bus.go                                              ││
+│ │   ISSUE: Check-then-act with lock release → duplicate events                     ││
+│ │   FIX: Hold write lock for entire check-and-record                               ││
+│ │                                                                                  ││
+│ │ W3H.4 - Index Comparison Bugs (strings.Index > 0)                                ││
+│ │   FILE: core/context/hooks/access_hook.go                                        ││
+│ │   ISSUE: start > 0 rejects valid index 0                                         ││
+│ │   FIX: Change to start >= 0                                                      ││
+│ │                                                                                  ││
+│ │ W3H.5 - Python Docstring Detection in Block End                                  ││
+│ │   FILE: core/knowledge/extractors/py_extractor.go                                ││
+│ │   ISSUE: Triple-quoted strings skipped as comments                               ││
+│ │   FIX: Implement proper triple-quote state tracking                              ││
+│ │                                                                                  ││
+│ │ W3H.6 - TypeScript Brace Counting Ignores Strings                                ││
+│ │   FILE: core/knowledge/extractors/ts_extractor.go                                ││
+│ │   ISSUE: Braces in strings/comments counted incorrectly                          ││
+│ │   FIX: Add simple lexer for string/comment state                                 ││
+│ │                                                                                  ││
+│ │ W3H.7 - CrossSessionPool Double-Close Risk                                       ││
+│ │   FILE: core/session/cross_session_pool.go                                       ││
+│ │   ISSUE: Close() can panic if called twice                                       ││
+│ │   FIX: Add sync.Once guard                                                       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 3: MEDIUM SEVERITY FIXES (39 issues - memory leaks/performance)            ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W3M.1-W3M.5 - Unbounded Map/Cache Growth                                         ││
+│ │   FILES: activity_bus.go, speculative_prefetcher.go                              ││
+│ │   ISSUES: EventDebouncer.seen, inflight maps grow without eviction               ││
+│ │                                                                                  ││
+│ │ W3M.6-W3M.10 - Session System Robustness                                         ││
+│ │   FILES: core/session/*.go                                                       ││
+│ │   ISSUES: TOCTOU races, context leaks, goroutine leaks                           ││
+│ │                                                                                  ││
+│ │ W3M.11-W3M.15 - Performance Optimizations                                        ││
+│ │   FILES: py_extractor.go, eviction_task.go, observation_log.go                   ││
+│ │   ISSUES: O(n²) algorithms, full file rewrites, nested loops                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 4: LOW SEVERITY FIXES (17 issues - style/minor optimizations)              ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W3L.1-W3L.17 - Code Quality Improvements                                         ││
+│ │   ISSUES: Error message clarity, logging, documentation, minor optimizations     ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │                                                                                  ││
+│ │   W3C.1 ─┬─► W3H.1 ─┬─► W3M.1-5                                                  ││
+│ │   W3C.2 ─┤          │                                                            ││
+│ │   W3C.3 ─┤          ├─► W3M.6-10                                                 ││
+│ │   W3C.4 ─┼─► W3H.2 ─┤                                                            ││
+│ │   W3C.5 ─┤          ├─► W3M.11-15                                                ││
+│ │   W3C.6 ─┘          │                                                            ││
+│ │                     └─► W3L.1-17                                                 ││
+│ │                                                                                  ││
+│ │   W3H.3 ──► W3H.4 ──► W3H.7 (independent chain)                                  ││
+│ │   W3H.5 ──► W3H.6 (independent chain)                                            ││
+│ │                                                                                  ││
+│ │ TOTAL: 86 issues (6 critical, 7 high, 39 medium, 17 low, 17 info)                ││
+│ │ REFERENCES: FIX.md "Wave 3 Implementation Analysis - Critical Fixes"             ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
 │ ESTIMATED CAPACITY: 34-42 parallel engineer pipelines (increased for FS + TS)      │
 │ DEPENDENCIES: Wave 2 complete                                                       │
 │                                                                                     │
@@ -32579,167 +32703,370 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
-│ │ PARALLEL GROUP 4V: Inference Engine (IE.1-IE.10)                                ││
-│ │ ** ARCHITECTURE: GRAPH.md Section 8 "Inference Engine" **                       ││
+│ │ PARALLEL GROUP 4V: Iterative Inference Engine (IE.1-IE.16)                      ││
+│ │ ** ARCHITECTURE: GRAPH.md Section 8 "Inference Engine" (Updated) **             ││
 │ │ ** DERIVES: New edges from existing edges via Horn clause rules **              ││
+│ │ ** CRITICAL: ZERO RECURSION - All algorithms use explicit stacks/queues **      ││
 │ │                                                                                  ││
-│ │ DESIGN PRINCIPLES:                                                              ││
-│ │   1. Horn clause rules: IF body THEN head                                       ││
-│ │   2. Forward chaining to fixpoint                                               ││
-│ │   3. Incremental inference on edge changes                                      ││
-│ │   4. Materialized views for common derived edges                                ││
-│ │   5. Bounded transitive closure (max depth)                                     ││
+│ │ DESIGN PRINCIPLES (Production-Grade):                                           ││
+│ │   1. ZERO RECURSION: All algorithms use explicit data structures                ││
+│ │   2. O(1) REACHABILITY: Interval labeling for constant-time transitive queries  ││
+│ │   3. O(1) INVALIDATION: Normalized provenance table, no LIKE scans              ││
+│ │   4. ITERATIVE FIXED-POINT: Worklist algorithms with bounded memory             ││
+│ │   5. SCC CONDENSATION: Handle cycles via Tarjan (iterative) + DAG indexing      ││
+│ │   6. INCREMENTAL UPDATES: Only compute inferences involving changed edges       ││
+│ │                                                                                  ││
+│ │ COMPLEXITY GUARANTEES:                                                          ││
+│ │   | Operation              | Old (Recursive)  | New (Iterative)               | ││
+│ │   |------------------------|------------------|-------------------------------| ││
+│ │   | SCC Detection          | O(V+E) recursive | O(V+E) iterative              | ││
+│ │   | Transitive Query       | O(V+E) BFS       | O(1) interval lookup          | ││
+│ │   | Full Materialization   | O(n³) worst case | O(R × E × fanout)             | ││
+│ │   | Incremental Insert     | O(R × N) scan    | O(R × fanout) indexed         | ││
+│ │   | Invalidation           | O(N) LIKE scan   | O(1) index lookup             | ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ PHASE 1 (All parallel - Type definitions):                                      ││
+│ │ PHASE 1A (All parallel - Type definitions):                                     ││
 │ │                                                                                  ││
-│ │ • IE.1.1 RuleCondition Type (core/knowledge/inference/condition.go)             ││
-│ │   - Subject, Predicate, Object string (can be variables: ?x, ?y, ?z)            ││
-│ │   - IsVariable(term string) bool helper                                         ││
+│ │ • IE.1.1 EdgeKey Type (core/knowledge/graph/edge_key.go)                        ││
+│ │   - SourceID, TargetID string; EdgeType int                                     ││
+│ │   - Hash() uint64 for map keys                                                  ││
+│ │   - String() string for debugging                                               ││
+│ │   ACCEPTANCE: EdgeKey works as map key, hashing is collision-resistant          ││
+│ │   FILES: core/knowledge/graph/edge_key.go, edge_key_test.go                     ││
+│ │                                                                                  ││
+│ │ • IE.1.2 AdjacencyList Type (core/knowledge/graph/adjacency.go)                 ││
+│ │   - Nodes map[string]bool; Outgoing, Incoming map[string][]string               ││
+│ │   - NewAdjacencyList() *AdjacencyList                                           ││
+│ │   - AddEdge(source, target string)                                              ││
+│ │   - GetOutgoing(nodeID string) []string                                         ││
+│ │   - GetIncoming(nodeID string) []string                                         ││
+│ │   ACCEPTANCE: O(1) lookups, handles self-loops correctly                        ││
+│ │   FILES: core/knowledge/graph/adjacency.go, adjacency_test.go                   ││
+│ │                                                                                  ││
+│ │ • IE.1.3 RuleCondition Type (core/knowledge/inference/condition.go)             ││
+│ │   - EdgeType int; Source, Target string (variables or concrete IDs)             ││
+│ │   - IsVariable(term string) bool (checks for "?" prefix)                        ││
 │ │   - Unify(bindings map[string]string, edge Edge) (map[string]string, bool)      ││
-│ │   - Substitute(bindings map[string]string) RuleCondition                        ││
 │ │   ACCEPTANCE: Unification works, variables bind correctly                       ││
 │ │   FILES: core/knowledge/inference/condition.go, condition_test.go               ││
 │ │                                                                                  ││
-│ │ • IE.1.2 InferenceRule Type (core/knowledge/inference/rule.go)                  ││
-│ │   - ID, Name string, Head RuleCondition, Body []RuleCondition                   ││
-│ │   - Priority int (lower = higher priority), Enabled bool                        ││
-│ │   - Validate() error - checks rule is well-formed (all head vars in body)       ││
-│ │   - GetVariables() []string - returns all variables in rule                     ││
+│ │ • IE.1.4 InferenceRule Type (core/knowledge/inference/rule.go)                  ││
+│ │   - RuleID int64; RuleName string; Antecedent []RuleCondition                   ││
+│ │   - Consequent RuleConsequent; Confidence float64; IsEnabled bool               ││
+│ │   - Validate() error - checks all head vars appear in body                      ││
 │ │   ACCEPTANCE: Rules validate, malformed rules rejected with reason              ││
 │ │   FILES: core/knowledge/inference/rule.go, rule_test.go                         ││
 │ │                                                                                  ││
-│ │ • IE.1.3 InferenceResult Type (core/knowledge/inference/result.go)              ││
-│ │   - DerivedEdge Edge, RuleID string                                             ││
-│ │   - Evidence []Edge (body edges that triggered rule)                            ││
-│ │   - DerivedAt time.Time, Confidence float64                                     ││
-│ │   - Provenance string (human-readable explanation)                              ││
-│ │   ACCEPTANCE: Results track provenance, evidence complete                       ││
-│ │   FILES: core/knowledge/inference/result.go                                     ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1B (Parallel with 1A - Schema tables):                                    ││
+│ │                                                                                  ││
+│ │ • IE.1.5 SCC Tables Migration (core/vectorgraphdb/migrations/)                  ││
+│ │   - CREATE TABLE sccs (scc_id, node_count, representative_node, created_at)     ││
+│ │   - CREATE TABLE scc_members (node_id PRIMARY KEY, scc_id)                      ││
+│ │   - CREATE INDEX idx_scc_members_scc ON scc_members(scc_id)                     ││
+│ │   ACCEPTANCE: Tables created, indexes verified via EXPLAIN QUERY PLAN           ││
+│ │   FILES: core/vectorgraphdb/migrations/004_scc_tables.go                        ││
+│ │                                                                                  ││
+│ │ • IE.1.6 Reachability Index Table (core/vectorgraphdb/migrations/)              ││
+│ │   - CREATE TABLE reachability_index (node_id PK, scc_id, pre_order, post_order, ││
+│ │     topo_order, edge_type, updated_at)                                          ││
+│ │   - CREATE INDEX idx_reach_scc, idx_reach_pre, idx_reach_post, idx_reach_type   ││
+│ │   ACCEPTANCE: Interval queries use indexes, O(1) verified via benchmarks        ││
+│ │   FILES: core/vectorgraphdb/migrations/005_reachability_index.go                ││
+│ │                                                                                  ││
+│ │ • IE.1.7 Normalized Provenance Table (core/vectorgraphdb/migrations/)           ││
+│ │   - CREATE TABLE inference_provenance (id, inferred_edge_id, evidence_edge_id,  ││
+│ │     evidence_position)                                                          ││
+│ │   - CREATE INDEX idx_provenance_evidence ON inference_provenance(evidence_edge_id)│
+│ │   - CREATE INDEX idx_provenance_inferred ON inference_provenance(inferred_edge_id)│
+│ │   ACCEPTANCE: O(1) invalidation lookup verified, no LIKE scans in EXPLAIN       ││
+│ │   FILES: core/vectorgraphdb/migrations/006_provenance.go                        ││
+│ │                                                                                  ││
+│ │ • IE.1.8 Edge Traversal Indexes (core/vectorgraphdb/migrations/)                ││
+│ │   - CREATE INDEX idx_edges_source_type ON edges(source_id, edge_type)           ││
+│ │   - CREATE INDEX idx_edges_target_type ON edges(target_id, edge_type)           ││
+│ │   - CREATE INDEX idx_edges_composite ON edges(source_id, target_id, edge_type)  ││
+│ │   ACCEPTANCE: Edge lookups O(1), verified via EXPLAIN QUERY PLAN                ││
+│ │   FILES: core/vectorgraphdb/migrations/007_edge_indexes.go                      ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ PHASE 2 (After IE.1.x - Rule storage):                                          ││
+│ │ PHASE 2 (After 1A - SCC Detection, NO RECURSION):                               ││
 │ │                                                                                  ││
-│ │ • IE.2.1 RuleStore (core/knowledge/inference/rule_store.go)                     ││
-│ │   - LoadRules(ctx) ([]InferenceRule, error) from SQLite                         ││
-│ │   - SaveRule(ctx, rule InferenceRule) error                                     ││
-│ │   - DeleteRule(ctx, id string) error                                            ││
-│ │   - GetRulesByPriority(ctx) []InferenceRule (sorted by priority)                ││
-│ │   - GetEnabledRules(ctx) []InferenceRule                                        ││
-│ │   ACCEPTANCE: CRUD works, priority ordering correct                             ││
-│ │   DEPENDS ON: Group 4S (KG.1.5 Inference Rule Table)                            ││
-│ │   FILES: core/knowledge/inference/rule_store.go, rule_store_test.go             ││
+│ │ • IE.2.1 dfsFrame Type (core/knowledge/graph/scc.go)                            ││
+│ │   - nodeID string; neighborIdx int; neighbors []string; phase int               ││
+│ │   - phase: 0=enter, 1=process neighbors, 2=exit (replaces call stack)           ││
+│ │   ACCEPTANCE: Frame correctly models DFS state machine                          ││
+│ │   FILES: core/knowledge/graph/scc.go                                            ││
 │ │                                                                                  ││
-│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ • IE.2.2 IterativeTarjan (core/knowledge/graph/scc.go)                          ││
+│ │   - graph *AdjacencyList; index int; nodeIndex, nodeLowlink map[string]int      ││
+│ │   - onStack map[string]bool; stack []string; sccs [][]string                    ││
+│ │   - dfsStack []dfsFrame (EXPLICIT STACK - NO RECURSION)                         ││
+│ │   - NewIterativeTarjan(graph *AdjacencyList) *IterativeTarjan                   ││
+│ │   - FindSCCs() [][]string - O(V+E) time, O(V) space, NO RECURSION               ││
+│ │   - iterativeDFS(startID string) - explicit state machine with dfsStack         ││
+│ │   ACCEPTANCE: Handles 100K+ node graphs without stack overflow                  ││
+│ │   ACCEPTANCE: Produces same SCCs as recursive Tarjan on test cases              ││
+│ │   ACCEPTANCE: All phases (0,1,2) correctly transition, no recursion in code     ││
+│ │   FILES: core/knowledge/graph/scc.go, scc_test.go                               ││
+│ │   DELETE: Any recursive SCC code in existing codebase                           ││
 │ │                                                                                  ││
-│ │ PHASE 3 (After IE.2.1 - Evaluation engine):                                     ││
-│ │                                                                                  ││
-│ │ • IE.3.1 ForwardChainer (core/knowledge/inference/forward_chain.go)             ││
-│ │   - Evaluate(ctx, rules []InferenceRule) ([]InferenceResult, error)             ││
-│ │   - Iterate until fixpoint (no new edges derived)                               ││
-│ │   - MaxIterations limit to prevent infinite loops (default: 100)                ││
-│ │   - IterateOnce(ctx, rules) ([]InferenceResult, bool) returns (results, done)   ││
-│ │   ACCEPTANCE: Fixpoint reached, new edges derived correctly                     ││
-│ │   FILES: core/knowledge/inference/forward_chain.go, forward_chain_test.go       ││
-│ │                                                                                  ││
-│ │ • IE.3.2 RuleEvaluator (core/knowledge/inference/rule_evaluator.go)             ││
-│ │   - EvaluateRule(ctx, rule, edges []Edge) []InferenceResult                     ││
-│ │   - Pattern matching with backtracking                                          ││
-│ │   - Binding propagation through body conditions                                 ││
-│ │   - findBindings(ctx, conditions, edges) []map[string]string                    ││
-│ │   ACCEPTANCE: Single rule evaluation correct, backtracking works                ││
-│ │   FILES: core/knowledge/inference/rule_evaluator.go, rule_evaluator_test.go     ││
+│ │ • IE.2.3 CondensedGraph Type (core/knowledge/graph/condensed.go)                ││
+│ │   - SCCs [][]string; NodeToSCC map[string]int; DAGEdges map[int][]int           ││
+│ │   - TopoOrder []int (topological sort of condensed DAG)                         ││
+│ │   - CondenseGraph(graph *AdjacencyList, sccs [][]string) *CondensedGraph        ││
+│ │   - kahnSort() []int - Kahn's algorithm (iterative, NO RECURSION)               ││
+│ │   ACCEPTANCE: DAG is acyclic, topo order valid, NO RECURSION in code            ││
+│ │   FILES: core/knowledge/graph/condensed.go, condensed_test.go                   ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ PHASE 4 (After IE.3.x - Materialization):                                       ││
+│ │ PHASE 3 (After 2 - Reachability Index, O(1) queries):                           ││
 │ │                                                                                  ││
-│ │ • IE.4.1 MaterializationManager (core/knowledge/inference/materialization.go)   ││
-│ │   - Materialize(ctx, results []InferenceResult) error                           ││
-│ │   - Store derived edges with rule_id reference in materialized_edges table      ││
-│ │   - Track materialized edges for invalidation                                   ││
-│ │   - IsMaterialized(ctx, edgeID) bool                                            ││
-│ │   ACCEPTANCE: Derived edges queryable, tracked for updates                      ││
-│ │   DEPENDS ON: Group 4S (materialized_edges table)                               ││
-│ │   FILES: core/knowledge/inference/materialization.go, materialization_test.go   ││
+│ │ • IE.3.1 IntervalIndex Type (core/knowledge/graph/reachability.go)              ││
+│ │   - PreOrder, PostOrder map[string]int; NodeToSCC map[string]int                ││
+│ │   - SCCMembers map[int][]string; EdgeType int                                   ││
+│ │   - BuildIntervalIndex(cg *CondensedGraph, edgeType int) *IntervalIndex         ││
+│ │     (uses ITERATIVE DFS for pre/post numbering, NO RECURSION)                   ││
+│ │   - CanReach(from, to string) bool - O(1) interval comparison                   ││
+│ │   - GetAllReachable(start string) []string - O(n) scan with O(1) filter         ││
+│ │   ACCEPTANCE: CanReach is O(1), verified via benchmarks                         ││
+│ │   ACCEPTANCE: Interval containment: pre[A]<=pre[B] AND post[A]>=post[B]         ││
+│ │   ACCEPTANCE: Same-SCC nodes always reach each other                            ││
+│ │   FILES: core/knowledge/graph/reachability.go, reachability_test.go             ││
 │ │                                                                                  ││
-│ │ • IE.4.2 InvalidationManager (core/knowledge/inference/invalidation.go)         ││
-│ │   - OnEdgeChange(ctx, edge Edge, changeType ChangeType) error                   ││
-│ │   - Cascade invalidation for dependent derived edges                            ││
-│ │   - Incremental re-materialization (only affected rules)                        ││
-│ │   - ChangeType enum: EdgeAdded, EdgeRemoved, EdgeModified                       ││
-│ │   ACCEPTANCE: Changes cascade correctly, no stale derived edges                 ││
-│ │   FILES: core/knowledge/inference/invalidation.go, invalidation_test.go         ││
-│ │                                                                                  ││
-│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
-│ │                                                                                  ││
-│ │ PHASE 5 (After IE.4.x - Engine facade):                                         ││
-│ │                                                                                  ││
-│ │ • IE.5.1 InferenceEngine (core/knowledge/inference/engine.go)                   ││
-│ │   - NewInferenceEngine(db *VectorGraphDB) *InferenceEngine                      ││
-│ │   - RunInference(ctx) error - full forward chaining pass                        ││
-│ │   - OnEdgeAdded(ctx, edge Edge) error - incremental inference                   ││
-│ │   - OnEdgeRemoved(ctx, edge Edge) error - incremental invalidation              ││
-│ │   - GetDerivedEdges(ctx, nodeID string) ([]Edge, error)                         ││
-│ │   - GetProvenance(ctx, edgeID int64) (*InferenceResult, error)                  ││
-│ │   ACCEPTANCE: Full and incremental inference work                               ││
-│ │   FILES: core/knowledge/inference/engine.go, engine_test.go                     ││
+│ │ • IE.3.2 IntervalIndex Persistence (core/knowledge/graph/reachability.go)       ││
+│ │   - PersistToSQLite(ctx, db *sql.DB) error - batch insert to reachability_index ││
+│ │   - LoadIntervalIndex(ctx, db *sql.DB, edgeType int) (*IntervalIndex, error)    ││
+│ │   ACCEPTANCE: Round-trip persistence works, same CanReach results after load    ││
+│ │   DEPENDS ON: IE.1.6 (reachability_index table)                                 ││
+│ │   FILES: core/knowledge/graph/reachability.go                                   ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ PHASE 6 (After IE.5.1 - Built-in rules):                                        ││
+│ │ PHASE 4 (After 1B - In-memory indexes for inference):                           ││
 │ │                                                                                  ││
-│ │ • IE.6.1 Built-in Inference Rules (core/knowledge/inference/builtin_rules.go)   ││
+│ │ • IE.4.1 EdgeIndexes Type (core/knowledge/inference/indexes.go)                 ││
+│ │   - bySourceType map[int]map[string][]Edge (edgeType -> sourceID -> edges)      ││
+│ │   - byTargetType map[int]map[string][]Edge (edgeType -> targetID -> edges)      ││
+│ │   - edgeExists map[EdgeKey]bool (O(1) existence check)                          ││
+│ │   - NewEdgeIndexes() *EdgeIndexes                                               ││
+│ │   - Build(edges []Edge) - construct from edge list                              ││
+│ │   - Add(edge Edge) - incremental add                                            ││
+│ │   - Exists(key EdgeKey) bool - O(1) lookup                                      ││
+│ │   - GetBySource(edgeType int, sourceID string) []Edge                           ││
+│ │   - GetByTarget(edgeType int, targetID string) []Edge                           ││
+│ │   ACCEPTANCE: All lookups O(1) or O(fan-out), no full scans                     ││
+│ │   FILES: core/knowledge/inference/indexes.go, indexes_test.go                   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After 4 - Iterative binding resolution, NO RECURSION):                 ││
+│ │                                                                                  ││
+│ │ • IE.5.1 workItem Type (core/knowledge/inference/binding.go)                    ││
+│ │   - bindings map[string]string; condIndex int                                   ││
+│ │   - Used in explicit queue instead of recursive calls                           ││
+│ │   FILES: core/knowledge/inference/binding.go                                    ││
+│ │                                                                                  ││
+│ │ • IE.5.2 IterativeBindingResolver (core/knowledge/inference/binding.go)         ││
+│ │   - indexes *EdgeIndexes                                                        ││
+│ │   - FindBindings(initial map[string]string, conditions []RuleCondition)         ││
+│ │     []map[string]string                                                         ││
+│ │   - Uses EXPLICIT QUEUE (not recursion) to explore binding space                ││
+│ │   - For each condition: source bound? target bound? both? neither?              ││
+│ │   - O(1) lookups via EdgeIndexes, NO full table scans                           ││
+│ │   ACCEPTANCE: NO recursion in code (verified via AST check)                     ││
+│ │   ACCEPTANCE: Same results as recursive binding on test cases                   ││
+│ │   ACCEPTANCE: Handles 10K+ bindings without stack overflow                      ││
+│ │   FILES: core/knowledge/inference/binding.go, binding_test.go                   ││
+│ │   DELETE: Any recursive findBindingCompletions code                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After 5 - Rule application):                                           ││
+│ │                                                                                  ││
+│ │ • IE.6.1 RuleApplicator (core/knowledge/inference/applicator.go)                ││
+│ │   - indexes *EdgeIndexes; resolver *IterativeBindingResolver                    ││
+│ │   - ApplyRule(rule *InferenceRule, trigger Edge, derived map[EdgeKey]bool)      ││
+│ │     []Edge (returns new inferred edges)                                         ││
+│ │   - For each condition matching trigger's EdgeType:                             ││
+│ │     1. Initialize bindings from trigger                                         ││
+│ │     2. Call resolver.FindBindings for remaining conditions                      ││
+│ │     3. Generate consequent edges from complete bindings                         ││
+│ │   ACCEPTANCE: Correct inferences, no duplicates, no recursion                   ││
+│ │   FILES: core/knowledge/inference/applicator.go, applicator_test.go             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After 6 - Iterative fixed-point engine):                               ││
+│ │                                                                                  ││
+│ │ • IE.7.1 IterativeInferenceEngine (core/knowledge/inference/iterative_engine.go)││
+│ │   - db *sql.DB; rules []*InferenceRule; indexes *EdgeIndexes                    ││
+│ │   - applicator *RuleApplicator; resolver *IterativeBindingResolver              ││
+│ │   - NewIterativeInferenceEngine(db *sql.DB) (*IterativeInferenceEngine, error)  ││
+│ │   - loadRules() error - load from inference_rules table                         ││
+│ │   - buildIndexes(edges []Edge) - construct in-memory indexes                    ││
+│ │   FILES: core/knowledge/inference/iterative_engine.go                           ││
+│ │                                                                                  ││
+│ │ • IE.7.2 Materialize Method (core/knowledge/inference/iterative_engine.go)      ││
+│ │   - Materialize(ctx context.Context) error                                      ││
+│ │   - Phase 1: Load all base edges, build indexes                                 ││
+│ │   - Phase 2: Initialize WORKLIST with all base edges                            ││
+│ │   - Phase 3: ITERATE until worklist empty (fixpoint)                            ││
+│ │     - Process batch from worklist                                               ││
+│ │     - For each edge, apply all rules via applicator                             ││
+│ │     - Add new inferred edges to worklist and indexes                            ││
+│ │     - Persist batch to inferred_edges table                                     ││
+│ │   - MaxIterations safety limit (default: 1000)                                  ││
+│ │   ACCEPTANCE: NO recursion (verified via code review)                           ││
+│ │   ACCEPTANCE: Terminates at fixpoint, all inferences derived                    ││
+│ │   ACCEPTANCE: Handles 100K edges in <5 min                                      ││
+│ │   FILES: core/knowledge/inference/iterative_engine.go                           ││
+│ │                                                                                  ││
+│ │ • IE.7.3 OnEdgeInserted Method (core/knowledge/inference/iterative_engine.go)   ││
+│ │   - OnEdgeInserted(ctx, newEdge Edge) error                                     ││
+│ │   - Mini-fixpoint: just new edge as trigger                                     ││
+│ │   - Uses same worklist algorithm as Materialize                                 ││
+│ │   ACCEPTANCE: Incremental inference <10ms for single edge                       ││
+│ │   FILES: core/knowledge/inference/iterative_engine.go                           ││
+│ │                                                                                  ││
+│ │ • IE.7.4 OnEdgeDeleted Method (core/knowledge/inference/iterative_engine.go)    ││
+│ │   - OnEdgeDeleted(ctx, edgeID int64) error                                      ││
+│ │   - O(1) lookup via inference_provenance(evidence_edge_id) index                ││
+│ │   - UPDATE inferred_edges SET valid=0 WHERE id IN (SELECT ... FROM provenance)  ││
+│ │   - NO LIKE scans, NO JSON parsing                                              ││
+│ │   ACCEPTANCE: O(1) invalidation, verified via EXPLAIN QUERY PLAN                ││
+│ │   DEPENDS ON: IE.1.7 (inference_provenance table with index)                    ││
+│ │   FILES: core/knowledge/inference/iterative_engine.go                           ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 8 (After 7 - Hybrid query integration):                                   ││
+│ │                                                                                  ││
+│ │ • IE.8.1 HybridQueryCoordinator (core/knowledge/query/hybrid_coordinator.go)    ││
+│ │   - db *sql.DB; bleveIndex bleve.Index; hnswIndex *hnsw.Index                   ││
+│ │   - reachability map[int]*IntervalIndex (edgeType -> index)                     ││
+│ │   - Query(ctx, q *HybridQuery) (*QueryResult, error)                            ││
+│ │     1. TextQuery via Bleve (if specified)                                       ││
+│ │     2. SemanticQuery via HNSW (if specified)                                    ││
+│ │     3. ReachableFrom filter via IntervalIndex (O(1) per candidate!)             ││
+│ │   - RebuildReachabilityIndex(ctx, edgeType int) error                           ││
+│ │   ACCEPTANCE: Hybrid queries work, reachability is O(1) per candidate           ││
+│ │   DEPENDS ON: IE.3.1 (IntervalIndex), Bleve, HNSW                               ││
+│ │   FILES: core/knowledge/query/hybrid_coordinator.go, hybrid_coordinator_test.go ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 9 (After 7 - Built-in rules):                                             ││
+│ │                                                                                  ││
+│ │ • IE.9.1 Built-in Inference Rules (core/knowledge/inference/builtin_rules.go)   ││
 │ │   - TransitiveImport: A imports B, B imports C → A indirectly_imports C         ││
 │ │   - InheritedMethod: A extends B, B has_method M → A has_method M               ││
 │ │   - InterfaceSatisfaction: A implements all methods of I → A satisfies I        ││
-│ │   - CallChain: A calls B, B calls C → A transitively_calls C (max depth 3)      ││
-│ │   - ReferenceClosure: A references B, B references C → A transitively_refs C    ││
-│ │   - LoadBuiltinRules(ctx, engine *InferenceEngine) error                        ││
-│ │   ACCEPTANCE: Built-in rules load by default, produce expected edges            ││
-│ │   FILES: core/knowledge/inference/builtin_rules.go                              ││
+│ │   - CallChain: A calls B, B calls C → A transitively_calls C                    ││
+│ │   - ReferenceClosure: A refs B, B refs C → A transitively_refs C                ││
+│ │   - LoadBuiltinRules(ctx, engine *IterativeInferenceEngine) error               ││
+│ │   ACCEPTANCE: Built-in rules produce expected edges on test graphs              ││
+│ │   FILES: core/knowledge/inference/builtin_rules.go, builtin_rules_test.go       ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ PHASE 7 (Integration tests):                                                    ││
+│ │ PHASE 10 (Integration & stress tests):                                          ││
 │ │                                                                                  ││
-│ │ • IE.7.1 Forward chaining fixpoint tests                                        ││
-│ │ • IE.7.2 Incremental inference tests (edge added/removed)                       ││
-│ │ • IE.7.3 Circular rule detection tests                                          ││
-│ │ • IE.7.4 Built-in rule correctness tests                                        ││
-│ │   FILES: core/knowledge/inference/integration_test.go                           ││
+│ │ • IE.10.1 No-Recursion Verification Test                                        ││
+│ │   - Parse all IE.*.go files with go/ast                                         ││
+│ │   - Assert: no function calls itself (directly or indirectly)                   ││
+│ │   - Assert: no *CallExpr where Fun matches enclosing func name                  ││
+│ │   ACCEPTANCE: Test passes, proving zero recursion in inference code             ││
+│ │   FILES: core/knowledge/inference/no_recursion_test.go                          ││
+│ │                                                                                  ││
+│ │ • IE.10.2 Large Graph Stress Test                                               ││
+│ │   - Generate graph with 100K nodes, 500K edges                                  ││
+│ │   - Run Materialize(), verify no stack overflow                                 ││
+│ │   - Assert: completes in <5 min                                                 ││
+│ │   ACCEPTANCE: No crash, memory bounded, completes on time                       ││
+│ │   FILES: core/knowledge/inference/stress_test.go                                ││
+│ │                                                                                  ││
+│ │ • IE.10.3 Incremental Inference Tests                                           ││
+│ │   - Add single edge, verify incremental inference <10ms                         ││
+│ │   - Delete edge, verify O(1) invalidation                                       ││
+│ │   ACCEPTANCE: Incremental operations meet latency targets                       ││
+│ │   FILES: core/knowledge/inference/incremental_test.go                           ││
+│ │                                                                                  ││
+│ │ • IE.10.4 Reachability Correctness Tests                                        ││
+│ │   - Compare IntervalIndex.CanReach with BFS for random node pairs               ││
+│ │   - Test graphs with cycles (SCCs), DAGs, disconnected components               ││
+│ │   ACCEPTANCE: IntervalIndex agrees with BFS on all test cases                   ││
+│ │   FILES: core/knowledge/inference/reachability_correctness_test.go              ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
 │ │ FILES (SUMMARY):                                                                ││
-│ │   core/knowledge/inference/condition.go - IE.1.1                                ││
-│ │   core/knowledge/inference/rule.go - IE.1.2                                     ││
-│ │   core/knowledge/inference/result.go - IE.1.3                                   ││
-│ │   core/knowledge/inference/rule_store.go - IE.2.1                               ││
-│ │   core/knowledge/inference/forward_chain.go - IE.3.1                            ││
-│ │   core/knowledge/inference/rule_evaluator.go - IE.3.2                           ││
-│ │   core/knowledge/inference/materialization.go - IE.4.1                          ││
-│ │   core/knowledge/inference/invalidation.go - IE.4.2                             ││
-│ │   core/knowledge/inference/engine.go - IE.5.1                                   ││
-│ │   core/knowledge/inference/builtin_rules.go - IE.6.1                            ││
+│ │   core/knowledge/graph/edge_key.go - IE.1.1                                     ││
+│ │   core/knowledge/graph/adjacency.go - IE.1.2                                    ││
+│ │   core/knowledge/inference/condition.go - IE.1.3                                ││
+│ │   core/knowledge/inference/rule.go - IE.1.4                                     ││
+│ │   core/vectorgraphdb/migrations/004_scc_tables.go - IE.1.5                      ││
+│ │   core/vectorgraphdb/migrations/005_reachability_index.go - IE.1.6              ││
+│ │   core/vectorgraphdb/migrations/006_provenance.go - IE.1.7                      ││
+│ │   core/vectorgraphdb/migrations/007_edge_indexes.go - IE.1.8                    ││
+│ │   core/knowledge/graph/scc.go - IE.2.1, IE.2.2                                  ││
+│ │   core/knowledge/graph/condensed.go - IE.2.3                                    ││
+│ │   core/knowledge/graph/reachability.go - IE.3.1, IE.3.2                         ││
+│ │   core/knowledge/inference/indexes.go - IE.4.1                                  ││
+│ │   core/knowledge/inference/binding.go - IE.5.1, IE.5.2                          ││
+│ │   core/knowledge/inference/applicator.go - IE.6.1                               ││
+│ │   core/knowledge/inference/iterative_engine.go - IE.7.1-IE.7.4                  ││
+│ │   core/knowledge/query/hybrid_coordinator.go - IE.8.1                           ││
+│ │   core/knowledge/inference/builtin_rules.go - IE.9.1                            ││
+│ │   core/knowledge/inference/*_test.go - IE.10.1-IE.10.4                          ││
 │ │                                                                                  ││
-│ │ INTERNAL DEPENDENCIES:                                                          ││
-│ │   Phase 1 (3 parallel) → Phase 2 → Phase 3 (2 parallel) →                       ││
-│ │   Phase 4 (2 parallel) → Phase 5 → Phase 6 → Phase 7 (4 parallel tests)         ││
+│ │ FILES TO DELETE (old recursive implementation):                                 ││
+│ │   core/knowledge/inference/forward_chain.go (if exists) - REPLACED              ││
+│ │   core/knowledge/inference/rule_evaluator.go (if exists) - REPLACED             ││
+│ │   Any code using findBindingCompletions recursively - REPLACED                  ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES (Maximal Parallelism):                                    ││
+│ │   ┌─────────────────────────────────────────────────────────────────────────┐   ││
+│ │   │ Phase 1A ──────┬──────► Phase 2 ──► Phase 3 ──────────────────────────┐ │   ││
+│ │   │ (4 parallel)   │        (SCC)       (Reachability)                    │ │   ││
+│ │   │                │                                                      │ │   ││
+│ │   │ Phase 1B ──────┼──────────────────────────────────► Phase 4 ──┐       │ │   ││
+│ │   │ (4 parallel)   │                                    (Indexes)  │       │ │   ││
+│ │   │                │                                               ▼       │ │   ││
+│ │   │                │                                            Phase 5 ──► Phase 6   ││
+│ │   │                │                                            (Binding)   (Applicator) ││
+│ │   │                │                                                              │ │   ││
+│ │   │                └──────────────────────────────────────────────────────► Phase 7   ││
+│ │   │                                                                      (Engine)     ││
+│ │   │                                                                          │        ││
+│ │   │                                                                          ▼        ││
+│ │   │                                                        Phase 8 ◄── Phase 9        ││
+│ │   │                                                        (Hybrid)   (Rules)         ││
+│ │   │                                                             │                     ││
+│ │   │                                                             ▼                     ││
+│ │   │                                                          Phase 10                 ││
+│ │   │                                                          (Tests - 4 parallel)    ││
+│ │   └─────────────────────────────────────────────────────────────────────────┘   ││
 │ │                                                                                  ││
 │ │ EXTERNAL DEPENDENCIES:                                                          ││
-│ │   - Group 4S: Schema Extensions (inference_rules, materialized_edges tables)    ││
-│ │   - VectorGraphDB (edge storage, queries)                                       ││
+│ │   - Group 4S: Schema Extensions (inference_rules, inferred_edges tables)        ││
+│ │   - VectorGraphDB (edge storage, SQLite connection)                             ││
+│ │   - Bleve (full-text search for hybrid queries)                                 ││
+│ │   - HNSW (vector similarity for hybrid queries)                                 ││
 │ │                                                                                  ││
-│ │ MEMORY COST: ~5 MB (rule cache, binding tables during evaluation)               ││
-│ │ CPU COST: Initial inference ~10s for 100K edges, incremental <100ms             ││
+│ │ MEMORY COST: ~20 MB (in-memory indexes, worklist, binding queue)                ││
+│ │ CPU COST: Initial inference <5 min for 100K edges, incremental <10ms            ││
 │ │                                                                                  ││
 │ │ WHY WAVE 4:                                                                     ││
 │ │   Inference derives new knowledge from existing edges.                          ││
 │ │   Requires schema (4S) and extraction (4T) to populate edges first.             ││
 │ │   Derived edges enable powerful queries via hybrid search (4U).                 ││
+│ │   ZERO RECURSION ensures production reliability on large codebases.             ││
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
@@ -33744,8 +34071,1233 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
-│ ESTIMATED CAPACITY: 130-150 parallel engineer pipelines (increased for KG groups)  │
-│ DEPENDENCIES: Wave 3 complete, Groups 4E, 4G, 4K, 4L, 4P, 4Q complete              │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4Z: Performance & Resource Optimization (PF.1-PF.7)              ││
+│ │ ** REQUIRED: Production readiness for all WAVE 4 systems **                     ││
+│ │ ** REFERENCE: FIX.md for detailed analysis and code evidence **                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 1 (All parallel - foundational utilities, no interdependencies):          ││
+│ │                                                                                  ││
+│ │ • PF.1.1 Batch Node Loader Utility (core/vectorgraphdb/batch_loader.go)         ││
+│ │   - BatchNodeLoader struct with db *sql.DB                                       ││
+│ │   - LoadByIDs(ctx, ids []string) (map[string]*Node, error)                       ││
+│ │   - Single query: SELECT * FROM nodes WHERE id IN (?, ?, ...)                    ││
+│ │   - Chunked loading for >1000 IDs (500 per chunk)                                ││
+│ │   - Connection reuse via prepared statement                                      ││
+│ │   ACCEPTANCE: Benchmark shows 10x fewer DB round-trips for 100 node load         ││
+│ │   REPLACES: N+1 pattern in query.go:157-167, search.go:76-91                     ││
+│ │   FILES: core/vectorgraphdb/batch_loader.go (NEW)                                ││
+│ │          core/vectorgraphdb/batch_loader_test.go (NEW)                           ││
+│ │                                                                                  ││
+│ │ • PF.1.2 Module-Level Compiled Regex (core/knowledge/query/regex_cache.go)       ││
+│ │   - Package-level var tokenizeRegex = regexp.MustCompile(...)                    ││
+│ │   - Package-level var phraseRegex = regexp.MustCompile(...)                      ││
+│ │   - All regex patterns compiled once at init()                                   ││
+│ │   ACCEPTANCE: go test -bench shows 0 regexp.Compile calls per query              ││
+│ │   REPLACES: domain_filter.go:675 runtime compilation                             ││
+│ │   FILES: core/knowledge/query/regex_cache.go (NEW)                               ││
+│ │          core/knowledge/query/domain_filter.go (MODIFY - use cached regex)       ││
+│ │                                                                                  ││
+│ │ • PF.1.3 Token Set Utility (core/knowledge/tokenset.go)                          ││
+│ │   - TokenSet struct wrapping map[string]struct{}                                 ││
+│ │   - NewTokenSet(tokens []string) *TokenSet                                       ││
+│ │   - Contains(token string) bool - O(1) lookup                                    ││
+│ │   - Intersection(other *TokenSet) *TokenSet                                      ││
+│ │   - MatchCount(other *TokenSet) int                                              ││
+│ │   ACCEPTANCE: O(1) token lookup, replaces O(n) nested loops                      ││
+│ │   REPLACES: entity_linker.go:376-393 O(n²) pattern                               ││
+│ │   FILES: core/knowledge/tokenset.go (NEW)                                        ││
+│ │          core/knowledge/tokenset_test.go (NEW)                                   ││
+│ │                                                                                  ││
+│ │ • PF.1.4 Activation Cache (core/knowledge/memory/activation_cache.go)            ││
+│ │   - ActivationCache struct with sync.Map for thread-safety                       ││
+│ │   - Key: nodeID + timestamp truncated to second                                  ││
+│ │   - GetOrCompute(nodeID, now, computeFn) float64                                 ││
+│ │   - Invalidate(nodeID) for cache busting                                         ││
+│ │   - TTL: 1 second (activations stable within scoring batch)                      ││
+│ │   ACCEPTANCE: Repeated activation lookups return cached value, no recompute      ││
+│ │   REPLACES: scorer.go:108 repeated Activation() calls                            ││
+│ │   FILES: core/knowledge/memory/activation_cache.go (NEW)                         ││
+│ │          core/knowledge/memory/activation_cache_test.go (NEW)                    ││
+│ │                                                                                  ││
+│ │ • PF.1.5 Neighbor Set Type for HNSW (core/vectorgraphdb/hnsw/neighbor_set.go)    ││
+│ │   - neighborSet struct with map[string]struct{} + []string for ordering          ││
+│ │   - Add(id string) bool - returns false if already present, O(1)                 ││
+│ │   - Contains(id string) bool - O(1) lookup                                       ││
+│ │   - Slice() []string - returns ordered slice                                     ││
+│ │   - Len() int                                                                    ││
+│ │   ACCEPTANCE: Contains() is O(1), not O(n)                                       ││
+│ │   REPLACES: layer.go:84-91 linear containsNeighbor scan                          ││
+│ │   FILES: core/vectorgraphdb/hnsw/neighbor_set.go (NEW)                           ││
+│ │          core/vectorgraphdb/hnsw/neighbor_set_test.go (NEW)                      ││
+│ │                                                                                  ││
+│ │ • PF.1.6 Bounded Overflow Buffer (core/concurrency/bounded_overflow.go)          ││
+│ │   - BoundedOverflow[T] struct with maxSize int                                   ││
+│ │   - Append(item T) error - returns ErrOverflowFull if at capacity                ││
+│ │   - Drain() []T - returns and clears buffer                                      ││
+│ │   - Len() int, IsFull() bool                                                     ││
+│ │   ACCEPTANCE: Append fails gracefully at maxSize, no unbounded growth            ││
+│ │   REPLACES: unbounded_channel.go:71, adaptive_channel.go:201 unbounded slices    ││
+│ │   FILES: core/concurrency/bounded_overflow.go (NEW)                              ││
+│ │          core/concurrency/bounded_overflow_test.go (NEW)                         ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 2 (After PF.1.1, PF.1.5 - VectorGraphDB optimizations):                    ││
+│ │                                                                                  ││
+│ │ • PF.2.1 QueryEngine Batch Loading Integration                                   ││
+│ │   (core/vectorgraphdb/query.go MODIFY)                                           ││
+│ │   - Add batchLoader *BatchNodeLoader field to QueryEngine                        ││
+│ │   - Refactor scoreResults() to collect all IDs first                             ││
+│ │   - Single batchLoader.LoadByIDs() call                                          ││
+│ │   - Score from loaded map instead of per-ID queries                              ││
+│ │   ACCEPTANCE: HybridQuery with 100 results makes ≤2 DB queries (not 100+)        ││
+│ │   MODIFIES: query.go:157-167 (scoreResults), query.go:238 (RelatedInDomain)      ││
+│ │   DEPENDS ON: PF.1.1                                                             ││
+│ │   FILES: core/vectorgraphdb/query.go (MODIFY)                                    ││
+│ │          core/vectorgraphdb/query_test.go (ADD batch loading tests)              ││
+│ │                                                                                  ││
+│ │ • PF.2.2 VectorSearcher Batch Loading Integration                                ││
+│ │   (core/vectorgraphdb/search.go MODIFY)                                          ││
+│ │   - Refactor loadNodes() to use BatchNodeLoader                                  ││
+│ │   - Collect IDs from HNSW results                                                ││
+│ │   - Single batch load instead of per-result QueryRow                             ││
+│ │   ACCEPTANCE: Vector search with 100 results makes ≤2 DB queries                 ││
+│ │   MODIFIES: search.go:76-91 (loadNodes)                                          ││
+│ │   DEPENDS ON: PF.1.1                                                             ││
+│ │   FILES: core/vectorgraphdb/search.go (MODIFY)                                   ││
+│ │                                                                                  ││
+│ │ • PF.2.3 HNSW Layer Neighbor Set Migration                                       ││
+│ │   (core/vectorgraphdb/hnsw/layer.go MODIFY)                                      ││
+│ │   - Replace layerNode.neighbors []string with *neighborSet                       ││
+│ │   - Update addNeighbor() to use neighborSet.Add()                                ││
+│ │   - Remove containsNeighbor() function (now inline O(1))                         ││
+│ │   - Update getNeighbors() to return neighborSet.Slice()                          ││
+│ │   ACCEPTANCE: Insertion benchmark shows ≥50% improvement for dense graphs        ││
+│ │   MODIFIES: layer.go:67-91 (addNeighbor, containsNeighbor, getNeighbors)         ││
+│ │   DEPENDS ON: PF.1.5                                                             ││
+│ │   FILES: core/vectorgraphdb/hnsw/layer.go (MODIFY)                               ││
+│ │          core/vectorgraphdb/hnsw/layer_test.go (ADD neighbor set tests)          ││
+│ │                                                                                  ││
+│ │ • PF.2.4 HNSW Batch Neighbor Retrieval                                           ││
+│ │   (core/vectorgraphdb/hnsw/layer.go MODIFY)                                      ││
+│ │   - Add getNeighborsMany(ids []string) map[string][]string                       ││
+│ │   - Single lock acquisition for batch retrieval                                  ││
+│ │   - Update searchLayer() to batch-fetch neighbors                                ││
+│ │   ACCEPTANCE: searchLayer acquires layer lock ≤3 times (not 100+ times)          ││
+│ │   MODIFIES: hnsw.go:175-209 (searchLayer), layer.go (add batch method)           ││
+│ │   FILES: core/vectorgraphdb/hnsw/layer.go (MODIFY)                               ││
+│ │          core/vectorgraphdb/hnsw/hnsw.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • PF.2.5 HNSW Deletion Lock Optimization                                         ││
+│ │   (core/vectorgraphdb/hnsw/hnsw.go MODIFY)                                       ││
+│ │   - Add DeleteBatch(ids []string) method                                         ││
+│ │   - Single global lock for entire batch                                          ││
+│ │   - Collect all affected layers, then process                                    ││
+│ │   - Defer entryPoint selection to end of batch                                   ││
+│ │   ACCEPTANCE: Deleting 100 nodes acquires global lock once (not 100 times)       ││
+│ │   MODIFIES: hnsw.go:304-320 (deleteLocked), batch.go:259-267                     ││
+│ │   FILES: core/vectorgraphdb/hnsw/hnsw.go (MODIFY)                                ││
+│ │          core/vectorgraphdb/batch.go (MODIFY - use DeleteBatch)                  ││
+│ │                                                                                  ││
+│ │ • PF.2.6 Database Index Additions                                                ││
+│ │   (core/vectorgraphdb/migrations/014_performance_indexes.go NEW)                 ││
+│ │   - CREATE INDEX idx_nodes_updated_at ON nodes(updated_at)                       ││
+│ │   - CREATE INDEX idx_nodes_created_at ON nodes(created_at)                       ││
+│ │   - CREATE INDEX idx_edges_type_source ON edges(edge_type, source_id)            ││
+│ │   - Migration up/down functions                                                  ││
+│ │   ACCEPTANCE: EXPLAIN QUERY PLAN shows index usage for temporal queries          ││
+│ │   FIXES: schema.sql missing indexes for updated_at queries                       ││
+│ │   FILES: core/vectorgraphdb/migrations/014_performance_indexes.go (NEW)          ││
+│ │          core/vectorgraphdb/migrations/014_performance_indexes_test.go (NEW)     ││
+│ │                                                                                  ││
+│ │ • PF.2.7 NodeStore Instance Caching                                              ││
+│ │   (core/vectorgraphdb/query.go MODIFY)                                           ││
+│ │   - Add nodeStore field to QueryEngine (reused across queries)                   ││
+│ │   - Add edgeStore field to QueryEngine                                           ││
+│ │   - Remove per-query NewNodeStore() instantiation                                ││
+│ │   ACCEPTANCE: No NewNodeStore() calls in hot path, stores reused                 ││
+│ │   MODIFIES: query.go:159, query.go:238, search.go:78                             ││
+│ │   FILES: core/vectorgraphdb/query.go (MODIFY)                                    ││
+│ │          core/vectorgraphdb/search.go (MODIFY)                                   ││
+│ │          core/vectorgraphdb/traversal.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 3 (All parallel - Bleve/Search optimizations, no PHASE 2 deps):            ││
+│ │                                                                                  ││
+│ │ • PF.3.1 Async Index Queue (core/search/bleve/async_indexer.go)                  ││
+│ │   - AsyncIndexer struct with queue chan *IndexRequest                            ││
+│ │   - worker goroutines (configurable, default 2)                                  ││
+│ │   - IndexAsync(ctx, doc) <-chan error - non-blocking                             ││
+│ │   - Batch accumulation (50ms window or 100 docs)                                 ││
+│ │   - Uses GoroutineScope for worker lifecycle                                     ││
+│ │   ACCEPTANCE: Index() returns immediately, actual indexing async                 ││
+│ │   REPLACES: index_manager.go:182-201 synchronous blocking                        ││
+│ │   FILES: core/search/bleve/async_indexer.go (NEW)                                ││
+│ │          core/search/bleve/async_indexer_test.go (NEW)                           ││
+│ │                                                                                  ││
+│ │ • PF.3.2 IndexManager Async Integration                                          ││
+│ │   (core/search/bleve/index_manager.go MODIFY)                                    ││
+│ │   - Add asyncIndexer *AsyncIndexer field                                         ││
+│ │   - Index() delegates to asyncIndexer.IndexAsync()                               ││
+│ │   - IndexSync() for cases requiring immediate consistency                        ││
+│ │   - Graceful shutdown flushes pending                                            ││
+│ │   ACCEPTANCE: Index() does not hold write lock during Bleve I/O                  ││
+│ │   MODIFIES: index_manager.go:182-201                                             ││
+│ │   DEPENDS ON: PF.3.1                                                             ││
+│ │   FILES: core/search/bleve/index_manager.go (MODIFY)                             ││
+│ │                                                                                  ││
+│ │ • PF.3.3 DeleteByPath Path Index                                                 ││
+│ │   (core/search/bleve/index_manager.go MODIFY)                                    ││
+│ │   - Add pathToID map[string]string field (reverse index)                         ││
+│ │   - Update on Index(): pathToID[doc.Path] = doc.ID                               ││
+│ │   - DeleteByPath(): lookup ID from map, delete directly                          ││
+│ │   - Remove embedded SearchInContext from delete path                             ││
+│ │   ACCEPTANCE: DeleteByPath makes 0 search queries                                ││
+│ │   MODIFIES: index_manager.go:308-334                                             ││
+│ │   FILES: core/search/bleve/index_manager.go (MODIFY)                             ││
+│ │                                                                                  ││
+│ │ • PF.3.4 Batch Operation Timeout                                                 ││
+│ │   (core/search/bleve/index_manager.go MODIFY)                                    ││
+│ │   - Add batchTimeout to IndexManagerConfig (default 30s)                         ││
+│ │   - Wrap m.index.Batch() with context timeout                                    ││
+│ │   - Return ErrBatchTimeout if exceeded                                           ││
+│ │   ACCEPTANCE: Batch commits fail gracefully after timeout, not hang              ││
+│ │   MODIFIES: index_manager.go:256, index_manager.go:265                           ││
+│ │   FILES: core/search/bleve/index_manager.go (MODIFY)                             ││
+│ │                                                                                  ││
+│ │ • PF.3.5 Selective Field Loading                                                 ││
+│ │   (core/search/bleve/index_manager.go MODIFY)                                    ││
+│ │   - Add fields parameter to Search() method                                      ││
+│ │   - Default fields: ["id", "path", "type", "language"] (not "*")                 ││
+│ │   - SearchWithContent() loads full content when needed                           ││
+│ │   - Update buildBleveRequest() to use requested fields                           ││
+│ │   ACCEPTANCE: Default search loads ≤5 fields, not all 11+                        ││
+│ │   MODIFIES: index_manager.go:422-426 (buildBleveRequest)                         ││
+│ │   FILES: core/search/bleve/index_manager.go (MODIFY)                             ││
+│ │                                                                                  ││
+│ │ • PF.3.6 IncrementalIndexer Batch Accumulation                                   ││
+│ │   (core/search/indexer/incremental.go MODIFY)                                    ││
+│ │   - Accumulate changes into batches (100ms window or 50 changes)                 ││
+│ │   - Process batch with IndexBatch() instead of per-file Index()                  ││
+│ │   - Parallel change processing with worker pool                                  ││
+│ │   ACCEPTANCE: 100 file changes processed in ≤3 IndexBatch calls                  ││
+│ │   MODIFIES: incremental.go:134-148 (Index loop)                                  ││
+│ │   FILES: core/search/indexer/incremental.go (MODIFY)                             ││
+│ │                                                                                  ││
+│ │ • PF.3.7 SearchCache Single-Lock LRU                                             ││
+│ │   (core/search/coordinator/cache.go MODIFY)                                      ││
+│ │   - Refactor Get() to acquire write lock once for promote                        ││
+│ │   - Inline LRU promotion in Get() under single lock                              ││
+│ │   - Remove separate promoteEntry() call                                          ││
+│ │   ACCEPTANCE: Cache hit acquires lock once, not twice                            ││
+│ │   MODIFIES: cache.go:106-114 (Get with double lock)                              ││
+│ │   FILES: core/search/coordinator/cache.go (MODIFY)                               ││
+│ │                                                                                  ││
+│ │ • PF.3.8 SearchCache Key with Pagination                                         ││
+│ │   (core/search/coordinator/cache.go MODIFY)                                      ││
+│ │   - Update GenerateCacheKey() to include limit and offset                        ││
+│ │   - Key format: hash(query + filters + limit + offset)                           ││
+│ │   ACCEPTANCE: Different pagination params produce different cache keys           ││
+│ │   MODIFIES: cache.go:252-263 (GenerateCacheKey)                                  ││
+│ │   FILES: core/search/coordinator/cache.go (MODIFY)                               ││
+│ │                                                                                  ││
+│ │ • PF.3.9 Fusion Result Capping                                                   ││
+│ │   (core/search/coordinator/coordinator.go MODIFY)                                ││
+│ │   - Cap intermediate fusion maps to 2x requested limit                           ││
+│ │   - Use heap-based top-K selection instead of full sort                          ││
+│ │   - Early termination when top-K is stable                                       ││
+│ │   ACCEPTANCE: Fusion allocates O(limit) not O(all results)                       ││
+│ │   MODIFIES: coordinator.go:374-375 (fuseRRF allocation)                          ││
+│ │   FILES: core/search/coordinator/coordinator.go (MODIFY)                         ││
+│ │                                                                                  ││
+│ │ • PF.3.10 Batch Size Validation                                                  ││
+│ │   (core/search/bleve/index_manager.go MODIFY)                                    ││
+│ │   - Add MinBatchSize=10, MaxBatchSize=5000 constants                             ││
+│ │   - Validate and clamp BatchSize in NewIndexManager()                            ││
+│ │   - Log warning if configured size was clamped                                   ││
+│ │   ACCEPTANCE: BatchSize always within safe bounds                                ││
+│ │   MODIFIES: index_manager.go:236-241                                             ││
+│ │   FILES: core/search/bleve/index_manager.go (MODIFY)                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 4 (After PF.1.2, PF.1.3, PF.1.4 - Knowledge Graph optimizations):          ││
+│ │                                                                                  ││
+│ │ • PF.4.1 DomainFilter Regex Cache Integration                                    ││
+│ │   (core/knowledge/query/domain_filter.go MODIFY)                                 ││
+│ │   - Import regex_cache package                                                   ││
+│ │   - Replace regexp.MustCompile() calls with cached regex                         ││
+│ │   - Update tokenizeQuery() to use tokenizeRegex                                  ││
+│ │   - Update containsPhrase() to use phraseRegex                                   ││
+│ │   ACCEPTANCE: No regexp.Compile in hot path, benchmark shows improvement         ││
+│ │   MODIFIES: domain_filter.go:675, domain_filter.go:689-691                       ││
+│ │   DEPENDS ON: PF.1.2                                                             ││
+│ │   FILES: core/knowledge/query/domain_filter.go (MODIFY)                          ││
+│ │                                                                                  ││
+│ │ • PF.4.2 EntityLinker TokenSet Integration                                       ││
+│ │   (core/knowledge/entity_linker.go MODIFY)                                       ││
+│ │   - Replace fuzzyMatchScore nested loops with TokenSet operations                ││
+│ │   - Pre-compute TokenSet for indexed entities on Add()                           ││
+│ │   - Cache TokenSet in entityIndex alongside entity                               ││
+│ │   - fuzzyMatchScore uses MatchCount() for O(n) not O(n²)                         ││
+│ │   ACCEPTANCE: Fuzzy matching 1000 entities is O(n) not O(n²)                     ││
+│ │   MODIFIES: entity_linker.go:376-393 (nested loop), entity_linker.go:322-370     ││
+│ │   DEPENDS ON: PF.1.3                                                             ││
+│ │   FILES: core/knowledge/entity_linker.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • PF.4.3 EntityLinker String Normalization Cache                                 ││
+│ │   (core/knowledge/entity_linker.go MODIFY)                                       ││
+│ │   - Add normalizedNames map[string]string to EntityLinker                        ││
+│ │   - Pre-normalize on entity Add(): normalizedNames[name] = lower(name)           ││
+│ │   - fuzzyMatchScore uses pre-normalized instead of runtime ToLower               ││
+│ │   ACCEPTANCE: No strings.ToLower() in fuzzyMatchScore hot path                   ││
+│ │   MODIFIES: entity_linker.go:331-332                                             ││
+│ │   FILES: core/knowledge/entity_linker.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • PF.4.4 Levenshtein Early Exit                                                  ││
+│ │   (core/knowledge/entity_linker.go MODIFY)                                       ││
+│ │   - Add maxDistance parameter to levenshteinDistance()                           ││
+│ │   - Track minimum possible distance during computation                           ││
+│ │   - Return early if min possible > maxDistance                                   ││
+│ │   - Use single-row space optimization (O(n) space not O(n×m))                    ││
+│ │   ACCEPTANCE: Levenshtein for clearly different strings exits early              ││
+│ │   MODIFIES: entity_linker.go:431-470                                             ││
+│ │   FILES: core/knowledge/entity_linker.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • PF.4.5 MemoryScorer Activation Cache Integration                               ││
+│ │   (core/knowledge/memory/scorer.go MODIFY)                                       ││
+│ │   - Add activationCache *ActivationCache field                                   ││
+│ │   - ComputeMemoryScore uses cache.GetOrCompute()                                 ││
+│ │   - Cache invalidation on memory access recording                                ││
+│ │   ACCEPTANCE: Scoring 100 results with same timestamp hits cache 99 times        ││
+│ │   MODIFIES: scorer.go:108 (ComputeMemoryScore loop)                              ││
+│ │   DEPENDS ON: PF.1.4                                                             ││
+│ │   FILES: core/knowledge/memory/scorer.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • PF.4.6 GraphTraverser Visit Key Fix                                            ││
+│ │   (core/knowledge/query/graph_traverser.go MODIFY)                               ││
+│ │   - Fix visitKey() to include path hash, not just nodeID                         ││
+│ │   - visitKey format: nodeID + ":" + pathHash                                     ││
+│ │   - Prevents redundant traversal of same node via different paths                ││
+│ │   - Add maxVisits configuration to prevent explosion                             ││
+│ │   ACCEPTANCE: Graph traversal visits each (node, path) pair once                 ││
+│ │   MODIFIES: graph_traverser.go:366-371 (visitKey)                                ││
+│ │   FILES: core/knowledge/query/graph_traverser.go (MODIFY)                        ││
+│ │                                                                                  ││
+│ │ • PF.4.7 RuleEvaluator Memoization                                               ││
+│ │   (core/knowledge/inference/rule_evaluator.go MODIFY)                            ││
+│ │   - Add matchCache map[cacheKey][]matchResult to RuleEvaluator                   ││
+│ │   - Cache key: (conditionIndex, bindingHash)                                     ││
+│ │   - matchCondition() checks cache before edge scan                               ││
+│ │   - Cache cleared between rule evaluations                                       ││
+│ │   ACCEPTANCE: Repeated condition matching returns cached results                 ││
+│ │   MODIFIES: rule_evaluator.go:88-132 (findBindingsRecursive)                     ││
+│ │   FILES: core/knowledge/inference/rule_evaluator.go (MODIFY)                     ││
+│ │                                                                                  ││
+│ │ • PF.4.8 RuleEvaluator Edge Index                                                ││
+│ │   (core/knowledge/inference/rule_evaluator.go MODIFY)                            ││
+│ │   - Add edgesBySource map[string][]Edge index                                    ││
+│ │   - Add edgesByTarget map[string][]Edge index                                    ││
+│ │   - Build indexes before evaluation                                              ││
+│ │   - matchCondition() uses index instead of full scan                             ││
+│ │   ACCEPTANCE: matchCondition is O(matched) not O(all edges)                      ││
+│ │   MODIFIES: rule_evaluator.go:113                                                ││
+│ │   FILES: core/knowledge/inference/rule_evaluator.go (MODIFY)                     ││
+│ │                                                                                  ││
+│ │ • PF.4.9 ValidAccessTypes Constant                                               ││
+│ │   (core/knowledge/memory/actr_types.go MODIFY)                                   ││
+│ │   - Move ValidAccessTypes to package-level var (computed once)                   ││
+│ │   - Add validAccessTypeSet map[AccessType]struct{} for O(1) lookup               ││
+│ │   - IsValid() uses set lookup instead of slice iteration                         ││
+│ │   ACCEPTANCE: IsValid() is O(1) with no allocation                               ││
+│ │   MODIFIES: actr_types.go:35-42                                                  ││
+│ │   FILES: core/knowledge/memory/actr_types.go (MODIFY)                            ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 5 (After PF.1.6 - Concurrency/Resource optimizations):                     ││
+│ │                                                                                  ││
+│ │ • PF.5.1 WAL Context Propagation                                                 ││
+│ │   (core/concurrency/wal.go MODIFY)                                               ││
+│ │   - Add ctx context.Context field to WriteAheadLog                               ││
+│ │   - periodicSync() selects on ctx.Done() alongside stopSync                      ││
+│ │   - startPeriodicSyncIfNeeded() passes context to goroutine                      ││
+│ │   ACCEPTANCE: WAL goroutine exits on context cancellation                        ││
+│ │   MODIFIES: wal.go:93-96, wal.go:318-330                                         ││
+│ │   FILES: core/concurrency/wal.go (MODIFY)                                        ││
+│ │                                                                                  ││
+│ │ • PF.5.2 AdaptiveChannel Context Propagation                                     ││
+│ │   (core/concurrency/adaptive_channel.go MODIFY)                                  ││
+│ │   - Add ctx context.Context to AdaptiveChannelConfig                             ││
+│ │   - adaptLoop() selects on ctx.Done()                                            ││
+│ │   - NewAdaptiveChannel accepts context                                           ││
+│ │   ACCEPTANCE: AdaptiveChannel goroutine exits on context cancellation            ││
+│ │   MODIFIES: adaptive_channel.go:76-86                                            ││
+│ │   FILES: core/concurrency/adaptive_channel.go (MODIFY)                           ││
+│ │                                                                                  ││
+│ │ • PF.5.3 UnboundedChannel Overflow Limit                                         ││
+│ │   (core/concurrency/unbounded_channel.go MODIFY)                                 ││
+│ │   - Add maxOverflow int to UnboundedChannelConfig                                ││
+│ │   - Use BoundedOverflow instead of raw slice                                     ││
+│ │   - Return ErrOverflowFull when limit reached                                    ││
+│ │   ACCEPTANCE: Overflow cannot exceed configured maximum                          ││
+│ │   MODIFIES: unbounded_channel.go:65-73                                           ││
+│ │   DEPENDS ON: PF.1.6                                                             ││
+│ │   FILES: core/concurrency/unbounded_channel.go (MODIFY)                          ││
+│ │                                                                                  ││
+│ │ • PF.5.4 AdaptiveChannel Overflow Limit                                          ││
+│ │   (core/concurrency/adaptive_channel.go MODIFY)                                  ││
+│ │   - Add maxOverflow int to AdaptiveChannelConfig                                 ││
+│ │   - Use BoundedOverflow in enqueueOverflow()                                     ││
+│ │   - Return error when overflow full                                              ││
+│ │   ACCEPTANCE: Overflow cannot exceed configured maximum                          ││
+│ │   MODIFIES: adaptive_channel.go:198-203                                          ││
+│ │   DEPENDS ON: PF.1.6                                                             ││
+│ │   FILES: core/concurrency/adaptive_channel.go (MODIFY)                           ││
+│ │                                                                                  ││
+│ │ • PF.5.5 LLMGate Queue Size Limit                                                ││
+│ │   (core/concurrency/llm_gate.go MODIFY)                                          ││
+│ │   - Add maxQueueSize to UnboundedQueue                                           ││
+│ │   - Push() returns ErrQueueFull when limit reached                               ││
+│ │   - Configurable per DualQueueGate                                               ││
+│ │   ACCEPTANCE: Queue size bounded, backpressure works                             ││
+│ │   MODIFIES: llm_gate.go:116-147                                                  ││
+│ │   FILES: core/concurrency/llm_gate.go (MODIFY)                                   ││
+│ │                                                                                  ││
+│ │ • PF.5.6 ObservationLog Async Write                                              ││
+│ │   (core/context/observation_log.go MODIFY)                                       ││
+│ │   - Move file I/O outside mutex in writeToWAL()                                  ││
+│ │   - Use buffered channel for write requests                                      ││
+│ │   - Dedicated writer goroutine (via GoroutineScope)                              ││
+│ │   - Mutex only protects queue append                                             ││
+│ │   ACCEPTANCE: writeToWAL() does not hold lock during File.Sync()                 ││
+│ │   MODIFIES: observation_log.go:216-243                                           ││
+│ │   FILES: core/context/observation_log.go (MODIFY)                                ││
+│ │                                                                                  ││
+│ │ • PF.5.7 Scheduler Context Propagation                                           ││
+│ │   (core/concurrency/scheduler.go MODIFY)                                         ││
+│ │   - Pass parent context to pipeline runners                                      ││
+│ │   - Replace context.Background() with inherited context                          ││
+│ │   - Pipelines respect application-level cancellation                             ││
+│ │   ACCEPTANCE: Scheduler shutdown cancels all pipeline contexts                   ││
+│ │   MODIFIES: scheduler.go:155                                                     ││
+│ │   FILES: core/concurrency/scheduler.go (MODIFY)                                  ││
+│ │                                                                                  ││
+│ │ • PF.5.8 LLMGate Context Propagation                                             ││
+│ │   (core/concurrency/llm_gate.go MODIFY)                                          ││
+│ │   - Add parent context to DualQueueGate                                          ││
+│ │   - newRequestContext() derives from parent, not Background()                    ││
+│ │   - Requests cancelled when gate closes                                          ││
+│ │   ACCEPTANCE: Gate close cancels all pending request contexts                    ││
+│ │   MODIFIES: llm_gate.go:505-509                                                  ││
+│ │   FILES: core/concurrency/llm_gate.go (MODIFY)                                   ││
+│ │                                                                                  ││
+│ │ • PF.5.9 AdaptiveChannel Send Race Fix                                           ││
+│ │   (core/concurrency/adaptive_channel.go MODIFY)                                  ││
+│ │   - Fix blockSend() to hold lock during channel send                             ││
+│ │   - Or use atomic channel swap pattern                                           ││
+│ │   - Prevent stale channel reference after resize                                 ││
+│ │   ACCEPTANCE: No lost messages during concurrent resize and send                 ││
+│ │   MODIFIES: adaptive_channel.go:152-168                                          ││
+│ │   FILES: core/concurrency/adaptive_channel.go (MODIFY)                           ││
+│ │                                                                                  ││
+│ │ • PF.5.10 HotCache Batch Eviction                                                ││
+│ │   (core/context/hot_cache.go MODIFY)                                             ││
+│ │   - Collect eviction candidates under read lock                                  ││
+│ │   - Evict collected items under write lock (single acquisition)                  ││
+│ │   - Or use lock-free eviction queue                                              ││
+│ │   ACCEPTANCE: Eviction loop acquires write lock once, not per-item               ││
+│ │   MODIFIES: hot_cache.go:211-219                                                 ││
+│ │   FILES: core/context/hot_cache.go (MODIFY)                                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 6 (After all prior phases - Integration & Benchmarks):                     ││
+│ │                                                                                  ││
+│ │ • PF.6.1 VectorGraphDB Performance Benchmark Suite                               ││
+│ │   (core/vectorgraphdb/benchmark_test.go NEW)                                     ││
+│ │   - BenchmarkHybridQuery100Results                                               ││
+│ │   - BenchmarkHNSWInsert1000Nodes                                                 ││
+│ │   - BenchmarkBatchDelete100Nodes                                                 ││
+│ │   - BenchmarkConcurrentSearch10Goroutines                                        ││
+│ │   ACCEPTANCE: All benchmarks show ≥2x improvement vs baseline                    ││
+│ │   FILES: core/vectorgraphdb/benchmark_test.go (NEW)                              ││
+│ │                                                                                  ││
+│ │ • PF.6.2 Bleve Performance Benchmark Suite                                       ││
+│ │   (core/search/bleve/benchmark_test.go NEW)                                      ││
+│ │   - BenchmarkAsyncIndex1000Docs                                                  ││
+│ │   - BenchmarkIncrementalIndex100Changes                                          ││
+│ │   - BenchmarkSearchWithCache                                                     ││
+│ │   - BenchmarkFusion100Results                                                    ││
+│ │   ACCEPTANCE: All benchmarks show ≥2x improvement vs baseline                    ││
+│ │   FILES: core/search/bleve/benchmark_test.go (NEW)                               ││
+│ │                                                                                  ││
+│ │ • PF.6.3 Knowledge Graph Performance Benchmark Suite                             ││
+│ │   (core/knowledge/benchmark_test.go NEW)                                         ││
+│ │   - BenchmarkEntityLinkerFuzzyMatch1000                                          ││
+│ │   - BenchmarkRuleEvaluator5Conditions                                            ││
+│ │   - BenchmarkMemoryScorer100Results                                              ││
+│ │   - BenchmarkDomainFilter1000Queries                                             ││
+│ │   ACCEPTANCE: All benchmarks show ≥2x improvement vs baseline                    ││
+│ │   FILES: core/knowledge/benchmark_test.go (NEW)                                  ││
+│ │                                                                                  ││
+│ │ • PF.6.4 Concurrency Stress Test Suite                                           ││
+│ │   (core/concurrency/stress_test.go NEW)                                          ││
+│ │   - TestUnboundedChannelOverflowLimit                                            ││
+│ │   - TestAdaptiveChannelResizeUnderLoad                                           ││
+│ │   - TestWALContextCancellation                                                   ││
+│ │   - TestLLMGateQueueBackpressure                                                 ││
+│ │   - Race detector enabled (-race flag)                                           ││
+│ │   ACCEPTANCE: All tests pass with -race, no goroutine leaks                      ││
+│ │   FILES: core/concurrency/stress_test.go (NEW)                                   ││
+│ │                                                                                  ││
+│ │ • PF.6.5 Memory Leak Detection Test                                              ││
+│ │   (core/performance_test.go NEW)                                                 ││
+│ │   - TestNoGoroutineLeakOnShutdown                                                ││
+│ │   - TestBoundedMemoryUnderLoad                                                   ││
+│ │   - TestCacheEvictionUnderPressure                                               ││
+│ │   - Use runtime.NumGoroutine() assertions                                        ││
+│ │   ACCEPTANCE: Goroutine count returns to baseline after operations               ││
+│ │   FILES: core/performance_test.go (NEW)                                          ││
+│ │                                                                                  ││
+│ │ • PF.6.6 End-to-End Performance Regression Test                                  ││
+│ │   (core/e2e_performance_test.go NEW)                                             ││
+│ │   - TestFullQueryPipelineLatency                                                 ││
+│ │   - TestIndexingThroughput                                                       ││
+│ │   - TestConcurrentAgentLoad                                                      ││
+│ │   - Latency percentiles: p50, p95, p99                                           ││
+│ │   ACCEPTANCE: p99 latency within SLA thresholds                                  ││
+│ │   FILES: core/e2e_performance_test.go (NEW)                                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ PHASE 7 (After PF.6.x - Documentation & Cleanup):                                ││
+│ │                                                                                  ││
+│ │ • PF.7.1 Update FIX.md with Resolution Status                                    ││
+│ │   - Mark each issue as RESOLVED with commit reference                            ││
+│ │   - Add benchmark results showing improvement                                    ││
+│ │   - Document any issues deferred or out of scope                                 ││
+│ │   FILES: FIX.md (MODIFY)                                                         ││
+│ │                                                                                  ││
+│ │ • PF.7.2 Performance Tuning Guide                                                ││
+│ │   (docs/PERFORMANCE.md NEW)                                                      ││
+│ │   - Document configuration options affecting performance                         ││
+│ │   - Batch sizes, cache sizes, timeout values                                     ││
+│ │   - Recommended settings for different workloads                                 ││
+│ │   FILES: docs/PERFORMANCE.md (NEW)                                               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES (SUMMARY):                                                                 ││
+│ │                                                                                  ││
+│ │ NEW FILES (22):                                                                  ││
+│ │   core/vectorgraphdb/batch_loader.go - PF.1.1                                    ││
+│ │   core/vectorgraphdb/batch_loader_test.go - PF.1.1                               ││
+│ │   core/vectorgraphdb/hnsw/neighbor_set.go - PF.1.5                               ││
+│ │   core/vectorgraphdb/hnsw/neighbor_set_test.go - PF.1.5                          ││
+│ │   core/vectorgraphdb/migrations/014_performance_indexes.go - PF.2.6              ││
+│ │   core/vectorgraphdb/migrations/014_performance_indexes_test.go - PF.2.6         ││
+│ │   core/vectorgraphdb/benchmark_test.go - PF.6.1                                  ││
+│ │   core/knowledge/query/regex_cache.go - PF.1.2                                   ││
+│ │   core/knowledge/tokenset.go - PF.1.3                                            ││
+│ │   core/knowledge/tokenset_test.go - PF.1.3                                       ││
+│ │   core/knowledge/memory/activation_cache.go - PF.1.4                             ││
+│ │   core/knowledge/memory/activation_cache_test.go - PF.1.4                        ││
+│ │   core/knowledge/benchmark_test.go - PF.6.3                                      ││
+│ │   core/search/bleve/async_indexer.go - PF.3.1                                    ││
+│ │   core/search/bleve/async_indexer_test.go - PF.3.1                               ││
+│ │   core/search/bleve/benchmark_test.go - PF.6.2                                   ││
+│ │   core/concurrency/bounded_overflow.go - PF.1.6                                  ││
+│ │   core/concurrency/bounded_overflow_test.go - PF.1.6                             ││
+│ │   core/concurrency/stress_test.go - PF.6.4                                       ││
+│ │   core/performance_test.go - PF.6.5                                              ││
+│ │   core/e2e_performance_test.go - PF.6.6                                          ││
+│ │   docs/PERFORMANCE.md - PF.7.2                                                   ││
+│ │                                                                                  ││
+│ │ MODIFIED FILES (24):                                                             ││
+│ │   core/vectorgraphdb/query.go - PF.2.1, PF.2.7                                   ││
+│ │   core/vectorgraphdb/search.go - PF.2.2, PF.2.7                                  ││
+│ │   core/vectorgraphdb/traversal.go - PF.2.7                                       ││
+│ │   core/vectorgraphdb/batch.go - PF.2.5                                           ││
+│ │   core/vectorgraphdb/hnsw/layer.go - PF.2.3, PF.2.4                              ││
+│ │   core/vectorgraphdb/hnsw/hnsw.go - PF.2.4, PF.2.5                               ││
+│ │   core/knowledge/query/domain_filter.go - PF.4.1                                 ││
+│ │   core/knowledge/entity_linker.go - PF.4.2, PF.4.3, PF.4.4                       ││
+│ │   core/knowledge/query/graph_traverser.go - PF.4.6                               ││
+│ │   core/knowledge/inference/rule_evaluator.go - PF.4.7, PF.4.8                    ││
+│ │   core/knowledge/memory/scorer.go - PF.4.5                                       ││
+│ │   core/knowledge/memory/actr_types.go - PF.4.9                                   ││
+│ │   core/search/bleve/index_manager.go - PF.3.2, PF.3.3, PF.3.4, PF.3.5, PF.3.10   ││
+│ │   core/search/indexer/incremental.go - PF.3.6                                    ││
+│ │   core/search/coordinator/cache.go - PF.3.7, PF.3.8                              ││
+│ │   core/search/coordinator/coordinator.go - PF.3.9                                ││
+│ │   core/concurrency/wal.go - PF.5.1                                               ││
+│ │   core/concurrency/adaptive_channel.go - PF.5.2, PF.5.4, PF.5.9                  ││
+│ │   core/concurrency/unbounded_channel.go - PF.5.3                                 ││
+│ │   core/concurrency/llm_gate.go - PF.5.5, PF.5.8                                  ││
+│ │   core/concurrency/scheduler.go - PF.5.7                                         ││
+│ │   core/context/observation_log.go - PF.5.6                                       ││
+│ │   core/context/hot_cache.go - PF.5.10                                            ││
+│ │   FIX.md - PF.7.1                                                                ││
+│ │                                                                                  ││
+│ │ INTERNAL DEPENDENCIES:                                                           ││
+│ │   Phase 1 (6 parallel) → Phase 2 (7 tasks, depends on PF.1.1, PF.1.5)            ││
+│ │   Phase 1 (6 parallel) → Phase 3 (10 parallel, no Phase 2 deps)                  ││
+│ │   Phase 1 (6 parallel) → Phase 4 (9 tasks, depends on PF.1.2-1.4)                ││
+│ │   Phase 1 (6 parallel) → Phase 5 (10 tasks, depends on PF.1.6)                   ││
+│ │   Phase 2,3,4,5 → Phase 6 (6 parallel benchmarks/tests)                          ││
+│ │   Phase 6 → Phase 7 (2 tasks, documentation)                                     ││
+│ │                                                                                  ││
+│ │ PARALLELISM ANALYSIS:                                                            ││
+│ │   - Phase 1: 6 independent tasks (max parallel)                                  ││
+│ │   - Phase 2-5: Can run in parallel across phases (up to 36 parallel)             ││
+│ │     * Phase 2: 7 tasks (VectorDB), some internal sequencing                      ││
+│ │     * Phase 3: 10 tasks (Bleve), mostly parallel                                 ││
+│ │     * Phase 4: 9 tasks (Knowledge), mostly parallel                              ││
+│ │     * Phase 5: 10 tasks (Concurrency), mostly parallel                           ││
+│ │   - Phase 6: 6 test suites (parallel)                                            ││
+│ │   - Phase 7: 2 documentation tasks (parallel)                                    ││
+│ │   TOTAL: 50 tasks, ~20-30 can execute in parallel at peak                        ││
+│ │                                                                                  ││
+│ │ EXTERNAL DEPENDENCIES:                                                           ││
+│ │   - Groups 4L-4Y must be complete (these are optimizations to existing code)     ││
+│ │   - No new external packages required                                            ││
+│ │                                                                                  ││
+│ │ ESTIMATED IMPACT:                                                                ││
+│ │   - VectorGraphDB: 10-100x fewer DB queries, 50% faster insertions               ││
+│ │   - Bleve: Non-blocking indexing, 2x faster incremental updates                  ││
+│ │   - Knowledge: 10x faster fuzzy matching, O(1) activation lookups                ││
+│ │   - Concurrency: Bounded memory, no goroutine leaks, proper cancellation         ││
+│ │                                                                                  ││
+│ │ REFERENCES:                                                                      ││
+│ │   - FIX.md: Detailed analysis with file:line references                          ││
+│ │   - ARCHITECTURE.md: Performance requirements and SLAs                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AA: Versioned TC Reads - Snapshot Isolation (VTC.1-VTC.8)       ││
+│ │                                                                                  ││
+│ │ PURPOSE: Prevent race conditions during reachability index rebuild by providing  ││
+│ │          snapshot isolation via copy-on-write with atomic pointer swap.          ││
+│ │                                                                                  ││
+│ │ PHASE 1 (4 parallel):                                                            ││
+│ │   VTC.1 IndexSnapshot type definition                                            ││
+│ │     CREATE: core/knowledge/relations/versioned_index.go                          ││
+│ │     - IndexSnapshot struct with version, createdAt, edgeType fields              ││
+│ │     - Immutable intervals map[string]*IntervalLabel                              ││
+│ │     - Immutable sccMap map[string]int                                            ││
+│ │     ACCEPTANCE: Type compiles, fields are private with getters                   ││
+│ │                                                                                  ││
+│ │   VTC.2 IntervalLabel type definition                                            ││
+│ │     CREATE: core/knowledge/relations/versioned_index.go                          ││
+│ │     - Pre, Post, TopoOrder, SCCID int fields                                     ││
+│ │     ACCEPTANCE: Type compiles, all fields accessible                             ││
+│ │                                                                                  ││
+│ │   VTC.3 VersionedIntervalIndex struct                                            ││
+│ │     CREATE: core/knowledge/relations/versioned_index.go                          ││
+│ │     - atomic.Pointer[IndexSnapshot] for current snapshot                         ││
+│ │     - NewVersionedIntervalIndex() constructor with empty snapshot                ││
+│ │     ACCEPTANCE: Constructor returns valid index, Read() returns snapshot         ││
+│ │                                                                                  ││
+│ │   VTC.4 Unit tests for type definitions                                          ││
+│ │     CREATE: core/knowledge/relations/versioned_index_test.go                     ││
+│ │     - Test snapshot creation, field access                                       ││
+│ │     ACCEPTANCE: Tests pass                                                       ││
+│ │                                                                                  ││
+│ │ PHASE 2 (2 parallel, depends on Phase 1):                                        ││
+│ │   VTC.5 Read operations (lock-free)                                              ││
+│ │     MODIFY: core/knowledge/relations/versioned_index.go                          ││
+│ │     - Read() *IndexSnapshot returns current.Load()                               ││
+│ │     - CanReach(from, to string) bool on VersionedIntervalIndex                   ││
+│ │     - CanReach(from, to string) bool on IndexSnapshot (pure function)            ││
+│ │     ACCEPTANCE: CanReach returns true for same SCC, interval containment         ││
+│ │                                                                                  ││
+│ │   VTC.6 Rebuild operation (atomic swap)                                          ││
+│ │     MODIFY: core/knowledge/relations/versioned_index.go                          ││
+│ │     - Rebuild(ctx, edgeType, adjList) creates new snapshot                       ││
+│ │     - Uses iterative DFS for interval computation (zero recursion)               ││
+│ │     - Atomic swap via current.Store(newSnap)                                     ││
+│ │     ACCEPTANCE: Version increments, readers see consistent state                 ││
+│ │                                                                                  ││
+│ │ PHASE 3 (2 parallel, depends on Phase 2):                                        ││
+│ │   VTC.7 Concurrency tests                                                        ││
+│ │     CREATE: core/knowledge/relations/versioned_index_test.go                     ││
+│ │     - Test concurrent Read() during Rebuild()                                    ││
+│ │     - Verify no torn reads (all interval labels consistent)                      ││
+│ │     - Verify version monotonically increases                                     ││
+│ │     ACCEPTANCE: 1000 concurrent reads during rebuild return consistent results   ││
+│ │                                                                                  ││
+│ │   VTC.8 Integration with HybridQueryCoordinator                                  ││
+│ │     MODIFY: core/knowledge/hybrid_query.go                                       ││
+│ │     - Replace IntervalIndex with VersionedIntervalIndex                          ││
+│ │     - Update RebuildReachabilityIndex to use new API                             ││
+│ │     ACCEPTANCE: Existing tests pass, no mutex contention under load              ││
+│ │                                                                                  ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │   VTC.1 ──┐                                                                      ││
+│ │   VTC.2 ──┼──► VTC.5 ──┐                                                         ││
+│ │   VTC.3 ──┤            ├──► VTC.7                                                ││
+│ │   VTC.4 ──┘    VTC.6 ──┴──► VTC.8                                                ││
+│ │                                                                                  ││
+│ │ FILES CREATED: core/knowledge/relations/versioned_index.go                       ││
+│ │                core/knowledge/relations/versioned_index_test.go                  ││
+│ │ FILES MODIFIED: core/knowledge/hybrid_query.go                                   ││
+│ │                                                                                  ││
+│ │ REFERENCES: GRAPH.md "Versioned TC Reads (Snapshot Isolation)"                   ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AB: Stratified Semi-Naive Evaluation (SNE.1-SNE.12)             ││
+│ │                                                                                  ││
+│ │ PURPOSE: Replace naive forward chaining with semi-naive evaluation using delta  ││
+│ │          tables. Only compute Δ × All ∪ All × Δ instead of All × All.           ││
+│ │                                                                                  ││
+│ │ PHASE 1 (4 parallel):                                                            ││
+│ │   SNE.1 EdgeKey type definition                                                  ││
+│ │     CREATE: core/knowledge/relations/semi_naive.go                               ││
+│ │     - EdgeKey struct {Source, Target string; EdgeType int}                       ││
+│ │     ACCEPTANCE: Type compiles, usable as map key                                 ││
+│ │                                                                                  ││
+│ │   SNE.2 DeltaTable implementation                                                ││
+│ │     CREATE: core/knowledge/relations/semi_naive.go                               ││
+│ │     - edges map[EdgeKey]struct{}, iteration int                                  ││
+│ │     - NewDeltaTable(iteration) constructor                                       ││
+│ │     - Add(source, target, edgeType) bool (returns true if new)                   ││
+│ │     - IsEmpty() bool, Edges() []EdgeKey                                          ││
+│ │     ACCEPTANCE: Add returns false for duplicates, Edges returns all              ││
+│ │                                                                                  ││
+│ │   SNE.3 InferenceRule enhancements                                               ││
+│ │     MODIFY: core/knowledge/relations/inference.go                                ││
+│ │     - Add IsTransitive() bool method to InferenceRule                            ││
+│ │     - Add OutputSourceVar, OutputTargetVar fields                                ││
+│ │     ACCEPTANCE: Built-in rules correctly identified as transitive                ││
+│ │                                                                                  ││
+│ │   SNE.4 Database interface for semi-naive                                        ││
+│ │     CREATE: core/knowledge/relations/semi_naive.go                               ││
+│ │     - Database interface with GetEdgesByType, GetEdgesFrom, GetEdgesTo           ││
+│ │     - InsertInferredEdge method                                                  ││
+│ │     ACCEPTANCE: Interface compiles, existing DB adapters can implement           ││
+│ │                                                                                  ││
+│ │ PHASE 2 (2 parallel, depends on Phase 1):                                        ││
+│ │   SNE.5 Stratification algorithm                                                 ││
+│ │     CREATE: core/knowledge/relations/semi_naive.go                               ││
+│ │     - StratifiedSemiNaive struct with rules, strata, allFacts                    ││
+│ │     - computeStrata() using Kahn's algorithm (iterative topological sort)        ││
+│ │     - ruleProduces(a, b *InferenceRule) bool                                     ││
+│ │     ACCEPTANCE: Rules correctly ordered by dependency, cycles in single stratum  ││
+│ │                                                                                  ││
+│ │   SNE.6 Unit tests for stratification                                            ││
+│ │     CREATE: core/knowledge/relations/semi_naive_test.go                          ││
+│ │     - Test linear dependency chain                                               ││
+│ │     - Test independent rules (same stratum)                                      ││
+│ │     - Test cyclic dependencies (grouped)                                         ││
+│ │     ACCEPTANCE: All stratification tests pass                                    ││
+│ │                                                                                  ││
+│ │ PHASE 3 (2 parallel, depends on Phase 2):                                        ││
+│ │   SNE.7 applyRuleSemiNaive for transitive rules                                  ││
+│ │     MODIFY: core/knowledge/relations/semi_naive.go                               ││
+│ │     - Special case: (Δ × All) ∪ (All × Δ) for transitive rules                   ││
+│ │     - GetEdgesFrom/GetEdgesTo for efficient join                                 ││
+│ │     ACCEPTANCE: Transitive closure computed correctly                            ││
+│ │                                                                                  ││
+│ │   SNE.8 applyGeneralRuleSemiNaive for non-transitive rules                       ││
+│ │     MODIFY: core/knowledge/relations/semi_naive.go                               ││
+│ │     - For each condition position, try binding to delta facts                    ││
+│ │     - Use IterativeBindingResolver for remaining conditions                      ││
+│ │     ACCEPTANCE: General rules produce correct derivations                        ││
+│ │                                                                                  ││
+│ │ PHASE 4 (2 parallel, depends on Phase 3):                                        ││
+│ │   SNE.9 evaluateStratum implementation                                           ││
+│ │     MODIFY: core/knowledge/relations/semi_naive.go                               ││
+│ │     - Initialize delta with base facts                                           ││
+│ │     - Fixed-point iteration: nextDelta from applyRuleSemiNaive                   ││
+│ │     - Persist new facts to database                                              ││
+│ │     ACCEPTANCE: Stratum reaches fixed point, no infinite loops                   ││
+│ │                                                                                  ││
+│ │   SNE.10 Evaluate top-level implementation                                       ││
+│ │     MODIFY: core/knowledge/relations/semi_naive.go                               ││
+│ │     - Call computeStrata()                                                       ││
+│ │     - Process strata in order via evaluateStratum                                ││
+│ │     ACCEPTANCE: Full evaluation produces correct transitive closure              ││
+│ │                                                                                  ││
+│ │ PHASE 5 (2 parallel, depends on Phase 4):                                        ││
+│ │   SNE.11 Performance benchmarks                                                  ││
+│ │     CREATE: core/knowledge/relations/semi_naive_bench_test.go                    ││
+│ │     - Benchmark vs naive evaluation on 10K, 50K, 100K edges                      ││
+│ │     - Measure derivation count per iteration (should decrease)                   ││
+│ │     ACCEPTANCE: Semi-naive 10x faster than naive on 10K+ edges                   ││
+│ │                                                                                  ││
+│ │   SNE.12 Integration with IterativeInferenceEngine                               ││
+│ │     MODIFY: core/knowledge/relations/inference_engine.go                         ││
+│ │     - Replace naive forward chaining with StratifiedSemiNaive                    ││
+│ │     - Update Materialize() to use new evaluation                                 ││
+│ │     ACCEPTANCE: Existing tests pass, performance improved                        ││
+│ │                                                                                  ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │   SNE.1 ──┐                                                                      ││
+│ │   SNE.2 ──┼──► SNE.5 ──► SNE.7 ──┐                                               ││
+│ │   SNE.3 ──┤    SNE.6     SNE.8 ──┼──► SNE.9  ──► SNE.11                          ││
+│ │   SNE.4 ──┘                      │    SNE.10 ──► SNE.12                          ││
+│ │                                                                                  ││
+│ │ FILES CREATED: core/knowledge/relations/semi_naive.go                            ││
+│ │                core/knowledge/relations/semi_naive_test.go                       ││
+│ │                core/knowledge/relations/semi_naive_bench_test.go                 ││
+│ │ FILES MODIFIED: core/knowledge/relations/inference.go                            ││
+│ │                 core/knowledge/relations/inference_engine.go                     ││
+│ │                                                                                  ││
+│ │ REFERENCES: GRAPH.md "Stratified Semi-Naive Evaluation"                          ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AC: Product Quantization for HNSW (PQ.1-PQ.14)                  ││
+│ │                                                                                  ││
+│ │ PURPOSE: Reduce vector memory from 3,072 bytes to 96 bytes per vector (32x)     ││
+│ │          using Product Quantization with asymmetric distance computation.        ││
+│ │                                                                                  ││
+│ │ PHASE 1 (4 parallel):                                                            ││
+│ │   PQ.1 Constants and PQCode type                                                 ││
+│ │     CREATE: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - NumSubspaces=96, SubspaceDim=8, NumCentroids=256                           ││
+│ │     - FullVectorDim=768, CompressedSize=96                                       ││
+│ │     - PQCode [NumSubspaces]uint8 type                                            ││
+│ │     ACCEPTANCE: Constants correct, PQCode is 96 bytes                            ││
+│ │                                                                                  ││
+│ │   PQ.2 ProductQuantizer struct                                                   ││
+│ │     CREATE: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - centroids [NumSubspaces][NumCentroids][SubspaceDim]float32                 ││
+│ │     - trained bool flag                                                          ││
+│ │     - NewProductQuantizer() constructor                                          ││
+│ │     ACCEPTANCE: Struct compiles, centroids array correct size                    ││
+│ │                                                                                  ││
+│ │   PQ.3 subspaceDistance helper                                                   ││
+│ │     CREATE: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - Compute squared Euclidean distance for 8-dim subvectors                    ││
+│ │     ACCEPTANCE: Correct distance for test vectors                                ││
+│ │                                                                                  ││
+│ │   PQ.4 DistanceTable type                                                        ││
+│ │     CREATE: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - [NumSubspaces][NumCentroids]float32 for precomputed distances              ││
+│ │     ACCEPTANCE: Type compiles, correct size (96 * 256 * 4 bytes)                 ││
+│ │                                                                                  ││
+│ │ PHASE 2 (3 parallel, depends on Phase 1):                                        ││
+│ │   PQ.5 K-means++ initialization                                                  ││
+│ │     MODIFY: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - Random first centroid selection                                            ││
+│ │     - Distance-weighted probability for remaining centroids                      ││
+│ │     ACCEPTANCE: Centroids well-distributed (visual inspection on test data)      ││
+│ │                                                                                  ││
+│ │   PQ.6 trainSubspace implementation                                              ││
+│ │     MODIFY: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - K-means iterations: assignment step, update step                           ││
+│ │     - Handle edge case: fewer vectors than centroids                             ││
+│ │     ACCEPTANCE: Centroids converge, distortion decreases                         ││
+│ │                                                                                  ││
+│ │   PQ.7 Train top-level implementation                                            ││
+│ │     MODIFY: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - Extract subvectors for each subspace                                       ││
+│ │     - Call trainSubspace for all 96 subspaces                                    ││
+│ │     - Set trained=true                                                           ││
+│ │     ACCEPTANCE: Training completes in <60s for 100K vectors                      ││
+│ │                                                                                  ││
+│ │ PHASE 3 (3 parallel, depends on Phase 2):                                        ││
+│ │   PQ.8 Encode implementation                                                     ││
+│ │     MODIFY: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - Find nearest centroid for each subspace                                    ││
+│ │     - Return PQCode with 96 centroid indices                                     ││
+│ │     ACCEPTANCE: Encode returns 96-byte code, deterministic for same input        ││
+│ │                                                                                  ││
+│ │   PQ.9 ComputeDistanceTable implementation                                       ││
+│ │     MODIFY: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - Precompute distance from query subvector to all centroids                  ││
+│ │     - O(96 * 256) = O(24,576) operations per query                               ││
+│ │     ACCEPTANCE: Table computed correctly, O(24K) operations measured             ││
+│ │                                                                                  ││
+│ │   PQ.10 AsymmetricDistance implementation                                        ││
+│ │     MODIFY: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - Sum distances from precomputed table: Σ table[i][code[i]]                  ││
+│ │     - O(96) operations per distance computation                                  ││
+│ │     ACCEPTANCE: Distance approximates true Euclidean within 10% error            ││
+│ │                                                                                  ││
+│ │ PHASE 4 (2 parallel, depends on Phase 3):                                        ││
+│ │   PQ.11 Serialization (PQCode and Centroids)                                     ││
+│ │     MODIFY: core/vectorgraphdb/quantization/product_quantizer.go                 ││
+│ │     - PQCode.Serialize() []byte, DeserializePQCode([]byte) PQCode                ││
+│ │     - SerializeCentroids() []byte (786,432 bytes)                                ││
+│ │     - DeserializeCentroids([]byte)                                               ││
+│ │     ACCEPTANCE: Round-trip preserves all values exactly                          ││
+│ │                                                                                  ││
+│ │   PQ.12 Unit tests for ProductQuantizer                                          ││
+│ │     CREATE: core/vectorgraphdb/quantization/product_quantizer_test.go            ││
+│ │     - Test training convergence                                                  ││
+│ │     - Test encode/decode round-trip                                              ││
+│ │     - Test distance approximation quality                                        ││
+│ │     ACCEPTANCE: All tests pass, recall@10 >= 95%                                 ││
+│ │                                                                                  ││
+│ │ PHASE 5 (2 parallel, depends on Phase 4):                                        ││
+│ │   PQ.13 QuantizedHNSW implementation                                             ││
+│ │     CREATE: core/vectorgraphdb/hnsw/quantized_hnsw.go                            ││
+│ │     - Store PQ codes instead of full vectors                                     ││
+│ │     - Search uses ComputeDistanceTable + AsymmetricDistance                      ││
+│ │     - Optional: full vectors in top layer for re-ranking                         ││
+│ │     ACCEPTANCE: Search returns correct neighbors, memory reduced 32x             ││
+│ │                                                                                  ││
+│ │   PQ.14 Integration with VectorGraphDB                                           ││
+│ │     MODIFY: core/vectorgraphdb/vectorgraphdb.go                                  ││
+│ │     - Add QuantizedHNSW as alternative index type                                ││
+│ │     - Configuration flag for quantization on/off                                 ││
+│ │     - Migration path from full vectors to PQ codes                               ││
+│ │     ACCEPTANCE: Existing tests pass, memory usage matches theoretical            ││
+│ │                                                                                  ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │   PQ.1 ──┐                                                                       ││
+│ │   PQ.2 ──┼──► PQ.5 ──┐                                                           ││
+│ │   PQ.3 ──┤    PQ.6 ──┼──► PQ.8  ──┐                                              ││
+│ │   PQ.4 ──┘    PQ.7 ──┘    PQ.9  ──┼──► PQ.11 ──► PQ.13                           ││
+│ │                           PQ.10 ──┘    PQ.12 ──► PQ.14                           ││
+│ │                                                                                  ││
+│ │ FILES CREATED: core/vectorgraphdb/quantization/product_quantizer.go              ││
+│ │                core/vectorgraphdb/quantization/product_quantizer_test.go         ││
+│ │                core/vectorgraphdb/hnsw/quantized_hnsw.go                         ││
+│ │ FILES MODIFIED: core/vectorgraphdb/vectorgraphdb.go                              ││
+│ │                                                                                  ││
+│ │ REFERENCES: GRAPH.md "Product Quantization for HNSW"                             ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AD: MVCC Version Chains (MVCC.1-MVCC.12)                        ││
+│ │                                                                                  ││
+│ │ PURPOSE: Replace RWMutex locking with MVCC for lock-free reads and better       ││
+│ │          write concurrency. Readers never block writers, writers never block    ││
+│ │          readers.                                                                ││
+│ │                                                                                  ││
+│ │ PHASE 1 (4 parallel):                                                            ││
+│ │   MVCC.1 Version struct                                                          ││
+│ │     CREATE: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - txnID uint64, timestamp time.Time, data interface{}                        ││
+│ │     - next *Version (linked list), deleted bool (tombstone)                      ││
+│ │     ACCEPTANCE: Type compiles, fields accessible                                 ││
+│ │                                                                                  ││
+│ │   MVCC.2 VersionChain struct                                                     ││
+│ │     CREATE: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - head unsafe.Pointer (*Version)                                             ││
+│ │     - NewVersionChain(txnID, data) constructor                                   ││
+│ │     ACCEPTANCE: Chain created with single version, head points to it             ││
+│ │                                                                                  ││
+│ │   MVCC.3 Transaction struct                                                      ││
+│ │     CREATE: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - id uint64, startTime time.Time, store *MVCCStore                           ││
+│ │     - writes map[string]interface{}, deletes map[string]struct{}                 ││
+│ │     ACCEPTANCE: Type compiles, buffered writes/deletes tracked                   ││
+│ │                                                                                  ││
+│ │   MVCC.4 MVCCStore struct skeleton                                               ││
+│ │     CREATE: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - chains sync.Map (key -> *VersionChain)                                     ││
+│ │     - txnIDGen atomic.Uint64, minActive atomic.Uint64                            ││
+│ │     - NewMVCCStore() constructor                                                 ││
+│ │     ACCEPTANCE: Store created, transaction IDs increment correctly               ││
+│ │                                                                                  ││
+│ │ PHASE 2 (3 parallel, depends on Phase 1):                                        ││
+│ │   MVCC.5 VersionChain.Read (visibility check)                                    ││
+│ │     MODIFY: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - Traverse chain from newest to oldest                                       ││
+│ │     - Return version visible to transaction (timestamp/txnID check)              ││
+│ │     - Handle tombstones (deleted=true returns not found)                         ││
+│ │     ACCEPTANCE: Correct visibility for committed and own-txn versions            ││
+│ │                                                                                  ││
+│ │   MVCC.6 VersionChain.Write (CAS prepend)                                        ││
+│ │     MODIFY: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - Create new Version with txnID, timestamp, data                             ││
+│ │     - CAS loop to atomically prepend to chain                                    ││
+│ │     ACCEPTANCE: Concurrent writes don't lose data, all succeed                   ││
+│ │                                                                                  ││
+│ │   MVCC.7 VersionChain.Delete (tombstone)                                         ││
+│ │     MODIFY: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - Create tombstone Version (deleted=true)                                    ││
+│ │     - CAS loop to prepend tombstone                                              ││
+│ │     ACCEPTANCE: Deleted records invisible to subsequent reads                    ││
+│ │                                                                                  ││
+│ │ PHASE 3 (3 parallel, depends on Phase 2):                                        ││
+│ │   MVCC.8 Transaction.Get, Put, Delete                                            ││
+│ │     MODIFY: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - Get: check local writes first, then chain.Read                             ││
+│ │     - Put: buffer in writes map, remove from deletes                             ││
+│ │     - Delete: buffer in deletes map, remove from writes                          ││
+│ │     ACCEPTANCE: Reads see own writes, deletes shadow prior writes                ││
+│ │                                                                                  ││
+│ │   MVCC.9 Transaction.Commit                                                      ││
+│ │     MODIFY: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - Apply all buffered writes to chains                                        ││
+│ │     - Apply all buffered deletes as tombstones                                   ││
+│ │     - Clear buffers                                                              ││
+│ │     ACCEPTANCE: Committed changes visible to subsequent transactions             ││
+│ │                                                                                  ││
+│ │   MVCC.10 Transaction.Rollback                                                   ││
+│ │     MODIFY: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - Discard buffered writes and deletes                                        ││
+│ │     ACCEPTANCE: Rolled-back changes not visible anywhere                         ││
+│ │                                                                                  ││
+│ │ PHASE 4 (2 parallel, depends on Phase 3):                                        ││
+│ │   MVCC.11 Garbage collection                                                     ││
+│ │     MODIFY: core/vectorgraphdb/mvcc/version_chain.go                             ││
+│ │     - gcLoop: periodic cleanup ticker                                            ││
+│ │     - gcChain: remove versions older than all active transactions                ││
+│ │     - Keep one "base" version for each chain                                     ││
+│ │     ACCEPTANCE: Old versions cleaned up, no memory leaks under load              ││
+│ │                                                                                  ││
+│ │   MVCC.12 Integration tests                                                      ││
+│ │     CREATE: core/vectorgraphdb/mvcc/version_chain_test.go                        ││
+│ │     - Concurrent read/write test (readers never blocked)                         ││
+│ │     - Snapshot isolation test (read sees start-time state)                       ││
+│ │     - GC correctness test (no premature cleanup)                                 ││
+│ │     ACCEPTANCE: All tests pass, no race detector warnings                        ││
+│ │                                                                                  ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │   MVCC.1 ──┐                                                                     ││
+│ │   MVCC.2 ──┼──► MVCC.5 ──┐                                                       ││
+│ │   MVCC.3 ──┤    MVCC.6 ──┼──► MVCC.8  ──┐                                        ││
+│ │   MVCC.4 ──┘    MVCC.7 ──┘    MVCC.9  ──┼──► MVCC.11                             ││
+│ │                               MVCC.10 ──┘    MVCC.12                             ││
+│ │                                                                                  ││
+│ │ FILES CREATED: core/vectorgraphdb/mvcc/version_chain.go                          ││
+│ │                core/vectorgraphdb/mvcc/version_chain_test.go                     ││
+│ │                                                                                  ││
+│ │ REFERENCES: GRAPH.md "MVCC Version Chains"                                       ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AE: TC Checkpointing - WAL-Based (TCP.1-TCP.10)                 ││
+│ │                                                                                  ││
+│ │ PURPOSE: Enable resumable transitive closure computation via WAL-based          ││
+│ │          checkpointing. Crash recovery resumes from last stratum/delta.          ││
+│ │                                                                                  ││
+│ │ PHASE 1 (4 parallel):                                                            ││
+│ │   TCP.1 EntryType constants                                                      ││
+│ │     CREATE: core/knowledge/relations/checkpointer.go                             ││
+│ │     - EntryTypeNewFact, EntryTypeDeltaComplete                                   ││
+│ │     - EntryTypeStratumComplete, EntryTypeComputationComplete                     ││
+│ │     - EntryTypeWorklist                                                          ││
+│ │     ACCEPTANCE: Constants defined, iota-based                                    ││
+│ │                                                                                  ││
+│ │   TCP.2 CheckpointEntry struct                                                   ││
+│ │     CREATE: core/knowledge/relations/checkpointer.go                             ││
+│ │     - Type EntryType, Timestamp time.Time, Data json.RawMessage                  ││
+│ │     - JSON serializable                                                          ││
+│ │     ACCEPTANCE: Entry serializes/deserializes correctly                          ││
+│ │                                                                                  ││
+│ │   TCP.3 ComputationState struct                                                  ││
+│ │     CREATE: core/knowledge/relations/checkpointer.go                             ││
+│ │     - Stratum int, Delta int, Facts map[EdgeKey]struct{}                         ││
+│ │     - Worklist []EdgeKey                                                         ││
+│ │     ACCEPTANCE: State captures resumable computation position                    ││
+│ │                                                                                  ││
+│ │   TCP.4 TCCheckpointer struct skeleton                                           ││
+│ │     CREATE: core/knowledge/relations/checkpointer.go                             ││
+│ │     - walPath string, walFile *os.File, walWriter *bufio.Writer                  ││
+│ │     - mu sync.Mutex for write serialization                                      ││
+│ │     - NewTCCheckpointer(dir) constructor                                         ││
+│ │     ACCEPTANCE: Checkpointer created, WAL path set correctly                     ││
+│ │                                                                                  ││
+│ │ PHASE 2 (2 parallel, depends on Phase 1):                                        ││
+│ │   TCP.5 writeEntry implementation                                                ││
+│ │     MODIFY: core/knowledge/relations/checkpointer.go                             ││
+│ │     - JSON marshal entry                                                         ││
+│ │     - Length-prefix (uint32 little-endian)                                       ││
+│ │     - Write to buffered writer                                                   ││
+│ │     ACCEPTANCE: Entries written with correct length prefix                       ││
+│ │                                                                                  ││
+│ │   TCP.6 Log methods (NewFact, DeltaComplete, StratumComplete, etc.)              ││
+│ │     MODIFY: core/knowledge/relations/checkpointer.go                             ││
+│ │     - LogNewFact(edge EdgeKey)                                                   ││
+│ │     - LogDeltaComplete(delta int)                                                ││
+│ │     - LogStratumComplete(stratum int)                                            ││
+│ │     - LogWorklist(worklist []EdgeKey)                                            ││
+│ │     - LogComputationComplete() - also removes WAL file                           ││
+│ │     ACCEPTANCE: Each log method writes correct entry type                        ││
+│ │                                                                                  ││
+│ │ PHASE 3 (2 parallel, depends on Phase 2):                                        ││
+│ │   TCP.7 recover implementation                                                   ││
+│ │     MODIFY: core/knowledge/relations/checkpointer.go                             ││
+│ │     - Read WAL file entry by entry                                               ││
+│ │     - Reconstruct ComputationState from entries                                  ││
+│ │     - Handle truncated entries gracefully (partial write on crash)               ││
+│ │     ACCEPTANCE: Recovery restores correct stratum/delta/facts                    ││
+│ │                                                                                  ││
+│ │   TCP.8 StartComputation implementation                                          ││
+│ │     MODIFY: core/knowledge/relations/checkpointer.go                             ││
+│ │     - Check for existing WAL (recovery case)                                     ││
+│ │     - If exists: recover and return restored state                               ││
+│ │     - If not: create fresh WAL and return empty state                            ││
+│ │     ACCEPTANCE: Fresh start vs recovery correctly distinguished                  ││
+│ │                                                                                  ││
+│ │ PHASE 4 (2 parallel, depends on Phase 3):                                        ││
+│ │   TCP.9 Flush and Close implementations                                          ││
+│ │     MODIFY: core/knowledge/relations/checkpointer.go                             ││
+│ │     - Flush(): walWriter.Flush() + walFile.Sync()                                ││
+│ │     - Close(): flush + close file                                                ││
+│ │     ACCEPTANCE: Flush ensures durability, Close cleans up resources              ││
+│ │                                                                                  ││
+│ │   TCP.10 Integration with StratifiedSemiNaive                                    ││
+│ │     MODIFY: core/knowledge/relations/semi_naive.go                               ││
+│ │     - EvaluateWithCheckpointing(ctx, cp *TCCheckpointer)                         ││
+│ │     - Log facts, checkpoint deltas/strata periodically                           ││
+│ │     - Resume from checkpoint state                                               ││
+│ │     ACCEPTANCE: Simulated crash + restart produces correct result                ││
+│ │                                                                                  ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │   TCP.1 ──┐                                                                      ││
+│ │   TCP.2 ──┼──► TCP.5 ──► TCP.7 ──► TCP.9                                         ││
+│ │   TCP.3 ──┤    TCP.6 ──► TCP.8 ──► TCP.10                                        ││
+│ │   TCP.4 ──┘                                                                      ││
+│ │                                                                                  ││
+│ │ FILES CREATED: core/knowledge/relations/checkpointer.go                          ││
+│ │                core/knowledge/relations/checkpointer_test.go                     ││
+│ │ FILES MODIFIED: core/knowledge/relations/semi_naive.go                           ││
+│ │                                                                                  ││
+│ │ REFERENCES: GRAPH.md "TC Checkpointing (WAL-Based)"                              ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AF: Wave 4 Critical Bug Fixes                                    ││
+│ │ ** FROM FIX.md "Wave 4 Implementation Analysis - Critical Fixes" **              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 1: CRITICAL FIXES (Must fix immediately - data corruption/crashes)         ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W4C.1 - Unbounded Candidates Growth in HNSW Search                               ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go                                          ││
+│ │   ISSUE: searchLayer() grows candidates without bound → O(n²) → memory exhaustion││
+│ │   FIX: Add maxCandidates = ef * 2 bound, break when limit reached                ││
+│ │   ACCEPTANCE: Search completes in bounded time regardless of graph size          ││
+│ │                                                                                  ││
+│ │ W4C.2 - Filter Logic Bug - MinSimilarity Never Applied                           ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go                                          ││
+│ │   ISSUE: matchesFilter() checks MinSimilarity > 0 but returns true unconditionally││
+│ │   FIX: Add actual comparison: similarity < filter.MinSimilarity → return false   ││
+│ │   ACCEPTANCE: Queries with MinSimilarity filter return only matching results     ││
+│ │                                                                                  ││
+│ │ W4C.3 - Persistent Conditional State Bug in Call Graph                           ││
+│ │   FILE: core/knowledge/relations/call_graph.go                                   ││
+│ │   ISSUE: isConditional flag persists across function boundaries                  ││
+│ │   FIX: Reset isConditional in walkFunction() before walking body                 ││
+│ │   ACCEPTANCE: Call graph correctly identifies conditional vs unconditional calls ││
+│ │                                                                                  ││
+│ │ W4C.4 - Race Condition in AsyncRetrievalFeedbackHook                             ││
+│ │   FILE: core/chunking/retrieval_feedback.go                                      ││
+│ │   ISSUE: Concurrent goroutine writes to shared queryMetrics map without locks    ││
+│ │   FIX: Add sync.RWMutex to protect map access                                    ││
+│ │   ACCEPTANCE: Concurrent feedback collection doesn't cause panics                ││
+│ │                                                                                  ││
+│ │ W4C.5 - Race Condition in Bleve HybridSearch                                     ││
+│ │   FILE: core/vectorgraphdb/bleve_db.go                                           ││
+│ │   ISSUE: Concurrent goroutines write to shared results slice                     ││
+│ │   FIX: Use channels or mutex to aggregate results safely                         ││
+│ │   ACCEPTANCE: Concurrent hybrid searches don't corrupt results                   ││
+│ │                                                                                  ││
+│ │ W4C.6 - Map Modification During Iteration                                        ││
+│ │   FILE: core/handoff/prepared_context.go                                         ││
+│ │   ISSUE: delete() called on map while iterating over it                          ││
+│ │   FIX: Collect keys to delete first, then delete in separate loop                ││
+│ │   ACCEPTANCE: Context cleanup doesn't cause runtime panics                       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 2: HIGH SEVERITY FIXES (Should fix soon - memory leaks/deadlocks)          ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W4H.1 - Version Cache Never Evicted                                              ││
+│ │   FILE: core/vectorgraphdb/versioned_nodes.go                                    ││
+│ │   ISSUE: versionCache map grows indefinitely, no eviction policy                 ││
+│ │   FIX: Implement LRU eviction with configurable maxSize (default 10000)          ││
+│ │   ACCEPTANCE: Memory usage bounded under sustained write load                    ││
+│ │                                                                                  ││
+│ │ W4H.2 - Nested Lock Acquisition Causes Deadlock                                  ││
+│ │   FILE: core/handoff/prepared_context.go                                         ││
+│ │   ISSUE: GetToolContext() calls method that tries to acquire same lock           ││
+│ │   FIX: Use RLock for read path or refactor to avoid nested locking               ││
+│ │   ACCEPTANCE: No deadlocks under concurrent tool context access                  ││
+│ │                                                                                  ││
+│ │ W4H.3 - Event Cache Unbounded Growth                                             ││
+│ │   FILE: agents/archivalist/bleve_index.go                                        ││
+│ │   ISSUE: eventCache map grows without limit, no eviction                         ││
+│ │   FIX: Add LRU eviction or time-based expiry                                     ││
+│ │   ACCEPTANCE: Memory bounded under high event throughput                         ││
+│ │                                                                                  ││
+│ │ W4H.4 - Double Close of Channel                                                  ││
+│ │   FILE: core/handoff/manager.go                                                  ││
+│ │   ISSUE: done channel can be closed twice causing panic                          ││
+│ │   FIX: Use sync.Once to ensure single close                                      ││
+│ │   ACCEPTANCE: Graceful shutdown doesn't panic                                    ││
+│ │                                                                                  ││
+│ │ W4H.5 - Missing Bounds Checks on Map Access                                      ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go                                          ││
+│ │   ISSUE: neighbors[level] accessed without checking level exists                 ││
+│ │   FIX: Add bounds checking before map/slice access                               ││
+│ │   ACCEPTANCE: No index out of bounds panics                                      ││
+│ │                                                                                  ││
+│ │ W4H.6 - O(n³) Substring Search Algorithm                                         ││
+│ │   FILE: core/chunking/citation_detector.go                                       ││
+│ │   ISSUE: Nested loops create O(n³) complexity for citation detection             ││
+│ │   FIX: Replace with rolling hash or KMP algorithm (O(n))                         ││
+│ │   ACCEPTANCE: Citation detection scales linearly with input size                 ││
+│ │                                                                                  ││
+│ │ W4H.7 - WAL Manager TOCTOU Race                                                  ││
+│ │   FILE: core/session/wal_manager.go                                              ││
+│ │   ISSUE: File existence check then open creates race condition                   ││
+│ │   FIX: Use atomic file operations (O_CREATE|O_EXCL or rename)                    ││
+│ │   ACCEPTANCE: Concurrent WAL operations don't corrupt files                      ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 3: MEDIUM SEVERITY FIXES (38 issues - performance/correctness)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W4M.1-W4M.10 - VectorGraphDB Performance                                         ││
+│ │   FILES: core/vectorgraphdb/hnsw/*.go, core/vectorgraphdb/*.go                   ││
+│ │   ISSUES: Lock contention, inefficient neighbor management, memory pooling       ││
+│ │                                                                                  ││
+│ │ W4M.11-W4M.20 - Knowledge Relations Correctness                                  ││
+│ │   FILES: core/knowledge/relations/*.go                                           ││
+│ │   ISSUES: Scope tracking, error propagation, memory allocation patterns          ││
+│ │                                                                                  ││
+│ │ W4M.21-W4M.30 - Handoff System Robustness                                        ││
+│ │   FILES: core/handoff/*.go                                                       ││
+│ │   ISSUES: Context size estimation, rollback handling, state consistency          ││
+│ │                                                                                  ││
+│ │ W4M.31-W4M.38 - Chunking Pipeline Accuracy                                       ││
+│ │   FILES: core/chunking/*.go                                                      ││
+│ │   ISSUES: Feedback aggregation, citation matching, boundary detection            ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PHASE 4: LOW SEVERITY FIXES (24 issues - style/minor optimizations)              ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ W4L.1-W4L.24 - Code Quality Improvements                                         ││
+│ │   ISSUES: Error message clarity, logging consistency, documentation updates      ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │                                                                                  ││
+│ │   W4C.1 ─┬─► W4H.5 ─┬─► W4M.1-10                                                 ││
+│ │   W4C.2 ─┤          │                                                            ││
+│ │          │          ├─► W4M.11-20                                                ││
+│ │   W4C.3 ─┼─► W4H.1 ─┤                                                            ││
+│ │   W4C.4 ─┤          ├─► W4M.21-30                                                ││
+│ │   W4C.5 ─┤          │                                                            ││
+│ │   W4C.6 ─┘          └─► W4M.31-38 ─► W4L.1-24                                    ││
+│ │                                                                                  ││
+│ │   W4H.2 ──► W4H.4 ──► W4H.7 (independent chain)                                  ││
+│ │   W4H.3 ──► W4H.6 (independent chain)                                            ││
+│ │                                                                                  ││
+│ │ TOTAL: 90 issues (6 critical, 7 high, 38 medium, 24 low, 15 info)                ││
+│ │ REFERENCES: FIX.md "Wave 4 Implementation Analysis - Critical Fixes"             ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 180-200 parallel engineer pipelines (increased for new groups) │
+│ DEPENDENCIES: Wave 3 complete, Groups 4E, 4G, 4K, 4L-4Z complete                   │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```

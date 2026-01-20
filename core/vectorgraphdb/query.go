@@ -27,14 +27,25 @@ type HybridQueryOptions struct {
 
 // QueryEngine provides hybrid vector + graph queries.
 type QueryEngine struct {
-	vs *VectorSearcher
-	gt *GraphTraverser
-	db *VectorGraphDB
+	vs        *VectorSearcher
+	gt        *GraphTraverser
+	db        *VectorGraphDB
+	nodeStore *NodeStore // Cached instance for reuse
 }
 
 // NewQueryEngine creates a new QueryEngine.
 func NewQueryEngine(db *VectorGraphDB, vs *VectorSearcher, gt *GraphTraverser) *QueryEngine {
-	return &QueryEngine{vs: vs, gt: gt, db: db}
+	return &QueryEngine{
+		vs:        vs,
+		gt:        gt,
+		db:        db,
+		nodeStore: NewNodeStore(db, nil), // Create once and reuse
+	}
+}
+
+// getNodeStore returns the cached NodeStore instance.
+func (qe *QueryEngine) getNodeStore() *NodeStore {
+	return qe.nodeStore
 }
 
 // HybridQuery combines vector similarity with graph connectivity.
@@ -156,18 +167,60 @@ func (qe *QueryEngine) maxConnections(graphCounts map[string]int) int {
 
 func (qe *QueryEngine) scoreResults(allIDs map[string]bool, vectorScores map[string]float64, graphCounts map[string]int, maxConn int, opts *HybridQueryOptions) []HybridResult {
 	results := make([]HybridResult, 0, len(allIDs))
-	ns := NewNodeStore(qe.db, nil)
+	ns := qe.getNodeStore()
 
+	// Collect all IDs for batch loading
+	ids := make([]string, 0, len(allIDs))
 	for id := range allIDs {
-		result := qe.scoreNode(id, vectorScores, graphCounts, maxConn, opts, ns)
-		if result != nil {
-			results = append(results, *result)
+		ids = append(ids, id)
+	}
+
+	// Batch load all nodes at once to eliminate N+1 query pattern
+	loader := NewBatchLoader(func(batchIDs []string) (map[string]*GraphNode, error) {
+		return ns.GetNodesBatch(batchIDs)
+	}, DefaultBatchLoaderConfig())
+
+	nodes, err := loader.LoadBatch(ids)
+	if err != nil {
+		// Fallback to individual loads on batch failure
+		for id := range allIDs {
+			result := qe.scoreNodeFallback(id, vectorScores, graphCounts, maxConn, opts, ns)
+			if result != nil {
+				results = append(results, *result)
+			}
 		}
+		return results
+	}
+
+	// Score with pre-loaded nodes
+	for id := range allIDs {
+		node := nodes[id]
+		if node == nil {
+			continue
+		}
+		result := qe.scoreNodeWithData(id, node, vectorScores, graphCounts, maxConn, opts)
+		results = append(results, result)
 	}
 	return results
 }
 
-func (qe *QueryEngine) scoreNode(id string, vectorScores map[string]float64, graphCounts map[string]int, maxConn int, opts *HybridQueryOptions, ns *NodeStore) *HybridResult {
+// scoreNodeWithData scores a node using pre-loaded node data.
+func (qe *QueryEngine) scoreNodeWithData(id string, node *GraphNode, vectorScores map[string]float64, graphCounts map[string]int, maxConn int, opts *HybridQueryOptions) HybridResult {
+	vecScore := vectorScores[id]
+	graphScore := float64(graphCounts[id]) / float64(maxConn)
+	combined := (vecScore * opts.VectorWeight) + (graphScore * opts.GraphWeight)
+
+	return HybridResult{
+		Node:            node,
+		VectorScore:     vecScore,
+		GraphScore:      graphScore,
+		CombinedScore:   combined,
+		ConnectionCount: graphCounts[id],
+	}
+}
+
+// scoreNodeFallback loads and scores a single node (used when batch loading fails).
+func (qe *QueryEngine) scoreNodeFallback(id string, vectorScores map[string]float64, graphCounts map[string]int, maxConn int, opts *HybridQueryOptions, ns *NodeStore) *HybridResult {
 	node, err := ns.GetNode(id)
 	if err != nil {
 		return nil
@@ -235,7 +288,7 @@ func (qe *QueryEngine) SemanticExpand(seedNodeIDs []string, limit int) ([]Hybrid
 
 // RelatedInDomain finds related nodes within the same domain.
 func (qe *QueryEngine) RelatedInDomain(nodeID string, limit int) ([]HybridResult, error) {
-	ns := NewNodeStore(qe.db, nil)
+	ns := qe.getNodeStore() // Use cached instance
 	node, err := ns.GetNode(nodeID)
 	if err != nil {
 		return nil, err

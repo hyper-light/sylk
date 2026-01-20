@@ -1,6 +1,7 @@
 package concurrency_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
@@ -555,4 +556,124 @@ func TestDefaultWALConfig(t *testing.T) {
 	assert.Equal(t, int64(64*1024*1024), config.MaxSegmentSize)
 	assert.Equal(t, concurrency.SyncBatched, config.SyncMode)
 	assert.Equal(t, 100*time.Millisecond, config.SyncInterval)
+}
+
+func TestWriteAheadLog_ContextCancellation(t *testing.T) {
+	t.Run("periodic sync stops on context cancel", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		dir := t.TempDir()
+		config := concurrency.WALConfig{
+			Dir:            dir,
+			MaxSegmentSize: 1024 * 1024,
+			SyncMode:       concurrency.SyncPeriodic,
+			SyncInterval:   50 * time.Millisecond,
+		}
+
+		wal, err := concurrency.NewWriteAheadLogWithContext(ctx, config)
+		require.NoError(t, err)
+
+		// Append an entry
+		_, err = wal.Append(&concurrency.WALEntry{
+			Type:    concurrency.EntryStateChange,
+			Payload: []byte("test"),
+		})
+		require.NoError(t, err)
+
+		// Cancel context - this should trigger the periodic sync to stop
+		cancel()
+
+		// Give the goroutine time to respond to cancellation
+		time.Sleep(100 * time.Millisecond)
+
+		// Close should still work
+		err = wal.Close()
+		require.NoError(t, err)
+
+		// Verify data was synced
+		wal2, err := concurrency.NewWriteAheadLog(config)
+		require.NoError(t, err)
+		defer wal2.Close()
+
+		all, err := wal2.ReadAll()
+		require.NoError(t, err)
+		assert.Len(t, all, 1)
+	})
+
+	t.Run("batched sync works with context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		dir := t.TempDir()
+		config := concurrency.WALConfig{
+			Dir:            dir,
+			MaxSegmentSize: 1024 * 1024,
+			SyncMode:       concurrency.SyncBatched,
+			SyncInterval:   50 * time.Millisecond,
+		}
+
+		wal, err := concurrency.NewWriteAheadLogWithContext(ctx, config)
+		require.NoError(t, err)
+
+		// Append multiple entries
+		for i := 0; i < 5; i++ {
+			_, err = wal.Append(&concurrency.WALEntry{
+				Type:    concurrency.EntryStateChange,
+				Payload: []byte{byte(i)},
+			})
+			require.NoError(t, err)
+		}
+
+		err = wal.Close()
+		require.NoError(t, err)
+
+		// Verify all data was written
+		wal2, err := concurrency.NewWriteAheadLog(config)
+		require.NoError(t, err)
+		defer wal2.Close()
+
+		all, err := wal2.ReadAll()
+		require.NoError(t, err)
+		assert.Len(t, all, 5)
+	})
+
+	t.Run("context cancellation during operations", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		dir := t.TempDir()
+		config := concurrency.WALConfig{
+			Dir:            dir,
+			MaxSegmentSize: 1024 * 1024,
+			SyncMode:       concurrency.SyncPeriodic,
+			SyncInterval:   10 * time.Millisecond,
+		}
+
+		wal, err := concurrency.NewWriteAheadLogWithContext(ctx, config)
+		require.NoError(t, err)
+
+		// Start concurrent appends
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				_, err := wal.Append(&concurrency.WALEntry{
+					Type:    concurrency.EntryStateChange,
+					Payload: []byte{byte(i)},
+				})
+				if err == concurrency.ErrWALClosed {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+
+		// Cancel after some time
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+
+		// Close should work cleanly
+		err = wal.Close()
+		require.NoError(t, err)
+
+		wg.Wait()
+	})
 }

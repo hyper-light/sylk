@@ -17,6 +17,24 @@ func TestNewUnboundedQueue(t *testing.T) {
 	if q.Len() != 0 {
 		t.Errorf("expected empty queue, got %d", q.Len())
 	}
+	if q.MaxSize() != 10000 {
+		t.Errorf("expected default max size 10000, got %d", q.MaxSize())
+	}
+}
+
+func TestNewBoundedQueue(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      100,
+		RejectPolicy: RejectPolicyError,
+		BlockTimeout: time.Second,
+	}
+	q := NewBoundedQueue(config)
+	if q == nil {
+		t.Fatal("expected non-nil queue")
+	}
+	if q.MaxSize() != 100 {
+		t.Errorf("expected max size 100, got %d", q.MaxSize())
+	}
 }
 
 func TestUnboundedQueue_PushPop(t *testing.T) {
@@ -25,8 +43,12 @@ func TestUnboundedQueue_PushPop(t *testing.T) {
 	req1 := &LLMRequest{ID: "req-1"}
 	req2 := &LLMRequest{ID: "req-2"}
 
-	q.Push(req1)
-	q.Push(req2)
+	if err := q.Push(req1); err != nil {
+		t.Fatalf("unexpected push error: %v", err)
+	}
+	if err := q.Push(req2); err != nil {
+		t.Fatalf("unexpected push error: %v", err)
+	}
 
 	if q.Len() != 2 {
 		t.Errorf("expected 2 items, got %d", q.Len())
@@ -47,8 +69,120 @@ func TestUnboundedQueue_PushPop(t *testing.T) {
 	}
 }
 
-func TestUnboundedQueue_Concurrent(t *testing.T) {
+func TestUnboundedQueue_MaxSize(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      2,
+		RejectPolicy: RejectPolicyError,
+	}
+	q := NewBoundedQueue(config)
+
+	if err := q.Push(&LLMRequest{ID: "1"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := q.Push(&LLMRequest{ID: "2"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err := q.Push(&LLMRequest{ID: "3"})
+	if err != ErrUserQueueFull {
+		t.Errorf("expected ErrUserQueueFull, got %v", err)
+	}
+
+	if !q.IsFull() {
+		t.Error("expected queue to be full")
+	}
+}
+
+func TestUnboundedQueue_DropOldestPolicy(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      2,
+		RejectPolicy: RejectPolicyDropOldest,
+	}
+	q := NewBoundedQueue(config)
+
+	q.Push(&LLMRequest{ID: "1"})
+	q.Push(&LLMRequest{ID: "2"})
+	q.Push(&LLMRequest{ID: "3"}) // Should drop "1"
+
+	if q.Len() != 2 {
+		t.Errorf("expected 2 items, got %d", q.Len())
+	}
+
+	// First item should be "2" since "1" was dropped
+	got := q.Pop()
+	if got.ID != "2" {
+		t.Errorf("expected '2' (oldest dropped), got %s", got.ID)
+	}
+}
+
+func TestUnboundedQueue_BlockPolicy(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      1,
+		RejectPolicy: RejectPolicyBlock,
+		BlockTimeout: 50 * time.Millisecond,
+	}
+	q := NewBoundedQueue(config)
+
+	q.Push(&LLMRequest{ID: "1"})
+
+	// This should block then timeout
+	start := time.Now()
+	err := q.Push(&LLMRequest{ID: "2"})
+	elapsed := time.Since(start)
+
+	if err != ErrUserQueueFull {
+		t.Errorf("expected ErrUserQueueFull after timeout, got %v", err)
+	}
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("expected to block for ~50ms, blocked for %v", elapsed)
+	}
+}
+
+func TestUnboundedQueue_BlockPolicySuccess(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      1,
+		RejectPolicy: RejectPolicyBlock,
+		BlockTimeout: time.Second,
+	}
+	q := NewBoundedQueue(config)
+
+	q.Push(&LLMRequest{ID: "1"})
+
+	// Pop in background to make space
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		q.Pop()
+	}()
+
+	// This should block then succeed
+	start := time.Now()
+	err := q.Push(&LLMRequest{ID: "2"})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("expected success, got %v", err)
+	}
+	if elapsed < 40*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Errorf("expected to block for ~50ms, blocked for %v", elapsed)
+	}
+}
+
+func TestUnboundedQueue_Close(t *testing.T) {
 	q := NewUnboundedQueue()
+	q.Close()
+
+	err := q.Push(&LLMRequest{ID: "1"})
+	if err != ErrGateClosed {
+		t.Errorf("expected ErrGateClosed, got %v", err)
+	}
+}
+
+func TestUnboundedQueue_Concurrent(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      1000, // Large enough for concurrent test
+		RejectPolicy: RejectPolicyError,
+	}
+	q := NewBoundedQueue(config)
 	var wg sync.WaitGroup
 
 	for i := 0; i < 100; i++ {
@@ -376,6 +510,109 @@ func TestDualQueueGate_Close(t *testing.T) {
 	}
 }
 
+func TestDualQueueGate_UserQueueFull(t *testing.T) {
+	blockCh := make(chan struct{})
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			<-blockCh
+			return nil, nil
+		},
+	}
+
+	config := DualQueueGateConfig{
+		MaxUserQueueSize:      2,
+		MaxPipelineQueueSize:  100,
+		MaxConcurrentRequests: 1,
+		UserQueueRejectPolicy: RejectPolicyError,
+	}
+	gate := NewDualQueueGate(config, executor)
+	defer func() {
+		close(blockCh)
+		gate.Close()
+	}()
+
+	// First request will start executing
+	gate.Submit(context.Background(), &LLMRequest{
+		ID:          "user-1",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	})
+
+	// Wait for it to start
+	time.Sleep(20 * time.Millisecond)
+
+	// These two will fill the queue
+	gate.Submit(context.Background(), &LLMRequest{
+		ID:          "user-2",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	})
+	gate.Submit(context.Background(), &LLMRequest{
+		ID:          "user-3",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	})
+
+	// This should fail with queue full
+	err := gate.Submit(context.Background(), &LLMRequest{
+		ID:          "user-4",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	})
+	if err != ErrUserQueueFull {
+		t.Errorf("expected ErrUserQueueFull, got %v", err)
+	}
+}
+
+func TestDualQueueGate_PipelineQueueFull(t *testing.T) {
+	blockCh := make(chan struct{})
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			<-blockCh
+			return nil, nil
+		},
+	}
+
+	config := DualQueueGateConfig{
+		MaxUserQueueSize:      100,
+		MaxPipelineQueueSize:  2,
+		MaxConcurrentRequests: 1,
+	}
+	gate := NewDualQueueGate(config, executor)
+	defer func() {
+		close(blockCh)
+		gate.Close()
+	}()
+
+	// First request will start executing
+	gate.Submit(context.Background(), &LLMRequest{
+		ID:        "pipeline-1",
+		AgentType: AgentTypeEngineer,
+	})
+
+	// Wait for it to start
+	time.Sleep(20 * time.Millisecond)
+
+	// These two will fill the queue
+	gate.Submit(context.Background(), &LLMRequest{
+		ID:        "pipeline-2",
+		AgentType: AgentTypeEngineer,
+	})
+	gate.Submit(context.Background(), &LLMRequest{
+		ID:        "pipeline-3",
+		AgentType: AgentTypeEngineer,
+	})
+
+	// This should fail with queue full
+	err := gate.Submit(context.Background(), &LLMRequest{
+		ID:        "pipeline-4",
+		AgentType: AgentTypeEngineer,
+	})
+	if err != ErrQueueFull {
+		t.Errorf("expected ErrQueueFull, got %v", err)
+	}
+}
+
 func TestDualQueueGate_BudgetCheck(t *testing.T) {
 	executor := &mockExecutor{}
 	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
@@ -551,5 +788,161 @@ func TestIsUserInteractive(t *testing.T) {
 				t.Errorf("expected %v, got %v", tt.expected, got)
 			}
 		})
+	}
+}
+
+func TestNewDualQueueGateWithContext(t *testing.T) {
+	ctx := context.Background()
+	executor := &mockExecutor{}
+	gate := NewDualQueueGateWithContext(ctx, DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	if gate == nil {
+		t.Fatal("expected non-nil gate")
+	}
+	if gate.ctx == nil {
+		t.Error("expected gate to have a context")
+	}
+	if gate.cancel == nil {
+		t.Error("expected gate to have a cancel function")
+	}
+}
+
+func TestDualQueueGate_ContextPropagation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	requestCancelled := atomic.Bool{}
+
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			<-ctx.Done()
+			requestCancelled.Store(true)
+			return nil, ctx.Err()
+		},
+	}
+
+	gate := NewDualQueueGateWithContext(ctx, DefaultDualQueueGateConfig(), executor)
+
+	req := &LLMRequest{
+		ID:          "ctx-test",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	}
+	_ = gate.Submit(context.Background(), req)
+
+	// Wait for request to start executing
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel the parent context
+	cancel()
+
+	// Wait for cancellation to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	if !requestCancelled.Load() {
+		t.Error("expected request to be cancelled when parent context is cancelled")
+	}
+
+	gate.Close()
+}
+
+func TestDualQueueGate_CloseContextCancellation(t *testing.T) {
+	requestCancelled := atomic.Bool{}
+
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			<-ctx.Done()
+			requestCancelled.Store(true)
+			return nil, ctx.Err()
+		},
+	}
+
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+
+	req := &LLMRequest{
+		ID:          "close-test",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	}
+	_ = gate.Submit(context.Background(), req)
+
+	// Wait for request to start executing
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the gate
+	gate.Close()
+
+	// Wait for cancellation to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	if !requestCancelled.Load() {
+		t.Error("expected request to be cancelled when gate is closed")
+	}
+}
+
+func TestDualQueueGate_RequestInheritsGateContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	contextReceived := make(chan context.Context, 1)
+
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			contextReceived <- ctx
+			return "done", nil
+		},
+	}
+
+	gate := NewDualQueueGateWithContext(ctx, DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	req := &LLMRequest{
+		ID:          "inherit-test",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	}
+	_ = gate.Submit(context.Background(), req)
+
+	select {
+	case execCtx := <-contextReceived:
+		// Verify the context chain by cancelling parent and checking child
+		cancel()
+		select {
+		case <-execCtx.Done():
+			// Good - context properly inherited
+		case <-time.After(100 * time.Millisecond):
+			t.Error("execution context did not inherit from gate context")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request not executed in time")
+	}
+}
+
+func TestDualQueueGate_NewRequestContextWithParent(t *testing.T) {
+	executor := &mockExecutor{}
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	// Test with nil parent (should use gate context)
+	ctx1, cancel1 := gate.newRequestContextWithParent(nil)
+	defer cancel1()
+
+	if ctx1 == nil {
+		t.Error("expected non-nil context")
+	}
+
+	// Test with custom parent
+	customCtx, customCancel := context.WithCancel(context.Background())
+	defer customCancel()
+
+	ctx2, cancel2 := gate.newRequestContextWithParent(customCtx)
+	defer cancel2()
+
+	// Cancel custom parent and verify child is also cancelled
+	customCancel()
+	select {
+	case <-ctx2.Done():
+		// Good - context properly inherited from parent
+	case <-time.After(100 * time.Millisecond):
+		t.Error("context did not inherit from provided parent")
 	}
 }

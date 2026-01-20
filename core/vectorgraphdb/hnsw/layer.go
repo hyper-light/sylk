@@ -5,8 +5,10 @@ import (
 	"sync"
 )
 
+// layerNode represents a node in an HNSW layer with its neighbors.
+// Uses ConcurrentNeighborSet for O(1) neighbor lookups instead of O(n) slice scans.
 type layerNode struct {
-	neighbors []string
+	neighbors *ConcurrentNeighborSet
 }
 
 type layer struct {
@@ -24,7 +26,7 @@ func (l *layer) addNode(id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, exists := l.nodes[id]; !exists {
-		l.nodes[id] = &layerNode{neighbors: make([]string, 0)}
+		l.nodes[id] = &layerNode{neighbors: NewConcurrentNeighborSet()}
 	}
 }
 
@@ -43,71 +45,99 @@ func (l *layer) hasNode(id string) bool {
 
 func (l *layer) getNeighbors(id string) []string {
 	l.mu.RLock()
-	defer l.mu.RUnlock()
 	node, exists := l.nodes[id]
+	l.mu.RUnlock()
 	if !exists {
 		return nil
 	}
-	result := make([]string, len(node.neighbors))
-	copy(result, node.neighbors)
+	// Get sorted neighbors from ConcurrentNeighborSet
+	neighbors := node.neighbors.GetSortedNeighbors()
+	ids := make([]string, len(neighbors))
+	for i, n := range neighbors {
+		ids[i] = n.ID
+	}
+	return ids
+}
+
+// getNeighborsMany retrieves neighbors for multiple nodes in a single batch operation.
+// This reduces lock acquisitions compared to calling getNeighbors multiple times.
+// PF.2.4: Batch neighbor retrieval for improved performance.
+func (l *layer) getNeighborsMany(nodeIDs []string) map[string][]string {
+	result := make(map[string][]string, len(nodeIDs))
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	for _, id := range nodeIDs {
+		if node, exists := l.nodes[id]; exists {
+			neighbors := node.neighbors.GetSortedNeighbors()
+			ids := make([]string, len(neighbors))
+			for i, n := range neighbors {
+				ids[i] = n.ID
+			}
+			result[id] = ids
+		}
+	}
 	return result
 }
 
-func (l *layer) setNeighbors(id string, neighbors []string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// getNeighborsWithDistances returns neighbors with their distances for a node.
+// Useful when distance information is needed for neighbor selection.
+func (l *layer) getNeighborsWithDistances(id string) []Neighbor {
+	l.mu.RLock()
 	node, exists := l.nodes[id]
+	l.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+	return node.neighbors.GetSortedNeighbors()
+}
+
+func (l *layer) setNeighbors(id string, neighbors []string, distances []float32) {
+	l.mu.RLock()
+	node, exists := l.nodes[id]
+	l.mu.RUnlock()
 	if !exists {
 		return
 	}
-	node.neighbors = make([]string, len(neighbors))
-	copy(node.neighbors, neighbors)
+	// Clear and repopulate the neighbor set
+	node.neighbors.Clear()
+	for i, neighborID := range neighbors {
+		dist := float32(0)
+		if i < len(distances) {
+			dist = distances[i]
+		}
+		node.neighbors.Add(neighborID, dist)
+	}
 }
 
-func (l *layer) addNeighbor(id, neighborID string, maxNeighbors int) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// addNeighbor adds a neighbor with distance to a node.
+// Uses ConcurrentNeighborSet.AddWithLimit for O(1) contains check and automatic
+// replacement of worst neighbors when at capacity.
+func (l *layer) addNeighbor(id, neighborID string, distance float32, maxNeighbors int) bool {
+	l.mu.RLock()
 	node, exists := l.nodes[id]
+	l.mu.RUnlock()
 	if !exists {
 		return false
 	}
-	if l.containsNeighbor(node, neighborID) {
-		return false
-	}
-	if len(node.neighbors) >= maxNeighbors {
-		return false
-	}
-	node.neighbors = append(node.neighbors, neighborID)
-	return true
+	// AddWithLimit handles the contains check, capacity limit, and worst-neighbor replacement
+	return node.neighbors.AddWithLimit(neighborID, distance, maxNeighbors)
 }
 
+// containsNeighbor checks if a node has a specific neighbor.
+// O(1) lookup using ConcurrentNeighborSet instead of O(n) slice scan.
 func (l *layer) containsNeighbor(node *layerNode, neighborID string) bool {
-	for _, n := range node.neighbors {
-		if n == neighborID {
-			return true
-		}
-	}
-	return false
+	return node.neighbors.Contains(neighborID)
 }
 
 func (l *layer) removeNeighbor(id, neighborID string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
 	node, exists := l.nodes[id]
+	l.mu.RUnlock()
 	if !exists {
 		return
 	}
-	node.neighbors = l.filterNeighbor(node.neighbors, neighborID)
-}
-
-func (l *layer) filterNeighbor(neighbors []string, toRemove string) []string {
-	result := make([]string, 0, len(neighbors))
-	for _, n := range neighbors {
-		if n != toRemove {
-			result = append(result, n)
-		}
-	}
-	return result
+	node.neighbors.Remove(neighborID)
 }
 
 func (l *layer) nodeCount() int {

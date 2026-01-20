@@ -32,6 +32,14 @@ const (
 
 	// DefaultTimeout is the default search timeout.
 	DefaultTimeout = 5 * time.Second
+
+	// MaxFusionOverfetch is the maximum results to fetch for fusion.
+	// This prevents unbounded memory allocation when fusing results.
+	MaxFusionOverfetch = 1000
+
+	// DefaultFusionMultiplier is the multiplier applied to limit for fusion.
+	// We fetch more results than requested to have sufficient candidates for fusion.
+	DefaultFusionMultiplier = 2
 )
 
 // =============================================================================

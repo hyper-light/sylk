@@ -28,6 +28,13 @@ func (m *mockHNSW) Delete(id string) error {
 	return nil
 }
 
+func (m *mockHNSW) DeleteBatch(ids []string) error {
+	for _, id := range ids {
+		m.deleted[id] = true
+	}
+	return nil
+}
+
 func setupTestDB(t *testing.T) (*VectorGraphDB, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -413,5 +420,124 @@ func TestFloat32sToBytes(t *testing.T) {
 
 	if len(bytes) != 12 {
 		t.Errorf("len(bytes) = %d, want 12", len(bytes))
+	}
+}
+
+func TestNodeStoreGetNodesBatch(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	// Insert test nodes
+	for i := 0; i < 10; i++ {
+		node := &GraphNode{
+			ID:       nodeID(i),
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+			Metadata: map[string]any{"index": i},
+		}
+		ns.InsertNode(node, []float32{float32(i + 1), 0.1, 0.1})
+	}
+
+	// Test batch load with subset of IDs
+	ids := []string{nodeID(0), nodeID(2), nodeID(5), nodeID(9)}
+	nodes, err := ns.GetNodesBatch(ids)
+	if err != nil {
+		t.Fatalf("GetNodesBatch: %v", err)
+	}
+
+	if len(nodes) != 4 {
+		t.Errorf("Got %d nodes, want 4", len(nodes))
+	}
+
+	// Verify each requested node is in the result
+	for _, id := range ids {
+		if nodes[id] == nil {
+			t.Errorf("Node %s not found in batch result", id)
+		}
+	}
+}
+
+func TestNodeStoreGetNodesBatchEmpty(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	nodes, err := ns.GetNodesBatch([]string{})
+	if err != nil {
+		t.Fatalf("GetNodesBatch: %v", err)
+	}
+
+	if len(nodes) != 0 {
+		t.Errorf("Got %d nodes, want 0", len(nodes))
+	}
+}
+
+func TestNodeStoreGetNodesBatchMissingNodes(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	// Insert only some nodes
+	for i := 0; i < 3; i++ {
+		node := &GraphNode{
+			ID:       nodeID(i),
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+		}
+		ns.InsertNode(node, []float32{float32(i + 1), 0.1, 0.1})
+	}
+
+	// Request nodes that exist and nodes that don't
+	ids := []string{nodeID(0), nodeID(1), "nonexistent1", "nonexistent2"}
+	nodes, err := ns.GetNodesBatch(ids)
+	if err != nil {
+		t.Fatalf("GetNodesBatch: %v", err)
+	}
+
+	// Should only return the 2 existing nodes
+	if len(nodes) != 2 {
+		t.Errorf("Got %d nodes, want 2", len(nodes))
+	}
+
+	// Verify correct nodes are returned
+	if nodes[nodeID(0)] == nil {
+		t.Error("node000 should be returned")
+	}
+	if nodes[nodeID(1)] == nil {
+		t.Error("node001 should be returned")
+	}
+}
+
+func TestNodeStoreGetNodesBatchLarge(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	// Insert 200 nodes to test batching beyond default batch size (100)
+	ids := make([]string, 200)
+	for i := 0; i < 200; i++ {
+		id := "node" + string(rune('a'+i/26)) + string(rune('a'+i%26))
+		ids[i] = id
+		node := &GraphNode{
+			ID:       id,
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+		}
+		ns.InsertNode(node, []float32{float32(i + 1), 0.1, 0.1})
+	}
+
+	// Batch load all
+	nodes, err := ns.GetNodesBatch(ids)
+	if err != nil {
+		t.Fatalf("GetNodesBatch: %v", err)
+	}
+
+	if len(nodes) != 200 {
+		t.Errorf("Got %d nodes, want 200", len(nodes))
 	}
 }

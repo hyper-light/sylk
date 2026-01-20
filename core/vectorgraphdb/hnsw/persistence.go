@@ -83,7 +83,9 @@ func (h *Index) saveLayer(stmt *sql.Stmt, layer *layer, layerIdx int) error {
 	defer layer.mu.RUnlock()
 
 	for nodeID, node := range layer.nodes {
-		for _, neighborID := range node.neighbors {
+		// Use GetIDs() to get neighbor IDs from ConcurrentNeighborSet
+		neighborIDs := node.neighbors.GetIDs()
+		for _, neighborID := range neighborIDs {
 			if _, err := stmt.Exec(nodeID, neighborID, layerIdx); err != nil {
 				return fmt.Errorf("insert graph edge: %w", err)
 			}
@@ -156,7 +158,8 @@ func (h *Index) loadGraphRow(rows *sql.Rows) error {
 	h.ensureLayers(level)
 	h.layers[level].addNode(sourceID)
 	h.layers[level].addNode(targetID)
-	h.layers[level].addNeighbor(sourceID, targetID, h.maxNeighborsForLevel(level))
+	// Use 0 as default distance when loading from persistence (distance not stored)
+	h.layers[level].addNeighbor(sourceID, targetID, 0, h.maxNeighborsForLevel(level))
 	return nil
 }
 

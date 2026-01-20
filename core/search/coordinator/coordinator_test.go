@@ -667,3 +667,186 @@ func TestSearchCoordinator_Search_QueryInResult(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "my test query", result.Query)
 }
+
+// =============================================================================
+// Fusion Limit Tests (PF.3.9)
+// =============================================================================
+
+func TestCapFusionLimit_Normal(t *testing.T) {
+	// Normal case: limit * multiplier is under max
+	result := capFusionLimit(10)
+	assert.Equal(t, 10*DefaultFusionMultiplier, result)
+}
+
+func TestCapFusionLimit_CapsAtMax(t *testing.T) {
+	// When limit * multiplier exceeds max, cap at max
+	hugeLimit := MaxFusionOverfetch + 1000
+	result := capFusionLimit(hugeLimit)
+	assert.Equal(t, MaxFusionOverfetch, result)
+}
+
+func TestCapFusionLimit_ExactlyAtMax(t *testing.T) {
+	// When limit * multiplier equals max exactly
+	exactLimit := MaxFusionOverfetch / DefaultFusionMultiplier
+	result := capFusionLimit(exactLimit)
+	assert.Equal(t, MaxFusionOverfetch, result)
+}
+
+func TestCapFusionLimit_JustBelowMax(t *testing.T) {
+	// When limit * multiplier is just below max
+	justBelowLimit := (MaxFusionOverfetch / DefaultFusionMultiplier) - 1
+	result := capFusionLimit(justBelowLimit)
+	expected := justBelowLimit * DefaultFusionMultiplier
+	assert.Equal(t, expected, result)
+}
+
+func TestSelectTopK_SmallSlice(t *testing.T) {
+	// When items <= k, should return all items sorted
+	items := []search.ScoredDocument{
+		{Document: search.Document{ID: "a"}, Score: 0.5},
+		{Document: search.Document{ID: "b"}, Score: 0.9},
+		{Document: search.Document{ID: "c"}, Score: 0.3},
+	}
+
+	result := selectTopK(items, 5)
+
+	assert.Len(t, result, 3)
+	assert.Equal(t, "b", result[0].ID)
+	assert.Equal(t, "a", result[1].ID)
+	assert.Equal(t, "c", result[2].ID)
+}
+
+func TestSelectTopK_LargeSlice(t *testing.T) {
+	// When items > k, should return top k items sorted
+	items := []search.ScoredDocument{
+		{Document: search.Document{ID: "a"}, Score: 0.5},
+		{Document: search.Document{ID: "b"}, Score: 0.9},
+		{Document: search.Document{ID: "c"}, Score: 0.3},
+		{Document: search.Document{ID: "d"}, Score: 0.7},
+		{Document: search.Document{ID: "e"}, Score: 0.8},
+	}
+
+	result := selectTopK(items, 3)
+
+	assert.Len(t, result, 3)
+	assert.Equal(t, "b", result[0].ID)
+	assert.Equal(t, 0.9, result[0].Score)
+	assert.Equal(t, "e", result[1].ID)
+	assert.Equal(t, 0.8, result[1].Score)
+	assert.Equal(t, "d", result[2].ID)
+	assert.Equal(t, 0.7, result[2].Score)
+}
+
+func TestSelectTopK_EmptySlice(t *testing.T) {
+	items := []search.ScoredDocument{}
+	result := selectTopK(items, 5)
+	assert.Empty(t, result)
+}
+
+func TestSelectTopK_ZeroK(t *testing.T) {
+	items := []search.ScoredDocument{
+		{Document: search.Document{ID: "a"}, Score: 0.5},
+	}
+	result := selectTopK(items, 0)
+	assert.Nil(t, result)
+}
+
+func TestSelectTopK_DuplicateScores(t *testing.T) {
+	// Should handle duplicate scores correctly
+	items := []search.ScoredDocument{
+		{Document: search.Document{ID: "a"}, Score: 0.5},
+		{Document: search.Document{ID: "b"}, Score: 0.5},
+		{Document: search.Document{ID: "c"}, Score: 0.9},
+		{Document: search.Document{ID: "d"}, Score: 0.5},
+	}
+
+	result := selectTopK(items, 3)
+
+	assert.Len(t, result, 3)
+	assert.Equal(t, "c", result[0].ID)
+	assert.Equal(t, 0.9, result[0].Score)
+	// The remaining two should be from {a, b, d} all with score 0.5
+	assert.Equal(t, 0.5, result[1].Score)
+	assert.Equal(t, 0.5, result[2].Score)
+}
+
+func TestSelectTopK_LargeDataset(t *testing.T) {
+	// Test with a larger dataset to verify heap efficiency
+	items := make([]search.ScoredDocument, 1000)
+	for i := 0; i < 1000; i++ {
+		items[i] = search.ScoredDocument{
+			Document: search.Document{ID: string(rune('0' + i%10))},
+			Score:    float64(i) / 1000.0,
+		}
+	}
+
+	result := selectTopK(items, 10)
+
+	assert.Len(t, result, 10)
+	// Top 10 should be indices 990-999 with scores 0.990-0.999
+	for i := 0; i < 10; i++ {
+		expectedScore := float64(999-i) / 1000.0
+		assert.Equal(t, expectedScore, result[i].Score)
+	}
+}
+
+func TestSearchCoordinator_FusionLimitCapped(t *testing.T) {
+	// Test that fusion limits are properly capped in actual search
+	var capturedLimit int
+
+	bleve := &mockBleveSearcher{
+		isOpen:  true,
+		results: &search.SearchResult{},
+	}
+
+	vector := &mockVectorSearcherWithCapture{
+		results: []ScoredVectorResult{},
+		captureLimit: func(limit int) {
+			capturedLimit = limit
+		},
+	}
+
+	embedder := &mockEmbeddingGenerator{embedding: []float32{0.1}}
+
+	coord := NewSearchCoordinator(bleve, vector, embedder)
+
+	// Use the maximum valid limit (100). With multiplier (2), this becomes 200.
+	// Since 200 < MaxFusionOverfetch (1000), verify fusion multiplier is applied.
+	req := &HybridSearchRequest{
+		Query: "test",
+		Limit: MaxLimit, // 100
+	}
+
+	_, err := coord.Search(context.Background(), req)
+	require.NoError(t, err)
+
+	// Vector search should have received limit * multiplier = 200
+	assert.Equal(t, MaxLimit*DefaultFusionMultiplier, capturedLimit)
+}
+
+func TestSearchCoordinator_FusionLimitCapped_ViaCapFunction(t *testing.T) {
+	// Test capFusionLimit directly for the capping behavior
+	// When limit * multiplier would exceed MaxFusionOverfetch,
+	// it should be capped
+
+	// This is tested via TestCapFusionLimit_CapsAtMax, but we can verify
+	// the behavior through the cap function too
+	hugeLimit := MaxFusionOverfetch
+	result := capFusionLimit(hugeLimit)
+	// hugeLimit * 2 = 2000 which exceeds MaxFusionOverfetch (1000)
+	assert.Equal(t, MaxFusionOverfetch, result)
+}
+
+// mockVectorSearcherWithCapture captures the limit passed to Search
+type mockVectorSearcherWithCapture struct {
+	results      []ScoredVectorResult
+	err          error
+	captureLimit func(int)
+}
+
+func (m *mockVectorSearcherWithCapture) Search(ctx context.Context, vector []float32, limit int) ([]ScoredVectorResult, error) {
+	if m.captureLimit != nil {
+		m.captureLimit(limit)
+	}
+	return m.results, m.err
+}

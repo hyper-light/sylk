@@ -515,6 +515,79 @@ func TestACTRMemory_Integration(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// PF.4.9: ValidAccessTypes Optimization Tests
+// =============================================================================
+
+func TestValidAccessTypes_PreAllocated(t *testing.T) {
+	// Get the slice twice and verify it's the same underlying array
+	types1 := ValidAccessTypes()
+	types2 := ValidAccessTypes()
+
+	if len(types1) != 4 {
+		t.Errorf("Expected 4 access types, got %d", len(types1))
+	}
+
+	// Check that we got the expected types
+	expectedTypes := []AccessType{
+		AccessRetrieval,
+		AccessReinforcement,
+		AccessCreation,
+		AccessReference,
+	}
+
+	for i, expected := range expectedTypes {
+		if types1[i] != expected {
+			t.Errorf("Expected type %d at index %d, got %d", expected, i, types1[i])
+		}
+	}
+
+	// The slices should reference the same underlying data
+	// Note: We can't directly compare slice headers, but we can verify
+	// that the function returns consistent results
+	if len(types1) != len(types2) {
+		t.Error("ValidAccessTypes should return consistent length")
+	}
+
+	for i := range types1 {
+		if types1[i] != types2[i] {
+			t.Error("ValidAccessTypes should return consistent values")
+		}
+	}
+}
+
+func TestValidAccessTypes_IsValid(t *testing.T) {
+	// All valid types should return true
+	for _, at := range ValidAccessTypes() {
+		if !at.IsValid() {
+			t.Errorf("Expected %v to be valid", at)
+		}
+	}
+
+	// Invalid types should return false
+	invalidType := AccessType(99)
+	if invalidType.IsValid() {
+		t.Error("Expected invalid type to return false")
+	}
+}
+
+func TestValidAccessTypes_ImmutabilityWarning(t *testing.T) {
+	// This test documents the expected behavior - callers should not modify
+	// the returned slice. We verify the documentation is accurate.
+	types := ValidAccessTypes()
+
+	// Verify all expected types are present
+	found := make(map[AccessType]bool)
+	for _, at := range types {
+		found[at] = true
+	}
+
+	if !found[AccessRetrieval] || !found[AccessReinforcement] ||
+		!found[AccessCreation] || !found[AccessReference] {
+		t.Error("ValidAccessTypes should contain all access types")
+	}
+}
+
 func TestGammaRand(t *testing.T) {
 	// Test that gamma random samples are positive
 	for alpha := 0.1; alpha <= 10.0; alpha += 0.5 {

@@ -3,7 +3,9 @@ package coordinator
 import (
 	"container/list"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"sort"
 	"sync"
 	"time"
 
@@ -71,29 +73,32 @@ func NewSearchCacheWithDefaults() *SearchCache {
 	return NewSearchCache(DefaultCacheConfig())
 }
 
-// Get retrieves a cached search result by key.
+// Get retrieves a cached search result by key with single-lock LRU promotion.
 // Returns nil and false if the entry is not found or expired.
+// This uses a single write lock for the entire operation (check + promote)
+// to avoid the overhead of two separate lock acquisitions (PF.3.7).
 func (c *SearchCache) Get(key string) (*search.SearchResult, bool) {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.disabled {
-		c.mu.RUnlock()
 		return nil, false
 	}
 
 	entry, exists := c.entries[key]
 	if !exists {
-		c.mu.RUnlock()
 		return nil, false
 	}
 
+	// Check TTL
 	if c.isExpired(entry) {
-		c.mu.RUnlock()
-		c.delete(key)
+		c.removeEntryLocked(key)
 		return nil, false
 	}
-	c.mu.RUnlock()
 
-	c.promoteEntry(key)
+	// Promote to front (LRU) while holding lock
+	c.promoteEntryLocked(entry)
+
 	return entry.result, true
 }
 
@@ -102,15 +107,21 @@ func (c *SearchCache) isExpired(entry *cacheEntry) bool {
 	return time.Now().After(entry.expiresAt)
 }
 
-// promoteEntry moves an entry to the front of the LRU list.
-func (c *SearchCache) promoteEntry(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	entry, exists := c.entries[key]
-	if exists && entry.element != nil {
+// promoteEntryLocked moves entry to front of LRU list (assumes lock held).
+func (c *SearchCache) promoteEntryLocked(entry *cacheEntry) {
+	if entry.element != nil {
 		c.lru.MoveToFront(entry.element)
 	}
+}
+
+// removeEntryLocked removes entry from cache (assumes lock held).
+func (c *SearchCache) removeEntryLocked(key string) {
+	entry, exists := c.entries[key]
+	if !exists {
+		return
+	}
+	c.removeLRUElement(entry)
+	delete(c.entries, key)
 }
 
 // Set stores a search result in the cache.
@@ -249,17 +260,42 @@ func (c *SearchCache) IsEnabled() bool {
 	return !c.disabled
 }
 
-// GenerateCacheKey creates a cache key from query and filters.
-func GenerateCacheKey(query string, filters map[string]string) string {
+// GenerateCacheKey creates a unique cache key including pagination parameters.
+// The key is deterministic: same inputs always produce the same key.
+func GenerateCacheKey(query string, filters map[string]string, limit, offset int) string {
 	h := sha256.New()
 	h.Write([]byte(query))
 
-	for k, v := range filters {
+	// Sort filter keys for deterministic ordering
+	keys := make([]string, 0, len(filters))
+	for k := range filters {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
 		h.Write([]byte(k))
-		h.Write([]byte(v))
+		h.Write([]byte(filters[k]))
 	}
 
+	// Include pagination parameters
+	binary.Write(h, binary.LittleEndian, int32(limit))
+	binary.Write(h, binary.LittleEndian, int32(offset))
+
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// CacheKeyFromRequest builds a cache key from a SearchRequest.
+// This is a convenience function that extracts the relevant fields from the request.
+func CacheKeyFromRequest(req *search.SearchRequest) string {
+	filters := make(map[string]string)
+	if req.Type != "" {
+		filters["type"] = string(req.Type)
+	}
+	if req.PathFilter != "" {
+		filters["path"] = req.PathFilter
+	}
+	return GenerateCacheKey(req.Query, filters, req.Limit, req.Offset)
 }
 
 // CleanExpired removes all expired entries from the cache.

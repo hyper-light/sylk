@@ -1,6 +1,7 @@
 package concurrency
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -20,6 +21,7 @@ type SchedulablePipeline struct {
 	SpawnTime    time.Time
 	Dependencies []string
 	Runner       *PipelineRunner
+	cancel       context.CancelFunc // Set by scheduler when pipeline starts
 }
 
 type PipelinePriorityQueue struct {

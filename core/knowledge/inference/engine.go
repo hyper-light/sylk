@@ -34,6 +34,22 @@ type ExtendedEdgeProvider interface {
 }
 
 // =============================================================================
+// ForwardChainerInterface (SNE.12)
+// =============================================================================
+
+// ForwardChainerInterface defines the interface for forward chaining evaluation.
+// This allows the InferenceEngine to use either the standard ForwardChainer
+// or the SemiNaiveForwardChainer.
+type ForwardChainerInterface interface {
+	// Evaluate runs forward chaining on the given rules and edges.
+	Evaluate(ctx context.Context, rules []InferenceRule, edges []Edge) ([]InferenceResult, error)
+	// GetMaxIterations returns the maximum iterations limit.
+	GetMaxIterations() int
+	// SetMaxIterations updates the maximum iterations limit.
+	SetMaxIterations(maxIterations int)
+}
+
+// =============================================================================
 // InferenceEngine (IE.5.1)
 // =============================================================================
 
@@ -44,6 +60,8 @@ type ExtendedEdgeProvider interface {
 type InferenceEngine struct {
 	ruleStore      *RuleStore
 	forwardChainer *ForwardChainer
+	semiNaiveFC    *SemiNaiveForwardChainer
+	useSemiNaive   bool
 	materializer   *MaterializationManager
 	invalidator    *InvalidationManager
 	edgeProvider   ExtendedEdgeProvider
@@ -97,6 +115,58 @@ func (e *InferenceEngine) SetEdgeProvider(provider ExtendedEdgeProvider) {
 }
 
 // =============================================================================
+// Semi-Naive Evaluation Configuration (SNE.12)
+// =============================================================================
+
+// UseSemiNaiveEvaluation enables or disables semi-naive evaluation.
+// When enabled, the engine uses the SemiNaiveForwardChainer which is more
+// efficient for recursive rules like transitive closure.
+// The semi-naive evaluator must be initialized with the current rules first.
+func (e *InferenceEngine) UseSemiNaiveEvaluation(ctx context.Context, enable bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if enable {
+		// Get current rules to initialize the semi-naive evaluator
+		rules, err := e.ruleStore.GetEnabledRules(ctx)
+		if err != nil {
+			return fmt.Errorf("get enabled rules: %w", err)
+		}
+
+		// Create semi-naive forward chainer
+		semiNaiveFC, err := NewSemiNaiveForwardChainer(rules, e.forwardChainer.GetMaxIterations())
+		if err != nil {
+			return fmt.Errorf("create semi-naive forward chainer: %w", err)
+		}
+
+		e.semiNaiveFC = semiNaiveFC
+		e.useSemiNaive = true
+	} else {
+		e.useSemiNaive = false
+		e.semiNaiveFC = nil
+	}
+
+	return nil
+}
+
+// IsSemiNaiveEnabled returns whether semi-naive evaluation is enabled.
+func (e *InferenceEngine) IsSemiNaiveEnabled() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.useSemiNaive
+}
+
+// getActiveForwardChainer returns the currently active forward chainer.
+// If semi-naive is enabled and initialized, it returns the SemiNaiveForwardChainer.
+// Otherwise, it returns the standard ForwardChainer.
+func (e *InferenceEngine) getActiveForwardChainer() ForwardChainerInterface {
+	if e.useSemiNaive && e.semiNaiveFC != nil {
+		return e.semiNaiveFC
+	}
+	return e.forwardChainer
+}
+
+// =============================================================================
 // Full Inference
 // =============================================================================
 
@@ -134,8 +204,9 @@ func (e *InferenceEngine) RunInference(ctx context.Context) error {
 		return nil // No edges to process
 	}
 
-	// Run forward chaining
-	results, err := e.forwardChainer.Evaluate(ctx, rules, edges)
+	// Run forward chaining using the active forward chainer (standard or semi-naive)
+	fc := e.getActiveForwardChainer()
+	results, err := fc.Evaluate(ctx, rules, edges)
 	if err != nil && err != ErrMaxIterationsReached {
 		return fmt.Errorf("forward chaining: %w", err)
 	}
@@ -186,8 +257,9 @@ func (e *InferenceEngine) OnEdgeAdded(ctx context.Context, edge Edge) error {
 		edges = []Edge{edge}
 	}
 
-	// Run forward chaining with relevant rules only
-	results, err := e.forwardChainer.Evaluate(ctx, relevantRules, edges)
+	// Run forward chaining with relevant rules only using the active forward chainer
+	fc := e.getActiveForwardChainer()
+	results, err := fc.Evaluate(ctx, relevantRules, edges)
 	if err != nil && err != ErrMaxIterationsReached {
 		return fmt.Errorf("forward chaining: %w", err)
 	}
@@ -301,7 +373,8 @@ func (e *InferenceEngine) OnEdgeModified(ctx context.Context, oldEdge, newEdge E
 			edges = []Edge{newEdge}
 		}
 
-		results, err := e.forwardChainer.Evaluate(ctx, relevantRules, edges)
+		fc := e.getActiveForwardChainer()
+		results, err := fc.Evaluate(ctx, relevantRules, edges)
 		if err != nil && err != ErrMaxIterationsReached {
 			return fmt.Errorf("forward chaining: %w", err)
 		}
@@ -376,8 +449,9 @@ func (e *InferenceEngine) rematerializeWithRules(ctx context.Context, ruleIDs []
 		return nil
 	}
 
-	// Run forward chaining with affected rules
-	results, err := e.forwardChainer.Evaluate(ctx, rules, edges)
+	// Run forward chaining with affected rules using the active forward chainer
+	fc := e.getActiveForwardChainer()
+	results, err := fc.Evaluate(ctx, rules, edges)
 	if err != nil && err != ErrMaxIterationsReached {
 		return fmt.Errorf("forward chaining: %w", err)
 	}

@@ -2,6 +2,7 @@ package concurrency
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -61,20 +62,36 @@ type WriteAheadLog struct {
 	lastSyncTime time.Time
 	stopSync     chan struct{}
 	syncDone     chan struct{}
+
+	// Context for cancellation propagation
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
+// NewWriteAheadLog creates a new WAL with the given configuration.
+// Deprecated: Use NewWriteAheadLogWithContext instead for proper context propagation.
 func NewWriteAheadLog(config WALConfig) (*WriteAheadLog, error) {
+	return NewWriteAheadLogWithContext(context.Background(), config)
+}
+
+// NewWriteAheadLogWithContext creates a new WAL with context for cancellation propagation.
+// The context is used to signal goroutines to stop when the parent context is cancelled.
+func NewWriteAheadLogWithContext(ctx context.Context, config WALConfig) (*WriteAheadLog, error) {
 	if err := os.MkdirAll(config.Dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory: %w", err)
 	}
 
+	walCtx, cancel := context.WithCancel(ctx)
 	wal := &WriteAheadLog{
 		config:   config,
 		stopSync: make(chan struct{}),
 		syncDone: make(chan struct{}),
+		ctx:      walCtx,
+		cancel:   cancel,
 	}
 
 	if err := wal.initialize(); err != nil {
+		cancel() // Clean up context on initialization failure
 		return nil, err
 	}
 
@@ -322,7 +339,13 @@ func (w *WriteAheadLog) periodicSync() {
 
 	for {
 		select {
+		case <-w.ctx.Done():
+			// Context cancelled - perform final sync and exit
+			w.trySyncPending()
+			return
 		case <-w.stopSync:
+			// Explicit stop requested - perform final sync and exit
+			w.trySyncPending()
 			return
 		case <-ticker.C:
 			w.trySyncPending()
@@ -566,6 +589,11 @@ func (w *WriteAheadLog) CurrentSequence() uint64 {
 func (w *WriteAheadLog) Close() error {
 	if w.closed.Swap(true) {
 		return ErrWALClosed
+	}
+
+	// Cancel the context to signal all goroutines to stop
+	if w.cancel != nil {
+		w.cancel()
 	}
 
 	w.stopPeriodicSync()

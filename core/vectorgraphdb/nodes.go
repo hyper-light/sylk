@@ -23,6 +23,7 @@ var (
 type HNSWInserter interface {
 	Insert(id string, vector []float32, domain Domain, nodeType NodeType) error
 	Delete(id string) error
+	DeleteBatch(ids []string) error
 }
 
 type NodeStore struct {
@@ -395,6 +396,74 @@ func (ns *NodeStore) TouchNode(id string) error {
 		return ErrNodeNotFound
 	}
 	return nil
+}
+
+// GetNodesBatch loads multiple nodes by their IDs in a single query using WHERE id IN (...).
+// This eliminates the N+1 query pattern by fetching all nodes at once.
+// Returns a map of node ID to node for all found nodes. Missing nodes are silently omitted.
+func (ns *NodeStore) GetNodesBatch(ids []string) (map[string]*GraphNode, error) {
+	if len(ids) == 0 {
+		return make(map[string]*GraphNode), nil
+	}
+
+	// Build placeholders for IN clause
+	placeholders := make([]byte, 0, len(ids)*2)
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		if i > 0 {
+			placeholders = append(placeholders, ',')
+		}
+		placeholders = append(placeholders, '?')
+		args[i] = id
+	}
+
+	query := `
+		SELECT id, domain, node_type, name, path, package, line_start, line_end, signature,
+			session_id, timestamp, category, url, source, authors, published_at,
+			content, content_hash, metadata, verified, verification_type, confidence, trust_level,
+			created_at, updated_at, expires_at, superseded_by
+		FROM nodes WHERE id IN (` + string(placeholders) + `)`
+
+	rows, err := ns.db.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch query nodes: %w", err)
+	}
+	defer rows.Close()
+
+	nodes, err := ns.scanNodes(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert slice to map for efficient lookup
+	result := make(map[string]*GraphNode, len(nodes))
+	for _, node := range nodes {
+		result[node.ID] = node
+	}
+	return result, nil
+}
+
+// GetNodesBatchSlice loads multiple nodes by their IDs and returns them as a slice.
+// This is a convenience wrapper around GetNodesBatch that preserves order when possible.
+// Missing nodes are omitted from the result.
+func (ns *NodeStore) GetNodesBatchSlice(ids []string) ([]*GraphNode, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	nodeMap, err := ns.GetNodesBatch(ids)
+	if err != nil {
+		return nil, err
+	}
+
+	// Preserve order of input IDs where nodes exist
+	result := make([]*GraphNode, 0, len(nodeMap))
+	for _, id := range ids {
+		if node, exists := nodeMap[id]; exists {
+			result = append(result, node)
+		}
+	}
+	return result, nil
 }
 
 func nullString(value string) any {

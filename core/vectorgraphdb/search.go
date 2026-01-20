@@ -41,13 +41,23 @@ type HNSWSearcher interface {
 
 // VectorSearcher provides vector similarity search capabilities.
 type VectorSearcher struct {
-	db   *VectorGraphDB
-	hnsw HNSWSearcher
+	db        *VectorGraphDB
+	hnsw      HNSWSearcher
+	nodeStore *NodeStore // Cached instance for reuse
 }
 
 // NewVectorSearcher creates a new VectorSearcher.
 func NewVectorSearcher(db *VectorGraphDB, hnswIndex HNSWSearcher) *VectorSearcher {
-	return &VectorSearcher{db: db, hnsw: hnswIndex}
+	return &VectorSearcher{
+		db:        db,
+		hnsw:      hnswIndex,
+		nodeStore: NewNodeStore(db, nil), // Create once and reuse
+	}
+}
+
+// getNodeStore returns the cached NodeStore instance.
+func (vs *VectorSearcher) getNodeStore() *NodeStore {
+	return vs.nodeStore
 }
 
 // Search performs vector similarity search with optional filters.
@@ -74,28 +84,68 @@ func (vs *VectorSearcher) buildFilter(opts *SearchOptions) *HNSWSearchFilter {
 }
 
 func (vs *VectorSearcher) loadNodes(hnswResults []HNSWSearchResult, minSim float64) ([]SearchResult, error) {
-	results := make([]SearchResult, 0, len(hnswResults))
-	ns := NewNodeStore(vs.db, nil)
-
+	// Filter by minimum similarity first
+	filtered := make([]HNSWSearchResult, 0, len(hnswResults))
 	for _, hr := range hnswResults {
-		if hr.Similarity < minSim {
+		if hr.Similarity >= minSim {
+			filtered = append(filtered, hr)
+		}
+	}
+
+	if len(filtered) == 0 {
+		return []SearchResult{}, nil
+	}
+
+	// Collect all IDs for batch loading
+	ids := make([]string, len(filtered))
+	similarityMap := make(map[string]float64, len(filtered))
+	for i, hr := range filtered {
+		ids[i] = hr.ID
+		similarityMap[hr.ID] = hr.Similarity
+	}
+
+	ns := vs.getNodeStore()
+
+	// Batch load all nodes at once to eliminate N+1 query pattern
+	loader := NewBatchLoader(func(batchIDs []string) (map[string]*GraphNode, error) {
+		return ns.GetNodesBatch(batchIDs)
+	}, DefaultBatchLoaderConfig())
+
+	nodes, err := loader.LoadBatch(ids)
+	if err != nil {
+		// Fallback to individual loads on batch failure
+		return vs.loadNodesFallback(filtered, ns)
+	}
+
+	// Build results with pre-loaded nodes, preserving order
+	results := make([]SearchResult, 0, len(filtered))
+	for _, hr := range filtered {
+		node := nodes[hr.ID]
+		if node == nil {
 			continue
 		}
-		result, err := vs.loadSingleResult(ns, hr)
-		if err != nil {
-			continue
-		}
-		results = append(results, result)
+		results = append(results, SearchResult{
+			Node:       node,
+			Similarity: hr.Similarity,
+		})
 	}
 	return results, nil
 }
 
-func (vs *VectorSearcher) loadSingleResult(ns *NodeStore, hr HNSWSearchResult) (SearchResult, error) {
-	node, err := ns.GetNode(hr.ID)
-	if err != nil {
-		return SearchResult{}, err
+// loadNodesFallback loads nodes individually when batch loading fails.
+func (vs *VectorSearcher) loadNodesFallback(hnswResults []HNSWSearchResult, ns *NodeStore) ([]SearchResult, error) {
+	results := make([]SearchResult, 0, len(hnswResults))
+	for _, hr := range hnswResults {
+		node, err := ns.GetNode(hr.ID)
+		if err != nil {
+			continue
+		}
+		results = append(results, SearchResult{
+			Node:       node,
+			Similarity: hr.Similarity,
+		})
 	}
-	return SearchResult{Node: node, Similarity: hr.Similarity}, nil
+	return results, nil
 }
 
 // SearchByDomain performs search filtered to a specific domain.

@@ -959,3 +959,130 @@ func TestDomainFilter_InferDomainFromContent(t *testing.T) {
 		}
 	})
 }
+
+// =============================================================================
+// PF.4.1: Regex Cache Integration Tests
+// =============================================================================
+
+func TestTokenizeQuery_UsesPrecompiledRegex(t *testing.T) {
+	// PF.4.1: Verify that tokenizeQuery uses the pre-compiled TokenizePattern
+	// from regex_cache.go instead of compiling regex on every call.
+
+	t.Run("tokenizes correctly using cached regex", func(t *testing.T) {
+		testCases := []struct {
+			input    string
+			expected []string
+		}{
+			{"hello world", []string{"hello", "world"}},
+			{"find-function-name", []string{"find-function-name"}}, // hyphens preserved
+			{"test_case_name", []string{"test_case_name"}},         // underscores preserved
+			{"HELLO WORLD", []string{"hello", "world"}},            // lowercased
+			{"Hello123World", []string{"hello123world"}},           // alphanumeric
+			{"func()", []string{"func"}},                           // strips parens
+			{"a.b.c", []string{"a", "b", "c"}},                     // splits on dots
+			{"", []string{}},
+			{"   spaces   ", []string{"spaces"}},
+			{"multi!@#special$%^chars", []string{"multi", "special", "chars"}},
+		}
+
+		for _, tc := range testCases {
+			result := tokenizeQuery(tc.input)
+			if len(result) != len(tc.expected) {
+				t.Errorf("tokenizeQuery(%q): expected %v (len=%d), got %v (len=%d)",
+					tc.input, tc.expected, len(tc.expected), result, len(result))
+				continue
+			}
+			for i, word := range result {
+				if word != tc.expected[i] {
+					t.Errorf("tokenizeQuery(%q)[%d]: expected %q, got %q",
+						tc.input, i, tc.expected[i], word)
+				}
+			}
+		}
+	})
+
+	t.Run("is consistent with TokenizePattern", func(t *testing.T) {
+		// Verify that tokenizeQuery produces the same results as using
+		// TokenizePattern directly (from regex_cache.go)
+		input := "hello world test-case_name"
+		expected := TokenizePattern.Split(input, -1)
+
+		// Filter empty strings as tokenizeQuery does
+		var expectedFiltered []string
+		for _, p := range expected {
+			if p != "" {
+				expectedFiltered = append(expectedFiltered, p)
+			}
+		}
+
+		result := tokenizeQuery(input)
+
+		if len(result) != len(expectedFiltered) {
+			t.Errorf("tokenizeQuery should match TokenizePattern behavior: expected %v, got %v",
+				expectedFiltered, result)
+		}
+	})
+
+	t.Run("performance - no regex compilation on repeated calls", func(t *testing.T) {
+		// This test verifies the performance characteristic indirectly.
+		// If regex was compiled on every call, this would be slower.
+		// With pre-compiled regex, repeated calls are efficient.
+		queries := []string{
+			"find function foo",
+			"test case bar",
+			"documentation search",
+			"architecture design",
+			"code review",
+		}
+
+		// Run multiple iterations to ensure consistent behavior
+		for i := 0; i < 1000; i++ {
+			for _, q := range queries {
+				result := tokenizeQuery(q)
+				if len(result) == 0 {
+					t.Errorf("unexpected empty result for %q", q)
+				}
+			}
+		}
+	})
+}
+
+func TestTokenizePattern_Consistency(t *testing.T) {
+	// Verify that the pre-compiled TokenizePattern matches the expected pattern
+	t.Run("matches non-alphanumeric-underscore-hyphen characters", func(t *testing.T) {
+		input := "hello!world@test#case$name"
+		parts := TokenizePattern.Split(input, -1)
+
+		// Filter empty strings
+		var filtered []string
+		for _, p := range parts {
+			if p != "" {
+				filtered = append(filtered, p)
+			}
+		}
+
+		expected := []string{"hello", "world", "test", "case", "name"}
+		if len(filtered) != len(expected) {
+			t.Errorf("TokenizePattern.Split: expected %v, got %v", expected, filtered)
+		}
+	})
+
+	t.Run("preserves hyphens and underscores", func(t *testing.T) {
+		input := "hello-world_test"
+		parts := TokenizePattern.Split(input, -1)
+
+		// Filter empty strings
+		var filtered []string
+		for _, p := range parts {
+			if p != "" {
+				filtered = append(filtered, p)
+			}
+		}
+
+		// The pattern [^a-zA-Z0-9_-]+ preserves hyphens and underscores
+		expected := []string{"hello-world_test"}
+		if len(filtered) != len(expected) || (len(filtered) > 0 && filtered[0] != expected[0]) {
+			t.Errorf("TokenizePattern should preserve hyphens/underscores: expected %v, got %v", expected, filtered)
+		}
+	})
+}

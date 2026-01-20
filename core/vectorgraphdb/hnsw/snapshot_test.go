@@ -27,7 +27,7 @@ func TestNewLayerSnapshot(t *testing.T) {
 		l := newLayer()
 		l.addNode("node1")
 		l.addNode("node2")
-		l.addNeighbor("node1", "node2", 10)
+		l.addNeighbor("node1", "node2", 0.5, 10)
 
 		snapshot := NewLayerSnapshot(l)
 
@@ -40,12 +40,12 @@ func TestNewLayerSnapshot(t *testing.T) {
 	t.Run("modifications to original do not affect snapshot", func(t *testing.T) {
 		l := newLayer()
 		l.addNode("node1")
-		l.addNeighbor("node1", "neighbor1", 10)
+		l.addNeighbor("node1", "neighbor1", 0.3, 10)
 
 		snapshot := NewLayerSnapshot(l)
 
 		// Modify original layer
-		l.addNeighbor("node1", "neighbor2", 10)
+		l.addNeighbor("node1", "neighbor2", 0.4, 10)
 		l.addNode("node3")
 
 		// Snapshot should be unchanged
@@ -424,8 +424,8 @@ func TestSnapshot_DataIsolation(t *testing.T) {
 	idx.layers = []*layer{newLayer()}
 	idx.layers[0].addNode("vec1")
 	idx.layers[0].addNode("vec2")
-	idx.layers[0].addNeighbor("vec1", "vec2", 10)
-	idx.layers[0].addNeighbor("vec2", "vec1", 10)
+	idx.layers[0].addNeighbor("vec1", "vec2", 0.1, 10)
+	idx.layers[0].addNeighbor("vec2", "vec1", 0.1, 10)
 
 	// Create snapshot
 	snapshot := NewHNSWSnapshot(idx, 1)
@@ -448,7 +448,7 @@ func TestSnapshot_DataIsolation(t *testing.T) {
 
 	t.Run("layer modification isolation", func(t *testing.T) {
 		idx.layers[0].addNode("vec3")
-		idx.layers[0].addNeighbor("vec1", "vec3", 10)
+		idx.layers[0].addNeighbor("vec1", "vec3", 0.2, 10)
 
 		layer := snapshot.GetLayer(0)
 		require.NotNil(t, layer)

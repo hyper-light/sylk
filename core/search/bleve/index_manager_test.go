@@ -2,8 +2,10 @@ package bleve
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1199,5 +1201,1573 @@ func BenchmarkIndexManager_IndexBatch(b *testing.B) {
 		if err := mgr.IndexBatch(ctx, docs); err != nil {
 			b.Fatalf("IndexBatch() error = %v", err)
 		}
+	}
+}
+
+// =============================================================================
+// PF.3.4 - Batch Timeout Tests
+// =============================================================================
+
+func TestIndexManager_BatchWithTimeout_Success(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Create and add documents to batch
+	batch := mgr.index.NewBatch()
+	doc := createTestDocument("timeout-test-doc", "batch timeout test content")
+	if err := batch.Index(doc.ID, doc); err != nil {
+		t.Fatalf("batch.Index() error = %v", err)
+	}
+
+	// BatchWithTimeout should succeed normally
+	mgr.mu.Lock()
+	err := mgr.BatchWithTimeout(ctx, batch)
+	mgr.mu.Unlock()
+
+	if err != nil {
+		t.Errorf("BatchWithTimeout() error = %v, want nil", err)
+	}
+}
+
+func TestIndexManager_BatchWithTimeout_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+
+	// Create cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	// Create and add document to batch
+	batch := mgr.index.NewBatch()
+	doc := createTestDocument("timeout-cancel-doc", "batch timeout cancel content")
+	if err := batch.Index(doc.ID, doc); err != nil {
+		t.Fatalf("batch.Index() error = %v", err)
+	}
+
+	// BatchWithTimeout should return context error or succeed if batch completes first
+	mgr.mu.Lock()
+	err := mgr.BatchWithTimeout(ctx, batch)
+	mgr.mu.Unlock()
+
+	// Acceptable outcomes:
+	// 1. No error (batch completed before timeout check)
+	// 2. context.Canceled (direct context error)
+	// 3. ErrBatchTimeout wrapping context.Canceled (our wrapped timeout error)
+	if err != nil {
+		// Check if error indicates cancellation/timeout (either direct or wrapped)
+		errStr := err.Error()
+		isAcceptable := err == context.Canceled ||
+			err == context.DeadlineExceeded ||
+			errors.Is(err, ErrBatchTimeout) ||
+			errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			(errStr != "" && (strings.Contains(errStr, "canceled") ||
+				strings.Contains(errStr, "timeout") ||
+				strings.Contains(errStr, "deadline")))
+
+		if !isAcceptable {
+			t.Errorf("BatchWithTimeout() unexpected error = %v", err)
+		}
+	}
+	// If err is nil, the batch completed before context cancellation was detected - also acceptable
+}
+
+func TestIndexManager_BatchWithTimeout_CustomTimeout(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    100,
+		BatchTimeout: 5 * time.Second, // Custom timeout
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	// Verify config was applied
+	if mgr.config.BatchTimeout != 5*time.Second {
+		t.Errorf("BatchTimeout = %v, want 5s", mgr.config.BatchTimeout)
+	}
+
+	// Test batch indexing works with custom timeout
+	docs := make([]*search.Document, 5)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"custom timeout test",
+		)
+	}
+
+	err := mgr.IndexBatch(context.Background(), docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with custom timeout error = %v", err)
+	}
+}
+
+func TestIndexManager_IndexBatch_UsesTimeout(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// IndexBatch should use BatchWithTimeout internally
+	docs := make([]*search.Document, 10)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"batch with timeout protection",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() error = %v, want nil", err)
+	}
+
+	// Verify documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 10 {
+		t.Errorf("DocumentCount() = %d, want 10", count)
+	}
+}
+
+func TestDefaultBatchTimeout(t *testing.T) {
+	t.Parallel()
+
+	if DefaultBatchTimeout != 30*time.Second {
+		t.Errorf("DefaultBatchTimeout = %v, want 30s", DefaultBatchTimeout)
+	}
+}
+
+func TestIndexConfig_DefaultHasBatchTimeout(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultIndexConfig("/some/path")
+	if config.BatchTimeout != DefaultBatchTimeout {
+		t.Errorf("DefaultIndexConfig().BatchTimeout = %v, want %v", config.BatchTimeout, DefaultBatchTimeout)
+	}
+}
+
+func TestNewIndexManager_HasBatchTimeout(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewIndexManager("/some/path")
+	if mgr.config.BatchTimeout != DefaultBatchTimeout {
+		t.Errorf("NewIndexManager().config.BatchTimeout = %v, want %v", mgr.config.BatchTimeout, DefaultBatchTimeout)
+	}
+}
+
+// Helper to check if error is timeout-related
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err == ErrBatchTimeout || err == context.DeadlineExceeded ||
+		(err.Error() != "" && (err.Error() == "batch commit timeout" ||
+			err.Error() == "context deadline exceeded"))
+}
+
+// =============================================================================
+// PF.3.5 - Selective Field Loading Tests
+// =============================================================================
+
+func TestFieldConfig_Defaults(t *testing.T) {
+	t.Parallel()
+
+	// Test DefaultFieldConfig
+	cfg := DefaultFieldConfig()
+	if cfg.LoadContent {
+		t.Error("DefaultFieldConfig().LoadContent = true, want false")
+	}
+	if len(cfg.Fields) == 0 {
+		t.Error("DefaultFieldConfig().Fields should not be empty")
+	}
+
+	// Test FullFieldConfig
+	fullCfg := FullFieldConfig()
+	if !fullCfg.LoadContent {
+		t.Error("FullFieldConfig().LoadContent = false, want true")
+	}
+	if fullCfg.Fields != nil {
+		t.Error("FullFieldConfig().Fields should be nil")
+	}
+
+	// Test MetadataOnlyFieldConfig
+	metaCfg := MetadataOnlyFieldConfig()
+	if metaCfg.LoadContent {
+		t.Error("MetadataOnlyFieldConfig().LoadContent = true, want false")
+	}
+	if len(metaCfg.Fields) != 4 {
+		t.Errorf("MetadataOnlyFieldConfig().Fields length = %d, want 4", len(metaCfg.Fields))
+	}
+}
+
+func TestCustomFieldConfig(t *testing.T) {
+	t.Parallel()
+
+	fields := []string{"path", "type"}
+	cfg := CustomFieldConfig(fields, true)
+
+	if !cfg.LoadContent {
+		t.Error("CustomFieldConfig().LoadContent = false, want true")
+	}
+	if len(cfg.Fields) != 2 {
+		t.Errorf("CustomFieldConfig().Fields length = %d, want 2", len(cfg.Fields))
+	}
+}
+
+func TestDefaultMetadataFields(t *testing.T) {
+	t.Parallel()
+
+	// Verify expected fields are present
+	expectedFields := []string{"path", "type", "language", "modified_at"}
+	for _, expected := range expectedFields {
+		found := false
+		for _, field := range DefaultMetadataFields {
+			if field == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("DefaultMetadataFields missing expected field: %s", expected)
+		}
+	}
+
+	// Verify content is NOT in default metadata fields
+	for _, field := range DefaultMetadataFields {
+		if field == "content" {
+			t.Error("DefaultMetadataFields should not contain 'content'")
+		}
+	}
+}
+
+func TestIndexManager_SearchWithFields_DefaultConfig(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a document with content
+	doc := createTestDocument("fields-test-1", "This is the full content of the document for testing field selection")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Search with default config (metadata only)
+	req := &search.SearchRequest{
+		Query: "content",
+		Limit: 10,
+	}
+
+	result, err := mgr.SearchWithFields(ctx, req, DefaultFieldConfig())
+	if err != nil {
+		t.Fatalf("SearchWithFields() error = %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("SearchWithFields() returned nil result")
+	}
+
+	if result.TotalHits == 0 {
+		t.Error("expected at least one hit")
+	}
+}
+
+func TestIndexManager_SearchWithFields_FullConfig(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a document with content
+	content := "Full content loading test document body"
+	doc := createTestDocument("fields-test-2", content)
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Search with full config (all fields including content)
+	req := &search.SearchRequest{
+		Query: "loading",
+		Limit: 10,
+	}
+
+	result, err := mgr.SearchWithFields(ctx, req, FullFieldConfig())
+	if err != nil {
+		t.Fatalf("SearchWithFields() error = %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("SearchWithFields() returned nil result")
+	}
+
+	if result.TotalHits == 0 {
+		t.Fatal("expected at least one hit")
+	}
+
+	// With full config, content should be loaded
+	if len(result.Documents) > 0 {
+		if result.Documents[0].Content == "" {
+			t.Error("expected Content to be loaded with FullFieldConfig")
+		}
+	}
+}
+
+func TestIndexManager_SearchWithFields_CustomConfig(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a document
+	doc := createTestDocument("fields-test-3", "Custom field selection test")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Search with custom config (only path and type)
+	req := &search.SearchRequest{
+		Query: "custom",
+		Limit: 10,
+	}
+
+	customCfg := CustomFieldConfig([]string{"path", "type"}, false)
+	result, err := mgr.SearchWithFields(ctx, req, customCfg)
+	if err != nil {
+		t.Fatalf("SearchWithFields() error = %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("SearchWithFields() returned nil result")
+	}
+
+	if result.TotalHits == 0 {
+		t.Error("expected at least one hit")
+	}
+}
+
+func TestIndexManager_SearchWithFields_Closed(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewIndexManager(testIndexPath(t))
+
+	req := &search.SearchRequest{
+		Query: "test",
+		Limit: 10,
+	}
+
+	_, err := mgr.SearchWithFields(context.Background(), req, DefaultFieldConfig())
+	if err != ErrIndexClosed {
+		t.Errorf("SearchWithFields() error = %v, want %v", err, ErrIndexClosed)
+	}
+}
+
+func TestIndexManager_GetDocumentContent(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a document with known content
+	expectedContent := "This is the document content for lazy loading test"
+	doc := createTestDocument("content-test-1", expectedContent)
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Get content
+	content, err := mgr.GetDocumentContent(ctx, doc.ID)
+	if err != nil {
+		t.Fatalf("GetDocumentContent() error = %v", err)
+	}
+
+	if content != expectedContent {
+		t.Errorf("GetDocumentContent() = %q, want %q", content, expectedContent)
+	}
+}
+
+func TestIndexManager_GetDocumentContent_NotFound(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Try to get content for non-existent document
+	content, err := mgr.GetDocumentContent(ctx, "nonexistent-doc-id")
+	if err != nil {
+		t.Fatalf("GetDocumentContent() error = %v, want nil", err)
+	}
+
+	if content != "" {
+		t.Errorf("GetDocumentContent() = %q, want empty string for non-existent doc", content)
+	}
+}
+
+func TestIndexManager_GetDocumentContent_EmptyID(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	_, err := mgr.GetDocumentContent(ctx, "")
+	if err != ErrEmptyDocumentID {
+		t.Errorf("GetDocumentContent(\"\") error = %v, want %v", err, ErrEmptyDocumentID)
+	}
+}
+
+func TestIndexManager_GetDocumentContent_Closed(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewIndexManager(testIndexPath(t))
+
+	_, err := mgr.GetDocumentContent(context.Background(), "some-id")
+	if err != ErrIndexClosed {
+		t.Errorf("GetDocumentContent() error = %v, want %v", err, ErrIndexClosed)
+	}
+}
+
+func TestIndexManager_Search_UsesDefaultFieldConfig(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a document
+	doc := createTestDocument("default-search-test", "Testing that Search uses DefaultFieldConfig")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Regular Search should work (uses DefaultFieldConfig internally)
+	req := &search.SearchRequest{
+		Query: "testing",
+		Limit: 10,
+	}
+
+	result, err := mgr.Search(ctx, req)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("Search() returned nil result")
+	}
+
+	if result.TotalHits == 0 {
+		t.Error("expected at least one hit")
+	}
+}
+
+// =============================================================================
+// Integration Test: Selective Field Loading with Lazy Content Load
+// =============================================================================
+
+func TestIndexManager_SelectiveFieldsWithLazyContentLoad(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index multiple documents with different content
+	docs := []struct {
+		id      string
+		content string
+	}{
+		{"lazy-1", "First document with unique content alpha"},
+		{"lazy-2", "Second document with unique content beta"},
+		{"lazy-3", "Third document with unique content gamma"},
+	}
+
+	for _, d := range docs {
+		doc := createTestDocument(d.id, d.content)
+		if err := mgr.Index(ctx, doc); err != nil {
+			t.Fatalf("Index() error = %v", err)
+		}
+	}
+
+	// Search with metadata-only config
+	req := &search.SearchRequest{
+		Query: "unique content",
+		Limit: 10,
+	}
+
+	result, err := mgr.SearchWithFields(ctx, req, MetadataOnlyFieldConfig())
+	if err != nil {
+		t.Fatalf("SearchWithFields() error = %v", err)
+	}
+
+	if result.TotalHits != 3 {
+		t.Errorf("expected 3 hits, got %d", result.TotalHits)
+	}
+
+	// For each result, lazy-load content and verify
+	for _, scoredDoc := range result.Documents {
+		content, err := mgr.GetDocumentContent(ctx, scoredDoc.ID)
+		if err != nil {
+			t.Errorf("GetDocumentContent(%s) error = %v", scoredDoc.ID, err)
+			continue
+		}
+
+		if content == "" {
+			t.Errorf("GetDocumentContent(%s) returned empty content", scoredDoc.ID)
+		}
+	}
+}
+
+func TestErrBatchTimeout_Message(t *testing.T) {
+	t.Parallel()
+
+	if ErrBatchTimeout.Error() != "batch commit timeout" {
+		t.Errorf("ErrBatchTimeout.Error() = %q, want %q", ErrBatchTimeout.Error(), "batch commit timeout")
+	}
+}
+
+// =============================================================================
+// PF.3.2 - Async Indexing Integration Tests
+// =============================================================================
+
+func TestIndexManager_IndexAsync(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	doc := createTestDocument("doc1", "package main\nfunc main() {}")
+	ctx := context.Background()
+
+	// Without async enabled, should fall back to sync
+	resultCh := mgr.IndexAsync(ctx, doc)
+	if resultCh == nil {
+		t.Fatal("IndexAsync() returned nil channel")
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Errorf("IndexAsync() result = %v, want nil", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("IndexAsync() timed out")
+	}
+
+	// Verify document was indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 1 {
+		t.Errorf("DocumentCount() = %d, want 1", count)
+	}
+}
+
+func TestIndexManager_IndexAsync_NilDocument(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	resultCh := mgr.IndexAsync(ctx, nil)
+	if resultCh == nil {
+		t.Fatal("IndexAsync(nil) returned nil channel")
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != ErrNilDocument {
+			t.Errorf("IndexAsync(nil) result = %v, want %v", err, ErrNilDocument)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("IndexAsync(nil) timed out")
+	}
+}
+
+func TestIndexManager_IndexAsync_EmptyID(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+	doc := createTestDocument("", "content")
+	doc.ID = ""
+
+	resultCh := mgr.IndexAsync(ctx, doc)
+	if resultCh == nil {
+		t.Fatal("IndexAsync() returned nil channel")
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != ErrEmptyDocumentID {
+			t.Errorf("IndexAsync() result = %v, want %v", err, ErrEmptyDocumentID)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("IndexAsync() timed out")
+	}
+}
+
+func TestIndexManager_DeleteAsync(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// First index a document
+	doc := createTestDocument("doc1", "package main")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Delete it asynchronously
+	resultCh := mgr.DeleteAsync(ctx, doc.ID)
+	if resultCh == nil {
+		t.Fatal("DeleteAsync() returned nil channel")
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Errorf("DeleteAsync() result = %v, want nil", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("DeleteAsync() timed out")
+	}
+}
+
+func TestIndexManager_DeleteAsync_EmptyID(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	resultCh := mgr.DeleteAsync(ctx, "")
+	if resultCh == nil {
+		t.Fatal("DeleteAsync(\"\") returned nil channel")
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != ErrEmptyDocumentID {
+			t.Errorf("DeleteAsync(\"\") result = %v, want %v", err, ErrEmptyDocumentID)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("DeleteAsync(\"\") timed out")
+	}
+}
+
+func TestIndexManager_FlushAsync_NoAsync(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// FlushAsync should be no-op when async is not enabled
+	err := mgr.FlushAsync(ctx)
+	if err != nil {
+		t.Errorf("FlushAsync() error = %v, want nil", err)
+	}
+}
+
+func TestIndexManager_AsyncStats_NoAsync(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+
+	stats := mgr.AsyncStats()
+	if stats.Enqueued != 0 || stats.Processed != 0 {
+		t.Errorf("AsyncStats() = %+v, expected zero values", stats)
+	}
+}
+
+func TestIndexManager_IsAsyncEnabled_False(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+
+	if mgr.IsAsyncEnabled() {
+		t.Error("IsAsyncEnabled() = true, want false")
+	}
+}
+
+func TestIndexManager_WithAsyncEnabled(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:               path,
+		BatchSize:          100,
+		AsyncEnabled:       true,
+		AsyncQueueSize:     1000,
+		AsyncBatchSize:     10,
+		AsyncFlushInterval: 10 * time.Millisecond,
+	}
+
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	if !mgr.IsAsyncEnabled() {
+		t.Error("IsAsyncEnabled() = false, want true")
+	}
+
+	// Test async indexing
+	ctx := context.Background()
+	doc := createTestDocument("async-doc", "package main\nfunc async() {}")
+
+	resultCh := mgr.IndexAsync(ctx, doc)
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Errorf("IndexAsync() result = %v, want nil", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("IndexAsync() timed out")
+	}
+
+	// Flush and verify
+	if err := mgr.FlushAsync(ctx); err != nil {
+		t.Fatalf("FlushAsync() error = %v", err)
+	}
+
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 1 {
+		t.Errorf("DocumentCount() = %d, want 1", count)
+	}
+
+	stats := mgr.AsyncStats()
+	if stats.Enqueued == 0 {
+		t.Error("AsyncStats().Enqueued should be > 0")
+	}
+}
+
+func TestIndexManager_AsyncCloseProcessesPending(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:               path,
+		BatchSize:          100,
+		AsyncEnabled:       true,
+		AsyncQueueSize:     1000,
+		AsyncBatchSize:     100,
+		AsyncFlushInterval: 10 * time.Second, // Long interval
+	}
+
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Submit multiple documents
+	for i := 0; i < 5; i++ {
+		doc := createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"async content",
+		)
+		mgr.IndexAsync(ctx, doc)
+	}
+
+	// Close should process all pending
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	// Reopen and verify
+	mgr2 := NewIndexManager(path)
+	if err := mgr2.Open(); err != nil {
+		t.Fatalf("Reopen error = %v", err)
+	}
+	defer mgr2.Close()
+
+	count, err := mgr2.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 5 {
+		t.Errorf("DocumentCount() = %d, want 5 (pending ops should be processed on close)", count)
+	}
+}
+
+// =============================================================================
+// PF.3.3 - Path Index Tests
+// =============================================================================
+
+func TestIndexManager_PathIndex_PopulatedOnIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	doc := createTestDocument("doc1", "package main")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Path index should be populated
+	if mgr.PathIndexSize() != 1 {
+		t.Errorf("PathIndexSize() = %d, want 1", mgr.PathIndexSize())
+	}
+
+	docID, exists := mgr.GetDocIDByPath(doc.Path)
+	if !exists {
+		t.Errorf("GetDocIDByPath() exists = false, want true")
+	}
+	if docID != doc.ID {
+		t.Errorf("GetDocIDByPath() = %q, want %q", docID, doc.ID)
+	}
+}
+
+func TestIndexManager_PathIndex_PopulatedOnBatchIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	docs := make([]*search.Document, 5)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"batch content",
+		)
+	}
+
+	if err := mgr.IndexBatch(ctx, docs); err != nil {
+		t.Fatalf("IndexBatch() error = %v", err)
+	}
+
+	// All paths should be in the index
+	if mgr.PathIndexSize() != 5 {
+		t.Errorf("PathIndexSize() = %d, want 5", mgr.PathIndexSize())
+	}
+
+	for _, doc := range docs {
+		docID, exists := mgr.GetDocIDByPath(doc.Path)
+		if !exists {
+			t.Errorf("GetDocIDByPath(%q) not found", doc.Path)
+		}
+		if docID != doc.ID {
+			t.Errorf("GetDocIDByPath(%q) = %q, want %q", doc.Path, docID, doc.ID)
+		}
+	}
+}
+
+func TestIndexManager_PathIndex_PopulatedOnUpdate(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	doc := createTestDocument("doc1", "original content")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Update document
+	doc.Content = "updated content"
+	if err := mgr.Update(ctx, doc); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	// Path index should still have the mapping
+	docID, exists := mgr.GetDocIDByPath(doc.Path)
+	if !exists {
+		t.Errorf("GetDocIDByPath() after Update exists = false, want true")
+	}
+	if docID != doc.ID {
+		t.Errorf("GetDocIDByPath() = %q, want %q", docID, doc.ID)
+	}
+}
+
+func TestIndexManager_DeleteByPath_UsesPathIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	doc := createTestDocument("doc1", "package main")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Verify path index is populated
+	if mgr.PathIndexSize() != 1 {
+		t.Errorf("PathIndexSize() before delete = %d, want 1", mgr.PathIndexSize())
+	}
+
+	// Delete by path (should use O(1) lookup)
+	if err := mgr.DeleteByPath(ctx, doc.Path); err != nil {
+		t.Fatalf("DeleteByPath() error = %v", err)
+	}
+
+	// Path index should be cleared
+	if mgr.PathIndexSize() != 0 {
+		t.Errorf("PathIndexSize() after delete = %d, want 0", mgr.PathIndexSize())
+	}
+
+	// Document should be deleted
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 0 {
+		t.Errorf("DocumentCount() = %d, want 0", count)
+	}
+}
+
+func TestIndexManager_DeleteByPath_FallsBackToSearch(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	doc := createTestDocument("doc1", "package main")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Manually clear path index to force fallback
+	mgr.RemovePathIndex(doc.Path)
+
+	// Delete by path should still work via search fallback
+	if err := mgr.DeleteByPath(ctx, doc.Path); err != nil {
+		t.Fatalf("DeleteByPath() with fallback error = %v", err)
+	}
+
+	// Document should be deleted
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 0 {
+		t.Errorf("DocumentCount() = %d, want 0", count)
+	}
+}
+
+func TestIndexManager_UpdatePathIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+
+	// Add mapping
+	mgr.UpdatePathIndex("/test/path", "doc123")
+
+	docID, exists := mgr.GetDocIDByPath("/test/path")
+	if !exists {
+		t.Error("GetDocIDByPath() exists = false after UpdatePathIndex")
+	}
+	if docID != "doc123" {
+		t.Errorf("GetDocIDByPath() = %q, want %q", docID, "doc123")
+	}
+
+	// Update mapping
+	mgr.UpdatePathIndex("/test/path", "doc456")
+
+	docID, exists = mgr.GetDocIDByPath("/test/path")
+	if !exists {
+		t.Error("GetDocIDByPath() exists = false after update")
+	}
+	if docID != "doc456" {
+		t.Errorf("GetDocIDByPath() = %q, want %q", docID, "doc456")
+	}
+}
+
+func TestIndexManager_RemovePathIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+
+	mgr.UpdatePathIndex("/test/path", "doc123")
+	mgr.RemovePathIndex("/test/path")
+
+	_, exists := mgr.GetDocIDByPath("/test/path")
+	if exists {
+		t.Error("GetDocIDByPath() exists = true after RemovePathIndex, want false")
+	}
+}
+
+func TestIndexManager_PathIndexClearedOnClose(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	ctx := context.Background()
+	doc := createTestDocument("doc1", "content")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	if mgr.PathIndexSize() != 1 {
+		t.Errorf("PathIndexSize() before close = %d, want 1", mgr.PathIndexSize())
+	}
+
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	// After close, path index should be cleared
+	if mgr.PathIndexSize() != 0 {
+		t.Errorf("PathIndexSize() after close = %d, want 0", mgr.PathIndexSize())
+	}
+}
+
+func TestIndexManager_PathIndex_ConcurrentAccess(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	const numGoroutines = 10
+	const opsPerGoroutine = 20
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines*opsPerGoroutine)
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				id := search.GenerateDocumentID([]byte{byte(goroutineID), byte(i)})
+				doc := createTestDocument(id, "concurrent path index test")
+				if err := mgr.Index(ctx, doc); err != nil {
+					errCh <- err
+					return
+				}
+
+				// Also read from path index
+				_, _ = mgr.GetDocIDByPath(doc.Path)
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent path index error: %v", err)
+	}
+
+	// Should have indexed all documents
+	expectedSize := numGoroutines * opsPerGoroutine
+	if mgr.PathIndexSize() != expectedSize {
+		t.Errorf("PathIndexSize() = %d, want %d", mgr.PathIndexSize(), expectedSize)
+	}
+}
+
+// =============================================================================
+// PF.3.2/PF.3.3 Integration Tests
+// =============================================================================
+
+func TestIndexManager_AsyncIndexUpdatesPathIndex(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:               path,
+		BatchSize:          100,
+		AsyncEnabled:       true,
+		AsyncQueueSize:     1000,
+		AsyncBatchSize:     10,
+		AsyncFlushInterval: 10 * time.Millisecond,
+	}
+
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	doc := createTestDocument("async-doc", "async content")
+
+	// Index async should also update path index
+	resultCh := mgr.IndexAsync(ctx, doc)
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Errorf("IndexAsync() result = %v, want nil", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("IndexAsync() timed out")
+	}
+
+	// Path index should be updated immediately (before async completes)
+	docID, exists := mgr.GetDocIDByPath(doc.Path)
+	if !exists {
+		t.Error("GetDocIDByPath() exists = false after IndexAsync, want true")
+	}
+	if docID != doc.ID {
+		t.Errorf("GetDocIDByPath() = %q, want %q", docID, doc.ID)
+	}
+}
+
+func BenchmarkIndexManager_DeleteByPath_WithPathIndex(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "bench.bleve")
+	mgr := NewIndexManager(path)
+	if err := mgr.Open(); err != nil {
+		b.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Pre-populate with documents
+	docs := make([]*search.Document, 100)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"benchmark content",
+		)
+	}
+	if err := mgr.IndexBatch(ctx, docs); err != nil {
+		b.Fatalf("IndexBatch() error = %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Re-index if we've deleted all
+		if i > 0 && i%100 == 0 {
+			for j := range docs {
+				docs[j].ID = search.GenerateDocumentID([]byte{byte(i), byte(j)})
+			}
+			if err := mgr.IndexBatch(ctx, docs); err != nil {
+				b.Fatalf("IndexBatch() error = %v", err)
+			}
+		}
+
+		docIdx := i % 100
+		_ = mgr.DeleteByPath(ctx, docs[docIdx].Path)
+	}
+}
+
+// =============================================================================
+// PF.3.10 - Batch Size Validation Tests
+// =============================================================================
+
+func TestValidateBatchSize_Constants(t *testing.T) {
+	t.Parallel()
+
+	// Verify constants are as expected
+	if MinBatchSize != 10 {
+		t.Errorf("MinBatchSize = %d, want 10", MinBatchSize)
+	}
+	if MaxBatchSize != 10000 {
+		t.Errorf("MaxBatchSize = %d, want 10000", MaxBatchSize)
+	}
+	if DefaultBatchSize != 100 {
+		t.Errorf("DefaultBatchSize = %d, want 100", DefaultBatchSize)
+	}
+}
+
+func TestValidateBatchSize_BelowMin(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		input    int
+		expected int
+	}{
+		{0, MinBatchSize},
+		{1, MinBatchSize},
+		{5, MinBatchSize},
+		{9, MinBatchSize},
+		{-1, MinBatchSize},
+		{-100, MinBatchSize},
+	}
+
+	for _, tc := range testCases {
+		t.Run(string(rune('0'+tc.input)), func(t *testing.T) {
+			result := ValidateBatchSize(tc.input)
+			if result != tc.expected {
+				t.Errorf("ValidateBatchSize(%d) = %d, want %d", tc.input, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestValidateBatchSize_AboveMax(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		input    int
+		expected int
+	}{
+		{10001, MaxBatchSize},
+		{20000, MaxBatchSize},
+		{100000, MaxBatchSize},
+		{1000000, MaxBatchSize},
+	}
+
+	for _, tc := range testCases {
+		result := ValidateBatchSize(tc.input)
+		if result != tc.expected {
+			t.Errorf("ValidateBatchSize(%d) = %d, want %d", tc.input, result, tc.expected)
+		}
+	}
+}
+
+func TestValidateBatchSize_WithinBounds(t *testing.T) {
+	t.Parallel()
+
+	testCases := []int{
+		MinBatchSize,
+		MinBatchSize + 1,
+		50,
+		100,
+		500,
+		1000,
+		5000,
+		MaxBatchSize - 1,
+		MaxBatchSize,
+	}
+
+	for _, input := range testCases {
+		result := ValidateBatchSize(input)
+		if result != input {
+			t.Errorf("ValidateBatchSize(%d) = %d, want %d (should return input unchanged)", input, result, input)
+		}
+	}
+}
+
+func TestIndexManager_IndexBatch_LargeBatchChunking(t *testing.T) {
+	t.Parallel()
+
+	// Use a small batch size to test chunking behavior
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    20, // Small batch size to trigger chunking
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Create 55 documents (should result in 3 chunks: 20, 20, 15)
+	docs := make([]*search.Document, 55)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i), byte(i >> 8)}),
+			"chunked batch test document",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with chunking error = %v, want nil", err)
+	}
+
+	// Verify all documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 55 {
+		t.Errorf("DocumentCount() = %d, want 55", count)
+	}
+}
+
+func TestIndexManager_IndexBatch_VeryLargeBatch(t *testing.T) {
+	t.Parallel()
+
+	// Test with batch size at MaxBatchSize boundary
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    50, // Use 50 to make test faster while still testing chunking
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Create 200 documents to test multiple chunks
+	docs := make([]*search.Document, 200)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i), byte(i >> 8)}),
+			"large batch test",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with large batch error = %v, want nil", err)
+	}
+
+	// Verify all documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 200 {
+		t.Errorf("DocumentCount() = %d, want 200", count)
+	}
+}
+
+func TestIndexManager_IndexBatch_ChunkingContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    10, // Very small to create many chunks
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	// Create cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	// Create 50 documents (should be chunked into 5 batches)
+	docs := make([]*search.Document, 50)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"cancel test",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	// Should either return context.Canceled or succeed if first chunk completes before check
+	if err != nil && err != context.Canceled {
+		// Check if it's a chunk error wrapping context.Canceled
+		if !strings.Contains(err.Error(), "canceled") && !strings.Contains(err.Error(), "context") {
+			t.Errorf("IndexBatch() with cancelled context error = %v, expected context.Canceled or nil", err)
+		}
+	}
+}
+
+func TestIndexManager_IndexBatch_BatchSizeZeroDefaultsToMin(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    0, // Zero should be validated to MinBatchSize
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Create 25 documents (with validated batch size of 10, should result in 3 chunks)
+	docs := make([]*search.Document, 25)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"zero batch size test",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with zero batch size error = %v, want nil", err)
+	}
+
+	// Verify all documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 25 {
+		t.Errorf("DocumentCount() = %d, want 25", count)
+	}
+}
+
+func TestIndexManager_IndexBatch_NegativeBatchSizeDefaultsToMin(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    -50, // Negative should be validated to MinBatchSize
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Create 15 documents
+	docs := make([]*search.Document, 15)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"negative batch size test",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with negative batch size error = %v, want nil", err)
+	}
+
+	// Verify all documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 15 {
+		t.Errorf("DocumentCount() = %d, want 15", count)
+	}
+}
+
+func TestIndexManager_IndexBatch_ExactlyBatchSize(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    20,
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Create exactly 20 documents (should not trigger chunking since len(docs) == batchSize)
+	docs := make([]*search.Document, 20)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"exact batch size test",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with exact batch size error = %v, want nil", err)
+	}
+
+	// Verify all documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 20 {
+		t.Errorf("DocumentCount() = %d, want 20", count)
+	}
+}
+
+func TestIndexManager_IndexBatch_OneLessThanBatchSize(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    20,
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Create 19 documents (should not trigger chunking)
+	docs := make([]*search.Document, 19)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"less than batch size test",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with less than batch size error = %v, want nil", err)
+	}
+
+	// Verify all documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 19 {
+		t.Errorf("DocumentCount() = %d, want 19", count)
+	}
+}
+
+func TestIndexManager_IndexBatch_OneMoreThanBatchSize(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	config := IndexConfig{
+		Path:         path,
+		BatchSize:    20,
+		BatchTimeout: DefaultBatchTimeout,
+	}
+	mgr := NewIndexManagerWithConfig(config)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Create 21 documents (should trigger chunking: 20 + 1)
+	docs := make([]*search.Document, 21)
+	for i := range docs {
+		docs[i] = createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"more than batch size test",
+		)
+	}
+
+	err := mgr.IndexBatch(ctx, docs)
+	if err != nil {
+		t.Errorf("IndexBatch() with more than batch size error = %v, want nil", err)
+	}
+
+	// Verify all documents were indexed
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 21 {
+		t.Errorf("DocumentCount() = %d, want 21", count)
 	}
 }

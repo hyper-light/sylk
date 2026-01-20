@@ -1,7 +1,9 @@
 package concurrency
 
 import (
+	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -252,4 +254,180 @@ func itoa(i int) string {
 		return string(rune('0' + i))
 	}
 	return itoa(i/10) + string(rune('0'+i%10))
+}
+
+func TestNewPipelineSchedulerWithContext(t *testing.T) {
+	ctx := context.Background()
+	s := NewPipelineSchedulerWithContext(ctx, DefaultSchedulerConfig())
+
+	if s.ActiveCount() != 0 {
+		t.Errorf("got ActiveCount %d, want 0", s.ActiveCount())
+	}
+	if s.ctx == nil {
+		t.Error("expected scheduler to have a context")
+	}
+	if s.cancel == nil {
+		t.Error("expected scheduler to have a cancel function")
+	}
+}
+
+func TestPipelineScheduler_ContextPropagation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := NewPipelineSchedulerWithContext(ctx, SchedulerConfig{MaxConcurrent: 2})
+
+	pipelineStarted := make(chan struct{})
+	pipelineCancelled := atomic.Bool{}
+
+	runner := NewPipelineRunner(PipelineRunnerConfig{
+		ID:              "test-runner",
+		ShutdownTimeout: time.Second,
+	})
+	runner.RegisterPhase(PhaseWorker, func(ctx context.Context) error {
+		close(pipelineStarted)
+		<-ctx.Done()
+		pipelineCancelled.Store(true)
+		return ctx.Err()
+	})
+
+	p := &SchedulablePipeline{
+		ID:        "p1",
+		Priority:  PriorityNormal,
+		SpawnTime: time.Now(),
+		Runner:    runner,
+	}
+	if err := s.Schedule(p); err != nil {
+		t.Fatalf("Schedule failed: %v", err)
+	}
+
+	// Wait for pipeline to start
+	select {
+	case <-pipelineStarted:
+	case <-time.After(time.Second):
+		t.Fatal("pipeline did not start in time")
+	}
+
+	// Cancel the parent context
+	cancel()
+
+	// Wait for cancellation to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	if !pipelineCancelled.Load() {
+		t.Error("expected pipeline to be cancelled when parent context is cancelled")
+	}
+}
+
+func TestPipelineScheduler_CloseContextCancellation(t *testing.T) {
+	ctx := context.Background()
+	s := NewPipelineSchedulerWithContext(ctx, SchedulerConfig{MaxConcurrent: 2})
+
+	pipelineStarted := make(chan struct{})
+	pipelineCancelled := atomic.Bool{}
+
+	runner := NewPipelineRunner(PipelineRunnerConfig{
+		ID:              "test-runner",
+		ShutdownTimeout: time.Second,
+	})
+	runner.RegisterPhase(PhaseWorker, func(ctx context.Context) error {
+		close(pipelineStarted)
+		<-ctx.Done()
+		pipelineCancelled.Store(true)
+		return ctx.Err()
+	})
+
+	p := &SchedulablePipeline{
+		ID:        "p1",
+		Priority:  PriorityNormal,
+		SpawnTime: time.Now(),
+		Runner:    runner,
+	}
+	if err := s.Schedule(p); err != nil {
+		t.Fatalf("Schedule failed: %v", err)
+	}
+
+	// Wait for pipeline to start
+	select {
+	case <-pipelineStarted:
+	case <-time.After(time.Second):
+		t.Fatal("pipeline did not start in time")
+	}
+
+	// Close the scheduler
+	s.Close()
+
+	// Wait for cancellation to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	if !pipelineCancelled.Load() {
+		t.Error("expected pipeline to be cancelled when scheduler is closed")
+	}
+}
+
+func TestPipelineScheduler_CancelIndividualPipeline(t *testing.T) {
+	ctx := context.Background()
+	s := NewPipelineSchedulerWithContext(ctx, SchedulerConfig{MaxConcurrent: 2})
+
+	pipeline1Started := make(chan struct{})
+	pipeline1Cancelled := atomic.Bool{}
+	pipeline2Running := atomic.Bool{}
+
+	runner1 := NewPipelineRunner(PipelineRunnerConfig{
+		ID:              "runner-1",
+		ShutdownTimeout: time.Second,
+	})
+	runner1.RegisterPhase(PhaseWorker, func(ctx context.Context) error {
+		close(pipeline1Started)
+		<-ctx.Done()
+		pipeline1Cancelled.Store(true)
+		return ctx.Err()
+	})
+
+	runner2 := NewPipelineRunner(PipelineRunnerConfig{
+		ID:              "runner-2",
+		ShutdownTimeout: time.Second,
+	})
+	runner2.RegisterPhase(PhaseWorker, func(ctx context.Context) error {
+		pipeline2Running.Store(true)
+		time.Sleep(200 * time.Millisecond)
+		return nil
+	})
+
+	p1 := &SchedulablePipeline{
+		ID:        "p1",
+		Priority:  PriorityNormal,
+		SpawnTime: time.Now(),
+		Runner:    runner1,
+	}
+	p2 := &SchedulablePipeline{
+		ID:        "p2",
+		Priority:  PriorityNormal,
+		SpawnTime: time.Now(),
+		Runner:    runner2,
+	}
+
+	_ = s.Schedule(p1)
+	_ = s.Schedule(p2)
+
+	// Wait for pipeline 1 to start
+	select {
+	case <-pipeline1Started:
+	case <-time.After(time.Second):
+		t.Fatal("pipeline 1 did not start in time")
+	}
+
+	// Cancel only pipeline 1
+	if err := s.Cancel("p1"); err != nil {
+		t.Fatalf("Cancel failed: %v", err)
+	}
+
+	// Wait for cancellation to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	if !pipeline1Cancelled.Load() {
+		t.Error("expected pipeline 1 to be cancelled")
+	}
+
+	// Pipeline 2 should still be running or have completed normally
+	// (it was not cancelled)
+	s.Close()
 }

@@ -352,3 +352,115 @@ func TestQueryEngineHybridScoring(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryEngineBatchLoading(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+	es := NewEdgeStore(db)
+
+	// Create many nodes to verify batch loading handles multiple nodes
+	nodeCount := 50
+	for i := 0; i < nodeCount; i++ {
+		ns.InsertNode(&GraphNode{
+			ID:       nodeID(i),
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+		}, []float32{float32(i%10) + 0.1, 0.1, 0.1})
+	}
+
+	// Create edges to form a connected graph
+	for i := 0; i < nodeCount-1; i++ {
+		es.InsertEdge(&GraphEdge{SourceID: nodeID(i), TargetID: nodeID(i + 1), EdgeType: EdgeTypeCalls})
+	}
+
+	// Setup mock HNSW with results
+	mock := newMockHNSWSearcher()
+	results := make([]HNSWSearchResult, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		results[i] = HNSWSearchResult{ID: nodeID(i), Similarity: float64(nodeCount-i) / float64(nodeCount)}
+	}
+	mock.setResults(results)
+	mock.addVector(nodeID(0), []float32{1, 0.1, 0.1})
+
+	vs := NewVectorSearcher(db, mock)
+	gt := NewGraphTraverser(db)
+	qe := NewQueryEngine(db, vs, gt)
+
+	// Run hybrid query - should use batch loading internally
+	queryResults, err := qe.HybridQuery([]float32{1, 0, 0}, []string{nodeID(0)}, &HybridQueryOptions{
+		VectorLimit: nodeCount,
+		GraphDepth:  2,
+	})
+	if err != nil {
+		t.Fatalf("HybridQuery: %v", err)
+	}
+
+	// Verify we got results - batch loading should have worked
+	if len(queryResults) == 0 {
+		t.Error("HybridQuery should return results with batch loading")
+	}
+
+	// Verify all results have valid nodes
+	for _, r := range queryResults {
+		if r.Node == nil {
+			t.Error("Result node should not be nil")
+		}
+		if r.Node.ID == "" {
+			t.Error("Result node ID should not be empty")
+		}
+	}
+}
+
+func TestQueryEngineScoreResultsWithBatchLoader(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	// Insert nodes
+	for i := 0; i < 10; i++ {
+		ns.InsertNode(&GraphNode{
+			ID:       nodeID(i),
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+		}, []float32{float32(i + 1), 0.1, 0.1})
+	}
+
+	mock := newMockHNSWSearcher()
+	vs := NewVectorSearcher(db, mock)
+	gt := NewGraphTraverser(db)
+	qe := NewQueryEngine(db, vs, gt)
+
+	// Prepare test data
+	allIDs := make(map[string]bool)
+	vectorScores := make(map[string]float64)
+	graphCounts := make(map[string]int)
+
+	for i := 0; i < 10; i++ {
+		id := nodeID(i)
+		allIDs[id] = true
+		vectorScores[id] = float64(10-i) / 10.0
+		graphCounts[id] = i + 1
+	}
+
+	opts := &HybridQueryOptions{
+		VectorWeight: 0.7,
+		GraphWeight:  0.3,
+	}
+
+	// Call scoreResults directly to test batch loading
+	results := qe.scoreResults(allIDs, vectorScores, graphCounts, 10, opts)
+
+	if len(results) != 10 {
+		t.Errorf("Got %d results, want 10", len(results))
+	}
+
+	// Verify all results have nodes and proper scores
+	for _, r := range results {
+		if r.Node == nil {
+			t.Error("Result node should not be nil")
+		}
+	}
+}

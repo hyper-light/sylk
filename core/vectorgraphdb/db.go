@@ -93,6 +93,27 @@ func (v *VectorGraphDB) Migrate() error {
 	return nil
 }
 
+// EnsureIndexes creates any missing performance indexes.
+// This is idempotent and safe to call multiple times.
+func (v *VectorGraphDB) EnsureIndexes() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_nodes_updated_at ON nodes(updated_at)",
+		"CREATE INDEX IF NOT EXISTS idx_edges_type_domain ON edges(edge_type, source_id)",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_domain ON nodes(domain)",
+	}
+
+	for _, idx := range indexes {
+		if _, err := v.db.Exec(idx); err != nil {
+			return fmt.Errorf("failed to create index: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func (v *VectorGraphDB) Vacuum() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()

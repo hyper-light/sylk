@@ -708,3 +708,247 @@ func TestHotCache_SingleEntry(t *testing.T) {
 		t.Error("expected 0 entries after full eviction")
 	}
 }
+
+// =============================================================================
+// Async Eviction Tests (PF.5.10)
+// =============================================================================
+
+func TestHotCache_AsyncEvictionMode(t *testing.T) {
+	t.Run("async eviction triggered on add", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       5000,
+			AsyncEviction: true,
+		})
+		defer cache.Close()
+
+		// Add entries to trigger eviction
+		for i := 0; i < 20; i++ {
+			cache.Add("entry-"+string(rune('a'+(i%26))), makeTestEntry("entry-"+string(rune('a'+(i%26))), 1000))
+		}
+
+		// Wait for async eviction to process
+		time.Sleep(100 * time.Millisecond)
+
+		// Should be at or under max size
+		if cache.Size() > cache.MaxSize() {
+			t.Errorf("expected size <= %d, got %d", cache.MaxSize(), cache.Size())
+		}
+	})
+
+	t.Run("async eviction with callback", func(t *testing.T) {
+		var evictedIDs []string
+		var mu sync.Mutex
+
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       3000,
+			AsyncEviction: true,
+			OnEvict: func(id string, entry *ContentEntry) {
+				mu.Lock()
+				evictedIDs = append(evictedIDs, id)
+				mu.Unlock()
+			},
+		})
+		defer cache.Close()
+
+		// Add entries to trigger eviction
+		for i := 0; i < 10; i++ {
+			cache.Add("entry-"+string(rune('a'+i)), makeTestEntry("entry-"+string(rune('a'+i)), 1000))
+		}
+
+		// Wait for async eviction
+		time.Sleep(100 * time.Millisecond)
+
+		mu.Lock()
+		evictCount := len(evictedIDs)
+		mu.Unlock()
+
+		if evictCount == 0 {
+			t.Error("expected some entries to be evicted")
+		}
+	})
+
+	t.Run("async eviction concurrent safety", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       10000,
+			AsyncEviction: true,
+		})
+		defer cache.Close()
+
+		var wg sync.WaitGroup
+
+		// Concurrent adds
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				cache.Add("entry-"+string(rune(id)), makeTestEntry("entry-"+string(rune(id)), 500))
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Wait for async eviction
+		time.Sleep(100 * time.Millisecond)
+
+		// Should not exceed max size
+		if cache.Size() > cache.MaxSize() {
+			t.Errorf("cache size %d exceeds max %d", cache.Size(), cache.MaxSize())
+		}
+	})
+
+	t.Run("sync mode still works", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       3000,
+			AsyncEviction: false,
+		})
+
+		// Add entries
+		for i := 0; i < 10; i++ {
+			cache.Add("entry-"+string(rune('a'+i)), makeTestEntry("entry-"+string(rune('a'+i)), 1000))
+		}
+
+		// Should immediately be at or under max size
+		if cache.Size() > cache.MaxSize() {
+			t.Errorf("expected size <= %d, got %d", cache.MaxSize(), cache.Size())
+		}
+	})
+}
+
+func TestHotCache_EvictionCallback(t *testing.T) {
+	t.Run("callback invoked on eviction", func(t *testing.T) {
+		var evictedIDs []string
+		var mu sync.Mutex
+
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize: 3000,
+			OnEvict: func(id string, entry *ContentEntry) {
+				mu.Lock()
+				evictedIDs = append(evictedIDs, id)
+				mu.Unlock()
+			},
+		})
+
+		// Add entries to trigger eviction
+		for i := 0; i < 10; i++ {
+			cache.Add("entry-"+string(rune('a'+i)), makeTestEntry("entry-"+string(rune('a'+i)), 1000))
+		}
+
+		mu.Lock()
+		evictCount := len(evictedIDs)
+		mu.Unlock()
+
+		if evictCount == 0 {
+			t.Error("expected eviction callback to be invoked")
+		}
+	})
+
+	t.Run("callback on Remove", func(t *testing.T) {
+		var evictedID string
+
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize: 100000,
+			OnEvict: func(id string, entry *ContentEntry) {
+				evictedID = id
+			},
+		})
+
+		cache.Add("test-entry", makeTestEntry("test-entry", 1000))
+		cache.Remove("test-entry")
+
+		if evictedID != "test-entry" {
+			t.Errorf("expected eviction callback for 'test-entry', got '%s'", evictedID)
+		}
+	})
+
+	t.Run("callback on Clear", func(t *testing.T) {
+		var evictedIDs []string
+
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize: 100000,
+			OnEvict: func(id string, entry *ContentEntry) {
+				evictedIDs = append(evictedIDs, id)
+			},
+		})
+
+		cache.Add("entry-1", makeTestEntry("entry-1", 1000))
+		cache.Add("entry-2", makeTestEntry("entry-2", 1000))
+		cache.Add("entry-3", makeTestEntry("entry-3", 1000))
+
+		cache.Clear()
+
+		if len(evictedIDs) != 3 {
+			t.Errorf("expected 3 eviction callbacks, got %d", len(evictedIDs))
+		}
+	})
+
+	t.Run("SetEvictionCallback updates callback", func(t *testing.T) {
+		cache := NewDefaultHotCache()
+
+		var called bool
+		cache.SetEvictionCallback(func(id string, entry *ContentEntry) {
+			called = true
+		})
+
+		cache.Add("test", makeTestEntry("test", 1000))
+		cache.Remove("test")
+
+		if !called {
+			t.Error("expected new callback to be invoked")
+		}
+	})
+}
+
+func TestHotCache_EvictionBatchSize(t *testing.T) {
+	t.Run("custom batch size", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:           100000,
+			EvictionBatchSize: 50,
+		})
+
+		if cache.EvictionBatchSize() != 50 {
+			t.Errorf("expected batch size 50, got %d", cache.EvictionBatchSize())
+		}
+	})
+
+	t.Run("SetEvictionBatchSize updates size", func(t *testing.T) {
+		cache := NewDefaultHotCache()
+
+		cache.SetEvictionBatchSize(200)
+
+		if cache.EvictionBatchSize() != 200 {
+			t.Errorf("expected batch size 200, got %d", cache.EvictionBatchSize())
+		}
+	})
+
+	t.Run("invalid batch size uses default", func(t *testing.T) {
+		cache := NewDefaultHotCache()
+
+		cache.SetEvictionBatchSize(-1)
+
+		if cache.EvictionBatchSize() != DefaultEvictionBatchSize {
+			t.Errorf("expected default batch size, got %d", cache.EvictionBatchSize())
+		}
+	})
+}
+
+func TestHotCache_Close(t *testing.T) {
+	t.Run("close stops async eviction", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       5000,
+			AsyncEviction: true,
+		})
+
+		// Add some entries
+		for i := 0; i < 5; i++ {
+			cache.Add("entry-"+string(rune('a'+i)), makeTestEntry("entry-"+string(rune('a'+i)), 500))
+		}
+
+		// Close should not panic
+		cache.Close()
+
+		// Wait briefly
+		time.Sleep(50 * time.Millisecond)
+
+		// Should not panic or deadlock
+	})
+}

@@ -44,7 +44,9 @@ func copyLayerNodes(l *layer) map[string][]string {
 
 	nodes := make(map[string][]string, len(l.nodes))
 	for id, node := range l.nodes {
-		nodes[id] = copyStringSlice(node.neighbors)
+		// Get neighbor IDs from ConcurrentNeighborSet and copy
+		neighborIDs := node.neighbors.GetIDs()
+		nodes[id] = copyStringSlice(neighborIDs)
 	}
 	return nodes
 }

@@ -31,20 +31,33 @@ type PipelineScheduler struct {
 	waiting   map[string]*SchedulablePipeline
 	completed map[string]bool
 	closed    bool
+	ctx       context.Context
+	cancel    context.CancelFunc
 	mu        sync.Mutex
 }
 
+// NewPipelineScheduler creates a new scheduler with a background context.
+// For context propagation, use NewPipelineSchedulerWithContext instead.
 func NewPipelineScheduler(config SchedulerConfig) *PipelineScheduler {
+	return NewPipelineSchedulerWithContext(context.Background(), config)
+}
+
+// NewPipelineSchedulerWithContext creates a new scheduler with the given parent context.
+// All pipelines started by this scheduler will respect the parent context's cancellation.
+func NewPipelineSchedulerWithContext(ctx context.Context, config SchedulerConfig) *PipelineScheduler {
 	if config.MaxConcurrent <= 0 {
 		config.MaxConcurrent = runtime.NumCPU()
 	}
 
+	schedCtx, cancel := context.WithCancel(ctx)
 	return &PipelineScheduler{
 		config:    config,
 		active:    make(map[string]*SchedulablePipeline),
 		ready:     NewPipelinePriorityQueue(),
 		waiting:   make(map[string]*SchedulablePipeline),
 		completed: make(map[string]bool),
+		ctx:       schedCtx,
+		cancel:    cancel,
 	}
 }
 
@@ -152,7 +165,10 @@ func (s *PipelineScheduler) tryScheduleNext() {
 func (s *PipelineScheduler) startPipeline(p *SchedulablePipeline) {
 	s.active[p.ID] = p
 	if p.Runner != nil {
-		go p.Runner.Start(context.Background())
+		// Create child context for this pipeline that inherits from scheduler's context
+		pipelineCtx, cancel := context.WithCancel(s.ctx)
+		p.cancel = cancel
+		go p.Runner.Start(pipelineCtx)
 	}
 }
 
@@ -212,6 +228,10 @@ func (s *PipelineScheduler) cancelActive(id string) bool {
 	if !ok {
 		return false
 	}
+	// Cancel the pipeline's context first if available
+	if p.cancel != nil {
+		p.cancel()
+	}
 	if p.Runner != nil {
 		p.Runner.Stop()
 	}
@@ -253,11 +273,19 @@ func (s *PipelineScheduler) Close() {
 	defer s.mu.Unlock()
 
 	s.closed = true
+	// Cancel the scheduler context, which propagates to all pipelines
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.cancelAllActive()
 }
 
 func (s *PipelineScheduler) cancelAllActive() {
 	for id, p := range s.active {
+		// Cancel the pipeline's context first if available
+		if p.cancel != nil {
+			p.cancel()
+		}
 		if p.Runner != nil {
 			p.Runner.Stop()
 		}

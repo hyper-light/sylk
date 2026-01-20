@@ -47,6 +47,9 @@ type MemoryWeightedScorer struct {
 	// Update configuration for Bayesian learning
 	updateConfig *handoff.UpdateConfig
 
+	// PF.4.5: Activation cache for avoiding redundant ACT-R calculations
+	activationCache *ActivationCache
+
 	mu sync.RWMutex
 }
 
@@ -57,6 +60,25 @@ type MemoryWeightedScorer struct {
 //   - FrequencyBonus: Beta(2, 8) -> mean 0.2 (least important)
 //   - RetrievalThreshold: Beta(2, 8) -> mean 0.2 (low threshold)
 func NewMemoryWeightedScorer(store *MemoryStore) *MemoryWeightedScorer {
+	return NewMemoryWeightedScorerWithCache(store, nil, nil)
+}
+
+// NewMemoryWeightedScorerWithCache creates a new MemoryWeightedScorer with optional
+// cache configuration. If cacheConfig is nil, uses default cache configuration.
+// If updateConfig is nil, uses default Bayesian learning configuration.
+func NewMemoryWeightedScorerWithCache(store *MemoryStore, cacheConfig *ActivationCacheConfig, updateConfig *handoff.UpdateConfig) *MemoryWeightedScorer {
+	var cache *ActivationCache
+	if cacheConfig != nil {
+		cache = NewActivationCache(*cacheConfig)
+	} else {
+		cache = NewDefaultActivationCache()
+	}
+
+	cfg := updateConfig
+	if cfg == nil {
+		cfg = handoff.DefaultUpdateConfig()
+	}
+
 	return &MemoryWeightedScorer{
 		store:              store,
 		ActivationWeight:   handoff.NewLearnedWeight(5.0, 5.0),
@@ -64,17 +86,14 @@ func NewMemoryWeightedScorer(store *MemoryStore) *MemoryWeightedScorer {
 		FrequencyBonus:     handoff.NewLearnedWeight(2.0, 8.0),
 		RetrievalThreshold: handoff.NewLearnedWeight(2.0, 8.0),
 		MinActivation:      DefaultMinActivation,
-		updateConfig:       handoff.DefaultUpdateConfig(),
+		updateConfig:       cfg,
+		activationCache:    cache,
 	}
 }
 
 // NewMemoryWeightedScorerWithConfig creates a scorer with custom update configuration.
 func NewMemoryWeightedScorerWithConfig(store *MemoryStore, config *handoff.UpdateConfig) *MemoryWeightedScorer {
-	scorer := NewMemoryWeightedScorer(store)
-	if config != nil {
-		scorer.updateConfig = config
-	}
-	return scorer
+	return NewMemoryWeightedScorerWithCache(store, nil, config)
 }
 
 // ApplyMemoryWeighting computes memory-weighted scores for hybrid results.
@@ -255,6 +274,9 @@ func (s *MemoryWeightedScorer) RecordRetrievalOutcome(
 // ComputeMemoryScore computes the memory-weighted score for a single node.
 // Combines activation, recency bonus, and frequency bonus using learned weights.
 //
+// PF.4.5: Uses ActivationCache to avoid redundant activation calculations.
+// Activations are cached by (nodeID, timeBucket) for efficiency.
+//
 // Formula:
 //
 //	memoryScore = activation * activationWeight
@@ -292,10 +314,17 @@ func (s *MemoryWeightedScorer) ComputeMemoryScore(
 		frequencyWeight = s.FrequencyBonus.Mean()
 	}
 
-	// Compute activation (clamped to minimum)
-	activation := memory.Activation(now)
-	if activation < s.MinActivation {
-		activation = s.MinActivation
+	// PF.4.5: Use cache to avoid redundant activation calculations
+	// The cache is keyed by (nodeID, timeBucket) so requests within the same
+	// time window share cached values while ensuring activations are recalculated
+	// as they naturally decay over time.
+	var activation float64
+	if s.activationCache != nil {
+		activation = s.activationCache.GetOrCompute(nodeID, now, func() float64 {
+			return s.computeActivationClamped(memory, now)
+		})
+	} else {
+		activation = s.computeActivationClamped(memory, now)
 	}
 
 	// Normalize activation to [0,1] range for combination
@@ -321,6 +350,16 @@ func (s *MemoryWeightedScorer) ComputeMemoryScore(
 		frequencyComponent*frequencyWeight
 
 	return memoryScore, nil
+}
+
+// computeActivationClamped computes the activation for a memory and clamps it
+// to the minimum activation floor. This is a helper for cache computation.
+func (s *MemoryWeightedScorer) computeActivationClamped(memory *ACTRMemory, now time.Time) float64 {
+	activation := memory.Activation(now)
+	if activation < s.MinActivation {
+		activation = s.MinActivation
+	}
+	return activation
 }
 
 // GetWeights returns the current learned weight values (means).
@@ -364,6 +403,35 @@ func (s *MemoryWeightedScorer) SetMinActivation(min float64) {
 // Store returns the underlying MemoryStore.
 func (s *MemoryWeightedScorer) Store() *MemoryStore {
 	return s.store
+}
+
+// ActivationCache returns the activation cache for monitoring or testing.
+// Returns nil if no cache is configured.
+func (s *MemoryWeightedScorer) ActivationCache() *ActivationCache {
+	return s.activationCache
+}
+
+// InvalidateActivationCache invalidates all cached activations for a specific node.
+// Call this when a node's memory traces have been updated.
+func (s *MemoryWeightedScorer) InvalidateActivationCache(nodeID string) {
+	if s.activationCache != nil {
+		s.activationCache.InvalidateNode(nodeID)
+	}
+}
+
+// ClearActivationCache clears all cached activations.
+func (s *MemoryWeightedScorer) ClearActivationCache() {
+	if s.activationCache != nil {
+		s.activationCache.Clear()
+	}
+}
+
+// Stop stops the scorer and releases resources including the activation cache.
+// Should be called when the scorer is no longer needed.
+func (s *MemoryWeightedScorer) Stop() {
+	if s.activationCache != nil {
+		s.activationCache.Stop()
+	}
 }
 
 // =============================================================================

@@ -94,6 +94,7 @@ type EntityLink struct {
 
 // EntityLinker links entity references to their definitions.
 // It uses a SymbolTable for lookup and supports fuzzy matching for partial matches.
+// PF.4.2: Now uses TokenSet for O(k) token matching instead of O(n×m) nested loops.
 type EntityLinker struct {
 	mu sync.RWMutex
 
@@ -108,6 +109,13 @@ type EntityLinker struct {
 
 	// config holds configuration for the linker.
 	config EntityLinkerConfig
+
+	// normCache caches normalized (lowercased) strings to avoid repeated ToLower calls.
+	normCache *normalizationCache
+
+	// PF.4.2: Pre-built TokenSets for entity names during indexing.
+	// Maps normalized entity names to their TokenSets for O(k) intersection.
+	entityNameTokenSets map[string]TokenSet
 }
 
 // EntityLinkerConfig contains configuration options for the EntityLinker.
@@ -123,15 +131,129 @@ type EntityLinkerConfig struct {
 
 	// MaxFuzzyDistance is the maximum edit distance for fuzzy matching.
 	MaxFuzzyDistance int
+
+	// NormalizationCacheSize is the maximum number of entries in the normalization cache.
+	// When exceeded, LRU eviction is applied. Default is 10000.
+	NormalizationCacheSize int
+}
+
+// =============================================================================
+// Normalization Cache with LRU Eviction
+// =============================================================================
+
+// normCacheEntry represents an entry in the normalization cache.
+type normCacheEntry struct {
+	normalized string
+	accessTime int64 // Unix nano timestamp for LRU
+}
+
+// normalizationCache provides thread-safe caching of normalized strings with LRU eviction.
+type normalizationCache struct {
+	mu         sync.RWMutex
+	cache      map[string]*normCacheEntry
+	maxSize    int
+	accessTime int64 // Monotonic counter for LRU ordering
+}
+
+// newNormalizationCache creates a new normalization cache with the specified max size.
+func newNormalizationCache(maxSize int) *normalizationCache {
+	if maxSize <= 0 {
+		maxSize = 10000
+	}
+	return &normalizationCache{
+		cache:   make(map[string]*normCacheEntry),
+		maxSize: maxSize,
+	}
+}
+
+// get retrieves a normalized string from the cache.
+// Returns the normalized string and true if found, or empty string and false if not cached.
+func (nc *normalizationCache) get(original string) (string, bool) {
+	nc.mu.RLock()
+	entry, found := nc.cache[original]
+	if found {
+		// Update access time under read lock is safe for LRU tracking
+		nc.mu.RUnlock()
+		nc.mu.Lock()
+		nc.accessTime++
+		entry.accessTime = nc.accessTime
+		nc.mu.Unlock()
+		return entry.normalized, true
+	}
+	nc.mu.RUnlock()
+	return "", false
+}
+
+// set stores a normalized string in the cache, applying LRU eviction if needed.
+func (nc *normalizationCache) set(original, normalized string) {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+
+	// Check if already in cache
+	if _, exists := nc.cache[original]; exists {
+		nc.accessTime++
+		nc.cache[original].normalized = normalized
+		nc.cache[original].accessTime = nc.accessTime
+		return
+	}
+
+	// Evict if at capacity
+	if len(nc.cache) >= nc.maxSize {
+		nc.evictLRU()
+	}
+
+	nc.accessTime++
+	nc.cache[original] = &normCacheEntry{
+		normalized: normalized,
+		accessTime: nc.accessTime,
+	}
+}
+
+// evictLRU removes the least recently used entry from the cache.
+// Must be called with the write lock held.
+func (nc *normalizationCache) evictLRU() {
+	if len(nc.cache) == 0 {
+		return
+	}
+
+	var oldestKey string
+	var oldestTime int64 = 1<<63 - 1 // Max int64
+
+	for key, entry := range nc.cache {
+		if entry.accessTime < oldestTime {
+			oldestTime = entry.accessTime
+			oldestKey = key
+		}
+	}
+
+	if oldestKey != "" {
+		delete(nc.cache, oldestKey)
+	}
+}
+
+// clear removes all entries from the cache.
+func (nc *normalizationCache) clear() {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	nc.cache = make(map[string]*normCacheEntry)
+	nc.accessTime = 0
+}
+
+// size returns the current number of entries in the cache.
+func (nc *normalizationCache) size() int {
+	nc.mu.RLock()
+	defer nc.mu.RUnlock()
+	return len(nc.cache)
 }
 
 // DefaultEntityLinkerConfig returns the default configuration for EntityLinker.
 func DefaultEntityLinkerConfig() EntityLinkerConfig {
 	return EntityLinkerConfig{
-		MinFuzzyConfidence: 0.5,
-		CaseSensitive:      true,
-		CrossFileEnabled:   true,
-		MaxFuzzyDistance:   3,
+		MinFuzzyConfidence:     0.5,
+		CaseSensitive:          true,
+		CrossFileEnabled:       true,
+		MaxFuzzyDistance:       3,
+		NormalizationCacheSize: 10000,
 	}
 }
 
@@ -143,10 +265,12 @@ func NewEntityLinker(symbolTable *SymbolTable) *EntityLinker {
 // NewEntityLinkerWithConfig creates a new EntityLinker with custom configuration.
 func NewEntityLinkerWithConfig(symbolTable *SymbolTable, config EntityLinkerConfig) *EntityLinker {
 	return &EntityLinker{
-		symbolTable: symbolTable,
-		entityIndex: make(map[string][]*ExtractedEntity),
-		entityByID:  make(map[string]*ExtractedEntity),
-		config:      config,
+		symbolTable:         symbolTable,
+		entityIndex:         make(map[string][]*ExtractedEntity),
+		entityByID:          make(map[string]*ExtractedEntity),
+		config:              config,
+		normCache:           newNormalizationCache(config.NormalizationCacheSize),
+		entityNameTokenSets: make(map[string]TokenSet), // PF.4.2: Initialize TokenSet cache
 	}
 }
 
@@ -156,7 +280,29 @@ func generateEntityID(filePath, entityPath string) string {
 	return hex.EncodeToString(hash[:16])
 }
 
+// normalize returns the normalized (lowercased) version of a string.
+// Uses the normalization cache to avoid repeated strings.ToLower calls.
+// This method is safe for concurrent use.
+func (el *EntityLinker) normalize(s string) string {
+	// Fast path: case-sensitive mode doesn't need normalization
+	if el.config.CaseSensitive {
+		return s
+	}
+
+	// Check cache first
+	if normalized, found := el.normCache.get(s); found {
+		return normalized
+	}
+
+	// Compute and cache the normalized value
+	normalized := strings.ToLower(s)
+	el.normCache.set(s, normalized)
+	return normalized
+}
+
 // IndexEntities indexes a slice of entities for efficient lookup.
+// PF.4.2: Now pre-builds TokenSets for entity names during indexing
+// to enable O(k) token intersection instead of O(n×m) nested loops.
 func (el *EntityLinker) IndexEntities(entities []ExtractedEntity) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
@@ -167,11 +313,22 @@ func (el *EntityLinker) IndexEntities(entities []ExtractedEntity) {
 
 		el.entityByID[id] = entity
 
+		// Pre-normalize the entity name and cache it
 		name := entity.Name
 		if !el.config.CaseSensitive {
-			name = strings.ToLower(name)
+			name = el.normalize(entity.Name)
 		}
 		el.entityIndex[name] = append(el.entityIndex[name], entity)
+
+		// PF.4.2: Pre-build TokenSet for this entity name if not already cached.
+		// This enables O(k) intersection during fuzzy matching.
+		// IMPORTANT: Use the ORIGINAL entity.Name for tokenization so that
+		// camelCase boundaries are preserved (tokenizeName relies on uppercase letters).
+		// The tokens are then stored under the normalized key for lookup.
+		if _, exists := el.entityNameTokenSets[name]; !exists {
+			tokens := el.tokenizeName(entity.Name)
+			el.entityNameTokenSets[name] = FromTokens(tokens)
+		}
 	}
 }
 
@@ -231,11 +388,8 @@ func (el *EntityLinker) ResolveReference(ref string, context ExtractedEntity) *E
 		return nil
 	}
 
-	// Normalize reference name if case-insensitive
-	lookupName := ref
-	if !el.config.CaseSensitive {
-		lookupName = strings.ToLower(ref)
-	}
+	// PF.4.3: Use normalization cache instead of repeated strings.ToLower
+	lookupName := el.normalize(ref)
 
 	// First, try exact match
 	if entities, found := el.entityIndex[lookupName]; found {
@@ -258,11 +412,8 @@ func (el *EntityLinker) ResolveReference(ref string, context ExtractedEntity) *E
 			pkgOrType := parts[0]
 			name := parts[1]
 
-			// Look for a method or qualified name
-			qualifiedKey := name
-			if !el.config.CaseSensitive {
-				qualifiedKey = strings.ToLower(name)
-			}
+			// PF.4.3: Use normalization cache for qualified name lookup
+			qualifiedKey := el.normalize(name)
 
 			if entities, found := el.entityIndex[qualifiedKey]; found {
 				for _, entity := range entities {
@@ -319,18 +470,15 @@ func (el *EntityLinker) fuzzyResolve(ref string, context ExtractedEntity) *Extra
 
 // fuzzyMatchScore calculates a similarity score between two strings.
 // Returns a value between 0.0 (no match) and 1.0 (exact match).
+// PF.4.2: Uses TokenSet.Intersection() for O(k) token matching instead of O(n×m) nested loops.
 func (el *EntityLinker) fuzzyMatchScore(ref, target string) float64 {
 	if ref == target {
 		return 1.0
 	}
 
-	// Normalize for comparison
-	refNorm := ref
-	targetNorm := target
-	if !el.config.CaseSensitive {
-		refNorm = strings.ToLower(ref)
-		targetNorm = strings.ToLower(target)
-	}
+	// Normalize for comparison using the normalization cache
+	refNorm := el.normalize(ref)
+	targetNorm := el.normalize(target)
 
 	if refNorm == targetNorm {
 		return 0.99 // Case-insensitive exact match
@@ -356,9 +504,11 @@ func (el *EntityLinker) fuzzyMatchScore(ref, target string) float64 {
 		return 0.5 + (float64(shorter)/float64(longer))*0.3
 	}
 
-	// Calculate edit distance for small strings
+	// PF.4.4: Calculate edit distance for small strings using threshold-based
+	// Levenshtein with early exit optimization
 	if len(ref) <= 20 && len(target) <= 20 {
-		distance := el.levenshteinDistance(refNorm, targetNorm)
+		// Use threshold-based Levenshtein for early exit optimization
+		distance := el.levenshteinDistanceWithThreshold(refNorm, targetNorm, el.config.MaxFuzzyDistance)
 		maxLen := len(refNorm)
 		if len(targetNorm) > maxLen {
 			maxLen = len(targetNorm)
@@ -369,23 +519,30 @@ func (el *EntityLinker) fuzzyMatchScore(ref, target string) float64 {
 		}
 	}
 
-	// Check for camelCase/snake_case variations
-	refTokens := el.tokenizeName(refNorm)
-	targetTokens := el.tokenizeName(targetNorm)
+	// PF.4.2: Use TokenSet for O(k) camelCase/snake_case token matching.
+	// This replaces the previous O(n×m) nested loop implementation.
+	// IMPORTANT: Use the ORIGINAL strings (ref, target) for tokenization so that
+	// camelCase boundaries are preserved (tokenizeName relies on uppercase letters).
+	refTokens := el.tokenizeName(ref)
+	refTokenSet := FromTokens(refTokens)
 
-	if len(refTokens) > 0 && len(targetTokens) > 0 {
-		matchingTokens := 0
-		for _, rt := range refTokens {
-			for _, tt := range targetTokens {
-				if rt == tt {
-					matchingTokens++
-					break
-				}
-			}
-		}
-		maxTokens := len(refTokens)
-		if len(targetTokens) > maxTokens {
-			maxTokens = len(targetTokens)
+	// Try to use cached TokenSet for target, fall back to creating one
+	var targetTokenSet TokenSet
+	if cached, exists := el.entityNameTokenSets[targetNorm]; exists {
+		targetTokenSet = cached
+	} else {
+		// Use original target for tokenization to preserve camelCase boundaries
+		targetTokens := el.tokenizeName(target)
+		targetTokenSet = FromTokens(targetTokens)
+	}
+
+	if refTokenSet.Size() > 0 && targetTokenSet.Size() > 0 {
+		// Use TokenSet.CommonTokenCount() for O(k) token matching
+		// where k = min(|refTokenSet|, |targetTokenSet|)
+		matchingTokens := refTokenSet.CommonTokenCount(targetTokenSet)
+		maxTokens := refTokenSet.Size()
+		if targetTokenSet.Size() > maxTokens {
+			maxTokens = targetTokenSet.Size()
 		}
 		if matchingTokens > 0 {
 			return 0.3 + (float64(matchingTokens)/float64(maxTokens))*0.5
@@ -428,7 +585,31 @@ func (el *EntityLinker) tokenizeName(name string) []string {
 }
 
 // levenshteinDistance calculates the edit distance between two strings.
+// Deprecated: Use levenshteinDistanceWithThreshold for better performance.
 func (el *EntityLinker) levenshteinDistance(a, b string) int {
+	// Delegate to threshold version with max threshold for backward compatibility
+	return el.levenshteinDistanceWithThreshold(a, b, max(len(a), len(b)))
+}
+
+// levenshteinDistanceWithThreshold calculates the edit distance between two strings
+// with early exit optimization when the distance exceeds the threshold.
+// PF.4.4: Implements space-efficient single-row algorithm with O(min(n,m)) space
+// and early exit when distance cannot be within threshold.
+//
+// Returns threshold+1 if the actual distance exceeds the threshold (early exit).
+// This optimization significantly reduces computation for fuzzy matching where
+// we only care if strings are "close enough".
+func (el *EntityLinker) levenshteinDistanceWithThreshold(a, b string, threshold int) int {
+	// Early exit: if length difference exceeds threshold, no need to compute
+	lenDiff := len(a) - len(b)
+	if lenDiff < 0 {
+		lenDiff = -lenDiff
+	}
+	if lenDiff > threshold {
+		return threshold + 1
+	}
+
+	// Handle empty string cases
 	if len(a) == 0 {
 		return len(b)
 	}
@@ -436,37 +617,56 @@ func (el *EntityLinker) levenshteinDistance(a, b string) int {
 		return len(a)
 	}
 
-	// Create matrix
-	matrix := make([][]int, len(a)+1)
-	for i := range matrix {
-		matrix[i] = make([]int, len(b)+1)
+	// Ensure a is the shorter string for space efficiency
+	if len(a) > len(b) {
+		a, b = b, a
 	}
 
-	// Initialize first row and column
-	for i := 0; i <= len(a); i++ {
-		matrix[i][0] = i
-	}
-	for j := 0; j <= len(b); j++ {
-		matrix[0][j] = j
+	// Use single-row algorithm for O(min(n,m)) space complexity
+	prev := make([]int, len(a)+1)
+	for j := range prev {
+		prev[j] = j
 	}
 
-	// Fill matrix
-	for i := 1; i <= len(a); i++ {
-		for j := 1; j <= len(b); j++ {
+	for i := 1; i <= len(b); i++ {
+		curr := make([]int, len(a)+1)
+		curr[0] = i
+		minInRow := curr[0]
+
+		for j := 1; j <= len(a); j++ {
 			cost := 1
-			if a[i-1] == b[j-1] {
+			if b[i-1] == a[j-1] {
 				cost = 0
 			}
 
-			matrix[i][j] = min(
-				matrix[i-1][j]+1,      // deletion
-				matrix[i][j-1]+1,      // insertion
-				matrix[i-1][j-1]+cost, // substitution
+			curr[j] = min(
+				prev[j]+1,       // deletion
+				curr[j-1]+1,     // insertion
+				prev[j-1]+cost,  // substitution
 			)
+
+			if curr[j] < minInRow {
+				minInRow = curr[j]
+			}
 		}
+
+		// Early exit: if minimum in row exceeds threshold, further computation is futile
+		if minInRow > threshold {
+			return threshold + 1
+		}
+
+		prev = curr
 	}
 
-	return matrix[len(a)][len(b)]
+	return prev[len(a)]
+}
+
+// max returns the maximum of two integers.
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // LinkEntitiesWithContent performs entity linking using file content for additional context.
@@ -478,13 +678,11 @@ func (el *EntityLinker) LinkEntitiesWithContent(entities []ExtractedEntity, cont
 	var links []EntityLink
 
 	// Build a map of entity names to their definitions
+	// PF.4.3: Use normalization cache instead of repeated strings.ToLower
 	definitions := make(map[string][]*ExtractedEntity)
 	for i := range entities {
 		entity := &entities[i]
-		name := entity.Name
-		if !el.config.CaseSensitive {
-			name = strings.ToLower(name)
-		}
+		name := el.normalize(entity.Name)
 		definitions[name] = append(definitions[name], entity)
 	}
 
@@ -522,9 +720,9 @@ func (el *EntityLinker) findReferencesInContent(
 		}
 
 		// Check if the definition name appears in the content
-		searchName := defName
+		// PF.4.3: Use normalization cache for search name
+		searchName := el.normalize(defName)
 		if !el.config.CaseSensitive {
-			searchName = strings.ToLower(defName)
 			contentStr = strings.ToLower(contentStr)
 		}
 
@@ -602,10 +800,8 @@ func (el *EntityLinker) calculateLinkConfidence(
 	}
 
 	// Multiple definitions of same name reduce confidence
-	lookupName := definition.Name
-	if !el.config.CaseSensitive {
-		lookupName = strings.ToLower(definition.Name)
-	}
+	// PF.4.3: Use normalization cache for lookup
+	lookupName := el.normalize(definition.Name)
 	if defs, found := el.entityIndex[lookupName]; found && len(defs) > 1 {
 		// Ambiguous - multiple definitions
 		confidence *= 0.8
@@ -638,10 +834,8 @@ func (el *EntityLinker) GetEntitiesByName(name string) []*ExtractedEntity {
 	el.mu.RLock()
 	defer el.mu.RUnlock()
 
-	lookupName := name
-	if !el.config.CaseSensitive {
-		lookupName = strings.ToLower(name)
-	}
+	// PF.4.3: Use normalization cache for lookup
+	lookupName := el.normalize(name)
 
 	if entities, found := el.entityIndex[lookupName]; found {
 		// Return a copy to prevent modification
@@ -660,6 +854,8 @@ func (el *EntityLinker) Clear() {
 
 	el.entityIndex = make(map[string][]*ExtractedEntity)
 	el.entityByID = make(map[string]*ExtractedEntity)
+	el.entityNameTokenSets = make(map[string]TokenSet) // PF.4.2: Clear TokenSet cache
+	el.normCache.clear()                               // Clear normalization cache
 }
 
 // min returns the minimum of three integers.

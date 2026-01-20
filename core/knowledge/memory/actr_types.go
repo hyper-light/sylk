@@ -16,20 +16,25 @@ import (
 type AccessType int
 
 const (
-	AccessRetrieval      AccessType = 0
-	AccessReinforcement  AccessType = 1
-	AccessCreation       AccessType = 2
-	AccessReference      AccessType = 3
+	AccessRetrieval     AccessType = 0
+	AccessReinforcement AccessType = 1
+	AccessCreation      AccessType = 2
+	AccessReference     AccessType = 3
 )
 
+// validAccessTypes is the pre-allocated slice of valid access types.
+// This avoids allocating a new slice on every call to ValidAccessTypes().
+var validAccessTypes = []AccessType{
+	AccessRetrieval,
+	AccessReinforcement,
+	AccessCreation,
+	AccessReference,
+}
+
 // ValidAccessTypes returns all valid AccessType values.
+// The returned slice should not be modified.
 func ValidAccessTypes() []AccessType {
-	return []AccessType{
-		AccessRetrieval,
-		AccessReinforcement,
-		AccessCreation,
-		AccessReference,
-	}
+	return validAccessTypes
 }
 
 // IsValid returns true if the access type is a recognized value.
@@ -108,7 +113,9 @@ type AccessTrace struct {
 
 // ACTRMemory represents an ACT-R declarative memory chunk with adaptive
 // decay learning. Implements the ACT-R activation equation:
-//   B = ln(Σtⱼ^(-d)) + β
+//
+//	B = ln(Σtⱼ^(-d)) + β
+//
 // where d is the decay parameter (learned per-domain via Beta distribution).
 type ACTRMemory struct {
 	// Identity
@@ -116,8 +123,8 @@ type ACTRMemory struct {
 	Domain int    `json:"domain"`
 
 	// Access history
-	Traces     []AccessTrace `json:"traces"`
-	MaxTraces  int           `json:"max_traces"`
+	Traces    []AccessTrace `json:"traces"`
+	MaxTraces int           `json:"max_traces"`
 
 	// Decay parameters (Beta distribution for Thompson Sampling)
 	DecayAlpha float64 `json:"decay_alpha"`
@@ -133,7 +140,9 @@ type ACTRMemory struct {
 }
 
 // Activation computes the base-level activation using the ACT-R equation:
-//   B = ln(Σtⱼ^(-d)) + β
+//
+//	B = ln(Σtⱼ^(-d)) + β
+//
 // where d is the decay parameter (sampled from Beta distribution).
 func (m *ACTRMemory) Activation(now time.Time) float64 {
 	if len(m.Traces) == 0 {
@@ -162,7 +171,8 @@ func (m *ACTRMemory) Activation(now time.Time) float64 {
 }
 
 // DecayMean returns the expected value of the decay parameter:
-//   E[d] = α/(α+β)
+//
+//	E[d] = α/(α+β)
 func (m *ACTRMemory) DecayMean() float64 {
 	if m.DecayAlpha+m.DecayBeta == 0 {
 		return 0.5
@@ -185,7 +195,9 @@ func (m *ACTRMemory) DecaySample() float64 {
 
 // RetrievalProbability computes the probability of successful retrieval
 // using softmax activation with a threshold:
-//   P(retrieval) = 1 / (1 + exp(-(A - τ)/s))
+//
+//	P(retrieval) = 1 / (1 + exp(-(A - τ)/s))
+//
 // where A is activation, τ is threshold, and s is noise (default 0.25).
 func (m *ACTRMemory) RetrievalProbability(now time.Time, threshold float64) float64 {
 	activation := m.Activation(now)
@@ -248,11 +260,11 @@ func (m *ACTRMemory) UpdateDecay(ageAtRetrieval float64, wasUseful bool) {
 // Each domain has different memory decay characteristics based on the type
 // of knowledge being stored.
 type DomainDecayParams struct {
-	DecayAlpha        float64 `json:"decay_alpha"`
-	DecayBeta         float64 `json:"decay_beta"`
-	BaseOffsetMean    float64 `json:"base_offset_mean"`
-	BaseOffsetVar     float64 `json:"base_offset_var"`
-	EffectiveSamples  float64 `json:"effective_samples"`
+	DecayAlpha       float64 `json:"decay_alpha"`
+	DecayBeta        float64 `json:"decay_beta"`
+	BaseOffsetMean   float64 `json:"base_offset_mean"`
+	BaseOffsetVar    float64 `json:"base_offset_var"`
+	EffectiveSamples float64 `json:"effective_samples"`
 }
 
 // Domain constants matching core/domain package for decay parameter mapping.

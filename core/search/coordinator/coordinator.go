@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"container/heap"
 	"context"
 	"sort"
 	"sync"
@@ -172,8 +173,9 @@ func (c *SearchCoordinator) searchBleve(
 // buildBleveRequest creates a Bleve search request from the hybrid request.
 func (c *SearchCoordinator) buildBleveRequest(req *HybridSearchRequest) *search.SearchRequest {
 	bleveReq := &search.SearchRequest{
-		Query: req.Query,
-		Limit: req.Limit * 2, // Request more for fusion
+		Query:  req.Query,
+		Limit:  capFusionLimit(req.Limit),
+		Offset: 0, // Always start from 0 for fusion
 	}
 
 	if req.Filters != nil && len(req.Filters.Types) > 0 {
@@ -184,6 +186,15 @@ func (c *SearchCoordinator) buildBleveRequest(req *HybridSearchRequest) *search.
 	}
 
 	return bleveReq
+}
+
+// capFusionLimit calculates the fusion limit, capping to prevent unbounded allocation.
+func capFusionLimit(limit int) int {
+	fusionLimit := limit * DefaultFusionMultiplier
+	if fusionLimit > MaxFusionOverfetch {
+		return MaxFusionOverfetch
+	}
+	return fusionLimit
 }
 
 // processBleveResult converts Bleve results to the internal format.
@@ -221,7 +232,7 @@ func (c *SearchCoordinator) searchVector(
 		return searchResult{duration: time.Since(startTime), err: err}
 	}
 
-	return c.executeVectorSearch(ctx, queryVector, req.Limit*2, startTime)
+	return c.executeVectorSearch(ctx, queryVector, capFusionLimit(req.Limit), startTime)
 }
 
 // getQueryVector gets or generates the query embedding.
@@ -477,25 +488,88 @@ func (c *SearchCoordinator) normalizeScore(score, maxScore float64) float64 {
 	return score / maxScore
 }
 
-// sortByScores sorts documents by their fused scores.
+// sortByScores sorts documents by their fused scores using efficient top-K selection.
 func (c *SearchCoordinator) sortByScores(
 	docs map[string]search.ScoredDocument,
 	scores map[string]float64,
 	limit int,
 ) []search.ScoredDocument {
-	result := make([]search.ScoredDocument, 0, len(docs))
-
+	// Prepare scored documents
+	items := make([]search.ScoredDocument, 0, len(docs))
 	for id, doc := range docs {
 		doc.Score = scores[id]
-		result = append(result, doc)
+		items = append(items, doc)
 	}
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Score > result[j].Score
-	})
+	// If no limit or items fit within limit, do a full sort
+	if limit <= 0 || len(items) <= limit {
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Score > items[j].Score
+		})
+		return items
+	}
 
-	if limit > 0 && len(result) > limit {
-		result = result[:limit]
+	// Use heap for efficient top-K selection
+	return selectTopK(items, limit)
+}
+
+// =============================================================================
+// Heap-based Top-K Selection
+// =============================================================================
+
+// scoredDocHeap is a min-heap of scored documents (smallest score at top).
+// This allows efficient top-K selection: we maintain K items, and when a new
+// item comes in, we only add it if it's larger than the smallest in the heap.
+type scoredDocHeap []search.ScoredDocument
+
+func (h scoredDocHeap) Len() int           { return len(h) }
+func (h scoredDocHeap) Less(i, j int) bool { return h[i].Score < h[j].Score } // min-heap
+func (h scoredDocHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *scoredDocHeap) Push(x interface{}) {
+	*h = append(*h, x.(search.ScoredDocument))
+}
+
+func (h *scoredDocHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// selectTopK efficiently selects the top K documents by score.
+// Uses a min-heap to avoid a full sort when K << len(items).
+// Time complexity: O(n log k) vs O(n log n) for full sort.
+func selectTopK(items []search.ScoredDocument, k int) []search.ScoredDocument {
+	if k <= 0 {
+		return nil
+	}
+	if len(items) <= k {
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Score > items[j].Score
+		})
+		return items
+	}
+
+	// Initialize heap with first k items
+	h := make(scoredDocHeap, k)
+	copy(h, items[:k])
+	heap.Init(&h)
+
+	// Process remaining items
+	for i := k; i < len(items); i++ {
+		// If current item has higher score than min in heap, replace
+		if items[i].Score > h[0].Score {
+			h[0] = items[i]
+			heap.Fix(&h, 0)
+		}
+	}
+
+	// Extract items from heap in reverse order (highest to lowest score)
+	result := make([]search.ScoredDocument, k)
+	for i := k - 1; i >= 0; i-- {
+		result[i] = heap.Pop(&h).(search.ScoredDocument)
 	}
 
 	return result

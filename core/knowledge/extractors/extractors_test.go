@@ -1005,3 +1005,281 @@ func TestPythonExtractor_DunderMethods(t *testing.T) {
 		assert.True(t, foundMethods[dm], "Should find %s method", dm)
 	}
 }
+
+// =============================================================================
+// Python Docstring Tests (W3H.5)
+// =============================================================================
+
+func TestPythonExtractor_SingleLineDocstring(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def greet(name: str) -> str:
+    """Return a greeting message."""
+    return f"Hello, {name}"
+
+def next_func():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/docstring.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "greet", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 3, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "next_func", fn2.Name)
+	assert.Equal(t, 5, fn2.StartLine)
+}
+
+func TestPythonExtractor_MultiLineDocstring(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def calculate(a: int, b: int) -> int:
+    """
+    Calculate the sum of two numbers.
+
+    Args:
+        a: First number
+        b: Second number
+
+    Returns:
+        The sum of a and b
+    """
+    return a + b
+
+def other():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/multiline_doc.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "calculate", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 12, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "other", fn2.Name)
+	assert.Equal(t, 14, fn2.StartLine)
+}
+
+func TestPythonExtractor_NestedQuotesInDocstring(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def parse(text: str) -> dict:
+    """
+    Parse text with "double quotes" and 'single quotes' inside.
+
+    Example:
+        >>> parse("hello 'world'")
+        {'word': 'hello'}
+    """
+    return {"result": text}
+
+def next_func():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/nested_quotes.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "parse", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 9, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "next_func", fn2.Name)
+	assert.Equal(t, 11, fn2.StartLine)
+}
+
+func TestPythonExtractor_DocstringFollowedByCode(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def process(data: list) -> list:
+    """Process the data list."""
+    result = []
+    for item in data:
+        result.append(item * 2)
+    return result
+
+def helper():
+    return 42
+`
+
+	entities, err := extractor.Extract("/test/doc_code.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "process", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 6, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "helper", fn2.Name)
+	assert.Equal(t, 8, fn2.StartLine)
+}
+
+func TestPythonExtractor_MixedQuoteStyleDocstring(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def single_quote_doc():
+    '''
+    This uses single-quote docstring.
+    It has "double quotes" inside.
+    '''
+    return True
+
+def double_quote_doc():
+    """
+    This uses double-quote docstring.
+    It has 'single quotes' inside.
+    """
+    return False
+`
+
+	entities, err := extractor.Extract("/test/mixed_quotes.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn1 := entities[0]
+	assert.Equal(t, "single_quote_doc", fn1.Name)
+	assert.Equal(t, 1, fn1.StartLine)
+	assert.Equal(t, 6, fn1.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "double_quote_doc", fn2.Name)
+	assert.Equal(t, 8, fn2.StartLine)
+	assert.Equal(t, 13, fn2.EndLine)
+}
+
+func TestPythonExtractor_ClassWithDocstring(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `class MyClass:
+    """
+    A class with a docstring.
+
+    This docstring spans multiple lines.
+    """
+
+    def __init__(self):
+        """Initialize the class."""
+        self.value = 0
+
+    def method(self):
+        """
+        A method with docstring.
+        """
+        return self.value
+
+class NextClass:
+    pass
+`
+
+	entities, err := extractor.Extract("/test/class_doc.py", []byte(source))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(entities), 4) // 2 classes + 2 methods
+
+	class1 := entities[0]
+	assert.Equal(t, "MyClass", class1.Name)
+	assert.Equal(t, 1, class1.StartLine)
+	assert.Equal(t, 16, class1.EndLine)
+
+	// Find NextClass
+	var class2 *Entity
+	for i := range entities {
+		if entities[i].Name == "NextClass" {
+			class2 = &entities[i]
+			break
+		}
+	}
+	require.NotNil(t, class2)
+	assert.Equal(t, 18, class2.StartLine)
+}
+
+func TestPythonExtractor_DocstringWithIndentedCode(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	// Test that docstrings with lower indentation lines are handled correctly
+	source := `def confusing():
+    """
+    This docstring has content that looks like lower indentation.
+    But it's all inside the docstring.
+    """
+    return "real code"
+
+def real_next():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/code_in_doc.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "confusing", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 6, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "real_next", fn2.Name)
+	assert.Equal(t, 8, fn2.StartLine)
+}
+
+func TestPythonExtractor_TripleQuoteInString(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def with_triple_in_string():
+    x = "normal string"
+    y = 'another string'
+    return x + y
+
+def next_func():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/strings.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "with_triple_in_string", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 4, fn.EndLine)
+}
+
+func TestPythonExtractor_EscapedQuotesInDocstring(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def escaped():
+    """
+    Handle escaped quotes: \"escaped\" and \'also escaped\'
+    """
+    return True
+
+def after():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/escaped.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "escaped", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 5, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "after", fn2.Name)
+	assert.Equal(t, 7, fn2.StartLine)
+}

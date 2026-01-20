@@ -356,9 +356,9 @@ func TestSearchCache_CleanExpiredPartial(t *testing.T) {
 }
 
 func TestGenerateCacheKey(t *testing.T) {
-	key1 := GenerateCacheKey("query", nil)
-	key2 := GenerateCacheKey("query", nil)
-	key3 := GenerateCacheKey("different", nil)
+	key1 := GenerateCacheKey("query", nil, 20, 0)
+	key2 := GenerateCacheKey("query", nil, 20, 0)
+	key3 := GenerateCacheKey("different", nil, 20, 0)
 
 	// Same query should produce same key
 	assert.Equal(t, key1, key2)
@@ -373,11 +373,139 @@ func TestGenerateCacheKey_WithFilters(t *testing.T) {
 		"path": "/src",
 	}
 
-	key1 := GenerateCacheKey("query", filters)
-	key2 := GenerateCacheKey("query", nil)
+	key1 := GenerateCacheKey("query", filters, 20, 0)
+	key2 := GenerateCacheKey("query", nil, 20, 0)
 
 	// Filters should change the key
 	assert.NotEqual(t, key1, key2)
+}
+
+func TestGenerateCacheKey_WithPagination(t *testing.T) {
+	// Same query, same limit, same offset -> same key
+	key1 := GenerateCacheKey("query", nil, 20, 0)
+	key2 := GenerateCacheKey("query", nil, 20, 0)
+	assert.Equal(t, key1, key2)
+
+	// Same query, different limit -> different key
+	key3 := GenerateCacheKey("query", nil, 10, 0)
+	assert.NotEqual(t, key1, key3)
+
+	// Same query, different offset -> different key
+	key4 := GenerateCacheKey("query", nil, 20, 10)
+	assert.NotEqual(t, key1, key4)
+
+	// Same query, same limit different offset -> different key
+	key5 := GenerateCacheKey("query", nil, 10, 0)
+	key6 := GenerateCacheKey("query", nil, 10, 5)
+	assert.NotEqual(t, key5, key6)
+}
+
+func TestGenerateCacheKey_DeterministicFilterOrder(t *testing.T) {
+	// Filters should produce the same key regardless of map iteration order
+	filters1 := map[string]string{
+		"a": "1",
+		"b": "2",
+		"c": "3",
+	}
+	filters2 := map[string]string{
+		"c": "3",
+		"a": "1",
+		"b": "2",
+	}
+
+	key1 := GenerateCacheKey("query", filters1, 20, 0)
+	key2 := GenerateCacheKey("query", filters2, 20, 0)
+
+	assert.Equal(t, key1, key2, "Cache keys should be deterministic regardless of filter order")
+}
+
+func TestCacheKeyFromRequest(t *testing.T) {
+	req := &search.SearchRequest{
+		Query:  "test query",
+		Limit:  10,
+		Offset: 5,
+	}
+
+	key1 := CacheKeyFromRequest(req)
+	key2 := CacheKeyFromRequest(req)
+
+	// Same request should produce same key
+	assert.Equal(t, key1, key2)
+
+	// Different limit should produce different key
+	req2 := &search.SearchRequest{
+		Query:  "test query",
+		Limit:  20,
+		Offset: 5,
+	}
+	key3 := CacheKeyFromRequest(req2)
+	assert.NotEqual(t, key1, key3)
+
+	// Different offset should produce different key
+	req3 := &search.SearchRequest{
+		Query:  "test query",
+		Limit:  10,
+		Offset: 10,
+	}
+	key4 := CacheKeyFromRequest(req3)
+	assert.NotEqual(t, key1, key4)
+}
+
+func TestCacheKeyFromRequest_WithFilters(t *testing.T) {
+	req1 := &search.SearchRequest{
+		Query:      "test",
+		Limit:      20,
+		Type:       search.DocTypeSourceCode,
+		PathFilter: "/src",
+	}
+
+	req2 := &search.SearchRequest{
+		Query: "test",
+		Limit: 20,
+	}
+
+	key1 := CacheKeyFromRequest(req1)
+	key2 := CacheKeyFromRequest(req2)
+
+	// Filters should change the key
+	assert.NotEqual(t, key1, key2)
+}
+
+func TestCachePaginationIndependence(t *testing.T) {
+	// Test that different pagination parameters produce different cache entries
+	cache := NewSearchCacheWithDefaults()
+
+	result1 := &search.SearchResult{
+		Query:     "test",
+		TotalHits: 100,
+		Documents: []search.ScoredDocument{
+			{Score: 0.95},
+		},
+	}
+	result2 := &search.SearchResult{
+		Query:     "test",
+		TotalHits: 100,
+		Documents: []search.ScoredDocument{
+			{Score: 0.85},
+		},
+	}
+
+	// Cache results with different pagination
+	key1 := GenerateCacheKey("test", nil, 10, 0)
+	key2 := GenerateCacheKey("test", nil, 10, 10)
+
+	cache.Set(key1, result1)
+	cache.Set(key2, result2)
+
+	// Verify they're stored separately
+	cached1, found1 := cache.Get(key1)
+	cached2, found2 := cache.Get(key2)
+
+	assert.True(t, found1)
+	assert.True(t, found2)
+	assert.NotEqual(t, cached1.Documents[0].Score, cached2.Documents[0].Score)
+	assert.Equal(t, 0.95, cached1.Documents[0].Score)
+	assert.Equal(t, 0.85, cached2.Documents[0].Score)
 }
 
 func TestSearchCache_VersionIncrementsOnInvalidate(t *testing.T) {
@@ -494,4 +622,126 @@ func TestSearchCache_GetPromotion(t *testing.T) {
 
 	_, found = cache.Get("key2")
 	assert.False(t, found, "key2 should be evicted")
+}
+
+// =============================================================================
+// Test: Single-Lock LRU Promotion (PF.3.7)
+// =============================================================================
+
+func TestSearchCache_SingleLockPromotion(t *testing.T) {
+	t.Run("get promotes entry with single lock acquisition", func(t *testing.T) {
+		cfg := CacheConfig{
+			TTL:     5 * time.Minute,
+			MaxSize: 3,
+		}
+		cache := NewSearchCache(cfg)
+
+		// Add entries
+		cache.Set("key1", &search.SearchResult{Query: "q1"})
+		cache.Set("key2", &search.SearchResult{Query: "q2"})
+		cache.Set("key3", &search.SearchResult{Query: "q3"})
+
+		// Access key1 to promote it
+		result, found := cache.Get("key1")
+		assert.True(t, found)
+		assert.Equal(t, "q1", result.Query)
+
+		// Add key4, should evict key2 (LRU after key1 was promoted)
+		cache.Set("key4", &search.SearchResult{Query: "q4"})
+
+		// key1 should still exist (promoted)
+		_, found = cache.Get("key1")
+		assert.True(t, found, "key1 should exist after promotion")
+
+		// key2 should be evicted (was LRU)
+		_, found = cache.Get("key2")
+		assert.False(t, found, "key2 should be evicted")
+
+		// key3 and key4 should exist
+		_, found = cache.Get("key3")
+		assert.True(t, found, "key3 should exist")
+		_, found = cache.Get("key4")
+		assert.True(t, found, "key4 should exist")
+	})
+
+	t.Run("get removes expired entry atomically", func(t *testing.T) {
+		cfg := CacheConfig{
+			TTL:     50 * time.Millisecond,
+			MaxSize: 100,
+		}
+		cache := NewSearchCache(cfg)
+
+		cache.Set("key1", &search.SearchResult{Query: "test"})
+
+		// Wait for expiry
+		time.Sleep(100 * time.Millisecond)
+
+		// Get should return miss and remove the entry atomically
+		result, found := cache.Get("key1")
+		assert.False(t, found)
+		assert.Nil(t, result)
+
+		// Entry should be removed from cache
+		assert.Equal(t, 0, cache.Size())
+	})
+}
+
+func TestSearchCache_ConcurrentGetPromotion(t *testing.T) {
+	t.Run("concurrent gets promote entries safely", func(t *testing.T) {
+		cfg := CacheConfig{
+			TTL:     5 * time.Minute,
+			MaxSize: 100,
+		}
+		cache := NewSearchCache(cfg)
+
+		// Add entries
+		for i := 0; i < 10; i++ {
+			key := "key" + string(rune('0'+i))
+			cache.Set(key, &search.SearchResult{Query: key})
+		}
+
+		// Concurrent gets
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				key := "key" + string(rune('0'+(id%10)))
+				result, found := cache.Get(key)
+				if found {
+					// Just access the result to ensure it's valid
+					_ = result.Query
+				}
+			}(i)
+		}
+
+		wg.Wait()
+
+		// All entries should still exist
+		for i := 0; i < 10; i++ {
+			key := "key" + string(rune('0'+i))
+			_, found := cache.Get(key)
+			assert.True(t, found, "key %s should still exist", key)
+		}
+	})
+}
+
+func TestSearchCache_GetDisabled(t *testing.T) {
+	t.Run("get returns miss when disabled", func(t *testing.T) {
+		cache := NewSearchCacheWithDefaults()
+
+		cache.Set("key1", &search.SearchResult{Query: "test"})
+		cache.Disable()
+
+		result, found := cache.Get("key1")
+		assert.False(t, found)
+		assert.Nil(t, result)
+
+		cache.Enable()
+
+		// Should be found again after enabling
+		result, found = cache.Get("key1")
+		assert.True(t, found)
+		assert.Equal(t, "test", result.Query)
+	})
 }

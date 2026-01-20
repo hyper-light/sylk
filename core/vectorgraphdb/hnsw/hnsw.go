@@ -216,8 +216,10 @@ func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
 
 	for i := range min(len(neighbors), maxConn) {
 		neighbor := neighbors[i]
-		h.layers[level].addNeighbor(id, neighbor.ID, maxConn)
-		h.layers[level].addNeighbor(neighbor.ID, id, maxConn)
+		// Convert similarity to distance (1 - similarity)
+		distance := float32(1.0 - neighbor.Similarity)
+		h.layers[level].addNeighbor(id, neighbor.ID, distance, maxConn)
+		h.layers[level].addNeighbor(neighbor.ID, id, distance, maxConn)
 	}
 }
 
@@ -297,23 +299,55 @@ func (h *Index) Delete(id string) error {
 		return ErrNodeNotFound
 	}
 
-	h.deleteLocked(id)
+	h.deleteUnlocked(id)
 	return nil
 }
 
-func (h *Index) deleteLocked(id string) {
-	for _, l := range h.layers {
-		if l.hasNode(id) {
-			h.removeNodeConnections(id, l)
-			l.removeNode(id)
+// DeleteBatch deletes multiple nodes with a single lock acquisition.
+// This is more efficient than calling Delete() multiple times when
+// deleting many nodes, as it avoids repeated lock/unlock overhead.
+func (h *Index) DeleteBatch(ids []string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Validate all IDs exist first
+	for _, id := range ids {
+		if _, exists := h.vectors[id]; !exists {
+			return ErrNodeNotFound
 		}
 	}
 
+	// Process all deletions with single lock acquisition
+	for _, id := range ids {
+		h.deleteUnlocked(id)
+	}
+	return nil
+}
+
+// deleteUnlocked performs deletion without acquiring locks.
+// Caller must hold h.mu.Lock().
+func (h *Index) deleteUnlocked(id string) {
+	// Collect all layers that have this node first (read phase)
+	layersWithNode := make([]*layer, 0, len(h.layers))
+	for _, l := range h.layers {
+		if l.hasNode(id) {
+			layersWithNode = append(layersWithNode, l)
+		}
+	}
+
+	// Now process all layers in one pass (write phase)
+	for _, l := range layersWithNode {
+		h.removeNodeConnections(id, l)
+		l.removeNode(id)
+	}
+
+	// Remove from maps
 	delete(h.vectors, id)
 	delete(h.magnitudes, id)
 	delete(h.domains, id)
 	delete(h.nodeTypes, id)
 
+	// Update entry point if needed
 	if h.entryPoint == id {
 		h.selectNewEntryPoint()
 	}

@@ -112,6 +112,16 @@ func (m *mockVectorIndex) Delete(id string) error {
 	return nil
 }
 
+func (m *mockVectorIndex) DeleteBatch(ids []string) error {
+	for _, id := range ids {
+		delete(m.vectors, id)
+		delete(m.domains, id)
+		delete(m.nodeTypes, id)
+		m.deleted[id] = true
+	}
+	return nil
+}
+
 func (m *mockVectorIndex) Size() int {
 	return len(m.vectors)
 }

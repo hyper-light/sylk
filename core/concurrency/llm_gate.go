@@ -12,10 +12,11 @@ import (
 )
 
 var (
-	ErrGateClosed     = errors.New("gate is closed")
-	ErrRequestTimeout = errors.New("request timeout")
-	ErrQueueFull      = errors.New("pipeline queue full")
-	ErrRateLimited    = errors.New("rate limited")
+	ErrGateClosed      = errors.New("gate is closed")
+	ErrRequestTimeout  = errors.New("request timeout")
+	ErrQueueFull       = errors.New("pipeline queue full")
+	ErrRateLimited     = errors.New("rate limited")
+	ErrUserQueueFull   = errors.New("user queue full")
 )
 
 type RequestPriority int
@@ -113,27 +114,121 @@ var interactiveAgents = map[AgentType]bool{
 	AgentAcademic:     true,
 }
 
-type UnboundedQueue struct {
-	mu    sync.Mutex
-	items []*LLMRequest
-	cond  *sync.Cond
+// RejectPolicy defines what to do when a queue is full.
+type RejectPolicy int
+
+const (
+	// RejectPolicyError returns an error immediately when queue is full.
+	RejectPolicyError RejectPolicy = iota
+	// RejectPolicyBlock blocks until space is available or timeout.
+	RejectPolicyBlock
+	// RejectPolicyDropOldest drops the oldest item to make room.
+	RejectPolicyDropOldest
+)
+
+// BoundedQueueConfig holds configuration for bounded queues.
+type BoundedQueueConfig struct {
+	MaxSize      int           // Maximum queue size (default: 10000)
+	RejectPolicy RejectPolicy  // What to do when full (default: RejectPolicyError)
+	BlockTimeout time.Duration // How long to block before rejecting (for RejectPolicyBlock)
 }
 
+// DefaultBoundedQueueConfig returns a default configuration for bounded queues.
+func DefaultBoundedQueueConfig() BoundedQueueConfig {
+	return BoundedQueueConfig{
+		MaxSize:      10000,
+		RejectPolicy: RejectPolicyError,
+		BlockTimeout: 5 * time.Second,
+	}
+}
+
+// UnboundedQueue is a bounded FIFO queue for LLM requests with backpressure support.
+// Despite its name (kept for backward compatibility), it now enforces size limits.
+type UnboundedQueue struct {
+	mu           sync.Mutex
+	items        []*LLMRequest
+	cond         *sync.Cond
+	maxSize      int
+	rejectPolicy RejectPolicy
+	blockTimeout time.Duration
+	closed       bool
+}
+
+// NewUnboundedQueue creates a new queue with default bounded configuration.
+// For backward compatibility, this creates a queue with a 10000 item limit.
 func NewUnboundedQueue() *UnboundedQueue {
+	return NewBoundedQueue(DefaultBoundedQueueConfig())
+}
+
+// NewBoundedQueue creates a new queue with the specified configuration.
+func NewBoundedQueue(config BoundedQueueConfig) *UnboundedQueue {
+	maxSize := config.MaxSize
+	if maxSize <= 0 {
+		maxSize = 10000
+	}
+	blockTimeout := config.BlockTimeout
+	if blockTimeout <= 0 {
+		blockTimeout = 5 * time.Second
+	}
+
 	q := &UnboundedQueue{
-		items: make([]*LLMRequest, 0, 16),
+		items:        make([]*LLMRequest, 0, min(maxSize, 100)),
+		maxSize:      maxSize,
+		rejectPolicy: config.RejectPolicy,
+		blockTimeout: blockTimeout,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
-func (q *UnboundedQueue) Push(req *LLMRequest) {
+// Push adds a request to the queue with backpressure handling.
+// Returns ErrUserQueueFull if the queue is full and reject policy is RejectPolicyError.
+// Returns ErrGateClosed if the queue has been closed.
+func (q *UnboundedQueue) Push(req *LLMRequest) error {
 	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.closed {
+		return ErrGateClosed
+	}
+
+	// Handle full queue based on policy
+	if len(q.items) >= q.maxSize {
+		switch q.rejectPolicy {
+		case RejectPolicyError:
+			return ErrUserQueueFull
+		case RejectPolicyDropOldest:
+			// Drop oldest item to make room
+			if len(q.items) > 0 {
+				q.items[0] = nil // Help GC
+				q.items = q.items[1:]
+			}
+		case RejectPolicyBlock:
+			// Wait for space with timeout
+			deadline := time.Now().Add(q.blockTimeout)
+			for len(q.items) >= q.maxSize && !q.closed {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return ErrUserQueueFull
+				}
+				// Use timed wait
+				q.mu.Unlock()
+				time.Sleep(min(remaining, 10*time.Millisecond))
+				q.mu.Lock()
+			}
+			if q.closed {
+				return ErrGateClosed
+			}
+		}
+	}
+
 	q.items = append(q.items, req)
-	q.mu.Unlock()
 	q.cond.Signal()
+	return nil
 }
 
+// Pop removes and returns the first request from the queue.
+// Returns nil if the queue is empty.
 func (q *UnboundedQueue) Pop() *LLMRequest {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -142,15 +237,39 @@ func (q *UnboundedQueue) Pop() *LLMRequest {
 		return nil
 	}
 	req := q.items[0]
-	q.items[0] = nil
+	q.items[0] = nil // Help GC
 	q.items = q.items[1:]
+	q.cond.Signal() // Signal waiters that space is available
 	return req
 }
 
+// Len returns the current number of items in the queue.
 func (q *UnboundedQueue) Len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.items)
+}
+
+// MaxSize returns the maximum capacity of the queue.
+func (q *UnboundedQueue) MaxSize() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.maxSize
+}
+
+// IsFull returns whether the queue is at capacity.
+func (q *UnboundedQueue) IsFull() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items) >= q.maxSize
+}
+
+// Close closes the queue, preventing new pushes and waking blocked waiters.
+func (q *UnboundedQueue) Close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.cond.Broadcast()
 }
 
 type requestHeap []*LLMRequest
@@ -245,6 +364,9 @@ type ActiveRequest struct {
 
 type DualQueueGateConfig struct {
 	MaxPipelineQueueSize  int
+	MaxUserQueueSize      int           // Maximum size for user queue (default: 1000)
+	UserQueueRejectPolicy RejectPolicy  // Policy when user queue is full (default: RejectPolicyError)
+	UserQueueBlockTimeout time.Duration // Block timeout for user queue (default: 5s)
 	MaxConcurrentRequests int
 	RequestTimeout        time.Duration
 	ShutdownTimeout       time.Duration
@@ -253,6 +375,9 @@ type DualQueueGateConfig struct {
 func DefaultDualQueueGateConfig() DualQueueGateConfig {
 	return DualQueueGateConfig{
 		MaxPipelineQueueSize:  1000,
+		MaxUserQueueSize:      1000,
+		UserQueueRejectPolicy: RejectPolicyError,
+		UserQueueBlockTimeout: 5 * time.Second,
 		MaxConcurrentRequests: 4,
 		RequestTimeout:        5 * time.Minute,
 		ShutdownTimeout:       5 * time.Second,
@@ -273,18 +398,38 @@ type DualQueueGate struct {
 	rateLimiter    RateLimiter
 	requestWg      sync.WaitGroup
 	dispatchWg     sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
 }
 
+// NewDualQueueGate creates a new gate with a background context.
+// For context propagation, use NewDualQueueGateWithContext instead.
 func NewDualQueueGate(config DualQueueGateConfig, executor RequestExecutor) *DualQueueGate {
+	return NewDualQueueGateWithContext(context.Background(), config, executor)
+}
+
+// NewDualQueueGateWithContext creates a new gate with the given parent context.
+// All requests processed by this gate will respect the parent context's cancellation.
+func NewDualQueueGateWithContext(ctx context.Context, config DualQueueGateConfig, executor RequestExecutor) *DualQueueGate {
 	config = normalizeDualQueueGateConfig(config)
+
+	userQueueConfig := BoundedQueueConfig{
+		MaxSize:      config.MaxUserQueueSize,
+		RejectPolicy: config.UserQueueRejectPolicy,
+		BlockTimeout: config.UserQueueBlockTimeout,
+	}
+
+	gateCtx, cancel := context.WithCancel(ctx)
 	g := &DualQueueGate{
 		config:         config,
-		userQueue:      NewUnboundedQueue(),
+		userQueue:      NewBoundedQueue(userQueueConfig),
 		pipelineQueue:  NewPriorityQueue(config.MaxPipelineQueueSize),
 		activeRequests: make(map[string]*ActiveRequest),
 		workAvailable:  make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
 		executor:       executor,
+		ctx:            gateCtx,
+		cancel:         cancel,
 	}
 	g.startDispatchLoop()
 	return g
@@ -293,6 +438,12 @@ func NewDualQueueGate(config DualQueueGateConfig, executor RequestExecutor) *Dua
 func normalizeDualQueueGateConfig(cfg DualQueueGateConfig) DualQueueGateConfig {
 	if cfg.MaxPipelineQueueSize <= 0 {
 		cfg.MaxPipelineQueueSize = 1000
+	}
+	if cfg.MaxUserQueueSize <= 0 {
+		cfg.MaxUserQueueSize = 1000
+	}
+	if cfg.UserQueueBlockTimeout <= 0 {
+		cfg.UserQueueBlockTimeout = 5 * time.Second
 	}
 	if cfg.MaxConcurrentRequests <= 0 {
 		cfg.MaxConcurrentRequests = 4
@@ -356,7 +507,9 @@ func (g *DualQueueGate) ensureRequestDefaults(req *LLMRequest) {
 
 func (g *DualQueueGate) enqueueRequest(req *LLMRequest, isUser bool) error {
 	if isUser {
-		g.userQueue.Push(req)
+		if err := g.userQueue.Push(req); err != nil {
+			return err
+		}
 		g.maybePreemptForUser()
 		return nil
 	}
@@ -503,10 +656,23 @@ func (g *DualQueueGate) startRequest(req *LLMRequest, isUser bool) {
 }
 
 func (g *DualQueueGate) newRequestContext() (context.Context, context.CancelFunc) {
-	if g.config.RequestTimeout > 0 {
-		return context.WithTimeout(context.Background(), g.config.RequestTimeout)
+	return g.newRequestContextWithParent(nil)
+}
+
+// newRequestContextWithParent creates a request context that inherits from the given parent
+// context if provided, otherwise from the gate's context. The timeout is always applied.
+func (g *DualQueueGate) newRequestContextWithParent(parentCtx context.Context) (context.Context, context.CancelFunc) {
+	// Use parent context if provided, otherwise use gate context
+	baseCtx := parentCtx
+	if baseCtx == nil {
+		baseCtx = g.ctx
 	}
-	return context.WithCancel(context.Background())
+
+	// Inherit from base context
+	if g.config.RequestTimeout > 0 {
+		return context.WithTimeout(baseCtx, g.config.RequestTimeout)
+	}
+	return context.WithCancel(baseCtx)
 }
 
 func (g *DualQueueGate) trackActiveRequest(req *LLMRequest, cancel context.CancelFunc, isUser bool) {
@@ -697,6 +863,15 @@ func (g *DualQueueGate) Close() {
 	close(g.stopCh)
 	g.signalWork()
 	g.dispatchWg.Wait()
+
+	// Close queues to reject new items and wake blocked waiters
+	g.userQueue.Close()
+	g.pipelineQueue.Close()
+
+	// Cancel the gate context, which propagates to all pending requests
+	if g.cancel != nil {
+		g.cancel()
+	}
 
 	g.cancelActiveRequests()
 	g.drainQueues()

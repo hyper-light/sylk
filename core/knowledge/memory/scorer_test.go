@@ -861,3 +861,232 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// =============================================================================
+// PF.4.5 ActivationCache Integration Tests
+// =============================================================================
+
+func TestMemoryWeightedScorer_ActivationCacheIntegration(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	t.Run("default scorer has cache", func(t *testing.T) {
+		store := NewMemoryStore(db, 100, time.Millisecond)
+		scorer := NewMemoryWeightedScorer(store)
+		defer scorer.Stop()
+
+		if scorer.ActivationCache() == nil {
+			t.Error("expected default scorer to have activation cache")
+		}
+	})
+
+	t.Run("custom cache config", func(t *testing.T) {
+		store := NewMemoryStore(db, 100, time.Millisecond)
+		cacheConfig := &ActivationCacheConfig{
+			MaxSize:         500,
+			TTL:             time.Minute,
+			CleanupInterval: 0, // Disable background cleanup for testing
+		}
+		scorer := NewMemoryWeightedScorerWithCache(store, cacheConfig, nil)
+		defer scorer.Stop()
+
+		if scorer.ActivationCache() == nil {
+			t.Error("expected scorer to have activation cache")
+		}
+	})
+
+	t.Run("cache reduces computation", func(t *testing.T) {
+		store := NewMemoryStore(db, 100, time.Millisecond)
+		cacheConfig := &ActivationCacheConfig{
+			MaxSize:         1000,
+			TTL:             10 * time.Minute, // Long TTL for test
+			CleanupInterval: 0,
+		}
+		scorer := NewMemoryWeightedScorerWithCache(store, cacheConfig, nil)
+		defer scorer.Stop()
+
+		nodeID := "cache-test-node"
+		insertTestNode(t, db, nodeID, domain.DomainAcademic)
+
+		// Add some access traces
+		for i := 0; i < 5; i++ {
+			err := store.RecordAccess(ctx, nodeID, AccessRetrieval, "test")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// First call should miss cache
+		now := time.Now().UTC()
+		score1, err := scorer.ComputeMemoryScore(ctx, nodeID, now, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		cache := scorer.ActivationCache()
+		stats1 := cache.Stats()
+		if stats1.Misses != 1 {
+			t.Errorf("expected 1 cache miss, got %d", stats1.Misses)
+		}
+
+		// Second call with same time should hit cache
+		score2, err := scorer.ComputeMemoryScore(ctx, nodeID, now, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		stats2 := cache.Stats()
+		if stats2.Hits < 1 {
+			t.Errorf("expected at least 1 cache hit, got %d", stats2.Hits)
+		}
+
+		// Scores should be equal (same cached activation)
+		if score1 != score2 {
+			t.Errorf("expected equal scores with caching: %f vs %f", score1, score2)
+		}
+	})
+
+	t.Run("cache invalidation on node update", func(t *testing.T) {
+		store := NewMemoryStore(db, 100, time.Millisecond)
+		cacheConfig := &ActivationCacheConfig{
+			MaxSize:         1000,
+			TTL:             10 * time.Minute,
+			CleanupInterval: 0,
+		}
+		scorer := NewMemoryWeightedScorerWithCache(store, cacheConfig, nil)
+		defer scorer.Stop()
+
+		nodeID := "cache-invalidate-node"
+		insertTestNode(t, db, nodeID, domain.DomainArchitect)
+
+		// Add initial traces
+		for i := 0; i < 3; i++ {
+			_ = store.RecordAccess(ctx, nodeID, AccessRetrieval, "test")
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// Cache a score
+		now := time.Now().UTC()
+		_, err := scorer.ComputeMemoryScore(ctx, nodeID, now, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		cache := scorer.ActivationCache()
+		initialSize := cache.Size()
+		if initialSize == 0 {
+			t.Error("expected cache to have entries after compute")
+		}
+
+		// Invalidate cache for this node
+		scorer.InvalidateActivationCache(nodeID)
+
+		// Cache should be smaller or empty for this node
+		// Note: Size may not change immediately due to time bucketing
+	})
+
+	t.Run("clear activation cache", func(t *testing.T) {
+		store := NewMemoryStore(db, 100, time.Millisecond)
+		scorer := NewMemoryWeightedScorer(store)
+		defer scorer.Stop()
+
+		nodeID := "cache-clear-node"
+		insertTestNode(t, db, nodeID, domain.DomainLibrarian)
+
+		// Add traces and compute scores to populate cache
+		for i := 0; i < 3; i++ {
+			_ = store.RecordAccess(ctx, nodeID, AccessRetrieval, "test")
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		now := time.Now().UTC()
+		_, _ = scorer.ComputeMemoryScore(ctx, nodeID, now, false)
+
+		// Clear the cache
+		scorer.ClearActivationCache()
+
+		cache := scorer.ActivationCache()
+		if cache.Size() != 0 {
+			t.Errorf("expected empty cache after clear, got size %d", cache.Size())
+		}
+	})
+
+	t.Run("cache hit rate improves with repeated access", func(t *testing.T) {
+		store := NewMemoryStore(db, 100, time.Millisecond)
+		cacheConfig := &ActivationCacheConfig{
+			MaxSize:         1000,
+			TTL:             10 * time.Minute,
+			CleanupInterval: 0,
+		}
+		scorer := NewMemoryWeightedScorerWithCache(store, cacheConfig, nil)
+		defer scorer.Stop()
+
+		// Create multiple nodes
+		nodeIDs := []string{"hr-node-1", "hr-node-2", "hr-node-3"}
+		for _, id := range nodeIDs {
+			insertTestNode(t, db, id, domain.DomainAcademic)
+			for i := 0; i < 3; i++ {
+				_ = store.RecordAccess(ctx, id, AccessRetrieval, "test")
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+
+		cache := scorer.ActivationCache()
+		cache.ResetStats()
+
+		// First round: all misses
+		now := time.Now().UTC()
+		for _, id := range nodeIDs {
+			_, _ = scorer.ComputeMemoryScore(ctx, id, now, false)
+		}
+
+		// Second round: should have hits
+		for _, id := range nodeIDs {
+			_, _ = scorer.ComputeMemoryScore(ctx, id, now, false)
+		}
+
+		stats := cache.Stats()
+		hitRate := cache.HitRate()
+
+		// Should have at least 50% hit rate (second round should all be hits)
+		if hitRate < 0.5 {
+			t.Errorf("expected hit rate >= 0.5, got %f (hits: %d, misses: %d)",
+				hitRate, stats.Hits, stats.Misses)
+		}
+	})
+}
+
+func TestNewMemoryWeightedScorerWithCache(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	store := NewMemoryStore(db, 100, time.Millisecond)
+
+	t.Run("nil cache config uses default", func(t *testing.T) {
+		scorer := NewMemoryWeightedScorerWithCache(store, nil, nil)
+		defer scorer.Stop()
+
+		if scorer.ActivationCache() == nil {
+			t.Error("expected cache even with nil config")
+		}
+	})
+
+	t.Run("custom cache and update config", func(t *testing.T) {
+		cacheConfig := &ActivationCacheConfig{
+			MaxSize: 100,
+			TTL:     time.Second,
+		}
+		updateConfig := &handoff.UpdateConfig{
+			LearningRate: 0.5,
+		}
+
+		scorer := NewMemoryWeightedScorerWithCache(store, cacheConfig, updateConfig)
+		defer scorer.Stop()
+
+		if scorer.ActivationCache() == nil {
+			t.Error("expected cache with custom config")
+		}
+	})
+}

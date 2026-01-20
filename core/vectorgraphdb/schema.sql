@@ -165,22 +165,25 @@ CREATE TABLE library_docs (
 -- =============================================================================
 -- INDEXES
 -- =============================================================================
-CREATE INDEX idx_nodes_domain_type ON nodes(domain, node_type);
-CREATE INDEX idx_nodes_path ON nodes(path) WHERE path IS NOT NULL;
-CREATE INDEX idx_nodes_name ON nodes(name);
-CREATE INDEX idx_nodes_session ON nodes(session_id) WHERE session_id IS NOT NULL;
-CREATE INDEX idx_nodes_hash ON nodes(content_hash) WHERE content_hash IS NOT NULL;
-CREATE INDEX idx_nodes_superseded ON nodes(superseded_by) WHERE superseded_by IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_nodes_domain_type ON nodes(domain, node_type);
+CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path) WHERE path IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+CREATE INDEX IF NOT EXISTS idx_nodes_session ON nodes(session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_nodes_hash ON nodes(content_hash) WHERE content_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_nodes_superseded ON nodes(superseded_by) WHERE superseded_by IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_nodes_updated_at ON nodes(updated_at);
+CREATE INDEX IF NOT EXISTS idx_nodes_domain ON nodes(domain);
 
-CREATE INDEX idx_edges_source ON edges(source_id, edge_type);
-CREATE INDEX idx_edges_target ON edges(target_id, edge_type);
-CREATE INDEX idx_edges_type ON edges(edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_type_domain ON edges(edge_type, source_id);
 
-CREATE INDEX idx_vectors_domain ON vectors(domain);
-CREATE INDEX idx_vectors_domain_type ON vectors(domain, node_type);
+CREATE INDEX IF NOT EXISTS idx_vectors_domain ON vectors(domain);
+CREATE INDEX IF NOT EXISTS idx_vectors_domain_type ON vectors(domain, node_type);
 
-CREATE INDEX idx_provenance_node ON provenance(node_id);
-CREATE INDEX idx_conflicts_unresolved ON conflicts(resolved) WHERE resolved = FALSE;
+CREATE INDEX IF NOT EXISTS idx_provenance_node ON provenance(node_id);
+CREATE INDEX IF NOT EXISTS idx_conflicts_unresolved ON conflicts(resolved) WHERE resolved = FALSE;
 
-CREATE INDEX idx_hnsw_edges_level ON hnsw_edges(level, source_id);
-CREATE INDEX idx_chunks_node ON academic_chunks(node_id);
+CREATE INDEX IF NOT EXISTS idx_hnsw_edges_level ON hnsw_edges(level, source_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_node ON academic_chunks(node_id);

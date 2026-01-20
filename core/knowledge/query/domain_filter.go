@@ -4,7 +4,6 @@
 package query
 
 import (
-	"regexp"
 	"strings"
 	"sync"
 
@@ -670,10 +669,13 @@ func (df *DomainFilter) IsEmpty() bool {
 // =============================================================================
 
 // tokenizeQuery splits a query into lowercase words.
+// PF.4.1: Uses pre-compiled regex from RegexCache for performance optimization.
+// This replaces the previous implementation that compiled regex on every call.
 func tokenizeQuery(query string) []string {
-	// Use regex to split on non-alphanumeric characters
-	re := regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
-	parts := re.Split(strings.ToLower(query), -1)
+	// Use pre-compiled TokenizePattern from regex_cache.go instead of
+	// compiling regexp.MustCompile(`[^a-zA-Z0-9_-]+`) on every call.
+	// TokenizePattern is initialized at package load time, providing O(1) access.
+	parts := TokenizePattern.Split(strings.ToLower(query), -1)
 
 	// Filter empty strings
 	result := make([]string, 0, len(parts))

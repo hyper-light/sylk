@@ -22,9 +22,17 @@ func setupEngineTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("failed to open test database: %v", err)
 	}
 
+	setupEngineTestTables(t, db)
+	return db
+}
+
+// setupEngineTestTables creates the required tables in the given database.
+func setupEngineTestTables(t *testing.T, db *sql.DB) {
+	t.Helper()
+
 	// Create inference_rules table
-	_, err = db.Exec(`
-		CREATE TABLE inference_rules (
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS inference_rules (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			head_subject TEXT NOT NULL,
@@ -38,13 +46,12 @@ func setupEngineTestDB(t *testing.T) *sql.DB {
 		)
 	`)
 	if err != nil {
-		db.Close()
 		t.Fatalf("failed to create inference_rules table: %v", err)
 	}
 
 	// Create materialized_edges table
 	_, err = db.Exec(`
-		CREATE TABLE materialized_edges (
+		CREATE TABLE IF NOT EXISTS materialized_edges (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			rule_id TEXT NOT NULL,
 			edge_key TEXT NOT NULL,
@@ -54,21 +61,12 @@ func setupEngineTestDB(t *testing.T) *sql.DB {
 		)
 	`)
 	if err != nil {
-		db.Close()
 		t.Fatalf("failed to create materialized_edges table: %v", err)
 	}
 
-	// Create indexes
-	_, err = db.Exec(`
-		CREATE INDEX idx_materialized_rule ON materialized_edges(rule_id);
-		CREATE INDEX idx_materialized_edge_key ON materialized_edges(edge_key);
-	`)
-	if err != nil {
-		db.Close()
-		t.Fatalf("failed to create indexes: %v", err)
-	}
-
-	return db
+	// Create indexes (ignore errors for indexes that already exist)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_materialized_rule ON materialized_edges(rule_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_materialized_edge_key ON materialized_edges(edge_key)`)
 }
 
 // engineMockEdgeProvider implements ExtendedEdgeProvider for testing.
@@ -1131,5 +1129,299 @@ func TestInferenceEngine_RunInference_SkipsDisabledRules(t *testing.T) {
 	stats := engine.Stats()
 	if stats.MaterializedEdges != 0 {
 		t.Errorf("expected 0 materialized edges, got %d", stats.MaterializedEdges)
+	}
+}
+
+// =============================================================================
+// SNE.12: Semi-Naive Evaluation Integration Tests
+// =============================================================================
+
+func TestInferenceEngine_UseSemiNaiveEvaluation_Enable(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	ctx := context.Background()
+
+	// Add a rule first
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Enable semi-naive evaluation
+	if err := engine.UseSemiNaiveEvaluation(ctx, true); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation failed: %v", err)
+	}
+
+	if !engine.IsSemiNaiveEnabled() {
+		t.Error("expected semi-naive evaluation to be enabled")
+	}
+}
+
+func TestInferenceEngine_UseSemiNaiveEvaluation_Disable(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	ctx := context.Background()
+
+	// Add a rule first
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Enable then disable
+	if err := engine.UseSemiNaiveEvaluation(ctx, true); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation (enable) failed: %v", err)
+	}
+	if err := engine.UseSemiNaiveEvaluation(ctx, false); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation (disable) failed: %v", err)
+	}
+
+	if engine.IsSemiNaiveEnabled() {
+		t.Error("expected semi-naive evaluation to be disabled")
+	}
+}
+
+func TestInferenceEngine_RunInference_WithSemiNaive(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	// Add transitivity rule
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Enable semi-naive evaluation
+	if err := engine.UseSemiNaiveEvaluation(ctx, true); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation failed: %v", err)
+	}
+
+	// Run inference with semi-naive
+	if err := engine.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	// Should derive A-indirect_calls->C
+	stats := engine.Stats()
+	if stats.MaterializedEdges != 1 {
+		t.Errorf("expected 1 materialized edge, got %d", stats.MaterializedEdges)
+	}
+
+	// Check the derived edge exists
+	edges, err := engine.GetDerivedEdges(ctx, "A")
+	if err != nil {
+		t.Fatalf("GetDerivedEdges failed: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("expected 1 derived edge for A, got %d", len(edges))
+	}
+	if edges[0].Source != "A" || edges[0].Predicate != "indirect_calls" || edges[0].Target != "C" {
+		t.Errorf("unexpected derived edge: %v", edges[0])
+	}
+}
+
+func TestInferenceEngine_RunInference_SemiNaiveMatchesStandard(t *testing.T) {
+	// Verify that semi-naive and standard forward chaining produce the same results
+	// Use separate databases (non-shared) to avoid table collision
+	db1, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open test database 1: %v", err)
+	}
+	defer db1.Close()
+	setupEngineTestTables(t, db1)
+
+	db2, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open test database 2: %v", err)
+	}
+	defer db2.Close()
+	setupEngineTestTables(t, db2)
+
+	edges := []Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+		NewEdge("C", "calls", "D"),
+	}
+
+	// Engine 1: Standard forward chaining
+	engine1 := NewInferenceEngine(db1)
+	engine1.SetEdgeProvider(newEngineMockEdgeProvider(edges))
+
+	// Engine 2: Semi-naive evaluation
+	engine2 := NewInferenceEngine(db2)
+	engine2.SetEdgeProvider(newEngineMockEdgeProvider(edges))
+
+	ctx := context.Background()
+
+	rule := createTransitivityRule("rule1")
+
+	if err := engine1.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule (engine1) failed: %v", err)
+	}
+	if err := engine2.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule (engine2) failed: %v", err)
+	}
+
+	// Enable semi-naive for engine2
+	if err := engine2.UseSemiNaiveEvaluation(ctx, true); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation failed: %v", err)
+	}
+
+	// Run inference on both
+	if err := engine1.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference (engine1) failed: %v", err)
+	}
+	if err := engine2.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference (engine2) failed: %v", err)
+	}
+
+	// Both should produce the same number of materialized edges
+	stats1 := engine1.Stats()
+	stats2 := engine2.Stats()
+
+	if stats1.MaterializedEdges != stats2.MaterializedEdges {
+		t.Errorf("materialized edges mismatch: standard=%d, semi-naive=%d",
+			stats1.MaterializedEdges, stats2.MaterializedEdges)
+	}
+}
+
+func TestInferenceEngine_OnEdgeAdded_WithSemiNaive(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Enable semi-naive evaluation
+	if err := engine.UseSemiNaiveEvaluation(ctx, true); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation failed: %v", err)
+	}
+
+	// Add second edge that completes the pattern
+	provider.AddEdge(NewEdge("B", "calls", "C"))
+	if err := engine.OnEdgeAdded(ctx, NewEdge("B", "calls", "C")); err != nil {
+		t.Fatalf("OnEdgeAdded failed: %v", err)
+	}
+
+	// Should derive A-indirect_calls->C
+	stats := engine.Stats()
+	if stats.MaterializedEdges != 1 {
+		t.Errorf("expected 1 materialized edge, got %d", stats.MaterializedEdges)
+	}
+}
+
+func TestInferenceEngine_IsSemiNaiveEnabled_Default(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+
+	// By default, semi-naive should be disabled
+	if engine.IsSemiNaiveEnabled() {
+		t.Error("expected semi-naive evaluation to be disabled by default")
+	}
+}
+
+func TestInferenceEngine_getActiveForwardChainer_Standard(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+
+	// When semi-naive is disabled, should return standard forward chainer
+	fc := engine.getActiveForwardChainer()
+	if fc == nil {
+		t.Fatal("expected non-nil forward chainer")
+	}
+	if _, ok := fc.(*ForwardChainer); !ok {
+		t.Error("expected standard ForwardChainer when semi-naive is disabled")
+	}
+}
+
+func TestInferenceEngine_getActiveForwardChainer_SemiNaive(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	ctx := context.Background()
+
+	// Add a rule so semi-naive can be enabled
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Enable semi-naive
+	if err := engine.UseSemiNaiveEvaluation(ctx, true); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation failed: %v", err)
+	}
+
+	// Should return semi-naive forward chainer
+	fc := engine.getActiveForwardChainer()
+	if fc == nil {
+		t.Fatal("expected non-nil forward chainer")
+	}
+	if _, ok := fc.(*SemiNaiveForwardChainer); !ok {
+		t.Error("expected SemiNaiveForwardChainer when semi-naive is enabled")
+	}
+}
+
+func TestInferenceEngine_SemiNaive_MultipleRuns(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Enable semi-naive
+	if err := engine.UseSemiNaiveEvaluation(ctx, true); err != nil {
+		t.Fatalf("UseSemiNaiveEvaluation failed: %v", err)
+	}
+
+	// Run inference multiple times
+	for i := 0; i < 3; i++ {
+		if err := engine.RunInference(ctx); err != nil {
+			t.Fatalf("RunInference iteration %d failed: %v", i, err)
+		}
+	}
+
+	// Should still have only 1 materialized edge (no duplicates)
+	stats := engine.Stats()
+	if stats.MaterializedEdges != 1 {
+		t.Errorf("expected 1 materialized edge after multiple runs, got %d", stats.MaterializedEdges)
 	}
 }

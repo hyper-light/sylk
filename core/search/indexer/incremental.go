@@ -4,6 +4,7 @@ package indexer
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/search"
@@ -72,6 +73,7 @@ type FileChange struct {
 // IndexManagerInterface defines the indexing operations needed by IncrementalIndexer.
 type IndexManagerInterface interface {
 	Index(ctx context.Context, doc *search.Document) error
+	IndexBatch(ctx context.Context, docs []*search.Document) error
 	Delete(ctx context.Context, id string) error
 	DeleteByPath(ctx context.Context, path string) error
 }
@@ -92,6 +94,15 @@ type DocumentBuilder interface {
 // Configuration
 // =============================================================================
 
+// Default configuration values for batch accumulation.
+const (
+	// DefaultFlushInterval is the default interval for flushing pending changes.
+	DefaultFlushInterval = 100 * time.Millisecond
+
+	// DefaultMaxBatchSize is the default maximum batch size before auto-flush.
+	DefaultMaxBatchSize = 100
+)
+
 // IncrementalIndexerConfig configures the incremental indexer.
 type IncrementalIndexerConfig struct {
 	// BatchSize is the number of documents to process per batch.
@@ -99,6 +110,12 @@ type IncrementalIndexerConfig struct {
 
 	// MaxConcurrency is the maximum number of concurrent operations.
 	MaxConcurrency int
+
+	// FlushInterval is the interval for flushing pending changes (default: 100ms).
+	FlushInterval time.Duration
+
+	// MaxBatchSize is the maximum batch size before auto-flush (default: 100).
+	MaxBatchSize int
 }
 
 // =============================================================================
@@ -107,11 +124,18 @@ type IncrementalIndexerConfig struct {
 
 // IncrementalIndexer handles incremental indexing of changed files.
 // It only indexes files whose checksums have changed.
+// It supports batch accumulation for efficient bulk operations.
 type IncrementalIndexer struct {
 	config        IncrementalIndexerConfig
 	indexManager  IndexManagerInterface
 	checksumStore ChecksumStore
 	docBuilder    DocumentBuilder
+
+	// Batch accumulation fields for PF.3.6
+	pendingChanges []*FileChange
+	pendingMu      sync.Mutex
+	flushInterval  time.Duration
+	maxBatchSize   int
 }
 
 // NewIncrementalIndexer creates a new incremental indexer.
@@ -121,30 +145,153 @@ func NewIncrementalIndexer(
 	checksumStore ChecksumStore,
 	docBuilder DocumentBuilder,
 ) *IncrementalIndexer {
+	flushInterval := config.FlushInterval
+	if flushInterval <= 0 {
+		flushInterval = DefaultFlushInterval
+	}
+
+	maxBatchSize := config.MaxBatchSize
+	if maxBatchSize <= 0 {
+		maxBatchSize = DefaultMaxBatchSize
+	}
+
 	return &IncrementalIndexer{
-		config:        config,
-		indexManager:  indexManager,
-		checksumStore: checksumStore,
-		docBuilder:    docBuilder,
+		config:         config,
+		indexManager:   indexManager,
+		checksumStore:  checksumStore,
+		docBuilder:     docBuilder,
+		pendingChanges: make([]*FileChange, 0, maxBatchSize),
+		flushInterval:  flushInterval,
+		maxBatchSize:   maxBatchSize,
 	}
 }
 
-// Index processes a list of file changes.
+// Index processes a list of file changes using batch operations for efficiency.
+// Changes are grouped by operation type and processed in batches.
 // Returns partial results if context is cancelled.
 func (i *IncrementalIndexer) Index(ctx context.Context, changes []FileChange) (*search.IndexingResult, error) {
 	startTime := time.Now()
 	result := search.NewIndexingResult()
 
-	for _, change := range changes {
+	if len(changes) == 0 {
+		result.Duration = time.Since(startTime)
+		return result, nil
+	}
+
+	// Group changes by operation type for batch processing
+	var toIndex []*search.Document
+	var toDelete []string
+	var checksumUpdates []checksumUpdate
+
+	for idx := range changes {
+		change := &changes[idx]
+
 		if err := i.checkContext(ctx); err != nil {
 			result.Duration = time.Since(startTime)
 			return result, err
 		}
-		i.processChange(ctx, change, result)
+
+		switch change.Operation {
+		case OpCreate, OpModify:
+			doc, update, err := i.prepareForIndex(change)
+			if err != nil {
+				result.AddFailure("", change.Path, err.Error(), true)
+				continue
+			}
+			if doc == nil {
+				// Skipped due to unchanged checksum
+				continue
+			}
+			toIndex = append(toIndex, doc)
+			checksumUpdates = append(checksumUpdates, update)
+
+		case OpDelete:
+			toDelete = append(toDelete, change.Path)
+			i.checksumStore.DeleteChecksum(change.Path)
+
+		case OpRename:
+			// Handle rename: delete old path, index new path
+			toDelete = append(toDelete, change.OldPath)
+			i.checksumStore.DeleteChecksum(change.OldPath)
+
+			doc, update, err := i.prepareForIndex(&FileChange{
+				Path:      change.Path,
+				Operation: OpCreate,
+				FileInfo:  change.FileInfo,
+			})
+			if err != nil {
+				result.AddFailure("", change.Path, err.Error(), true)
+				continue
+			}
+			if doc != nil {
+				toIndex = append(toIndex, doc)
+				checksumUpdates = append(checksumUpdates, update)
+			}
+		}
+	}
+
+	// Process batch index
+	if len(toIndex) > 0 {
+		if err := i.indexManager.IndexBatch(ctx, toIndex); err != nil {
+			// If batch fails, record all as failures
+			for _, doc := range toIndex {
+				result.AddFailure(doc.ID, doc.Path, err.Error(), true)
+			}
+		} else {
+			// Update checksums and record successes
+			for _, update := range checksumUpdates {
+				i.checksumStore.SetChecksum(update.path, update.checksum)
+				result.AddSuccess()
+			}
+		}
+	}
+
+	// Process deletes
+	for _, path := range toDelete {
+		if err := i.indexManager.DeleteByPath(ctx, path); err != nil {
+			result.AddFailure("", path, err.Error(), true)
+		} else {
+			result.AddSuccess()
+		}
 	}
 
 	result.Duration = time.Since(startTime)
 	return result, nil
+}
+
+// checksumUpdate holds a pending checksum update.
+type checksumUpdate struct {
+	path     string
+	checksum string
+}
+
+// prepareForIndex builds a document and checks if indexing is needed.
+// Returns nil doc if the file should be skipped (unchanged checksum).
+func (i *IncrementalIndexer) prepareForIndex(change *FileChange) (*search.Document, checksumUpdate, error) {
+	if change.FileInfo == nil {
+		return nil, checksumUpdate{}, errNilFileInfo
+	}
+
+	doc, err := i.docBuilder.BuildDocument(change.FileInfo)
+	if err != nil {
+		return nil, checksumUpdate{}, err
+	}
+
+	// Check if checksum unchanged
+	if i.checksumUnchanged(change.Path, doc.Checksum) {
+		return nil, checksumUpdate{}, nil // Skip unchanged file
+	}
+
+	return doc, checksumUpdate{path: change.Path, checksum: doc.Checksum}, nil
+}
+
+// errNilFileInfo is returned when FileInfo is nil for create/modify operations.
+var errNilFileInfo = &fileInfoNilError{}
+
+type fileInfoNilError struct{}
+
+func (e *fileInfoNilError) Error() string {
+	return "FileInfo is nil for create/modify operation"
 }
 
 // checkContext returns an error if context is cancelled.
@@ -229,4 +376,101 @@ func (i *IncrementalIndexer) handleRename(ctx context.Context, change FileChange
 		Operation: OpCreate,
 		FileInfo:  change.FileInfo,
 	}, result)
+}
+
+// =============================================================================
+// Batch Accumulation Methods (PF.3.6)
+// =============================================================================
+
+// AccumulateChange adds a change to the pending batch.
+// If the batch reaches maxBatchSize, it triggers an automatic flush.
+// This method is thread-safe.
+func (i *IncrementalIndexer) AccumulateChange(change *FileChange) {
+	i.pendingMu.Lock()
+	i.pendingChanges = append(i.pendingChanges, change)
+	shouldFlush := len(i.pendingChanges) >= i.maxBatchSize
+	i.pendingMu.Unlock()
+
+	if shouldFlush {
+		_ = i.FlushPending(context.Background())
+	}
+}
+
+// FlushPending processes all accumulated changes as a batch.
+// Returns nil if there are no pending changes.
+// This method is thread-safe.
+func (i *IncrementalIndexer) FlushPending(ctx context.Context) error {
+	i.pendingMu.Lock()
+	changes := i.pendingChanges
+	i.pendingChanges = make([]*FileChange, 0, i.maxBatchSize)
+	i.pendingMu.Unlock()
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	// Group by operation type
+	var toIndex []*FileChange
+	var toDelete []*FileChange
+	for _, c := range changes {
+		if c.Operation == OpDelete {
+			toDelete = append(toDelete, c)
+		} else {
+			toIndex = append(toIndex, c)
+		}
+	}
+
+	// Batch index
+	if len(toIndex) > 0 {
+		docs := make([]*search.Document, 0, len(toIndex))
+		checksumUpdates := make([]checksumUpdate, 0, len(toIndex))
+
+		for _, c := range toIndex {
+			doc, update, err := i.prepareForIndex(c)
+			if err != nil || doc == nil {
+				continue // Skip errors and unchanged files
+			}
+			docs = append(docs, doc)
+			checksumUpdates = append(checksumUpdates, update)
+		}
+
+		if len(docs) > 0 {
+			if err := i.indexManager.IndexBatch(ctx, docs); err != nil {
+				return err
+			}
+			// Update checksums on success
+			for _, update := range checksumUpdates {
+				i.checksumStore.SetChecksum(update.path, update.checksum)
+			}
+		}
+	}
+
+	// Batch delete
+	for _, c := range toDelete {
+		if err := i.indexManager.DeleteByPath(ctx, c.Path); err != nil {
+			// Continue processing other deletes on error
+			continue
+		}
+		i.checksumStore.DeleteChecksum(c.Path)
+	}
+
+	return nil
+}
+
+// PendingCount returns the number of pending changes awaiting flush.
+// This method is thread-safe.
+func (i *IncrementalIndexer) PendingCount() int {
+	i.pendingMu.Lock()
+	defer i.pendingMu.Unlock()
+	return len(i.pendingChanges)
+}
+
+// MaxBatchSize returns the configured maximum batch size.
+func (i *IncrementalIndexer) MaxBatchSize() int {
+	return i.maxBatchSize
+}
+
+// FlushInterval returns the configured flush interval.
+func (i *IncrementalIndexer) FlushInterval() time.Duration {
+	return i.flushInterval
 }

@@ -22,8 +22,10 @@ type incrementalMockIndexManager struct {
 	indexed        map[string]*search.Document
 	deleted        map[string]bool
 	indexErr       error
+	indexBatchErr  error
 	deleteErr      error
 	deleteByPathFn func(ctx context.Context, path string) error
+	batchCalls     int // tracks number of IndexBatch calls
 }
 
 func newIncrementalMockIndexManager() *incrementalMockIndexManager {
@@ -40,6 +42,19 @@ func (m *incrementalMockIndexManager) Index(ctx context.Context, doc *search.Doc
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.indexed[doc.ID] = doc
+	return nil
+}
+
+func (m *incrementalMockIndexManager) IndexBatch(ctx context.Context, docs []*search.Document) error {
+	if m.indexBatchErr != nil {
+		return m.indexBatchErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchCalls++
+	for _, doc := range docs {
+		m.indexed[doc.ID] = doc
+	}
 	return nil
 }
 
@@ -455,8 +470,9 @@ func TestIndex_RenameOperation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if result.Indexed != 1 {
-			t.Errorf("expected 1 indexed, got %d", result.Indexed)
+		// Rename counts as 2 operations: 1 delete + 1 index
+		if result.Indexed != 2 {
+			t.Errorf("expected 2 indexed (delete + index), got %d", result.Indexed)
 		}
 
 		// Verify old path was deleted
@@ -574,9 +590,9 @@ func TestIndex_MixedOperations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		// All 4 operations should succeed
-		if result.Indexed != 4 {
-			t.Errorf("expected 4 indexed, got %d", result.Indexed)
+		// 5 operations: create=1, modify=1, delete=1, rename=2 (delete + index)
+		if result.Indexed != 5 {
+			t.Errorf("expected 5 indexed (create+modify+delete+rename(delete+index)), got %d", result.Indexed)
 		}
 		if result.Failed != 0 {
 			t.Errorf("expected 0 failed, got %d", result.Failed)
@@ -655,7 +671,7 @@ func TestIndex_ErrorHandling(t *testing.T) {
 
 	t.Run("handles index error", func(t *testing.T) {
 		indexMgr := newIncrementalMockIndexManager()
-		indexMgr.indexErr = errors.New("index error")
+		indexMgr.indexBatchErr = errors.New("index batch error")
 		checksumStore := newIncrementalMockChecksumStore()
 		docBuilder := newIncrementalMockDocumentBuilder()
 
@@ -764,7 +780,7 @@ func TestIndex_ChecksumStoreUpdates(t *testing.T) {
 
 	t.Run("does not update checksum store on failed index", func(t *testing.T) {
 		indexMgr := newIncrementalMockIndexManager()
-		indexMgr.indexErr = errors.New("index error")
+		indexMgr.indexBatchErr = errors.New("index batch error")
 		checksumStore := newIncrementalMockChecksumStore()
 		docBuilder := newIncrementalMockDocumentBuilder()
 
@@ -892,4 +908,475 @@ func TestChangeOperation_String(t *testing.T) {
 			}
 		})
 	}
+}
+
+// =============================================================================
+// Test: Batch Indexing (PF.3.6)
+// =============================================================================
+
+func TestIndex_UsesBatchIndexing(t *testing.T) {
+	t.Run("uses IndexBatch for multiple create operations", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		indexer := NewIncrementalIndexer(
+			defaultTestConfig(),
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		changes := []FileChange{
+			{
+				Path:      "/test/file1.go",
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo("/test/file1.go"),
+			},
+			{
+				Path:      "/test/file2.go",
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo("/test/file2.go"),
+			},
+			{
+				Path:      "/test/file3.go",
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo("/test/file3.go"),
+			},
+		}
+
+		result, err := indexer.Index(context.Background(), changes)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Indexed != 3 {
+			t.Errorf("expected 3 indexed, got %d", result.Indexed)
+		}
+		// Should use batch indexing (single call)
+		if indexMgr.batchCalls != 1 {
+			t.Errorf("expected 1 batch call, got %d", indexMgr.batchCalls)
+		}
+		if len(indexMgr.indexed) != 3 {
+			t.Errorf("expected 3 documents in index, got %d", len(indexMgr.indexed))
+		}
+	})
+
+	t.Run("handles batch index error", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		indexMgr.indexBatchErr = errors.New("batch index error")
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		indexer := NewIncrementalIndexer(
+			defaultTestConfig(),
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		changes := []FileChange{
+			{
+				Path:      "/test/file1.go",
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo("/test/file1.go"),
+			},
+			{
+				Path:      "/test/file2.go",
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo("/test/file2.go"),
+			},
+		}
+
+		result, err := indexer.Index(context.Background(), changes)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Both should be recorded as failures
+		if result.Failed != 2 {
+			t.Errorf("expected 2 failed, got %d", result.Failed)
+		}
+		if result.Indexed != 0 {
+			t.Errorf("expected 0 indexed, got %d", result.Indexed)
+		}
+	})
+}
+
+// =============================================================================
+// Test: Batch Accumulation (PF.3.6)
+// =============================================================================
+
+func TestAccumulateChange(t *testing.T) {
+	t.Run("accumulates changes without immediate flush", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			BatchSize:    10,
+			MaxBatchSize: 100, // High threshold to prevent auto-flush
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		change := &FileChange{
+			Path:      "/test/file.go",
+			Operation: OpCreate,
+			FileInfo:  createTestFileInfo("/test/file.go"),
+		}
+
+		indexer.AccumulateChange(change)
+
+		// Should have 1 pending change
+		if indexer.PendingCount() != 1 {
+			t.Errorf("expected 1 pending change, got %d", indexer.PendingCount())
+		}
+		// Index should not have been called yet
+		if indexMgr.batchCalls != 0 {
+			t.Errorf("expected 0 batch calls, got %d", indexMgr.batchCalls)
+		}
+	})
+
+	t.Run("auto-flushes when maxBatchSize reached", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			BatchSize:    10,
+			MaxBatchSize: 3, // Low threshold for auto-flush
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Accumulate 3 changes (should trigger auto-flush)
+		for i := 0; i < 3; i++ {
+			change := &FileChange{
+				Path:      "/test/file" + string(rune('0'+i)) + ".go",
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo("/test/file" + string(rune('0'+i)) + ".go"),
+			}
+			indexer.AccumulateChange(change)
+		}
+
+		// Should have flushed
+		if indexer.PendingCount() != 0 {
+			t.Errorf("expected 0 pending changes after auto-flush, got %d", indexer.PendingCount())
+		}
+		// Should have called batch index
+		if indexMgr.batchCalls != 1 {
+			t.Errorf("expected 1 batch call after auto-flush, got %d", indexMgr.batchCalls)
+		}
+	})
+}
+
+func TestFlushPending(t *testing.T) {
+	t.Run("flushes accumulated changes", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			BatchSize:    10,
+			MaxBatchSize: 100,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Accumulate some changes
+		for i := 0; i < 5; i++ {
+			change := &FileChange{
+				Path:      "/test/file" + string(rune('0'+i)) + ".go",
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo("/test/file" + string(rune('0'+i)) + ".go"),
+			}
+			indexer.AccumulateChange(change)
+		}
+
+		if indexer.PendingCount() != 5 {
+			t.Errorf("expected 5 pending changes, got %d", indexer.PendingCount())
+		}
+
+		// Flush
+		err := indexer.FlushPending(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Should be empty now
+		if indexer.PendingCount() != 0 {
+			t.Errorf("expected 0 pending changes after flush, got %d", indexer.PendingCount())
+		}
+		// Documents should be indexed
+		if len(indexMgr.indexed) != 5 {
+			t.Errorf("expected 5 indexed documents, got %d", len(indexMgr.indexed))
+		}
+	})
+
+	t.Run("returns nil for empty pending", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		indexer := NewIncrementalIndexer(
+			defaultTestConfig(),
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		err := indexer.FlushPending(context.Background())
+		if err != nil {
+			t.Errorf("expected nil error for empty flush, got %v", err)
+		}
+	})
+
+	t.Run("handles delete operations", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		// Pre-store checksum for delete
+		checksumStore.SetChecksum("/test/delete.go", "some-checksum")
+
+		config := IncrementalIndexerConfig{
+			BatchSize:    10,
+			MaxBatchSize: 100,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Accumulate a delete
+		indexer.AccumulateChange(&FileChange{
+			Path:      "/test/delete.go",
+			Operation: OpDelete,
+		})
+
+		// Flush
+		err := indexer.FlushPending(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Should have deleted
+		if !indexMgr.deleted["/test/delete.go"] {
+			t.Error("expected file to be deleted")
+		}
+		// Checksum should be removed
+		if _, ok := checksumStore.GetChecksum("/test/delete.go"); ok {
+			t.Error("expected checksum to be deleted")
+		}
+	})
+
+	t.Run("handles mixed operations", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			BatchSize:    10,
+			MaxBatchSize: 100,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Accumulate mixed operations
+		indexer.AccumulateChange(&FileChange{
+			Path:      "/test/create.go",
+			Operation: OpCreate,
+			FileInfo:  createTestFileInfo("/test/create.go"),
+		})
+		indexer.AccumulateChange(&FileChange{
+			Path:      "/test/delete.go",
+			Operation: OpDelete,
+		})
+		indexer.AccumulateChange(&FileChange{
+			Path:      "/test/modify.go",
+			Operation: OpModify,
+			FileInfo:  createTestFileInfo("/test/modify.go"),
+		})
+
+		// Flush
+		err := indexer.FlushPending(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Should have 2 indexed (create + modify)
+		if len(indexMgr.indexed) != 2 {
+			t.Errorf("expected 2 indexed documents, got %d", len(indexMgr.indexed))
+		}
+		// Should have 1 deleted
+		if !indexMgr.deleted["/test/delete.go"] {
+			t.Error("expected delete.go to be deleted")
+		}
+	})
+}
+
+func TestMaxBatchSize(t *testing.T) {
+	t.Run("returns configured max batch size", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			MaxBatchSize: 50,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		if indexer.MaxBatchSize() != 50 {
+			t.Errorf("expected max batch size 50, got %d", indexer.MaxBatchSize())
+		}
+	})
+
+	t.Run("uses default when not configured", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		indexer := NewIncrementalIndexer(
+			IncrementalIndexerConfig{},
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		if indexer.MaxBatchSize() != DefaultMaxBatchSize {
+			t.Errorf("expected default max batch size %d, got %d", DefaultMaxBatchSize, indexer.MaxBatchSize())
+		}
+	})
+}
+
+func TestFlushInterval(t *testing.T) {
+	t.Run("returns configured flush interval", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			FlushInterval: 200 * time.Millisecond,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		if indexer.FlushInterval() != 200*time.Millisecond {
+			t.Errorf("expected flush interval 200ms, got %v", indexer.FlushInterval())
+		}
+	})
+
+	t.Run("uses default when not configured", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		indexer := NewIncrementalIndexer(
+			IncrementalIndexerConfig{},
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		if indexer.FlushInterval() != DefaultFlushInterval {
+			t.Errorf("expected default flush interval %v, got %v", DefaultFlushInterval, indexer.FlushInterval())
+		}
+	})
+}
+
+// =============================================================================
+// Test: Concurrent Batch Accumulation (PF.3.6)
+// =============================================================================
+
+func TestAccumulateChange_Concurrent(t *testing.T) {
+	t.Run("handles concurrent accumulation safely", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			MaxBatchSize: 1000, // High to prevent auto-flush
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Spawn multiple goroutines to accumulate changes
+		var wg sync.WaitGroup
+		numGoroutines := 10
+		changesPerGoroutine := 10
+
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < changesPerGoroutine; j++ {
+					path := "/test/file" + string(rune('A'+id)) + string(rune('0'+j)) + ".go"
+					change := &FileChange{
+						Path:      path,
+						Operation: OpCreate,
+						FileInfo:  createTestFileInfo(path),
+					}
+					indexer.AccumulateChange(change)
+				}
+			}(i)
+		}
+
+		wg.Wait()
+
+		// All changes should be pending
+		expected := numGoroutines * changesPerGoroutine
+		if indexer.PendingCount() != expected {
+			t.Errorf("expected %d pending changes, got %d", expected, indexer.PendingCount())
+		}
+
+		// Flush and verify
+		err := indexer.FlushPending(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error during flush: %v", err)
+		}
+
+		if indexer.PendingCount() != 0 {
+			t.Errorf("expected 0 pending after flush, got %d", indexer.PendingCount())
+		}
+	})
 }

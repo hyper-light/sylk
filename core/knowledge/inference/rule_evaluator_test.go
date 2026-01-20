@@ -683,3 +683,451 @@ func TestCloneEdges_Empty(t *testing.T) {
 		t.Error("Clone of empty slice should be empty")
 	}
 }
+
+// =============================================================================
+// PF.4.8: Edge Index Tests
+// =============================================================================
+
+func TestRuleEvaluator_buildEdgeIndex(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+		{Source: "B", Predicate: "calls", Target: "D"},
+		{Source: "B", Predicate: "imports", Target: "E"},
+	}
+
+	idx := evaluator.buildEdgeIndex(edges)
+
+	// Test bySource
+	if len(idx.bySource["A"]) != 2 {
+		t.Errorf("Expected 2 edges from source A, got %d", len(idx.bySource["A"]))
+	}
+	if len(idx.bySource["B"]) != 2 {
+		t.Errorf("Expected 2 edges from source B, got %d", len(idx.bySource["B"]))
+	}
+
+	// Test byTarget
+	if len(idx.byTarget["B"]) != 1 {
+		t.Errorf("Expected 1 edge to target B, got %d", len(idx.byTarget["B"]))
+	}
+
+	// Test byPredicate
+	if len(idx.byPredicate["calls"]) != 3 {
+		t.Errorf("Expected 3 edges with predicate 'calls', got %d", len(idx.byPredicate["calls"]))
+	}
+	if len(idx.byPredicate["imports"]) != 1 {
+		t.Errorf("Expected 1 edge with predicate 'imports', got %d", len(idx.byPredicate["imports"]))
+	}
+
+	// Test bySourcePred
+	if len(idx.bySourcePred["A:calls"]) != 2 {
+		t.Errorf("Expected 2 edges for A:calls, got %d", len(idx.bySourcePred["A:calls"]))
+	}
+	if len(idx.bySourcePred["B:imports"]) != 1 {
+		t.Errorf("Expected 1 edge for B:imports, got %d", len(idx.bySourcePred["B:imports"]))
+	}
+
+	// Test byTargetPred
+	if len(idx.byTargetPred["B:calls"]) != 1 {
+		t.Errorf("Expected 1 edge for B:calls (as target), got %d", len(idx.byTargetPred["B:calls"]))
+	}
+
+	// Test allEdges
+	if len(idx.allEdges) != 4 {
+		t.Errorf("Expected 4 edges in allEdges, got %d", len(idx.allEdges))
+	}
+}
+
+func TestRuleEvaluator_buildEdgeIndex_Empty(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	idx := evaluator.buildEdgeIndex([]Edge{})
+
+	if idx == nil {
+		t.Error("Index should not be nil for empty edges")
+	}
+	if len(idx.allEdges) != 0 {
+		t.Error("allEdges should be empty")
+	}
+}
+
+func TestRuleEvaluator_matchConditionIndexed_BoundSource(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+		{Source: "B", Predicate: "calls", Target: "D"},
+	}
+
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+
+	// With ?x bound to "A"
+	bindings := map[string]string{"?x": "A"}
+	matches := evaluator.matchConditionIndexed(condition, bindings)
+
+	if len(matches) != 2 {
+		t.Errorf("Expected 2 matches with source A, got %d", len(matches))
+	}
+
+	for _, m := range matches {
+		if m.edge.Source != "A" {
+			t.Errorf("Expected source A, got %s", m.edge.Source)
+		}
+	}
+}
+
+func TestRuleEvaluator_matchConditionIndexed_BoundTarget(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "C", Predicate: "calls", Target: "B"},
+		{Source: "D", Predicate: "calls", Target: "E"},
+	}
+
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+
+	// With ?y bound to "B"
+	bindings := map[string]string{"?y": "B"}
+	matches := evaluator.matchConditionIndexed(condition, bindings)
+
+	if len(matches) != 2 {
+		t.Errorf("Expected 2 matches with target B, got %d", len(matches))
+	}
+
+	for _, m := range matches {
+		if m.edge.Target != "B" {
+			t.Errorf("Expected target B, got %s", m.edge.Target)
+		}
+	}
+}
+
+func TestRuleEvaluator_matchConditionIndexed_ConstantPredicate(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "imports", Target: "C"},
+		{Source: "B", Predicate: "calls", Target: "D"},
+	}
+
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "imports", // constant predicate
+		Object:    "?y",
+	}
+
+	bindings := map[string]string{}
+	matches := evaluator.matchConditionIndexed(condition, bindings)
+
+	if len(matches) != 1 {
+		t.Errorf("Expected 1 match with predicate 'imports', got %d", len(matches))
+	}
+
+	if matches[0].edge.Predicate != "imports" {
+		t.Errorf("Expected predicate 'imports', got %s", matches[0].edge.Predicate)
+	}
+}
+
+func TestRuleEvaluator_matchConditionIndexed_NoIndex(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	evaluator.edgeIndex = nil
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+
+	matches := evaluator.matchConditionIndexed(condition, map[string]string{})
+
+	if matches != nil {
+		t.Error("Expected nil matches when no index")
+	}
+}
+
+// =============================================================================
+// PF.4.7: Memoization Tests
+// =============================================================================
+
+func TestRuleEvaluator_conditionCacheKey(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+
+	// Same condition with same bindings should have same key
+	bindings1 := map[string]string{"?x": "A"}
+	bindings2 := map[string]string{"?x": "A"}
+
+	key1 := evaluator.conditionCacheKey(condition, bindings1)
+	key2 := evaluator.conditionCacheKey(condition, bindings2)
+
+	if key1 != key2 {
+		t.Errorf("Same bindings should produce same key: %s != %s", key1, key2)
+	}
+
+	// Different bindings should have different keys
+	bindings3 := map[string]string{"?x": "B"}
+	key3 := evaluator.conditionCacheKey(condition, bindings3)
+
+	if key1 == key3 {
+		t.Error("Different bindings should produce different keys")
+	}
+
+	// Multiple variables bound should produce consistent keys
+	bindings4 := map[string]string{"?x": "A", "?y": "B"}
+	bindings5 := map[string]string{"?y": "B", "?x": "A"} // order shouldn't matter
+
+	key4 := evaluator.conditionCacheKey(condition, bindings4)
+	key5 := evaluator.conditionCacheKey(condition, bindings5)
+
+	if key4 != key5 {
+		t.Errorf("Binding order should not affect key: %s != %s", key4, key5)
+	}
+}
+
+func TestRuleEvaluator_conditionCacheKey_ConstantCondition(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	condition := RuleCondition{
+		Subject:   "NodeA",
+		Predicate: "calls",
+		Object:    "NodeB",
+	}
+
+	// No variables, so bindings don't matter
+	key1 := evaluator.conditionCacheKey(condition, map[string]string{})
+	key2 := evaluator.conditionCacheKey(condition, map[string]string{"?x": "ignored"})
+
+	if key1 != key2 {
+		t.Errorf("Irrelevant bindings should not affect key: %s != %s", key1, key2)
+	}
+}
+
+func TestRuleEvaluator_matchConditionCached(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+	}
+
+	evaluator.clearCache()
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+
+	bindings := map[string]string{"?x": "A"}
+
+	// First call should compute and cache
+	matches1 := evaluator.matchConditionCached(condition, bindings)
+
+	// Second call should return cached result
+	matches2 := evaluator.matchConditionCached(condition, bindings)
+
+	if len(matches1) != len(matches2) {
+		t.Errorf("Cached result should match: %d != %d", len(matches1), len(matches2))
+	}
+
+	if len(matches1) != 2 {
+		t.Errorf("Expected 2 matches, got %d", len(matches1))
+	}
+
+	// Verify cache was populated
+	cacheKey := evaluator.conditionCacheKey(condition, bindings)
+	if _, ok := evaluator.matchCache[cacheKey]; !ok {
+		t.Error("Cache should contain the computed result")
+	}
+}
+
+func TestRuleEvaluator_clearCache(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	// Add something to cache
+	evaluator.matchCache["test_key"] = []conditionMatch{
+		{edge: Edge{Source: "A", Predicate: "rel", Target: "B"}},
+	}
+
+	if len(evaluator.matchCache) != 1 {
+		t.Error("Cache should have 1 entry")
+	}
+
+	evaluator.clearCache()
+
+	if len(evaluator.matchCache) != 0 {
+		t.Error("Cache should be empty after clear")
+	}
+}
+
+func TestRuleEvaluator_CacheIsClearedPerEvaluation(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	ctx := context.Background()
+
+	rule := InferenceRule{
+		ID:   "r1",
+		Name: "Test",
+		Head: RuleCondition{
+			Subject:   "?x",
+			Predicate: "derived",
+			Object:    "?y",
+		},
+		Body: []RuleCondition{
+			{Subject: "?x", Predicate: "rel", Object: "?y"},
+		},
+		Priority: 1,
+		Enabled:  true,
+	}
+
+	edges1 := []Edge{
+		{Source: "A", Predicate: "rel", Target: "B"},
+	}
+
+	// First evaluation
+	results1 := evaluator.EvaluateRule(ctx, rule, edges1)
+	if len(results1) != 1 {
+		t.Fatalf("Expected 1 result from first evaluation, got %d", len(results1))
+	}
+
+	// Second evaluation with different edges
+	edges2 := []Edge{
+		{Source: "C", Predicate: "rel", Target: "D"},
+		{Source: "E", Predicate: "rel", Target: "F"},
+	}
+
+	results2 := evaluator.EvaluateRule(ctx, rule, edges2)
+	if len(results2) != 2 {
+		t.Fatalf("Expected 2 results from second evaluation, got %d", len(results2))
+	}
+
+	// Verify results are from the correct edge set
+	foundC := false
+	foundE := false
+	for _, r := range results2 {
+		if r.DerivedEdge.SourceID == "C" {
+			foundC = true
+		}
+		if r.DerivedEdge.SourceID == "E" {
+			foundE = true
+		}
+		if r.DerivedEdge.SourceID == "A" {
+			t.Error("Result from first edge set should not appear in second evaluation")
+		}
+	}
+
+	if !foundC || !foundE {
+		t.Error("Missing expected results from second evaluation")
+	}
+}
+
+// =============================================================================
+// Performance Tests (ensure optimizations work correctly)
+// =============================================================================
+
+func TestRuleEvaluator_IndexedMatchingProducesCorrectResults(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	ctx := context.Background()
+
+	// Complex rule with multiple conditions
+	rule := InferenceRule{
+		ID:   "transitive",
+		Name: "Transitive Closure",
+		Head: RuleCondition{
+			Subject:   "?a",
+			Predicate: "reaches",
+			Object:    "?c",
+		},
+		Body: []RuleCondition{
+			{Subject: "?a", Predicate: "edge", Object: "?b"},
+			{Subject: "?b", Predicate: "edge", Object: "?c"},
+		},
+		Priority: 1,
+		Enabled:  true,
+	}
+
+	// Create a graph: A->B->C->D
+	edges := []Edge{
+		{Source: "A", Predicate: "edge", Target: "B"},
+		{Source: "B", Predicate: "edge", Target: "C"},
+		{Source: "C", Predicate: "edge", Target: "D"},
+	}
+
+	results := evaluator.EvaluateRule(ctx, rule, edges)
+
+	// Expected: A reaches C, B reaches D
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 transitive results, got %d", len(results))
+	}
+
+	expected := map[string]string{
+		"A": "C",
+		"B": "D",
+	}
+
+	for _, r := range results {
+		expectedTarget, ok := expected[r.DerivedEdge.SourceID]
+		if !ok {
+			t.Errorf("Unexpected source: %s", r.DerivedEdge.SourceID)
+			continue
+		}
+		if r.DerivedEdge.TargetID != expectedTarget {
+			t.Errorf("Expected %s->%s, got %s->%s",
+				r.DerivedEdge.SourceID, expectedTarget,
+				r.DerivedEdge.SourceID, r.DerivedEdge.TargetID)
+		}
+	}
+}
+
+func TestRuleEvaluator_filterMatches(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	candidates := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+		{Source: "A", Predicate: "imports", Target: "D"},
+	}
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+
+	bindings := map[string]string{"?x": "A"}
+
+	matches := evaluator.filterMatches(candidates, condition, bindings)
+
+	// Should filter out the imports edge
+	if len(matches) != 2 {
+		t.Errorf("Expected 2 matches, got %d", len(matches))
+	}
+
+	for _, m := range matches {
+		if m.edge.Predicate != "calls" {
+			t.Errorf("Expected predicate 'calls', got %s", m.edge.Predicate)
+		}
+	}
+}

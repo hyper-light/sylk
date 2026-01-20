@@ -325,3 +325,148 @@ func TestVectorSearcherFindSimilarNotFound(t *testing.T) {
 		t.Error("FindSimilar should fail for nonexistent node")
 	}
 }
+
+func TestVectorSearcherBatchLoading(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	// Insert many nodes to test batch loading
+	nodeCount := 50
+	for i := 0; i < nodeCount; i++ {
+		ns.InsertNode(&GraphNode{
+			ID:       nodeID(i),
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+		}, []float32{float32(i%10) + 0.1, 0.1, 0.1})
+	}
+
+	// Setup mock with results for all nodes
+	mock := newMockHNSWSearcher()
+	results := make([]HNSWSearchResult, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		results[i] = HNSWSearchResult{
+			ID:         nodeID(i),
+			Similarity: float64(nodeCount-i) / float64(nodeCount),
+			Domain:     DomainCode,
+			NodeType:   NodeTypeFile,
+		}
+	}
+	mock.setResults(results)
+
+	vs := NewVectorSearcher(db, mock)
+
+	// Search should use batch loading internally
+	searchResults, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{Limit: nodeCount})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	// Verify we got all results via batch loading
+	if len(searchResults) != nodeCount {
+		t.Errorf("Got %d results, want %d", len(searchResults), nodeCount)
+	}
+
+	// Verify all results have valid nodes
+	for _, r := range searchResults {
+		if r.Node == nil {
+			t.Error("Result node should not be nil")
+		}
+		if r.Node.ID == "" {
+			t.Error("Result node ID should not be empty")
+		}
+	}
+}
+
+func TestVectorSearcherBatchLoadingWithMinSimilarity(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	// Insert nodes
+	for i := 0; i < 10; i++ {
+		ns.InsertNode(&GraphNode{
+			ID:       nodeID(i),
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+		}, []float32{float32(i + 1), 0.1, 0.1})
+	}
+
+	// Setup mock with varying similarity scores
+	mock := newMockHNSWSearcher()
+	results := []HNSWSearchResult{
+		{ID: nodeID(0), Similarity: 0.9},
+		{ID: nodeID(1), Similarity: 0.8},
+		{ID: nodeID(2), Similarity: 0.6},
+		{ID: nodeID(3), Similarity: 0.4}, // Below threshold
+		{ID: nodeID(4), Similarity: 0.3}, // Below threshold
+	}
+	mock.setResults(results)
+
+	vs := NewVectorSearcher(db, mock)
+
+	// Search with min similarity filter
+	searchResults, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{
+		MinSimilarity: 0.5,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	// Should only return 3 results (those with similarity >= 0.5)
+	if len(searchResults) != 3 {
+		t.Errorf("Got %d results, want 3", len(searchResults))
+	}
+
+	// Verify all results meet minimum similarity
+	for _, r := range searchResults {
+		if r.Similarity < 0.5 {
+			t.Errorf("Result %s has similarity %f, want >= 0.5", r.Node.ID, r.Similarity)
+		}
+	}
+}
+
+func TestVectorSearcherBatchLoadingPreservesOrder(t *testing.T) {
+	db, path := setupTestDB(t)
+	defer cleanupDB(db, path)
+
+	ns := NewNodeStore(db, nil)
+
+	// Insert nodes
+	for i := 0; i < 5; i++ {
+		ns.InsertNode(&GraphNode{
+			ID:       nodeID(i),
+			Domain:   DomainCode,
+			NodeType: NodeTypeFile,
+		}, []float32{float32(i + 1), 0.1, 0.1})
+	}
+
+	// Setup mock with specific order
+	mock := newMockHNSWSearcher()
+	results := []HNSWSearchResult{
+		{ID: nodeID(2), Similarity: 0.95},
+		{ID: nodeID(0), Similarity: 0.9},
+		{ID: nodeID(4), Similarity: 0.85},
+		{ID: nodeID(1), Similarity: 0.8},
+		{ID: nodeID(3), Similarity: 0.75},
+	}
+	mock.setResults(results)
+
+	vs := NewVectorSearcher(db, mock)
+
+	searchResults, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{Limit: 5})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	// Verify order is preserved from HNSW results
+	expectedOrder := []string{nodeID(2), nodeID(0), nodeID(4), nodeID(1), nodeID(3)}
+	for i, r := range searchResults {
+		if r.Node.ID != expectedOrder[i] {
+			t.Errorf("Result %d: got %s, want %s", i, r.Node.ID, expectedOrder[i])
+		}
+	}
+}

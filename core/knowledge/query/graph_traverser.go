@@ -5,6 +5,8 @@ package query
 import (
 	"container/list"
 	"context"
+	"fmt"
+	"hash/fnv"
 )
 
 // =============================================================================
@@ -60,19 +62,59 @@ type EdgeQuerier interface {
 }
 
 // =============================================================================
+// Graph Traverser Configuration
+// =============================================================================
+
+// TraverserConfig configures the behavior of the GraphTraverser.
+type TraverserConfig struct {
+	// SimpleVisit when true uses only nodeID for visit tracking (faster but
+	// may miss paths in highly connected graphs). When false, uses path-based
+	// visit tracking for proper cycle detection across all path branches.
+	// Default is false for full cycle detection.
+	SimpleVisit bool
+
+	// MaxPathLength limits the maximum path length during traversal.
+	// Helps prevent exponential path explosion in highly connected graphs.
+	// Default is 20 if not set.
+	MaxPathLength int
+}
+
+// DefaultTraverserConfig returns a TraverserConfig with sensible defaults.
+func DefaultTraverserConfig() TraverserConfig {
+	return TraverserConfig{
+		SimpleVisit:   false,
+		MaxPathLength: 20,
+	}
+}
+
+// =============================================================================
 // Graph Traverser
 // =============================================================================
 
 // GraphTraverser provides pattern-based graph traversal using BFS.
 // It implements graceful degradation by returning empty results on failure.
+//
+// PF.4.6: Supports configurable path-based visit tracking for proper cycle
+// detection across different path branches in highly connected graphs.
 type GraphTraverser struct {
-	db EdgeQuerier
+	db     EdgeQuerier
+	config TraverserConfig
 }
 
 // NewGraphTraverser creates a new GraphTraverser with the provided edge querier.
+// Uses default configuration with full path-based cycle detection.
 func NewGraphTraverser(db EdgeQuerier) *GraphTraverser {
+	return NewGraphTraverserWithConfig(db, DefaultTraverserConfig())
+}
+
+// NewGraphTraverserWithConfig creates a new GraphTraverser with custom configuration.
+func NewGraphTraverserWithConfig(db EdgeQuerier, config TraverserConfig) *GraphTraverser {
+	if config.MaxPathLength <= 0 {
+		config.MaxPathLength = 20
+	}
 	return &GraphTraverser{
-		db: db,
+		db:     db,
+		config: config,
 	}
 }
 
@@ -240,7 +282,15 @@ func (gt *GraphTraverser) bfsTraverse(ctx context.Context, startID string, patte
 				continue
 			}
 
-			// Mark visited for this traversal branch
+			// PF.4.6: Path length limit to prevent exponential explosion
+			if len(curr.path) >= gt.config.MaxPathLength {
+				continue
+			}
+
+			// PF.4.6: Mark visited for this traversal branch
+			// With full cycle detection (SimpleVisit=false), the visit key
+			// includes path context to allow the same node to be visited
+			// via different paths while preventing true cycles.
 			visitKey := gt.visitKey(curr.path, neighbor.id)
 			if visited[visitKey] {
 				continue
@@ -364,10 +414,38 @@ func (gt *GraphTraverser) isInPath(nodeID string, path []string) bool {
 }
 
 // visitKey creates a unique key for visited state based on path.
+// PF.4.6: Fixed to include path information for proper cycle detection.
+//
+// When SimpleVisit is true, uses only nodeID (faster but may revisit nodes
+// via different paths). When false, includes path context using a hash
+// for efficient storage while detecting true cycles across path branches.
 func (gt *GraphTraverser) visitKey(path []string, nextID string) string {
-	// Use a simple approach: path length + node ID
-	// This allows the same node to be visited via different paths
-	return nextID
+	// Simple mode: just use nodeID (faster, prevents any revisit)
+	if gt.config.SimpleVisit {
+		return nextID
+	}
+
+	// Full cycle detection mode: include path context
+	// Use FNV-1a hash for efficiency - combines path with nextID
+	h := fnv.New64a()
+	for _, p := range path {
+		h.Write([]byte(p))
+		h.Write([]byte{0}) // null byte separator to avoid collisions
+	}
+	h.Write([]byte(nextID))
+
+	// Return nodeID:hash format for debuggability
+	return fmt.Sprintf("%s:%x", nextID, h.Sum64())
+}
+
+// hashPath computes a hash of the path for use in path-based visited tracking.
+func hashPath(path []string) uint64 {
+	h := fnv.New64a()
+	for _, p := range path {
+		h.Write([]byte(p))
+		h.Write([]byte{0})
+	}
+	return h.Sum64()
 }
 
 // createResult converts a traversal node into a GraphResult.
@@ -407,4 +485,9 @@ func (gt *GraphTraverser) calculateScore(node traversalNode) float64 {
 // IsReady returns true if the traverser has a valid edge querier.
 func (gt *GraphTraverser) IsReady() bool {
 	return gt.db != nil
+}
+
+// Config returns the current traverser configuration.
+func (gt *GraphTraverser) Config() TraverserConfig {
+	return gt.config
 }
