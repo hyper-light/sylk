@@ -21,6 +21,7 @@ type HNSWSnapshot struct {
 	CreatedAt  time.Time
 	EntryPoint string
 	MaxLevel   int
+	EfSearch   int                                // search beam width (0 uses default)
 	Layers     []LayerSnapshot                    // frozen layer state (copied)
 	Vectors    map[string][]float32               // frozen vector cache
 	Magnitudes map[string]float64                 // frozen magnitudes
@@ -107,6 +108,7 @@ func createSnapshotFromIndex(idx *Index, seqNum uint64) *HNSWSnapshot {
 		CreatedAt:  time.Now(),
 		EntryPoint: idx.entryPoint,
 		MaxLevel:   idx.maxLevel,
+		EfSearch:   idx.efSearch,
 		Layers:     copyLayers(idx.layers),
 		Vectors:    copyVectors(idx.vectors),
 		Magnitudes: copyMagnitudes(idx.magnitudes),
@@ -217,10 +219,21 @@ func (s *HNSWSnapshot) AcquireReader() int32 {
 	return s.readers.Add(1)
 }
 
-// ReleaseReader decrements the reader count.
-// Returns the new reader count.
-func (s *HNSWSnapshot) ReleaseReader() int32 {
-	return s.readers.Add(-1)
+// ReleaseReader decrements the reader count if positive.
+// Returns the new reader count and true if successful, or current count
+// and false if already at zero (over-release attempt).
+// Uses compare-and-swap for thread-safe underflow protection.
+func (s *HNSWSnapshot) ReleaseReader() (int32, bool) {
+	for {
+		current := s.readers.Load()
+		if current <= 0 {
+			return current, false
+		}
+		if s.readers.CompareAndSwap(current, current-1) {
+			return current - 1, true
+		}
+		// CAS failed, another goroutine modified the counter, retry
+	}
 }
 
 // ReaderCount returns the current number of active readers.

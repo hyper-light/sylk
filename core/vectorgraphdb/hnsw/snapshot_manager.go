@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,13 +101,22 @@ func (sm *HNSWSnapshotManager) copyAllLayers(layers []*layer) []LayerSnapshot {
 }
 
 // ReleaseSnapshot decrements the reader count for GC eligibility.
-func (sm *HNSWSnapshotManager) ReleaseSnapshot(id uint64) {
+// Returns true if the release was valid, false if over-released (underflow prevented).
+// Logs a warning on over-release attempts to help identify lifecycle bugs.
+func (sm *HNSWSnapshotManager) ReleaseSnapshot(id uint64) bool {
 	val, ok := sm.snapshots.Load(id)
 	if !ok {
-		return
+		return false
 	}
 	snap := val.(*HNSWSnapshot)
-	snap.ReleaseReader()
+	_, released := snap.ReleaseReader()
+	if !released {
+		slog.Warn("snapshot over-release attempt detected",
+			slog.Uint64("snapshot_id", id),
+			slog.Int64("reader_count", int64(snap.ReaderCount())),
+		)
+	}
+	return released
 }
 
 // OnInsert increments the sequence number so new snapshots see new data.

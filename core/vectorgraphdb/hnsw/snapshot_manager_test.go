@@ -133,11 +133,13 @@ func TestSnapshotManager_ReleaseSnapshot(t *testing.T) {
 	snap := sm.CreateSnapshot()
 	assert.Equal(t, int32(1), snap.ReaderCount())
 
-	sm.ReleaseSnapshot(snap.ID)
+	released := sm.ReleaseSnapshot(snap.ID)
+	assert.True(t, released, "first release should succeed")
 	assert.Equal(t, int32(0), snap.ReaderCount())
 
-	// Releasing non-existent snapshot should not panic
-	sm.ReleaseSnapshot(99999)
+	// Releasing non-existent snapshot should return false
+	released = sm.ReleaseSnapshot(99999)
+	assert.False(t, released, "releasing non-existent snapshot should return false")
 }
 
 func TestSnapshotManager_OnInsert_IncreasesSeqNum(t *testing.T) {
@@ -417,4 +419,259 @@ func TestSnapshotManager_MultipleSnapshotsAtDifferentSeqNums(t *testing.T) {
 	_, exists2 := sm.GetSnapshot(snap2.ID)
 	assert.True(t, exists1)
 	assert.True(t, exists2)
+}
+
+// W4P.10 - Snapshot Reader Count Underflow Protection Tests
+
+func TestSnapshotManager_ReleaseSnapshot_DoubleReleaseProtection(t *testing.T) {
+	idx := New(DefaultConfig())
+	sm := NewSnapshotManager(idx, DefaultSnapshotManagerConfig())
+
+	err := idx.Insert("v1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	require.NoError(t, err)
+
+	snap := sm.CreateSnapshot()
+	assert.Equal(t, int32(1), snap.ReaderCount())
+
+	// First release should succeed
+	released := sm.ReleaseSnapshot(snap.ID)
+	assert.True(t, released, "first release should succeed")
+	assert.Equal(t, int32(0), snap.ReaderCount())
+
+	// Second release should fail (over-release protection)
+	released = sm.ReleaseSnapshot(snap.ID)
+	assert.False(t, released, "second release should be blocked")
+	assert.Equal(t, int32(0), snap.ReaderCount(), "reader count should not go negative")
+
+	// Third release should also fail
+	released = sm.ReleaseSnapshot(snap.ID)
+	assert.False(t, released, "third release should also be blocked")
+	assert.Equal(t, int32(0), snap.ReaderCount(), "reader count should remain at 0")
+}
+
+func TestSnapshotManager_ReleaseSnapshot_MultipleAcquireRelease(t *testing.T) {
+	idx := New(DefaultConfig())
+	sm := NewSnapshotManager(idx, DefaultSnapshotManagerConfig())
+
+	err := idx.Insert("v1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	require.NoError(t, err)
+
+	snap := sm.CreateSnapshot()
+	assert.Equal(t, int32(1), snap.ReaderCount())
+
+	// Acquire additional readers
+	snap.AcquireReader()
+	snap.AcquireReader()
+	assert.Equal(t, int32(3), snap.ReaderCount())
+
+	// Release all three
+	assert.True(t, sm.ReleaseSnapshot(snap.ID))
+	assert.Equal(t, int32(2), snap.ReaderCount())
+
+	assert.True(t, sm.ReleaseSnapshot(snap.ID))
+	assert.Equal(t, int32(1), snap.ReaderCount())
+
+	assert.True(t, sm.ReleaseSnapshot(snap.ID))
+	assert.Equal(t, int32(0), snap.ReaderCount())
+
+	// Fourth release should fail
+	assert.False(t, sm.ReleaseSnapshot(snap.ID))
+	assert.Equal(t, int32(0), snap.ReaderCount())
+}
+
+func TestSnapshotManager_ReleaseSnapshot_ConcurrentSafety(t *testing.T) {
+	idx := New(DefaultConfig())
+	sm := NewSnapshotManager(idx, DefaultSnapshotManagerConfig())
+
+	err := idx.Insert("v1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	require.NoError(t, err)
+
+	snap := sm.CreateSnapshot()
+
+	// Acquire many readers concurrently
+	const numReaders = 100
+	var wg sync.WaitGroup
+
+	for i := 0; i < numReaders-1; i++ { // -1 because CreateSnapshot already acquires one
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			snap.AcquireReader()
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(numReaders), snap.ReaderCount())
+
+	// Release all readers concurrently
+	successCount := make(chan bool, numReaders*2) // Buffer for potential over-releases
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			successCount <- sm.ReleaseSnapshot(snap.ID)
+		}()
+	}
+	wg.Wait()
+	close(successCount)
+
+	// Count successful releases
+	successes := 0
+	for success := range successCount {
+		if success {
+			successes++
+		}
+	}
+
+	assert.Equal(t, numReaders, successes, "exactly numReaders releases should succeed")
+	assert.Equal(t, int32(0), snap.ReaderCount(), "reader count should be exactly 0")
+
+	// Additional releases should all fail
+	for i := 0; i < 10; i++ {
+		assert.False(t, sm.ReleaseSnapshot(snap.ID), "over-releases should fail")
+	}
+	assert.Equal(t, int32(0), snap.ReaderCount(), "reader count should remain 0")
+}
+
+func TestSnapshotManager_ReleaseSnapshot_ConcurrentAcquireRelease(t *testing.T) {
+	idx := New(DefaultConfig())
+	sm := NewSnapshotManager(idx, DefaultSnapshotManagerConfig())
+
+	err := idx.Insert("v1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	require.NoError(t, err)
+
+	snap := sm.CreateSnapshot()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	const numGoroutines = 10
+
+	// Start goroutines that acquire and release continuously
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					snap.AcquireReader()
+					time.Sleep(time.Microsecond)
+					sm.ReleaseSnapshot(snap.ID)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// After all goroutines finish, reader count should never be negative
+	finalCount := snap.ReaderCount()
+	assert.GreaterOrEqual(t, finalCount, int32(0), "reader count should never be negative")
+}
+
+func TestSnapshotManager_ReleaseSnapshot_ReturnValueCorrectness(t *testing.T) {
+	idx := New(DefaultConfig())
+	sm := NewSnapshotManager(idx, DefaultSnapshotManagerConfig())
+
+	t.Run("non-existent snapshot returns false", func(t *testing.T) {
+		assert.False(t, sm.ReleaseSnapshot(99999))
+	})
+
+	t.Run("valid release returns true", func(t *testing.T) {
+		err := idx.Insert("v1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+		require.NoError(t, err)
+
+		snap := sm.CreateSnapshot()
+		assert.True(t, sm.ReleaseSnapshot(snap.ID))
+	})
+
+	t.Run("over-release returns false", func(t *testing.T) {
+		err := idx.Insert("v2", []float32{0, 1, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+		require.NoError(t, err)
+
+		snap := sm.CreateSnapshot()
+		assert.True(t, sm.ReleaseSnapshot(snap.ID), "first release valid")
+		assert.False(t, sm.ReleaseSnapshot(snap.ID), "second release invalid")
+	})
+}
+
+func TestHNSWSnapshot_ReleaseReader_DirectUnderflowProtection(t *testing.T) {
+	// Test the ReleaseReader method directly on HNSWSnapshot
+	snap := &HNSWSnapshot{
+		ID:         1,
+		SeqNum:     0,
+		CreatedAt:  time.Now(),
+		Vectors:    make(map[string][]float32),
+		Magnitudes: make(map[string]float64),
+	}
+
+	// Initial state: 0 readers
+	count, ok := snap.ReleaseReader()
+	assert.False(t, ok, "release with 0 readers should fail")
+	assert.Equal(t, int32(0), count)
+
+	// Add a reader
+	snap.AcquireReader()
+	assert.Equal(t, int32(1), snap.ReaderCount())
+
+	// Release should succeed
+	count, ok = snap.ReleaseReader()
+	assert.True(t, ok, "release with 1 reader should succeed")
+	assert.Equal(t, int32(0), count)
+
+	// Second release should fail
+	count, ok = snap.ReleaseReader()
+	assert.False(t, ok, "release with 0 readers should fail")
+	assert.Equal(t, int32(0), count)
+}
+
+func TestHNSWSnapshot_ReleaseReader_ConcurrentCASRetry(t *testing.T) {
+	// Test that concurrent releases correctly use CAS retry
+	snap := &HNSWSnapshot{
+		ID:         1,
+		SeqNum:     0,
+		CreatedAt:  time.Now(),
+		Vectors:    make(map[string][]float32),
+		Magnitudes: make(map[string]float64),
+	}
+
+	// Acquire many readers
+	const numReaders = 1000
+	for i := 0; i < numReaders; i++ {
+		snap.AcquireReader()
+	}
+	assert.Equal(t, int32(numReaders), snap.ReaderCount())
+
+	// Release all concurrently
+	var wg sync.WaitGroup
+	results := make(chan bool, numReaders)
+
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, ok := snap.ReleaseReader()
+			results <- ok
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	// All releases should succeed
+	successCount := 0
+	for ok := range results {
+		if ok {
+			successCount++
+		}
+	}
+	assert.Equal(t, numReaders, successCount)
+	assert.Equal(t, int32(0), snap.ReaderCount())
+
+	// Additional release should fail
+	_, ok := snap.ReleaseReader()
+	assert.False(t, ok)
 }
