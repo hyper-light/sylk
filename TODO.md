@@ -37425,16 +37425,16 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add checksum validation on restore                                       ││
 │ │   SEVERITY: HIGH - Data corruption                                              ││
 │ │                                                                                  ││
-│ │ [ ] W12.38 - HNSW Layer Connection Race                                         ││
-│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:156-196                                 ││
+│ │ [x] W12.38 - HNSW Layer Connection Race                                         ││
+│ │   FILE: core/vectorgraphdb/hnsw/layer.go:128-144                                ││
 │ │   ISSUE: Layer connections modified without synchronization                     ││
-│ │   FIX: Add per-node locks for connection modification                           ││
+│ │   FIX: Changed setNeighbors to use write lock (Lock) instead of read lock      ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.39 - Persistence Incomplete Error Handling                              ││
-│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:145-178                          ││
+│ │ [x] W12.39 - Persistence Incomplete Error Handling                              ││
+│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:96-267                           ││
 │ │   ISSUE: Partial writes not rolled back on error                                ││
-│ │   FIX: Implement atomic write with rollback on failure                          ││
+│ │   FIX: Implemented atomic load with two-phase staging+commit pattern           ││
 │ │   SEVERITY: HIGH - Data corruption                                              ││
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
