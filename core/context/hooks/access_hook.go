@@ -92,6 +92,9 @@ func (h *AccessTrackingHook) SetEnabled(enabled bool) {
 }
 
 // Execute extracts and records content references from the response.
+// It parses the LLM response looking for content ID references (excerpt markers,
+// file paths, etc.) and records each access with the tracker for usage analytics.
+// Errors from individual access recordings are collected but do not fail the hook.
 func (h *AccessTrackingHook) Execute(
 	ctx context.Context,
 	data *ctxpkg.PromptHookData,
@@ -112,12 +115,22 @@ func (h *AccessTrackingHook) Execute(
 		return &ctxpkg.HookResult{Modified: false}, nil
 	}
 
-	// Record each access
+	// Record each access, collecting any errors for debugging
+	// Access tracking is best-effort; individual failures should not block the hook
+	var firstErr error
 	for _, id := range ids {
-		_ = h.tracker.RecordAccess(id, data.TurnNumber, "in_response")
+		if err := h.tracker.RecordAccess(id, data.TurnNumber, "in_response"); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
 
-	return &ctxpkg.HookResult{Modified: false}, nil
+	// Return success with any error noted for observability
+	return &ctxpkg.HookResult{
+		Modified: false,
+		Error:    firstErr, // Non-fatal: recorded for debugging purposes
+	}, nil
 }
 
 // ToPromptHook converts this hook to a generic PromptHook for registration.
@@ -188,6 +201,10 @@ func (h *ContentPromotionHook) SetEnabled(enabled bool) {
 }
 
 // Execute promotes retrieved content to hot cache.
+// It examines tool outputs from retrieval tools (read_file, search, etc.) and:
+// 1. Records content access with the tracker for usage analytics
+// 2. Promotes the content to the hot cache for faster subsequent access
+// Errors from tracking/promotion are collected but do not fail the hook.
 func (h *ContentPromotionHook) Execute(
 	ctx context.Context,
 	data *ctxpkg.ToolCallHookData,
@@ -209,16 +226,30 @@ func (h *ContentPromotionHook) Execute(
 	}
 
 	// Record access and promote each entry
+	// Tracking and promotion are best-effort; failures should not block the hook
+	var firstErr error
 	for _, entry := range entries {
 		if h.tracker != nil {
-			_ = h.tracker.RecordAccess(entry.ID, data.TurnNumber, "tool_retrieved")
+			if err := h.tracker.RecordAccess(entry.ID, data.TurnNumber, "tool_retrieved"); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
 		}
 		if h.promoter != nil {
-			_ = h.promoter.Promote(entry)
+			if err := h.promoter.Promote(entry); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
 		}
 	}
 
-	return &ctxpkg.HookResult{Modified: false}, nil
+	// Return success with any error noted for observability
+	return &ctxpkg.HookResult{
+		Modified: false,
+		Error:    firstErr, // Non-fatal: recorded for debugging purposes
+	}, nil
 }
 
 // ToToolCallHook converts this hook to a generic ToolCallHook for registration.
@@ -238,13 +269,18 @@ func (h *ContentPromotionHook) ToToolCallHook() *ctxpkg.ToolCallHook {
 // =============================================================================
 
 // extractContentReferences extracts content IDs referenced in the response.
+// It identifies two types of references:
+// 1. Excerpt/Summary markers: Lines containing "[EXCERPT N]" or "[SUMMARY N]" followed by source ID
+// 2. File paths: Lines containing paths with common code file extensions (.go, .py, .js, etc.)
+// Returns a deduplicated list of content IDs found in the response.
 func extractContentReferences(response string) []string {
 	if response == "" {
 		return nil
 	}
 
-	ids := make([]string, 0)
 	lines := strings.Split(response, "\n")
+	// Pre-allocate with estimated capacity based on response size
+	ids := make([]string, 0, len(lines)/10+1)
 
 	for _, line := range lines {
 		// Look for [EXCERPT N] source_id format

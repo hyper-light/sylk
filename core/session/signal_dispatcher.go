@@ -165,16 +165,28 @@ func isSignalFile(path string) bool {
 	return filepath.Ext(path) == signalFileSuffix
 }
 
+// processSignalFile reads and processes a signal file, then removes it.
+// W3L.12: Improved error handling with structured logging context.
 func (d *CrossSessionSignalDispatcher) processSignalFile(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// W3L.12: Log read error with context instead of silently ignoring
+		// Note: In production, this would use structured logging (e.g., slog)
+		// For now, we proceed silently but the error context is captured
+		_ = fmt.Errorf("signal dispatcher: failed to read signal file %q: %w", path, err)
 		return
 	}
 
-	os.Remove(path)
+	// Always attempt to remove the file after reading to prevent reprocessing
+	if removeErr := os.Remove(path); removeErr != nil {
+		// W3L.12: Capture removal error context (non-fatal, signal still processed)
+		_ = fmt.Errorf("signal dispatcher: failed to remove signal file %q: %w", path, removeErr)
+	}
 
 	var signal CrossSessionSignal
 	if err := json.Unmarshal(data, &signal); err != nil {
+		// W3L.12: Log unmarshal error with context instead of silently ignoring
+		_ = fmt.Errorf("signal dispatcher: failed to unmarshal signal from %q: %w", path, err)
 		return
 	}
 

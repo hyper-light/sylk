@@ -205,9 +205,14 @@ func (h *EpisodeObservationHook) Execute(
 	obs := h.tracker.FinalizeEpisode(data.Response, data.ToolCalls)
 
 	// Log the observation if logger is available
+	// Observation logging is best-effort; errors are recorded but do not fail the hook
 	if h.observationLog != nil {
-		// Ignore errors - observation logging is best-effort
-		_ = h.observationLog.Log(obs)
+		if err := h.observationLog.Log(obs); err != nil {
+			return &ctxpkg.HookResult{
+				Modified: false,
+				Error:    err, // Non-fatal: recorded for debugging purposes
+			}, nil
+		}
 	}
 
 	return &ctxpkg.HookResult{Modified: false}, nil
@@ -348,12 +353,14 @@ func extractExcerptIDs(aq *ctxpkg.AugmentedQuery) []string {
 
 // extractContentIDsFromResponse extracts content IDs referenced in the response.
 // Looks for patterns like file paths, content references, and citation markers.
+// Currently supports the "[EXCERPT N]" and "[SUMMARY N]" marker format.
 func extractContentIDsFromResponse(response string) []string {
 	if response == "" {
 		return nil
 	}
 
-	ids := make([]string, 0)
+	// Pre-allocate with reasonable capacity based on typical response patterns
+	ids := make([]string, 0, 8)
 
 	// Look for content reference patterns
 	// This is a simplified implementation - in production, this would use

@@ -1,5 +1,30 @@
 package relations
 
+// W4L.5: Import Graph Extractor
+//
+// This file extracts import/dependency relationships from source code files.
+// It supports multiple languages with language-specific parsing:
+//
+// Go imports:
+//   - Single imports: import "package" or import alias "package"
+//   - Multi imports: import ( ... ) blocks
+//   - Dot imports: import . "package" (imports into current namespace)
+//   - Blank imports: import _ "package" (side-effect only)
+//
+// TypeScript/JavaScript imports:
+//   - ES6 imports: import X from "module", import { a, b } from "module"
+//   - Namespace imports: import * as X from "module"
+//   - Side-effect imports: import "module"
+//   - CommonJS: require("module")
+//   - Dynamic imports: import("module")
+//
+// Python imports:
+//   - Simple imports: import module or import module as alias
+//   - From imports: from module import x, y, z
+//   - Relative imports: from . import x or from ..package import y
+//
+// Import types are classified as: standard, relative, package, alias, or selective.
+
 import (
 	"path/filepath"
 	"regexp"

@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -482,9 +483,9 @@ func TestManager_Switch(t *testing.T) {
 	// s1 should be paused
 	assert.Equal(t, session.StatePaused, s1.State())
 
-	// Switch to non-existent
+	// Switch to non-existent - use errors.Is for wrapped errors (W3L.7)
 	err = mgr.Switch("nonexistent")
-	assert.Equal(t, session.ErrSessionNotFound, err)
+	assert.True(t, errors.Is(err, session.ErrSessionNotFound), "expected ErrSessionNotFound, got: %v", err)
 }
 
 func TestManager_PauseResume(t *testing.T) {

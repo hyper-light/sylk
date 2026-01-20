@@ -1,5 +1,32 @@
 package hnsw
 
+// W4L.2: HNSW Layer Management
+//
+// This file implements the layer structure for the HNSW index. Each layer maintains
+// a graph of nodes with neighbor connections. The multi-layer structure is key to
+// HNSW's logarithmic search complexity:
+//
+// Layer Structure:
+//   - Layer 0 (base): Contains ALL nodes, with M*2 connections per node
+//   - Layer 1+: Contains progressively fewer nodes, with M connections per node
+//   - Higher layers have longer-range connections for fast global navigation
+//
+// Node Level Assignment:
+//   - Each node is assigned a random level L using: floor(-ln(uniform(0,1)) * levelMult)
+//   - A node exists in layers 0 through L (always present in layer 0)
+//   - Probability of node at level L: (1/levelMult)^L
+//
+// Search Algorithm (per layer):
+//   1. Start at entry point
+//   2. Greedily move to the neighbor closest to query
+//   3. Repeat until no closer neighbor exists
+//   4. At layer 0, expand search to ef candidates for best results
+//
+// Connection Heuristics:
+//   - Neighbors are selected based on distance (cosine similarity)
+//   - Connections are bidirectional for search efficiency
+//   - Worst neighbors are replaced when at capacity
+
 import (
 	"math/rand"
 	"sync"
@@ -7,6 +34,7 @@ import (
 
 // layerNode represents a node in an HNSW layer with its neighbors.
 // Uses ConcurrentNeighborSet for O(1) neighbor lookups instead of O(n) slice scans.
+// W4L.2: Added structured neighbor management for HNSW requirements.
 type layerNode struct {
 	neighbors *ConcurrentNeighborSet
 }
@@ -156,6 +184,16 @@ func (l *layer) allNodeIDs() []string {
 	return ids
 }
 
+// randomLevel generates a random level for a new node using the HNSW level distribution.
+// W4L.2: Documented the level generation algorithm.
+//
+// The formula is: L = floor(-ln(uniform(0,1)) * mL)
+// where mL = 1/ln(M) ensures optimal layer distribution.
+//
+// The constant 0.36067977499789996 is ln(e^(1/e)) which provides good default scaling.
+// This gives an expected number of nodes at level L proportional to (1/M)^L.
+//
+// Example with M=16: ~94% of nodes at level 0 only, ~6% at level 1+, etc.
 func randomLevel(levelMult float64) int {
 	r := rand.Float64()
 	level := int(-levelMult * (1.0 / 0.36067977499789996) * float64(fastLog(r)))

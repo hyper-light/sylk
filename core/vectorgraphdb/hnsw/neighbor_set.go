@@ -1,14 +1,30 @@
 package hnsw
 
+// W4L.3: Neighbor Set Data Structures for HNSW
+//
+// This file provides efficient neighbor management for HNSW nodes. The key challenge
+// is balancing fast membership checks, sorted retrieval, and capacity management.
+//
+// Design rationale:
+//   - Map-based storage: O(1) Contains() checks during graph construction
+//   - On-demand sorting: Neighbors sorted by distance only when needed
+//   - Capacity limits: HNSW requires M (or M*2) neighbors per node maximum
+//   - Worst-neighbor replacement: When at capacity, replace furthest neighbor
+//
+// Two variants are provided:
+//   - NeighborSet: Not thread-safe, for single-threaded operations
+//   - ConcurrentNeighborSet: Thread-safe with RWMutex, for concurrent access
+
 import (
 	"sort"
 	"sync"
 )
 
 // Neighbor represents a neighbor node with its distance from the query.
+// W4L.3: Distance is typically 1-similarity for cosine similarity (lower is better).
 type Neighbor struct {
 	ID       string
-	Distance float32
+	Distance float32 // Lower distance = more similar (1 - cosine_similarity)
 }
 
 // NeighborSet provides O(1) lookup for neighbor membership while supporting
@@ -368,25 +384,36 @@ func (cns *ConcurrentNeighborSet) UpdateDistance(id string, dist float32) bool {
 }
 
 // AddWithLimit adds a neighbor if there's room or if it's better than the worst.
-// Returns true if the neighbor was added.
-// This is useful for maintaining a fixed-size set of best neighbors.
+// W4L.3: Documented the worst-neighbor replacement strategy for HNSW.
+//
+// This implements the capacity-limited neighbor selection required by HNSW:
+//   1. If neighbor already exists: Update its distance (connection reweighting)
+//   2. If under capacity: Add the neighbor directly
+//   3. If at capacity: Compare with worst (furthest) neighbor
+//      - If new neighbor is closer: Replace the worst neighbor
+//      - Otherwise: Reject the new neighbor
+//
+// The worst-neighbor replacement ensures the set always contains the M closest
+// neighbors seen so far, which is essential for HNSW's search quality.
+//
+// Returns true if the neighbor was added or updated, false if rejected.
 func (cns *ConcurrentNeighborSet) AddWithLimit(id string, dist float32, maxSize int) bool {
 	cns.mu.Lock()
 	defer cns.mu.Unlock()
 
-	// Already exists - update distance
+	// Already exists - update distance (connection may have improved)
 	if _, exists := cns.neighbors[id]; exists {
 		cns.neighbors[id] = dist
 		return true
 	}
 
-	// Room available
+	// Room available - add directly
 	if len(cns.neighbors) < maxSize {
 		cns.neighbors[id] = dist
 		return true
 	}
 
-	// Find the worst neighbor
+	// At capacity - find the worst (furthest) neighbor for potential replacement
 	var worstID string
 	var worstDist float32 = -1
 	for existingID, existingDist := range cns.neighbors {
@@ -396,7 +423,7 @@ func (cns *ConcurrentNeighborSet) AddWithLimit(id string, dist float32, maxSize 
 		}
 	}
 
-	// Replace if new neighbor is better
+	// Replace worst neighbor if new one is closer (lower distance = better)
 	if dist < worstDist {
 		delete(cns.neighbors, worstID)
 		cns.neighbors[id] = dist

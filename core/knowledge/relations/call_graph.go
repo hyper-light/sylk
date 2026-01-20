@@ -1,4 +1,6 @@
 // Package relations provides relation extraction from source code entities.
+// W4L.4-7: This package extracts semantic relationships between code entities
+// including function calls, imports, type hierarchies, and inference rules.
 package relations
 
 import (
@@ -189,6 +191,20 @@ func (e *CallGraphExtractor) isPyFile(filePath string) bool {
 }
 
 // extractGoCallGraph extracts call relationships from Go source code using AST.
+// W4L.4: Improved documentation for AST-based extraction with regex fallback.
+//
+// This method attempts AST-based extraction first for accurate results. If parsing
+// fails (e.g., incomplete or invalid Go code), it falls back to regex-based
+// extraction which is less accurate but more resilient to syntax errors.
+//
+// The AST approach provides:
+//   - Accurate function/method identification
+//   - Proper scope tracking for conditional calls
+//   - Correct handling of method receivers
+//
+// The regex fallback provides:
+//   - Resilience to syntax errors
+//   - Partial extraction from incomplete code
 func (e *CallGraphExtractor) extractGoCallGraph(
 	filePath string,
 	content []byte,
@@ -202,6 +218,8 @@ func (e *CallGraphExtractor) extractGoCallGraph(
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filePath, content, 0)
 	if err != nil {
+		// W4L.4: AST parsing failed, fall back to regex extraction.
+		// This can happen with incomplete code, syntax errors, or generated code.
 		return e.extractCallsWithRegex(filePath, content, funcsInFile, entityByName, e.goCallPattern)
 	}
 
