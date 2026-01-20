@@ -37179,7 +37179,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Use sync.Once for channel close, add nil check                           ││
 │ │   SEVERITY: CRITICAL - Panic on shutdown                                        ││
 │ │                                                                                  ││
-│ │ [ ] W12.6 - SignalDispatcher Broadcast Error Handling                           ││
+│ │ [x] W12.6 - SignalDispatcher Broadcast Error Handling                           ││
 │ │   FILE: core/session/signal_dispatcher.go:237-248                               ││
 │ │   ISSUE: Errors in broadcast handlers swallowed, no error aggregation           ││
 │ │   FIX: Collect and return errors, log individual failures                       ││

@@ -440,3 +440,185 @@ func TestSignalDispatcher_W12_4_GoroutineCleanup(t *testing.T) {
 		}
 	})
 }
+
+// TestSignalDispatcher_W12_6_BroadcastErrorHandling tests that sendBroadcast
+// collects and returns errors from individual send attempts (W12.6 fix).
+func TestSignalDispatcher_W12_6_BroadcastErrorHandling(t *testing.T) {
+	t.Run("successful broadcast returns no error", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		// Create sender
+		sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "sender",
+		})
+		require.NoError(t, err)
+		defer sender.Close()
+
+		// Create receivers
+		receiver1, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "receiver1",
+		})
+		require.NoError(t, err)
+		defer receiver1.Close()
+
+		receiver2, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "receiver2",
+		})
+		require.NoError(t, err)
+		defer receiver2.Close()
+
+		// Send broadcast - should succeed
+		signal := NewPressureSignal("sender", "test-payload")
+		err = sender.SendSignal(signal)
+		require.NoError(t, err)
+	})
+
+	t.Run("broadcast to non-existent session dir succeeds", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "sender",
+		})
+		require.NoError(t, err)
+		defer sender.Close()
+
+		// Create a receiver directory (simulating another session)
+		receiverDir := filepath.Join(baseDir, "receiver")
+		require.NoError(t, os.MkdirAll(receiverDir, 0755))
+
+		// Send broadcast - should succeed because writeSignalFile creates dirs
+		signal := NewPressureSignal("sender", "test-payload")
+		err = sender.SendSignal(signal)
+		require.NoError(t, err)
+	})
+
+	t.Run("broadcast collects errors from failed writes", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "sender",
+		})
+		require.NoError(t, err)
+		defer sender.Close()
+
+		// Create a receiver directory that we'll make read-only
+		receiverDir := filepath.Join(baseDir, "receiver")
+		require.NoError(t, os.MkdirAll(receiverDir, 0755))
+
+		// Make the directory read-only so writes fail
+		require.NoError(t, os.Chmod(receiverDir, 0444))
+		defer os.Chmod(receiverDir, 0755) // Cleanup
+
+		// Send broadcast - should return an error
+		signal := NewPressureSignal("sender", "test-payload")
+		err = sender.SendSignal(signal)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "receiver")
+	})
+
+	t.Run("broadcast aggregates multiple errors", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "sender",
+		})
+		require.NoError(t, err)
+		defer sender.Close()
+
+		// Create multiple receiver directories that will fail
+		receiver1Dir := filepath.Join(baseDir, "receiver1")
+		receiver2Dir := filepath.Join(baseDir, "receiver2")
+		require.NoError(t, os.MkdirAll(receiver1Dir, 0755))
+		require.NoError(t, os.MkdirAll(receiver2Dir, 0755))
+
+		// Make both directories read-only
+		require.NoError(t, os.Chmod(receiver1Dir, 0444))
+		require.NoError(t, os.Chmod(receiver2Dir, 0444))
+		defer func() {
+			os.Chmod(receiver1Dir, 0755)
+			os.Chmod(receiver2Dir, 0755)
+		}()
+
+		// Send broadcast - should return aggregated errors
+		signal := NewPressureSignal("sender", "test-payload")
+		err = sender.SendSignal(signal)
+		assert.Error(t, err)
+
+		// Check that error message contains both receiver names
+		errStr := err.Error()
+		assert.Contains(t, errStr, "receiver1")
+		assert.Contains(t, errStr, "receiver2")
+	})
+
+	t.Run("partial failure returns errors for failures only", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "sender",
+		})
+		require.NoError(t, err)
+		defer sender.Close()
+
+		// Create two receivers - one that will work, one that will fail
+		goodReceiver, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "good-receiver",
+		})
+		require.NoError(t, err)
+		defer goodReceiver.Close()
+
+		badReceiverDir := filepath.Join(baseDir, "bad-receiver")
+		require.NoError(t, os.MkdirAll(badReceiverDir, 0755))
+		require.NoError(t, os.Chmod(badReceiverDir, 0444))
+		defer os.Chmod(badReceiverDir, 0755)
+
+		// Send broadcast
+		signal := NewPressureSignal("sender", "test-payload")
+		err = sender.SendSignal(signal)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "bad-receiver")
+		assert.NotContains(t, err.Error(), "good-receiver")
+
+		// Verify the good receiver got the signal
+		files, readErr := os.ReadDir(filepath.Join(baseDir, "good-receiver"))
+		require.NoError(t, readErr)
+		signalFound := false
+		for _, f := range files {
+			if filepath.Ext(f.Name()) == ".signal" {
+				signalFound = true
+				break
+			}
+		}
+		assert.True(t, signalFound, "good-receiver should have received the signal")
+	})
+
+	t.Run("targeted signal not affected by broadcast changes", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		sender, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "sender",
+		})
+		require.NoError(t, err)
+		defer sender.Close()
+
+		receiver, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "receiver",
+		})
+		require.NoError(t, err)
+		defer receiver.Close()
+
+		// Send targeted signal - should succeed
+		signal := NewPreemptSignal("sender", "receiver", "test-payload")
+		err = sender.SendSignal(signal)
+		require.NoError(t, err)
+	})
+}
