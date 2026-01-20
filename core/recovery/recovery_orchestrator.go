@@ -1,10 +1,18 @@
 package recovery
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
+)
+
+// Sentinel errors for recovery operations.
+var (
+	ErrSoftInterventionFailed = errors.New("soft intervention failed")
+	ErrUserEscalationFailed   = errors.New("user escalation failed")
+	ErrAgentTerminationFailed = errors.New("agent termination failed")
 )
 
 type AgentTerminator interface {
@@ -46,22 +54,24 @@ func NewRecoveryOrchestrator(
 	}
 }
 
-func (r *RecoveryOrchestrator) HandleStuckAgent(assessment HealthAssessment) {
+// HandleStuckAgent processes a health assessment and takes appropriate recovery action.
+// Returns any errors encountered during recovery operations.
+func (r *RecoveryOrchestrator) HandleStuckAgent(assessment HealthAssessment) error {
 	state := r.getOrCreateState(assessment.AgentID, assessment.SessionID)
 	state.Lock()
 	defer state.Unlock()
 
 	if assessment.Status == StatusHealthy {
 		r.handleRecoveredAgent(state)
-		return
+		return nil
 	}
 
 	if assessment.StuckSince == nil {
-		return
+		return nil
 	}
 
 	stuckDuration := time.Since(*assessment.StuckSince)
-	r.processStuckDuration(state, assessment, stuckDuration)
+	return r.processStuckDuration(state, assessment, stuckDuration)
 }
 
 func (r *RecoveryOrchestrator) handleRecoveredAgent(state *RecoveryState) {

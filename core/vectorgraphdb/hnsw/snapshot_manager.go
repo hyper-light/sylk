@@ -53,15 +53,21 @@ func NewSnapshotManager(index *Index, cfg SnapshotManagerConfig) *HNSWSnapshotMa
 
 // CreateSnapshot captures the current HNSW state for consistent reads.
 // The snapshot is a deep copy that remains immutable.
+// W12.12: Uses write lock to prevent TOCTOU race between ID generation and storage.
 func (sm *HNSWSnapshotManager) CreateSnapshot() *HNSWSnapshot {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	// W12.12: Use write lock to make snapshot creation atomic.
+	// This prevents race between snapshotID.Add and snapshots.Store.
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
 	sm.index.RLock()
 	defer sm.index.RUnlock()
 
+	// W12.12: Atomically capture both ID and seqNum under the same lock
+	// to ensure consistency between snapshot metadata and content.
 	id := sm.snapshotID.Add(1)
 	seqNum := sm.currentSeqNum.Load()
+
 	snap := sm.buildSnapshot(id, seqNum)
 	snap.AcquireReader()
 	sm.snapshots.Store(id, snap)
@@ -103,7 +109,11 @@ func (sm *HNSWSnapshotManager) copyAllLayers(layers []*layer) []LayerSnapshot {
 // ReleaseSnapshot decrements the reader count for GC eligibility.
 // Returns true if the release was valid, false if over-released (underflow prevented).
 // Logs a warning on over-release attempts to help identify lifecycle bugs.
+// W12.12: Uses read lock to prevent race with concurrent GC or snapshot creation.
 func (sm *HNSWSnapshotManager) ReleaseSnapshot(id uint64) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
 	val, ok := sm.snapshots.Load(id)
 	if !ok {
 		return false
@@ -145,7 +155,11 @@ func (sm *HNSWSnapshotManager) GCLoop(ctx context.Context) {
 }
 
 // collectGarbage removes old snapshots with no active readers.
+// W12.12: Uses write lock to prevent race with concurrent operations.
 func (sm *HNSWSnapshotManager) collectGarbage() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	cutoff := time.Now().Add(-sm.retention)
 	sm.snapshots.Range(func(key, value any) bool {
 		snap := value.(*HNSWSnapshot)

@@ -37225,7 +37225,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add bounds validation before accessing neighbor data                     ││
 │ │   SEVERITY: CRITICAL - Potential panic on corrupt data                          ││
 │ │                                                                                  ││
-│ │ [ ] W12.12 - SnapshotManager Race Condition                                     ││
+│ │ [x] W12.12 - SnapshotManager Race Condition                                     ││
 │ │   FILE: core/vectorgraphdb/hnsw/snapshot_manager.go:56-68                       ││
 │ │   ISSUE: CreateSnapshot has TOCTOU race between check and create                ││
 │ │   FIX: Use atomic compare-and-swap or lock during entire operation              ││

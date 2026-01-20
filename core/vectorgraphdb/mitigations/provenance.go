@@ -62,11 +62,15 @@ func (p *ProvenanceTracker) removeFromCacheOrder(nodeID string) {
 }
 
 // GetProvenance retrieves all provenance records for a node.
+// Returns a copy of cached data to prevent race conditions if cache is modified.
 func (p *ProvenanceTracker) GetProvenance(nodeID string) ([]*Provenance, error) {
 	p.cacheMu.RLock()
 	if cached, ok := p.provenanceCache[nodeID]; ok {
+		// Return a copy to prevent races if cache is cleared during use
+		result := make([]*Provenance, len(cached))
+		copy(result, cached)
 		p.cacheMu.RUnlock()
-		return cached, nil
+		return result, nil
 	}
 	p.cacheMu.RUnlock()
 

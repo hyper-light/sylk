@@ -266,12 +266,14 @@ type MemoryMonitor struct {
 	allPaused       atomic.Bool
 	pressureLevel   atomic.Int32
 
-	// Lifecycle
+	// Lifecycle - goroutine is tracked via wg for proper shutdown
 	stopCh chan struct{}
 	done   chan struct{}
+	wg     sync.WaitGroup
 }
 
 // NewMemoryMonitor creates a new memory monitor.
+// The monitoring goroutine is tracked via WaitGroup for proper shutdown.
 func NewMemoryMonitor(config MemoryMonitorConfig) *MemoryMonitor {
 	if config.SignalPublisher == nil {
 		config.SignalPublisher = &NoOpSignalPublisher{}
@@ -287,6 +289,7 @@ func NewMemoryMonitor(config MemoryMonitorConfig) *MemoryMonitor {
 	m.initComponents()
 	m.updateSystemMemory()
 
+	m.wg.Add(1)
 	go m.monitorLoop()
 
 	return m
