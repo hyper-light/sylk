@@ -195,12 +195,20 @@ func (m *MultiSessionWALManager) registerSession(sessionID string, walDir string
 	return nil
 }
 
+// openWAL opens a WAL at the specified directory.
+// W12.31: Wraps errors with directory context for better diagnostics.
 func (m *MultiSessionWALManager) openWAL(walDir string) (*concurrency.WriteAheadLog, error) {
 	cfg := m.config.WALConfig
 	cfg.Dir = walDir
-	return concurrency.NewWriteAheadLog(cfg)
+	wal, err := concurrency.NewWriteAheadLog(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("open WAL at %s: %w", walDir, err)
+	}
+	return wal, nil
 }
 
+// GetWAL retrieves an existing WAL for the given session.
+// W12.31: Returns wrapped error with session ID context.
 func (m *MultiSessionWALManager) GetWAL(sessionID string) (*concurrency.WriteAheadLog, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -211,7 +219,7 @@ func (m *MultiSessionWALManager) GetWAL(sessionID string) (*concurrency.WriteAhe
 
 	wal, exists := m.sessionWALs[sessionID]
 	if !exists {
-		return nil, ErrSessionWALMissing
+		return nil, fmt.Errorf("get WAL for session %s: %w", sessionID, ErrSessionWALMissing)
 	}
 
 	return wal, nil
@@ -237,6 +245,8 @@ func (m *MultiSessionWALManager) RecoverAllSessions(ctx context.Context) error {
 	return nil
 }
 
+// getUnrecoveredSessions queries for sessions that need recovery.
+// W12.31: Wraps query errors with operation context.
 func (m *MultiSessionWALManager) getUnrecoveredSessions(ctx context.Context) ([]SessionWALInfo, error) {
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT session_id, wal_dir, created_at, last_active
@@ -244,11 +254,15 @@ func (m *MultiSessionWALManager) getUnrecoveredSessions(ctx context.Context) ([]
 		WHERE recovered = 0
 	`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query unrecovered sessions: %w", err)
 	}
 	defer rows.Close()
 
-	return m.scanSessionInfoRows(rows)
+	sessions, err := m.scanSessionInfoRows(rows)
+	if err != nil {
+		return sessions, fmt.Errorf("scan unrecovered sessions: %w", err)
+	}
+	return sessions, nil
 }
 
 // scanSessionInfoRows scans rows from unrecovered sessions query.
@@ -296,6 +310,8 @@ func (m *MultiSessionWALManager) markSessionRecovered(sessionID string) {
 	m.db.Exec(`UPDATE session_wals SET recovered = 1 WHERE session_id = ?`, sessionID)
 }
 
+// UpdateActivity updates the last activity timestamp for a session.
+// W12.31: Wraps errors with session ID and operation context.
 func (m *MultiSessionWALManager) UpdateActivity(sessionID string) error {
 	if m.closed.Load() {
 		return ErrWALManagerClosed
@@ -304,12 +320,17 @@ func (m *MultiSessionWALManager) UpdateActivity(sessionID string) error {
 	_, err := m.db.Exec(`
 		UPDATE session_wals SET last_active = ? WHERE session_id = ?
 	`, time.Now(), sessionID)
-	if err != nil && m.closed.Load() {
-		return ErrWALManagerClosed
+	if err != nil {
+		if m.closed.Load() {
+			return ErrWALManagerClosed
+		}
+		return fmt.Errorf("update activity for session %s: %w", sessionID, err)
 	}
-	return err
+	return nil
 }
 
+// GetSessionInfo retrieves metadata for a session from the database.
+// W12.31: Wraps errors with session ID and operation context.
 func (m *MultiSessionWALManager) GetSessionInfo(sessionID string) (*SessionWALInfo, error) {
 	if m.closed.Load() {
 		return nil, ErrWALManagerClosed
@@ -323,18 +344,20 @@ func (m *MultiSessionWALManager) GetSessionInfo(sessionID string) (*SessionWALIn
 	`, sessionID).Scan(&info.SessionID, &info.WALDir, &info.CreatedAt, &info.LastActive, &info.Recovered)
 
 	if err == sql.ErrNoRows {
-		return nil, ErrSessionWALMissing
+		return nil, fmt.Errorf("get session info for %s: %w", sessionID, ErrSessionWALMissing)
 	}
 	if err != nil {
 		if m.closed.Load() {
 			return nil, ErrWALManagerClosed
 		}
-		return nil, err
+		return nil, fmt.Errorf("get session info for %s: %w", sessionID, err)
 	}
 
 	return &info, nil
 }
 
+// ListSessions returns all sessions ordered by last activity.
+// W12.31: Wraps errors with operation context.
 func (m *MultiSessionWALManager) ListSessions(ctx context.Context) ([]SessionWALInfo, error) {
 	if m.closed.Load() {
 		return nil, ErrWALManagerClosed
@@ -349,26 +372,42 @@ func (m *MultiSessionWALManager) ListSessions(ctx context.Context) ([]SessionWAL
 		if m.closed.Load() {
 			return nil, ErrWALManagerClosed
 		}
-		return nil, err
+		return nil, fmt.Errorf("list sessions query: %w", err)
 	}
 	defer rows.Close()
 
-	return m.scanFullSessionInfoRows(rows)
+	sessions, err := m.scanFullSessionInfoRows(rows)
+	if err != nil {
+		return sessions, fmt.Errorf("list sessions scan: %w", err)
+	}
+	return sessions, nil
 }
 
+// scanFullSessionInfoRows scans rows from the list sessions query.
+// W12.31: Collects and returns scan errors instead of silently ignoring them.
 func (m *MultiSessionWALManager) scanFullSessionInfoRows(rows *sql.Rows) ([]SessionWALInfo, error) {
-	var sessions []SessionWALInfo
+	sessions := make([]SessionWALInfo, 0, 16)
+	var scanErrors []error
 
 	for rows.Next() {
 		var info SessionWALInfo
 		err := rows.Scan(&info.SessionID, &info.WALDir, &info.CreatedAt, &info.LastActive, &info.Recovered)
 		if err != nil {
+			scanErrors = append(scanErrors, fmt.Errorf("scan full session info: %w", err))
 			continue
 		}
 		sessions = append(sessions, info)
 	}
 
-	return sessions, rows.Err()
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return sessions, rowsErr
+	}
+
+	if len(scanErrors) > 0 {
+		return sessions, fmt.Errorf("partial scan failure (%d errors): %w", len(scanErrors), scanErrors[0])
+	}
+
+	return sessions, nil
 }
 
 func (m *MultiSessionWALManager) RemoveSession(sessionID string) error {

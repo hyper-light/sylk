@@ -2,8 +2,10 @@ package session
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -83,14 +85,16 @@ func TestMultiSessionWALManager_GetOrCreateWAL_Reuse(t *testing.T) {
 	}
 }
 
+// TestMultiSessionWALManager_GetWAL_NotFound tests that GetWAL returns
+// wrapped ErrSessionWALMissing with session context (W12.31).
 func TestMultiSessionWALManager_GetWAL_NotFound(t *testing.T) {
 	manager, tmpDir := newTestWALManager(t)
 	defer os.RemoveAll(tmpDir)
 	defer manager.Close()
 
 	_, err := manager.GetWAL("nonexistent")
-	if err != ErrSessionWALMissing {
-		t.Errorf("expected ErrSessionWALMissing, got %v", err)
+	if !errors.Is(err, ErrSessionWALMissing) {
+		t.Errorf("expected error wrapping ErrSessionWALMissing, got %v", err)
 	}
 }
 
@@ -147,14 +151,16 @@ func TestMultiSessionWALManager_GetSessionInfo(t *testing.T) {
 	}
 }
 
+// TestMultiSessionWALManager_GetSessionInfo_NotFound tests that GetSessionInfo
+// returns wrapped ErrSessionWALMissing with session context (W12.31).
 func TestMultiSessionWALManager_GetSessionInfo_NotFound(t *testing.T) {
 	manager, tmpDir := newTestWALManager(t)
 	defer os.RemoveAll(tmpDir)
 	defer manager.Close()
 
 	_, err := manager.GetSessionInfo("nonexistent")
-	if err != ErrSessionWALMissing {
-		t.Errorf("expected ErrSessionWALMissing, got %v", err)
+	if !errors.Is(err, ErrSessionWALMissing) {
+		t.Errorf("expected error wrapping ErrSessionWALMissing, got %v", err)
 	}
 }
 
@@ -215,8 +221,8 @@ func TestMultiSessionWALManager_RemoveSession(t *testing.T) {
 	}
 
 	_, err = manager.GetSessionInfo("session-1")
-	if err != ErrSessionWALMissing {
-		t.Error("expected session to be removed from database")
+	if !errors.Is(err, ErrSessionWALMissing) {
+		t.Errorf("expected error wrapping ErrSessionWALMissing, got %v", err)
 	}
 }
 
@@ -447,7 +453,7 @@ func TestMultiSessionWALManager_Race_ConcurrentCloseDuringGetSessionInfo(t *test
 			defer wg.Done()
 			<-started
 			_, err := manager.GetSessionInfo("session-1")
-			if err != nil && err != ErrWALManagerClosed && err != ErrSessionWALMissing {
+			if err != nil && err != ErrWALManagerClosed && !errors.Is(err, ErrSessionWALMissing) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		}()
@@ -644,5 +650,49 @@ func TestMultiSessionWALManager_Race_ConcurrentCloseMultipleTimes(t *testing.T) 
 
 	if closedCount != 1 {
 		t.Errorf("expected exactly 1 successful close, got %d", closedCount)
+	}
+}
+
+// TestMultiSessionWALManager_ErrorContext verifies that errors include
+// operation and session context for better debugging (W12.31).
+func TestMultiSessionWALManager_ErrorContext(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+	defer manager.Close()
+
+	testCases := []struct {
+		name        string
+		operation   func() error
+		wantContext string
+	}{
+		{
+			name: "GetWAL_NotFound",
+			operation: func() error {
+				_, err := manager.GetWAL("test-session-123")
+				return err
+			},
+			wantContext: "test-session-123",
+		},
+		{
+			name: "GetSessionInfo_NotFound",
+			operation: func() error {
+				_, err := manager.GetSessionInfo("another-session-456")
+				return err
+			},
+			wantContext: "another-session-456",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.operation()
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			errStr := err.Error()
+			if !strings.Contains(errStr, tc.wantContext) {
+				t.Errorf("error %q should contain session ID %q", errStr, tc.wantContext)
+			}
+		})
 	}
 }

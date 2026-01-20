@@ -37367,13 +37367,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Return errors and let caller decide handling                             ││
 │ │   SEVERITY: HIGH - Silent database failures                                     ││
 │ │                                                                                  ││
-│ │ [ ] W12.30 - Manager Race in Subscription Handler                               ││
+│ │ [x] W12.30 - Manager Race in Subscription Handler                               ││
 │ │   FILE: core/session/manager.go:636-649                                         ││
 │ │   ISSUE: Subscription map accessed without synchronization                      ││
 │ │   FIX: Add mutex protection for subscription operations                         ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.31 - WALManager Missing Error Context                                   ││
+│ │ [x] W12.31 - WALManager Missing Error Context                                   ││
 │ │   FILE: core/session/wal_manager.go:189-215                                     ││
 │ │   ISSUE: Errors lack context about which operation failed                       ││
 │ │   FIX: Wrap errors with operation context                                       ││
