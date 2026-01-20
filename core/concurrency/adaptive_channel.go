@@ -109,6 +109,9 @@ type AdaptiveChannel[T any] struct {
 
 	// Context for cancellation propagation
 	ctx context.Context
+
+	// Health monitoring (optional)
+	healthMonitor HealthMonitor
 }
 
 // NewAdaptiveChannel creates a new adaptive channel with the given configuration.
@@ -309,10 +312,22 @@ func (ac *AdaptiveChannel[T]) enqueueOverflow(msg T) error {
 	// Always bounded now (legacy unbounded mode is deprecated)
 	if !ac.boundedOvfl.Add(msg) {
 		// DropNewest policy - message was rejected
-		// Note: BoundedOverflow already tracks dropped count internally
+		ac.emitMessageDropped()
 		return ErrOverflowFull
 	}
 	return nil
+}
+
+// emitMessageDropped emits a health event when a message is dropped.
+func (ac *AdaptiveChannel[T]) emitMessageDropped() {
+	monitor := ac.healthMonitor
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventMessageDropped, "AdaptiveChannel")
+	event.Count = ac.boundedOvfl.DroppedCount()
+	emitHealthEvent(monitor, event)
 }
 
 func (ac *AdaptiveChannel[T]) SendTimeout(msg T, timeout time.Duration) error {
@@ -502,6 +517,14 @@ func (ac *AdaptiveChannel[T]) DisableOverflow() {
 	ac.mu.Unlock()
 }
 
+// SetHealthMonitor sets an optional health monitor for observability.
+// The monitor receives events for message drops and channel resizes.
+func (ac *AdaptiveChannel[T]) SetHealthMonitor(monitor HealthMonitor) {
+	ac.mu.Lock()
+	ac.healthMonitor = monitor
+	ac.mu.Unlock()
+}
+
 func (ac *AdaptiveChannel[T]) adaptLoop() {
 	ticker := time.NewTicker(AdaptInterval)
 	defer ticker.Stop()
@@ -602,6 +625,7 @@ func (ac *AdaptiveChannel[T]) resizeLocked(newSize int) {
 		return
 	}
 
+	oldSize := ac.currentSize
 	newCh := make(chan T, newSize)
 	oldCh := ac.ch
 
@@ -616,6 +640,22 @@ func (ac *AdaptiveChannel[T]) resizeLocked(newSize int) {
 	ac.highWaterCnt = 0
 	ac.lowWaterCnt = 0
 	ac.version.Add(1)
+
+	// Emit resize event (outside lock would be better but we keep it simple)
+	ac.emitResizeEvent(oldSize, newSize)
+}
+
+// emitResizeEvent emits a health event when channel is resized.
+func (ac *AdaptiveChannel[T]) emitResizeEvent(oldSize, newSize int) {
+	monitor := ac.healthMonitor
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventChannelResized, "AdaptiveChannel")
+	event.OldValue = int64(oldSize)
+	event.NewValue = int64(newSize)
+	emitHealthEvent(monitor, event)
 }
 
 // drainOldChannel moves messages from old to new channel, preserving overflow.

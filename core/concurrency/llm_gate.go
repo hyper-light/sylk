@@ -464,6 +464,9 @@ type DualQueueGate struct {
 	dispatchWg     sync.WaitGroup
 	ctx            context.Context
 	cancel         context.CancelFunc
+
+	// Health monitoring (optional)
+	healthMonitor HealthMonitor
 }
 
 // NewDualQueueGate creates a new gate with a background context.
@@ -536,6 +539,14 @@ func (g *DualQueueGate) SetRateLimiter(limiter RateLimiter) {
 	g.mu.Unlock()
 }
 
+// SetHealthMonitor sets an optional health monitor for observability.
+// The monitor receives events for queue depth changes and shutdown.
+func (g *DualQueueGate) SetHealthMonitor(monitor HealthMonitor) {
+	g.mu.Lock()
+	g.healthMonitor = monitor
+	g.mu.Unlock()
+}
+
 func (g *DualQueueGate) Submit(ctx context.Context, req *LLMRequest) error {
 	if err := g.checkClosed(); err != nil {
 		return err
@@ -577,6 +588,7 @@ func (g *DualQueueGate) enqueueRequest(req *LLMRequest, isUser bool) error {
 		if err := g.userQueue.Push(req); err != nil {
 			return err
 		}
+		g.checkQueueDepth(g.userQueue.Len(), g.config.MaxUserQueueSize)
 		g.maybePreemptForUser()
 		return nil
 	}
@@ -584,7 +596,40 @@ func (g *DualQueueGate) enqueueRequest(req *LLMRequest, isUser bool) error {
 	if err := g.pipelineQueue.Push(req); err != nil {
 		return err
 	}
+	g.checkQueueDepth(g.pipelineQueue.Len(), g.config.MaxPipelineQueueSize)
 	return nil
+}
+
+// checkQueueDepth emits health event if queue depth exceeds 80% threshold.
+func (g *DualQueueGate) checkQueueDepth(current, max int) {
+	g.mu.Lock()
+	monitor := g.healthMonitor
+	g.mu.Unlock()
+
+	if monitor == nil {
+		return
+	}
+
+	threshold := (max * 80) / 100
+	if current >= threshold {
+		g.emitQueueDepthHigh(current, max)
+	}
+}
+
+// emitQueueDepthHigh emits a health event when queue depth is high.
+func (g *DualQueueGate) emitQueueDepthHigh(current, max int) {
+	g.mu.Lock()
+	monitor := g.healthMonitor
+	g.mu.Unlock()
+
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventQueueDepthHigh, "DualQueueGate")
+	event.Count = int64(current)
+	event.NewValue = int64(max)
+	emitHealthEvent(monitor, event)
 }
 
 func (g *DualQueueGate) notifyClosedRequest(req *LLMRequest) {
@@ -927,6 +972,8 @@ func (g *DualQueueGate) Close() {
 		return
 	}
 
+	g.emitShutdownStarted()
+
 	close(g.stopCh)
 	g.signalWork()
 	g.dispatchWg.Wait()
@@ -943,6 +990,36 @@ func (g *DualQueueGate) Close() {
 	g.cancelActiveRequests()
 	g.drainQueues()
 	g.waitForRequests()
+
+	g.emitShutdownComplete()
+}
+
+// emitShutdownStarted emits a health event when shutdown begins.
+func (g *DualQueueGate) emitShutdownStarted() {
+	g.mu.Lock()
+	monitor := g.healthMonitor
+	g.mu.Unlock()
+
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventShutdownStarted, "DualQueueGate")
+	emitHealthEvent(monitor, event)
+}
+
+// emitShutdownComplete emits a health event when shutdown finishes.
+func (g *DualQueueGate) emitShutdownComplete() {
+	g.mu.Lock()
+	monitor := g.healthMonitor
+	g.mu.Unlock()
+
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventShutdownComplete, "DualQueueGate")
+	emitHealthEvent(monitor, event)
 }
 
 func (g *DualQueueGate) cancelActiveRequests() {

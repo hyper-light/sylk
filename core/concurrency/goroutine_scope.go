@@ -33,6 +33,9 @@ type GoroutineScope struct {
 	shutdownMu       sync.Mutex
 	shutdownStarted  bool
 	shutdownComplete chan struct{}
+
+	// Health monitoring (optional)
+	healthMonitor HealthMonitor
 }
 
 type worker struct {
@@ -88,8 +91,26 @@ func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFu
 		return err
 	}
 
+	s.emitWorkerStarted(w)
 	go s.runWorker(w, fn)
 	return nil
+}
+
+// emitWorkerStarted emits a health event when a worker starts.
+func (s *GoroutineScope) emitWorkerStarted(w *worker) {
+	s.mu.Lock()
+	monitor := s.healthMonitor
+	count := len(s.workers)
+	s.mu.Unlock()
+
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventWorkerStarted, "GoroutineScope")
+	event.Count = int64(count)
+	event.Message = w.description
+	emitHealthEvent(monitor, event)
 }
 
 func (s *GoroutineScope) checkAndRegister(w *worker) error {
@@ -156,10 +177,25 @@ func (s *GoroutineScope) cleanupWorker(w *worker) {
 
 	s.mu.Lock()
 	delete(s.workers, w.id)
+	count := len(s.workers)
+	monitor := s.healthMonitor
 	s.mu.Unlock()
 
+	s.emitWorkerStopped(w, count, monitor)
 	s.budget.Release(s.agentID)
 	s.wg.Done()
+}
+
+// emitWorkerStopped emits a health event when a worker stops.
+func (s *GoroutineScope) emitWorkerStopped(w *worker, count int, monitor HealthMonitor) {
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventWorkerStopped, "GoroutineScope")
+	event.Count = int64(count)
+	event.Message = w.description
+	emitHealthEvent(monitor, event)
 }
 
 func (s *GoroutineScope) Shutdown(gracePeriod, hardDeadline time.Duration) error {
@@ -254,7 +290,10 @@ func (s *GoroutineScope) buildLeakError() *GoroutineLeakError {
 			w.id, w.description, w.startedAt, w.deadline,
 		))
 	}
+	monitor := s.healthMonitor
 	s.mu.Unlock()
+
+	s.emitLeakDetected(len(leaked), monitor)
 
 	return &GoroutineLeakError{
 		AgentID:     s.agentID,
@@ -262,6 +301,18 @@ func (s *GoroutineScope) buildLeakError() *GoroutineLeakError {
 		Workers:     leaked,
 		StackDump:   captureAllStacks(),
 	}
+}
+
+// emitLeakDetected emits a health event when goroutine leak is detected.
+func (s *GoroutineScope) emitLeakDetected(count int, monitor HealthMonitor) {
+	if monitor == nil {
+		return
+	}
+
+	event := newHealthEvent(EventLeakDetected, "GoroutineScope")
+	event.Count = int64(count)
+	event.Message = fmt.Sprintf("agent %s has %d leaked goroutines", s.agentID, count)
+	emitHealthEvent(monitor, event)
 }
 
 func (s *GoroutineScope) WorkerCount() int {
@@ -276,6 +327,14 @@ func (s *GoroutineScope) SetMaxLifetime(d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maxLifetime = d
+}
+
+// SetHealthMonitor sets an optional health monitor for observability.
+// The monitor receives events for worker start/stop and leak detection.
+func (s *GoroutineScope) SetHealthMonitor(monitor HealthMonitor) {
+	s.mu.Lock()
+	s.healthMonitor = monitor
+	s.mu.Unlock()
 }
 
 func captureStack(skip int) string {

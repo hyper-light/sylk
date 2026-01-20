@@ -176,18 +176,22 @@ type ObservationLog struct {
 
 	adaptive *AdaptiveState
 	scope    *concurrency.GoroutineScope
+
+	// Health monitoring (optional) - uses concurrency.HealthMonitor
+	healthMonitor concurrency.HealthMonitor
 }
 
 // ObservationLogConfig holds configuration for the observation log.
 type ObservationLogConfig struct {
 	Path                 string
 	BufferSize           int
-	WriteQueueSize       int                      // Size of async write queue (default: 1000)
-	SyncInterval         time.Duration            // Interval between fsync calls (default: 100ms)
-	SyncFailureThreshold int                      // Consecutive failures before health callback (default: 3)
-	SyncHealthCallback   SyncHealthCallback       // Optional callback for sync health issues
-	Logger               *slog.Logger             // Optional logger for sync errors
-	BackoffConfig        *WriteQueueBackoffConfig // Optional backoff config for queue full retries (W4N.6)
+	WriteQueueSize       int                        // Size of async write queue (default: 1000)
+	SyncInterval         time.Duration              // Interval between fsync calls (default: 100ms)
+	SyncFailureThreshold int                        // Consecutive failures before health callback (default: 3)
+	SyncHealthCallback   SyncHealthCallback         // Optional callback for sync health issues
+	Logger               *slog.Logger               // Optional logger for sync errors
+	BackoffConfig        *WriteQueueBackoffConfig   // Optional backoff config for queue full retries (W4N.6)
+	HealthMonitor        concurrency.HealthMonitor  // Optional health monitor for observability
 	Adaptive             *AdaptiveState
 	Scope                *concurrency.GoroutineScope
 }
@@ -233,6 +237,7 @@ func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*Obser
 		closeDone:            make(chan struct{}),
 		adaptive:             config.Adaptive,
 		scope:                config.Scope,
+		healthMonitor:        config.HealthMonitor,
 	}
 
 	if err := log.loadSequence(); err != nil {
@@ -415,11 +420,38 @@ func (l *ObservationLog) performSyncLocked() {
 	l.lastSync = time.Now()
 
 	if err == nil {
-		l.consecutiveSyncFailures = 0
+		l.handleSyncSuccess()
 		return
 	}
 
 	l.handleSyncError(err)
+}
+
+// handleSyncSuccess handles successful sync, emitting recovered event if needed.
+// Must be called with l.mu held.
+func (l *ObservationLog) handleSyncSuccess() {
+	if l.consecutiveSyncFailures > 0 {
+		l.emitSyncRecovered()
+	}
+	l.consecutiveSyncFailures = 0
+}
+
+// emitSyncRecovered emits a health event when sync recovers after failures.
+// Must be called with l.mu held.
+func (l *ObservationLog) emitSyncRecovered() {
+	monitor := l.healthMonitor
+	if monitor == nil {
+		return
+	}
+
+	event := concurrency.HealthEvent{
+		Type:      concurrency.EventSyncRecovered,
+		Source:    "ObservationLog",
+		Timestamp: time.Now(),
+		Count:     int64(l.consecutiveSyncFailures),
+		Message:   l.path,
+	}
+	l.safeEmitHealthEvent(monitor, event)
 }
 
 // handleSyncError logs the error and triggers callback if threshold reached.
@@ -433,6 +465,9 @@ func (l *ObservationLog) handleSyncError(err error) {
 		slog.String("error", err.Error()),
 	)
 
+	// Emit health monitor event
+	l.emitSyncFailure(err)
+
 	if l.syncHealthCallback == nil {
 		return
 	}
@@ -440,6 +475,33 @@ func (l *ObservationLog) handleSyncError(err error) {
 	if l.consecutiveSyncFailures >= l.syncFailureThreshold {
 		l.syncHealthCallback(l.consecutiveSyncFailures, err)
 	}
+}
+
+// emitSyncFailure emits a health event when sync fails.
+// Must be called with l.mu held.
+func (l *ObservationLog) emitSyncFailure(err error) {
+	monitor := l.healthMonitor
+	if monitor == nil {
+		return
+	}
+
+	event := concurrency.HealthEvent{
+		Type:      concurrency.EventSyncFailure,
+		Source:    "ObservationLog",
+		Timestamp: time.Now(),
+		Count:     int64(l.consecutiveSyncFailures),
+		Error:     err,
+		Message:   l.path,
+	}
+	l.safeEmitHealthEvent(monitor, event)
+}
+
+// safeEmitHealthEvent safely emits an event, recovering from panics.
+func (l *ObservationLog) safeEmitHealthEvent(monitor concurrency.HealthMonitor, event concurrency.HealthEvent) {
+	defer func() {
+		_ = recover()
+	}()
+	monitor.OnHealthEvent(event)
 }
 
 // flushPendingWrites drains the write queue and flushes to disk.
@@ -584,6 +646,9 @@ func (l *ObservationLog) enqueueWithBackoff(ctx context.Context, data []byte, se
 		resultCh: make(chan error, 1),
 	}
 
+	// Check queue depth and emit health event if high
+	l.checkWriteQueueDepth()
+
 	// Try immediate send first
 	if l.trySendRequest(req) {
 		return <-req.resultCh
@@ -596,6 +661,17 @@ func (l *ObservationLog) enqueueWithBackoff(ctx context.Context, data []byte, se
 
 	// Apply exponential backoff retry
 	return l.retryWithBackoff(ctx, req)
+}
+
+// checkWriteQueueDepth emits health event if queue depth exceeds 80% threshold.
+func (l *ObservationLog) checkWriteQueueDepth() {
+	depth := len(l.writeQueue)
+	capacity := cap(l.writeQueue)
+	threshold := (capacity * 80) / 100
+
+	if depth >= threshold {
+		l.emitQueueDepthHigh(depth, capacity)
+	}
 }
 
 // trySendRequest attempts a non-blocking send to the write queue.
@@ -1136,6 +1212,44 @@ func (l *ObservationLog) ConsecutiveSyncFailures() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.consecutiveSyncFailures
+}
+
+// =============================================================================
+// Health Monitor
+// =============================================================================
+
+// SetHealthMonitor sets an optional health monitor for observability.
+// The monitor receives events for sync failures and queue depth.
+func (l *ObservationLog) SetHealthMonitor(monitor concurrency.HealthMonitor) {
+	l.mu.Lock()
+	l.healthMonitor = monitor
+	l.mu.Unlock()
+}
+
+// WriteQueueDepth returns the current write queue depth.
+func (l *ObservationLog) WriteQueueDepth() int {
+	return len(l.writeQueue)
+}
+
+// emitQueueDepthHigh emits a health event when queue depth exceeds threshold.
+func (l *ObservationLog) emitQueueDepthHigh(depth, capacity int) {
+	l.mu.Lock()
+	monitor := l.healthMonitor
+	l.mu.Unlock()
+
+	if monitor == nil {
+		return
+	}
+
+	event := concurrency.HealthEvent{
+		Type:      concurrency.EventQueueDepthHigh,
+		Source:    "ObservationLog",
+		Timestamp: time.Now(),
+		Count:     int64(depth),
+		NewValue:  int64(capacity),
+		Message:   l.path,
+	}
+	l.safeEmitHealthEvent(monitor, event)
 }
 
 // =============================================================================
