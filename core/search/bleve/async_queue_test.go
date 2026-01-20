@@ -1721,6 +1721,557 @@ func TestErrRetriesExhausted(t *testing.T) {
 }
 
 // =============================================================================
+// Context Propagation Tests (W4P.21)
+// =============================================================================
+
+func TestNewIndexOperationWithContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	op := NewIndexOperationWithContext(ctx, OpIndex, "doc1", map[string]string{"key": "value"})
+
+	if op == nil {
+		t.Fatal("NewIndexOperationWithContext returned nil")
+	}
+	if op.Ctx != ctx {
+		t.Error("operation context does not match provided context")
+	}
+	if op.Type != OpIndex {
+		t.Errorf("Type = %v, want %v", op.Type, OpIndex)
+	}
+	if op.DocID != "doc1" {
+		t.Errorf("DocID = %q, want %q", op.DocID, "doc1")
+	}
+}
+
+func TestNewIndexOperationWithContext_NilContext(t *testing.T) {
+	t.Parallel()
+
+	op := NewIndexOperationWithContext(nil, OpIndex, "doc1", nil)
+
+	if op == nil {
+		t.Fatal("NewIndexOperationWithContext returned nil")
+	}
+	if op.Ctx == nil {
+		t.Error("operation context should not be nil when nil is passed")
+	}
+}
+
+func TestAsyncIndexQueue_Submit_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	q, _, _ := createTestQueue(t, AsyncIndexQueueConfig{
+		MaxQueueSize:  100,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+		Workers:       1,
+	})
+
+	// Create already cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	op := NewIndexOperationWithContext(ctx, OpIndex, "doc1", nil)
+	err := q.Submit(op)
+
+	if err != context.Canceled {
+		t.Errorf("Submit() with cancelled context error = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestAsyncIndexQueue_Submit_ContextTimeout(t *testing.T) {
+	t.Parallel()
+
+	q, _, _ := createTestQueue(t, AsyncIndexQueueConfig{
+		MaxQueueSize:  100,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+		Workers:       1,
+	})
+
+	// Create context with past deadline
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
+	defer cancel()
+
+	op := NewIndexOperationWithContext(ctx, OpIndex, "doc1", nil)
+	err := q.Submit(op)
+
+	if err != context.DeadlineExceeded {
+		t.Errorf("Submit() with expired context error = %v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
+func TestAsyncIndexQueue_Submit_ContextCancelledDuringRetry(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+	startedProcessing := make(chan struct{})
+	var once sync.Once
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      1, // Process one at a time to ensure we block
+			FlushInterval:  1 * time.Millisecond,
+			Workers:        1,
+			MaxRetries:     10, // Many retries
+			RetryBaseDelay: 50 * time.Millisecond,
+			RetryMaxDelay:  200 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			once.Do(func() {
+				close(startedProcessing)
+			})
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Submit first item - processor picks it up and blocks
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+
+	// Wait for processor to start processing (and block)
+	select {
+	case <-startedProcessing:
+	case <-time.After(1 * time.Second):
+		t.Fatal("processor did not start processing")
+	}
+
+	// Submit second item - fills the queue
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// Create context that will be cancelled during retry
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Start submission in goroutine
+	done := make(chan error, 1)
+	go func() {
+		op := NewIndexOperationWithContext(ctx, OpIndex, "test", nil)
+		done <- q.Submit(op)
+	}()
+
+	// Cancel context during retry
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+
+	// Wait for the result BEFORE unblocking processor
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Errorf("Submit() with context cancelled during retry = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Submit() did not return after context cancelled")
+	}
+
+	// Cleanup
+	close(processingBlock)
+	_ = q.Close()
+}
+
+func TestAsyncIndexQueue_Submit_ContextTimeoutDuringRetry(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     10,
+			RetryBaseDelay: 100 * time.Millisecond,
+			RetryMaxDelay:  500 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Fill queue and block processor
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// Create context with short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	op := NewIndexOperationWithContext(ctx, OpIndex, "test", nil)
+	err := q.Submit(op)
+
+	// Cleanup
+	close(processingBlock)
+	defer q.Close()
+
+	if err != context.DeadlineExceeded {
+		t.Errorf("Submit() with timeout during retry = %v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
+func TestAsyncIndexQueue_SubmitBlocking_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	// Use a channel to block ALL processing so the queue stays full
+	processingBlock := make(chan struct{})
+	startedProcessing := make(chan struct{})
+	var once sync.Once
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  1,
+			BatchSize:     1, // Process one at a time to ensure we block
+			FlushInterval: 1 * time.Millisecond,
+			Workers:       1,
+		},
+		func(string, interface{}) error {
+			once.Do(func() {
+				close(startedProcessing) // Signal that processing started (only once)
+			})
+			<-processingBlock // Block forever until cleanup
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Submit first item - goes into queue, then processor picks it up and blocks
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+
+	// Wait for processor to start processing (and block)
+	select {
+	case <-startedProcessing:
+	case <-time.After(1 * time.Second):
+		t.Fatal("processor did not start processing")
+	}
+
+	// Now submit second item - fills the queue channel
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// Create context that will be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Start blocking submission - should block because queue is full
+	done := make(chan error, 1)
+	go func() {
+		op := NewIndexOperationWithContext(ctx, OpIndex, "test", nil)
+		done <- q.SubmitBlocking(op)
+	}()
+
+	// Give time for SubmitBlocking to actually block on the select
+	time.Sleep(20 * time.Millisecond)
+
+	// Cancel context - should unblock SubmitBlocking
+	cancel()
+
+	// Wait for the result BEFORE unblocking processor
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Errorf("SubmitBlocking() with context cancelled = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("SubmitBlocking() did not return after context cancelled")
+	}
+
+	// Cleanup - close processingBlock to allow processor to complete
+	close(processingBlock)
+	_ = q.Close()
+}
+
+func TestAsyncIndexQueue_SubmitIndexWithContext_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	indexCalls := &atomic.Int64{}
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     10,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		mockIndexFn(indexCalls, 0, nil),
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	ctx := context.Background()
+	resultCh := q.SubmitIndexWithContext(ctx, "doc1", map[string]string{"content": "test"})
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Errorf("SubmitIndexWithContext() result = %v, want nil", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("timed out waiting for result")
+	}
+
+	if indexCalls.Load() != 1 {
+		t.Errorf("indexFn called %d times, want 1", indexCalls.Load())
+	}
+}
+
+func TestAsyncIndexQueue_SubmitIndexWithContext_Cancelled(t *testing.T) {
+	t.Parallel()
+
+	q, _, _ := createTestQueue(t, AsyncIndexQueueConfig{
+		MaxQueueSize:  100,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+		Workers:       1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	resultCh := q.SubmitIndexWithContext(ctx, "doc1", nil)
+
+	select {
+	case err := <-resultCh:
+		if err != context.Canceled {
+			t.Errorf("SubmitIndexWithContext() with cancelled context = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("timed out waiting for result")
+	}
+}
+
+func TestAsyncIndexQueue_SubmitDeleteWithContext_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	deleteCalls := &atomic.Int64{}
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     10,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		nil,
+		mockDeleteFn(deleteCalls, 0, nil),
+		nil,
+	)
+	defer q.Close()
+
+	ctx := context.Background()
+	resultCh := q.SubmitDeleteWithContext(ctx, "doc1")
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Errorf("SubmitDeleteWithContext() result = %v, want nil", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("timed out waiting for result")
+	}
+
+	if deleteCalls.Load() != 1 {
+		t.Errorf("deleteFn called %d times, want 1", deleteCalls.Load())
+	}
+}
+
+func TestAsyncIndexQueue_SubmitDeleteWithContext_Cancelled(t *testing.T) {
+	t.Parallel()
+
+	q, _, _ := createTestQueue(t, AsyncIndexQueueConfig{
+		MaxQueueSize:  100,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+		Workers:       1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	resultCh := q.SubmitDeleteWithContext(ctx, "doc1")
+
+	select {
+	case err := <-resultCh:
+		if err != context.Canceled {
+			t.Errorf("SubmitDeleteWithContext() with cancelled context = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("timed out waiting for result")
+	}
+}
+
+func TestAsyncIndexQueue_ContextPropagation_ResourceCleanup(t *testing.T) {
+	t.Parallel()
+
+	// Test that resources are properly cleaned up when context is cancelled
+	processingBlock := make(chan struct{})
+	cleanupDone := make(chan struct{})
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     5,
+			RetryBaseDelay: 50 * time.Millisecond,
+			RetryMaxDelay:  200 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Fill queue
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		op := NewIndexOperationWithContext(ctx, OpIndex, "test", nil)
+		_ = q.Submit(op)
+		close(cleanupDone)
+	}()
+
+	// Cancel and wait for cleanup
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-cleanupDone:
+		// Cleanup completed properly
+	case <-time.After(500 * time.Millisecond):
+		t.Error("cleanup did not complete after context cancellation")
+	}
+
+	close(processingBlock)
+	_ = q.Close()
+}
+
+func TestAsyncIndexQueue_ContextPropagation_MultipleOperations(t *testing.T) {
+	t.Parallel()
+
+	q, indexCalls, deleteCalls := createTestQueue(t, AsyncIndexQueueConfig{
+		MaxQueueSize:  100,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+		Workers:       2,
+	})
+
+	ctx := context.Background()
+
+	// Submit multiple operations with context
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(2)
+		go func(id int) {
+			defer wg.Done()
+			docID := "doc-" + string(rune('0'+id))
+			<-q.SubmitIndexWithContext(ctx, docID, nil)
+		}(i)
+		go func(id int) {
+			defer wg.Done()
+			docID := "del-" + string(rune('0'+id))
+			<-q.SubmitDeleteWithContext(ctx, docID)
+		}(i)
+	}
+
+	wg.Wait()
+	_ = q.Flush(ctx)
+
+	if indexCalls.Load() != 10 {
+		t.Errorf("indexFn called %d times, want 10", indexCalls.Load())
+	}
+	if deleteCalls.Load() != 10 {
+		t.Errorf("deleteFn called %d times, want 10", deleteCalls.Load())
+	}
+}
+
+func TestAsyncIndexQueue_ContextPropagation_SyncMethodsWithTimeout(t *testing.T) {
+	t.Parallel()
+
+	indexCalls := &atomic.Int64{}
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     10,
+			FlushInterval: 500 * time.Millisecond, // Slow flush
+			Workers:       1,
+		},
+		mockIndexFn(indexCalls, 100*time.Millisecond, nil), // Slow indexing
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	// Test SubmitIndexSync with timeout that should expire
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	err := q.SubmitIndexSync(ctx, "doc1", nil)
+	if err != context.DeadlineExceeded {
+		t.Errorf("SubmitIndexSync() with short timeout = %v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
+func TestAsyncIndexQueue_ContextPropagation_NilContextInOp(t *testing.T) {
+	t.Parallel()
+
+	q, indexCalls, _ := createTestQueue(t, AsyncIndexQueueConfig{
+		MaxQueueSize:  100,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Millisecond,
+		Workers:       1,
+	})
+
+	// Create operation with nil context manually
+	op := &IndexOperation{
+		Type:      OpIndex,
+		DocID:     "doc1",
+		Document:  nil,
+		ResultCh:  make(chan error, 1),
+		CreatedAt: time.Now(),
+		Ctx:       nil, // Explicitly nil
+	}
+
+	err := q.Submit(op)
+	if err != nil {
+		t.Errorf("Submit() with nil context in op = %v, want nil", err)
+	}
+
+	// Wait for processing
+	select {
+	case <-op.ResultCh:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("timed out waiting for result")
+	}
+
+	if indexCalls.Load() != 1 {
+		t.Errorf("indexFn called %d times, want 1", indexCalls.Load())
+	}
+}
+
+// =============================================================================
 // Benchmark Tests
 // =============================================================================
 
@@ -1793,4 +2344,562 @@ func BenchmarkAsyncIndexQueue_ConcurrentSubmit(b *testing.B) {
 			q.SubmitIndex("doc", doc)
 		}
 	})
+}
+
+// =============================================================================
+// BatchResult Tests
+// =============================================================================
+
+func TestBatchResult_NewBatchResult(t *testing.T) {
+	t.Parallel()
+
+	br := NewBatchResult(10)
+	if br == nil {
+		t.Fatal("NewBatchResult returned nil")
+	}
+	if br.Results == nil {
+		t.Error("Results map should not be nil")
+	}
+	if br.SuccessCount != 0 {
+		t.Errorf("SuccessCount = %d, want 0", br.SuccessCount)
+	}
+	if br.FailureCount != 0 {
+		t.Errorf("FailureCount = %d, want 0", br.FailureCount)
+	}
+}
+
+func TestBatchResult_AddSuccess(t *testing.T) {
+	t.Parallel()
+
+	br := NewBatchResult(5)
+	br.AddSuccess("doc1")
+	br.AddSuccess("doc2")
+
+	if br.SuccessCount != 2 {
+		t.Errorf("SuccessCount = %d, want 2", br.SuccessCount)
+	}
+	if br.FailureCount != 0 {
+		t.Errorf("FailureCount = %d, want 0", br.FailureCount)
+	}
+	if !br.IsSuccess("doc1") {
+		t.Error("doc1 should be successful")
+	}
+	if !br.IsSuccess("doc2") {
+		t.Error("doc2 should be successful")
+	}
+	if br.GetError("doc1") != nil {
+		t.Error("doc1 error should be nil")
+	}
+}
+
+func TestBatchResult_AddFailure(t *testing.T) {
+	t.Parallel()
+
+	br := NewBatchResult(5)
+	err1 := errors.New("index error for doc1")
+	err2 := errors.New("index error for doc2")
+
+	br.AddFailure("doc1", err1)
+	br.AddFailure("doc2", err2)
+
+	if br.SuccessCount != 0 {
+		t.Errorf("SuccessCount = %d, want 0", br.SuccessCount)
+	}
+	if br.FailureCount != 2 {
+		t.Errorf("FailureCount = %d, want 2", br.FailureCount)
+	}
+	if br.IsSuccess("doc1") {
+		t.Error("doc1 should not be successful")
+	}
+	if br.GetError("doc1") != err1 {
+		t.Errorf("doc1 error = %v, want %v", br.GetError("doc1"), err1)
+	}
+	if br.GetError("doc2") != err2 {
+		t.Errorf("doc2 error = %v, want %v", br.GetError("doc2"), err2)
+	}
+}
+
+func TestBatchResult_MixedSuccessAndFailure(t *testing.T) {
+	t.Parallel()
+
+	br := NewBatchResult(5)
+	err := errors.New("indexing failed")
+
+	br.AddSuccess("doc1")
+	br.AddFailure("doc2", err)
+	br.AddSuccess("doc3")
+
+	if br.SuccessCount != 2 {
+		t.Errorf("SuccessCount = %d, want 2", br.SuccessCount)
+	}
+	if br.FailureCount != 1 {
+		t.Errorf("FailureCount = %d, want 1", br.FailureCount)
+	}
+	if !br.HasFailures() {
+		t.Error("HasFailures should return true")
+	}
+	if br.IsSuccess("doc2") {
+		t.Error("doc2 should not be successful")
+	}
+	if br.GetError("doc2") != err {
+		t.Errorf("doc2 error = %v, want %v", br.GetError("doc2"), err)
+	}
+}
+
+func TestBatchResult_HasFailures(t *testing.T) {
+	t.Parallel()
+
+	br := NewBatchResult(5)
+
+	if br.HasFailures() {
+		t.Error("empty result should not have failures")
+	}
+
+	br.AddSuccess("doc1")
+	if br.HasFailures() {
+		t.Error("result with only successes should not have failures")
+	}
+
+	br.AddFailure("doc2", errors.New("error"))
+	if !br.HasFailures() {
+		t.Error("result with failure should have failures")
+	}
+}
+
+func TestBatchResult_GetError_NotFound(t *testing.T) {
+	t.Parallel()
+
+	br := NewBatchResult(5)
+	br.AddSuccess("doc1")
+
+	if br.GetError("nonexistent") != nil {
+		t.Error("GetError for nonexistent doc should return nil")
+	}
+}
+
+func TestBatchResult_IsSuccess_NotFound(t *testing.T) {
+	t.Parallel()
+
+	br := NewBatchResult(5)
+	br.AddSuccess("doc1")
+
+	if br.IsSuccess("nonexistent") {
+		t.Error("IsSuccess for nonexistent doc should return false")
+	}
+}
+
+// =============================================================================
+// Per-Operation Error Tracking Tests
+// =============================================================================
+
+func TestAsyncIndexQueue_BatchWithResult_AllSucceed(t *testing.T) {
+	t.Parallel()
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     5,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		nil,
+		nil,
+		nil, // No legacy batch function
+	)
+	defer q.Close()
+
+	// Set enhanced batch function where all operations succeed
+	q.SetBatchWithResultFn(func(ops []*IndexOperation) *BatchResult {
+		result := NewBatchResult(len(ops))
+		for _, op := range ops {
+			result.AddSuccess(op.DocID)
+		}
+		return result
+	})
+
+	// Submit operations and collect result channels
+	resultChannels := make([]<-chan error, 5)
+	for i := 0; i < 5; i++ {
+		docID := "doc" + string(rune('A'+i))
+		resultChannels[i] = q.SubmitIndex(docID, nil)
+	}
+
+	// Wait for batch to process
+	_ = q.Flush(context.Background())
+
+	// All operations should succeed
+	for i, ch := range resultChannels {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Errorf("operation %d error = %v, want nil", i, err)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Errorf("operation %d timed out", i)
+		}
+	}
+
+	stats := q.Stats()
+	if stats.Processed != 5 {
+		t.Errorf("Processed = %d, want 5", stats.Processed)
+	}
+	if stats.Dropped != 0 {
+		t.Errorf("Dropped = %d, want 0", stats.Dropped)
+	}
+}
+
+func TestAsyncIndexQueue_BatchWithResult_PartialFailure(t *testing.T) {
+	t.Parallel()
+
+	doc2Err := errors.New("doc2 indexing failed")
+	doc4Err := errors.New("doc4 indexing failed")
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     5,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		nil,
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	// Set enhanced batch function with some failures
+	q.SetBatchWithResultFn(func(ops []*IndexOperation) *BatchResult {
+		result := NewBatchResult(len(ops))
+		for _, op := range ops {
+			switch op.DocID {
+			case "docB":
+				result.AddFailure(op.DocID, doc2Err)
+			case "docD":
+				result.AddFailure(op.DocID, doc4Err)
+			default:
+				result.AddSuccess(op.DocID)
+			}
+		}
+		return result
+	})
+
+	// Submit operations
+	docIDs := []string{"docA", "docB", "docC", "docD", "docE"}
+	resultChannels := make(map[string]<-chan error)
+	for _, docID := range docIDs {
+		resultChannels[docID] = q.SubmitIndex(docID, nil)
+	}
+
+	// Wait for batch to process
+	_ = q.Flush(context.Background())
+
+	// Check specific errors for each operation
+	expectedErrors := map[string]error{
+		"docA": nil,
+		"docB": doc2Err,
+		"docC": nil,
+		"docD": doc4Err,
+		"docE": nil,
+	}
+
+	for docID, expectedErr := range expectedErrors {
+		select {
+		case err := <-resultChannels[docID]:
+			if err != expectedErr {
+				t.Errorf("%s error = %v, want %v", docID, err, expectedErr)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Errorf("%s timed out", docID)
+		}
+	}
+
+	stats := q.Stats()
+	if stats.Processed != 3 {
+		t.Errorf("Processed = %d, want 3", stats.Processed)
+	}
+	if stats.Dropped != 2 {
+		t.Errorf("Dropped = %d, want 2", stats.Dropped)
+	}
+}
+
+func TestAsyncIndexQueue_BatchWithResult_AllFail(t *testing.T) {
+	t.Parallel()
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     5,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		nil,
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	// Set enhanced batch function where all fail with unique errors
+	q.SetBatchWithResultFn(func(ops []*IndexOperation) *BatchResult {
+		result := NewBatchResult(len(ops))
+		for _, op := range ops {
+			result.AddFailure(op.DocID, errors.New("failed: "+op.DocID))
+		}
+		return result
+	})
+
+	// Submit operations
+	docIDs := []string{"doc1", "doc2", "doc3"}
+	resultChannels := make(map[string]<-chan error)
+	for _, docID := range docIDs {
+		resultChannels[docID] = q.SubmitIndex(docID, nil)
+	}
+
+	// Wait for batch to process
+	_ = q.Flush(context.Background())
+
+	// All operations should have unique errors
+	for docID := range resultChannels {
+		select {
+		case err := <-resultChannels[docID]:
+			if err == nil {
+				t.Errorf("%s should have failed", docID)
+			}
+			expectedMsg := "failed: " + docID
+			if err.Error() != expectedMsg {
+				t.Errorf("%s error = %q, want %q", docID, err.Error(), expectedMsg)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Errorf("%s timed out", docID)
+		}
+	}
+
+	stats := q.Stats()
+	if stats.Processed != 0 {
+		t.Errorf("Processed = %d, want 0", stats.Processed)
+	}
+	if stats.Dropped != 3 {
+		t.Errorf("Dropped = %d, want 3", stats.Dropped)
+	}
+}
+
+// customTestError is a test error type to verify error context preservation.
+type customTestError struct {
+	DocID   string
+	Details string
+}
+
+func (e *customTestError) Error() string {
+	return "custom error: " + e.DocID + " - " + e.Details
+}
+
+func TestAsyncIndexQueue_BatchWithResult_OriginalErrorPreserved(t *testing.T) {
+	t.Parallel()
+
+	// Create a custom error type to verify error context is preserved
+	customErr := &customTestError{DocID: "doc1", Details: "validation failed"}
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     5,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		nil,
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	// Set batch function returning custom error
+	q.SetBatchWithResultFn(func(ops []*IndexOperation) *BatchResult {
+		result := NewBatchResult(len(ops))
+		for _, op := range ops {
+			if op.DocID == "doc1" {
+				result.AddFailure(op.DocID, customErr)
+			} else {
+				result.AddSuccess(op.DocID)
+			}
+		}
+		return result
+	})
+
+	resultCh := q.SubmitIndex("doc1", nil)
+	_ = q.Flush(context.Background())
+
+	select {
+	case err := <-resultCh:
+		// Verify the original error type is preserved
+		if ce, ok := err.(*customTestError); !ok {
+			t.Errorf("error type not preserved, got %T, want *customTestError", err)
+		} else if ce.DocID != "doc1" || ce.Details != "validation failed" {
+			t.Errorf("error context not preserved: %+v", ce)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("operation timed out")
+	}
+}
+
+func TestAsyncIndexQueue_BatchWithResult_PreferredOverLegacy(t *testing.T) {
+	t.Parallel()
+
+	legacyCalled := &atomic.Bool{}
+	enhancedCalled := &atomic.Bool{}
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     5,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		nil,
+		nil,
+		func(ops []*IndexOperation) error {
+			legacyCalled.Store(true)
+			return nil
+		},
+	)
+	defer q.Close()
+
+	// Set enhanced function - should be preferred
+	q.SetBatchWithResultFn(func(ops []*IndexOperation) *BatchResult {
+		enhancedCalled.Store(true)
+		result := NewBatchResult(len(ops))
+		for _, op := range ops {
+			result.AddSuccess(op.DocID)
+		}
+		return result
+	})
+
+	q.SubmitIndex("doc1", nil)
+	_ = q.Flush(context.Background())
+
+	if legacyCalled.Load() {
+		t.Error("legacy batch function should not be called when enhanced is set")
+	}
+	if !enhancedCalled.Load() {
+		t.Error("enhanced batch function should be called")
+	}
+}
+
+func TestAsyncIndexQueue_SetBatchWithResultFn_ClearCallback(t *testing.T) {
+	t.Parallel()
+
+	enhancedCalled := &atomic.Int64{}
+	legacyCalled := &atomic.Int64{}
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  100,
+			BatchSize:     5,
+			FlushInterval: 10 * time.Millisecond,
+			Workers:       1,
+		},
+		nil,
+		nil,
+		func(ops []*IndexOperation) error {
+			legacyCalled.Add(1)
+			return nil
+		},
+	)
+	defer q.Close()
+
+	// Set enhanced function
+	q.SetBatchWithResultFn(func(ops []*IndexOperation) *BatchResult {
+		enhancedCalled.Add(1)
+		result := NewBatchResult(len(ops))
+		for _, op := range ops {
+			result.AddSuccess(op.DocID)
+		}
+		return result
+	})
+
+	// First batch uses enhanced
+	q.SubmitIndex("doc1", nil)
+	_ = q.Flush(context.Background())
+
+	if enhancedCalled.Load() != 1 {
+		t.Errorf("enhanced called %d times, want 1", enhancedCalled.Load())
+	}
+
+	// Clear enhanced callback
+	q.SetBatchWithResultFn(nil)
+
+	// Second batch should fall back to legacy
+	q.SubmitIndex("doc2", nil)
+	_ = q.Flush(context.Background())
+
+	if legacyCalled.Load() != 1 {
+		t.Errorf("legacy called %d times, want 1", legacyCalled.Load())
+	}
+}
+
+func TestAsyncIndexQueue_BatchWithResult_ConcurrentOperations(t *testing.T) {
+	t.Parallel()
+
+	var processedDocs sync.Map
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:  1000,
+			BatchSize:     10,
+			FlushInterval: 5 * time.Millisecond,
+			Workers:       2,
+		},
+		nil,
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	// Enhanced batch function tracking processed docs
+	q.SetBatchWithResultFn(func(ops []*IndexOperation) *BatchResult {
+		result := NewBatchResult(len(ops))
+		for _, op := range ops {
+			processedDocs.Store(op.DocID, true)
+			result.AddSuccess(op.DocID)
+		}
+		return result
+	})
+
+	const numGoroutines = 10
+	const opsPerGoroutine = 20
+
+	var wg sync.WaitGroup
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				docID := "doc-" + string(rune('A'+goroutineID)) + "-" + string(rune('0'+i%10))
+				q.SubmitIndex(docID, nil)
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	_ = q.Flush(context.Background())
+
+	stats := q.Stats()
+	expectedTotal := int64(numGoroutines * opsPerGoroutine)
+	if stats.Processed != expectedTotal {
+		t.Errorf("Processed = %d, want %d", stats.Processed, expectedTotal)
+	}
+}
+
+func TestErrPartialBatchFailure(t *testing.T) {
+	t.Parallel()
+
+	if ErrPartialBatchFailure.Error() != "partial batch failure: some operations failed" {
+		t.Errorf("ErrPartialBatchFailure message = %q, want %q",
+			ErrPartialBatchFailure.Error(), "partial batch failure: some operations failed")
+	}
 }

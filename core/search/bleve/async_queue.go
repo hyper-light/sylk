@@ -25,7 +25,87 @@ var (
 
 	// ErrRetriesExhausted indicates all retry attempts failed.
 	ErrRetriesExhausted = errors.New("all retry attempts exhausted")
+
+	// ErrPartialBatchFailure indicates some operations in a batch failed.
+	ErrPartialBatchFailure = errors.New("partial batch failure: some operations failed")
 )
+
+// =============================================================================
+// Batch Result Types
+// =============================================================================
+
+// OperationResult represents the result of a single operation in a batch.
+type OperationResult struct {
+	// DocID is the document ID this result corresponds to.
+	DocID string
+
+	// Success indicates whether the operation completed successfully.
+	Success bool
+
+	// Err is the error if the operation failed (nil on success).
+	Err error
+}
+
+// BatchResult contains per-operation results for a batch operation.
+// This enables callers to determine which specific operations failed.
+type BatchResult struct {
+	// Results contains the outcome for each operation, keyed by document ID.
+	Results map[string]*OperationResult
+
+	// SuccessCount is the number of operations that succeeded.
+	SuccessCount int
+
+	// FailureCount is the number of operations that failed.
+	FailureCount int
+}
+
+// NewBatchResult creates a new BatchResult with the given capacity.
+func NewBatchResult(capacity int) *BatchResult {
+	return &BatchResult{
+		Results: make(map[string]*OperationResult, capacity),
+	}
+}
+
+// AddSuccess records a successful operation.
+func (br *BatchResult) AddSuccess(docID string) {
+	br.Results[docID] = &OperationResult{
+		DocID:   docID,
+		Success: true,
+		Err:     nil,
+	}
+	br.SuccessCount++
+}
+
+// AddFailure records a failed operation with its error.
+func (br *BatchResult) AddFailure(docID string, err error) {
+	br.Results[docID] = &OperationResult{
+		DocID:   docID,
+		Success: false,
+		Err:     err,
+	}
+	br.FailureCount++
+}
+
+// HasFailures returns true if any operations failed.
+func (br *BatchResult) HasFailures() bool {
+	return br.FailureCount > 0
+}
+
+// GetError returns the error for a specific document ID, or nil if successful.
+func (br *BatchResult) GetError(docID string) error {
+	if result, ok := br.Results[docID]; ok {
+		return result.Err
+	}
+	return nil
+}
+
+// IsSuccess returns true if the operation for docID succeeded.
+func (br *BatchResult) IsSuccess(docID string) bool {
+	if result, ok := br.Results[docID]; ok {
+		return result.Success
+	}
+	return false
+}
 
 // =============================================================================
 // Operation Types
@@ -70,9 +150,11 @@ type IndexOperation struct {
 	Document  interface{}
 	ResultCh  chan error
 	CreatedAt time.Time
+	Ctx       context.Context // Caller context for lifecycle management
 }
 
-// NewIndexOperation creates a new index operation.
+// NewIndexOperation creates a new index operation with background context.
+// Prefer NewIndexOperationWithContext for proper context propagation.
 func NewIndexOperation(opType OperationType, docID string, doc interface{}) *IndexOperation {
 	return &IndexOperation{
 		Type:      opType,
@@ -80,6 +162,23 @@ func NewIndexOperation(opType OperationType, docID string, doc interface{}) *Ind
 		Document:  doc,
 		ResultCh:  make(chan error, 1),
 		CreatedAt: time.Now(),
+		Ctx:       context.Background(),
+	}
+}
+
+// NewIndexOperationWithContext creates a new index operation with caller context.
+// The context is used for cancellation and timeout propagation.
+func NewIndexOperationWithContext(ctx context.Context, opType OperationType, docID string, doc interface{}) *IndexOperation {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &IndexOperation{
+		Type:      opType,
+		DocID:     docID,
+		Document:  doc,
+		ResultCh:  make(chan error, 1),
+		CreatedAt: time.Now(),
+		Ctx:       ctx,
 	}
 }
 
@@ -205,6 +304,9 @@ type AsyncIndexQueue struct {
 	deleteFn func(docID string) error
 	batchFn  func(ops []*IndexOperation) error
 
+	// Enhanced batch function with per-operation results (preferred over batchFn)
+	batchWithResultFn func(ops []*IndexOperation) *BatchResult
+
 	// Overflow callback for permanent failures after retries exhausted
 	overflowMu sync.RWMutex
 	overflowFn OverflowCallback
@@ -290,6 +392,7 @@ func (q *AsyncIndexQueue) calculateBackoff(attempt int) time.Duration {
 
 // Submit adds an operation to the queue with exponential backoff retry.
 // Returns ErrRetriesExhausted if all retry attempts fail and invokes overflow callback.
+// Respects the operation's context for cancellation and timeout.
 func (q *AsyncIndexQueue) Submit(op *IndexOperation) error {
 	if op == nil {
 		return ErrNilOperation
@@ -297,6 +400,15 @@ func (q *AsyncIndexQueue) Submit(op *IndexOperation) error {
 
 	if q.closed.Load() {
 		return ErrQueueClosed
+	}
+
+	// Check operation context before attempting submission
+	if op.Ctx != nil {
+		select {
+		case <-op.Ctx.Done():
+			return op.Ctx.Err()
+		default:
+		}
 	}
 
 	// Try immediate submission first
@@ -313,14 +425,20 @@ func (q *AsyncIndexQueue) Submit(op *IndexOperation) error {
 }
 
 // retrySubmit handles the retry loop for failed submissions.
+// Respects both queue context and operation context for cancellation.
 func (q *AsyncIndexQueue) retrySubmit(op *IndexOperation) error {
+	opCtx := op.Ctx
+	if opCtx == nil {
+		opCtx = context.Background()
+	}
+
 	for attempt := 0; attempt < q.config.MaxRetries; attempt++ {
 		// Check if queue closed during retry
 		if q.closed.Load() {
 			return ErrQueueClosed
 		}
 
-		// Wait with backoff
+		// Wait with backoff, respecting both contexts
 		delay := q.calculateBackoff(attempt)
 		timer := time.NewTimer(delay)
 
@@ -330,6 +448,9 @@ func (q *AsyncIndexQueue) retrySubmit(op *IndexOperation) error {
 		case <-q.ctx.Done():
 			timer.Stop()
 			return ErrQueueClosed
+		case <-opCtx.Done():
+			timer.Stop()
+			return opCtx.Err()
 		}
 
 		q.retried.Add(1)
@@ -364,6 +485,7 @@ func (q *AsyncIndexQueue) invokeOverflowCallback(op *IndexOperation, err error) 
 
 // SubmitBlocking adds an operation to the queue, blocking if the queue is full.
 // Returns ErrQueueClosed if the queue is closed while waiting.
+// Respects the operation's context for cancellation.
 func (q *AsyncIndexQueue) SubmitBlocking(op *IndexOperation) error {
 	if op == nil {
 		return ErrNilOperation
@@ -373,12 +495,20 @@ func (q *AsyncIndexQueue) SubmitBlocking(op *IndexOperation) error {
 		return ErrQueueClosed
 	}
 
+	// Check operation context before blocking
+	opCtx := op.Ctx
+	if opCtx == nil {
+		opCtx = context.Background()
+	}
+
 	select {
 	case q.queue <- op:
 		q.enqueued.Add(1)
 		return nil
 	case <-q.ctx.Done():
 		return ErrQueueClosed
+	case <-opCtx.Done():
+		return opCtx.Err()
 	}
 }
 
@@ -410,8 +540,9 @@ func (q *AsyncIndexQueue) SubmitDelete(docID string) <-chan error {
 
 // SubmitIndexSync submits an index operation and waits for the result.
 // This is useful when you need synchronous behavior but still want batching.
+// The context is used for cancellation during submission and result waiting.
 func (q *AsyncIndexQueue) SubmitIndexSync(ctx context.Context, docID string, doc interface{}) error {
-	resultCh := q.SubmitIndex(docID, doc)
+	resultCh := q.SubmitIndexWithContext(ctx, docID, doc)
 
 	select {
 	case err := <-resultCh:
@@ -425,7 +556,7 @@ func (q *AsyncIndexQueue) SubmitIndexSync(ctx context.Context, docID string, doc
 
 // SubmitDeleteSync submits a delete operation and waits for the result.
 func (q *AsyncIndexQueue) SubmitDeleteSync(ctx context.Context, docID string) error {
-	resultCh := q.SubmitDelete(docID)
+	resultCh := q.SubmitDeleteWithContext(ctx, docID)
 
 	select {
 	case err := <-resultCh:
@@ -435,6 +566,30 @@ func (q *AsyncIndexQueue) SubmitDeleteSync(ctx context.Context, docID string) er
 	case <-q.ctx.Done():
 		return ErrQueueClosed
 	}
+}
+
+// SubmitIndexWithContext is a convenience method for indexing with caller context.
+// The context is used for cancellation during submission and retry.
+func (q *AsyncIndexQueue) SubmitIndexWithContext(ctx context.Context, docID string, doc interface{}) <-chan error {
+	op := NewIndexOperationWithContext(ctx, OpIndex, docID, doc)
+
+	if err := q.Submit(op); err != nil {
+		op.ResultCh <- err
+	}
+
+	return op.ResultCh
+}
+
+// SubmitDeleteWithContext is a convenience method for deleting with caller context.
+// The context is used for cancellation during submission and retry.
+func (q *AsyncIndexQueue) SubmitDeleteWithContext(ctx context.Context, docID string) <-chan error {
+	op := NewIndexOperationWithContext(ctx, OpDelete, docID, nil)
+
+	if err := q.Submit(op); err != nil {
+		op.ResultCh <- err
+	}
+
+	return op.ResultCh
 }
 
 // =============================================================================
@@ -519,6 +674,17 @@ func (q *AsyncIndexQueue) SetOverflowCallback(fn OverflowCallback) {
 	q.overflowMu.Lock()
 	defer q.overflowMu.Unlock()
 	q.overflowFn = fn
+}
+
+// SetBatchWithResultFn sets an enhanced batch function that returns per-operation results.
+// This function is preferred over the legacy batchFn and enables tracking of which
+// specific operations failed in a batch. Pass nil to clear the callback.
+//
+// The provided function should populate a BatchResult with AddSuccess/AddFailure
+// for each document ID in the operations slice. This allows callers to receive
+// specific errors for their individual operations rather than a single batch error.
+func (q *AsyncIndexQueue) SetBatchWithResultFn(fn func(ops []*IndexOperation) *BatchResult) {
+	q.batchWithResultFn = fn
 }
 
 // SubmitNoRetry adds an operation without retry (original behavior).
@@ -622,62 +788,106 @@ func (q *AsyncIndexQueue) processBatch(ops []*IndexOperation) error {
 		return nil
 	}
 
-	// Try batch function first if available
+	// Prefer enhanced batch function with per-operation results
+	if q.batchWithResultFn != nil {
+		return q.processBatchWithResult(ops)
+	}
+
+	// Try legacy batch function if available
 	if q.batchFn != nil {
-		err := q.batchFn(ops)
-		q.notifyBatchResults(ops, err)
-		q.batchesProcessed.Add(1)
-		if err == nil {
-			q.processed.Add(int64(len(ops)))
-		}
-		return err
+		return q.processBatchLegacy(ops)
 	}
 
 	// Fall back to individual operations
+	return q.processBatchIndividual(ops)
+}
+
+// processBatchWithResult processes a batch using the enhanced batch function.
+func (q *AsyncIndexQueue) processBatchWithResult(ops []*IndexOperation) error {
+	result := q.batchWithResultFn(ops)
+	q.notifyBatchResultsDetailed(ops, result)
+	q.batchesProcessed.Add(1)
+
+	q.processed.Add(int64(result.SuccessCount))
+	q.dropped.Add(int64(result.FailureCount))
+
+	if result.HasFailures() {
+		return ErrPartialBatchFailure
+	}
+	return nil
+}
+
+// processBatchLegacy processes a batch using the legacy batch function.
+func (q *AsyncIndexQueue) processBatchLegacy(ops []*IndexOperation) error {
+	err := q.batchFn(ops)
+	q.notifyBatchResults(ops, err)
+	q.batchesProcessed.Add(1)
+	if err == nil {
+		q.processed.Add(int64(len(ops)))
+	}
+	return err
+}
+
+// processBatchIndividual processes operations one at a time.
+func (q *AsyncIndexQueue) processBatchIndividual(ops []*IndexOperation) error {
 	var lastErr error
 	for _, op := range ops {
-		var err error
-		switch op.Type {
-		case OpIndex:
-			if q.indexFn != nil {
-				err = q.indexFn(op.DocID, op.Document)
-			}
-		case OpDelete:
-			if q.deleteFn != nil {
-				err = q.deleteFn(op.DocID)
-			}
-		}
-
-		// Notify the operation's result channel
-		if op.ResultCh != nil {
-			select {
-			case op.ResultCh <- err:
-			default:
-				// Channel full or closed, skip
-			}
-		}
-
+		err := q.processOneOperation(op)
 		if err != nil {
 			lastErr = err
-			q.dropped.Add(1)
-		} else {
-			q.processed.Add(1)
+		}
+	}
+	q.batchesProcessed.Add(1)
+	return lastErr
+}
+
+// processOneOperation processes a single operation and notifies its result channel.
+func (q *AsyncIndexQueue) processOneOperation(op *IndexOperation) error {
+	var err error
+	switch op.Type {
+	case OpIndex:
+		if q.indexFn != nil {
+			err = q.indexFn(op.DocID, op.Document)
+		}
+	case OpDelete:
+		if q.deleteFn != nil {
+			err = q.deleteFn(op.DocID)
 		}
 	}
 
-	q.batchesProcessed.Add(1)
-	return lastErr
+	// Notify the operation's result channel
+	q.notifyOperationResult(op, err)
+
+	if err != nil {
+		q.dropped.Add(1)
+	} else {
+		q.processed.Add(1)
+	}
+	return err
+}
+
+// notifyOperationResult sends the result to an operation's result channel.
+func (q *AsyncIndexQueue) notifyOperationResult(op *IndexOperation, err error) {
+	if op.ResultCh != nil {
+		select {
+		case op.ResultCh <- err:
+		default:
+			// Channel full or closed, skip
+		}
+	}
 }
 
 // notifyBatchResults notifies all operations in a batch with the same result.
 func (q *AsyncIndexQueue) notifyBatchResults(ops []*IndexOperation, err error) {
 	for _, op := range ops {
-		if op.ResultCh != nil {
-			select {
-			case op.ResultCh <- err:
-			default:
-				// Channel full or closed, skip
-			}
-		}
+		q.notifyOperationResult(op, err)
+	}
+}
+
+// notifyBatchResultsDetailed notifies each operation with its specific result.
+func (q *AsyncIndexQueue) notifyBatchResultsDetailed(ops []*IndexOperation, result *BatchResult) {
+	for _, op := range ops {
+		err := result.GetError(op.DocID)
+		q.notifyOperationResult(op, err)
 	}
 }
