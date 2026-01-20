@@ -106,7 +106,9 @@ func (d *CrossSessionSignalDispatcher) Watch(ctx context.Context) error {
 func (d *CrossSessionSignalDispatcher) watchLoop(ctx context.Context) {
 	defer close(d.doneChan)
 
-	done := d.mergeStopChannels(ctx)
+	done, cleanup := d.mergeStopChannels(ctx)
+	defer cleanup()
+
 	for {
 		if d.processNextEvent(done) {
 			return
@@ -114,16 +116,20 @@ func (d *CrossSessionSignalDispatcher) watchLoop(ctx context.Context) {
 	}
 }
 
-func (d *CrossSessionSignalDispatcher) mergeStopChannels(ctx context.Context) <-chan struct{} {
+func (d *CrossSessionSignalDispatcher) mergeStopChannels(ctx context.Context) (<-chan struct{}, func()) {
 	done := make(chan struct{})
+	cleanup := make(chan struct{})
+
 	go func() {
 		select {
 		case <-ctx.Done():
 		case <-d.stopChan:
+		case <-cleanup:
 		}
 		close(done)
 	}()
-	return done
+
+	return done, func() { close(cleanup) }
 }
 
 func (d *CrossSessionSignalDispatcher) processNextEvent(done <-chan struct{}) bool {

@@ -260,3 +260,84 @@ func TestSignalDispatcher_SenderDoesNotReceiveOwnBroadcast(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+func TestSignalDispatcher_MergeStopChannels_NormalShutdown(t *testing.T) {
+	baseDir := t.TempDir()
+
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+		BaseDir:   baseDir,
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, dispatcher.Watch(ctx))
+
+	time.Sleep(50 * time.Millisecond)
+
+	err = dispatcher.Close()
+	require.NoError(t, err)
+}
+
+func TestSignalDispatcher_MergeStopChannels_ContextCancellation(t *testing.T) {
+	baseDir := t.TempDir()
+
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+		BaseDir:   baseDir,
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+	defer dispatcher.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, dispatcher.Watch(ctx))
+
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+
+	time.Sleep(100 * time.Millisecond)
+}
+
+func TestSignalDispatcher_MergeStopChannels_WatcherClosesCleansUp(t *testing.T) {
+	baseDir := t.TempDir()
+
+	dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+		BaseDir:   baseDir,
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	ctx := t.Context()
+	require.NoError(t, dispatcher.Watch(ctx))
+
+	time.Sleep(50 * time.Millisecond)
+
+	dispatcher.watcher.Close()
+
+	select {
+	case <-dispatcher.doneChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for doneChan to close after watcher close")
+	}
+}
+
+func TestSignalDispatcher_MergeStopChannels_NoLeakOnRapidStartStop(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		baseDir := t.TempDir()
+
+		dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "rapid-test",
+		})
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		require.NoError(t, dispatcher.Watch(ctx))
+
+		time.Sleep(10 * time.Millisecond)
+
+		cancel()
+		dispatcher.Close()
+	}
+}
