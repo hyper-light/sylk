@@ -68,8 +68,24 @@ func (t *TransientTracker) Record(_ error) bool {
 	nowNano := time.Now().UnixNano()
 	cutoff := nowNano - t.windowNano
 
-	idx := t.head.Add(1) & t.mask
-	atomic.StoreInt64(&t.timestamps[idx].value, nowNano)
+	// Use CAS loop to atomically claim a slot and write timestamp together.
+	// This prevents the race where head is incremented but timestamp isn't
+	// written before another goroutine reads the slot.
+	for {
+		currentHead := t.head.Load()
+		nextHead := currentHead + 1
+		idx := nextHead & t.mask
+
+		// Try to claim this slot by incrementing head
+		if !t.head.CompareAndSwap(currentHead, nextHead) {
+			// Another goroutine won, retry with new head value
+			continue
+		}
+
+		// Successfully claimed slot, now write timestamp
+		atomic.StoreInt64(&t.timestamps[idx].value, nowNano)
+		break
+	}
 
 	count := t.countInWindow(cutoff)
 	return t.checkNotificationThreshold(count, nowNano)

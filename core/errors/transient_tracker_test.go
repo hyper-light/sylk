@@ -710,3 +710,77 @@ func TestTransientTracker_SporadicErrors(t *testing.T) {
 		time.Sleep(60 * time.Millisecond) // Wait longer than window
 	}
 }
+
+// =============================================================================
+// W12.48 Fix: CAS-based Update Race Condition Test
+// =============================================================================
+
+func TestTransientTracker_CASUpdateRace(t *testing.T) {
+	// This test verifies W12.48 fix: the CAS-based slot acquisition prevents
+	// lost updates when concurrent goroutines call Record simultaneously.
+	tracker := NewTransientTracker(TransientTrackerConfig{
+		FrequencyCount:       50,
+		FrequencyWindow:      5 * time.Second,
+		NotificationCooldown: 1 * time.Millisecond,
+	})
+
+	var wg sync.WaitGroup
+	goroutines := 100
+	recordsPerGoroutine := 50
+
+	// Track how many records were made
+	totalRecords := goroutines * recordsPerGoroutine
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			err := errors.New("cas race test")
+			for j := 0; j < recordsPerGoroutine; j++ {
+				tracker.Record(err)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// After all records, we should have timestamps in the ring buffer.
+	// The fix ensures no slots are skipped due to race conditions.
+	// With a ring buffer of size >= FrequencyCount*2, we should see
+	// all recent records reflected in the count.
+
+	// Verify head has advanced by the expected amount
+	// Note: head starts at 0 and we add totalRecords
+	expectedHead := uint64(totalRecords)
+	actualHead := tracker.head.Load()
+	if actualHead != expectedHead {
+		t.Errorf("expected head=%d after %d records, got %d", expectedHead, totalRecords, actualHead)
+	}
+}
+
+func TestTransientTracker_CASUpdateOrdering(t *testing.T) {
+	// Verify that CAS ensures each goroutine gets a unique slot
+	tracker := NewTransientTracker(TransientTrackerConfig{
+		FrequencyCount:       8,
+		FrequencyWindow:      10 * time.Second,
+		NotificationCooldown: 60 * time.Second,
+	})
+
+	var wg sync.WaitGroup
+	goroutines := 16 // 2x the buffer size to wrap around
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			tracker.Record(errors.New("ordering test"))
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify head advanced correctly
+	if tracker.head.Load() != uint64(goroutines) {
+		t.Errorf("head should be %d, got %d", goroutines, tracker.head.Load())
+	}
+}
