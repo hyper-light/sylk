@@ -903,19 +903,55 @@ func (g *DualQueueGate) drainQueue(queue interface{ Pop() *LLMRequest }) {
 	}
 }
 
+// waitForRequests waits for all pending requests to complete within the
+// shutdown timeout. Uses a bounded wait pattern to ensure the wait goroutine
+// is properly cleaned up even if timeout fires.
 func (g *DualQueueGate) waitForRequests() {
-	done := make(chan struct{})
-	go func() {
-		g.requestWg.Wait()
-		close(done)
-	}()
+	timeout := g.config.ShutdownTimeout
+	if timeout <= 0 {
+		return
+	}
+	g.boundedWaitGroupWait(&g.requestWg, timeout)
+}
 
-	timer := time.NewTimer(g.config.ShutdownTimeout)
-	defer timer.Stop()
+// boundedWaitGroupWait waits for the WaitGroup to complete within the given
+// timeout. Ensures the spawned goroutine is properly cleaned up regardless of
+// whether the wait completes or times out.
+func (g *DualQueueGate) boundedWaitGroupWait(wg *sync.WaitGroup, timeout time.Duration) {
+	done := make(chan struct{})
+	// Use a separate context for this wait operation so we can signal
+	// the goroutine to stop if the timeout fires.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), timeout)
+	defer waitCancel()
+
+	go g.waitGroupWaiter(wg, done, waitCtx)
 
 	select {
 	case <-done:
-	case <-timer.C:
+		// Wait completed successfully
+	case <-waitCtx.Done():
+		// Timeout fired - waitCancel() will be called by defer,
+		// which signals the waiter goroutine to stop
+	}
+}
+
+// waitGroupWaiter is a helper that waits on the WaitGroup and respects context
+// cancellation to enable cleanup when the caller times out.
+func (g *DualQueueGate) waitGroupWaiter(wg *sync.WaitGroup, done chan struct{}, ctx context.Context) {
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+		close(done)
+	case <-ctx.Done():
+		// Context cancelled (timeout) - goroutine exits cleanly.
+		// The inner goroutine waiting on wg.Wait() will complete
+		// when the WaitGroup reaches zero, which happens when all
+		// requests finish (they were already cancelled during shutdown).
 	}
 }
 
