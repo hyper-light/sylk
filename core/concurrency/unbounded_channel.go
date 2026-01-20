@@ -2,6 +2,7 @@ package concurrency
 
 import (
 	"context"
+	"log"
 	"sync"
 	"sync/atomic"
 )
@@ -42,27 +43,26 @@ func DefaultUnboundedChannelConfig() UnboundedChannelConfig {
 // for user-facing input where blocking is unacceptable. Messages are buffered
 // in an overflow buffer when the channel is full.
 //
-// With MaxOverflowSize > 0, the overflow buffer is bounded to prevent memory
-// exhaustion. When the overflow is full, behavior depends on OverflowDropPolicy:
+// The overflow buffer is bounded to prevent memory exhaustion. When the overflow
+// is full, behavior depends on OverflowDropPolicy:
 //   - DropOldest: evict oldest message to make room for new one
 //   - DropNewest: reject new message (returns ErrOverflowFull from Send)
 //   - Block: wait until space is available (not recommended for unbounded semantics)
 //
-// With MaxOverflowSize = 0, the overflow grows without bound (legacy behavior).
+// Note: MaxOverflowSize=0 (legacy unbounded mode) is deprecated and will use the
+// default bound of 10000 to prevent memory exhaustion.
 type UnboundedChannel[T any] struct {
-	ch             chan T
-	boundedOvfl    *BoundedOverflow[T] // Used when MaxOverflowSize > 0
-	unboundedOvfl  []T                 // Used when MaxOverflowSize = 0 (legacy)
-	maxOverflowSz  int
-	mu             sync.Mutex
-	cond           *sync.Cond
+	ch            chan T
+	boundedOvfl   *BoundedOverflow[T]
+	maxOverflowSz int
+	mu            sync.Mutex
+	cond          *sync.Cond
 
 	closed    atomic.Bool
 	closeOnce sync.Once
 
-	sendCount    atomic.Int64
-	recvCount    atomic.Int64
-	droppedCount atomic.Int64
+	sendCount atomic.Int64
+	recvCount atomic.Int64
 }
 
 // NewUnboundedChannel creates a new unbounded channel with default capacity
@@ -87,19 +87,23 @@ func NewUnboundedChannelWithConfig[T any](config UnboundedChannelConfig) *Unboun
 		config.ChannelCapacity = defaultUnboundedCapacity
 	}
 
+	// Enforce minimum bound when MaxOverflowSize=0 (legacy mode deprecated)
+	if config.MaxOverflowSize == 0 {
+		log.Printf("[DEPRECATED] UnboundedChannel: MaxOverflowSize=0 is deprecated. " +
+			"Using default bound of %d to prevent memory exhaustion. " +
+			"Please explicitly set MaxOverflowSize in your configuration.",
+			defaultMaxOverflowSize)
+		config.MaxOverflowSize = defaultMaxOverflowSize
+	}
+
 	uc := &UnboundedChannel[T]{
 		ch:            make(chan T, config.ChannelCapacity),
 		maxOverflowSz: config.MaxOverflowSize,
 	}
 	uc.cond = sync.NewCond(&uc.mu)
 
-	if config.MaxOverflowSize > 0 {
-		// Bounded overflow mode
-		uc.boundedOvfl = NewBoundedOverflow[T](config.MaxOverflowSize, config.OverflowDropPolicy)
-	} else {
-		// Legacy unbounded mode (not recommended)
-		uc.unboundedOvfl = make([]T, 0)
-	}
+	// Always use bounded overflow mode now (legacy unbounded is deprecated)
+	uc.boundedOvfl = NewBoundedOverflow[T](config.MaxOverflowSize, config.OverflowDropPolicy)
 
 	return uc
 }
@@ -136,19 +140,13 @@ func (uc *UnboundedChannel[T]) Send(msg T) error {
 		return ErrChannelClosed
 	}
 
-	var added bool
-	if uc.boundedOvfl != nil {
-		// Bounded overflow mode
-		added = uc.boundedOvfl.Add(msg)
-		if !added {
-			// DropNewest policy or closed - message was dropped
-			uc.droppedCount.Add(1)
-			uc.mu.Unlock()
-			return ErrOverflowFull
-		}
-	} else {
-		// Legacy unbounded mode
-		uc.unboundedOvfl = append(uc.unboundedOvfl, msg)
+	// Bounded overflow mode (legacy unbounded mode is deprecated and converted to bounded)
+	added := uc.boundedOvfl.Add(msg)
+	if !added {
+		// DropNewest policy or closed - message was dropped
+		// Note: BoundedOverflow already tracks dropped count internally
+		uc.mu.Unlock()
+		return ErrOverflowFull
 	}
 
 	uc.cond.Signal() // Wake up any waiting receivers
@@ -266,34 +264,23 @@ func (uc *UnboundedChannel[T]) OverflowLen() int {
 
 // overflowLenLocked returns the overflow length. Caller must hold mu.
 func (uc *UnboundedChannel[T]) overflowLenLocked() int {
-	if uc.boundedOvfl != nil {
-		return uc.boundedOvfl.Len()
-	}
-	return len(uc.unboundedOvfl)
+	// Always bounded now (legacy unbounded mode is deprecated)
+	return uc.boundedOvfl.Len()
 }
 
 // Stats returns channel statistics.
 func (uc *UnboundedChannel[T]) Stats() UnboundedChannelStats {
 	uc.mu.Lock()
-	var overflowCap int
-	var droppedFromOvfl int64
-
-	if uc.boundedOvfl != nil {
-		overflowCap = uc.boundedOvfl.Cap()
-		droppedFromOvfl = uc.boundedOvfl.DroppedCount()
-	} else {
-		overflowCap = -1 // Unbounded
-	}
-
+	// Always bounded now (legacy unbounded mode is deprecated)
 	stats := UnboundedChannelStats{
 		ChannelLen:       len(uc.ch),
-		OverflowLen:      uc.overflowLenLocked(),
-		OverflowCapacity: overflowCap,
+		OverflowLen:      uc.boundedOvfl.Len(),
+		OverflowCapacity: uc.boundedOvfl.Cap(),
 		SendCount:        uc.sendCount.Load(),
 		ReceiveCount:     uc.recvCount.Load(),
-		DroppedCount:     uc.droppedCount.Load() + droppedFromOvfl,
+		DroppedCount:     uc.boundedOvfl.DroppedCount(),
 		IsClosed:         uc.closed.Load(),
-		IsBounded:        uc.boundedOvfl != nil,
+		IsBounded:        true,
 	}
 	uc.mu.Unlock()
 	return stats
@@ -318,9 +305,8 @@ func (uc *UnboundedChannel[T]) Close() {
 		uc.closed.Store(true)
 		uc.mu.Lock()
 		close(uc.ch)
-		if uc.boundedOvfl != nil {
-			uc.boundedOvfl.Close()
-		}
+		// Always bounded now (legacy unbounded mode is deprecated)
+		uc.boundedOvfl.Close()
 		uc.cond.Broadcast() // Wake up all waiting receivers
 		uc.mu.Unlock()
 	})
@@ -334,25 +320,10 @@ func (uc *UnboundedChannel[T]) IsClosed() bool {
 // drainOverflow removes and returns the first message from the overflow
 // buffer, if any.
 func (uc *UnboundedChannel[T]) drainOverflow() (T, bool) {
-	var zero T
-
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
-
-	if uc.boundedOvfl != nil {
-		// Bounded overflow mode
-		return uc.boundedOvfl.Take()
-	}
-
-	// Legacy unbounded mode
-	if len(uc.unboundedOvfl) == 0 {
-		return zero, false
-	}
-
-	msg := uc.unboundedOvfl[0]
-	uc.unboundedOvfl[0] = zero // Clear reference for GC
-	uc.unboundedOvfl = uc.unboundedOvfl[1:]
-	return msg, true
+	// Always bounded now (legacy unbounded mode is deprecated)
+	return uc.boundedOvfl.Take()
 }
 
 // isClosedAndEmpty returns true if the channel is closed and has no
