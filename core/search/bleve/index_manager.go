@@ -692,10 +692,18 @@ func (m *IndexManager) BatchWithTimeout(ctx context.Context, batch *bleve.Batch)
 		defer cancel()
 	}
 
+	// Capture a local reference to the index to avoid race with Close().
+	// This is safe because the caller holds the lock, and we're only reading
+	// the pointer. The goroutine uses this captured reference.
+	idx := m.index
+	if idx == nil {
+		return ErrIndexClosed
+	}
+
 	// Use channel to capture result from goroutine
 	done := make(chan error, 1)
 	go func() {
-		done <- m.index.Batch(batch)
+		done <- idx.Batch(batch)
 	}()
 
 	select {
