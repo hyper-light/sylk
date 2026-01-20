@@ -134,10 +134,11 @@ type AsyncRetrievalFeedbackHook struct {
 
 // feedbackEntry represents a single feedback entry to be processed.
 type feedbackEntry struct {
-	chunkID    string
-	wasUseful  bool
-	context    RetrievalContext
-	chunkStats *ChunkStats
+	chunkID   string
+	statsID   string // Reference by ID, not pointer - avoids race condition
+	wasUseful bool
+	context   RetrievalContext
+	timestamp time.Time
 }
 
 // domainAggregateStats holds aggregate statistics for a domain.
@@ -219,6 +220,22 @@ func (h *AsyncRetrievalFeedbackHook) RegisterChunk(chunk Chunk) {
 	}
 }
 
+// ensureChunkStats ensures chunk stats exist and returns the chunk ID for reference.
+// This avoids passing pointers across goroutine boundaries which would cause races.
+func (h *AsyncRetrievalFeedbackHook) ensureChunkStats(chunkID string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, exists := h.chunkStats[chunkID]; !exists {
+		h.chunkStats[chunkID] = &ChunkStats{
+			ChunkID:   chunkID,
+			Domain:    DomainGeneral, // Default domain for unknown chunks
+			CreatedAt: time.Now(),
+		}
+	}
+	return chunkID // Return the ID for reference, not the pointer
+}
+
 // RecordRetrieval records feedback about a retrieved chunk asynchronously.
 // This method is non-blocking - if the buffer is full, the feedback is dropped.
 func (h *AsyncRetrievalFeedbackHook) RecordRetrieval(chunkID string, wasUseful bool, ctx RetrievalContext) error {
@@ -226,25 +243,15 @@ func (h *AsyncRetrievalFeedbackHook) RecordRetrieval(chunkID string, wasUseful b
 		return fmt.Errorf("feedback hook has been stopped")
 	}
 
-	// Get or create chunk stats
-	h.mu.Lock()
-	stats, exists := h.chunkStats[chunkID]
-	if !exists {
-		// Create minimal stats for unknown chunks
-		stats = &ChunkStats{
-			ChunkID:   chunkID,
-			Domain:    DomainGeneral, // Default domain for unknown chunks
-			CreatedAt: time.Now(),
-		}
-		h.chunkStats[chunkID] = stats
-	}
-	h.mu.Unlock()
+	// Ensure chunk stats exist and get the statsID for reference
+	statsID := h.ensureChunkStats(chunkID)
 
 	entry := feedbackEntry{
-		chunkID:    chunkID,
-		wasUseful:  wasUseful,
-		context:    ctx,
-		chunkStats: stats,
+		chunkID:   chunkID,
+		statsID:   statsID, // Reference by ID, not pointer
+		wasUseful: wasUseful,
+		context:   ctx,
+		timestamp: time.Now(),
 	}
 
 	// Non-blocking send
@@ -265,24 +272,15 @@ func (h *AsyncRetrievalFeedbackHook) RecordRetrievalSync(chunkID string, wasUsef
 		return fmt.Errorf("feedback hook has been stopped")
 	}
 
-	// Get or create chunk stats
-	h.mu.Lock()
-	stats, exists := h.chunkStats[chunkID]
-	if !exists {
-		stats = &ChunkStats{
-			ChunkID:   chunkID,
-			Domain:    DomainGeneral,
-			CreatedAt: time.Now(),
-		}
-		h.chunkStats[chunkID] = stats
-	}
-	h.mu.Unlock()
+	// Ensure chunk stats exist and get the statsID for reference
+	statsID := h.ensureChunkStats(chunkID)
 
 	entry := feedbackEntry{
-		chunkID:    chunkID,
-		wasUseful:  wasUseful,
-		context:    ctx,
-		chunkStats: stats,
+		chunkID:   chunkID,
+		statsID:   statsID, // Reference by ID, not pointer
+		wasUseful: wasUseful,
+		context:   ctx,
+		timestamp: time.Now(),
 	}
 
 	// Process immediately
@@ -318,34 +316,58 @@ func (h *AsyncRetrievalFeedbackHook) drainRemaining() {
 }
 
 // processEntry processes a single feedback entry.
+// All stats access is done under lock to avoid races.
 func (h *AsyncRetrievalFeedbackHook) processEntry(entry feedbackEntry) error {
-	stats := entry.chunkStats
-
-	// Update chunk stats atomically
-	atomic.AddInt64(&stats.TotalRetrievals, 1)
-	if entry.wasUseful {
-		atomic.AddInt64(&stats.UsefulRetrievals, 1)
+	// Look up stats by ID under lock - avoids race condition
+	obs, err := h.updateStatsAndBuildObservation(entry)
+	if err != nil {
+		return err
 	}
 
+	// Record observation to learner (outside lock to avoid holding it too long)
+	if err := h.learner.RecordObservation(obs); err != nil {
+		return fmt.Errorf("failed to record observation: %w", err)
+	}
+
+	return nil
+}
+
+// updateStatsAndBuildObservation updates stats under lock and builds the observation.
+// Returns the observation for the learner.
+func (h *AsyncRetrievalFeedbackHook) updateStatsAndBuildObservation(entry feedbackEntry) (ChunkUsageObservation, error) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Look up stats by ID under lock
+	stats, exists := h.chunkStats[entry.statsID]
+	if !exists {
+		return ChunkUsageObservation{}, fmt.Errorf("stats not found for chunk: %s", entry.statsID)
+	}
+
+	// Update chunk stats (now safe under lock)
+	stats.TotalRetrievals++
+	if entry.wasUseful {
+		stats.UsefulRetrievals++
+	}
+
+	// Update last retrieved timestamp
 	stats.LastRetrieved = entry.context.Timestamp
 	if stats.LastRetrieved.IsZero() {
-		stats.LastRetrieved = time.Now()
+		stats.LastRetrieved = entry.timestamp
 	}
 
 	// Update domain aggregate stats
-	domainStat, exists := h.domainStats[stats.Domain]
-	if !exists {
+	domainStat, domainExists := h.domainStats[stats.Domain]
+	if !domainExists {
 		domainStat = &domainAggregateStats{}
 		h.domainStats[stats.Domain] = domainStat
 	}
-	atomic.AddInt64(&domainStat.totalRetrievals, 1)
+	domainStat.totalRetrievals++
 	if entry.wasUseful {
-		atomic.AddInt64(&domainStat.usefulRetrievals, 1)
+		domainStat.usefulRetrievals++
 	}
-	h.mu.Unlock()
 
-	// Create observation for the learner
+	// Build observation from stats (copy values while under lock)
 	obs := ChunkUsageObservation{
 		Domain:        stats.Domain,
 		TokenCount:    stats.TokenCount,
@@ -359,7 +381,7 @@ func (h *AsyncRetrievalFeedbackHook) processEntry(entry feedbackEntry) error {
 
 	// Set timestamp if not provided
 	if obs.Timestamp.IsZero() {
-		obs.Timestamp = time.Now()
+		obs.Timestamp = entry.timestamp
 	}
 
 	// Ensure token count is valid for learner
@@ -367,45 +389,42 @@ func (h *AsyncRetrievalFeedbackHook) processEntry(entry feedbackEntry) error {
 		obs.TokenCount = 100 // Default fallback
 	}
 
-	// Record observation to learner
-	if err := h.learner.RecordObservation(obs); err != nil {
-		return fmt.Errorf("failed to record observation: %w", err)
-	}
-
-	return nil
+	return obs, nil
 }
 
 // GetHitRate returns the hit rate for a specific chunk.
 func (h *AsyncRetrievalFeedbackHook) GetHitRate(chunkID string) (hitRate float64, totalRetrievals int) {
 	h.mu.RLock()
-	stats, exists := h.chunkStats[chunkID]
-	h.mu.RUnlock()
+	defer h.mu.RUnlock()
 
+	stats, exists := h.chunkStats[chunkID]
 	if !exists {
 		return 0.0, 0
 	}
 
-	total := atomic.LoadInt64(&stats.TotalRetrievals)
-	return stats.HitRate(), int(total)
+	total := stats.TotalRetrievals
+	if total == 0 {
+		return 0.0, 0
+	}
+	return float64(stats.UsefulRetrievals) / float64(total), int(total)
 }
 
 // GetDomainHitRate returns the aggregate hit rate for a domain.
 func (h *AsyncRetrievalFeedbackHook) GetDomainHitRate(domain Domain) (hitRate float64, totalRetrievals int) {
 	h.mu.RLock()
-	domainStat, exists := h.domainStats[domain]
-	h.mu.RUnlock()
+	defer h.mu.RUnlock()
 
+	domainStat, exists := h.domainStats[domain]
 	if !exists {
 		return 0.0, 0
 	}
 
-	total := atomic.LoadInt64(&domainStat.totalRetrievals)
+	total := domainStat.totalRetrievals
 	if total == 0 {
 		return 0.0, 0
 	}
 
-	useful := atomic.LoadInt64(&domainStat.usefulRetrievals)
-	return float64(useful) / float64(total), int(total)
+	return float64(domainStat.usefulRetrievals) / float64(total), int(total)
 }
 
 // GetChunkStats returns the statistics for a specific chunk.
