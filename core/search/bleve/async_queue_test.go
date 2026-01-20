@@ -1235,7 +1235,7 @@ func TestAsyncIndexQueue_Submit_RetryExhausted(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     2,
@@ -1301,7 +1301,7 @@ func TestAsyncIndexQueue_Submit_NoRetryWhenMaxRetriesZero(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     0, // Disable retries
@@ -1318,7 +1318,7 @@ func TestAsyncIndexQueue_Submit_NoRetryWhenMaxRetriesZero(t *testing.T) {
 
 	// Fill the queue and block processor
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
 	// Submit should fail immediately
@@ -1396,7 +1396,7 @@ func TestAsyncIndexQueue_Submit_BackoffTiming(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     3,
@@ -1413,7 +1413,7 @@ func TestAsyncIndexQueue_Submit_BackoffTiming(t *testing.T) {
 
 	// Fill queue and block processor
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
 	// Submit should take at least the sum of backoff delays
@@ -1442,7 +1442,7 @@ func TestAsyncIndexQueue_SubmitNoRetry(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     5, // Would retry normally
@@ -1459,7 +1459,7 @@ func TestAsyncIndexQueue_SubmitNoRetry(t *testing.T) {
 
 	// Fill queue and block processor
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
 	// SubmitNoRetry should fail immediately
@@ -1515,7 +1515,7 @@ func TestAsyncIndexQueue_SetOverflowCallback(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     1,
@@ -1539,7 +1539,7 @@ func TestAsyncIndexQueue_SetOverflowCallback(t *testing.T) {
 
 	// Fill and block processor
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
 	// This should overflow
@@ -1571,7 +1571,7 @@ func TestAsyncIndexQueue_Submit_ClosedDuringRetry(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     10,
@@ -1588,7 +1588,7 @@ func TestAsyncIndexQueue_Submit_ClosedDuringRetry(t *testing.T) {
 
 	// Fill queue and block processor
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
 	// Start a submission that will retry
@@ -1622,7 +1622,7 @@ func TestAsyncIndexQueue_RetryStats(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     3,
@@ -1643,12 +1643,13 @@ func TestAsyncIndexQueue_RetryStats(t *testing.T) {
 		t.Errorf("initial Retried = %d, want 0", stats.Retried)
 	}
 
-	// Fill and block processor
+	// Fill queue and block processor
+	// With BatchSize=1, the processor will immediately flush and block on indexFn
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block on indexFn
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
-	// This should exhaust retries
+	// This should exhaust retries since queue is full and processor is blocked
 	_ = q.Submit(NewIndexOperation(OpIndex, "retry", nil))
 
 	// Cleanup
@@ -1883,7 +1884,7 @@ func TestAsyncIndexQueue_Submit_ContextTimeoutDuringRetry(t *testing.T) {
 		context.Background(),
 		AsyncIndexQueueConfig{
 			MaxQueueSize:   1,
-			BatchSize:      100,
+			BatchSize:      1, // Flush immediately so indexFn blocks processor
 			FlushInterval:  10 * time.Second,
 			Workers:        1,
 			MaxRetries:     10,
@@ -1900,7 +1901,7 @@ func TestAsyncIndexQueue_Submit_ContextTimeoutDuringRetry(t *testing.T) {
 
 	// Fill queue and block processor
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
 	// Create context with short timeout
