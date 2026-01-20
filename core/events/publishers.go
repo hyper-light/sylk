@@ -1,3 +1,9 @@
+// Package events provides event publishing components for the activity bus.
+// Publishers are typed components that emit events for specific subsystems:
+// - GuidePublisher: user prompts, routing decisions, clarification requests
+// - ToolPublisher: tool calls, results, and timeouts
+// - AgentPublisher: agent actions, decisions, errors, and outcomes
+// - LLMPublisher: LLM requests, responses, and errors
 package events
 
 import (
@@ -7,6 +13,7 @@ import (
 )
 
 // ErrNilBus is returned when a publisher attempts to publish an event but the bus is nil.
+// This error indicates the publisher was created without a valid ActivityEventBus reference.
 var ErrNilBus = errors.New("event bus is nil")
 
 // =============================================================================
@@ -232,6 +239,8 @@ func (p *AgentPublisher) PublishAgentDecision(decision, rationale string) error 
 }
 
 // PublishAgentError publishes an agent error event.
+// The err parameter can be nil, in which case an empty error message is recorded.
+// The context parameter provides additional context about where/why the error occurred.
 func (p *AgentPublisher) PublishAgentError(err error, context string) error {
 	if p.bus == nil {
 		return ErrNilBus
@@ -373,7 +382,10 @@ func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputToken
 }
 
 // PublishLLMError publishes an LLM error event.
-func (p *LLMPublisher) PublishLLMError(model string, err error, context string) error {
+// Note: Uses EventTypeLLMResponse with OutcomeFailure to indicate an error.
+// This design allows subscribers filtering by EventTypeLLMResponse to capture
+// both successful responses and errors, while the Outcome field distinguishes them.
+func (p *LLMPublisher) PublishLLMError(model string, err error, errContext string) error {
 	if p.bus == nil {
 		return ErrNilBus
 	}
@@ -381,9 +393,11 @@ func (p *LLMPublisher) PublishLLMError(model string, err error, context string) 
 	var errMsg string
 	if err != nil {
 		errMsg = err.Error()
+	} else {
+		errMsg = "unknown error"
 	}
 
-	content := fmt.Sprintf("LLM error: model=%s, error=%s, context=%s", model, errMsg, context)
+	content := fmt.Sprintf("LLM error: model=%s, error=%s, context=%s", model, errMsg, errContext)
 
 	event := NewActivityEvent(EventTypeLLMResponse, p.sessionID, content)
 	event.AgentID = p.agentID
@@ -393,7 +407,7 @@ func (p *LLMPublisher) PublishLLMError(model string, err error, context string) 
 
 	event.Data["model"] = model
 	event.Data["error"] = errMsg
-	event.Data["context"] = context
+	event.Data["error_context"] = errContext
 
 	p.bus.Publish(event)
 	return nil

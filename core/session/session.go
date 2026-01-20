@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"sync"
 	"sync/atomic"
@@ -462,19 +463,22 @@ func (s *Session) Serialize() ([]byte, error) {
 
 	data, err := json.Marshal(snapshot)
 	if err != nil {
-		return nil, ErrSerializationFailed
+		// W3L.8: Wrap underlying error for better debugging context
+		return nil, fmt.Errorf("session %q: %w: %v", s.id, ErrSerializationFailed, err)
 	}
 	return data, nil
 }
 
-// Restore restores session state from serialized data
+// Restore restores session state from serialized data.
+// W3L.9: Improved error wrapping to include underlying JSON error for debugging.
 func (s *Session) Restore(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var snapshot sessionSnapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return ErrDeserializationFailed
+		// W3L.9: Wrap underlying error for better debugging context
+		return fmt.Errorf("session %q: %w: %v", s.id, ErrDeserializationFailed, err)
 	}
 
 	// Restore identity (ID is immutable, but others can be restored)

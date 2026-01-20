@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -181,13 +182,16 @@ func (m *Manager) GetActive() (*Session, bool) {
 	return m.Get(*activeIDPtr)
 }
 
-// List returns all sessions
+// List returns all sessions.
+// W3L.6: Pre-allocate result slice based on estimated session count for better performance.
 func (m *Manager) List() []*Session {
 	if m.closed.Load() {
 		return nil
 	}
 
-	var result []*Session
+	// W3L.6: Pre-allocate with estimated capacity (avg sessions per shard * num shards)
+	estimatedCapacity := m.numShards * 4 // Assume ~4 sessions per shard on average
+	result := make([]*Session, 0, estimatedCapacity)
 
 	for _, shard := range m.shards {
 		shard.mu.RLock()
@@ -247,10 +251,12 @@ func (m *Manager) ensureOpen() error {
 	return nil
 }
 
+// getSessionOrErr retrieves a session or returns an error with context.
+// W3L.7: Include session ID in error message for better debugging.
 func (m *Manager) getSessionOrErr(id string) (*Session, error) {
 	session, ok := m.Get(id)
 	if !ok {
-		return nil, ErrSessionNotFound
+		return nil, fmt.Errorf("session %q: %w", id, ErrSessionNotFound)
 	}
 	return session, nil
 }

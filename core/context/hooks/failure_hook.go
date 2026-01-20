@@ -194,8 +194,17 @@ func (h *FailurePatternWarningHook) Execute(
 	}, nil
 }
 
+// filterRelevantFailures filters failure patterns to include only those with
+// sufficient recurrence count (>= minRecurrence). Results are limited to maxWarnings
+// to prevent prompt bloat. The returned slice preserves the input order, which
+// is assumed to be sorted by relevance/similarity.
 func (h *FailurePatternWarningHook) filterRelevantFailures(failures []FailurePattern) []FailurePattern {
-	relevant := make([]FailurePattern, 0, len(failures))
+	// Pre-allocate with bounded capacity
+	capacity := len(failures)
+	if capacity > h.maxWarnings {
+		capacity = h.maxWarnings
+	}
+	relevant := make([]FailurePattern, 0, capacity)
 
 	for _, f := range failures {
 		if f.RecurrenceCount >= h.minRecurrence {
@@ -209,8 +218,13 @@ func (h *FailurePatternWarningHook) filterRelevantFailures(failures []FailurePat
 	return relevant
 }
 
+// buildWarningContent constructs a formatted warning message from failure patterns.
+// The output uses markdown formatting for clear presentation in the agent context.
+// Each failure includes: recurrence count, similarity percentage, approach, error, and resolution.
 func (h *FailurePatternWarningHook) buildWarningContent(failures []FailurePattern) string {
 	var sb strings.Builder
+	// Pre-grow buffer: ~200 bytes header + ~300 bytes per failure
+	sb.Grow(200 + len(failures)*300)
 
 	sb.WriteString("[FAILURE_PATTERN_WARNING]\n")
 	sb.WriteString("The following similar approaches have failed in the past:\n\n")
@@ -233,6 +247,10 @@ func (h *FailurePatternWarningHook) buildWarningContent(failures []FailurePatter
 	return sb.String()
 }
 
+// injectWarning prepends a failure warning excerpt to the augmented query.
+// If no AugmentedQuery exists, one is created. The warning is added as a
+// high-priority excerpt (confidence=1.0) from the "failure_memory" source,
+// ensuring it appears at the top of the agent's context.
 func (h *FailurePatternWarningHook) injectWarning(
 	existing *ctxpkg.AugmentedQuery,
 	warning string,
@@ -241,7 +259,7 @@ func (h *FailurePatternWarningHook) injectWarning(
 	if existing == nil {
 		existing = &ctxpkg.AugmentedQuery{
 			OriginalQuery: "",
-			Excerpts:      make([]ctxpkg.Excerpt, 0),
+			Excerpts:      make([]ctxpkg.Excerpt, 0, 1),
 			Summaries:     make([]ctxpkg.Summary, 0),
 		}
 	}

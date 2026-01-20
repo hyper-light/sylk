@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -120,9 +121,12 @@ func normalizeCrossSessionPoolConfig(cfg CrossSessionPoolConfig) CrossSessionPoo
 	return cfg
 }
 
+// Acquire attempts to acquire a resource slot for the given session.
+// W3L.11: Enhanced error messages with session ID and priority context.
 func (p *CrossSessionPool) Acquire(ctx context.Context, sessionID string, priority Priority) (*ResourceHandle, error) {
 	if err := p.checkClosed(); err != nil {
-		return nil, err
+		// W3L.11: Add context to closed pool error
+		return nil, fmt.Errorf("acquire for session %q (priority=%d): %w", sessionID, priority, err)
 	}
 
 	handle, acquired := p.tryAcquire(sessionID, priority)
@@ -131,10 +135,20 @@ func (p *CrossSessionPool) Acquire(ctx context.Context, sessionID string, priori
 	}
 
 	if priority == PriorityUser {
-		return p.acquireWithPreemption(ctx, sessionID)
+		handle, err := p.acquireWithPreemption(ctx, sessionID)
+		if err != nil {
+			// W3L.11: Add context to preemption errors
+			return nil, fmt.Errorf("acquire with preemption for session %q: %w", sessionID, err)
+		}
+		return handle, nil
 	}
 
-	return p.waitForSlot(ctx, sessionID, priority)
+	handle, err := p.waitForSlot(ctx, sessionID, priority)
+	if err != nil {
+		// W3L.11: Add context to wait errors
+		return nil, fmt.Errorf("wait for slot session %q (priority=%d): %w", sessionID, priority, err)
+	}
+	return handle, nil
 }
 
 func (p *CrossSessionPool) checkClosed() error {

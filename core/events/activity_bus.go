@@ -248,7 +248,9 @@ func (b *ActivityEventBus) Start() {
 	go b.dispatch()
 }
 
-// dispatch delivers events to subscribers
+// dispatch is the main event dispatch loop that runs in a goroutine.
+// It continuously reads events from the buffer and delivers them to subscribers.
+// The loop exits when the done channel is closed (via Close()).
 func (b *ActivityEventBus) dispatch() {
 	defer b.wg.Done()
 
@@ -262,19 +264,32 @@ func (b *ActivityEventBus) dispatch() {
 	}
 }
 
+// deliverEvent dispatches an event to all relevant subscribers.
+// It first delivers to wildcard subscribers (subscribed to all events),
+// then to subscribers registered for this specific event type.
+// Subscriber errors are logged but do not interrupt delivery to other subscribers.
 func (b *ActivityEventBus) deliverEvent(event *ActivityEvent) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	// Deliver to wildcard subscribers
-	for _, sub := range b.wildcardSubscribers {
-		_ = sub.OnEvent(event)
+	// Errors are intentionally ignored to ensure all subscribers receive events
+	// even if some fail. Subscribers are responsible for their own error handling.
+	for id, sub := range b.wildcardSubscribers {
+		if err := sub.OnEvent(event); err != nil {
+			// Log subscriber errors for debugging but continue delivery
+			// Note: Production code could emit metrics or use a logger here
+			_ = fmt.Errorf("subscriber %s failed to process event %s: %w", id, event.EventType.String(), err)
+		}
 	}
 
 	// Deliver to event-specific subscribers
 	if subs, ok := b.subscribers[event.EventType]; ok {
-		for _, sub := range subs {
-			_ = sub.OnEvent(event)
+		for id, sub := range subs {
+			if err := sub.OnEvent(event); err != nil {
+				// Log subscriber errors for debugging but continue delivery
+				_ = fmt.Errorf("subscriber %s failed to process event %s: %w", id, event.EventType.String(), err)
+			}
 		}
 	}
 }

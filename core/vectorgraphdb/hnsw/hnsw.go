@@ -1,7 +1,23 @@
+// Package hnsw implements the Hierarchical Navigable Small World (HNSW) algorithm
+// for approximate nearest neighbor search. HNSW builds a multi-layer graph where
+// higher layers contain fewer nodes with longer-range connections for fast traversal,
+// while lower layers provide fine-grained navigation to the nearest neighbors.
+//
+// Key algorithm concepts:
+//   - Multi-layer structure: Nodes exist at a random level L, appearing in layers 0 through L
+//   - Greedy search: Starting from the entry point, traverse layers from top to bottom
+//   - Neighbor selection: Use heuristic to maintain diverse, high-quality connections
+//   - M parameter: Maximum number of connections per node (M*2 for layer 0)
+//   - efConstruct: Size of dynamic candidate list during insertion
+//   - efSearch: Size of dynamic candidate list during search
+//
+// Reference: "Efficient and robust approximate nearest neighbor search using
+// Hierarchical Navigable Small World graphs" (Malkov & Yashunin, 2016)
 package hnsw
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
 	"sync"
@@ -9,11 +25,20 @@ import (
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
 
+// Sentinel errors for HNSW operations. Use errors.Is() to check error types.
+// W4L.1: Improved error definitions with clearer documentation.
 var (
-	ErrNodeNotFound      = errors.New("node not found")
-	ErrEmptyVector       = errors.New("vector cannot be empty")
-	ErrDimensionMismatch = errors.New("vector dimension mismatch")
-	ErrIndexEmpty        = errors.New("index is empty")
+	// ErrNodeNotFound indicates the requested node ID does not exist in the index.
+	ErrNodeNotFound = errors.New("hnsw: node not found")
+
+	// ErrEmptyVector indicates an attempt to insert or search with a zero-length vector.
+	ErrEmptyVector = errors.New("hnsw: vector cannot be empty")
+
+	// ErrDimensionMismatch indicates the vector dimension doesn't match the index dimension.
+	ErrDimensionMismatch = errors.New("hnsw: vector dimension mismatch")
+
+	// ErrIndexEmpty indicates the index has no nodes to search.
+	ErrIndexEmpty = errors.New("hnsw: index is empty")
 )
 
 type SearchResult struct {
@@ -79,9 +104,17 @@ func New(cfg Config) *Index {
 	}
 }
 
+// Insert adds a new vector to the index with the given ID, domain, and node type.
+// W4L.1: Improved error messages with context for debugging.
+//
+// The vector will be connected to its nearest neighbors at each layer it exists in,
+// where the node's maximum layer is determined randomly based on levelMult.
+//
+// Returns ErrEmptyVector if the vector is empty, or ErrDimensionMismatch if the
+// vector dimension doesn't match the index's established dimension.
 func (h *Index) Insert(id string, vector []float32, domain vectorgraphdb.Domain, nodeType vectorgraphdb.NodeType) error {
 	if len(vector) == 0 {
-		return ErrEmptyVector
+		return fmt.Errorf("%w: node %q cannot have empty vector", ErrEmptyVector, id)
 	}
 
 	h.mu.Lock()
@@ -90,7 +123,8 @@ func (h *Index) Insert(id string, vector []float32, domain vectorgraphdb.Domain,
 	if h.dimension == 0 {
 		h.dimension = len(vector)
 	} else if len(vector) != h.dimension {
-		return ErrDimensionMismatch
+		return fmt.Errorf("%w: node %q has dimension %d, expected %d",
+			ErrDimensionMismatch, id, len(vector), h.dimension)
 	}
 
 	return h.insertLocked(id, vector, domain, nodeType)
@@ -349,12 +383,19 @@ func (h *Index) matchesFilter(id string, similarity float64, filter *SearchFilte
 	return true
 }
 
+// Delete removes a node from the index by ID.
+// W4L.1: Improved error message with node context.
+//
+// This operation removes the node from all layers and updates neighbor connections.
+// If the deleted node was the entry point, a new entry point is selected.
+//
+// Returns ErrNodeNotFound if the node doesn't exist.
 func (h *Index) Delete(id string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if _, exists := h.vectors[id]; !exists {
-		return ErrNodeNotFound
+		return fmt.Errorf("%w: cannot delete node %q", ErrNodeNotFound, id)
 	}
 
 	h.deleteUnlocked(id)
@@ -362,8 +403,13 @@ func (h *Index) Delete(id string) error {
 }
 
 // DeleteBatch deletes multiple nodes with a single lock acquisition.
+// W4L.1: Improved error message to identify which node was not found.
+//
 // This is more efficient than calling Delete() multiple times when
 // deleting many nodes, as it avoids repeated lock/unlock overhead.
+// All IDs are validated before any deletions occur, ensuring atomicity.
+//
+// Returns ErrNodeNotFound (with the specific ID) if any node doesn't exist.
 func (h *Index) DeleteBatch(ids []string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -371,7 +417,8 @@ func (h *Index) DeleteBatch(ids []string) error {
 	// Validate all IDs exist first
 	for _, id := range ids {
 		if _, exists := h.vectors[id]; !exists {
-			return ErrNodeNotFound
+			return fmt.Errorf("%w: cannot delete node %q in batch of %d nodes",
+				ErrNodeNotFound, id, len(ids))
 		}
 	}
 
@@ -444,23 +491,31 @@ func (h *Index) Contains(id string) bool {
 	return exists
 }
 
+// GetVector returns a copy of the vector for the given node ID.
+// W4L.1: Improved error message with node context.
+//
+// Returns ErrNodeNotFound if the node doesn't exist.
 func (h *Index) GetVector(id string) ([]float32, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	vec, exists := h.vectors[id]
 	if !exists {
-		return nil, ErrNodeNotFound
+		return nil, fmt.Errorf("%w: cannot get vector for node %q", ErrNodeNotFound, id)
 	}
 	result := make([]float32, len(vec))
 	copy(result, vec)
 	return result, nil
 }
 
+// GetMetadata returns the domain and node type for the given node ID.
+// W4L.1: Improved error message with node context.
+//
+// Returns ErrNodeNotFound if the node doesn't exist.
 func (h *Index) GetMetadata(id string) (vectorgraphdb.Domain, vectorgraphdb.NodeType, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if _, exists := h.vectors[id]; !exists {
-		return 0, 0, ErrNodeNotFound
+		return 0, 0, fmt.Errorf("%w: cannot get metadata for node %q", ErrNodeNotFound, id)
 	}
 	return h.domains[id], h.nodeTypes[id], nil
 }

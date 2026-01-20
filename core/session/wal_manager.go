@@ -221,19 +221,35 @@ func (m *MultiSessionWALManager) getUnrecoveredSessions(ctx context.Context) ([]
 	return m.scanSessionInfoRows(rows)
 }
 
+// scanSessionInfoRows scans rows from unrecovered sessions query.
+// W3L.10: Collect and return scan errors instead of silently ignoring them.
 func (m *MultiSessionWALManager) scanSessionInfoRows(rows *sql.Rows) ([]SessionWALInfo, error) {
-	var sessions []SessionWALInfo
+	// W3L.10: Pre-allocate slice with reasonable initial capacity
+	sessions := make([]SessionWALInfo, 0, 16)
+	var scanErrors []error
 
 	for rows.Next() {
 		var info SessionWALInfo
 		err := rows.Scan(&info.SessionID, &info.WALDir, &info.CreatedAt, &info.LastActive)
 		if err != nil {
+			// W3L.10: Collect scan errors for debugging instead of silently ignoring
+			scanErrors = append(scanErrors, fmt.Errorf("scan session info: %w", err))
 			continue
 		}
 		sessions = append(sessions, info)
 	}
 
-	return sessions, rows.Err()
+	// Return rows.Err() which has priority, but log scan errors if any occurred
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return sessions, rowsErr
+	}
+
+	// If we had scan errors but rows.Err() is nil, return first scan error
+	if len(scanErrors) > 0 {
+		return sessions, fmt.Errorf("partial scan failure (%d errors): %w", len(scanErrors), scanErrors[0])
+	}
+
+	return sessions, nil
 }
 
 func (m *MultiSessionWALManager) recoverSession(ctx context.Context, info SessionWALInfo) {
