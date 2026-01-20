@@ -2,9 +2,11 @@ package mitigations
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -177,4 +179,103 @@ func TestHallucinationFirewall_Metrics(t *testing.T) {
 
 	assert.Equal(t, 0, metrics.QueueDepth)
 	assert.Equal(t, 0, metrics.PendingReviews)
+}
+
+func TestHallucinationFirewall_BackgroundCleanup(t *testing.T) {
+	config := FirewallConfig{
+		MinConfidence:   0.6,
+		ReviewQueueSize: 100,
+		ReviewTTL:       50 * time.Millisecond, // Short TTL for testing
+	}
+	firewall := NewHallucinationFirewall(nil, nil, config)
+	defer firewall.Close()
+
+	// Add an item that will expire quickly
+	node := &vectorgraphdb.GraphNode{ID: "cleanup-test", Metadata: map[string]any{}}
+	verification := &VerificationResult{
+		Verified:    false,
+		Confidence:  0.5,
+		ShouldQueue: true,
+	}
+	err := firewall.Store(context.Background(), node, verification)
+	require.NoError(t, err)
+
+	// Verify item is in queue
+	queue := firewall.GetReviewQueue(10)
+	assert.Len(t, queue, 1)
+
+	// Start background cleanup with short interval
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = firewall.StartBackgroundCleanup(ctx, 25*time.Millisecond)
+	require.NoError(t, err)
+
+	// Wait for item to expire and be cleaned
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify item was cleaned up
+	metrics := firewall.GetMetrics()
+	assert.Equal(t, 0, metrics.PendingReviews)
+}
+
+func TestHallucinationFirewall_StopBackgroundCleanup_Safe(t *testing.T) {
+	firewall := NewHallucinationFirewall(nil, nil, DefaultFirewallConfig())
+
+	// Multiple calls to StopBackgroundCleanup should be safe
+	firewall.StopBackgroundCleanup()
+	firewall.StopBackgroundCleanup()
+	firewall.StopBackgroundCleanup()
+
+	// Close should also be safe
+	firewall.Close()
+}
+
+func TestHallucinationFirewall_Close_StopsCleanup(t *testing.T) {
+	firewall := NewHallucinationFirewall(nil, nil, DefaultFirewallConfig())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start cleanup
+	err := firewall.StartBackgroundCleanup(ctx, 100*time.Millisecond)
+	require.NoError(t, err)
+
+	// Close should stop cleanup without panic
+	firewall.Close()
+
+	// Additional close should be safe
+	firewall.Close()
+}
+
+func TestHallucinationFirewall_WithScope(t *testing.T) {
+	config := FirewallConfig{
+		MinConfidence:   0.6,
+		ReviewQueueSize: 100,
+		ReviewTTL:       50 * time.Millisecond,
+	}
+
+	// Create a GoroutineScope for tracking
+	pressureLevel := &atomic.Int32{}
+	budget := concurrency.NewGoroutineBudget(pressureLevel)
+	budget.RegisterAgent("test-firewall", "tester")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scope := concurrency.NewGoroutineScope(ctx, "test-firewall", budget)
+
+	// Create firewall with scope
+	firewall := NewHallucinationFirewallWithScope(nil, nil, config, scope)
+	defer firewall.Close()
+
+	// Start tracked cleanup
+	err := firewall.StartBackgroundCleanup(ctx, 25*time.Millisecond)
+	require.NoError(t, err)
+
+	// Worker should be tracked
+	assert.Equal(t, 1, scope.WorkerCount())
+
+	// Cleanup properly
+	err = scope.Shutdown(100*time.Millisecond, 500*time.Millisecond)
+	assert.NoError(t, err)
 }

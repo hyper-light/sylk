@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 	"github.com/google/uuid"
 )
@@ -19,6 +20,11 @@ type HallucinationFirewall struct {
 	pendingItems  map[string]*ReviewItem
 	reviewTTL     time.Duration
 	maxPending    int
+
+	// Background worker tracking
+	scope        *concurrency.GoroutineScope
+	cleanupStop  chan struct{}
+	cleanupOnce  sync.Once
 }
 
 // FirewallConfig configures the hallucination firewall.
@@ -50,7 +56,20 @@ func NewHallucinationFirewall(
 		pendingItems:  make(map[string]*ReviewItem),
 		reviewTTL:     config.ReviewTTL,
 		maxPending:    config.ReviewQueueSize,
+		cleanupStop:   make(chan struct{}),
 	}
+}
+
+// NewHallucinationFirewallWithScope creates a firewall with goroutine tracking.
+func NewHallucinationFirewallWithScope(
+	db *vectorgraphdb.VectorGraphDB,
+	verifier CodeVerifier,
+	config FirewallConfig,
+	scope *concurrency.GoroutineScope,
+) *HallucinationFirewall {
+	f := NewHallucinationFirewall(db, verifier, config)
+	f.scope = scope
+	return f
 }
 
 // Verify performs verification on a node before storage.
@@ -293,7 +312,50 @@ type FirewallMetrics struct {
 	RejectedCount  int `json:"rejected_count"`
 }
 
+// StartBackgroundCleanup starts a background worker to clean expired items.
+// Uses GoroutineScope if configured, otherwise runs directly.
+// The interval specifies how often to check for expired items.
+func (f *HallucinationFirewall) StartBackgroundCleanup(ctx context.Context, interval time.Duration) error {
+	if f.scope != nil {
+		return f.startTrackedCleanup(ctx, interval)
+	}
+	go f.runCleanupLoop(ctx, interval)
+	return nil
+}
+
+func (f *HallucinationFirewall) startTrackedCleanup(ctx context.Context, interval time.Duration) error {
+	return f.scope.Go("hallucination-firewall-cleanup", 0, func(workerCtx context.Context) error {
+		f.runCleanupLoop(workerCtx, interval)
+		return nil
+	})
+}
+
+func (f *HallucinationFirewall) runCleanupLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-f.cleanupStop:
+			return
+		case <-ticker.C:
+			f.CleanExpired()
+		}
+	}
+}
+
+// StopBackgroundCleanup stops the background cleanup worker.
+func (f *HallucinationFirewall) StopBackgroundCleanup() {
+	f.cleanupOnce.Do(func() {
+		close(f.cleanupStop)
+	})
+}
+
+// Close releases resources and stops background workers.
 func (f *HallucinationFirewall) Close() {
+	f.StopBackgroundCleanup()
 	f.queueMu.Lock()
 	f.pendingItems = make(map[string]*ReviewItem)
 	f.queueMu.Unlock()
