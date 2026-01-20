@@ -15,8 +15,9 @@ import (
 )
 
 // Test helpers for concurrency testing
-func newTestBudget(max int) *concurrency.GoroutineBudget {
-	return concurrency.NewGoroutineBudget(max)
+func newTestBudget() *concurrency.GoroutineBudget {
+	pressureLevel := &atomic.Int32{}
+	return concurrency.NewGoroutineBudget(pressureLevel)
 }
 
 func newTestGoroutineScope(ctx context.Context, agentID string, budget *concurrency.GoroutineBudget) *concurrency.GoroutineScope {
@@ -820,7 +821,7 @@ func TestScheduler_Submit_ReleasesSlotOnScopeError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	budget := newTestBudget(100)
+	budget := newTestBudget()
 	scope := newTestGoroutineScope(ctx, "test-agent", budget)
 
 	// Shutdown the scope so Go() returns ErrScopeShutdown
@@ -853,7 +854,7 @@ func TestScheduler_Submit_ReleasesSlotOnScopeError_Concurrent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	budget := newTestBudget(100)
+	budget := newTestBudget()
 	scope := newTestGoroutineScope(ctx, "test-agent", budget)
 
 	scheduler := dag.NewScheduler(dag.SchedulerConfig{

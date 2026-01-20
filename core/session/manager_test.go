@@ -226,3 +226,92 @@ func TestManager_SetActiveSession_UniqueStrings(t *testing.T) {
 		assert.Equal(t, s.ID(), active.ID())
 	}
 }
+
+// TestManager_Subscribe_ConcurrentSubscribeUnsubscribe verifies that
+// concurrent subscribe and unsubscribe operations are race-safe (W12.30).
+func TestManager_Subscribe_ConcurrentSubscribeUnsubscribe(t *testing.T) {
+	mgr := session.NewManager(session.DefaultManagerConfig())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var eventCount atomic.Int64
+	numGoroutines := 10
+
+	// Concurrent subscribe/unsubscribe goroutines
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					// Subscribe
+					unsubscribe := mgr.Subscribe(func(event *session.Event) {
+						eventCount.Add(1)
+					})
+
+					// Small delay to allow event emission
+					time.Sleep(time.Microsecond)
+
+					// Unsubscribe
+					unsubscribe()
+				}
+			}
+		}()
+	}
+
+	// Concurrent event emission (create sessions to trigger events)
+	for i := 0; i < numGoroutines/2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					_, _ = mgr.Create(context.Background(), session.Config{Name: "test"})
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// No assertions on count needed - the test passes if no race is detected
+	t.Logf("Events received: %d", eventCount.Load())
+}
+
+// TestManager_Subscribe_MultipleUnsubscribe verifies that calling unsubscribe
+// multiple times is safe and doesn't cause issues (W12.30).
+func TestManager_Subscribe_MultipleUnsubscribe(t *testing.T) {
+	mgr := session.NewManager(session.DefaultManagerConfig())
+
+	var eventCount atomic.Int64
+	unsubscribe := mgr.Subscribe(func(event *session.Event) {
+		eventCount.Add(1)
+	})
+
+	// Create a session to trigger event
+	_, err := mgr.Create(context.Background(), session.Config{Name: "test"})
+	require.NoError(t, err)
+
+	// Should have received the event
+	assert.Equal(t, int64(1), eventCount.Load())
+
+	// Unsubscribe multiple times - should be safe
+	unsubscribe()
+	unsubscribe()
+	unsubscribe()
+
+	// Create another session
+	_, err = mgr.Create(context.Background(), session.Config{Name: "test2"})
+	require.NoError(t, err)
+
+	// Should not receive any more events
+	assert.Equal(t, int64(1), eventCount.Load())
+}
