@@ -35296,6 +35296,162 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ REFERENCES: FIX.md "Wave 4 Implementation Analysis - Critical Fixes"             ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AG: Wave 4 New Critical Fixes (Code Review Audit)               ││
+│ │ ** Discovered via comprehensive code review of Groups 3A-4AF **                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EXECUTION WAVE 1: Foundation Concurrency (4 parallel - no dependencies)         ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] W4N.1 - AdaptiveChannel Message Loss During Resize                          ││
+│ │   FILE: core/concurrency/adaptive_channel.go:630-653                            ││
+│ │   ISSUE: Messages can be lost during aggressive downsizing (documented)         ││
+│ │   FIX: Implement safe staged drain with bounded iteration                       ││
+│ │   SEVERITY: CRITICAL - Data loss possible                                       ││
+│ │                                                                                  ││
+│ │ [ ] W4N.2 - UnboundedChannel/AdaptiveChannel Legacy Unbounded Mode              ││
+│ │   FILES: core/concurrency/adaptive_channel.go:137-138                           ││
+│ │          core/concurrency/unbounded_channel.go:99-101                           ││
+│ │   ISSUE: MaxOverflowSize=0 allows unbounded growth → memory exhaustion          ││
+│ │   FIX: Enforce minimum bound, deprecate legacy mode                             ││
+│ │   SEVERITY: CRITICAL - Memory exhaustion risk                                   ││
+│ │                                                                                  ││
+│ │ [ ] W4N.3 - GoroutineScope.waitWithTimeout Untracked Goroutines                 ││
+│ │   FILE: core/concurrency/goroutine_scope.go:199-220                             ││
+│ │   ISSUE: Spawns 2 untracked goroutines for WaitGroup timeout handling           ││
+│ │   FIX: Use single goroutine with select-based timeout, track properly           ││
+│ │   SEVERITY: CRITICAL - Goroutine leak risk                                      ││
+│ │                                                                                  ││
+│ │ [ ] W4N.4 - DualQueueGate.waitForRequests Untracked Goroutine                   ││
+│ │   FILE: core/concurrency/llm_gate.go:907-920                                    ││
+│ │   ISSUE: Spawns untracked goroutine to wait for WaitGroup                       ││
+│ │   FIX: Track via context cancellation or bounded wait pattern                   ││
+│ │   SEVERITY: CRITICAL - Goroutine leak on shutdown timeout                       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EXECUTION WAVE 2: Context/Cache Layer (4 parallel - depends on Wave 1)          ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] W4N.5 - HotCache Eviction Goroutine Not Tracked                             ││
+│ │   FILE: core/context/hot_cache.go:141-143                                       ││
+│ │   ISSUE: evictionLoop goroutine started but not tracked via WaitGroup           ││
+│ │   FIX: Add WaitGroup tracking and wait in Close()                               ││
+│ │   SEVERITY: HIGH - Goroutine not awaited on shutdown                            ││
+│ │                                                                                  ││
+│ │ [ ] W4N.6 - ObservationLog WriteQueue Backpressure                              ││
+│ │   FILE: core/context/observation_log.go:429-436                                 ││
+│ │   ISSUE: Returns error immediately on full queue, observations lost             ││
+│ │   FIX: Implement exponential backoff retry or bounded blocking                  ││
+│ │   SEVERITY: HIGH - Silent data loss during burst load                           ││
+│ │                                                                                  ││
+│ │ [ ] W4N.7 - WAL periodicSync Ignores Sync Errors                                ││
+│ │   FILE: core/context/observation_log.go:316-324                                 ││
+│ │   ISSUE: file.Sync() error silently ignored in periodicSync                     ││
+│ │   FIX: Log error or propagate to health monitoring                              ││
+│ │   SEVERITY: MEDIUM - Silent data corruption on disk errors                      ││
+│ │                                                                                  ││
+│ │ [ ] W4N.8 - HotCache Close Not Thread-Safe Against Add                          ││
+│ │   FILE: core/context/hot_cache.go:215-219                                       ││
+│ │   ISSUE: Close() races with Add() - eviction goroutine may process stale data   ││
+│ │   FIX: Add closed flag check at start of Add()                                  ││
+│ │   SEVERITY: MEDIUM - Race condition on shutdown                                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EXECUTION WAVE 3: Search/Gate Layer (4 parallel - depends on Wave 1)            ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] W4N.9 - SearchCoordinator Parallel Goroutines Untracked                     ││
+│ │   FILE: core/search/coordinator/coordinator.go:156-168                          ││
+│ │   ISSUE: Parallel search goroutines use WaitGroup but not GoroutineScope        ││
+│ │   FIX: Pass GoroutineScope to coordinator, use scope.Go() for searches          ││
+│ │   SEVERITY: HIGH - WAVE 4 tracking violation                                    ││
+│ │                                                                                  ││
+│ │ [ ] W4N.10 - SpeculativePrefetcher CancelAll Race Condition                     ││
+│ │   FILE: core/context/speculative_prefetcher.go:539-549                          ││
+│ │   ISSUE: inflightCount.Store(0) races with concurrent cleanup's Add(-1)         ││
+│ │   FIX: Cancel via context, let normal cleanup handle count                      ││
+│ │   SEVERITY: HIGH - Counter can go negative                                      ││
+│ │                                                                                  ││
+│ │ [ ] W4N.11 - LLMGate RejectPolicyBlock Sleep Loop                               ││
+│ │   FILE: core/concurrency/llm_gate.go:206-218                                    ││
+│ │   ISSUE: Releases mutex, sleeps, reacquires - queue state can change            ││
+│ │   FIX: Use proper condition variable wait instead of sleep loop                 ││
+│ │   SEVERITY: MEDIUM - Inefficient and potentially incorrect                      ││
+│ │                                                                                  ││
+│ │ [ ] W4N.12 - DualQueueGate Shutdown Drain Timeout                               ││
+│ │   FILE: core/concurrency/llm_gate.go:906-920                                    ││
+│ │   ISSUE: No hard deadline - orphaned requests can hang forever                  ││
+│ │   FIX: Add hard deadline, force-cancel and log orphaned requests                ││
+│ │   SEVERITY: MEDIUM - Shutdown can hang indefinitely                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EXECUTION WAVE 4: Data Layer (4 parallel - depends on Wave 2, 3)                ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] W4N.13 - HNSW GetVectors/GetMagnitudes Expose Internal State                ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go (GetVectors, GetMagnitudes methods)     ││
+│ │   ISSUE: Returns actual internal maps, caller can corrupt state                 ││
+│ │   FIX: Return deep copies of maps                                               ││
+│ │   SEVERITY: MEDIUM - Potential data corruption                                  ││
+│ │                                                                                  ││
+│ │ [ ] W4N.14 - HandoffManager MarshalJSON Sequential Lock Acquisition             ││
+│ │   FILE: core/handoff/manager.go:831-853                                         ││
+│ │   ISSUE: Acquires mu.RLock then contextMu.RLock - inconsistent state possible   ││
+│ │   FIX: Use single lock for entire marshal or accept eventual consistency        ││
+│ │   SEVERITY: MEDIUM - Inconsistent serialization during updates                  ││
+│ │                                                                                  ││
+│ │ [ ] W4N.15 - AsyncRetrievalFeedbackHook Untracked Background Worker             ││
+│ │   FILE: core/chunking/retrieval_feedback.go:199-200                             ││
+│ │   ISSUE: processLoop goroutine tracked via WaitGroup but not GoroutineScope     ││
+│ │   FIX: Accept GoroutineScope in config and use if provided                      ││
+│ │   SEVERITY: LOW - WAVE 4 tracking incomplete                                    ││
+│ │                                                                                  ││
+│ │ [ ] W4N.16 - ObservationLog Sequence Number Overflow Protection                 ││
+│ │   FILE: core/context/observation_log.go:445                                     ││
+│ │   ISSUE: uint64 sequence can overflow after ~18.4 quintillion observations      ││
+│ │   FIX: Document limitation or implement reset during compaction                 ││
+│ │   SEVERITY: LOW - Theoretical but should be addressed                           ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EXECUTION WAVE 5: Performance/Polish (2 parallel - depends on Wave 4)           ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] W4N.17 - HotCache EvictPercent Double Loop Performance                      ││
+│ │   FILE: core/context/hot_cache.go:256-263                                       ││
+│ │   ISSUE: Nested loop with repeated eviction attempts when target not reached    ││
+│ │   FIX: Use single-pass eviction with pre-calculated batch sizes                 ││
+│ │   SEVERITY: LOW - Performance optimization                                      ││
+│ │                                                                                  ││
+│ │ [ ] W4N.18 - Health Monitoring Hooks                                            ││
+│ │   FILES: Multiple concurrency and context files                                 ││
+│ │   ISSUE: No callbacks/metrics for message loss, queue depth, goroutine leaks    ││
+│ │   FIX: Add HealthMonitor interface with optional callbacks                      ││
+│ │   SEVERITY: LOW - Observability improvement                                     ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │                                                                                  ││
+│ │   WAVE 1 (no deps)         WAVE 2 (W1)        WAVE 3 (W1)        WAVE 4 (W2,W3) ││
+│ │   ┌──────────────┐        ┌──────────────┐   ┌──────────────┐   ┌──────────────┐││
+│ │   │ W4N.1        │───────►│ W4N.5        │   │ W4N.9        │──►│ W4N.13       │││
+│ │   │ W4N.2        │───────►│ W4N.6        │   │ W4N.10       │──►│ W4N.14       │││
+│ │   │ W4N.3        │───────►│ W4N.7        │   │ W4N.11       │──►│ W4N.15       │││
+│ │   │ W4N.4        │───────►│ W4N.8        │   │ W4N.12       │──►│ W4N.16       │││
+│ │   └──────────────┘        └──────────────┘   └──────────────┘   └──────┬───────┘││
+│ │                                                                        │        ││
+│ │                                                                        ▼        ││
+│ │                                                                 WAVE 5 (W4)     ││
+│ │                                                                ┌──────────────┐ ││
+│ │                                                                │ W4N.17       │ ││
+│ │                                                                │ W4N.18       │ ││
+│ │                                                                └──────────────┘ ││
+│ │                                                                                  ││
+│ │ TOTAL: 18 issues (4 critical, 4 high, 6 medium, 4 low)                          ││
+│ │ EXECUTION: 5 waves, max 4 parallel per wave                                     ││
+│ │ REFERENCES: Code review audit of Wave 4 Groups 3A-4AF                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
 │ ESTIMATED CAPACITY: 180-200 parallel engineer pipelines (increased for new groups) │
 │ DEPENDENCIES: Wave 3 complete, Groups 4E, 4G, 4K, 4L-4Z complete                   │
 │                                                                                     │
