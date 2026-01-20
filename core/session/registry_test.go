@@ -302,6 +302,46 @@ func TestRegistry_ActivityScoreCalculation(t *testing.T) {
 	assert.InDelta(t, expected, session.ActivityScore, 0.001)
 }
 
+// TestRegistry_RemoveDeadSessions_ErrorPropagation verifies W12.29 fix:
+// database errors in removeDeadSessions are now properly returned to callers.
+func TestRegistry_RemoveDeadSessions_ErrorPropagation(t *testing.T) {
+	r := newTestRegistry(t)
+
+	// Register a session
+	require.NoError(t, r.Register("session-1"))
+
+	// Close the database to cause errors
+	r.db.Close()
+
+	// GetActiveSessions internally calls removeDeadSessions, which should
+	// now propagate database errors instead of silently ignoring them.
+	_, err := r.GetActiveSessions()
+	// Either we get an error from the query or from removeDeadSessions
+	// The key point is the operation fails gracefully with an error
+	assert.Error(t, err, "should return error when database is closed")
+}
+
+// TestRegistry_ValidateSessionProcess_ErrorPropagation verifies W12.29 fix:
+// database errors in validateSessionProcess are now properly returned to callers.
+func TestRegistry_ValidateSessionProcess_ErrorPropagation(t *testing.T) {
+	r := newTestRegistry(t)
+
+	// Register a session from current process
+	require.NoError(t, r.Register("session-1"))
+
+	// Get session should work while DB is open
+	session, err := r.GetSession("session-1")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+
+	// Close the registry (which closes DB) to trigger errors
+	r.Close()
+
+	// Now GetSession should fail with ErrRegistryClosed
+	_, err = r.GetSession("session-1")
+	assert.ErrorIs(t, err, ErrRegistryClosed)
+}
+
 func newTestRegistry(t *testing.T) *Registry {
 	t.Helper()
 

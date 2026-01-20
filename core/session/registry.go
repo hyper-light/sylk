@@ -381,7 +381,9 @@ func (r *Registry) scanAndValidateSessions(rows *sql.Rows) ([]SessionRecord, err
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	r.removeDeadSessions(deadSessions)
+	if err := r.removeDeadSessions(deadSessions); err != nil {
+		return nil, err
+	}
 	return sessions, nil
 }
 
@@ -425,10 +427,16 @@ func (r *Registry) scanSessionRow(rows *sql.Rows) (SessionRecord, error) {
 	return record, nil
 }
 
-func (r *Registry) removeDeadSessions(sessionIDs []string) {
+// removeDeadSessions deletes sessions whose processes are no longer running.
+// Returns an error if any database delete operation fails (W12.29 fix).
+func (r *Registry) removeDeadSessions(sessionIDs []string) error {
 	for _, id := range sessionIDs {
-		r.db.Exec(`DELETE FROM sessions WHERE session_id = ?`, id)
+		_, err := r.db.Exec(`DELETE FROM sessions WHERE session_id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("failed to remove dead session %s: %w", id, err)
+		}
 	}
+	return nil
 }
 
 // GetSession returns a single session by ID
@@ -474,9 +482,15 @@ func (r *Registry) querySession(sessionID string) (*SessionRecord, error) {
 	return &record, nil
 }
 
+// validateSessionProcess checks if the session's process is still running.
+// If not, deletes the session from the database and returns ErrProcessNotRunning.
+// Returns database errors to caller for proper handling (W12.29 fix).
 func (r *Registry) validateSessionProcess(sessionID string, record *SessionRecord) (*SessionRecord, error) {
 	if !r.isProcessRunning(record.PID, record.StartTime) {
-		r.db.Exec(`DELETE FROM sessions WHERE session_id = ?`, sessionID)
+		_, err := r.db.Exec(`DELETE FROM sessions WHERE session_id = ?`, sessionID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to delete dead session %s: %w", sessionID, err)
+		}
 		return nil, ErrProcessNotRunning
 	}
 	return record, nil
@@ -509,9 +523,7 @@ func (r *Registry) cleanupDeadProcesses() error {
 	defer rows.Close()
 
 	deadSessions := r.findDeadSessions(rows)
-	r.removeDeadSessions(deadSessions)
-
-	return nil
+	return r.removeDeadSessions(deadSessions)
 }
 
 func (r *Registry) findDeadSessions(rows *sql.Rows) []string {
