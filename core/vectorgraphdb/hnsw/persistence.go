@@ -3,8 +3,8 @@ package hnsw
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"strconv"
-	"unsafe"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
@@ -93,109 +93,226 @@ func (h *Index) saveLayer(stmt *sql.Stmt, layer *layer, layerIdx int) error {
 	return nil
 }
 
+// Load loads graph structure from the database with atomic semantics.
+// W12.39: Implements atomic write with rollback - if any error occurs during
+// loading, the index state remains unchanged (no partial writes).
 func (h *Index) Load(db *sql.DB) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if err := h.loadMetadata(db); err != nil {
+	// Phase 1: Stage all data into temporary structures
+	stagedMeta, err := h.stageMetadataLoad(db)
+	if err != nil {
 		return err
 	}
 
+	stagedGraph, err := h.stageGraphLoad(db)
+	if err != nil {
+		return err
+	}
+
+	// Phase 2: Commit staged data atomically
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.commitStagedMetadata(stagedMeta)
+
 	// W4P.15: Ensure layers exist based on maxLevel from metadata.
-	// This handles the case where there are no edges (e.g., single node).
 	if h.maxLevel >= 0 {
 		h.ensureLayers(h.maxLevel)
 	}
 
-	if err := h.loadGraph(db); err != nil {
-		return err
-	}
-
+	h.commitStagedGraph(stagedGraph)
 	h.refreshDerivedFields()
 	return nil
 }
 
-func (h *Index) loadMetadata(db *sql.DB) error {
+// stagedMetadata holds metadata loaded from database before commit.
+// W12.39: Used for atomic load - data staged here until fully loaded.
+type stagedMetadata struct {
+	entryPoint  string
+	maxLevel    int
+	m           int
+	efConstruct int
+	efSearch    int
+	levelMult   float64
+}
+
+// stageMetadataLoad reads all metadata into temporary structures.
+// W12.39: On error, returns nil staged data for automatic rollback.
+func (h *Index) stageMetadataLoad(db *sql.DB) (*stagedMetadata, error) {
 	rows, err := db.Query("SELECT key, value FROM hnsw_meta")
 	if err != nil {
-		return fmt.Errorf("query metadata: %w", err)
+		return nil, fmt.Errorf("query metadata: %w", err)
 	}
 	defer rows.Close()
+
+	staged := &stagedMetadata{
+		maxLevel:    -1,
+		m:           h.M,
+		efConstruct: h.efConstruct,
+		efSearch:    h.efSearch,
+		levelMult:   h.levelMult,
+	}
 
 	for rows.Next() {
 		var key string
 		var value string
 		if err := rows.Scan(&key, &value); err != nil {
-			return fmt.Errorf("scan metadata: %w", err)
+			return nil, fmt.Errorf("scan metadata: %w", err)
 		}
-		h.applyMetaValue(key, value)
+		h.applyStagedMetaValue(key, value, staged)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate metadata: %w", err)
+		return nil, fmt.Errorf("iterate metadata: %w", err)
 	}
-	return nil
+	return staged, nil
 }
 
-func (h *Index) loadGraph(db *sql.DB) error {
+// applyStagedMetaValue applies a metadata value to staging area.
+// W12.39: Writes to staging only, not to index state.
+func (h *Index) applyStagedMetaValue(key, value string, staged *stagedMetadata) {
+	switch key {
+	case "entry_point":
+		staged.entryPoint = value
+	case "max_level":
+		staged.maxLevel = parseIntDefault(value, -1)
+	case "m":
+		staged.m = parseIntDefault(value, staged.m)
+	case "ef_construct":
+		staged.efConstruct = parseIntDefault(value, staged.efConstruct)
+	case "ef_search":
+		staged.efSearch = parseIntDefault(value, staged.efSearch)
+	case "level_mult":
+		staged.levelMult = parseFloatDefault(value, staged.levelMult)
+	}
+}
+
+// commitStagedMetadata transfers staged metadata to the index.
+// W12.39: Called only after all data successfully loaded into staging.
+// Caller must hold h.mu (write lock).
+func (h *Index) commitStagedMetadata(staged *stagedMetadata) {
+	h.entryPoint = staged.entryPoint
+	h.maxLevel = staged.maxLevel
+	h.M = staged.m
+	h.efConstruct = staged.efConstruct
+	h.efSearch = staged.efSearch
+	h.levelMult = staged.levelMult
+}
+
+// stagedGraphEdge represents a single edge to be added to the graph.
+// W12.39: Used for atomic graph load.
+type stagedGraphEdge struct {
+	sourceID string
+	targetID string
+	level    int
+}
+
+// stageGraphLoad reads all graph edges into temporary structures.
+// W12.39: On error, returns nil staged data for automatic rollback.
+func (h *Index) stageGraphLoad(db *sql.DB) ([]stagedGraphEdge, error) {
 	rows, err := db.Query(`SELECT source_id, target_id, level FROM hnsw_edges ORDER BY level`)
 	if err != nil {
-		return fmt.Errorf("query graph: %w", err)
+		return nil, fmt.Errorf("query graph: %w", err)
 	}
 	defer rows.Close()
 
+	var staged []stagedGraphEdge
 	for rows.Next() {
-		if err := h.loadGraphRow(rows); err != nil {
-			return err
+		edge, err := h.stageGraphRow(rows)
+		if err != nil {
+			return nil, err
 		}
-	}
-	return rows.Err()
-}
-
-func (h *Index) loadGraphRow(rows *sql.Rows) error {
-	var sourceID string
-	var targetID string
-	var level int
-
-	if err := rows.Scan(&sourceID, &targetID, &level); err != nil {
-		return fmt.Errorf("scan graph row: %w", err)
-	}
-
-	h.ensureLayers(level)
-	h.layers[level].addNode(sourceID)
-	h.layers[level].addNode(targetID)
-	h.layers[level].addNeighbor(sourceID, targetID, 0, h.maxNeighborsForLevel(level))
-	return nil
-}
-
-func (h *Index) LoadVectors(db *sql.DB) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	rows, err := db.Query(`
-		SELECT v.node_id, v.embedding, v.magnitude, n.domain, n.node_type
-		FROM vectors v
-		JOIN nodes n ON v.node_id = n.id
-	`)
-	if err != nil {
-		return fmt.Errorf("query vectors: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		if err := h.loadVectorRow(rows); err != nil {
-			return err
-		}
+		staged = append(staged, edge)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate graph rows: %w", err)
+	}
+	return staged, nil
+}
+
+// stageGraphRow reads a single graph row into staged data.
+// W12.39: Returns edge data without modifying index state.
+func (h *Index) stageGraphRow(rows *sql.Rows) (stagedGraphEdge, error) {
+	var edge stagedGraphEdge
+	if err := rows.Scan(&edge.sourceID, &edge.targetID, &edge.level); err != nil {
+		return stagedGraphEdge{}, fmt.Errorf("scan graph row: %w", err)
+	}
+	return edge, nil
+}
+
+// commitStagedGraph transfers staged graph edges to the index.
+// W12.39: Called only after all data successfully loaded into staging.
+// Caller must hold h.mu (write lock).
+func (h *Index) commitStagedGraph(staged []stagedGraphEdge) {
+	for _, edge := range staged {
+		h.ensureLayers(edge.level)
+		h.layers[edge.level].addNode(edge.sourceID)
+		h.layers[edge.level].addNode(edge.targetID)
+		h.layers[edge.level].addNeighbor(edge.sourceID, edge.targetID, 0, h.maxNeighborsForLevel(edge.level))
+	}
+}
+
+// LoadVectors loads vectors from the database with atomic semantics.
+// W12.39: Implements atomic write with rollback - if any error occurs during
+// loading, the index state remains unchanged (no partial writes).
+func (h *Index) LoadVectors(db *sql.DB) error {
+	// Phase 1: Load all data into temporary structures
+	staged, err := h.stageVectorLoad(db)
+	if err != nil {
 		return err
 	}
+
+	// Phase 2: Commit staged data atomically
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.commitStagedVectors(staged)
 
 	// W4P.15: Recompute edge distances after loading vectors
 	h.recomputeEdgeDistances()
 	return nil
 }
 
-func (h *Index) loadVectorRow(rows *sql.Rows) error {
+// stagedVectorData holds vector data loaded from database before commit.
+// W12.39: Used for atomic load - data staged here until fully loaded.
+type stagedVectorData struct {
+	vectors    map[string][]float32
+	magnitudes map[string]float64
+	domains    map[string]vectorgraphdb.Domain
+	nodeTypes  map[string]vectorgraphdb.NodeType
+}
+
+// stageVectorLoad reads all vector data into temporary structures.
+// W12.39: On error, returns nil staged data for automatic rollback.
+func (h *Index) stageVectorLoad(db *sql.DB) (*stagedVectorData, error) {
+	rows, err := db.Query(`
+		SELECT v.node_id, v.embedding, v.magnitude, n.domain, n.node_type
+		FROM vectors v
+		JOIN nodes n ON v.node_id = n.id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query vectors: %w", err)
+	}
+	defer rows.Close()
+
+	staged := &stagedVectorData{
+		vectors:    make(map[string][]float32),
+		magnitudes: make(map[string]float64),
+		domains:    make(map[string]vectorgraphdb.Domain),
+		nodeTypes:  make(map[string]vectorgraphdb.NodeType),
+	}
+
+	for rows.Next() {
+		if err := h.stageVectorRow(rows, staged); err != nil {
+			return nil, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate vector rows: %w", err)
+	}
+	return staged, nil
+}
+
+// stageVectorRow reads a single vector row into staged data.
+// W12.39: Writes to staging area only, not to index state.
+func (h *Index) stageVectorRow(rows *sql.Rows, staged *stagedVectorData) error {
 	var nodeID string
 	var embeddingBlob []byte
 	var magnitude float64
@@ -207,11 +324,29 @@ func (h *Index) loadVectorRow(rows *sql.Rows) error {
 	}
 
 	embedding := bytesToFloat32s(embeddingBlob)
-	h.vectors[nodeID] = embedding
-	h.magnitudes[nodeID] = magnitude
-	h.domains[nodeID] = vectorgraphdb.Domain(domain)
-	h.nodeTypes[nodeID] = vectorgraphdb.NodeType(nodeType)
+	staged.vectors[nodeID] = embedding
+	staged.magnitudes[nodeID] = magnitude
+	staged.domains[nodeID] = vectorgraphdb.Domain(domain)
+	staged.nodeTypes[nodeID] = vectorgraphdb.NodeType(nodeType)
 	return nil
+}
+
+// commitStagedVectors transfers staged vector data to the index.
+// W12.39: Called only after all data successfully loaded into staging.
+// Caller must hold h.mu (write lock).
+func (h *Index) commitStagedVectors(staged *stagedVectorData) {
+	for nodeID, vec := range staged.vectors {
+		h.vectors[nodeID] = vec
+	}
+	for nodeID, mag := range staged.magnitudes {
+		h.magnitudes[nodeID] = mag
+	}
+	for nodeID, domain := range staged.domains {
+		h.domains[nodeID] = domain
+	}
+	for nodeID, nodeType := range staged.nodeTypes {
+		h.nodeTypes[nodeID] = nodeType
+	}
 }
 
 // recomputeEdgeDistances recalculates all edge distances using stored vectors.
@@ -311,25 +446,6 @@ func (h *Index) ensureMetaKeys(tx *sql.Tx) error {
 	return nil
 }
 
-func (h *Index) applyMetaValue(key, value string) {
-	switch key {
-	case "entry_point":
-		h.entryPoint = value
-	case "max_level":
-		h.maxLevel = parseIntDefault(value, -1)
-	case "m":
-		h.M = parseIntDefault(value, h.M)
-	case "ef_construct":
-		h.efConstruct = parseIntDefault(value, h.efConstruct)
-	case "ef_search":
-		h.efSearch = parseIntDefault(value, h.efSearch)
-	case "level_mult":
-		h.levelMult = parseFloatDefault(value, h.levelMult)
-	case "total_nodes":
-		return
-	}
-}
-
 func (h *Index) refreshDerivedFields() {
 	maxLevel := -1
 	for level, layer := range h.layers {
@@ -385,8 +501,10 @@ func bytesToFloat32s(b []byte) []float32 {
 	return result
 }
 
+// float32FromBits converts a uint32 to float32.
+// W12.35: Uses math.Float32frombits instead of unsafe pointer cast for type safety.
 func float32FromBits(b uint32) float32 {
-	return *(*float32)(unsafe.Pointer(&b))
+	return math.Float32frombits(b)
 }
 
 func float32ToBytes(f []float32) []byte {
@@ -401,6 +519,8 @@ func float32ToBytes(f []float32) []byte {
 	return result
 }
 
+// float32ToBits converts a float32 to uint32.
+// W12.35: Uses math.Float32bits instead of unsafe pointer cast for type safety.
 func float32ToBits(f float32) uint32 {
-	return *(*uint32)(unsafe.Pointer(&f))
+	return math.Float32bits(f)
 }
