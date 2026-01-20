@@ -303,7 +303,8 @@ func (m *Manager) ignoreInvalidTransition(err error) error {
 }
 
 func (m *Manager) setActiveSession(id string) {
-	m.activeID.Store(&id)
+	idCopy := id
+	m.activeID.Store(&idCopy)
 }
 
 func (m *Manager) emitSwitchEvent(id string) {
