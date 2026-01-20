@@ -14,6 +14,21 @@ const DefaultVersionCacheSize = 10000
 // VersionedNodeStore wraps NodeStore with optimistic concurrency control.
 // It maintains an LRU version cache for fast validation of node versions
 // with bounded memory usage.
+//
+// # Optimistic Concurrency Control
+//
+// VersionedNodeStore enables optimistic concurrency control by tracking
+// node versions. Before updating a node, clients should:
+// 1. Read the node with GetNodeWithVersion to get the current version
+// 2. Perform local modifications
+// 3. Attempt update with the expected version
+// 4. Retry from step 1 if version mismatch occurs
+//
+// # Cache Behavior
+//
+// The LRU cache bounds memory usage while providing fast version lookups.
+// Cache entries are invalidated after writes via InvalidateVersionCache.
+// The cache size is configurable via NewVersionedNodeStoreWithSize.
 type VersionedNodeStore struct {
 	*NodeStore
 	cache *lru.Cache[string, uint64]
@@ -69,7 +84,7 @@ func (store *VersionedNodeStore) fetchAndCacheVersion(nodeID string) (uint64, er
 	var version uint64
 	err := store.db.db.QueryRow("SELECT version FROM nodes WHERE id = ?", nodeID).Scan(&version)
 	if err != nil {
-		return 0, fmt.Errorf("get version: %w", err)
+		return 0, fmt.Errorf("get version for node %s: %w", nodeID, err)
 	}
 
 	store.cache.Add(nodeID, version)

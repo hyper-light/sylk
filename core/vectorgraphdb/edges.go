@@ -15,10 +15,20 @@ var (
 	ErrEdgeEndpointMissing = errors.New("edge endpoint node not found")
 )
 
+// EdgeStore provides CRUD operations for graph edges in VectorGraphDB.
+// It manages relationships between nodes with support for edge types,
+// weights, and cross-domain validation.
+//
+// Thread Safety: EdgeStore operations are thread-safe through the underlying
+// VectorGraphDB implementation.
+//
+// Cross-Domain Edges: Edges between nodes in different domains are validated
+// against allowed cross-domain edge type rules.
 type EdgeStore struct {
 	db *VectorGraphDB
 }
 
+// NewEdgeStore creates a new EdgeStore with the given database.
 func NewEdgeStore(db *VectorGraphDB) *EdgeStore {
 	return &EdgeStore{db: db}
 }
@@ -88,11 +98,11 @@ func (es *EdgeStore) insertEdgeRow(edge *GraphEdge) error {
 	`, edge.SourceID, edge.TargetID, edge.EdgeType, edge.Weight,
 		string(metadata), edge.CreatedAt.Format(time.RFC3339))
 	if err != nil {
-		return fmt.Errorf("insert edge: %w", err)
+		return fmt.Errorf("insert edge from %s to %s (type=%v): %w", edge.SourceID, edge.TargetID, edge.EdgeType, err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
-		return fmt.Errorf("fetch edge id: %w", err)
+		return fmt.Errorf("fetch edge id for %s->%s: %w", edge.SourceID, edge.TargetID, err)
 	}
 	edge.ID = id
 	return nil
@@ -261,7 +271,7 @@ func (es *EdgeStore) getIncomingEdgesFiltered(nodeID string, edgeTypes []EdgeTyp
 func (es *EdgeStore) DeleteEdge(id int64) error {
 	result, err := es.db.db.Exec("DELETE FROM edges WHERE id = ?", id)
 	if err != nil {
-		return fmt.Errorf("delete edge: %w", err)
+		return fmt.Errorf("delete edge id=%d: %w", id, err)
 	}
 
 	rows, _ := result.RowsAffected()
@@ -274,7 +284,7 @@ func (es *EdgeStore) DeleteEdge(id int64) error {
 func (es *EdgeStore) DeleteEdgesBetween(fromID, toID string) error {
 	_, err := es.db.db.Exec("DELETE FROM edges WHERE source_id = ? AND target_id = ?", fromID, toID)
 	if err != nil {
-		return fmt.Errorf("delete edges: %w", err)
+		return fmt.Errorf("delete edges from %s to %s: %w", fromID, toID, err)
 	}
 	return nil
 }

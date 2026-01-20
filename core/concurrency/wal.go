@@ -1,3 +1,36 @@
+// Package concurrency provides concurrency primitives for the Sylk application,
+// including a Write-Ahead Log (WAL) implementation for durability and crash recovery.
+//
+// # Write-Ahead Log (WAL)
+//
+// The WAL provides durability guarantees by persisting operations to disk before
+// they are applied to the main data store. This enables recovery after crashes
+// by replaying the log entries.
+//
+// ## WAL Protocol
+//
+// 1. Append: Each operation is first written to the WAL with a unique sequence number
+// 2. Sync: Depending on SyncMode, data is fsynced to disk (immediately, batched, or periodically)
+// 3. Apply: The operation is then applied to the main data store
+// 4. Truncate: Old WAL segments can be removed after successful checkpointing
+//
+// ## Recovery Process
+//
+// On startup, the WAL reads existing segments and provides entries for replay:
+// 1. List all WAL segments in sequence order
+// 2. Read entries from the last checkpoint sequence
+// 3. Replay entries to restore state
+//
+// ## Segment Management
+//
+// The WAL uses segmented files (wal-{sequence}.log) to bound file sizes and
+// enable efficient truncation. New segments are created when MaxSegmentSize is reached.
+//
+// ## Sync Modes
+//
+// - SyncEveryWrite: Fsync after each write (safest, slowest)
+// - SyncBatched: Fsync after SyncInterval elapses (balanced)
+// - SyncPeriodic: Background goroutine performs periodic fsync (fastest, least safe)
 package concurrency
 
 import (
@@ -215,7 +248,7 @@ func (w *WriteAheadLog) openCurrentSegment() error {
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open segment: %w", err)
+		return fmt.Errorf("failed to open segment %d at %s: %w", w.segmentSeq, path, err)
 	}
 
 	return w.initializeSegment(file)
@@ -225,7 +258,7 @@ func (w *WriteAheadLog) initializeSegment(file *os.File) error {
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
-		return fmt.Errorf("failed to stat segment: %w", err)
+		return fmt.Errorf("failed to stat segment %d at %s: %w", w.segmentSeq, file.Name(), err)
 	}
 
 	w.currentFile = file
@@ -274,7 +307,7 @@ func (w *WriteAheadLog) rotateIfNeeded(dataLen int) error {
 
 func (w *WriteAheadLog) writeEntry(data []byte) error {
 	if _, err := w.writer.Write(data); err != nil {
-		return fmt.Errorf("failed to write entry: %w", err)
+		return fmt.Errorf("failed to write entry seq=%d to segment %d: %w", w.sequence, w.segmentSeq, err)
 	}
 	w.segmentSize += int64(len(data))
 	w.pendingSync.Store(true)
@@ -303,8 +336,9 @@ func (w *WriteAheadLog) rotateSegment() error {
 		return err
 	}
 
+	oldSegment := w.segmentSeq
 	if err := w.currentFile.Close(); err != nil {
-		return err
+		return fmt.Errorf("failed to close segment %d during rotation: %w", oldSegment, err)
 	}
 
 	w.segmentSeq++
@@ -339,14 +373,14 @@ func (w *WriteAheadLog) syncWithDoubleBuffer() error {
 	w.mu.Lock()
 	if err := w.writer.Flush(); err != nil {
 		w.mu.Unlock()
-		return fmt.Errorf("failed to flush writer: %w", err)
+		return fmt.Errorf("failed to flush writer for segment %d: %w", w.segmentSeq, err)
 	}
 	w.pendingSync.Store(false)
 	w.mu.Unlock()
 
 	// Perform fsync outside write lock
 	if err := w.currentFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync file: %w", err)
+		return fmt.Errorf("failed to sync segment %d to disk: %w", w.segmentSeq, err)
 	}
 
 	w.mu.Lock()
@@ -364,11 +398,11 @@ func (w *WriteAheadLog) syncLocked() error {
 	}
 
 	if err := w.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush writer: %w", err)
+		return fmt.Errorf("failed to flush writer for segment %d: %w", w.segmentSeq, err)
 	}
 
 	if err := w.currentFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync file: %w", err)
+		return fmt.Errorf("failed to sync segment %d to disk: %w", w.segmentSeq, err)
 	}
 
 	w.pendingSync.Store(false)

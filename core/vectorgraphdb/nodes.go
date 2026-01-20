@@ -20,17 +20,30 @@ var (
 	ErrEmbeddingMissing = errors.New("embedding required for node")
 )
 
+// HNSWInserter defines the interface for HNSW index operations.
+// This abstraction allows the NodeStore to insert/delete vectors
+// without direct dependency on the HNSW implementation.
 type HNSWInserter interface {
 	Insert(id string, vector []float32, domain Domain, nodeType NodeType) error
 	Delete(id string) error
 	DeleteBatch(ids []string) error
 }
 
+// NodeStore provides CRUD operations for graph nodes in VectorGraphDB.
+// It manages both the SQLite persistence and HNSW vector index synchronization.
+//
+// Thread Safety: NodeStore operations are thread-safe through the underlying
+// VectorGraphDB and HNSW index implementations.
+//
+// Consistency: Node insertions are performed in a transaction with the embedding,
+// followed by HNSW index insertion. HNSW failures do not roll back the database.
 type NodeStore struct {
 	db   *VectorGraphDB
 	hnsw HNSWInserter
 }
 
+// NewNodeStore creates a new NodeStore with the given database and optional HNSW index.
+// If hnswIndex is nil, vector operations will be skipped.
 func NewNodeStore(db *VectorGraphDB, hnswIndex HNSWInserter) *NodeStore {
 	return &NodeStore{db: db, hnsw: hnswIndex}
 }
@@ -117,7 +130,7 @@ func (ns *NodeStore) insertNodeRow(tx *sql.Tx, node *GraphNode) error {
 		node.Verified, nullInt(int(node.VerificationType)), nullFloat(node.Confidence), nullInt(int(node.TrustLevel)),
 		node.CreatedAt.Format(time.RFC3339), node.UpdatedAt.Format(time.RFC3339), nullTime(node.ExpiresAt), nullString(node.SupersededBy))
 	if err != nil {
-		return fmt.Errorf("insert node: %w", err)
+		return fmt.Errorf("insert node %s (domain=%v, type=%v): %w", node.ID, node.Domain, node.NodeType, err)
 	}
 	return nil
 }
@@ -130,7 +143,7 @@ func (ns *NodeStore) insertEmbedding(tx *sql.Tx, nodeID string, embedding []floa
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, nodeID, blob, mag, EmbeddingDimension, domain, nodeType)
 	if err != nil {
-		return fmt.Errorf("insert embedding: %w", err)
+		return fmt.Errorf("insert embedding for node %s (dims=%d): %w", nodeID, len(embedding), err)
 	}
 	return nil
 }
@@ -248,7 +261,7 @@ func (ns *NodeStore) updateNodeRow(node *GraphNode) error {
 		node.Verified, nullInt(int(node.VerificationType)), nullFloat(node.Confidence), nullInt(int(node.TrustLevel)),
 		node.UpdatedAt.Format(time.RFC3339), nullTime(node.ExpiresAt), nullString(node.SupersededBy), node.ID)
 	if err != nil {
-		return fmt.Errorf("update node: %w", err)
+		return fmt.Errorf("update node %s: %w", node.ID, err)
 	}
 
 	rows, _ := result.RowsAffected()

@@ -1,3 +1,30 @@
+// Package session provides session management for the Sylk application,
+// including multi-session WAL (Write-Ahead Log) management for durability.
+//
+// # Multi-Session WAL Manager
+//
+// The MultiSessionWALManager coordinates WAL instances across multiple sessions,
+// providing isolation and recovery capabilities for each session independently.
+//
+// ## Session Isolation
+//
+// Each session maintains its own WAL directory under the base directory:
+//
+//	{BaseDir}/{sessionID}/wal/
+//
+// This ensures that session data is isolated and can be recovered independently.
+//
+// ## Recovery
+//
+// On startup, the manager can recover all sessions that were not properly closed:
+// 1. Query the metadata database for unrecovered sessions
+// 2. Open each session's WAL
+// 3. Mark sessions as recovered after successful initialization
+//
+// ## Metadata Storage
+//
+// Session metadata (creation time, last activity, recovery status) is stored
+// in a shared SQLite database at {SharedDBDir}/wal_metadata.db.
 package session
 
 import (
@@ -135,16 +162,16 @@ func (m *MultiSessionWALManager) createSessionWAL(sessionID string) (*concurrenc
 	walDir := m.getSessionWALDir(sessionID)
 
 	if err := os.MkdirAll(walDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create WAL dir: %w", err)
+		return nil, fmt.Errorf("failed to create WAL dir for session %s at %s: %w", sessionID, walDir, err)
 	}
 
 	if err := m.registerSession(sessionID, walDir); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to register session %s: %w", sessionID, err)
 	}
 
 	wal, err := m.openWAL(walDir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open WAL for session %s at %s: %w", sessionID, walDir, err)
 	}
 
 	m.sessionWALs[sessionID] = wal
@@ -162,7 +189,10 @@ func (m *MultiSessionWALManager) registerSession(sessionID string, walDir string
 		VALUES (?, ?, ?, ?, 0)
 		ON CONFLICT (session_id) DO UPDATE SET last_active = ?
 	`, sessionID, walDir, now, now, now)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to insert/update session_wals for session %s: %w", sessionID, err)
+	}
+	return nil
 }
 
 func (m *MultiSessionWALManager) openWAL(walDir string) (*concurrency.WriteAheadLog, error) {
@@ -356,11 +386,14 @@ func (m *MultiSessionWALManager) RemoveSession(sessionID string) error {
 
 	_, err := m.db.Exec(`DELETE FROM session_wals WHERE session_id = ?`, sessionID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete session %s from metadata: %w", sessionID, err)
 	}
 
 	sessionDir := filepath.Join(m.config.BaseDir, sessionID)
-	return os.RemoveAll(sessionDir)
+	if err := os.RemoveAll(sessionDir); err != nil {
+		return fmt.Errorf("failed to remove session directory %s: %w", sessionDir, err)
+	}
+	return nil
 }
 
 func (m *MultiSessionWALManager) ActiveSessionCount() int {

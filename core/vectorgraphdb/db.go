@@ -45,7 +45,7 @@ func OpenWithConfig(config DBConfig) (*VectorGraphDB, error) {
 
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("failed to open database at %s: %w", config.Path, err)
 	}
 
 	db.SetMaxOpenConns(config.MaxOpenConns)
@@ -54,7 +54,7 @@ func OpenWithConfig(config DBConfig) (*VectorGraphDB, error) {
 
 	if err := db.Ping(); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to ping database: %w", err)
+		return nil, fmt.Errorf("failed to ping database at %s: %w", config.Path, err)
 	}
 
 	vgdb := &VectorGraphDB{
@@ -64,7 +64,7 @@ func OpenWithConfig(config DBConfig) (*VectorGraphDB, error) {
 
 	if err := vgdb.Migrate(); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to migrate database: %w", err)
+		return nil, fmt.Errorf("failed to migrate database at %s: %w", config.Path, err)
 	}
 
 	return vgdb, nil
@@ -87,7 +87,7 @@ func (v *VectorGraphDB) Migrate() error {
 
 	_, err := v.db.Exec(schemaSQL)
 	if err != nil {
-		return fmt.Errorf("failed to execute schema: %w", err)
+		return fmt.Errorf("failed to execute schema on %s: %w", v.path, err)
 	}
 
 	return nil
@@ -120,7 +120,7 @@ func (v *VectorGraphDB) Vacuum() error {
 
 	_, err := v.db.Exec("VACUUM")
 	if err != nil {
-		return fmt.Errorf("failed to vacuum database: %w", err)
+		return fmt.Errorf("failed to vacuum database at %s: %w", v.path, err)
 	}
 
 	return nil
@@ -255,7 +255,7 @@ func (v *VectorGraphDB) GetSchemaVersion() (int, error) {
 	var version int
 	err := v.db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get schema version: %w", err)
+		return 0, fmt.Errorf("failed to get schema version from %s: %w", v.path, err)
 	}
 	return version, nil
 }
