@@ -37254,7 +37254,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Release lock before waiting, reacquire after                             ││
 │ │   SEVERITY: CRITICAL - Deadlock                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W12.16 - Queue Channel Leak                                                 ││
+│ │ [x] W12.16 - Queue Channel Leak                                                 ││
 │ │   FILE: core/llm/queue.go:139-149                                               ││
 │ │   ISSUE: startContextWatcher creates channel that's never closed on cancel      ││
 │ │   FIX: Ensure channel cleanup on context cancellation                           ││
