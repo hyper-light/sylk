@@ -37156,7 +37156,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add backpressure handling or error return for dropped messages           ││
 │ │   SEVERITY: CRITICAL - Silent message loss                                      ││
 │ │                                                                                  ││
-│ │ [ ] W12.3 - ChannelBus Untracked Async Handlers                                 ││
+│ │ [x] W12.3 - ChannelBus Untracked Async Handlers                                 ││
 │ │   FILE: agents/guide/channel_bus.go:217-219                                     ││
 │ │   ISSUE: go func() for handlers not tracked, no cleanup on shutdown             ││
 │ │   FIX: Use GoroutineScope or WaitGroup for handler goroutines                   ││
@@ -37213,7 +37213,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1D - VECTORGRAPHDB CORE (3 CRITICAL)                                      ││
 │ │                                                                                  ││
-│ │ [ ] W12.10 - HNSW Persistence Deadlock                                          ││
+│ │ [x] W12.10 - HNSW Persistence Deadlock                                          ││
 │ │   FILE: core/vectorgraphdb/hnsw/persistence.go:219-263                          ││
 │ │   ISSUE: recomputeEdgeDistances holds mutex while calling methods that also lock││
 │ │   FIX: Restructure to release lock before calling other methods                 ││
