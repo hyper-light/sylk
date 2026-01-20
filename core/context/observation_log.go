@@ -27,6 +27,19 @@ import (
 // DefaultObservationBufferSize is the buffer size for the observation channel.
 const DefaultObservationBufferSize = 100
 
+// SequenceOverflowThreshold is the sequence value at which we log overflow warnings.
+// Set to MaxUint64 - 1 million to give advance warning before overflow.
+// At this threshold, Compact() should be called to reset sequence numbers.
+//
+// LIMITATION: The uint64 sequence number can theoretically overflow after
+// ~18.4 quintillion observations (2^64 - 1). In practice, at 10 million
+// observations per second, this would take ~58,000 years. However, we add
+// protection to:
+//   - Log warnings when approaching the threshold
+//   - Reset sequences during Compact() (already implemented)
+//   - Error if an overflow would actually occur
+const SequenceOverflowThreshold = ^uint64(0) - 1_000_000
+
 // DefaultFlushInterval is the default interval for flushing the WAL.
 const DefaultFlushInterval = 100 * time.Millisecond
 
@@ -39,6 +52,7 @@ var (
 	ErrInvalidObservation       = errors.New("invalid observation")
 	ErrWriteQueueFull           = errors.New("write queue is full")
 	ErrWriteQueueRetryExhausted = errors.New("write queue retry attempts exhausted")
+	ErrSequenceOverflow         = errors.New("sequence number would overflow; call Compact() to reset")
 )
 
 // DefaultWriteQueueSize is the default size of the async write queue.
@@ -504,11 +518,11 @@ func (l *ObservationLog) Record(ctx context.Context, obs *EpisodeObservation) er
 }
 
 func (l *ObservationLog) writeToWAL(ctx context.Context, obs *EpisodeObservation) error {
-	// Step 1: Assign sequence under lock (fast)
-	l.mu.Lock()
-	seq := l.sequence + 1
-	l.sequence = seq
-	l.mu.Unlock()
+	// Step 1: Assign sequence under lock with overflow protection (fast)
+	seq, err := l.incrementSequence()
+	if err != nil {
+		return err
+	}
 
 	// Step 2: Serialize outside lock (can be slow, doesn't block other operations)
 	data, err := l.serializeObservation(seq, obs)
@@ -518,6 +532,32 @@ func (l *ObservationLog) writeToWAL(ctx context.Context, obs *EpisodeObservation
 
 	// Step 3: Queue for async write with backoff retry
 	return l.enqueueWithBackoff(ctx, data, seq)
+}
+
+// incrementSequence safely increments the sequence number with overflow protection.
+// Returns ErrSequenceOverflow if increment would cause overflow.
+// Logs a warning when sequence approaches the overflow threshold.
+func (l *ObservationLog) incrementSequence() (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Check for imminent overflow (at max uint64)
+	if l.sequence == ^uint64(0) {
+		return 0, ErrSequenceOverflow
+	}
+
+	seq := l.sequence + 1
+	l.sequence = seq
+
+	// Log warning when approaching threshold (only once per threshold crossing)
+	if seq == SequenceOverflowThreshold {
+		l.logger.Warn("sequence number approaching overflow threshold",
+			slog.Uint64("sequence", seq),
+			slog.String("action", "call Compact() to reset sequence numbers"),
+		)
+	}
+
+	return seq, nil
 }
 
 // serializeObservation converts an observation to JSON bytes.
@@ -625,7 +665,21 @@ func (l *ObservationLog) writeToWALSync(obs *EpisodeObservation) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// Check for imminent overflow
+	if l.sequence == ^uint64(0) {
+		return ErrSequenceOverflow
+	}
+
 	l.sequence++
+
+	// Log warning when approaching threshold
+	if l.sequence == SequenceOverflowThreshold {
+		l.logger.Warn("sequence number approaching overflow threshold",
+			slog.Uint64("sequence", l.sequence),
+			slog.String("action", "call Compact() to reset sequence numbers"),
+		)
+	}
+
 	logged := LoggedObservation{
 		Sequence:    l.sequence,
 		Timestamp:   time.Now(),
