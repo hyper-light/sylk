@@ -385,7 +385,8 @@ func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputToken
 // Note: Uses EventTypeLLMResponse with OutcomeFailure to indicate an error.
 // This design allows subscribers filtering by EventTypeLLMResponse to capture
 // both successful responses and errors, while the Outcome field distinguishes them.
-func (p *LLMPublisher) PublishLLMError(model string, err error, errContext string) error {
+// The err parameter can be nil, in which case an empty error string is recorded.
+func (p *LLMPublisher) PublishLLMError(model string, err error, context string) error {
 	if p.bus == nil {
 		return ErrNilBus
 	}
@@ -393,11 +394,9 @@ func (p *LLMPublisher) PublishLLMError(model string, err error, errContext strin
 	var errMsg string
 	if err != nil {
 		errMsg = err.Error()
-	} else {
-		errMsg = "unknown error"
 	}
 
-	content := fmt.Sprintf("LLM error: model=%s, error=%s, context=%s", model, errMsg, errContext)
+	content := fmt.Sprintf("LLM error: model=%s, error=%s, context=%s", model, errMsg, context)
 
 	event := NewActivityEvent(EventTypeLLMResponse, p.sessionID, content)
 	event.AgentID = p.agentID
@@ -407,7 +406,7 @@ func (p *LLMPublisher) PublishLLMError(model string, err error, errContext strin
 
 	event.Data["model"] = model
 	event.Data["error"] = errMsg
-	event.Data["error_context"] = errContext
+	event.Data["context"] = context
 
 	p.bus.Publish(event)
 	return nil
