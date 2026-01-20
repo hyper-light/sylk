@@ -103,6 +103,10 @@ var (
 
 	// ErrCoordinatorClosed indicates the coordinator has been closed.
 	ErrCoordinatorClosed = errors.New("coordinator is closed")
+
+	// ErrSearchQueueFull indicates the search request queue is at capacity.
+	// W4M.16: Fail-fast when backpressure threshold is exceeded.
+	ErrSearchQueueFull = errors.New("search queue at capacity, try again later")
 )
 
 // =============================================================================
@@ -415,6 +419,10 @@ type CoordinatorConfig struct {
 
 	// MaxConcurrentSearches limits concurrent search operations.
 	MaxConcurrentSearches int
+
+	// EnableBackpressure enables fail-fast when semaphore is full.
+	// W4M.16: When true, returns ErrSearchQueueFull instead of blocking.
+	EnableBackpressure bool
 }
 
 // DefaultCoordinatorConfig returns sensible default configuration.

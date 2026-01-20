@@ -850,3 +850,206 @@ func (m *mockVectorSearcherWithCapture) Search(ctx context.Context, vector []flo
 	}
 	return m.results, m.err
 }
+
+// =============================================================================
+// Backpressure Tests (W4M.16)
+// =============================================================================
+
+func TestSearchCoordinator_Backpressure_Enabled(t *testing.T) {
+	bleve := &mockBleveSearcher{
+		isOpen: true,
+		delay:  100 * time.Millisecond, // Slow to allow queue to fill
+		results: &search.SearchResult{
+			Documents: []search.ScoredDocument{
+				{Document: search.Document{ID: "doc1"}, Score: 1.0},
+			},
+		},
+	}
+
+	vector := &mockVectorSearcher{
+		delay: 100 * time.Millisecond,
+		results: []ScoredVectorResult{
+			{ID: "doc2", Score: 0.9},
+		},
+	}
+
+	embedder := &mockEmbeddingGenerator{embedding: []float32{0.1}}
+
+	config := CoordinatorConfig{
+		MaxConcurrentSearches: 2,    // Very limited capacity
+		EnableBackpressure:    true, // Enable fail-fast
+		DefaultTimeout:        5 * time.Second,
+		RRFK:                  60,
+		EnableFallback:        true,
+	}
+
+	coord := NewSearchCoordinatorWithConfig(bleve, vector, embedder, config)
+	defer coord.Close()
+
+	var wg sync.WaitGroup
+	results := make(chan error, 10)
+
+	// Launch more searches than the semaphore can handle
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := &HybridSearchRequest{
+				Query:   "test",
+				Limit:   10,
+				Timeout: 5 * time.Second,
+			}
+			_, err := coord.Search(context.Background(), req)
+			results <- err
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	// Count successes and queue-full errors
+	successCount := 0
+	queueFullCount := 0
+	for err := range results {
+		if err == nil {
+			successCount++
+		} else if errors.Is(err, ErrSearchQueueFull) {
+			queueFullCount++
+		}
+	}
+
+	// With backpressure enabled, some should fail fast
+	assert.Greater(t, queueFullCount, 0, "expected some requests to fail with ErrSearchQueueFull")
+	assert.Greater(t, successCount, 0, "expected some requests to succeed")
+}
+
+func TestSearchCoordinator_Backpressure_Disabled(t *testing.T) {
+	bleve := &mockBleveSearcher{
+		isOpen: true,
+		delay:  50 * time.Millisecond,
+		results: &search.SearchResult{
+			Documents: []search.ScoredDocument{
+				{Document: search.Document{ID: "doc1"}, Score: 1.0},
+			},
+		},
+	}
+
+	vector := &mockVectorSearcher{
+		delay: 50 * time.Millisecond,
+		results: []ScoredVectorResult{
+			{ID: "doc2", Score: 0.9},
+		},
+	}
+
+	embedder := &mockEmbeddingGenerator{embedding: []float32{0.1}}
+
+	config := CoordinatorConfig{
+		MaxConcurrentSearches: 2,
+		EnableBackpressure:    false, // Disabled - will block
+		DefaultTimeout:        5 * time.Second,
+		RRFK:                  60,
+		EnableFallback:        true,
+	}
+
+	coord := NewSearchCoordinatorWithConfig(bleve, vector, embedder, config)
+	defer coord.Close()
+
+	var wg sync.WaitGroup
+	results := make(chan error, 5)
+
+	// Launch a few searches
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := &HybridSearchRequest{
+				Query:   "test",
+				Limit:   10,
+				Timeout: 5 * time.Second,
+			}
+			_, err := coord.Search(context.Background(), req)
+			results <- err
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	// Without backpressure, all should eventually succeed (blocking mode)
+	queueFullCount := 0
+	for err := range results {
+		if errors.Is(err, ErrSearchQueueFull) {
+			queueFullCount++
+		}
+	}
+
+	assert.Equal(t, 0, queueFullCount, "with backpressure disabled, should never get ErrSearchQueueFull")
+}
+
+func TestSearchCoordinator_Backpressure_ImmediateReject(t *testing.T) {
+	// Test that backpressure rejects immediately when queue is full
+	slowBleve := &mockBleveSearcher{
+		isOpen: true,
+		delay:  200 * time.Millisecond, // Slow enough to test backpressure
+		results: &search.SearchResult{
+			Documents: []search.ScoredDocument{
+				{Document: search.Document{ID: "doc1"}, Score: 1.0},
+			},
+		},
+	}
+
+	slowVector := &mockVectorSearcher{
+		delay: 200 * time.Millisecond,
+		results: []ScoredVectorResult{
+			{ID: "doc2", Score: 0.9},
+		},
+	}
+
+	embedder := &mockEmbeddingGenerator{embedding: []float32{0.1}}
+
+	config := CoordinatorConfig{
+		MaxConcurrentSearches: 1,    // Only 1 slot
+		EnableBackpressure:    true, // Fail-fast
+		DefaultTimeout:        5 * time.Second,
+		RRFK:                  60,
+		EnableFallback:        true,
+	}
+
+	coord := NewSearchCoordinatorWithConfig(slowBleve, slowVector, embedder, config)
+
+	// Start first search (will occupy the slot)
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		req := &HybridSearchRequest{
+			Query:   "slow",
+			Limit:   10,
+			Timeout: 5 * time.Second,
+		}
+		coord.Search(context.Background(), req)
+		close(done)
+	}()
+
+	<-started
+	// Small delay to ensure first search has acquired semaphore
+	time.Sleep(20 * time.Millisecond)
+
+	// Second search should fail immediately
+	start := time.Now()
+	req := &HybridSearchRequest{
+		Query:   "fast",
+		Limit:   10,
+		Timeout: 5 * time.Second,
+	}
+	_, err := coord.Search(context.Background(), req)
+	duration := time.Since(start)
+
+	// Should fail fast (well under 100ms, definitely not 200ms)
+	assert.Less(t, duration, 100*time.Millisecond, "backpressure should fail immediately, not block")
+	assert.ErrorIs(t, err, ErrSearchQueueFull)
+
+	// Wait for first search to complete before closing
+	<-done
+	coord.Close()
+}

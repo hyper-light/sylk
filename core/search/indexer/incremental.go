@@ -4,6 +4,7 @@ package indexer
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"time"
 
@@ -94,13 +95,23 @@ type DocumentBuilder interface {
 // Configuration
 // =============================================================================
 
-// Default configuration values for batch accumulation.
+// Default configuration values for batch accumulation and worker pool.
 const (
 	// DefaultFlushInterval is the default interval for flushing pending changes.
 	DefaultFlushInterval = 100 * time.Millisecond
 
 	// DefaultMaxBatchSize is the default maximum batch size before auto-flush.
 	DefaultMaxBatchSize = 100
+
+	// DefaultWorkerCount is the default number of concurrent workers for processing.
+	// Set to 0 to use runtime.NumCPU().
+	DefaultWorkerCount = 0
+
+	// MinWorkerCount is the minimum number of workers.
+	MinWorkerCount = 1
+
+	// MaxWorkerCount is the maximum number of workers to prevent resource exhaustion.
+	MaxWorkerCount = 32
 )
 
 // IncrementalIndexerConfig configures the incremental indexer.
@@ -116,6 +127,10 @@ type IncrementalIndexerConfig struct {
 
 	// MaxBatchSize is the maximum batch size before auto-flush (default: 100).
 	MaxBatchSize int
+
+	// WorkerCount is the number of concurrent workers for processing changes.
+	// Set to 0 to use runtime.NumCPU(). Default: 0.
+	WorkerCount int
 }
 
 // =============================================================================
@@ -125,6 +140,7 @@ type IncrementalIndexerConfig struct {
 // IncrementalIndexer handles incremental indexing of changed files.
 // It only indexes files whose checksums have changed.
 // It supports batch accumulation for efficient bulk operations.
+// PF.3.6/W4M.11: Now uses a concurrent worker pool for processing changes.
 type IncrementalIndexer struct {
 	config        IncrementalIndexerConfig
 	indexManager  IndexManagerInterface
@@ -136,6 +152,9 @@ type IncrementalIndexer struct {
 	pendingMu      sync.Mutex
 	flushInterval  time.Duration
 	maxBatchSize   int
+
+	// W4M.11: Worker pool configuration
+	workerCount int
 }
 
 // NewIncrementalIndexer creates a new incremental indexer.
@@ -155,6 +174,9 @@ func NewIncrementalIndexer(
 		maxBatchSize = DefaultMaxBatchSize
 	}
 
+	// W4M.11: Configure worker count
+	workerCount := normalizeWorkerCount(config.WorkerCount)
+
 	return &IncrementalIndexer{
 		config:         config,
 		indexManager:   indexManager,
@@ -163,7 +185,22 @@ func NewIncrementalIndexer(
 		pendingChanges: make([]*FileChange, 0, maxBatchSize),
 		flushInterval:  flushInterval,
 		maxBatchSize:   maxBatchSize,
+		workerCount:    workerCount,
 	}
+}
+
+// normalizeWorkerCount ensures worker count is within valid bounds.
+func normalizeWorkerCount(count int) int {
+	if count <= 0 {
+		count = runtime.NumCPU()
+	}
+	if count < MinWorkerCount {
+		return MinWorkerCount
+	}
+	if count > MaxWorkerCount {
+		return MaxWorkerCount
+	}
+	return count
 }
 
 // Index processes a list of file changes using batch operations for efficiency.
@@ -396,7 +433,8 @@ func (i *IncrementalIndexer) AccumulateChange(change *FileChange) {
 	}
 }
 
-// FlushPending processes all accumulated changes as a batch.
+// FlushPending processes all accumulated changes as a batch using a worker pool.
+// W4M.11: Uses concurrent workers to prepare documents in parallel.
 // Returns nil if there are no pending changes.
 // This method is thread-safe.
 func (i *IncrementalIndexer) FlushPending(ctx context.Context) error {
@@ -420,19 +458,9 @@ func (i *IncrementalIndexer) FlushPending(ctx context.Context) error {
 		}
 	}
 
-	// Batch index
+	// W4M.11: Process indexing with concurrent worker pool
 	if len(toIndex) > 0 {
-		docs := make([]*search.Document, 0, len(toIndex))
-		checksumUpdates := make([]checksumUpdate, 0, len(toIndex))
-
-		for _, c := range toIndex {
-			doc, update, err := i.prepareForIndex(c)
-			if err != nil || doc == nil {
-				continue // Skip errors and unchanged files
-			}
-			docs = append(docs, doc)
-			checksumUpdates = append(checksumUpdates, update)
-		}
+		docs, checksumUpdates := i.prepareDocsWithWorkerPool(ctx, toIndex)
 
 		if len(docs) > 0 {
 			if err := i.indexManager.IndexBatch(ctx, docs); err != nil {
@@ -445,7 +473,7 @@ func (i *IncrementalIndexer) FlushPending(ctx context.Context) error {
 		}
 	}
 
-	// Batch delete
+	// Process deletes (deletes are typically fast, no need for worker pool)
 	for _, c := range toDelete {
 		if err := i.indexManager.DeleteByPath(ctx, c.Path); err != nil {
 			// Continue processing other deletes on error
@@ -455,6 +483,90 @@ func (i *IncrementalIndexer) FlushPending(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// prepareDocsWithWorkerPool prepares documents using a concurrent worker pool.
+// W4M.11: This replaces sequential document preparation with parallel processing.
+func (i *IncrementalIndexer) prepareDocsWithWorkerPool(
+	ctx context.Context,
+	changes []*FileChange,
+) ([]*search.Document, []checksumUpdate) {
+	// For small batches, use sequential processing (less overhead)
+	if len(changes) <= i.workerCount {
+		return i.prepareDocsSequential(changes)
+	}
+
+	// Create work channel
+	workCh := make(chan *FileChange, len(changes))
+	for _, c := range changes {
+		workCh <- c
+	}
+	close(workCh)
+
+	// Result collection
+	type prepareResult struct {
+		doc    *search.Document
+		update checksumUpdate
+	}
+	resultCh := make(chan prepareResult, len(changes))
+
+	// Launch workers
+	var wg sync.WaitGroup
+	for w := 0; w < i.workerCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range workCh {
+				// Check context cancellation
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				doc, update, err := i.prepareForIndex(c)
+				if err != nil || doc == nil {
+					continue
+				}
+				resultCh <- prepareResult{doc: doc, update: update}
+			}
+		}()
+	}
+
+	// Close result channel when all workers complete
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Collect results
+	docs := make([]*search.Document, 0, len(changes))
+	updates := make([]checksumUpdate, 0, len(changes))
+	for r := range resultCh {
+		docs = append(docs, r.doc)
+		updates = append(updates, r.update)
+	}
+
+	return docs, updates
+}
+
+// prepareDocsSequential prepares documents sequentially for small batches.
+func (i *IncrementalIndexer) prepareDocsSequential(
+	changes []*FileChange,
+) ([]*search.Document, []checksumUpdate) {
+	docs := make([]*search.Document, 0, len(changes))
+	updates := make([]checksumUpdate, 0, len(changes))
+
+	for _, c := range changes {
+		doc, update, err := i.prepareForIndex(c)
+		if err != nil || doc == nil {
+			continue
+		}
+		docs = append(docs, doc)
+		updates = append(updates, update)
+	}
+
+	return docs, updates
 }
 
 // PendingCount returns the number of pending changes awaiting flush.
@@ -473,4 +585,10 @@ func (i *IncrementalIndexer) MaxBatchSize() int {
 // FlushInterval returns the configured flush interval.
 func (i *IncrementalIndexer) FlushInterval() time.Duration {
 	return i.flushInterval
+}
+
+// WorkerCount returns the configured number of concurrent workers.
+// W4M.11: Used for concurrent document preparation.
+func (i *IncrementalIndexer) WorkerCount() int {
+	return i.workerCount
 }

@@ -104,7 +104,20 @@ func (c *SearchCoordinator) executeSearch(
 }
 
 // acquireSemaphore acquires a slot from the semaphore.
+// W4M.16: Supports fail-fast backpressure when enabled.
 func (c *SearchCoordinator) acquireSemaphore(ctx context.Context) error {
+	// W4M.16: Fail-fast backpressure mode
+	if c.config.EnableBackpressure {
+		select {
+		case c.semaphore <- struct{}{}:
+			return nil
+		default:
+			// Queue is full, fail fast instead of blocking
+			return ErrSearchQueueFull
+		}
+	}
+
+	// Standard blocking mode with timeout
 	select {
 	case c.semaphore <- struct{}{}:
 		return nil

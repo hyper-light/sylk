@@ -168,19 +168,17 @@ func newNormalizationCache(maxSize int) *normalizationCache {
 
 // get retrieves a normalized string from the cache.
 // Returns the normalized string and true if found, or empty string and false if not cached.
+// W4M.12: Fixed double lock acquisition race condition by using single write lock.
 func (nc *normalizationCache) get(original string) (string, bool) {
-	nc.mu.RLock()
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+
 	entry, found := nc.cache[original]
 	if found {
-		// Update access time under read lock is safe for LRU tracking
-		nc.mu.RUnlock()
-		nc.mu.Lock()
 		nc.accessTime++
 		entry.accessTime = nc.accessTime
-		nc.mu.Unlock()
 		return entry.normalized, true
 	}
-	nc.mu.RUnlock()
 	return "", false
 }
 

@@ -1380,3 +1380,283 @@ func TestAccumulateChange_Concurrent(t *testing.T) {
 		}
 	})
 }
+
+// =============================================================================
+// Test: Worker Pool (W4M.11)
+// =============================================================================
+
+func TestWorkerCount(t *testing.T) {
+	t.Run("returns configured worker count", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			WorkerCount: 8,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		if indexer.WorkerCount() != 8 {
+			t.Errorf("expected worker count 8, got %d", indexer.WorkerCount())
+		}
+	})
+
+	t.Run("uses default (NumCPU) when not configured", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		indexer := NewIncrementalIndexer(
+			IncrementalIndexerConfig{},
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Should be between MinWorkerCount and MaxWorkerCount
+		wc := indexer.WorkerCount()
+		if wc < MinWorkerCount || wc > MaxWorkerCount {
+			t.Errorf("worker count %d is outside valid range [%d, %d]",
+				wc, MinWorkerCount, MaxWorkerCount)
+		}
+	})
+
+	t.Run("caps at MaxWorkerCount", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			WorkerCount: 1000, // Exceeds MaxWorkerCount
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		if indexer.WorkerCount() != MaxWorkerCount {
+			t.Errorf("expected worker count capped at %d, got %d",
+				MaxWorkerCount, indexer.WorkerCount())
+		}
+	})
+
+	t.Run("enforces MinWorkerCount", func(t *testing.T) {
+		result := normalizeWorkerCount(-5)
+		if result < MinWorkerCount {
+			t.Errorf("expected at least %d workers, got %d", MinWorkerCount, result)
+		}
+	})
+}
+
+func TestFlushPending_WorkerPool(t *testing.T) {
+	t.Run("processes large batches with worker pool", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			MaxBatchSize: 1000,
+			WorkerCount:  4, // Use 4 workers
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Accumulate more changes than workers to trigger parallel processing
+		numChanges := 20
+		for i := 0; i < numChanges; i++ {
+			path := "/test/file" + string(rune('A'+(i/10))) + string(rune('0'+(i%10))) + ".go"
+			change := &FileChange{
+				Path:      path,
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo(path),
+			}
+			indexer.AccumulateChange(change)
+		}
+
+		// Flush with worker pool
+		err := indexer.FlushPending(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Verify all documents were indexed
+		if len(indexMgr.indexed) != numChanges {
+			t.Errorf("expected %d indexed documents, got %d", numChanges, len(indexMgr.indexed))
+		}
+	})
+
+	t.Run("uses sequential processing for small batches", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			MaxBatchSize: 1000,
+			WorkerCount:  8, // More workers than changes
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Add fewer changes than workers (triggers sequential processing)
+		numChanges := 3
+		for i := 0; i < numChanges; i++ {
+			path := "/test/file" + string(rune('0'+i)) + ".go"
+			change := &FileChange{
+				Path:      path,
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo(path),
+			}
+			indexer.AccumulateChange(change)
+		}
+
+		err := indexer.FlushPending(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(indexMgr.indexed) != numChanges {
+			t.Errorf("expected %d indexed documents, got %d", numChanges, len(indexMgr.indexed))
+		}
+	})
+
+	t.Run("handles context cancellation in worker pool", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		// Make doc builder slow to allow cancellation
+		docBuilder.buildFn = func(fi *FileInfo) (*search.Document, error) {
+			time.Sleep(100 * time.Millisecond)
+			content := "content for " + fi.Path
+			checksum := search.GenerateChecksum([]byte(content))
+			return &search.Document{
+				ID:       search.GenerateDocumentID([]byte(fi.Path)),
+				Path:     fi.Path,
+				Type:     search.DocTypeSourceCode,
+				Content:  content,
+				Checksum: checksum,
+			}, nil
+		}
+
+		config := IncrementalIndexerConfig{
+			MaxBatchSize: 1000,
+			WorkerCount:  4,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Add many changes
+		for i := 0; i < 50; i++ {
+			path := "/test/file" + string(rune('A'+(i/26))) + string(rune('a'+(i%26))) + ".go"
+			change := &FileChange{
+				Path:      path,
+				Operation: OpCreate,
+				FileInfo:  createTestFileInfo(path),
+			}
+			indexer.AccumulateChange(change)
+		}
+
+		// Cancel context quickly
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+
+		// Should not hang - worker pool should respect context
+		done := make(chan error, 1)
+		go func() {
+			done <- indexer.FlushPending(ctx)
+		}()
+
+		select {
+		case <-done:
+			// Good - function returned (may have partial results or error)
+		case <-time.After(5 * time.Second):
+			t.Fatal("FlushPending did not respect context cancellation")
+		}
+	})
+}
+
+func TestFlushPending_WorkerPool_Concurrent(t *testing.T) {
+	t.Run("worker pool is thread-safe", func(t *testing.T) {
+		indexMgr := newIncrementalMockIndexManager()
+		checksumStore := newIncrementalMockChecksumStore()
+		docBuilder := newIncrementalMockDocumentBuilder()
+
+		config := IncrementalIndexerConfig{
+			MaxBatchSize: 50,
+			WorkerCount:  4,
+		}
+
+		indexer := NewIncrementalIndexer(
+			config,
+			indexMgr,
+			checksumStore,
+			docBuilder,
+		)
+
+		// Concurrent accumulation and flushing
+		var wg sync.WaitGroup
+		numGoroutines := 5
+		changesPerGoroutine := 20
+
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < changesPerGoroutine; j++ {
+					path := "/test/g" + string(rune('0'+id)) + "/file" + string(rune('0'+(j%10))) + string(rune('a'+(j/10))) + ".go"
+					change := &FileChange{
+						Path:      path,
+						Operation: OpCreate,
+						FileInfo:  createTestFileInfo(path),
+					}
+					indexer.AccumulateChange(change)
+				}
+			}(i)
+		}
+
+		// Also flush concurrently
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(5 * time.Millisecond) // Small delay to let accumulation start
+				_ = indexer.FlushPending(context.Background())
+			}()
+		}
+
+		wg.Wait()
+
+		// Final flush to get any remaining
+		_ = indexer.FlushPending(context.Background())
+
+		// Should have processed all documents without panic or race
+		// (exact count may vary due to concurrent flush timing)
+		if len(indexMgr.indexed) == 0 {
+			t.Error("expected some documents to be indexed")
+		}
+	})
+}
