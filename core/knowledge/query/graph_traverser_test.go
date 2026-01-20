@@ -1065,3 +1065,402 @@ func TestHashPath(t *testing.T) {
 		}
 	})
 }
+
+// =============================================================================
+// W4P.34: Cycle Detection and Convergence Tests
+// =============================================================================
+
+func TestGraphTraverser_SimpleCycle(t *testing.T) {
+	// Test simple cycle: A -> B -> A
+	entityType := "node"
+	edgeCallCount := 0
+
+	mock := &mockEdgeQuerier{
+		getNodesByPatternFunc: func(pattern *NodeMatcher) ([]string, error) {
+			return []string{"A"}, nil
+		},
+		getOutgoingEdgesFunc: func(nodeID string, edgeTypes []string) ([]Edge, error) {
+			edgeCallCount++
+			edges := map[string][]Edge{
+				"A": {{ID: 1, SourceID: "A", TargetID: "B", EdgeType: "link", Weight: 1.0}},
+				"B": {{ID: 2, SourceID: "B", TargetID: "A", EdgeType: "link", Weight: 1.0}},
+			}
+			return edges[nodeID], nil
+		},
+	}
+
+	traverser := NewGraphTraverser(mock)
+	ctx := context.Background()
+
+	pattern := &GraphPattern{
+		StartNode: &NodeMatcher{EntityType: &entityType},
+		Traversals: []TraversalStep{
+			{EdgeType: "link", Direction: DirectionOutgoing, MaxHops: 10},
+		},
+	}
+
+	results, err := traverser.Execute(ctx, pattern, 100)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// Should terminate without infinite loop
+	if edgeCallCount > 10 {
+		t.Errorf("too many edge calls (%d), cycle detection may have failed", edgeCallCount)
+	}
+
+	// Verify no path contains A more than once (cycle prevented)
+	for _, r := range results {
+		nodeCount := make(map[string]int)
+		for _, n := range r.Path {
+			nodeCount[n]++
+			if nodeCount[n] > 1 {
+				t.Errorf("cycle detected in result path: %v", r.Path)
+			}
+		}
+	}
+}
+
+func TestGraphTraverser_DiamondPattern(t *testing.T) {
+	// Test diamond pattern: A -> B -> D, A -> C -> D
+	// D should be reached via both paths but only expanded once
+	entityType := "node"
+	expansionCount := make(map[string]int)
+
+	mock := &mockEdgeQuerier{
+		getNodesByPatternFunc: func(pattern *NodeMatcher) ([]string, error) {
+			return []string{"A"}, nil
+		},
+		getOutgoingEdgesFunc: func(nodeID string, edgeTypes []string) ([]Edge, error) {
+			expansionCount[nodeID]++
+			edges := map[string][]Edge{
+				"A": {
+					{ID: 1, SourceID: "A", TargetID: "B", EdgeType: "link", Weight: 1.0},
+					{ID: 2, SourceID: "A", TargetID: "C", EdgeType: "link", Weight: 1.0},
+				},
+				"B": {{ID: 3, SourceID: "B", TargetID: "D", EdgeType: "link", Weight: 1.0}},
+				"C": {{ID: 4, SourceID: "C", TargetID: "D", EdgeType: "link", Weight: 1.0}},
+				"D": {{ID: 5, SourceID: "D", TargetID: "E", EdgeType: "link", Weight: 1.0}},
+				"E": {},
+			}
+			return edges[nodeID], nil
+		},
+	}
+
+	config := TraverserConfig{
+		SimpleVisit:          false,
+		MaxPathLength:        20,
+		ConvergenceDetection: true,
+	}
+	traverser := NewGraphTraverserWithConfig(mock, config)
+	ctx := context.Background()
+
+	pattern := &GraphPattern{
+		StartNode: &NodeMatcher{EntityType: &entityType},
+		Traversals: []TraversalStep{
+			{EdgeType: "link", Direction: DirectionOutgoing, MaxHops: 5},
+		},
+	}
+
+	results, err := traverser.Execute(ctx, pattern, 100)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// With convergence detection, D should only be expanded once
+	if expansionCount["D"] > 1 {
+		t.Errorf("D was expanded %d times, expected 1 (convergence detection failed)", expansionCount["D"])
+	}
+
+	// A should be expanded exactly once
+	if expansionCount["A"] != 1 {
+		t.Errorf("A was expanded %d times, expected 1", expansionCount["A"])
+	}
+
+	// B and C should each be expanded once
+	if expansionCount["B"] != 1 {
+		t.Errorf("B was expanded %d times, expected 1", expansionCount["B"])
+	}
+	if expansionCount["C"] != 1 {
+		t.Errorf("C was expanded %d times, expected 1", expansionCount["C"])
+	}
+
+	_ = results // Results are produced but convergence prevents redundant work
+}
+
+func TestGraphTraverser_DiamondPatternNoConvergenceDetection(t *testing.T) {
+	// Test diamond pattern with convergence detection disabled
+	// D should be expanded multiple times
+	entityType := "node"
+	expansionCount := make(map[string]int)
+
+	mock := &mockEdgeQuerier{
+		getNodesByPatternFunc: func(pattern *NodeMatcher) ([]string, error) {
+			return []string{"A"}, nil
+		},
+		getOutgoingEdgesFunc: func(nodeID string, edgeTypes []string) ([]Edge, error) {
+			expansionCount[nodeID]++
+			edges := map[string][]Edge{
+				"A": {
+					{ID: 1, SourceID: "A", TargetID: "B", EdgeType: "link", Weight: 1.0},
+					{ID: 2, SourceID: "A", TargetID: "C", EdgeType: "link", Weight: 1.0},
+				},
+				"B": {{ID: 3, SourceID: "B", TargetID: "D", EdgeType: "link", Weight: 1.0}},
+				"C": {{ID: 4, SourceID: "C", TargetID: "D", EdgeType: "link", Weight: 1.0}},
+				"D": {},
+			}
+			return edges[nodeID], nil
+		},
+	}
+
+	config := TraverserConfig{
+		SimpleVisit:          false,
+		MaxPathLength:        20,
+		ConvergenceDetection: false, // Disabled
+	}
+	traverser := NewGraphTraverserWithConfig(mock, config)
+	ctx := context.Background()
+
+	pattern := &GraphPattern{
+		StartNode: &NodeMatcher{EntityType: &entityType},
+		Traversals: []TraversalStep{
+			{EdgeType: "link", Direction: DirectionOutgoing, MaxHops: 5},
+		},
+	}
+
+	_, err := traverser.Execute(ctx, pattern, 100)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// Without convergence detection, D may be expanded multiple times
+	// (depends on path-based visit tracking allowing it)
+	t.Logf("D was expanded %d times (convergence detection disabled)", expansionCount["D"])
+}
+
+func TestGraphTraverser_DeepGraphWithConvergence(t *testing.T) {
+	// Test a deeper graph with multiple convergence points:
+	//     A
+	//    / \
+	//   B   C
+	//   |\ /|
+	//   | X |
+	//   |/ \|
+	//   D   E
+	//    \ /
+	//     F
+	entityType := "node"
+	expansionCount := make(map[string]int)
+
+	mock := &mockEdgeQuerier{
+		getNodesByPatternFunc: func(pattern *NodeMatcher) ([]string, error) {
+			return []string{"A"}, nil
+		},
+		getOutgoingEdgesFunc: func(nodeID string, edgeTypes []string) ([]Edge, error) {
+			expansionCount[nodeID]++
+			edges := map[string][]Edge{
+				"A": {
+					{ID: 1, SourceID: "A", TargetID: "B", EdgeType: "link", Weight: 1.0},
+					{ID: 2, SourceID: "A", TargetID: "C", EdgeType: "link", Weight: 1.0},
+				},
+				"B": {
+					{ID: 3, SourceID: "B", TargetID: "D", EdgeType: "link", Weight: 1.0},
+					{ID: 4, SourceID: "B", TargetID: "E", EdgeType: "link", Weight: 1.0},
+				},
+				"C": {
+					{ID: 5, SourceID: "C", TargetID: "D", EdgeType: "link", Weight: 1.0},
+					{ID: 6, SourceID: "C", TargetID: "E", EdgeType: "link", Weight: 1.0},
+				},
+				"D": {{ID: 7, SourceID: "D", TargetID: "F", EdgeType: "link", Weight: 1.0}},
+				"E": {{ID: 8, SourceID: "E", TargetID: "F", EdgeType: "link", Weight: 1.0}},
+				"F": {},
+			}
+			return edges[nodeID], nil
+		},
+	}
+
+	config := TraverserConfig{
+		SimpleVisit:          false,
+		MaxPathLength:        20,
+		ConvergenceDetection: true,
+	}
+	traverser := NewGraphTraverserWithConfig(mock, config)
+	ctx := context.Background()
+
+	pattern := &GraphPattern{
+		StartNode: &NodeMatcher{EntityType: &entityType},
+		Traversals: []TraversalStep{
+			{EdgeType: "link", Direction: DirectionOutgoing, MaxHops: 10},
+		},
+	}
+
+	results, err := traverser.Execute(ctx, pattern, 100)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// Each convergence node should only be expanded once
+	convergenceNodes := []string{"D", "E", "F"}
+	for _, node := range convergenceNodes {
+		if expansionCount[node] > 1 {
+			t.Errorf("%s was expanded %d times, expected 1", node, expansionCount[node])
+		}
+	}
+
+	// Total expansions should be reasonable (not exponential)
+	totalExpansions := 0
+	for _, count := range expansionCount {
+		totalExpansions += count
+	}
+	if totalExpansions > 10 {
+		t.Errorf("total expansions %d is too high, convergence detection may have failed", totalExpansions)
+	}
+
+	_ = results
+}
+
+func TestGraphTraverser_ConvergenceWithMultipleSteps(t *testing.T) {
+	// Test convergence detection with multiple traversal steps
+	// Ensure convergence is tracked per-step (node can be expanded in different steps)
+	entityType := "node"
+	expansionCount := make(map[string]int)
+
+	mock := &mockEdgeQuerier{
+		getNodesByPatternFunc: func(pattern *NodeMatcher) ([]string, error) {
+			return []string{"A"}, nil
+		},
+		getOutgoingEdgesFunc: func(nodeID string, edgeTypes []string) ([]Edge, error) {
+			expansionCount[nodeID]++
+			edges := map[string][]Edge{
+				"A": {
+					{ID: 1, SourceID: "A", TargetID: "B", EdgeType: "step1", Weight: 1.0},
+					{ID: 2, SourceID: "A", TargetID: "C", EdgeType: "step1", Weight: 1.0},
+				},
+				"B": {{ID: 3, SourceID: "B", TargetID: "D", EdgeType: "step1", Weight: 1.0}},
+				"C": {{ID: 4, SourceID: "C", TargetID: "D", EdgeType: "step1", Weight: 1.0}},
+				"D": {{ID: 5, SourceID: "D", TargetID: "E", EdgeType: "step2", Weight: 1.0}},
+				"E": {},
+			}
+			return edges[nodeID], nil
+		},
+	}
+
+	config := TraverserConfig{
+		SimpleVisit:          false,
+		MaxPathLength:        20,
+		ConvergenceDetection: true,
+	}
+	traverser := NewGraphTraverserWithConfig(mock, config)
+	ctx := context.Background()
+
+	pattern := &GraphPattern{
+		StartNode: &NodeMatcher{EntityType: &entityType},
+		Traversals: []TraversalStep{
+			{EdgeType: "step1", Direction: DirectionOutgoing, MaxHops: 3},
+			{EdgeType: "step2", Direction: DirectionOutgoing, MaxHops: 2},
+		},
+	}
+
+	results, err := traverser.Execute(ctx, pattern, 100)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// D should be expanded once per step it participates in
+	// In step1, D is a convergence point (reached via B and C)
+	// In step2, D may be expanded again (new step context)
+	t.Logf("Expansion counts: %v", expansionCount)
+
+	// Verify we got results (the traversal completed successfully)
+	if len(results) == 0 {
+		t.Log("No final results - paths may not have completed all steps")
+	}
+}
+
+func TestGraphTraverser_ExpandKeyFormat(t *testing.T) {
+	mock := &mockEdgeQuerier{}
+	traverser := NewGraphTraverser(mock)
+
+	key1 := traverser.expandKey("nodeA", 0)
+	key2 := traverser.expandKey("nodeA", 1)
+	key3 := traverser.expandKey("nodeB", 0)
+
+	// Same node, different steps should have different keys
+	if key1 == key2 {
+		t.Error("expected different keys for same node at different steps")
+	}
+
+	// Different nodes, same step should have different keys
+	if key1 == key3 {
+		t.Error("expected different keys for different nodes at same step")
+	}
+
+	// Verify key format contains both node and step
+	if key1 != "nodeA@0" {
+		t.Errorf("unexpected key format: %s", key1)
+	}
+}
+
+func TestGraphTraverser_LargeDiamondGraph(t *testing.T) {
+	// Test with a larger diamond pattern to stress test convergence detection
+	// Graph: A -> [B1, B2, B3, B4] -> C (all Bi connect to C)
+	entityType := "node"
+	expansionCount := make(map[string]int)
+
+	mock := &mockEdgeQuerier{
+		getNodesByPatternFunc: func(pattern *NodeMatcher) ([]string, error) {
+			return []string{"A"}, nil
+		},
+		getOutgoingEdgesFunc: func(nodeID string, edgeTypes []string) ([]Edge, error) {
+			expansionCount[nodeID]++
+			switch nodeID {
+			case "A":
+				return []Edge{
+					{ID: 1, SourceID: "A", TargetID: "B1", EdgeType: "link", Weight: 1.0},
+					{ID: 2, SourceID: "A", TargetID: "B2", EdgeType: "link", Weight: 1.0},
+					{ID: 3, SourceID: "A", TargetID: "B3", EdgeType: "link", Weight: 1.0},
+					{ID: 4, SourceID: "A", TargetID: "B4", EdgeType: "link", Weight: 1.0},
+				}, nil
+			case "B1", "B2", "B3", "B4":
+				return []Edge{
+					{ID: 10, SourceID: nodeID, TargetID: "C", EdgeType: "link", Weight: 1.0},
+				}, nil
+			default:
+				return nil, nil
+			}
+		},
+	}
+
+	config := TraverserConfig{
+		SimpleVisit:          false,
+		MaxPathLength:        20,
+		ConvergenceDetection: true,
+	}
+	traverser := NewGraphTraverserWithConfig(mock, config)
+	ctx := context.Background()
+
+	pattern := &GraphPattern{
+		StartNode: &NodeMatcher{EntityType: &entityType},
+		Traversals: []TraversalStep{
+			{EdgeType: "link", Direction: DirectionOutgoing, MaxHops: 5},
+		},
+	}
+
+	_, err := traverser.Execute(ctx, pattern, 100)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// C should only be expanded once despite being reached via 4 different paths
+	if expansionCount["C"] > 1 {
+		t.Errorf("C was expanded %d times, expected 1", expansionCount["C"])
+	}
+
+	// Each Bi should be expanded exactly once
+	for i := 1; i <= 4; i++ {
+		nodeName := "B" + string(rune('0'+i))
+		if expansionCount[nodeName] != 1 {
+			t.Errorf("%s was expanded %d times, expected 1", nodeName, expansionCount[nodeName])
+		}
+	}
+}

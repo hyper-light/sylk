@@ -1031,6 +1031,325 @@ func TestDetectDomain_DefaultToLibrarian(t *testing.T) {
 }
 
 // =============================================================================
+// Domain Detection Configuration Tests (W4P.36)
+// =============================================================================
+
+func TestDomainDetectionConfig_Default(t *testing.T) {
+	cfg := DefaultDomainDetectionConfig()
+
+	if cfg.FallbackMode != FallbackLog {
+		t.Errorf("FallbackMode = %v, want FallbackLog", cfg.FallbackMode)
+	}
+	if cfg.DefaultDomain != domain.DomainLibrarian {
+		t.Errorf("DefaultDomain = %v, want DomainLibrarian", cfg.DefaultDomain)
+	}
+	if cfg.RequireExplicitDomain {
+		t.Error("RequireExplicitDomain should be false by default")
+	}
+	if !cfg.LogFallbacks {
+		t.Error("LogFallbacks should be true by default")
+	}
+}
+
+func TestDomainDetectionConfig_Strict(t *testing.T) {
+	cfg := StrictDomainDetectionConfig()
+
+	if cfg.FallbackMode != FallbackError {
+		t.Errorf("FallbackMode = %v, want FallbackError", cfg.FallbackMode)
+	}
+	if !cfg.RequireExplicitDomain {
+		t.Error("RequireExplicitDomain should be true for strict config")
+	}
+}
+
+func TestDomainDetectionConfig_Silent(t *testing.T) {
+	cfg := SilentDomainDetectionConfig()
+
+	if cfg.FallbackMode != FallbackSilent {
+		t.Errorf("FallbackMode = %v, want FallbackSilent", cfg.FallbackMode)
+	}
+	if cfg.LogFallbacks {
+		t.Error("LogFallbacks should be false for silent config")
+	}
+}
+
+func TestSetDomainDetectionConfig(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	customCfg := DomainDetectionConfig{
+		FallbackMode:          FallbackError,
+		DefaultDomain:         domain.DomainArchitect,
+		RequireExplicitDomain: true,
+		LogFallbacks:          false,
+	}
+	coord.SetDomainDetectionConfig(customCfg)
+
+	retrieved := coord.GetDomainDetectionConfig()
+	if retrieved.FallbackMode != FallbackError {
+		t.Errorf("FallbackMode = %v, want FallbackError", retrieved.FallbackMode)
+	}
+	if retrieved.DefaultDomain != domain.DomainArchitect {
+		t.Errorf("DefaultDomain = %v, want DomainArchitect", retrieved.DefaultDomain)
+	}
+	if !retrieved.RequireExplicitDomain {
+		t.Error("RequireExplicitDomain should be true")
+	}
+}
+
+func TestDetectDomainWithResult_ExplicitDomain(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	query := &HybridQuery{
+		TextQuery: "test",
+		Filters: []QueryFilter{
+			{Type: FilterDomain, Value: domain.DomainEngineer},
+		},
+	}
+
+	result := coord.detectDomainWithResult(query)
+	if result.Domain != domain.DomainEngineer {
+		t.Errorf("Domain = %v, want DomainEngineer", result.Domain)
+	}
+	if result.WasFallback {
+		t.Error("WasFallback should be false for explicit domain")
+	}
+	if !result.Explicit {
+		t.Error("Explicit should be true")
+	}
+}
+
+func TestDetectDomainWithResult_FallbackDetected(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	query := &HybridQuery{
+		TextQuery: "test",
+	}
+
+	result := coord.detectDomainWithResult(query)
+	if result.Domain != domain.DomainLibrarian {
+		t.Errorf("Domain = %v, want DomainLibrarian", result.Domain)
+	}
+	if !result.WasFallback {
+		t.Error("WasFallback should be true when no explicit domain")
+	}
+	if result.Explicit {
+		t.Error("Explicit should be false")
+	}
+}
+
+func TestDetectDomainWithResult_CustomDefaultDomain(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	coord.SetDomainDetectionConfig(DomainDetectionConfig{
+		FallbackMode:  FallbackLog,
+		DefaultDomain: domain.DomainArchitect,
+		LogFallbacks:  true,
+	})
+
+	query := &HybridQuery{
+		TextQuery: "test",
+	}
+
+	result := coord.detectDomainWithResult(query)
+	if result.Domain != domain.DomainArchitect {
+		t.Errorf("Domain = %v, want DomainArchitect", result.Domain)
+	}
+	if !result.WasFallback {
+		t.Error("WasFallback should be true")
+	}
+}
+
+func TestDetectDomainStrict_ExplicitDomain(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	coord.SetDomainDetectionConfig(StrictDomainDetectionConfig())
+
+	query := &HybridQuery{
+		TextQuery: "test",
+		Filters: []QueryFilter{
+			{Type: FilterDomain, Value: domain.DomainEngineer},
+		},
+	}
+
+	d, err := coord.DetectDomainStrict(query)
+	if err != nil {
+		t.Fatalf("DetectDomainStrict() unexpected error: %v", err)
+	}
+	if d != domain.DomainEngineer {
+		t.Errorf("Domain = %v, want DomainEngineer", d)
+	}
+}
+
+func TestDetectDomainStrict_MissingDomainReturnsError(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	coord.SetDomainDetectionConfig(StrictDomainDetectionConfig())
+
+	query := &HybridQuery{
+		TextQuery: "test",
+	}
+
+	_, err := coord.DetectDomainStrict(query)
+	if err == nil {
+		t.Fatal("expected error for missing explicit domain in strict mode")
+	}
+
+	domainErr, ok := err.(*ErrDomainRequired)
+	if !ok {
+		t.Fatalf("expected ErrDomainRequired, got %T", err)
+	}
+	if domainErr.QueryContext == "" {
+		t.Error("ErrDomainRequired.QueryContext should not be empty")
+	}
+}
+
+func TestDetectDomainStrict_NonStrictAllowsFallback(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	// Default config should allow fallback
+
+	query := &HybridQuery{
+		TextQuery: "test",
+	}
+
+	d, err := coord.DetectDomainStrict(query)
+	if err != nil {
+		t.Fatalf("DetectDomainStrict() unexpected error: %v", err)
+	}
+	if d != domain.DomainLibrarian {
+		t.Errorf("Domain = %v, want DomainLibrarian", d)
+	}
+}
+
+func TestGetQueryContext_TextQuery(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	query := &HybridQuery{
+		TextQuery: "short query",
+	}
+
+	ctx := coord.getQueryContext(query)
+	if ctx != "text=\"short query\"" {
+		t.Errorf("getQueryContext() = %v, want text=\"short query\"", ctx)
+	}
+}
+
+func TestGetQueryContext_LongTextTruncated(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	// Create a query longer than 50 characters
+	longQuery := "this is a very long query string that exceeds the fifty character limit"
+	query := &HybridQuery{
+		TextQuery: longQuery,
+	}
+
+	ctx := coord.getQueryContext(query)
+	// Should be truncated to first 47 chars + "..."
+	expected := "text=\"this is a very long query string that exceeds t...\""
+	if ctx != expected {
+		t.Errorf("getQueryContext() = %v, want %v", ctx, expected)
+	}
+}
+
+func TestGetQueryContext_SemanticVector(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	query := &HybridQuery{
+		SemanticVector: []float32{0.1, 0.2, 0.3},
+	}
+
+	ctx := coord.getQueryContext(query)
+	if ctx != "semantic_vector" {
+		t.Errorf("getQueryContext() = %v, want semantic_vector", ctx)
+	}
+}
+
+func TestGetQueryContext_GraphPattern(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	entityType := "test"
+	query := &HybridQuery{
+		GraphPattern: &GraphPattern{
+			StartNode: &NodeMatcher{EntityType: &entityType},
+		},
+	}
+
+	ctx := coord.getQueryContext(query)
+	if ctx != "graph_pattern" {
+		t.Errorf("getQueryContext() = %v, want graph_pattern", ctx)
+	}
+}
+
+func TestGetQueryContext_Unknown(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	query := &HybridQuery{}
+
+	ctx := coord.getQueryContext(query)
+	if ctx != "unknown" {
+		t.Errorf("getQueryContext() = %v, want unknown", ctx)
+	}
+}
+
+func TestErrDomainRequired_Error(t *testing.T) {
+	err := &ErrDomainRequired{QueryContext: "text=\"test query\""}
+
+	expected := "explicit domain required but not provided for query: text=\"test query\""
+	if err.Error() != expected {
+		t.Errorf("Error() = %v, want %v", err.Error(), expected)
+	}
+}
+
+func TestDomainDetectionConfig_ConcurrentAccess(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+
+	const numGoroutines = 50
+	done := make(chan bool, numGoroutines*2)
+
+	// Writers
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			cfg := DomainDetectionConfig{
+				FallbackMode:  DomainFallbackMode(id % 3),
+				DefaultDomain: domain.Domain(id % 10),
+				LogFallbacks:  id%2 == 0,
+			}
+			coord.SetDomainDetectionConfig(cfg)
+			done <- true
+		}(i)
+	}
+
+	// Readers
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			_ = coord.GetDomainDetectionConfig()
+			done <- true
+		}()
+	}
+
+	// Wait for all operations
+	for i := 0; i < numGoroutines*2; i++ {
+		<-done
+	}
+	// Should complete without race conditions
+}
+
+func TestDomainDetection_FallbackModeError(t *testing.T) {
+	coord := NewHybridQueryCoordinator(nil, nil, nil)
+	coord.SetDomainDetectionConfig(DomainDetectionConfig{
+		FallbackMode:          FallbackError,
+		DefaultDomain:         domain.DomainLibrarian,
+		RequireExplicitDomain: false, // Should still error due to FallbackError mode
+		LogFallbacks:          true,
+	})
+
+	query := &HybridQuery{
+		TextQuery: "test",
+	}
+
+	_, err := coord.DetectDomainStrict(query)
+	if err == nil {
+		t.Error("expected error with FallbackError mode")
+	}
+}
+
+// =============================================================================
 // Weight Learning Integration Tests
 // =============================================================================
 

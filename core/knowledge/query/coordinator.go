@@ -5,6 +5,7 @@ package query
 
 import (
 	"context"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,6 +98,82 @@ func DefaultMetricsTrackerConfig() MetricsTrackerConfig {
 		TTL:             DefaultMetricsTTL,
 		CleanupInterval: DefaultCleanupInterval,
 	}
+}
+
+// =============================================================================
+// Domain Detection Configuration (W4P.36)
+// =============================================================================
+
+// DomainFallbackMode specifies how to handle domain detection failures.
+type DomainFallbackMode int
+
+const (
+	// FallbackSilent uses default domain without logging (legacy behavior).
+	FallbackSilent DomainFallbackMode = iota
+	// FallbackLog uses default domain but logs the fallback.
+	FallbackLog
+	// FallbackError returns an error when domain cannot be detected.
+	FallbackError
+)
+
+// DomainDetectionConfig holds settings for domain detection behavior.
+type DomainDetectionConfig struct {
+	// FallbackMode specifies behavior when domain detection fails.
+	FallbackMode DomainFallbackMode
+
+	// DefaultDomain is used when detection fails (if FallbackMode is not FallbackError).
+	DefaultDomain domain.Domain
+
+	// RequireExplicitDomain when true, returns error if no explicit domain is provided.
+	RequireExplicitDomain bool
+
+	// LogFallbacks when true, logs whenever the fallback domain is used.
+	LogFallbacks bool
+}
+
+// DefaultDomainDetectionConfig returns the default configuration with logging enabled.
+func DefaultDomainDetectionConfig() DomainDetectionConfig {
+	return DomainDetectionConfig{
+		FallbackMode:          FallbackLog,
+		DefaultDomain:         domain.DomainLibrarian,
+		RequireExplicitDomain: false,
+		LogFallbacks:          true,
+	}
+}
+
+// StrictDomainDetectionConfig returns a configuration that requires explicit domains.
+// Useful for critical queries where domain correctness is essential.
+func StrictDomainDetectionConfig() DomainDetectionConfig {
+	return DomainDetectionConfig{
+		FallbackMode:          FallbackError,
+		DefaultDomain:         domain.DomainLibrarian,
+		RequireExplicitDomain: true,
+		LogFallbacks:          true,
+	}
+}
+
+// SilentDomainDetectionConfig returns a configuration with silent fallback.
+// Maintains backward compatibility with legacy behavior.
+func SilentDomainDetectionConfig() DomainDetectionConfig {
+	return DomainDetectionConfig{
+		FallbackMode:          FallbackSilent,
+		DefaultDomain:         domain.DomainLibrarian,
+		RequireExplicitDomain: false,
+		LogFallbacks:          false,
+	}
+}
+
+// =============================================================================
+// Domain Detection Errors
+// =============================================================================
+
+// ErrDomainRequired is returned when explicit domain is required but not provided.
+type ErrDomainRequired struct {
+	QueryContext string
+}
+
+func (e *ErrDomainRequired) Error() string {
+	return "explicit domain required but not provided for query: " + e.QueryContext
 }
 
 // =============================================================================
@@ -335,14 +412,15 @@ func (mt *metricsTracker) TTL() time.Duration {
 // HybridQueryCoordinator orchestrates parallel execution of text, semantic,
 // and graph-based searches, fusing results using RRF with learned weights.
 type HybridQueryCoordinator struct {
-	bleveSearcher  *BleveSearcher
-	vectorSearcher *VectorSearcher
-	graphTraverser *GraphTraverser
-	rrfFusion      *RRFFusion
-	learnedWeights *LearnedQueryWeights
-	timeout        time.Duration
-	metricsTracker *metricsTracker
-	mu             sync.RWMutex
+	bleveSearcher        *BleveSearcher
+	vectorSearcher       *VectorSearcher
+	graphTraverser       *GraphTraverser
+	rrfFusion            *RRFFusion
+	learnedWeights       *LearnedQueryWeights
+	timeout              time.Duration
+	metricsTracker       *metricsTracker
+	domainDetectionCfg   DomainDetectionConfig
+	mu                   sync.RWMutex
 }
 
 // NewHybridQueryCoordinator creates a new coordinator with the provided components.
@@ -353,13 +431,14 @@ func NewHybridQueryCoordinator(
 	graph *GraphTraverser,
 ) *HybridQueryCoordinator {
 	return &HybridQueryCoordinator{
-		bleveSearcher:  bleve,
-		vectorSearcher: vector,
-		graphTraverser: graph,
-		rrfFusion:      DefaultRRFFusion(),
-		learnedWeights: NewLearnedQueryWeights(),
-		timeout:        100 * time.Millisecond,
-		metricsTracker: newMetricsTracker(),
+		bleveSearcher:      bleve,
+		vectorSearcher:     vector,
+		graphTraverser:     graph,
+		rrfFusion:          DefaultRRFFusion(),
+		learnedWeights:     NewLearnedQueryWeights(),
+		timeout:            100 * time.Millisecond,
+		metricsTracker:     newMetricsTracker(),
+		domainDetectionCfg: DefaultDomainDetectionConfig(),
 	}
 }
 
@@ -383,13 +462,14 @@ func NewHybridQueryCoordinatorWithOptions(
 	}
 
 	return &HybridQueryCoordinator{
-		bleveSearcher:  bleve,
-		vectorSearcher: vector,
-		graphTraverser: graph,
-		rrfFusion:      rrfFusion,
-		learnedWeights: learnedWeights,
-		timeout:        timeout,
-		metricsTracker: newMetricsTracker(),
+		bleveSearcher:      bleve,
+		vectorSearcher:     vector,
+		graphTraverser:     graph,
+		rrfFusion:          rrfFusion,
+		learnedWeights:     learnedWeights,
+		timeout:            timeout,
+		metricsTracker:     newMetricsTracker(),
+		domainDetectionCfg: DefaultDomainDetectionConfig(),
 	}
 }
 
@@ -418,6 +498,20 @@ func (c *HybridQueryCoordinator) SetRRFParameter(k int) {
 // GetRRFParameter returns the current RRF k parameter.
 func (c *HybridQueryCoordinator) GetRRFParameter() int {
 	return c.rrfFusion.K()
+}
+
+// SetDomainDetectionConfig updates the domain detection configuration.
+func (c *HybridQueryCoordinator) SetDomainDetectionConfig(cfg DomainDetectionConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.domainDetectionCfg = cfg
+}
+
+// GetDomainDetectionConfig returns the current domain detection configuration.
+func (c *HybridQueryCoordinator) GetDomainDetectionConfig() DomainDetectionConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.domainDetectionCfg
 }
 
 // Execute performs a hybrid query with parallel execution of all enabled searchers.
@@ -629,24 +723,118 @@ func (c *HybridQueryCoordinator) getWeightsForQuery(query *HybridQuery) *QueryWe
 	return c.learnedWeights.GetWeights(d, explore)
 }
 
-// detectDomain attempts to determine the domain from query context.
-func (c *HybridQueryCoordinator) detectDomain(query *HybridQuery) domain.Domain {
+// DomainDetectionResult holds the result of domain detection with context.
+type DomainDetectionResult struct {
+	Domain     domain.Domain
+	WasFallback bool
+	Explicit    bool
+}
+
+// detectDomainWithResult attempts to determine the domain from query context.
+// Returns detailed result including whether fallback was used.
+func (c *HybridQueryCoordinator) detectDomainWithResult(query *HybridQuery) DomainDetectionResult {
 	// Check filters for domain specification
 	for _, filter := range query.Filters {
 		if filter.Type == FilterDomain {
 			if d, ok := filter.Value.(domain.Domain); ok {
-				return d
+				return DomainDetectionResult{
+					Domain:     d,
+					WasFallback: false,
+					Explicit:    true,
+				}
 			}
 			if dStr, ok := filter.Value.(string); ok {
 				if d, ok := domain.ParseDomain(dStr); ok {
-					return d
+					return DomainDetectionResult{
+						Domain:     d,
+						WasFallback: false,
+						Explicit:    true,
+					}
 				}
 			}
 		}
 	}
 
-	// Default to Librarian domain
-	return domain.DomainLibrarian
+	// No explicit domain found - this is a fallback
+	c.mu.RLock()
+	cfg := c.domainDetectionCfg
+	c.mu.RUnlock()
+
+	return DomainDetectionResult{
+		Domain:     cfg.DefaultDomain,
+		WasFallback: true,
+		Explicit:    false,
+	}
+}
+
+// detectDomain attempts to determine the domain from query context.
+// Uses configured fallback behavior when detection fails.
+func (c *HybridQueryCoordinator) detectDomain(query *HybridQuery) domain.Domain {
+	result := c.detectDomainWithResult(query)
+
+	if result.WasFallback {
+		c.mu.RLock()
+		cfg := c.domainDetectionCfg
+		c.mu.RUnlock()
+
+		// Log the fallback if configured
+		if cfg.LogFallbacks || cfg.FallbackMode == FallbackLog {
+			queryCtx := c.getQueryContext(query)
+			log.Printf("[WARN] domain detection fallback: using default domain %q for query %s",
+				result.Domain.String(), queryCtx)
+		}
+	}
+
+	return result.Domain
+}
+
+// getQueryContext extracts a brief context string from the query for logging.
+func (c *HybridQueryCoordinator) getQueryContext(query *HybridQuery) string {
+	if query.TextQuery != "" {
+		// Truncate long queries for logging
+		text := query.TextQuery
+		if len(text) > 50 {
+			text = text[:47] + "..."
+		}
+		return "text=\"" + text + "\""
+	}
+	if len(query.SemanticVector) > 0 {
+		return "semantic_vector"
+	}
+	if query.GraphPattern != nil {
+		return "graph_pattern"
+	}
+	return "unknown"
+}
+
+// DetectDomainStrict attempts to detect the domain and returns an error if
+// explicit domain is required but not provided. This is useful for critical
+// queries where using the wrong domain could cause incorrect results.
+func (c *HybridQueryCoordinator) DetectDomainStrict(query *HybridQuery) (domain.Domain, error) {
+	result := c.detectDomainWithResult(query)
+
+	c.mu.RLock()
+	cfg := c.domainDetectionCfg
+	c.mu.RUnlock()
+
+	if result.WasFallback {
+		// Check if explicit domain is required
+		if cfg.RequireExplicitDomain || cfg.FallbackMode == FallbackError {
+			queryCtx := c.getQueryContext(query)
+			log.Printf("[ERROR] domain detection failed: explicit domain required for query %s",
+				queryCtx)
+			return domain.DomainLibrarian, &ErrDomainRequired{QueryContext: queryCtx}
+		}
+
+		// Log the fallback if configured
+		if cfg.LogFallbacks || cfg.FallbackMode == FallbackLog {
+			queryCtx := c.getQueryContext(query)
+			log.Printf("[WARN] domain detection fallback: using default domain %q for query %s",
+				result.Domain.String(), queryCtx)
+		}
+	}
+
+	return result.Domain, nil
 }
 
 // shouldExplore determines whether to use exploration mode for weights.

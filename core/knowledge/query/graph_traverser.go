@@ -77,13 +77,20 @@ type TraverserConfig struct {
 	// Helps prevent exponential path explosion in highly connected graphs.
 	// Default is 20 if not set.
 	MaxPathLength int
+
+	// ConvergenceDetection when true enables detection of diamond/convergence
+	// patterns where different paths lead to the same node. When detected,
+	// the converged node is recorded in results but not re-expanded, preventing
+	// redundant processing. Default is true.
+	ConvergenceDetection bool
 }
 
 // DefaultTraverserConfig returns a TraverserConfig with sensible defaults.
 func DefaultTraverserConfig() TraverserConfig {
 	return TraverserConfig{
-		SimpleVisit:   false,
-		MaxPathLength: 20,
+		SimpleVisit:          false,
+		MaxPathLength:        20,
+		ConvergenceDetection: true,
 	}
 }
 
@@ -206,125 +213,136 @@ type traversalNode struct {
 }
 
 // bfsTraverse performs BFS traversal from a single start node.
+// W4P.34: Added convergence detection to prevent redundant processing
+// when different paths lead to the same node (diamond patterns).
 func (gt *GraphTraverser) bfsTraverse(ctx context.Context, startID string, pattern *GraphPattern, limit int) []GraphResult {
 	if len(pattern.Traversals) == 0 {
-		// No traversal steps - return the start node as result
-		return []GraphResult{{
-			ID:    startID,
-			Path:  []string{startID},
-			Score: 1.0,
-		}}
+		return []GraphResult{{ID: startID, Path: []string{startID}, Score: 1.0}}
 	}
 
 	var results []GraphResult
 	visited := make(map[string]bool)
+	expanded := make(map[string]bool) // W4P.34: Global tracking for convergence
 	queue := list.New()
 
-	// Initialize with start node
 	queue.PushBack(traversalNode{
-		id:        startID,
-		depth:     0,
-		stepIndex: 0,
-		path:      []string{startID},
+		id: startID, depth: 0, stepIndex: 0, path: []string{startID},
 	})
 
 	for queue.Len() > 0 && len(results) < limit {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return results
-		default:
 		}
 
-		elem := queue.Front()
-		queue.Remove(elem)
-		curr := elem.Value.(traversalNode)
+		curr := queue.Remove(queue.Front()).(traversalNode)
 
-		// Check if we've completed all traversal steps
 		if curr.stepIndex >= len(pattern.Traversals) {
-			result := gt.createResult(curr)
-			results = append(results, result)
+			results = append(results, gt.createResult(curr))
 			continue
 		}
 
-		// Get current traversal step
 		step := pattern.Traversals[curr.stepIndex]
+		maxHops := gt.resolveMaxHops(step.MaxHops)
 
-		// Calculate max depth for this step
-		maxHops := step.MaxHops
-		if maxHops <= 0 {
-			maxHops = 1 // Default to single hop
-		}
-		if maxHops == -1 {
-			maxHops = 10 // Cap unlimited at 10
-		}
-
-		// Check depth limit for current step
 		if curr.depth >= maxHops {
-			// Move to next step
-			nextNode := traversalNode{
-				id:           curr.id,
-				depth:        0,
-				stepIndex:    curr.stepIndex + 1,
-				path:         curr.path,
-				matchedEdges: curr.matchedEdges,
-				totalWeight:  curr.totalWeight,
-			}
-			queue.PushBack(nextNode)
+			queue.PushBack(gt.advanceStep(curr))
 			continue
 		}
 
-		// Expand neighbors based on direction
-		neighbors := gt.expandNeighbors(curr.id, step, visited)
-
-		for _, neighbor := range neighbors {
-			// Cycle detection: skip if already in current path
-			if gt.isInPath(neighbor.id, curr.path) {
-				continue
-			}
-
-			// PF.4.6: Path length limit to prevent exponential explosion
-			if len(curr.path) >= gt.config.MaxPathLength {
-				continue
-			}
-
-			// PF.4.6: Mark visited for this traversal branch
-			// With full cycle detection (SimpleVisit=false), the visit key
-			// includes path context to allow the same node to be visited
-			// via different paths while preventing true cycles.
-			visitKey := gt.visitKey(curr.path, neighbor.id)
-			if visited[visitKey] {
-				continue
-			}
-			visited[visitKey] = true
-
-			// Check target matcher if specified
-			if step.TargetMatcher != nil && step.TargetMatcher.Matches() {
-				// For simplicity, we skip nodes that don't match
-				// In a full implementation, we'd check against node properties
-			}
-
-			newPath := make([]string, len(curr.path), len(curr.path)+1)
-			copy(newPath, curr.path)
-			newPath = append(newPath, neighbor.id)
-
-			newEdges := make([]EdgeMatch, len(curr.matchedEdges), len(curr.matchedEdges)+1)
-			copy(newEdges, curr.matchedEdges)
-			newEdges = append(newEdges, neighbor.edgeMatch)
-
-			nextNode := traversalNode{
-				id:           neighbor.id,
-				depth:        curr.depth + 1,
-				stepIndex:    curr.stepIndex,
-				path:         newPath,
-				matchedEdges: newEdges,
-				totalWeight:  curr.totalWeight + neighbor.edgeMatch.Weight,
-			}
-
-			queue.PushBack(nextNode)
+		// W4P.34: Skip expansion if this is a convergence point
+		// The node was already expanded via a different path at this depth/step
+		expandKey := gt.expandKey(curr.id, curr.stepIndex)
+		if gt.config.ConvergenceDetection && expanded[expandKey] {
+			continue
 		}
+		expanded[expandKey] = true
+
+		gt.processNeighbors(curr, step, visited, queue)
 	}
 
 	return results
+}
+
+// expandKey creates a unique key for tracking which nodes have been expanded.
+// W4P.34: Includes stepIndex to allow re-expansion at different traversal steps.
+func (gt *GraphTraverser) expandKey(nodeID string, stepIndex int) string {
+	return fmt.Sprintf("%s@%d", nodeID, stepIndex)
+}
+
+// resolveMaxHops normalizes the MaxHops value with sensible defaults.
+func (gt *GraphTraverser) resolveMaxHops(maxHops int) int {
+	if maxHops <= 0 {
+		return 1
+	}
+	if maxHops == -1 {
+		return 10
+	}
+	return maxHops
+}
+
+// advanceStep creates a new traversal node for the next pattern step.
+func (gt *GraphTraverser) advanceStep(curr traversalNode) traversalNode {
+	return traversalNode{
+		id: curr.id, depth: 0, stepIndex: curr.stepIndex + 1,
+		path: curr.path, matchedEdges: curr.matchedEdges, totalWeight: curr.totalWeight,
+	}
+}
+
+// processNeighbors expands neighbors and adds valid ones to the queue.
+func (gt *GraphTraverser) processNeighbors(
+	curr traversalNode, step TraversalStep,
+	visited map[string]bool, queue *list.List,
+) {
+	neighbors := gt.expandNeighbors(curr.id, step, visited)
+
+	for _, neighbor := range neighbors {
+		if gt.shouldSkipNeighbor(neighbor.id, curr.path, visited) {
+			continue
+		}
+		queue.PushBack(gt.createNextNode(curr, neighbor))
+	}
+}
+
+// shouldSkipNeighbor checks if a neighbor should be skipped during traversal.
+// Returns true for cycles, path length violations, or already visited paths.
+func (gt *GraphTraverser) shouldSkipNeighbor(
+	neighborID string, path []string, visited map[string]bool,
+) bool {
+	// Cycle detection: skip if already in current path
+	if gt.isInPath(neighborID, path) {
+		return true
+	}
+
+	// Path length limit to prevent exponential explosion
+	if len(path) >= gt.config.MaxPathLength {
+		return true
+	}
+
+	// Path-based visit tracking for cycle detection
+	visitKey := gt.visitKey(path, neighborID)
+	if visited[visitKey] {
+		return true
+	}
+	visited[visitKey] = true
+
+	return false
+}
+
+// createNextNode creates a new traversal node for a neighbor.
+func (gt *GraphTraverser) createNextNode(curr traversalNode, neighbor expandNeighbor) traversalNode {
+	newPath := make([]string, len(curr.path), len(curr.path)+1)
+	copy(newPath, curr.path)
+	newPath = append(newPath, neighbor.id)
+
+	newEdges := make([]EdgeMatch, len(curr.matchedEdges), len(curr.matchedEdges)+1)
+	copy(newEdges, curr.matchedEdges)
+	newEdges = append(newEdges, neighbor.edgeMatch)
+
+	return traversalNode{
+		id: neighbor.id, depth: curr.depth + 1, stepIndex: curr.stepIndex,
+		path: newPath, matchedEdges: newEdges,
+		totalWeight: curr.totalWeight + neighbor.edgeMatch.Weight,
+	}
 }
 
 // expandNeighbor represents a neighbor found during BFS expansion.
