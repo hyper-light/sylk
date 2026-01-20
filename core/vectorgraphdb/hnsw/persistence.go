@@ -83,7 +83,6 @@ func (h *Index) saveLayer(stmt *sql.Stmt, layer *layer, layerIdx int) error {
 	defer layer.mu.RUnlock()
 
 	for nodeID, node := range layer.nodes {
-		// Use GetIDs() to get neighbor IDs from ConcurrentNeighborSet
 		neighborIDs := node.neighbors.GetIDs()
 		for _, neighborID := range neighborIDs {
 			if _, err := stmt.Exec(nodeID, neighborID, layerIdx); err != nil {
@@ -100,6 +99,12 @@ func (h *Index) Load(db *sql.DB) error {
 
 	if err := h.loadMetadata(db); err != nil {
 		return err
+	}
+
+	// W4P.15: Ensure layers exist based on maxLevel from metadata.
+	// This handles the case where there are no edges (e.g., single node).
+	if h.maxLevel >= 0 {
+		h.ensureLayers(h.maxLevel)
 	}
 
 	if err := h.loadGraph(db); err != nil {
@@ -158,7 +163,6 @@ func (h *Index) loadGraphRow(rows *sql.Rows) error {
 	h.ensureLayers(level)
 	h.layers[level].addNode(sourceID)
 	h.layers[level].addNode(targetID)
-	// Use 0 as default distance when loading from persistence (distance not stored)
 	h.layers[level].addNeighbor(sourceID, targetID, 0, h.maxNeighborsForLevel(level))
 	return nil
 }
@@ -182,7 +186,13 @@ func (h *Index) LoadVectors(db *sql.DB) error {
 			return err
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// W4P.15: Recompute edge distances after loading vectors
+	h.recomputeEdgeDistances()
+	return nil
 }
 
 func (h *Index) loadVectorRow(rows *sql.Rows) error {
@@ -202,6 +212,68 @@ func (h *Index) loadVectorRow(rows *sql.Rows) error {
 	h.domains[nodeID] = vectorgraphdb.Domain(domain)
 	h.nodeTypes[nodeID] = vectorgraphdb.NodeType(nodeType)
 	return nil
+}
+
+// recomputeEdgeDistances recalculates all edge distances using stored vectors.
+// W4P.15: Called after LoadVectors to restore correct neighbor ordering.
+func (h *Index) recomputeEdgeDistances() {
+	for _, layer := range h.layers {
+		h.recomputeLayerDistances(layer)
+	}
+}
+
+// recomputeLayerDistances recalculates distances for all edges in a single layer.
+func (h *Index) recomputeLayerDistances(l *layer) {
+	l.mu.RLock()
+	nodeIDs := make([]string, 0, len(l.nodes))
+	for id := range l.nodes {
+		nodeIDs = append(nodeIDs, id)
+	}
+	l.mu.RUnlock()
+
+	for _, nodeID := range nodeIDs {
+		h.recomputeNodeDistances(l, nodeID)
+	}
+}
+
+// recomputeNodeDistances recalculates distances for all neighbors of a single node.
+func (h *Index) recomputeNodeDistances(l *layer, nodeID string) {
+	srcVec, srcMag, srcOK := h.getVectorAndMagnitudeLocked(nodeID)
+	if !srcOK {
+		return
+	}
+
+	l.mu.RLock()
+	node, exists := l.nodes[nodeID]
+	l.mu.RUnlock()
+	if !exists {
+		return
+	}
+
+	neighbors := node.neighbors.GetSortedNeighbors()
+	for _, neighbor := range neighbors {
+		dstVec, dstMag, dstOK := h.getVectorAndMagnitudeLocked(neighbor.ID)
+		if !dstOK {
+			continue
+		}
+		similarity := CosineSimilarity(srcVec, dstVec, srcMag, dstMag)
+		distance := float32(1.0 - similarity)
+		node.neighbors.UpdateDistance(neighbor.ID, distance)
+	}
+}
+
+// getVectorAndMagnitudeLocked retrieves vector and magnitude without locking.
+// Caller must hold h.mu (read or write lock).
+func (h *Index) getVectorAndMagnitudeLocked(id string) ([]float32, float64, bool) {
+	vec, vecExists := h.vectors[id]
+	if !vecExists {
+		return nil, 0, false
+	}
+	mag, magExists := h.magnitudes[id]
+	if !magExists {
+		return nil, 0, false
+	}
+	return vec, mag, true
 }
 
 func (h *Index) ensureMetaKeys(tx *sql.Tx) error {
