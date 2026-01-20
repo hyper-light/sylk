@@ -35433,17 +35433,19 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ EXECUTION WAVE 5: Performance/Polish (2 parallel - depends on Wave 4)           ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ [ ] W4N.17 - HotCache EvictPercent Double Loop Performance                      ││
+│ │ [x] W4N.17 - HotCache EvictPercent Double Loop Performance                      ││
 │ │   FILE: core/context/hot_cache.go:256-263                                       ││
 │ │   ISSUE: Nested loop with repeated eviction attempts when target not reached    ││
 │ │   FIX: Use single-pass eviction with pre-calculated batch sizes                 ││
 │ │   SEVERITY: LOW - Performance optimization                                      ││
+│ │   STATUS: DONE - Commit 205ffe8                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.18 - Health Monitoring Hooks                                            ││
+│ │ [x] W4N.18 - Health Monitoring Hooks                                            ││
 │ │   FILES: Multiple concurrency and context files                                 ││
 │ │   ISSUE: No callbacks/metrics for message loss, queue depth, goroutine leaks    ││
 │ │   FIX: Add HealthMonitor interface with optional callbacks                      ││
 │ │   SEVERITY: LOW - Observability improvement                                     ││
+│ │   STATUS: DONE - Commit a94dfbd                                                 ││
 │ │                                                                                  ││
 │ │ ─────────────────────────────────────────────────────────────────────────────── ││
 │ │ DEPENDENCY GRAPH:                                                                ││
