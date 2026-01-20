@@ -37396,7 +37396,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Use GoroutineScope for deadlock detector                                 ││
 │ │   SEVERITY: HIGH - Goroutine leak                                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.34 - DiskQuota Missing Atomic Operations                                ││
+│ │ [x] W12.34 - DiskQuota Missing Atomic Operations                                ││
 │ │   FILE: core/resources/disk_quota.go:112-134                                    ││
 │ │   ISSUE: Size tracking uses non-atomic operations                               ││
 │ │   FIX: Use atomic.Int64 for size tracking                                       ││
@@ -37407,7 +37407,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1D - VECTORGRAPHDB CORE (5 HIGH)                                          ││
 │ │                                                                                  ││
-│ │ [ ] W12.35 - HNSW Unsafe Pointer Cast                                           ││
+│ │ [x] W12.35 - HNSW Unsafe Pointer Cast                                           ││
 │ │   FILE: core/vectorgraphdb/hnsw/persistence.go:363-364,379-380                  ││
 │ │   ISSUE: Unsafe pointer casts without type validation                           ││
 │ │   FIX: Add type assertions with validation                                      ││
