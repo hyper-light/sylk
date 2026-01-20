@@ -203,11 +203,11 @@ func TestHNSWSnapshot_ReaderCount(t *testing.T) {
 		snapshot.AcquireReader()
 		snapshot.AcquireReader()
 
-		count := snapshot.ReleaseReader()
+		count, _ := snapshot.ReleaseReader()
 		assert.Equal(t, int32(1), count)
 		assert.Equal(t, int32(1), snapshot.ReaderCount())
 
-		count = snapshot.ReleaseReader()
+		count, _ = snapshot.ReleaseReader()
 		assert.Equal(t, int32(0), count)
 		assert.Equal(t, int32(0), snapshot.ReaderCount())
 	})

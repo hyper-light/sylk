@@ -1292,3 +1292,293 @@ func BenchmarkCosineSimilarity(b *testing.B) {
 		CosineSimilarity(a, c, magA, magC)
 	}
 }
+
+// W4P.8: Tests for searchLayer pre-allocation optimization
+
+// TestSearchLayerPreallocation verifies that search works correctly with pre-allocation.
+// This is the happy path test ensuring the optimization doesn't break functionality.
+func TestSearchLayerPreallocation(t *testing.T) {
+	idx := New(Config{
+		M:           16,
+		EfConstruct: 100,
+		EfSearch:    50,
+		LevelMult:   0.36067977499789996,
+		Dimension:   128,
+	})
+
+	// Insert test vectors
+	for i := 0; i < 100; i++ {
+		vec := make([]float32, 128)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		if err := idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile); err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+	}
+
+	// Verify search returns correct results
+	query := make([]float32, 128)
+	for j := range query {
+		query[j] = rand.Float32()
+	}
+
+	results := idx.Search(query, 10, nil)
+
+	// Should return requested number of results (or fewer if not enough nodes)
+	if len(results) == 0 {
+		t.Error("Search with pre-allocation returned no results")
+	}
+	if len(results) > 10 {
+		t.Errorf("Search returned more results than requested: got %d, want <= 10", len(results))
+	}
+
+	// Results should be sorted by descending similarity
+	for i := 1; i < len(results); i++ {
+		if results[i].Similarity > results[i-1].Similarity {
+			t.Errorf("Results not sorted: index %d has similarity %v > index %d with %v",
+				i, results[i].Similarity, i-1, results[i-1].Similarity)
+		}
+	}
+}
+
+// TestSearchLayerPreallocationVariousK tests search with different k values
+// to ensure pre-allocation works correctly across sizes.
+func TestSearchLayerPreallocationVariousK(t *testing.T) {
+	idx := New(Config{
+		M:           16,
+		EfConstruct: 100,
+		EfSearch:    100, // Large efSearch to test various k values
+		LevelMult:   0.36067977499789996,
+		Dimension:   64,
+	})
+
+	// Insert test vectors
+	for i := 0; i < 200; i++ {
+		vec := make([]float32, 64)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		if err := idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile); err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+	}
+
+	// Test various k values: small, medium, large
+	kValues := []int{1, 5, 10, 25, 50, 100}
+
+	for _, k := range kValues {
+		t.Run("k="+string(rune('0'+k/100))+string(rune('0'+(k/10)%10))+string(rune('0'+k%10)), func(t *testing.T) {
+			query := make([]float32, 64)
+			for j := range query {
+				query[j] = rand.Float32()
+			}
+
+			results := idx.Search(query, k, nil)
+
+			// Should not exceed requested k
+			if len(results) > k {
+				t.Errorf("k=%d: got %d results, expected <= %d", k, len(results), k)
+			}
+
+			// Should return at least 1 result (we have 200 nodes)
+			if len(results) == 0 {
+				t.Errorf("k=%d: no results returned", k)
+			}
+
+			// Results should be sorted by descending similarity
+			for i := 1; i < len(results); i++ {
+				if results[i].Similarity > results[i-1].Similarity {
+					t.Errorf("k=%d: results not sorted at index %d", k, i)
+				}
+			}
+		})
+	}
+}
+
+// TestSearchLayerPreallocationSmallEf tests with small efSearch values
+// to ensure we don't over-allocate for small searches.
+func TestSearchLayerPreallocationSmallEf(t *testing.T) {
+	// Test with very small efSearch
+	idx := New(Config{
+		M:           8,
+		EfConstruct: 50,
+		EfSearch:    5, // Very small efSearch
+		LevelMult:   0.36067977499789996,
+		Dimension:   32,
+	})
+
+	// Insert a few vectors
+	for i := 0; i < 20; i++ {
+		vec := make([]float32, 32)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		if err := idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile); err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+	}
+
+	query := make([]float32, 32)
+	for j := range query {
+		query[j] = rand.Float32()
+	}
+
+	results := idx.Search(query, 3, nil)
+
+	// Should work correctly even with small efSearch
+	if len(results) == 0 {
+		t.Error("Search with small efSearch returned no results")
+	}
+	if len(results) > 3 {
+		t.Errorf("Search returned more results than requested: got %d, want <= 3", len(results))
+	}
+}
+
+// TestSearchLayerPreallocationLargeEf tests with large efSearch values
+// to ensure pre-allocation handles larger capacity correctly.
+func TestSearchLayerPreallocationLargeEf(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping large efSearch test in short mode")
+	}
+
+	idx := New(Config{
+		M:           32,
+		EfConstruct: 200,
+		EfSearch:    200, // Large efSearch
+		LevelMult:   0.36067977499789996,
+		Dimension:   128,
+	})
+
+	// Insert enough vectors
+	for i := 0; i < 500; i++ {
+		vec := make([]float32, 128)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		if err := idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile); err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
+	}
+
+	query := make([]float32, 128)
+	for j := range query {
+		query[j] = rand.Float32()
+	}
+
+	results := idx.Search(query, 50, nil)
+
+	if len(results) == 0 {
+		t.Error("Search with large efSearch returned no results")
+	}
+	if len(results) > 50 {
+		t.Errorf("Search returned more results than requested: got %d, want <= 50", len(results))
+	}
+
+	// Verify results are properly sorted
+	for i := 1; i < len(results); i++ {
+		if results[i].Similarity > results[i-1].Similarity {
+			t.Errorf("Results not sorted at index %d", i)
+		}
+	}
+}
+
+// BenchmarkSearchLayerAllocations benchmarks search to verify allocation behavior.
+// Run with: go test -bench=BenchmarkSearchLayerAllocations -benchmem
+func BenchmarkSearchLayerAllocations(b *testing.B) {
+	idx := New(Config{
+		M:           16,
+		EfConstruct: 100,
+		EfSearch:    50,
+		LevelMult:   0.36067977499789996,
+		Dimension:   128,
+	})
+
+	// Insert test vectors
+	for i := 0; i < 1000; i++ {
+		vec := make([]float32, 128)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	}
+
+	query := make([]float32, 128)
+	for i := range query {
+		query[i] = rand.Float32()
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		idx.Search(query, 10, nil)
+	}
+}
+
+// BenchmarkSearchLayerAllocationsVariousK benchmarks search with various k values.
+func BenchmarkSearchLayerAllocationsVariousK(b *testing.B) {
+	idx := New(Config{
+		M:           16,
+		EfConstruct: 100,
+		EfSearch:    100,
+		LevelMult:   0.36067977499789996,
+		Dimension:   128,
+	})
+
+	// Insert test vectors
+	for i := 0; i < 1000; i++ {
+		vec := make([]float32, 128)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	}
+
+	query := make([]float32, 128)
+	for i := range query {
+		query[i] = rand.Float32()
+	}
+
+	kValues := []int{1, 10, 50, 100}
+
+	for _, k := range kValues {
+		b.Run("k="+string(rune('0'+k/100))+string(rune('0'+(k/10)%10))+string(rune('0'+k%10)), func(b *testing.B) {
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				idx.Search(query, k, nil)
+			}
+		})
+	}
+}
+
+// BenchmarkSearchLayerAllocationsLargeGraph benchmarks on a larger graph.
+func BenchmarkSearchLayerAllocationsLargeGraph(b *testing.B) {
+	idx := New(Config{
+		M:           32,
+		EfConstruct: 200,
+		EfSearch:    100,
+		LevelMult:   0.36067977499789996,
+		Dimension:   256,
+	})
+
+	// Insert more vectors for a larger graph
+	for i := 0; i < 5000; i++ {
+		vec := make([]float32, 256)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	}
+
+	query := make([]float32, 256)
+	for i := range query {
+		query[i] = rand.Float32()
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		idx.Search(query, 20, nil)
+	}
+}

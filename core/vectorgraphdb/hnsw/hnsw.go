@@ -222,7 +222,11 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 	visited := make(map[string]bool)
 	visited[ep] = true
 
-	candidates := make([]SearchResult, 0, ef)
+	// W4P.8: Pre-allocate candidates with maxCandidates capacity to avoid
+	// reallocation during search. The slice can grow up to ef*2 during BFS
+	// exploration, so we pre-allocate that capacity upfront.
+	maxCandidates := ef * 2
+	candidates := make([]SearchResult, 0, maxCandidates)
 
 	// Bounds check for entry point vector and magnitude
 	epVec, epMag, ok := h.getVectorAndMagnitude(ep)
@@ -231,8 +235,6 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 	}
 	epSim := CosineSimilarity(query, epVec, queryMag, epMag)
 	candidates = append(candidates, SearchResult{ID: ep, Similarity: epSim})
-
-	maxCandidates := ef * 2 // Pre-compute limit to prevent unbounded growth
 
 	// Use explicit index with proper bounds checking to prevent unbounded growth
 	for i := 0; i < len(candidates) && len(candidates) < maxCandidates; i++ {
