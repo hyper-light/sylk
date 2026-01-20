@@ -301,3 +301,105 @@ func TestWriteReferenceBlock_Empty(t *testing.T) {
 
 	assert.Empty(t, sb.String())
 }
+
+func TestSanitizePromptInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"empty_string", "", ""},
+		{"normal_text", "Hello, world!", "Hello, world!"},
+		{"with_newlines", "Line1\nLine2", "Line1\nLine2"},
+		{"with_tabs", "Col1\tCol2", "Col1\tCol2"},
+		{"with_carriage_return", "Line1\r\nLine2", "Line1\r\nLine2"},
+		{"null_bytes_removed", "Hello\x00World", "HelloWorld"},
+		{"control_chars_removed", "Hello\x01\x02\x03World", "HelloWorld"},
+		{"bell_removed", "Alert\x07Sound", "AlertSound"},
+		{"backspace_removed", "Back\x08space", "Backspace"},
+		{"escape_removed", "Escape\x1bSequence", "EscapeSequence"},
+		{"unicode_preserved", "Hello\u4e16\u754c", "Hello\u4e16\u754c"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := sanitizePromptInput(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestEscapeXMLContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"empty_string", "", ""},
+		{"normal_text", "Hello", "Hello"},
+		{"ampersand", "A & B", "A &amp; B"},
+		{"less_than", "a < b", "a &lt; b"},
+		{"greater_than", "a > b", "a &gt; b"},
+		{"double_quote", "say \"hello\"", "say &quot;hello&quot;"},
+		{"single_quote", "it's", "it&apos;s"},
+		{"multiple_special", "<a & b>", "&lt;a &amp; b&gt;"},
+		{"xml_tag", "<script>alert()</script>", "&lt;script&gt;alert()&lt;/script&gt;"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := escapeXMLContent(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestShouldKeepRune(t *testing.T) {
+	tests := []struct {
+		name     string
+		r        rune
+		expected bool
+	}{
+		{"tab_kept", '\t', true},
+		{"newline_kept", '\n', true},
+		{"carriage_return_kept", '\r', true},
+		{"null_removed", 0, false},
+		{"bell_removed", '\x07', false},
+		{"regular_char", 'a', true},
+		{"space_kept", ' ', true},
+		{"unicode_kept", '\u4e16', true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := shouldKeepRune(tt.r)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestLLMContextBuilder_SanitizesContent(t *testing.T) {
+	_, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	builder := NewLLMContextBuilder(nil, nil, nil, nil)
+
+	node := &vectorgraphdb.GraphNode{
+		ID:        "sanitize-test",
+		Domain:    vectorgraphdb.DomainCode,
+		NodeType:  vectorgraphdb.NodeTypeFile,
+		Metadata:  map[string]any{"content": "Hello\x00World\x1bTest", "path": "/test\x00.go"},
+		UpdatedAt: time.Now(),
+	}
+
+	items := []*ContextItem{
+		{Node: node, Selected: true, TokenCount: 10},
+	}
+
+	ctx, err := builder.Build(items)
+
+	require.NoError(t, err)
+	require.Len(t, ctx.CodeContext, 1)
+	assert.Equal(t, "HelloWorldTest", ctx.CodeContext[0].Content)
+	assert.Equal(t, "/test.go", ctx.CodeContext[0].Source)
+}

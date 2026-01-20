@@ -5,9 +5,49 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
+
+// sanitizePromptInput removes potentially dangerous characters from prompt inputs.
+// It removes control characters (except \t, \n, \r), null bytes, and normalizes whitespace.
+func sanitizePromptInput(input string) string {
+	if input == "" {
+		return input
+	}
+
+	var sb strings.Builder
+	sb.Grow(len(input))
+
+	for _, r := range input {
+		if shouldKeepRune(r) {
+			sb.WriteRune(r)
+		}
+	}
+
+	return sb.String()
+}
+
+func shouldKeepRune(r rune) bool {
+	if r == '\t' || r == '\n' || r == '\r' {
+		return true
+	}
+	if unicode.IsControl(r) || r == 0 {
+		return false
+	}
+	return true
+}
+
+// escapeXMLContent escapes special XML characters in content.
+func escapeXMLContent(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&apos;")
+	return s
+}
 
 // LLMContextBuilder constructs structured context for LLM prompts.
 type LLMContextBuilder struct {
@@ -80,7 +120,7 @@ INSTRUCTIONS:
 
 func (b *LLMContextBuilder) annotateItem(item *ContextItem) (*AnnotatedItem, error) {
 	annotated := &AnnotatedItem{
-		Content:   extractNodeContent(item.Node),
+		Content:   sanitizePromptInput(extractNodeContent(item.Node)),
 		Domain:    item.Node.Domain,
 		Freshness: item.Node.UpdatedAt,
 	}
@@ -112,14 +152,14 @@ func (b *LLMContextBuilder) addTrustInfo(annotated *AnnotatedItem, nodeID string
 
 func (b *LLMContextBuilder) addSourceInfo(annotated *AnnotatedItem, node *vectorgraphdb.GraphNode) {
 	if path, ok := node.Metadata["path"].(string); ok {
-		annotated.Source = path
+		annotated.Source = sanitizePromptInput(path)
 		return
 	}
 	if url, ok := node.Metadata["url"].(string); ok {
-		annotated.Source = url
+		annotated.Source = sanitizePromptInput(url)
 		return
 	}
-	annotated.Source = node.ID
+	annotated.Source = sanitizePromptInput(node.ID)
 }
 
 func (b *LLMContextBuilder) addConflictInfo(annotated *AnnotatedItem, nodeID string) {
@@ -259,7 +299,10 @@ func (ctx *LLMContext) FormatAsXML() string {
 		sb.WriteString("  <conflicts>\n")
 		for _, c := range ctx.Conflicts {
 			sb.WriteString(fmt.Sprintf("    <conflict type=\"%s\" items=\"%s,%s\">%s</conflict>\n",
-				c.Type, c.ItemAID, c.ItemBID, c.Description))
+				escapeXMLContent(string(c.Type)),
+				escapeXMLContent(c.ItemAID),
+				escapeXMLContent(c.ItemBID),
+				escapeXMLContent(c.Description)))
 		}
 		sb.WriteString("  </conflicts>\n")
 	}
@@ -278,9 +321,11 @@ func (ctx *LLMContext) formatDomainXML(sb *strings.Builder, domain string, items
 	sb.WriteString(fmt.Sprintf("  <%s_context>\n", domain))
 	for _, item := range items {
 		sb.WriteString(fmt.Sprintf("    <item trust=\"%s\" score=\"%.2f\" source=\"%s\">\n",
-			item.TrustLevel.String(), item.TrustScore, item.Source))
+			escapeXMLContent(item.TrustLevel.String()),
+			item.TrustScore,
+			escapeXMLContent(item.Source)))
 		sb.WriteString("      <content><![CDATA[")
-		sb.WriteString(item.Content)
+		sb.WriteString(sanitizePromptInput(item.Content))
 		sb.WriteString("]]></content>\n")
 		sb.WriteString(fmt.Sprintf("      <freshness>%s</freshness>\n",
 			item.Freshness.Format(time.RFC3339)))
