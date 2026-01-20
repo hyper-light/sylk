@@ -20,27 +20,147 @@ type VectorGraphDB struct {
 	mu   sync.RWMutex
 }
 
+// DBConfig configures the database connection pool.
+//
+// Connection Pool Tuning Guidelines:
+//
+//   - Development/Testing: MaxOpenConns=10, MaxIdleConns=5
+//   - Light Production: MaxOpenConns=25, MaxIdleConns=10
+//   - Heavy Production: MaxOpenConns=50, MaxIdleConns=25
+//   - High Concurrency: MaxOpenConns=100, MaxIdleConns=50
+//
+// MaxIdleConns should typically be 40-50% of MaxOpenConns to balance
+// connection reuse with resource consumption.
+//
+// ConnMaxLifetime controls how long a connection can be reused. Shorter
+// lifetimes help load balancers but increase connection churn.
+//
+// ConnMaxIdleTime controls how long idle connections remain in the pool.
+// This helps release resources during low-activity periods.
 type DBConfig struct {
 	Path            string
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
 }
 
+// Connection pool configuration bounds.
+const (
+	// MinOpenConns is the minimum allowed value for MaxOpenConns.
+	MinOpenConns = 1
+	// MaxOpenConnsLimit is the maximum allowed value for MaxOpenConns.
+	MaxOpenConnsLimit = 200
+	// MinIdleConns is the minimum allowed value for MaxIdleConns.
+	MinIdleConns = 0
+	// DefaultMaxOpenConns is suitable for moderate production workloads.
+	DefaultMaxOpenConns = 25
+	// DefaultMaxIdleConns is 40% of DefaultMaxOpenConns for good reuse.
+	DefaultMaxIdleConns = 10
+	// DefaultConnMaxLifetime prevents stale connections.
+	DefaultConnMaxLifetime = time.Hour
+	// DefaultConnMaxIdleTime releases idle connections after inactivity.
+	DefaultConnMaxIdleTime = 30 * time.Minute
+)
+
+// DefaultDBConfig returns a configuration suitable for moderate production workloads.
 func DefaultDBConfig(path string) DBConfig {
+	return DBConfig{
+		Path:            path,
+		MaxOpenConns:    DefaultMaxOpenConns,
+		MaxIdleConns:    DefaultMaxIdleConns,
+		ConnMaxLifetime: DefaultConnMaxLifetime,
+		ConnMaxIdleTime: DefaultConnMaxIdleTime,
+	}
+}
+
+// LightDBConfig returns a configuration for development or light workloads.
+func LightDBConfig(path string) DBConfig {
 	return DBConfig{
 		Path:            path,
 		MaxOpenConns:    10,
 		MaxIdleConns:    5,
 		ConnMaxLifetime: time.Hour,
+		ConnMaxIdleTime: 30 * time.Minute,
 	}
 }
 
+// HeavyDBConfig returns a configuration for high-concurrency production workloads.
+func HeavyDBConfig(path string) DBConfig {
+	return DBConfig{
+		Path:            path,
+		MaxOpenConns:    50,
+		MaxIdleConns:    25,
+		ConnMaxLifetime: time.Hour,
+		ConnMaxIdleTime: 30 * time.Minute,
+	}
+}
+
+// Validate checks the configuration values and returns an error if invalid.
+// It ensures MaxOpenConns is within bounds and MaxIdleConns does not exceed MaxOpenConns.
+func (c DBConfig) Validate() error {
+	if c.Path == "" {
+		return fmt.Errorf("db config: path is required")
+	}
+	if c.MaxOpenConns < MinOpenConns || c.MaxOpenConns > MaxOpenConnsLimit {
+		return fmt.Errorf("db config: MaxOpenConns must be between %d and %d, got %d",
+			MinOpenConns, MaxOpenConnsLimit, c.MaxOpenConns)
+	}
+	if c.MaxIdleConns < MinIdleConns {
+		return fmt.Errorf("db config: MaxIdleConns must be at least %d, got %d",
+			MinIdleConns, c.MaxIdleConns)
+	}
+	if c.MaxIdleConns > c.MaxOpenConns {
+		return fmt.Errorf("db config: MaxIdleConns (%d) cannot exceed MaxOpenConns (%d)",
+			c.MaxIdleConns, c.MaxOpenConns)
+	}
+	return nil
+}
+
+// DBOption is a functional option for configuring DBConfig.
+type DBOption func(*DBConfig)
+
+// WithMaxOpenConns sets the maximum number of open connections.
+func WithMaxOpenConns(n int) DBOption {
+	return func(c *DBConfig) { c.MaxOpenConns = n }
+}
+
+// WithMaxIdleConns sets the maximum number of idle connections.
+func WithMaxIdleConns(n int) DBOption {
+	return func(c *DBConfig) { c.MaxIdleConns = n }
+}
+
+// WithConnMaxLifetime sets the maximum connection lifetime.
+func WithConnMaxLifetime(d time.Duration) DBOption {
+	return func(c *DBConfig) { c.ConnMaxLifetime = d }
+}
+
+// WithConnMaxIdleTime sets the maximum idle time for connections.
+func WithConnMaxIdleTime(d time.Duration) DBOption {
+	return func(c *DBConfig) { c.ConnMaxIdleTime = d }
+}
+
+// Open opens a database with default configuration.
 func Open(path string) (*VectorGraphDB, error) {
 	return OpenWithConfig(DefaultDBConfig(path))
 }
 
+// OpenWithOptions opens a database with functional options applied to defaults.
+func OpenWithOptions(path string, opts ...DBOption) (*VectorGraphDB, error) {
+	config := DefaultDBConfig(path)
+	for _, opt := range opts {
+		opt(&config)
+	}
+	return OpenWithConfig(config)
+}
+
+// OpenWithConfig opens a database with the given configuration.
+// The configuration is validated before opening the database.
 func OpenWithConfig(config DBConfig) (*VectorGraphDB, error) {
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+
 	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_synchronous=normal", config.Path)
 
 	db, err := sql.Open("sqlite3", dsn)
@@ -51,6 +171,7 @@ func OpenWithConfig(config DBConfig) (*VectorGraphDB, error) {
 	db.SetMaxOpenConns(config.MaxOpenConns)
 	db.SetMaxIdleConns(config.MaxIdleConns)
 	db.SetConnMaxLifetime(config.ConnMaxLifetime)
+	db.SetConnMaxIdleTime(config.ConnMaxIdleTime)
 
 	if err := db.Ping(); err != nil {
 		db.Close()
