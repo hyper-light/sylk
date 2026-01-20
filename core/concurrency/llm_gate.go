@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -192,39 +193,100 @@ func (q *UnboundedQueue) Push(req *LLMRequest) error {
 		return ErrGateClosed
 	}
 
-	// Handle full queue based on policy
-	if len(q.items) >= q.maxSize {
-		switch q.rejectPolicy {
-		case RejectPolicyError:
-			return ErrUserQueueFull
-		case RejectPolicyDropOldest:
-			// Drop oldest item to make room
-			if len(q.items) > 0 {
-				q.items[0] = nil // Help GC
-				q.items = q.items[1:]
-			}
-		case RejectPolicyBlock:
-			// Wait for space with timeout
-			deadline := time.Now().Add(q.blockTimeout)
-			for len(q.items) >= q.maxSize && !q.closed {
-				remaining := time.Until(deadline)
-				if remaining <= 0 {
-					return ErrUserQueueFull
-				}
-				// Use timed wait
-				q.mu.Unlock()
-				time.Sleep(min(remaining, 10*time.Millisecond))
-				q.mu.Lock()
-			}
-			if q.closed {
-				return ErrGateClosed
-			}
-		}
+	if err := q.handleFullQueue(); err != nil {
+		return err
 	}
 
 	q.items = append(q.items, req)
 	q.cond.Signal()
 	return nil
+}
+
+// handleFullQueue applies the reject policy when the queue is full.
+// Must be called with q.mu held. Returns with q.mu held.
+func (q *UnboundedQueue) handleFullQueue() error {
+	if !q.isFull() {
+		return nil
+	}
+	return q.applyRejectPolicy()
+}
+
+// isFull returns true if the queue is at capacity.
+func (q *UnboundedQueue) isFull() bool {
+	return len(q.items) >= q.maxSize
+}
+
+// applyRejectPolicy applies the configured policy when queue is full.
+// Must be called with q.mu held. Returns with q.mu held.
+func (q *UnboundedQueue) applyRejectPolicy() error {
+	switch q.rejectPolicy {
+	case RejectPolicyError:
+		return ErrUserQueueFull
+	case RejectPolicyDropOldest:
+		q.dropOldest()
+	case RejectPolicyBlock:
+		return q.waitForSpace()
+	}
+	return nil
+}
+
+// dropOldest removes the oldest item from the queue.
+// Must be called with q.mu held.
+func (q *UnboundedQueue) dropOldest() {
+	if len(q.items) > 0 {
+		q.items[0] = nil // Help GC
+		q.items = q.items[1:]
+	}
+}
+
+// waitForSpace blocks until space is available in the queue or timeout expires.
+// Must be called with q.mu held. Returns with q.mu held.
+func (q *UnboundedQueue) waitForSpace() error {
+	deadline := time.Now().Add(q.blockTimeout)
+	timerDone := make(chan struct{})
+	go q.timedWakeup(timerDone, q.blockTimeout)
+	defer close(timerDone)
+
+	return q.waitUntilSpaceOrDeadline(deadline)
+}
+
+// waitUntilSpaceOrDeadline waits until space is available, queue is closed, or deadline passes.
+// Must be called with q.mu held. Returns with q.mu held.
+func (q *UnboundedQueue) waitUntilSpaceOrDeadline(deadline time.Time) error {
+	for q.shouldWaitForSpace() {
+		if time.Now().After(deadline) {
+			return ErrUserQueueFull
+		}
+		q.cond.Wait()
+	}
+	return q.checkClosedAfterWait()
+}
+
+// shouldWaitForSpace returns true if the queue is full and not closed.
+func (q *UnboundedQueue) shouldWaitForSpace() bool {
+	return len(q.items) >= q.maxSize && !q.closed
+}
+
+// checkClosedAfterWait returns ErrGateClosed if the queue was closed.
+func (q *UnboundedQueue) checkClosedAfterWait() error {
+	if q.closed {
+		return ErrGateClosed
+	}
+	return nil
+}
+
+// timedWakeup broadcasts on the condition variable after the timeout.
+// Exits early if done channel is closed.
+func (q *UnboundedQueue) timedWakeup(done <-chan struct{}, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		q.cond.Broadcast()
+	case <-done:
+		// Caller finished, no need to wake
+	}
 }
 
 // Pop removes and returns the first request from the queue.
@@ -369,7 +431,8 @@ type DualQueueGateConfig struct {
 	UserQueueBlockTimeout time.Duration // Block timeout for user queue (default: 5s)
 	MaxConcurrentRequests int
 	RequestTimeout        time.Duration
-	ShutdownTimeout       time.Duration
+	ShutdownTimeout       time.Duration // Soft timeout for graceful shutdown (default: 5s)
+	HardDeadline          time.Duration // Hard deadline after which shutdown completes forcefully (default: 2x ShutdownTimeout)
 }
 
 func DefaultDualQueueGateConfig() DualQueueGateConfig {
@@ -381,6 +444,7 @@ func DefaultDualQueueGateConfig() DualQueueGateConfig {
 		MaxConcurrentRequests: 4,
 		RequestTimeout:        5 * time.Minute,
 		ShutdownTimeout:       5 * time.Second,
+		HardDeadline:          10 * time.Second, // 2x ShutdownTimeout
 	}
 }
 
@@ -453,6 +517,9 @@ func normalizeDualQueueGateConfig(cfg DualQueueGateConfig) DualQueueGateConfig {
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 5 * time.Second
+	}
+	if cfg.HardDeadline <= 0 {
+		cfg.HardDeadline = 2 * cfg.ShutdownTimeout
 	}
 	return cfg
 }
@@ -903,15 +970,94 @@ func (g *DualQueueGate) drainQueue(queue interface{ Pop() *LLMRequest }) {
 	}
 }
 
-// waitForRequests waits for all pending requests to complete within the
-// shutdown timeout. Uses a bounded wait pattern to ensure the wait goroutine
-// is properly cleaned up even if timeout fires.
+// waitForRequests waits for all pending requests to complete within the shutdown
+// timeout. If requests don't complete within the soft timeout, it waits until
+// the hard deadline and then logs orphaned requests before returning.
 func (g *DualQueueGate) waitForRequests() {
-	timeout := g.config.ShutdownTimeout
-	if timeout <= 0 {
+	if g.config.ShutdownTimeout <= 0 {
 		return
 	}
-	g.boundedWaitGroupWait(&g.requestWg, timeout)
+	if g.waitWithSoftTimeout() {
+		return
+	}
+	g.waitWithHardDeadline()
+}
+
+// waitWithSoftTimeout waits for requests to complete within the soft timeout.
+// Returns true if all requests completed, false if timeout was reached.
+func (g *DualQueueGate) waitWithSoftTimeout() bool {
+	done := make(chan struct{})
+	go g.signalOnWaitGroupDone(&g.requestWg, done)
+
+	timer := time.NewTimer(g.config.ShutdownTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// waitWithHardDeadline waits until the hard deadline, then logs orphaned requests.
+func (g *DualQueueGate) waitWithHardDeadline() {
+	remaining := g.config.HardDeadline - g.config.ShutdownTimeout
+	if remaining <= 0 {
+		g.logOrphanedRequests()
+		return
+	}
+
+	done := make(chan struct{})
+	go g.signalOnWaitGroupDone(&g.requestWg, done)
+
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		g.logOrphanedRequests()
+	}
+}
+
+// signalOnWaitGroupDone waits on the WaitGroup and closes done when finished.
+func (g *DualQueueGate) signalOnWaitGroupDone(wg *sync.WaitGroup, done chan struct{}) {
+	wg.Wait()
+	close(done)
+}
+
+// logOrphanedRequests logs information about requests that didn't complete.
+func (g *DualQueueGate) logOrphanedRequests() {
+	g.mu.Lock()
+	orphans := g.collectOrphanInfo()
+	g.mu.Unlock()
+
+	for _, info := range orphans {
+		log.Printf("DualQueueGate: orphaned request id=%s agent=%s running=%v",
+			info.id, info.agent, info.duration)
+	}
+}
+
+// orphanInfo holds information about an orphaned request for logging.
+type orphanInfo struct {
+	id       string
+	agent    string
+	duration time.Duration
+}
+
+// collectOrphanInfo gathers information about active requests. Must be called with mu held.
+func (g *DualQueueGate) collectOrphanInfo() []orphanInfo {
+	result := make([]orphanInfo, 0, len(g.activeRequests))
+	for _, ar := range g.activeRequests {
+		result = append(result, orphanInfo{
+			id:       ar.Request.ID,
+			agent:    string(ar.Request.AgentType),
+			duration: time.Since(ar.StartedAt),
+		})
+	}
+	return result
 }
 
 // boundedWaitGroupWait waits for the WaitGroup to complete within the given
