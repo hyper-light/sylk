@@ -875,6 +875,13 @@ func (pq *ProductQuantizer) TrainWithConfig(ctx context.Context, vectors [][]flo
 // extractSubspace extracts the subspace slice from each vector.
 // For subspace i, extracts dimensions [i*subspaceDim, (i+1)*subspaceDim).
 func (pq *ProductQuantizer) extractSubspace(vectors [][]float32, subspace int) [][]float32 {
+	return pq.extractSubspaceBatch(vectors, subspace)
+}
+
+// extractSubspaceNaive extracts subspace vectors using individual allocations.
+// This is the original implementation, kept for testing and comparison.
+// Each vector gets its own slice allocation.
+func (pq *ProductQuantizer) extractSubspaceNaive(vectors [][]float32, subspace int) [][]float32 {
 	start := subspace * pq.subspaceDim
 	end := start + pq.subspaceDim
 
@@ -884,6 +891,32 @@ func (pq *ProductQuantizer) extractSubspace(vectors [][]float32, subspace int) [
 		copy(subVec, v[start:end])
 		result[i] = subVec
 	}
+	return result
+}
+
+// extractSubspaceBatch extracts subspace vectors using a single contiguous buffer.
+// This reduces allocations from O(n) to O(1) by pre-allocating all memory at once
+// and using slice views into the contiguous buffer.
+func (pq *ProductQuantizer) extractSubspaceBatch(vectors [][]float32, subspace int) [][]float32 {
+	n := len(vectors)
+	if n == 0 {
+		return [][]float32{}
+	}
+
+	dim := pq.subspaceDim
+	start := subspace * dim
+
+	// Single allocation for all subspace data
+	buffer := make([]float32, n*dim)
+	result := make([][]float32, n)
+
+	// Copy data and create slice views
+	for i, v := range vectors {
+		offset := i * dim
+		copy(buffer[offset:offset+dim], v[start:start+dim])
+		result[i] = buffer[offset : offset+dim]
+	}
+
 	return result
 }
 
@@ -1291,6 +1324,7 @@ func (pq *ProductQuantizer) assignNearestCentroids(
 ) {
 	k := pq.centroidsPerSubspace
 	cNorms := pq.centroidNorms[subspace]
+	dots := buf.dots
 
 	for i := 0; i < chunkN; i++ {
 		if results[start+i] == nil {
@@ -1299,18 +1333,54 @@ func (pq *ProductQuantizer) assignNearestCentroids(
 
 		xNorm := buf.xNorms[i]
 		dotRow := i * k
-		minDist := float32(math.MaxFloat32)
-		minIdx := uint8(0)
-
-		for c := 0; c < k; c++ {
-			dist := xNorm + cNorms[c] - 2*buf.dots[dotRow+c]
-			if dist < minDist {
-				minDist = dist
-				minIdx = uint8(c)
-			}
-		}
+		minIdx := argminDistance(xNorm, cNorms, dots, dotRow, k)
 		results[start+i][subspace] = minIdx
 	}
+}
+
+// argminDistance finds the centroid index with minimum distance using 4x loop unrolling.
+// Uses the identity: dist = xNorm + cNorm - 2*dot
+// Returns the index of the centroid with minimum distance.
+func argminDistance(xNorm float32, cNorms, dots []float32, dotRow, k int) uint8 {
+	minDist := float32(math.MaxFloat32)
+	minIdx := uint8(0)
+
+	// 4x unrolled loop for better branch prediction
+	c := 0
+	for ; c <= k-4; c += 4 {
+		dist0 := xNorm + cNorms[c] - 2*dots[dotRow+c]
+		dist1 := xNorm + cNorms[c+1] - 2*dots[dotRow+c+1]
+		dist2 := xNorm + cNorms[c+2] - 2*dots[dotRow+c+2]
+		dist3 := xNorm + cNorms[c+3] - 2*dots[dotRow+c+3]
+
+		if dist0 < minDist {
+			minDist = dist0
+			minIdx = uint8(c)
+		}
+		if dist1 < minDist {
+			minDist = dist1
+			minIdx = uint8(c + 1)
+		}
+		if dist2 < minDist {
+			minDist = dist2
+			minIdx = uint8(c + 2)
+		}
+		if dist3 < minDist {
+			minDist = dist3
+			minIdx = uint8(c + 3)
+		}
+	}
+
+	// Handle remainder
+	for ; c < k; c++ {
+		dist := xNorm + cNorms[c] - 2*dots[dotRow+c]
+		if dist < minDist {
+			minDist = dist
+			minIdx = uint8(c)
+		}
+	}
+
+	return minIdx
 }
 
 // =============================================================================
