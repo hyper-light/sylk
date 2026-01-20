@@ -1,6 +1,7 @@
 package mitigations
 
 import (
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
@@ -244,6 +245,8 @@ type QualityComponents struct {
 }
 
 // ContextItem represents a scored context item for LLM prompts.
+// The struct includes a mutex for thread-safe score updates during redundancy
+// penalty calculation.
 type ContextItem struct {
 	Node          *vectorgraphdb.GraphNode `json:"node"`
 	QualityScore  float64                  `json:"quality_score"`
@@ -252,6 +255,44 @@ type ContextItem struct {
 	Components    QualityComponents        `json:"components"`
 	Selected      bool                     `json:"selected"`
 	Reason        string                   `json:"reason,omitempty"`
+	scoreMu       scoreMutex               `json:"-"`
+}
+
+// scoreMutex wraps sync.RWMutex for ContextItem score protection.
+type scoreMutex struct {
+	mu sync.RWMutex
+}
+
+// UpdateRedundancy safely updates redundancy and derived scores.
+// This method provides atomic updates to prevent race conditions during
+// concurrent redundancy penalty calculations.
+func (c *ContextItem) UpdateRedundancy(redundancy, qualityScore, scorePerToken float64) {
+	c.scoreMu.mu.Lock()
+	defer c.scoreMu.mu.Unlock()
+	c.Components.Redundancy = redundancy
+	c.QualityScore = qualityScore
+	c.ScorePerToken = scorePerToken
+}
+
+// GetQualityScore returns the quality score with read lock protection.
+func (c *ContextItem) GetQualityScore() float64 {
+	c.scoreMu.mu.RLock()
+	defer c.scoreMu.mu.RUnlock()
+	return c.QualityScore
+}
+
+// GetScorePerToken returns the score per token with read lock protection.
+func (c *ContextItem) GetScorePerToken() float64 {
+	c.scoreMu.mu.RLock()
+	defer c.scoreMu.mu.RUnlock()
+	return c.ScorePerToken
+}
+
+// GetRedundancy returns the redundancy component with read lock protection.
+func (c *ContextItem) GetRedundancy() float64 {
+	c.scoreMu.mu.RLock()
+	defer c.scoreMu.mu.RUnlock()
+	return c.Components.Redundancy
 }
 
 // AnnotatedItem represents a context item with trust and conflict annotations.

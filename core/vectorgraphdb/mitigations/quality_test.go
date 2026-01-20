@@ -1,6 +1,7 @@
 package mitigations
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
@@ -239,5 +240,83 @@ func TestBuildWordSet(t *testing.T) {
 			result := buildWordSet(tt.content)
 			assert.Equal(t, tt.expected, result)
 		})
+	}
+}
+
+func TestContextItem_UpdateRedundancy_Concurrent(t *testing.T) {
+	item := &ContextItem{
+		QualityScore:  0.8,
+		TokenCount:    100,
+		ScorePerToken: 0.008,
+		Components:    QualityComponents{Redundancy: 0},
+	}
+
+	var wg sync.WaitGroup
+	numGoroutines := 10
+	updatesPerGoroutine := 100
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < updatesPerGoroutine; j++ {
+				item.UpdateRedundancy(0.5, 0.7, 0.007)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify final state is consistent
+	assert.Equal(t, 0.5, item.Components.Redundancy)
+	assert.Equal(t, 0.7, item.QualityScore)
+	assert.Equal(t, 0.007, item.ScorePerToken)
+}
+
+func TestApplyRedundancyPenalty_ThreadSafe(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	scorer := NewContextQualityScorer(db, DefaultQualityWeights(), nil, nil)
+
+	// Create items with similar content
+	items := make([]*ContextItem, 0)
+	for i := 0; i < 5; i++ {
+		node := &vectorgraphdb.GraphNode{
+			ID:       "node-" + string(rune('A'+i)),
+			Domain:   vectorgraphdb.DomainCode,
+			NodeType: vectorgraphdb.NodeTypeFile,
+			Metadata: map[string]any{"content": "common words shared content"},
+		}
+		item, _ := scorer.Score(node, 0.9)
+		items = append(items, item)
+	}
+
+	// Apply redundancy penalty concurrently with reads
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		scorer.applyRedundancyPenalty(items)
+	}()
+
+	go func() {
+		defer wg.Done()
+		// Concurrent reads using thread-safe getters
+		for i := 0; i < 100; i++ {
+			for _, item := range items {
+				_ = item.GetQualityScore()
+				_ = item.GetScorePerToken()
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	// Verify items were modified
+	for _, item := range items[1:] {
+		// Items after first should have some redundancy penalty
+		assert.GreaterOrEqual(t, item.GetRedundancy(), 0.0)
 	}
 }

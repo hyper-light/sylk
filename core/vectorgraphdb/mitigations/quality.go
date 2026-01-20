@@ -202,12 +202,19 @@ func (s *ContextQualityScorer) applyRedundancyPenalty(items []*ContextItem) {
 		for j := i + 1; j < len(items); j++ {
 			similarity := s.computeContentSimilarity(items[i].Node, items[j].Node)
 			if similarity > 0.7 {
-				items[j].Components.Redundancy += similarity * 0.3
-				items[j].QualityScore = s.computeQualityScore(items[j].Components)
-				items[j].ScorePerToken = s.computeScorePerToken(items[j].QualityScore, items[j].TokenCount)
+				s.updateItemRedundancy(items[j], similarity*0.3)
 			}
 		}
 	}
+}
+
+func (s *ContextQualityScorer) updateItemRedundancy(item *ContextItem, delta float64) {
+	newRedundancy := item.Components.Redundancy + delta
+	components := item.Components
+	components.Redundancy = newRedundancy
+	qualityScore := s.computeQualityScore(components)
+	scorePerToken := s.computeScorePerToken(qualityScore, item.TokenCount)
+	item.UpdateRedundancy(newRedundancy, qualityScore, scorePerToken)
 }
 
 func (s *ContextQualityScorer) computeContentSimilarity(a, b *vectorgraphdb.GraphNode) float64 {
