@@ -240,7 +240,7 @@ func (h *AsyncRetrievalFeedbackHook) ensureChunkStats(chunkID string) string {
 // This method is non-blocking - if the buffer is full, the feedback is dropped.
 func (h *AsyncRetrievalFeedbackHook) RecordRetrieval(chunkID string, wasUseful bool, ctx RetrievalContext) error {
 	if h.stopped.Load() {
-		return fmt.Errorf("feedback hook has been stopped")
+		return fmt.Errorf("cannot record retrieval for chunk %q: feedback hook has been stopped", chunkID)
 	}
 
 	// Ensure chunk stats exist and get the statsID for reference
@@ -261,7 +261,7 @@ func (h *AsyncRetrievalFeedbackHook) RecordRetrieval(chunkID string, wasUseful b
 	default:
 		// Buffer full, drop the feedback
 		h.droppedCount.Add(1)
-		return fmt.Errorf("feedback buffer full, entry dropped")
+		return fmt.Errorf("feedback buffer full: dropped entry for chunk %q (useful=%t)", chunkID, wasUseful)
 	}
 }
 
@@ -269,7 +269,7 @@ func (h *AsyncRetrievalFeedbackHook) RecordRetrieval(chunkID string, wasUseful b
 // Use this when you need to ensure feedback is recorded before continuing.
 func (h *AsyncRetrievalFeedbackHook) RecordRetrievalSync(chunkID string, wasUseful bool, ctx RetrievalContext) error {
 	if h.stopped.Load() {
-		return fmt.Errorf("feedback hook has been stopped")
+		return fmt.Errorf("cannot record retrieval for chunk %q: feedback hook has been stopped", chunkID)
 	}
 
 	// Ensure chunk stats exist and get the statsID for reference

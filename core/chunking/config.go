@@ -1,3 +1,41 @@
+// Package chunking provides adaptive text chunking with Bayesian-learned parameters.
+//
+// The chunking package implements a system for splitting text into semantically
+// meaningful chunks for retrieval-augmented generation (RAG) pipelines. It uses
+// Thompson Sampling and Bayesian updating to learn optimal chunk sizes over time
+// based on retrieval feedback.
+//
+// # Core Components
+//
+// ChunkConfig defines the configuration parameters for chunking, including:
+//   - MaxTokens: Hard constraint from embedding model limits
+//   - TargetTokens: Learned optimal chunk size (Gamma distribution)
+//   - ContextTokensBefore/After: Learned context window sizes
+//   - OverflowStrategyWeights: Learned strategy preferences (Dirichlet distribution)
+//
+// ChunkConfigLearner maintains per-domain configurations and updates them based
+// on retrieval feedback observations. It uses exponential decay to prioritize
+// recent observations while maintaining stability.
+//
+// # Citation Detection
+//
+// CitationDetector identifies when chunks are cited in generated responses,
+// enabling automatic feedback collection. It supports multiple citation patterns
+// including bracketed references, quoted text, and content overlap detection.
+//
+// # Retrieval Feedback
+//
+// AsyncRetrievalFeedbackHook provides non-blocking feedback recording for
+// production use, while SyncRetrievalFeedbackHook offers synchronous recording
+// for testing scenarios.
+//
+// # Domain Support
+//
+// The package provides domain-specific priors for:
+//   - DomainCode: Source code with smaller chunks and high staleness weight
+//   - DomainAcademic: Research content with larger chunks for concept completeness
+//   - DomainHistory: Narrative content with moderate context for flow
+//   - DomainGeneral: Balanced defaults for mixed content
 package chunking
 
 import "fmt"

@@ -551,12 +551,15 @@ func longestCommonSubstringLength(s1, s2 string) int {
 }
 
 // findSignificantOverlaps finds phrases that appear in both strings.
+// It returns up to 10 significant overlapping phrases between the two strings.
+// The function uses a greedy approach to find the longest non-overlapping phrases.
 func findSignificantOverlaps(s1, s2 string, minLength int) []string {
 	if len(s1) < minLength || len(s2) < minLength {
 		return nil
 	}
 
-	var overlaps []string
+	// Pre-allocate with expected capacity (max 10 overlaps)
+	overlaps := make([]string, 0, 10)
 	words1 := strings.Fields(s1)
 
 	// Build phrases of increasing length and check for overlap

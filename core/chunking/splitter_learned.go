@@ -170,7 +170,7 @@ func (lss *LearnedSemanticSplitter) SplitWithLearning(ctx context.Context, conte
 	// Use the base splitter with learned target size
 	baseChunks, err := lss.baseSplitter.Split(ctx, content, targetTokens)
 	if err != nil {
-		return nil, fmt.Errorf("base splitter failed: %w", err)
+		return nil, fmt.Errorf("base splitter failed for domain %q with target %d tokens: %w", domain.String(), targetTokens, err)
 	}
 
 	// Post-process chunks to add context and metadata
