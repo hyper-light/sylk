@@ -174,7 +174,7 @@ func (h *Index) insertWithConnections(id string, vector []float32, mag float64, 
 		epVec = vector
 		epMag = mag
 	}
-	currDist := 1.0 - CosineSimilarity(vector, epVec, mag, epMag)
+	currDist := CosineDistance(vector, epVec, mag, epMag)
 
 	for level := h.maxLevel; level > nodeLevel; level-- {
 		currObj, currDist = h.greedySearchLayer(vector, mag, currObj, currDist, level)
@@ -186,6 +186,8 @@ func (h *Index) insertWithConnections(id string, vector []float32, mag float64, 
 		h.connectNode(id, neighbors, level)
 		if len(neighbors) > 0 {
 			currObj = neighbors[0].ID
+			// Use similarity from search result to compute distance
+			// (already using shared CosineDistance via CosineSimilarity)
 			currDist = 1.0 - neighbors[0].Similarity
 		}
 	}
@@ -207,7 +209,7 @@ func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, 
 			if !exists {
 				continue
 			}
-			dist := 1.0 - CosineSimilarity(query, vec, queryMag, mag)
+			dist := CosineDistance(query, vec, queryMag, mag)
 			if dist < epDist {
 				ep = neighbor
 				epDist = dist
@@ -333,7 +335,7 @@ func (h *Index) searchLocked(query []float32, queryMag float64, k int, filter *S
 		// Entry point missing data - return empty results
 		return nil
 	}
-	currDist := 1.0 - CosineSimilarity(query, epVec, queryMag, epMag)
+	currDist := CosineDistance(query, epVec, queryMag, epMag)
 
 	for level := h.maxLevel; level > 0; level-- {
 		currObj, currDist = h.greedySearchLayer(query, queryMag, currObj, currDist, level)
