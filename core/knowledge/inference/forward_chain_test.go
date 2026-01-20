@@ -834,3 +834,407 @@ func TestForwardChainer_Integration_CyclicGraph(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// W4P.14: Soft Iteration Limit Tests
+// =============================================================================
+
+func TestForwardChainer_MaxRuleApplicationsReached(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	fc := NewForwardChainer(evaluator, 1000) // High iteration limit
+	fc.SetMaxRuleApplications(5)              // Low rule application limit
+	ctx := context.Background()
+
+	// Transitive rule that will generate many applications
+	rules := []InferenceRule{
+		{
+			ID:   "transitivity",
+			Name: "Transitivity",
+			Head: RuleCondition{
+				Subject:   "?x",
+				Predicate: "calls",
+				Object:    "?z",
+			},
+			Body: []RuleCondition{
+				{Subject: "?x", Predicate: "calls", Object: "?y"},
+				{Subject: "?y", Predicate: "calls", Object: "?z"},
+			},
+			Priority: 1,
+			Enabled:  true,
+		},
+	}
+
+	// Long chain that needs many rule applications
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "B", Predicate: "calls", Target: "C"},
+		{Source: "C", Predicate: "calls", Target: "D"},
+		{Source: "D", Predicate: "calls", Target: "E"},
+		{Source: "E", Predicate: "calls", Target: "F"},
+		{Source: "F", Predicate: "calls", Target: "G"},
+	}
+
+	results, err := fc.Evaluate(ctx, rules, edges)
+
+	if !errors.Is(err, ErrMaxRuleApplicationsReached) {
+		t.Errorf("Expected ErrMaxRuleApplicationsReached, got %v", err)
+	}
+
+	// Should have partial results before limit hit
+	if len(results) == 0 {
+		t.Error("Expected partial results before max rule applications")
+	}
+}
+
+func TestForwardChainer_ForwardChainError_Details(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	fc := NewForwardChainer(evaluator, 2) // Very low limit
+	ctx := context.Background()
+
+	rules := []InferenceRule{
+		{
+			ID:   "transitivity",
+			Name: "Transitivity",
+			Head: RuleCondition{
+				Subject:   "?x",
+				Predicate: "calls",
+				Object:    "?z",
+			},
+			Body: []RuleCondition{
+				{Subject: "?x", Predicate: "calls", Object: "?y"},
+				{Subject: "?y", Predicate: "calls", Object: "?z"},
+			},
+			Priority: 1,
+			Enabled:  true,
+		},
+	}
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "B", Predicate: "calls", Target: "C"},
+		{Source: "C", Predicate: "calls", Target: "D"},
+		{Source: "D", Predicate: "calls", Target: "E"},
+	}
+
+	_, err := fc.Evaluate(ctx, rules, edges)
+
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	var fcErr *ForwardChainError
+	if !errors.As(err, &fcErr) {
+		t.Fatalf("Expected ForwardChainError, got %T", err)
+	}
+
+	// Verify error details
+	if fcErr.Iteration < 1 {
+		t.Errorf("Expected iteration >= 1, got %d", fcErr.Iteration)
+	}
+	if fcErr.DerivedCount == 0 {
+		t.Error("Expected non-zero derived count")
+	}
+
+	// Error string should contain details
+	errStr := fcErr.Error()
+	if errStr == "" {
+		t.Error("Expected non-empty error string")
+	}
+}
+
+func TestForwardChainer_CycleDetectionEnabled(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	fc := NewForwardChainer(evaluator, 100)
+
+	// Cycle detection should be enabled by default
+	if !fc.IsCycleDetectionEnabled() {
+		t.Error("Cycle detection should be enabled by default")
+	}
+
+	// Test disabling
+	fc.SetCycleDetection(false)
+	if fc.IsCycleDetectionEnabled() {
+		t.Error("Cycle detection should be disabled")
+	}
+
+	// Test enabling
+	fc.SetCycleDetection(true)
+	if !fc.IsCycleDetectionEnabled() {
+		t.Error("Cycle detection should be enabled")
+	}
+}
+
+func TestForwardChainer_CyclicRulesWithTracking(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	fc := NewForwardChainer(evaluator, 100)
+	fc.SetMaxRuleApplications(100)
+	ctx := context.Background()
+
+	// Cyclic graph: A -> B -> C -> A
+	// The transitive closure will terminate naturally due to duplicate detection
+	rules := []InferenceRule{
+		{
+			ID:   "transitivity",
+			Name: "Transitivity",
+			Head: RuleCondition{
+				Subject:   "?x",
+				Predicate: "reaches",
+				Object:    "?z",
+			},
+			Body: []RuleCondition{
+				{Subject: "?x", Predicate: "reaches", Object: "?y"},
+				{Subject: "?y", Predicate: "reaches", Object: "?z"},
+			},
+			Priority: 1,
+			Enabled:  true,
+		},
+	}
+
+	edges := []Edge{
+		{Source: "A", Predicate: "reaches", Target: "B"},
+		{Source: "B", Predicate: "reaches", Target: "C"},
+		{Source: "C", Predicate: "reaches", Target: "A"},
+	}
+
+	results, err := fc.Evaluate(ctx, rules, edges)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Should complete successfully computing transitive closure
+	// A->C, B->A, C->B, A->A, B->B, C->C (6 edges)
+	if len(results) != 6 {
+		t.Errorf("Expected 6 derived edges, got %d", len(results))
+	}
+}
+
+func TestForwardChainer_EarlyTerminationNoNewFacts(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	fc := NewForwardChainer(evaluator, 100)
+	ctx := context.Background()
+
+	// Rule that only fires once
+	rules := []InferenceRule{
+		{
+			ID:   "once",
+			Name: "Single Fire",
+			Head: RuleCondition{
+				Subject:   "?x",
+				Predicate: "derived",
+				Object:    "constant",
+			},
+			Body: []RuleCondition{
+				{Subject: "?x", Predicate: "original", Object: "?y"},
+			},
+			Priority: 1,
+			Enabled:  true,
+		},
+	}
+
+	edges := []Edge{
+		{Source: "A", Predicate: "original", Target: "B"},
+	}
+
+	results, err := fc.Evaluate(ctx, rules, edges)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Should have exactly 1 result and terminate early
+	if len(results) != 1 {
+		t.Errorf("Expected 1 result, got %d", len(results))
+	}
+}
+
+func TestForwardChainer_GetSetMaxRuleApplications(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	fc := NewForwardChainer(evaluator, 100)
+
+	// Default should be the constant
+	if fc.GetMaxRuleApplications() != DefaultMaxRuleApplications {
+		t.Errorf("Expected default %d, got %d", DefaultMaxRuleApplications, fc.GetMaxRuleApplications())
+	}
+
+	// Set to new value
+	fc.SetMaxRuleApplications(500)
+	if fc.GetMaxRuleApplications() != 500 {
+		t.Errorf("Expected 500, got %d", fc.GetMaxRuleApplications())
+	}
+
+	// Invalid values should be ignored
+	fc.SetMaxRuleApplications(0)
+	if fc.GetMaxRuleApplications() != 500 {
+		t.Errorf("Expected 500 (unchanged), got %d", fc.GetMaxRuleApplications())
+	}
+
+	fc.SetMaxRuleApplications(-10)
+	if fc.GetMaxRuleApplications() != 500 {
+		t.Errorf("Expected 500 (unchanged), got %d", fc.GetMaxRuleApplications())
+	}
+}
+
+func TestForwardChainer_WithOptions(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	opts := ForwardChainerOptions{
+		MaxIterations:        50,
+		MaxRuleApplications:  200,
+		EnableCycleDetection: false,
+	}
+
+	fc := NewForwardChainerWithOptions(evaluator, opts)
+
+	if fc.GetMaxIterations() != 50 {
+		t.Errorf("Expected maxIterations 50, got %d", fc.GetMaxIterations())
+	}
+	if fc.GetMaxRuleApplications() != 200 {
+		t.Errorf("Expected maxRuleApplications 200, got %d", fc.GetMaxRuleApplications())
+	}
+	if fc.IsCycleDetectionEnabled() {
+		t.Error("Expected cycle detection to be disabled")
+	}
+}
+
+func TestForwardChainer_StrictIterationLimit(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	fc := NewForwardChainer(evaluator, 3) // Exactly 3 iterations allowed
+	ctx := context.Background()
+
+	// Create a scenario that needs more than 3 iterations
+	rules := []InferenceRule{
+		{
+			ID:   "chain",
+			Name: "Chain Rule",
+			Head: RuleCondition{
+				Subject:   "?x",
+				Predicate: "connects",
+				Object:    "?z",
+			},
+			Body: []RuleCondition{
+				{Subject: "?x", Predicate: "connects", Object: "?y"},
+				{Subject: "?y", Predicate: "connects", Object: "?z"},
+			},
+			Priority: 1,
+			Enabled:  true,
+		},
+	}
+
+	// Long chain: 1->2->3->4->5->6->7->8
+	edges := []Edge{
+		{Source: "1", Predicate: "connects", Target: "2"},
+		{Source: "2", Predicate: "connects", Target: "3"},
+		{Source: "3", Predicate: "connects", Target: "4"},
+		{Source: "4", Predicate: "connects", Target: "5"},
+		{Source: "5", Predicate: "connects", Target: "6"},
+		{Source: "6", Predicate: "connects", Target: "7"},
+		{Source: "7", Predicate: "connects", Target: "8"},
+	}
+
+	_, err := fc.Evaluate(ctx, rules, edges)
+
+	// Should hit iteration limit
+	if !errors.Is(err, ErrMaxIterationsReached) {
+		t.Errorf("Expected ErrMaxIterationsReached, got %v", err)
+	}
+}
+
+func TestForwardChainer_ErrorUnwrap(t *testing.T) {
+	err := &ForwardChainError{
+		Err:           ErrMaxIterationsReached,
+		Iteration:     5,
+		DerivedCount:  10,
+		RuleAppsCount: 50,
+	}
+
+	// Test Unwrap
+	if !errors.Is(err, ErrMaxIterationsReached) {
+		t.Error("Expected error to unwrap to ErrMaxIterationsReached")
+	}
+
+	// Test Error string
+	errStr := err.Error()
+	if errStr == "" {
+		t.Error("Error string should not be empty")
+	}
+}
+
+func TestForwardChainer_WithCycleDetectionDisabled(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	opts := ForwardChainerOptions{
+		MaxIterations:        100,
+		EnableCycleDetection: false,
+	}
+	fc := NewForwardChainerWithOptions(evaluator, opts)
+	ctx := context.Background()
+
+	// Simple rule
+	rules := []InferenceRule{
+		{
+			ID:   "r1",
+			Name: "Simple",
+			Head: RuleCondition{
+				Subject:   "?x",
+				Predicate: "related",
+				Object:    "?y",
+			},
+			Body: []RuleCondition{
+				{Subject: "?x", Predicate: "knows", Object: "?y"},
+			},
+			Priority: 1,
+			Enabled:  true,
+		},
+	}
+
+	edges := []Edge{
+		{Source: "A", Predicate: "knows", Target: "B"},
+	}
+
+	results, err := fc.Evaluate(ctx, rules, edges)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Errorf("Expected 1 result, got %d", len(results))
+	}
+}
+
+func TestRuleApplicationTracker(t *testing.T) {
+	tracker := newRuleApplicationTracker()
+
+	// First application
+	repeat := tracker.track("rule1", "A|rel|B")
+	if repeat {
+		t.Error("First application should not be a repeat")
+	}
+	if tracker.count() != 1 {
+		t.Errorf("Expected count 1, got %d", tracker.count())
+	}
+
+	// Different rule, same edge
+	repeat = tracker.track("rule2", "A|rel|B")
+	if repeat {
+		t.Error("Different rule should not be a repeat")
+	}
+	if tracker.count() != 2 {
+		t.Errorf("Expected count 2, got %d", tracker.count())
+	}
+
+	// Same rule, different edge
+	repeat = tracker.track("rule1", "C|rel|D")
+	if repeat {
+		t.Error("Different edge should not be a repeat")
+	}
+	if tracker.count() != 3 {
+		t.Errorf("Expected count 3, got %d", tracker.count())
+	}
+
+	// Repeat application
+	repeat = tracker.track("rule1", "A|rel|B")
+	if !repeat {
+		t.Error("Same rule+edge should be a repeat")
+	}
+	if tracker.count() != 4 {
+		t.Errorf("Expected count 4, got %d", tracker.count())
+	}
+}

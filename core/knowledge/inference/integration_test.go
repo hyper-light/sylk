@@ -3,6 +3,7 @@ package inference
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -447,8 +448,8 @@ func TestIntegration_ForwardChaining_MaxIterationsRespected(t *testing.T) {
 
 	// Should not error out - max iterations should be respected
 	err := engine.RunInference(ctx)
-	// ErrMaxIterationsReached is an acceptable outcome
-	if err != nil && err != ErrMaxIterationsReached {
+	// ErrMaxIterationsReached is an acceptable outcome (may be wrapped in ForwardChainError)
+	if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -726,7 +727,7 @@ func TestIntegration_Circular_SelfReferentialRulesNoInfiniteLoop(t *testing.T) {
 
 	// Should complete without hanging
 	err := engine.RunInference(ctx)
-	if err != nil && err != ErrMaxIterationsReached {
+	if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 		t.Fatalf("RunInference failed: %v", err)
 	}
 
@@ -772,7 +773,7 @@ func TestIntegration_Circular_MutuallyRecursiveRulesReachFixpoint(t *testing.T) 
 
 	// Should complete and reach fixpoint
 	err := engine.RunInference(ctx)
-	if err != nil && err != ErrMaxIterationsReached {
+	if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 		t.Fatalf("RunInference failed: %v", err)
 	}
 
@@ -839,8 +840,8 @@ func TestIntegration_Circular_MaxIterationsPreventsRunaway(t *testing.T) {
 
 	// With max iterations = 1, we should hit the limit before full closure
 	// Either no error (if fixpoint reached in 1 iteration, unlikely for this graph)
-	// or ErrMaxIterationsReached
-	if err != nil && err != ErrMaxIterationsReached {
+	// or ErrMaxIterationsReached (may be wrapped in ForwardChainError)
+	if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
