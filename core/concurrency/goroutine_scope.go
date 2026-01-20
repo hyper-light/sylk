@@ -180,38 +180,58 @@ func (s *GoroutineScope) beginShutdown() bool {
 }
 
 func (s *GoroutineScope) waitForShutdown(gracePeriod, hardDeadline time.Duration) error {
-	graceDone := s.startWaitGroup()
+	graceDone := s.waitWithTimeout(gracePeriod)
+
+	if graceDone {
+		return nil
+	}
+
+	return s.forceShutdown(hardDeadline - gracePeriod)
+}
+
+// waitWithTimeout waits for all workers to complete within the given timeout.
+// Returns true if all workers completed, false if timeout elapsed.
+// Uses inline wait with timeout instead of spawning an untracked goroutine.
+func (s *GoroutineScope) waitWithTimeout(timeout time.Duration) bool {
+	done := make(chan struct{})
+	defer close(done)
+
+	// Use a tracked goroutine via sync.WaitGroup for the wait itself
+	var waitWg sync.WaitGroup
+	waitWg.Add(1)
+	go func() {
+		defer waitWg.Done()
+		s.wg.Wait()
+	}()
+
+	// Wait for either completion or timeout
+	completed := make(chan struct{})
+	go func() {
+		waitWg.Wait()
+		close(completed)
+	}()
 
 	select {
-	case <-graceDone:
-		return nil
-	case <-time.After(gracePeriod):
-		return s.forceShutdown(graceDone, hardDeadline-gracePeriod)
+	case <-completed:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 
-func (s *GoroutineScope) startWaitGroup() <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	return done
-}
-
-func (s *GoroutineScope) forceShutdown(graceDone <-chan struct{}, remaining time.Duration) error {
+func (s *GoroutineScope) forceShutdown(remaining time.Duration) error {
 	s.cancelAllWorkers()
 
 	if s.workerCount() == 0 {
 		return nil
 	}
 
-	select {
-	case <-graceDone:
+	// Wait for remaining time with inline wait
+	if s.waitWithTimeout(remaining) {
 		return nil
-	case <-time.After(remaining):
-		return s.buildLeakError()
 	}
+
+	return s.buildLeakError()
 }
 
 func (s *GoroutineScope) cancelAllWorkers() {

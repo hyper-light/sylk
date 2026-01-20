@@ -107,6 +107,9 @@ type ObservationLog struct {
 	closed         atomic.Bool
 	closeDone      chan struct{}
 
+	// inlineWg tracks goroutines started without a scope
+	inlineWg sync.WaitGroup
+
 	adaptive *AdaptiveState
 	scope    *concurrency.GoroutineScope
 }
@@ -230,8 +233,12 @@ func (l *ObservationLog) scanForLastSequence() error {
 
 func (l *ObservationLog) startProcessor(ctx context.Context) error {
 	if l.scope == nil {
-		// No scope provided, start inline
-		go l.processLoop(ctx)
+		// No scope provided, track inline goroutine via WaitGroup
+		l.inlineWg.Add(1)
+		go func() {
+			defer l.inlineWg.Done()
+			l.processLoop(ctx)
+		}()
 		return nil
 	}
 
@@ -244,7 +251,12 @@ func (l *ObservationLog) startProcessor(ctx context.Context) error {
 // startAsyncWriter starts the async writer goroutine.
 func (l *ObservationLog) startAsyncWriter(ctx context.Context) error {
 	if l.scope == nil {
-		go l.asyncWriteLoop(ctx)
+		// No scope provided, track inline goroutine via WaitGroup
+		l.inlineWg.Add(1)
+		go func() {
+			defer l.inlineWg.Done()
+			l.asyncWriteLoop(ctx)
+		}()
 		return nil
 	}
 
@@ -791,6 +803,9 @@ func (l *ObservationLog) Close() error {
 
 	// Wait for processor to finish
 	<-l.closeDone
+
+	// Wait for any inline goroutines that were started without a scope
+	l.inlineWg.Wait()
 
 	return l.closeFile()
 }
