@@ -657,3 +657,355 @@ func BenchmarkConcurrentNeighborSet_Contains(b *testing.B) {
 		cns.Contains("M")
 	}
 }
+
+// W4P.9: Cache behavior tests
+
+func TestNeighborSet_CacheHappyPath(t *testing.T) {
+	ns := NewNeighborSet()
+	ns.Add("node3", 0.8)
+	ns.Add("node1", 0.2)
+	ns.Add("node2", 0.5)
+
+	// First call should populate cache
+	sorted1 := ns.GetSortedNeighbors()
+	if len(sorted1) != 3 {
+		t.Errorf("expected 3 neighbors, got %d", len(sorted1))
+	}
+	if sorted1[0].ID != "node1" || sorted1[0].Distance != 0.2 {
+		t.Errorf("expected node1 with 0.2 first, got %s with %f", sorted1[0].ID, sorted1[0].Distance)
+	}
+
+	// Second call should use cache (same result)
+	sorted2 := ns.GetSortedNeighbors()
+	if len(sorted2) != 3 {
+		t.Errorf("expected 3 neighbors, got %d", len(sorted2))
+	}
+	if sorted2[0].ID != "node1" || sorted2[0].Distance != 0.2 {
+		t.Errorf("expected node1 with 0.2 first, got %s with %f", sorted2[0].ID, sorted2[0].Distance)
+	}
+}
+
+func TestNeighborSet_CacheInvalidationOnAdd(t *testing.T) {
+	ns := NewNeighborSet()
+	ns.Add("node2", 0.5)
+	ns.Add("node3", 0.8)
+
+	// Populate cache
+	sorted1 := ns.GetSortedNeighbors()
+	if sorted1[0].ID != "node2" {
+		t.Errorf("expected node2 first, got %s", sorted1[0].ID)
+	}
+
+	// Add a better neighbor - should invalidate cache
+	ns.Add("node1", 0.1)
+
+	// Should reflect the new neighbor
+	sorted2 := ns.GetSortedNeighbors()
+	if len(sorted2) != 3 {
+		t.Errorf("expected 3 neighbors, got %d", len(sorted2))
+	}
+	if sorted2[0].ID != "node1" || sorted2[0].Distance != 0.1 {
+		t.Errorf("expected node1 with 0.1 first, got %s with %f", sorted2[0].ID, sorted2[0].Distance)
+	}
+}
+
+func TestNeighborSet_CacheInvalidationOnRemove(t *testing.T) {
+	ns := NewNeighborSet()
+	ns.Add("node1", 0.2)
+	ns.Add("node2", 0.5)
+	ns.Add("node3", 0.8)
+
+	// Populate cache
+	sorted1 := ns.GetSortedNeighbors()
+	if len(sorted1) != 3 {
+		t.Errorf("expected 3 neighbors, got %d", len(sorted1))
+	}
+
+	// Remove a neighbor - should invalidate cache
+	ns.Remove("node1")
+
+	// Should reflect the removal
+	sorted2 := ns.GetSortedNeighbors()
+	if len(sorted2) != 2 {
+		t.Errorf("expected 2 neighbors after removal, got %d", len(sorted2))
+	}
+	if sorted2[0].ID != "node2" {
+		t.Errorf("expected node2 first after removal, got %s", sorted2[0].ID)
+	}
+}
+
+func TestNeighborSet_CacheInvalidationOnClear(t *testing.T) {
+	ns := NewNeighborSet()
+	ns.Add("node1", 0.2)
+	ns.Add("node2", 0.5)
+
+	// Populate cache
+	_ = ns.GetSortedNeighbors()
+
+	// Clear - should invalidate cache
+	ns.Clear()
+
+	// Should be empty
+	sorted := ns.GetSortedNeighbors()
+	if len(sorted) != 0 {
+		t.Errorf("expected 0 neighbors after clear, got %d", len(sorted))
+	}
+}
+
+func TestNeighborSet_CacheInvalidationOnMerge(t *testing.T) {
+	ns1 := NewNeighborSet()
+	ns1.Add("node2", 0.5)
+	ns1.Add("node3", 0.8)
+
+	// Populate cache
+	_ = ns1.GetSortedNeighbors()
+
+	ns2 := NewNeighborSet()
+	ns2.Add("node1", 0.1)
+
+	// Merge - should invalidate cache
+	ns1.Merge(ns2)
+
+	// Should reflect the merged neighbor
+	sorted := ns1.GetSortedNeighbors()
+	if len(sorted) != 3 {
+		t.Errorf("expected 3 neighbors after merge, got %d", len(sorted))
+	}
+	if sorted[0].ID != "node1" {
+		t.Errorf("expected node1 first after merge, got %s", sorted[0].ID)
+	}
+}
+
+func TestNeighborSet_CacheInvalidationOnTrim(t *testing.T) {
+	ns := NewNeighborSet()
+	ns.Add("node1", 0.2)
+	ns.Add("node2", 0.5)
+	ns.Add("node3", 0.8)
+
+	// Populate cache
+	_ = ns.GetSortedNeighbors()
+
+	// Trim - should invalidate cache
+	ns.TrimToSize(2)
+
+	// Should reflect the trim
+	sorted := ns.GetSortedNeighbors()
+	if len(sorted) != 2 {
+		t.Errorf("expected 2 neighbors after trim, got %d", len(sorted))
+	}
+	if !ns.Contains("node1") || !ns.Contains("node2") {
+		t.Error("expected closest 2 nodes to be kept")
+	}
+}
+
+func TestConcurrentNeighborSet_CacheHappyPath(t *testing.T) {
+	cns := NewConcurrentNeighborSet()
+	cns.Add("node3", 0.8)
+	cns.Add("node1", 0.2)
+	cns.Add("node2", 0.5)
+
+	// First call should populate cache
+	sorted1 := cns.GetSortedNeighbors()
+	if len(sorted1) != 3 {
+		t.Errorf("expected 3 neighbors, got %d", len(sorted1))
+	}
+	if sorted1[0].ID != "node1" {
+		t.Errorf("expected node1 first, got %s", sorted1[0].ID)
+	}
+
+	// Second call should use cache (same result)
+	sorted2 := cns.GetSortedNeighbors()
+	if len(sorted2) != 3 {
+		t.Errorf("expected 3 neighbors, got %d", len(sorted2))
+	}
+	if sorted2[0].ID != "node1" {
+		t.Errorf("expected node1 first, got %s", sorted2[0].ID)
+	}
+}
+
+func TestConcurrentNeighborSet_CacheInvalidationOnAdd(t *testing.T) {
+	cns := NewConcurrentNeighborSet()
+	cns.Add("node2", 0.5)
+	cns.Add("node3", 0.8)
+
+	// Populate cache
+	_ = cns.GetSortedNeighbors()
+
+	// Add a better neighbor - should invalidate cache
+	cns.Add("node1", 0.1)
+
+	// Should reflect the new neighbor
+	sorted := cns.GetSortedNeighbors()
+	if sorted[0].ID != "node1" {
+		t.Errorf("expected node1 first after add, got %s", sorted[0].ID)
+	}
+}
+
+func TestConcurrentNeighborSet_CacheInvalidationOnRemove(t *testing.T) {
+	cns := NewConcurrentNeighborSet()
+	cns.Add("node1", 0.2)
+	cns.Add("node2", 0.5)
+
+	// Populate cache
+	_ = cns.GetSortedNeighbors()
+
+	// Remove - should invalidate cache
+	cns.Remove("node1")
+
+	sorted := cns.GetSortedNeighbors()
+	if len(sorted) != 1 {
+		t.Errorf("expected 1 neighbor after removal, got %d", len(sorted))
+	}
+}
+
+func TestConcurrentNeighborSet_CacheInvalidationOnAddIfAbsent(t *testing.T) {
+	cns := NewConcurrentNeighborSet()
+	cns.Add("node2", 0.5)
+
+	// Populate cache
+	_ = cns.GetSortedNeighbors()
+
+	// AddIfAbsent - should invalidate cache
+	cns.AddIfAbsent("node1", 0.1)
+
+	sorted := cns.GetSortedNeighbors()
+	if sorted[0].ID != "node1" {
+		t.Errorf("expected node1 first after AddIfAbsent, got %s", sorted[0].ID)
+	}
+}
+
+func TestConcurrentNeighborSet_CacheInvalidationOnUpdateDistance(t *testing.T) {
+	cns := NewConcurrentNeighborSet()
+	cns.Add("node1", 0.5)
+	cns.Add("node2", 0.2)
+
+	// Populate cache
+	sorted1 := cns.GetSortedNeighbors()
+	if sorted1[0].ID != "node2" {
+		t.Errorf("expected node2 first, got %s", sorted1[0].ID)
+	}
+
+	// UpdateDistance - should invalidate cache
+	cns.UpdateDistance("node1", 0.1)
+
+	sorted2 := cns.GetSortedNeighbors()
+	if sorted2[0].ID != "node1" {
+		t.Errorf("expected node1 first after update, got %s", sorted2[0].ID)
+	}
+}
+
+func TestConcurrentNeighborSet_CacheInvalidationOnAddWithLimit(t *testing.T) {
+	cns := NewConcurrentNeighborSet()
+	cns.Add("node2", 0.5)
+	cns.Add("node3", 0.8)
+
+	// Populate cache
+	_ = cns.GetSortedNeighbors()
+
+	// AddWithLimit - should invalidate cache
+	cns.AddWithLimit("node1", 0.1, 3)
+
+	sorted := cns.GetSortedNeighbors()
+	if sorted[0].ID != "node1" {
+		t.Errorf("expected node1 first after AddWithLimit, got %s", sorted[0].ID)
+	}
+}
+
+func TestConcurrentNeighborSet_ConcurrentCacheAccess(t *testing.T) {
+	cns := NewConcurrentNeighborSet()
+	for i := 0; i < 100; i++ {
+		cns.Add(string(rune('A'+i%26)), float32(i)*0.01)
+	}
+
+	var wg sync.WaitGroup
+
+	// Concurrent reads that use cache
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sorted := cns.GetSortedNeighbors()
+			if len(sorted) == 0 {
+				t.Error("expected non-empty sorted neighbors")
+			}
+		}()
+	}
+
+	// Concurrent writes that invalidate cache
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			cns.Add(string(rune('a'+i%26)), float32(i)*0.001)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify final state is consistent
+	sorted := cns.GetSortedNeighbors()
+	if len(sorted) == 0 {
+		t.Error("expected non-empty final sorted neighbors")
+	}
+}
+
+// Benchmark: Verify caching reduces sorting operations
+func BenchmarkNeighborSet_GetSortedNeighbors_Cached(b *testing.B) {
+	ns := NewNeighborSet()
+	for i := 0; i < 48; i++ {
+		ns.Add(string(rune('A'+i)), float32(i)*0.01)
+	}
+
+	// Prime the cache
+	_ = ns.GetSortedNeighbors()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ns.GetSortedNeighbors()
+	}
+}
+
+func BenchmarkNeighborSet_GetSortedNeighbors_Uncached(b *testing.B) {
+	ns := NewNeighborSet()
+	for i := 0; i < 48; i++ {
+		ns.Add(string(rune('A'+i)), float32(i)*0.01)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Force cache invalidation before each call
+		ns.Add("temp", 0.99)
+		ns.Remove("temp")
+		_ = ns.GetSortedNeighbors()
+	}
+}
+
+func BenchmarkConcurrentNeighborSet_GetSortedNeighbors_Cached(b *testing.B) {
+	cns := NewConcurrentNeighborSet()
+	for i := 0; i < 48; i++ {
+		cns.Add(string(rune('A'+i)), float32(i)*0.01)
+	}
+
+	// Prime the cache
+	_ = cns.GetSortedNeighbors()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = cns.GetSortedNeighbors()
+	}
+}
+
+func BenchmarkConcurrentNeighborSet_GetSortedNeighbors_Uncached(b *testing.B) {
+	cns := NewConcurrentNeighborSet()
+	for i := 0; i < 48; i++ {
+		cns.Add(string(rune('A'+i)), float32(i)*0.01)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Force cache invalidation before each call
+		cns.Add("temp", 0.99)
+		cns.Remove("temp")
+		_ = cns.GetSortedNeighbors()
+	}
+}

@@ -30,15 +30,21 @@ type Neighbor struct {
 // NeighborSet provides O(1) lookup for neighbor membership while supporting
 // sorted retrieval. It replaces O(n) slice operations used in HNSW layers.
 //
+// W4P.9: Sorted neighbors are cached to avoid repeated O(n log n) sorting.
+// The cache is invalidated when the set is modified (dirty flag pattern).
+//
 // This type is NOT thread-safe. For concurrent access, use ConcurrentNeighborSet.
 type NeighborSet struct {
-	neighbors map[string]float32
+	neighbors   map[string]float32
+	sortedCache []Neighbor // Cached sorted neighbors (ascending)
+	dirty       bool       // True when cache needs refresh
 }
 
 // NewNeighborSet creates a new empty NeighborSet.
 func NewNeighborSet() *NeighborSet {
 	return &NeighborSet{
 		neighbors: make(map[string]float32),
+		dirty:     true,
 	}
 }
 
@@ -46,19 +52,26 @@ func NewNeighborSet() *NeighborSet {
 func NewNeighborSetWithCapacity(capacity int) *NeighborSet {
 	return &NeighborSet{
 		neighbors: make(map[string]float32, capacity),
+		dirty:     true,
 	}
 }
 
 // Add adds a neighbor with the given distance.
 // If the neighbor already exists, the distance is updated.
+// W4P.9: Invalidates the sorted cache.
 func (ns *NeighborSet) Add(id string, dist float32) {
 	ns.neighbors[id] = dist
+	ns.dirty = true
 }
 
 // Remove removes a neighbor from the set.
 // No-op if the neighbor doesn't exist.
+// W4P.9: Invalidates the sorted cache.
 func (ns *NeighborSet) Remove(id string) {
-	delete(ns.neighbors, id)
+	if _, exists := ns.neighbors[id]; exists {
+		delete(ns.neighbors, id)
+		ns.dirty = true
+	}
 }
 
 // Contains returns true if the neighbor exists in the set.
@@ -77,27 +90,42 @@ func (ns *NeighborSet) GetDistance(id string) (float32, bool) {
 
 // GetSortedNeighbors returns all neighbors sorted by distance (ascending).
 // Neighbors with smaller distances come first.
+// W4P.9: Uses cached sorted slice when available, only re-sorts when dirty.
 func (ns *NeighborSet) GetSortedNeighbors() []Neighbor {
-	result := make([]Neighbor, 0, len(ns.neighbors))
-	for id, dist := range ns.neighbors {
-		result = append(result, Neighbor{ID: id, Distance: dist})
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Distance < result[j].Distance
-	})
+	ns.refreshCacheIfDirty()
+	// Return a copy to protect internal state
+	result := make([]Neighbor, len(ns.sortedCache))
+	copy(result, ns.sortedCache)
 	return result
+}
+
+// refreshCacheIfDirty rebuilds the sorted cache if modifications occurred.
+// W4P.9: Centralizes cache rebuild logic for ascending sort order.
+func (ns *NeighborSet) refreshCacheIfDirty() {
+	if !ns.dirty {
+		return
+	}
+	ns.sortedCache = make([]Neighbor, 0, len(ns.neighbors))
+	for id, dist := range ns.neighbors {
+		ns.sortedCache = append(ns.sortedCache, Neighbor{ID: id, Distance: dist})
+	}
+	sort.Slice(ns.sortedCache, func(i, j int) bool {
+		return ns.sortedCache[i].Distance < ns.sortedCache[j].Distance
+	})
+	ns.dirty = false
 }
 
 // GetSortedNeighborsDescending returns all neighbors sorted by distance (descending).
 // Neighbors with larger distances come first.
+// W4P.9: Leverages the ascending cache and reverses for descending order.
 func (ns *NeighborSet) GetSortedNeighborsDescending() []Neighbor {
-	result := make([]Neighbor, 0, len(ns.neighbors))
-	for id, dist := range ns.neighbors {
-		result = append(result, Neighbor{ID: id, Distance: dist})
+	ns.refreshCacheIfDirty()
+	// Create reversed copy from ascending cache
+	n := len(ns.sortedCache)
+	result := make([]Neighbor, n)
+	for i := 0; i < n; i++ {
+		result[i] = ns.sortedCache[n-1-i]
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Distance > result[j].Distance
-	})
 	return result
 }
 
@@ -126,8 +154,11 @@ func (ns *NeighborSet) Size() int {
 }
 
 // Clear removes all neighbors from the set.
+// W4P.9: Invalidates the sorted cache.
 func (ns *NeighborSet) Clear() {
 	ns.neighbors = make(map[string]float32)
+	ns.sortedCache = nil
+	ns.dirty = true
 }
 
 // Clone creates a deep copy of the NeighborSet.
@@ -141,14 +172,19 @@ func (ns *NeighborSet) Clone() *NeighborSet {
 
 // Merge adds all neighbors from another set.
 // If a neighbor exists in both sets, the distance from the other set is used.
+// W4P.9: Invalidates the sorted cache.
 func (ns *NeighborSet) Merge(other *NeighborSet) {
 	for id, dist := range other.neighbors {
 		ns.neighbors[id] = dist
+	}
+	if len(other.neighbors) > 0 {
+		ns.dirty = true
 	}
 }
 
 // TrimToSize removes neighbors to ensure the set has at most maxSize elements.
 // Keeps the neighbors with smallest distances.
+// W4P.9: Invalidates the sorted cache after trimming.
 func (ns *NeighborSet) TrimToSize(maxSize int) {
 	if len(ns.neighbors) <= maxSize {
 		return
@@ -159,6 +195,7 @@ func (ns *NeighborSet) TrimToSize(maxSize int) {
 	for i := 0; i < maxSize && i < len(sorted); i++ {
 		ns.neighbors[sorted[i].ID] = sorted[i].Distance
 	}
+	ns.dirty = true
 }
 
 // ForEach calls the given function for each neighbor.
@@ -171,15 +208,21 @@ func (ns *NeighborSet) ForEach(fn func(id string, dist float32)) {
 
 // ConcurrentNeighborSet is a thread-safe variant of NeighborSet using RWMutex.
 // Use this when the set needs to be accessed from multiple goroutines.
+//
+// W4P.9: Sorted neighbors are cached to avoid repeated O(n log n) sorting.
+// The cache is invalidated when the set is modified (dirty flag pattern).
 type ConcurrentNeighborSet struct {
-	mu        sync.RWMutex
-	neighbors map[string]float32
+	mu          sync.RWMutex
+	neighbors   map[string]float32
+	sortedCache []Neighbor // Cached sorted neighbors (ascending)
+	dirty       bool       // True when cache needs refresh
 }
 
 // NewConcurrentNeighborSet creates a new thread-safe NeighborSet.
 func NewConcurrentNeighborSet() *ConcurrentNeighborSet {
 	return &ConcurrentNeighborSet{
 		neighbors: make(map[string]float32),
+		dirty:     true,
 	}
 }
 
@@ -187,23 +230,30 @@ func NewConcurrentNeighborSet() *ConcurrentNeighborSet {
 func NewConcurrentNeighborSetWithCapacity(capacity int) *ConcurrentNeighborSet {
 	return &ConcurrentNeighborSet{
 		neighbors: make(map[string]float32, capacity),
+		dirty:     true,
 	}
 }
 
 // Add adds a neighbor with the given distance.
 // If the neighbor already exists, the distance is updated.
+// W4P.9: Invalidates the sorted cache.
 func (cns *ConcurrentNeighborSet) Add(id string, dist float32) {
 	cns.mu.Lock()
 	defer cns.mu.Unlock()
 	cns.neighbors[id] = dist
+	cns.dirty = true
 }
 
 // Remove removes a neighbor from the set.
 // No-op if the neighbor doesn't exist.
+// W4P.9: Invalidates the sorted cache.
 func (cns *ConcurrentNeighborSet) Remove(id string) {
 	cns.mu.Lock()
 	defer cns.mu.Unlock()
-	delete(cns.neighbors, id)
+	if _, exists := cns.neighbors[id]; exists {
+		delete(cns.neighbors, id)
+		cns.dirty = true
+	}
 }
 
 // Contains returns true if the neighbor exists in the set.
@@ -226,33 +276,48 @@ func (cns *ConcurrentNeighborSet) GetDistance(id string) (float32, bool) {
 
 // GetSortedNeighbors returns all neighbors sorted by distance (ascending).
 // Neighbors with smaller distances come first.
+// W4P.9: Uses cached sorted slice when available, only re-sorts when dirty.
 func (cns *ConcurrentNeighborSet) GetSortedNeighbors() []Neighbor {
-	cns.mu.RLock()
-	defer cns.mu.RUnlock()
+	cns.mu.Lock()
+	defer cns.mu.Unlock()
 
-	result := make([]Neighbor, 0, len(cns.neighbors))
-	for id, dist := range cns.neighbors {
-		result = append(result, Neighbor{ID: id, Distance: dist})
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Distance < result[j].Distance
-	})
+	cns.refreshCacheIfDirtyLocked()
+	// Return a copy to protect internal state
+	result := make([]Neighbor, len(cns.sortedCache))
+	copy(result, cns.sortedCache)
 	return result
+}
+
+// refreshCacheIfDirtyLocked rebuilds the sorted cache if modifications occurred.
+// W4P.9: Must be called with mu held (write lock).
+func (cns *ConcurrentNeighborSet) refreshCacheIfDirtyLocked() {
+	if !cns.dirty {
+		return
+	}
+	cns.sortedCache = make([]Neighbor, 0, len(cns.neighbors))
+	for id, dist := range cns.neighbors {
+		cns.sortedCache = append(cns.sortedCache, Neighbor{ID: id, Distance: dist})
+	}
+	sort.Slice(cns.sortedCache, func(i, j int) bool {
+		return cns.sortedCache[i].Distance < cns.sortedCache[j].Distance
+	})
+	cns.dirty = false
 }
 
 // GetSortedNeighborsDescending returns all neighbors sorted by distance (descending).
 // Neighbors with larger distances come first.
+// W4P.9: Leverages the ascending cache and reverses for descending order.
 func (cns *ConcurrentNeighborSet) GetSortedNeighborsDescending() []Neighbor {
-	cns.mu.RLock()
-	defer cns.mu.RUnlock()
+	cns.mu.Lock()
+	defer cns.mu.Unlock()
 
-	result := make([]Neighbor, 0, len(cns.neighbors))
-	for id, dist := range cns.neighbors {
-		result = append(result, Neighbor{ID: id, Distance: dist})
+	cns.refreshCacheIfDirtyLocked()
+	// Create reversed copy from ascending cache
+	n := len(cns.sortedCache)
+	result := make([]Neighbor, n)
+	for i := 0; i < n; i++ {
+		result[i] = cns.sortedCache[n-1-i]
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Distance > result[j].Distance
-	})
 	return result
 }
 
@@ -286,10 +351,13 @@ func (cns *ConcurrentNeighborSet) Size() int {
 }
 
 // Clear removes all neighbors from the set.
+// W4P.9: Invalidates the sorted cache.
 func (cns *ConcurrentNeighborSet) Clear() {
 	cns.mu.Lock()
 	defer cns.mu.Unlock()
 	cns.neighbors = make(map[string]float32)
+	cns.sortedCache = nil
+	cns.dirty = true
 }
 
 // Clone creates a deep copy of the ConcurrentNeighborSet.
@@ -307,6 +375,7 @@ func (cns *ConcurrentNeighborSet) Clone() *ConcurrentNeighborSet {
 
 // Merge adds all neighbors from another set.
 // If a neighbor exists in both sets, the distance from the other set is used.
+// W4P.9: Invalidates the sorted cache if any neighbors were merged.
 func (cns *ConcurrentNeighborSet) Merge(other *ConcurrentNeighborSet) {
 	other.mu.RLock()
 	otherCopy := make(map[string]float32, len(other.neighbors))
@@ -320,10 +389,14 @@ func (cns *ConcurrentNeighborSet) Merge(other *ConcurrentNeighborSet) {
 	for id, dist := range otherCopy {
 		cns.neighbors[id] = dist
 	}
+	if len(otherCopy) > 0 {
+		cns.dirty = true
+	}
 }
 
 // TrimToSize removes neighbors to ensure the set has at most maxSize elements.
 // Keeps the neighbors with smallest distances.
+// W4P.9: Uses cache for sorting and invalidates after trimming.
 func (cns *ConcurrentNeighborSet) TrimToSize(maxSize int) {
 	cns.mu.Lock()
 	defer cns.mu.Unlock()
@@ -332,19 +405,14 @@ func (cns *ConcurrentNeighborSet) TrimToSize(maxSize int) {
 		return
 	}
 
-	// Sort and trim
-	result := make([]Neighbor, 0, len(cns.neighbors))
-	for id, dist := range cns.neighbors {
-		result = append(result, Neighbor{ID: id, Distance: dist})
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Distance < result[j].Distance
-	})
+	// Use cache if available, otherwise sort inline
+	cns.refreshCacheIfDirtyLocked()
 
 	cns.neighbors = make(map[string]float32, maxSize)
-	for i := 0; i < maxSize && i < len(result); i++ {
-		cns.neighbors[result[i].ID] = result[i].Distance
+	for i := 0; i < maxSize && i < len(cns.sortedCache); i++ {
+		cns.neighbors[cns.sortedCache[i].ID] = cns.sortedCache[i].Distance
 	}
+	cns.dirty = true
 }
 
 // ForEach calls the given function for each neighbor.
@@ -361,6 +429,7 @@ func (cns *ConcurrentNeighborSet) ForEach(fn func(id string, dist float32)) {
 
 // AddIfAbsent adds a neighbor only if it doesn't already exist.
 // Returns true if the neighbor was added, false if it already existed.
+// W4P.9: Invalidates the sorted cache only if a neighbor was added.
 func (cns *ConcurrentNeighborSet) AddIfAbsent(id string, dist float32) bool {
 	cns.mu.Lock()
 	defer cns.mu.Unlock()
@@ -368,11 +437,13 @@ func (cns *ConcurrentNeighborSet) AddIfAbsent(id string, dist float32) bool {
 		return false
 	}
 	cns.neighbors[id] = dist
+	cns.dirty = true
 	return true
 }
 
 // UpdateDistance updates the distance for an existing neighbor.
 // Returns true if the neighbor existed and was updated.
+// W4P.9: Invalidates the sorted cache only if a distance was updated.
 func (cns *ConcurrentNeighborSet) UpdateDistance(id string, dist float32) bool {
 	cns.mu.Lock()
 	defer cns.mu.Unlock()
@@ -380,6 +451,7 @@ func (cns *ConcurrentNeighborSet) UpdateDistance(id string, dist float32) bool {
 		return false
 	}
 	cns.neighbors[id] = dist
+	cns.dirty = true
 	return true
 }
 
@@ -387,15 +459,16 @@ func (cns *ConcurrentNeighborSet) UpdateDistance(id string, dist float32) bool {
 // W4L.3: Documented the worst-neighbor replacement strategy for HNSW.
 //
 // This implements the capacity-limited neighbor selection required by HNSW:
-//   1. If neighbor already exists: Update its distance (connection reweighting)
-//   2. If under capacity: Add the neighbor directly
-//   3. If at capacity: Compare with worst (furthest) neighbor
-//      - If new neighbor is closer: Replace the worst neighbor
-//      - Otherwise: Reject the new neighbor
+//  1. If neighbor already exists: Update its distance (connection reweighting)
+//  2. If under capacity: Add the neighbor directly
+//  3. If at capacity: Compare with worst (furthest) neighbor
+//     - If new neighbor is closer: Replace the worst neighbor
+//     - Otherwise: Reject the new neighbor
 //
 // The worst-neighbor replacement ensures the set always contains the M closest
 // neighbors seen so far, which is essential for HNSW's search quality.
 //
+// W4P.9: Invalidates the sorted cache on any modification.
 // Returns true if the neighbor was added or updated, false if rejected.
 func (cns *ConcurrentNeighborSet) AddWithLimit(id string, dist float32, maxSize int) bool {
 	cns.mu.Lock()
@@ -404,12 +477,14 @@ func (cns *ConcurrentNeighborSet) AddWithLimit(id string, dist float32, maxSize 
 	// Already exists - update distance (connection may have improved)
 	if _, exists := cns.neighbors[id]; exists {
 		cns.neighbors[id] = dist
+		cns.dirty = true
 		return true
 	}
 
 	// Room available - add directly
 	if len(cns.neighbors) < maxSize {
 		cns.neighbors[id] = dist
+		cns.dirty = true
 		return true
 	}
 
@@ -427,6 +502,7 @@ func (cns *ConcurrentNeighborSet) AddWithLimit(id string, dist float32, maxSize 
 	if dist < worstDist {
 		delete(cns.neighbors, worstID)
 		cns.neighbors[id] = dist
+		cns.dirty = true
 		return true
 	}
 
