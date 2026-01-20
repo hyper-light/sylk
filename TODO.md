@@ -37493,17 +37493,21 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   RESOLUTION: Added recoverAndPublishError to StreamBridge.runStreamLoop and    ││
 │ │               recoverStreamPanic to StreamToChannel for comprehensive recovery  ││
 │ │                                                                                  ││
-│ │ [ ] W12.46 - Budget Tracker Race Condition                                      ││
+│ │ [x] W12.46 - Budget Tracker Race Condition                                      ││
 │ │   FILE: core/llm/budget.go:78-95                                                ││
 │ │   ISSUE: Budget checks and updates not atomic                                   ││
 │ │   FIX: Use atomic operations or mutex for budget tracking                       ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
+│ │   RESOLUTION: Added CheckAndReserve method that atomically checks budget        ││
+│ │               limits and records usage with coordinated locking                 ││
 │ │                                                                                  ││
-│ │ [ ] W12.47 - TokenCounter Missing Validation                                    ││
+│ │ [x] W12.47 - TokenCounter Missing Validation                                    ││
 │ │   FILE: core/providers/token_counter.go:134-156                                 ││
 │ │   ISSUE: Token counts accepted without validation                               ││
 │ │   FIX: Add bounds checking for token counts                                     ││
 │ │   SEVERITY: HIGH - Invalid data acceptance                                      ││
+│ │   RESOLUTION: Added ValidateTokenCount, ValidatingCounter wrapper, and          ││
+│ │               validated variants of count methods with bounds checking          ││
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
