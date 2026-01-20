@@ -3,6 +3,7 @@ package concurrency
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,35 +78,34 @@ func DefaultAdaptiveChannelConfig() AdaptiveChannelConfig {
 // AdaptiveChannel is a channel that automatically resizes based on usage patterns.
 // It supports optional overflow buffering when the channel is full during send timeout.
 //
-// With MaxOverflowSize > 0 and AllowOverflow=true, the overflow buffer is bounded
-// to prevent memory exhaustion. When overflow is full, behavior depends on OverflowDropPolicy:
+// The overflow buffer is bounded to prevent memory exhaustion. When overflow is full,
+// behavior depends on OverflowDropPolicy:
 //   - DropOldest: evict oldest message to make room for new one
 //   - DropNewest: reject new message (returns error from Send)
 //   - Block: wait until space is available (not recommended)
 //
-// With MaxOverflowSize = 0, the overflow grows without bound (legacy behavior).
+// Note: MaxOverflowSize=0 (legacy unbounded mode) is deprecated and will use the
+// default bound of 10000 to prevent memory exhaustion.
 type AdaptiveChannel[T any] struct {
 	config AdaptiveChannelConfig
 
-	mu            sync.Mutex
-	ch            chan T
-	boundedOvfl   *BoundedOverflow[T] // Used when MaxOverflowSize > 0
-	unboundedOvfl []T                 // Used when MaxOverflowSize = 0 (legacy)
-	currentSize   int
-	highWaterCnt  int
-	lowWaterCnt   int
+	mu           sync.Mutex
+	ch           chan T
+	boundedOvfl  *BoundedOverflow[T]
+	currentSize  int
+	highWaterCnt int
+	lowWaterCnt  int
 
 	// version is incremented on each resize to detect stale channel references
 	version atomic.Uint64
 
-	closed       atomic.Bool
-	stopCh       chan struct{}
-	closeOnce    sync.Once
-	resizeUp     atomic.Int64
-	resizeDown   atomic.Int64
-	sendCount    atomic.Int64
-	recvCount    atomic.Int64
-	droppedCount atomic.Int64
+	closed    atomic.Bool
+	stopCh    chan struct{}
+	closeOnce sync.Once
+	resizeUp  atomic.Int64
+	resizeDown atomic.Int64
+	sendCount  atomic.Int64
+	recvCount  atomic.Int64
 
 	// Context for cancellation propagation
 	ctx context.Context
@@ -121,6 +121,16 @@ func NewAdaptiveChannel[T any](config AdaptiveChannelConfig) *AdaptiveChannel[T]
 // The context is used to signal the adapt loop goroutine to stop when the parent context is cancelled.
 func NewAdaptiveChannelWithContext[T any](ctx context.Context, config AdaptiveChannelConfig) *AdaptiveChannel[T] {
 	config = normalizeAdaptiveChannelConfig(config)
+
+	// Enforce minimum bound when MaxOverflowSize=0 (legacy mode deprecated)
+	if config.MaxOverflowSize == 0 {
+		log.Printf("[DEPRECATED] AdaptiveChannel: MaxOverflowSize=0 is deprecated. " +
+			"Using default bound of %d to prevent memory exhaustion. " +
+			"Please explicitly set MaxOverflowSize in your configuration.",
+			DefaultAdaptiveMaxOverflow)
+		config.MaxOverflowSize = DefaultAdaptiveMaxOverflow
+	}
+
 	ac := &AdaptiveChannel[T]{
 		config:      config,
 		ch:          make(chan T, config.InitialSize),
@@ -129,14 +139,8 @@ func NewAdaptiveChannelWithContext[T any](ctx context.Context, config AdaptiveCh
 		ctx:         ctx,
 	}
 
-	// Initialize overflow buffer based on configuration
-	if config.MaxOverflowSize > 0 {
-		// Bounded overflow mode (recommended)
-		ac.boundedOvfl = NewBoundedOverflow[T](config.MaxOverflowSize, config.OverflowDropPolicy)
-	} else {
-		// Legacy unbounded mode (not recommended)
-		ac.unboundedOvfl = make([]T, 0)
-	}
+	// Always use bounded overflow mode now (legacy unbounded is deprecated)
+	ac.boundedOvfl = NewBoundedOverflow[T](config.MaxOverflowSize, config.OverflowDropPolicy)
 
 	go ac.adaptLoop()
 	return ac
@@ -302,18 +306,12 @@ func (ac *AdaptiveChannel[T]) enqueueOverflow(msg T) error {
 		return ErrChannelClosed
 	}
 
-	if ac.boundedOvfl != nil {
-		// Bounded overflow mode
-		if !ac.boundedOvfl.Add(msg) {
-			// DropNewest policy - message was rejected
-			ac.droppedCount.Add(1)
-			return ErrOverflowFull
-		}
-		return nil
+	// Always bounded now (legacy unbounded mode is deprecated)
+	if !ac.boundedOvfl.Add(msg) {
+		// DropNewest policy - message was rejected
+		// Note: BoundedOverflow already tracks dropped count internally
+		return ErrOverflowFull
 	}
-
-	// Legacy unbounded mode
-	ac.unboundedOvfl = append(ac.unboundedOvfl, msg)
 	return nil
 }
 
@@ -402,26 +400,29 @@ func (ac *AdaptiveChannel[T]) TryReceive() (T, bool) {
 		return zero, false
 	}
 
-	if msg, ok := ac.drainOverflow(); ok {
-		ac.recvCount.Add(1)
-		return msg, true
-	}
-
-	// Get channel reference under lock, then release.
+	// Try channel first (older messages) for FIFO ordering
 	ac.mu.Lock()
 	ch := ac.ch
 	ac.mu.Unlock()
 
 	select {
 	case msg, ok := <-ch:
-		if !ok {
-			return zero, false
+		if ok {
+			ac.recvCount.Add(1)
+			return msg, true
 		}
+		// Channel closed, fall through to overflow
+	default:
+		// Channel empty, fall through to overflow
+	}
+
+	// Try overflow (newer messages)
+	if msg, ok := ac.drainOverflow(); ok {
 		ac.recvCount.Add(1)
 		return msg, true
-	default:
-		return zero, false
 	}
+
+	return zero, false
 }
 
 func (ac *AdaptiveChannel[T]) Size() int {
@@ -447,30 +448,19 @@ func (ac *AdaptiveChannel[T]) OverflowLen() int {
 
 // overflowLenLocked returns the overflow length. Caller must hold mu.
 func (ac *AdaptiveChannel[T]) overflowLenLocked() int {
-	if ac.boundedOvfl != nil {
-		return ac.boundedOvfl.Len()
-	}
-	return len(ac.unboundedOvfl)
+	// Always bounded now (legacy unbounded mode is deprecated)
+	return ac.boundedOvfl.Len()
 }
 
 func (ac *AdaptiveChannel[T]) Stats() ChannelStats {
 	ac.mu.Lock()
-	var overflowCap int
-	var droppedFromOvfl int64
-
-	if ac.boundedOvfl != nil {
-		overflowCap = ac.boundedOvfl.Cap()
-		droppedFromOvfl = ac.boundedOvfl.DroppedCount()
-	} else {
-		overflowCap = -1 // Unbounded
-	}
-
+	// Always bounded now (legacy unbounded mode is deprecated)
 	stats := ChannelStats{
 		CurrentSize:      ac.currentSize,
 		MessageCount:     len(ac.ch),
-		OverflowCount:    ac.overflowLenLocked(),
-		OverflowCapacity: overflowCap,
-		DroppedCount:     ac.droppedCount.Load() + droppedFromOvfl,
+		OverflowCount:    ac.boundedOvfl.Len(),
+		OverflowCapacity: ac.boundedOvfl.Cap(),
+		DroppedCount:     ac.boundedOvfl.DroppedCount(),
 		ResizeUpCount:    ac.resizeUp.Load(),
 		ResizeDownCount:  ac.resizeDown.Load(),
 		SendCount:        ac.sendCount.Load(),
@@ -486,9 +476,8 @@ func (ac *AdaptiveChannel[T]) Close() {
 		close(ac.stopCh)
 		ac.mu.Lock()
 		close(ac.ch)
-		if ac.boundedOvfl != nil {
-			ac.boundedOvfl.Close()
-		}
+		// Always bounded now (legacy unbounded mode is deprecated)
+		ac.boundedOvfl.Close()
 		ac.mu.Unlock()
 	})
 }
@@ -603,54 +592,60 @@ func (ac *AdaptiveChannel[T]) resizeDownIfNeeded() {
 	ac.resizeDown.Add(1)
 }
 
-// resizeLocked performs a staged resize with minimal lock time.
-// Stage 1: Create new channel and collect messages (lock held)
-// Stage 2: Swap channel reference and increment version (lock held)
-// The drain is done in bounded batches to prevent long lock holds.
+// resizeLocked performs a staged resize that preserves all messages.
+// Stage 1: Create new channel (lock held)
+// Stage 2: Drain old channel completely, storing overflow if needed (lock held)
+// Stage 3: Swap channel reference and increment version (lock held)
+// The drain uses bounded iteration to prevent infinite loops.
 func (ac *AdaptiveChannel[T]) resizeLocked(newSize int) {
 	if newSize == ac.currentSize {
 		return
 	}
 
-	// Stage 1: Create new channel
 	newCh := make(chan T, newSize)
 	oldCh := ac.ch
 
-	// Collect messages from old channel in bounded batches
-	// to prevent holding lock too long
-	const maxDrainPerBatch = 100
-	drained := 0
-	for drained < maxDrainPerBatch {
-		select {
-		case msg := <-oldCh:
-			select {
-			case newCh <- msg:
-				drained++
-			default:
-				// New channel is full, we've hit capacity during downsize
-				// Put message back and stop draining
-				// Note: Can't put back, so message is lost in this edge case
-				// This only happens during aggressive downsizing
-				break
-			}
-		default:
-			// Old channel is empty
-			goto swapChannel
-		}
-	}
+	// Drain old channel completely with bounded iteration.
+	// maxDrainIterations bounds the loop to prevent infinite iteration.
+	maxDrainIterations := ac.currentSize + 1
+	ac.drainOldChannel(oldCh, newCh, maxDrainIterations)
 
-swapChannel:
-	// Stage 2: Atomically swap the channel reference
+	// Swap channel reference
 	ac.ch = newCh
 	ac.currentSize = newSize
 	ac.highWaterCnt = 0
 	ac.lowWaterCnt = 0
-	ac.version.Add(1) // Increment version to signal channel change
+	ac.version.Add(1)
+}
 
-	// Note: We no longer do a second drain loop here to minimize lock time.
-	// Any remaining messages in oldCh from blocked senders will be lost,
-	// but senders using version checking will retry on the new channel.
-	// The tradeoff is minimal lock time vs potential message loss during resize.
+// drainOldChannel moves messages from old to new channel, preserving overflow.
+// Messages that don't fit in newCh are stored in the overflow buffer.
+// Iteration is bounded by maxIterations to prevent infinite loops.
+func (ac *AdaptiveChannel[T]) drainOldChannel(oldCh, newCh chan T, maxIterations int) {
+	for i := 0; i < maxIterations; i++ {
+		select {
+		case msg := <-oldCh:
+			ac.transferMessage(msg, newCh)
+		default:
+			return
+		}
+	}
+}
+
+// transferMessage sends msg to newCh, or stores in overflow if newCh is full.
+func (ac *AdaptiveChannel[T]) transferMessage(msg T, newCh chan T) {
+	select {
+	case newCh <- msg:
+		return
+	default:
+		ac.storeInOverflow(msg)
+	}
+}
+
+// storeInOverflow stores a message in the overflow buffer during resize.
+func (ac *AdaptiveChannel[T]) storeInOverflow(msg T) {
+	// Always bounded now (legacy unbounded mode is deprecated)
+	ac.boundedOvfl.Add(msg)
 }
 
 func (ac *AdaptiveChannel[T]) isClosedAndEmpty() bool {
@@ -662,22 +657,8 @@ func (ac *AdaptiveChannel[T]) isClosedAndEmpty() bool {
 }
 
 func (ac *AdaptiveChannel[T]) drainOverflow() (T, bool) {
-	var zero T
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
-
-	if ac.boundedOvfl != nil {
-		// Bounded overflow mode
-		return ac.boundedOvfl.Take()
-	}
-
-	// Legacy unbounded mode
-	if len(ac.unboundedOvfl) == 0 {
-		return zero, false
-	}
-
-	msg := ac.unboundedOvfl[0]
-	ac.unboundedOvfl[0] = zero // Clear reference for GC
-	ac.unboundedOvfl = ac.unboundedOvfl[1:]
-	return msg, true
+	// Always bounded now (legacy unbounded mode is deprecated)
+	return ac.boundedOvfl.Take()
 }
