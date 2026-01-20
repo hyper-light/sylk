@@ -2,8 +2,8 @@ package inference
 
 import (
 	"context"
+	"hash/fnv"
 	"sort"
-	"strings"
 )
 
 // =============================================================================
@@ -289,58 +289,111 @@ func (re *RuleEvaluator) clearCache() {
 }
 
 // conditionCacheKey generates a unique cache key for a condition and bindings.
-// The key combines the condition's triple pattern with the current bound variables.
+// W4P.40: Uses FNV-1a hash for efficient key generation, avoiding expensive
+// string concatenation and reducing GC pressure from temporary strings.
 func (re *RuleEvaluator) conditionCacheKey(condition RuleCondition, bindings map[string]string) string {
-	var sb strings.Builder
+	h := fnv.New64a()
 
-	// Include the condition pattern
-	sb.WriteString(condition.Subject)
-	sb.WriteByte('|')
-	sb.WriteString(condition.Predicate)
-	sb.WriteByte('|')
-	sb.WriteString(condition.Object)
-	sb.WriteByte('|')
+	// Hash the condition pattern with separators
+	h.Write([]byte(condition.Subject))
+	h.Write([]byte{0}) // null separator
+	h.Write([]byte(condition.Predicate))
+	h.Write([]byte{0})
+	h.Write([]byte(condition.Object))
+	h.Write([]byte{0})
 
-	// Include relevant bindings in sorted order for deterministic keys
-	// Only include bindings that are variables in this condition
-	relevantVars := make([]string, 0, 3)
-	if IsVariable(condition.Subject) {
-		relevantVars = append(relevantVars, condition.Subject)
-	}
-	if IsVariable(condition.Predicate) {
-		relevantVars = append(relevantVars, condition.Predicate)
-	}
-	if IsVariable(condition.Object) {
-		relevantVars = append(relevantVars, condition.Object)
+	// Collect and sort relevant variables for deterministic hashing
+	relevantVars := collectRelevantVars(condition)
+	if len(relevantVars) > 1 {
+		sort.Strings(relevantVars)
 	}
 
-	sort.Strings(relevantVars)
+	// Hash bound variable values in sorted order
 	for _, v := range relevantVars {
 		if val, ok := bindings[v]; ok {
-			sb.WriteString(v)
-			sb.WriteByte('=')
-			sb.WriteString(val)
-			sb.WriteByte(',')
+			h.Write([]byte(v))
+			h.Write([]byte{1}) // different separator for key-value pairs
+			h.Write([]byte(val))
+			h.Write([]byte{0})
 		}
 	}
 
-	return sb.String()
+	// Convert hash to string key
+	return formatHashKey(h.Sum64())
+}
+
+// collectRelevantVars extracts variable names from a condition's triple pattern.
+// W4P.40: Helper function to reduce cyclomatic complexity of conditionCacheKey.
+func collectRelevantVars(condition RuleCondition) []string {
+	vars := make([]string, 0, 3)
+	if IsVariable(condition.Subject) {
+		vars = append(vars, condition.Subject)
+	}
+	if IsVariable(condition.Predicate) {
+		vars = append(vars, condition.Predicate)
+	}
+	if IsVariable(condition.Object) {
+		vars = append(vars, condition.Object)
+	}
+	return vars
+}
+
+// formatHashKey converts a uint64 hash to a hexadecimal string key.
+// W4P.40: Uses a fixed-size buffer to avoid allocations.
+func formatHashKey(hash uint64) string {
+	const hexDigits = "0123456789abcdef"
+	var buf [16]byte
+	for i := 15; i >= 0; i-- {
+		buf[i] = hexDigits[hash&0xf]
+		hash >>= 4
+	}
+	return string(buf[:])
 }
 
 // matchConditionCached finds all edges that match a condition given current bindings,
 // using memoization to avoid redundant computation.
 // PF.4.7: Returns cached results if available, otherwise computes and caches.
+// W4P.28: Returns deep copies to prevent caller modifications from corrupting the cache.
 func (re *RuleEvaluator) matchConditionCached(condition RuleCondition, bindings map[string]string) []conditionMatch {
 	cacheKey := re.conditionCacheKey(condition, bindings)
 
 	if cached, ok := re.matchCache[cacheKey]; ok {
-		return cached
+		return cloneConditionMatches(cached)
 	}
 
 	// PF.4.8: Use indexed matching instead of full edge scan
 	matches := re.matchConditionIndexed(condition, bindings)
 	re.matchCache[cacheKey] = matches
-	return matches
+	return cloneConditionMatches(matches)
+}
+
+// cloneConditionMatches creates a deep copy of a conditionMatch slice.
+// W4P.28: This ensures caller modifications cannot corrupt the cache.
+func cloneConditionMatches(matches []conditionMatch) []conditionMatch {
+	if matches == nil {
+		return nil
+	}
+	result := make([]conditionMatch, len(matches))
+	for i, m := range matches {
+		result[i] = conditionMatch{
+			edge:     m.edge, // Edge is a struct, copied by value
+			bindings: cloneBindings(m.bindings),
+		}
+	}
+	return result
+}
+
+// cloneBindings creates a deep copy of a bindings map.
+// W4P.28: This ensures caller modifications cannot corrupt cached bindings.
+func cloneBindings(bindings map[string]string) map[string]string {
+	if bindings == nil {
+		return nil
+	}
+	result := make(map[string]string, len(bindings))
+	for k, v := range bindings {
+		result[k] = v
+	}
+	return result
 }
 
 // =============================================================================

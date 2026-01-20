@@ -2,7 +2,9 @@ package inference
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 )
 
 // =============================================================================
@@ -1130,4 +1132,776 @@ func TestRuleEvaluator_filterMatches(t *testing.T) {
 			t.Errorf("Expected predicate 'calls', got %s", m.edge.Predicate)
 		}
 	}
+}
+
+// =============================================================================
+// W4P.28: Cache Isolation Tests
+// =============================================================================
+
+func TestCloneConditionMatches(t *testing.T) {
+	original := []conditionMatch{
+		{
+			edge:     Edge{Source: "A", Predicate: "rel", Target: "B"},
+			bindings: map[string]string{"?x": "A", "?y": "B"},
+		},
+		{
+			edge:     Edge{Source: "C", Predicate: "rel", Target: "D"},
+			bindings: map[string]string{"?x": "C", "?y": "D"},
+		},
+	}
+
+	cloned := cloneConditionMatches(original)
+
+	// Verify length matches
+	if len(cloned) != len(original) {
+		t.Errorf("Expected %d matches, got %d", len(original), len(cloned))
+	}
+
+	// Verify contents are equal
+	for i := range original {
+		if cloned[i].edge != original[i].edge {
+			t.Errorf("Edge mismatch at index %d", i)
+		}
+		for k, v := range original[i].bindings {
+			if cloned[i].bindings[k] != v {
+				t.Errorf("Bindings mismatch at index %d, key %s", i, k)
+			}
+		}
+	}
+
+	// Verify modification isolation - modify clone bindings
+	cloned[0].bindings["?x"] = "MODIFIED"
+	if original[0].bindings["?x"] == "MODIFIED" {
+		t.Error("Modifying cloned bindings affected original")
+	}
+
+	// Verify modification isolation - modify clone edge
+	cloned[0].edge.Source = "MODIFIED"
+	if original[0].edge.Source == "MODIFIED" {
+		t.Error("Modifying cloned edge affected original")
+	}
+
+	// Verify modification isolation - add to clone bindings
+	cloned[0].bindings["?new"] = "NEW"
+	if _, exists := original[0].bindings["?new"]; exists {
+		t.Error("Adding to cloned bindings affected original")
+	}
+}
+
+func TestCloneConditionMatches_Nil(t *testing.T) {
+	cloned := cloneConditionMatches(nil)
+	if cloned != nil {
+		t.Error("Clone of nil should be nil")
+	}
+}
+
+func TestCloneConditionMatches_Empty(t *testing.T) {
+	cloned := cloneConditionMatches([]conditionMatch{})
+	if cloned == nil {
+		t.Error("Clone of empty slice should not be nil")
+	}
+	if len(cloned) != 0 {
+		t.Error("Clone of empty slice should be empty")
+	}
+}
+
+func TestCloneBindings(t *testing.T) {
+	original := map[string]string{
+		"?x": "A",
+		"?y": "B",
+		"?z": "C",
+	}
+
+	cloned := cloneBindings(original)
+
+	// Verify length matches
+	if len(cloned) != len(original) {
+		t.Errorf("Expected %d bindings, got %d", len(original), len(cloned))
+	}
+
+	// Verify contents are equal
+	for k, v := range original {
+		if cloned[k] != v {
+			t.Errorf("Binding mismatch for key %s", k)
+		}
+	}
+
+	// Verify modification isolation
+	cloned["?x"] = "MODIFIED"
+	if original["?x"] == "MODIFIED" {
+		t.Error("Modifying cloned bindings affected original")
+	}
+
+	cloned["?new"] = "NEW"
+	if _, exists := original["?new"]; exists {
+		t.Error("Adding to cloned bindings affected original")
+	}
+}
+
+func TestCloneBindings_Nil(t *testing.T) {
+	cloned := cloneBindings(nil)
+	if cloned != nil {
+		t.Error("Clone of nil should be nil")
+	}
+}
+
+func TestCloneBindings_Empty(t *testing.T) {
+	cloned := cloneBindings(map[string]string{})
+	if cloned == nil {
+		t.Error("Clone of empty map should not be nil")
+	}
+	if len(cloned) != 0 {
+		t.Error("Clone of empty map should be empty")
+	}
+}
+
+// TestMatchConditionCached_Isolation verifies that caller modifications
+// to returned matches do not affect cached data (W4P.28).
+func TestMatchConditionCached_Isolation(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+	}
+
+	evaluator.clearCache()
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+
+	bindings := map[string]string{"?x": "A"}
+
+	// First call - populates cache
+	matches1 := evaluator.matchConditionCached(condition, bindings)
+	if len(matches1) != 2 {
+		t.Fatalf("Expected 2 matches, got %d", len(matches1))
+	}
+
+	// Corrupt the returned matches
+	matches1[0].bindings["?x"] = "CORRUPTED"
+	matches1[0].edge.Source = "CORRUPTED"
+	matches1 = append(matches1, conditionMatch{
+		edge:     Edge{Source: "EXTRA", Predicate: "EXTRA", Target: "EXTRA"},
+		bindings: map[string]string{"?extra": "EXTRA"},
+	})
+
+	// Second call - should get uncorrupted data from cache
+	matches2 := evaluator.matchConditionCached(condition, bindings)
+
+	if len(matches2) != 2 {
+		t.Errorf("Expected 2 matches from cache, got %d (cache was corrupted)", len(matches2))
+	}
+
+	for _, m := range matches2 {
+		if m.bindings["?x"] == "CORRUPTED" {
+			t.Error("Cache was corrupted: bindings contain CORRUPTED value")
+		}
+		if m.edge.Source == "CORRUPTED" {
+			t.Error("Cache was corrupted: edge source contains CORRUPTED value")
+		}
+	}
+
+	// Verify original binding value is preserved
+	foundOriginalBinding := false
+	for _, m := range matches2 {
+		if m.bindings["?x"] == "A" {
+			foundOriginalBinding = true
+			break
+		}
+	}
+	if !foundOriginalBinding {
+		t.Error("Original binding value ?x=A not found in cached matches")
+	}
+}
+
+// TestMatchConditionCached_IsolationBetweenCalls verifies that modifications
+// to one returned result don't affect other callers' results (W4P.28).
+func TestMatchConditionCached_IsolationBetweenCalls(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "rel", Target: "B"},
+	}
+
+	evaluator.clearCache()
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "rel",
+		Object:    "?y",
+	}
+
+	bindings := map[string]string{}
+
+	// Get two separate results
+	result1 := evaluator.matchConditionCached(condition, bindings)
+	result2 := evaluator.matchConditionCached(condition, bindings)
+
+	if len(result1) != 1 || len(result2) != 1 {
+		t.Fatal("Expected 1 match each")
+	}
+
+	// Modify result1
+	result1[0].bindings["?x"] = "MODIFIED_BY_CALLER1"
+
+	// result2 should be unaffected
+	if result2[0].bindings["?x"] == "MODIFIED_BY_CALLER1" {
+		t.Error("Modification to result1 affected result2 - isolation failure")
+	}
+}
+
+// TestMatchConditionCached_HappyPath verifies matches are returned correctly (W4P.28).
+func TestMatchConditionCached_HappyPath(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+		{Source: "B", Predicate: "calls", Target: "D"},
+	}
+
+	evaluator.clearCache()
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	// Test 1: Match with bound source
+	condition1 := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+	bindings1 := map[string]string{"?x": "A"}
+
+	matches1 := evaluator.matchConditionCached(condition1, bindings1)
+	if len(matches1) != 2 {
+		t.Errorf("Expected 2 matches for source A, got %d", len(matches1))
+	}
+
+	for _, m := range matches1 {
+		if m.edge.Source != "A" {
+			t.Errorf("Expected source A, got %s", m.edge.Source)
+		}
+		if m.bindings["?x"] != "A" {
+			t.Errorf("Expected ?x=A in bindings, got ?x=%s", m.bindings["?x"])
+		}
+	}
+
+	// Test 2: Match with no bindings (all edges with predicate "calls")
+	bindings2 := map[string]string{}
+	matches2 := evaluator.matchConditionCached(condition1, bindings2)
+	if len(matches2) != 3 {
+		t.Errorf("Expected 3 matches for predicate calls, got %d", len(matches2))
+	}
+
+	// Test 3: Verify cache hit returns same data
+	matches3 := evaluator.matchConditionCached(condition1, bindings1)
+	if len(matches3) != len(matches1) {
+		t.Errorf("Cache hit returned different count: %d vs %d", len(matches3), len(matches1))
+	}
+}
+
+// TestMatchConditionCached_ConcurrentModification verifies that concurrent
+// modifications to returned matches by different callers don't interfere
+// with each other (W4P.28). Each goroutine uses its own evaluator to avoid
+// the pre-existing issue of unsynchronized cache map access.
+// This test is designed to be run with -race flag.
+func TestMatchConditionCached_ConcurrentModification(t *testing.T) {
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+		{Source: "B", Predicate: "calls", Target: "D"},
+	}
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+	bindings := map[string]string{"?x": "A"}
+
+	const numGoroutines = 10
+	const numIterations = 100
+
+	// Channel to collect error messages
+	errCh := make(chan string, numGoroutines*numIterations)
+
+	// Use WaitGroup for proper synchronization
+	var wg sync.WaitGroup
+
+	// Start goroutines that each use their own evaluator
+	// and verify that modifications to returned results don't affect
+	// subsequent queries on the same evaluator
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+
+			// Each goroutine has its own evaluator
+			evaluator := NewRuleEvaluator()
+			evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+			for i := 0; i < numIterations; i++ {
+				// Get cached matches
+				matches := evaluator.matchConditionCached(condition, bindings)
+
+				// Verify we got the expected number of matches
+				if len(matches) != 2 {
+					errCh <- "unexpected match count"
+					continue
+				}
+
+				// Verify data is not corrupted from previous iteration
+				for _, m := range matches {
+					if m.edge.Source != "A" {
+						errCh <- "corrupted source: got " + m.edge.Source + ", expected A"
+					}
+					if m.bindings["?x"] != "A" {
+						errCh <- "corrupted binding: got " + m.bindings["?x"] + ", expected A"
+					}
+				}
+
+				// Modify our local copy (should not affect cache or future calls)
+				matches[0].bindings["?x"] = "MODIFIED_BY_GOROUTINE"
+				matches[0].edge.Source = "MODIFIED_BY_GOROUTINE"
+			}
+		}(g)
+	}
+
+	// Wait with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All goroutines completed
+	case <-time.After(30 * time.Second):
+		t.Fatal("Test timed out waiting for goroutines")
+	}
+
+	// Check for errors
+	close(errCh)
+	var errors []string
+	for errMsg := range errCh {
+		errors = append(errors, errMsg)
+	}
+
+	if len(errors) > 0 {
+		t.Errorf("Concurrent modification test failed with %d errors", len(errors))
+		// Show first few errors
+		for i, errMsg := range errors {
+			if i >= 5 {
+				t.Errorf("... and %d more errors", len(errors)-5)
+				break
+			}
+			t.Errorf("Error %d: %s", i+1, errMsg)
+		}
+	}
+}
+
+// TestMatchConditionCached_RapidSequentialModification verifies that rapid
+// sequential calls with modifications don't corrupt the cache (W4P.28).
+func TestMatchConditionCached_RapidSequentialModification(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	edges := []Edge{
+		{Source: "A", Predicate: "calls", Target: "B"},
+		{Source: "A", Predicate: "calls", Target: "C"},
+	}
+
+	evaluator.edgeIndex = evaluator.buildEdgeIndex(edges)
+
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+	bindings := map[string]string{"?x": "A"}
+
+	const numIterations = 1000
+
+	for i := 0; i < numIterations; i++ {
+		// Get matches from cache
+		matches := evaluator.matchConditionCached(condition, bindings)
+
+		// Verify we got correct data
+		if len(matches) != 2 {
+			t.Fatalf("Iteration %d: expected 2 matches, got %d", i, len(matches))
+		}
+
+		for j, m := range matches {
+			if m.edge.Source != "A" {
+				t.Fatalf("Iteration %d, match %d: corrupted source %s", i, j, m.edge.Source)
+			}
+			if m.bindings["?x"] != "A" {
+				t.Fatalf("Iteration %d, match %d: corrupted binding %s", i, j, m.bindings["?x"])
+			}
+		}
+
+		// Aggressively corrupt the returned data
+		matches[0].bindings["?x"] = "CORRUPTED"
+		matches[0].bindings["?y"] = "CORRUPTED"
+		matches[0].edge.Source = "CORRUPTED"
+		matches[0].edge.Target = "CORRUPTED"
+		matches[0].edge.Predicate = "CORRUPTED"
+		matches = append(matches, conditionMatch{
+			edge:     Edge{Source: "INJECTED", Predicate: "INJECTED", Target: "INJECTED"},
+			bindings: map[string]string{"?injected": "INJECTED"},
+		})
+	}
+}
+
+// TestEvaluateRule_CacheIsolation verifies the full evaluation flow
+// maintains cache isolation (W4P.28).
+func TestEvaluateRule_CacheIsolation(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	ctx := context.Background()
+
+	rule := InferenceRule{
+		ID:   "test_rule",
+		Name: "Test Isolation",
+		Head: RuleCondition{
+			Subject:   "?x",
+			Predicate: "derived",
+			Object:    "?y",
+		},
+		Body: []RuleCondition{
+			{Subject: "?x", Predicate: "rel", Object: "?y"},
+		},
+		Priority: 1,
+		Enabled:  true,
+	}
+
+	edges := []Edge{
+		{Source: "A", Predicate: "rel", Target: "B"},
+		{Source: "C", Predicate: "rel", Target: "D"},
+	}
+
+	// First evaluation
+	results1 := evaluator.EvaluateRule(ctx, rule, edges)
+	if len(results1) != 2 {
+		t.Fatalf("Expected 2 results, got %d", len(results1))
+	}
+
+	// Try to corrupt the internal state through results (shouldn't be possible
+	// because results are new objects, but this verifies the full flow)
+	for i := range results1 {
+		results1[i].DerivedEdge.SourceID = "CORRUPTED"
+	}
+
+	// Second evaluation should still work correctly
+	results2 := evaluator.EvaluateRule(ctx, rule, edges)
+	if len(results2) != 2 {
+		t.Fatalf("Expected 2 results on second evaluation, got %d", len(results2))
+	}
+
+	for _, r := range results2 {
+		if r.DerivedEdge.SourceID == "CORRUPTED" {
+			t.Error("Second evaluation returned corrupted data")
+		}
+	}
+}
+
+// =============================================================================
+// W4P.40: Hash-Based Cache Key Tests
+// =============================================================================
+
+// TestConditionCacheKey_Uniqueness verifies that different inputs produce different keys.
+func TestConditionCacheKey_Uniqueness(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	testCases := []struct {
+		name       string
+		condition1 RuleCondition
+		bindings1  map[string]string
+		condition2 RuleCondition
+		bindings2  map[string]string
+	}{
+		{
+			name:       "DifferentSubject",
+			condition1: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{},
+			condition2: RuleCondition{Subject: "?z", Predicate: "calls", Object: "?y"},
+			bindings2:  map[string]string{},
+		},
+		{
+			name:       "DifferentPredicate",
+			condition1: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{},
+			condition2: RuleCondition{Subject: "?x", Predicate: "imports", Object: "?y"},
+			bindings2:  map[string]string{},
+		},
+		{
+			name:       "DifferentObject",
+			condition1: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{},
+			condition2: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?z"},
+			bindings2:  map[string]string{},
+		},
+		{
+			name:       "DifferentBindingValue",
+			condition1: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{"?x": "A"},
+			condition2: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings2:  map[string]string{"?x": "B"},
+		},
+		{
+			name:       "BoundVsUnbound",
+			condition1: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{"?x": "A"},
+			condition2: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings2:  map[string]string{},
+		},
+		{
+			name:       "DifferentBoundVariable",
+			condition1: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{"?x": "A"},
+			condition2: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings2:  map[string]string{"?y": "A"},
+		},
+		{
+			name:       "ConstantVsVariable",
+			condition1: RuleCondition{Subject: "NodeA", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{},
+			condition2: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings2:  map[string]string{},
+		},
+		{
+			name:       "MultipleBindings",
+			condition1: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings1:  map[string]string{"?x": "A", "?y": "B"},
+			condition2: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings2:  map[string]string{"?x": "A", "?y": "C"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			key1 := evaluator.conditionCacheKey(tc.condition1, tc.bindings1)
+			key2 := evaluator.conditionCacheKey(tc.condition2, tc.bindings2)
+
+			if key1 == key2 {
+				t.Errorf("Expected different keys for different inputs:\n  key1: %s\n  key2: %s", key1, key2)
+			}
+		})
+	}
+}
+
+// TestConditionCacheKey_Consistency verifies that same inputs always produce same key.
+func TestConditionCacheKey_Consistency(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	testCases := []struct {
+		name      string
+		condition RuleCondition
+		bindings  map[string]string
+	}{
+		{
+			name:      "SimpleCondition",
+			condition: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings:  map[string]string{},
+		},
+		{
+			name:      "WithBinding",
+			condition: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			bindings:  map[string]string{"?x": "NodeA"},
+		},
+		{
+			name:      "WithMultipleBindings",
+			condition: RuleCondition{Subject: "?x", Predicate: "?p", Object: "?y"},
+			bindings:  map[string]string{"?x": "A", "?y": "B", "?p": "calls"},
+		},
+		{
+			name:      "ConstantCondition",
+			condition: RuleCondition{Subject: "NodeA", Predicate: "calls", Object: "NodeB"},
+			bindings:  map[string]string{},
+		},
+		{
+			name:      "MixedCondition",
+			condition: RuleCondition{Subject: "?x", Predicate: "calls", Object: "NodeB"},
+			bindings:  map[string]string{"?x": "NodeA"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Generate key multiple times
+			const iterations = 100
+			keys := make([]string, iterations)
+
+			for i := 0; i < iterations; i++ {
+				keys[i] = evaluator.conditionCacheKey(tc.condition, tc.bindings)
+			}
+
+			// Verify all keys are identical
+			for i := 1; i < iterations; i++ {
+				if keys[i] != keys[0] {
+					t.Errorf("Inconsistent key at iteration %d:\n  expected: %s\n  got: %s", i, keys[0], keys[i])
+				}
+			}
+		})
+	}
+}
+
+// TestConditionCacheKey_BindingOrderIndependent verifies that binding order doesn't affect key.
+func TestConditionCacheKey_BindingOrderIndependent(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	condition := RuleCondition{Subject: "?x", Predicate: "?p", Object: "?y"}
+
+	// Create bindings in different orders
+	bindings1 := map[string]string{"?x": "A", "?y": "B", "?p": "calls"}
+	bindings2 := map[string]string{"?p": "calls", "?x": "A", "?y": "B"}
+	bindings3 := map[string]string{"?y": "B", "?p": "calls", "?x": "A"}
+
+	key1 := evaluator.conditionCacheKey(condition, bindings1)
+	key2 := evaluator.conditionCacheKey(condition, bindings2)
+	key3 := evaluator.conditionCacheKey(condition, bindings3)
+
+	if key1 != key2 || key2 != key3 {
+		t.Errorf("Keys should be identical regardless of binding order:\n  key1: %s\n  key2: %s\n  key3: %s", key1, key2, key3)
+	}
+}
+
+// TestConditionCacheKey_IrrelevantBindingsIgnored verifies bindings for
+// non-variables in the condition are ignored.
+func TestConditionCacheKey_IrrelevantBindingsIgnored(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+
+	condition := RuleCondition{Subject: "NodeA", Predicate: "calls", Object: "NodeB"}
+
+	// All constants - bindings should be ignored
+	bindings1 := map[string]string{}
+	bindings2 := map[string]string{"?x": "ignored", "?y": "also_ignored"}
+
+	key1 := evaluator.conditionCacheKey(condition, bindings1)
+	key2 := evaluator.conditionCacheKey(condition, bindings2)
+
+	if key1 != key2 {
+		t.Errorf("Irrelevant bindings should not affect key:\n  key1: %s\n  key2: %s", key1, key2)
+	}
+}
+
+// TestCollectRelevantVars tests the helper function.
+func TestCollectRelevantVars(t *testing.T) {
+	testCases := []struct {
+		name      string
+		condition RuleCondition
+		expected  int
+	}{
+		{
+			name:      "AllVariables",
+			condition: RuleCondition{Subject: "?x", Predicate: "?p", Object: "?y"},
+			expected:  3,
+		},
+		{
+			name:      "NoVariables",
+			condition: RuleCondition{Subject: "A", Predicate: "calls", Object: "B"},
+			expected:  0,
+		},
+		{
+			name:      "OneVariable",
+			condition: RuleCondition{Subject: "?x", Predicate: "calls", Object: "B"},
+			expected:  1,
+		},
+		{
+			name:      "TwoVariables",
+			condition: RuleCondition{Subject: "?x", Predicate: "calls", Object: "?y"},
+			expected:  2,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			vars := collectRelevantVars(tc.condition)
+			if len(vars) != tc.expected {
+				t.Errorf("Expected %d variables, got %d", tc.expected, len(vars))
+			}
+		})
+	}
+}
+
+// TestFormatHashKey tests the hash formatting function.
+func TestFormatHashKey(t *testing.T) {
+	testCases := []struct {
+		hash     uint64
+		expected string
+	}{
+		{0, "0000000000000000"},
+		{1, "0000000000000001"},
+		{15, "000000000000000f"},
+		{16, "0000000000000010"},
+		{255, "00000000000000ff"},
+		{0xdeadbeef, "00000000deadbeef"},
+		{0xffffffffffffffff, "ffffffffffffffff"},
+	}
+
+	for _, tc := range testCases {
+		result := formatHashKey(tc.hash)
+		if result != tc.expected {
+			t.Errorf("formatHashKey(%x) = %s, expected %s", tc.hash, result, tc.expected)
+		}
+	}
+}
+
+// TestConditionCacheKey_HashCollisionResistance verifies that similar inputs
+// don't produce hash collisions.
+func TestConditionCacheKey_HashCollisionResistance(t *testing.T) {
+	evaluator := NewRuleEvaluator()
+	seen := make(map[string]string)
+
+	// Generate many different condition/binding combinations
+	predicates := []string{"calls", "imports", "uses", "extends", "implements"}
+	nodes := []string{"A", "B", "C", "D", "E", "node1", "node2", "main", "helper"}
+
+	for _, subj := range append(nodes, "?x", "?a", "?s") {
+		for _, pred := range append(predicates, "?p") {
+			for _, obj := range append(nodes, "?y", "?b", "?o") {
+				condition := RuleCondition{Subject: subj, Predicate: pred, Object: obj}
+
+				// Collect relevant variables in the condition
+				relevantVars := collectRelevantVars(condition)
+
+				// Test with various binding combinations
+				bindingCombos := []map[string]string{
+					{},
+					{"?x": "A"},
+					{"?y": "B"},
+					{"?x": "A", "?y": "B"},
+					{"?p": "calls"},
+					{"?a": "NodeA"},
+					{"?s": "NodeS"},
+					{"?b": "NodeB"},
+					{"?o": "NodeO"},
+				}
+
+				for _, bindings := range bindingCombos {
+					key := evaluator.conditionCacheKey(condition, bindings)
+
+					// Create a descriptor that only includes relevant bindings
+					// (matches the actual key generation logic)
+					desc := condition.Subject + "|" + condition.Predicate + "|" + condition.Object
+					for _, v := range relevantVars {
+						if val, ok := bindings[v]; ok {
+							desc += "|" + v + "=" + val
+						}
+					}
+
+					if prevDesc, exists := seen[key]; exists && prevDesc != desc {
+						t.Errorf("Hash collision detected:\n  key: %s\n  input1: %s\n  input2: %s", key, prevDesc, desc)
+					}
+					seen[key] = desc
+				}
+			}
+		}
+	}
+
+	t.Logf("Tested %d unique key generations without collision", len(seen))
 }

@@ -332,3 +332,110 @@ func BenchmarkIsVariable(b *testing.B) {
 		}
 	}
 }
+
+// =============================================================================
+// W4P.40: Hash-Based Cache Key Benchmarks
+// =============================================================================
+
+// BenchmarkCacheKey_Simple benchmarks cache key generation with simple conditions.
+func BenchmarkCacheKey_Simple(b *testing.B) {
+	evaluator := NewRuleEvaluator()
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+	bindings := map[string]string{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evaluator.conditionCacheKey(condition, bindings)
+	}
+}
+
+// BenchmarkCacheKey_WithBindings benchmarks cache key generation with bound variables.
+func BenchmarkCacheKey_WithBindings(b *testing.B) {
+	evaluator := NewRuleEvaluator()
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "calls",
+		Object:    "?y",
+	}
+	bindings := map[string]string{"?x": "node1"}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evaluator.conditionCacheKey(condition, bindings)
+	}
+}
+
+// BenchmarkCacheKey_MultipleBindings benchmarks cache key with multiple bindings.
+func BenchmarkCacheKey_MultipleBindings(b *testing.B) {
+	evaluator := NewRuleEvaluator()
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "?p",
+		Object:    "?y",
+	}
+	bindings := map[string]string{
+		"?x": "node1",
+		"?y": "node2",
+		"?p": "calls",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evaluator.conditionCacheKey(condition, bindings)
+	}
+}
+
+// BenchmarkCacheKey_LongStrings benchmarks cache key with longer string values.
+func BenchmarkCacheKey_LongStrings(b *testing.B) {
+	evaluator := NewRuleEvaluator()
+	condition := RuleCondition{
+		Subject:   "?x",
+		Predicate: "implements_interface",
+		Object:    "?y",
+	}
+	bindings := map[string]string{
+		"?x": "com.example.application.services.UserServiceImpl",
+		"?y": "com.example.application.interfaces.UserService",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evaluator.conditionCacheKey(condition, bindings)
+	}
+}
+
+// BenchmarkCollectRelevantVars benchmarks the helper function.
+func BenchmarkCollectRelevantVars(b *testing.B) {
+	conditions := []RuleCondition{
+		{Subject: "?x", Predicate: "?p", Object: "?y"},
+		{Subject: "?x", Predicate: "calls", Object: "?y"},
+		{Subject: "NodeA", Predicate: "calls", Object: "NodeB"},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, c := range conditions {
+			collectRelevantVars(c)
+		}
+	}
+}
+
+// BenchmarkFormatHashKey benchmarks the hash formatting function.
+func BenchmarkFormatHashKey(b *testing.B) {
+	hash := uint64(0xdeadbeefcafebabe)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		formatHashKey(hash)
+	}
+}
