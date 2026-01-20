@@ -1,7 +1,6 @@
 package hnsw
 
 import (
-	"math"
 	"sync"
 	"testing"
 
@@ -274,7 +273,7 @@ func TestSnapshot_distance_MissingVector(t *testing.T) {
 	}
 
 	dist := snap.distance([]float32{1.0, 0.0}, 1.0, "nonexistent")
-	assert.Equal(t, math.MaxFloat64, dist)
+	assert.Equal(t, 2.0, dist) // max cosine distance
 }
 
 func TestSnapshot_distance_MissingMagnitude(t *testing.T) {
@@ -284,7 +283,7 @@ func TestSnapshot_distance_MissingMagnitude(t *testing.T) {
 	}
 
 	dist := snap.distance([]float32{1.0, 0.0}, 1.0, "test")
-	assert.Equal(t, math.MaxFloat64, dist)
+	assert.Equal(t, 2.0, dist) // max cosine distance
 }
 
 func TestSnapshot_Search_ConcurrentReads(t *testing.T) {
@@ -655,4 +654,355 @@ func TestSnapshot_EfSearch_NilIndexUsesZero(t *testing.T) {
 	// Effective efSearch should fall back to default behavior
 	efSearch := snap.getEffectiveEfSearch(10)
 	assert.Equal(t, vectorgraphdb.DefaultEfSearch, efSearch)
+}
+
+// W4P.16: Tests for entry point validation per-layer during search
+
+func TestSnapshot_hasValidEntryVector(t *testing.T) {
+	tests := []struct {
+		name       string
+		vectors    map[string][]float32
+		magnitudes map[string]float64
+		nodeID     string
+		expected   bool
+	}{
+		{
+			name:       "valid entry with both vector and magnitude",
+			vectors:    map[string][]float32{"node1": {1.0, 0.0}},
+			magnitudes: map[string]float64{"node1": 1.0},
+			nodeID:     "node1",
+			expected:   true,
+		},
+		{
+			name:       "missing vector",
+			vectors:    map[string][]float32{},
+			magnitudes: map[string]float64{"node1": 1.0},
+			nodeID:     "node1",
+			expected:   false,
+		},
+		{
+			name:       "missing magnitude",
+			vectors:    map[string][]float32{"node1": {1.0, 0.0}},
+			magnitudes: map[string]float64{},
+			nodeID:     "node1",
+			expected:   false,
+		},
+		{
+			name:       "both missing",
+			vectors:    map[string][]float32{},
+			magnitudes: map[string]float64{},
+			nodeID:     "node1",
+			expected:   false,
+		},
+		{
+			name:       "different node exists",
+			vectors:    map[string][]float32{"other": {1.0, 0.0}},
+			magnitudes: map[string]float64{"other": 1.0},
+			nodeID:     "node1",
+			expected:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := &HNSWSnapshot{
+				Vectors:    tc.vectors,
+				Magnitudes: tc.magnitudes,
+			}
+			result := snap.hasValidEntryVector(tc.nodeID)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestSnapshot_isValidLayer(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{}},
+			{Nodes: map[string][]string{}},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		level    int
+		expected bool
+	}{
+		{"valid layer 0", 0, true},
+		{"valid layer 1", 1, true},
+		{"out of bounds positive", 2, false},
+		{"out of bounds negative", -1, false},
+		{"large out of bounds", 100, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := snap.isValidLayer(tc.level)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestSnapshot_nodeExistsAtLayer(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {"n2"}, "node2": {}}},
+			{Nodes: map[string][]string{"node1": {}}},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		nodeID   string
+		level    int
+		expected bool
+	}{
+		{"node exists at layer 0", "node1", 0, true},
+		{"node exists at layer 1", "node1", 1, true},
+		{"node2 exists at layer 0 only", "node2", 0, true},
+		{"node2 missing at layer 1", "node2", 1, false},
+		{"nonexistent node", "node3", 0, false},
+		{"invalid layer", "node1", 5, false},
+		{"negative layer", "node1", -1, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := snap.nodeExistsAtLayer(tc.nodeID, tc.level)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestSnapshot_searchLayerWithValidation_ValidEntry(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Vectors:    map[string][]float32{"node1": {1.0, 0.0}, "node2": {0.9, 0.1}},
+		Magnitudes: map[string]float64{"node1": 1.0, "node2": 0.906},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {"node2"}, "node2": {"node1"}}},
+			{Nodes: map[string][]string{"node1": {}}},
+		},
+	}
+
+	query := []float32{0.9, 0.1}
+	queryMag := 0.906
+
+	// Should perform normal search and potentially find a better node
+	result := snap.searchLayerWithValidation(query, queryMag, "node1", 0)
+	assert.NotEmpty(t, result)
+}
+
+func TestSnapshot_searchLayerWithValidation_InvalidLayer(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {}}},
+		},
+	}
+
+	// Should return entry unchanged when layer is invalid
+	result := snap.searchLayerWithValidation([]float32{1.0}, 1.0, "node1", 5)
+	assert.Equal(t, "node1", result)
+}
+
+func TestSnapshot_searchLayerWithValidation_MissingEntryAtLayer(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Vectors:    map[string][]float32{"node1": {1.0, 0.0}},
+		Magnitudes: map[string]float64{"node1": 1.0},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {}}},
+			{Nodes: map[string][]string{}}, // node1 missing at layer 1
+		},
+	}
+
+	// Should return entry unchanged when node missing at layer
+	result := snap.searchLayerWithValidation([]float32{1.0, 0.0}, 1.0, "node1", 1)
+	assert.Equal(t, "node1", result)
+}
+
+func TestSnapshot_Search_EntryPointVectorMissing(t *testing.T) {
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors:    map[string][]float32{}, // Entry point vector missing
+		Magnitudes: map[string]float64{"node1": 1.0},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {}}},
+		},
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 5, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_EntryPointMagnitudeMissing(t *testing.T) {
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors:    map[string][]float32{"node1": {1.0, 0.0}},
+		Magnitudes: map[string]float64{}, // Entry point magnitude missing
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {}}},
+		},
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 5, nil)
+	assert.Nil(t, results)
+}
+
+func TestSnapshot_Search_ValidEntryAtAllLayers(t *testing.T) {
+	// Happy path: valid entry point at all layers
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	results := snap.Search([]float32{1.0, 0.0, 0.0}, 3, nil)
+
+	require.NotNil(t, results)
+	assert.NotEmpty(t, results)
+	// Verify results are sorted by similarity
+	for i := 1; i < len(results); i++ {
+		assert.GreaterOrEqual(t, results[i-1].Similarity, results[i].Similarity)
+	}
+}
+
+func TestSnapshot_Search_EntryMissingAtSomeLayer(t *testing.T) {
+	// Entry point exists in vectors but missing at layer 1
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   1,
+		Vectors: map[string][]float32{
+			"node1": {1.0, 0.0},
+			"node2": {0.9, 0.1},
+		},
+		Magnitudes: map[string]float64{
+			"node1": 1.0,
+			"node2": 0.906,
+		},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {"node2"}, "node2": {"node1"}}},
+			{Nodes: map[string][]string{"node2": {}}}, // node1 missing at layer 1
+		},
+	}
+
+	// Should still work - skips layer 1 and proceeds to layer 0
+	results := snap.Search([]float32{1.0, 0.0}, 2, nil)
+	require.NotNil(t, results)
+	assert.NotEmpty(t, results)
+}
+
+func TestSnapshot_Search_EmptyLayer(t *testing.T) {
+	// Layer exists but has no nodes
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   1,
+		Vectors:    map[string][]float32{"node1": {1.0, 0.0}},
+		Magnitudes: map[string]float64{"node1": 1.0},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {}}},
+			{Nodes: map[string][]string{}}, // Empty layer
+		},
+	}
+
+	// Should handle empty layer gracefully
+	results := snap.Search([]float32{1.0, 0.0}, 2, nil)
+	require.NotNil(t, results)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "node1", results[0].ID)
+}
+
+func TestSnapshot_Search_SingleLayer(t *testing.T) {
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors: map[string][]float32{
+			"node1": {1.0, 0.0},
+			"node2": {0.9, 0.1},
+		},
+		Magnitudes: map[string]float64{
+			"node1": 1.0,
+			"node2": 0.906,
+		},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {"node2"}, "node2": {"node1"}}},
+		},
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 2, nil)
+	require.NotNil(t, results)
+	assert.Len(t, results, 2)
+}
+
+func TestSnapshot_Search_NoLayers(t *testing.T) {
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   -1,
+		Vectors:    map[string][]float32{"node1": {1.0, 0.0}},
+		Magnitudes: map[string]float64{"node1": 1.0},
+		Layers:     []LayerSnapshot{},
+	}
+
+	// With no layers but valid entry vector data, returns the entry point
+	// since initializeCandidates uses vector data directly (not layer data)
+	results := snap.Search([]float32{1.0, 0.0}, 2, nil)
+	require.NotNil(t, results)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "node1", results[0].ID)
+}
+
+func TestSnapshot_Search_ValidEntryButNoNeighbors(t *testing.T) {
+	// Entry point valid but has no neighbors at any layer
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   1,
+		Vectors:    map[string][]float32{"node1": {1.0, 0.0}},
+		Magnitudes: map[string]float64{"node1": 1.0},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{"node1": {}}},
+			{Nodes: map[string][]string{"node1": {}}},
+		},
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 5, nil)
+	require.NotNil(t, results)
+	assert.Len(t, results, 1)
+	assert.Equal(t, "node1", results[0].ID)
+}
+
+func TestSnapshot_Search_ConcurrentWithEntryValidation(t *testing.T) {
+	idx := createPopulatedIndex(t)
+	snap := NewHNSWSnapshot(idx, 1)
+
+	var wg sync.WaitGroup
+	numReaders := 50
+
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// Vary the query to exercise different paths
+			query := []float32{float32(id%3) * 0.5, float32((id+1)%3) * 0.5, float32((id+2)%3) * 0.5}
+			results := snap.Search(query, 3, nil)
+			// Should always return valid results from a properly built snapshot
+			assert.NotNil(t, results)
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestSnapshot_isValidLayer_EmptyLayers(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Layers: []LayerSnapshot{},
+	}
+
+	assert.False(t, snap.isValidLayer(0))
+	assert.False(t, snap.isValidLayer(-1))
+	assert.False(t, snap.isValidLayer(1))
+}
+
+func TestSnapshot_nodeExistsAtLayer_EmptyLayers(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Layers: []LayerSnapshot{},
+	}
+
+	assert.False(t, snap.nodeExistsAtLayer("any", 0))
 }

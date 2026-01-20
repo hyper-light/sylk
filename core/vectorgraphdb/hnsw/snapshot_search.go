@@ -1,7 +1,7 @@
 package hnsw
 
 import (
-	"math"
+	"log/slog"
 	"slices"
 	"sort"
 
@@ -34,15 +34,59 @@ func (snap *HNSWSnapshot) isValidSearchInput(query []float32, k int) bool {
 }
 
 // searchFromEntry navigates from the entry point to find k nearest neighbors.
+// Validates entry point vector exists at each layer and handles missing entries gracefully.
 func (snap *HNSWSnapshot) searchFromEntry(query []float32, queryMag float64, k int, filter *SearchFilter) []SearchResult {
 	currentNode := snap.EntryPoint
 
+	if !snap.hasValidEntryVector(currentNode) {
+		slog.Debug("entry point vector missing from snapshot", slog.String("entry_point", currentNode))
+		return nil
+	}
+
 	for level := snap.MaxLevel; level > 0; level-- {
-		currentNode = snap.greedySearchLayer(query, queryMag, currentNode, level)
+		currentNode = snap.searchLayerWithValidation(query, queryMag, currentNode, level)
 	}
 
 	candidates := snap.searchLayer0(query, queryMag, currentNode, k, filter)
 	return candidates
+}
+
+// hasValidEntryVector checks if a node has both vector and magnitude data.
+func (snap *HNSWSnapshot) hasValidEntryVector(nodeID string) bool {
+	_, hasVec := snap.Vectors[nodeID]
+	_, hasMag := snap.Magnitudes[nodeID]
+	return hasVec && hasMag
+}
+
+// searchLayerWithValidation performs greedy search with entry point validation.
+// Returns the best found node, or the original entry if the layer is invalid.
+func (snap *HNSWSnapshot) searchLayerWithValidation(query []float32, queryMag float64, entry string, level int) string {
+	if !snap.isValidLayer(level) {
+		return entry
+	}
+
+	if !snap.nodeExistsAtLayer(entry, level) {
+		slog.Debug("entry point missing at layer",
+			slog.String("entry_point", entry),
+			slog.Int("layer", level))
+		return entry
+	}
+
+	return snap.greedySearchLayer(query, queryMag, entry, level)
+}
+
+// isValidLayer checks if a layer index is within bounds.
+func (snap *HNSWSnapshot) isValidLayer(level int) bool {
+	return level >= 0 && level < len(snap.Layers)
+}
+
+// nodeExistsAtLayer checks if a node exists in the specified layer.
+func (snap *HNSWSnapshot) nodeExistsAtLayer(nodeID string, level int) bool {
+	if !snap.isValidLayer(level) {
+		return false
+	}
+	_, exists := snap.Layers[level].Nodes[nodeID]
+	return exists
 }
 
 // greedySearchLayer performs greedy search at a single layer to find the closest node.
@@ -259,15 +303,16 @@ func (snap *HNSWSnapshot) getNodeType(id string) vectorgraphdb.NodeType {
 }
 
 // distance computes the cosine distance between query and a stored node.
-// Returns MaxFloat64 if the node's vector or magnitude is not found.
+// Uses the shared CosineDistance function to ensure consistency with live search.
+// Returns 2.0 (maximum cosine distance) if the node's vector or magnitude is not found.
 func (snap *HNSWSnapshot) distance(query []float32, queryMag float64, nodeID string) float64 {
 	vec, ok := snap.Vectors[nodeID]
 	if !ok {
-		return math.MaxFloat64
+		return 2.0 // max cosine distance when vector missing
 	}
 	mag, ok := snap.Magnitudes[nodeID]
 	if !ok {
-		return math.MaxFloat64
+		return 2.0 // max cosine distance when magnitude missing
 	}
-	return 1.0 - CosineSimilarity(query, vec, queryMag, mag)
+	return CosineDistance(query, vec, queryMag, mag)
 }
