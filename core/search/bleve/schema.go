@@ -7,7 +7,7 @@ import (
 	"github.com/blevesearch/bleve/v2/mapping"
 
 	// Import custom analyzers to register them with the Bleve registry
-	"github.com/adalundhe/sylk/core/search/analyzer"
+	_ "github.com/adalundhe/sylk/core/search/analyzer"
 )
 
 // Default mapping configuration constants.
@@ -22,82 +22,102 @@ const (
 	KeywordAnalyzerName = "keyword"
 )
 
+// globalConfigLoader is the default configuration loader for schema building.
+var globalConfigLoader = NewSchemaConfigLoader()
+
+// GetConfigLoader returns the global schema configuration loader.
+func GetConfigLoader() *SchemaConfigLoader {
+	return globalConfigLoader
+}
+
 // BuildDocumentMapping creates a DocumentMapping for indexing Document structs.
-// It configures appropriate analyzers for each field type:
-//   - Content: code analyzer for source code search
-//   - Symbols: symbol analyzer preserving case
-//   - Comments: comment analyzer with stemming
-//   - Path, Type, Language: keyword analyzer for exact matching
-//   - ModifiedAt, IndexedAt: datetime mappings
-//
+// It uses the global configuration loader to determine field mappings.
 // Returns a configured DocumentMapping ready for use in an IndexMapping.
 func BuildDocumentMapping() *mapping.DocumentMapping {
+	return BuildDocumentMappingFromConfig(globalConfigLoader.GetConfig())
+}
+
+// BuildDocumentMappingFromConfig creates a DocumentMapping from a SchemaConfig.
+// It configures appropriate analyzers for each field type based on configuration.
+// Returns a configured DocumentMapping ready for use in an IndexMapping.
+func BuildDocumentMappingFromConfig(config *SchemaConfig) *mapping.DocumentMapping {
 	docMapping := mapping.NewDocumentMapping()
-	docMapping.Dynamic = false
+	docMapping.Dynamic = config.DynamicMapping
 
-	// ID field - disabled (used only for retrieval, not search)
-	docMapping.AddFieldMappingsAt("id", buildDisabledField())
-
-	// Path field - keyword analyzer for exact path matching
-	docMapping.AddFieldMappingsAt("path", buildKeywordField())
-
-	// Type field - keyword analyzer for filtering by document type
-	docMapping.AddFieldMappingsAt("type", buildKeywordField())
-
-	// Language field - keyword analyzer for filtering by programming language
-	docMapping.AddFieldMappingsAt("language", buildKeywordField())
-
-	// Content field - code analyzer for source code search
-	docMapping.AddFieldMappingsAt("content", buildCodeField())
-
-	// Symbols field - symbol analyzer preserving case for exact symbol matching
-	docMapping.AddFieldMappingsAt("symbols", buildSymbolField())
-
-	// Comments field - comment analyzer with stemming for natural language
-	docMapping.AddFieldMappingsAt("comments", buildCommentField())
-
-	// Imports field - keyword analyzer for exact import path matching
-	docMapping.AddFieldMappingsAt("imports", buildKeywordField())
-
-	// Checksum field - disabled (used only for change detection, not search)
-	docMapping.AddFieldMappingsAt("checksum", buildDisabledField())
-
-	// ModifiedAt field - datetime for temporal queries
-	docMapping.AddFieldMappingsAt("modified_at", buildDateTimeField())
-
-	// IndexedAt field - datetime for temporal queries
-	docMapping.AddFieldMappingsAt("indexed_at", buildDateTimeField())
-
-	// GitCommit field - keyword analyzer for exact commit hash matching
-	docMapping.AddFieldMappingsAt("git_commit", buildKeywordField())
-
-	// Domain field - keyword analyzer for domain-filtered searches
-	docMapping.AddFieldMappingsAt(DomainFieldName, buildKeywordField())
+	for _, field := range config.Fields {
+		fieldMapping := buildFieldFromConfig(&field)
+		docMapping.AddFieldMappingsAt(field.Name, fieldMapping)
+	}
 
 	return docMapping
 }
 
 // BuildIndexMapping creates a complete IndexMapping for the document search index.
-// It configures the document type mapping, default analyzer, and disables dynamic
-// mapping for optimal performance.
-//
+// It uses the global configuration loader for settings.
 // Returns a configured IndexMapping ready for index creation.
 func BuildIndexMapping() (*mapping.IndexMappingImpl, error) {
+	return BuildIndexMappingFromConfig(globalConfigLoader.GetConfig())
+}
+
+// BuildIndexMappingFromConfig creates an IndexMapping from a SchemaConfig.
+// It configures the document type mapping, default analyzer, and dynamic mapping.
+// Returns a configured IndexMapping ready for index creation.
+func BuildIndexMappingFromConfig(config *SchemaConfig) (*mapping.IndexMappingImpl, error) {
 	indexMapping := mapping.NewIndexMapping()
 
 	// Set default analyzer for any unmapped text fields
-	indexMapping.DefaultAnalyzer = DefaultAnalyzerName
+	indexMapping.DefaultAnalyzer = config.DefaultAnalyzer
 
-	// Disable dynamic mapping - only explicitly mapped fields are indexed
-	indexMapping.DefaultMapping.Dynamic = false
+	// Set dynamic mapping from config
+	indexMapping.DefaultMapping.Dynamic = config.DynamicMapping
 
 	// Add document type mapping
-	indexMapping.AddDocumentMapping(DefaultTypeName, BuildDocumentMapping())
+	indexMapping.AddDocumentMapping(config.TypeName, BuildDocumentMappingFromConfig(config))
 
 	// Set default document type
-	indexMapping.DefaultType = DefaultTypeName
+	indexMapping.DefaultType = config.TypeName
 
 	return indexMapping, nil
+}
+
+// buildFieldFromConfig creates a FieldMapping from a FieldConfig.
+func buildFieldFromConfig(fc *FieldMappingConfig) *mapping.FieldMapping {
+	switch fc.Type {
+	case FieldTypeDateTime:
+		return buildDateTimeFieldFromConfig(fc)
+	case FieldTypeDisabled:
+		return buildDisabledFieldFromConfig(fc)
+	default:
+		return buildTextFieldFromConfig(fc)
+	}
+}
+
+// buildTextFieldFromConfig creates a text field mapping from config.
+func buildTextFieldFromConfig(fc *FieldMappingConfig) *mapping.FieldMapping {
+	fieldMapping := mapping.NewTextFieldMapping()
+	fieldMapping.Analyzer = fc.Analyzer
+	fieldMapping.Store = fc.Store
+	fieldMapping.Index = fc.Index
+	fieldMapping.IncludeInAll = fc.IncludeInAll
+	return fieldMapping
+}
+
+// buildDateTimeFieldFromConfig creates a datetime field mapping from config.
+func buildDateTimeFieldFromConfig(fc *FieldMappingConfig) *mapping.FieldMapping {
+	fieldMapping := mapping.NewDateTimeFieldMapping()
+	fieldMapping.Store = fc.Store
+	fieldMapping.Index = fc.Index
+	fieldMapping.IncludeInAll = fc.IncludeInAll
+	return fieldMapping
+}
+
+// buildDisabledFieldFromConfig creates a disabled field mapping from config.
+func buildDisabledFieldFromConfig(fc *FieldMappingConfig) *mapping.FieldMapping {
+	fieldMapping := mapping.NewTextFieldMapping()
+	fieldMapping.Store = fc.Store
+	fieldMapping.Index = false
+	fieldMapping.IncludeInAll = false
+	return fieldMapping
 }
 
 // =============================================================================
@@ -108,69 +128,71 @@ func BuildIndexMapping() (*mapping.IndexMappingImpl, error) {
 const DomainFieldName = "domain"
 
 // =============================================================================
-// Field Mapping Builders
+// Legacy Field Mapping Builders (for backwards compatibility)
 // =============================================================================
 
 // buildDisabledField creates a field mapping that stores but does not index the field.
 // Used for fields like ID and Checksum that are needed for retrieval but not search.
+// Deprecated: Use BuildDocumentMappingFromConfig with a SchemaConfig instead.
 func buildDisabledField() *mapping.FieldMapping {
-	fieldMapping := mapping.NewTextFieldMapping()
-	fieldMapping.Store = true
-	fieldMapping.Index = false
-	fieldMapping.IncludeInAll = false
-	return fieldMapping
+	return buildDisabledFieldFromConfig(&FieldMappingConfig{Store: true, Index: false})
 }
 
 // buildKeywordField creates a field mapping using the keyword analyzer.
 // Used for exact-match fields like path, type, and language.
+// Deprecated: Use BuildDocumentMappingFromConfig with a SchemaConfig instead.
 func buildKeywordField() *mapping.FieldMapping {
-	fieldMapping := mapping.NewTextFieldMapping()
-	fieldMapping.Analyzer = KeywordAnalyzerName
-	fieldMapping.Store = true
-	fieldMapping.Index = true
-	fieldMapping.IncludeInAll = false
-	return fieldMapping
+	return buildTextFieldFromConfig(&FieldMappingConfig{
+		Analyzer:     KeywordAnalyzerName,
+		Store:        true,
+		Index:        true,
+		IncludeInAll: false,
+	})
 }
 
 // buildCodeField creates a field mapping using the code analyzer.
 // Used for source code content with camelCase/snake_case tokenization.
+// Deprecated: Use BuildDocumentMappingFromConfig with a SchemaConfig instead.
 func buildCodeField() *mapping.FieldMapping {
-	fieldMapping := mapping.NewTextFieldMapping()
-	fieldMapping.Analyzer = analyzer.CodeAnalyzerName
-	fieldMapping.Store = true
-	fieldMapping.Index = true
-	fieldMapping.IncludeInAll = true
-	return fieldMapping
+	return buildTextFieldFromConfig(&FieldMappingConfig{
+		Analyzer:     "code",
+		Store:        true,
+		Index:        true,
+		IncludeInAll: true,
+	})
 }
 
 // buildSymbolField creates a field mapping using the symbol analyzer.
 // Used for symbol names where case preservation is important.
+// Deprecated: Use BuildDocumentMappingFromConfig with a SchemaConfig instead.
 func buildSymbolField() *mapping.FieldMapping {
-	fieldMapping := mapping.NewTextFieldMapping()
-	fieldMapping.Analyzer = analyzer.SymbolAnalyzerName
-	fieldMapping.Store = true
-	fieldMapping.Index = true
-	fieldMapping.IncludeInAll = true
-	return fieldMapping
+	return buildTextFieldFromConfig(&FieldMappingConfig{
+		Analyzer:     "symbol",
+		Store:        true,
+		Index:        true,
+		IncludeInAll: true,
+	})
 }
 
 // buildCommentField creates a field mapping using the comment analyzer.
 // Used for code comments with stemming for natural language search.
+// Deprecated: Use BuildDocumentMappingFromConfig with a SchemaConfig instead.
 func buildCommentField() *mapping.FieldMapping {
-	fieldMapping := mapping.NewTextFieldMapping()
-	fieldMapping.Analyzer = analyzer.CommentAnalyzerName
-	fieldMapping.Store = true
-	fieldMapping.Index = true
-	fieldMapping.IncludeInAll = true
-	return fieldMapping
+	return buildTextFieldFromConfig(&FieldMappingConfig{
+		Analyzer:     "comment",
+		Store:        true,
+		Index:        true,
+		IncludeInAll: true,
+	})
 }
 
 // buildDateTimeField creates a field mapping for datetime fields.
 // Used for ModifiedAt and IndexedAt timestamps.
+// Deprecated: Use BuildDocumentMappingFromConfig with a SchemaConfig instead.
 func buildDateTimeField() *mapping.FieldMapping {
-	fieldMapping := mapping.NewDateTimeFieldMapping()
-	fieldMapping.Store = true
-	fieldMapping.Index = true
-	fieldMapping.IncludeInAll = false
-	return fieldMapping
+	return buildDateTimeFieldFromConfig(&FieldMappingConfig{
+		Store:        true,
+		Index:        true,
+		IncludeInAll: false,
+	})
 }
