@@ -395,10 +395,18 @@ func (pc *PreparedContext) performRefresh() {
 // pruneInactiveToolStates removes tool states that haven't been used recently.
 func (pc *PreparedContext) pruneInactiveToolStates() {
 	cutoff := time.Now().Add(-pc.config.MaxAge * 2)
+
+	// Collect keys to delete
+	var toDelete []string
 	for name, state := range pc.toolStates {
 		if !state.Active && state.LastUsed.Before(cutoff) {
-			delete(pc.toolStates, name)
+			toDelete = append(toDelete, name)
 		}
+	}
+
+	// Delete after iteration
+	for _, name := range toDelete {
+		delete(pc.toolStates, name)
 	}
 }
 

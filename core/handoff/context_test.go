@@ -1125,6 +1125,273 @@ func TestPreparedContext_ToolStatePruning(t *testing.T) {
 }
 
 // =============================================================================
+// HO.6.1 PreparedContext - pruneInactiveToolStates Tests (W4C.6)
+// =============================================================================
+
+func TestPreparedContext_PruneInactiveToolStates_AllInactivePruned(t *testing.T) {
+	// Test that all inactive tool states past the cutoff are correctly pruned
+	config := PreparedContextConfig{
+		MaxSummaryTokens:  1000,
+		MaxRecentMessages: 10,
+		MaxAge:            10 * time.Millisecond, // Short MaxAge so cutoff is 20ms ago
+		MaxToolStates:     20,
+	}
+	ctx := NewPreparedContext(config)
+
+	// Add inactive tool states with old LastUsed times (before cutoff)
+	oldTime := time.Now().Add(-50 * time.Millisecond) // Well past cutoff of 2*MaxAge = 20ms
+	ctx.UpdateToolState("old_inactive1", ToolState{Active: false, LastUsed: oldTime})
+	ctx.UpdateToolState("old_inactive2", ToolState{Active: false, LastUsed: oldTime})
+	ctx.UpdateToolState("old_inactive3", ToolState{Active: false, LastUsed: oldTime})
+
+	// Add an active tool state (should not be pruned regardless of age)
+	ctx.UpdateToolState("old_active", ToolState{Active: true, LastUsed: oldTime})
+
+	// Add a recent inactive tool state (should not be pruned)
+	ctx.UpdateToolState("recent_inactive", ToolState{Active: false, LastUsed: time.Now()})
+
+	// Verify all states exist before refresh
+	states := ctx.ToolStates()
+	if len(states) != 5 {
+		t.Errorf("Expected 5 tool states before refresh, got %d", len(states))
+	}
+
+	// Trigger pruning via Refresh
+	ctx.Refresh()
+
+	// Verify only old inactive states were pruned
+	states = ctx.ToolStates()
+
+	// old_active should still exist (active=true protects it)
+	if _, exists := states["old_active"]; !exists {
+		t.Error("old_active should NOT have been pruned (it's active)")
+	}
+
+	// recent_inactive should still exist (not past cutoff)
+	if _, exists := states["recent_inactive"]; !exists {
+		t.Error("recent_inactive should NOT have been pruned (it's recent)")
+	}
+
+	// old_inactive states should be pruned
+	if _, exists := states["old_inactive1"]; exists {
+		t.Error("old_inactive1 should have been pruned")
+	}
+	if _, exists := states["old_inactive2"]; exists {
+		t.Error("old_inactive2 should have been pruned")
+	}
+	if _, exists := states["old_inactive3"]; exists {
+		t.Error("old_inactive3 should have been pruned")
+	}
+
+	// Should have exactly 2 remaining states
+	if len(states) != 2 {
+		t.Errorf("Expected 2 tool states after pruning, got %d", len(states))
+	}
+}
+
+func TestPreparedContext_PruneInactiveToolStates_NoPanicOrSkippedEntries(t *testing.T) {
+	// Test that no entries are skipped during pruning (the bug was map modification during iteration)
+	// With many entries, the old buggy code could skip entries non-deterministically
+
+	config := PreparedContextConfig{
+		MaxSummaryTokens:  1000,
+		MaxRecentMessages: 10,
+		MaxAge:            10 * time.Millisecond,
+		MaxToolStates:     1000, // Allow many tool states
+	}
+	ctx := NewPreparedContext(config)
+
+	// Add a large number of inactive tool states that should all be pruned
+	oldTime := time.Now().Add(-100 * time.Millisecond)
+	numStates := 100
+	for i := 0; i < numStates; i++ {
+		name := "tool_" + string(rune('A'+i%26)) + "_" + string(rune('0'+i/26))
+		ctx.UpdateToolState(name, ToolState{Active: false, LastUsed: oldTime})
+	}
+
+	// Verify all states exist before refresh
+	statesBefore := ctx.ToolStates()
+	if len(statesBefore) != numStates {
+		t.Errorf("Expected %d tool states before refresh, got %d", numStates, len(statesBefore))
+	}
+
+	// Trigger pruning - this should NOT panic and should delete ALL entries
+	ctx.Refresh()
+
+	// Verify all inactive old states were pruned
+	statesAfter := ctx.ToolStates()
+	if len(statesAfter) != 0 {
+		t.Errorf("Expected 0 tool states after pruning, got %d (some entries were skipped)", len(statesAfter))
+		// Log which states were not pruned for debugging
+		for name := range statesAfter {
+			t.Logf("State not pruned: %s", name)
+		}
+	}
+}
+
+func TestPreparedContext_PruneInactiveToolStates_ConcurrentAccess(t *testing.T) {
+	// Test that concurrent access during pruning is safe (no race conditions)
+	config := PreparedContextConfig{
+		MaxSummaryTokens:  1000,
+		MaxRecentMessages: 10,
+		MaxAge:            1 * time.Millisecond, // Very short for quick pruning
+		MaxToolStates:     100,
+	}
+	ctx := NewPreparedContext(config)
+
+	var wg sync.WaitGroup
+	numGoroutines := 10
+	numOperations := 50
+
+	// Goroutines that add tool states
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				name := "tool_" + string(rune('A'+id)) + "_" + string(rune('0'+j%10))
+				// Alternate between active and inactive states
+				ctx.UpdateToolState(name, ToolState{
+					Active:   j%2 == 0,
+					LastUsed: time.Now(),
+				})
+			}
+		}(i)
+	}
+
+	// Goroutines that trigger refresh (which calls pruneInactiveToolStates)
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				ctx.Refresh()
+				time.Sleep(100 * time.Microsecond) // Small delay to allow interleaving
+			}
+		}()
+	}
+
+	// Goroutines that read tool states
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				_ = ctx.ToolStates()
+				_, _ = ctx.GetToolState("tool_A_0")
+			}
+		}()
+	}
+
+	// Wait for all goroutines to complete - should not deadlock or panic
+	wg.Wait()
+
+	// Context should be in a valid state
+	stats := ctx.Stats()
+	if stats.ToolStateCount < 0 {
+		t.Errorf("ToolStateCount = %d, should be >= 0", stats.ToolStateCount)
+	}
+}
+
+func TestPreparedContext_PruneInactiveToolStates_EmptyMap(t *testing.T) {
+	// Test that pruning works correctly with an empty map
+	config := PreparedContextConfig{
+		MaxSummaryTokens:  1000,
+		MaxRecentMessages: 10,
+		MaxAge:            time.Minute,
+		MaxToolStates:     20,
+	}
+	ctx := NewPreparedContext(config)
+
+	// Trigger pruning on empty map - should not panic
+	ctx.Refresh()
+
+	// Should still have zero states
+	states := ctx.ToolStates()
+	if len(states) != 0 {
+		t.Errorf("Expected 0 tool states, got %d", len(states))
+	}
+}
+
+func TestPreparedContext_PruneInactiveToolStates_MixedStates(t *testing.T) {
+	// Test complex scenario with mix of states
+	config := PreparedContextConfig{
+		MaxSummaryTokens:  1000,
+		MaxRecentMessages: 10,
+		MaxAge:            50 * time.Millisecond,
+		MaxToolStates:     50,
+	}
+	ctx := NewPreparedContext(config)
+
+	oldTime := time.Now().Add(-200 * time.Millisecond) // Past cutoff of 100ms
+	recentTime := time.Now()
+
+	// Category 1: Old + Inactive -> Should be pruned
+	ctx.UpdateToolState("old_inactive_1", ToolState{Active: false, LastUsed: oldTime})
+	ctx.UpdateToolState("old_inactive_2", ToolState{Active: false, LastUsed: oldTime})
+
+	// Category 2: Old + Active -> Should NOT be pruned
+	ctx.UpdateToolState("old_active_1", ToolState{Active: true, LastUsed: oldTime})
+	ctx.UpdateToolState("old_active_2", ToolState{Active: true, LastUsed: oldTime})
+
+	// Category 3: Recent + Inactive -> Should NOT be pruned
+	ctx.UpdateToolState("recent_inactive_1", ToolState{Active: false, LastUsed: recentTime})
+	ctx.UpdateToolState("recent_inactive_2", ToolState{Active: false, LastUsed: recentTime})
+
+	// Category 4: Recent + Active -> Should NOT be pruned
+	ctx.UpdateToolState("recent_active_1", ToolState{Active: true, LastUsed: recentTime})
+	ctx.UpdateToolState("recent_active_2", ToolState{Active: true, LastUsed: recentTime})
+
+	// Verify 8 states before refresh
+	statesBefore := ctx.ToolStates()
+	if len(statesBefore) != 8 {
+		t.Errorf("Expected 8 tool states before refresh, got %d", len(statesBefore))
+	}
+
+	// Trigger pruning
+	ctx.Refresh()
+
+	statesAfter := ctx.ToolStates()
+
+	// Should have 6 states remaining (all except old_inactive_1 and old_inactive_2)
+	if len(statesAfter) != 6 {
+		t.Errorf("Expected 6 tool states after pruning, got %d", len(statesAfter))
+	}
+
+	// Verify Category 1 pruned
+	if _, exists := statesAfter["old_inactive_1"]; exists {
+		t.Error("old_inactive_1 should have been pruned")
+	}
+	if _, exists := statesAfter["old_inactive_2"]; exists {
+		t.Error("old_inactive_2 should have been pruned")
+	}
+
+	// Verify Category 2 kept
+	if _, exists := statesAfter["old_active_1"]; !exists {
+		t.Error("old_active_1 should NOT have been pruned")
+	}
+	if _, exists := statesAfter["old_active_2"]; !exists {
+		t.Error("old_active_2 should NOT have been pruned")
+	}
+
+	// Verify Category 3 kept
+	if _, exists := statesAfter["recent_inactive_1"]; !exists {
+		t.Error("recent_inactive_1 should NOT have been pruned")
+	}
+	if _, exists := statesAfter["recent_inactive_2"]; !exists {
+		t.Error("recent_inactive_2 should NOT have been pruned")
+	}
+
+	// Verify Category 4 kept
+	if _, exists := statesAfter["recent_active_1"]; !exists {
+		t.Error("recent_active_1 should NOT have been pruned")
+	}
+	if _, exists := statesAfter["recent_active_2"]; !exists {
+		t.Error("recent_active_2 should NOT have been pruned")
+	}
+}
+
+// =============================================================================
 // Edge Cases Tests
 // =============================================================================
 
