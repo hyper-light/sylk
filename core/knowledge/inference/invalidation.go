@@ -192,10 +192,28 @@ func (im *InvalidationManager) getAffectedRuleIDs(ctx context.Context, edgeKey s
 }
 
 // InvalidateDependents finds and removes derived edges that depended on the given edge.
+// It initializes cycle detection and delegates to the recursive helper.
 func (im *InvalidationManager) InvalidateDependents(ctx context.Context, edgeKey string) error {
 	if im.materializer == nil {
 		return nil
 	}
+
+	visited := make(map[string]bool)
+	return im.invalidateDependentsRecursive(ctx, edgeKey, visited)
+}
+
+// invalidateDependentsRecursive recursively invalidates edges with cycle detection.
+// It tracks visited edge keys to prevent infinite recursion on cyclic dependencies.
+func (im *InvalidationManager) invalidateDependentsRecursive(
+	ctx context.Context,
+	edgeKey string,
+	visited map[string]bool,
+) error {
+	// Cycle detection: skip if already visited
+	if visited[edgeKey] {
+		return nil
+	}
+	visited[edgeKey] = true
 
 	// Find all materialized edges that used this edge as evidence
 	dependents, err := im.materializer.GetMaterializedByEvidence(ctx, edgeKey)
@@ -203,14 +221,14 @@ func (im *InvalidationManager) InvalidateDependents(ctx context.Context, edgeKey
 		return fmt.Errorf("get dependents: %w", err)
 	}
 
-	// Delete each dependent
+	// Delete each dependent and recursively invalidate its dependents
 	for _, dep := range dependents {
 		if err := im.materializer.DeleteMaterializedEdge(ctx, dep.EdgeKey); err != nil {
 			return fmt.Errorf("delete dependent %s: %w", dep.EdgeKey, err)
 		}
 
 		// Recursively invalidate edges that depended on this one
-		if err := im.InvalidateDependents(ctx, dep.EdgeKey); err != nil {
+		if err := im.invalidateDependentsRecursive(ctx, dep.EdgeKey, visited); err != nil {
 			return fmt.Errorf("invalidate cascade for %s: %w", dep.EdgeKey, err)
 		}
 	}

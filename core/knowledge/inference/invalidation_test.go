@@ -3,6 +3,7 @@ package inference
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -654,5 +655,223 @@ func TestInvalidationManager_HandleEdgeAdded_NoEdgeProvider(t *testing.T) {
 	err := manager.OnEdgeChange(ctx, edge, ChangeTypeAdded)
 	if err != nil {
 		t.Fatalf("OnEdgeChange failed without edge provider: %v", err)
+	}
+}
+
+// =============================================================================
+// W3H.2 Cycle Detection Tests
+// =============================================================================
+
+func TestInvalidationManager_InvalidateDependents_CyclicDependencies(t *testing.T) {
+	db, materializer, _, _, _, manager := createInvalidationTestSetup(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create a cyclic dependency: A -> B -> C -> A
+	// Edge A depends on evidence from C
+	// Edge B depends on evidence from A
+	// Edge C depends on evidence from B
+	resultA := InferenceResult{
+		DerivedEdge: DerivedEdge{SourceID: "A", EdgeType: "derived", TargetID: "X"},
+		RuleID:      "rule1",
+		Evidence:    []EvidenceEdge{{SourceID: "C", EdgeType: "derived", TargetID: "Z"}},
+		DerivedAt:   time.Now(),
+		Confidence:  1.0,
+	}
+	resultB := InferenceResult{
+		DerivedEdge: DerivedEdge{SourceID: "B", EdgeType: "derived", TargetID: "Y"},
+		RuleID:      "rule1",
+		Evidence:    []EvidenceEdge{{SourceID: "A", EdgeType: "derived", TargetID: "X"}},
+		DerivedAt:   time.Now(),
+		Confidence:  1.0,
+	}
+	resultC := InferenceResult{
+		DerivedEdge: DerivedEdge{SourceID: "C", EdgeType: "derived", TargetID: "Z"},
+		RuleID:      "rule1",
+		Evidence:    []EvidenceEdge{{SourceID: "B", EdgeType: "derived", TargetID: "Y"}},
+		DerivedAt:   time.Now(),
+		Confidence:  1.0,
+	}
+
+	if err := materializer.Materialize(ctx, []InferenceResult{resultA}); err != nil {
+		t.Fatalf("Materialize A failed: %v", err)
+	}
+	if err := materializer.Materialize(ctx, []InferenceResult{resultB}); err != nil {
+		t.Fatalf("Materialize B failed: %v", err)
+	}
+	if err := materializer.Materialize(ctx, []InferenceResult{resultC}); err != nil {
+		t.Fatalf("Materialize C failed: %v", err)
+	}
+
+	// This should NOT cause infinite recursion due to cycle detection
+	// Invalidating A should cascade to B, B to C, but C should not re-trigger A
+	err := manager.InvalidateDependents(ctx, "A|derived|X")
+	if err != nil {
+		t.Fatalf("InvalidateDependents failed (should handle cycle): %v", err)
+	}
+
+	// Edge B should be invalidated (it depended on A)
+	exists, err := materializer.IsMaterialized(ctx, "B|derived|Y")
+	if err != nil {
+		t.Fatalf("IsMaterialized B failed: %v", err)
+	}
+	if exists {
+		t.Error("edge B should have been invalidated")
+	}
+
+	// Edge C should be invalidated (it depended on B)
+	exists, err = materializer.IsMaterialized(ctx, "C|derived|Z")
+	if err != nil {
+		t.Fatalf("IsMaterialized C failed: %v", err)
+	}
+	if exists {
+		t.Error("edge C should have been invalidated")
+	}
+}
+
+func TestInvalidationManager_InvalidateDependents_SelfReferentialCycle(t *testing.T) {
+	db, materializer, _, _, _, manager := createInvalidationTestSetup(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create a self-referential edge: A depends on itself
+	resultA := InferenceResult{
+		DerivedEdge: DerivedEdge{SourceID: "Self", EdgeType: "refers", TargetID: "Self"},
+		RuleID:      "rule1",
+		Evidence:    []EvidenceEdge{{SourceID: "Self", EdgeType: "refers", TargetID: "Self"}},
+		DerivedAt:   time.Now(),
+		Confidence:  1.0,
+	}
+
+	if err := materializer.Materialize(ctx, []InferenceResult{resultA}); err != nil {
+		t.Fatalf("Materialize failed: %v", err)
+	}
+
+	// This should NOT cause infinite recursion
+	err := manager.InvalidateDependents(ctx, "Self|refers|Self")
+	if err != nil {
+		t.Fatalf("InvalidateDependents failed (should handle self-reference): %v", err)
+	}
+}
+
+func TestInvalidationManager_InvalidateDependents_DeepRecursion(t *testing.T) {
+	db, materializer, _, _, _, manager := createInvalidationTestSetup(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create a deep chain of dependencies: E0 -> E1 -> E2 -> ... -> E99
+	const depth = 100
+	for i := 0; i < depth; i++ {
+		var evidence []EvidenceEdge
+		if i > 0 {
+			evidence = []EvidenceEdge{{
+				SourceID: fmt.Sprintf("Node%d", i-1),
+				EdgeType: "chain",
+				TargetID: fmt.Sprintf("Target%d", i-1),
+			}}
+		} else {
+			evidence = []EvidenceEdge{{SourceID: "base", EdgeType: "ev", TargetID: "edge"}}
+		}
+
+		result := InferenceResult{
+			DerivedEdge: DerivedEdge{
+				SourceID: fmt.Sprintf("Node%d", i),
+				EdgeType: "chain",
+				TargetID: fmt.Sprintf("Target%d", i),
+			},
+			RuleID:     "rule1",
+			Evidence:   evidence,
+			DerivedAt:  time.Now(),
+			Confidence: 1.0,
+		}
+
+		if err := materializer.Materialize(ctx, []InferenceResult{result}); err != nil {
+			t.Fatalf("Materialize edge %d failed: %v", i, err)
+		}
+	}
+
+	// Invalidate the base edge - should cascade through all 100 edges without stack overflow
+	err := manager.InvalidateDependents(ctx, "base|ev|edge")
+	if err != nil {
+		t.Fatalf("InvalidateDependents failed on deep recursion: %v", err)
+	}
+
+	// Verify first edge was invalidated
+	exists, err := materializer.IsMaterialized(ctx, "Node0|chain|Target0")
+	if err != nil {
+		t.Fatalf("IsMaterialized Node0 failed: %v", err)
+	}
+	if exists {
+		t.Error("first edge should have been invalidated")
+	}
+
+	// Verify last edge was invalidated
+	exists, err = materializer.IsMaterialized(ctx, fmt.Sprintf("Node%d|chain|Target%d", depth-1, depth-1))
+	if err != nil {
+		t.Fatalf("IsMaterialized last node failed: %v", err)
+	}
+	if exists {
+		t.Error("last edge should have been invalidated")
+	}
+}
+
+func TestInvalidationManager_InvalidateDependents_NormalInvalidationNoCycles(t *testing.T) {
+	db, materializer, _, _, _, manager := createInvalidationTestSetup(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create a simple linear dependency: Base -> A -> B (no cycles)
+	resultA := InferenceResult{
+		DerivedEdge: DerivedEdge{SourceID: "A", EdgeType: "derived", TargetID: "X"},
+		RuleID:      "rule1",
+		Evidence:    []EvidenceEdge{{SourceID: "base", EdgeType: "ev", TargetID: "edge"}},
+		DerivedAt:   time.Now(),
+		Confidence:  1.0,
+	}
+	resultB := InferenceResult{
+		DerivedEdge: DerivedEdge{SourceID: "B", EdgeType: "derived", TargetID: "Y"},
+		RuleID:      "rule1",
+		Evidence:    []EvidenceEdge{{SourceID: "A", EdgeType: "derived", TargetID: "X"}},
+		DerivedAt:   time.Now(),
+		Confidence:  1.0,
+	}
+
+	if err := materializer.Materialize(ctx, []InferenceResult{resultA}); err != nil {
+		t.Fatalf("Materialize A failed: %v", err)
+	}
+	if err := materializer.Materialize(ctx, []InferenceResult{resultB}); err != nil {
+		t.Fatalf("Materialize B failed: %v", err)
+	}
+
+	// Invalidate base edge
+	err := manager.InvalidateDependents(ctx, "base|ev|edge")
+	if err != nil {
+		t.Fatalf("InvalidateDependents failed: %v", err)
+	}
+
+	// A should be invalidated
+	exists, err := materializer.IsMaterialized(ctx, "A|derived|X")
+	if err != nil {
+		t.Fatalf("IsMaterialized A failed: %v", err)
+	}
+	if exists {
+		t.Error("edge A should have been invalidated")
+	}
+
+	// B should be cascade-invalidated
+	exists, err = materializer.IsMaterialized(ctx, "B|derived|Y")
+	if err != nil {
+		t.Fatalf("IsMaterialized B failed: %v", err)
+	}
+	if exists {
+		t.Error("edge B should have been cascade-invalidated")
 	}
 }
