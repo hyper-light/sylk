@@ -513,3 +513,146 @@ func TestSnapshot_sortCandidates(t *testing.T) {
 	assert.Equal(t, "mid", sorted[1].ID)
 	assert.Equal(t, "low", sorted[2].ID)
 }
+
+// W4P.7: Tests for efSearch configuration in snapshot search
+
+func TestSnapshot_EfSearch_PassedFromIndex(t *testing.T) {
+	// Create index with custom efSearch
+	cfg := DefaultConfig()
+	cfg.EfSearch = 200
+	idx := New(cfg)
+
+	err := idx.Insert("vec1", []float32{1.0, 0.0, 0.0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFunction)
+	require.NoError(t, err)
+
+	// Create snapshot and verify efSearch is passed
+	snap := NewHNSWSnapshot(idx, 1)
+	assert.Equal(t, 200, snap.EfSearch)
+}
+
+func TestSnapshot_EfSearch_DefaultWhenNotSet(t *testing.T) {
+	snap := &HNSWSnapshot{
+		EfSearch: 0, // Not set
+	}
+
+	// When EfSearch is 0, should use max(k*2, DefaultEfSearch)
+	// For k=10, max(20, 50) = 50
+	efSearch := snap.getEffectiveEfSearch(10)
+	assert.Equal(t, vectorgraphdb.DefaultEfSearch, efSearch)
+
+	// For k=100, max(200, 50) = 200
+	efSearch = snap.getEffectiveEfSearch(100)
+	assert.Equal(t, 200, efSearch)
+}
+
+func TestSnapshot_EfSearch_UsesConfiguredValue(t *testing.T) {
+	snap := &HNSWSnapshot{
+		EfSearch: 150,
+	}
+
+	// Should use configured value regardless of k
+	assert.Equal(t, 150, snap.getEffectiveEfSearch(10))
+	assert.Equal(t, 150, snap.getEffectiveEfSearch(100))
+	assert.Equal(t, 150, snap.getEffectiveEfSearch(1000))
+}
+
+func TestSnapshot_Search_QualityWithConfiguredEfSearch(t *testing.T) {
+	// Create index with specific efSearch
+	cfg := DefaultConfig()
+	cfg.EfSearch = 100
+	idx := New(cfg)
+
+	// Insert enough vectors to make efSearch relevant
+	for i := 0; i < 50; i++ {
+		vec := []float32{
+			float32(i) * 0.02,
+			float32(50-i) * 0.02,
+			0.5,
+		}
+		err := idx.Insert(
+			"vec"+string(rune('A'+i)),
+			vec,
+			vectorgraphdb.DomainCode,
+			vectorgraphdb.NodeTypeFunction,
+		)
+		require.NoError(t, err)
+	}
+
+	query := []float32{0.5, 0.5, 0.5}
+	k := 10
+
+	// Get snapshot search results (should use efSearch=100 from index)
+	snap := NewHNSWSnapshot(idx, 1)
+	assert.Equal(t, 100, snap.EfSearch, "Snapshot should have efSearch from index")
+	assert.Equal(t, 100, snap.getEffectiveEfSearch(k), "Effective efSearch should be configured value")
+
+	snapResults := snap.Search(query, k, nil)
+
+	// Verify search returns valid results
+	require.NotEmpty(t, snapResults, "Search should return results")
+	require.LessOrEqual(t, len(snapResults), k, "Should not exceed k results")
+
+	// Results should be sorted by similarity
+	for i := 1; i < len(snapResults); i++ {
+		assert.GreaterOrEqual(t, snapResults[i-1].Similarity, snapResults[i].Similarity,
+			"Results should be sorted by descending similarity")
+	}
+}
+
+func TestSnapshot_getEffectiveEfSearch(t *testing.T) {
+	tests := []struct {
+		name       string
+		efSearch   int
+		k          int
+		wantResult int
+	}{
+		{
+			name:       "uses configured value when set",
+			efSearch:   150,
+			k:          10,
+			wantResult: 150,
+		},
+		{
+			name:       "uses default when not set and k is small",
+			efSearch:   0,
+			k:          10,
+			wantResult: vectorgraphdb.DefaultEfSearch,
+		},
+		{
+			name:       "uses k*2 when not set and k*2 > default",
+			efSearch:   0,
+			k:          100,
+			wantResult: 200,
+		},
+		{
+			name:       "configured value overrides k*2 logic",
+			efSearch:   50,
+			k:          100,
+			wantResult: 50,
+		},
+		{
+			name:       "handles k=1",
+			efSearch:   0,
+			k:          1,
+			wantResult: vectorgraphdb.DefaultEfSearch,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := &HNSWSnapshot{EfSearch: tc.efSearch}
+			result := snap.getEffectiveEfSearch(tc.k)
+			assert.Equal(t, tc.wantResult, result)
+		})
+	}
+}
+
+func TestSnapshot_EfSearch_NilIndexUsesZero(t *testing.T) {
+	// When creating snapshot from nil index, EfSearch should be 0
+	snap := NewHNSWSnapshot(nil, 1)
+	assert.Equal(t, 0, snap.EfSearch)
+
+	// Effective efSearch should fall back to default behavior
+	efSearch := snap.getEffectiveEfSearch(10)
+	assert.Equal(t, vectorgraphdb.DefaultEfSearch, efSearch)
+}

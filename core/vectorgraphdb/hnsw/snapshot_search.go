@@ -117,7 +117,7 @@ func (snap *HNSWSnapshot) initializeCandidates(query []float32, queryMag float64
 
 // expandCandidates expands the search by exploring neighbors of candidates.
 func (snap *HNSWSnapshot) expandCandidates(query []float32, queryMag float64, candidates []SearchResult, visited map[string]bool, k int) []SearchResult {
-	efSearch := max(k*2, 100) // Use larger ef for better recall
+	efSearch := snap.getEffectiveEfSearch(k)
 
 	for i := 0; i < len(candidates) && len(candidates) < efSearch*2; i++ {
 		curr := candidates[i]
@@ -126,6 +126,15 @@ func (snap *HNSWSnapshot) expandCandidates(query []float32, queryMag float64, ca
 	}
 
 	return snap.sortCandidates(candidates)
+}
+
+// getEffectiveEfSearch returns the efSearch value to use for search.
+// Uses the stored EfSearch if set, otherwise falls back to max(k*2, DefaultEfSearch).
+func (snap *HNSWSnapshot) getEffectiveEfSearch(k int) int {
+	if snap.EfSearch > 0 {
+		return snap.EfSearch
+	}
+	return max(k*2, vectorgraphdb.DefaultEfSearch)
 }
 
 // processNeighbors adds unvisited neighbors to the candidate list.
