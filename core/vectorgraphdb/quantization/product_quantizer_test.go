@@ -2066,6 +2066,229 @@ func BenchmarkFindNearestCentroid(b *testing.B) {
 }
 
 // =============================================================================
+// argminDistance Tests (4x Loop Unrolling Optimization)
+// =============================================================================
+
+// argminDistanceScalar is the reference scalar implementation for testing.
+// This verifies that the 4x unrolled version produces identical results.
+func argminDistanceScalar(xNorm float32, cNorms, dots []float32, dotRow, k int) uint8 {
+	minDist := float32(math.MaxFloat32)
+	minIdx := uint8(0)
+	for c := 0; c < k; c++ {
+		dist := xNorm + cNorms[c] - 2*dots[dotRow+c]
+		if dist < minDist {
+			minDist = dist
+			minIdx = uint8(c)
+		}
+	}
+	return minIdx
+}
+
+func TestArgminDistanceUnrolledMatchesScalar(t *testing.T) {
+	// Test with various k values including edge cases for 4x unrolling
+	kValues := []int{1, 4, 5, 8, 9, 16, 17, 255, 256}
+
+	rng := rand.New(rand.NewSource(42))
+
+	for _, k := range kValues {
+		t.Run(fmt.Sprintf("k=%d", k), func(t *testing.T) {
+			// Generate random test data
+			cNorms := make([]float32, k)
+			dots := make([]float32, k)
+			for i := 0; i < k; i++ {
+				cNorms[i] = rng.Float32() * 10
+				dots[i] = rng.Float32() * 10
+			}
+			xNorm := rng.Float32() * 10
+
+			// Compare unrolled vs scalar
+			gotUnrolled := argminDistance(xNorm, cNorms, dots, 0, k)
+			gotScalar := argminDistanceScalar(xNorm, cNorms, dots, 0, k)
+
+			if gotUnrolled != gotScalar {
+				t.Errorf("k=%d: unrolled=%d, scalar=%d", k, gotUnrolled, gotScalar)
+			}
+		})
+	}
+}
+
+func TestArgminDistanceUnrolledWithOffset(t *testing.T) {
+	// Test that dotRow offset works correctly with unrolling
+	kValues := []int{4, 8, 16, 256}
+	rng := rand.New(rand.NewSource(123))
+
+	for _, k := range kValues {
+		t.Run(fmt.Sprintf("k=%d", k), func(t *testing.T) {
+			// Create data with multiple rows
+			numRows := 5
+			cNorms := make([]float32, k)
+			dots := make([]float32, k*numRows)
+
+			for i := 0; i < k; i++ {
+				cNorms[i] = rng.Float32() * 10
+			}
+			for i := 0; i < k*numRows; i++ {
+				dots[i] = rng.Float32() * 10
+			}
+
+			// Test each row
+			for row := 0; row < numRows; row++ {
+				xNorm := rng.Float32() * 10
+				dotRow := row * k
+
+				gotUnrolled := argminDistance(xNorm, cNorms, dots, dotRow, k)
+				gotScalar := argminDistanceScalar(xNorm, cNorms, dots, dotRow, k)
+
+				if gotUnrolled != gotScalar {
+					t.Errorf("k=%d row=%d: unrolled=%d, scalar=%d", k, row, gotUnrolled, gotScalar)
+				}
+			}
+		})
+	}
+}
+
+func TestArgminDistanceMinimumAtDifferentPositions(t *testing.T) {
+	// Test that minimum is found regardless of its position in the array
+	// This catches bugs in unrolling where certain positions might be missed
+	kValues := []int{1, 4, 5, 8, 9, 16, 17, 255, 256}
+
+	for _, k := range kValues {
+		t.Run(fmt.Sprintf("k=%d", k), func(t *testing.T) {
+			for minPos := 0; minPos < k; minPos++ {
+				// Create data where minimum is at position minPos
+				cNorms := make([]float32, k)
+				dots := make([]float32, k)
+
+				// Set all distances to 100
+				for i := 0; i < k; i++ {
+					cNorms[i] = 50
+					dots[i] = 0 // dist = xNorm + 50 - 0 = xNorm + 50
+				}
+				// Set minimum at minPos: make dot product large so distance is small
+				dots[minPos] = 50 // dist = xNorm + 50 - 100 = xNorm - 50
+
+				xNorm := float32(100)
+
+				gotUnrolled := argminDistance(xNorm, cNorms, dots, 0, k)
+				gotScalar := argminDistanceScalar(xNorm, cNorms, dots, 0, k)
+
+				if gotUnrolled != uint8(minPos) {
+					t.Errorf("k=%d minPos=%d: unrolled=%d, want %d", k, minPos, gotUnrolled, minPos)
+				}
+				if gotScalar != uint8(minPos) {
+					t.Errorf("k=%d minPos=%d: scalar=%d, want %d", k, minPos, gotScalar, minPos)
+				}
+			}
+		})
+	}
+}
+
+func TestArgminDistanceWithTies(t *testing.T) {
+	// When there are ties, both implementations should pick the first (lowest index)
+	k := 16
+
+	cNorms := make([]float32, k)
+	dots := make([]float32, k)
+
+	// All distances equal
+	for i := 0; i < k; i++ {
+		cNorms[i] = 10
+		dots[i] = 5
+	}
+	xNorm := float32(10)
+
+	gotUnrolled := argminDistance(xNorm, cNorms, dots, 0, k)
+	gotScalar := argminDistanceScalar(xNorm, cNorms, dots, 0, k)
+
+	// Both should return 0 (first index) when all distances are equal
+	if gotUnrolled != 0 {
+		t.Errorf("unrolled with ties: got %d, want 0", gotUnrolled)
+	}
+	if gotScalar != 0 {
+		t.Errorf("scalar with ties: got %d, want 0", gotScalar)
+	}
+	if gotUnrolled != gotScalar {
+		t.Errorf("tie handling differs: unrolled=%d, scalar=%d", gotUnrolled, gotScalar)
+	}
+}
+
+func BenchmarkArgminDistanceUnrolled(b *testing.B) {
+	// Benchmark the 4x unrolled implementation
+	rng := rand.New(rand.NewSource(42))
+	k := 256
+
+	cNorms := make([]float32, k)
+	dots := make([]float32, k)
+	for i := 0; i < k; i++ {
+		cNorms[i] = rng.Float32() * 10
+		dots[i] = rng.Float32() * 10
+	}
+	xNorm := rng.Float32() * 10
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		argminDistance(xNorm, cNorms, dots, 0, k)
+	}
+}
+
+func BenchmarkArgminDistanceScalar(b *testing.B) {
+	// Benchmark the scalar implementation for comparison
+	rng := rand.New(rand.NewSource(42))
+	k := 256
+
+	cNorms := make([]float32, k)
+	dots := make([]float32, k)
+	for i := 0; i < k; i++ {
+		cNorms[i] = rng.Float32() * 10
+		dots[i] = rng.Float32() * 10
+	}
+	xNorm := rng.Float32() * 10
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		argminDistanceScalar(xNorm, cNorms, dots, 0, k)
+	}
+}
+
+func BenchmarkArgminDistanceByK(b *testing.B) {
+	// Benchmark with different k values to show unrolling benefit
+	kValues := []int{4, 8, 16, 64, 256}
+	rng := rand.New(rand.NewSource(42))
+
+	for _, k := range kValues {
+		b.Run(fmt.Sprintf("unrolled_k=%d", k), func(b *testing.B) {
+			cNorms := make([]float32, k)
+			dots := make([]float32, k)
+			for i := 0; i < k; i++ {
+				cNorms[i] = rng.Float32() * 10
+				dots[i] = rng.Float32() * 10
+			}
+			xNorm := rng.Float32() * 10
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				argminDistance(xNorm, cNorms, dots, 0, k)
+			}
+		})
+
+		b.Run(fmt.Sprintf("scalar_k=%d", k), func(b *testing.B) {
+			cNorms := make([]float32, k)
+			dots := make([]float32, k)
+			for i := 0; i < k; i++ {
+				cNorms[i] = rng.Float32() * 10
+				dots[i] = rng.Float32() * 10
+			}
+			xNorm := rng.Float32() * 10
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				argminDistanceScalar(xNorm, cNorms, dots, 0, k)
+			}
+		})
+	}
+}
+
+// =============================================================================
 // Training Configuration Tests (PQ.7)
 // =============================================================================
 
