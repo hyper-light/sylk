@@ -1009,6 +1009,76 @@ func (pq *ProductQuantizer) TrainParallelWithConfig(ctx context.Context, vectors
 }
 
 // =============================================================================
+// EncodingBuffer for Batch Encoding (PQ.8)
+// =============================================================================
+
+// EncodingBuffer holds pre-allocated buffers for batch encoding operations.
+// This reduces allocations by reusing buffers across chunks within the same worker.
+// CRITICAL: Must call Reset() before reusing for a new chunk to prevent data leakage.
+type EncodingBuffer struct {
+	// subspaceData holds contiguous subvector data for BLAS GEMM
+	subspaceData []float32
+	// xNorms holds squared norms of input vectors
+	xNorms []float32
+	// dots holds dot product results from BLAS GEMM
+	dots []float32
+}
+
+// NewEncodingBuffer creates a new encoding buffer.
+func NewEncodingBuffer() *EncodingBuffer {
+	return &EncodingBuffer{}
+}
+
+// Reset clears all buffer data to prevent leakage between chunks.
+// CRITICAL: This MUST be called before processing each new chunk.
+func (b *EncodingBuffer) Reset() {
+	// Zero out the slices to prevent data leakage
+	for i := range b.subspaceData {
+		b.subspaceData[i] = 0
+	}
+	for i := range b.xNorms {
+		b.xNorms[i] = 0
+	}
+	for i := range b.dots {
+		b.dots[i] = 0
+	}
+}
+
+// EnsureCapacity ensures buffers are large enough for the given dimensions.
+// Grows buffers if needed but reuses existing allocations when sufficient.
+func (b *EncodingBuffer) EnsureCapacity(chunkN, subspaceDim, k int) {
+	// Grow subspaceData if needed: [chunkN * subspaceDim]
+	subspaceSize := chunkN * subspaceDim
+	if subspaceSize > cap(b.subspaceData) {
+		b.subspaceData = make([]float32, subspaceSize)
+	} else {
+		b.subspaceData = b.subspaceData[:subspaceSize]
+	}
+
+	// Grow xNorms if needed: [chunkN]
+	if chunkN > cap(b.xNorms) {
+		b.xNorms = make([]float32, chunkN)
+	} else {
+		b.xNorms = b.xNorms[:chunkN]
+	}
+
+	// Grow dots if needed: [chunkN * k]
+	dotsSize := chunkN * k
+	if dotsSize > cap(b.dots) {
+		b.dots = make([]float32, dotsSize)
+	} else {
+		b.dots = b.dots[:dotsSize]
+	}
+}
+
+// encodingBufferPool provides thread-safe buffer reuse across EncodeBatch calls.
+var encodingBufferPool = sync.Pool{
+	New: func() interface{} {
+		return NewEncodingBuffer()
+	},
+}
+
+// =============================================================================
 // Vector Encoding (PQ.8)
 // =============================================================================
 
@@ -1085,10 +1155,11 @@ func (pq *ProductQuantizer) Encode(vector []float32) (PQCode, error) {
 }
 
 // EncodeBatch encodes multiple vectors using BLAS GEMM for maximum throughput.
-// Vectors are processed in chunks with parallel workers.
+// Vectors are processed in chunks with parallel workers using pooled buffers.
 //
 // Uses BLAS GEMM to compute all N×K dot products per subspace in one operation:
-//   dots[N×K] = vectors[N×dim] @ centroids[dim×K]
+//
+//	dots[N×K] = vectors[N×dim] @ centroids[dim×K]
 //
 // This is significantly faster than per-vector encoding for large batches.
 // Returns an error if any vector has incorrect dimension or quantizer is not trained.
@@ -1126,7 +1197,6 @@ func (pq *ProductQuantizer) EncodeBatch(vectors [][]float32, workers int) ([]PQC
 	}
 
 	// Chunk size balances BLAS efficiency vs memory usage
-	// Larger chunks = more BLAS efficiency, but more memory
 	chunkSize := (n + workers - 1) / workers
 	if chunkSize < 32 {
 		chunkSize = 32 // Minimum for BLAS efficiency
@@ -1151,83 +1221,96 @@ func (pq *ProductQuantizer) EncodeBatch(vectors [][]float32, workers int) ([]PQC
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			// Get pooled buffer for this worker
+			buf := encodingBufferPool.Get().(*EncodingBuffer)
+			defer encodingBufferPool.Put(buf)
+
 			chunkN := end - start
+			buf.EnsureCapacity(chunkN, dim, k)
 
-			// Build contiguous subspace matrices for this chunk
-			// For each subspace, extract subvectors into contiguous array
-			subspaceData := make([]float32, chunkN*dim)
-			xNorms := make([]float32, chunkN)
-			dots := make([]float32, chunkN*k)
-
-			for m := 0; m < pq.numSubspaces; m++ {
-				subStart := m * dim
-
-				// Extract subvectors and compute norms
-				for i := 0; i < chunkN; i++ {
-					vec := vectors[start+i]
-					var norm float32
-					for d := 0; d < dim; d++ {
-						val := vec[subStart+d]
-						subspaceData[i*dim+d] = val
-						norm += val * val
-					}
-					xNorms[i] = norm
-				}
-
-				// BLAS GEMM: dots[N×K] = subspaceData[N×dim] @ centroids[dim×K]
-				// centroids stored as [K×dim], so we use Trans
-				blas32.Gemm(
-					blas.NoTrans, // op(A) = A
-					blas.Trans,   // op(B) = B.T (centroids is K×dim, we want dim×K)
-					1.0,          // alpha
-					blas32.General{
-						Rows:   chunkN,
-						Cols:   dim,
-						Stride: dim,
-						Data:   subspaceData,
-					},
-					blas32.General{
-						Rows:   k,
-						Cols:   dim,
-						Stride: dim,
-						Data:   pq.centroidsFlat[m],
-					},
-					0.0, // beta
-					blas32.General{
-						Rows:   chunkN,
-						Cols:   k,
-						Stride: k,
-						Data:   dots,
-					},
-				)
-
-				// Find nearest centroid for each vector in chunk
-				cNorms := pq.centroidNorms[m]
-				for i := 0; i < chunkN; i++ {
-					if results[start+i] == nil {
-						results[start+i] = make(PQCode, pq.numSubspaces)
-					}
-
-					xNorm := xNorms[i]
-					dotRow := i * k
-					minDist := float32(math.MaxFloat32)
-					minIdx := uint8(0)
-
-					for c := 0; c < k; c++ {
-						dist := xNorm + cNorms[c] - 2*dots[dotRow+c]
-						if dist < minDist {
-							minDist = dist
-							minIdx = uint8(c)
-						}
-					}
-					results[start+i][m] = minIdx
-				}
-			}
+			// Process each subspace
+			pq.encodeChunkSubspaces(vectors, results, buf, start, end)
 		}(chunkStart, chunkEnd)
 	}
 
 	wg.Wait()
 	return results, nil
+}
+
+// encodeChunkSubspaces processes all subspaces for a chunk of vectors.
+// Uses pre-allocated buffers to minimize allocations.
+func (pq *ProductQuantizer) encodeChunkSubspaces(
+	vectors [][]float32,
+	results []PQCode,
+	buf *EncodingBuffer,
+	start, end int,
+) {
+	chunkN := end - start
+	k := pq.centroidsPerSubspace
+	dim := pq.subspaceDim
+
+	for m := 0; m < pq.numSubspaces; m++ {
+		// Reset buffers before each subspace to prevent data leakage
+		buf.Reset()
+
+		subStart := m * dim
+
+		// Extract subvectors and compute norms
+		for i := 0; i < chunkN; i++ {
+			vec := vectors[start+i]
+			var norm float32
+			for d := 0; d < dim; d++ {
+				val := vec[subStart+d]
+				buf.subspaceData[i*dim+d] = val
+				norm += val * val
+			}
+			buf.xNorms[i] = norm
+		}
+
+		// BLAS GEMM: dots[N×K] = subspaceData[N×dim] @ centroids[dim×K]
+		blas32.Gemm(
+			blas.NoTrans,
+			blas.Trans,
+			1.0,
+			blas32.General{Rows: chunkN, Cols: dim, Stride: dim, Data: buf.subspaceData},
+			blas32.General{Rows: k, Cols: dim, Stride: dim, Data: pq.centroidsFlat[m]},
+			0.0,
+			blas32.General{Rows: chunkN, Cols: k, Stride: k, Data: buf.dots},
+		)
+
+		// Find nearest centroid for each vector in chunk
+		pq.assignNearestCentroids(results, buf, start, chunkN, m)
+	}
+}
+
+// assignNearestCentroids finds the nearest centroid for each vector in a chunk.
+func (pq *ProductQuantizer) assignNearestCentroids(
+	results []PQCode,
+	buf *EncodingBuffer,
+	start, chunkN, subspace int,
+) {
+	k := pq.centroidsPerSubspace
+	cNorms := pq.centroidNorms[subspace]
+
+	for i := 0; i < chunkN; i++ {
+		if results[start+i] == nil {
+			results[start+i] = make(PQCode, pq.numSubspaces)
+		}
+
+		xNorm := buf.xNorms[i]
+		dotRow := i * k
+		minDist := float32(math.MaxFloat32)
+		minIdx := uint8(0)
+
+		for c := 0; c < k; c++ {
+			dist := xNorm + cNorms[c] - 2*buf.dots[dotRow+c]
+			if dist < minDist {
+				minDist = dist
+				minIdx = uint8(c)
+			}
+		}
+		results[start+i][subspace] = minIdx
+	}
 }
 
 // =============================================================================
@@ -1238,11 +1321,8 @@ func (pq *ProductQuantizer) EncodeBatch(vectors [][]float32, workers int) ([]PQC
 // Returns a table where table[m][c] = distance(query_subspace_m, centroid_m_c).
 // This enables O(M) distance computation for each PQCode lookup instead of O(D).
 func (pq *ProductQuantizer) ComputeDistanceTable(query []float32) (*DistanceTable, error) {
-	if len(query) != pq.vectorDim {
-		return nil, fmt.Errorf("query dimension %d != expected %d", len(query), pq.vectorDim)
-	}
-	if !pq.trained {
-		return nil, ErrQuantizerNotTrained
+	if err := pq.validateDistanceTableInput(query); err != nil {
+		return nil, err
 	}
 
 	dt := NewDistanceTable(pq.numSubspaces, pq.centroidsPerSubspace)
@@ -1250,17 +1330,73 @@ func (pq *ProductQuantizer) ComputeDistanceTable(query []float32) (*DistanceTabl
 		return nil, errors.New("failed to create distance table")
 	}
 
-	for m := 0; m < pq.numSubspaces; m++ {
-		start := m * pq.subspaceDim
-		end := start + pq.subspaceDim
-		querySubvector := query[start:end]
-
-		for c := 0; c < pq.centroidsPerSubspace; c++ {
-			dt.Table[m][c] = subspaceDistance(querySubvector, pq.centroids[m][c])
-		}
-	}
-
+	pq.computeDistanceTableBLAS(query, dt)
 	return dt, nil
+}
+
+// validateDistanceTableInput checks that query dimensions match and quantizer is trained.
+func (pq *ProductQuantizer) validateDistanceTableInput(query []float32) error {
+	if len(query) != pq.vectorDim {
+		return fmt.Errorf("query dimension %d != expected %d", len(query), pq.vectorDim)
+	}
+	if !pq.trained {
+		return ErrQuantizerNotTrained
+	}
+	return nil
+}
+
+// computeDistanceTableBLAS fills the distance table using BLAS-accelerated computation.
+// Uses the identity: ||c - q||² = ||c||² + ||q||² - 2(c·q)
+// BLAS Gemv computes all dot products c·q for each subspace in one call.
+func (pq *ProductQuantizer) computeDistanceTableBLAS(query []float32, dt *DistanceTable) {
+	k := pq.centroidsPerSubspace
+	dim := pq.subspaceDim
+
+	// Allocate buffer for dot products (reused across subspaces)
+	dots := make([]float32, k)
+
+	for m := 0; m < pq.numSubspaces; m++ {
+		subStart := m * dim
+		querySubvec := query[subStart : subStart+dim]
+
+		// Compute ||q||² for this subspace
+		qNorm := computeVectorNormSquared(querySubvec)
+
+		// BLAS Gemv: dots = centroids[K×dim] @ querySubvec[dim]
+		// This computes c·q for all K centroids at once
+		blas32.Gemv(
+			blas.NoTrans,
+			1.0, // alpha
+			blas32.General{
+				Rows:   k,
+				Cols:   dim,
+				Stride: dim,
+				Data:   pq.centroidsFlat[m],
+			},
+			blas32.Vector{N: dim, Inc: 1, Data: querySubvec},
+			0.0, // beta
+			blas32.Vector{N: k, Inc: 1, Data: dots},
+		)
+
+		// Compute distances: ||c - q||² = ||c||² + ||q||² - 2(c·q)
+		computeDistancesFromDotProducts(dt.Table[m], pq.centroidNorms[m], dots, qNorm)
+	}
+}
+
+// computeVectorNormSquared returns ||v||² = sum(v[i]²).
+func computeVectorNormSquared(v []float32) float32 {
+	var norm float32
+	for _, val := range v {
+		norm += val * val
+	}
+	return norm
+}
+
+// computeDistancesFromDotProducts fills distances using: dist[c] = cNorms[c] + qNorm - 2*dots[c].
+func computeDistancesFromDotProducts(distances, cNorms, dots []float32, qNorm float32) {
+	for c := range distances {
+		distances[c] = cNorms[c] + qNorm - 2*dots[c]
+	}
 }
 
 // =============================================================================

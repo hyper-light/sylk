@@ -2,8 +2,10 @@ package quantization
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand"
+	"sync"
 	"testing"
 )
 
@@ -2970,6 +2972,310 @@ func TestProductQuantizer_ComputeDistanceTable_ZeroDistanceForMatchingCentroid(t
 	}
 }
 
+// scalarSubspaceDistance computes squared L2 distance using scalar operations (reference).
+func scalarSubspaceDistance(a, b []float32) float32 {
+	var sum float32
+	for i := range a {
+		d := a[i] - b[i]
+		sum += d * d
+	}
+	return sum
+}
+
+// computeDistanceTableScalar computes distance table using scalar operations (reference).
+func computeDistanceTableScalar(pq *ProductQuantizer, query []float32) *DistanceTable {
+	dt := NewDistanceTable(pq.NumSubspaces(), pq.CentroidsPerSubspace())
+	centroids := pq.Centroids()
+	subspaceDim := pq.SubspaceDim()
+
+	for m := 0; m < pq.NumSubspaces(); m++ {
+		start := m * subspaceDim
+		end := start + subspaceDim
+		querySubvector := query[start:end]
+
+		for c := 0; c < pq.CentroidsPerSubspace(); c++ {
+			dt.Table[m][c] = scalarSubspaceDistance(querySubvector, centroids[m][c])
+		}
+	}
+	return dt
+}
+
+func TestComputeDistanceTable_BLASvsScalar(t *testing.T) {
+	const tolerance = 1e-5
+
+	testCases := []struct {
+		name                 string
+		vectorDim            int
+		numSubspaces         int
+		centroidsPerSubspace int
+		numVectors           int
+	}{
+		{"small_4x8", 32, 4, 8, 100},
+		{"medium_8x16", 64, 8, 16, 200},
+		{"typical_32x256", 768, 32, 256, 3000},
+		{"large_subspace_16x64", 256, 16, 64, 1000},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := ProductQuantizerConfig{
+				NumSubspaces:         tc.numSubspaces,
+				CentroidsPerSubspace: tc.centroidsPerSubspace,
+			}
+			pq, err := NewProductQuantizer(tc.vectorDim, config)
+			if err != nil {
+				t.Fatalf("failed to create ProductQuantizer: %v", err)
+			}
+
+			vectors := generateTrainingVectors(tc.numVectors, tc.vectorDim, 42)
+			trainConfig := TrainConfig{
+				MaxIterations:   20,
+				Seed:            12345,
+				MinSamplesRatio: 10.0,
+			}
+			if err := pq.TrainWithConfig(context.Background(), vectors, trainConfig); err != nil {
+				t.Fatalf("failed to train: %v", err)
+			}
+
+			// Test with multiple query vectors
+			queries := [][]float32{
+				vectors[0],                                             // Training vector
+				vectors[len(vectors)/2],                                // Middle training vector
+				generateTrainingVectors(1, tc.vectorDim, 99999)[0],     // Random vector
+			}
+
+			for i, query := range queries {
+				// Compute using BLAS
+				blasTable, err := pq.ComputeDistanceTable(query)
+				if err != nil {
+					t.Fatalf("query %d: ComputeDistanceTable() error = %v", i, err)
+				}
+
+				// Compute using scalar (reference)
+				scalarTable := computeDistanceTableScalar(pq, query)
+
+				// Compare results
+				for m := 0; m < pq.NumSubspaces(); m++ {
+					for c := 0; c < pq.CentroidsPerSubspace(); c++ {
+						blasDist := blasTable.Table[m][c]
+						scalarDist := scalarTable.Table[m][c]
+						diff := blasDist - scalarDist
+						if diff < 0 {
+							diff = -diff
+						}
+						if diff > tolerance {
+							t.Errorf("query %d, subspace %d, centroid %d: BLAS=%f, scalar=%f, diff=%f > %f",
+								i, m, c, blasDist, scalarDist, diff, tolerance)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestComputeDistanceTable_EdgeCases(t *testing.T) {
+	const tolerance = 1e-5
+
+	t.Run("single_centroid", func(t *testing.T) {
+		config := ProductQuantizerConfig{
+			NumSubspaces:         2,
+			CentroidsPerSubspace: 1,
+		}
+		pq, err := NewProductQuantizer(8, config)
+		if err != nil {
+			t.Fatalf("failed to create ProductQuantizer: %v", err)
+		}
+
+		vectors := generateTrainingVectors(50, 8, 42)
+		trainConfig := TrainConfig{MaxIterations: 10, Seed: 123, MinSamplesRatio: 10.0}
+		if err := pq.TrainWithConfig(context.Background(), vectors, trainConfig); err != nil {
+			t.Fatalf("failed to train: %v", err)
+		}
+
+		query := vectors[0]
+		blasTable, err := pq.ComputeDistanceTable(query)
+		if err != nil {
+			t.Fatalf("ComputeDistanceTable() error = %v", err)
+		}
+
+		scalarTable := computeDistanceTableScalar(pq, query)
+
+		for m := 0; m < pq.NumSubspaces(); m++ {
+			diff := blasTable.Table[m][0] - scalarTable.Table[m][0]
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > tolerance {
+				t.Errorf("subspace %d: BLAS=%f, scalar=%f, diff=%f",
+					m, blasTable.Table[m][0], scalarTable.Table[m][0], diff)
+			}
+		}
+	})
+
+	t.Run("max_centroids_256", func(t *testing.T) {
+		config := ProductQuantizerConfig{
+			NumSubspaces:         4,
+			CentroidsPerSubspace: 256,
+		}
+		pq, err := NewProductQuantizer(64, config)
+		if err != nil {
+			t.Fatalf("failed to create ProductQuantizer: %v", err)
+		}
+
+		vectors := generateTrainingVectors(3000, 64, 42)
+		trainConfig := TrainConfig{MaxIterations: 15, Seed: 456, MinSamplesRatio: 10.0}
+		if err := pq.TrainWithConfig(context.Background(), vectors, trainConfig); err != nil {
+			t.Fatalf("failed to train: %v", err)
+		}
+
+		query := vectors[100]
+		blasTable, err := pq.ComputeDistanceTable(query)
+		if err != nil {
+			t.Fatalf("ComputeDistanceTable() error = %v", err)
+		}
+
+		scalarTable := computeDistanceTableScalar(pq, query)
+
+		mismatchCount := 0
+		for m := 0; m < pq.NumSubspaces(); m++ {
+			for c := 0; c < pq.CentroidsPerSubspace(); c++ {
+				diff := blasTable.Table[m][c] - scalarTable.Table[m][c]
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > tolerance {
+					mismatchCount++
+					if mismatchCount <= 5 {
+						t.Errorf("subspace %d, centroid %d: BLAS=%f, scalar=%f, diff=%f",
+							m, c, blasTable.Table[m][c], scalarTable.Table[m][c], diff)
+					}
+				}
+			}
+		}
+		if mismatchCount > 5 {
+			t.Errorf("... and %d more mismatches", mismatchCount-5)
+		}
+	})
+
+	t.Run("zero_query_vector", func(t *testing.T) {
+		config := ProductQuantizerConfig{
+			NumSubspaces:         4,
+			CentroidsPerSubspace: 8,
+		}
+		pq, err := NewProductQuantizer(32, config)
+		if err != nil {
+			t.Fatalf("failed to create ProductQuantizer: %v", err)
+		}
+
+		vectors := generateTrainingVectors(100, 32, 42)
+		trainConfig := TrainConfig{MaxIterations: 10, Seed: 789, MinSamplesRatio: 10.0}
+		if err := pq.TrainWithConfig(context.Background(), vectors, trainConfig); err != nil {
+			t.Fatalf("failed to train: %v", err)
+		}
+
+		// Zero vector query
+		query := make([]float32, 32)
+		blasTable, err := pq.ComputeDistanceTable(query)
+		if err != nil {
+			t.Fatalf("ComputeDistanceTable() error = %v", err)
+		}
+
+		scalarTable := computeDistanceTableScalar(pq, query)
+
+		for m := 0; m < pq.NumSubspaces(); m++ {
+			for c := 0; c < pq.CentroidsPerSubspace(); c++ {
+				diff := blasTable.Table[m][c] - scalarTable.Table[m][c]
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > tolerance {
+					t.Errorf("zero query - subspace %d, centroid %d: BLAS=%f, scalar=%f",
+						m, c, blasTable.Table[m][c], scalarTable.Table[m][c])
+				}
+			}
+		}
+	})
+
+	t.Run("query_equals_centroid", func(t *testing.T) {
+		config := ProductQuantizerConfig{
+			NumSubspaces:         4,
+			CentroidsPerSubspace: 8,
+		}
+		pq, err := NewProductQuantizer(32, config)
+		if err != nil {
+			t.Fatalf("failed to create ProductQuantizer: %v", err)
+		}
+
+		vectors := generateTrainingVectors(100, 32, 42)
+		trainConfig := TrainConfig{MaxIterations: 20, Seed: 321, MinSamplesRatio: 10.0}
+		if err := pq.TrainWithConfig(context.Background(), vectors, trainConfig); err != nil {
+			t.Fatalf("failed to train: %v", err)
+		}
+
+		// Build query from centroids
+		centroids := pq.Centroids()
+		query := make([]float32, 32)
+		subspaceDim := pq.SubspaceDim()
+		for m := 0; m < pq.NumSubspaces(); m++ {
+			copy(query[m*subspaceDim:(m+1)*subspaceDim], centroids[m][0])
+		}
+
+		blasTable, err := pq.ComputeDistanceTable(query)
+		if err != nil {
+			t.Fatalf("ComputeDistanceTable() error = %v", err)
+		}
+
+		// Distance to matching centroid should be nearly zero
+		for m := 0; m < pq.NumSubspaces(); m++ {
+			if blasTable.Table[m][0] > 1e-5 {
+				t.Errorf("subspace %d, centroid 0: expected ~0, got %f", m, blasTable.Table[m][0])
+			}
+		}
+	})
+}
+
+func TestComputeDistanceTable_HelperFunctions(t *testing.T) {
+	t.Run("computeVectorNormSquared", func(t *testing.T) {
+		v := []float32{3.0, 4.0}
+		norm := computeVectorNormSquared(v)
+		expected := float32(25.0) // 3² + 4² = 9 + 16 = 25
+		if norm != expected {
+			t.Errorf("computeVectorNormSquared([3,4]) = %f, want %f", norm, expected)
+		}
+	})
+
+	t.Run("computeVectorNormSquared_empty", func(t *testing.T) {
+		v := []float32{}
+		norm := computeVectorNormSquared(v)
+		if norm != 0 {
+			t.Errorf("computeVectorNormSquared([]) = %f, want 0", norm)
+		}
+	})
+
+	t.Run("computeDistancesFromDotProducts", func(t *testing.T) {
+		distances := make([]float32, 3)
+		cNorms := []float32{1.0, 4.0, 9.0}
+		dots := []float32{2.0, 3.0, 4.0}
+		qNorm := float32(5.0)
+
+		computeDistancesFromDotProducts(distances, cNorms, dots, qNorm)
+
+		// dist[c] = cNorms[c] + qNorm - 2*dots[c]
+		expected := []float32{
+			1.0 + 5.0 - 2*2.0, // = 2.0
+			4.0 + 5.0 - 2*3.0, // = 3.0
+			9.0 + 5.0 - 2*4.0, // = 6.0
+		}
+
+		for i := range distances {
+			if distances[i] != expected[i] {
+				t.Errorf("distances[%d] = %f, want %f", i, distances[i], expected[i])
+			}
+		}
+	})
+}
+
 // =============================================================================
 // AsymmetricDistance Tests (PQ.10)
 // =============================================================================
@@ -3653,6 +3959,138 @@ func BenchmarkProductQuantizer_ComputeDistanceTable(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		pq.ComputeDistanceTable(query)
 	}
+}
+
+// computeDistanceTableScalarBenchmark is a scalar-only implementation for benchmarking.
+func computeDistanceTableScalarBenchmark(pq *ProductQuantizer, query []float32) *DistanceTable {
+	dt := NewDistanceTable(pq.NumSubspaces(), pq.CentroidsPerSubspace())
+	centroids := pq.Centroids()
+	subspaceDim := pq.SubspaceDim()
+
+	for m := 0; m < pq.NumSubspaces(); m++ {
+		start := m * subspaceDim
+		end := start + subspaceDim
+		querySubvector := query[start:end]
+
+		for c := 0; c < pq.CentroidsPerSubspace(); c++ {
+			dt.Table[m][c] = scalarSubspaceDistance(querySubvector, centroids[m][c])
+		}
+	}
+	return dt
+}
+
+func BenchmarkDistanceTable_BLAS(b *testing.B) {
+	benchmarks := []struct {
+		name       string
+		vectorDim  int
+		numSub     int
+		centroids  int
+	}{
+		{"small_32d_4x8", 32, 4, 8},
+		{"medium_128d_8x32", 128, 8, 32},
+		{"typical_768d_32x256", 768, 32, 256},
+		{"large_1536d_48x256", 1536, 48, 256},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			config := ProductQuantizerConfig{
+				NumSubspaces:         bm.numSub,
+				CentroidsPerSubspace: bm.centroids,
+			}
+			pq, _ := NewProductQuantizer(bm.vectorDim, config)
+
+			numVectors := bm.centroids * bm.numSub * 10
+			if numVectors < 500 {
+				numVectors = 500
+			}
+			if numVectors > 5000 {
+				numVectors = 5000
+			}
+			vectors := generateTrainingVectors(numVectors, bm.vectorDim, 42)
+			trainConfig := TrainConfig{MaxIterations: 15, Seed: 12345, MinSamplesRatio: 10.0}
+			pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+			query := vectors[0]
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				pq.ComputeDistanceTable(query)
+			}
+		})
+	}
+}
+
+func BenchmarkDistanceTable_Scalar(b *testing.B) {
+	benchmarks := []struct {
+		name       string
+		vectorDim  int
+		numSub     int
+		centroids  int
+	}{
+		{"small_32d_4x8", 32, 4, 8},
+		{"medium_128d_8x32", 128, 8, 32},
+		{"typical_768d_32x256", 768, 32, 256},
+		{"large_1536d_48x256", 1536, 48, 256},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			config := ProductQuantizerConfig{
+				NumSubspaces:         bm.numSub,
+				CentroidsPerSubspace: bm.centroids,
+			}
+			pq, _ := NewProductQuantizer(bm.vectorDim, config)
+
+			numVectors := bm.centroids * bm.numSub * 10
+			if numVectors < 500 {
+				numVectors = 500
+			}
+			if numVectors > 5000 {
+				numVectors = 5000
+			}
+			vectors := generateTrainingVectors(numVectors, bm.vectorDim, 42)
+			trainConfig := TrainConfig{MaxIterations: 15, Seed: 12345, MinSamplesRatio: 10.0}
+			pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+			query := vectors[0]
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				computeDistanceTableScalarBenchmark(pq, query)
+			}
+		})
+	}
+}
+
+func BenchmarkDistanceTable_Comparison(b *testing.B) {
+	config := ProductQuantizerConfig{
+		NumSubspaces:         32,
+		CentroidsPerSubspace: 256,
+	}
+	pq, _ := NewProductQuantizer(768, config)
+
+	vectors := generateTrainingVectors(3000, 768, 42)
+	trainConfig := TrainConfig{MaxIterations: 20, Seed: 12345, MinSamplesRatio: 10.0}
+	pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+	query := vectors[0]
+
+	b.Run("BLAS", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			pq.ComputeDistanceTable(query)
+		}
+	})
+
+	b.Run("Scalar", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			computeDistanceTableScalarBenchmark(pq, query)
+		}
+	})
 }
 
 func BenchmarkProductQuantizer_AsymmetricDistance(b *testing.B) {
@@ -4511,5 +4949,427 @@ func BenchmarkPQCode_UnmarshalBinary(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var code2 PQCode
 		code2.UnmarshalBinary(data)
+	}
+}
+
+// =============================================================================
+// EncodingBuffer Tests
+// =============================================================================
+
+func TestEncodingBuffer_NewEncodingBuffer(t *testing.T) {
+	buf := NewEncodingBuffer()
+	if buf == nil {
+		t.Fatal("NewEncodingBuffer() returned nil")
+	}
+	if buf.subspaceData != nil {
+		t.Error("new buffer should have nil subspaceData")
+	}
+	if buf.xNorms != nil {
+		t.Error("new buffer should have nil xNorms")
+	}
+	if buf.dots != nil {
+		t.Error("new buffer should have nil dots")
+	}
+}
+
+func TestEncodingBuffer_EnsureCapacity(t *testing.T) {
+	tests := []struct {
+		name        string
+		chunkN      int
+		subspaceDim int
+		k           int
+	}{
+		{"small", 10, 8, 16},
+		{"medium", 100, 24, 256},
+		{"large", 512, 32, 256},
+		{"single", 1, 4, 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := NewEncodingBuffer()
+			buf.EnsureCapacity(tt.chunkN, tt.subspaceDim, tt.k)
+
+			expectedSubspaceSize := tt.chunkN * tt.subspaceDim
+			expectedDotsSize := tt.chunkN * tt.k
+
+			if len(buf.subspaceData) != expectedSubspaceSize {
+				t.Errorf("subspaceData len = %d, want %d", len(buf.subspaceData), expectedSubspaceSize)
+			}
+			if len(buf.xNorms) != tt.chunkN {
+				t.Errorf("xNorms len = %d, want %d", len(buf.xNorms), tt.chunkN)
+			}
+			if len(buf.dots) != expectedDotsSize {
+				t.Errorf("dots len = %d, want %d", len(buf.dots), expectedDotsSize)
+			}
+		})
+	}
+}
+
+func TestEncodingBuffer_EnsureCapacity_Reuse(t *testing.T) {
+	buf := NewEncodingBuffer()
+
+	// First allocation
+	buf.EnsureCapacity(100, 24, 256)
+	firstSubspace := buf.subspaceData
+	firstNorms := buf.xNorms
+	firstDots := buf.dots
+
+	// Smaller request should reuse existing buffers (same backing array)
+	buf.EnsureCapacity(50, 24, 256)
+	if cap(buf.subspaceData) != cap(firstSubspace) {
+		t.Error("smaller request should reuse subspaceData capacity")
+	}
+	if cap(buf.xNorms) != cap(firstNorms) {
+		t.Error("smaller request should reuse xNorms capacity")
+	}
+	if cap(buf.dots) != cap(firstDots) {
+		t.Error("smaller request should reuse dots capacity")
+	}
+}
+
+func TestEncodingBuffer_Reset(t *testing.T) {
+	buf := NewEncodingBuffer()
+	buf.EnsureCapacity(10, 8, 16)
+
+	// Fill with non-zero values
+	for i := range buf.subspaceData {
+		buf.subspaceData[i] = float32(i + 1)
+	}
+	for i := range buf.xNorms {
+		buf.xNorms[i] = float32(i + 1)
+	}
+	for i := range buf.dots {
+		buf.dots[i] = float32(i + 1)
+	}
+
+	buf.Reset()
+
+	// Verify all zeroed
+	for i, v := range buf.subspaceData {
+		if v != 0 {
+			t.Errorf("subspaceData[%d] = %f after Reset, want 0", i, v)
+		}
+	}
+	for i, v := range buf.xNorms {
+		if v != 0 {
+			t.Errorf("xNorms[%d] = %f after Reset, want 0", i, v)
+		}
+	}
+	for i, v := range buf.dots {
+		if v != 0 {
+			t.Errorf("dots[%d] = %f after Reset, want 0", i, v)
+		}
+	}
+}
+
+// =============================================================================
+// Golden Tests: Verify EncodeBatch produces identical output to single Encode
+// =============================================================================
+
+func TestEncodeBatch_GoldenTest_ByteForByteIdentical(t *testing.T) {
+	// This test verifies that EncodeBatch produces EXACTLY the same
+	// output as calling Encode on each vector individually.
+	// This is critical for correctness validation of buffer reuse.
+
+	config := ProductQuantizerConfig{
+		NumSubspaces:         8,
+		CentroidsPerSubspace: 32,
+	}
+	pq, err := NewProductQuantizer(64, config)
+	if err != nil {
+		t.Fatalf("failed to create PQ: %v", err)
+	}
+
+	// Train with deterministic seed
+	vectors := generateTrainingVectors(500, 64, 42)
+	trainConfig := TrainConfig{
+		MaxIterations:   20,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
+	}
+	if err := pq.TrainWithConfig(context.Background(), vectors, trainConfig); err != nil {
+		t.Fatalf("training failed: %v", err)
+	}
+
+	// Test various batch sizes
+	testSizes := []int{1, 2, 5, 10, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 256, 500}
+
+	for _, batchSize := range testSizes {
+		t.Run(fmt.Sprintf("size_%d", batchSize), func(t *testing.T) {
+			testVectors := vectors[:batchSize]
+
+			// Encode using batch method
+			batchCodes, err := pq.EncodeBatch(testVectors, 4)
+			if err != nil {
+				t.Fatalf("EncodeBatch failed: %v", err)
+			}
+
+			// Encode using single method
+			singleCodes := make([]PQCode, batchSize)
+			for i, v := range testVectors {
+				code, err := pq.Encode(v)
+				if err != nil {
+					t.Fatalf("Encode failed: %v", err)
+				}
+				singleCodes[i] = code
+			}
+
+			// Verify byte-for-byte identical
+			for i := 0; i < batchSize; i++ {
+				if !batchCodes[i].Equal(singleCodes[i]) {
+					t.Errorf("vector %d: batch=%v, single=%v", i, batchCodes[i], singleCodes[i])
+				}
+			}
+		})
+	}
+}
+
+func TestEncodeBatch_GoldenTest_ChunkBoundaries(t *testing.T) {
+	// Test behavior at exact chunk boundaries to ensure no off-by-one errors
+	config := ProductQuantizerConfig{
+		NumSubspaces:         4,
+		CentroidsPerSubspace: 16,
+	}
+	pq, _ := NewProductQuantizer(32, config)
+
+	vectors := generateTrainingVectors(200, 32, 42)
+	trainConfig := TrainConfig{
+		MaxIterations:   10,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
+	}
+	pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+	// Test with exactly 32, 64, 128 vectors (chunk boundary sizes)
+	for _, size := range []int{32, 64, 128, 160} {
+		testVectors := vectors[:size]
+
+		batchCodes, _ := pq.EncodeBatch(testVectors, 2)
+
+		for i, v := range testVectors {
+			singleCode, _ := pq.Encode(v)
+			if !batchCodes[i].Equal(singleCode) {
+				t.Errorf("size %d, vector %d mismatch", size, i)
+			}
+		}
+	}
+}
+
+func TestEncodeBatch_GoldenTest_PartialChunks(t *testing.T) {
+	// Test partial chunks (when batch size is not evenly divisible by chunk size)
+	config := ProductQuantizerConfig{
+		NumSubspaces:         4,
+		CentroidsPerSubspace: 8,
+	}
+	pq, _ := NewProductQuantizer(32, config)
+
+	vectors := generateTrainingVectors(100, 32, 42)
+	trainConfig := TrainConfig{
+		MaxIterations:   10,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
+	}
+	pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+	// Test partial chunk sizes: 33, 47, 65, 97 (not divisible by common chunk sizes)
+	for _, size := range []int{33, 47, 65, 97} {
+		testVectors := vectors[:size]
+
+		batchCodes, _ := pq.EncodeBatch(testVectors, 4)
+
+		for i, v := range testVectors {
+			singleCode, _ := pq.Encode(v)
+			if !batchCodes[i].Equal(singleCode) {
+				t.Errorf("partial chunk size %d, vector %d mismatch", size, i)
+			}
+		}
+	}
+}
+
+func TestEncodeBatch_GoldenTest_DifferentConfigurations(t *testing.T) {
+	// Test with different subspace and centroid configurations
+	configs := []struct {
+		name      string
+		dim       int
+		subspaces int
+		centroids int
+	}{
+		{"small_4x8", 32, 4, 8},
+		{"medium_8x32", 64, 8, 32},
+		{"large_16x64", 128, 16, 64},
+		{"max_32x256", 768, 32, 256},
+	}
+
+	for _, cfg := range configs {
+		t.Run(cfg.name, func(t *testing.T) {
+			pqConfig := ProductQuantizerConfig{
+				NumSubspaces:         cfg.subspaces,
+				CentroidsPerSubspace: cfg.centroids,
+			}
+			pq, err := NewProductQuantizer(cfg.dim, pqConfig)
+			if err != nil {
+				t.Fatalf("failed to create PQ: %v", err)
+			}
+
+			// Need enough training vectors
+			minSamples := cfg.centroids * max(10, cfg.dim/cfg.subspaces)
+			vectors := generateTrainingVectors(minSamples+200, cfg.dim, 42)
+			trainConfig := TrainConfig{
+				MaxIterations:   15,
+				Seed:            12345,
+				MinSamplesRatio: 10.0,
+			}
+			if err := pq.TrainWithConfig(context.Background(), vectors, trainConfig); err != nil {
+				t.Fatalf("training failed: %v", err)
+			}
+
+			// Test with 100 vectors
+			testVectors := vectors[:100]
+			batchCodes, _ := pq.EncodeBatch(testVectors, 4)
+
+			for i, v := range testVectors {
+				singleCode, _ := pq.Encode(v)
+				if !batchCodes[i].Equal(singleCode) {
+					t.Errorf("config %s, vector %d mismatch", cfg.name, i)
+				}
+			}
+		})
+	}
+}
+
+func TestEncodeBatch_GoldenTest_ConcurrentEncodings(t *testing.T) {
+	// Test concurrent encoding to verify no cross-worker contamination
+	config := ProductQuantizerConfig{
+		NumSubspaces:         8,
+		CentroidsPerSubspace: 32,
+	}
+	pq, _ := NewProductQuantizer(64, config)
+
+	vectors := generateTrainingVectors(500, 64, 42)
+	trainConfig := TrainConfig{
+		MaxIterations:   20,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
+	}
+	pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+	// Compute expected results with single encode
+	expected := make([]PQCode, len(vectors))
+	for i, v := range vectors {
+		expected[i], _ = pq.Encode(v)
+	}
+
+	// Run multiple concurrent batch encodings
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			// Each goroutine encodes the full batch
+			batchCodes, err := pq.EncodeBatch(vectors, 4)
+			if err != nil {
+				errors <- fmt.Errorf("goroutine %d: EncodeBatch failed: %v", id, err)
+				return
+			}
+
+			// Verify results match expected
+			for i := range batchCodes {
+				if !batchCodes[i].Equal(expected[i]) {
+					errors <- fmt.Errorf("goroutine %d, vector %d mismatch", id, i)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+}
+
+func TestEncodeBatch_GoldenTest_SingleVector(t *testing.T) {
+	// Edge case: batch of size 1
+	config := ProductQuantizerConfig{
+		NumSubspaces:         4,
+		CentroidsPerSubspace: 8,
+	}
+	pq, _ := NewProductQuantizer(32, config)
+
+	vectors := generateTrainingVectors(100, 32, 42)
+	trainConfig := TrainConfig{
+		MaxIterations:   10,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
+	}
+	pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+	singleVec := [][]float32{vectors[0]}
+
+	batchCode, err := pq.EncodeBatch(singleVec, 1)
+	if err != nil {
+		t.Fatalf("EncodeBatch failed: %v", err)
+	}
+
+	expectedCode, _ := pq.Encode(vectors[0])
+	if !batchCode[0].Equal(expectedCode) {
+		t.Errorf("single vector batch mismatch: got %v, want %v", batchCode[0], expectedCode)
+	}
+}
+
+func TestEncodeBatch_NoDataLeakage(t *testing.T) {
+	// Test that buffer reuse doesn't leak data between chunks
+	config := ProductQuantizerConfig{
+		NumSubspaces:         4,
+		CentroidsPerSubspace: 16,
+	}
+	pq, _ := NewProductQuantizer(32, config)
+
+	// Create vectors where consecutive chunks have very different values
+	rng := rand.New(rand.NewSource(42))
+	vectors := make([][]float32, 200)
+	for i := range vectors {
+		vectors[i] = make([]float32, 32)
+		// First chunk: values around 1.0
+		// Second chunk: values around 100.0
+		// etc.
+		scale := float32(1.0)
+		if i >= 50 {
+			scale = 100.0
+		}
+		if i >= 100 {
+			scale = 0.01
+		}
+		if i >= 150 {
+			scale = 1000.0
+		}
+		for j := range vectors[i] {
+			vectors[i][j] = rng.Float32() * scale
+		}
+	}
+
+	trainConfig := TrainConfig{
+		MaxIterations:   10,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
+	}
+	pq.TrainWithConfig(context.Background(), vectors, trainConfig)
+
+	// Encode batch
+	batchCodes, _ := pq.EncodeBatch(vectors, 2)
+
+	// Verify each matches single encode
+	for i, v := range vectors {
+		singleCode, _ := pq.Encode(v)
+		if !batchCodes[i].Equal(singleCode) {
+			t.Errorf("data leakage detected at vector %d: batch=%v, single=%v", i, batchCodes[i], singleCode)
+		}
 	}
 }
