@@ -3,6 +3,9 @@ package inference
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1556,4 +1559,382 @@ func TestMaterializationManager_ConcurrentDeadLetterAccess(t *testing.T) {
 	wg2.Wait()
 
 	// Should not panic due to race conditions
+}
+
+// =============================================================================
+// W4P.35 Evidence Deserialization Validation Tests
+// =============================================================================
+
+func TestUnmarshalAndValidateEvidence_ValidJSON(t *testing.T) {
+	testCases := []struct {
+		name     string
+		json     string
+		expected []string
+	}{
+		{
+			name:     "single evidence key",
+			json:     `["A|calls|B"]`,
+			expected: []string{"A|calls|B"},
+		},
+		{
+			name:     "multiple evidence keys",
+			json:     `["A|calls|B", "C|imports|D", "E|extends|F"]`,
+			expected: []string{"A|calls|B", "C|imports|D", "E|extends|F"},
+		},
+		{
+			name:     "empty array",
+			json:     `[]`,
+			expected: []string{},
+		},
+		{
+			name:     "keys with special characters",
+			json:     `["pkg/foo|imports|pkg/bar", "test:path|depends|other:path"]`,
+			expected: []string{"pkg/foo|imports|pkg/bar", "test:path|depends|other:path"},
+		},
+		{
+			name:     "keys with empty source or target allowed",
+			json:     `["|predicate|target", "source|predicate|"]`,
+			expected: []string{"|predicate|target", "source|predicate|"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := unmarshalAndValidateEvidence(tc.json)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(result) != len(tc.expected) {
+				t.Fatalf("expected %d elements, got %d", len(tc.expected), len(result))
+			}
+			for i, expected := range tc.expected {
+				if result[i] != expected {
+					t.Errorf("element %d: expected %q, got %q", i, expected, result[i])
+				}
+			}
+		})
+	}
+}
+
+func TestUnmarshalAndValidateEvidence_InvalidJSON(t *testing.T) {
+	testCases := []struct {
+		name        string
+		json        string
+		errContains string
+	}{
+		{
+			name:        "empty string",
+			json:        "",
+			errContains: "empty evidence JSON",
+		},
+		{
+			name:        "malformed JSON - missing bracket",
+			json:        `["A|calls|B"`,
+			errContains: "malformed JSON",
+		},
+		{
+			name:        "malformed JSON - not an array",
+			json:        `{"key": "value"}`,
+			errContains: "malformed JSON",
+		},
+		{
+			name:        "malformed JSON - wrong type in array",
+			json:        `[123, 456]`,
+			errContains: "malformed JSON",
+		},
+		{
+			name:        "malformed JSON - null value",
+			json:        `null`,
+			errContains: "malformed JSON",
+		},
+		{
+			name:        "malformed JSON - plain string",
+			json:        `"A|calls|B"`,
+			errContains: "malformed JSON",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unmarshalAndValidateEvidence(tc.json)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, ErrInvalidEvidence) {
+				t.Errorf("error should wrap ErrInvalidEvidence, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("error should contain %q, got: %v", tc.errContains, err)
+			}
+		})
+	}
+}
+
+func TestUnmarshalAndValidateEvidence_InvalidFormat(t *testing.T) {
+	testCases := []struct {
+		name        string
+		json        string
+		errContains string
+	}{
+		{
+			name:        "empty key in array",
+			json:        `["A|calls|B", "", "C|imports|D"]`,
+			errContains: "evidence[1] is empty",
+		},
+		{
+			name:        "missing delimiters",
+			json:        `["no-delimiters"]`,
+			errContains: "evidence[0] has invalid format",
+		},
+		{
+			name:        "too few parts",
+			json:        `["A|B"]`,
+			errContains: "evidence[0] has invalid format",
+		},
+		{
+			name:        "too many parts",
+			json:        `["A|B|C|D"]`,
+			errContains: "evidence[0] has invalid format",
+		},
+		{
+			name:        "empty predicate",
+			json:        `["source||target"]`,
+			errContains: "evidence[0] has empty predicate",
+		},
+		{
+			name:        "second key has empty predicate",
+			json:        `["A|calls|B", "X||Y"]`,
+			errContains: "evidence[1] has empty predicate",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unmarshalAndValidateEvidence(tc.json)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, ErrInvalidEvidence) {
+				t.Errorf("error should wrap ErrInvalidEvidence, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("error should contain %q, got: %v", tc.errContains, err)
+			}
+		})
+	}
+}
+
+func TestValidateEvidenceArray_Valid(t *testing.T) {
+	testCases := []struct {
+		name     string
+		evidence []string
+	}{
+		{
+			name:     "single valid key",
+			evidence: []string{"A|calls|B"},
+		},
+		{
+			name:     "multiple valid keys",
+			evidence: []string{"A|calls|B", "C|imports|D"},
+		},
+		{
+			name:     "empty array",
+			evidence: []string{},
+		},
+		{
+			name:     "keys with empty source allowed",
+			evidence: []string{"|predicate|target"},
+		},
+		{
+			name:     "keys with empty target allowed",
+			evidence: []string{"source|predicate|"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateEvidenceArray(tc.evidence)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateEvidenceArray_Invalid(t *testing.T) {
+	testCases := []struct {
+		name        string
+		evidence    []string
+		errContains string
+	}{
+		{
+			name:        "empty string in array",
+			evidence:    []string{"A|calls|B", ""},
+			errContains: "evidence[1] is empty",
+		},
+		{
+			name:        "key without delimiters",
+			evidence:    []string{"invalid"},
+			errContains: "evidence[0] has invalid format",
+		},
+		{
+			name:        "key with empty predicate",
+			evidence:    []string{"source||target"},
+			errContains: "evidence[0] has empty predicate",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateEvidenceArray(tc.evidence)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !errors.Is(err, ErrInvalidEvidence) {
+				t.Errorf("error should wrap ErrInvalidEvidence, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("error should contain %q, got: %v", tc.errContains, err)
+			}
+		})
+	}
+}
+
+func TestScanSingleRecord_InvalidEvidenceJSON(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Insert a record with invalid evidence JSON directly
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO materialized_edges (rule_id, edge_key, evidence_json, derived_at)
+		VALUES (?, ?, ?, ?)
+	`, "rule1", "A|calls|B", "not-valid-json", time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("failed to insert test record: %v", err)
+	}
+
+	manager := NewMaterializationManager(db)
+
+	// Try to retrieve - should fail with validation error
+	_, err = manager.GetMaterializedEdges(ctx, "rule1")
+	if err == nil {
+		t.Fatal("expected error from invalid evidence JSON")
+	}
+	if !errors.Is(err, ErrInvalidEvidence) {
+		t.Errorf("error should wrap ErrInvalidEvidence, got: %v", err)
+	}
+}
+
+func TestScanSingleRecord_EmptyEvidenceJSON(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Insert a record with empty evidence JSON
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO materialized_edges (rule_id, edge_key, evidence_json, derived_at)
+		VALUES (?, ?, ?, ?)
+	`, "rule1", "A|calls|B", "", time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("failed to insert test record: %v", err)
+	}
+
+	manager := NewMaterializationManager(db)
+
+	// Try to retrieve - should fail with validation error
+	_, err = manager.GetMaterializedEdges(ctx, "rule1")
+	if err == nil {
+		t.Fatal("expected error from empty evidence JSON")
+	}
+	if !errors.Is(err, ErrInvalidEvidence) {
+		t.Errorf("error should wrap ErrInvalidEvidence, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "empty evidence JSON") {
+		t.Errorf("error should mention empty evidence JSON: %v", err)
+	}
+}
+
+func TestScanSingleRecord_MalformedEvidenceKeys(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Insert a record with evidence containing malformed keys
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO materialized_edges (rule_id, edge_key, evidence_json, derived_at)
+		VALUES (?, ?, ?, ?)
+	`, "rule1", "A|calls|B", `["invalid-key-format"]`, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("failed to insert test record: %v", err)
+	}
+
+	manager := NewMaterializationManager(db)
+
+	// Try to retrieve - should fail with validation error
+	_, err = manager.GetMaterializedEdges(ctx, "rule1")
+	if err == nil {
+		t.Fatal("expected error from malformed evidence key")
+	}
+	if !errors.Is(err, ErrInvalidEvidence) {
+		t.Errorf("error should wrap ErrInvalidEvidence, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid format") {
+		t.Errorf("error should mention invalid format: %v", err)
+	}
+}
+
+func TestScanSingleRecord_ValidEvidencePassesValidation(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Use normal Materialize which stores valid evidence
+	result := InferenceResult{
+		DerivedEdge: DerivedEdge{
+			SourceID: "A",
+			EdgeType: "calls",
+			TargetID: "B",
+		},
+		RuleID: "rule1",
+		Evidence: []EvidenceEdge{
+			{SourceID: "X", EdgeType: "depends", TargetID: "Y"},
+			{SourceID: "M", EdgeType: "imports", TargetID: "N"},
+		},
+		DerivedAt:  time.Now(),
+		Confidence: 1.0,
+	}
+
+	if err := manager.Materialize(ctx, []InferenceResult{result}); err != nil {
+		t.Fatalf("Materialize failed: %v", err)
+	}
+
+	// Retrieve - should pass validation
+	edges, err := manager.GetMaterializedEdges(ctx, "rule1")
+	if err != nil {
+		t.Fatalf("GetMaterializedEdges failed: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("expected 1 edge, got %d", len(edges))
+	}
+	if len(edges[0].Evidence) != 2 {
+		t.Errorf("expected 2 evidence keys, got %d", len(edges[0].Evidence))
+	}
+}
+
+func TestErrInvalidEvidence_Sentinel(t *testing.T) {
+	// Test that ErrInvalidEvidence can be used as a sentinel error
+	err := fmt.Errorf("%w: test error", ErrInvalidEvidence)
+	if !errors.Is(err, ErrInvalidEvidence) {
+		t.Error("wrapped error should match ErrInvalidEvidence sentinel")
+	}
 }

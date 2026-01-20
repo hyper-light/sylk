@@ -115,6 +115,16 @@ func (e *InferenceEngine) SetEdgeProvider(provider ExtendedEdgeProvider) {
 	)
 }
 
+// requireEdgeProvider validates that an edge provider has been set.
+// Returns ErrEdgeProviderRequired if the edge provider is nil.
+// Must be called while holding the lock (read or write).
+func (e *InferenceEngine) requireEdgeProvider() error {
+	if e.edgeProvider == nil {
+		return ErrEdgeProviderRequired
+	}
+	return nil
+}
+
 // =============================================================================
 // Semi-Naive Evaluation Configuration (SNE.12)
 // =============================================================================
@@ -174,6 +184,7 @@ func (e *InferenceEngine) getActiveForwardChainer() ForwardChainerInterface {
 // RunInference performs a full forward chaining pass over all enabled rules.
 // It retrieves all edges from the edge provider, evaluates all enabled rules,
 // and materializes all derived edges.
+// Returns ErrEdgeProviderRequired if no edge provider has been set.
 func (e *InferenceEngine) RunInference(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -183,6 +194,11 @@ func (e *InferenceEngine) RunInference(ctx context.Context) error {
 		e.lastRunTime = startTime
 		e.lastRunDuration = time.Since(startTime)
 	}()
+
+	// Validate edge provider is set
+	if err := e.requireEdgeProvider(); err != nil {
+		return err
+	}
 
 	// Get all enabled rules
 	rules, err := e.ruleStore.GetEnabledRules(ctx)
@@ -194,12 +210,9 @@ func (e *InferenceEngine) RunInference(ctx context.Context) error {
 	}
 
 	// Get all edges
-	var edges []Edge
-	if e.edgeProvider != nil {
-		edges, err = e.edgeProvider.GetAllEdges(ctx)
-		if err != nil {
-			return fmt.Errorf("get all edges: %w", err)
-		}
+	edges, err := e.edgeProvider.GetAllEdges(ctx)
+	if err != nil {
+		return fmt.Errorf("get all edges: %w", err)
 	}
 	if len(edges) == 0 {
 		return nil // No edges to process
@@ -228,9 +241,15 @@ func (e *InferenceEngine) RunInference(ctx context.Context) error {
 
 // OnEdgeAdded performs incremental inference when a new edge is added.
 // It only evaluates rules whose body might match the new edge.
+// Returns ErrEdgeProviderRequired if no edge provider has been set.
 func (e *InferenceEngine) OnEdgeAdded(ctx context.Context, edge Edge) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Validate edge provider is set
+	if err := e.requireEdgeProvider(); err != nil {
+		return err
+	}
 
 	// Get all enabled rules
 	rules, err := e.ruleStore.GetEnabledRules(ctx)
@@ -248,14 +267,9 @@ func (e *InferenceEngine) OnEdgeAdded(ctx context.Context, edge Edge) error {
 	}
 
 	// Get all current edges including the new one
-	var edges []Edge
-	if e.edgeProvider != nil {
-		edges, err = e.edgeProvider.GetAllEdges(ctx)
-		if err != nil {
-			return fmt.Errorf("get all edges: %w", err)
-		}
-	} else {
-		edges = []Edge{edge}
+	edges, err := e.edgeProvider.GetAllEdges(ctx)
+	if err != nil {
+		return fmt.Errorf("get all edges: %w", err)
 	}
 
 	// Run forward chaining with relevant rules only using the active forward chainer
@@ -334,9 +348,15 @@ func (e *InferenceEngine) OnEdgeRemoved(ctx context.Context, edge Edge) error {
 // It invalidates edges that depended on the old edge and then derives new edges.
 // The operation is atomic: edges are captured once at the start to ensure
 // consistent state throughout the entire operation.
+// Returns ErrEdgeProviderRequired if no edge provider has been set.
 func (e *InferenceEngine) OnEdgeModified(ctx context.Context, oldEdge, newEdge Edge) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Validate edge provider is set
+	if err := e.requireEdgeProvider(); err != nil {
+		return err
+	}
 
 	// Capture edge snapshot once at the start for atomic operation
 	edgeSnapshot, err := e.captureEdgeSnapshot(ctx)
@@ -571,6 +591,9 @@ func (e *InferenceEngine) GetDerivedEdges(ctx context.Context, nodeID string) ([
 
 // ErrInvalidEdgeKey is returned when an edge key cannot be parsed.
 var ErrInvalidEdgeKey = errors.New("invalid edge key")
+
+// ErrEdgeProviderRequired is returned when an operation requires an edge provider but none is set.
+var ErrEdgeProviderRequired = errors.New("edge provider required: call SetEdgeProvider before this operation")
 
 // ParseEdgeKey converts an edge key (source|predicate|target) back to an Edge.
 // Returns an error if the key is empty, malformed, or has missing required fields.

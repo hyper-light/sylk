@@ -2139,3 +2139,289 @@ func TestInferenceEngine_OnEdgeModified_OrderingGuarantee(t *testing.T) {
 		t.Logf("Note: %d derived edges remain for A", len(edges))
 	}
 }
+
+// =============================================================================
+// W4P.38: Edge Provider Not Set Validation Tests
+// =============================================================================
+
+func TestInferenceEngine_RunInference_NoEdgeProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	// Note: No edge provider set
+
+	ctx := context.Background()
+
+	// Add a rule
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// RunInference should return ErrEdgeProviderRequired
+	err := engine.RunInference(ctx)
+	if err == nil {
+		t.Fatal("expected error when edge provider not set")
+	}
+	if !errors.Is(err, ErrEdgeProviderRequired) {
+		t.Errorf("expected ErrEdgeProviderRequired, got: %v", err)
+	}
+}
+
+func TestInferenceEngine_OnEdgeAdded_NoEdgeProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	// Note: No edge provider set
+
+	ctx := context.Background()
+
+	// Add a rule
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// OnEdgeAdded should return ErrEdgeProviderRequired
+	err := engine.OnEdgeAdded(ctx, NewEdge("A", "calls", "B"))
+	if err == nil {
+		t.Fatal("expected error when edge provider not set")
+	}
+	if !errors.Is(err, ErrEdgeProviderRequired) {
+		t.Errorf("expected ErrEdgeProviderRequired, got: %v", err)
+	}
+}
+
+func TestInferenceEngine_OnEdgeModified_NoEdgeProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	// Note: No edge provider set
+
+	ctx := context.Background()
+
+	// OnEdgeModified should return ErrEdgeProviderRequired
+	err := engine.OnEdgeModified(ctx, NewEdge("A", "calls", "B"), NewEdge("A", "calls", "C"))
+	if err == nil {
+		t.Fatal("expected error when edge provider not set")
+	}
+	if !errors.Is(err, ErrEdgeProviderRequired) {
+		t.Errorf("expected ErrEdgeProviderRequired, got: %v", err)
+	}
+}
+
+func TestInferenceEngine_RunInference_WithEdgeProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	// Add a rule
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// RunInference should succeed with edge provider set
+	err := engine.RunInference(ctx)
+	if err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	// Verify inference worked
+	stats := engine.Stats()
+	if stats.MaterializedEdges != 1 {
+		t.Errorf("expected 1 materialized edge, got %d", stats.MaterializedEdges)
+	}
+}
+
+func TestInferenceEngine_OnEdgeAdded_WithEdgeProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	// Add a rule
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Add the completing edge
+	provider.AddEdge(NewEdge("B", "calls", "C"))
+
+	// OnEdgeAdded should succeed with edge provider set
+	err := engine.OnEdgeAdded(ctx, NewEdge("B", "calls", "C"))
+	if err != nil {
+		t.Fatalf("OnEdgeAdded failed: %v", err)
+	}
+
+	// Verify inference worked
+	stats := engine.Stats()
+	if stats.MaterializedEdges != 1 {
+		t.Errorf("expected 1 materialized edge, got %d", stats.MaterializedEdges)
+	}
+}
+
+func TestInferenceEngine_OnEdgeModified_WithEdgeProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	// Add a rule and run initial inference
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+	if err := engine.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	// Verify initial state
+	stats := engine.Stats()
+	if stats.MaterializedEdges != 1 {
+		t.Fatalf("expected 1 materialized edge before modification, got %d", stats.MaterializedEdges)
+	}
+
+	// Modify an edge
+	provider.RemoveEdge("A|calls|B")
+	provider.AddEdge(NewEdge("A", "calls", "D"))
+
+	// OnEdgeModified should succeed with edge provider set
+	err := engine.OnEdgeModified(ctx, NewEdge("A", "calls", "B"), NewEdge("A", "calls", "D"))
+	if err != nil {
+		t.Fatalf("OnEdgeModified failed: %v", err)
+	}
+}
+
+func TestInferenceEngine_ErrEdgeProviderRequired_Message(t *testing.T) {
+	// Verify the error message is clear and helpful
+	errMsg := ErrEdgeProviderRequired.Error()
+	if !containsString(errMsg, "edge provider required") {
+		t.Errorf("error message should mention 'edge provider required': %s", errMsg)
+	}
+	if !containsString(errMsg, "SetEdgeProvider") {
+		t.Errorf("error message should mention 'SetEdgeProvider': %s", errMsg)
+	}
+}
+
+func TestInferenceEngine_RequireEdgeProvider_NilProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	// Note: No edge provider set
+
+	// Access the private method via reflection isn't idiomatic,
+	// so we test through the public methods instead.
+	// This test verifies the behavior transitively through RunInference.
+
+	ctx := context.Background()
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	err := engine.RunInference(ctx)
+	if !errors.Is(err, ErrEdgeProviderRequired) {
+		t.Errorf("expected ErrEdgeProviderRequired, got: %v", err)
+	}
+}
+
+func TestInferenceEngine_RequireEdgeProvider_AfterSetProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	ctx := context.Background()
+
+	// First, verify error without provider
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	err := engine.RunInference(ctx)
+	if !errors.Is(err, ErrEdgeProviderRequired) {
+		t.Fatalf("expected ErrEdgeProviderRequired before setting provider, got: %v", err)
+	}
+
+	// Now set the provider
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	// Should succeed now
+	err = engine.RunInference(ctx)
+	if err != nil {
+		t.Fatalf("RunInference should succeed after setting provider: %v", err)
+	}
+}
+
+func TestInferenceEngine_OnEdgeRemoved_NoEdgeProvider_Allowed(t *testing.T) {
+	// OnEdgeRemoved doesn't require edge provider since it only
+	// invalidates existing materialized edges
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	// Note: No edge provider set
+
+	ctx := context.Background()
+
+	// OnEdgeRemoved should succeed even without edge provider
+	// (it only invalidates, doesn't need to fetch edges)
+	err := engine.OnEdgeRemoved(ctx, NewEdge("A", "calls", "B"))
+	if err != nil {
+		t.Fatalf("OnEdgeRemoved should not require edge provider: %v", err)
+	}
+}
+
+func TestInferenceEngine_CaptureEdgeSnapshot_NoProvider_EmptyResult(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	// Note: No edge provider set
+
+	ctx := context.Background()
+
+	// Direct test of captureEdgeSnapshot behavior with nil provider
+	// The method returns empty slice, not an error
+	snapshot, err := engine.captureEdgeSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("captureEdgeSnapshot failed: %v", err)
+	}
+	if snapshot == nil {
+		t.Error("expected non-nil empty slice, got nil")
+	}
+	if len(snapshot) != 0 {
+		t.Errorf("expected empty snapshot, got %d edges", len(snapshot))
+	}
+}

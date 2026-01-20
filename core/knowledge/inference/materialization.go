@@ -4,11 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
+
+// =============================================================================
+// Evidence Validation Errors (W4P.35)
+// =============================================================================
+
+// ErrInvalidEvidence is returned when evidence data fails validation.
+var ErrInvalidEvidence = errors.New("invalid evidence data")
 
 // =============================================================================
 // Retry Configuration and Dead-Letter Queue (W4P.20)
@@ -367,6 +376,7 @@ func (m *MaterializationManager) scanMaterializedEdges(rows *sql.Rows) ([]Materi
 }
 
 // scanSingleRecord scans a single row into a MaterializedEdgeRecord.
+// W4P.35: Added JSON schema validation after unmarshaling evidence data.
 func (m *MaterializationManager) scanSingleRecord(rows *sql.Rows) (MaterializedEdgeRecord, error) {
 	var record MaterializedEdgeRecord
 	var evidenceJSON string
@@ -377,9 +387,11 @@ func (m *MaterializationManager) scanSingleRecord(rows *sql.Rows) (MaterializedE
 		return MaterializedEdgeRecord{}, fmt.Errorf("scan row: %w", err)
 	}
 
-	if err := json.Unmarshal([]byte(evidenceJSON), &record.Evidence); err != nil {
-		return MaterializedEdgeRecord{}, fmt.Errorf("unmarshal evidence: %w", err)
+	evidence, err := unmarshalAndValidateEvidence(evidenceJSON)
+	if err != nil {
+		return MaterializedEdgeRecord{}, err
 	}
+	record.Evidence = evidence
 
 	derivedAt, err := time.Parse(time.RFC3339, derivedAtStr)
 	if err != nil {
@@ -388,6 +400,50 @@ func (m *MaterializationManager) scanSingleRecord(rows *sql.Rows) (MaterializedE
 	record.DerivedAt = derivedAt
 
 	return record, nil
+}
+
+// unmarshalAndValidateEvidence parses and validates evidence JSON data.
+// W4P.35: Provides schema validation and integrity checks for evidence arrays.
+// Returns ErrInvalidEvidence for malformed or invalid data.
+func unmarshalAndValidateEvidence(evidenceJSON string) ([]string, error) {
+	if evidenceJSON == "" {
+		return nil, fmt.Errorf("%w: empty evidence JSON", ErrInvalidEvidence)
+	}
+
+	// Check for JSON null (which is valid JSON but not a valid array)
+	trimmed := strings.TrimSpace(evidenceJSON)
+	if trimmed == "null" {
+		return nil, fmt.Errorf("%w: malformed JSON: expected array, got null", ErrInvalidEvidence)
+	}
+
+	var evidence []string
+	if err := json.Unmarshal([]byte(evidenceJSON), &evidence); err != nil {
+		return nil, fmt.Errorf("%w: malformed JSON: %v", ErrInvalidEvidence, err)
+	}
+
+	if err := validateEvidenceArray(evidence); err != nil {
+		return nil, err
+	}
+
+	return evidence, nil
+}
+
+// validateEvidenceArray checks integrity of deserialized evidence keys.
+// Each evidence key must be a non-empty string in the format "source|predicate|target".
+func validateEvidenceArray(evidence []string) error {
+	for i, key := range evidence {
+		if key == "" {
+			return fmt.Errorf("%w: evidence[%d] is empty", ErrInvalidEvidence, i)
+		}
+		parts := strings.Split(key, "|")
+		if len(parts) != 3 {
+			return fmt.Errorf("%w: evidence[%d] has invalid format (expected source|predicate|target): %q", ErrInvalidEvidence, i, key)
+		}
+		if parts[1] == "" {
+			return fmt.Errorf("%w: evidence[%d] has empty predicate: %q", ErrInvalidEvidence, i, key)
+		}
+	}
+	return nil
 }
 
 // DeleteMaterializedByRule removes all edges derived by a specific rule.
