@@ -522,3 +522,203 @@ func TestW12_14_Cancel_StressTest(t *testing.T) {
 
 	wg.Wait()
 }
+
+// =============================================================================
+// W12.15 - LLMGate Deadlock in waitForSpace Tests
+// =============================================================================
+
+// TestW12_15_WaitForSpace_NoDeadlock verifies no deadlock in waitForSpace when
+// using the block policy with concurrent Push and Pop operations.
+func TestW12_15_WaitForSpace_NoDeadlock(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      2,
+		RejectPolicy: RejectPolicyBlock,
+		BlockTimeout: 100 * time.Millisecond,
+	}
+	q := NewBoundedQueue(config)
+
+	// Fill the queue
+	q.Push(&LLMRequest{ID: "1"})
+	q.Push(&LLMRequest{ID: "2"})
+
+	// Start a goroutine that will try to push (and block)
+	pushDone := make(chan error)
+	go func() {
+		pushDone <- q.Push(&LLMRequest{ID: "3"})
+	}()
+
+	// Pop an item to make space
+	time.Sleep(20 * time.Millisecond)
+	popped := q.Pop()
+	if popped == nil {
+		t.Error("expected to pop an item")
+	}
+
+	// The push should now succeed
+	select {
+	case err := <-pushDone:
+		if err != nil {
+			t.Errorf("push should have succeeded, got error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("push did not complete - potential deadlock")
+	}
+}
+
+// TestW12_15_WaitForSpace_Timeout verifies timeout works correctly without deadlock.
+func TestW12_15_WaitForSpace_Timeout(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      1,
+		RejectPolicy: RejectPolicyBlock,
+		BlockTimeout: 50 * time.Millisecond,
+	}
+	q := NewBoundedQueue(config)
+
+	// Fill the queue
+	q.Push(&LLMRequest{ID: "1"})
+
+	// Try to push - should timeout
+	start := time.Now()
+	err := q.Push(&LLMRequest{ID: "2"})
+	elapsed := time.Since(start)
+
+	if err != ErrUserQueueFull {
+		t.Errorf("expected ErrUserQueueFull, got %v", err)
+	}
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("expected to block for ~50ms, blocked for %v", elapsed)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("timeout took too long: %v", elapsed)
+	}
+}
+
+// TestW12_15_WaitForSpace_CloseUnblocks verifies Close unblocks waiting pushers.
+func TestW12_15_WaitForSpace_CloseUnblocks(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      1,
+		RejectPolicy: RejectPolicyBlock,
+		BlockTimeout: 5 * time.Second,
+	}
+	q := NewBoundedQueue(config)
+
+	// Fill the queue
+	q.Push(&LLMRequest{ID: "1"})
+
+	// Start a goroutine that will block on push
+	pushDone := make(chan error)
+	go func() {
+		pushDone <- q.Push(&LLMRequest{ID: "2"})
+	}()
+
+	// Give time to start blocking
+	time.Sleep(20 * time.Millisecond)
+
+	// Close the queue
+	q.Close()
+
+	// The push should return with closed error
+	select {
+	case err := <-pushDone:
+		if err != ErrGateClosed {
+			t.Errorf("expected ErrGateClosed, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("push did not complete after close - potential deadlock")
+	}
+}
+
+// TestW12_15_WaitForSpace_ConcurrentPushPop stress tests concurrent push/pop.
+func TestW12_15_WaitForSpace_ConcurrentPushPop(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      5,
+		RejectPolicy: RejectPolicyBlock,
+		BlockTimeout: 100 * time.Millisecond,
+	}
+	q := NewBoundedQueue(config)
+
+	var wg sync.WaitGroup
+	var pushErrors atomic.Int32
+	var popCount atomic.Int32
+
+	// Start multiple pushers
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if err := q.Push(&LLMRequest{ID: "push"}); err != nil {
+				pushErrors.Add(1)
+			}
+		}(i)
+	}
+
+	// Start multiple poppers
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			time.Sleep(time.Duration(n%5) * time.Millisecond)
+			if q.Pop() != nil {
+				popCount.Add(1)
+			}
+		}(i)
+	}
+
+	// Wait with timeout to detect deadlock
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - no deadlock
+	case <-time.After(5 * time.Second):
+		t.Error("concurrent push/pop did not complete - potential deadlock")
+	}
+}
+
+// TestW12_15_TimedWakeup_CleanExit verifies timedWakeup goroutine exits cleanly.
+func TestW12_15_TimedWakeup_CleanExit(t *testing.T) {
+	config := BoundedQueueConfig{
+		MaxSize:      1,
+		RejectPolicy: RejectPolicyBlock,
+		BlockTimeout: time.Second,
+	}
+	q := NewBoundedQueue(config)
+
+	// Fill the queue
+	q.Push(&LLMRequest{ID: "1"})
+
+	// Start multiple pushers that will block
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			// Try to push, will block then timeout
+			q.Push(&LLMRequest{ID: "block"})
+		}(i)
+	}
+
+	// Give time to start blocking
+	time.Sleep(20 * time.Millisecond)
+
+	// Pop to unblock one
+	q.Pop()
+
+	// Wait for all to complete
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(3 * time.Second):
+		t.Error("pushers did not complete - goroutine leak or deadlock")
+	}
+}

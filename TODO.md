@@ -37248,7 +37248,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add mutex protection around cancel state modification                    ││
 │ │   SEVERITY: CRITICAL - Race condition                                           ││
 │ │                                                                                  ││
-│ │ [ ] W12.15 - LLMGate Deadlock in waitForSpace                                   ││
+│ │ [x] W12.15 - LLMGate Deadlock in waitForSpace                                   ││
 │ │   FILE: core/concurrency/llm_gate.go:244-251                                    ││
 │ │   ISSUE: Holds lock while waiting on channel, can deadlock                      ││
 │ │   FIX: Release lock before waiting, reacquire after                             ││
