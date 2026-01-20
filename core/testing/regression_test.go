@@ -89,8 +89,8 @@ func generateTestVector(dim int, seed float32) []float32 {
 	for i := range vec {
 		vec[i] = seed + float32(i)*0.01
 	}
-	hnsw.NormalizeVector(vec)
-	return vec
+	normalized, _ := hnsw.NormalizeVectorCopy(vec)
+	return normalized
 }
 
 // =============================================================================

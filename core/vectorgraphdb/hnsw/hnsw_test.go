@@ -213,6 +213,245 @@ func TestNormalizeZeroVector(t *testing.T) {
 	}
 }
 
+// W4P.18: Tests for NormalizeVectorCopy - safe copy-based normalization
+
+// TestNormalizeVectorCopyOriginalUnchanged verifies that the original vector
+// is not modified when using NormalizeVectorCopy.
+func TestNormalizeVectorCopyOriginalUnchanged(t *testing.T) {
+	original := []float32{3, 4, 0}
+	originalCopy := make([]float32, len(original))
+	copy(originalCopy, original)
+
+	normalized, mag := NormalizeVectorCopy(original)
+
+	// Original should be unchanged
+	for i := range original {
+		if original[i] != originalCopy[i] {
+			t.Errorf("Original vector modified at index %d: got %v, want %v",
+				i, original[i], originalCopy[i])
+		}
+	}
+
+	// Normalized should be correct
+	if math.Abs(mag-5.0) > 1e-6 {
+		t.Errorf("NormalizeVectorCopy returned magnitude %v, want 5.0", mag)
+	}
+
+	// Normalized copy should have unit length
+	normalizedMag := Magnitude(normalized)
+	if math.Abs(normalizedMag-1.0) > 1e-6 {
+		t.Errorf("Normalized vector magnitude = %v, want 1.0", normalizedMag)
+	}
+}
+
+// TestNormalizeVectorCopyReturnsNormalizedCopy verifies that the returned copy
+// is correctly normalized.
+func TestNormalizeVectorCopyReturnsNormalizedCopy(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       []float32
+		expectedMag float64
+	}{
+		{
+			name:        "3-4-5 triangle",
+			input:       []float32{3, 4, 0},
+			expectedMag: 5.0,
+		},
+		{
+			name:        "unit vector",
+			input:       []float32{1, 0, 0},
+			expectedMag: 1.0,
+		},
+		{
+			name:        "negative values",
+			input:       []float32{-3, -4, 0},
+			expectedMag: 5.0,
+		},
+		{
+			name:        "higher dimension",
+			input:       []float32{1, 2, 3, 4, 5},
+			expectedMag: math.Sqrt(1 + 4 + 9 + 16 + 25), // sqrt(55) ~= 7.416
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			normalized, mag := NormalizeVectorCopy(tt.input)
+
+			// Check magnitude returned
+			if math.Abs(mag-tt.expectedMag) > 1e-5 {
+				t.Errorf("Magnitude = %v, want %v", mag, tt.expectedMag)
+			}
+
+			// Check normalized vector has unit length
+			normalizedMag := Magnitude(normalized)
+			if math.Abs(normalizedMag-1.0) > 1e-6 {
+				t.Errorf("Normalized magnitude = %v, want 1.0", normalizedMag)
+			}
+
+			// Check direction is preserved (dot product should equal original magnitude)
+			dot := float64(DotProduct(tt.input, normalized))
+			if math.Abs(dot-tt.expectedMag) > 1e-5 {
+				t.Errorf("Direction not preserved: dot product = %v, want %v", dot, tt.expectedMag)
+			}
+		})
+	}
+}
+
+// TestNormalizeVectorCopyMultipleNormalizationsDontCompound verifies that
+// normalizing an already-normalized vector maintains unit length.
+func TestNormalizeVectorCopyMultipleNormalizationsDontCompound(t *testing.T) {
+	original := []float32{3, 4, 0}
+
+	// Normalize multiple times
+	v1, mag1 := NormalizeVectorCopy(original)
+	v2, mag2 := NormalizeVectorCopy(v1)
+	v3, mag3 := NormalizeVectorCopy(v2)
+
+	// First normalization should have original magnitude
+	if math.Abs(mag1-5.0) > 1e-6 {
+		t.Errorf("First normalization magnitude = %v, want 5.0", mag1)
+	}
+
+	// Subsequent normalizations should have magnitude ~1.0
+	if math.Abs(mag2-1.0) > 1e-6 {
+		t.Errorf("Second normalization magnitude = %v, want 1.0", mag2)
+	}
+	if math.Abs(mag3-1.0) > 1e-6 {
+		t.Errorf("Third normalization magnitude = %v, want 1.0", mag3)
+	}
+
+	// All normalized vectors should have unit length
+	for i, v := range [][]float32{v1, v2, v3} {
+		m := Magnitude(v)
+		if math.Abs(m-1.0) > 1e-6 {
+			t.Errorf("Normalized vector %d magnitude = %v, want 1.0", i+1, m)
+		}
+	}
+
+	// Original should remain unchanged
+	if original[0] != 3 || original[1] != 4 || original[2] != 0 {
+		t.Errorf("Original vector was modified: %v", original)
+	}
+}
+
+// TestNormalizeVectorCopyZeroVector verifies behavior with zero vector.
+func TestNormalizeVectorCopyZeroVector(t *testing.T) {
+	zero := []float32{0, 0, 0}
+	zeroCopy := make([]float32, len(zero))
+	copy(zeroCopy, zero)
+
+	normalized, mag := NormalizeVectorCopy(zero)
+
+	// Magnitude should be 0
+	if mag != 0 {
+		t.Errorf("Zero vector magnitude = %v, want 0", mag)
+	}
+
+	// Original should be unchanged
+	for i := range zero {
+		if zero[i] != zeroCopy[i] {
+			t.Errorf("Zero vector modified at index %d", i)
+		}
+	}
+
+	// Result should be a copy (same values as input since magnitude is 0)
+	if len(normalized) != len(zero) {
+		t.Errorf("Result length = %d, want %d", len(normalized), len(zero))
+	}
+	for i := range normalized {
+		if normalized[i] != zero[i] {
+			t.Errorf("Result[%d] = %v, want %v", i, normalized[i], zero[i])
+		}
+	}
+}
+
+// TestNormalizeVectorCopyConcurrentSafety verifies that concurrent normalizations
+// of the same vector are safe.
+func TestNormalizeVectorCopyConcurrentSafety(t *testing.T) {
+	// Shared vector that will be normalized concurrently
+	shared := []float32{3, 4, 0, 0, 0, 0, 0, 0}
+	sharedCopy := make([]float32, len(shared))
+	copy(sharedCopy, shared)
+
+	var wg sync.WaitGroup
+	numGoroutines := 100
+
+	// Store results to verify correctness
+	results := make([][]float32, numGoroutines)
+	magnitudes := make([]float64, numGoroutines)
+
+	// Launch concurrent normalizations
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx], magnitudes[idx] = NormalizeVectorCopy(shared)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify original is unchanged
+	for i := range shared {
+		if shared[i] != sharedCopy[i] {
+			t.Errorf("Shared vector modified at index %d: got %v, want %v",
+				i, shared[i], sharedCopy[i])
+		}
+	}
+
+	// Verify all results are correct
+	expectedMag := 5.0 // sqrt(9 + 16)
+	for i := 0; i < numGoroutines; i++ {
+		if math.Abs(magnitudes[i]-expectedMag) > 1e-6 {
+			t.Errorf("Goroutine %d: magnitude = %v, want %v", i, magnitudes[i], expectedMag)
+		}
+
+		resultMag := Magnitude(results[i])
+		if math.Abs(resultMag-1.0) > 1e-6 {
+			t.Errorf("Goroutine %d: result magnitude = %v, want 1.0", i, resultMag)
+		}
+	}
+}
+
+// TestNormalizeVectorCopyEmptyVector verifies behavior with empty vector.
+func TestNormalizeVectorCopyEmptyVector(t *testing.T) {
+	empty := []float32{}
+
+	normalized, mag := NormalizeVectorCopy(empty)
+
+	if mag != 0 {
+		t.Errorf("Empty vector magnitude = %v, want 0", mag)
+	}
+
+	if len(normalized) != 0 {
+		t.Errorf("Result length = %d, want 0", len(normalized))
+	}
+}
+
+// TestNormalizeVectorCopyResultIsIndependent verifies that modifying the result
+// does not affect the original vector.
+func TestNormalizeVectorCopyResultIsIndependent(t *testing.T) {
+	original := []float32{3, 4, 0}
+	originalCopy := make([]float32, len(original))
+	copy(originalCopy, original)
+
+	normalized, _ := NormalizeVectorCopy(original)
+
+	// Modify the result
+	for i := range normalized {
+		normalized[i] = 999.0
+	}
+
+	// Original should be unchanged
+	for i := range original {
+		if original[i] != originalCopy[i] {
+			t.Errorf("Original modified after result change at index %d: got %v, want %v",
+				i, original[i], originalCopy[i])
+		}
+	}
+}
+
 func TestIndexNew(t *testing.T) {
 	cfg := DefaultConfig()
 	idx := New(cfg)
