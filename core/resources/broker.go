@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/signal"
 )
 
@@ -25,12 +26,24 @@ type ResourceBroker struct {
 	closed    bool
 	stopCh    chan struct{}
 	done      chan struct{}
+
+	// scope is the optional GoroutineScope for tracking the deadlock detection goroutine.
+	// W12.33: Ensures proper goroutine lifecycle management.
+	scope *concurrency.GoroutineScope
+
+	// usesScope indicates whether the deadlock detector is managed by GoroutineScope.
+	// When true, Close() should not wait on done channel.
+	usesScope bool
 }
 
 type ResourceBrokerConfig struct {
 	AcquisitionTimeout time.Duration
 	DeadlockDetection  bool
 	DetectionInterval  time.Duration
+
+	// Scope is the optional GoroutineScope for tracking the deadlock detection goroutine.
+	// W12.33: When provided, the deadlock detector is tracked via GoroutineScope.
+	Scope *concurrency.GoroutineScope
 }
 
 func DefaultBrokerConfig() ResourceBrokerConfig {
@@ -78,13 +91,50 @@ func NewResourceBroker(
 		config:        config,
 		stopCh:        make(chan struct{}),
 		done:          make(chan struct{}),
+		scope:         config.Scope,
 	}
 
 	if config.DeadlockDetection {
-		go b.deadlockDetectionLoop()
+		b.startDeadlockDetector()
 	}
 
 	return b
+}
+
+// startDeadlockDetector starts the deadlock detection goroutine.
+// W12.33: Uses GoroutineScope when available for proper tracking.
+func (b *ResourceBroker) startDeadlockDetector() {
+	if b.scope != nil {
+		// Use GoroutineScope for tracked goroutine lifecycle
+		err := b.scope.Go("broker-deadlock-detector", b.config.DetectionInterval*10, b.deadlockDetectorWork)
+		if err != nil {
+			// Fallback to untracked if scope rejects (e.g., shutdown)
+			go b.deadlockDetectionLoop()
+		} else {
+			b.usesScope = true
+		}
+	} else {
+		// Fallback: untracked goroutine when no scope provided
+		go b.deadlockDetectionLoop()
+	}
+}
+
+// deadlockDetectorWork is the GoroutineScope-compatible work function.
+// It runs the deadlock detection loop and respects context cancellation.
+func (b *ResourceBroker) deadlockDetectorWork(ctx context.Context) error {
+	ticker := time.NewTicker(b.config.DetectionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.stopCh:
+			return nil
+		case <-ticker.C:
+			b.detectDeadlocks()
+		}
+	}
 }
 
 func (b *ResourceBroker) deadlockDetectionLoop() {
@@ -401,6 +451,7 @@ func (b *ResourceBroker) Close() error {
 		return nil
 	}
 	b.closed = true
+	usesScope := b.usesScope
 
 	for pipelineID, alloc := range b.allocations {
 		b.releaseHandles(b.filePool, alloc.FileHandles)
@@ -411,7 +462,10 @@ func (b *ResourceBroker) Close() error {
 	b.mu.Unlock()
 
 	close(b.stopCh)
-	if b.config.DeadlockDetection {
+
+	// W12.33: Only wait on done channel if not using GoroutineScope.
+	// When using scope, the goroutine lifecycle is managed by the scope.
+	if b.config.DeadlockDetection && !usesScope {
 		<-b.done
 	}
 

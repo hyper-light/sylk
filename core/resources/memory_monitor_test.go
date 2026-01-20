@@ -1160,3 +1160,138 @@ func TestMemoryMonitor_CloseInterruptsMonitoring(t *testing.T) {
 		t.Error("expected some signals before close")
 	}
 }
+
+// =============================================================================
+// W12.32 - Race Condition Fix Tests
+// =============================================================================
+
+// TestMemoryMonitor_GlobalUsagePercent_RaceFree verifies GlobalUsagePercent
+// reads ceiling and usage atomically under the same lock.
+func TestMemoryMonitor_GlobalUsagePercent_RaceFree(t *testing.T) {
+	config := DefaultMemoryMonitorConfig()
+	config.MonitorInterval = 10 * time.Millisecond
+	monitor := NewMemoryMonitor(config)
+	defer monitor.Close()
+
+	var wg sync.WaitGroup
+	const goroutines = 10
+	const iterations = 500
+
+	// Concurrent reads of GlobalUsagePercent
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_ = monitor.GlobalUsagePercent()
+			}
+		}()
+	}
+
+	// Concurrent writes to usage
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				monitor.AddUsage(ComponentQueryCache, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	// Test passes if no race detected by -race flag
+}
+
+// TestMemoryMonitor_CanAllocate_RaceFree verifies CanAllocate
+// reads ceiling and usage atomically under the same lock.
+func TestMemoryMonitor_CanAllocate_RaceFree(t *testing.T) {
+	config := DefaultMemoryMonitorConfig()
+	config.MonitorInterval = 10 * time.Millisecond
+	monitor := NewMemoryMonitor(config)
+	defer monitor.Close()
+
+	var wg sync.WaitGroup
+	const goroutines = 10
+	const iterations = 500
+
+	// Concurrent reads via CanAllocate
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_ = monitor.CanAllocate(1024)
+			}
+		}()
+	}
+
+	// Concurrent writes to usage
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				monitor.AddUsage(ComponentStaging, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	// Test passes if no race detected by -race flag
+}
+
+// TestMemoryMonitor_GlobalUsagePercent_Consistency verifies GlobalUsagePercent
+// returns consistent values (not mixing old ceiling with new usage).
+func TestMemoryMonitor_GlobalUsagePercent_Consistency(t *testing.T) {
+	config := DefaultMemoryMonitorConfig()
+	config.MonitorInterval = 100 * time.Millisecond
+	monitor := NewMemoryMonitor(config)
+	defer monitor.Close()
+
+	// Get the ceiling
+	ceiling := monitor.GlobalCeiling()
+	if ceiling <= 0 {
+		t.Skip("ceiling not available")
+	}
+
+	// Add known usage
+	monitor.AddUsage(ComponentQueryCache, 1000)
+
+	// Verify percent is consistent with the values
+	percent := monitor.GlobalUsagePercent()
+	expectedPercent := float64(1000) / float64(ceiling)
+
+	// Allow small tolerance for floating point
+	if percent < expectedPercent*0.99 || percent > expectedPercent*1.01 {
+		t.Errorf("expected percent ~%f, got %f", expectedPercent, percent)
+	}
+}
+
+// TestMemoryMonitor_CanAllocate_Consistency verifies CanAllocate
+// returns correct results based on current state.
+func TestMemoryMonitor_CanAllocate_Consistency(t *testing.T) {
+	config := DefaultMemoryMonitorConfig()
+	config.MonitorInterval = 100 * time.Millisecond
+	monitor := NewMemoryMonitor(config)
+	defer monitor.Close()
+
+	// Should be able to allocate small amount initially
+	if !monitor.CanAllocate(1024) {
+		t.Error("expected to be able to allocate 1024 bytes")
+	}
+
+	// Add usage near ceiling
+	ceiling := monitor.GlobalCeiling()
+	monitor.AddUsage(ComponentQueryCache, ceiling-100)
+
+	// Should not be able to allocate more than remaining
+	if monitor.CanAllocate(200) {
+		t.Error("expected not to be able to allocate 200 bytes when near ceiling")
+	}
+
+	// Should be able to allocate small amount
+	if !monitor.CanAllocate(50) {
+		t.Error("expected to be able to allocate 50 bytes")
+	}
+}

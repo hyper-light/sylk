@@ -382,27 +382,29 @@ func (m *MemoryMonitor) GlobalCeiling() int64 {
 }
 
 // GlobalUsagePercent returns global usage as percentage of ceiling.
+// Reads both ceiling and usage atomically under the same lock.
 func (m *MemoryMonitor) GlobalUsagePercent() float64 {
 	m.mu.RLock()
-	ceiling := m.globalCeiling
-	m.mu.RUnlock()
+	defer m.mu.RUnlock()
 
+	ceiling := m.globalCeiling
 	if ceiling <= 0 {
 		return 0
 	}
-	return float64(m.GlobalUsage()) / float64(ceiling)
+	return float64(m.globalUsageLocked()) / float64(ceiling)
 }
 
 // CanAllocate checks if the requested bytes can be allocated without exceeding ceiling.
+// Reads both ceiling and usage atomically under the same lock.
 func (m *MemoryMonitor) CanAllocate(bytes int64) bool {
 	if bytes <= 0 {
 		return true
 	}
 	m.mu.RLock()
-	ceiling := m.globalCeiling
-	m.mu.RUnlock()
+	defer m.mu.RUnlock()
 
-	currentUsage := m.GlobalUsage()
+	ceiling := m.globalCeiling
+	currentUsage := m.globalUsageLocked()
 	return currentUsage+bytes <= ceiling
 }
 

@@ -37384,13 +37384,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1C - RESOURCE MANAGEMENT (3 HIGH)                                         ││
 │ │                                                                                  ││
-│ │ [ ] W12.32 - MemoryMonitor Race in GlobalUsage                                  ││
+│ │ [x] W12.32 - MemoryMonitor Race in GlobalUsage                                  ││
 │ │   FILE: core/resources/memory_monitor.go:357-366                                ││
 │ │   ISSUE: GlobalUsage reads stats without synchronization                        ││
 │ │   FIX: Add read lock for stats access                                           ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.33 - Broker Untracked Deadlock Detection Goroutine                      ││
+│ │ [x] W12.33 - Broker Untracked Deadlock Detection Goroutine                      ││
 │ │   FILE: core/resources/broker.go:84                                             ││
 │ │   ISSUE: Deadlock detection goroutine not tracked                               ││
 │ │   FIX: Use GoroutineScope for deadlock detector                                 ││

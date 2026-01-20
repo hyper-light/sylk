@@ -3,8 +3,11 @@ package resources
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 func newTestBroker(t *testing.T) *ResourceBroker {
@@ -445,4 +448,168 @@ func TestResourceBroker_NoDeadlockDetection(t *testing.T) {
 	if err != nil {
 		t.Errorf("Close failed: %v", err)
 	}
+}
+
+// =============================================================================
+// W12.33 - GoroutineScope Tracking Tests
+// =============================================================================
+
+// newTestBrokerWithScope creates a broker with GoroutineScope for testing.
+func newTestBrokerWithScope(t *testing.T) (*ResourceBroker, *concurrency.GoroutineScope) {
+	t.Helper()
+
+	pressureLevel := new(atomic.Int32)
+	budget := concurrency.NewGoroutineBudget(pressureLevel)
+	budget.RegisterAgent("broker-test", "tester")
+
+	scope := concurrency.NewGoroutineScope(context.Background(), "broker-test", budget)
+
+	config := DefaultBrokerConfig()
+	config.DeadlockDetection = true
+	config.DetectionInterval = 50 * time.Millisecond
+	config.Scope = scope
+
+	broker := NewResourceBroker(nil, nil, nil, nil, nil, nil, config)
+
+	t.Cleanup(func() {
+		_ = scope.Shutdown(100*time.Millisecond, 200*time.Millisecond)
+	})
+
+	return broker, scope
+}
+
+// TestResourceBroker_DeadlockDetector_WithScope verifies the deadlock detector
+// is tracked via GoroutineScope when provided.
+func TestResourceBroker_DeadlockDetector_WithScope(t *testing.T) {
+	broker, scope := newTestBrokerWithScope(t)
+
+	// Give time for the goroutine to start
+	time.Sleep(20 * time.Millisecond)
+
+	// Verify the goroutine is tracked
+	workerCount := scope.WorkerCount()
+	if workerCount != 1 {
+		t.Errorf("expected 1 tracked worker, got %d", workerCount)
+	}
+
+	// Close the broker
+	err := broker.Close()
+	if err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+
+	// Give time for cleanup
+	time.Sleep(20 * time.Millisecond)
+
+	// Verify the goroutine is cleaned up
+	workerCount = scope.WorkerCount()
+	if workerCount != 0 {
+		t.Errorf("expected 0 workers after close, got %d", workerCount)
+	}
+}
+
+// TestResourceBroker_DeadlockDetector_Runs verifies the deadlock detector
+// actually runs and detects cycles.
+func TestResourceBroker_DeadlockDetector_Runs(t *testing.T) {
+	broker, _ := newTestBrokerWithScope(t)
+	defer broker.Close()
+
+	// Add a cycle
+	broker.AddWaitEdge("A", "B")
+	broker.AddWaitEdge("B", "C")
+	broker.AddWaitEdge("C", "A")
+
+	// Wait for detection to run
+	time.Sleep(100 * time.Millisecond)
+
+	// The cycle should be detected (no crash)
+	stats := broker.Stats()
+	if stats.WaitGraphSize != 3 {
+		t.Errorf("expected wait graph size 3, got %d", stats.WaitGraphSize)
+	}
+}
+
+// TestResourceBroker_DeadlockDetector_WithoutScope verifies the deadlock detector
+// still works without GoroutineScope (fallback).
+func TestResourceBroker_DeadlockDetector_WithoutScope(t *testing.T) {
+	config := DefaultBrokerConfig()
+	config.DeadlockDetection = true
+	config.DetectionInterval = 50 * time.Millisecond
+	// No scope provided
+
+	broker := NewResourceBroker(nil, nil, nil, nil, nil, nil, config)
+	defer broker.Close()
+
+	// Add a cycle
+	broker.AddWaitEdge("X", "Y")
+	broker.AddWaitEdge("Y", "X")
+
+	// Wait for detection to run
+	time.Sleep(100 * time.Millisecond)
+
+	// Should work without crashing
+	stats := broker.Stats()
+	if stats.WaitGraphSize != 2 {
+		t.Errorf("expected wait graph size 2, got %d", stats.WaitGraphSize)
+	}
+}
+
+// TestResourceBroker_ScopeShutdown_StopsDetector verifies that when the scope
+// shuts down, the deadlock detector stops gracefully.
+func TestResourceBroker_ScopeShutdown_StopsDetector(t *testing.T) {
+	pressureLevel := new(atomic.Int32)
+	budget := concurrency.NewGoroutineBudget(pressureLevel)
+	budget.RegisterAgent("broker-shutdown-test", "tester")
+
+	scope := concurrency.NewGoroutineScope(context.Background(), "broker-shutdown-test", budget)
+
+	config := DefaultBrokerConfig()
+	config.DeadlockDetection = true
+	config.DetectionInterval = 50 * time.Millisecond
+	config.Scope = scope
+
+	broker := NewResourceBroker(nil, nil, nil, nil, nil, nil, config)
+
+	// Give time for the goroutine to start
+	time.Sleep(20 * time.Millisecond)
+
+	// Shutdown scope first (should stop the detector)
+	err := scope.Shutdown(100*time.Millisecond, 200*time.Millisecond)
+	if err != nil {
+		t.Errorf("scope shutdown failed: %v", err)
+	}
+
+	// Broker close should still work
+	err = broker.Close()
+	if err != nil {
+		t.Errorf("broker close failed: %v", err)
+	}
+}
+
+// TestResourceBroker_ConcurrentOpsWithScope verifies concurrent operations
+// work correctly with scope-tracked deadlock detector.
+func TestResourceBroker_ConcurrentOpsWithScope(t *testing.T) {
+	broker, _ := newTestBrokerWithScope(t)
+	defer broker.Close()
+
+	var wg sync.WaitGroup
+	const goroutines = 10
+	const iterations = 50
+
+	// Concurrent wait edge operations
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				waiter := string(rune('A' + (idx % 26)))
+				holder := string(rune('a' + (j % 26)))
+				broker.AddWaitEdge(waiter, holder)
+				broker.RemoveWaitEdge(waiter)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	// Test passes if no race detected by -race flag
 }
