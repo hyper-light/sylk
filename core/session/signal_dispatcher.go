@@ -235,25 +235,38 @@ func (d *CrossSessionSignalDispatcher) sendTargeted(signal CrossSessionSignal) e
 	return d.writeSignalFile(targetDir, signal)
 }
 
+// sendBroadcast sends a signal to all other sessions.
+// W12.6: Collects and returns errors from individual send attempts.
 func (d *CrossSessionSignalDispatcher) sendBroadcast(signal CrossSessionSignal) error {
 	entries, err := os.ReadDir(d.config.BaseDir)
 	if err != nil {
 		return fmt.Errorf("failed to read signal base dir: %w", err)
 	}
 
+	var errs []error
 	for _, entry := range entries {
-		d.sendToEntryIfValid(entry, signal)
+		if err := d.sendToEntryIfValid(entry, signal); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	return nil
 }
 
-func (d *CrossSessionSignalDispatcher) sendToEntryIfValid(entry os.DirEntry, signal CrossSessionSignal) {
+// sendToEntryIfValid sends a signal to a session directory if valid.
+// W12.6: Returns errors instead of swallowing them.
+func (d *CrossSessionSignalDispatcher) sendToEntryIfValid(entry os.DirEntry, signal CrossSessionSignal) error {
 	if !entry.IsDir() || entry.Name() == d.sessionID {
-		return
+		return nil
 	}
 	targetDir := filepath.Join(d.config.BaseDir, entry.Name())
-	d.writeSignalFile(targetDir, signal)
+	if err := d.writeSignalFile(targetDir, signal); err != nil {
+		return fmt.Errorf("failed to send signal to session %s: %w", entry.Name(), err)
+	}
+	return nil
 }
 
 func (d *CrossSessionSignalDispatcher) writeSignalFile(targetDir string, signal CrossSessionSignal) error {

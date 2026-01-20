@@ -65,6 +65,7 @@ type sessionBusStats struct {
 	messagesReceived    int64
 	subscriptionsActive int64
 	wildcardMatches     int64
+	wildcardDropped     int64 // Count of dropped wildcard messages due to backpressure
 }
 
 // SessionBusStats contains session bus statistics
@@ -74,6 +75,7 @@ type SessionBusStats struct {
 	MessagesReceived    int64  `json:"messages_received"`
 	SubscriptionsActive int64  `json:"subscriptions_active"`
 	WildcardMatches     int64  `json:"wildcard_matches"`
+	WildcardDropped     int64  `json:"wildcard_dropped"` // Messages dropped due to backpressure
 }
 
 // SessionBusConfig configures a session bus
@@ -343,6 +345,8 @@ func (sb *SessionBus) runWildcardHandlerWithScope(handler MessageHandler, msg *M
 			return nil
 		})
 	default:
+		// Semaphore full - track dropped message for observability
+		atomic.AddInt64(&sb.stats.wildcardDropped, 1)
 	}
 }
 
@@ -522,6 +526,7 @@ func (sb *SessionBus) Stats() SessionBusStats {
 		MessagesReceived:    atomic.LoadInt64(&sb.stats.messagesReceived),
 		SubscriptionsActive: atomic.LoadInt64(&sb.stats.subscriptionsActive),
 		WildcardMatches:     atomic.LoadInt64(&sb.stats.wildcardMatches),
+		WildcardDropped:     atomic.LoadInt64(&sb.stats.wildcardDropped),
 	}
 }
 

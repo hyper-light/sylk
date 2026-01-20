@@ -37219,7 +37219,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Restructure to release lock before calling other methods                 ││
 │ │   SEVERITY: CRITICAL - Deadlock                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W12.11 - HNSW Missing Bounds Check                                          ││
+│ │ [x] W12.11 - HNSW Missing Bounds Check                                          ││
 │ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:204-237                                 ││
 │ │   ISSUE: insertWithConnections doesn't validate neighbor indices                ││
 │ │   FIX: Add bounds validation before accessing neighbor data                     ││

@@ -214,15 +214,24 @@ func (h *Index) insertWithConnections(id string, vector []float32, mag float64, 
 	}
 	currDist := CosineDistance(vector, epVec, mag, epMag)
 
+	// W12.11: Bounds check for layer access during upper level traversal
 	for level := h.maxLevel; level > nodeLevel; level-- {
+		if !h.isValidLayerIndex(level) {
+			continue
+		}
 		currObj, currDist = h.greedySearchLayer(vector, mag, currObj, currDist, level)
 	}
 
+	// W12.11: Bounds check for layer access during connection phase
 	for level := min(nodeLevel, h.maxLevel); level >= 0; level-- {
+		if !h.isValidLayerIndex(level) {
+			continue
+		}
 		h.layers[level].addNode(id)
 		neighbors := h.searchLayer(vector, mag, currObj, h.efConstruct, level)
 		h.connectNode(id, neighbors, level)
-		if len(neighbors) > 0 {
+		// W12.11: Validate first neighbor before using it
+		if len(neighbors) > 0 && h.isValidNeighbor(neighbors[0].ID) {
 			currObj = neighbors[0].ID
 			// Use similarity from search result to compute distance
 			// (already using shared CosineDistance via CosineSimilarity)
@@ -236,7 +245,19 @@ func (h *Index) insertWithConnections(id string, vector []float32, mag float64, 
 	}
 }
 
+// isValidLayerIndex checks if a layer index is within bounds.
+// W12.11: Prevents panic on invalid layer access.
+// Caller must hold h.mu (read or write lock).
+func (h *Index) isValidLayerIndex(level int) bool {
+	return level >= 0 && level < len(h.layers)
+}
+
 func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, epDist float64, level int) (string, float64) {
+	// W12.11: Bounds check for layer access
+	if !h.isValidLayerIndex(level) {
+		return ep, epDist
+	}
+
 	changed := true
 	for changed {
 		changed = false
@@ -259,6 +280,11 @@ func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, 
 }
 
 func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int, level int) []SearchResult {
+	// W12.11: Bounds check for layer access
+	if !h.isValidLayerIndex(level) {
+		return nil
+	}
+
 	visited := make(map[string]bool)
 	visited[ep] = true
 
@@ -373,11 +399,23 @@ func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
 
 	for i := range min(len(neighbors), maxConn) {
 		neighbor := neighbors[i]
+		// W12.11: Bounds check - validate neighbor exists in index before connecting
+		if !h.isValidNeighbor(neighbor.ID) {
+			continue
+		}
 		// Convert similarity to distance (1 - similarity)
 		distance := float32(1.0 - neighbor.Similarity)
 		h.layers[level].addNeighbor(id, neighbor.ID, distance, maxConn)
 		h.layers[level].addNeighbor(neighbor.ID, id, distance, maxConn)
 	}
+}
+
+// isValidNeighbor checks if a neighbor ID is valid for connection.
+// W12.11: Validates neighbor exists in the index to prevent corrupt connections.
+// Caller must hold h.mu (read or write lock).
+func (h *Index) isValidNeighbor(neighborID string) bool {
+	_, exists := h.vectors[neighborID]
+	return exists
 }
 
 func (h *Index) Search(query []float32, k int, filter *SearchFilter) []SearchResult {

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 type patternSet struct {
@@ -18,13 +17,22 @@ type patternSet struct {
 	userFixable []*regexp.Regexp
 }
 
+// emptyPatternSet is the default pattern set used when none is configured.
+var emptyPatternSet = &patternSet{
+	transient:   make([]*regexp.Regexp, 0),
+	permanent:   make([]*regexp.Regexp, 0),
+	userFixable: make([]*regexp.Regexp, 0),
+}
+
+// ErrorClassifier classifies errors by tier using pattern matching and HTTP status codes.
 type ErrorClassifier struct {
-	patterns       unsafe.Pointer
+	patterns       atomic.Value // stores *patternSet
 	mu             sync.Mutex
 	rateLimitCodes []int
 	degradingCodes []int
 }
 
+// NewErrorClassifier creates a new ErrorClassifier with default configuration.
 func NewErrorClassifier() *ErrorClassifier {
 	ps := &patternSet{
 		transient:   make([]*regexp.Regexp, 0),
@@ -41,7 +49,7 @@ func NewErrorClassifier() *ErrorClassifier {
 			http.StatusServiceUnavailable,
 		},
 	}
-	atomic.StorePointer(&c.patterns, unsafe.Pointer(ps))
+	c.patterns.Store(ps)
 
 	sort.Ints(c.rateLimitCodes)
 	sort.Ints(c.degradingCodes)
@@ -79,7 +87,7 @@ func (c *ErrorClassifier) loadAllPatterns(cfg *ErrorClassifierConfig) error {
 		permanent:   append(ps.permanent, permanent...),
 		userFixable: append(ps.userFixable, userFixable...),
 	}
-	atomic.StorePointer(&c.patterns, unsafe.Pointer(newPS))
+	c.patterns.Store(newPS)
 	return nil
 }
 

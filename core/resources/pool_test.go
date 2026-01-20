@@ -844,3 +844,144 @@ func TestWaitForResource_RaceCondition(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// W12.8 - Pool Double Close Tests
+// =============================================================================
+
+// TestPool_DoubleClose verifies double close returns error without panic.
+func TestPool_DoubleClose(t *testing.T) {
+	cfg := DefaultResourcePoolConfig(10)
+	pool := NewResourcePool(ResourceTypeFile, cfg)
+
+	// First close should succeed
+	err := pool.Close()
+	if err != nil {
+		t.Errorf("first close should succeed, got %v", err)
+	}
+
+	// Second close should return ErrPoolClosed
+	err = pool.Close()
+	if err != ErrPoolClosed {
+		t.Errorf("second close should return ErrPoolClosed, got %v", err)
+	}
+
+	// Third close should also return ErrPoolClosed
+	err = pool.Close()
+	if err != ErrPoolClosed {
+		t.Errorf("third close should return ErrPoolClosed, got %v", err)
+	}
+}
+
+// TestPool_ConcurrentClose verifies concurrent closes don't panic.
+func TestPool_ConcurrentClose(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		cfg := DefaultResourcePoolConfig(10)
+		pool := NewResourcePool(ResourceTypeFile, cfg)
+
+		var wg sync.WaitGroup
+		errors := make(chan error, 10)
+
+		// Launch 10 concurrent close calls
+		for j := 0; j < 10; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errors <- pool.Close()
+			}()
+		}
+
+		wg.Wait()
+		close(errors)
+
+		// Exactly one should succeed (return nil)
+		successCount := 0
+		errorCount := 0
+		for err := range errors {
+			if err == nil {
+				successCount++
+			} else if err == ErrPoolClosed {
+				errorCount++
+			} else {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}
+
+		if successCount != 1 {
+			t.Errorf("iteration %d: expected exactly 1 success, got %d", i, successCount)
+		}
+		if errorCount != 9 {
+			t.Errorf("iteration %d: expected 9 ErrPoolClosed, got %d", i, errorCount)
+		}
+	}
+}
+
+// TestPool_CloseWithActiveHandles verifies close works with handles in use.
+func TestPool_CloseWithActiveHandles(t *testing.T) {
+	cfg := DefaultResourcePoolConfig(10)
+	pool := NewResourcePool(ResourceTypeFile, cfg)
+
+	ctx := context.Background()
+
+	// Acquire some handles
+	h1, _ := pool.AcquireUser(ctx)
+	h2, _ := pool.AcquirePipeline(ctx, 1)
+
+	// Close should succeed even with handles in use
+	err := pool.Close()
+	if err != nil {
+		t.Errorf("close should succeed, got %v", err)
+	}
+
+	// Handles acquired before close can still be released
+	err = pool.Release(h1)
+	if err != nil {
+		t.Errorf("release of handle acquired before close should succeed, got %v", err)
+	}
+
+	// After releasing, double release should fail
+	err = pool.Release(h1)
+	if err != ErrInvalidHandle {
+		t.Errorf("double release should return ErrInvalidHandle, got %v", err)
+	}
+
+	// New acquire after close should fail
+	_, err = pool.AcquireUser(ctx)
+	if err != ErrPoolClosed {
+		t.Errorf("acquire after close should return ErrPoolClosed, got %v", err)
+	}
+
+	_ = h2 // Release second handle
+	pool.Release(h2)
+}
+
+// TestPool_CloseWithWaitersNoPanic verifies close with waiters doesn't panic.
+func TestPool_CloseWithWaitersNoPanic(t *testing.T) {
+	cfg := ResourcePoolConfig{
+		Total:               1,
+		UserReservedPercent: 1.0,
+		PipelineTimeout:     5 * time.Second,
+	}
+	pool := NewResourcePool(ResourceTypeFile, cfg)
+
+	ctx := context.Background()
+
+	// Start multiple waiters
+	for i := 0; i < 5; i++ {
+		go func() {
+			pool.AcquirePipeline(ctx, 1)
+		}()
+	}
+
+	// Let waiters queue up
+	time.Sleep(50 * time.Millisecond)
+
+	// Close should not panic
+	err := pool.Close()
+	if err != nil {
+		t.Errorf("close should succeed, got %v", err)
+	}
+
+	// Give time for waiters to exit
+	time.Sleep(50 * time.Millisecond)
+}

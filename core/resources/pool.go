@@ -108,6 +108,7 @@ type ResourcePool struct {
 
 	signalBus *signal.SignalBus
 	closed    bool
+	closeOnce sync.Once
 }
 
 // NewResourcePool creates a new resource pool.
@@ -366,20 +367,35 @@ type PoolStats struct {
 }
 
 // Close shuts down the pool.
+// Safe to call multiple times - uses sync.Once to prevent double-close panic.
 func (p *ResourcePool) Close() error {
+	didClose := false
+
+	p.closeOnce.Do(func() {
+		didClose = true
+		p.doClose()
+	})
+
+	if !didClose {
+		return ErrPoolClosed
+	}
+	return nil
+}
+
+// doClose performs the actual close operation.
+func (p *ResourcePool) doClose() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.closed {
-		return ErrPoolClosed
-	}
-
 	p.closed = true
+	p.closeWaiters()
+}
 
+// closeWaiters closes all waiting request channels.
+// Must be called with mu held.
+func (p *ResourcePool) closeWaiters() {
 	for p.waitQueue.Len() > 0 {
 		req := heap.Pop(&p.waitQueue).(*waitRequest)
 		close(req.ready)
 	}
-
-	return nil
 }
