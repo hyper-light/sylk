@@ -47,7 +47,7 @@ func (m *mockEventBus) Subscribe(topic string, handler guide.MessageHandler) (gu
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.subscriptions[topic] = append(m.subscriptions[topic], handler)
-	return &mockSubscription{topic: topic, active: true}, nil
+	return newMockSubscription(topic), nil
 }
 
 func (m *mockEventBus) SubscribeAsync(topic string, handler guide.MessageHandler) (guide.Subscription, error) {
@@ -63,12 +63,18 @@ func (m *mockEventBus) Close() error {
 
 type mockSubscription struct {
 	topic  string
-	active bool
+	active atomic.Bool
+}
+
+func newMockSubscription(topic string) *mockSubscription {
+	s := &mockSubscription{topic: topic}
+	s.active.Store(true)
+	return s
 }
 
 func (s *mockSubscription) Topic() string      { return s.topic }
-func (s *mockSubscription) IsActive() bool     { return s.active }
-func (s *mockSubscription) Unsubscribe() error { s.active = false; return nil }
+func (s *mockSubscription) IsActive() bool     { return s.active.Load() }
+func (s *mockSubscription) Unsubscribe() error { s.active.Store(false); return nil }
 
 // =============================================================================
 // W12.2 Tests - Wildcard Handler Backpressure Tracking

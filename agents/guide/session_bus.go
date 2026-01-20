@@ -368,30 +368,42 @@ func (sb *SessionBus) wildcardTimeout() time.Duration {
 	return 5 * time.Second
 }
 
-// Close closes the session bus and all session-scoped subscriptions
+// Close closes the session bus and all session-scoped subscriptions.
+//
+// Lock ordering: sb.mu is released BEFORE calling underlying subscription.Unsubscribe().
+// This maintains consistent lock ordering with sessionSubscription.Unsubscribe() which
+// also calls underlying Unsubscribe() after releasing sb.mu.
+//
+// Order: sb.mu -> (release) -> underlying subscription
 func (sb *SessionBus) Close() error {
 	if sb.closed.Swap(true) {
 		return ErrSessionClosed
 	}
 
+	// Phase 1: Under lock, collect subscriptions and mark inactive
 	sb.mu.Lock()
-	defer sb.mu.Unlock()
-
-	// Unsubscribe all session subscriptions
-	for _, sub := range sb.subscriptions {
-		sb.unsubscribeLocked(sub)
-	}
+	subs := sb.subscriptions
 	sb.subscriptions = nil
+	for _, sub := range subs {
+		sb.markInactiveAndCleanup(sub)
+	}
+	sb.mu.Unlock()
+
+	// Phase 2: Without lock, close underlying subscriptions
+	// This prevents deadlock if underlying Unsubscribe() is blocking
+	for _, sub := range subs {
+		sb.closeUnderlyingSubscription(sub)
+	}
 
 	return nil
 }
 
-func (sb *SessionBus) unsubscribeLocked(sub *sessionSubscription) {
+// markInactiveAndCleanup marks a subscription as inactive, cleans up router, and updates stats.
+// Called while holding sb.mu. Does NOT call underlying subscription.Unsubscribe().
+func (sb *SessionBus) markInactiveAndCleanup(sub *sessionSubscription) {
 	if !sub.active.Swap(false) {
 		return
 	}
-
-	sb.closeUnderlyingSubscription(sub)
 	sb.closeRouterSubscription(sub)
 	atomic.AddInt64(&sb.stats.subscriptionsActive, -1)
 }
