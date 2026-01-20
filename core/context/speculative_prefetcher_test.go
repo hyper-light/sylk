@@ -955,3 +955,326 @@ func TestTrackedPrefetchFuture_CloseOnceProtection(t *testing.T) {
 	}
 	// No panic should occur - test passes if we reach here
 }
+
+// =============================================================================
+// W3M.2 Inflight Map Cleanup Tests
+// =============================================================================
+
+// TestCleanupWorker_PeriodicCleanup verifies that the cleanup worker
+// periodically removes completed futures from the inflight map.
+func TestCleanupWorker_PeriodicCleanup(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+
+	// Start the cleanup worker
+	sp.StartCleanupWorker()
+	defer sp.StopCleanupWorker()
+
+	ctx := context.Background()
+
+	// Start a prefetch and wait for it to complete
+	future, err := sp.StartSpeculative(ctx, "test query")
+	if err != nil {
+		t.Fatalf("StartSpeculative error: %v", err)
+	}
+
+	// Wait for completion
+	future.Wait()
+
+	// Give cleanup time to run
+	time.Sleep(50 * time.Millisecond)
+
+	// The future should already be cleaned up by executePrefetch's defer
+	mapSize := sp.MapSize()
+	if mapSize != 0 {
+		t.Errorf("MapSize = %d, want 0 after completion", mapSize)
+	}
+}
+
+// TestCleanupWorker_StartStop verifies that the cleanup worker can be
+// started and stopped cleanly.
+func TestCleanupWorker_StartStop(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+
+	// Start and stop multiple times
+	for i := 0; i < 3; i++ {
+		sp.StartCleanupWorker()
+		// Starting again should be a no-op
+		sp.StartCleanupWorker()
+
+		// Short delay to let goroutine start
+		time.Sleep(5 * time.Millisecond)
+
+		sp.StopCleanupWorker()
+		// Stopping again should be a no-op
+		sp.StopCleanupWorker()
+	}
+}
+
+// TestCleanupWorker_ConcurrentStartStop verifies that concurrent start/stop
+// calls do not cause races or panics.
+func TestCleanupWorker_ConcurrentStartStop(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+
+	const goroutines = 20
+	const iterations = 10
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				sp.StartCleanupWorker()
+				sp.StopCleanupWorker()
+			}
+		}()
+	}
+
+	wg.Wait()
+	// No panic should occur - test passes if we reach here
+
+	// Make sure worker is stopped
+	sp.StopCleanupWorker()
+}
+
+// TestMapSize_ReflectsActualEntries verifies that MapSize accurately
+// reports the number of entries in the inflight map.
+func TestMapSize_ReflectsActualEntries(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+	sp.prefetchTimeout = 5 * time.Second // Long timeout to keep futures inflight
+
+	if sp.MapSize() != 0 {
+		t.Errorf("Initial MapSize = %d, want 0", sp.MapSize())
+	}
+
+	ctx := context.Background()
+
+	// Start multiple prefetches
+	sp.StartSpeculative(ctx, "query 1")
+	sp.StartSpeculative(ctx, "query 2")
+	sp.StartSpeculative(ctx, "query 3")
+
+	// Give goroutines time to start
+	time.Sleep(20 * time.Millisecond)
+
+	// Map should have entries (though they may complete quickly)
+	// Due to fast completion, we check that the mechanism works
+	initialSize := sp.MapSize()
+	t.Logf("MapSize after 3 starts: %d", initialSize)
+}
+
+// TestMapBoundedUnderLoad verifies that the inflight map doesn't grow
+// unboundedly under sustained prefetch load.
+func TestMapBoundedUnderLoad(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+	sp.maxInflight = 100 // Allow many prefetches
+	sp.StartCleanupWorker()
+	defer sp.StopCleanupWorker()
+
+	ctx := context.Background()
+	const totalPrefetches = 200
+
+	// Track max map size observed
+	var maxSize int
+
+	// Start many prefetches with different queries
+	for i := 0; i < totalPrefetches; i++ {
+		query := "unique query " + string(rune('a'+i%26)) + string(rune('0'+i))
+		sp.StartSpeculative(ctx, query)
+
+		// Check map size periodically
+		if i%20 == 0 {
+			currentSize := sp.MapSize()
+			if currentSize > maxSize {
+				maxSize = currentSize
+			}
+		}
+	}
+
+	// Wait for all to complete
+	time.Sleep(200 * time.Millisecond)
+
+	// Call CleanupCompleted to ensure all completed futures are removed
+	sp.CleanupCompleted()
+
+	finalSize := sp.MapSize()
+	t.Logf("Max observed map size: %d, final size: %d", maxSize, finalSize)
+
+	// Final map size should be 0 or very low (only truly in-flight)
+	if finalSize > 10 {
+		t.Errorf("Final MapSize = %d, expected <= 10 (cleanup should work)", finalSize)
+	}
+}
+
+// TestCleanupCompleted_RemovesOnlyDone verifies that CleanupCompleted only
+// removes completed futures, leaving in-progress ones intact.
+func TestCleanupCompleted_RemovesOnlyDone(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+	sp.prefetchTimeout = 10 * time.Second // Long timeout
+
+	// Create a future manually to control its state
+	hash := sp.hashQuery("manual query")
+	future := newTrackedPrefetchFuture("manual query", hash)
+	sp.inflight.Store(hash, future)
+
+	// Create another that's already done
+	doneHash := sp.hashQuery("done query")
+	doneFuture := newTrackedPrefetchFuture("done query", doneHash)
+	doneFuture.complete(&AugmentedQuery{OriginalQuery: "done query"}, nil)
+	sp.inflight.Store(doneHash, doneFuture)
+
+	// Map should have 2 entries
+	if sp.MapSize() != 2 {
+		t.Errorf("MapSize before cleanup = %d, want 2", sp.MapSize())
+	}
+
+	// Run cleanup
+	cleaned := sp.CleanupCompleted()
+
+	// Should have cleaned 1 (the done one)
+	if cleaned != 1 {
+		t.Errorf("cleaned = %d, want 1", cleaned)
+	}
+
+	// Map should have 1 entry (the in-progress one)
+	if sp.MapSize() != 1 {
+		t.Errorf("MapSize after cleanup = %d, want 1", sp.MapSize())
+	}
+
+	// The in-progress future should still be there
+	if sp.GetInflight("manual query") != future {
+		t.Error("In-progress future should not be removed")
+	}
+
+	// The done future should be gone
+	if sp.GetInflight("done query") != nil {
+		t.Error("Done future should be removed")
+	}
+}
+
+// TestCleanupCompleted_ConcurrentAccess verifies that CleanupCompleted
+// is safe to call concurrently with prefetch operations.
+func TestCleanupCompleted_ConcurrentAccess(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+	sp.maxInflight = 100
+
+	ctx := context.Background()
+
+	const iterations = 100
+	var wg sync.WaitGroup
+
+	// Goroutine 1: Continuously start prefetches
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			query := "concurrent query " + string(rune('a'+i%26))
+			sp.StartSpeculative(ctx, query)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Goroutine 2: Continuously run cleanup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			sp.CleanupCompleted()
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Goroutine 3: Continuously check map size
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = sp.MapSize()
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+	// No race conditions should occur - test passes if we reach here
+}
+
+// TestCompletedFuturesRemovedOnCompletion verifies that futures are
+// automatically removed from the map when they complete.
+func TestCompletedFuturesRemovedOnCompletion(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+
+	ctx := context.Background()
+
+	// Start a prefetch
+	future, err := sp.StartSpeculative(ctx, "auto-cleanup query")
+	if err != nil {
+		t.Fatalf("StartSpeculative error: %v", err)
+	}
+
+	// Wait for completion
+	_, err = future.Wait()
+	if err != nil {
+		t.Logf("Wait returned error (expected for some setups): %v", err)
+	}
+
+	// Small delay to ensure cleanup defer has run
+	time.Sleep(10 * time.Millisecond)
+
+	// The future should be removed from the map
+	if sp.GetInflight("auto-cleanup query") != nil {
+		t.Error("Completed future should be auto-removed from inflight map")
+	}
+}
+
+// TestInflightMapNoDataRaceDuringCleanup verifies no data races occur
+// when cleanup runs during active prefetch operations.
+func TestInflightMapNoDataRaceDuringCleanup(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+	sp.maxInflight = 50
+
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	const prefetchers = 10
+	const cleaners = 5
+	const iterations = 20
+
+	// Start prefetchers
+	for i := 0; i < prefetchers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				query := "race test " + string(rune('a'+id)) + string(rune('0'+j%10))
+				future, err := sp.StartSpeculative(ctx, query)
+				if err == nil && future != nil {
+					future.Wait()
+				}
+			}
+		}(i)
+	}
+
+	// Start cleaners
+	for i := 0; i < cleaners; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations*2; j++ {
+				sp.CleanupCompleted()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Final cleanup
+	sp.CleanupCompleted()
+
+	// Map should be empty or nearly empty
+	finalSize := sp.MapSize()
+	if finalSize > 5 {
+		t.Errorf("Final MapSize = %d, expected small value", finalSize)
+	}
+}

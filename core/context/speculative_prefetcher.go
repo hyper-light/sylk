@@ -167,6 +167,12 @@ type SpeculativePrefetcher struct {
 	// inflightCount tracks the number of in-flight operations
 	inflightCount atomic.Int64
 
+	// cleanup worker control
+	cleanupStop   chan struct{}
+	cleanupDone   chan struct{}
+	cleanupOnce   sync.Once
+	cleanupStopMu sync.Mutex
+
 	// config
 	prefetchTimeout time.Duration
 	maxInflight     int
@@ -516,6 +522,17 @@ func (sp *SpeculativePrefetcher) InflightCount() int64 {
 	return sp.inflightCount.Load()
 }
 
+// MapSize returns the actual number of entries in the inflight map.
+// This is useful for testing to verify cleanup is working correctly.
+func (sp *SpeculativePrefetcher) MapSize() int {
+	var count int
+	sp.inflight.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
 // CancelAll cancels all in-flight prefetches.
 // Used during shutdown or pressure response.
 func (sp *SpeculativePrefetcher) CancelAll() {
@@ -528,4 +545,54 @@ func (sp *SpeculativePrefetcher) CancelAll() {
 		return true
 	})
 	sp.inflightCount.Store(0)
+}
+
+// StartCleanupWorker starts a background goroutine that periodically
+// removes completed futures from the inflight map.
+func (sp *SpeculativePrefetcher) StartCleanupWorker() {
+	sp.cleanupStopMu.Lock()
+	defer sp.cleanupStopMu.Unlock()
+
+	if sp.cleanupStop != nil {
+		return // Already running
+	}
+
+	stopChan := make(chan struct{})
+	doneChan := make(chan struct{})
+	sp.cleanupStop = stopChan
+	sp.cleanupDone = doneChan
+
+	go sp.runCleanupLoop(stopChan, doneChan)
+}
+
+func (sp *SpeculativePrefetcher) runCleanupLoop(stopChan, doneChan chan struct{}) {
+	ticker := time.NewTicker(CleanupInterval)
+	defer ticker.Stop()
+	defer close(doneChan)
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			sp.CleanupCompleted()
+		}
+	}
+}
+
+// StopCleanupWorker stops the background cleanup goroutine.
+func (sp *SpeculativePrefetcher) StopCleanupWorker() {
+	sp.cleanupStopMu.Lock()
+	stopChan := sp.cleanupStop
+	doneChan := sp.cleanupDone
+	sp.cleanupStop = nil
+	sp.cleanupDone = nil
+	sp.cleanupStopMu.Unlock()
+
+	if stopChan == nil {
+		return // Not running
+	}
+
+	close(stopChan)
+	<-doneChan
 }
