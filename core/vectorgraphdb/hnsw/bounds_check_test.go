@@ -122,12 +122,15 @@ func TestBoundsCheckPartialDataVectorMissing(t *testing.T) {
 }
 
 // TestBoundsCheckPartialDataMagnitudeMissing tests scenario where magnitude
-// is missing but vector might exist (simulated inconsistent state).
+// is missing but vector exists (simulated inconsistent state).
+// W4P.24: With magnitude validation, missing magnitudes are recomputed on demand.
+// Note: Cache is NOT updated during read operations to avoid data races.
 func TestBoundsCheckPartialDataMagnitudeMissing(t *testing.T) {
 	idx := New(DefaultConfig())
 
 	// Insert a node normally first
-	idx.Insert("node1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	vec := []float32{1, 0, 0}
+	idx.Insert("node1", vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
 	// Simulate inconsistent state: remove magnitude but keep vector
 	idx.mu.Lock()
@@ -135,11 +138,32 @@ func TestBoundsCheckPartialDataMagnitudeMissing(t *testing.T) {
 	idx.mu.Unlock()
 
 	idx.mu.RLock()
-	_, _, ok := idx.getVectorAndMagnitude("node1")
+	retrievedVec, mag, ok := idx.getVectorAndMagnitude("node1")
 	idx.mu.RUnlock()
 
-	if ok {
-		t.Error("getVectorAndMagnitude should return false when magnitude is missing")
+	// W4P.24: Missing magnitude should be recomputed, not cause failure
+	if !ok {
+		t.Error("getVectorAndMagnitude should return true and recompute magnitude when magnitude is missing")
+	}
+
+	// Verify the magnitude was correctly computed
+	expectedMag := Magnitude(vec)
+	if mag != expectedMag {
+		t.Errorf("Recomputed magnitude incorrect: got %v, expected %v", mag, expectedMag)
+	}
+
+	// Verify vector is returned
+	if retrievedVec == nil {
+		t.Error("Vector should be returned")
+	}
+
+	// Note: Cache is NOT populated during read to avoid data races
+	idx.mu.RLock()
+	_, exists := idx.magnitudes["node1"]
+	idx.mu.RUnlock()
+
+	if exists {
+		t.Error("Magnitude should NOT be cached during read operation")
 	}
 }
 
