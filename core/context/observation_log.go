@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -34,9 +35,10 @@ const DefaultFlushInterval = 100 * time.Millisecond
 // =============================================================================
 
 var (
-	ErrObservationLogClosed = errors.New("observation log is closed")
-	ErrInvalidObservation   = errors.New("invalid observation")
-	ErrWriteQueueFull       = errors.New("write queue is full")
+	ErrObservationLogClosed     = errors.New("observation log is closed")
+	ErrInvalidObservation       = errors.New("invalid observation")
+	ErrWriteQueueFull           = errors.New("write queue is full")
+	ErrWriteQueueRetryExhausted = errors.New("write queue retry attempts exhausted")
 )
 
 // DefaultWriteQueueSize is the default size of the async write queue.
@@ -52,6 +54,35 @@ const DefaultSyncFailureThreshold = 3
 // SyncHealthCallback is called when sync failures reach a threshold.
 // It receives the number of consecutive failures and the last error.
 type SyncHealthCallback func(consecutiveFailures int, lastError error)
+
+// =============================================================================
+// WriteQueue Backoff Configuration (W4N.6)
+// =============================================================================
+
+// WriteQueueBackoffConfig configures exponential backoff for write queue retries.
+type WriteQueueBackoffConfig struct {
+	// MaxRetries is the maximum number of retry attempts (0 means no retry, fail immediately).
+	MaxRetries int
+	// InitialDelay is the initial backoff delay before the first retry.
+	InitialDelay time.Duration
+	// MaxDelay caps the maximum backoff delay.
+	MaxDelay time.Duration
+	// Multiplier is the exponential backoff multiplier (default: 2.0).
+	Multiplier float64
+	// Timeout is the total timeout for all retries (0 means no timeout).
+	Timeout time.Duration
+}
+
+// DefaultWriteQueueBackoff returns the default backoff configuration.
+func DefaultWriteQueueBackoff() WriteQueueBackoffConfig {
+	return WriteQueueBackoffConfig{
+		MaxRetries:   5,
+		InitialDelay: 1 * time.Millisecond,
+		MaxDelay:     50 * time.Millisecond,
+		Multiplier:   2.0,
+		Timeout:      500 * time.Millisecond,
+	}
+}
 
 // =============================================================================
 // Logged Observation
@@ -112,6 +143,9 @@ type ObservationLog struct {
 	syncInterval    time.Duration
 	lastSync        time.Time
 
+	// Write queue backoff configuration (W4N.6)
+	backoffConfig WriteQueueBackoffConfig
+
 	// Sync health tracking (W4N.7)
 	consecutiveSyncFailures int
 	syncFailureThreshold    int
@@ -134,11 +168,12 @@ type ObservationLog struct {
 type ObservationLogConfig struct {
 	Path                 string
 	BufferSize           int
-	WriteQueueSize       int                // Size of async write queue (default: 1000)
-	SyncInterval         time.Duration      // Interval between fsync calls (default: 100ms)
-	SyncFailureThreshold int                // Consecutive failures before health callback (default: 3)
-	SyncHealthCallback   SyncHealthCallback // Optional callback for sync health issues
-	Logger               *slog.Logger       // Optional logger for sync errors
+	WriteQueueSize       int                      // Size of async write queue (default: 1000)
+	SyncInterval         time.Duration            // Interval between fsync calls (default: 100ms)
+	SyncFailureThreshold int                      // Consecutive failures before health callback (default: 3)
+	SyncHealthCallback   SyncHealthCallback       // Optional callback for sync health issues
+	Logger               *slog.Logger             // Optional logger for sync errors
+	BackoffConfig        *WriteQueueBackoffConfig // Optional backoff config for queue full retries (W4N.6)
 	Adaptive             *AdaptiveState
 	Scope                *concurrency.GoroutineScope
 }
@@ -163,6 +198,11 @@ func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*Obser
 		return nil, err
 	}
 
+	backoffCfg := DefaultWriteQueueBackoff()
+	if config.BackoffConfig != nil {
+		backoffCfg = *config.BackoffConfig
+	}
+
 	log := &ObservationLog{
 		path:                 config.Path,
 		file:                 file,
@@ -171,6 +211,7 @@ func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*Obser
 		writeDone:            make(chan struct{}),
 		syncInterval:         config.SyncInterval,
 		lastSync:             time.Now(),
+		backoffConfig:        backoffCfg,
 		syncFailureThreshold: config.SyncFailureThreshold,
 		syncHealthCallback:   config.SyncHealthCallback,
 		logger:               normalizeObsLogger(config.Logger),
@@ -451,8 +492,8 @@ func (l *ObservationLog) Record(ctx context.Context, obs *EpisodeObservation) er
 		return ErrInvalidObservation
 	}
 
-	// Write to WAL synchronously
-	if err := l.writeToWAL(obs); err != nil {
+	// Write to WAL synchronously with backoff retry
+	if err := l.writeToWAL(ctx, obs); err != nil {
 		return err
 	}
 
@@ -462,7 +503,7 @@ func (l *ObservationLog) Record(ctx context.Context, obs *EpisodeObservation) er
 	return nil
 }
 
-func (l *ObservationLog) writeToWAL(obs *EpisodeObservation) error {
+func (l *ObservationLog) writeToWAL(ctx context.Context, obs *EpisodeObservation) error {
 	// Step 1: Assign sequence under lock (fast)
 	l.mu.Lock()
 	seq := l.sequence + 1
@@ -470,6 +511,17 @@ func (l *ObservationLog) writeToWAL(obs *EpisodeObservation) error {
 	l.mu.Unlock()
 
 	// Step 2: Serialize outside lock (can be slow, doesn't block other operations)
+	data, err := l.serializeObservation(seq, obs)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: Queue for async write with backoff retry
+	return l.enqueueWithBackoff(ctx, data, seq)
+}
+
+// serializeObservation converts an observation to JSON bytes.
+func (l *ObservationLog) serializeObservation(seq uint64, obs *EpisodeObservation) ([]byte, error) {
 	logged := LoggedObservation{
 		Sequence:    seq,
 		Timestamp:   time.Now(),
@@ -479,24 +531,91 @@ func (l *ObservationLog) writeToWAL(obs *EpisodeObservation) error {
 
 	data, err := json.Marshal(logged)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	data = append(data, '\n')
+	return append(data, '\n'), nil
+}
 
-	// Step 3: Queue for async write
+// enqueueWithBackoff attempts to enqueue a write request with exponential backoff.
+func (l *ObservationLog) enqueueWithBackoff(ctx context.Context, data []byte, seq uint64) error {
 	req := &writeRequest{
 		data:     data,
 		sequence: seq,
 		resultCh: make(chan error, 1),
 	}
 
+	// Try immediate send first
+	if l.trySendRequest(req) {
+		return <-req.resultCh
+	}
+
+	// If no retries configured, return immediately
+	if l.backoffConfig.MaxRetries == 0 {
+		return ErrWriteQueueFull
+	}
+
+	// Apply exponential backoff retry
+	return l.retryWithBackoff(ctx, req)
+}
+
+// trySendRequest attempts a non-blocking send to the write queue.
+func (l *ObservationLog) trySendRequest(req *writeRequest) bool {
 	select {
 	case l.writeQueue <- req:
-		// Wait for write to complete to ensure durability
-		return <-req.resultCh
+		return true
 	default:
-		// Queue is full - apply backpressure
-		return ErrWriteQueueFull
+		return false
+	}
+}
+
+// retryWithBackoff retries sending the request with exponential backoff.
+func (l *ObservationLog) retryWithBackoff(ctx context.Context, req *writeRequest) error {
+	cfg := l.backoffConfig
+	startTime := time.Now()
+
+	for attempt := 0; attempt < cfg.MaxRetries; attempt++ {
+		delay := l.calculateBackoffDelay(attempt, cfg)
+
+		if cfg.Timeout > 0 && time.Since(startTime)+delay > cfg.Timeout {
+			return ErrWriteQueueRetryExhausted
+		}
+
+		if err := l.waitForBackoff(ctx, delay); err != nil {
+			return err
+		}
+
+		if l.trySendRequest(req) {
+			return <-req.resultCh
+		}
+	}
+
+	return ErrWriteQueueRetryExhausted
+}
+
+// calculateBackoffDelay computes the delay for a given attempt.
+func (l *ObservationLog) calculateBackoffDelay(attempt int, cfg WriteQueueBackoffConfig) time.Duration {
+	multiplier := cfg.Multiplier
+	if multiplier <= 0 {
+		multiplier = 2.0
+	}
+
+	delay := time.Duration(float64(cfg.InitialDelay) * math.Pow(multiplier, float64(attempt)))
+	if delay > cfg.MaxDelay {
+		delay = cfg.MaxDelay
+	}
+	return delay
+}
+
+// waitForBackoff waits for the specified delay, respecting context cancellation.
+func (l *ObservationLog) waitForBackoff(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
