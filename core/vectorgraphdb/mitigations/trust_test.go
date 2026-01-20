@@ -280,3 +280,101 @@ func TestTrustHierarchy_DetermineHistoryTrustLevel_Old(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, TrustRecentHistory, info.TrustLevel)
 }
+
+func TestClampTrustScore(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    float64
+		expected float64
+	}{
+		{"negative_clamped_to_zero", -0.5, 0.0},
+		{"zero_unchanged", 0.0, 0.0},
+		{"valid_low", 0.3, 0.3},
+		{"valid_mid", 0.5, 0.5},
+		{"valid_high", 0.9, 0.9},
+		{"one_unchanged", 1.0, 1.0},
+		{"above_one_clamped", 1.5, 1.0},
+		{"large_negative", -10.0, 0.0},
+		{"large_positive", 10.0, 1.0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := clampTrustScore(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestValidateTrustScore(t *testing.T) {
+	tests := []struct {
+		name      string
+		score     float64
+		field     string
+		wantError bool
+	}{
+		{"valid_zero", 0.0, "test", false},
+		{"valid_mid", 0.5, "test", false},
+		{"valid_one", 1.0, "test", false},
+		{"negative_invalid", -0.1, "base_score", true},
+		{"above_one_invalid", 1.1, "trust_score", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTrustScore(tt.score, tt.field)
+			if tt.wantError {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.field)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestTrustError_Unwrap(t *testing.T) {
+	innerErr := assert.AnError
+	trustErr := &TrustError{Op: "test", Field: "score", Value: 1.5, Err: innerErr}
+
+	assert.Equal(t, innerErr, trustErr.Unwrap())
+	assert.Contains(t, trustErr.Error(), "test")
+	assert.Contains(t, trustErr.Error(), "score")
+	assert.Contains(t, trustErr.Error(), "1.5")
+}
+
+func TestTrustError_NoField(t *testing.T) {
+	innerErr := assert.AnError
+	trustErr := &TrustError{Op: "compute", Err: innerErr}
+
+	msg := trustErr.Error()
+	assert.Contains(t, msg, "trust compute")
+	assert.NotContains(t, msg, "value")
+}
+
+func TestTrustHierarchy_ScoresBounded(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ns := vectorgraphdb.NewNodeStore(db, nil)
+	node := &vectorgraphdb.GraphNode{
+		ID:       "bounded-trust-node",
+		Domain:   vectorgraphdb.DomainCode,
+		NodeType: vectorgraphdb.NodeTypeFile,
+		Metadata: map[string]any{},
+	}
+	emb := makeTestEmbedding()
+	require.NoError(t, ns.InsertNode(node, emb))
+
+	trust := NewTrustHierarchy(db, nil, nil)
+
+	info, err := trust.GetTrustInfo("bounded-trust-node")
+
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, info.TrustScore, 0.0)
+	assert.LessOrEqual(t, info.TrustScore, 1.0)
+	assert.GreaterOrEqual(t, info.BaseScore, 0.0)
+	assert.LessOrEqual(t, info.BaseScore, 1.0)
+	assert.GreaterOrEqual(t, info.EffectiveScore, 0.0)
+	assert.LessOrEqual(t, info.EffectiveScore, 1.0)
+}

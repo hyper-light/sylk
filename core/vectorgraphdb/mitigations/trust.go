@@ -53,6 +53,49 @@ func (t *TrustHierarchy) GetTrustInfo(nodeID string) (*TrustInfo, error) {
 	return t.computeTrust(nodeID)
 }
 
+// TrustError represents an error during trust operations.
+type TrustError struct {
+	Op    string
+	Field string
+	Value float64
+	Err   error
+}
+
+func (e *TrustError) Error() string {
+	if e.Field != "" {
+		return fmt.Sprintf("trust %s: %s value %.4f: %v", e.Op, e.Field, e.Value, e.Err)
+	}
+	return fmt.Sprintf("trust %s: %v", e.Op, e.Err)
+}
+
+func (e *TrustError) Unwrap() error {
+	return e.Err
+}
+
+// clampTrustScore ensures a trust score is within valid bounds [0.0, 1.0].
+func clampTrustScore(score float64) float64 {
+	if score < 0.0 {
+		return 0.0
+	}
+	if score > 1.0 {
+		return 1.0
+	}
+	return score
+}
+
+// validateTrustScore returns an error if the score is outside [0.0, 1.0].
+func validateTrustScore(score float64, field string) error {
+	if score < 0.0 || score > 1.0 {
+		return &TrustError{
+			Op:    "validate",
+			Field: field,
+			Value: score,
+			Err:   fmt.Errorf("score must be between 0.0 and 1.0"),
+		}
+	}
+	return nil
+}
+
 func (t *TrustHierarchy) computeTrust(nodeID string) (*TrustInfo, error) {
 	ns := vectorgraphdb.NewNodeStore(t.db, nil)
 	node, err := ns.GetNode(nodeID)
@@ -63,11 +106,11 @@ func (t *TrustHierarchy) computeTrust(nodeID string) (*TrustInfo, error) {
 	info := &TrustInfo{NodeID: nodeID}
 
 	info.TrustLevel = t.determineTrustLevel(node)
-	info.BaseScore = info.TrustLevel.Score()
+	info.BaseScore = clampTrustScore(info.TrustLevel.Score())
 
-	info.FreshnessBoost = t.computeFreshnessBoost(nodeID)
-	info.VerifyBoost = t.computeVerifyBoost(nodeID)
-	info.CrossRefBoost = t.computeCrossRefBoost(nodeID)
+	info.FreshnessBoost = clampTrustScore(t.computeFreshnessBoost(nodeID))
+	info.VerifyBoost = clampTrustScore(t.computeVerifyBoost(nodeID))
+	info.CrossRefBoost = clampTrustScore(t.computeCrossRefBoost(nodeID))
 
 	info.TrustScore = t.combineScores(info)
 	info.EffectiveScore = info.TrustScore
@@ -209,10 +252,7 @@ func countUniqueSources(provs []*Provenance) int {
 func (t *TrustHierarchy) combineScores(info *TrustInfo) float64 {
 	score := info.BaseScore * info.FreshnessBoost * info.VerifyBoost
 	score += info.CrossRefBoost
-	if score > 1.0 {
-		return 1.0
-	}
-	return score
+	return clampTrustScore(score)
 }
 
 // ApplyTrust applies trust scores to search results.
