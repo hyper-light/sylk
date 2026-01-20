@@ -49,21 +49,23 @@ func NewEventDebouncer(window time.Duration) *EventDebouncer {
 }
 
 // ShouldSkip returns true if the event should be skipped because a duplicate
-// was seen within the debounce window.
+// was seen within the debounce window. Uses atomic check-and-record to prevent
+// TOCTOU race conditions.
 func (d *EventDebouncer) ShouldSkip(event *ActivityEvent) bool {
 	signature := d.signature(event)
 
-	d.mu.RLock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	lastSeen, exists := d.seen[signature]
-	d.mu.RUnlock()
 
 	if !exists {
-		d.recordEvent(signature)
+		d.seen[signature] = time.Now()
 		return false
 	}
 
 	if time.Since(lastSeen) > d.window {
-		d.recordEvent(signature)
+		d.seen[signature] = time.Now()
 		return false
 	}
 
@@ -73,13 +75,6 @@ func (d *EventDebouncer) ShouldSkip(event *ActivityEvent) bool {
 // signature generates a unique signature for an event based on its key attributes.
 func (d *EventDebouncer) signature(event *ActivityEvent) string {
 	return fmt.Sprintf("%s:%s:%s", event.EventType.String(), event.AgentID, event.SessionID)
-}
-
-// recordEvent records the current time for an event signature.
-func (d *EventDebouncer) recordEvent(signature string) {
-	d.mu.Lock()
-	d.seen[signature] = time.Now()
-	d.mu.Unlock()
 }
 
 // Cleanup removes expired entries from the seen map.

@@ -2,6 +2,7 @@ package events
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -333,6 +334,95 @@ func TestEventDebouncer_ConcurrentAccess(t *testing.T) {
 
 	if count == 0 {
 		t.Error("Expected some events to be recorded")
+	}
+}
+
+// TestEventDebouncer_ConcurrentSameSignature tests atomic check-and-record
+// to prevent TOCTOU race condition (W3H.3). Multiple goroutines concurrently
+// submit events with the same signature - only ONE should be recorded as the
+// first event (not skipped), and all others should be skipped.
+func TestEventDebouncer_ConcurrentSameSignature(t *testing.T) {
+	debouncer := NewEventDebouncer(1 * time.Second) // Long window
+
+	var wg sync.WaitGroup
+	goroutines := 100
+	notSkippedCount := int32(0)
+	skippedCount := int32(0)
+
+	// All goroutines will fire at the same time
+	startChan := make(chan struct{})
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startChan // Wait for signal
+
+			event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+			event.AgentID = "agent-1"
+
+			if debouncer.ShouldSkip(event) {
+				atomic.AddInt32(&skippedCount, 1)
+			} else {
+				atomic.AddInt32(&notSkippedCount, 1)
+			}
+		}()
+	}
+
+	// Fire all goroutines at once
+	close(startChan)
+	wg.Wait()
+
+	// Exactly ONE event should NOT be skipped (the first one)
+	// All others should be skipped
+	if notSkippedCount != 1 {
+		t.Errorf("Expected exactly 1 event not skipped (the first), got %d", notSkippedCount)
+	}
+
+	expectedSkipped := int32(goroutines - 1)
+	if skippedCount != expectedSkipped {
+		t.Errorf("Expected %d events skipped, got %d", expectedSkipped, skippedCount)
+	}
+}
+
+// TestEventDebouncer_ConcurrentSameSignatureStress stress-tests the atomic
+// check-and-record to ensure no TOCTOU race conditions under heavy load.
+func TestEventDebouncer_ConcurrentSameSignatureStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
+
+	for iteration := 0; iteration < 100; iteration++ {
+		debouncer := NewEventDebouncer(1 * time.Second)
+
+		var wg sync.WaitGroup
+		goroutines := 50
+		notSkippedCount := int32(0)
+
+		startChan := make(chan struct{})
+
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startChan
+
+				event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
+				event.AgentID = "agent-1"
+
+				if !debouncer.ShouldSkip(event) {
+					atomic.AddInt32(&notSkippedCount, 1)
+				}
+			}()
+		}
+
+		close(startChan)
+		wg.Wait()
+
+		if notSkippedCount != 1 {
+			t.Errorf("Iteration %d: Expected exactly 1 event not skipped, got %d",
+				iteration, notSkippedCount)
+		}
 	}
 }
 
