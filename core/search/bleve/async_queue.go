@@ -22,6 +22,9 @@ var (
 
 	// ErrNilOperation indicates a nil operation was submitted.
 	ErrNilOperation = errors.New("operation cannot be nil")
+
+	// ErrRetriesExhausted indicates all retry attempts failed.
+	ErrRetriesExhausted = errors.New("all retry attempts exhausted")
 )
 
 // =============================================================================
@@ -97,15 +100,27 @@ type AsyncIndexQueueConfig struct {
 
 	// Workers is the number of worker goroutines processing operations (default 2).
 	Workers int
+
+	// MaxRetries is the number of retry attempts for failed submissions (default 3).
+	MaxRetries int
+
+	// RetryBaseDelay is the initial backoff delay for retries (default 10ms).
+	RetryBaseDelay time.Duration
+
+	// RetryMaxDelay caps the exponential backoff delay (default 100ms).
+	RetryMaxDelay time.Duration
 }
 
 // DefaultAsyncIndexQueueConfig returns sensible defaults for the queue configuration.
 func DefaultAsyncIndexQueueConfig() AsyncIndexQueueConfig {
 	return AsyncIndexQueueConfig{
-		MaxQueueSize:  10000,
-		BatchSize:     100,
-		FlushInterval: 100 * time.Millisecond,
-		Workers:       2,
+		MaxQueueSize:   10000,
+		BatchSize:      100,
+		FlushInterval:  100 * time.Millisecond,
+		Workers:        2,
+		MaxRetries:     3,
+		RetryBaseDelay: 10 * time.Millisecond,
+		RetryMaxDelay:  100 * time.Millisecond,
 	}
 }
 
@@ -122,6 +137,15 @@ func (c *AsyncIndexQueueConfig) validate() {
 	}
 	if c.Workers <= 0 {
 		c.Workers = 2
+	}
+	if c.MaxRetries < 0 {
+		c.MaxRetries = 3
+	}
+	if c.RetryBaseDelay <= 0 {
+		c.RetryBaseDelay = 10 * time.Millisecond
+	}
+	if c.RetryMaxDelay <= 0 {
+		c.RetryMaxDelay = 100 * time.Millisecond
 	}
 }
 
@@ -145,11 +169,17 @@ type AsyncIndexQueueStats struct {
 
 	// BatchesProcessed is the total number of batches committed.
 	BatchesProcessed int64
+
+	// Retried is the total number of retry attempts made.
+	Retried int64
 }
 
 // =============================================================================
 // AsyncIndexQueue
 // =============================================================================
+
+// OverflowCallback is invoked when an operation fails permanently after all retries.
+type OverflowCallback func(op *IndexOperation, err error)
 
 // AsyncIndexQueue manages asynchronous indexing operations.
 // It batches operations before committing to Bleve for better performance.
@@ -164,18 +194,27 @@ type AsyncIndexQueue struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	closed atomic.Bool
+
+	// closeMu protects the queue channel from concurrent close/send.
+	// It must be held (RLock for send, Lock for close) to avoid races.
+	closeMu sync.RWMutex
+	closed  atomic.Bool
 
 	// Callbacks for actual index operations
 	indexFn  func(docID string, doc interface{}) error
 	deleteFn func(docID string) error
 	batchFn  func(ops []*IndexOperation) error
 
+	// Overflow callback for permanent failures after retries exhausted
+	overflowMu sync.RWMutex
+	overflowFn OverflowCallback
+
 	// Metrics
 	enqueued         atomic.Int64
 	processed        atomic.Int64
 	dropped          atomic.Int64
 	batchesProcessed atomic.Int64
+	retried          atomic.Int64
 }
 
 // NewAsyncIndexQueue creates a new async indexing queue.
@@ -219,13 +258,14 @@ func NewAsyncIndexQueue(
 // Submit Methods
 // =============================================================================
 
-// Submit adds an operation to the queue.
-// Returns immediately unless the queue is full (then applies backpressure via ErrQueueFull).
-func (q *AsyncIndexQueue) Submit(op *IndexOperation) error {
-	if op == nil {
-		return ErrNilOperation
-	}
+// trySubmit attempts a single non-blocking submission to the queue.
+// Returns ErrQueueClosed if the queue was closed, ErrQueueFull if full.
+func (q *AsyncIndexQueue) trySubmit(op *IndexOperation) error {
+	// Hold read lock to prevent Close() from closing channel during send
+	q.closeMu.RLock()
+	defer q.closeMu.RUnlock()
 
+	// Check closed after acquiring lock
 	if q.closed.Load() {
 		return ErrQueueClosed
 	}
@@ -235,9 +275,90 @@ func (q *AsyncIndexQueue) Submit(op *IndexOperation) error {
 		q.enqueued.Add(1)
 		return nil
 	default:
-		// Queue is full, apply backpressure
-		q.dropped.Add(1)
 		return ErrQueueFull
+	}
+}
+
+// calculateBackoff returns the backoff duration for a given retry attempt.
+func (q *AsyncIndexQueue) calculateBackoff(attempt int) time.Duration {
+	delay := q.config.RetryBaseDelay << attempt // Exponential: base * 2^attempt
+	if delay > q.config.RetryMaxDelay {
+		return q.config.RetryMaxDelay
+	}
+	return delay
+}
+
+// Submit adds an operation to the queue with exponential backoff retry.
+// Returns ErrRetriesExhausted if all retry attempts fail and invokes overflow callback.
+func (q *AsyncIndexQueue) Submit(op *IndexOperation) error {
+	if op == nil {
+		return ErrNilOperation
+	}
+
+	if q.closed.Load() {
+		return ErrQueueClosed
+	}
+
+	// Try immediate submission first
+	err := q.trySubmit(op)
+	if err == nil {
+		return nil
+	}
+	if err == ErrQueueClosed {
+		return ErrQueueClosed
+	}
+
+	// Retry with exponential backoff
+	return q.retrySubmit(op)
+}
+
+// retrySubmit handles the retry loop for failed submissions.
+func (q *AsyncIndexQueue) retrySubmit(op *IndexOperation) error {
+	for attempt := 0; attempt < q.config.MaxRetries; attempt++ {
+		// Check if queue closed during retry
+		if q.closed.Load() {
+			return ErrQueueClosed
+		}
+
+		// Wait with backoff
+		delay := q.calculateBackoff(attempt)
+		timer := time.NewTimer(delay)
+
+		select {
+		case <-timer.C:
+			// Timer expired, try again
+		case <-q.ctx.Done():
+			timer.Stop()
+			return ErrQueueClosed
+		}
+
+		q.retried.Add(1)
+
+		// Attempt submission (trySubmit handles closed channel safely)
+		err := q.trySubmit(op)
+		if err == nil {
+			return nil
+		}
+		if err == ErrQueueClosed {
+			return ErrQueueClosed
+		}
+		// err == ErrQueueFull, continue retry loop
+	}
+
+	// All retries exhausted
+	q.dropped.Add(1)
+	q.invokeOverflowCallback(op, ErrRetriesExhausted)
+	return ErrRetriesExhausted
+}
+
+// invokeOverflowCallback safely calls the overflow callback if set.
+func (q *AsyncIndexQueue) invokeOverflowCallback(op *IndexOperation, err error) {
+	q.overflowMu.RLock()
+	fn := q.overflowFn
+	q.overflowMu.RUnlock()
+
+	if fn != nil {
+		fn(op, err)
 	}
 }
 
@@ -353,13 +474,16 @@ func (q *AsyncIndexQueue) Flush(ctx context.Context) error {
 // Close gracefully shuts down the queue, processing all remaining items.
 // Blocks until all operations are processed and workers have stopped.
 func (q *AsyncIndexQueue) Close() error {
+	// Acquire write lock to prevent any concurrent sends
+	q.closeMu.Lock()
 	if q.closed.Swap(true) {
 		// Already closed
+		q.closeMu.Unlock()
 		return nil
 	}
-
 	// Close the input queue to signal processor to finish
 	close(q.queue)
+	q.closeMu.Unlock()
 
 	// Wait for all goroutines to finish
 	q.wg.Wait()
@@ -379,12 +503,45 @@ func (q *AsyncIndexQueue) Stats() AsyncIndexQueueStats {
 		Processed:        q.processed.Load(),
 		Dropped:          q.dropped.Load(),
 		BatchesProcessed: q.batchesProcessed.Load(),
+		Retried:          q.retried.Load(),
 	}
 }
 
 // IsClosed returns true if the queue has been closed.
 func (q *AsyncIndexQueue) IsClosed() bool {
 	return q.closed.Load()
+}
+
+// SetOverflowCallback sets the callback invoked when operations fail permanently.
+// The callback is invoked synchronously when all retries are exhausted.
+// Pass nil to clear the callback.
+func (q *AsyncIndexQueue) SetOverflowCallback(fn OverflowCallback) {
+	q.overflowMu.Lock()
+	defer q.overflowMu.Unlock()
+	q.overflowFn = fn
+}
+
+// SubmitNoRetry adds an operation without retry (original behavior).
+// Returns ErrQueueFull immediately if the queue is full.
+func (q *AsyncIndexQueue) SubmitNoRetry(op *IndexOperation) error {
+	if op == nil {
+		return ErrNilOperation
+	}
+
+	if q.closed.Load() {
+		return ErrQueueClosed
+	}
+
+	err := q.trySubmit(op)
+	if err == nil {
+		return nil
+	}
+	if err == ErrQueueClosed {
+		return ErrQueueClosed
+	}
+	// ErrQueueFull
+	q.dropped.Add(1)
+	return err
 }
 
 // =============================================================================

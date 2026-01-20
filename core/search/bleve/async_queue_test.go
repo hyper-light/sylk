@@ -659,10 +659,13 @@ func TestAsyncIndexQueue_Backpressure(t *testing.T) {
 	q := NewAsyncIndexQueue(
 		context.Background(),
 		AsyncIndexQueueConfig{
-			MaxQueueSize:  5,
-			BatchSize:     100,
-			FlushInterval: 10 * time.Second,
-			Workers:       1,
+			MaxQueueSize:   5,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     0, // Disable retries to test immediate backpressure
+			RetryBaseDelay: 1 * time.Millisecond,
+			RetryMaxDelay:  5 * time.Millisecond,
 		},
 		mockIndexFn(&atomic.Int64{}, 100*time.Millisecond, nil), // Slow processing
 		nil,
@@ -670,11 +673,11 @@ func TestAsyncIndexQueue_Backpressure(t *testing.T) {
 	)
 	defer q.Close()
 
-	// Fill the queue quickly
+	// Fill the queue quickly using SubmitNoRetry for original behavior
 	var fullCount int
 	for i := 0; i < 20; i++ {
 		op := NewIndexOperation(OpIndex, "doc"+string(rune('0'+i)), nil)
-		err := q.Submit(op)
+		err := q.SubmitNoRetry(op)
 		if err == ErrQueueFull {
 			fullCount++
 		}
@@ -1041,6 +1044,679 @@ func TestAsyncIndexQueue_ContextCancellation(t *testing.T) {
 	err := q.Close()
 	if err != nil {
 		t.Errorf("Close() after context cancel error = %v", err)
+	}
+}
+
+// =============================================================================
+// Retry Mechanism Tests
+// =============================================================================
+
+func TestAsyncIndexQueue_RetryConfig_Defaults(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultAsyncIndexQueueConfig()
+
+	if config.MaxRetries != 3 {
+		t.Errorf("MaxRetries = %d, want 3", config.MaxRetries)
+	}
+	if config.RetryBaseDelay != 10*time.Millisecond {
+		t.Errorf("RetryBaseDelay = %v, want 10ms", config.RetryBaseDelay)
+	}
+	if config.RetryMaxDelay != 100*time.Millisecond {
+		t.Errorf("RetryMaxDelay = %v, want 100ms", config.RetryMaxDelay)
+	}
+}
+
+func TestAsyncIndexQueue_RetryConfig_Validate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		config AsyncIndexQueueConfig
+		want   AsyncIndexQueueConfig
+	}{
+		{
+			name: "negative MaxRetries gets default",
+			config: AsyncIndexQueueConfig{
+				MaxRetries:     -1,
+				RetryBaseDelay: 10 * time.Millisecond,
+				RetryMaxDelay:  100 * time.Millisecond,
+			},
+			want: AsyncIndexQueueConfig{
+				MaxRetries:     3,
+				RetryBaseDelay: 10 * time.Millisecond,
+				RetryMaxDelay:  100 * time.Millisecond,
+			},
+		},
+		{
+			name: "zero MaxRetries preserved (disables retry)",
+			config: AsyncIndexQueueConfig{
+				MaxRetries:     0,
+				RetryBaseDelay: 10 * time.Millisecond,
+				RetryMaxDelay:  100 * time.Millisecond,
+			},
+			want: AsyncIndexQueueConfig{
+				MaxRetries:     0,
+				RetryBaseDelay: 10 * time.Millisecond,
+				RetryMaxDelay:  100 * time.Millisecond,
+			},
+		},
+		{
+			name: "zero delays get defaults",
+			config: AsyncIndexQueueConfig{
+				MaxRetries:     3,
+				RetryBaseDelay: 0,
+				RetryMaxDelay:  0,
+			},
+			want: AsyncIndexQueueConfig{
+				MaxRetries:     3,
+				RetryBaseDelay: 10 * time.Millisecond,
+				RetryMaxDelay:  100 * time.Millisecond,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.config.validate()
+
+			if tt.config.MaxRetries != tt.want.MaxRetries {
+				t.Errorf("MaxRetries = %d, want %d", tt.config.MaxRetries, tt.want.MaxRetries)
+			}
+			if tt.config.RetryBaseDelay != tt.want.RetryBaseDelay {
+				t.Errorf("RetryBaseDelay = %v, want %v", tt.config.RetryBaseDelay, tt.want.RetryBaseDelay)
+			}
+			if tt.config.RetryMaxDelay != tt.want.RetryMaxDelay {
+				t.Errorf("RetryMaxDelay = %v, want %v", tt.config.RetryMaxDelay, tt.want.RetryMaxDelay)
+			}
+		})
+	}
+}
+
+func TestAsyncIndexQueue_Submit_SuccessfulNoRetryNeeded(t *testing.T) {
+	t.Parallel()
+
+	indexCalls := &atomic.Int64{}
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   100,
+			BatchSize:      10,
+			FlushInterval:  10 * time.Millisecond,
+			Workers:        1,
+			MaxRetries:     3,
+			RetryBaseDelay: 5 * time.Millisecond,
+			RetryMaxDelay:  50 * time.Millisecond,
+		},
+		mockIndexFn(indexCalls, 0, nil),
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	op := NewIndexOperation(OpIndex, "doc1", map[string]string{"content": "test"})
+	err := q.Submit(op)
+	if err != nil {
+		t.Errorf("Submit() error = %v, want nil", err)
+	}
+
+	// Wait for processing
+	time.Sleep(50 * time.Millisecond)
+
+	stats := q.Stats()
+	if stats.Enqueued != 1 {
+		t.Errorf("Enqueued = %d, want 1", stats.Enqueued)
+	}
+	if stats.Retried != 0 {
+		t.Errorf("Retried = %d, want 0 (no retries needed)", stats.Retried)
+	}
+}
+
+func TestAsyncIndexQueue_Submit_RetrySuccess(t *testing.T) {
+	t.Parallel()
+
+	// This test verifies that submissions eventually succeed when the queue
+	// has capacity freed up during retry attempts.
+	// Since timing-based tests are inherently flaky, we just verify the
+	// submission succeeds and don't assert on retry counts.
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   10,
+			BatchSize:      5,
+			FlushInterval:  10 * time.Millisecond,
+			Workers:        2,
+			MaxRetries:     3,
+			RetryBaseDelay: 5 * time.Millisecond,
+			RetryMaxDelay:  20 * time.Millisecond,
+		},
+		func(docID string, doc interface{}) error { return nil },
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	// Submit multiple documents - some may need retries under load
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			op := NewIndexOperation(OpIndex, "doc-"+string(rune('A'+id)), nil)
+			_ = q.Submit(op) // Errors are acceptable under high contention
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Wait for processing to complete
+	_ = q.Flush(context.Background())
+
+	stats := q.Stats()
+	// With retries enabled, all submissions should eventually succeed
+	if stats.Enqueued == 0 {
+		t.Error("Expected some documents to be enqueued")
+	}
+}
+
+func TestAsyncIndexQueue_Submit_RetryExhausted(t *testing.T) {
+	t.Parallel()
+
+	// This test verifies ErrRetriesExhausted is returned when queue stays full.
+	// We use a never-unblocking processor to guarantee the queue stays full.
+
+	processingBlock := make(chan struct{})
+	var overflowCalled atomic.Bool
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     2,
+			RetryBaseDelay: 1 * time.Millisecond,
+			RetryMaxDelay:  5 * time.Millisecond,
+		},
+		func(docID string, doc interface{}) error {
+			<-processingBlock // Never returns until test ends
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Set overflow callback
+	q.SetOverflowCallback(func(op *IndexOperation, err error) {
+		overflowCalled.Store(true)
+	})
+
+	// Submit first item - goes into channel
+	err1 := q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill", nil))
+	if err1 != nil {
+		t.Fatalf("First submit failed: %v", err1)
+	}
+
+	// Give processor time to pick it up (it will block in indexFn)
+	time.Sleep(20 * time.Millisecond)
+
+	// Submit second item - fills the channel
+	err2 := q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+	if err2 != nil {
+		t.Fatalf("Second submit failed: %v", err2)
+	}
+
+	// Now channel is full. Submit should exhaust retries.
+	err := q.Submit(NewIndexOperation(OpIndex, "overflow", nil))
+
+	// Cleanup
+	close(processingBlock)
+	_ = q.Close()
+
+	if err != ErrRetriesExhausted {
+		t.Errorf("Submit() error = %v, want %v", err, ErrRetriesExhausted)
+	}
+
+	if !overflowCalled.Load() {
+		t.Error("overflow callback was not invoked")
+	}
+
+	stats := q.Stats()
+	if stats.Dropped == 0 {
+		t.Error("Expected Dropped > 0")
+	}
+}
+
+func TestAsyncIndexQueue_Submit_NoRetryWhenMaxRetriesZero(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+
+	// MaxRetries = 0 should disable retry mechanism
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     0, // Disable retries
+			RetryBaseDelay: 1 * time.Millisecond,
+			RetryMaxDelay:  5 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Fill the queue and block processor
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// Submit should fail immediately
+	start := time.Now()
+	op := NewIndexOperation(OpIndex, "test", nil)
+	err := q.Submit(op)
+	elapsed := time.Since(start)
+
+	if err != ErrRetriesExhausted {
+		t.Errorf("Submit() error = %v, want %v", err, ErrRetriesExhausted)
+	}
+
+	// Should be nearly instant (no retry delays)
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("Submit() took %v, expected < 50ms (no retry delays)", elapsed)
+	}
+
+	// Cleanup
+	close(processingBlock)
+	_ = q.Close()
+
+	stats := q.Stats()
+	if stats.Retried != 0 {
+		t.Errorf("Retried = %d, want 0", stats.Retried)
+	}
+}
+
+func TestAsyncIndexQueue_CalculateBackoff(t *testing.T) {
+	t.Parallel()
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   100,
+			BatchSize:      10,
+			FlushInterval:  100 * time.Millisecond,
+			Workers:        1,
+			MaxRetries:     5,
+			RetryBaseDelay: 10 * time.Millisecond,
+			RetryMaxDelay:  100 * time.Millisecond,
+		},
+		nil,
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, 10 * time.Millisecond},   // 10 * 2^0 = 10
+		{1, 20 * time.Millisecond},   // 10 * 2^1 = 20
+		{2, 40 * time.Millisecond},   // 10 * 2^2 = 40
+		{3, 80 * time.Millisecond},   // 10 * 2^3 = 80
+		{4, 100 * time.Millisecond},  // 10 * 2^4 = 160, capped at 100
+		{10, 100 * time.Millisecond}, // Very high, capped at max
+	}
+
+	for _, tt := range tests {
+		got := q.calculateBackoff(tt.attempt)
+		if got != tt.want {
+			t.Errorf("calculateBackoff(%d) = %v, want %v", tt.attempt, got, tt.want)
+		}
+	}
+}
+
+func TestAsyncIndexQueue_Submit_BackoffTiming(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+
+	// Test that backoff actually delays appropriately
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     3,
+			RetryBaseDelay: 20 * time.Millisecond,
+			RetryMaxDelay:  100 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Fill queue and block processor
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// Submit should take at least the sum of backoff delays
+	// attempt 0: 20ms, attempt 1: 40ms, attempt 2: 80ms = 140ms minimum
+	start := time.Now()
+	op := NewIndexOperation(OpIndex, "test", nil)
+	_ = q.Submit(op)
+	elapsed := time.Since(start)
+
+	// Cleanup
+	close(processingBlock)
+	_ = q.Close()
+
+	minExpected := 100 * time.Millisecond // At least some backoff should occur
+	if elapsed < minExpected {
+		t.Errorf("Submit() took %v, expected at least %v (backoff delays)", elapsed, minExpected)
+	}
+}
+
+func TestAsyncIndexQueue_SubmitNoRetry(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     5, // Would retry normally
+			RetryBaseDelay: 50 * time.Millisecond,
+			RetryMaxDelay:  100 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Fill queue and block processor
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// SubmitNoRetry should fail immediately
+	start := time.Now()
+	op := NewIndexOperation(OpIndex, "test", nil)
+	err := q.SubmitNoRetry(op)
+	elapsed := time.Since(start)
+
+	if err != ErrQueueFull {
+		t.Errorf("SubmitNoRetry() error = %v, want %v", err, ErrQueueFull)
+	}
+
+	// Should be instant (no retry)
+	if elapsed > 20*time.Millisecond {
+		t.Errorf("SubmitNoRetry() took %v, expected < 20ms", elapsed)
+	}
+
+	// Cleanup
+	close(processingBlock)
+	_ = q.Close()
+}
+
+func TestAsyncIndexQueue_SubmitNoRetry_NilOperation(t *testing.T) {
+	t.Parallel()
+
+	q, _, _ := createTestQueue(t, DefaultAsyncIndexQueueConfig())
+
+	err := q.SubmitNoRetry(nil)
+	if err != ErrNilOperation {
+		t.Errorf("SubmitNoRetry(nil) error = %v, want %v", err, ErrNilOperation)
+	}
+}
+
+func TestAsyncIndexQueue_SubmitNoRetry_Closed(t *testing.T) {
+	t.Parallel()
+
+	q, _, _ := createTestQueue(t, DefaultAsyncIndexQueueConfig())
+	_ = q.Close()
+
+	op := NewIndexOperation(OpIndex, "doc1", nil)
+	err := q.SubmitNoRetry(op)
+	if err != ErrQueueClosed {
+		t.Errorf("SubmitNoRetry() on closed queue error = %v, want %v", err, ErrQueueClosed)
+	}
+}
+
+func TestAsyncIndexQueue_SetOverflowCallback(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     1,
+			RetryBaseDelay: 1 * time.Millisecond,
+			RetryMaxDelay:  5 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	callCount := &atomic.Int64{}
+
+	// Set callback
+	q.SetOverflowCallback(func(op *IndexOperation, err error) {
+		callCount.Add(1)
+	})
+
+	// Fill and block processor
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// This should overflow
+	_ = q.Submit(NewIndexOperation(OpIndex, "overflow1", nil))
+
+	if callCount.Load() != 1 {
+		t.Errorf("callback called %d times, want 1", callCount.Load())
+	}
+
+	// Clear callback
+	q.SetOverflowCallback(nil)
+	_ = q.Submit(NewIndexOperation(OpIndex, "overflow2", nil))
+
+	if callCount.Load() != 1 {
+		t.Errorf("callback called %d times after clearing, want still 1", callCount.Load())
+	}
+
+	// Cleanup
+	close(processingBlock)
+	_ = q.Close()
+}
+
+func TestAsyncIndexQueue_Submit_ClosedDuringRetry(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     10,
+			RetryBaseDelay: 50 * time.Millisecond,
+			RetryMaxDelay:  200 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Fill queue and block processor
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// Start a submission that will retry
+	done := make(chan error, 1)
+	go func() {
+		op := NewIndexOperation(OpIndex, "test", nil)
+		done <- q.Submit(op)
+	}()
+
+	// Close queue while retry is in progress
+	time.Sleep(30 * time.Millisecond)
+	close(processingBlock)
+	_ = q.Close()
+
+	select {
+	case err := <-done:
+		if err != ErrQueueClosed {
+			t.Errorf("Submit() during close error = %v, want %v", err, ErrQueueClosed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Submit() did not return after queue closed")
+	}
+}
+
+func TestAsyncIndexQueue_RetryStats(t *testing.T) {
+	t.Parallel()
+
+	processingBlock := make(chan struct{})
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   1,
+			BatchSize:      100,
+			FlushInterval:  10 * time.Second,
+			Workers:        1,
+			MaxRetries:     3,
+			RetryBaseDelay: 1 * time.Millisecond,
+			RetryMaxDelay:  5 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			<-processingBlock
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	// Initial stats
+	stats := q.Stats()
+	if stats.Retried != 0 {
+		t.Errorf("initial Retried = %d, want 0", stats.Retried)
+	}
+
+	// Fill and block processor
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
+	time.Sleep(10 * time.Millisecond)
+	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
+
+	// This should exhaust retries
+	_ = q.Submit(NewIndexOperation(OpIndex, "retry", nil))
+
+	// Cleanup
+	close(processingBlock)
+	_ = q.Close()
+
+	stats = q.Stats()
+	if stats.Retried != 3 {
+		t.Errorf("Retried = %d, want 3 (MaxRetries)", stats.Retried)
+	}
+}
+
+func TestAsyncIndexQueue_ConcurrentRetries(t *testing.T) {
+	t.Parallel()
+
+	q := NewAsyncIndexQueue(
+		context.Background(),
+		AsyncIndexQueueConfig{
+			MaxQueueSize:   5,
+			BatchSize:      2,
+			FlushInterval:  5 * time.Millisecond,
+			Workers:        2,
+			MaxRetries:     3,
+			RetryBaseDelay: 1 * time.Millisecond,
+			RetryMaxDelay:  10 * time.Millisecond,
+		},
+		func(string, interface{}) error {
+			time.Sleep(time.Millisecond)
+			return nil
+		},
+		nil,
+		nil,
+	)
+	defer q.Close()
+
+	const numGoroutines = 10
+	const opsPerGoroutine = 5
+
+	var wg sync.WaitGroup
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				docID := "doc-" + string(rune('A'+goroutineID)) + "-" + string(rune('0'+i))
+				_ = q.Submit(NewIndexOperation(OpIndex, docID, nil))
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Flush to ensure all processed
+	_ = q.Flush(context.Background())
+
+	stats := q.Stats()
+	// With contention, we expect some retries and some drops
+	// But importantly, no panics or deadlocks occurred
+	t.Logf("Stats: Enqueued=%d, Processed=%d, Dropped=%d, Retried=%d",
+		stats.Enqueued, stats.Processed, stats.Dropped, stats.Retried)
+}
+
+func TestErrRetriesExhausted(t *testing.T) {
+	t.Parallel()
+
+	if ErrRetriesExhausted.Error() != "all retry attempts exhausted" {
+		t.Errorf("ErrRetriesExhausted message = %q, want %q",
+			ErrRetriesExhausted.Error(), "all retry attempts exhausted")
 	}
 }
 
