@@ -553,22 +553,47 @@ func (h *Index) RUnlock() {
 	h.mu.RUnlock()
 }
 
-// GetLayers returns the layers slice for snapshot creation.
+// GetLayers returns a copy of the layers slice for snapshot creation.
+// W4N.13: Returns a shallow copy of the layers slice to protect internal state.
+// Note: The layer objects themselves are not cloned for performance reasons.
 // Caller must hold at least a read lock.
 func (h *Index) GetLayers() []*layer {
-	return h.layers
+	if h.layers == nil {
+		return nil
+	}
+	result := make([]*layer, len(h.layers))
+	copy(result, h.layers)
+	return result
 }
 
-// GetVectors returns the vectors map for snapshot creation.
+// GetVectors returns a deep copy of the vectors map for snapshot creation.
+// W4N.13: Returns a deep copy to protect internal state from external modification.
 // Caller must hold at least a read lock.
 func (h *Index) GetVectors() map[string][]float32 {
-	return h.vectors
+	if h.vectors == nil {
+		return nil
+	}
+	result := make(map[string][]float32, len(h.vectors))
+	for id, vec := range h.vectors {
+		vecCopy := make([]float32, len(vec))
+		copy(vecCopy, vec)
+		result[id] = vecCopy
+	}
+	return result
 }
 
-// GetMagnitudes returns the magnitudes map for snapshot creation.
+// GetMagnitudes returns a copy of the magnitudes map for snapshot creation.
+// W4N.13: Returns a copy to protect internal state from external modification.
 // Caller must hold at least a read lock.
 func (h *Index) GetMagnitudes() map[string]float64 {
-	return h.magnitudes
+	if h.magnitudes == nil {
+		return nil
+	}
+	result := make(map[string]float64, len(h.magnitudes))
+	for id, mag := range h.magnitudes {
+		result[id] = mag
+	}
+	return result
 }
 
 // GetEntryPoint returns the current entry point node ID.
@@ -583,14 +608,30 @@ func (h *Index) GetMaxLevel() int {
 	return h.maxLevel
 }
 
-// GetDomains returns the domains map for snapshot creation.
+// GetDomains returns a copy of the domains map for snapshot creation.
+// W4N.13: Returns a copy to protect internal state from external modification.
 // Caller must hold at least a read lock.
 func (h *Index) GetDomains() map[string]vectorgraphdb.Domain {
-	return h.domains
+	if h.domains == nil {
+		return nil
+	}
+	result := make(map[string]vectorgraphdb.Domain, len(h.domains))
+	for id, domain := range h.domains {
+		result[id] = domain
+	}
+	return result
 }
 
-// GetNodeTypes returns the node types map for snapshot creation.
+// GetNodeTypes returns a copy of the node types map for snapshot creation.
+// W4N.13: Returns a copy to protect internal state from external modification.
 // Caller must hold at least a read lock.
 func (h *Index) GetNodeTypes() map[string]vectorgraphdb.NodeType {
-	return h.nodeTypes
+	if h.nodeTypes == nil {
+		return nil
+	}
+	result := make(map[string]vectorgraphdb.NodeType, len(h.nodeTypes))
+	for id, nodeType := range h.nodeTypes {
+		result[id] = nodeType
+	}
+	return result
 }
