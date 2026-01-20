@@ -18,6 +18,10 @@ const DefaultHotCacheMaxSize = 32 * 1024 * 1024
 // DefaultEvictionBatchSize is the default number of entries to evict per batch.
 const DefaultEvictionBatchSize = 100
 
+// MaxEvictionsPerAdd is the maximum number of entries to evict per Add() call.
+// This bounds latency spikes during hot-path operations (W3M.10 fix).
+const MaxEvictionsPerAdd = 10
+
 // HotCacheName is the name used for EvictableCache identification.
 const HotCacheName = "adaptive-hot-cache"
 
@@ -422,6 +426,7 @@ func (c *HotCache) Add(id string, entry *ContentEntry) {
 }
 
 // evictIfOverLimitLocked evicts entries if the cache is over the size limit.
+// Eviction is bounded by MaxEvictionsPerAdd to prevent latency spikes (W3M.10).
 // Must be called with mu held. Returns entries to invoke callbacks on.
 func (c *HotCache) evictIfOverLimitLocked() []evictedEntry {
 	currentSize := c.currentSize.Load()
@@ -431,7 +436,8 @@ func (c *HotCache) evictIfOverLimitLocked() []evictedEntry {
 	}
 
 	targetBytes := currentSize - maxSize
-	evicted, _ := c.evictBatch(c.evictionBatchSize, targetBytes)
+	// Bound eviction count to MaxEvictionsPerAdd to prevent latency spikes
+	evicted, _ := c.evictBatch(MaxEvictionsPerAdd, targetBytes)
 	return evicted
 }
 

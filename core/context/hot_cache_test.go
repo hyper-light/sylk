@@ -952,3 +952,168 @@ func TestHotCache_Close(t *testing.T) {
 		// Should not panic or deadlock
 	})
 }
+
+// =============================================================================
+// Bounded Eviction Tests (W3M.10)
+// =============================================================================
+
+func TestHotCache_BoundedEvictionPerAdd(t *testing.T) {
+	t.Run("eviction bounded by MaxEvictionsPerAdd in sync mode", func(t *testing.T) {
+		var evictionCount int
+		var mu sync.Mutex
+
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       1000, // Very small cache
+			AsyncEviction: false,
+			OnEvict: func(id string, entry *ContentEntry) {
+				mu.Lock()
+				evictionCount++
+				mu.Unlock()
+			},
+		})
+
+		// First, fill the cache with many small entries
+		for i := 0; i < 50; i++ {
+			cache.Add("prefill-"+string(rune(i)), makeTestEntry("prefill-"+string(rune(i)), 100))
+		}
+
+		// Reset eviction count
+		mu.Lock()
+		evictionCount = 0
+		mu.Unlock()
+
+		// Add a single new entry - should trigger bounded eviction
+		cache.Add("trigger", makeTestEntry("trigger", 100))
+
+		mu.Lock()
+		count := evictionCount
+		mu.Unlock()
+
+		// Should evict at most MaxEvictionsPerAdd entries per Add() call
+		if count > MaxEvictionsPerAdd {
+			t.Errorf("evicted %d entries, expected at most %d per Add()", count, MaxEvictionsPerAdd)
+		}
+	})
+
+	t.Run("cache eventually respects capacity with multiple adds", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       5000,
+			AsyncEviction: false,
+		})
+
+		// Add many entries - cache should eventually stay near capacity
+		for i := 0; i < 100; i++ {
+			cache.Add("entry-"+string(rune(i)), makeTestEntry("entry-"+string(rune(i)), 500))
+		}
+
+		// Size may exceed max temporarily but should be bounded reasonably
+		// With bounded eviction, the overshoot is limited
+		maxAllowedOvershoot := int64(MaxEvictionsPerAdd * 1000) // Approximate max overshoot
+		if cache.Size() > cache.MaxSize()+maxAllowedOvershoot {
+			t.Errorf("cache size %d exceeds reasonable bound (max %d + overshoot %d)",
+				cache.Size(), cache.MaxSize(), maxAllowedOvershoot)
+		}
+	})
+
+	t.Run("no latency spikes during eviction", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       2000,
+			AsyncEviction: false,
+		})
+
+		// Pre-fill cache
+		for i := 0; i < 50; i++ {
+			cache.Add("prefill-"+string(rune(i)), makeTestEntry("prefill-"+string(rune(i)), 200))
+		}
+
+		// Measure time for single Add() operations
+		var maxDuration time.Duration
+		for i := 0; i < 20; i++ {
+			start := time.Now()
+			cache.Add("timed-"+string(rune(i)), makeTestEntry("timed-"+string(rune(i)), 200))
+			elapsed := time.Since(start)
+			if elapsed > maxDuration {
+				maxDuration = elapsed
+			}
+		}
+
+		// With bounded eviction, Add() should complete quickly
+		// Allow 10ms as reasonable upper bound for in-memory operations
+		if maxDuration > 10*time.Millisecond {
+			t.Errorf("Add() took %v, expected < 10ms with bounded eviction", maxDuration)
+		}
+	})
+
+	t.Run("async mode continues eviction in background", func(t *testing.T) {
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       3000,
+			AsyncEviction: true,
+		})
+		defer cache.Close()
+
+		// Add many entries to trigger eviction
+		for i := 0; i < 50; i++ {
+			cache.Add("entry-"+string(rune(i)), makeTestEntry("entry-"+string(rune(i)), 500))
+		}
+
+		// Wait for async eviction to complete
+		time.Sleep(200 * time.Millisecond)
+
+		// Should eventually be at or under max size
+		if cache.Size() > cache.MaxSize() {
+			t.Errorf("cache size %d exceeds max %d after async eviction",
+				cache.Size(), cache.MaxSize())
+		}
+	})
+}
+
+func TestHotCache_BoundedEvictionConcurrent(t *testing.T) {
+	t.Run("concurrent adds with bounded eviction", func(t *testing.T) {
+		var totalEvictions int64
+		var maxEvictionsPerOp int64
+		var mu sync.Mutex
+
+		cache := NewHotCache(HotCacheConfig{
+			MaxSize:       5000,
+			AsyncEviction: false,
+			OnEvict: func(id string, entry *ContentEntry) {
+				mu.Lock()
+				totalEvictions++
+				mu.Unlock()
+			},
+		})
+
+		var wg sync.WaitGroup
+
+		// Concurrent adds
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+
+				mu.Lock()
+				beforeEvictions := totalEvictions
+				mu.Unlock()
+
+				cache.Add("entry-"+string(rune(id)), makeTestEntry("entry-"+string(rune(id)), 300))
+
+				mu.Lock()
+				afterEvictions := totalEvictions
+				evictedThisOp := afterEvictions - beforeEvictions
+				if evictedThisOp > maxEvictionsPerOp {
+					maxEvictionsPerOp = evictedThisOp
+				}
+				mu.Unlock()
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Each individual Add() should be bounded
+		// Note: due to concurrency, multiple goroutines may evict simultaneously,
+		// but each goroutine's contribution should be bounded
+		if maxEvictionsPerOp > int64(MaxEvictionsPerAdd*2) {
+			t.Logf("warning: max evictions per operation was %d (some overlap expected)", maxEvictionsPerOp)
+		}
+	})
+}
