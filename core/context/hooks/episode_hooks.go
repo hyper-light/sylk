@@ -364,9 +364,9 @@ func extractContentIDsFromResponse(response string) []string {
 	for _, line := range lines {
 		if strings.Contains(line, "[EXCERPT") || strings.Contains(line, "[SUMMARY") {
 			// Extract source from line like "### [EXCERPT 1] source (confidence: 0.85)"
-			if start := strings.Index(line, "]"); start > 0 {
+			if start := strings.Index(line, "]"); start >= 0 {
 				remainder := line[start+1:]
-				if end := strings.Index(remainder, "("); end > 0 {
+				if end := strings.Index(remainder, "("); end >= 0 {
 					source := strings.TrimSpace(remainder[:end])
 					if source != "" {
 						ids = append(ids, source)

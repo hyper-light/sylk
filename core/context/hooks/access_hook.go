@@ -266,9 +266,9 @@ func extractContentReferences(response string) []string {
 // extractIDFromExcerptLine extracts the source ID from an excerpt/summary line.
 func extractIDFromExcerptLine(line string) string {
 	// Format: "### [EXCERPT 1] source_id (confidence: 0.85)"
-	if start := strings.Index(line, "]"); start > 0 {
+	if start := strings.Index(line, "]"); start >= 0 {
 		remainder := line[start+1:]
-		if end := strings.Index(remainder, "("); end > 0 {
+		if end := strings.Index(remainder, "("); end >= 0 {
 			return strings.TrimSpace(remainder[:end])
 		}
 		// No parenthesis, just trim
@@ -283,7 +283,7 @@ func extractFilePath(line string) string {
 	extensions := []string{".go", ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".md"}
 
 	for _, ext := range extensions {
-		if idx := strings.Index(line, ext); idx > 0 {
+		if idx := strings.Index(line, ext); idx >= 0 {
 			// Walk backwards to find start of path
 			start := idx
 			for start > 0 && isPathChar(line[start-1]) {

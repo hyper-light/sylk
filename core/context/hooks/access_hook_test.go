@@ -586,3 +586,206 @@ func TestDeduplicateIDs(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// W3H.4 Index Comparison Bug Fix Tests
+// =============================================================================
+
+func TestExtractIDFromExcerptLine_IndexZero(t *testing.T) {
+	// W3H.4: Test index at position 0 (edge case that was failing)
+	tests := []struct {
+		name     string
+		line     string
+		expected string
+	}{
+		{
+			name:     "bracket at position 0",
+			line:     "] source_id (confidence: 0.85)",
+			expected: "source_id",
+		},
+		{
+			name:     "bracket at position 0 no confidence",
+			line:     "] source_id",
+			expected: "source_id",
+		},
+		{
+			name:     "bracket at position 0 with parenthesis at position 0",
+			line:     "](extra)",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractIDFromExcerptLine(tt.line)
+			if result != tt.expected {
+				t.Errorf("extractIDFromExcerptLine(%q) = %q, want %q", tt.line, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractIDFromExcerptLine_IndexGreaterThanZero(t *testing.T) {
+	// W3H.4: Test index at position > 0 (normal case)
+	tests := []struct {
+		name     string
+		line     string
+		expected string
+	}{
+		{
+			name:     "standard excerpt format",
+			line:     "### [EXCERPT 1] src/main.go (confidence: 0.95)",
+			expected: "src/main.go",
+		},
+		{
+			name:     "summary format",
+			line:     "[SUMMARY 2] pkg/utils.go (score: 0.80)",
+			expected: "pkg/utils.go",
+		},
+		{
+			name:     "no confidence suffix",
+			line:     "### [EXCERPT 3] internal/db/query.go",
+			expected: "internal/db/query.go",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractIDFromExcerptLine(tt.line)
+			if result != tt.expected {
+				t.Errorf("extractIDFromExcerptLine(%q) = %q, want %q", tt.line, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractIDFromExcerptLine_IndexNotFound(t *testing.T) {
+	// W3H.4: Test index not found (-1 case)
+	tests := []struct {
+		name     string
+		line     string
+		expected string
+	}{
+		{
+			name:     "no bracket",
+			line:     "EXCERPT 1 src/main.go",
+			expected: "",
+		},
+		{
+			name:     "empty string",
+			line:     "",
+			expected: "",
+		},
+		{
+			name:     "only opening bracket",
+			line:     "[EXCERPT 1 src/main.go",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractIDFromExcerptLine(tt.line)
+			if result != tt.expected {
+				t.Errorf("extractIDFromExcerptLine(%q) = %q, want %q", tt.line, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractFilePath_IndexZero(t *testing.T) {
+	// W3H.4: Test file extension at position 0 (edge case that was failing)
+	tests := []struct {
+		name     string
+		line     string
+		expected string
+	}{
+		{
+			name:     "extension at start of line",
+			line:     ".go file contains the code",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractFilePath(tt.line)
+			if result != tt.expected {
+				t.Errorf("extractFilePath(%q) = %q, want %q", tt.line, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractFilePath_IndexGreaterThanZero(t *testing.T) {
+	// W3H.4: Test file extension at position > 0 (normal case)
+	tests := []struct {
+		name     string
+		line     string
+		expected string
+	}{
+		{
+			name:     "standard go file path",
+			line:     "Check out src/main.go for the implementation.",
+			expected: "src/main.go",
+		},
+		{
+			name:     "python file path",
+			line:     "See utils/helper.py for details.",
+			expected: "utils/helper.py",
+		},
+		{
+			name:     "javascript file path",
+			line:     "The file app/index.js exports the module.",
+			expected: "app/index.js",
+		},
+		{
+			name:     "path with line number",
+			line:     "Error in src/main.go:42",
+			expected: "src/main.go:42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractFilePath(tt.line)
+			if result != tt.expected {
+				t.Errorf("extractFilePath(%q) = %q, want %q", tt.line, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractFilePath_IndexNotFound(t *testing.T) {
+	// W3H.4: Test file extension not found (-1 case)
+	tests := []struct {
+		name     string
+		line     string
+		expected string
+	}{
+		{
+			name:     "no extension",
+			line:     "Check out the README for more info.",
+			expected: "",
+		},
+		{
+			name:     "empty string",
+			line:     "",
+			expected: "",
+		},
+		{
+			name:     "no valid extension",
+			line:     "The file contains some data.",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractFilePath(tt.line)
+			if result != tt.expected {
+				t.Errorf("extractFilePath(%q) = %q, want %q", tt.line, result, tt.expected)
+			}
+		})
+	}
+}
