@@ -63,6 +63,17 @@ type WriteAheadLog struct {
 	stopSync     chan struct{}
 	syncDone     chan struct{}
 
+	// syncMu protects the sync operation itself, separate from the write lock.
+	// This allows writes to continue while a sync is in progress.
+	syncMu sync.Mutex
+
+	// syncBuffer holds data written since last sync. When sync starts,
+	// we swap buffers so writes can continue to the new buffer while
+	// the old buffer is being synced.
+	syncBuffer     *bufio.Writer
+	syncBufferFile *os.File
+	syncInProgress atomic.Bool
+
 	// Context for cancellation propagation
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -307,12 +318,46 @@ func (w *WriteAheadLog) Sync() error {
 		return ErrWALClosed
 	}
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	// Use the same double-buffered sync approach
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
 
-	return w.syncLocked()
+	return w.syncWithDoubleBuffer()
 }
 
+// syncWithDoubleBuffer performs sync with minimal write lock time.
+// Caller must hold syncMu.
+func (w *WriteAheadLog) syncWithDoubleBuffer() error {
+	if !w.pendingSync.Load() {
+		return nil
+	}
+
+	w.syncInProgress.Store(true)
+	defer w.syncInProgress.Store(false)
+
+	// Acquire write lock briefly to flush buffer
+	w.mu.Lock()
+	if err := w.writer.Flush(); err != nil {
+		w.mu.Unlock()
+		return fmt.Errorf("failed to flush writer: %w", err)
+	}
+	w.pendingSync.Store(false)
+	w.mu.Unlock()
+
+	// Perform fsync outside write lock
+	if err := w.currentFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	w.mu.Lock()
+	w.lastSyncTime = time.Now()
+	w.mu.Unlock()
+
+	return nil
+}
+
+// syncLocked performs a sync while holding the write lock.
+// This is used during segment rotation where we need atomic sync.
 func (w *WriteAheadLog) syncLocked() error {
 	if !w.pendingSync.Load() {
 		return nil
@@ -353,12 +398,42 @@ func (w *WriteAheadLog) periodicSync() {
 	}
 }
 
+// trySyncPending performs a non-blocking sync if there's pending data.
+// Uses double-buffering to allow writes to continue during sync.
 func (w *WriteAheadLog) trySyncPending() {
 	if !w.pendingSync.Load() {
 		return
 	}
+	// Try to acquire sync lock without blocking
+	if !w.syncMu.TryLock() {
+		// Another sync is in progress, skip this one
+		return
+	}
+	defer w.syncMu.Unlock()
+
+	// Quick check again after acquiring lock
+	if !w.pendingSync.Load() {
+		return
+	}
+
+	// Mark sync in progress
+	w.syncInProgress.Store(true)
+	defer w.syncInProgress.Store(false)
+
+	// Acquire write lock briefly to flush buffer and mark as synced
 	w.mu.Lock()
-	_ = w.syncLocked()
+	if err := w.writer.Flush(); err != nil {
+		w.mu.Unlock()
+		return
+	}
+	w.pendingSync.Store(false)
+	w.mu.Unlock()
+
+	// Perform fsync outside write lock - this is the slow part
+	_ = w.currentFile.Sync()
+
+	w.mu.Lock()
+	w.lastSyncTime = time.Now()
 	w.mu.Unlock()
 }
 

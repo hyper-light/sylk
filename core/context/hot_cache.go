@@ -297,26 +297,38 @@ type evictedEntry struct {
 // evictBatch evicts up to batchSize entries from the cache.
 // Returns the entries that were evicted for callback processing.
 // Must be called with mu held.
+//
+// Performance optimization: Pre-allocates the evicted slice to reduce allocations
+// during the critical section. Uses a single pass through the LRU list tail.
 func (c *HotCache) evictBatch(batchSize int, targetBytes int64) ([]evictedEntry, int64) {
-	var evicted []evictedEntry
+	// Pre-allocate with estimated capacity to reduce allocations under lock
+	estimatedCount := min(batchSize, c.lruList.Len())
+	evicted := make([]evictedEntry, 0, estimatedCount)
 	var evictedSize int64
 
-	for len(evicted) < batchSize && evictedSize < targetBytes && c.lruList.Len() > 0 {
+	// Single pass through LRU list tail - O(batchSize) operations
+	for len(evicted) < batchSize && evictedSize < targetBytes {
 		back := c.lruList.Back()
 		if back == nil {
 			break
 		}
 
 		entry := back.Value.(*lruEntry)
+
+		// Collect entry info before modifying data structures
 		evicted = append(evicted, evictedEntry{
 			id:    entry.id,
 			entry: entry.entry,
 		})
+		entrySize := entry.size
 
+		// Remove from LRU list and map (O(1) operations)
 		c.lruList.Remove(entry.element)
 		delete(c.entries, entry.id)
-		c.currentSize.Add(-entry.size)
-		evictedSize += entry.size
+
+		// Update atomics outside the map/list operations
+		c.currentSize.Add(-entrySize)
+		evictedSize += entrySize
 		c.evictions.Add(1)
 	}
 
