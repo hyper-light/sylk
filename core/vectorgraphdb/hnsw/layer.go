@@ -124,10 +124,11 @@ func (l *layer) getNeighborsWithDistances(id string) []Neighbor {
 }
 
 // setNeighbors replaces all neighbors of a node with new neighbors and distances.
-// W12.38: Holds layer lock through entire operation to prevent race conditions.
+// W12.38: Holds write lock through entire operation since node lookup and
+// neighbor set modification must be atomic.
 func (l *layer) setNeighbors(id string, neighbors []string, distances []float32) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	node, exists := l.nodes[id]
 	if !exists {
 		return
