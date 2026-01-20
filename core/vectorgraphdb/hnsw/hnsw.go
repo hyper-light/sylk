@@ -84,6 +84,7 @@ type Index struct {
 	magnitudes  map[string]float64
 	domains     map[string]vectorgraphdb.Domain
 	nodeTypes   map[string]vectorgraphdb.NodeType
+	nodeLevels  map[string]int // W4P.32: Track assigned level for each node
 	M           int
 	efConstruct int
 	efSearch    int
@@ -118,6 +119,7 @@ func New(cfg Config) *Index {
 		magnitudes:  make(map[string]float64),
 		domains:     make(map[string]vectorgraphdb.Domain),
 		nodeTypes:   make(map[string]vectorgraphdb.NodeType),
+		nodeLevels:  make(map[string]int), // W4P.32: Initialize node level tracking
 		M:           cfg.M,
 		efConstruct: cfg.EfConstruct,
 		efSearch:    cfg.EfSearch,
@@ -155,12 +157,22 @@ func (h *Index) Insert(id string, vector []float32, domain vectorgraphdb.Domain,
 
 func (h *Index) insertLocked(id string, vector []float32, domain vectorgraphdb.Domain, nodeType vectorgraphdb.NodeType) error {
 	mag := Magnitude(vector)
+
+	// W4P.32: Check if this is an update (node already exists)
+	existingLevel, isUpdate := h.nodeLevels[id]
+
+	// Synchronize metadata atomically
 	h.vectors[id] = vector
 	h.magnitudes[id] = mag
 	h.domains[id] = domain
 	h.nodeTypes[id] = nodeType
 
-	nodeLevel := randomLevel(h.levelMult)
+	// W4P.32: For updates, preserve existing layer membership
+	nodeLevel := existingLevel
+	if !isUpdate {
+		nodeLevel = randomLevel(h.levelMult)
+	}
+	h.nodeLevels[id] = nodeLevel
 	h.ensureLayers(nodeLevel)
 
 	if h.entryPoint == "" {
@@ -168,7 +180,10 @@ func (h *Index) insertLocked(id string, vector []float32, domain vectorgraphdb.D
 		return nil
 	}
 
-	h.insertWithConnections(id, vector, mag, nodeLevel)
+	// W4P.32: Skip layer operations for updates - node already has connections
+	if !isUpdate {
+		h.insertWithConnections(id, vector, mag, nodeLevel)
+	}
 	return nil
 }
 
@@ -510,6 +525,7 @@ func (h *Index) DeleteBatch(ids []string) error {
 
 // deleteUnlocked performs deletion without acquiring locks.
 // W4P.26: Enhanced to validate and clean up ALL references to deleted node.
+// W4P.32: Also removes node level tracking.
 // Caller must hold h.mu.Lock().
 func (h *Index) deleteUnlocked(id string) {
 	// Process all layers to clean up references
@@ -522,6 +538,7 @@ func (h *Index) deleteUnlocked(id string) {
 	delete(h.magnitudes, id)
 	delete(h.domains, id)
 	delete(h.nodeTypes, id)
+	delete(h.nodeLevels, id) // W4P.32: Clean up level tracking
 
 	// Update entry point if needed
 	if h.entryPoint == id {
@@ -596,6 +613,60 @@ func (h *Index) GetMetadata(id string) (vectorgraphdb.Domain, vectorgraphdb.Node
 		return 0, 0, fmt.Errorf("%w: cannot get metadata for node %q", ErrNodeNotFound, id)
 	}
 	return h.domains[id], h.nodeTypes[id], nil
+}
+
+// GetNodeLevel returns the assigned level for the given node ID.
+// W4P.32: Provides access to layer membership information.
+//
+// Returns ErrNodeNotFound if the node doesn't exist.
+func (h *Index) GetNodeLevel(id string) (int, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	level, exists := h.nodeLevels[id]
+	if !exists {
+		return -1, fmt.Errorf("%w: cannot get level for node %q", ErrNodeNotFound, id)
+	}
+	return level, nil
+}
+
+// ValidateMetadataConsistency checks that all metadata maps are consistent.
+// W4P.32: Detects metadata inconsistencies where a node exists in vectors
+// but is missing from other metadata maps or layer membership.
+//
+// Returns a list of inconsistency descriptions, empty if all is consistent.
+func (h *Index) ValidateMetadataConsistency() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.validateMetadataLocked()
+}
+
+// validateMetadataLocked performs consistency validation without locking.
+// W4P.32: Caller must hold at least a read lock.
+func (h *Index) validateMetadataLocked() []string {
+	var issues []string
+
+	for id := range h.vectors {
+		issues = h.checkNodeConsistency(id, issues)
+	}
+	return issues
+}
+
+// checkNodeConsistency validates a single node's metadata consistency.
+// W4P.32: Verifies domain, nodeType, magnitude, and level tracking exist.
+func (h *Index) checkNodeConsistency(id string, issues []string) []string {
+	if _, ok := h.domains[id]; !ok {
+		issues = append(issues, fmt.Sprintf("node %q: missing domain", id))
+	}
+	if _, ok := h.nodeTypes[id]; !ok {
+		issues = append(issues, fmt.Sprintf("node %q: missing nodeType", id))
+	}
+	if _, ok := h.magnitudes[id]; !ok {
+		issues = append(issues, fmt.Sprintf("node %q: missing magnitude", id))
+	}
+	if _, ok := h.nodeLevels[id]; !ok {
+		issues = append(issues, fmt.Sprintf("node %q: missing level tracking", id))
+	}
+	return issues
 }
 
 func (h *Index) Stats() IndexStats {
@@ -710,6 +781,20 @@ func (h *Index) GetNodeTypes() map[string]vectorgraphdb.NodeType {
 	result := make(map[string]vectorgraphdb.NodeType, len(h.nodeTypes))
 	for id, nodeType := range h.nodeTypes {
 		result[id] = nodeType
+	}
+	return result
+}
+
+// GetNodeLevels returns a copy of the node levels map for snapshot creation.
+// W4P.32: Returns a copy to protect internal state from external modification.
+// Caller must hold at least a read lock.
+func (h *Index) GetNodeLevels() map[string]int {
+	if h.nodeLevels == nil {
+		return nil
+	}
+	result := make(map[string]int, len(h.nodeLevels))
+	for id, level := range h.nodeLevels {
+		result[id] = level
 	}
 	return result
 }
