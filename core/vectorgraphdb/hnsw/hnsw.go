@@ -131,7 +131,16 @@ func (h *Index) initializeFirstNode(id string, level int) {
 
 func (h *Index) insertWithConnections(id string, vector []float32, mag float64, nodeLevel int) {
 	currObj := h.entryPoint
-	currDist := 1.0 - CosineSimilarity(vector, h.vectors[currObj], mag, h.magnitudes[currObj])
+
+	// Bounds check for entry point vector and magnitude
+	epVec, epMag, ok := h.getVectorAndMagnitude(currObj)
+	if !ok {
+		// Entry point missing data - this shouldn't happen in normal operation
+		// but we handle it gracefully by skipping upper layer traversal
+		epVec = vector
+		epMag = mag
+	}
+	currDist := 1.0 - CosineSimilarity(vector, epVec, mag, epMag)
 
 	for level := h.maxLevel; level > nodeLevel; level-- {
 		currObj, currDist = h.greedySearchLayer(vector, mag, currObj, currDist, level)
@@ -159,13 +168,16 @@ func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, 
 		changed = false
 		neighbors := h.layers[level].getNeighbors(ep)
 		for _, neighbor := range neighbors {
-			if vec, exists := h.vectors[neighbor]; exists {
-				dist := 1.0 - CosineSimilarity(query, vec, queryMag, h.magnitudes[neighbor])
-				if dist < epDist {
-					ep = neighbor
-					epDist = dist
-					changed = true
-				}
+			// Bounds check for both vector and magnitude
+			vec, mag, exists := h.getVectorAndMagnitude(neighbor)
+			if !exists {
+				continue
+			}
+			dist := 1.0 - CosineSimilarity(query, vec, queryMag, mag)
+			if dist < epDist {
+				ep = neighbor
+				epDist = dist
+				changed = true
 			}
 		}
 	}
@@ -214,7 +226,11 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Similarity > candidates[j].Similarity
+		if candidates[i].Similarity != candidates[j].Similarity {
+			return candidates[i].Similarity > candidates[j].Similarity
+		}
+		// Stable tie-breaker: sort by ID for deterministic ordering
+		return candidates[i].ID < candidates[j].ID
 	})
 
 	if len(candidates) > ef {
@@ -274,7 +290,14 @@ func (h *Index) Search(query []float32, k int, filter *SearchFilter) []SearchRes
 
 func (h *Index) searchLocked(query []float32, queryMag float64, k int, filter *SearchFilter) []SearchResult {
 	currObj := h.entryPoint
-	currDist := 1.0 - CosineSimilarity(query, h.vectors[currObj], queryMag, h.magnitudes[currObj])
+
+	// Bounds check for entry point vector and magnitude
+	epVec, epMag, ok := h.getVectorAndMagnitude(currObj)
+	if !ok {
+		// Entry point missing data - return empty results
+		return nil
+	}
+	currDist := 1.0 - CosineSimilarity(query, epVec, queryMag, epMag)
 
 	for level := h.maxLevel; level > 0; level-- {
 		currObj, currDist = h.greedySearchLayer(query, queryMag, currObj, currDist, level)

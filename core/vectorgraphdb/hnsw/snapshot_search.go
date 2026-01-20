@@ -158,9 +158,14 @@ func (snap *HNSWSnapshot) createSearchResult(query []float32, queryMag float64, 
 }
 
 // sortCandidates sorts candidates by similarity in descending order.
+// Uses ID as a stable tie-breaker for deterministic ordering.
 func (snap *HNSWSnapshot) sortCandidates(candidates []SearchResult) []SearchResult {
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Similarity > candidates[j].Similarity
+		if candidates[i].Similarity != candidates[j].Similarity {
+			return candidates[i].Similarity > candidates[j].Similarity
+		}
+		// Stable tie-breaker: sort by ID for deterministic ordering
+		return candidates[i].ID < candidates[j].ID
 	})
 	return candidates
 }
