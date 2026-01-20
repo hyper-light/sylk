@@ -529,6 +529,160 @@ func TestMaterializationManager_GetMaterializedByEvidence_NotFound(t *testing.T)
 	}
 }
 
+// TestMaterializationManager_GetMaterializedByEvidence_NoFalsePositives tests
+// that substring matches don't cause false positives (W3M.15 fix).
+func TestMaterializationManager_GetMaterializedByEvidence_NoFalsePositives(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create edges with evidence that could cause substring false positives
+	// Evidence: "X|depends|Y" should NOT match "AX|depends|YB" or "X|depends|YZ"
+	results := []InferenceResult{
+		{
+			DerivedEdge: DerivedEdge{SourceID: "A", EdgeType: "calls", TargetID: "B"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "X", EdgeType: "depends", TargetID: "Y"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+		{
+			DerivedEdge: DerivedEdge{SourceID: "C", EdgeType: "calls", TargetID: "D"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "AX", EdgeType: "depends", TargetID: "YB"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+		{
+			DerivedEdge: DerivedEdge{SourceID: "E", EdgeType: "calls", TargetID: "F"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "X", EdgeType: "depends", TargetID: "YZ"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+	}
+
+	if err := manager.Materialize(ctx, results); err != nil {
+		t.Fatalf("Materialize failed: %v", err)
+	}
+
+	// Search for exact match - should only find the first one
+	edges, err := manager.GetMaterializedByEvidence(ctx, "X|depends|Y")
+	if err != nil {
+		t.Fatalf("GetMaterializedByEvidence failed: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Errorf("expected 1 edge (exact match only), got %d", len(edges))
+	}
+	if len(edges) > 0 && edges[0].EdgeKey != "A|calls|B" {
+		t.Errorf("expected edge A|calls|B, got %s", edges[0].EdgeKey)
+	}
+}
+
+// TestMaterializationManager_GetMaterializedByEvidence_SimilarKeys tests that
+// keys with similar prefixes/suffixes don't cause false positives.
+func TestMaterializationManager_GetMaterializedByEvidence_SimilarKeys(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create edges with similar but different evidence keys
+	results := []InferenceResult{
+		{
+			DerivedEdge: DerivedEdge{SourceID: "A", EdgeType: "calls", TargetID: "B"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "foo", EdgeType: "imports", TargetID: "bar"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+		{
+			DerivedEdge: DerivedEdge{SourceID: "C", EdgeType: "calls", TargetID: "D"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "foo_ext", EdgeType: "imports", TargetID: "bar_ext"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+		{
+			DerivedEdge: DerivedEdge{SourceID: "E", EdgeType: "calls", TargetID: "F"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "prefix_foo", EdgeType: "imports", TargetID: "prefix_bar"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+	}
+
+	if err := manager.Materialize(ctx, results); err != nil {
+		t.Fatalf("Materialize failed: %v", err)
+	}
+
+	// Search for exact match - should only find the first one
+	edges, err := manager.GetMaterializedByEvidence(ctx, "foo|imports|bar")
+	if err != nil {
+		t.Fatalf("GetMaterializedByEvidence failed: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Errorf("expected 1 edge for foo|imports|bar, got %d", len(edges))
+	}
+}
+
+// TestMaterializationManager_GetMaterializedByEvidence_SpecialCharacters tests
+// that special characters in evidence keys are handled correctly via exact matching.
+func TestMaterializationManager_GetMaterializedByEvidence_SpecialCharacters(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create edges with special characters in evidence (avoiding backslashes
+	// which have complex JSON encoding behavior)
+	results := []InferenceResult{
+		{
+			DerivedEdge: DerivedEdge{SourceID: "A", EdgeType: "calls", TargetID: "B"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "pkg/foo-bar", EdgeType: "imports", TargetID: "pkg/baz.qux"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+		{
+			DerivedEdge: DerivedEdge{SourceID: "C", EdgeType: "calls", TargetID: "D"},
+			RuleID:      "rule1",
+			Evidence:    []EvidenceEdge{{SourceID: "test:path", EdgeType: "imports", TargetID: "other:path"}},
+			DerivedAt:   time.Now(),
+			Confidence:  1.0,
+		},
+	}
+
+	if err := manager.Materialize(ctx, results); err != nil {
+		t.Fatalf("Materialize failed: %v", err)
+	}
+
+	// Search for key with special characters (hyphen, dot)
+	edges, err := manager.GetMaterializedByEvidence(ctx, "pkg/foo-bar|imports|pkg/baz.qux")
+	if err != nil {
+		t.Fatalf("GetMaterializedByEvidence failed: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Errorf("expected 1 edge for special char key, got %d", len(edges))
+	}
+
+	// Search for key with colons
+	edges, err = manager.GetMaterializedByEvidence(ctx, "test:path|imports|other:path")
+	if err != nil {
+		t.Fatalf("GetMaterializedByEvidence failed: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Errorf("expected 1 edge for colon key, got %d", len(edges))
+	}
+}
+
 // =============================================================================
 // DeleteMaterializedEdge Tests
 // =============================================================================
@@ -679,5 +833,263 @@ func TestMaterializationManager_ConcurrentReads(t *testing.T) {
 		if err != nil {
 			t.Errorf("concurrent IsMaterialized %d failed: %v", i, err)
 		}
+	}
+}
+
+// =============================================================================
+// W3M.14 Lock Contention Tests
+// =============================================================================
+
+func TestMaterializationManager_ConcurrentMaterializeDifferentEdges(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Run multiple materializations concurrently with different edges
+	numGoroutines := 20
+	var wg sync.WaitGroup
+	errors := make([]error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			source := "Node" + string(rune('A'+idx))
+			target := "Node" + string(rune('B'+idx))
+			result := createTestInferenceResult("rule1", source, "calls", target, "ev"+source)
+			errors[idx] = manager.Materialize(ctx, []InferenceResult{result})
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Check for errors
+	for i, err := range errors {
+		if err != nil {
+			t.Errorf("concurrent Materialize %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all edges were stored
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM materialized_edges").Scan(&count)
+	if err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != numGoroutines {
+		t.Errorf("expected %d records, got %d", numGoroutines, count)
+	}
+}
+
+func TestMaterializationManager_NoDataCorruption(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create a batch of edges to insert
+	numEdges := 50
+	var wg sync.WaitGroup
+	errors := make([]error, numEdges)
+
+	for i := 0; i < numEdges; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			result := InferenceResult{
+				DerivedEdge: DerivedEdge{
+					SourceID: "Source" + string(rune('A'+idx%26)) + "_" + string(rune('0'+idx/26)),
+					EdgeType: "edge_type",
+					TargetID: "Target" + string(rune('A'+idx%26)) + "_" + string(rune('0'+idx/26)),
+				},
+				RuleID: "rule1",
+				Evidence: []EvidenceEdge{
+					{SourceID: "ev_src", EdgeType: "ev_type", TargetID: "ev_tgt"},
+				},
+				DerivedAt:  time.Now(),
+				Confidence: 1.0,
+			}
+			errors[idx] = manager.Materialize(ctx, []InferenceResult{result})
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Check for errors
+	for i, err := range errors {
+		if err != nil {
+			t.Errorf("Materialize %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all records are present and properly formed
+	edges, err := manager.GetAllMaterializedEdges(ctx)
+	if err != nil {
+		t.Fatalf("GetAllMaterializedEdges failed: %v", err)
+	}
+	if len(edges) != numEdges {
+		t.Errorf("expected %d edges, got %d", numEdges, len(edges))
+	}
+
+	// Verify each edge has valid data
+	for _, edge := range edges {
+		if edge.ID == 0 {
+			t.Error("found edge with zero ID")
+		}
+		if edge.EdgeKey == "" {
+			t.Error("found edge with empty EdgeKey")
+		}
+		if edge.RuleID != "rule1" {
+			t.Errorf("found edge with wrong rule_id: %s", edge.RuleID)
+		}
+		if len(edge.Evidence) == 0 {
+			t.Error("found edge with empty evidence")
+		}
+	}
+}
+
+func TestMaterializationManager_MixedReadWriteContention(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Pre-populate some edges
+	for i := 0; i < 10; i++ {
+		result := createTestInferenceResult("rule1", "Pre"+string(rune('A'+i)), "calls", "Pre"+string(rune('B'+i)), "ev")
+		if err := manager.Materialize(ctx, []InferenceResult{result}); err != nil {
+			t.Fatalf("pre-populate failed: %v", err)
+		}
+	}
+
+	// Run concurrent reads and writes
+	var wg sync.WaitGroup
+	numOperations := 30
+
+	// Writers
+	writeErrors := make([]error, numOperations/3)
+	for i := 0; i < numOperations/3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			result := createTestInferenceResult("rule1", "Write"+string(rune('A'+idx)), "calls", "Write"+string(rune('B'+idx)), "ev")
+			writeErrors[idx] = manager.Materialize(ctx, []InferenceResult{result})
+		}(i)
+	}
+
+	// Readers (IsMaterialized)
+	readErrors := make([]error, numOperations/3)
+	for i := 0; i < numOperations/3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			key := "PreA|calls|PreB"
+			_, readErrors[idx] = manager.IsMaterialized(ctx, key)
+		}(i)
+	}
+
+	// Readers (GetMaterializedEdges)
+	listErrors := make([]error, numOperations/3)
+	for i := 0; i < numOperations/3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, listErrors[idx] = manager.GetMaterializedEdges(ctx, "rule1")
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Check for errors
+	for i, err := range writeErrors {
+		if err != nil {
+			t.Errorf("write %d failed: %v", i, err)
+		}
+	}
+	for i, err := range readErrors {
+		if err != nil {
+			t.Errorf("read %d failed: %v", i, err)
+		}
+	}
+	for i, err := range listErrors {
+		if err != nil {
+			t.Errorf("list %d failed: %v", i, err)
+		}
+	}
+}
+
+func TestMaterializationManager_ConcurrentDeleteAndRead(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+	insertTestRule(t, db, "rule2")
+
+	// Pre-populate edges for both rules
+	for i := 0; i < 10; i++ {
+		result1 := createTestInferenceResult("rule1", "R1_"+string(rune('A'+i)), "calls", "R1_"+string(rune('B'+i)), "ev")
+		result2 := createTestInferenceResult("rule2", "R2_"+string(rune('A'+i)), "calls", "R2_"+string(rune('B'+i)), "ev")
+		if err := manager.Materialize(ctx, []InferenceResult{result1, result2}); err != nil {
+			t.Fatalf("pre-populate failed: %v", err)
+		}
+	}
+
+	// Run concurrent deletes and reads
+	var wg sync.WaitGroup
+
+	// Delete rule1 edges
+	wg.Add(1)
+	var deleteErr error
+	go func() {
+		defer wg.Done()
+		deleteErr = manager.DeleteMaterializedByRule(ctx, "rule1")
+	}()
+
+	// Read rule2 edges multiple times during delete
+	readErrors := make([]error, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, readErrors[idx] = manager.GetMaterializedEdges(ctx, "rule2")
+		}(i)
+	}
+
+	wg.Wait()
+
+	if deleteErr != nil {
+		t.Errorf("delete failed: %v", deleteErr)
+	}
+	for i, err := range readErrors {
+		if err != nil {
+			t.Errorf("read %d failed: %v", i, err)
+		}
+	}
+
+	// Verify rule1 edges are gone
+	edges1, err := manager.GetMaterializedEdges(ctx, "rule1")
+	if err != nil {
+		t.Fatalf("GetMaterializedEdges rule1 failed: %v", err)
+	}
+	if len(edges1) != 0 {
+		t.Errorf("expected 0 rule1 edges, got %d", len(edges1))
+	}
+
+	// Verify rule2 edges are intact
+	edges2, err := manager.GetMaterializedEdges(ctx, "rule2")
+	if err != nil {
+		t.Fatalf("GetMaterializedEdges rule2 failed: %v", err)
+	}
+	if len(edges2) != 10 {
+		t.Errorf("expected 10 rule2 edges, got %d", len(edges2))
 	}
 }

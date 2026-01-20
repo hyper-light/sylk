@@ -30,9 +30,12 @@ type MaterializedEdgeRecord struct {
 
 // MaterializationManager handles the persistence of derived edges.
 // It stores edges created by inference rules and tracks their provenance.
+// Uses a write-only mutex to serialize write operations while allowing
+// concurrent reads. Data preparation is done outside the lock to minimize
+// contention during I/O operations.
 type MaterializationManager struct {
-	db *sql.DB
-	mu sync.RWMutex
+	db      *sql.DB
+	writeMu sync.Mutex // Protects write operations only
 }
 
 // NewMaterializationManager creates a new MaterializationManager with the given database.
@@ -42,15 +45,69 @@ func NewMaterializationManager(db *sql.DB) *MaterializationManager {
 	}
 }
 
+// preparedResult holds pre-computed data for materialization.
+// This allows data preparation outside of database transactions.
+type preparedResult struct {
+	edgeKey      string
+	ruleID       string
+	evidenceJSON string
+	derivedAt    string
+}
+
 // Materialize stores derived edges from inference results.
 // It inserts records into the materialized_edges table, avoiding duplicates.
+// Data preparation is done outside the transaction to minimize lock time.
 func (m *MaterializationManager) Materialize(ctx context.Context, results []InferenceResult) error {
 	if len(results) == 0 {
 		return nil
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Prepare all data outside of transaction (no lock held)
+	prepared, err := m.prepareResults(results)
+	if err != nil {
+		return err
+	}
+
+	// Execute transaction with prepared data
+	return m.executeMaterialize(ctx, prepared)
+}
+
+// prepareResults builds edge keys and evidence JSON for all results.
+// This is CPU-bound work done outside any lock or transaction.
+func (m *MaterializationManager) prepareResults(results []InferenceResult) ([]preparedResult, error) {
+	prepared := make([]preparedResult, len(results))
+	for i, result := range results {
+		pr, err := m.prepareOneResult(result)
+		if err != nil {
+			return nil, err
+		}
+		prepared[i] = pr
+	}
+	return prepared, nil
+}
+
+// prepareOneResult prepares a single result for materialization.
+func (m *MaterializationManager) prepareOneResult(result InferenceResult) (preparedResult, error) {
+	edgeKey := m.buildEdgeKey(result.DerivedEdge)
+	evidenceKeys := m.buildEvidenceKeys(result.Evidence)
+	evidenceJSON, err := json.Marshal(evidenceKeys)
+	if err != nil {
+		return preparedResult{}, fmt.Errorf("marshal evidence: %w", err)
+	}
+
+	return preparedResult{
+		edgeKey:      edgeKey,
+		ruleID:       result.RuleID,
+		evidenceJSON: string(evidenceJSON),
+		derivedAt:    result.DerivedAt.UTC().Format(time.RFC3339),
+	}, nil
+}
+
+// executeMaterialize runs the database transaction with prepared data.
+// Lock is acquired only for the write transaction, not during data preparation.
+func (m *MaterializationManager) executeMaterialize(ctx context.Context, prepared []preparedResult) error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
 
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -58,8 +115,8 @@ func (m *MaterializationManager) Materialize(ctx context.Context, results []Infe
 	}
 	defer tx.Rollback()
 
-	for _, result := range results {
-		if err := m.materializeResult(ctx, tx, result); err != nil {
+	for _, pr := range prepared {
+		if err := m.insertPrepared(ctx, tx, pr); err != nil {
 			return err
 		}
 	}
@@ -67,38 +124,26 @@ func (m *MaterializationManager) Materialize(ctx context.Context, results []Infe
 	return tx.Commit()
 }
 
-// materializeResult stores a single inference result.
-func (m *MaterializationManager) materializeResult(ctx context.Context, tx *sql.Tx, result InferenceResult) error {
-	edgeKey := m.buildEdgeKey(result.DerivedEdge)
-
-	// Check if already materialized to avoid duplicates
-	exists, err := m.existsInTx(ctx, tx, edgeKey)
+// insertPrepared inserts a single prepared result, skipping duplicates.
+func (m *MaterializationManager) insertPrepared(ctx context.Context, tx *sql.Tx, pr preparedResult) error {
+	exists, err := m.existsInTx(ctx, tx, pr.edgeKey)
 	if err != nil {
 		return fmt.Errorf("check existence: %w", err)
 	}
 	if exists {
-		return nil // Skip duplicate
+		return nil
 	}
-
-	// Build evidence keys
-	evidenceKeys := m.buildEvidenceKeys(result.Evidence)
-	evidenceJSON, err := json.Marshal(evidenceKeys)
-	if err != nil {
-		return fmt.Errorf("marshal evidence: %w", err)
-	}
-
-	derivedAt := result.DerivedAt.UTC().Format(time.RFC3339)
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO materialized_edges (rule_id, edge_key, evidence_json, derived_at)
 		VALUES (?, ?, ?, ?)
-	`, result.RuleID, edgeKey, string(evidenceJSON), derivedAt)
+	`, pr.ruleID, pr.edgeKey, pr.evidenceJSON, pr.derivedAt)
 	if err != nil {
 		return fmt.Errorf("insert materialized edge: %w", err)
 	}
-
 	return nil
 }
+
 
 // existsInTx checks if an edge key already exists in the materialized_edges table.
 func (m *MaterializationManager) existsInTx(ctx context.Context, tx *sql.Tx, edgeKey string) (bool, error) {
@@ -128,10 +173,8 @@ func (m *MaterializationManager) buildEvidenceKeys(evidence []EvidenceEdge) []st
 }
 
 // IsMaterialized checks if an edge was derived by inference.
+// No application lock needed - SQLite handles read concurrency.
 func (m *MaterializationManager) IsMaterialized(ctx context.Context, edgeKey string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	var count int
 	err := m.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM materialized_edges WHERE edge_key = ?
@@ -143,10 +186,8 @@ func (m *MaterializationManager) IsMaterialized(ctx context.Context, edgeKey str
 }
 
 // GetMaterializedEdges retrieves all edges derived by a specific rule.
+// No application lock needed - SQLite handles read concurrency.
 func (m *MaterializationManager) GetMaterializedEdges(ctx context.Context, ruleID string) ([]MaterializedEdgeRecord, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT id, rule_id, edge_key, evidence_json, derived_at
 		FROM materialized_edges
@@ -202,9 +243,10 @@ func (m *MaterializationManager) scanSingleRecord(rows *sql.Rows) (MaterializedE
 
 // DeleteMaterializedByRule removes all edges derived by a specific rule.
 // This is used when a rule is updated or deleted.
+// Uses write lock to serialize with other write operations.
 func (m *MaterializationManager) DeleteMaterializedByRule(ctx context.Context, ruleID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
 
 	_, err := m.db.ExecContext(ctx, `
 		DELETE FROM materialized_edges WHERE rule_id = ?
@@ -216,10 +258,8 @@ func (m *MaterializationManager) DeleteMaterializedByRule(ctx context.Context, r
 }
 
 // GetAllMaterializedEdges retrieves all materialized edges.
+// No application lock needed - SQLite handles read concurrency.
 func (m *MaterializationManager) GetAllMaterializedEdges(ctx context.Context) ([]MaterializedEdgeRecord, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT id, rule_id, edge_key, evidence_json, derived_at
 		FROM materialized_edges
@@ -233,11 +273,21 @@ func (m *MaterializationManager) GetAllMaterializedEdges(ctx context.Context) ([
 }
 
 // GetMaterializedByEvidence retrieves all edges that depend on a given evidence edge.
+// No application lock needed - SQLite handles read concurrency.
 func (m *MaterializationManager) GetMaterializedByEvidence(ctx context.Context, evidenceKey string) ([]MaterializedEdgeRecord, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	records, err := m.queryByEvidencePattern(ctx, evidenceKey)
+	if err != nil {
+		return nil, err
+	}
 
-	// Query all records and filter by evidence (JSON contains)
+	return m.filterByExactEvidence(records, evidenceKey), nil
+}
+
+// queryByEvidencePattern retrieves candidates that may contain the evidence key.
+// Uses a simple substring match as a pre-filter. Exact matching is done by
+// filterByExactEvidence after unmarshaling the JSON evidence arrays.
+func (m *MaterializationManager) queryByEvidencePattern(ctx context.Context, evidenceKey string) ([]MaterializedEdgeRecord, error) {
+	// Simple pattern match - filterByExactEvidence does precise matching
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT id, rule_id, edge_key, evidence_json, derived_at
 		FROM materialized_edges
@@ -248,20 +298,18 @@ func (m *MaterializationManager) GetMaterializedByEvidence(ctx context.Context, 
 	}
 	defer rows.Close()
 
-	records, err := m.scanMaterializedEdges(rows)
-	if err != nil {
-		return nil, err
-	}
+	return m.scanMaterializedEdges(rows)
+}
 
-	// Filter to ensure exact match in evidence array
+// filterByExactEvidence filters records to those with exact evidence match.
+func (m *MaterializationManager) filterByExactEvidence(records []MaterializedEdgeRecord, evidenceKey string) []MaterializedEdgeRecord {
 	var filtered []MaterializedEdgeRecord
 	for _, record := range records {
 		if m.containsEvidence(record.Evidence, evidenceKey) {
 			filtered = append(filtered, record)
 		}
 	}
-
-	return filtered, nil
+	return filtered
 }
 
 // containsEvidence checks if the evidence array contains a specific key.
@@ -275,9 +323,10 @@ func (m *MaterializationManager) containsEvidence(evidence []string, key string)
 }
 
 // DeleteMaterializedEdge deletes a specific materialized edge by its key.
+// Uses write lock to serialize with other write operations.
 func (m *MaterializationManager) DeleteMaterializedEdge(ctx context.Context, edgeKey string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
 
 	_, err := m.db.ExecContext(ctx, `
 		DELETE FROM materialized_edges WHERE edge_key = ?
