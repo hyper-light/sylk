@@ -522,6 +522,253 @@ func TestTruncate_RemovesOldObservations(t *testing.T) {
 	log.Close()
 }
 
+func TestTruncate_AppendOnlyNoRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Record 10 observations
+	for i := 0; i < 10; i++ {
+		log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+
+	// Get file size before truncate
+	sizeBefore, _ := log.Size()
+
+	// Truncate before sequence 5 - should append marker, not rewrite
+	if err := log.Truncate(5); err != nil {
+		t.Fatalf("failed to truncate: %v", err)
+	}
+
+	// File size should increase (append-only)
+	sizeAfter, _ := log.Size()
+	if sizeAfter <= sizeBefore {
+		t.Errorf("expected file size to increase after truncate marker, got %d <= %d", sizeAfter, sizeBefore)
+	}
+
+	// Verify observations are still filtered correctly
+	observations, _ := log.GetObservations()
+	if len(observations) != 6 {
+		t.Errorf("expected 6 observations, got %d", len(observations))
+	}
+
+	log.Close()
+}
+
+func TestTruncate_DataIntegrityAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Record 10 observations
+	for i := 0; i < 10; i++ {
+		log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: i,
+		})
+	}
+
+	// Truncate before sequence 5
+	log.Truncate(5)
+	log.Close()
+
+	// Reopen and verify
+	log2, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to reopen log: %v", err)
+	}
+	defer log2.Close()
+
+	observations, _ := log2.GetObservations()
+	if len(observations) != 6 {
+		t.Errorf("expected 6 observations after reopen, got %d", len(observations))
+	}
+
+	// Verify truncate sequence was preserved
+	if log2.TruncateSequence() != 5 {
+		t.Errorf("expected truncate sequence 5, got %d", log2.TruncateSequence())
+	}
+}
+
+func TestTruncate_PerformanceLargeFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Record 1000 observations
+	for i := 0; i < 1000; i++ {
+		log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: i,
+			PrefetchedIDs: []string{"a", "b", "c"},
+		})
+	}
+
+	// Truncate should be fast (append-only, no rewrite)
+	start := time.Now()
+	if err := log.Truncate(500); err != nil {
+		t.Fatalf("failed to truncate: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Truncate should be < 10ms since it's just appending a marker
+	if elapsed > 10*time.Millisecond {
+		t.Errorf("truncate took %v, expected < 10ms for append-only operation", elapsed)
+	}
+
+	// Verify correct observations are returned
+	observations, _ := log.GetObservations()
+	if len(observations) != 501 {
+		t.Errorf("expected 501 observations (500-1000), got %d", len(observations))
+	}
+}
+
+func TestCompact_ReclainsSpace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Record 100 observations
+	for i := 0; i < 100; i++ {
+		log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+
+	// Truncate to keep only last 10
+	log.Truncate(91)
+
+	// Get size before compaction
+	sizeBefore, _ := log.Size()
+
+	// Compact to physically remove deleted entries
+	if err := log.Compact(); err != nil {
+		t.Fatalf("failed to compact: %v", err)
+	}
+
+	// Size should decrease significantly
+	sizeAfter, _ := log.Size()
+	if sizeAfter >= sizeBefore {
+		t.Errorf("expected size to decrease after compact, got %d >= %d", sizeAfter, sizeBefore)
+	}
+
+	// Verify data integrity
+	observations, _ := log.GetObservations()
+	if len(observations) != 10 {
+		t.Errorf("expected 10 observations after compact, got %d", len(observations))
+	}
+
+	// Deleted count should be reset
+	if log.DeletedCount() != 0 {
+		t.Errorf("expected deleted count 0 after compact, got %d", log.DeletedCount())
+	}
+}
+
+func TestCompact_DataIntegrityAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Record, truncate, compact
+	for i := 0; i < 50; i++ {
+		log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: i,
+		})
+	}
+	log.Truncate(26)
+	log.Compact()
+	log.Close()
+
+	// Reopen and verify
+	log2, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to reopen log: %v", err)
+	}
+	defer log2.Close()
+
+	observations, _ := log2.GetObservations()
+	if len(observations) != 25 {
+		t.Errorf("expected 25 observations, got %d", len(observations))
+	}
+
+	// Verify data content
+	for _, obs := range observations {
+		if obs.Sequence < 26 {
+			t.Errorf("found observation with sequence %d, expected >= 26", obs.Sequence)
+		}
+	}
+}
+
+func TestTruncate_MultipleTruncates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Record 20 observations
+	for i := 0; i < 20; i++ {
+		log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+
+	// Multiple truncates
+	log.Truncate(5)
+	log.Truncate(10)
+	log.Truncate(15)
+
+	// Should only see observations >= 15
+	observations, _ := log.GetObservations()
+	if len(observations) != 6 {
+		t.Errorf("expected 6 observations (15-20), got %d", len(observations))
+	}
+
+	for _, obs := range observations {
+		if obs.Sequence < 15 {
+			t.Errorf("found observation with sequence %d, expected >= 15", obs.Sequence)
+		}
+	}
+}
+
 // =============================================================================
 // Query Methods Tests
 // =============================================================================

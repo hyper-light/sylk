@@ -53,6 +53,20 @@ type LoggedObservation struct {
 	Timestamp   time.Time          `json:"timestamp"`
 	Observation EpisodeObservation `json:"observation"`
 	Processed   bool               `json:"processed"`
+	Deleted     bool               `json:"deleted,omitempty"`
+}
+
+// TruncateMarker is a special record that marks all entries before a sequence as deleted.
+type TruncateMarker struct {
+	Type            string    `json:"type"`
+	BeforeSequence  uint64    `json:"before_sequence"`
+	Timestamp       time.Time `json:"timestamp"`
+	DeletedCount    int       `json:"deleted_count"`
+}
+
+// IsTruncateMarker checks if a JSON line is a truncate marker.
+func IsTruncateMarker(data []byte) bool {
+	return len(data) > 10 && data[1] == '"' && data[2] == 't' && data[3] == 'y' && data[4] == 'p' && data[5] == 'e'
 }
 
 // writeRequest represents an async write request.
@@ -76,6 +90,10 @@ type ObservationLog struct {
 	file     *os.File
 	writer   *bufio.Writer
 	sequence uint64
+
+	// Truncation tracking for soft deletes (avoids full file rewrite)
+	truncateBeforeSeq uint64 // Entries with sequence < this are logically deleted
+	deletedCount      int    // Count of logically deleted entries
 
 	// Async write queue - decouples serialization from I/O
 	writeQueue      chan *writeRequest
@@ -179,10 +197,21 @@ func (l *ObservationLog) scanForLastSequence() error {
 
 	scanner := bufio.NewScanner(l.file)
 	var lastSeq uint64
+	var truncateSeq uint64
+	var deletedCount int
 
 	for scanner.Scan() {
+		line := scanner.Bytes()
+		if IsTruncateMarker(line) {
+			var marker TruncateMarker
+			if err := json.Unmarshal(line, &marker); err == nil {
+				truncateSeq = marker.BeforeSequence
+				deletedCount = marker.DeletedCount
+			}
+			continue
+		}
 		var logged LoggedObservation
-		if err := json.Unmarshal(scanner.Bytes(), &logged); err != nil {
+		if err := json.Unmarshal(line, &logged); err != nil {
 			continue
 		}
 		if logged.Sequence > lastSeq {
@@ -191,6 +220,8 @@ func (l *ObservationLog) scanForLastSequence() error {
 	}
 
 	l.sequence = lastSeq
+	l.truncateBeforeSeq = truncateSeq
+	l.deletedCount = deletedCount
 
 	// Seek to end for appending
 	_, err := l.file.Seek(0, 2)
@@ -451,9 +482,13 @@ func (l *ObservationLog) Replay() (int, error) {
 
 func (l *ObservationLog) readAllObservations() ([]LoggedObservation, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	truncateSeq := l.truncateBeforeSeq
+	l.mu.Unlock()
 
-	// Read from start
+	return l.readObservationsFiltered(truncateSeq)
+}
+
+func (l *ObservationLog) readObservationsFiltered(truncateSeq uint64) ([]LoggedObservation, error) {
 	file, err := os.Open(l.path)
 	if err != nil {
 		return nil, err
@@ -464,11 +499,18 @@ func (l *ObservationLog) readAllObservations() ([]LoggedObservation, error) {
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
+		line := scanner.Bytes()
+		if IsTruncateMarker(line) {
+			continue // Skip truncate markers
+		}
 		var logged LoggedObservation
-		if err := json.Unmarshal(scanner.Bytes(), &logged); err != nil {
+		if err := json.Unmarshal(line, &logged); err != nil {
 			continue
 		}
-		observations = append(observations, logged)
+		// Filter out logically deleted entries
+		if logged.Sequence >= truncateSeq && !logged.Deleted {
+			observations = append(observations, logged)
+		}
 	}
 
 	return observations, scanner.Err()
@@ -541,8 +583,73 @@ func (l *ObservationLog) GetObservations() ([]LoggedObservation, error) {
 // Truncate Methods
 // =============================================================================
 
-// Truncate removes all observations before the given sequence.
+// Truncate marks all observations before the given sequence as logically deleted.
+// This is an append-only operation that writes a truncate marker, avoiding full file rewrite.
+// Use Compact() to reclaim space by physically removing deleted entries.
 func (l *ObservationLog) Truncate(beforeSequence uint64) error {
+	if l.closed.Load() {
+		return ErrObservationLogClosed
+	}
+
+	return l.writeTruncateMarker(beforeSequence)
+}
+
+func (l *ObservationLog) writeTruncateMarker(beforeSequence uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Count entries being deleted
+	deletedCount := l.countEntriesBefore(beforeSequence)
+
+	// Create truncate marker
+	marker := TruncateMarker{
+		Type:           "truncate",
+		BeforeSequence: beforeSequence,
+		Timestamp:      time.Now(),
+		DeletedCount:   deletedCount,
+	}
+
+	// Write marker to WAL
+	return l.writeMarkerLocked(marker)
+}
+
+func (l *ObservationLog) countEntriesBefore(beforeSequence uint64) int {
+	count := 0
+	for seq := l.truncateBeforeSeq; seq < beforeSequence && seq <= l.sequence; seq++ {
+		count++
+	}
+	return count
+}
+
+func (l *ObservationLog) writeMarkerLocked(marker TruncateMarker) error {
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	if _, err := l.writer.Write(data); err != nil {
+		return err
+	}
+
+	if err := l.writer.Flush(); err != nil {
+		return err
+	}
+
+	if err := l.file.Sync(); err != nil {
+		return err
+	}
+
+	// Update in-memory state
+	l.truncateBeforeSeq = marker.BeforeSequence
+	l.deletedCount += marker.DeletedCount
+
+	return nil
+}
+
+// Compact physically removes deleted entries by rewriting the file.
+// This should be called periodically when deletedCount exceeds a threshold.
+func (l *ObservationLog) Compact() error {
 	if l.closed.Load() {
 		return ErrObservationLogClosed
 	}
@@ -550,36 +657,20 @@ func (l *ObservationLog) Truncate(beforeSequence uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return l.truncateLocked(beforeSequence)
+	return l.compactLocked()
 }
 
-func (l *ObservationLog) truncateLocked(beforeSequence uint64) error {
-	// Read all observations
-	file, err := os.Open(l.path)
+func (l *ObservationLog) compactLocked() error {
+	observations, err := l.readObservationsFiltered(l.truncateBeforeSeq)
 	if err != nil {
 		return err
 	}
 
-	var keep []LoggedObservation
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		var logged LoggedObservation
-		if err := json.Unmarshal(scanner.Bytes(), &logged); err != nil {
-			continue
-		}
-		if logged.Sequence >= beforeSequence {
-			keep = append(keep, logged)
-		}
-	}
-	file.Close()
-
-	// Rewrite file with kept observations
-	return l.rewriteFile(keep)
+	return l.rewriteFile(observations)
 }
 
 func (l *ObservationLog) rewriteFile(observations []LoggedObservation) error {
-	// Close current file
+	// Flush and close current file
 	l.writer.Flush()
 	l.file.Close()
 
@@ -591,17 +682,24 @@ func (l *ObservationLog) rewriteFile(observations []LoggedObservation) error {
 
 	writer := bufio.NewWriter(file)
 
-	for _, obs := range observations {
-		data, err := json.Marshal(obs)
-		if err != nil {
+	// Write truncate marker first to preserve truncation state
+	if l.truncateBeforeSeq > 0 {
+		marker := TruncateMarker{
+			Type:           "truncate",
+			BeforeSequence: l.truncateBeforeSeq,
+			Timestamp:      time.Now(),
+			DeletedCount:   0, // Reset after compaction
+		}
+		if err := l.writeMarkerToWriter(writer, marker); err != nil {
 			file.Close()
 			return err
 		}
-		data = append(data, '\n')
-		if _, err := writer.Write(data); err != nil {
-			file.Close()
-			return err
-		}
+	}
+
+	// Write observations
+	if err := l.writeObservationsToWriter(writer, observations); err != nil {
+		file.Close()
+		return err
 	}
 
 	if err := writer.Flush(); err != nil {
@@ -616,8 +714,48 @@ func (l *ObservationLog) rewriteFile(observations []LoggedObservation) error {
 
 	l.file = file
 	l.writer = bufio.NewWriter(file)
+	l.deletedCount = 0 // Reset after compaction
 
 	return nil
+}
+
+func (l *ObservationLog) writeMarkerToWriter(w *bufio.Writer, marker TruncateMarker) error {
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	_, err = w.Write(data)
+	return err
+}
+
+func (l *ObservationLog) writeObservationsToWriter(w *bufio.Writer, observations []LoggedObservation) error {
+	for _, obs := range observations {
+		data, err := json.Marshal(obs)
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		if _, err := w.Write(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeletedCount returns the number of logically deleted entries.
+// When this exceeds a threshold, Compact() should be called.
+func (l *ObservationLog) DeletedCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.deletedCount
+}
+
+// TruncateSequence returns the sequence number before which entries are deleted.
+func (l *ObservationLog) TruncateSequence() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.truncateBeforeSeq
 }
 
 // =============================================================================
