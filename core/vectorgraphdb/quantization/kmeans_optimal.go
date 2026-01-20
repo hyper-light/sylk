@@ -427,10 +427,19 @@ func (s *kmeansState) copyCentroidsFrom(other *kmeansState) {
 
 // resetForRestart resets the state for a new k-means restart.
 // Vectors and vectorNorms are preserved (they don't change between restarts).
+// All other state is zeroed to prevent data leakage between restarts.
 func (s *kmeansState) resetForRestart() {
-	// Clear centroids (will be reinitialized)
+	// Clear centroids (will be reinitialized by initKMeansPlusPlus)
 	for i := range s.centroids {
 		s.centroids[i] = 0
+	}
+	// Clear centroid norms (recomputed after centroid init)
+	for i := range s.centroidNorms {
+		s.centroidNorms[i] = 0
+	}
+	// Clear dot products (recomputed each iteration)
+	for i := range s.dots {
+		s.dots[i] = 0
 	}
 	// Clear assignments
 	for i := range s.assignments {
@@ -440,10 +449,11 @@ func (s *kmeansState) resetForRestart() {
 	for i := range s.counts {
 		s.counts[i] = 0
 	}
-	// Clear newCentroids
+	// Clear newCentroids accumulator
 	for i := range s.newCentroids {
 		s.newCentroids[i] = 0
 	}
+	// Reset objective
 	s.objective = 0
 }
 
@@ -532,6 +542,87 @@ func kmeansSequentialRestarts(vectors [][]float32, k int, config KMeansConfig, b
 	return result, nil
 }
 
+// kmeansParallelRestarts runs restarts in parallel using a worker pool with pre-allocated states.
+// Each worker maintains its own kmeansState that is reused across assigned restarts.
+func kmeansParallelRestarts(
+	ctx context.Context,
+	vectors [][]float32,
+	k int,
+	config KMeansConfig,
+	baseSeed int64,
+	numWorkers int,
+) ([][]float32, error) {
+	// Work items for the job queue
+	type workItem struct {
+		restartID int
+		seed      int64
+	}
+
+	// Channel for distributing work to workers
+	jobs := make(chan workItem, config.NumRestarts)
+	results := make(chan kmeansResult, config.NumRestarts)
+	var wg sync.WaitGroup
+
+	// Launch worker goroutines with pre-allocated state
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Pre-allocate state for this worker (reused across all restarts)
+			state := newKMeansState(vectors, k)
+			if state == nil {
+				return
+			}
+
+			// Process jobs until channel closes or context cancels
+			for job := range jobs {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// Reset and reuse state for this restart
+				state.resetForRestart()
+
+				rng := rand.New(rand.NewSource(job.seed))
+				objective := state.runSingleKMeans(config, rng)
+
+				select {
+				case results <- kmeansResult{
+					centroids: state.extractCentroids(),
+					objective: objective,
+				}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Enqueue all restart jobs
+	go func() {
+		for restart := 0; restart < config.NumRestarts; restart++ {
+			select {
+			case <-ctx.Done():
+				break
+			case jobs <- workItem{restartID: restart, seed: baseSeed + int64(restart)}:
+			}
+		}
+		close(jobs)
+	}()
+
+	// Close results channel when all workers complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect best result
+	return collectBestResult(results), nil
+}
+
 // KMeansOptimal performs optimal k-means clustering with BLAS vectorization.
 // Returns the best centroids found across all restarts.
 //
@@ -598,62 +689,8 @@ func KMeansOptimal(ctx context.Context, vectors [][]float32, k int, config KMean
 		return kmeansSequentialRestarts(vectors, k, config, seed)
 	}
 
-	// Channel to collect results
-	results := make(chan kmeansResult, config.NumRestarts)
-	sem := make(chan struct{}, numWorkers)
-	var wg sync.WaitGroup
-
-	// Launch parallel restarts
-	for restart := 0; restart < config.NumRestarts; restart++ {
-		// Check for cancellation before spawning
-		select {
-		case <-ctx.Done():
-			// Wait for running workers, then return best so far
-			wg.Wait()
-			close(results)
-			return collectBestResult(results), ctx.Err()
-		default:
-		}
-
-		wg.Add(1)
-		go func(restartID int, restartSeed int64) {
-			defer wg.Done()
-
-			// Acquire semaphore
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			defer func() { <-sem }()
-
-			// Each restart gets its own state (memory isolation for correctness)
-			state := newKMeansState(vectors, k)
-			if state == nil {
-				return
-			}
-
-			rng := rand.New(rand.NewSource(restartSeed))
-			objective := state.runSingleKMeans(config, rng)
-
-			select {
-			case results <- kmeansResult{
-				centroids: state.extractCentroids(),
-				objective: objective,
-			}:
-			case <-ctx.Done():
-			}
-		}(restart, seed+int64(restart))
-	}
-
-	// Close results channel when all workers complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collect best result
-	return collectBestResult(results), nil
+	// Run parallel restarts with pre-allocated worker states
+	return kmeansParallelRestarts(ctx, vectors, k, config, seed, numWorkers)
 }
 
 // collectBestResult reads all results from the channel and returns the best centroids.
