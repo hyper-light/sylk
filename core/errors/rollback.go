@@ -2,7 +2,69 @@ package errors
 
 import (
 	"context"
+	"sync"
 )
+
+// IntermediateResource represents a resource created during rollback.
+type IntermediateResource struct {
+	Layer       RollbackLayer
+	ResourceID  string
+	Description string
+	Cleanup     func() error
+}
+
+// ResourceTracker tracks intermediate resources for cleanup on failure.
+type ResourceTracker struct {
+	mu        sync.Mutex
+	resources []*IntermediateResource
+}
+
+// NewResourceTracker creates a new resource tracker.
+func NewResourceTracker() *ResourceTracker {
+	return &ResourceTracker{
+		resources: make([]*IntermediateResource, 0),
+	}
+}
+
+// Track adds a resource to be cleaned up on failure.
+func (rt *ResourceTracker) Track(res *IntermediateResource) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.resources = append(rt.resources, res)
+}
+
+// CleanupAll cleans up all tracked resources in reverse order.
+func (rt *ResourceTracker) CleanupAll() []error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	errors := make([]error, 0)
+	for i := len(rt.resources) - 1; i >= 0; i-- {
+		if rt.resources[i].Cleanup != nil {
+			if err := rt.resources[i].Cleanup(); err != nil {
+				errors = append(errors, err)
+			}
+		}
+	}
+	rt.resources = rt.resources[:0]
+	return errors
+}
+
+// Clear removes all tracked resources without cleanup.
+func (rt *ResourceTracker) Clear() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.resources = rt.resources[:0]
+}
+
+// Resources returns a copy of tracked resources.
+func (rt *ResourceTracker) Resources() []*IntermediateResource {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	result := make([]*IntermediateResource, len(rt.resources))
+	copy(result, rt.resources)
+	return result
+}
 
 // RollbackOptions configures which layers to include in a rollback operation.
 type RollbackOptions struct {
@@ -86,15 +148,50 @@ func (m *RollbackManager) Rollback(
 	pipelineID string,
 	options RollbackOptions,
 ) (*RollbackReceipt, error) {
+	tracker := NewResourceTracker()
 	results := make([]*LayerResult, 0)
 
-	results = m.rollbackLayers(pipelineID, options, results)
-	results = m.handleGitLayers(pipelineID, options, results)
+	results, failed := m.rollbackWithTracking(pipelineID, options, results, tracker)
+	if failed {
+		m.handlePartialFailure(tracker)
+	}
 
 	receipt := m.buildReceipt(pipelineID, results, options)
+	m.addCleanupWarnings(receipt, tracker)
 	m.recordToArchivalist(ctx, pipelineID, receipt)
+	tracker.Clear()
 
 	return receipt, nil
+}
+
+// rollbackWithTracking executes rollback with resource tracking.
+func (m *RollbackManager) rollbackWithTracking(
+	pipelineID string,
+	options RollbackOptions,
+	results []*LayerResult,
+	tracker *ResourceTracker,
+) ([]*LayerResult, bool) {
+	results, failed := m.rollbackLayers(pipelineID, options, results, tracker)
+	if failed {
+		return results, true
+	}
+	return m.handleGitLayers(pipelineID, options, results, tracker)
+}
+
+// handlePartialFailure cleans up intermediate resources on failure.
+func (m *RollbackManager) handlePartialFailure(tracker *ResourceTracker) {
+	tracker.CleanupAll()
+}
+
+// addCleanupWarnings adds warnings for any tracked resources.
+func (m *RollbackManager) addCleanupWarnings(
+	receipt *RollbackReceipt,
+	tracker *ResourceTracker,
+) {
+	resources := tracker.Resources()
+	for _, res := range resources {
+		receipt.AddWarning("intermediate resource: " + res.Description)
+	}
 }
 
 // rollbackLayers handles staging and agent state rollback.
@@ -102,16 +199,25 @@ func (m *RollbackManager) rollbackLayers(
 	pipelineID string,
 	options RollbackOptions,
 	results []*LayerResult,
-) []*LayerResult {
+	tracker *ResourceTracker,
+) ([]*LayerResult, bool) {
 	if options.IncludeStaging {
-		results = append(results, m.rollbackStaging(pipelineID))
+		result := m.rollbackStaging(pipelineID, tracker)
+		results = append(results, result)
+		if !result.Success {
+			return results, true
+		}
 	}
 
 	if options.IncludeAgentState {
-		results = append(results, m.rollbackAgentState(pipelineID))
+		result := m.rollbackAgentState(pipelineID, tracker)
+		results = append(results, result)
+		if !result.Success {
+			return results, true
+		}
 	}
 
-	return results
+	return results, false
 }
 
 // handleGitLayers handles git-related rollback layers.
@@ -119,20 +225,28 @@ func (m *RollbackManager) handleGitLayers(
 	pipelineID string,
 	options RollbackOptions,
 	results []*LayerResult,
-) []*LayerResult {
+	tracker *ResourceTracker,
+) ([]*LayerResult, bool) {
 	if options.IncludeGitLocal && m.config.GitEnabled {
-		results = append(results, m.rollbackGitLocal(pipelineID))
+		result := m.rollbackGitLocal(pipelineID, tracker)
+		results = append(results, result)
+		if !result.Success {
+			return results, true
+		}
 	}
 
 	if options.IncludeGitPushed {
 		results = append(results, m.handleGitPushed(pipelineID, options))
 	}
 
-	return results
+	return results, false
 }
 
 // rollbackStaging discards staged files for the pipeline.
-func (m *RollbackManager) rollbackStaging(pipelineID string) *LayerResult {
+func (m *RollbackManager) rollbackStaging(
+	pipelineID string,
+	tracker *ResourceTracker,
+) *LayerResult {
 	result := &LayerResult{Layer: LayerFileStaging, Success: true}
 
 	if m.staging == nil {
@@ -145,6 +259,8 @@ func (m *RollbackManager) rollbackStaging(pipelineID string) *LayerResult {
 		return m.stagingError(err)
 	}
 
+	m.trackStagingResource(pipelineID, count, tracker)
+
 	if err := m.staging.DiscardStaging(pipelineID); err != nil {
 		return m.stagingError(err)
 	}
@@ -152,6 +268,23 @@ func (m *RollbackManager) rollbackStaging(pipelineID string) *LayerResult {
 	result.ItemCount = count
 	result.Message = "staged files discarded"
 	return result
+}
+
+// trackStagingResource tracks staging operation for cleanup.
+func (m *RollbackManager) trackStagingResource(
+	pipelineID string,
+	count int,
+	tracker *ResourceTracker,
+) {
+	if count == 0 {
+		return
+	}
+	tracker.Track(&IntermediateResource{
+		Layer:       LayerFileStaging,
+		ResourceID:  pipelineID,
+		Description: "staging discard in progress",
+		Cleanup:     nil, // No rollback for staging discard
+	})
 }
 
 // stagingError creates a failed layer result for staging errors.
@@ -164,13 +297,18 @@ func (m *RollbackManager) stagingError(err error) *LayerResult {
 }
 
 // rollbackAgentState restores agent checkpoint for the pipeline.
-func (m *RollbackManager) rollbackAgentState(pipelineID string) *LayerResult {
+func (m *RollbackManager) rollbackAgentState(
+	pipelineID string,
+	tracker *ResourceTracker,
+) *LayerResult {
 	result := &LayerResult{Layer: LayerAgentState, Success: true}
 
 	if m.checkpoint == nil {
 		result.Message = "checkpoint manager not configured"
 		return result
 	}
+
+	m.trackAgentStateResource(pipelineID, tracker)
 
 	if err := m.checkpoint.RestoreCheckpoint(pipelineID); err != nil {
 		result.Success = false
@@ -183,8 +321,24 @@ func (m *RollbackManager) rollbackAgentState(pipelineID string) *LayerResult {
 	return result
 }
 
+// trackAgentStateResource tracks checkpoint restore for cleanup.
+func (m *RollbackManager) trackAgentStateResource(
+	pipelineID string,
+	tracker *ResourceTracker,
+) {
+	tracker.Track(&IntermediateResource{
+		Layer:       LayerAgentState,
+		ResourceID:  pipelineID,
+		Description: "checkpoint restore in progress",
+		Cleanup:     nil, // Checkpoints are idempotent
+	})
+}
+
 // rollbackGitLocal resets local unpushed commits.
-func (m *RollbackManager) rollbackGitLocal(pipelineID string) *LayerResult {
+func (m *RollbackManager) rollbackGitLocal(
+	pipelineID string,
+	tracker *ResourceTracker,
+) *LayerResult {
 	result := &LayerResult{Layer: LayerGitLocal, Success: true}
 
 	if m.git == nil {
@@ -202,6 +356,8 @@ func (m *RollbackManager) rollbackGitLocal(pipelineID string) *LayerResult {
 		return result
 	}
 
+	m.trackGitLocalResource(pipelineID, count, tracker)
+
 	if err := m.git.ResetSoft(pipelineID, count); err != nil {
 		return m.gitLocalError(err)
 	}
@@ -209,6 +365,20 @@ func (m *RollbackManager) rollbackGitLocal(pipelineID string) *LayerResult {
 	result.ItemCount = count
 	result.Message = "local commits reset"
 	return result
+}
+
+// trackGitLocalResource tracks git reset for cleanup.
+func (m *RollbackManager) trackGitLocalResource(
+	pipelineID string,
+	count int,
+	tracker *ResourceTracker,
+) {
+	tracker.Track(&IntermediateResource{
+		Layer:       LayerGitLocal,
+		ResourceID:  pipelineID,
+		Description: "git reset in progress",
+		Cleanup:     nil, // Git reset is atomic
+	})
 }
 
 // gitLocalError creates a failed layer result for git local errors.

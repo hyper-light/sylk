@@ -318,8 +318,9 @@ func TestRollbackManager_BuildReceipt_PartialFailure(t *testing.T) {
 	staging := mocks.NewStagingManager(t)
 	staging.On("GetStagedFileCount", "partial-test").Return(0, errors.New("staging error"))
 
+	// Note: checkpoint.RestoreCheckpoint is NOT called because staging failed first.
+	// The rollback stops early on failure to prevent partial state.
 	checkpoint := mocks.NewCheckpointManager(t)
-	checkpoint.On("RestoreCheckpoint", "partial-test").Return(nil)
 
 	recorder := mocks.NewRollbackRecorder(t)
 	recorder.On("RecordRollback", mock.Anything, "partial-test", mock.Anything).Return(nil)
@@ -336,6 +337,11 @@ func TestRollbackManager_BuildReceipt_PartialFailure(t *testing.T) {
 
 	if receipt.WasSuccessful() {
 		t.Error("WasSuccessful() = true, want false (staging failed)")
+	}
+
+	// Verify only staging layer was attempted (early failure behavior)
+	if len(receipt.LayerResults) != 1 {
+		t.Errorf("LayerResults count = %d, want 1 (early failure)", len(receipt.LayerResults))
 	}
 }
 

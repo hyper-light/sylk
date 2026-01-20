@@ -47,13 +47,73 @@ func DefaultEscalationConfig() EscalationConfig {
 	}
 }
 
+// ErrorDetails captures full context about an error for diagnosis.
+type ErrorDetails struct {
+	Message      string            `json:"message"`
+	Tier         ErrorTier         `json:"tier"`
+	StatusCode   int               `json:"status_code,omitempty"`
+	RetryAfter   time.Duration     `json:"retry_after,omitempty"`
+	Context      map[string]string `json:"context,omitempty"`
+	Timestamp    time.Time         `json:"timestamp"`
+	ChainedCause string            `json:"chained_cause,omitempty"`
+}
+
+// ExtractErrorDetails extracts full details from an error.
+func ExtractErrorDetails(err error) *ErrorDetails {
+	if err == nil {
+		return nil
+	}
+	details := &ErrorDetails{
+		Message:   err.Error(),
+		Tier:      GetTier(err),
+		Timestamp: time.Now(),
+	}
+	populateTieredDetails(err, details)
+	populateChainedCause(err, details)
+	return details
+}
+
+// populateTieredDetails extracts TieredError-specific fields.
+func populateTieredDetails(err error, details *ErrorDetails) {
+	te, ok := err.(*TieredError)
+	if !ok {
+		return
+	}
+	details.StatusCode = te.StatusCode
+	details.RetryAfter = te.RetryAfter
+	if len(te.Context) > 0 {
+		details.Context = copyContextMap(te.Context)
+	}
+}
+
+// copyContextMap creates a copy of the context map.
+func copyContextMap(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// populateChainedCause extracts the root cause message.
+func populateChainedCause(err error, details *ErrorDetails) {
+	if unwrapper, ok := err.(interface{ Unwrap() error }); ok {
+		if cause := unwrapper.Unwrap(); cause != nil {
+			details.ChainedCause = cause.Error()
+		}
+	}
+}
+
 // EscalationContext provides context for an escalation decision.
 type EscalationContext struct {
-	Error      error
-	Tier       ErrorTier
-	AttemptNum int
-	PipelineID string
-	AgentID    string
+	Error        error
+	ErrorDetails *ErrorDetails
+	Tier         ErrorTier
+	AttemptNum   int
+	PipelineID   string
+	AgentID      string
+	TaskID       string
+	Operation    string
 }
 
 // EscalationResult contains the outcome of an escalation.
@@ -62,6 +122,10 @@ type EscalationResult struct {
 	Remedy       *Remedy
 	UserDecision bool
 	Error        error
+	ErrorDetails *ErrorDetails
+	PipelineID   string
+	AgentID      string
+	AttemptNum   int
 }
 
 // EscalationManager orchestrates the 3-level escalation chain.
@@ -91,10 +155,19 @@ func (em *EscalationManager) Escalate(
 	ctx context.Context,
 	ectx EscalationContext,
 ) (*EscalationResult, error) {
-	if em.isCriticalError(ectx.Tier) {
-		return em.handleCriticalError(ctx, ectx)
+	enrichedCtx := em.enrichContext(ectx)
+	if em.isCriticalError(enrichedCtx.Tier) {
+		return em.handleCriticalError(ctx, enrichedCtx)
 	}
-	return em.runEscalationChain(ctx, ectx)
+	return em.runEscalationChain(ctx, enrichedCtx)
+}
+
+// enrichContext adds error details if not already present.
+func (em *EscalationManager) enrichContext(ectx EscalationContext) EscalationContext {
+	if ectx.ErrorDetails == nil && ectx.Error != nil {
+		ectx.ErrorDetails = ExtractErrorDetails(ectx.Error)
+	}
+	return ectx
 }
 
 // runEscalationChain attempts each level in sequence.
@@ -121,18 +194,22 @@ func (em *EscalationManager) tryLevel1(
 		return nil, err
 	}
 	if recovered {
-		return em.buildLevel1Result(), nil
+		return em.buildLevel1Result(ectx), nil
 	}
 	return nil, nil
 }
 
 // buildLevel1Result creates a successful Level 1 result.
-func (em *EscalationManager) buildLevel1Result() *EscalationResult {
+func (em *EscalationManager) buildLevel1Result(ectx EscalationContext) *EscalationResult {
 	return &EscalationResult{
 		Level:        LevelAgentSelfRecovery,
 		Remedy:       NewRemedy("self-recovered via retry", RemedyRetry, 1.0),
 		UserDecision: false,
 		Error:        nil,
+		ErrorDetails: ectx.ErrorDetails,
+		PipelineID:   ectx.PipelineID,
+		AgentID:      ectx.AgentID,
+		AttemptNum:   ectx.AttemptNum,
 	}
 }
 
@@ -146,18 +223,25 @@ func (em *EscalationManager) tryLevel2(
 		return nil, err
 	}
 	if remedy != nil {
-		return em.buildLevel2Result(remedy), nil
+		return em.buildLevel2Result(ectx, remedy), nil
 	}
 	return nil, nil
 }
 
 // buildLevel2Result creates a successful Level 2 result.
-func (em *EscalationManager) buildLevel2Result(remedy *Remedy) *EscalationResult {
+func (em *EscalationManager) buildLevel2Result(
+	ectx EscalationContext,
+	remedy *Remedy,
+) *EscalationResult {
 	return &EscalationResult{
 		Level:        LevelArchitectWorkaround,
 		Remedy:       remedy,
 		UserDecision: false,
 		Error:        nil,
+		ErrorDetails: ectx.ErrorDetails,
+		PipelineID:   ectx.PipelineID,
+		AgentID:      ectx.AgentID,
+		AttemptNum:   ectx.AttemptNum,
 	}
 }
 
@@ -226,7 +310,7 @@ func (em *EscalationManager) escalateToUser(
 	ectx EscalationContext,
 ) (*EscalationResult, error) {
 	remedySet := em.buildUserRemedySet(ectx)
-	return em.buildUserDecisionResult(remedySet), nil
+	return em.buildUserDecisionResult(ectx, remedySet), nil
 }
 
 // buildUserRemedySet creates remedies for user to choose from.
@@ -239,12 +323,19 @@ func (em *EscalationManager) buildUserRemedySet(ectx EscalationContext) *RemedyS
 }
 
 // buildUserDecisionResult creates the Level 3 result.
-func (em *EscalationManager) buildUserDecisionResult(rs *RemedySet) *EscalationResult {
+func (em *EscalationManager) buildUserDecisionResult(
+	ectx EscalationContext,
+	rs *RemedySet,
+) *EscalationResult {
 	return &EscalationResult{
 		Level:        LevelUserDecision,
 		Remedy:       rs.Best(),
 		UserDecision: true,
 		Error:        nil,
+		ErrorDetails: ectx.ErrorDetails,
+		PipelineID:   ectx.PipelineID,
+		AgentID:      ectx.AgentID,
+		AttemptNum:   ectx.AttemptNum,
 	}
 }
 
@@ -292,6 +383,10 @@ func (em *EscalationManager) buildCriticalTimeoutResult(
 		Remedy:       NewRemedy("critical error timeout", RemedyManual, 1.0),
 		UserDecision: true,
 		Error:        ectx.Error,
+		ErrorDetails: ectx.ErrorDetails,
+		PipelineID:   ectx.PipelineID,
+		AgentID:      ectx.AgentID,
+		AttemptNum:   ectx.AttemptNum,
 	}
 }
 
@@ -304,6 +399,10 @@ func (em *EscalationManager) buildCriticalEscalationResult(
 		Remedy:       NewRemedy("external service degrading", RemedyManual, 0.9),
 		UserDecision: true,
 		Error:        nil,
+		ErrorDetails: ectx.ErrorDetails,
+		PipelineID:   ectx.PipelineID,
+		AgentID:      ectx.AgentID,
+		AttemptNum:   ectx.AttemptNum,
 	}
 }
 

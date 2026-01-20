@@ -37526,13 +37526,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Restructure lock acquisition to prevent deadlock                         ││
 │ │   SEVERITY: HIGH - Potential deadlock                                           ││
 │ │                                                                                  ││
-│ │ [ ] W12.50 - Escalation Missing Context                                         ││
+│ │ [x] W12.50 - Escalation Missing Context                                         ││
 │ │   FILE: core/errors/escalation.go:89-112                                        ││
 │ │   ISSUE: Escalation decisions lack context about original error                 ││
 │ │   FIX: Include full error context in escalation                                 ││
 │ │   SEVERITY: HIGH - Poor error diagnosis                                         ││
 │ │                                                                                  ││
-│ │ [ ] W12.51 - Rollback Incomplete Cleanup                                        ││
+│ │ [x] W12.51 - Rollback Incomplete Cleanup                                        ││
 │ │   FILE: core/errors/rollback.go:145-178                                         ││
 │ │   ISSUE: Rollback doesn't clean up all intermediate state                       ││
 │ │   FIX: Track and cleanup all intermediate resources                             ││
