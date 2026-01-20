@@ -37173,7 +37173,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Track goroutines with WaitGroup, cleanup on context cancel               ││
 │ │   SEVERITY: CRITICAL - Goroutine leak on every dispatch                         ││
 │ │                                                                                  ││
-│ │ [ ] W12.5 - WAL Channel Double-Close                                            ││
+│ │ [x] W12.5 - WAL Channel Double-Close                                            ││
 │ │   FILE: core/concurrency/wal.go:722-724                                         ││
 │ │   ISSUE: stopPeriodicSync can close syncDone channel that's already closed      ││
 │ │   FIX: Use sync.Once for channel close, add nil check                           ││
@@ -37294,7 +37294,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Restructure lock acquisition order                                       ││
 │ │   SEVERITY: CRITICAL - Deadlock                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W12.21 - Freshness Unused Channel                                           ││
+│ │ [x] W12.21 - Freshness Unused Channel                                           ││
 │ │   FILE: core/vectorgraphdb/mitigations/freshness.go:20,33                       ││
 │ │   ISSUE: Channel created but never consumed, blocks forever                     ││
 │ │   FIX: Remove unused channel or add consumer                                    ││

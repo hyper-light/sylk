@@ -96,6 +96,9 @@ type WriteAheadLog struct {
 	stopSync     chan struct{}
 	syncDone     chan struct{}
 
+	// stopSyncOnce ensures stopSync channel is closed exactly once (W12.5).
+	stopSyncOnce sync.Once
+
 	// syncMu protects the sync operation itself, separate from the write lock.
 	// This allows writes to continue while a sync is in progress.
 	syncMu sync.Mutex
@@ -717,9 +720,15 @@ func (w *WriteAheadLog) Close() error {
 	return w.currentFile.Close()
 }
 
+// stopPeriodicSync safely stops the periodic sync goroutine.
+// W12.5: Uses sync.Once to prevent double-close of stopSync channel.
 func (w *WriteAheadLog) stopPeriodicSync() {
-	if w.config.SyncMode == SyncPeriodic {
-		close(w.stopSync)
-		<-w.syncDone
+	if w.config.SyncMode != SyncPeriodic {
+		return
 	}
+
+	w.stopSyncOnce.Do(func() {
+		close(w.stopSync)
+	})
+	<-w.syncDone
 }

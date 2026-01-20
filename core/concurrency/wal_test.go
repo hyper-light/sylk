@@ -677,3 +677,125 @@ func TestWriteAheadLog_ContextCancellation(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+// TestWriteAheadLog_W12_5_ChannelDoubleClose tests that stopPeriodicSync
+// uses sync.Once to prevent panic from double-close (W12.5 fix).
+func TestWriteAheadLog_W12_5_ChannelDoubleClose(t *testing.T) {
+	t.Run("double close does not panic", func(t *testing.T) {
+		dir := t.TempDir()
+		config := concurrency.WALConfig{
+			Dir:            dir,
+			MaxSegmentSize: 1024 * 1024,
+			SyncMode:       concurrency.SyncPeriodic,
+			SyncInterval:   50 * time.Millisecond,
+		}
+
+		wal, err := concurrency.NewWriteAheadLog(config)
+		require.NoError(t, err)
+
+		// Append an entry to ensure sync goroutine is active
+		_, err = wal.Append(&concurrency.WALEntry{
+			Type:    concurrency.EntryStateChange,
+			Payload: []byte("test"),
+		})
+		require.NoError(t, err)
+
+		// First close should succeed
+		err = wal.Close()
+		require.NoError(t, err)
+
+		// Second close should return ErrWALClosed, not panic
+		err = wal.Close()
+		assert.ErrorIs(t, err, concurrency.ErrWALClosed)
+	})
+
+	t.Run("context cancel before close does not panic", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		dir := t.TempDir()
+		config := concurrency.WALConfig{
+			Dir:            dir,
+			MaxSegmentSize: 1024 * 1024,
+			SyncMode:       concurrency.SyncPeriodic,
+			SyncInterval:   50 * time.Millisecond,
+		}
+
+		wal, err := concurrency.NewWriteAheadLogWithContext(ctx, config)
+		require.NoError(t, err)
+
+		// Append an entry
+		_, err = wal.Append(&concurrency.WALEntry{
+			Type:    concurrency.EntryStateChange,
+			Payload: []byte("test"),
+		})
+		require.NoError(t, err)
+
+		// Cancel context first - this triggers periodicSync to exit
+		cancel()
+
+		// Give time for the goroutine to react
+		time.Sleep(100 * time.Millisecond)
+
+		// Close should not panic even though context was cancelled
+		err = wal.Close()
+		require.NoError(t, err)
+	})
+
+	t.Run("rapid close calls do not panic", func(t *testing.T) {
+		dir := t.TempDir()
+		config := concurrency.WALConfig{
+			Dir:            dir,
+			MaxSegmentSize: 1024 * 1024,
+			SyncMode:       concurrency.SyncPeriodic,
+			SyncInterval:   10 * time.Millisecond,
+		}
+
+		wal, err := concurrency.NewWriteAheadLog(config)
+		require.NoError(t, err)
+
+		// Append an entry
+		_, err = wal.Append(&concurrency.WALEntry{
+			Type:    concurrency.EntryStateChange,
+			Payload: []byte("test"),
+		})
+		require.NoError(t, err)
+
+		// Rapid concurrent close attempts
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				wal.Close() // We don't care about the error, just no panic
+			}()
+		}
+
+		wg.Wait()
+	})
+
+	t.Run("non-periodic mode unaffected", func(t *testing.T) {
+		dir := t.TempDir()
+		config := concurrency.WALConfig{
+			Dir:            dir,
+			MaxSegmentSize: 1024 * 1024,
+			SyncMode:       concurrency.SyncEveryWrite,
+			SyncInterval:   100 * time.Millisecond,
+		}
+
+		wal, err := concurrency.NewWriteAheadLog(config)
+		require.NoError(t, err)
+
+		_, err = wal.Append(&concurrency.WALEntry{
+			Type:    concurrency.EntryStateChange,
+			Payload: []byte("test"),
+		})
+		require.NoError(t, err)
+
+		// Close should work normally without periodic sync
+		err = wal.Close()
+		require.NoError(t, err)
+
+		// Second close returns error, no panic
+		err = wal.Close()
+		assert.ErrorIs(t, err, concurrency.ErrWALClosed)
+	})
+}
