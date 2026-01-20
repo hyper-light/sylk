@@ -537,3 +537,101 @@ func TestWrappedErrorChain(t *testing.T) {
 		t.Error("wrapped chain should satisfy errors.Is for base")
 	}
 }
+
+func TestErrorClassifier_UninitializedPatterns(t *testing.T) {
+	// Create classifier with zero value (uninitialized patterns)
+	c := &ErrorClassifier{}
+
+	// loadPatterns should return emptyPatternSet, not panic
+	ps := c.loadPatterns()
+	if ps == nil {
+		t.Fatal("loadPatterns() should not return nil")
+	}
+
+	// Classify should work without panic
+	tier := c.Classify(errors.New("some error"))
+	if tier != TierPermanent {
+		t.Errorf("Classify() = %v, want %v for uninitialized classifier", tier, TierPermanent)
+	}
+}
+
+func TestErrorClassifier_TypeSafePatternStore(t *testing.T) {
+	c := NewErrorClassifier()
+
+	// Verify initial patterns are stored correctly
+	ps := c.loadPatterns()
+	if ps == nil {
+		t.Fatal("loadPatterns() should not return nil after initialization")
+	}
+	if ps.transient == nil || ps.permanent == nil || ps.userFixable == nil {
+		t.Error("pattern slices should be initialized, not nil")
+	}
+}
+
+func TestErrorClassifier_ConcurrentAddAndClassify(t *testing.T) {
+	c := NewErrorClassifier()
+	const goroutines = 10
+	const iterations = 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 3)
+
+	// Concurrent writers for transient patterns
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_ = c.AddTransientPattern(fmt.Sprintf(`transient_%d_%d`, id, j))
+			}
+		}(i)
+	}
+
+	// Concurrent writers for permanent patterns
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_ = c.AddPermanentPattern(fmt.Sprintf(`permanent_%d_%d`, id, j))
+			}
+		}(i)
+	}
+
+	// Concurrent readers
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				c.Classify(errors.New("transient_5_50 error"))
+				c.Classify(errors.New("permanent_5_50 error"))
+				c.Classify(errors.New("unknown error"))
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestErrorClassifier_PatternSetImmutability(t *testing.T) {
+	c := NewErrorClassifier()
+
+	// Add a pattern
+	_ = c.AddTransientPattern(`test_pattern`)
+
+	// Get the pattern set
+	ps1 := c.loadPatterns()
+	originalLen := len(ps1.transient)
+
+	// Add another pattern
+	_ = c.AddTransientPattern(`another_pattern`)
+
+	// Original pattern set should be unchanged (immutable)
+	if len(ps1.transient) != originalLen {
+		t.Error("original pattern set should not be modified after adding new pattern")
+	}
+
+	// New pattern set should have the new pattern
+	ps2 := c.loadPatterns()
+	if len(ps2.transient) != originalLen+1 {
+		t.Errorf("new pattern set should have %d patterns, got %d", originalLen+1, len(ps2.transient))
+	}
+}

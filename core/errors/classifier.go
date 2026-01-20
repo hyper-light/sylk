@@ -119,8 +119,13 @@ func sortedCopy(codes []int) []int {
 	return result
 }
 
+// loadPatterns safely loads the current pattern set.
+// Returns emptyPatternSet if no patterns have been configured.
 func (c *ErrorClassifier) loadPatterns() *patternSet {
-	return (*patternSet)(atomic.LoadPointer(&c.patterns))
+	if ps, ok := c.patterns.Load().(*patternSet); ok && ps != nil {
+		return ps
+	}
+	return emptyPatternSet
 }
 
 func (c *ErrorClassifier) Classify(err error) ErrorTier {
@@ -269,6 +274,6 @@ func (c *ErrorClassifier) addPatternTo(pattern string, target string) error {
 		newPS.userFixable = append(newPS.userFixable[:len(newPS.userFixable):len(newPS.userFixable)], re)
 	}
 
-	atomic.StorePointer(&c.patterns, unsafe.Pointer(newPS))
+	c.patterns.Store(newPS)
 	return nil
 }
