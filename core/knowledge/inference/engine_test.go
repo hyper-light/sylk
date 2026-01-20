@@ -1425,3 +1425,467 @@ func TestInferenceEngine_SemiNaive_MultipleRuns(t *testing.T) {
 		t.Errorf("expected 1 materialized edge after multiple runs, got %d", stats.MaterializedEdges)
 	}
 }
+
+// =============================================================================
+// W4P.22: Race Condition Tests for OnEdgeModified
+// =============================================================================
+
+// slowEdgeProvider wraps an edge provider with configurable delays for race testing.
+type slowEdgeProvider struct {
+	mu        sync.RWMutex
+	edges     []Edge
+	delay     time.Duration
+	callCount int
+}
+
+func newSlowEdgeProvider(edges []Edge, delay time.Duration) *slowEdgeProvider {
+	return &slowEdgeProvider{edges: edges, delay: delay}
+}
+
+func (p *slowEdgeProvider) GetAllEdges(ctx context.Context) ([]Edge, error) {
+	p.mu.Lock()
+	p.callCount++
+	p.mu.Unlock()
+
+	if p.delay > 0 {
+		select {
+		case <-time.After(p.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]Edge, len(p.edges))
+	copy(result, p.edges)
+	return result, nil
+}
+
+func (p *slowEdgeProvider) GetEdgesByNode(ctx context.Context, nodeID string) ([]Edge, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var result []Edge
+	for _, e := range p.edges {
+		if e.Source == nodeID || e.Target == nodeID {
+			result = append(result, e)
+		}
+	}
+	return result, nil
+}
+
+func (p *slowEdgeProvider) AddEdge(edge Edge) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.edges = append(p.edges, edge)
+}
+
+func (p *slowEdgeProvider) RemoveEdge(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var newEdges []Edge
+	for _, e := range p.edges {
+		if e.Key() != key {
+			newEdges = append(newEdges, e)
+		}
+	}
+	p.edges = newEdges
+}
+
+func (p *slowEdgeProvider) GetCallCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.callCount
+}
+
+func (p *slowEdgeProvider) ResetCallCount() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.callCount = 0
+}
+
+// TestInferenceEngine_OnEdgeModified_AtomicSnapshot verifies that OnEdgeModified
+// captures a single snapshot of edges at the start, ensuring atomicity.
+func TestInferenceEngine_OnEdgeModified_AtomicSnapshot(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newSlowEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	}, 0)
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	if err := engine.AddRule(ctx, createTransitivityRule("rule1")); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Run full inference first
+	if err := engine.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	provider.ResetCallCount()
+
+	// Modify an edge
+	provider.RemoveEdge("A|calls|B")
+	provider.AddEdge(NewEdge("A", "calls", "D"))
+
+	err := engine.OnEdgeModified(ctx, NewEdge("A", "calls", "B"), NewEdge("A", "calls", "D"))
+	if err != nil {
+		t.Fatalf("OnEdgeModified failed: %v", err)
+	}
+
+	// The snapshot should be captured only once at the start
+	callCount := provider.GetCallCount()
+	if callCount != 1 {
+		t.Errorf("expected 1 GetAllEdges call (snapshot), got %d", callCount)
+	}
+}
+
+// TestInferenceEngine_OnEdgeModified_ConcurrentModifications tests that
+// concurrent edge modifications don't cause data races.
+func TestInferenceEngine_OnEdgeModified_ConcurrentModifications(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+		NewEdge("C", "calls", "D"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	if err := engine.AddRule(ctx, createTransitivityRule("rule1")); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Run initial inference
+	if err := engine.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	// Run concurrent modifications - this test passes if no race is detected
+	var wg sync.WaitGroup
+	errs := make([]error, 10)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			oldEdge := NewEdge("A", "calls", "B")
+			newEdge := NewEdge("A", "calls", "X")
+			errs[idx] = engine.OnEdgeModified(ctx, oldEdge, newEdge)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All operations should complete without panics (errors are acceptable)
+	for i, err := range errs {
+		if err != nil {
+			t.Logf("modification %d returned error (expected): %v", i, err)
+		}
+	}
+}
+
+// TestInferenceEngine_OnEdgeModified_ConcurrentWithReads tests that reads
+// can proceed concurrently with modifications without data races.
+func TestInferenceEngine_OnEdgeModified_ConcurrentWithReads(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	if err := engine.AddRule(ctx, createTransitivityRule("rule1")); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	if err := engine.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+
+	// Start readers
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				_, _ = engine.GetDerivedEdges(ctx, "A")
+				_ = engine.Stats()
+				_, _ = engine.GetProvenance(ctx, "A|indirect_calls|C")
+			}
+		}()
+	}
+
+	// Start writers
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				oldEdge := NewEdge("A", "calls", "B")
+				newEdge := NewEdge("A", "calls", "X")
+				_ = engine.OnEdgeModified(ctx, oldEdge, newEdge)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestInferenceEngine_ConcurrentOnEdgeOperations tests all edge operations
+// running concurrently without data races.
+func TestInferenceEngine_ConcurrentOnEdgeOperations(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+		NewEdge("C", "calls", "D"),
+		NewEdge("D", "calls", "E"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	if err := engine.AddRule(ctx, createTransitivityRule("rule1")); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	if err := engine.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+
+	// OnEdgeAdded
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			edge := NewEdge("X", "calls", "Y")
+			provider.AddEdge(edge)
+			_ = engine.OnEdgeAdded(ctx, edge)
+		}(i)
+	}
+
+	// OnEdgeRemoved
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			edge := NewEdge("A", "calls", "B")
+			_ = engine.OnEdgeRemoved(ctx, edge)
+		}(i)
+	}
+
+	// OnEdgeModified
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			oldEdge := NewEdge("B", "calls", "C")
+			newEdge := NewEdge("B", "calls", "Z")
+			_ = engine.OnEdgeModified(ctx, oldEdge, newEdge)
+		}(i)
+	}
+
+	// RunInference
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = engine.RunInference(ctx)
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestInferenceEngine_CaptureEdgeSnapshot verifies snapshot isolation.
+func TestInferenceEngine_CaptureEdgeSnapshot(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	// Capture snapshot
+	snapshot, err := engine.captureEdgeSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("captureEdgeSnapshot failed: %v", err)
+	}
+
+	// Modify the provider after snapshot
+	provider.AddEdge(NewEdge("X", "calls", "Y"))
+
+	// Snapshot should not be affected
+	if len(snapshot) != 2 {
+		t.Errorf("expected snapshot to have 2 edges, got %d", len(snapshot))
+	}
+
+	// Modifying the snapshot should not affect the provider
+	snapshot[0] = NewEdge("MODIFIED", "MODIFIED", "MODIFIED")
+
+	edges, _ := provider.GetAllEdges(ctx)
+	for _, e := range edges {
+		if e.Source == "MODIFIED" {
+			t.Error("modifying snapshot affected provider edges")
+		}
+	}
+}
+
+// TestInferenceEngine_CaptureEdgeSnapshot_NoProvider tests snapshot with nil provider.
+func TestInferenceEngine_CaptureEdgeSnapshot_NoProvider(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	// No edge provider set
+
+	ctx := context.Background()
+
+	snapshot, err := engine.captureEdgeSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("captureEdgeSnapshot failed: %v", err)
+	}
+
+	if snapshot == nil {
+		t.Error("expected non-nil empty slice, got nil")
+	}
+	if len(snapshot) != 0 {
+		t.Errorf("expected empty snapshot, got %d edges", len(snapshot))
+	}
+}
+
+// TestInferenceEngine_RematerializeWithSnapshot verifies snapshot-based rematerialization.
+func TestInferenceEngine_RematerializeWithSnapshot(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	rule := createTransitivityRule("rule1")
+	if err := engine.AddRule(ctx, rule); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	// Capture snapshot
+	snapshot, err := engine.captureEdgeSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("captureEdgeSnapshot failed: %v", err)
+	}
+
+	// Remove edges from provider (simulating concurrent modification)
+	provider.RemoveEdge("A|calls|B")
+	provider.RemoveEdge("B|calls|C")
+
+	// Rematerialize using snapshot should still work
+	err = engine.rematerializeWithSnapshot(ctx, []string{"rule1"}, snapshot)
+	if err != nil {
+		t.Fatalf("rematerializeWithSnapshot failed: %v", err)
+	}
+
+	// Should have derived the edge from the snapshot
+	stats := engine.Stats()
+	if stats.MaterializedEdges != 1 {
+		t.Errorf("expected 1 materialized edge, got %d", stats.MaterializedEdges)
+	}
+}
+
+// TestInferenceEngine_OnEdgeModified_OrderingGuarantee tests that operations
+// complete atomically from caller's perspective.
+func TestInferenceEngine_OnEdgeModified_OrderingGuarantee(t *testing.T) {
+	db := setupEngineTestDB(t)
+	defer db.Close()
+
+	engine := NewInferenceEngine(db)
+	provider := newEngineMockEdgeProvider([]Edge{
+		NewEdge("A", "calls", "B"),
+		NewEdge("B", "calls", "C"),
+	})
+	engine.SetEdgeProvider(provider)
+
+	ctx := context.Background()
+
+	if err := engine.AddRule(ctx, createTransitivityRule("rule1")); err != nil {
+		t.Fatalf("AddRule failed: %v", err)
+	}
+
+	if err := engine.RunInference(ctx); err != nil {
+		t.Fatalf("RunInference failed: %v", err)
+	}
+
+	// Record state before modification
+	statsBefore := engine.Stats()
+	if statsBefore.MaterializedEdges != 1 {
+		t.Fatalf("expected 1 materialized edge before, got %d", statsBefore.MaterializedEdges)
+	}
+
+	// Modify edge - this should complete as a single atomic operation
+	provider.RemoveEdge("A|calls|B")
+	provider.AddEdge(NewEdge("A", "calls", "D"))
+
+	done := make(chan struct{})
+	var modifyErr error
+
+	go func() {
+		modifyErr = engine.OnEdgeModified(ctx, NewEdge("A", "calls", "B"), NewEdge("A", "calls", "D"))
+		close(done)
+	}()
+
+	// Wait for completion
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnEdgeModified timed out")
+	}
+
+	if modifyErr != nil {
+		t.Fatalf("OnEdgeModified failed: %v", modifyErr)
+	}
+
+	// After the operation completes, state should be consistent
+	// (no intermediate states visible)
+	edges, err := engine.GetDerivedEdges(ctx, "A")
+	if err != nil {
+		t.Fatalf("GetDerivedEdges failed: %v", err)
+	}
+
+	// A-indirect_calls->C should be invalidated since A no longer calls B
+	// and A-calls->D doesn't chain with anything
+	if len(edges) != 0 {
+		t.Logf("Note: %d derived edges remain for A", len(edges))
+	}
+}

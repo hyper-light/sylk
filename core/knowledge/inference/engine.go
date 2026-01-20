@@ -332,9 +332,17 @@ func (e *InferenceEngine) OnEdgeRemoved(ctx context.Context, edge Edge) error {
 
 // OnEdgeModified handles edge modification as a remove followed by an add.
 // It invalidates edges that depended on the old edge and then derives new edges.
+// The operation is atomic: edges are captured once at the start to ensure
+// consistent state throughout the entire operation.
 func (e *InferenceEngine) OnEdgeModified(ctx context.Context, oldEdge, newEdge Edge) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Capture edge snapshot once at the start for atomic operation
+	edgeSnapshot, err := e.captureEdgeSnapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("capture edge snapshot: %w", err)
+	}
 
 	oldEdgeKey := oldEdge.Key()
 
@@ -349,9 +357,9 @@ func (e *InferenceEngine) OnEdgeModified(ctx context.Context, oldEdge, newEdge E
 		return fmt.Errorf("invalidate dependents: %w", err)
 	}
 
-	// Re-derive edges with affected rules and the new edge
+	// Re-derive edges with affected rules using the snapshot
 	if len(affectedRuleIDs) > 0 {
-		if err := e.rematerializeWithRules(ctx, affectedRuleIDs); err != nil {
+		if err := e.rematerializeWithSnapshot(ctx, affectedRuleIDs, edgeSnapshot); err != nil {
 			return fmt.Errorf("rematerialize: %w", err)
 		}
 	}
@@ -363,19 +371,9 @@ func (e *InferenceEngine) OnEdgeModified(ctx context.Context, oldEdge, newEdge E
 	}
 
 	relevantRules := e.filterRulesForEdge(rules, newEdge)
-	if len(relevantRules) > 0 {
-		var edges []Edge
-		if e.edgeProvider != nil {
-			edges, err = e.edgeProvider.GetAllEdges(ctx)
-			if err != nil {
-				return fmt.Errorf("get all edges: %w", err)
-			}
-		} else {
-			edges = []Edge{newEdge}
-		}
-
+	if len(relevantRules) > 0 && len(edgeSnapshot) > 0 {
 		fc := e.getActiveForwardChainer()
-		results, err := fc.Evaluate(ctx, relevantRules, edges)
+		results, err := fc.Evaluate(ctx, relevantRules, edgeSnapshot)
 		if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 			return fmt.Errorf("forward chaining: %w", err)
 		}
@@ -388,6 +386,22 @@ func (e *InferenceEngine) OnEdgeModified(ctx context.Context, oldEdge, newEdge E
 	}
 
 	return nil
+}
+
+// captureEdgeSnapshot captures a copy of all edges for atomic operations.
+// Returns an empty slice if no edge provider is set.
+func (e *InferenceEngine) captureEdgeSnapshot(ctx context.Context) ([]Edge, error) {
+	if e.edgeProvider == nil {
+		return []Edge{}, nil
+	}
+	edges, err := e.edgeProvider.GetAllEdges(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Return a copy to prevent external mutation
+	snapshot := make([]Edge, len(edges))
+	copy(snapshot, edges)
+	return snapshot, nil
 }
 
 // getAffectedRuleIDs returns the rule IDs that produced edges depending on the given edge.
@@ -412,7 +426,17 @@ func (e *InferenceEngine) getAffectedRuleIDs(ctx context.Context, edgeKey string
 
 // rematerializeWithRules re-runs inference for the specified rules.
 func (e *InferenceEngine) rematerializeWithRules(ctx context.Context, ruleIDs []string) error {
-	if len(ruleIDs) == 0 {
+	edges, err := e.captureEdgeSnapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("capture edge snapshot: %w", err)
+	}
+	return e.rematerializeWithSnapshot(ctx, ruleIDs, edges)
+}
+
+// rematerializeWithSnapshot re-runs inference using a pre-captured edge snapshot.
+// This ensures atomic operations when edges must not change during processing.
+func (e *InferenceEngine) rematerializeWithSnapshot(ctx context.Context, ruleIDs []string, edges []Edge) error {
+	if len(ruleIDs) == 0 || len(edges) == 0 {
 		return nil
 	}
 
@@ -435,18 +459,6 @@ func (e *InferenceEngine) rematerializeWithRules(ctx context.Context, ruleIDs []
 		}
 	}
 	if len(rules) == 0 {
-		return nil
-	}
-
-	// Get all current edges
-	var edges []Edge
-	if e.edgeProvider != nil {
-		edges, err = e.edgeProvider.GetAllEdges(ctx)
-		if err != nil {
-			return fmt.Errorf("get all edges: %w", err)
-		}
-	}
-	if len(edges) == 0 {
 		return nil
 	}
 
