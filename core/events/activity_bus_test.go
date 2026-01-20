@@ -601,3 +601,126 @@ func TestActivityEventBus_SubscribeAfterClose(t *testing.T) {
 	// Subscribe after close should not panic
 	bus.Subscribe(sub)
 }
+
+// =============================================================================
+// Start() Idempotence Tests (W3C.3)
+// =============================================================================
+
+func TestActivityEventBus_SingleStart(t *testing.T) {
+	bus := NewActivityEventBus(100)
+
+	// Single Start() should work correctly
+	bus.Start()
+
+	// Verify dispatch is running by publishing and receiving an event
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+	bus.Subscribe(sub)
+
+	event := NewActivityEvent(EventTypeAgentAction, "test-session", "test action")
+	bus.Publish(event)
+
+	// Wait for event delivery
+	time.Sleep(100 * time.Millisecond)
+
+	events := sub.getEvents()
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event after single Start(), got %d", len(events))
+	}
+
+	bus.Close()
+}
+
+func TestActivityEventBus_MultipleStartIdempotent(t *testing.T) {
+	bus := NewActivityEventBus(100)
+
+	// Call Start() multiple times - should be idempotent
+	bus.Start()
+	bus.Start()
+	bus.Start()
+
+	// Verify dispatch is running correctly (only one goroutine)
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+	bus.Subscribe(sub)
+
+	event := NewActivityEvent(EventTypeAgentAction, "test-session", "test action")
+	bus.Publish(event)
+
+	// Wait for event delivery
+	time.Sleep(100 * time.Millisecond)
+
+	events := sub.getEvents()
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event after multiple Start() calls, got %d", len(events))
+	}
+
+	// Close should complete without deadlock
+	// (If multiple goroutines were spawned, wg.Wait() would deadlock)
+	done := make(chan struct{})
+	go func() {
+		bus.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - Close completed
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() deadlocked - multiple Start() calls spawned multiple goroutines")
+	}
+}
+
+func TestActivityEventBus_ConcurrentStartIdempotent(t *testing.T) {
+	bus := NewActivityEventBus(100)
+
+	// Call Start() concurrently from multiple goroutines
+	var wg sync.WaitGroup
+	goroutines := 100
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			bus.Start()
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify dispatch is running correctly (only one goroutine)
+	sub := &mockSubscriber{
+		id:         "test-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+	bus.Subscribe(sub)
+
+	event := NewActivityEvent(EventTypeAgentAction, "test-session", "test action")
+	bus.Publish(event)
+
+	// Wait for event delivery
+	time.Sleep(100 * time.Millisecond)
+
+	events := sub.getEvents()
+	if len(events) != 1 {
+		t.Errorf("Expected 1 event after concurrent Start() calls, got %d", len(events))
+	}
+
+	// Close should complete without deadlock
+	done := make(chan struct{})
+	go func() {
+		bus.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - Close completed
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() deadlocked - concurrent Start() calls spawned multiple goroutines")
+	}
+}

@@ -3,6 +3,7 @@ package events
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -116,8 +117,8 @@ type ActivityEventBus struct {
 	// mu protects subscribers maps
 	mu sync.RWMutex
 
-	// dispatchMu protects dispatch goroutine shutdown
-	dispatchMu sync.Mutex
+	// started indicates if dispatch goroutine is running (atomic for idempotent Start)
+	started atomic.Bool
 
 	// closed indicates if the bus is closed
 	closed bool
@@ -144,25 +145,24 @@ func NewActivityEventBus(bufferSize int) *ActivityEventBus {
 	}
 }
 
-// Publish publishes an event to the bus
+// Publish publishes an event to the bus.
+// The RLock is held through the channel send to prevent TOCTOU race
+// where Close() could execute between checking closed and sending.
 func (b *ActivityEventBus) Publish(event *ActivityEvent) {
 	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	if b.closed {
-		b.mu.RUnlock()
 		return
 	}
-	b.mu.RUnlock()
 
-	// Debounce the event
 	if b.debouncer.ShouldSkip(event) {
 		return
 	}
 
-	// Non-blocking send to buffer, drop if full
 	select {
 	case b.buffer <- event:
 	default:
-		// Buffer full, drop event
 	}
 }
 
@@ -213,13 +213,11 @@ func filterSubs(subs []EventSubscriber, id string) []EventSubscriber {
 	return filtered
 }
 
-// Start starts the dispatch goroutine
+// Start starts the dispatch goroutine.
+// This method is idempotent - subsequent calls have no effect.
 func (b *ActivityEventBus) Start() {
-	b.dispatchMu.Lock()
-	defer b.dispatchMu.Unlock()
-
-	if b.closed {
-		return
+	if b.started.Swap(true) {
+		return // Already started
 	}
 
 	b.wg.Add(1)
