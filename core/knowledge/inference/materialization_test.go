@@ -1938,3 +1938,575 @@ func TestErrInvalidEvidence_Sentinel(t *testing.T) {
 		t.Error("wrapped error should match ErrInvalidEvidence sentinel")
 	}
 }
+
+// =============================================================================
+// W4P.39 Write Batching Tests
+// =============================================================================
+
+func TestDefaultBatchConfig(t *testing.T) {
+	config := DefaultBatchConfig()
+
+	if config.BatchSize != 100 {
+		t.Errorf("expected BatchSize 100, got %d", config.BatchSize)
+	}
+}
+
+func TestMaterializationManager_SetBatchConfig(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+
+	config := BatchConfig{BatchSize: 50}
+	manager.SetBatchConfig(config)
+
+	if manager.batchConfig.BatchSize != 50 {
+		t.Errorf("expected BatchSize 50, got %d", manager.batchConfig.BatchSize)
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_Empty(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	results := manager.MaterializeBatched(ctx, []InferenceResult{})
+
+	if results != nil {
+		t.Errorf("expected nil results for empty input, got %d batches", len(results))
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_SingleBatch(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create 5 edges with batch size of 10 (fits in one batch)
+	manager.SetBatchConfig(BatchConfig{BatchSize: 10})
+
+	inferenceResults := make([]InferenceResult, 5)
+	for i := 0; i < 5; i++ {
+		inferenceResults[i] = createTestInferenceResult(
+			"rule1",
+			fmt.Sprintf("A%d", i),
+			"calls",
+			fmt.Sprintf("B%d", i),
+			fmt.Sprintf("ev%d", i),
+		)
+	}
+
+	batchResults := manager.MaterializeBatched(ctx, inferenceResults)
+
+	// Should have exactly 1 batch
+	if len(batchResults) != 1 {
+		t.Fatalf("expected 1 batch, got %d", len(batchResults))
+	}
+
+	// Batch should succeed
+	if batchResults[0].Error != nil {
+		t.Errorf("batch 0 should succeed, got error: %v", batchResults[0].Error)
+	}
+
+	// Should have 5 committed keys
+	if len(batchResults[0].CommittedKeys) != 5 {
+		t.Errorf("expected 5 committed keys, got %d", len(batchResults[0].CommittedKeys))
+	}
+
+	// Verify edges are in database
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("A%d|calls|B%d", i, i)
+		exists, err := manager.IsMaterialized(ctx, key)
+		if err != nil {
+			t.Fatalf("IsMaterialized failed: %v", err)
+		}
+		if !exists {
+			t.Errorf("edge %s should exist", key)
+		}
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_MultipleBatches(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create 25 edges with batch size of 10 (should create 3 batches)
+	manager.SetBatchConfig(BatchConfig{BatchSize: 10})
+
+	inferenceResults := make([]InferenceResult, 25)
+	for i := 0; i < 25; i++ {
+		inferenceResults[i] = createTestInferenceResult(
+			"rule1",
+			fmt.Sprintf("Node%d", i),
+			"calls",
+			fmt.Sprintf("Target%d", i),
+			fmt.Sprintf("ev%d", i),
+		)
+	}
+
+	batchResults := manager.MaterializeBatched(ctx, inferenceResults)
+
+	// Should have 3 batches (10 + 10 + 5)
+	if len(batchResults) != 3 {
+		t.Fatalf("expected 3 batches, got %d", len(batchResults))
+	}
+
+	// All batches should succeed
+	successCount := CountSuccessfulBatches(batchResults)
+	if successCount != 3 {
+		t.Errorf("expected 3 successful batches, got %d", successCount)
+	}
+
+	// Verify committed keys count
+	committedKeys := CollectAllCommittedKeys(batchResults)
+	if len(committedKeys) != 25 {
+		t.Errorf("expected 25 committed keys, got %d", len(committedKeys))
+	}
+
+	// Verify all edges exist in database
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM materialized_edges").Scan(&count)
+	if err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != 25 {
+		t.Errorf("expected 25 edges in database, got %d", count)
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_PartialFailure(t *testing.T) {
+	// Use foreign key enforcement to trigger failures
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Insert only rule1, not rule2
+	insertTestRule(t, db, "rule1")
+
+	// Configure fast retry
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      1,
+		InitialBackoff:  1 * time.Millisecond,
+		MaxBackoff:      5 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	// Batch size of 5: first batch uses rule1 (success), second uses rule2 (fail)
+	manager.SetBatchConfig(BatchConfig{BatchSize: 5})
+
+	inferenceResults := make([]InferenceResult, 10)
+	// First 5 edges use rule1 (will succeed)
+	for i := 0; i < 5; i++ {
+		inferenceResults[i] = createTestInferenceResult(
+			"rule1",
+			fmt.Sprintf("A%d", i),
+			"calls",
+			fmt.Sprintf("B%d", i),
+			"ev",
+		)
+	}
+	// Next 5 edges use rule2 (will fail due to FK constraint)
+	for i := 5; i < 10; i++ {
+		inferenceResults[i] = createTestInferenceResult(
+			"nonexistent_rule",
+			fmt.Sprintf("X%d", i),
+			"calls",
+			fmt.Sprintf("Y%d", i),
+			"ev",
+		)
+	}
+
+	batchResults := manager.MaterializeBatched(ctx, inferenceResults)
+
+	// Should have 2 batches
+	if len(batchResults) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batchResults))
+	}
+
+	// First batch should succeed
+	if batchResults[0].Error != nil {
+		t.Errorf("batch 0 should succeed, got error: %v", batchResults[0].Error)
+	}
+	if len(batchResults[0].CommittedKeys) != 5 {
+		t.Errorf("batch 0: expected 5 committed keys, got %d", len(batchResults[0].CommittedKeys))
+	}
+
+	// Second batch should fail
+	if batchResults[1].Error == nil {
+		t.Error("batch 1 should fail due to FK constraint")
+	}
+	if len(batchResults[1].FailedKeys) != 5 {
+		t.Errorf("batch 1: expected 5 failed keys, got %d", len(batchResults[1].FailedKeys))
+	}
+
+	// Verify partial success: only first 5 edges in database
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM materialized_edges").Scan(&count)
+	if err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != 5 {
+		t.Errorf("expected 5 edges in database (partial success), got %d", count)
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_ReducesTransactions(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create 100 edges
+	numEdges := 100
+	inferenceResults := make([]InferenceResult, numEdges)
+	for i := 0; i < numEdges; i++ {
+		inferenceResults[i] = createTestInferenceResult(
+			"rule1",
+			fmt.Sprintf("Source%d", i),
+			"calls",
+			fmt.Sprintf("Target%d", i),
+			fmt.Sprintf("ev%d", i),
+		)
+	}
+
+	// With batch size of 25, should create 4 transactions instead of 100
+	manager.SetBatchConfig(BatchConfig{BatchSize: 25})
+
+	batchResults := manager.MaterializeBatched(ctx, inferenceResults)
+
+	// Should have 4 batches (4 transactions vs 100 individual calls)
+	if len(batchResults) != 4 {
+		t.Errorf("expected 4 batches, got %d", len(batchResults))
+	}
+
+	// All should succeed
+	for i, br := range batchResults {
+		if br.Error != nil {
+			t.Errorf("batch %d failed: %v", i, br.Error)
+		}
+	}
+
+	// Verify all edges committed
+	committedKeys := CollectAllCommittedKeys(batchResults)
+	if len(committedKeys) != numEdges {
+		t.Errorf("expected %d committed keys, got %d", numEdges, len(committedKeys))
+	}
+
+	// Verify database has all edges
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM materialized_edges").Scan(&count)
+	if err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != numEdges {
+		t.Errorf("expected %d edges in database, got %d", numEdges, count)
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_ConcurrentBatches(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	manager.SetBatchConfig(BatchConfig{BatchSize: 10})
+
+	// Run multiple batched materializations concurrently
+	var wg sync.WaitGroup
+	numGoroutines := 5
+	edgesPerGoroutine := 20
+
+	allResults := make([][]BatchResult, numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(goroutineIdx int) {
+			defer wg.Done()
+
+			inferenceResults := make([]InferenceResult, edgesPerGoroutine)
+			for i := 0; i < edgesPerGoroutine; i++ {
+				inferenceResults[i] = createTestInferenceResult(
+					"rule1",
+					fmt.Sprintf("G%d_S%d", goroutineIdx, i),
+					"calls",
+					fmt.Sprintf("G%d_T%d", goroutineIdx, i),
+					"ev",
+				)
+			}
+
+			allResults[goroutineIdx] = manager.MaterializeBatched(ctx, inferenceResults)
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Verify all goroutines succeeded
+	totalCommitted := 0
+	for g, results := range allResults {
+		for _, br := range results {
+			if br.Error != nil {
+				t.Errorf("goroutine %d: batch %d failed: %v", g, br.BatchIndex, br.Error)
+			}
+			totalCommitted += len(br.CommittedKeys)
+		}
+	}
+
+	expectedTotal := numGoroutines * edgesPerGoroutine
+	if totalCommitted != expectedTotal {
+		t.Errorf("expected %d total committed keys, got %d", expectedTotal, totalCommitted)
+	}
+
+	// Verify database count
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM materialized_edges").Scan(&count)
+	if err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != expectedTotal {
+		t.Errorf("expected %d edges in database, got %d", expectedTotal, count)
+	}
+}
+
+func TestSplitIntoBatches(t *testing.T) {
+	manager := &MaterializationManager{}
+
+	testCases := []struct {
+		name          string
+		numItems      int
+		batchSize     int
+		expectedCount int
+		expectedSizes []int
+	}{
+		{
+			name:          "empty",
+			numItems:      0,
+			batchSize:     10,
+			expectedCount: 0,
+			expectedSizes: nil,
+		},
+		{
+			name:          "single batch exact",
+			numItems:      10,
+			batchSize:     10,
+			expectedCount: 1,
+			expectedSizes: []int{10},
+		},
+		{
+			name:          "single batch partial",
+			numItems:      5,
+			batchSize:     10,
+			expectedCount: 1,
+			expectedSizes: []int{5},
+		},
+		{
+			name:          "multiple batches exact",
+			numItems:      30,
+			batchSize:     10,
+			expectedCount: 3,
+			expectedSizes: []int{10, 10, 10},
+		},
+		{
+			name:          "multiple batches with remainder",
+			numItems:      25,
+			batchSize:     10,
+			expectedCount: 3,
+			expectedSizes: []int{10, 10, 5},
+		},
+		{
+			name:          "one item per batch",
+			numItems:      5,
+			batchSize:     1,
+			expectedCount: 5,
+			expectedSizes: []int{1, 1, 1, 1, 1},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared := make([]preparedResult, tc.numItems)
+			for i := 0; i < tc.numItems; i++ {
+				prepared[i] = preparedResult{edgeKey: fmt.Sprintf("key%d", i)}
+			}
+
+			batches := manager.splitIntoBatches(prepared, tc.batchSize)
+
+			if len(batches) != tc.expectedCount {
+				t.Errorf("expected %d batches, got %d", tc.expectedCount, len(batches))
+				return
+			}
+
+			for i, expectedSize := range tc.expectedSizes {
+				if len(batches[i]) != expectedSize {
+					t.Errorf("batch %d: expected size %d, got %d", i, expectedSize, len(batches[i]))
+				}
+			}
+		})
+	}
+}
+
+func TestCountSuccessfulBatches(t *testing.T) {
+	testCases := []struct {
+		name     string
+		results  []BatchResult
+		expected int
+	}{
+		{
+			name:     "empty",
+			results:  []BatchResult{},
+			expected: 0,
+		},
+		{
+			name: "all success",
+			results: []BatchResult{
+				{BatchIndex: 0, CommittedKeys: []string{"a"}},
+				{BatchIndex: 1, CommittedKeys: []string{"b"}},
+			},
+			expected: 2,
+		},
+		{
+			name: "all failed",
+			results: []BatchResult{
+				{BatchIndex: 0, FailedKeys: []string{"a"}, Error: errors.New("fail")},
+				{BatchIndex: 1, FailedKeys: []string{"b"}, Error: errors.New("fail")},
+			},
+			expected: 0,
+		},
+		{
+			name: "mixed",
+			results: []BatchResult{
+				{BatchIndex: 0, CommittedKeys: []string{"a"}},
+				{BatchIndex: 1, FailedKeys: []string{"b"}, Error: errors.New("fail")},
+				{BatchIndex: 2, CommittedKeys: []string{"c"}},
+			},
+			expected: 2,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := CountSuccessfulBatches(tc.results)
+			if result != tc.expected {
+				t.Errorf("expected %d, got %d", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestCollectAllFailedKeys(t *testing.T) {
+	results := []BatchResult{
+		{BatchIndex: 0, FailedKeys: []string{"a", "b"}, Error: errors.New("fail")},
+		{BatchIndex: 1, CommittedKeys: []string{"c"}},
+		{BatchIndex: 2, FailedKeys: []string{"d"}, Error: errors.New("fail")},
+	}
+
+	failed := CollectAllFailedKeys(results)
+
+	expected := []string{"a", "b", "d"}
+	if len(failed) != len(expected) {
+		t.Fatalf("expected %d failed keys, got %d", len(expected), len(failed))
+	}
+
+	for i, key := range expected {
+		if failed[i] != key {
+			t.Errorf("failed[%d]: expected %s, got %s", i, key, failed[i])
+		}
+	}
+}
+
+func TestCollectAllCommittedKeys(t *testing.T) {
+	results := []BatchResult{
+		{BatchIndex: 0, CommittedKeys: []string{"a", "b"}},
+		{BatchIndex: 1, FailedKeys: []string{"c"}, Error: errors.New("fail")},
+		{BatchIndex: 2, CommittedKeys: []string{"d", "e", "f"}},
+	}
+
+	committed := CollectAllCommittedKeys(results)
+
+	expected := []string{"a", "b", "d", "e", "f"}
+	if len(committed) != len(expected) {
+		t.Fatalf("expected %d committed keys, got %d", len(expected), len(committed))
+	}
+
+	for i, key := range expected {
+		if committed[i] != key {
+			t.Errorf("committed[%d]: expected %s, got %s", i, key, committed[i])
+		}
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_DefaultBatchSize(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Create 150 edges (default batch size is 100)
+	inferenceResults := make([]InferenceResult, 150)
+	for i := 0; i < 150; i++ {
+		inferenceResults[i] = createTestInferenceResult(
+			"rule1",
+			fmt.Sprintf("S%d", i),
+			"calls",
+			fmt.Sprintf("T%d", i),
+			"ev",
+		)
+	}
+
+	batchResults := manager.MaterializeBatched(ctx, inferenceResults)
+
+	// With default batch size of 100: should have 2 batches (100 + 50)
+	if len(batchResults) != 2 {
+		t.Errorf("expected 2 batches with default size, got %d", len(batchResults))
+	}
+
+	// Verify all succeeded
+	for i, br := range batchResults {
+		if br.Error != nil {
+			t.Errorf("batch %d failed: %v", i, br.Error)
+		}
+	}
+}
+
+func TestMaterializationManager_MaterializeBatched_ZeroBatchSize(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	insertTestRule(t, db, "rule1")
+
+	// Set invalid batch size of 0 (should fall back to 100)
+	manager.SetBatchConfig(BatchConfig{BatchSize: 0})
+
+	inferenceResults := make([]InferenceResult, 150)
+	for i := 0; i < 150; i++ {
+		inferenceResults[i] = createTestInferenceResult(
+			"rule1",
+			fmt.Sprintf("S%d", i),
+			"calls",
+			fmt.Sprintf("T%d", i),
+			"ev",
+		)
+	}
+
+	batchResults := manager.MaterializeBatched(ctx, inferenceResults)
+
+	// Should fall back to default of 100: 2 batches (100 + 50)
+	if len(batchResults) != 2 {
+		t.Errorf("expected 2 batches with fallback size, got %d", len(batchResults))
+	}
+}

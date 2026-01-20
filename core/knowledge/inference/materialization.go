@@ -31,6 +31,18 @@ type RetryConfig struct {
 	BackoffMultiple float64       // Multiplier for exponential backoff (default 2.0)
 }
 
+// BatchConfig holds settings for write batching behavior.
+type BatchConfig struct {
+	BatchSize int // Maximum number of edges per transaction batch (default 100)
+}
+
+// DefaultBatchConfig returns the default batch configuration.
+func DefaultBatchConfig() BatchConfig {
+	return BatchConfig{
+		BatchSize: 100,
+	}
+}
+
 // DefaultRetryConfig returns the default retry configuration.
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{
@@ -82,10 +94,14 @@ type MaterializedEdgeRecord struct {
 //
 // W4P.20: Added retry with exponential backoff for failed materializations.
 // Failed edges are logged and queued for later retry or manual intervention.
+//
+// W4P.39: Added batch configuration for write batching to reduce transaction
+// overhead when materializing many edges.
 type MaterializationManager struct {
 	db              *sql.DB
 	writeMu         sync.Mutex // Protects write operations only
 	retryConfig     RetryConfig
+	batchConfig     BatchConfig
 	deadLetterMu    sync.Mutex
 	deadLetterQueue []FailedEdge
 	onFailure       FailureCallback
@@ -96,6 +112,7 @@ func NewMaterializationManager(db *sql.DB) *MaterializationManager {
 	return &MaterializationManager{
 		db:              db,
 		retryConfig:     DefaultRetryConfig(),
+		batchConfig:     DefaultBatchConfig(),
 		deadLetterQueue: make([]FailedEdge, 0),
 	}
 }
@@ -103,6 +120,11 @@ func NewMaterializationManager(db *sql.DB) *MaterializationManager {
 // SetRetryConfig sets the retry configuration for materialization.
 func (m *MaterializationManager) SetRetryConfig(config RetryConfig) {
 	m.retryConfig = config
+}
+
+// SetBatchConfig sets the batch configuration for write batching.
+func (m *MaterializationManager) SetBatchConfig(config BatchConfig) {
+	m.batchConfig = config
 }
 
 // SetFailureCallback sets a callback function for failed materializations.
@@ -540,4 +562,123 @@ func (m *MaterializationManager) DeleteMaterializedEdge(ctx context.Context, edg
 		return fmt.Errorf("delete materialized edge: %w", err)
 	}
 	return nil
+}
+
+// =============================================================================
+// Write Batching (W4P.39)
+// =============================================================================
+
+// BatchResult captures the outcome of a single batch commit operation.
+type BatchResult struct {
+	BatchIndex    int      // Index of this batch (0-based)
+	CommittedKeys []string // Edge keys successfully committed
+	FailedKeys    []string // Edge keys that failed
+	Error         error    // Error if batch failed (nil on success)
+}
+
+// MaterializeBatched stores derived edges using configurable batch sizes.
+// Commits edges in batches to reduce transaction overhead. Returns results
+// for each batch, allowing partial success tracking.
+func (m *MaterializationManager) MaterializeBatched(ctx context.Context, results []InferenceResult) []BatchResult {
+	if len(results) == 0 {
+		return nil
+	}
+
+	prepared, err := m.prepareResults(results)
+	if err != nil {
+		return []BatchResult{{Error: err}}
+	}
+
+	return m.executeBatches(ctx, prepared)
+}
+
+// executeBatches processes prepared results in batches using configured size.
+func (m *MaterializationManager) executeBatches(ctx context.Context, prepared []preparedResult) []BatchResult {
+	batchSize := m.batchConfig.BatchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+
+	batches := m.splitIntoBatches(prepared, batchSize)
+	results := make([]BatchResult, len(batches))
+
+	for i, batch := range batches {
+		results[i] = m.processSingleBatch(ctx, i, batch)
+	}
+
+	return results
+}
+
+// splitIntoBatches divides prepared results into chunks of specified size.
+func (m *MaterializationManager) splitIntoBatches(prepared []preparedResult, batchSize int) [][]preparedResult {
+	if len(prepared) == 0 {
+		return nil
+	}
+
+	numBatches := (len(prepared) + batchSize - 1) / batchSize
+	batches := make([][]preparedResult, 0, numBatches)
+
+	for i := 0; i < len(prepared); i += batchSize {
+		end := i + batchSize
+		if end > len(prepared) {
+			end = len(prepared)
+		}
+		batches = append(batches, prepared[i:end])
+	}
+
+	return batches
+}
+
+// processSingleBatch commits one batch and returns its result.
+func (m *MaterializationManager) processSingleBatch(ctx context.Context, index int, batch []preparedResult) BatchResult {
+	result := BatchResult{BatchIndex: index}
+	keys := m.extractEdgeKeys(batch)
+
+	err := m.executeMaterialize(ctx, batch)
+	if err != nil {
+		result.FailedKeys = keys
+		result.Error = err
+		return result
+	}
+
+	result.CommittedKeys = keys
+	return result
+}
+
+// extractEdgeKeys returns the edge keys from a batch of prepared results.
+func (m *MaterializationManager) extractEdgeKeys(batch []preparedResult) []string {
+	keys := make([]string, len(batch))
+	for i, pr := range batch {
+		keys[i] = pr.edgeKey
+	}
+	return keys
+}
+
+// CountSuccessfulBatches returns the number of batches that committed.
+func CountSuccessfulBatches(results []BatchResult) int {
+	count := 0
+	for _, r := range results {
+		if r.Error == nil {
+			count++
+		}
+	}
+	return count
+}
+
+// CollectAllFailedKeys returns all failed edge keys across all batches.
+func CollectAllFailedKeys(results []BatchResult) []string {
+	var failed []string
+	for _, r := range results {
+		failed = append(failed, r.FailedKeys...)
+	}
+	return failed
+}
+
+// CollectAllCommittedKeys returns all committed edge keys across all batches.
+func CollectAllCommittedKeys(results []BatchResult) []string {
+	var committed []string
+	for _, r := range results {
+		committed = append(committed, r.CommittedKeys...)
+	}
+	return committed
 }
