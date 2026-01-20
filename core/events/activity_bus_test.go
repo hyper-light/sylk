@@ -113,6 +113,7 @@ func TestEventSubscriber_SpecificEventTypes(t *testing.T) {
 
 func TestNewEventDebouncer(t *testing.T) {
 	debouncer := NewEventDebouncer(5 * time.Second)
+	defer debouncer.Stop()
 
 	if debouncer.window != 5*time.Second {
 		t.Errorf("window = %v, want %v", debouncer.window, 5*time.Second)
@@ -135,6 +136,7 @@ func TestNewEventDebouncer_DefaultWindow(t *testing.T) {
 
 	for _, tt := range tests {
 		debouncer := NewEventDebouncer(tt.input)
+		defer debouncer.Stop()
 		if debouncer.window != tt.expected {
 			t.Errorf("NewEventDebouncer(%v).window = %v, want %v", tt.input, debouncer.window, tt.expected)
 		}
@@ -143,6 +145,7 @@ func TestNewEventDebouncer_DefaultWindow(t *testing.T) {
 
 func TestEventDebouncer_ShouldSkip_FirstEvent(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	event.AgentID = "agent-1"
@@ -155,6 +158,7 @@ func TestEventDebouncer_ShouldSkip_FirstEvent(t *testing.T) {
 
 func TestEventDebouncer_ShouldSkip_DuplicateWithinWindow(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	event1.AgentID = "agent-1"
@@ -175,6 +179,7 @@ func TestEventDebouncer_ShouldSkip_DuplicateWithinWindow(t *testing.T) {
 
 func TestEventDebouncer_ShouldSkip_DuplicateAfterWindow(t *testing.T) {
 	debouncer := NewEventDebouncer(50 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	event1.AgentID = "agent-1"
@@ -198,6 +203,7 @@ func TestEventDebouncer_ShouldSkip_DuplicateAfterWindow(t *testing.T) {
 
 func TestEventDebouncer_ShouldSkip_DifferentEventTypes(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	event1.AgentID = "agent-1"
@@ -218,6 +224,7 @@ func TestEventDebouncer_ShouldSkip_DifferentEventTypes(t *testing.T) {
 
 func TestEventDebouncer_ShouldSkip_DifferentAgents(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	event1.AgentID = "agent-1"
@@ -238,6 +245,7 @@ func TestEventDebouncer_ShouldSkip_DifferentAgents(t *testing.T) {
 
 func TestEventDebouncer_ShouldSkip_DifferentSessions(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event1 := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	event1.AgentID = "agent-1"
@@ -258,6 +266,7 @@ func TestEventDebouncer_ShouldSkip_DifferentSessions(t *testing.T) {
 
 func TestEventDebouncer_Signature(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	event.AgentID = "agent-1"
@@ -273,6 +282,7 @@ func TestEventDebouncer_Signature(t *testing.T) {
 
 func TestEventDebouncer_Cleanup(t *testing.T) {
 	debouncer := NewEventDebouncer(50 * time.Millisecond)
+	defer debouncer.Stop()
 
 	// Add some events
 	for i := 0; i < 5; i++ {
@@ -290,8 +300,8 @@ func TestEventDebouncer_Cleanup(t *testing.T) {
 		t.Error("Expected some events to be recorded")
 	}
 
-	// Wait for entries to expire
-	time.Sleep(60 * time.Millisecond)
+	// Wait for entries to expire (window*2 = 100ms)
+	time.Sleep(110 * time.Millisecond)
 
 	// Run cleanup
 	debouncer.Cleanup()
@@ -306,8 +316,141 @@ func TestEventDebouncer_Cleanup(t *testing.T) {
 	}
 }
 
+// TestEventDebouncer_AutomaticCleanup verifies background cleanup runs automatically.
+func TestEventDebouncer_AutomaticCleanup(t *testing.T) {
+	// Use a short window to speed up the test
+	debouncer := NewEventDebouncer(30 * time.Millisecond)
+	defer debouncer.Stop()
+
+	// Add events
+	for i := 0; i < 10; i++ {
+		event := NewActivityEvent(EventTypeAgentAction, "session-"+string(rune('A'+i)), "test")
+		event.AgentID = "agent-" + string(rune('A'+i))
+		debouncer.ShouldSkip(event)
+	}
+
+	// Verify events are recorded
+	debouncer.mu.RLock()
+	initialCount := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	if initialCount != 10 {
+		t.Errorf("Expected 10 entries, got %d", initialCount)
+	}
+
+	// Wait for automatic cleanup (window + window*2 + buffer = 30 + 60 + 20 = 110ms)
+	time.Sleep(120 * time.Millisecond)
+
+	// Entries should be cleaned up automatically
+	debouncer.mu.RLock()
+	finalCount := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	if finalCount != 0 {
+		t.Errorf("Automatic cleanup should have removed entries, got %d remaining", finalCount)
+	}
+}
+
+// TestEventDebouncer_BoundedMemory verifies memory doesn't grow unboundedly.
+func TestEventDebouncer_BoundedMemory(t *testing.T) {
+	// Use a very short window
+	debouncer := NewEventDebouncer(20 * time.Millisecond)
+	defer debouncer.Stop()
+
+	// Add many unique events over time
+	for round := 0; round < 5; round++ {
+		for i := 0; i < 100; i++ {
+			event := NewActivityEvent(EventTypeAgentAction, "session-"+string(rune('A'+i%26)), "test")
+			event.AgentID = "agent-" + string(rune('A'+round)) + string(rune('A'+i%26))
+			debouncer.ShouldSkip(event)
+		}
+		// Wait for cleanup to run
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// After all rounds, the map should be bounded (not 500 entries)
+	debouncer.mu.RLock()
+	count := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	// Should have at most entries from the last round (100) that haven't expired yet
+	// Plus some margin for timing
+	maxExpected := 150
+	if count > maxExpected {
+		t.Errorf("Map should be bounded, got %d entries (max expected %d)", count, maxExpected)
+	}
+}
+
+// TestEventDebouncer_ConcurrentCleanup verifies no data races during cleanup.
+func TestEventDebouncer_ConcurrentCleanup(t *testing.T) {
+	debouncer := NewEventDebouncer(10 * time.Millisecond)
+	defer debouncer.Stop()
+
+	var wg sync.WaitGroup
+	goroutines := 20
+	iterations := 100
+
+	// Start goroutines that add events
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				event := NewActivityEvent(EventTypeAgentAction, "session-"+string(rune('A'+j%26)), "test")
+				event.AgentID = "agent-" + string(rune('A'+id))
+				debouncer.ShouldSkip(event)
+			}
+		}(i)
+	}
+
+	// Start goroutines that manually trigger cleanup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				debouncer.Cleanup()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	wg.Wait()
+	// Test passes if no data race is detected (run with -race)
+}
+
+// TestEventDebouncer_Stop verifies the debouncer can be stopped.
+func TestEventDebouncer_Stop(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	// Stop should not panic
+	debouncer.Stop()
+
+	// Multiple stops should not panic
+	debouncer.Stop()
+	debouncer.Stop()
+}
+
+// TestEventDebouncer_StopIdempotent verifies Stop is idempotent.
+func TestEventDebouncer_StopIdempotent(t *testing.T) {
+	debouncer := NewEventDebouncer(100 * time.Millisecond)
+
+	// Call Stop concurrently
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			debouncer.Stop()
+		}()
+	}
+	wg.Wait()
+	// Should not panic
+}
+
 func TestEventDebouncer_ConcurrentAccess(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	wg := sync.WaitGroup{}
 	goroutines := 10
@@ -343,6 +486,7 @@ func TestEventDebouncer_ConcurrentAccess(t *testing.T) {
 // first event (not skipped), and all others should be skipped.
 func TestEventDebouncer_ConcurrentSameSignature(t *testing.T) {
 	debouncer := NewEventDebouncer(1 * time.Second) // Long window
+	defer debouncer.Stop()
 
 	var wg sync.WaitGroup
 	goroutines := 100
@@ -418,6 +562,7 @@ func TestEventDebouncer_ConcurrentSameSignatureStress(t *testing.T) {
 
 		close(startChan)
 		wg.Wait()
+		debouncer.Stop()
 
 		if notSkippedCount != 1 {
 			t.Errorf("Iteration %d: Expected exactly 1 event not skipped, got %d",
@@ -428,6 +573,7 @@ func TestEventDebouncer_ConcurrentSameSignatureStress(t *testing.T) {
 
 func TestEventDebouncer_EmptyAgentID(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
+	defer debouncer.Stop()
 
 	event := NewActivityEvent(EventTypeAgentAction, "session-1", "test")
 	// AgentID is empty
