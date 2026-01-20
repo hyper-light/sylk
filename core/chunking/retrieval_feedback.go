@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 // =============================================================================
@@ -122,8 +124,11 @@ type AsyncRetrievalFeedbackHook struct {
 	// cancel cancels the background worker.
 	cancel context.CancelFunc
 
-	// wg tracks the background worker goroutine.
+	// wg tracks the background worker goroutine (used when scope is nil).
 	wg sync.WaitGroup
+
+	// scope is the optional GoroutineScope for tracking the background worker.
+	scope *concurrency.GoroutineScope
 
 	// stopped indicates if the hook has been stopped.
 	stopped atomic.Bool
@@ -160,6 +165,11 @@ type AsyncFeedbackConfig struct {
 
 	// Context is the parent context (optional, defaults to background).
 	Context context.Context
+
+	// Scope is the optional GoroutineScope for tracking the background worker.
+	// When provided, the worker is tracked via scope.Go() for WAVE 4 compliance.
+	// When nil, falls back to standard WaitGroup tracking (backward compatible).
+	Scope *concurrency.GoroutineScope
 }
 
 // NewAsyncRetrievalFeedbackHook creates a new AsyncRetrievalFeedbackHook.
@@ -168,6 +178,19 @@ func NewAsyncRetrievalFeedbackHook(config AsyncFeedbackConfig) (*AsyncRetrievalF
 		return nil, fmt.Errorf("learner is required")
 	}
 
+	hook := buildAsyncHook(config)
+
+	// Start background worker via scope or WaitGroup
+	if err := hook.startWorker(); err != nil {
+		hook.cancel()
+		return nil, fmt.Errorf("failed to start background worker: %w", err)
+	}
+
+	return hook, nil
+}
+
+// buildAsyncHook creates the hook struct with all required fields initialized.
+func buildAsyncHook(config AsyncFeedbackConfig) *AsyncRetrievalFeedbackHook {
 	bufferSize := config.BufferSize
 	if bufferSize <= 0 {
 		bufferSize = 1000
@@ -184,7 +207,7 @@ func NewAsyncRetrievalFeedbackHook(config AsyncFeedbackConfig) (*AsyncRetrievalF
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
 
-	hook := &AsyncRetrievalFeedbackHook{
+	return &AsyncRetrievalFeedbackHook{
 		learner:      config.Learner,
 		chunkStats:   make(map[string]*ChunkStats),
 		domainStats:  make(map[Domain]*domainAggregateStats),
@@ -193,13 +216,18 @@ func NewAsyncRetrievalFeedbackHook(config AsyncFeedbackConfig) (*AsyncRetrievalF
 		bufferSize:   bufferSize,
 		ctx:          ctx,
 		cancel:       cancel,
+		scope:        config.Scope,
 	}
+}
 
-	// Start background worker
-	hook.wg.Add(1)
-	go hook.processLoop()
-
-	return hook, nil
+// startWorker starts the background worker using scope.Go() or WaitGroup.
+func (h *AsyncRetrievalFeedbackHook) startWorker() error {
+	if h.scope != nil {
+		return h.scope.Go("AsyncRetrievalFeedbackHook.processLoop", 0, h.processLoopScoped)
+	}
+	h.wg.Add(1)
+	go h.processLoop()
+	return nil
 }
 
 // RegisterChunk registers a chunk for tracking. This should be called when
@@ -288,13 +316,27 @@ func (h *AsyncRetrievalFeedbackHook) RecordRetrievalSync(chunkID string, wasUsef
 }
 
 // processLoop is the background worker that processes feedback entries.
+// Used when scope is nil (WaitGroup tracking).
 func (h *AsyncRetrievalFeedbackHook) processLoop() {
 	defer h.wg.Done()
+	h.runProcessLoop(h.ctx)
+}
 
+// processLoopScoped is the background worker for GoroutineScope tracking.
+// Matches concurrency.WorkFunc signature: func(ctx context.Context) error.
+func (h *AsyncRetrievalFeedbackHook) processLoopScoped(ctx context.Context) error {
+	h.runProcessLoop(ctx)
+	return nil
+}
+
+// runProcessLoop contains the shared processing logic for both tracking modes.
+func (h *AsyncRetrievalFeedbackHook) runProcessLoop(ctx context.Context) {
 	for {
 		select {
+		case <-ctx.Done():
+			h.drainRemaining()
+			return
 		case <-h.ctx.Done():
-			// Drain remaining entries before exiting
 			h.drainRemaining()
 			return
 		case entry := <-h.feedbackChan:
@@ -467,12 +509,16 @@ func (h *AsyncRetrievalFeedbackHook) SetSessionID(sessionID string) {
 
 // Stop stops the background worker and waits for it to finish.
 // Any remaining entries in the buffer will be processed before returning.
+// When using GoroutineScope, the scope manages worker lifecycle.
 func (h *AsyncRetrievalFeedbackHook) Stop() {
 	if h.stopped.Swap(true) {
 		return // Already stopped
 	}
 	h.cancel()
-	h.wg.Wait()
+	// Only wait on WaitGroup when not using scope (scope manages lifecycle)
+	if h.scope == nil {
+		h.wg.Wait()
+	}
 }
 
 // =============================================================================
