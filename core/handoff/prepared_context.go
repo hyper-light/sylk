@@ -180,14 +180,14 @@ func (pc *PreparedContext) AddMessage(msg Message) {
 		msg.TokenCount = estimateTokens(msg.Content)
 	}
 
-	// Add to rolling summary
-	pc.summary.AddMessage(msg)
+	// Add to rolling summary (use locked variant to avoid deadlock)
+	pc.summary.addMessageLocked(msg)
 
-	// Add to recent messages buffer
-	pc.recentMessages.Push(msg)
+	// Add to recent messages buffer (use locked variant to avoid deadlock)
+	pc.recentMessages.pushLocked(msg)
 
 	// Update token count
-	pc.recalculateTokenCount()
+	pc.recalculateTokenCountLocked()
 
 	pc.lastUpdated = time.Now()
 	pc.version++
@@ -197,7 +197,7 @@ func (pc *PreparedContext) AddMessage(msg Message) {
 func (pc *PreparedContext) RecentMessages() []Message {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
-	return pc.recentMessages.Items()
+	return pc.recentMessages.itemsLocked()
 }
 
 // =============================================================================
@@ -222,7 +222,7 @@ func (pc *PreparedContext) UpdateToolState(name string, state ToolState) {
 	}
 
 	pc.toolStates[name] = &state
-	pc.recalculateTokenCount()
+	pc.recalculateTokenCountLocked()
 	pc.lastUpdated = time.Now()
 	pc.version++
 }
@@ -261,7 +261,7 @@ func (pc *PreparedContext) RemoveToolState(name string) bool {
 
 	if _, exists := pc.toolStates[name]; exists {
 		delete(pc.toolStates, name)
-		pc.recalculateTokenCount()
+		pc.recalculateTokenCountLocked()
 		pc.lastUpdated = time.Now()
 		pc.version++
 		return true
@@ -294,14 +294,14 @@ func (pc *PreparedContext) pruneOldestToolState() {
 func (pc *PreparedContext) Summary() string {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
-	return pc.summary.Summary()
+	return pc.summary.summaryLocked()
 }
 
 // KeyTopics returns the key topics from the rolling summary.
 func (pc *PreparedContext) KeyTopics() []string {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
-	return pc.summary.KeyTopics()
+	return pc.summary.keyTopicsLocked()
 }
 
 // =============================================================================
@@ -315,16 +315,16 @@ func (pc *PreparedContext) TokenCount() int {
 	return pc.tokenCount
 }
 
-// recalculateTokenCount updates the total token count.
-// Caller must hold the write lock.
-func (pc *PreparedContext) recalculateTokenCount() {
+// recalculateTokenCountLocked updates the total token count.
+// Caller must hold pc.mu write lock.
+func (pc *PreparedContext) recalculateTokenCountLocked() {
 	count := 0
 
-	// Summary tokens
-	count += pc.summary.TokenCount()
+	// Summary tokens (use locked variant to avoid deadlock)
+	count += pc.summary.tokenCountLocked()
 
-	// Recent messages tokens (separate from summary for recent access)
-	for _, msg := range pc.recentMessages.Items() {
+	// Recent messages tokens (use locked variant to avoid deadlock)
+	for _, msg := range pc.recentMessages.itemsLocked() {
 		count += msg.TokenCount
 	}
 
@@ -382,7 +382,7 @@ func (pc *PreparedContext) Refresh() {
 // Caller must hold the write lock.
 func (pc *PreparedContext) performRefresh() {
 	// Recalculate token count
-	pc.recalculateTokenCount()
+	pc.recalculateTokenCountLocked()
 
 	// Prune inactive tool states
 	pc.pruneInactiveToolStates()
@@ -438,7 +438,7 @@ type PreparedContextSnapshot struct {
 }
 
 // toSnapshot creates a snapshot of the current state.
-// Caller must hold at least a read lock.
+// Caller must hold pc.mu (read or write lock).
 func (pc *PreparedContext) toSnapshot() PreparedContextSnapshot {
 	toolStates := make(map[string]ToolState, len(pc.toolStates))
 	for name, state := range pc.toolStates {
@@ -451,11 +451,11 @@ func (pc *PreparedContext) toSnapshot() PreparedContextSnapshot {
 	}
 
 	return PreparedContextSnapshot{
-		Summary:        pc.summary.Summary(),
-		RecentMessages: pc.recentMessages.Items(),
+		Summary:        pc.summary.summaryLocked(),
+		RecentMessages: pc.recentMessages.itemsLocked(),
 		ToolStates:     toolStates,
 		TokenCount:     pc.tokenCount,
-		KeyTopics:      pc.summary.KeyTopics(),
+		KeyTopics:      pc.summary.keyTopicsLocked(),
 		LastUpdated:    pc.lastUpdated.Format(time.RFC3339Nano),
 		LastRefreshed:  pc.lastRefreshed.Format(time.RFC3339Nano),
 		CreatedAt:      pc.createdAt.Format(time.RFC3339Nano),
@@ -489,10 +489,10 @@ func FromSnapshot(snapshot PreparedContextSnapshot) (*PreparedContext, error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	// Restore messages
+	// Restore messages (use locked variants since we hold pc.mu)
 	for _, msg := range snapshot.RecentMessages {
-		pc.summary.AddMessage(msg)
-		pc.recentMessages.Push(msg)
+		pc.summary.addMessageLocked(msg)
+		pc.recentMessages.pushLocked(msg)
 	}
 
 	// Restore tool states
@@ -518,7 +518,7 @@ func FromSnapshot(snapshot PreparedContextSnapshot) (*PreparedContext, error) {
 	}
 
 	pc.version = snapshot.Version
-	pc.recalculateTokenCount()
+	pc.recalculateTokenCountLocked()
 
 	return pc, nil
 }
@@ -528,9 +528,10 @@ func FromSnapshot(snapshot PreparedContextSnapshot) (*PreparedContext, error) {
 // =============================================================================
 
 // preparedContextJSON is the full JSON representation.
+// Uses extracted data types to avoid race conditions during marshaling.
 type preparedContextJSON struct {
-	Summary        *RollingSummary           `json:"summary"`
-	RecentMessages *CircularBuffer[Message]  `json:"recent_messages"`
+	Summary        rollingSummaryData        `json:"summary"`
+	RecentMessages circularBufferData        `json:"recent_messages"`
 	ToolStates     map[string]*ToolState     `json:"tool_states"`
 	TokenCount     int                       `json:"token_count"`
 	LastUpdated    string                    `json:"last_updated"`
@@ -541,23 +542,94 @@ type preparedContextJSON struct {
 	Metadata       map[string]string         `json:"metadata"`
 }
 
+// rollingSummaryData is a snapshot of RollingSummary data for JSON marshaling.
+type rollingSummaryData struct {
+	MaxTokens     int                   `json:"max_tokens"`
+	CurrentTokens int                   `json:"current_tokens"`
+	Messages      []Message             `json:"messages"`
+	KeyTopics     map[string]int        `json:"key_topics"`
+	SummaryText   string                `json:"summary_text"`
+	LastUpdated   string                `json:"last_updated"`
+	MessageCount  int                   `json:"message_count"`
+	Config        *RollingSummaryConfig `json:"config"`
+}
+
+// circularBufferData is a snapshot of CircularBuffer data for JSON marshaling.
+type circularBufferData struct {
+	Items    []Message `json:"items"`
+	Capacity int       `json:"capacity"`
+}
+
 // MarshalJSON implements json.Marshaler.
+// Extracts all data while holding the lock to avoid race conditions.
 func (pc *PreparedContext) MarshalJSON() ([]byte, error) {
 	pc.mu.RLock()
-	defer pc.mu.RUnlock()
+	// Extract all data while holding the lock using locked methods
+	summaryData := rollingSummaryData{
+		MaxTokens:     pc.summary.maxTokens,
+		CurrentTokens: pc.summary.currentTokens,
+		Messages:      pc.summary.messageBuffer.itemsLocked(),
+		KeyTopics:     copyKeyTopics(pc.summary.keyTopics),
+		SummaryText:   pc.summary.summaryText,
+		LastUpdated:   pc.summary.lastUpdated.Format(time.RFC3339Nano),
+		MessageCount:  pc.summary.messageCount,
+		Config:        pc.summary.config,
+	}
+	recentMessagesData := circularBufferData{
+		Items:    pc.recentMessages.itemsLocked(),
+		Capacity: pc.recentMessages.capacity,
+	}
+	toolStates := copyToolStates(pc.toolStates)
+	tokenCount := pc.tokenCount
+	lastUpdated := pc.lastUpdated.Format(time.RFC3339Nano)
+	lastRefreshed := pc.lastRefreshed.Format(time.RFC3339Nano)
+	createdAt := pc.createdAt.Format(time.RFC3339Nano)
+	config := pc.config
+	version := pc.version
+	metadata := copyStringMap(pc.metadata)
+	pc.mu.RUnlock()
 
+	// Marshal outside the lock - all data is now safely copied
 	return json.Marshal(preparedContextJSON{
-		Summary:        pc.summary,
-		RecentMessages: pc.recentMessages,
-		ToolStates:     pc.toolStates,
-		TokenCount:     pc.tokenCount,
-		LastUpdated:    pc.lastUpdated.Format(time.RFC3339Nano),
-		LastRefreshed:  pc.lastRefreshed.Format(time.RFC3339Nano),
-		CreatedAt:      pc.createdAt.Format(time.RFC3339Nano),
-		Config:         pc.config,
-		Version:        pc.version,
-		Metadata:       pc.metadata,
+		Summary:        summaryData,
+		RecentMessages: recentMessagesData,
+		ToolStates:     toolStates,
+		TokenCount:     tokenCount,
+		LastUpdated:    lastUpdated,
+		LastRefreshed:  lastRefreshed,
+		CreatedAt:      createdAt,
+		Config:         config,
+		Version:        version,
+		Metadata:       metadata,
 	})
+}
+
+// copyKeyTopics creates a copy of the key topics map.
+func copyKeyTopics(src map[string]int) map[string]int {
+	dst := make(map[string]int, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// copyToolStates creates a copy of the tool states map.
+func copyToolStates(src map[string]*ToolState) map[string]*ToolState {
+	dst := make(map[string]*ToolState, len(src))
+	for k, v := range src {
+		copy := *v
+		dst[k] = &copy
+	}
+	return dst
+}
+
+// copyStringMap creates a copy of a string map.
+func copyStringMap(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -570,15 +642,11 @@ func (pc *PreparedContext) UnmarshalJSON(data []byte) error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	pc.summary = temp.Summary
-	if pc.summary == nil {
-		pc.summary = NewRollingSummary(temp.Config.MaxSummaryTokens)
-	}
+	// Reconstruct RollingSummary from snapshot data
+	pc.summary = restoreRollingSummary(temp.Summary, temp.Config.MaxSummaryTokens)
 
-	pc.recentMessages = temp.RecentMessages
-	if pc.recentMessages == nil {
-		pc.recentMessages = NewCircularBuffer[Message](temp.Config.MaxRecentMessages)
-	}
+	// Reconstruct CircularBuffer from snapshot data
+	pc.recentMessages = restoreCircularBuffer(temp.RecentMessages, temp.Config.MaxRecentMessages)
 
 	pc.toolStates = temp.ToolStates
 	if pc.toolStates == nil {
@@ -612,6 +680,56 @@ func (pc *PreparedContext) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+// restoreRollingSummary reconstructs a RollingSummary from snapshot data.
+func restoreRollingSummary(data rollingSummaryData, maxTokens int) *RollingSummary {
+	config := data.Config
+	if config == nil {
+		config = DefaultRollingSummaryConfig()
+		config.MaxTokens = maxTokens
+	}
+	rs := NewRollingSummaryWithConfig(config)
+
+	rs.maxTokens = data.MaxTokens
+	rs.currentTokens = data.CurrentTokens
+	rs.summaryText = data.SummaryText
+	rs.messageCount = data.MessageCount
+	rs.keyTopics = data.KeyTopics
+	if rs.keyTopics == nil {
+		rs.keyTopics = make(map[string]int)
+	}
+
+	// Restore messages to buffer
+	for _, msg := range data.Messages {
+		rs.messageBuffer.pushLocked(msg)
+	}
+
+	// Parse timestamp
+	if data.LastUpdated != "" {
+		if t, err := time.Parse(time.RFC3339Nano, data.LastUpdated); err == nil {
+			rs.lastUpdated = t
+		}
+	}
+
+	return rs
+}
+
+// restoreCircularBuffer reconstructs a CircularBuffer from snapshot data.
+func restoreCircularBuffer(data circularBufferData, maxCapacity int) *CircularBuffer[Message] {
+	capacity := data.Capacity
+	if capacity < 1 {
+		capacity = maxCapacity
+	}
+	if capacity < len(data.Items) {
+		capacity = len(data.Items)
+	}
+
+	buf := NewCircularBuffer[Message](capacity)
+	for _, item := range data.Items {
+		buf.pushLocked(item)
+	}
+	return buf
 }
 
 // =============================================================================
@@ -717,12 +835,12 @@ func (pc *PreparedContext) Stats() PreparedContextStats {
 
 	return PreparedContextStats{
 		TokenCount:       pc.tokenCount,
-		SummaryTokens:    pc.summary.TokenCount(),
-		MessageCount:     pc.summary.MessageCount(),
-		BufferedMessages: pc.recentMessages.Len(),
+		SummaryTokens:    pc.summary.tokenCountLocked(),
+		MessageCount:     pc.summary.messageCountLocked(),
+		BufferedMessages: pc.recentMessages.lenLocked(),
 		ToolStateCount:   len(pc.toolStates),
 		ActiveTools:      activeTools,
-		KeyTopicCount:    len(pc.summary.KeyTopics()),
+		KeyTopicCount:    len(pc.summary.keyTopicsLocked()),
 		Version:          pc.version,
 		Age:              time.Since(pc.createdAt),
 		TimeSinceRefresh: time.Since(pc.lastRefreshed),
@@ -734,8 +852,8 @@ func (pc *PreparedContext) Clear() {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	pc.summary.Clear()
-	pc.recentMessages.Clear()
+	pc.summary.clearLocked()
+	pc.recentMessages.clearLocked()
 	pc.toolStates = make(map[string]*ToolState)
 	pc.metadata = make(map[string]string)
 	pc.tokenCount = 0

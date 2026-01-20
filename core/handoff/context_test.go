@@ -1604,3 +1604,569 @@ func BenchmarkPreparedContext_RefreshIfStale(b *testing.B) {
 		ctx.RefreshIfStale(time.Hour) // Won't be stale
 	}
 }
+
+// =============================================================================
+// W4H.2 - Nested Lock Acquisition Deadlock Tests
+// =============================================================================
+
+// TestPreparedContext_AddMessage_NoDeadlock tests that concurrent AddMessage
+// calls do not cause deadlock from nested lock acquisition.
+// This test should complete without hanging if the fix is correct.
+func TestPreparedContext_AddMessage_NoDeadlock(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numGoroutines := 20
+	numMessages := 100
+	done := make(chan struct{})
+
+	// Start a watchdog to detect deadlock (test should complete in ~5 seconds)
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(30 * time.Second):
+			t.Error("Test timed out - possible deadlock detected")
+		}
+	}()
+
+	// Concurrent AddMessage calls
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numMessages; j++ {
+				msg := NewMessage("user", "Message from goroutine")
+				ctx.AddMessage(msg)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(done)
+
+	// Verify all messages were processed
+	stats := ctx.Stats()
+	expectedMessages := numGoroutines * numMessages
+	if stats.MessageCount < expectedMessages/2 {
+		t.Errorf("MessageCount = %d, expected at least %d",
+			stats.MessageCount, expectedMessages/2)
+	}
+}
+
+// TestPreparedContext_ConcurrentAddMessageAndRead tests concurrent read/write
+// operations that previously caused deadlock from nested lock acquisition.
+func TestPreparedContext_ConcurrentAddMessageAndRead(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numGoroutines := 10
+	numOperations := 100
+	done := make(chan struct{})
+
+	// Watchdog for deadlock detection
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(30 * time.Second):
+			t.Error("Test timed out - possible deadlock detected")
+		}
+	}()
+
+	// Writers - AddMessage
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				ctx.AddMessage(NewMessage("user", "Test message content"))
+			}
+		}()
+	}
+
+	// Readers - Summary (calls summary.Summary() which was causing deadlock)
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				_ = ctx.Summary()
+			}
+		}()
+	}
+
+	// Readers - KeyTopics
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				_ = ctx.KeyTopics()
+			}
+		}()
+	}
+
+	// Readers - TokenCount
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				_ = ctx.TokenCount()
+			}
+		}()
+	}
+
+	// Readers - RecentMessages (calls recentMessages.Items())
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				_ = ctx.RecentMessages()
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(done)
+}
+
+// TestPreparedContext_ConcurrentOperations_TokenCountCorrect verifies that
+// token counts remain correct under concurrent operations.
+func TestPreparedContext_ConcurrentOperations_TokenCountCorrect(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numGoroutines := 10
+	numMessages := 50
+
+	// Concurrent AddMessage calls
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numMessages; j++ {
+				ctx.AddMessage(NewMessage("user", "Test message for token counting"))
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Token count should be positive and consistent
+	tokenCount := ctx.TokenCount()
+	if tokenCount <= 0 {
+		t.Errorf("TokenCount() = %d, should be > 0", tokenCount)
+	}
+
+	// Token count should match Stats
+	stats := ctx.Stats()
+	if stats.TokenCount != tokenCount {
+		t.Errorf("Stats.TokenCount = %d, TokenCount() = %d, should match",
+			stats.TokenCount, tokenCount)
+	}
+}
+
+// TestPreparedContext_ConcurrentStatsAndAddMessage tests that Stats() and
+// AddMessage() can run concurrently without deadlock.
+func TestPreparedContext_ConcurrentStatsAndAddMessage(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numOperations := 200
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(30 * time.Second):
+			t.Error("Test timed out - possible deadlock in Stats/AddMessage")
+		}
+	}()
+
+	// AddMessage writer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			ctx.AddMessage(NewMessage("user", "Message"))
+		}
+	}()
+
+	// Stats reader
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			stats := ctx.Stats()
+			// Validate stats are consistent
+			if stats.TokenCount < 0 {
+				t.Errorf("Invalid negative token count: %d", stats.TokenCount)
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+}
+
+// TestPreparedContext_ConcurrentSnapshotAndAddMessage tests Snapshot() and
+// AddMessage() running concurrently.
+func TestPreparedContext_ConcurrentSnapshotAndAddMessage(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numOperations := 100
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(30 * time.Second):
+			t.Error("Test timed out - possible deadlock in Snapshot/AddMessage")
+		}
+	}()
+
+	// AddMessage writer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			ctx.AddMessage(NewMessage("user", "Snapshot test message"))
+		}
+	}()
+
+	// Snapshot reader
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			snap := ctx.Snapshot()
+			// Validate snapshot is consistent
+			if snap.TokenCount < 0 {
+				t.Errorf("Invalid negative token count in snapshot: %d", snap.TokenCount)
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+}
+
+// TestPreparedContext_ConcurrentClearAndAddMessage tests that Clear() and
+// AddMessage() can run concurrently without deadlock.
+func TestPreparedContext_ConcurrentClearAndAddMessage(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numOperations := 100
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(30 * time.Second):
+			t.Error("Test timed out - possible deadlock in Clear/AddMessage")
+		}
+	}()
+
+	// AddMessage writer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			ctx.AddMessage(NewMessage("user", "Message before clear"))
+		}
+	}()
+
+	// Clear operations
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations/10; i++ {
+			ctx.Clear()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+
+	// Context should be in a valid state
+	stats := ctx.Stats()
+	if stats.TokenCount < 0 {
+		t.Errorf("Invalid token count after concurrent Clear/AddMessage: %d", stats.TokenCount)
+	}
+}
+
+// TestPreparedContext_ConcurrentToBytesAndAddMessage tests serialization
+// concurrent with modifications.
+func TestPreparedContext_ConcurrentToBytesAndAddMessage(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numOperations := 100
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(30 * time.Second):
+			t.Error("Test timed out - possible deadlock in ToBytes/AddMessage")
+		}
+	}()
+
+	// AddMessage writer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			ctx.AddMessage(NewMessage("user", "Serialization test"))
+		}
+	}()
+
+	// ToBytes serializer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			data, err := ctx.ToBytes()
+			if err != nil {
+				t.Errorf("ToBytes error: %v", err)
+				return
+			}
+			if len(data) == 0 {
+				t.Error("ToBytes returned empty data")
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+}
+
+// TestPreparedContext_ConcurrentJSONMarshalAndAddMessage tests JSON
+// marshaling concurrent with modifications.
+func TestPreparedContext_ConcurrentJSONMarshalAndAddMessage(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+	var wg sync.WaitGroup
+	numOperations := 100
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(30 * time.Second):
+			t.Error("Test timed out - possible deadlock in JSON marshal/AddMessage")
+		}
+	}()
+
+	// AddMessage writer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			ctx.AddMessage(NewMessage("user", "JSON test"))
+		}
+	}()
+
+	// JSON marshal
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numOperations; i++ {
+			data, err := json.Marshal(ctx)
+			if err != nil {
+				t.Errorf("JSON Marshal error: %v", err)
+				return
+			}
+			if len(data) == 0 {
+				t.Error("JSON Marshal returned empty data")
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+}
+
+// TestCircularBuffer_LockedMethods tests the locked variant methods.
+func TestCircularBuffer_LockedMethods(t *testing.T) {
+	t.Run("pushLocked works correctly", func(t *testing.T) {
+		buf := NewCircularBuffer[int](3)
+		// Direct access to locked method (simulating holding lock)
+		buf.mu.Lock()
+		buf.pushLocked(1)
+		buf.pushLocked(2)
+		buf.mu.Unlock()
+
+		if buf.Len() != 2 {
+			t.Errorf("Len() = %d, expected 2", buf.Len())
+		}
+	})
+
+	t.Run("itemsLocked works correctly", func(t *testing.T) {
+		buf := NewCircularBuffer[string](5)
+		buf.Push("a")
+		buf.Push("b")
+
+		buf.mu.RLock()
+		items := buf.itemsLocked()
+		buf.mu.RUnlock()
+
+		if len(items) != 2 {
+			t.Errorf("itemsLocked() length = %d, expected 2", len(items))
+		}
+	})
+
+	t.Run("lenLocked works correctly", func(t *testing.T) {
+		buf := NewCircularBuffer[int](5)
+		buf.Push(1)
+		buf.Push(2)
+		buf.Push(3)
+
+		buf.mu.RLock()
+		length := buf.lenLocked()
+		buf.mu.RUnlock()
+
+		if length != 3 {
+			t.Errorf("lenLocked() = %d, expected 3", length)
+		}
+	})
+
+	t.Run("clearLocked works correctly", func(t *testing.T) {
+		buf := NewCircularBuffer[int](5)
+		buf.Push(1)
+		buf.Push(2)
+
+		buf.mu.Lock()
+		buf.clearLocked()
+		buf.mu.Unlock()
+
+		if buf.Len() != 0 {
+			t.Errorf("Len() = %d after clearLocked, expected 0", buf.Len())
+		}
+	})
+}
+
+// TestRollingSummary_LockedMethods tests the locked variant methods.
+func TestRollingSummary_LockedMethods(t *testing.T) {
+	t.Run("addMessageLocked works correctly", func(t *testing.T) {
+		rs := NewRollingSummary(1000)
+		msg := NewMessage("user", "Test message")
+
+		rs.mu.Lock()
+		rs.addMessageLocked(msg)
+		rs.mu.Unlock()
+
+		if rs.MessageCount() != 1 {
+			t.Errorf("MessageCount() = %d, expected 1", rs.MessageCount())
+		}
+	})
+
+	t.Run("tokenCountLocked works correctly", func(t *testing.T) {
+		rs := NewRollingSummary(1000)
+		rs.AddMessage(NewMessage("user", "Hello world"))
+
+		rs.mu.RLock()
+		count := rs.tokenCountLocked()
+		rs.mu.RUnlock()
+
+		if count == 0 {
+			t.Error("tokenCountLocked() should return non-zero after adding message")
+		}
+	})
+
+	t.Run("summaryLocked works correctly", func(t *testing.T) {
+		rs := NewRollingSummary(1000)
+		rs.AddMessage(NewMessage("user", "Test content"))
+
+		rs.mu.RLock()
+		summary := rs.summaryLocked()
+		rs.mu.RUnlock()
+
+		if summary == "" {
+			t.Error("summaryLocked() should return non-empty string")
+		}
+	})
+
+	t.Run("keyTopicsLocked works correctly", func(t *testing.T) {
+		rs := NewRollingSummaryWithConfig(&RollingSummaryConfig{
+			MaxTokens:              1000,
+			MessageBufferSize:      20,
+			TopicExtractionEnabled: true,
+			MaxTopics:              10,
+			MinTopicMentions:       1,
+			TokensPerChar:          0.25,
+		})
+		rs.AddMessage(NewMessage("user", "Go programming language"))
+		rs.AddMessage(NewMessage("user", "Go programming"))
+
+		rs.mu.RLock()
+		topics := rs.keyTopicsLocked()
+		rs.mu.RUnlock()
+
+		// Should have at least some topics
+		if topics == nil {
+			t.Error("keyTopicsLocked() should not return nil")
+		}
+	})
+
+	t.Run("messageCountLocked works correctly", func(t *testing.T) {
+		rs := NewRollingSummary(1000)
+		rs.AddMessage(NewMessage("user", "First"))
+		rs.AddMessage(NewMessage("assistant", "Second"))
+
+		rs.mu.RLock()
+		count := rs.messageCountLocked()
+		rs.mu.RUnlock()
+
+		if count != 2 {
+			t.Errorf("messageCountLocked() = %d, expected 2", count)
+		}
+	})
+
+	t.Run("clearLocked works correctly", func(t *testing.T) {
+		rs := NewRollingSummary(1000)
+		rs.AddMessage(NewMessage("user", "Test"))
+
+		rs.mu.Lock()
+		rs.clearLocked()
+		rs.mu.Unlock()
+
+		if rs.MessageCount() != 0 {
+			t.Errorf("MessageCount() = %d after clearLocked, expected 0", rs.MessageCount())
+		}
+	})
+}
+
+// TestPreparedContext_RecalculateTokenCountLocked tests that token counting
+// works correctly with the locked variant.
+func TestPreparedContext_RecalculateTokenCountLocked(t *testing.T) {
+	ctx := NewPreparedContextDefault()
+
+	// Add multiple messages
+	for i := 0; i < 5; i++ {
+		ctx.AddMessage(NewMessage("user", "Test message for token counting"))
+	}
+
+	// Add tool states
+	ctx.UpdateToolState("editor", ToolState{
+		Active: true,
+		State:  map[string]interface{}{"file": "test.go"},
+	})
+
+	// Verify token count is calculated correctly
+	tokenCount := ctx.TokenCount()
+	if tokenCount <= 0 {
+		t.Errorf("TokenCount() = %d, should be > 0", tokenCount)
+	}
+
+	// Clear and verify token count is zero
+	ctx.Clear()
+	if ctx.TokenCount() != 0 {
+		t.Errorf("TokenCount() = %d after Clear, expected 0", ctx.TokenCount())
+	}
+}

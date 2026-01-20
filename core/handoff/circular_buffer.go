@@ -64,7 +64,12 @@ func NewCircularBuffer[T any](capacity int) *CircularBuffer[T] {
 func (cb *CircularBuffer[T]) Push(item T) bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	return cb.pushLocked(item)
+}
 
+// pushLocked is the internal implementation of Push.
+// Caller must hold cb.mu write lock.
+func (cb *CircularBuffer[T]) pushLocked(item T) bool {
 	evicted := false
 
 	// If buffer is full, advance head (evict oldest)
@@ -156,7 +161,12 @@ func (cb *CircularBuffer[T]) At(index int) (T, bool) {
 func (cb *CircularBuffer[T]) Items() []T {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
+	return cb.itemsLocked()
+}
 
+// itemsLocked is the internal implementation of Items.
+// Caller must hold cb.mu (read or write lock).
+func (cb *CircularBuffer[T]) itemsLocked() []T {
 	result := make([]T, cb.count)
 	for i := 0; i < cb.count; i++ {
 		idx := (cb.head + i) % cb.capacity
@@ -194,6 +204,12 @@ func (cb *CircularBuffer[T]) RecentN(n int) []T {
 func (cb *CircularBuffer[T]) Len() int {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
+	return cb.lenLocked()
+}
+
+// lenLocked is the internal implementation of Len.
+// Caller must hold cb.mu (read or write lock).
+func (cb *CircularBuffer[T]) lenLocked() int {
 	return cb.count
 }
 
@@ -226,7 +242,12 @@ func (cb *CircularBuffer[T]) IsFull() bool {
 func (cb *CircularBuffer[T]) Clear() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	cb.clearLocked()
+}
 
+// clearLocked is the internal implementation of Clear.
+// Caller must hold cb.mu write lock.
+func (cb *CircularBuffer[T]) clearLocked() {
 	var zero T
 	for i := 0; i < cb.capacity; i++ {
 		cb.items[i] = zero

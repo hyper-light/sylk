@@ -159,7 +159,12 @@ func NewRollingSummaryWithConfig(config *RollingSummaryConfig) *RollingSummary {
 func (rs *RollingSummary) AddMessage(msg Message) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	rs.addMessageLocked(msg)
+}
 
+// addMessageLocked is the internal implementation of AddMessage.
+// Caller must hold rs.mu write lock.
+func (rs *RollingSummary) addMessageLocked(msg Message) {
 	// Estimate tokens if not provided
 	if msg.TokenCount == 0 {
 		msg.TokenCount = estimateTokens(msg.Content)
@@ -170,8 +175,8 @@ func (rs *RollingSummary) AddMessage(msg Message) {
 		msg.Timestamp = time.Now()
 	}
 
-	// Add to message buffer
-	rs.messageBuffer.Push(msg)
+	// Add to message buffer (use locked variant)
+	rs.messageBuffer.pushLocked(msg)
 	rs.messageCount++
 
 	// Extract topics if enabled
@@ -189,6 +194,12 @@ func (rs *RollingSummary) AddMessage(msg Message) {
 func (rs *RollingSummary) Summary() string {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
+	return rs.summaryLocked()
+}
+
+// summaryLocked is the internal implementation of Summary.
+// Caller must hold rs.mu (read or write lock).
+func (rs *RollingSummary) summaryLocked() string {
 	return rs.summaryText
 }
 
@@ -197,7 +208,12 @@ func (rs *RollingSummary) Summary() string {
 func (rs *RollingSummary) KeyTopics() []string {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
+	return rs.keyTopicsLocked()
+}
 
+// keyTopicsLocked is the internal implementation of KeyTopics.
+// Caller must hold rs.mu (read or write lock).
+func (rs *RollingSummary) keyTopicsLocked() []string {
 	// Collect topics that meet minimum mentions threshold
 	var topics []string
 	for topic, count := range rs.keyTopics {
@@ -227,6 +243,12 @@ func (rs *RollingSummary) KeyTopics() []string {
 func (rs *RollingSummary) TokenCount() int {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
+	return rs.tokenCountLocked()
+}
+
+// tokenCountLocked is the internal implementation of TokenCount.
+// Caller must hold rs.mu (read or write lock).
+func (rs *RollingSummary) tokenCountLocked() int {
 	return rs.currentTokens
 }
 
@@ -241,6 +263,12 @@ func (rs *RollingSummary) MaxTokens() int {
 func (rs *RollingSummary) MessageCount() int {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
+	return rs.messageCountLocked()
+}
+
+// messageCountLocked is the internal implementation of MessageCount.
+// Caller must hold rs.mu (read or write lock).
+func (rs *RollingSummary) messageCountLocked() int {
 	return rs.messageCount
 }
 
@@ -269,8 +297,13 @@ func (rs *RollingSummary) LastUpdated() time.Time {
 func (rs *RollingSummary) Clear() {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	rs.clearLocked()
+}
 
-	rs.messageBuffer.Clear()
+// clearLocked is the internal implementation of Clear.
+// Caller must hold rs.mu write lock.
+func (rs *RollingSummary) clearLocked() {
+	rs.messageBuffer.clearLocked()
 	rs.keyTopics = make(map[string]int)
 	rs.summaryText = ""
 	rs.currentTokens = 0
@@ -283,9 +316,10 @@ func (rs *RollingSummary) Clear() {
 // =============================================================================
 
 // rebuildSummary constructs the summary from buffered messages within the token budget.
+// Caller must hold rs.mu write lock.
 func (rs *RollingSummary) rebuildSummary() {
 	var builder strings.Builder
-	messages := rs.messageBuffer.Items()
+	messages := rs.messageBuffer.itemsLocked()
 	tokenBudget := rs.maxTokens
 
 	// Reserve some tokens for topics section if enabled
@@ -526,7 +560,7 @@ func (rs *RollingSummary) MarshalJSON() ([]byte, error) {
 	return json.Marshal(rollingSummaryJSON{
 		MaxTokens:     rs.maxTokens,
 		CurrentTokens: rs.currentTokens,
-		Messages:      rs.messageBuffer.Items(),
+		Messages:      rs.messageBuffer.itemsLocked(),
 		KeyTopics:     rs.keyTopics,
 		SummaryText:   rs.summaryText,
 		LastUpdated:   rs.lastUpdated.Format(time.RFC3339Nano),
@@ -559,7 +593,7 @@ func (rs *RollingSummary) UnmarshalJSON(data []byte) error {
 	// Restore message buffer
 	rs.messageBuffer = NewCircularBuffer[Message](rs.config.MessageBufferSize)
 	for _, msg := range temp.Messages {
-		rs.messageBuffer.Push(msg)
+		rs.messageBuffer.pushLocked(msg)
 	}
 
 	// Restore key topics
@@ -609,7 +643,7 @@ func (rs *RollingSummary) Stats() SummaryStats {
 		CurrentTokens: rs.currentTokens,
 		TokenUsage:    usage,
 		MessageCount:  rs.messageCount,
-		BufferedCount: rs.messageBuffer.Len(),
+		BufferedCount: rs.messageBuffer.lenLocked(),
 		TopicCount:    len(rs.keyTopics),
 		LastUpdated:   rs.lastUpdated,
 		SummaryLength: len(rs.summaryText),
