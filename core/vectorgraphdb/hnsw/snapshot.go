@@ -1,10 +1,25 @@
 package hnsw
 
 import (
+	"encoding/binary"
+	"errors"
+	"hash"
+	"hash/crc32"
+	"math"
+	"sort"
 	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
+)
+
+// W12.37: Sentinel errors for snapshot validation.
+var (
+	// ErrSnapshotChecksumMismatch indicates the snapshot data has been corrupted.
+	ErrSnapshotChecksumMismatch = errors.New("hnsw: snapshot checksum mismatch")
+
+	// ErrSnapshotNotValidated indicates the snapshot has not been validated yet.
+	ErrSnapshotNotValidated = errors.New("hnsw: snapshot not validated")
 )
 
 // LayerSnapshot represents an immutable snapshot of a layer's state.
@@ -15,6 +30,7 @@ type LayerSnapshot struct {
 
 // HNSWSnapshot represents a point-in-time frozen state of the HNSW index.
 // It provides thread-safe read access through atomic reader counting.
+// W12.37: Includes checksum for data integrity validation.
 type HNSWSnapshot struct {
 	ID         uint64               // unique snapshot ID
 	SeqNum     uint64               // index sequence number at snapshot time
@@ -27,6 +43,8 @@ type HNSWSnapshot struct {
 	Magnitudes map[string]float64                 // frozen magnitudes
 	Domains    map[string]vectorgraphdb.Domain    // frozen domain metadata
 	NodeTypes  map[string]vectorgraphdb.NodeType  // frozen node type metadata
+	Checksum   uint32                             // W12.37: CRC32 checksum for integrity
+	validated  bool                               // W12.37: whether checksum has been validated
 	readers    atomic.Int32                       // active reader count
 }
 
@@ -84,10 +102,11 @@ func (ls *LayerSnapshot) NodeCount() int {
 }
 
 // NewHNSWSnapshot creates a new snapshot from an Index.
+// W12.37: Computes and stores checksum for data integrity validation.
 // The caller must hold at least a read lock on the index.
 func NewHNSWSnapshot(idx *Index, seqNum uint64) *HNSWSnapshot {
 	if idx == nil {
-		return &HNSWSnapshot{
+		snap := &HNSWSnapshot{
 			SeqNum:     seqNum,
 			CreatedAt:  time.Now(),
 			MaxLevel:   -1,
@@ -96,14 +115,18 @@ func NewHNSWSnapshot(idx *Index, seqNum uint64) *HNSWSnapshot {
 			Magnitudes: make(map[string]float64),
 			Domains:    make(map[string]vectorgraphdb.Domain),
 			NodeTypes:  make(map[string]vectorgraphdb.NodeType),
+			validated:  true, // Empty snapshot is trivially valid
 		}
+		snap.Checksum = snap.computeChecksum()
+		return snap
 	}
 	return createSnapshotFromIndex(idx, seqNum)
 }
 
 // createSnapshotFromIndex builds a snapshot from index data.
+// W12.37: Computes checksum after populating all data fields.
 func createSnapshotFromIndex(idx *Index, seqNum uint64) *HNSWSnapshot {
-	return &HNSWSnapshot{
+	snap := &HNSWSnapshot{
 		SeqNum:     seqNum,
 		CreatedAt:  time.Now(),
 		EntryPoint: idx.entryPoint,
@@ -114,7 +137,10 @@ func createSnapshotFromIndex(idx *Index, seqNum uint64) *HNSWSnapshot {
 		Magnitudes: copyMagnitudes(idx.magnitudes),
 		Domains:    copyDomains(idx.domains),
 		NodeTypes:  copyNodeTypes(idx.nodeTypes),
+		validated:  true, // Freshly created snapshot is valid
 	}
+	snap.Checksum = snap.computeChecksum()
+	return snap
 }
 
 // copyLayers creates deep copies of all layers with batch lock acquisition.
@@ -286,4 +312,209 @@ func (s *HNSWSnapshot) LayerCount() int {
 func (s *HNSWSnapshot) ContainsVector(id string) bool {
 	_, exists := s.Vectors[id]
 	return exists
+}
+
+// computeChecksum calculates a CRC32 checksum over the snapshot's data.
+// W12.37: Uses deterministic ordering for reproducible checksums.
+func (s *HNSWSnapshot) computeChecksum() uint32 {
+	h := crc32.NewIEEE()
+
+	// Write fixed fields
+	writeUint64(h, s.SeqNum)
+	writeString(h, s.EntryPoint)
+	writeInt(h, s.MaxLevel)
+	writeInt(h, s.EfSearch)
+
+	// Write vectors in sorted order for determinism
+	s.checksumVectors(h)
+
+	// Write magnitudes in sorted order
+	s.checksumMagnitudes(h)
+
+	// Write layers
+	s.checksumLayers(h)
+
+	// Write domains in sorted order
+	s.checksumDomains(h)
+
+	// Write node types in sorted order
+	s.checksumNodeTypes(h)
+
+	return h.Sum32()
+}
+
+// checksumVectors adds vector data to the checksum in deterministic order.
+func (s *HNSWSnapshot) checksumVectors(h hash.Hash32) {
+	ids := sortedKeys(s.Vectors)
+	for _, id := range ids {
+		writeString(h, id)
+		vec := s.Vectors[id]
+		for _, v := range vec {
+			writeFloat32(h, v)
+		}
+	}
+}
+
+// checksumMagnitudes adds magnitude data to the checksum in deterministic order.
+func (s *HNSWSnapshot) checksumMagnitudes(h hash.Hash32) {
+	ids := sortedMagnitudeKeys(s.Magnitudes)
+	for _, id := range ids {
+		writeString(h, id)
+		writeFloat64(h, s.Magnitudes[id])
+	}
+}
+
+// checksumLayers adds layer data to the checksum.
+func (s *HNSWSnapshot) checksumLayers(h hash.Hash32) {
+	writeInt(h, len(s.Layers))
+	for i, layer := range s.Layers {
+		writeInt(h, i)
+		checksumLayerSnapshot(h, &layer)
+	}
+}
+
+// checksumLayerSnapshot adds a single layer's data to the checksum.
+func checksumLayerSnapshot(h hash.Hash32, layer *LayerSnapshot) {
+	ids := sortedLayerKeys(layer.Nodes)
+	for _, id := range ids {
+		writeString(h, id)
+		neighbors := layer.Nodes[id]
+		writeInt(h, len(neighbors))
+		for _, neighbor := range neighbors {
+			writeString(h, neighbor)
+		}
+	}
+}
+
+// checksumDomains adds domain data to the checksum in deterministic order.
+func (s *HNSWSnapshot) checksumDomains(h hash.Hash32) {
+	ids := sortedDomainKeys(s.Domains)
+	for _, id := range ids {
+		writeString(h, id)
+		writeInt(h, int(s.Domains[id]))
+	}
+}
+
+// checksumNodeTypes adds node type data to the checksum in deterministic order.
+func (s *HNSWSnapshot) checksumNodeTypes(h hash.Hash32) {
+	ids := sortedNodeTypeKeys(s.NodeTypes)
+	for _, id := range ids {
+		writeString(h, id)
+		writeInt(h, int(s.NodeTypes[id]))
+	}
+}
+
+// ValidateChecksum verifies the snapshot data integrity.
+// W12.37: Returns nil if the checksum matches, ErrSnapshotChecksumMismatch otherwise.
+func (s *HNSWSnapshot) ValidateChecksum() error {
+	computed := s.computeChecksum()
+	if computed != s.Checksum {
+		return ErrSnapshotChecksumMismatch
+	}
+	s.validated = true
+	return nil
+}
+
+// IsValidated returns whether the snapshot has passed checksum validation.
+// W12.37: Freshly created snapshots are automatically validated.
+func (s *HNSWSnapshot) IsValidated() bool {
+	return s.validated
+}
+
+// GetChecksum returns the stored checksum value.
+func (s *HNSWSnapshot) GetChecksum() uint32 {
+	return s.Checksum
+}
+
+// Helper functions for deterministic checksum computation.
+
+// writeUint64 writes a uint64 to the hash in little-endian order.
+func writeUint64(h hash.Hash32, v uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], v)
+	h.Write(buf[:])
+}
+
+// writeInt writes an int as int64 to the hash in little-endian order.
+func writeInt(h hash.Hash32, v int) {
+	writeUint64(h, uint64(v))
+}
+
+// writeFloat32 writes a float32 to the hash in little-endian order.
+func writeFloat32(h hash.Hash32, v float32) {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], floatBits(v))
+	h.Write(buf[:])
+}
+
+// writeFloat64 writes a float64 to the hash in little-endian order.
+func writeFloat64(h hash.Hash32, v float64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], doubleBits(v))
+	h.Write(buf[:])
+}
+
+// writeString writes a string to the hash with length prefix.
+func writeString(h hash.Hash32, s string) {
+	writeInt(h, len(s))
+	h.Write([]byte(s))
+}
+
+// floatBits converts float32 to uint32 bits using math package.
+// W12.37: Uses math.Float32bits for type-safe bit conversion.
+func floatBits(f float32) uint32 {
+	return math.Float32bits(f)
+}
+
+// doubleBits converts float64 to uint64 bits using math package.
+// W12.37: Uses math.Float64bits for type-safe bit conversion.
+func doubleBits(f float64) uint64 {
+	return math.Float64bits(f)
+}
+
+// Sorted key extraction functions for deterministic iteration.
+
+func sortedKeys(m map[string][]float32) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedMagnitudeKeys(m map[string]float64) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedLayerKeys(m map[string][]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedDomainKeys(m map[string]vectorgraphdb.Domain) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedNodeTypeKeys(m map[string]vectorgraphdb.NodeType) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
