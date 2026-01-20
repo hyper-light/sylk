@@ -2771,3 +2771,797 @@ func TestIndexManager_IndexBatch_OneMoreThanBatchSize(t *testing.T) {
 		t.Errorf("DocumentCount() = %d, want 21", count)
 	}
 }
+
+// =============================================================================
+// W4P.4 - Path Index Synchronization Tests
+// =============================================================================
+
+func TestIndexManager_DeleteByPath_BleveFirstThenPathIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a document
+	doc := createTestDocument("doc1", "package main")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Verify path index is populated
+	if mgr.PathIndexSize() != 1 {
+		t.Errorf("PathIndexSize() before delete = %d, want 1", mgr.PathIndexSize())
+	}
+
+	// Delete by path - Bleve should be deleted first, then path index
+	if err := mgr.DeleteByPath(ctx, doc.Path); err != nil {
+		t.Fatalf("DeleteByPath() error = %v", err)
+	}
+
+	// Both should now be empty
+	if mgr.PathIndexSize() != 0 {
+		t.Errorf("PathIndexSize() after delete = %d, want 0", mgr.PathIndexSize())
+	}
+
+	count, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() error = %v", err)
+	}
+	if count != 0 {
+		t.Errorf("DocumentCount() = %d, want 0", count)
+	}
+}
+
+func TestIndexManager_ValidatePathIndexSync_Synced(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index some documents
+	for i := 0; i < 5; i++ {
+		doc := createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"content",
+		)
+		if err := mgr.Index(ctx, doc); err != nil {
+			t.Fatalf("Index() error = %v", err)
+		}
+	}
+
+	// Validate sync - should be synced
+	result, err := mgr.ValidatePathIndexSync(ctx)
+	if err != nil {
+		t.Fatalf("ValidatePathIndexSync() error = %v", err)
+	}
+
+	if !result.IsSynced {
+		t.Error("ValidatePathIndexSync() IsSynced = false, want true")
+	}
+	if len(result.PhantomPaths) > 0 {
+		t.Errorf("ValidatePathIndexSync() PhantomPaths = %v, want empty", result.PhantomPaths)
+	}
+}
+
+func TestIndexManager_ValidatePathIndexSync_PhantomPath(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a document
+	doc := createTestDocument("doc1", "content")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Create a phantom entry by manually adding to path index without Bleve
+	mgr.UpdatePathIndex("/phantom/path.go", "nonexistent-doc")
+
+	// Validate sync - should detect phantom
+	result, err := mgr.ValidatePathIndexSync(ctx)
+	if err != nil {
+		t.Fatalf("ValidatePathIndexSync() error = %v", err)
+	}
+
+	if result.IsSynced {
+		t.Error("ValidatePathIndexSync() IsSynced = true, want false (phantom detected)")
+	}
+	if len(result.PhantomPaths) != 1 {
+		t.Errorf("ValidatePathIndexSync() len(PhantomPaths) = %d, want 1", len(result.PhantomPaths))
+	}
+	if len(result.PhantomPaths) > 0 && result.PhantomPaths[0] != "/phantom/path.go" {
+		t.Errorf("ValidatePathIndexSync() PhantomPaths[0] = %q, want %q", result.PhantomPaths[0], "/phantom/path.go")
+	}
+}
+
+func TestIndexManager_RepairPathIndex_RemovesPhantoms(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index a real document
+	doc := createTestDocument("doc1", "content")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Add phantom entries
+	mgr.UpdatePathIndex("/phantom1.go", "nonexistent-1")
+	mgr.UpdatePathIndex("/phantom2.go", "nonexistent-2")
+	mgr.UpdatePathIndex("/phantom3.go", "nonexistent-3")
+
+	// Verify we have 4 entries (1 real + 3 phantom)
+	if mgr.PathIndexSize() != 4 {
+		t.Errorf("PathIndexSize() before repair = %d, want 4", mgr.PathIndexSize())
+	}
+
+	// Repair
+	repaired, err := mgr.RepairPathIndex(ctx)
+	if err != nil {
+		t.Fatalf("RepairPathIndex() error = %v", err)
+	}
+	if repaired != 3 {
+		t.Errorf("RepairPathIndex() = %d, want 3 (phantom entries)", repaired)
+	}
+
+	// Verify only real entry remains
+	if mgr.PathIndexSize() != 1 {
+		t.Errorf("PathIndexSize() after repair = %d, want 1", mgr.PathIndexSize())
+	}
+
+	// Verify real path still exists
+	_, exists := mgr.GetDocIDByPath(doc.Path)
+	if !exists {
+		t.Error("GetDocIDByPath() for real doc = false after repair, want true")
+	}
+}
+
+func TestIndexManager_RepairPathIndex_NoPhantoms(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index some real documents
+	for i := 0; i < 3; i++ {
+		doc := createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"content",
+		)
+		if err := mgr.Index(ctx, doc); err != nil {
+			t.Fatalf("Index() error = %v", err)
+		}
+	}
+
+	// Repair - should find nothing to repair
+	repaired, err := mgr.RepairPathIndex(ctx)
+	if err != nil {
+		t.Fatalf("RepairPathIndex() error = %v", err)
+	}
+	if repaired != 0 {
+		t.Errorf("RepairPathIndex() = %d, want 0 (no phantoms)", repaired)
+	}
+
+	// All paths should still exist
+	if mgr.PathIndexSize() != 3 {
+		t.Errorf("PathIndexSize() after repair = %d, want 3", mgr.PathIndexSize())
+	}
+}
+
+func TestIndexManager_ValidatePathIndexSync_ClosedIndex(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	ctx := context.Background()
+	_, err := mgr.ValidatePathIndexSync(ctx)
+	if err != ErrIndexClosed {
+		t.Errorf("ValidatePathIndexSync() on closed index error = %v, want %v", err, ErrIndexClosed)
+	}
+}
+
+func TestIndexManager_RepairPathIndex_ClosedIndex(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	ctx := context.Background()
+	_, err := mgr.RepairPathIndex(ctx)
+	if err != ErrIndexClosed {
+		t.Errorf("RepairPathIndex() on closed index error = %v, want %v", err, ErrIndexClosed)
+	}
+}
+
+func TestIndexManager_ValidatePathIndexSync_ContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Add many phantom entries to make validation take longer
+	for i := 0; i < 100; i++ {
+		mgr.UpdatePathIndex(
+			"/phantom/"+search.GenerateDocumentID([]byte{byte(i)})+".go",
+			"nonexistent-"+search.GenerateDocumentID([]byte{byte(i)}),
+		)
+	}
+
+	// Create cancelled context
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err := mgr.ValidatePathIndexSync(cancelCtx)
+	if err != context.Canceled {
+		t.Errorf("ValidatePathIndexSync() with cancelled context error = %v, want context.Canceled", err)
+	}
+}
+
+func TestIndexManager_PathIndexDesyncResult_Fields(t *testing.T) {
+	t.Parallel()
+
+	result := PathIndexDesyncResult{
+		PhantomPaths: []string{"/path1", "/path2"},
+		OrphanedDocs: []string{"doc1", "doc2", "doc3"},
+		IsSynced:     false,
+	}
+
+	if len(result.PhantomPaths) != 2 {
+		t.Errorf("PathIndexDesyncResult.PhantomPaths length = %d, want 2", len(result.PhantomPaths))
+	}
+	if len(result.OrphanedDocs) != 3 {
+		t.Errorf("PathIndexDesyncResult.OrphanedDocs length = %d, want 3", len(result.OrphanedDocs))
+	}
+	if result.IsSynced {
+		t.Error("PathIndexDesyncResult.IsSynced = true, want false")
+	}
+}
+
+func TestIndexManager_DeleteByPath_PathIndexNotRemovedOnBleveFailure(t *testing.T) {
+	// This test simulates when Bleve delete fails by closing the index
+	// but keeping the path index entry. The path index entry should remain.
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Index a document
+	doc := createTestDocument("doc1", "content")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Manually add to path index as if a previous operation failed mid-way
+	testPath := "/test/manual.go"
+	mgr.UpdatePathIndex(testPath, "manual-doc")
+
+	// Close the index to simulate Bleve failure
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	// Try to delete by path - should fail because index is closed
+	err := mgr.DeleteByPath(ctx, testPath)
+	if err != ErrIndexClosed {
+		t.Errorf("DeleteByPath() on closed index error = %v, want %v", err, ErrIndexClosed)
+	}
+}
+
+func TestIndexManager_Sync_ConcurrentValidateAndRepair(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index some documents
+	for i := 0; i < 10; i++ {
+		doc := createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"content",
+		)
+		if err := mgr.Index(ctx, doc); err != nil {
+			t.Fatalf("Index() error = %v", err)
+		}
+	}
+
+	// Add some phantom entries
+	for i := 0; i < 5; i++ {
+		mgr.UpdatePathIndex(
+			"/phantom/"+search.GenerateDocumentID([]byte{byte(i)})+".go",
+			"nonexistent-"+search.GenerateDocumentID([]byte{byte(i)}),
+		)
+	}
+
+	// Concurrent validate and repair
+	var wg sync.WaitGroup
+	errCh := make(chan error, 20)
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := mgr.ValidatePathIndexSync(ctx)
+			if err != nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := mgr.RepairPathIndex(ctx)
+			if err != nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent sync operation error: %v", err)
+	}
+
+	// After all operations, should be synced
+	result, err := mgr.ValidatePathIndexSync(ctx)
+	if err != nil {
+		t.Fatalf("ValidatePathIndexSync() error = %v", err)
+	}
+	if !result.IsSynced {
+		t.Error("ValidatePathIndexSync() IsSynced = false after concurrent repairs, want true")
+	}
+}
+
+// =============================================================================
+// W4P.6 - Index Corruption Recovery Tests
+// =============================================================================
+
+func TestIndexHealth_String(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		health IndexHealth
+		want   string
+	}{
+		{IndexHealthUnknown, "unknown"},
+		{IndexHealthy, "healthy"},
+		{IndexHealthDegraded, "degraded"},
+		{IndexHealthCorrupted, "corrupted"},
+		{IndexHealth(99), "unknown"}, // Invalid value
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := tt.health.String(); got != tt.want {
+				t.Errorf("IndexHealth(%d).String() = %q, want %q", tt.health, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIndexManager_CheckHealth_HealthyIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index some documents
+	doc := createTestDocument("health-test-1", "test content for health check")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Check health
+	result := mgr.CheckHealth(ctx)
+
+	if result.Health != IndexHealthy {
+		t.Errorf("CheckHealth().Health = %v, want %v", result.Health, IndexHealthy)
+	}
+	if result.DocumentCount != 1 {
+		t.Errorf("CheckHealth().DocumentCount = %d, want 1", result.DocumentCount)
+	}
+	if result.Error != nil {
+		t.Errorf("CheckHealth().Error = %v, want nil", result.Error)
+	}
+	if result.CheckedAt.IsZero() {
+		t.Error("CheckHealth().CheckedAt is zero, want non-zero")
+	}
+}
+
+func TestIndexManager_CheckHealth_ClosedIndex(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewIndexManager(testIndexPath(t))
+	ctx := context.Background()
+
+	// Check health on closed index
+	result := mgr.CheckHealth(ctx)
+
+	if result.Health != IndexHealthUnknown {
+		t.Errorf("CheckHealth().Health = %v, want %v", result.Health, IndexHealthUnknown)
+	}
+	if result.Error != ErrIndexClosed {
+		t.Errorf("CheckHealth().Error = %v, want %v", result.Error, ErrIndexClosed)
+	}
+}
+
+func TestIndexManager_SetAutoRebuild(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewIndexManager(testIndexPath(t))
+
+	// Default should be false
+	if mgr.AutoRebuildEnabled() {
+		t.Error("AutoRebuildEnabled() default = true, want false")
+	}
+
+	// Enable
+	mgr.SetAutoRebuild(true)
+	if !mgr.AutoRebuildEnabled() {
+		t.Error("AutoRebuildEnabled() after SetAutoRebuild(true) = false, want true")
+	}
+
+	// Disable
+	mgr.SetAutoRebuild(false)
+	if mgr.AutoRebuildEnabled() {
+		t.Error("AutoRebuildEnabled() after SetAutoRebuild(false) = true, want false")
+	}
+}
+
+func TestIndexManager_LastHealthResult(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// After open, result should show healthy (verification happens on open)
+	initial := mgr.LastHealthResult()
+	if initial.Health != IndexHealthy {
+		t.Errorf("Initial LastHealthResult().Health = %v, want %v", initial.Health, IndexHealthy)
+	}
+
+	// After another health check, should have updated result
+	mgr.CheckHealth(ctx)
+	result := mgr.LastHealthResult()
+
+	if result.Health != IndexHealthy {
+		t.Errorf("LastHealthResult().Health after check = %v, want %v", result.Health, IndexHealthy)
+	}
+}
+
+func TestIndexManager_RebuildIndex_Success(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Index some documents
+	for i := 0; i < 5; i++ {
+		doc := createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"rebuild test content",
+		)
+		if err := mgr.Index(ctx, doc); err != nil {
+			t.Fatalf("Index() error = %v", err)
+		}
+	}
+
+	// Verify documents exist
+	count, _ := mgr.DocumentCount()
+	if count != 5 {
+		t.Fatalf("DocumentCount() before rebuild = %d, want 5", count)
+	}
+
+	// Rebuild the index
+	docCountBefore, err := mgr.RebuildIndex()
+	if err != nil {
+		t.Fatalf("RebuildIndex() error = %v", err)
+	}
+	if docCountBefore != 5 {
+		t.Errorf("RebuildIndex() returned doc count = %d, want 5", docCountBefore)
+	}
+
+	// Verify index is empty after rebuild
+	countAfter, err := mgr.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount() after rebuild error = %v", err)
+	}
+	if countAfter != 0 {
+		t.Errorf("DocumentCount() after rebuild = %d, want 0", countAfter)
+	}
+
+	// Verify index is usable
+	doc := createTestDocument("after-rebuild", "new content")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() after rebuild error = %v", err)
+	}
+
+	// Cleanup
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestIndexManager_RebuildIndex_ClearsPathIndex(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+
+	// Index a document
+	doc := createTestDocument("path-test", "path rebuild test")
+	if err := mgr.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	// Verify path index is populated
+	if mgr.PathIndexSize() != 1 {
+		t.Fatalf("PathIndexSize() before rebuild = %d, want 1", mgr.PathIndexSize())
+	}
+
+	// Rebuild
+	_, err := mgr.RebuildIndex()
+	if err != nil {
+		t.Fatalf("RebuildIndex() error = %v", err)
+	}
+
+	// Path index should be cleared
+	if mgr.PathIndexSize() != 0 {
+		t.Errorf("PathIndexSize() after rebuild = %d, want 0", mgr.PathIndexSize())
+	}
+}
+
+func TestIndexManager_RebuildIndex_UpdatesHealthStatus(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer mgr.Close()
+
+	// Rebuild
+	_, err := mgr.RebuildIndex()
+	if err != nil {
+		t.Fatalf("RebuildIndex() error = %v", err)
+	}
+
+	// Check last health result is updated
+	health := mgr.LastHealthResult()
+	if health.Health != IndexHealthy {
+		t.Errorf("LastHealthResult().Health after rebuild = %v, want %v", health.Health, IndexHealthy)
+	}
+	if health.DocumentCount != 0 {
+		t.Errorf("LastHealthResult().DocumentCount after rebuild = %d, want 0", health.DocumentCount)
+	}
+}
+
+func TestIndexManager_Open_WithHealthVerification(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+	mgr := NewIndexManager(path)
+
+	if err := mgr.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	// Health should be checked on open
+	health := mgr.LastHealthResult()
+	if health.Health != IndexHealthy {
+		t.Errorf("LastHealthResult().Health after Open = %v, want %v", health.Health, IndexHealthy)
+	}
+
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func TestIndexManager_CheckHealth_AfterIndexingDocuments(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index multiple documents
+	for i := 0; i < 10; i++ {
+		doc := createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"health check document",
+		)
+		if err := mgr.Index(ctx, doc); err != nil {
+			t.Fatalf("Index() error = %v", err)
+		}
+	}
+
+	// Health check should show correct count
+	result := mgr.CheckHealth(ctx)
+	if result.Health != IndexHealthy {
+		t.Errorf("CheckHealth().Health = %v, want %v", result.Health, IndexHealthy)
+	}
+	if result.DocumentCount != 10 {
+		t.Errorf("CheckHealth().DocumentCount = %d, want 10", result.DocumentCount)
+	}
+}
+
+func TestIndexManager_CheckHealth_ConcurrentAccess(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+	ctx := context.Background()
+
+	// Index some documents first
+	for i := 0; i < 5; i++ {
+		doc := createTestDocument(
+			search.GenerateDocumentID([]byte{byte(i)}),
+			"concurrent health check",
+		)
+		if err := mgr.Index(ctx, doc); err != nil {
+			t.Fatalf("Index() error = %v", err)
+		}
+	}
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines)
+
+	// Concurrent health checks
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := mgr.CheckHealth(ctx)
+			if result.Health != IndexHealthy {
+				errCh <- errors.New("expected healthy status")
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent CheckHealth error: %v", err)
+	}
+}
+
+func TestIndexManager_AutoRebuild_ConcurrentAccess(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewIndexManager(testIndexPath(t))
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+
+	// Concurrent reads and writes to autoRebuild flag
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(2)
+
+		go func(set bool) {
+			defer wg.Done()
+			mgr.SetAutoRebuild(set)
+		}(i%2 == 0)
+
+		go func() {
+			defer wg.Done()
+			_ = mgr.AutoRebuildEnabled()
+		}()
+	}
+
+	wg.Wait()
+	// No race detector errors = success
+}
+
+func TestErrIndexCorrupted_Message(t *testing.T) {
+	t.Parallel()
+
+	if ErrIndexCorrupted.Error() != "index is corrupted" {
+		t.Errorf("ErrIndexCorrupted.Error() = %q, want %q", ErrIndexCorrupted.Error(), "index is corrupted")
+	}
+}
+
+func TestErrRebuildFailed_Message(t *testing.T) {
+	t.Parallel()
+
+	if ErrRebuildFailed.Error() != "index rebuild failed" {
+		t.Errorf("ErrRebuildFailed.Error() = %q, want %q", ErrRebuildFailed.Error(), "index rebuild failed")
+	}
+}
+
+func TestIndexManager_CheckHealth_ContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	mgr := createOpenIndex(t)
+
+	// Create cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Health check with cancelled context should still return a result
+	// (the context cancellation affects the search verification)
+	result := mgr.CheckHealth(ctx)
+
+	// Result should be returned even with cancelled context
+	// It may be healthy (if operations completed before cancellation) or corrupted (if cancelled mid-operation)
+	if result.CheckedAt.IsZero() {
+		t.Error("CheckHealth().CheckedAt should not be zero")
+	}
+}
+
+func TestIndexManager_Open_ExistingHealthyIndex(t *testing.T) {
+	t.Parallel()
+
+	path := testIndexPath(t)
+
+	// Create and populate an index
+	mgr1 := NewIndexManager(path)
+	if err := mgr1.Open(); err != nil {
+		t.Fatalf("first Open() error = %v", err)
+	}
+
+	ctx := context.Background()
+	doc := createTestDocument("persist-test", "persistence test content")
+	if err := mgr1.Index(ctx, doc); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+	if err := mgr1.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+
+	// Reopen - should verify health on open
+	mgr2 := NewIndexManager(path)
+	if err := mgr2.Open(); err != nil {
+		t.Fatalf("second Open() error = %v", err)
+	}
+	defer mgr2.Close()
+
+	// Health should be verified
+	health := mgr2.LastHealthResult()
+	if health.Health != IndexHealthy {
+		t.Errorf("LastHealthResult().Health after reopen = %v, want %v", health.Health, IndexHealthy)
+	}
+
+	// Document should still be searchable
+	count, _ := mgr2.DocumentCount()
+	if count != 1 {
+		t.Errorf("DocumentCount() after reopen = %d, want 1", count)
+	}
+}

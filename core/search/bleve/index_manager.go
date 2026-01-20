@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/blevesearch/bleve/v2"
@@ -37,6 +38,10 @@ type IndexConfig struct {
 
 // DefaultBatchTimeout is the default timeout for batch commit operations.
 const DefaultBatchTimeout = 30 * time.Second
+
+// DefaultMaxConcurrentBatches is the default limit for concurrent batch commit goroutines.
+// This prevents goroutine explosion under high load (W4P.5).
+const DefaultMaxConcurrentBatches = 16
 
 // =============================================================================
 // Batch Size Validation (PF.3.10)
@@ -168,7 +173,56 @@ var (
 
 	// ErrBatchTimeout indicates a batch commit operation timed out.
 	ErrBatchTimeout = errors.New("batch commit timeout")
+
+	// ErrBatchSemaphoreFull indicates backpressure: too many concurrent batch commits (W4P.5).
+	ErrBatchSemaphoreFull = errors.New("batch commit queue full")
+
+	// ErrIndexCorrupted indicates the index is corrupted and needs rebuild.
+	ErrIndexCorrupted = errors.New("index is corrupted")
+
+	// ErrRebuildFailed indicates automatic rebuild of corrupted index failed.
+	ErrRebuildFailed = errors.New("index rebuild failed")
 )
+
+// =============================================================================
+// Index Health
+// =============================================================================
+
+// IndexHealth represents the health status of a Bleve index.
+type IndexHealth int
+
+const (
+	// IndexHealthUnknown indicates health has not been checked.
+	IndexHealthUnknown IndexHealth = iota
+	// IndexHealthy indicates the index is functioning normally.
+	IndexHealthy
+	// IndexHealthDegraded indicates the index has minor issues but is usable.
+	IndexHealthDegraded
+	// IndexHealthCorrupted indicates the index is corrupted and needs rebuild.
+	IndexHealthCorrupted
+)
+
+// String returns a string representation of IndexHealth.
+func (h IndexHealth) String() string {
+	switch h {
+	case IndexHealthy:
+		return "healthy"
+	case IndexHealthDegraded:
+		return "degraded"
+	case IndexHealthCorrupted:
+		return "corrupted"
+	default:
+		return "unknown"
+	}
+}
+
+// IndexHealthResult contains the result of a health check.
+type IndexHealthResult struct {
+	Health       IndexHealth
+	DocumentCount uint64
+	Error        error
+	CheckedAt    time.Time
+}
 
 // =============================================================================
 // IndexManager
@@ -189,6 +243,17 @@ type IndexManager struct {
 	// Path index for O(1) DeleteByPath lookup (PF.3.3)
 	pathIndex map[string]string // path -> docID
 	pathMu    sync.RWMutex
+
+	// Health tracking for corruption detection (W4P.6)
+	lastHealth  IndexHealthResult
+	healthMu    sync.RWMutex
+	autoRebuild bool // If true, automatically rebuild on corruption
+
+	// Batch commit concurrency limiter (W4P.5)
+	// Prevents goroutine explosion by limiting concurrent batch commits.
+	batchSem       chan struct{}
+	batchSemMu     sync.RWMutex  // Protects batchSem access
+	batchSemClosed atomic.Bool   // Tracks if semaphore is closed
 }
 
 // NewIndexManager creates a new IndexManager for the given path.
@@ -218,7 +283,9 @@ func NewIndexManagerWithConfig(config IndexConfig) *IndexManager {
 
 // Open opens or creates the Bleve index at the configured path.
 // If the index already exists, it opens it; otherwise, creates a new one.
+// If autoRebuild is enabled and corruption is detected, attempts to rebuild.
 // Returns ErrIndexAlreadyOpen if the index is already open.
+// Returns ErrIndexCorrupted if corruption is detected and autoRebuild is disabled.
 func (m *IndexManager) Open() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -231,12 +298,87 @@ func (m *IndexManager) Open() error {
 		return err
 	}
 
+	// Initialize batch commit semaphore (W4P.5)
+	m.initBatchSemaphore()
+
+	// Verify index health after opening (W4P.6)
+	if err := m.verifyOnOpen(); err != nil {
+		return err
+	}
+
 	// Initialize async queue if enabled (PF.3.2)
 	if m.config.AsyncEnabled {
 		m.initAsyncQueue()
 	}
 
 	return nil
+}
+
+// verifyOnOpen checks index health after opening and handles corruption.
+// Must be called with write lock held.
+func (m *IndexManager) verifyOnOpen() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result := m.verifyIndexHealth(ctx, m.index)
+	m.updateLastHealth(result)
+
+	if result.Health != IndexHealthCorrupted {
+		return nil
+	}
+
+	// Index is corrupted - check if auto-rebuild is enabled
+	m.healthMu.RLock()
+	shouldRebuild := m.autoRebuild
+	m.healthMu.RUnlock()
+
+	if !shouldRebuild {
+		return fmt.Errorf("%w: %v", ErrIndexCorrupted, result.Error)
+	}
+
+	// Attempt auto-rebuild
+	return m.rebuildLocked()
+}
+
+// rebuildLocked rebuilds the index. Must be called with write lock held.
+func (m *IndexManager) rebuildLocked() error {
+	// Close the corrupted index
+	if m.index != nil {
+		_ = m.index.Close()
+		m.index = nil
+	}
+
+	// Remove existing index files
+	if err := os.RemoveAll(m.config.Path); err != nil {
+		return fmt.Errorf("%w: remove files: %v", ErrRebuildFailed, err)
+	}
+
+	// Create fresh index
+	if err := m.createNewIndex(); err != nil {
+		return fmt.Errorf("%w: create new: %v", ErrRebuildFailed, err)
+	}
+
+	// Update health status
+	m.updateLastHealth(IndexHealthResult{
+		Health:        IndexHealthy,
+		DocumentCount: 0,
+		CheckedAt:     time.Now(),
+	})
+
+	return nil
+}
+
+// initBatchSemaphore initializes the batch commit concurrency limiter (W4P.5).
+// Must be called with write lock held.
+func (m *IndexManager) initBatchSemaphore() {
+	maxConcurrent := m.config.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = DefaultMaxConcurrentBatches
+	}
+	m.batchSemMu.Lock()
+	m.batchSem = make(chan struct{}, maxConcurrent)
+	m.batchSemClosed.Store(false)
+	m.batchSemMu.Unlock()
 }
 
 // initAsyncQueue initializes the async indexing queue.
@@ -360,6 +502,10 @@ func (m *IndexManager) Close() error {
 		m.useAsync = false
 	}
 
+	// Mark batch semaphore as closed first (W4P.5)
+	// This prevents new goroutines from acquiring slots
+	m.batchSemClosed.Store(true)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -370,6 +516,12 @@ func (m *IndexManager) Close() error {
 	m.closed = true
 	err := m.index.Close()
 	m.index = nil
+
+	// Clear batch semaphore (W4P.5)
+	// Set to nil under lock to signal closure to in-flight goroutines
+	m.batchSemMu.Lock()
+	m.batchSem = nil
+	m.batchSemMu.Unlock()
 
 	// Clear path index (PF.3.3)
 	m.pathMu.Lock()
@@ -428,6 +580,271 @@ func (m *IndexManager) PathIndexSize() int {
 	m.pathMu.RLock()
 	defer m.pathMu.RUnlock()
 	return len(m.pathIndex)
+}
+
+// =============================================================================
+// Path Index Synchronization (W4P.4)
+// =============================================================================
+
+// PathIndexDesyncResult holds the result of a path index desync check.
+type PathIndexDesyncResult struct {
+	// PhantomPaths are paths in the path index but not in Bleve.
+	PhantomPaths []string
+	// OrphanedDocs are doc IDs in Bleve with paths not in the path index.
+	OrphanedDocs []string
+	// IsSynced is true if no desync was detected.
+	IsSynced bool
+}
+
+// ValidatePathIndexSync checks if the path index is synchronized with Bleve.
+// Returns a PathIndexDesyncResult describing any desynchronization found.
+// Returns ErrIndexClosed if the index is not open.
+func (m *IndexManager) ValidatePathIndexSync(ctx context.Context) (*PathIndexDesyncResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.closed || m.index == nil {
+		return nil, ErrIndexClosed
+	}
+
+	return m.validateSyncLocked(ctx)
+}
+
+// validateSyncLocked performs sync validation. Must be called with read lock held.
+func (m *IndexManager) validateSyncLocked(ctx context.Context) (*PathIndexDesyncResult, error) {
+	result := &PathIndexDesyncResult{IsSynced: true}
+
+	// Get snapshot of path index
+	m.pathMu.RLock()
+	pathSnapshot := make(map[string]string, len(m.pathIndex))
+	for path, docID := range m.pathIndex {
+		pathSnapshot[path] = docID
+	}
+	m.pathMu.RUnlock()
+
+	// Check for phantom paths (in path index but not in Bleve)
+	phantoms, err := m.findPhantomPaths(ctx, pathSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	result.PhantomPaths = phantoms
+
+	if len(result.PhantomPaths) > 0 {
+		result.IsSynced = false
+	}
+
+	return result, nil
+}
+
+// findPhantomPaths finds paths in path index that don't exist in Bleve.
+func (m *IndexManager) findPhantomPaths(ctx context.Context, pathMap map[string]string) ([]string, error) {
+	var phantoms []string
+
+	for path, docID := range pathMap {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		exists, err := m.documentExistsLocked(docID)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			phantoms = append(phantoms, path)
+		}
+	}
+
+	return phantoms, nil
+}
+
+// documentExistsLocked checks if a document exists in Bleve. Must be called with lock held.
+func (m *IndexManager) documentExistsLocked(docID string) (bool, error) {
+	query := bleve.NewDocIDQuery([]string{docID})
+	searchReq := bleve.NewSearchRequest(query)
+	searchReq.Size = 1
+	searchReq.Fields = []string{}
+
+	result, err := m.index.Search(searchReq)
+	if err != nil {
+		return false, err
+	}
+
+	return len(result.Hits) > 0, nil
+}
+
+// RepairPathIndex removes phantom entries from the path index.
+// Phantom entries are paths that exist in the path index but whose
+// documents no longer exist in Bleve.
+// Returns the number of phantom entries removed.
+// Returns ErrIndexClosed if the index is not open.
+func (m *IndexManager) RepairPathIndex(ctx context.Context) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.closed || m.index == nil {
+		return 0, ErrIndexClosed
+	}
+
+	return m.repairPathIndexLocked(ctx)
+}
+
+// repairPathIndexLocked removes phantom entries. Must be called with read lock held.
+func (m *IndexManager) repairPathIndexLocked(ctx context.Context) (int, error) {
+	// Get snapshot of path index
+	m.pathMu.RLock()
+	pathSnapshot := make(map[string]string, len(m.pathIndex))
+	for path, docID := range m.pathIndex {
+		pathSnapshot[path] = docID
+	}
+	m.pathMu.RUnlock()
+
+	// Find phantom paths
+	phantoms, err := m.findPhantomPaths(ctx, pathSnapshot)
+	if err != nil {
+		return 0, err
+	}
+
+	// Remove phantom entries
+	if len(phantoms) > 0 {
+		m.pathMu.Lock()
+		for _, path := range phantoms {
+			delete(m.pathIndex, path)
+		}
+		m.pathMu.Unlock()
+	}
+
+	return len(phantoms), nil
+}
+
+// =============================================================================
+// Index Health Methods (W4P.6)
+// =============================================================================
+
+// SetAutoRebuild enables or disables automatic rebuild on corruption detection.
+// When enabled, Open() will attempt to rebuild the index if corruption is detected.
+func (m *IndexManager) SetAutoRebuild(enabled bool) {
+	m.healthMu.Lock()
+	m.autoRebuild = enabled
+	m.healthMu.Unlock()
+}
+
+// AutoRebuildEnabled returns whether automatic rebuild is enabled.
+func (m *IndexManager) AutoRebuildEnabled() bool {
+	m.healthMu.RLock()
+	defer m.healthMu.RUnlock()
+	return m.autoRebuild
+}
+
+// LastHealthResult returns the most recent health check result.
+func (m *IndexManager) LastHealthResult() IndexHealthResult {
+	m.healthMu.RLock()
+	defer m.healthMu.RUnlock()
+	return m.lastHealth
+}
+
+// CheckHealth performs a health check on the index and returns the result.
+// This method detects corruption by attempting basic index operations.
+// Returns IndexHealthCorrupted if the index appears corrupted.
+func (m *IndexManager) CheckHealth(ctx context.Context) IndexHealthResult {
+	result := IndexHealthResult{CheckedAt: time.Now()}
+
+	m.mu.RLock()
+	if m.closed || m.index == nil {
+		m.mu.RUnlock()
+		result.Health = IndexHealthUnknown
+		result.Error = ErrIndexClosed
+		m.updateLastHealth(result)
+		return result
+	}
+	idx := m.index
+	m.mu.RUnlock()
+
+	result = m.verifyIndexHealth(ctx, idx)
+	m.updateLastHealth(result)
+	return result
+}
+
+// verifyIndexHealth performs actual health verification operations.
+func (m *IndexManager) verifyIndexHealth(ctx context.Context, idx bleve.Index) IndexHealthResult {
+	result := IndexHealthResult{CheckedAt: time.Now()}
+
+	// Test 1: Check document count (basic operation)
+	count, err := idx.DocCount()
+	if err != nil {
+		result.Health = IndexHealthCorrupted
+		result.Error = fmt.Errorf("doc count failed: %w", err)
+		return result
+	}
+	result.DocumentCount = count
+
+	// Test 2: Try a simple search operation
+	if err := m.verifySearchCapability(ctx, idx); err != nil {
+		result.Health = IndexHealthCorrupted
+		result.Error = fmt.Errorf("search verification failed: %w", err)
+		return result
+	}
+
+	result.Health = IndexHealthy
+	return result
+}
+
+// verifySearchCapability tests that the index can execute searches.
+func (m *IndexManager) verifySearchCapability(ctx context.Context, idx bleve.Index) error {
+	query := bleve.NewMatchAllQuery()
+	searchReq := bleve.NewSearchRequest(query)
+	searchReq.Size = 1
+
+	_, err := idx.SearchInContext(ctx, searchReq)
+	return err
+}
+
+// updateLastHealth stores the health result thread-safely.
+func (m *IndexManager) updateLastHealth(result IndexHealthResult) {
+	m.healthMu.Lock()
+	m.lastHealth = result
+	m.healthMu.Unlock()
+}
+
+// RebuildIndex closes the current index, removes it, and creates a fresh one.
+// This is a destructive operation - all indexed data will be lost.
+// Returns the number of documents that were in the index before rebuild.
+func (m *IndexManager) RebuildIndex() (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var docCount uint64
+	if m.index != nil && !m.closed {
+		docCount, _ = m.index.DocCount()
+		if err := m.index.Close(); err != nil {
+			return docCount, fmt.Errorf("close before rebuild: %w", err)
+		}
+	}
+
+	// Remove existing index files
+	if err := os.RemoveAll(m.config.Path); err != nil {
+		return docCount, fmt.Errorf("remove index files: %w", err)
+	}
+
+	// Create fresh index
+	if err := m.createNewIndex(); err != nil {
+		return docCount, fmt.Errorf("%w: %v", ErrRebuildFailed, err)
+	}
+
+	// Clear path index since we're starting fresh
+	m.pathMu.Lock()
+	m.pathIndex = make(map[string]string)
+	m.pathMu.Unlock()
+
+	// Update health status
+	m.updateLastHealth(IndexHealthResult{
+		Health:        IndexHealthy,
+		DocumentCount: 0,
+		CheckedAt:     time.Now(),
+	})
+
+	return docCount, nil
 }
 
 // =============================================================================
@@ -678,6 +1095,7 @@ func (m *IndexManager) addToBatch(batch *bleve.Batch, doc *search.Document) erro
 // BatchWithTimeout wraps batch commit with context timeout protection.
 // If the context doesn't already have a deadline, it applies the configured BatchTimeout.
 // This prevents batch commits from hanging indefinitely if Bleve experiences issues.
+// W4P.5: Uses semaphore to limit concurrent batch goroutines and prevent goroutine explosion.
 // Must be called with appropriate lock held (caller's responsibility).
 func (m *IndexManager) BatchWithTimeout(ctx context.Context, batch *bleve.Batch) error {
 	// Determine the timeout to use
@@ -694,16 +1112,20 @@ func (m *IndexManager) BatchWithTimeout(ctx context.Context, batch *bleve.Batch)
 	}
 
 	// Capture a local reference to the index to avoid race with Close().
-	// This is safe because the caller holds the lock, and we're only reading
-	// the pointer. The goroutine uses this captured reference.
 	idx := m.index
 	if idx == nil {
 		return ErrIndexClosed
 	}
 
+	// W4P.5: Acquire semaphore slot before spawning goroutine
+	if err := m.acquireBatchSemaphore(ctx); err != nil {
+		return err
+	}
+
 	// Use channel to capture result from goroutine
 	done := make(chan error, 1)
 	go func() {
+		defer m.releaseBatchSemaphore()
 		done <- idx.Batch(batch)
 	}()
 
@@ -712,6 +1134,54 @@ func (m *IndexManager) BatchWithTimeout(ctx context.Context, batch *bleve.Batch)
 		return err
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %v", ErrBatchTimeout, ctx.Err())
+	}
+}
+
+// acquireBatchSemaphore acquires a slot from the batch commit semaphore (W4P.5).
+// Returns ErrIndexClosed if semaphore is closed or nil,
+// or context error if context is canceled while waiting.
+func (m *IndexManager) acquireBatchSemaphore(ctx context.Context) error {
+	// Fast path: check if already closed
+	if m.batchSemClosed.Load() {
+		return ErrIndexClosed
+	}
+
+	m.batchSemMu.RLock()
+	sem := m.batchSem
+	m.batchSemMu.RUnlock()
+
+	if sem == nil {
+		return ErrIndexClosed
+	}
+
+	select {
+	case sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseBatchSemaphore releases a slot back to the batch commit semaphore (W4P.5).
+// Safe to call even after Close() - will be a no-op if semaphore is closed.
+func (m *IndexManager) releaseBatchSemaphore() {
+	// Fast path: check if already closed
+	if m.batchSemClosed.Load() {
+		return
+	}
+
+	m.batchSemMu.RLock()
+	sem := m.batchSem
+	m.batchSemMu.RUnlock()
+
+	if sem == nil {
+		return
+	}
+
+	// Non-blocking drain: if channel is empty, skip (should not happen normally)
+	select {
+	case <-sem:
+	default:
 	}
 }
 
@@ -743,6 +1213,8 @@ func (m *IndexManager) Delete(ctx context.Context, id string) error {
 // Uses O(1) path index lookup when available, falls back to search.
 // Returns nil if the document is not found.
 // Returns ErrIndexClosed if the index is not open.
+// W4P.4: Operations are ordered to maintain consistency - Bleve delete happens
+// first, path index removal only occurs on success.
 func (m *IndexManager) DeleteByPath(ctx context.Context, path string) error {
 	// First, try O(1) lookup from path index (PF.3.3)
 	m.pathMu.RLock()
@@ -750,12 +1222,18 @@ func (m *IndexManager) DeleteByPath(ctx context.Context, path string) error {
 	m.pathMu.RUnlock()
 
 	if exists {
-		// Remove from path index
+		// W4P.4: Delete from Bleve FIRST, then remove from path index only on success.
+		// This prevents phantom entries where path index points to non-existent doc.
+		if err := m.Delete(ctx, docID); err != nil {
+			return err
+		}
+
+		// Remove from path index only after successful Bleve delete
 		m.pathMu.Lock()
 		delete(m.pathIndex, path)
 		m.pathMu.Unlock()
 
-		return m.Delete(ctx, docID)
+		return nil
 	}
 
 	// Fall back to search if not in cache
