@@ -37413,16 +37413,19 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add type assertions with validation                                      ││
 │ │   SEVERITY: HIGH - Potential panic                                              ││
 │ │                                                                                  ││
-│ │ [ ] W12.36 - HNSW Search Without Read Lock                                      ││
+│ │ [x] W12.36 - HNSW Search Without Read Lock                                      ││
 │ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:298-342                                 ││
 │ │   ISSUE: Search reads graph state without holding read lock                     ││
-│ │   FIX: Add read lock for search operations                                      ││
+│ │   FIX: Added W12.36 comments documenting lock requirements for searchLayer     ││
+│ │        and greedySearchLayer. Public Search() holds RLock before calling       ││
+│ │        searchLocked. Verified with race detector tests.                        ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.37 - Snapshot Missing Validation                                        ││
+│ │ [x] W12.37 - Snapshot Missing Validation                                        ││
 │ │   FILE: core/vectorgraphdb/hnsw/snapshot.go:89-115                              ││
 │ │   ISSUE: Snapshot restore doesn't validate data integrity                       ││
-│ │   FIX: Add checksum validation on restore                                       ││
+│ │   FIX: Added CRC32 checksum validation with computeChecksum(), ValidateChecksum││
+│ │        methods. Checksums computed on snapshot creation, validated on restore. ││
 │ │   SEVERITY: HIGH - Data corruption                                              ││
 │ │                                                                                  ││
 │ │ [x] W12.38 - HNSW Layer Connection Race                                         ││
@@ -37482,11 +37485,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   SEVERITY: HIGH - Race condition                                               ││
 │ │   RESOLUTION: Changed lastChunkAt/chunksReceived to atomic types for lock-free  ││
 │ │                                                                                  ││
-│ │ [ ] W12.45 - StreamBridge Missing Error Recovery                                ││
+│ │ [x] W12.45 - StreamBridge Missing Error Recovery                                ││
 │ │   FILE: core/providers/stream_bridge.go:167-198                                 ││
 │ │   ISSUE: Errors in bridge handlers not recovered                                ││
 │ │   FIX: Add panic recovery and error propagation                                 ││
 │ │   SEVERITY: HIGH - Crash on handler error                                       ││
+│ │   RESOLUTION: Added recoverAndPublishError to StreamBridge.runStreamLoop and    ││
+│ │               recoverStreamPanic to StreamToChannel for comprehensive recovery  ││
 │ │                                                                                  ││
 │ │ [ ] W12.46 - Budget Tracker Race Condition                                      ││
 │ │   FILE: core/llm/budget.go:78-95                                                ││
