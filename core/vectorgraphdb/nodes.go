@@ -20,6 +20,27 @@ var (
 	ErrEmbeddingMissing = errors.New("embedding required for node")
 )
 
+// HNSWInsertError represents a failure during HNSW index insertion.
+// It includes information about whether the rollback succeeded.
+type HNSWInsertError struct {
+	NodeID         string
+	HNSWErr        error
+	RollbackFailed bool
+	RollbackErr    error
+}
+
+func (e *HNSWInsertError) Error() string {
+	if e.RollbackFailed {
+		return fmt.Sprintf("HNSW insert failed for node %s: %v; rollback also failed: %v",
+			e.NodeID, e.HNSWErr, e.RollbackErr)
+	}
+	return fmt.Sprintf("HNSW insert failed for node %s (rolled back): %v", e.NodeID, e.HNSWErr)
+}
+
+func (e *HNSWInsertError) Unwrap() error {
+	return e.HNSWErr
+}
+
 // HNSWInserter defines the interface for HNSW index operations.
 // This abstraction allows the NodeStore to insert/delete vectors
 // without direct dependency on the HNSW implementation.
@@ -88,7 +109,28 @@ func (ns *NodeStore) insertNodeTx(node *GraphNode, embedding []float32) error {
 	if err := ns.insertNodeToDB(node, embedding); err != nil {
 		return err
 	}
-	return ns.insertNodeToHNSW(node, embedding)
+	if err := ns.insertNodeToHNSW(node, embedding); err != nil {
+		return ns.rollbackDBInsert(node.ID, err)
+	}
+	return nil
+}
+
+func (ns *NodeStore) rollbackDBInsert(nodeID string, hnswErr error) error {
+	rollbackErr := ns.deleteNodeFromDB(nodeID)
+	return &HNSWInsertError{
+		NodeID:         nodeID,
+		HNSWErr:        hnswErr,
+		RollbackFailed: rollbackErr != nil,
+		RollbackErr:    rollbackErr,
+	}
+}
+
+func (ns *NodeStore) deleteNodeFromDB(id string) error {
+	_, err := ns.db.db.Exec("DELETE FROM nodes WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("rollback delete node %s: %w", id, err)
+	}
+	return nil
 }
 
 func (ns *NodeStore) insertNodeToDB(node *GraphNode, embedding []float32) error {

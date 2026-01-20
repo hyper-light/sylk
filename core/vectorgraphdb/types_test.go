@@ -1301,7 +1301,7 @@ func TestGraphNodeJSONFieldNames(t *testing.T) {
 	}
 
 	for _, field := range expectedFields {
-		if !contains(jsonStr, field) {
+		if !containsSubstr(jsonStr, field) {
 			t.Errorf("GraphNode JSON missing expected field: %s", field)
 		}
 	}
@@ -1332,7 +1332,7 @@ func TestGraphEdgeJSONFieldNames(t *testing.T) {
 	}
 
 	for _, field := range expectedFields {
-		if !contains(jsonStr, field) {
+		if !containsSubstr(jsonStr, field) {
 			t.Errorf("GraphEdge JSON missing expected field: %s", field)
 		}
 	}
@@ -1361,7 +1361,7 @@ func TestVectorDataJSONFieldNames(t *testing.T) {
 	}
 
 	for _, field := range expectedFields {
-		if !contains(jsonStr, field) {
+		if !containsSubstr(jsonStr, field) {
 			t.Errorf("VectorData JSON missing expected field: %s", field)
 		}
 	}
@@ -1400,18 +1400,18 @@ func TestDBStatsJSONFieldNames(t *testing.T) {
 	}
 
 	for _, field := range expectedFields {
-		if !contains(jsonStr, field) {
+		if !containsSubstr(jsonStr, field) {
 			t.Errorf("DBStats JSON missing expected field: %s", field)
 		}
 	}
 }
 
 // Helper function
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+func containsSubstr(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstrHelper(s, substr))
 }
 
-func containsHelper(s, substr string) bool {
+func containsSubstrHelper(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
 			return true
