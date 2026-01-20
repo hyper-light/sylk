@@ -18,23 +18,25 @@
     "wave_6": { "status": "completed" },
     "wave_7": { "status": "completed" },
     "wave_8": { "status": "completed" },
-    "wave_9": { "status": "completed" }
+    "wave_9": { "status": "completed" },
+    "wave_10": { "status": "completed", "note": "7 missing tasks" }
   },
   "groups": {
-    "4Q": { "name": "GP-Based Dynamic Handoff", "status": "completed" },
-    "4R": { "name": "Chunk Parameter Learning", "status": "completed" },
-    "4S": { "name": "Knowledge Graph Schema", "status": "completed" },
-    "4T": { "name": "Entity & Relation Extraction", "status": "completed" },
-    "4U": { "name": "Hybrid Query Coordinator", "status": "completed" },
-    "4V": { "name": "Inference Engine", "status": "completed" },
-    "4W": { "name": "Temporal Graph Support", "status": "completed" },
-    "4X": { "name": "Memory Decay System", "status": "completed" },
-    "4Y": { "name": "Archivalist Event System", "status": "completed" }
+    "4Q": { "name": "GP-Based Dynamic Handoff", "status": "completed", "tasks": 34 },
+    "4R": { "name": "Chunk Parameter Learning", "status": "completed", "tasks": 14 },
+    "4S": { "name": "Knowledge Graph Schema", "status": "completed", "tasks": 9 },
+    "4T": { "name": "Entity & Relation Extraction", "status": "completed", "tasks": 18 },
+    "4U": { "name": "Hybrid Query Coordinator", "status": "completed", "tasks": 15 },
+    "4V": { "name": "Inference Engine", "status": "completed", "tasks": 14 },
+    "4W": { "name": "Temporal Graph Support", "status": "completed", "tasks": 11 },
+    "4X": { "name": "Memory Decay System", "status": "completed", "tasks": 32 },
+    "4Y": { "name": "Archivalist Event System", "status": "completed", "tasks": 45 }
   },
   "summary": {
-    "total_waves": 10,
-    "total_files": 152,
-    "total_lines": 108362,
-    "commits": 10
+    "total_waves": 11,
+    "total_tasks": 192,
+    "total_files": 163,
+    "total_lines": 117657,
+    "commits": 11
   }
 }
