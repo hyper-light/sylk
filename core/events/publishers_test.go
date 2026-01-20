@@ -240,17 +240,17 @@ func TestGuidePublisher_NilBus(t *testing.T) {
 
 	publisher := NewGuidePublisher(nil, "session-123")
 
-	// Should not panic and should return nil error
-	if err := publisher.PublishUserPrompt("test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	// Should not panic and should return ErrNilBus error
+	if err := publisher.PublishUserPrompt("test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishRoutingDecision("a", "b", "c"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishRoutingDecision("a", "b", "c"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishClarificationRequest("test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishClarificationRequest("test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 }
 
@@ -465,17 +465,17 @@ func TestToolPublisher_NilBus(t *testing.T) {
 
 	publisher := NewToolPublisher(nil, "session-123", "agent-1")
 
-	// Should not panic and should return nil error
-	if err := publisher.PublishToolCall("test", nil); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	// Should not panic and should return ErrNilBus error
+	if err := publisher.PublishToolCall("test", nil); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishToolResult("test", nil, true); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishToolResult("test", nil, true); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishToolTimeout("test", time.Second); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishToolTimeout("test", time.Second); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 }
 
@@ -761,25 +761,25 @@ func TestAgentPublisher_NilBus(t *testing.T) {
 
 	publisher := NewAgentPublisher(nil, "session-123", "agent-1")
 
-	// Should not panic and should return nil error
-	if err := publisher.PublishAgentAction("test", "test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	// Should not panic and should return ErrNilBus error
+	if err := publisher.PublishAgentAction("test", "test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishAgentDecision("test", "test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishAgentDecision("test", "test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishAgentError(errors.New("test"), "test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishAgentError(errors.New("test"), "test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishSuccess("test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishSuccess("test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishFailure(errors.New("test"), "test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishFailure(errors.New("test"), "test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 }
 
@@ -1015,17 +1015,17 @@ func TestLLMPublisher_NilBus(t *testing.T) {
 
 	publisher := NewLLMPublisher(nil, "session-123", "agent-1")
 
-	// Should not panic and should return nil error
-	if err := publisher.PublishLLMRequest("gpt-4", 100); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	// Should not panic and should return ErrNilBus error
+	if err := publisher.PublishLLMRequest("gpt-4", 100); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishLLMResponse("gpt-4", 100, 50, time.Second); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishLLMResponse("gpt-4", 100, 50, time.Second); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 
-	if err := publisher.PublishLLMError("gpt-4", errors.New("test"), "test"); err != nil {
-		t.Errorf("Expected nil error for nil bus, got %v", err)
+	if err := publisher.PublishLLMError("gpt-4", errors.New("test"), "test"); !errors.Is(err, ErrNilBus) {
+		t.Errorf("Expected ErrNilBus for nil bus, got %v", err)
 	}
 }
 

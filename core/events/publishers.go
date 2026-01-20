@@ -1,9 +1,13 @@
 package events
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrNilBus is returned when a publisher attempts to publish an event but the bus is nil.
+var ErrNilBus = errors.New("event bus is nil")
 
 // =============================================================================
 // GuidePublisher - Publishes guide/router related events
@@ -27,7 +31,7 @@ func NewGuidePublisher(bus *ActivityEventBus, sessionID string) *GuidePublisher 
 // PublishUserPrompt publishes a user prompt event.
 func (p *GuidePublisher) PublishUserPrompt(prompt string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	event := NewActivityEvent(EventTypeUserPrompt, p.sessionID, prompt)
@@ -43,7 +47,7 @@ func (p *GuidePublisher) PublishUserPrompt(prompt string) error {
 // PublishRoutingDecision publishes a routing decision event.
 func (p *GuidePublisher) PublishRoutingDecision(fromAgent, toAgent, reason string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	content := fmt.Sprintf("Routing from %s to %s: %s", fromAgent, toAgent, reason)
@@ -63,7 +67,7 @@ func (p *GuidePublisher) PublishRoutingDecision(fromAgent, toAgent, reason strin
 // PublishClarificationRequest publishes a clarification request event.
 func (p *GuidePublisher) PublishClarificationRequest(question string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	event := NewActivityEvent(EventTypeUserClarification, p.sessionID, question)
@@ -100,7 +104,7 @@ func NewToolPublisher(bus *ActivityEventBus, sessionID, agentID string) *ToolPub
 // PublishToolCall publishes a tool call event.
 func (p *ToolPublisher) PublishToolCall(toolName string, params map[string]any) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	content := fmt.Sprintf("Tool call: %s", toolName)
@@ -120,7 +124,7 @@ func (p *ToolPublisher) PublishToolCall(toolName string, params map[string]any) 
 // PublishToolResult publishes a tool result event.
 func (p *ToolPublisher) PublishToolResult(toolName string, result any, success bool) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	content := fmt.Sprintf("Tool result: %s", toolName)
@@ -147,7 +151,7 @@ func (p *ToolPublisher) PublishToolResult(toolName string, result any, success b
 // PublishToolTimeout publishes a tool timeout event.
 func (p *ToolPublisher) PublishToolTimeout(toolName string, timeout time.Duration) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	content := fmt.Sprintf("Tool timeout: %s after %v", toolName, timeout)
@@ -190,7 +194,7 @@ func NewAgentPublisher(bus *ActivityEventBus, sessionID, agentID string) *AgentP
 // PublishAgentAction publishes an agent action event.
 func (p *AgentPublisher) PublishAgentAction(action, details string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	content := fmt.Sprintf("Agent action: %s - %s", action, details)
@@ -210,7 +214,7 @@ func (p *AgentPublisher) PublishAgentAction(action, details string) error {
 // PublishAgentDecision publishes an agent decision event.
 func (p *AgentPublisher) PublishAgentDecision(decision, rationale string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	content := fmt.Sprintf("Agent decision: %s - %s", decision, rationale)
@@ -230,7 +234,7 @@ func (p *AgentPublisher) PublishAgentDecision(decision, rationale string) error 
 // PublishAgentError publishes an agent error event.
 func (p *AgentPublisher) PublishAgentError(err error, context string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	var errMsg string
@@ -256,7 +260,7 @@ func (p *AgentPublisher) PublishAgentError(err error, context string) error {
 // PublishSuccess publishes a success outcome event.
 func (p *AgentPublisher) PublishSuccess(summary string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	event := NewActivityEvent(EventTypeSuccess, p.sessionID, summary)
@@ -274,7 +278,7 @@ func (p *AgentPublisher) PublishSuccess(summary string) error {
 // PublishFailure publishes a failure outcome event.
 func (p *AgentPublisher) PublishFailure(err error, summary string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	var errMsg string
@@ -321,7 +325,7 @@ func NewLLMPublisher(bus *ActivityEventBus, sessionID, agentID string) *LLMPubli
 // PublishLLMRequest publishes an LLM request event.
 func (p *LLMPublisher) PublishLLMRequest(model string, inputTokens int) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	content := fmt.Sprintf("LLM request: model=%s, input_tokens=%d", model, inputTokens)
@@ -341,7 +345,7 @@ func (p *LLMPublisher) PublishLLMRequest(model string, inputTokens int) error {
 // PublishLLMResponse publishes an LLM response event.
 func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputTokens int, duration time.Duration) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	var tokensPerSec float64
@@ -371,7 +375,7 @@ func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputToken
 // PublishLLMError publishes an LLM error event.
 func (p *LLMPublisher) PublishLLMError(model string, err error, context string) error {
 	if p.bus == nil {
-		return nil // Silently ignore if no bus
+		return ErrNilBus
 	}
 
 	var errMsg string
