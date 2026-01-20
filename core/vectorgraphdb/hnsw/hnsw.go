@@ -252,6 +252,10 @@ func (h *Index) isValidLayerIndex(level int) bool {
 	return level >= 0 && level < len(h.layers)
 }
 
+// greedySearchLayer performs greedy search at a single layer to find the closest node.
+// W12.36: Caller must hold h.mu (read or write lock) to safely access h.vectors,
+// h.magnitudes, and h.layers. This function does not acquire locks itself to avoid
+// deadlocks when called from insertLocked (which holds write lock).
 func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, epDist float64, level int) (string, float64) {
 	// W12.11: Bounds check for layer access
 	if !h.isValidLayerIndex(level) {
@@ -279,6 +283,10 @@ func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, 
 	return ep, epDist
 }
 
+// searchLayer performs beam search at a single layer to find ef nearest neighbors.
+// W12.36: Caller must hold h.mu (read or write lock) to safely access h.vectors,
+// h.magnitudes, and h.layers. This function does not acquire locks itself to avoid
+// deadlocks when called from insertLocked (which holds write lock).
 func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int, level int) []SearchResult {
 	// W12.11: Bounds check for layer access
 	if !h.isValidLayerIndex(level) {
