@@ -33,16 +33,39 @@ type DeadlockResult struct {
 
 type AgentStatusFunc func(agentID string) bool
 
+// DeadlockConfig configures deadlock detection behavior.
+type DeadlockConfig struct {
+	// ConfirmationChecks is the number of times to reconfirm a deadlock.
+	ConfirmationChecks int
+	// ConfirmationDelay is the delay between confirmation checks.
+	ConfirmationDelay time.Duration
+}
+
+// DefaultDeadlockConfig returns the default deadlock configuration.
+func DefaultDeadlockConfig() DeadlockConfig {
+	return DeadlockConfig{
+		ConfirmationChecks: 2,
+		ConfirmationDelay:  10 * time.Millisecond,
+	}
+}
+
 type DeadlockDetector struct {
 	waitGraph   map[string][]WaitEdge
 	agentStatus AgentStatusFunc
+	config      DeadlockConfig
 	mu          sync.RWMutex
 }
 
 func NewDeadlockDetector(statusFn AgentStatusFunc) *DeadlockDetector {
+	return NewDeadlockDetectorWithConfig(statusFn, DefaultDeadlockConfig())
+}
+
+// NewDeadlockDetectorWithConfig creates a DeadlockDetector with custom config.
+func NewDeadlockDetectorWithConfig(statusFn AgentStatusFunc, config DeadlockConfig) *DeadlockDetector {
 	return &DeadlockDetector{
 		waitGraph:   make(map[string][]WaitEdge),
 		agentStatus: statusFn,
+		config:      config,
 	}
 }
 
@@ -74,6 +97,11 @@ func (d *DeadlockDetector) ClearWait(waiter, resourceID string) {
 }
 
 func (d *DeadlockDetector) Check() []DeadlockResult {
+	candidates := d.detectCandidates()
+	return d.confirmDeadlocks(candidates)
+}
+
+func (d *DeadlockDetector) detectCandidates() []DeadlockResult {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -81,6 +109,80 @@ func (d *DeadlockDetector) Check() []DeadlockResult {
 	results = append(results, d.findCircularDeadlocks()...)
 	results = append(results, d.findDeadHolderDeadlocks()...)
 	return results
+}
+
+func (d *DeadlockDetector) confirmDeadlocks(candidates []DeadlockResult) []DeadlockResult {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	confirmed := make([]DeadlockResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		if d.confirmDeadlock(candidate) {
+			confirmed = append(confirmed, candidate)
+		}
+	}
+	return confirmed
+}
+
+func (d *DeadlockDetector) confirmDeadlock(candidate DeadlockResult) bool {
+	for i := 0; i < d.config.ConfirmationChecks; i++ {
+		time.Sleep(d.config.ConfirmationDelay)
+		if !d.reconfirmCandidate(candidate) {
+			return false
+		}
+	}
+	return true
+}
+
+func (d *DeadlockDetector) reconfirmCandidate(candidate DeadlockResult) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	switch candidate.Type {
+	case DeadlockCircular:
+		return d.confirmCycleExists(candidate.Cycle)
+	case DeadlockDeadHolder:
+		return d.confirmDeadHolder(candidate)
+	default:
+		return false
+	}
+}
+
+func (d *DeadlockDetector) confirmCycleExists(cycle []string) bool {
+	if len(cycle) < 2 {
+		return false
+	}
+
+	for i := 0; i < len(cycle)-1; i++ {
+		if !d.edgeExists(cycle[i], cycle[i+1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (d *DeadlockDetector) edgeExists(waiter, holder string) bool {
+	edges := d.waitGraph[waiter]
+	for _, edge := range edges {
+		if edge.HolderID == holder {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *DeadlockDetector) confirmDeadHolder(candidate DeadlockResult) bool {
+	if len(candidate.WaitingAgents) == 0 {
+		return false
+	}
+
+	waiter := candidate.WaitingAgents[0]
+	if !d.edgeExists(waiter, candidate.DeadHolder) {
+		return false
+	}
+
+	return !d.agentStatus(candidate.DeadHolder)
 }
 
 func (d *DeadlockDetector) findCircularDeadlocks() []DeadlockResult {

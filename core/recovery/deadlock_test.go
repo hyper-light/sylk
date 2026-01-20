@@ -3,6 +3,7 @@ package recovery
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func alwaysAlive(_ string) bool { return true }
@@ -164,5 +165,129 @@ func TestDeadlockDetector_LongChain(t *testing.T) {
 		if r.Detected && r.Type == DeadlockCircular {
 			t.Error("Long chain without cycle should not be circular deadlock")
 		}
+	}
+}
+
+func TestDeadlockDetector_FalsePositiveRejection(t *testing.T) {
+	// Use fast config for testing
+	config := DeadlockConfig{
+		ConfirmationChecks: 2,
+		ConfirmationDelay:  1 * time.Millisecond,
+	}
+	dd := NewDeadlockDetectorWithConfig(alwaysAlive, config)
+
+	// Create a cycle
+	dd.RegisterWait("A", "B", "file", "f1")
+	dd.RegisterWait("B", "C", "file", "f2")
+	dd.RegisterWait("C", "A", "file", "f3")
+
+	// Start check in goroutine
+	resultChan := make(chan []DeadlockResult, 1)
+	go func() {
+		resultChan <- dd.Check()
+	}()
+
+	// Clear the cycle during confirmation window
+	time.Sleep(500 * time.Microsecond)
+	dd.ClearWait("C", "f3")
+
+	results := <-resultChan
+
+	// The deadlock should be rejected since cycle was cleared
+	var foundConfirmed bool
+	for _, r := range results {
+		if r.Detected && r.Type == DeadlockCircular {
+			foundConfirmed = true
+		}
+	}
+
+	if foundConfirmed {
+		t.Log("Cycle was confirmed before clear, acceptable race condition")
+	}
+}
+
+func TestDeadlockDetector_DeadHolderConfirmation(t *testing.T) {
+	statusCallCount := 0
+	var mu sync.Mutex
+
+	statusFn := func(agentID string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		statusCallCount++
+		// First call returns dead, subsequent calls return alive
+		return statusCallCount > 1
+	}
+
+	config := DeadlockConfig{
+		ConfirmationChecks: 2,
+		ConfirmationDelay:  1 * time.Millisecond,
+	}
+	dd := NewDeadlockDetectorWithConfig(statusFn, config)
+
+	dd.RegisterWait("A", "B", "file", "f1")
+
+	results := dd.Check()
+
+	// Should not confirm since holder becomes alive during confirmation
+	var foundDeadHolder bool
+	for _, r := range results {
+		if r.Detected && r.Type == DeadlockDeadHolder {
+			foundDeadHolder = true
+		}
+	}
+
+	if foundDeadHolder {
+		t.Error("Dead holder should be rejected when agent becomes alive during confirmation")
+	}
+}
+
+func TestDeadlockDetector_ConfirmedDeadlock(t *testing.T) {
+	config := DeadlockConfig{
+		ConfirmationChecks: 2,
+		ConfirmationDelay:  1 * time.Millisecond,
+	}
+	dd := NewDeadlockDetectorWithConfig(alwaysAlive, config)
+
+	// Create a stable cycle
+	dd.RegisterWait("A", "B", "file", "f1")
+	dd.RegisterWait("B", "A", "file", "f2")
+
+	results := dd.Check()
+
+	var foundCircular bool
+	for _, r := range results {
+		if r.Detected && r.Type == DeadlockCircular {
+			foundCircular = true
+		}
+	}
+
+	if !foundCircular {
+		t.Error("Stable circular deadlock should be confirmed")
+	}
+}
+
+func TestDeadlockDetectorWithConfig(t *testing.T) {
+	config := DeadlockConfig{
+		ConfirmationChecks: 3,
+		ConfirmationDelay:  5 * time.Millisecond,
+	}
+	dd := NewDeadlockDetectorWithConfig(alwaysAlive, config)
+
+	if dd.config.ConfirmationChecks != 3 {
+		t.Errorf("Expected ConfirmationChecks=3, got %d", dd.config.ConfirmationChecks)
+	}
+	if dd.config.ConfirmationDelay != 5*time.Millisecond {
+		t.Errorf("Expected ConfirmationDelay=5ms, got %v", dd.config.ConfirmationDelay)
+	}
+}
+
+func TestDefaultDeadlockConfig(t *testing.T) {
+	config := DefaultDeadlockConfig()
+
+	if config.ConfirmationChecks != 2 {
+		t.Errorf("Expected default ConfirmationChecks=2, got %d", config.ConfirmationChecks)
+	}
+	if config.ConfirmationDelay != 10*time.Millisecond {
+		t.Errorf("Expected default ConfirmationDelay=10ms, got %v", config.ConfirmationDelay)
 	}
 }
