@@ -72,10 +72,6 @@ func NewGoroutineScope(parentCtx context.Context, agentID string, budget *Gorout
 }
 
 func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFunc) error {
-	if err := s.checkShutdown(); err != nil {
-		return err
-	}
-
 	timeout = s.normalizeTimeout(timeout)
 
 	if err := s.budget.Acquire(s.agentID); err != nil {
@@ -83,18 +79,26 @@ func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFu
 	}
 
 	w := s.createWorker(description, timeout)
-	s.registerWorker(w)
+
+	// Atomically check shutdown and register worker to prevent race
+	// between wg.Add(1) and wg.Wait() during shutdown.
+	if err := s.checkAndRegister(w); err != nil {
+		w.cancel()
+		s.budget.Release(s.agentID)
+		return err
+	}
 
 	go s.runWorker(w, fn)
 	return nil
 }
 
-func (s *GoroutineScope) checkShutdown() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *GoroutineScope) checkAndRegister(w *worker) error {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
 	if s.shutdownStarted {
 		return ErrScopeShutdown
 	}
+	s.registerWorkerLocked(w)
 	return nil
 }
 
@@ -117,7 +121,7 @@ func (s *GoroutineScope) createWorker(description string, timeout time.Duration)
 	}
 }
 
-func (s *GoroutineScope) registerWorker(w *worker) {
+func (s *GoroutineScope) registerWorkerLocked(w *worker) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	w.id = s.nextID
@@ -191,28 +195,21 @@ func (s *GoroutineScope) waitForShutdown(gracePeriod, hardDeadline time.Duration
 
 // waitWithTimeout waits for all workers to complete within the given timeout.
 // Returns true if all workers completed, false if timeout elapsed.
-// Uses inline wait with timeout instead of spawning an untracked goroutine.
+// Uses a single goroutine that is properly bounded by the timeout.
 func (s *GoroutineScope) waitWithTimeout(timeout time.Duration) bool {
 	done := make(chan struct{})
-	defer close(done)
 
-	// Use a tracked goroutine via sync.WaitGroup for the wait itself
-	var waitWg sync.WaitGroup
-	waitWg.Add(1)
+	// Single goroutine that signals when WaitGroup completes.
+	// This goroutine will exit when either:
+	// 1. s.wg.Wait() returns (all workers done), or
+	// 2. The workers are cancelled (during forceShutdown), causing s.wg.Wait() to return
 	go func() {
-		defer waitWg.Done()
 		s.wg.Wait()
-	}()
-
-	// Wait for either completion or timeout
-	completed := make(chan struct{})
-	go func() {
-		waitWg.Wait()
-		close(completed)
+		close(done)
 	}()
 
 	select {
-	case <-completed:
+	case <-done:
 		return true
 	case <-time.After(timeout):
 		return false
