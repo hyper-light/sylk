@@ -199,6 +199,7 @@ func DefaultHybridSearchOptions() *HybridSearchOptions {
 }
 
 // HybridSearch performs a combined vector + text search with RRF fusion.
+// The RLock is held throughout the entire operation to prevent use-after-close.
 func (db *BleveIntegratedDB) HybridSearch(
 	ctx context.Context,
 	query string,
@@ -206,12 +207,22 @@ func (db *BleveIntegratedDB) HybridSearch(
 	opts *HybridSearchOptions,
 ) ([]*ExtendedHybridResult, error) {
 	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	if db.closed {
-		db.mu.RUnlock()
 		return nil, ErrViewClosed
 	}
-	db.mu.RUnlock()
 
+	return db.hybridSearchLocked(ctx, query, embedding, opts)
+}
+
+// hybridSearchLocked performs the hybrid search assuming the RLock is held.
+func (db *BleveIntegratedDB) hybridSearchLocked(
+	ctx context.Context,
+	query string,
+	embedding []float32,
+	opts *HybridSearchOptions,
+) ([]*ExtendedHybridResult, error) {
 	if opts == nil {
 		opts = DefaultHybridSearchOptions()
 	}
@@ -223,20 +234,21 @@ func (db *BleveIntegratedDB) HybridSearch(
 		defer cancel()
 	}
 
-	// Perform vector search
-	vectorResults, err := db.vectorSearch(embedding, opts)
+	// Perform vector search (lock already held)
+	vectorResults, err := db.vectorSearchLocked(embedding, opts)
 	if err != nil {
 		return nil, fmt.Errorf("vector search: %w", err)
 	}
 
-	// Perform text search (with circuit breaker)
-	bleveResults := db.textSearch(ctx, query, opts)
+	// Perform text search with circuit breaker (lock already held)
+	bleveResults := db.textSearchLocked(ctx, query, opts)
 
 	// Fuse results using RRF
 	return FuseResultsRRF(vectorResults, bleveResults), nil
 }
 
-func (db *BleveIntegratedDB) vectorSearch(
+// vectorSearchLocked performs vector search assuming the RLock is held.
+func (db *BleveIntegratedDB) vectorSearchLocked(
 	embedding []float32,
 	opts *HybridSearchOptions,
 ) ([]*ExtendedHybridResult, error) {
@@ -261,7 +273,8 @@ func (db *BleveIntegratedDB) vectorSearch(
 	return ExtendResults(results), nil
 }
 
-func (db *BleveIntegratedDB) textSearch(
+// textSearchLocked performs text search assuming the RLock is held.
+func (db *BleveIntegratedDB) textSearchLocked(
 	ctx context.Context,
 	query string,
 	opts *HybridSearchOptions,
