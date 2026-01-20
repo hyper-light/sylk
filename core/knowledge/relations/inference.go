@@ -113,27 +113,30 @@ func (r *InferenceRule) Validate() error {
 }
 
 // validateBasicFields checks ID, Name, and Body are not empty.
+// W4L.7: Improved error messages with rule context for debugging.
 func (r *InferenceRule) validateBasicFields() error {
 	if r.ID == "" {
-		return fmt.Errorf("rule ID cannot be empty")
+		return fmt.Errorf("inference rule validation failed: ID cannot be empty (name=%q)", r.Name)
 	}
 	if r.Name == "" {
-		return fmt.Errorf("rule name cannot be empty")
+		return fmt.Errorf("inference rule validation failed: name cannot be empty (id=%q)", r.ID)
 	}
 	if len(r.Body) == 0 {
-		return fmt.Errorf("rule body cannot be empty")
+		return fmt.Errorf("inference rule %q (id=%q) validation failed: body cannot be empty", r.Name, r.ID)
 	}
 	return nil
 }
 
 // validateHeadVariables ensures all head variables appear in body.
+// W4L.7: Improved error messages with rule context for debugging.
 func (r *InferenceRule) validateHeadVariables() error {
 	headVars := extractRuleVariables(r.Head)
 	bodyVars := r.collectBodyVariables()
 
 	for _, headVar := range headVars {
 		if !bodyVars[headVar] {
-			return fmt.Errorf("head variable %s not found in body", headVar)
+			return fmt.Errorf("inference rule %q (id=%q) validation failed: head variable %s not bound in body (head=%s, body has %d conditions)",
+				r.Name, r.ID, headVar, formatRuleCondition(r.Head), len(r.Body))
 		}
 	}
 	return nil

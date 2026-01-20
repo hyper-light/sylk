@@ -1,5 +1,35 @@
 package relations
 
+// W4L.6: Type Relation Extractor
+//
+// This file extracts type relationships from source code, detecting inheritance,
+// interface implementation, embedding, and type usage patterns.
+//
+// Supported relationship types:
+//   - Extends: Class/type inheritance (e.g., class Child extends Parent)
+//   - Implements: Interface implementation (e.g., class X implements Interface)
+//   - Embeds: Go struct embedding (anonymous field that promotes methods)
+//   - Uses: Type used as field type or parameter
+//
+// Language-specific detection:
+//
+// Go (AST-based):
+//   - Struct embedding: Detected via anonymous fields in struct types
+//   - Interface embedding: Detected via anonymous fields in interface types
+//   - Field usage: Detected via named fields with non-builtin types
+//   - Note: Go uses implicit interface satisfaction (not explicit "implements")
+//
+// TypeScript/JavaScript (regex-based):
+//   - Class extends: class X extends Y
+//   - Class implements: class X implements Y, Z
+//   - Interface extends: interface X extends Y, Z
+//   - Handles generic type parameters in patterns
+//
+// Python (regex-based):
+//   - Class inheritance: class X(Parent1, Parent2)
+//   - Multiple inheritance supported
+//   - Filters out metaclass= and other kwargs
+
 import (
 	"go/ast"
 	"go/parser"

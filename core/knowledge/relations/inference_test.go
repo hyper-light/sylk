@@ -148,7 +148,8 @@ func TestInferenceRule_Validate_UnboundHeadVariable(t *testing.T) {
 
 	err := rule.Validate()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "head variable ?z not found in body")
+	// W4L.7: Updated to match improved error message with rule context
+	assert.Contains(t, err.Error(), "head variable ?z not bound in body")
 }
 
 // =============================================================================

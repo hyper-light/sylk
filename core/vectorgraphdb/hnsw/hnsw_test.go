@@ -1,6 +1,7 @@
 package hnsw
 
 import (
+	"errors"
 	"math"
 	"math/rand"
 	"sync"
@@ -261,7 +262,8 @@ func TestIndexInsertEmptyVector(t *testing.T) {
 	idx := New(DefaultConfig())
 	err := idx.Insert("node1", []float32{}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
-	if err != ErrEmptyVector {
+	// W4L.1: Use errors.Is() to check wrapped errors
+	if !errors.Is(err, ErrEmptyVector) {
 		t.Errorf("Insert empty vector: got %v, want ErrEmptyVector", err)
 	}
 }
@@ -335,7 +337,8 @@ func TestIndexDeleteNonexistent(t *testing.T) {
 	idx := New(DefaultConfig())
 	err := idx.Delete("nonexistent")
 
-	if err != ErrNodeNotFound {
+	// W4L.1: Use errors.Is() to check wrapped errors
+	if !errors.Is(err, ErrNodeNotFound) {
 		t.Errorf("Delete nonexistent: got %v, want ErrNodeNotFound", err)
 	}
 }
@@ -386,7 +389,8 @@ func TestIndexGetVectorNotFound(t *testing.T) {
 	idx := New(DefaultConfig())
 	_, err := idx.GetVector("nonexistent")
 
-	if err != ErrNodeNotFound {
+	// W4L.1: Use errors.Is() to check wrapped errors
+	if !errors.Is(err, ErrNodeNotFound) {
 		t.Errorf("GetVector nonexistent: got %v, want ErrNodeNotFound", err)
 	}
 }
