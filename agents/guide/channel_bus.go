@@ -82,7 +82,12 @@ func (b *ChannelBus) publishToSubscribers(subs []*channelSubscription, msg *Mess
 }
 
 func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message) {
-	if !sub.active.Load() || sub.closed.Load() {
+	if !sub.active.Load() {
+		return
+	}
+	sub.closeMu.RLock()
+	defer sub.closeMu.RUnlock()
+	if sub.closed.Load() {
 		return
 	}
 	select {
@@ -165,6 +170,7 @@ type channelSubscription struct {
 	async      bool
 	active     atomic.Bool
 	closed     atomic.Bool
+	closeMu    sync.RWMutex // protects channel close/send operations
 	topicShard *topicSubscriptions
 }
 
@@ -205,6 +211,8 @@ func (s *channelSubscription) Unsubscribe() error {
 }
 
 func (s *channelSubscription) close() {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
 	if s.closed.Swap(true) {
 		return
 	}
