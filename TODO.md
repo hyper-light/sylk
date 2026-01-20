@@ -35304,30 +35304,34 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ EXECUTION WAVE 1: Foundation Concurrency (4 parallel - no dependencies)         ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ [ ] W4N.1 - AdaptiveChannel Message Loss During Resize                          ││
+│ │ [x] W4N.1 - AdaptiveChannel Message Loss During Resize                          ││
 │ │   FILE: core/concurrency/adaptive_channel.go:630-653                            ││
 │ │   ISSUE: Messages can be lost during aggressive downsizing (documented)         ││
 │ │   FIX: Implement safe staged drain with bounded iteration                       ││
 │ │   SEVERITY: CRITICAL - Data loss possible                                       ││
+│ │   STATUS: DONE - Commit e4ba9c3                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.2 - UnboundedChannel/AdaptiveChannel Legacy Unbounded Mode              ││
+│ │ [x] W4N.2 - UnboundedChannel/AdaptiveChannel Legacy Unbounded Mode              ││
 │ │   FILES: core/concurrency/adaptive_channel.go:137-138                           ││
 │ │          core/concurrency/unbounded_channel.go:99-101                           ││
 │ │   ISSUE: MaxOverflowSize=0 allows unbounded growth → memory exhaustion          ││
 │ │   FIX: Enforce minimum bound, deprecate legacy mode                             ││
 │ │   SEVERITY: CRITICAL - Memory exhaustion risk                                   ││
+│ │   STATUS: DONE - Commit 7ac1a40                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.3 - GoroutineScope.waitWithTimeout Untracked Goroutines                 ││
+│ │ [x] W4N.3 - GoroutineScope.waitWithTimeout Untracked Goroutines                 ││
 │ │   FILE: core/concurrency/goroutine_scope.go:199-220                             ││
 │ │   ISSUE: Spawns 2 untracked goroutines for WaitGroup timeout handling           ││
 │ │   FIX: Use single goroutine with select-based timeout, track properly           ││
 │ │   SEVERITY: CRITICAL - Goroutine leak risk                                      ││
+│ │   STATUS: DONE - Commit ca47dbc                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.4 - DualQueueGate.waitForRequests Untracked Goroutine                   ││
+│ │ [x] W4N.4 - DualQueueGate.waitForRequests Untracked Goroutine                   ││
 │ │   FILE: core/concurrency/llm_gate.go:907-920                                    ││
 │ │   ISSUE: Spawns untracked goroutine to wait for WaitGroup                       ││
 │ │   FIX: Track via context cancellation or bounded wait pattern                   ││
 │ │   SEVERITY: CRITICAL - Goroutine leak on shutdown timeout                       ││
+│ │   STATUS: DONE - Commit 4b022bc                                                 ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │ EXECUTION WAVE 2: Context/Cache Layer (4 parallel - depends on Wave 1)          ││
