@@ -666,13 +666,18 @@ func (l *ObservationLog) compactLocked() error {
 		return err
 	}
 
-	return l.rewriteFile(observations)
+	return l.rewriteFileAndResetSequence(observations)
 }
 
-func (l *ObservationLog) rewriteFile(observations []LoggedObservation) error {
+// rewriteFileAndResetSequence rewrites the WAL file with remaining observations
+// and resets the sequence counter to prevent unbounded growth (W3M.13 fix).
+func (l *ObservationLog) rewriteFileAndResetSequence(observations []LoggedObservation) error {
 	// Flush and close current file
 	l.writer.Flush()
 	l.file.Close()
+
+	// Renumber observations starting from 1 to reset sequence counter
+	renumbered := l.renumberObservations(observations)
 
 	// Create new file
 	file, err := os.Create(l.path)
@@ -682,22 +687,8 @@ func (l *ObservationLog) rewriteFile(observations []LoggedObservation) error {
 
 	writer := bufio.NewWriter(file)
 
-	// Write truncate marker first to preserve truncation state
-	if l.truncateBeforeSeq > 0 {
-		marker := TruncateMarker{
-			Type:           "truncate",
-			BeforeSequence: l.truncateBeforeSeq,
-			Timestamp:      time.Now(),
-			DeletedCount:   0, // Reset after compaction
-		}
-		if err := l.writeMarkerToWriter(writer, marker); err != nil {
-			file.Close()
-			return err
-		}
-	}
-
-	// Write observations
-	if err := l.writeObservationsToWriter(writer, observations); err != nil {
+	// Write observations with new sequence numbers
+	if err := l.writeObservationsToWriter(writer, renumbered); err != nil {
 		file.Close()
 		return err
 	}
@@ -714,9 +705,26 @@ func (l *ObservationLog) rewriteFile(observations []LoggedObservation) error {
 
 	l.file = file
 	l.writer = bufio.NewWriter(file)
-	l.deletedCount = 0 // Reset after compaction
+	l.deletedCount = 0         // Reset after compaction
+	l.truncateBeforeSeq = 0    // Reset truncation point after renumbering
+	l.sequence = uint64(len(renumbered)) // Reset sequence to count of remaining observations
 
 	return nil
+}
+
+// renumberObservations assigns new sequential sequence numbers starting from 1.
+func (l *ObservationLog) renumberObservations(observations []LoggedObservation) []LoggedObservation {
+	result := make([]LoggedObservation, len(observations))
+	for i, obs := range observations {
+		result[i] = LoggedObservation{
+			Sequence:    uint64(i + 1),
+			Timestamp:   obs.Timestamp,
+			Observation: obs.Observation,
+			Processed:   obs.Processed,
+			Deleted:     false,
+		}
+	}
+	return result
 }
 
 func (l *ObservationLog) writeMarkerToWriter(w *bufio.Writer, marker TruncateMarker) error {

@@ -726,10 +726,11 @@ func TestCompact_DataIntegrityAfterReopen(t *testing.T) {
 		t.Errorf("expected 25 observations, got %d", len(observations))
 	}
 
-	// Verify data content
-	for _, obs := range observations {
-		if obs.Sequence < 26 {
-			t.Errorf("found observation with sequence %d, expected >= 26", obs.Sequence)
+	// Verify sequences are renumbered from 1 after compact (W3M.13 fix)
+	for i, obs := range observations {
+		expectedSeq := uint64(i + 1)
+		if obs.Sequence != expectedSeq {
+			t.Errorf("expected sequence %d, got %d", expectedSeq, obs.Sequence)
 		}
 	}
 }
@@ -1197,5 +1198,245 @@ func TestObservationLog_ConcurrentAsyncWrites(t *testing.T) {
 			t.Errorf("duplicate sequence number: %d", obs.Sequence)
 		}
 		seqMap[obs.Sequence] = true
+	}
+}
+
+// =============================================================================
+// W3M.13 Sequence Counter Reset Tests
+// =============================================================================
+
+func TestSequenceResetAfterCompact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Record 100 observations - sequence goes to 100
+	for i := 0; i < 100; i++ {
+		log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+
+	initialSeq := log.CurrentSequence()
+	if initialSeq != 100 {
+		t.Errorf("expected sequence 100, got %d", initialSeq)
+	}
+
+	// Truncate to keep only last 10
+	log.Truncate(91)
+
+	// Compact should reset sequence
+	if err := log.Compact(); err != nil {
+		t.Fatalf("failed to compact: %v", err)
+	}
+
+	// After compact, sequence should be reset to count of remaining entries
+	resetSeq := log.CurrentSequence()
+	if resetSeq != 10 {
+		t.Errorf("expected sequence reset to 10, got %d", resetSeq)
+	}
+
+	log.Close()
+}
+
+func TestSequenceResetNoConflicts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	// Record 50 observations
+	for i := 0; i < 50; i++ {
+		log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: i,
+		})
+	}
+
+	// Truncate to keep last 10 (sequences 41-50)
+	log.Truncate(41)
+	log.Compact()
+
+	// After compact, sequence should be 10 (renumbered 1-10)
+	if log.CurrentSequence() != 10 {
+		t.Errorf("expected sequence 10 after compact, got %d", log.CurrentSequence())
+	}
+
+	// Record more observations - should continue from 10
+	for i := 0; i < 5; i++ {
+		log.Record(context.Background(), &EpisodeObservation{
+			TaskCompleted: true,
+			FollowUpCount: 100 + i, // Different values to identify new records
+		})
+	}
+
+	if log.CurrentSequence() != 15 {
+		t.Errorf("expected sequence 15 after new records, got %d", log.CurrentSequence())
+	}
+
+	// Verify all sequences are unique and sequential
+	observations, _ := log.GetObservations()
+	if len(observations) != 15 {
+		t.Errorf("expected 15 observations, got %d", len(observations))
+	}
+
+	seqMap := make(map[uint64]bool)
+	for _, obs := range observations {
+		if seqMap[obs.Sequence] {
+			t.Errorf("duplicate sequence number: %d", obs.Sequence)
+		}
+		seqMap[obs.Sequence] = true
+	}
+
+	log.Close()
+}
+
+func TestSequencePersistenceAcrossRestarts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	// First session: create log, record, truncate, compact
+	log1, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		log1.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+	log1.Truncate(91)
+	log1.Compact()
+
+	seqAfterCompact := log1.CurrentSequence()
+	if seqAfterCompact != 10 {
+		t.Errorf("expected sequence 10 after compact, got %d", seqAfterCompact)
+	}
+
+	log1.Close()
+
+	// Second session: reopen and verify sequence persisted
+	log2, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to reopen log: %v", err)
+	}
+
+	if log2.CurrentSequence() != 10 {
+		t.Errorf("expected sequence 10 after reopen, got %d", log2.CurrentSequence())
+	}
+
+	// Record more and verify no conflicts
+	for i := 0; i < 5; i++ {
+		log2.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+
+	if log2.CurrentSequence() != 15 {
+		t.Errorf("expected sequence 15, got %d", log2.CurrentSequence())
+	}
+
+	observations, _ := log2.GetObservations()
+	if len(observations) != 15 {
+		t.Errorf("expected 15 observations, got %d", len(observations))
+	}
+
+	// Verify sequences are unique and sequential
+	for i, obs := range observations {
+		expectedSeq := uint64(i + 1)
+		if obs.Sequence != expectedSeq {
+			t.Errorf("observation %d has sequence %d, expected %d", i, obs.Sequence, expectedSeq)
+		}
+	}
+
+	log2.Close()
+}
+
+func TestSequenceResetMultipleCompacts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Multiple rounds of record -> truncate -> compact
+	for round := 0; round < 3; round++ {
+		// Record 50 observations
+		for i := 0; i < 50; i++ {
+			log.Record(context.Background(), &EpisodeObservation{
+				TaskCompleted: true,
+				FollowUpCount: round*100 + i,
+			})
+		}
+
+		// Keep only last 10
+		currentSeq := log.CurrentSequence()
+		log.Truncate(currentSeq - 9)
+		log.Compact()
+
+		// After each compact, sequence should be 10
+		if log.CurrentSequence() != 10 {
+			t.Errorf("round %d: expected sequence 10, got %d", round, log.CurrentSequence())
+		}
+	}
+
+	// Verify final state
+	observations, _ := log.GetObservations()
+	if len(observations) != 10 {
+		t.Errorf("expected 10 observations, got %d", len(observations))
+	}
+
+	// Verify sequences are 1-10
+	for i, obs := range observations {
+		if obs.Sequence != uint64(i+1) {
+			t.Errorf("expected sequence %d, got %d", i+1, obs.Sequence)
+		}
+	}
+}
+
+func TestTruncateSequenceResetAfterCompact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "obs.wal")
+
+	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
+		Path: path,
+	})
+	if err != nil {
+		t.Fatalf("failed to create log: %v", err)
+	}
+	defer log.Close()
+
+	// Record and truncate
+	for i := 0; i < 100; i++ {
+		log.Record(context.Background(), &EpisodeObservation{TaskCompleted: true})
+	}
+	log.Truncate(91)
+
+	// TruncateSequence should be 91 before compact
+	if log.TruncateSequence() != 91 {
+		t.Errorf("expected truncate sequence 91, got %d", log.TruncateSequence())
+	}
+
+	// After compact, truncate sequence should be reset to 0
+	// since observations are renumbered
+	log.Compact()
+
+	if log.TruncateSequence() != 0 {
+		t.Errorf("expected truncate sequence 0 after compact, got %d", log.TruncateSequence())
 	}
 }
