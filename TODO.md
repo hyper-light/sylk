@@ -37456,28 +37456,31 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   SEVERITY: HIGH - Goroutine leak                                               ││
 │ │   RESOLUTION: Unified with W12.40 fix using single waiter goroutine             ││
 │ │                                                                                  ││
-│ │ [ ] W12.42 - Scheduler DAG Slot Leak                                            ││
+│ │ [x] W12.42 - Scheduler DAG Slot Leak                                            ││
 │ │   FILE: core/dag/scheduler.go:110                                               ││
 │ │   ISSUE: DAG slot not released if scope.Go() returns error                      ││
 │ │   FIX: Release slot in error path                                               ││
 │ │   SEVERITY: HIGH - Resource leak                                                ││
+│ │   RESOLUTION: Fixed - slot released and execution unregistered on scope.Go err  ││
 │ │                                                                                  ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 2B - LLM INTEGRATION (5 HIGH)                                             ││
 │ │                                                                                  ││
-│ │ [ ] W12.43 - StreamWatchdog Untracked Goroutine                                 ││
+│ │ [x] W12.43 - StreamWatchdog Untracked Goroutine                                 ││
 │ │   FILE: core/providers/stream_watchdog.go:99-120                                ││
 │ │   ISSUE: Watch goroutine not tracked with GoroutineScope                        ││
 │ │   FIX: Use GoroutineScope for watchdog goroutine                                ││
 │ │   SEVERITY: HIGH - Goroutine leak                                               ││
+│ │   RESOLUTION: Added optional Scope to config, watchdog uses scope.Go() when set ││
 │ │                                                                                  ││
-│ │ [ ] W12.44 - StreamWatchdog Race in ReportChunk                                 ││
+│ │ [x] W12.44 - StreamWatchdog Race in ReportChunk                                 ││
 │ │   FILE: core/providers/stream_watchdog.go:212-225                               ││
 │ │   ISSUE: lastChunkTime updated without synchronization                          ││
 │ │   FIX: Use atomic.Value for time tracking                                       ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
+│ │   RESOLUTION: Changed lastChunkAt/chunksReceived to atomic types for lock-free  ││
 │ │                                                                                  ││
 │ │ [ ] W12.45 - StreamBridge Missing Error Recovery                                ││
 │ │   FILE: core/providers/stream_bridge.go:167-198                                 ││
