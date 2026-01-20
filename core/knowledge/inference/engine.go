@@ -3,6 +3,7 @@ package inference
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -207,7 +208,7 @@ func (e *InferenceEngine) RunInference(ctx context.Context) error {
 	// Run forward chaining using the active forward chainer (standard or semi-naive)
 	fc := e.getActiveForwardChainer()
 	results, err := fc.Evaluate(ctx, rules, edges)
-	if err != nil && err != ErrMaxIterationsReached {
+	if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 		return fmt.Errorf("forward chaining: %w", err)
 	}
 
@@ -260,7 +261,7 @@ func (e *InferenceEngine) OnEdgeAdded(ctx context.Context, edge Edge) error {
 	// Run forward chaining with relevant rules only using the active forward chainer
 	fc := e.getActiveForwardChainer()
 	results, err := fc.Evaluate(ctx, relevantRules, edges)
-	if err != nil && err != ErrMaxIterationsReached {
+	if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 		return fmt.Errorf("forward chaining: %w", err)
 	}
 
@@ -375,7 +376,7 @@ func (e *InferenceEngine) OnEdgeModified(ctx context.Context, oldEdge, newEdge E
 
 		fc := e.getActiveForwardChainer()
 		results, err := fc.Evaluate(ctx, relevantRules, edges)
-		if err != nil && err != ErrMaxIterationsReached {
+		if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 			return fmt.Errorf("forward chaining: %w", err)
 		}
 
@@ -452,7 +453,7 @@ func (e *InferenceEngine) rematerializeWithRules(ctx context.Context, ruleIDs []
 	// Run forward chaining with affected rules using the active forward chainer
 	fc := e.getActiveForwardChainer()
 	results, err := fc.Evaluate(ctx, rules, edges)
-	if err != nil && err != ErrMaxIterationsReached {
+	if err != nil && !errors.Is(err, ErrMaxIterationsReached) {
 		return fmt.Errorf("forward chaining: %w", err)
 	}
 

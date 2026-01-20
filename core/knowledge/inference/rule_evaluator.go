@@ -55,7 +55,62 @@ func (re *RuleEvaluator) EvaluateRule(ctx context.Context, rule InferenceRule, e
 	re.clearCache()
 
 	// Build edge index for efficient lookups (PF.4.8)
+	// W4P.13: This path is used for standalone evaluation; for batch evaluation
+	// via ForwardChainer, use EvaluateRuleWithIndex to share a cached index.
 	re.edgeIndex = re.buildEdgeIndex(edges)
+
+	// Find all valid bindings for the rule body
+	bindings := re.findBindings(ctx, rule.Body, edges)
+
+	var results []InferenceResult
+	for _, binding := range bindings {
+		select {
+		case <-ctx.Done():
+			return results
+		default:
+		}
+
+		// Apply bindings to the rule head to derive a new edge
+		derivedEdge := re.applyBindings(rule.Head, binding.variables)
+
+		// Collect evidence edges that supported this inference
+		evidence := make([]EvidenceEdge, len(binding.matchedEdges))
+		for i, e := range binding.matchedEdges {
+			evidence[i] = e.ToEvidenceEdge()
+		}
+
+		// Create the inference result
+		result := NewInferenceResult(
+			derivedEdge.ToDerivedEdge(),
+			rule.ID,
+			evidence,
+			1.0, // Default confidence for deterministic inference
+		)
+		result.GenerateProvenance(rule.Name)
+
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// EvaluateRuleWithIndex evaluates a rule using a pre-built edge index.
+// W4P.13: This method enables index reuse across multiple rule evaluations,
+// avoiding the O(n) index build cost on every evaluation.
+//
+// The caller is responsible for ensuring the index is valid for the given edges.
+// Use this method when evaluating multiple rules against the same edge set.
+func (re *RuleEvaluator) EvaluateRuleWithIndex(
+	ctx context.Context,
+	rule InferenceRule,
+	edges []Edge,
+	index *EdgeIndex,
+) []InferenceResult {
+	// Clear memoization cache for this evaluation session (PF.4.7)
+	re.clearCache()
+
+	// Use the provided index (W4P.13)
+	re.edgeIndex = index
 
 	// Find all valid bindings for the rule body
 	bindings := re.findBindings(ctx, rule.Body, edges)
