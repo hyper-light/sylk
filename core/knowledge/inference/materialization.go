@@ -5,9 +5,46 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
+
+// =============================================================================
+// Retry Configuration and Dead-Letter Queue (W4P.20)
+// =============================================================================
+
+// RetryConfig holds settings for materialization retry behavior.
+type RetryConfig struct {
+	MaxRetries      int           // Maximum number of retry attempts (default 3)
+	InitialBackoff  time.Duration // Initial backoff duration (default 100ms)
+	MaxBackoff      time.Duration // Maximum backoff duration (default 5s)
+	BackoffMultiple float64       // Multiplier for exponential backoff (default 2.0)
+}
+
+// DefaultRetryConfig returns the default retry configuration.
+func DefaultRetryConfig() RetryConfig {
+	return RetryConfig{
+		MaxRetries:      3,
+		InitialBackoff:  100 * time.Millisecond,
+		MaxBackoff:      5 * time.Second,
+		BackoffMultiple: 2.0,
+	}
+}
+
+// FailedEdge represents an edge that failed materialization after all retries.
+type FailedEdge struct {
+	EdgeKey   string    `json:"edge_key"`
+	RuleID    string    `json:"rule_id"`
+	Error     string    `json:"error"`
+	Attempts  int       `json:"attempts"`
+	FailedAt  time.Time `json:"failed_at"`
+	Prepared  preparedResult
+}
+
+// FailureCallback is called when materialization fails.
+// Can be used for metrics, alerting, or custom logging.
+type FailureCallback func(edge FailedEdge)
 
 // =============================================================================
 // MaterializedEdgeRecord (IE.4.1)
@@ -33,15 +70,67 @@ type MaterializedEdgeRecord struct {
 // Uses a write-only mutex to serialize write operations while allowing
 // concurrent reads. Data preparation is done outside the lock to minimize
 // contention during I/O operations.
+//
+// W4P.20: Added retry with exponential backoff for failed materializations.
+// Failed edges are logged and queued for later retry or manual intervention.
 type MaterializationManager struct {
-	db      *sql.DB
-	writeMu sync.Mutex // Protects write operations only
+	db              *sql.DB
+	writeMu         sync.Mutex // Protects write operations only
+	retryConfig     RetryConfig
+	deadLetterMu    sync.Mutex
+	deadLetterQueue []FailedEdge
+	onFailure       FailureCallback
 }
 
 // NewMaterializationManager creates a new MaterializationManager with the given database.
 func NewMaterializationManager(db *sql.DB) *MaterializationManager {
 	return &MaterializationManager{
-		db: db,
+		db:              db,
+		retryConfig:     DefaultRetryConfig(),
+		deadLetterQueue: make([]FailedEdge, 0),
+	}
+}
+
+// SetRetryConfig sets the retry configuration for materialization.
+func (m *MaterializationManager) SetRetryConfig(config RetryConfig) {
+	m.retryConfig = config
+}
+
+// SetFailureCallback sets a callback function for failed materializations.
+func (m *MaterializationManager) SetFailureCallback(cb FailureCallback) {
+	m.onFailure = cb
+}
+
+// GetDeadLetterQueue returns a copy of the dead-letter queue.
+// Failed edges remain in the queue until cleared.
+func (m *MaterializationManager) GetDeadLetterQueue() []FailedEdge {
+	m.deadLetterMu.Lock()
+	defer m.deadLetterMu.Unlock()
+	result := make([]FailedEdge, len(m.deadLetterQueue))
+	copy(result, m.deadLetterQueue)
+	return result
+}
+
+// ClearDeadLetterQueue removes all edges from the dead-letter queue.
+func (m *MaterializationManager) ClearDeadLetterQueue() {
+	m.deadLetterMu.Lock()
+	defer m.deadLetterMu.Unlock()
+	m.deadLetterQueue = make([]FailedEdge, 0)
+}
+
+// addToDeadLetter adds a failed edge to the dead-letter queue.
+func (m *MaterializationManager) addToDeadLetter(failed FailedEdge) {
+	m.deadLetterMu.Lock()
+	m.deadLetterQueue = append(m.deadLetterQueue, failed)
+	m.deadLetterMu.Unlock()
+
+	// Log the failure for visibility
+	log.Printf("[WARN] materialization failed after %d attempts: edge=%s rule=%s error=%s",
+		failed.Attempts, failed.EdgeKey, failed.RuleID, failed.Error)
+
+	// Notify callback if set
+	if m.onFailure != nil {
+		m.onFailure(failed)
 	}
 }
 
@@ -105,7 +194,32 @@ func (m *MaterializationManager) prepareOneResult(result InferenceResult) (prepa
 
 // executeMaterialize runs the database transaction with prepared data.
 // Lock is acquired only for the write transaction, not during data preparation.
+// W4P.20: Uses retry with exponential backoff for transient failures.
 func (m *MaterializationManager) executeMaterialize(ctx context.Context, prepared []preparedResult) error {
+	var lastErr error
+	backoff := m.retryConfig.InitialBackoff
+
+	for attempt := 0; attempt <= m.retryConfig.MaxRetries; attempt++ {
+		if attempt > 0 {
+			if err := m.waitBackoff(ctx, backoff); err != nil {
+				return err // Context cancelled
+			}
+			backoff = m.nextBackoff(backoff)
+		}
+
+		lastErr = m.tryMaterialize(ctx, prepared)
+		if lastErr == nil {
+			return nil
+		}
+	}
+
+	// All retries exhausted - queue failed edges for manual intervention
+	m.queueFailedEdges(prepared, lastErr)
+	return lastErr
+}
+
+// tryMaterialize attempts to insert all prepared edges in a transaction.
+func (m *MaterializationManager) tryMaterialize(ctx context.Context, prepared []preparedResult) error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 
@@ -122,6 +236,41 @@ func (m *MaterializationManager) executeMaterialize(ctx context.Context, prepare
 	}
 
 	return tx.Commit()
+}
+
+// waitBackoff waits for the backoff duration or until context is cancelled.
+func (m *MaterializationManager) waitBackoff(ctx context.Context, backoff time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(backoff):
+		return nil
+	}
+}
+
+// nextBackoff calculates the next backoff duration with exponential increase.
+func (m *MaterializationManager) nextBackoff(current time.Duration) time.Duration {
+	next := time.Duration(float64(current) * m.retryConfig.BackoffMultiple)
+	if next > m.retryConfig.MaxBackoff {
+		return m.retryConfig.MaxBackoff
+	}
+	return next
+}
+
+// queueFailedEdges adds all prepared edges to the dead-letter queue.
+func (m *MaterializationManager) queueFailedEdges(prepared []preparedResult, err error) {
+	now := time.Now()
+	for _, pr := range prepared {
+		failed := FailedEdge{
+			EdgeKey:  pr.edgeKey,
+			RuleID:   pr.ruleID,
+			Error:    err.Error(),
+			Attempts: m.retryConfig.MaxRetries + 1,
+			FailedAt: now,
+			Prepared: pr,
+		}
+		m.addToDeadLetter(failed)
+	}
 }
 
 // insertPrepared inserts a single prepared result, skipping duplicates.

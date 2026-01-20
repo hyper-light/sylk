@@ -18,10 +18,26 @@ import (
 // materialized_edges table including the extended columns.
 func setupMaterializationTestDB(t *testing.T) *sql.DB {
 	t.Helper()
+	return setupMaterializationTestDBWithFK(t, false)
+}
+
+// setupMaterializationTestDBWithFK creates an in-memory SQLite database with
+// optional foreign key enforcement enabled.
+func setupMaterializationTestDBWithFK(t *testing.T, enforceForeignKeys bool) *sql.DB {
+	t.Helper()
 	// Use shared cache mode for in-memory database to support concurrent access
 	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
 	if err != nil {
 		t.Fatalf("failed to open test database: %v", err)
+	}
+
+	// Enable foreign keys if requested
+	if enforceForeignKeys {
+		_, err = db.Exec("PRAGMA foreign_keys = ON")
+		if err != nil {
+			db.Close()
+			t.Fatalf("failed to enable foreign keys: %v", err)
+		}
 	}
 
 	// Create inference_rules table (required for foreign key)
@@ -1092,4 +1108,452 @@ func TestMaterializationManager_ConcurrentDeleteAndRead(t *testing.T) {
 	if len(edges2) != 10 {
 		t.Errorf("expected 10 rule2 edges, got %d", len(edges2))
 	}
+}
+
+// =============================================================================
+// W4P.20 Retry and Dead-Letter Queue Tests
+// =============================================================================
+
+func TestDefaultRetryConfig(t *testing.T) {
+	config := DefaultRetryConfig()
+
+	if config.MaxRetries != 3 {
+		t.Errorf("expected MaxRetries 3, got %d", config.MaxRetries)
+	}
+	if config.InitialBackoff != 100*time.Millisecond {
+		t.Errorf("expected InitialBackoff 100ms, got %v", config.InitialBackoff)
+	}
+	if config.MaxBackoff != 5*time.Second {
+		t.Errorf("expected MaxBackoff 5s, got %v", config.MaxBackoff)
+	}
+	if config.BackoffMultiple != 2.0 {
+		t.Errorf("expected BackoffMultiple 2.0, got %f", config.BackoffMultiple)
+	}
+}
+
+func TestMaterializationManager_SetRetryConfig(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+
+	config := RetryConfig{
+		MaxRetries:      5,
+		InitialBackoff:  50 * time.Millisecond,
+		MaxBackoff:      10 * time.Second,
+		BackoffMultiple: 3.0,
+	}
+	manager.SetRetryConfig(config)
+
+	if manager.retryConfig.MaxRetries != 5 {
+		t.Errorf("expected MaxRetries 5, got %d", manager.retryConfig.MaxRetries)
+	}
+}
+
+func TestMaterializationManager_SuccessfulMaterialization(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Configure fast retry for tests
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      3,
+		InitialBackoff:  1 * time.Millisecond,
+		MaxBackoff:      10 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	insertTestRule(t, db, "rule1")
+
+	result := createTestInferenceResult("rule1", "A", "calls", "B", "ev1")
+	err := manager.Materialize(ctx, []InferenceResult{result})
+	if err != nil {
+		t.Fatalf("Materialize failed: %v", err)
+	}
+
+	// Verify edge was stored
+	exists, err := manager.IsMaterialized(ctx, "A|calls|B")
+	if err != nil {
+		t.Fatalf("IsMaterialized failed: %v", err)
+	}
+	if !exists {
+		t.Error("edge should exist after successful materialization")
+	}
+
+	// Verify dead-letter queue is empty
+	dlq := manager.GetDeadLetterQueue()
+	if len(dlq) != 0 {
+		t.Errorf("expected empty dead-letter queue, got %d entries", len(dlq))
+	}
+}
+
+func TestMaterializationManager_FailureCallback(t *testing.T) {
+	// Use foreign key enforcement to trigger failures
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Configure fast retry for tests
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      2,
+		InitialBackoff:  1 * time.Millisecond,
+		MaxBackoff:      5 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	// Track callback invocations
+	var callbackMu sync.Mutex
+	callbackCalls := make([]FailedEdge, 0)
+	manager.SetFailureCallback(func(edge FailedEdge) {
+		callbackMu.Lock()
+		callbackCalls = append(callbackCalls, edge)
+		callbackMu.Unlock()
+	})
+
+	// Don't insert the rule, so the foreign key constraint will fail
+	// This simulates a database error
+
+	result := createTestInferenceResult("nonexistent_rule", "A", "calls", "B", "ev1")
+	err := manager.Materialize(ctx, []InferenceResult{result})
+
+	// Should fail due to foreign key constraint
+	if err == nil {
+		t.Fatal("expected error from missing rule foreign key")
+	}
+
+	// Verify callback was called for the failed edge
+	callbackMu.Lock()
+	numCalls := len(callbackCalls)
+	callbackMu.Unlock()
+
+	if numCalls != 1 {
+		t.Errorf("expected 1 callback call, got %d", numCalls)
+	}
+
+	// Verify dead-letter queue has the failed edge
+	dlq := manager.GetDeadLetterQueue()
+	if len(dlq) != 1 {
+		t.Fatalf("expected 1 entry in dead-letter queue, got %d", len(dlq))
+	}
+	if dlq[0].EdgeKey != "A|calls|B" {
+		t.Errorf("expected edge key A|calls|B, got %s", dlq[0].EdgeKey)
+	}
+	if dlq[0].RuleID != "nonexistent_rule" {
+		t.Errorf("expected rule_id nonexistent_rule, got %s", dlq[0].RuleID)
+	}
+	if dlq[0].Attempts != 3 { // MaxRetries + 1
+		t.Errorf("expected 3 attempts, got %d", dlq[0].Attempts)
+	}
+}
+
+func TestMaterializationManager_DeadLetterQueue(t *testing.T) {
+	// Use foreign key enforcement to trigger failures
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Configure fast retry for tests
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      1,
+		InitialBackoff:  1 * time.Millisecond,
+		MaxBackoff:      5 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	// Attempt to materialize with missing rule (will fail due to FK constraint)
+	result := createTestInferenceResult("missing_rule", "X", "calls", "Y", "ev1")
+	_ = manager.Materialize(ctx, []InferenceResult{result})
+
+	// Verify dead-letter queue contains the failed edge
+	dlq := manager.GetDeadLetterQueue()
+	if len(dlq) != 1 {
+		t.Fatalf("expected 1 entry in dead-letter queue, got %d", len(dlq))
+	}
+
+	failed := dlq[0]
+	if failed.EdgeKey != "X|calls|Y" {
+		t.Errorf("expected edge key X|calls|Y, got %s", failed.EdgeKey)
+	}
+	if failed.RuleID != "missing_rule" {
+		t.Errorf("expected rule_id missing_rule, got %s", failed.RuleID)
+	}
+	if failed.Error == "" {
+		t.Error("expected error message, got empty string")
+	}
+	if failed.FailedAt.IsZero() {
+		t.Error("expected FailedAt to be set")
+	}
+	if failed.Attempts != 2 { // MaxRetries + 1
+		t.Errorf("expected 2 attempts, got %d", failed.Attempts)
+	}
+
+	// Test clearing the dead-letter queue
+	manager.ClearDeadLetterQueue()
+	dlq = manager.GetDeadLetterQueue()
+	if len(dlq) != 0 {
+		t.Errorf("expected empty dead-letter queue after clear, got %d entries", len(dlq))
+	}
+}
+
+func TestMaterializationManager_RetryExhausted(t *testing.T) {
+	// Use foreign key enforcement to trigger failures
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Configure for 3 retries with fast backoff
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      3,
+		InitialBackoff:  1 * time.Millisecond,
+		MaxBackoff:      5 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	// Track callback invocations
+	callbackCount := 0
+	manager.SetFailureCallback(func(edge FailedEdge) {
+		callbackCount++
+	})
+
+	// Attempt to materialize with missing rule (will exhaust retries due to FK constraint)
+	result := createTestInferenceResult("missing_rule", "A", "calls", "B", "ev1")
+	err := manager.Materialize(ctx, []InferenceResult{result})
+
+	if err == nil {
+		t.Fatal("expected error after retries exhausted")
+	}
+
+	// Verify attempts count in dead-letter queue
+	dlq := manager.GetDeadLetterQueue()
+	if len(dlq) != 1 {
+		t.Fatalf("expected 1 entry in dead-letter queue, got %d", len(dlq))
+	}
+	if dlq[0].Attempts != 4 { // MaxRetries + 1 = 4 total attempts
+		t.Errorf("expected 4 attempts, got %d", dlq[0].Attempts)
+	}
+
+	// Verify callback was called exactly once (per failed edge)
+	if callbackCount != 1 {
+		t.Errorf("expected 1 callback call, got %d", callbackCount)
+	}
+}
+
+func TestMaterializationManager_ExponentialBackoff(t *testing.T) {
+	db := setupMaterializationTestDB(t)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+
+	// Test nextBackoff calculation
+	config := RetryConfig{
+		InitialBackoff:  100 * time.Millisecond,
+		MaxBackoff:      500 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	}
+	manager.SetRetryConfig(config)
+
+	// First backoff: 100ms * 2 = 200ms
+	next := manager.nextBackoff(100 * time.Millisecond)
+	if next != 200*time.Millisecond {
+		t.Errorf("expected 200ms, got %v", next)
+	}
+
+	// Second backoff: 200ms * 2 = 400ms
+	next = manager.nextBackoff(200 * time.Millisecond)
+	if next != 400*time.Millisecond {
+		t.Errorf("expected 400ms, got %v", next)
+	}
+
+	// Third backoff: 400ms * 2 = 800ms, but capped at 500ms
+	next = manager.nextBackoff(400 * time.Millisecond)
+	if next != 500*time.Millisecond {
+		t.Errorf("expected 500ms (capped), got %v", next)
+	}
+
+	// Already at max: stays at 500ms
+	next = manager.nextBackoff(500 * time.Millisecond)
+	if next != 500*time.Millisecond {
+		t.Errorf("expected 500ms (at max), got %v", next)
+	}
+}
+
+func TestMaterializationManager_BackoffTiming(t *testing.T) {
+	// Use foreign key enforcement to trigger failures and force retries
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Configure specific backoff timing
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      2,
+		InitialBackoff:  50 * time.Millisecond,
+		MaxBackoff:      200 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	// Record timing of materialization attempts
+	start := time.Now()
+	result := createTestInferenceResult("missing_rule", "A", "calls", "B", "ev1")
+	_ = manager.Materialize(ctx, []InferenceResult{result})
+	elapsed := time.Since(start)
+
+	// With 2 retries:
+	// - Attempt 0: immediate
+	// - Attempt 1: 50ms backoff
+	// - Attempt 2: 100ms backoff
+	// Total expected delay: ~150ms (plus execution time)
+	// We allow some tolerance for execution overhead
+	minExpected := 140 * time.Millisecond
+	maxExpected := 500 * time.Millisecond
+
+	if elapsed < minExpected {
+		t.Errorf("elapsed time %v is less than minimum expected %v", elapsed, minExpected)
+	}
+	if elapsed > maxExpected {
+		t.Errorf("elapsed time %v is greater than maximum expected %v", elapsed, maxExpected)
+	}
+}
+
+func TestMaterializationManager_ContextCancelledDuringBackoff(t *testing.T) {
+	// Use foreign key enforcement to trigger failures and force retries
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+
+	// Configure long backoff to ensure context cancellation happens during backoff
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      5,
+		InitialBackoff:  500 * time.Millisecond,
+		MaxBackoff:      2 * time.Second,
+		BackoffMultiple: 2.0,
+	})
+
+	// Create a context that will be cancelled quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Don't insert the rule to force a retry due to FK constraint
+	result := createTestInferenceResult("missing_rule", "A", "calls", "B", "ev1")
+	err := manager.Materialize(ctx, []InferenceResult{result})
+
+	// Should fail with context error, not retry exhaustion
+	if err == nil {
+		t.Fatal("expected error from context cancellation")
+	}
+	if err != context.DeadlineExceeded && err != context.Canceled {
+		// The error might be wrapped, check the underlying cause
+		if ctx.Err() == nil {
+			t.Logf("got error (non-context): %v", err)
+		}
+	}
+
+	// Dead-letter queue should be empty since we didn't exhaust retries
+	dlq := manager.GetDeadLetterQueue()
+	if len(dlq) != 0 {
+		t.Errorf("expected empty dead-letter queue after context cancel, got %d entries", len(dlq))
+	}
+}
+
+func TestMaterializationManager_MultipleEdgesPartialFailure(t *testing.T) {
+	// Use foreign key enforcement to trigger failures
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Configure fast retry
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      1,
+		InitialBackoff:  1 * time.Millisecond,
+		MaxBackoff:      5 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	// Try to materialize edges with missing rule (FK constraint will fail)
+	// All edges in the batch will fail together
+	results := []InferenceResult{
+		createTestInferenceResult("missing_rule", "A", "calls", "B", "ev1"),
+		createTestInferenceResult("missing_rule", "C", "calls", "D", "ev2"),
+		createTestInferenceResult("missing_rule", "E", "calls", "F", "ev3"),
+	}
+
+	err := manager.Materialize(ctx, results)
+	if err == nil {
+		t.Fatal("expected error from missing rule")
+	}
+
+	// All edges should be in dead-letter queue
+	dlq := manager.GetDeadLetterQueue()
+	if len(dlq) != 3 {
+		t.Fatalf("expected 3 entries in dead-letter queue, got %d", len(dlq))
+	}
+
+	// Verify all edges are captured
+	edgeKeys := make(map[string]bool)
+	for _, failed := range dlq {
+		edgeKeys[failed.EdgeKey] = true
+	}
+	for _, expectedKey := range []string{"A|calls|B", "C|calls|D", "E|calls|F"} {
+		if !edgeKeys[expectedKey] {
+			t.Errorf("expected edge %s in dead-letter queue", expectedKey)
+		}
+	}
+}
+
+func TestMaterializationManager_ConcurrentDeadLetterAccess(t *testing.T) {
+	// Use foreign key enforcement to trigger failures
+	db := setupMaterializationTestDBWithFK(t, true)
+	defer db.Close()
+	manager := NewMaterializationManager(db)
+	ctx := context.Background()
+
+	// Configure fast retry
+	manager.SetRetryConfig(RetryConfig{
+		MaxRetries:      1,
+		InitialBackoff:  1 * time.Millisecond,
+		MaxBackoff:      5 * time.Millisecond,
+		BackoffMultiple: 2.0,
+	})
+
+	// Run concurrent operations that add to dead-letter queue
+	var wg sync.WaitGroup
+	numGoroutines := 10
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			result := createTestInferenceResult("missing_rule", "Node"+string(rune('A'+idx)), "calls", "Node"+string(rune('B'+idx)), "ev")
+			_ = manager.Materialize(ctx, []InferenceResult{result})
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify all failures are captured (no race conditions)
+	dlq := manager.GetDeadLetterQueue()
+	if len(dlq) != numGoroutines {
+		t.Errorf("expected %d entries in dead-letter queue, got %d", numGoroutines, len(dlq))
+	}
+
+	// Test concurrent clearing and reading
+	var wg2 sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg2.Add(2)
+		go func() {
+			defer wg2.Done()
+			_ = manager.GetDeadLetterQueue()
+		}()
+		go func() {
+			defer wg2.Done()
+			manager.ClearDeadLetterQueue()
+		}()
+	}
+	wg2.Wait()
+
+	// Should not panic due to race conditions
 }
