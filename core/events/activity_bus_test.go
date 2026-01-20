@@ -724,3 +724,198 @@ func TestActivityEventBus_ConcurrentStartIdempotent(t *testing.T) {
 		t.Fatal("Close() deadlocked - concurrent Start() calls spawned multiple goroutines")
 	}
 }
+
+// =============================================================================
+// W3C.2 TOCTOU Race Condition Tests
+// =============================================================================
+
+// TestActivityEventBus_PublishHappyPath tests the normal publish operation.
+func TestActivityEventBus_PublishHappyPath(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	sub := &mockSubscriber{
+		id:         "happy-path-sub",
+		eventTypes: []EventType{EventTypeAgentAction},
+	}
+	bus.Subscribe(sub)
+
+	// Publish multiple unique events
+	for i := 0; i < 5; i++ {
+		event := NewActivityEvent(EventTypeAgentAction, "session-"+string(rune('A'+i)), "action")
+		event.AgentID = "agent-" + string(rune('A'+i))
+		bus.Publish(event)
+	}
+
+	// Wait for event delivery
+	time.Sleep(200 * time.Millisecond)
+
+	events := sub.getEvents()
+	if len(events) != 5 {
+		t.Errorf("Expected 5 events, got %d", len(events))
+	}
+}
+
+// TestActivityEventBus_ConcurrentPublishClose tests the TOCTOU fix by
+// concurrently publishing events while closing the bus.
+// This should NOT panic with "send on closed channel".
+func TestActivityEventBus_ConcurrentPublishClose(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		bus := NewActivityEventBus(100)
+		bus.Start()
+
+		var wg sync.WaitGroup
+		publishers := 10
+
+		// Start publishers
+		for i := 0; i < publishers; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < 100; j++ {
+					event := NewActivityEvent(EventTypeAgentAction, "session", "action")
+					event.AgentID = "agent"
+					bus.Publish(event)
+				}
+			}(i)
+		}
+
+		// Close the bus while publishers are running
+		// This timing races with the publishers
+		go func() {
+			time.Sleep(time.Microsecond * time.Duration(iteration%10))
+			bus.Close()
+		}()
+
+		wg.Wait()
+	}
+	// If we reach here without panic, the test passes
+}
+
+// TestActivityEventBus_ConcurrentPublishCloseStress is a stress test for the
+// TOCTOU race condition fix. It runs many iterations to catch race conditions.
+func TestActivityEventBus_ConcurrentPublishCloseStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
+
+	for iteration := 0; iteration < 1000; iteration++ {
+		bus := NewActivityEventBus(10) // Small buffer to increase contention
+		bus.Start()
+
+		var wg sync.WaitGroup
+
+		// Start many publishers
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					event := NewActivityEvent(EventTypeAgentAction, "s", "a")
+					bus.Publish(event)
+				}
+			}()
+		}
+
+		// Close immediately to maximize race window
+		bus.Close()
+		wg.Wait()
+	}
+}
+
+// TestActivityEventBus_BufferFullScenario tests that the bus handles
+// a full buffer correctly by dropping events without blocking.
+func TestActivityEventBus_BufferFullScenario(t *testing.T) {
+	bus := NewActivityEventBus(5) // Small buffer
+	// Do NOT start dispatch - buffer will fill and stay full
+	defer bus.Close()
+
+	// Publish more events than buffer can hold
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		event := NewActivityEvent(EventTypeAgentAction, "session-"+string(rune('A'+i%26)), "action")
+		event.AgentID = "agent-" + string(rune('A'+i%26))
+		bus.Publish(event)
+	}
+	elapsed := time.Since(start)
+
+	// Should complete quickly (non-blocking) - allow generous timeout
+	if elapsed > 1*time.Second {
+		t.Errorf("Publish took too long (%v), should be non-blocking", elapsed)
+	}
+
+	// Verify buffer has some events (it should be full with 5)
+	if len(bus.buffer) == 0 {
+		t.Error("Buffer should have some events")
+	}
+}
+
+// TestActivityEventBus_BufferFullWithDispatcher tests buffer full scenario
+// when the dispatcher is running but slow subscribers cause backpressure.
+func TestActivityEventBus_BufferFullWithDispatcher(t *testing.T) {
+	bus := NewActivityEventBus(2) // Very small buffer
+	bus.Start()
+	defer bus.Close()
+
+	// Create a slow subscriber that blocks
+	slowSub := &slowSubscriber{
+		id:       "slow-sub",
+		delay:    50 * time.Millisecond,
+		received: make([]*ActivityEvent, 0),
+	}
+	bus.Subscribe(slowSub)
+
+	// Rapidly publish events - should not block even with slow subscriber
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		event := NewActivityEvent(EventTypeAgentAction, "s"+string(rune('A'+i%26)), "action")
+		event.AgentID = "a" + string(rune('A'+i%26))
+		bus.Publish(event)
+	}
+	elapsed := time.Since(start)
+
+	// Should complete quickly - publishers should not block
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Publish took too long (%v), should be non-blocking", elapsed)
+	}
+
+	// Wait for some events to be delivered
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify some events were received (not all - some dropped)
+	received := slowSub.getReceived()
+	if len(received) == 0 {
+		t.Error("Should have received some events")
+	}
+}
+
+// slowSubscriber is a test subscriber that introduces delay.
+type slowSubscriber struct {
+	id       string
+	delay    time.Duration
+	received []*ActivityEvent
+	mu       sync.Mutex
+}
+
+func (s *slowSubscriber) ID() string {
+	return s.id
+}
+
+func (s *slowSubscriber) EventTypes() []EventType {
+	return []EventType{} // Wildcard
+}
+
+func (s *slowSubscriber) OnEvent(event *ActivityEvent) error {
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	s.received = append(s.received, event)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *slowSubscriber) getReceived() []*ActivityEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*ActivityEvent{}, s.received...)
+}
