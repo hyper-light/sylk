@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,14 @@ const DefaultWriteQueueSize = 1000
 
 // DefaultSyncInterval is the default interval for syncing the WAL to disk.
 const DefaultSyncInterval = 100 * time.Millisecond
+
+// DefaultSyncFailureThreshold is the default number of consecutive sync failures
+// before triggering the health callback.
+const DefaultSyncFailureThreshold = 3
+
+// SyncHealthCallback is called when sync failures reach a threshold.
+// It receives the number of consecutive failures and the last error.
+type SyncHealthCallback func(consecutiveFailures int, lastError error)
 
 // =============================================================================
 // Logged Observation
@@ -103,6 +112,12 @@ type ObservationLog struct {
 	syncInterval    time.Duration
 	lastSync        time.Time
 
+	// Sync health tracking (W4N.7)
+	consecutiveSyncFailures int
+	syncFailureThreshold    int
+	syncHealthCallback      SyncHealthCallback
+	logger                  *slog.Logger
+
 	obsChannel     chan *EpisodeObservation
 	obsChannelOnce sync.Once
 	closed         atomic.Bool
@@ -117,12 +132,15 @@ type ObservationLog struct {
 
 // ObservationLogConfig holds configuration for the observation log.
 type ObservationLogConfig struct {
-	Path           string
-	BufferSize     int
-	WriteQueueSize int           // Size of async write queue (default: 1000)
-	SyncInterval   time.Duration // Interval between fsync calls (default: 100ms)
-	Adaptive       *AdaptiveState
-	Scope          *concurrency.GoroutineScope
+	Path                 string
+	BufferSize           int
+	WriteQueueSize       int                // Size of async write queue (default: 1000)
+	SyncInterval         time.Duration      // Interval between fsync calls (default: 100ms)
+	SyncFailureThreshold int                // Consecutive failures before health callback (default: 3)
+	SyncHealthCallback   SyncHealthCallback // Optional callback for sync health issues
+	Logger               *slog.Logger       // Optional logger for sync errors
+	Adaptive             *AdaptiveState
+	Scope                *concurrency.GoroutineScope
 }
 
 // NewObservationLog creates a new observation log.
@@ -136,6 +154,9 @@ func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*Obser
 	if config.SyncInterval <= 0 {
 		config.SyncInterval = DefaultSyncInterval
 	}
+	if config.SyncFailureThreshold <= 0 {
+		config.SyncFailureThreshold = DefaultSyncFailureThreshold
+	}
 
 	file, err := openWALFile(config.Path)
 	if err != nil {
@@ -143,17 +164,20 @@ func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*Obser
 	}
 
 	log := &ObservationLog{
-		path:         config.Path,
-		file:         file,
-		writer:       bufio.NewWriter(file),
-		writeQueue:   make(chan *writeRequest, config.WriteQueueSize),
-		writeDone:    make(chan struct{}),
-		syncInterval: config.SyncInterval,
-		lastSync:     time.Now(),
-		obsChannel:   make(chan *EpisodeObservation, config.BufferSize),
-		closeDone:    make(chan struct{}),
-		adaptive:     config.Adaptive,
-		scope:        config.Scope,
+		path:                 config.Path,
+		file:                 file,
+		writer:               bufio.NewWriter(file),
+		writeQueue:           make(chan *writeRequest, config.WriteQueueSize),
+		writeDone:            make(chan struct{}),
+		syncInterval:         config.SyncInterval,
+		lastSync:             time.Now(),
+		syncFailureThreshold: config.SyncFailureThreshold,
+		syncHealthCallback:   config.SyncHealthCallback,
+		logger:               normalizeObsLogger(config.Logger),
+		obsChannel:           make(chan *EpisodeObservation, config.BufferSize),
+		closeDone:            make(chan struct{}),
+		adaptive:             config.Adaptive,
+		scope:                config.Scope,
 	}
 
 	if err := log.loadSequence(); err != nil {
@@ -313,13 +337,53 @@ func (l *ObservationLog) performWrite(data []byte) error {
 }
 
 // periodicSync syncs to disk if enough time has passed.
+// Logs errors and tracks consecutive failures for health monitoring.
 func (l *ObservationLog) periodicSync() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if time.Since(l.lastSync) >= l.syncInterval {
-		l.file.Sync()
-		l.lastSync = time.Now()
+	if time.Since(l.lastSync) < l.syncInterval {
+		return
+	}
+
+	l.performSyncLocked()
+}
+
+// performSyncLocked performs the actual sync and handles errors.
+// Must be called with l.mu held.
+func (l *ObservationLog) performSyncLocked() {
+	if l.file == nil {
+		return
+	}
+
+	err := l.file.Sync()
+	l.lastSync = time.Now()
+
+	if err == nil {
+		l.consecutiveSyncFailures = 0
+		return
+	}
+
+	l.handleSyncError(err)
+}
+
+// handleSyncError logs the error and triggers callback if threshold reached.
+// Must be called with l.mu held.
+func (l *ObservationLog) handleSyncError(err error) {
+	l.consecutiveSyncFailures++
+
+	l.logger.Error("WAL periodic sync failed",
+		slog.String("path", l.path),
+		slog.Int("consecutive_failures", l.consecutiveSyncFailures),
+		slog.String("error", err.Error()),
+	)
+
+	if l.syncHealthCallback == nil {
+		return
+	}
+
+	if l.consecutiveSyncFailures >= l.syncFailureThreshold {
+		l.syncHealthCallback(l.consecutiveSyncFailures, err)
 	}
 }
 
@@ -888,4 +952,27 @@ func (l *ObservationLog) ReadAt(sequence uint64) (*LoggedObservation, error) {
 	}
 
 	return nil, io.EOF
+}
+
+// =============================================================================
+// Sync Health Monitoring (W4N.7)
+// =============================================================================
+
+// ConsecutiveSyncFailures returns the current count of consecutive sync failures.
+func (l *ObservationLog) ConsecutiveSyncFailures() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.consecutiveSyncFailures
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+// normalizeObsLogger returns a default logger if nil is provided.
+func normalizeObsLogger(logger *slog.Logger) *slog.Logger {
+	if logger == nil {
+		return slog.Default()
+	}
+	return logger
 }
