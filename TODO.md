@@ -37514,13 +37514,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 2C - ERROR HANDLING & RECOVERY (5 HIGH)                                   ││
 │ │                                                                                  ││
-│ │ [ ] W12.48 - TransientTracker Lost Updates                                      ││
+│ │ [x] W12.48 - TransientTracker Lost Updates                                      ││
 │ │   FILE: core/errors/transient_tracker.go:67-76                                  ││
 │ │   ISSUE: Record() can lose updates due to check-then-act race                   ││
 │ │   FIX: Use atomic compare-and-swap for updates                                  ││
 │ │   SEVERITY: HIGH - Lost error tracking                                          ││
 │ │                                                                                  ││
-│ │ [ ] W12.49 - CircuitBreaker Deadlock Potential                                  ││
+│ │ [x] W12.49 - CircuitBreaker Deadlock Potential                                  ││
 │ │   FILE: core/errors/circuit_breaker.go:120-130                                  ││
 │ │   ISSUE: RecordResult() can deadlock with concurrent state transitions          ││
 │ │   FIX: Restructure lock acquisition to prevent deadlock                         ││
