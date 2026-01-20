@@ -1,6 +1,8 @@
 package extractors
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/knowledge"
@@ -1657,4 +1659,434 @@ function nextFunc() {
 	fn2 := entities[1]
 	assert.Equal(t, "nextFunc", fn2.Name)
 	assert.Equal(t, 6, fn2.StartLine)
+}
+
+// =============================================================================
+// Python Parent Class Detection Tests (W3M.4)
+// =============================================================================
+
+func TestPythonExtractor_ParentClassDetection_SingleClass(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `class MyClass:
+    def method1(self):
+        pass
+
+    def method2(self):
+        pass
+
+def standalone():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/single_class.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 4) // 1 class + 2 methods + 1 function
+
+	classEntity := entities[0]
+	assert.Equal(t, "MyClass", classEntity.Name)
+	assert.Equal(t, knowledge.EntityKindType, classEntity.Kind)
+
+	// Both methods should have the class as parent
+	for i := 1; i <= 2; i++ {
+		method := entities[i]
+		assert.Equal(t, knowledge.EntityKindMethod, method.Kind)
+		assert.Equal(t, classEntity.ID, method.ParentID)
+	}
+
+	// Standalone function should have no parent
+	standalone := entities[3]
+	assert.Equal(t, "standalone", standalone.Name)
+	assert.Equal(t, knowledge.EntityKindFunction, standalone.Kind)
+	assert.Empty(t, standalone.ParentID)
+}
+
+func TestPythonExtractor_ParentClassDetection_MultipleClasses(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `class First:
+    def first_method(self):
+        pass
+
+class Second:
+    def second_method(self):
+        pass
+
+class Third:
+    def third_method(self):
+        pass
+`
+
+	entities, err := extractor.Extract("/test/multi_class.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 6) // 3 classes + 3 methods
+
+	// Build a map of class names to IDs
+	classIDs := make(map[string]string)
+	for _, e := range entities {
+		if e.Kind == knowledge.EntityKindType {
+			classIDs[e.Name] = e.ID
+		}
+	}
+
+	// Verify each method has correct parent
+	for _, e := range entities {
+		if e.Kind == knowledge.EntityKindMethod {
+			switch e.Name {
+			case "first_method":
+				assert.Equal(t, classIDs["First"], e.ParentID)
+			case "second_method":
+				assert.Equal(t, classIDs["Second"], e.ParentID)
+			case "third_method":
+				assert.Equal(t, classIDs["Third"], e.ParentID)
+			}
+		}
+	}
+}
+
+func TestPythonExtractor_ParentClassDetection_NestedClasses(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `class Outer:
+    def outer_method(self):
+        pass
+
+    class Inner:
+        def inner_method(self):
+            pass
+
+    def another_outer(self):
+        pass
+`
+
+	entities, err := extractor.Extract("/test/nested_classes.py", []byte(source))
+	require.NoError(t, err)
+
+	// Find classes and methods
+	var outer, inner *Entity
+	var outerMethod, innerMethod, anotherOuter *Entity
+	for i := range entities {
+		e := &entities[i]
+		switch e.Name {
+		case "Outer":
+			outer = e
+		case "Inner":
+			inner = e
+		case "outer_method":
+			outerMethod = e
+		case "inner_method":
+			innerMethod = e
+		case "another_outer":
+			anotherOuter = e
+		}
+	}
+
+	require.NotNil(t, outer)
+	require.NotNil(t, inner)
+	require.NotNil(t, outerMethod)
+	require.NotNil(t, innerMethod)
+	require.NotNil(t, anotherOuter)
+
+	// outer_method should belong to Outer
+	assert.Equal(t, outer.ID, outerMethod.ParentID)
+
+	// inner_method should belong to Inner
+	assert.Equal(t, inner.ID, innerMethod.ParentID)
+
+	// another_outer should belong to Outer
+	assert.Equal(t, outer.ID, anotherOuter.ParentID)
+}
+
+func TestPythonExtractor_ParentClassDetection_NoParent(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def func1():
+    pass
+
+def func2():
+    pass
+
+async def func3():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/no_class.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 3)
+
+	// All functions should have no parent
+	for _, e := range entities {
+		assert.Equal(t, knowledge.EntityKindFunction, e.Kind)
+		assert.Empty(t, e.ParentID)
+	}
+}
+
+func TestPythonExtractor_ParentClassDetection_FunctionAfterClass(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `class MyClass:
+    def method(self):
+        pass
+
+def standalone():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/func_after_class.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 3)
+
+	classEntity := entities[0]
+	methodEntity := entities[1]
+	funcEntity := entities[2]
+
+	assert.Equal(t, "MyClass", classEntity.Name)
+	assert.Equal(t, knowledge.EntityKindType, classEntity.Kind)
+
+	assert.Equal(t, "method", methodEntity.Name)
+	assert.Equal(t, knowledge.EntityKindMethod, methodEntity.Kind)
+	assert.Equal(t, classEntity.ID, methodEntity.ParentID)
+
+	assert.Equal(t, "standalone", funcEntity.Name)
+	assert.Equal(t, knowledge.EntityKindFunction, funcEntity.Kind)
+	assert.Empty(t, funcEntity.ParentID)
+}
+
+func TestPythonExtractor_ParentClassDetection_FunctionBeforeClass(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def standalone():
+    pass
+
+class MyClass:
+    def method(self):
+        pass
+`
+
+	entities, err := extractor.Extract("/test/func_before_class.py", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 3)
+
+	// Find entities by name (order may vary based on extraction logic)
+	var funcEntity, classEntity, methodEntity *Entity
+	for i := range entities {
+		switch entities[i].Name {
+		case "standalone":
+			funcEntity = &entities[i]
+		case "MyClass":
+			classEntity = &entities[i]
+		case "method":
+			methodEntity = &entities[i]
+		}
+	}
+
+	require.NotNil(t, funcEntity)
+	require.NotNil(t, classEntity)
+	require.NotNil(t, methodEntity)
+
+	assert.Equal(t, knowledge.EntityKindFunction, funcEntity.Kind)
+	assert.Empty(t, funcEntity.ParentID)
+
+	assert.Equal(t, knowledge.EntityKindType, classEntity.Kind)
+
+	assert.Equal(t, knowledge.EntityKindMethod, methodEntity.Kind)
+	assert.Equal(t, classEntity.ID, methodEntity.ParentID)
+}
+
+func TestPythonExtractor_ParentClassDetection_ManyClassesPerformance(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	// Generate source with many classes and methods
+	var builder strings.Builder
+	numClasses := 100
+	methodsPerClass := 10
+
+	for i := 0; i < numClasses; i++ {
+		builder.WriteString("class Class")
+		builder.WriteString(strconv.Itoa(i))
+		builder.WriteString(":\n")
+		for j := 0; j < methodsPerClass; j++ {
+			builder.WriteString("    def method_")
+			builder.WriteString(strconv.Itoa(j))
+			builder.WriteString("(self):\n")
+			builder.WriteString("        pass\n\n")
+		}
+		builder.WriteString("\n")
+	}
+
+	source := builder.String()
+
+	entities, err := extractor.Extract("/test/perf.py", []byte(source))
+	require.NoError(t, err)
+
+	// Should have numClasses classes and numClasses * methodsPerClass methods
+	expectedClasses := numClasses
+	expectedMethods := numClasses * methodsPerClass
+
+	classCount := 0
+	methodCount := 0
+	for _, e := range entities {
+		if e.Kind == knowledge.EntityKindType {
+			classCount++
+		}
+		if e.Kind == knowledge.EntityKindMethod {
+			methodCount++
+			assert.NotEmpty(t, e.ParentID, "Method %s should have parent", e.Name)
+		}
+	}
+
+	assert.Equal(t, expectedClasses, classCount)
+	assert.Equal(t, expectedMethods, methodCount)
+}
+
+func TestPythonExtractor_ParentClassDetection_InterleavedClassesAndFunctions(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `def func1():
+    pass
+
+class Class1:
+    def method1(self):
+        pass
+
+def func2():
+    pass
+
+class Class2:
+    def method2(self):
+        pass
+
+def func3():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/interleaved.py", []byte(source))
+	require.NoError(t, err)
+
+	// Build maps for verification
+	classIDs := make(map[string]string)
+	for _, e := range entities {
+		if e.Kind == knowledge.EntityKindType {
+			classIDs[e.Name] = e.ID
+		}
+	}
+
+	for _, e := range entities {
+		switch e.Name {
+		case "func1", "func2", "func3":
+			assert.Equal(t, knowledge.EntityKindFunction, e.Kind)
+			assert.Empty(t, e.ParentID)
+		case "method1":
+			assert.Equal(t, knowledge.EntityKindMethod, e.Kind)
+			assert.Equal(t, classIDs["Class1"], e.ParentID)
+		case "method2":
+			assert.Equal(t, knowledge.EntityKindMethod, e.Kind)
+			assert.Equal(t, classIDs["Class2"], e.ParentID)
+		}
+	}
+}
+
+func TestPythonExtractor_ParentClassDetection_AsyncMethods(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	source := `class AsyncService:
+    async def fetch(self):
+        pass
+
+    def sync_method(self):
+        pass
+
+    async def process(self):
+        pass
+
+async def standalone_async():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/async_methods.py", []byte(source))
+	require.NoError(t, err)
+
+	classEntity := entities[0]
+	assert.Equal(t, "AsyncService", classEntity.Name)
+
+	methodsFound := 0
+	for _, e := range entities {
+		if e.Kind == knowledge.EntityKindMethod {
+			methodsFound++
+			assert.Equal(t, classEntity.ID, e.ParentID)
+		}
+		if e.Name == "standalone_async" {
+			assert.Equal(t, knowledge.EntityKindFunction, e.Kind)
+			assert.Empty(t, e.ParentID)
+		}
+	}
+	assert.Equal(t, 3, methodsFound)
+}
+
+func TestClassLookup_EmptyClasses(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lookup := newClassLookup([]Entity{}, []string{}, extractor)
+
+	name, id := lookup.findParentClass(10, 4)
+	assert.Empty(t, name)
+	assert.Empty(t, id)
+}
+
+func TestClassLookup_SingleClass(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{"class Test:", "    def method(self):", "        pass"}
+	entities := []Entity{
+		{Name: "Test", ID: "test-id", StartLine: 1, EndLine: 3},
+	}
+
+	lookup := newClassLookup(entities, lines, extractor)
+
+	// Line inside class with proper indent
+	name, id := lookup.findParentClass(2, 4)
+	assert.Equal(t, "Test", name)
+	assert.Equal(t, "test-id", id)
+
+	// Line before class
+	name, id = lookup.findParentClass(0, 0)
+	assert.Empty(t, name)
+	assert.Empty(t, id)
+
+	// Line after class
+	name, id = lookup.findParentClass(4, 0)
+	assert.Empty(t, name)
+	assert.Empty(t, id)
+
+	// Line inside class but with same indent as class
+	name, id = lookup.findParentClass(2, 0)
+	assert.Empty(t, name)
+	assert.Empty(t, id)
+}
+
+func TestClassLookup_BinarySearchCorrectness(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		"class A:",      // line 1
+		"    pass",      // line 2
+		"class B:",      // line 3
+		"    pass",      // line 4
+		"class C:",      // line 5
+		"    pass",      // line 6
+	}
+	entities := []Entity{
+		{Name: "A", ID: "a-id", StartLine: 1, EndLine: 2},
+		{Name: "B", ID: "b-id", StartLine: 3, EndLine: 4},
+		{Name: "C", ID: "c-id", StartLine: 5, EndLine: 6},
+	}
+
+	lookup := newClassLookup(entities, lines, extractor)
+
+	// Test finding correct class for each position
+	name, _ := lookup.findParentClass(2, 4)
+	assert.Equal(t, "A", name)
+
+	name, _ = lookup.findParentClass(4, 4)
+	assert.Equal(t, "B", name)
+
+	name, _ = lookup.findParentClass(6, 4)
+	assert.Equal(t, "C", name)
 }

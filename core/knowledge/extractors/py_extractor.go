@@ -2,6 +2,7 @@ package extractors
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/adalundhe/sylk/core/knowledge"
@@ -10,12 +11,80 @@ import (
 // PythonExtractor extracts entities from Python source files using regex patterns.
 type PythonExtractor struct {
 	// Compiled regex patterns for different entity types
-	functionPattern     *regexp.Regexp
+	functionPattern      *regexp.Regexp
 	asyncFunctionPattern *regexp.Regexp
-	classPattern        *regexp.Regexp
-	methodPattern       *regexp.Regexp
-	asyncMethodPattern  *regexp.Regexp
-	decoratorPattern    *regexp.Regexp
+	classPattern         *regexp.Regexp
+	methodPattern        *regexp.Regexp
+	asyncMethodPattern   *regexp.Regexp
+	decoratorPattern     *regexp.Regexp
+}
+
+// classInfo holds information about a class for O(1) lookup.
+type classInfo struct {
+	name      string
+	id        string
+	startLine int
+	endLine   int
+	indent    int
+}
+
+// classLookup provides O(1) parent class detection using binary search.
+type classLookup struct {
+	classes []classInfo // sorted by startLine
+}
+
+// newClassLookup creates a class lookup from class entities.
+func newClassLookup(classEntities []Entity, lines []string, extractor *PythonExtractor) *classLookup {
+	classes := make([]classInfo, 0, len(classEntities))
+	for _, ce := range classEntities {
+		indent := extractor.getIndentLevel(lines[ce.StartLine-1])
+		classes = append(classes, classInfo{
+			name:      ce.Name,
+			id:        ce.ID,
+			startLine: ce.StartLine,
+			endLine:   ce.EndLine,
+			indent:    indent,
+		})
+	}
+	sort.Slice(classes, func(i, j int) bool {
+		return classes[i].startLine < classes[j].startLine
+	})
+	return &classLookup{classes: classes}
+}
+
+// findParentClass finds the parent class for a function at given line with given indent.
+// Returns className, classID, or empty strings if no parent class.
+func (cl *classLookup) findParentClass(line, indent int) (string, string) {
+	if len(cl.classes) == 0 {
+		return "", ""
+	}
+	idx := cl.searchClassIndex(line)
+	return cl.checkCandidates(idx, line, indent)
+}
+
+// searchClassIndex finds the index of the last class starting before or at line.
+func (cl *classLookup) searchClassIndex(line int) int {
+	return sort.Search(len(cl.classes), func(i int) bool {
+		return cl.classes[i].startLine > line
+	}) - 1
+}
+
+// checkCandidates checks candidate classes starting from idx backwards.
+// For nested classes, we must check all candidates since an inner class
+// may end before the line but an outer class may still contain it.
+func (cl *classLookup) checkCandidates(idx, line, indent int) (string, string) {
+	for i := idx; i >= 0; i-- {
+		c := cl.classes[i]
+		if cl.isValidParent(c, line, indent) {
+			return c.name, c.id
+		}
+	}
+	return "", ""
+}
+
+// isValidParent checks if c is a valid parent class for the given line/indent.
+func (cl *classLookup) isValidParent(c classInfo, line, indent int) bool {
+	return line > c.startLine && line <= c.endLine && indent > c.indent
 }
 
 // NewPythonExtractor creates a new Python entity extractor.
@@ -55,31 +124,11 @@ func (e *PythonExtractor) Extract(filePath string, content []byte) ([]Entity, er
 	classEntities := e.extractClasses(filePath, source, lines)
 	entities = append(entities, classEntities...)
 
-	// Build a map of class ranges for method association
-	classRanges := make(map[string]struct {
-		id        string
-		startLine int
-		endLine   int
-		indent    int
-	})
-
-	for _, ce := range classEntities {
-		indent := e.getIndentLevel(lines[ce.StartLine-1])
-		classRanges[ce.Name] = struct {
-			id        string
-			startLine int
-			endLine   int
-			indent    int
-		}{
-			id:        ce.ID,
-			startLine: ce.StartLine,
-			endLine:   ce.EndLine,
-			indent:    indent,
-		}
-	}
+	// Build O(1) class lookup using sorted classes with binary search
+	lookup := newClassLookup(classEntities, lines, e)
 
 	// Extract functions (top-level only) and methods (within classes)
-	entities = append(entities, e.extractFunctionsAndMethods(filePath, source, lines, classRanges)...)
+	entities = append(entities, e.extractFunctionsAndMethods(filePath, source, lines, lookup)...)
 
 	return entities, nil
 }
@@ -131,109 +180,113 @@ func (e *PythonExtractor) extractClasses(filePath, source string, lines []string
 }
 
 // extractFunctionsAndMethods extracts function and method declarations.
-func (e *PythonExtractor) extractFunctionsAndMethods(filePath, source string, lines []string, classRanges map[string]struct {
-	id        string
-	startLine int
-	endLine   int
-	indent    int
-}) []Entity {
+func (e *PythonExtractor) extractFunctionsAndMethods(
+	filePath, source string,
+	lines []string,
+	lookup *classLookup,
+) []Entity {
 	var entities []Entity
 
 	// Extract regular functions and methods
-	entities = append(entities, e.extractFuncsByPattern(filePath, source, lines, classRanges, e.functionPattern, false)...)
+	entities = append(entities, e.extractFuncsByPattern(filePath, source, lines, lookup, e.functionPattern, false)...)
 
 	// Extract async functions and methods
-	entities = append(entities, e.extractFuncsByPattern(filePath, source, lines, classRanges, e.asyncFunctionPattern, true)...)
+	entities = append(entities, e.extractFuncsByPattern(filePath, source, lines, lookup, e.asyncFunctionPattern, true)...)
 
 	return entities
 }
 
 // extractFuncsByPattern extracts functions matching the given pattern.
-func (e *PythonExtractor) extractFuncsByPattern(filePath, source string, lines []string, classRanges map[string]struct {
-	id        string
-	startLine int
-	endLine   int
-	indent    int
-}, pattern *regexp.Regexp, isAsync bool) []Entity {
-	var entities []Entity
+func (e *PythonExtractor) extractFuncsByPattern(
+	filePath, source string,
+	lines []string,
+	lookup *classLookup,
+	pattern *regexp.Regexp,
+	isAsync bool,
+) []Entity {
 	matches := pattern.FindAllStringSubmatchIndex(source, -1)
+	entities := make([]Entity, 0, len(matches))
 
 	for _, match := range matches {
-		if len(match) >= 6 {
-			startPos := match[0]
-			startLine := e.posToLine(source, startPos)
-
-			// Get indentation
-			indent := ""
-			if match[2] != -1 && match[3] != -1 {
-				indent = source[match[2]:match[3]]
-			}
-			indentLevel := len(indent)
-
-			// Extract function name (group 2)
-			name := source[match[4]:match[5]]
-
-			// Find the end of the function (based on indentation)
-			endLine := e.findPythonBlockEnd(lines, startLine, indentLevel)
-
-			// Build signature
-			var sig strings.Builder
-			if isAsync {
-				sig.WriteString("async ")
-			}
-			sig.WriteString("def ")
-			sig.WriteString(name)
-			sig.WriteString("(")
-			if match[6] != -1 && match[7] != -1 {
-				params := strings.TrimSpace(source[match[6]:match[7]])
-				sig.WriteString(params)
-			}
-			sig.WriteString(")")
-			if match[8] != -1 && match[9] != -1 {
-				sig.WriteString(source[match[8]:match[9]])
-			}
-
-			// Determine if this is a method (inside a class) or a top-level function
-			var parentID string
-			var kind knowledge.EntityKind
-			var entityPath string
-
-			// Check if this function is inside any class
-			parentClass := ""
-			for className, classInfo := range classRanges {
-				// Method must be:
-				// 1. Within the class line range
-				// 2. Have greater indentation than the class definition
-				if startLine > classInfo.startLine && startLine <= classInfo.endLine && indentLevel > classInfo.indent {
-					parentClass = className
-					parentID = classInfo.id
-					break
-				}
-			}
-
-			if parentClass != "" {
-				kind = knowledge.EntityKindMethod
-				entityPath = parentClass + "." + name
-			} else {
-				kind = knowledge.EntityKindFunction
-				entityPath = "func:" + name
-			}
-
-			entity := Entity{
-				ID:        generateEntityID(filePath, entityPath),
-				Name:      name,
-				Kind:      kind,
-				FilePath:  filePath,
-				StartLine: startLine,
-				EndLine:   endLine,
-				Signature: sig.String(),
-				ParentID:  parentID,
-			}
-			entities = append(entities, entity)
+		if entity := e.processMatch(filePath, source, lines, lookup, match, isAsync); entity != nil {
+			entities = append(entities, *entity)
 		}
 	}
 
 	return entities
+}
+
+// processMatch processes a single regex match and returns an entity or nil.
+func (e *PythonExtractor) processMatch(
+	filePath, source string,
+	lines []string,
+	lookup *classLookup,
+	match []int,
+	isAsync bool,
+) *Entity {
+	if len(match) < 6 {
+		return nil
+	}
+
+	startPos := match[0]
+	startLine := e.posToLine(source, startPos)
+	indentLevel := e.extractIndentLevel(source, match)
+	name := source[match[4]:match[5]]
+	endLine := e.findPythonBlockEnd(lines, startLine, indentLevel)
+	sig := e.buildSignature(source, match, isAsync, name)
+
+	// O(1) parent class lookup using binary search
+	parentClass, parentID := lookup.findParentClass(startLine, indentLevel)
+
+	kind, entityPath := e.determineKindAndPath(parentClass, name)
+
+	entity := Entity{
+		ID:        generateEntityID(filePath, entityPath),
+		Name:      name,
+		Kind:      kind,
+		FilePath:  filePath,
+		StartLine: startLine,
+		EndLine:   endLine,
+		Signature: sig,
+		ParentID:  parentID,
+	}
+	return &entity
+}
+
+// extractIndentLevel extracts the indentation level from a match.
+func (e *PythonExtractor) extractIndentLevel(source string, match []int) int {
+	if match[2] != -1 && match[3] != -1 {
+		return len(source[match[2]:match[3]])
+	}
+	return 0
+}
+
+// buildSignature builds the function signature string.
+func (e *PythonExtractor) buildSignature(source string, match []int, isAsync bool, name string) string {
+	var sig strings.Builder
+	if isAsync {
+		sig.WriteString("async ")
+	}
+	sig.WriteString("def ")
+	sig.WriteString(name)
+	sig.WriteString("(")
+	if match[6] != -1 && match[7] != -1 {
+		params := strings.TrimSpace(source[match[6]:match[7]])
+		sig.WriteString(params)
+	}
+	sig.WriteString(")")
+	if match[8] != -1 && match[9] != -1 {
+		sig.WriteString(source[match[8]:match[9]])
+	}
+	return sig.String()
+}
+
+// determineKindAndPath determines the entity kind and path based on parent class.
+func (e *PythonExtractor) determineKindAndPath(parentClass, name string) (knowledge.EntityKind, string) {
+	if parentClass != "" {
+		return knowledge.EntityKindMethod, parentClass + "." + name
+	}
+	return knowledge.EntityKindFunction, "func:" + name
 }
 
 // posToLine converts a byte position to a line number (1-indexed).
