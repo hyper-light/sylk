@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"sync"
@@ -11,12 +12,18 @@ import (
 type mockTerminator struct {
 	mu         sync.Mutex
 	terminated []string
+	failNext   bool
+	failErr    error
 }
 
 func (m *mockTerminator) TerminateAgent(agentID string, reason string) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.terminated = append(m.terminated, agentID)
-	m.mu.Unlock()
+	if m.failNext {
+		m.failNext = false
+		return m.failErr
+	}
 	return nil
 }
 
@@ -42,19 +49,29 @@ type testNotifier struct {
 	escalations     []string
 	forceKills      []string
 	reacquireNotifs []string
+	failBreakout    bool
+	failEscalation  bool
+	breakoutErr     error
+	escalationErr   error
 }
 
 func (n *testNotifier) InjectBreakoutPrompt(agentID string, prompt string) error {
 	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.breakouts = append(n.breakouts, agentID)
-	n.mu.Unlock()
+	if n.failBreakout {
+		return n.breakoutErr
+	}
 	return nil
 }
 
 func (n *testNotifier) EscalateToUser(sessionID, agentID string, _ HealthAssessment) error {
 	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.escalations = append(n.escalations, agentID)
-	n.mu.Unlock()
+	if n.failEscalation {
+		return n.escalationErr
+	}
 	return nil
 }
 
@@ -95,6 +112,29 @@ func newTestOrchestrator() (*RecoveryOrchestrator, *testNotifier, *mockTerminato
 	return ro, notifier, terminator
 }
 
+func newTestOrchestratorWithComponents() (*RecoveryOrchestrator, *testNotifier, *mockTerminator, *mockReleaser) {
+	pc := NewProgressCollector()
+	rd := NewRepetitionDetector(DefaultRepetitionConfig())
+	hs := NewHealthScorer(pc, rd, nil, DefaultHealthWeights(), DefaultHealthThresholds())
+	dd := NewDeadlockDetector(func(_ string) bool { return true })
+
+	notifier := &testNotifier{}
+	terminator := &mockTerminator{}
+	releaser := &mockReleaser{}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	config := RecoveryConfig{
+		SoftInterventionDelay: 30 * time.Second,
+		UserEscalationDelay:   60 * time.Second,
+		ForceKillDelay:        120 * time.Second,
+		MaxSoftAttempts:       2,
+		MonitorInterval:       5 * time.Second,
+	}
+
+	ro := NewRecoveryOrchestrator(hs, dd, releaser, terminator, notifier, logger, config)
+	return ro, notifier, terminator, releaser
+}
+
 func TestRecoveryOrchestrator_HealthyAgentNoAction(t *testing.T) {
 	ro, notifier, _ := newTestOrchestrator()
 
@@ -103,7 +143,10 @@ func TestRecoveryOrchestrator_HealthyAgentNoAction(t *testing.T) {
 		Status:  StatusHealthy,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	err := ro.HandleStuckAgent(assessment)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned unexpected error: %v", err)
+	}
 
 	if len(notifier.breakouts) > 0 {
 		t.Error("Should not send breakout for healthy agent")
@@ -124,7 +167,10 @@ func TestRecoveryOrchestrator_SoftIntervention(t *testing.T) {
 		StuckSince: &stuckTime,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	err := ro.HandleStuckAgent(assessment)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned unexpected error: %v", err)
+	}
 
 	if len(notifier.breakouts) != 1 {
 		t.Errorf("Expected 1 breakout, got %d", len(notifier.breakouts))
@@ -142,9 +188,9 @@ func TestRecoveryOrchestrator_MaxSoftAttempts(t *testing.T) {
 		StuckSince: &stuckTime,
 	}
 
-	ro.HandleStuckAgent(assessment)
-	ro.HandleStuckAgent(assessment)
-	ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
 
 	if len(notifier.breakouts) != 2 {
 		t.Errorf("Expected max 2 breakouts, got %d", len(notifier.breakouts))
@@ -162,7 +208,10 @@ func TestRecoveryOrchestrator_UserEscalation(t *testing.T) {
 		StuckSince: &stuckTime,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	err := ro.HandleStuckAgent(assessment)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned unexpected error: %v", err)
+	}
 
 	if len(notifier.escalations) != 1 {
 		t.Errorf("Expected 1 escalation, got %d", len(notifier.escalations))
@@ -180,7 +229,10 @@ func TestRecoveryOrchestrator_ForceKill(t *testing.T) {
 		StuckSince: &stuckTime,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	err := ro.HandleStuckAgent(assessment)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned unexpected error: %v", err)
+	}
 
 	if len(notifier.forceKills) != 1 {
 		t.Errorf("Expected 1 force kill notification, got %d", len(notifier.forceKills))
@@ -201,7 +253,7 @@ func TestRecoveryOrchestrator_UserWaitPreventsForceKill(t *testing.T) {
 		StuckSince: &stuckTime,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
 
 	ro.SetUserResponse("agent-1", UserRecoveryResponse{
 		Action:    UserActionWait,
@@ -210,7 +262,7 @@ func TestRecoveryOrchestrator_UserWaitPreventsForceKill(t *testing.T) {
 
 	stuckTime = time.Now().Add(-125 * time.Second)
 	assessment.StuckSince = &stuckTime
-	ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
 
 	if len(terminator.terminated) > 0 {
 		t.Error("Should not terminate when user chose to wait")
@@ -231,14 +283,14 @@ func TestRecoveryOrchestrator_UserKillAction(t *testing.T) {
 		StuckSince: &stuckTime,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
 
 	ro.SetUserResponse("agent-1", UserRecoveryResponse{
 		Action:    UserActionKill,
 		Timestamp: time.Now(),
 	})
 
-	ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
 
 	if len(terminator.terminated) != 1 {
 		t.Errorf("Expected 1 termination after user kill, got %d", len(terminator.terminated))
@@ -256,11 +308,11 @@ func TestRecoveryOrchestrator_AgentRecovery(t *testing.T) {
 		StuckSince: &stuckTime,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
 
 	assessment.Status = StatusHealthy
 	assessment.StuckSince = nil
-	ro.HandleStuckAgent(assessment)
+	_ = ro.HandleStuckAgent(assessment)
 
 	if len(notifier.reacquireNotifs) != 1 {
 		t.Errorf("Expected 1 reacquire notification, got %d", len(notifier.reacquireNotifs))
@@ -276,7 +328,7 @@ func TestRecoveryOrchestrator_GetState(t *testing.T) {
 	}
 
 	stuckTime := time.Now().Add(-35 * time.Second)
-	ro.HandleStuckAgent(HealthAssessment{
+	_ = ro.HandleStuckAgent(HealthAssessment{
 		AgentID:    "agent-1",
 		SessionID:  "session-1",
 		Status:     StatusStuck,
@@ -318,9 +370,190 @@ func TestRecoveryOrchestrator_NilStuckSince(t *testing.T) {
 		StuckSince: nil,
 	}
 
-	ro.HandleStuckAgent(assessment)
+	err := ro.HandleStuckAgent(assessment)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned unexpected error: %v", err)
+	}
 
 	if len(notifier.breakouts) > 0 {
 		t.Error("Should not intervene without StuckSince")
+	}
+}
+
+// Error propagation tests
+
+func TestRecoveryOrchestrator_SoftInterventionError(t *testing.T) {
+	ro, notifier, _, _ := newTestOrchestratorWithComponents()
+
+	// Configure notifier to fail breakout
+	notifier.failBreakout = true
+	notifier.breakoutErr = errors.New("injection failed")
+
+	stuckTime := time.Now().Add(-35 * time.Second)
+	assessment := HealthAssessment{
+		AgentID:    "agent-1",
+		SessionID:  "session-1",
+		Status:     StatusStuck,
+		StuckSince: &stuckTime,
+	}
+
+	err := ro.HandleStuckAgent(assessment)
+
+	if err == nil {
+		t.Error("HandleStuckAgent() should return error when soft intervention fails")
+	}
+	if !errors.Is(err, ErrSoftInterventionFailed) {
+		t.Errorf("error should wrap ErrSoftInterventionFailed, got: %v", err)
+	}
+}
+
+func TestRecoveryOrchestrator_UserEscalationError(t *testing.T) {
+	ro, notifier, _, _ := newTestOrchestratorWithComponents()
+
+	// Configure notifier to fail escalation
+	notifier.failEscalation = true
+	notifier.escalationErr = errors.New("escalation failed")
+
+	stuckTime := time.Now().Add(-65 * time.Second)
+	assessment := HealthAssessment{
+		AgentID:    "agent-1",
+		SessionID:  "session-1",
+		Status:     StatusStuck,
+		StuckSince: &stuckTime,
+	}
+
+	err := ro.HandleStuckAgent(assessment)
+
+	if err == nil {
+		t.Error("HandleStuckAgent() should return error when escalation fails")
+	}
+	if !errors.Is(err, ErrUserEscalationFailed) {
+		t.Errorf("error should wrap ErrUserEscalationFailed, got: %v", err)
+	}
+}
+
+func TestRecoveryOrchestrator_TerminationError(t *testing.T) {
+	ro, _, terminator, _ := newTestOrchestratorWithComponents()
+
+	// Configure terminator to fail
+	terminator.failNext = true
+	terminator.failErr = errors.New("termination failed")
+
+	stuckTime := time.Now().Add(-125 * time.Second)
+	assessment := HealthAssessment{
+		AgentID:    "agent-1",
+		SessionID:  "session-1",
+		Status:     StatusCritical,
+		StuckSince: &stuckTime,
+	}
+
+	err := ro.HandleStuckAgent(assessment)
+
+	if err == nil {
+		t.Error("HandleStuckAgent() should return error when termination fails")
+	}
+	if !errors.Is(err, ErrAgentTerminationFailed) {
+		t.Errorf("error should wrap ErrAgentTerminationFailed, got: %v", err)
+	}
+}
+
+func TestRecoveryOrchestrator_ErrorContainsOriginal(t *testing.T) {
+	ro, notifier, _, _ := newTestOrchestratorWithComponents()
+
+	originalErr := errors.New("underlying cause")
+	notifier.failBreakout = true
+	notifier.breakoutErr = originalErr
+
+	stuckTime := time.Now().Add(-35 * time.Second)
+	assessment := HealthAssessment{
+		AgentID:    "agent-1",
+		SessionID:  "session-1",
+		Status:     StatusStuck,
+		StuckSince: &stuckTime,
+	}
+
+	err := ro.HandleStuckAgent(assessment)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Check that original error is wrapped
+	if !errors.Is(err, originalErr) {
+		t.Errorf("error chain should contain original error: %v", err)
+	}
+}
+
+func TestRecoveryOrchestrator_NoErrorOnSuccess(t *testing.T) {
+	ro, _, _, _ := newTestOrchestratorWithComponents()
+
+	// Test soft intervention success
+	stuckTime := time.Now().Add(-35 * time.Second)
+	assessment := HealthAssessment{
+		AgentID:    "agent-1",
+		SessionID:  "session-1",
+		Status:     StatusStuck,
+		StuckSince: &stuckTime,
+	}
+
+	err := ro.HandleStuckAgent(assessment)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned error on success: %v", err)
+	}
+
+	// Test user escalation success
+	stuckTime = time.Now().Add(-65 * time.Second)
+	assessment2 := HealthAssessment{
+		AgentID:    "agent-2",
+		SessionID:  "session-2",
+		Status:     StatusStuck,
+		StuckSince: &stuckTime,
+	}
+
+	err = ro.HandleStuckAgent(assessment2)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned error on escalation success: %v", err)
+	}
+
+	// Test force kill success
+	stuckTime = time.Now().Add(-125 * time.Second)
+	assessment3 := HealthAssessment{
+		AgentID:    "agent-3",
+		SessionID:  "session-3",
+		Status:     StatusCritical,
+		StuckSince: &stuckTime,
+	}
+
+	err = ro.HandleStuckAgent(assessment3)
+	if err != nil {
+		t.Errorf("HandleStuckAgent() returned error on force kill success: %v", err)
+	}
+}
+
+func TestRecoveryOrchestrator_ConcurrentHandling(t *testing.T) {
+	ro, _, _, _ := newTestOrchestratorWithComponents()
+
+	const goroutines = 10
+	const iterations = 50
+
+	done := make(chan struct{})
+
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < iterations; j++ {
+				stuckTime := time.Now().Add(-35 * time.Second)
+				_ = ro.HandleStuckAgent(HealthAssessment{
+					AgentID:    "agent-concurrent",
+					SessionID:  "session-concurrent",
+					Status:     StatusStuck,
+					StuckSince: &stuckTime,
+				})
+			}
+		}(i)
+	}
+
+	for i := 0; i < goroutines; i++ {
+		<-done
 	}
 }

@@ -37277,7 +37277,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add type assertions with safety checks                                   ││
 │ │   SEVERITY: CRITICAL - Potential panic or memory corruption                     ││
 │ │                                                                                  ││
-│ │ [ ] W12.19 - Recovery Orchestrator Missing Error Propagation                    ││
+│ │ [x] W12.19 - Recovery Orchestrator Missing Error Propagation                    ││
 │ │   FILE: core/recovery/recovery_orchestrator.go:88-112                           ││
 │ │   ISSUE: Errors in recovery steps not propagated to caller                      ││
 │ │   FIX: Collect and return all errors from recovery operations                   ││
@@ -37300,7 +37300,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Remove unused channel or add consumer                                    ││
 │ │   SEVERITY: CRITICAL - Goroutine leak                                           ││
 │ │                                                                                  ││
-│ │ [ ] W12.22 - Provenance Race Condition                                          ││
+│ │ [x] W12.22 - Provenance Race Condition                                          ││
 │ │   FILE: core/vectorgraphdb/mitigations/provenance.go:66-73                      ││
 │ │   ISSUE: GetProvenance reads map without lock while updates can occur           ││
 │ │   FIX: Add read lock for map access                                             ││

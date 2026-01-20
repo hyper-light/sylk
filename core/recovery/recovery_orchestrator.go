@@ -85,46 +85,54 @@ func (r *RecoveryOrchestrator) handleRecoveredAgent(state *RecoveryState) {
 	r.clearState(state.AgentID)
 }
 
-func (r *RecoveryOrchestrator) processStuckDuration(state *RecoveryState, assessment HealthAssessment, duration time.Duration) {
+// processStuckDuration handles recovery based on how long the agent has been stuck.
+// REQUIRES: caller holds state.mu.
+func (r *RecoveryOrchestrator) processStuckDuration(state *RecoveryState, assessment HealthAssessment, duration time.Duration) error {
 	switch {
 	case duration < r.config.SoftInterventionDelay:
-		return
+		return nil
 	case duration < r.config.UserEscalationDelay:
-		r.trySoftIntervention(state, assessment)
+		return r.trySoftIntervention(state, assessment)
 	case duration < r.config.ForceKillDelay:
-		r.handleUserEscalationPhase(state, assessment)
+		return r.handleUserEscalationPhase(state, assessment)
 	default:
-		r.handleForceKillPhase(state, assessment)
+		return r.handleForceKillPhase(state, assessment)
 	}
 }
 
-func (r *RecoveryOrchestrator) handleUserEscalationPhase(state *RecoveryState, assessment HealthAssessment) {
+// handleUserEscalationPhase manages the user escalation phase of recovery.
+// REQUIRES: caller holds state.mu.
+func (r *RecoveryOrchestrator) handleUserEscalationPhase(state *RecoveryState, assessment HealthAssessment) error {
 	if !state.UserEscalated {
-		r.escalateToUser(state, assessment)
-		return
+		return r.escalateToUser(state, assessment)
 	}
 	if state.UserResponse != nil {
-		r.handleUserResponse(state, assessment)
+		return r.handleUserResponse(state, assessment)
 	}
+	return nil
 }
 
-func (r *RecoveryOrchestrator) handleForceKillPhase(state *RecoveryState, assessment HealthAssessment) {
+// handleForceKillPhase manages the force kill phase of recovery.
+// REQUIRES: caller holds state.mu.
+func (r *RecoveryOrchestrator) handleForceKillPhase(state *RecoveryState, assessment HealthAssessment) error {
 	if state.UserResponse == nil || state.UserResponse.Action != UserActionWait {
-		r.forceKill(state, assessment)
+		return r.forceKill(state, assessment)
 	}
+	return nil
 }
 
 // trySoftIntervention attempts a soft intervention for a stuck agent.
 // REQUIRES: caller holds state.mu.
-func (r *RecoveryOrchestrator) trySoftIntervention(state *RecoveryState, assessment HealthAssessment) {
+// Returns ErrSoftInterventionFailed if the intervention fails.
+func (r *RecoveryOrchestrator) trySoftIntervention(state *RecoveryState, assessment HealthAssessment) error {
 	if state.SoftAttempts >= r.config.MaxSoftAttempts {
-		return
+		return nil
 	}
 
 	prompt := r.buildBreakoutPrompt(assessment)
 	if err := r.notifier.InjectBreakoutPrompt(state.AgentID, prompt); err != nil {
 		r.logger.Warn("soft intervention failed", "agent", state.AgentID, "error", err)
-		return
+		return errors.Join(ErrSoftInterventionFailed, err)
 	}
 
 	state.markSoftInterventionLocked()
@@ -133,6 +141,7 @@ func (r *RecoveryOrchestrator) trySoftIntervention(state *RecoveryState, assessm
 		"attempt", state.SoftAttempts,
 		"max_attempts", r.config.MaxSoftAttempts,
 	)
+	return nil
 }
 
 func (r *RecoveryOrchestrator) buildBreakoutPrompt(assessment HealthAssessment) string {
@@ -147,30 +156,36 @@ func (r *RecoveryOrchestrator) buildBreakoutPrompt(assessment HealthAssessment) 
 
 // escalateToUser escalates the agent issue to user attention.
 // REQUIRES: caller holds state.mu.
-func (r *RecoveryOrchestrator) escalateToUser(state *RecoveryState, assessment HealthAssessment) {
+// Returns ErrUserEscalationFailed if escalation fails.
+func (r *RecoveryOrchestrator) escalateToUser(state *RecoveryState, assessment HealthAssessment) error {
 	if err := r.notifier.EscalateToUser(state.SessionID, state.AgentID, assessment); err != nil {
 		r.logger.Warn("user escalation failed", "agent", state.AgentID, "error", err)
-		return
+		return errors.Join(ErrUserEscalationFailed, err)
 	}
 
 	state.markUserEscalatedLocked()
 	r.logger.Info("escalated to user", "agent", state.AgentID)
+	return nil
 }
 
-func (r *RecoveryOrchestrator) handleUserResponse(state *RecoveryState, assessment HealthAssessment) {
+// handleUserResponse processes the user's recovery decision.
+// REQUIRES: caller holds state.mu.
+func (r *RecoveryOrchestrator) handleUserResponse(state *RecoveryState, assessment HealthAssessment) error {
 	switch state.UserResponse.Action {
 	case UserActionWait:
 		r.logger.Info("user chose to wait", "agent", state.AgentID)
 	case UserActionKill:
-		r.forceKill(state, assessment)
+		return r.forceKill(state, assessment)
 	case UserActionInspect:
 		r.logger.Info("user inspecting agent", "agent", state.AgentID)
 	}
+	return nil
 }
 
 // forceKill forcefully terminates an agent and releases its resources.
 // REQUIRES: caller holds state.mu.
-func (r *RecoveryOrchestrator) forceKill(state *RecoveryState, assessment HealthAssessment) {
+// Returns ErrAgentTerminationFailed if termination fails.
+func (r *RecoveryOrchestrator) forceKill(state *RecoveryState, assessment HealthAssessment) error {
 	state.markForceKillLocked()
 
 	released := r.resourceMgr.ForceReleaseByAgent(state.AgentID)
@@ -179,14 +194,17 @@ func (r *RecoveryOrchestrator) forceKill(state *RecoveryState, assessment Health
 	reason := r.buildForceKillReason(assessment)
 	r.notifier.NotifyForceKill(state.SessionID, state.AgentID, reason)
 
+	var termErr error
 	if err := r.terminator.TerminateAgent(state.AgentID, reason); err != nil {
 		r.logger.Error("failed to terminate agent", "agent", state.AgentID, "error", err)
+		termErr = errors.Join(ErrAgentTerminationFailed, err)
 	}
 
 	r.logger.Warn("force killed stuck agent",
 		"agent", state.AgentID,
 		"released_resources", len(released),
 	)
+	return termErr
 }
 
 func (r *RecoveryOrchestrator) buildForceKillReason(assessment HealthAssessment) string {
