@@ -63,7 +63,8 @@ func TestUnifiedResolver_Resolve(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 
 	resolution, err := resolver.Resolve(context.Background(), "test code query", nil)
 
@@ -77,14 +78,15 @@ func TestUnifiedResolver_Resolve_CacheHit(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 
 	opts := &ResolveOptions{
 		TokenBudget: 4000,
 		CacheResult: true,
 	}
 
-	_, err := resolver.Resolve(context.Background(), "cached query", opts)
+	_, err = resolver.Resolve(context.Background(), "cached query", opts)
 	require.NoError(t, err)
 
 	resolution, err := resolver.Resolve(context.Background(), "cached query", opts)
@@ -97,7 +99,8 @@ func TestUnifiedResolver_DetectIntent(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 	metrics := &PipelineMetrics{}
 
 	tests := []struct {
@@ -125,7 +128,8 @@ func TestUnifiedResolver_SelectDomains(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 
 	tests := []struct {
 		name      string
@@ -181,7 +185,8 @@ func TestUnifiedResolver_GetMetrics(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 
 	metrics := resolver.GetMetrics()
 
@@ -193,7 +198,8 @@ func TestUnifiedResolver_ClearCache(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 
 	resolver.intentCache.Set("test", &QueryResolution{Query: "test"})
 	assert.Equal(t, 1, len(resolver.intentCache.entries))
@@ -246,7 +252,8 @@ func TestUnifiedResolver_Resolve_WithOptions(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 
 	opts := &ResolveOptions{
 		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
@@ -268,12 +275,13 @@ func TestUnifiedResolver_Context_Cancellation(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	resolver := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	resolver, err := NewUnifiedResolver(db, nil, nil, DefaultResolverConfig())
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := resolver.Resolve(ctx, "test", nil)
+	_, err = resolver.Resolve(ctx, "test", nil)
 
 	assert.NoError(t, err)
 }
@@ -289,4 +297,49 @@ func TestPipelineMetrics(t *testing.T) {
 
 	assert.Equal(t, 1*time.Millisecond, metrics.IntentDetect)
 	assert.Equal(t, 100*time.Millisecond, metrics.Total)
+}
+
+func TestNewUnifiedResolver_NilDB(t *testing.T) {
+	_, err := NewUnifiedResolver(nil, nil, nil, DefaultResolverConfig())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database is required")
+}
+
+func TestNewUnifiedResolver_InvalidCacheTTL(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	config := ResolverConfig{
+		CacheTTL:     0,
+		CacheMaxSize: 1000,
+	}
+
+	_, err := NewUnifiedResolver(db, nil, nil, config)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cache TTL must be positive")
+}
+
+func TestNewUnifiedResolver_InvalidCacheMaxSize(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	config := ResolverConfig{
+		CacheTTL:     5 * time.Minute,
+		CacheMaxSize: 0,
+	}
+
+	_, err := NewUnifiedResolver(db, nil, nil, config)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cache max size must be positive")
+}
+
+func TestResolverError_Unwrap(t *testing.T) {
+	innerErr := assert.AnError
+	resolverErr := &ResolverError{Op: "test", Err: innerErr}
+
+	assert.Equal(t, innerErr, resolverErr.Unwrap())
+	assert.Contains(t, resolverErr.Error(), "resolver test")
 }

@@ -153,12 +153,32 @@ func DefaultResolverConfig() ResolverConfig {
 	}
 }
 
+// ResolverError represents an error during resolver operations.
+type ResolverError struct {
+	Op  string
+	Err error
+}
+
+func (e *ResolverError) Error() string {
+	return fmt.Sprintf("resolver %s: %v", e.Op, e.Err)
+}
+
+func (e *ResolverError) Unwrap() error {
+	return e.Err
+}
+
+// NewUnifiedResolver creates a new UnifiedResolver with all dependencies.
+// Returns an error if the database is nil or config is invalid.
 func NewUnifiedResolver(
 	db *vectorgraphdb.VectorGraphDB,
 	hnsw HNSWSimilaritySearcher,
 	embedder Embedder,
 	config ResolverConfig,
-) *UnifiedResolver {
+) (*UnifiedResolver, error) {
+	if err := validateResolverConfig(db, config); err != nil {
+		return nil, err
+	}
+
 	freshness := NewFreshnessTracker(db, DefaultDecayConfig())
 	provenance := NewProvenanceTracker(db)
 	trust := NewTrustHierarchy(db, provenance, freshness)
@@ -177,7 +197,20 @@ func NewUnifiedResolver(
 		conflicts:   conflicts,
 		scorer:      scorer,
 		prompter:    prompter,
+	}, nil
+}
+
+func validateResolverConfig(db *vectorgraphdb.VectorGraphDB, config ResolverConfig) error {
+	if db == nil {
+		return &ResolverError{Op: "init", Err: fmt.Errorf("database is required")}
 	}
+	if config.CacheTTL <= 0 {
+		return &ResolverError{Op: "init", Err: fmt.Errorf("cache TTL must be positive")}
+	}
+	if config.CacheMaxSize <= 0 {
+		return &ResolverError{Op: "init", Err: fmt.Errorf("cache max size must be positive")}
+	}
+	return nil
 }
 
 func (r *UnifiedResolver) Resolve(ctx context.Context, query string, opts *ResolveOptions) (*QueryResolution, error) {
