@@ -35337,29 +35337,33 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ EXECUTION WAVE 2: Context/Cache Layer (4 parallel - depends on Wave 1)          ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ [ ] W4N.5 - HotCache Eviction Goroutine Not Tracked                             ││
+│ │ [x] W4N.5 - HotCache Eviction Goroutine Not Tracked                             ││
 │ │   FILE: core/context/hot_cache.go:141-143                                       ││
 │ │   ISSUE: evictionLoop goroutine started but not tracked via WaitGroup           ││
 │ │   FIX: Add WaitGroup tracking and wait in Close()                               ││
 │ │   SEVERITY: HIGH - Goroutine not awaited on shutdown                            ││
+│ │   STATUS: DONE - Commit 0cbfad8                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.6 - ObservationLog WriteQueue Backpressure                              ││
+│ │ [x] W4N.6 - ObservationLog WriteQueue Backpressure                              ││
 │ │   FILE: core/context/observation_log.go:429-436                                 ││
 │ │   ISSUE: Returns error immediately on full queue, observations lost             ││
 │ │   FIX: Implement exponential backoff retry or bounded blocking                  ││
 │ │   SEVERITY: HIGH - Silent data loss during burst load                           ││
+│ │   STATUS: DONE - Commit 34cf9cc                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.7 - WAL periodicSync Ignores Sync Errors                                ││
+│ │ [x] W4N.7 - WAL periodicSync Ignores Sync Errors                                ││
 │ │   FILE: core/context/observation_log.go:316-324                                 ││
 │ │   ISSUE: file.Sync() error silently ignored in periodicSync                     ││
 │ │   FIX: Log error or propagate to health monitoring                              ││
 │ │   SEVERITY: MEDIUM - Silent data corruption on disk errors                      ││
+│ │   STATUS: DONE - Commit 982a4e9                                                 ││
 │ │                                                                                  ││
-│ │ [ ] W4N.8 - HotCache Close Not Thread-Safe Against Add                          ││
+│ │ [x] W4N.8 - HotCache Close Not Thread-Safe Against Add                          ││
 │ │   FILE: core/context/hot_cache.go:215-219                                       ││
 │ │   ISSUE: Close() races with Add() - eviction goroutine may process stale data   ││
 │ │   FIX: Add closed flag check at start of Add()                                  ││
 │ │   SEVERITY: MEDIUM - Race condition on shutdown                                 ││
+│ │   STATUS: DONE - Commit 2b88d26                                                 ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │ EXECUTION WAVE 3: Search/Gate Layer (4 parallel - depends on Wave 1)            ││
