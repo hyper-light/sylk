@@ -50,12 +50,62 @@ type ExecutionResult struct {
 }
 
 // =============================================================================
+// Metrics Tracker Constants
+// =============================================================================
+
+const (
+	// DefaultMetricsMaxEntries is the default maximum number of metrics entries.
+	DefaultMetricsMaxEntries = 10000
+
+	// DefaultMetricsTTL is the default time-to-live for metrics entries.
+	DefaultMetricsTTL = 1 * time.Hour
+
+	// DefaultCleanupInterval is the default interval for background cleanup.
+	DefaultCleanupInterval = 5 * time.Minute
+)
+
+// =============================================================================
+// Metrics Entry
+// =============================================================================
+
+// metricsEntry wraps QueryMetrics with timestamp for TTL tracking.
+type metricsEntry struct {
+	metrics   *QueryMetrics
+	timestamp time.Time
+}
+
+// =============================================================================
+// Metrics Tracker Config
+// =============================================================================
+
+// MetricsTrackerConfig holds configuration for the metrics tracker.
+type MetricsTrackerConfig struct {
+	// MaxEntries is the maximum number of metrics entries to retain.
+	MaxEntries int
+
+	// TTL is the time-to-live for metrics entries.
+	TTL time.Duration
+
+	// CleanupInterval is the interval for background cleanup.
+	CleanupInterval time.Duration
+}
+
+// DefaultMetricsTrackerConfig returns the default configuration.
+func DefaultMetricsTrackerConfig() MetricsTrackerConfig {
+	return MetricsTrackerConfig{
+		MaxEntries:      DefaultMetricsMaxEntries,
+		TTL:             DefaultMetricsTTL,
+		CleanupInterval: DefaultCleanupInterval,
+	}
+}
+
+// =============================================================================
 // Metrics Tracker
 // =============================================================================
 
-// metricsTracker provides thread-safe tracking of query metrics.
+// metricsTracker provides thread-safe tracking of query metrics with bounded memory.
 type metricsTracker struct {
-	metrics       map[string]*QueryMetrics
+	metrics       map[string]*metricsEntry
 	totalLatency  atomic.Int64
 	totalCount    atomic.Int64
 	textLatency   atomic.Int64
@@ -68,22 +118,127 @@ type metricsTracker struct {
 	fusionCount   atomic.Int64
 	timeoutCount  atomic.Int64
 	mu            sync.RWMutex
+
+	// Configuration
+	maxEntries int
+	ttl        time.Duration
+
+	// Background cleanup
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
-// newMetricsTracker creates a new metrics tracker.
+// newMetricsTracker creates a new metrics tracker with default configuration.
 func newMetricsTracker() *metricsTracker {
-	return &metricsTracker{
-		metrics: make(map[string]*QueryMetrics),
+	return newMetricsTrackerWithConfig(DefaultMetricsTrackerConfig())
+}
+
+// newMetricsTrackerWithConfig creates a new metrics tracker with custom config.
+func newMetricsTrackerWithConfig(config MetricsTrackerConfig) *metricsTracker {
+	if config.MaxEntries <= 0 {
+		config.MaxEntries = DefaultMetricsMaxEntries
+	}
+	if config.TTL <= 0 {
+		config.TTL = DefaultMetricsTTL
+	}
+	if config.CleanupInterval <= 0 {
+		config.CleanupInterval = DefaultCleanupInterval
+	}
+
+	mt := &metricsTracker{
+		metrics:    make(map[string]*metricsEntry),
+		maxEntries: config.MaxEntries,
+		ttl:        config.TTL,
+		stopCh:     make(chan struct{}),
+	}
+
+	// Start background cleanup goroutine
+	mt.wg.Add(1)
+	go mt.cleanupLoop(config.CleanupInterval)
+
+	return mt
+}
+
+// cleanupLoop runs periodic cleanup of expired entries.
+func (mt *metricsTracker) cleanupLoop(interval time.Duration) {
+	defer mt.wg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-mt.stopCh:
+			return
+		case <-ticker.C:
+			mt.cleanup()
+		}
 	}
 }
 
-// Record stores metrics for a query.
+// cleanup removes expired entries from the metrics map.
+func (mt *metricsTracker) cleanup() {
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
+
+	now := time.Now()
+	for id, entry := range mt.metrics {
+		if now.Sub(entry.timestamp) > mt.ttl {
+			delete(mt.metrics, id)
+		}
+	}
+}
+
+// Close stops the background cleanup goroutine.
+func (mt *metricsTracker) Close() {
+	close(mt.stopCh)
+	mt.wg.Wait()
+}
+
+// Record stores metrics for a query with bounded memory management.
 func (mt *metricsTracker) Record(queryID string, metrics *QueryMetrics) {
 	mt.mu.Lock()
-	mt.metrics[queryID] = metrics
+	mt.recordLocked(queryID, metrics)
 	mt.mu.Unlock()
 
-	// Update aggregate counters
+	// Update aggregate counters (atomic, no lock needed)
+	mt.updateAggregates(metrics)
+}
+
+// recordLocked stores metrics entry under lock and enforces bounds.
+func (mt *metricsTracker) recordLocked(queryID string, metrics *QueryMetrics) {
+	// Evict oldest entries if at capacity
+	mt.evictIfNeeded()
+
+	mt.metrics[queryID] = &metricsEntry{
+		metrics:   metrics,
+		timestamp: time.Now(),
+	}
+}
+
+// evictIfNeeded removes oldest entries if at or over capacity.
+func (mt *metricsTracker) evictIfNeeded() {
+	if len(mt.metrics) < mt.maxEntries {
+		return
+	}
+
+	// Find and remove oldest entry
+	var oldestID string
+	var oldestTime time.Time
+
+	for id, entry := range mt.metrics {
+		if oldestID == "" || entry.timestamp.Before(oldestTime) {
+			oldestID = id
+			oldestTime = entry.timestamp
+		}
+	}
+
+	if oldestID != "" {
+		delete(mt.metrics, oldestID)
+	}
+}
+
+// updateAggregates updates the atomic aggregate counters.
+func (mt *metricsTracker) updateAggregates(metrics *QueryMetrics) {
 	mt.totalLatency.Add(int64(metrics.TotalLatency))
 	mt.totalCount.Add(1)
 
@@ -149,8 +304,28 @@ func (mt *metricsTracker) GetAverageMetrics() *QueryMetrics {
 func (mt *metricsTracker) GetMetrics(queryID string) (*QueryMetrics, bool) {
 	mt.mu.RLock()
 	defer mt.mu.RUnlock()
-	m, ok := mt.metrics[queryID]
-	return m, ok
+	entry, ok := mt.metrics[queryID]
+	if !ok {
+		return nil, false
+	}
+	return entry.metrics, true
+}
+
+// EntryCount returns the current number of metrics entries.
+func (mt *metricsTracker) EntryCount() int {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+	return len(mt.metrics)
+}
+
+// MaxEntries returns the configured maximum entries limit.
+func (mt *metricsTracker) MaxEntries() int {
+	return mt.maxEntries
+}
+
+// TTL returns the configured time-to-live for entries.
+func (mt *metricsTracker) TTL() time.Duration {
+	return mt.ttl
 }
 
 // =============================================================================
@@ -551,6 +726,17 @@ func (c *HybridQueryCoordinator) ReadySearchers() []string {
 		ready = append(ready, "graph")
 	}
 	return ready
+}
+
+// =============================================================================
+// Lifecycle Methods
+// =============================================================================
+
+// Close cleans up resources including the background metrics cleanup goroutine.
+func (c *HybridQueryCoordinator) Close() {
+	if c.metricsTracker != nil {
+		c.metricsTracker.Close()
+	}
 }
 
 // =============================================================================
