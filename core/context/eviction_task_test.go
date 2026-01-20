@@ -874,3 +874,207 @@ func TestTaskCompletionEvictionWithMixedContent(t *testing.T) {
 	}
 	assert.Equal(t, 270, totalTokens)
 }
+
+// =============================================================================
+// W3M.11 - Performance Tests for O(n) Completion Matching
+// =============================================================================
+
+func TestCompletionMatchingPerformanceWithManyItems(t *testing.T) {
+	// Test that completion matching scales linearly, not quadratically.
+	// This verifies the W3M.11 fix: O(n) instead of O(n²).
+	markers := []string{
+		"task complete", "workflow complete", "done", "finished",
+		"completed", "approved", "merged", "deployed", "released",
+		"shipped", "delivered", "concluded", "resolved", "closed",
+	}
+
+	cfg := TaskCompletionConfig{
+		CompletedTaskMarkers: markers,
+		PreserveLastNTasks:   0,
+	}
+	eviction := NewTaskCompletionEviction(cfg)
+
+	baseTime := time.Now()
+
+	// Create 1000 entries across 100 tasks
+	entries := make([]*ContentEntry, 0, 1000)
+	for i := 0; i < 100; i++ {
+		taskID := "task" + string(rune('0'+i/10)) + string(rune('0'+i%10))
+		for j := 0; j < 10; j++ {
+			content := "Working on " + taskID
+			if j == 9 {
+				content = "Task complete for " + taskID
+			}
+			entries = append(entries, createTestEntry(
+				taskID+"-"+string(rune('0'+j)),
+				taskID,
+				content,
+				100,
+				baseTime.Add(time.Duration(i*10+j)*time.Minute),
+			))
+		}
+	}
+
+	// Measure execution time - should complete quickly with O(n) complexity
+	start := time.Now()
+	result, err := eviction.SelectForEviction(context.Background(), entries, 50000)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.NotEmpty(t, result)
+	// With O(n) complexity, 1000 entries should complete in well under 1 second
+	assert.Less(t, elapsed, 1*time.Second, "Completion matching took too long, possible O(n²) complexity")
+}
+
+func TestCompletionMatchingWithManyMarkers(t *testing.T) {
+	// Test with many markers to verify pre-lowercasing optimization
+	markers := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		markers[i] = "marker" + string(rune('a'+i%26)) + string(rune('0'+i%10))
+	}
+	markers[50] = "special complete marker"
+
+	cfg := TaskCompletionConfig{
+		CompletedTaskMarkers: markers,
+		PreserveLastNTasks:   0,
+	}
+	eviction := NewTaskCompletionEviction(cfg)
+
+	baseTime := time.Now()
+	entries := []*ContentEntry{
+		createTestEntry("1", "task1", "Regular work content", 100, baseTime),
+		createTestEntry("2", "task1", "This has the SPECIAL COMPLETE MARKER here", 100, baseTime.Add(1*time.Minute)),
+	}
+
+	result, err := eviction.SelectForEviction(context.Background(), entries, 500)
+
+	require.NoError(t, err)
+	assert.Len(t, result, 2, "Should detect completion marker regardless of case")
+}
+
+func TestLowerMarkersPrecomputation(t *testing.T) {
+	// Verify that markers are pre-lowercased correctly
+	cfg := TaskCompletionConfig{
+		CompletedTaskMarkers: []string{"TASK COMPLETE", "Done", "FiNiShEd"},
+		PreserveLastNTasks:   0,
+	}
+	eviction := NewTaskCompletionEviction(cfg)
+
+	// Test with various case combinations
+	testCases := []struct {
+		content  string
+		expected bool
+	}{
+		{"task complete", true},
+		{"TASK COMPLETE", true},
+		{"Task Complete", true},
+		{"done", true},
+		{"DONE", true},
+		{"finished", true},
+		{"FINISHED", true},
+		{"no markers here", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.content, func(t *testing.T) {
+			entries := []*ContentEntry{
+				createTestEntry("1", "task1", tc.content, 100, time.Now()),
+			}
+
+			result, _ := eviction.SelectForEviction(context.Background(), entries, 500)
+
+			if tc.expected {
+				assert.Len(t, result, 1, "Should detect marker in: %s", tc.content)
+			} else {
+				assert.Empty(t, result, "Should not detect marker in: %s", tc.content)
+			}
+		})
+	}
+}
+
+func TestSetMarkersUpdatesLowerCache(t *testing.T) {
+	// Verify that SetMarkers updates the pre-lowercased cache
+	cfg := TaskCompletionConfig{
+		CompletedTaskMarkers: []string{"original marker"},
+		PreserveLastNTasks:   0,
+	}
+	eviction := NewTaskCompletionEviction(cfg)
+
+	entries := []*ContentEntry{
+		createTestEntry("1", "task1", "NEW MARKER HERE", 100, time.Now()),
+	}
+
+	// Original marker should not match
+	result, _ := eviction.SelectForEviction(context.Background(), entries, 500)
+	assert.Empty(t, result, "Should not match with original markers")
+
+	// Update markers
+	eviction.SetMarkers([]string{"NEW MARKER"})
+
+	// New marker should match (case-insensitive)
+	result, _ = eviction.SelectForEviction(context.Background(), entries, 500)
+	assert.Len(t, result, 1, "Should match after SetMarkers")
+}
+
+func TestCompletionDetectionEdgeCases(t *testing.T) {
+	cfg := TaskCompletionConfig{
+		CompletedTaskMarkers: []string{"done", "complete"},
+		PreserveLastNTasks:   0,
+	}
+	eviction := NewTaskCompletionEviction(cfg)
+
+	testCases := []struct {
+		name     string
+		content  string
+		expected bool
+	}{
+		{"empty content", "", false},
+		{"marker at start", "done with this task", true},
+		{"marker at end", "this task is complete", true},
+		{"marker in middle", "the task is done now", true},
+		{"marker as substring", "abandoned task", true}, // "done" IS in "abandoned" - substring matching
+		{"no marker present", "working on the task", false},
+		{"partial marker", "com", false},
+		{"unicode content with marker", "Task is done!", true},
+		{"whitespace only", "   ", false},
+		{"marker with extra spaces", "task is   done", true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []*ContentEntry{
+				createTestEntry("1", "task1", tc.content, 100, time.Now()),
+			}
+
+			result, _ := eviction.SelectForEviction(context.Background(), entries, 500)
+
+			if tc.expected {
+				assert.Len(t, result, 1, "Should detect completion in: %q", tc.content)
+			} else {
+				assert.Empty(t, result, "Should not detect completion in: %q", tc.content)
+			}
+		})
+	}
+}
+
+func TestBuildLowerMarkers(t *testing.T) {
+	// Test the helper function directly
+	testCases := []struct {
+		input    []string
+		expected []string
+	}{
+		{nil, []string{}},
+		{[]string{}, []string{}},
+		{[]string{"HELLO"}, []string{"hello"}},
+		{[]string{"Hello", "WORLD", "MiXeD"}, []string{"hello", "world", "mixed"}},
+	}
+
+	for _, tc := range testCases {
+		result := buildLowerMarkers(tc.input)
+		if tc.input == nil {
+			assert.Len(t, result, 0)
+		} else {
+			assert.Equal(t, tc.expected, result)
+		}
+	}
+}

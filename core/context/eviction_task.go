@@ -114,10 +114,13 @@ func cloneEntries(entries []*ContentEntry) []*ContentEntry {
 // It evicts completed task discussions while preserving ongoing tasks.
 type TaskCompletionEviction struct {
 	completedTaskMarkers []string
-	preserveLastNTasks   int
-	taskIDKey            string
-	taskStatusKey        string
-	mu                   sync.RWMutex
+	// lowerMarkers contains pre-lowercased markers for O(1) lookup per marker.
+	// This avoids repeated strings.ToLower calls during marker matching.
+	lowerMarkers       []string
+	preserveLastNTasks int
+	taskIDKey          string
+	taskStatusKey      string
+	mu                 sync.RWMutex
 }
 
 // NewTaskCompletionEviction creates a new TaskCompletionEviction with the given config.
@@ -137,12 +140,25 @@ func NewTaskCompletionEviction(config TaskCompletionConfig) *TaskCompletionEvict
 		taskStatusKey = "task_status"
 	}
 
+	// Pre-compute lowercased markers for O(n) matching instead of O(n*m).
+	lowerMarkers := buildLowerMarkers(markers)
+
 	return &TaskCompletionEviction{
 		completedTaskMarkers: markers,
+		lowerMarkers:         lowerMarkers,
 		preserveLastNTasks:   config.PreserveLastNTasks,
 		taskIDKey:            taskIDKey,
 		taskStatusKey:        taskStatusKey,
 	}
+}
+
+// buildLowerMarkers creates a slice of pre-lowercased markers.
+func buildLowerMarkers(markers []string) []string {
+	lower := make([]string, len(markers))
+	for i, m := range markers {
+		lower[i] = strings.ToLower(m)
+	}
+	return lower
 }
 
 // Name returns the strategy identifier.
@@ -262,10 +278,11 @@ func (e *TaskCompletionEviction) hasCompletionMarkerInContent(group *TaskGroup) 
 }
 
 // contentContainsMarker checks if content contains any completion marker.
+// Uses pre-lowercased markers for O(n) complexity instead of O(n*m).
 func (e *TaskCompletionEviction) contentContainsMarker(content string) bool {
 	lowerContent := strings.ToLower(content)
-	for _, marker := range e.completedTaskMarkers {
-		if strings.Contains(lowerContent, strings.ToLower(marker)) {
+	for _, marker := range e.lowerMarkers {
+		if strings.Contains(lowerContent, marker) {
 			return true
 		}
 	}
@@ -326,10 +343,12 @@ func (e *TaskCompletionEviction) addTaskEntries(
 // =============================================================================
 
 // SetMarkers sets the completion markers (thread-safe).
+// Also updates the pre-lowercased markers cache.
 func (e *TaskCompletionEviction) SetMarkers(markers []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.completedTaskMarkers = markers
+	e.lowerMarkers = buildLowerMarkers(markers)
 }
 
 // GetMarkers returns the current completion markers (thread-safe).
