@@ -1062,27 +1062,32 @@ func (g *DualQueueGate) drainQueue(queue interface{ Pop() *LLMRequest }) {
 // waitForRequests waits for all pending requests to complete within the shutdown
 // timeout. If requests don't complete within the soft timeout, it waits until
 // the hard deadline and then logs orphaned requests before returning.
+//
+// This implementation uses a single shared waiter goroutine to prevent goroutine
+// accumulation across timeout phases (W12.40, W12.41 fix).
 func (g *DualQueueGate) waitForRequests() {
 	if g.config.ShutdownTimeout <= 0 {
 		return
 	}
-	if g.waitWithSoftTimeout() {
+
+	// Create a single waiter goroutine shared between soft timeout and hard deadline.
+	// This prevents spawning multiple inner goroutines that all block on wg.Wait().
+	done := make(chan struct{})
+	go g.signalOnWaitGroupDone(&g.requestWg, done)
+
+	// Phase 1: Soft timeout
+	if g.waitForDoneOrTimeout(done, g.config.ShutdownTimeout) {
 		return
 	}
-	g.waitWithHardDeadline()
+
+	// Phase 2: Hard deadline (remaining time after soft timeout)
+	g.waitForDoneOrHardDeadline(done)
 }
 
-// waitWithSoftTimeout waits for requests to complete within the soft timeout.
-// Returns true if all requests completed, false if timeout was reached.
-// Uses context cancellation to ensure the waiter goroutine exits cleanly.
-func (g *DualQueueGate) waitWithSoftTimeout() bool {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan struct{})
-	go g.signalOnWaitGroupDoneWithContext(ctx, &g.requestWg, done)
-
-	timer := time.NewTimer(g.config.ShutdownTimeout)
+// waitForDoneOrTimeout waits for the done channel to close or the timeout to elapse.
+// Returns true if done closed, false if timeout elapsed.
+func (g *DualQueueGate) waitForDoneOrTimeout(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
@@ -1093,20 +1098,14 @@ func (g *DualQueueGate) waitWithSoftTimeout() bool {
 	}
 }
 
-// waitWithHardDeadline waits until the hard deadline, then logs orphaned requests.
-// Uses context cancellation to ensure the waiter goroutine exits cleanly.
-func (g *DualQueueGate) waitWithHardDeadline() {
+// waitForDoneOrHardDeadline waits for the done channel or remaining hard deadline time.
+// Logs orphaned requests if hard deadline is reached.
+func (g *DualQueueGate) waitForDoneOrHardDeadline(done <-chan struct{}) {
 	remaining := g.config.HardDeadline - g.config.ShutdownTimeout
 	if remaining <= 0 {
 		g.logOrphanedRequests()
 		return
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan struct{})
-	go g.signalOnWaitGroupDoneWithContext(ctx, &g.requestWg, done)
 
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()

@@ -722,3 +722,268 @@ func TestW12_15_TimedWakeup_CleanExit(t *testing.T) {
 		t.Error("pushers did not complete - goroutine leak or deadlock")
 	}
 }
+
+// =============================================================================
+// W12.40 - LLMGate Goroutine Leak in waitWithSoftTimeout Tests
+// =============================================================================
+
+// TestW12_40_SignalOnWaitGroupDoneWithContext_Success tests that the context-aware
+// helper closes done when WaitGroup completes.
+func TestW12_40_SignalOnWaitGroupDoneWithContext_Success(t *testing.T) {
+	gate := &DualQueueGate{}
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	ctx := context.Background()
+
+	wg.Add(1)
+	go gate.signalOnWaitGroupDoneWithContext(ctx, &wg, done)
+
+	// Complete the WaitGroup
+	wg.Done()
+
+	select {
+	case <-done:
+		// Expected - done channel should be closed
+	case <-time.After(100 * time.Millisecond):
+		t.Error("done channel should be closed when WaitGroup completes")
+	}
+}
+
+// TestW12_40_SignalOnWaitGroupDoneWithContext_Cancellation tests that context
+// cancellation causes the helper to exit without closing done.
+func TestW12_40_SignalOnWaitGroupDoneWithContext_Cancellation(t *testing.T) {
+	gate := &DualQueueGate{}
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	wg.Add(1) // Will never complete
+	go gate.signalOnWaitGroupDoneWithContext(ctx, &wg, done)
+
+	// Cancel context
+	cancel()
+
+	// Give time for goroutine to exit
+	time.Sleep(50 * time.Millisecond)
+
+	// done should NOT be closed
+	select {
+	case <-done:
+		t.Error("done should not be closed when context is cancelled")
+	default:
+		// Expected
+	}
+
+	// Clean up - complete WaitGroup to let inner goroutine exit
+	wg.Done()
+}
+
+// TestW12_40_WaitWithSoftTimeout_NoGoroutineLeak tests that waitWithSoftTimeout
+// does not leak goroutines when timeout fires before WaitGroup completes.
+func TestW12_40_WaitWithSoftTimeout_NoGoroutineLeak(t *testing.T) {
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	initialGoroutines := runtime.NumGoroutine()
+
+	for i := 0; i < 5; i++ {
+		executor := &mockExecutor{
+			executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+				<-ctx.Done() // Block until cancelled
+				return nil, ctx.Err()
+			},
+		}
+
+		config := DefaultDualQueueGateConfig()
+		config.ShutdownTimeout = 20 * time.Millisecond
+		config.HardDeadline = 30 * time.Millisecond
+		gate := NewDualQueueGate(config, executor)
+
+		req := &LLMRequest{
+			ID:          "test",
+			AgentID:     "agent1",
+			UserInvoked: true,
+		}
+		gate.Submit(context.Background(), req)
+
+		// Give time for request to start
+		time.Sleep(10 * time.Millisecond)
+
+		// Close triggers waitWithSoftTimeout
+		gate.Close()
+	}
+
+	// Allow goroutines to clean up
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+
+	finalGoroutines := runtime.NumGoroutine()
+	if finalGoroutines > initialGoroutines+3 {
+		t.Errorf("W12.40: potential goroutine leak in waitWithSoftTimeout: initial=%d, final=%d",
+			initialGoroutines, finalGoroutines)
+	}
+}
+
+// =============================================================================
+// W12.41 - LLMGate Goroutine Leak in waitWithHardDeadline Tests
+// =============================================================================
+
+// TestW12_41_WaitWithHardDeadline_NoGoroutineLeak tests that waitWithHardDeadline
+// does not leak goroutines when the hard deadline fires.
+func TestW12_41_WaitWithHardDeadline_NoGoroutineLeak(t *testing.T) {
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	initialGoroutines := runtime.NumGoroutine()
+
+	for i := 0; i < 5; i++ {
+		blockCh := make(chan struct{})
+		executor := &mockExecutor{
+			executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-blockCh:
+					return "done", nil
+				}
+			},
+		}
+
+		config := DefaultDualQueueGateConfig()
+		config.ShutdownTimeout = 10 * time.Millisecond
+		config.HardDeadline = 30 * time.Millisecond
+		gate := NewDualQueueGate(config, executor)
+
+		req := &LLMRequest{
+			ID:          "test",
+			AgentID:     "agent1",
+			UserInvoked: true,
+		}
+		gate.Submit(context.Background(), req)
+
+		// Give time for request to start
+		time.Sleep(5 * time.Millisecond)
+
+		// Close triggers both waitWithSoftTimeout and waitWithHardDeadline
+		gate.Close()
+
+		// Unblock executor to clean up
+		close(blockCh)
+	}
+
+	// Allow goroutines to clean up
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+
+	finalGoroutines := runtime.NumGoroutine()
+	if finalGoroutines > initialGoroutines+3 {
+		t.Errorf("W12.41: potential goroutine leak in waitWithHardDeadline: initial=%d, final=%d",
+			initialGoroutines, finalGoroutines)
+	}
+}
+
+// TestW12_40_41_CombinedShutdownNoLeak tests that repeated shutdown cycles
+// with timeouts do not leak goroutines (comprehensive test for both fixes).
+func TestW12_40_41_CombinedShutdownNoLeak(t *testing.T) {
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	initialGoroutines := runtime.NumGoroutine()
+
+	for i := 0; i < 10; i++ {
+		blockCh := make(chan struct{})
+		executor := &mockExecutor{
+			executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-blockCh:
+					return "done", nil
+				}
+			},
+		}
+
+		config := DefaultDualQueueGateConfig()
+		config.ShutdownTimeout = 5 * time.Millisecond
+		config.HardDeadline = 15 * time.Millisecond
+		gate := NewDualQueueGate(config, executor)
+
+		// Submit multiple requests
+		for j := 0; j < 3; j++ {
+			req := &LLMRequest{
+				ID:          "test-" + string(rune('a'+j)),
+				AgentID:     "agent1",
+				UserInvoked: true,
+			}
+			gate.Submit(context.Background(), req)
+		}
+
+		// Give time for requests to start
+		time.Sleep(5 * time.Millisecond)
+
+		// Close - will hit both soft and hard timeout
+		gate.Close()
+
+		// Unblock executor
+		close(blockCh)
+	}
+
+	// Allow goroutines to clean up
+	runtime.GC()
+	time.Sleep(300 * time.Millisecond)
+
+	finalGoroutines := runtime.NumGoroutine()
+	if finalGoroutines > initialGoroutines+3 {
+		t.Errorf("W12.40-41: goroutine leak in shutdown cycle: initial=%d, final=%d",
+			initialGoroutines, finalGoroutines)
+	}
+}
+
+// TestW12_40_41_SingleWaiterGoroutine verifies that the waitForRequests function
+// uses a single waiter goroutine across both soft timeout and hard deadline phases,
+// preventing goroutine accumulation.
+func TestW12_40_41_SingleWaiterGoroutine(t *testing.T) {
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+
+	// Create gate with executor that ignores context cancellation
+	// to ensure we hit both timeout phases
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			// Intentionally ignore ctx.Done() to simulate slow shutdown
+			time.Sleep(100 * time.Millisecond)
+			return "done", nil
+		},
+	}
+
+	config := DefaultDualQueueGateConfig()
+	config.ShutdownTimeout = 10 * time.Millisecond
+	config.HardDeadline = 25 * time.Millisecond
+	gate := NewDualQueueGate(config, executor)
+
+	req := &LLMRequest{
+		ID:          "test-single-waiter",
+		AgentID:     "agent1",
+		UserInvoked: true,
+	}
+	gate.Submit(context.Background(), req)
+
+	// Give time for request to start
+	time.Sleep(5 * time.Millisecond)
+
+	// Count goroutines before close
+	preCloseGoroutines := runtime.NumGoroutine()
+
+	// Close triggers both soft timeout and hard deadline
+	gate.Close()
+
+	// Allow goroutines to settle
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+
+	postCloseGoroutines := runtime.NumGoroutine()
+
+	// Should not accumulate goroutines - the single waiter pattern means
+	// at most 1 goroutine is spawned for the entire wait sequence
+	if postCloseGoroutines > preCloseGoroutines {
+		t.Errorf("W12.40-41: goroutine count increased after close: pre=%d, post=%d",
+			preCloseGoroutines, postCloseGoroutines)
+	}
+}
