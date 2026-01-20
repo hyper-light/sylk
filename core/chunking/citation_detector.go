@@ -516,34 +516,35 @@ func (cd *CitationDetector) ClearChunks() {
 // String Overlap Utilities
 // =============================================================================
 
-// longestCommonSubstringLength finds the length of the longest common substring.
+// longestCommonSubstringLength finds the length of the longest common substring
+// using dynamic programming. Time complexity: O(n*m), Space complexity: O(min(n,m)).
 func longestCommonSubstringLength(s1, s2 string) int {
 	if len(s1) == 0 || len(s2) == 0 {
 		return 0
 	}
 
-	// Use a simplified approach for efficiency
-	// This is not the full dynamic programming solution, but works for our use case
-	maxLen := 0
-	minLen := len(s1)
-	if len(s2) < minLen {
-		minLen = len(s2)
+	// Ensure s2 is the shorter string for space efficiency
+	if len(s2) > len(s1) {
+		s1, s2 = s2, s1
 	}
 
-	// Check for s1 substrings in s2
-	for length := minLen; length >= 1; length-- {
-		for start := 0; start <= len(s1)-length; start++ {
-			substr := s1[start : start+length]
-			if strings.Contains(s2, substr) {
-				if length > maxLen {
-					maxLen = length
+	// Use only 2 rows for space efficiency: O(min(n,m)) space
+	prev := make([]int, len(s2)+1)
+	curr := make([]int, len(s2)+1)
+	maxLen := 0
+
+	for i := 1; i <= len(s1); i++ {
+		for j := 1; j <= len(s2); j++ {
+			if s1[i-1] == s2[j-1] {
+				curr[j] = prev[j-1] + 1
+				if curr[j] > maxLen {
+					maxLen = curr[j]
 				}
-				break // Found a match at this length, move to next
+			} else {
+				curr[j] = 0
 			}
 		}
-		if maxLen >= length {
-			break // We found the longest, no need to check shorter
-		}
+		prev, curr = curr, prev
 	}
 
 	return maxLen
