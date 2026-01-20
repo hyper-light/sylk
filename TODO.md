@@ -37144,7 +37144,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1A - MESSAGING & EVENTS (3 CRITICAL)                                      ││
 │ │                                                                                  ││
-│ │ [ ] W12.1 - ResponseStream Send on Closed Channel                               ││
+│ │ [x] W12.1 - ResponseStream Send on Closed Channel                               ││
 │ │   FILE: agents/guide/response_stream.go:361-379                                 ││
 │ │   ISSUE: Close() broadcasts on rs.done without checking if already closed       ││
 │ │   FIX: Use sync.Once for close, check closed state before channel operations    ││
@@ -37236,7 +37236,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 2B - LLM INTEGRATION (4 CRITICAL)                                         ││
 │ │                                                                                  ││
-│ │ [ ] W12.13 - LLMGate Goroutine Leak in waitGroupWaiter                          ││
+│ │ [x] W12.13 - LLMGate Goroutine Leak in waitGroupWaiter                          ││
 │ │   FILE: core/concurrency/llm_gate.go:1163-1179                                  ││
 │ │   ISSUE: Goroutine blocks forever if WaitGroup never completes                  ││
 │ │   FIX: Add timeout or context cancellation to waiter goroutine                  ││
