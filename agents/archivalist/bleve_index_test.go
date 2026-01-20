@@ -3,6 +3,8 @@ package archivalist
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 // MockBleveIndex implements BleveIndex for testing.
 type MockBleveIndex struct {
+	mu           sync.RWMutex
 	indexed      map[string]interface{}
 	searchResult *bleve.SearchResult
 	indexErr     error
@@ -32,6 +35,8 @@ func NewMockBleveIndex() *MockBleveIndex {
 }
 
 func (m *MockBleveIndex) Index(id string, data interface{}) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.indexErr != nil {
 		return m.indexErr
 	}
@@ -40,6 +45,8 @@ func (m *MockBleveIndex) Index(id string, data interface{}) error {
 }
 
 func (m *MockBleveIndex) Search(req *bleve.SearchRequest) (*bleve.SearchResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.searchErr != nil {
 		return nil, m.searchErr
 	}
@@ -53,6 +60,8 @@ func (m *MockBleveIndex) Search(req *bleve.SearchRequest) (*bleve.SearchResult, 
 }
 
 func (m *MockBleveIndex) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.closeErr != nil {
 		return m.closeErr
 	}
@@ -61,6 +70,8 @@ func (m *MockBleveIndex) Close() error {
 }
 
 func (m *MockBleveIndex) SetSearchResult(ids ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	hits := make(search.DocumentMatchCollection, len(ids))
 	for i, id := range ids {
 		hits[i] = &search.DocumentMatch{ID: id}
@@ -77,7 +88,7 @@ func (m *MockBleveIndex) SetSearchResult(ids ...string) {
 
 func TestNewBleveEventIndex(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	if bleveIndex == nil {
 		t.Fatal("Expected non-nil BleveEventIndex")
@@ -93,7 +104,7 @@ func TestNewBleveEventIndex(t *testing.T) {
 }
 
 func TestNewBleveEventIndex_NilIndex(t *testing.T) {
-	bleveIndex := NewBleveEventIndex(nil)
+	bleveIndex := NewBleveEventIndex(nil, 0)
 
 	if bleveIndex == nil {
 		t.Fatal("Expected non-nil BleveEventIndex even with nil index")
@@ -110,7 +121,7 @@ func TestNewBleveEventIndex_NilIndex(t *testing.T) {
 
 func TestBleveEventIndex_IndexEvent_Success(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	event := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
 	event.Summary = "Test summary"
@@ -151,7 +162,7 @@ func TestBleveEventIndex_IndexEvent_Success(t *testing.T) {
 
 func TestBleveEventIndex_IndexEvent_NilEvent(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	err := bleveIndex.IndexEvent(context.Background(), nil, []string{"content"})
 	if err == nil {
@@ -164,7 +175,7 @@ func TestBleveEventIndex_IndexEvent_NilEvent(t *testing.T) {
 }
 
 func TestBleveEventIndex_IndexEvent_NilIndex(t *testing.T) {
-	bleveIndex := NewBleveEventIndex(nil)
+	bleveIndex := NewBleveEventIndex(nil, 0)
 	event := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
 
 	err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
@@ -180,7 +191,7 @@ func TestBleveEventIndex_IndexEvent_NilIndex(t *testing.T) {
 func TestBleveEventIndex_IndexEvent_IndexError(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
 	mockIndex.indexErr = errors.New("index failed")
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	event := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
 
@@ -196,7 +207,7 @@ func TestBleveEventIndex_IndexEvent_IndexError(t *testing.T) {
 
 func TestBleveEventIndex_IndexEvent_ContextCanceled(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
@@ -250,7 +261,7 @@ func TestBleveEventIndex_IndexEvent_FieldSelection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mockIndex := NewMockBleveIndex()
-			bleveIndex := NewBleveEventIndex(mockIndex)
+			bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 			event := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
 			event.Summary = "Test summary"
@@ -279,7 +290,7 @@ func TestBleveEventIndex_IndexEvent_FieldSelection(t *testing.T) {
 
 func TestBleveEventIndex_IndexEvent_DataField(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	event := createTestEvent("test-1", events.EventTypeToolCall, "Test content")
 	event.Data = map[string]any{
@@ -310,7 +321,7 @@ func TestBleveEventIndex_IndexEvent_DataField(t *testing.T) {
 
 func TestBleveEventIndex_Search_Success(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	// Index some events first
 	event1 := createTestEvent("event-1", events.EventTypeAgentDecision, "Decision about architecture")
@@ -334,7 +345,7 @@ func TestBleveEventIndex_Search_Success(t *testing.T) {
 }
 
 func TestBleveEventIndex_Search_NilIndex(t *testing.T) {
-	bleveIndex := NewBleveEventIndex(nil)
+	bleveIndex := NewBleveEventIndex(nil, 0)
 
 	_, err := bleveIndex.Search(context.Background(), "test", 10)
 	if err == nil {
@@ -345,7 +356,7 @@ func TestBleveEventIndex_Search_NilIndex(t *testing.T) {
 func TestBleveEventIndex_Search_SearchError(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
 	mockIndex.searchErr = errors.New("search failed")
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	_, err := bleveIndex.Search(context.Background(), "test", 10)
 	if err == nil {
@@ -355,7 +366,7 @@ func TestBleveEventIndex_Search_SearchError(t *testing.T) {
 
 func TestBleveEventIndex_Search_ContextCanceled(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -372,7 +383,7 @@ func TestBleveEventIndex_Search_ContextCanceled(t *testing.T) {
 
 func TestBleveEventIndex_Search_DefaultLimit(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	// Search with limit 0 should use default
 	_, err := bleveIndex.Search(context.Background(), "test", 0)
@@ -389,7 +400,7 @@ func TestBleveEventIndex_Search_DefaultLimit(t *testing.T) {
 
 func TestBleveEventIndex_Search_EmptyResults(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	// No search result set, should return empty
 	results, err := bleveIndex.Search(context.Background(), "nonexistent", 10)
@@ -408,7 +419,7 @@ func TestBleveEventIndex_Search_EmptyResults(t *testing.T) {
 
 func TestBleveEventIndex_SearchWithFilters_Success(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	// Index events
 	event1 := createTestEvent("event-1", events.EventTypeAgentDecision, "Test content")
@@ -434,7 +445,7 @@ func TestBleveEventIndex_SearchWithFilters_Success(t *testing.T) {
 
 func TestBleveEventIndex_SearchWithFilters_NoQuery(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	event1 := createTestEvent("event-1", events.EventTypeAgentDecision, "Test content")
 	bleveIndex.IndexEvent(context.Background(), event1, []string{"content"})
@@ -458,7 +469,7 @@ func TestBleveEventIndex_SearchWithFilters_NoQuery(t *testing.T) {
 
 func TestBleveEventIndex_SearchWithFilters_NoFilters(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	event1 := createTestEvent("event-1", events.EventTypeAgentDecision, "Test content")
 	bleveIndex.IndexEvent(context.Background(), event1, []string{"content"})
@@ -478,7 +489,7 @@ func TestBleveEventIndex_SearchWithFilters_NoFilters(t *testing.T) {
 
 func TestBleveEventIndex_SearchWithFilters_EmptyQueryAndFilters(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	event1 := createTestEvent("event-1", events.EventTypeAgentDecision, "Test content")
 	bleveIndex.IndexEvent(context.Background(), event1, []string{"content"})
@@ -502,7 +513,7 @@ func TestBleveEventIndex_SearchWithFilters_EmptyQueryAndFilters(t *testing.T) {
 
 func TestBleveEventIndex_Close_Success(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	err := bleveIndex.Close()
 	if err != nil {
@@ -515,7 +526,7 @@ func TestBleveEventIndex_Close_Success(t *testing.T) {
 }
 
 func TestBleveEventIndex_Close_NilIndex(t *testing.T) {
-	bleveIndex := NewBleveEventIndex(nil)
+	bleveIndex := NewBleveEventIndex(nil, 0)
 
 	err := bleveIndex.Close()
 	if err != nil {
@@ -526,7 +537,7 @@ func TestBleveEventIndex_Close_NilIndex(t *testing.T) {
 func TestBleveEventIndex_Close_Error(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
 	mockIndex.closeErr = errors.New("close failed")
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	err := bleveIndex.Close()
 	if err == nil {
@@ -540,7 +551,7 @@ func TestBleveEventIndex_Close_Error(t *testing.T) {
 
 func TestBleveEventIndex_Cache_Operations(t *testing.T) {
 	mockIndex := NewMockBleveIndex()
-	bleveIndex := NewBleveEventIndex(mockIndex)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
 
 	// Initially empty
 	if bleveIndex.CacheSize() != 0 {
@@ -575,6 +586,254 @@ func TestBleveEventIndex_Cache_Operations(t *testing.T) {
 	bleveIndex.ClearCache()
 	if bleveIndex.CacheSize() != 0 {
 		t.Errorf("Expected cache size 0 after clear, got %d", bleveIndex.CacheSize())
+	}
+}
+
+// =============================================================================
+// W4H.3 LRU Cache Tests
+// =============================================================================
+
+func TestBleveEventIndex_LRU_CacheHitMiss(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 100)
+
+	// Cache miss for non-existent event
+	event := bleveIndex.GetCachedEvent("non-existent")
+	if event != nil {
+		t.Error("Expected nil for cache miss")
+	}
+
+	// Index an event (cache hit after indexing)
+	testEvent := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
+	err := bleveIndex.IndexEvent(context.Background(), testEvent, []string{"content"})
+	if err != nil {
+		t.Fatalf("Failed to index event: %v", err)
+	}
+
+	// Cache hit
+	cachedEvent := bleveIndex.GetCachedEvent("test-1")
+	if cachedEvent == nil {
+		t.Error("Expected cache hit after indexing")
+	}
+	if cachedEvent.ID != testEvent.ID {
+		t.Error("Cached event ID mismatch")
+	}
+
+	// Verify cache size
+	if bleveIndex.CacheSize() != 1 {
+		t.Errorf("Expected cache size 1, got %d", bleveIndex.CacheSize())
+	}
+}
+
+func TestBleveEventIndex_LRU_Eviction(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	maxSize := 5
+	bleveIndex := NewBleveEventIndex(mockIndex, maxSize)
+
+	// Fill cache beyond capacity
+	for i := 0; i < maxSize+3; i++ {
+		event := createTestEvent(
+			fmt.Sprintf("event-%d", i),
+			events.EventTypeAgentDecision,
+			fmt.Sprintf("Content %d", i),
+		)
+		err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+		if err != nil {
+			t.Fatalf("Failed to index event %d: %v", i, err)
+		}
+	}
+
+	// Verify cache size is bounded
+	if bleveIndex.CacheSize() != maxSize {
+		t.Errorf("Expected cache size %d, got %d", maxSize, bleveIndex.CacheSize())
+	}
+
+	// Oldest events should be evicted (event-0, event-1, event-2)
+	for i := 0; i < 3; i++ {
+		evicted := bleveIndex.GetCachedEvent(fmt.Sprintf("event-%d", i))
+		if evicted != nil {
+			t.Errorf("Expected event-%d to be evicted, but it was found in cache", i)
+		}
+	}
+
+	// Newest events should still be in cache
+	for i := 3; i < maxSize+3; i++ {
+		cached := bleveIndex.GetCachedEvent(fmt.Sprintf("event-%d", i))
+		if cached == nil {
+			t.Errorf("Expected event-%d to be in cache, but it was not found", i)
+		}
+	}
+}
+
+func TestBleveEventIndex_LRU_Concurrent(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 1000)
+
+	const numGoroutines = 10
+	const eventsPerGoroutine = 100
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// Concurrent indexing
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < eventsPerGoroutine; i++ {
+				event := createTestEvent(
+					fmt.Sprintf("g%d-event-%d", goroutineID, i),
+					events.EventTypeAgentDecision,
+					fmt.Sprintf("Content from goroutine %d event %d", goroutineID, i),
+				)
+				err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+				if err != nil {
+					t.Errorf("Failed to index event: %v", err)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Verify all events were indexed (cache size should equal total events)
+	expectedSize := numGoroutines * eventsPerGoroutine
+	if bleveIndex.CacheSize() != expectedSize {
+		t.Errorf("Expected cache size %d, got %d", expectedSize, bleveIndex.CacheSize())
+	}
+}
+
+func TestBleveEventIndex_LRU_ConcurrentReadWrite(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 500)
+
+	const numWriters = 5
+	const numReaders = 5
+	const opsPerGoroutine = 100
+	var wg sync.WaitGroup
+	wg.Add(numWriters + numReaders)
+
+	// Writers
+	for w := 0; w < numWriters; w++ {
+		go func(writerID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				event := createTestEvent(
+					fmt.Sprintf("w%d-event-%d", writerID, i),
+					events.EventTypeAgentDecision,
+					fmt.Sprintf("Writer %d content %d", writerID, i),
+				)
+				_ = bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+			}
+		}(w)
+	}
+
+	// Readers
+	for r := 0; r < numReaders; r++ {
+		go func(readerID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				// Read random events
+				_ = bleveIndex.GetCachedEvent(fmt.Sprintf("w%d-event-%d", readerID%numWriters, i%opsPerGoroutine))
+				_ = bleveIndex.CacheSize()
+			}
+		}(r)
+	}
+
+	wg.Wait()
+
+	// Verify cache is still functional
+	if bleveIndex.CacheSize() > 500 {
+		t.Errorf("Cache exceeded max size: %d", bleveIndex.CacheSize())
+	}
+}
+
+func TestBleveEventIndex_LRU_MemoryStability(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	maxSize := 100
+	bleveIndex := NewBleveEventIndex(mockIndex, maxSize)
+
+	// Index many events (10x the cache size) to ensure stable memory
+	totalEvents := maxSize * 10
+	for i := 0; i < totalEvents; i++ {
+		event := createTestEvent(
+			fmt.Sprintf("event-%d", i),
+			events.EventTypeAgentDecision,
+			fmt.Sprintf("Content %d with some additional text to make it larger", i),
+		)
+		err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+		if err != nil {
+			t.Fatalf("Failed to index event %d: %v", i, err)
+		}
+
+		// Periodically verify cache size is bounded
+		if i > 0 && i%100 == 0 {
+			size := bleveIndex.CacheSize()
+			if size > maxSize {
+				t.Errorf("Cache exceeded max size at iteration %d: %d > %d", i, size, maxSize)
+			}
+		}
+	}
+
+	// Final verification
+	finalSize := bleveIndex.CacheSize()
+	if finalSize != maxSize {
+		t.Errorf("Expected final cache size %d, got %d", maxSize, finalSize)
+	}
+
+	// Verify only the most recent events are in cache
+	for i := totalEvents - maxSize; i < totalEvents; i++ {
+		cached := bleveIndex.GetCachedEvent(fmt.Sprintf("event-%d", i))
+		if cached == nil {
+			t.Errorf("Expected event-%d to be in cache", i)
+		}
+	}
+}
+
+func TestBleveEventIndex_LRU_DefaultSize(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+
+	// Test with 0 (should use default)
+	bleveIndex := NewBleveEventIndex(mockIndex, 0)
+	if bleveIndex == nil {
+		t.Fatal("Expected non-nil BleveEventIndex with size 0")
+	}
+
+	// Test with negative (should use default)
+	bleveIndex = NewBleveEventIndex(mockIndex, -1)
+	if bleveIndex == nil {
+		t.Fatal("Expected non-nil BleveEventIndex with negative size")
+	}
+}
+
+func TestBleveEventIndex_LRU_UpdateExisting(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 10)
+
+	// Index initial event
+	event1 := createTestEvent("test-1", events.EventTypeAgentDecision, "Initial content")
+	err := bleveIndex.IndexEvent(context.Background(), event1, []string{"content"})
+	if err != nil {
+		t.Fatalf("Failed to index event: %v", err)
+	}
+
+	// Update the same event
+	event2 := createTestEvent("test-1", events.EventTypeAgentDecision, "Updated content")
+	err = bleveIndex.IndexEvent(context.Background(), event2, []string{"content"})
+	if err != nil {
+		t.Fatalf("Failed to update event: %v", err)
+	}
+
+	// Cache size should still be 1
+	if bleveIndex.CacheSize() != 1 {
+		t.Errorf("Expected cache size 1 after update, got %d", bleveIndex.CacheSize())
+	}
+
+	// Should get updated event
+	cached := bleveIndex.GetCachedEvent("test-1")
+	if cached == nil {
+		t.Error("Expected to find cached event")
+	}
+	if cached.Content != "Updated content" {
+		t.Errorf("Expected updated content, got %s", cached.Content)
 	}
 }
 

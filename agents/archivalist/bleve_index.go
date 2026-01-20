@@ -10,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search/query"
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 // =============================================================================
@@ -23,15 +24,19 @@ type BleveIndex interface {
 	Close() error
 }
 
+// DefaultEventCacheSize is the default maximum number of events to cache.
+const DefaultEventCacheSize = 10000
+
 // BleveEventIndex provides full-text search indexing for ActivityEvents.
 // It wraps a Bleve index to provide event-specific indexing and search operations.
+// Uses an LRU cache with bounded size to prevent unbounded memory growth.
 type BleveEventIndex struct {
 	index BleveIndex
 	mu    sync.RWMutex
 
 	// eventCache stores indexed events for retrieval after search.
-	// Key is the event ID, value is the serialized event.
-	eventCache map[string]*events.ActivityEvent
+	// Uses LRU eviction to bound memory usage (W4H.3 fix).
+	eventCache *lru.Cache[string, *events.ActivityEvent]
 }
 
 // bleveEventDocument represents the document structure indexed in Bleve.
@@ -51,10 +56,15 @@ type bleveEventDocument struct {
 }
 
 // NewBleveEventIndex creates a new BleveEventIndex with the provided Bleve index.
-func NewBleveEventIndex(index BleveIndex) *BleveEventIndex {
+// maxCacheSize specifies the maximum number of events to cache; if <= 0, uses default.
+func NewBleveEventIndex(index BleveIndex, maxCacheSize int) *BleveEventIndex {
+	if maxCacheSize <= 0 {
+		maxCacheSize = DefaultEventCacheSize
+	}
+	cache, _ := lru.New[string, *events.ActivityEvent](maxCacheSize)
 	return &BleveEventIndex{
 		index:      index,
-		eventCache: make(map[string]*events.ActivityEvent),
+		eventCache: cache,
 	}
 }
 
@@ -85,9 +95,9 @@ func (b *BleveEventIndex) IndexEvent(ctx context.Context, event *events.Activity
 		return fmt.Errorf("failed to index event %s: %w", event.ID, err)
 	}
 
-	// Cache the event for retrieval
+	// Cache the event for retrieval (LRU eviction handled automatically)
 	b.mu.Lock()
-	b.eventCache[event.ID] = event
+	b.eventCache.Add(event.ID, event)
 	b.mu.Unlock()
 
 	return nil
@@ -238,7 +248,7 @@ func (b *BleveEventIndex) resultsToEvents(result *bleve.SearchResult) []*events.
 
 	for _, hit := range result.Hits {
 		// Try to get from cache first
-		if event, ok := b.eventCache[hit.ID]; ok {
+		if event, ok := b.eventCache.Get(hit.ID); ok {
 			eventList = append(eventList, event)
 		}
 	}
@@ -259,19 +269,20 @@ func (b *BleveEventIndex) Close() error {
 func (b *BleveEventIndex) GetCachedEvent(id string) *events.ActivityEvent {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.eventCache[id]
+	event, _ := b.eventCache.Get(id)
+	return event
 }
 
 // ClearCache clears the event cache.
 func (b *BleveEventIndex) ClearCache() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.eventCache = make(map[string]*events.ActivityEvent)
+	b.eventCache.Purge()
 }
 
 // CacheSize returns the number of cached events.
 func (b *BleveEventIndex) CacheSize() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return len(b.eventCache)
+	return b.eventCache.Len()
 }
