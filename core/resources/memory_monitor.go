@@ -361,7 +361,12 @@ func (m *MemoryMonitor) SetComponentBudget(name ComponentName, budget int64) {
 func (m *MemoryMonitor) GlobalUsage() int64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.globalUsageLocked()
+}
 
+// globalUsageLocked calculates total memory usage without acquiring the lock.
+// Caller must hold m.mu.RLock or m.mu.Lock.
+func (m *MemoryMonitor) globalUsageLocked() int64 {
 	var total int64
 	for _, comp := range m.components {
 		total += comp.Current()
@@ -426,7 +431,7 @@ func (m *MemoryMonitor) Stats() MemoryMonitorStats {
 	defer m.mu.RUnlock()
 
 	stats := MemoryMonitorStats{
-		GlobalUsage:     m.GlobalUsage(),
+		GlobalUsage:     m.globalUsageLocked(),
 		GlobalCeiling:   m.globalCeiling,
 		SystemMemory:    m.systemMemory,
 		PipelinesPaused: m.pipelinesPaused.Load(),
@@ -543,16 +548,17 @@ func (m *MemoryMonitor) checkComponentPressure() {
 	defer m.mu.RUnlock()
 
 	for _, comp := range m.components {
-		m.checkSingleComponentPressure(comp)
+		m.checkSingleComponentPressureLocked(comp)
 	}
 }
 
-// checkSingleComponentPressure checks one component.
-func (m *MemoryMonitor) checkSingleComponentPressure(comp *ComponentMemory) {
+// checkSingleComponentPressureLocked checks one component.
+// Caller must hold m.mu.RLock or m.mu.Lock.
+func (m *MemoryMonitor) checkSingleComponentPressureLocked(comp *ComponentMemory) {
 	percent := comp.UsagePercent()
 	stats := comp.Stats()
 
-	payload := m.createPayload(comp.Name(), stats.Current, stats.Budget, m.globalCeiling)
+	payload := m.createPayloadLocked(comp.Name(), stats.Current, stats.Budget, m.globalCeiling)
 
 	if percent >= m.config.ComponentWarnThreshold {
 		m.handleComponentAggressivePressure(payload)
@@ -576,13 +582,27 @@ func (m *MemoryMonitor) handleComponentLRUPressure(payload MemorySignalPayload) 
 	_ = m.config.SignalPublisher.PublishMemorySignal(SignalComponentLRU, payload)
 }
 
-// createPayload creates a signal payload.
+// createPayload creates a signal payload without holding locks.
+// It acquires locks internally as needed.
 func (m *MemoryMonitor) createPayload(comp ComponentName, current, budget, ceiling int64) MemorySignalPayload {
 	return MemorySignalPayload{
 		Component:     comp,
 		CurrentBytes:  current,
 		BudgetBytes:   budget,
 		GlobalBytes:   m.GlobalUsage(),
+		GlobalCeiling: ceiling,
+		Timestamp:     time.Now(),
+	}
+}
+
+// createPayloadLocked creates a signal payload.
+// Caller must hold m.mu.RLock or m.mu.Lock.
+func (m *MemoryMonitor) createPayloadLocked(comp ComponentName, current, budget, ceiling int64) MemorySignalPayload {
+	return MemorySignalPayload{
+		Component:     comp,
+		CurrentBytes:  current,
+		BudgetBytes:   budget,
+		GlobalBytes:   m.globalUsageLocked(),
 		GlobalCeiling: ceiling,
 		Timestamp:     time.Now(),
 	}

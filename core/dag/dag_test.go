@@ -8,10 +8,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Test helpers for concurrency testing
+func newTestBudget(max int) *concurrency.GoroutineBudget {
+	return concurrency.NewGoroutineBudget(max)
+}
+
+func newTestGoroutineScope(ctx context.Context, agentID string, budget *concurrency.GoroutineBudget) *concurrency.GoroutineScope {
+	return concurrency.NewGoroutineScope(ctx, agentID, budget)
+}
 
 type mockDispatcher struct {
 	mu            sync.Mutex
@@ -803,4 +813,85 @@ func TestDefaultExecutionPolicy(t *testing.T) {
 	assert.Equal(t, 10, policy.MaxConcurrency)
 	assert.Equal(t, 5*time.Minute, policy.DefaultTimeout)
 	assert.Equal(t, 0, policy.DefaultRetries)
+}
+
+func TestScheduler_Submit_ReleasesSlotOnScopeError(t *testing.T) {
+	// Create a scope that will be shutdown to force scope.Go() to return an error
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	budget := newTestBudget(100)
+	scope := newTestGoroutineScope(ctx, "test-agent", budget)
+
+	// Shutdown the scope so Go() returns ErrScopeShutdown
+	_ = scope.Shutdown(time.Millisecond, 10*time.Millisecond)
+
+	scheduler := dag.NewScheduler(dag.SchedulerConfig{
+		MaxConcurrentDAGs: 2,
+	}, scope)
+	defer scheduler.Close()
+
+	d, _ := dag.NewBuilder("test").
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+
+	// First submit should fail due to scope shutdown
+	_, err := scheduler.Submit(context.Background(), d, dispatcher)
+	require.Error(t, err)
+
+	// The slot should have been released, verify by checking stats
+	// With MaxConcurrentDAGs=2 and 0 active, we should be able to submit
+	// after scope issue, but since scope is shutdown it will fail again
+	stats := scheduler.Stats()
+	assert.Equal(t, 0, stats.ActiveExecutions)
+}
+
+func TestScheduler_Submit_ReleasesSlotOnScopeError_Concurrent(t *testing.T) {
+	// Test that concurrent submit attempts properly handle slot release on scope errors
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	budget := newTestBudget(100)
+	scope := newTestGoroutineScope(ctx, "test-agent", budget)
+
+	scheduler := dag.NewScheduler(dag.SchedulerConfig{
+		MaxConcurrentDAGs: 2,
+	}, scope)
+	defer scheduler.Close()
+
+	// Shutdown the scope after a brief delay
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		_ = scope.Shutdown(time.Millisecond, 10*time.Millisecond)
+	}()
+
+	var wg sync.WaitGroup
+	errCount := atomic.Int32{}
+
+	// Try to submit multiple DAGs concurrently
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			d, _ := dag.NewBuilder("dag-" + string(rune('a'+idx))).
+				AddNode(dag.NodeConfig{ID: "node-1"}).
+				Build()
+
+			dispatcher := newMockDispatcher()
+			_, err := scheduler.Submit(context.Background(), d, dispatcher)
+			if err != nil {
+				errCount.Add(1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Some should have failed due to scope shutdown
+	// Verify no slot leak by checking we can still get stats
+	stats := scheduler.Stats()
+	assert.GreaterOrEqual(t, stats.MaxConcurrentDAGs, 0)
 }

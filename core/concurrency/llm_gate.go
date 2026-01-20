@@ -1074,9 +1074,13 @@ func (g *DualQueueGate) waitForRequests() {
 
 // waitWithSoftTimeout waits for requests to complete within the soft timeout.
 // Returns true if all requests completed, false if timeout was reached.
+// Uses context cancellation to ensure the waiter goroutine exits cleanly.
 func (g *DualQueueGate) waitWithSoftTimeout() bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	done := make(chan struct{})
-	go g.signalOnWaitGroupDone(&g.requestWg, done)
+	go g.signalOnWaitGroupDoneWithContext(ctx, &g.requestWg, done)
 
 	timer := time.NewTimer(g.config.ShutdownTimeout)
 	defer timer.Stop()
@@ -1090,6 +1094,7 @@ func (g *DualQueueGate) waitWithSoftTimeout() bool {
 }
 
 // waitWithHardDeadline waits until the hard deadline, then logs orphaned requests.
+// Uses context cancellation to ensure the waiter goroutine exits cleanly.
 func (g *DualQueueGate) waitWithHardDeadline() {
 	remaining := g.config.HardDeadline - g.config.ShutdownTimeout
 	if remaining <= 0 {
@@ -1097,8 +1102,11 @@ func (g *DualQueueGate) waitWithHardDeadline() {
 		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	done := make(chan struct{})
-	go g.signalOnWaitGroupDone(&g.requestWg, done)
+	go g.signalOnWaitGroupDoneWithContext(ctx, &g.requestWg, done)
 
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()
@@ -1115,6 +1123,30 @@ func (g *DualQueueGate) waitWithHardDeadline() {
 func (g *DualQueueGate) signalOnWaitGroupDone(wg *sync.WaitGroup, done chan struct{}) {
 	wg.Wait()
 	close(done)
+}
+
+// signalOnWaitGroupDoneWithContext waits on the WaitGroup and closes done when
+// finished. If the context is cancelled before the WaitGroup completes, the
+// function exits without closing done. This prevents goroutine leaks when
+// the caller times out waiting for the WaitGroup.
+func (g *DualQueueGate) signalOnWaitGroupDoneWithContext(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	done chan struct{},
+) {
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+		close(done)
+	case <-ctx.Done():
+		// Context cancelled - exit without closing done.
+		// The inner goroutine exits when the WaitGroup reaches zero.
+	}
 }
 
 // logOrphanedRequests logs information about requests that didn't complete.

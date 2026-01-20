@@ -107,10 +107,14 @@ func (s *Scheduler) Submit(ctx context.Context, dag *DAG, dispatcher NodeDispatc
 	s.registerExecution(dag, executor)
 
 	if s.scope != nil {
-		_ = s.scope.Go("dag.scheduler.run_execution", 0, func(ctx context.Context) error {
+		if err := s.scope.Go("dag.scheduler.run_execution", 0, func(ctx context.Context) error {
 			s.runExecution(ctx, dag, dispatcher, executor)
 			return nil
-		})
+		}); err != nil {
+			s.releaseDAGSlot()
+			s.unregisterExecution(dag.ID())
+			return "", err
+		}
 		return dag.ID(), nil
 	}
 

@@ -31,9 +31,10 @@ type Manager struct {
 	// Persistence
 	persister Persister
 
-	// Event handlers
-	handlersMu sync.RWMutex
-	handlers   []EventHandler
+	// Event handlers - using map with unique IDs for safe unsubscription (W12.30)
+	handlersMu      sync.RWMutex
+	handlers        map[uint64]EventHandler
+	nextHandlerID   atomic.Uint64
 
 	// State
 	closed atomic.Bool
@@ -95,7 +96,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		numShards:   cfg.NumShards,
 		maxSessions: cfg.MaxSessions,
 		persister:   cfg.Persister,
-		handlers:    make([]EventHandler, 0),
+		handlers:    make(map[uint64]EventHandler),
 		scope:       cfg.Scope,
 	}
 }
@@ -632,34 +633,35 @@ func (m *Manager) discardSession(session *Session) {
 // Event Handling
 // =============================================================================
 
-// Subscribe registers an event handler
+// Subscribe registers an event handler and returns an unsubscribe function.
+// W12.30: Uses map with unique IDs for race-safe unsubscription.
 func (m *Manager) Subscribe(handler EventHandler) func() {
+	id := m.nextHandlerID.Add(1)
+
 	m.handlersMu.Lock()
-	m.handlers = append(m.handlers, handler)
-	index := len(m.handlers) - 1
+	m.handlers[id] = handler
 	m.handlersMu.Unlock()
 
-	// Return unsubscribe function
+	// Return unsubscribe function that uses the unique ID
 	return func() {
 		m.handlersMu.Lock()
-		defer m.handlersMu.Unlock()
-		if index < len(m.handlers) {
-			m.handlers[index] = nil
-		}
+		delete(m.handlers, id)
+		m.handlersMu.Unlock()
 	}
 }
 
-// emitEvent emits an event to all handlers
+// emitEvent emits an event to all handlers.
+// W12.30: Copies handlers under lock, then dispatches without lock held.
 func (m *Manager) emitEvent(event *Event) {
 	m.handlersMu.RLock()
-	handlers := make([]EventHandler, len(m.handlers))
-	copy(handlers, m.handlers)
+	handlers := make([]EventHandler, 0, len(m.handlers))
+	for _, handler := range m.handlers {
+		handlers = append(handlers, handler)
+	}
 	m.handlersMu.RUnlock()
 
 	for _, handler := range handlers {
-		if handler != nil {
-			m.dispatchHandler(handler, event)
-		}
+		m.dispatchHandler(handler, event)
 	}
 }
 

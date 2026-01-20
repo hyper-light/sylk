@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -60,11 +61,12 @@ func (n *NoOpDiskSignalPublisher) PublishCleanupNeeded(usagePercent float64, use
 }
 
 // DiskQuotaManager manages disk usage quotas with auto-scaling.
+// W12.34: Uses atomic.Int64 for size tracking to ensure thread-safe operations.
 type DiskQuotaManager struct {
 	config    DiskQuotaConfig
 	basePath  string
-	usage     int64
-	mu        sync.RWMutex
+	usage     atomic.Int64 // W12.34: Atomic size tracking for concurrent access
+	mu        sync.RWMutex // Protects publisher and lastScan only
 	publisher DiskSignalPublisher
 	lastScan  time.Time
 }
@@ -117,40 +119,37 @@ func (m *DiskQuotaManager) clampQuota(quota int64) int64 {
 }
 
 // Usage returns the current tracked disk usage.
+// W12.34: Uses atomic.Load for lock-free access.
 func (m *DiskQuotaManager) Usage() int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.usage
+	return m.usage.Load()
 }
 
 // UsagePercent returns the current usage as a percentage of quota.
+// W12.34: Uses atomic.Load for lock-free access.
 func (m *DiskQuotaManager) UsagePercent() float64 {
 	quota := m.CalculateQuota()
 	if quota == 0 {
 		return 1.0
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return float64(m.usage) / float64(quota)
+	return float64(m.usage.Load()) / float64(quota)
 }
 
 // CanWrite checks if writing size bytes would exceed the quota.
+// W12.34: Uses atomic.Load for lock-free access.
 func (m *DiskQuotaManager) CanWrite(size int64) bool {
 	quota := m.CalculateQuota()
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.usage+size <= quota
+	return m.usage.Load()+size <= quota
 }
 
 // RecordWrite tracks a write operation and checks thresholds.
+// W12.34: Uses atomic.Add for thread-safe increment.
 func (m *DiskQuotaManager) RecordWrite(size int64) error {
 	quota := m.CalculateQuota()
+	currentUsage := m.usage.Add(size)
 
-	m.mu.Lock()
-	m.usage += size
-	currentUsage := m.usage
+	m.mu.RLock()
 	publisher := m.publisher
-	m.mu.Unlock()
+	m.mu.RUnlock()
 
 	return m.checkThresholds(currentUsage, quota, publisher)
 }
@@ -172,12 +171,18 @@ func (m *DiskQuotaManager) checkThresholds(usage, quota int64, pub DiskSignalPub
 }
 
 // RecordDelete tracks a deletion, reducing tracked usage.
+// W12.34: Uses atomic operations for thread-safe decrement with floor at zero.
 func (m *DiskQuotaManager) RecordDelete(size int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.usage -= size
-	if m.usage < 0 {
-		m.usage = 0
+	for {
+		current := m.usage.Load()
+		newValue := current - size
+		if newValue < 0 {
+			newValue = 0
+		}
+		if m.usage.CompareAndSwap(current, newValue) {
+			return
+		}
+		// Retry on CAS failure (another goroutine modified usage)
 	}
 }
 
@@ -254,14 +259,16 @@ func (m *DiskQuotaManager) removeAndTrack(path string, size int64) {
 }
 
 // ScanUsage reconciles tracked usage with actual disk usage.
+// W12.34: Uses atomic.Store for thread-safe update.
 func (m *DiskQuotaManager) ScanUsage() error {
 	totalSize, err := m.calculateDirectorySize()
 	if err != nil {
 		return err
 	}
 
+	m.usage.Store(totalSize)
+
 	m.mu.Lock()
-	m.usage = totalSize
 	m.lastScan = time.Now()
 	m.mu.Unlock()
 

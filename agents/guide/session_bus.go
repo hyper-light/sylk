@@ -99,6 +99,7 @@ type sessionSubscription struct {
 	subscription Subscription       // From underlying bus
 	topicSub     *topicSubscription // From router (for wildcards)
 	active       atomic.Bool
+	parent       *SessionBus // Parent bus for coordinated unsubscribe
 }
 
 // NewSessionBus creates a new session-scoped bus
@@ -294,6 +295,7 @@ func (sb *SessionBus) trackSubscription(topic, pattern string, isWildcard bool, 
 		isWildcard:   isWildcard,
 		subscription: sub,
 		topicSub:     topicSub,
+		parent:       sb,
 	}
 	sessSub.active.Store(true)
 
@@ -501,12 +503,21 @@ func (s *sessionSubscription) IsActive() bool {
 	return s.active.Load()
 }
 
-// Unsubscribe removes the subscription
+// Unsubscribe removes the subscription with proper lock ordering.
+// Lock order: parent.mu -> underlying subscription
+// This ensures consistent ordering with SessionBus.Close() to prevent deadlock.
 func (s *sessionSubscription) Unsubscribe() error {
 	if !s.active.Swap(false) {
 		return ErrSubscriptionInvalid
 	}
 
+	// Coordinate with parent to remove from subscriptions list and update stats.
+	// This ensures consistent lock ordering: always acquire parent.mu first.
+	if s.parent != nil {
+		s.parent.removeSubscription(s)
+	}
+
+	// Close underlying subscription after releasing parent lock
 	if s.subscription != nil {
 		return s.subscription.Unsubscribe()
 	}

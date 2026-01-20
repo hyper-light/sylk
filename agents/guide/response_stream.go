@@ -3,6 +3,7 @@ package guide
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +11,9 @@ import (
 
 // ErrStreamClosed is returned when attempting to send to a closed stream.
 var ErrStreamClosed = &streamError{msg: "stream is closed"}
+
+// ErrBufferFull is returned when the stream buffer is full and backpressure timeout expires.
+var ErrBufferFull = errors.New("stream buffer full: backpressure timeout exceeded")
 
 // =============================================================================
 // Response Streaming
@@ -42,6 +46,11 @@ type StreamConfig struct {
 
 	// Maximum streams per session
 	MaxStreamsPerSession int `json:"max_streams_per_session"`
+
+	// BackpressureTimeout is the maximum time to wait when buffer is full.
+	// If zero, uses non-blocking send (returns immediately if full).
+	// If positive, waits up to this duration before returning ErrBufferFull.
+	BackpressureTimeout time.Duration `json:"backpressure_timeout"`
 }
 
 // DefaultStreamConfig returns sensible defaults
@@ -51,6 +60,7 @@ func DefaultStreamConfig() StreamConfig {
 		StreamTimeout:        5 * time.Minute,
 		HeartbeatInterval:    30 * time.Second,
 		MaxStreamsPerSession: 50,
+		BackpressureTimeout:  100 * time.Millisecond,
 	}
 }
 
@@ -71,6 +81,9 @@ type ResponseStream struct {
 	lastSend  time.Time
 	closed    atomic.Bool
 	closeOnce sync.Once // Ensures channel is closed exactly once
+
+	// Backpressure configuration
+	backpressureTimeout time.Duration
 
 	// Statistics
 	eventCount int64
@@ -177,12 +190,13 @@ func (sm *StreamManager) CreateStream(correlationID, sessionID string) (*Respons
 	}
 
 	stream := &ResponseStream{
-		ID:            generateStreamID(),
-		CorrelationID: correlationID,
-		SessionID:     sessionID,
-		events:        make(chan *StreamEvent, sm.config.MaxBufferSize),
-		started:       time.Now(),
-		lastSend:      time.Now(),
+		ID:                  generateStreamID(),
+		CorrelationID:       correlationID,
+		SessionID:           sessionID,
+		events:              make(chan *StreamEvent, sm.config.MaxBufferSize),
+		started:             time.Now(),
+		lastSend:            time.Now(),
+		backpressureTimeout: sm.config.BackpressureTimeout,
 	}
 
 	sm.streams[correlationID] = stream
@@ -343,8 +357,25 @@ func (rs *ResponseStream) SendError(err error) bool {
 	return rs.sendEvent(event)
 }
 
-// sendEvent sends an event to the stream
+// sendEvent sends an event to the stream with backpressure support.
+// If the buffer is full, waits up to backpressureTimeout before returning false.
+// This prevents unbounded buffering and OOM on slow consumers (W12.28 fix).
 func (rs *ResponseStream) sendEvent(event *StreamEvent) bool {
+	if rs.closed.Load() {
+		return false
+	}
+
+	// Fast path: try non-blocking send first
+	if rs.trySendImmediate(event) {
+		return true
+	}
+
+	// Slow path: apply backpressure with timeout
+	return rs.sendWithBackpressure(event)
+}
+
+// trySendImmediate attempts a non-blocking send under lock.
+func (rs *ResponseStream) trySendImmediate(event *StreamEvent) bool {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
@@ -357,8 +388,30 @@ func (rs *ResponseStream) sendEvent(event *StreamEvent) bool {
 		rs.lastSend = time.Now()
 		return true
 	default:
-		// Buffer full
 		return false
+	}
+}
+
+// sendWithBackpressure waits for buffer space with timeout.
+func (rs *ResponseStream) sendWithBackpressure(event *StreamEvent) bool {
+	if rs.backpressureTimeout <= 0 {
+		return false // No backpressure configured, fail immediately
+	}
+
+	timer := time.NewTimer(rs.backpressureTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			return false // Timeout expired
+		default:
+			if rs.trySendImmediate(event) {
+				return true
+			}
+			// Brief yield to allow consumer to drain
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 

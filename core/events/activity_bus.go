@@ -72,12 +72,14 @@ func (d *EventDebouncer) cleanupLoop() {
 	}
 }
 
-// Stop stops the background cleanup goroutine.
+// Stop stops the background cleanup goroutine and clears all tracked state.
 // Safe to call multiple times.
 func (d *EventDebouncer) Stop() {
 	d.stopOnce.Do(func() {
 		d.mu.Lock()
 		d.stopped = true
+		// Clear the seen map to release memory immediately
+		d.seen = make(map[string]time.Time)
 		d.mu.Unlock()
 		close(d.done)
 	})

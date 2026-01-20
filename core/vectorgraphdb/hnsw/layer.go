@@ -71,10 +71,12 @@ func (l *layer) hasNode(id string) bool {
 	return exists
 }
 
+// getNeighbors returns the IDs of all neighbors sorted by distance.
+// W12.38: Holds layer lock through entire operation to prevent race conditions.
 func (l *layer) getNeighbors(id string) []string {
 	l.mu.RLock()
+	defer l.mu.RUnlock()
 	node, exists := l.nodes[id]
-	l.mu.RUnlock()
 	if !exists {
 		return nil
 	}
@@ -110,20 +112,23 @@ func (l *layer) getNeighborsMany(nodeIDs []string) map[string][]string {
 
 // getNeighborsWithDistances returns neighbors with their distances for a node.
 // Useful when distance information is needed for neighbor selection.
+// W12.38: Holds layer lock through entire operation to prevent race conditions.
 func (l *layer) getNeighborsWithDistances(id string) []Neighbor {
 	l.mu.RLock()
+	defer l.mu.RUnlock()
 	node, exists := l.nodes[id]
-	l.mu.RUnlock()
 	if !exists {
 		return nil
 	}
 	return node.neighbors.GetSortedNeighbors()
 }
 
+// setNeighbors replaces all neighbors of a node with new neighbors and distances.
+// W12.38: Holds layer lock through entire operation to prevent race conditions.
 func (l *layer) setNeighbors(id string, neighbors []string, distances []float32) {
 	l.mu.RLock()
+	defer l.mu.RUnlock()
 	node, exists := l.nodes[id]
-	l.mu.RUnlock()
 	if !exists {
 		return
 	}
@@ -141,10 +146,12 @@ func (l *layer) setNeighbors(id string, neighbors []string, distances []float32)
 // addNeighbor adds a neighbor with distance to a node.
 // Uses ConcurrentNeighborSet.AddWithLimit for O(1) contains check and automatic
 // replacement of worst neighbors when at capacity.
+// W12.38: Holds layer lock through entire operation to prevent race conditions
+// where node could be deleted between lookup and neighbor modification.
 func (l *layer) addNeighbor(id, neighborID string, distance float32, maxNeighbors int) bool {
 	l.mu.RLock()
+	defer l.mu.RUnlock()
 	node, exists := l.nodes[id]
-	l.mu.RUnlock()
 	if !exists {
 		return false
 	}
@@ -158,10 +165,12 @@ func (l *layer) containsNeighbor(node *layerNode, neighborID string) bool {
 	return node.neighbors.Contains(neighborID)
 }
 
+// removeNeighbor removes a neighbor from a node's neighbor set.
+// W12.38: Holds layer lock through entire operation to prevent race conditions.
 func (l *layer) removeNeighbor(id, neighborID string) {
 	l.mu.RLock()
+	defer l.mu.RUnlock()
 	node, exists := l.nodes[id]
-	l.mu.RUnlock()
 	if !exists {
 		return
 	}

@@ -431,6 +431,39 @@ func TestEventDebouncer_Stop(t *testing.T) {
 	debouncer.Stop()
 }
 
+// TestEventDebouncer_StopClearsState verifies Stop clears internal state (W12.24).
+func TestEventDebouncer_StopClearsState(t *testing.T) {
+	debouncer := NewEventDebouncer(1 * time.Second) // Long window
+
+	// Add several events to populate the seen map
+	for i := 0; i < 100; i++ {
+		event := NewActivityEvent(EventTypeAgentAction, "session-"+string(rune('A'+i%26)), "test")
+		event.AgentID = "agent-" + string(rune('A'+i%26))
+		debouncer.ShouldSkip(event)
+	}
+
+	// Verify events are recorded
+	debouncer.mu.RLock()
+	countBefore := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	if countBefore == 0 {
+		t.Fatal("Expected some events to be recorded before Stop")
+	}
+
+	// Stop the debouncer
+	debouncer.Stop()
+
+	// Verify the seen map is cleared
+	debouncer.mu.RLock()
+	countAfter := len(debouncer.seen)
+	debouncer.mu.RUnlock()
+
+	if countAfter != 0 {
+		t.Errorf("Stop() should clear seen map, got %d entries remaining", countAfter)
+	}
+}
+
 // TestEventDebouncer_StopIdempotent verifies Stop is idempotent.
 func TestEventDebouncer_StopIdempotent(t *testing.T) {
 	debouncer := NewEventDebouncer(100 * time.Millisecond)
