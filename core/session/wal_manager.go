@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
@@ -40,7 +41,7 @@ type MultiSessionWALManager struct {
 
 	sessionWALs map[string]*concurrency.WriteAheadLog
 	mu          sync.RWMutex
-	closed      bool
+	closed      atomic.Bool
 }
 
 type SessionWALInfo struct {
@@ -119,7 +120,7 @@ func (m *MultiSessionWALManager) GetOrCreateWAL(sessionID string) (*concurrency.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return nil, ErrWALManagerClosed
 	}
 
@@ -174,7 +175,7 @@ func (m *MultiSessionWALManager) GetWAL(sessionID string) (*concurrency.WriteAhe
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return nil, ErrWALManagerClosed
 	}
 
@@ -190,7 +191,7 @@ func (m *MultiSessionWALManager) RecoverAllSessions(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return ErrWALManagerClosed
 	}
 
@@ -250,26 +251,23 @@ func (m *MultiSessionWALManager) markSessionRecovered(sessionID string) {
 }
 
 func (m *MultiSessionWALManager) UpdateActivity(sessionID string) error {
-	m.mu.RLock()
-	if m.closed {
-		m.mu.RUnlock()
+	if m.closed.Load() {
 		return ErrWALManagerClosed
 	}
-	m.mu.RUnlock()
 
 	_, err := m.db.Exec(`
 		UPDATE session_wals SET last_active = ? WHERE session_id = ?
 	`, time.Now(), sessionID)
+	if err != nil && m.closed.Load() {
+		return ErrWALManagerClosed
+	}
 	return err
 }
 
 func (m *MultiSessionWALManager) GetSessionInfo(sessionID string) (*SessionWALInfo, error) {
-	m.mu.RLock()
-	if m.closed {
-		m.mu.RUnlock()
+	if m.closed.Load() {
 		return nil, ErrWALManagerClosed
 	}
-	m.mu.RUnlock()
 
 	var info SessionWALInfo
 	err := m.db.QueryRow(`
@@ -282,6 +280,9 @@ func (m *MultiSessionWALManager) GetSessionInfo(sessionID string) (*SessionWALIn
 		return nil, ErrSessionWALMissing
 	}
 	if err != nil {
+		if m.closed.Load() {
+			return nil, ErrWALManagerClosed
+		}
 		return nil, err
 	}
 
@@ -289,12 +290,9 @@ func (m *MultiSessionWALManager) GetSessionInfo(sessionID string) (*SessionWALIn
 }
 
 func (m *MultiSessionWALManager) ListSessions(ctx context.Context) ([]SessionWALInfo, error) {
-	m.mu.RLock()
-	if m.closed {
-		m.mu.RUnlock()
+	if m.closed.Load() {
 		return nil, ErrWALManagerClosed
 	}
-	m.mu.RUnlock()
 
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT session_id, wal_dir, created_at, last_active, recovered
@@ -302,6 +300,9 @@ func (m *MultiSessionWALManager) ListSessions(ctx context.Context) ([]SessionWAL
 		ORDER BY last_active DESC
 	`)
 	if err != nil {
+		if m.closed.Load() {
+			return nil, ErrWALManagerClosed
+		}
 		return nil, err
 	}
 	defer rows.Close()
@@ -328,7 +329,7 @@ func (m *MultiSessionWALManager) RemoveSession(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return ErrWALManagerClosed
 	}
 
@@ -356,10 +357,10 @@ func (m *MultiSessionWALManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return ErrWALManagerClosed
 	}
-	m.closed = true
+	m.closed.Store(true)
 
 	for _, wal := range m.sessionWALs {
 		wal.Close()

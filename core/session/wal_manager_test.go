@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -332,5 +333,316 @@ func TestMultiSessionWALManager_WALWrite(t *testing.T) {
 	}
 	if seq == 0 {
 		t.Error("expected non-zero sequence")
+	}
+}
+
+// Race condition tests for W4H.7 TOCTOU fix
+
+func TestMultiSessionWALManager_Race_UpdateActivityNormal(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+	defer manager.Close()
+
+	manager.GetOrCreateWAL("session-1")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			manager.UpdateActivity("session-1")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestMultiSessionWALManager_Race_UpdateActivityAfterClose(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+
+	manager.GetOrCreateWAL("session-1")
+	manager.Close()
+
+	err := manager.UpdateActivity("session-1")
+	if err != ErrWALManagerClosed {
+		t.Errorf("expected ErrWALManagerClosed, got %v", err)
+	}
+}
+
+func TestMultiSessionWALManager_Race_ConcurrentCloseDuringUpdate(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+
+	manager.GetOrCreateWAL("session-1")
+
+	var wg sync.WaitGroup
+	started := make(chan struct{})
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-started
+			err := manager.UpdateActivity("session-1")
+			if err != nil && err != ErrWALManagerClosed {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-started
+		manager.Close()
+	}()
+
+	close(started)
+	wg.Wait()
+}
+
+func TestMultiSessionWALManager_Race_GetSessionInfoNormal(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+	defer manager.Close()
+
+	manager.GetOrCreateWAL("session-1")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			manager.GetSessionInfo("session-1")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestMultiSessionWALManager_Race_GetSessionInfoAfterClose(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+
+	manager.GetOrCreateWAL("session-1")
+	manager.Close()
+
+	_, err := manager.GetSessionInfo("session-1")
+	if err != ErrWALManagerClosed {
+		t.Errorf("expected ErrWALManagerClosed, got %v", err)
+	}
+}
+
+func TestMultiSessionWALManager_Race_ConcurrentCloseDuringGetSessionInfo(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+
+	manager.GetOrCreateWAL("session-1")
+
+	var wg sync.WaitGroup
+	started := make(chan struct{})
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-started
+			_, err := manager.GetSessionInfo("session-1")
+			if err != nil && err != ErrWALManagerClosed && err != ErrSessionWALMissing {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-started
+		manager.Close()
+	}()
+
+	close(started)
+	wg.Wait()
+}
+
+func TestMultiSessionWALManager_Race_ListSessionsNormal(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+	defer manager.Close()
+
+	manager.GetOrCreateWAL("session-1")
+	manager.GetOrCreateWAL("session-2")
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			manager.ListSessions(ctx)
+		}()
+	}
+	wg.Wait()
+}
+
+func TestMultiSessionWALManager_Race_ListSessionsAfterClose(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+
+	manager.GetOrCreateWAL("session-1")
+	manager.Close()
+
+	ctx := context.Background()
+	_, err := manager.ListSessions(ctx)
+	if err != ErrWALManagerClosed {
+		t.Errorf("expected ErrWALManagerClosed, got %v", err)
+	}
+}
+
+func TestMultiSessionWALManager_Race_ConcurrentCloseDuringListSessions(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+
+	manager.GetOrCreateWAL("session-1")
+	manager.GetOrCreateWAL("session-2")
+
+	var wg sync.WaitGroup
+	started := make(chan struct{})
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-started
+			_, err := manager.ListSessions(ctx)
+			if err != nil && err != ErrWALManagerClosed {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-started
+		manager.Close()
+	}()
+
+	close(started)
+	wg.Wait()
+}
+
+func TestMultiSessionWALManager_Race_RapidOpenCloseCycles(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "wal-manager-race-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	for cycle := 0; cycle < 5; cycle++ {
+		cfg := WALManagerConfig{
+			BaseDir:     filepath.Join(tmpDir, "sessions"),
+			SharedDBDir: filepath.Join(tmpDir, "shared"),
+			WALConfig:   concurrency.DefaultWALConfig(),
+		}
+
+		manager, err := NewMultiSessionWALManager(cfg)
+		if err != nil {
+			t.Fatalf("cycle %d: failed to create manager: %v", cycle, err)
+		}
+
+		var wg sync.WaitGroup
+		started := make(chan struct{})
+
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-started
+				sessionID := "session-" + string(rune('A'+idx))
+				manager.GetOrCreateWAL(sessionID)
+				manager.UpdateActivity(sessionID)
+				manager.GetSessionInfo(sessionID)
+			}(i)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-started
+			time.Sleep(time.Millisecond)
+			manager.Close()
+		}()
+
+		close(started)
+		wg.Wait()
+	}
+}
+
+func TestMultiSessionWALManager_Race_MixedOperations(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+	defer manager.Close()
+
+	for i := 0; i < 5; i++ {
+		sessionID := "session-" + string(rune('A'+i))
+		manager.GetOrCreateWAL(sessionID)
+	}
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sessionID := "session-" + string(rune('A'+(idx%5)))
+			switch idx % 4 {
+			case 0:
+				manager.UpdateActivity(sessionID)
+			case 1:
+				manager.GetSessionInfo(sessionID)
+			case 2:
+				manager.ListSessions(ctx)
+			case 3:
+				manager.GetWAL(sessionID)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestMultiSessionWALManager_Race_ConcurrentCloseMultipleTimes(t *testing.T) {
+	manager, tmpDir := newTestWALManager(t)
+	defer os.RemoveAll(tmpDir)
+
+	manager.GetOrCreateWAL("session-1")
+
+	var wg sync.WaitGroup
+	started := make(chan struct{})
+	closedCount := 0
+	var mu sync.Mutex
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-started
+			err := manager.Close()
+			if err == nil {
+				mu.Lock()
+				closedCount++
+				mu.Unlock()
+			} else if err != ErrWALManagerClosed {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+
+	close(started)
+	wg.Wait()
+
+	if closedCount != 1 {
+		t.Errorf("expected exactly 1 successful close, got %d", closedCount)
 	}
 }
