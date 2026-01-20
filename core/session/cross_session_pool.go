@@ -71,6 +71,7 @@ type CrossSessionPool struct {
 	totalAllocated  int
 	handleIDCounter int64
 	closed          bool
+	closeOnce       sync.Once
 
 	notifyChan chan struct{}
 }
@@ -383,17 +384,24 @@ func (p *CrossSessionPool) GetAvailableSlots() int {
 
 func (p *CrossSessionPool) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return ErrPoolClosed
 	}
 	p.closed = true
-
-	for _, w := range p.waiters {
-		close(w.result)
-	}
+	waitersToClose := p.waiters
 	p.waiters = nil
+	p.mu.Unlock()
+
+	p.closeOnce.Do(func() {
+		p.closeWaiters(waitersToClose)
+	})
 
 	return nil
+}
+
+func (p *CrossSessionPool) closeWaiters(waiters []*waiter) {
+	for _, w := range waiters {
+		close(w.result)
+	}
 }

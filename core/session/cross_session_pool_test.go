@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -327,6 +328,106 @@ func TestCrossSessionPool_DefaultConfig(t *testing.T) {
 	assert.Equal(t, 100, cfg.TotalSlots)
 	assert.Equal(t, DefaultPreemptTimeout, cfg.PreemptTimeout)
 	assert.Equal(t, DefaultAcquireTimeout, cfg.AcquireTimeout)
+}
+
+func TestCrossSessionPool_DoubleClose(t *testing.T) {
+	cfg := CrossSessionPoolConfig{
+		TotalSlots:     10,
+		AcquireTimeout: 100 * time.Millisecond,
+	}
+	calc := NewFairShareCalculator(nil, DefaultFairShareConfig())
+	calc.UpdateLastAllocation(map[string]SessionAllocation{
+		"session-1": {SessionID: "session-1", SubprocessSlots: 10},
+	})
+
+	pool := NewCrossSessionPool(cfg, calc, nil, nil)
+
+	err1 := pool.Close()
+	assert.NoError(t, err1, "first close should succeed")
+
+	err2 := pool.Close()
+	assert.ErrorIs(t, err2, ErrPoolClosed, "second close should return ErrPoolClosed")
+}
+
+func TestCrossSessionPool_ConcurrentClose(t *testing.T) {
+	cfg := CrossSessionPoolConfig{
+		TotalSlots:     10,
+		AcquireTimeout: 100 * time.Millisecond,
+	}
+	calc := NewFairShareCalculator(nil, DefaultFairShareConfig())
+	calc.UpdateLastAllocation(map[string]SessionAllocation{
+		"session-1": {SessionID: "session-1", SubprocessSlots: 10},
+	})
+
+	pool := NewCrossSessionPool(cfg, calc, nil, nil)
+
+	ctx := context.Background()
+	_, err := pool.Acquire(ctx, "session-1", PriorityPipeline)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, 10)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errChan <- pool.Close()
+		}()
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	successCount := 0
+	closedErrCount := 0
+	for err := range errChan {
+		if err == nil {
+			successCount++
+		} else if errors.Is(err, ErrPoolClosed) {
+			closedErrCount++
+		}
+	}
+
+	assert.Equal(t, 1, successCount, "exactly one close should succeed")
+	assert.Equal(t, 9, closedErrCount, "other closes should return ErrPoolClosed")
+}
+
+func TestCrossSessionPool_CloseWithWaitingGoroutines(t *testing.T) {
+	cfg := CrossSessionPoolConfig{
+		TotalSlots:     1,
+		AcquireTimeout: 5 * time.Second,
+	}
+	calc := NewFairShareCalculator(nil, DefaultFairShareConfig())
+	calc.UpdateLastAllocation(map[string]SessionAllocation{
+		"session-1": {SessionID: "session-1", SubprocessSlots: 10},
+		"session-2": {SessionID: "session-2", SubprocessSlots: 10},
+	})
+
+	pool := NewCrossSessionPool(cfg, calc, nil, nil)
+
+	ctx := context.Background()
+	h, err := pool.Acquire(ctx, "session-1", PriorityPipeline)
+	require.NoError(t, err)
+	_ = h
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pool.Acquire(ctx, "session-2", PriorityPipeline)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, 1, pool.GetWaitingCount())
+
+	err1 := pool.Close()
+	assert.NoError(t, err1)
+
+	err2 := pool.Close()
+	assert.ErrorIs(t, err2, ErrPoolClosed)
+
+	wg.Wait()
 }
 
 func newTestPool(t *testing.T) (*CrossSessionPool, func()) {
