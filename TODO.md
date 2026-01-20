@@ -37150,13 +37150,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Use sync.Once for close, check closed state before channel operations    ││
 │ │   SEVERITY: CRITICAL - Panic on double close                                    ││
 │ │                                                                                  ││
-│ │ [ ] W12.2 - SessionBus Wildcard Handler Dropped                                 ││
+│ │ [x] W12.2 - SessionBus Wildcard Handler Dropped                                 ││
 │ │   FILE: agents/guide/session_bus.go:334-347                                     ││
 │ │   ISSUE: Wildcard subscriptions silently dropped when channel full              ││
 │ │   FIX: Add backpressure handling or error return for dropped messages           ││
 │ │   SEVERITY: CRITICAL - Silent message loss                                      ││
 │ │                                                                                  ││
-│ │ [ ] W12.3 - ChannelBus Untracked Async Handlers                                 ││
+│ │ [x] W12.3 - ChannelBus Untracked Async Handlers                                 ││
 │ │   FILE: agents/guide/channel_bus.go:217-219                                     ││
 │ │   ISSUE: go func() for handlers not tracked, no cleanup on shutdown             ││
 │ │   FIX: Use GoroutineScope or WaitGroup for handler goroutines                   ││
