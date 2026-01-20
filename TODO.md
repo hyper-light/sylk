@@ -37196,7 +37196,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add context cancellation check in wait loop                              ││
 │ │   SEVERITY: CRITICAL - Goroutine leak per timeout                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.8 - Pool Double Close Panic                                             ││
+│ │ [x] W12.8 - Pool Double Close Panic                                             ││
 │ │   FILE: core/resources/pool.go:364-381                                          ││
 │ │   ISSUE: Close() can panic if called twice due to channel double-close          ││
 │ │   FIX: Use sync.Once for close, add closed state check                          ││
