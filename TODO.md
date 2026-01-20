@@ -37167,7 +37167,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1B - SESSION & STATE MANAGEMENT (3 CRITICAL)                              ││
 │ │                                                                                  ││
-│ │ [ ] W12.4 - SignalDispatcher Goroutine Leak                                     ││
+│ │ [x] W12.4 - SignalDispatcher Goroutine Leak                                     ││
 │ │   FILE: core/session/signal_dispatcher.go:119-133                               ││
 │ │   ISSUE: mergeStopChannels spawns goroutines without lifecycle tracking         ││
 │ │   FIX: Track goroutines with WaitGroup, cleanup on context cancel               ││
@@ -37190,7 +37190,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1C - RESOURCE MANAGEMENT (3 CRITICAL)                                     ││
 │ │                                                                                  ││
-│ │ [ ] W12.7 - Pool Goroutine Leak in waitForResource                              ││
+│ │ [x] W12.7 - Pool Goroutine Leak in waitForResource                              ││
 │ │   FILE: core/resources/pool.go:270-283                                          ││
 │ │   ISSUE: goroutine waiting for resource never cleaned up on context cancel      ││
 │ │   FIX: Add context cancellation check in wait loop                              ││
@@ -37213,7 +37213,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1D - VECTORGRAPHDB CORE (3 CRITICAL)                                      ││
 │ │                                                                                  ││
-│ │ [x] W12.10 - HNSW Persistence Deadlock                                          ││
+│ │ [ ] W12.10 - HNSW Persistence Deadlock                                          ││
 │ │   FILE: core/vectorgraphdb/hnsw/persistence.go:219-263                          ││
 │ │   ISSUE: recomputeEdgeDistances holds mutex while calling methods that also lock││
 │ │   FIX: Restructure to release lock before calling other methods                 ││
@@ -37265,7 +37265,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 2C - ERROR HANDLING & RECOVERY (3 CRITICAL)                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.17 - Recovery Race in RecoveryState                                     ││
+│ │ [x] W12.17 - Recovery Race in RecoveryState                                     ││
 │ │   FILE: core/recovery/recovery.go:65-87                                         ││
 │ │   ISSUE: RecoveryState accessed without synchronization                         ││
 │ │   FIX: Add mutex protection for state access                                    ││
@@ -37288,7 +37288,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 2D - VECTORGRAPHDB MITIGATIONS (4 CRITICAL)                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.20 - Conflicts AutoResolve Deadlock                                     ││
+│ │ [x] W12.20 - Conflicts AutoResolve Deadlock                                     ││
 │ │   FILE: core/vectorgraphdb/mitigations/conflicts.go:442-460                     ││
 │ │   ISSUE: AutoResolve holds lock while calling methods that acquire same lock    ││
 │ │   FIX: Restructure lock acquisition order                                       ││

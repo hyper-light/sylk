@@ -168,14 +168,11 @@ func TestW12_13_GateShutdown_NoLeakOnTimeout(t *testing.T) {
 	initialGoroutines := runtime.NumGoroutine()
 
 	blockCh := make(chan struct{})
-	requestStarted := make(chan struct{})
+	requestStarted := make(chan struct{}, 2) // Buffered to avoid blocking
 
 	executor := &mockExecutor{
 		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
-			select {
-			case requestStarted <- struct{}{}:
-			default:
-			}
+			requestStarted <- struct{}{}
 			// Block until blockCh is closed, but respect context
 			select {
 			case <-blockCh:
@@ -209,7 +206,7 @@ func TestW12_13_GateShutdown_NoLeakOnTimeout(t *testing.T) {
 		select {
 		case <-requestStarted:
 		case <-time.After(time.Second):
-			t.Fatal("requests did not start")
+			t.Fatalf("request %d did not start", i)
 		}
 	}
 
