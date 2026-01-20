@@ -319,6 +319,70 @@ func TestSortDomainCounts(t *testing.T) {
 	assert.Equal(t, 5, counts[2].Count)
 }
 
+func TestSortDomainCounts_Empty(t *testing.T) {
+	counts := []DomainCount{}
+	sortDomainCounts(counts)
+	assert.Empty(t, counts)
+}
+
+func TestSortDomainCounts_SingleItem(t *testing.T) {
+	counts := []DomainCount{
+		{Domain: domain.DomainLibrarian, Count: 42},
+	}
+
+	sortDomainCounts(counts)
+
+	require.Len(t, counts, 1)
+	assert.Equal(t, domain.DomainLibrarian, counts[0].Domain)
+	assert.Equal(t, 42, counts[0].Count)
+}
+
+func TestSortDomainCounts_AlreadySorted(t *testing.T) {
+	counts := []DomainCount{
+		{Domain: domain.DomainAcademic, Count: 100},
+		{Domain: domain.DomainLibrarian, Count: 50},
+		{Domain: domain.DomainArchivalist, Count: 25},
+	}
+
+	sortDomainCounts(counts)
+
+	assert.Equal(t, 100, counts[0].Count)
+	assert.Equal(t, domain.DomainAcademic, counts[0].Domain)
+	assert.Equal(t, 50, counts[1].Count)
+	assert.Equal(t, domain.DomainLibrarian, counts[1].Domain)
+	assert.Equal(t, 25, counts[2].Count)
+	assert.Equal(t, domain.DomainArchivalist, counts[2].Domain)
+}
+
+func TestSortDomainCounts_ReverseSorted(t *testing.T) {
+	counts := []DomainCount{
+		{Domain: domain.DomainArchivalist, Count: 1},
+		{Domain: domain.DomainLibrarian, Count: 10},
+		{Domain: domain.DomainAcademic, Count: 100},
+	}
+
+	sortDomainCounts(counts)
+
+	assert.Equal(t, 100, counts[0].Count)
+	assert.Equal(t, 10, counts[1].Count)
+	assert.Equal(t, 1, counts[2].Count)
+}
+
+func TestSortDomainCounts_EqualCounts(t *testing.T) {
+	counts := []DomainCount{
+		{Domain: domain.DomainLibrarian, Count: 50},
+		{Domain: domain.DomainAcademic, Count: 50},
+		{Domain: domain.DomainArchivalist, Count: 50},
+	}
+
+	sortDomainCounts(counts)
+
+	// All counts should remain 50 (order among equal elements is not guaranteed)
+	for _, c := range counts {
+		assert.Equal(t, 50, c.Count)
+	}
+}
+
 func TestDomainFacet_Integration_WithIndex(t *testing.T) {
 	tmpDir := t.TempDir()
 	manager := NewIndexManager(tmpDir + "/test.bleve")

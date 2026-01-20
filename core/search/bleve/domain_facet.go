@@ -1,6 +1,8 @@
 package bleve
 
 import (
+	"sort"
+
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/blevesearch/bleve/v2"
@@ -57,13 +59,9 @@ type DomainCount struct {
 }
 
 func sortDomainCounts(counts []DomainCount) {
-	for i := 0; i < len(counts)-1; i++ {
-		for j := i + 1; j < len(counts); j++ {
-			if counts[j].Count > counts[i].Count {
-				counts[i], counts[j] = counts[j], counts[i]
-			}
-		}
-	}
+	sort.Slice(counts, func(i, j int) bool {
+		return counts[i].Count > counts[j].Count
+	})
 }
 
 // HasDomain returns true if the domain has at least one document.
