@@ -2,6 +2,7 @@ package llm
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -392,5 +393,135 @@ func TestBudgetErrorMessages(t *testing.T) {
 		if tc.err.Error() != tc.message {
 			t.Errorf("expected error message %q, got %q", tc.message, tc.err.Error())
 		}
+	}
+}
+
+// TestCheckAndReserve_Basic verifies basic atomic check-and-reserve.
+func TestCheckAndReserve_Basic(t *testing.T) {
+	tracker := NewUsageTracker()
+	budget := NewTokenBudget(tracker)
+	budget.SetGlobalLimit(1000)
+
+	req := newTestRequest("session1", "task1", "openai", 500)
+	record := UsageRecord{
+		SessionID:   "session1",
+		TaskID:      "task1",
+		Provider:    "openai",
+		TotalTokens: 500,
+	}
+
+	// First reservation should succeed
+	err := budget.CheckAndReserve(req, record)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+
+	// Second reservation should also succeed (total 1000)
+	err = budget.CheckAndReserve(req, record)
+	if err != nil {
+		t.Errorf("expected no error at exact limit, got %v", err)
+	}
+
+	// Third reservation should fail (would exceed 1000)
+	err = budget.CheckAndReserve(req, record)
+	if err != ErrGlobalBudgetExceeded {
+		t.Errorf("expected ErrGlobalBudgetExceeded, got %v", err)
+	}
+
+	// Verify only 1000 tokens were recorded
+	if tracker.TotalTokens() != 1000 {
+		t.Errorf("expected 1000 tokens, got %d", tracker.TotalTokens())
+	}
+}
+
+// TestCheckAndReserve_RaceCondition verifies atomic operation prevents race conditions.
+// W12.46: This test ensures concurrent check-and-reserve operations are atomic.
+func TestCheckAndReserve_RaceCondition(t *testing.T) {
+	tracker := NewUsageTracker()
+	budget := NewTokenBudget(tracker)
+
+	// Set a tight budget that allows exactly 10 reservations
+	budget.SetGlobalLimit(100)
+
+	var wg sync.WaitGroup
+	numGoroutines := 50
+	var successCount int64
+	var failCount int64
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			req := newTestRequest("session1", "task1", "openai", 10)
+			record := UsageRecord{
+				SessionID:   "session1",
+				TaskID:      "task1",
+				Provider:    "openai",
+				TotalTokens: 10,
+			}
+
+			err := budget.CheckAndReserve(req, record)
+			if err == nil {
+				atomic.AddInt64(&successCount, 1)
+			} else {
+				atomic.AddInt64(&failCount, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Exactly 10 reservations should succeed (100 / 10 = 10)
+	if tracker.TotalTokens() != 100 {
+		t.Errorf("expected exactly 100 tokens, got %d (race condition!)", tracker.TotalTokens())
+	}
+
+	// Verify counts
+	if atomic.LoadInt64(&successCount) != 10 {
+		t.Errorf("expected 10 successes, got %d", successCount)
+	}
+	if atomic.LoadInt64(&failCount) != 40 {
+		t.Errorf("expected 40 failures, got %d", failCount)
+	}
+}
+
+// TestCheckAndReserve_SessionLimit verifies session limit enforcement.
+func TestCheckAndReserve_SessionLimit(t *testing.T) {
+	tracker := NewUsageTracker()
+	budget := NewTokenBudget(tracker)
+	budget.SetSessionLimit("session1", 100)
+
+	req := newTestRequest("session1", "task1", "openai", 60)
+	record := UsageRecord{
+		SessionID:   "session1",
+		TaskID:      "task1",
+		Provider:    "openai",
+		TotalTokens: 60,
+	}
+
+	// First reservation should succeed
+	err := budget.CheckAndReserve(req, record)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+
+	// Second reservation should fail (60 + 60 > 100)
+	err = budget.CheckAndReserve(req, record)
+	if err != ErrSessionBudgetExceeded {
+		t.Errorf("expected ErrSessionBudgetExceeded, got %v", err)
+	}
+
+	// Different session should succeed
+	req2 := newTestRequest("session2", "task1", "openai", 60)
+	record2 := UsageRecord{
+		SessionID:   "session2",
+		TaskID:      "task1",
+		Provider:    "openai",
+		TotalTokens: 60,
+	}
+	err = budget.CheckAndReserve(req2, record2)
+	if err != nil {
+		t.Errorf("expected no error for different session, got %v", err)
 	}
 }

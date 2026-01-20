@@ -50,6 +50,12 @@ func (t *UsageTracker) Record(record UsageRecord) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.recordLocked(record)
+}
+
+// recordLocked adds a usage record without acquiring the lock.
+// Caller must hold the write lock.
+func (t *UsageTracker) recordLocked(record UsageRecord) {
 	t.records = append(t.records, record)
 	t.updateAggregates(record)
 }
@@ -69,10 +75,22 @@ func (t *UsageTracker) TotalTokens() int64 {
 	return t.totalTokens
 }
 
+// totalTokensLocked returns total tokens without acquiring lock.
+// Caller must hold at least RLock.
+func (t *UsageTracker) totalTokensLocked() int64 {
+	return t.totalTokens
+}
+
 // TokensBySession returns the total tokens for a specific session.
 func (t *UsageTracker) TokensBySession(sessionID string) int64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	return t.tokensBySession[sessionID]
+}
+
+// tokensBySessionLocked returns session tokens without acquiring lock.
+// Caller must hold at least RLock.
+func (t *UsageTracker) tokensBySessionLocked(sessionID string) int64 {
 	return t.tokensBySession[sessionID]
 }
 
@@ -83,11 +101,33 @@ func (t *UsageTracker) TokensByTask(taskID string) int64 {
 	return t.tokensByTask[taskID]
 }
 
+// tokensByTaskLocked returns task tokens without acquiring lock.
+// Caller must hold at least RLock.
+func (t *UsageTracker) tokensByTaskLocked(taskID string) int64 {
+	return t.tokensByTask[taskID]
+}
+
 // TokensByProvider returns the total tokens for a specific provider.
 func (t *UsageTracker) TokensByProvider(provider string) int64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.tokensByProvider[provider]
+}
+
+// tokensByProviderLocked returns provider tokens without acquiring lock.
+// Caller must hold at least RLock.
+func (t *UsageTracker) tokensByProviderLocked(provider string) int64 {
+	return t.tokensByProvider[provider]
+}
+
+// Lock acquires the write lock for atomic operations.
+func (t *UsageTracker) Lock() {
+	t.mu.Lock()
+}
+
+// Unlock releases the write lock.
+func (t *UsageTracker) Unlock() {
+	t.mu.Unlock()
 }
 
 // TokensByAgent returns the total tokens for a specific agent type.
