@@ -408,6 +408,26 @@ func (sb *SessionBus) closeRouterSubscription(sub *sessionSubscription) {
 	}
 }
 
+// removeSubscription removes a subscription from the list and updates stats.
+// Called by sessionSubscription.Unsubscribe() for proper lock ordering.
+func (sb *SessionBus) removeSubscription(sub *sessionSubscription) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+
+	sb.removeFromSlice(sub)
+	sb.closeRouterSubscription(sub)
+	atomic.AddInt64(&sb.stats.subscriptionsActive, -1)
+}
+
+func (sb *SessionBus) removeFromSlice(sub *sessionSubscription) {
+	for i, s := range sb.subscriptions {
+		if s == sub {
+			sb.subscriptions = append(sb.subscriptions[:i], sb.subscriptions[i+1:]...)
+			return
+		}
+	}
+}
+
 // =============================================================================
 // Topic Resolution
 // =============================================================================

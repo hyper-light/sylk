@@ -447,3 +447,145 @@ func TestSessionBusManager_ActiveSessionIDs(t *testing.T) {
 	assert.Contains(t, ids, "session-a")
 	assert.Contains(t, ids, "session-b")
 }
+
+// =============================================================================
+// W12.26 Tests - Lock Ordering Deadlock Prevention
+// =============================================================================
+
+func TestSessionBus_W12_26_ConcurrentUnsubscribeAndClose(t *testing.T) {
+	// Test that concurrent Unsubscribe and Close don't deadlock
+	// W12.26: Ensure consistent lock ordering between Subscribe and Unsubscribe
+	bus := newMockEventBus()
+
+	for i := 0; i < 10; i++ {
+		sb, err := guide.NewSessionBus(bus, guide.SessionBusConfig{
+			SessionID: "test-deadlock",
+		})
+		require.NoError(t, err)
+
+		// Create multiple subscriptions
+		subs := make([]guide.Subscription, 0, 20)
+		for j := 0; j < 20; j++ {
+			sub, err := sb.Subscribe("topic", func(msg *guide.Message) error {
+				return nil
+			})
+			require.NoError(t, err)
+			subs = append(subs, sub)
+		}
+
+		// Concurrently unsubscribe and close
+		var wg sync.WaitGroup
+		wg.Add(len(subs) + 1)
+
+		// Unsubscribe all subscriptions concurrently
+		for _, sub := range subs {
+			go func(s guide.Subscription) {
+				defer wg.Done()
+				s.Unsubscribe()
+			}(sub)
+		}
+
+		// Close the bus concurrently
+		go func() {
+			defer wg.Done()
+			sb.Close()
+		}()
+
+		// If there's a deadlock, this will timeout
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Success - no deadlock
+		case <-time.After(2 * time.Second):
+			t.Fatal("Deadlock detected: concurrent Unsubscribe and Close")
+		}
+	}
+}
+
+func TestSessionBus_W12_26_UnsubscribeUpdatesStats(t *testing.T) {
+	// Test that Unsubscribe properly updates the parent's stats
+	bus := newMockEventBus()
+
+	sb, err := guide.NewSessionBus(bus, guide.SessionBusConfig{
+		SessionID: "test-stats",
+	})
+	require.NoError(t, err)
+	defer sb.Close()
+
+	// Create a subscription
+	sub, err := sb.Subscribe("topic", func(msg *guide.Message) error {
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Verify subscription count
+	stats := sb.Stats()
+	assert.Equal(t, int64(1), stats.SubscriptionsActive)
+
+	// Unsubscribe
+	err = sub.Unsubscribe()
+	require.NoError(t, err)
+
+	// Verify count decremented
+	stats = sb.Stats()
+	assert.Equal(t, int64(0), stats.SubscriptionsActive)
+}
+
+func TestSessionBus_W12_26_UnsubscribeRemovesFromSlice(t *testing.T) {
+	// Test that Unsubscribe removes the subscription from the internal slice
+	bus := newMockEventBus()
+
+	sb, err := guide.NewSessionBus(bus, guide.SessionBusConfig{
+		SessionID: "test-slice",
+	})
+	require.NoError(t, err)
+	defer sb.Close()
+
+	// Create multiple subscriptions
+	sub1, _ := sb.Subscribe("topic1", func(msg *guide.Message) error { return nil })
+	sub2, _ := sb.Subscribe("topic2", func(msg *guide.Message) error { return nil })
+	sub3, _ := sb.Subscribe("topic3", func(msg *guide.Message) error { return nil })
+
+	assert.Equal(t, int64(3), sb.Stats().SubscriptionsActive)
+
+	// Unsubscribe middle one
+	sub2.Unsubscribe()
+	assert.Equal(t, int64(2), sb.Stats().SubscriptionsActive)
+
+	// Unsubscribe first one
+	sub1.Unsubscribe()
+	assert.Equal(t, int64(1), sb.Stats().SubscriptionsActive)
+
+	// Unsubscribe last one
+	sub3.Unsubscribe()
+	assert.Equal(t, int64(0), sb.Stats().SubscriptionsActive)
+}
+
+func TestSessionBus_W12_26_DoubleUnsubscribe(t *testing.T) {
+	// Test that double unsubscribe doesn't decrement stats twice
+	bus := newMockEventBus()
+
+	sb, err := guide.NewSessionBus(bus, guide.SessionBusConfig{
+		SessionID: "test-double",
+	})
+	require.NoError(t, err)
+	defer sb.Close()
+
+	sub, _ := sb.Subscribe("topic", func(msg *guide.Message) error { return nil })
+	assert.Equal(t, int64(1), sb.Stats().SubscriptionsActive)
+
+	// First unsubscribe
+	err = sub.Unsubscribe()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), sb.Stats().SubscriptionsActive)
+
+	// Second unsubscribe should fail but not affect stats
+	err = sub.Unsubscribe()
+	assert.Error(t, err)
+	assert.Equal(t, int64(0), sb.Stats().SubscriptionsActive)
+}
