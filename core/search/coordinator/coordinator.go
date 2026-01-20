@@ -144,7 +144,61 @@ type searchResult struct {
 }
 
 // searchParallel executes Bleve and Vector searches concurrently.
+// W4N.9: Uses GoroutineScope when available for WAVE 4 tracking.
 func (c *SearchCoordinator) searchParallel(
+	ctx context.Context,
+	req *HybridSearchRequest,
+) (searchResult, searchResult) {
+	if c.config.Scope != nil {
+		return c.searchParallelWithScope(ctx, req)
+	}
+	return c.searchParallelWithWaitGroup(ctx, req)
+}
+
+// searchParallelWithScope executes parallel searches using GoroutineScope.
+// W4N.9: Tracked goroutines with budget enforcement and lifecycle management.
+func (c *SearchCoordinator) searchParallelWithScope(
+	ctx context.Context,
+	req *HybridSearchRequest,
+) (searchResult, searchResult) {
+	var bleveResult, vectorResult searchResult
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	c.launchScopedSearch(&wg, &bleveResult, "bleve-search", req.Timeout, func() searchResult {
+		return c.searchBleve(ctx, req)
+	})
+
+	c.launchScopedSearch(&wg, &vectorResult, "vector-search", req.Timeout, func() searchResult {
+		return c.searchVector(ctx, req)
+	})
+
+	wg.Wait()
+	return bleveResult, vectorResult
+}
+
+// launchScopedSearch launches a single search using the GoroutineScope.
+func (c *SearchCoordinator) launchScopedSearch(
+	wg *sync.WaitGroup,
+	result *searchResult,
+	desc string,
+	timeout time.Duration,
+	searchFn func() searchResult,
+) {
+	err := c.config.Scope.Go(desc, timeout, func(_ context.Context) error {
+		defer wg.Done()
+		*result = searchFn()
+		return nil
+	})
+	if err != nil {
+		wg.Done()
+		*result = searchResult{err: err}
+	}
+}
+
+// searchParallelWithWaitGroup executes parallel searches using standard WaitGroup.
+// This is the fallback path when no GoroutineScope is configured.
+func (c *SearchCoordinator) searchParallelWithWaitGroup(
 	ctx context.Context,
 	req *HybridSearchRequest,
 ) (searchResult, searchResult) {

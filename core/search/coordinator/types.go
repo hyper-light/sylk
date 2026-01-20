@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/search"
 )
 
@@ -423,6 +424,11 @@ type CoordinatorConfig struct {
 	// EnableBackpressure enables fail-fast when semaphore is full.
 	// W4M.16: When true, returns ErrSearchQueueFull instead of blocking.
 	EnableBackpressure bool
+
+	// Scope is the optional GoroutineScope for WAVE 4 goroutine tracking.
+	// W4N.9: When provided, parallel searches use scope.Go() for tracking.
+	// When nil, falls back to standard WaitGroup (backward compatible).
+	Scope *concurrency.GoroutineScope
 }
 
 // DefaultCoordinatorConfig returns sensible default configuration.
