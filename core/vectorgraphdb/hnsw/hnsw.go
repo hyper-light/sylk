@@ -177,22 +177,37 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 	visited[ep] = true
 
 	candidates := make([]SearchResult, 0, ef)
-	epSim := CosineSimilarity(query, h.vectors[ep], queryMag, h.magnitudes[ep])
+
+	// Bounds check for entry point vector and magnitude
+	epVec, epMag, ok := h.getVectorAndMagnitude(ep)
+	if !ok {
+		return candidates
+	}
+	epSim := CosineSimilarity(query, epVec, queryMag, epMag)
 	candidates = append(candidates, SearchResult{ID: ep, Similarity: epSim})
 
-	for i := range candidates {
-		if len(candidates) >= ef*2 {
-			break
-		}
+	maxCandidates := ef * 2 // Pre-compute limit to prevent unbounded growth
+
+	// Use explicit index with proper bounds checking to prevent unbounded growth
+	for i := 0; i < len(candidates) && len(candidates) < maxCandidates; i++ {
 		curr := candidates[i]
 		neighbors := h.layers[level].getNeighbors(curr.ID)
+
 		for _, neighbor := range neighbors {
 			if visited[neighbor] {
 				continue
 			}
 			visited[neighbor] = true
-			if vec, exists := h.vectors[neighbor]; exists {
-				sim := CosineSimilarity(query, vec, queryMag, h.magnitudes[neighbor])
+
+			vec, mag, exists := h.getVectorAndMagnitude(neighbor)
+			if !exists {
+				continue
+			}
+
+			sim := CosineSimilarity(query, vec, queryMag, mag)
+
+			// Only append if we haven't hit the limit
+			if len(candidates) < maxCandidates {
 				candidates = append(candidates, SearchResult{ID: neighbor, Similarity: sim})
 			}
 		}
@@ -206,6 +221,20 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 		candidates = candidates[:ef]
 	}
 	return candidates
+}
+
+// getVectorAndMagnitude safely retrieves both vector and magnitude for a node.
+// Returns false if either is missing.
+func (h *Index) getVectorAndMagnitude(id string) ([]float32, float64, bool) {
+	vec, vecExists := h.vectors[id]
+	if !vecExists {
+		return nil, 0, false
+	}
+	mag, magExists := h.magnitudes[id]
+	if !magExists {
+		return nil, 0, false
+	}
+	return vec, mag, true
 }
 
 func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
@@ -258,7 +287,7 @@ func (h *Index) searchLocked(query []float32, queryMag float64, k int, filter *S
 func (h *Index) filterAndLimit(candidates []SearchResult, k int, filter *SearchFilter) []SearchResult {
 	results := make([]SearchResult, 0, k)
 	for _, c := range candidates {
-		if !h.matchesFilter(c.ID, filter) {
+		if !h.matchesFilter(c.ID, c.Similarity, filter) {
 			continue
 		}
 		c.Domain = h.domains[c.ID]
@@ -271,18 +300,24 @@ func (h *Index) filterAndLimit(candidates []SearchResult, k int, filter *SearchF
 	return results
 }
 
-func (h *Index) matchesFilter(id string, filter *SearchFilter) bool {
+func (h *Index) matchesFilter(id string, similarity float64, filter *SearchFilter) bool {
 	if filter == nil {
 		return true
 	}
-	if filter.MinSimilarity > 0 {
-		return true
+
+	// Check minimum similarity threshold FIRST
+	if filter.MinSimilarity > 0 && similarity < filter.MinSimilarity {
+		return false // Reject if below threshold
 	}
+
+	// Check domain filter
 	if len(filter.Domains) > 0 {
 		if !slices.Contains(filter.Domains, h.domains[id]) {
 			return false
 		}
 	}
+
+	// Check node type filter
 	if len(filter.NodeTypes) > 0 {
 		if !slices.Contains(filter.NodeTypes, h.nodeTypes[id]) {
 			return false

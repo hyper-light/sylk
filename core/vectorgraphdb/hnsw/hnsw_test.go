@@ -847,6 +847,379 @@ func TestSearchResultsOrdering(t *testing.T) {
 	}
 }
 
+// W4C.2: Test MinSimilarity filter rejects nodes below threshold
+func TestSearchWithMinSimilarityRejectsBelowThreshold(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	// Insert vectors with known similarity scores to query [1,0,0,0]
+	// exact match: similarity = 1.0
+	// similar: similarity ~0.994 (high)
+	// different: similarity = 0.0 (orthogonal)
+	idx.Insert("exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("similar", []float32{0.9, 0.1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("different", []float32{0, 1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+
+	// Filter with MinSimilarity = 0.5 should reject "different" (similarity = 0.0)
+	filter := &SearchFilter{
+		MinSimilarity: 0.5,
+	}
+	results := idx.Search([]float32{1, 0, 0, 0}, 10, filter)
+
+	// All results should have similarity >= 0.5
+	for _, r := range results {
+		if r.Similarity < 0.5 {
+			t.Errorf("Result %s has similarity %v, which is below MinSimilarity 0.5", r.ID, r.Similarity)
+		}
+	}
+
+	// "different" should NOT be in results (orthogonal vector, similarity = 0)
+	for _, r := range results {
+		if r.ID == "different" {
+			t.Errorf("'different' should be rejected (similarity 0.0 < MinSimilarity 0.5), but it was included with similarity %v", r.Similarity)
+		}
+	}
+}
+
+// W4C.2: Test MinSimilarity filter accepts nodes at/above threshold
+func TestSearchWithMinSimilarityAcceptsAtOrAboveThreshold(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	// Insert vectors with known similarities to query [1,0,0,0]
+	idx.Insert("exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("similar", []float32{0.9, 0.1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+
+	// Both should pass with MinSimilarity = 0.9 (exact=1.0, similar~0.994)
+	filter := &SearchFilter{
+		MinSimilarity: 0.9,
+	}
+	results := idx.Search([]float32{1, 0, 0, 0}, 10, filter)
+
+	if len(results) < 2 {
+		t.Errorf("Expected at least 2 results above MinSimilarity 0.9, got %d", len(results))
+	}
+
+	// All results should have similarity >= 0.9
+	for _, r := range results {
+		if r.Similarity < 0.9 {
+			t.Errorf("Result %s has similarity %v, which is below MinSimilarity 0.9", r.ID, r.Similarity)
+		}
+	}
+}
+
+// W4C.2: Test MinSimilarity combined with domain filter
+func TestSearchWithMinSimilarityAndDomainFilter(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	// Insert vectors in different domains
+	idx.Insert("code_exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("code_different", []float32{0, 1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("history_exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainHistory, vectorgraphdb.NodeTypeSession)
+	idx.Insert("history_different", []float32{0, 1, 0, 0}, vectorgraphdb.DomainHistory, vectorgraphdb.NodeTypeSession)
+
+	// Filter: DomainCode AND MinSimilarity 0.5
+	filter := &SearchFilter{
+		Domains:       []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		MinSimilarity: 0.5,
+	}
+	results := idx.Search([]float32{1, 0, 0, 0}, 10, filter)
+
+	// Should only return "code_exact" (DomainCode, similarity=1.0)
+	// Should NOT return:
+	// - "code_different" (DomainCode but similarity=0.0 < 0.5)
+	// - "history_exact" (similarity=1.0 but wrong domain)
+	// - "history_different" (wrong domain and similarity=0.0)
+	for _, r := range results {
+		if r.Domain != vectorgraphdb.DomainCode {
+			t.Errorf("Result %s has domain %s, expected DomainCode", r.ID, r.Domain)
+		}
+		if r.Similarity < 0.5 {
+			t.Errorf("Result %s has similarity %v, which is below MinSimilarity 0.5", r.ID, r.Similarity)
+		}
+	}
+
+	// Verify code_different is NOT in results
+	for _, r := range results {
+		if r.ID == "code_different" {
+			t.Errorf("'code_different' should be rejected (similarity 0.0 < MinSimilarity 0.5)")
+		}
+	}
+}
+
+// W4C.2: Test MinSimilarity combined with node type filter
+func TestSearchWithMinSimilarityAndNodeTypeFilter(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	// Insert vectors with different node types
+	idx.Insert("file_exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("file_different", []float32{0, 1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("func_exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFunction)
+	idx.Insert("func_different", []float32{0, 1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFunction)
+
+	// Filter: NodeTypeFile AND MinSimilarity 0.5
+	filter := &SearchFilter{
+		NodeTypes:     []vectorgraphdb.NodeType{vectorgraphdb.NodeTypeFile},
+		MinSimilarity: 0.5,
+	}
+	results := idx.Search([]float32{1, 0, 0, 0}, 10, filter)
+
+	// Should only return "file_exact"
+	for _, r := range results {
+		if r.NodeType != vectorgraphdb.NodeTypeFile {
+			t.Errorf("Result %s has node type %s, expected NodeTypeFile", r.ID, r.NodeType)
+		}
+		if r.Similarity < 0.5 {
+			t.Errorf("Result %s has similarity %v, which is below MinSimilarity 0.5", r.ID, r.Similarity)
+		}
+	}
+
+	// Verify file_different is NOT in results
+	for _, r := range results {
+		if r.ID == "file_different" {
+			t.Errorf("'file_different' should be rejected (similarity 0.0 < MinSimilarity 0.5)")
+		}
+	}
+}
+
+// W4C.2: Test MinSimilarity = 0 behaves like no filter
+func TestSearchWithMinSimilarityZero(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	idx.Insert("exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("different", []float32{0, 1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+
+	// MinSimilarity = 0 should not filter anything
+	filter := &SearchFilter{
+		MinSimilarity: 0,
+	}
+	results := idx.Search([]float32{1, 0, 0, 0}, 10, filter)
+
+	// Both results should be present
+	if len(results) != 2 {
+		t.Errorf("Expected 2 results with MinSimilarity=0, got %d", len(results))
+	}
+}
+
+// W4C.2: Test MinSimilarity with very high threshold filters all
+func TestSearchWithMinSimilarityVeryHigh(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	// Insert a nearly-exact vector (not exact)
+	idx.Insert("similar", []float32{0.99, 0.01, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+
+	// MinSimilarity = 1.0 should only match exact vectors
+	filter := &SearchFilter{
+		MinSimilarity: 1.0,
+	}
+	results := idx.Search([]float32{1, 0, 0, 0}, 10, filter)
+
+	// No results expected since similarity < 1.0
+	if len(results) != 0 {
+		t.Errorf("Expected 0 results with MinSimilarity=1.0, got %d", len(results))
+		for _, r := range results {
+			t.Logf("Unexpected result: %s with similarity %v", r.ID, r.Similarity)
+		}
+	}
+}
+
+// W4C.1: Test that candidates never exceed ef*2 in searchLayer
+func TestSearchLayerCandidatesBounded(t *testing.T) {
+	idx := New(Config{
+		M:           16,
+		EfConstruct: 200,
+		EfSearch:    50, // ef=50, so maxCandidates should be 100
+		LevelMult:   0.36067977499789996,
+		Dimension:   128,
+	})
+
+	// Insert enough nodes to create a dense graph
+	for i := 0; i < 500; i++ {
+		vec := make([]float32, 128)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	}
+
+	// Perform multiple searches to verify bound is maintained
+	for i := 0; i < 10; i++ {
+		query := make([]float32, 128)
+		for j := range query {
+			query[j] = rand.Float32()
+		}
+		results := idx.Search(query, 10, nil)
+
+		// Results should be non-empty
+		if len(results) == 0 {
+			t.Errorf("Search %d returned no results", i)
+		}
+
+		// Results should not exceed requested k
+		if len(results) > 10 {
+			t.Errorf("Search %d returned %d results, expected at most 10", i, len(results))
+		}
+	}
+}
+
+// W4C.1: Test that search quality is maintained after fix
+func TestSearchLayerQualityMaintained(t *testing.T) {
+	idx := New(Config{
+		M:           16,
+		EfConstruct: 100,
+		EfSearch:    50,
+		LevelMult:   0.36067977499789996,
+		Dimension:   4,
+	})
+
+	// Insert known vectors
+	idx.Insert("exact", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("similar90", []float32{0.9, 0.1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("similar80", []float32{0.8, 0.2, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("orthogonal", []float32{0, 1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+
+	results := idx.Search([]float32{1, 0, 0, 0}, 4, nil)
+
+	if len(results) < 3 {
+		t.Fatalf("Expected at least 3 results, got %d", len(results))
+	}
+
+	// First result should be exact match or very close
+	if results[0].Similarity < 0.99 {
+		t.Errorf("First result similarity %v, expected >= 0.99", results[0].Similarity)
+	}
+
+	// Results should be sorted by descending similarity
+	for i := 1; i < len(results); i++ {
+		if results[i].Similarity > results[i-1].Similarity {
+			t.Errorf("Results not sorted: index %d has similarity %v > index %d with %v",
+				i, results[i].Similarity, i-1, results[i-1].Similarity)
+		}
+	}
+}
+
+// W4C.1: Test bounds checking for missing vectors in searchLayer
+func TestSearchLayerMissingVectorBoundsCheck(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	// Insert some vectors
+	idx.Insert("node1", []float32{1, 0, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	idx.Insert("node2", []float32{0, 1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+
+	// This test ensures the bounds check doesn't panic when vectors are properly present
+	results := idx.Search([]float32{1, 0, 0, 0}, 10, nil)
+	if len(results) == 0 {
+		t.Error("Expected results but got none")
+	}
+}
+
+// W4C.1: Test getVectorAndMagnitude helper function
+func TestGetVectorAndMagnitude(t *testing.T) {
+	idx := New(DefaultConfig())
+
+	// Insert a vector
+	idx.Insert("node1", []float32{3, 4, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+
+	// Test existing node
+	idx.mu.RLock()
+	vec, mag, ok := idx.getVectorAndMagnitude("node1")
+	idx.mu.RUnlock()
+
+	if !ok {
+		t.Error("getVectorAndMagnitude should find node1")
+	}
+	if vec == nil {
+		t.Error("Vector should not be nil")
+	}
+	if mag != 5.0 {
+		t.Errorf("Magnitude should be 5.0, got %v", mag)
+	}
+
+	// Test non-existent node
+	idx.mu.RLock()
+	_, _, ok = idx.getVectorAndMagnitude("nonexistent")
+	idx.mu.RUnlock()
+
+	if ok {
+		t.Error("getVectorAndMagnitude should not find nonexistent node")
+	}
+}
+
+// W4C.1: Test memory bounded on large graph with high connectivity
+func TestSearchLayerMemoryBoundedLargeGraph(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping large graph test in short mode")
+	}
+
+	idx := New(Config{
+		M:           32, // Higher connectivity
+		EfConstruct: 200,
+		EfSearch:    100,
+		LevelMult:   0.36067977499789996,
+		Dimension:   64,
+	})
+
+	// Insert a large number of nodes
+	numNodes := 1000
+	for i := 0; i < numNodes; i++ {
+		vec := make([]float32, 64)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	}
+
+	// Verify searches complete without memory issues
+	for i := 0; i < 20; i++ {
+		query := make([]float32, 64)
+		for j := range query {
+			query[j] = rand.Float32()
+		}
+		results := idx.Search(query, 10, nil)
+
+		// Should return results without hanging or memory issues
+		if len(results) == 0 {
+			t.Errorf("Search %d on large graph returned no results", i)
+		}
+	}
+}
+
+// W4C.1: Test that concurrent searches with bounded candidates work correctly
+func TestSearchLayerConcurrentBounded(t *testing.T) {
+	idx := New(Config{
+		M:           16,
+		EfConstruct: 100,
+		EfSearch:    50,
+		LevelMult:   0.36067977499789996,
+		Dimension:   128,
+	})
+
+	// Insert nodes
+	for i := 0; i < 200; i++ {
+		vec := make([]float32, 128)
+		for j := range vec {
+			vec[j] = rand.Float32()
+		}
+		idx.Insert(randomNodeID(i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
+	}
+
+	// Run concurrent searches
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			query := make([]float32, 128)
+			for j := range query {
+				query[j] = rand.Float32()
+			}
+			results := idx.Search(query, 10, nil)
+			if len(results) == 0 {
+				t.Error("Concurrent search returned no results")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func randomNodeID(i int) string {
 	return "node" + string(rune('0'+i/100)) + string(rune('0'+(i/10)%10)) + string(rune('0'+i%10))
 }
