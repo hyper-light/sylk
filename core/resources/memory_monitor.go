@@ -267,9 +267,10 @@ type MemoryMonitor struct {
 	pressureLevel   atomic.Int32
 
 	// Lifecycle - goroutine is tracked via wg for proper shutdown
-	stopCh chan struct{}
-	done   chan struct{}
-	wg     sync.WaitGroup
+	stopCh    chan struct{}
+	done      chan struct{}
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // NewMemoryMonitor creates a new memory monitor.
@@ -457,7 +458,9 @@ type MemoryMonitorStats struct {
 // =============================================================================
 
 // monitorLoop runs the background monitoring goroutine.
+// This goroutine is tracked via WaitGroup and properly signals completion.
 func (m *MemoryMonitor) monitorLoop() {
+	defer m.wg.Done()
 	defer close(m.done)
 
 	ticker := time.NewTicker(m.config.MonitorInterval)
@@ -590,8 +593,12 @@ func (m *MemoryMonitor) createPayload(comp ComponentName, current, budget, ceili
 // =============================================================================
 
 // Close stops the memory monitor.
+// Waits for the monitoring goroutine to complete.
+// Safe to call multiple times.
 func (m *MemoryMonitor) Close() error {
-	close(m.stopCh)
-	<-m.done
+	m.closeOnce.Do(func() {
+		close(m.stopCh)
+	})
+	m.wg.Wait()
 	return nil
 }

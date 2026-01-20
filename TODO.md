@@ -37156,7 +37156,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add backpressure handling or error return for dropped messages           ││
 │ │   SEVERITY: CRITICAL - Silent message loss                                      ││
 │ │                                                                                  ││
-│ │ [x] W12.3 - ChannelBus Untracked Async Handlers                                 ││
+│ │ [ ] W12.3 - ChannelBus Untracked Async Handlers                                 ││
 │ │   FILE: agents/guide/channel_bus.go:217-219                                     ││
 │ │   ISSUE: go func() for handlers not tracked, no cleanup on shutdown             ││
 │ │   FIX: Use GoroutineScope or WaitGroup for handler goroutines                   ││
@@ -37202,7 +37202,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Use sync.Once for close, add closed state check                          ││
 │ │   SEVERITY: CRITICAL - Panic                                                    ││
 │ │                                                                                  ││
-│ │ [ ] W12.9 - MemoryMonitor Untracked Goroutine                                   ││
+│ │ [x] W12.9 - MemoryMonitor Untracked Goroutine                                   ││
 │ │   FILE: core/resources/memory_monitor.go:290                                    ││
 │ │   ISSUE: Monitoring goroutine started without GoroutineScope                    ││
 │ │   FIX: Use GoroutineScope for all background goroutines                         ││
@@ -37306,7 +37306,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add read lock for map access                                             ││
 │ │   SEVERITY: CRITICAL - Race condition                                           ││
 │ │                                                                                  ││
-│ │ [ ] W12.23 - HallucinationFirewall Untracked Goroutine                          ││
+│ │ [x] W12.23 - HallucinationFirewall Untracked Goroutine                          ││
 │ │   FILE: core/vectorgraphdb/mitigations/hallucination_firewall.go:145-167        ││
 │ │   ISSUE: Background verification goroutine not tracked                          ││
 │ │   FIX: Use GoroutineScope for background work                                   ││

@@ -1022,3 +1022,141 @@ func TestMemoryMonitor_AtomicPauseFlags(t *testing.T) {
 		t.Errorf("expected 10000 reads, got %d", readCount.Load())
 	}
 }
+
+// =============================================================================
+// W12.9 - MemoryMonitor Goroutine Tracking Tests
+// =============================================================================
+
+// TestMemoryMonitor_GoroutineTracking verifies the monitoring goroutine is tracked.
+func TestMemoryMonitor_GoroutineTracking(t *testing.T) {
+	config := DefaultMemoryMonitorConfig()
+	config.MonitorInterval = 10 * time.Millisecond
+
+	monitor := NewMemoryMonitor(config)
+
+	// Do some work
+	monitor.AddUsage(ComponentQueryCache, 100)
+	time.Sleep(50 * time.Millisecond)
+
+	// Close should not hang
+	done := make(chan struct{})
+	go func() {
+		monitor.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(1 * time.Second):
+		t.Fatal("Close() timed out - goroutine tracking issue")
+	}
+}
+
+// TestMemoryMonitor_MultipleCloseDoesNotPanic verifies double close is safe.
+func TestMemoryMonitor_MultipleCloseDoesNotPanic(t *testing.T) {
+	config := DefaultMemoryMonitorConfig()
+	config.MonitorInterval = 10 * time.Millisecond
+
+	monitor := NewMemoryMonitor(config)
+
+	// First close should succeed
+	err := monitor.Close()
+	if err != nil {
+		t.Errorf("first close should succeed, got %v", err)
+	}
+
+	// Second close should not panic
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("Close() panicked on double call: %v", r)
+		}
+	}()
+
+	err = monitor.Close()
+	if err != nil {
+		t.Errorf("second close should succeed (idempotent), got %v", err)
+	}
+}
+
+// TestMemoryMonitor_RapidCreateClose verifies no goroutine leaks on rapid create/close.
+func TestMemoryMonitor_RapidCreateClose(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		config := DefaultMemoryMonitorConfig()
+		config.MonitorInterval = 10 * time.Millisecond
+		monitor := NewMemoryMonitor(config)
+
+		// Small amount of work
+		monitor.AddUsage(ComponentQueryCache, 10)
+
+		// Close
+		monitor.Close()
+	}
+	// If goroutines leak, we'd see increased memory or goroutine count
+	// This test mainly checks for panics
+}
+
+// TestMemoryMonitor_ConcurrentCloseNoPanic verifies concurrent close calls don't panic.
+func TestMemoryMonitor_ConcurrentCloseNoPanic(t *testing.T) {
+	for iteration := 0; iteration < 50; iteration++ {
+		config := DefaultMemoryMonitorConfig()
+		config.MonitorInterval = 10 * time.Millisecond
+		monitor := NewMemoryMonitor(config)
+
+		var wg sync.WaitGroup
+		const numClosers = 5
+
+		// Launch concurrent closers
+		for i := 0; i < numClosers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("iteration %d: Close() panicked: %v", iteration, r)
+					}
+				}()
+				monitor.Close()
+			}()
+		}
+
+		wg.Wait()
+	}
+}
+
+// TestMemoryMonitor_CloseInterruptsMonitoring verifies Close stops monitoring.
+func TestMemoryMonitor_CloseInterruptsMonitoring(t *testing.T) {
+	publisher := newMockSignalPublisher()
+	config := DefaultMemoryMonitorConfig()
+	config.SignalPublisher = publisher
+	config.MonitorInterval = 20 * time.Millisecond
+	config.QueryCacheBudget = 1000
+	config.ComponentLRUThreshold = 0.70
+
+	monitor := NewMemoryMonitor(config)
+
+	// Add usage above threshold
+	monitor.AddUsage(ComponentQueryCache, 800)
+
+	// Wait for some signals
+	time.Sleep(100 * time.Millisecond)
+	initialSignals := len(publisher.getSignals())
+
+	// Close the monitor
+	monitor.Close()
+
+	// Clear signals and wait
+	publisher.clear()
+	time.Sleep(100 * time.Millisecond)
+
+	// No new signals should be emitted
+	newSignals := len(publisher.getSignals())
+	if newSignals > 0 {
+		t.Errorf("expected 0 signals after close, got %d", newSignals)
+	}
+
+	// Sanity check that we did get signals before close
+	if initialSignals == 0 {
+		t.Error("expected some signals before close")
+	}
+}
