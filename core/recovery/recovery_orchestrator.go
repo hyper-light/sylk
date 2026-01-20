@@ -104,6 +104,8 @@ func (r *RecoveryOrchestrator) handleForceKillPhase(state *RecoveryState, assess
 	}
 }
 
+// trySoftIntervention attempts a soft intervention for a stuck agent.
+// REQUIRES: caller holds state.mu.
 func (r *RecoveryOrchestrator) trySoftIntervention(state *RecoveryState, assessment HealthAssessment) {
 	if state.SoftAttempts >= r.config.MaxSoftAttempts {
 		return
@@ -115,7 +117,7 @@ func (r *RecoveryOrchestrator) trySoftIntervention(state *RecoveryState, assessm
 		return
 	}
 
-	state.MarkSoftIntervention()
+	state.markSoftInterventionLocked()
 	r.logger.Info("soft intervention sent",
 		"agent", state.AgentID,
 		"attempt", state.SoftAttempts,
@@ -133,13 +135,15 @@ func (r *RecoveryOrchestrator) buildBreakoutPrompt(assessment HealthAssessment) 
 		"update on your current task, explain any blockers, or try an alternative approach."
 }
 
+// escalateToUser escalates the agent issue to user attention.
+// REQUIRES: caller holds state.mu.
 func (r *RecoveryOrchestrator) escalateToUser(state *RecoveryState, assessment HealthAssessment) {
 	if err := r.notifier.EscalateToUser(state.SessionID, state.AgentID, assessment); err != nil {
 		r.logger.Warn("user escalation failed", "agent", state.AgentID, "error", err)
 		return
 	}
 
-	state.MarkUserEscalated()
+	state.markUserEscalatedLocked()
 	r.logger.Info("escalated to user", "agent", state.AgentID)
 }
 
@@ -154,11 +158,13 @@ func (r *RecoveryOrchestrator) handleUserResponse(state *RecoveryState, assessme
 	}
 }
 
+// forceKill forcefully terminates an agent and releases its resources.
+// REQUIRES: caller holds state.mu.
 func (r *RecoveryOrchestrator) forceKill(state *RecoveryState, assessment HealthAssessment) {
-	state.MarkForceKill()
+	state.markForceKillLocked()
 
 	released := r.resourceMgr.ForceReleaseByAgent(state.AgentID)
-	state.AddReleasedResources(released)
+	state.addReleasedResourcesLocked(released)
 
 	reason := r.buildForceKillReason(assessment)
 	r.notifier.NotifyForceKill(state.SessionID, state.AgentID, reason)
@@ -195,11 +201,12 @@ func (r *RecoveryOrchestrator) clearState(agentID string) {
 	r.recoveryState.Delete(agentID)
 }
 
+// SetUserResponse records the user's response for a given agent's recovery state.
 func (r *RecoveryOrchestrator) SetUserResponse(agentID string, response UserRecoveryResponse) {
 	if state, ok := r.recoveryState.Load(agentID); ok {
 		s := state.(*RecoveryState)
 		s.Lock()
-		s.SetUserResponse(&response)
+		s.setUserResponseLocked(&response)
 		s.Unlock()
 		r.notifier.OnUserResponse(agentID, response)
 	}

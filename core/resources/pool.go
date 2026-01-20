@@ -272,7 +272,11 @@ func (p *ResourcePool) waitForResource(ctx context.Context, req *waitRequest) (*
 	defer timer.Stop()
 
 	select {
-	case handle := <-req.ready:
+	case handle, ok := <-req.ready:
+		if !ok {
+			// Channel closed means pool is closing
+			return nil, ErrPoolClosed
+		}
 		return handle, nil
 	case <-timer.C:
 		p.removeWaitRequest(req)

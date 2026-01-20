@@ -116,11 +116,16 @@ func (d *CrossSessionSignalDispatcher) watchLoop(ctx context.Context) {
 	}
 }
 
+// mergeStopChannels creates a unified done channel that closes when any stop
+// condition is met. W12.4: Uses WaitGroup to ensure goroutine cleanup.
 func (d *CrossSessionSignalDispatcher) mergeStopChannels(ctx context.Context) (<-chan struct{}, func()) {
 	done := make(chan struct{})
 	cleanup := make(chan struct{})
+	var wg sync.WaitGroup
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		select {
 		case <-ctx.Done():
 		case <-d.stopChan:
@@ -129,7 +134,10 @@ func (d *CrossSessionSignalDispatcher) mergeStopChannels(ctx context.Context) (<
 		close(done)
 	}()
 
-	return done, func() { close(cleanup) }
+	return done, func() {
+		close(cleanup)
+		wg.Wait()
+	}
 }
 
 func (d *CrossSessionSignalDispatcher) processNextEvent(done <-chan struct{}) bool {

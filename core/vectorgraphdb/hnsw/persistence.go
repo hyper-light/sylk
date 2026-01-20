@@ -216,6 +216,8 @@ func (h *Index) loadVectorRow(rows *sql.Rows) error {
 
 // recomputeEdgeDistances recalculates all edge distances using stored vectors.
 // W4P.15: Called after LoadVectors to restore correct neighbor ordering.
+// W12.10: Restructured to avoid holding h.mu while acquiring layer locks.
+// Caller must hold h.mu (write lock).
 func (h *Index) recomputeEdgeDistances() {
 	for _, layer := range h.layers {
 		h.recomputeLayerDistances(layer)
@@ -223,34 +225,52 @@ func (h *Index) recomputeEdgeDistances() {
 }
 
 // recomputeLayerDistances recalculates distances for all edges in a single layer.
+// W12.10: Collects all data with proper lock ordering to avoid deadlock.
+// Caller must hold h.mu (write lock).
 func (h *Index) recomputeLayerDistances(l *layer) {
-	l.mu.RLock()
-	nodeIDs := make([]string, 0, len(l.nodes))
-	for id := range l.nodes {
-		nodeIDs = append(nodeIDs, id)
-	}
-	l.mu.RUnlock()
+	// Collect node-neighbor pairs with layer lock held
+	updates := h.collectDistanceUpdates(l)
 
-	for _, nodeID := range nodeIDs {
-		h.recomputeNodeDistances(l, nodeID)
+	// Apply updates - layer's ConcurrentNeighborSet handles its own locking
+	for _, update := range updates {
+		update.neighbors.UpdateDistance(update.neighborID, update.distance)
 	}
 }
 
-// recomputeNodeDistances recalculates distances for all neighbors of a single node.
-func (h *Index) recomputeNodeDistances(l *layer, nodeID string) {
+// distanceUpdate holds data needed to update a single neighbor distance.
+// W12.10: Used to batch updates and avoid holding multiple locks.
+type distanceUpdate struct {
+	neighbors  *ConcurrentNeighborSet
+	neighborID string
+	distance   float32
+}
+
+// collectDistanceUpdates collects all distance updates for a layer.
+// W12.10: Acquires layer lock, computes distances, releases lock before returning.
+// Caller must hold h.mu (read or write lock).
+func (h *Index) collectDistanceUpdates(l *layer) []distanceUpdate {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var updates []distanceUpdate
+	for nodeID, node := range l.nodes {
+		nodeUpdates := h.computeNodeDistanceUpdates(nodeID, node)
+		updates = append(updates, nodeUpdates...)
+	}
+	return updates
+}
+
+// computeNodeDistanceUpdates computes distance updates for all neighbors of a node.
+// W12.10: Does not acquire any locks - caller must hold both h.mu and l.mu.
+func (h *Index) computeNodeDistanceUpdates(nodeID string, node *layerNode) []distanceUpdate {
 	srcVec, srcMag, srcOK := h.getVectorAndMagnitudeLocked(nodeID)
 	if !srcOK {
-		return
-	}
-
-	l.mu.RLock()
-	node, exists := l.nodes[nodeID]
-	l.mu.RUnlock()
-	if !exists {
-		return
+		return nil
 	}
 
 	neighbors := node.neighbors.GetSortedNeighbors()
+	updates := make([]distanceUpdate, 0, len(neighbors))
+
 	for _, neighbor := range neighbors {
 		dstVec, dstMag, dstOK := h.getVectorAndMagnitudeLocked(neighbor.ID)
 		if !dstOK {
@@ -258,8 +278,13 @@ func (h *Index) recomputeNodeDistances(l *layer, nodeID string) {
 		}
 		similarity := CosineSimilarity(srcVec, dstVec, srcMag, dstMag)
 		distance := float32(1.0 - similarity)
-		node.neighbors.UpdateDistance(neighbor.ID, distance)
+		updates = append(updates, distanceUpdate{
+			neighbors:  node.neighbors,
+			neighborID: neighbor.ID,
+			distance:   distance,
+		})
 	}
+	return updates
 }
 
 // getVectorAndMagnitudeLocked retrieves vector and magnitude without locking.

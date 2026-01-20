@@ -62,36 +62,130 @@ func (s *RecoveryState) Unlock() {
 	s.mu.Unlock()
 }
 
-func (s *RecoveryState) MarkSoftIntervention() {
+// markSoftInterventionLocked updates state for a soft intervention attempt.
+// REQUIRES: caller holds s.mu.
+func (s *RecoveryState) markSoftInterventionLocked() {
 	s.SoftAttempts++
 	s.LastSoftIntervention = time.Now()
 	s.Level = RecoverySoftIntervention
 }
 
-func (s *RecoveryState) MarkUserEscalated() {
+// MarkSoftIntervention updates state for a soft intervention attempt (thread-safe).
+func (s *RecoveryState) MarkSoftIntervention() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markSoftInterventionLocked()
+}
+
+// markUserEscalatedLocked updates state when escalating to user.
+// REQUIRES: caller holds s.mu.
+func (s *RecoveryState) markUserEscalatedLocked() {
 	s.UserEscalated = true
 	s.UserEscalatedAt = time.Now()
 	s.Level = RecoveryUserEscalation
 }
 
-func (s *RecoveryState) SetUserResponse(response *UserRecoveryResponse) {
+// MarkUserEscalated updates state when escalating to user (thread-safe).
+func (s *RecoveryState) MarkUserEscalated() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markUserEscalatedLocked()
+}
+
+// setUserResponseLocked sets the user's recovery response.
+// REQUIRES: caller holds s.mu.
+func (s *RecoveryState) setUserResponseLocked(response *UserRecoveryResponse) {
 	s.UserResponse = response
 }
 
-func (s *RecoveryState) MarkForceKill() {
+// SetUserResponse sets the user's recovery response (thread-safe).
+func (s *RecoveryState) SetUserResponse(response *UserRecoveryResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setUserResponseLocked(response)
+}
+
+// markForceKillLocked updates state when force killing.
+// REQUIRES: caller holds s.mu.
+func (s *RecoveryState) markForceKillLocked() {
 	s.Level = RecoveryForceKill
 }
 
-func (s *RecoveryState) AddReleasedResources(resources []string) {
+// MarkForceKill updates state when force killing (thread-safe).
+func (s *RecoveryState) MarkForceKill() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markForceKillLocked()
+}
+
+// addReleasedResourcesLocked appends released resources to the state.
+// REQUIRES: caller holds s.mu.
+func (s *RecoveryState) addReleasedResourcesLocked(resources []string) {
 	s.ResourcesReleased = append(s.ResourcesReleased, resources...)
 }
 
-func (s *RecoveryState) Reset() {
+// AddReleasedResources appends released resources to the state (thread-safe).
+func (s *RecoveryState) AddReleasedResources(resources []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.addReleasedResourcesLocked(resources)
+}
+
+// resetLocked resets the recovery state to initial values.
+// REQUIRES: caller holds s.mu.
+func (s *RecoveryState) resetLocked() {
 	s.Level = RecoveryNone
 	s.SoftAttempts = 0
 	s.UserEscalated = false
 	s.UserResponse = nil
 	s.ResourcesReleased = nil
+}
+
+// Reset resets the recovery state to initial values (thread-safe).
+func (s *RecoveryState) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resetLocked()
+}
+
+// GetLevel returns the current recovery level (thread-safe).
+func (s *RecoveryState) GetLevel() RecoveryLevel {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Level
+}
+
+// GetSoftAttempts returns the number of soft intervention attempts (thread-safe).
+func (s *RecoveryState) GetSoftAttempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.SoftAttempts
+}
+
+// IsUserEscalated returns whether the state has been escalated to user (thread-safe).
+func (s *RecoveryState) IsUserEscalated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.UserEscalated
+}
+
+// GetUserResponse returns the user's recovery response (thread-safe).
+func (s *RecoveryState) GetUserResponse() *UserRecoveryResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.UserResponse
+}
+
+// GetReleasedResources returns a copy of the released resources (thread-safe).
+func (s *RecoveryState) GetReleasedResources() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ResourcesReleased == nil {
+		return nil
+	}
+	result := make([]string, len(s.ResourcesReleased))
+	copy(result, s.ResourcesReleased)
+	return result
 }
 
 type UserRecoveryAction int

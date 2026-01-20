@@ -35465,9 +35465,334 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │                                                                │ W4N.18       │ ││
 │ │                                                                └──────────────┘ ││
 │ │                                                                                  ││
-│ │ TOTAL: 18 issues (4 critical, 4 high, 6 medium, 4 low)                          ││
+│ │ TOTAL: 18 issues (4 critical, 4 high, 6 medium, 4 low) - ALL COMPLETE            ││
 │ │ EXECUTION: 5 waves, max 4 parallel per wave                                     ││
 │ │ REFERENCES: Code review audit of Wave 4 Groups 3A-4AF                           ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AH: Wave 4 DB Enhancement Fixes (W4P)                           ││
+│ │ ** Discovered via comprehensive DB implementation analysis **                   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 1: VectorDB CRITICAL + HIGH (3 parallel - no dependencies)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.1 - HNSW Insertion Failure Causes DB/Index Inconsistency                ││
+│ │   FILE: core/vectorgraphdb/nodes.go:87-92                                       ││
+│ │   ISSUE: insertNodeToDB succeeds but insertNodeToHNSW fails = inconsistency     ││
+│ │   FIX: Implement compensation/rollback on HNSW failure                          ││
+│ │   SEVERITY: CRITICAL - Data consistency issue                                   ││
+│ │                                                                                  ││
+│ │ [x] W4P.2 - Snapshot Layer Lock Contention                                      ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot.go:118-125                             ││
+│ │   ISSUE: O(n) lock acquisitions during snapshot creation                        ││
+│ │   FIX: Batch-acquire all layer locks at once                                    ││
+│ │   SEVERITY: HIGH - Performance under load                                       ││
+│ │                                                                                  ││
+│ │ [x] W4P.3 - SQLite Connection Pool Tuning                                       ││
+│ │   FILE: core/vectorgraphdb/db.go:30-37                                          ││
+│ │   ISSUE: Hardcoded MaxOpenConns=10, MaxIdleConns=5 insufficient for scale       ││
+│ │   FIX: Make configurable, recommend 20-50 for production                        ││
+│ │   SEVERITY: HIGH - Connection exhaustion under load                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 2: Bleve/KG HIGH (3 parallel - no dependencies)                        ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.4 - Path Index Desynchronization with Bleve                             ││
+│ │   FILE: core/search/bleve/index_manager.go:404-415                              ││
+│ │   ISSUE: Path index updated separately from Bleve, can desync on failure        ││
+│ │   FIX: Make transactional or add validation/repair mechanism                    ││
+│ │   SEVERITY: HIGH - Data consistency                                             ││
+│ │                                                                                  ││
+│ │ [x] W4P.5 - Batch Commit Goroutine Leak Risk                                    ││
+│ │   FILE: core/search/bleve/index_manager.go:706-707                              ││
+│ │   ISSUE: Spawns goroutine per batch commit without pool/limit                   ││
+│ │   FIX: Implement goroutine pool or semaphore                                    ││
+│ │   SEVERITY: HIGH - Goroutine explosion                                          ││
+│ │                                                                                  ││
+│ │ [x] W4P.6 - No Index Corruption Recovery                                        ││
+│ │   FILE: core/search/bleve/index_manager.go:222-349                              ││
+│ │   ISSUE: Corrupted Bleve index causes repeated failures, no recovery            ││
+│ │   FIX: Add verification, auto-rebuild, or fallback index                        ││
+│ │   SEVERITY: HIGH - System availability                                          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 3: VectorDB MEDIUM Part 1 (4 parallel - depends on Wave 1)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.7 - Snapshot Search Hardcoded efSearch                                  ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_search.go:120                          ││
+│ │   ISSUE: Uses hardcoded max(k*2,100) instead of index efSearch                  ││
+│ │   FIX: Pass index efSearch to snapshot creation                                 ││
+│ │   SEVERITY: MEDIUM - Search quality inconsistency                               ││
+│ │                                                                                  ││
+│ │ [x] W4P.8 - Memory Pre-allocation Missing in searchLayer                        ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:235-260                                 ││
+│ │   ISSUE: Candidates slice grows via append without pre-allocation               ││
+│ │   FIX: Pre-allocate make([]SearchResult, 0, maxCandidates)                      ││
+│ │   SEVERITY: MEDIUM - GC pressure                                                ││
+│ │                                                                                  ││
+│ │ [x] W4P.9 - Repeated Sorting in GetSortedNeighbors                              ││
+│ │   FILE: core/vectorgraphdb/hnsw/neighbor_set.go:228-241                         ││
+│ │   ISSUE: O(n log n) sort on every call without caching                          ││
+│ │   FIX: Add caching or sorting-on-insert option                                  ││
+│ │   SEVERITY: MEDIUM - Repeated computation                                       ││
+│ │                                                                                  ││
+│ │ [x] W4P.10 - Snapshot Reader Count Underflow                                    ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_manager.go:102-110                     ││
+│ │   ISSUE: ReleaseSnapshot can underflow if called twice                          ││
+│ │   FIX: Validate before decrement, return bool for over-release                  ││
+│ │   SEVERITY: MEDIUM - Snapshot lifecycle                                         ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 4: Bleve/KG MEDIUM Part 1 (4 parallel - depends on Wave 2)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.11 - AsyncIndexQueue No Retry Mechanism                                 ││
+│ │   FILE: core/search/bleve/async_queue.go:201                                    ││
+│ │   ISSUE: Failed submissions dropped immediately without retry                   ││
+│ │   FIX: Add exponential backoff retry or overflow callback                       ││
+│ │   SEVERITY: MEDIUM - Data loss under pressure                                   ││
+│ │                                                                                  ││
+│ │ [x] W4P.12 - Path Index Unbounded Memory Growth                                 ││
+│ │   FILE: core/search/bleve/index_manager.go:190-191                              ││
+│ │   ISSUE: pathIndex map grows indefinitely, no cleanup                           ││
+│ │   FIX: Implement periodic GC or LRU eviction                                    ││
+│ │   SEVERITY: MEDIUM - Memory leak                                                ││
+│ │                                                                                  ││
+│ │ [x] W4P.13 - Edge Index Rebuilt Every Evaluation                                ││
+│ │   FILE: core/knowledge/inference/rule_evaluator.go:57-58                        ││
+│ │   ISSUE: Edge index rebuilt fresh on every rule evaluation                      ││
+│ │   FIX: Cache at forward chaining level, invalidate selectively                  ││
+│ │   SEVERITY: MEDIUM - Repeated computation                                       ││
+│ │                                                                                  ││
+│ │ [x] W4P.14 - Forward Chainer Soft Iteration Limit                               ││
+│ │   FILE: core/knowledge/inference/forward_chain.go:66-95                         ││
+│ │   ISSUE: MaxIterations not strictly enforced, can diverge                       ││
+│ │   FIX: Add stricter cycle detection, early termination                          ││
+│ │   SEVERITY: MEDIUM - Infinite loop risk                                         ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 5: VectorDB MEDIUM Part 2 (4 parallel - depends on Wave 3)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.15 - Distance Persistence Missing                                       ││
+│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:161-162                          ││
+│ │   ISSUE: Distances set to 0 on load, degrades search until rebuilt              ││
+│ │   FIX: Store distances in hnsw_edges or recompute on load                       ││
+│ │   SEVERITY: MEDIUM - Post-load degradation                                      ││
+│ │                                                                                  ││
+│ │ [x] W4P.16 - Entry Point Validation Incomplete                                  ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_search.go:36-46                        ││
+│ │   ISSUE: Entry point checked once but not validated per-layer                   ││
+│ │   FIX: Validate entry point vector exists at each layer search                  ││
+│ │   SEVERITY: MEDIUM - Silent failures                                            ││
+│ │                                                                                  ││
+│ │ [x] W4P.17 - Inconsistent Distance Calculation                                  ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_search.go:252-264                      ││
+│ │   ISSUE: Live vs snapshot search may have rounding differences                  ││
+│ │   FIX: Use identical formula, add consistency tests                             ││
+│ │   SEVERITY: MEDIUM - Ranking inconsistency                                      ││
+│ │                                                                                  ││
+│ │ [x] W4P.18 - In-place Vector Normalization Side Effects                         ││
+│ │   FILE: core/vectorgraphdb/hnsw/distance.go:65-75                               ││
+│ │   ISSUE: NormalizeVector modifies in-place, corrupts shared vectors             ││
+│ │   FIX: Return normalized copy or document ownership                             ││
+│ │   SEVERITY: MEDIUM - Data corruption                                            ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 6: Bleve/KG MEDIUM Part 2 (4 parallel - depends on Wave 4)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.19 - Async Queue Error Context Lost                                     ││
+│ │   FILE: core/search/bleve/async_queue.go:462-513                                ││
+│ │   ISSUE: Batch errors sent to all channels, individual errors lost              ││
+│ │   FIX: Implement per-operation error tracking                                   ││
+│ │   SEVERITY: MEDIUM - Error visibility                                           ││
+│ │                                                                                  ││
+│ │ [x] W4P.20 - Materialization Manager No Rollback                                ││
+│ │   FILE: core/knowledge/inference/materialization.go:109-125                     ││
+│ │   ISSUE: Failed materializations not retried or logged                          ││
+│ │   FIX: Add retry with backoff, queue for later                                  ││
+│ │   SEVERITY: MEDIUM - Silent edge loss                                           ││
+│ │                                                                                  ││
+│ │ [x] W4P.21 - No Context Propagation in Async Ops                                ││
+│ │   FILE: core/search/bleve/async_queue.go:189-215                                ││
+│ │   ISSUE: Uses context.Background(), ignores caller context                      ││
+│ │   FIX: Accept and use caller context for lifecycle                              ││
+│ │   SEVERITY: MEDIUM - Cancellation broken                                        ││
+│ │                                                                                  ││
+│ │ [x] W4P.22 - Inference Engine Write Lock Timing                                 ││
+│ │   FILE: core/knowledge/inference/engine.go:334-389                              ││
+│ │   ISSUE: Write lock released before edge provider call                          ││
+│ │   FIX: Hold lock during entire operation or use events                          ││
+│ │   SEVERITY: MEDIUM - Race condition                                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 7: VectorDB MEDIUM Part 3 + LOW (4 parallel - depends on Wave 5)       ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.23 - Domain Filtering Silent Default                                    ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_search.go:229-237                      ││
+│ │   ISSUE: Missing domain defaults to DomainCode silently                         ││
+│ │   FIX: Return error or log warning on missing domain                            ││
+│ │   SEVERITY: MEDIUM - Silent filtering errors                                    ││
+│ │                                                                                  ││
+│ │ [x] W4P.24 - Magnitude Caching Without Validation                               ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:133-138                                 ││
+│ │   ISSUE: Cached magnitude not validated against vector                          ││
+│ │   FIX: Add assertion or implement vector versioning                             ││
+│ │   SEVERITY: MEDIUM - Distance errors                                            ││
+│ │                                                                                  ││
+│ │ [x] W4P.25 - Batch Loader Lock Pattern                                          ││
+│ │   FILE: core/vectorgraphdb/batch_loader.go:78-129                               ││
+│ │   ISSUE: Two separate lock cycles for read then write                           ││
+│ │   FIX: Combine into single lock cycle                                           ││
+│ │   SEVERITY: LOW - Minor inefficiency                                            ││
+│ │                                                                                  ││
+│ │ [x] W4P.26 - Neighbor Links Not Validated Post-Delete                           ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:434-459                                 ││
+│ │   ISSUE: Deletion doesn't validate remaining neighbor links                     ││
+│ │   FIX: Validate all links or implement reverse link validation                  ││
+│ │   SEVERITY: LOW - Orphaned references                                           ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 8: Bleve/KG MEDIUM Part 3 (4 parallel - depends on Wave 6)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.27 - Edge Key Format No Validation                                      ││
+│ │   FILE: core/knowledge/inference/materialization.go:160-173                     ││
+│ │   ISSUE: Edge key parsing has no validation, silent failures                    ││
+│ │   FIX: Add strict parsing with error handling                                   ││
+│ │   SEVERITY: MEDIUM - Silent failures                                            ││
+│ │                                                                                  ││
+│ │ [x] W4P.28 - Binding Variable Isolation                                         ││
+│ │   FILE: core/knowledge/inference/rule_evaluator.go:160-179                      ││
+│ │   ISSUE: Cached matches returned by reference, caller can corrupt               ││
+│ │   FIX: Return deep copies or document immutability                              ││
+│ │   SEVERITY: MEDIUM - Cache corruption                                           ││
+│ │                                                                                  ││
+│ │ [x] W4P.29 - Query Metrics Unbounded Accumulation                               ││
+│ │   FILE: core/knowledge/query/coordinator.go:81-109                              ││
+│ │   ISSUE: Metrics map grows indefinitely                                         ││
+│ │   FIX: Add TTL cleanup or bounded LRU                                           ││
+│ │   SEVERITY: MEDIUM - Memory leak                                                ││
+│ │                                                                                  ││
+│ │ [x] W4P.30 - Regex Cache Panic Risk                                             ││
+│ │   FILE: core/knowledge/query/regex_cache.go:141-148                             ││
+│ │   ISSUE: MustGetOrCompile panics in background goroutines                       ││
+│ │   FIX: Return errors, forbid Must* or add recovery                              ││
+│ │   SEVERITY: MEDIUM - Crash risk                                                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 9: VectorDB LOW + Bleve LOW Part 1 (4 parallel - depends on Wave 7)    ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.31 - Visited Map Threading Documentation                                ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_search.go:94-127                       ││
+│ │   ISSUE: Visited map threading model not documented                             ││
+│ │   FIX: Add documentation about single-threaded guarantee                        ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [x] W4P.32 - Entry Point Metadata Sync                                          ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:166-196                                 ││
+│ │   ISSUE: Metadata not synced with layer membership                              ││
+│ │   FIX: Synchronize metadata during insertion                                    ││
+│ │   SEVERITY: MEDIUM - Incorrect metadata in results                              ││
+│ │                                                                                  ││
+│ │ [x] W4P.33 - Domain Facet Bubble Sort                                           ││
+│ │   FILE: core/search/bleve/domain_facet.go:59-67                                 ││
+│ │   ISSUE: Uses O(n²) bubble sort instead of standard sort                        ││
+│ │   FIX: Replace with sort.Slice for O(n log n)                                   ││
+│ │   SEVERITY: LOW - Minor performance                                             ││
+│ │                                                                                  ││
+│ │ [x] W4P.34 - Graph Traverser Cycle Detection                                    ││
+│ │   FILE: core/knowledge/query/graph_traverser.go:68-88                           ││
+│ │   ISSUE: Path-based tracking may miss convergence cycles                        ││
+│ │   FIX: Add convergence detection                                                ││
+│ │   SEVERITY: LOW - Edge case                                                     ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 10: Bleve LOW Part 2 + Final (4 parallel - depends on Wave 8)          ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.35 - Evidence Deserialization No Validation                             ││
+│ │   FILE: core/knowledge/inference/materialization.go:221-238                     ││
+│ │   ISSUE: JSON unmarshaled without schema validation                             ││
+│ │   FIX: Add JSON schema validation and integrity checks                          ││
+│ │   SEVERITY: LOW - Data integrity                                                ││
+│ │                                                                                  ││
+│ │ [x] W4P.36 - Query Domain Detection Fallback                                    ││
+│ │   FILE: core/knowledge/query/coordinator.go:457-475                             ││
+│ │   ISSUE: Silent fallback to DomainLibrarian on detection failure                ││
+│ │   FIX: Log failures, require explicit domain for critical queries               ││
+│ │   SEVERITY: LOW - Silent behavior change                                        ││
+│ │                                                                                  ││
+│ │ [x] W4P.37 - BleveEventIndex Cache Eviction                                     ││
+│ │   FILE: agents/archivalist/bleve_index.go:60-69                                 ││
+│ │   ISSUE: LRU eviction silent, evicted events return nil                         ││
+│ │   FIX: Add cache stats, consider disk fallback                                  ││
+│ │   SEVERITY: LOW - Silent eviction                                               ││
+│ │                                                                                  ││
+│ │ [x] W4P.38 - Edge Provider Not Set Validation                                   ││
+│ │   FILE: core/knowledge/inference/engine.go:100-114                              ││
+│ │   ISSUE: Nil edgeProvider produces empty results silently                       ││
+│ │   FIX: Add explicit error when required but not set                             ││
+│ │   SEVERITY: MEDIUM - Silent failure                                             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ W4P WAVE 11: Final Items (3 parallel - depends on Wave 9, 10)                   ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [x] W4P.39 - Materialization Write Batching                                     ││
+│ │   FILE: core/knowledge/inference/materialization.go:108-125                     ││
+│ │   ISSUE: Each materialization is a separate transaction                         ││
+│ │   FIX: Batch multiple materializations in single transaction                    ││
+│ │   SEVERITY: MEDIUM - Performance                                                ││
+│ │                                                                                  ││
+│ │ [x] W4P.40 - Cache Key Generation Performance                                   ││
+│ │   FILE: core/knowledge/inference/rule_evaluator.go:238-273                      ││
+│ │   ISSUE: String concatenation and repeated sorting for keys                     ││
+│ │   FIX: Use hash-based keys                                                      ││
+│ │   SEVERITY: LOW - Minor performance                                             ││
+│ │                                                                                  ││
+│ │ [x] W4P.41 - Field Mapping Configuration Hardcoding                             ││
+│ │   FILE: core/search/bleve/schema.go:34-77                                       ││
+│ │   ISSUE: All analyzer configs hardcoded                                         ││
+│ │   FIX: Load from configuration files                                            ││
+│ │   SEVERITY: LOW - Flexibility                                                   ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │                                                                                  ││
+│ │   WAVE 1 (VDB)    WAVE 2 (Bleve)   WAVE 3 (VDB)    WAVE 4 (Bleve)              ││
+│ │   ┌───────────┐   ┌───────────┐    ┌───────────┐   ┌───────────┐               ││
+│ │   │ W4P.1-3   │   │ W4P.4-6   │    │ W4P.7-10  │   │ W4P.11-14 │               ││
+│ │   └─────┬─────┘   └─────┬─────┘    └─────┬─────┘   └─────┬─────┘               ││
+│ │         │               │                │               │                      ││
+│ │         ▼               ▼                ▼               ▼                      ││
+│ │   WAVE 5 (VDB)    WAVE 6 (Bleve)   WAVE 7 (VDB)    WAVE 8 (Bleve)              ││
+│ │   ┌───────────┐   ┌───────────┐    ┌───────────┐   ┌───────────┐               ││
+│ │   │ W4P.15-18 │   │ W4P.19-22 │    │ W4P.23-26 │   │ W4P.27-30 │               ││
+│ │   └─────┬─────┘   └─────┬─────┘    └─────┬─────┘   └─────┬─────┘               ││
+│ │         │               │                │               │                      ││
+│ │         ▼               ▼                ▼               ▼                      ││
+│ │   WAVE 9 (Mixed)                   WAVE 10 (Mixed)                             ││
+│ │   ┌───────────┐                    ┌───────────┐                               ││
+│ │   │ W4P.31-34 │                    │ W4P.35-38 │                               ││
+│ │   └─────┬─────┘                    └─────┬─────┘                               ││
+│ │         └──────────────┬─────────────────┘                                     ││
+│ │                        ▼                                                        ││
+│ │                  WAVE 11 (Final)                                                ││
+│ │                  ┌───────────┐                                                  ││
+│ │                  │ W4P.39-41 │                                                  ││
+│ │                  └───────────┘                                                  ││
+│ │                                                                                  ││
+│ │ TOTAL: 41 issues (1 critical, 5 high, 26 medium, 9 low)                        ││
+│ │ EXECUTION: 11 waves, max 4 parallel per wave                                   ││
+│ │ REFERENCES: DB implementation analysis of VectorDB, Bleve, KnowledgeGraph      ││
 │ └─────────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                     │
 │ ESTIMATED CAPACITY: 180-200 parallel engineer pipelines (increased for new groups) │
@@ -36763,3 +37088,1137 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 6.130 → 6.132/6.133 → 6.131/6.134 → 6.135/6.136 → 6.139 → 6.137 → 6.138
 
 **Optimization Note:** Waves 5, 6, 7, 8, 9 have significant cross-dependencies but can overlap if carefully scheduled. The Orchestrator (once implemented in Wave 6) monitors completion status and eagerly starts downstream work as soon as dependencies are satisfied. Pipeline Variants (6.101-6.112) in Wave 8 specifically requires Orchestrator completion. **NEW:** FILESYSTEM VFS integration (FS.6) should integrate with Pipeline Variants for variant VFS isolation.
+
+---
+
+## W12: WAVE 1-2 COMPREHENSIVE FIX SECTION
+
+**Analysis Date:** 2026-01-20
+**Total Issues:** 143 (23 CRITICAL, 33 HIGH, 41 MEDIUM, 46 LOW)
+**Scope:** All Wave 1 and Wave 2 parallel groups analyzed for:
+- Memory leaks
+- Goroutine leaks / untracked goroutines
+- Race conditions
+- Deadlocks
+- Channel misuse (double close, send on closed channel)
+- Missing error handling
+- Performance issues
+- Missing resource cleanup
+- Incorrect synchronization
+- Functions over 100 lines
+- High cyclomatic complexity (must be ≤ 4)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ W12 EXECUTION OVERVIEW                                                              │
+│ ════════════════════                                                                │
+│                                                                                     │
+│ WAVE 1 GROUPS ANALYZED:                                                             │
+│   1A - Messaging & Events (16 issues: 3 CRITICAL, 5 HIGH, 4 MEDIUM, 4 LOW)         │
+│   1B - Session & State Management (18 issues: 3 CRITICAL, 3 HIGH, 5 MEDIUM, 7 LOW) │
+│   1C - Resource Management (17 issues: 3 CRITICAL, 3 HIGH, 6 MEDIUM, 5 LOW)        │
+│   1D - VectorGraphDB Core (19 issues: 3 CRITICAL, 5 HIGH, 6 MEDIUM, 5 LOW)         │
+│                                                                                     │
+│ WAVE 2 GROUPS ANALYZED:                                                             │
+│   2A - DAG & Pipeline Execution (14 issues: 0 CRITICAL, 3 HIGH, 5 MEDIUM, 6 LOW)   │
+│   2B - LLM Integration (17 issues: 4 CRITICAL, 5 HIGH, 4 MEDIUM, 4 LOW)            │
+│   2C - Error Handling & Recovery (19 issues: 3 CRITICAL, 5 HIGH, 5 MEDIUM, 6 LOW)  │
+│   2D - VectorGraphDB Mitigations (23 issues: 4 CRITICAL, 4 HIGH, 6 MEDIUM, 9 LOW)  │
+│                                                                                     │
+│ EXECUTION STRATEGY:                                                                 │
+│   W12 Wave 1: All CRITICAL (23 items) - 8 parallel subagents                       │
+│   W12 Wave 2: All HIGH (33 items) - 8 parallel subagents                           │
+│   W12 Wave 3: All MEDIUM (41 items) - 8 parallel subagents                         │
+│   W12 Wave 4: All LOW (46 items) - 8 parallel subagents                            │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### W12 WAVE 1: CRITICAL FIXES (23 items)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ W12 WAVE 1: CRITICAL SEVERITY (23 items - max 8 parallel)                          │
+│ ═══════════════════════════════════════════════════════════════════════════════════│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1A - MESSAGING & EVENTS (3 CRITICAL)                                      ││
+│ │                                                                                  ││
+│ │ [ ] W12.1 - ResponseStream Send on Closed Channel                               ││
+│ │   FILE: agents/guide/response_stream.go:361-379                                 ││
+│ │   ISSUE: Close() broadcasts on rs.done without checking if already closed       ││
+│ │   FIX: Use sync.Once for close, check closed state before channel operations    ││
+│ │   SEVERITY: CRITICAL - Panic on double close                                    ││
+│ │                                                                                  ││
+│ │ [ ] W12.2 - SessionBus Wildcard Handler Dropped                                 ││
+│ │   FILE: agents/guide/session_bus.go:334-347                                     ││
+│ │   ISSUE: Wildcard subscriptions silently dropped when channel full              ││
+│ │   FIX: Add backpressure handling or error return for dropped messages           ││
+│ │   SEVERITY: CRITICAL - Silent message loss                                      ││
+│ │                                                                                  ││
+│ │ [ ] W12.3 - ChannelBus Untracked Async Handlers                                 ││
+│ │   FILE: agents/guide/channel_bus.go:217-219                                     ││
+│ │   ISSUE: go func() for handlers not tracked, no cleanup on shutdown             ││
+│ │   FIX: Use GoroutineScope or WaitGroup for handler goroutines                   ││
+│ │   SEVERITY: CRITICAL - Goroutine leak                                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1B - SESSION & STATE MANAGEMENT (3 CRITICAL)                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.4 - SignalDispatcher Goroutine Leak                                     ││
+│ │   FILE: core/session/signal_dispatcher.go:119-133                               ││
+│ │   ISSUE: mergeStopChannels spawns goroutines without lifecycle tracking         ││
+│ │   FIX: Track goroutines with WaitGroup, cleanup on context cancel               ││
+│ │   SEVERITY: CRITICAL - Goroutine leak on every dispatch                         ││
+│ │                                                                                  ││
+│ │ [ ] W12.5 - WAL Channel Double-Close                                            ││
+│ │   FILE: core/concurrency/wal.go:722-724                                         ││
+│ │   ISSUE: stopPeriodicSync can close syncDone channel that's already closed      ││
+│ │   FIX: Use sync.Once for channel close, add nil check                           ││
+│ │   SEVERITY: CRITICAL - Panic on shutdown                                        ││
+│ │                                                                                  ││
+│ │ [ ] W12.6 - SignalDispatcher Broadcast Error Handling                           ││
+│ │   FILE: core/session/signal_dispatcher.go:237-248                               ││
+│ │   ISSUE: Errors in broadcast handlers swallowed, no error aggregation           ││
+│ │   FIX: Collect and return errors, log individual failures                       ││
+│ │   SEVERITY: CRITICAL - Silent failures in signal dispatch                       ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1C - RESOURCE MANAGEMENT (3 CRITICAL)                                     ││
+│ │                                                                                  ││
+│ │ [ ] W12.7 - Pool Goroutine Leak in waitForResource                              ││
+│ │   FILE: core/resources/pool.go:270-283                                          ││
+│ │   ISSUE: goroutine waiting for resource never cleaned up on context cancel      ││
+│ │   FIX: Add context cancellation check in wait loop                              ││
+│ │   SEVERITY: CRITICAL - Goroutine leak per timeout                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.8 - Pool Double Close Panic                                             ││
+│ │   FILE: core/resources/pool.go:364-381                                          ││
+│ │   ISSUE: Close() can panic if called twice due to channel double-close          ││
+│ │   FIX: Use sync.Once for close, add closed state check                          ││
+│ │   SEVERITY: CRITICAL - Panic                                                    ││
+│ │                                                                                  ││
+│ │ [ ] W12.9 - MemoryMonitor Untracked Goroutine                                   ││
+│ │   FILE: core/resources/memory_monitor.go:290                                    ││
+│ │   ISSUE: Monitoring goroutine started without GoroutineScope                    ││
+│ │   FIX: Use GoroutineScope for all background goroutines                         ││
+│ │   SEVERITY: CRITICAL - Goroutine leak                                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1D - VECTORGRAPHDB CORE (3 CRITICAL)                                      ││
+│ │                                                                                  ││
+│ │ [x] W12.10 - HNSW Persistence Deadlock                                          ││
+│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:219-263                          ││
+│ │   ISSUE: recomputeEdgeDistances holds mutex while calling methods that also lock││
+│ │   FIX: Restructure to release lock before calling other methods                 ││
+│ │   SEVERITY: CRITICAL - Deadlock                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.11 - HNSW Missing Bounds Check                                          ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:204-237                                 ││
+│ │   ISSUE: insertWithConnections doesn't validate neighbor indices                ││
+│ │   FIX: Add bounds validation before accessing neighbor data                     ││
+│ │   SEVERITY: CRITICAL - Potential panic on corrupt data                          ││
+│ │                                                                                  ││
+│ │ [ ] W12.12 - SnapshotManager Race Condition                                     ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_manager.go:56-68                       ││
+│ │   ISSUE: CreateSnapshot has TOCTOU race between check and create                ││
+│ │   FIX: Use atomic compare-and-swap or lock during entire operation              ││
+│ │   SEVERITY: CRITICAL - Race condition                                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2B - LLM INTEGRATION (4 CRITICAL)                                         ││
+│ │                                                                                  ││
+│ │ [ ] W12.13 - LLMGate Goroutine Leak in waitGroupWaiter                          ││
+│ │   FILE: core/concurrency/llm_gate.go:1163-1179                                  ││
+│ │   ISSUE: Goroutine blocks forever if WaitGroup never completes                  ││
+│ │   FIX: Add timeout or context cancellation to waiter goroutine                  ││
+│ │   SEVERITY: CRITICAL - Goroutine leak                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.14 - LLMGate Race in Cancel                                             ││
+│ │   FILE: core/concurrency/llm_gate.go:960-968                                    ││
+│ │   ISSUE: Cancel() modifies state without proper synchronization                 ││
+│ │   FIX: Add mutex protection around cancel state modification                    ││
+│ │   SEVERITY: CRITICAL - Race condition                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.15 - LLMGate Deadlock in waitForSpace                                   ││
+│ │   FILE: core/concurrency/llm_gate.go:244-251                                    ││
+│ │   ISSUE: Holds lock while waiting on channel, can deadlock                      ││
+│ │   FIX: Release lock before waiting, reacquire after                             ││
+│ │   SEVERITY: CRITICAL - Deadlock                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.16 - Queue Channel Leak                                                 ││
+│ │   FILE: core/llm/queue.go:139-149                                               ││
+│ │   ISSUE: startContextWatcher creates channel that's never closed on cancel      ││
+│ │   FIX: Ensure channel cleanup on context cancellation                           ││
+│ │   SEVERITY: CRITICAL - Resource leak                                            ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2C - ERROR HANDLING & RECOVERY (3 CRITICAL)                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.17 - Recovery Race in RecoveryState                                     ││
+│ │   FILE: core/recovery/recovery.go:65-87                                         ││
+│ │   ISSUE: RecoveryState accessed without synchronization                         ││
+│ │   FIX: Add mutex protection for state access                                    ││
+│ │   SEVERITY: CRITICAL - Race condition                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.18 - Classifier Unsafe Pointer Operations                               ││
+│ │   FILE: core/errors/classifier.go:22,44,82,115,264                              ││
+│ │   ISSUE: Unsafe pointer casts without validation                                ││
+│ │   FIX: Add type assertions with safety checks                                   ││
+│ │   SEVERITY: CRITICAL - Potential panic or memory corruption                     ││
+│ │                                                                                  ││
+│ │ [ ] W12.19 - Recovery Orchestrator Missing Error Propagation                    ││
+│ │   FILE: core/recovery/recovery_orchestrator.go:88-112                           ││
+│ │   ISSUE: Errors in recovery steps not propagated to caller                      ││
+│ │   FIX: Collect and return all errors from recovery operations                   ││
+│ │   SEVERITY: CRITICAL - Silent recovery failures                                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2D - VECTORGRAPHDB MITIGATIONS (4 CRITICAL)                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.20 - Conflicts AutoResolve Deadlock                                     ││
+│ │   FILE: core/vectorgraphdb/mitigations/conflicts.go:442-460                     ││
+│ │   ISSUE: AutoResolve holds lock while calling methods that acquire same lock    ││
+│ │   FIX: Restructure lock acquisition order                                       ││
+│ │   SEVERITY: CRITICAL - Deadlock                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.21 - Freshness Unused Channel                                           ││
+│ │   FILE: core/vectorgraphdb/mitigations/freshness.go:20,33                       ││
+│ │   ISSUE: Channel created but never consumed, blocks forever                     ││
+│ │   FIX: Remove unused channel or add consumer                                    ││
+│ │   SEVERITY: CRITICAL - Goroutine leak                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.22 - Provenance Race Condition                                          ││
+│ │   FILE: core/vectorgraphdb/mitigations/provenance.go:66-73                      ││
+│ │   ISSUE: GetProvenance reads map without lock while updates can occur           ││
+│ │   FIX: Add read lock for map access                                             ││
+│ │   SEVERITY: CRITICAL - Race condition                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.23 - HallucinationFirewall Untracked Goroutine                          ││
+│ │   FILE: core/vectorgraphdb/mitigations/hallucination_firewall.go:145-167        ││
+│ │   ISSUE: Background verification goroutine not tracked                          ││
+│ │   FIX: Use GoroutineScope for background work                                   ││
+│ │   SEVERITY: CRITICAL - Goroutine leak                                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### W12 WAVE 2: HIGH FIXES (33 items)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ W12 WAVE 2: HIGH SEVERITY (33 items - max 8 parallel)                              │
+│ ═══════════════════════════════════════════════════════════════════════════════════│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1A - MESSAGING & EVENTS (5 HIGH)                                          ││
+│ │                                                                                  ││
+│ │ [ ] W12.24 - ActivityBus EventDebouncer Missing Cleanup                         ││
+│ │   FILE: core/events/activity_bus.go:43-84                                       ││
+│ │   ISSUE: Debouncer timers not cleaned up on bus shutdown                        ││
+│ │   FIX: Track and cancel all pending timers on Close()                           ││
+│ │   SEVERITY: HIGH - Resource leak                                                ││
+│ │                                                                                  ││
+│ │ [ ] W12.25 - SignalBus Pending ACKs Never Cleaned                               ││
+│ │   FILE: core/signal/bus.go:119-216                                              ││
+│ │   ISSUE: Pending ACK map grows unbounded, no TTL or cleanup                     ││
+│ │   FIX: Add TTL-based cleanup for pending ACKs                                   ││
+│ │   SEVERITY: HIGH - Memory leak                                                  ││
+│ │                                                                                  ││
+│ │ [ ] W12.26 - SessionBus Lock Ordering Deadlock Risk                             ││
+│ │   FILE: agents/guide/session_bus.go:528-549                                     ││
+│ │   ISSUE: Inconsistent lock ordering between Subscribe and Unsubscribe           ││
+│ │   FIX: Establish and document consistent lock ordering                          ││
+│ │   SEVERITY: HIGH - Potential deadlock                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.27 - ChannelBus Race in Topic Registration                              ││
+│ │   FILE: agents/guide/channel_bus.go:84-92                                       ││
+│ │   ISSUE: Check-then-act race when registering new topics                        ││
+│ │   FIX: Use sync.Map or lock entire operation                                    ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.28 - ResponseStream Buffer Overflow                                     ││
+│ │   FILE: agents/guide/response_stream.go:156-178                                 ││
+│ │   ISSUE: Unbounded buffering can cause OOM on slow consumers                    ││
+│ │   FIX: Add buffer limits with backpressure                                      ││
+│ │   SEVERITY: HIGH - Memory exhaustion                                            ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1B - SESSION & STATE MANAGEMENT (3 HIGH)                                  ││
+│ │                                                                                  ││
+│ │ [ ] W12.29 - Registry Unhandled Database Errors                                 ││
+│ │   FILE: core/session/registry.go:430,479                                        ││
+│ │   ISSUE: Database errors logged but not returned to caller                      ││
+│ │   FIX: Return errors and let caller decide handling                             ││
+│ │   SEVERITY: HIGH - Silent database failures                                     ││
+│ │                                                                                  ││
+│ │ [ ] W12.30 - Manager Race in Subscription Handler                               ││
+│ │   FILE: core/session/manager.go:636-649                                         ││
+│ │   ISSUE: Subscription map accessed without synchronization                      ││
+│ │   FIX: Add mutex protection for subscription operations                         ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.31 - WALManager Missing Error Context                                   ││
+│ │   FILE: core/session/wal_manager.go:189-215                                     ││
+│ │   ISSUE: Errors lack context about which operation failed                       ││
+│ │   FIX: Wrap errors with operation context                                       ││
+│ │   SEVERITY: HIGH - Poor error diagnosis                                         ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1C - RESOURCE MANAGEMENT (3 HIGH)                                         ││
+│ │                                                                                  ││
+│ │ [ ] W12.32 - MemoryMonitor Race in GlobalUsage                                  ││
+│ │   FILE: core/resources/memory_monitor.go:357-366                                ││
+│ │   ISSUE: GlobalUsage reads stats without synchronization                        ││
+│ │   FIX: Add read lock for stats access                                           ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.33 - Broker Untracked Deadlock Detection Goroutine                      ││
+│ │   FILE: core/resources/broker.go:84                                             ││
+│ │   ISSUE: Deadlock detection goroutine not tracked                               ││
+│ │   FIX: Use GoroutineScope for deadlock detector                                 ││
+│ │   SEVERITY: HIGH - Goroutine leak                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.34 - DiskQuota Missing Atomic Operations                                ││
+│ │   FILE: core/resources/disk_quota.go:112-134                                    ││
+│ │   ISSUE: Size tracking uses non-atomic operations                               ││
+│ │   FIX: Use atomic.Int64 for size tracking                                       ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1D - VECTORGRAPHDB CORE (5 HIGH)                                          ││
+│ │                                                                                  ││
+│ │ [ ] W12.35 - HNSW Unsafe Pointer Cast                                           ││
+│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:363-364,379-380                  ││
+│ │   ISSUE: Unsafe pointer casts without type validation                           ││
+│ │   FIX: Add type assertions with validation                                      ││
+│ │   SEVERITY: HIGH - Potential panic                                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.36 - HNSW Search Without Read Lock                                      ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:298-342                                 ││
+│ │   ISSUE: Search reads graph state without holding read lock                     ││
+│ │   FIX: Add read lock for search operations                                      ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.37 - Snapshot Missing Validation                                        ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot.go:89-115                              ││
+│ │   ISSUE: Snapshot restore doesn't validate data integrity                       ││
+│ │   FIX: Add checksum validation on restore                                       ││
+│ │   SEVERITY: HIGH - Data corruption                                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.38 - HNSW Layer Connection Race                                         ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:156-196                                 ││
+│ │   ISSUE: Layer connections modified without synchronization                     ││
+│ │   FIX: Add per-node locks for connection modification                           ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.39 - Persistence Incomplete Error Handling                              ││
+│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:145-178                          ││
+│ │   ISSUE: Partial writes not rolled back on error                                ││
+│ │   FIX: Implement atomic write with rollback on failure                          ││
+│ │   SEVERITY: HIGH - Data corruption                                              ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2A - DAG & PIPELINE EXECUTION (3 HIGH)                                    ││
+│ │                                                                                  ││
+│ │ [ ] W12.40 - LLMGate Goroutine Leak in waitWithSoftTimeout                      ││
+│ │   FILE: core/concurrency/llm_gate.go:1065-1077                                  ││
+│ │   ISSUE: Goroutine blocks forever if timeout never fires                        ││
+│ │   FIX: Add context cancellation to timeout goroutine                            ││
+│ │   SEVERITY: HIGH - Goroutine leak                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.41 - LLMGate Goroutine Leak in waitWithHardDeadline                     ││
+│ │   FILE: core/concurrency/llm_gate.go:1081-1100                                  ││
+│ │   ISSUE: Similar goroutine leak pattern as waitWithSoftTimeout                  ││
+│ │   FIX: Add context cancellation to deadline goroutine                           ││
+│ │   SEVERITY: HIGH - Goroutine leak                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.42 - Scheduler DAG Slot Leak                                            ││
+│ │   FILE: core/dag/scheduler.go:110                                               ││
+│ │   ISSUE: DAG slot not released if scope.Go() returns error                      ││
+│ │   FIX: Release slot in error path                                               ││
+│ │   SEVERITY: HIGH - Resource leak                                                ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2B - LLM INTEGRATION (5 HIGH)                                             ││
+│ │                                                                                  ││
+│ │ [ ] W12.43 - StreamWatchdog Untracked Goroutine                                 ││
+│ │   FILE: core/providers/stream_watchdog.go:99-120                                ││
+│ │   ISSUE: Watch goroutine not tracked with GoroutineScope                        ││
+│ │   FIX: Use GoroutineScope for watchdog goroutine                                ││
+│ │   SEVERITY: HIGH - Goroutine leak                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.44 - StreamWatchdog Race in ReportChunk                                 ││
+│ │   FILE: core/providers/stream_watchdog.go:212-225                               ││
+│ │   ISSUE: lastChunkTime updated without synchronization                          ││
+│ │   FIX: Use atomic.Value for time tracking                                       ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.45 - StreamBridge Missing Error Recovery                                ││
+│ │   FILE: core/providers/stream_bridge.go:167-198                                 ││
+│ │   ISSUE: Errors in bridge handlers not recovered                                ││
+│ │   FIX: Add panic recovery and error propagation                                 ││
+│ │   SEVERITY: HIGH - Crash on handler error                                       ││
+│ │                                                                                  ││
+│ │ [ ] W12.46 - Budget Tracker Race Condition                                      ││
+│ │   FILE: core/llm/budget.go:78-95                                                ││
+│ │   ISSUE: Budget checks and updates not atomic                                   ││
+│ │   FIX: Use atomic operations or mutex for budget tracking                       ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.47 - TokenCounter Missing Validation                                    ││
+│ │   FILE: core/providers/token_counter.go:134-156                                 ││
+│ │   ISSUE: Token counts accepted without validation                               ││
+│ │   FIX: Add bounds checking for token counts                                     ││
+│ │   SEVERITY: HIGH - Invalid data acceptance                                      ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2C - ERROR HANDLING & RECOVERY (5 HIGH)                                   ││
+│ │                                                                                  ││
+│ │ [ ] W12.48 - TransientTracker Lost Updates                                      ││
+│ │   FILE: core/errors/transient_tracker.go:67-76                                  ││
+│ │   ISSUE: Record() can lose updates due to check-then-act race                   ││
+│ │   FIX: Use atomic compare-and-swap for updates                                  ││
+│ │   SEVERITY: HIGH - Lost error tracking                                          ││
+│ │                                                                                  ││
+│ │ [ ] W12.49 - CircuitBreaker Deadlock Potential                                  ││
+│ │   FILE: core/errors/circuit_breaker.go:120-130                                  ││
+│ │   ISSUE: RecordResult() can deadlock with concurrent state transitions          ││
+│ │   FIX: Restructure lock acquisition to prevent deadlock                         ││
+│ │   SEVERITY: HIGH - Potential deadlock                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.50 - Escalation Missing Context                                         ││
+│ │   FILE: core/errors/escalation.go:89-112                                        ││
+│ │   ISSUE: Escalation decisions lack context about original error                 ││
+│ │   FIX: Include full error context in escalation                                 ││
+│ │   SEVERITY: HIGH - Poor error diagnosis                                         ││
+│ │                                                                                  ││
+│ │ [ ] W12.51 - Rollback Incomplete Cleanup                                        ││
+│ │   FILE: core/errors/rollback.go:145-178                                         ││
+│ │   ISSUE: Rollback doesn't clean up all intermediate state                       ││
+│ │   FIX: Track and cleanup all intermediate resources                             ││
+│ │   SEVERITY: HIGH - Resource leak                                                ││
+│ │                                                                                  ││
+│ │ [ ] W12.52 - Deadlock Detector False Positives                                  ││
+│ │   FILE: core/recovery/deadlock.go:88-124                                        ││
+│ │   ISSUE: Deadlock detection can trigger false positives                         ││
+│ │   FIX: Add confirmation checks before declaring deadlock                        ││
+│ │   SEVERITY: HIGH - Incorrect behavior                                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2D - VECTORGRAPHDB MITIGATIONS (4 HIGH)                                   ││
+│ │                                                                                  ││
+│ │ [ ] W12.53 - Quality Race in applyRedundancyPenalty                             ││
+│ │   FILE: core/vectorgraphdb/mitigations/quality.go:200-210                       ││
+│ │   ISSUE: Score modification without synchronization                             ││
+│ │   FIX: Add mutex protection for score updates                                   ││
+│ │   SEVERITY: HIGH - Race condition                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.54 - Resolver Missing Error Propagation                                 ││
+│ │   FILE: core/vectorgraphdb/mitigations/resolver.go:156-189                      ││
+│ │   ISSUE: Resolution errors swallowed, caller not notified                       ││
+│ │   FIX: Return errors to caller                                                  ││
+│ │   SEVERITY: HIGH - Silent failures                                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.55 - Trust Missing Bounds Checking                                      ││
+│ │   FILE: core/vectorgraphdb/mitigations/trust.go:78-95                           ││
+│ │   ISSUE: Trust scores accepted without validation                               ││
+│ │   FIX: Add bounds checking for trust values                                     ││
+│ │   SEVERITY: HIGH - Invalid data acceptance                                      ││
+│ │                                                                                  ││
+│ │ [ ] W12.56 - Prompt Missing Sanitization                                        ││
+│ │   FILE: core/vectorgraphdb/mitigations/prompt.go:123-156                        ││
+│ │   ISSUE: Prompt inputs not sanitized before use                                 ││
+│ │   FIX: Add input sanitization                                                   ││
+│ │   SEVERITY: HIGH - Potential injection                                          ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### W12 WAVE 3: MEDIUM FIXES (41 items)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ W12 WAVE 3: MEDIUM SEVERITY (41 items - max 8 parallel)                            │
+│ ═══════════════════════════════════════════════════════════════════════════════════│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1A - MESSAGING & EVENTS (4 MEDIUM)                                        ││
+│ │                                                                                  ││
+│ │ [ ] W12.57 - ActivityBus Missing Metrics                                        ││
+│ │   FILE: core/events/activity_bus.go:112-145                                     ││
+│ │   ISSUE: No metrics for event throughput or latency                             ││
+│ │   FIX: Add prometheus-style metrics                                             ││
+│ │   SEVERITY: MEDIUM - Observability gap                                          ││
+│ │                                                                                  ││
+│ │ [ ] W12.58 - SignalBus Missing Timeout Configuration                            ││
+│ │   FILE: core/signal/bus.go:45-67                                                ││
+│ │   ISSUE: Hardcoded timeouts, not configurable                                   ││
+│ │   FIX: Add configuration for timeouts                                           ││
+│ │   SEVERITY: MEDIUM - Inflexibility                                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.59 - SessionBus Function Over 100 Lines                                 ││
+│ │   FILE: agents/guide/session_bus.go:256-389                                     ││
+│ │   ISSUE: handleMessage function exceeds 100 lines                               ││
+│ │   FIX: Refactor into smaller functions                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.60 - ChannelBus High Cyclomatic Complexity                              ││
+│ │   FILE: agents/guide/channel_bus.go:145-198                                     ││
+│ │   ISSUE: dispatch function has cyclomatic complexity > 4                        ││
+│ │   FIX: Refactor to reduce complexity                                            ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1B - SESSION & STATE MANAGEMENT (5 MEDIUM)                                ││
+│ │                                                                                  ││
+│ │ [ ] W12.61 - Registry Missing Retry Logic                                       ││
+│ │   FILE: core/session/registry.go:345-378                                        ││
+│ │   ISSUE: Database operations fail without retry                                 ││
+│ │   FIX: Add exponential backoff retry                                            ││
+│ │   SEVERITY: MEDIUM - Resilience                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.62 - Manager Function Over 100 Lines                                    ││
+│ │   FILE: core/session/manager.go:456-598                                         ││
+│ │   ISSUE: reconcileState function exceeds 100 lines                              ││
+│ │   FIX: Refactor into smaller functions                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.63 - WAL Missing Checksum Validation                                    ││
+│ │   FILE: core/concurrency/wal.go:456-489                                         ││
+│ │   ISSUE: WAL entries read without checksum validation                           ││
+│ │   FIX: Add checksum on write, validate on read                                  ││
+│ │   SEVERITY: MEDIUM - Data integrity                                             ││
+│ │                                                                                  ││
+│ │ [ ] W12.64 - SignalDispatcher High Cyclomatic Complexity                        ││
+│ │   FILE: core/session/signal_dispatcher.go:156-212                               ││
+│ │   ISSUE: routeSignal has cyclomatic complexity > 4                              ││
+│ │   FIX: Refactor using strategy pattern                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.65 - Checkpointer Missing Progress Reporting                            ││
+│ │   FILE: core/concurrency/checkpointer.go:89-134                                 ││
+│ │   ISSUE: Long checkpoints don't report progress                                 ││
+│ │   FIX: Add progress callbacks                                                   ││
+│ │   SEVERITY: MEDIUM - Observability                                              ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1C - RESOURCE MANAGEMENT (6 MEDIUM)                                       ││
+│ │                                                                                  ││
+│ │ [ ] W12.66 - Pool Missing Resource Validation                                   ││
+│ │   FILE: core/resources/pool.go:156-178                                          ││
+│ │   ISSUE: Resources returned to pool without validation                          ││
+│ │   FIX: Add validation before accepting returns                                  ││
+│ │   SEVERITY: MEDIUM - Resource corruption                                        ││
+│ │                                                                                  ││
+│ │ [ ] W12.67 - MemoryMonitor Function Over 100 Lines                              ││
+│ │   FILE: core/resources/memory_monitor.go:189-312                                ││
+│ │   ISSUE: monitorLoop function exceeds 100 lines                                 ││
+│ │   FIX: Refactor into smaller functions                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.68 - Broker Missing Circuit Breaker                                     ││
+│ │   FILE: core/resources/broker.go:145-189                                        ││
+│ │   ISSUE: No circuit breaker for failing resource requests                       ││
+│ │   FIX: Add circuit breaker pattern                                              ││
+│ │   SEVERITY: MEDIUM - Resilience                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.69 - Tracker Unbounded Memory Growth                                    ││
+│ │   FILE: core/llm/tracker.go:29,49-55                                            ││
+│ │   ISSUE: Records slice grows unbounded                                          ││
+│ │   FIX: Add max size with eviction policy                                        ││
+│ │   SEVERITY: MEDIUM - Memory growth                                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.70 - DiskQuota Missing Periodic Reconciliation                          ││
+│ │   FILE: core/resources/disk_quota.go:67-89                                      ││
+│ │   ISSUE: Tracked size can drift from actual                                     ││
+│ │   FIX: Add periodic reconciliation                                              ││
+│ │   SEVERITY: MEDIUM - Accuracy                                                   ││
+│ │                                                                                  ││
+│ │ [ ] W12.71 - GoroutineScope Missing Stack Traces                                ││
+│ │   FILE: core/concurrency/goroutine_scope.go:78-112                              ││
+│ │   ISSUE: Leaked goroutines reported without stack traces                        ││
+│ │   FIX: Capture and report stack traces                                          ││
+│ │   SEVERITY: MEDIUM - Debugging                                                  ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1D - VECTORGRAPHDB CORE (6 MEDIUM)                                        ││
+│ │                                                                                  ││
+│ │ [ ] W12.72 - HNSW Function Over 100 Lines                                       ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:204-356                                 ││
+│ │   ISSUE: Insert function exceeds 100 lines                                      ││
+│ │   FIX: Refactor into smaller functions                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.73 - Persistence Missing Compression                                    ││
+│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:89-123                           ││
+│ │   ISSUE: Large graphs stored uncompressed                                       ││
+│ │   FIX: Add optional compression                                                 ││
+│ │   SEVERITY: MEDIUM - Storage efficiency                                         ││
+│ │                                                                                  ││
+│ │ [ ] W12.74 - SnapshotManager Missing Cleanup                                    ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_manager.go:134-167                     ││
+│ │   ISSUE: Old snapshots not automatically cleaned up                             ││
+│ │   FIX: Add retention policy with automatic cleanup                              ││
+│ │   SEVERITY: MEDIUM - Disk usage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.75 - HNSW High Cyclomatic Complexity                                    ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:298-342                                 ││
+│ │   ISSUE: searchLayer has cyclomatic complexity > 4                              ││
+│ │   FIX: Refactor to reduce complexity                                            ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.76 - Snapshot Missing Version Migration                                 ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot.go:45-78                               ││
+│ │   ISSUE: No migration path for snapshot format changes                          ││
+│ │   FIX: Add version field and migration logic                                    ││
+│ │   SEVERITY: MEDIUM - Forward compatibility                                      ││
+│ │                                                                                  ││
+│ │ [ ] W12.77 - HNSW Missing Distance Metric Validation                            ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:45-67                                   ││
+│ │   ISSUE: Distance metric not validated on creation                              ││
+│ │   FIX: Add metric validation                                                    ││
+│ │   SEVERITY: MEDIUM - Error handling                                             ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2A - DAG & PIPELINE EXECUTION (5 MEDIUM)                                  ││
+│ │                                                                                  ││
+│ │ [ ] W12.78 - AdaptiveChannel Race in adaptLoop                                  ││
+│ │   FILE: core/concurrency/adaptive_channel.go:528-545                            ││
+│ │   ISSUE: Adaptation decisions based on stale metrics                            ││
+│ │   FIX: Use atomic reads for metrics                                             ││
+│ │   SEVERITY: MEDIUM - Race condition                                             ││
+│ │                                                                                  ││
+│ │ [ ] W12.79 - Executor Function Over 100 Lines                                   ││
+│ │   FILE: core/dag/executor.go:189-312                                            ││
+│ │   ISSUE: executeNode function exceeds 100 lines                                 ││
+│ │   FIX: Refactor into smaller functions                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.80 - Scheduler High Cyclomatic Complexity                               ││
+│ │   FILE: core/dag/scheduler.go:156-212                                           ││
+│ │   ISSUE: schedule function has cyclomatic complexity > 4                        ││
+│ │   FIX: Refactor using state machine pattern                                     ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.81 - LLMGate Missing Graceful Shutdown                                  ││
+│ │   FILE: core/concurrency/llm_gate.go:234-267                                    ││
+│ │   ISSUE: Shutdown doesn't wait for in-flight operations                         ││
+│ │   FIX: Add graceful shutdown with drain                                         ││
+│ │   SEVERITY: MEDIUM - Data loss risk                                             ││
+│ │                                                                                  ││
+│ │ [ ] W12.82 - AdaptiveChannel Missing Metrics                                    ││
+│ │   FILE: core/concurrency/adaptive_channel.go:89-112                             ││
+│ │   ISSUE: No metrics for channel adaptation decisions                            ││
+│ │   FIX: Add metrics for adaptation events                                        ││
+│ │   SEVERITY: MEDIUM - Observability                                              ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2B - LLM INTEGRATION (4 MEDIUM)                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.83 - Queue Function Over 100 Lines                                      ││
+│ │   FILE: core/llm/queue.go:189-312                                               ││
+│ │   ISSUE: processQueue function exceeds 100 lines                                ││
+│ │   FIX: Refactor into smaller functions                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.84 - StreamMetrics Missing Aggregation                                  ││
+│ │   FILE: core/providers/stream_metrics.go:78-112                                 ││
+│ │   ISSUE: Metrics stored individually, no aggregation                            ││
+│ │   FIX: Add periodic aggregation                                                 ││
+│ │   SEVERITY: MEDIUM - Memory efficiency                                          ││
+│ │                                                                                  ││
+│ │ [ ] W12.85 - Budget High Cyclomatic Complexity                                  ││
+│ │   FILE: core/llm/budget.go:145-198                                              ││
+│ │   ISSUE: checkBudget has cyclomatic complexity > 4                              ││
+│ │   FIX: Refactor into smaller decision functions                                 ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.86 - StreamBridge Missing Backpressure                                  ││
+│ │   FILE: core/providers/stream_bridge.go:89-123                                  ││
+│ │   ISSUE: Fast producer can overwhelm slow consumer                              ││
+│ │   FIX: Add backpressure mechanism                                               ││
+│ │   SEVERITY: MEDIUM - Resource exhaustion                                        ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2C - ERROR HANDLING & RECOVERY (5 MEDIUM)                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.87 - Classifier Function Over 100 Lines                                 ││
+│ │   FILE: core/errors/classifier.go:145-278                                       ││
+│ │   ISSUE: classify function exceeds 100 lines                                    ││
+│ │   FIX: Refactor into smaller classification functions                           ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.88 - CircuitBreaker High Cyclomatic Complexity                          ││
+│ │   FILE: core/errors/circuit_breaker.go:167-234                                  ││
+│ │   ISSUE: shouldTrip has cyclomatic complexity > 4                               ││
+│ │   FIX: Refactor using strategy pattern                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.89 - Recovery Missing Checkpoint                                        ││
+│ │   FILE: core/recovery/recovery.go:134-167                                       ││
+│ │   ISSUE: Long recovery operations can't be resumed                              ││
+│ │   FIX: Add checkpoint support for recovery                                      ││
+│ │   SEVERITY: MEDIUM - Reliability                                                ││
+│ │                                                                                  ││
+│ │ [ ] W12.90 - ProgressSignal Missing Timeout                                     ││
+│ │   FILE: core/recovery/progress_signal.go:56-89                                  ││
+│ │   ISSUE: Progress signals can hang indefinitely                                 ││
+│ │   FIX: Add timeout for progress reporting                                       ││
+│ │   SEVERITY: MEDIUM - Reliability                                                ││
+│ │                                                                                  ││
+│ │ [ ] W12.91 - Remedy Missing Validation                                          ││
+│ │   FILE: core/errors/remedy.go:89-123                                            ││
+│ │   ISSUE: Remediation actions not validated before execution                     ││
+│ │   FIX: Add pre-execution validation                                             ││
+│ │   SEVERITY: MEDIUM - Safety                                                     ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2D - VECTORGRAPHDB MITIGATIONS (6 MEDIUM)                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.92 - Conflicts Function Over 100 Lines                                  ││
+│ │   FILE: core/vectorgraphdb/mitigations/conflicts.go:189-312                     ││
+│ │   ISSUE: resolveConflict function exceeds 100 lines                             ││
+│ │   FIX: Refactor into smaller functions                                          ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.93 - Freshness High Cyclomatic Complexity                               ││
+│ │   FILE: core/vectorgraphdb/mitigations/freshness.go:89-145                      ││
+│ │   ISSUE: checkFreshness has cyclomatic complexity > 4                           ││
+│ │   FIX: Refactor using chain of responsibility                                   ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.94 - Quality Missing Metrics                                            ││
+│ │   FILE: core/vectorgraphdb/mitigations/quality.go:56-89                         ││
+│ │   ISSUE: No metrics for quality scoring decisions                               ││
+│ │   FIX: Add quality score metrics                                                ││
+│ │   SEVERITY: MEDIUM - Observability                                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.95 - HallucinationFirewall Function Over 100 Lines                      ││
+│ │   FILE: core/vectorgraphdb/mitigations/hallucination_firewall.go:89-212         ││
+│ │   ISSUE: verify function exceeds 100 lines                                      ││
+│ │   FIX: Refactor into smaller verification functions                             ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.96 - Resolver High Cyclomatic Complexity                                ││
+│ │   FILE: core/vectorgraphdb/mitigations/resolver.go:89-156                       ││
+│ │   ISSUE: resolve has cyclomatic complexity > 4                                  ││
+│ │   FIX: Refactor using resolver registry pattern                                 ││
+│ │   SEVERITY: MEDIUM - Maintainability                                            ││
+│ │                                                                                  ││
+│ │ [ ] W12.97 - Trust Missing Audit Trail                                          ││
+│ │   FILE: core/vectorgraphdb/mitigations/trust.go:123-156                         ││
+│ │   ISSUE: Trust score changes not audited                                        ││
+│ │   FIX: Add audit logging for trust changes                                      ││
+│ │   SEVERITY: MEDIUM - Auditability                                               ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### W12 WAVE 4: LOW FIXES (46 items)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ W12 WAVE 4: LOW SEVERITY (46 items - max 8 parallel)                               │
+│ ═══════════════════════════════════════════════════════════════════════════════════│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1A - MESSAGING & EVENTS (4 LOW)                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.98 - ActivityBus Missing Documentation                                  ││
+│ │   FILE: core/events/activity_bus.go:1-40                                        ││
+│ │   ISSUE: Public API lacks documentation                                         ││
+│ │   FIX: Add godoc comments                                                       ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.99 - SignalBus Inconsistent Naming                                      ││
+│ │   FILE: core/signal/bus.go:89-112                                               ││
+│ │   ISSUE: Inconsistent method naming conventions                                 ││
+│ │   FIX: Standardize naming                                                       ││
+│ │   SEVERITY: LOW - Consistency                                                   ││
+│ │                                                                                  ││
+│ │ [ ] W12.100 - SessionBus Missing Test Coverage                                  ││
+│ │   FILE: agents/guide/session_bus.go                                             ││
+│ │   ISSUE: Edge cases not covered in tests                                        ││
+│ │   FIX: Add comprehensive test cases                                             ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.101 - ChannelBus Magic Numbers                                          ││
+│ │   FILE: agents/guide/channel_bus.go:45,67,89                                    ││
+│ │   ISSUE: Magic numbers for buffer sizes                                         ││
+│ │   FIX: Extract to named constants                                               ││
+│ │   SEVERITY: LOW - Readability                                                   ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1B - SESSION & STATE MANAGEMENT (7 LOW)                                   ││
+│ │                                                                                  ││
+│ │ [ ] W12.102 - Registry Magic Numbers                                            ││
+│ │   FILE: core/session/registry.go:56,78,112                                      ││
+│ │   ISSUE: Hardcoded retry counts and timeouts                                    ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.103 - Manager Missing Documentation                                     ││
+│ │   FILE: core/session/manager.go:1-50                                            ││
+│ │   ISSUE: Complex state machine not documented                                   ││
+│ │   FIX: Add state machine documentation                                          ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.104 - WAL Missing Test Coverage                                         ││
+│ │   FILE: core/concurrency/wal.go                                                 ││
+│ │   ISSUE: Corruption recovery not tested                                         ││
+│ │   FIX: Add corruption recovery tests                                            ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.105 - SignalDispatcher Inconsistent Logging                             ││
+│ │   FILE: core/session/signal_dispatcher.go:89-112                                ││
+│ │   ISSUE: Log levels inconsistent                                                ││
+│ │   FIX: Standardize log levels                                                   ││
+│ │   SEVERITY: LOW - Logging consistency                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.106 - WALManager Missing Metrics                                        ││
+│ │   FILE: core/session/wal_manager.go:45-78                                       ││
+│ │   ISSUE: No metrics for WAL operations                                          ││
+│ │   FIX: Add operation metrics                                                    ││
+│ │   SEVERITY: LOW - Observability                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.107 - Checkpointer Missing Documentation                                ││
+│ │   FILE: core/concurrency/checkpointer.go:1-40                                   ││
+│ │   ISSUE: Checkpoint strategy not documented                                     ││
+│ │   FIX: Add strategy documentation                                               ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.108 - GoroutineScope Missing Test Coverage                              ││
+│ │   FILE: core/concurrency/goroutine_scope.go                                     ││
+│ │   ISSUE: Leak detection not comprehensively tested                              ││
+│ │   FIX: Add leak detection tests                                                 ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1C - RESOURCE MANAGEMENT (5 LOW)                                          ││
+│ │                                                                                  ││
+│ │ [ ] W12.109 - Pool Missing Documentation                                        ││
+│ │   FILE: core/resources/pool.go:1-45                                             ││
+│ │   ISSUE: Pool lifecycle not documented                                          ││
+│ │   FIX: Add lifecycle documentation                                              ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.110 - MemoryMonitor Magic Numbers                                       ││
+│ │   FILE: core/resources/memory_monitor.go:45,67,89                               ││
+│ │   ISSUE: Hardcoded thresholds                                                   ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.111 - Broker Missing Test Coverage                                      ││
+│ │   FILE: core/resources/broker.go                                                ││
+│ │   ISSUE: Deadlock scenarios not tested                                          ││
+│ │   FIX: Add deadlock scenario tests                                              ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.112 - Tracker Inconsistent Logging                                      ││
+│ │   FILE: core/llm/tracker.go:78-112                                              ││
+│ │   ISSUE: Log format inconsistent                                                ││
+│ │   FIX: Standardize log format                                                   ││
+│ │   SEVERITY: LOW - Logging consistency                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.113 - DiskQuota Missing Documentation                                   ││
+│ │   FILE: core/resources/disk_quota.go:1-40                                       ││
+│ │   ISSUE: Quota calculation not documented                                       ││
+│ │   FIX: Add calculation documentation                                            ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 1D - VECTORGRAPHDB CORE (5 LOW)                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.114 - HNSW Missing Documentation                                        ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw.go:1-50                                    ││
+│ │   ISSUE: Algorithm implementation not documented                                ││
+│ │   FIX: Add algorithm documentation                                              ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.115 - Persistence Magic Numbers                                         ││
+│ │   FILE: core/vectorgraphdb/hnsw/persistence.go:34,56,78                         ││
+│ │   ISSUE: Hardcoded buffer sizes                                                 ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.116 - SnapshotManager Missing Test Coverage                             ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot_manager.go                             ││
+│ │   ISSUE: Concurrent snapshot creation not tested                                ││
+│ │   FIX: Add concurrency tests                                                    ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.117 - Snapshot Inconsistent Logging                                     ││
+│ │   FILE: core/vectorgraphdb/hnsw/snapshot.go:134-167                             ││
+│ │   ISSUE: Snapshot operations logged inconsistently                              ││
+│ │   FIX: Standardize snapshot logging                                             ││
+│ │   SEVERITY: LOW - Logging consistency                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.118 - HNSW Missing Benchmark Tests                                      ││
+│ │   FILE: core/vectorgraphdb/hnsw/hnsw_test.go                                    ││
+│ │   ISSUE: Performance characteristics not benchmarked                            ││
+│ │   FIX: Add comprehensive benchmarks                                             ││
+│ │   SEVERITY: LOW - Performance testing                                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2A - DAG & PIPELINE EXECUTION (6 LOW)                                     ││
+│ │                                                                                  ││
+│ │ [ ] W12.119 - LLMGate Missing Documentation                                     ││
+│ │   FILE: core/concurrency/llm_gate.go:1-50                                       ││
+│ │   ISSUE: Gate behavior not documented                                           ││
+│ │   FIX: Add behavior documentation                                               ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.120 - AdaptiveChannel Magic Numbers                                     ││
+│ │   FILE: core/concurrency/adaptive_channel.go:45,67,89                           ││
+│ │   ISSUE: Adaptation thresholds hardcoded                                        ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.121 - Executor Missing Test Coverage                                    ││
+│ │   FILE: core/dag/executor.go                                                    ││
+│ │   ISSUE: Error recovery paths not tested                                        ││
+│ │   FIX: Add error recovery tests                                                 ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.122 - Scheduler Inconsistent Logging                                    ││
+│ │   FILE: core/dag/scheduler.go:89-123                                            ││
+│ │   ISSUE: Scheduling decisions logged inconsistently                             ││
+│ │   FIX: Standardize scheduling logs                                              ││
+│ │   SEVERITY: LOW - Logging consistency                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.123 - LLMGate Missing Benchmark Tests                                   ││
+│ │   FILE: core/concurrency/llm_gate_test.go                                       ││
+│ │   ISSUE: Gate performance not benchmarked                                       ││
+│ │   FIX: Add gate benchmarks                                                      ││
+│ │   SEVERITY: LOW - Performance testing                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.124 - AdaptiveChannel Missing Documentation                             ││
+│ │   FILE: core/concurrency/adaptive_channel.go:1-45                               ││
+│ │   ISSUE: Adaptation algorithm not documented                                    ││
+│ │   FIX: Add algorithm documentation                                              ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2B - LLM INTEGRATION (4 LOW)                                              ││
+│ │                                                                                  ││
+│ │ [ ] W12.125 - Queue Missing Documentation                                       ││
+│ │   FILE: core/llm/queue.go:1-45                                                  ││
+│ │   ISSUE: Queue semantics not documented                                         ││
+│ │   FIX: Add queue documentation                                                  ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.126 - StreamWatchdog Magic Numbers                                      ││
+│ │   FILE: core/providers/stream_watchdog.go:34,56,78                              ││
+│ │   ISSUE: Timeout values hardcoded                                               ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.127 - StreamMetrics Missing Test Coverage                               ││
+│ │   FILE: core/providers/stream_metrics.go                                        ││
+│ │   ISSUE: Metric edge cases not tested                                           ││
+│ │   FIX: Add metric edge case tests                                               ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.128 - Budget Missing Documentation                                      ││
+│ │   FILE: core/llm/budget.go:1-45                                                 ││
+│ │   ISSUE: Budget enforcement not documented                                      ││
+│ │   FIX: Add enforcement documentation                                            ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2C - ERROR HANDLING & RECOVERY (6 LOW)                                    ││
+│ │                                                                                  ││
+│ │ [ ] W12.129 - Classifier Missing Documentation                                  ││
+│ │   FILE: core/errors/classifier.go:1-45                                          ││
+│ │   ISSUE: Classification criteria not documented                                 ││
+│ │   FIX: Add classification documentation                                         ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.130 - CircuitBreaker Magic Numbers                                      ││
+│ │   FILE: core/errors/circuit_breaker.go:34,56,78                                 ││
+│ │   ISSUE: Trip thresholds hardcoded                                              ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.131 - TransientTracker Missing Test Coverage                            ││
+│ │   FILE: core/errors/transient_tracker.go                                        ││
+│ │   ISSUE: Tracking edge cases not tested                                         ││
+│ │   FIX: Add edge case tests                                                      ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.132 - Recovery Inconsistent Logging                                     ││
+│ │   FILE: core/recovery/recovery.go:89-123                                        ││
+│ │   ISSUE: Recovery steps logged inconsistently                                   ││
+│ │   FIX: Standardize recovery logs                                                ││
+│ │   SEVERITY: LOW - Logging consistency                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.133 - Deadlock Missing Documentation                                    ││
+│ │   FILE: core/recovery/deadlock.go:1-45                                          ││
+│ │   ISSUE: Detection algorithm not documented                                     ││
+│ │   FIX: Add algorithm documentation                                              ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.134 - Escalation Missing Test Coverage                                  ││
+│ │   FILE: core/errors/escalation.go                                               ││
+│ │   ISSUE: Escalation paths not tested                                            ││
+│ │   FIX: Add escalation tests                                                     ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ GROUP 2D - VECTORGRAPHDB MITIGATIONS (9 LOW)                                    ││
+│ │                                                                                  ││
+│ │ [ ] W12.135 - Conflicts Missing Documentation                                   ││
+│ │   FILE: core/vectorgraphdb/mitigations/conflicts.go:1-50                        ││
+│ │   ISSUE: Conflict resolution not documented                                     ││
+│ │   FIX: Add resolution documentation                                             ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.136 - Freshness Magic Numbers                                           ││
+│ │   FILE: core/vectorgraphdb/mitigations/freshness.go:34,56,78                    ││
+│ │   ISSUE: Freshness thresholds hardcoded                                         ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.137 - Provenance Missing Test Coverage                                  ││
+│ │   FILE: core/vectorgraphdb/mitigations/provenance.go                            ││
+│ │   ISSUE: Provenance tracking not tested                                         ││
+│ │   FIX: Add provenance tests                                                     ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.138 - Quality Inconsistent Logging                                      ││
+│ │   FILE: core/vectorgraphdb/mitigations/quality.go:134-167                       ││
+│ │   ISSUE: Quality decisions logged inconsistently                                ││
+│ │   FIX: Standardize quality logs                                                 ││
+│ │   SEVERITY: LOW - Logging consistency                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.139 - HallucinationFirewall Missing Documentation                       ││
+│ │   FILE: core/vectorgraphdb/mitigations/hallucination_firewall.go:1-50           ││
+│ │   ISSUE: Firewall rules not documented                                          ││
+│ │   FIX: Add rules documentation                                                  ││
+│ │   SEVERITY: LOW - Documentation                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.140 - Resolver Magic Numbers                                            ││
+│ │   FILE: core/vectorgraphdb/mitigations/resolver.go:34,56,78                     ││
+│ │   ISSUE: Resolution thresholds hardcoded                                        ││
+│ │   FIX: Extract to configuration                                                 ││
+│ │   SEVERITY: LOW - Configurability                                               ││
+│ │                                                                                  ││
+│ │ [ ] W12.141 - Trust Missing Test Coverage                                       ││
+│ │   FILE: core/vectorgraphdb/mitigations/trust.go                                 ││
+│ │   ISSUE: Trust calculations not tested                                          ││
+│ │   FIX: Add trust calculation tests                                              ││
+│ │   SEVERITY: LOW - Test coverage                                                 ││
+│ │                                                                                  ││
+│ │ [ ] W12.142 - Prompt Inconsistent Logging                                       ││
+│ │   FILE: core/vectorgraphdb/mitigations/prompt.go:89-123                         ││
+│ │   ISSUE: Prompt operations logged inconsistently                                ││
+│ │   FIX: Standardize prompt logs                                                  ││
+│ │   SEVERITY: LOW - Logging consistency                                           ││
+│ │                                                                                  ││
+│ │ [ ] W12.143 - HallucinationFirewall Missing Benchmark Tests                     ││
+│ │   FILE: core/vectorgraphdb/mitigations/hallucination_firewall_test.go           ││
+│ │   ISSUE: Firewall performance not benchmarked                                   ││
+│ │   FIX: Add firewall benchmarks                                                  ││
+│ │   SEVERITY: LOW - Performance testing                                           ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### W12 DEPENDENCY GRAPH
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ W12 DEPENDENCY GRAPH                                                                │
+│ ════════════════════                                                                │
+│                                                                                     │
+│   W12 WAVE 1 (CRITICAL - 23 items)                                                 │
+│   ┌───────────────────────────────────────────────────────────────────────────┐    │
+│   │ 1A: W12.1-3   1B: W12.4-6   1C: W12.7-9   1D: W12.10-12                  │    │
+│   │ 2B: W12.13-16 2C: W12.17-19 2D: W12.20-23                                │    │
+│   └─────────────────────────────────┬─────────────────────────────────────────┘    │
+│                                     │                                               │
+│                                     ▼                                               │
+│   W12 WAVE 2 (HIGH - 33 items)                                                     │
+│   ┌───────────────────────────────────────────────────────────────────────────┐    │
+│   │ 1A: W12.24-28  1B: W12.29-31  1C: W12.32-34  1D: W12.35-39               │    │
+│   │ 2A: W12.40-42  2B: W12.43-47  2C: W12.48-52  2D: W12.53-56               │    │
+│   └─────────────────────────────────┬─────────────────────────────────────────┘    │
+│                                     │                                               │
+│                                     ▼                                               │
+│   W12 WAVE 3 (MEDIUM - 41 items)                                                   │
+│   ┌───────────────────────────────────────────────────────────────────────────┐    │
+│   │ 1A: W12.57-60  1B: W12.61-65  1C: W12.66-71  1D: W12.72-77               │    │
+│   │ 2A: W12.78-82  2B: W12.83-86  2C: W12.87-91  2D: W12.92-97               │    │
+│   └─────────────────────────────────┬─────────────────────────────────────────┘    │
+│                                     │                                               │
+│                                     ▼                                               │
+│   W12 WAVE 4 (LOW - 46 items)                                                      │
+│   ┌───────────────────────────────────────────────────────────────────────────┐    │
+│   │ 1A: W12.98-101   1B: W12.102-108  1C: W12.109-113  1D: W12.114-118       │    │
+│   │ 2A: W12.119-124  2B: W12.125-128  2C: W12.129-134  2D: W12.135-143       │    │
+│   └───────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                     │
+│ TOTAL: 143 issues (23 CRITICAL, 33 HIGH, 41 MEDIUM, 46 LOW)                        │
+│ EXECUTION: 4 waves, max 8 parallel subagents per wave                              │
+│ REFERENCES: Wave 1-2 comprehensive code analysis                                    │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```

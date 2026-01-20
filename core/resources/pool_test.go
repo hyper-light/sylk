@@ -673,3 +673,174 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("expected 30s timeout, got %v", cfg.PipelineTimeout)
 	}
 }
+
+// =============================================================================
+// W12.7 - Pool Goroutine Leak Tests
+// =============================================================================
+
+// TestWaitForResource_PoolClose verifies waiting goroutines are cleaned up on pool close.
+func TestWaitForResource_PoolClose(t *testing.T) {
+	cfg := ResourcePoolConfig{
+		Total:               1,
+		UserReservedPercent: 1.0, // All reserved - pipeline can't acquire
+		PipelineTimeout:     5 * time.Second,
+	}
+	pool := NewResourcePool(ResourceTypeFile, cfg)
+
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+
+	// Start a goroutine that will wait for a resource
+	go func() {
+		_, err := pool.AcquirePipeline(ctx, 1)
+		errCh <- err
+	}()
+
+	// Let the goroutine enter wait state
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the pool - should wake up waiting goroutines
+	pool.Close()
+
+	// Verify the waiting goroutine received ErrPoolClosed
+	select {
+	case err := <-errCh:
+		if err != ErrPoolClosed {
+			t.Errorf("expected ErrPoolClosed, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("goroutine did not exit after pool close - GOROUTINE LEAK")
+	}
+}
+
+// TestWaitForResource_MultipleWaitersOnClose verifies all waiting goroutines exit on close.
+func TestWaitForResource_MultipleWaitersOnClose(t *testing.T) {
+	cfg := ResourcePoolConfig{
+		Total:               1,
+		UserReservedPercent: 1.0,
+		PipelineTimeout:     5 * time.Second,
+	}
+	pool := NewResourcePool(ResourceTypeFile, cfg)
+
+	ctx := context.Background()
+	const numWaiters = 10
+	errCh := make(chan error, numWaiters)
+
+	// Start multiple waiting goroutines
+	for i := 0; i < numWaiters; i++ {
+		go func() {
+			_, err := pool.AcquirePipeline(ctx, 1)
+			errCh <- err
+		}()
+	}
+
+	// Let goroutines enter wait state
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the pool
+	pool.Close()
+
+	// Verify all goroutines exit with ErrPoolClosed
+	for i := 0; i < numWaiters; i++ {
+		select {
+		case err := <-errCh:
+			if err != ErrPoolClosed {
+				t.Errorf("waiter %d: expected ErrPoolClosed, got %v", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("waiter %d did not exit - GOROUTINE LEAK", i)
+		}
+	}
+}
+
+// TestWaitForResource_ContextCancelledDuringWait verifies context cancellation works.
+func TestWaitForResource_ContextCancelledDuringWait(t *testing.T) {
+	cfg := ResourcePoolConfig{
+		Total:               1,
+		UserReservedPercent: 1.0,
+		PipelineTimeout:     5 * time.Second,
+	}
+	pool := NewResourcePool(ResourceTypeFile, cfg)
+	defer pool.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := pool.AcquirePipeline(ctx, 1)
+		errCh <- err
+	}()
+
+	// Let goroutine enter wait state
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel context
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != context.Canceled {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("goroutine did not exit on context cancel - GOROUTINE LEAK")
+	}
+}
+
+// TestWaitForResource_TimeoutDuringWait verifies timeout works.
+func TestWaitForResource_TimeoutDuringWait(t *testing.T) {
+	cfg := ResourcePoolConfig{
+		Total:               1,
+		UserReservedPercent: 1.0,
+		PipelineTimeout:     100 * time.Millisecond,
+	}
+	pool := NewResourcePool(ResourceTypeFile, cfg)
+	defer pool.Close()
+
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := pool.AcquirePipeline(ctx, 1)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != ErrAcquireTimeout {
+			t.Errorf("expected ErrAcquireTimeout, got %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("goroutine did not exit on timeout - GOROUTINE LEAK")
+	}
+}
+
+// TestWaitForResource_RaceCondition tests for race conditions in wait/close.
+func TestWaitForResource_RaceCondition(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		cfg := ResourcePoolConfig{
+			Total:               1,
+			UserReservedPercent: 1.0,
+			PipelineTimeout:     time.Second,
+		}
+		pool := NewResourcePool(ResourceTypeFile, cfg)
+
+		ctx := context.Background()
+		done := make(chan struct{})
+
+		go func() {
+			pool.AcquirePipeline(ctx, 1)
+			close(done)
+		}()
+
+		// Race: close immediately
+		pool.Close()
+
+		select {
+		case <-done:
+			// Success - goroutine exited
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("iteration %d: goroutine leak detected", i)
+		}
+	}
+}

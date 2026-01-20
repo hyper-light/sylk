@@ -341,3 +341,102 @@ func TestSignalDispatcher_MergeStopChannels_NoLeakOnRapidStartStop(t *testing.T)
 		dispatcher.Close()
 	}
 }
+
+// TestSignalDispatcher_W12_4_GoroutineCleanup tests that mergeStopChannels
+// properly tracks and cleans up its internal goroutine (W12.4 fix).
+func TestSignalDispatcher_W12_4_GoroutineCleanup(t *testing.T) {
+	t.Run("cleanup waits for goroutine completion", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "w12-4-test",
+		})
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		require.NoError(t, dispatcher.Watch(ctx))
+
+		// Give time for watch loop to start
+		time.Sleep(50 * time.Millisecond)
+
+		// Cancel context which triggers cleanup
+		cancel()
+
+		// Close should complete without hanging (cleanup waits for goroutine)
+		done := make(chan struct{})
+		go func() {
+			dispatcher.Close()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Success - Close completed
+		case <-time.After(2 * time.Second):
+			t.Fatal("Close() timed out - goroutine cleanup may be stuck")
+		}
+	})
+
+	t.Run("multiple rapid watch and close cycles", func(t *testing.T) {
+		// Test that rapid cycles don't leak goroutines
+		for i := 0; i < 20; i++ {
+			baseDir := t.TempDir()
+
+			dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+				BaseDir:   baseDir,
+				SessionID: "w12-4-rapid",
+			})
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			err = dispatcher.Watch(ctx)
+			require.NoError(t, err)
+
+			// Immediate cancel and close
+			cancel()
+
+			// Use timeout to detect any hang
+			done := make(chan error, 1)
+			go func() {
+				done <- dispatcher.Close()
+			}()
+
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(1 * time.Second):
+				t.Fatalf("iteration %d: Close() timed out", i)
+			}
+		}
+	})
+
+	t.Run("stopChan signal triggers cleanup", func(t *testing.T) {
+		baseDir := t.TempDir()
+
+		dispatcher, err := NewCrossSessionSignalDispatcher(CrossSessionSignalDispatcherConfig{
+			BaseDir:   baseDir,
+			SessionID: "w12-4-stop",
+		})
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		require.NoError(t, dispatcher.Watch(ctx))
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Close triggers stopChan
+		done := make(chan struct{})
+		go func() {
+			dispatcher.Close()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Success
+		case <-time.After(2 * time.Second):
+			t.Fatal("Close() timed out on stopChan signal")
+		}
+	})
+}

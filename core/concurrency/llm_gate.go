@@ -1138,28 +1138,39 @@ func (g *DualQueueGate) collectOrphanInfo() []orphanInfo {
 }
 
 // boundedWaitGroupWait waits for the WaitGroup to complete within the given
-// timeout. Ensures the spawned goroutine is properly cleaned up regardless of
-// whether the wait completes or times out.
+// timeout. Uses a single goroutine that completes when the WaitGroup is done,
+// avoiding nested goroutine patterns that could leak.
 func (g *DualQueueGate) boundedWaitGroupWait(wg *sync.WaitGroup, timeout time.Duration) {
 	done := make(chan struct{})
-	// Use a separate context for this wait operation so we can signal
-	// the goroutine to stop if the timeout fires.
-	waitCtx, waitCancel := context.WithTimeout(context.Background(), timeout)
-	defer waitCancel()
+	go g.signalOnWaitGroupCompletion(wg, done)
 
-	go g.waitGroupWaiter(wg, done, waitCtx)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	select {
 	case <-done:
 		// Wait completed successfully
-	case <-waitCtx.Done():
-		// Timeout fired - waitCancel() will be called by defer,
-		// which signals the waiter goroutine to stop
+	case <-timer.C:
+		// Timeout fired - the goroutine will complete when wg reaches zero
+		// (after requests are cancelled during shutdown)
 	}
 }
 
-// waitGroupWaiter is a helper that waits on the WaitGroup and respects context
-// cancellation to enable cleanup when the caller times out.
+// signalOnWaitGroupCompletion waits on the WaitGroup and closes done when finished.
+// This is a simple helper with no nested goroutines - it will complete when
+// the WaitGroup reaches zero, which happens during normal shutdown when all
+// requests finish (they are cancelled as part of the shutdown sequence).
+func (g *DualQueueGate) signalOnWaitGroupCompletion(wg *sync.WaitGroup, done chan struct{}) {
+	wg.Wait()
+	close(done)
+}
+
+// waitGroupWaiter waits on the WaitGroup and respects context cancellation.
+// If context is cancelled before the WaitGroup completes, the function exits
+// without closing the done channel. The caller should handle both cases.
+// Note: This spawns a single goroutine for the WaitGroup wait. That goroutine
+// completes when the WaitGroup reaches zero (during shutdown, requests are
+// cancelled causing the WaitGroup to decrement).
 func (g *DualQueueGate) waitGroupWaiter(wg *sync.WaitGroup, done chan struct{}, ctx context.Context) {
 	finished := make(chan struct{})
 	go func() {
@@ -1171,10 +1182,9 @@ func (g *DualQueueGate) waitGroupWaiter(wg *sync.WaitGroup, done chan struct{}, 
 	case <-finished:
 		close(done)
 	case <-ctx.Done():
-		// Context cancelled (timeout) - goroutine exits cleanly.
-		// The inner goroutine waiting on wg.Wait() will complete
-		// when the WaitGroup reaches zero, which happens when all
-		// requests finish (they were already cancelled during shutdown).
+		// Context cancelled - exit without closing done.
+		// The inner goroutine will complete when the WaitGroup reaches zero,
+		// which happens when all requests finish during shutdown.
 	}
 }
 

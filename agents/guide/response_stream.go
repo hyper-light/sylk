@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+// ErrStreamClosed is returned when attempting to send to a closed stream.
+var ErrStreamClosed = &streamError{msg: "stream is closed"}
+
 // =============================================================================
 // Response Streaming
 // =============================================================================
@@ -64,9 +67,10 @@ type ResponseStream struct {
 	events chan *StreamEvent
 
 	// State
-	started  time.Time
-	lastSend time.Time
-	closed   atomic.Bool
+	started   time.Time
+	lastSend  time.Time
+	closed    atomic.Bool
+	closeOnce sync.Once // Ensures channel is closed exactly once
 
 	// Statistics
 	eventCount int64
@@ -358,13 +362,24 @@ func (rs *ResponseStream) sendEvent(event *StreamEvent) bool {
 	}
 }
 
-// Close closes the stream
+// Close closes the stream safely. Multiple calls to Close are safe
+// and will not panic. Uses sync.Once to ensure the channel is closed
+// exactly once, preventing send-on-closed-channel panics.
 func (rs *ResponseStream) Close() {
+	// Mark as closed first to reject new sends immediately
 	if rs.closed.Swap(true) {
-		return
+		return // Already marked closed, but closeOnce handles the actual close
 	}
 
-	// Send end event
+	rs.closeOnce.Do(func() {
+		rs.closeInternal()
+	})
+}
+
+// closeInternal performs the actual close operation. Must only be called
+// via closeOnce.Do to ensure it executes exactly once.
+func (rs *ResponseStream) closeInternal() {
+	// Send end event (non-blocking since buffer might be full)
 	event := &StreamEvent{
 		Type:      StreamEventEnd,
 		Timestamp: time.Now(),
@@ -374,6 +389,7 @@ func (rs *ResponseStream) Close() {
 	select {
 	case rs.events <- event:
 	default:
+		// Buffer full, skip end event
 	}
 
 	close(rs.events)
