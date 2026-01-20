@@ -808,3 +808,150 @@ func TestGetOrStart_ConcurrentDeduplication(t *testing.T) {
 		t.Errorf("TotalStarted = %d, expected <= 10 (deduplication should work)", stats.TotalStarted)
 	}
 }
+
+// =============================================================================
+// W3C.1 Channel Double-Close Tests (sync.Once protection)
+// =============================================================================
+
+// TestTrackedPrefetchFuture_CompleteMultipleTimes verifies that calling
+// complete() multiple times does not panic (sync.Once protection).
+func TestTrackedPrefetchFuture_CompleteMultipleTimes(t *testing.T) {
+	future := newTrackedPrefetchFuture("test query", "abc123")
+
+	result := &AugmentedQuery{OriginalQuery: "test query"}
+
+	// Complete once
+	future.complete(result, nil)
+
+	// Complete again - should not panic due to sync.Once
+	future.complete(result, nil)
+	future.complete(result, nil)
+
+	if !future.IsDone() {
+		t.Error("Future should be done after complete")
+	}
+}
+
+// TestCancelAll_ConcurrentCalls verifies that concurrent CancelAll() calls
+// do not cause a double-close panic (W3C.1 race condition fix).
+func TestCancelAll_ConcurrentCalls(t *testing.T) {
+	sp, _ := createTestPrefetcher(t)
+	sp.prefetchTimeout = 10 * time.Second // Long timeout so futures remain inflight
+
+	ctx := context.Background()
+
+	// Start multiple prefetches
+	for i := 0; i < 10; i++ {
+		sp.StartSpeculative(ctx, "query "+string(rune('a'+i)))
+	}
+
+	// Give goroutines time to start
+	time.Sleep(20 * time.Millisecond)
+
+	// Call CancelAll concurrently from multiple goroutines
+	const goroutines = 20
+	var wg sync.WaitGroup
+
+	// Barrier to start all goroutines at the same time
+	var ready sync.WaitGroup
+	ready.Add(1)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready.Wait() // Wait for barrier
+			sp.CancelAll()
+		}()
+	}
+
+	// Release all goroutines simultaneously
+	ready.Done()
+	wg.Wait()
+
+	// No panic should occur - test passes if we reach here
+	if sp.InflightCount() != 0 {
+		t.Errorf("InflightCount after concurrent CancelAll = %d, want 0", sp.InflightCount())
+	}
+}
+
+// TestCancelAll_ConcurrentWithComplete verifies that CancelAll() and complete()
+// can race without causing a double-close panic (W3C.1 race condition fix).
+func TestCancelAll_ConcurrentWithComplete(t *testing.T) {
+	const iterations = 100
+
+	for i := 0; i < iterations; i++ {
+		sp, _ := createTestPrefetcher(t)
+		sp.prefetchTimeout = 10 * time.Second
+
+		ctx := context.Background()
+
+		// Start a prefetch
+		future, err := sp.StartSpeculative(ctx, "test query")
+		if err != nil {
+			continue // Skip if budget exhausted
+		}
+
+		// Give goroutine time to start
+		time.Sleep(1 * time.Millisecond)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Goroutine 1: Call complete() directly
+		go func() {
+			defer wg.Done()
+			result := &AugmentedQuery{OriginalQuery: "test query"}
+			future.complete(result, nil)
+		}()
+
+		// Goroutine 2: Call CancelAll()
+		go func() {
+			defer wg.Done()
+			sp.CancelAll()
+		}()
+
+		wg.Wait()
+
+		// Future should be done (either from complete or CancelAll)
+		if !future.IsDone() {
+			t.Errorf("Iteration %d: Future should be done", i)
+		}
+	}
+	// No panic should occur across all iterations
+}
+
+// TestTrackedPrefetchFuture_CloseOnceProtection verifies that the closeOnce
+// field properly protects against double-close in high-concurrency scenarios.
+func TestTrackedPrefetchFuture_CloseOnceProtection(t *testing.T) {
+	const goroutines = 100
+	const iterations = 10
+
+	for iter := 0; iter < iterations; iter++ {
+		future := newTrackedPrefetchFuture("test query", "abc123")
+
+		var wg sync.WaitGroup
+		var ready sync.WaitGroup
+		ready.Add(1)
+
+		// Launch many goroutines trying to complete simultaneously
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				ready.Wait() // Wait for barrier
+				result := &AugmentedQuery{OriginalQuery: "test query"}
+				future.complete(result, nil)
+			}(i)
+		}
+
+		// Release all goroutines simultaneously
+		ready.Done()
+		wg.Wait()
+
+		if !future.IsDone() {
+			t.Errorf("Iteration %d: Future should be done after concurrent completes", iter)
+		}
+	}
+	// No panic should occur - test passes if we reach here
+}

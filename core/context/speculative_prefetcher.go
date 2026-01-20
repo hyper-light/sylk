@@ -45,12 +45,13 @@ const (
 
 // TrackedPrefetchFuture represents an in-flight prefetch operation.
 type TrackedPrefetchFuture struct {
-	result  atomic.Pointer[AugmentedQuery]
-	err     atomic.Pointer[error]
-	done    chan struct{}
-	started time.Time
-	query   string
-	hash    string
+	result    atomic.Pointer[AugmentedQuery]
+	err       atomic.Pointer[error]
+	done      chan struct{}
+	closeOnce sync.Once
+	started   time.Time
+	query     string
+	hash      string
 }
 
 // newTrackedPrefetchFuture creates a new prefetch future.
@@ -71,7 +72,7 @@ func (f *TrackedPrefetchFuture) complete(result *AugmentedQuery, err error) {
 	if err != nil {
 		f.err.Store(&err)
 	}
-	close(f.done)
+	f.closeOnce.Do(func() { close(f.done) })
 }
 
 // IsDone returns true if the prefetch is complete.
@@ -520,12 +521,9 @@ func (sp *SpeculativePrefetcher) InflightCount() int64 {
 func (sp *SpeculativePrefetcher) CancelAll() {
 	sp.inflight.Range(func(key, value any) bool {
 		future := value.(*TrackedPrefetchFuture)
-		if !future.IsDone() {
-			// Mark as cancelled
-			err := context.Canceled
-			future.err.Store(&err)
-			close(future.done)
-		}
+		err := context.Canceled
+		future.err.Store(&err)
+		future.closeOnce.Do(func() { close(future.done) })
 		sp.inflight.Delete(key)
 		return true
 	})
