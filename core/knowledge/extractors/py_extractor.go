@@ -19,6 +19,43 @@ type PythonExtractor struct {
 	decoratorPattern     *regexp.Regexp
 }
 
+// blockEndKey uniquely identifies a block by its start line and base indentation.
+type blockEndKey struct {
+	startLine  int
+	baseIndent int
+}
+
+// blockEndCache stores precomputed block end positions for O(1) lookup.
+// This eliminates O(n^2) behavior when many functions/classes are present.
+type blockEndCache struct {
+	cache map[blockEndKey]int
+}
+
+// newBlockEndCache creates a cache by scanning all lines once (O(n)).
+func newBlockEndCache(lines []string, extractor *PythonExtractor) *blockEndCache {
+	return &blockEndCache{cache: make(map[blockEndKey]int)}
+}
+
+// precomputeBlockEnds scans lines once and caches block ends for given start positions.
+func (c *blockEndCache) precomputeBlockEnds(lines []string, starts []blockEndKey, extractor *PythonExtractor) {
+	for _, key := range starts {
+		if _, exists := c.cache[key]; !exists {
+			c.cache[key] = extractor.computeBlockEnd(lines, key.startLine, key.baseIndent)
+		}
+	}
+}
+
+// get retrieves a cached block end, computing it if not present.
+func (c *blockEndCache) get(startLine, baseIndent int, lines []string, extractor *PythonExtractor) int {
+	key := blockEndKey{startLine: startLine, baseIndent: baseIndent}
+	if end, exists := c.cache[key]; exists {
+		return end
+	}
+	end := extractor.computeBlockEnd(lines, startLine, baseIndent)
+	c.cache[key] = end
+	return end
+}
+
 // classInfo holds information about a class for O(1) lookup.
 type classInfo struct {
 	name      string
@@ -118,23 +155,75 @@ func (e *PythonExtractor) Extract(filePath string, content []byte) ([]Entity, er
 
 	source := string(content)
 	lines := strings.Split(source, "\n")
+
+	// Create block end cache and collect all block starts in single pass
+	cache := newBlockEndCache(lines, e)
+	blockStarts := e.collectBlockStarts(source)
+	cache.precomputeBlockEnds(lines, blockStarts, e)
+
 	var entities []Entity
 
-	// First pass: extract classes
-	classEntities := e.extractClasses(filePath, source, lines)
+	// First pass: extract classes using cache
+	classEntities := e.extractClassesWithCache(filePath, source, lines, cache)
 	entities = append(entities, classEntities...)
 
 	// Build O(1) class lookup using sorted classes with binary search
 	lookup := newClassLookup(classEntities, lines, e)
 
-	// Extract functions (top-level only) and methods (within classes)
-	entities = append(entities, e.extractFunctionsAndMethods(filePath, source, lines, lookup)...)
+	// Extract functions and methods using cache
+	entities = append(entities, e.extractFunctionsAndMethodsWithCache(filePath, source, lines, lookup, cache)...)
 
 	return entities, nil
 }
 
-// extractClasses extracts class declarations.
-func (e *PythonExtractor) extractClasses(filePath, source string, lines []string) []Entity {
+// collectBlockStarts gathers all block start positions from the source.
+func (e *PythonExtractor) collectBlockStarts(source string) []blockEndKey {
+	var starts []blockEndKey
+
+	// Collect class starts
+	classMatches := e.classPattern.FindAllStringSubmatchIndex(source, -1)
+	for _, match := range classMatches {
+		if len(match) >= 6 {
+			startLine := e.posToLine(source, match[0])
+			indent := 0
+			if match[2] != -1 && match[3] != -1 {
+				indent = match[3] - match[2]
+			}
+			starts = append(starts, blockEndKey{startLine: startLine, baseIndent: indent})
+		}
+	}
+
+	// Collect function starts
+	funcMatches := e.functionPattern.FindAllStringSubmatchIndex(source, -1)
+	for _, match := range funcMatches {
+		if len(match) >= 6 {
+			startLine := e.posToLine(source, match[0])
+			indent := 0
+			if match[2] != -1 && match[3] != -1 {
+				indent = match[3] - match[2]
+			}
+			starts = append(starts, blockEndKey{startLine: startLine, baseIndent: indent})
+		}
+	}
+
+	// Collect async function starts
+	asyncMatches := e.asyncFunctionPattern.FindAllStringSubmatchIndex(source, -1)
+	for _, match := range asyncMatches {
+		if len(match) >= 6 {
+			startLine := e.posToLine(source, match[0])
+			indent := 0
+			if match[2] != -1 && match[3] != -1 {
+				indent = match[3] - match[2]
+			}
+			starts = append(starts, blockEndKey{startLine: startLine, baseIndent: indent})
+		}
+	}
+
+	return starts
+}
+
+// extractClassesWithCache extracts class declarations using cached block ends.
+func (e *PythonExtractor) extractClassesWithCache(filePath, source string, lines []string, cache *blockEndCache) []Entity {
 	var entities []Entity
 	matches := e.classPattern.FindAllStringSubmatchIndex(source, -1)
 
@@ -144,16 +233,16 @@ func (e *PythonExtractor) extractClasses(filePath, source string, lines []string
 			startLine := e.posToLine(source, startPos)
 
 			// Get indentation
-			indent := ""
+			indentLen := 0
 			if match[2] != -1 && match[3] != -1 {
-				indent = source[match[2]:match[3]]
+				indentLen = match[3] - match[2]
 			}
 
 			// Extract class name (group 2)
 			name := source[match[4]:match[5]]
 
-			// Find the end of the class (based on indentation)
-			endLine := e.findPythonBlockEnd(lines, startLine, len(indent))
+			// Get block end from cache (O(1) lookup)
+			endLine := cache.get(startLine, indentLen, lines, e)
 
 			// Build signature
 			var sig strings.Builder
@@ -179,36 +268,38 @@ func (e *PythonExtractor) extractClasses(filePath, source string, lines []string
 	return entities
 }
 
-// extractFunctionsAndMethods extracts function and method declarations.
-func (e *PythonExtractor) extractFunctionsAndMethods(
+// extractFunctionsAndMethodsWithCache extracts functions and methods using cached block ends.
+func (e *PythonExtractor) extractFunctionsAndMethodsWithCache(
 	filePath, source string,
 	lines []string,
 	lookup *classLookup,
+	cache *blockEndCache,
 ) []Entity {
 	var entities []Entity
 
 	// Extract regular functions and methods
-	entities = append(entities, e.extractFuncsByPattern(filePath, source, lines, lookup, e.functionPattern, false)...)
+	entities = append(entities, e.extractFuncsByPatternWithCache(filePath, source, lines, lookup, e.functionPattern, false, cache)...)
 
 	// Extract async functions and methods
-	entities = append(entities, e.extractFuncsByPattern(filePath, source, lines, lookup, e.asyncFunctionPattern, true)...)
+	entities = append(entities, e.extractFuncsByPatternWithCache(filePath, source, lines, lookup, e.asyncFunctionPattern, true, cache)...)
 
 	return entities
 }
 
-// extractFuncsByPattern extracts functions matching the given pattern.
-func (e *PythonExtractor) extractFuncsByPattern(
+// extractFuncsByPatternWithCache extracts functions matching the given pattern using cache.
+func (e *PythonExtractor) extractFuncsByPatternWithCache(
 	filePath, source string,
 	lines []string,
 	lookup *classLookup,
 	pattern *regexp.Regexp,
 	isAsync bool,
+	cache *blockEndCache,
 ) []Entity {
 	matches := pattern.FindAllStringSubmatchIndex(source, -1)
 	entities := make([]Entity, 0, len(matches))
 
 	for _, match := range matches {
-		if entity := e.processMatch(filePath, source, lines, lookup, match, isAsync); entity != nil {
+		if entity := e.processMatchWithCache(filePath, source, lines, lookup, match, isAsync, cache); entity != nil {
 			entities = append(entities, *entity)
 		}
 	}
@@ -216,13 +307,14 @@ func (e *PythonExtractor) extractFuncsByPattern(
 	return entities
 }
 
-// processMatch processes a single regex match and returns an entity or nil.
-func (e *PythonExtractor) processMatch(
+// processMatchWithCache processes a single regex match using cache and returns an entity or nil.
+func (e *PythonExtractor) processMatchWithCache(
 	filePath, source string,
 	lines []string,
 	lookup *classLookup,
 	match []int,
 	isAsync bool,
+	cache *blockEndCache,
 ) *Entity {
 	if len(match) < 6 {
 		return nil
@@ -232,7 +324,7 @@ func (e *PythonExtractor) processMatch(
 	startLine := e.posToLine(source, startPos)
 	indentLevel := e.extractIndentLevel(source, match)
 	name := source[match[4]:match[5]]
-	endLine := e.findPythonBlockEnd(lines, startLine, indentLevel)
+	endLine := cache.get(startLine, indentLevel, lines, e)
 	sig := e.buildSignature(source, match, isAsync, name)
 
 	// O(1) parent class lookup using binary search
@@ -427,10 +519,11 @@ type blockEndState struct {
 	baseIndent       int
 }
 
-// findPythonBlockEnd finds where a Python block ends based on indentation.
+// computeBlockEnd computes where a Python block ends based on indentation.
 // A block ends when we find a line with equal or less indentation that is not
 // empty, comment, or inside a triple-quoted docstring.
-func (e *PythonExtractor) findPythonBlockEnd(lines []string, startLine int, baseIndent int) int {
+// This is called once per block during cache precomputation.
+func (e *PythonExtractor) computeBlockEnd(lines []string, startLine int, baseIndent int) int {
 	if !e.isValidStartLine(startLine, len(lines)) {
 		return startLine
 	}

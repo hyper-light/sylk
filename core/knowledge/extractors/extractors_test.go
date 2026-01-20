@@ -2090,3 +2090,308 @@ func TestClassLookup_BinarySearchCorrectness(t *testing.T) {
 	name, _ = lookup.findParentClass(6, 4)
 	assert.Equal(t, "C", name)
 }
+
+// =============================================================================
+// Python Block End Cache Tests (W3M.5)
+// =============================================================================
+
+func TestBlockEndCache_BasicUsage(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		"def func1():",      // line 1
+		"    x = 1",         // line 2
+		"    return x",      // line 3
+		"",                  // line 4
+		"def func2():",      // line 5
+		"    y = 2",         // line 6
+		"    return y",      // line 7
+	}
+
+	cache := newBlockEndCache(lines, extractor)
+	starts := []blockEndKey{
+		{startLine: 1, baseIndent: 0},
+		{startLine: 5, baseIndent: 0},
+	}
+	cache.precomputeBlockEnds(lines, starts, extractor)
+
+	// Verify cached values
+	end1 := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 3, end1)
+
+	end2 := cache.get(5, 0, lines, extractor)
+	assert.Equal(t, 7, end2)
+}
+
+func TestBlockEndCache_CacheHit(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		"def func():",
+		"    x = 1",
+		"    return x",
+	}
+
+	cache := newBlockEndCache(lines, extractor)
+	starts := []blockEndKey{{startLine: 1, baseIndent: 0}}
+	cache.precomputeBlockEnds(lines, starts, extractor)
+
+	// First call - should use cached value
+	end1 := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 3, end1)
+
+	// Second call - should still use cached value
+	end2 := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 3, end2)
+	assert.Equal(t, end1, end2)
+}
+
+func TestBlockEndCache_CacheMiss(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		"def func():",
+		"    x = 1",
+		"    return x",
+	}
+
+	cache := newBlockEndCache(lines, extractor)
+	// Don't precompute - force a cache miss
+
+	// Should compute and cache the result
+	end := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 3, end)
+}
+
+func TestBlockEndCache_NestedBlocks(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		"class MyClass:",            // line 1
+		"    def method1(self):",    // line 2
+		"        x = 1",             // line 3
+		"        return x",          // line 4
+		"",                          // line 5
+		"    def method2(self):",    // line 6
+		"        y = 2",             // line 7
+		"        return y",          // line 8
+		"",                          // line 9
+		"def standalone():",         // line 10
+		"    pass",                  // line 11
+	}
+
+	cache := newBlockEndCache(lines, extractor)
+	starts := []blockEndKey{
+		{startLine: 1, baseIndent: 0},  // class
+		{startLine: 2, baseIndent: 4},  // method1
+		{startLine: 6, baseIndent: 4},  // method2
+		{startLine: 10, baseIndent: 0}, // standalone
+	}
+	cache.precomputeBlockEnds(lines, starts, extractor)
+
+	// Verify class ends at line 8 (last non-empty line in class)
+	classEnd := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 8, classEnd)
+
+	// Verify method1 ends at line 4
+	method1End := cache.get(2, 4, lines, extractor)
+	assert.Equal(t, 4, method1End)
+
+	// Verify method2 ends at line 8
+	method2End := cache.get(6, 4, lines, extractor)
+	assert.Equal(t, 8, method2End)
+
+	// Verify standalone ends at line 11
+	standaloneEnd := cache.get(10, 0, lines, extractor)
+	assert.Equal(t, 11, standaloneEnd)
+}
+
+func TestBlockEndCache_PerformanceWithManyFunctions(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	// Generate source with many functions
+	numFunctions := 500
+	var builder strings.Builder
+	for i := 0; i < numFunctions; i++ {
+		builder.WriteString("def func_")
+		builder.WriteString(strconv.Itoa(i))
+		builder.WriteString("():\n")
+		builder.WriteString("    x = ")
+		builder.WriteString(strconv.Itoa(i))
+		builder.WriteString("\n")
+		builder.WriteString("    return x\n\n")
+	}
+
+	source := builder.String()
+
+	// Extract entities
+	entities, err := extractor.Extract("/test/perf.py", []byte(source))
+	require.NoError(t, err)
+
+	// Should have exactly numFunctions functions
+	assert.Equal(t, numFunctions, len(entities))
+
+	// Verify all functions have correct structure
+	for i, e := range entities {
+		assert.Equal(t, knowledge.EntityKindFunction, e.Kind)
+		expectedStart := i*4 + 1  // Each function block is 4 lines (def + 2 body + empty)
+		expectedEnd := expectedStart + 2 // Function body ends 2 lines after start
+		assert.Equal(t, expectedStart, e.StartLine, "Function %d start", i)
+		assert.Equal(t, expectedEnd, e.EndLine, "Function %d end", i)
+	}
+}
+
+func TestBlockEndCache_DifferentIndentLevels(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		"def outer():",         // line 1, indent 0
+		"    def inner():",     // line 2, indent 4
+		"        x = 1",        // line 3, indent 8
+		"        return x",     // line 4, indent 8
+		"    return inner",     // line 5, indent 4
+		"",                     // line 6
+		"def another():",       // line 7, indent 0
+		"    pass",             // line 8, indent 4
+	}
+
+	cache := newBlockEndCache(lines, extractor)
+	starts := []blockEndKey{
+		{startLine: 1, baseIndent: 0},
+		{startLine: 2, baseIndent: 4},
+		{startLine: 7, baseIndent: 0},
+	}
+	cache.precomputeBlockEnds(lines, starts, extractor)
+
+	// outer() ends at line 5
+	outerEnd := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 5, outerEnd)
+
+	// inner() ends at line 4
+	innerEnd := cache.get(2, 4, lines, extractor)
+	assert.Equal(t, 4, innerEnd)
+
+	// another() ends at line 8
+	anotherEnd := cache.get(7, 0, lines, extractor)
+	assert.Equal(t, 8, anotherEnd)
+}
+
+func TestBlockEndCache_EmptyCache(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		"def func():",
+		"    pass",
+	}
+
+	cache := newBlockEndCache(lines, extractor)
+	// No precomputation
+
+	// Should still work via lazy computation
+	end := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 2, end)
+}
+
+func TestBlockEndCache_DocstringsInBlocks(t *testing.T) {
+	extractor := NewPythonExtractor()
+	lines := []string{
+		`def func():`,           // line 1
+		`    """`,               // line 2
+		`    Multi-line`,        // line 3
+		`    docstring.`,        // line 4
+		`    """`,               // line 5
+		`    return 42`,         // line 6
+		``,                      // line 7
+		`def next():`,           // line 8
+		`    pass`,              // line 9
+	}
+
+	cache := newBlockEndCache(lines, extractor)
+	starts := []blockEndKey{
+		{startLine: 1, baseIndent: 0},
+		{startLine: 8, baseIndent: 0},
+	}
+	cache.precomputeBlockEnds(lines, starts, extractor)
+
+	// func() should end at line 6 (includes docstring)
+	funcEnd := cache.get(1, 0, lines, extractor)
+	assert.Equal(t, 6, funcEnd)
+
+	// next() should end at line 9
+	nextEnd := cache.get(8, 0, lines, extractor)
+	assert.Equal(t, 9, nextEnd)
+}
+
+func TestPythonExtractor_BlockEndCachingCorrectness(t *testing.T) {
+	extractor := NewPythonExtractor()
+
+	// Complex source with various block structures
+	source := `class Repository:
+    """A data repository."""
+
+    def __init__(self, db):
+        """Initialize repository."""
+        self.db = db
+
+    def find(self, id):
+        """Find by ID."""
+        return self.db.get(id)
+
+    def save(self, entity):
+        """Save entity."""
+        self.db.put(entity)
+        return entity
+
+class Service:
+    def __init__(self, repo):
+        self.repo = repo
+
+    async def process(self, data):
+        result = await self.repo.save(data)
+        return result
+
+def standalone():
+    pass
+`
+
+	entities, err := extractor.Extract("/test/repo.py", []byte(source))
+	require.NoError(t, err)
+
+	// Verify we extracted correct number of entities
+	// 2 classes + 3 methods in Repository + 2 methods in Service + 1 function
+	classCount := 0
+	methodCount := 0
+	funcCount := 0
+	for _, e := range entities {
+		switch e.Kind {
+		case knowledge.EntityKindType:
+			classCount++
+		case knowledge.EntityKindMethod:
+			methodCount++
+		case knowledge.EntityKindFunction:
+			funcCount++
+		}
+	}
+
+	assert.Equal(t, 2, classCount, "Should have 2 classes")
+	assert.Equal(t, 5, methodCount, "Should have 5 methods")
+	assert.Equal(t, 1, funcCount, "Should have 1 function")
+
+	// Verify Repository class boundaries
+	var repoClass *Entity
+	for i := range entities {
+		if entities[i].Name == "Repository" {
+			repoClass = &entities[i]
+			break
+		}
+	}
+	require.NotNil(t, repoClass)
+	assert.Equal(t, 1, repoClass.StartLine)
+	assert.Equal(t, 15, repoClass.EndLine) // Last non-empty line of class
+
+	// Verify Service class boundaries
+	var svcClass *Entity
+	for i := range entities {
+		if entities[i].Name == "Service" {
+			svcClass = &entities[i]
+			break
+		}
+	}
+	require.NotNil(t, svcClass)
+	assert.Equal(t, 17, svcClass.StartLine)
+	assert.Equal(t, 23, svcClass.EndLine) // Last non-empty line of class
+}
