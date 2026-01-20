@@ -957,14 +957,26 @@ func (g *DualQueueGate) signalWork() {
 	}
 }
 
+// Cancel cancels an active request by its ID. Safe to call concurrently.
+// If the request doesn't exist or has already completed, this is a no-op.
 func (g *DualQueueGate) Cancel(reqID string) {
-	g.mu.Lock()
-	ar, exists := g.activeRequests[reqID]
-	g.mu.Unlock()
-
-	if exists && ar.CancelFunc != nil {
-		ar.CancelFunc()
+	cancelFunc := g.getRequestCancelFunc(reqID)
+	if cancelFunc != nil {
+		cancelFunc()
 	}
+}
+
+// getRequestCancelFunc retrieves the cancel function for a request while holding the lock.
+// Returns nil if the request doesn't exist or has no cancel function.
+func (g *DualQueueGate) getRequestCancelFunc(reqID string) context.CancelFunc {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	ar, exists := g.activeRequests[reqID]
+	if !exists || ar == nil {
+		return nil
+	}
+	return ar.CancelFunc
 }
 
 func (g *DualQueueGate) Close() {

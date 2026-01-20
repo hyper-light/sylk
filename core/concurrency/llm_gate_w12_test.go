@@ -379,3 +379,146 @@ func TestW12_14_Cancel_ConcurrentWithClose(t *testing.T) {
 	wg.Wait()
 	close(blockCh)
 }
+
+// TestW12_14_GetRequestCancelFunc_Exists tests getting cancel func for existing request.
+func TestW12_14_GetRequestCancelFunc_Exists(t *testing.T) {
+	started := make(chan struct{})
+	blockCh := make(chan struct{})
+
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			close(started)
+			select {
+			case <-blockCh:
+				return "done", nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+	defer func() {
+		close(blockCh)
+		gate.Close()
+	}()
+
+	req := &LLMRequest{
+		ID:          "get-cancel-func-test",
+		AgentType:   AgentGuide,
+		UserInvoked: true,
+	}
+	gate.Submit(context.Background(), req)
+
+	<-started
+
+	// Get the cancel func
+	cancelFunc := gate.getRequestCancelFunc("get-cancel-func-test")
+	if cancelFunc == nil {
+		t.Error("expected non-nil cancel func for active request")
+	}
+
+	// Verify it can be called without error
+	cancelFunc()
+}
+
+// TestW12_14_GetRequestCancelFunc_NotExists tests getting cancel func for non-existent request.
+func TestW12_14_GetRequestCancelFunc_NotExists(t *testing.T) {
+	executor := &mockExecutor{}
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	cancelFunc := gate.getRequestCancelFunc("non-existent")
+	if cancelFunc != nil {
+		t.Error("expected nil cancel func for non-existent request")
+	}
+}
+
+// TestW12_14_Cancel_ConcurrentWithCompletion tests Cancel racing with request completion.
+func TestW12_14_Cancel_ConcurrentWithCompletion(t *testing.T) {
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			// Very short execution to create race with Cancel
+			time.Sleep(time.Millisecond)
+			return "done", nil
+		},
+	}
+
+	gate := NewDualQueueGate(DefaultDualQueueGateConfig(), executor)
+	defer gate.Close()
+
+	// Run multiple iterations to catch race conditions
+	for i := 0; i < 50; i++ {
+		req := &LLMRequest{
+			ID:          "completion-race-" + string(rune('0'+i%10)),
+			AgentType:   AgentGuide,
+			UserInvoked: true,
+			ResultCh:    make(chan *LLMResult, 1),
+		}
+		gate.Submit(context.Background(), req)
+
+		// Cancel concurrently with potential completion
+		go gate.Cancel(req.ID)
+	}
+
+	// Allow all requests to complete
+	time.Sleep(100 * time.Millisecond)
+}
+
+// TestW12_14_Cancel_StressTest stress tests concurrent Cancel calls.
+func TestW12_14_Cancel_StressTest(t *testing.T) {
+	blockCh := make(chan struct{})
+	var started atomic.Int32
+
+	executor := &mockExecutor{
+		executeFunc: func(ctx context.Context, req *LLMRequest) (any, error) {
+			started.Add(1)
+			select {
+			case <-blockCh:
+				return "done", nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+
+	config := DualQueueGateConfig{
+		MaxPipelineQueueSize:  100,
+		MaxUserQueueSize:      100,
+		MaxConcurrentRequests: 10,
+		ShutdownTimeout:       time.Second,
+	}
+	gate := NewDualQueueGate(config, executor)
+	defer func() {
+		close(blockCh)
+		gate.Close()
+	}()
+
+	// Submit multiple requests
+	reqIDs := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		reqIDs[i] = "stress-" + string(rune('0'+i))
+		req := &LLMRequest{
+			ID:          reqIDs[i],
+			AgentType:   AgentGuide,
+			UserInvoked: true,
+		}
+		gate.Submit(context.Background(), req)
+	}
+
+	// Wait for all to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel all from multiple goroutines concurrently
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			// Cancel random request
+			gate.Cancel(reqIDs[n%len(reqIDs)])
+		}(i)
+	}
+
+	wg.Wait()
+}

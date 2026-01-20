@@ -37242,7 +37242,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add timeout or context cancellation to waiter goroutine                  ││
 │ │   SEVERITY: CRITICAL - Goroutine leak                                           ││
 │ │                                                                                  ││
-│ │ [ ] W12.14 - LLMGate Race in Cancel                                             ││
+│ │ [x] W12.14 - LLMGate Race in Cancel                                             ││
 │ │   FILE: core/concurrency/llm_gate.go:960-968                                    ││
 │ │   ISSUE: Cancel() modifies state without proper synchronization                 ││
 │ │   FIX: Add mutex protection around cancel state modification                    ││
@@ -37271,7 +37271,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Add mutex protection for state access                                    ││
 │ │   SEVERITY: CRITICAL - Race condition                                           ││
 │ │                                                                                  ││
-│ │ [ ] W12.18 - Classifier Unsafe Pointer Operations                               ││
+│ │ [x] W12.18 - Classifier Unsafe Pointer Operations                               ││
 │ │   FILE: core/errors/classifier.go:22,44,82,115,264                              ││
 │ │   ISSUE: Unsafe pointer casts without validation                                ││
 │ │   FIX: Add type assertions with safety checks                                   ││
