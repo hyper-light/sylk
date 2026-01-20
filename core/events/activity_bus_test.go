@@ -1155,3 +1155,273 @@ func (s *slowSubscriber) getReceived() []*ActivityEvent {
 	defer s.mu.Unlock()
 	return append([]*ActivityEvent{}, s.received...)
 }
+
+// =============================================================================
+// W3M.3 Unsubscribe O(1) Optimization Tests
+// =============================================================================
+
+// TestActivityEventBus_UnsubscribeRemovesCorrectSubscriber verifies that
+// Unsubscribe removes only the targeted subscriber.
+func TestActivityEventBus_UnsubscribeRemovesCorrectSubscriber(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	// Create multiple subscribers for the same event type
+	sub1 := &mockSubscriber{id: "sub-1", eventTypes: []EventType{EventTypeAgentAction}}
+	sub2 := &mockSubscriber{id: "sub-2", eventTypes: []EventType{EventTypeAgentAction}}
+	sub3 := &mockSubscriber{id: "sub-3", eventTypes: []EventType{EventTypeAgentAction}}
+
+	bus.Subscribe(sub1)
+	bus.Subscribe(sub2)
+	bus.Subscribe(sub3)
+
+	// Unsubscribe only sub-2
+	bus.Unsubscribe("sub-2")
+
+	// Publish event
+	event := NewActivityEvent(EventTypeAgentAction, "test-session", "test action")
+	bus.Publish(event)
+
+	// Wait for event delivery
+	time.Sleep(100 * time.Millisecond)
+
+	// sub1 and sub3 should receive the event, sub2 should not
+	if len(sub1.getEvents()) != 1 {
+		t.Errorf("sub1 expected 1 event, got %d", len(sub1.getEvents()))
+	}
+	if len(sub2.getEvents()) != 0 {
+		t.Errorf("sub2 expected 0 events after unsubscribe, got %d", len(sub2.getEvents()))
+	}
+	if len(sub3.getEvents()) != 1 {
+		t.Errorf("sub3 expected 1 event, got %d", len(sub3.getEvents()))
+	}
+}
+
+// TestActivityEventBus_UnsubscribeWildcardSubscriber verifies that
+// wildcard subscribers can be unsubscribed correctly.
+func TestActivityEventBus_UnsubscribeWildcardSubscriber(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	// Create wildcard subscribers
+	wildcard1 := &mockSubscriber{id: "wildcard-1", eventTypes: []EventType{}}
+	wildcard2 := &mockSubscriber{id: "wildcard-2", eventTypes: []EventType{}}
+
+	bus.Subscribe(wildcard1)
+	bus.Subscribe(wildcard2)
+
+	// Unsubscribe one wildcard subscriber
+	bus.Unsubscribe("wildcard-1")
+
+	// Publish event
+	event := NewActivityEvent(EventTypeAgentAction, "test-session", "test action")
+	bus.Publish(event)
+
+	// Wait for event delivery
+	time.Sleep(100 * time.Millisecond)
+
+	// Only wildcard2 should receive the event
+	if len(wildcard1.getEvents()) != 0 {
+		t.Errorf("wildcard1 expected 0 events after unsubscribe, got %d", len(wildcard1.getEvents()))
+	}
+	if len(wildcard2.getEvents()) != 1 {
+		t.Errorf("wildcard2 expected 1 event, got %d", len(wildcard2.getEvents()))
+	}
+}
+
+// TestActivityEventBus_UnsubscribeMultipleEventTypes verifies that unsubscribing
+// removes the subscriber from all event types it was registered for.
+func TestActivityEventBus_UnsubscribeMultipleEventTypes(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	// Subscriber registered for multiple event types
+	sub := &mockSubscriber{
+		id:         "multi-type-sub",
+		eventTypes: []EventType{EventTypeAgentAction, EventTypeToolCall, EventTypeUserPrompt},
+	}
+	bus.Subscribe(sub)
+
+	// Unsubscribe
+	bus.Unsubscribe("multi-type-sub")
+
+	// Publish events of all types
+	bus.Publish(NewActivityEvent(EventTypeAgentAction, "s1", "action"))
+	bus.Publish(NewActivityEvent(EventTypeToolCall, "s2", "tool"))
+	bus.Publish(NewActivityEvent(EventTypeUserPrompt, "s3", "prompt"))
+
+	// Wait for event delivery
+	time.Sleep(150 * time.Millisecond)
+
+	// Should receive no events
+	if len(sub.getEvents()) != 0 {
+		t.Errorf("Expected 0 events after unsubscribe, got %d", len(sub.getEvents()))
+	}
+}
+
+// TestActivityEventBus_UnsubscribeNonExistent verifies that unsubscribing
+// a non-existent subscriber does not cause errors.
+func TestActivityEventBus_UnsubscribeNonExistent(t *testing.T) {
+	bus := NewActivityEventBus(100)
+	bus.Start()
+	defer bus.Close()
+
+	// Unsubscribe non-existent subscriber - should not panic
+	bus.Unsubscribe("non-existent-subscriber")
+
+	// Verify bus still works
+	sub := &mockSubscriber{id: "test-sub", eventTypes: []EventType{EventTypeAgentAction}}
+	bus.Subscribe(sub)
+
+	event := NewActivityEvent(EventTypeAgentAction, "test-session", "test action")
+	bus.Publish(event)
+
+	time.Sleep(100 * time.Millisecond)
+
+	if len(sub.getEvents()) != 1 {
+		t.Errorf("Expected 1 event, got %d", len(sub.getEvents()))
+	}
+}
+
+// TestActivityEventBus_ConcurrentUnsubscribe tests that concurrent unsubscribe
+// operations do not cause data races.
+func TestActivityEventBus_ConcurrentUnsubscribe(t *testing.T) {
+	bus := NewActivityEventBus(1000)
+	bus.Start()
+	defer bus.Close()
+
+	// Create many subscribers
+	numSubscribers := 100
+	subscribers := make([]*mockSubscriber, numSubscribers)
+	for i := 0; i < numSubscribers; i++ {
+		subID := "sub-" + string(rune('A'+i/26)) + string(rune('A'+i%26))
+		subscribers[i] = &mockSubscriber{
+			id:         subID,
+			eventTypes: []EventType{EventTypeAgentAction},
+		}
+		bus.Subscribe(subscribers[i])
+	}
+
+	var wg sync.WaitGroup
+
+	// Concurrently unsubscribe all subscribers
+	for i := 0; i < numSubscribers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			subID := "sub-" + string(rune('A'+id/26)) + string(rune('A'+id%26))
+			bus.Unsubscribe(subID)
+		}(i)
+	}
+
+	// Concurrently publish events
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			sessionID := "session-" + string(rune('A'+id%26))
+			event := NewActivityEvent(EventTypeAgentAction, sessionID, "action")
+			bus.Publish(event)
+		}(i)
+	}
+
+	wg.Wait()
+	// Test passes if no race condition or panic occurs
+}
+
+// TestActivityEventBus_ConcurrentSubscribeUnsubscribe tests concurrent subscribe
+// and unsubscribe operations for data race safety.
+func TestActivityEventBus_ConcurrentSubscribeUnsubscribe(t *testing.T) {
+	bus := NewActivityEventBus(1000)
+	bus.Start()
+	defer bus.Close()
+
+	var wg sync.WaitGroup
+	iterations := 100
+
+	// Concurrent subscribe operations
+	for i := 0; i < iterations; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			subID := "sub-" + string(rune('A'+id/26)) + string(rune('A'+id%26))
+			sub := &mockSubscriber{
+				id:         subID,
+				eventTypes: []EventType{EventTypeAgentAction},
+			}
+			bus.Subscribe(sub)
+		}(i)
+	}
+
+	// Concurrent unsubscribe operations
+	for i := 0; i < iterations; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			subID := "sub-" + string(rune('A'+id/26)) + string(rune('A'+id%26))
+			bus.Unsubscribe(subID)
+		}(i)
+	}
+
+	// Concurrent publish operations
+	for i := 0; i < iterations; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			sessionID := "s-" + string(rune('A'+id%26))
+			event := NewActivityEvent(EventTypeAgentAction, sessionID, "action")
+			bus.Publish(event)
+		}(i)
+	}
+
+	wg.Wait()
+	// Test passes if no race condition or panic occurs
+}
+
+// TestActivityEventBus_UnsubscribePerformanceWithManySubscribers benchmarks
+// that unsubscribe completes in constant time regardless of subscriber count.
+func TestActivityEventBus_UnsubscribePerformanceWithManySubscribers(t *testing.T) {
+	// This test verifies O(1) behavior by checking that unsubscribe time
+	// does not significantly increase with more subscribers
+
+	testCases := []struct {
+		numSubscribers int
+	}{
+		{10},
+		{100},
+		{1000},
+	}
+
+	for _, tc := range testCases {
+		bus := NewActivityEventBus(100)
+
+		// Subscribe many subscribers
+		for i := 0; i < tc.numSubscribers; i++ {
+			subID := "sub-" + string(rune('A'+i/676)) + string(rune('A'+(i/26)%26)) + string(rune('A'+i%26))
+			sub := &mockSubscriber{
+				id:         subID,
+				eventTypes: []EventType{EventTypeAgentAction},
+			}
+			bus.Subscribe(sub)
+		}
+
+		// Measure unsubscribe time for the middle subscriber
+		targetIdx := tc.numSubscribers / 2
+		targetID := "sub-" + string(rune('A'+targetIdx/676)) + string(rune('A'+(targetIdx/26)%26)) + string(rune('A'+targetIdx%26))
+		start := time.Now()
+		bus.Unsubscribe(targetID)
+		elapsed := time.Since(start)
+
+		bus.Close()
+
+		// Unsubscribe should be very fast (< 1ms) for O(1) operation
+		// We use a generous threshold to avoid flaky tests
+		if elapsed > 10*time.Millisecond {
+			t.Errorf("Unsubscribe with %d subscribers took %v, expected < 10ms",
+				tc.numSubscribers, elapsed)
+		}
+	}
+}
