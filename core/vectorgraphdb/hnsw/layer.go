@@ -168,6 +168,23 @@ func (l *layer) removeNeighbor(id, neighborID string) {
 	node.neighbors.Remove(neighborID)
 }
 
+// findNodesPointingTo returns all node IDs that have targetID as a neighbor.
+// W4P.26: Used to find and clean up dangling references after node deletion.
+// This ensures graph integrity by finding ALL nodes pointing to a deleted node,
+// not just the nodes the deleted node points to.
+func (l *layer) findNodesPointingTo(targetID string) []string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var pointing []string
+	for nodeID, node := range l.nodes {
+		if node.neighbors.Contains(targetID) {
+			pointing = append(pointing, nodeID)
+		}
+	}
+	return pointing
+}
+
 func (l *layer) nodeCount() int {
 	l.mu.RLock()
 	defer l.mu.RUnlock()

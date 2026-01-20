@@ -18,12 +18,20 @@ package hnsw
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"slices"
 	"sort"
 	"sync"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
+
+// magnitudeTolerance defines the relative tolerance for magnitude validation.
+// A cached magnitude is considered stale if it differs from the recomputed
+// value by more than this fraction of the recomputed magnitude.
+// W4P.24: Used for detecting stale magnitude cache entries.
+const magnitudeTolerance = 1e-6
 
 // Sentinel errors for HNSW operations. Use errors.Is() to check error types.
 // W4L.1: Improved error definitions with clearer documentation.
@@ -48,10 +56,25 @@ type SearchResult struct {
 	NodeType   vectorgraphdb.NodeType
 }
 
+// DomainFilterMode controls how missing domains are handled during filtering.
+type DomainFilterMode int
+
+const (
+	// DomainFilterStrict excludes nodes with missing domain metadata from results.
+	// Use this when domain filtering must be exact and missing data indicates a problem.
+	DomainFilterStrict DomainFilterMode = iota
+
+	// DomainFilterLenient includes nodes with missing domain metadata in results.
+	// A warning is logged when a node's domain is not found.
+	// Use this when missing domain data is acceptable but should be noted.
+	DomainFilterLenient
+)
+
 type SearchFilter struct {
-	Domains       []vectorgraphdb.Domain
-	NodeTypes     []vectorgraphdb.NodeType
-	MinSimilarity float64
+	Domains          []vectorgraphdb.Domain
+	NodeTypes        []vectorgraphdb.NodeType
+	MinSimilarity    float64
+	DomainFilterMode DomainFilterMode // Default: DomainFilterStrict (zero value)
 }
 
 type Index struct {
@@ -278,7 +301,9 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 }
 
 // getVectorAndMagnitude safely retrieves both vector and magnitude for a node.
-// Returns false if either is missing.
+// W4P.24: Validates that cached magnitude matches the vector, recomputes if stale.
+// This function does NOT update the cache to avoid data races during read operations.
+// Returns false if the vector is missing.
 func (h *Index) getVectorAndMagnitude(id string) ([]float32, float64, bool) {
 	vec, vecExists := h.vectors[id]
 	if !vecExists {
@@ -286,9 +311,43 @@ func (h *Index) getVectorAndMagnitude(id string) ([]float32, float64, bool) {
 	}
 	mag, magExists := h.magnitudes[id]
 	if !magExists {
-		return nil, 0, false
+		// No cached magnitude - compute it (don't cache during read to avoid race)
+		mag = Magnitude(vec)
+		slog.Warn("magnitude cache miss, computed on read",
+			slog.String("node_id", id),
+			slog.Float64("magnitude", mag))
+		return vec, mag, true
 	}
-	return vec, mag, true
+	// Validate cached magnitude against vector
+	return validateAndReturnMagnitude(id, vec, mag)
+}
+
+// validateAndReturnMagnitude checks if cached magnitude is valid for the vector.
+// W4P.24: Recomputes magnitude if mismatch detected, logs warning.
+// Does NOT update cache to avoid data races during read operations.
+func validateAndReturnMagnitude(id string, vec []float32, cachedMag float64) ([]float32, float64, bool) {
+	computedMag := Magnitude(vec)
+	if isMagnitudeValid(cachedMag, computedMag) {
+		return vec, cachedMag, true
+	}
+	// Stale magnitude detected - log warning and return computed value
+	// Note: We don't update the cache here to avoid write during read lock
+	slog.Warn("stale magnitude cache detected, using computed value",
+		slog.String("node_id", id),
+		slog.Float64("cached_magnitude", cachedMag),
+		slog.Float64("computed_magnitude", computedMag),
+		slog.Float64("difference", math.Abs(cachedMag-computedMag)))
+	return vec, computedMag, true
+}
+
+// isMagnitudeValid checks if cached magnitude matches computed magnitude within tolerance.
+// W4P.24: Uses relative tolerance for floating-point comparison.
+func isMagnitudeValid(cached, computed float64) bool {
+	if computed == 0 {
+		return cached == 0
+	}
+	relDiff := math.Abs(cached-computed) / computed
+	return relDiff <= magnitudeTolerance
 }
 
 func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
@@ -373,7 +432,23 @@ func (h *Index) matchesFilter(id string, similarity float64, filter *SearchFilte
 
 	// Check domain filter
 	if len(filter.Domains) > 0 {
-		if !slices.Contains(filter.Domains, h.domains[id]) {
+		domain, found := h.domains[id]
+		if !found {
+			// W4P.23: Handle missing domain based on filter mode
+			if filter.DomainFilterMode == DomainFilterLenient {
+				slog.Warn("domain not found for node during search filter",
+					slog.String("node_id", id),
+					slog.String("mode", "lenient"),
+					slog.String("action", "including node in results"))
+			} else {
+				// Strict mode (default): exclude nodes with missing domains
+				slog.Debug("domain not found for node during search filter",
+					slog.String("node_id", id),
+					slog.String("mode", "strict"),
+					slog.String("action", "excluding node from results"))
+				return false
+			}
+		} else if !slices.Contains(filter.Domains, domain) {
 			return false
 		}
 	}
@@ -434,20 +509,12 @@ func (h *Index) DeleteBatch(ids []string) error {
 }
 
 // deleteUnlocked performs deletion without acquiring locks.
+// W4P.26: Enhanced to validate and clean up ALL references to deleted node.
 // Caller must hold h.mu.Lock().
 func (h *Index) deleteUnlocked(id string) {
-	// Collect all layers that have this node first (read phase)
-	layersWithNode := make([]*layer, 0, len(h.layers))
+	// Process all layers to clean up references
 	for _, l := range h.layers {
-		if l.hasNode(id) {
-			layersWithNode = append(layersWithNode, l)
-		}
-	}
-
-	// Now process all layers in one pass (write phase)
-	for _, l := range layersWithNode {
-		h.removeNodeConnections(id, l)
-		l.removeNode(id)
+		h.cleanupNodeReferences(id, l)
 	}
 
 	// Remove from maps
@@ -462,11 +529,18 @@ func (h *Index) deleteUnlocked(id string) {
 	}
 }
 
-func (h *Index) removeNodeConnections(id string, l *layer) {
-	neighbors := l.getNeighbors(id)
-	for _, neighbor := range neighbors {
-		l.removeNeighbor(neighbor, id)
+// cleanupNodeReferences removes all references to a deleted node from a layer.
+// W4P.26: Uses reverse lookup to find ALL nodes pointing to the deleted node,
+// ensuring no dangling references remain that could cause search failures.
+func (h *Index) cleanupNodeReferences(id string, l *layer) {
+	// Find all nodes that point to the deleted node (reverse lookup)
+	pointingNodes := l.findNodesPointingTo(id)
+	for _, nodeID := range pointingNodes {
+		l.removeNeighbor(nodeID, id)
 	}
+
+	// Remove the node itself from the layer
+	l.removeNode(id)
 }
 
 func (h *Index) selectNewEntryPoint() {

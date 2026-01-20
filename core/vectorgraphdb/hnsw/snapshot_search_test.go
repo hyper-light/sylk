@@ -311,8 +311,9 @@ func TestSnapshot_getDomain_NilDomainsMap(t *testing.T) {
 		Domains: nil,
 	}
 
-	domain := snap.getDomain("any")
+	domain, found := snap.getDomain("any")
 	assert.Equal(t, vectorgraphdb.DomainCode, domain)
+	assert.False(t, found)
 }
 
 func TestSnapshot_getNodeType_NilNodeTypesMap(t *testing.T) {
@@ -331,8 +332,21 @@ func TestSnapshot_getDomain_MissingID(t *testing.T) {
 		},
 	}
 
-	domain := snap.getDomain("nonexistent")
+	domain, found := snap.getDomain("nonexistent")
 	assert.Equal(t, vectorgraphdb.DomainCode, domain)
+	assert.False(t, found)
+}
+
+func TestSnapshot_getDomain_ExistingID(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: map[string]vectorgraphdb.Domain{
+			"exists": vectorgraphdb.DomainHistory,
+		},
+	}
+
+	domain, found := snap.getDomain("exists")
+	assert.Equal(t, vectorgraphdb.DomainHistory, domain)
+	assert.True(t, found)
 }
 
 func TestSnapshot_getNodeType_MissingID(t *testing.T) {
@@ -452,10 +466,320 @@ func TestSnapshot_passesDomainFilter(t *testing.T) {
 		},
 	}
 
+	// Nil filter passes
 	assert.True(t, snap.passesDomainFilter("code", nil))
-	assert.True(t, snap.passesDomainFilter("code", []vectorgraphdb.Domain{}))
-	assert.True(t, snap.passesDomainFilter("code", []vectorgraphdb.Domain{vectorgraphdb.DomainCode}))
-	assert.False(t, snap.passesDomainFilter("code", []vectorgraphdb.Domain{vectorgraphdb.DomainHistory}))
+
+	// Empty domains list passes
+	assert.True(t, snap.passesDomainFilter("code", &SearchFilter{Domains: []vectorgraphdb.Domain{}}))
+
+	// Domain in filter passes
+	assert.True(t, snap.passesDomainFilter("code", &SearchFilter{Domains: []vectorgraphdb.Domain{vectorgraphdb.DomainCode}}))
+
+	// Domain not in filter fails
+	assert.False(t, snap.passesDomainFilter("code", &SearchFilter{Domains: []vectorgraphdb.Domain{vectorgraphdb.DomainHistory}}))
+}
+
+// W4P.23: Tests for domain filtering with missing domain handling
+func TestSnapshot_passesDomainFilter_MissingDomain_StrictMode(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: map[string]vectorgraphdb.Domain{
+			"known": vectorgraphdb.DomainCode,
+		},
+	}
+
+	// Strict mode (default): missing domain should fail
+	filter := &SearchFilter{
+		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		DomainFilterMode: DomainFilterStrict,
+	}
+	assert.False(t, snap.passesDomainFilter("unknown", filter), "strict mode should exclude nodes with missing domains")
+}
+
+func TestSnapshot_passesDomainFilter_MissingDomain_LenientMode(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: map[string]vectorgraphdb.Domain{
+			"known": vectorgraphdb.DomainCode,
+		},
+	}
+
+	// Lenient mode: missing domain should pass (with warning logged)
+	filter := &SearchFilter{
+		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		DomainFilterMode: DomainFilterLenient,
+	}
+	assert.True(t, snap.passesDomainFilter("unknown", filter), "lenient mode should include nodes with missing domains")
+}
+
+func TestSnapshot_passesDomainFilter_NilDomainsMap_StrictMode(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: nil, // No domain map
+	}
+
+	filter := &SearchFilter{
+		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		DomainFilterMode: DomainFilterStrict,
+	}
+	assert.False(t, snap.passesDomainFilter("any", filter), "strict mode with nil domains map should exclude")
+}
+
+func TestSnapshot_passesDomainFilter_NilDomainsMap_LenientMode(t *testing.T) {
+	snap := &HNSWSnapshot{
+		Domains: nil, // No domain map
+	}
+
+	filter := &SearchFilter{
+		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		DomainFilterMode: DomainFilterLenient,
+	}
+	assert.True(t, snap.passesDomainFilter("any", filter), "lenient mode with nil domains map should include")
+}
+
+func TestSnapshot_handleMissingDomain(t *testing.T) {
+	snap := &HNSWSnapshot{}
+
+	tests := []struct {
+		name     string
+		mode     DomainFilterMode
+		expected bool
+	}{
+		{"strict mode excludes", DomainFilterStrict, false},
+		{"lenient mode includes", DomainFilterLenient, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := snap.handleMissingDomain("test-node", tc.mode)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+// W4P.23: Integration tests for search with domain filtering modes
+func TestSnapshot_Search_DomainFilter_MissingDomain_StrictMode(t *testing.T) {
+	// Create snapshot with some nodes missing domain metadata
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors: map[string][]float32{
+			"node1": {1.0, 0.0},
+			"node2": {0.9, 0.1},
+			"node3": {0.8, 0.2},
+		},
+		Magnitudes: map[string]float64{
+			"node1": 1.0,
+			"node2": 0.906,
+			"node3": 0.825,
+		},
+		Domains: map[string]vectorgraphdb.Domain{
+			"node1": vectorgraphdb.DomainCode,
+			// node2 and node3 have missing domains
+		},
+		NodeTypes: map[string]vectorgraphdb.NodeType{
+			"node1": vectorgraphdb.NodeTypeFunction,
+			"node2": vectorgraphdb.NodeTypeFunction,
+			"node3": vectorgraphdb.NodeTypeFunction,
+		},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{
+				"node1": {"node2", "node3"},
+				"node2": {"node1", "node3"},
+				"node3": {"node1", "node2"},
+			}},
+		},
+	}
+
+	// Strict mode: should only return node1 (the only one with domain set to DomainCode)
+	filter := &SearchFilter{
+		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		DomainFilterMode: DomainFilterStrict,
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 10, filter)
+	require.NotNil(t, results)
+	assert.Len(t, results, 1, "strict mode should only return nodes with known matching domains")
+	assert.Equal(t, "node1", results[0].ID)
+}
+
+func TestSnapshot_Search_DomainFilter_MissingDomain_LenientMode(t *testing.T) {
+	// Create snapshot with some nodes missing domain metadata
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors: map[string][]float32{
+			"node1": {1.0, 0.0},
+			"node2": {0.9, 0.1},
+			"node3": {0.8, 0.2},
+		},
+		Magnitudes: map[string]float64{
+			"node1": 1.0,
+			"node2": 0.906,
+			"node3": 0.825,
+		},
+		Domains: map[string]vectorgraphdb.Domain{
+			"node1": vectorgraphdb.DomainCode,
+			// node2 and node3 have missing domains
+		},
+		NodeTypes: map[string]vectorgraphdb.NodeType{
+			"node1": vectorgraphdb.NodeTypeFunction,
+			"node2": vectorgraphdb.NodeTypeFunction,
+			"node3": vectorgraphdb.NodeTypeFunction,
+		},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{
+				"node1": {"node2", "node3"},
+				"node2": {"node1", "node3"},
+				"node3": {"node1", "node2"},
+			}},
+		},
+	}
+
+	// Lenient mode: should return all nodes (missing domains are included)
+	filter := &SearchFilter{
+		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+		DomainFilterMode: DomainFilterLenient,
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 10, filter)
+	require.NotNil(t, results)
+	assert.Len(t, results, 3, "lenient mode should include nodes with missing domains")
+}
+
+func TestSnapshot_Search_DomainFilter_MultipleDomains_SomePresent(t *testing.T) {
+	// Test filtering with multiple allowed domains, some nodes present, some missing
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors: map[string][]float32{
+			"node1": {1.0, 0.0},
+			"node2": {0.9, 0.1},
+			"node3": {0.8, 0.2},
+			"node4": {0.7, 0.3},
+		},
+		Magnitudes: map[string]float64{
+			"node1": 1.0,
+			"node2": 0.906,
+			"node3": 0.825,
+			"node4": 0.762,
+		},
+		Domains: map[string]vectorgraphdb.Domain{
+			"node1": vectorgraphdb.DomainCode,
+			"node2": vectorgraphdb.DomainHistory,
+			"node3": vectorgraphdb.DomainAcademic,
+			// node4 has missing domain
+		},
+		NodeTypes: map[string]vectorgraphdb.NodeType{
+			"node1": vectorgraphdb.NodeTypeFunction,
+			"node2": vectorgraphdb.NodeTypeHistoryEntry,
+			"node3": vectorgraphdb.NodeTypePaper,
+			"node4": vectorgraphdb.NodeTypeFunction,
+		},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{
+				"node1": {"node2", "node3", "node4"},
+				"node2": {"node1", "node3", "node4"},
+				"node3": {"node1", "node2", "node4"},
+				"node4": {"node1", "node2", "node3"},
+			}},
+		},
+	}
+
+	// Filter for Code and History domains in strict mode
+	filter := &SearchFilter{
+		Domains:          []vectorgraphdb.Domain{vectorgraphdb.DomainCode, vectorgraphdb.DomainHistory},
+		DomainFilterMode: DomainFilterStrict,
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 10, filter)
+	require.NotNil(t, results)
+	assert.Len(t, results, 2, "should return only nodes with Code or History domains")
+
+	// Verify we got the right nodes
+	ids := make([]string, len(results))
+	for i, r := range results {
+		ids[i] = r.ID
+	}
+	assert.Contains(t, ids, "node1")
+	assert.Contains(t, ids, "node2")
+}
+
+func TestSnapshot_Search_DomainFilter_DefaultModeIsStrict(t *testing.T) {
+	// Verify that the zero value of DomainFilterMode is Strict
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors: map[string][]float32{
+			"node1": {1.0, 0.0},
+			"node2": {0.9, 0.1},
+		},
+		Magnitudes: map[string]float64{
+			"node1": 1.0,
+			"node2": 0.906,
+		},
+		Domains: map[string]vectorgraphdb.Domain{
+			"node1": vectorgraphdb.DomainCode,
+			// node2 missing
+		},
+		NodeTypes: map[string]vectorgraphdb.NodeType{
+			"node1": vectorgraphdb.NodeTypeFunction,
+			"node2": vectorgraphdb.NodeTypeFunction,
+		},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{
+				"node1": {"node2"},
+				"node2": {"node1"},
+			}},
+		},
+	}
+
+	// Filter without explicitly setting DomainFilterMode (should default to strict)
+	filter := &SearchFilter{
+		Domains: []vectorgraphdb.Domain{vectorgraphdb.DomainCode},
+	}
+
+	results := snap.Search([]float32{1.0, 0.0}, 10, filter)
+	require.NotNil(t, results)
+	assert.Len(t, results, 1, "default mode (strict) should exclude nodes with missing domains")
+	assert.Equal(t, "node1", results[0].ID)
+}
+
+func TestSnapshot_Search_NoDomainFilter_IncludesMissingDomains(t *testing.T) {
+	// When no domain filter is applied, missing domains should be included
+	snap := &HNSWSnapshot{
+		EntryPoint: "node1",
+		MaxLevel:   0,
+		Vectors: map[string][]float32{
+			"node1": {1.0, 0.0},
+			"node2": {0.9, 0.1},
+		},
+		Magnitudes: map[string]float64{
+			"node1": 1.0,
+			"node2": 0.906,
+		},
+		Domains: map[string]vectorgraphdb.Domain{
+			"node1": vectorgraphdb.DomainCode,
+			// node2 missing
+		},
+		NodeTypes: map[string]vectorgraphdb.NodeType{
+			"node1": vectorgraphdb.NodeTypeFunction,
+			"node2": vectorgraphdb.NodeTypeFunction,
+		},
+		Layers: []LayerSnapshot{
+			{Nodes: map[string][]string{
+				"node1": {"node2"},
+				"node2": {"node1"},
+			}},
+		},
+	}
+
+	// No filter at all
+	results := snap.Search([]float32{1.0, 0.0}, 10, nil)
+	require.NotNil(t, results)
+	assert.Len(t, results, 2, "no filter should include all nodes")
+
+	// Empty filter
+	results = snap.Search([]float32{1.0, 0.0}, 10, &SearchFilter{})
+	require.NotNil(t, results)
+	assert.Len(t, results, 2, "empty filter should include all nodes")
 }
 
 func TestSnapshot_passesNodeTypeFilter(t *testing.T) {

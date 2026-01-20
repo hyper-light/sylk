@@ -230,7 +230,8 @@ func (snap *HNSWSnapshot) filterAndLimit(candidates []SearchResult, k int, filte
 		if !snap.matchesFilter(c.ID, c.Similarity, filter) {
 			continue
 		}
-		c.Domain = snap.getDomain(c.ID)
+		domain, _ := snap.getDomain(c.ID)
+		c.Domain = domain
 		c.NodeType = snap.getNodeType(c.ID)
 		results = append(results, c)
 		if len(results) >= k {
@@ -248,7 +249,7 @@ func (snap *HNSWSnapshot) matchesFilter(id string, similarity float64, filter *S
 	if !snap.passesMinSimilarity(similarity, filter.MinSimilarity) {
 		return false
 	}
-	if !snap.passesDomainFilter(id, filter.Domains) {
+	if !snap.passesDomainFilter(id, filter) {
 		return false
 	}
 	return snap.passesNodeTypeFilter(id, filter.NodeTypes)
@@ -263,11 +264,36 @@ func (snap *HNSWSnapshot) passesMinSimilarity(similarity, minSimilarity float64)
 }
 
 // passesDomainFilter checks if the node's domain is in the allowed list.
-func (snap *HNSWSnapshot) passesDomainFilter(id string, domains []vectorgraphdb.Domain) bool {
-	if len(domains) == 0 {
+// When the domain is missing and filter mode is strict, returns false.
+// When the domain is missing and filter mode is lenient, logs a warning and returns true.
+func (snap *HNSWSnapshot) passesDomainFilter(id string, filter *SearchFilter) bool {
+	if filter == nil || len(filter.Domains) == 0 {
 		return true
 	}
-	return slices.Contains(domains, snap.getDomain(id))
+	domain, found := snap.getDomain(id)
+	if !found {
+		return snap.handleMissingDomain(id, filter.DomainFilterMode)
+	}
+	return slices.Contains(filter.Domains, domain)
+}
+
+// handleMissingDomain determines behavior when a node's domain is not found.
+// Strict mode: excludes the node (returns false).
+// Lenient mode: logs a warning and includes the node (returns true).
+func (snap *HNSWSnapshot) handleMissingDomain(id string, mode DomainFilterMode) bool {
+	if mode == DomainFilterLenient {
+		slog.Warn("domain not found for node during search filter",
+			slog.String("node_id", id),
+			slog.String("mode", "lenient"),
+			slog.String("action", "including node in results"))
+		return true
+	}
+	// Strict mode (default): exclude nodes with missing domains
+	slog.Debug("domain not found for node during search filter",
+		slog.String("node_id", id),
+		slog.String("mode", "strict"),
+		slog.String("action", "excluding node from results"))
+	return false
 }
 
 // passesNodeTypeFilter checks if the node's type is in the allowed list.
@@ -278,16 +304,17 @@ func (snap *HNSWSnapshot) passesNodeTypeFilter(id string, nodeTypes []vectorgrap
 	return slices.Contains(nodeTypes, snap.getNodeType(id))
 }
 
-// getDomain returns the domain for a node ID, or default if not found.
-func (snap *HNSWSnapshot) getDomain(id string) vectorgraphdb.Domain {
+// getDomain returns the domain for a node ID and whether it was found.
+// Returns (DomainCode, false) if the domain map is nil or ID is not found.
+func (snap *HNSWSnapshot) getDomain(id string) (vectorgraphdb.Domain, bool) {
 	if snap.Domains == nil {
-		return vectorgraphdb.DomainCode
+		return vectorgraphdb.DomainCode, false
 	}
 	domain, ok := snap.Domains[id]
 	if !ok {
-		return vectorgraphdb.DomainCode
+		return vectorgraphdb.DomainCode, false
 	}
-	return domain
+	return domain, true
 }
 
 // getNodeType returns the node type for a node ID, or default if not found.
