@@ -557,7 +557,10 @@ func (e *InferenceEngine) GetDerivedEdges(ctx context.Context, nodeID string) ([
 	// Filter edges connected to the node
 	var edges []Edge
 	for _, record := range records {
-		edge := parseEdgeKey(record.EdgeKey)
+		edge, err := ParseEdgeKey(record.EdgeKey)
+		if err != nil {
+			return nil, fmt.Errorf("parse edge key for record %d: %w", record.ID, err)
+		}
 		if edge.Source == nodeID || edge.Target == nodeID {
 			edges = append(edges, edge)
 		}
@@ -566,18 +569,40 @@ func (e *InferenceEngine) GetDerivedEdges(ctx context.Context, nodeID string) ([
 	return edges, nil
 }
 
-// parseEdgeKey converts an edge key (source|predicate|target) back to an Edge.
-func parseEdgeKey(key string) Edge {
-	// Split by pipe character
+// ErrInvalidEdgeKey is returned when an edge key cannot be parsed.
+var ErrInvalidEdgeKey = errors.New("invalid edge key")
+
+// ParseEdgeKey converts an edge key (source|predicate|target) back to an Edge.
+// Returns an error if the key is empty, malformed, or has missing required fields.
+// Edge keys must have exactly 3 pipe-delimited parts with a non-empty predicate.
+func ParseEdgeKey(key string) (Edge, error) {
+	if key == "" {
+		return Edge{}, fmt.Errorf("%w: empty key", ErrInvalidEdgeKey)
+	}
+
 	parts := splitEdgeKey(key)
 	if len(parts) != 3 {
-		return Edge{}
+		return Edge{}, fmt.Errorf("%w: expected 3 parts (source|predicate|target), got %d in key %q", ErrInvalidEdgeKey, len(parts), key)
 	}
+
+	// Predicate must not be empty
+	if parts[1] == "" {
+		return Edge{}, fmt.Errorf("%w: predicate cannot be empty in key %q", ErrInvalidEdgeKey, key)
+	}
+
 	return Edge{
 		Source:    parts[0],
 		Predicate: parts[1],
 		Target:    parts[2],
-	}
+	}, nil
+}
+
+// parseEdgeKey converts an edge key to an Edge, returning empty Edge on error.
+// This is for internal use where errors are logged but not propagated.
+// Prefer ParseEdgeKey for new code that can handle errors.
+func parseEdgeKey(key string) Edge {
+	edge, _ := ParseEdgeKey(key)
+	return edge
 }
 
 // splitEdgeKey splits an edge key by the pipe delimiter.
@@ -617,15 +642,14 @@ func (e *InferenceEngine) GetProvenance(ctx context.Context, edgeKey string) (*I
 			}
 
 			// Convert record to InferenceResult
-			edge := parseEdgeKey(record.EdgeKey)
-			evidence := make([]EvidenceEdge, len(record.Evidence))
-			for i, evKey := range record.Evidence {
-				evEdge := parseEdgeKey(evKey)
-				evidence[i] = EvidenceEdge{
-					SourceID: evEdge.Source,
-					EdgeType: evEdge.Predicate,
-					TargetID: evEdge.Target,
-				}
+			edge, err := ParseEdgeKey(record.EdgeKey)
+			if err != nil {
+				return nil, fmt.Errorf("parse edge key: %w", err)
+			}
+
+			evidence, err := parseEvidenceKeys(record.Evidence)
+			if err != nil {
+				return nil, fmt.Errorf("parse evidence: %w", err)
 			}
 
 			result := &InferenceResult{
@@ -649,6 +673,24 @@ func (e *InferenceEngine) GetProvenance(ctx context.Context, edgeKey string) (*I
 	}
 
 	return nil, nil // Edge not found
+}
+
+// parseEvidenceKeys converts a slice of edge keys to EvidenceEdge slice.
+// Returns an error if any key is malformed.
+func parseEvidenceKeys(keys []string) ([]EvidenceEdge, error) {
+	evidence := make([]EvidenceEdge, len(keys))
+	for i, evKey := range keys {
+		evEdge, err := ParseEdgeKey(evKey)
+		if err != nil {
+			return nil, fmt.Errorf("evidence key %d: %w", i, err)
+		}
+		evidence[i] = EvidenceEdge{
+			SourceID: evEdge.Source,
+			EdgeType: evEdge.Predicate,
+			TargetID: evEdge.Target,
+		}
+	}
+	return evidence, nil
 }
 
 // Stats returns statistics about the inference engine.

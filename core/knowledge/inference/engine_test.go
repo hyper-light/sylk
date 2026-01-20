@@ -3,6 +3,7 @@ package inference
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -1003,6 +1004,255 @@ func TestParseEdgeKey(t *testing.T) {
 		if result != tc.expected {
 			t.Errorf("parseEdgeKey(%s) = %v, want %v", tc.key, result, tc.expected)
 		}
+	}
+}
+
+// =============================================================================
+// ParseEdgeKey Validation Tests (W4P.27)
+// =============================================================================
+
+func TestParseEdgeKey_ValidKeys(t *testing.T) {
+	testCases := []struct {
+		name     string
+		key      string
+		expected Edge
+	}{
+		{
+			name:     "simple valid key",
+			key:      "A|calls|B",
+			expected: Edge{Source: "A", Predicate: "calls", Target: "B"},
+		},
+		{
+			name:     "path-like source and target",
+			key:      "pkg/foo|imports|pkg/bar",
+			expected: Edge{Source: "pkg/foo", Predicate: "imports", Target: "pkg/bar"},
+		},
+		{
+			name:     "empty source allowed",
+			key:      "|predicate|target",
+			expected: Edge{Source: "", Predicate: "predicate", Target: "target"},
+		},
+		{
+			name:     "empty target allowed",
+			key:      "source|predicate|",
+			expected: Edge{Source: "source", Predicate: "predicate", Target: ""},
+		},
+		{
+			name:     "empty source and target allowed",
+			key:      "|predicate|",
+			expected: Edge{Source: "", Predicate: "predicate", Target: ""},
+		},
+		{
+			name:     "special characters in source",
+			key:      "node:123|calls|node:456",
+			expected: Edge{Source: "node:123", Predicate: "calls", Target: "node:456"},
+		},
+		{
+			name:     "hyphen in predicate",
+			key:      "A|depends-on|B",
+			expected: Edge{Source: "A", Predicate: "depends-on", Target: "B"},
+		},
+		{
+			name:     "underscore in predicate",
+			key:      "A|has_property|B",
+			expected: Edge{Source: "A", Predicate: "has_property", Target: "B"},
+		},
+		{
+			name:     "unicode characters",
+			key:      "NodeA|relacionado|NodoB",
+			expected: Edge{Source: "NodeA", Predicate: "relacionado", Target: "NodoB"},
+		},
+		{
+			name:     "dots in values",
+			key:      "pkg.foo|imports|pkg.bar",
+			expected: Edge{Source: "pkg.foo", Predicate: "imports", Target: "pkg.bar"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := ParseEdgeKey(tc.key)
+			if err != nil {
+				t.Errorf("ParseEdgeKey(%q) returned unexpected error: %v", tc.key, err)
+				return
+			}
+			if result != tc.expected {
+				t.Errorf("ParseEdgeKey(%q) = %v, want %v", tc.key, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestParseEdgeKey_InvalidKeys(t *testing.T) {
+	testCases := []struct {
+		name        string
+		key         string
+		errContains string
+	}{
+		{
+			name:        "empty string",
+			key:         "",
+			errContains: "empty key",
+		},
+		{
+			name:        "single part no pipes",
+			key:         "nodatahere",
+			errContains: "expected 3 parts",
+		},
+		{
+			name:        "two parts only",
+			key:         "source|target",
+			errContains: "expected 3 parts",
+		},
+		{
+			name:        "four parts too many",
+			key:         "a|b|c|d",
+			errContains: "expected 3 parts",
+		},
+		{
+			name:        "empty predicate",
+			key:         "source||target",
+			errContains: "predicate cannot be empty",
+		},
+		{
+			name:        "empty predicate with empty source",
+			key:         "||target",
+			errContains: "predicate cannot be empty",
+		},
+		{
+			name:        "all empty parts",
+			key:         "||",
+			errContains: "predicate cannot be empty",
+		},
+		{
+			name:        "five pipes too many parts",
+			key:         "a|b|c|d|e|f",
+			errContains: "expected 3 parts",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := ParseEdgeKey(tc.key)
+			if err == nil {
+				t.Errorf("ParseEdgeKey(%q) expected error containing %q, got nil (result: %v)",
+					tc.key, tc.errContains, result)
+				return
+			}
+			if !errors.Is(err, ErrInvalidEdgeKey) {
+				t.Errorf("ParseEdgeKey(%q) error should wrap ErrInvalidEdgeKey, got: %v", tc.key, err)
+			}
+			if !containsString(err.Error(), tc.errContains) {
+				t.Errorf("ParseEdgeKey(%q) error %q should contain %q", tc.key, err.Error(), tc.errContains)
+			}
+		})
+	}
+}
+
+func TestParseEdgeKey_ErrorMessages(t *testing.T) {
+	// Verify error messages include the invalid key for debugging
+	testCases := []struct {
+		key         string
+		errContains []string
+	}{
+		{
+			key:         "badkey",
+			errContains: []string{"badkey", "expected 3 parts", "got 1"},
+		},
+		{
+			key:         "a|b",
+			errContains: []string{"a|b", "expected 3 parts", "got 2"},
+		},
+		{
+			key:         "a||b",
+			errContains: []string{"a||b", "predicate cannot be empty"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.key, func(t *testing.T) {
+			_, err := ParseEdgeKey(tc.key)
+			if err == nil {
+				t.Fatalf("ParseEdgeKey(%q) expected error, got nil", tc.key)
+			}
+			errStr := err.Error()
+			for _, want := range tc.errContains {
+				if !containsString(errStr, want) {
+					t.Errorf("error %q should contain %q", errStr, want)
+				}
+			}
+		})
+	}
+}
+
+// containsString checks if s contains substr (case-sensitive).
+func containsString(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr) >= 0))
+}
+
+// findSubstring returns the index of substr in s, or -1 if not found.
+func findSubstring(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestParseEvidenceKeys_Valid(t *testing.T) {
+	keys := []string{
+		"A|calls|B",
+		"B|imports|C",
+		"C|depends|D",
+	}
+
+	evidence, err := parseEvidenceKeys(keys)
+	if err != nil {
+		t.Fatalf("parseEvidenceKeys failed: %v", err)
+	}
+
+	if len(evidence) != 3 {
+		t.Fatalf("expected 3 evidence edges, got %d", len(evidence))
+	}
+
+	expected := []EvidenceEdge{
+		{SourceID: "A", EdgeType: "calls", TargetID: "B"},
+		{SourceID: "B", EdgeType: "imports", TargetID: "C"},
+		{SourceID: "C", EdgeType: "depends", TargetID: "D"},
+	}
+
+	for i, ev := range evidence {
+		if ev != expected[i] {
+			t.Errorf("evidence[%d] = %v, want %v", i, ev, expected[i])
+		}
+	}
+}
+
+func TestParseEvidenceKeys_Empty(t *testing.T) {
+	evidence, err := parseEvidenceKeys([]string{})
+	if err != nil {
+		t.Fatalf("parseEvidenceKeys failed: %v", err)
+	}
+	if len(evidence) != 0 {
+		t.Errorf("expected empty slice, got %d items", len(evidence))
+	}
+}
+
+func TestParseEvidenceKeys_InvalidKey(t *testing.T) {
+	keys := []string{
+		"A|calls|B",
+		"invalid_key", // Missing pipes
+		"C|depends|D",
+	}
+
+	_, err := parseEvidenceKeys(keys)
+	if err == nil {
+		t.Fatal("expected error for invalid evidence key")
+	}
+	if !containsString(err.Error(), "evidence key 1") {
+		t.Errorf("error should indicate which key failed: %v", err)
 	}
 }
 
