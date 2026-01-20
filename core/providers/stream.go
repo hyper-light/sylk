@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -184,6 +185,8 @@ func StreamWithCallback(
 	return collector.Response(), nil
 }
 
+// StreamToChannel converts a streaming provider into channels for chunks and errors.
+// Includes panic recovery to prevent crashes from propagating (W12.45 fix).
 func StreamToChannel(
 	ctx context.Context,
 	provider Provider,
@@ -193,8 +196,13 @@ func StreamToChannel(
 	errs := make(chan error, 1)
 
 	go func() {
+		// Note: defers execute in LIFO order
+		// 1. recoverStreamPanic runs first (sends error to errs channel)
+		// 2. close(errs) runs second
+		// 3. close(chunks) runs last
 		defer close(chunks)
 		defer close(errs)
+		defer recoverStreamPanic(errs)
 
 		if handlerProvider, ok := provider.(StreamHandlerProvider); ok {
 			err := handlerProvider.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
@@ -227,4 +235,17 @@ func StreamToChannel(
 	}()
 
 	return chunks, errs
+}
+
+// recoverStreamPanic recovers from panics in stream goroutines and sends an error.
+// This ensures that panics in streaming code don't crash the application (W12.45 fix).
+func recoverStreamPanic(errs chan<- error) {
+	if r := recover(); r != nil {
+		err := fmt.Errorf("panic in stream: %v", r)
+		select {
+		case errs <- err:
+		default:
+			// Error channel full or closed, panic was still recovered
+		}
+	}
 }

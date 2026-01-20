@@ -3,6 +3,7 @@ package providers_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -595,5 +596,122 @@ func TestStreamBridgeConfig_CustomValues(t *testing.T) {
 
 	if config.PublishTimeout != 10*time.Second {
 		t.Errorf("PublishTimeout = %v, want 10s", config.PublishTimeout)
+	}
+}
+
+// =============================================================================
+// W12.45 Panic Recovery Tests
+// =============================================================================
+
+// panicStreamProvider is a StreamProvider that panics during streaming.
+type panicStreamProvider struct {
+	panicMessage string
+}
+
+func (p *panicStreamProvider) Name() string {
+	return "panic-provider"
+}
+
+func (p *panicStreamProvider) SupportedModels() []providers.ModelInfo {
+	return nil
+}
+
+func (p *panicStreamProvider) Complete(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error) {
+	return nil, nil
+}
+
+func (p *panicStreamProvider) Stream(ctx context.Context, req *providers.CompletionRequest) (<-chan *providers.StreamChunk, error) {
+	panic(p.panicMessage)
+}
+
+func (p *panicStreamProvider) CountTokens(messages []providers.Message) (int, error) {
+	return 0, nil
+}
+
+func (p *panicStreamProvider) MaxContextTokens(model string) int {
+	return 0
+}
+
+func (p *panicStreamProvider) HealthCheck(ctx context.Context) error {
+	return nil
+}
+
+func (p *panicStreamProvider) StreamWithHandler(ctx context.Context, req *providers.StreamRequest, handler providers.StreamHandler) error {
+	panic(p.panicMessage)
+}
+
+// TestStreamBridge_PanicRecovery verifies that panics in stream handlers
+// are recovered and published as error chunks (W12.45 fix).
+func TestStreamBridge_PanicRecovery(t *testing.T) {
+	publisher := providermocks.NewMockStreamPublisher(t)
+	messages := capturePublishedMessages(publisher)
+	bridge := providers.NewStreamBridge(&streamPublisherAdapter{mock: publisher}, providers.DefaultStreamBridgeConfig())
+
+	panicProvider := &panicStreamProvider{panicMessage: "test panic"}
+	req := &providers.Request{}
+	streamCtx := providers.NewStreamContext("session-1", "panic", "panic-model", "agent-1")
+
+	// This should not panic the test
+	err := bridge.StartStream(context.Background(), panicProvider, req, streamCtx)
+	if err != nil {
+		t.Fatalf("StartStream failed: %v", err)
+	}
+
+	// Wait for the stream goroutine to process the panic
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify an error chunk was published
+	published := messages()
+	if len(published) != 1 {
+		t.Fatalf("expected 1 error message, got %d", len(published))
+	}
+
+	if published[0].Payload.Type != providers.ChunkTypeError {
+		t.Errorf("payload type = %q, want %q", published[0].Payload.Type, providers.ChunkTypeError)
+	}
+
+	// The panic is recovered by StreamToChannel and converted to an error
+	if !strings.Contains(published[0].Payload.Text, "panic in stream") {
+		t.Errorf("error text should contain 'panic in stream', got %q", published[0].Payload.Text)
+	}
+
+	if !strings.Contains(published[0].Payload.Text, "test panic") {
+		t.Errorf("error text should contain panic message 'test panic', got %q", published[0].Payload.Text)
+	}
+
+	// Verify stream was untracked
+	if len(bridge.GetActiveStreams()) != 0 {
+		t.Error("stream should be untracked after panic recovery")
+	}
+}
+
+// TestStreamBridge_PanicRecovery_Concurrent verifies panic recovery
+// works correctly under concurrent stream operations.
+func TestStreamBridge_PanicRecovery_Concurrent(t *testing.T) {
+	publisher := providermocks.NewMockStreamPublisher(t)
+	allowPublish(publisher)
+	bridge := providers.NewStreamBridge(&streamPublisherAdapter{mock: publisher}, providers.DefaultStreamBridgeConfig())
+
+	var wg sync.WaitGroup
+	streamCount := 10
+
+	for i := 0; i < streamCount; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			panicProvider := &panicStreamProvider{
+				panicMessage: "concurrent panic " + string(rune('0'+n)),
+			}
+			streamCtx := providers.NewStreamContext("session", "panic", "model", "agent")
+			_ = bridge.StartStream(context.Background(), panicProvider, &providers.Request{}, streamCtx)
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(200 * time.Millisecond)
+
+	// All streams should be untracked after panic recovery
+	if len(bridge.GetActiveStreams()) != 0 {
+		t.Errorf("expected 0 active streams after panic recovery, got %d", len(bridge.GetActiveStreams()))
 	}
 }

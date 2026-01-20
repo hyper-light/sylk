@@ -2,6 +2,8 @@ package providers
 
 import (
 	"context"
+	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -74,6 +76,7 @@ func (b *StreamBridge) StartStream(
 }
 
 // runStreamLoop reads chunks from the provider and publishes them.
+// Includes panic recovery to prevent crashes from propagating (W12.45 fix).
 func (b *StreamBridge) runStreamLoop(
 	ctx context.Context,
 	provider StreamProvider,
@@ -81,10 +84,27 @@ func (b *StreamBridge) runStreamLoop(
 	streamCtx *StreamContext,
 ) {
 	defer b.untrackStream(streamCtx.CorrelationID)
+	defer b.recoverAndPublishError(streamCtx)
 
 	chunks, errs := StreamToChannel(ctx, provider, req)
 
 	b.processChunks(ctx, chunks, errs, streamCtx)
+}
+
+// recoverAndPublishError recovers from panics and publishes an error chunk.
+// This ensures that panics in handlers don't crash the entire application (W12.45 fix).
+func (b *StreamBridge) recoverAndPublishError(streamCtx *StreamContext) {
+	if r := recover(); r != nil {
+		err := fmt.Errorf("panic in stream handler: %v\n%s", r, captureStackTrace())
+		b.publishErrorChunk(err, streamCtx)
+	}
+}
+
+// captureStackTrace captures the current stack trace for panic reporting.
+func captureStackTrace() string {
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	return string(buf[:n])
 }
 
 // processChunks handles the chunk and error channels from streaming.
