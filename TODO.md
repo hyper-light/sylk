@@ -37350,7 +37350,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ │   FIX: Use sync.Map or lock entire operation                                    ││
 │ │   SEVERITY: HIGH - Race condition                                               ││
 │ │                                                                                  ││
-│ │ [ ] W12.28 - ResponseStream Buffer Overflow                                     ││
+│ │ [x] W12.28 - ResponseStream Buffer Overflow                                     ││
 │ │   FILE: agents/guide/response_stream.go:156-178                                 ││
 │ │   ISSUE: Unbounded buffering can cause OOM on slow consumers                    ││
 │ │   FIX: Add buffer limits with backpressure                                      ││
@@ -37361,7 +37361,7 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1B - SESSION & STATE MANAGEMENT (3 HIGH)                                  ││
 │ │                                                                                  ││
-│ │ [ ] W12.29 - Registry Unhandled Database Errors                                 ││
+│ │ [x] W12.29 - Registry Unhandled Database Errors                                 ││
 │ │   FILE: core/session/registry.go:430,479                                        ││
 │ │   ISSUE: Database errors logged but not returned to caller                      ││
 │ │   FIX: Return errors and let caller decide handling                             ││
