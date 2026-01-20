@@ -460,3 +460,134 @@ func TestStreamManager_CleanupIdle(t *testing.T) {
 	assert.Equal(t, 1, closed)
 	assert.Nil(t, sm.GetStream("corr-idle"))
 }
+
+// =============================================================================
+// W12.28 - Backpressure Tests
+// =============================================================================
+
+func TestResponseStream_Backpressure_WithTimeout(t *testing.T) {
+	// W12.28: Test that backpressure timeout allows buffer to drain
+	sm := guide.NewStreamManager(guide.StreamConfig{
+		MaxBufferSize:        2,
+		StreamTimeout:        5 * time.Minute,
+		HeartbeatInterval:    30 * time.Second,
+		MaxStreamsPerSession: 50,
+		BackpressureTimeout:  50 * time.Millisecond,
+	})
+	stream, err := sm.CreateStream("corr-backpressure", "sess-1")
+	require.NoError(t, err)
+
+	// Start consumer that drains slowly
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range stream.Events() {
+			time.Sleep(5 * time.Millisecond) // Slow consumer
+		}
+	}()
+
+	// Send multiple events - backpressure should allow some to succeed
+	successCount := 0
+	for i := 0; i < 10; i++ {
+		if stream.SendText("msg") {
+			successCount++
+		}
+	}
+
+	stream.Close()
+	<-done
+
+	// Should have succeeded in sending some messages due to backpressure
+	assert.Greater(t, successCount, 0, "backpressure should allow some sends to succeed")
+}
+
+func TestResponseStream_Backpressure_NoTimeout(t *testing.T) {
+	// W12.28: Test that zero backpressure timeout returns immediately on full buffer
+	sm := guide.NewStreamManager(guide.StreamConfig{
+		MaxBufferSize:        1,
+		StreamTimeout:        5 * time.Minute,
+		HeartbeatInterval:    30 * time.Second,
+		MaxStreamsPerSession: 50,
+		BackpressureTimeout:  0, // No backpressure
+	})
+	stream, err := sm.CreateStream("corr-no-backpressure", "sess-1")
+	require.NoError(t, err)
+
+	// Fill buffer (start event already in buffer)
+	// Next send should fail immediately with no wait
+	start := time.Now()
+	result := stream.SendText("overflow")
+	elapsed := time.Since(start)
+
+	// Should fail quickly (no backpressure delay)
+	assert.False(t, result, "send should fail when buffer full with no backpressure")
+	assert.Less(t, elapsed, 10*time.Millisecond, "should return immediately without delay")
+
+	stream.Close()
+}
+
+func TestResponseStream_Backpressure_SlowConsumer(t *testing.T) {
+	// W12.28: Test that slow consumer doesn't cause OOM - sends eventually fail
+	sm := guide.NewStreamManager(guide.StreamConfig{
+		MaxBufferSize:        3,
+		StreamTimeout:        5 * time.Minute,
+		HeartbeatInterval:    30 * time.Second,
+		MaxStreamsPerSession: 50,
+		BackpressureTimeout:  10 * time.Millisecond, // Short timeout
+	})
+	stream, err := sm.CreateStream("corr-slow-consumer", "sess-1")
+	require.NoError(t, err)
+
+	// No consumer - buffer will fill up
+	failCount := 0
+	for i := 0; i < 20; i++ {
+		if !stream.SendText("msg") {
+			failCount++
+		}
+	}
+
+	// Should have failures due to buffer full + timeout
+	assert.Greater(t, failCount, 0, "sends should fail when buffer full and timeout expires")
+
+	stream.Close()
+}
+
+func TestResponseStream_Backpressure_Concurrent(t *testing.T) {
+	// W12.28: Test concurrent sends with backpressure don't cause races
+	sm := guide.NewStreamManager(guide.StreamConfig{
+		MaxBufferSize:        5,
+		StreamTimeout:        5 * time.Minute,
+		HeartbeatInterval:    30 * time.Second,
+		MaxStreamsPerSession: 50,
+		BackpressureTimeout:  20 * time.Millisecond,
+	})
+	stream, err := sm.CreateStream("corr-concurrent-backpressure", "sess-1")
+	require.NoError(t, err)
+
+	// Start consumer
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range stream.Events() {
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	// Concurrent senders
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				stream.SendText("concurrent")
+			}
+		}()
+	}
+
+	wg.Wait()
+	stream.Close()
+	<-done
+
+	assert.True(t, stream.IsClosed())
+}
