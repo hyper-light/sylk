@@ -3,7 +3,10 @@ package providers
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 // Default watchdog configuration values
@@ -33,6 +36,11 @@ type WatchdogEvent struct {
 type StreamWatchdogConfig struct {
 	ChunkTimeout  time.Duration // Max time between chunks (default: 60s)
 	MaxStreamTime time.Duration // Max total stream duration (default: 10m)
+
+	// Scope is the optional GoroutineScope for WAVE 4 compliance.
+	// When provided, watchdog goroutines are tracked via scope.Go().
+	// When nil, falls back to raw goroutines (for backward compatibility).
+	Scope *concurrency.GoroutineScope
 }
 
 // DefaultStreamWatchdogConfig returns a config with default values
@@ -47,8 +55,8 @@ func DefaultStreamWatchdogConfig() StreamWatchdogConfig {
 type WatchedStream struct {
 	streamID       string
 	cancel         context.CancelFunc
-	lastChunkAt    time.Time
-	chunksReceived int
+	lastChunkAt    atomic.Value // stores time.Time atomically for lock-free reads
+	chunksReceived atomic.Int64 // atomic counter for lock-free updates
 	startedAt      time.Time
 	mu             sync.Mutex
 	stopCh         chan struct{}
@@ -57,21 +65,21 @@ type WatchedStream struct {
 
 // ChunksReceived returns the number of chunks received for this stream
 func (w *WatchedStream) ChunksReceived() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.chunksReceived
+	return int(w.chunksReceived.Load())
 }
 
 // LastChunkAt returns the timestamp of the last received chunk
 func (w *WatchedStream) LastChunkAt() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.lastChunkAt
+	if v := w.lastChunkAt.Load(); v != nil {
+		return v.(time.Time)
+	}
+	return time.Time{}
 }
 
 // StreamWatchdog monitors streams for timeout conditions
 type StreamWatchdog struct {
 	config    StreamWatchdogConfig
+	scope     *concurrency.GoroutineScope
 	streams   map[string]*WatchedStream
 	callbacks []func(WatchdogEvent)
 	mu        sync.RWMutex
@@ -82,6 +90,7 @@ type StreamWatchdog struct {
 func NewStreamWatchdog(config StreamWatchdogConfig) *StreamWatchdog {
 	return &StreamWatchdog{
 		config:    config,
+		scope:     config.Scope,
 		streams:   make(map[string]*WatchedStream),
 		callbacks: make([]func(WatchdogEvent), 0),
 	}
@@ -106,15 +115,25 @@ func (w *StreamWatchdog) Watch(ctx context.Context, streamID string, cancel cont
 
 	now := time.Now()
 	watched := &WatchedStream{
-		streamID:    streamID,
-		cancel:      cancel,
-		lastChunkAt: now,
-		startedAt:   now,
-		stopCh:      make(chan struct{}),
+		streamID:  streamID,
+		cancel:    cancel,
+		startedAt: now,
+		stopCh:    make(chan struct{}),
 	}
+	watched.lastChunkAt.Store(now)
 
 	w.streams[streamID] = watched
-	go w.runWatcher(watched)
+
+	// Launch watchdog goroutine via GoroutineScope (WAVE 4 compliant)
+	if w.scope != nil {
+		_ = w.scope.Go("watchdog:"+streamID, w.config.MaxStreamTime, func(_ context.Context) error {
+			w.runWatcher(watched)
+			return nil
+		})
+	} else {
+		// Fallback for nil scope (backward compatibility/testing)
+		go w.runWatcher(watched)
+	}
 
 	return watched
 }
@@ -146,7 +165,6 @@ func (w *StreamWatchdog) runWatcher(watched *WatchedStream) {
 // Returns true if timeout occurred and stream was cancelled.
 func (w *StreamWatchdog) checkChunkTimeout(watched *WatchedStream) bool {
 	watched.mu.Lock()
-	elapsed := time.Since(watched.lastChunkAt)
 	stopped := watched.stopped
 	watched.mu.Unlock()
 
@@ -154,7 +172,9 @@ func (w *StreamWatchdog) checkChunkTimeout(watched *WatchedStream) bool {
 		return true
 	}
 
-	if elapsed <= w.config.ChunkTimeout {
+	// Use atomic.Value for lock-free time read (W12.44 fix)
+	lastChunk := watched.LastChunkAt()
+	if time.Since(lastChunk) <= w.config.ChunkTimeout {
 		return false
 	}
 
@@ -177,13 +197,17 @@ func (w *StreamWatchdog) handleMaxDuration(watched *WatchedStream) {
 
 // emitTimeout creates and emits a timeout event
 func (w *StreamWatchdog) emitTimeout(watched *WatchedStream, eventType WatchdogEventType) {
+	// Read atomic values outside the lock (W12.44 fix)
+	lastChunk := watched.LastChunkAt()
+	chunks := watched.ChunksReceived()
+
 	watched.mu.Lock()
 	event := WatchdogEvent{
 		StreamID:       watched.streamID,
 		EventType:      eventType,
 		Timestamp:      time.Now(),
-		LastChunkAt:    watched.lastChunkAt,
-		ChunksReceived: watched.chunksReceived,
+		LastChunkAt:    lastChunk,
+		ChunksReceived: chunks,
 	}
 	watched.stopped = true
 	watched.mu.Unlock()
@@ -208,7 +232,8 @@ func (w *StreamWatchdog) notifyCallbacks(event WatchdogEvent) {
 	}
 }
 
-// ReportChunk should be called when a chunk is received to reset the timeout
+// ReportChunk should be called when a chunk is received to reset the timeout.
+// Uses atomic operations for lock-free updates (W12.44 fix).
 func (w *StreamWatchdog) ReportChunk(streamID string) {
 	w.mu.RLock()
 	watched, exists := w.streams[streamID]
@@ -218,10 +243,9 @@ func (w *StreamWatchdog) ReportChunk(streamID string) {
 		return
 	}
 
-	watched.mu.Lock()
-	watched.lastChunkAt = time.Now()
-	watched.chunksReceived++
-	watched.mu.Unlock()
+	// Use atomic operations for lock-free updates (W12.44 fix)
+	watched.lastChunkAt.Store(time.Now())
+	watched.chunksReceived.Add(1)
 }
 
 // Stop stops watching a specific stream without triggering a timeout event

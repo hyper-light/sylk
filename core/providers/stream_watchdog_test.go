@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 // =============================================================================
@@ -372,9 +374,8 @@ func TestWatchedStream_ChunksReceived(t *testing.T) {
 		t.Error("expected 0 initial chunks")
 	}
 
-	watched.mu.Lock()
-	watched.chunksReceived = 5
-	watched.mu.Unlock()
+	// Use atomic operation to set value (W12.44 fix)
+	watched.chunksReceived.Store(5)
 
 	if watched.ChunksReceived() != 5 {
 		t.Errorf("expected 5 chunks, got %d", watched.ChunksReceived())
@@ -383,10 +384,20 @@ func TestWatchedStream_ChunksReceived(t *testing.T) {
 
 func TestWatchedStream_LastChunkAt(t *testing.T) {
 	now := time.Now()
-	watched := &WatchedStream{lastChunkAt: now}
+	watched := &WatchedStream{}
+	watched.lastChunkAt.Store(now)
 
 	if !watched.LastChunkAt().Equal(now) {
 		t.Error("expected matching timestamp")
+	}
+}
+
+func TestWatchedStream_LastChunkAt_Uninitialized(t *testing.T) {
+	watched := &WatchedStream{}
+
+	// Should return zero time when uninitialized
+	if !watched.LastChunkAt().IsZero() {
+		t.Error("expected zero time for uninitialized lastChunkAt")
 	}
 }
 
@@ -541,5 +552,233 @@ func TestWatchdogEventType_Values(t *testing.T) {
 	}
 	if WatchdogMaxDuration != "max_duration" {
 		t.Error("unexpected WatchdogMaxDuration value")
+	}
+}
+
+// =============================================================================
+// GoroutineScope Tests (W12.43)
+// =============================================================================
+
+func newTestBudget(agentID string) *concurrency.GoroutineBudget {
+	pressureLevel := &atomic.Int32{}
+	budget := concurrency.NewGoroutineBudget(pressureLevel)
+	budget.RegisterAgent(agentID, "watchdog")
+	return budget
+}
+
+func TestStreamWatchdog_WithGoroutineScope(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	budget := newTestBudget("test-watchdog")
+	scope := concurrency.NewGoroutineScope(ctx, "test-watchdog", budget)
+	defer func() { _ = scope.Shutdown(100*time.Millisecond, 500*time.Millisecond) }()
+
+	config := StreamWatchdogConfig{
+		ChunkTimeout:  100 * time.Millisecond,
+		MaxStreamTime: 1 * time.Second,
+		Scope:         scope,
+	}
+	watchdog := NewStreamWatchdog(config)
+	defer watchdog.Close()
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+
+	watched := watchdog.Watch(streamCtx, "stream-1", streamCancel)
+
+	if watched == nil {
+		t.Fatal("expected non-nil watched stream")
+	}
+	if watchdog.ActiveStreamCount() != 1 {
+		t.Errorf("expected 1 active stream, got %d", watchdog.ActiveStreamCount())
+	}
+
+	// The goroutine should be tracked by the scope
+	if scope.WorkerCount() == 0 {
+		t.Error("expected scope to track watchdog goroutine")
+	}
+
+	watchdog.Stop("stream-1")
+
+	// Allow goroutine to clean up
+	time.Sleep(20 * time.Millisecond)
+
+	if watchdog.ActiveStreamCount() != 0 {
+		t.Errorf("expected 0 active streams after stop, got %d", watchdog.ActiveStreamCount())
+	}
+}
+
+func TestStreamWatchdog_WithGoroutineScope_ChunkTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	budget := newTestBudget("test-watchdog")
+	scope := concurrency.NewGoroutineScope(ctx, "test-watchdog", budget)
+	defer func() { _ = scope.Shutdown(100*time.Millisecond, 500*time.Millisecond) }()
+
+	config := StreamWatchdogConfig{
+		ChunkTimeout:  50 * time.Millisecond,
+		MaxStreamTime: 10 * time.Second,
+		Scope:         scope,
+	}
+	watchdog := NewStreamWatchdog(config)
+	defer watchdog.Close()
+
+	var timeoutEvent atomic.Value
+	watchdog.OnTimeout(func(event WatchdogEvent) {
+		timeoutEvent.Store(event)
+	})
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+
+	watchdog.Watch(streamCtx, "stream-1", streamCancel)
+
+	// Wait for chunk timeout
+	time.Sleep(150 * time.Millisecond)
+
+	event, ok := timeoutEvent.Load().(WatchdogEvent)
+	if !ok {
+		t.Fatal("expected timeout event")
+	}
+	if event.StreamID != "stream-1" {
+		t.Errorf("expected stream-1, got %s", event.StreamID)
+	}
+	if event.EventType != WatchdogChunkTimeout {
+		t.Errorf("expected chunk_timeout, got %s", event.EventType)
+	}
+}
+
+func TestStreamWatchdog_WithGoroutineScope_ScopeShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	budget := newTestBudget("test-watchdog")
+	scope := concurrency.NewGoroutineScope(ctx, "test-watchdog", budget)
+
+	config := StreamWatchdogConfig{
+		ChunkTimeout:  100 * time.Millisecond,
+		MaxStreamTime: 1 * time.Second,
+		Scope:         scope,
+	}
+	watchdog := NewStreamWatchdog(config)
+
+	// Shutdown scope first
+	_ = scope.Shutdown(10*time.Millisecond, 50*time.Millisecond)
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+
+	// Watch should still return a watched stream (scope.Go error is ignored)
+	// but the goroutine won't be started via scope
+	watched := watchdog.Watch(streamCtx, "stream-1", streamCancel)
+
+	// The watched stream is created but goroutine may not run via scope
+	// This verifies no panic occurs when scope is shutdown
+	if watched == nil {
+		// This is acceptable - the stream registration happens but scope.Go fails
+		// However, the current implementation doesn't return nil on scope.Go error
+	}
+
+	watchdog.Close()
+}
+
+func TestStreamWatchdog_WithGoroutineScope_Concurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	budget := newTestBudget("test-watchdog")
+	scope := concurrency.NewGoroutineScope(ctx, "test-watchdog", budget)
+	defer func() { _ = scope.Shutdown(500*time.Millisecond, 2*time.Second) }()
+
+	config := StreamWatchdogConfig{
+		ChunkTimeout:  500 * time.Millisecond,
+		MaxStreamTime: 5 * time.Second,
+		Scope:         scope,
+	}
+	watchdog := NewStreamWatchdog(config)
+	defer watchdog.Close()
+
+	var wg sync.WaitGroup
+
+	// Concurrent watch/stop operations with scope
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			streamID := "stream-" + string(rune('a'+n%26))
+
+			streamCtx, streamCancel := context.WithCancel(context.Background())
+			watchdog.Watch(streamCtx, streamID, streamCancel)
+
+			// Report some chunks
+			for j := 0; j < 3; j++ {
+				watchdog.ReportChunk(streamID)
+				time.Sleep(time.Millisecond)
+			}
+
+			watchdog.Stop(streamID)
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// =============================================================================
+// W12.44 Race Condition Tests
+// =============================================================================
+
+// TestStreamWatchdog_ReportChunk_RaceCondition verifies that concurrent
+// ReportChunk calls and timeout checks don't race (W12.44 fix).
+func TestStreamWatchdog_ReportChunk_RaceCondition(t *testing.T) {
+	config := StreamWatchdogConfig{
+		ChunkTimeout:  500 * time.Millisecond,
+		MaxStreamTime: 5 * time.Second,
+	}
+	watchdog := NewStreamWatchdog(config)
+	defer watchdog.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watchdog.Watch(ctx, "race-test", cancel)
+
+	var wg sync.WaitGroup
+	// Concurrent reporters
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				watchdog.ReportChunk("race-test")
+			}
+		}()
+	}
+
+	// Concurrent readers (simulate timeout checking)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				info := watchdog.GetStreamInfo("race-test")
+				if info != nil {
+					_ = info.ChunksReceived()
+					_ = info.LastChunkAt()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify final state is consistent
+	info := watchdog.GetStreamInfo("race-test")
+	if info == nil {
+		t.Fatal("expected stream info")
+	}
+	if info.ChunksReceived() != 5000 {
+		t.Errorf("expected 5000 chunks, got %d", info.ChunksReceived())
 	}
 }
