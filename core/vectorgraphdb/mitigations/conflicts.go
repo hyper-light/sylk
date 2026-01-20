@@ -440,24 +440,48 @@ func (d *ConflictDetector) checkAgainstRemaining(nodes []*vectorgraphdb.GraphNod
 
 // AutoResolve attempts automatic resolution for clear cases.
 func (d *ConflictDetector) AutoResolve(conflictID string) (bool, error) {
-	d.conflictsMu.Lock()
-	conflict, ok := d.conflicts[conflictID]
-	d.conflictsMu.Unlock()
-
-	if !ok {
-		return false, fmt.Errorf("conflict not found: %s", conflictID)
+	// Extract conflict data under read lock to avoid race conditions
+	conflictData, err := d.getConflictForAutoResolve(conflictID)
+	if err != nil {
+		return false, err
+	}
+	if conflictData == nil {
+		return false, nil // Already resolved
 	}
 
-	if conflict.Resolution != nil {
-		return false, nil
-	}
-
-	resolution, canResolve := d.determineAutoResolution(conflict)
+	resolution, canResolve := d.determineAutoResolution(conflictData)
 	if !canResolve {
 		return false, nil
 	}
 
 	return true, d.Resolve(conflictID, resolution)
+}
+
+// getConflictForAutoResolve returns conflict data if eligible for auto-resolution.
+// Returns nil, nil if conflict is already resolved.
+func (d *ConflictDetector) getConflictForAutoResolve(conflictID string) (*Conflict, error) {
+	d.conflictsMu.RLock()
+	defer d.conflictsMu.RUnlock()
+
+	conflict, ok := d.conflicts[conflictID]
+	if !ok {
+		return nil, fmt.Errorf("conflict not found: %s", conflictID)
+	}
+
+	if conflict.Resolution != nil {
+		return nil, nil
+	}
+
+	// Return a copy to avoid accessing shared data without lock
+	return &Conflict{
+		ID:           conflict.ID,
+		NodeAID:      conflict.NodeAID,
+		NodeBID:      conflict.NodeBID,
+		ConflictType: conflict.ConflictType,
+		Similarity:   conflict.Similarity,
+		Details:      conflict.Details,
+		DetectedAt:   conflict.DetectedAt,
+	}, nil
 }
 
 func (d *ConflictDetector) determineAutoResolution(conflict *Conflict) (Resolution, bool) {

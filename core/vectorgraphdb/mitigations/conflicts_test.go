@@ -247,3 +247,97 @@ func TestAbsTimeDiff(t *testing.T) {
 	assert.Equal(t, 1*time.Hour, absTimeDiff(earlier, now))
 	assert.Equal(t, 2*time.Hour, absTimeDiff(earlier, later))
 }
+
+func TestConflictDetector_AutoResolve_AlreadyResolved(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	detector := NewConflictDetector(db, nil, DefaultConflictDetectorConfig())
+
+	conflict := detector.createConflict("node-a", "node-b", ConflictTemporal, 0.9, "test")
+	detector.storeConflict(conflict)
+
+	// Resolve it first
+	err := detector.Resolve(conflict.ID, ResolutionKeepNewer)
+	require.NoError(t, err)
+
+	// Try to auto-resolve already resolved conflict
+	resolved, err := detector.AutoResolve(conflict.ID)
+
+	require.NoError(t, err)
+	assert.False(t, resolved)
+}
+
+func TestConflictDetector_AutoResolve_Concurrent(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	detector := NewConflictDetector(db, nil, DefaultConflictDetectorConfig())
+
+	// Create multiple conflicts
+	conflicts := make([]*Conflict, 10)
+	for i := 0; i < 10; i++ {
+		conflict := detector.createConflict(
+			"node-a-"+string(rune('0'+i)),
+			"node-b-"+string(rune('0'+i)),
+			ConflictTemporal,
+			0.9,
+			"test conflict",
+		)
+		detector.storeConflict(conflict)
+		conflicts[i] = conflict
+	}
+
+	// Concurrent reads and auto-resolve attempts
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			detector.GetActiveConflicts(10)
+		}
+	}()
+
+	for _, c := range conflicts {
+		_, _ = detector.AutoResolve(c.ID)
+	}
+
+	<-done
+}
+
+func TestConflictDetector_getConflictForAutoResolve(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	detector := NewConflictDetector(db, nil, DefaultConflictDetectorConfig())
+
+	conflict := detector.createConflict("node-a", "node-b", ConflictSemantic, 0.95, "test")
+	detector.storeConflict(conflict)
+
+	// Get unresolved conflict
+	got, err := detector.getConflictForAutoResolve(conflict.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, conflict.ID, got.ID)
+	assert.Equal(t, conflict.NodeAID, got.NodeAID)
+	assert.Equal(t, conflict.NodeBID, got.NodeBID)
+
+	// Resolve and try again
+	err = detector.Resolve(conflict.ID, ResolutionKeepNewer)
+	require.NoError(t, err)
+
+	got, err = detector.getConflictForAutoResolve(conflict.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestConflictDetector_getConflictForAutoResolve_NotFound(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	detector := NewConflictDetector(db, nil, DefaultConflictDetectorConfig())
+
+	_, err := detector.getConflictForAutoResolve("nonexistent")
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
