@@ -85,8 +85,14 @@ type HotCache struct {
 	// stopCh signals the eviction goroutine to stop
 	stopCh chan struct{}
 
+	// wg tracks the eviction goroutine for graceful shutdown
+	wg sync.WaitGroup
+
 	// asyncEviction enables async eviction mode (default: true)
 	asyncEviction bool
+
+	// closed indicates whether Close() has been called (atomic for safe checking)
+	closed atomic.Bool
 
 	// stats
 	hits      atomic.Int64
@@ -138,6 +144,7 @@ func NewHotCache(config HotCacheConfig) *HotCache {
 
 	// Start async eviction goroutine if enabled
 	if config.AsyncEviction {
+		c.wg.Add(1)
 		go c.evictionLoop()
 	}
 
@@ -153,6 +160,7 @@ func NewDefaultHotCache() *HotCache {
 
 // evictionLoop is the background goroutine that processes async eviction requests.
 func (c *HotCache) evictionLoop() {
+	defer c.wg.Done()
 	for {
 		select {
 		case <-c.stopCh:
@@ -212,9 +220,16 @@ func (c *HotCache) triggerAsyncEviction() {
 
 // Close stops the async eviction goroutine and cleans up resources.
 // After Close is called, the cache should not be used.
+// Close is safe to call multiple times; subsequent calls are no-ops.
 func (c *HotCache) Close() {
+	// Use atomic swap to ensure Close() is only executed once
+	if !c.closed.CompareAndSwap(false, true) {
+		return // Already closed
+	}
+
 	if c.asyncEviction {
 		close(c.stopCh)
+		c.wg.Wait()
 	}
 }
 
@@ -396,7 +411,13 @@ func (c *HotCache) DefaultMaxSize() int64 {
 // Add adds or updates an entry in the cache.
 // Uses batch eviction with minimal lock time when the cache exceeds max size.
 // In async eviction mode, eviction is triggered in a background goroutine.
+// Returns silently if the cache has been closed (W4N.8 thread-safety).
 func (c *HotCache) Add(id string, entry *ContentEntry) {
+	// Check closed flag first to prevent operations after Close() (W4N.8)
+	if c.closed.Load() {
+		return
+	}
+
 	if entry == nil {
 		return
 	}
