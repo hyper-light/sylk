@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -175,7 +176,11 @@ func NewObservationLog(ctx context.Context, config ObservationLogConfig) (*Obser
 }
 
 func openWALFile(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open WAL file %q: %w", path, err)
+	}
+	return file, nil
 }
 
 func (l *ObservationLog) loadSequence() error {

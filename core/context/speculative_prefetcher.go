@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -326,7 +327,7 @@ func (sp *SpeculativePrefetcher) executePrefetch(
 	defer sp.cleanup(hash)
 
 	if sp.searcher == nil {
-		future.complete(nil, errors.New("no searcher configured"))
+		future.complete(nil, fmt.Errorf("speculative prefetch failed for query hash %s: no searcher configured", hash))
 		return
 	}
 

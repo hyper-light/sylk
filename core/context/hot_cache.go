@@ -289,9 +289,12 @@ func (c *HotCache) evictBytes(targetBytes int64) int64 {
 }
 
 // evictedEntry holds information about an evicted entry for callback invocation.
+// This struct is used internally to pass eviction data between the locked
+// eviction phase and the unlocked callback invocation phase, allowing
+// expensive cleanup operations to run without holding the cache lock.
 type evictedEntry struct {
-	id    string
-	entry *ContentEntry
+	id    string        // Cache key of the evicted entry
+	entry *ContentEntry // The evicted content entry (may be nil for deleted entries)
 }
 
 // evictBatch evicts up to batchSize entries from the cache.

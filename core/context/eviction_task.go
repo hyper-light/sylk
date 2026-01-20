@@ -244,8 +244,15 @@ func (e *TaskCompletionEviction) mapToSlice(taskMap map[string]*TaskGroup) []*Ta
 }
 
 // filterCompletedTasks filters task groups to only include completed tasks.
+// Pre-allocates slice with estimated capacity based on typical completion rates
+// (approximately 50% of tasks are usually completed) to reduce allocations.
 func (e *TaskCompletionEviction) filterCompletedTasks(groups []*TaskGroup) []*TaskGroup {
-	var completed []*TaskGroup
+	// Pre-allocate with estimated capacity (assume ~50% completion rate)
+	estimatedCapacity := len(groups) / 2
+	if estimatedCapacity == 0 && len(groups) > 0 {
+		estimatedCapacity = 1
+	}
+	completed := make([]*TaskGroup, 0, estimatedCapacity)
 	for _, group := range groups {
 		if e.isTaskComplete(group) {
 			completed = append(completed, group)

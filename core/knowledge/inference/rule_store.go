@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 )
+
+// ErrRuleNotFound is returned when a rule cannot be found by ID.
+var ErrRuleNotFound = errors.New("inference rule not found")
 
 // =============================================================================
 // RuleStore (IE.2.1)
@@ -137,7 +141,7 @@ func (s *RuleStore) DeleteRule(ctx context.Context, id string) error {
 		return fmt.Errorf("get rows affected: %w", err)
 	}
 	if rowsAffected == 0 {
-		return fmt.Errorf("rule not found: %s", id)
+		return fmt.Errorf("delete rule id=%s: %w", id, ErrRuleNotFound)
 	}
 
 	s.removeFromCache(id)
