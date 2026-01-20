@@ -135,7 +135,18 @@ func (snap *HNSWSnapshot) findCloserNeighbor(query []float32, queryMag float64, 
 }
 
 // searchLayer0 performs beam search at layer 0 to find k nearest neighbors.
+//
+// Threading model: This function creates a visited map that is used exclusively within
+// this single search operation. The map is passed by reference to expandCandidates and
+// processNeighbors but is never accessed concurrently because:
+//  1. Each Search() call creates its own visited map (no sharing between goroutines)
+//  2. The search traversal is sequential within each call (no internal parallelism)
+//  3. The snapshot itself is immutable, so no synchronization is needed for reads
+//
+// Therefore, no mutex or synchronization is required for the visited map.
 func (snap *HNSWSnapshot) searchLayer0(query []float32, queryMag float64, entry string, k int, filter *SearchFilter) []SearchResult {
+	// visited tracks nodes already evaluated to avoid redundant distance calculations.
+	// This map is local to this search invocation and not shared across goroutines.
 	visited := make(map[string]bool)
 	visited[entry] = true
 
@@ -160,6 +171,12 @@ func (snap *HNSWSnapshot) initializeCandidates(query []float32, queryMag float64
 }
 
 // expandCandidates expands the search by exploring neighbors of candidates.
+//
+// The visited map parameter is owned by the calling searchLayer0 function and is used
+// to track which nodes have been evaluated. This map is modified during iteration
+// (via processNeighbors) but this is safe because:
+//   - The iteration is sequential (single-threaded within this search)
+//   - No concurrent goroutines access this map instance
 func (snap *HNSWSnapshot) expandCandidates(query []float32, queryMag float64, candidates []SearchResult, visited map[string]bool, k int) []SearchResult {
 	efSearch := snap.getEffectiveEfSearch(k)
 
@@ -182,6 +199,10 @@ func (snap *HNSWSnapshot) getEffectiveEfSearch(k int) int {
 }
 
 // processNeighbors adds unvisited neighbors to the candidate list.
+//
+// This function reads and writes to the visited map to track processed nodes.
+// No synchronization is needed because the visited map is local to a single Search()
+// call and all operations within that call are sequential (single-threaded).
 func (snap *HNSWSnapshot) processNeighbors(query []float32, queryMag float64, neighbors []string, candidates []SearchResult, visited map[string]bool) []SearchResult {
 	for _, neighbor := range neighbors {
 		if visited[neighbor] {
