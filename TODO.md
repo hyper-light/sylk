@@ -37326,13 +37326,13 @@ FS.1.* (W3, parallel) → FS.2.* (W3, parallel) → FS.3-4 (W4, parallel) → FS
 │ ┌─────────────────────────────────────────────────────────────────────────────────┐│
 │ │ GROUP 1A - MESSAGING & EVENTS (5 HIGH)                                          ││
 │ │                                                                                  ││
-│ │ [ ] W12.24 - ActivityBus EventDebouncer Missing Cleanup                         ││
+│ │ [x] W12.24 - ActivityBus EventDebouncer Missing Cleanup                         ││
 │ │   FILE: core/events/activity_bus.go:43-84                                       ││
 │ │   ISSUE: Debouncer timers not cleaned up on bus shutdown                        ││
 │ │   FIX: Track and cancel all pending timers on Close()                           ││
 │ │   SEVERITY: HIGH - Resource leak                                                ││
 │ │                                                                                  ││
-│ │ [ ] W12.25 - SignalBus Pending ACKs Never Cleaned                               ││
+│ │ [x] W12.25 - SignalBus Pending ACKs Never Cleaned                               ││
 │ │   FILE: core/signal/bus.go:119-216                                              ││
 │ │   ISSUE: Pending ACK map grows unbounded, no TTL or cleanup                     ││
 │ │   FIX: Add TTL-based cleanup for pending ACKs                                   ││
