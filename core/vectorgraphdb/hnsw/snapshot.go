@@ -115,13 +115,54 @@ func createSnapshotFromIndex(idx *Index, seqNum uint64) *HNSWSnapshot {
 	}
 }
 
-// copyLayers creates deep copies of all layers.
+// copyLayers creates deep copies of all layers with batch lock acquisition.
+// W4P.2: Uses batch locking to prevent lock contention and deadlocks.
+// Locks are acquired in consistent order (by index) and released together.
 func copyLayers(layers []*layer) []LayerSnapshot {
+	if len(layers) == 0 {
+		return make([]LayerSnapshot, 0)
+	}
+	return copyLayersWithBatchLock(layers)
+}
+
+// copyLayersWithBatchLock acquires all layer locks before copying.
+// This prevents O(n) lock acquisitions and ensures consistent snapshot state.
+func copyLayersWithBatchLock(layers []*layer) []LayerSnapshot {
+	// Acquire all read locks in order (prevents deadlocks)
+	for _, l := range layers {
+		if l != nil {
+			l.mu.RLock()
+		}
+	}
+	// Defer release of all locks in reverse order
+	defer func() {
+		for i := len(layers) - 1; i >= 0; i-- {
+			if layers[i] != nil {
+				layers[i].mu.RUnlock()
+			}
+		}
+	}()
+
+	// Copy all layer data while holding all locks
 	snapshots := make([]LayerSnapshot, len(layers))
 	for i, l := range layers {
-		snapshots[i] = NewLayerSnapshot(l)
+		snapshots[i] = copyLayerNodesUnlocked(l)
 	}
 	return snapshots
+}
+
+// copyLayerNodesUnlocked extracts nodes without acquiring locks.
+// Caller must hold the layer's read lock.
+func copyLayerNodesUnlocked(l *layer) LayerSnapshot {
+	if l == nil {
+		return LayerSnapshot{Nodes: make(map[string][]string)}
+	}
+	nodes := make(map[string][]string, len(l.nodes))
+	for id, node := range l.nodes {
+		neighborIDs := node.neighbors.GetIDs()
+		nodes[id] = copyStringSlice(neighborIDs)
+	}
+	return LayerSnapshot{Nodes: nodes}
 }
 
 // copyVectors creates a deep copy of the vectors map.

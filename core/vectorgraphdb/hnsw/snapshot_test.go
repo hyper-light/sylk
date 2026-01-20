@@ -1,6 +1,7 @@
 package hnsw
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -486,3 +487,250 @@ func TestSnapshot_ConcurrentCreation(t *testing.T) {
 		assert.Contains(t, snapshot.Vectors, "vec1")
 	}
 }
+
+// W4P.2 Tests for batch layer lock acquisition
+
+func TestCopyLayers_BatchLocking_HappyPath(t *testing.T) {
+	t.Run("empty layers returns empty slice", func(t *testing.T) {
+		result := copyLayers([]*layer{})
+		assert.NotNil(t, result)
+		assert.Empty(t, result)
+	})
+
+	t.Run("nil layers in slice handled correctly", func(t *testing.T) {
+		layers := []*layer{newLayer(), nil, newLayer()}
+		layers[0].addNode("node1")
+		layers[2].addNode("node3")
+
+		result := copyLayers(layers)
+
+		require.Len(t, result, 3)
+		assert.Contains(t, result[0].Nodes, "node1")
+		assert.Empty(t, result[1].Nodes) // nil layer becomes empty snapshot
+		assert.Contains(t, result[2].Nodes, "node3")
+	})
+
+	t.Run("multiple layers with connections", func(t *testing.T) {
+		layers := make([]*layer, 3)
+		for i := range layers {
+			layers[i] = newLayer()
+		}
+
+		// Add nodes across layers
+		layers[0].addNode("node1")
+		layers[0].addNode("node2")
+		layers[0].addNeighbor("node1", "node2", 0.5, 10)
+		layers[1].addNode("node1")
+		layers[2].addNode("node1")
+
+		result := copyLayers(layers)
+
+		require.Len(t, result, 3)
+		assert.Len(t, result[0].Nodes, 2)
+		assert.Equal(t, []string{"node2"}, result[0].Nodes["node1"])
+		assert.Len(t, result[1].Nodes, 1)
+		assert.Len(t, result[2].Nodes, 1)
+	})
+}
+
+func TestCopyLayers_BatchLocking_Concurrent(t *testing.T) {
+	t.Run("multiple concurrent snapshot requests", func(t *testing.T) {
+		// Create layers with data
+		layers := make([]*layer, 5)
+		for i := range layers {
+			layers[i] = newLayer()
+			for j := range 10 {
+				nodeID := fmt.Sprintf("node_%d_%d", i, j)
+				layers[i].addNode(nodeID)
+			}
+		}
+
+		numGoroutines := 100
+		results := make([][]LayerSnapshot, numGoroutines)
+		var wg sync.WaitGroup
+		wg.Add(numGoroutines)
+
+		// Concurrently copy layers
+		for i := range numGoroutines {
+			go func(idx int) {
+				defer wg.Done()
+				results[idx] = copyLayers(layers)
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Verify all results are consistent
+		for i, result := range results {
+			require.Len(t, result, 5, "result %d should have 5 layers", i)
+			for j := range 5 {
+				assert.Len(t, result[j].Nodes, 10, "result %d layer %d should have 10 nodes", i, j)
+			}
+		}
+	})
+
+	t.Run("concurrent snapshots with concurrent modifications", func(t *testing.T) {
+		layers := make([]*layer, 3)
+		for i := range layers {
+			layers[i] = newLayer()
+			layers[i].addNode(fmt.Sprintf("initial_%d", i))
+		}
+
+		numReaders := 50
+		numWriters := 10
+		iterations := 100
+
+		var wg sync.WaitGroup
+		wg.Add(numReaders + numWriters)
+
+		// Readers - create snapshots
+		for i := range numReaders {
+			go func(id int) {
+				defer wg.Done()
+				for j := range iterations {
+					result := copyLayers(layers)
+					// Snapshot should be internally consistent (not checking specific content
+					// since modifications are happening)
+					require.Len(t, result, 3, "reader %d iter %d", id, j)
+				}
+			}(i)
+		}
+
+		// Writers - modify layers
+		for i := range numWriters {
+			go func(id int) {
+				defer wg.Done()
+				for j := range iterations {
+					layerIdx := (id + j) % 3
+					nodeID := fmt.Sprintf("writer_%d_%d", id, j)
+					layers[layerIdx].addNode(nodeID)
+				}
+			}(i)
+		}
+
+		wg.Wait()
+	})
+}
+
+func TestCopyLayers_BatchLocking_NoDeadlock(t *testing.T) {
+	t.Run("no deadlock with interleaved lock patterns", func(t *testing.T) {
+		layers := make([]*layer, 10)
+		for i := range layers {
+			layers[i] = newLayer()
+			layers[i].addNode(fmt.Sprintf("node_%d", i))
+		}
+
+		done := make(chan bool)
+		numGoroutines := 20
+
+		var wg sync.WaitGroup
+		wg.Add(numGoroutines)
+
+		// Launch goroutines that copy layers concurrently
+		for i := range numGoroutines {
+			go func(id int) {
+				defer wg.Done()
+				for {
+					select {
+					case <-done:
+						return
+					default:
+						_ = copyLayers(layers)
+					}
+				}
+			}(i)
+		}
+
+		// Let it run for a short time to detect deadlocks
+		time.Sleep(100 * time.Millisecond)
+		close(done)
+
+		// Wait with timeout to detect deadlocks
+		completed := make(chan bool)
+		go func() {
+			wg.Wait()
+			completed <- true
+		}()
+
+		select {
+		case <-completed:
+			// Success - no deadlock
+		case <-time.After(5 * time.Second):
+			t.Fatal("Deadlock detected: goroutines did not complete within timeout")
+		}
+	})
+}
+
+func TestCopyLayersWithBatchLock_DirectCalls(t *testing.T) {
+	t.Run("acquires and releases locks correctly", func(t *testing.T) {
+		layers := make([]*layer, 3)
+		for i := range layers {
+			layers[i] = newLayer()
+			layers[i].addNode(fmt.Sprintf("node_%d", i))
+		}
+
+		// Call the batch lock function
+		result := copyLayersWithBatchLock(layers)
+
+		require.Len(t, result, 3)
+
+		// Verify locks are released by attempting to acquire write locks
+		for i, l := range layers {
+			// This would deadlock if read locks were not released
+			l.mu.Lock()
+			assert.Len(t, l.nodes, 1, "layer %d should have 1 node", i)
+			l.mu.Unlock()
+		}
+	})
+}
+
+func TestCopyLayerNodesUnlocked(t *testing.T) {
+	t.Run("nil layer returns empty snapshot", func(t *testing.T) {
+		result := copyLayerNodesUnlocked(nil)
+		assert.NotNil(t, result.Nodes)
+		assert.Empty(t, result.Nodes)
+	})
+
+	t.Run("copies nodes without acquiring lock", func(t *testing.T) {
+		l := newLayer()
+		l.addNode("node1")
+		l.addNode("node2")
+		l.addNeighbor("node1", "node2", 0.3, 10)
+
+		// Manually hold the lock (simulating batch lock acquisition)
+		l.mu.RLock()
+		result := copyLayerNodesUnlocked(l)
+		l.mu.RUnlock()
+
+		assert.Len(t, result.Nodes, 2)
+		assert.Equal(t, []string{"node2"}, result.Nodes["node1"])
+	})
+}
+
+func TestCopyLayers_Performance(t *testing.T) {
+	t.Run("batch locking scales with layer count", func(t *testing.T) {
+		layerCounts := []int{1, 5, 10, 20}
+
+		for _, count := range layerCounts {
+			layers := make([]*layer, count)
+			for i := range layers {
+				layers[i] = newLayer()
+				for j := range 100 {
+					layers[i].addNode(fmt.Sprintf("node_%d_%d", i, j))
+				}
+			}
+
+			start := time.Now()
+			iterations := 1000
+			for range iterations {
+				_ = copyLayers(layers)
+			}
+			elapsed := time.Since(start)
+
+			// Log performance (not strict assertion, but useful for comparison)
+			t.Logf("copyLayers with %d layers: %v for %d iterations (%.2f us/op)",
+				count, elapsed, iterations, float64(elapsed.Microseconds())/float64(iterations))
+		}
+	})
+}
+
