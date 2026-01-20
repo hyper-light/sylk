@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/blevesearch/bleve/v2"
@@ -27,6 +28,10 @@ type BleveIndex interface {
 // DefaultEventCacheSize is the default maximum number of events to cache.
 const DefaultEventCacheSize = 10000
 
+// EvictCallback is called when an event is evicted from the cache.
+// The callback receives the event ID and the event pointer.
+type EvictCallback func(key string, event *events.ActivityEvent)
+
 // BleveEventIndex provides full-text search indexing for ActivityEvents.
 // It wraps a Bleve index to provide event-specific indexing and search operations.
 // Uses an LRU cache with bounded size to prevent unbounded memory growth.
@@ -37,6 +42,14 @@ type BleveEventIndex struct {
 	// eventCache stores indexed events for retrieval after search.
 	// Uses LRU eviction to bound memory usage (W4H.3 fix).
 	eventCache *lru.Cache[string, *events.ActivityEvent]
+
+	// Cache statistics for observability (W4P.37 fix)
+	hits      atomic.Int64
+	misses    atomic.Int64
+	evictions atomic.Int64
+
+	// onEvict is called when an event is evicted from the cache
+	onEvict EvictCallback
 }
 
 // bleveEventDocument represents the document structure indexed in Bleve.
@@ -55,16 +68,54 @@ type bleveEventDocument struct {
 	Importance float64  `json:"importance"`
 }
 
+// BleveEventIndexConfig holds configuration for BleveEventIndex.
+type BleveEventIndexConfig struct {
+	// Index is the underlying Bleve index.
+	Index BleveIndex
+
+	// MaxCacheSize is the maximum number of events to cache.
+	// If <= 0, uses DefaultEventCacheSize.
+	MaxCacheSize int
+
+	// OnEvict is called when an event is evicted from the cache.
+	// Optional - can be nil if no callback is needed.
+	OnEvict EvictCallback
+}
+
 // NewBleveEventIndex creates a new BleveEventIndex with the provided Bleve index.
 // maxCacheSize specifies the maximum number of events to cache; if <= 0, uses default.
 func NewBleveEventIndex(index BleveIndex, maxCacheSize int) *BleveEventIndex {
+	return NewBleveEventIndexWithConfig(BleveEventIndexConfig{
+		Index:        index,
+		MaxCacheSize: maxCacheSize,
+	})
+}
+
+// NewBleveEventIndexWithConfig creates a new BleveEventIndex with the provided config.
+// This constructor allows setting an eviction callback for observability.
+func NewBleveEventIndexWithConfig(config BleveEventIndexConfig) *BleveEventIndex {
+	maxCacheSize := config.MaxCacheSize
 	if maxCacheSize <= 0 {
 		maxCacheSize = DefaultEventCacheSize
 	}
-	cache, _ := lru.New[string, *events.ActivityEvent](maxCacheSize)
-	return &BleveEventIndex{
-		index:      index,
-		eventCache: cache,
+
+	b := &BleveEventIndex{
+		index:   config.Index,
+		onEvict: config.OnEvict,
+	}
+
+	// Create cache with eviction callback that tracks stats and invokes user callback
+	cache, _ := lru.NewWithEvict[string, *events.ActivityEvent](maxCacheSize, b.handleEviction)
+	b.eventCache = cache
+
+	return b
+}
+
+// handleEviction is the internal eviction handler that updates stats and invokes user callback.
+func (b *BleveEventIndex) handleEviction(key string, event *events.ActivityEvent) {
+	b.evictions.Add(1)
+	if b.onEvict != nil {
+		b.onEvict(key, event)
 	}
 }
 
@@ -249,7 +300,10 @@ func (b *BleveEventIndex) resultsToEvents(result *bleve.SearchResult) []*events.
 	for _, hit := range result.Hits {
 		// Try to get from cache first
 		if event, ok := b.eventCache.Get(hit.ID); ok {
+			b.hits.Add(1)
 			eventList = append(eventList, event)
+		} else {
+			b.misses.Add(1)
 		}
 	}
 
@@ -266,10 +320,16 @@ func (b *BleveEventIndex) Close() error {
 
 // GetCachedEvent retrieves a cached event by ID.
 // Returns nil if the event is not in the cache.
+// Updates cache hit/miss statistics.
 func (b *BleveEventIndex) GetCachedEvent(id string) *events.ActivityEvent {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	event, _ := b.eventCache.Get(id)
+	event, ok := b.eventCache.Get(id)
+	if ok {
+		b.hits.Add(1)
+	} else {
+		b.misses.Add(1)
+	}
 	return event
 }
 
@@ -285,4 +345,72 @@ func (b *BleveEventIndex) CacheSize() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.eventCache.Len()
+}
+
+// =============================================================================
+// Cache Statistics (W4P.37)
+// =============================================================================
+
+// CacheStats holds cache performance statistics.
+type CacheStats struct {
+	Hits      int64   `json:"hits"`
+	Misses    int64   `json:"misses"`
+	Evictions int64   `json:"evictions"`
+	Size      int     `json:"size"`
+	HitRate   float64 `json:"hit_rate"`
+}
+
+// Stats returns current cache statistics.
+func (b *BleveEventIndex) Stats() CacheStats {
+	b.mu.RLock()
+	size := b.eventCache.Len()
+	b.mu.RUnlock()
+
+	hits := b.hits.Load()
+	misses := b.misses.Load()
+	evictions := b.evictions.Load()
+	total := hits + misses
+
+	var hitRate float64
+	if total > 0 {
+		hitRate = float64(hits) / float64(total)
+	}
+
+	return CacheStats{
+		Hits:      hits,
+		Misses:    misses,
+		Evictions: evictions,
+		Size:      size,
+		HitRate:   hitRate,
+	}
+}
+
+// Hits returns the total number of cache hits.
+func (b *BleveEventIndex) Hits() int64 {
+	return b.hits.Load()
+}
+
+// Misses returns the total number of cache misses.
+func (b *BleveEventIndex) Misses() int64 {
+	return b.misses.Load()
+}
+
+// Evictions returns the total number of cache evictions.
+func (b *BleveEventIndex) Evictions() int64 {
+	return b.evictions.Load()
+}
+
+// ResetStats resets all cache statistics to zero.
+func (b *BleveEventIndex) ResetStats() {
+	b.hits.Store(0)
+	b.misses.Store(0)
+	b.evictions.Store(0)
+}
+
+// SetEvictionCallback sets or replaces the eviction callback.
+// Pass nil to disable the callback.
+func (b *BleveEventIndex) SetEvictionCallback(callback EvictCallback) {
+	b.mu.Lock()
+	b.onEvict = callback
+	b.mu.Unlock()
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -834,6 +835,383 @@ func TestBleveEventIndex_LRU_UpdateExisting(t *testing.T) {
 	}
 	if cached.Content != "Updated content" {
 		t.Errorf("Expected updated content, got %s", cached.Content)
+	}
+}
+
+// =============================================================================
+// W4P.37 Cache Statistics Tests
+// =============================================================================
+
+func TestBleveEventIndex_Stats_HitsMisses(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 100)
+
+	// Initially all stats should be zero
+	stats := bleveIndex.Stats()
+	if stats.Hits != 0 || stats.Misses != 0 || stats.Evictions != 0 {
+		t.Errorf("Expected all stats to be zero, got hits=%d misses=%d evictions=%d",
+			stats.Hits, stats.Misses, stats.Evictions)
+	}
+
+	// Cache miss for non-existent event
+	_ = bleveIndex.GetCachedEvent("non-existent")
+	if bleveIndex.Misses() != 1 {
+		t.Errorf("Expected 1 miss, got %d", bleveIndex.Misses())
+	}
+
+	// Index an event
+	event := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
+	err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+	if err != nil {
+		t.Fatalf("Failed to index event: %v", err)
+	}
+
+	// Cache hit
+	_ = bleveIndex.GetCachedEvent("test-1")
+	if bleveIndex.Hits() != 1 {
+		t.Errorf("Expected 1 hit, got %d", bleveIndex.Hits())
+	}
+
+	// Another cache miss
+	_ = bleveIndex.GetCachedEvent("another-non-existent")
+	if bleveIndex.Misses() != 2 {
+		t.Errorf("Expected 2 misses, got %d", bleveIndex.Misses())
+	}
+
+	// Verify hit rate calculation
+	stats = bleveIndex.Stats()
+	expectedHitRate := float64(1) / float64(3) // 1 hit out of 3 total
+	if stats.HitRate < expectedHitRate-0.01 || stats.HitRate > expectedHitRate+0.01 {
+		t.Errorf("Expected hit rate ~%.2f, got %.2f", expectedHitRate, stats.HitRate)
+	}
+}
+
+func TestBleveEventIndex_Stats_Evictions(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	maxSize := 5
+	bleveIndex := NewBleveEventIndex(mockIndex, maxSize)
+
+	// Fill cache beyond capacity to trigger evictions
+	for i := 0; i < maxSize+3; i++ {
+		event := createTestEvent(
+			fmt.Sprintf("event-%d", i),
+			events.EventTypeAgentDecision,
+			fmt.Sprintf("Content %d", i),
+		)
+		err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+		if err != nil {
+			t.Fatalf("Failed to index event %d: %v", i, err)
+		}
+	}
+
+	// Should have 3 evictions (8 events added, max size 5)
+	if bleveIndex.Evictions() != 3 {
+		t.Errorf("Expected 3 evictions, got %d", bleveIndex.Evictions())
+	}
+
+	// Verify stats struct
+	stats := bleveIndex.Stats()
+	if stats.Evictions != 3 {
+		t.Errorf("Expected stats.Evictions=3, got %d", stats.Evictions)
+	}
+	if stats.Size != maxSize {
+		t.Errorf("Expected stats.Size=%d, got %d", maxSize, stats.Size)
+	}
+}
+
+func TestBleveEventIndex_Stats_ResetStats(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 100)
+
+	// Generate some stats
+	event := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
+	_ = bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+	_ = bleveIndex.GetCachedEvent("test-1")         // hit
+	_ = bleveIndex.GetCachedEvent("non-existent-1") // miss
+	_ = bleveIndex.GetCachedEvent("non-existent-2") // miss
+
+	// Verify stats are non-zero
+	if bleveIndex.Hits() != 1 || bleveIndex.Misses() != 2 {
+		t.Errorf("Expected hits=1 misses=2, got hits=%d misses=%d",
+			bleveIndex.Hits(), bleveIndex.Misses())
+	}
+
+	// Reset stats
+	bleveIndex.ResetStats()
+
+	// Verify all stats are reset
+	stats := bleveIndex.Stats()
+	if stats.Hits != 0 || stats.Misses != 0 || stats.Evictions != 0 {
+		t.Errorf("Expected all stats to be zero after reset, got hits=%d misses=%d evictions=%d",
+			stats.Hits, stats.Misses, stats.Evictions)
+	}
+}
+
+func TestBleveEventIndex_Stats_SearchHitsMisses(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 100)
+
+	// Index some events
+	event1 := createTestEvent("event-1", events.EventTypeAgentDecision, "Decision about architecture")
+	event2 := createTestEvent("event-2", events.EventTypeAgentDecision, "Decision about testing")
+	_ = bleveIndex.IndexEvent(context.Background(), event1, []string{"content"})
+	_ = bleveIndex.IndexEvent(context.Background(), event2, []string{"content"})
+
+	// Set up mock search result with one cached and one not cached
+	mockIndex.SetSearchResult("event-1", "event-3") // event-3 not in cache
+
+	// Search - should produce 1 hit (event-1) and 1 miss (event-3)
+	_, err := bleveIndex.Search(context.Background(), "decision", 10)
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+
+	if bleveIndex.Hits() != 1 {
+		t.Errorf("Expected 1 hit from search, got %d", bleveIndex.Hits())
+	}
+	if bleveIndex.Misses() != 1 {
+		t.Errorf("Expected 1 miss from search, got %d", bleveIndex.Misses())
+	}
+}
+
+func TestBleveEventIndex_EvictionCallback(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	maxSize := 5
+
+	// Track evicted events via callback
+	var evictedIDs []string
+	var evictedEvents []*events.ActivityEvent
+	var mu sync.Mutex
+
+	onEvict := func(key string, event *events.ActivityEvent) {
+		mu.Lock()
+		evictedIDs = append(evictedIDs, key)
+		evictedEvents = append(evictedEvents, event)
+		mu.Unlock()
+	}
+
+	bleveIndex := NewBleveEventIndexWithConfig(BleveEventIndexConfig{
+		Index:        mockIndex,
+		MaxCacheSize: maxSize,
+		OnEvict:      onEvict,
+	})
+
+	// Fill cache beyond capacity
+	for i := 0; i < maxSize+3; i++ {
+		event := createTestEvent(
+			fmt.Sprintf("event-%d", i),
+			events.EventTypeAgentDecision,
+			fmt.Sprintf("Content %d", i),
+		)
+		err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+		if err != nil {
+			t.Fatalf("Failed to index event %d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Should have 3 evictions
+	if len(evictedIDs) != 3 {
+		t.Errorf("Expected 3 eviction callbacks, got %d", len(evictedIDs))
+	}
+
+	// Verify the oldest events were evicted (event-0, event-1, event-2)
+	expectedEvicted := []string{"event-0", "event-1", "event-2"}
+	for i, expected := range expectedEvicted {
+		if i < len(evictedIDs) && evictedIDs[i] != expected {
+			t.Errorf("Expected evicted[%d]=%s, got %s", i, expected, evictedIDs[i])
+		}
+	}
+
+	// Verify the event data was passed to callback
+	for i, event := range evictedEvents {
+		if event == nil {
+			t.Errorf("Expected non-nil event in callback %d", i)
+		}
+	}
+}
+
+func TestBleveEventIndex_SetEvictionCallback(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	maxSize := 3
+
+	bleveIndex := NewBleveEventIndex(mockIndex, maxSize)
+
+	// Initially no callback
+	for i := 0; i < maxSize+1; i++ {
+		event := createTestEvent(
+			fmt.Sprintf("initial-%d", i),
+			events.EventTypeAgentDecision,
+			fmt.Sprintf("Content %d", i),
+		)
+		_ = bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+	}
+
+	// Set callback now
+	var callbackCalled bool
+	bleveIndex.SetEvictionCallback(func(key string, event *events.ActivityEvent) {
+		callbackCalled = true
+	})
+
+	// Trigger more evictions
+	for i := 0; i < maxSize+1; i++ {
+		event := createTestEvent(
+			fmt.Sprintf("after-%d", i),
+			events.EventTypeAgentDecision,
+			fmt.Sprintf("Content %d", i),
+		)
+		_ = bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+	}
+
+	if !callbackCalled {
+		t.Error("Expected eviction callback to be called after SetEvictionCallback")
+	}
+}
+
+func TestBleveEventIndex_Stats_Concurrent(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 1000)
+
+	const numGoroutines = 10
+	const opsPerGoroutine = 100
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines * 2)
+
+	// Writers
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				event := createTestEvent(
+					fmt.Sprintf("g%d-event-%d", goroutineID, i),
+					events.EventTypeAgentDecision,
+					fmt.Sprintf("Content from goroutine %d event %d", goroutineID, i),
+				)
+				_ = bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+			}
+		}(g)
+	}
+
+	// Readers (some hits, some misses)
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				// Mix of existing and non-existing keys
+				if i%2 == 0 {
+					_ = bleveIndex.GetCachedEvent(fmt.Sprintf("g%d-event-%d", goroutineID, i/2))
+				} else {
+					_ = bleveIndex.GetCachedEvent(fmt.Sprintf("nonexistent-%d-%d", goroutineID, i))
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Verify stats are consistent
+	stats := bleveIndex.Stats()
+	total := stats.Hits + stats.Misses
+	if total == 0 {
+		t.Error("Expected some cache operations to be recorded")
+	}
+
+	// Hit rate should be between 0 and 1
+	if stats.HitRate < 0 || stats.HitRate > 1 {
+		t.Errorf("Invalid hit rate: %.2f", stats.HitRate)
+	}
+}
+
+func TestBleveEventIndex_Stats_HitRateZeroTotal(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	bleveIndex := NewBleveEventIndex(mockIndex, 100)
+
+	// No operations yet - hit rate should be 0, not NaN
+	stats := bleveIndex.Stats()
+	if stats.HitRate != 0 {
+		t.Errorf("Expected hit rate 0 with zero operations, got %.2f", stats.HitRate)
+	}
+}
+
+func TestBleveEventIndex_NewWithConfig(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+
+	// Test with config
+	config := BleveEventIndexConfig{
+		Index:        mockIndex,
+		MaxCacheSize: 50,
+	}
+	bleveIndex := NewBleveEventIndexWithConfig(config)
+
+	if bleveIndex == nil {
+		t.Fatal("Expected non-nil BleveEventIndex")
+	}
+
+	// Verify it works correctly
+	event := createTestEvent("test-1", events.EventTypeAgentDecision, "Test content")
+	err := bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+	if err != nil {
+		t.Fatalf("Failed to index event: %v", err)
+	}
+
+	cached := bleveIndex.GetCachedEvent("test-1")
+	if cached == nil {
+		t.Error("Expected to find cached event")
+	}
+}
+
+func TestBleveEventIndex_EvictionCallback_Concurrent(t *testing.T) {
+	mockIndex := NewMockBleveIndex()
+	maxSize := 50
+
+	var callbackCount atomic.Int64
+
+	onEvict := func(key string, event *events.ActivityEvent) {
+		callbackCount.Add(1)
+	}
+
+	bleveIndex := NewBleveEventIndexWithConfig(BleveEventIndexConfig{
+		Index:        mockIndex,
+		MaxCacheSize: maxSize,
+		OnEvict:      onEvict,
+	})
+
+	const numGoroutines = 10
+	const eventsPerGoroutine = 20
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for i := 0; i < eventsPerGoroutine; i++ {
+				event := createTestEvent(
+					fmt.Sprintf("g%d-event-%d", goroutineID, i),
+					events.EventTypeAgentDecision,
+					fmt.Sprintf("Content %d", i),
+				)
+				_ = bleveIndex.IndexEvent(context.Background(), event, []string{"content"})
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Total events: 10 * 20 = 200
+	// Max cache: 50
+	// Expected evictions: 200 - 50 = 150
+	totalEvents := numGoroutines * eventsPerGoroutine
+	expectedEvictions := totalEvents - maxSize
+
+	if callbackCount.Load() != int64(expectedEvictions) {
+		t.Errorf("Expected %d eviction callbacks, got %d", expectedEvictions, callbackCount.Load())
+	}
+
+	// Verify eviction count matches stats
+	if bleveIndex.Evictions() != int64(expectedEvictions) {
+		t.Errorf("Expected %d evictions in stats, got %d", expectedEvictions, bleveIndex.Evictions())
 	}
 }
 
