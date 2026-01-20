@@ -407,69 +407,128 @@ func (e *TypeScriptExtractor) posToLine(source string, pos int) int {
 }
 
 // findBlockEnd finds the line where a block (started with {) ends.
+// It properly handles strings, comments, and template literals.
 func (e *TypeScriptExtractor) findBlockEnd(lines []string, startLine int) int {
 	if startLine < 1 || startLine > len(lines) {
 		return startLine
 	}
 
+	lexer := newTSLexer()
 	braceCount := 0
 	started := false
 
 	for i := startLine - 1; i < len(lines); i++ {
 		line := lines[i]
-		for _, ch := range line {
-			if ch == '{' {
-				braceCount++
-				started = true
-			} else if ch == '}' {
-				braceCount--
-				if started && braceCount == 0 {
-					return i + 1
-				}
-			}
+		endLine, done := e.processLineForBraces(line, i, lexer, &braceCount, &started)
+		if done {
+			return endLine
 		}
+		lexer.resetForNewLine()
 	}
 
 	return startLine
 }
 
+// processLineForBraces processes a single line for brace counting.
+// Returns (line number, true) if block end is found, (0, false) otherwise.
+func (e *TypeScriptExtractor) processLineForBraces(line string, lineIdx int, lexer *tsLexer, braceCount *int, started *bool) (int, bool) {
+	runes := []rune(line)
+	for j := 0; j < len(runes); j++ {
+		ch := runes[j]
+		next := e.peekNextRune(runes, j)
+
+		lexer.processChar(ch, next)
+
+		if !lexer.isInCodeContext() {
+			continue
+		}
+
+		if ch == '{' {
+			*braceCount++
+			*started = true
+		} else if ch == '}' {
+			*braceCount--
+			if *started && *braceCount == 0 {
+				return lineIdx + 1, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// peekNextRune returns the next rune in the slice, or 0 if at end.
+func (e *TypeScriptExtractor) peekNextRune(runes []rune, idx int) rune {
+	if idx+1 < len(runes) {
+		return runes[idx+1]
+	}
+	return 0
+}
+
 // findStatementEnd finds the line where a statement ends (typically with ; or end of object literal).
+// It properly handles strings, comments, and template literals.
 func (e *TypeScriptExtractor) findStatementEnd(lines []string, startLine int) int {
 	if startLine < 1 || startLine > len(lines) {
 		return startLine
 	}
 
+	lexer := newTSLexer()
 	braceCount := 0
 	parenCount := 0
 
 	for i := startLine - 1; i < len(lines); i++ {
 		line := lines[i]
-		for _, ch := range line {
-			switch ch {
-			case '{':
-				braceCount++
-			case '}':
-				braceCount--
-			case '(':
-				parenCount++
-			case ')':
-				parenCount--
-			case ';':
-				if braceCount == 0 && parenCount == 0 {
-					return i + 1
-				}
-			}
+		endLine, done := e.processLineForStatement(line, i, startLine, lexer, &braceCount, &parenCount)
+		if done {
+			return endLine
 		}
-		// If we close all braces and parens, this might be the end
-		if braceCount == 0 && parenCount == 0 && i > startLine-1 {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasSuffix(trimmed, ";") || strings.HasSuffix(trimmed, "}") {
-				return i + 1
+		lexer.resetForNewLine()
+	}
+
+	return startLine
+}
+
+// processLineForStatement processes a single line for statement end detection.
+// Returns (line number, true) if statement end is found, (0, false) otherwise.
+func (e *TypeScriptExtractor) processLineForStatement(line string, lineIdx, startLine int, lexer *tsLexer, braceCount, parenCount *int) (int, bool) {
+	runes := []rune(line)
+	for j := 0; j < len(runes); j++ {
+		ch := runes[j]
+		next := e.peekNextRune(runes, j)
+
+		lexer.processChar(ch, next)
+
+		if !lexer.isInCodeContext() {
+			continue
+		}
+
+		switch ch {
+		case '{':
+			*braceCount++
+		case '}':
+			*braceCount--
+		case '(':
+			*parenCount++
+		case ')':
+			*parenCount--
+		case ';':
+			if *braceCount == 0 && *parenCount == 0 {
+				return lineIdx + 1, true
 			}
 		}
 	}
 
-	return startLine
+	return e.checkStatementEndByLine(line, lineIdx, startLine, *braceCount, *parenCount)
+}
+
+// checkStatementEndByLine checks if the current line ends a statement.
+func (e *TypeScriptExtractor) checkStatementEndByLine(line string, lineIdx, startLine, braceCount, parenCount int) (int, bool) {
+	if braceCount == 0 && parenCount == 0 && lineIdx > startLine-1 {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasSuffix(trimmed, ";") || strings.HasSuffix(trimmed, "}") {
+			return lineIdx + 1, true
+		}
+	}
+	return 0, false
 }
 
 // extractClassBody extracts the body of a class between startLine and endLine.
@@ -484,4 +543,130 @@ func (e *TypeScriptExtractor) extractClassBody(lines []string, startLine, endLin
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// tsLexerState tracks the current lexical context during parsing.
+type tsLexerState int
+
+const (
+	tsStateNormal tsLexerState = iota
+	tsStateSingleQuoteString
+	tsStateDoubleQuoteString
+	tsStateTemplateLiteral
+	tsStateSingleLineComment
+	tsStateMultiLineComment
+	tsStateRegex
+)
+
+// tsLexer provides character-by-character lexical analysis for TypeScript.
+type tsLexer struct {
+	state   tsLexerState
+	escaped bool
+}
+
+// newTSLexer creates a new TypeScript lexer in normal state.
+func newTSLexer() *tsLexer {
+	return &tsLexer{state: tsStateNormal}
+}
+
+// isInCodeContext returns true if we're in normal code (not string/comment/regex).
+func (l *tsLexer) isInCodeContext() bool {
+	return l.state == tsStateNormal
+}
+
+// processChar advances the lexer state based on the current and next character.
+// Returns whether the character was consumed by a state transition.
+func (l *tsLexer) processChar(ch, next rune) {
+	if l.escaped {
+		l.escaped = false
+		return
+	}
+
+	switch l.state {
+	case tsStateNormal:
+		l.processNormalState(ch, next)
+	case tsStateSingleQuoteString:
+		l.processSingleQuoteState(ch)
+	case tsStateDoubleQuoteString:
+		l.processDoubleQuoteState(ch)
+	case tsStateTemplateLiteral:
+		l.processTemplateLiteralState(ch)
+	case tsStateMultiLineComment:
+		l.processMultiLineCommentState(ch, next)
+	case tsStateRegex:
+		l.processRegexState(ch)
+	}
+}
+
+// processNormalState handles state transitions from normal code context.
+func (l *tsLexer) processNormalState(ch, next rune) {
+	switch ch {
+	case '\'':
+		l.state = tsStateSingleQuoteString
+	case '"':
+		l.state = tsStateDoubleQuoteString
+	case '`':
+		l.state = tsStateTemplateLiteral
+	case '/':
+		if next == '/' {
+			l.state = tsStateSingleLineComment
+		} else if next == '*' {
+			l.state = tsStateMultiLineComment
+		}
+	}
+}
+
+// processSingleQuoteState handles characters inside single-quoted strings.
+func (l *tsLexer) processSingleQuoteState(ch rune) {
+	switch ch {
+	case '\\':
+		l.escaped = true
+	case '\'':
+		l.state = tsStateNormal
+	}
+}
+
+// processDoubleQuoteState handles characters inside double-quoted strings.
+func (l *tsLexer) processDoubleQuoteState(ch rune) {
+	switch ch {
+	case '\\':
+		l.escaped = true
+	case '"':
+		l.state = tsStateNormal
+	}
+}
+
+// processTemplateLiteralState handles characters inside template literals.
+func (l *tsLexer) processTemplateLiteralState(ch rune) {
+	switch ch {
+	case '\\':
+		l.escaped = true
+	case '`':
+		l.state = tsStateNormal
+	}
+}
+
+// processMultiLineCommentState handles characters inside multi-line comments.
+func (l *tsLexer) processMultiLineCommentState(ch, next rune) {
+	if ch == '*' && next == '/' {
+		l.state = tsStateNormal
+	}
+}
+
+// processRegexState handles characters inside regular expressions.
+func (l *tsLexer) processRegexState(ch rune) {
+	switch ch {
+	case '\\':
+		l.escaped = true
+	case '/':
+		l.state = tsStateNormal
+	}
+}
+
+// resetForNewLine resets state that doesn't carry across lines.
+func (l *tsLexer) resetForNewLine() {
+	if l.state == tsStateSingleLineComment {
+		l.state = tsStateNormal
+	}
+	l.escaped = false
 }

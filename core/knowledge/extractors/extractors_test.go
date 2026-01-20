@@ -1283,3 +1283,378 @@ def after():
 	assert.Equal(t, "after", fn2.Name)
 	assert.Equal(t, 7, fn2.StartLine)
 }
+
+// =============================================================================
+// TypeScript Brace Counting Tests (W3H.6)
+// =============================================================================
+
+func TestTypeScriptExtractor_BracesInDoubleQuotedString(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	const x = "{ not a brace } still not";
+	return x;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/strings.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 4, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 6, fn2.StartLine)
+	assert.Equal(t, 8, fn2.EndLine)
+}
+
+func TestTypeScriptExtractor_BracesInSingleQuotedString(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	const x = '{ not a brace } still not';
+	return x;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/strings.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 4, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 6, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_BracesInTemplateLiteral(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := "function test() {\n\tconst x = `{ not a brace } still not`;\n\treturn x;\n}\n\nfunction nextFunc() {\n\treturn true;\n}\n"
+
+	entities, err := extractor.Extract("/test/template.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 4, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 6, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_BracesInSingleLineComment(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	// { not a brace } still not
+	const x = 1;
+	return x;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/comments.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 5, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 7, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_BracesInMultiLineComment(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	/* { not a brace }
+	   still not a brace }
+	   { also not */
+	const x = 1;
+	return x;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/multicomment.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 7, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 9, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_NestedBracesWithStrings(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	const obj = {
+		key: "value with { brace }",
+		other: '{ another brace }'
+	};
+	return obj;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/nested.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 7, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 9, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_EscapedQuotesInString(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	const x = "escaped \" quote { brace }";
+	const y = 'escaped \' quote { brace }';
+	return x + y;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/escaped.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 5, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 7, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_MixedStringsAndComments(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	const x = "{ brace in string }";
+	// { brace in comment }
+	/* { multi-line
+	   comment with brace } */
+	const y = '{ another string brace }';
+	return x + y;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/mixed.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 8, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 10, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_ClassWithBracesInStrings(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `export class Parser {
+	private pattern: string = "{ }";
+
+	parse(input: string): string {
+		// Handle { braces } in comments
+		const result = "processed { value }";
+		return result;
+	}
+
+	format(): string {
+		return '{ formatted }';
+	}
+}
+
+function standalone() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/class.ts", []byte(source))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(entities), 2)
+
+	// Find Parser class
+	var classEntity *Entity
+	for i := range entities {
+		if entities[i].Name == "Parser" {
+			classEntity = &entities[i]
+			break
+		}
+	}
+	require.NotNil(t, classEntity, "Parser class should be found")
+	assert.Equal(t, 1, classEntity.StartLine)
+	assert.Equal(t, 13, classEntity.EndLine)
+
+	// Find standalone function
+	var standalone *Entity
+	for i := range entities {
+		if entities[i].Name == "standalone" {
+			standalone = &entities[i]
+			break
+		}
+	}
+	require.NotNil(t, standalone)
+	assert.Equal(t, 15, standalone.StartLine)
+}
+
+func TestTypeScriptExtractor_InterfaceWithBracesInComments(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `export interface Config {
+	// { brace in comment }
+	name: string;
+	/* { multi-line brace }
+	   in comment */
+	value: number;
+}
+
+interface OtherConfig {
+	key: string;
+}
+`
+
+	entities, err := extractor.Extract("/test/interface.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	iface := entities[0]
+	assert.Equal(t, "Config", iface.Name)
+	assert.Equal(t, 1, iface.StartLine)
+	assert.Equal(t, 7, iface.EndLine)
+
+	iface2 := entities[1]
+	assert.Equal(t, "OtherConfig", iface2.Name)
+	assert.Equal(t, 9, iface2.StartLine)
+}
+
+func TestTypeScriptExtractor_TypeAliasWithBracesInComments(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `// { brace in comment before type }
+type Handler = (event: Event) => void;
+
+/* { brace in multi-line comment }
+   before another type */
+type Callback = () => void;
+`
+
+	entities, err := extractor.Extract("/test/types.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	handler := entities[0]
+	assert.Equal(t, "Handler", handler.Name)
+	assert.Equal(t, 2, handler.StartLine)
+
+	callback := entities[1]
+	assert.Equal(t, "Callback", callback.Name)
+	assert.Equal(t, 6, callback.StartLine)
+}
+
+func TestTypeScriptExtractor_TemplateLiteralWithNestedBraces(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := "function test() {\n\tconst x = `template with ${value} and { fake brace }`;\n\treturn x;\n}\n\nfunction nextFunc() {\n\treturn true;\n}\n"
+
+	entities, err := extractor.Extract("/test/template_nested.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 4, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 6, fn2.StartLine)
+}
+
+func TestTypeScriptExtractor_EscapedBackslashBeforeQuote(t *testing.T) {
+	extractor := NewTypeScriptExtractor()
+
+	source := `function test() {
+	const path = "C:\\Users\\{ name }\\file";
+	return path;
+}
+
+function nextFunc() {
+	return true;
+}
+`
+
+	entities, err := extractor.Extract("/test/path.ts", []byte(source))
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+
+	fn := entities[0]
+	assert.Equal(t, "test", fn.Name)
+	assert.Equal(t, 1, fn.StartLine)
+	assert.Equal(t, 4, fn.EndLine)
+
+	fn2 := entities[1]
+	assert.Equal(t, "nextFunc", fn2.Name)
+	assert.Equal(t, 6, fn2.StartLine)
+}
