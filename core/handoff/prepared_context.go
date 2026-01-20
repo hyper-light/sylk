@@ -2,6 +2,7 @@ package handoff
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -473,13 +474,18 @@ func (pc *PreparedContext) Snapshot() PreparedContextSnapshot {
 }
 
 // FromBytes deserializes a prepared context from bytes.
+// W4L.9: Error wrapping with %w for proper error chains.
 func FromBytes(data []byte) (*PreparedContext, error) {
 	var snapshot PreparedContextSnapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal prepared context snapshot: %w", err)
 	}
 
-	return FromSnapshot(snapshot)
+	ctx, err := FromSnapshot(snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to restore prepared context from snapshot: %w", err)
+	}
+	return ctx, nil
 }
 
 // FromSnapshot creates a PreparedContext from a snapshot.
@@ -633,10 +639,11 @@ func copyStringMap(src map[string]string) map[string]string {
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
+// W4L.9: Error wrapping with %w for proper error chains.
 func (pc *PreparedContext) UnmarshalJSON(data []byte) error {
 	var temp preparedContextJSON
 	if err := json.Unmarshal(data, &temp); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal prepared context JSON: %w", err)
 	}
 
 	pc.mu.Lock()

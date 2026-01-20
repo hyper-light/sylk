@@ -3,6 +3,7 @@ package handoff
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -718,8 +719,8 @@ func TestHandoffManager_EvaluateAndExecute_Closed(t *testing.T) {
 	if result.Success {
 		t.Error("Result should indicate failure when closed")
 	}
-	if result.Error != ErrManagerClosed {
-		t.Errorf("Error = %v, want ErrManagerClosed", result.Error)
+	if !errors.Is(result.Error, ErrManagerClosed) {
+		t.Errorf("Error = %v, want ErrManagerClosed (wrapped)", result.Error)
 	}
 }
 
@@ -773,8 +774,8 @@ func TestHandoffManager_ForceHandoff_Closed(t *testing.T) {
 	if result.Success {
 		t.Error("ForceHandoff should fail when closed")
 	}
-	if result.Error != ErrManagerClosed {
-		t.Errorf("Error = %v, want ErrManagerClosed", result.Error)
+	if !errors.Is(result.Error, ErrManagerClosed) {
+		t.Errorf("Error = %v, want ErrManagerClosed (wrapped)", result.Error)
 	}
 }
 
@@ -794,8 +795,8 @@ func TestHandoffManager_ForceHandoff_NoContext(t *testing.T) {
 	if result.Success {
 		t.Error("ForceHandoff should fail with no context")
 	}
-	if result.Error != ErrNoContextPrepared {
-		t.Errorf("Error = %v, want ErrNoContextPrepared", result.Error)
+	if !errors.Is(result.Error, ErrNoContextPrepared) {
+		t.Errorf("Error = %v, want ErrNoContextPrepared (wrapped)", result.Error)
 	}
 }
 

@@ -2,6 +2,7 @@ package handoff
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 )
 
@@ -300,21 +301,23 @@ type circularBufferJSON[T any] struct {
 }
 
 // MarshalJSON implements json.Marshaler.
+// W4L.11: Fixed to use itemsLocked() to avoid double-lock issue.
 func (cb *CircularBuffer[T]) MarshalJSON() ([]byte, error) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 
 	return json.Marshal(circularBufferJSON[T]{
-		Items:    cb.Items(),
+		Items:    cb.itemsLocked(),
 		Capacity: cb.capacity,
 	})
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
+// W4L.11: Error wrapping with %w for proper error chains.
 func (cb *CircularBuffer[T]) UnmarshalJSON(data []byte) error {
 	var temp circularBufferJSON[T]
 	if err := json.Unmarshal(data, &temp); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal circular buffer JSON: %w", err)
 	}
 
 	cb.mu.Lock()

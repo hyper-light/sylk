@@ -2,6 +2,8 @@ package handoff
 
 import (
 	"encoding/json"
+	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -213,23 +215,22 @@ func (rs *RollingSummary) KeyTopics() []string {
 
 // keyTopicsLocked is the internal implementation of KeyTopics.
 // Caller must hold rs.mu (read or write lock).
+// W4L.10: Pre-allocate slice with known capacity for better performance.
 func (rs *RollingSummary) keyTopicsLocked() []string {
+	// Pre-allocate slice with estimated capacity based on keyTopics map size
+	topics := make([]string, 0, len(rs.keyTopics))
+
 	// Collect topics that meet minimum mentions threshold
-	var topics []string
 	for topic, count := range rs.keyTopics {
 		if count >= rs.config.MinTopicMentions {
 			topics = append(topics, topic)
 		}
 	}
 
-	// Sort by mention count (simple bubble sort for small lists)
-	for i := 0; i < len(topics); i++ {
-		for j := i + 1; j < len(topics); j++ {
-			if rs.keyTopics[topics[j]] > rs.keyTopics[topics[i]] {
-				topics[i], topics[j] = topics[j], topics[i]
-			}
-		}
-	}
+	// Sort by mention count using standard library sort (stable, efficient)
+	sort.Slice(topics, func(i, j int) bool {
+		return rs.keyTopics[topics[i]] > rs.keyTopics[topics[j]]
+	})
 
 	// Limit to MaxTopics
 	if len(topics) > rs.config.MaxTopics {
@@ -449,22 +450,20 @@ func (rs *RollingSummary) pruneTopics() {
 }
 
 // getTopTopicsUnlocked returns top N topics (caller must hold lock).
+// W4L.10: Pre-allocate slice and use efficient sorting.
 func (rs *RollingSummary) getTopTopicsUnlocked(n int) []string {
-	var topics []string
+	// Pre-allocate slice with estimated capacity
+	topics := make([]string, 0, len(rs.keyTopics))
 	for topic, count := range rs.keyTopics {
 		if count >= rs.config.MinTopicMentions {
 			topics = append(topics, topic)
 		}
 	}
 
-	// Sort by count
-	for i := 0; i < len(topics); i++ {
-		for j := i + 1; j < len(topics); j++ {
-			if rs.keyTopics[topics[j]] > rs.keyTopics[topics[i]] {
-				topics[i], topics[j] = topics[j], topics[i]
-			}
-		}
-	}
+	// Sort by count using standard library sort
+	sort.Slice(topics, func(i, j int) bool {
+		return rs.keyTopics[topics[i]] > rs.keyTopics[topics[j]]
+	})
 
 	if n > len(topics) {
 		n = len(topics)
@@ -570,10 +569,11 @@ func (rs *RollingSummary) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
+// W4L.10: Error wrapping with %w for proper error chains.
 func (rs *RollingSummary) UnmarshalJSON(data []byte) error {
 	var temp rollingSummaryJSON
 	if err := json.Unmarshal(data, &temp); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal rolling summary JSON: %w", err)
 	}
 
 	rs.mu.Lock()

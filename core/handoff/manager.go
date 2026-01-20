@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,13 +36,47 @@ import (
 //	manager.UpdateContext(messages)
 //	result := manager.EvaluateAndExecute(ctx)
 
-// Manager errors
+// Manager errors - base errors for error wrapping
 var (
 	ErrManagerClosed      = errors.New("handoff manager is closed")
 	ErrManagerNotStarted  = errors.New("handoff manager not started")
 	ErrNoContextPrepared  = errors.New("no context prepared for handoff")
 	ErrEvaluationDisabled = errors.New("automatic evaluation is disabled")
 )
+
+// ManagerError wraps manager errors with additional context including
+// agent ID, operation name, and current state.
+type ManagerError struct {
+	Err       error        // Underlying error
+	AgentID   string       // Agent that encountered the error
+	Operation string       // Operation that failed (e.g., "EvaluateAndExecute", "ForceHandoff")
+	State     HandoffStatus // Manager state when error occurred
+}
+
+// Error implements the error interface.
+func (e *ManagerError) Error() string {
+	return fmt.Sprintf("handoff manager error [agent=%s, operation=%s, state=%s]: %v",
+		e.AgentID, e.Operation, e.State, e.Err)
+}
+
+// Unwrap returns the underlying error for errors.Is and errors.As support.
+func (e *ManagerError) Unwrap() error {
+	return e.Err
+}
+
+// newManagerError creates a new ManagerError with the given context.
+func (m *HandoffManager) newManagerError(err error, operation string) *ManagerError {
+	agentID := "unknown"
+	if m.config != nil {
+		agentID = m.config.AgentID
+	}
+	return &ManagerError{
+		Err:       err,
+		AgentID:   agentID,
+		Operation: operation,
+		State:     HandoffStatus(m.status.Load()),
+	}
+}
 
 // HandoffStatus represents the current status of the handoff manager.
 type HandoffStatus int
@@ -382,11 +417,12 @@ func (m *HandoffManager) GetPreparedContext() *PreparedContext {
 
 // EvaluateAndExecute evaluates whether a handoff should occur and executes it if triggered.
 // Returns the HandoffResult if a handoff was executed, nil if no handoff was triggered.
+// W4L.8: Error messages now include context (agent ID, operation, state).
 func (m *HandoffManager) EvaluateAndExecute(ctx context.Context) *HandoffResult {
 	if m.closed.Load() {
 		return &HandoffResult{
 			Success:   false,
-			Error:     ErrManagerClosed,
+			Error:     m.newManagerError(ErrManagerClosed, "EvaluateAndExecute"),
 			Timestamp: time.Now(),
 		}
 	}
@@ -446,11 +482,12 @@ func (m *HandoffManager) EvaluateAndExecute(ctx context.Context) *HandoffResult 
 
 // ForceHandoff forces an immediate handoff regardless of evaluation.
 // Returns the HandoffResult from the forced handoff.
+// W4L.8: Error messages now include context (agent ID, operation, state).
 func (m *HandoffManager) ForceHandoff(ctx context.Context, reason string) *HandoffResult {
 	if m.closed.Load() {
 		return &HandoffResult{
 			Success:   false,
-			Error:     ErrManagerClosed,
+			Error:     m.newManagerError(ErrManagerClosed, "ForceHandoff"),
 			Timestamp: time.Now(),
 		}
 	}
@@ -466,7 +503,7 @@ func (m *HandoffManager) ForceHandoff(ctx context.Context, reason string) *Hando
 		m.contextMu.RUnlock()
 		return &HandoffResult{
 			Success:   false,
-			Error:     ErrNoContextPrepared,
+			Error:     m.newManagerError(ErrNoContextPrepared, "ForceHandoff"),
 			Timestamp: time.Now(),
 		}
 	}
