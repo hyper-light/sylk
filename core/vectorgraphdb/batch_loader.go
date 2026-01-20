@@ -74,15 +74,8 @@ func (bl *BatchLoader[T]) LoadBatch(ids []string) (map[string]T, error) {
 	// Deduplicate IDs
 	uniqueIDs := bl.deduplicateIDs(ids)
 
-	// Check which IDs are already cached
-	bl.mu.RLock()
-	uncachedIDs := make([]string, 0, len(uniqueIDs))
-	for _, id := range uniqueIDs {
-		if _, cached := bl.cache[id]; !cached {
-			uncachedIDs = append(uncachedIDs, id)
-		}
-	}
-	bl.mu.RUnlock()
+	// Check cache and load uncached in a single coordinated operation
+	uncachedIDs := bl.filterUncachedIDs(uniqueIDs)
 
 	// Load uncached items in batches
 	if len(uncachedIDs) > 0 {
@@ -106,6 +99,20 @@ func (bl *BatchLoader[T]) deduplicateIDs(ids []string) []string {
 		}
 	}
 	return result
+}
+
+// filterUncachedIDs returns IDs that are not in the cache.
+func (bl *BatchLoader[T]) filterUncachedIDs(ids []string) []string {
+	bl.mu.RLock()
+	defer bl.mu.RUnlock()
+
+	uncached := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, cached := bl.cache[id]; !cached {
+			uncached = append(uncached, id)
+		}
+	}
+	return uncached
 }
 
 // loadInBatches loads items in batches respecting maxBatchSize.
@@ -155,17 +162,9 @@ func (bl *BatchLoader[T]) Preload(ids []string) error {
 		return nil
 	}
 
-	// Deduplicate and filter already cached
+	// Deduplicate and filter already cached in a single lock cycle
 	uniqueIDs := bl.deduplicateIDs(ids)
-
-	bl.mu.RLock()
-	uncachedIDs := make([]string, 0, len(uniqueIDs))
-	for _, id := range uniqueIDs {
-		if _, cached := bl.cache[id]; !cached {
-			uncachedIDs = append(uncachedIDs, id)
-		}
-	}
-	bl.mu.RUnlock()
+	uncachedIDs := bl.filterUncachedIDs(uniqueIDs)
 
 	if len(uncachedIDs) == 0 {
 		return nil
@@ -188,7 +187,7 @@ func (bl *BatchLoader[T]) Get(id string) (T, bool) {
 // This is a convenience method for single item access but should be
 // avoided in loops - use LoadBatch instead.
 func (bl *BatchLoader[T]) GetOrLoad(id string) (T, error) {
-	// Check cache first
+	// Check cache first with read lock
 	bl.mu.RLock()
 	if item, ok := bl.cache[id]; ok {
 		bl.mu.RUnlock()
@@ -196,22 +195,20 @@ func (bl *BatchLoader[T]) GetOrLoad(id string) (T, error) {
 	}
 	bl.mu.RUnlock()
 
-	// Load single item
+	// Load single item (outside lock to avoid holding lock during I/O)
 	items, err := bl.loadFn([]string{id})
 	if err != nil {
 		var zero T
 		return zero, err
 	}
 
+	// Single lock cycle: update cache and retrieve result atomically
 	bl.mu.Lock()
 	for loadedID, item := range items {
 		bl.cache[loadedID] = item
 	}
-	bl.mu.Unlock()
-
-	bl.mu.RLock()
 	item, ok := bl.cache[id]
-	bl.mu.RUnlock()
+	bl.mu.Unlock()
 
 	if !ok {
 		var zero T

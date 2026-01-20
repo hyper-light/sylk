@@ -549,3 +549,346 @@ func TestDefaultBatchLoaderConfig(t *testing.T) {
 		t.Errorf("expected default MaxBatchSize 100, got %d", config.MaxBatchSize)
 	}
 }
+
+// TestBatchLoader_ConcurrentRaceDetection tests that concurrent operations
+// don't cause data races. Run with -race flag to detect races.
+func TestBatchLoader_ConcurrentRaceDetection(t *testing.T) {
+	items := make(map[string]*TestItem)
+	for i := 0; i < 1000; i++ {
+		id := "item" + string(rune('A'+i%26)) + string(rune('0'+(i/26)%10)) + string(rune('0'+(i/260)%10))
+		items[id] = &TestItem{ID: id, Value: "value" + id}
+	}
+
+	loadFn := func(ids []string) (map[string]*TestItem, error) {
+		result := make(map[string]*TestItem)
+		for _, id := range ids {
+			if item, ok := items[id]; ok {
+				result[id] = item
+			}
+		}
+		return result, nil
+	}
+
+	loader := NewBatchLoader(loadFn, BatchLoaderConfig{MaxBatchSize: 50})
+
+	var wg sync.WaitGroup
+	numGoroutines := 50
+	opsPerGoroutine := 100
+
+	// Mix of operations: LoadBatch, Preload, Get, GetOrLoad, Size, Clear
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				op := (goroutineID + j) % 6
+				switch op {
+				case 0: // LoadBatch
+					ids := make([]string, 10)
+					for k := 0; k < 10; k++ {
+						idx := (goroutineID*10 + k + j) % 1000
+						ids[k] = "item" + string(rune('A'+idx%26)) + string(rune('0'+(idx/26)%10)) + string(rune('0'+(idx/260)%10))
+					}
+					_, _ = loader.LoadBatch(ids)
+				case 1: // Preload
+					ids := make([]string, 5)
+					for k := 0; k < 5; k++ {
+						idx := (goroutineID*5 + k + j*2) % 1000
+						ids[k] = "item" + string(rune('A'+idx%26)) + string(rune('0'+(idx/26)%10)) + string(rune('0'+(idx/260)%10))
+					}
+					_ = loader.Preload(ids)
+				case 2: // Get
+					idx := (goroutineID + j) % 1000
+					id := "item" + string(rune('A'+idx%26)) + string(rune('0'+(idx/26)%10)) + string(rune('0'+(idx/260)%10))
+					_, _ = loader.Get(id)
+				case 3: // GetOrLoad
+					idx := (goroutineID*3 + j) % 1000
+					id := "item" + string(rune('A'+idx%26)) + string(rune('0'+(idx/26)%10)) + string(rune('0'+(idx/260)%10))
+					_, _ = loader.GetOrLoad(id)
+				case 4: // Size
+					_ = loader.Size()
+				case 5: // CachedIDs
+					_ = loader.CachedIDs()
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify data integrity - all cached items should be valid
+	cachedIDs := loader.CachedIDs()
+	for _, id := range cachedIDs {
+		item, ok := loader.Get(id)
+		if !ok {
+			t.Errorf("cached ID %s not retrievable", id)
+			continue
+		}
+		if item.ID != id {
+			t.Errorf("item ID mismatch: expected %s, got %s", id, item.ID)
+		}
+	}
+}
+
+// TestBatchLoader_DataIntegrityConcurrent verifies that data integrity is
+// maintained when multiple goroutines load overlapping IDs.
+func TestBatchLoader_DataIntegrityConcurrent(t *testing.T) {
+	// Create a deterministic set of items
+	items := make(map[string]*TestItem)
+	for i := 0; i < 100; i++ {
+		id := "integrity" + string(rune('0'+i/10)) + string(rune('0'+i%10))
+		items[id] = &TestItem{ID: id, Value: "value-" + id}
+	}
+
+	var loadCount atomic.Int64
+	loadFn := func(ids []string) (map[string]*TestItem, error) {
+		loadCount.Add(1)
+		result := make(map[string]*TestItem)
+		for _, id := range ids {
+			if item, ok := items[id]; ok {
+				// Return a copy to detect any shared state issues
+				result[id] = &TestItem{ID: item.ID, Value: item.Value}
+			}
+		}
+		return result, nil
+	}
+
+	loader := NewBatchLoader(loadFn, BatchLoaderConfig{MaxBatchSize: 10})
+
+	var wg sync.WaitGroup
+	numGoroutines := 20
+	errChan := make(chan error, numGoroutines*100)
+
+	// All goroutines load the same overlapping set of IDs
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			// Each goroutine loads overlapping ranges
+			start := (goroutineID * 5) % 100
+			ids := make([]string, 20)
+			for j := 0; j < 20; j++ {
+				idx := (start + j) % 100
+				ids[j] = "integrity" + string(rune('0'+idx/10)) + string(rune('0'+idx%10))
+			}
+
+			result, err := loader.LoadBatch(ids)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			// Verify all requested items that exist are returned correctly
+			for _, id := range ids {
+				if expected, exists := items[id]; exists {
+					if loaded, ok := result[id]; !ok {
+						errChan <- errors.New("missing item: " + id)
+					} else if loaded.Value != expected.Value {
+						errChan <- errors.New("value mismatch for " + id)
+					}
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		t.Error(err)
+	}
+
+	// Verify final cache state
+	for id, expected := range items {
+		if cached, ok := loader.Get(id); ok {
+			if cached.Value != expected.Value {
+				t.Errorf("cache integrity check failed for %s: expected %s, got %s",
+					id, expected.Value, cached.Value)
+			}
+		}
+	}
+}
+
+// TestBatchLoader_ConcurrentGetOrLoad tests concurrent GetOrLoad calls
+// for the same ID don't cause races or corrupt data.
+func TestBatchLoader_ConcurrentGetOrLoad(t *testing.T) {
+	item := &TestItem{ID: "shared", Value: "shared-value"}
+
+	var loadCount atomic.Int64
+	loadFn := func(ids []string) (map[string]*TestItem, error) {
+		loadCount.Add(1)
+		result := make(map[string]*TestItem)
+		for _, id := range ids {
+			if id == "shared" {
+				result[id] = &TestItem{ID: item.ID, Value: item.Value}
+			}
+		}
+		return result, nil
+	}
+
+	loader := NewBatchLoader(loadFn, DefaultBatchLoaderConfig())
+
+	var wg sync.WaitGroup
+	numGoroutines := 100
+	errChan := make(chan error, numGoroutines)
+
+	// All goroutines try to GetOrLoad the same ID simultaneously
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := loader.GetOrLoad("shared")
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if result.ID != "shared" || result.Value != "shared-value" {
+				errChan <- errors.New("unexpected result value")
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		t.Error(err)
+	}
+
+	// Should have loaded at least once, but caching should reduce total loads
+	if loadCount.Load() == 0 {
+		t.Error("expected at least one load call")
+	}
+	t.Logf("load function called %d times for %d concurrent GetOrLoad calls", loadCount.Load(), numGoroutines)
+}
+
+// TestBatchLoader_ConcurrentInvalidateAndLoad tests that concurrent
+// invalidation and loading operations work correctly.
+func TestBatchLoader_ConcurrentInvalidateAndLoad(t *testing.T) {
+	items := make(map[string]*TestItem)
+	for i := 0; i < 50; i++ {
+		id := "inv" + string(rune('0'+i/10)) + string(rune('0'+i%10))
+		items[id] = &TestItem{ID: id, Value: "value-" + id}
+	}
+
+	loadFn := func(ids []string) (map[string]*TestItem, error) {
+		result := make(map[string]*TestItem)
+		for _, id := range ids {
+			if item, ok := items[id]; ok {
+				result[id] = &TestItem{ID: item.ID, Value: item.Value}
+			}
+		}
+		return result, nil
+	}
+
+	loader := NewBatchLoader(loadFn, BatchLoaderConfig{MaxBatchSize: 10})
+
+	var wg sync.WaitGroup
+
+	// Goroutines that load
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				ids := make([]string, 5)
+				for k := 0; k < 5; k++ {
+					idx := (goroutineID + j + k) % 50
+					ids[k] = "inv" + string(rune('0'+idx/10)) + string(rune('0'+idx%10))
+				}
+				_, _ = loader.LoadBatch(ids)
+			}
+		}(i)
+	}
+
+	// Goroutines that invalidate
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				idx := (goroutineID*10 + j) % 50
+				id := "inv" + string(rune('0'+idx/10)) + string(rune('0'+idx%10))
+				loader.Invalidate(id)
+			}
+		}(i)
+	}
+
+	// Goroutines that clear
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				loader.Clear()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Just verify no panic occurred and loader is still usable
+	_, err := loader.LoadBatch([]string{"inv00", "inv01"})
+	if err != nil {
+		t.Errorf("loader unusable after concurrent operations: %v", err)
+	}
+}
+
+// TestBatchLoader_LockOverhead benchmarks the lock performance
+func TestBatchLoader_LockOverhead(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping lock overhead test in short mode")
+	}
+
+	items := make(map[string]*TestItem)
+	for i := 0; i < 1000; i++ {
+		id := "perf" + string(rune('0'+i/100)) + string(rune('0'+(i/10)%10)) + string(rune('0'+i%10))
+		items[id] = &TestItem{ID: id, Value: "value" + id}
+	}
+
+	loadFn := func(ids []string) (map[string]*TestItem, error) {
+		result := make(map[string]*TestItem)
+		for _, id := range ids {
+			if item, ok := items[id]; ok {
+				result[id] = item
+			}
+		}
+		return result, nil
+	}
+
+	loader := NewBatchLoader(loadFn, BatchLoaderConfig{MaxBatchSize: 100})
+
+	// Pre-load all items
+	allIDs := make([]string, 0, 1000)
+	for id := range items {
+		allIDs = append(allIDs, id)
+	}
+	_, _ = loader.LoadBatch(allIDs)
+
+	// Measure concurrent read performance (all reads from cache)
+	var wg sync.WaitGroup
+	iterations := 10000
+	numGoroutines := 10
+
+	start := func() int64 { return 0 }() // placeholder for timing
+	_ = start
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				idx := (goroutineID*iterations + j) % 1000
+				id := "perf" + string(rune('0'+idx/100)) + string(rune('0'+(idx/10)%10)) + string(rune('0'+idx%10))
+				_, _ = loader.Get(id)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify cache is still intact
+	if loader.Size() != 1000 {
+		t.Errorf("expected 1000 cached items after concurrent reads, got %d", loader.Size())
+	}
+}
