@@ -69,12 +69,14 @@ func (s *RuleStore) scanRules(rows *sql.Rows) ([]InferenceRule, error) {
 }
 
 // updateCache replaces the cache with the given rules.
+// Each rule is copied before storing to avoid pointer aliasing.
 func (s *RuleStore) updateCache(rules []InferenceRule) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cache = make(map[string]*InferenceRule, len(rules))
 	for i := range rules {
-		s.cache[rules[i].ID] = &rules[i]
+		ruleCopy := rules[i]
+		s.cache[ruleCopy.ID] = &ruleCopy
 	}
 }
 

@@ -550,6 +550,172 @@ func TestRuleStore_GetRule_CacheReturnsCopy(t *testing.T) {
 // Helper Functions Tests
 // =============================================================================
 
+// =============================================================================
+// W3C.4 Pointer Aliasing Bug Tests
+// =============================================================================
+
+// TestRuleStore_updateCache_NoPointerAliasing verifies that each cached rule
+// points to distinct memory, not all pointing to the last element.
+func TestRuleStore_updateCache_NoPointerAliasing(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	store := NewRuleStore(db)
+
+	// Create rules with distinct IDs and properties
+	rules := []InferenceRule{
+		{ID: "rule1", Name: "First Rule", Priority: 1, Enabled: true,
+			Head: RuleCondition{Subject: "?a", Predicate: "p1", Object: "?b"},
+			Body: []RuleCondition{{Subject: "?a", Predicate: "b1", Object: "?b"}}},
+		{ID: "rule2", Name: "Second Rule", Priority: 2, Enabled: false,
+			Head: RuleCondition{Subject: "?c", Predicate: "p2", Object: "?d"},
+			Body: []RuleCondition{{Subject: "?c", Predicate: "b2", Object: "?d"}}},
+		{ID: "rule3", Name: "Third Rule", Priority: 3, Enabled: true,
+			Head: RuleCondition{Subject: "?e", Predicate: "p3", Object: "?f"},
+			Body: []RuleCondition{{Subject: "?e", Predicate: "b3", Object: "?f"}}},
+	}
+
+	// Call updateCache directly
+	store.updateCache(rules)
+
+	// Verify each cached rule is distinct and correct
+	for _, original := range rules {
+		cached, ok := store.cache[original.ID]
+		if !ok {
+			t.Errorf("rule %s not found in cache", original.ID)
+			continue
+		}
+
+		// Check that the cached rule matches the original
+		if cached.ID != original.ID {
+			t.Errorf("rule %s: ID mismatch, got %s (pointer aliasing bug!)", original.ID, cached.ID)
+		}
+		if cached.Name != original.Name {
+			t.Errorf("rule %s: Name mismatch, got %s, want %s", original.ID, cached.Name, original.Name)
+		}
+		if cached.Priority != original.Priority {
+			t.Errorf("rule %s: Priority mismatch, got %d, want %d", original.ID, cached.Priority, original.Priority)
+		}
+		if cached.Enabled != original.Enabled {
+			t.Errorf("rule %s: Enabled mismatch, got %v, want %v", original.ID, cached.Enabled, original.Enabled)
+		}
+	}
+
+	// Additional check: verify pointers are to distinct memory addresses
+	var ptrs []*InferenceRule
+	for _, ptr := range store.cache {
+		ptrs = append(ptrs, ptr)
+	}
+	for i := 0; i < len(ptrs); i++ {
+		for j := i + 1; j < len(ptrs); j++ {
+			if ptrs[i] == ptrs[j] {
+				t.Error("multiple cache entries point to same memory address (pointer aliasing bug!)")
+			}
+		}
+	}
+}
+
+// TestRuleStore_updateCache_EmptyRules verifies updateCache handles empty input.
+func TestRuleStore_updateCache_EmptyRules(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	store := NewRuleStore(db)
+
+	// Pre-populate cache
+	store.cache["existing"] = &InferenceRule{ID: "existing"}
+
+	// Update with empty slice
+	store.updateCache([]InferenceRule{})
+
+	// Cache should be empty
+	if len(store.cache) != 0 {
+		t.Errorf("expected empty cache, got %d entries", len(store.cache))
+	}
+}
+
+// TestRuleStore_updateCache_SingleRule verifies updateCache handles single rule.
+func TestRuleStore_updateCache_SingleRule(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	store := NewRuleStore(db)
+
+	rule := InferenceRule{
+		ID:       "single",
+		Name:     "Single Rule",
+		Priority: 42,
+		Enabled:  true,
+		Head:     RuleCondition{Subject: "?x", Predicate: "test", Object: "?y"},
+		Body:     []RuleCondition{{Subject: "?x", Predicate: "body", Object: "?y"}},
+	}
+
+	store.updateCache([]InferenceRule{rule})
+
+	if len(store.cache) != 1 {
+		t.Errorf("expected 1 cache entry, got %d", len(store.cache))
+	}
+
+	cached, ok := store.cache["single"]
+	if !ok {
+		t.Fatal("single rule not found in cache")
+	}
+
+	if cached.ID != rule.ID || cached.Name != rule.Name || cached.Priority != rule.Priority {
+		t.Error("cached rule does not match original")
+	}
+}
+
+// TestRuleStore_CacheLookupReturnsCorrectRule verifies lookups return the correct rule.
+func TestRuleStore_CacheLookupReturnsCorrectRule(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	store := NewRuleStore(db)
+	ctx := context.Background()
+
+	// Save multiple rules with distinct properties
+	rules := []InferenceRule{
+		createTestRule("alpha", 10, true),
+		createTestRule("beta", 20, false),
+		createTestRule("gamma", 30, true),
+	}
+
+	// Modify names to make them more distinct
+	rules[0].Name = "Alpha Rule"
+	rules[1].Name = "Beta Rule"
+	rules[2].Name = "Gamma Rule"
+
+	for _, r := range rules {
+		if err := store.SaveRule(ctx, r); err != nil {
+			t.Fatalf("SaveRule failed: %v", err)
+		}
+	}
+
+	// Delete from DB to force cache-only lookups
+	for _, r := range rules {
+		if _, err := db.Exec("DELETE FROM inference_rules WHERE id = ?", r.ID); err != nil {
+			t.Fatalf("failed to delete from db: %v", err)
+		}
+	}
+
+	// Verify each lookup returns the correct rule
+	for _, expected := range rules {
+		got, err := store.GetRule(ctx, expected.ID)
+		if err != nil {
+			t.Fatalf("GetRule(%s) failed: %v", expected.ID, err)
+		}
+		if got == nil {
+			t.Fatalf("GetRule(%s) returned nil", expected.ID)
+		}
+		if got.ID != expected.ID {
+			t.Errorf("GetRule(%s): got ID %s (pointer aliasing bug!)", expected.ID, got.ID)
+		}
+		if got.Name != expected.Name {
+			t.Errorf("GetRule(%s): got Name %s, want %s", expected.ID, got.Name, expected.Name)
+		}
+		if got.Priority != expected.Priority {
+			t.Errorf("GetRule(%s): got Priority %d, want %d", expected.ID, got.Priority, expected.Priority)
+		}
+	}
+}
+
 func TestBoolToInt(t *testing.T) {
 	if boolToInt(true) != 1 {
 		t.Error("boolToInt(true) should return 1")
