@@ -82,7 +82,7 @@ func (b *ChannelBus) publishToSubscribers(subs []*channelSubscription, msg *Mess
 }
 
 func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message) {
-	if !sub.active.Load() {
+	if !sub.active.Load() || sub.closed.Load() {
 		return
 	}
 	select {

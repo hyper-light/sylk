@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -215,7 +216,7 @@ func (pm *TemporalPartitionManager) QueryTimeRange(start, end time.Time) []strin
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
-	pm.stats.QueriesExecuted++
+	atomic.AddInt64(&pm.stats.QueriesExecuted, 1)
 
 	startKey, endKey := pm.partitionBounds(start, end)
 	return pm.collectPartitionEntries(start, end, startKey, endKey)
@@ -247,11 +248,11 @@ func (pm *TemporalPartitionManager) collectPartitionRange(partition *TemporalPar
 	if partition == nil {
 		return nil
 	}
-	pm.stats.PartitionsScanned++
-	partition.mu.RLock()
+	atomic.AddInt64(&pm.stats.PartitionsScanned, 1)
+	partition.mu.Lock()
 	ids := filterPartitionEntries(partition, start, end)
 	partition.LastAccessTime = time.Now()
-	partition.mu.RUnlock()
+	partition.mu.Unlock()
 	return ids
 }
 

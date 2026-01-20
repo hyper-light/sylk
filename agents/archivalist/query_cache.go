@@ -64,10 +64,23 @@ type CachedResponse struct {
 	CreatedAt  time.Time
 	ExpiresAt  time.Time
 	HitCount   int64
-	LastHitAt  time.Time
+	lastHitAt  atomic.Value // stores time.Time
 	QueryType  QueryType
 	SessionID  string
 	SourceType string // "cache", "synthesis"
+}
+
+// LastHitAt returns the last hit time (thread-safe)
+func (cr *CachedResponse) LastHitAt() time.Time {
+	if v := cr.lastHitAt.Load(); v != nil {
+		return v.(time.Time)
+	}
+	return time.Time{}
+}
+
+// SetLastHitAt sets the last hit time (thread-safe)
+func (cr *CachedResponse) SetLastHitAt(t time.Time) {
+	cr.lastHitAt.Store(t)
 }
 
 // IsExpired checks if the cached response has expired
@@ -174,7 +187,7 @@ func (qc *QueryCache) getMatchedResponse(hash string, sessionID string) (*Cached
 
 func (qc *QueryCache) recordHit(response *CachedResponse) {
 	atomic.AddInt64(&response.HitCount, 1)
-	response.LastHitAt = time.Now()
+	response.SetLastHitAt(time.Now())
 	atomic.AddInt64(&qc.hits, 1)
 	if response.SessionID != "" {
 		qc.incrementSessionCount(&qc.sessionHits, response.SessionID)
