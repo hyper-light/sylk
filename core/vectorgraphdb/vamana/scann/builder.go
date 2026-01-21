@@ -174,6 +174,7 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, graphStore *storage.GraphS
 	R := b.vamanaConf.R
 	assignments := b.partitioner.Assignments()
 	numParts := b.partitioner.NumPartitions()
+	numWorkers := b.config.NumWorkers
 
 	partitionMembers := make([][]uint32, numParts)
 	for i := range n {
@@ -181,41 +182,61 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, graphStore *storage.GraphS
 		partitionMembers[part] = append(partitionMembers[part], uint32(i))
 	}
 
-	for i := range n {
-		myPart := assignments[i]
-		members := partitionMembers[myPart]
+	chunkSize := (n + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
 
-		neighbors := make([]uint32, 0, R)
-		seen := make(map[uint32]struct{})
-		seen[uint32(i)] = struct{}{}
-
-		localTarget := (R * 3) / 4
-		if localTarget > len(members)-1 {
-			localTarget = len(members) - 1
+	for w := range numWorkers {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		if start >= end {
+			continue
 		}
 
-		perm := rand.Perm(len(members))
-		for _, idx := range perm {
-			if len(neighbors) >= localTarget {
-				break
-			}
-			candidate := members[idx]
-			if _, exists := seen[candidate]; !exists {
-				seen[candidate] = struct{}{}
-				neighbors = append(neighbors, candidate)
-			}
-		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				myPart := assignments[i]
+				members := partitionMembers[myPart]
 
-		for len(neighbors) < R && len(neighbors) < n-1 {
-			neighbor := uint32(rand.IntN(n))
-			if _, exists := seen[neighbor]; !exists {
-				seen[neighbor] = struct{}{}
-				neighbors = append(neighbors, neighbor)
-			}
-		}
+				neighbors := make([]uint32, 0, R)
+				seen := make(map[uint32]struct{})
+				seen[uint32(i)] = struct{}{}
 
-		graphStore.SetNeighbors(uint32(i), neighbors)
+				localTarget := (R * 3) / 4
+				if localTarget > len(members)-1 {
+					localTarget = len(members) - 1
+				}
+
+				perm := rand.Perm(len(members))
+				for _, idx := range perm {
+					if len(neighbors) >= localTarget {
+						break
+					}
+					candidate := members[idx]
+					if _, exists := seen[candidate]; !exists {
+						seen[candidate] = struct{}{}
+						neighbors = append(neighbors, candidate)
+					}
+				}
+
+				for len(neighbors) < R && len(neighbors) < n-1 {
+					neighbor := uint32(rand.IntN(n))
+					if _, exists := seen[neighbor]; !exists {
+						seen[neighbor] = struct{}{}
+						neighbors = append(neighbors, neighbor)
+					}
+				}
+
+				graphStore.SetNeighbors(uint32(i), neighbors)
+			}
+		}(start, end)
 	}
+
+	wg.Wait()
 }
 
 func (b *BatchBuilder) buildGraphVamana(
