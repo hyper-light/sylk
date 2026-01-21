@@ -380,7 +380,7 @@ func (b *BatchBuilder) refineGraph(
 	alpha := b.vamanaConf.Alpha
 	numWorkers := b.config.NumWorkers
 
-	numPasses := 4
+	numPasses := computeRefinementPasses(n)
 	for pass := range numPasses {
 		order := rand.Perm(n)
 		if pass%2 == 1 {
@@ -395,6 +395,19 @@ func (b *BatchBuilder) refineGraph(
 			b.config.ProgressCallback(pass+1, numPasses)
 		}
 	}
+}
+
+func computeRefinementPasses(n int) int {
+	if n <= 1000 {
+		return 2
+	}
+	if n <= 10000 {
+		return 3
+	}
+	if n <= 100000 {
+		return 4
+	}
+	return 5
 }
 
 type nodeUpdate struct {
