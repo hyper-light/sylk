@@ -186,6 +186,20 @@ func RobustPrune(p uint32, candidates []uint32, alpha float64, R int, distFn Dis
 	return selected
 }
 
+type PruneBuffers struct {
+	ToScore  []uint32
+	Scored   []candidate
+	Selected []uint32
+}
+
+func NewPruneBuffers(maxCandidates, R int) *PruneBuffers {
+	return &PruneBuffers{
+		ToScore:  make([]uint32, maxCandidates),
+		Scored:   make([]candidate, maxCandidates),
+		Selected: make([]uint32, 0, R),
+	}
+}
+
 func RobustPruneDirect(
 	p uint32,
 	candidates []uint32,
@@ -193,6 +207,7 @@ func RobustPruneDirect(
 	R int,
 	vectors [][]float32,
 	mags []float64,
+	buf *PruneBuffers,
 ) []uint32 {
 	if len(candidates) == 0 {
 		return nil
@@ -211,7 +226,7 @@ func RobustPruneDirect(
 
 	toScore := candidates
 	if len(candidates) > maxScore && secondHopSamples > 0 {
-		toScore = make([]uint32, maxScore)
+		toScore = buf.ToScore[:maxScore]
 		copy(toScore, candidates[:preserveCount])
 		copy(toScore[preserveCount:], candidates[preserveCount:maxScore])
 		for i, c := range candidates[maxScore:] {
@@ -225,7 +240,7 @@ func RobustPruneDirect(
 	pVec := vectors[p]
 	pMag := mags[p]
 
-	scored := make([]candidate, len(toScore))
+	scored := buf.Scored[:len(toScore)]
 	for i, c := range toScore {
 		cVec := vectors[c]
 		cMag := mags[c]
@@ -251,7 +266,7 @@ func RobustPruneDirect(
 
 	examineCount := min(maxExamine, len(scored))
 
-	selected := make([]uint32, 0, R)
+	selected := buf.Selected[:0]
 	consecutiveRejections := 0
 
 	for i := range examineCount {
@@ -288,7 +303,7 @@ func RobustPruneDirect(
 		}
 	}
 
-	return selected
+	return slices.Clone(selected)
 }
 
 func RobustPruneWithScores(p uint32, scored []candidate, alpha float64, R int, distFn DistanceFunc) []uint32 {

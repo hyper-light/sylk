@@ -584,6 +584,7 @@ func (b *BatchBuilder) computeRefinements(
 
 	seen := make([]bool, n)
 	candidateList := make([]uint32, 0, R*R)
+	pruneBuf := vamana.NewPruneBuffers(R*R, R)
 	updates := make([]nodeUpdate, 0, len(nodeIndices))
 
 	for _, idx := range nodeIndices {
@@ -615,7 +616,7 @@ func (b *BatchBuilder) computeRefinements(
 			continue
 		}
 
-		newNeighbors := vamana.RobustPruneDirect(nodeID, candidateList, alpha, R, vectors, mags)
+		newNeighbors := vamana.RobustPruneDirect(nodeID, candidateList, alpha, R, vectors, mags, pruneBuf)
 		updates = append(updates, nodeUpdate{
 			nodeID:       nodeID,
 			newNeighbors: newNeighbors,
