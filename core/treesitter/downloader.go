@@ -156,7 +156,7 @@ func NewGrammarDownloader(opts ...DownloaderOption) (*GrammarDownloader, error) 
 		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		cacheDir:     filepath.Join(dataDir, "grammars"),
 		buildDir:     filepath.Join(dataDir, "grammar-build"),
-		baseURL:      "https://github.com/tree-sitter",
+		baseURL:      "https://github.com",
 		checksums:    make(map[string]string),
 		sessionPerms: make(map[string]DownloadPermission),
 		alwaysPerms:  make(map[string]bool),
@@ -188,23 +188,24 @@ type GrammarInfo struct {
 }
 
 var knownGrammars = map[string]GrammarInfo{
-	"go":         {Name: "go", Repo: "tree-sitter-go", Branch: "master", SourcePath: "src"},
-	"python":     {Name: "python", Repo: "tree-sitter-python", Branch: "master", SourcePath: "src"},
-	"javascript": {Name: "javascript", Repo: "tree-sitter-javascript", Branch: "master", SourcePath: "src"},
-	"typescript": {Name: "typescript", Repo: "tree-sitter-typescript", Branch: "master", SourcePath: "typescript/src"},
-	"tsx":        {Name: "tsx", Repo: "tree-sitter-typescript", Branch: "master", SourcePath: "tsx/src"},
-	"rust":       {Name: "rust", Repo: "tree-sitter-rust", Branch: "master", SourcePath: "src"},
-	"c":          {Name: "c", Repo: "tree-sitter-c", Branch: "master", SourcePath: "src"},
-	"cpp":        {Name: "cpp", Repo: "tree-sitter-cpp", Branch: "master", SourcePath: "src"},
-	"java":       {Name: "java", Repo: "tree-sitter-java", Branch: "master", SourcePath: "src"},
-	"ruby":       {Name: "ruby", Repo: "tree-sitter-ruby", Branch: "master", SourcePath: "src"},
-	"json":       {Name: "json", Repo: "tree-sitter-json", Branch: "master", SourcePath: "src"},
-	"yaml":       {Name: "yaml", Repo: "tree-sitter-yaml", Branch: "master", SourcePath: "src"},
-	"toml":       {Name: "toml", Repo: "tree-sitter-toml", Branch: "master", SourcePath: "src"},
-	"html":       {Name: "html", Repo: "tree-sitter-html", Branch: "master", SourcePath: "src"},
-	"css":        {Name: "css", Repo: "tree-sitter-css", Branch: "master", SourcePath: "src"},
-	"bash":       {Name: "bash", Repo: "tree-sitter-bash", Branch: "master", SourcePath: "src"},
-	"markdown":   {Name: "markdown", Repo: "tree-sitter-markdown", Branch: "split_parser", SourcePath: "tree-sitter-markdown/src"},
+	"go":         {Name: "go", Repo: "tree-sitter/tree-sitter-go", Branch: "master", SourcePath: "src"},
+	"python":     {Name: "python", Repo: "tree-sitter/tree-sitter-python", Branch: "master", SourcePath: "src"},
+	"javascript": {Name: "javascript", Repo: "tree-sitter/tree-sitter-javascript", Branch: "master", SourcePath: "src"},
+	"typescript": {Name: "typescript", Repo: "tree-sitter/tree-sitter-typescript", Branch: "master", SourcePath: "typescript/src"},
+	"tsx":        {Name: "tsx", Repo: "tree-sitter/tree-sitter-typescript", Branch: "master", SourcePath: "tsx/src"},
+	"rust":       {Name: "rust", Repo: "tree-sitter/tree-sitter-rust", Branch: "master", SourcePath: "src"},
+	"c":          {Name: "c", Repo: "tree-sitter/tree-sitter-c", Branch: "master", SourcePath: "src"},
+	"cpp":        {Name: "cpp", Repo: "tree-sitter/tree-sitter-cpp", Branch: "master", SourcePath: "src"},
+	"java":       {Name: "java", Repo: "tree-sitter/tree-sitter-java", Branch: "master", SourcePath: "src"},
+	"ruby":       {Name: "ruby", Repo: "tree-sitter/tree-sitter-ruby", Branch: "master", SourcePath: "src"},
+	"json":       {Name: "json", Repo: "tree-sitter/tree-sitter-json", Branch: "master", SourcePath: "src"},
+	"yaml":       {Name: "yaml", Repo: "tree-sitter-grammars/tree-sitter-yaml", Branch: "master", SourcePath: "src"},
+	"toml":       {Name: "toml", Repo: "tree-sitter-grammars/tree-sitter-toml", Branch: "master", SourcePath: "src"},
+	"html":       {Name: "html", Repo: "tree-sitter/tree-sitter-html", Branch: "master", SourcePath: "src"},
+	"css":        {Name: "css", Repo: "tree-sitter/tree-sitter-css", Branch: "master", SourcePath: "src"},
+	"bash":       {Name: "bash", Repo: "tree-sitter/tree-sitter-bash", Branch: "master", SourcePath: "src"},
+	"markdown":   {Name: "markdown", Repo: "tree-sitter-grammars/tree-sitter-markdown", Branch: "main", SourcePath: "src"},
+	"properties": {Name: "properties", Repo: "tree-sitter-grammars/tree-sitter-properties", Branch: "master", SourcePath: "src"},
 }
 
 func (d *GrammarDownloader) EnsureGrammar(ctx context.Context, name string) (string, error) {
@@ -489,41 +490,78 @@ func (d *GrammarDownloader) compileGrammar(ctx context.Context, name, srcDir str
 		return "", fmt.Errorf("parser.c not found in %s", srcDir)
 	}
 
-	sources := []string{parserC}
+	var cSources, cxxSources []string
+	cSources = append(cSources, parserC)
 
 	scannerC := filepath.Join(srcDir, "scanner.c")
 	if _, err := os.Stat(scannerC); err == nil {
-		sources = append(sources, scannerC)
+		cSources = append(cSources, scannerC)
 	}
 	scannerCC := filepath.Join(srcDir, "scanner.cc")
 	if _, err := os.Stat(scannerCC); err == nil {
-		sources = append(sources, scannerCC)
+		cxxSources = append(cxxSources, scannerCC)
 	}
 
 	libName := grammarLibName(name)
 	libPath := filepath.Join(d.cacheDir, libName)
 
-	compiler := "cc"
-	if hasCCScanner(sources) {
-		compiler = "c++"
+	if len(cxxSources) == 0 {
+		return d.compilePureC(ctx, srcDir, cSources, libPath)
 	}
+	return d.compileMixed(ctx, srcDir, cSources, cxxSources, libPath)
+}
 
-	args := buildCompilerArgs(srcDir, sources, libPath)
+func (d *GrammarDownloader) compilePureC(ctx context.Context, srcDir string, sources []string, libPath string) (string, error) {
+	args := []string{"-shared", "-fPIC", "-O2", "-std=c11", "-I", srcDir}
+	args = append(args, sources...)
+	args = append(args, "-o", libPath)
 
-	var cmd *exec.Cmd
-	if d.sandboxEnabled {
-		cmd = d.sandboxedCompileCommand(ctx, compiler, args)
-	} else {
-		cmd = exec.CommandContext(ctx, compiler, args...)
-	}
-
+	cmd := exec.CommandContext(ctx, "gcc", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("compile failed: %w\noutput: %s", err, output)
 	}
+	return libPath, nil
+}
 
-	if _, err := os.Stat(libPath); err != nil {
-		return "", fmt.Errorf("compiled library not found at %s", libPath)
+func (d *GrammarDownloader) compileMixed(ctx context.Context, srcDir string, cSources, cxxSources []string, libPath string) (string, error) {
+	tmpDir, err := os.MkdirTemp("", "grammar-build-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	var objects []string
+
+	for i, src := range cSources {
+		obj := filepath.Join(tmpDir, fmt.Sprintf("c_%d.o", i))
+		args := []string{"-c", "-fPIC", "-O2", "-std=c11", "-I", srcDir, src, "-o", obj}
+		cmd := exec.CommandContext(ctx, "gcc", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("compile %s failed: %w\noutput: %s", src, err, output)
+		}
+		objects = append(objects, obj)
+	}
+
+	for i, src := range cxxSources {
+		obj := filepath.Join(tmpDir, fmt.Sprintf("cxx_%d.o", i))
+		args := []string{"-c", "-fPIC", "-O2", "-std=c++11", "-I", srcDir, src, "-o", obj}
+		cmd := exec.CommandContext(ctx, "g++", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("compile %s failed: %w\noutput: %s", src, err, output)
+		}
+		objects = append(objects, obj)
+	}
+
+	args := []string{"-shared", "-fPIC", "-o", libPath}
+	args = append(args, objects...)
+	args = append(args, "-lstdc++")
+	cmd := exec.CommandContext(ctx, "gcc", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("link failed: %w\noutput: %s", err, output)
 	}
 
 	return libPath, nil
@@ -590,6 +628,12 @@ func buildCompilerArgs(srcDir string, sources []string, libPath string) []string
 		"-fPIC",
 		"-O2",
 		"-I", srcDir,
+	}
+
+	if hasCCScanner(sources) {
+		args = append(args, "-std=c++11")
+	} else {
+		args = append(args, "-std=c11")
 	}
 
 	switch runtime.GOOS {

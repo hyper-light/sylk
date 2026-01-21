@@ -48,6 +48,16 @@ If you encounter a need for FTS5 or SQLite extensions:
 3. **WAIT** - Do not proceed until the user explicitly says "yes" or "authorized"
 4. **REMOVE** - If you find existing FTS5/extension code, flag it for removal
 
+
+When implementing:
+1. **NEVER** Use magic numbers, we derive from the data
+2. **ALWAYS** Keep cyclomatic complexity less than 4
+3. **NEVER** Allow for untracked goroutines
+4. **NEVER** Allow for unbounded growth
+5. **NEVER** Allow for drops, memory-leaks, or race conditions
+6. **ALWAYS** Implement the most correct, robust, performant implementation and DO NOT WEIGHT COMPLEXITY
+7. **ALWAYS** Use modern go structures (Go 1.25+).
+
 **"Explicit authorization" means the user must specifically say they authorize the extension. Implied or assumed permission is NOT sufficient.**
 
 ---

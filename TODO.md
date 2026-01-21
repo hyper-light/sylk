@@ -35798,6 +35798,2184 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ ESTIMATED CAPACITY: 180-200 parallel engineer pipelines (increased for new groups) │
 │ DEPENDENCIES: Wave 3 complete, Groups 4E, 4G, 4K, 4L-4Z complete                   │
 │                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AI: Enhanced Vector Quantization (EVQ.1-EVQ.38)                 ││
+│ │ ** 4-Layer Hybrid Quantization for Improved Recall **                           ││
+│ │                                                                                  ││
+│ │ REFERENCE: See GRAPH_OPTIMIZATIONS.md for full analysis and architecture        ││
+│ │                                                                                  ││
+│ │ MOTIVATION: Current OPQ achieves ~85% recall. Neural methods (QINCo2) achieve   ││
+│ │ ~95% but require 10-30min training, incompatible with interactive terminal use. ││
+│ │ This hybrid approach achieves ~92-94% recall with ZERO blocking operations.     ││
+│ │                                                                                  ││
+│ │ ARCHITECTURE:                                                                    ││
+│ │   Layer 4: Query-Adaptive Weighting  (+1% recall, per-query)                    ││
+│ │   Layer 3: Remove-Birth Adaptation   (maintains recall, per-operation)          ││
+│ │   Layer 2: LOPQ Local Codebooks      (+2-3% recall, background training)        ││
+│ │   Layer 1: RaBitQ Instant Baseline   (~88% recall, ZERO training)               ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 1: Foundation Types (6 parallel - no dependencies)                    ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.1 - RaBitQ Types and Interfaces                                         ││
+│ │   FILE: core/vectorgraphdb/quantization/rabitq_types.go                         ││
+│ │   ISSUE: Need types for random rotation quantization                            ││
+│ │   FIX: Define RaBitQConfig, RaBitQEncoder interface, RaBitQCode type            ││
+│ │   ACCEPTANCE: Types compile, no cyclic imports with existing quantization       ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.2 - LOPQ Types and Interfaces                                           ││
+│ │   FILE: core/vectorgraphdb/quantization/lopq_types.go                           ││
+│ │   ISSUE: Need types for locally-optimized product quantization                  ││
+│ │   FIX: Define LOPQConfig, LOPQIndex interface, PartitionID, LocalCodebook       ││
+│ │   ACCEPTANCE: Types compile, compatible with existing ProductQuantizer          ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.3 - Remove-Birth Types                                                  ││
+│ │   FILE: core/vectorgraphdb/quantization/remove_birth_types.go                   ││
+│ │   ISSUE: Need types for centroid lifecycle management                           ││
+│ │   FIX: Define CentroidUtilization, BirthEvent, DeathEvent, AdaptationConfig     ││
+│ │   ACCEPTANCE: Types compile, event types serializable for SQLite                ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.4 - Query-Adaptive Types                                                ││
+│ │   FILE: core/vectorgraphdb/quantization/query_adaptive_types.go                 ││
+│ │   ISSUE: Need types for per-query subspace weighting                            ││
+│ │   FIX: Define SubspaceWeights, QueryProfile, WeightingStrategy                  ││
+│ │   ACCEPTANCE: Types compile, weights slice length matches subspace count        ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.5 - Training Queue Types                                                ││
+│ │   FILE: core/vectorgraphdb/quantization/training_queue_types.go                 ││
+│ │   ISSUE: Need types for background training job management                      ││
+│ │   FIX: Define TrainingJob, JobStatus, TrainingQueue interface                   ││
+│ │   ACCEPTANCE: Types compile, job status transitions well-defined                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.6 - Hybrid Quantizer Interface                                          ││
+│ │   FILE: core/vectorgraphdb/quantization/hybrid_quantizer.go                     ││
+│ │   ISSUE: Need unified interface for 4-layer hybrid quantization                 ││
+│ │   FIX: Define HybridQuantizer interface with Encode, Decode, Distance, Status   ││
+│ │   ACCEPTANCE: Interface compatible with QuantizedHNSW consumer                  ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 2: Core Implementations (6 parallel - depends on Phase 1)             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.7 - RaBitQ Rotation Matrix Generator                                    ││
+│ │   FILE: core/vectorgraphdb/quantization/rabitq_rotation.go                      ││
+│ │   ISSUE: Need deterministic orthogonal rotation matrix from seed                ││
+│ │   FIX: Implement Gram-Schmidt orthogonalization with seeded RNG                 ││
+│ │   ACCEPTANCE: Matrix is orthogonal (R*R^T = I), deterministic from seed         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.8 - RaBitQ Encoder Implementation                                       ││
+│ │   FILE: core/vectorgraphdb/quantization/rabitq.go                               ││
+│ │   ISSUE: Need sign-based quantization encoder                                   ││
+│ │   FIX: Implement Encode(vec) = sign(R @ vec), pack into bytes                   ││
+│ │   ACCEPTANCE: Encodes 768-dim to 96 bytes, <100us per vector                    ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.9 - RaBitQ Distance Function                                            ││
+│ │   FILE: core/vectorgraphdb/quantization/rabitq.go                               ││
+│ │   ISSUE: Need Hamming distance with analytical correction                       ││
+│ │   FIX: Implement popcount-based distance with correction factor                 ││
+│ │   ACCEPTANCE: Distance correlates with true L2 (Pearson > 0.85)                 ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.10 - LOPQ Coarse Quantizer                                              ││
+│ │   FILE: core/vectorgraphdb/quantization/lopq_coarse.go                          ││
+│ │   ISSUE: Need vector space partitioning (1024 coarse centroids)                 ││
+│ │   FIX: Reuse existing k-means with 1024 centroids, add PartitionID lookup       ││
+│ │   ACCEPTANCE: Partition assignment <500us, consistent with NearestCentroid      ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.11 - Training Queue Implementation                                      ││
+│ │   FILE: core/vectorgraphdb/quantization/training_queue.go                       ││
+│ │   ISSUE: Need background job queue for non-blocking LOPQ training               ││
+│ │   FIX: Implement priority queue with SQLite persistence, worker goroutine       ││
+│ │   ACCEPTANCE: Jobs persist across restarts, FIFO within priority                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.12 - Centroid Utilization Tracker                                       ││
+│ │   FILE: core/vectorgraphdb/quantization/utilization_tracker.go                  ││
+│ │   ISSUE: Need to track how many vectors assigned to each centroid               ││
+│ │   FIX: Implement in-memory counter with SQLite persistence                      ││
+│ │   ACCEPTANCE: Increment/decrement O(1), persist on graceful shutdown            ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 3: SQLite Integration (4 parallel - depends on Phase 1)               ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.13 - RaBitQ Schema Migration                                            ││
+│ │   FILE: core/vectorgraphdb/migrations/evq_rabitq.go                             ││
+│ │   ISSUE: Need SQLite tables for RaBitQ config and rotation matrix               ││
+│ │   FIX: Add rabitq_config table, store compressed rotation matrix as BLOB        ││
+│ │   ACCEPTANCE: Migration runs idempotently, rotation matrix round-trips          ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.14 - LOPQ Schema Migration                                              ││
+│ │   FILE: core/vectorgraphdb/migrations/evq_lopq.go                               ││
+│ │   ISSUE: Need SQLite tables for partitions and local codebooks                  ││
+│ │   FIX: Add lopq_partitions, lopq_codebooks tables                               ││
+│ │   ACCEPTANCE: Migration runs idempotently, foreign keys to vectors              ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.15 - Utilization Schema Migration                                       ││
+│ │   FILE: core/vectorgraphdb/migrations/evq_utilization.go                        ││
+│ │   ISSUE: Need SQLite table for centroid utilization tracking                    ││
+│ │   FIX: Add centroid_utilization table                                           ││
+│ │   ACCEPTANCE: Migration runs idempotently, composite primary key works          ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.16 - Training Queue Schema Migration                                    ││
+│ │   FILE: core/vectorgraphdb/migrations/evq_training_queue.go                     ││
+│ │   ISSUE: Need SQLite table for background training job persistence              ││
+│ │   FIX: Add training_queue table with status, timestamps                         ││
+│ │   ACCEPTANCE: Migration runs idempotently, status enum constraint               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 4: LOPQ Training (4 parallel - depends on Phase 2, 3)                 ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.17 - LOPQ Local Codebook Trainer                                        ││
+│ │   FILE: core/vectorgraphdb/quantization/lopq_trainer.go                         ││
+│ │   ISSUE: Need to train PQ codebooks per partition                               ││
+│ │   FIX: Sample vectors from partition, train local PQ, store in SQLite           ││
+│ │   ACCEPTANCE: Training <1s for 1000 vectors, codebook stored correctly          ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.18 - Background Training Manager                                        ││
+│ │   FILE: core/vectorgraphdb/quantization/training_manager.go                     ││
+│ │   ISSUE: Need non-blocking orchestration of LOPQ training                       ││
+│ │   FIX: Worker goroutine processes queue, respects GoroutineBudget               ││
+│ │   ACCEPTANCE: Training never blocks insert, graceful shutdown                   ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.19 - Codebook Hot-Swap                                                  ││
+│ │   FILE: core/vectorgraphdb/quantization/lopq_swap.go                            ││
+│ │   ISSUE: Need atomic codebook replacement without downtime                      ││
+│ │   FIX: Implement double-buffering with atomic pointer swap                      ││
+│ │   ACCEPTANCE: No query failures during swap, old codebook garbage collected     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.20 - Partition Vector Re-encoding                                       ││
+│ │   FILE: core/vectorgraphdb/quantization/lopq_reencode.go                        ││
+│ │   ISSUE: Need to re-encode vectors when local codebook changes                  ││
+│ │   FIX: Background job iterates partition vectors, updates codes                 ││
+│ │   ACCEPTANCE: Re-encoding non-blocking, progress trackable                      ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 5: HNSW Integration (4 parallel - depends on Phase 2, 4)              ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.21 - QuantizedHNSW RaBitQ Mode                                          ││
+│ │   FILE: core/vectorgraphdb/quantization/quantized_hnsw.go                       ││
+│ │   ISSUE: Need to integrate RaBitQ as instant-available quantization             ││
+│ │   FIX: Add RaBitQ path in Encode/Distance, use when LOPQ not ready              ││
+│ │   ACCEPTANCE: Search works immediately on cold start with RaBitQ                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.22 - QuantizedHNSW LOPQ Mode                                            ││
+│ │   FILE: core/vectorgraphdb/quantization/quantized_hnsw.go                       ││
+│ │   ISSUE: Need to integrate LOPQ for improved recall                             ││
+│ │   FIX: Add LOPQ path with partition lookup + local PQ encoding                  ││
+│ │   ACCEPTANCE: Recall improves 2-3% over RaBitQ when LOPQ trained                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.23 - Hybrid Mode Fallback Logic                                         ││
+│ │   FILE: core/vectorgraphdb/quantization/quantized_hnsw.go                       ││
+│ │   ISSUE: Need seamless fallback from LOPQ to RaBitQ                             ││
+│ │   FIX: Check LOPQ availability per partition, fallback to RaBitQ                ││
+│ │   ACCEPTANCE: No errors when partition codebook missing, transparent fallback   ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.24 - Quantization Status API                                            ││
+│ │   FILE: core/vectorgraphdb/quantization/status.go                               ││
+│ │   ISSUE: Need visibility into quantization layer status                         ││
+│ │   FIX: Add GetQuantizationStatus() returning layer states, training progress    ││
+│ │   ACCEPTANCE: Status includes all 4 layers, JSON-serializable                   ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 6: Streaming Adaptation (4 parallel - depends on Phase 2, 3)          ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.25 - Remove-Birth Dead Centroid Detection                               ││
+│ │   FILE: core/vectorgraphdb/quantization/remove_birth.go                         ││
+│ │   ISSUE: Need to detect underutilized centroids                                 ││
+│ │   FIX: Implement threshold check, schedule removal when below threshold         ││
+│ │   ACCEPTANCE: Dead centroids detected within 100ms of crossing threshold        ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.26 - Remove-Birth Centroid Splitting                                    ││
+│ │   FILE: core/vectorgraphdb/quantization/remove_birth.go                         ││
+│ │   ISSUE: Need to split overutilized centroids                                   ││
+│ │   FIX: Identify split candidates, create two from one via perturbation          ││
+│ │   ACCEPTANCE: Split preserves codebook size, improves local recall              ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.27 - Online Insert Hook                                                 ││
+│ │   FILE: core/vectorgraphdb/quantization/online_hooks.go                         ││
+│ │   ISSUE: Need to update utilization on vector insert                            ││
+│ │   FIX: Hook into AddNode, increment centroid utilization                        ││
+│ │   ACCEPTANCE: Insert overhead <10us, utilization always consistent              ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.28 - Online Delete Hook                                                 ││
+│ │   FILE: core/vectorgraphdb/quantization/online_hooks.go                         ││
+│ │   ISSUE: Need to update utilization on vector delete                            ││
+│ │   FIX: Hook into DeleteNode, decrement centroid utilization                     ││
+│ │   ACCEPTANCE: Delete overhead <10us, triggers death check if needed             ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 7: Query-Time Optimization (3 parallel - depends on Phase 5)          ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.29 - Subspace Variance Analyzer                                         ││
+│ │   FILE: core/vectorgraphdb/quantization/query_adaptive.go                       ││
+│ │   ISSUE: Need to compute per-subspace variance for weighting                    ││
+│ │   FIX: Implement variance computation over query vector subspaces               ││
+│ │   ACCEPTANCE: Variance computation <50us per query                              ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.30 - Query-Adaptive Distance                                            ││
+│ │   FILE: core/vectorgraphdb/quantization/query_adaptive.go                       ││
+│ │   ISSUE: Need weighted asymmetric distance computation                          ││
+│ │   FIX: Weight subspace distances by variance, normalize                         ││
+│ │   ACCEPTANCE: Weighted distance correlates better with true L2                  ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.31 - Query-Adaptive Integration                                         ││
+│ │   FILE: core/vectorgraphdb/quantization/quantized_hnsw.go                       ││
+│ │   ISSUE: Need to use query-adaptive weighting in search                         ││
+│ │   FIX: Add optional query-adaptive path, enable via config                      ││
+│ │   ACCEPTANCE: Recall +1% with query-adaptive enabled                            ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ EVQ PHASE 8: Testing and Benchmarks (7 parallel - depends on all above)         ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.32 - RaBitQ Unit Tests                                                  ││
+│ │   FILE: core/vectorgraphdb/quantization/rabitq_test.go                          ││
+│ │   ISSUE: Need comprehensive tests for RaBitQ encoder                            ││
+│ │   FIX: Test rotation orthogonality, encoding consistency, distance correlation  ││
+│ │   ACCEPTANCE: 90%+ coverage, all edge cases covered                             ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.33 - LOPQ Unit Tests                                                    ││
+│ │   FILE: core/vectorgraphdb/quantization/lopq_test.go                            ││
+│ │   ISSUE: Need comprehensive tests for LOPQ components                           ││
+│ │   FIX: Test partitioning, local training, hot-swap, re-encoding                 ││
+│ │   ACCEPTANCE: 90%+ coverage, concurrent access safe                             ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.34 - Remove-Birth Unit Tests                                            ││
+│ │   FILE: core/vectorgraphdb/quantization/remove_birth_test.go                    ││
+│ │   ISSUE: Need tests for centroid lifecycle management                           ││
+│ │   FIX: Test death detection, splitting, utilization tracking                    ││
+│ │   ACCEPTANCE: All state transitions tested, race-free                           ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.35 - Recall Benchmark vs Baseline                                       ││
+│ │   FILE: core/vectorgraphdb/quantization/benchmark_test.go                       ││
+│ │   ISSUE: Need to verify recall improvement claims                               ││
+│ │   FIX: Benchmark recall@10 for RaBitQ, LOPQ, Hybrid vs current OPQ              ││
+│ │   ACCEPTANCE: RaBitQ >=85%, LOPQ >=90%, Hybrid >=92%                            ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.36 - Cold Start Latency Test                                            ││
+│ │   FILE: core/vectorgraphdb/quantization/benchmark_test.go                       ││
+│ │   ISSUE: Need to verify zero-training-time claim                                ││
+│ │   FIX: Measure time from empty DB to first successful search                    ││
+│ │   ACCEPTANCE: First search <100ms after first insert (RaBitQ path)              ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.37 - Distribution Shift Test                                            ││
+│ │   FILE: core/vectorgraphdb/quantization/benchmark_test.go                       ││
+│ │   ISSUE: Need to verify recall stability under distribution shift               ││
+│ │   FIX: Insert vectors from different distributions over time, measure recall    ││
+│ │   ACCEPTANCE: Recall doesn't degrade >5% after 10x initial data                 ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] EVQ.38 - Memory Pressure Test                                               ││
+│ │   FILE: core/vectorgraphdb/quantization/benchmark_test.go                       ││
+│ │   ISSUE: Need to verify behavior under memory pressure                          ││
+│ │   FIX: Test with PressureController in critical state                           ││
+│ │   ACCEPTANCE: Training paused, RaBitQ fallback works, no OOM                    ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ DEPENDENCY GRAPH:                                                                ││
+│ │                                                                                  ││
+│ │   PHASE 1 (Types)          PHASE 2 (Core)           PHASE 3 (Schema)            ││
+│ │   ┌───────────────┐        ┌───────────────┐        ┌───────────────┐           ││
+│ │   │ EVQ.1-6       │───────>│ EVQ.7-12      │        │ EVQ.13-16     │           ││
+│ │   │ (6 parallel)  │        │ (6 parallel)  │        │ (4 parallel)  │           ││
+│ │   └───────────────┘        └───────┬───────┘        └───────┬───────┘           ││
+│ │         │                          │                        │                   ││
+│ │         │                          ▼                        ▼                   ││
+│ │         │                  ┌───────────────┐        ┌───────────────┐           ││
+│ │         │                  │ PHASE 4       │        │ PHASE 6       │           ││
+│ │         │                  │ EVQ.17-20     │◄───────│ EVQ.25-28     │           ││
+│ │         │                  │ (4 parallel)  │        │ (4 parallel)  │           ││
+│ │         │                  └───────┬───────┘        └───────────────┘           ││
+│ │         │                          │                                            ││
+│ │         │                          ▼                                            ││
+│ │         │                  ┌───────────────┐                                    ││
+│ │         │                  │ PHASE 5       │                                    ││
+│ │         └─────────────────>│ EVQ.21-24     │                                    ││
+│ │                            │ (4 parallel)  │                                    ││
+│ │                            └───────┬───────┘                                    ││
+│ │                                    │                                            ││
+│ │                                    ▼                                            ││
+│ │                            ┌───────────────┐                                    ││
+│ │                            │ PHASE 7       │                                    ││
+│ │                            │ EVQ.29-31     │                                    ││
+│ │                            │ (3 parallel)  │                                    ││
+│ │                            └───────┬───────┘                                    ││
+│ │                                    │                                            ││
+│ │                                    ▼                                            ││
+│ │                            ┌───────────────┐                                    ││
+│ │                            │ PHASE 8       │                                    ││
+│ │                            │ EVQ.32-38     │                                    ││
+│ │                            │ (7 parallel)  │                                    ││
+│ │                            └───────────────┘                                    ││
+│ │                                                                                  ││
+│ │ TOTAL: 38 tasks (18 high, 20 medium priority)                                   ││
+│ │ EXECUTION: 8 phases, max 7 parallel per phase                                   ││
+│ │ EXPECTED RECALL: ~92-94% (vs ~85% current, ~95% neural)                         ││
+│ │ BLOCKING OPERATIONS: ZERO (RaBitQ instant, LOPQ background)                     ││
+│ │ REFERENCES: GRAPH_OPTIMIZATIONS.md, SIGMOD 2024, CVPR 2014, arXiv 2306.12574    ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ PARALLEL GROUP 4AJ: Vamana Knowledge Graph Architecture (VAM.1-VAM.73)          ││
+│ │ ** Complete HNSW Replacement with DiskANN/Vamana Algorithm **                   ││
+│ │ ** BACKWARD → FORWARD Implementation Strategy **                                ││
+│ │                                                                                  ││
+│ │ IMPLEMENTATION PHILOSOPHY:                                                      ││
+│ │   Build from storage layer UP, validating each layer on Sylk codebase:          ││
+│ │   1. Storage Foundation → Test storage works                                    ││
+│ │   2. Ingestion Hook → Test we can write real data                               ││
+│ │   3. Core Algorithm → Test search works                                         ││
+│ │   4. Streaming Layer → Test real-time updates work                              ││
+│ │   5. Advanced Features → Test filtered search, batch build                      ││
+│ │   6. Integration → Drop-in replacement                                          ││
+│ │                                                                                  ││
+│ │ MOTIVATION: HNSW achieves good recall but has limitations:                      ││
+│ │   - Multi-layer structure adds complexity and memory overhead                   ││
+│ │   - Poor streaming insert performance (rebuild upper layers)                    ││
+│ │   - No native filtered search support (post-filtering loses recall)             ││
+│ │   - Limited disk-friendliness (random access patterns)                          ││
+│ │                                                                                  ││
+│ │ VAMANA ADVANTAGES:                                                              ││
+│ │   - Single-layer graph with α-RNG pruning (RobustPrune)                         ││
+│ │   - Sub-second ingest-to-query via delta layer + WAL                            ││
+│ │   - Stitched Vamana for Domain/NodeType filtered search (no recall loss)        ││
+│ │   - mmap-friendly storage (sequential access, page-aligned)                     ││
+│ │   - ScaNN-style batch indexing for cold start                                   ││
+│ │                                                                                  ││
+│ │ ARCHITECTURE:                                                                    ││
+│ │   HOT PATH (mmap binary files):                                                 ││
+│ │     vectors.bin  - contiguous float32 arrays                                    ││
+│ │     graph.bin    - fixed-degree adjacency lists                                 ││
+│ │     labels.bin   - packed Domain/NodeType for filtering                         ││
+│ │   COLD PATH (SQLite - Source of Truth):                                         ││
+│ │     nodes table  - metadata (name, path, docstring, etc.)                       ││
+│ │     vectors table - embeddings (BLOB, rebuilt to binary on cold start)          ││
+│ │     node_id → internal_id mapping                                               ││
+│ │   STREAMING:                                                                    ││
+│ │     Delta layer (RAM) + WAL for crash recovery                                  ││
+│ │     Atomic snapshot publishing                                                  ││
+│ │     Compaction: delta → snapshot merge                                          ││
+│ │                                                                                  ││
+│ │ ALGORITHMS (from DiskANN papers):                                               ││
+│ │   - Vamana: RobustPrune with α-RNG, GreedySearch                                ││
+│ │   - Stitched Vamana: per-label subgraphs + stitching                            ││
+│ │   - ScaNN AVQ: anisotropic vector quantization for batch                        ││
+│ │                                                                                  ││
+│ │ NO BACKWARDS COMPATIBILITY: HNSW directory will be deleted entirely             ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 1: Foundation Types & Interfaces (8 tasks - no dependencies)          ││
+│ │ ** START HERE: Define contracts before implementation **                        ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.1 - Vamana Core Types                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/types.go                                      ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - InternalID uint32 (compact node identifier)                               ││
+│ │     - NodeID string (external identifier, maps to InternalID)                   ││
+│ │     - VamanaConfig struct: R (max degree), L (search list), α (RNG param ~1.2)  ││
+│ │     - SearchResult struct: InternalID, Similarity, Domain, NodeType             ││
+│ │     - SearchFilter struct: Domains, NodeTypes, MinSimilarity                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Types compile without cyclic imports                                  ││
+│ │     - [ ] VamanaConfig has DefaultConfig() with R=64, L=100, α=1.2              ││
+│ │     - [ ] InternalID is uint32 (not string) for memory efficiency               ││
+│ │     - [ ] JSON tags for serialization                                           ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.2 - Mmap Storage Types                                                  ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/types.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - VectorHeader: dim(4B), count(8B), flags(4B) = 16 bytes                    ││
+│ │     - GraphHeader: R(4B), count(8B), flags(4B) = 16 bytes                       ││
+│ │     - LabelHeader: domainBits(1B), typeBits(2B), count(8B), flags(4B) = 15B     ││
+│ │     - SnapshotMetadata: version, timestamp, vectorCount, graphChecksum          ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Headers are fixed-size, page-aligned (16 bytes)                       ││
+│ │     - [ ] Binary encoding/decoding methods                                      ││
+│ │     - [ ] Checksum computation for integrity verification                       ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.3 - Delta Layer Types                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/delta/types.go                                ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - DeltaEntry struct: InternalID, Vector, Neighbors, Domain, NodeType        ││
+│ │     - DeltaOperation enum: Insert, Delete, Update                               ││
+│ │     - DeltaConfig struct: MaxSize, CompactionThreshold, WALPath                 ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Types compile without cyclic imports                                  ││
+│ │     - [ ] DefaultDeltaConfig() with MaxSize=10000, CompactionThreshold=0.8      ││
+│ │     - [ ] Serializable to WAL format                                            ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.4 - WAL Entry Types                                                     ││
+│ │   FILE: core/vectorgraphdb/vamana/wal/types.go                                  ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - WALEntry: SequenceID(8B), OpType(1B), Timestamp(8B), DataLen(4B), Data    ││
+│ │     - OpType enum: Insert, Delete, Checkpoint, Compact                          ││
+│ │     - WALHeader: magic(4B), version(2B), flags(2B)                              ││
+│ │     - CRC32 checksum for each entry                                             ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Binary encoding with length-prefixed data                             ││
+│ │     - [ ] Checksum validation methods                                           ││
+│ │     - [ ] WAL_MAGIC = 0x56414D57 ("VAMW")                                        ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.5 - Stitched Vamana Types                                               ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/types.go                             ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - LabelSet struct: packed Domain + NodeType                                 ││
+│ │     - SubgraphID uint16 (max 65535 label combinations)                          ││
+│ │     - StitchedConfig struct: StitchDegree, FilteredSearchL                      ││
+│ │     - SubgraphMetadata: SubgraphID, LabelSet, NodeCount, Medoid                 ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] LabelSet fits in 3 bytes (1B domain + 2B nodetype)                    ││
+│ │     - [ ] SubgraphID derivable from LabelSet deterministically                  ││
+│ │     - [ ] Medoid (centroid node) tracked per subgraph                           ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] VAM.6 - ScaNN Batch Types                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/types.go                                ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - AVQConfig struct: NumPartitions, CodebookSize, AnisotropicWeight          ││
+│ │     - BatchBuildConfig struct: NumWorkers, ProgressCallback, TempDir            ││
+│ │     - PartitionAssignment struct: VectorID, PartitionID, Residual               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] DefaultAVQConfig() with sensible defaults                             ││
+│ │     - [ ] NumWorkers defaults to runtime.GOMAXPROCS(0)                          ││
+│ │     - [ ] ProgressCallback optional (nil-safe)                                  ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] VAM.7 - Index Interface                                                     ││
+│ │   FILE: core/vectorgraphdb/vamana/index.go (interface only)                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - VamanaIndex interface:                                                    ││
+│ │       Insert(id string, vector []float32, domain, nodeType) error               ││
+│ │       Delete(id string) error                                                   ││
+│ │       Search(query []float32, k int, filter *SearchFilter) []SearchResult       ││
+│ │       GetVector(id string) ([]float32, error)                                   ││
+│ │       Size() int                                                                ││
+│ │       Close() error                                                             ││
+│ │     - VamanaInserter interface (subset for batch operations)                    ││
+│ │     - VamanaSearcher interface (subset for search operations)                   ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Interface matches existing HNSWSearcher/HNSWInserter patterns         ││
+│ │     - [ ] Drop-in replacement for existing vectorgraphdb consumers              ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.8 - Error Types                                                         ││
+│ │   FILE: core/vectorgraphdb/vamana/errors.go                                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - ErrNodeNotFound, ErrEmptyVector, ErrDimensionMismatch                     ││
+│ │     - ErrIndexEmpty, ErrSnapshotCorrupt, ErrWALCorrupt                          ││
+│ │     - ErrCompactionInProgress, ErrDeltaFull                                     ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Sentinel errors for errors.Is() usage                                 ││
+│ │     - [ ] Wrapped errors include context (node ID, expected vs actual)          ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 2: Mmap Storage Layer (6 tasks - depends on Phase 1)                  ││
+│ │ ** CRITICAL: This is the foundation - must be rock solid **                     ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.9 - Mmap Utilities                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/mmap.go                               ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - MmapRegion struct: data []byte, size int64, readonly bool                 ││
+│ │     - MapFile(path, size, readonly) (*MmapRegion, error)                        ││
+│ │     - GrowFile(path, newSize) error (for dynamic growth)                        ││
+│ │     - Msync(region) error (flush to disk)                                       ││
+│ │     - Munmap(region) error (release mapping)                                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Uses golang.org/x/sys/unix for mmap syscalls                          ││
+│ │     - [ ] Page-aligned allocations (4KB boundary)                               ││
+│ │     - [ ] Graceful error handling for insufficient disk space                   ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.10 - Vector Store                                                       ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/vectors.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - VectorStore struct: region *MmapRegion, header *VectorHeader              ││
+│ │     - Open(path) (*VectorStore, error)                                          ││
+│ │     - Create(path, dim, capacity) (*VectorStore, error)                         ││
+│ │     - Get(internalID) []float32 (zero-copy via unsafe pointer)                  ││
+│ │     - Append(vector) (InternalID, error)                                        ││
+│ │     - Close() error                                                             ││
+│ │   FORMAT: [Header: 16B][Vector0: dim*4B][Vector1: dim*4B]...                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Zero-copy vector access via unsafe.Slice                              ││
+│ │     - [ ] Append is O(1) amortized (pre-allocate capacity)                      ││
+│ │     - [ ] Thread-safe for concurrent reads, single writer                       ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.11 - Graph Store                                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/graph.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - GraphStore struct: region *MmapRegion, header *GraphHeader, R int         ││
+│ │     - Open(path) (*GraphStore, error)                                           ││
+│ │     - Create(path, R, capacity) (*GraphStore, error)                            ││
+│ │     - GetNeighbors(internalID) []InternalID (zero-copy)                         ││
+│ │     - SetNeighbors(internalID, neighbors []InternalID) error                    ││
+│ │     - Close() error                                                             ││
+│ │   FORMAT: [Header: 16B][Node0: count(2B)|neighbors(R*4B)][Node1: ...]           ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Fixed-degree storage (R neighbors per node, padded if fewer)          ││
+│ │     - [ ] Neighbor count stored as uint16 (actual count <= R)                   ││
+│ │     - [ ] O(1) neighbor access via direct offset calculation                    ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.12 - Label Store                                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/labels.go                             ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - LabelStore struct: region *MmapRegion, header *LabelHeader                ││
+│ │     - Open(path) (*LabelStore, error)                                           ││
+│ │     - Create(path, capacity) (*LabelStore, error)                               ││
+│ │     - Get(internalID) (Domain, NodeType)                                        ││
+│ │     - Set(internalID, domain, nodeType) error                                   ││
+│ │     - FilterMask(domains, nodeTypes) []bool (for filtered search)               ││
+│ │     - Close() error                                                             ││
+│ │   FORMAT: [Header: 16B][Label0: domain(1B)|nodeType(2B)][Label1: ...]           ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] 3 bytes per label (packed Domain + NodeType)                          ││
+│ │     - [ ] FilterMask returns boolean array for batch filtering                  ││
+│ │     - [ ] O(1) label access                                                     ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.13 - ID Mapping Store                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/idmap.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - IDMap struct: toInternal map[string]InternalID, toExternal []string       ││
+│ │     - NewIDMap() *IDMap                                                         ││
+│ │     - Assign(externalID string) InternalID (assigns next available)             ││
+│ │     - ToInternal(externalID) (InternalID, bool)                                 ││
+│ │     - ToExternal(internalID) (string, bool)                                     ││
+│ │     - Save(path) error, Load(path) (*IDMap, error)                              ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Bidirectional O(1) lookup                                             ││
+│ │     - [ ] Persists to JSON or binary format                                     ││
+│ │     - [ ] Thread-safe via sync.RWMutex                                          ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.14 - Snapshot Manager                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/snapshot.go                           ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - SnapshotManager struct: baseDir, current *Snapshot, pending *Snapshot     ││
+│ │     - Snapshot struct: VectorStore, GraphStore, LabelStore, IDMap, Metadata     ││
+│ │     - OpenCurrent() (*Snapshot, error)                                          ││
+│ │     - BeginWrite() (*Snapshot, error) (creates new pending snapshot)            ││
+│ │     - CommitWrite() error (atomic rename current → old, pending → current)      ││
+│ │     - AbortWrite() error (delete pending)                                       ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Atomic commit via os.Rename                                           ││
+│ │     - [ ] Recovery: detect incomplete writes on startup                         ││
+│ │     - [ ] Old snapshot kept until new commit succeeds                           ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 3: Embedding Pipeline (3 tasks - depends on Phase 1)                  ││
+│ │ ** NEW: Generate vectors from code symbols **                                   ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.62 - Code Embedder Interface                                            ││
+│ │   FILE: core/vectorgraphdb/vamana/embedder/interface.go                         ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Embedder interface:                                                       ││
+│ │       Embed(ctx, text string) ([]float32, error)                                ││
+│ │       EmbedBatch(ctx, texts []string) ([][]float32, error)                      ││
+│ │       Dimension() int                                                           ││
+│ │     - EmbedderConfig struct: Model, Dimension, BatchSize, Timeout               ││
+│ │     - Rate limiting support (tokens/min, requests/min)                          ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Interface decouples embedding provider from storage                   ││
+│ │     - [ ] EmbedBatch supports parallel embedding with bounded concurrency       ││
+│ │     - [ ] Context cancellation respected                                        ││
+│ │     - [ ] Rate limiting prevents API throttling                                 ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.63 - Mock Embedder                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/embedder/mock.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - MockEmbedder struct: dimension int, rng *rand.Rand                        ││
+│ │     - Deterministic embeddings from text hash (reproducible tests)              ││
+│ │     - Configurable latency simulation for benchmarking                          ││
+│ │     - Implements Embedder interface                                             ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Same text → same embedding (deterministic)                            ││
+│ │     - [ ] Configurable dimension (default 768 for text-embedding-3-small)       ││
+│ │     - [ ] No external API calls (fast unit tests)                               ││
+│ │     - [ ] Latency simulation for realistic benchmarks                           ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.64 - Symbol Text Serializer                                             ││
+│ │   FILE: core/vectorgraphdb/vamana/embedder/serializer.go                        ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - SerializeSymbol(symbol *SymbolNode) string                                ││
+│ │     - SerializeFile(file *FileNode) string                                      ││
+│ │     - Format for functions: "func Name(params) returns // docstring"            ││
+│ │     - Format for types: "type Name struct { fields } // docstring"              ││
+│ │     - Include signature, docstring, file path context                           ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Deterministic serialization (same symbol → same text)                 ││
+│ │     - [ ] Truncation for very long docstrings (max 2000 chars)                  ││
+│ │     - [ ] Includes enough context for semantic similarity                       ││
+│ │     - [ ] Language-agnostic (works for Go, Python, TS, etc.)                    ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 4: Multi-Domain Ingestion (12 tasks - depends on Phase 2, 3)          ││
+│ │ ** NEW: Hook all agent data sources to Vamana storage **                        ││
+│ │ ** Supports: Librarian (code), Academic (research), Archivalist (events) **     ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 4A: Core Ingestion Infrastructure (4 tasks)                               ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] VAM.65 - Ingestion Interface                                                ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/interface.go                        ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Ingester interface:                                                       ││
+│ │       Ingest(ctx, items []IngestItem) error                                     ││
+│ │       IngestOne(ctx, item IngestItem) error                                     ││
+│ │       Delete(ctx, ids []string) error                                           ││
+│ │     - IngestItem struct:                                                        ││
+│ │       ID string                                                                 ││
+│ │       Content string (text to embed)                                            ││
+│ │       Domain Domain                                                             ││
+│ │       NodeType NodeType                                                         ││
+│ │       Metadata map[string]any (flexible per-domain data)                        ││
+│ │     - Unified interface for ALL domains (Code, History, Academic)               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Single interface handles all three domains                            ││
+│ │     - [ ] Metadata flexible enough for domain-specific fields                   ││
+│ │     - [ ] Batch and single-item ingestion supported                             ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.66 - Batch Vector Writer                                                ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/batch_writer.go                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BatchVectorWriter struct: snapshot, batchSize, buffer                     ││
+│ │     - Add(id string, vector []float32, domain, nodeType) error                  ││
+│ │     - Flush() error (writes buffered vectors to snapshot)                       ││
+│ │     - Close() error (flushes remaining, finalizes)                              ││
+│ │     - Streams vectors to storage without loading all in memory                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Bounded memory: max batchSize vectors in memory                       ││
+│ │     - [ ] Flush on batch full or explicit call                                  ││
+│ │     - [ ] Thread-safe for concurrent Add() calls                                ││
+│ │     - [ ] Progress tracking (vectors written / total)                           ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.67 - Label Mapper                                                       ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/labels.go                           ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - PackLabel(domain Domain, nodeType NodeType) uint32                        ││
+│ │     - UnpackLabel(packed uint32) (Domain, NodeType)                             ││
+│ │     - ValidateDomainNodeType(domain, nodeType) error                            ││
+│ │     Domain-specific NodeType mappings:                                          ││
+│ │       DomainCode (0): Function, Method, Struct, Interface, Variable, etc.       ││
+│ │       DomainHistory (1): Event, Conversation, Decision, Summary                 ││
+│ │       DomainAcademic (2): Paper, Abstract, Citation, Finding                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Bidirectional mapping (pack/unpack)                                   ││
+│ │     - [ ] Packed label fits in 3 bytes (1B domain + 2B nodeType)                ││
+│ │     - [ ] Validates domain-nodeType combinations                                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.68 - Edge Writer                                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/edges.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - WriteEdge(snapshot, fromID, toID string, edgeType EdgeType) error         ││
+│ │     - WriteEdgeBatch(snapshot, edges []Edge) error                              ││
+│ │     Edge types per domain:                                                      ││
+│ │       DomainCode: imports, contains, calls, implements                          ││
+│ │       DomainHistory: follows, references, summarizes                            ││
+│ │       DomainAcademic: cites, supports, contradicts                              ││
+│ │   NOTE: Initial implementation may skip graph edges (vectors-only mode)         ││
+│ │         Full edge support added after core algorithm works                      ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Edge types are domain-aware                                           ││
+│ │     - [ ] Bidirectional edges supported where needed                            ││
+│ │     - [ ] Edge IDs map to InternalIDs via IDMap                                 ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 4B: Librarian Ingestion - Code (3 tasks)                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] VAM.69 - Code Ingester                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/code_ingester.go                    ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - CodeIngester struct: embedder, snapshot, serializer                       ││
+│ │     - IngestCodeGraph(ctx, graph *CodeGraph) error                              ││
+│ │     - Coordinates: serialize symbols → embed → write with DomainCode            ││
+│ │     - Parallel embedding with bounded worker pool                               ││
+│ │   DEPENDENCIES:                                                                 ││
+│ │     - Uses existing CodeGraph from core/vectorgraphdb/ingestion/types.go        ││
+│ │     - Uses Symbol Text Serializer (VAM.64)                                      ││
+│ │     - Uses Batch Vector Writer (VAM.66)                                         ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Integrates with existing IngestCodebase() pipeline                    ││
+│ │     - [ ] All symbols get Domain = DomainCode (0)                               ││
+│ │     - [ ] Progress callback for large codebases                                 ││
+│ │     - [ ] Atomic: all-or-nothing write to snapshot                              ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.70 - Symbol → GraphNode Converter                                       ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/symbol_converter.go                 ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - ConvertSymbol(symbol *SymbolNode) *IngestItem                             ││
+│ │     - ConvertFile(file *FileNode) *IngestItem                                   ││
+│ │     - Maps SymbolKind → NodeType:                                               ││
+│ │       Function → NodeTypeFunction                                               ││
+│ │       Method → NodeTypeMethod                                                   ││
+│ │       Type/Struct → NodeTypeStruct                                              ││
+│ │       Interface → NodeTypeInterface                                             ││
+│ │       Variable → NodeTypeVariable                                               ││
+│ │       Constant → NodeTypeConstant                                               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] All SymbolKind values mapped to NodeType                              ││
+│ │     - [ ] Preserves Name, Path, Signature, Docstring in Metadata                ││
+│ │     - [ ] Generates stable ID from file path + symbol name                      ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.71 - Codebase Change Observer                                           ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/change_observer.go                  ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - ChangeObserver struct: watcher, debounce, callback                        ││
+│ │     - Watch(ctx, rootPath string) error                                         ││
+│ │     - OnChange callback: (changedFiles []string) error                          ││
+│ │     - Debounce rapid changes (100ms window)                                     ││
+│ │     - Git-aware: detect staged/unstaged changes                                 ││
+│ │   USE CASE: Librarian observes file changes → triggers re-indexing             ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Watches recursively with gitignore respect                            ││
+│ │     - [ ] Debounces rapid changes (editor save spam)                            ││
+│ │     - [ ] Reports changed files for incremental re-index                        ││
+│ │     - [ ] Graceful shutdown on context cancel                                   ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 4C: Academic Ingestion - Research (2 tasks)                               ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] VAM.72 - Academic Document Ingester                                         ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/academic_ingester.go                ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - AcademicIngester struct: embedder, snapshot                               ││
+│ │     - IngestPaper(ctx, paper *Paper) error                                      ││
+│ │     - IngestSearchResults(ctx, results []SearchResult) error                    ││
+│ │     - Paper struct: Title, Abstract, Authors, DOI, Content, Citations           ││
+│ │     - Serializes: title + abstract + key findings → embeddable text             ││
+│ │   USE CASE: Academic agent retrieves papers → indexes for retrieval             ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] All papers get Domain = DomainAcademic (2)                            ││
+│ │     - [ ] NodeType: Paper, Abstract, Citation, Finding                          ││
+│ │     - [ ] Handles long papers via chunking (max 8000 chars per chunk)           ││
+│ │     - [ ] Citation relationships captured as edges                              ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] VAM.73 - Academic Text Serializer                                           ││
+│ │   FILE: core/vectorgraphdb/vamana/embedder/academic_serializer.go               ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - SerializePaper(paper *Paper) string                                       ││
+│ │     - SerializeAbstract(paper *Paper) string                                    ││
+│ │     - SerializeCitation(citation *Citation) string                              ││
+│ │     - ChunkLongContent(content string, maxLen int) []string                     ││
+│ │     Format: "Title: X\nAuthors: Y\nAbstract: Z\nKey Findings: ..."              ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Deterministic serialization                                           ││
+│ │     - [ ] Chunking preserves semantic boundaries (paragraphs)                   ││
+│ │     - [ ] Includes enough context for retrieval                                 ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 4D: Archivalist Ingestion - Events (3 tasks)                              ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] VAM.74 - Event Pipeline Ingester                                            ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/event_ingester.go                   ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - EventIngester struct: embedder, snapshot, eventBus                        ││
+│ │     - Subscribe(ctx) error (listens to event pipeline)                          ││
+│ │     - IngestEvent(ctx, event *Event) error                                      ││
+│ │     - Event types: Conversation, Decision, ToolCall, ErrorReport, Summary       ││
+│ │     - Serializes event → embeddable text                                        ││
+│ │   USE CASE: Archivalist receives events → indexes for history search            ││
+│ │   DEPENDENCIES:                                                                 ││
+│ │     - Subscribes to existing event pipeline (core/events/)                      ││
+│ │     - Uses Batch Vector Writer for buffered writes                              ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] All events get Domain = DomainHistory (1)                             ││
+│ │     - [ ] NodeType: Event, Conversation, Decision, Summary                      ││
+│ │     - [ ] Handles high-frequency events via batching                            ││
+│ │     - [ ] Temporal ordering preserved (timestamp indexed)                       ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] VAM.75 - Event Text Serializer                                              ││
+│ │   FILE: core/vectorgraphdb/vamana/embedder/event_serializer.go                  ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - SerializeEvent(event *Event) string                                       ││
+│ │     - SerializeConversation(conv *Conversation) string                          ││
+│ │     - SerializeDecision(decision *Decision) string                              ││
+│ │     Format for events: "[timestamp] type: content // context"                   ││
+│ │     Format for conversations: "User: X\nAssistant: Y\n..."                      ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Deterministic serialization                                           ││
+│ │     - [ ] Includes timestamp, type, content, context                            ││
+│ │     - [ ] Truncates very long conversations (max 4000 chars)                    ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] VAM.76 - Event Relationship Builder                                         ││
+│ │   FILE: core/vectorgraphdb/vamana/ingestion/event_edges.go                      ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BuildTemporalEdges(events []Event) []Edge (event → next event)            ││
+│ │     - BuildReferenceEdges(event *Event) []Edge (event → referenced items)       ││
+│ │     - BuildSummaryEdges(summary, events []Event) []Edge                         ││
+│ │     Edge types:                                                                 ││
+│ │       follows: temporal sequence                                                ││
+│ │       references: event mentions file/symbol/paper                              ││
+│ │       summarizes: summary → source events                                       ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Temporal chain maintained (follows edges)                             ││
+│ │     - [ ] Cross-domain references detected (event → code symbol)                ││
+│ │     - [ ] Summary relationships enable drill-down                               ││
+│ │   PRIORITY: LOW                                                                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 5: Storage Validation (1 task - depends on Phase 4)                   ││
+│ │ ** CHECKPOINT: Prove storage works on THIS REPO (Sylk) before algorithm **      ││
+│ │ ** DOGFOODING: All validation uses Sylk codebase as test corpus **              ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.77 - Storage Benchmark on Sylk                                          ││
+│ │   FILE: core/vectorgraphdb/vamana/benchmark/storage_test.go                     ││
+│ │   TARGET: /home/ada/Projects/sylk (THIS REPO)                                   ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BenchmarkStorageIngest_Sylk: ingest entire Sylk codebase                  ││
+│ │     - Uses: os.Getwd() or hardcoded project root                                ││
+│ │     - Ingests ALL Go files in core/, cmd/, internal/                            ││
+│ │     - Measures:                                                                 ││
+│ │       - Parse time (tree-sitter) - target: <500ms                               ││
+│ │       - Embed time (mock embedder) - target: <2s                                ││
+│ │       - Write time (vectors.bin, labels.bin) - target: <500ms                   ││
+│ │       - Total symbols indexed (expect: 2000-5000 for Sylk)                      ││
+│ │       - Disk size (bytes per symbol)                                            ││
+│ │       - Memory peak during ingestion                                            ││
+│ │     - Validates:                                                                ││
+│ │       - All symbols written successfully                                        ││
+│ │       - Can read back ANY symbol by ID                                          ││
+│ │       - Labels match source symbols (Function, Struct, etc.)                    ││
+│ │       - IDMap bidirectional lookup works                                        ││
+│ │     - Real queries on Sylk code:                                                ││
+│ │       - Find "IngestCodebase" function                                          ││
+│ │       - Find "VectorGraphDB" struct                                             ││
+│ │       - Find all parsers in treesitter package                                  ││
+│ │   ACCEPTANCE (AGGRESSIVE - sub-second, 100k+/sec):                              ││
+│ │     - [ ] Sylk codebase ingests without error                                   ││
+│ │     - [ ] Total ingest time: <500ms for Sylk (parse + write, mock embed)        ││
+│ │     - [ ] Write throughput: ≥100,000 symbols/sec (batched)                      ││
+│ │     - [ ] Disk size: ≤3.2KB per symbol (768×4B + 256B overhead)                 ││
+│ │     - [ ] Memory peak: <64MB for Sylk (~5000 symbols = ~17MB data)              ││
+│ │     - [ ] Memory overhead: <4x raw data size                                    ││
+│ │     - [ ] All vectors readable and match expected dimension                     ││
+│ │     - [ ] Can locate specific Sylk symbols by ID                                ││
+│ │   WHY THESE TARGETS:                                                            ││
+│ │     - 17MB data on NVMe = 2-5ms disk I/O                                        ││
+│ │     - 17MB in memory = 0.3ms to traverse                                        ││
+│ │     - No excuse for >500ms with this data size                                  ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   BLOCKING: Must pass before proceeding to Phase 6                              ││
+│ │   RUN: go test -v -run BenchmarkStorageIngest ./core/vectorgraphdb/vamana/...   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 6: Core Vamana Algorithm (6 tasks - depends on Phase 2)               ││
+│ │ ** Now build the search algorithm on validated storage **                       ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.15 - Distance Functions                                                 ││
+│ │   FILE: core/vectorgraphdb/vamana/distance.go                                   ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - CosineDistance(a, b []float32, magA, magB float64) float64                ││
+│ │     - CosineSimilarity(a, b, magA, magB) float64                                ││
+│ │     - Magnitude(v []float32) float64                                            ││
+│ │     - SIMD-optimized inner product (use go:noescape for assembly)               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Identical to existing hnsw/distance.go (for consistency)              ││
+│ │     - [ ] Benchmark: ≥90% of HNSW distance performance                          ││
+│ │     - [ ] Pre-computed magnitude caching                                        ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.16 - RobustPrune Algorithm                                              ││
+│ │   FILE: core/vectorgraphdb/vamana/prune.go                                      ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - RobustPrune(p InternalID, candidates []InternalID, α float64, R int)      ││
+│ │       → []InternalID                                                            ││
+│ │     Algorithm (α-RNG pruning):                                                  ││
+│ │       1. Sort candidates by distance to p                                       ││
+│ │       2. For each candidate c in order:                                         ││
+│ │          - If dist(p,c) ≤ α * dist(c, any selected neighbor): add c             ││
+│ │          - Stop when |selected| = R                                             ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] α=1.0 is standard RNG, α>1.0 allows more diversity                    ││
+│ │     - [ ] Returns at most R neighbors                                           ││
+│ │     - [ ] O(R * |candidates|) complexity                                        ││
+│ │     - [ ] Unit tests verify RNG property                                        ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.17 - GreedySearch Algorithm                                             ││
+│ │   FILE: core/vectorgraphdb/vamana/search.go                                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - GreedySearch(query []float32, start InternalID, L, K int) []SearchResult  ││
+│ │     Algorithm (beam-style traversal):                                           ││
+│ │       1. Initialize candidates = {start}, visited = {}                          ││
+│ │       2. While candidates not empty:                                            ││
+│ │          - Pop closest unvisited candidate c                                    ││
+│ │          - Mark c visited, add to results                                       ││
+│ │          - For each neighbor n of c:                                            ││
+│ │            - If n not visited and closer than L-th result: add to candidates    ││
+│ │       3. Return top K results                                                   ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Uses min-heap for candidates (closest first)                          ││
+│ │     - [ ] Uses max-heap for results (furthest first for eviction)               ││
+│ │     - [ ] L controls search quality (larger L = better recall)                  ││
+│ │     - [ ] Unit tests verify recall on synthetic data                            ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.18 - Vamana Insert                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/insert.go                                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Insert(index *VamanaIndex, id string, vector, domain, nodeType)           ││
+│ │     Algorithm (FreshVamana streaming insert):                                   ││
+│ │       1. Assign internalID, store vector/labels                                 ││
+│ │       2. candidates = GreedySearch(vector, medoid, L=efConstruct, K=R*2)        ││
+│ │       3. neighbors = RobustPrune(internalID, candidates, α, R)                  ││
+│ │       4. For each neighbor n:                                                   ││
+│ │          - Add internalID to n's neighbor list                                  ││
+│ │          - If |n.neighbors| > R: n.neighbors = RobustPrune(n, n.neighbors, α, R)││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Bidirectional edge insertion                                          ││
+│ │     - [ ] Neighbor overflow triggers re-pruning                                 ││
+│ │     - [ ] Updates medoid if new node is better centroid                         ││
+│ │     - [ ] Unit tests verify graph connectivity                                  ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.19 - Vamana Delete                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/delete.go                                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Delete(index *VamanaIndex, id string) error                               ││
+│ │     Algorithm:                                                                  ││
+│ │       1. Find internalID from externalID                                        ││
+│ │       2. For each neighbor n of internalID:                                     ││
+│ │          - Remove internalID from n's neighbor list                             ││
+│ │          - Optionally repair: find replacement via GreedySearch                 ││
+│ │       3. Mark slot as deleted (tombstone)                                       ││
+│ │       4. Update medoid if deleted node was medoid                               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Lazy deletion via tombstone (no compaction during delete)             ││
+│ │     - [ ] Neighbor repair optional (configurable)                               ││
+│ │     - [ ] Medoid update if necessary                                            ││
+│ │     - [ ] Unit tests verify no dangling references                              ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.20 - Medoid Computation                                                 ││
+│ │   FILE: core/vectorgraphdb/vamana/medoid.go                                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - ComputeMedoid(vectors [][]float32) InternalID                             ││
+│ │     - UpdateMedoidIncremental(current, newVector) InternalID                    ││
+│ │     Algorithm: Find vector minimizing sum of distances to all others            ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] O(n) approximate medoid via sampling for large n                      ││
+│ │     - [ ] Incremental update avoids full recomputation                          ││
+│ │     - [ ] Used as starting point for GreedySearch                               ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 7: Search Validation (1 task - depends on Phase 5, 6)                 ││
+│ │ ** CHECKPOINT: Prove search works on THIS REPO before streaming layer **        ││
+│ │ ** DOGFOODING: Query actual Sylk code with real developer questions **          ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.78 - Search Benchmark on Sylk                                           ││
+│ │   FILE: core/vectorgraphdb/vamana/benchmark/search_test.go                      ││
+│ │   TARGET: Indexed Sylk codebase from VAM.77                                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BenchmarkSearch_Sylk: query indexed Sylk codebase                         ││
+│ │     - REAL queries a developer would ask about Sylk:                            ││
+│ │       - "function that ingests codebase and parses files"                       ││
+│ │         → EXPECT: IngestCodebase in ingestion.go                                ││
+│ │       - "tree-sitter parser pool management"                                    ││
+│ │         → EXPECT: ParserPool in parser_pool.go                                  ││
+│ │       - "HNSW vector search implementation"                                     ││
+│ │         → EXPECT: GreedySearch in hnsw/search.go                                ││
+│ │       - "SQLite database connection and transactions"                           ││
+│ │         → EXPECT: VectorGraphDB.BeginTx in db.go                                ││
+│ │       - "batch insert nodes with embeddings"                                    ││
+│ │         → EXPECT: BatchInsertNodes in batch.go                                  ││
+│ │     - Ground truth: manually verify top results are correct                     ││
+│ │     - Measures:                                                                 ││
+│ │       - Recall@10 (does expected result appear in top 10?)                      ││
+│ │       - p50/p99 latency (ms)                                                    ││
+│ │       - Throughput (queries/sec)                                                ││
+│ │   ACCEPTANCE (AGGRESSIVE - microsecond search, 100k+ qps):                      ││
+│ │     - [ ] Expected symbols appear in top-5 for all test queries                 ││
+│ │     - [ ] p50 latency < 100μs for K=10 (0.1ms)                                  ││
+│ │     - [ ] p99 latency < 500μs for K=10 (0.5ms)                                  ││
+│ │     - [ ] Throughput ≥ 100,000 queries/sec (single thread)                      ││
+│ │     - [ ] Throughput ≥ 500,000 queries/sec (parallel)                           ││
+│ │     - [ ] "NodeType=Function" filter returns only functions                     ││
+│ │     - [ ] Results are USEFUL (developer would find them helpful)                ││
+│ │   WHY THESE TARGETS:                                                            ││
+│ │     - 5000 nodes × 64 neighbors = 320k edges                                    ││
+│ │     - GreedySearch visits ~100-200 nodes for K=10                               ││
+│ │     - 200 distance calculations = ~50μs                                         ││
+│ │     - No excuse for >500μs                                                      ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   BLOCKING: Must pass before proceeding to Phase 8                              ││
+│ │   RUN: go test -v -run BenchmarkSearch ./core/vectorgraphdb/vamana/...          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 8: Delta Layer & WAL (5 tasks - depends on Phase 6)                   ││
+│ │ ** Streaming updates: sub-second ingest-to-query **                             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.21 - Write-Ahead Log                                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/wal/wal.go                                    ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - WAL struct: file *os.File, sequence uint64, mu sync.Mutex                 ││
+│ │     - Open(path) (*WAL, error)                                                  ││
+│ │     - Append(entry *WALEntry) error (fsync after each write)                    ││
+│ │     - Replay(handler func(*WALEntry) error) error                               ││
+│ │     - Truncate(beforeSeq uint64) error (after successful compaction)            ││
+│ │     - Close() error                                                             ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Crash-safe: incomplete entries detected via checksum                  ││
+│ │     - [ ] Replay skips corrupt entries with warning                             ││
+│ │     - [ ] Truncate removes entries before checkpoint                            ││
+│ │     - [ ] Tests pass with simulated crashes                                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.22 - Delta Index                                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/delta/delta.go                                ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - DeltaIndex struct: entries map[InternalID]*DeltaEntry, graph, wal         ││
+│ │     - Insert(id, vector, domain, nodeType) error                                ││
+│ │     - Delete(id) error                                                          ││
+│ │     - Search(query, k, filter) []SearchResult (searches delta only)             ││
+│ │     - Size() int                                                                ││
+│ │     - Drain() []*DeltaEntry (for compaction, clears delta)                      ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] In-memory Vamana graph for fast insert                                ││
+│ │     - [ ] All operations logged to WAL before returning                         ││
+│ │     - [ ] Search is independent of base snapshot                                ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.23 - Merged Search                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/delta/merged_search.go                        ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - MergedSearch(query, k, filter, base *Snapshot, delta *DeltaIndex)         ││
+│ │       → []SearchResult                                                          ││
+│ │     Algorithm:                                                                  ││
+│ │       1. Search base snapshot: baseResults                                      ││
+│ │       2. Search delta: deltaResults                                             ││
+│ │       3. Merge and re-rank by similarity                                        ││
+│ │       4. Apply tombstone filtering (exclude deleted from base)                  ││
+│ │       5. Return top K                                                           ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Handles tombstones (deleted IDs in delta mask base results)           ││
+│ │     - [ ] O(k log k) merge for sorted results                                   ││
+│ │     - [ ] Filter applied to both base and delta                                 ││
+│ │     - [ ] Unit tests verify correct merge behavior                              ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.24 - Compaction                                                         ││
+│ │   FILE: core/vectorgraphdb/vamana/delta/compaction.go                           ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Compactor struct: base *Snapshot, delta *DeltaIndex, config               ││
+│ │     - ShouldCompact() bool (delta.Size() > threshold)                           ││
+│ │     - Compact(ctx) error                                                        ││
+│ │     Algorithm:                                                                  ││
+│ │       1. Create new snapshot files                                              ││
+│ │       2. Copy base + apply delta operations                                     ││
+│ │       3. Rebuild graph connections for merged data                              ││
+│ │       4. Atomic commit new snapshot                                             ││
+│ │       5. Truncate WAL                                                           ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Background compaction via context                                     ││
+│ │     - [ ] Concurrent reads unaffected during compaction                         ││
+│ │     - [ ] Atomic switchover (readers see old or new, never partial)             ││
+│ │     - [ ] Tests pass with concurrent inserts during compaction                  ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.25 - WAL Recovery                                                       ││
+│ │   FILE: core/vectorgraphdb/vamana/wal/recovery.go                               ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - RecoverDelta(wal *WAL) (*DeltaIndex, error)                               ││
+│ │     Algorithm:                                                                  ││
+│ │       1. Replay WAL from beginning                                              ││
+│ │       2. Apply Insert/Delete operations to fresh DeltaIndex                     ││
+│ │       3. Skip Checkpoint entries (informational only)                           ││
+│ │       4. Return reconstructed delta                                             ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Handles incomplete final entry gracefully                             ││
+│ │     - [ ] Logs warning on corrupt entries                                       ││
+│ │     - [ ] Returns consistent delta state                                        ││
+│ │     - [ ] Tests pass with truncated WAL files                                   ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 9: Streaming Validation (1 task - depends on Phase 8)                 ││
+│ │ ** CHECKPOINT: Prove streaming ingest-to-query works on THIS REPO **            ││
+│ │ ** DOGFOODING: Simulate live development - edit file, query immediately **      ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.79 - Streaming Benchmark on Sylk                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/benchmark/streaming_test.go                   ││
+│ │   TARGET: Live-indexed Sylk codebase                                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BenchmarkStreaming_Sylk: measure ingest-to-query latency                  ││
+│ │     - REAL scenario (simulates developer workflow):                             ││
+│ │       1. Index Sylk codebase (baseline from VAM.77)                             ││
+│ │       2. "Add" a new function: TestNewVamanaFunction                            ││
+│ │       3. Insert via delta layer (simulates file save)                           ││
+│ │       4. IMMEDIATELY query: "new vamana test function"                          ││
+│ │       5. Verify: new function appears in results                                ││
+│ │       6. Measure: time from insert-complete to query-returns-result             ││
+│ │     - REAL scenario (simulates rapid iteration):                                ││
+│ │       - Add 10 new symbols in rapid succession (100ms apart)                    ││
+│ │       - Query for each after adding                                             ││
+│ │       - All should be immediately queryable                                     ││
+│ │     - Concurrent load test:                                                     ││
+│ │       - Writers: continuous inserts (100/sec)                                   ││
+│ │       - Readers: continuous queries (50/sec)                                    ││
+│ │       - Measure: query latency during write load                                ││
+│ │   ACCEPTANCE (AGGRESSIVE - microsecond ingest-to-query):                        ││
+│ │     - [ ] New symbol queryable within 1ms of insert                             ││
+│ │     - [ ] Query latency stable during write load (p99 < 1ms)                    ││
+│ │     - [ ] Insert throughput: ≥50,000 symbols/sec (async WAL)                    ││
+│ │     - [ ] Insert throughput: ≥10,000 symbols/sec (sync WAL)                     ││
+│ │     - [ ] No dropped writes under concurrent load                               ││
+│ │     - [ ] WAL recovery completes in <50ms for 10k entries                       ││
+│ │     - [ ] Developer can "save file" and immediately search for new code         ││
+│ │   WHY THESE TARGETS:                                                            ││
+│ │     - Delta layer is in-memory (microsecond insert)                             ││
+│ │     - WAL append is sequential (fast even with fsync)                           ││
+│ │     - Merged search adds ~100μs overhead                                        ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   BLOCKING: Must pass before proceeding to Phase 10                             ││
+│ │   RUN: go test -v -run BenchmarkStreaming ./core/vectorgraphdb/vamana/...       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 10: Stitched Vamana (6 tasks - depends on Phase 6)                    ││
+│ │ ** Filtered search by Domain/NodeType without recall loss **                    ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.26 - Label Index                                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/label_index.go                       ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - LabelIndex struct: byLabel map[LabelSet][]InternalID                      ││
+│ │     - Add(internalID, labels LabelSet)                                          ││
+│ │     - Remove(internalID, labels LabelSet)                                       ││
+│ │     - Get(labels LabelSet) []InternalID                                         ││
+│ │     - GetAny(domains, nodeTypes) []InternalID (union of matching labels)        ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] O(1) lookup by exact label set                                        ││
+│ │     - [ ] GetAny handles OR semantics for filtered search                       ││
+│ │     - [ ] Thread-safe via sync.RWMutex                                          ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.27 - Subgraph Manager                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/subgraph.go                          ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - SubgraphManager struct: subgraphs map[SubgraphID]*Subgraph                ││
+│ │     - Subgraph struct: nodes []InternalID, medoid InternalID, edges             ││
+│ │     - GetOrCreate(labelSet LabelSet) *Subgraph                                  ││
+│ │     - AddNode(labelSet, internalID) error                                       ││
+│ │     - RemoveNode(labelSet, internalID) error                                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Lazy subgraph creation (created on first node)                        ││
+│ │     - [ ] Each node belongs to exactly one subgraph                             ││
+│ │     - [ ] Subgraph has its own local graph edges                                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.28 - FilteredRobustPrune                                                ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/filtered_prune.go                    ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - FilteredRobustPrune(p, candidates, α, R, labelSet) []InternalID           ││
+│ │     Algorithm (label-aware pruning):                                            ││
+│ │       1. Partition candidates into same-label and cross-label                   ││
+│ │       2. Apply RobustPrune to same-label first (priority)                       ││
+│ │       3. Fill remaining slots with cross-label (for stitching)                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Prioritizes same-label neighbors                                      ││
+│ │     - [ ] Maintains cross-label edges for graph connectivity                    ││
+│ │     - [ ] Configurable same-label vs cross-label ratio                          ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.29 - Stitched Search                                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/search.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - StitchedSearch(query, k, filter *SearchFilter, index) []SearchResult      ││
+│ │     Algorithm:                                                                  ││
+│ │       1. If no filter: use global search (Phase 3)                              ││
+│ │       2. Get candidate subgraphs matching filter                                ││
+│ │       3. For each subgraph:                                                     ││
+│ │          - GreedySearch from subgraph medoid                                    ││
+│ │          - Collect top-K per subgraph                                           ││
+│ │       4. Merge results from all subgraphs                                       ││
+│ │       5. Return global top-K                                                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Filters applied pre-search (no post-filtering recall loss)            ││
+│ │     - [ ] Multi-subgraph search for OR filters                                  ││
+│ │     - [ ] Falls back to global search for empty filter                          ││
+│ │     - [ ] Benchmark: filtered recall ≥ unfiltered recall                        ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.30 - Stitched Insert                                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/insert.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - StitchedInsert(index, id, vector, domain, nodeType)                       ││
+│ │     Algorithm:                                                                  ││
+│ │       1. Standard Vamana insert to global graph                                 ││
+│ │       2. Determine labelSet from domain + nodeType                              ││
+│ │       3. Add to subgraph (create if needed)                                     ││
+│ │       4. Build local edges within subgraph                                      ││
+│ │       5. Build stitching edges to other subgraphs                               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Maintains both global and local graph structures                      ││
+│ │     - [ ] Subgraph medoid updated if better candidate                           ││
+│ │     - [ ] Stitching edges maintain cross-label connectivity                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.31 - Stitched Delete                                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/delete.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - StitchedDelete(index, id)                                                 ││
+│ │     Algorithm:                                                                  ││
+│ │       1. Standard Vamana delete from global graph                               ││
+│ │       2. Remove from subgraph                                                   ││
+│ │       3. Update subgraph medoid if necessary                                    ││
+│ │       4. Repair local and stitching edges                                       ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Maintains subgraph integrity                                          ││
+│ │     - [ ] No orphaned nodes in subgraphs                                        ││
+│ │     - [ ] Medoid update if deleted was medoid                                   ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 11: Filtered Search Validation (1 task - depends on Phase 10)         ││
+│ │ ** CHECKPOINT: Prove filtered search works on THIS REPO **                      ││
+│ │ ** DOGFOODING: Search "only functions" or "only structs" in Sylk **             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.80 - Filtered Search Benchmark on Sylk                                  ││
+│ │   FILE: core/vectorgraphdb/vamana/benchmark/filtered_test.go                    ││
+│ │   TARGET: Indexed Sylk codebase with multi-domain data                          ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BenchmarkFilteredSearch_Sylk: test Domain/NodeType filtering              ││
+│ │     - REAL Sylk queries with filters:                                           ││
+│ │       1. "vector search" + NodeType=Function                                    ││
+│ │          → EXPECT: only functions, no structs/interfaces                        ││
+│ │          → EXPECT: GreedySearch, Search, etc.                                   ││
+│ │       2. "database" + NodeType=Struct                                           ││
+│ │          → EXPECT: only structs like VectorGraphDB, Config                      ││
+│ │       3. "parse" + NodeType=Method                                              ││
+│ │          → EXPECT: only methods like Parse(), ParseFile()                       ││
+│ │       4. "config" + NodeType=Struct                                             ││
+│ │          → EXPECT: Config structs, not config functions                         ││
+│ │     - Filter verification:                                                      ││
+│ │       - Query "database" WITHOUT filter: returns functions + structs            ││
+│ │       - Query "database" WITH NodeType=Function: ONLY functions                 ││
+│ │       - Verify NO structs leak through                                          ││
+│ │     - Multi-domain test (once Academic/History ingestion works):                ││
+│ │       - Add mock research papers about "vector search"                          ││
+│ │       - Add mock events mentioning "database"                                   ││
+│ │       - Query with DomainCode filter: only Sylk code, no papers/events          ││
+│ │   ACCEPTANCE (AGGRESSIVE - filtering is FREE or FASTER):                        ││
+│ │     - [ ] Filtered recall ≥ unfiltered recall (Stitched Vamana property)        ││
+│ │     - [ ] NodeType filter returns ONLY that type (verified on Sylk)             ││
+│ │     - [ ] Domain filter returns ONLY that domain                                ││
+│ │     - [ ] Combined filters work correctly (AND semantics)                       ││
+│ │     - [ ] Filtered p99 latency < 500μs (same or better than unfiltered)         ││
+│ │     - [ ] Filtered throughput ≥ 100,000 qps                                     ││
+│ │     - [ ] Filtering adds ZERO overhead (pre-filter via subgraph)                ││
+│ │     - [ ] Useful for "show me only structs" type queries                        ││
+│ │   WHY THESE TARGETS:                                                            ││
+│ │     - Stitched Vamana searches SMALLER subgraphs                                ││
+│ │     - Filtered should be FASTER than unfiltered, not slower                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   BLOCKING: Must pass before proceeding to Phase 12                             ││
+│ │   RUN: go test -v -run BenchmarkFiltered ./core/vectorgraphdb/vamana/...        ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 12: ScaNN Batch Indexing (8 tasks - depends on Phase 2)               ││
+│ │ ** Critical for Cold Start: Sub-60s indexing of 50k+ vectors **                 ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ SCANN ARCHITECTURE OVERVIEW:                                                    ││
+│ │   ScaNN (Scalable Nearest Neighbors) uses Anisotropic Vector Quantization       ││
+│ │   to partition vectors, then builds per-partition graphs in parallel.           ││
+│ │   Key insight: dimensions with higher variance are more discriminative,         ││
+│ │   so we weight them higher during quantization.                                 ││
+│ │                                                                                  ││
+│ │   Pipeline: SQLite → Sample → Train AVQ → Assign All → Build Partitions         ││
+│ │             → Merge with Stitching → Write Snapshot                             ││
+│ │                                                                                  ││
+│ │   Memory Model: Stream vectors in batches (1000 at a time), never load all.     ││
+│ │   Parallelism: Worker pool for partition building, bounded by NumWorkers.       ││
+│ │                                                                                  ││
+│ │ [ ] VAM.32 - Dimension Variance Analyzer                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/variance.go                             ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - VarianceAnalyzer struct: sums, sumSquares, count for online computation   ││
+│ │     - Add(vector []float32) - Welford's online algorithm                        ││
+│ │     - Variances() []float64 - returns per-dimension variance                    ││
+│ │     - Weights() []float64 - returns 1/(σ² + ε) anisotropic weights              ││
+│ │     Algorithm (Welford's Online Variance):                                      ││
+│ │       For each vector v:                                                        ││
+│ │         count++                                                                 ││
+│ │         delta = v - mean                                                        ││
+│ │         mean += delta / count                                                   ││
+│ │         delta2 = v - mean                                                       ││
+│ │         M2 += delta * delta2                                                    ││
+│ │       variance = M2 / count                                                     ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Numerically stable (Welford's algorithm)                              ││
+│ │     - [ ] Single-pass computation (streaming compatible)                        ││
+│ │     - [ ] ε = 1e-8 to prevent division by zero                                  ││
+│ │     - [ ] Unit test: matches numpy.var on 10k random vectors                    ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.33 - Anisotropic Vector Quantization                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/avq.go                                  ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - AVQ struct:                                                               ││
+│ │         centroids [][]float32  // K centroids, each dim-dimensional             ││
+│ │         weights   []float64    // per-dimension anisotropic weights             ││
+│ │         dim       int                                                           ││
+│ │     - Train(samples [][]float32, config AVQConfig) error                        ││
+│ │     - Assign(vector []float32) int (nearest centroid index)                     ││
+│ │     - AssignBatch(vectors [][]float32) []int (parallel assignment)              ││
+│ │     - Residual(vector, centroidIdx) []float32                                   ││
+│ │     - Save(path) / Load(path) for persistence                                   ││
+│ │                                                                                  ││
+│ │     Algorithm (Anisotropic K-Means):                                            ││
+│ │       1. INIT: Use k-means++ initialization                                     ││
+│ │          - Pick first centroid uniformly at random                              ││
+│ │          - For k = 2..K:                                                        ││
+│ │            - D(x) = min distance from x to existing centroids (anisotropic)     ││
+│ │            - Pick next centroid with prob proportional to D(x)²                 ││
+│ │                                                                                  ││
+│ │       2. ITERATE (max 20 iterations or until convergence):                      ││
+│ │          a. ASSIGN: For each vector v:                                          ││
+│ │             assignment[v] = argmin_c dist_aniso(v, centroid[c])                 ││
+│ │             where dist_aniso(a,b) = Σ_i w_i * (a_i - b_i)²                      ││
+│ │                                                                                  ││
+│ │          b. UPDATE: For each centroid c:                                        ││
+│ │             centroid[c] = mean of vectors assigned to c                         ││
+│ │                                                                                  ││
+│ │          c. CHECK CONVERGENCE:                                                  ││
+│ │             If < 0.1% of assignments changed, stop                              ││
+│ │                                                                                  ││
+│ │     Anisotropic Distance Formula:                                               ││
+│ │       dist_aniso(q, c) = Σ_i (w_i * (q_i - c_i)²)                               ││
+│ │       where w_i = 1 / (variance_i + ε)                                          ││
+│ │       // High-variance dims get LOW weight (already discriminative)             ││
+│ │       // Low-variance dims get HIGH weight (need amplification)                 ││
+│ │       // This is OPPOSITE of typical intuition but correct for quantization     ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] K-means++ initialization (not random)                                 ││
+│ │     - [ ] Converges in ≤20 iterations                                           ││
+│ │     - [ ] Anisotropic distance uses pre-computed weights                        ││
+│ │     - [ ] AssignBatch parallelized via worker pool                              ││
+│ │     - [ ] Residual = vector - centroid[assignment]                              ││
+│ │     - [ ] Unit test: K=16 on 10k vectors converges, balanced partitions         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.34 - Vector Sampler                                                     ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/sampler.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - ReservoirSampler struct: samples, k, count, rng                           ││
+│ │     - NewReservoirSampler(k int, seed int64) *ReservoirSampler                  ││
+│ │     - Add(vector []float32) - reservoir sampling algorithm                      ││
+│ │     - Samples() [][]float32 - returns collected samples                         ││
+│ │     Algorithm (Reservoir Sampling - Algorithm R):                               ││
+│ │       For i-th vector v:                                                        ││
+│ │         If i < k: samples[i] = v                                                ││
+│ │         Else:                                                                   ││
+│ │           j = random(0, i)                                                      ││
+│ │           If j < k: samples[j] = v                                              ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] O(1) memory regardless of input size                                  ││
+│ │     - [ ] Uniform probability for all input vectors                             ││
+│ │     - [ ] Deterministic with seed for reproducibility                           ││
+│ │     - [ ] Default sample size: min(10000, 10% of total)                         ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ [ ] VAM.35 - Partition Graph Builder                                            ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/partition.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - PartitionGraph struct:                                                    ││
+│ │         partitionID  int                                                        ││
+│ │         localIDs     []InternalID   // local 0..n-1                             ││
+│ │         globalIDs    []InternalID   // maps local → global                      ││
+│ │         vectors      [][]float32                                                ││
+│ │         neighbors    [][]InternalID // local neighbor lists                     ││
+│ │         medoid       InternalID     // local ID of medoid                       ││
+│ │     - BuildPartitionGraph(ctx, vectors, globalIDs, config) (*PartitionGraph, error)││
+│ │                                                                                  ││
+│ │     Algorithm (Vamana Construction on Partition):                               ││
+│ │       1. Compute local medoid (minimize sum of distances)                       ││
+│ │       2. Initialize all neighbor lists as empty                                 ││
+│ │       3. For each vector v in random order:                                     ││
+│ │          a. candidates = GreedySearch(v, medoid, L=R*2, K=R*2)                  ││
+│ │          b. neighbors[v] = RobustPrune(v, candidates, α, R)                     ││
+│ │          c. For each neighbor n in neighbors[v]:                                ││
+│ │             - Add v to neighbors[n]                                             ││
+│ │             - If |neighbors[n]| > R:                                            ││
+│ │                 neighbors[n] = RobustPrune(n, neighbors[n], α, R)               ││
+│ │       4. Return PartitionGraph with local→global ID mapping                     ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Context cancellation respected                                        ││
+│ │     - [ ] Random insertion order (seeded for reproducibility)                   ││
+│ │     - [ ] Bidirectional edges maintained                                        ││
+│ │     - [ ] Local medoid computed correctly                                       ││
+│ │     - [ ] Unit test: partition graph is connected                               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.36 - Parallel Graph Builder                                             ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/builder.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BatchBuilder struct:                                                      ││
+│ │         config      BatchBuildConfig                                            ││
+│ │         avq         *AVQ                                                        ││
+│ │         workerPool  *WorkerPool                                                 ││
+│ │         progressFn  func(phase string, pct float64)                             ││
+│ │     - Build(ctx, vectorIter, labelIter) (*Snapshot, error)                      ││
+│ │                                                                                  ││
+│ │     Algorithm (Parallel Batch Construction):                                    ││
+│ │       PHASE 1 - SAMPLE & TRAIN (10% of time):                                   ││
+│ │         1. Stream vectors, collect sample via ReservoirSampler                  ││
+│ │         2. Compute variance via VarianceAnalyzer                                ││
+│ │         3. Train AVQ on sample                                                  ││
+│ │         progressFn("train", 0.10)                                               ││
+│ │                                                                                  ││
+│ │       PHASE 2 - ASSIGN (20% of time):                                           ││
+│ │         4. Stream all vectors again, assign to partitions                       ││
+│ │         5. Write partition assignments to temp file (vector_id, partition_id)   ││
+│ │         6. Count vectors per partition                                          ││
+│ │         progressFn("assign", 0.30)                                              ││
+│ │                                                                                  ││
+│ │       PHASE 3 - BUILD PARTITIONS (60% of time):                                 ││
+│ │         7. For each partition P (via worker pool):                              ││
+│ │            a. Load vectors for partition P from temp file                       ││
+│ │            b. Build PartitionGraph for P                                        ││
+│ │            c. Write partition to temp file                                      ││
+│ │         progressFn("build", 0.30 + 0.60 * partitions_done / total)              ││
+│ │                                                                                  ││
+│ │       PHASE 4 - MERGE (10% of time):                                            ││
+│ │         8. Merge all partitions via Merger                                      ││
+│ │         9. Write final snapshot                                                 ││
+│ │         progressFn("merge", 1.00)                                               ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Worker pool size = min(NumWorkers, NumPartitions)                     ││
+│ │     - [ ] Progress callback at each phase transition                            ││
+│ │     - [ ] Temp files cleaned up on error AND success                            ││
+│ │     - [ ] Context cancellation stops all workers                                ││
+│ │     - [ ] Memory: <2GB for 50k 768-dim vectors                                  ││
+│ │     - [ ] Benchmark: 50k vectors in <60s on 4 cores                             ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.37 - Partition Merger                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/merger.go                               ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Merger struct: config, stitchDegree                                       ││
+│ │     - Merge(partitions []*PartitionGraph, vectors, labels) (*Snapshot, error)   ││
+│ │                                                                                  ││
+│ │     Algorithm (Partition Merging with Stitching):                               ││
+│ │       1. CONCATENATE:                                                           ││
+│ │          - Allocate global vector/graph/label stores                            ││
+│ │          - For each partition P:                                                ││
+│ │            - Copy vectors to global store at offset                             ││
+│ │            - Remap local neighbor IDs to global IDs                             ││
+│ │            - Copy labels to global store                                        ││
+│ │                                                                                  ││
+│ │       2. SELECT GLOBAL MEDOID:                                                  ││
+│ │          - Candidates = medoids from all partitions                             ││
+│ │          - Global medoid = argmin_m Σ dist(m, other_medoids)                    ││
+│ │                                                                                  ││
+│ │       3. ADD STITCHING EDGES:                                                   ││
+│ │          For each partition medoid M:                                           ││
+│ │            a. candidates = other partition medoids                              ││
+│ │            b. stitch_neighbors = top-S closest (S = StitchDegree, default 4)    ││
+│ │            c. Add bidirectional edges M ↔ stitch_neighbors                      ││
+│ │            d. Re-prune if overflow                                              ││
+│ │                                                                                  ││
+│ │       4. ADD BORDER NODE STITCHING (optional, improves recall):                 ││
+│ │          For each partition P:                                                  ││
+│ │            - border_nodes = nodes with <R/2 intra-partition neighbors           ││
+│ │            - For each border node B:                                            ││
+│ │              - Search other partitions for closest nodes                        ││
+│ │              - Add cross-partition edges                                        ││
+│ │                                                                                  ││
+│ │       5. WRITE SNAPSHOT:                                                        ││
+│ │          - Write vectors.bin, graph.bin, labels.bin                             ││
+│ │          - Write idmap.json                                                     ││
+│ │          - Write snapshot_meta.json with global medoid                          ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Global graph is fully connected (BFS from medoid reaches all)         ││
+│ │     - [ ] No duplicate edges                                                    ││
+│ │     - [ ] Stitching edges are bidirectional                                     ││
+│ │     - [ ] StitchDegree configurable (default 4)                                 ││
+│ │     - [ ] Unit test: merged graph has same recall as single-build               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.38 - Cold Start Pipeline                                                ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/cold_start.go                           ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - ColdStartBuilder struct:                                                  ││
+│ │         db          *sql.DB                                                     ││
+│ │         batchSize   int  // default 1000                                        ││
+│ │         builder     *BatchBuilder                                               ││
+│ │         progressFn  func(phase string, pct float64)                             ││
+│ │     - BuildFromSQLite(ctx, dbPath, outputPath) (*Snapshot, error)               ││
+│ │     - EstimateTime(vectorCount, dim) time.Duration                              ││
+│ │                                                                                  ││
+│ │     Pipeline (Memory-Bounded Streaming):                                        ││
+│ │       1. COUNT: SELECT COUNT(*) FROM vectors                                    ││
+│ │          - If 0: return empty snapshot                                          ││
+│ │          - Estimate time, log to user                                           ││
+│ │                                                                                  ││
+│ │       2. CREATE ITERATORS:                                                      ││
+│ │          VectorIterator:                                                        ││
+│ │            SELECT id, vector FROM vectors ORDER BY id                           ││
+│ │            - Yields (id string, vector []float32) in batches of 1000            ││
+│ │            - Uses cursor-based pagination (WHERE id > last_id)                  ││
+│ │                                                                                  ││
+│ │          LabelIterator:                                                         ││
+│ │            SELECT id, domain, node_type FROM nodes ORDER BY id                  ││
+│ │            - Yields (id string, domain Domain, nodeType NodeType)               ││
+│ │            - Joined with vector iterator by id                                  ││
+│ │                                                                                  ││
+│ │       3. BUILD:                                                                 ││
+│ │          - Pass iterators to BatchBuilder.Build()                               ││
+│ │          - BatchBuilder handles sampling, training, partitioning, merging       ││
+│ │                                                                                  ││
+│ │       4. INITIALIZE DELTA:                                                      ││
+│ │          - Create empty delta layer                                             ││
+│ │          - Create empty WAL                                                     ││
+│ │          - Return snapshot + delta as ready-to-use index                        ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Streams vectors (max 1000 in memory at once during iteration)         ││
+│ │     - [ ] Progress reporting: "Loading: X%", "Training: X%", etc.               ││
+│ │     - [ ] Handles 50k+ vectors without OOM (<2GB peak memory)                   ││
+│ │     - [ ] Handles empty database (returns empty but valid snapshot)             ││
+│ │     - [ ] Context cancellation cleans up partial files                          ││
+│ │     - [ ] Benchmark: 50k 768-dim vectors in <60s on 4 cores                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.39 - Worker Pool                                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/worker_pool.go                          ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - WorkerPool struct: workers, jobs chan, results chan, wg                   ││
+│ │     - NewWorkerPool(ctx, numWorkers) *WorkerPool                                ││
+│ │     - Submit(job func() (any, error)) <-chan Result                             ││
+│ │     - Wait() error (waits for all jobs, returns first error)                    ││
+│ │     - Close()                                                                   ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Context cancellation stops all workers                                ││
+│ │     - [ ] No goroutine leaks (all tracked via WaitGroup)                        ││
+│ │     - [ ] Bounded channel sizes (no unbounded growth)                           ││
+│ │     - [ ] First error returned, remaining jobs cancelled                        ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 13: Cold Start Validation (1 task - depends on Phase 12)              ││
+│ │ ** CHECKPOINT: Prove batch indexing works on THIS REPO **                       ││
+│ │ ** DOGFOODING: Simulate fresh clone - rebuild index from scratch **             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.81 - Cold Start Benchmark on Sylk                                       ││
+│ │   FILE: core/vectorgraphdb/vamana/benchmark/cold_start_test.go                  ││
+│ │   TARGET: Sylk codebase - simulate fresh git clone                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BenchmarkColdStart_Sylk: rebuild index from SQLite                        ││
+│ │     - REAL scenario (simulates fresh clone):                                    ││
+│ │       1. User clones Sylk repo                                                  ││
+│ │       2. Runs sylk for first time                                               ││
+│ │       3. System must index entire codebase before useful                        ││
+│ │       4. User should NOT wait more than 60s                                     ││
+│ │     - Test procedure:                                                           ││
+│ │       1. Delete existing binary index files (vectors.bin, graph.bin, etc.)      ││
+│ │       2. Keep SQLite with nodes + vectors tables (source of truth)              ││
+│ │       3. Run ColdStartBuilder.BuildFromSQLite()                                 ││
+│ │       4. Time it. Must be <60s for Sylk.                                        ││
+│ │       5. Run same queries from VAM.78 - verify same results                     ││
+│ │     - Progress reporting (user feedback):                                       ││
+│ │       - "Sampling vectors... 10%"                                               ││
+│ │       - "Training quantizer... 20%"                                             ││
+│ │       - "Building partitions... 60%"                                            ││
+│ │       - "Merging graph... 90%"                                                  ││
+│ │       - "Ready! Indexed 3,547 symbols in 45s"                                   ││
+│ │     - Measures:                                                                 ││
+│ │       - Total rebuild time (target: <60s for Sylk)                              ││
+│ │       - Phase breakdown: sample, train, assign, build, merge                    ││
+│ │       - Peak memory usage (target: <2GB)                                        ││
+│ │   ACCEPTANCE (AGGRESSIVE - sub-second cold start):                              ││
+│ │     - [ ] Cold start completes in <500ms for Sylk codebase                      ││
+│ │     - [ ] Cold start completes in <100ms if vectors pre-embedded in SQLite      ││
+│ │     - [ ] Peak memory < 64MB during rebuild (4x data size max)                  ││
+│ │     - [ ] Rebuilt index returns same search results as incremental              ││
+│ │     - [ ] Progress callback fires but completes before user notices             ││
+│ │     - [ ] User can start querying IMMEDIATELY (no perceptible wait)             ││
+│ │   WHY THESE TARGETS:                                                            ││
+│ │     - 17MB data = 2-5ms disk read on NVMe                                       ││
+│ │     - Graph construction: O(n log n) = <100ms for 5000 nodes                    ││
+│ │     - ScaNN partitioning: parallel, <200ms                                      ││
+│ │     - No excuse for >500ms total                                                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   BLOCKING: Must pass before proceeding to Phase 14                             ││
+│ │   RUN: go test -v -run BenchmarkColdStart ./core/vectorgraphdb/vamana/...       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 14: Integration Layer (6 tasks - depends on Phase 6-12)               ││
+│ │ ** Connect Vamana to existing VectorGraphDB consumers **                        ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.40 - Unified Index                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/unified_index.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - UnifiedIndex struct: snapshot, delta, stitched, config, mu                ││
+│ │     - Open(path string) (*UnifiedIndex, error)                                  ││
+│ │     - Insert, Delete, Search (delegates to appropriate component)               ││
+│ │     - Close() error                                                             ││
+│ │     - Stats() IndexStats                                                        ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Implements VamanaIndex interface (VAM.7)                              ││
+│ │     - [ ] Coordinates snapshot, delta, and stitched components                  ││
+│ │     - [ ] Background compaction triggered automatically                         ││
+│ │     - [ ] Thread-safe via RWMutex                                               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.41 - VectorGraphDB Integration                                          ││
+│ │   FILE: core/vectorgraphdb/db.go (modify)                                       ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Replace hnsw.Index with vamana.UnifiedIndex                               ││
+│ │     - Update all HNSW references to Vamana                                      ││
+│ │     - Preserve existing public API (backward compatible)                        ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] VectorGraphDB consumers unchanged                                     ││
+│ │     - [ ] HNSWSearcher/HNSWInserter interfaces still work                       ││
+│ │     - [ ] All existing tests pass                                               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.42 - BatchStore Integration                                             ││
+│ │   FILE: core/vectorgraphdb/batch.go (modify)                                    ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Replace insertNodesHNSW with insertNodesVamana                            ││
+│ │     - Use ColdStartBuilder for initial batch (if empty index)                   ││
+│ │     - Use standard Insert for incremental batch                                 ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] BatchInsertNodes works with Vamana                                    ││
+│ │     - [ ] Cold start optimization for empty index                               ││
+│ │     - [ ] Progress callback passed to Vamana                                    ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.43 - VectorSearcher Integration                                         ││
+│ │   FILE: core/vectorgraphdb/search.go (modify)                                   ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Replace HNSWSearcher with VamanaSearcher                                  ││
+│ │     - Update filter translation for Stitched Vamana                             ││
+│ │     - Preserve SearchResult format                                              ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] VectorSearcher works with Vamana                                      ││
+│ │     - [ ] SearchOptions translated to SearchFilter                              ││
+│ │     - [ ] Multi-domain search uses Stitched Vamana                              ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.44 - NodeStore Integration                                              ││
+│ │   FILE: core/vectorgraphdb/nodes.go (modify)                                    ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Update insertNodeToHNSW → insertNodeToVamana                              ││
+│ │     - Add internal_id tracking for node ↔ Vamana mapping                        ││
+│ │     - Handle Vamana errors in rollback                                          ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Node insertion uses Vamana                                            ││
+│ │     - [ ] Rollback on Vamana failure                                            ││
+│ │     - [ ] internal_id stored in nodes table (new column)                        ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.45 - ProtectedVectorDB Integration                                      ││
+│ │   FILE: core/vectorgraphdb/protected.go (modify)                                ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Update VectorIndex interface usage for Vamana                             ││
+│ │     - Update SnapshotManager for Vamana snapshots                               ││
+│ │     - Preserve protection config                                                ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] ProtectedVectorDB works with Vamana                                   ││
+│ │     - [ ] Snapshot management coordinated                                       ││
+│ │     - [ ] All protection features preserved                                     ││
+│ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 15: HNSW Removal (4 tasks - depends on Phase 14)                      ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.46 - Delete HNSW Directory                                              ││
+│ │   FILES TO DELETE: core/vectorgraphdb/hnsw/ (entire directory - 31 files)       ││
+│ │   INCLUDES:                                                                     ││
+│ │     - hnsw.go, distance.go, layer.go, neighbor_set.go                           ││
+│ │     - persistence.go, snapshot.go, snapshot_manager.go, snapshot_search.go      ││
+│ │     - finger.go, adaptive_search.go, mnru.go                                    ││
+│ │     - All *_test.go files                                                       ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Directory deleted                                                     ││
+│ │     - [ ] No broken imports remaining                                           ││
+│ │     - [ ] go build succeeds                                                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.47 - Delete Quantized HNSW                                              ││
+│ │   FILES TO DELETE:                                                              ││
+│ │     - core/vectorgraphdb/quantization/quantized_hnsw.go                         ││
+│ │     - core/vectorgraphdb/quantization/quantized_hnsw_test.go                    ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Files deleted                                                         ││
+│ │     - [ ] No broken imports remaining                                           ││
+│ │     - [ ] go build succeeds                                                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.48 - Remove HNSW References                                             ││
+│ │   FILES TO MODIFY:                                                              ││
+│ │     - core/vectorgraphdb/types.go (remove HNSW types if any)                    ││
+│ │     - core/vectorgraphdb/constants.go (remove HNSW constants)                   ││
+│ │     - Any remaining files with HNSW imports                                     ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] grep -r "hnsw" core/vectorgraphdb/ returns no results                 ││
+│ │     - [ ] go build succeeds                                                     ││
+│ │     - [ ] go vet passes                                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.49 - Update Documentation                                               ││
+│ │   FILES TO MODIFY:                                                              ││
+│ │     - README.md (if references HNSW)                                            ││
+│ │     - Any doc/*.md files referencing HNSW                                       ││
+│ │     - Code comments referencing HNSW                                            ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Documentation updated to reference Vamana                             ││
+│ │     - [ ] No stale HNSW references in docs                                      ││
+│ │   PRIORITY: LOW                                                                 ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 16: Unit Testing (8 tasks - depends on Phase 14-15)                   ││
+│ │ ** Comprehensive unit tests for all components **                               ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.50 - Core Algorithm Unit Tests                                          ││
+│ │   FILE: core/vectorgraphdb/vamana/*_test.go                                     ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - TestRobustPrune_AlphaVariants                                             ││
+│ │     - TestGreedySearch_Convergence                                              ││
+│ │     - TestInsert_GraphConnectivity                                              ││
+│ │     - TestDelete_NoOrphans                                                      ││
+│ │     - TestMedoid_Accuracy                                                       ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] 90%+ coverage on core algorithms                                      ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │     - [ ] Cyclomatic complexity ≤4 per function                                 ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.51 - Storage Layer Unit Tests                                           ││
+│ │   FILE: core/vectorgraphdb/vamana/storage/*_test.go                             ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - TestVectorStore_ZeroCopyAccess                                            ││
+│ │     - TestGraphStore_NeighborOperations                                         ││
+│ │     - TestLabelStore_FilterMask                                                 ││
+│ │     - TestIDMap_Bidirectional                                                   ││
+│ │     - TestSnapshot_AtomicCommit                                                 ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] 90%+ coverage on storage layer                                        ││
+│ │     - [ ] Tests pass with race detector                                         ││
+│ │     - [ ] Mmap cleanup verified (no leaks)                                      ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.52 - Delta Layer Unit Tests                                             ││
+│ │   FILE: core/vectorgraphdb/vamana/delta/*_test.go, wal/*_test.go                ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - TestWAL_CrashRecovery                                                     ││
+│ │     - TestDeltaIndex_InsertDelete                                               ││
+│ │     - TestMergedSearch_Tombstones                                               ││
+│ │     - TestCompaction_AtomicSwitch                                               ││
+│ │     - TestCompaction_ConcurrentReads                                            ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] 90%+ coverage on delta/WAL                                            ││
+│ │     - [ ] Crash recovery tested with truncated files                            ││
+│ │     - [ ] Concurrent access tested with race detector                           ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.53 - Stitched Vamana Unit Tests                                         ││
+│ │   FILE: core/vectorgraphdb/vamana/stitched/*_test.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - TestStitchedSearch_FilteredRecall                                         ││
+│ │     - TestStitchedInsert_SubgraphMembership                                     ││
+│ │     - TestFilteredRobustPrune_LabelPriority                                     ││
+│ │     - TestSubgraphManager_LazyCreate                                            ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] 90%+ coverage on stitched components                                  ││
+│ │     - [ ] Filtered recall ≥ unfiltered recall verified                          ││
+│ │     - [ ] Multi-label OR filters tested                                         ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.54 - ScaNN Batch Builder Unit Tests                                     ││
+│ │   FILE: core/vectorgraphdb/vamana/scann/*_test.go                               ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - TestVarianceAnalyzer_WelfordAccuracy                                      ││
+│ │     - TestAVQ_KMeansPlusPlusInit                                                ││
+│ │     - TestAVQ_AnisotropicDistance                                               ││
+│ │     - TestAVQ_TrainingConvergence                                               ││
+│ │     - TestReservoirSampler_UniformDistribution                                  ││
+│ │     - TestPartitionBuilder_Connectivity                                         ││
+│ │     - TestMerger_StitchingEdges                                                 ││
+│ │     - TestColdStart_FromSQLite                                                  ││
+│ │     - TestWorkerPool_Cancellation                                               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] 90%+ coverage on ScaNN batch builder                                  ││
+│ │     - [ ] Parallel build correctness verified                                   ││
+│ │     - [ ] Memory usage bounded during large builds (<2GB for 50k vectors)       ││
+│ │     - [ ] Worker pool properly cancels on context cancellation                  ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.55 - Integration Tests                                                  ││
+│ │   FILE: core/vectorgraphdb/vamana/integration_test.go                           ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - TestEndToEnd_InsertSearchDelete                                           ││
+│ │     - TestEndToEnd_BatchThenStreaming                                           ││
+│ │     - TestEndToEnd_FilteredSearch                                               ││
+│ │     - TestEndToEnd_CompactionDuringLoad                                         ││
+│ │     - TestEndToEnd_CrashRecovery                                                ││
+│ │     - TestEndToEnd_ColdStartLargeDataset                                        ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Full workflow tested                                                  ││
+│ │     - [ ] Crash simulation and recovery                                         ││
+│ │     - [ ] Concurrent read/write tested                                          ││
+│ │     - [ ] Cold start with 10k+ vectors tested                                   ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.57 - Performance Benchmarks                                             ││
+│ │   FILE: core/vectorgraphdb/vamana/benchmark_test.go                             ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - BenchmarkInsert_Throughput                                                ││
+│ │     - BenchmarkSearch_Latency                                                   ││
+│ │     - BenchmarkBatchBuild_50K                                                   ││
+│ │     - BenchmarkMemoryUsage                                                      ││
+│ │     - BenchmarkColdStart_SQLiteStream                                           ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Insert: ≥1000 vectors/sec                                             ││
+│ │     - [ ] Search: ≤10ms p99 latency for K=10                                    ││
+│ │     - [ ] Batch build: 50K vectors in <60s                                      ││
+│ │     - [ ] Memory: <2GB peak for 50K 768-dim vectors                             ││
+│ │     - [ ] Cold start: <90s for 50K vectors from SQLite                          ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 17: LSP & Quality Gates (4 tasks - depends on all phases)             ││
+│ │ ** Final validation before merge **                                             ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.58 - LSP Diagnostics Pass                                               ││
+│ │   FILES: core/vectorgraphdb/vamana/**/*.go                                      ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Run gopls diagnostics on all Vamana files                                 ││
+│ │     - Fix all errors, warnings                                                  ││
+│ │     - Address all hints                                                         ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Zero LSP errors                                                       ││
+│ │     - [ ] Zero LSP warnings                                                     ││
+│ │     - [ ] All exports documented                                                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.59 - Cyclomatic Complexity Check                                        ││
+│ │   FILES: core/vectorgraphdb/vamana/**/*.go                                      ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Run gocyclo on all Vamana files                                           ││
+│ │     - Refactor any function with complexity >4                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] All functions have cyclomatic complexity ≤4                           ││
+│ │     - [ ] No exceptions (per CLAUDE.md requirement)                             ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.60 - Go Vet & Staticcheck                                               ││
+│ │   FILES: core/vectorgraphdb/vamana/**/*.go                                      ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - Run go vet ./core/vectorgraphdb/vamana/...                                ││
+│ │     - Run staticcheck ./core/vectorgraphdb/vamana/...                           ││
+│ │     - Fix all issues                                                            ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Zero go vet issues                                                    ││
+│ │     - [ ] Zero staticcheck issues                                               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.61 - Final Build Verification                                           ││
+│ │   FILES: entire codebase                                                        ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - go build ./...                                                            ││
+│ │     - go test ./... -race                                                       ││
+│ │     - go test ./core/vectorgraphdb/... -cover                                   ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Build succeeds with no errors                                         ││
+│ │     - [ ] All tests pass                                                        ││
+│ │     - [ ] No race conditions detected                                           ││
+│ │     - [ ] Coverage ≥80% on Vamana package                                       ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ DEPENDENCY GRAPH (Backward → Forward with Validation Checkpoints):              ││
+│ │                                                                                  ││
+│ │   ┌─────────────────────────────────────────────────────────────────────────┐   ││
+│ │   │                    FOUNDATION LAYER (Build First)                       │   ││
+│ │   └─────────────────────────────────────────────────────────────────────────┘   ││
+│ │                                                                                  ││
+│ │   Phase 1 (Types)     Phase 2 (Storage)    Phase 3 (Embed)    Phase 4 (Ingest) ││
+│ │   ┌───────────┐       ┌───────────┐        ┌───────────┐      ┌────────────┐   ││
+│ │   │ VAM.1-8   │──────>│ VAM.9-14  │───────>│ VAM.62-64 │─────>│ VAM.65-76  │   ││
+│ │   │ (8 tasks) │       │ (6 tasks) │        │ (3 tasks) │      │ (12 tasks) │   ││
+│ │   │ Types     │       │ Mmap      │        │ Embedder  │      │ Multi-Dom  │   ││
+│ │   └───────────┘       └───────────┘        └───────────┘      │ Ingest     │   ││
+│ │                                                               │ Code/Acad/ │   ││
+│ │                                                               │ Archivalist│   ││
+│ │                                                               └──────┬─────┘   ││
+│ │                                                                      │         ││
+│ │   ┌──────────────────────────────────────────────────────────────────┼───────┐ ││
+│ │   │ Phase 5: STORAGE VALIDATION ★ CHECKPOINT                         │       │ ││
+│ │   │ VAM.77 - Benchmark storage on Sylk codebase                      ▼       │ ││
+│ │   │ BLOCKING: Must pass before algorithm work                    [GATE 1]    │ ││
+│ │   └──────────────────────────────────────────────────────────────────┼───────┘ ││
+│ │                                                                      │         ││
+│ │   ┌─────────────────────────────────────────────────────────────────────────┐   ││
+│ │   │                    ALGORITHM LAYER (Build on Validated Storage)         │   ││
+│ │   └─────────────────────────────────────────────────────────────────────────┘   ││
+│ │                                                                      │         ││
+│ │   Phase 6 (Core)                                                     │         ││
+│ │   ┌───────────┐                                                      │         ││
+│ │   │ VAM.15-20 │<─────────────────────────────────────────────────────┘         ││
+│ │   │ (6 tasks) │                                                                ││
+│ │   │ Distance  │                                                                ││
+│ │   │ Prune     │                                                                ││
+│ │   │ Search    │                                                                ││
+│ │   │ Insert    │                                                                ││
+│ │   └─────┬─────┘                                                                ││
+│ │         │                                                                      ││
+│ │   ┌─────┼──────────────────────────────────────────────────────────────────┐   ││
+│ │   │ Phase 7: SEARCH VALIDATION ★ CHECKPOINT                                │   ││
+│ │   │ VAM.78 - Benchmark search recall/latency on Sylk              [GATE 2] │   ││
+│ │   └─────┼──────────────────────────────────────────────────────────────────┘   ││
+│ │         │                                                                      ││
+│ │   ┌─────────────────────────────────────────────────────────────────────────┐   ││
+│ │   │                    STREAMING LAYER (Real-time Updates)                  │   ││
+│ │   └─────────────────────────────────────────────────────────────────────────┘   ││
+│ │         │                                                                      ││
+│ │   Phase 8 (Delta)                                                              ││
+│ │   ┌───────────┐                                                                ││
+│ │   │ VAM.21-25 │<───────────────────────────────────────────────────────────────││
+│ │   │ (5 tasks) │                                                                ││
+│ │   │ WAL       │                                                                ││
+│ │   │ Delta Idx │                                                                ││
+│ │   │ Compaction│                                                                ││
+│ │   └─────┬─────┘                                                                ││
+│ │         │                                                                      ││
+│ │   ┌─────┼──────────────────────────────────────────────────────────────────┐   ││
+│ │   │ Phase 9: STREAMING VALIDATION ★ CHECKPOINT                             │   ││
+│ │   │ VAM.79 - Benchmark ingest-to-query latency (<100ms)           [GATE 3] │   ││
+│ │   └─────┼──────────────────────────────────────────────────────────────────┘   ││
+│ │         │                                                                      ││
+│ │   ┌─────────────────────────────────────────────────────────────────────────┐   ││
+│ │   │                    FILTERING LAYER (Domain/NodeType Search)             │   ││
+│ │   └─────────────────────────────────────────────────────────────────────────┘   ││
+│ │         │                                                                      ││
+│ │   Phase 10 (Stitched)                                                          ││
+│ │   ┌───────────┐                                                                ││
+│ │   │ VAM.26-31 │<───────────────────────────────────────────────────────────────││
+│ │   │ (6 tasks) │                                                                ││
+│ │   │ Label Idx │                                                                ││
+│ │   │ Subgraph  │                                                                ││
+│ │   │ FilterPrn │                                                                ││
+│ │   └─────┬─────┘                                                                ││
+│ │         │                                                                      ││
+│ │   ┌─────┼──────────────────────────────────────────────────────────────────┐   ││
+│ │   │ Phase 11: FILTERED VALIDATION ★ CHECKPOINT                             │   ││
+│ │   │ VAM.80 - Benchmark filtered recall (Domain/NodeType)          [GATE 4] │   ││
+│ │   └─────┼──────────────────────────────────────────────────────────────────┘   ││
+│ │         │                                                                      ││
+│ │   ┌─────────────────────────────────────────────────────────────────────────┐   ││
+│ │   │                    BATCH LAYER (Cold Start Optimization)                │   ││
+│ │   └─────────────────────────────────────────────────────────────────────────┘   ││
+│ │         │                                                                      ││
+│ │   Phase 12 (ScaNN)                                                             ││
+│ │   ┌─────────────┐                                                              ││
+│ │   │ VAM.32-39   │<─────────────────────────────────────────────────────────────││
+│ │   │ (8 tasks)   │                                                              ││
+│ │   │ Variance    │                                                              ││
+│ │   │ AVQ         │                                                              ││
+│ │   │ Partition   │                                                              ││
+│ │   │ Builder     │                                                              ││
+│ │   │ Merger      │                                                              ││
+│ │   └──────┬──────┘                                                              ││
+│ │          │                                                                     ││
+│ │   ┌──────┼─────────────────────────────────────────────────────────────────┐   ││
+│ │   │ Phase 13: COLD START VALIDATION ★ CHECKPOINT                           │   ││
+│ │   │ VAM.81 - Benchmark rebuild from SQLite (<60s for 50k)         [GATE 5] │   ││
+│ │   └──────┼─────────────────────────────────────────────────────────────────┘   ││
+│ │          │                                                                     ││
+│ │   ┌─────────────────────────────────────────────────────────────────────────┐   ││
+│ │   │                    INTEGRATION LAYER (Connect to System)                │   ││
+│ │   └─────────────────────────────────────────────────────────────────────────┘   ││
+│ │          │                                                                     ││
+│ │   Phase 14 (Integration)   Phase 15 (Removal)   Phase 16-17 (Test/Quality)    ││
+│ │   ┌───────────┐            ┌───────────┐        ┌───────────┐                  ││
+│ │   │ VAM.40-45 │<───────────│ VAM.46-49 │───────>│ VAM.50-61 │                  ││
+│ │   │ (6 tasks) │            │ (4 tasks) │        │ (12 tasks)│                  ││
+│ │   │ Unified   │            │ Delete    │        │ Unit Test │                  ││
+│ │   │ Index     │            │ HNSW      │        │ Quality   │                  ││
+│ │   └───────────┘            └───────────┘        └───────────┘                  ││
+│ │                                                                                 ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ SUMMARY:                                                                        ││
+│ │                                                                                  ││
+│ │ TOTAL: 81 tasks (61 original + 20 new)                                          ││
+│ │ EXECUTION: 17 phases with 5 validation checkpoints                              ││
+│ │ STRATEGY: Backward → Forward (storage → algorithm → features → integration)     ││
+│ │                                                                                  ││
+│ │ NEW TASKS ADDED:                                                                ││
+│ │   Phase 3: VAM.62-64 (Embedding Pipeline)                                       ││
+│ │   Phase 4: VAM.65-76 (Multi-Domain Ingestion)                                   ││
+│ │     - VAM.65-68: Core ingestion infrastructure                                  ││
+│ │     - VAM.69-71: Librarian (code) ingestion                                     ││
+│ │     - VAM.72-73: Academic (research) ingestion                                  ││
+│ │     - VAM.74-76: Archivalist (events) ingestion                                 ││
+│ │   Phase 5:  VAM.77 (Storage Validation)                                         ││
+│ │   Phase 7:  VAM.78 (Search Validation)                                          ││
+│ │   Phase 9:  VAM.79 (Streaming Validation)                                       ││
+│ │   Phase 11: VAM.80 (Filtered Validation)                                        ││
+│ │   Phase 13: VAM.81 (Cold Start Validation)                                      ││
+│ │                                                                                  ││
+│ │ MULTI-DOMAIN SUPPORT:                                                           ││
+│ │   DomainCode (0)     - Librarian: code symbols, functions, types                ││
+│ │   DomainHistory (1)  - Archivalist: events, conversations, decisions            ││
+│ │   DomainAcademic (2) - Academic: papers, abstracts, citations                   ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ PERFORMANCE TARGETS (AGGRESSIVE - No Excuses):                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │   DATA SIZE (Sylk ~5000 symbols):                                               ││
+│ │     Vectors: 5000 × 768 × 4B = 15 MB                                            ││
+│ │     Graph:   5000 × 64 × 4B  = 1.3 MB                                           ││
+│ │     Total:   ~17 MB (this is TINY)                                              ││
+│ │                                                                                  ││
+│ │   COLD START:                                                                   ││
+│ │     Target:  <500ms (from empty to queryable)                                   ││
+│ │     Stretch: <100ms (if vectors pre-embedded)                                   ││
+│ │     Memory:  <64MB peak (4x data size max)                                      ││
+│ │                                                                                  ││
+│ │   SEARCH:                                                                       ││
+│ │     p50:     <100μs (0.1ms)                                                     ││
+│ │     p99:     <500μs (0.5ms)                                                     ││
+│ │     QPS:     ≥100,000 (single thread)                                           ││
+│ │     QPS:     ≥500,000 (parallel)                                                ││
+│ │                                                                                  ││
+│ │   STREAMING INSERT:                                                             ││
+│ │     Ingest-to-query: <1ms                                                       ││
+│ │     Throughput:      ≥100,000 symbols/sec (batched)                             ││
+│ │     WAL recovery:    <50ms for 10k entries                                      ││
+│ │                                                                                  ││
+│ │   FILTERED SEARCH:                                                              ││
+│ │     Latency:  Same or FASTER than unfiltered (subgraph is smaller)              ││
+│ │     Overhead: ZERO (pre-filter, not post-filter)                                ││
+│ │                                                                                  ││
+│ │   WHY THESE ARE ACHIEVABLE:                                                     ││
+│ │     - NVMe: 3-7 GB/s → 17MB in 2-5ms                                            ││
+│ │     - Memory: 50 GB/s → 17MB in 0.3ms                                           ││
+│ │     - GreedySearch visits ~200 nodes → ~50μs                                    ││
+│ │     - mmap with warm cache → microseconds                                       ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ FILES TO CREATE: ~45 new files in core/vectorgraphdb/vamana/                    ││
+│ │ FILES TO DELETE: 31 files in core/vectorgraphdb/hnsw/ + 2 quantization files    ││
+│ │ FILES TO MODIFY: 5 files in core/vectorgraphdb/ (db.go, batch.go, etc.)         ││
+│ │                                                                                  ││
+│ │ REFERENCES:                                                                     ││
+│ │   - DiskANN (NEURIPS 2019)                                                      ││
+│ │   - Stitched Vamana (SIGMOD 2024)                                               ││
+│ │   - ScaNN (ICML 2020)                                                           ││
+│ │                                                                                  ││
+│ │ CRITICAL CONSTRAINTS (per CLAUDE.md):                                           ││
+│ │   - NO magic numbers - derive from data                                         ││
+│ │   - Cyclomatic complexity ≤4 per function                                       ││
+│ │   - NO untracked goroutines                                                     ││
+│ │   - NO unbounded growth                                                         ││
+│ │   - NO drops, memory-leaks, or race conditions                                  ││
+│ │   - Use modern Go structures (Go 1.25+)                                         ││
+│ │   - NO SQLite extensions (Bleve for FTS, VectorDB for semantic)                 ││
+│ │                                                                                  ││
+│ └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│ ESTIMATED CAPACITY: 200-220 parallel engineer pipelines (increased for VAM group)  │
+│ DEPENDENCIES: Wave 3 complete, Groups 4E, 4G, 4K, 4L-4Z complete                   │
+│                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 

@@ -2,6 +2,7 @@ package treesitter
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -96,6 +97,1829 @@ func (t *TreeSitterTool) Parse(ctx context.Context, filePath string, content []b
 	defer tree.Close()
 
 	return t.buildParseResult(tree, filePath, langName, start), nil
+}
+
+func (t *TreeSitterTool) ParseFast(ctx context.Context, filePath string, content []byte) (*ParseResult, error) {
+	langName := detectLanguage(filePath)
+	if langName == "" {
+		return nil, ErrGrammarNotFound
+	}
+
+	tree, err := t.parseContent(ctx, langName, content)
+	if err != nil {
+		return nil, err
+	}
+	defer tree.Close()
+
+	return t.buildParseResultFast(tree, filePath, langName), nil
+}
+
+func (t *TreeSitterTool) ParseWithParser(ctx context.Context, parser *Parser, filePath string, content []byte, currentLang *string) (*ParseResult, error) {
+	langName := detectLanguage(filePath)
+	if langName == "" {
+		return nil, ErrGrammarNotFound
+	}
+
+	if *currentLang != langName {
+		lang, err := t.loader.LoadContext(ctx, langName)
+		if err != nil {
+			return nil, err
+		}
+		if err := parser.SetLanguage(lang); err != nil {
+			return nil, err
+		}
+		*currentLang = langName
+	}
+
+	tree, err := parser.Parse(content, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tree.Close()
+
+	return t.buildParseResultFast(tree, filePath, langName), nil
+}
+
+func (t *TreeSitterTool) buildParseResultFast(tree *Tree, filePath, langName string) *ParseResult {
+	result := &ParseResult{
+		Language: langName,
+		FilePath: filePath,
+	}
+
+	root := tree.RootNode()
+
+	switch langName {
+	case "go":
+		result.Functions, result.Types, result.Imports = extractGoSymbolsSinglePass(root)
+	case "python":
+		result.Functions, result.Types, result.Imports = extractPythonSymbolsSinglePass(root)
+	case "javascript", "typescript", "tsx":
+		result.Functions, result.Types, result.Imports = extractJSSymbolsSinglePass(root)
+	case "java":
+		result.Functions, result.Types, result.Imports = extractJavaSymbolsSinglePass(root)
+	case "rust":
+		result.Functions, result.Types, result.Imports = extractRustSymbolsSinglePass(root)
+	case "c", "cpp":
+		result.Functions, result.Types, result.Imports = extractCSymbolsSinglePass(root)
+	case "ruby":
+		result.Functions, result.Types, result.Imports = extractRubySymbolsSinglePass(root)
+	case "php":
+		result.Functions, result.Types, result.Imports = extractPHPSymbolsSinglePass(root)
+	case "elixir":
+		result.Functions, result.Types, result.Imports = extractElixirSymbolsSinglePass(root)
+	case "scala":
+		result.Functions, result.Types, result.Imports = extractScalaSymbolsSinglePass(root)
+	case "markdown":
+		result.Types = extractMarkdownSections(root)
+	case "json":
+		result.Types = extractJSONKeys(root)
+	case "yaml":
+		result.Types = extractYAMLKeys(root)
+	case "hcl":
+		result.Types = extractHCLBlocks(root)
+	case "lua":
+		result.Functions, result.Types, result.Imports = extractLuaSymbolsSinglePass(root)
+	case "toml":
+		result.Types = extractTOMLKeys(root)
+	case "scss", "css":
+		result.Types = extractCSSSelectors(root)
+	case "vue", "svelte":
+		result.Functions, result.Types, result.Imports = extractJSSymbolsSinglePass(root)
+	case "zig":
+		result.Functions, result.Types, result.Imports = extractZigSymbolsSinglePass(root)
+	case "cuda":
+		result.Functions, result.Types, result.Imports = extractCSymbolsSinglePass(root)
+	case "kotlin":
+		result.Functions, result.Types, result.Imports = extractKotlinSymbolsSinglePass(root)
+	case "make":
+		result.Types = extractMakeTargets(root)
+	case "bash", "zsh", "sh":
+		result.Functions, result.Types, result.Imports = extractBashSymbolsSinglePass(root)
+	case "gitattributes", "gitignore":
+		result.Types = extractGitPatterns(root)
+	case "haskell":
+		result.Functions, result.Types, result.Imports = extractHaskellSymbolsSinglePass(root)
+	case "diff":
+		result.Types = extractDiffFiles(root)
+	}
+
+	result.Errors = collectParseErrors(root)
+
+	return result
+}
+
+func extractGoSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	count := root.NamedChildCount()
+	for i := range count {
+		node := root.NamedChild(uint(i))
+		switch node.Type() {
+		case "function_declaration", "method_declaration":
+			functions = append(functions, parseFunctionInfo(node))
+		case "type_declaration":
+			types = append(types, parseTypeDecl(node)...)
+		case "import_declaration":
+			imports = append(imports, parseImportDecl(node)...)
+		}
+	}
+
+	return functions, types, imports
+}
+
+func extractPythonSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "function_definition":
+			functions = append(functions, parsePythonFunction(node, false))
+		case "class_definition":
+			types = append(types, parsePythonClass(node))
+			extractPythonMethods(node, &functions)
+		case "import_statement":
+			imports = append(imports, parsePythonImport(node)...)
+		case "import_from_statement":
+			imports = append(imports, parsePythonFromImport(node)...)
+		case "decorated_definition":
+			if child := node.ChildByFieldName("definition"); child != nil {
+				walk(child)
+			}
+			return
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			child := node.NamedChild(uint(i))
+			if child.Type() != "block" {
+				walk(child)
+			}
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return functions, types, imports
+}
+
+func parsePythonFunction(node *Node, isMethod bool) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  isMethod,
+	}
+
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		info.Name = nodeText(nameNode)
+	}
+
+	if params := node.ChildByFieldName("parameters"); params != nil {
+		info.Parameters = nodeText(params)
+	}
+
+	if retType := node.ChildByFieldName("return_type"); retType != nil {
+		info.ReturnType = nodeText(retType)
+	}
+
+	return info
+}
+
+func parsePythonClass(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "class",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		info.Name = nodeText(nameNode)
+	}
+
+	return info
+}
+
+func extractPythonMethods(classNode *Node, functions *[]FunctionInfo) {
+	body := classNode.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+
+	className := ""
+	if nameNode := classNode.ChildByFieldName("name"); nameNode != nil {
+		className = nodeText(nameNode)
+	}
+
+	count := body.NamedChildCount()
+	for i := range count {
+		child := body.NamedChild(uint(i))
+		switch child.Type() {
+		case "function_definition":
+			fn := parsePythonFunction(child, true)
+			fn.Receiver = className
+			*functions = append(*functions, fn)
+		case "decorated_definition":
+			if def := child.ChildByFieldName("definition"); def != nil && def.Type() == "function_definition" {
+				fn := parsePythonFunction(def, true)
+				fn.Receiver = className
+				*functions = append(*functions, fn)
+			}
+		}
+	}
+}
+
+func parsePythonImport(node *Node) []ImportInfo {
+	var imports []ImportInfo
+
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		switch child.Type() {
+		case "dotted_name":
+			imports = append(imports, ImportInfo{
+				Path: nodeText(child),
+				Line: node.StartPosition().Row + 1,
+			})
+		case "aliased_import":
+			imp := ImportInfo{Line: node.StartPosition().Row + 1}
+			if name := child.ChildByFieldName("name"); name != nil {
+				imp.Path = nodeText(name)
+			}
+			if alias := child.ChildByFieldName("alias"); alias != nil {
+				imp.Alias = nodeText(alias)
+			}
+			imports = append(imports, imp)
+		}
+	}
+
+	return imports
+}
+
+func parsePythonFromImport(node *Node) []ImportInfo {
+	var imports []ImportInfo
+
+	moduleName := ""
+	if mod := node.ChildByFieldName("module_name"); mod != nil {
+		moduleName = nodeText(mod)
+	}
+
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		switch child.Type() {
+		case "dotted_name", "identifier":
+			imports = append(imports, ImportInfo{
+				Path: moduleName + "." + nodeText(child),
+				Line: node.StartPosition().Row + 1,
+			})
+		case "aliased_import":
+			imp := ImportInfo{Line: node.StartPosition().Row + 1}
+			if name := child.ChildByFieldName("name"); name != nil {
+				imp.Path = moduleName + "." + nodeText(name)
+			}
+			if alias := child.ChildByFieldName("alias"); alias != nil {
+				imp.Alias = nodeText(alias)
+			}
+			imports = append(imports, imp)
+		}
+	}
+
+	return imports
+}
+
+func nodeText(node *Node) string {
+	if node == nil || node.IsNull() {
+		return ""
+	}
+	return node.Content()
+}
+
+func extractJSSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node, className string)
+	walk = func(node *Node, className string) {
+		switch node.Type() {
+		case "function_declaration", "generator_function_declaration":
+			functions = append(functions, parseJSFunction(node, false, ""))
+		case "class_declaration":
+			types = append(types, parseJSClass(node))
+			if body := node.ChildByFieldName("body"); body != nil {
+				name := ""
+				if n := node.ChildByFieldName("name"); n != nil {
+					name = nodeText(n)
+				}
+				walkClassBody(body, name, &functions)
+			}
+			return
+		case "lexical_declaration", "variable_declaration":
+			extractJSVarFunctions(node, &functions)
+		case "import_statement":
+			imports = append(imports, parseJSImport(node)...)
+		case "export_statement":
+			if decl := node.ChildByFieldName("declaration"); decl != nil {
+				walk(decl, className)
+			}
+			return
+		case "interface_declaration", "type_alias_declaration":
+			types = append(types, parseJSTypeDecl(node))
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), className)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), "")
+	}
+
+	return functions, types, imports
+}
+
+func parseJSFunction(node *Node, isMethod bool, receiver string) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  isMethod,
+		Receiver:  receiver,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func parseJSClass(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "class",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func walkClassBody(body *Node, className string, functions *[]FunctionInfo) {
+	count := body.NamedChildCount()
+	for i := range count {
+		child := body.NamedChild(uint(i))
+		if child.Type() == "method_definition" {
+			fn := parseJSFunction(child, true, className)
+			if n := child.ChildByFieldName("name"); n != nil {
+				fn.Name = nodeText(n)
+			}
+			*functions = append(*functions, fn)
+		}
+	}
+}
+
+func extractJSVarFunctions(node *Node, functions *[]FunctionInfo) {
+	count := node.NamedChildCount()
+	for i := range count {
+		decl := node.NamedChild(uint(i))
+		if decl.Type() == "variable_declarator" {
+			value := decl.ChildByFieldName("value")
+			if value != nil && (value.Type() == "arrow_function" || value.Type() == "function") {
+				fn := FunctionInfo{
+					StartLine: decl.StartPosition().Row + 1,
+					EndLine:   decl.EndPosition().Row + 1,
+				}
+				if n := decl.ChildByFieldName("name"); n != nil {
+					fn.Name = nodeText(n)
+				}
+				if p := value.ChildByFieldName("parameters"); p != nil {
+					fn.Parameters = nodeText(p)
+				}
+				*functions = append(*functions, fn)
+			}
+		}
+	}
+}
+
+func parseJSImport(node *Node) []ImportInfo {
+	var imports []ImportInfo
+	if src := node.ChildByFieldName("source"); src != nil {
+		imports = append(imports, ImportInfo{
+			Path: nodeText(src),
+			Line: node.StartPosition().Row + 1,
+		})
+	}
+	return imports
+}
+
+func parseJSTypeDecl(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if node.Type() == "interface_declaration" {
+		info.Kind = "interface"
+	} else {
+		info.Kind = "type"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func extractJavaSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node, className string)
+	walk = func(node *Node, className string) {
+		switch node.Type() {
+		case "class_declaration", "interface_declaration", "enum_declaration":
+			types = append(types, parseJavaType(node))
+			name := ""
+			if n := node.ChildByFieldName("name"); n != nil {
+				name = nodeText(n)
+			}
+			if body := node.ChildByFieldName("body"); body != nil {
+				walkJavaClassBody(body, name, &functions, &types)
+			}
+			return
+		case "import_declaration":
+			imports = append(imports, parseJavaImport(node))
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), className)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), "")
+	}
+
+	return functions, types, imports
+}
+
+func parseJavaType(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	switch node.Type() {
+	case "interface_declaration":
+		info.Kind = "interface"
+	case "enum_declaration":
+		info.Kind = "enum"
+	default:
+		info.Kind = "class"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func walkJavaClassBody(body *Node, className string, functions *[]FunctionInfo, types *[]TypeInfo) {
+	count := body.NamedChildCount()
+	for i := range count {
+		child := body.NamedChild(uint(i))
+		switch child.Type() {
+		case "method_declaration", "constructor_declaration":
+			fn := FunctionInfo{
+				StartLine: child.StartPosition().Row + 1,
+				EndLine:   child.EndPosition().Row + 1,
+				IsMethod:  true,
+				Receiver:  className,
+			}
+			if n := child.ChildByFieldName("name"); n != nil {
+				fn.Name = nodeText(n)
+			}
+			if p := child.ChildByFieldName("parameters"); p != nil {
+				fn.Parameters = nodeText(p)
+			}
+			*functions = append(*functions, fn)
+		case "class_declaration", "interface_declaration", "enum_declaration":
+			*types = append(*types, parseJavaType(child))
+		}
+	}
+}
+
+func parseJavaImport(node *Node) ImportInfo {
+	info := ImportInfo{Line: node.StartPosition().Row + 1}
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "scoped_identifier" || child.Type() == "identifier" {
+			info.Path = nodeText(child)
+			break
+		}
+	}
+	return info
+}
+
+func extractRustSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "function_item":
+			functions = append(functions, parseRustFunction(node, ""))
+		case "struct_item", "enum_item", "trait_item", "type_item":
+			types = append(types, parseRustType(node))
+		case "impl_item":
+			typeName := ""
+			if t := node.ChildByFieldName("type"); t != nil {
+				typeName = nodeText(t)
+			}
+			if body := node.ChildByFieldName("body"); body != nil {
+				walkRustImplBody(body, typeName, &functions)
+			}
+			return
+		case "use_declaration":
+			imports = append(imports, parseRustUse(node)...)
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return functions, types, imports
+}
+
+func parseRustFunction(node *Node, receiver string) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  receiver != "",
+		Receiver:  receiver,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func parseRustType(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	switch node.Type() {
+	case "struct_item":
+		info.Kind = "struct"
+	case "enum_item":
+		info.Kind = "enum"
+	case "trait_item":
+		info.Kind = "trait"
+	default:
+		info.Kind = "type"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func walkRustImplBody(body *Node, typeName string, functions *[]FunctionInfo) {
+	count := body.NamedChildCount()
+	for i := range count {
+		child := body.NamedChild(uint(i))
+		if child.Type() == "function_item" {
+			*functions = append(*functions, parseRustFunction(child, typeName))
+		}
+	}
+}
+
+func parseRustUse(node *Node) []ImportInfo {
+	var imports []ImportInfo
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "use_tree" || child.Type() == "scoped_identifier" || child.Type() == "identifier" {
+			imports = append(imports, ImportInfo{
+				Path: nodeText(child),
+				Line: node.StartPosition().Row + 1,
+			})
+			break
+		}
+	}
+	return imports
+}
+
+func extractCSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "function_definition":
+			functions = append(functions, parseCFunction(node))
+		case "declaration":
+			if fn := tryCFunctionDecl(node); fn != nil {
+				functions = append(functions, *fn)
+			}
+		case "struct_specifier", "union_specifier", "enum_specifier", "class_specifier":
+			if t := parseCType(node); t.Name != "" {
+				types = append(types, t)
+			}
+		case "type_definition":
+			types = append(types, parseCTypedef(node))
+		case "preproc_include":
+			imports = append(imports, parseCInclude(node))
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return functions, types, imports
+}
+
+func parseCFunction(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if decl := node.ChildByFieldName("declarator"); decl != nil {
+		if name := decl.ChildByFieldName("declarator"); name != nil {
+			info.Name = nodeText(name)
+		}
+		if params := decl.ChildByFieldName("parameters"); params != nil {
+			info.Parameters = nodeText(params)
+		}
+	}
+	return info
+}
+
+func tryCFunctionDecl(node *Node) *FunctionInfo {
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "function_declarator" {
+			info := &FunctionInfo{
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			}
+			if name := child.ChildByFieldName("declarator"); name != nil {
+				info.Name = nodeText(name)
+			}
+			if params := child.ChildByFieldName("parameters"); params != nil {
+				info.Parameters = nodeText(params)
+			}
+			return info
+		}
+	}
+	return nil
+}
+
+func parseCType(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	switch node.Type() {
+	case "struct_specifier":
+		info.Kind = "struct"
+	case "union_specifier":
+		info.Kind = "union"
+	case "enum_specifier":
+		info.Kind = "enum"
+	case "class_specifier":
+		info.Kind = "class"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseCTypedef(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "typedef",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "type_identifier" {
+			info.Name = nodeText(child)
+			break
+		}
+	}
+	return info
+}
+
+func parseCInclude(node *Node) ImportInfo {
+	info := ImportInfo{Line: node.StartPosition().Row + 1}
+	if path := node.ChildByFieldName("path"); path != nil {
+		info.Path = nodeText(path)
+	}
+	return info
+}
+
+func extractRubySymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node, className string)
+	walk = func(node *Node, className string) {
+		switch node.Type() {
+		case "method":
+			functions = append(functions, parseRubyMethod(node, className))
+		case "singleton_method":
+			fn := parseRubyMethod(node, className)
+			fn.Name = "self." + fn.Name
+			functions = append(functions, fn)
+		case "class", "singleton_class":
+			t := parseRubyClass(node)
+			types = append(types, t)
+			if body := node.ChildByFieldName("body"); body != nil {
+				walk(body, t.Name)
+			}
+			return
+		case "module":
+			types = append(types, parseRubyModule(node))
+		case "call":
+			if imp := tryRubyRequire(node); imp != nil {
+				imports = append(imports, *imp)
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), className)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), "")
+	}
+
+	return functions, types, imports
+}
+
+func parseRubyMethod(node *Node, className string) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  className != "",
+		Receiver:  className,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func parseRubyClass(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "class",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseRubyModule(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "module",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func tryRubyRequire(node *Node) *ImportInfo {
+	if method := node.ChildByFieldName("method"); method != nil {
+		name := nodeText(method)
+		if name == "require" || name == "require_relative" {
+			if args := node.ChildByFieldName("arguments"); args != nil {
+				if args.NamedChildCount() > 0 {
+					return &ImportInfo{
+						Path: nodeText(args.NamedChild(0)),
+						Line: node.StartPosition().Row + 1,
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func extractPHPSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node, className string)
+	walk = func(node *Node, className string) {
+		switch node.Type() {
+		case "function_definition":
+			functions = append(functions, parsePHPFunction(node, className))
+		case "method_declaration":
+			functions = append(functions, parsePHPFunction(node, className))
+		case "class_declaration", "interface_declaration", "trait_declaration":
+			t := parsePHPType(node)
+			types = append(types, t)
+			if body := node.ChildByFieldName("body"); body != nil {
+				walkPHPClassBody(body, t.Name, &functions)
+			}
+			return
+		case "namespace_use_declaration":
+			imports = append(imports, parsePHPUse(node)...)
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), className)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), "")
+	}
+
+	return functions, types, imports
+}
+
+func parsePHPFunction(node *Node, className string) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  className != "",
+		Receiver:  className,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func parsePHPType(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	switch node.Type() {
+	case "interface_declaration":
+		info.Kind = "interface"
+	case "trait_declaration":
+		info.Kind = "trait"
+	default:
+		info.Kind = "class"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func walkPHPClassBody(body *Node, className string, functions *[]FunctionInfo) {
+	count := body.NamedChildCount()
+	for i := range count {
+		child := body.NamedChild(uint(i))
+		if child.Type() == "method_declaration" {
+			*functions = append(*functions, parsePHPFunction(child, className))
+		}
+	}
+}
+
+func parsePHPUse(node *Node) []ImportInfo {
+	var imports []ImportInfo
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "namespace_use_clause" || child.Type() == "qualified_name" {
+			imports = append(imports, ImportInfo{
+				Path: nodeText(child),
+				Line: node.StartPosition().Row + 1,
+			})
+		}
+	}
+	return imports
+}
+
+func extractElixirSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node, moduleName string)
+	walk = func(node *Node, moduleName string) {
+		switch node.Type() {
+		case "call":
+			name := ""
+			if target := node.ChildByFieldName("target"); target != nil {
+				name = nodeText(target)
+			}
+			switch name {
+			case "def", "defp":
+				functions = append(functions, parseElixirFunction(node, moduleName, name == "defp"))
+			case "defmodule":
+				t := parseElixirModule(node)
+				types = append(types, t)
+				if args := node.ChildByFieldName("arguments"); args != nil {
+					if args.NamedChildCount() > 1 {
+						if body := args.NamedChild(1); body != nil {
+							walk(body, t.Name)
+						}
+					}
+				}
+				return
+			case "import", "alias", "require", "use":
+				imports = append(imports, parseElixirImport(node))
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), moduleName)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), "")
+	}
+
+	return functions, types, imports
+}
+
+func parseElixirFunction(node *Node, moduleName string, isPrivate bool) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  moduleName != "",
+		Receiver:  moduleName,
+	}
+	if args := node.ChildByFieldName("arguments"); args != nil {
+		if args.NamedChildCount() > 0 {
+			first := args.NamedChild(0)
+			if first.Type() == "call" {
+				if target := first.ChildByFieldName("target"); target != nil {
+					info.Name = nodeText(target)
+				}
+				if params := first.ChildByFieldName("arguments"); params != nil {
+					info.Parameters = nodeText(params)
+				}
+			} else {
+				info.Name = nodeText(first)
+			}
+		}
+	}
+	return info
+}
+
+func parseElixirModule(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "module",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if args := node.ChildByFieldName("arguments"); args != nil {
+		if args.NamedChildCount() > 0 {
+			info.Name = nodeText(args.NamedChild(0))
+		}
+	}
+	return info
+}
+
+func parseElixirImport(node *Node) ImportInfo {
+	info := ImportInfo{Line: node.StartPosition().Row + 1}
+	if args := node.ChildByFieldName("arguments"); args != nil {
+		if args.NamedChildCount() > 0 {
+			info.Path = nodeText(args.NamedChild(0))
+		}
+	}
+	return info
+}
+
+func extractScalaSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node, className string)
+	walk = func(node *Node, className string) {
+		switch node.Type() {
+		case "function_definition":
+			functions = append(functions, parseScalaFunction(node, className))
+		case "class_definition", "trait_definition", "object_definition":
+			t := parseScalaType(node)
+			types = append(types, t)
+			if body := node.ChildByFieldName("body"); body != nil {
+				walk(body, t.Name)
+			}
+			return
+		case "import_declaration":
+			imports = append(imports, parseScalaImport(node))
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), className)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), "")
+	}
+
+	return functions, types, imports
+}
+
+func parseScalaFunction(node *Node, className string) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  className != "",
+		Receiver:  className,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func parseScalaType(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	switch node.Type() {
+	case "trait_definition":
+		info.Kind = "trait"
+	case "object_definition":
+		info.Kind = "object"
+	default:
+		info.Kind = "class"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseScalaImport(node *Node) ImportInfo {
+	info := ImportInfo{Line: node.StartPosition().Row + 1}
+	if path := node.ChildByFieldName("path"); path != nil {
+		info.Path = nodeText(path)
+	}
+	return info
+}
+
+func extractMarkdownSections(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "atx_heading", "setext_heading":
+			level := 0
+			content := ""
+			count := node.ChildCount()
+			for i := range count {
+				child := node.Child(uint(i))
+				switch child.Type() {
+				case "atx_h1_marker":
+					level = 1
+				case "atx_h2_marker":
+					level = 2
+				case "atx_h3_marker":
+					level = 3
+				case "atx_h4_marker":
+					level = 4
+				case "atx_h5_marker":
+					level = 5
+				case "atx_h6_marker":
+					level = 6
+				case "heading_content", "inline":
+					content = nodeText(child)
+				}
+			}
+			if content != "" {
+				types = append(types, TypeInfo{
+					Name:      content,
+					Kind:      fmt.Sprintf("h%d", level),
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
+}
+
+func extractJSONKeys(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	if root.Type() != "document" && root.Type() != "object" {
+		return types
+	}
+
+	var obj *Node
+	if root.Type() == "document" && root.NamedChildCount() > 0 {
+		obj = root.NamedChild(0)
+	} else {
+		obj = root
+	}
+
+	if obj == nil || obj.Type() != "object" {
+		return types
+	}
+
+	count := obj.NamedChildCount()
+	for i := range count {
+		pair := obj.NamedChild(uint(i))
+		if pair.Type() == "pair" {
+			if key := pair.ChildByFieldName("key"); key != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(key),
+					Kind:      "key",
+					StartLine: pair.StartPosition().Row + 1,
+					EndLine:   pair.EndPosition().Row + 1,
+				})
+			}
+		}
+	}
+
+	return types
+}
+
+func extractYAMLKeys(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node, depth int)
+	walk = func(node *Node, depth int) {
+		if depth > 1 {
+			return
+		}
+
+		switch node.Type() {
+		case "block_mapping_pair":
+			if key := node.ChildByFieldName("key"); key != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(key),
+					Kind:      "key",
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), depth+1)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), 0)
+	}
+
+	return types
+}
+
+func extractHCLBlocks(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		if node.Type() == "block" {
+			blockType := ""
+			labels := ""
+
+			count := node.ChildCount()
+			for i := range count {
+				child := node.Child(uint(i))
+				switch child.Type() {
+				case "identifier":
+					if blockType == "" {
+						blockType = nodeText(child)
+					}
+				case "string_lit":
+					if labels != "" {
+						labels += "."
+					}
+					labels += nodeText(child)
+				}
+			}
+
+			name := blockType
+			if labels != "" {
+				name = blockType + " " + labels
+			}
+
+			types = append(types, TypeInfo{
+				Name:      name,
+				Kind:      "block",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
+}
+
+func extractLuaSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "function_declaration":
+			functions = append(functions, parseLuaFunction(node))
+		case "local_function":
+			functions = append(functions, parseLuaLocalFunction(node))
+		case "function_call":
+			if imp := tryLuaRequire(node); imp != nil {
+				imports = append(imports, *imp)
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return functions, types, imports
+}
+
+func parseLuaFunction(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func parseLuaLocalFunction(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func tryLuaRequire(node *Node) *ImportInfo {
+	if name := node.ChildByFieldName("name"); name != nil {
+		if nodeText(name) == "require" {
+			if args := node.ChildByFieldName("arguments"); args != nil {
+				if args.NamedChildCount() > 0 {
+					return &ImportInfo{
+						Path: nodeText(args.NamedChild(0)),
+						Line: node.StartPosition().Row + 1,
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func extractTOMLKeys(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "table", "table_array_element":
+			count := node.ChildCount()
+			for i := range count {
+				child := node.Child(uint(i))
+				if child.Type() == "bare_key" || child.Type() == "dotted_key" || child.Type() == "quoted_key" {
+					types = append(types, TypeInfo{
+						Name:      nodeText(child),
+						Kind:      "table",
+						StartLine: node.StartPosition().Row + 1,
+						EndLine:   node.EndPosition().Row + 1,
+					})
+					break
+				}
+			}
+		case "pair":
+			if key := node.ChildByFieldName("key"); key != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(key),
+					Kind:      "key",
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
+}
+
+func extractCSSSelectors(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		if node.Type() == "rule_set" {
+			if selectors := node.ChildByFieldName("selectors"); selectors != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(selectors),
+					Kind:      "selector",
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
+}
+
+func extractZigSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "FnProto":
+			functions = append(functions, parseZigFunction(node))
+		case "VarDecl":
+			if t := tryZigType(node); t != nil {
+				types = append(types, *t)
+			}
+		case "Builtin":
+			if imp := tryZigImport(node); imp != nil {
+				imports = append(imports, *imp)
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return functions, types, imports
+}
+
+func parseZigFunction(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("params"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func tryZigType(node *Node) *TypeInfo {
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "IDENTIFIER" {
+			return &TypeInfo{
+				Name:      nodeText(child),
+				Kind:      "const",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			}
+		}
+	}
+	return nil
+}
+
+func tryZigImport(node *Node) *ImportInfo {
+	text := nodeText(node)
+	if len(text) > 8 && text[:8] == "@import(" {
+		return &ImportInfo{
+			Path: text,
+			Line: node.StartPosition().Row + 1,
+		}
+	}
+	return nil
+}
+
+func extractKotlinSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node, className string)
+	walk = func(node *Node, className string) {
+		switch node.Type() {
+		case "function_declaration":
+			functions = append(functions, parseKotlinFunction(node, className))
+		case "class_declaration", "interface_declaration", "object_declaration":
+			t := parseKotlinType(node)
+			types = append(types, t)
+			if body := node.ChildByFieldName("body"); body != nil {
+				walk(body, t.Name)
+			}
+			return
+		case "import_header":
+			imports = append(imports, parseKotlinImport(node))
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)), className)
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)), "")
+	}
+
+	return functions, types, imports
+}
+
+func parseKotlinFunction(node *Node, className string) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		IsMethod:  className != "",
+		Receiver:  className,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	if p := node.ChildByFieldName("parameters"); p != nil {
+		info.Parameters = nodeText(p)
+	}
+	return info
+}
+
+func parseKotlinType(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	switch node.Type() {
+	case "interface_declaration":
+		info.Kind = "interface"
+	case "object_declaration":
+		info.Kind = "object"
+	default:
+		info.Kind = "class"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseKotlinImport(node *Node) ImportInfo {
+	info := ImportInfo{Line: node.StartPosition().Row + 1}
+	if id := node.ChildByFieldName("identifier"); id != nil {
+		info.Path = nodeText(id)
+	}
+	return info
+}
+
+func extractMakeTargets(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	count := root.NamedChildCount()
+	for i := range count {
+		node := root.NamedChild(uint(i))
+		if node.Type() == "rule" {
+			if targets := node.ChildByFieldName("targets"); targets != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(targets),
+					Kind:      "target",
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		}
+	}
+
+	return types
+}
+
+func extractBashSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "function_definition":
+			functions = append(functions, parseBashFunction(node))
+		case "command":
+			if imp := tryBashSource(node); imp != nil {
+				imports = append(imports, *imp)
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return functions, types, imports
+}
+
+func parseBashFunction(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func tryBashSource(node *Node) *ImportInfo {
+	if node.NamedChildCount() > 0 {
+		first := node.NamedChild(0)
+		name := nodeText(first)
+		if name == "source" || name == "." {
+			if node.NamedChildCount() > 1 {
+				return &ImportInfo{
+					Path: nodeText(node.NamedChild(1)),
+					Line: node.StartPosition().Row + 1,
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func extractGitPatterns(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	count := root.NamedChildCount()
+	for i := range count {
+		node := root.NamedChild(uint(i))
+		if node.Type() == "pattern" || node.Type() == "path" {
+			types = append(types, TypeInfo{
+				Name:      nodeText(node),
+				Kind:      "pattern",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+	}
+
+	return types
+}
+
+func extractHaskellSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "function":
+			functions = append(functions, parseHaskellFunction(node))
+		case "signature":
+			functions = append(functions, parseHaskellSignature(node))
+		case "adt", "newtype", "type_alias":
+			types = append(types, parseHaskellType(node))
+		case "import":
+			imports = append(imports, parseHaskellImport(node))
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return functions, types, imports
+}
+
+func parseHaskellFunction(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseHaskellSignature(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseHaskellType(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	switch node.Type() {
+	case "adt":
+		info.Kind = "data"
+	case "newtype":
+		info.Kind = "newtype"
+	default:
+		info.Kind = "type"
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseHaskellImport(node *Node) ImportInfo {
+	info := ImportInfo{Line: node.StartPosition().Row + 1}
+	if mod := node.ChildByFieldName("module"); mod != nil {
+		info.Path = nodeText(mod)
+	}
+	return info
+}
+
+func extractDiffFiles(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "file_change", "git_diff":
+			if oldFile := node.ChildByFieldName("old"); oldFile != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(oldFile),
+					Kind:      "file",
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		case "filename":
+			types = append(types, TypeInfo{
+				Name:      nodeText(node),
+				Kind:      "file",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
 }
 
 func (t *TreeSitterTool) parseContent(ctx context.Context, langName string, content []byte) (*Tree, error) {
@@ -290,12 +2114,24 @@ func parseImportDecl(node *Node) []ImportInfo {
 	return imports
 }
 
-func walkAllNamedChildren(node *Node, fn func(*Node)) {
-	count := node.NamedChildCount()
+func walkAllNamedChildren(root *Node, fn func(*Node)) {
+	stack := make([]*Node, 0, 32)
+
+	count := root.NamedChildCount()
 	for i := range count {
-		child := node.NamedChild(uint(i))
-		fn(child)
-		walkAllNamedChildren(child, fn)
+		stack = append(stack, root.NamedChild(uint(i)))
+	}
+
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		fn(node)
+
+		count := node.NamedChildCount()
+		for i := range count {
+			stack = append(stack, node.NamedChild(uint(i)))
+		}
 	}
 }
 
@@ -316,6 +2152,10 @@ func parseImportSpec(node *Node) ImportInfo {
 }
 
 func collectParseErrors(root *Node) []ParseError {
+	if !root.HasError() {
+		return nil
+	}
+
 	var errors []ParseError
 	walkAllChildren(root, func(node *Node) {
 		if node.HasError() && node.Type() == "ERROR" {
@@ -336,12 +2176,24 @@ func walkNamedChildren(node *Node, fn func(*Node)) {
 	}
 }
 
-func walkAllChildren(node *Node, fn func(*Node)) {
-	count := node.ChildCount()
+func walkAllChildren(root *Node, fn func(*Node)) {
+	stack := make([]*Node, 0, 64)
+
+	count := root.ChildCount()
 	for i := range count {
-		child := node.Child(uint(i))
-		fn(child)
-		walkAllChildren(child, fn)
+		stack = append(stack, root.Child(uint(i)))
+	}
+
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		fn(node)
+
+		count := node.ChildCount()
+		for i := range count {
+			stack = append(stack, node.Child(uint(i)))
+		}
 	}
 }
 

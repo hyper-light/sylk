@@ -28,13 +28,14 @@ type GrammarHandle struct {
 }
 
 type GrammarLoader struct {
-	grammars      map[string]*GrammarHandle
-	trustedDirs   []string
-	checksums     map[string]string
-	requireVerify bool
-	autoDownload  bool
-	downloader    *GrammarDownloader
-	mu            sync.RWMutex
+	grammars       map[string]*GrammarHandle
+	failedGrammars map[string]struct{}
+	trustedDirs    []string
+	checksums      map[string]string
+	requireVerify  bool
+	autoDownload   bool
+	downloader     *GrammarDownloader
+	mu             sync.RWMutex
 }
 
 type LoaderOption func(*GrammarLoader)
@@ -76,10 +77,11 @@ func WithDownloader(d *GrammarDownloader) LoaderOption {
 
 func NewGrammarLoader(opts ...LoaderOption) *GrammarLoader {
 	gl := &GrammarLoader{
-		grammars:      make(map[string]*GrammarHandle),
-		trustedDirs:   defaultTrustedDirs(),
-		checksums:     make(map[string]string),
-		requireVerify: false,
+		grammars:       make(map[string]*GrammarHandle),
+		failedGrammars: make(map[string]struct{}),
+		trustedDirs:    defaultTrustedDirs(),
+		checksums:      make(map[string]string),
+		requireVerify:  false,
 	}
 	for _, opt := range opts {
 		opt(gl)
@@ -144,6 +146,10 @@ func (gl *GrammarLoader) LoadContext(ctx context.Context, name string) (*sitter.
 		gl.mu.RUnlock()
 		return sitter.NewLanguage(h.langPtr), nil
 	}
+	if _, failed := gl.failedGrammars[name]; failed {
+		gl.mu.RUnlock()
+		return nil, fmt.Errorf("grammar %q previously failed to load", name)
+	}
 	gl.mu.RUnlock()
 
 	gl.mu.Lock()
@@ -151,6 +157,9 @@ func (gl *GrammarLoader) LoadContext(ctx context.Context, name string) (*sitter.
 
 	if h, ok := gl.grammars[name]; ok {
 		return sitter.NewLanguage(h.langPtr), nil
+	}
+	if _, failed := gl.failedGrammars[name]; failed {
+		return nil, fmt.Errorf("grammar %q previously failed to load", name)
 	}
 
 	handle, err := gl.loadLibrarySafe(name)
@@ -161,6 +170,7 @@ func (gl *GrammarLoader) LoadContext(ctx context.Context, name string) (*sitter.
 			}
 		}
 		if err != nil {
+			gl.failedGrammars[name] = struct{}{}
 			return nil, err
 		}
 	}

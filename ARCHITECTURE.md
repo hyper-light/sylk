@@ -45749,6 +45749,986 @@ func deserializeEmbedding(data []byte) []float32 {
 }
 ```
 
+---
+
+### Vamana Index Architecture (HNSW Replacement)
+
+> **MIGRATION NOTE**: The HNSW implementation above is being replaced with Vamana (DiskANN algorithm).
+> This section documents the target architecture. See TODO.md PARALLEL GROUP 4AJ for implementation tasks.
+
+#### Why Vamana Over HNSW
+
+| Aspect | HNSW | Vamana |
+|--------|------|--------|
+| **Graph Structure** | Multi-layer (expensive upper layers) | Single-layer with α-RNG pruning |
+| **Streaming Insert** | Requires layer assignment, upper layer rebuilds | O(log n) insert via RobustPrune |
+| **Filtered Search** | Post-filtering (loses recall) | Pre-filtering via Stitched Vamana (maintains recall) |
+| **Disk Friendliness** | Random access patterns | Sequential, mmap-friendly |
+| **Cold Start** | Build full index | ScaNN partitioned parallel build |
+| **Memory Model** | All in RAM | Base in mmap, delta in RAM |
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     VAMANA KNOWLEDGE GRAPH ARCHITECTURE                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                           UNIFIED INDEX                                         │ │
+│  │                    (Coordinates all components)                                 │ │
+│  │                                                                                 │ │
+│  │   ┌─────────────────────────────────────────────────────────────────────────┐  │ │
+│  │   │                        QUERY PATH                                        │  │ │
+│  │   │  Search(query, k, filter) → MergedSearch(base ∪ delta) → Results        │  │ │
+│  │   │                                                                          │  │ │
+│  │   │  1. If filter present: use Stitched Vamana (per-label subgraphs)        │  │ │
+│  │   │  2. Search base snapshot via GreedySearch                                │  │ │
+│  │   │  3. Search delta layer via GreedySearch                                  │  │ │
+│  │   │  4. Merge results, apply tombstone filtering                             │  │ │
+│  │   │  5. Return top-K by similarity                                           │  │ │
+│  │   └─────────────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                                 │ │
+│  │   ┌─────────────────────────────────────────────────────────────────────────┐  │ │
+│  │   │                        INSERT PATH                                       │  │ │
+│  │   │  Insert(id, vector, domain, nodeType) → Delta + WAL                     │  │ │
+│  │   │                                                                          │  │ │
+│  │   │  1. Assign InternalID, compute neighbors via GreedySearch               │  │ │
+│  │   │  2. Apply RobustPrune for α-RNG property                                 │  │ │
+│  │   │  3. Add bidirectional edges, re-prune overflows                          │  │ │
+│  │   │  4. Append to WAL (crash recovery)                                       │  │ │
+│  │   │  5. If delta.Size() > threshold: trigger background compaction          │  │ │
+│  │   └─────────────────────────────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                      │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐  ┌───────────────────┐  │
+│  │    BASE SNAPSHOT         │  │     DELTA LAYER          │  │   STITCHED        │  │
+│  │    (mmap binary files)   │  │     (in-memory)          │  │   VAMANA          │  │
+│  │                          │  │                          │  │   (filtered)      │  │
+│  │  vectors.bin             │  │  entries map[ID]*Entry   │  │                   │  │
+│  │  graph.bin               │  │  graph in-memory         │  │  subgraphs by     │  │
+│  │  labels.bin              │  │  tombstones set[ID]      │  │  Domain×NodeType  │  │
+│  │  idmap.json              │  │  WAL for crash recovery  │  │                   │  │
+│  │                          │  │                          │  │  medoid per       │  │
+│  │  Zero-copy vector        │  │  Sub-second ingest-to-   │  │  subgraph         │  │
+│  │  access via unsafe       │  │  query capability        │  │                   │  │
+│  └──────────────────────────┘  └──────────────────────────┘  └───────────────────┘  │
+│                                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                        COLD START (ScaNN Batch Builder)                       │   │
+│  │                                                                               │   │
+│  │  SQLite → Sample(10%) → Train AVQ → Assign → Partition Build → Merge         │   │
+│  │                                                                               │   │
+│  │  Memory-bounded: stream 1000 vectors/batch, <2GB peak for 50k vectors        │   │
+│  │  Parallel: worker pool builds partition graphs concurrently                  │   │
+│  │  Target: 50k vectors in <60s on 4 cores                                      │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Storage Layer (Hybrid Mmap + SQLite)
+
+**Design Principle**: Hot path (vectors, graph, labels) uses mmap binary files for zero-copy access. Cold path (metadata, provenance) stays in SQLite.
+
+##### Binary File Formats
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ vectors.bin - Contiguous Float32 Arrays                                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  HEADER (16 bytes, page-aligned):                                                    │
+│  ┌────────────┬────────────┬────────────┬────────────┐                              │
+│  │ dim (4B)   │ count (8B) │ flags (4B) │            │                              │
+│  │ uint32     │ uint64     │ uint32     │            │                              │
+│  │ e.g. 768   │ e.g. 50000 │ 0x00000001 │            │                              │
+│  └────────────┴────────────┴────────────┴────────────┘                              │
+│                                                                                      │
+│  DATA (dim × 4 bytes per vector):                                                    │
+│  ┌────────────────────────────────────────────────────────────────┐                 │
+│  │ Vector[0]: float32[dim]  │ e.g. [0.123, -0.456, 0.789, ...]   │                 │
+│  ├────────────────────────────────────────────────────────────────┤                 │
+│  │ Vector[1]: float32[dim]  │                                     │                 │
+│  ├────────────────────────────────────────────────────────────────┤                 │
+│  │ ...                      │                                     │                 │
+│  └────────────────────────────────────────────────────────────────┘                 │
+│                                                                                      │
+│  ACCESS: O(1) via offset = 16 + internalID × dim × 4                                │
+│  ZERO-COPY: unsafe.Slice((*float32)(ptr), dim)                                       │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ graph.bin - Fixed-Degree Adjacency Lists                                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  HEADER (16 bytes):                                                                  │
+│  ┌────────────┬────────────┬────────────┬────────────┐                              │
+│  │ R (4B)     │ count (8B) │ flags (4B) │            │                              │
+│  │ uint32     │ uint64     │ uint32     │            │                              │
+│  │ e.g. 64    │ e.g. 50000 │ 0x00000001 │            │                              │
+│  └────────────┴────────────┴────────────┴────────────┘                              │
+│                                                                                      │
+│  DATA (2 + R×4 bytes per node):                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐                 │
+│  │ Node[0]: count(2B) │ neighbors[R](uint32[R])                   │                 │
+│  │          e.g. 45   │ [12, 847, 3921, ..., 0, 0, ...]          │                 │
+│  ├────────────────────────────────────────────────────────────────┤                 │
+│  │ Node[1]: count(2B) │ neighbors[R](uint32[R])                   │                 │
+│  ├────────────────────────────────────────────────────────────────┤                 │
+│  │ ...                                                            │                 │
+│  └────────────────────────────────────────────────────────────────┘                 │
+│                                                                                      │
+│  ACCESS: O(1) via offset = 16 + internalID × (2 + R × 4)                            │
+│  FIXED-DEGREE: R neighbors per node, padded with 0 if fewer                         │
+│  NEIGHBOR COUNT: uint16 stores actual count (≤ R)                                   │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ labels.bin - Packed Domain/NodeType Arrays                                           │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  HEADER (16 bytes):                                                                  │
+│  ┌────────────┬────────────┬────────────┬────────────┬────────────┐                 │
+│  │ domainBits │ typeBits   │ count (8B) │ flags (4B) │            │                 │
+│  │ (1B)       │ (2B)       │ uint64     │ uint32     │            │                 │
+│  │ e.g. 8     │ e.g. 16    │ e.g. 50000 │ 0x00000001 │            │                 │
+│  └────────────┴────────────┴────────────┴────────────┴────────────┘                 │
+│                                                                                      │
+│  DATA (3 bytes per node):                                                            │
+│  ┌────────────────────────────────────────────────────────────────┐                 │
+│  │ Label[0]: domain(1B) │ nodeType(2B)                            │                 │
+│  │           e.g. 0     │ e.g. 1 (File)                           │                 │
+│  ├────────────────────────────────────────────────────────────────┤                 │
+│  │ Label[1]: domain(1B) │ nodeType(2B)                            │                 │
+│  ├────────────────────────────────────────────────────────────────┤                 │
+│  │ ...                                                            │                 │
+│  └────────────────────────────────────────────────────────────────┘                 │
+│                                                                                      │
+│  ACCESS: O(1) via offset = 16 + internalID × 3                                      │
+│  FILTER MASK: FilterMask(domains, nodeTypes) returns []bool for batch filtering    │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Snapshot Management
+
+```go
+// Atomic snapshot publishing via rename
+type SnapshotManager struct {
+    baseDir  string
+    current  *Snapshot  // currently active (immutable during reads)
+    pending  *Snapshot  // being written (nil if no write in progress)
+    mu       sync.RWMutex
+}
+
+type Snapshot struct {
+    vectors  *VectorStore   // mmap'd vectors.bin
+    graph    *GraphStore    // mmap'd graph.bin
+    labels   *LabelStore    // mmap'd labels.bin
+    idmap    *IDMap         // bidirectional ID mapping
+    metadata SnapshotMeta   // version, checksum, medoid
+}
+
+// Directory structure:
+// vamana/
+// ├── current/           ← symlink to v123/
+// ├── v123/
+// │   ├── vectors.bin
+// │   ├── graph.bin
+// │   ├── labels.bin
+// │   ├── idmap.json
+// │   └── meta.json
+// ├── v124/              ← pending write (becomes current on commit)
+// └── delta/
+//     ├── wal.bin
+//     └── checkpoint.json
+
+// Atomic commit sequence:
+// 1. Write all files to pending directory (v124/)
+// 2. fsync all files
+// 3. Update symlink: current → v124 (atomic on POSIX)
+// 4. Remove old version (v123/) after grace period
+```
+
+#### Core Algorithms
+
+##### RobustPrune (α-RNG Neighbor Selection)
+
+```go
+// RobustPrune implements α-RNG (alpha Relative Neighborhood Graph) pruning.
+// It selects neighbors that maintain graph navigability while limiting degree.
+//
+// Parameters:
+//   p: node being pruned
+//   candidates: potential neighbors sorted by distance to p
+//   α: diversity parameter (1.0 = standard RNG, >1.0 allows more diversity, typically 1.2)
+//   R: maximum number of neighbors to return
+//
+// Algorithm:
+//   For each candidate c (closest first):
+//     Add c to selected if: dist(p,c) ≤ α × min(dist(c,s) for s in selected)
+//     Stop when |selected| = R
+//
+// The α-RNG property ensures every node can be reached via greedy search.
+// Higher α values create more edges (better recall, more memory).
+
+func RobustPrune(
+    p InternalID,
+    candidates []InternalID,  // sorted by distance to p, ascending
+    vectors *VectorStore,
+    α float64,  // typically 1.2
+    R int,      // max neighbors, typically 64
+) []InternalID {
+    if len(candidates) == 0 {
+        return nil
+    }
+    
+    selected := make([]InternalID, 0, R)
+    pVec := vectors.Get(p)
+    
+    for _, c := range candidates {
+        if len(selected) >= R {
+            break
+        }
+        
+        cVec := vectors.Get(c)
+        distPC := cosineDistance(pVec, cVec)
+        
+        // Check α-RNG condition: is c α-close to p relative to all selected?
+        isAlphaClose := true
+        for _, s := range selected {
+            sVec := vectors.Get(s)
+            distCS := cosineDistance(cVec, sVec)
+            if distPC > α * distCS {
+                isAlphaClose = false
+                break
+            }
+        }
+        
+        if isAlphaClose {
+            selected = append(selected, c)
+        }
+    }
+    
+    return selected
+}
+```
+
+##### GreedySearch (Beam-Style Graph Traversal)
+
+```go
+// GreedySearch performs beam-style traversal starting from a given node.
+// It maintains a candidate set (min-heap) and result set (max-heap).
+//
+// Parameters:
+//   query: query vector
+//   start: starting node (typically medoid)
+//   L: search list size (beam width, controls recall vs speed)
+//   K: number of results to return
+//
+// Returns: top-K nodes sorted by similarity (descending)
+
+func GreedySearch(
+    query []float32,
+    start InternalID,
+    L int,   // beam width, typically 100
+    K int,   // number of results
+    vectors *VectorStore,
+    graph *GraphStore,
+) []SearchResult {
+    // Min-heap: candidates to explore (closest first)
+    candidates := NewMinHeap[SearchResult](L)
+    
+    // Max-heap: current best results (furthest first, for eviction)
+    results := NewMaxHeap[SearchResult](K)
+    
+    // Visited set
+    visited := make(map[InternalID]bool)
+    
+    // Initialize with start node
+    startDist := cosineDistance(query, vectors.Get(start))
+    candidates.Push(SearchResult{ID: start, Distance: startDist})
+    
+    for candidates.Len() > 0 {
+        // Pop closest unvisited candidate
+        current := candidates.Pop()
+        if visited[current.ID] {
+            continue
+        }
+        visited[current.ID] = true
+        
+        // Add to results
+        results.Push(current)
+        if results.Len() > K {
+            results.Pop()  // evict furthest
+        }
+        
+        // Get threshold: distance to K-th result (or infinity if < K results)
+        threshold := math.Inf(1)
+        if results.Len() >= K {
+            threshold = results.Peek().Distance
+        }
+        
+        // Explore neighbors
+        neighbors := graph.GetNeighbors(current.ID)
+        for _, n := range neighbors {
+            if visited[n] {
+                continue
+            }
+            nDist := cosineDistance(query, vectors.Get(n))
+            
+            // Only add if closer than current threshold
+            if nDist < threshold {
+                candidates.Push(SearchResult{ID: n, Distance: nDist})
+                // Keep candidates bounded to L
+                for candidates.Len() > L {
+                    candidates.Pop()  // this pops furthest since we need closest
+                }
+            }
+        }
+    }
+    
+    // Extract results sorted by similarity (descending)
+    return results.DrainSorted()
+}
+```
+
+##### Vamana Insert (FreshVamana Streaming)
+
+```go
+// Insert adds a new node to the Vamana index.
+// Uses FreshVamana streaming insert algorithm.
+//
+// Steps:
+//   1. Assign InternalID, store vector/labels
+//   2. Find candidate neighbors via GreedySearch from medoid
+//   3. Select neighbors via RobustPrune
+//   4. Add bidirectional edges
+//   5. Re-prune any neighbor that exceeds R
+//   6. Update medoid if new node is better centroid
+
+func (idx *UnifiedIndex) Insert(
+    ctx context.Context,
+    id string,
+    vector []float32,
+    domain Domain,
+    nodeType NodeType,
+) error {
+    idx.mu.Lock()
+    defer idx.mu.Unlock()
+    
+    // 1. Assign InternalID
+    internalID := idx.idmap.Assign(id)
+    
+    // 2. Store vector and labels
+    if err := idx.delta.vectors.Append(internalID, vector); err != nil {
+        return fmt.Errorf("failed to store vector: %w", err)
+    }
+    if err := idx.delta.labels.Set(internalID, domain, nodeType); err != nil {
+        return fmt.Errorf("failed to store labels: %w", err)
+    }
+    
+    // 3. Find candidates via GreedySearch
+    candidates := GreedySearch(
+        vector,
+        idx.medoid,
+        idx.config.L,           // efConstruct, e.g., 100
+        idx.config.R * 2,       // get 2R candidates for pruning
+        idx.combinedVectors(),  // searches both base and delta
+        idx.combinedGraph(),
+    )
+    
+    // 4. Select neighbors via RobustPrune
+    candidateIDs := make([]InternalID, len(candidates))
+    for i, c := range candidates {
+        candidateIDs[i] = c.ID
+    }
+    neighbors := RobustPrune(internalID, candidateIDs, idx.combinedVectors(), idx.config.Alpha, idx.config.R)
+    
+    // 5. Add bidirectional edges
+    idx.delta.graph.SetNeighbors(internalID, neighbors)
+    for _, n := range neighbors {
+        nNeighbors := idx.combinedGraph().GetNeighbors(n)
+        nNeighbors = append(nNeighbors, internalID)
+        
+        // Re-prune if overflow
+        if len(nNeighbors) > idx.config.R {
+            nNeighbors = RobustPrune(n, nNeighbors, idx.combinedVectors(), idx.config.Alpha, idx.config.R)
+        }
+        idx.delta.graph.SetNeighbors(n, nNeighbors)
+    }
+    
+    // 6. Write to WAL
+    if err := idx.wal.Append(WALEntry{
+        Op:       OpInsert,
+        ID:       id,
+        Vector:   vector,
+        Domain:   domain,
+        NodeType: nodeType,
+    }); err != nil {
+        return fmt.Errorf("failed to write WAL: %w", err)
+    }
+    
+    // 7. Check compaction threshold
+    if idx.delta.ShouldCompact() {
+        go idx.triggerCompaction(ctx)
+    }
+    
+    return nil
+}
+```
+
+#### Stitched Vamana (Filtered Search)
+
+**Problem**: Standard post-filtering loses recall. If you search for K=10 and filter removes 8, you only get 2 good results.
+
+**Solution**: Stitched Vamana maintains per-label subgraphs with stitching edges for cross-label connectivity.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      STITCHED VAMANA ARCHITECTURE                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  Label = Domain × NodeType (e.g., Code×File, History×Session)                       │
+│                                                                                      │
+│  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐                │
+│  │ Subgraph:       │     │ Subgraph:       │     │ Subgraph:       │                │
+│  │ Code×File       │     │ Code×Function   │     │ History×Session │                │
+│  │                 │     │                 │     │                 │                │
+│  │  ●──●──●        │     │  ●──●──●        │     │  ●──●──●        │                │
+│  │  │╲ │ ╱│        │     │  │╲ │ ╱│        │     │  │╲ │ ╱│        │                │
+│  │  ● ─●─ ●        │     │  ● ─●─ ●        │     │  ● ─●─ ●        │                │
+│  │  │╱ │ ╲│        │     │  │╱ │ ╲│        │     │  │╱ │ ╲│        │                │
+│  │  ●──●──●        │     │  ●──●──●        │     │  ●──●──●        │                │
+│  │                 │     │                 │     │                 │                │
+│  │  Medoid: M1     │     │  Medoid: M2     │     │  Medoid: M3     │                │
+│  └────────┬────────┘     └────────┬────────┘     └────────┬────────┘                │
+│           │                       │                       │                          │
+│           └───────────────────────┼───────────────────────┘                          │
+│                                   │                                                  │
+│                           STITCHING EDGES                                            │
+│                     (Connect medoids across subgraphs)                               │
+│                                   │                                                  │
+│                                   ▼                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │                         GLOBAL GRAPH                                         │    │
+│  │                                                                              │    │
+│  │   M1 ═══════════ M2 ═══════════ M3                                          │    │
+│  │    ║              ║              ║                                           │    │
+│  │    ║              ║              ║                                           │    │
+│  │   All nodes in   All nodes in   All nodes in                                │    │
+│  │   Code×File      Code×Function  History×Session                             │    │
+│  │                                                                              │    │
+│  │   ═══ = Stitching edges (strong, always traversed)                          │    │
+│  │   ─── = Intra-subgraph edges (local navigation)                             │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// StitchedSearch performs filtered search using per-label subgraphs.
+// This maintains recall because we search WITHIN the filtered set,
+// not filter AFTER searching the full graph.
+
+func (idx *StitchedIndex) Search(
+    query []float32,
+    k int,
+    filter *SearchFilter,
+) []SearchResult {
+    if filter == nil || (len(filter.Domains) == 0 && len(filter.NodeTypes) == 0) {
+        // No filter: use global search
+        return idx.globalSearch(query, k)
+    }
+    
+    // Get candidate subgraphs matching filter
+    matchingSubgraphs := idx.getMatchingSubgraphs(filter)
+    if len(matchingSubgraphs) == 0 {
+        return nil
+    }
+    
+    // Search each subgraph from its medoid
+    allResults := make([]SearchResult, 0, k*len(matchingSubgraphs))
+    for _, sg := range matchingSubgraphs {
+        results := GreedySearch(
+            query,
+            sg.medoid,
+            idx.config.FilteredL,  // may be higher than standard L for better recall
+            k,
+            sg.vectors,
+            sg.graph,
+        )
+        allResults = append(allResults, results...)
+    }
+    
+    // Merge and return top-K
+    sort.Slice(allResults, func(i, j int) bool {
+        return allResults[i].Distance < allResults[j].Distance
+    })
+    if len(allResults) > k {
+        allResults = allResults[:k]
+    }
+    
+    return allResults
+}
+
+// FilteredRobustPrune maintains both intra-label and cross-label edges.
+// Priority: same-label edges first, then cross-label for stitching.
+
+func FilteredRobustPrune(
+    p InternalID,
+    candidates []InternalID,
+    vectors *VectorStore,
+    labels *LabelStore,
+    α float64,
+    R int,
+    sameToOtherRatio float64,  // e.g., 0.75 = 75% same-label, 25% cross-label
+) []InternalID {
+    pLabel := labels.Get(p)
+    
+    // Partition candidates
+    sameLabel := make([]InternalID, 0)
+    crossLabel := make([]InternalID, 0)
+    for _, c := range candidates {
+        if labels.Get(c) == pLabel {
+            sameLabel = append(sameLabel, c)
+        } else {
+            crossLabel = append(crossLabel, c)
+        }
+    }
+    
+    // Allocate slots
+    sameSlots := int(float64(R) * sameToOtherRatio)
+    crossSlots := R - sameSlots
+    
+    // Prune each partition
+    samePruned := RobustPrune(p, sameLabel, vectors, α, sameSlots)
+    crossPruned := RobustPrune(p, crossLabel, vectors, α, crossSlots)
+    
+    // Combine
+    result := make([]InternalID, 0, R)
+    result = append(result, samePruned...)
+    result = append(result, crossPruned...)
+    
+    return result
+}
+```
+
+#### ScaNN Cold Start Pipeline
+
+**Problem**: Building Vamana from scratch on 50k+ vectors is slow (serial insertion).
+
+**Solution**: ScaNN-style partitioned parallel construction using Anisotropic Vector Quantization.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        SCANN COLD START PIPELINE                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  TARGET: 50k vectors in <60s on 4 cores, <2GB peak memory                           │
+│                                                                                      │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  PHASE 1: SAMPLE & TRAIN (10% of time, ~6s)                                         │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │  1. Stream vectors from SQLite (1000/batch, never load all)                 │    │
+│  │  2. Collect sample via Reservoir Sampling (10% or 10k, whichever smaller)   │    │
+│  │  3. Compute per-dimension variance (Welford's online algorithm)             │    │
+│  │  4. Train AVQ centroids (k-means++ with anisotropic distance)              │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                      │
+│  Variance Computation (numerically stable):                                          │
+│    count++                                                                           │
+│    delta = v - mean                                                                  │
+│    mean += delta / count                                                             │
+│    delta2 = v - mean                                                                 │
+│    M2 += delta * delta2                                                              │
+│    variance = M2 / count                                                             │
+│                                                                                      │
+│  Anisotropic Distance:                                                               │
+│    dist(q,c) = Σ_i w_i × (q_i - c_i)²                                               │
+│    where w_i = 1 / (variance_i + ε)                                                  │
+│    // Low-variance dims get HIGH weight (need amplification)                        │
+│    // High-variance dims get LOW weight (already discriminative)                    │
+│                                                                                      │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  PHASE 2: ASSIGN (20% of time, ~12s)                                                │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │  5. Stream all vectors again                                                │    │
+│  │  6. Assign each to nearest AVQ centroid (partition)                         │    │
+│  │  7. Write (vector_id, partition_id) to temp file                           │    │
+│  │  8. Count vectors per partition                                             │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                      │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  PHASE 3: BUILD PARTITIONS (60% of time, ~36s)                                      │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │  WORKER POOL (min(NumWorkers, NumPartitions) workers)                       │    │
+│  │                                                                              │    │
+│  │  For each partition P (parallel):                                           │    │
+│  │    a. Load vectors for partition P                                          │    │
+│  │    b. Compute local medoid                                                  │    │
+│  │    c. Build Vamana graph within partition:                                  │    │
+│  │       - Random insertion order (seeded for reproducibility)                 │    │
+│  │       - GreedySearch + RobustPrune for each node                           │    │
+│  │       - Bidirectional edges                                                 │    │
+│  │    d. Write PartitionGraph to temp file                                     │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                      │
+│  Partition Graph Structure:                                                          │
+│    - localIDs: [0, 1, 2, ...]                                                       │
+│    - globalIDs: [actual IDs]                                                        │
+│    - vectors: [][]float32                                                           │
+│    - neighbors: [][]InternalID (local IDs)                                          │
+│    - medoid: InternalID (local)                                                     │
+│                                                                                      │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│  PHASE 4: MERGE (10% of time, ~6s)                                                  │
+│  ═══════════════════════════════════════════════════════════════════════════════    │
+│                                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+│  │  9. Concatenate all partitions:                                             │    │
+│  │     - Remap local IDs to global IDs                                         │    │
+│  │     - Concatenate vectors, labels                                           │    │
+│  │     - Remap neighbor IDs in graph                                           │    │
+│  │                                                                              │    │
+│  │  10. Add stitching edges:                                                   │    │
+│  │      - Connect partition medoids to each other                              │    │
+│  │      - For each medoid M: add edges to top-S closest other medoids         │    │
+│  │      - Add border node stitching (nodes with <R/2 intra-partition edges)   │    │
+│  │                                                                              │    │
+│  │  11. Select global medoid (minimize sum of distances to partition medoids) │    │
+│  │                                                                              │    │
+│  │  12. Write final snapshot files (vectors.bin, graph.bin, labels.bin)       │    │
+│  └─────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// AVQ (Anisotropic Vector Quantization) for partitioning
+type AVQ struct {
+    centroids [][]float32  // K centroids
+    weights   []float64    // per-dimension anisotropic weights
+    dim       int
+}
+
+// Train uses k-means++ with anisotropic distance
+func (avq *AVQ) Train(samples [][]float32, config AVQConfig) error {
+    avq.dim = len(samples[0])
+    
+    // 1. Compute per-dimension variance
+    va := NewVarianceAnalyzer(avq.dim)
+    for _, s := range samples {
+        va.Add(s)
+    }
+    variances := va.Variances()
+    
+    // 2. Compute anisotropic weights: w_i = 1 / (σ_i² + ε)
+    avq.weights = make([]float64, avq.dim)
+    const epsilon = 1e-8
+    for i, v := range variances {
+        avq.weights[i] = 1.0 / (v + epsilon)
+    }
+    
+    // 3. K-means++ initialization
+    avq.centroids = avq.kMeansPlusPlusInit(samples, config.NumPartitions)
+    
+    // 4. K-means iteration (max 20 iterations)
+    for iter := 0; iter < 20; iter++ {
+        // Assign
+        assignments := make([]int, len(samples))
+        for i, s := range samples {
+            assignments[i] = avq.nearestCentroid(s)
+        }
+        
+        // Update centroids
+        newCentroids := avq.computeCentroids(samples, assignments, config.NumPartitions)
+        
+        // Check convergence (< 0.1% assignments changed)
+        changed := avq.countChanges(avq.centroids, newCentroids)
+        avq.centroids = newCentroids
+        if float64(changed)/float64(len(samples)) < 0.001 {
+            break
+        }
+    }
+    
+    return nil
+}
+
+// AnisotropicDistance computes weighted squared distance
+func (avq *AVQ) anisotropicDistance(a, b []float32) float64 {
+    var sum float64
+    for i := range a {
+        diff := float64(a[i] - b[i])
+        sum += avq.weights[i] * diff * diff
+    }
+    return sum
+}
+
+// Reservoir Sampling for memory-bounded sampling
+type ReservoirSampler struct {
+    samples [][]float32
+    k       int
+    count   int
+    rng     *rand.Rand
+}
+
+func (rs *ReservoirSampler) Add(v []float32) {
+    if rs.count < rs.k {
+        // Copy to avoid aliasing
+        cp := make([]float32, len(v))
+        copy(cp, v)
+        rs.samples = append(rs.samples, cp)
+    } else {
+        j := rs.rng.Intn(rs.count + 1)
+        if j < rs.k {
+            copy(rs.samples[j], v)
+        }
+    }
+    rs.count++
+}
+```
+
+#### Delta Layer and WAL
+
+**Purpose**: Sub-second ingest-to-query via in-memory delta + crash recovery via WAL.
+
+```go
+// DeltaIndex holds uncommitted changes in RAM
+type DeltaIndex struct {
+    mu sync.RWMutex
+    
+    // In-memory storage
+    vectors   map[InternalID][]float32
+    graph     map[InternalID][]InternalID
+    labels    map[InternalID]LabelSet
+    tombstones map[InternalID]bool  // deleted IDs mask base results
+    
+    // Configuration
+    maxSize           int      // trigger compaction at this size
+    compactionRunning atomic.Bool
+}
+
+// WAL provides crash recovery
+type WAL struct {
+    mu       sync.Mutex
+    file     *os.File
+    sequence uint64
+}
+
+type WALEntry struct {
+    Sequence  uint64
+    Op        OpType     // Insert, Delete, Checkpoint
+    Timestamp int64
+    DataLen   uint32
+    Data      []byte     // serialized operation
+    Checksum  uint32     // CRC32
+}
+
+// Format: [Sequence:8][Op:1][Timestamp:8][DataLen:4][Data:N][Checksum:4]
+
+// Recovery: replay WAL to reconstruct delta
+func RecoverDelta(walPath string) (*DeltaIndex, error) {
+    wal, err := OpenWAL(walPath)
+    if err != nil {
+        return nil, err
+    }
+    
+    delta := NewDeltaIndex()
+    
+    err = wal.Replay(func(entry *WALEntry) error {
+        switch entry.Op {
+        case OpInsert:
+            var op InsertOp
+            if err := op.Unmarshal(entry.Data); err != nil {
+                // Log warning, skip corrupt entry
+                log.Warn("skipping corrupt WAL entry", "seq", entry.Sequence)
+                return nil
+            }
+            delta.ApplyInsert(op)
+        case OpDelete:
+            var op DeleteOp
+            if err := op.Unmarshal(entry.Data); err != nil {
+                return nil
+            }
+            delta.ApplyDelete(op)
+        case OpCheckpoint:
+            // Informational only
+        }
+        return nil
+    })
+    
+    return delta, err
+}
+
+// Compaction: merge delta into new snapshot
+func (idx *UnifiedIndex) Compact(ctx context.Context) error {
+    if !idx.delta.compactionRunning.CompareAndSwap(false, true) {
+        return ErrCompactionInProgress
+    }
+    defer idx.delta.compactionRunning.Store(false)
+    
+    // 1. Create new snapshot directory
+    newVersion := idx.snapshotMgr.BeginWrite()
+    
+    // 2. Copy base + apply delta
+    if err := idx.mergeIntoSnapshot(ctx, newVersion); err != nil {
+        idx.snapshotMgr.AbortWrite()
+        return err
+    }
+    
+    // 3. Atomic commit (rename)
+    if err := idx.snapshotMgr.CommitWrite(); err != nil {
+        return err
+    }
+    
+    // 4. Truncate WAL
+    if err := idx.wal.TruncateBefore(idx.delta.lastSequence); err != nil {
+        log.Warn("failed to truncate WAL", "err", err)
+    }
+    
+    // 5. Clear delta
+    idx.delta.Clear()
+    
+    return nil
+}
+```
+
+#### Configuration
+
+```go
+// VamanaConfig contains all configuration parameters
+type VamanaConfig struct {
+    // Graph parameters
+    R            int     // Max neighbors per node (default: 64)
+    L            int     // Search list size (default: 100)
+    Alpha        float64 // RNG diversity parameter (default: 1.2)
+    
+    // Stitched Vamana
+    FilteredL        int     // Search list for filtered queries (default: 150)
+    StitchDegree     int     // Cross-subgraph edges (default: 4)
+    SameToOtherRatio float64 // Intra vs cross label edges (default: 0.75)
+    
+    // Delta layer
+    DeltaMaxSize         int // Trigger compaction (default: 10000)
+    CompactionThreshold  float64 // Fraction of max (default: 0.8)
+    WALPath              string
+    
+    // ScaNN batch build
+    NumPartitions   int // AVQ partitions (default: 16)
+    SampleSize      int // Training sample (default: 10000)
+    NumWorkers      int // Parallel workers (default: runtime.GOMAXPROCS(0))
+    TempDir         string
+    
+    // Storage
+    BaseDir string
+    MmapReadOnly bool // Read-only mmap for base snapshot
+}
+
+// DefaultVamanaConfig returns sensible defaults for production use
+func DefaultVamanaConfig(baseDir string) VamanaConfig {
+    return VamanaConfig{
+        // Graph
+        R:     64,
+        L:     100,
+        Alpha: 1.2,
+        
+        // Stitched
+        FilteredL:        150,
+        StitchDegree:     4,
+        SameToOtherRatio: 0.75,
+        
+        // Delta
+        DeltaMaxSize:        10000,
+        CompactionThreshold: 0.8,
+        WALPath:             filepath.Join(baseDir, "delta", "wal.bin"),
+        
+        // ScaNN
+        NumPartitions: 16,
+        SampleSize:    10000,
+        NumWorkers:    runtime.GOMAXPROCS(0),
+        TempDir:       filepath.Join(baseDir, "tmp"),
+        
+        // Storage
+        BaseDir:      baseDir,
+        MmapReadOnly: true,
+    }
+}
+```
+
+#### Performance Characteristics
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        VAMANA PERFORMANCE TARGETS                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  OPERATION         │ TARGET        │ NOTES                                          │
+│  ──────────────────┼───────────────┼────────────────────────────────────────────   │
+│  Insert            │ ≥1000 vec/sec │ Streaming via delta layer                      │
+│  Search (K=10)     │ ≤10ms p99     │ Merged search (base ∪ delta)                   │
+│  Filtered Search   │ ≤15ms p99     │ Stitched Vamana, no recall loss               │
+│  Cold Start (50k)  │ <60s          │ ScaNN parallel build on 4 cores               │
+│  Ingest-to-Query   │ <100ms        │ Available immediately via delta               │
+│                                                                                      │
+│  MEMORY USAGE      │               │                                                │
+│  ──────────────────┼───────────────┼────────────────────────────────────────────   │
+│  Base Snapshot     │ mmap (0 RAM)  │ OS manages page cache                         │
+│  Delta Layer       │ ~100MB        │ 10k vectors × 768 dims × 4 bytes + overhead   │
+│  Peak (Cold Start) │ <2GB          │ Stream 1k vectors/batch                        │
+│                                                                                      │
+│  RECALL TARGETS    │               │                                                │
+│  ──────────────────┼───────────────┼────────────────────────────────────────────   │
+│  Recall@10         │ ≥95%          │ Synthetic benchmark data                       │
+│  Filtered Recall   │ ≥ Unfiltered  │ Stitched Vamana guarantees this               │
+│                                                                                      │
+│  DISK USAGE        │               │                                                │
+│  ──────────────────┼───────────────┼────────────────────────────────────────────   │
+│  vectors.bin       │ ~150MB/50k    │ 50k × 768 × 4 bytes                           │
+│  graph.bin         │ ~13MB/50k     │ 50k × (2 + 64×4) bytes                        │
+│  labels.bin        │ ~150KB/50k    │ 50k × 3 bytes                                 │
+│  Total             │ ~165MB/50k    │ Plus SQLite metadata                          │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Implementation Phases
+
+See TODO.md **PARALLEL GROUP 4AJ** for the complete 61-task implementation plan across 10 phases:
+
+| Phase | Tasks | Description |
+|-------|-------|-------------|
+| 1 | VAM.1-8 | Foundation Types & Interfaces |
+| 2 | VAM.9-14 | Mmap Storage Layer |
+| 3 | VAM.15-20 | Core Vamana Algorithm |
+| 4 | VAM.21-25 | Delta Layer & WAL |
+| 5 | VAM.26-31 | Stitched Vamana |
+| 6 | VAM.32-39 | ScaNN Batch Indexing (8 tasks with detailed algorithms) |
+| 7 | VAM.40-45 | Integration Layer |
+| 8 | VAM.46-49 | HNSW Removal |
+| 9 | VAM.50-57 | Testing & Validation |
+| 10 | VAM.58-61 | LSP & Quality Gates |
+
+**Critical Constraints** (per CLAUDE.md):
+- NO magic numbers - derive from data
+- Cyclomatic complexity ≤4 per function
+- NO untracked goroutines
+- NO unbounded growth
+- NO drops, memory-leaks, or race conditions
+- Use modern Go 1.25+ structures
+- NO SQLite extensions (Bleve for FTS, VectorDB for semantic)
+
+---
+
 ### Core VectorGraphDB Structure
 
 ```go
