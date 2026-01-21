@@ -79,3 +79,7 @@ func (c *MagnitudeCache) Grow(newCap int) {
 	copy(newMags, mags)
 	c.mags.Store(&newMags)
 }
+
+func (c *MagnitudeCache) Slice() []float64 {
+	return *c.mags.Load()
+}

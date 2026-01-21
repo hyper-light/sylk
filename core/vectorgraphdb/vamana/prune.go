@@ -186,6 +186,111 @@ func RobustPrune(p uint32, candidates []uint32, alpha float64, R int, distFn Dis
 	return selected
 }
 
+func RobustPruneDirect(
+	p uint32,
+	candidates []uint32,
+	alpha float64,
+	R int,
+	vectors [][]float32,
+	mags []float64,
+) []uint32 {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	if len(candidates) <= R {
+		return slices.Clone(candidates)
+	}
+
+	maxExamine := min(R*2, len(candidates))
+	preserveCount := min(R, len(candidates))
+	ratio := max(1, len(candidates)/maxExamine)
+	totalSamples := maxExamine * bits.Len(uint(ratio))
+	secondHopSamples := min(len(candidates)-preserveCount, totalSamples-preserveCount)
+	maxScore := preserveCount + max(0, secondHopSamples)
+
+	toScore := candidates
+	if len(candidates) > maxScore && secondHopSamples > 0 {
+		toScore = make([]uint32, maxScore)
+		copy(toScore, candidates[:preserveCount])
+		copy(toScore[preserveCount:], candidates[preserveCount:maxScore])
+		for i, c := range candidates[maxScore:] {
+			j := rand.IntN(secondHopSamples + i + 1)
+			if j < secondHopSamples {
+				toScore[preserveCount+j] = c
+			}
+		}
+	}
+
+	pVec := vectors[p]
+	pMag := mags[p]
+
+	scored := make([]candidate, len(toScore))
+	for i, c := range toScore {
+		cVec := vectors[c]
+		cMag := mags[c]
+		var dist float64
+		if pMag == 0 || cMag == 0 {
+			dist = 2.0
+		} else {
+			dot := DotProduct(pVec, cVec)
+			dist = 1.0 - float64(dot)/(pMag*cMag)
+		}
+		scored[i] = candidate{id: c, dist: dist}
+	}
+
+	slices.SortFunc(scored, func(a, b candidate) int {
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
+		return 0
+	})
+
+	examineCount := min(maxExamine, len(scored))
+
+	selected := make([]uint32, 0, R)
+	consecutiveRejections := 0
+
+	for i := range examineCount {
+		if len(selected) >= R || consecutiveRejections >= R {
+			break
+		}
+
+		c := scored[i]
+		cVec := vectors[c.id]
+		cMag := mags[c.id]
+
+		keep := true
+		for _, s := range selected {
+			sVec := vectors[s]
+			sMag := mags[s]
+			var distCS float64
+			if cMag == 0 || sMag == 0 {
+				distCS = 2.0
+			} else {
+				dot := DotProduct(cVec, sVec)
+				distCS = 1.0 - float64(dot)/(cMag*sMag)
+			}
+			if c.dist > alpha*distCS {
+				keep = false
+				break
+			}
+		}
+
+		if keep {
+			selected = append(selected, c.id)
+			consecutiveRejections = 0
+		} else {
+			consecutiveRejections++
+		}
+	}
+
+	return selected
+}
+
 func RobustPruneWithScores(p uint32, scored []candidate, alpha float64, R int, distFn DistanceFunc) []uint32 {
 	if len(scored) == 0 {
 		return nil

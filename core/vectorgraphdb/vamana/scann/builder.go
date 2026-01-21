@@ -578,18 +578,7 @@ func (b *BatchBuilder) computeRefinements(
 	R int,
 	alpha float64,
 ) []nodeUpdate {
-	distFn := func(a, b uint32) float64 {
-		vecA := vectors[a]
-		vecB := vectors[b]
-		magA := magCache.GetOrCompute(a, vecA)
-		magB := magCache.GetOrCompute(b, vecB)
-		if magA == 0 || magB == 0 {
-			return 2.0
-		}
-		dot := vamana.DotProduct(vecA, vecB)
-		return 1.0 - float64(dot)/(magA*magB)
-	}
-
+	mags := magCache.Slice()
 	minImprovement := R / bits.Len(uint(R))
 
 	updates := make([]nodeUpdate, 0, len(nodeIndices))
@@ -623,7 +612,7 @@ func (b *BatchBuilder) computeRefinements(
 			continue
 		}
 
-		newNeighbors := vamana.RobustPrune(nodeID, candidateList, alpha, R, distFn)
+		newNeighbors := vamana.RobustPruneDirect(nodeID, candidateList, alpha, R, vectors, mags)
 		updates = append(updates, nodeUpdate{
 			nodeID:       nodeID,
 			newNeighbors: newNeighbors,
