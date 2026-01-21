@@ -229,6 +229,9 @@ func GreedySearchFast(
 	results := &resultHeap{}
 	heap.Init(results)
 
+	itersSinceImprovement := 0
+	var prevBound float64 = 2.0
+
 	for candidates.Len() > 0 {
 		current := heap.Pop(candidates).(searchCandidate)
 
@@ -248,6 +251,16 @@ func GreedySearchFast(
 			bound = (*results)[0].dist
 		} else {
 			bound = 2.0
+		}
+
+		if bound < prevBound {
+			itersSinceImprovement = 0
+			prevBound = bound
+		} else {
+			itersSinceImprovement++
+			if results.Len() >= L && itersSinceImprovement >= L {
+				break
+			}
 		}
 
 		neighbors := graph.GetNeighbors(current.id)
