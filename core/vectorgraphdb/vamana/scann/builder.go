@@ -580,31 +580,34 @@ func (b *BatchBuilder) computeRefinements(
 ) []nodeUpdate {
 	mags := magCache.Slice()
 	minImprovement := R / bits.Len(uint(R))
+	n := len(vectors)
 
+	seen := make([]bool, n)
+	candidateList := make([]uint32, 0, R*R)
 	updates := make([]nodeUpdate, 0, len(nodeIndices))
 
 	for _, idx := range nodeIndices {
 		nodeID := uint32(idx)
-
 		currentNeighbors := graphStore.GetNeighbors(nodeID)
-		seen := make(map[uint32]struct{}, len(currentNeighbors)*R)
 
-		candidateList := make([]uint32, 0, len(currentNeighbors)*R)
+		candidateList = candidateList[:0]
 
 		for _, neighbor := range currentNeighbors {
-			seen[neighbor] = struct{}{}
+			seen[neighbor] = true
 			candidateList = append(candidateList, neighbor)
 		}
 
 		for _, neighbor := range currentNeighbors {
 			for _, nn := range graphStore.GetNeighbors(neighbor) {
-				if nn != nodeID {
-					if _, exists := seen[nn]; !exists {
-						seen[nn] = struct{}{}
-						candidateList = append(candidateList, nn)
-					}
+				if nn != nodeID && !seen[nn] {
+					seen[nn] = true
+					candidateList = append(candidateList, nn)
 				}
 			}
+		}
+
+		for _, c := range candidateList {
+			seen[c] = false
 		}
 
 		improvement := len(candidateList) - len(currentNeighbors)
