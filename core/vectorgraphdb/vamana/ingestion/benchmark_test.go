@@ -282,13 +282,13 @@ func verifyIngestion(t *testing.T, tmpDir string, symbols []symbolInfo, stats pi
 	}
 
 	sampleCount := min(100, len(symbols))
-	step := max(1, len(symbols)/sampleCount)
 	verified := 0
 
 	mock := embedder.NewMockEmbedder(768)
 
-	for i := 0; i < len(symbols); i += step {
-		s := symbols[i]
+	for i := range sampleCount {
+		idx := i * len(symbols) / sampleCount
+		s := symbols[idx]
 
 		internalID, ok := idMap.ToInternal(s.id)
 		if !ok {
