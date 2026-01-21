@@ -133,13 +133,19 @@ func RobustPrune(p uint32, candidates []uint32, alpha float64, R int, distFn Dis
 		return 0
 	})
 
+	maxExamine := R * 2
+	if maxExamine > len(scored) {
+		maxExamine = len(scored)
+	}
+
 	selected := make([]uint32, 0, R)
 
-	for _, c := range scored {
+	for i := 0; i < maxExamine; i++ {
 		if len(selected) >= R {
 			break
 		}
 
+		c := scored[i]
 		keep := true
 		for _, s := range selected {
 			distCS := distFn(c.id, s)
