@@ -57,6 +57,7 @@ func (b *BatchBuilder) Build(
 	b.codebooks = NewPartitionCodebooks(b.partitioner.Centroids(), b.avqConfig.AnisotropicWeight)
 	b.trainCodebooks(vectors)
 
+	b.precomputeMagnitudes(vectors, magCache)
 	b.buildGraphLocalityAware(n, graphStore)
 	b.refineGraph(vectors, graphStore, magCache)
 
@@ -93,6 +94,38 @@ func (b *BatchBuilder) trainCodebooks(vectors [][]float32) {
 			defer func() { <-sem }()
 			b.codebooks.TrainPartition(pid, pvecs)
 		}(partID, vecs)
+	}
+
+	wg.Wait()
+}
+
+func (b *BatchBuilder) precomputeMagnitudes(vectors [][]float32, magCache *vamana.MagnitudeCache) {
+	n := len(vectors)
+	numWorkers := b.config.NumWorkers
+	if numWorkers <= 0 {
+		numWorkers = 1
+	}
+
+	chunkSize := (n + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+
+	for w := range numWorkers {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		if start >= end {
+			continue
+		}
+
+		wg.Add(1)
+		go func(s, e int) {
+			defer wg.Done()
+			for i := s; i < e; i++ {
+				magCache.GetOrCompute(uint32(i), vectors[i])
+			}
+		}(start, end)
 	}
 
 	wg.Wait()
