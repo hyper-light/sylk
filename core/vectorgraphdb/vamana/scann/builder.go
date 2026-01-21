@@ -71,7 +71,7 @@ func (b *BatchBuilder) Build(
 	}
 
 	b.partitioner = NewPartitioner(numParts, dim)
-	b.partitioner.Train(vectors, 20)
+	b.partitioner.Train(vectors, computeKMeansIterations(n))
 
 	b.codebooks = NewPartitionCodebooks(b.partitioner.Centroids(), b.avqConfig.AnisotropicWeight)
 	b.trainCodebooks(vectors)
@@ -408,6 +408,19 @@ func computeRefinementPasses(n int) int {
 		return 4
 	}
 	return 5
+}
+
+func computeKMeansIterations(n int) int {
+	if n <= 1000 {
+		return 5
+	}
+	if n <= 10000 {
+		return 8
+	}
+	if n <= 100000 {
+		return 12
+	}
+	return 15
 }
 
 type nodeUpdate struct {
