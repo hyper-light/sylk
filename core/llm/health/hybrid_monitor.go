@@ -35,9 +35,10 @@ type HybridHealthMonitor struct {
 	// Combined health score
 	health atomic.Int64 // Fixed-point: score * 1000
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	mu     sync.RWMutex
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	mu       sync.RWMutex
 }
 
 // NewHybridHealthMonitor creates monitor with prober and passive components.
@@ -154,7 +155,9 @@ func (hm *HybridHealthMonitor) RecordFailure(err error) {
 
 // Stop stops all background goroutines.
 func (hm *HybridHealthMonitor) Stop() {
-	close(hm.stopCh)
+	hm.stopOnce.Do(func() {
+		close(hm.stopCh)
+	})
 	hm.prober.Stop()
 	hm.wg.Wait()
 }

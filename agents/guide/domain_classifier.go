@@ -199,8 +199,7 @@ func (dc *DomainClassifier) CacheStats() *cache.CacheStats {
 	if dc.cache == nil {
 		return nil
 	}
-	stats := dc.cache.Stats()
-	return &stats
+	return dc.cache.Stats()
 }
 
 // ClearCache clears the classification cache.

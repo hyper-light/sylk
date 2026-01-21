@@ -101,13 +101,16 @@ const (
 	IntentSearch Intent = "search" // Search codebase
 	IntentLocate Intent = "locate" // Locate specific items
 
+	// Planning intents (handled by Architect)
+	IntentPlan   Intent = "plan"   // Create a design plan
+	IntentDesign Intent = "design" // Design architecture
+
 	// Meta intents
 	IntentHelp    Intent = "help"    // Request help/guidance
 	IntentStatus  Intent = "status"  // Check system status
 	IntentUnknown Intent = "unknown" // Could not classify
 )
 
-// AllIntents returns all valid intents
 func AllIntents() []Intent {
 	return []Intent{
 		IntentRecall,
@@ -118,6 +121,8 @@ func AllIntents() []Intent {
 		IntentFind,
 		IntentSearch,
 		IntentLocate,
+		IntentPlan,
+		IntentDesign,
 		IntentHelp,
 		IntentStatus,
 	}
@@ -165,12 +170,15 @@ const (
 	// Search domains (handled by Librarian)
 	DomainCode Domain = "code" // Code search, symbols, definitions
 
+	// Planning domains (handled by Architect)
+	DomainDesign Domain = "design" // System design, architecture
+	DomainTasks  Domain = "tasks"  // Task decomposition, workflows
+
 	// Meta domains
 	DomainSystem  Domain = "system"  // System status, health
 	DomainUnknown Domain = "unknown" // Could not classify
 )
 
-// AllDomains returns all valid domains
 func AllDomains() []Domain {
 	return []Domain{
 		DomainPatterns,
@@ -181,6 +189,8 @@ func AllDomains() []Domain {
 		DomainIntents,
 		DomainAgents,
 		DomainCode,
+		DomainDesign,
+		DomainTasks,
 		DomainSystem,
 	}
 }

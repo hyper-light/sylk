@@ -99,6 +99,10 @@ type AdaptiveQuantizerConfig struct {
 	// EnableResidual enables residual quantization for better accuracy.
 	// Default: true
 	EnableResidual bool
+
+	// BanditConfig provides bandit-learned thresholds for strategy selection.
+	// If nil, default hardcoded thresholds are used.
+	BanditConfig *BanditConfig
 }
 
 // DefaultAdaptiveQuantizerConfig returns default configuration.
@@ -133,36 +137,47 @@ func NewAdaptiveQuantizer(vectorDim int, config AdaptiveQuantizerConfig) (*Adapt
 
 // deriveStrategy selects the optimal strategy based on data characteristics.
 func (aq *AdaptiveQuantizer) deriveStrategy(numVectors int) QuantizationStrategy {
-	// If forced, use that strategy
 	if aq.config.ForceStrategy >= 0 {
 		return aq.config.ForceStrategy
 	}
 
-	// Derive based on dataset size and target recall
+	exactThreshold, coarseThreshold, mediumThreshold := aq.getStrategyThresholds()
+
 	switch {
-	case numVectors < 100:
-		// Tiny dataset: exact search is faster than PQ overhead
+	case numVectors < exactThreshold:
 		return StrategyExact
 
-	case numVectors < 1000:
-		// Small dataset: coarse PQ + re-ranking
-		// Not enough data for fine-grained codebooks
+	case numVectors < coarseThreshold:
 		return StrategyCoarsePQRerank
 
-	case numVectors < 100000:
-		// Medium dataset: standard PQ or residual PQ
+	case numVectors < mediumThreshold:
 		if aq.config.EnableResidual && aq.config.TargetRecall > 0.85 {
 			return StrategyResidualPQ
 		}
 		return StrategyStandardPQ
 
 	default:
-		// Large dataset: residual PQ for best accuracy
 		if aq.config.EnableResidual {
 			return StrategyResidualPQ
 		}
 		return StrategyStandardPQ
 	}
+}
+
+// getStrategyThresholds returns the thresholds for strategy selection.
+// Uses bandit-learned values if available, otherwise defaults.
+func (aq *AdaptiveQuantizer) getStrategyThresholds() (exact, coarse, medium int) {
+	if aq.config.BanditConfig != nil {
+		exact = aq.config.BanditConfig.StrategyExactThreshold
+		coarse = aq.config.BanditConfig.StrategyCoarseThreshold
+		medium = aq.config.BanditConfig.StrategyMediumThreshold
+
+		if exact > 0 && coarse > 0 && medium > 0 && exact < coarse && coarse < medium {
+			return exact, coarse, medium
+		}
+	}
+
+	return 100, 1000, 100000
 }
 
 // derivePQConfig derives optimal PQ configuration from data characteristics.
@@ -716,14 +731,8 @@ func (aq *AdaptiveQuantizer) SearchWithRerank(query []float32, k, numCandidates 
 	return candidates, nil
 }
 
-// squaredL2Distance computes squared L2 distance between two vectors.
 func squaredL2Distance(a, b []float32) float32 {
-	var sum float32
-	for i := range a {
-		d := a[i] - b[i]
-		sum += d * d
-	}
-	return sum
+	return SquaredL2Single(a, b)
 }
 
 // ComputeRecall computes recall@k against ground truth.
@@ -820,16 +829,16 @@ func (aq *AdaptiveQuantizer) Stats() AdaptiveQuantizerStats {
 
 // AdaptiveQuantizerStats contains statistics about the quantizer.
 type AdaptiveQuantizerStats struct {
-	Strategy                QuantizationStrategy
-	VectorDim               int
-	NumVectors              int
-	Trained                 bool
-	PrimarySubspaces        int
-	PrimaryCentroids        int
-	ResidualSubspaces       int
-	ResidualCentroids       int
+	Strategy                 QuantizationStrategy
+	VectorDim                int
+	NumVectors               int
+	Trained                  bool
+	PrimarySubspaces         int
+	PrimaryCentroids         int
+	ResidualSubspaces        int
+	ResidualCentroids        int
 	CompressedBytesPerVector int
-	StoredOriginalVectors   bool
+	StoredOriginalVectors    bool
 }
 
 // String returns a human-readable strategy name.

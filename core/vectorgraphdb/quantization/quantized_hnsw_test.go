@@ -24,9 +24,9 @@ func generateRandomVector(dim int, rng *rand.Rand) []float32 {
 	return vec
 }
 
-// generateClusteredVectors creates vectors clustered around centroids.
+// hnswGenerateClusteredVectors creates vectors clustered around centroids.
 // This provides more realistic test data for quantization.
-func generateClusteredVectors(numVectors, dim, numClusters int, rng *rand.Rand) [][]float32 {
+func hnswGenerateClusteredVectors(numVectors, dim, numClusters int, rng *rand.Rand) [][]float32 {
 	// Generate cluster centroids
 	centroids := make([][]float32, numClusters)
 	for i := range centroids {
@@ -201,7 +201,7 @@ func TestQuantizedHNSW_Insert(t *testing.T) {
 
 	// Insert vectors
 	for i := 0; i < 100; i++ {
-		id := string(rune('a' + i%26)) + string(rune('0'+i/26))
+		id := string(rune('a'+i%26)) + string(rune('0'+i/26))
 		vec := generateRandomVector(64, rng)
 		err := qh.Insert(id, vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 		if err != nil {
@@ -245,7 +245,7 @@ func TestQuantizedHNSW_InsertAfterTraining(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 
 	// Insert training vectors (need unique IDs for each)
-	trainingVectors := generateClusteredVectors(1000, 64, 64, rng)
+	trainingVectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 	for i, vec := range trainingVectors {
 		id := fmt.Sprintf("vec-%d", i)
 		qh.Insert(id, vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -303,7 +303,7 @@ func TestQuantizedHNSW_Train(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 
 	// Insert enough vectors for training (need unique IDs)
-	vectors := generateClusteredVectors(1000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 	for i, vec := range vectors {
 		id := fmt.Sprintf("vec-%d", i)
 		qh.Insert(id, vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -376,7 +376,7 @@ func TestQuantizedHNSW_TrainAlreadyTrained(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vectors := generateClusteredVectors(1000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 	for i, vec := range vectors {
 		qh.Insert(fmt.Sprintf("vec-%d", i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 	}
@@ -458,7 +458,7 @@ func TestQuantizedHNSW_SearchAfterTraining(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 
 	// Insert and track IDs
-	vectors := generateClusteredVectors(3000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(3000, 64, 64, rng)
 	idToVec := make(map[string][]float32)
 	for i, vec := range vectors {
 		id := "id-" + string(rune('a'+i%26)) + string(rune('0'+i/26/26)) + string(rune('0'+i/26%26))
@@ -508,7 +508,7 @@ func TestQuantizedHNSW_SearchWithFilter(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vectors := generateClusteredVectors(1000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 
 	// Insert with different domains (need unique IDs)
 	for i, vec := range vectors {
@@ -610,7 +610,7 @@ func TestQuantizedHNSW_DeleteAfterTraining(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vectors := generateClusteredVectors(1000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 
 	for i, vec := range vectors {
 		qh.Insert(fmt.Sprintf("vec-%d", i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -664,7 +664,7 @@ func TestQuantizedHNSW_MemoryUsage(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	// Need at least 256 * max(10, 24) = 6144 vectors for training
 	// Use 7000 to have some margin
-	vectors := generateClusteredVectors(7000, 768, 64, rng)
+	vectors := hnswGenerateClusteredVectors(7000, 768, 64, rng)
 
 	for i, vec := range vectors {
 		qh.Insert(fmt.Sprintf("vec-%d", i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -769,7 +769,7 @@ func TestQuantizedHNSW_ComputeRecall(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vectors := generateClusteredVectors(3000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(3000, 64, 64, rng)
 
 	for i, vec := range vectors {
 		qh.Insert("id-"+string(rune('a'+i%26))+string(rune('0'+i/26)), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -779,7 +779,6 @@ func TestQuantizedHNSW_ComputeRecall(t *testing.T) {
 		t.Fatalf("Train failed: %v", err)
 	}
 
-	// Compute recall with some query vectors
 	queries := make([][]float32, 10)
 	for i := range queries {
 		queries[i] = generateRandomVector(64, rng)
@@ -902,7 +901,7 @@ func TestQuantizedHNSW_ConcurrentSearch(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vectors := generateClusteredVectors(1000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 
 	for i, vec := range vectors {
 		qh.Insert(fmt.Sprintf("vec-%d", i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -970,7 +969,7 @@ func TestQuantizedHNSW_Snapshot(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vectors := generateClusteredVectors(1000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 
 	for i, vec := range vectors {
 		qh.Insert(fmt.Sprintf("vec-%d", i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -1021,7 +1020,7 @@ func TestQuantizedHNSW_RestoreFromSnapshot(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vectors := generateClusteredVectors(1000, 64, 64, rng)
+	vectors := hnswGenerateClusteredVectors(1000, 64, 64, rng)
 
 	for i, vec := range vectors {
 		qh1.Insert(fmt.Sprintf("vec-%d", i), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
@@ -1249,7 +1248,7 @@ func BenchmarkQuantizedHNSW_Search(b *testing.B) {
 	rng := rand.New(rand.NewSource(42))
 
 	// Insert and train
-	vectors := generateClusteredVectors(5000, 768, 64, rng)
+	vectors := hnswGenerateClusteredVectors(5000, 768, 64, rng)
 	for i, vec := range vectors {
 		qh.Insert("id-"+string(rune('a'+i%26)), vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 	}

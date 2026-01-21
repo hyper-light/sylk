@@ -90,20 +90,15 @@ func (s *CacheStats) Reset() {
 }
 
 // Snapshot returns a copy of the current statistics.
-func (s *CacheStats) Snapshot() CacheStats {
-	return CacheStats{
-		hits:      atomicWithValue(s.hits.Load()),
-		misses:    atomicWithValue(s.misses.Load()),
-		sets:      atomicWithValue(s.sets.Load()),
-		evictions: atomicWithValue(s.evictions.Load()),
+func (s *CacheStats) Snapshot() *CacheStats {
+	snapshot := &CacheStats{
 		startTime: s.startTime,
 	}
-}
-
-func atomicWithValue(v int64) atomic.Int64 {
-	var a atomic.Int64
-	a.Store(v)
-	return a
+	snapshot.hits.Store(s.hits.Load())
+	snapshot.misses.Store(s.misses.Load())
+	snapshot.sets.Store(s.sets.Load())
+	snapshot.evictions.Store(s.evictions.Load())
+	return snapshot
 }
 
 // StatsSnapshot is a non-atomic snapshot of cache statistics for serialization.

@@ -243,11 +243,3 @@ func TestCacheStats_ConcurrentAccess(t *testing.T) {
 		t.Errorf("Misses = %d, want 1000", stats.Misses())
 	}
 }
-
-func TestAtomicWithValue(t *testing.T) {
-	a := atomicWithValue(42)
-
-	if a.Load() != 42 {
-		t.Errorf("Load() = %d, want 42", a.Load())
-	}
-}

@@ -31,8 +31,9 @@ type Bulkhead struct {
 	totalFailures atomic.Int64
 
 	// Lifecycle
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 
 	mu sync.RWMutex
 }
@@ -283,7 +284,9 @@ func (b *Bulkhead) drainQueue() {
 
 // Stop gracefully shuts down the bulkhead.
 func (b *Bulkhead) Stop() {
-	close(b.stopCh)
+	b.stopOnce.Do(func() {
+		close(b.stopCh)
+	})
 	b.wg.Wait()
 }
 

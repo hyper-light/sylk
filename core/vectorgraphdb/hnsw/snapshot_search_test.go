@@ -796,47 +796,6 @@ func TestSnapshot_passesNodeTypeFilter(t *testing.T) {
 	assert.False(t, snap.passesNodeTypeFilter("func", []vectorgraphdb.NodeType{vectorgraphdb.NodeTypePaper}))
 }
 
-func TestSnapshot_createSearchResult(t *testing.T) {
-	snap := &HNSWSnapshot{
-		Vectors:    map[string][]float32{"exists": {1.0, 0.0}},
-		Magnitudes: map[string]float64{"exists": 1.0},
-	}
-
-	t.Run("existing vector", func(t *testing.T) {
-		result := snap.createSearchResult([]float32{1.0, 0.0}, 1.0, "exists")
-		require.NotNil(t, result)
-		assert.Equal(t, "exists", result.ID)
-		assert.InDelta(t, 1.0, result.Similarity, 0.0001)
-	})
-
-	t.Run("missing vector", func(t *testing.T) {
-		result := snap.createSearchResult([]float32{1.0, 0.0}, 1.0, "missing")
-		assert.Nil(t, result)
-	})
-
-	t.Run("missing magnitude", func(t *testing.T) {
-		snap.Vectors["nomag"] = []float32{1.0, 0.0}
-		result := snap.createSearchResult([]float32{1.0, 0.0}, 1.0, "nomag")
-		assert.Nil(t, result)
-	})
-}
-
-func TestSnapshot_sortCandidates(t *testing.T) {
-	snap := &HNSWSnapshot{}
-
-	candidates := []SearchResult{
-		{ID: "low", Similarity: 0.3},
-		{ID: "high", Similarity: 0.9},
-		{ID: "mid", Similarity: 0.6},
-	}
-
-	sorted := snap.sortCandidates(candidates)
-
-	assert.Equal(t, "high", sorted[0].ID)
-	assert.Equal(t, "mid", sorted[1].ID)
-	assert.Equal(t, "low", sorted[2].ID)
-}
-
 // W4P.7: Tests for efSearch configuration in snapshot search
 
 func TestSnapshot_EfSearch_PassedFromIndex(t *testing.T) {

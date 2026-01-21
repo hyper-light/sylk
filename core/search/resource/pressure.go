@@ -472,7 +472,11 @@ func (c *PressureSearchController) applyTimeout(
 		timeout = c.config.DegradedTimeout
 	}
 
-	ctx, _ = context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	go func() {
+		<-ctx.Done()
+		cancel()
+	}()
 	return ctx
 }
 

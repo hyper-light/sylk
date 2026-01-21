@@ -173,11 +173,11 @@ type ProductQuantizer struct {
 
 // Validation errors for ProductQuantizer construction.
 var (
-	ErrInvalidVectorDim         = errors.New("vector dimension must be positive")
-	ErrInvalidNumSubspaces      = errors.New("number of subspaces must be positive")
-	ErrInvalidCentroidsPerSub   = errors.New("centroids per subspace must be between 1 and 256")
-	ErrVectorDimNotDivisible    = errors.New("vector dimension must be divisible by number of subspaces")
-	ErrQuantizerNotTrained      = errors.New("product quantizer has not been trained")
+	ErrInvalidVectorDim       = errors.New("vector dimension must be positive")
+	ErrInvalidNumSubspaces    = errors.New("number of subspaces must be positive")
+	ErrInvalidCentroidsPerSub = errors.New("centroids per subspace must be between 1 and 256")
+	ErrVectorDimNotDivisible  = errors.New("vector dimension must be divisible by number of subspaces")
+	ErrQuantizerNotTrained    = errors.New("product quantizer has not been trained")
 )
 
 // NewProductQuantizer creates a new ProductQuantizer for vectors of the given dimension.
@@ -303,39 +303,8 @@ func (pq *ProductQuantizer) buildEncodingCache() {
 
 // subspaceDistance computes squared L2 distance between two subspace vectors.
 // This is used during training and encoding to find nearest centroids.
-// Handles different lengths gracefully by using the minimum length.
 func subspaceDistance(a, b []float32) float32 {
-	// Handle nil/empty slices
-	if len(a) == 0 || len(b) == 0 {
-		return 0
-	}
-
-	// Use minimum length for safety
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-
-	var sum float32
-
-	// Loop unrolling for better performance on common subspace dimensions
-	// Process 4 elements at a time
-	i := 0
-	for ; i <= n-4; i += 4 {
-		d0 := a[i] - b[i]
-		d1 := a[i+1] - b[i+1]
-		d2 := a[i+2] - b[i+2]
-		d3 := a[i+3] - b[i+3]
-		sum += d0*d0 + d1*d1 + d2*d2 + d3*d3
-	}
-
-	// Handle remaining elements
-	for ; i < n; i++ {
-		d := a[i] - b[i]
-		sum += d * d
-	}
-
-	return sum
+	return SquaredL2Single(a, b)
 }
 
 // =============================================================================
@@ -358,11 +327,11 @@ type DistanceTable struct {
 
 // Validation errors for DistanceTable
 var (
-	ErrDistanceTableNil            = errors.New("distance table is nil")
-	ErrDistanceTableEmpty          = errors.New("distance table has no subspaces")
-	ErrDistanceTableInvalidDims    = errors.New("distance table dimensions do not match configuration")
-	ErrDistanceTableInvalidCode    = errors.New("PQ code length does not match number of subspaces")
-	ErrDistanceTableCentroidOOB    = errors.New("centroid index out of bounds")
+	ErrDistanceTableNil         = errors.New("distance table is nil")
+	ErrDistanceTableEmpty       = errors.New("distance table has no subspaces")
+	ErrDistanceTableInvalidDims = errors.New("distance table dimensions do not match configuration")
+	ErrDistanceTableInvalidCode = errors.New("PQ code length does not match number of subspaces")
+	ErrDistanceTableCentroidOOB = errors.New("centroid index out of bounds")
 )
 
 // NewDistanceTable creates an empty distance table with the specified dimensions.
@@ -768,7 +737,6 @@ func DeriveTrainConfig(k int, subspaceDim int) TrainConfig {
 	}
 }
 
-
 // =============================================================================
 // Top-Level Training (PQ.7)
 // =============================================================================
@@ -1062,10 +1030,8 @@ func NewEncodingBuffer() *EncodingBuffer {
 	return &EncodingBuffer{}
 }
 
-// Reset clears all buffer data to prevent leakage between chunks.
-// CRITICAL: This MUST be called before processing each new chunk.
+// Reset clears buffer data to prevent leakage between chunks.
 func (b *EncodingBuffer) Reset() {
-	// Zero out the slices to prevent data leakage
 	for i := range b.subspaceData {
 		b.subspaceData[i] = 0
 	}
@@ -1453,13 +1419,8 @@ func (pq *ProductQuantizer) computeDistanceTableBLAS(query []float32, dt *Distan
 	}
 }
 
-// computeVectorNormSquared returns ||v||² = sum(v[i]²).
 func computeVectorNormSquared(v []float32) float32 {
-	var norm float32
-	for _, val := range v {
-		norm += val * val
-	}
-	return norm
+	return VectorNormSquared(v)
 }
 
 // computeDistancesFromDotProducts fills distances using: dist[c] = cNorms[c] + qNorm - 2*dots[c].
@@ -1527,12 +1488,12 @@ const (
 
 // Serialization errors
 var (
-	ErrSerializationNotTrained  = errors.New("cannot serialize untrained product quantizer")
-	ErrInvalidMagicNumber       = errors.New("invalid magic number in serialized data")
-	ErrUnsupportedVersion       = errors.New("unsupported serialization version")
-	ErrChecksumMismatch         = errors.New("checksum mismatch in serialized data")
-	ErrInvalidSerializedData    = errors.New("invalid serialized data")
-	ErrSerializedDataTooShort   = errors.New("serialized data is too short")
+	ErrSerializationNotTrained = errors.New("cannot serialize untrained product quantizer")
+	ErrInvalidMagicNumber      = errors.New("invalid magic number in serialized data")
+	ErrUnsupportedVersion      = errors.New("unsupported serialization version")
+	ErrChecksumMismatch        = errors.New("checksum mismatch in serialized data")
+	ErrInvalidSerializedData   = errors.New("invalid serialized data")
+	ErrSerializedDataTooShort  = errors.New("serialized data is too short")
 )
 
 // pqHeader represents the serialization header for ProductQuantizer.

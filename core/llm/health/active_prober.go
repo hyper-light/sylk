@@ -19,8 +19,9 @@ type ActiveProber struct {
 	consecutiveFail    atomic.Int32
 	consecutiveSuccess atomic.Int32
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // NewActiveProber creates a prober that runs in background.
@@ -133,6 +134,8 @@ func (ap *ActiveProber) scoreFromFailure() float64 {
 
 // Stop stops the prober goroutine gracefully.
 func (ap *ActiveProber) Stop() {
-	close(ap.stopCh)
+	ap.stopOnce.Do(func() {
+		close(ap.stopCh)
+	})
 	ap.wg.Wait()
 }

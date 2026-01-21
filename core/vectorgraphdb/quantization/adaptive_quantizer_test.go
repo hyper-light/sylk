@@ -4,18 +4,17 @@ import (
 	"context"
 	"math"
 	"math/rand"
+	"runtime"
 	"sort"
+	"sync"
 	"testing"
 )
 
-// TestAdaptiveQuantizer_RecallComparison compares recall across all strategies.
-// This verifies that Residual PQ + Re-ranking achieves 95%+ recall.
 func TestAdaptiveQuantizer_RecallComparison(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 
-	// Test parameters - realistic embedding dimensions
 	dim := 64
-	numDB := 5000  // Medium dataset to test all strategies
+	numDB := 5000
 	numClusters := 50
 	numQueries := 100
 	k := 10
@@ -263,7 +262,6 @@ func TestAdaptiveQuantizer_TinyDataset(t *testing.T) {
 	}
 }
 
-// TestAdaptiveQuantizer_RecallVsCandidates tests how recall scales with candidate count.
 func TestAdaptiveQuantizer_RecallVsCandidates(t *testing.T) {
 	rng := rand.New(rand.NewSource(789))
 
@@ -330,40 +328,35 @@ func TestAdaptiveQuantizer_RecallVsCandidates(t *testing.T) {
 	}
 }
 
-// Helper: compute ground truth using brute force
 func computeGroundTruth(queries, dbVectors [][]float32, k int) [][]int {
-	groundTruth := make([][]int, len(queries))
+	idx := NewDistanceIndex(dbVectors)
+	numQueries := len(queries)
+	groundTruth := make([][]int, numQueries)
+	numWorkers := runtime.GOMAXPROCS(0)
 
-	for q, query := range queries {
-		type distIdx struct {
-			dist float32
-			idx  int
-		}
+	var wg sync.WaitGroup
+	queryChan := make(chan int, numQueries)
 
-		dists := make([]distIdx, len(dbVectors))
-		for i, dbVec := range dbVectors {
-			var sum float32
-			for j := range query {
-				d := query[j] - dbVec[j]
-				sum += d * d
+	for range numWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			distBuf := make([]float32, len(dbVectors))
+			for q := range queryChan {
+				groundTruth[q] = idx.KNN(queries[q], k, distBuf)
 			}
-			dists[i] = distIdx{dist: sum, idx: i}
-		}
-
-		sort.Slice(dists, func(i, j int) bool {
-			return dists[i].dist < dists[j].dist
-		})
-
-		groundTruth[q] = make([]int, k)
-		for i := 0; i < k && i < len(dists); i++ {
-			groundTruth[q][i] = dists[i].idx
-		}
+		}()
 	}
+
+	for q := range numQueries {
+		queryChan <- q
+	}
+	close(queryChan)
+	wg.Wait()
 
 	return groundTruth
 }
 
-// Helper: compute recall for adaptive quantizer
 func computeRecallForAQ(t *testing.T, aq *AdaptiveQuantizer, queries [][]float32, groundTruth [][]int, k int) float64 {
 	var totalRecall float64
 
@@ -391,34 +384,23 @@ func computeRecallForAQ(t *testing.T, aq *AdaptiveQuantizer, queries [][]float32
 	return totalRecall / float64(len(queries))
 }
 
-// Helper: compute recall with re-ranking using stored vectors
 func computeRecallWithRerank(t *testing.T, aq *AdaptiveQuantizer, queries [][]float32, groundTruth [][]int, k, numCandidates int, dbVectors [][]float32) float64 {
 	var totalRecall float64
 
 	for q, query := range queries {
-		// Get candidates from adaptive quantizer
 		candidates, err := aq.Search(query, numCandidates)
 		if err != nil {
 			t.Fatalf("search failed: %v", err)
 		}
 
-		// Re-rank with exact distances using original vectors
 		for i := range candidates {
-			idx := candidates[i].Index
-			var sum float32
-			for j := range query {
-				d := query[j] - dbVectors[idx][j]
-				sum += d * d
-			}
-			candidates[i].Distance = sum
+			candidates[i].Distance = SquaredL2Single(query, dbVectors[candidates[i].Index])
 		}
 
-		// Sort by exact distance
 		sort.Slice(candidates, func(i, j int) bool {
 			return candidates[i].Distance < candidates[j].Distance
 		})
 
-		// Take top k
 		if len(candidates) > k {
 			candidates = candidates[:k]
 		}

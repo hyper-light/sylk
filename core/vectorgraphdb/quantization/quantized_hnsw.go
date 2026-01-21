@@ -67,6 +67,11 @@ type QuantizedHNSWConfig struct {
 	// If false, only compressed codes are stored (maximum compression).
 	// If true, original vectors are retained for retraining or exact search fallback.
 	StoreOriginalVectors bool
+
+	// UseFastScan enables 4-bit FastScan PQ instead of standard 8-bit PQ.
+	// FastScan uses 16 centroids per subspace (vs 256 for standard PQ).
+	// Trade-off: faster distance computation but slightly lower accuracy.
+	UseFastScan bool
 }
 
 // DefaultQuantizedHNSWConfig returns a QuantizedHNSWConfig with sensible defaults.
@@ -100,6 +105,12 @@ type QuantizedHNSW struct {
 	// quantizer handles vector compression/decompression
 	quantizer *ProductQuantizer
 
+	// bbq provides fast binary quantization for first-layer filtering
+	bbq *BBQEncoder
+
+	// bbqCodes stores BBQ-encoded vectors for fast distance computation
+	bbqCodes map[uint64][]byte
+
 	// codes stores compressed vectors by node ID (uint64 representation)
 	codes map[uint64]PQCode
 
@@ -132,6 +143,21 @@ type QuantizedHNSW struct {
 
 	// stats tracks compression statistics
 	stats QuantizedHNSWStats
+
+	// difficultyEstimator predicts query difficulty for adaptive search
+	difficultyEstimator *QueryDifficultyEstimator
+
+	// avq provides anisotropic loss weighting for OOD queries
+	avq *AnisotropicVQ
+
+	// fastScan is the optional 4-bit FastScan quantizer
+	fastScan *FastScanPQ
+
+	// fastScanCodes stores packed 4-bit codes when FastScan is enabled
+	fastScanCodes map[uint64][]byte
+
+	// mnru handles safe vector updates with connectivity preservation
+	mnru *hnsw.MNRUUpdater
 }
 
 // QuantizedHNSWStats tracks statistics for the quantized index.
@@ -156,6 +182,9 @@ type QuantizedHNSWStats struct {
 
 	// TrainingVectorCount is the number of vectors used for training
 	TrainingVectorCount int64
+
+	// QuantizationError is the mean squared reconstruction error from training
+	QuantizationError float64
 }
 
 // NewQuantizedHNSW creates a new quantized HNSW index with the given configuration.
@@ -175,9 +204,13 @@ func NewQuantizedHNSW(config QuantizedHNSWConfig) (*QuantizedHNSW, error) {
 		return nil, fmt.Errorf("failed to create product quantizer: %w", err)
 	}
 
-	return &QuantizedHNSW{
+	bbq := NewBBQEncoder(vectorDim, 4)
+
+	qh := &QuantizedHNSW{
 		index:            index,
 		quantizer:        quantizer,
+		bbq:              bbq,
+		bbqCodes:         make(map[uint64][]byte),
 		codes:            make(map[uint64]PQCode),
 		pendingVectors:   make(map[uint64][]float32),
 		pendingDomains:   make(map[uint64]vectorgraphdb.Domain),
@@ -187,7 +220,18 @@ func NewQuantizedHNSW(config QuantizedHNSWConfig) (*QuantizedHNSW, error) {
 		nextID:           1,
 		config:           config,
 		trained:          false,
-	}, nil
+		avq:              NewAnisotropicVQ(vectorDim),
+	}
+
+	if config.UseFastScan {
+		numSubspaces := quantizer.NumSubspaces()
+		qh.fastScan = NewFastScanPQ(vectorDim, numSubspaces)
+		qh.fastScanCodes = make(map[uint64][]byte)
+	}
+
+	qh.mnru = hnsw.NewMNRUUpdater(index)
+
+	return qh, nil
 }
 
 // =============================================================================
@@ -228,6 +272,9 @@ func (qh *QuantizedHNSW) Train(vectors [][]float32) error {
 
 	qh.trained = true
 	qh.stats.TrainingVectorCount = int64(len(vectors))
+	qh.stats.QuantizationError = qh.computeQuantizationError(vectors)
+
+	qh.initDifficultyEstimator(vectors)
 
 	// Compress all pending vectors
 	for id, vec := range qh.pendingVectors {
@@ -254,6 +301,77 @@ func (qh *QuantizedHNSW) IsTrained() bool {
 	qh.mu.RLock()
 	defer qh.mu.RUnlock()
 	return qh.trained
+}
+
+func (qh *QuantizedHNSW) deriveCandidateCount(k, adaptedEf int) int {
+	quantErr := qh.stats.QuantizationError
+	if quantErr <= 0 {
+		return adaptedEf
+	}
+	rerankMultiplier := math.Sqrt(1.0 / quantErr)
+	rerankMultiplier = math.Max(1.0, math.Min(rerankMultiplier, float64(adaptedEf)/float64(k)))
+
+	candidateCount := int(float64(k) * rerankMultiplier)
+	return max(candidateCount, adaptedEf)
+}
+
+func (qh *QuantizedHNSW) computeQuantizationError(vectors [][]float32) float64 {
+	if len(vectors) == 0 {
+		return 0
+	}
+
+	centroids := qh.quantizer.Centroids()
+	if centroids == nil {
+		return 0
+	}
+
+	numSubspaces := qh.quantizer.NumSubspaces()
+	subspaceDim := qh.quantizer.SubspaceDim()
+	vectorDim := qh.quantizer.VectorDim()
+
+	var totalError float64
+	var count int
+
+	for _, vec := range vectors {
+		code, err := qh.quantizer.Encode(vec)
+		if err != nil {
+			continue
+		}
+
+		reconstructed := make([]float32, vectorDim)
+		for m := range numSubspaces {
+			centroidIdx := int(code[m])
+			start := m * subspaceDim
+			copy(reconstructed[start:start+subspaceDim], centroids[m][centroidIdx])
+		}
+
+		var sqErr float64
+		for j, v := range vec {
+			d := float64(v - reconstructed[j])
+			sqErr += d * d
+		}
+		totalError += sqErr / float64(len(vec))
+		count++
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalError / float64(count)
+}
+
+func (qh *QuantizedHNSW) initDifficultyEstimator(vectors [][]float32) {
+	if len(vectors) == 0 {
+		return
+	}
+	k := qh.quantizer.CentroidsPerSubspace()
+	config := DeriveKMeansConfig(k)
+	centroids, err := KMeansOptimal(context.Background(), vectors, k, config)
+	if err != nil || len(centroids) == 0 {
+		return
+	}
+	qh.difficultyEstimator = NewQueryDifficultyEstimator(centroids)
+	qh.difficultyEstimator.CalibrateOODThreshold(vectors)
 }
 
 // =============================================================================
@@ -290,9 +408,12 @@ func (qh *QuantizedHNSW) Insert(id string, vector []float32, domain vectorgraphd
 			return fmt.Errorf("failed to encode vector: %w", err)
 		}
 		qh.codes[numID] = code
+		qh.bbqCodes[numID] = qh.bbq.EncodeDatabase(vector)
+		if qh.fastScan != nil {
+			qh.fastScanCodes[numID] = qh.fastScan.Encode(vector)
+		}
 		qh.stats.CompressedVectors++
 
-		// Store original if configured
 		if qh.config.StoreOriginalVectors {
 			qh.pendingVectors[numID] = vector
 		}
@@ -313,6 +434,36 @@ func (qh *QuantizedHNSW) Insert(id string, vector []float32, domain vectorgraphd
 	}
 
 	qh.updateMemoryStats()
+	return nil
+}
+
+func (qh *QuantizedHNSW) UpdateVector(id string, newVector []float32) error {
+	if err := qh.mnru.UpdateVector(id, newVector); err != nil {
+		return err
+	}
+
+	qh.mu.Lock()
+	defer qh.mu.Unlock()
+
+	numID, exists := qh.idMap[id]
+	if !exists {
+		return ErrVectorNotFound
+	}
+
+	if qh.trained {
+		code, err := qh.quantizer.Encode(newVector)
+		if err != nil {
+			return fmt.Errorf("failed to encode vector: %w", err)
+		}
+		qh.codes[numID] = code
+		qh.bbqCodes[numID] = qh.bbq.EncodeDatabase(newVector)
+		if qh.fastScan != nil {
+			qh.fastScanCodes[numID] = qh.fastScan.Encode(newVector)
+		}
+	} else {
+		qh.pendingVectors[numID] = newVector
+	}
+
 	return nil
 }
 
@@ -337,16 +488,25 @@ func (qh *QuantizedHNSW) trainLocked() error {
 		return fmt.Errorf("failed to train quantizer: %w", err)
 	}
 
+	qh.bbq.Train(vectors)
+
+	if qh.fastScan != nil {
+		qh.fastScan.Train(vectors)
+	}
+
 	qh.trained = true
 	qh.stats.TrainingVectorCount = int64(len(vectors))
 
-	// Compress all pending vectors
 	for id, vec := range qh.pendingVectors {
 		code, err := qh.quantizer.Encode(vec)
 		if err != nil {
 			continue
 		}
 		qh.codes[id] = code
+		qh.bbqCodes[id] = qh.bbq.EncodeDatabase(vec)
+		if qh.fastScan != nil {
+			qh.fastScanCodes[id] = qh.fastScan.Encode(vec)
+		}
 		qh.stats.CompressedVectors++
 	}
 
@@ -384,53 +544,42 @@ func (qh *QuantizedHNSW) Search(query []float32, k int, filter *hnsw.SearchFilte
 		return qh.index.Search(query, k, filter), nil
 	}
 
-	// Get candidates from HNSW graph traversal
-	// Request more candidates for re-ranking with PQ distances
 	efSearch := qh.config.HNSWConfig.EfSearch
 	if efSearch == 0 {
 		efSearch = vectorgraphdb.DefaultEfSearch
 	}
-	candidateCount := max(k*4, efSearch)
+
+	if qh.avq != nil {
+		qh.avq.UpdateQueryDistribution(query)
+	}
+
+	adaptedEf := efSearch
+	isOOD := false
+	if qh.difficultyEstimator != nil {
+		adaptedEf = qh.difficultyEstimator.AdaptEfSearch(efSearch, query)
+		isOOD = qh.difficultyEstimator.IsOOD(query)
+	}
+	candidateCount := qh.deriveCandidateCount(k, adaptedEf)
 
 	candidates := qh.index.Search(query, candidateCount, filter)
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 
-	// Compute distance table for asymmetric distance computation
-	distTable, err := qh.quantizer.ComputeDistanceTable(query)
-	if err != nil {
-		// Fall back to regular search on error
-		if len(candidates) > k {
-			return candidates[:k], nil
-		}
-		return candidates, nil
+	if isOOD && qh.avq != nil {
+		return qh.rerankWithAVQ(query, candidates, k)
 	}
 
-	// Re-rank candidates using PQ distances
-	results := make([]searchResult, 0, len(candidates))
-	for _, c := range candidates {
-		numID, exists := qh.idMap[c.ID]
-		if !exists {
-			continue
-		}
+	bbqFilterThreshold := k * 4
+	if len(candidates) > bbqFilterThreshold && len(qh.bbqCodes) > 0 {
+		candidates = qh.filterWithBBQ(query, candidates, candidateCount)
+	}
 
-		code, hasCode := qh.codes[numID]
-		if !hasCode {
-			// Use original similarity if no code
-			results = append(results, searchResult{
-				id:       c.ID,
-				distance: float32(1.0 - c.Similarity),
-			})
-			continue
-		}
-
-		// Compute asymmetric distance
-		dist := qh.quantizer.AsymmetricDistance(distTable, code)
-		results = append(results, searchResult{
-			id:       c.ID,
-			distance: dist,
-		})
+	var results []searchResult
+	if qh.fastScan != nil && len(qh.fastScanCodes) > 0 {
+		results = qh.rerankWithFastScan(query, candidates)
+	} else {
+		results = qh.rerankWithPQ(query, candidates)
 	}
 
 	// Sort by distance (ascending)
@@ -453,6 +602,161 @@ func (qh *QuantizedHNSW) Search(query []float32, k int, filter *hnsw.SearchFilte
 		}
 
 		domain, nodeType, _ := qh.index.GetMetadata(results[i].id)
+		finalResults = append(finalResults, hnsw.SearchResult{
+			ID:         results[i].id,
+			Similarity: similarity,
+			Domain:     domain,
+			NodeType:   nodeType,
+		})
+	}
+
+	return finalResults, nil
+}
+
+type bbqCandidate struct {
+	result   hnsw.SearchResult
+	distance int
+}
+
+func (qh *QuantizedHNSW) filterWithBBQ(query []float32, candidates []hnsw.SearchResult, targetCount int) []hnsw.SearchResult {
+	queryCode := qh.bbq.EncodeQuery(query)
+
+	bbqCandidates := make([]bbqCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		numID, exists := qh.idMap[c.ID]
+		if !exists {
+			continue
+		}
+
+		bbqCode, hasBBQ := qh.bbqCodes[numID]
+		if !hasBBQ {
+			bbqCandidates = append(bbqCandidates, bbqCandidate{
+				result:   c,
+				distance: math.MaxInt32,
+			})
+			continue
+		}
+
+		dist := qh.bbq.AsymmetricDistance(queryCode, bbqCode)
+		bbqCandidates = append(bbqCandidates, bbqCandidate{
+			result:   c,
+			distance: dist,
+		})
+	}
+
+	sort.Slice(bbqCandidates, func(i, j int) bool {
+		return bbqCandidates[i].distance < bbqCandidates[j].distance
+	})
+
+	keepCount := min(targetCount, len(bbqCandidates))
+	filtered := make([]hnsw.SearchResult, keepCount)
+	for i := range keepCount {
+		filtered[i] = bbqCandidates[i].result
+	}
+
+	return filtered
+}
+
+func (qh *QuantizedHNSW) rerankWithPQ(query []float32, candidates []hnsw.SearchResult) []searchResult {
+	distTable, err := qh.quantizer.ComputeDistanceTable(query)
+	if err != nil {
+		results := make([]searchResult, len(candidates))
+		for i, c := range candidates {
+			results[i] = searchResult{id: c.ID, distance: float32(1.0 - c.Similarity)}
+		}
+		return results
+	}
+
+	results := make([]searchResult, 0, len(candidates))
+	for _, c := range candidates {
+		numID, exists := qh.idMap[c.ID]
+		if !exists {
+			continue
+		}
+
+		code, hasCode := qh.codes[numID]
+		if !hasCode {
+			results = append(results, searchResult{id: c.ID, distance: float32(1.0 - c.Similarity)})
+			continue
+		}
+
+		dist := qh.quantizer.AsymmetricDistance(distTable, code)
+		results = append(results, searchResult{id: c.ID, distance: dist})
+	}
+	return results
+}
+
+func (qh *QuantizedHNSW) rerankWithFastScan(query []float32, candidates []hnsw.SearchResult) []searchResult {
+	tables := qh.fastScan.ComputeDistanceTable(query)
+
+	results := make([]searchResult, 0, len(candidates))
+	for _, c := range candidates {
+		numID, exists := qh.idMap[c.ID]
+		if !exists {
+			continue
+		}
+
+		code, hasCode := qh.fastScanCodes[numID]
+		if !hasCode {
+			results = append(results, searchResult{id: c.ID, distance: float32(1.0 - c.Similarity)})
+			continue
+		}
+
+		dist := qh.fastScan.AsymmetricDistance(tables, code)
+		results = append(results, searchResult{id: c.ID, distance: dist})
+	}
+	return results
+}
+
+func (qh *QuantizedHNSW) rerankWithAVQ(query []float32, candidates []hnsw.SearchResult, k int) ([]hnsw.SearchResult, error) {
+	queryDir := qh.avq.GetPrincipalQueryDirection()
+	centroids := qh.quantizer.Centroids()
+	numSubspaces := qh.quantizer.NumSubspaces()
+	subspaceDim := qh.quantizer.SubspaceDim()
+
+	type avqResult struct {
+		id   string
+		loss float64
+	}
+
+	results := make([]avqResult, 0, len(candidates))
+	for _, c := range candidates {
+		numID, exists := qh.idMap[c.ID]
+		if !exists {
+			continue
+		}
+
+		code, hasCode := qh.codes[numID]
+		if !hasCode {
+			results = append(results, avqResult{id: c.ID, loss: 1.0 - c.Similarity})
+			continue
+		}
+
+		reconstructed := make([]float32, qh.quantizer.VectorDim())
+		for m := range numSubspaces {
+			centroidIdx := int(code[m])
+			start := m * subspaceDim
+			copy(reconstructed[start:start+subspaceDim], centroids[m][centroidIdx])
+		}
+
+		loss := qh.avq.AnisotropicLoss(query, reconstructed, queryDir)
+		results = append(results, avqResult{id: c.ID, loss: loss})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].loss < results[j].loss
+	})
+
+	finalResults := make([]hnsw.SearchResult, 0, min(k, len(results)))
+	for i := 0; i < len(results) && i < k; i++ {
+		domain, nodeType, _ := qh.index.GetMetadata(results[i].id)
+		similarity := 1.0 - results[i].loss
+		if similarity < 0 {
+			similarity = 0
+		}
+		if similarity > 1 {
+			similarity = 1
+		}
 		finalResults = append(finalResults, hnsw.SearchResult{
 			ID:         results[i].id,
 			Similarity: similarity,
@@ -884,7 +1188,7 @@ func (qh *QuantizedHNSW) GetCompressionStats() CompressionStats {
 	numSubspaces := qh.quantizer.NumSubspaces()
 	centroidsPerSubspace := qh.quantizer.CentroidsPerSubspace()
 
-	originalBytes := vectorDim * 4 // 4 bytes per float32
+	originalBytes := vectorDim * 4  // 4 bytes per float32
 	compressedBytes := numSubspaces // 1 byte per subspace (uint8)
 
 	quantizationBits := int(math.Log2(float64(centroidsPerSubspace)))

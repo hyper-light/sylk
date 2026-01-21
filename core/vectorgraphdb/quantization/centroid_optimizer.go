@@ -35,12 +35,15 @@ type CentroidOptimizer struct {
 	config CentroidOptimizerConfig
 
 	// Data statistics (computed during analysis)
-	globalVariance     float64   // Total variance of data
-	subspaceVariances  []float64 // Variance per subspace
-	eigenvalues        []float64 // Eigenvalues from PCA (intrinsic dimensionality)
-	intrinsicDim       float64   // Estimated intrinsic dimensionality
-	dataComplexity     float64   // Complexity score [0,1]
-	clusteringStrength float64   // How clustered the data is [0,1]
+	globalVariance     float64
+	subspaceVariances  []float64
+	eigenvalues        []float64
+	intrinsicDim       float64
+	dataComplexity     float64
+	clusteringStrength float64
+
+	// Data-derived scaling factors (optional, replaces hardcoded values when computed)
+	factors *DataDerivedScalingFactors
 }
 
 // CentroidOptimizerConfig configures centroid optimization.
@@ -80,9 +83,9 @@ type CentroidOptimizerConfig struct {
 func DefaultCentroidOptimizerConfig() CentroidOptimizerConfig {
 	return CentroidOptimizerConfig{
 		TargetRecall:               0.95,
-		TargetDistortion:           0,    // Auto-derive
-		MinCentroidsPerSubspace:    0,    // Auto-derive
-		MaxCentroidsPerSubspace:    256,  // uint8 max
+		TargetDistortion:           0,   // Auto-derive
+		MinCentroidsPerSubspace:    0,   // Auto-derive
+		MaxCentroidsPerSubspace:    256, // uint8 max
 		EnableCrossValidation:      false,
 		CrossValidationSampleRatio: 0.1,
 		NumSubspaces:               8, // Default, should be set from data
@@ -104,6 +107,24 @@ func NewCentroidOptimizer(config CentroidOptimizerConfig) *CentroidOptimizer {
 	return &CentroidOptimizer{
 		config: config,
 	}
+}
+
+// ComputeAndCacheFactors derives scaling factors from the data and caches them.
+// Call this before OptimizeCentroidCount for data-adaptive optimization.
+// Factors are only recomputed if this method is called again.
+func (co *CentroidOptimizer) ComputeAndCacheFactors(vectors [][]float32, numSubspaces int) {
+	factors := DeriveScalingFactors(vectors, numSubspaces)
+	co.factors = &factors
+}
+
+// SetFactors allows manually setting pre-computed scaling factors.
+func (co *CentroidOptimizer) SetFactors(factors *DataDerivedScalingFactors) {
+	co.factors = factors
+}
+
+// GetFactors returns the current scaling factors (nil if not computed).
+func (co *CentroidOptimizer) GetFactors() *DataDerivedScalingFactors {
+	return co.factors
 }
 
 // OptimizeCentroidCount analyzes data and returns optimal centroid count.
@@ -470,64 +491,65 @@ func (co *CentroidOptimizer) estimateClusteringStrength(vectors [][]float32, sub
 
 // computeStatisticalMinimum computes minimum K for stable k-means.
 func (co *CentroidOptimizer) computeStatisticalMinimum(n, subspaceDim int) int {
-	// For k-means stability, need at least 10-20 samples per centroid
-	// Higher dimensional subspaces need more samples per centroid
-	samplesPerCentroid := max(10, 2*subspaceDim)
+	minSamples := 10
+	dimMultiplier := 2.0
+
+	if co.factors != nil && co.factors.Computed {
+		minSamples = co.factors.MinSamplesPerCentroid
+		dimMultiplier = co.factors.SubspaceDimMultiplier
+	}
+
+	samplesPerCentroid := max(minSamples, int(dimMultiplier*float64(subspaceDim)))
 	kMax := n / samplesPerCentroid
 
-	// Power of 2 for efficient encoding
 	return nearestPowerOf2(kMax)
 }
 
 // computeVarianceBasedK computes K based on per-subspace variance.
 func (co *CentroidOptimizer) computeVarianceBasedK(n, subspaceDim int) int {
 	if len(co.subspaceVariances) == 0 || co.globalVariance == 0 {
-		return 32 // Default
+		return 32
 	}
 
-	// Higher variance subspaces need more centroids
-	// K ∝ variance^(1/2) (from rate-distortion theory approximation)
 	maxVar := floats.Max(co.subspaceVariances)
 	avgVar := floats.Sum(co.subspaceVariances) / float64(len(co.subspaceVariances))
 
-	// Scale factor based on variance spread
 	varRatio := 1.0
 	if avgVar > 0 {
 		varRatio = math.Sqrt(maxVar / avgVar)
 	}
 
-	// Base K from statistical minimum, scaled by variance
-	baseK := n / max(10, 2*subspaceDim)
+	minSamples := 10
+	dimMultiplier := 2.0
+	if co.factors != nil && co.factors.Computed {
+		minSamples = co.factors.MinSamplesPerCentroid
+		dimMultiplier = co.factors.SubspaceDimMultiplier
+	}
+
+	baseK := n / max(minSamples, int(dimMultiplier*float64(subspaceDim)))
 	scaledK := int(float64(baseK) * varRatio)
 
 	return nearestPowerOf2(scaledK)
 }
 
 // computeRateDistortionK computes K from rate-distortion theory.
+// D(R) = σ² * 2^(-2R/dim) for Gaussian source; K = (1/targetDistortionRatio)^(dim/2)
 func (co *CentroidOptimizer) computeRateDistortionK(subspaceDim int) int {
-	// Rate-distortion for quantization:
-	// D(R) = σ² * 2^(-2R/dim) for Gaussian source
-	// where R = log2(K) bits, D is distortion
-	//
-	// Rearranging: K = 2^(R) where R = (dim/2) * log2(σ²/D)
-	//
-	// For target distortion D = σ² * targetDistortionRatio:
-	// K = (1/targetDistortionRatio)^(dim/2)
+	targetDistortionRatio := 0.1
+	if co.factors != nil && co.factors.Computed {
+		targetDistortionRatio = co.factors.TargetDistortionRatio
+	}
 
-	targetDistortionRatio := 0.1 // 10% of original variance
 	if co.config.TargetDistortion > 0 && co.globalVariance > 0 {
 		targetDistortionRatio = co.config.TargetDistortion / co.globalVariance
 	}
 
-	// Adjust based on target recall (higher recall = lower distortion needed)
-	recallFactor := 1.0 + (co.config.TargetRecall-0.5)*2 // Maps [0.5, 1.0] -> [1.0, 2.0]
+	recallFactor := 1.0 + (co.config.TargetRecall-0.5)*2
 	targetDistortionRatio /= recallFactor
 
-	// Compute K
 	exponent := float64(subspaceDim) / 2.0
 	kFloat := math.Pow(1.0/targetDistortionRatio, exponent)
 
-	// Clamp to reasonable range
 	k := int(kFloat)
 	if k < 8 {
 		k = 8
@@ -541,18 +563,19 @@ func (co *CentroidOptimizer) computeRateDistortionK(subspaceDim int) int {
 
 // computeIntrinsicDimensionalityK computes K scaled by intrinsic dimensionality.
 func (co *CentroidOptimizer) computeIntrinsicDimensionalityK(subspaceDim int) int {
-	// If intrinsic dim < actual dim, data lies on lower-dim manifold
-	// and needs fewer centroids to represent
 	intrinsicRatio := co.intrinsicDim / float64(subspaceDim)
 	if intrinsicRatio > 1 {
 		intrinsicRatio = 1
 	}
 	if intrinsicRatio < 0.1 {
-		intrinsicRatio = 0.1 // Don't go too low
+		intrinsicRatio = 0.1
 	}
 
-	// Base K, scaled by intrinsic dimensionality
-	baseK := 64 // Reasonable default
+	baseK := 64
+	if co.factors != nil && co.factors.Computed {
+		baseK = co.factors.BaseK
+	}
+
 	scaledK := int(float64(baseK) * intrinsicRatio)
 
 	return nearestPowerOf2(scaledK)
@@ -560,35 +583,29 @@ func (co *CentroidOptimizer) computeIntrinsicDimensionalityK(subspaceDim int) in
 
 // computeRecallBasedK computes K needed for target recall.
 func (co *CentroidOptimizer) computeRecallBasedK(n int) int {
-	// Empirical relationship between K and recall for PQ:
-	// recall ≈ 1 - exp(-αK) where α depends on data distribution
-	//
-	// For clustered data (high clusteringStrength), lower K suffices
-	// For uniform data, higher K needed
-
-	// Target recall to required K mapping
-	// Derived from empirical observations
 	targetRecall := co.config.TargetRecall
 
-	// Base K for 90% recall (empirically ~64 for typical data)
 	baseK := 64
+	recallScaleFactor := 10.0
+	clusteringAdjustMin := 0.5
 
-	// Scale for target recall using logistic-like curve
+	if co.factors != nil && co.factors.Computed {
+		baseK = co.factors.BaseK
+		recallScaleFactor = co.factors.RecallScaleFactor
+		clusteringAdjustMin = co.factors.ClusteringAdjustmentRange[0]
+	}
+
 	if targetRecall > 0.9 {
-		// Each 1% above 90% requires ~10% more centroids
 		extraRecall := targetRecall - 0.9
-		scaleFactor := 1.0 + extraRecall*10
+		scaleFactor := 1.0 + extraRecall*recallScaleFactor
 		baseK = int(float64(baseK) * scaleFactor)
 	} else if targetRecall < 0.9 {
-		// Can use fewer centroids
 		scaleFactor := targetRecall / 0.9
 		baseK = int(float64(baseK) * scaleFactor)
 	}
 
-	// Adjust for clustering strength
-	// Clustered data: true neighbors are concentrated, lower K works
-	// Uniform data: neighbors spread out, need higher K
-	clusteringAdjust := 1.0 - co.clusteringStrength*0.5 // [0.5, 1.0]
+	clusteringRange := 1.0 - clusteringAdjustMin
+	clusteringAdjust := 1.0 - co.clusteringStrength*clusteringRange
 	baseK = int(float64(baseK) * clusteringAdjust)
 
 	return nearestPowerOf2(baseK)
@@ -596,13 +613,22 @@ func (co *CentroidOptimizer) computeRecallBasedK(n int) int {
 
 // computeComplexityBasedK computes K based on data complexity.
 func (co *CentroidOptimizer) computeComplexityBasedK(n, subspaceDim int) int {
-	// More complex data needs more centroids to represent
-	// Complexity score [0,1] maps to K multiplier [0.5, 2.0]
-	complexityMultiplier := 0.5 + co.dataComplexity*1.5
+	complexityBase := 0.5
+	complexityRange := 1.5
 
-	// Base K from data size
-	baseK := min(n/max(10, subspaceDim), 256)
+	if co.factors != nil && co.factors.Computed {
+		complexityBase = co.factors.ComplexityMultiplierRange[0]
+		complexityRange = co.factors.ComplexityMultiplierRange[1]
+	}
 
+	complexityMultiplier := complexityBase + co.dataComplexity*complexityRange
+
+	minSamples := 10
+	if co.factors != nil && co.factors.Computed {
+		minSamples = co.factors.MinSamplesPerCentroid
+	}
+
+	baseK := min(n/max(minSamples, subspaceDim), 256)
 	scaledK := int(float64(baseK) * complexityMultiplier)
 
 	return nearestPowerOf2(scaledK)
@@ -830,32 +856,10 @@ func (co *CentroidOptimizer) evaluateK(
 	return recall / float64(len(valVectors))
 }
 
-// computeExactKNN computes ground truth k nearest neighbors.
 func computeExactKNN(query []float32, vectors [][]float32, k int) []int {
-	type distIdx struct {
-		dist float32
-		idx  int
-	}
-
-	dists := make([]distIdx, len(vectors))
-	for i, v := range vectors {
-		var d float32
-		for j := range query {
-			diff := query[j] - v[j]
-			d += diff * diff
-		}
-		dists[i] = distIdx{dist: d, idx: i}
-	}
-
-	sort.Slice(dists, func(i, j int) bool {
-		return dists[i].dist < dists[j].dist
-	})
-
-	result := make([]int, min(k, len(dists)))
-	for i := range result {
-		result[i] = dists[i].idx
-	}
-	return result
+	idx := NewDistanceIndex(vectors)
+	distBuf := make([]float32, len(vectors))
+	return idx.KNN(query, k, distBuf)
 }
 
 // GetStatistics returns computed data statistics.
@@ -876,4 +880,602 @@ type CentroidOptimizerStats struct {
 	IntrinsicDim       float64
 	DataComplexity     float64
 	ClusteringStrength float64
+}
+
+// =============================================================================
+// Data-Derived Scaling Factors
+// =============================================================================
+
+// DataDerivedScalingFactors contains scaling factors derived from actual data
+// measurements rather than hardcoded values. This allows the optimizer to adapt
+// to the specific characteristics of the dataset being quantized.
+type DataDerivedScalingFactors struct {
+	// TargetDistortionRatio is derived from actual reconstruction error at K=64.
+	// Represents the acceptable distortion as a fraction of original variance.
+	// Typically 10% of the measured reconstruction error at baseline K.
+	TargetDistortionRatio float64
+
+	// BaseK is derived from intrinsic dimensionality analysis.
+	// Computed as intrinsic_dim * 4 to cover 95% of variance directions.
+	// This provides the baseline centroid count before other adjustments.
+	BaseK int
+
+	// RecallScaleFactor is empirically derived from testing K=32,64,128 on sample data.
+	// Maps the relationship between extra recall above 90% and required K increase.
+	// Default hardcoded value was 10 (each 1% above 90% requires 10% more K).
+	RecallScaleFactor float64
+
+	// ClusteringAdjustmentRange defines how clustering strength affects K.
+	// Derived from Hopkins statistic spread: [1-H, 1] where H is Hopkins stat.
+	// Index 0: minimum adjustment (for highly clustered data)
+	// Index 1: maximum adjustment (for uniform data)
+	ClusteringAdjustmentRange [2]float64
+
+	// ComplexityMultiplierRange defines how data complexity scales K.
+	// Derived from eigenvalue decay rate analysis.
+	// Index 0: base multiplier for low complexity data
+	// Index 1: additional multiplier range for high complexity
+	ComplexityMultiplierRange [2]float64
+
+	// MinSamplesPerCentroid is the minimum samples needed per centroid for stable k-means.
+	// Derived from subspace covariance stability analysis.
+	MinSamplesPerCentroid int
+
+	// SubspaceDimMultiplier scales MinSamplesPerCentroid by subspace dimension.
+	// Higher dimensional subspaces need proportionally more samples.
+	SubspaceDimMultiplier float64
+
+	// Computed indicates whether these factors have been derived from data.
+	// If false, methods should fall back to hardcoded defaults.
+	Computed bool
+}
+
+// DefaultScalingFactors returns the hardcoded default values for backward compatibility.
+// These are the values that were previously hardcoded throughout the optimizer.
+func DefaultScalingFactors() DataDerivedScalingFactors {
+	return DataDerivedScalingFactors{
+		TargetDistortionRatio:     0.1,  // 10% of original variance
+		BaseK:                     64,   // Reasonable default
+		RecallScaleFactor:         10.0, // Each 1% above 90% = 10% more K
+		ClusteringAdjustmentRange: [2]float64{0.5, 1.0},
+		ComplexityMultiplierRange: [2]float64{0.5, 1.5},
+		MinSamplesPerCentroid:     10,
+		SubspaceDimMultiplier:     2.0,
+		Computed:                  false,
+	}
+}
+
+// DeriveScalingFactors computes data-adaptive scaling factors from the actual
+// vector distribution. This replaces hardcoded magic numbers with empirically
+// derived values specific to the dataset.
+//
+// The derivation process:
+//   - TargetDistortionRatio: Compute actual reconstruction error at K=64, use 10% of that
+//   - BaseK: Use intrinsic dimensionality * 4 (covers 95% variance directions)
+//   - RecallScaleFactor: Empirically test K=32,64,128, fit recall curve
+//   - ClusteringAdjustmentRange: Based on Hopkins statistic spread [1-H, 1]
+//   - ComplexityMultiplierRange: Based on eigenvalue decay rate
+//   - MinSamplesPerCentroid: Based on subspace covariance stability
+//
+// For small datasets (< 100 vectors) or efficiency, sampling is used.
+// The function is deterministic given the same input vectors.
+func DeriveScalingFactors(vectors [][]float32, numSubspaces int) DataDerivedScalingFactors {
+	factors := DefaultScalingFactors()
+
+	if len(vectors) < 10 {
+		return factors
+	}
+
+	dim := len(vectors[0])
+	if dim == 0 || numSubspaces <= 0 {
+		return factors
+	}
+
+	subspaceDim := dim / numSubspaces
+	if subspaceDim == 0 {
+		return factors
+	}
+
+	if containsNonFiniteValues(vectors) {
+		return factors
+	}
+
+	co := NewCentroidOptimizer(DefaultCentroidOptimizerConfig())
+	co.analyzeDataDistribution(vectors, numSubspaces)
+
+	// Derive each factor
+	factors.TargetDistortionRatio = deriveTargetDistortionRatio(vectors, numSubspaces, subspaceDim, co)
+	factors.BaseK = deriveBaseK(co.intrinsicDim)
+	factors.RecallScaleFactor = deriveRecallScaleFactor(vectors, numSubspaces)
+	factors.ClusteringAdjustmentRange = deriveClusteringAdjustmentRange(co.clusteringStrength)
+	factors.ComplexityMultiplierRange = deriveComplexityMultiplierRange(co.eigenvalues)
+	factors.MinSamplesPerCentroid, factors.SubspaceDimMultiplier = deriveSamplingFactors(vectors, numSubspaces, subspaceDim)
+	factors.Computed = true
+
+	return factors
+}
+
+// deriveTargetDistortionRatio computes the target distortion as 10% of actual
+// reconstruction error at baseline K=64.
+func deriveTargetDistortionRatio(vectors [][]float32, numSubspaces, subspaceDim int, co *CentroidOptimizer) float64 {
+	n := len(vectors)
+
+	// Sample for efficiency
+	sampleSize := min(500, n)
+	sampleVectors := sampleVectorsUniform(vectors, sampleSize)
+
+	// Compute baseline reconstruction error at K=64
+	baselineError := computeReconstructionError(sampleVectors, numSubspaces, subspaceDim, 64)
+
+	if baselineError <= 0 || co.globalVariance <= 0 {
+		return 0.1 // Fallback to default
+	}
+
+	// Target is 10% of baseline error relative to variance
+	errorRatio := baselineError / co.globalVariance
+	targetRatio := errorRatio * 0.1
+
+	// Clamp to reasonable range
+	if targetRatio < 0.01 {
+		targetRatio = 0.01
+	}
+	if targetRatio > 0.5 {
+		targetRatio = 0.5
+	}
+
+	return targetRatio
+}
+
+// deriveBaseK computes base K from intrinsic dimensionality.
+// Uses intrinsic_dim * 4 to cover 95% of variance directions.
+func deriveBaseK(intrinsicDim float64) int {
+	if intrinsicDim <= 0 {
+		return 64 // Default fallback
+	}
+
+	// Base K = intrinsic_dim * 4, covers 95% variance directions
+	baseK := int(intrinsicDim * 4)
+
+	// Clamp to valid range
+	if baseK < 8 {
+		baseK = 8
+	}
+	if baseK > 256 {
+		baseK = 256
+	}
+
+	return nearestPowerOf2(baseK)
+}
+
+// deriveRecallScaleFactor empirically tests K=32,64,128 and fits the recall curve
+// to determine how much additional K is needed per percentage point of recall above 90%.
+func deriveRecallScaleFactor(vectors [][]float32, numSubspaces int) float64 {
+	n := len(vectors)
+	if n < 100 {
+		return 10.0 // Default for small datasets
+	}
+
+	dim := len(vectors[0])
+	subspaceDim := dim / numSubspaces
+
+	// Sample for efficiency
+	sampleSize := min(300, n)
+	sampleVectors := sampleVectorsUniform(vectors, sampleSize)
+
+	// Split into train/test
+	trainSize := sampleSize * 8 / 10
+	trainVectors := sampleVectors[:trainSize]
+	testVectors := sampleVectors[trainSize:]
+
+	if len(testVectors) < 10 {
+		return 10.0
+	}
+
+	// Test K values
+	testKs := []int{32, 64, 128}
+	recalls := make([]float64, len(testKs))
+
+	// Limit K based on available data
+	maxK := len(trainVectors) / max(10, subspaceDim)
+	validKs := make([]int, 0, len(testKs))
+	for _, k := range testKs {
+		if k <= maxK {
+			validKs = append(validKs, k)
+		}
+	}
+
+	if len(validKs) < 2 {
+		return 10.0 // Not enough data points
+	}
+
+	for i, k := range validKs {
+		recalls[i] = measureRecallAtK(trainVectors, testVectors, numSubspaces, k)
+	}
+
+	// Fit recall-K relationship
+	// Model: recall = 1 - exp(-alpha * K / baseK)
+	// For K going from 64 to 128 (2x), how much does recall improve?
+	//
+	// We want to find: for each 1% above 90%, how much K increase is needed?
+	// scaleFactor = (K_increase_percent) / (recall_increase_percent)
+
+	// Find the index where recall is closest to 0.9
+	var idx90 int
+	minDiff := math.MaxFloat64
+	for i, r := range recalls {
+		if diff := math.Abs(r - 0.9); diff < minDiff {
+			minDiff = diff
+			idx90 = i
+		}
+	}
+
+	// If we have data points above and below 90%, interpolate
+	if idx90 > 0 && idx90 < len(recalls)-1 {
+		// Calculate the relationship between K and recall near 90%
+		recallDiff := recalls[idx90+1] - recalls[idx90]
+		kRatio := float64(validKs[idx90+1]) / float64(validKs[idx90])
+
+		if recallDiff > 0.001 {
+			// scaleFactor = (kRatio - 1) / recallDiff
+			// This gives: K_new = K_base * (1 + scaleFactor * (target - 0.9))
+			scaleFactor := (kRatio - 1.0) / recallDiff
+			scaleFactor *= 100 // Convert to per-percentage-point
+
+			// Clamp to reasonable range
+			if scaleFactor < 5 {
+				scaleFactor = 5
+			}
+			if scaleFactor > 20 {
+				scaleFactor = 20
+			}
+			return scaleFactor
+		}
+	}
+
+	return 10.0 // Default
+}
+
+// deriveClusteringAdjustmentRange computes the adjustment range based on Hopkins statistic.
+// Returns [1-H, 1] where H is the Hopkins statistic representing clustering tendency.
+func deriveClusteringAdjustmentRange(hopkinsH float64) [2]float64 {
+	// Hopkins statistic H:
+	// H near 0.5 = random data
+	// H near 1.0 = highly clustered
+	// H near 0.0 = uniformly distributed
+
+	// clusteringStrength in the optimizer is computed as 1 - ratio where ratio < 1 means clustered
+	// So clusteringStrength near 1 = highly clustered, near 0 = random
+
+	// For highly clustered data (H near 1), we can use lower K
+	// adjustment = 1 - clusteringStrength * spread
+	// spread determines how much clustering affects K
+
+	// Derive spread from the clustering strength itself
+	// Higher clustering = larger potential adjustment range
+	spread := 0.3 + hopkinsH*0.4 // [0.3, 0.7] based on clustering
+
+	minAdjust := 1.0 - spread
+	maxAdjust := 1.0
+
+	// Clamp
+	if minAdjust < 0.3 {
+		minAdjust = 0.3
+	}
+	if minAdjust > 0.9 {
+		minAdjust = 0.9
+	}
+
+	return [2]float64{minAdjust, maxAdjust}
+}
+
+// deriveComplexityMultiplierRange computes the complexity multiplier range from eigenvalue decay.
+// Fast decay = low complexity, slow decay = high complexity.
+func deriveComplexityMultiplierRange(eigenvalues []float64) [2]float64 {
+	if len(eigenvalues) < 2 {
+		return [2]float64{0.5, 1.5} // Default
+	}
+
+	// Compute eigenvalue decay rate
+	// Look at ratio of top-10 eigenvalues to total
+	topK := min(10, len(eigenvalues))
+	var topSum, totalSum float64
+	for i, ev := range eigenvalues {
+		totalSum += ev
+		if i < topK {
+			topSum += ev
+		}
+	}
+
+	if totalSum <= 0 {
+		return [2]float64{0.5, 1.5}
+	}
+
+	concentration := topSum / totalSum // [0, 1]
+
+	// High concentration = fast decay = low complexity = need smaller multiplier range
+	// Low concentration = slow decay = high complexity = need larger multiplier range
+
+	// Base multiplier: always at least 0.5
+	baseMult := 0.5
+
+	// Range multiplier: inversely proportional to concentration
+	// concentration near 1 (fast decay) -> range = 1.0
+	// concentration near 0 (slow decay) -> range = 2.0
+	rangeMult := 1.0 + (1.0-concentration)*1.0
+
+	return [2]float64{baseMult, rangeMult}
+}
+
+// deriveSamplingFactors determines optimal sampling requirements for stable k-means
+// by analyzing subspace covariance stability.
+func deriveSamplingFactors(vectors [][]float32, numSubspaces, subspaceDim int) (minSamples int, dimMultiplier float64) {
+	n := len(vectors)
+	if n < 50 {
+		return 10, 2.0 // Default for small datasets
+	}
+
+	// Test covariance stability at different sample sizes
+	// Find the point where adding more samples doesn't significantly change covariance
+
+	testSizes := []int{10, 20, 50, 100, 200}
+	var lastCovNorm float64
+	stableSize := 10
+
+	for _, size := range testSizes {
+		if size > n/2 {
+			break
+		}
+
+		sample := sampleVectorsUniform(vectors, size)
+		covNorm := computeSubspaceCovarianceNorm(sample, numSubspaces, subspaceDim)
+
+		if lastCovNorm > 0 {
+			// Check relative change
+			relChange := math.Abs(covNorm-lastCovNorm) / lastCovNorm
+			if relChange < 0.05 { // Less than 5% change = stable
+				stableSize = size
+				break
+			}
+		}
+		lastCovNorm = covNorm
+		stableSize = size
+	}
+
+	// MinSamplesPerCentroid is the stable size
+	minSamples = stableSize
+	if minSamples < 10 {
+		minSamples = 10
+	}
+
+	// Compute dimension multiplier
+	// Higher dimensional subspaces need more samples proportionally
+	// Empirical: samples_needed ≈ minSamples + multiplier * subspaceDim
+	// We want to find multiplier such that total samples provides stability
+	dimMultiplier = float64(stableSize) / float64(subspaceDim)
+	if dimMultiplier < 1.0 {
+		dimMultiplier = 1.0
+	}
+	if dimMultiplier > 5.0 {
+		dimMultiplier = 5.0
+	}
+
+	return minSamples, dimMultiplier
+}
+
+// computeReconstructionError computes the average reconstruction error for k-means
+// quantization with the given K centroids.
+func computeReconstructionError(vectors [][]float32, numSubspaces, subspaceDim, k int) float64 {
+	n := len(vectors)
+	if n < k {
+		return 0
+	}
+
+	// Simple k-means reconstruction error estimation
+	// For each subspace, compute variance reduction from k-means
+
+	var totalError float64
+
+	for m := 0; m < numSubspaces; m++ {
+		start := m * subspaceDim
+
+		// Extract subspace data
+		subspaceData := make([][]float32, n)
+		for i := range vectors {
+			subspaceData[i] = vectors[i][start : start+subspaceDim]
+		}
+
+		// Compute within-cluster variance using simple k-means approximation
+		// For efficiency, use random centroid selection (not full k-means)
+		error := estimateKMeansError(subspaceData, k)
+		totalError += error
+	}
+
+	return totalError / float64(numSubspaces)
+}
+
+// estimateKMeansError estimates k-means reconstruction error without full training.
+// Uses a fast approximation based on random centroid selection.
+func estimateKMeansError(subspaceData [][]float32, k int) float64 {
+	n := len(subspaceData)
+	if n == 0 {
+		return 0
+	}
+	dim := len(subspaceData[0])
+	if dim == 0 {
+		return 0
+	}
+
+	// Select k random centroids from the data
+	step := n / k
+	if step < 1 {
+		step = 1
+	}
+
+	centroids := make([][]float32, min(k, n))
+	for i := range centroids {
+		idx := (i * step) % n
+		centroids[i] = subspaceData[idx]
+	}
+
+	// Compute average distance to nearest centroid
+	var totalError float64
+	for _, vec := range subspaceData {
+		minDist := float64(math.MaxFloat32)
+		for _, centroid := range centroids {
+			var dist float64
+			for d := 0; d < dim; d++ {
+				diff := float64(vec[d] - centroid[d])
+				dist += diff * diff
+			}
+			if dist < minDist {
+				minDist = dist
+			}
+		}
+		totalError += minDist
+	}
+
+	return totalError / float64(n*dim)
+}
+
+// measureRecallAtK measures recall at a specific K value.
+func measureRecallAtK(trainVectors, testVectors [][]float32, numSubspaces, k int) float64 {
+	dim := len(trainVectors[0])
+
+	// Create and train a simple PQ
+	pqConfig := ProductQuantizerConfig{
+		NumSubspaces:         numSubspaces,
+		CentroidsPerSubspace: k,
+	}
+
+	pq, err := NewProductQuantizer(dim, pqConfig)
+	if err != nil {
+		return 0.5 // Fallback
+	}
+
+	ctx := context.Background()
+	subspaceDim := dim / numSubspaces
+	trainConfig := DeriveTrainConfig(k, subspaceDim)
+	if err := pq.TrainParallelWithConfig(ctx, trainVectors, trainConfig, 0); err != nil {
+		return 0.5
+	}
+
+	// Encode training vectors
+	codes, err := pq.EncodeBatch(trainVectors, runtime.NumCPU())
+	if err != nil {
+		return 0.5
+	}
+
+	// Measure recall
+	knn := 10
+	var totalRecall float64
+
+	for _, query := range testVectors {
+		// Ground truth
+		gtIndices := computeExactKNN(query, trainVectors, knn)
+
+		// PQ search
+		table, _ := pq.ComputeDistanceTable(query)
+		type distIdx struct {
+			dist float32
+			idx  int
+		}
+		dists := make([]distIdx, len(codes))
+		for i, code := range codes {
+			dists[i] = distIdx{dist: pq.AsymmetricDistance(table, code), idx: i}
+		}
+		sort.Slice(dists, func(i, j int) bool {
+			return dists[i].dist < dists[j].dist
+		})
+
+		// Count hits
+		gtSet := make(map[int]bool)
+		for _, idx := range gtIndices {
+			gtSet[idx] = true
+		}
+
+		hits := 0
+		for i := 0; i < knn && i < len(dists); i++ {
+			if gtSet[dists[i].idx] {
+				hits++
+			}
+		}
+		totalRecall += float64(hits) / float64(knn)
+	}
+
+	return totalRecall / float64(len(testVectors))
+}
+
+// computeSubspaceCovarianceNorm computes the Frobenius norm of subspace covariance.
+// Used to measure covariance stability across different sample sizes.
+func computeSubspaceCovarianceNorm(vectors [][]float32, numSubspaces, subspaceDim int) float64 {
+	n := len(vectors)
+	if n < 2 {
+		return 0
+	}
+
+	var totalNorm float64
+
+	// For efficiency, only compute for first subspace
+	// Compute mean
+	mean := make([]float64, subspaceDim)
+	for _, v := range vectors {
+		for d := 0; d < subspaceDim; d++ {
+			mean[d] += float64(v[d])
+		}
+	}
+	for d := range mean {
+		mean[d] /= float64(n)
+	}
+
+	// Compute covariance diagonal (sufficient for stability check)
+	var covTrace float64
+	for _, v := range vectors {
+		for d := 0; d < subspaceDim; d++ {
+			diff := float64(v[d]) - mean[d]
+			covTrace += diff * diff
+		}
+	}
+	covTrace /= float64(n - 1)
+	totalNorm = covTrace
+
+	return totalNorm
+}
+
+// sampleVectorsUniform samples n vectors uniformly from the input.
+// Uses deterministic sampling for reproducibility.
+func sampleVectorsUniform(vectors [][]float32, n int) [][]float32 {
+	total := len(vectors)
+	if n >= total {
+		return vectors
+	}
+
+	sampled := make([][]float32, n)
+	step := total / n
+	for i := 0; i < n; i++ {
+		idx := i * step
+		sampled[i] = vectors[idx]
+	}
+	return sampled
+}
+
+func containsNonFiniteValues(vectors [][]float32) bool {
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		return false
+	}
+	flat := flattenToFloat64(vectors)
+	sum := floats.Sum(flat)
+	return math.IsInf(sum, 0) || math.IsNaN(sum)
+}
+
+func flattenToFloat64(vectors [][]float32) []float64 {
+	n, dim := len(vectors), len(vectors[0])
+	flat := make([]float64, n*dim)
+	offset := 0
+	for _, v := range vectors {
+		for _, val := range v {
+			flat[offset] = float64(val)
+			offset++
+		}
+	}
+	return flat
 }

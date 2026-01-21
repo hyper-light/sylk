@@ -5,6 +5,7 @@ package indexer
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -152,9 +153,10 @@ func (b *BatchIndexer) startWorkers(ctx context.Context, files <-chan *FileInfo,
 }
 
 // getWorkerCount returns the effective worker count.
+// Defaults to runtime.NumCPU() for maximum parallelism.
 func (b *BatchIndexer) getWorkerCount() int {
 	if b.config.MaxConcurrency <= 0 {
-		return BatchIndexerDefaultMaxConcurrency
+		return runtime.NumCPU()
 	}
 	return b.config.MaxConcurrency
 }

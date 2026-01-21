@@ -16,6 +16,7 @@
 package hnsw
 
 import (
+	"container/heap"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,6 +93,7 @@ type Index struct {
 	maxLevel    int
 	entryPoint  string
 	dimension   int
+	finger      *FINGERAccelerator // Optional FINGER accelerator for candidate skipping
 }
 
 type Config struct {
@@ -283,12 +285,45 @@ func (h *Index) greedySearchLayer(query []float32, queryMag float64, ep string, 
 	return ep, epDist
 }
 
-// searchLayer performs beam search at a single layer to find ef nearest neighbors.
-// W12.36: Caller must hold h.mu (read or write lock) to safely access h.vectors,
-// h.magnitudes, and h.layers. This function does not acquire locks itself to avoid
-// deadlocks when called from insertLocked (which holds write lock).
+type searchCandidate struct {
+	id       string
+	distance float64
+}
+
+// candidateMinHeap: min-heap by distance (closest first) for candidate expansion
+type candidateMinHeap []searchCandidate
+
+func (h candidateMinHeap) Len() int           { return len(h) }
+func (h candidateMinHeap) Less(i, j int) bool { return h[i].distance < h[j].distance }
+func (h candidateMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *candidateMinHeap) Push(x any)        { *h = append(*h, x.(searchCandidate)) }
+func (h *candidateMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// candidateMaxHeap: max-heap by distance (furthest first) for result eviction
+type candidateMaxHeap []searchCandidate
+
+func (h candidateMaxHeap) Len() int           { return len(h) }
+func (h candidateMaxHeap) Less(i, j int) bool { return h[i].distance > h[j].distance }
+func (h candidateMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *candidateMaxHeap) Push(x any)        { *h = append(*h, x.(searchCandidate)) }
+func (h *candidateMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// searchLayer implements HNSW Algorithm 2: SEARCH-LAYER from Malkov & Yashunin (2016).
+// Uses dual-heap approach: min-heap for candidate expansion, max-heap for result eviction.
+// Includes patience-based early termination via AdaptiveSearchConfig.
 func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int, level int) []SearchResult {
-	// W12.11: Bounds check for layer access
 	if !h.isValidLayerIndex(level) {
 		return nil
 	}
@@ -296,57 +331,102 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 	visited := make(map[string]bool)
 	visited[ep] = true
 
-	// W4P.8: Pre-allocate candidates with maxCandidates capacity to avoid
-	// reallocation during search. The slice can grow up to ef*2 during BFS
-	// exploration, so we pre-allocate that capacity upfront.
-	maxCandidates := ef * 2
-	candidates := make([]SearchResult, 0, maxCandidates)
-
-	// Bounds check for entry point vector and magnitude
 	epVec, epMag, ok := h.getVectorAndMagnitude(ep)
 	if !ok {
-		return candidates
+		return nil
 	}
-	epSim := CosineSimilarity(query, epVec, queryMag, epMag)
-	candidates = append(candidates, SearchResult{ID: ep, Similarity: epSim})
+	epDist := CosineDistance(query, epVec, queryMag, epMag)
 
-	// Use explicit index with proper bounds checking to prevent unbounded growth
-	for i := 0; i < len(candidates) && len(candidates) < maxCandidates; i++ {
-		curr := candidates[i]
-		neighbors := h.layers[level].getNeighbors(curr.ID)
+	candidates := &candidateMinHeap{{id: ep, distance: epDist}}
+	heap.Init(candidates)
 
-		for _, neighbor := range neighbors {
-			if visited[neighbor] {
+	results := &candidateMaxHeap{{id: ep, distance: epDist}}
+	heap.Init(results)
+
+	adaptiveCfg := NewAdaptiveSearchConfig(ef)
+	stableCount := 0
+	lastBestDist := epDist
+
+	for candidates.Len() > 0 {
+		closest := heap.Pop(candidates).(searchCandidate)
+		furthest := (*results)[0]
+
+		if closest.distance > furthest.distance {
+			break
+		}
+
+		// Track best distance improvement for this iteration
+		iterationBestDist := lastBestDist
+
+		neighbors := h.layers[level].getNeighbors(closest.id)
+		for _, neighborID := range neighbors {
+			if visited[neighborID] {
 				continue
 			}
-			visited[neighbor] = true
+			visited[neighborID] = true
 
-			vec, mag, exists := h.getVectorAndMagnitude(neighbor)
+			if h.finger != nil && h.finger.HasProjectionMatrix() {
+				currentBestSim := 1.0 - (*results)[0].distance
+				if h.finger.ShouldSkipCandidate(query, currentBestSim, closest.id, neighborID) {
+					continue
+				}
+			}
+
+			vec, mag, exists := h.getVectorAndMagnitude(neighborID)
 			if !exists {
 				continue
 			}
 
-			sim := CosineSimilarity(query, vec, queryMag, mag)
+			neighborDist := CosineDistance(query, vec, queryMag, mag)
+			furthest = (*results)[0]
 
-			// Only append if we haven't hit the limit
-			if len(candidates) < maxCandidates {
-				candidates = append(candidates, SearchResult{ID: neighbor, Similarity: sim})
+			if neighborDist < furthest.distance || results.Len() < ef {
+				heap.Push(candidates, searchCandidate{id: neighborID, distance: neighborDist})
+				heap.Push(results, searchCandidate{id: neighborID, distance: neighborDist})
+
+				if results.Len() > ef {
+					heap.Pop(results)
+				}
+
+				// Track if we found a better (smaller) distance
+				if neighborDist < iterationBestDist {
+					iterationBestDist = neighborDist
+				}
 			}
 		}
+
+		improvement := adaptiveCfg.ComputeImprovement(iterationBestDist, lastBestDist)
+		significantlyImproved := improvement < 0 && adaptiveCfg.IsSignificantImprovement(-improvement)
+
+		if significantlyImproved {
+			stableCount = 0
+			lastBestDist = iterationBestDist
+		} else {
+			stableCount++
+		}
+
+		if adaptiveCfg.ShouldTerminate(stableCount, results.Len(), iterationBestDist, lastBestDist) {
+			break
+		}
 	}
 
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].Similarity != candidates[j].Similarity {
-			return candidates[i].Similarity > candidates[j].Similarity
+	output := make([]SearchResult, results.Len())
+	for i := results.Len() - 1; i >= 0; i-- {
+		c := heap.Pop(results).(searchCandidate)
+		output[i] = SearchResult{
+			ID:         c.id,
+			Similarity: 1.0 - c.distance,
 		}
-		// Stable tie-breaker: sort by ID for deterministic ordering
-		return candidates[i].ID < candidates[j].ID
+	}
+
+	sort.Slice(output, func(i, j int) bool {
+		if output[i].Similarity != output[j].Similarity {
+			return output[i].Similarity > output[j].Similarity
+		}
+		return output[i].ID < output[j].ID
 	})
 
-	if len(candidates) > ef {
-		candidates = candidates[:ef]
-	}
-	return candidates
+	return output
 }
 
 // getVectorAndMagnitude safely retrieves both vector and magnitude for a node.
@@ -713,6 +793,50 @@ func (h *Index) checkNodeConsistency(id string, issues []string) []string {
 		issues = append(issues, fmt.Sprintf("node %q: missing level tracking", id))
 	}
 	return issues
+}
+
+// EnableFINGER creates and initializes a FINGER accelerator for candidate skipping.
+// lowRank specifies the dimensionality of the low-rank approximation space.
+// If lowRank <= 0, a default value of min(32, dimension/4) is used.
+// Call PrecomputeFINGER after bulk insertions to build the projection matrix.
+func (h *Index) EnableFINGER(lowRank int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.finger = NewFINGERAccelerator(h.dimension, lowRank)
+}
+
+// PrecomputeFINGER builds the FINGER projection matrix using current vectors and
+// layer 0 neighbor relationships. This is an expensive operation that should be
+// called after bulk insertions, not after every single insert.
+// Does nothing if FINGER is not enabled.
+func (h *Index) PrecomputeFINGER() {
+	h.mu.RLock()
+	if h.finger == nil || len(h.layers) == 0 {
+		h.mu.RUnlock()
+		return
+	}
+
+	vectors := h.GetVectors()
+	layer0 := h.layers[0]
+	nodeIDs := layer0.allNodeIDs()
+	neighbors := layer0.getNeighborsMany(nodeIDs)
+	h.mu.RUnlock()
+
+	h.finger.PrecomputeResiduals(vectors, neighbors)
+}
+
+// HasFINGER returns true if FINGER acceleration is enabled and has a projection matrix.
+func (h *Index) HasFINGER() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.finger != nil && h.finger.HasProjectionMatrix()
+}
+
+// DisableFINGER removes the FINGER accelerator, disabling candidate skipping.
+func (h *Index) DisableFINGER() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.finger = nil
 }
 
 func (h *Index) Stats() IndexStats {

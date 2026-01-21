@@ -208,7 +208,7 @@ func (dc *DomainCache) Wait() {
 }
 
 // Stats returns the current cache statistics.
-func (dc *DomainCache) Stats() CacheStats {
+func (dc *DomainCache) Stats() *CacheStats {
 	return dc.stats.Snapshot()
 }
 

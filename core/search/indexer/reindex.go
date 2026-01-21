@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/adalundhe/sylk/core/search"
@@ -152,7 +153,7 @@ func applyReindexDefaults(config *ReindexConfig) {
 		config.BatchSize = ReindexDefaultBatchSize
 	}
 	if config.MaxConcurrency <= 0 {
-		config.MaxConcurrency = ReindexDefaultMaxConcurrency
+		config.MaxConcurrency = runtime.NumCPU()
 	}
 }
 

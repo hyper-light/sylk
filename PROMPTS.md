@@ -30,3 +30,32 @@ Examine ARCHITECTURE.md and find the section with "Comprehensive Parallel Execut
 
 
 Now, insert this architecture into an appropriate spot in ARCHITECTURE.md. Then, transform this architecture in to an exhaustive, explicit, atomic, exact set of TODOs - these should contain detailed descriptions of each TODO, references to places in existing code where we need to modify/add/remove, *explicit and exacting* acceptance criteria. Insert these TODOs into TODO.md at an appropriate point such that, with respect to all other groups and TODOS, we maximize the parallelism of the work done. Then, find the Comprehensive Parallel Execution Order (Agent-Based), and insert these TODOS in an appropriate WAVE and Parallel Group, or create a new Wave and/or Parallel Group if required such that we likewise maximize the parallelism of work done.
+
+
+Now, let's implement that workflow. All items, no skipping, YOU MUST ALWAYS AND FOREVER:                    
+  - Generate a commit after each task is complete.                                                                     
+  - Examine the cyclomatic complexity or the code your just wrote and ENSURE it is 4 or less.                          
+  - We do NOT allow functions over 100 lines. EVER.                                                                    
+  - Generate test files per-file with THOROUGH testing that MUST cover happy path, negative path, failure, any race    
+  condition or deadlock handling, and edge cases.                                                                      
+  - YOU MUST RUN THESE TESTS AND ALL TESTS MUST PASS DO NOT JUST FIX THE TESTS TO PASS YOU MUST FIX THE ACTUAL         
+  IMPLEMENTATION CODE.                                                                                                 
+  - Generate another commit.                                                                                           
+  - You MUST mark EACH item done in TODO.md AFTER IT IS COMPLETED ALWAYS                                               
+  - DO NOT SKIP ANY ITEM EVER FOR ANY REASON DO NOT DEFER                                                              
+  - YOU MUST CHECK FOR RACE CONDITIONS, DEADLOCKS, UNTRACKED GOROUTINES, AND MEMORY LEAKS. Do NOT accept any of these                        
+  - IF YOU ENCOUNTER A BUILD OR TEST FAILURE, EVEN IF PRE-EXISTING, YOU FIX IT.                                        
+  - DO NOT generate your own mocks - specify interfaces for structs and use mockery -                                  
+  https://github.com/vektra/mockery to generate them.                                                                  
+  - We do NOT defer, bypass, or skip work. EVER.                                                                       
+  - If code or an existing implementation exists and does not match spec, we ALWAYS just modify it and DO NOT attempt  
+  to preserve legacy behavior.                                                                                         
+  - You MUST integrate correctly and fully with the security apis we specify in ARCHITECTURE.md, both for if           
+  sandboxing is enabled OR disabled.                                                                                   
+  - MAXIMIZE USE OF SUBAGENTS TO PARALLELIZE WHEREVER ORDERING ALLOWS DO NOT JUST WORK SERIALLY.                       
+  - You MUST update the Wave and Parallel Group items as done once they are done in TODO.md. ALWAYS.                   
+  - ALWAYS run tests with a timeout. ALWAYS.  
+
+Now, calculate a workflow-dag for the in-progress and remaining fixes. Execute items in parallel using sub-agents with a
+maximum concurrency of 16. If you implement a fix IT MUST BE THE MOST CORRECT, ROBUST, AND PERFORMANT OPTION. YOU DO NOT
+TAKE SHORTCUTS OR FACTOR IN COMPLEXITY. YOU ALWAYS LOOK TO REUSE EXISTING STRUCTURES AND CODE.

@@ -10,6 +10,8 @@ import (
 	"math"
 	"time"
 	"unsafe"
+
+	"gonum.org/v1/gonum/blas/blas32"
 )
 
 var (
@@ -191,11 +193,11 @@ func (ns *NodeStore) insertEmbedding(tx *sql.Tx, nodeID string, embedding []floa
 }
 
 func computeMagnitude(v []float32) float64 {
-	var sum float32
-	for _, val := range v {
-		sum += val * val
+	if len(v) == 0 {
+		return 0
 	}
-	return math.Sqrt(float64(sum))
+	vec := blas32.Vector{N: len(v), Inc: 1, Data: v}
+	return math.Sqrt(float64(blas32.Dot(vec, vec)))
 }
 
 func (ns *NodeStore) GetNode(id string) (*GraphNode, error) {

@@ -699,6 +699,7 @@ func TestScanner_Scan_ContextCancellation(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	scanner := NewScanner(ScanConfig{RootPath: dir})
 

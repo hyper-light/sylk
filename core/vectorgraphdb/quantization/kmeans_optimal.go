@@ -257,7 +257,9 @@ func (s *kmeansState) computeCentroidNorms() {
 // Result: dots[i*k + j] = vectors[i] · centroids[j]
 //
 // This is the key vectorized operation:
-//   dots = X @ C.T
+//
+//	dots = X @ C.T
+//
 // where X is (n × dim) and C is (k × dim), giving (n × k) result.
 func (s *kmeansState) computeDotProductsBLAS() {
 	// GEMM: C = alpha * A * B + beta * C
@@ -420,11 +422,6 @@ func (s *kmeansState) extractCentroids() [][]float32 {
 	return result
 }
 
-// copyCentroidsFrom copies centroids from another state (used to preserve best result).
-func (s *kmeansState) copyCentroidsFrom(other *kmeansState) {
-	copy(s.centroids, other.centroids)
-}
-
 // resetForRestart resets the state for a new k-means restart.
 // Vectors and vectorNorms are preserved (they don't change between restarts).
 // All other state is zeroed to prevent data leakage between restarts.
@@ -465,13 +462,14 @@ func (s *kmeansState) runSingleKMeans(config KMeansConfig, rng *rand.Rand) float
 	prevObjective := math.MaxFloat64
 
 	for iter := 0; iter < config.MaxIterations; iter++ {
-		// Compute all dot products using BLAS GEMM
 		s.computeDotProductsBLAS()
 
-		// Assignment step using precomputed dots
 		objective := s.assignFromDots()
 
-		// Check convergence
+		if math.IsInf(objective, 0) || math.IsNaN(objective) {
+			return math.Inf(1)
+		}
+
 		if prevObjective < math.MaxFloat64 {
 			improvement := (prevObjective - objective) / objective
 			if improvement >= 0 && improvement < config.ConvergenceThreshold {
@@ -480,13 +478,8 @@ func (s *kmeansState) runSingleKMeans(config KMeansConfig, rng *rand.Rand) float
 		}
 		prevObjective = objective
 
-		// Update step
 		s.updateCentroids()
-
-		// Handle empty clusters
 		s.reinitializeEmptyClusters(rng)
-
-		// Recompute centroid norms for next iteration
 		s.computeCentroidNorms()
 	}
 

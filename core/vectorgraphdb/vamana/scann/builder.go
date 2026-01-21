@@ -4,6 +4,7 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/storage"
@@ -53,6 +54,15 @@ func (b *BatchBuilder) BuildIncremental(
 	return nil
 }
 
+type BuildTimings struct {
+	KMeans     time.Duration
+	Codebooks  time.Duration
+	Magnitudes time.Duration
+	GraphInit  time.Duration
+	Refinement time.Duration
+	Medoid     time.Duration
+}
+
 func (b *BatchBuilder) Build(
 	vectors [][]float32,
 	vectorStore *storage.VectorStore,
@@ -77,7 +87,7 @@ func (b *BatchBuilder) Build(
 	b.trainCodebooks(vectors)
 
 	b.precomputeMagnitudes(vectors, magCache)
-	b.buildGraphLocalityAware(n, graphStore)
+	b.buildGraphLocalityAware(n, vectors, graphStore)
 	b.refineGraph(vectors, graphStore, magCache)
 
 	medoid := vamana.ComputeCentroidMedoid(vectorStore, magCache, nil)
@@ -87,6 +97,57 @@ func (b *BatchBuilder) Build(
 		Codebooks:   b.codebooks,
 		Medoid:      medoid,
 	}, nil
+}
+
+func (b *BatchBuilder) BuildWithTimings(
+	vectors [][]float32,
+	vectorStore *storage.VectorStore,
+	graphStore *storage.GraphStore,
+	magCache *vamana.MagnitudeCache,
+) (*BuildResult, *BuildTimings, error) {
+	var timings BuildTimings
+	n := len(vectors)
+	if n == 0 {
+		return &BuildResult{}, &timings, nil
+	}
+
+	dim := len(vectors[0])
+	numParts := b.avqConfig.NumPartitions
+	if numParts > n {
+		numParts = n
+	}
+
+	start := time.Now()
+	b.partitioner = NewPartitioner(numParts, dim)
+	b.partitioner.Train(vectors, computeKMeansIterations(n))
+	timings.KMeans = time.Since(start)
+
+	start = time.Now()
+	b.codebooks = NewPartitionCodebooks(b.partitioner.Centroids(), b.avqConfig.AnisotropicWeight)
+	b.trainCodebooks(vectors)
+	timings.Codebooks = time.Since(start)
+
+	start = time.Now()
+	b.precomputeMagnitudes(vectors, magCache)
+	timings.Magnitudes = time.Since(start)
+
+	start = time.Now()
+	b.buildGraphLocalityAware(n, vectors, graphStore)
+	timings.GraphInit = time.Since(start)
+
+	start = time.Now()
+	b.refineGraph(vectors, graphStore, magCache)
+	timings.Refinement = time.Since(start)
+
+	start = time.Now()
+	medoid := vamana.ComputeCentroidMedoid(vectorStore, magCache, nil)
+	timings.Medoid = time.Since(start)
+
+	return &BuildResult{
+		Partitioner: b.partitioner,
+		Codebooks:   b.codebooks,
+		Medoid:      medoid,
+	}, &timings, nil
 }
 
 func (b *BatchBuilder) trainCodebooks(vectors [][]float32) {
@@ -170,7 +231,7 @@ func (b *BatchBuilder) buildGraphRandom(n int, graphStore *storage.GraphStore) {
 	}
 }
 
-func (b *BatchBuilder) buildGraphLocalityAware(n int, graphStore *storage.GraphStore) {
+func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graphStore *storage.GraphStore) {
 	R := b.vamanaConf.R
 	assignments := b.partitioner.Assignments()
 	numParts := b.partitioner.NumPartitions()
@@ -199,36 +260,36 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, graphStore *storage.GraphS
 		go func(start, end int) {
 			defer wg.Done()
 			for i := start; i < end; i++ {
-				myPart := assignments[i]
-				members := partitionMembers[myPart]
-
 				neighbors := make([]uint32, 0, R)
 				seen := make(map[uint32]struct{})
 				seen[uint32(i)] = struct{}{}
 
-				localTarget := (R * 3) / 4
-				if localTarget > len(members)-1 {
-					localTarget = len(members) - 1
-				}
+				myPart := assignments[i]
+				members := partitionMembers[myPart]
 
+				// Sample from same partition first (locality)
+				localSample := (R * 3) / 4
 				perm := rand.Perm(len(members))
 				for _, idx := range perm {
-					if len(neighbors) >= localTarget {
+					if len(neighbors) >= localSample {
 						break
 					}
-					candidate := members[idx]
-					if _, exists := seen[candidate]; !exists {
-						seen[candidate] = struct{}{}
-						neighbors = append(neighbors, candidate)
+					cid := members[idx]
+					if _, exists := seen[cid]; exists {
+						continue
 					}
+					seen[cid] = struct{}{}
+					neighbors = append(neighbors, cid)
 				}
 
+				// Fill rest randomly (connectivity)
 				for len(neighbors) < R && len(neighbors) < n-1 {
-					neighbor := uint32(rand.IntN(n))
-					if _, exists := seen[neighbor]; !exists {
-						seen[neighbor] = struct{}{}
-						neighbors = append(neighbors, neighbor)
+					cid := uint32(rand.IntN(n))
+					if _, exists := seen[cid]; exists {
+						continue
 					}
+					seen[cid] = struct{}{}
+					neighbors = append(neighbors, cid)
 				}
 
 				graphStore.SetNeighbors(uint32(i), neighbors)
@@ -419,29 +480,20 @@ func (b *BatchBuilder) refineGraph(
 }
 
 func computeRefinementPasses(n int) int {
-	if n <= 1000 {
-		return 2
+	if n <= 50000 {
+		return 1
 	}
-	if n <= 10000 {
-		return 3
-	}
-	if n <= 100000 {
-		return 4
-	}
-	return 5
+	return 2
 }
 
 func computeKMeansIterations(n int) int {
-	if n <= 1000 {
+	if n <= 10000 {
 		return 5
 	}
-	if n <= 10000 {
-		return 8
-	}
 	if n <= 100000 {
-		return 12
+		return 7
 	}
-	return 15
+	return 10
 }
 
 type nodeUpdate struct {
@@ -543,12 +595,11 @@ func (b *BatchBuilder) computeRefinements(
 		nodeID := uint32(idx)
 
 		currentNeighbors := graphStore.GetNeighbors(nodeID)
-		candidates := make(map[uint32]struct{}, R*3)
+		candidates := make(map[uint32]struct{}, len(currentNeighbors)*R)
 
 		for _, neighbor := range currentNeighbors {
 			candidates[neighbor] = struct{}{}
-			secondHop := graphStore.GetNeighbors(neighbor)
-			for _, nn := range secondHop {
+			for _, nn := range graphStore.GetNeighbors(neighbor) {
 				if nn != nodeID {
 					candidates[nn] = struct{}{}
 				}

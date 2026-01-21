@@ -128,17 +128,29 @@ func (r *ProviderRegistry) GetForModel(model string) (ProviderAdapter, error) {
 }
 
 func (r *ProviderRegistry) findProviderForModel(model string) (ProviderAdapter, error) {
+	// First, search with read lock
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-
+	var foundName string
+	var foundAdapter ProviderAdapter
 	for name, adapter := range r.adapters {
 		if adapter.SupportsModel(model) {
-			r.modelIndex[model] = name
-			return adapter, nil
+			foundName = name
+			foundAdapter = adapter
+			break
 		}
 	}
+	r.mu.RUnlock()
 
-	return nil, fmt.Errorf("no provider supports model: %s", model)
+	if foundAdapter == nil {
+		return nil, fmt.Errorf("no provider supports model: %s", model)
+	}
+
+	// Then, update index with write lock
+	r.mu.Lock()
+	r.modelIndex[model] = foundName
+	r.mu.Unlock()
+
+	return foundAdapter, nil
 }
 
 func (r *ProviderRegistry) ListEnabled() []ProviderAdapter {

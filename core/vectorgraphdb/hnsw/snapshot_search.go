@@ -1,6 +1,7 @@
 package hnsw
 
 import (
+	"container/heap"
 	"log/slog"
 	"slices"
 	"sort"
@@ -134,114 +135,79 @@ func (snap *HNSWSnapshot) findCloserNeighbor(query []float32, queryMag float64, 
 	return false, "", currentDist
 }
 
-// searchLayer0 performs beam search at layer 0 to find k nearest neighbors.
-//
-// Threading model: This function creates a visited map that is used exclusively within
-// this single search operation. The map is passed by reference to expandCandidates and
-// processNeighbors but is never accessed concurrently because:
-//  1. Each Search() call creates its own visited map (no sharing between goroutines)
-//  2. The search traversal is sequential within each call (no internal parallelism)
-//  3. The snapshot itself is immutable, so no synchronization is needed for reads
-//
-// Therefore, no mutex or synchronization is required for the visited map.
+// searchLayer0 implements HNSW Algorithm 2: SEARCH-LAYER from Malkov & Yashunin (2016).
+// Uses dual-heap approach: min-heap for candidate expansion, max-heap for result eviction.
+// This matches the live index searchLayer for consistent results.
 func (snap *HNSWSnapshot) searchLayer0(query []float32, queryMag float64, entry string, k int, filter *SearchFilter) []SearchResult {
-	// visited tracks nodes already evaluated to avoid redundant distance calculations.
-	// This map is local to this search invocation and not shared across goroutines.
+	ef := snap.getEffectiveEfSearch(k)
+
 	visited := make(map[string]bool)
 	visited[entry] = true
 
-	candidates := snap.initializeCandidates(query, queryMag, entry)
-	candidates = snap.expandCandidates(query, queryMag, candidates, visited, k)
+	entryDist := snap.distance(query, queryMag, entry)
 
-	return snap.filterAndLimit(candidates, k, filter)
+	candidates := &candidateMinHeap{{id: entry, distance: entryDist}}
+	heap.Init(candidates)
+
+	results := &candidateMaxHeap{{id: entry, distance: entryDist}}
+	heap.Init(results)
+
+	for candidates.Len() > 0 {
+		closest := heap.Pop(candidates).(searchCandidate)
+		furthest := (*results)[0]
+
+		if closest.distance > furthest.distance {
+			break
+		}
+
+		neighbors := snap.getLayerNeighbors(closest.id, 0)
+		for _, neighborID := range neighbors {
+			if visited[neighborID] {
+				continue
+			}
+			visited[neighborID] = true
+
+			neighborDist := snap.distance(query, queryMag, neighborID)
+			if neighborDist >= 2.0 {
+				continue
+			}
+
+			furthest = (*results)[0]
+			if neighborDist < furthest.distance || results.Len() < ef {
+				heap.Push(candidates, searchCandidate{id: neighborID, distance: neighborDist})
+				heap.Push(results, searchCandidate{id: neighborID, distance: neighborDist})
+
+				if results.Len() > ef {
+					heap.Pop(results)
+				}
+			}
+		}
+	}
+
+	output := make([]SearchResult, results.Len())
+	for i := results.Len() - 1; i >= 0; i-- {
+		c := heap.Pop(results).(searchCandidate)
+		output[i] = SearchResult{
+			ID:         c.id,
+			Similarity: 1.0 - c.distance,
+		}
+	}
+
+	sort.Slice(output, func(i, j int) bool {
+		if output[i].Similarity != output[j].Similarity {
+			return output[i].Similarity > output[j].Similarity
+		}
+		return output[i].ID < output[j].ID
+	})
+
+	return snap.filterAndLimit(output, k, filter)
 }
 
-// initializeCandidates creates the initial candidate list with the entry point.
-func (snap *HNSWSnapshot) initializeCandidates(query []float32, queryMag float64, entry string) []SearchResult {
-	vec, ok := snap.Vectors[entry]
-	if !ok {
-		return []SearchResult{}
-	}
-	mag, ok := snap.Magnitudes[entry]
-	if !ok {
-		return []SearchResult{}
-	}
-	sim := CosineSimilarity(query, vec, queryMag, mag)
-	return []SearchResult{{ID: entry, Similarity: sim}}
-}
-
-// expandCandidates expands the search by exploring neighbors of candidates.
-//
-// The visited map parameter is owned by the calling searchLayer0 function and is used
-// to track which nodes have been evaluated. This map is modified during iteration
-// (via processNeighbors) but this is safe because:
-//   - The iteration is sequential (single-threaded within this search)
-//   - No concurrent goroutines access this map instance
-func (snap *HNSWSnapshot) expandCandidates(query []float32, queryMag float64, candidates []SearchResult, visited map[string]bool, k int) []SearchResult {
-	efSearch := snap.getEffectiveEfSearch(k)
-
-	for i := 0; i < len(candidates) && len(candidates) < efSearch*2; i++ {
-		curr := candidates[i]
-		neighbors := snap.getLayerNeighbors(curr.ID, 0)
-		candidates = snap.processNeighbors(query, queryMag, neighbors, candidates, visited)
-	}
-
-	return snap.sortCandidates(candidates)
-}
-
-// getEffectiveEfSearch returns the efSearch value to use for search.
-// Uses the stored EfSearch if set, otherwise falls back to max(k*2, DefaultEfSearch).
 func (snap *HNSWSnapshot) getEffectiveEfSearch(k int) int {
 	if snap.EfSearch > 0 {
 		return snap.EfSearch
 	}
 	return max(k*2, vectorgraphdb.DefaultEfSearch)
-}
-
-// processNeighbors adds unvisited neighbors to the candidate list.
-//
-// This function reads and writes to the visited map to track processed nodes.
-// No synchronization is needed because the visited map is local to a single Search()
-// call and all operations within that call are sequential (single-threaded).
-func (snap *HNSWSnapshot) processNeighbors(query []float32, queryMag float64, neighbors []string, candidates []SearchResult, visited map[string]bool) []SearchResult {
-	for _, neighbor := range neighbors {
-		if visited[neighbor] {
-			continue
-		}
-		visited[neighbor] = true
-		result := snap.createSearchResult(query, queryMag, neighbor)
-		if result != nil {
-			candidates = append(candidates, *result)
-		}
-	}
-	return candidates
-}
-
-// createSearchResult creates a SearchResult for a node if its vector exists.
-func (snap *HNSWSnapshot) createSearchResult(query []float32, queryMag float64, nodeID string) *SearchResult {
-	vec, ok := snap.Vectors[nodeID]
-	if !ok {
-		return nil
-	}
-	mag, ok := snap.Magnitudes[nodeID]
-	if !ok {
-		return nil
-	}
-	sim := CosineSimilarity(query, vec, queryMag, mag)
-	return &SearchResult{ID: nodeID, Similarity: sim}
-}
-
-// sortCandidates sorts candidates by similarity in descending order.
-// Uses ID as a stable tie-breaker for deterministic ordering.
-func (snap *HNSWSnapshot) sortCandidates(candidates []SearchResult) []SearchResult {
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].Similarity != candidates[j].Similarity {
-			return candidates[i].Similarity > candidates[j].Similarity
-		}
-		// Stable tie-breaker: sort by ID for deterministic ordering
-		return candidates[i].ID < candidates[j].ID
-	})
-	return candidates
 }
 
 // filterAndLimit applies the filter and limits results to k items.

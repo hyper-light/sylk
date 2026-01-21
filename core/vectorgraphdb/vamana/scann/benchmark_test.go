@@ -253,13 +253,15 @@ func buildWithScaNN(
 	t.Logf("Building index with ScaNN (partitions=%d, R=%d)...", avqConf.NumPartitions, config.R)
 	buildStart := time.Now()
 
-	result, err := builder.Build(embeddings, vectorStore, graphStore, magCache)
+	result, timings, err := builder.BuildWithTimings(embeddings, vectorStore, graphStore, magCache)
 	if err != nil {
 		t.Fatalf("ScaNN Build failed: %v", err)
 	}
 
 	buildTime := time.Since(buildStart)
 	t.Logf("ScaNN build: %v (%.0f vectors/sec)", buildTime, float64(len(embeddings))/buildTime.Seconds())
+	t.Logf("  Timings: KMeans=%v, Codebooks=%v, Magnitudes=%v, GraphInit=%v, Refinement=%v, Medoid=%v",
+		timings.KMeans, timings.Codebooks, timings.Magnitudes, timings.GraphInit, timings.Refinement, timings.Medoid)
 
 	return result
 }
