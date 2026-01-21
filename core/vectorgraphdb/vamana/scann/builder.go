@@ -1,6 +1,7 @@
 package scann
 
 import (
+	"math/bits"
 	"math/rand/v2"
 	"runtime"
 	"sync"
@@ -487,13 +488,27 @@ func computeRefinementPasses(n int) int {
 }
 
 func computeKMeansIterations(n int) int {
-	if n <= 10000 {
-		return 5
+	if n <= 1 {
+		return 1
 	}
-	if n <= 100000 {
-		return 7
+	iters := bits.Len(uint(n))
+	return max(5, min(20, iters))
+}
+
+func neighborsEqual(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return 10
+	aSet := make(map[uint32]struct{}, len(a))
+	for _, v := range a {
+		aSet[v] = struct{}{}
+	}
+	for _, v := range b {
+		if _, exists := aSet[v]; !exists {
+			return false
+		}
+	}
+	return true
 }
 
 type nodeUpdate struct {
@@ -606,7 +621,8 @@ func (b *BatchBuilder) computeRefinements(
 			}
 		}
 
-		if len(candidates) <= len(currentNeighbors) {
+		newCandidateCount := len(candidates) - len(currentNeighbors)
+		if newCandidateCount <= 0 {
 			continue
 		}
 
@@ -616,6 +632,11 @@ func (b *BatchBuilder) computeRefinements(
 		}
 
 		newNeighbors := vamana.RobustPrune(nodeID, candidateList, alpha, R, distFn)
+
+		if neighborsEqual(currentNeighbors, newNeighbors) {
+			continue
+		}
+
 		updates = append(updates, nodeUpdate{
 			nodeID:       nodeID,
 			newNeighbors: newNeighbors,
