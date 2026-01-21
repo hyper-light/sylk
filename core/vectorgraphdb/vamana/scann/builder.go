@@ -463,60 +463,28 @@ func (b *BatchBuilder) refineGraph(
 	alpha := b.vamanaConf.Alpha
 	numWorkers := b.config.NumWorkers
 
-	maxIters := computeRefinementMaxIters(n)
-	convergenceThreshold := n / 1000
-	if convergenceThreshold < 1 {
-		convergenceThreshold = 1
-	}
-
-	dirty := make([]bool, n)
-	for i := range n {
-		dirty[i] = true
-	}
-
-	for iter := range maxIters {
-		dirtyNodes := make([]int, 0, n)
-		for i := range n {
-			if dirty[i] {
-				dirtyNodes = append(dirtyNodes, i)
+	numPasses := computeRefinementPasses(n)
+	for pass := range numPasses {
+		order := rand.Perm(n)
+		if pass%2 == 1 {
+			for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
+				order[i], order[j] = order[j], order[i]
 			}
 		}
 
-		if len(dirtyNodes) == 0 {
-			break
-		}
-
-		if iter%2 == 1 {
-			for i, j := 0, len(dirtyNodes)-1; i < j; i, j = i+1, j-1 {
-				dirtyNodes[i], dirtyNodes[j] = dirtyNodes[j], dirtyNodes[i]
-			}
-		}
-
-		changedNodes := b.refinePassWithTracking(dirtyNodes, vectors, graphStore, magCache, R, alpha, numWorkers)
-
-		for i := range n {
-			dirty[i] = false
-		}
-		for changed := range changedNodes {
-			dirty[changed] = true
-			for _, neighbor := range graphStore.GetNeighbors(uint32(changed)) {
-				dirty[neighbor] = true
-			}
-		}
-
-		if len(changedNodes) <= convergenceThreshold {
-			break
-		}
+		b.refinePassParallel(order, vectors, graphStore, magCache, R, alpha, numWorkers)
 
 		if b.config.ProgressCallback != nil {
-			b.config.ProgressCallback(iter+1, maxIters)
+			b.config.ProgressCallback(pass+1, numPasses)
 		}
 	}
 }
 
-func computeRefinementMaxIters(n int) int {
-	iters := bits.Len(uint(n))
-	return max(3, min(10, iters))
+func computeRefinementPasses(n int) int {
+	if n <= 50000 {
+		return 1
+	}
+	return 2
 }
 
 func computeKMeansIterations(n int) int {
@@ -532,19 +500,16 @@ type nodeUpdate struct {
 	newNeighbors []uint32
 }
 
-func (b *BatchBuilder) refinePassWithTracking(
-	nodes []int,
+func (b *BatchBuilder) refinePassParallel(
+	order []int,
 	vectors [][]float32,
 	graphStore *storage.GraphStore,
 	magCache *vamana.MagnitudeCache,
 	R int,
 	alpha float64,
 	numWorkers int,
-) map[int]struct{} {
-	n := len(nodes)
-	if n == 0 {
-		return nil
-	}
+) {
+	n := len(order)
 	if numWorkers <= 0 {
 		numWorkers = 1
 	}
@@ -572,7 +537,7 @@ func (b *BatchBuilder) refinePassWithTracking(
 			defer wg.Done()
 			updates := b.computeRefinements(chunk, vectors, graphStore, magCache, R, alpha)
 			updatesCh <- updates
-		}(nodes[start:end])
+		}(order[start:end])
 	}
 
 	go func() {
@@ -580,15 +545,8 @@ func (b *BatchBuilder) refinePassWithTracking(
 		close(updatesCh)
 	}()
 
-	changed := make(map[int]struct{})
-
 	for updates := range updatesCh {
 		for _, u := range updates {
-			currentNeighbors := graphStore.GetNeighbors(u.nodeID)
-			if !neighborsEqual(currentNeighbors, u.newNeighbors) {
-				changed[int(u.nodeID)] = struct{}{}
-			}
-
 			graphStore.SetNeighbors(u.nodeID, u.newNeighbors)
 
 			for _, neighborID := range u.newNeighbors {
@@ -604,29 +562,10 @@ func (b *BatchBuilder) refinePassWithTracking(
 				if !hasEdge && len(existingNeighbors) < R {
 					updated := append(existingNeighbors, u.nodeID)
 					graphStore.SetNeighbors(neighborID, updated)
-					changed[int(neighborID)] = struct{}{}
 				}
 			}
 		}
 	}
-
-	return changed
-}
-
-func neighborsEqual(a, b []uint32) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	aSet := make(map[uint32]struct{}, len(a))
-	for _, v := range a {
-		aSet[v] = struct{}{}
-	}
-	for _, v := range b {
-		if _, exists := aSet[v]; !exists {
-			return false
-		}
-	}
-	return true
 }
 
 func (b *BatchBuilder) computeRefinements(
