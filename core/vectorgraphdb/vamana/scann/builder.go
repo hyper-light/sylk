@@ -34,6 +34,25 @@ type BuildResult struct {
 	Medoid      uint32
 }
 
+// BuildIncremental adds vectors one at a time using VamanaInsert.
+// Use this for streaming/interactive scenarios where vectors arrive incrementally.
+// Faster for small updates but slower than batch Build for full index construction.
+func (b *BatchBuilder) BuildIncremental(
+	vectors [][]float32,
+	vectorStore *storage.VectorStore,
+	graphStore *storage.GraphStore,
+	magCache *vamana.MagnitudeCache,
+	medoid uint32,
+) error {
+	for i, vec := range vectors {
+		nodeID := uint32(i)
+		if err := vamana.VamanaInsert(nodeID, vec, medoid, b.vamanaConf, vectorStore, graphStore, magCache); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (b *BatchBuilder) Build(
 	vectors [][]float32,
 	vectorStore *storage.VectorStore,
