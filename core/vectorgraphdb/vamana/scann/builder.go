@@ -82,7 +82,7 @@ func (b *BatchBuilder) Build(
 	}
 
 	b.partitioner = NewPartitioner(numParts, dim)
-	b.partitioner.Train(vectors, computeKMeansIterations(n))
+	b.partitioner.Train(vectors, computeKMeansIterations(n, numParts))
 
 	b.codebooks = NewPartitionCodebooks(b.partitioner.Centroids(), b.avqConfig.AnisotropicWeight)
 	b.trainCodebooks(vectors)
@@ -120,7 +120,7 @@ func (b *BatchBuilder) BuildWithTimings(
 
 	start := time.Now()
 	b.partitioner = NewPartitioner(numParts, dim)
-	b.partitioner.Train(vectors, computeKMeansIterations(n))
+	b.partitioner.Train(vectors, computeKMeansIterations(n, numParts))
 	timings.KMeans = time.Since(start)
 
 	start = time.Now()
@@ -463,7 +463,7 @@ func (b *BatchBuilder) refineGraph(
 	alpha := b.vamanaConf.Alpha
 	numWorkers := b.config.NumWorkers
 
-	numPasses := computeRefinementPasses(n)
+	numPasses := computeRefinementPasses(n, R)
 	for pass := range numPasses {
 		order := rand.Perm(n)
 		if pass%2 == 1 {
@@ -480,19 +480,21 @@ func (b *BatchBuilder) refineGraph(
 	}
 }
 
-func computeRefinementPasses(n int) int {
-	if n <= 50000 {
+func computeRefinementPasses(n, R int) int {
+	if n <= 1 || R <= 0 {
 		return 1
 	}
-	return 2
+	threshold := bits.Len(uint(R) * uint(R) * uint(R))
+	return max(1, bits.Len(uint(n))-threshold+1)
 }
 
-func computeKMeansIterations(n int) int {
-	if n <= 1 {
+func computeKMeansIterations(n, k int) int {
+	if n <= 1 || k <= 1 {
 		return 1
 	}
-	iters := bits.Len(uint(n))
-	return max(5, min(20, iters))
+	clusterBits := bits.Len(uint(k))
+	avgClusterSizeBits := bits.Len(uint(n / k))
+	return max(clusterBits, avgClusterSizeBits)
 }
 
 type nodeUpdate struct {
@@ -588,30 +590,37 @@ func (b *BatchBuilder) computeRefinements(
 		return 1.0 - float64(dot)/(magA*magB)
 	}
 
+	minImprovement := R / bits.Len(uint(R))
+
 	updates := make([]nodeUpdate, 0, len(nodeIndices))
 
 	for _, idx := range nodeIndices {
 		nodeID := uint32(idx)
 
 		currentNeighbors := graphStore.GetNeighbors(nodeID)
-		candidates := make(map[uint32]struct{}, len(currentNeighbors)*R)
+		seen := make(map[uint32]struct{}, len(currentNeighbors)*R)
+
+		candidateList := make([]uint32, 0, len(currentNeighbors)*R)
 
 		for _, neighbor := range currentNeighbors {
-			candidates[neighbor] = struct{}{}
+			seen[neighbor] = struct{}{}
+			candidateList = append(candidateList, neighbor)
+		}
+
+		for _, neighbor := range currentNeighbors {
 			for _, nn := range graphStore.GetNeighbors(neighbor) {
 				if nn != nodeID {
-					candidates[nn] = struct{}{}
+					if _, exists := seen[nn]; !exists {
+						seen[nn] = struct{}{}
+						candidateList = append(candidateList, nn)
+					}
 				}
 			}
 		}
 
-		if len(candidates) <= len(currentNeighbors) {
+		improvement := len(candidateList) - len(currentNeighbors)
+		if improvement < minImprovement {
 			continue
-		}
-
-		candidateList := make([]uint32, 0, len(candidates))
-		for c := range candidates {
-			candidateList = append(candidateList, c)
 		}
 
 		newNeighbors := vamana.RobustPrune(nodeID, candidateList, alpha, R, distFn)

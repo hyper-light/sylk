@@ -5,13 +5,17 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"sync"
+
+	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
 )
 
 type Partitioner struct {
-	centroids   [][]float32
-	dim         int
-	numParts    int
-	assignments []uint32
+	centroids       [][]float32
+	centroidsFlat   []float32
+	centroidNormsSq []float64
+	dim             int
+	numParts        int
+	assignments     []uint32
 }
 
 func NewPartitioner(numPartitions, dim int) *Partitioner {
@@ -33,12 +37,23 @@ func (p *Partitioner) Train(vectors [][]float32, maxIters int) {
 		k = n
 	}
 
+	vectorNormsSq := make([]float64, n)
+	for i, vec := range vectors {
+		var normSq float64
+		for _, v := range vec {
+			normSq += float64(v) * float64(v)
+		}
+		vectorNormsSq[i] = normSq
+	}
+
 	p.initCentroidsKMeansPP(vectors, k)
+	p.prepareCentroidsBatch()
 	p.assignments = make([]uint32, n)
 
 	for iter := range maxIters {
-		changed := p.assignToCentroids(vectors)
+		changed := p.assignToCentroidsWithNorms(vectors, vectorNormsSq)
 		p.updateCentroids(vectors)
+		p.prepareCentroidsBatch()
 
 		if iter > 0 && changed < n/1000 {
 			break
@@ -87,6 +102,18 @@ func (p *Partitioner) initCentroidsKMeansPP(vectors [][]float32, k int) {
 }
 
 func (p *Partitioner) assignToCentroids(vectors [][]float32) int {
+	vectorNormsSq := make([]float64, len(vectors))
+	for i, vec := range vectors {
+		var normSq float64
+		for _, v := range vec {
+			normSq += float64(v) * float64(v)
+		}
+		vectorNormsSq[i] = normSq
+	}
+	return p.assignToCentroidsWithNorms(vectors, vectorNormsSq)
+}
+
+func (p *Partitioner) assignToCentroidsWithNorms(vectors [][]float32, vectorNormsSq []float64) int {
 	n := len(vectors)
 	numWorkers := runtime.GOMAXPROCS(0)
 	chunkSize := (n + numWorkers - 1) / numWorkers
@@ -111,7 +138,7 @@ func (p *Partitioner) assignToCentroids(vectors [][]float32) int {
 			localChanged := 0
 
 			for i := start; i < end; i++ {
-				nearest := p.findNearest(vectors[i])
+				nearest := p.findNearestWithNorm(vectors[i], vectorNormsSq[i])
 				if p.assignments[i] != nearest {
 					p.assignments[i] = nearest
 					localChanged++
@@ -128,7 +155,54 @@ func (p *Partitioner) assignToCentroids(vectors [][]float32) int {
 	return int(changed)
 }
 
+func (p *Partitioner) prepareCentroidsBatch() {
+	if p.centroidsFlat == nil || len(p.centroidsFlat) != p.numParts*p.dim {
+		p.centroidsFlat = make([]float32, p.numParts*p.dim)
+		p.centroidNormsSq = make([]float64, p.numParts)
+	}
+
+	for i, c := range p.centroids {
+		if c == nil {
+			continue
+		}
+		copy(p.centroidsFlat[i*p.dim:], c)
+		var normSq float64
+		for _, v := range c {
+			normSq += float64(v) * float64(v)
+		}
+		p.centroidNormsSq[i] = normSq
+	}
+}
+
 func (p *Partitioner) findNearest(vec []float32) uint32 {
+	var vecNormSq float64
+	for _, v := range vec {
+		vecNormSq += float64(v) * float64(v)
+	}
+	return p.findNearestWithNorm(vec, vecNormSq)
+}
+
+func (p *Partitioner) findNearestWithNorm(vec []float32, vecNormSq float64) uint32 {
+	if p.centroidsFlat == nil {
+		return p.findNearestScalar(vec)
+	}
+
+	dots := make([]float32, p.numParts)
+	vamana.BatchDotProducts(vec, p.centroidsFlat, p.numParts, dots)
+
+	var bestIdx uint32
+	bestDist := math.MaxFloat64
+	for i := range p.numParts {
+		d := vecNormSq + p.centroidNormsSq[i] - 2*float64(dots[i])
+		if d < bestDist {
+			bestDist = d
+			bestIdx = uint32(i)
+		}
+	}
+	return bestIdx
+}
+
+func (p *Partitioner) findNearestScalar(vec []float32) uint32 {
 	var bestIdx uint32
 	bestDist := math.MaxFloat64
 

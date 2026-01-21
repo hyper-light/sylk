@@ -1,6 +1,8 @@
 package vamana
 
 import (
+	"math/bits"
+	"math/rand/v2"
 	"slices"
 )
 
@@ -118,8 +120,28 @@ func RobustPrune(p uint32, candidates []uint32, alpha float64, R int, distFn Dis
 		return slices.Clone(candidates)
 	}
 
-	scored := make([]candidate, len(candidates))
-	for i, c := range candidates {
+	maxExamine := min(R*2, len(candidates))
+	preserveCount := min(R, len(candidates))
+	ratio := max(1, len(candidates)/maxExamine)
+	totalSamples := maxExamine * bits.Len(uint(ratio))
+	secondHopSamples := min(len(candidates)-preserveCount, totalSamples-preserveCount)
+	maxScore := preserveCount + max(0, secondHopSamples)
+
+	toScore := candidates
+	if len(candidates) > maxScore && secondHopSamples > 0 {
+		toScore = make([]uint32, maxScore)
+		copy(toScore, candidates[:preserveCount])
+		copy(toScore[preserveCount:], candidates[preserveCount:maxScore])
+		for i, c := range candidates[maxScore:] {
+			j := rand.IntN(secondHopSamples + i + 1)
+			if j < secondHopSamples {
+				toScore[preserveCount+j] = c
+			}
+		}
+	}
+
+	scored := make([]candidate, len(toScore))
+	for i, c := range toScore {
 		scored[i] = candidate{id: c, dist: distFn(p, c)}
 	}
 
@@ -133,12 +155,12 @@ func RobustPrune(p uint32, candidates []uint32, alpha float64, R int, distFn Dis
 		return 0
 	})
 
-	maxExamine := min(R*2, len(scored))
+	examineCount := min(maxExamine, len(scored))
 
 	selected := make([]uint32, 0, R)
 	consecutiveRejections := 0
 
-	for i := range maxExamine {
+	for i := range examineCount {
 		if len(selected) >= R || consecutiveRejections >= R {
 			break
 		}
