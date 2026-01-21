@@ -166,6 +166,11 @@ func (s *VectorStore) Get(internalID uint32) []float32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	return s.getUnsafe(internalID)
+}
+
+// getUnsafe returns vector without locking. Caller must ensure no concurrent writes.
+func (s *VectorStore) getUnsafe(internalID uint32) []float32 {
 	if s.region == nil {
 		return nil
 	}
@@ -182,6 +187,48 @@ func (s *VectorStore) Get(internalID uint32) []float32 {
 	offset := vectorOffset(s.dim, uint64(internalID))
 	ptr := unsafe.Pointer(&data[offset])
 	return unsafe.Slice((*float32)(ptr), s.dim)
+}
+
+// Snapshot returns a read-only snapshot for lock-free access during search.
+// The snapshot is valid only while the VectorStore is open and not being modified.
+type VectorSnapshot struct {
+	data  []byte
+	dim   int
+	count uint64
+}
+
+func (s *VectorStore) Snapshot() *VectorSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.region == nil {
+		return nil
+	}
+
+	return &VectorSnapshot{
+		data:  s.region.Data(),
+		dim:   s.dim,
+		count: s.header.Count,
+	}
+}
+
+func (snap *VectorSnapshot) Get(internalID uint32) []float32 {
+	if snap == nil || snap.data == nil {
+		return nil
+	}
+	if uint64(internalID) >= snap.count {
+		return nil
+	}
+	offset := vectorOffset(snap.dim, uint64(internalID))
+	ptr := unsafe.Pointer(&snap.data[offset])
+	return unsafe.Slice((*float32)(ptr), snap.dim)
+}
+
+func (snap *VectorSnapshot) Len() int {
+	if snap == nil {
+		return 0
+	}
+	return int(snap.count)
 }
 
 // Append adds a new vector to the store and returns its internal ID.
