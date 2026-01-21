@@ -146,17 +146,69 @@ func (p *Partitioner) findNearest(vec []float32) uint32 {
 }
 
 func (p *Partitioner) updateCentroids(vectors [][]float32) {
+	n := len(vectors)
+	numWorkers := runtime.GOMAXPROCS(0)
+	chunkSize := (n + numWorkers - 1) / numWorkers
+
+	type localAccum struct {
+		counts []int
+		sums   [][]float64
+	}
+
+	accums := make([]localAccum, numWorkers)
+	var wg sync.WaitGroup
+
+	for w := range numWorkers {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		if start >= end {
+			continue
+		}
+
+		accums[w] = localAccum{
+			counts: make([]int, p.numParts),
+			sums:   make([][]float64, p.numParts),
+		}
+		for i := range p.numParts {
+			accums[w].sums[i] = make([]float64, p.dim)
+		}
+
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
+			local := &accums[w]
+			for i := start; i < end; i++ {
+				part := p.assignments[i]
+				local.counts[part]++
+				vec := vectors[i]
+				sum := local.sums[part]
+				for j, v := range vec {
+					sum[j] += float64(v)
+				}
+			}
+		}(w, start, end)
+	}
+
+	wg.Wait()
+
 	counts := make([]int, p.numParts)
 	sums := make([][]float64, p.numParts)
 	for i := range p.numParts {
 		sums[i] = make([]float64, p.dim)
 	}
 
-	for i, vec := range vectors {
-		part := p.assignments[i]
-		counts[part]++
-		for j, v := range vec {
-			sums[part][j] += float64(v)
+	for w := range numWorkers {
+		if accums[w].counts == nil {
+			continue
+		}
+		for i := range p.numParts {
+			counts[i] += accums[w].counts[i]
+			for j := range p.dim {
+				sums[i][j] += accums[w].sums[i][j]
+			}
 		}
 	}
 
