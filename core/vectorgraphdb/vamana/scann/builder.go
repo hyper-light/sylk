@@ -57,7 +57,7 @@ func (b *BatchBuilder) Build(
 	b.codebooks = NewPartitionCodebooks(b.partitioner.Centroids(), b.avqConfig.AnisotropicWeight)
 	b.trainCodebooks(vectors)
 
-	b.buildGraphRandom(n, graphStore)
+	b.buildGraphLocalityAware(n, graphStore)
 	b.refineGraph(vectors, graphStore, magCache)
 
 	medoid := vamana.ComputeCentroidMedoid(vectorStore, magCache, nil)
@@ -105,6 +105,54 @@ func (b *BatchBuilder) buildGraphRandom(n int, graphStore *storage.GraphStore) {
 		neighbors := make([]uint32, 0, R)
 		seen := make(map[uint32]struct{})
 		seen[uint32(i)] = struct{}{}
+
+		for len(neighbors) < R && len(neighbors) < n-1 {
+			neighbor := uint32(rand.IntN(n))
+			if _, exists := seen[neighbor]; !exists {
+				seen[neighbor] = struct{}{}
+				neighbors = append(neighbors, neighbor)
+			}
+		}
+
+		graphStore.SetNeighbors(uint32(i), neighbors)
+	}
+}
+
+func (b *BatchBuilder) buildGraphLocalityAware(n int, graphStore *storage.GraphStore) {
+	R := b.vamanaConf.R
+	assignments := b.partitioner.Assignments()
+	numParts := b.partitioner.NumPartitions()
+
+	partitionMembers := make([][]uint32, numParts)
+	for i := range n {
+		part := assignments[i]
+		partitionMembers[part] = append(partitionMembers[part], uint32(i))
+	}
+
+	for i := range n {
+		myPart := assignments[i]
+		members := partitionMembers[myPart]
+
+		neighbors := make([]uint32, 0, R)
+		seen := make(map[uint32]struct{})
+		seen[uint32(i)] = struct{}{}
+
+		localTarget := (R * 3) / 4
+		if localTarget > len(members)-1 {
+			localTarget = len(members) - 1
+		}
+
+		perm := rand.Perm(len(members))
+		for _, idx := range perm {
+			if len(neighbors) >= localTarget {
+				break
+			}
+			candidate := members[idx]
+			if _, exists := seen[candidate]; !exists {
+				seen[candidate] = struct{}{}
+				neighbors = append(neighbors, candidate)
+			}
+		}
 
 		for len(neighbors) < R && len(neighbors) < n-1 {
 			neighbor := uint32(rand.IntN(n))
