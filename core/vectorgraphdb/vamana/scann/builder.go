@@ -495,22 +495,6 @@ func computeKMeansIterations(n int) int {
 	return max(5, min(20, iters))
 }
 
-func neighborsEqual(a, b []uint32) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	aSet := make(map[uint32]struct{}, len(a))
-	for _, v := range a {
-		aSet[v] = struct{}{}
-	}
-	for _, v := range b {
-		if _, exists := aSet[v]; !exists {
-			return false
-		}
-	}
-	return true
-}
-
 type nodeUpdate struct {
 	nodeID       uint32
 	newNeighbors []uint32
@@ -621,8 +605,7 @@ func (b *BatchBuilder) computeRefinements(
 			}
 		}
 
-		newCandidateCount := len(candidates) - len(currentNeighbors)
-		if newCandidateCount <= 0 {
+		if len(candidates) <= len(currentNeighbors) {
 			continue
 		}
 
@@ -632,11 +615,6 @@ func (b *BatchBuilder) computeRefinements(
 		}
 
 		newNeighbors := vamana.RobustPrune(nodeID, candidateList, alpha, R, distFn)
-
-		if neighborsEqual(currentNeighbors, newNeighbors) {
-			continue
-		}
-
 		updates = append(updates, nodeUpdate{
 			nodeID:       nodeID,
 			newNeighbors: newNeighbors,
