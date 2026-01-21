@@ -352,7 +352,7 @@ func runIngestBenchmark(tb testing.TB, tmpDir string, symbols []Symbol) IngestSt
 	if err := labelStore.Sync(); err != nil {
 		tb.Fatalf("Failed to sync labels: %v", err)
 	}
-	if err := idMap.Save(filepath.Join(tmpDir, "idmap.json")); err != nil {
+	if err := idMap.SaveBinary(filepath.Join(tmpDir, "idmap.bin")); err != nil {
 		tb.Fatalf("Failed to save idmap: %v", err)
 	}
 
@@ -384,7 +384,7 @@ func verifyStorage(t *testing.T, tmpDir string, symbols []Symbol, stats IngestSt
 	}
 	defer labelStore.Close()
 
-	idMap, err := LoadIDMap(filepath.Join(tmpDir, "idmap.json"))
+	idMap, err := LoadIDMapBinary(filepath.Join(tmpDir, "idmap.bin"))
 	if err != nil {
 		t.Fatalf("Failed to reload idmap: %v", err)
 	}
@@ -472,12 +472,12 @@ func verifyStorage(t *testing.T, tmpDir string, symbols []Symbol, stats IngestSt
 		t.Logf("PASS: Throughput %.0f symbols/sec meets 100,000 target", throughput)
 	}
 
-	// Target: <=3.2KB per symbol
+	// Target: <=3.3KB per symbol (floor is 3,203: 768×4 vector + 32×4 graph + 3 labels)
 	bytesPerSymbol := float64(stats.DiskSize) / float64(stats.SymbolCount)
-	if bytesPerSymbol > 3200 {
-		t.Logf("WARNING: Disk usage %.0f bytes/symbol exceeds 3.2KB target", bytesPerSymbol)
+	if bytesPerSymbol > 3300 {
+		t.Logf("WARNING: Disk usage %.0f bytes/symbol exceeds 3.3KB target", bytesPerSymbol)
 	} else {
-		t.Logf("PASS: Disk usage %.0f bytes/symbol within 3.2KB target", bytesPerSymbol)
+		t.Logf("PASS: Disk usage %.0f bytes/symbol within 3.3KB target", bytesPerSymbol)
 	}
 
 	t.Logf("Disk size: %.2f MB", float64(stats.DiskSize)/(1024*1024))

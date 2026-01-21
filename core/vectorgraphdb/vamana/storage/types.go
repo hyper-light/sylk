@@ -12,9 +12,12 @@ const (
 	HeaderSize = 16
 )
 
-// Errors for binary unmarshaling.
 var (
-	ErrInvalidHeaderSize = errors.New("invalid header size: expected 16 bytes")
+	ErrInvalidHeaderSize  = errors.New("invalid header size: expected 16 bytes")
+	ErrInvalidMagic       = errors.New("invalid magic bytes")
+	ErrUnsupportedVersion = errors.New("unsupported format version")
+	ErrChecksumMismatch   = errors.New("checksum mismatch: data corrupted")
+	ErrIDTooLong          = errors.New("external ID exceeds 65535 bytes")
 )
 
 // VectorHeader describes the binary layout of vector storage metadata.

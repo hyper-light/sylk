@@ -1,8 +1,9 @@
-// Package storage provides mmap-based storage types for the Vamana index.
 package storage
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
 	"os"
 	"sync"
 )
@@ -150,6 +151,104 @@ func (m *IDMap) Load(path string) error {
 func LoadIDMap(path string) (*IDMap, error) {
 	m := NewIDMap()
 	if err := m.Load(path); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+var idmapMagic = [4]byte{'I', 'D', 'M', 'P'}
+
+const idmapVersion uint32 = 1
+
+func (m *IDMap) SaveBinary(path string) error {
+	m.mu.RLock()
+	externalIDs := make([]string, len(m.toExternal))
+	copy(externalIDs, m.toExternal)
+	m.mu.RUnlock()
+
+	var totalLen int
+	for _, id := range externalIDs {
+		if len(id) > 65535 {
+			return ErrIDTooLong
+		}
+		totalLen += 2 + len(id)
+	}
+
+	buf := make([]byte, 12+totalLen+4)
+	copy(buf[0:4], idmapMagic[:])
+	binary.LittleEndian.PutUint32(buf[4:8], idmapVersion)
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(len(externalIDs)))
+
+	offset := 12
+	for _, extID := range externalIDs {
+		binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(extID)))
+		offset += 2
+		copy(buf[offset:offset+len(extID)], extID)
+		offset += len(extID)
+	}
+
+	checksum := crc32.ChecksumIEEE(buf[:offset])
+	binary.LittleEndian.PutUint32(buf[offset:offset+4], checksum)
+
+	return os.WriteFile(path, buf, 0o644)
+}
+
+func (m *IDMap) LoadBinary(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	if len(data) < 16 {
+		return ErrInvalidMagic
+	}
+
+	if [4]byte(data[0:4]) != idmapMagic {
+		return ErrInvalidMagic
+	}
+
+	version := binary.LittleEndian.Uint32(data[4:8])
+	if version != idmapVersion {
+		return ErrUnsupportedVersion
+	}
+
+	count := binary.LittleEndian.Uint32(data[8:12])
+
+	storedChecksum := binary.LittleEndian.Uint32(data[len(data)-4:])
+	if crc32.ChecksumIEEE(data[:len(data)-4]) != storedChecksum {
+		return ErrChecksumMismatch
+	}
+
+	externalIDs := make([]string, count)
+	offset := 12
+	for i := range count {
+		if offset+2 > len(data)-4 {
+			return ErrChecksumMismatch
+		}
+		length := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if offset+length > len(data)-4 {
+			return ErrChecksumMismatch
+		}
+		externalIDs[i] = string(data[offset : offset+length])
+		offset += length
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.toExternal = externalIDs
+	m.toInternal = make(map[string]uint32, len(externalIDs))
+	for i, extID := range externalIDs {
+		m.toInternal[extID] = uint32(i)
+	}
+
+	return nil
+}
+
+func LoadIDMapBinary(path string) (*IDMap, error) {
+	m := NewIDMap()
+	if err := m.LoadBinary(path); err != nil {
 		return nil, err
 	}
 	return m, nil
