@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"gonum.org/v1/gonum/blas/blas32"
+	"github.com/viterin/vek/vek32"
 )
 
 // CoarseQuantizer partitions vector space into coarse regions using k-means.
@@ -122,18 +122,12 @@ func (cq *CoarseQuantizer) findNearestCentroid(vector []float32) int {
 }
 
 func (cq *CoarseQuantizer) squaredDistance(a, b []float32) float32 {
-	n := len(a)
-	if n == 0 {
+	if len(a) == 0 {
 		return 0
 	}
-
-	vecA := blas32.Vector{N: n, Inc: 1, Data: a}
-	vecB := blas32.Vector{N: n, Inc: 1, Data: b}
-
-	aNorm := blas32.Dot(vecA, vecA)
-	bNorm := blas32.Dot(vecB, vecB)
-	aDotB := blas32.Dot(vecA, vecB)
-
+	aNorm := vek32.Dot(a, a)
+	bNorm := vek32.Dot(b, b)
+	aDotB := vek32.Dot(a, b)
 	dist := aNorm + bNorm - 2*aDotB
 	if dist < 0 {
 		return 0
