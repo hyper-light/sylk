@@ -150,8 +150,7 @@ func TestNewHNSWSnapshot(t *testing.T) {
 		idx := New(DefaultConfig())
 		idx.stringToID["vec1"] = 1
 		idx.idToString = append(idx.idToString, "vec1")
-		idx.vectors[1] = []float32{1.0, 2.0, 3.0}
-		idx.magnitudes[1] = 3.74
+		idx.nodes[1] = nodeData{vector: []float32{1.0, 2.0, 3.0}, magnitude: 3.74}
 		idx.entryPoint = 1
 		idx.maxLevel = 2
 		idx.layers = []*layer{newLayer(), newLayer(), newLayer()}
@@ -171,16 +170,16 @@ func TestNewHNSWSnapshot(t *testing.T) {
 		idx := New(DefaultConfig())
 		idx.stringToID["vec1"] = 1
 		idx.idToString = append(idx.idToString, "vec1")
-		idx.vectors[1] = []float32{1.0, 2.0}
-		idx.magnitudes[1] = 2.24
+		idx.nodes[1] = nodeData{vector: []float32{1.0, 2.0}, magnitude: 2.24}
 
 		snapshot := NewHNSWSnapshot(idx, 1)
 
-		idx.vectors[1][0] = 999.0
+		nd := idx.nodes[1]
+		nd.vector[0] = 999.0
+		idx.nodes[1] = nd
 		idx.stringToID["vec2"] = 2
 		idx.idToString = append(idx.idToString, "vec2")
-		idx.vectors[2] = []float32{3.0, 4.0}
-		delete(idx.magnitudes, 1)
+		idx.nodes[2] = nodeData{vector: []float32{3.0, 4.0}, magnitude: 5.0}
 
 		assert.Equal(t, []float32{1.0, 2.0}, snapshot.Vectors["vec1"])
 		assert.NotContains(t, snapshot.Vectors, "vec2")
@@ -431,10 +430,8 @@ func TestSnapshot_DataIsolation(t *testing.T) {
 	idx.stringToID["vec1"] = 1
 	idx.stringToID["vec2"] = 2
 	idx.idToString = []string{"", "vec1", "vec2"}
-	idx.vectors[1] = []float32{1.0, 2.0, 3.0}
-	idx.vectors[2] = []float32{4.0, 5.0, 6.0}
-	idx.magnitudes[1] = 3.74
-	idx.magnitudes[2] = 8.77
+	idx.nodes[1] = nodeData{vector: []float32{1.0, 2.0, 3.0}, magnitude: 3.74}
+	idx.nodes[2] = nodeData{vector: []float32{4.0, 5.0, 6.0}, magnitude: 8.77}
 	idx.layers = []*layer{newLayer()}
 	idx.layers[0].addNode(1)
 	idx.layers[0].addNode(2)
@@ -444,19 +441,21 @@ func TestSnapshot_DataIsolation(t *testing.T) {
 	snapshot := NewHNSWSnapshot(idx, 1)
 
 	t.Run("vector modification isolation", func(t *testing.T) {
-		idx.vectors[1][0] = 100.0
+		nd := idx.nodes[1]
+		nd.vector[0] = 100.0
+		idx.nodes[1] = nd
 		assert.Equal(t, float32(1.0), snapshot.Vectors["vec1"][0])
 	})
 
 	t.Run("vector addition isolation", func(t *testing.T) {
 		idx.stringToID["vec3"] = 3
 		idx.idToString = append(idx.idToString, "vec3")
-		idx.vectors[3] = []float32{7.0, 8.0, 9.0}
+		idx.nodes[3] = nodeData{vector: []float32{7.0, 8.0, 9.0}, magnitude: 12.0}
 		assert.NotContains(t, snapshot.Vectors, "vec3")
 	})
 
 	t.Run("vector deletion isolation", func(t *testing.T) {
-		delete(idx.vectors, 2)
+		delete(idx.nodes, 2)
 		assert.Contains(t, snapshot.Vectors, "vec2")
 	})
 
@@ -475,8 +474,7 @@ func TestSnapshot_ConcurrentCreation(t *testing.T) {
 	idx := New(DefaultConfig())
 	idx.stringToID["vec1"] = 1
 	idx.idToString = append(idx.idToString, "vec1")
-	idx.vectors[1] = []float32{1.0, 2.0}
-	idx.magnitudes[1] = 2.24
+	idx.nodes[1] = nodeData{vector: []float32{1.0, 2.0}, magnitude: 2.24}
 	idx.layers = []*layer{newLayer()}
 	idx.layers[0].addNode(1)
 

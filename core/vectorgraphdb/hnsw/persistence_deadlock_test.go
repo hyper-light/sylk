@@ -189,7 +189,7 @@ func TestW12_10_MissingVectorHandling(t *testing.T) {
 	idx.mu.Lock()
 	// Manually remove the vector to simulate corruption
 	internalID := idx.stringToID["node1"]
-	delete(idx.vectors, internalID)
+	delete(idx.nodes, internalID)
 
 	// Should not panic
 	idx.recomputeEdgeDistances()

@@ -356,7 +356,7 @@ func TestConcurrentDeleteAndSearch(t *testing.T) {
 		// Internal ID for node i is i+1 (sequential assignment starting at 1)
 		deletedInternalID := uint32(i + 1)
 
-		if _, exists := idx.vectors[deletedInternalID]; exists {
+		if _, exists := idx.nodes[deletedInternalID]; exists {
 			continue // Node wasn't actually deleted (race condition in test setup is ok)
 		}
 		for _, l := range idx.layers {

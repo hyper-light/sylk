@@ -57,7 +57,7 @@ func (h *Index) saveMetadata(tx *sql.Tx) error {
 				ELSE value
 			END
 		WHERE key IN ('entry_point', 'max_level', 'm', 'ef_construct', 'ef_search', 'level_mult', 'total_nodes')
-	`, entryPointStr, h.maxLevel, h.M, h.efConstruct, h.efSearch, h.levelMult, len(h.vectors))
+	`, entryPointStr, h.maxLevel, h.M, h.efConstruct, h.efSearch, h.levelMult, len(h.nodes))
 	if err != nil {
 		return fmt.Errorf("update metadata: %w", err)
 	}
@@ -327,11 +327,8 @@ func (h *Index) stageVectorRow(rows *sql.Rows, staged *stagedVectorData) error {
 func (h *Index) commitStagedVectors(staged *stagedVectorData) {
 	for stringID, vec := range staged.vectors {
 		internalID := h.getOrCreateInternalID(stringID)
-		h.vectors[internalID] = vec
-	}
-	for stringID, mag := range staged.magnitudes {
-		internalID := h.stringToID[stringID]
-		h.magnitudes[internalID] = mag
+		mag := staged.magnitudes[stringID]
+		h.nodes[internalID] = nodeData{vector: vec, magnitude: mag}
 	}
 	for stringID, domain := range staged.domains {
 		internalID := h.stringToID[stringID]
@@ -400,15 +397,11 @@ func (h *Index) computeNodeDistanceUpdates(nodeID uint32, node *layerNode) []dis
 }
 
 func (h *Index) getVectorAndMagnitudeLocked(id uint32) ([]float32, float64, bool) {
-	vec, vecExists := h.vectors[id]
-	if !vecExists {
+	nd, exists := h.nodes[id]
+	if !exists {
 		return nil, 0, false
 	}
-	mag, magExists := h.magnitudes[id]
-	if !magExists {
-		return nil, 0, false
-	}
-	return vec, mag, true
+	return nd.vector, nd.magnitude, true
 }
 
 func (h *Index) ensureMetaKeys(tx *sql.Tx) error {
