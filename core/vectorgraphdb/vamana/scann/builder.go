@@ -546,27 +546,71 @@ func (b *BatchBuilder) refinePassParallel(
 		numWorkers = n
 	}
 
-	chunkSize := (n + numWorkers - 1) / numWorkers
+	workChunkSize := max(64, n/(numWorkers*8))
+	workCh := make(chan []int, (n+workChunkSize-1)/workChunkSize)
+	for i := 0; i < n; i += workChunkSize {
+		end := min(i+workChunkSize, n)
+		workCh <- order[i:end]
+	}
+	close(workCh)
 
-	updatesCh := make(chan []nodeUpdate, numWorkers)
+	updatesCh := make(chan []nodeUpdate, numWorkers*2)
 	var wg sync.WaitGroup
 
-	for w := range numWorkers {
-		start := w * chunkSize
-		end := start + chunkSize
-		if end > n {
-			end = n
-		}
-		if start >= end {
-			continue
-		}
-
+	for range numWorkers {
 		wg.Add(1)
-		go func(chunk []int) {
+		go func() {
 			defer wg.Done()
-			updates := b.computeRefinements(chunk, vectors, graphStore, magCache, R, alpha)
-			updatesCh <- updates
-		}(order[start:end])
+			mags := magCache.Slice()
+			minImprovement := R / bits.Len(uint(R))
+			vecCount := len(vectors)
+
+			seen := make([]bool, vecCount)
+			candidateList := make([]uint32, 0, R*R)
+			pruneBuf := vamana.NewPruneBuffers(R*R, R)
+
+			for chunk := range workCh {
+				updates := make([]nodeUpdate, 0, len(chunk))
+				for _, idx := range chunk {
+					nodeID := uint32(idx)
+					currentNeighbors := graphStore.GetNeighbors(nodeID)
+
+					candidateList = candidateList[:0]
+
+					for _, neighbor := range currentNeighbors {
+						seen[neighbor] = true
+						candidateList = append(candidateList, neighbor)
+					}
+
+					for _, neighbor := range currentNeighbors {
+						for _, nn := range graphStore.GetNeighbors(neighbor) {
+							if nn != nodeID && !seen[nn] {
+								seen[nn] = true
+								candidateList = append(candidateList, nn)
+							}
+						}
+					}
+
+					for _, c := range candidateList {
+						seen[c] = false
+					}
+
+					improvement := len(candidateList) - len(currentNeighbors)
+					if improvement < minImprovement {
+						continue
+					}
+
+					newNeighbors := vamana.RobustPruneDirect(nodeID, candidateList, alpha, R, vectors, mags, pruneBuf)
+					updates = append(updates, nodeUpdate{
+						nodeID:       nodeID,
+						newNeighbors: newNeighbors,
+					})
+				}
+				if len(updates) > 0 {
+					updatesCh <- updates
+				}
+			}
+		}()
 	}
 
 	go func() {
@@ -583,60 +627,4 @@ func (b *BatchBuilder) refinePassParallel(
 			}
 		}
 	}
-}
-
-func (b *BatchBuilder) computeRefinements(
-	nodeIndices []int,
-	vectors [][]float32,
-	graphStore *storage.GraphStore,
-	magCache *vamana.MagnitudeCache,
-	R int,
-	alpha float64,
-) []nodeUpdate {
-	mags := magCache.Slice()
-	minImprovement := R / bits.Len(uint(R))
-	n := len(vectors)
-
-	seen := make([]bool, n)
-	candidateList := make([]uint32, 0, R*R)
-	pruneBuf := vamana.NewPruneBuffers(R*R, R)
-	updates := make([]nodeUpdate, 0, len(nodeIndices))
-
-	for _, idx := range nodeIndices {
-		nodeID := uint32(idx)
-		currentNeighbors := graphStore.GetNeighbors(nodeID)
-
-		candidateList = candidateList[:0]
-
-		for _, neighbor := range currentNeighbors {
-			seen[neighbor] = true
-			candidateList = append(candidateList, neighbor)
-		}
-
-		for _, neighbor := range currentNeighbors {
-			for _, nn := range graphStore.GetNeighbors(neighbor) {
-				if nn != nodeID && !seen[nn] {
-					seen[nn] = true
-					candidateList = append(candidateList, nn)
-				}
-			}
-		}
-
-		for _, c := range candidateList {
-			seen[c] = false
-		}
-
-		improvement := len(candidateList) - len(currentNeighbors)
-		if improvement < minImprovement {
-			continue
-		}
-
-		newNeighbors := vamana.RobustPruneDirect(nodeID, candidateList, alpha, R, vectors, mags, pruneBuf)
-		updates = append(updates, nodeUpdate{
-			nodeID:       nodeID,
-			newNeighbors: newNeighbors,
-		})
-	}
-
-	return updates
 }
