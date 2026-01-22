@@ -433,26 +433,54 @@ func (fc *FlashCoder) RobustPruneFlash(
 	}
 
 	scored := buf.scored[:len(toScore)]
+	numSubspaces := fc.numSubspaces
+	numCentroids := fc.numCentroids
+	sdt := fc.sdt
+	codes := fc.codes
+	mags := flashMags.mags
+
 	for i, c := range toScore {
-		cCode := fc.codes[c]
-		cMag := flashMags.Get(c)
-		dist := fc.ApproxCosineDistSDT(pCode, cCode, pMag, cMag)
+		cCode := codes[c]
+		cMag := mags[c]
+
+		var dot float32
+		for m := 0; m < numSubspaces; m++ {
+			dot += sdt[m][int(pCode[m])*numCentroids+int(cCode[m])]
+		}
+
+		var dist float64
+		if pMag == 0 || cMag == 0 {
+			dist = 2.0
+		} else {
+			dist = 1.0 - float64(dot)/(float64(pMag)*float64(cMag))
+		}
 		scored[i] = flashCandidate{id: c, dist: dist}
 	}
 
+	examineCount := min(maxExamine, len(scored))
+
 	for i := 1; i < len(scored); i++ {
-		j := i
-		for j > 0 && scored[j].dist < scored[j-1].dist {
-			scored[j], scored[j-1] = scored[j-1], scored[j]
+		key := scored[i]
+		j := i - 1
+
+		if i >= examineCount && key.dist >= scored[examineCount-1].dist {
+			continue
+		}
+
+		for j >= 0 && scored[j].dist > key.dist {
+			scored[j+1] = scored[j]
 			j--
 		}
+		scored[j+1] = key
 	}
 
-	examineCount := min(maxExamine, len(scored))
 	maxCheck := bits.Len(uint(R * R))
 
 	selected := make([]uint32, 0, R)
 	consecutiveRejections := 0
+
+	selectedCodes := make([][]uint8, 0, R)
+	selectedMags := make([]float32, 0, R)
 
 	for i := range examineCount {
 		if len(selected) >= R || consecutiveRejections >= R {
@@ -460,17 +488,28 @@ func (fc *FlashCoder) RobustPruneFlash(
 		}
 
 		c := scored[i]
-		cCode := fc.codes[c.id]
-		cMag := flashMags.Get(c.id)
+		cCode := codes[c.id]
+		cMag := mags[c.id]
 
 		keep := true
 		checkStart := max(0, len(selected)-maxCheck)
-		for j := checkStart; j < len(selected); j++ {
-			s := selected[j]
-			sCode := fc.codes[s]
-			sMag := flashMags.Get(s)
 
-			distCS := fc.ApproxCosineDistSDT(cCode, sCode, cMag, sMag)
+		for j := checkStart; j < len(selected); j++ {
+			sCode := selectedCodes[j]
+			sMag := selectedMags[j]
+
+			var dot float32
+			for m := 0; m < numSubspaces; m++ {
+				dot += sdt[m][int(cCode[m])*numCentroids+int(sCode[m])]
+			}
+
+			var distCS float64
+			if cMag == 0 || sMag == 0 {
+				distCS = 2.0
+			} else {
+				distCS = 1.0 - float64(dot)/(float64(cMag)*float64(sMag))
+			}
+
 			if c.dist > alpha*distCS {
 				keep = false
 				break
@@ -479,6 +518,8 @@ func (fc *FlashCoder) RobustPruneFlash(
 
 		if keep {
 			selected = append(selected, c.id)
+			selectedCodes = append(selectedCodes, cCode)
+			selectedMags = append(selectedMags, cMag)
 			consecutiveRejections = 0
 		} else {
 			consecutiveRejections++
