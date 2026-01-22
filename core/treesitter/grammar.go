@@ -112,24 +112,11 @@ func defaultTrustedDirs() []string {
 }
 
 func sylkDataDir() string {
-	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
-		return filepath.Join(xdg, "sylk")
-	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "sylk")
-	case "windows":
-		if appdata := os.Getenv("APPDATA"); appdata != "" {
-			return filepath.Join(appdata, "sylk")
-		}
-		return filepath.Join(home, "AppData", "Roaming", "sylk")
-	default:
-		return filepath.Join(home, ".local", "share", "sylk")
-	}
+	return filepath.Join(home, ".sylk")
 }
 
 func (gl *GrammarLoader) Load(name string) (*sitter.Language, error) {
