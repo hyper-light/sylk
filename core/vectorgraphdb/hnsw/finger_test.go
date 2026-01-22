@@ -39,18 +39,18 @@ func TestNewFINGERAccelerator(t *testing.T) {
 func TestFINGERAccelerator_PrecomputeResiduals(t *testing.T) {
 	acc := NewFINGERAccelerator(4, 2)
 
-	vectors := map[string][]float32{
-		"a": {1.0, 0.0, 0.0, 0.0},
-		"b": {0.0, 1.0, 0.0, 0.0},
-		"c": {0.0, 0.0, 1.0, 0.0},
-		"d": {0.0, 0.0, 0.0, 1.0},
-		"e": {0.5, 0.5, 0.0, 0.0},
+	vectors := map[uint32][]float32{
+		1: {1.0, 0.0, 0.0, 0.0},
+		2: {0.0, 1.0, 0.0, 0.0},
+		3: {0.0, 0.0, 1.0, 0.0},
+		4: {0.0, 0.0, 0.0, 1.0},
+		5: {0.5, 0.5, 0.0, 0.0},
 	}
 
-	neighbors := map[string][]string{
-		"a": {"b", "c"},
-		"b": {"a", "d"},
-		"c": {"a", "e"},
+	neighbors := map[uint32][]uint32{
+		1: {2, 3},
+		2: {1, 4},
+		3: {1, 5},
 	}
 
 	acc.PrecomputeResiduals(vectors, neighbors)
@@ -72,7 +72,7 @@ func TestFINGERAccelerator_PrecomputeResidualsEmptyInput(t *testing.T) {
 		t.Error("projection matrix should not be computed for empty input")
 	}
 
-	acc.PrecomputeResiduals(map[string][]float32{}, map[string][]string{})
+	acc.PrecomputeResiduals(map[uint32][]float32{}, map[uint32][]uint32{})
 	if acc.HasProjectionMatrix() {
 		t.Error("projection matrix should not be computed for empty maps")
 	}
@@ -81,13 +81,13 @@ func TestFINGERAccelerator_PrecomputeResidualsEmptyInput(t *testing.T) {
 func TestFINGERAccelerator_PrecomputeResidualsSkipsMissingVectors(t *testing.T) {
 	acc := NewFINGERAccelerator(4, 2)
 
-	vectors := map[string][]float32{
-		"a": {1.0, 0.0, 0.0, 0.0},
+	vectors := map[uint32][]float32{
+		1: {1.0, 0.0, 0.0, 0.0},
 	}
 
-	neighbors := map[string][]string{
-		"a": {"b", "c"},
-		"x": {"a"},
+	neighbors := map[uint32][]uint32{
+		1: {2, 3},
+		9: {1},
 	}
 
 	acc.PrecomputeResiduals(vectors, neighbors)
@@ -100,18 +100,18 @@ func TestFINGERAccelerator_PrecomputeResidualsSkipsMissingVectors(t *testing.T) 
 func TestFINGERAccelerator_Project(t *testing.T) {
 	acc := NewFINGERAccelerator(4, 2)
 
-	vectors := map[string][]float32{
-		"a": {1.0, 0.0, 0.0, 0.0},
-		"b": {0.0, 1.0, 0.0, 0.0},
-		"c": {0.0, 0.0, 1.0, 0.0},
-		"d": {0.0, 0.0, 0.0, 1.0},
-		"e": {0.5, 0.5, 0.5, 0.5},
+	vectors := map[uint32][]float32{
+		1: {1.0, 0.0, 0.0, 0.0},
+		2: {0.0, 1.0, 0.0, 0.0},
+		3: {0.0, 0.0, 1.0, 0.0},
+		4: {0.0, 0.0, 0.0, 1.0},
+		5: {0.5, 0.5, 0.5, 0.5},
 	}
 
-	neighbors := map[string][]string{
-		"a": {"b", "c", "d"},
-		"b": {"a", "c", "d"},
-		"c": {"a", "b", "d"},
+	neighbors := map[uint32][]uint32{
+		1: {2, 3, 4},
+		2: {1, 3, 4},
+		3: {1, 2, 4},
 	}
 
 	acc.PrecomputeResiduals(vectors, neighbors)
@@ -205,30 +205,30 @@ func TestFINGERAccelerator_EstimateAngle(t *testing.T) {
 	}
 }
 
-func TestFINGERAccelerator_ShouldSkipCandidate(t *testing.T) {
+func TestFINGERAccelerator_ShouldSkipCandidateByID(t *testing.T) {
 	acc := NewFINGERAccelerator(4, 2)
 
-	vectors := map[string][]float32{
-		"a": {1.0, 0.0, 0.0, 0.0},
-		"b": {0.0, 1.0, 0.0, 0.0},
-		"c": {0.0, 0.0, 1.0, 0.0},
-		"d": {0.0, 0.0, 0.0, 1.0},
-		"e": {0.5, 0.5, 0.0, 0.0},
-		"f": {0.0, 0.5, 0.5, 0.0},
+	vectors := map[uint32][]float32{
+		1: {1.0, 0.0, 0.0, 0.0},
+		2: {0.0, 1.0, 0.0, 0.0},
+		3: {0.0, 0.0, 1.0, 0.0},
+		4: {0.0, 0.0, 0.0, 1.0},
+		5: {0.5, 0.5, 0.0, 0.0},
+		6: {0.0, 0.5, 0.5, 0.0},
 	}
 
-	neighbors := map[string][]string{
-		"a": {"b", "c", "d"},
-		"b": {"a", "c", "d", "e", "f"},
-		"c": {"a", "b", "d"},
+	neighbors := map[uint32][]uint32{
+		1: {2, 3, 4},
+		2: {1, 3, 4, 5, 6},
+		3: {1, 2, 4},
 	}
 
 	acc.PrecomputeResiduals(vectors, neighbors)
 
-	skip := acc.ShouldSkipCandidate(vectors["a"], 0.5, "a", "b")
-	t.Logf("ShouldSkipCandidate(a->b) = %v", skip)
+	skip := acc.ShouldSkipCandidateByID(vectors[1], 0.5, 1, 2)
+	t.Logf("ShouldSkipCandidateByID(1->2) = %v", skip)
 
-	skip = acc.ShouldSkipCandidate(vectors["a"], 0.5, "x", "y")
+	skip = acc.ShouldSkipCandidateByID(vectors[1], 0.5, 99, 100)
 	if skip {
 		t.Error("should not skip unknown edge")
 	}
@@ -238,7 +238,7 @@ func TestFINGERAccelerator_ShouldSkipWithoutMatrix(t *testing.T) {
 	acc := NewFINGERAccelerator(4, 2)
 
 	query := []float32{1.0, 0.0, 0.0, 0.0}
-	skip := acc.ShouldSkipCandidate(query, 0.5, "a", "b")
+	skip := acc.ShouldSkipCandidateByID(query, 0.5, 1, 2)
 
 	if skip {
 		t.Error("should not skip without projection matrix")
@@ -266,16 +266,16 @@ func TestFINGERAccelerator_SetSkipThreshold(t *testing.T) {
 func TestFINGERAccelerator_Clear(t *testing.T) {
 	acc := NewFINGERAccelerator(4, 2)
 
-	vectors := map[string][]float32{
-		"a": {1.0, 0.0, 0.0, 0.0},
-		"b": {0.0, 1.0, 0.0, 0.0},
-		"c": {0.0, 0.0, 1.0, 0.0},
-		"d": {0.0, 0.0, 0.0, 1.0},
+	vectors := map[uint32][]float32{
+		1: {1.0, 0.0, 0.0, 0.0},
+		2: {0.0, 1.0, 0.0, 0.0},
+		3: {0.0, 0.0, 1.0, 0.0},
+		4: {0.0, 0.0, 0.0, 1.0},
 	}
 
-	neighbors := map[string][]string{
-		"a": {"b", "c", "d"},
-		"b": {"a", "c"},
+	neighbors := map[uint32][]uint32{
+		1: {2, 3, 4},
+		2: {1, 3},
 	}
 
 	acc.PrecomputeResiduals(vectors, neighbors)
@@ -297,19 +297,19 @@ func TestFINGERAccelerator_Clear(t *testing.T) {
 func TestFINGERAccelerator_ThreadSafety(t *testing.T) {
 	acc := NewFINGERAccelerator(8, 4)
 
-	vectors := map[string][]float32{
-		"a": {1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-		"b": {0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-		"c": {0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-		"d": {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0},
-		"e": {0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0},
-		"f": {0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0},
+	vectors := map[uint32][]float32{
+		1: {1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+		2: {0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+		3: {0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+		4: {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0},
+		5: {0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0},
+		6: {0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0},
 	}
 
-	neighbors := map[string][]string{
-		"a": {"b", "c", "d", "e", "f"},
-		"b": {"a", "c", "d", "e", "f"},
-		"c": {"a", "b", "d", "e", "f"},
+	neighbors := map[uint32][]uint32{
+		1: {2, 3, 4, 5, 6},
+		2: {1, 3, 4, 5, 6},
+		3: {1, 2, 4, 5, 6},
 	}
 
 	acc.PrecomputeResiduals(vectors, neighbors)
@@ -323,7 +323,7 @@ func TestFINGERAccelerator_ThreadSafety(t *testing.T) {
 			defer wg.Done()
 
 			query := []float32{float32(id % 8), 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7}
-			_ = acc.ShouldSkipCandidate(query, 0.5, "a", "b")
+			_ = acc.ShouldSkipCandidateByID(query, 0.5, 1, 2)
 			_ = acc.GetSkipThreshold()
 			_ = acc.HasProjectionMatrix()
 			_ = acc.GetEdgeResidualCount()
@@ -344,23 +344,23 @@ func TestFINGERAccelerator_LargeGraph(t *testing.T) {
 
 	acc := NewFINGERAccelerator(dim, lowRank)
 
-	vectors := make(map[string][]float32, numNodes)
+	vectors := make(map[uint32][]float32, numNodes)
 	for i := 0; i < numNodes; i++ {
 		vec := make([]float32, dim)
 		for j := 0; j < dim; j++ {
 			vec[j] = float32(i*dim+j) / float32(numNodes*dim)
 		}
-		vectors[string(rune('a'+i%26))+string(rune('0'+i/26))] = vec
+		vectors[uint32(i+1)] = vec
 	}
 
-	neighbors := make(map[string][]string)
-	ids := make([]string, 0, numNodes)
+	neighbors := make(map[uint32][]uint32)
+	ids := make([]uint32, 0, numNodes)
 	for id := range vectors {
 		ids = append(ids, id)
 	}
 
 	for i, id := range ids {
-		neighborList := make([]string, 0, 5)
+		neighborList := make([]uint32, 0, 5)
 		for j := 1; j <= 5 && i+j < len(ids); j++ {
 			neighborList = append(neighborList, ids[(i+j)%len(ids)])
 		}
@@ -385,17 +385,17 @@ func TestFINGERAccelerator_LargeGraph(t *testing.T) {
 func TestFINGERAccelerator_SkipThresholdBehavior(t *testing.T) {
 	acc := NewFINGERAccelerator(4, 2)
 
-	vectors := map[string][]float32{
-		"a": {1.0, 0.0, 0.0, 0.0},
-		"b": {-1.0, 0.0, 0.0, 0.0},
-		"c": {0.0, 1.0, 0.0, 0.0},
-		"d": {0.0, 0.0, 1.0, 0.0},
-		"e": {0.0, 0.0, 0.0, 1.0},
+	vectors := map[uint32][]float32{
+		1: {1.0, 0.0, 0.0, 0.0},
+		2: {-1.0, 0.0, 0.0, 0.0},
+		3: {0.0, 1.0, 0.0, 0.0},
+		4: {0.0, 0.0, 1.0, 0.0},
+		5: {0.0, 0.0, 0.0, 1.0},
 	}
 
-	neighbors := map[string][]string{
-		"a": {"b", "c", "d", "e"},
-		"b": {"a", "c", "d", "e"},
+	neighbors := map[uint32][]uint32{
+		1: {2, 3, 4, 5},
+		2: {1, 3, 4, 5},
 	}
 
 	acc.PrecomputeResiduals(vectors, neighbors)
@@ -404,7 +404,7 @@ func TestFINGERAccelerator_SkipThresholdBehavior(t *testing.T) {
 	conservativeSkips := 0
 	for fromID, toIDs := range neighbors {
 		for _, toID := range toIDs {
-			if acc.ShouldSkipCandidate(vectors["a"], 0.5, fromID, toID) {
+			if acc.ShouldSkipCandidateByID(vectors[1], 0.5, fromID, toID) {
 				conservativeSkips++
 			}
 		}
@@ -414,7 +414,7 @@ func TestFINGERAccelerator_SkipThresholdBehavior(t *testing.T) {
 	aggressiveSkips := 0
 	for fromID, toIDs := range neighbors {
 		for _, toID := range toIDs {
-			if acc.ShouldSkipCandidate(vectors["a"], 0.5, fromID, toID) {
+			if acc.ShouldSkipCandidateByID(vectors[1], 0.5, fromID, toID) {
 				aggressiveSkips++
 			}
 		}

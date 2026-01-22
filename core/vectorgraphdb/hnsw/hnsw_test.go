@@ -771,41 +771,47 @@ func TestIndexConcurrentDelete(t *testing.T) {
 }
 
 func TestLayerBasicOperations(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	l := newLayer()
 
-	l.addNode("node1")
-	if !l.hasNode("node1") {
-		t.Error("hasNode(node1) = false after add")
+	l.addNode(node1ID)
+	if !l.hasNode(node1ID) {
+		t.Error("hasNode(node1ID) = false after add")
 	}
 
-	l.addNeighbor("node1", "node2", 0.5, 10)
-	neighbors := l.getNeighbors("node1")
-	if len(neighbors) != 1 || neighbors[0] != "node2" {
-		t.Errorf("getNeighbors = %v, want [node2]", neighbors)
+	l.addNeighbor(node1ID, node2ID, 0.5, 10)
+	neighbors := l.getNeighbors(node1ID)
+	if len(neighbors) != 1 || neighbors[0] != node2ID {
+		t.Errorf("getNeighbors = %v, want [node2ID]", neighbors)
 	}
 
-	l.removeNeighbor("node1", "node2")
-	neighbors = l.getNeighbors("node1")
+	l.removeNeighbor(node1ID, node2ID)
+	neighbors = l.getNeighbors(node1ID)
 	if len(neighbors) != 0 {
 		t.Errorf("After remove: getNeighbors = %v, want []", neighbors)
 	}
 
-	l.removeNode("node1")
-	if l.hasNode("node1") {
-		t.Error("hasNode(node1) = true after remove")
+	l.removeNode(node1ID)
+	if l.hasNode(node1ID) {
+		t.Error("hasNode(node1ID) = true after remove")
 	}
 }
 
 func TestLayerMaxNeighbors(t *testing.T) {
+	const node1ID uint32 = 1
 	l := newLayer()
-	l.addNode("node1")
+	l.addNode(node1ID)
 
 	for i := 0; i < 5; i++ {
-		l.addNeighbor("node1", randomNodeID(i), float32(i)*0.1, 5)
+		l.addNeighbor(node1ID, uint32(100+i), float32(i)*0.1, 5)
 	}
 
 	// "overflow" has higher distance (0.9) than existing neighbors, so won't replace any
-	added := l.addNeighbor("node1", "overflow", 0.9, 5)
+	const overflowID uint32 = 999
+	added := l.addNeighbor(node1ID, overflowID, 0.9, 5)
 	if added {
 		t.Error("addNeighbor succeeded beyond max with worse distance")
 	}
@@ -815,7 +821,7 @@ func TestLayerNodeCount(t *testing.T) {
 	l := newLayer()
 
 	for i := 0; i < 10; i++ {
-		l.addNode(randomNodeID(i))
+		l.addNode(uint32(i + 1))
 	}
 
 	if l.nodeCount() != 10 {
@@ -843,187 +849,232 @@ func TestRandomLevel(t *testing.T) {
 
 // PF.2.3: Test O(1) containsNeighbor lookup with ConcurrentNeighborSet
 func TestLayerContainsNeighbor(t *testing.T) {
+	const (
+		node1ID     uint32 = 1
+		neighbor1ID uint32 = 10
+		neighbor2ID uint32 = 20
+		neighbor3ID uint32 = 30
+	)
 	l := newLayer()
-	l.addNode("node1")
-	l.addNeighbor("node1", "neighbor1", 0.1, 10)
-	l.addNeighbor("node1", "neighbor2", 0.2, 10)
+	l.addNode(node1ID)
+	l.addNeighbor(node1ID, neighbor1ID, 0.1, 10)
+	l.addNeighbor(node1ID, neighbor2ID, 0.2, 10)
 
 	// Access node directly to test containsNeighbor
 	l.mu.RLock()
-	node := l.nodes["node1"]
+	node := l.nodes[node1ID]
 	l.mu.RUnlock()
 
 	// Test O(1) lookup
-	if !l.containsNeighbor(node, "neighbor1") {
-		t.Error("containsNeighbor should find neighbor1")
+	if !l.containsNeighbor(node, neighbor1ID) {
+		t.Error("containsNeighbor should find neighbor1ID")
 	}
-	if !l.containsNeighbor(node, "neighbor2") {
-		t.Error("containsNeighbor should find neighbor2")
+	if !l.containsNeighbor(node, neighbor2ID) {
+		t.Error("containsNeighbor should find neighbor2ID")
 	}
-	if l.containsNeighbor(node, "neighbor3") {
-		t.Error("containsNeighbor should not find neighbor3")
+	if l.containsNeighbor(node, neighbor3ID) {
+		t.Error("containsNeighbor should not find neighbor3ID")
 	}
 }
 
 // PF.2.3: Test that neighbors are returned sorted by distance
 func TestLayerGetNeighborsSorted(t *testing.T) {
+	const (
+		node1ID  uint32 = 1
+		farID    uint32 = 10
+		closeID  uint32 = 20
+		mediumID uint32 = 30
+	)
 	l := newLayer()
-	l.addNode("node1")
+	l.addNode(node1ID)
 
 	// Add neighbors with varying distances (out of order)
-	l.addNeighbor("node1", "far", 0.9, 10)
-	l.addNeighbor("node1", "close", 0.1, 10)
-	l.addNeighbor("node1", "medium", 0.5, 10)
+	l.addNeighbor(node1ID, farID, 0.9, 10)
+	l.addNeighbor(node1ID, closeID, 0.1, 10)
+	l.addNeighbor(node1ID, mediumID, 0.5, 10)
 
-	neighbors := l.getNeighbors("node1")
+	neighbors := l.getNeighbors(node1ID)
 	if len(neighbors) != 3 {
 		t.Fatalf("Expected 3 neighbors, got %d", len(neighbors))
 	}
 
 	// Should be sorted by distance: close, medium, far
-	if neighbors[0] != "close" {
-		t.Errorf("First neighbor should be 'close' (distance 0.1), got %s", neighbors[0])
+	if neighbors[0] != closeID {
+		t.Errorf("First neighbor should be closeID (distance 0.1), got %d", neighbors[0])
 	}
-	if neighbors[1] != "medium" {
-		t.Errorf("Second neighbor should be 'medium' (distance 0.5), got %s", neighbors[1])
+	if neighbors[1] != mediumID {
+		t.Errorf("Second neighbor should be mediumID (distance 0.5), got %d", neighbors[1])
 	}
-	if neighbors[2] != "far" {
-		t.Errorf("Third neighbor should be 'far' (distance 0.9), got %s", neighbors[2])
+	if neighbors[2] != farID {
+		t.Errorf("Third neighbor should be farID (distance 0.9), got %d", neighbors[2])
 	}
 }
 
 // PF.2.4: Test batch neighbor retrieval
 func TestLayerGetNeighborsMany(t *testing.T) {
+	const (
+		node1ID    uint32 = 1
+		node2ID    uint32 = 2
+		node3ID    uint32 = 3
+		n1aID      uint32 = 11
+		n1bID      uint32 = 12
+		n2aID      uint32 = 21
+		n3aID      uint32 = 31
+		n3bID      uint32 = 32
+		n3cID      uint32 = 33
+		nonexistID uint32 = 999
+	)
 	l := newLayer()
 
 	// Create multiple nodes with neighbors
-	l.addNode("node1")
-	l.addNode("node2")
-	l.addNode("node3")
+	l.addNode(node1ID)
+	l.addNode(node2ID)
+	l.addNode(node3ID)
 
-	l.addNeighbor("node1", "n1a", 0.1, 10)
-	l.addNeighbor("node1", "n1b", 0.2, 10)
-	l.addNeighbor("node2", "n2a", 0.3, 10)
-	l.addNeighbor("node3", "n3a", 0.4, 10)
-	l.addNeighbor("node3", "n3b", 0.5, 10)
-	l.addNeighbor("node3", "n3c", 0.6, 10)
+	l.addNeighbor(node1ID, n1aID, 0.1, 10)
+	l.addNeighbor(node1ID, n1bID, 0.2, 10)
+	l.addNeighbor(node2ID, n2aID, 0.3, 10)
+	l.addNeighbor(node3ID, n3aID, 0.4, 10)
+	l.addNeighbor(node3ID, n3bID, 0.5, 10)
+	l.addNeighbor(node3ID, n3cID, 0.6, 10)
 
 	// Batch retrieval
-	result := l.getNeighborsMany([]string{"node1", "node2", "node3", "nonexistent"})
+	result := l.getNeighborsMany([]uint32{node1ID, node2ID, node3ID, nonexistID})
 
 	// Check node1
-	if n1, ok := result["node1"]; !ok || len(n1) != 2 {
-		t.Errorf("node1 should have 2 neighbors, got %v", n1)
+	if n1, ok := result[node1ID]; !ok || len(n1) != 2 {
+		t.Errorf("node1ID should have 2 neighbors, got %v", n1)
 	}
 
 	// Check node2
-	if n2, ok := result["node2"]; !ok || len(n2) != 1 {
-		t.Errorf("node2 should have 1 neighbor, got %v", n2)
+	if n2, ok := result[node2ID]; !ok || len(n2) != 1 {
+		t.Errorf("node2ID should have 1 neighbor, got %v", n2)
 	}
 
 	// Check node3
-	if n3, ok := result["node3"]; !ok || len(n3) != 3 {
-		t.Errorf("node3 should have 3 neighbors, got %v", n3)
+	if n3, ok := result[node3ID]; !ok || len(n3) != 3 {
+		t.Errorf("node3ID should have 3 neighbors, got %v", n3)
 	}
 
 	// Check nonexistent is not present
-	if _, ok := result["nonexistent"]; ok {
-		t.Error("nonexistent should not be in result")
+	if _, ok := result[nonexistID]; ok {
+		t.Error("nonexistID should not be in result")
 	}
 }
 
 // PF.2.3: Test getNeighborsWithDistances
 func TestLayerGetNeighborsWithDistances(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		closeID uint32 = 10
+		farID   uint32 = 20
+	)
 	l := newLayer()
-	l.addNode("node1")
+	l.addNode(node1ID)
 
-	l.addNeighbor("node1", "close", 0.1, 10)
-	l.addNeighbor("node1", "far", 0.9, 10)
+	l.addNeighbor(node1ID, closeID, 0.1, 10)
+	l.addNeighbor(node1ID, farID, 0.9, 10)
 
-	neighbors := l.getNeighborsWithDistances("node1")
+	neighbors := l.getNeighborsWithDistances(node1ID)
 	if len(neighbors) != 2 {
 		t.Fatalf("Expected 2 neighbors, got %d", len(neighbors))
 	}
 
 	// Should be sorted by distance
-	if neighbors[0].ID != "close" || neighbors[0].Distance != 0.1 {
-		t.Errorf("First neighbor should be close with distance 0.1, got %s with %f", neighbors[0].ID, neighbors[0].Distance)
+	if neighbors[0].ID != closeID || neighbors[0].Distance != 0.1 {
+		t.Errorf("First neighbor should be closeID with distance 0.1, got %d with %f", neighbors[0].ID, neighbors[0].Distance)
 	}
-	if neighbors[1].ID != "far" || neighbors[1].Distance != 0.9 {
-		t.Errorf("Second neighbor should be far with distance 0.9, got %s with %f", neighbors[1].ID, neighbors[1].Distance)
+	if neighbors[1].ID != farID || neighbors[1].Distance != 0.9 {
+		t.Errorf("Second neighbor should be farID with distance 0.9, got %d with %f", neighbors[1].ID, neighbors[1].Distance)
 	}
 }
 
 // PF.2.3: Test setNeighbors with distances
 func TestLayerSetNeighbors(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		old1ID  uint32 = 10
+		old2ID  uint32 = 20
+		new1ID  uint32 = 100
+		new2ID  uint32 = 200
+		new3ID  uint32 = 300
+	)
 	l := newLayer()
-	l.addNode("node1")
+	l.addNode(node1ID)
 
 	// Initial neighbors
-	l.addNeighbor("node1", "old1", 0.5, 10)
-	l.addNeighbor("node1", "old2", 0.6, 10)
+	l.addNeighbor(node1ID, old1ID, 0.5, 10)
+	l.addNeighbor(node1ID, old2ID, 0.6, 10)
 
 	// Replace with new neighbors
-	l.setNeighbors("node1", []string{"new1", "new2", "new3"}, []float32{0.1, 0.2, 0.3})
+	l.setNeighbors(node1ID, []uint32{new1ID, new2ID, new3ID}, []float32{0.1, 0.2, 0.3})
 
-	neighbors := l.getNeighbors("node1")
+	neighbors := l.getNeighbors(node1ID)
 	if len(neighbors) != 3 {
 		t.Fatalf("Expected 3 neighbors after setNeighbors, got %d", len(neighbors))
 	}
 
 	// Old neighbors should be gone
 	for _, n := range neighbors {
-		if n == "old1" || n == "old2" {
-			t.Errorf("Old neighbor %s should not be present", n)
+		if n == old1ID || n == old2ID {
+			t.Errorf("Old neighbor %d should not be present", n)
 		}
 	}
 }
 
 // PF.2.3: Test addNeighbor replaces worst neighbor when at capacity
 func TestLayerAddNeighborReplacesWorst(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		n1ID    uint32 = 10
+		n2ID    uint32 = 20
+		n3ID    uint32 = 30
+		n4ID    uint32 = 40
+	)
 	l := newLayer()
-	l.addNode("node1")
+	l.addNode(node1ID)
 
 	// Add neighbors up to capacity
-	l.addNeighbor("node1", "n1", 0.3, 3)
-	l.addNeighbor("node1", "n2", 0.5, 3)
-	l.addNeighbor("node1", "n3", 0.7, 3) // Worst
+	l.addNeighbor(node1ID, n1ID, 0.3, 3)
+	l.addNeighbor(node1ID, n2ID, 0.5, 3)
+	l.addNeighbor(node1ID, n3ID, 0.7, 3) // Worst
 
 	// Add a better neighbor - should replace n3
-	added := l.addNeighbor("node1", "n4", 0.2, 3)
+	added := l.addNeighbor(node1ID, n4ID, 0.2, 3)
 	if !added {
-		t.Error("Should add n4 as it's better than worst")
+		t.Error("Should add n4ID as it's better than worst")
 	}
 
-	neighbors := l.getNeighbors("node1")
+	neighbors := l.getNeighbors(node1ID)
 	if len(neighbors) != 3 {
 		t.Errorf("Expected 3 neighbors, got %d", len(neighbors))
 	}
 
 	// n3 (worst) should be replaced by n4
 	for _, n := range neighbors {
-		if n == "n3" {
-			t.Error("n3 (worst) should have been replaced")
+		if n == n3ID {
+			t.Error("n3ID (worst) should have been replaced")
 		}
 	}
 
 	// Verify n4 is present
 	found := false
 	for _, n := range neighbors {
-		if n == "n4" {
+		if n == n4ID {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("n4 should be present")
+		t.Error("n4ID should be present")
 	}
 }
 
 // Test concurrent layer operations for thread safety
 func TestLayerConcurrentOperations(t *testing.T) {
+	const node1ID uint32 = 1
 	l := newLayer()
-	l.addNode("node1")
+	l.addNode(node1ID)
 
 	var wg sync.WaitGroup
 	numGoroutines := 50
@@ -1033,7 +1084,7 @@ func TestLayerConcurrentOperations(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			l.addNeighbor("node1", randomNodeID(i), float32(i)*0.01, 100)
+			l.addNeighbor(node1ID, uint32(100+i), float32(i)*0.01, 100)
 		}(i)
 	}
 
@@ -1042,14 +1093,14 @@ func TestLayerConcurrentOperations(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			l.getNeighbors("node1")
+			l.getNeighbors(node1ID)
 		}()
 	}
 
 	wg.Wait()
 
 	// Should have some neighbors
-	neighbors := l.getNeighbors("node1")
+	neighbors := l.getNeighbors(node1ID)
 	if len(neighbors) == 0 {
 		t.Error("Expected some neighbors after concurrent operations")
 	}
@@ -1361,9 +1412,17 @@ func TestGetVectorAndMagnitude(t *testing.T) {
 	// Insert a vector
 	idx.Insert("node1", []float32{3, 4, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
+	// Get internal ID for node1
+	idx.mu.RLock()
+	internalID, exists := idx.stringToID["node1"]
+	idx.mu.RUnlock()
+	if !exists {
+		t.Fatal("node1 should exist in stringToID")
+	}
+
 	// Test existing node
 	idx.mu.RLock()
-	vec, mag, ok := idx.getVectorAndMagnitude("node1")
+	vec, mag, ok := idx.getVectorAndMagnitude(internalID)
 	idx.mu.RUnlock()
 
 	if !ok {
@@ -1376,9 +1435,10 @@ func TestGetVectorAndMagnitude(t *testing.T) {
 		t.Errorf("Magnitude should be 5.0, got %v", mag)
 	}
 
-	// Test non-existent node
+	// Test non-existent node (use an ID that doesn't exist)
+	const nonexistentID uint32 = 999999
 	idx.mu.RLock()
-	_, _, ok = idx.getVectorAndMagnitude("nonexistent")
+	_, _, ok = idx.getVectorAndMagnitude(nonexistentID)
 	idx.mu.RUnlock()
 
 	if ok {

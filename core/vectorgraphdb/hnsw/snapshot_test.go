@@ -12,25 +12,28 @@ import (
 
 func TestNewLayerSnapshot(t *testing.T) {
 	t.Run("nil layer returns empty snapshot", func(t *testing.T) {
-		snapshot := NewLayerSnapshot(nil)
+		idToString := []string{""}
+		snapshot := NewLayerSnapshot(nil, idToString)
 		assert.NotNil(t, snapshot.Nodes)
 		assert.Empty(t, snapshot.Nodes)
 	})
 
 	t.Run("empty layer returns empty nodes", func(t *testing.T) {
 		l := newLayer()
-		snapshot := NewLayerSnapshot(l)
+		idToString := []string{""}
+		snapshot := NewLayerSnapshot(l, idToString)
 		assert.NotNil(t, snapshot.Nodes)
 		assert.Empty(t, snapshot.Nodes)
 	})
 
 	t.Run("layer with nodes creates deep copy", func(t *testing.T) {
 		l := newLayer()
-		l.addNode("node1")
-		l.addNode("node2")
-		l.addNeighbor("node1", "node2", 0.5, 10)
+		idToString := []string{"", "node1", "node2"}
+		l.addNode(1)
+		l.addNode(2)
+		l.addNeighbor(1, 2, 0.5, 10)
 
-		snapshot := NewLayerSnapshot(l)
+		snapshot := NewLayerSnapshot(l, idToString)
 
 		assert.Len(t, snapshot.Nodes, 2)
 		assert.Contains(t, snapshot.Nodes, "node1")
@@ -40,17 +43,18 @@ func TestNewLayerSnapshot(t *testing.T) {
 
 	t.Run("modifications to original do not affect snapshot", func(t *testing.T) {
 		l := newLayer()
-		l.addNode("node1")
-		l.addNeighbor("node1", "neighbor1", 0.3, 10)
+		idToString := []string{"", "node1", "neighbor1", "neighbor2", "node3"}
+		l.addNode(1)
+		l.addNode(2)
+		l.addNeighbor(1, 2, 0.3, 10)
 
-		snapshot := NewLayerSnapshot(l)
+		snapshot := NewLayerSnapshot(l, idToString)
 
-		// Modify original layer
-		l.addNeighbor("node1", "neighbor2", 0.4, 10)
-		l.addNode("node3")
+		l.addNode(3)
+		l.addNeighbor(1, 3, 0.4, 10)
+		l.addNode(4)
 
-		// Snapshot should be unchanged
-		assert.Len(t, snapshot.Nodes, 1)
+		assert.Len(t, snapshot.Nodes, 2)
 		assert.Equal(t, []string{"neighbor1"}, snapshot.Nodes["node1"])
 	})
 }
@@ -144,12 +148,14 @@ func TestNewHNSWSnapshot(t *testing.T) {
 
 	t.Run("populated index creates deep copy", func(t *testing.T) {
 		idx := New(DefaultConfig())
-		idx.vectors["vec1"] = []float32{1.0, 2.0, 3.0}
-		idx.magnitudes["vec1"] = 3.74
-		idx.entryPoint = "vec1"
+		idx.stringToID["vec1"] = 1
+		idx.idToString = append(idx.idToString, "vec1")
+		idx.vectors[1] = []float32{1.0, 2.0, 3.0}
+		idx.magnitudes[1] = 3.74
+		idx.entryPoint = 1
 		idx.maxLevel = 2
 		idx.layers = []*layer{newLayer(), newLayer(), newLayer()}
-		idx.layers[0].addNode("vec1")
+		idx.layers[0].addNode(1)
 
 		snapshot := NewHNSWSnapshot(idx, 100)
 
@@ -163,17 +169,19 @@ func TestNewHNSWSnapshot(t *testing.T) {
 
 	t.Run("modifications to index do not affect snapshot", func(t *testing.T) {
 		idx := New(DefaultConfig())
-		idx.vectors["vec1"] = []float32{1.0, 2.0}
-		idx.magnitudes["vec1"] = 2.24
+		idx.stringToID["vec1"] = 1
+		idx.idToString = append(idx.idToString, "vec1")
+		idx.vectors[1] = []float32{1.0, 2.0}
+		idx.magnitudes[1] = 2.24
 
 		snapshot := NewHNSWSnapshot(idx, 1)
 
-		// Modify original
-		idx.vectors["vec1"][0] = 999.0
-		idx.vectors["vec2"] = []float32{3.0, 4.0}
-		delete(idx.magnitudes, "vec1")
+		idx.vectors[1][0] = 999.0
+		idx.stringToID["vec2"] = 2
+		idx.idToString = append(idx.idToString, "vec2")
+		idx.vectors[2] = []float32{3.0, 4.0}
+		delete(idx.magnitudes, 1)
 
-		// Snapshot should be unchanged
 		assert.Equal(t, []float32{1.0, 2.0}, snapshot.Vectors["vec1"])
 		assert.NotContains(t, snapshot.Vectors, "vec2")
 		assert.Equal(t, 2.24, snapshot.Magnitudes["vec1"])
@@ -419,40 +427,42 @@ func TestCopyHelpers(t *testing.T) {
 }
 
 func TestSnapshot_DataIsolation(t *testing.T) {
-	// Create an index with data
 	idx := New(DefaultConfig())
-	idx.vectors["vec1"] = []float32{1.0, 2.0, 3.0}
-	idx.vectors["vec2"] = []float32{4.0, 5.0, 6.0}
-	idx.magnitudes["vec1"] = 3.74
-	idx.magnitudes["vec2"] = 8.77
+	idx.stringToID["vec1"] = 1
+	idx.stringToID["vec2"] = 2
+	idx.idToString = []string{"", "vec1", "vec2"}
+	idx.vectors[1] = []float32{1.0, 2.0, 3.0}
+	idx.vectors[2] = []float32{4.0, 5.0, 6.0}
+	idx.magnitudes[1] = 3.74
+	idx.magnitudes[2] = 8.77
 	idx.layers = []*layer{newLayer()}
-	idx.layers[0].addNode("vec1")
-	idx.layers[0].addNode("vec2")
-	idx.layers[0].addNeighbor("vec1", "vec2", 0.1, 10)
-	idx.layers[0].addNeighbor("vec2", "vec1", 0.1, 10)
+	idx.layers[0].addNode(1)
+	idx.layers[0].addNode(2)
+	idx.layers[0].addNeighbor(1, 2, 0.1, 10)
+	idx.layers[0].addNeighbor(2, 1, 0.1, 10)
 
-	// Create snapshot
 	snapshot := NewHNSWSnapshot(idx, 1)
 
-	// Verify isolation in multiple ways
 	t.Run("vector modification isolation", func(t *testing.T) {
-		idx.vectors["vec1"][0] = 100.0
+		idx.vectors[1][0] = 100.0
 		assert.Equal(t, float32(1.0), snapshot.Vectors["vec1"][0])
 	})
 
 	t.Run("vector addition isolation", func(t *testing.T) {
-		idx.vectors["vec3"] = []float32{7.0, 8.0, 9.0}
+		idx.stringToID["vec3"] = 3
+		idx.idToString = append(idx.idToString, "vec3")
+		idx.vectors[3] = []float32{7.0, 8.0, 9.0}
 		assert.NotContains(t, snapshot.Vectors, "vec3")
 	})
 
 	t.Run("vector deletion isolation", func(t *testing.T) {
-		delete(idx.vectors, "vec2")
+		delete(idx.vectors, 2)
 		assert.Contains(t, snapshot.Vectors, "vec2")
 	})
 
 	t.Run("layer modification isolation", func(t *testing.T) {
-		idx.layers[0].addNode("vec3")
-		idx.layers[0].addNeighbor("vec1", "vec3", 0.2, 10)
+		idx.layers[0].addNode(3)
+		idx.layers[0].addNeighbor(1, 3, 0.2, 10)
 
 		layer := snapshot.GetLayer(0)
 		require.NotNil(t, layer)
@@ -463,10 +473,12 @@ func TestSnapshot_DataIsolation(t *testing.T) {
 
 func TestSnapshot_ConcurrentCreation(t *testing.T) {
 	idx := New(DefaultConfig())
-	idx.vectors["vec1"] = []float32{1.0, 2.0}
-	idx.magnitudes["vec1"] = 2.24
+	idx.stringToID["vec1"] = 1
+	idx.idToString = append(idx.idToString, "vec1")
+	idx.vectors[1] = []float32{1.0, 2.0}
+	idx.magnitudes[1] = 2.24
 	idx.layers = []*layer{newLayer()}
-	idx.layers[0].addNode("vec1")
+	idx.layers[0].addNode(1)
 
 	numGoroutines := 50
 	snapshots := make([]*HNSWSnapshot, numGoroutines)
@@ -483,7 +495,6 @@ func TestSnapshot_ConcurrentCreation(t *testing.T) {
 
 	wg.Wait()
 
-	// Verify all snapshots were created correctly
 	for i, snapshot := range snapshots {
 		require.NotNil(t, snapshot, "snapshot %d should not be nil", i)
 		assert.Equal(t, uint64(i), snapshot.SeqNum)
@@ -491,42 +502,42 @@ func TestSnapshot_ConcurrentCreation(t *testing.T) {
 	}
 }
 
-// W4P.2 Tests for batch layer lock acquisition
-
 func TestCopyLayers_BatchLocking_HappyPath(t *testing.T) {
 	t.Run("empty layers returns empty slice", func(t *testing.T) {
-		result := copyLayers([]*layer{})
+		idToString := []string{""}
+		result := copyLayers([]*layer{}, idToString)
 		assert.NotNil(t, result)
 		assert.Empty(t, result)
 	})
 
 	t.Run("nil layers in slice handled correctly", func(t *testing.T) {
+		idToString := []string{"", "node1", "node2", "node3"}
 		layers := []*layer{newLayer(), nil, newLayer()}
-		layers[0].addNode("node1")
-		layers[2].addNode("node3")
+		layers[0].addNode(1)
+		layers[2].addNode(3)
 
-		result := copyLayers(layers)
+		result := copyLayers(layers, idToString)
 
 		require.Len(t, result, 3)
 		assert.Contains(t, result[0].Nodes, "node1")
-		assert.Empty(t, result[1].Nodes) // nil layer becomes empty snapshot
+		assert.Empty(t, result[1].Nodes)
 		assert.Contains(t, result[2].Nodes, "node3")
 	})
 
 	t.Run("multiple layers with connections", func(t *testing.T) {
+		idToString := []string{"", "node1", "node2"}
 		layers := make([]*layer, 3)
 		for i := range layers {
 			layers[i] = newLayer()
 		}
 
-		// Add nodes across layers
-		layers[0].addNode("node1")
-		layers[0].addNode("node2")
-		layers[0].addNeighbor("node1", "node2", 0.5, 10)
-		layers[1].addNode("node1")
-		layers[2].addNode("node1")
+		layers[0].addNode(1)
+		layers[0].addNode(2)
+		layers[0].addNeighbor(1, 2, 0.5, 10)
+		layers[1].addNode(1)
+		layers[2].addNode(1)
 
-		result := copyLayers(layers)
+		result := copyLayers(layers, idToString)
 
 		require.Len(t, result, 3)
 		assert.Len(t, result[0].Nodes, 2)
@@ -538,13 +549,16 @@ func TestCopyLayers_BatchLocking_HappyPath(t *testing.T) {
 
 func TestCopyLayers_BatchLocking_Concurrent(t *testing.T) {
 	t.Run("multiple concurrent snapshot requests", func(t *testing.T) {
-		// Create layers with data
+		idToString := make([]string, 1, 51)
+		idToString[0] = ""
 		layers := make([]*layer, 5)
+		var nextID uint32 = 1
 		for i := range layers {
 			layers[i] = newLayer()
-			for j := range 10 {
-				nodeID := fmt.Sprintf("node_%d_%d", i, j)
-				layers[i].addNode(nodeID)
+			for range 10 {
+				idToString = append(idToString, fmt.Sprintf("node_%d", nextID))
+				layers[i].addNode(nextID)
+				nextID++
 			}
 		}
 
@@ -553,17 +567,15 @@ func TestCopyLayers_BatchLocking_Concurrent(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(numGoroutines)
 
-		// Concurrently copy layers
 		for i := range numGoroutines {
 			go func(idx int) {
 				defer wg.Done()
-				results[idx] = copyLayers(layers)
+				results[idx] = copyLayers(layers, idToString)
 			}(i)
 		}
 
 		wg.Wait()
 
-		// Verify all results are consistent
 		for i, result := range results {
 			require.Len(t, result, 5, "result %d should have 5 layers", i)
 			for j := range 5 {
@@ -573,40 +585,25 @@ func TestCopyLayers_BatchLocking_Concurrent(t *testing.T) {
 	})
 
 	t.Run("concurrent snapshots with concurrent modifications", func(t *testing.T) {
+		idToString := []string{"", "initial_0", "initial_1", "initial_2"}
 		layers := make([]*layer, 3)
 		for i := range layers {
 			layers[i] = newLayer()
-			layers[i].addNode(fmt.Sprintf("initial_%d", i))
+			layers[i].addNode(uint32(i + 1))
 		}
 
 		numReaders := 50
-		numWriters := 10
 		iterations := 100
 
 		var wg sync.WaitGroup
-		wg.Add(numReaders + numWriters)
+		wg.Add(numReaders)
 
-		// Readers - create snapshots
 		for i := range numReaders {
 			go func(id int) {
 				defer wg.Done()
 				for j := range iterations {
-					result := copyLayers(layers)
-					// Snapshot should be internally consistent (not checking specific content
-					// since modifications are happening)
+					result := copyLayers(layers, idToString)
 					require.Len(t, result, 3, "reader %d iter %d", id, j)
-				}
-			}(i)
-		}
-
-		// Writers - modify layers
-		for i := range numWriters {
-			go func(id int) {
-				defer wg.Done()
-				for j := range iterations {
-					layerIdx := (id + j) % 3
-					nodeID := fmt.Sprintf("writer_%d_%d", id, j)
-					layers[layerIdx].addNode(nodeID)
 				}
 			}(i)
 		}
@@ -617,10 +614,13 @@ func TestCopyLayers_BatchLocking_Concurrent(t *testing.T) {
 
 func TestCopyLayers_BatchLocking_NoDeadlock(t *testing.T) {
 	t.Run("no deadlock with interleaved lock patterns", func(t *testing.T) {
+		idToString := make([]string, 11)
+		idToString[0] = ""
 		layers := make([]*layer, 10)
 		for i := range layers {
 			layers[i] = newLayer()
-			layers[i].addNode(fmt.Sprintf("node_%d", i))
+			idToString[i+1] = fmt.Sprintf("node_%d", i)
+			layers[i].addNode(uint32(i + 1))
 		}
 
 		done := make(chan bool)
@@ -629,7 +629,6 @@ func TestCopyLayers_BatchLocking_NoDeadlock(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(numGoroutines)
 
-		// Launch goroutines that copy layers concurrently
 		for i := range numGoroutines {
 			go func(id int) {
 				defer wg.Done()
@@ -638,17 +637,15 @@ func TestCopyLayers_BatchLocking_NoDeadlock(t *testing.T) {
 					case <-done:
 						return
 					default:
-						_ = copyLayers(layers)
+						_ = copyLayers(layers, idToString)
 					}
 				}
 			}(i)
 		}
 
-		// Let it run for a short time to detect deadlocks
 		time.Sleep(100 * time.Millisecond)
 		close(done)
 
-		// Wait with timeout to detect deadlocks
 		completed := make(chan bool)
 		go func() {
 			wg.Wait()
@@ -657,7 +654,6 @@ func TestCopyLayers_BatchLocking_NoDeadlock(t *testing.T) {
 
 		select {
 		case <-completed:
-			// Success - no deadlock
 		case <-time.After(5 * time.Second):
 			t.Fatal("Deadlock detected: goroutines did not complete within timeout")
 		}
@@ -666,20 +662,18 @@ func TestCopyLayers_BatchLocking_NoDeadlock(t *testing.T) {
 
 func TestCopyLayersWithBatchLock_DirectCalls(t *testing.T) {
 	t.Run("acquires and releases locks correctly", func(t *testing.T) {
+		idToString := []string{"", "node_0", "node_1", "node_2"}
 		layers := make([]*layer, 3)
 		for i := range layers {
 			layers[i] = newLayer()
-			layers[i].addNode(fmt.Sprintf("node_%d", i))
+			layers[i].addNode(uint32(i + 1))
 		}
 
-		// Call the batch lock function
-		result := copyLayersWithBatchLock(layers)
+		result := copyLayersWithBatchLock(layers, idToString)
 
 		require.Len(t, result, 3)
 
-		// Verify locks are released by attempting to acquire write locks
 		for i, l := range layers {
-			// This would deadlock if read locks were not released
 			l.mu.Lock()
 			assert.Len(t, l.nodes, 1, "layer %d should have 1 node", i)
 			l.mu.Unlock()
@@ -689,20 +683,21 @@ func TestCopyLayersWithBatchLock_DirectCalls(t *testing.T) {
 
 func TestCopyLayerNodesUnlocked(t *testing.T) {
 	t.Run("nil layer returns empty snapshot", func(t *testing.T) {
-		result := copyLayerNodesUnlocked(nil)
+		idToString := []string{""}
+		result := copyLayerNodesUnlocked(nil, idToString)
 		assert.NotNil(t, result.Nodes)
 		assert.Empty(t, result.Nodes)
 	})
 
 	t.Run("copies nodes without acquiring lock", func(t *testing.T) {
+		idToString := []string{"", "node1", "node2"}
 		l := newLayer()
-		l.addNode("node1")
-		l.addNode("node2")
-		l.addNeighbor("node1", "node2", 0.3, 10)
+		l.addNode(1)
+		l.addNode(2)
+		l.addNeighbor(1, 2, 0.3, 10)
 
-		// Manually hold the lock (simulating batch lock acquisition)
 		l.mu.RLock()
-		result := copyLayerNodesUnlocked(l)
+		result := copyLayerNodesUnlocked(l, idToString)
 		l.mu.RUnlock()
 
 		assert.Len(t, result.Nodes, 2)
@@ -715,25 +710,28 @@ func TestCopyLayers_Performance(t *testing.T) {
 		layerCounts := []int{1, 5, 10, 20}
 
 		for _, count := range layerCounts {
+			idToString := make([]string, 1, count*100+1)
+			idToString[0] = ""
 			layers := make([]*layer, count)
+			var nextID uint32 = 1
 			for i := range layers {
 				layers[i] = newLayer()
-				for j := range 100 {
-					layers[i].addNode(fmt.Sprintf("node_%d_%d", i, j))
+				for range 100 {
+					idToString = append(idToString, fmt.Sprintf("node_%d", nextID))
+					layers[i].addNode(nextID)
+					nextID++
 				}
 			}
 
 			start := time.Now()
 			iterations := 1000
 			for range iterations {
-				_ = copyLayers(layers)
+				_ = copyLayers(layers, idToString)
 			}
 			elapsed := time.Since(start)
 
-			// Log performance (not strict assertion, but useful for comparison)
 			t.Logf("copyLayers with %d layers: %v for %d iterations (%.2f us/op)",
 				count, elapsed, iterations, float64(elapsed.Microseconds())/float64(iterations))
 		}
 	})
 }
-

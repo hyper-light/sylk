@@ -241,7 +241,12 @@ func TestW4P15_GetVectorAndMagnitudeLocked(t *testing.T) {
 	idx.Insert("node1", vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
 	idx.mu.RLock()
-	gotVec, gotMag, ok := idx.getVectorAndMagnitudeLocked("node1")
+	internalID, exists := idx.stringToID["node1"]
+	if !exists {
+		idx.mu.RUnlock()
+		t.Fatal("expected node1 to exist in stringToID map")
+	}
+	gotVec, gotMag, ok := idx.getVectorAndMagnitudeLocked(internalID)
 	idx.mu.RUnlock()
 
 	if !ok {
@@ -255,9 +260,14 @@ func TestW4P15_GetVectorAndMagnitudeLocked(t *testing.T) {
 	}
 
 	idx.mu.RLock()
-	_, _, ok = idx.getVectorAndMagnitudeLocked("nonexistent")
-	idx.mu.RUnlock()
-	if ok {
-		t.Error("should not find nonexistent node")
+	nonexistentID, exists := idx.stringToID["nonexistent"]
+	if exists {
+		_, _, ok = idx.getVectorAndMagnitudeLocked(nonexistentID)
+		idx.mu.RUnlock()
+		if ok {
+			t.Error("should not find nonexistent node")
+		}
+	} else {
+		idx.mu.RUnlock()
 	}
 }

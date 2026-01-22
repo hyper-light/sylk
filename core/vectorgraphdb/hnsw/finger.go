@@ -7,20 +7,18 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
-// FINGERAccelerator implements the FINGER (Fast INference of Graph-based NEarest
-// neighbor Retrieval) algorithm for accelerating HNSW graph traversal.
-// It uses low-rank approximation to skip obviously-far candidates without
-// computing exact distances.
+type edgeKey struct {
+	from, to uint32
+}
+
 type FINGERAccelerator struct {
 	mu               sync.RWMutex
 	projectionMatrix *mat.Dense
 	lowRank          int
 	skipThreshold    float64
-	edgeResiduals    map[string][]float32
+	edgeResiduals    map[edgeKey][]float32
 }
 
-// NewFINGERAccelerator creates a new FINGER accelerator with the given dimension
-// and low-rank approximation size. If lowRank is <= 0, it defaults to min(32, dim/4).
 func NewFINGERAccelerator(dim, lowRank int) *FINGERAccelerator {
 	if lowRank <= 0 {
 		lowRank = min(32, dim/4)
@@ -31,14 +29,11 @@ func NewFINGERAccelerator(dim, lowRank int) *FINGERAccelerator {
 	return &FINGERAccelerator{
 		lowRank:       lowRank,
 		skipThreshold: 0.7,
-		edgeResiduals: make(map[string][]float32),
+		edgeResiduals: make(map[edgeKey][]float32),
 	}
 }
 
-// PrecomputeResiduals precomputes edge residual vectors and builds the low-rank
-// projection matrix using SVD. This should be called during index construction
-// or after bulk insertions.
-func (f *FINGERAccelerator) PrecomputeResiduals(vectors map[string][]float32, neighbors map[string][]string) {
+func (f *FINGERAccelerator) PrecomputeResiduals(vectors map[uint32][]float32, neighbors map[uint32][]uint32) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -50,7 +45,7 @@ func (f *FINGERAccelerator) PrecomputeResiduals(vectors map[string][]float32, ne
 			if len(fromVec) == 0 || len(toVec) == 0 {
 				continue
 			}
-			key := fromID + "->" + toID
+			key := edgeKey{from: fromID, to: toID}
 			residual := make([]float32, len(fromVec))
 			residualF64 := make([]float64, len(fromVec))
 			for i := range fromVec {
@@ -67,9 +62,6 @@ func (f *FINGERAccelerator) PrecomputeResiduals(vectors map[string][]float32, ne
 	}
 }
 
-// computeProjectionMatrix computes the low-rank projection matrix using SVD
-// of the residual vectors. The projection matrix consists of the top-k right
-// singular vectors.
 func (f *FINGERAccelerator) computeProjectionMatrix(residuals [][]float64) {
 	if len(residuals) == 0 {
 		return
@@ -97,10 +89,7 @@ func (f *FINGERAccelerator) computeProjectionMatrix(residuals [][]float64) {
 	}
 }
 
-// ShouldSkipCandidate determines if a candidate should be skipped based on
-// the low-rank approximation. Returns true if the candidate is likely too far
-// to improve the current best result.
-func (f *FINGERAccelerator) ShouldSkipCandidate(query []float32, currentBestSim float64, fromID, candidateID string) bool {
+func (f *FINGERAccelerator) ShouldSkipCandidateByID(query []float32, currentBestSim float64, fromID, candidateID uint32) bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -108,7 +97,7 @@ func (f *FINGERAccelerator) ShouldSkipCandidate(query []float32, currentBestSim 
 		return false
 	}
 
-	key := fromID + "->" + candidateID
+	key := edgeKey{from: fromID, to: candidateID}
 	residual, ok := f.edgeResiduals[key]
 	if !ok {
 		return false
@@ -121,7 +110,6 @@ func (f *FINGERAccelerator) ShouldSkipCandidate(query []float32, currentBestSim 
 	return angle > f.skipThreshold
 }
 
-// project projects a vector to the low-rank space using the projection matrix.
 func (f *FINGERAccelerator) project(vec []float32) []float64 {
 	if f.projectionMatrix == nil {
 		return nil
@@ -138,8 +126,6 @@ func (f *FINGERAccelerator) project(vec []float32) []float64 {
 	return result
 }
 
-// estimateAngle estimates the angle between two vectors in the projected space.
-// Returns a value in [0, 1] representing the normalized angle (angle/pi).
 func (f *FINGERAccelerator) estimateAngle(a, b []float64) float64 {
 	if len(a) == 0 || len(b) == 0 {
 		return 0
@@ -159,39 +145,33 @@ func (f *FINGERAccelerator) estimateAngle(a, b []float64) float64 {
 	return math.Acos(math.Max(-1, math.Min(1, cos))) / math.Pi
 }
 
-// SetSkipThreshold sets the threshold for skipping candidates.
-// Values closer to 0 skip more aggressively, values closer to 1 are more conservative.
 func (f *FINGERAccelerator) SetSkipThreshold(threshold float64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.skipThreshold = threshold
 }
 
-// GetSkipThreshold returns the current skip threshold.
 func (f *FINGERAccelerator) GetSkipThreshold() float64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.skipThreshold
 }
 
-// HasProjectionMatrix returns true if the projection matrix has been computed.
 func (f *FINGERAccelerator) HasProjectionMatrix() bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.projectionMatrix != nil
 }
 
-// GetEdgeResidualCount returns the number of precomputed edge residuals.
 func (f *FINGERAccelerator) GetEdgeResidualCount() int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return len(f.edgeResiduals)
 }
 
-// Clear resets the accelerator, removing all precomputed data.
 func (f *FINGERAccelerator) Clear() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.projectionMatrix = nil
-	f.edgeResiduals = make(map[string][]float32)
+	f.edgeResiduals = make(map[edgeKey][]float32)
 }

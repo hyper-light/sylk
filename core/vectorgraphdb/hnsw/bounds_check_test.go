@@ -56,7 +56,8 @@ func TestBoundsCheckGetVectorAndMagnitudeExisting(t *testing.T) {
 	idx.Insert("node1", []float32{3, 4, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
 	idx.mu.RLock()
-	vec, mag, ok := idx.getVectorAndMagnitude("node1")
+	internalID := idx.stringToID["node1"]
+	vec, mag, ok := idx.getVectorAndMagnitude(internalID)
 	idx.mu.RUnlock()
 
 	if !ok {
@@ -85,7 +86,8 @@ func TestBoundsCheckGetVectorAndMagnitudeMissing(t *testing.T) {
 	idx.Insert("node1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
 	idx.mu.RLock()
-	vec, mag, ok := idx.getVectorAndMagnitude("nonexistent")
+	// Use an ID that doesn't exist (9999 is not assigned)
+	vec, mag, ok := idx.getVectorAndMagnitude(9999)
 	idx.mu.RUnlock()
 
 	if ok {
@@ -107,13 +109,13 @@ func TestBoundsCheckPartialDataVectorMissing(t *testing.T) {
 	// Insert a node normally first
 	idx.Insert("node1", []float32{1, 0, 0}, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
-	// Simulate inconsistent state: remove vector but keep magnitude
 	idx.mu.Lock()
-	delete(idx.vectors, "node1")
+	internalID := idx.stringToID["node1"]
+	delete(idx.vectors, internalID)
 	idx.mu.Unlock()
 
 	idx.mu.RLock()
-	_, _, ok := idx.getVectorAndMagnitude("node1")
+	_, _, ok := idx.getVectorAndMagnitude(internalID)
 	idx.mu.RUnlock()
 
 	if ok {
@@ -134,11 +136,12 @@ func TestBoundsCheckPartialDataMagnitudeMissing(t *testing.T) {
 
 	// Simulate inconsistent state: remove magnitude but keep vector
 	idx.mu.Lock()
-	delete(idx.magnitudes, "node1")
+	internalID := idx.stringToID["node1"]
+	delete(idx.magnitudes, internalID)
 	idx.mu.Unlock()
 
 	idx.mu.RLock()
-	retrievedVec, mag, ok := idx.getVectorAndMagnitude("node1")
+	retrievedVec, mag, ok := idx.getVectorAndMagnitude(internalID)
 	idx.mu.RUnlock()
 
 	// W4P.24: Missing magnitude should be recomputed, not cause failure
@@ -159,7 +162,7 @@ func TestBoundsCheckPartialDataMagnitudeMissing(t *testing.T) {
 
 	// Note: Cache is NOT populated during read to avoid data races
 	idx.mu.RLock()
-	_, exists := idx.magnitudes["node1"]
+	_, exists := idx.magnitudes[internalID]
 	idx.mu.RUnlock()
 
 	if exists {
@@ -205,8 +208,9 @@ func TestBoundsCheckGreedySearchWithCorruptedNeighbor(t *testing.T) {
 
 	// Remove data for one node that's likely a neighbor
 	idx.mu.Lock()
-	delete(idx.vectors, randomNodeIDForBoundsTest(5))
-	delete(idx.magnitudes, randomNodeIDForBoundsTest(5))
+	corruptedID := idx.stringToID[randomNodeIDForBoundsTest(5)]
+	delete(idx.vectors, corruptedID)
+	delete(idx.magnitudes, corruptedID)
 	idx.mu.Unlock()
 
 	// Search should still work, skipping the corrupted neighbor
@@ -317,8 +321,9 @@ func TestBoundsCheckSearchLayerWithMissingNeighbor(t *testing.T) {
 
 	// Remove data for one node
 	idx.mu.Lock()
-	delete(idx.vectors, "node2")
-	delete(idx.magnitudes, "node2")
+	node2ID := idx.stringToID["node2"]
+	delete(idx.vectors, node2ID)
+	delete(idx.magnitudes, node2ID)
 	idx.mu.Unlock()
 
 	// Search should skip node2 and return other results
@@ -349,9 +354,10 @@ func TestBoundsCheckMultipleCorruptedNodes(t *testing.T) {
 	// Corrupt half the nodes
 	idx.mu.Lock()
 	for i := 0; i < 10; i++ {
-		id := randomNodeIDForBoundsTest(i)
-		delete(idx.vectors, id)
-		delete(idx.magnitudes, id)
+		strID := randomNodeIDForBoundsTest(i)
+		internalID := idx.stringToID[strID]
+		delete(idx.vectors, internalID)
+		delete(idx.magnitudes, internalID)
 	}
 	idx.mu.Unlock()
 
@@ -362,8 +368,9 @@ func TestBoundsCheckMultipleCorruptedNodes(t *testing.T) {
 	// Results should only contain non-corrupted nodes
 	for _, r := range results {
 		idx.mu.RLock()
-		_, hasVec := idx.vectors[r.ID]
-		_, hasMag := idx.magnitudes[r.ID]
+		resultInternalID := idx.stringToID[r.ID]
+		_, hasVec := idx.vectors[resultInternalID]
+		_, hasMag := idx.magnitudes[resultInternalID]
 		idx.mu.RUnlock()
 		if !hasVec || !hasMag {
 			t.Errorf("Result %s should have valid vector and magnitude", r.ID)
@@ -381,9 +388,9 @@ func TestBoundsCheckEmptyIndex(t *testing.T) {
 		t.Error("Search on empty index should return nil")
 	}
 
-	// getVectorAndMagnitude on empty index
+	// getVectorAndMagnitude on empty index (use non-existent uint32 ID)
 	idx.mu.RLock()
-	_, _, ok := idx.getVectorAndMagnitude("any")
+	_, _, ok := idx.getVectorAndMagnitude(9999)
 	idx.mu.RUnlock()
 	if ok {
 		t.Error("getVectorAndMagnitude should return false on empty index")

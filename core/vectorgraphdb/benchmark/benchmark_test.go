@@ -158,7 +158,7 @@ func benchmarkNeighborSetAdd(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		ns := hnsw.NewNeighborSet()
 		for j := 0; j < 100; j++ {
-			ns.Add(fmt.Sprintf("id-%d", j), float32(j)*0.1)
+			ns.Add(uint32(j), float32(j)*0.1)
 		}
 	}
 }
@@ -166,21 +166,21 @@ func benchmarkNeighborSetAdd(b *testing.B) {
 func benchmarkNeighborSetContains(b *testing.B) {
 	ns := hnsw.NewNeighborSet()
 	for j := 0; j < 100; j++ {
-		ns.Add(fmt.Sprintf("id-%d", j), float32(j)*0.1)
+		ns.Add(uint32(j), float32(j)*0.1)
 	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = ns.Contains(fmt.Sprintf("id-%d", i%100))
+		_ = ns.Contains(uint32(i % 100))
 	}
 }
 
 func benchmarkNeighborSetGetSorted(b *testing.B) {
 	ns := hnsw.NewNeighborSet()
 	for j := 0; j < 100; j++ {
-		ns.Add(fmt.Sprintf("id-%d", j), float32(j)*0.1)
+		ns.Add(uint32(j), float32(j)*0.1)
 	}
 
 	b.ReportAllocs()
@@ -194,7 +194,7 @@ func benchmarkNeighborSetGetSorted(b *testing.B) {
 func benchmarkNeighborSetGetTopK(b *testing.B) {
 	ns := hnsw.NewNeighborSet()
 	for j := 0; j < 100; j++ {
-		ns.Add(fmt.Sprintf("id-%d", j), float32(j)*0.1)
+		ns.Add(uint32(j), float32(j)*0.1)
 	}
 
 	b.ReportAllocs()
@@ -213,7 +213,7 @@ func benchmarkNeighborSetTrimToSize(b *testing.B) {
 		b.StopTimer()
 		ns := hnsw.NewNeighborSet()
 		for j := 0; j < 100; j++ {
-			ns.Add(fmt.Sprintf("id-%d", j), float32(j)*0.1)
+			ns.Add(uint32(j), float32(j)*0.1)
 		}
 		b.StartTimer()
 
@@ -247,7 +247,7 @@ func benchmarkConcurrentNeighborSetAdd(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		ns := hnsw.NewConcurrentNeighborSet()
 		for j := 0; j < 100; j++ {
-			ns.Add(fmt.Sprintf("id-%d", j), float32(j)*0.1)
+			ns.Add(uint32(j), float32(j)*0.1)
 		}
 	}
 }
@@ -255,14 +255,14 @@ func benchmarkConcurrentNeighborSetAdd(b *testing.B) {
 func benchmarkConcurrentNeighborSetContains(b *testing.B) {
 	ns := hnsw.NewConcurrentNeighborSet()
 	for j := 0; j < 100; j++ {
-		ns.Add(fmt.Sprintf("id-%d", j), float32(j)*0.1)
+		ns.Add(uint32(j), float32(j)*0.1)
 	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = ns.Contains(fmt.Sprintf("id-%d", i%100))
+		_ = ns.Contains(uint32(i % 100))
 	}
 }
 
@@ -276,7 +276,7 @@ func benchmarkConcurrentNeighborSetAddWithLimit(b *testing.B) {
 		b.StartTimer()
 
 		for j := 0; j < 100; j++ {
-			ns.AddWithLimit(fmt.Sprintf("id-%d", j), float32(j)*0.1, 50)
+			ns.AddWithLimit(uint32(j), float32(j)*0.1, 50)
 		}
 	}
 }

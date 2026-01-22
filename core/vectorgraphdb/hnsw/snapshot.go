@@ -13,64 +13,56 @@ import (
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
 
-// W12.37: Sentinel errors for snapshot validation.
 var (
-	// ErrSnapshotChecksumMismatch indicates the snapshot data has been corrupted.
 	ErrSnapshotChecksumMismatch = errors.New("hnsw: snapshot checksum mismatch")
-
-	// ErrSnapshotNotValidated indicates the snapshot has not been validated yet.
-	ErrSnapshotNotValidated = errors.New("hnsw: snapshot not validated")
+	ErrSnapshotNotValidated     = errors.New("hnsw: snapshot not validated")
 )
 
-// LayerSnapshot represents an immutable snapshot of a layer's state.
-// All data is deep copied to ensure isolation from the live index.
 type LayerSnapshot struct {
-	Nodes map[string][]string // nodeID -> neighbors (deep copied, immutable)
+	Nodes map[string][]string
 }
 
-// HNSWSnapshot represents a point-in-time frozen state of the HNSW index.
-// It provides thread-safe read access through atomic reader counting.
-// W12.37: Includes checksum for data integrity validation.
 type HNSWSnapshot struct {
-	ID         uint64               // unique snapshot ID
-	SeqNum     uint64               // index sequence number at snapshot time
+	ID         uint64
+	SeqNum     uint64
 	CreatedAt  time.Time
 	EntryPoint string
 	MaxLevel   int
-	EfSearch   int                                // search beam width (0 uses default)
-	Layers     []LayerSnapshot                    // frozen layer state (copied)
-	Vectors    map[string][]float32               // frozen vector cache
-	Magnitudes map[string]float64                 // frozen magnitudes
-	Domains    map[string]vectorgraphdb.Domain    // frozen domain metadata
-	NodeTypes  map[string]vectorgraphdb.NodeType  // frozen node type metadata
-	Checksum   uint32                             // W12.37: CRC32 checksum for integrity
-	validated  bool                               // W12.37: whether checksum has been validated
-	readers    atomic.Int32                       // active reader count
+	EfSearch   int
+	Layers     []LayerSnapshot
+	Vectors    map[string][]float32
+	Magnitudes map[string]float64
+	Domains    map[string]vectorgraphdb.Domain
+	NodeTypes  map[string]vectorgraphdb.NodeType
+	Checksum   uint32
+	validated  bool
+	readers    atomic.Int32
 }
 
-// NewLayerSnapshot creates a deep copy of a layer's nodes.
-func NewLayerSnapshot(l *layer) LayerSnapshot {
+func NewLayerSnapshot(l *layer, idToString []string) LayerSnapshot {
 	if l == nil {
 		return LayerSnapshot{Nodes: make(map[string][]string)}
 	}
-	return LayerSnapshot{Nodes: copyLayerNodes(l)}
+	return LayerSnapshot{Nodes: copyLayerNodes(l, idToString)}
 }
 
-// copyLayerNodes extracts and deep copies all nodes from a layer.
-func copyLayerNodes(l *layer) map[string][]string {
+func copyLayerNodes(l *layer, idToString []string) map[string][]string {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
 	nodes := make(map[string][]string, len(l.nodes))
 	for id, node := range l.nodes {
-		// Get neighbor IDs from ConcurrentNeighborSet and copy
+		stringID := idToString[id]
 		neighborIDs := node.neighbors.GetIDs()
-		nodes[id] = copyStringSlice(neighborIDs)
+		stringNeighbors := make([]string, len(neighborIDs))
+		for i, nid := range neighborIDs {
+			stringNeighbors[i] = idToString[nid]
+		}
+		nodes[stringID] = stringNeighbors
 	}
 	return nodes
 }
 
-// copyStringSlice creates a deep copy of a string slice.
 func copyStringSlice(src []string) []string {
 	if src == nil {
 		return nil
@@ -80,8 +72,6 @@ func copyStringSlice(src []string) []string {
 	return dst
 }
 
-// GetNeighbors returns the neighbors for a node ID.
-// Returns nil if the node does not exist.
 func (ls *LayerSnapshot) GetNeighbors(id string) []string {
 	neighbors, exists := ls.Nodes[id]
 	if !exists {
@@ -90,20 +80,15 @@ func (ls *LayerSnapshot) GetNeighbors(id string) []string {
 	return copyStringSlice(neighbors)
 }
 
-// HasNode checks if a node exists in the layer snapshot.
 func (ls *LayerSnapshot) HasNode(id string) bool {
 	_, exists := ls.Nodes[id]
 	return exists
 }
 
-// NodeCount returns the number of nodes in the layer snapshot.
 func (ls *LayerSnapshot) NodeCount() int {
 	return len(ls.Nodes)
 }
 
-// NewHNSWSnapshot creates a new snapshot from an Index.
-// W12.37: Computes and stores checksum for data integrity validation.
-// The caller must hold at least a read lock on the index.
 func NewHNSWSnapshot(idx *Index, seqNum uint64) *HNSWSnapshot {
 	if idx == nil {
 		snap := &HNSWSnapshot{
@@ -115,7 +100,7 @@ func NewHNSWSnapshot(idx *Index, seqNum uint64) *HNSWSnapshot {
 			Magnitudes: make(map[string]float64),
 			Domains:    make(map[string]vectorgraphdb.Domain),
 			NodeTypes:  make(map[string]vectorgraphdb.NodeType),
-			validated:  true, // Empty snapshot is trivially valid
+			validated:  true,
 		}
 		snap.Checksum = snap.computeChecksum()
 		return snap
@@ -123,46 +108,42 @@ func NewHNSWSnapshot(idx *Index, seqNum uint64) *HNSWSnapshot {
 	return createSnapshotFromIndex(idx, seqNum)
 }
 
-// createSnapshotFromIndex builds a snapshot from index data.
-// W12.37: Computes checksum after populating all data fields.
 func createSnapshotFromIndex(idx *Index, seqNum uint64) *HNSWSnapshot {
+	entryPointStr := ""
+	if idx.entryPoint != invalidNodeID {
+		entryPointStr = idx.idToString[idx.entryPoint]
+	}
+
 	snap := &HNSWSnapshot{
 		SeqNum:     seqNum,
 		CreatedAt:  time.Now(),
-		EntryPoint: idx.entryPoint,
+		EntryPoint: entryPointStr,
 		MaxLevel:   idx.maxLevel,
 		EfSearch:   idx.efSearch,
-		Layers:     copyLayers(idx.layers),
-		Vectors:    copyVectors(idx.vectors),
-		Magnitudes: copyMagnitudes(idx.magnitudes),
-		Domains:    copyDomains(idx.domains),
-		NodeTypes:  copyNodeTypes(idx.nodeTypes),
-		validated:  true, // Freshly created snapshot is valid
+		Layers:     copyLayers(idx.layers, idx.idToString),
+		Vectors:    idx.GetVectors(),
+		Magnitudes: idx.GetMagnitudes(),
+		Domains:    idx.GetDomains(),
+		NodeTypes:  idx.GetNodeTypes(),
+		validated:  true,
 	}
 	snap.Checksum = snap.computeChecksum()
 	return snap
 }
 
-// copyLayers creates deep copies of all layers with batch lock acquisition.
-// W4P.2: Uses batch locking to prevent lock contention and deadlocks.
-// Locks are acquired in consistent order (by index) and released together.
-func copyLayers(layers []*layer) []LayerSnapshot {
+func copyLayers(layers []*layer, idToString []string) []LayerSnapshot {
 	if len(layers) == 0 {
 		return make([]LayerSnapshot, 0)
 	}
-	return copyLayersWithBatchLock(layers)
+	return copyLayersWithBatchLock(layers, idToString)
 }
 
-// copyLayersWithBatchLock acquires all layer locks before copying.
-// This prevents O(n) lock acquisitions and ensures consistent snapshot state.
-func copyLayersWithBatchLock(layers []*layer) []LayerSnapshot {
-	// Acquire all read locks in order (prevents deadlocks)
+func copyLayersWithBatchLock(layers []*layer, idToString []string) []LayerSnapshot {
 	for _, l := range layers {
 		if l != nil {
 			l.mu.RLock()
 		}
 	}
-	// Defer release of all locks in reverse order
 	defer func() {
 		for i := len(layers) - 1; i >= 0; i-- {
 			if layers[i] != nil {
@@ -171,29 +152,30 @@ func copyLayersWithBatchLock(layers []*layer) []LayerSnapshot {
 		}
 	}()
 
-	// Copy all layer data while holding all locks
 	snapshots := make([]LayerSnapshot, len(layers))
 	for i, l := range layers {
-		snapshots[i] = copyLayerNodesUnlocked(l)
+		snapshots[i] = copyLayerNodesUnlocked(l, idToString)
 	}
 	return snapshots
 }
 
-// copyLayerNodesUnlocked extracts nodes without acquiring locks.
-// Caller must hold the layer's read lock.
-func copyLayerNodesUnlocked(l *layer) LayerSnapshot {
+func copyLayerNodesUnlocked(l *layer, idToString []string) LayerSnapshot {
 	if l == nil {
 		return LayerSnapshot{Nodes: make(map[string][]string)}
 	}
 	nodes := make(map[string][]string, len(l.nodes))
 	for id, node := range l.nodes {
+		stringID := idToString[id]
 		neighborIDs := node.neighbors.GetIDs()
-		nodes[id] = copyStringSlice(neighborIDs)
+		stringNeighbors := make([]string, len(neighborIDs))
+		for i, nid := range neighborIDs {
+			stringNeighbors[i] = idToString[nid]
+		}
+		nodes[stringID] = stringNeighbors
 	}
 	return LayerSnapshot{Nodes: nodes}
 }
 
-// copyVectors creates a deep copy of the vectors map.
 func copyVectors(vectors map[string][]float32) map[string][]float32 {
 	result := make(map[string][]float32, len(vectors))
 	for id, vec := range vectors {
@@ -202,7 +184,6 @@ func copyVectors(vectors map[string][]float32) map[string][]float32 {
 	return result
 }
 
-// copyFloat32Slice creates a deep copy of a float32 slice.
 func copyFloat32Slice(src []float32) []float32 {
 	if src == nil {
 		return nil
@@ -212,7 +193,6 @@ func copyFloat32Slice(src []float32) []float32 {
 	return dst
 }
 
-// copyMagnitudes creates a copy of the magnitudes map.
 func copyMagnitudes(magnitudes map[string]float64) map[string]float64 {
 	result := make(map[string]float64, len(magnitudes))
 	for id, mag := range magnitudes {
@@ -221,7 +201,6 @@ func copyMagnitudes(magnitudes map[string]float64) map[string]float64 {
 	return result
 }
 
-// copyDomains creates a copy of the domains map.
 func copyDomains(domains map[string]vectorgraphdb.Domain) map[string]vectorgraphdb.Domain {
 	result := make(map[string]vectorgraphdb.Domain, len(domains))
 	for id, domain := range domains {
@@ -230,7 +209,6 @@ func copyDomains(domains map[string]vectorgraphdb.Domain) map[string]vectorgraph
 	return result
 }
 
-// copyNodeTypes creates a copy of the node types map.
 func copyNodeTypes(nodeTypes map[string]vectorgraphdb.NodeType) map[string]vectorgraphdb.NodeType {
 	result := make(map[string]vectorgraphdb.NodeType, len(nodeTypes))
 	for id, nodeType := range nodeTypes {
@@ -239,16 +217,10 @@ func copyNodeTypes(nodeTypes map[string]vectorgraphdb.NodeType) map[string]vecto
 	return result
 }
 
-// AcquireReader increments the reader count.
-// Returns the new reader count.
 func (s *HNSWSnapshot) AcquireReader() int32 {
 	return s.readers.Add(1)
 }
 
-// ReleaseReader decrements the reader count if positive.
-// Returns the new reader count and true if successful, or current count
-// and false if already at zero (over-release attempt).
-// Uses compare-and-swap for thread-safe underflow protection.
 func (s *HNSWSnapshot) ReleaseReader() (int32, bool) {
 	for {
 		current := s.readers.Load()
@@ -258,27 +230,21 @@ func (s *HNSWSnapshot) ReleaseReader() (int32, bool) {
 		if s.readers.CompareAndSwap(current, current-1) {
 			return current - 1, true
 		}
-		// CAS failed, another goroutine modified the counter, retry
 	}
 }
 
-// ReaderCount returns the current number of active readers.
 func (s *HNSWSnapshot) ReaderCount() int32 {
 	return s.readers.Load()
 }
 
-// IsEmpty returns true if the snapshot contains no vectors.
 func (s *HNSWSnapshot) IsEmpty() bool {
 	return len(s.Vectors) == 0
 }
 
-// Size returns the number of vectors in the snapshot.
 func (s *HNSWSnapshot) Size() int {
 	return len(s.Vectors)
 }
 
-// GetVector returns a copy of the vector for the given ID.
-// Returns nil if the vector does not exist.
 func (s *HNSWSnapshot) GetVector(id string) []float32 {
 	vec, exists := s.Vectors[id]
 	if !exists {
@@ -287,15 +253,11 @@ func (s *HNSWSnapshot) GetVector(id string) []float32 {
 	return copyFloat32Slice(vec)
 }
 
-// GetMagnitude returns the magnitude for the given ID.
-// Returns 0 and false if the ID does not exist.
 func (s *HNSWSnapshot) GetMagnitude(id string) (float64, bool) {
 	mag, exists := s.Magnitudes[id]
 	return mag, exists
 }
 
-// GetLayer returns the layer snapshot at the given level.
-// Returns nil if the level is out of bounds.
 func (s *HNSWSnapshot) GetLayer(level int) *LayerSnapshot {
 	if level < 0 || level >= len(s.Layers) {
 		return nil
@@ -303,47 +265,32 @@ func (s *HNSWSnapshot) GetLayer(level int) *LayerSnapshot {
 	return &s.Layers[level]
 }
 
-// LayerCount returns the number of layers in the snapshot.
 func (s *HNSWSnapshot) LayerCount() int {
 	return len(s.Layers)
 }
 
-// ContainsVector checks if a vector with the given ID exists.
 func (s *HNSWSnapshot) ContainsVector(id string) bool {
 	_, exists := s.Vectors[id]
 	return exists
 }
 
-// computeChecksum calculates a CRC32 checksum over the snapshot's data.
-// W12.37: Uses deterministic ordering for reproducible checksums.
 func (s *HNSWSnapshot) computeChecksum() uint32 {
 	h := crc32.NewIEEE()
 
-	// Write fixed fields
 	writeUint64(h, s.SeqNum)
 	writeString(h, s.EntryPoint)
 	writeInt(h, s.MaxLevel)
 	writeInt(h, s.EfSearch)
 
-	// Write vectors in sorted order for determinism
 	s.checksumVectors(h)
-
-	// Write magnitudes in sorted order
 	s.checksumMagnitudes(h)
-
-	// Write layers
 	s.checksumLayers(h)
-
-	// Write domains in sorted order
 	s.checksumDomains(h)
-
-	// Write node types in sorted order
 	s.checksumNodeTypes(h)
 
 	return h.Sum32()
 }
 
-// checksumVectors adds vector data to the checksum in deterministic order.
 func (s *HNSWSnapshot) checksumVectors(h hash.Hash32) {
 	ids := sortedKeys(s.Vectors)
 	for _, id := range ids {
@@ -355,7 +302,6 @@ func (s *HNSWSnapshot) checksumVectors(h hash.Hash32) {
 	}
 }
 
-// checksumMagnitudes adds magnitude data to the checksum in deterministic order.
 func (s *HNSWSnapshot) checksumMagnitudes(h hash.Hash32) {
 	ids := sortedMagnitudeKeys(s.Magnitudes)
 	for _, id := range ids {
@@ -364,7 +310,6 @@ func (s *HNSWSnapshot) checksumMagnitudes(h hash.Hash32) {
 	}
 }
 
-// checksumLayers adds layer data to the checksum.
 func (s *HNSWSnapshot) checksumLayers(h hash.Hash32) {
 	writeInt(h, len(s.Layers))
 	for i, layer := range s.Layers {
@@ -373,7 +318,6 @@ func (s *HNSWSnapshot) checksumLayers(h hash.Hash32) {
 	}
 }
 
-// checksumLayerSnapshot adds a single layer's data to the checksum.
 func checksumLayerSnapshot(h hash.Hash32, layer *LayerSnapshot) {
 	ids := sortedLayerKeys(layer.Nodes)
 	for _, id := range ids {
@@ -386,7 +330,6 @@ func checksumLayerSnapshot(h hash.Hash32, layer *LayerSnapshot) {
 	}
 }
 
-// checksumDomains adds domain data to the checksum in deterministic order.
 func (s *HNSWSnapshot) checksumDomains(h hash.Hash32) {
 	ids := sortedDomainKeys(s.Domains)
 	for _, id := range ids {
@@ -395,7 +338,6 @@ func (s *HNSWSnapshot) checksumDomains(h hash.Hash32) {
 	}
 }
 
-// checksumNodeTypes adds node type data to the checksum in deterministic order.
 func (s *HNSWSnapshot) checksumNodeTypes(h hash.Hash32) {
 	ids := sortedNodeTypeKeys(s.NodeTypes)
 	for _, id := range ids {
@@ -404,8 +346,6 @@ func (s *HNSWSnapshot) checksumNodeTypes(h hash.Hash32) {
 	}
 }
 
-// ValidateChecksum verifies the snapshot data integrity.
-// W12.37: Returns nil if the checksum matches, ErrSnapshotChecksumMismatch otherwise.
 func (s *HNSWSnapshot) ValidateChecksum() error {
 	computed := s.computeChecksum()
 	if computed != s.Checksum {
@@ -415,64 +355,48 @@ func (s *HNSWSnapshot) ValidateChecksum() error {
 	return nil
 }
 
-// IsValidated returns whether the snapshot has passed checksum validation.
-// W12.37: Freshly created snapshots are automatically validated.
 func (s *HNSWSnapshot) IsValidated() bool {
 	return s.validated
 }
 
-// GetChecksum returns the stored checksum value.
 func (s *HNSWSnapshot) GetChecksum() uint32 {
 	return s.Checksum
 }
 
-// Helper functions for deterministic checksum computation.
-
-// writeUint64 writes a uint64 to the hash in little-endian order.
 func writeUint64(h hash.Hash32, v uint64) {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], v)
 	h.Write(buf[:])
 }
 
-// writeInt writes an int as int64 to the hash in little-endian order.
 func writeInt(h hash.Hash32, v int) {
 	writeUint64(h, uint64(v))
 }
 
-// writeFloat32 writes a float32 to the hash in little-endian order.
 func writeFloat32(h hash.Hash32, v float32) {
 	var buf [4]byte
 	binary.LittleEndian.PutUint32(buf[:], floatBits(v))
 	h.Write(buf[:])
 }
 
-// writeFloat64 writes a float64 to the hash in little-endian order.
 func writeFloat64(h hash.Hash32, v float64) {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], doubleBits(v))
 	h.Write(buf[:])
 }
 
-// writeString writes a string to the hash with length prefix.
 func writeString(h hash.Hash32, s string) {
 	writeInt(h, len(s))
 	h.Write([]byte(s))
 }
 
-// floatBits converts float32 to uint32 bits using math package.
-// W12.37: Uses math.Float32bits for type-safe bit conversion.
 func floatBits(f float32) uint32 {
 	return math.Float32bits(f)
 }
 
-// doubleBits converts float64 to uint64 bits using math package.
-// W12.37: Uses math.Float64bits for type-safe bit conversion.
 func doubleBits(f float64) uint64 {
 	return math.Float64bits(f)
 }
-
-// Sorted key extraction functions for deterministic iteration.
 
 func sortedKeys(m map[string][]float32) []string {
 	keys := make([]string, 0, len(m))

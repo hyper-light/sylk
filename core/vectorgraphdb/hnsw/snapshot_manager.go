@@ -21,8 +21,8 @@ const (
 type HNSWSnapshotManager struct {
 	index         *Index
 	currentSeqNum atomic.Uint64
-	snapshotID    atomic.Uint64      // unique ID for each snapshot
-	snapshots     sync.Map           // snapshotID → *HNSWSnapshot
+	snapshotID    atomic.Uint64 // unique ID for each snapshot
+	snapshots     sync.Map      // snapshotID → *HNSWSnapshot
 	gcInterval    time.Duration
 	retention     time.Duration
 	mu            sync.RWMutex
@@ -100,8 +100,9 @@ func (sm *HNSWSnapshotManager) buildSnapshot(id, seqNum uint64) *HNSWSnapshot {
 // copyAllLayers creates deep copies of all layers.
 func (sm *HNSWSnapshotManager) copyAllLayers(layers []*layer) []LayerSnapshot {
 	snapshots := make([]LayerSnapshot, len(layers))
+	idToString := sm.index.idToString
 	for i, l := range layers {
-		snapshots[i] = NewLayerSnapshot(l)
+		snapshots[i] = NewLayerSnapshot(l, idToString)
 	}
 	return snapshots
 }

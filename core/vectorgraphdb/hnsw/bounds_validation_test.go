@@ -68,21 +68,23 @@ func TestW12_11_IsValidNeighbor(t *testing.T) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
+	existingID := idx.stringToID["existing"]
+
 	tests := []struct {
 		name       string
-		neighborID string
+		neighborID uint32
 		want       bool
 	}{
-		{"existing_neighbor", "existing", true},
-		{"nonexistent_neighbor", "nonexistent", false},
-		{"empty_neighbor", "", false},
+		{"existing_neighbor", existingID, true},
+		{"nonexistent_neighbor", 99999, false},
+		{"invalid_node_id", invalidNodeID, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := idx.isValidNeighbor(tt.neighborID)
 			if got != tt.want {
-				t.Errorf("W12.11: isValidNeighbor(%q) = %v, want %v", tt.neighborID, got, tt.want)
+				t.Errorf("W12.11: isValidNeighbor(%d) = %v, want %v", tt.neighborID, got, tt.want)
 			}
 		})
 	}
@@ -97,12 +99,14 @@ func TestW12_11_GreedySearchLayerInvalidLevel(t *testing.T) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
+	internalID := idx.stringToID["node1"]
+
 	// Should not panic with invalid level
 	query := []float32{1, 0, 0, 0}
-	ep, dist := idx.greedySearchLayer(query, Magnitude(query), "node1", 0.5, -1)
+	ep, dist := idx.greedySearchLayer(query, Magnitude(query), internalID, 0.5, -1)
 
 	// Should return unchanged entry point
-	if ep != "node1" {
+	if ep != internalID {
 		t.Errorf("W12.11: greedySearchLayer with invalid level changed entry point")
 	}
 	if dist != 0.5 {
@@ -110,8 +114,8 @@ func TestW12_11_GreedySearchLayerInvalidLevel(t *testing.T) {
 	}
 
 	// Test with level beyond bounds
-	ep, dist = idx.greedySearchLayer(query, Magnitude(query), "node1", 0.5, 1000)
-	if ep != "node1" {
+	ep, dist = idx.greedySearchLayer(query, Magnitude(query), internalID, 0.5, 1000)
+	if ep != internalID {
 		t.Errorf("W12.11: greedySearchLayer with out-of-bounds level changed entry point")
 	}
 }
@@ -125,16 +129,17 @@ func TestW12_11_SearchLayerInvalidLevel(t *testing.T) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
+	internalID := idx.stringToID["node1"]
 	query := []float32{1, 0, 0, 0}
 
 	// Should return nil for invalid level
-	results := idx.searchLayer(query, Magnitude(query), "node1", 10, -1)
+	results := idx.searchLayer(query, Magnitude(query), internalID, 10, -1)
 	if results != nil {
 		t.Errorf("W12.11: searchLayer with invalid level should return nil")
 	}
 
 	// Test with level beyond bounds
-	results = idx.searchLayer(query, Magnitude(query), "node1", 10, 1000)
+	results = idx.searchLayer(query, Magnitude(query), internalID, 10, 1000)
 	if results != nil {
 		t.Errorf("W12.11: searchLayer with out-of-bounds level should return nil")
 	}
@@ -150,14 +155,19 @@ func TestW12_11_ConnectNodeInvalidNeighbor(t *testing.T) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	// Create search results with a mix of valid and invalid neighbors
-	neighbors := []SearchResult{
-		{ID: "node1", Similarity: 0.9},
-		{ID: "nonexistent", Similarity: 0.8},
+	node1ID := idx.stringToID["node1"]
+	// Use a new internal ID that doesn't exist in stringToID
+	newNodeID := idx.nextID
+	idx.nextID++
+
+	// Create search candidates with a mix of valid and invalid neighbors
+	neighbors := []searchCandidate{
+		{id: node1ID, distance: 0.1},
+		{id: 99999, distance: 0.2}, // nonexistent internal ID
 	}
 
 	// Should not panic and should skip invalid neighbor
-	idx.connectNode("new_node", neighbors, 0)
+	idx.connectNode(newNodeID, neighbors, 0)
 }
 
 // TestW12_11_InsertWithCorruptedLayerState verifies insertion handles corrupted state.
@@ -256,7 +266,7 @@ func TestW12_11_EmptyIndexBoundsCheck(t *testing.T) {
 	}
 
 	// All neighbors should be invalid on empty index
-	if idx.isValidNeighbor("any") {
+	if idx.isValidNeighbor(1) {
 		t.Error("W12.11: Empty index should have no valid neighbors")
 	}
 }

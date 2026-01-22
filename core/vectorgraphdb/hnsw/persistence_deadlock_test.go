@@ -128,8 +128,8 @@ func TestW12_10_CollectDistanceUpdates(t *testing.T) {
 		if update.neighbors == nil {
 			t.Error("W12.10: update has nil neighbors")
 		}
-		if update.neighborID == "" {
-			t.Error("W12.10: update has empty neighborID")
+		if update.neighborID == invalidNodeID {
+			t.Error("W12.10: update has invalid neighborID")
 		}
 		if update.distance < 0 || update.distance > 2 {
 			t.Errorf("W12.10: invalid distance %v", update.distance)
@@ -155,15 +155,20 @@ func TestW12_10_ComputeNodeDistanceUpdates(t *testing.T) {
 		t.Skip("no layers created")
 	}
 
+	internalID, idExists := idx.stringToID["node1"]
+	if !idExists {
+		t.Skip("node1 not in stringToID map")
+	}
+
 	idx.layers[0].mu.RLock()
-	node, exists := idx.layers[0].nodes["node1"]
+	node, exists := idx.layers[0].nodes[internalID]
 	idx.layers[0].mu.RUnlock()
 
 	if !exists {
 		t.Skip("node1 not in layer 0")
 	}
 
-	updates := idx.computeNodeDistanceUpdates("node1", node)
+	updates := idx.computeNodeDistanceUpdates(internalID, node)
 
 	// Check that updates are valid
 	for _, update := range updates {
@@ -183,7 +188,8 @@ func TestW12_10_MissingVectorHandling(t *testing.T) {
 
 	idx.mu.Lock()
 	// Manually remove the vector to simulate corruption
-	delete(idx.vectors, "node1")
+	internalID := idx.stringToID["node1"]
+	delete(idx.vectors, internalID)
 
 	// Should not panic
 	idx.recomputeEdgeDistances()

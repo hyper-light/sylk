@@ -9,6 +9,43 @@ import (
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
 
+// snapshotCandidate is a search candidate using string IDs for snapshot compatibility.
+// Snapshots store all IDs as strings for persistence/external compatibility.
+type snapshotCandidate struct {
+	id       string
+	distance float64
+}
+
+// snapshotMinHeap: min-heap by distance (closest first) for candidate expansion.
+type snapshotMinHeap []snapshotCandidate
+
+func (h snapshotMinHeap) Len() int           { return len(h) }
+func (h snapshotMinHeap) Less(i, j int) bool { return h[i].distance < h[j].distance }
+func (h snapshotMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *snapshotMinHeap) Push(x any)        { *h = append(*h, x.(snapshotCandidate)) }
+func (h *snapshotMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// snapshotMaxHeap: max-heap by distance (furthest first) for result eviction.
+type snapshotMaxHeap []snapshotCandidate
+
+func (h snapshotMaxHeap) Len() int           { return len(h) }
+func (h snapshotMaxHeap) Less(i, j int) bool { return h[i].distance > h[j].distance }
+func (h snapshotMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *snapshotMaxHeap) Push(x any)        { *h = append(*h, x.(snapshotCandidate)) }
+func (h *snapshotMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 // Search performs k-nearest neighbor search on the frozen snapshot.
 // The snapshot is immutable, so no locks are required.
 // Returns nil if the snapshot is empty, k <= 0, or query is invalid.
@@ -146,14 +183,14 @@ func (snap *HNSWSnapshot) searchLayer0(query []float32, queryMag float64, entry 
 
 	entryDist := snap.distance(query, queryMag, entry)
 
-	candidates := &candidateMinHeap{{id: entry, distance: entryDist}}
+	candidates := &snapshotMinHeap{{id: entry, distance: entryDist}}
 	heap.Init(candidates)
 
-	results := &candidateMaxHeap{{id: entry, distance: entryDist}}
+	results := &snapshotMaxHeap{{id: entry, distance: entryDist}}
 	heap.Init(results)
 
 	for candidates.Len() > 0 {
-		closest := heap.Pop(candidates).(searchCandidate)
+		closest := heap.Pop(candidates).(snapshotCandidate)
 		furthest := (*results)[0]
 
 		if closest.distance > furthest.distance {
@@ -174,8 +211,8 @@ func (snap *HNSWSnapshot) searchLayer0(query []float32, queryMag float64, entry 
 
 			furthest = (*results)[0]
 			if neighborDist < furthest.distance || results.Len() < ef {
-				heap.Push(candidates, searchCandidate{id: neighborID, distance: neighborDist})
-				heap.Push(results, searchCandidate{id: neighborID, distance: neighborDist})
+				heap.Push(candidates, snapshotCandidate{id: neighborID, distance: neighborDist})
+				heap.Push(results, snapshotCandidate{id: neighborID, distance: neighborDist})
 
 				if results.Len() > ef {
 					heap.Pop(results)
@@ -186,7 +223,7 @@ func (snap *HNSWSnapshot) searchLayer0(query []float32, queryMag float64, entry 
 
 	output := make([]SearchResult, results.Len())
 	for i := results.Len() - 1; i >= 0; i-- {
-		c := heap.Pop(results).(searchCandidate)
+		c := heap.Pop(results).(snapshotCandidate)
 		output[i] = SearchResult{
 			ID:         c.id,
 			Similarity: 1.0 - c.distance,

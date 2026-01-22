@@ -20,10 +20,11 @@ func TestNewNeighborSetWithCapacity(t *testing.T) {
 }
 
 func TestNeighborSet_Add(t *testing.T) {
+	const node1ID uint32 = 1
 	ns := NewNeighborSet()
 
-	ns.Add("node1", 0.5)
-	if !ns.Contains("node1") {
+	ns.Add(node1ID, 0.5)
+	if !ns.Contains(node1ID) {
 		t.Error("expected node1 to be in set")
 	}
 	if ns.Size() != 1 {
@@ -31,11 +32,11 @@ func TestNeighborSet_Add(t *testing.T) {
 	}
 
 	// Update existing
-	ns.Add("node1", 0.3)
+	ns.Add(node1ID, 0.3)
 	if ns.Size() != 1 {
 		t.Errorf("expected size 1 after update, got %d", ns.Size())
 	}
-	dist, ok := ns.GetDistance("node1")
+	dist, ok := ns.GetDistance(node1ID)
 	if !ok {
 		t.Error("expected node1 to exist")
 	}
@@ -45,15 +46,20 @@ func TestNeighborSet_Add(t *testing.T) {
 }
 
 func TestNeighborSet_Remove(t *testing.T) {
+	const (
+		node1ID    uint32 = 1
+		node2ID    uint32 = 2
+		nonexistID uint32 = 999
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.5)
-	ns.Add("node2", 0.6)
+	ns.Add(node1ID, 0.5)
+	ns.Add(node2ID, 0.6)
 
-	ns.Remove("node1")
-	if ns.Contains("node1") {
+	ns.Remove(node1ID)
+	if ns.Contains(node1ID) {
 		t.Error("expected node1 to be removed")
 	}
-	if !ns.Contains("node2") {
+	if !ns.Contains(node2ID) {
 		t.Error("expected node2 to still exist")
 	}
 	if ns.Size() != 1 {
@@ -61,29 +67,37 @@ func TestNeighborSet_Remove(t *testing.T) {
 	}
 
 	// Remove non-existent - should not panic
-	ns.Remove("nonexistent")
+	ns.Remove(nonexistID)
 	if ns.Size() != 1 {
 		t.Errorf("expected size 1 after removing non-existent, got %d", ns.Size())
 	}
 }
 
 func TestNeighborSet_Contains(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.5)
+	ns.Add(node1ID, 0.5)
 
-	if !ns.Contains("node1") {
+	if !ns.Contains(node1ID) {
 		t.Error("expected node1 to be contained")
 	}
-	if ns.Contains("node2") {
+	if ns.Contains(node2ID) {
 		t.Error("expected node2 to not be contained")
 	}
 }
 
 func TestNeighborSet_GetDistance(t *testing.T) {
+	const (
+		node1ID    uint32 = 1
+		nonexistID uint32 = 999
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.5)
+	ns.Add(node1ID, 0.5)
 
-	dist, ok := ns.GetDistance("node1")
+	dist, ok := ns.GetDistance(node1ID)
 	if !ok {
 		t.Error("expected node1 to exist")
 	}
@@ -91,17 +105,22 @@ func TestNeighborSet_GetDistance(t *testing.T) {
 		t.Errorf("expected distance 0.5, got %f", dist)
 	}
 
-	_, ok = ns.GetDistance("nonexistent")
+	_, ok = ns.GetDistance(nonexistID)
 	if ok {
 		t.Error("expected nonexistent to not exist")
 	}
 }
 
 func TestNeighborSet_GetSortedNeighbors(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node3", 0.8)
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
+	ns.Add(node3ID, 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
 
 	sorted := ns.GetSortedNeighbors()
 	if len(sorted) != 3 {
@@ -109,22 +128,27 @@ func TestNeighborSet_GetSortedNeighbors(t *testing.T) {
 	}
 
 	// Should be sorted by distance ascending
-	if sorted[0].ID != "node1" || sorted[0].Distance != 0.2 {
-		t.Errorf("expected node1 with 0.2 first, got %s with %f", sorted[0].ID, sorted[0].Distance)
+	if sorted[0].ID != node1ID || sorted[0].Distance != 0.2 {
+		t.Errorf("expected node1 with 0.2 first, got %d with %f", sorted[0].ID, sorted[0].Distance)
 	}
-	if sorted[1].ID != "node2" || sorted[1].Distance != 0.5 {
-		t.Errorf("expected node2 with 0.5 second, got %s with %f", sorted[1].ID, sorted[1].Distance)
+	if sorted[1].ID != node2ID || sorted[1].Distance != 0.5 {
+		t.Errorf("expected node2 with 0.5 second, got %d with %f", sorted[1].ID, sorted[1].Distance)
 	}
-	if sorted[2].ID != "node3" || sorted[2].Distance != 0.8 {
-		t.Errorf("expected node3 with 0.8 third, got %s with %f", sorted[2].ID, sorted[2].Distance)
+	if sorted[2].ID != node3ID || sorted[2].Distance != 0.8 {
+		t.Errorf("expected node3 with 0.8 third, got %d with %f", sorted[2].ID, sorted[2].Distance)
 	}
 }
 
 func TestNeighborSet_GetSortedNeighborsDescending(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node3", 0.8)
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
+	ns.Add(node3ID, 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
 
 	sorted := ns.GetSortedNeighborsDescending()
 	if len(sorted) != 3 {
@@ -132,32 +156,39 @@ func TestNeighborSet_GetSortedNeighborsDescending(t *testing.T) {
 	}
 
 	// Should be sorted by distance descending
-	if sorted[0].ID != "node3" || sorted[0].Distance != 0.8 {
-		t.Errorf("expected node3 with 0.8 first, got %s with %f", sorted[0].ID, sorted[0].Distance)
+	if sorted[0].ID != node3ID || sorted[0].Distance != 0.8 {
+		t.Errorf("expected node3 with 0.8 first, got %d with %f", sorted[0].ID, sorted[0].Distance)
 	}
-	if sorted[1].ID != "node2" || sorted[1].Distance != 0.5 {
-		t.Errorf("expected node2 with 0.5 second, got %s with %f", sorted[1].ID, sorted[1].Distance)
+	if sorted[1].ID != node2ID || sorted[1].Distance != 0.5 {
+		t.Errorf("expected node2 with 0.5 second, got %d with %f", sorted[1].ID, sorted[1].Distance)
 	}
-	if sorted[2].ID != "node1" || sorted[2].Distance != 0.2 {
-		t.Errorf("expected node1 with 0.2 third, got %s with %f", sorted[2].ID, sorted[2].Distance)
+	if sorted[2].ID != node1ID || sorted[2].Distance != 0.2 {
+		t.Errorf("expected node1 with 0.2 third, got %d with %f", sorted[2].ID, sorted[2].Distance)
 	}
 }
 
 func TestNeighborSet_GetTopK(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+		node4ID uint32 = 4
+		node5ID uint32 = 5
+	)
 	ns := NewNeighborSet()
-	ns.Add("node3", 0.8)
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
-	ns.Add("node4", 0.9)
-	ns.Add("node5", 0.1)
+	ns.Add(node3ID, 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
+	ns.Add(node4ID, 0.9)
+	ns.Add(node5ID, 0.1)
 
 	t.Run("k less than size", func(t *testing.T) {
 		topK := ns.GetTopK(3)
 		if len(topK) != 3 {
 			t.Errorf("expected 3 neighbors, got %d", len(topK))
 		}
-		if topK[0].ID != "node5" || topK[0].Distance != 0.1 {
-			t.Errorf("expected node5 first, got %s", topK[0].ID)
+		if topK[0].ID != node5ID || topK[0].Distance != 0.1 {
+			t.Errorf("expected node5 first, got %d", topK[0].ID)
 		}
 	})
 
@@ -170,84 +201,107 @@ func TestNeighborSet_GetTopK(t *testing.T) {
 }
 
 func TestNeighborSet_GetIDs(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
-	ns.Add("node3", 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
+	ns.Add(node3ID, 0.8)
 
 	ids := ns.GetIDs()
 	if len(ids) != 3 {
 		t.Errorf("expected 3 IDs, got %d", len(ids))
 	}
 
-	idSet := make(map[string]bool)
+	idSet := make(map[uint32]bool)
 	for _, id := range ids {
 		idSet[id] = true
 	}
-	if !idSet["node1"] || !idSet["node2"] || !idSet["node3"] {
+	if !idSet[node1ID] || !idSet[node2ID] || !idSet[node3ID] {
 		t.Error("expected all node IDs to be present")
 	}
 }
 
 func TestNeighborSet_Size(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	ns := NewNeighborSet()
 	if ns.Size() != 0 {
 		t.Errorf("expected size 0, got %d", ns.Size())
 	}
 
-	ns.Add("node1", 0.5)
+	ns.Add(node1ID, 0.5)
 	if ns.Size() != 1 {
 		t.Errorf("expected size 1, got %d", ns.Size())
 	}
 
-	ns.Add("node2", 0.6)
+	ns.Add(node2ID, 0.6)
 	if ns.Size() != 2 {
 		t.Errorf("expected size 2, got %d", ns.Size())
 	}
 }
 
 func TestNeighborSet_Clear(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.5)
-	ns.Add("node2", 0.6)
+	ns.Add(node1ID, 0.5)
+	ns.Add(node2ID, 0.6)
 
 	ns.Clear()
 	if ns.Size() != 0 {
 		t.Errorf("expected size 0 after clear, got %d", ns.Size())
 	}
-	if ns.Contains("node1") {
+	if ns.Contains(node1ID) {
 		t.Error("expected node1 to be cleared")
 	}
 }
 
 func TestNeighborSet_Clone(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.5)
-	ns.Add("node2", 0.6)
+	ns.Add(node1ID, 0.5)
+	ns.Add(node2ID, 0.6)
 
 	clone := ns.Clone()
 	if clone.Size() != 2 {
 		t.Errorf("expected clone size 2, got %d", clone.Size())
 	}
-	if !clone.Contains("node1") || !clone.Contains("node2") {
+	if !clone.Contains(node1ID) || !clone.Contains(node2ID) {
 		t.Error("expected clone to contain all nodes")
 	}
 
 	// Modify original
-	ns.Add("node3", 0.7)
-	if clone.Contains("node3") {
+	ns.Add(node3ID, 0.7)
+	if clone.Contains(node3ID) {
 		t.Error("clone should not be affected by original modification")
 	}
 }
 
 func TestNeighborSet_Merge(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns1 := NewNeighborSet()
-	ns1.Add("node1", 0.5)
-	ns1.Add("node2", 0.6)
+	ns1.Add(node1ID, 0.5)
+	ns1.Add(node2ID, 0.6)
 
 	ns2 := NewNeighborSet()
-	ns2.Add("node2", 0.3) // Different distance
-	ns2.Add("node3", 0.7)
+	ns2.Add(node2ID, 0.3) // Different distance
+	ns2.Add(node3ID, 0.7)
 
 	ns1.Merge(ns2)
 	if ns1.Size() != 3 {
@@ -255,19 +309,26 @@ func TestNeighborSet_Merge(t *testing.T) {
 	}
 
 	// Distance should be from ns2
-	dist, _ := ns1.GetDistance("node2")
+	dist, _ := ns1.GetDistance(node2ID)
 	if dist != 0.3 {
 		t.Errorf("expected distance 0.3 from merge, got %f", dist)
 	}
 }
 
 func TestNeighborSet_TrimToSize(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+		node4ID uint32 = 4
+		node5ID uint32 = 5
+	)
 	ns := NewNeighborSet()
-	ns.Add("node3", 0.8)
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
-	ns.Add("node4", 0.9)
-	ns.Add("node5", 0.1)
+	ns.Add(node3ID, 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
+	ns.Add(node4ID, 0.9)
+	ns.Add(node5ID, 0.1)
 
 	ns.TrimToSize(3)
 	if ns.Size() != 3 {
@@ -275,18 +336,22 @@ func TestNeighborSet_TrimToSize(t *testing.T) {
 	}
 
 	// Should keep the 3 closest
-	if !ns.Contains("node5") || !ns.Contains("node1") || !ns.Contains("node2") {
+	if !ns.Contains(node5ID) || !ns.Contains(node1ID) || !ns.Contains(node2ID) {
 		t.Error("expected closest 3 nodes to be kept")
 	}
-	if ns.Contains("node3") || ns.Contains("node4") {
+	if ns.Contains(node3ID) || ns.Contains(node4ID) {
 		t.Error("expected furthest 2 nodes to be removed")
 	}
 }
 
 func TestNeighborSet_TrimToSize_NoOp(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
 
 	ns.TrimToSize(5)
 	if ns.Size() != 2 {
@@ -295,19 +360,23 @@ func TestNeighborSet_TrimToSize_NoOp(t *testing.T) {
 }
 
 func TestNeighborSet_ForEach(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.5)
-	ns.Add("node2", 0.6)
+	ns.Add(node1ID, 0.5)
+	ns.Add(node2ID, 0.6)
 
-	visited := make(map[string]float32)
-	ns.ForEach(func(id string, dist float32) {
+	visited := make(map[uint32]float32)
+	ns.ForEach(func(id uint32, dist float32) {
 		visited[id] = dist
 	})
 
 	if len(visited) != 2 {
 		t.Errorf("expected 2 visited, got %d", len(visited))
 	}
-	if visited["node1"] != 0.5 || visited["node2"] != 0.6 {
+	if visited[node1ID] != 0.5 || visited[node2ID] != 0.6 {
 		t.Error("expected correct distances in ForEach")
 	}
 }
@@ -329,10 +398,11 @@ func TestNewConcurrentNeighborSetWithCapacity(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_Add(t *testing.T) {
+	const node1ID uint32 = 1
 	cns := NewConcurrentNeighborSet()
 
-	cns.Add("node1", 0.5)
-	if !cns.Contains("node1") {
+	cns.Add(node1ID, 0.5)
+	if !cns.Contains(node1ID) {
 		t.Error("expected node1 to be in set")
 	}
 	if cns.Size() != 1 {
@@ -341,50 +411,68 @@ func TestConcurrentNeighborSet_Add(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_Remove(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.5)
-	cns.Add("node2", 0.6)
+	cns.Add(node1ID, 0.5)
+	cns.Add(node2ID, 0.6)
 
-	cns.Remove("node1")
-	if cns.Contains("node1") {
+	cns.Remove(node1ID)
+	if cns.Contains(node1ID) {
 		t.Error("expected node1 to be removed")
 	}
-	if !cns.Contains("node2") {
+	if !cns.Contains(node2ID) {
 		t.Error("expected node2 to still exist")
 	}
 }
 
 func TestConcurrentNeighborSet_Contains(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.5)
+	cns.Add(node1ID, 0.5)
 
-	if !cns.Contains("node1") {
+	if !cns.Contains(node1ID) {
 		t.Error("expected node1 to be contained")
 	}
-	if cns.Contains("node2") {
+	if cns.Contains(node2ID) {
 		t.Error("expected node2 to not be contained")
 	}
 }
 
 func TestConcurrentNeighborSet_GetSortedNeighbors(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node3", 0.8)
-	cns.Add("node1", 0.2)
-	cns.Add("node2", 0.5)
+	cns.Add(node3ID, 0.8)
+	cns.Add(node1ID, 0.2)
+	cns.Add(node2ID, 0.5)
 
 	sorted := cns.GetSortedNeighbors()
 	if len(sorted) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(sorted))
 	}
-	if sorted[0].ID != "node1" {
-		t.Errorf("expected node1 first, got %s", sorted[0].ID)
+	if sorted[0].ID != node1ID {
+		t.Errorf("expected node1 first, got %d", sorted[0].ID)
 	}
 }
 
 func TestConcurrentNeighborSet_Clone(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.5)
-	cns.Add("node2", 0.6)
+	cns.Add(node1ID, 0.5)
+	cns.Add(node2ID, 0.6)
 
 	clone := cns.Clone()
 	if clone.Size() != 2 {
@@ -392,18 +480,22 @@ func TestConcurrentNeighborSet_Clone(t *testing.T) {
 	}
 
 	// Modify original
-	cns.Add("node3", 0.7)
-	if clone.Contains("node3") {
+	cns.Add(node3ID, 0.7)
+	if clone.Contains(node3ID) {
 		t.Error("clone should not be affected by original modification")
 	}
 }
 
 func TestConcurrentNeighborSet_Merge(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns1 := NewConcurrentNeighborSet()
-	cns1.Add("node1", 0.5)
+	cns1.Add(node1ID, 0.5)
 
 	cns2 := NewConcurrentNeighborSet()
-	cns2.Add("node2", 0.6)
+	cns2.Add(node2ID, 0.6)
 
 	cns1.Merge(cns2)
 	if cns1.Size() != 2 {
@@ -412,87 +504,100 @@ func TestConcurrentNeighborSet_Merge(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_TrimToSize(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node3", 0.8)
-	cns.Add("node1", 0.2)
-	cns.Add("node2", 0.5)
+	cns.Add(node3ID, 0.8)
+	cns.Add(node1ID, 0.2)
+	cns.Add(node2ID, 0.5)
 
 	cns.TrimToSize(2)
 	if cns.Size() != 2 {
 		t.Errorf("expected size 2 after trim, got %d", cns.Size())
 	}
-	if !cns.Contains("node1") || !cns.Contains("node2") {
+	if !cns.Contains(node1ID) || !cns.Contains(node2ID) {
 		t.Error("expected closest 2 nodes to be kept")
 	}
 }
 
 func TestConcurrentNeighborSet_AddIfAbsent(t *testing.T) {
+	const node1ID uint32 = 1
 	cns := NewConcurrentNeighborSet()
 
 	// First add should succeed
-	if !cns.AddIfAbsent("node1", 0.5) {
+	if !cns.AddIfAbsent(node1ID, 0.5) {
 		t.Error("expected first add to succeed")
 	}
 
 	// Second add should fail
-	if cns.AddIfAbsent("node1", 0.3) {
+	if cns.AddIfAbsent(node1ID, 0.3) {
 		t.Error("expected second add to fail")
 	}
 
 	// Distance should be unchanged
-	dist, _ := cns.GetDistance("node1")
+	dist, _ := cns.GetDistance(node1ID)
 	if dist != 0.5 {
 		t.Errorf("expected distance 0.5, got %f", dist)
 	}
 }
 
 func TestConcurrentNeighborSet_UpdateDistance(t *testing.T) {
+	const node1ID uint32 = 1
 	cns := NewConcurrentNeighborSet()
 
 	// Update non-existent should fail
-	if cns.UpdateDistance("node1", 0.5) {
+	if cns.UpdateDistance(node1ID, 0.5) {
 		t.Error("expected update of non-existent to fail")
 	}
 
-	cns.Add("node1", 0.5)
+	cns.Add(node1ID, 0.5)
 
 	// Update existing should succeed
-	if !cns.UpdateDistance("node1", 0.3) {
+	if !cns.UpdateDistance(node1ID, 0.3) {
 		t.Error("expected update to succeed")
 	}
 
-	dist, _ := cns.GetDistance("node1")
+	dist, _ := cns.GetDistance(node1ID)
 	if dist != 0.3 {
 		t.Errorf("expected distance 0.3, got %f", dist)
 	}
 }
 
 func TestConcurrentNeighborSet_AddWithLimit(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+		node4ID uint32 = 4
+	)
 	cns := NewConcurrentNeighborSet()
 
 	// Add up to limit
-	cns.AddWithLimit("node1", 0.5, 2)
-	cns.AddWithLimit("node2", 0.6, 2)
+	cns.AddWithLimit(node1ID, 0.5, 2)
+	cns.AddWithLimit(node2ID, 0.6, 2)
 	if cns.Size() != 2 {
 		t.Errorf("expected size 2, got %d", cns.Size())
 	}
 
 	// Add better than worst
-	if !cns.AddWithLimit("node3", 0.3, 2) {
+	if !cns.AddWithLimit(node3ID, 0.3, 2) {
 		t.Error("expected better neighbor to be added")
 	}
 	if cns.Size() != 2 {
 		t.Errorf("expected size 2, got %d", cns.Size())
 	}
-	if cns.Contains("node2") {
+	if cns.Contains(node2ID) {
 		t.Error("expected worst neighbor (node2) to be replaced")
 	}
-	if !cns.Contains("node3") {
+	if !cns.Contains(node3ID) {
 		t.Error("expected better neighbor (node3) to be added")
 	}
 
 	// Add worse than worst
-	if cns.AddWithLimit("node4", 0.7, 2) {
+	if cns.AddWithLimit(node4ID, 0.7, 2) {
 		t.Error("expected worse neighbor to not be added")
 	}
 	if cns.Size() != 2 {
@@ -509,7 +614,7 @@ func TestConcurrentNeighborSet_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			id := string(rune('A' + i%26))
+			id := uint32(i + 1)
 			cns.Add(id, float32(i)*0.01)
 		}(i)
 	}
@@ -519,7 +624,7 @@ func TestConcurrentNeighborSet_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			id := string(rune('A' + i%26))
+			id := uint32(i + 1)
 			cns.Contains(id)
 			cns.GetSortedNeighbors()
 			cns.Size()
@@ -535,26 +640,37 @@ func TestConcurrentNeighborSet_Concurrent(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_GetTopK(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+		node4ID uint32 = 4
+		node5ID uint32 = 5
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node3", 0.8)
-	cns.Add("node1", 0.2)
-	cns.Add("node2", 0.5)
-	cns.Add("node4", 0.9)
-	cns.Add("node5", 0.1)
+	cns.Add(node3ID, 0.8)
+	cns.Add(node1ID, 0.2)
+	cns.Add(node2ID, 0.5)
+	cns.Add(node4ID, 0.9)
+	cns.Add(node5ID, 0.1)
 
 	topK := cns.GetTopK(3)
 	if len(topK) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(topK))
 	}
-	if topK[0].ID != "node5" {
-		t.Errorf("expected node5 first, got %s", topK[0].ID)
+	if topK[0].ID != node5ID {
+		t.Errorf("expected node5 first, got %d", topK[0].ID)
 	}
 }
 
 func TestConcurrentNeighborSet_GetIDs(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.2)
-	cns.Add("node2", 0.5)
+	cns.Add(node1ID, 0.2)
+	cns.Add(node2ID, 0.5)
 
 	ids := cns.GetIDs()
 	if len(ids) != 2 {
@@ -563,9 +679,13 @@ func TestConcurrentNeighborSet_GetIDs(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_Clear(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.5)
-	cns.Add("node2", 0.6)
+	cns.Add(node1ID, 0.5)
+	cns.Add(node2ID, 0.6)
 
 	cns.Clear()
 	if cns.Size() != 0 {
@@ -574,12 +694,16 @@ func TestConcurrentNeighborSet_Clear(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_ForEach(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.5)
-	cns.Add("node2", 0.6)
+	cns.Add(node1ID, 0.5)
+	cns.Add(node2ID, 0.6)
 
-	visited := make(map[string]float32)
-	cns.ForEach(func(id string, dist float32) {
+	visited := make(map[uint32]float32)
+	cns.ForEach(func(id uint32, dist float32) {
 		visited[id] = dist
 	})
 
@@ -589,43 +713,49 @@ func TestConcurrentNeighborSet_ForEach(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_GetSortedNeighborsDescending(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node3", 0.8)
-	cns.Add("node1", 0.2)
-	cns.Add("node2", 0.5)
+	cns.Add(node3ID, 0.8)
+	cns.Add(node1ID, 0.2)
+	cns.Add(node2ID, 0.5)
 
 	sorted := cns.GetSortedNeighborsDescending()
 	if len(sorted) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(sorted))
 	}
-	if sorted[0].ID != "node3" {
-		t.Errorf("expected node3 first (descending), got %s", sorted[0].ID)
+	if sorted[0].ID != node3ID {
+		t.Errorf("expected node3 first (descending), got %d", sorted[0].ID)
 	}
 }
 
 // Benchmark tests
 
 func BenchmarkNeighborSet_Contains(b *testing.B) {
+	const targetID uint32 = 13
 	ns := NewNeighborSet()
 	for i := 0; i < 100; i++ {
-		ns.Add(string(rune('A'+i)), float32(i)*0.01)
+		ns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ns.Contains("M")
+		ns.Contains(targetID)
 	}
 }
 
 func BenchmarkSlice_Contains(b *testing.B) {
-	neighbors := make([]string, 100)
+	neighbors := make([]uint32, 100)
 	for i := 0; i < 100; i++ {
-		neighbors[i] = string(rune('A' + i))
+		neighbors[i] = uint32(i + 1)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		target := "M"
+		target := uint32(13)
 		for _, n := range neighbors {
 			if n == target {
 				break
@@ -637,7 +767,7 @@ func BenchmarkSlice_Contains(b *testing.B) {
 func BenchmarkNeighborSet_GetSortedNeighbors(b *testing.B) {
 	ns := NewNeighborSet()
 	for i := 0; i < 48; i++ {
-		ns.Add(string(rune('A'+i)), float32(i)*0.01)
+		ns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	b.ResetTimer()
@@ -647,32 +777,38 @@ func BenchmarkNeighborSet_GetSortedNeighbors(b *testing.B) {
 }
 
 func BenchmarkConcurrentNeighborSet_Contains(b *testing.B) {
+	const targetID uint32 = 13
 	cns := NewConcurrentNeighborSet()
 	for i := 0; i < 100; i++ {
-		cns.Add(string(rune('A'+i)), float32(i)*0.01)
+		cns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cns.Contains("M")
+		cns.Contains(targetID)
 	}
 }
 
 // W4P.9: Cache behavior tests
 
 func TestNeighborSet_CacheHappyPath(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node3", 0.8)
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
+	ns.Add(node3ID, 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
 
 	// First call should populate cache
 	sorted1 := ns.GetSortedNeighbors()
 	if len(sorted1) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(sorted1))
 	}
-	if sorted1[0].ID != "node1" || sorted1[0].Distance != 0.2 {
-		t.Errorf("expected node1 with 0.2 first, got %s with %f", sorted1[0].ID, sorted1[0].Distance)
+	if sorted1[0].ID != node1ID || sorted1[0].Distance != 0.2 {
+		t.Errorf("expected node1 with 0.2 first, got %d with %f", sorted1[0].ID, sorted1[0].Distance)
 	}
 
 	// Second call should use cache (same result)
@@ -680,40 +816,50 @@ func TestNeighborSet_CacheHappyPath(t *testing.T) {
 	if len(sorted2) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(sorted2))
 	}
-	if sorted2[0].ID != "node1" || sorted2[0].Distance != 0.2 {
-		t.Errorf("expected node1 with 0.2 first, got %s with %f", sorted2[0].ID, sorted2[0].Distance)
+	if sorted2[0].ID != node1ID || sorted2[0].Distance != 0.2 {
+		t.Errorf("expected node1 with 0.2 first, got %d with %f", sorted2[0].ID, sorted2[0].Distance)
 	}
 }
 
 func TestNeighborSet_CacheInvalidationOnAdd(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node2", 0.5)
-	ns.Add("node3", 0.8)
+	ns.Add(node2ID, 0.5)
+	ns.Add(node3ID, 0.8)
 
 	// Populate cache
 	sorted1 := ns.GetSortedNeighbors()
-	if sorted1[0].ID != "node2" {
-		t.Errorf("expected node2 first, got %s", sorted1[0].ID)
+	if sorted1[0].ID != node2ID {
+		t.Errorf("expected node2 first, got %d", sorted1[0].ID)
 	}
 
 	// Add a better neighbor - should invalidate cache
-	ns.Add("node1", 0.1)
+	ns.Add(node1ID, 0.1)
 
 	// Should reflect the new neighbor
 	sorted2 := ns.GetSortedNeighbors()
 	if len(sorted2) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(sorted2))
 	}
-	if sorted2[0].ID != "node1" || sorted2[0].Distance != 0.1 {
-		t.Errorf("expected node1 with 0.1 first, got %s with %f", sorted2[0].ID, sorted2[0].Distance)
+	if sorted2[0].ID != node1ID || sorted2[0].Distance != 0.1 {
+		t.Errorf("expected node1 with 0.1 first, got %d with %f", sorted2[0].ID, sorted2[0].Distance)
 	}
 }
 
 func TestNeighborSet_CacheInvalidationOnRemove(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
-	ns.Add("node3", 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
+	ns.Add(node3ID, 0.8)
 
 	// Populate cache
 	sorted1 := ns.GetSortedNeighbors()
@@ -722,22 +868,26 @@ func TestNeighborSet_CacheInvalidationOnRemove(t *testing.T) {
 	}
 
 	// Remove a neighbor - should invalidate cache
-	ns.Remove("node1")
+	ns.Remove(node1ID)
 
 	// Should reflect the removal
 	sorted2 := ns.GetSortedNeighbors()
 	if len(sorted2) != 2 {
 		t.Errorf("expected 2 neighbors after removal, got %d", len(sorted2))
 	}
-	if sorted2[0].ID != "node2" {
-		t.Errorf("expected node2 first after removal, got %s", sorted2[0].ID)
+	if sorted2[0].ID != node2ID {
+		t.Errorf("expected node2 first after removal, got %d", sorted2[0].ID)
 	}
 }
 
 func TestNeighborSet_CacheInvalidationOnClear(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
 
 	// Populate cache
 	_ = ns.GetSortedNeighbors()
@@ -753,15 +903,20 @@ func TestNeighborSet_CacheInvalidationOnClear(t *testing.T) {
 }
 
 func TestNeighborSet_CacheInvalidationOnMerge(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns1 := NewNeighborSet()
-	ns1.Add("node2", 0.5)
-	ns1.Add("node3", 0.8)
+	ns1.Add(node2ID, 0.5)
+	ns1.Add(node3ID, 0.8)
 
 	// Populate cache
 	_ = ns1.GetSortedNeighbors()
 
 	ns2 := NewNeighborSet()
-	ns2.Add("node1", 0.1)
+	ns2.Add(node1ID, 0.1)
 
 	// Merge - should invalidate cache
 	ns1.Merge(ns2)
@@ -771,16 +926,21 @@ func TestNeighborSet_CacheInvalidationOnMerge(t *testing.T) {
 	if len(sorted) != 3 {
 		t.Errorf("expected 3 neighbors after merge, got %d", len(sorted))
 	}
-	if sorted[0].ID != "node1" {
-		t.Errorf("expected node1 first after merge, got %s", sorted[0].ID)
+	if sorted[0].ID != node1ID {
+		t.Errorf("expected node1 first after merge, got %d", sorted[0].ID)
 	}
 }
 
 func TestNeighborSet_CacheInvalidationOnTrim(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	ns := NewNeighborSet()
-	ns.Add("node1", 0.2)
-	ns.Add("node2", 0.5)
-	ns.Add("node3", 0.8)
+	ns.Add(node1ID, 0.2)
+	ns.Add(node2ID, 0.5)
+	ns.Add(node3ID, 0.8)
 
 	// Populate cache
 	_ = ns.GetSortedNeighbors()
@@ -793,24 +953,29 @@ func TestNeighborSet_CacheInvalidationOnTrim(t *testing.T) {
 	if len(sorted) != 2 {
 		t.Errorf("expected 2 neighbors after trim, got %d", len(sorted))
 	}
-	if !ns.Contains("node1") || !ns.Contains("node2") {
+	if !ns.Contains(node1ID) || !ns.Contains(node2ID) {
 		t.Error("expected closest 2 nodes to be kept")
 	}
 }
 
 func TestConcurrentNeighborSet_CacheHappyPath(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node3", 0.8)
-	cns.Add("node1", 0.2)
-	cns.Add("node2", 0.5)
+	cns.Add(node3ID, 0.8)
+	cns.Add(node1ID, 0.2)
+	cns.Add(node2ID, 0.5)
 
 	// First call should populate cache
 	sorted1 := cns.GetSortedNeighbors()
 	if len(sorted1) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(sorted1))
 	}
-	if sorted1[0].ID != "node1" {
-		t.Errorf("expected node1 first, got %s", sorted1[0].ID)
+	if sorted1[0].ID != node1ID {
+		t.Errorf("expected node1 first, got %d", sorted1[0].ID)
 	}
 
 	// Second call should use cache (same result)
@@ -818,39 +983,48 @@ func TestConcurrentNeighborSet_CacheHappyPath(t *testing.T) {
 	if len(sorted2) != 3 {
 		t.Errorf("expected 3 neighbors, got %d", len(sorted2))
 	}
-	if sorted2[0].ID != "node1" {
-		t.Errorf("expected node1 first, got %s", sorted2[0].ID)
+	if sorted2[0].ID != node1ID {
+		t.Errorf("expected node1 first, got %d", sorted2[0].ID)
 	}
 }
 
 func TestConcurrentNeighborSet_CacheInvalidationOnAdd(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node2", 0.5)
-	cns.Add("node3", 0.8)
+	cns.Add(node2ID, 0.5)
+	cns.Add(node3ID, 0.8)
 
 	// Populate cache
 	_ = cns.GetSortedNeighbors()
 
 	// Add a better neighbor - should invalidate cache
-	cns.Add("node1", 0.1)
+	cns.Add(node1ID, 0.1)
 
 	// Should reflect the new neighbor
 	sorted := cns.GetSortedNeighbors()
-	if sorted[0].ID != "node1" {
-		t.Errorf("expected node1 first after add, got %s", sorted[0].ID)
+	if sorted[0].ID != node1ID {
+		t.Errorf("expected node1 first after add, got %d", sorted[0].ID)
 	}
 }
 
 func TestConcurrentNeighborSet_CacheInvalidationOnRemove(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.2)
-	cns.Add("node2", 0.5)
+	cns.Add(node1ID, 0.2)
+	cns.Add(node2ID, 0.5)
 
 	// Populate cache
 	_ = cns.GetSortedNeighbors()
 
 	// Remove - should invalidate cache
-	cns.Remove("node1")
+	cns.Remove(node1ID)
 
 	sorted := cns.GetSortedNeighbors()
 	if len(sorted) != 1 {
@@ -859,62 +1033,75 @@ func TestConcurrentNeighborSet_CacheInvalidationOnRemove(t *testing.T) {
 }
 
 func TestConcurrentNeighborSet_CacheInvalidationOnAddIfAbsent(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node2", 0.5)
+	cns.Add(node2ID, 0.5)
 
 	// Populate cache
 	_ = cns.GetSortedNeighbors()
 
 	// AddIfAbsent - should invalidate cache
-	cns.AddIfAbsent("node1", 0.1)
+	cns.AddIfAbsent(node1ID, 0.1)
 
 	sorted := cns.GetSortedNeighbors()
-	if sorted[0].ID != "node1" {
-		t.Errorf("expected node1 first after AddIfAbsent, got %s", sorted[0].ID)
+	if sorted[0].ID != node1ID {
+		t.Errorf("expected node1 first after AddIfAbsent, got %d", sorted[0].ID)
 	}
 }
 
 func TestConcurrentNeighborSet_CacheInvalidationOnUpdateDistance(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node1", 0.5)
-	cns.Add("node2", 0.2)
+	cns.Add(node1ID, 0.5)
+	cns.Add(node2ID, 0.2)
 
 	// Populate cache
 	sorted1 := cns.GetSortedNeighbors()
-	if sorted1[0].ID != "node2" {
-		t.Errorf("expected node2 first, got %s", sorted1[0].ID)
+	if sorted1[0].ID != node2ID {
+		t.Errorf("expected node2 first, got %d", sorted1[0].ID)
 	}
 
 	// UpdateDistance - should invalidate cache
-	cns.UpdateDistance("node1", 0.1)
+	cns.UpdateDistance(node1ID, 0.1)
 
 	sorted2 := cns.GetSortedNeighbors()
-	if sorted2[0].ID != "node1" {
-		t.Errorf("expected node1 first after update, got %s", sorted2[0].ID)
+	if sorted2[0].ID != node1ID {
+		t.Errorf("expected node1 first after update, got %d", sorted2[0].ID)
 	}
 }
 
 func TestConcurrentNeighborSet_CacheInvalidationOnAddWithLimit(t *testing.T) {
+	const (
+		node1ID uint32 = 1
+		node2ID uint32 = 2
+		node3ID uint32 = 3
+	)
 	cns := NewConcurrentNeighborSet()
-	cns.Add("node2", 0.5)
-	cns.Add("node3", 0.8)
+	cns.Add(node2ID, 0.5)
+	cns.Add(node3ID, 0.8)
 
 	// Populate cache
 	_ = cns.GetSortedNeighbors()
 
 	// AddWithLimit - should invalidate cache
-	cns.AddWithLimit("node1", 0.1, 3)
+	cns.AddWithLimit(node1ID, 0.1, 3)
 
 	sorted := cns.GetSortedNeighbors()
-	if sorted[0].ID != "node1" {
-		t.Errorf("expected node1 first after AddWithLimit, got %s", sorted[0].ID)
+	if sorted[0].ID != node1ID {
+		t.Errorf("expected node1 first after AddWithLimit, got %d", sorted[0].ID)
 	}
 }
 
 func TestConcurrentNeighborSet_ConcurrentCacheAccess(t *testing.T) {
 	cns := NewConcurrentNeighborSet()
 	for i := 0; i < 100; i++ {
-		cns.Add(string(rune('A'+i%26)), float32(i)*0.01)
+		cns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	var wg sync.WaitGroup
@@ -936,7 +1123,7 @@ func TestConcurrentNeighborSet_ConcurrentCacheAccess(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			cns.Add(string(rune('a'+i%26)), float32(i)*0.001)
+			cns.Add(uint32(101+i), float32(i)*0.001)
 		}(i)
 	}
 
@@ -953,7 +1140,7 @@ func TestConcurrentNeighborSet_ConcurrentCacheAccess(t *testing.T) {
 func BenchmarkNeighborSet_GetSortedNeighbors_Cached(b *testing.B) {
 	ns := NewNeighborSet()
 	for i := 0; i < 48; i++ {
-		ns.Add(string(rune('A'+i)), float32(i)*0.01)
+		ns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	// Prime the cache
@@ -966,16 +1153,17 @@ func BenchmarkNeighborSet_GetSortedNeighbors_Cached(b *testing.B) {
 }
 
 func BenchmarkNeighborSet_GetSortedNeighbors_Uncached(b *testing.B) {
+	const tempID uint32 = 999
 	ns := NewNeighborSet()
 	for i := 0; i < 48; i++ {
-		ns.Add(string(rune('A'+i)), float32(i)*0.01)
+		ns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Force cache invalidation before each call
-		ns.Add("temp", 0.99)
-		ns.Remove("temp")
+		ns.Add(tempID, 0.99)
+		ns.Remove(tempID)
 		_ = ns.GetSortedNeighbors()
 	}
 }
@@ -983,7 +1171,7 @@ func BenchmarkNeighborSet_GetSortedNeighbors_Uncached(b *testing.B) {
 func BenchmarkConcurrentNeighborSet_GetSortedNeighbors_Cached(b *testing.B) {
 	cns := NewConcurrentNeighborSet()
 	for i := 0; i < 48; i++ {
-		cns.Add(string(rune('A'+i)), float32(i)*0.01)
+		cns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	// Prime the cache
@@ -996,16 +1184,17 @@ func BenchmarkConcurrentNeighborSet_GetSortedNeighbors_Cached(b *testing.B) {
 }
 
 func BenchmarkConcurrentNeighborSet_GetSortedNeighbors_Uncached(b *testing.B) {
+	const tempID uint32 = 999
 	cns := NewConcurrentNeighborSet()
 	for i := 0; i < 48; i++ {
-		cns.Add(string(rune('A'+i)), float32(i)*0.01)
+		cns.Add(uint32(i+1), float32(i)*0.01)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Force cache invalidation before each call
-		cns.Add("temp", 0.99)
-		cns.Remove("temp")
+		cns.Add(tempID, 0.99)
+		cns.Remove(tempID)
 		_ = cns.GetSortedNeighbors()
 	}
 }

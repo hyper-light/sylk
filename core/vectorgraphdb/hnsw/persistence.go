@@ -39,6 +39,11 @@ func (h *Index) saveMetadata(tx *sql.Tx) error {
 		return err
 	}
 
+	entryPointStr := ""
+	if h.entryPoint != invalidNodeID {
+		entryPointStr = h.idToString[h.entryPoint]
+	}
+
 	_, err := tx.Exec(`
 		UPDATE hnsw_meta SET
 			value = CASE key
@@ -52,7 +57,7 @@ func (h *Index) saveMetadata(tx *sql.Tx) error {
 				ELSE value
 			END
 		WHERE key IN ('entry_point', 'max_level', 'm', 'ef_construct', 'ef_search', 'level_mult', 'total_nodes')
-	`, h.entryPoint, h.maxLevel, h.M, h.efConstruct, h.efSearch, h.levelMult, len(h.vectors))
+	`, entryPointStr, h.maxLevel, h.M, h.efConstruct, h.efSearch, h.levelMult, len(h.vectors))
 	if err != nil {
 		return fmt.Errorf("update metadata: %w", err)
 	}
@@ -83,9 +88,11 @@ func (h *Index) saveLayer(stmt *sql.Stmt, layer *layer, layerIdx int) error {
 	defer layer.mu.RUnlock()
 
 	for nodeID, node := range layer.nodes {
+		nodeIDStr := h.idToString[nodeID]
 		neighborIDs := node.neighbors.GetIDs()
 		for _, neighborID := range neighborIDs {
-			if _, err := stmt.Exec(nodeID, neighborID, layerIdx); err != nil {
+			neighborIDStr := h.idToString[neighborID]
+			if _, err := stmt.Exec(nodeIDStr, neighborIDStr, layerIdx); err != nil {
 				return fmt.Errorf("insert graph edge: %w", err)
 			}
 		}
@@ -93,11 +100,7 @@ func (h *Index) saveLayer(stmt *sql.Stmt, layer *layer, layerIdx int) error {
 	return nil
 }
 
-// Load loads graph structure from the database with atomic semantics.
-// W12.39: Implements atomic write with rollback - if any error occurs during
-// loading, the index state remains unchanged (no partial writes).
 func (h *Index) Load(db *sql.DB) error {
-	// Phase 1: Stage all data into temporary structures
 	stagedMeta, err := h.stageMetadataLoad(db)
 	if err != nil {
 		return err
@@ -108,13 +111,11 @@ func (h *Index) Load(db *sql.DB) error {
 		return err
 	}
 
-	// Phase 2: Commit staged data atomically
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	h.commitStagedMetadata(stagedMeta)
 
-	// W4P.15: Ensure layers exist based on maxLevel from metadata.
 	if h.maxLevel >= 0 {
 		h.ensureLayers(h.maxLevel)
 	}
@@ -124,8 +125,6 @@ func (h *Index) Load(db *sql.DB) error {
 	return nil
 }
 
-// stagedMetadata holds metadata loaded from database before commit.
-// W12.39: Used for atomic load - data staged here until fully loaded.
 type stagedMetadata struct {
 	entryPoint  string
 	maxLevel    int
@@ -135,8 +134,6 @@ type stagedMetadata struct {
 	levelMult   float64
 }
 
-// stageMetadataLoad reads all metadata into temporary structures.
-// W12.39: On error, returns nil staged data for automatic rollback.
 func (h *Index) stageMetadataLoad(db *sql.DB) (*stagedMetadata, error) {
 	rows, err := db.Query("SELECT key, value FROM hnsw_meta")
 	if err != nil {
@@ -166,8 +163,6 @@ func (h *Index) stageMetadataLoad(db *sql.DB) (*stagedMetadata, error) {
 	return staged, nil
 }
 
-// applyStagedMetaValue applies a metadata value to staging area.
-// W12.39: Writes to staging only, not to index state.
 func (h *Index) applyStagedMetaValue(key, value string, staged *stagedMetadata) {
 	switch key {
 	case "entry_point":
@@ -185,11 +180,17 @@ func (h *Index) applyStagedMetaValue(key, value string, staged *stagedMetadata) 
 	}
 }
 
-// commitStagedMetadata transfers staged metadata to the index.
-// W12.39: Called only after all data successfully loaded into staging.
-// Caller must hold h.mu (write lock).
 func (h *Index) commitStagedMetadata(staged *stagedMetadata) {
-	h.entryPoint = staged.entryPoint
+	if staged.entryPoint == "" {
+		h.entryPoint = invalidNodeID
+	} else {
+		internalID, exists := h.stringToID[staged.entryPoint]
+		if exists {
+			h.entryPoint = internalID
+		} else {
+			h.entryPoint = invalidNodeID
+		}
+	}
 	h.maxLevel = staged.maxLevel
 	h.M = staged.m
 	h.efConstruct = staged.efConstruct
@@ -197,16 +198,12 @@ func (h *Index) commitStagedMetadata(staged *stagedMetadata) {
 	h.levelMult = staged.levelMult
 }
 
-// stagedGraphEdge represents a single edge to be added to the graph.
-// W12.39: Used for atomic graph load.
 type stagedGraphEdge struct {
 	sourceID string
 	targetID string
 	level    int
 }
 
-// stageGraphLoad reads all graph edges into temporary structures.
-// W12.39: On error, returns nil staged data for automatic rollback.
 func (h *Index) stageGraphLoad(db *sql.DB) ([]stagedGraphEdge, error) {
 	rows, err := db.Query(`SELECT source_id, target_id, level FROM hnsw_edges ORDER BY level`)
 	if err != nil {
@@ -228,8 +225,6 @@ func (h *Index) stageGraphLoad(db *sql.DB) ([]stagedGraphEdge, error) {
 	return staged, nil
 }
 
-// stageGraphRow reads a single graph row into staged data.
-// W12.39: Returns edge data without modifying index state.
 func (h *Index) stageGraphRow(rows *sql.Rows) (stagedGraphEdge, error) {
 	var edge stagedGraphEdge
 	if err := rows.Scan(&edge.sourceID, &edge.targetID, &edge.level); err != nil {
@@ -238,40 +233,42 @@ func (h *Index) stageGraphRow(rows *sql.Rows) (stagedGraphEdge, error) {
 	return edge, nil
 }
 
-// commitStagedGraph transfers staged graph edges to the index.
-// W12.39: Called only after all data successfully loaded into staging.
-// Caller must hold h.mu (write lock).
 func (h *Index) commitStagedGraph(staged []stagedGraphEdge) {
 	for _, edge := range staged {
 		h.ensureLayers(edge.level)
-		h.layers[edge.level].addNode(edge.sourceID)
-		h.layers[edge.level].addNode(edge.targetID)
-		h.layers[edge.level].addNeighbor(edge.sourceID, edge.targetID, 0, h.maxNeighborsForLevel(edge.level))
+		sourceID := h.getOrCreateInternalID(edge.sourceID)
+		targetID := h.getOrCreateInternalID(edge.targetID)
+		h.layers[edge.level].addNode(sourceID)
+		h.layers[edge.level].addNode(targetID)
+		h.layers[edge.level].addNeighbor(sourceID, targetID, 0, h.maxNeighborsForLevel(edge.level))
 	}
 }
 
-// LoadVectors loads vectors from the database with atomic semantics.
-// W12.39: Implements atomic write with rollback - if any error occurs during
-// loading, the index state remains unchanged (no partial writes).
+func (h *Index) getOrCreateInternalID(stringID string) uint32 {
+	if internalID, exists := h.stringToID[stringID]; exists {
+		return internalID
+	}
+	internalID := h.nextID
+	h.nextID++
+	h.stringToID[stringID] = internalID
+	h.idToString = append(h.idToString, stringID)
+	return internalID
+}
+
 func (h *Index) LoadVectors(db *sql.DB) error {
-	// Phase 1: Load all data into temporary structures
 	staged, err := h.stageVectorLoad(db)
 	if err != nil {
 		return err
 	}
 
-	// Phase 2: Commit staged data atomically
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.commitStagedVectors(staged)
 
-	// W4P.15: Recompute edge distances after loading vectors
 	h.recomputeEdgeDistances()
 	return nil
 }
 
-// stagedVectorData holds vector data loaded from database before commit.
-// W12.39: Used for atomic load - data staged here until fully loaded.
 type stagedVectorData struct {
 	vectors    map[string][]float32
 	magnitudes map[string]float64
@@ -279,8 +276,6 @@ type stagedVectorData struct {
 	nodeTypes  map[string]vectorgraphdb.NodeType
 }
 
-// stageVectorLoad reads all vector data into temporary structures.
-// W12.39: On error, returns nil staged data for automatic rollback.
 func (h *Index) stageVectorLoad(db *sql.DB) (*stagedVectorData, error) {
 	rows, err := db.Query(`
 		SELECT v.node_id, v.embedding, v.magnitude, n.domain, n.node_type
@@ -310,8 +305,6 @@ func (h *Index) stageVectorLoad(db *sql.DB) (*stagedVectorData, error) {
 	return staged, nil
 }
 
-// stageVectorRow reads a single vector row into staged data.
-// W12.39: Writes to staging area only, not to index state.
 func (h *Index) stageVectorRow(rows *sql.Rows, staged *stagedVectorData) error {
 	var nodeID string
 	var embeddingBlob []byte
@@ -331,58 +324,44 @@ func (h *Index) stageVectorRow(rows *sql.Rows, staged *stagedVectorData) error {
 	return nil
 }
 
-// commitStagedVectors transfers staged vector data to the index.
-// W12.39: Called only after all data successfully loaded into staging.
-// Caller must hold h.mu (write lock).
 func (h *Index) commitStagedVectors(staged *stagedVectorData) {
-	for nodeID, vec := range staged.vectors {
-		h.vectors[nodeID] = vec
+	for stringID, vec := range staged.vectors {
+		internalID := h.getOrCreateInternalID(stringID)
+		h.vectors[internalID] = vec
 	}
-	for nodeID, mag := range staged.magnitudes {
-		h.magnitudes[nodeID] = mag
+	for stringID, mag := range staged.magnitudes {
+		internalID := h.stringToID[stringID]
+		h.magnitudes[internalID] = mag
 	}
-	for nodeID, domain := range staged.domains {
-		h.domains[nodeID] = domain
+	for stringID, domain := range staged.domains {
+		internalID := h.stringToID[stringID]
+		h.domains[internalID] = domain
 	}
-	for nodeID, nodeType := range staged.nodeTypes {
-		h.nodeTypes[nodeID] = nodeType
+	for stringID, nodeType := range staged.nodeTypes {
+		internalID := h.stringToID[stringID]
+		h.nodeTypes[internalID] = nodeType
 	}
 }
 
-// recomputeEdgeDistances recalculates all edge distances using stored vectors.
-// W4P.15: Called after LoadVectors to restore correct neighbor ordering.
-// W12.10: Restructured to avoid holding h.mu while acquiring layer locks.
-// Caller must hold h.mu (write lock).
 func (h *Index) recomputeEdgeDistances() {
 	for _, layer := range h.layers {
 		h.recomputeLayerDistances(layer)
 	}
 }
 
-// recomputeLayerDistances recalculates distances for all edges in a single layer.
-// W12.10: Collects all data with proper lock ordering to avoid deadlock.
-// Caller must hold h.mu (write lock).
 func (h *Index) recomputeLayerDistances(l *layer) {
-	// Collect node-neighbor pairs with layer lock held
 	updates := h.collectDistanceUpdates(l)
-
-	// Apply updates - layer's ConcurrentNeighborSet handles its own locking
 	for _, update := range updates {
 		update.neighbors.UpdateDistance(update.neighborID, update.distance)
 	}
 }
 
-// distanceUpdate holds data needed to update a single neighbor distance.
-// W12.10: Used to batch updates and avoid holding multiple locks.
 type distanceUpdate struct {
 	neighbors  *ConcurrentNeighborSet
-	neighborID string
+	neighborID uint32
 	distance   float32
 }
 
-// collectDistanceUpdates collects all distance updates for a layer.
-// W12.10: Acquires layer lock, computes distances, releases lock before returning.
-// Caller must hold h.mu (read or write lock).
 func (h *Index) collectDistanceUpdates(l *layer) []distanceUpdate {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -395,9 +374,7 @@ func (h *Index) collectDistanceUpdates(l *layer) []distanceUpdate {
 	return updates
 }
 
-// computeNodeDistanceUpdates computes distance updates for all neighbors of a node.
-// W12.10: Does not acquire any locks - caller must hold both h.mu and l.mu.
-func (h *Index) computeNodeDistanceUpdates(nodeID string, node *layerNode) []distanceUpdate {
+func (h *Index) computeNodeDistanceUpdates(nodeID uint32, node *layerNode) []distanceUpdate {
 	srcVec, srcMag, srcOK := h.getVectorAndMagnitudeLocked(nodeID)
 	if !srcOK {
 		return nil
@@ -422,9 +399,7 @@ func (h *Index) computeNodeDistanceUpdates(nodeID string, node *layerNode) []dis
 	return updates
 }
 
-// getVectorAndMagnitudeLocked retrieves vector and magnitude without locking.
-// Caller must hold h.mu (read or write lock).
-func (h *Index) getVectorAndMagnitudeLocked(id string) ([]float32, float64, bool) {
+func (h *Index) getVectorAndMagnitudeLocked(id uint32) ([]float32, float64, bool) {
 	vec, vecExists := h.vectors[id]
 	if !vecExists {
 		return nil, 0, false
@@ -455,7 +430,7 @@ func (h *Index) refreshDerivedFields() {
 	}
 	h.maxLevel = maxLevel
 
-	if h.entryPoint == "" {
+	if h.entryPoint == invalidNodeID {
 		for level := h.maxLevel; level >= 0; level-- {
 			ids := h.layers[level].allNodeIDs()
 			if len(ids) > 0 {
@@ -501,8 +476,6 @@ func bytesToFloat32s(b []byte) []float32 {
 	return result
 }
 
-// float32FromBits converts a uint32 to float32.
-// W12.35: Uses math.Float32frombits instead of unsafe pointer cast for type safety.
 func float32FromBits(b uint32) float32 {
 	return math.Float32frombits(b)
 }
@@ -519,8 +492,6 @@ func float32ToBytes(f []float32) []byte {
 	return result
 }
 
-// float32ToBits converts a float32 to uint32.
-// W12.35: Uses math.Float32bits instead of unsafe pointer cast for type safety.
 func float32ToBits(f float32) uint32 {
 	return math.Float32bits(f)
 }
