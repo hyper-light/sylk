@@ -20,19 +20,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"slices"
 	"sort"
 	"sync"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
-
-// magnitudeTolerance defines the relative tolerance for magnitude validation.
-// A cached magnitude is considered stale if it differs from the recomputed
-// value by more than this fraction of the recomputed magnitude.
-// W4P.24: Used for detecting stale magnitude cache entries.
-const magnitudeTolerance = 1e-6
 
 // Sentinel errors for HNSW operations. Use errors.Is() to check error types.
 // W4L.1: Improved error definitions with clearer documentation.
@@ -430,9 +423,7 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep string, ef int
 }
 
 // getVectorAndMagnitude safely retrieves both vector and magnitude for a node.
-// W4P.24: Validates that cached magnitude matches the vector, recomputes if stale.
-// This function does NOT update the cache to avoid data races during read operations.
-// Returns false if the vector is missing.
+// Returns false if the vector is missing. Trusts cached magnitude (validated on insert).
 func (h *Index) getVectorAndMagnitude(id string) ([]float32, float64, bool) {
 	vec, vecExists := h.vectors[id]
 	if !vecExists {
@@ -445,38 +436,8 @@ func (h *Index) getVectorAndMagnitude(id string) ([]float32, float64, bool) {
 		slog.Warn("magnitude cache miss, computed on read",
 			slog.String("node_id", id),
 			slog.Float64("magnitude", mag))
-		return vec, mag, true
 	}
-	// Validate cached magnitude against vector
-	return validateAndReturnMagnitude(id, vec, mag)
-}
-
-// validateAndReturnMagnitude checks if cached magnitude is valid for the vector.
-// W4P.24: Recomputes magnitude if mismatch detected, logs warning.
-// Does NOT update cache to avoid data races during read operations.
-func validateAndReturnMagnitude(id string, vec []float32, cachedMag float64) ([]float32, float64, bool) {
-	computedMag := Magnitude(vec)
-	if isMagnitudeValid(cachedMag, computedMag) {
-		return vec, cachedMag, true
-	}
-	// Stale magnitude detected - log warning and return computed value
-	// Note: We don't update the cache here to avoid write during read lock
-	slog.Warn("stale magnitude cache detected, using computed value",
-		slog.String("node_id", id),
-		slog.Float64("cached_magnitude", cachedMag),
-		slog.Float64("computed_magnitude", computedMag),
-		slog.Float64("difference", math.Abs(cachedMag-computedMag)))
-	return vec, computedMag, true
-}
-
-// isMagnitudeValid checks if cached magnitude matches computed magnitude within tolerance.
-// W4P.24: Uses relative tolerance for floating-point comparison.
-func isMagnitudeValid(cached, computed float64) bool {
-	if computed == 0 {
-		return cached == 0
-	}
-	relDiff := math.Abs(cached-computed) / computed
-	return relDiff <= magnitudeTolerance
+	return vec, mag, true
 }
 
 func (h *Index) connectNode(id string, neighbors []SearchResult, level int) {
