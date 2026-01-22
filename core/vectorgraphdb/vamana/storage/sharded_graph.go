@@ -31,6 +31,7 @@ type ShardedGraphStore struct {
 	dir           string
 	R             int
 	shardCapacity int
+	useBitOps     bool
 
 	shards  []*graphShard
 	shardMu sync.RWMutex
@@ -77,6 +78,7 @@ func OpenShardedGraphStore(dir string) (*ShardedGraphStore, error) {
 		dir:           dir,
 		R:             meta.R,
 		shardCapacity: meta.ShardCapacity,
+		useBitOps:     meta.ShardCapacity == NodesPerShard,
 		shards:        shards,
 	}
 	s.count.Store(uint64(meta.Total))
@@ -100,6 +102,7 @@ func CreateShardedGraphStore(dir string, R int, shardCapacity int) (*ShardedGrap
 		dir:           dir,
 		R:             R,
 		shardCapacity: shardCapacity,
+		useBitOps:     shardCapacity == NodesPerShard,
 		shards:        make([]*graphShard, 0, 8),
 	}
 
@@ -143,7 +146,12 @@ func (s *ShardedGraphStore) createShard() error {
 
 // ensureShard ensures the shard for the given node ID exists.
 func (s *ShardedGraphStore) ensureShard(nodeID uint32) error {
-	shardIdx := int(nodeID) / s.shardCapacity
+	var shardIdx int
+	if s.useBitOps {
+		shardIdx = int(nodeID >> shardShift)
+	} else {
+		shardIdx = int(nodeID) / s.shardCapacity
+	}
 
 	s.shardMu.RLock()
 	if shardIdx < len(s.shards) {
@@ -167,8 +175,15 @@ func (s *ShardedGraphStore) ensureShard(nodeID uint32) error {
 
 // getShard returns the shard and local ID for the given global node ID.
 func (s *ShardedGraphStore) getShard(nodeID uint32) (*graphShard, uint32) {
-	shardIdx := int(nodeID) / s.shardCapacity
-	localID := uint32(int(nodeID) % s.shardCapacity)
+	var shardIdx int
+	var localID uint32
+	if s.useBitOps {
+		shardIdx = int(nodeID >> shardShift)
+		localID = nodeID & shardMask
+	} else {
+		shardIdx = int(nodeID) / s.shardCapacity
+		localID = uint32(int(nodeID) % s.shardCapacity)
+	}
 
 	s.shardMu.RLock()
 	defer s.shardMu.RUnlock()
@@ -276,8 +291,15 @@ func (s *ShardedGraphStore) SetNeighborsBatch(nodes []NodeNeighbors) error {
 
 	shardBatches := make(map[int][]NodeNeighbors)
 	for _, node := range nodes {
-		shardIdx := int(node.NodeID) / s.shardCapacity
-		localID := uint32(int(node.NodeID) % s.shardCapacity)
+		var shardIdx int
+		var localID uint32
+		if s.useBitOps {
+			shardIdx = int(node.NodeID >> shardShift)
+			localID = node.NodeID & shardMask
+		} else {
+			shardIdx = int(node.NodeID) / s.shardCapacity
+			localID = uint32(int(node.NodeID) % s.shardCapacity)
+		}
 		shardBatches[shardIdx] = append(shardBatches[shardIdx], NodeNeighbors{
 			NodeID:    localID,
 			Neighbors: node.Neighbors,

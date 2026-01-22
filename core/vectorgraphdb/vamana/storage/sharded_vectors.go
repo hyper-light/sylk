@@ -16,12 +16,17 @@ type shardedVectorMeta struct {
 	Total         int `yaml:"total"`
 }
 
-const VectorsPerShard = 65536
+const (
+	VectorsPerShard = 65536
+	shardShift      = 16            // log2(65536)
+	shardMask       = (1 << 16) - 1 // 0xFFFF
+)
 
 type ShardedVectorStore struct {
 	dir           string
 	dim           int
 	shardCapacity int
+	useBitOps     bool
 
 	shards  []*vectorShard
 	shardMu sync.RWMutex
@@ -67,6 +72,7 @@ func OpenShardedVectorStore(dir string) (*ShardedVectorStore, error) {
 		dir:           dir,
 		dim:           meta.Dim,
 		shardCapacity: meta.ShardCapacity,
+		useBitOps:     meta.ShardCapacity == VectorsPerShard,
 		shards:        shards,
 	}
 	s.total.Store(uint64(meta.Total))
@@ -90,6 +96,7 @@ func CreateShardedVectorStore(dir string, dim int, shardCapacity int) (*ShardedV
 		dir:           dir,
 		dim:           dim,
 		shardCapacity: shardCapacity,
+		useBitOps:     shardCapacity == VectorsPerShard,
 		shards:        make([]*vectorShard, 0, 8),
 	}
 
@@ -131,7 +138,12 @@ func (s *ShardedVectorStore) createShard() error {
 }
 
 func (s *ShardedVectorStore) ensureShard(vectorID uint32) error {
-	shardIdx := int(vectorID) / s.shardCapacity
+	var shardIdx int
+	if s.useBitOps {
+		shardIdx = int(vectorID >> shardShift)
+	} else {
+		shardIdx = int(vectorID) / s.shardCapacity
+	}
 
 	s.shardMu.RLock()
 	if shardIdx < len(s.shards) {
@@ -153,8 +165,15 @@ func (s *ShardedVectorStore) ensureShard(vectorID uint32) error {
 }
 
 func (s *ShardedVectorStore) getShard(vectorID uint32) (*vectorShard, uint32) {
-	shardIdx := int(vectorID) / s.shardCapacity
-	localID := uint32(int(vectorID) % s.shardCapacity)
+	var shardIdx int
+	var localID uint32
+	if s.useBitOps {
+		shardIdx = int(vectorID >> shardShift)
+		localID = vectorID & shardMask
+	} else {
+		shardIdx = int(vectorID) / s.shardCapacity
+		localID = uint32(int(vectorID) % s.shardCapacity)
+	}
 
 	s.shardMu.RLock()
 	defer s.shardMu.RUnlock()
@@ -187,7 +206,12 @@ func (s *ShardedVectorStore) Append(vector []float32) (uint32, error) {
 	defer s.shardMu.Unlock()
 
 	total := int(s.total.Load())
-	shardIdx := total / s.shardCapacity
+	var shardIdx int
+	if s.useBitOps {
+		shardIdx = total >> shardShift
+	} else {
+		shardIdx = total / s.shardCapacity
+	}
 
 	for shardIdx >= len(s.shards) {
 		if err := s.createShard(); err != nil {
@@ -226,9 +250,16 @@ func (s *ShardedVectorStore) AppendBatch(vectors [][]float32) (startID uint32, e
 	remaining := vectors
 
 	for len(remaining) > 0 {
-		shardIdx := total / s.shardCapacity
-		localID := total % s.shardCapacity
-		space := s.shardCapacity - localID
+		var shardIdx, localID, space int
+		if s.useBitOps {
+			shardIdx = total >> shardShift
+			localID = total & shardMask
+			space = VectorsPerShard - localID
+		} else {
+			shardIdx = total / s.shardCapacity
+			localID = total % s.shardCapacity
+			space = s.shardCapacity - localID
+		}
 
 		for shardIdx >= len(s.shards) {
 			if err := s.createShard(); err != nil {
@@ -280,6 +311,7 @@ func (s *ShardedVectorStore) ShardCount() int {
 type ShardedVectorSnapshot struct {
 	shards        []*VectorSnapshot
 	shardCapacity int
+	useBitOps     bool
 	count         uint64
 	dim           int
 }
@@ -298,6 +330,7 @@ func (s *ShardedVectorStore) Snapshot() *ShardedVectorSnapshot {
 	return &ShardedVectorSnapshot{
 		shards:        snapshots,
 		shardCapacity: s.shardCapacity,
+		useBitOps:     s.useBitOps,
 		count:         s.total.Load(),
 		dim:           s.dim,
 	}
@@ -308,8 +341,15 @@ func (snap *ShardedVectorSnapshot) Get(vectorID uint32) []float32 {
 		return nil
 	}
 
-	shardIdx := int(vectorID) / snap.shardCapacity
-	localID := uint32(int(vectorID) % snap.shardCapacity)
+	var shardIdx int
+	var localID uint32
+	if snap.useBitOps {
+		shardIdx = int(vectorID >> shardShift)
+		localID = vectorID & shardMask
+	} else {
+		shardIdx = int(vectorID) / snap.shardCapacity
+		localID = uint32(int(vectorID) % snap.shardCapacity)
+	}
 
 	if shardIdx >= len(snap.shards) {
 		return nil
