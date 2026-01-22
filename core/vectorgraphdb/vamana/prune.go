@@ -267,6 +267,7 @@ func RobustPruneDirect(
 	})
 
 	examineCount := min(maxExamine, len(scored))
+	maxCheck := bits.Len(uint(R * R))
 
 	selected := buf.Selected[:0]
 	consecutiveRejections := 0
@@ -281,7 +282,9 @@ func RobustPruneDirect(
 		cMag := mags[c.id]
 
 		keep := true
-		for _, s := range selected {
+		checkStart := max(0, len(selected)-maxCheck)
+		for j := checkStart; j < len(selected); j++ {
+			s := selected[j]
 			sVec := vectors[s]
 			sMag := mags[s]
 			var distCS float64
