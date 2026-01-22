@@ -185,15 +185,14 @@ func (s *ShardedVectorStore) getShard(vectorID uint32) (*vectorShard, uint32) {
 	return s.shards[shardIdx], localID
 }
 
+// Get returns the vector at the given ID.
+// No lock needed: mmap reads are thread-safe, and Get returns a zero-copy
+// slice into mmap memory. Concurrent writes to different vectors are safe.
 func (s *ShardedVectorStore) Get(vectorID uint32) []float32 {
 	shard, localID := s.getShard(vectorID)
 	if shard == nil {
 		return nil
 	}
-
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
 	return shard.store.Get(localID)
 }
 

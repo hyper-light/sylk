@@ -197,15 +197,12 @@ func (s *ShardedGraphStore) getShard(nodeID uint32) (*graphShard, uint32) {
 
 // GetNeighbors returns the neighbor list for the given node.
 // Returns nil if the node doesn't exist or has no neighbors.
+// No lock needed: mmap reads are thread-safe for concurrent access.
 func (s *ShardedGraphStore) GetNeighbors(nodeID uint32) []uint32 {
 	shard, localID := s.getShard(nodeID)
 	if shard == nil {
 		return nil
 	}
-
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
 	return shard.store.GetNeighbors(localID)
 }
 
@@ -215,10 +212,6 @@ func (s *ShardedGraphStore) GetNeighborCount(nodeID uint32) uint16 {
 	if shard == nil {
 		return 0
 	}
-
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
 	return shard.store.GetNeighborCount(localID)
 }
 
