@@ -579,19 +579,7 @@ func (b *BatchBuilder) refinePassParallel(
 			graphStore.SetNeighbors(u.nodeID, u.newNeighbors)
 
 			for _, neighborID := range u.newNeighbors {
-				existingNeighbors := graphStore.GetNeighbors(neighborID)
-				hasEdge := false
-				for _, en := range existingNeighbors {
-					if en == u.nodeID {
-						hasEdge = true
-						break
-					}
-				}
-
-				if !hasEdge && len(existingNeighbors) < R {
-					updated := append(existingNeighbors, u.nodeID)
-					graphStore.SetNeighbors(neighborID, updated)
-				}
+				graphStore.AddNeighbor(neighborID, u.nodeID)
 			}
 		}
 	}

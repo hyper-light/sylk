@@ -211,6 +211,34 @@ func (s *GraphStore) SetNeighbors(internalID uint32, neighbors []uint32) error {
 	return nil
 }
 
+// AddNeighbor appends a neighbor if not present and list not full. Returns true if added.
+func (s *GraphStore) AddNeighbor(internalID, neighborID uint32) bool {
+	if s.closed.Load() || uint64(internalID) >= s.capacity {
+		return false
+	}
+
+	data := s.region.Data()
+	offset := s.nodeOffset(internalID)
+	count := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+
+	if count >= s.R {
+		return false
+	}
+
+	neighborsStart := offset + 2
+	for i := range count {
+		pos := neighborsStart + int64(i)*4
+		if binary.LittleEndian.Uint32(data[pos:]) == neighborID {
+			return false
+		}
+	}
+
+	binary.LittleEndian.PutUint32(data[neighborsStart+int64(count)*4:], neighborID)
+	binary.LittleEndian.PutUint16(data[offset:offset+2], uint16(count+1))
+
+	return true
+}
+
 // GetNeighborCount returns the number of neighbors for the given node.
 // Returns 0 if the node has no neighbors, the ID is out of bounds, or the store is closed.
 func (s *GraphStore) GetNeighborCount(internalID uint32) uint16 {
