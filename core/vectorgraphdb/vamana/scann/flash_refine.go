@@ -89,18 +89,13 @@ func (r *LargeScaleRefiner) RefineOnce(order []int) int {
 						candidateList = append(candidateList, neighbor)
 					}
 
-					candidateCap := maxCandidates + maxCandidates
-					for _, neighbor := range currentNeighbors {
-						if len(candidateList) >= candidateCap {
-							break
-						}
+					exploreCount := min(logR, len(currentNeighbors))
+					for i := range exploreCount {
+						neighbor := currentNeighbors[i]
 						for _, nn := range r.graphStore.GetNeighbors(neighbor) {
 							if nn != nodeID && !seen[nn] {
 								seen[nn] = true
 								candidateList = append(candidateList, nn)
-								if len(candidateList) >= candidateCap {
-									break
-								}
 							}
 						}
 					}
