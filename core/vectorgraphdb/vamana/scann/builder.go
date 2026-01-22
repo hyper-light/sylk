@@ -91,7 +91,7 @@ func (b *BatchBuilder) Build(
 	b.buildGraphLocalityAware(n, vectors, graphStore)
 	b.refineGraph(vectors, graphStore, magCache)
 
-	medoid := vamana.ComputeCentroidMedoid(vectorStore, magCache, nil)
+	medoid := vamana.ComputeMedoidFromVectors(vectors)
 
 	return &BuildResult{
 		Partitioner: b.partitioner,
@@ -141,7 +141,7 @@ func (b *BatchBuilder) BuildWithTimings(
 	timings.Refinement = time.Since(start)
 
 	start = time.Now()
-	medoid := vamana.ComputeCentroidMedoid(vectorStore, magCache, nil)
+	medoid := vamana.ComputeMedoidFromVectors(vectors)
 	timings.Medoid = time.Since(start)
 
 	return &BuildResult{

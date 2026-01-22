@@ -1,7 +1,6 @@
 package stitch
 
 import (
-	"bufio"
 	"context"
 	"os"
 	"os/exec"
@@ -12,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/document"
 	"github.com/adalundhe/sylk/core/search/indexer"
 	"github.com/adalundhe/sylk/core/treesitter"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
@@ -42,8 +42,8 @@ func TestStitch_RealWorld_SylkPlusPaperPlusRepo(t *testing.T) {
 	sylkSymbols := collectGoSymbols(t, sylkRoot)
 	t.Logf("Sylk symbols: %d", len(sylkSymbols))
 
-	t.Log("=== Phase 2: Collect paper chunks ===")
-	paperChunks := collectPaperChunks(t, filepath.Join(testDataDir, "paper.txt"))
+	t.Log("=== Phase 2: Chunk paper via DocumentChunker ===")
+	paperChunks := chunkPaperDocument(t, filepath.Join(testDataDir, "paper.txt"))
 	t.Logf("Paper chunks: %d", len(paperChunks))
 
 	t.Log("=== Phase 3: Collect DiskANN symbols ===")
@@ -69,7 +69,11 @@ func TestStitch_RealWorld_SylkPlusPaperPlusRepo(t *testing.T) {
 	}
 	sylkEmbeddings, _ := mockEmb.EmbedBatch(context.Background(), sylkTexts)
 
-	paperEmbeddings, _ := mockEmb.EmbedBatch(context.Background(), paperChunks)
+	paperTexts := make([]string, len(paperChunks))
+	for i, chunk := range paperChunks {
+		paperTexts[i] = chunk.Text
+	}
+	paperEmbeddings, _ := mockEmb.EmbedBatch(context.Background(), paperTexts)
 
 	diskannTexts := make([]string, diskannCount)
 	for i, s := range diskannSymbols {
@@ -100,7 +104,7 @@ func TestStitch_RealWorld_SylkPlusPaperPlusRepo(t *testing.T) {
 	magCache := vamana.NewMagnitudeCache(totalCount)
 
 	t.Log("=== Phase 6: Build Sylk graph ===")
-	sylkGraph, err := storage.CreateGraphStore(filepath.Join(tmpDir, "sylk_graph.bin"), config.R, sylkCount)
+	sylkGraph, err := storage.CreateGraphStore(filepath.Join(tmpDir, "sylk_graph.bin"), config.R, totalCount)
 	if err != nil {
 		t.Fatalf("CreateGraphStore sylk: %v", err)
 	}
@@ -279,44 +283,21 @@ func collectGoSymbols(t *testing.T, root string) []symbolInfo {
 	return symbols
 }
 
-func collectPaperChunks(t *testing.T, paperPath string) []string {
+func chunkPaperDocument(t *testing.T, paperPath string) []document.Chunk {
 	t.Helper()
-	file, err := os.Open(paperPath)
+	content, err := os.ReadFile(paperPath)
 	if err != nil {
-		t.Fatalf("Open paper: %v", err)
-	}
-	defer file.Close()
-
-	var chunks []string
-	var currentChunk strings.Builder
-	lineCount := 0
-	chunkSize := 10
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		currentChunk.WriteString(line)
-		currentChunk.WriteString(" ")
-		lineCount++
-
-		if lineCount >= chunkSize {
-			chunk := strings.TrimSpace(currentChunk.String())
-			if len(chunk) > 50 {
-				chunks = append(chunks, chunk)
-			}
-			currentChunk.Reset()
-			lineCount = 0
-		}
+		t.Fatalf("Read paper: %v", err)
 	}
 
-	if currentChunk.Len() > 50 {
-		chunks = append(chunks, strings.TrimSpace(currentChunk.String()))
-	}
+	chunker := document.NewChunker(document.ChunkerConfig{
+		TargetChunkSize: 512,
+		OverlapSize:     64,
+		MinChunkSize:    50,
+	})
 
-	return chunks
+	documentID := filepath.Base(paperPath)
+	return chunker.Chunk(documentID, string(content))
 }
 
 func collectRustSymbols(t *testing.T, root string) []symbolInfo {

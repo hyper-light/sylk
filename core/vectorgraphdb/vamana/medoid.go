@@ -234,3 +234,59 @@ func sampleNodes(nodes []uint32, sampleSize int) []uint32 {
 
 	return shuffled[:sampleSize]
 }
+
+// ComputeMedoidFromVectors finds the centroid-nearest vector from a slice.
+// Returns index within the slice (local ID), not a global VectorStore ID.
+// O(n*d) where n is vector count and d is dimension.
+func ComputeMedoidFromVectors(vectors [][]float32) uint32 {
+	n := len(vectors)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		return 0
+	}
+
+	dim := len(vectors[0])
+	centroid := make([]float64, dim)
+
+	for _, vec := range vectors {
+		for i, v := range vec {
+			centroid[i] += float64(v)
+		}
+	}
+
+	count := float64(n)
+	for i := range centroid {
+		centroid[i] /= count
+	}
+
+	centroidF32 := make([]float32, dim)
+	for i, v := range centroid {
+		centroidF32[i] = float32(v)
+	}
+	centroidMag := Magnitude(centroidF32)
+	if centroidMag == 0 {
+		return 0
+	}
+
+	var bestIdx uint32
+	bestSimilarity := -2.0
+
+	for i, vec := range vectors {
+		mag := Magnitude(vec)
+		if mag == 0 {
+			continue
+		}
+
+		dot := DotProduct(centroidF32, vec)
+		similarity := float64(dot) / (centroidMag * mag)
+
+		if similarity > bestSimilarity {
+			bestSimilarity = similarity
+			bestIdx = uint32(i)
+		}
+	}
+
+	return bestIdx
+}

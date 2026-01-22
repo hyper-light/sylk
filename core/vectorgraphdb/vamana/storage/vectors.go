@@ -321,7 +321,45 @@ func (s *VectorStore) Close() error {
 	return err
 }
 
-// floatToUint32 converts a float32 to its IEEE 754 binary representation.
 func floatToUint32(f float32) uint32 {
 	return *(*uint32)(unsafe.Pointer(&f))
+}
+
+func (s *VectorStore) Set(internalID uint32, vector []float32) error {
+	if len(vector) != s.dim {
+		return ErrVectorDimensionMismatch
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.region == nil {
+		return ErrVectorStoreClosed
+	}
+
+	if s.region.Readonly() {
+		return ErrVectorStoreNotWritable
+	}
+
+	if uint64(internalID) >= s.capacity {
+		return ErrVectorIndexOutOfBounds
+	}
+
+	data := s.region.Data()
+	if data == nil {
+		return ErrVectorStoreClosed
+	}
+
+	offset := vectorOffset(s.dim, uint64(internalID))
+	dst := data[offset : offset+vectorSize(s.dim)]
+	for i, v := range vector {
+		binary.LittleEndian.PutUint32(dst[i*4:], floatToUint32(v))
+	}
+
+	if uint64(internalID) >= s.header.Count {
+		s.header.Count = uint64(internalID) + 1
+		binary.LittleEndian.PutUint64(data[4:12], s.header.Count)
+	}
+
+	return nil
 }

@@ -398,13 +398,12 @@ func verifyStorage(t *testing.T, tmpDir string, symbols []Symbol, stats IngestSt
 		t.Errorf("IDMap size mismatch: got %d, want %d", idMap.Size(), len(symbols))
 	}
 
-	// Verify random samples
 	sampleCount := min(100, len(symbols))
 	step := len(symbols) / sampleCount
 	var verified int
 
-	for i := 0; i < len(symbols); i += step {
-		sym := symbols[i]
+	for j := range sampleCount {
+		sym := symbols[j*step]
 
 		// Check ID mapping
 		internalID, ok := idMap.ToInternal(sym.ID)

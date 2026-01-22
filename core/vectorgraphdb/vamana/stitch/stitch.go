@@ -2,6 +2,7 @@ package stitch
 
 import (
 	"container/heap"
+	"runtime"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/storage"
@@ -97,83 +98,146 @@ func (s *Stitcher) Stitch(
 	result.MainBoundaryNodes = len(mainBoundary)
 	result.SegmentBoundaryNodes = len(segmentBoundary)
 
-	// Connect segment boundary nodes to main graph
-	for _, segLocalID := range segmentBoundary {
-		segGlobalID := segLocalID + segmentOffset
-		segVec := vectors.Get(segGlobalID)
-		if segVec == nil {
-			continue
-		}
+	numWorkers := runtime.NumCPU()
+	snapshot := vectors.Snapshot()
 
-		// Search main graph for nearest neighbors
-		neighbors := vamana.GreedySearch(
-			segVec,
-			mainMedoid,
-			s.config.L,
-			s.config.CrossEdgesPerNode,
-			vectors,
-			mainGraph,
-			s.magCache,
-		)
-		result.SearchesPerformed++
-
-		// Add bidirectional cross-edges
-		for _, neighbor := range neighbors {
-			mainNodeID := uint32(neighbor.InternalID)
-
-			// Add edge: segment node → main node
-			s.addEdgeWithPrune(segmentGraph, segLocalID, mainNodeID, vectors, result)
-
-			// Add edge: main node → segment node (global ID)
-			s.addEdgeWithPrune(mainGraph, mainNodeID, segGlobalID, vectors, result)
-
-			result.CrossEdgesAdded += 2
-		}
+	type crossEdge struct {
+		mainID      uint32
+		segLocalID  uint32
+		segGlobalID uint32
 	}
 
-	// Connect main boundary nodes to segment graph
-	for _, mainNodeID := range mainBoundary {
-		mainVec := vectors.Get(mainNodeID)
-		if mainVec == nil {
-			continue
-		}
-
-		// Search segment graph for nearest neighbors
-		// Need to adjust: segment graph uses local IDs (0-based)
-		// but vectors are at global positions (mainCount + localID)
-		neighbors := s.searchSegment(
-			mainVec,
-			segmentMedoid,
-			segmentGraph,
-			vectors,
-			segmentOffset,
-		)
-		result.SearchesPerformed++
-
-		for _, neighbor := range neighbors {
-			segLocalID := uint32(neighbor.InternalID)
-			segGlobalID := segLocalID + segmentOffset
-
-			// Add edge: main node → segment node (global ID)
-			s.addEdgeWithPrune(mainGraph, mainNodeID, segGlobalID, vectors, result)
-
-			// Add edge: segment node → main node
-			s.addEdgeWithPrune(segmentGraph, segLocalID, mainNodeID, vectors, result)
-
-			result.CrossEdgesAdded += 2
-		}
+	phase1Results := make(chan []crossEdge, numWorkers)
+	segChan := make(chan uint32, len(segmentBoundary))
+	for _, id := range segmentBoundary {
+		segChan <- id
 	}
+	close(segChan)
+
+	for range numWorkers {
+		go func() {
+			var localEdges []crossEdge
+			for segLocalID := range segChan {
+				segGlobalID := segLocalID + segmentOffset
+				segVec := snapshot.Get(segGlobalID)
+				if segVec == nil {
+					continue
+				}
+
+				neighbors := vamana.GreedySearchFast(
+					segVec,
+					mainMedoid,
+					s.config.L,
+					s.config.CrossEdgesPerNode,
+					snapshot,
+					mainGraph,
+					s.magCache,
+				)
+
+				for _, neighbor := range neighbors {
+					localEdges = append(localEdges, crossEdge{
+						mainID:      uint32(neighbor.InternalID),
+						segLocalID:  segLocalID,
+						segGlobalID: segGlobalID,
+					})
+				}
+			}
+			phase1Results <- localEdges
+		}()
+	}
+
+	var phase1Edges []crossEdge
+	for range numWorkers {
+		phase1Edges = append(phase1Edges, <-phase1Results...)
+	}
+
+	phase2Results := make(chan []crossEdge, numWorkers)
+	mainChan := make(chan uint32, len(mainBoundary))
+	for _, id := range mainBoundary {
+		mainChan <- id
+	}
+	close(mainChan)
+
+	for range numWorkers {
+		go func() {
+			var localEdges []crossEdge
+			for mainNodeID := range mainChan {
+				mainVec := snapshot.Get(mainNodeID)
+				if mainVec == nil {
+					continue
+				}
+
+				neighbors := s.searchSegmentFast(
+					mainVec,
+					segmentMedoid,
+					segmentGraph,
+					snapshot,
+					segmentOffset,
+					segmentCount,
+				)
+
+				for _, neighbor := range neighbors {
+					segLocalID := uint32(neighbor.InternalID)
+					localEdges = append(localEdges, crossEdge{
+						mainID:      mainNodeID,
+						segLocalID:  segLocalID,
+						segGlobalID: segLocalID + segmentOffset,
+					})
+				}
+			}
+			phase2Results <- localEdges
+		}()
+	}
+
+	var phase2Edges []crossEdge
+	for range numWorkers {
+		phase2Edges = append(phase2Edges, <-phase2Results...)
+	}
+
+	mergeSegmentIntoMain(mainGraph, segmentGraph, segmentOffset, segmentCount)
+
+	for _, e := range phase1Edges {
+		mainGraph.AddNeighbor(e.mainID, e.segGlobalID)
+		mainGraph.AddNeighbor(e.segGlobalID, e.mainID)
+	}
+
+	for _, e := range phase2Edges {
+		mainGraph.AddNeighbor(e.mainID, e.segGlobalID)
+		mainGraph.AddNeighbor(e.segGlobalID, e.mainID)
+	}
+
+	result.SearchesPerformed = len(segmentBoundary) + len(mainBoundary)
+	result.CrossEdgesAdded = (len(phase1Edges) + len(phase2Edges)) * 2
 
 	return result, nil
 }
 
-// searchSegment searches segment graph, translating local IDs to global vector positions.
-func (s *Stitcher) searchSegment(
+func mergeSegmentIntoMain(mainGraph, segmentGraph *storage.GraphStore, segmentOffset uint32, segmentCount int) {
+	for localID := range segmentCount {
+		globalID := uint32(localID) + segmentOffset
+		localNeighbors := segmentGraph.GetNeighbors(uint32(localID))
+
+		globalNeighbors := make([]uint32, len(localNeighbors))
+		for i, n := range localNeighbors {
+			globalNeighbors[i] = n + segmentOffset
+		}
+
+		mainGraph.SetNeighbors(globalID, globalNeighbors)
+	}
+}
+
+func (s *Stitcher) addEdgeNoPrune(graph *storage.GraphStore, fromID, toID uint32) {
+	graph.AddNeighbor(fromID, toID)
+}
+
+// searchSegmentFast searches segment graph using lock-free snapshot and []bool visited.
+func (s *Stitcher) searchSegmentFast(
 	query []float32,
 	medoid uint32,
 	segmentGraph *storage.GraphStore,
-	vectors *storage.VectorStore,
+	snapshot *storage.VectorSnapshot,
 	segmentOffset uint32,
+	segmentCount int,
 ) []vamana.SearchResult {
 	L := s.config.L
 	K := s.config.CrossEdgesPerNode
@@ -189,7 +253,7 @@ func (s *Stitcher) searchSegment(
 
 	distFn := func(localID uint32) float64 {
 		globalID := localID + segmentOffset
-		vec := vectors.Get(globalID)
+		vec := snapshot.Get(globalID)
 		if vec == nil {
 			return 2.0
 		}
@@ -201,19 +265,22 @@ func (s *Stitcher) searchSegment(
 		return 1.0 - float64(dot)/(queryMag*vecMag)
 	}
 
-	visited := make(map[uint32]struct{}, L*2)
+	visited := make([]bool, segmentCount)
 	candidates := make(minHeap, 0, L)
 	results := make(maxHeap, 0, L)
 
 	heap.Push(&candidates, searchCandidate{id: medoid, dist: distFn(medoid)})
 
+	itersSinceImprovement := 0
+	var prevBound float64 = 2.0
+
 	for candidates.Len() > 0 {
 		current := heap.Pop(&candidates).(searchCandidate)
 
-		if _, seen := visited[current.id]; seen {
+		if visited[current.id] {
 			continue
 		}
-		visited[current.id] = struct{}{}
+		visited[current.id] = true
 
 		heap.Push(&results, current)
 		if results.Len() > L {
@@ -225,9 +292,19 @@ func (s *Stitcher) searchSegment(
 			bound = results[0].dist
 		}
 
+		if bound < prevBound {
+			itersSinceImprovement = 0
+			prevBound = bound
+		} else {
+			itersSinceImprovement++
+			if results.Len() >= L && itersSinceImprovement >= L {
+				break
+			}
+		}
+
 		neighbors := segmentGraph.GetNeighbors(current.id)
 		for _, nid := range neighbors {
-			if _, seen := visited[nid]; seen {
+			if visited[nid] {
 				continue
 			}
 			dist := distFn(nid)

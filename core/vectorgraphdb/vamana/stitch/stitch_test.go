@@ -41,7 +41,7 @@ func TestStitch_Basic(t *testing.T) {
 
 	config := vamana.DefaultConfig()
 
-	mainGraph, err := storage.CreateGraphStore(filepath.Join(tmpDir, "main_graph.bin"), config.R, mainSize)
+	mainGraph, err := storage.CreateGraphStore(filepath.Join(tmpDir, "main_graph.bin"), config.R, totalSize)
 	if err != nil {
 		t.Fatalf("CreateGraphStore main: %v", err)
 	}
