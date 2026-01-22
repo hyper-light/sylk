@@ -3,21 +3,19 @@ package hnsw
 import (
 	"math"
 
+	"github.com/viterin/vek/vek32"
 	"gonum.org/v1/gonum/blas"
 	"gonum.org/v1/gonum/blas/blas32"
 )
 
-// DotProduct computes the dot product of two vectors using BLAS.
+// DotProduct computes the dot product of two vectors using SIMD.
 // Returns 0 if vectors have different lengths or are empty.
 func DotProduct(a, b []float32) float32 {
 	n := len(a)
 	if n != len(b) || n == 0 {
 		return 0
 	}
-	return blas32.Dot(
-		blas32.Vector{N: n, Inc: 1, Data: a},
-		blas32.Vector{N: n, Inc: 1, Data: b},
-	)
+	return vek32.Dot(a, b)
 }
 
 // BatchDotProducts computes dot products of query against multiple vectors.
