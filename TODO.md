@@ -36696,7 +36696,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ ** DOGFOODING: All validation uses Sylk codebase as test corpus **              ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ [ ] VAM.77 - Storage Benchmark on Sylk                                          ││
+│ │ [x] VAM.77 - Storage Benchmark on Sylk ✅ DONE                                   ││
 │ │   FILE: core/vectorgraphdb/vamana/benchmark/storage_test.go                     ││
 │ │   TARGET: /home/ada/Projects/sylk (THIS REPO)                                   ││
 │ │   IMPLEMENT:                                                                    ││
@@ -36844,7 +36844,7 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ ** DOGFOODING: Query actual Sylk code with real developer questions **          ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │                                                                                  ││
-│ │ [ ] VAM.78 - Search Benchmark on Sylk                                           ││
+│ │ [x] VAM.78 - Search Benchmark on Sylk ✅ DONE                                    ││
 │ │   FILE: core/vectorgraphdb/vamana/benchmark/search_test.go                      ││
 │ │   TARGET: Indexed Sylk codebase from VAM.77                                     ││
 │ │   IMPLEMENT:                                                                    ││
@@ -36881,6 +36881,49 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │   PRIORITY: HIGH                                                                ││
 │ │   BLOCKING: Must pass before proceeding to Phase 8                              ││
 │ │   RUN: go test -v -run BenchmarkSearch ./core/vectorgraphdb/vamana/...          ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 7B: Graph Stitching (2 tasks - depends on Phase 6, 7)                 ││
+│ │ ** Efficient merge of independently-built graphs for large batch ingestion **   ││
+│ │ ** Enables: ingest entire papers/repos without full rebuild **                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ [ ] VAM.80 - Boundary Sampling                                                  ││
+│ │   FILE: core/vectorgraphdb/vamana/stitch/boundary.go                            ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - SampleBoundary(graph *GraphStore, k int) []InternalID                     ││
+│ │     - Strategies:                                                               ││
+│ │       1. Random sampling (baseline)                                             ││
+│ │       2. High-degree nodes (hubs are good bridges)                              ││
+│ │       3. KMeans centroids on vectors (geometric coverage)                       ││
+│ │     - Default: random with k = √N                                               ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Returns k representative nodes from graph                             ││
+│ │     - [ ] O(N) for random, O(N*k) for degree-based                              ││
+│ │     - [ ] Deterministic with seed for reproducibility                           ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] VAM.81 - Graph Stitching                                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/stitch/stitch.go                              ││
+│ │   IMPLEMENT:                                                                    ││
+│ │     - StitchGraphs(main, segment *GraphStore, vectors *VectorStore) error       ││
+│ │     Algorithm:                                                                  ││
+│ │       1. Sample boundary nodes from segment: √|segment|                         ││
+│ │       2. Sample boundary nodes from main: √|main|                               ││
+│ │       3. For each boundary node in segment:                                     ││
+│ │          - GreedySearch main graph for R/2 neighbors                            ││
+│ │          - Add bidirectional cross-edges                                        ││
+│ │          - RobustPrune if degree > R                                            ││
+│ │       4. For each boundary node in main:                                        ││
+│ │          - GreedySearch segment for R/2 neighbors                               ││
+│ │          - Add bidirectional cross-edges                                        ││
+│ │          - RobustPrune if degree > R                                            ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] O(√N) searches, not O(N)                                              ││
+│ │     - [ ] Merged graph maintains navigability (recall unchanged)                ││
+│ │     - [ ] 20k + 5k stitch < 500ms                                               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   BENCHMARK: go test -v -run TestStitch ./core/vectorgraphdb/vamana/stitch/     ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │ VAM PHASE 8: Delta Layer & WAL (5 tasks - depends on Phase 6)                   ││
