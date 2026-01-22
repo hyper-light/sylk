@@ -4,6 +4,8 @@ import (
 	"math/bits"
 	"math/rand/v2"
 	"slices"
+
+	"github.com/viterin/vek/vek32"
 )
 
 type DistanceFunc func(a, b uint32) float64
@@ -248,7 +250,7 @@ func RobustPruneDirect(
 		if pMag == 0 || cMag == 0 {
 			dist = 2.0
 		} else {
-			dot := DotProduct(pVec, cVec)
+			dot := vek32.Dot(pVec, cVec)
 			dist = 1.0 - float64(dot)/(pMag*cMag)
 		}
 		scored[i] = candidate{id: c, dist: dist}
@@ -286,7 +288,7 @@ func RobustPruneDirect(
 			if cMag == 0 || sMag == 0 {
 				distCS = 2.0
 			} else {
-				dot := DotProduct(cVec, sVec)
+				dot := vek32.Dot(cVec, sVec)
 				distCS = 1.0 - float64(dot)/(cMag*sMag)
 			}
 			if c.dist > alpha*distCS {
