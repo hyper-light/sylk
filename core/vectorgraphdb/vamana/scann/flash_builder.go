@@ -195,7 +195,7 @@ func (b *BatchBuilder) refinePassFlash(
 
 			seen := make([]bool, vecCount)
 			candidateList := make([]uint32, 0, R*R)
-			flashBuf := NewFlashPruneBuffers(R * R)
+			flashBuf := NewFlashPruneBuffers(R*R, R)
 
 			for chunk := range workCh {
 				updates := make([]nodeUpdate, 0, len(chunk))

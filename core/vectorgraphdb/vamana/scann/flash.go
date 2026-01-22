@@ -372,9 +372,11 @@ func (fm *FlashMags) Get(id uint32) float32 {
 }
 
 type FlashPruneBuffers struct {
-	adt     *ADT
-	scored  []flashCandidate
-	toScore []uint32
+	adt           *ADT
+	scored        []flashCandidate
+	toScore       []uint32
+	selectedCodes [][]uint8
+	selectedMags  []float32
 }
 
 type flashCandidate struct {
@@ -382,10 +384,12 @@ type flashCandidate struct {
 	dist float64
 }
 
-func NewFlashPruneBuffers(maxCandidates int) *FlashPruneBuffers {
+func NewFlashPruneBuffers(maxCandidates int, R int) *FlashPruneBuffers {
 	return &FlashPruneBuffers{
-		scored:  make([]flashCandidate, maxCandidates),
-		toScore: make([]uint32, maxCandidates),
+		scored:        make([]flashCandidate, maxCandidates),
+		toScore:       make([]uint32, maxCandidates),
+		selectedCodes: make([][]uint8, R),
+		selectedMags:  make([]float32, R),
 	}
 }
 
@@ -479,8 +483,8 @@ func (fc *FlashCoder) RobustPruneFlash(
 	selected := make([]uint32, 0, R)
 	consecutiveRejections := 0
 
-	selectedCodes := make([][]uint8, 0, R)
-	selectedMags := make([]float32, 0, R)
+	selectedCodes := buf.selectedCodes[:0]
+	selectedMags := buf.selectedMags[:0]
 
 	for i := range examineCount {
 		if len(selected) >= R || consecutiveRejections >= R {
