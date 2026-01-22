@@ -173,6 +173,38 @@ func (s *GraphStore) GetNeighbors(internalID uint32) []uint32 {
 	return unsafe.Slice((*uint32)(neighborsPtr), int(count))
 }
 
+// NeighborAccessor provides fast neighbor lookups without per-call atomic checks.
+// Use for batch operations where the store is guaranteed to remain open.
+type NeighborAccessor struct {
+	data     []byte
+	nodeSize int64
+	capacity uint64
+}
+
+// NewNeighborAccessor creates a fast accessor for batch neighbor lookups.
+// The accessor is only valid while the GraphStore remains open.
+func (s *GraphStore) NewNeighborAccessor() NeighborAccessor {
+	return NeighborAccessor{
+		data:     s.region.Data(),
+		nodeSize: s.nodeSize,
+		capacity: s.capacity,
+	}
+}
+
+// Get returns neighbors for nodeID without atomic checks.
+func (a *NeighborAccessor) Get(nodeID uint32) []uint32 {
+	if uint64(nodeID) >= a.capacity {
+		return nil
+	}
+	offset := HeaderSize + int64(nodeID)*a.nodeSize
+	count := binary.LittleEndian.Uint16(a.data[offset : offset+2])
+	if count == 0 {
+		return nil
+	}
+	neighborsPtr := unsafe.Pointer(&a.data[offset+2])
+	return unsafe.Slice((*uint32)(neighborsPtr), int(count))
+}
+
 // SetNeighbors sets the neighbor list for the given node.
 // If len(neighbors) > R, the list is truncated to R elements.
 // Returns an error if the node ID exceeds capacity or the store is closed.

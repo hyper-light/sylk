@@ -67,6 +67,8 @@ func (r *LargeScaleRefiner) RefineOnce(order []int) int {
 	maxCandidates := r.R + logR2 + logR2
 	minImprovement := r.R / logR
 
+	accessor := r.graphStore.NewNeighborAccessor()
+
 	for range numWorkers {
 		wg.Add(1)
 		go func() {
@@ -81,7 +83,7 @@ func (r *LargeScaleRefiner) RefineOnce(order []int) int {
 
 				for _, idx := range chunk {
 					nodeID := uint32(idx)
-					currentNeighbors := r.graphStore.GetNeighbors(nodeID)
+					currentNeighbors := accessor.Get(nodeID)
 
 					candidateList = candidateList[:0]
 					for _, neighbor := range currentNeighbors {
@@ -94,7 +96,7 @@ func (r *LargeScaleRefiner) RefineOnce(order []int) int {
 						if len(candidateList) >= candidateCap {
 							break
 						}
-						for _, nn := range r.graphStore.GetNeighbors(neighbor) {
+						for _, nn := range accessor.Get(neighbor) {
 							if nn != nodeID && !seen[nn] {
 								seen[nn] = true
 								candidateList = append(candidateList, nn)
