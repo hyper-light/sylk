@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
+	"github.com/viterin/vek/vek32"
 )
 
 type Partitioner struct {
@@ -187,13 +187,13 @@ func (p *Partitioner) findNearestWithNorm(vec []float32, vecNormSq float64) uint
 		return p.findNearestScalar(vec)
 	}
 
-	dots := make([]float32, p.numParts)
-	vamana.BatchDotProducts(vec, p.centroidsFlat, p.numParts, dots)
-
 	var bestIdx uint32
 	bestDist := math.MaxFloat64
+	dim := p.dim
 	for i := range p.numParts {
-		d := vecNormSq + p.centroidNormsSq[i] - 2*float64(dots[i])
+		centroid := p.centroidsFlat[i*dim : (i+1)*dim]
+		dot := vek32.Dot(vec, centroid)
+		d := vecNormSq + p.centroidNormsSq[i] - 2*float64(dot)
 		if d < bestDist {
 			bestDist = d
 			bestIdx = uint32(i)
