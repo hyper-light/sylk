@@ -2,6 +2,7 @@ package scann
 
 import (
 	"math"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 
@@ -10,14 +11,12 @@ import (
 )
 
 type GraphDifficulty struct {
-	AvgExpansion    float64 // nodes visited / L at baseline search
-	AvgPathLength   float64 // hops from medoid to reach targets
-	ConvergenceRate float64 // how quickly search stops improving
+	AvgExpansion    float64
+	AvgPathLength   float64
+	ConvergenceRate float64
+	ProbeCount      int
 }
 
-// ProbeGraphDifficulty measures search difficulty by running sample queries.
-// Returns metrics that characterize how hard it is to search this graph.
-// Cost: ~5-10ms for 10 probes on 23K vector graph.
 func ProbeGraphDifficulty(
 	vectors [][]float32,
 	snapshot *storage.VectorSnapshot,
@@ -28,18 +27,20 @@ func ProbeGraphDifficulty(
 ) GraphDifficulty {
 	n := len(vectors)
 	if n == 0 || snapshot == nil {
-		return GraphDifficulty{AvgExpansion: 1.0, AvgPathLength: 1.0, ConvergenceRate: 1.0}
+		return defaultDifficulty(R)
 	}
 
-	numProbes := min(10, n)
+	numProbes := bits.Len(uint(n))
 	probeIndices := sampleRandomIndices(n, numProbes)
 
 	var totalExpansion, totalPathLen, totalConvRate float64
 	validProbes := 0
 
+	maxIter := R + bits.Len(uint(n))
+
 	for _, idx := range probeIndices {
 		queryVec := vectors[idx]
-		visited, pathLen, convRate := probeSearch(queryVec, medoid, R, snapshot, graphStore, magCache)
+		visited, pathLen, convRate := probeSearch(queryVec, medoid, maxIter, snapshot, graphStore, magCache)
 
 		if visited > 0 {
 			totalExpansion += float64(visited) / float64(R)
@@ -50,20 +51,30 @@ func ProbeGraphDifficulty(
 	}
 
 	if validProbes == 0 {
-		return GraphDifficulty{AvgExpansion: 1.0, AvgPathLength: 1.0, ConvergenceRate: 1.0}
+		return defaultDifficulty(R)
 	}
 
 	return GraphDifficulty{
 		AvgExpansion:    totalExpansion / float64(validProbes),
 		AvgPathLength:   totalPathLen / float64(validProbes),
 		ConvergenceRate: totalConvRate / float64(validProbes),
+		ProbeCount:      validProbes,
+	}
+}
+
+func defaultDifficulty(R int) GraphDifficulty {
+	return GraphDifficulty{
+		AvgExpansion:    float64(bits.Len(uint(R))) / float64(R),
+		AvgPathLength:   float64(bits.Len(uint(R))),
+		ConvergenceRate: 1.0,
+		ProbeCount:      0,
 	}
 }
 
 func probeSearch(
 	query []float32,
 	start uint32,
-	L int,
+	maxIter int,
 	snapshot *storage.VectorSnapshot,
 	graphStore *storage.GraphStore,
 	magCache *vamana.MagnitudeCache,
@@ -77,8 +88,9 @@ func probeSearch(
 	current := start
 	var bestDist float64 = 2.0
 	stableCount := 0
+	stableThreshold := bits.Len(uint(maxIter))
 
-	for iter := 0; iter < L*2; iter++ {
+	for iter := 0; iter < maxIter; iter++ {
 		if seen[current] {
 			break
 		}
@@ -102,7 +114,7 @@ func probeSearch(
 			stableCount = 0
 		} else {
 			stableCount++
-			if stableCount >= 3 {
+			if stableCount >= stableThreshold {
 				break
 			}
 		}
@@ -148,39 +160,26 @@ func probeSearch(
 	return
 }
 
-// DeriveL computes L from measured graph difficulty and target recall.
-// Formula: L = R * (baseMultiplier + difficultyAdjustment) * recallScaling
 func DeriveL(R int, targetRecall float64, difficulty GraphDifficulty) int {
-	if targetRecall <= 0.80 {
-		return R
-	}
-	if targetRecall >= 1.0 {
-		targetRecall = 0.995
-	}
+	targetRecall = max(0.0, min(targetRecall, 1.0-1.0/float64(R*R)))
 
-	baseMultiplier := 1.0
-	difficultyAdjust := (difficulty.AvgExpansion - 1.0) * 0.5
-	if difficultyAdjust < 0 {
-		difficultyAdjust = 0
+	combinedDifficulty := difficulty.AvgPathLength * (1.0 + difficulty.AvgExpansion)
+	recallBits := -math.Log2(1.0 - targetRecall)
+
+	logR := bits.Len(uint(R)) - 1
+	if logR < 1 {
+		logR = 1
 	}
 
-	recallFactor := 1.0 / (1.0 - targetRecall)
-	recallScale := math.Log2(recallFactor) / 2.0
+	difficultyScale := 1.0 + math.Log2(combinedDifficulty+1)/float64(bits.Len(uint(R)))
+	L := float64(R) * combinedDifficulty * recallBits * difficultyScale / float64(logR)
 
-	multiplier := (baseMultiplier + difficultyAdjust) * (1.0 + recallScale)
-
-	L := int(math.Ceil(float64(R) * multiplier))
-	return max(R, min(L, R*10))
+	maxL := R * bits.Len(uint(R)) * bits.Len(uint(R))
+	return max(R, min(int(math.Ceil(L)), maxL))
 }
 
-// DeriveL98 returns L for 98%+ recall using measured difficulty.
 func DeriveL98(R int, difficulty GraphDifficulty) int {
 	return DeriveL(R, 0.98, difficulty)
-}
-
-// DeriveL98Fast returns L for 98%+ using default difficulty estimate.
-func DeriveL98Fast(R int) int {
-	return DeriveL(R, 0.98, GraphDifficulty{AvgExpansion: 1.5, AvgPathLength: 10, ConvergenceRate: 1.0})
 }
 
 type AdaptiveL struct {
@@ -206,15 +205,19 @@ type recallObservation struct {
 func NewAdaptiveL(R int, targetRecall float64, difficulty GraphDifficulty) *AdaptiveL {
 	initialL := DeriveL(R, targetRecall, difficulty)
 
+	windowSize := bits.Len(uint(R)) * bits.Len(uint(R))
+	maxL := R * bits.Len(uint(R)) * bits.Len(uint(R))
+	adjustStep := max(1, R/bits.Len(uint(R)))
+
 	a := &AdaptiveL{
 		targetRecall: targetRecall,
 		R:            R,
 		difficulty:   difficulty,
-		observations: make([]recallObservation, 0, 32),
-		windowSize:   16,
+		observations: make([]recallObservation, 0, windowSize),
+		windowSize:   windowSize,
 		minL:         R,
-		maxL:         R * 10,
-		adjustStep:   max(1, R/4),
+		maxL:         maxL,
+		adjustStep:   adjustStep,
 	}
 	a.currentL.Store(int64(initialL))
 
@@ -235,7 +238,8 @@ func (a *AdaptiveL) RecordObservation(L int, recall float64) {
 		a.observations = a.observations[1:]
 	}
 
-	if len(a.observations) >= 4 {
+	minObservations := bits.Len(uint(a.R))
+	if len(a.observations) >= minObservations {
 		a.adjust()
 	}
 }
@@ -252,17 +256,24 @@ func (a *AdaptiveL) adjust() {
 		}
 	}
 
-	if count < 3 {
+	minCount := bits.Len(uint(a.R)) / 2
+	if minCount < 2 {
+		minCount = 2
+	}
+	if count < minCount {
 		return
 	}
 
 	avgRecall := sumRecall / float64(count)
 	gap := a.targetRecall - avgRecall
 
-	if gap > 0.02 {
+	gapThresholdUp := 1.0 / float64(a.R)
+	gapThresholdDown := gapThresholdUp * float64(bits.Len(uint(a.R)))
+
+	if gap > gapThresholdUp {
 		newL := min(a.maxL, currentL+a.adjustStep)
 		a.currentL.Store(int64(newL))
-	} else if gap < -0.05 {
+	} else if gap < -gapThresholdDown {
 		newL := max(a.minL, currentL-a.adjustStep)
 		a.currentL.Store(int64(newL))
 	}
@@ -286,46 +297,4 @@ func (a *AdaptiveL) Stats() (currentL int, avgRecall float64, observations int) 
 	avgRecall = sum / float64(observations)
 
 	return
-}
-
-// QuickCalibrate measures graph difficulty and derives L, then validates with minimal samples.
-func QuickCalibrate(
-	targetRecall float64,
-	vectors [][]float32,
-	vectorStore *storage.VectorStore,
-	graphStore *storage.GraphStore,
-	magCache *vamana.MagnitudeCache,
-	medoid uint32,
-	R int,
-) int {
-	n := len(vectors)
-	if n == 0 {
-		return DeriveL98Fast(R)
-	}
-
-	snapshot := vectorStore.Snapshot()
-	if snapshot == nil {
-		return DeriveL98Fast(R)
-	}
-
-	difficulty := ProbeGraphDifficulty(vectors, snapshot, graphStore, magCache, medoid, R)
-	derivedL := DeriveL(R, targetRecall, difficulty)
-
-	numSamples := min(5, n)
-	sampleIndices := sampleRandomIndices(n, numSamples)
-	groundTruth := computeGroundTruth(vectors, sampleIndices, 10, magCache)
-
-	testMultipliers := []float64{0.8, 1.0, 1.25, 1.5}
-	for _, mult := range testMultipliers {
-		testL := int(float64(derivedL) * mult)
-		if testL < R {
-			testL = R
-		}
-		recall := measureRecallAtL(snapshot, graphStore, magCache, vectors, sampleIndices, groundTruth, medoid, testL, 10)
-		if recall >= targetRecall {
-			return testL
-		}
-	}
-
-	return int(float64(derivedL) * 1.5)
 }
