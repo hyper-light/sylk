@@ -411,6 +411,9 @@ func (h *Index) searchLayerInternal(query []float32, queryMag float64, ep uint32
 
 func (h *Index) searchLayer(query []float32, queryMag float64, ep uint32, ef int, level int) []SearchResult {
 	internal := h.searchLayerInternal(query, queryMag, ep, ef, level)
+	if internal == nil {
+		return nil
+	}
 	output := make([]SearchResult, len(internal))
 	for i, c := range internal {
 		output[i] = SearchResult{

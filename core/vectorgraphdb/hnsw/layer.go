@@ -48,12 +48,7 @@ func (l *layer) getNeighbors(id uint32) []uint32 {
 	if !exists {
 		return nil
 	}
-	neighbors := node.neighbors.GetSortedNeighbors()
-	ids := make([]uint32, len(neighbors))
-	for i, n := range neighbors {
-		ids[i] = n.ID
-	}
-	return ids
+	return node.neighbors.GetIDs()
 }
 
 func (l *layer) getNeighborsMany(nodeIDs []uint32) map[uint32][]uint32 {
@@ -63,12 +58,7 @@ func (l *layer) getNeighborsMany(nodeIDs []uint32) map[uint32][]uint32 {
 
 	for _, id := range nodeIDs {
 		if node, exists := l.nodes[id]; exists {
-			neighbors := node.neighbors.GetSortedNeighbors()
-			ids := make([]uint32, len(neighbors))
-			for i, n := range neighbors {
-				ids[i] = n.ID
-			}
-			result[id] = ids
+			result[id] = node.neighbors.GetIDs()
 		}
 	}
 	return result
