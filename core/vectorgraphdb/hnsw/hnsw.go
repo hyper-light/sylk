@@ -43,6 +43,12 @@ var (
 	ErrIndexEmpty = errors.New("hnsw: index is empty")
 )
 
+var visitedPool = sync.Pool{
+	New: func() any {
+		return make(map[uint32]bool, 256)
+	},
+}
+
 type SearchResult struct {
 	ID         string
 	Similarity float64
@@ -317,7 +323,9 @@ func (h *Index) searchLayerInternal(query []float32, queryMag float64, ep uint32
 		return nil
 	}
 
-	visited := make(map[uint32]bool)
+	visited := visitedPool.Get().(map[uint32]bool)
+	clear(visited)
+	defer visitedPool.Put(visited)
 	visited[ep] = true
 
 	epVec, epMag, ok := h.getVectorAndMagnitude(ep)
