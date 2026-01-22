@@ -18,7 +18,7 @@ import (
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
-var validGrammarName = regexp.MustCompile(`^[a-z][a-z0-9_]{1,63}$`)
+var validGrammarName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type GrammarHandle struct {
 	libHandle uintptr
@@ -195,7 +195,7 @@ func (gl *GrammarLoader) downloadAndRetry(ctx context.Context, name string) erro
 
 func validateGrammarName(name string) error {
 	if !validGrammarName.MatchString(name) {
-		return fmt.Errorf("invalid grammar name %q: must be 2-64 lowercase alphanumeric chars", name)
+		return fmt.Errorf("invalid grammar name %q: must be 1-64 lowercase alphanumeric chars", name)
 	}
 	return nil
 }

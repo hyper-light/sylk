@@ -19,7 +19,8 @@ func TestValidateGrammarName(t *testing.T) {
 		{"c_sharp", true},
 
 		{"", false},
-		{"a", false},
+		{"a", true},
+		{"c", true},
 		{"Go", false},
 		{"PYTHON", false},
 		{"tree-sitter", false},

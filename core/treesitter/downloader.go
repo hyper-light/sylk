@@ -216,6 +216,7 @@ var knownGrammars = map[string]GrammarInfo{
 	"elixir":     {Name: "elixir", Repo: "elixir-lang/tree-sitter-elixir", Branch: "main", SourcePath: "src"},
 	"haskell":    {Name: "haskell", Repo: "tree-sitter/tree-sitter-haskell", Branch: "master", SourcePath: "src"},
 	"zig":        {Name: "zig", Repo: "tree-sitter-grammars/tree-sitter-zig", Branch: "master", SourcePath: "src"},
+	"swift":      {Name: "swift", Repo: "alex-pinkus/tree-sitter-swift", Branch: "main", SourcePath: "src"},
 }
 
 func (d *GrammarDownloader) EnsureGrammar(ctx context.Context, name string) (string, error) {

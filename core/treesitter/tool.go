@@ -183,8 +183,12 @@ func (t *TreeSitterTool) buildParseResultFast(tree *Tree, filePath, langName str
 		result.Types = extractTOMLKeys(root)
 	case "scss", "css":
 		result.Types = extractCSSSelectors(root)
-	case "vue", "svelte":
-		result.Functions, result.Types, result.Imports = extractJSSymbolsSinglePass(root)
+	case "html":
+		result.Types = extractHTMLElements(root)
+	case "vue":
+		result.Types = extractVueComponents(root)
+	case "svelte":
+		result.Types = extractSvelteComponents(root)
 	case "zig":
 		result.Functions, result.Types, result.Imports = extractZigSymbolsSinglePass(root)
 	case "cuda":
@@ -199,6 +203,8 @@ func (t *TreeSitterTool) buildParseResultFast(tree *Tree, filePath, langName str
 		result.Types = extractGitPatterns(root)
 	case "haskell":
 		result.Functions, result.Types, result.Imports = extractHaskellSymbolsSinglePass(root)
+	case "swift":
+		result.Functions, result.Types, result.Imports = extractSwiftSymbolsSinglePass(root)
 	case "diff":
 		result.Types = extractDiffFiles(root)
 	}
@@ -2149,6 +2155,242 @@ func extractTOMLKeys(root *Node) []TypeInfo {
 	return types
 }
 
+func extractHTMLElements(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		if node.Type() == "element" {
+			startTag := findChildByType(node, "start_tag")
+			if startTag == nil {
+				startTag = findChildByType(node, "self_closing_tag")
+			}
+			if startTag != nil {
+				tagNameNode := findChildByType(startTag, "tag_name")
+				if tagNameNode != nil {
+					tagName := nodeText(tagNameNode)
+					kind := classifyHTMLElement(tagName)
+					if kind != "" {
+						info := TypeInfo{
+							Name:      tagName,
+							Kind:      kind,
+							StartLine: node.StartPosition().Row + 1,
+							EndLine:   node.EndPosition().Row + 1,
+						}
+						if id := findHTMLAttribute(startTag, "id"); id != "" {
+							info.Name = tagName + "#" + id
+						}
+						types = append(types, info)
+					}
+				}
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
+}
+
+func classifyHTMLElement(tagName string) string {
+	switch tagName {
+	case "h1", "h2", "h3", "h4", "h5", "h6":
+		return "heading"
+	case "form":
+		return "form"
+	case "nav", "header", "footer", "main", "aside", "section", "article":
+		return "landmark"
+	case "a":
+		return "link"
+	case "button", "input", "select", "textarea":
+		return "control"
+	case "table":
+		return "table"
+	case "script":
+		return "script"
+	case "style":
+		return "style"
+	default:
+		if isCustomElement(tagName) {
+			return "component"
+		}
+		return ""
+	}
+}
+
+func findHTMLAttribute(startTag *Node, attrName string) string {
+	count := startTag.NamedChildCount()
+	for i := range count {
+		child := startTag.NamedChild(uint(i))
+		if child.Type() == "attribute" {
+			nameNode := findChildByType(child, "attribute_name")
+			if nameNode != nil && nodeText(nameNode) == attrName {
+				valueNode := findChildByType(child, "attribute_value")
+				if valueNode == nil {
+					valueNode = findChildByType(child, "quoted_attribute_value")
+				}
+				if valueNode != nil {
+					val := nodeText(valueNode)
+					if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') {
+						val = val[1 : len(val)-1]
+					}
+					return val
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func extractVueComponents(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "script_element":
+			types = append(types, TypeInfo{
+				Name:      "script",
+				Kind:      "script",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		case "template_element":
+			types = append(types, TypeInfo{
+				Name:      "template",
+				Kind:      "template",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		case "style_element":
+			types = append(types, TypeInfo{
+				Name:      "style",
+				Kind:      "style",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		case "element", "component":
+			if startTag := findChildByType(node, "start_tag"); startTag != nil {
+				if tagName := findChildByType(startTag, "tag_name"); tagName != nil {
+					name := nodeText(tagName)
+					if isCustomElement(name) {
+						types = append(types, TypeInfo{
+							Name:      name,
+							Kind:      "component",
+							StartLine: node.StartPosition().Row + 1,
+							EndLine:   node.EndPosition().Row + 1,
+						})
+					}
+				}
+			}
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
+}
+
+func extractSvelteComponents(root *Node) []TypeInfo {
+	var types []TypeInfo
+
+	var walk func(node *Node)
+	walk = func(node *Node) {
+		switch node.Type() {
+		case "script_element":
+			types = append(types, TypeInfo{
+				Name:      "script",
+				Kind:      "script",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		case "style_element":
+			types = append(types, TypeInfo{
+				Name:      "style",
+				Kind:      "style",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		case "element":
+			if startTag := findChildByType(node, "start_tag"); startTag != nil {
+				if tagName := findChildByType(startTag, "tag_name"); tagName != nil {
+					name := nodeText(tagName)
+					if isCustomElement(name) {
+						types = append(types, TypeInfo{
+							Name:      name,
+							Kind:      "component",
+							StartLine: node.StartPosition().Row + 1,
+							EndLine:   node.EndPosition().Row + 1,
+						})
+					}
+				}
+			}
+		case "if_statement", "each_block", "await_block":
+			types = append(types, TypeInfo{
+				Name:      node.Type(),
+				Kind:      "block",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+
+		count := node.NamedChildCount()
+		for i := range count {
+			walk(node.NamedChild(uint(i)))
+		}
+	}
+
+	count := root.NamedChildCount()
+	for i := range count {
+		walk(root.NamedChild(uint(i)))
+	}
+
+	return types
+}
+
+func findChildByType(node *Node, nodeType string) *Node {
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == nodeType {
+			return child
+		}
+	}
+	return nil
+}
+
+func isCustomElement(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	firstChar := name[0]
+	if firstChar >= 'A' && firstChar <= 'Z' {
+		return true
+	}
+	for i := range len(name) {
+		if name[i] == '-' {
+			return true
+		}
+	}
+	return false
+}
+
 func extractCSSSelectors(root *Node) []TypeInfo {
 	var types []TypeInfo
 
@@ -2574,6 +2816,161 @@ func parseHaskellImport(node *Node) ImportInfo {
 		info.Path = nodeText(mod)
 	}
 	return info
+}
+
+func extractSwiftSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
+	var functions []FunctionInfo
+	var types []TypeInfo
+	var imports []ImportInfo
+
+	count := root.NamedChildCount()
+	for i := range count {
+		node := root.NamedChild(uint(i))
+		switch node.Type() {
+		case "import_declaration":
+			imports = append(imports, parseSwiftImport(node))
+		case "function_declaration":
+			functions = append(functions, parseSwiftFunction(node))
+		case "class_declaration":
+			typeInfo := parseSwiftClassDeclaration(node)
+			types = append(types, typeInfo)
+			functions = append(functions, extractSwiftMethods(node)...)
+		case "protocol_declaration":
+			types = append(types, parseSwiftProtocol(node))
+			functions = append(functions, extractSwiftMethods(node)...)
+		case "typealias_declaration":
+			types = append(types, parseSwiftTypealias(node))
+		case "extension_declaration":
+			types = append(types, parseSwiftExtension(node))
+			functions = append(functions, extractSwiftMethods(node)...)
+		}
+	}
+
+	return functions, types, imports
+}
+
+func parseSwiftImport(node *Node) ImportInfo {
+	info := ImportInfo{
+		Line: node.StartPosition().Row + 1,
+	}
+	if id := node.ChildByFieldName("module"); id != nil {
+		info.Path = nodeText(id)
+	} else {
+		for i := uint(0); i < uint(node.NamedChildCount()); i++ {
+			child := node.NamedChild(i)
+			if child.Type() == "identifier" {
+				info.Path = nodeText(child)
+				break
+			}
+		}
+	}
+	return info
+}
+
+func parseSwiftFunction(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	for i := uint(0); i < uint(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "simple_identifier" {
+			info.Name = nodeText(child)
+			break
+		}
+	}
+	if params := node.ChildByFieldName("parameters"); params != nil {
+		info.Parameters = nodeText(params)
+	}
+	return info
+}
+
+func parseSwiftClassDeclaration(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		Kind:      "class",
+	}
+	for i := uint(0); i < uint(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "type_identifier":
+			info.Name = nodeText(child)
+		case "enum_class_body":
+			info.Kind = "enum"
+		case "class_body":
+			info.Kind = "class"
+		}
+	}
+	return info
+}
+
+func parseSwiftProtocol(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		Kind:      "protocol",
+	}
+	for i := uint(0); i < uint(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "type_identifier" {
+			info.Name = nodeText(child)
+			break
+		}
+	}
+	return info
+}
+
+func parseSwiftTypealias(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		Kind:      "typealias",
+	}
+	if name := node.ChildByFieldName("name"); name != nil {
+		info.Name = nodeText(name)
+	}
+	return info
+}
+
+func parseSwiftExtension(node *Node) TypeInfo {
+	info := TypeInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+		Kind:      "extension",
+	}
+	for i := uint(0); i < uint(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "type_identifier" || child.Type() == "user_type" {
+			info.Name = nodeText(child)
+			break
+		}
+	}
+	return info
+}
+
+func extractSwiftMethods(node *Node) []FunctionInfo {
+	var methods []FunctionInfo
+	var body *Node
+	for i := uint(0); i < uint(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "class_body", "enum_class_body", "protocol_body":
+			body = child
+		}
+	}
+	if body == nil {
+		return methods
+	}
+	for i := uint(0); i < uint(body.NamedChildCount()); i++ {
+		child := body.NamedChild(i)
+		if child.Type() == "function_declaration" || child.Type() == "protocol_function_declaration" {
+			info := parseSwiftFunction(child)
+			info.IsMethod = true
+			methods = append(methods, info)
+		}
+	}
+	return methods
 }
 
 func extractDiffFiles(root *Node) []TypeInfo {
