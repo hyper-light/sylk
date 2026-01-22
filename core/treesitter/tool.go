@@ -221,12 +221,54 @@ func extractGoSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Impor
 			functions = append(functions, parseFunctionInfo(node))
 		case "type_declaration":
 			types = append(types, parseTypeDecl(node)...)
+		case "const_declaration":
+			types = append(types, parseGoConstDecl(node)...)
+		case "var_declaration":
+			types = append(types, parseGoVarDecl(node)...)
 		case "import_declaration":
 			imports = append(imports, parseImportDecl(node)...)
 		}
 	}
 
 	return functions, types, imports
+}
+
+func parseGoConstDecl(node *Node) []TypeInfo {
+	var types []TypeInfo
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "const_spec" {
+			if nameNode := child.ChildByFieldName("name"); nameNode != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(nameNode),
+					Kind:      "const",
+					StartLine: child.StartPosition().Row + 1,
+					EndLine:   child.EndPosition().Row + 1,
+				})
+			}
+		}
+	}
+	return types
+}
+
+func parseGoVarDecl(node *Node) []TypeInfo {
+	var types []TypeInfo
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "var_spec" {
+			if nameNode := child.ChildByFieldName("name"); nameNode != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(nameNode),
+					Kind:      "var",
+					StartLine: child.StartPosition().Row + 1,
+					EndLine:   child.EndPosition().Row + 1,
+				})
+			}
+		}
+	}
+	return types
 }
 
 func extractPythonSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
@@ -244,21 +286,26 @@ func extractPythonSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []I
 			extractPythonMethods(node, &functions)
 		case "import_statement":
 			imports = append(imports, parsePythonImport(node)...)
-		case "import_from_statement":
+		case "import_from_statement", "future_import_statement":
 			imports = append(imports, parsePythonFromImport(node)...)
 		case "decorated_definition":
 			if child := node.ChildByFieldName("definition"); child != nil {
 				walk(child)
 			}
 			return
+		case "assignment":
+			types = append(types, parsePythonAssignments(node)...)
+		case "type_alias_statement":
+			if t := parsePythonTypeAlias(node); t.Name != "" {
+				types = append(types, t)
+			}
+		case "global_statement", "nonlocal_statement":
+			types = append(types, parsePythonGlobalNonlocal(node)...)
 		}
 
 		count := node.NamedChildCount()
 		for i := range count {
-			child := node.NamedChild(uint(i))
-			if child.Type() != "block" {
-				walk(child)
-			}
+			walk(node.NamedChild(uint(i)))
 		}
 	}
 
@@ -268,6 +315,83 @@ func extractPythonSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []I
 	}
 
 	return functions, types, imports
+}
+
+func parsePythonAssignments(node *Node) []TypeInfo {
+	var types []TypeInfo
+	if left := node.ChildByFieldName("left"); left != nil {
+		switch left.Type() {
+		case "identifier":
+			name := nodeText(left)
+			kind := "variable"
+			if isAllCaps(name) {
+				kind = "const"
+			}
+			types = append(types, TypeInfo{
+				Name:      name,
+				Kind:      kind,
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		case "pattern_list", "tuple_pattern":
+			for i := uint(0); i < left.NamedChildCount(); i++ {
+				child := left.NamedChild(i)
+				if child.Type() == "identifier" {
+					types = append(types, TypeInfo{
+						Name:      nodeText(child),
+						Kind:      "variable",
+						StartLine: node.StartPosition().Row + 1,
+						EndLine:   node.EndPosition().Row + 1,
+					})
+				}
+			}
+		}
+	}
+	return types
+}
+
+func isAllCaps(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+func parsePythonTypeAlias(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "type",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		info.Name = nodeText(nameNode)
+	}
+	return info
+}
+
+func parsePythonGlobalNonlocal(node *Node) []TypeInfo {
+	var types []TypeInfo
+	kind := "global"
+	if node.Type() == "nonlocal_statement" {
+		kind = "nonlocal"
+	}
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "identifier" {
+			types = append(types, TypeInfo{
+				Name:      nodeText(child),
+				Kind:      kind,
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+	}
+	return types
 }
 
 func parsePythonFunction(node *Node, isMethod bool) FunctionInfo {
@@ -411,27 +535,43 @@ func extractJSSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Impor
 		switch node.Type() {
 		case "function_declaration", "generator_function_declaration":
 			functions = append(functions, parseJSFunction(node, false, ""))
-		case "class_declaration":
+		case "function_expression":
+			if fn := parseJSFunction(node, false, ""); fn.Name != "" {
+				functions = append(functions, fn)
+			}
+		case "class_declaration", "abstract_class_declaration":
 			types = append(types, parseJSClass(node))
 			if body := node.ChildByFieldName("body"); body != nil {
 				name := ""
 				if n := node.ChildByFieldName("name"); n != nil {
 					name = nodeText(n)
 				}
-				walkClassBody(body, name, &functions)
+				walkJSClassBody(body, name, &functions, &types)
 			}
 			return
 		case "lexical_declaration", "variable_declaration":
-			extractJSVarFunctions(node, &functions)
+			extractJSVarDeclarations(node, &functions, &types)
 		case "import_statement":
 			imports = append(imports, parseJSImport(node)...)
 		case "export_statement":
 			if decl := node.ChildByFieldName("declaration"); decl != nil {
 				walk(decl, className)
 			}
+			if spec := node.ChildByFieldName("source"); spec != nil {
+				imports = append(imports, ImportInfo{
+					Path: nodeText(spec),
+					Line: node.StartPosition().Row + 1,
+				})
+			}
 			return
 		case "interface_declaration", "type_alias_declaration":
 			types = append(types, parseJSTypeDecl(node))
+		case "enum_declaration":
+			types = append(types, parseJSEnum(node))
+		case "ambient_declaration":
+			extractJSAmbient(node, &functions, &types)
+		case "internal_module":
+			types = append(types, parseJSModule(node))
 		}
 
 		count := node.NamedChildCount()
@@ -476,39 +616,115 @@ func parseJSClass(node *Node) TypeInfo {
 	return info
 }
 
-func walkClassBody(body *Node, className string, functions *[]FunctionInfo) {
+func walkJSClassBody(body *Node, className string, functions *[]FunctionInfo, types *[]TypeInfo) {
 	count := body.NamedChildCount()
 	for i := range count {
 		child := body.NamedChild(uint(i))
-		if child.Type() == "method_definition" {
+		switch child.Type() {
+		case "method_definition":
 			fn := parseJSFunction(child, true, className)
 			if n := child.ChildByFieldName("name"); n != nil {
 				fn.Name = nodeText(n)
 			}
 			*functions = append(*functions, fn)
+		case "public_field_definition", "field_definition":
+			if n := child.ChildByFieldName("name"); n != nil {
+				*types = append(*types, TypeInfo{
+					Name:      nodeText(n),
+					Kind:      "field",
+					StartLine: child.StartPosition().Row + 1,
+					EndLine:   child.EndPosition().Row + 1,
+				})
+			}
 		}
 	}
 }
 
-func extractJSVarFunctions(node *Node, functions *[]FunctionInfo) {
+func extractJSVarDeclarations(node *Node, functions *[]FunctionInfo, types *[]TypeInfo) {
 	count := node.NamedChildCount()
 	for i := range count {
 		decl := node.NamedChild(uint(i))
 		if decl.Type() == "variable_declarator" {
+			name := ""
+			if n := decl.ChildByFieldName("name"); n != nil {
+				name = nodeText(n)
+			}
 			value := decl.ChildByFieldName("value")
-			if value != nil && (value.Type() == "arrow_function" || value.Type() == "function") {
+			if value != nil && (value.Type() == "arrow_function" || value.Type() == "function" || value.Type() == "function_expression") {
 				fn := FunctionInfo{
+					Name:      name,
 					StartLine: decl.StartPosition().Row + 1,
 					EndLine:   decl.EndPosition().Row + 1,
-				}
-				if n := decl.ChildByFieldName("name"); n != nil {
-					fn.Name = nodeText(n)
 				}
 				if p := value.ChildByFieldName("parameters"); p != nil {
 					fn.Parameters = nodeText(p)
 				}
 				*functions = append(*functions, fn)
+			} else if name != "" {
+				*types = append(*types, TypeInfo{
+					Name:      name,
+					Kind:      "variable",
+					StartLine: decl.StartPosition().Row + 1,
+					EndLine:   decl.EndPosition().Row + 1,
+				})
 			}
+		}
+	}
+}
+
+func parseJSEnum(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "enum",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseJSModule(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "module",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func extractJSAmbient(node *Node, functions *[]FunctionInfo, types *[]TypeInfo) {
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		switch child.Type() {
+		case "function_signature":
+			fn := FunctionInfo{
+				StartLine: child.StartPosition().Row + 1,
+				EndLine:   child.EndPosition().Row + 1,
+			}
+			if n := child.ChildByFieldName("name"); n != nil {
+				fn.Name = nodeText(n)
+			}
+			if p := child.ChildByFieldName("parameters"); p != nil {
+				fn.Parameters = nodeText(p)
+			}
+			*functions = append(*functions, fn)
+		case "ambient_declaration":
+			extractJSAmbient(child, functions, types)
+		case "class_declaration", "abstract_class_declaration":
+			*types = append(*types, parseJSClass(child))
+		case "interface_declaration", "type_alias_declaration":
+			*types = append(*types, parseJSTypeDecl(child))
+		case "enum_declaration":
+			*types = append(*types, parseJSEnum(child))
+		case "module":
+			*types = append(*types, parseJSModule(child))
+		case "lexical_declaration", "variable_declaration":
+			extractJSVarDeclarations(child, functions, types)
 		}
 	}
 }
@@ -548,7 +764,8 @@ func extractJavaSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Imp
 	var walk func(node *Node, className string)
 	walk = func(node *Node, className string) {
 		switch node.Type() {
-		case "class_declaration", "interface_declaration", "enum_declaration":
+		case "class_declaration", "interface_declaration", "enum_declaration",
+			"annotation_type_declaration", "record_declaration":
 			types = append(types, parseJavaType(node))
 			name := ""
 			if n := node.ChildByFieldName("name"); n != nil {
@@ -560,6 +777,13 @@ func extractJavaSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Imp
 			return
 		case "import_declaration":
 			imports = append(imports, parseJavaImport(node))
+		case "package_declaration":
+			types = append(types, TypeInfo{
+				Name:      parseJavaPackage(node),
+				Kind:      "package",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
 		}
 
 		count := node.NamedChildCount()
@@ -586,6 +810,10 @@ func parseJavaType(node *Node) TypeInfo {
 		info.Kind = "interface"
 	case "enum_declaration":
 		info.Kind = "enum"
+	case "annotation_type_declaration":
+		info.Kind = "annotation"
+	case "record_declaration":
+		info.Kind = "record"
 	default:
 		info.Kind = "class"
 	}
@@ -593,6 +821,16 @@ func parseJavaType(node *Node) TypeInfo {
 		info.Name = nodeText(n)
 	}
 	return info
+}
+
+func parseJavaPackage(node *Node) string {
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "scoped_identifier" || child.Type() == "identifier" {
+			return nodeText(child)
+		}
+	}
+	return ""
 }
 
 func walkJavaClassBody(body *Node, className string, functions *[]FunctionInfo, types *[]TypeInfo) {
@@ -614,10 +852,48 @@ func walkJavaClassBody(body *Node, className string, functions *[]FunctionInfo, 
 				fn.Parameters = nodeText(p)
 			}
 			*functions = append(*functions, fn)
-		case "class_declaration", "interface_declaration", "enum_declaration":
+		case "field_declaration", "constant_declaration":
+			*types = append(*types, parseJavaFields(child)...)
+		case "class_declaration", "interface_declaration", "enum_declaration",
+			"annotation_type_declaration", "record_declaration":
 			*types = append(*types, parseJavaType(child))
+			if innerBody := child.ChildByFieldName("body"); innerBody != nil {
+				innerName := ""
+				if n := child.ChildByFieldName("name"); n != nil {
+					innerName = nodeText(n)
+				}
+				walkJavaClassBody(innerBody, innerName, functions, types)
+			}
+		case "enum_constant":
+			if n := child.ChildByFieldName("name"); n != nil {
+				*types = append(*types, TypeInfo{
+					Name:      nodeText(n),
+					Kind:      "enum_constant",
+					StartLine: child.StartPosition().Row + 1,
+					EndLine:   child.EndPosition().Row + 1,
+				})
+			}
 		}
 	}
+}
+
+func parseJavaFields(node *Node) []TypeInfo {
+	var types []TypeInfo
+	count := node.NamedChildCount()
+	for i := range count {
+		child := node.NamedChild(uint(i))
+		if child.Type() == "variable_declarator" {
+			if n := child.ChildByFieldName("name"); n != nil {
+				types = append(types, TypeInfo{
+					Name:      nodeText(n),
+					Kind:      "field",
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		}
+	}
+	return types
 }
 
 func parseJavaImport(node *Node) ImportInfo {
@@ -641,9 +917,10 @@ func extractRustSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Imp
 	var walk func(node *Node)
 	walk = func(node *Node) {
 		switch node.Type() {
-		case "function_item":
+		case "function_item", "function_signature_item":
 			functions = append(functions, parseRustFunction(node, ""))
-		case "struct_item", "enum_item", "trait_item", "type_item":
+		case "struct_item", "enum_item", "trait_item", "type_item", "mod_item",
+			"const_item", "static_item", "macro_definition":
 			types = append(types, parseRustType(node))
 		case "impl_item":
 			typeName := ""
@@ -654,7 +931,7 @@ func extractRustSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Imp
 				walkRustImplBody(body, typeName, &functions)
 			}
 			return
-		case "use_declaration":
+		case "use_declaration", "extern_crate_declaration":
 			imports = append(imports, parseRustUse(node)...)
 		}
 
@@ -700,6 +977,14 @@ func parseRustType(node *Node) TypeInfo {
 		info.Kind = "enum"
 	case "trait_item":
 		info.Kind = "trait"
+	case "mod_item":
+		info.Kind = "module"
+	case "const_item":
+		info.Kind = "const"
+	case "static_item":
+		info.Kind = "static"
+	case "macro_definition":
+		info.Kind = "macro"
 	default:
 		info.Kind = "type"
 	}
@@ -746,17 +1031,32 @@ func extractCSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Import
 		case "function_definition":
 			functions = append(functions, parseCFunction(node))
 		case "declaration":
-			if fn := tryCFunctionDecl(node); fn != nil {
-				functions = append(functions, *fn)
-			}
+			parseCDeclaration(node, &functions, &types)
 		case "struct_specifier", "union_specifier", "enum_specifier", "class_specifier":
 			if t := parseCType(node); t.Name != "" {
 				types = append(types, t)
+				walkCClassBody(node, t.Name, &functions, &types)
 			}
-		case "type_definition":
+		case "type_definition", "alias_declaration":
 			types = append(types, parseCTypedef(node))
 		case "preproc_include":
 			imports = append(imports, parseCInclude(node))
+		case "preproc_def", "preproc_function_def":
+			if t := parseCMacro(node); t.Name != "" {
+				types = append(types, t)
+			}
+		case "namespace_definition":
+			types = append(types, parseCNamespace(node))
+		case "using_declaration":
+			imports = append(imports, parseCUsing(node))
+		case "template_declaration":
+			parseCTemplate(node, &functions, &types)
+		case "concept_definition":
+			if t := parseCConcept(node); t.Name != "" {
+				types = append(types, t)
+			}
+		case "friend_declaration":
+			parseCFriend(node, &functions, &types)
 		}
 
 		count := node.NamedChildCount()
@@ -854,6 +1154,182 @@ func parseCInclude(node *Node) ImportInfo {
 		info.Path = nodeText(path)
 	}
 	return info
+}
+
+func parseCDeclaration(node *Node, functions *[]FunctionInfo, types *[]TypeInfo) {
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "function_declarator":
+			info := FunctionInfo{
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			}
+			if name := child.ChildByFieldName("declarator"); name != nil {
+				info.Name = nodeText(name)
+			}
+			if params := child.ChildByFieldName("parameters"); params != nil {
+				info.Parameters = nodeText(params)
+			}
+			*functions = append(*functions, info)
+		case "init_declarator":
+			if name := child.ChildByFieldName("declarator"); name != nil {
+				*types = append(*types, TypeInfo{
+					Name:      nodeText(name),
+					Kind:      "variable",
+					StartLine: node.StartPosition().Row + 1,
+					EndLine:   node.EndPosition().Row + 1,
+				})
+			}
+		case "identifier":
+			*types = append(*types, TypeInfo{
+				Name:      nodeText(child),
+				Kind:      "variable",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+	}
+}
+
+func walkCClassBody(node *Node, className string, functions *[]FunctionInfo, types *[]TypeInfo) {
+	body := node.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+	for i := uint(0); i < body.NamedChildCount(); i++ {
+		child := body.NamedChild(i)
+		switch child.Type() {
+		case "function_definition":
+			fn := parseCFunction(child)
+			fn.IsMethod = true
+			fn.Receiver = className
+			*functions = append(*functions, fn)
+		case "declaration":
+			parseCClassMember(child, className, functions, types)
+		case "field_declaration":
+			*types = append(*types, parseCFieldDecl(child)...)
+		case "access_specifier":
+			continue
+		}
+	}
+}
+
+func parseCClassMember(node *Node, className string, functions *[]FunctionInfo, types *[]TypeInfo) {
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "function_declarator" {
+			fn := FunctionInfo{
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+				IsMethod:  true,
+				Receiver:  className,
+			}
+			if name := child.ChildByFieldName("declarator"); name != nil {
+				fn.Name = nodeText(name)
+			}
+			if params := child.ChildByFieldName("parameters"); params != nil {
+				fn.Parameters = nodeText(params)
+			}
+			*functions = append(*functions, fn)
+			return
+		}
+	}
+}
+
+func parseCFieldDecl(node *Node) []TypeInfo {
+	var types []TypeInfo
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "field_identifier" {
+			types = append(types, TypeInfo{
+				Name:      nodeText(child),
+				Kind:      "field",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+	}
+	return types
+}
+
+func parseCMacro(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "macro",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if name := node.ChildByFieldName("name"); name != nil {
+		info.Name = nodeText(name)
+	}
+	return info
+}
+
+func parseCNamespace(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "namespace",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if name := node.ChildByFieldName("name"); name != nil {
+		info.Name = nodeText(name)
+	}
+	return info
+}
+
+func parseCUsing(node *Node) ImportInfo {
+	info := ImportInfo{Line: node.StartPosition().Row + 1}
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "scoped_identifier" || child.Type() == "identifier" || child.Type() == "qualified_identifier" {
+			info.Path = nodeText(child)
+			break
+		}
+	}
+	return info
+}
+
+func parseCTemplate(node *Node, functions *[]FunctionInfo, types *[]TypeInfo) {
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "function_definition":
+			*functions = append(*functions, parseCFunction(child))
+		case "declaration":
+			parseCDeclaration(child, functions, types)
+		case "class_specifier", "struct_specifier":
+			if t := parseCType(child); t.Name != "" {
+				*types = append(*types, t)
+				walkCClassBody(child, t.Name, functions, types)
+			}
+		case "alias_declaration":
+			*types = append(*types, parseCTypedef(child))
+		}
+	}
+}
+
+func parseCConcept(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "concept",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if name := node.ChildByFieldName("name"); name != nil {
+		info.Name = nodeText(name)
+	}
+	return info
+}
+
+func parseCFriend(node *Node, functions *[]FunctionInfo, types *[]TypeInfo) {
+	for i := uint(0); i < node.NamedChildCount(); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "function_definition":
+			*functions = append(*functions, parseCFunction(child))
+		case "declaration":
+			parseCDeclaration(child, functions, types)
+		}
+	}
 }
 
 func extractRubySymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []ImportInfo) {
@@ -1318,44 +1794,77 @@ func extractJSONKeys(root *Node) []TypeInfo {
 func extractYAMLKeys(root *Node) []TypeInfo {
 	var types []TypeInfo
 
-	var walk func(node *Node, depth int)
-	walk = func(node *Node, depth int) {
-		if depth > 1 {
-			return
-		}
-
+	var walk func(node *Node, path string)
+	walk = func(node *Node, path string) {
 		switch node.Type() {
 		case "block_mapping_pair":
 			if key := node.ChildByFieldName("key"); key != nil {
+				keyText := nodeText(key)
+				fullPath := keyText
+				if path != "" {
+					fullPath = path + "." + keyText
+				}
+
+				kind := "key"
+				if isYAMLSpecialKey(keyText) {
+					kind = keyText
+				}
+
 				types = append(types, TypeInfo{
-					Name:      nodeText(key),
-					Kind:      "key",
+					Name:      fullPath,
+					Kind:      kind,
 					StartLine: node.StartPosition().Row + 1,
 					EndLine:   node.EndPosition().Row + 1,
 				})
+
+				if value := node.ChildByFieldName("value"); value != nil {
+					walk(value, fullPath)
+				}
+				return
 			}
+		case "block_sequence_item":
+			count := node.NamedChildCount()
+			for i := range count {
+				walk(node.NamedChild(uint(i)), path)
+			}
+			return
 		}
 
 		count := node.NamedChildCount()
 		for i := range count {
-			walk(node.NamedChild(uint(i)), depth+1)
+			walk(node.NamedChild(uint(i)), path)
 		}
 	}
 
 	count := root.NamedChildCount()
 	for i := range count {
-		walk(root.NamedChild(uint(i)), 0)
+		walk(root.NamedChild(uint(i)), "")
 	}
 
 	return types
 }
 
+func isYAMLSpecialKey(key string) bool {
+	switch key {
+	case "apiVersion", "kind", "metadata", "spec", "data", "stringData",
+		"name", "namespace", "labels", "annotations", "selector",
+		"template", "containers", "volumes", "env", "ports",
+		"resources", "limits", "requests", "image", "command", "args",
+		"replicas", "strategy", "type", "nodeSelector", "tolerations",
+		"affinity", "serviceAccountName", "securityContext",
+		"livenessProbe", "readinessProbe", "startupProbe":
+		return true
+	}
+	return false
+}
+
 func extractHCLBlocks(root *Node) []TypeInfo {
 	var types []TypeInfo
 
-	var walk func(node *Node)
-	walk = func(node *Node) {
-		if node.Type() == "block" {
+	var walk func(node *Node, inBlock bool)
+	walk = func(node *Node, inBlock bool) {
+		switch node.Type() {
+		case "block":
 			blockType := ""
 			labels := ""
 
@@ -1380,23 +1889,60 @@ func extractHCLBlocks(root *Node) []TypeInfo {
 				name = blockType + " " + labels
 			}
 
+			kind := "block"
+			switch blockType {
+			case "resource":
+				kind = "resource"
+			case "data":
+				kind = "data"
+			case "variable":
+				kind = "variable"
+			case "output":
+				kind = "output"
+			case "locals":
+				kind = "locals"
+			case "module":
+				kind = "module"
+			case "provider":
+				kind = "provider"
+			case "terraform":
+				kind = "terraform"
+			}
+
 			types = append(types, TypeInfo{
 				Name:      name,
-				Kind:      "block",
+				Kind:      kind,
 				StartLine: node.StartPosition().Row + 1,
 				EndLine:   node.EndPosition().Row + 1,
 			})
+
+			if body := node.ChildByFieldName("body"); body != nil {
+				walk(body, true)
+			}
+			return
+
+		case "attribute":
+			if !inBlock {
+				if name := node.ChildByFieldName("name"); name != nil {
+					types = append(types, TypeInfo{
+						Name:      nodeText(name),
+						Kind:      "attribute",
+						StartLine: node.StartPosition().Row + 1,
+						EndLine:   node.EndPosition().Row + 1,
+					})
+				}
+			}
 		}
 
 		count := node.NamedChildCount()
 		for i := range count {
-			walk(node.NamedChild(uint(i)))
+			walk(node.NamedChild(uint(i)), inBlock)
 		}
 	}
 
 	count := root.NamedChildCount()
 	for i := range count {
-		walk(root.NamedChild(uint(i)))
+		walk(root.NamedChild(uint(i)), false)
 	}
 
 	return types
@@ -1418,6 +1964,10 @@ func extractLuaSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Impo
 			if imp := tryLuaRequire(node); imp != nil {
 				imports = append(imports, *imp)
 			}
+		case "variable_declaration":
+			parseLuaVarDecl(node, &functions, &types)
+		case "assignment_statement":
+			parseLuaAssignment(node, &functions, &types)
 		}
 
 		count := node.NamedChildCount()
@@ -1432,6 +1982,82 @@ func extractLuaSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Impo
 	}
 
 	return functions, types, imports
+}
+
+func parseLuaVarDecl(node *Node, functions *[]FunctionInfo, types *[]TypeInfo) {
+	names := node.ChildByFieldName("names")
+	values := node.ChildByFieldName("values")
+	if names == nil {
+		return
+	}
+
+	nameCount := names.NamedChildCount()
+	for i := uint(0); i < nameCount; i++ {
+		nameNode := names.NamedChild(i)
+		name := nodeText(nameNode)
+
+		var valueNode *Node
+		if values != nil && i < values.NamedChildCount() {
+			valueNode = values.NamedChild(i)
+		}
+
+		if valueNode != nil && valueNode.Type() == "function_definition" {
+			fn := FunctionInfo{
+				Name:      name,
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			}
+			if p := valueNode.ChildByFieldName("parameters"); p != nil {
+				fn.Parameters = nodeText(p)
+			}
+			*functions = append(*functions, fn)
+		} else {
+			*types = append(*types, TypeInfo{
+				Name:      name,
+				Kind:      "variable",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+	}
+}
+
+func parseLuaAssignment(node *Node, functions *[]FunctionInfo, types *[]TypeInfo) {
+	names := node.ChildByFieldName("variables")
+	values := node.ChildByFieldName("values")
+	if names == nil {
+		return
+	}
+
+	nameCount := names.NamedChildCount()
+	for i := uint(0); i < nameCount; i++ {
+		nameNode := names.NamedChild(i)
+		name := nodeText(nameNode)
+
+		var valueNode *Node
+		if values != nil && i < values.NamedChildCount() {
+			valueNode = values.NamedChild(i)
+		}
+
+		if valueNode != nil && valueNode.Type() == "function_definition" {
+			fn := FunctionInfo{
+				Name:      name,
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			}
+			if p := valueNode.ChildByFieldName("parameters"); p != nil {
+				fn.Parameters = nodeText(p)
+			}
+			*functions = append(*functions, fn)
+		} else if nameNode.Type() == "identifier" {
+			*types = append(*types, TypeInfo{
+				Name:      name,
+				Kind:      "variable",
+				StartLine: node.StartPosition().Row + 1,
+				EndLine:   node.EndPosition().Row + 1,
+			})
+		}
+	}
 }
 
 func parseLuaFunction(node *Node) FunctionInfo {
@@ -1561,13 +2187,27 @@ func extractZigSymbolsSinglePass(root *Node) ([]FunctionInfo, []TypeInfo, []Impo
 	var walk func(node *Node)
 	walk = func(node *Node) {
 		switch node.Type() {
-		case "FnProto":
+		case "function_declaration":
 			functions = append(functions, parseZigFunction(node))
-		case "VarDecl":
-			if t := tryZigType(node); t != nil {
-				types = append(types, *t)
+		case "variable_declaration":
+			types = append(types, parseZigVarDecl(node)...)
+		case "struct_declaration":
+			if t := parseZigStruct(node); t.Name != "" {
+				types = append(types, t)
 			}
-		case "Builtin":
+		case "enum_declaration":
+			if t := parseZigEnum(node); t.Name != "" {
+				types = append(types, t)
+			}
+		case "union_declaration":
+			if t := parseZigUnion(node); t.Name != "" {
+				types = append(types, t)
+			}
+		case "test_declaration":
+			if fn := parseZigTest(node); fn.Name != "" {
+				functions = append(functions, fn)
+			}
+		case "builtin_function":
 			if imp := tryZigImport(node); imp != nil {
 				imports = append(imports, *imp)
 			}
@@ -1595,31 +2235,83 @@ func parseZigFunction(node *Node) FunctionInfo {
 	if n := node.ChildByFieldName("name"); n != nil {
 		info.Name = nodeText(n)
 	}
-	if p := node.ChildByFieldName("params"); p != nil {
+	if p := node.ChildByFieldName("parameters"); p != nil {
 		info.Parameters = nodeText(p)
 	}
 	return info
 }
 
-func tryZigType(node *Node) *TypeInfo {
-	count := node.NamedChildCount()
-	for i := range count {
-		child := node.NamedChild(uint(i))
-		if child.Type() == "IDENTIFIER" {
-			return &TypeInfo{
-				Name:      nodeText(child),
-				Kind:      "const",
-				StartLine: node.StartPosition().Row + 1,
-				EndLine:   node.EndPosition().Row + 1,
+func parseZigVarDecl(node *Node) []TypeInfo {
+	var types []TypeInfo
+	if name := node.ChildByFieldName("name"); name != nil {
+		kind := "const"
+		for i := uint(0); i < node.ChildCount(); i++ {
+			child := node.Child(i)
+			if nodeText(child) == "var" {
+				kind = "var"
+				break
 			}
 		}
+		types = append(types, TypeInfo{
+			Name:      nodeText(name),
+			Kind:      kind,
+			StartLine: node.StartPosition().Row + 1,
+			EndLine:   node.EndPosition().Row + 1,
+		})
 	}
-	return nil
+	return types
+}
+
+func parseZigStruct(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "struct",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseZigEnum(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "enum",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseZigUnion(node *Node) TypeInfo {
+	info := TypeInfo{
+		Kind:      "union",
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = nodeText(n)
+	}
+	return info
+}
+
+func parseZigTest(node *Node) FunctionInfo {
+	info := FunctionInfo{
+		StartLine: node.StartPosition().Row + 1,
+		EndLine:   node.EndPosition().Row + 1,
+	}
+	if n := node.ChildByFieldName("name"); n != nil {
+		info.Name = "test " + nodeText(n)
+	}
+	return info
 }
 
 func tryZigImport(node *Node) *ImportInfo {
 	text := nodeText(node)
-	if len(text) > 8 && text[:8] == "@import(" {
+	if len(text) > 7 && text[:7] == "@import" {
 		return &ImportInfo{
 			Path: text,
 			Line: node.StartPosition().Row + 1,

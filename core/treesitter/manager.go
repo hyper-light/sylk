@@ -445,6 +445,18 @@ var extToLang = map[string]string{
 	".sh":         "bash",
 	".md":         "markdown",
 	".properties": "properties",
+	".scala":      "scala",
+	".sc":         "scala",
+	".tf":         "hcl",
+	".tfvars":     "hcl",
+	".vue":        "vue",
+	".svelte":     "svelte",
+	".lua":        "lua",
+	".php":        "php",
+	".ex":         "elixir",
+	".exs":        "elixir",
+	".hs":         "haskell",
+	".zig":        "zig",
 }
 
 func detectLanguage(filePath string) string {

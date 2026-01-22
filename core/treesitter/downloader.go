@@ -206,6 +206,16 @@ var knownGrammars = map[string]GrammarInfo{
 	"bash":       {Name: "bash", Repo: "tree-sitter/tree-sitter-bash", Branch: "master", SourcePath: "src"},
 	"markdown":   {Name: "markdown", Repo: "tree-sitter-grammars/tree-sitter-markdown", Branch: "main", SourcePath: "src"},
 	"properties": {Name: "properties", Repo: "tree-sitter-grammars/tree-sitter-properties", Branch: "master", SourcePath: "src"},
+	"hcl":        {Name: "hcl", Repo: "tree-sitter-grammars/tree-sitter-hcl", Branch: "main", SourcePath: "src"},
+	"scala":      {Name: "scala", Repo: "tree-sitter/tree-sitter-scala", Branch: "master", SourcePath: "src"},
+	"vue":        {Name: "vue", Repo: "tree-sitter-grammars/tree-sitter-vue", Branch: "main", SourcePath: "src"},
+	"svelte":     {Name: "svelte", Repo: "tree-sitter-grammars/tree-sitter-svelte", Branch: "master", SourcePath: "src"},
+	"lua":        {Name: "lua", Repo: "tree-sitter-grammars/tree-sitter-lua", Branch: "main", SourcePath: "src"},
+	"php":        {Name: "php", Repo: "tree-sitter/tree-sitter-php", Branch: "master", SourcePath: "php/src"},
+	"kotlin":     {Name: "kotlin", Repo: "fwcd/tree-sitter-kotlin", Branch: "main", SourcePath: "src"},
+	"elixir":     {Name: "elixir", Repo: "elixir-lang/tree-sitter-elixir", Branch: "main", SourcePath: "src"},
+	"haskell":    {Name: "haskell", Repo: "tree-sitter/tree-sitter-haskell", Branch: "master", SourcePath: "src"},
+	"zig":        {Name: "zig", Repo: "tree-sitter-grammars/tree-sitter-zig", Branch: "master", SourcePath: "src"},
 }
 
 func (d *GrammarDownloader) EnsureGrammar(ctx context.Context, name string) (string, error) {
