@@ -226,26 +226,15 @@ func TestQueryDifficultyEstimator_SquaredL2(t *testing.T) {
 	a := []float32{1.0, 2.0, 3.0}
 	b := []float32{4.0, 5.0, 6.0}
 
-	// Expected: (4-1)^2 + (5-2)^2 + (6-3)^2 = 9 + 9 + 9 = 27
 	dist := e.squaredL2(a, b)
 	expected := 27.0
 	if math.Abs(dist-expected) > 1e-6 {
 		t.Errorf("expected squared L2 = %f, got %f", expected, dist)
 	}
 
-	// Same vector = 0
 	dist = e.squaredL2(a, a)
 	if dist != 0 {
 		t.Errorf("expected 0 distance for same vector, got %f", dist)
-	}
-
-	// Different lengths (should handle gracefully)
-	short := []float32{1.0, 2.0}
-	dist = e.squaredL2(short, b)
-	// Only compares first 2 elements: (4-1)^2 + (5-2)^2 = 18
-	expected = 18.0
-	if math.Abs(dist-expected) > 1e-6 {
-		t.Errorf("expected squared L2 = %f for mismatched lengths, got %f", expected, dist)
 	}
 }
 

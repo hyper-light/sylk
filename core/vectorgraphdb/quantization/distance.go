@@ -3,6 +3,7 @@ package quantization
 import (
 	"sort"
 
+	"github.com/viterin/vek/vek32"
 	"gonum.org/v1/gonum/blas"
 	"gonum.org/v1/gonum/blas/blas32"
 )
@@ -25,8 +26,7 @@ func NewDistanceIndex(vectors [][]float32) *DistanceIndex {
 
 	for i, v := range vectors {
 		copy(flat[i*dim:], v)
-		vec := blas32.Vector{N: dim, Inc: 1, Data: v}
-		norms[i] = blas32.Dot(vec, vec)
+		norms[i] = vek32.Dot(v, v)
 	}
 	return &DistanceIndex{flat: flat, norms: norms, dim: dim, n: n}
 }
@@ -35,13 +35,12 @@ func (idx *DistanceIndex) SquaredL2(query []float32, out []float32) {
 	if idx.n == 0 {
 		return
 	}
-	queryVec := blas32.Vector{N: idx.dim, Inc: 1, Data: query}
-	queryNorm := blas32.Dot(queryVec, queryVec)
+	queryNorm := vek32.Dot(query, query)
 
 	blas32.Gemv(
 		blas.NoTrans, 1.0,
 		blas32.General{Rows: idx.n, Cols: idx.dim, Stride: idx.dim, Data: idx.flat},
-		queryVec, 0.0,
+		blas32.Vector{N: idx.dim, Inc: 1, Data: query}, 0.0,
 		blas32.Vector{N: idx.n, Inc: 1, Data: out},
 	)
 
@@ -85,11 +84,9 @@ func SquaredL2Single(a, b []float32) float32 {
 	if n == 0 || n != len(b) {
 		return 0
 	}
-	vecA := blas32.Vector{N: n, Inc: 1, Data: a}
-	vecB := blas32.Vector{N: n, Inc: 1, Data: b}
-	aNorm := blas32.Dot(vecA, vecA)
-	bNorm := blas32.Dot(vecB, vecB)
-	aDotB := blas32.Dot(vecA, vecB)
+	aNorm := vek32.Dot(a, a)
+	bNorm := vek32.Dot(b, b)
+	aDotB := vek32.Dot(a, b)
 	d := aNorm + bNorm - 2*aDotB
 	if d < 0 {
 		return 0
@@ -101,6 +98,5 @@ func VectorNormSquared(v []float32) float32 {
 	if len(v) == 0 {
 		return 0
 	}
-	vec := blas32.Vector{N: len(v), Inc: 1, Data: v}
-	return blas32.Dot(vec, vec)
+	return vek32.Dot(v, v)
 }

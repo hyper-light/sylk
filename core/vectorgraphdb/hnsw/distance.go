@@ -44,10 +44,7 @@ func Magnitude(v []float32) float64 {
 	if len(v) == 0 {
 		return 0
 	}
-	return math.Sqrt(float64(blas32.Dot(
-		blas32.Vector{N: len(v), Inc: 1, Data: v},
-		blas32.Vector{N: len(v), Inc: 1, Data: v},
-	)))
+	return math.Sqrt(float64(vek32.Dot(v, v)))
 }
 
 // CosineSimilarity computes cosine similarity between two vectors.
@@ -87,16 +84,10 @@ func EuclideanDistance(a, b []float32) float64 {
 	return euclideanDistanceBLAS(a, b)
 }
 
-// euclideanDistanceBLAS computes ||a - b||_2 using BLAS operations.
-// Uses: ||a-b||^2 = ||a||^2 + ||b||^2 - 2*dot(a,b)
 func euclideanDistanceBLAS(a, b []float32) float64 {
-	n := len(a)
-	vecA := blas32.Vector{N: n, Inc: 1, Data: a}
-	vecB := blas32.Vector{N: n, Inc: 1, Data: b}
-
-	aNorm := float64(blas32.Dot(vecA, vecA))
-	bNorm := float64(blas32.Dot(vecB, vecB))
-	aDotB := float64(blas32.Dot(vecA, vecB))
+	aNorm := float64(vek32.Dot(a, a))
+	bNorm := float64(vek32.Dot(b, b))
+	aDotB := float64(vek32.Dot(a, b))
 
 	sqDist := aNorm + bNorm - 2*aDotB
 	if sqDist < 0 {
@@ -105,17 +96,12 @@ func euclideanDistanceBLAS(a, b []float32) float64 {
 	return math.Sqrt(sqDist)
 }
 
-// NormalizeVectorCopy returns a normalized copy of the input vector.
-// The original vector is not modified.
-// Returns the normalized copy and the original magnitude.
-// If the vector has zero magnitude, returns a copy of the original and 0.
 func NormalizeVectorCopy(v []float32) ([]float32, float64) {
 	n := len(v)
 	if n == 0 {
 		return nil, 0
 	}
-	vec := blas32.Vector{N: n, Inc: 1, Data: v}
-	mag := math.Sqrt(float64(blas32.Dot(vec, vec)))
+	mag := math.Sqrt(float64(vek32.Dot(v, v)))
 
 	result := make([]float32, n)
 	if mag == 0 {
@@ -124,33 +110,23 @@ func NormalizeVectorCopy(v []float32) ([]float32, float64) {
 	}
 
 	invMag := float32(1.0 / mag)
-	resultVec := blas32.Vector{N: n, Inc: 1, Data: result}
-	blas32.Axpy(invMag, vec, resultVec)
+	for i, val := range v {
+		result[i] = val * invMag
+	}
 	return result, mag
 }
 
-// NormalizeVector normalizes a vector to unit length in-place.
-// Returns the original magnitude.
-//
-// Deprecated: Use NormalizeVectorCopy instead to avoid corrupting shared vectors.
-// This function modifies the input vector in-place, which can cause issues when:
-//   - The caller's vector is unexpectedly modified
-//   - Multiple normalizations compound errors
-//   - Shared vectors (e.g., from query) get corrupted
-//
-// This function is retained for backward compatibility but new code should use
-// NormalizeVectorCopy.
 func NormalizeVector(v []float32) float64 {
-	n := len(v)
-	if n == 0 {
+	if len(v) == 0 {
 		return 0
 	}
-	vec := blas32.Vector{N: n, Inc: 1, Data: v}
-	mag := math.Sqrt(float64(blas32.Dot(vec, vec)))
+	mag := math.Sqrt(float64(vek32.Dot(v, v)))
 	if mag == 0 {
 		return 0
 	}
 	invMag := float32(1.0 / mag)
-	blas32.Scal(invMag, vec)
+	for i := range v {
+		v[i] *= invMag
+	}
 	return mag
 }

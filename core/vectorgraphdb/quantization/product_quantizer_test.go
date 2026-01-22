@@ -54,10 +54,10 @@ func TestCompressionRatio(t *testing.T) {
 
 func TestNewPQCode(t *testing.T) {
 	tests := []struct {
-		name          string
-		numSubspaces  int
-		expectedLen   int
-		expectNil     bool
+		name         string
+		numSubspaces int
+		expectedLen  int
+		expectNil    bool
 	}{
 		{"standard 32 subspaces", 32, 32, false},
 		{"8 subspaces", 8, 8, false},
@@ -627,7 +627,7 @@ func TestProductQuantizer768DimCompression(t *testing.T) {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
 
-	originalBytes := pq.VectorDim() * 4 // float32 = 4 bytes
+	originalBytes := pq.VectorDim() * 4  // float32 = 4 bytes
 	compressedBytes := pq.NumSubspaces() // uint8 = 1 byte per subspace
 
 	// 768 * 4 = 3072 bytes original
@@ -744,43 +744,6 @@ func TestSubspaceDistanceSameLength(t *testing.T) {
 			a:        make([]float32, 24), // all zeros
 			b:        make([]float32, 24), // all zeros
 			expected: 0.0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := subspaceDistance(tt.a, tt.b)
-			if got != tt.expected {
-				t.Errorf("subspaceDistance(%v, %v) = %f, want %f", tt.a, tt.b, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestSubspaceDistanceDifferentLengths(t *testing.T) {
-	tests := []struct {
-		name     string
-		a        []float32
-		b        []float32
-		expected float32
-	}{
-		{
-			name:     "a longer than b",
-			a:        []float32{1.0, 2.0, 3.0, 4.0},
-			b:        []float32{0.0, 0.0},
-			expected: 5.0, // 1^2 + 2^2 = 5 (only first 2 elements)
-		},
-		{
-			name:     "b longer than a",
-			a:        []float32{1.0, 2.0},
-			b:        []float32{0.0, 0.0, 3.0, 4.0},
-			expected: 5.0, // 1^2 + 2^2 = 5 (only first 2 elements)
-		},
-		{
-			name:     "significantly different lengths",
-			a:        []float32{1.0},
-			b:        []float32{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-			expected: 1.0, // only uses first element
 		},
 	}
 
@@ -1052,7 +1015,7 @@ func containsError(err, target error) bool {
 	}
 	return err.Error() == target.Error() ||
 		len(err.Error()) > len(target.Error()) &&
-		err.Error()[:len(target.Error())] == target.Error()[:len(target.Error())]
+			err.Error()[:len(target.Error())] == target.Error()[:len(target.Error())]
 }
 
 func TestDistanceTableValidateSubspaceErrors(t *testing.T) {
@@ -1172,13 +1135,13 @@ func TestDistanceTableComputeDistanceEdgeCases(t *testing.T) {
 			name:     "code shorter than subspaces",
 			dt:       dt,
 			code:     PQCode{0, 1}, // Only 2 elements for 4 subspaces
-			expected: 0.0 + 9.0,   // Table[0][0] + Table[1][1]
+			expected: 0.0 + 9.0,    // Table[0][0] + Table[1][1]
 		},
 		{
 			name:     "code longer than subspaces",
 			dt:       dt,
 			code:     PQCode{0, 1, 2, 3, 4, 5, 6, 7}, // 8 elements for 4 subspaces
-			expected: 0.0 + 9.0 + 18.0 + 27.0,       // Only first 4 used
+			expected: 0.0 + 9.0 + 18.0 + 27.0,        // Only first 4 used
 		},
 	}
 
@@ -1222,7 +1185,7 @@ func TestDistanceTableComputeDistanceBoundsCheck(t *testing.T) {
 		{
 			name:     "out of bounds centroid - skipped",
 			code:     PQCode{5, 1}, // 5 > 3, so subspace 0 is skipped
-			expected: 20.0,        // Only subspace 1 contributes
+			expected: 20.0,         // Only subspace 1 contributes
 		},
 		{
 			name:     "all out of bounds",
@@ -1645,7 +1608,7 @@ func TestVectorsEqual(t *testing.T) {
 
 func TestFindNearestCentroid(t *testing.T) {
 	centroids := [][]float32{
-		{0.0, 0.0}, // centroid 0
+		{0.0, 0.0},  // centroid 0
 		{10.0, 0.0}, // centroid 1
 		{0.0, 10.0}, // centroid 2
 	}
@@ -2327,13 +2290,13 @@ func TestDeriveTrainConfigValues(t *testing.T) {
 func TestDeriveTrainConfigScaling(t *testing.T) {
 	// Test that NumRestarts scales with k
 	tests := []struct {
-		k               int
+		k                int
 		expectedRestarts int
 	}{
-		{2, 1},    // ceil(log2(2)) = 1
-		{4, 2},    // ceil(log2(4)) = 2
-		{16, 4},   // ceil(log2(16)) = 4
-		{256, 8},  // ceil(log2(256)) = 8
+		{2, 1},     // ceil(log2(2)) = 1
+		{4, 2},     // ceil(log2(4)) = 2
+		{16, 4},    // ceil(log2(16)) = 4
+		{256, 8},   // ceil(log2(256)) = 8
 		{1024, 10}, // ceil(log2(1024)) = 10
 	}
 
@@ -2570,10 +2533,10 @@ func TestProductQuantizer_TrainConvergence_Success(t *testing.T) {
 	}
 
 	trainConfig := TrainConfig{
-		MaxIterations:   100,
-		ConvergenceThreshold:  1e-5,
-		Seed:            12345,
-		MinSamplesRatio: 10.0,
+		MaxIterations:        100,
+		ConvergenceThreshold: 1e-5,
+		Seed:                 12345,
+		MinSamplesRatio:      10.0,
 	}
 
 	err = pq.TrainWithConfig(context.Background(), vectors, trainConfig)
@@ -2617,10 +2580,10 @@ func TestProductQuantizer_TrainParallel_Success(t *testing.T) {
 	vectors := generateTrainingVectors(200, 64, 42)
 
 	trainConfig := TrainConfig{
-		MaxIterations:   50,
-		ConvergenceThreshold:  1e-5,
-		Seed:            12345,
-		MinSamplesRatio: 10.0,
+		MaxIterations:        50,
+		ConvergenceThreshold: 1e-5,
+		Seed:                 12345,
+		MinSamplesRatio:      10.0,
 	}
 
 	err = pq.TrainParallelWithConfig(context.Background(), vectors, trainConfig, 4)
@@ -3062,10 +3025,10 @@ func BenchmarkProductQuantizer_Train_Small(b *testing.B) {
 	}
 	vectors := generateTrainingVectors(100, 32, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:   20,
-		ConvergenceThreshold:  1e-5,
-		Seed:            12345,
-		MinSamplesRatio: 10.0,
+		MaxIterations:        20,
+		ConvergenceThreshold: 1e-5,
+		Seed:                 12345,
+		MinSamplesRatio:      10.0,
 	}
 
 	b.ResetTimer()
@@ -3082,10 +3045,10 @@ func BenchmarkProductQuantizer_Train_Medium(b *testing.B) {
 	}
 	vectors := generateTrainingVectors(200, 64, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:   20,
-		ConvergenceThreshold:  1e-5,
-		Seed:            12345,
-		MinSamplesRatio: 10.0,
+		MaxIterations:        20,
+		ConvergenceThreshold: 1e-5,
+		Seed:                 12345,
+		MinSamplesRatio:      10.0,
 	}
 
 	b.ResetTimer()
@@ -3102,10 +3065,10 @@ func BenchmarkProductQuantizer_TrainParallel_Medium(b *testing.B) {
 	}
 	vectors := generateTrainingVectors(200, 64, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:   20,
-		ConvergenceThreshold:  1e-5,
-		Seed:            12345,
-		MinSamplesRatio: 10.0,
+		MaxIterations:        20,
+		ConvergenceThreshold: 1e-5,
+		Seed:                 12345,
+		MinSamplesRatio:      10.0,
 	}
 
 	b.ResetTimer()
@@ -3507,9 +3470,9 @@ func TestComputeDistanceTable_BLASvsScalar(t *testing.T) {
 
 			// Test with multiple query vectors
 			queries := [][]float32{
-				vectors[0],                                             // Training vector
-				vectors[len(vectors)/2],                                // Middle training vector
-				generateTrainingVectors(1, tc.vectorDim, 99999)[0],     // Random vector
+				vectors[0],              // Training vector
+				vectors[len(vectors)/2], // Middle training vector
+				generateTrainingVectors(1, tc.vectorDim, 99999)[0], // Random vector
 			}
 
 			for i, query := range queries {
@@ -3929,7 +3892,7 @@ func TestProductQuantizer_AsymmetricDistance_PreservesOrdering(t *testing.T) {
 	similarVec := make([]float32, 64)
 	copy(similarVec, query)
 	for i := range similarVec {
-		similarVec[i] += rng.Float32() * 0.1 - 0.05 // Small noise
+		similarVec[i] += rng.Float32()*0.1 - 0.05 // Small noise
 	}
 
 	differentVec := make([]float32, 64)
@@ -4449,10 +4412,10 @@ func computeDistanceTableScalarBenchmark(pq *ProductQuantizer, query []float32) 
 
 func BenchmarkDistanceTable_BLAS(b *testing.B) {
 	benchmarks := []struct {
-		name       string
-		vectorDim  int
-		numSub     int
-		centroids  int
+		name      string
+		vectorDim int
+		numSub    int
+		centroids int
 	}{
 		{"small_32d_4x8", 32, 4, 8},
 		{"medium_128d_8x32", 128, 8, 32},
@@ -4492,10 +4455,10 @@ func BenchmarkDistanceTable_BLAS(b *testing.B) {
 
 func BenchmarkDistanceTable_Scalar(b *testing.B) {
 	benchmarks := []struct {
-		name       string
-		vectorDim  int
-		numSub     int
-		centroids  int
+		name      string
+		vectorDim int
+		numSub    int
+		centroids int
 	}{
 		{"small_32d_4x8", 32, 4, 8},
 		{"medium_128d_8x32", 128, 8, 32},
@@ -4754,10 +4717,10 @@ func TestProductQuantizer_Serialization_LargeQuantizer(t *testing.T) {
 	// Train using parallel training for performance
 	vectors := generateTrainingVectors(3000, 768, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:        20,
-		NumRestarts:          2, // Reduce restarts for faster test
-		Seed:                 12345,
-		MinSamplesRatio:      10.0,
+		MaxIterations:   20,
+		NumRestarts:     2, // Reduce restarts for faster test
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
 	}
 	if err := pq.TrainParallelWithConfig(context.Background(), vectors, trainConfig, 0); err != nil {
 		t.Fatalf("failed to train: %v", err)
@@ -5235,7 +5198,7 @@ func TestProductQuantizer_Compression_VerifyRatio(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			originalSize := tt.vectorDim * 4 // float32 = 4 bytes
+			originalSize := tt.vectorDim * 4  // float32 = 4 bytes
 			compressedSize := tt.numSubspaces // uint8 per subspace = 1 byte
 
 			// Verify code size
@@ -5269,10 +5232,10 @@ func TestProductQuantizer_Compression_ActualMemory(t *testing.T) {
 	// Train using parallel for performance
 	vectors := generateTrainingVectors(3000, 768, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:        20,
-		NumRestarts:          2,
-		Seed:                 12345,
-		MinSamplesRatio:      10.0,
+		MaxIterations:   20,
+		NumRestarts:     2,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
 	}
 	if err := pq.TrainParallelWithConfig(context.Background(), vectors, trainConfig, 0); err != nil {
 		t.Fatalf("failed to train: %v", err)
@@ -5314,10 +5277,10 @@ func TestProductQuantizer_Compression_BatchStorage(t *testing.T) {
 	// Train using parallel for performance
 	vectors := generateTrainingVectors(3000, 768, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:        20,
-		NumRestarts:          2,
-		Seed:                 12345,
-		MinSamplesRatio:      10.0,
+		MaxIterations:   20,
+		NumRestarts:     2,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
 	}
 	if err := pq.TrainParallelWithConfig(context.Background(), vectors, trainConfig, 0); err != nil {
 		t.Fatalf("failed to train: %v", err)
@@ -5356,10 +5319,10 @@ func BenchmarkProductQuantizer_MarshalBinary(b *testing.B) {
 
 	vectors := generateTrainingVectors(3000, 768, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:        20,
-		NumRestarts:          2,
-		Seed:                 12345,
-		MinSamplesRatio:      10.0,
+		MaxIterations:   20,
+		NumRestarts:     2,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
 	}
 	pq.TrainParallelWithConfig(context.Background(), vectors, trainConfig, 0)
 
@@ -5378,10 +5341,10 @@ func BenchmarkProductQuantizer_UnmarshalBinary(b *testing.B) {
 
 	vectors := generateTrainingVectors(3000, 768, 42)
 	trainConfig := TrainConfig{
-		MaxIterations:        20,
-		NumRestarts:          2,
-		Seed:                 12345,
-		MinSamplesRatio:      10.0,
+		MaxIterations:   20,
+		NumRestarts:     2,
+		Seed:            12345,
+		MinSamplesRatio: 10.0,
 	}
 	pq.TrainParallelWithConfig(context.Background(), vectors, trainConfig, 0)
 

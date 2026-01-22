@@ -2,6 +2,8 @@ package scann
 
 import (
 	"math"
+
+	"github.com/viterin/vek/vek32"
 )
 
 type AVQCodebook struct {
@@ -148,9 +150,5 @@ func (pc *PartitionCodebooks) AsymmetricDistance(query []float32, partitionID in
 }
 
 func computeResidual(vec, centroid []float32) []float32 {
-	residual := make([]float32, len(vec))
-	for i := range vec {
-		residual[i] = vec[i] - centroid[i]
-	}
-	return residual
+	return vek32.Sub(vec, centroid)
 }
