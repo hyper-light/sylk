@@ -305,7 +305,7 @@ func runSearchBenchmark(
 
 	snapshot := vectorStore.Snapshot()
 
-	for _, testL := range []int{50, 100, 200} {
+	for _, testL := range []int{100, 200, 500} {
 		t.Logf("Running %d search queries (K=%d, L=%d)...", numQueries, K, testL)
 
 		var totalLatency time.Duration
