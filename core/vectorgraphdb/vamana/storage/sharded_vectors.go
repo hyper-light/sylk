@@ -6,9 +6,17 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	"gopkg.in/yaml.v3"
 )
 
-const DefaultVectorShardCapacity = 65536
+type shardedVectorMeta struct {
+	ShardCapacity int `yaml:"shard_capacity"`
+	Dim           int `yaml:"dim"`
+	Total         int `yaml:"total"`
+}
+
+const VectorsPerShard = 65536
 
 type ShardedVectorStore struct {
 	dir           string
@@ -18,7 +26,7 @@ type ShardedVectorStore struct {
 	shards  []*vectorShard
 	shardMu sync.RWMutex
 
-	count atomic.Uint64
+	total atomic.Uint64
 }
 
 type vectorShard struct {
@@ -27,55 +35,41 @@ type vectorShard struct {
 }
 
 func OpenShardedVectorStore(dir string) (*ShardedVectorStore, error) {
-	entries, err := os.ReadDir(dir)
+	metaData, err := os.ReadFile(filepath.Join(dir, "meta.yaml"))
 	if err != nil {
-		return nil, fmt.Errorf("sharded vectors: open dir: %w", err)
+		return nil, fmt.Errorf("sharded vectors: read meta: %w", err)
 	}
 
-	var shards []*vectorShard
-	var dim, shardCapacity int
-	var maxCount uint64
+	var meta shardedVectorMeta
+	if err := yaml.Unmarshal(metaData, &meta); err != nil {
+		return nil, fmt.Errorf("sharded vectors: parse meta: %w", err)
+	}
 
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".bin" {
-			continue
-		}
+	numShards := (meta.Total + meta.ShardCapacity - 1) / meta.ShardCapacity
+	if numShards == 0 {
+		numShards = 1
+	}
 
-		path := filepath.Join(dir, entry.Name())
+	shards := make([]*vectorShard, numShards)
+	for i := range numShards {
+		path := filepath.Join(dir, fmt.Sprintf("shard_%04d.bin", i))
 		store, err := OpenVectorStore(path)
 		if err != nil {
-			for _, s := range shards {
-				s.store.Close()
+			for j := range i {
+				shards[j].store.Close()
 			}
-			return nil, fmt.Errorf("sharded vectors: open shard %s: %w", entry.Name(), err)
+			return nil, fmt.Errorf("sharded vectors: open shard %d: %w", i, err)
 		}
-
-		if dim == 0 {
-			dim = store.Dimension()
-			shardCapacity = int(store.Capacity())
-		}
-
-		shards = append(shards, &vectorShard{store: store})
-
-		shardIdx := len(shards) - 1
-		shardMaxID := uint64(shardIdx)*uint64(shardCapacity) + store.Count()
-		if shardMaxID > maxCount {
-			maxCount = shardMaxID
-		}
-	}
-
-	if len(shards) == 0 {
-		return nil, fmt.Errorf("sharded vectors: no shards found in %s", dir)
+		shards[i] = &vectorShard{store: store}
 	}
 
 	s := &ShardedVectorStore{
 		dir:           dir,
-		dim:           dim,
-		shardCapacity: shardCapacity,
+		dim:           meta.Dim,
+		shardCapacity: meta.ShardCapacity,
 		shards:        shards,
 	}
-	s.count.Store(maxCount)
-
+	s.total.Store(uint64(meta.Total))
 	return s, nil
 }
 
@@ -85,7 +79,7 @@ func CreateShardedVectorStore(dir string, dim int, shardCapacity int) (*ShardedV
 	}
 
 	if shardCapacity <= 0 {
-		shardCapacity = DefaultVectorShardCapacity
+		shardCapacity = VectorsPerShard
 	}
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -103,7 +97,24 @@ func CreateShardedVectorStore(dir string, dim int, shardCapacity int) (*ShardedV
 		return nil, err
 	}
 
+	if err := s.saveMeta(); err != nil {
+		return nil, err
+	}
+
 	return s, nil
+}
+
+func (s *ShardedVectorStore) saveMeta() error {
+	meta := shardedVectorMeta{
+		ShardCapacity: s.shardCapacity,
+		Dim:           s.dim,
+		Total:         int(s.total.Load()),
+	}
+	data, err := yaml.Marshal(&meta)
+	if err != nil {
+		return fmt.Errorf("sharded vectors: marshal meta: %w", err)
+	}
+	return os.WriteFile(filepath.Join(s.dir, "meta.yaml"), data, 0644)
 }
 
 func (s *ShardedVectorStore) createShard() error {
@@ -173,50 +184,79 @@ func (s *ShardedVectorStore) Append(vector []float32) (uint32, error) {
 	}
 
 	s.shardMu.Lock()
+	defer s.shardMu.Unlock()
 
-	currentShard := s.shards[len(s.shards)-1]
-	currentShard.mu.Lock()
+	total := int(s.total.Load())
+	shardIdx := total / s.shardCapacity
 
-	if currentShard.store.Count() >= currentShard.store.Capacity() {
-		currentShard.mu.Unlock()
+	for shardIdx >= len(s.shards) {
 		if err := s.createShard(); err != nil {
-			s.shardMu.Unlock()
 			return 0, err
 		}
-		currentShard = s.shards[len(s.shards)-1]
-		currentShard.mu.Lock()
 	}
 
-	s.shardMu.Unlock()
-	defer currentShard.mu.Unlock()
-
-	localID, err := currentShard.store.Append(vector)
+	currentShard := s.shards[shardIdx]
+	currentShard.mu.Lock()
+	_, err := currentShard.store.Append(vector)
+	currentShard.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}
 
-	s.shardMu.RLock()
-	shardIdx := len(s.shards) - 1
-	s.shardMu.RUnlock()
+	s.total.Add(1)
+	return uint32(total), nil
+}
 
-	globalID := uint32(shardIdx*s.shardCapacity) + localID
+func (s *ShardedVectorStore) AppendBatch(vectors [][]float32) (startID uint32, err error) {
+	if len(vectors) == 0 {
+		return 0, nil
+	}
 
-	for {
-		current := s.count.Load()
-		newCount := uint64(globalID) + 1
-		if newCount <= current {
-			break
-		}
-		if s.count.CompareAndSwap(current, newCount) {
-			break
+	for _, v := range vectors {
+		if len(v) != s.dim {
+			return 0, ErrVectorDimensionMismatch
 		}
 	}
 
-	return globalID, nil
+	s.shardMu.Lock()
+	defer s.shardMu.Unlock()
+
+	total := int(s.total.Load())
+	startID = uint32(total)
+	remaining := vectors
+
+	for len(remaining) > 0 {
+		shardIdx := total / s.shardCapacity
+		localID := total % s.shardCapacity
+		space := s.shardCapacity - localID
+
+		for shardIdx >= len(s.shards) {
+			if err := s.createShard(); err != nil {
+				return 0, err
+			}
+		}
+
+		take := min(space, len(remaining))
+		batch := remaining[:take]
+		remaining = remaining[take:]
+
+		currentShard := s.shards[shardIdx]
+		currentShard.mu.Lock()
+		_, err := currentShard.store.AppendBatch(batch)
+		currentShard.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
+
+		total += take
+	}
+
+	s.total.Store(uint64(total))
+	return startID, nil
 }
 
 func (s *ShardedVectorStore) Count() uint64 {
-	return s.count.Load()
+	return s.total.Load()
 }
 
 func (s *ShardedVectorStore) Capacity() uint64 {
@@ -258,7 +298,7 @@ func (s *ShardedVectorStore) Snapshot() *ShardedVectorSnapshot {
 	return &ShardedVectorSnapshot{
 		shards:        snapshots,
 		shardCapacity: s.shardCapacity,
-		count:         s.count.Load(),
+		count:         s.total.Load(),
 		dim:           s.dim,
 	}
 }
@@ -299,7 +339,7 @@ func (s *ShardedVectorStore) Sync() error {
 		}
 	}
 
-	return nil
+	return s.saveMeta()
 }
 
 func (s *ShardedVectorStore) Close() error {
@@ -348,12 +388,12 @@ func (s *ShardedVectorStore) Set(vectorID uint32, vector []float32) error {
 	}
 
 	for {
-		current := s.count.Load()
-		newCount := uint64(vectorID) + 1
-		if newCount <= current {
+		current := s.total.Load()
+		newTotal := uint64(vectorID) + 1
+		if newTotal <= current {
 			break
 		}
-		if s.count.CompareAndSwap(current, newCount) {
+		if s.total.CompareAndSwap(current, newTotal) {
 			break
 		}
 	}

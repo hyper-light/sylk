@@ -325,6 +325,54 @@ func floatToUint32(f float32) uint32 {
 	return *(*uint32)(unsafe.Pointer(&f))
 }
 
+func (s *VectorStore) AppendBatch(vectors [][]float32) (startID uint32, err error) {
+	if len(vectors) == 0 {
+		return 0, nil
+	}
+
+	for _, v := range vectors {
+		if len(v) != s.dim {
+			return 0, ErrVectorDimensionMismatch
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.region == nil {
+		return 0, ErrVectorStoreClosed
+	}
+	if s.region.Readonly() {
+		return 0, ErrVectorStoreNotWritable
+	}
+
+	needed := uint64(len(vectors))
+	if s.header.Count+needed > s.capacity {
+		return 0, ErrVectorCapacityExceeded
+	}
+
+	data := s.region.Data()
+	if data == nil {
+		return 0, ErrVectorStoreClosed
+	}
+
+	startID = uint32(s.header.Count)
+	vecBytes := vectorSize(s.dim)
+
+	for i, vec := range vectors {
+		offset := vectorOffset(s.dim, s.header.Count+uint64(i))
+		dst := data[offset : offset+vecBytes]
+		for j, v := range vec {
+			binary.LittleEndian.PutUint32(dst[j*4:], floatToUint32(v))
+		}
+	}
+
+	s.header.Count += needed
+	binary.LittleEndian.PutUint64(data[4:12], s.header.Count)
+
+	return startID, nil
+}
+
 func (s *VectorStore) Set(internalID uint32, vector []float32) error {
 	if len(vector) != s.dim {
 		return ErrVectorDimensionMismatch

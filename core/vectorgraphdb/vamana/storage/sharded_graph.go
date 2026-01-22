@@ -6,11 +6,19 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	"gopkg.in/yaml.v3"
 )
 
-// DefaultGraphShardCapacity is the default number of nodes per shard.
-// 64K nodes * (2 + 64*4) bytes = ~16.5MB per shard with R=64.
-const DefaultGraphShardCapacity = 65536
+type shardedGraphMeta struct {
+	ShardCapacity int `yaml:"shard_capacity"`
+	R             int `yaml:"r"`
+	Total         int `yaml:"total"`
+}
+
+// NodesPerShard matches VectorsPerShard for consistency.
+// 64K nodes * (2 + 64*4) bytes = ~17MB per shard with R=64.
+const NodesPerShard = VectorsPerShard
 
 // ShardedGraphStore provides dynamic-growth graph storage via multiple fixed-size shards.
 // Each shard is a separate mmap file that never resizes. Growth adds new shards.
@@ -36,70 +44,52 @@ type graphShard struct {
 	mu    sync.RWMutex
 }
 
-// OpenShardedGraphStore opens an existing sharded graph store from the given directory.
-// Returns an error if the directory doesn't exist or contains no valid shards.
 func OpenShardedGraphStore(dir string) (*ShardedGraphStore, error) {
-	entries, err := os.ReadDir(dir)
+	metaData, err := os.ReadFile(filepath.Join(dir, "meta.yaml"))
 	if err != nil {
-		return nil, fmt.Errorf("sharded graph: open dir: %w", err)
+		return nil, fmt.Errorf("sharded graph: read meta: %w", err)
 	}
 
-	var shards []*graphShard
-	var R, shardCapacity int
-	var maxCount uint64
+	var meta shardedGraphMeta
+	if err := yaml.Unmarshal(metaData, &meta); err != nil {
+		return nil, fmt.Errorf("sharded graph: parse meta: %w", err)
+	}
 
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".bin" {
-			continue
-		}
+	numShards := (meta.Total + meta.ShardCapacity - 1) / meta.ShardCapacity
+	if numShards == 0 {
+		numShards = 1
+	}
 
-		path := filepath.Join(dir, entry.Name())
+	shards := make([]*graphShard, numShards)
+	for i := range numShards {
+		path := filepath.Join(dir, fmt.Sprintf("shard_%04d.bin", i))
 		store, err := OpenGraphStore(path)
 		if err != nil {
-			for _, s := range shards {
-				s.store.Close()
+			for j := range i {
+				shards[j].store.Close()
 			}
-			return nil, fmt.Errorf("sharded graph: open shard %s: %w", entry.Name(), err)
+			return nil, fmt.Errorf("sharded graph: open shard %d: %w", i, err)
 		}
-
-		if R == 0 {
-			R = store.R
-			shardCapacity = int(store.Capacity())
-		}
-
-		shards = append(shards, &graphShard{store: store})
-
-		shardIdx := len(shards) - 1
-		shardMaxID := uint64(shardIdx)*uint64(shardCapacity) + store.Count()
-		if shardMaxID > maxCount {
-			maxCount = shardMaxID
-		}
-	}
-
-	if len(shards) == 0 {
-		return nil, fmt.Errorf("sharded graph: no shards found in %s", dir)
+		shards[i] = &graphShard{store: store}
 	}
 
 	s := &ShardedGraphStore{
 		dir:           dir,
-		R:             R,
-		shardCapacity: shardCapacity,
+		R:             meta.R,
+		shardCapacity: meta.ShardCapacity,
 		shards:        shards,
 	}
-	s.count.Store(maxCount)
-
+	s.count.Store(uint64(meta.Total))
 	return s, nil
 }
 
-// CreateShardedGraphStore creates a new sharded graph store in the given directory.
-// R is the maximum degree per node. shardCapacity is nodes per shard (0 = default 64K).
 func CreateShardedGraphStore(dir string, R int, shardCapacity int) (*ShardedGraphStore, error) {
 	if R <= 0 {
 		return nil, fmt.Errorf("sharded graph: invalid R=%d", R)
 	}
 
 	if shardCapacity <= 0 {
-		shardCapacity = DefaultGraphShardCapacity
+		shardCapacity = NodesPerShard
 	}
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -117,7 +107,24 @@ func CreateShardedGraphStore(dir string, R int, shardCapacity int) (*ShardedGrap
 		return nil, err
 	}
 
+	if err := s.saveMeta(); err != nil {
+		return nil, err
+	}
+
 	return s, nil
+}
+
+func (s *ShardedGraphStore) saveMeta() error {
+	meta := shardedGraphMeta{
+		ShardCapacity: s.shardCapacity,
+		R:             s.R,
+		Total:         int(s.count.Load()),
+	}
+	data, err := yaml.Marshal(&meta)
+	if err != nil {
+		return fmt.Errorf("sharded graph: marshal meta: %w", err)
+	}
+	return os.WriteFile(filepath.Join(s.dir, "meta.yaml"), data, 0644)
 }
 
 // createShard adds a new shard. Caller must hold shardMu write lock.
@@ -251,7 +258,59 @@ func (s *ShardedGraphStore) AddNeighbor(nodeID, neighborID uint32) bool {
 	return shard.store.AddNeighbor(localID, neighborID)
 }
 
-// Count returns the total number of nodes across all shards.
+func (s *ShardedGraphStore) SetNeighborsBatch(nodes []NodeNeighbors) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	var maxNodeID uint32
+	for _, node := range nodes {
+		if node.NodeID > maxNodeID {
+			maxNodeID = node.NodeID
+		}
+	}
+
+	if err := s.ensureShard(maxNodeID); err != nil {
+		return err
+	}
+
+	shardBatches := make(map[int][]NodeNeighbors)
+	for _, node := range nodes {
+		shardIdx := int(node.NodeID) / s.shardCapacity
+		localID := uint32(int(node.NodeID) % s.shardCapacity)
+		shardBatches[shardIdx] = append(shardBatches[shardIdx], NodeNeighbors{
+			NodeID:    localID,
+			Neighbors: node.Neighbors,
+		})
+	}
+
+	s.shardMu.RLock()
+	defer s.shardMu.RUnlock()
+
+	for shardIdx, batch := range shardBatches {
+		shard := s.shards[shardIdx]
+		shard.mu.Lock()
+		err := shard.store.SetNeighborsBatch(batch)
+		shard.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+
+	for {
+		current := s.count.Load()
+		newCount := uint64(maxNodeID) + 1
+		if newCount <= current {
+			break
+		}
+		if s.count.CompareAndSwap(current, newCount) {
+			break
+		}
+	}
+
+	return nil
+}
+
 func (s *ShardedGraphStore) Count() uint64 {
 	return s.count.Load()
 }
@@ -278,7 +337,6 @@ func (s *ShardedGraphStore) ShardCount() int {
 	return len(s.shards)
 }
 
-// Sync flushes all shards to disk.
 func (s *ShardedGraphStore) Sync() error {
 	s.shardMu.RLock()
 	defer s.shardMu.RUnlock()
@@ -293,7 +351,7 @@ func (s *ShardedGraphStore) Sync() error {
 		}
 	}
 
-	return nil
+	return s.saveMeta()
 }
 
 // Close closes all shards.

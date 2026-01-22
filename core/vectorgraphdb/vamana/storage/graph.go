@@ -239,8 +239,52 @@ func (s *GraphStore) AddNeighbor(internalID, neighborID uint32) bool {
 	return true
 }
 
-// GetNeighborCount returns the number of neighbors for the given node.
-// Returns 0 if the node has no neighbors, the ID is out of bounds, or the store is closed.
+type NodeNeighbors struct {
+	NodeID    uint32
+	Neighbors []uint32
+}
+
+func (s *GraphStore) SetNeighborsBatch(nodes []NodeNeighbors) error {
+	if s.closed.Load() {
+		return ErrGraphClosed
+	}
+
+	data := s.region.Data()
+	var maxNodeID uint64
+
+	for _, node := range nodes {
+		if uint64(node.NodeID) >= s.capacity {
+			return fmt.Errorf("graph: set neighbors batch: %w: id=%d, capacity=%d",
+				ErrNodeOutOfBounds, node.NodeID, s.capacity)
+		}
+
+		count := len(node.Neighbors)
+		if count > s.R {
+			count = s.R
+		}
+
+		offset := s.nodeOffset(node.NodeID)
+		binary.LittleEndian.PutUint16(data[offset:offset+2], uint16(count))
+
+		if count > 0 {
+			neighborBytes := unsafe.Slice((*byte)(unsafe.Pointer(&node.Neighbors[0])), count*4)
+			copy(data[offset+2:], neighborBytes)
+		}
+
+		if uint64(node.NodeID) >= maxNodeID {
+			maxNodeID = uint64(node.NodeID) + 1
+		}
+	}
+
+	if maxNodeID > s.header.Count {
+		s.header.Count = maxNodeID
+		headerBytes, _ := s.header.MarshalBinary()
+		copy(data[:HeaderSize], headerBytes)
+	}
+
+	return nil
+}
+
 func (s *GraphStore) GetNeighborCount(internalID uint32) uint16 {
 	if s.closed.Load() {
 		return 0
