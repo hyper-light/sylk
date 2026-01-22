@@ -239,9 +239,13 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graph
 	numWorkers := b.config.NumWorkers
 
 	partitionMembers := make([][]uint32, numParts)
+	maxPartSize := 0
 	for i := range n {
 		part := assignments[i]
 		partitionMembers[part] = append(partitionMembers[part], uint32(i))
+	}
+	for _, members := range partitionMembers {
+		maxPartSize = max(maxPartSize, len(members))
 	}
 
 	chunkSize := (n + numWorkers - 1) / numWorkers
@@ -262,6 +266,13 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graph
 			defer wg.Done()
 			neighbors := make([]uint32, 0, R)
 			seen := make([]bool, n)
+			perm := make([]int, maxPartSize)
+			localSample := (R * 3) / 4
+			swaps := make([][2]int, localSample)
+
+			for j := range maxPartSize {
+				perm[j] = j
+			}
 
 			for i := start; i < end; i++ {
 				neighbors = neighbors[:0]
@@ -271,14 +282,28 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graph
 				members := partitionMembers[myPart]
 				memberCount := len(members)
 
-				localSample := (R * 3) / 4
-				for len(neighbors) < localSample && len(neighbors) < memberCount-1 {
-					cid := members[rand.IntN(memberCount)]
+				swapCount := min(localSample, memberCount)
+				for j := range swapCount {
+					r := j + rand.IntN(memberCount-j)
+					swaps[j] = [2]int{j, r}
+					perm[j], perm[r] = perm[r], perm[j]
+				}
+
+				for j := range swapCount {
+					cid := members[perm[j]]
 					if seen[cid] {
 						continue
 					}
 					seen[cid] = true
 					neighbors = append(neighbors, cid)
+					if len(neighbors) >= localSample {
+						break
+					}
+				}
+
+				for j := swapCount - 1; j >= 0; j-- {
+					a, b := swaps[j][0], swaps[j][1]
+					perm[a], perm[b] = perm[b], perm[a]
 				}
 
 				for len(neighbors) < R && len(neighbors) < n-1 {
