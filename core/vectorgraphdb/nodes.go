@@ -11,7 +11,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/viterin/vek/vek32"
+	"gonum.org/v1/gonum/blas/blas32"
 )
 
 var (
@@ -196,7 +196,8 @@ func computeMagnitude(v []float32) float64 {
 	if len(v) == 0 {
 		return 0
 	}
-	return math.Sqrt(float64(vek32.Dot(v, v)))
+	vec := blas32.Vector{N: len(v), Inc: 1, Data: v}
+	return math.Sqrt(float64(blas32.Dot(vec, vec)))
 }
 
 func (ns *NodeStore) GetNode(id string) (*GraphNode, error) {

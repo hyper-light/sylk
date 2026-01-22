@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"sync"
 
-	"github.com/viterin/vek/vek32"
+	"gonum.org/v1/gonum/blas/blas32"
 )
 
 // GenerateOrthogonalMatrix creates a random orthogonal rotation matrix using
@@ -60,17 +60,21 @@ func generateOrthogonalVector(existing [][]float32, dim int, rng *rand.Rand) []f
 }
 
 func dotProduct(a, b []float32) float32 {
-	if len(a) == 0 {
+	n := len(a)
+	if n == 0 {
 		return 0
 	}
-	return vek32.Dot(a, b)
+	vecA := blas32.Vector{N: n, Inc: 1, Data: a}
+	vecB := blas32.Vector{N: n, Inc: 1, Data: b}
+	return blas32.Dot(vecA, vecB)
 }
 
 func vectorNorm(v []float32) float32 {
-	if len(v) == 0 {
-		return 0
+	var sum float32
+	for _, val := range v {
+		sum += val * val
 	}
-	return float32(math.Sqrt(float64(vek32.Dot(v, v))))
+	return float32(math.Sqrt(float64(sum)))
 }
 
 // RotationMatrixCache provides thread-safe caching of rotation matrices by seed.
