@@ -15,6 +15,7 @@ type GraphDifficulty struct {
 	AvgPathLength   float64
 	ConvergenceRate float64
 	ProbeCount      int
+	N               int
 }
 
 func ProbeGraphDifficulty(
@@ -59,6 +60,7 @@ func ProbeGraphDifficulty(
 		AvgPathLength:   totalPathLen / float64(validProbes),
 		ConvergenceRate: totalConvRate / float64(validProbes),
 		ProbeCount:      validProbes,
+		N:               n,
 	}
 }
 
@@ -68,6 +70,7 @@ func defaultDifficulty(R int) GraphDifficulty {
 		AvgPathLength:   float64(bits.Len(uint(R))),
 		ConvergenceRate: 1.0,
 		ProbeCount:      0,
+		N:               0,
 	}
 }
 
@@ -163,7 +166,8 @@ func probeSearch(
 func DeriveL(R int, targetRecall float64, difficulty GraphDifficulty) int {
 	targetRecall = max(0.0, min(targetRecall, 1.0-1.0/float64(R*R)))
 
-	combinedDifficulty := difficulty.AvgPathLength * (1.0 + difficulty.AvgExpansion)
+	pathFactor := difficulty.AvgPathLength
+	expansionFactor := 1.0 + difficulty.AvgExpansion
 	recallBits := -math.Log2(1.0 - targetRecall)
 
 	logR := bits.Len(uint(R)) - 1
@@ -171,8 +175,12 @@ func DeriveL(R int, targetRecall float64, difficulty GraphDifficulty) int {
 		logR = 1
 	}
 
-	difficultyScale := 1.0 + math.Log2(combinedDifficulty+1)/float64(bits.Len(uint(R)))
-	L := float64(R) * combinedDifficulty * recallBits * difficultyScale / float64(logR)
+	depthRatio := 1.0
+	if difficulty.N > 0 {
+		depthRatio = float64(bits.Len(uint(difficulty.N))) / float64(bits.Len(uint(R)))
+	}
+
+	L := float64(R) * pathFactor * expansionFactor * recallBits * math.Sqrt(depthRatio) / float64(logR)
 
 	maxL := R * bits.Len(uint(R)) * bits.Len(uint(R))
 	return max(R, min(int(math.Ceil(L)), maxL))

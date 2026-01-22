@@ -305,8 +305,14 @@ func runSearchBenchmark(
 
 	snapshot := vectorStore.Snapshot()
 
-	for _, testL := range []int{100, 200, 500} {
-		t.Logf("Running %d search queries (K=%d, L=%d)...", numQueries, K, testL)
+	difficulty := ProbeGraphDifficulty(embeddings, snapshot, graphStore, magCache, medoid, config.R)
+	t.Logf("Graph difficulty: expansion=%.2f, pathLen=%.1f, n=%d", difficulty.AvgExpansion, difficulty.AvgPathLength, difficulty.N)
+
+	targets := []float64{0.90, 0.95, 0.98}
+	t.Logf("\n=== Derived L Benchmark ===")
+
+	for _, target := range targets {
+		derivedL := DeriveL(config.R, target, difficulty)
 
 		var totalLatency time.Duration
 		var totalRecall float64
@@ -315,7 +321,7 @@ func runSearchBenchmark(
 			queryVec := embeddings[queryIdx]
 
 			start := time.Now()
-			results := vamana.GreedySearchFast(queryVec, medoid, testL, K, snapshot, graphStore, magCache)
+			results := vamana.GreedySearchFast(queryVec, medoid, derivedL, K, snapshot, graphStore, magCache)
 			latency := time.Since(start)
 			totalLatency += latency
 
@@ -327,11 +333,16 @@ func runSearchBenchmark(
 		avgLatency := totalLatency / time.Duration(numQueries)
 		avgRecall := totalRecall / float64(numQueries)
 
-		t.Logf("  L=%d: latency=%v, recall=%.2f%%", testL, avgLatency, avgRecall*100)
+		status := "PASS"
+		if avgRecall < target {
+			status = "MISS"
+		}
+		t.Logf("  Target %.0f%%: L=%d (%.1fx R) -> latency=%v, recall=%.2f%% [%s]",
+			target*100, derivedL, float64(derivedL)/float64(config.R), avgLatency, avgRecall*100, status)
 	}
 
-	searchL := 100
-	t.Logf("=== Final Benchmark (L=%d) ===", searchL)
+	t.Logf("\n=== Final Benchmark (target=98%%) ===")
+	searchL := DeriveL(config.R, 0.98, difficulty)
 
 	var finalLatency time.Duration
 	var finalRecall float64
@@ -348,6 +359,7 @@ func runSearchBenchmark(
 	avgRecall := finalRecall / float64(numQueries)
 
 	t.Logf("  Vectors: %d", len(embeddings))
+	t.Logf("  Derived L: %d (%.1fx R)", searchL, float64(searchL)/float64(config.R))
 	t.Logf("  Average latency: %v", avgLatency)
 	t.Logf("  Average recall@%d: %.2f%%", K, avgRecall*100)
 
