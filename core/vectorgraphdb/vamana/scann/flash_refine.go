@@ -179,48 +179,14 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 	}
 
 	scoreBuf = scoreBuf[:0]
-	pVecReduced := pVec[:reducedDim]
-	nToScore := len(toScore)
-	i := 0
-	for ; i+3 < nToScore; i += 4 {
-		c0, c1, c2, c3 := toScore[i], toScore[i+1], toScore[i+2], toScore[i+3]
-		cVec0, cVec1, cVec2, cVec3 := r.vectors[c0], r.vectors[c1], r.vectors[c2], r.vectors[c3]
-		cMag0, cMag1, cMag2, cMag3 := r.mags[c0], r.mags[c1], r.mags[c2], r.mags[c3]
-
-		dot0 := vek32.Dot(pVecReduced, cVec0[:reducedDim])
-		dot1 := vek32.Dot(pVecReduced, cVec1[:reducedDim])
-		dot2 := vek32.Dot(pVecReduced, cVec2[:reducedDim])
-		dot3 := vek32.Dot(pVecReduced, cVec3[:reducedDim])
-
-		dist0, dist1, dist2, dist3 := 2.0, 2.0, 2.0, 2.0
-		if cMag0 != 0 {
-			dist0 = 1.0 - float64(dot0)/(pMag*cMag0)
-		}
-		if cMag1 != 0 {
-			dist1 = 1.0 - float64(dot1)/(pMag*cMag1)
-		}
-		if cMag2 != 0 {
-			dist2 = 1.0 - float64(dot2)/(pMag*cMag2)
-		}
-		if cMag3 != 0 {
-			dist3 = 1.0 - float64(dot3)/(pMag*cMag3)
-		}
-
-		scoreBuf = append(scoreBuf,
-			scoredCandidate{c0, dist0},
-			scoredCandidate{c1, dist1},
-			scoredCandidate{c2, dist2},
-			scoredCandidate{c3, dist3})
-	}
-	for ; i < nToScore; i++ {
-		c := toScore[i]
+	for _, c := range toScore {
 		cVec := r.vectors[c]
 		cMag := r.mags[c]
 		var dist float64
 		if cMag == 0 {
 			dist = 2.0
 		} else {
-			dot := vek32.Dot(pVecReduced, cVec[:reducedDim])
+			dot := vek32.Dot(pVec[:reducedDim], cVec[:reducedDim])
 			dist = 1.0 - float64(dot)/(pMag*cMag)
 		}
 		scoreBuf = append(scoreBuf, scoredCandidate{c, dist})
