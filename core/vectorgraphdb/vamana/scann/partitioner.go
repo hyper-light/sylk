@@ -344,12 +344,14 @@ func (p *Partitioner) NumPartitions() int {
 }
 
 func squaredL2(a, b []float32) float64 {
-	var sum float64
-	for i := range a {
-		d := float64(a[i] - b[i])
-		sum += d * d
+	aNorm := float64(vek32.Dot(a, a))
+	bNorm := float64(vek32.Dot(b, b))
+	aDotB := float64(vek32.Dot(a, b))
+	d := aNorm + bNorm - 2*aDotB
+	if d < 0 {
+		return 0
 	}
-	return sum
+	return d
 }
 
 func copyVector(v []float32) []float32 {
