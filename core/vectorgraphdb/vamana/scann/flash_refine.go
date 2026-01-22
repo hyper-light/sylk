@@ -172,7 +172,37 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 	}
 
 	scoreBuf = scoreBuf[:0]
-	for _, c := range toScore {
+	n := len(toScore)
+	i := 0
+	for ; i+4 <= n; i += 4 {
+		c0, c1, c2, c3 := toScore[i], toScore[i+1], toScore[i+2], toScore[i+3]
+		v0, v1, v2, v3 := r.vectors[c0], r.vectors[c1], r.vectors[c2], r.vectors[c3]
+		m0, m1, m2, m3 := r.mags[c0], r.mags[c1], r.mags[c2], r.mags[c3]
+		d0, d1 := vek32.Dot(pVec, v0), vek32.Dot(pVec, v1)
+		d2, d3 := vek32.Dot(pVec, v2), vek32.Dot(pVec, v3)
+		if m0 == 0 {
+			scoreBuf = append(scoreBuf, scoredCandidate{c0, 2.0})
+		} else {
+			scoreBuf = append(scoreBuf, scoredCandidate{c0, 1.0 - float64(d0)/(pMag*m0)})
+		}
+		if m1 == 0 {
+			scoreBuf = append(scoreBuf, scoredCandidate{c1, 2.0})
+		} else {
+			scoreBuf = append(scoreBuf, scoredCandidate{c1, 1.0 - float64(d1)/(pMag*m1)})
+		}
+		if m2 == 0 {
+			scoreBuf = append(scoreBuf, scoredCandidate{c2, 2.0})
+		} else {
+			scoreBuf = append(scoreBuf, scoredCandidate{c2, 1.0 - float64(d2)/(pMag*m2)})
+		}
+		if m3 == 0 {
+			scoreBuf = append(scoreBuf, scoredCandidate{c3, 2.0})
+		} else {
+			scoreBuf = append(scoreBuf, scoredCandidate{c3, 1.0 - float64(d3)/(pMag*m3)})
+		}
+	}
+	for ; i < n; i++ {
+		c := toScore[i]
 		cVec := r.vectors[c]
 		cMag := r.mags[c]
 		var dist float64
@@ -193,47 +223,10 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 		}
 	}
 
-	selected := make([]uint32, 0, r.R)
-	selectedVecs := make([][]float32, 0, r.R)
-	selectedMags := make([]float64, 0, r.R)
-
-	// Examine R plus a log²(R) buffer for diversity rejection
-	examineCount := min(r.R+bits.Len(uint(r.R))*bits.Len(uint(r.R)), len(scoreBuf))
-	maxCheck := bits.Len(uint(r.R))
-
-	for i := range examineCount {
-		if len(selected) >= r.R {
-			break
-		}
-
-		c := scoreBuf[i]
-		cVec := r.vectors[c.id]
-		cMag := r.mags[c.id]
-
-		keep := true
-		checkStart := max(0, len(selected)-maxCheck)
-		for j := checkStart; j < len(selected); j++ {
-			sVec := selectedVecs[j]
-			sMag := selectedMags[j]
-			var distCS float64
-			if cMag == 0 || sMag == 0 {
-				distCS = 2.0
-			} else {
-				dot := vek32.Dot(cVec, sVec)
-				distCS = 1.0 - float64(dot)/(cMag*sMag)
-			}
-			if c.dist > r.alpha*distCS {
-				keep = false
-				break
-			}
-		}
-
-		if keep {
-			selected = append(selected, c.id)
-			selectedVecs = append(selectedVecs, cVec)
-			selectedMags = append(selectedMags, cMag)
-		}
+	takeCount := min(r.R, len(scoreBuf))
+	selected := make([]uint32, takeCount)
+	for i := range takeCount {
+		selected[i] = scoreBuf[i].id
 	}
-
 	return selected
 }
