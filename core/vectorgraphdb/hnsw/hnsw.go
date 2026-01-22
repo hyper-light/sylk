@@ -79,15 +79,11 @@ type SearchFilter struct {
 
 const invalidNodeID uint32 = 0
 
-type nodeData struct {
-	vector    []float32
-	magnitude float64
-}
-
 type Index struct {
 	mu          sync.RWMutex
 	layers      []*layer
-	nodes       map[uint32]nodeData
+	vectors     map[uint32][]float32
+	magnitudes  map[uint32]float64
 	domains     map[uint32]vectorgraphdb.Domain
 	nodeTypes   map[uint32]vectorgraphdb.NodeType
 	nodeLevels  map[uint32]int
@@ -125,7 +121,8 @@ func DefaultConfig() Config {
 func New(cfg Config) *Index {
 	return &Index{
 		layers:      make([]*layer, 0),
-		nodes:       make(map[uint32]nodeData),
+		vectors:     make(map[uint32][]float32),
+		magnitudes:  make(map[uint32]float64),
 		domains:     make(map[uint32]vectorgraphdb.Domain),
 		nodeTypes:   make(map[uint32]vectorgraphdb.NodeType),
 		nodeLevels:  make(map[uint32]int),
@@ -181,7 +178,8 @@ func (h *Index) insertLocked(id string, vector []float32, domain vectorgraphdb.D
 
 	existingLevel := h.nodeLevels[internalID]
 
-	h.nodes[internalID] = nodeData{vector: vector, magnitude: mag}
+	h.vectors[internalID] = vector
+	h.magnitudes[internalID] = mag
 	h.domains[internalID] = domain
 	h.nodeTypes[internalID] = nodeType
 
@@ -435,15 +433,18 @@ func (h *Index) searchLayer(query []float32, queryMag float64, ep uint32, ef int
 }
 
 func (h *Index) getVectorAndMagnitude(id uint32) ([]float32, float64, bool) {
-	nd, exists := h.nodes[id]
-	if !exists {
+	vec, vecExists := h.vectors[id]
+	if !vecExists {
 		return nil, 0, false
 	}
-	mag := nd.magnitude
-	if mag == 0 {
-		mag = Magnitude(nd.vector)
+	mag, magExists := h.magnitudes[id]
+	if !magExists {
+		mag = Magnitude(vec)
+		slog.Warn("magnitude cache miss, computed on read",
+			slog.Uint64("node_id", uint64(id)),
+			slog.Float64("magnitude", mag))
 	}
-	return nd.vector, mag, true
+	return vec, mag, true
 }
 
 func (h *Index) connectNode(id uint32, neighbors []searchCandidate, level int) {
@@ -464,7 +465,7 @@ func (h *Index) connectNode(id uint32, neighbors []searchCandidate, level int) {
 }
 
 func (h *Index) isValidNeighbor(neighborID uint32) bool {
-	_, exists := h.nodes[neighborID]
+	_, exists := h.vectors[neighborID]
 	return exists
 }
 
@@ -599,7 +600,8 @@ func (h *Index) deleteUnlocked(id uint32, stringID string) {
 		h.cleanupNodeReferences(id, l)
 	}
 
-	delete(h.nodes, id)
+	delete(h.vectors, id)
+	delete(h.magnitudes, id)
 	delete(h.domains, id)
 	delete(h.nodeTypes, id)
 	delete(h.nodeLevels, id)
@@ -634,7 +636,7 @@ func (h *Index) selectNewEntryPoint() {
 func (h *Index) Size() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return len(h.nodes)
+	return len(h.vectors)
 }
 
 func (h *Index) Contains(id string) bool {
@@ -651,9 +653,9 @@ func (h *Index) GetVector(id string) ([]float32, error) {
 	if !exists {
 		return nil, fmt.Errorf("%w: cannot get vector for node %q", ErrNodeNotFound, id)
 	}
-	nd := h.nodes[internalID]
-	result := make([]float32, len(nd.vector))
-	copy(result, nd.vector)
+	vec := h.vectors[internalID]
+	result := make([]float32, len(vec))
+	copy(result, vec)
 	return result, nil
 }
 
@@ -685,7 +687,7 @@ func (h *Index) ValidateMetadataConsistency() []string {
 
 func (h *Index) validateMetadataLocked() []string {
 	var issues []string
-	for id := range h.nodes {
+	for id := range h.vectors {
 		issues = h.checkNodeConsistency(id, issues)
 	}
 	return issues
@@ -698,6 +700,9 @@ func (h *Index) checkNodeConsistency(id uint32, issues []string) []string {
 	}
 	if _, ok := h.nodeTypes[id]; !ok {
 		issues = append(issues, fmt.Sprintf("node %q: missing nodeType", stringID))
+	}
+	if _, ok := h.magnitudes[id]; !ok {
+		issues = append(issues, fmt.Sprintf("node %q: missing magnitude", stringID))
 	}
 	if _, ok := h.nodeLevels[id]; !ok {
 		issues = append(issues, fmt.Sprintf("node %q: missing level tracking", stringID))
@@ -732,9 +737,9 @@ func (h *Index) PrecomputeFINGER() {
 }
 
 func (h *Index) getVectorsInternal() map[uint32][]float32 {
-	result := make(map[uint32][]float32, len(h.nodes))
-	for id, nd := range h.nodes {
-		result[id] = nd.vector
+	result := make(map[uint32][]float32, len(h.vectors))
+	for id, vec := range h.vectors {
+		result[id] = vec
 	}
 	return result
 }
@@ -757,7 +762,7 @@ func (h *Index) Stats() IndexStats {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return IndexStats{
-		TotalNodes:  len(h.nodes),
+		TotalNodes:  len(h.vectors),
 		MaxLevel:    h.maxLevel,
 		NumLayers:   len(h.layers),
 		M:           h.M,
@@ -800,25 +805,25 @@ func (h *Index) GetLayers() []*layer {
 }
 
 func (h *Index) GetVectors() map[string][]float32 {
-	if h.nodes == nil {
+	if h.vectors == nil {
 		return nil
 	}
-	result := make(map[string][]float32, len(h.nodes))
-	for id, nd := range h.nodes {
-		vecCopy := make([]float32, len(nd.vector))
-		copy(vecCopy, nd.vector)
+	result := make(map[string][]float32, len(h.vectors))
+	for id, vec := range h.vectors {
+		vecCopy := make([]float32, len(vec))
+		copy(vecCopy, vec)
 		result[h.idToString[id]] = vecCopy
 	}
 	return result
 }
 
 func (h *Index) GetMagnitudes() map[string]float64 {
-	if h.nodes == nil {
+	if h.magnitudes == nil {
 		return nil
 	}
-	result := make(map[string]float64, len(h.nodes))
-	for id, nd := range h.nodes {
-		result[h.idToString[id]] = nd.magnitude
+	result := make(map[string]float64, len(h.magnitudes))
+	for id, mag := range h.magnitudes {
+		result[h.idToString[id]] = mag
 	}
 	return result
 }

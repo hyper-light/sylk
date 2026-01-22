@@ -30,10 +30,11 @@ func (u *MNRUUpdater) UpdateVector(id string, newVector []float32) error {
 		return ErrNodeNotFound
 	}
 
-	oldVector := u.index.nodes[internalID].vector
+	oldVector := u.index.vectors[internalID]
 	incomingNodes := u.findIncomingNodesLocked(internalID)
 
-	u.index.nodes[internalID] = nodeData{vector: newVector, magnitude: Magnitude(newVector)}
+	u.index.vectors[internalID] = newVector
+	u.index.magnitudes[internalID] = Magnitude(newVector)
 
 	nodeLevel, hasLevel := u.index.nodeLevels[internalID]
 	if hasLevel {
@@ -86,11 +87,14 @@ func (u *MNRUUpdater) rebuildConnectionsLocked(id uint32, newVector []float32, m
 			if nodeID == id {
 				continue
 			}
-			nd, ok := u.index.nodes[nodeID]
+			vec, ok := u.index.vectors[nodeID]
 			if !ok {
 				continue
 			}
-			vec, mag := nd.vector, nd.magnitude
+			mag, ok := u.index.magnitudes[nodeID]
+			if !ok {
+				mag = Magnitude(vec)
+			}
 			sim := CosineSimilarity(newVector, vec, newMag, mag)
 			candidates = append(candidates, searchCandidate{id: nodeID, distance: 1.0 - sim})
 		}
@@ -131,17 +135,23 @@ func (u *MNRUUpdater) isStillConnectedLocked(fromID, toID uint32) bool {
 }
 
 func (u *MNRUUpdater) maybeReconnectLocked(fromID, toID uint32, oldTargetVector []float32) {
-	fromNode, ok := u.index.nodes[fromID]
+	fromVec, ok := u.index.vectors[fromID]
 	if !ok {
 		return
 	}
-	toNode, ok := u.index.nodes[toID]
+	toVec, ok := u.index.vectors[toID]
 	if !ok {
 		return
 	}
 
-	fromVec, fromMag := fromNode.vector, fromNode.magnitude
-	toVec, toMag := toNode.vector, toNode.magnitude
+	fromMag := u.index.magnitudes[fromID]
+	toMag := u.index.magnitudes[toID]
+	if fromMag == 0 {
+		fromMag = Magnitude(fromVec)
+	}
+	if toMag == 0 {
+		toMag = Magnitude(toVec)
+	}
 
 	newSim := CosineSimilarity(fromVec, toVec, fromMag, toMag)
 	newDist := float32(1.0 - newSim)
@@ -227,19 +237,26 @@ func (u *MNRUUpdater) repairGlobalConnectivityLocked() {
 		}
 	}
 
-	for orphanID := range u.index.nodes {
+	for orphanID := range u.index.vectors {
 		if reachable[orphanID] {
 			continue
 		}
 
-		orphanNode := u.index.nodes[orphanID]
-		orphanVec, orphanMag := orphanNode.vector, orphanNode.magnitude
+		orphanVec := u.index.vectors[orphanID]
+		orphanMag := u.index.magnitudes[orphanID]
+		if orphanMag == 0 {
+			orphanMag = Magnitude(orphanVec)
+		}
 
 		var bestID uint32
 		bestSim := float64(-1)
 		for reachableID := range reachable {
-			nd := u.index.nodes[reachableID]
-			sim := CosineSimilarity(orphanVec, nd.vector, orphanMag, nd.magnitude)
+			vec := u.index.vectors[reachableID]
+			mag := u.index.magnitudes[reachableID]
+			if mag == 0 {
+				mag = Magnitude(vec)
+			}
+			sim := CosineSimilarity(orphanVec, vec, orphanMag, mag)
 			if sim > bestSim {
 				bestSim = sim
 				bestID = reachableID
@@ -302,7 +319,8 @@ func (u *MNRUUpdater) DeleteVector(id string) error {
 		}
 	}
 
-	delete(u.index.nodes, internalID)
+	delete(u.index.vectors, internalID)
+	delete(u.index.magnitudes, internalID)
 	delete(u.index.nodeLevels, internalID)
 	delete(u.index.domains, internalID)
 	delete(u.index.nodeTypes, internalID)
@@ -338,11 +356,14 @@ func (u *MNRUUpdater) selectNewEntryPointLocked() {
 }
 
 func (u *MNRUUpdater) repairConnectionsLocked(nodeID uint32) {
-	nd, ok := u.index.nodes[nodeID]
+	nodeVec, ok := u.index.vectors[nodeID]
 	if !ok {
 		return
 	}
-	nodeVec, nodeMag := nd.vector, nd.magnitude
+	nodeMag := u.index.magnitudes[nodeID]
+	if nodeMag == 0 {
+		nodeMag = Magnitude(nodeVec)
+	}
 
 	nodeLevel, hasLevel := u.index.nodeLevels[nodeID]
 	if !hasLevel {
@@ -375,15 +396,15 @@ func (u *MNRUUpdater) repairConnectionsLocked(nodeID uint32) {
 			if otherID == nodeID || existingNeighbors[otherID] {
 				continue
 			}
-			nd, ok := u.index.nodes[otherID]
+			otherVec, ok := u.index.vectors[otherID]
 			if !ok {
 				continue
 			}
-			otherMag := nd.magnitude
+			otherMag := u.index.magnitudes[otherID]
 			if otherMag == 0 {
-				otherMag = Magnitude(nd.vector)
+				otherMag = Magnitude(otherVec)
 			}
-			sim := CosineSimilarity(nodeVec, nd.vector, nodeMag, otherMag)
+			sim := CosineSimilarity(nodeVec, otherVec, nodeMag, otherMag)
 			candidates = append(candidates, searchCandidate{id: otherID, distance: 1.0 - sim})
 		}
 
@@ -464,7 +485,7 @@ func (u *MNRUUpdater) ValidateConnectivity() []string {
 	}
 
 	unreachable := make([]string, 0)
-	for id := range u.index.nodes {
+	for id := range u.index.vectors {
 		if !reachable[id] {
 			unreachable = append(unreachable, u.index.idToString[id])
 		}

@@ -433,17 +433,15 @@ ALTER TABLE vectors ADD COLUMN lopq_code BLOB;
 
 ---
 
-# GRAPH_OPTIMIZATIONS_V2.md: Pushing the Envelope
-## Executive Summary
-
+GRAPH_OPTIMIZATIONS_V2.md: Pushing the Envelope
+Executive Summary
 Your current GRAPH_OPTIMIZATIONS.md proposes a solid 4-layer hybrid quantization architecture (RaBitQ → LOPQ → Remove-Birth → Query-Adaptive) targeting ~92-94% recall. This document proposes 12 additional techniques that can push Sylk to 96-98% recall while adding:
 - 3-7× search speedup via adaptive termination and SIMD
 - Improved robustness via graph-guided retrieval and temporal awareness
 - Better correctness via anisotropic loss functions and multi-source fusion
 All techniques work locally, without cloud resources, and without ground-truth training data.
 ---
-
-## Part 1: Quantization Enhancements (Beyond Your Current 4-Layer)
+Part 1: Quantization Enhancements (Beyond Your Current 4-Layer)
 1.1 Anisotropic Vector Quantization (AVQ) — Layer 0.5
 Problem with Your Current Approach: Your OPQ minimizes reconstruction error uniformly. But for similarity search, errors parallel to the query matter more than orthogonal errors.
 Solution: Add anisotropic loss weighting to your existing OPQ.
@@ -476,8 +474,7 @@ Why This Works:
 - Self-supervised: Learn query covariance from your own search history
 Expected Improvement: +2-3% recall at same compression
 ---
-
-### 1.2 BBQ-Style Binary Quantization — Layer 0 (Replace RaBitQ)
+1.2 BBQ-Style Binary Quantization — Layer 0 (Replace RaBitQ)
 Problem: RaBitQ uses random rotations which are good but not optimal.
 Solution: Better Binary Quantization (BBQ) from ElasticSearch 2024.
 // BBQ uses asymmetric quantization: 
@@ -532,8 +529,7 @@ Why Better Than RaBitQ:
 - No training required — learns means during indexing
 Expected Improvement: 2× query speedup, same recall
 ---
-
-### 1.3 4-Bit FastScan PQ — Layer 2 Enhancement
+1.3 4-Bit FastScan PQ — Layer 2 Enhancement
 Problem: Your 8-bit PQ codes require 256-entry lookup tables that don't fit in CPU registers.
 Solution: 4-bit sub-quantizers with in-register LUTs (from FAISS).
 // FastScan uses 4-bit codes (16 centroids per subspace)
@@ -572,8 +568,7 @@ Why This Matters:
 - Trade: 16 vs 256 centroids = slightly lower recall, but MUCH faster
 Expected Improvement: 3-5× scan speedup, -1% recall (acceptable tradeoff)
 ---
-
-### 1.4 SAQ: Code Adjustment After Quantization — Layer 3 Enhancement
+1.4 SAQ: Code Adjustment After Quantization — Layer 3 Enhancement
 Problem: PQ assigns each subspace independently, missing cross-subspace correlations.
 Solution: Post-quantization coordinate descent refinement.
 // SAQ performs iterative refinement after initial PQ encoding
@@ -626,10 +621,8 @@ Why This Works:
 - Works on top of existing PQ — no architecture change
 Expected Improvement: +1-2% recall, minimal latency overhead (encode-time only)
 ---
-
-# Part 2: Search Speedup Techniques
-
-### 2.1 FINGER: Graph Traversal Acceleration
+Part 2: Search Speedup Techniques
+2.1 FINGER: Graph Traversal Acceleration
 Problem: During HNSW search, many distance computations don't change the result.
 Solution: Low-rank approximation for "obviously far" candidates.
 // FINGER uses precomputed edge statistics to skip expensive distance computations
@@ -683,8 +676,7 @@ Why This Works:
 - Works with any graph structure (HNSW, Vamana, etc.)
 Expected Improvement: 30-50% search latency reduction
 ---
-
-### 2.2 Patience-Based Early Termination
+2.2 Patience-Based Early Termination
 Problem: Fixed efSearch wastes computation on "easy" queries.
 Solution: Stop when candidate queue stabilizes.
 // AdaptiveSearcher implements patience-based early termination
@@ -788,9 +780,8 @@ func (e *QueryDifficultyEstimator) RecordSearch(
     e.partitionDifficulty[partition] = 0.95*oldDiff + 0.05*newDiff
 }
 ---
-
-# Part 3: Graph-Vector Hybrid Enhancements
-### 3.1 Reciprocal Rank Fusion for Hybrid Search
+Part 3: Graph-Vector Hybrid Enhancements
+3.1 Reciprocal Rank Fusion for Hybrid Search
 Problem: Your current RRF in rrf_fusion.go combines Bleve + HNSW. This can be improved.
 Enhancement: Add graph traversal as a third signal.
 // TripleRRF combines: Vector similarity + Full-text + Graph relationships
@@ -855,10 +846,8 @@ Why This Helps:
 - Vector search finds semantically similar content
 - Text search finds keyword matches
 - Graph search finds structurally related content (e.g., "functions that call X")
-
 ---
-
-### 3.2 Temporal-Aware Retrieval
+3.2 Temporal-Aware Retrieval
 Problem: Code evolves. Recent changes may be more relevant than old patterns.
 Solution: Add temporal decay to similarity scores.
 // TemporalSimilarity combines semantic similarity with recency
@@ -898,8 +887,7 @@ func (t *TemporalSimilarity) ScoreRecencyQuery(
 Integration with Your Temporal Module:
 Your core/vectorgraphdb/temporal/ already has temporal tracking. This adds temporal scoring.
 ---
-
-### 3.3 Multi-Hop Reasoning for Complex Queries
+3.3 Multi-Hop Reasoning for Complex Queries
 Problem: "Find all functions that call X which was modified by Y" requires multi-hop traversal.
 Solution: Combine vector search with iterative graph expansion.
 // MultiHopRetriever handles complex queries requiring graph reasoning
@@ -952,9 +940,8 @@ type HopConstraint struct {
     MinSimilarity    float64
 }
 ---
-
-# Part 4: SIMD and Hardware Optimizations
-### 4.1 SIMD Distance Computation
+Part 4: SIMD and Hardware Optimizations
+4.1 SIMD Distance Computation
 Problem: Your distance.go uses scalar operations.
 Solution: SIMD-accelerated distance functions.
 // distance_simd_amd64.go (build tag: amd64)
@@ -1012,8 +999,7 @@ func DotProductBLAS(a, b []float32) float32 {
 }
 Expected Improvement: 2-4× speedup for distance computations
 ---
-
-### 4.2 Cache-Friendly Memory Layout
+4.2 Cache-Friendly Memory Layout
 Problem: Random memory access patterns cause cache misses.
 Solution: Graph reordering + prefetching.
 // ReorderGraphForLocality reorders nodes so connected nodes are adjacent in memory
@@ -1065,9 +1051,8 @@ func (h *Index) searchLayerWithPrefetch(query []float32, queryMag float64, ep st
     }
 }
 ---
-
-# Part 5: Streaming and Incremental Updates
-### 5.1 MN-RU: Safe HNSW Updates
+Part 5: Streaming and Incremental Updates
+5.1 MN-RU: Safe HNSW Updates
 Problem: Standard HNSW updates can create "unreachable" nodes.
 Solution: Mutual Neighbor Replaced Update algorithm.
 // MNRUUpdater handles safe incremental HNSW updates
@@ -1117,8 +1102,7 @@ func (u *MNRUUpdater) findIncomingNodes(targetID string) []string {
     return incoming
 }
 ---
-
-### 5.2 CoDEQ-Style Streaming Quantization
+5.2 CoDEQ-Style Streaming Quantization
 Problem: PQ codebooks degrade when data distribution shifts.
 Solution: Consistent local updates without global retraining.
 // StreamingQuantizer maintains codebook consistency under updates

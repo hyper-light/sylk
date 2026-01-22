@@ -111,7 +111,7 @@ func TestBoundsCheckPartialDataVectorMissing(t *testing.T) {
 
 	idx.mu.Lock()
 	internalID := idx.stringToID["node1"]
-	delete(idx.nodes, internalID)
+	delete(idx.vectors, internalID)
 	idx.mu.Unlock()
 
 	idx.mu.RLock()
@@ -119,34 +119,34 @@ func TestBoundsCheckPartialDataVectorMissing(t *testing.T) {
 	idx.mu.RUnlock()
 
 	if ok {
-		t.Error("getVectorAndMagnitude should return false when node is missing")
+		t.Error("getVectorAndMagnitude should return false when vector is missing")
 	}
 }
 
-// TestBoundsCheckPartialDataMagnitudeZero tests scenario where magnitude
-// is zero (simulated edge case).
-// W4P.24: With magnitude validation, zero magnitudes are recomputed on demand.
-func TestBoundsCheckPartialDataMagnitudeZero(t *testing.T) {
+// TestBoundsCheckPartialDataMagnitudeMissing tests scenario where magnitude
+// is missing but vector exists (simulated inconsistent state).
+// W4P.24: With magnitude validation, missing magnitudes are recomputed on demand.
+// Note: Cache is NOT updated during read operations to avoid data races.
+func TestBoundsCheckPartialDataMagnitudeMissing(t *testing.T) {
 	idx := New(DefaultConfig())
 
 	// Insert a node normally first
 	vec := []float32{1, 0, 0}
 	idx.Insert("node1", vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
 
-	// Simulate edge case: set magnitude to zero
+	// Simulate inconsistent state: remove magnitude but keep vector
 	idx.mu.Lock()
 	internalID := idx.stringToID["node1"]
-	nd := idx.nodes[internalID]
-	idx.nodes[internalID] = nodeData{vector: nd.vector, magnitude: 0}
+	delete(idx.magnitudes, internalID)
 	idx.mu.Unlock()
 
 	idx.mu.RLock()
 	retrievedVec, mag, ok := idx.getVectorAndMagnitude(internalID)
 	idx.mu.RUnlock()
 
-	// W4P.24: Zero magnitude should be recomputed, not cause failure
+	// W4P.24: Missing magnitude should be recomputed, not cause failure
 	if !ok {
-		t.Error("getVectorAndMagnitude should return true and recompute magnitude when magnitude is zero")
+		t.Error("getVectorAndMagnitude should return true and recompute magnitude when magnitude is missing")
 	}
 
 	// Verify the magnitude was correctly computed
@@ -158,6 +158,15 @@ func TestBoundsCheckPartialDataMagnitudeZero(t *testing.T) {
 	// Verify vector is returned
 	if retrievedVec == nil {
 		t.Error("Vector should be returned")
+	}
+
+	// Note: Cache is NOT populated during read to avoid data races
+	idx.mu.RLock()
+	_, exists := idx.magnitudes[internalID]
+	idx.mu.RUnlock()
+
+	if exists {
+		t.Error("Magnitude should NOT be cached during read operation")
 	}
 }
 
@@ -173,7 +182,7 @@ func TestBoundsCheckSearchLockedWithMissingEntryPoint(t *testing.T) {
 	// Corrupt the entry point's data
 	idx.mu.Lock()
 	ep := idx.entryPoint
-	delete(idx.nodes, ep)
+	delete(idx.vectors, ep)
 	idx.mu.Unlock()
 
 	// Search should not panic, but may return nil
@@ -200,7 +209,8 @@ func TestBoundsCheckGreedySearchWithCorruptedNeighbor(t *testing.T) {
 	// Remove data for one node that's likely a neighbor
 	idx.mu.Lock()
 	corruptedID := idx.stringToID[randomNodeIDForBoundsTest(5)]
-	delete(idx.nodes, corruptedID)
+	delete(idx.vectors, corruptedID)
+	delete(idx.magnitudes, corruptedID)
 	idx.mu.Unlock()
 
 	// Search should still work, skipping the corrupted neighbor
@@ -223,7 +233,8 @@ func TestBoundsCheckInsertWithConnectionsCorruptedEntryPoint(t *testing.T) {
 
 	// Corrupt entry point data
 	idx.mu.Lock()
-	delete(idx.nodes, idx.entryPoint)
+	delete(idx.vectors, idx.entryPoint)
+	delete(idx.magnitudes, idx.entryPoint)
 	idx.mu.Unlock()
 
 	// Insert another node - should not panic
@@ -311,7 +322,8 @@ func TestBoundsCheckSearchLayerWithMissingNeighbor(t *testing.T) {
 	// Remove data for one node
 	idx.mu.Lock()
 	node2ID := idx.stringToID["node2"]
-	delete(idx.nodes, node2ID)
+	delete(idx.vectors, node2ID)
+	delete(idx.magnitudes, node2ID)
 	idx.mu.Unlock()
 
 	// Search should skip node2 and return other results
@@ -344,7 +356,8 @@ func TestBoundsCheckMultipleCorruptedNodes(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		strID := randomNodeIDForBoundsTest(i)
 		internalID := idx.stringToID[strID]
-		delete(idx.nodes, internalID)
+		delete(idx.vectors, internalID)
+		delete(idx.magnitudes, internalID)
 	}
 	idx.mu.Unlock()
 
@@ -356,9 +369,10 @@ func TestBoundsCheckMultipleCorruptedNodes(t *testing.T) {
 	for _, r := range results {
 		idx.mu.RLock()
 		resultInternalID := idx.stringToID[r.ID]
-		_, hasVec := idx.nodes[resultInternalID]
+		_, hasVec := idx.vectors[resultInternalID]
+		_, hasMag := idx.magnitudes[resultInternalID]
 		idx.mu.RUnlock()
-		if !hasVec {
+		if !hasVec || !hasMag {
 			t.Errorf("Result %s should have valid vector and magnitude", r.ID)
 		}
 	}
