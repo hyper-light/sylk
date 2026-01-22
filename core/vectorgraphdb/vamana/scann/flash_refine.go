@@ -171,6 +171,13 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 		toScore = candidates[:maxScore]
 	}
 
+	// Use reduced dimensions for scoring: R * log(R) dims
+	dim := len(pVec)
+	reducedDim := r.R * bits.Len(uint(r.R))
+	if reducedDim > dim {
+		reducedDim = dim
+	}
+
 	scoreBuf = scoreBuf[:0]
 	for _, c := range toScore {
 		cVec := r.vectors[c]
@@ -179,7 +186,7 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 		if cMag == 0 {
 			dist = 2.0
 		} else {
-			dot := vek32.Dot(pVec, cVec)
+			dot := vek32.Dot(pVec[:reducedDim], cVec[:reducedDim])
 			dist = 1.0 - float64(dot)/(pMag*cMag)
 		}
 		scoreBuf = append(scoreBuf, scoredCandidate{c, dist})
@@ -193,46 +200,11 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 		}
 	}
 
-	selected := make([]uint32, 0, r.R)
-	selectedVecs := make([][]float32, 0, r.R)
-	selectedMags := make([]float64, 0, r.R)
-
-	// Examine R plus a log²(R) buffer for diversity rejection
-	examineCount := min(r.R+bits.Len(uint(r.R))*bits.Len(uint(r.R)), len(scoreBuf))
-	maxCheck := bits.Len(uint(r.R))
-
-	for i := range examineCount {
-		if len(selected) >= r.R {
-			break
-		}
-
-		c := scoreBuf[i]
-		cVec := r.vectors[c.id]
-		cMag := r.mags[c.id]
-
-		keep := true
-		checkStart := max(0, len(selected)-maxCheck)
-		for j := checkStart; j < len(selected); j++ {
-			sVec := selectedVecs[j]
-			sMag := selectedMags[j]
-			var distCS float64
-			if cMag == 0 || sMag == 0 {
-				distCS = 2.0
-			} else {
-				dot := vek32.Dot(cVec, sVec)
-				distCS = 1.0 - float64(dot)/(cMag*sMag)
-			}
-			if c.dist > r.alpha*distCS {
-				keep = false
-				break
-			}
-		}
-
-		if keep {
-			selected = append(selected, c.id)
-			selectedVecs = append(selectedVecs, cVec)
-			selectedMags = append(selectedMags, cMag)
-		}
+	// Skip diversity pruning: take top-R directly
+	selectCount := min(r.R, len(scoreBuf))
+	selected := make([]uint32, selectCount)
+	for i := range selectCount {
+		selected[i] = scoreBuf[i].id
 	}
 
 	return selected
