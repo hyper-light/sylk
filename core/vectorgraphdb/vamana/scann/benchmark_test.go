@@ -53,6 +53,40 @@ func TestScaNN_Sylk(t *testing.T) {
 	runSearchBenchmark(t, embeddings, vectorStore, graphStore, magCache, buildResult.Medoid, config)
 }
 
+func TestScaNN_Sylk_Flash(t *testing.T) {
+	projectRoot := findProjectRoot(t)
+	t.Logf("Project root: %s", projectRoot)
+
+	symbols := collectSymbols(t, projectRoot)
+	t.Logf("Collected %d symbols", len(symbols))
+
+	if len(symbols) < 100 {
+		t.Skipf("Not enough symbols: %d", len(symbols))
+	}
+
+	tmpDir := t.TempDir()
+	config := vamana.DefaultConfig()
+
+	vectorStore, labelStore, embeddings := buildStorageLayer(t, tmpDir, symbols)
+	defer vectorStore.Close()
+	defer labelStore.Close()
+
+	graphStore, err := storage.CreateGraphStore(filepath.Join(tmpDir, "graph.bin"), config.R, len(symbols))
+	if err != nil {
+		t.Fatalf("CreateGraphStore failed: %v", err)
+	}
+	defer graphStore.Close()
+
+	magCache := vamana.NewMagnitudeCache(len(symbols))
+	for i := range len(symbols) {
+		magCache.GetOrCompute(uint32(i), embeddings[i])
+	}
+
+	buildResult := buildWithScaNNFlash(t, embeddings, vectorStore, graphStore, magCache, config)
+
+	runSearchBenchmark(t, embeddings, vectorStore, graphStore, magCache, buildResult.Medoid, config)
+}
+
 type symbolInfo struct {
 	id        string
 	name      string
@@ -270,6 +304,37 @@ func buildWithScaNN(
 
 	buildTime := time.Since(buildStart)
 	t.Logf("ScaNN build: %v (%.0f vectors/sec)", buildTime, float64(len(embeddings))/buildTime.Seconds())
+	t.Logf("  Timings: KMeans=%v, Codebooks=%v, Magnitudes=%v, GraphInit=%v, Refinement=%v, Medoid=%v",
+		timings.KMeans, timings.Codebooks, timings.Magnitudes, timings.GraphInit, timings.Refinement, timings.Medoid)
+
+	return result
+}
+
+func buildWithScaNNFlash(
+	t *testing.T,
+	embeddings [][]float32,
+	vectorStore *storage.VectorStore,
+	graphStore *storage.GraphStore,
+	magCache *vamana.MagnitudeCache,
+	config vamana.VamanaConfig,
+) *BuildResult {
+	t.Helper()
+
+	batchConf := DefaultBatchBuildConfig()
+	avqConf := DefaultAVQConfig()
+
+	builder := NewBatchBuilder(batchConf, avqConf, config)
+
+	t.Logf("Building index with ScaNN+Flash (partitions=%d, R=%d)...", avqConf.NumPartitions, config.R)
+	buildStart := time.Now()
+
+	result, timings, err := builder.BuildWithFlashAndTimings(embeddings, vectorStore, graphStore, magCache)
+	if err != nil {
+		t.Fatalf("ScaNN+Flash Build failed: %v", err)
+	}
+
+	buildTime := time.Since(buildStart)
+	t.Logf("ScaNN+Flash build: %v (%.0f vectors/sec)", buildTime, float64(len(embeddings))/buildTime.Seconds())
 	t.Logf("  Timings: KMeans=%v, Codebooks=%v, Magnitudes=%v, GraphInit=%v, Refinement=%v, Medoid=%v",
 		timings.KMeans, timings.Codebooks, timings.Magnitudes, timings.GraphInit, timings.Refinement, timings.Medoid)
 

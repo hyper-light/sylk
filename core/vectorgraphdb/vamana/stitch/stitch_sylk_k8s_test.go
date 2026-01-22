@@ -287,10 +287,13 @@ func buildGraphK8s(t *testing.T, embeddings [][]float32, graph *storage.GraphSto
 	batchConfig := scann.DefaultBatchBuildConfig()
 	builder := scann.NewBatchBuilder(batchConfig, avqConfig, config)
 
-	result, err := builder.Build(embeddings, vectorStore, graph, magCache)
+	result, timings, err := builder.BuildWithFlashAndTimings(embeddings, vectorStore, graph, magCache)
 	if err != nil {
-		t.Fatalf("ScaNN build: %v", err)
+		t.Fatalf("ScaNN+Flash build: %v", err)
 	}
+
+	t.Logf("  Build timings: KMeans=%v, Codebooks=%v, Magnitudes=%v, GraphInit=%v, Refinement=%v, Medoid=%v",
+		timings.KMeans, timings.Codebooks, timings.Magnitudes, timings.GraphInit, timings.Refinement, timings.Medoid)
 
 	return result.Medoid
 }

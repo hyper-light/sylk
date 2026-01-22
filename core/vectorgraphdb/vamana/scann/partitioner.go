@@ -2,6 +2,7 @@ package scann
 
 import (
 	"math"
+	"math/bits"
 	"math/rand/v2"
 	"runtime"
 	"sync"
@@ -53,6 +54,131 @@ func (p *Partitioner) Train(vectors [][]float32, maxIters int) {
 
 		if iter > 0 && changed < n/1000 {
 			break
+		}
+	}
+}
+
+func (p *Partitioner) TrainFast(vectors [][]float32, maxIters int) {
+	n := len(vectors)
+	if n == 0 || p.numParts == 0 {
+		return
+	}
+
+	k := p.numParts
+	if k > n {
+		k = n
+	}
+
+	sampleSize := bits.Len(uint(n)) * k
+	if sampleSize > n {
+		sampleSize = n
+	}
+
+	indices := rand.Perm(n)[:sampleSize]
+	sample := make([][]float32, sampleSize)
+	for i, idx := range indices {
+		sample[i] = vectors[idx]
+	}
+
+	sampleNormsSq := make([]float64, sampleSize)
+	for i, vec := range sample {
+		sampleNormsSq[i] = float64(vek32.Dot(vec, vec))
+	}
+
+	p.initCentroidsKMeansPPSample(sample, k)
+	p.prepareCentroidsBatch()
+
+	sampleAssignments := make([]uint32, sampleSize)
+	origAssignments := p.assignments
+	p.assignments = sampleAssignments
+
+	for iter := range maxIters {
+		changed := p.assignToCentroidsWithNorms(sample, sampleNormsSq)
+		p.updateCentroidsSample(sample)
+		p.prepareCentroidsBatch()
+
+		if iter > 0 && changed < k {
+			break
+		}
+	}
+
+	p.assignments = origAssignments
+	if p.assignments == nil || len(p.assignments) != n {
+		p.assignments = make([]uint32, n)
+	}
+
+	fullNormsSq := make([]float64, n)
+	for i, vec := range vectors {
+		fullNormsSq[i] = float64(vek32.Dot(vec, vec))
+	}
+	p.assignToCentroidsWithNorms(vectors, fullNormsSq)
+}
+
+func (p *Partitioner) initCentroidsKMeansPPSample(sample [][]float32, k int) {
+	n := len(sample)
+
+	first := rand.IntN(n)
+	p.centroids[0] = copyVector(sample[first])
+
+	distances := make([]float64, n)
+	for i := range n {
+		distances[i] = math.MaxFloat64
+	}
+
+	for c := 1; c < k; c++ {
+		var totalDist float64
+		for i, vec := range sample {
+			d := squaredL2(vec, p.centroids[c-1])
+			if d < distances[i] {
+				distances[i] = d
+			}
+			totalDist += distances[i]
+		}
+
+		if totalDist == 0 {
+			p.centroids[c] = copyVector(sample[rand.IntN(n)])
+			continue
+		}
+
+		threshold := rand.Float64() * totalDist
+		cumulative := 0.0
+		selected := n - 1
+		for i, d := range distances {
+			cumulative += d
+			if cumulative >= threshold {
+				selected = i
+				break
+			}
+		}
+		p.centroids[c] = copyVector(sample[selected])
+	}
+}
+
+func (p *Partitioner) updateCentroidsSample(sample [][]float32) {
+	counts := make([]int, p.numParts)
+	sums := make([][]float64, p.numParts)
+	for i := range p.numParts {
+		sums[i] = make([]float64, p.dim)
+	}
+
+	for i, vec := range sample {
+		part := p.assignments[i]
+		counts[part]++
+		for j, v := range vec {
+			sums[part][j] += float64(v)
+		}
+	}
+
+	for i := range p.numParts {
+		if counts[i] == 0 {
+			continue
+		}
+		if p.centroids[i] == nil {
+			p.centroids[i] = make([]float32, p.dim)
+		}
+		invCount := 1.0 / float64(counts[i])
+		for j := range p.dim {
+			p.centroids[i][j] = float32(sums[i][j] * invCount)
 		}
 	}
 }
