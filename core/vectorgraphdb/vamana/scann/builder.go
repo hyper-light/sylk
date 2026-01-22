@@ -239,9 +239,13 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graph
 	numWorkers := b.config.NumWorkers
 
 	partitionMembers := make([][]uint32, numParts)
+	maxPartSize := 0
 	for i := range n {
 		part := assignments[i]
 		partitionMembers[part] = append(partitionMembers[part], uint32(i))
+	}
+	for _, members := range partitionMembers {
+		maxPartSize = max(maxPartSize, len(members))
 	}
 
 	chunkSize := (n + numWorkers - 1) / numWorkers
@@ -260,40 +264,51 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graph
 		wg.Add(1)
 		go func(start, end int) {
 			defer wg.Done()
+			neighbors := make([]uint32, 0, R)
+			seen := make([]bool, n)
+			perm := make([]int, maxPartSize)
+
 			for i := start; i < end; i++ {
-				neighbors := make([]uint32, 0, R)
-				seen := make(map[uint32]struct{})
-				seen[uint32(i)] = struct{}{}
+				neighbors = neighbors[:0]
+				seen[i] = true
 
 				myPart := assignments[i]
 				members := partitionMembers[myPart]
+				memberCount := len(members)
 
-				// Sample from same partition first (locality)
+				for j := range memberCount {
+					perm[j] = j
+				}
+
 				localSample := (R * 3) / 4
-				perm := rand.Perm(len(members))
-				for _, idx := range perm {
+				rand.Shuffle(memberCount, func(a, b int) { perm[a], perm[b] = perm[b], perm[a] })
+				for j := range memberCount {
 					if len(neighbors) >= localSample {
 						break
 					}
-					cid := members[idx]
-					if _, exists := seen[cid]; exists {
+					cid := members[perm[j]]
+					if seen[cid] {
 						continue
 					}
-					seen[cid] = struct{}{}
+					seen[cid] = true
 					neighbors = append(neighbors, cid)
 				}
 
-				// Fill rest randomly (connectivity)
 				for len(neighbors) < R && len(neighbors) < n-1 {
 					cid := uint32(rand.IntN(n))
-					if _, exists := seen[cid]; exists {
+					if seen[cid] {
 						continue
 					}
-					seen[cid] = struct{}{}
+					seen[cid] = true
 					neighbors = append(neighbors, cid)
 				}
 
 				graphStore.SetNeighbors(uint32(i), neighbors)
+
+				seen[i] = false
+				for _, nb := range neighbors {
+					seen[nb] = false
+				}
 			}
 		}(start, end)
 	}
