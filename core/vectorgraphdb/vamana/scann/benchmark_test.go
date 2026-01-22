@@ -201,9 +201,19 @@ func buildStorageLayer(t *testing.T, tmpDir string, symbols []symbolInfo) (
 		texts[i] = embedder.SerializeSymbolStandalone(s.name, s.kind, s.signature, s.filePath)
 	}
 
-	embeddings, err := clustered.EmbedBatch(context.Background(), texts)
+	rawEmbeddings, err := clustered.EmbedBatch(context.Background(), texts)
 	if err != nil {
 		t.Fatalf("EmbedBatch failed: %v", err)
+	}
+
+	// Make embeddings contiguous for better cache locality during build.
+	// All slices point into one flat backing array.
+	dim := len(rawEmbeddings[0])
+	flat := make([]float32, len(rawEmbeddings)*dim)
+	embeddings := make([][]float32, len(rawEmbeddings))
+	for i, emb := range rawEmbeddings {
+		copy(flat[i*dim:], emb)
+		embeddings[i] = flat[i*dim : (i+1)*dim : (i+1)*dim]
 	}
 
 	vectorStore, err := storage.CreateVectorStore(filepath.Join(tmpDir, "vectors.bin"), 768, len(symbols))
