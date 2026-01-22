@@ -72,20 +72,22 @@ func (r *LargeScaleRefiner) RefineOnce(order []int) int {
 		go func() {
 			defer wg.Done()
 
-			seen := make([]bool, len(r.vectors))
+			seenGen := make([]uint32, len(r.vectors))
 			candidateList := make([]uint32, 0, r.R*r.R)
 			scoreBuf := make([]scoredCandidate, 0, maxCandidates)
+			var gen uint32
 
 			for chunk := range workCh {
 				updates := make([]nodeUpdate, 0, len(chunk)/4)
 
 				for _, idx := range chunk {
+					gen++
 					nodeID := uint32(idx)
 					currentNeighbors := r.graphStore.GetNeighbors(nodeID)
 
 					candidateList = candidateList[:0]
 					for _, neighbor := range currentNeighbors {
-						seen[neighbor] = true
+						seenGen[neighbor] = gen
 						candidateList = append(candidateList, neighbor)
 					}
 
@@ -95,18 +97,14 @@ func (r *LargeScaleRefiner) RefineOnce(order []int) int {
 							break
 						}
 						for _, nn := range r.graphStore.GetNeighbors(neighbor) {
-							if nn != nodeID && !seen[nn] {
-								seen[nn] = true
+							if nn != nodeID && seenGen[nn] != gen {
+								seenGen[nn] = gen
 								candidateList = append(candidateList, nn)
 								if len(candidateList) >= candidateCap {
 									break
 								}
 							}
 						}
-					}
-
-					for _, c := range candidateList {
-						seen[c] = false
 					}
 
 					improvement := len(candidateList) - len(currentNeighbors)
