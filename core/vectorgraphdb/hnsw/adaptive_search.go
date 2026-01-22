@@ -8,8 +8,8 @@ type AdaptiveSearchConfig struct {
 	ImprovementRatio  float64
 }
 
-func NewAdaptiveSearchConfig(efSearch int) *AdaptiveSearchConfig {
-	return &AdaptiveSearchConfig{
+func NewAdaptiveSearchConfig(efSearch int) AdaptiveSearchConfig {
+	return AdaptiveSearchConfig{
 		MinCandidates:     max(10, efSearch/10),
 		PatienceThreshold: max(3, efSearch/20),
 		ImprovementRatio:  0.001,
