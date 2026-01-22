@@ -33,8 +33,8 @@ type ShardedGraphStore struct {
 	shardCapacity int
 	useBitOps     bool
 
-	shards  []*graphShard
-	shardMu sync.RWMutex
+	shards  atomic.Value // []*graphShard - atomic for lock-free reads
+	shardMu sync.Mutex   // Only for shard creation
 
 	count atomic.Uint64
 }
@@ -79,8 +79,8 @@ func OpenShardedGraphStore(dir string) (*ShardedGraphStore, error) {
 		R:             meta.R,
 		shardCapacity: meta.ShardCapacity,
 		useBitOps:     meta.ShardCapacity == NodesPerShard,
-		shards:        shards,
 	}
+	s.shards.Store(shards)
 	s.count.Store(uint64(meta.Total))
 	return s, nil
 }
@@ -103,8 +103,8 @@ func CreateShardedGraphStore(dir string, R int, shardCapacity int) (*ShardedGrap
 		R:             R,
 		shardCapacity: shardCapacity,
 		useBitOps:     shardCapacity == NodesPerShard,
-		shards:        make([]*graphShard, 0, 8),
 	}
+	s.shards.Store(make([]*graphShard, 0, 8))
 
 	if err := s.createShard(); err != nil {
 		return nil, err
@@ -130,9 +130,13 @@ func (s *ShardedGraphStore) saveMeta() error {
 	return os.WriteFile(filepath.Join(s.dir, "meta.yaml"), data, 0644)
 }
 
-// createShard adds a new shard. Caller must hold shardMu write lock.
+func (s *ShardedGraphStore) loadShards() []*graphShard {
+	return s.shards.Load().([]*graphShard)
+}
+
 func (s *ShardedGraphStore) createShard() error {
-	shardIdx := len(s.shards)
+	shards := s.loadShards()
+	shardIdx := len(shards)
 	path := filepath.Join(s.dir, fmt.Sprintf("shard_%04d.bin", shardIdx))
 
 	store, err := CreateGraphStore(path, s.R, s.shardCapacity)
@@ -140,11 +144,13 @@ func (s *ShardedGraphStore) createShard() error {
 		return fmt.Errorf("sharded graph: create shard %d: %w", shardIdx, err)
 	}
 
-	s.shards = append(s.shards, &graphShard{store: store})
+	newShards := make([]*graphShard, len(shards)+1)
+	copy(newShards, shards)
+	newShards[shardIdx] = &graphShard{store: store}
+	s.shards.Store(newShards)
 	return nil
 }
 
-// ensureShard ensures the shard for the given node ID exists.
 func (s *ShardedGraphStore) ensureShard(nodeID uint32) error {
 	var shardIdx int
 	if s.useBitOps {
@@ -153,18 +159,14 @@ func (s *ShardedGraphStore) ensureShard(nodeID uint32) error {
 		shardIdx = int(nodeID) / s.shardCapacity
 	}
 
-	s.shardMu.RLock()
-	if shardIdx < len(s.shards) {
-		s.shardMu.RUnlock()
+	if shardIdx < len(s.loadShards()) {
 		return nil
 	}
-	s.shardMu.RUnlock()
 
 	s.shardMu.Lock()
 	defer s.shardMu.Unlock()
 
-	// Double-check after acquiring write lock
-	for shardIdx >= len(s.shards) {
+	for shardIdx >= len(s.loadShards()) {
 		if err := s.createShard(); err != nil {
 			return err
 		}
@@ -173,7 +175,6 @@ func (s *ShardedGraphStore) ensureShard(nodeID uint32) error {
 	return nil
 }
 
-// getShard returns the shard and local ID for the given global node ID.
 func (s *ShardedGraphStore) getShard(nodeID uint32) (*graphShard, uint32) {
 	var shardIdx int
 	var localID uint32
@@ -185,14 +186,12 @@ func (s *ShardedGraphStore) getShard(nodeID uint32) (*graphShard, uint32) {
 		localID = uint32(int(nodeID) % s.shardCapacity)
 	}
 
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	if shardIdx >= len(s.shards) {
+	shards := s.loadShards()
+	if shardIdx >= len(shards) {
 		return nil, 0
 	}
 
-	return s.shards[shardIdx], localID
+	return shards[shardIdx], localID
 }
 
 // GetNeighbors returns the neighbor list for the given node.
@@ -299,11 +298,9 @@ func (s *ShardedGraphStore) SetNeighborsBatch(nodes []NodeNeighbors) error {
 		})
 	}
 
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
+	shards := s.loadShards()
 	for shardIdx, batch := range shardBatches {
-		shard := s.shards[shardIdx]
+		shard := shards[shardIdx]
 		shard.mu.Lock()
 		err := shard.store.SetNeighborsBatch(batch)
 		shard.mu.Unlock()
@@ -330,13 +327,8 @@ func (s *ShardedGraphStore) Count() uint64 {
 	return s.count.Load()
 }
 
-// Capacity returns the current total capacity across all shards.
-// This grows dynamically as new shards are added.
 func (s *ShardedGraphStore) Capacity() uint64 {
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	return uint64(len(s.shards)) * uint64(s.shardCapacity)
+	return uint64(len(s.loadShards())) * uint64(s.shardCapacity)
 }
 
 // MaxDegree returns the maximum number of neighbors per node (R).
@@ -344,24 +336,14 @@ func (s *ShardedGraphStore) MaxDegree() int {
 	return s.R
 }
 
-// ShardCount returns the number of shards.
 func (s *ShardedGraphStore) ShardCount() int {
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	return len(s.shards)
+	return len(s.loadShards())
 }
 
 func (s *ShardedGraphStore) Sync() error {
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	for i, shard := range s.shards {
-		shard.mu.RLock()
-		err := shard.store.Sync()
-		shard.mu.RUnlock()
-
-		if err != nil {
+	shards := s.loadShards()
+	for i, shard := range shards {
+		if err := shard.store.Sync(); err != nil {
 			return fmt.Errorf("sharded graph: sync shard %d: %w", i, err)
 		}
 	}
@@ -369,13 +351,13 @@ func (s *ShardedGraphStore) Sync() error {
 	return s.saveMeta()
 }
 
-// Close closes all shards.
 func (s *ShardedGraphStore) Close() error {
 	s.shardMu.Lock()
 	defer s.shardMu.Unlock()
 
+	shards := s.loadShards()
 	var firstErr error
-	for i, shard := range s.shards {
+	for i, shard := range shards {
 		shard.mu.Lock()
 		err := shard.store.Close()
 		shard.mu.Unlock()
@@ -385,6 +367,6 @@ func (s *ShardedGraphStore) Close() error {
 		}
 	}
 
-	s.shards = nil
+	s.shards.Store([]*graphShard(nil))
 	return firstErr
 }

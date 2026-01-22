@@ -28,8 +28,8 @@ type ShardedVectorStore struct {
 	shardCapacity int
 	useBitOps     bool
 
-	shards  []*vectorShard
-	shardMu sync.RWMutex
+	shards  atomic.Value // []*vectorShard - atomic for lock-free reads
+	shardMu sync.Mutex   // Only for shard creation
 
 	total atomic.Uint64
 }
@@ -73,8 +73,8 @@ func OpenShardedVectorStore(dir string) (*ShardedVectorStore, error) {
 		dim:           meta.Dim,
 		shardCapacity: meta.ShardCapacity,
 		useBitOps:     meta.ShardCapacity == VectorsPerShard,
-		shards:        shards,
 	}
+	s.shards.Store(shards)
 	s.total.Store(uint64(meta.Total))
 	return s, nil
 }
@@ -97,8 +97,8 @@ func CreateShardedVectorStore(dir string, dim int, shardCapacity int) (*ShardedV
 		dim:           dim,
 		shardCapacity: shardCapacity,
 		useBitOps:     shardCapacity == VectorsPerShard,
-		shards:        make([]*vectorShard, 0, 8),
 	}
+	s.shards.Store(make([]*vectorShard, 0, 8))
 
 	if err := s.createShard(); err != nil {
 		return nil, err
@@ -124,8 +124,13 @@ func (s *ShardedVectorStore) saveMeta() error {
 	return os.WriteFile(filepath.Join(s.dir, "meta.yaml"), data, 0644)
 }
 
+func (s *ShardedVectorStore) loadShards() []*vectorShard {
+	return s.shards.Load().([]*vectorShard)
+}
+
 func (s *ShardedVectorStore) createShard() error {
-	shardIdx := len(s.shards)
+	shards := s.loadShards()
+	shardIdx := len(shards)
 	path := filepath.Join(s.dir, fmt.Sprintf("shard_%04d.bin", shardIdx))
 
 	store, err := CreateVectorStore(path, s.dim, s.shardCapacity)
@@ -133,7 +138,10 @@ func (s *ShardedVectorStore) createShard() error {
 		return fmt.Errorf("sharded vectors: create shard %d: %w", shardIdx, err)
 	}
 
-	s.shards = append(s.shards, &vectorShard{store: store})
+	newShards := make([]*vectorShard, len(shards)+1)
+	copy(newShards, shards)
+	newShards[shardIdx] = &vectorShard{store: store}
+	s.shards.Store(newShards)
 	return nil
 }
 
@@ -145,17 +153,14 @@ func (s *ShardedVectorStore) ensureShard(vectorID uint32) error {
 		shardIdx = int(vectorID) / s.shardCapacity
 	}
 
-	s.shardMu.RLock()
-	if shardIdx < len(s.shards) {
-		s.shardMu.RUnlock()
+	if shardIdx < len(s.loadShards()) {
 		return nil
 	}
-	s.shardMu.RUnlock()
 
 	s.shardMu.Lock()
 	defer s.shardMu.Unlock()
 
-	for shardIdx >= len(s.shards) {
+	for shardIdx >= len(s.loadShards()) {
 		if err := s.createShard(); err != nil {
 			return err
 		}
@@ -175,14 +180,12 @@ func (s *ShardedVectorStore) getShard(vectorID uint32) (*vectorShard, uint32) {
 		localID = uint32(int(vectorID) % s.shardCapacity)
 	}
 
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	if shardIdx >= len(s.shards) {
+	shards := s.loadShards()
+	if shardIdx >= len(shards) {
 		return nil, 0
 	}
 
-	return s.shards[shardIdx], localID
+	return shards[shardIdx], localID
 }
 
 // Get returns the vector at the given ID.
@@ -212,13 +215,13 @@ func (s *ShardedVectorStore) Append(vector []float32) (uint32, error) {
 		shardIdx = total / s.shardCapacity
 	}
 
-	for shardIdx >= len(s.shards) {
+	for shardIdx >= len(s.loadShards()) {
 		if err := s.createShard(); err != nil {
 			return 0, err
 		}
 	}
 
-	currentShard := s.shards[shardIdx]
+	currentShard := s.loadShards()[shardIdx]
 	currentShard.mu.Lock()
 	_, err := currentShard.store.Append(vector)
 	currentShard.mu.Unlock()
@@ -260,7 +263,7 @@ func (s *ShardedVectorStore) AppendBatch(vectors [][]float32) (startID uint32, e
 			space = s.shardCapacity - localID
 		}
 
-		for shardIdx >= len(s.shards) {
+		for shardIdx >= len(s.loadShards()) {
 			if err := s.createShard(); err != nil {
 				return 0, err
 			}
@@ -270,7 +273,7 @@ func (s *ShardedVectorStore) AppendBatch(vectors [][]float32) (startID uint32, e
 		batch := remaining[:take]
 		remaining = remaining[take:]
 
-		currentShard := s.shards[shardIdx]
+		currentShard := s.loadShards()[shardIdx]
 		currentShard.mu.Lock()
 		_, err := currentShard.store.AppendBatch(batch)
 		currentShard.mu.Unlock()
@@ -290,10 +293,7 @@ func (s *ShardedVectorStore) Count() uint64 {
 }
 
 func (s *ShardedVectorStore) Capacity() uint64 {
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	return uint64(len(s.shards)) * uint64(s.shardCapacity)
+	return uint64(len(s.loadShards())) * uint64(s.shardCapacity)
 }
 
 func (s *ShardedVectorStore) Dimension() int {
@@ -301,10 +301,7 @@ func (s *ShardedVectorStore) Dimension() int {
 }
 
 func (s *ShardedVectorStore) ShardCount() int {
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	return len(s.shards)
+	return len(s.loadShards())
 }
 
 type ShardedVectorSnapshot struct {
@@ -316,14 +313,10 @@ type ShardedVectorSnapshot struct {
 }
 
 func (s *ShardedVectorStore) Snapshot() *ShardedVectorSnapshot {
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	snapshots := make([]*VectorSnapshot, len(s.shards))
-	for i, shard := range s.shards {
-		shard.mu.RLock()
+	shards := s.loadShards()
+	snapshots := make([]*VectorSnapshot, len(shards))
+	for i, shard := range shards {
 		snapshots[i] = shard.store.Snapshot()
-		shard.mu.RUnlock()
 	}
 
 	return &ShardedVectorSnapshot{
@@ -365,15 +358,9 @@ func (snap *ShardedVectorSnapshot) Len() int {
 }
 
 func (s *ShardedVectorStore) Sync() error {
-	s.shardMu.RLock()
-	defer s.shardMu.RUnlock()
-
-	for i, shard := range s.shards {
-		shard.mu.RLock()
-		err := shard.store.Sync()
-		shard.mu.RUnlock()
-
-		if err != nil {
+	shards := s.loadShards()
+	for i, shard := range shards {
+		if err := shard.store.Sync(); err != nil {
 			return fmt.Errorf("sharded vectors: sync shard %d: %w", i, err)
 		}
 	}
@@ -385,8 +372,9 @@ func (s *ShardedVectorStore) Close() error {
 	s.shardMu.Lock()
 	defer s.shardMu.Unlock()
 
+	shards := s.loadShards()
 	var firstErr error
-	for i, shard := range s.shards {
+	for i, shard := range shards {
 		shard.mu.Lock()
 		err := shard.store.Close()
 		shard.mu.Unlock()
@@ -396,7 +384,7 @@ func (s *ShardedVectorStore) Close() error {
 		}
 	}
 
-	s.shards = nil
+	s.shards.Store([]*vectorShard(nil))
 	return firstErr
 }
 
