@@ -171,6 +171,13 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 		toScore = candidates[:maxScore]
 	}
 
+	// Reduced dimensions for scoring: R * log(R) dims preserves ranking accuracy
+	dim := len(pVec)
+	reducedDim := r.R * bits.Len(uint(r.R))
+	if reducedDim > dim {
+		reducedDim = dim
+	}
+
 	scoreBuf = scoreBuf[:0]
 	for _, c := range toScore {
 		cVec := r.vectors[c]
@@ -179,7 +186,7 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 		if cMag == 0 {
 			dist = 2.0
 		} else {
-			dot := vek32.Dot(pVec, cVec)
+			dot := vek32.Dot(pVec[:reducedDim], cVec[:reducedDim])
 			dist = 1.0 - float64(dot)/(pMag*cMag)
 		}
 		scoreBuf = append(scoreBuf, scoredCandidate{c, dist})
