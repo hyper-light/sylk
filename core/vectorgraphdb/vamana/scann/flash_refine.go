@@ -63,8 +63,7 @@ func (r *LargeScaleRefiner) RefineOnce(order []int) int {
 	var wg sync.WaitGroup
 
 	logR := bits.Len(uint(r.R))
-	logR2 := logR * logR
-	maxCandidates := r.R + logR2 + logR2
+	maxCandidates := r.R
 	minImprovement := r.R / logR
 
 	for range numWorkers {
