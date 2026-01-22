@@ -267,6 +267,12 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graph
 			neighbors := make([]uint32, 0, R)
 			seen := make([]bool, n)
 			perm := make([]int, maxPartSize)
+			localSample := (R * 3) / 4
+			swaps := make([][2]int, localSample)
+
+			for j := range maxPartSize {
+				perm[j] = j
+			}
 
 			for i := start; i < end; i++ {
 				neighbors = neighbors[:0]
@@ -276,22 +282,28 @@ func (b *BatchBuilder) buildGraphLocalityAware(n int, vectors [][]float32, graph
 				members := partitionMembers[myPart]
 				memberCount := len(members)
 
-				for j := range memberCount {
-					perm[j] = j
+				swapCount := min(localSample, memberCount)
+				for j := range swapCount {
+					r := j + rand.IntN(memberCount-j)
+					swaps[j] = [2]int{j, r}
+					perm[j], perm[r] = perm[r], perm[j]
 				}
 
-				localSample := (R * 3) / 4
-				rand.Shuffle(memberCount, func(a, b int) { perm[a], perm[b] = perm[b], perm[a] })
-				for j := range memberCount {
-					if len(neighbors) >= localSample {
-						break
-					}
+				for j := range swapCount {
 					cid := members[perm[j]]
 					if seen[cid] {
 						continue
 					}
 					seen[cid] = true
 					neighbors = append(neighbors, cid)
+					if len(neighbors) >= localSample {
+						break
+					}
+				}
+
+				for j := swapCount - 1; j >= 0; j-- {
+					a, b := swaps[j][0], swaps[j][1]
+					perm[a], perm[b] = perm[b], perm[a]
 				}
 
 				for len(neighbors) < R && len(neighbors) < n-1 {
