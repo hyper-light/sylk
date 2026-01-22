@@ -39,11 +39,7 @@ func (p *Partitioner) Train(vectors [][]float32, maxIters int) {
 
 	vectorNormsSq := make([]float64, n)
 	for i, vec := range vectors {
-		var normSq float64
-		for _, v := range vec {
-			normSq += float64(v) * float64(v)
-		}
-		vectorNormsSq[i] = normSq
+		vectorNormsSq[i] = float64(vek32.Dot(vec, vec))
 	}
 
 	p.initCentroidsKMeansPP(vectors, k)
