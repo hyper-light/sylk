@@ -200,46 +200,10 @@ func (r *LargeScaleRefiner) fastPrune(p uint32, candidates []uint32, scoreBuf []
 		}
 	}
 
-	selected := make([]uint32, 0, r.R)
-	selectedVecs := make([][]float32, 0, r.R)
-	selectedMags := make([]float64, 0, r.R)
-
-	// Examine R plus a log²(R) buffer for diversity rejection
-	examineCount := min(r.R+bits.Len(uint(r.R))*bits.Len(uint(r.R)), len(scoreBuf))
-	maxCheck := bits.Len(uint(r.R))
-
-	for i := range examineCount {
-		if len(selected) >= r.R {
-			break
-		}
-
-		c := scoreBuf[i]
-		cVec := r.vectors[c.id]
-		cMag := r.mags[c.id]
-
-		keep := true
-		checkStart := max(0, len(selected)-maxCheck)
-		for j := checkStart; j < len(selected); j++ {
-			sVec := selectedVecs[j]
-			sMag := selectedMags[j]
-			var distCS float64
-			if cMag == 0 || sMag == 0 {
-				distCS = 2.0
-			} else {
-				dot := vek32.Dot(cVec, sVec)
-				distCS = 1.0 - float64(dot)/(cMag*sMag)
-			}
-			if c.dist > r.alpha*distCS {
-				keep = false
-				break
-			}
-		}
-
-		if keep {
-			selected = append(selected, c.id)
-			selectedVecs = append(selectedVecs, cVec)
-			selectedMags = append(selectedMags, cMag)
-		}
+	selectCount := min(r.R, len(scoreBuf))
+	selected := make([]uint32, selectCount)
+	for i := range selectCount {
+		selected[i] = scoreBuf[i].id
 	}
 
 	return selected
