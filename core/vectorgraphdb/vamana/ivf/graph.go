@@ -65,6 +65,7 @@ type graphBuildWorker struct {
 	candidates    []vamanaCandidate
 	prunedList    []uint32
 	reverseBuffer []uint32
+	occludeFactor []float32
 	rng           uint64
 	pq            neighborPQ
 	idScratch     []uint32
@@ -92,6 +93,7 @@ func newGraphBuildWorker(maxMembers, R, L int) *graphBuildWorker {
 		candidates:    make([]vamanaCandidate, 0, maxMembers),
 		prunedList:    make([]uint32, 0, R),
 		reverseBuffer: make([]uint32, 0, R+1),
+		occludeFactor: make([]float32, 0, maxMembers),
 		rng:           uint64(maxMembers) | 1,
 		pq: neighborPQ{
 			data:     make([]vamanaCandidate, L+1),
@@ -424,13 +426,18 @@ func (g *VamanaGraph) robustPruneLocal(sourceLocal int, candidates []vamanaCandi
 		return a.dist - b.dist
 	})
 
-	maxc := len(candidates)
-	if maxc > R*4 {
-		maxc = R * 4
-		candidates = candidates[:maxc]
+	maxCandidates := w.pq.capacity + R
+	if len(candidates) > maxCandidates {
+		candidates = candidates[:maxCandidates]
 	}
 
-	occludeFactor := make([]float32, len(candidates))
+	if cap(w.occludeFactor) < len(candidates) {
+		w.occludeFactor = make([]float32, len(candidates))
+	}
+	occludeFactor := w.occludeFactor[:len(candidates)]
+	for i := range occludeFactor {
+		occludeFactor[i] = 0
+	}
 
 	w.prunedList = w.prunedList[:0]
 
