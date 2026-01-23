@@ -380,6 +380,8 @@ type FlashPruneBuffers struct {
 	rngState       uint64
 	candidateCodes []byte
 	candidateMags  []float32
+	dots           []float32
+	gathered       []float32
 	numSubspaces   int
 }
 
@@ -398,6 +400,8 @@ func NewFlashPruneBuffers(maxCandidates int, R int, numSubspaces int) *FlashPrun
 		rngState:       uint64(rand.Int64()) | 1,
 		candidateCodes: make([]byte, maxCandidates*numSubspaces),
 		candidateMags:  make([]float32, maxCandidates),
+		dots:           make([]float32, maxCandidates),
+		gathered:       make([]float32, maxCandidates),
 		numSubspaces:   numSubspaces,
 	}
 }
@@ -459,27 +463,41 @@ func (fc *FlashCoder) RobustPruneFlash(
 	codes := fc.codes
 	mags := flashMags.mags
 
-	candCodes := buf.candidateCodes[:len(toScore)*numSubspaces]
-	candMags := buf.candidateMags[:len(toScore)]
+	pTables := make([][]float32, numSubspaces)
+	for m := 0; m < numSubspaces; m++ {
+		base := int(pCode[m]) * numCentroids
+		pTables[m] = sdt[m][base : base+numCentroids]
+	}
+
+	n := len(toScore)
+	candCodes := buf.candidateCodes[:n*numSubspaces]
+	candMags := buf.candidateMags[:n]
 	for i, c := range toScore {
 		copy(candCodes[i*numSubspaces:(i+1)*numSubspaces], codes[c])
 		candMags[i] = mags[c]
 	}
 
-	for i := range toScore {
-		cCode := candCodes[i*numSubspaces : (i+1)*numSubspaces]
-		cMag := candMags[i]
+	dots := buf.dots[:n]
+	gathered := buf.gathered[:n]
+	for i := range dots {
+		dots[i] = 0
+	}
 
-		var dot float32
-		for m := 0; m < numSubspaces; m++ {
-			dot += sdt[m][int(pCode[m])*numCentroids+int(cCode[m])]
+	for m := 0; m < numSubspaces; m++ {
+		pTable := pTables[m]
+		for i := 0; i < n; i++ {
+			gathered[i] = pTable[candCodes[i*numSubspaces+m]]
 		}
+		vek32.Add_Inplace(dots, gathered)
+	}
 
+	for i := 0; i < n; i++ {
+		cMag := candMags[i]
 		var dist float64
 		if pMag == 0 || cMag == 0 {
 			dist = 2.0
 		} else {
-			dist = 1.0 - float64(dot)/(float64(pMag)*float64(cMag))
+			dist = 1.0 - float64(dots[i])/(float64(pMag)*float64(cMag))
 		}
 		scored[i] = flashCandidate{id: toScore[i], bufIdx: i, dist: dist}
 	}
