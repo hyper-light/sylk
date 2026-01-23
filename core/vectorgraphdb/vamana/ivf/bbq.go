@@ -3,6 +3,7 @@ package ivf
 import (
 	"math"
 	"math/bits"
+	"unsafe"
 
 	"github.com/viterin/vek/vek32"
 )
@@ -149,18 +150,23 @@ func (q *BBQQuery) DistanceFlat(codes []byte, n int, dists []int32) {
 	}
 }
 
-// HammingDistance uses hardware POPCNT via math/bits.OnesCount64.
+const bytesPerUint64 = 8
+
+// HammingDistance computes popcount(a XOR b) using hardware POPCNT.
 func HammingDistance(a, b []byte) int {
 	dist := 0
-	i := 0
-	for ; i+8 <= len(a); i += 8 {
-		a64 := uint64(a[i]) | uint64(a[i+1])<<8 | uint64(a[i+2])<<16 | uint64(a[i+3])<<24 |
-			uint64(a[i+4])<<32 | uint64(a[i+5])<<40 | uint64(a[i+6])<<48 | uint64(a[i+7])<<56
-		b64 := uint64(b[i]) | uint64(b[i+1])<<8 | uint64(b[i+2])<<16 | uint64(b[i+3])<<24 |
-			uint64(b[i+4])<<32 | uint64(b[i+5])<<40 | uint64(b[i+6])<<48 | uint64(b[i+7])<<56
-		dist += bits.OnesCount64(a64 ^ b64)
+	n := len(a)
+	nWords := n / bytesPerUint64
+
+	if nWords > 0 {
+		a64 := unsafe.Slice((*uint64)(unsafe.Pointer(&a[0])), nWords)
+		b64 := unsafe.Slice((*uint64)(unsafe.Pointer(&b[0])), nWords)
+		for i := 0; i < nWords; i++ {
+			dist += bits.OnesCount64(a64[i] ^ b64[i])
+		}
 	}
-	for ; i < len(a); i++ {
+
+	for i := nWords * bytesPerUint64; i < n; i++ {
 		dist += bits.OnesCount8(a[i] ^ b[i])
 	}
 	return dist
