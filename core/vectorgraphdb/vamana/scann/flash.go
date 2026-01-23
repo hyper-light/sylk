@@ -526,6 +526,8 @@ func (fc *FlashCoder) RobustPruneFlash(
 	selectedCodes := buf.selectedCodes[:0]
 	selectedMags := buf.selectedMags[:0]
 
+	cTables := make([][]float32, numSubspaces)
+
 	for i := range examineCount {
 		if len(selected) >= R || consecutiveRejections >= R {
 			break
@@ -535,6 +537,11 @@ func (fc *FlashCoder) RobustPruneFlash(
 		cCode := candCodes[c.bufIdx*numSubspaces : (c.bufIdx+1)*numSubspaces]
 		cMag := candMags[c.bufIdx]
 
+		for m := range numSubspaces {
+			base := int(cCode[m]) * numCentroids
+			cTables[m] = sdt[m][base : base+numCentroids]
+		}
+
 		keep := true
 		checkStart := max(0, len(selected)-maxCheck)
 
@@ -543,8 +550,8 @@ func (fc *FlashCoder) RobustPruneFlash(
 			sMag := selectedMags[j]
 
 			var dot float32
-			for m := 0; m < numSubspaces; m++ {
-				dot += sdt[m][int(cCode[m])*numCentroids+int(sCode[m])]
+			for m := range numSubspaces {
+				dot += cTables[m][sCode[m]]
 			}
 
 			var distCS float64
