@@ -377,6 +377,7 @@ type FlashPruneBuffers struct {
 	toScore       []uint32
 	selectedCodes [][]uint8
 	selectedMags  []float32
+	rngState      uint64
 }
 
 type flashCandidate struct {
@@ -390,7 +391,15 @@ func NewFlashPruneBuffers(maxCandidates int, R int) *FlashPruneBuffers {
 		toScore:       make([]uint32, maxCandidates),
 		selectedCodes: make([][]uint8, R),
 		selectedMags:  make([]float32, R),
+		rngState:      uint64(rand.Int64()) | 1,
 	}
+}
+
+func (buf *FlashPruneBuffers) fastIntN(n int) int {
+	buf.rngState ^= buf.rngState << 13
+	buf.rngState ^= buf.rngState >> 7
+	buf.rngState ^= buf.rngState << 17
+	return int(buf.rngState % uint64(n))
 }
 
 func (fc *FlashCoder) RobustPruneFlash(
@@ -416,10 +425,10 @@ func (fc *FlashCoder) RobustPruneFlash(
 	pCode := fc.codes[p]
 	pMag := flashMags.Get(p)
 
-	maxExamine := min(R*2, len(candidates))
+	maxExamine := min(R+(R>>1), len(candidates))
 	preserveCount := min(R, len(candidates))
 	ratio := max(1, len(candidates)/maxExamine)
-	totalSamples := maxExamine * bits.Len(uint(ratio))
+	totalSamples := maxExamine + (maxExamine>>2)*bits.Len(uint(ratio))
 	secondHopSamples := min(len(candidates)-preserveCount, totalSamples-preserveCount)
 	maxScore := preserveCount + max(0, secondHopSamples)
 
@@ -429,7 +438,7 @@ func (fc *FlashCoder) RobustPruneFlash(
 		copy(toScore, candidates[:preserveCount])
 		copy(toScore[preserveCount:], candidates[preserveCount:maxScore])
 		for i, c := range candidates[maxScore:] {
-			j := rand.IntN(secondHopSamples + i + 1)
+			j := buf.fastIntN(secondHopSamples + i + 1)
 			if j < secondHopSamples {
 				toScore[preserveCount+j] = c
 			}
@@ -478,7 +487,8 @@ func (fc *FlashCoder) RobustPruneFlash(
 		scored[j+1] = key
 	}
 
-	maxCheck := bits.Len(uint(R * R))
+	logR := bits.Len(uint(R))
+	maxCheck := logR * logR
 
 	selected := make([]uint32, 0, R)
 	consecutiveRejections := 0
