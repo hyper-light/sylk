@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -38,10 +39,33 @@ func (c *ClusteredMockEmbedder) Embed(_ context.Context, text string) ([]float32
 }
 
 func (c *ClusteredMockEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
-	results := make([][]float32, len(texts))
-	for i, text := range texts {
-		results[i] = c.embedClustered(text)
+	n := len(texts)
+	results := make([][]float32, n)
+
+	numWorkers := runtime.NumCPU()
+	chunkSize := (n + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+	for w := range numWorkers {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		if start >= end {
+			continue
+		}
+
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				results[i] = c.embedClustered(texts[i])
+			}
+		}(start, end)
 	}
+	wg.Wait()
+
 	return results, nil
 }
 
