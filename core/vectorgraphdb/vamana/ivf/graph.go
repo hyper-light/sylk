@@ -43,7 +43,7 @@ func ConfigForGraph(n, numPartitions int) GraphConfig {
 	logN := bits.Len(uint(n))
 
 	R := logN
-	L := R * bits.Len(uint(R))
+	L := deriveL(R, 0.95)
 
 	beamWidth := logN
 
@@ -56,6 +56,24 @@ func ConfigForGraph(n, numPartitions int) GraphConfig {
 		BeamWidth: beamWidth,
 		BridgeK:   bridgeK,
 	}
+}
+
+func deriveL(R int, targetRecall float64) int {
+	targetRecall = max(0.0, min(targetRecall, 1.0-1.0/float64(R*R)))
+
+	logR := bits.Len(uint(R))
+	if logR < 1 {
+		logR = 1
+	}
+
+	pathFactor := float64(logR)
+	expansionFactor := 1.0 + float64(logR)/float64(R)
+	recallBits := -math.Log2(1.0 - targetRecall)
+
+	L := float64(R) * pathFactor * expansionFactor * recallBits / float64(logR)
+
+	maxL := R * logR * logR
+	return max(R, min(int(math.Ceil(L)), maxL))
 }
 
 type graphBuildWorker struct {
@@ -169,10 +187,6 @@ func (pq *neighborPQ) closestUnexpanded() (uint32, int, bool) {
 
 func (pq *neighborPQ) hasUnexpanded() bool {
 	return pq.cursor < pq.size
-}
-
-func (pq *neighborPQ) allCandidates() []vamanaCandidate {
-	return pq.data[:pq.size]
 }
 
 func (idx *Index) BuildVamanaGraph() *VamanaGraph {
