@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/bits"
 	"math/rand/v2"
+	"slices"
 	"sync"
 
 	"github.com/viterin/vek/vek32"
@@ -382,6 +383,7 @@ type FlashPruneBuffers struct {
 	candidateMags  []float32
 	dots           []float32
 	gathered       []float32
+	sampleIndices  []int
 	numSubspaces   int
 }
 
@@ -402,6 +404,7 @@ func NewFlashPruneBuffers(maxCandidates int, R int, numSubspaces int) *FlashPrun
 		candidateMags:  make([]float32, maxCandidates),
 		dots:           make([]float32, maxCandidates),
 		gathered:       make([]float32, maxCandidates),
+		sampleIndices:  make([]int, maxCandidates),
 		numSubspaces:   numSubspaces,
 	}
 }
@@ -444,14 +447,21 @@ func (fc *FlashCoder) RobustPruneFlash(
 	maxScore := preserveCount + max(0, secondHopSamples)
 
 	toScore := candidates
-	if len(candidates) > maxScore && secondHopSamples > 0 {
-		toScore = buf.toScore[:maxScore]
+	if tailSize := len(candidates) - maxScore; tailSize > 0 && secondHopSamples > 0 {
+		toScore = buf.toScore[:preserveCount]
 		copy(toScore, candidates[:preserveCount])
-		copy(toScore[preserveCount:], candidates[preserveCount:maxScore])
-		for i, c := range candidates[maxScore:] {
-			j := buf.fastIntN(secondHopSamples + i + 1)
-			if j < secondHopSamples {
-				toScore[preserveCount+j] = c
+
+		indices := buf.sampleIndices[:secondHopSamples]
+		for i := range secondHopSamples {
+			indices[i] = buf.fastIntN(tailSize)
+		}
+		slices.Sort(indices)
+
+		prev := -1
+		for _, idx := range indices {
+			if idx != prev {
+				toScore = append(toScore, candidates[maxScore+idx])
+				prev = idx
 			}
 		}
 	}
