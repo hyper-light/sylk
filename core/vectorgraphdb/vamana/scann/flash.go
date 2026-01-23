@@ -518,7 +518,7 @@ func (fc *FlashCoder) RobustPruneFlash(
 	}
 
 	logR := bits.Len(uint(R))
-	maxCheck := logR * logR
+	maxCheck := logR + logR
 
 	selected := make([]uint32, 0, R)
 	consecutiveRejections := 0
