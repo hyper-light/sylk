@@ -20,13 +20,14 @@ const (
 )
 
 type VamanaGraph struct {
-	adjacency       [][]uint32
-	R               int
-	medoid          uint32
-	partitionReps   []uint32
-	nodeToPartition []uint16
-	idx             *Index
-	searchBufPool   sync.Pool
+	adjacency         [][]uint32
+	R                 int
+	medoid            uint32
+	partitionReps     []uint32
+	nodeToPartition   []uint16
+	clusteringQuality float64
+	idx               *Index
+	searchBufPool     sync.Pool
 }
 
 type GraphConfig struct {
@@ -236,7 +237,6 @@ func (idx *Index) BuildVamanaGraph() *VamanaGraph {
 	g.medoid = idx.computeMedoid()
 	g.buildLocalGraphsHamming(cfg)
 
-	// Build nodeToPartition lookup for efficient partition membership queries
 	g.nodeToPartition = make([]uint16, n)
 	for p, members := range idx.partitionIDs {
 		for _, nodeID := range members {
@@ -244,13 +244,98 @@ func (idx *Index) BuildVamanaGraph() *VamanaGraph {
 		}
 	}
 
+	g.clusteringQuality = g.computeClusteringQuality()
+
 	if numParts > 1 {
-		g.addCrossPartitionBridges(cfg)
+		g.computePartitionReps()
+
+		logP := bits.Len(uint(numParts))
+		stitchThreshold := math.Sqrt(float64(logP))
+
+		g.buildOverlayVamana()
+
+		if g.clusteringQuality < stitchThreshold {
+			g.stitchAdjacentPartitions(cfg)
+		}
 	}
 
 	g.ensureConnectivity(cfg)
 
 	return g
+}
+
+func (g *VamanaGraph) computeClusteringQuality() float64 {
+	idx := g.idx
+	n := idx.numVectors
+	numParts := len(idx.centroids)
+	if n == 0 || numParts < 2 {
+		return 1.0
+	}
+
+	dim := idx.dim
+	flat := idx.vectorsFlat
+	norms := idx.vectorNorms
+
+	logN := bits.Len(uint(n))
+	sampleSize := logN * logN
+	if sampleSize > n {
+		sampleSize = n
+	}
+	step := n / sampleSize
+	if step < 1 {
+		step = 1
+	}
+
+	var sumRatio float64
+	var count int
+
+	for i := 0; i < n; i += step {
+		vecOff := i * dim
+		vec := flat[vecOff : vecOff+dim]
+		vecNorm := norms[i]
+		if vecNorm == 0 {
+			continue
+		}
+
+		ownPart := int(g.nodeToPartition[i])
+		ownCentroid := idx.centroids[ownPart]
+		ownCentroidNorm := idx.centroidNorms[ownPart]
+		if ownCentroidNorm == 0 {
+			continue
+		}
+
+		ownDot := vek32.Dot(vec, ownCentroid)
+		ownSim := float64(ownDot) / (vecNorm * ownCentroidNorm)
+
+		bestOtherSim := -2.0
+		for p := 0; p < numParts; p++ {
+			if p == ownPart {
+				continue
+			}
+			centroid := idx.centroids[p]
+			centroidNorm := idx.centroidNorms[p]
+			if centroidNorm == 0 {
+				continue
+			}
+			dot := vek32.Dot(vec, centroid)
+			sim := float64(dot) / (vecNorm * centroidNorm)
+			if sim > bestOtherSim {
+				bestOtherSim = sim
+			}
+		}
+
+		if bestOtherSim > 0 && ownSim > 0 {
+			ratio := ownSim / bestOtherSim
+			sumRatio += ratio
+			count++
+		}
+	}
+
+	if count == 0 {
+		return 1.0
+	}
+
+	return sumRatio / float64(count)
 }
 
 func (g *VamanaGraph) buildLocalGraphsHamming(cfg GraphConfig) {
@@ -641,7 +726,7 @@ func (idx *Index) computeMedoid() uint32 {
 	return best
 }
 
-func (g *VamanaGraph) addCrossPartitionBridges(cfg GraphConfig) {
+func (g *VamanaGraph) computePartitionReps() {
 	idx := g.idx
 	numParts := len(idx.centroids)
 	if numParts <= 1 {
@@ -681,9 +766,6 @@ func (g *VamanaGraph) addCrossPartitionBridges(cfg GraphConfig) {
 		}
 		g.partitionReps[p] = bestNode
 	}
-
-	g.buildOverlayVamana()
-	g.stitchAdjacentPartitions(cfg)
 }
 
 func (g *VamanaGraph) buildOverlayVamana() {
@@ -1279,7 +1361,47 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 	}
 
 	numParts := len(idx.centroids)
-	nprobe := idx.config.NProbe
+	logK := bits.Len(uint(k))
+	if logK < 1 {
+		logK = 1
+	}
+	logP := bits.Len(uint(numParts))
+
+	// Base nprobe derived from k and partition count
+	missRate := 1.0 / float64(k*logK)
+	sqrtK := math.Sqrt(float64(k))
+	coverageFactor := 1.0 - math.Pow(missRate, 1.0/sqrtK)
+	nprobe := int(float64(numParts) * coverageFactor)
+
+	minProbe := k * logP
+	if nprobe < minProbe {
+		nprobe = minProbe
+	}
+
+	// Adjust nprobe based on clustering quality
+	// clusteringQuality = mean(ownSim / bestOtherSim)
+	// - Quality > 1.0: vectors are closer to own centroid than others (well-clustered)
+	// - Quality ≈ 1.0: vectors equally close to own and adjacent centroids (poorly clustered)
+	//
+	// For well-clustered data (quality > 1): reduce nprobe (fewer partitions needed)
+	// For poorly-clustered data (quality ≈ 1): increase nprobe (need more coverage)
+	//
+	// Derivation: spreadFactor = 1 / quality
+	// - quality=2.0 → spreadFactor=0.5 → probe half as many partitions
+	// - quality=1.0 → spreadFactor=1.0 → probe base amount
+	// - quality=0.5 → spreadFactor=2.0 → probe twice as many partitions
+	if g.clusteringQuality > 0 {
+		spreadFactor := 1.0 / g.clusteringQuality
+		nprobe = int(float64(nprobe) * spreadFactor)
+		// Ensure minimum probe count for safety
+		if nprobe < minProbe {
+			nprobe = minProbe
+		}
+	}
+
+	if nprobe > numParts {
+		nprobe = numParts
+	}
 
 	type partScore struct {
 		idx int
@@ -1305,16 +1427,11 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 		}
 	}
 
-	topN := min(nprobe, numParts)
-	topPartitions := make([]int, topN)
-	for i := range topN {
-		topPartitions[i] = scores[i].idx
-	}
-
 	h := &resultHeap{}
 	heap.Init(h)
 
-	for _, p := range topPartitions {
+	for pi := 0; pi < nprobe; pi++ {
+		p := scores[pi].idx
 		ids := idx.partitionIDs[p]
 		for _, id := range ids {
 			vecStart := int(id) * dim
