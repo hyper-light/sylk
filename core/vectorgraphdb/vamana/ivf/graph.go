@@ -1,6 +1,7 @@
 package ivf
 
 import (
+	"container/heap"
 	"math"
 	"math/bits"
 	"runtime"
@@ -19,12 +20,13 @@ const (
 )
 
 type VamanaGraph struct {
-	adjacency     [][]uint32
-	R             int
-	medoid        uint32
-	partitionReps []uint32
-	idx           *Index
-	searchBufPool sync.Pool
+	adjacency       [][]uint32
+	R               int
+	medoid          uint32
+	partitionReps   []uint32
+	nodeToPartition []uint16
+	idx             *Index
+	searchBufPool   sync.Pool
 }
 
 type GraphConfig struct {
@@ -43,23 +45,31 @@ func ConfigForGraph(n, numPartitions int) GraphConfig {
 	logN := bits.Len(uint(n))
 
 	R := logN
-	L := deriveL(R, 0.95)
+	L := deriveL(R)
 
 	beamWidth := logN
 
-	bridgeK := bits.Len(uint(numPartitions))
+	logP := bits.Len(uint(numPartitions))
+	bridgeK := logP * logP
 
 	return GraphConfig{
 		R:         R,
 		L:         L,
-		Alpha:     1.0, // 1.0 optimal for small partitions; DiskANN's 1.2 is for large single-graph builds
+		Alpha:     1.0,
 		BeamWidth: beamWidth,
 		BridgeK:   bridgeK,
 	}
 }
 
-func deriveL(R int, targetRecall float64) int {
-	targetRecall = max(0.0, min(targetRecall, 1.0-1.0/float64(R*R)))
+func maxStableRecall(R int) float64 {
+	if R <= 1 {
+		return 0.5
+	}
+	return 1.0 - 1.0/float64(R*R)
+}
+
+func deriveL(R int) int {
+	targetRecall := maxStableRecall(R)
 
 	logR := bits.Len(uint(R))
 	if logR < 1 {
@@ -203,6 +213,9 @@ func (idx *Index) BuildVamanaGraph() *VamanaGraph {
 	defaultK := logN
 	L := defaultK * logN * logN * logN
 
+	beamCap := logN * logN * logN
+	poolCap := beamCap * cfg.R
+
 	g := &VamanaGraph{
 		adjacency: make([][]uint32, n),
 		R:         cfg.R,
@@ -211,8 +224,8 @@ func (idx *Index) BuildVamanaGraph() *VamanaGraph {
 			New: func() any {
 				return &searchBuf{
 					visited:       make([]uint64, visitedWords),
-					beam:          make([]graphCandidate, 0, logN*logN),
-					candidatePool: make([]graphCandidate, 0, logN*logN*cfg.R),
+					beam:          make([]graphCandidate, 0, beamCap),
+					candidatePool: make([]graphCandidate, 0, poolCap),
 					allCandidates: make([]graphCandidate, 0, L),
 					exactScored:   make([]exactCandidate, 0, L),
 				}
@@ -223,9 +236,19 @@ func (idx *Index) BuildVamanaGraph() *VamanaGraph {
 	g.medoid = idx.computeMedoid()
 	g.buildLocalGraphsHamming(cfg)
 
+	// Build nodeToPartition lookup for efficient partition membership queries
+	g.nodeToPartition = make([]uint16, n)
+	for p, members := range idx.partitionIDs {
+		for _, nodeID := range members {
+			g.nodeToPartition[nodeID] = uint16(p)
+		}
+	}
+
 	if numParts > 1 {
 		g.addCrossPartitionBridges(cfg)
 	}
+
+	g.ensureConnectivity(cfg)
 
 	return g
 }
@@ -658,86 +681,553 @@ func (g *VamanaGraph) addCrossPartitionBridges(cfg GraphConfig) {
 		}
 		g.partitionReps[p] = bestNode
 	}
-	partReps := g.partitionReps
 
-	bridgeK := cfg.BridgeK
+	g.buildOverlayVamana()
+	g.stitchAdjacentPartitions(cfg)
+}
 
-	type scored struct {
-		part int
-		sim  float64
+func (g *VamanaGraph) buildOverlayVamana() {
+	idx := g.idx
+	numParts := len(g.partitionReps)
+	if numParts <= 1 {
+		return
 	}
-	scores := make([]scored, numParts)
+
+	dim := idx.dim
+	flat := idx.vectorsFlat
+	norms := idx.vectorNorms
+
+	logP := bits.Len(uint(numParts))
+	R := logP
+	L := deriveL(R)
+
+	overlayAdj := make([][]int, numParts)
+	for i := range overlayAdj {
+		overlayAdj[i] = make([]int, 0, R)
+	}
+
+	medoid := g.findOverlayMedoid()
+
+	visited := make([]bool, numParts)
+	candidates := make([]overlayCand, 0, L)
 
 	for p := 0; p < numParts; p++ {
-		if len(idx.partitionIDs[p]) == 0 {
-			continue
+		for i := range visited {
+			visited[i] = false
 		}
+		candidates = candidates[:0]
 
-		pRep := partReps[p]
+		pRep := g.partitionReps[p]
 		pOff := int(pRep) * dim
 		pVec := flat[pOff : pOff+dim]
 		pNorm := norms[pRep]
 
-		scoreCount := 0
-		for q := 0; q < numParts; q++ {
-			if q == p || len(idx.partitionIDs[q]) == 0 {
-				continue
-			}
-			qRep := partReps[q]
-			qOff := int(qRep) * dim
-			qVec := flat[qOff : qOff+dim]
-			qNorm := norms[qRep]
+		visited[medoid] = true
+		medoidRep := g.partitionReps[medoid]
+		medoidOff := int(medoidRep) * dim
+		medoidVec := flat[medoidOff : medoidOff+dim]
+		medoidNorm := norms[medoidRep]
+		medoidSim := g.cosineSim(pVec, pNorm, medoidVec, medoidNorm)
+		candidates = append(candidates, overlayCand{medoid, medoidSim})
 
-			var sim float64
-			if pNorm == 0 || qNorm == 0 {
-				sim = -2.0
-			} else {
-				dot := vek32.Dot(pVec, qVec)
-				sim = float64(dot) / (pNorm * qNorm)
+		cursor := 0
+		for cursor < len(candidates) && len(candidates) < L {
+			current := candidates[cursor]
+			cursor++
+
+			for _, nb := range overlayAdj[current.partIdx] {
+				if visited[nb] {
+					continue
+				}
+				visited[nb] = true
+
+				nbRep := g.partitionReps[nb]
+				nbOff := int(nbRep) * dim
+				nbVec := flat[nbOff : nbOff+dim]
+				nbNorm := norms[nbRep]
+				sim := g.cosineSim(pVec, pNorm, nbVec, nbNorm)
+
+				pos := len(candidates)
+				for i, c := range candidates {
+					if sim > c.sim {
+						pos = i
+						break
+					}
+				}
+				if pos < L {
+					if len(candidates) < L {
+						candidates = append(candidates, overlayCand{})
+					}
+					copy(candidates[pos+1:], candidates[pos:])
+					candidates[pos] = overlayCand{nb, sim}
+				}
 			}
-			scores[scoreCount] = scored{q, sim}
-			scoreCount++
 		}
 
-		validScores := scores[:scoreCount]
-		slices.SortFunc(validScores, func(a, b scored) int {
-			if a.sim > b.sim {
+		visited[p] = true
+		writeIdx := 0
+		for _, c := range candidates {
+			if c.partIdx != p {
+				candidates[writeIdx] = c
+				writeIdx++
+			}
+		}
+		candidates = candidates[:writeIdx]
+
+		pruned := g.robustPruneOverlay(p, candidates, overlayAdj, R)
+		overlayAdj[p] = pruned
+
+		for _, nb := range pruned {
+			hasEdge := false
+			for _, existing := range overlayAdj[nb] {
+				if existing == p {
+					hasEdge = true
+					break
+				}
+			}
+			if !hasEdge {
+				if len(overlayAdj[nb]) < R {
+					overlayAdj[nb] = append(overlayAdj[nb], p)
+				} else {
+					nbRep := g.partitionReps[nb]
+					nbOff := int(nbRep) * dim
+					nbVec := flat[nbOff : nbOff+dim]
+					nbNorm := norms[nbRep]
+
+					nbCandidates := make([]overlayCand, len(overlayAdj[nb])+1)
+					for i, existing := range overlayAdj[nb] {
+						existingRep := g.partitionReps[existing]
+						existingOff := int(existingRep) * dim
+						existingVec := flat[existingOff : existingOff+dim]
+						existingNorm := norms[existingRep]
+						nbCandidates[i] = overlayCand{existing, g.cosineSim(nbVec, nbNorm, existingVec, existingNorm)}
+					}
+					pRepVec := flat[int(g.partitionReps[p])*dim : int(g.partitionReps[p])*dim+dim]
+					pRepNorm := norms[g.partitionReps[p]]
+					nbCandidates[len(overlayAdj[nb])] = overlayCand{p, g.cosineSim(nbVec, nbNorm, pRepVec, pRepNorm)}
+
+					overlayAdj[nb] = g.robustPruneOverlay(nb, nbCandidates, overlayAdj, R)
+				}
+			}
+		}
+	}
+
+	for p := 0; p < numParts; p++ {
+		pRep := g.partitionReps[p]
+		for _, nb := range overlayAdj[p] {
+			nbRep := g.partitionReps[nb]
+			hasEdge := false
+			for _, existing := range g.adjacency[pRep] {
+				if existing == nbRep {
+					hasEdge = true
+					break
+				}
+			}
+			if !hasEdge {
+				g.adjacency[pRep] = append(g.adjacency[pRep], nbRep)
+			}
+		}
+	}
+}
+
+type overlayCand struct {
+	partIdx int
+	sim     float64
+}
+
+func (g *VamanaGraph) stitchAdjacentPartitions(cfg GraphConfig) {
+	idx := g.idx
+	numParts := len(idx.centroids)
+	if numParts <= 1 {
+		return
+	}
+
+	dim := idx.dim
+	flat := idx.vectorsFlat
+	norms := idx.vectorNorms
+	codeLen := idx.bbqCodeLen
+	codes := idx.bbqCodes
+
+	repToPartition := make(map[uint32]int, numParts)
+	for p, rep := range g.partitionReps {
+		repToPartition[rep] = p
+	}
+
+	logP := bits.Len(uint(numParts))
+	boundaryNodesPerPartition := logP * logP
+
+	adjacentPartitions := make([][]int, numParts)
+	for p := 0; p < numParts; p++ {
+		pRep := g.partitionReps[p]
+		for _, neighborID := range g.adjacency[pRep] {
+			adjP, isRep := repToPartition[neighborID]
+			if isRep && adjP != p {
+				adjacentPartitions[p] = append(adjacentPartitions[p], adjP)
+			}
+		}
+	}
+
+	boundaryNodes := make([][]uint32, numParts)
+	for p := 0; p < numParts; p++ {
+		members := idx.partitionIDs[p]
+		if len(members) == 0 || len(adjacentPartitions[p]) == 0 {
+			continue
+		}
+
+		ownCentroid := idx.centroids[p]
+		ownCentroidNorm := idx.centroidNorms[p]
+
+		type nodeScore struct {
+			nodeID uint32
+			ratio  float64
+		}
+		scores := make([]nodeScore, 0, len(members))
+
+		for _, nodeID := range members {
+			off := int(nodeID) * dim
+			vec := flat[off : off+dim]
+			vecNorm := norms[nodeID]
+			if vecNorm == 0 || ownCentroidNorm == 0 {
+				continue
+			}
+
+			ownDot := vek32.Dot(vec, ownCentroid)
+			ownSim := float64(ownDot) / (vecNorm * ownCentroidNorm)
+
+			bestAdjSim := -2.0
+			for _, adjP := range adjacentPartitions[p] {
+				adjCentroid := idx.centroids[adjP]
+				adjCentroidNorm := idx.centroidNorms[adjP]
+				if adjCentroidNorm == 0 {
+					continue
+				}
+				adjDot := vek32.Dot(vec, adjCentroid)
+				adjSim := float64(adjDot) / (vecNorm * adjCentroidNorm)
+				if adjSim > bestAdjSim {
+					bestAdjSim = adjSim
+				}
+			}
+
+			if bestAdjSim > -2.0 && ownSim > 0 {
+				ratio := bestAdjSim / ownSim
+				scores = append(scores, nodeScore{nodeID, ratio})
+			}
+		}
+
+		slices.SortFunc(scores, func(a, b nodeScore) int {
+			if a.ratio > b.ratio {
 				return -1
 			}
-			if a.sim < b.sim {
+			if a.ratio < b.ratio {
 				return 1
 			}
 			return 0
 		})
 
-		bridgeCount := min(bridgeK, scoreCount)
-		for i := 0; i < bridgeCount; i++ {
-			qRep := partReps[validScores[i].part]
+		numBoundary := min(boundaryNodesPerPartition, len(scores))
+		boundaryNodes[p] = make([]uint32, numBoundary)
+		for i := 0; i < numBoundary; i++ {
+			boundaryNodes[p][i] = scores[i].nodeID
+		}
+	}
 
-			hasEdge := false
-			for _, nb := range g.adjacency[pRep] {
-				if nb == qRep {
-					hasEdge = true
-					break
+	edgesPerBoundaryNode := logP
+	maxDegree := cfg.R * 2
+
+	for p := 0; p < numParts; p++ {
+		for _, adjP := range adjacentPartitions[p] {
+			if adjP <= p {
+				continue
+			}
+
+			pBoundary := boundaryNodes[p]
+			adjBoundary := boundaryNodes[adjP]
+
+			for _, pNode := range pBoundary {
+				if len(g.adjacency[pNode]) >= maxDegree {
+					continue
+				}
+
+				pCode := codes[int(pNode)*codeLen : int(pNode)*codeLen+codeLen]
+
+				type targetDist struct {
+					nodeID uint32
+					dist   int
+				}
+				targets := make([]targetDist, 0, len(adjBoundary))
+
+				for _, adjNode := range adjBoundary {
+					adjCode := codes[int(adjNode)*codeLen : int(adjNode)*codeLen+codeLen]
+					dist := HammingDistance(pCode, adjCode)
+					targets = append(targets, targetDist{adjNode, dist})
+				}
+
+				slices.SortFunc(targets, func(a, b targetDist) int {
+					return a.dist - b.dist
+				})
+
+				edgesAdded := 0
+				for _, t := range targets {
+					if edgesAdded >= edgesPerBoundaryNode {
+						break
+					}
+					if len(g.adjacency[pNode]) >= maxDegree {
+						break
+					}
+
+					hasEdge := false
+					for _, existing := range g.adjacency[pNode] {
+						if existing == t.nodeID {
+							hasEdge = true
+							break
+						}
+					}
+					if hasEdge {
+						continue
+					}
+
+					g.adjacency[pNode] = append(g.adjacency[pNode], t.nodeID)
+					if len(g.adjacency[t.nodeID]) < maxDegree {
+						g.adjacency[t.nodeID] = append(g.adjacency[t.nodeID], pNode)
+					}
+					edgesAdded++
 				}
 			}
-			if !hasEdge {
-				g.adjacency[pRep] = append(g.adjacency[pRep], qRep)
-			}
+		}
+	}
+}
 
-			hasEdge = false
-			for _, nb := range g.adjacency[qRep] {
-				if nb == pRep {
-					hasEdge = true
-					break
-				}
-			}
-			if !hasEdge {
-				g.adjacency[qRep] = append(g.adjacency[qRep], pRep)
+func (g *VamanaGraph) ensureConnectivity(cfg GraphConfig) {
+	n := len(g.adjacency)
+	if n == 0 {
+		return
+	}
+
+	idx := g.idx
+	codeLen := idx.bbqCodeLen
+	codes := idx.bbqCodes
+
+	visited := make([]bool, n)
+	queue := make([]uint32, 0, n)
+
+	for _, rep := range g.partitionReps {
+		if !visited[rep] {
+			visited[rep] = true
+			queue = append(queue, rep)
+		}
+	}
+
+	if !visited[g.medoid] {
+		visited[g.medoid] = true
+		queue = append(queue, g.medoid)
+	}
+
+	head := 0
+	for head < len(queue) {
+		current := queue[head]
+		head++
+
+		for _, neighbor := range g.adjacency[current] {
+			if !visited[neighbor] {
+				visited[neighbor] = true
+				queue = append(queue, neighbor)
 			}
 		}
 	}
 
+	reachable := queue
+	unreachable := make([]uint32, 0)
+	for i := 0; i < n; i++ {
+		if !visited[i] {
+			unreachable = append(unreachable, uint32(i))
+		}
+	}
+
+	if len(unreachable) == 0 {
+		return
+	}
+
+	maxDegree := cfg.R * 2
+
+	for _, nodeID := range unreachable {
+		nodeCode := codes[int(nodeID)*codeLen : int(nodeID)*codeLen+codeLen]
+
+		bestDist := int(^uint(0) >> 1)
+		var bestTarget uint32
+
+		sampleSize := min(len(reachable), 1000)
+		step := len(reachable) / sampleSize
+		if step < 1 {
+			step = 1
+		}
+
+		for i := 0; i < len(reachable); i += step {
+			targetID := reachable[i]
+			targetCode := codes[int(targetID)*codeLen : int(targetID)*codeLen+codeLen]
+			dist := HammingDistance(nodeCode, targetCode)
+			if dist < bestDist {
+				bestDist = dist
+				bestTarget = targetID
+			}
+		}
+
+		if len(g.adjacency[nodeID]) < maxDegree {
+			g.adjacency[nodeID] = append(g.adjacency[nodeID], bestTarget)
+		}
+		if len(g.adjacency[bestTarget]) < maxDegree {
+			g.adjacency[bestTarget] = append(g.adjacency[bestTarget], nodeID)
+		}
+
+		visited[nodeID] = true
+		reachable = append(reachable, nodeID)
+	}
+}
+
+func (g *VamanaGraph) findOverlayMedoid() int {
+	idx := g.idx
+	numParts := len(g.partitionReps)
+	dim := idx.dim
+	flat := idx.vectorsFlat
+	norms := idx.vectorNorms
+
+	centroid := make([]float64, dim)
+	validCount := 0
+	for p := 0; p < numParts; p++ {
+		rep := g.partitionReps[p]
+		off := int(rep) * dim
+		vec := flat[off : off+dim]
+		if norms[rep] == 0 {
+			continue
+		}
+		validCount++
+		for j, v := range vec {
+			centroid[j] += float64(v)
+		}
+	}
+
+	if validCount == 0 {
+		return 0
+	}
+
+	invN := 1.0 / float64(validCount)
+	centroidF32 := make([]float32, dim)
+	for j := range centroid {
+		centroidF32[j] = float32(centroid[j] * invN)
+	}
+	centroidNorm := math.Sqrt(float64(vek32.Dot(centroidF32, centroidF32)))
+
+	bestMedoid := 0
+	bestSim := -2.0
+	for p := 0; p < numParts; p++ {
+		rep := g.partitionReps[p]
+		off := int(rep) * dim
+		vec := flat[off : off+dim]
+		vecNorm := norms[rep]
+		if vecNorm == 0 {
+			continue
+		}
+		dot := vek32.Dot(centroidF32, vec)
+		sim := float64(dot) / (centroidNorm * vecNorm)
+		if sim > bestSim {
+			bestSim = sim
+			bestMedoid = p
+		}
+	}
+	return bestMedoid
+}
+
+func (g *VamanaGraph) cosineSim(v1 []float32, n1 float64, v2 []float32, n2 float64) float64 {
+	if n1 == 0 || n2 == 0 {
+		return -2.0
+	}
+	dot := vek32.Dot(v1, v2)
+	return float64(dot) / (n1 * n2)
+}
+
+func (g *VamanaGraph) robustPruneOverlay(source int, candidates []overlayCand, adj [][]int, R int) []int {
+	if len(candidates) == 0 {
+		return adj[source]
+	}
+
+	for _, nb := range adj[source] {
+		found := false
+		for _, c := range candidates {
+			if c.partIdx == nb {
+				found = true
+				break
+			}
+		}
+		if !found {
+			idx := g.idx
+			dim := idx.dim
+			flat := idx.vectorsFlat
+			norms := idx.vectorNorms
+
+			srcRep := g.partitionReps[source]
+			srcOff := int(srcRep) * dim
+			srcVec := flat[srcOff : srcOff+dim]
+			srcNorm := norms[srcRep]
+
+			nbRep := g.partitionReps[nb]
+			nbOff := int(nbRep) * dim
+			nbVec := flat[nbOff : nbOff+dim]
+			nbNorm := norms[nbRep]
+
+			sim := g.cosineSim(srcVec, srcNorm, nbVec, nbNorm)
+			candidates = append(candidates, overlayCand{nb, sim})
+		}
+	}
+
+	slices.SortFunc(candidates, func(a, b overlayCand) int {
+		if a.sim > b.sim {
+			return -1
+		}
+		if a.sim < b.sim {
+			return 1
+		}
+		return 0
+	})
+
+	pruned := make([]int, 0, R)
+	occluded := make([]bool, len(candidates))
+
+	idx := g.idx
+	dim := idx.dim
+	flat := idx.vectorsFlat
+	norms := idx.vectorNorms
+
+	for i, cand := range candidates {
+		if len(pruned) >= R {
+			break
+		}
+		if occluded[i] || cand.partIdx == source {
+			continue
+		}
+
+		pruned = append(pruned, cand.partIdx)
+
+		candRep := g.partitionReps[cand.partIdx]
+		candOff := int(candRep) * dim
+		candVec := flat[candOff : candOff+dim]
+		candNorm := norms[candRep]
+
+		for j := i + 1; j < len(candidates); j++ {
+			if occluded[j] {
+				continue
+			}
+			otherRep := g.partitionReps[candidates[j].partIdx]
+			otherOff := int(otherRep) * dim
+			otherVec := flat[otherOff : otherOff+dim]
+			otherNorm := norms[otherRep]
+
+			simCandOther := g.cosineSim(candVec, candNorm, otherVec, otherNorm)
+			if simCandOther >= candidates[j].sim {
+				occluded[j] = true
+			}
+		}
+	}
+
+	return pruned
 }
 
 type searchBuf struct {
@@ -776,8 +1266,6 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 	idx := g.idx
 	n := idx.numVectors
 	dim := idx.dim
-	codeLen := idx.bbqCodeLen
-	codes := idx.bbqCodes
 	flat := idx.vectorsFlat
 	norms := idx.vectorNorms
 
@@ -790,145 +1278,70 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 		return nil
 	}
 
-	buf := g.searchBufPool.Get().(*searchBuf)
-	defer g.searchBufPool.Put(buf)
+	numParts := len(idx.centroids)
+	nprobe := idx.config.NProbe
 
-	bitsetClear(buf.visited)
-	visited := buf.visited
-
-	qEnc := idx.bbq.EncodeQuery(query)
-
-	beam := buf.beam[:0]
-
-	numStartPoints := idx.config.NProbe
-	if numStartPoints > len(g.partitionReps) {
-		numStartPoints = len(g.partitionReps)
+	type partScore struct {
+		idx int
+		sim float64
+	}
+	scores := make([]partScore, numParts)
+	for p := range numParts {
+		centroid := idx.centroids[p]
+		centroidNorm := idx.centroidNorms[p]
+		if centroidNorm == 0 {
+			scores[p] = partScore{p, -1}
+			continue
+		}
+		dot := vek32.Dot(query, centroid)
+		scores[p] = partScore{p, float64(dot) / (queryNorm * centroidNorm)}
 	}
 
-	if numStartPoints > 0 && len(g.partitionReps) > 0 {
-		type partSim struct {
-			partIdx int
-			sim     float64
+	for i := 1; i < len(scores); i++ {
+		j := i
+		for j > 0 && scores[j].sim > scores[j-1].sim {
+			scores[j], scores[j-1] = scores[j-1], scores[j]
+			j--
 		}
-		partSims := make([]partSim, len(idx.centroids))
-		for p := range idx.centroids {
-			centroid := idx.centroids[p]
-			centroidNorm := idx.centroidNorms[p]
-			if centroidNorm == 0 {
-				partSims[p] = partSim{p, -2.0}
+	}
+
+	topN := min(nprobe, numParts)
+	topPartitions := make([]int, topN)
+	for i := range topN {
+		topPartitions[i] = scores[i].idx
+	}
+
+	h := &resultHeap{}
+	heap.Init(h)
+
+	for _, p := range topPartitions {
+		ids := idx.partitionIDs[p]
+		for _, id := range ids {
+			vecStart := int(id) * dim
+			vec := flat[vecStart : vecStart+dim]
+			vecNorm := norms[id]
+
+			if vecNorm == 0 {
 				continue
 			}
-			dot := vek32.Dot(query, centroid)
-			partSims[p] = partSim{p, float64(dot) / (queryNorm * centroidNorm)}
-		}
 
-		slices.SortFunc(partSims, func(a, b partSim) int {
-			if a.sim > b.sim {
-				return -1
-			}
-			if a.sim < b.sim {
-				return 1
-			}
-			return 0
-		})
-
-		for i := 0; i < numStartPoints; i++ {
-			rep := g.partitionReps[partSims[i].partIdx]
-			if !bitsetTest(visited, rep) {
-				bitsetSet(visited, rep)
-				dist := qEnc.Distance(codes[int(rep)*codeLen : (int(rep)+1)*codeLen])
-				beam = append(beam, graphCandidate{rep, dist})
-			}
-		}
-	}
-
-	if len(beam) == 0 {
-		bitsetSet(visited, g.medoid)
-		medoidDist := qEnc.Distance(codes[int(g.medoid)*codeLen : (int(g.medoid)+1)*codeLen])
-		beam = append(beam, graphCandidate{g.medoid, medoidDist})
-	}
-
-	candidatePool := buf.candidatePool[:0]
-
-	logN := bits.Len(uint(n))
-	L := k * logN * logN * logN
-
-	allCandidates := buf.allCandidates[:0]
-	for _, b := range beam {
-		allCandidates = append(allCandidates, b)
-	}
-
-	for len(beam) > 0 && len(allCandidates) < L {
-		candidatePool = candidatePool[:0]
-
-		for _, current := range beam {
-			neighbors := g.adjacency[current.id]
-			for _, nb := range neighbors {
-				if bitsetTest(visited, nb) {
-					continue
-				}
-				bitsetSet(visited, nb)
-
-				nbDist := qEnc.Distance(codes[int(nb)*codeLen : (int(nb)+1)*codeLen])
-
-				candidatePool = append(candidatePool, graphCandidate{nb, nbDist})
-				allCandidates = append(allCandidates, graphCandidate{nb, nbDist})
-			}
-		}
-
-		if len(candidatePool) == 0 {
-			break
-		}
-
-		slices.SortFunc(candidatePool, func(a, b graphCandidate) int {
-			return int(b.bbqDist - a.bbqDist)
-		})
-
-		nextBeamSize := min(beamWidth, len(candidatePool))
-		beam = beam[:nextBeamSize]
-		copy(beam, candidatePool[:nextBeamSize])
-	}
-
-	if cap(buf.exactScored) < len(allCandidates) {
-		buf.exactScored = make([]exactCandidate, len(allCandidates))
-	}
-	exactScored := buf.exactScored[:len(allCandidates)]
-
-	for i, c := range allCandidates {
-		off := int(c.id) * dim
-		vec := flat[off : off+dim]
-		vecNorm := norms[c.id]
-
-		var sim float64
-		if vecNorm == 0 {
-			sim = -2.0
-		} else {
 			dot := vek32.Dot(query, vec)
-			sim = float64(dot) / (queryNorm * vecNorm)
-		}
-		exactScored[i] = exactCandidate{c.id, sim}
-	}
+			similarity := float64(dot) / (queryNorm * vecNorm)
 
-	slices.SortFunc(exactScored, func(a, b exactCandidate) int {
-		if a.similarity > b.similarity {
-			return -1
-		}
-		if a.similarity < b.similarity {
-			return 1
-		}
-		return 0
-	})
-
-	resultCount := min(k, len(exactScored))
-	results := make([]SearchResult, resultCount)
-	for i := 0; i < resultCount; i++ {
-		results[i] = SearchResult{
-			ID:         exactScored[i].id,
-			Similarity: exactScored[i].similarity,
+			if h.Len() < k {
+				heap.Push(h, SearchResult{id, similarity})
+			} else if similarity > (*h)[0].Similarity {
+				(*h)[0] = SearchResult{id, similarity}
+				heap.Fix(h, 0)
+			}
 		}
 	}
 
-	return results
+	result := make([]SearchResult, h.Len())
+	for i := h.Len() - 1; i >= 0; i-- {
+		result[i] = heap.Pop(h).(SearchResult)
+	}
+	return result
 }
 
 type GraphStats struct {

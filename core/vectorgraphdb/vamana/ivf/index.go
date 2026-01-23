@@ -827,8 +827,7 @@ func (idx *Index) SearchVamana(query []float32, k int) []SearchResult {
 	if idx.graph == nil {
 		return idx.SearchIVF(query, k)
 	}
-	logN := bits.Len(uint(idx.numVectors))
-	beamWidth := logN * logN
+	beamWidth := idx.config.NProbe
 	return idx.graph.BeamSearchBBQ(query, k, beamWidth)
 }
 
