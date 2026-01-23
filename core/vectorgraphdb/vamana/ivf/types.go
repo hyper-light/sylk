@@ -18,21 +18,18 @@ func ConfigForN(n, dim int) Config {
 	}
 
 	logN := bits.Len(uint(n))
-	partitionBits := (logN + 1) / 2
-	numPartitions := 1 << partitionBits
-
-	nprobe := numPartitions
-
 	logDim := bits.Len(uint(dim))
+
+	numPartitions := 1 << (logN / 2)
+
+	nprobe := logN * logN
+
 	quantBits := bits.Len(uint(logDim))
 	if quantBits < 1 {
 		quantBits = 1
 	}
 
-	// Oversample: compensate for quantization ranking errors
-	// With q-bit quantization, max rank displacement ~ 2^q
-	// oversample = 2^quantBits ensures we capture displaced true neighbors
-	oversample := 1 << quantBits
+	oversample := logN
 
 	return Config{
 		NumPartitions: numPartitions,

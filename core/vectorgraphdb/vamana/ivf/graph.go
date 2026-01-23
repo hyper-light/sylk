@@ -199,18 +199,20 @@ func (idx *Index) BuildVamanaGraph() *VamanaGraph {
 	cfg := ConfigForGraph(n, numParts)
 	visitedWords := (n + bitsPerWordMask) / bitsPerWord
 
+	logN := bits.Len(uint(n))
+	defaultK := logN
+	L := defaultK * logN * logN * logN
+
 	g := &VamanaGraph{
 		adjacency: make([][]uint32, n),
 		R:         cfg.R,
 		idx:       idx,
 		searchBufPool: sync.Pool{
 			New: func() any {
-				logN := bits.Len(uint(n))
-				L := cfg.BeamWidth * logN
 				return &searchBuf{
 					visited:       make([]uint64, visitedWords),
-					beam:          make([]graphCandidate, 0, cfg.BeamWidth*2),
-					candidatePool: make([]graphCandidate, 0, cfg.BeamWidth*cfg.R),
+					beam:          make([]graphCandidate, 0, logN*logN),
+					candidatePool: make([]graphCandidate, 0, logN*logN*cfg.R),
 					allCandidates: make([]graphCandidate, 0, L),
 					exactScored:   make([]exactCandidate, 0, L),
 				}
@@ -735,6 +737,7 @@ func (g *VamanaGraph) addCrossPartitionBridges(cfg GraphConfig) {
 			}
 		}
 	}
+
 }
 
 type searchBuf struct {
@@ -848,7 +851,7 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 	candidatePool := buf.candidatePool[:0]
 
 	logN := bits.Len(uint(n))
-	L := k * numStartPoints * logN
+	L := k * logN * logN * logN
 
 	allCandidates := buf.allCandidates[:0]
 	for _, b := range beam {

@@ -6,7 +6,6 @@ import (
 	"math/bits"
 	"math/rand/v2"
 	"runtime"
-	"slices"
 	"sync"
 	"time"
 
@@ -825,77 +824,12 @@ func (idx *Index) SearchIVF(query []float32, k int) []SearchResult {
 }
 
 func (idx *Index) SearchVamana(query []float32, k int) []SearchResult {
-	if idx.numVectors == 0 || k <= 0 {
-		return nil
+	if idx.graph == nil {
+		return idx.SearchIVF(query, k)
 	}
-
-	queryNorm := math.Sqrt(float64(vek32.Dot(query, query)))
-	if queryNorm == 0 {
-		return nil
-	}
-
-	topPartitions := idx.findTopPartitions(query, queryNorm)
-
-	qEnc := idx.bbq.EncodeQuery(query)
-	codeLen := idx.bbqCodeLen
-	codes := idx.bbqCodes
-
-	type bbqCandidate struct {
-		id   uint32
-		dist int32
-	}
-
-	var candidates []bbqCandidate
-	for _, p := range topPartitions {
-		for _, id := range idx.partitionIDs[p] {
-			dist := qEnc.Distance(codes[int(id)*codeLen : (int(id)+1)*codeLen])
-			candidates = append(candidates, bbqCandidate{id, dist})
-		}
-	}
-
 	logN := bits.Len(uint(idx.numVectors))
-	rerankCount := k * logN * logN
-	if rerankCount > len(candidates) {
-		rerankCount = len(candidates)
-	}
-
-	slices.SortFunc(candidates, func(a, b bbqCandidate) int {
-		return int(b.dist - a.dist)
-	})
-	candidates = candidates[:rerankCount]
-
-	dim := idx.dim
-	flat := idx.vectorsFlat
-	norms := idx.vectorNorms
-
-	h := &resultHeap{}
-	heap.Init(h)
-
-	for _, c := range candidates {
-		vecStart := int(c.id) * dim
-		vec := flat[vecStart : vecStart+dim]
-		vecNorm := norms[c.id]
-
-		if vecNorm == 0 {
-			continue
-		}
-
-		dot := vek32.Dot(query, vec)
-		similarity := float64(dot) / (queryNorm * vecNorm)
-
-		if h.Len() < k {
-			heap.Push(h, SearchResult{c.id, similarity})
-		} else if similarity > (*h)[0].Similarity {
-			(*h)[0] = SearchResult{c.id, similarity}
-			heap.Fix(h, 0)
-		}
-	}
-
-	result := make([]SearchResult, h.Len())
-	for i := h.Len() - 1; i >= 0; i-- {
-		result[i] = heap.Pop(h).(SearchResult)
-	}
-	return result
+	beamWidth := logN * logN
+	return idx.graph.BeamSearchBBQ(query, k, beamWidth)
 }
 
 func (idx *Index) findTopPartitions(query []float32, queryNorm float64) []int {
