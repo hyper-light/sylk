@@ -464,7 +464,7 @@ func (fc *FlashCoder) RobustPruneFlash(
 	mags := flashMags.mags
 
 	pTables := make([][]float32, numSubspaces)
-	for m := 0; m < numSubspaces; m++ {
+	for m := range numSubspaces {
 		base := int(pCode[m]) * numCentroids
 		pTables[m] = sdt[m][base : base+numCentroids]
 	}
@@ -483,15 +483,15 @@ func (fc *FlashCoder) RobustPruneFlash(
 		dots[i] = 0
 	}
 
-	for m := 0; m < numSubspaces; m++ {
+	for m := range numSubspaces {
 		pTable := pTables[m]
-		for i := 0; i < n; i++ {
+		for i := range n {
 			gathered[i] = pTable[candCodes[i*numSubspaces+m]]
 		}
 		vek32.Add_Inplace(dots, gathered)
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		cMag := candMags[i]
 		var dist float64
 		if pMag == 0 || cMag == 0 {
