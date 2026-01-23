@@ -130,45 +130,8 @@ func main() {
 	fmt.Printf("\nPhase 5: Search benchmark (n=%d, queries=%d, K=%d, stride=%d)...\n",
 		n, numQueries, K, stride)
 
-	var totalLatency time.Duration
-	var totalRecall float64
-
-	for i := range numQueries {
-		queryIdx := (i * stride) % n
-		queryVec := embeddings[queryIdx]
-
-		start := time.Now()
-		results := idx.Search(queryVec, K)
-		totalLatency += time.Since(start)
-
-		groundTruth := bruteForceTopK(queryVec, embeddings, K)
-		recall := computeRecall(results, groundTruth)
-		totalRecall += recall
-
-	}
-	avgLatency := totalLatency / time.Duration(numQueries)
-	avgRecall := totalRecall / float64(numQueries)
-	fmt.Printf("  [Exact] Avg latency: %v, recall@%d: %.2f%%\n", avgLatency, K, avgRecall*100)
-
-	var bbqTotalLatency time.Duration
-	var bbqTotalRecall float64
-
-	for i := range numQueries {
-		queryIdx := (i * stride) % n
-		queryVec := embeddings[queryIdx]
-
-		start := time.Now()
-		results := idx.SearchBBQ(queryVec, K)
-		bbqTotalLatency += time.Since(start)
-
-		groundTruth := bruteForceTopK(queryVec, embeddings, K)
-		recall := computeRecall(results, groundTruth)
-		bbqTotalRecall += recall
-	}
-	bbqAvgLatency := bbqTotalLatency / time.Duration(numQueries)
-	bbqAvgRecall := bbqTotalRecall / float64(numQueries)
-	fmt.Printf("  [BBQ]   Avg latency: %v, recall@%d: %.2f%%\n", bbqAvgLatency, K, bbqAvgRecall*100)
-
+	var vamanaTotalLatency time.Duration
+	var vamanaTotalRecall float64
 	var ivfTotalLatency time.Duration
 	var ivfTotalRecall float64
 
@@ -176,36 +139,25 @@ func main() {
 		queryIdx := (i * stride) % n
 		queryVec := embeddings[queryIdx]
 
-		start := time.Now()
-		results := idx.SearchIVF(queryVec, K)
-		ivfTotalLatency += time.Since(start)
-
 		groundTruth := bruteForceTopK(queryVec, embeddings, K)
-		recall := computeRecall(results, groundTruth)
-		ivfTotalRecall += recall
-	}
-	ivfAvgLatency := ivfTotalLatency / time.Duration(numQueries)
-	ivfAvgRecall := ivfTotalRecall / float64(numQueries)
-	fmt.Printf("  [IVF]   Avg latency: %v, recall@%d: %.2f%%\n", ivfAvgLatency, K, ivfAvgRecall*100)
-
-	var vamanaTotalLatency time.Duration
-	var vamanaTotalRecall float64
-
-	for i := range numQueries {
-		queryIdx := (i * stride) % n
-		queryVec := embeddings[queryIdx]
 
 		start := time.Now()
 		results := idx.SearchVamana(queryVec, K)
 		vamanaTotalLatency += time.Since(start)
+		vamanaTotalRecall += computeRecall(results, groundTruth)
 
-		groundTruth := bruteForceTopK(queryVec, embeddings, K)
-		recall := computeRecall(results, groundTruth)
-		vamanaTotalRecall += recall
+		start = time.Now()
+		ivfResults := idx.SearchIVF(queryVec, K)
+		ivfTotalLatency += time.Since(start)
+		ivfTotalRecall += computeRecall(ivfResults, groundTruth)
 	}
 	vamanaAvgLatency := vamanaTotalLatency / time.Duration(numQueries)
 	vamanaAvgRecall := vamanaTotalRecall / float64(numQueries)
 	fmt.Printf("  [Vamana] Avg latency: %v, recall@%d: %.2f%%\n", vamanaAvgLatency, K, vamanaAvgRecall*100)
+
+	ivfAvgLatency := ivfTotalLatency / time.Duration(numQueries)
+	ivfAvgRecall := ivfTotalRecall / float64(numQueries)
+	fmt.Printf("  [IVF]    Avg latency: %v, recall@%d: %.2f%%\n", ivfAvgLatency, K, ivfAvgRecall*100)
 
 	totalTime := time.Since(totalStart)
 	fmt.Printf("\n=== Summary ===\n")
@@ -213,8 +165,8 @@ func main() {
 	fmt.Printf("Total symbols:    %d\n", len(symbols))
 	fmt.Printf("Total time:       %v\n", totalTime)
 	fmt.Printf("Build time:       %v (%.0f vec/sec)\n", buildTime, float64(len(embeddings))/buildTime.Seconds())
-	fmt.Printf("Search latency:   %v avg\n", avgLatency)
-	fmt.Printf("Recall@%d:        %.2f%%\n", K, avgRecall*100)
+	fmt.Printf("Search latency:   %v avg\n", vamanaAvgLatency)
+	fmt.Printf("Recall@%d:        %.2f%%\n", K, vamanaAvgRecall*100)
 
 	if *memProfile != "" {
 		f, err := os.Create(*memProfile)
