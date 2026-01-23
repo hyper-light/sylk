@@ -8512,6 +8512,10 @@ Multi-session, multi-agent systems require robust protection against shared stat
 
 ### Layer 1: HNSW Snapshot Isolation (Copy-on-Write)
 
+> **DEPRECATION NOTE (2025-01-22)**: HNSW is being replaced by Vamana as the primary index.
+> Vamana uses mmap-based storage with atomic directory swap for snapshot isolation, eliminating
+> the need for in-memory CoW snapshots. See "Vamana Index Architecture" section for current approach.
+
 The HNSW index presents a challenge: readers during writes may see partially-linked nodes, incomplete neighbor lists, or miss nodes entirely. Snapshot isolation provides consistent read views.
 
 ```go
@@ -45751,10 +45755,12 @@ func deserializeEmbedding(data []byte) []float32 {
 
 ---
 
-### Vamana Index Architecture (HNSW Replacement)
+### Vamana Index Architecture (PRIMARY)
 
-> **MIGRATION NOTE**: The HNSW implementation above is being replaced with Vamana (DiskANN algorithm).
-> This section documents the target architecture. See TODO.md PARALLEL GROUP 4AJ for implementation tasks.
+> **IMPLEMENTATION STATUS (2025-01-22)**: Vamana is now the PRIMARY index implementation.
+> Core algorithms, storage, ScaNN batch build, FLASH path, and stitching are COMPLETE.
+> WAL and Delta layer have types defined; implementation pending for streaming updates.
+> See TODO.md PARALLEL GROUP 4AJ for detailed status and remaining tasks.
 
 #### Why Vamana Over HNSW
 
@@ -45952,6 +45958,29 @@ type Snapshot struct {
 // 3. Update symlink: current → v124 (atomic on POSIX)
 // 4. Remove old version (v123/) after grace period
 ```
+
+#### Implementation Status (2025-01-22)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Core Types** | ✅ Complete | `vamana/types.go`, `vamana/errors.go` |
+| **Storage Layer** | ✅ Complete | `vamana/storage/` (mmap, vectors, graph, labels, idmap, snapshot) |
+| **Core Algorithms** | ✅ Complete | `vamana/` (prune, search, insert, delete, medoid, distance) |
+| **ScaNN Batch Build** | ✅ Complete | `vamana/scann/` (avq, partitioner, builder) |
+| **FLASH Path** | ✅ Complete | `vamana/scann/flash*.go` (for n > R² × log²R) |
+| **Graph Stitching** | ✅ Complete | `vamana/stitch/` (boundary sampling, cross-edges) |
+| **Embedder** | ✅ Complete | `vamana/embedder/` (interface, mock, serializer, clustered) |
+| **Ingestion** | ✅ Partial | `vamana/ingestion/` (interface, batch_writer, labels) |
+| **WAL** | 🔨 Types Only | `vamana/wal/types.go` (writer/reader/recovery pending) |
+| **Delta Layer** | 🔨 Types Only | `vamana/delta/types.go` (index/search/compaction pending) |
+| **Filtered Search** | ✅ Post-filter | `vamana/search.go` (GreedySearchWithFilter) |
+| **Stitched Vamana** | ◇ Deferred | `vamana/stitched/types.go` (pre-filter optimization) |
+| **Temporal** | ✅ Exists | `temporal/` (needs integration with Vamana) |
+
+**Performance Benchmarks (Sylk codebase ~23K symbols, K8s ~273K symbols):**
+- ScaNN batch build: 5.63s for 273K symbols (48,587 symbols/sec)
+- FLASH refinement: 832ms (31% improvement via reservoir sampling optimization)
+- Recall: ~97% Sylk, ~98% K8s with FLASH path
 
 #### Core Algorithms
 
