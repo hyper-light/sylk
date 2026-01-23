@@ -17,28 +17,16 @@ func ConfigForN(n, dim int) Config {
 		return Config{}
 	}
 
-	// NumPartitions: sqrt(N) partitions gives O(sqrt(N)) vectors per partition
-	// This balances partition overhead vs scan cost
-	// partitionBits = ceil(log2(sqrt(N))) = ceil(log2(N)/2)
 	logN := bits.Len(uint(n))
 	partitionBits := (logN + 1) / 2
 	numPartitions := 1 << partitionBits
 
-	// NProbe: sqrt(numPartitions) for multi-probe coverage
-	// With P partitions, probing sqrt(P) gives good recall/latency tradeoff
-	// nprobe = sqrt(P) = sqrt(sqrt(N)) = N^0.25
-	nprobe := 1 << ((partitionBits + 1) / 2)
-	if nprobe > numPartitions {
-		nprobe = numPartitions
-	}
+	nprobe := numPartitions
 
-	// QuantBits: bits needed to represent log2(dim) distinct levels
-	// More dimensions need fewer bits per dimension (information spreads)
-	// quantBits = ceil(log2(log2(dim)))
 	logDim := bits.Len(uint(dim))
 	quantBits := bits.Len(uint(logDim))
-	if quantBits < 2 {
-		quantBits = 2
+	if quantBits < 1 {
+		quantBits = 1
 	}
 
 	// Oversample: compensate for quantization ranking errors
@@ -78,8 +66,9 @@ type SearchResult struct {
 }
 
 type BuildStats struct {
+	StoreNanos     int64
+	BBQNanos       int64
 	PartitionNanos int64
-	BinaryNanos    int64
-	Uint4Nanos     int64
+	GraphNanos     int64
 	TotalNanos     int64
 }

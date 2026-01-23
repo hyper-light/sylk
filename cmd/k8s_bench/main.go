@@ -82,10 +82,16 @@ func main() {
 	fmt.Print("\nPhase 4: Building IVF index... ")
 	buildStart := time.Now()
 	idx := ivf.NewIndex(config, dim)
-	idx.Build(embeddings)
+	_, stats := idx.Build(embeddings)
 	buildTime := time.Since(buildStart)
 
 	fmt.Printf("done in %v (%.0f vec/sec)\n", buildTime, float64(len(embeddings))/buildTime.Seconds())
+	fmt.Printf("  Store: %dms, BBQ: %dms, Partition: %dms, Graph: %dms\n",
+		stats.StoreNanos/1e6, stats.BBQNanos/1e6, stats.PartitionNanos/1e6, stats.GraphNanos/1e6)
+
+	gs := idx.GraphStats()
+	fmt.Printf("  Graph: nodes=%d, edges=%d, avgDeg=%.1f, minDeg=%d, maxDeg=%d\n",
+		gs.NumNodes, gs.NumEdges, gs.AvgDegree, gs.MinDegree, gs.MaxDegree)
 
 	n := len(embeddings)
 	logN := bits.Len(uint(n))
@@ -122,8 +128,64 @@ func main() {
 	}
 	avgLatency := totalLatency / time.Duration(numQueries)
 	avgRecall := totalRecall / float64(numQueries)
-	fmt.Printf("  Avg latency: %v\n", avgLatency)
-	fmt.Printf("  Avg recall@%d: %.2f%%\n", K, avgRecall*100)
+	fmt.Printf("  [Exact] Avg latency: %v, recall@%d: %.2f%%\n", avgLatency, K, avgRecall*100)
+
+	var bbqTotalLatency time.Duration
+	var bbqTotalRecall float64
+
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+
+		start := time.Now()
+		results := idx.SearchBBQ(queryVec, K)
+		bbqTotalLatency += time.Since(start)
+
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		recall := computeRecall(results, groundTruth)
+		bbqTotalRecall += recall
+	}
+	bbqAvgLatency := bbqTotalLatency / time.Duration(numQueries)
+	bbqAvgRecall := bbqTotalRecall / float64(numQueries)
+	fmt.Printf("  [BBQ]   Avg latency: %v, recall@%d: %.2f%%\n", bbqAvgLatency, K, bbqAvgRecall*100)
+
+	var ivfTotalLatency time.Duration
+	var ivfTotalRecall float64
+
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+
+		start := time.Now()
+		results := idx.SearchIVF(queryVec, K)
+		ivfTotalLatency += time.Since(start)
+
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		recall := computeRecall(results, groundTruth)
+		ivfTotalRecall += recall
+	}
+	ivfAvgLatency := ivfTotalLatency / time.Duration(numQueries)
+	ivfAvgRecall := ivfTotalRecall / float64(numQueries)
+	fmt.Printf("  [IVF]   Avg latency: %v, recall@%d: %.2f%%\n", ivfAvgLatency, K, ivfAvgRecall*100)
+
+	var vamanaTotalLatency time.Duration
+	var vamanaTotalRecall float64
+
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+
+		start := time.Now()
+		results := idx.SearchVamana(queryVec, K)
+		vamanaTotalLatency += time.Since(start)
+
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		recall := computeRecall(results, groundTruth)
+		vamanaTotalRecall += recall
+	}
+	vamanaAvgLatency := vamanaTotalLatency / time.Duration(numQueries)
+	vamanaAvgRecall := vamanaTotalRecall / float64(numQueries)
+	fmt.Printf("  [Vamana] Avg latency: %v, recall@%d: %.2f%%\n", vamanaAvgLatency, K, vamanaAvgRecall*100)
 
 	totalTime := time.Since(totalStart)
 	fmt.Printf("\n=== Summary ===\n")
