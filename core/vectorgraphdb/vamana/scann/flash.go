@@ -479,9 +479,7 @@ func (fc *FlashCoder) RobustPruneFlash(
 
 	dots := buf.dots[:n]
 	gathered := buf.gathered[:n]
-	for i := range dots {
-		dots[i] = 0
-	}
+	clear(dots)
 
 	for m := range numSubspaces {
 		pTable := pTables[m]
