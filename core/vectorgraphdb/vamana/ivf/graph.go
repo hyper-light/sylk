@@ -52,7 +52,7 @@ func ConfigForGraph(n, numPartitions int) GraphConfig {
 	return GraphConfig{
 		R:         R,
 		L:         L,
-		Alpha:     1.2,
+		Alpha:     1.0, // 1.0 optimal for small partitions; DiskANN's 1.2 is for large single-graph builds
 		BeamWidth: beamWidth,
 		BridgeK:   bridgeK,
 	}
@@ -66,6 +66,9 @@ type graphBuildWorker struct {
 	prunedList    []uint32
 	reverseBuffer []uint32
 	rng           uint64
+	pq            neighborPQ
+	idScratch     []uint32
+	distScratch   []int
 }
 
 type vamanaCandidate struct {
@@ -73,7 +76,14 @@ type vamanaCandidate struct {
 	dist int
 }
 
-func newGraphBuildWorker(maxMembers, R int) *graphBuildWorker {
+type neighborPQ struct {
+	data     []vamanaCandidate
+	size     int
+	capacity int
+	cursor   int
+}
+
+func newGraphBuildWorker(maxMembers, R, L int) *graphBuildWorker {
 	visitedWords := (maxMembers + bitsPerWordMask) / bitsPerWord
 	return &graphBuildWorker{
 		hammingDists:  make([]int, maxMembers),
@@ -83,6 +93,12 @@ func newGraphBuildWorker(maxMembers, R int) *graphBuildWorker {
 		prunedList:    make([]uint32, 0, R),
 		reverseBuffer: make([]uint32, 0, R+1),
 		rng:           uint64(maxMembers) | 1,
+		pq: neighborPQ{
+			data:     make([]vamanaCandidate, L+1),
+			capacity: L,
+		},
+		idScratch:   make([]uint32, 0, R),
+		distScratch: make([]int, 0, R),
 	}
 }
 
@@ -104,6 +120,57 @@ func (w *graphBuildWorker) isVisited(localID uint32) bool {
 func (w *graphBuildWorker) nextRandom(n int) int {
 	w.rng = w.rng*lcgMultiplier + lcgIncrement
 	return int(w.rng>>33) % n
+}
+
+func (pq *neighborPQ) clear() {
+	pq.size = 0
+	pq.cursor = 0
+}
+
+func (pq *neighborPQ) insert(id uint32, dist int) {
+	if pq.size == pq.capacity && pq.data[pq.size-1].dist <= dist {
+		return
+	}
+
+	lo, hi := 0, pq.size
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		if dist < pq.data[mid].dist {
+			hi = mid
+		} else if pq.data[mid].id == id {
+			return
+		} else {
+			lo = mid + 1
+		}
+	}
+
+	if lo < pq.capacity {
+		copy(pq.data[lo+1:pq.size+1], pq.data[lo:pq.size])
+	}
+	pq.data[lo] = vamanaCandidate{id: id, dist: dist}
+	if pq.size < pq.capacity {
+		pq.size++
+	}
+	if lo < pq.cursor {
+		pq.cursor = lo
+	}
+}
+
+func (pq *neighborPQ) closestUnexpanded() (uint32, int, bool) {
+	if pq.cursor >= pq.size {
+		return 0, 0, false
+	}
+	c := pq.data[pq.cursor]
+	pq.cursor++
+	return c.id, c.dist, true
+}
+
+func (pq *neighborPQ) hasUnexpanded() bool {
+	return pq.cursor < pq.size
+}
+
+func (pq *neighborPQ) allCandidates() []vamanaCandidate {
+	return pq.data[:pq.size]
 }
 
 func (idx *Index) BuildVamanaGraph() *VamanaGraph {
@@ -159,7 +226,7 @@ func (g *VamanaGraph) buildLocalGraphsHamming(cfg GraphConfig) {
 
 	workers := make([]*graphBuildWorker, numWorkers)
 	for w := 0; w < numWorkers; w++ {
-		workers[w] = newGraphBuildWorker(maxMembersPerPartition, cfg.R)
+		workers[w] = newGraphBuildWorker(maxMembersPerPartition, cfg.R, cfg.L)
 	}
 
 	var wg sync.WaitGroup
@@ -214,17 +281,9 @@ func (g *VamanaGraph) buildPartitionGraphHamming(partIdx int, cfg GraphConfig, w
 		localAdj[i] = make([]uint32, 0, localR)
 	}
 
-	g.initRandomGraphLocal(localAdj, members, localR, w)
-
 	medoidLocal := g.findLocalMedoid(members, codes, codeLen)
 
-	visitOrder := make([]int, n)
-	for i := 0; i < n; i++ {
-		visitOrder[i] = i
-	}
-	g.shuffleOrder(visitOrder, w)
-
-	for _, localID := range visitOrder {
+	for localID := 0; localID < n; localID++ {
 		candidates := g.greedySearchLocal(localID, medoidLocal, localAdj, members, codes, codeLen, localL, w)
 
 		pruned := g.robustPruneLocal(localID, candidates, localAdj, members, codes, codeLen, cfg.Alpha, localR, w)
@@ -233,32 +292,22 @@ func (g *VamanaGraph) buildPartitionGraphHamming(partIdx int, cfg GraphConfig, w
 		g.addReverseEdgesLocal(localID, pruned, localAdj, members, codes, codeLen, cfg.Alpha, localR, w)
 	}
 
+	for localID := 0; localID < n; localID++ {
+		if len(localAdj[localID]) > localR {
+			nbrs := make([]vamanaCandidate, len(localAdj[localID]))
+			nodeCode := codes[int(members[localID])*codeLen : int(members[localID])*codeLen+codeLen]
+			for i, nb := range localAdj[localID] {
+				nbCode := codes[int(members[nb])*codeLen : int(members[nb])*codeLen+codeLen]
+				nbrs[i] = vamanaCandidate{nb, HammingDistance(nodeCode, nbCode)}
+			}
+			localAdj[localID] = g.robustPruneLocal(localID, nbrs, localAdj, members, codes, codeLen, cfg.Alpha, localR, w)
+		}
+	}
+
 	for i := 0; i < n; i++ {
 		g.adjacency[members[i]] = make([]uint32, len(localAdj[i]))
 		for j, localNb := range localAdj[i] {
 			g.adjacency[members[i]][j] = members[localNb]
-		}
-	}
-}
-
-func (g *VamanaGraph) initRandomGraphLocal(localAdj [][]uint32, members []uint32, R int, w *graphBuildWorker) {
-	n := len(members)
-	for i := 0; i < n; i++ {
-		edgeCount := R
-		if edgeCount > n-1 {
-			edgeCount = n - 1
-		}
-
-		w.clearVisited(n)
-		w.setVisited(uint32(i))
-
-		localAdj[i] = localAdj[i][:0]
-		for len(localAdj[i]) < edgeCount {
-			j := w.nextRandom(n)
-			if !w.isVisited(uint32(j)) {
-				w.setVisited(uint32(j))
-				localAdj[i] = append(localAdj[i], uint32(j))
-			}
 		}
 	}
 }
@@ -295,55 +344,47 @@ func (g *VamanaGraph) findLocalMedoid(members []uint32, codes []byte, codeLen in
 	return bestMedoid
 }
 
-func (g *VamanaGraph) shuffleOrder(order []int, w *graphBuildWorker) {
-	n := len(order)
-	for i := n - 1; i > 0; i-- {
-		j := w.nextRandom(i + 1)
-		order[i], order[j] = order[j], order[i]
-	}
-}
-
 func (g *VamanaGraph) greedySearchLocal(queryLocal, startLocal int, localAdj [][]uint32, members []uint32, codes []byte, codeLen int, L int, w *graphBuildWorker) []vamanaCandidate {
 	n := len(members)
 	w.clearVisited(n)
+	w.pq.clear()
+	w.candidates = w.candidates[:0]
 
 	queryCode := codes[int(members[queryLocal])*codeLen : int(members[queryLocal])*codeLen+codeLen]
-
-	w.candidates = w.candidates[:0]
 
 	w.setVisited(uint32(startLocal))
 	startCode := codes[int(members[startLocal])*codeLen : int(members[startLocal])*codeLen+codeLen]
 	startDist := HammingDistance(queryCode, startCode)
-	w.candidates = append(w.candidates, vamanaCandidate{uint32(startLocal), startDist})
+	w.pq.insert(uint32(startLocal), startDist)
 
-	expanded := 0
-	for expanded < len(w.candidates) && len(w.candidates) < L {
-		bestIdx := -1
-		bestDist := int(^uint(0) >> 1)
-		for i := expanded; i < len(w.candidates); i++ {
-			if w.candidates[i].dist < bestDist {
-				bestDist = w.candidates[i].dist
-				bestIdx = i
-			}
-		}
-
-		if bestIdx < 0 {
+	for w.pq.hasUnexpanded() {
+		currentID, currentDist, ok := w.pq.closestUnexpanded()
+		if !ok {
 			break
 		}
 
-		w.candidates[expanded], w.candidates[bestIdx] = w.candidates[bestIdx], w.candidates[expanded]
-		current := w.candidates[expanded]
-		expanded++
+		w.candidates = append(w.candidates, vamanaCandidate{currentID, currentDist})
 
-		for _, nbLocal := range localAdj[current.id] {
-			if w.isVisited(nbLocal) {
-				continue
+		w.idScratch = w.idScratch[:0]
+		for _, nbLocal := range localAdj[currentID] {
+			if !w.isVisited(nbLocal) {
+				w.setVisited(nbLocal)
+				w.idScratch = append(w.idScratch, nbLocal)
 			}
-			w.setVisited(nbLocal)
+		}
 
+		if len(w.idScratch) == 0 {
+			continue
+		}
+
+		w.distScratch = w.distScratch[:0]
+		for _, nbLocal := range w.idScratch {
 			nbCode := codes[int(members[nbLocal])*codeLen : int(members[nbLocal])*codeLen+codeLen]
-			dist := HammingDistance(queryCode, nbCode)
-			w.candidates = append(w.candidates, vamanaCandidate{nbLocal, dist})
+			w.distScratch = append(w.distScratch, HammingDistance(queryCode, nbCode))
+		}
+
+		for i, nbLocal := range w.idScratch {
+			w.pq.insert(nbLocal, w.distScratch[i])
 		}
 	}
 
@@ -383,32 +424,52 @@ func (g *VamanaGraph) robustPruneLocal(sourceLocal int, candidates []vamanaCandi
 		return a.dist - b.dist
 	})
 
+	maxc := len(candidates)
+	if maxc > R*4 {
+		maxc = R * 4
+		candidates = candidates[:maxc]
+	}
+
+	occludeFactor := make([]float32, len(candidates))
+
 	w.prunedList = w.prunedList[:0]
 
-	for _, candidate := range candidates {
-		if len(w.prunedList) >= R {
-			break
-		}
-		if candidate.id == uint32(sourceLocal) {
-			continue
-		}
-
-		occluded := false
-		candidateCode := codes[int(members[candidate.id])*codeLen : int(members[candidate.id])*codeLen+codeLen]
-
-		for _, neighbor := range w.prunedList {
-			neighborCode := codes[int(members[neighbor])*codeLen : int(members[neighbor])*codeLen+codeLen]
-			distNeighborCandidate := HammingDistance(neighborCode, candidateCode)
-
-			if float32(distNeighborCandidate)*alpha <= float32(candidate.dist) {
-				occluded = true
+	curAlpha := float32(1.0)
+	for curAlpha <= alpha && len(w.prunedList) < R {
+		for i, candidate := range candidates {
+			if len(w.prunedList) >= R {
 				break
 			}
-		}
+			if occludeFactor[i] > curAlpha {
+				continue
+			}
+			if candidate.id == uint32(sourceLocal) {
+				occludeFactor[i] = float32(math.MaxFloat32)
+				continue
+			}
 
-		if !occluded {
+			occludeFactor[i] = float32(math.MaxFloat32)
 			w.prunedList = append(w.prunedList, candidate.id)
+
+			candidateCode := codes[int(members[candidate.id])*codeLen : int(members[candidate.id])*codeLen+codeLen]
+
+			for j := i + 1; j < len(candidates); j++ {
+				if occludeFactor[j] > alpha {
+					continue
+				}
+				otherCode := codes[int(members[candidates[j].id])*codeLen : int(members[candidates[j].id])*codeLen+codeLen]
+				djk := HammingDistance(candidateCode, otherCode)
+				if djk == 0 {
+					occludeFactor[j] = float32(math.MaxFloat32)
+				} else {
+					ratio := float32(candidates[j].dist) / float32(djk)
+					if ratio > occludeFactor[j] {
+						occludeFactor[j] = ratio
+					}
+				}
+			}
 		}
+		curAlpha *= 1.2
 	}
 
 	result := make([]uint32, len(w.prunedList))
