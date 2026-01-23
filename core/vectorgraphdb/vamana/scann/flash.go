@@ -375,7 +375,7 @@ type FlashPruneBuffers struct {
 	adt            *ADT
 	scored         []flashCandidate
 	toScore        []uint32
-	selectedCodes  [][]uint8
+	selectedCodes  []uint8
 	selectedMags   []float32
 	rngState       uint64
 	candidateCodes []byte
@@ -395,7 +395,7 @@ func NewFlashPruneBuffers(maxCandidates int, R int, numSubspaces int) *FlashPrun
 	return &FlashPruneBuffers{
 		scored:         make([]flashCandidate, maxCandidates),
 		toScore:        make([]uint32, maxCandidates),
-		selectedCodes:  make([][]uint8, R),
+		selectedCodes:  make([]uint8, R*numSubspaces),
 		selectedMags:   make([]float32, R),
 		rngState:       uint64(rand.Int64()) | 1,
 		candidateCodes: make([]byte, maxCandidates*numSubspaces),
@@ -523,8 +523,9 @@ func (fc *FlashCoder) RobustPruneFlash(
 	selected := make([]uint32, 0, R)
 	consecutiveRejections := 0
 
-	selectedCodes := buf.selectedCodes[:0]
+	selectedCodes := buf.selectedCodes
 	selectedMags := buf.selectedMags[:0]
+	selectedCount := 0
 
 	cTables := make([][]float32, numSubspaces)
 
@@ -543,10 +544,10 @@ func (fc *FlashCoder) RobustPruneFlash(
 		}
 
 		keep := true
-		checkStart := max(0, len(selected)-maxCheck)
+		checkStart := max(0, selectedCount-maxCheck)
 
-		for j := checkStart; j < len(selected); j++ {
-			sCode := selectedCodes[j]
+		for j := checkStart; j < selectedCount; j++ {
+			sCode := selectedCodes[j*numSubspaces : (j+1)*numSubspaces]
 			sMag := selectedMags[j]
 
 			var dot float32
@@ -569,7 +570,8 @@ func (fc *FlashCoder) RobustPruneFlash(
 
 		if keep {
 			selected = append(selected, c.id)
-			selectedCodes = append(selectedCodes, cCode)
+			copy(selectedCodes[selectedCount*numSubspaces:], cCode)
+			selectedCount++
 			selectedMags = append(selectedMags, cMag)
 			consecutiveRejections = 0
 		} else {
