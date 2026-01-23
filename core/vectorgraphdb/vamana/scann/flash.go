@@ -372,26 +372,33 @@ func (fm *FlashMags) Get(id uint32) float32 {
 }
 
 type FlashPruneBuffers struct {
-	adt           *ADT
-	scored        []flashCandidate
-	toScore       []uint32
-	selectedCodes [][]uint8
-	selectedMags  []float32
-	rngState      uint64
+	adt            *ADT
+	scored         []flashCandidate
+	toScore        []uint32
+	selectedCodes  [][]uint8
+	selectedMags   []float32
+	rngState       uint64
+	candidateCodes []byte
+	candidateMags  []float32
+	numSubspaces   int
 }
 
 type flashCandidate struct {
-	id   uint32
-	dist float64
+	id     uint32
+	bufIdx int
+	dist   float64
 }
 
-func NewFlashPruneBuffers(maxCandidates int, R int) *FlashPruneBuffers {
+func NewFlashPruneBuffers(maxCandidates int, R int, numSubspaces int) *FlashPruneBuffers {
 	return &FlashPruneBuffers{
-		scored:        make([]flashCandidate, maxCandidates),
-		toScore:       make([]uint32, maxCandidates),
-		selectedCodes: make([][]uint8, R),
-		selectedMags:  make([]float32, R),
-		rngState:      uint64(rand.Int64()) | 1,
+		scored:         make([]flashCandidate, maxCandidates),
+		toScore:        make([]uint32, maxCandidates),
+		selectedCodes:  make([][]uint8, R),
+		selectedMags:   make([]float32, R),
+		rngState:       uint64(rand.Int64()) | 1,
+		candidateCodes: make([]byte, maxCandidates*numSubspaces),
+		candidateMags:  make([]float32, maxCandidates),
+		numSubspaces:   numSubspaces,
 	}
 }
 
@@ -452,9 +459,16 @@ func (fc *FlashCoder) RobustPruneFlash(
 	codes := fc.codes
 	mags := flashMags.mags
 
+	candCodes := buf.candidateCodes[:len(toScore)*numSubspaces]
+	candMags := buf.candidateMags[:len(toScore)]
 	for i, c := range toScore {
-		cCode := codes[c]
-		cMag := mags[c]
+		copy(candCodes[i*numSubspaces:(i+1)*numSubspaces], codes[c])
+		candMags[i] = mags[c]
+	}
+
+	for i := range toScore {
+		cCode := candCodes[i*numSubspaces : (i+1)*numSubspaces]
+		cMag := candMags[i]
 
 		var dot float32
 		for m := 0; m < numSubspaces; m++ {
@@ -467,7 +481,7 @@ func (fc *FlashCoder) RobustPruneFlash(
 		} else {
 			dist = 1.0 - float64(dot)/(float64(pMag)*float64(cMag))
 		}
-		scored[i] = flashCandidate{id: c, dist: dist}
+		scored[i] = flashCandidate{id: toScore[i], bufIdx: i, dist: dist}
 	}
 
 	examineCount := min(maxExamine, len(scored))
@@ -502,8 +516,8 @@ func (fc *FlashCoder) RobustPruneFlash(
 		}
 
 		c := scored[i]
-		cCode := codes[c.id]
-		cMag := mags[c.id]
+		cCode := candCodes[c.bufIdx*numSubspaces : (c.bufIdx+1)*numSubspaces]
+		cMag := candMags[c.bufIdx]
 
 		keep := true
 		checkStart := max(0, len(selected)-maxCheck)

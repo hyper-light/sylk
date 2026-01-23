@@ -284,7 +284,7 @@ func TestProfile_RefinementBreakdown(t *testing.T) {
 
 	seen := make([]bool, n)
 	candidateList := make([]uint32, 0, R*R)
-	flashBuf := NewFlashPruneBuffers(R*R, R)
+	flashBuf := NewFlashPruneBuffers(R*R, R, flashCoder.numSubspaces)
 
 	start = time.Now()
 	totalUpdates := 0
