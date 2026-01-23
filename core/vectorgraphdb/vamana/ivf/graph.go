@@ -392,13 +392,14 @@ func (g *VamanaGraph) greedySearchLocal(queryLocal, startLocal int, localAdj [][
 
 	w.setVisited(uint32(queryLocal))
 
-	result := make([]vamanaCandidate, 0, len(w.candidates))
+	writeIdx := 0
 	for _, c := range w.candidates {
 		if c.id != uint32(queryLocal) {
-			result = append(result, c)
+			w.candidates[writeIdx] = c
+			writeIdx++
 		}
 	}
-	return result
+	return w.candidates[:writeIdx]
 }
 
 func (g *VamanaGraph) robustPruneLocal(sourceLocal int, candidates []vamanaCandidate, localAdj [][]uint32, members []uint32, codes []byte, codeLen int, alpha float32, R int, w *graphBuildWorker) []uint32 {
