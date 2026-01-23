@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io/fs"
 	"math/bits"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -35,13 +37,31 @@ type symbol struct {
 }
 
 func main() {
+	cpuProfile := flag.String("cpuprofile", "", "write cpu profile to file")
+	memProfile := flag.String("memprofile", "", "write memory profile to file")
+	flag.Parse()
+
 	root := "/tmp/kubernetes"
-	if len(os.Args) > 1 {
-		root = os.Args[1]
+	if flag.NArg() > 0 {
+		root = flag.Arg(0)
 	}
 
 	fmt.Printf("=== Kubernetes Full Ingest Benchmark ===\n")
 	fmt.Printf("Root: %s\n\n", root)
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not create CPU profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "could not start CPU profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	totalStart := time.Now()
 
@@ -195,6 +215,20 @@ func main() {
 	fmt.Printf("Build time:       %v (%.0f vec/sec)\n", buildTime, float64(len(embeddings))/buildTime.Seconds())
 	fmt.Printf("Search latency:   %v avg\n", avgLatency)
 	fmt.Printf("Recall@%d:        %.2f%%\n", K, avgRecall*100)
+
+	if *memProfile != "" {
+		f, err := os.Create(*memProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not create memory profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "could not write memory profile: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }
 
 func parseAllSymbols(root string, files []string) []symbol {
