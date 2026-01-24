@@ -36205,12 +36205,14 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │ NO BACKWARDS COMPATIBILITY: HNSW directory will be deleted entirely             ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
-│ │ IMPLEMENTATION STATUS (Updated 2025-01-22):                                     ││
+│ │ IMPLEMENTATION STATUS (Updated 2025-01-23):                                     ││
 │ │   ✅ COMPLETE: Types, Storage, Embedder, Core Algorithm, ScaNN+FLASH, Stitch    ││
+│ │   ✅ COMPLETE: IVF Index (in-memory) - 58% faster graph build, 99.99% recall    ││
+│ │   🔨 IN PROGRESS: IVF Persistence (reuse sharded storage patterns)              ││
 │ │   🔨 IN PROGRESS: WAL (types done), Delta (types done), Ingestion (core done)   ││
 │ │   ◇ DEFERRED: Stitched Vamana (post-filter works, pre-filter is optimization)   ││
-│ │   📋 PENDING: Temporal integration, Integration layer, HNSW removal             ││
-│ │   🗑️ DEAD CODE: quantization/ (14MB), mvcc/, mitigations/, migrations/ → DELETE ││
+│ │   📋 PENDING: IVF Stitching, Temporal integration, Integration layer            ││
+│ │   🗑️ DEAD CODE: quantization/ (14MB), scann/ (after IVF validates), mvcc/       ││
 │ │                                                                                  ││
 │ │ ─────────────────────────────────────────────────────────────────────────────── ││
 │ │ PARALLEL EXECUTION PLAN:                                                        ││
@@ -37586,6 +37588,457 @@ All items in this wave have zero dependencies and can execute in full parallel.
 │ │     - [ ] Bounded channel sizes (no unbounded growth)                           ││
 │ │     - [ ] First error returned, remaining jobs cancelled                        ││
 │ │   PRIORITY: MEDIUM                                                              ││
+│ │                                                                                  ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │ VAM PHASE 12B: IVF Index Persistence & Stitching (11 tasks)                     ││
+│ │ ** mmap-based persistence with eventual consistency **                          ││
+│ │ ** SQLite is source of truth; mmap files are materialized cache **              ││
+│ │ ═══════════════════════════════════════════════════════════════════════════════ ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ ARCHITECTURE PRINCIPLES                                                         ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ 1. INSTANT LOAD - NO RECONSTRUCTION                                             ││
+│ │    On-disk format IS the in-memory format. Load = mmap + pointer assignment.    ││
+│ │    NO parsing, NO deserialization, NO recomputation of norms/codes/etc.         ││
+│ │                                                                                  ││
+│ │ 2. SEALED vs ACTIVE SHARDS                                                      ││
+│ │    ┌─────────────────────────────────────────────────────────────────────────┐  ││
+│ │    │ SEALED SHARD (= 65536 entries)                                          │  ││
+│ │    │   • Vectors/Norms/BBQ: mmap READ-ONLY, immutable                        │  ││
+│ │    │   • Graph: mmap READ-WRITE (edges mutable, node count fixed)            │  ││
+│ │    │   • Has checksum for corruption detection                               │  ││
+│ │    ├─────────────────────────────────────────────────────────────────────────┤  ││
+│ │    │ ACTIVE SHARD (< 65536 entries)                                          │  ││
+│ │    │   • mmap READ-WRITE, can append new entries                             │  ││
+│ │    │   • Preallocated to full size (no resize needed)                        │  ││
+│ │    │   • When full → seal it, create new active shard                        │  ││
+│ │    └─────────────────────────────────────────────────────────────────────────┘  ││
+│ │                                                                                  ││
+│ │ 3. EVENTUAL CONSISTENCY                                                         ││
+│ │    SQLite is source of truth. mmap files are a materialized cache.              ││
+│ │    On inconsistency → repair or rebuild. Repair is O(damage), not O(total).     ││
+│ │                                                                                  ││
+│ │    ┌─────────────────────────────────────────────────────────────────────────┐  ││
+│ │    │ On Load:                                                                │  ││
+│ │    │   1. mmap all shards (instant)                                          │  ││
+│ │    │   2. Verify per-shard checksums O(num_shards)                           │  ││
+│ │    │   3. Check count consistency across stores                              │  ││
+│ │    │   4. If shard corrupted → rebuild ONLY that shard from SQLite           │  ││
+│ │    │   5. If counts mismatch → truncate to minimum                           │  ││
+│ │    └─────────────────────────────────────────────────────────────────────────┘  ││
+│ │                                                                                  ││
+│ │ 4. BOUNDED REPAIR COSTS                                                         ││
+│ │    │ Inconsistency          │ Detection    │ Repair Cost          │             ││
+│ │    │ Count mismatch         │ O(1)         │ O(1) truncate        │             ││
+│ │    │ Single shard corrupt   │ O(1) cksum   │ O(65536) rebuild     │             ││
+│ │    │ Orphan edges           │ O(shard)     │ O(broken edges)      │             ││
+│ │    │ 3 shards corrupt       │ O(3) cksums  │ O(3 × 65536)         │             ││
+│ │    Full rebuild is NEVER needed unless SQLite itself is corrupt.               ││
+│ │                                                                                  ││
+│ │ 5. GRAPH IS SPECIAL                                                             ││
+│ │    Graph edges are mutable (stitch/prune can update any node's neighbors).      ││
+│ │    Graph shards are ALWAYS mmap READ-WRITE, even when sealed.                   ││
+│ │    Writes go through page cache → OS flushes to disk eventually.                ││
+│ │                                                                                  ││
+│ │ BENCHMARKS (2025-01-23 on K8s 309K vectors):                                    ││
+│ │   • Graph build: 703ms (was 2.2s with ScaNN) - 68% faster                       ││
+│ │   • Total build: 1.03s (was 2.45s) - 58% faster                                 ││
+│ │   • Recall: 99.99%                                                              ││
+│ │   • Latency: 40ms                                                               ││
+│ │                                                                                  ││
+│ │ EXISTING CODE TO REUSE:                                                         ││
+│ │   • storage/sharded_vectors.go - ShardedVectorStore (mmap, 65536/shard)         ││
+│ │   • storage/sharded_graph.go   - ShardedGraphStore (mmap, fixed-size nodes)     ││
+│ │   • storage/mmap.go            - MmapRegion, safe mmap wrappers                 ││
+│ │   • stitch/boundary.go         - SampleBoundary() for √N node selection         ││
+│ │                                                                                  ││
+│ │ EXISTING CODE IN IVF (in-memory, needs persistence):                            ││
+│ │   • ivf/index.go   - Index struct, Build(), Search methods                      ││
+│ │   • ivf/graph.go   - VamanaGraph, BuildVamanaGraph(), BeamSearchBBQ()           ││
+│ │   • ivf/bbq.go     - BBQ encoder/decoder                                        ││
+│ │   • ivf/types.go   - Config, SearchResult, BuildStats                           ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 12B-A: Shard Infrastructure (3 tasks)                                     ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] IVF.P1 - ShardedBBQStore                                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/sharded_bbq.go                            ││
+│ │   DEPENDS: storage/mmap.go (MmapRegion)                                         ││
+│ │   PATTERN: Copy storage/sharded_vectors.go, adapt for BBQ codes                 ││
+│ │                                                                                  ││
+│ │   STRUCTS:                                                                      ││
+│ │     type ShardedBBQStore struct {                                               ││
+│ │         dir           string                                                    ││
+│ │         codeLen       int                                                       ││
+│ │         shardCapacity int              // 65536                                 ││
+│ │         shards        atomic.Value     // []*bbqShard                           ││
+│ │         shardMu       sync.Mutex       // For shard creation only               ││
+│ │         count         atomic.Uint64                                             ││
+│ │     }                                                                           ││
+│ │     type bbqShard struct {                                                      ││
+│ │         data     *storage.MmapRegion                                            ││
+│ │         checksum uint64               // xxHash of data section                 ││
+│ │         sealed   bool                                                           ││
+│ │     }                                                                           ││
+│ │                                                                                  ││
+│ │   FORMAT per shard:                                                             ││
+│ │     [Magic:4B]["BBQ1"][CodeLen:4B][Count:4B][Reserved:4B]                       ││
+│ │     [Code0:codeLen][Code1:codeLen]...[CodeN:codeLen]                            ││
+│ │     [Checksum:8B]  ← xxHash64 of all codes                                      ││
+│ │                                                                                  ││
+│ │   METHODS:                                                                      ││
+│ │     Create(dir, codeLen) (*ShardedBBQStore, error)                              ││
+│ │     Open(dir) (*ShardedBBQStore, error)                                         ││
+│ │       → mmap all shards, verify checksums, report corrupted shards              ││
+│ │     Append(code []byte) (id uint32, err error)                                  ││
+│ │       → append to active shard, seal if full                                    ││
+│ │     Get(id uint32) []byte                                                       ││
+│ │       → zero-copy slice into mmap region                                        ││
+│ │     VerifyChecksum(shardIdx int) bool                                           ││
+│ │     RebuildShard(shardIdx int, codes [][]byte) error                            ││
+│ │     Close() error                                                               ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Zero-copy Get() via unsafe.Slice into mmap                            ││
+│ │     - [ ] Shards preallocated to full size (65536 × codeLen + header)           ││
+│ │     - [ ] Checksum computed on seal, verified on open                           ││
+│ │     - [ ] VerifyChecksum returns false for corrupted shard (not panic)          ││
+│ │     - [ ] RebuildShard overwrites shard from provided codes                     ││
+│ │     - [ ] Thread-safe: concurrent reads OK, single writer                       ││
+│ │     - [ ] Benchmark: 309K codes load in <5ms (just mmap, no parsing)            ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   TEST: ivf/sharded_bbq_test.go                                                 ││
+│ │                                                                                  ││
+│ │ [ ] IVF.P2 - ShardedNormStore                                                   ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/sharded_norms.go                          ││
+│ │   RATIONALE: Norms MUST be persisted - no recomputation on load                 ││
+│ │   PATTERN: Same as ShardedBBQStore but for float64 norms                        ││
+│ │                                                                                  ││
+│ │   FORMAT per shard:                                                             ││
+│ │     [Magic:4B]["NRM1"][Count:4B][Reserved:8B]                                   ││
+│ │     [Norm0:8B][Norm1:8B]...[NormN:8B]                                           ││
+│ │     [Checksum:8B]                                                               ││
+│ │                                                                                  ││
+│ │   SIZE: 65536 × 8 bytes = 512KB per shard                                       ││
+│ │                                                                                  ││
+│ │   METHODS:                                                                      ││
+│ │     Create(dir) (*ShardedNormStore, error)                                      ││
+│ │     Open(dir) (*ShardedNormStore, error)                                        ││
+│ │     Append(norm float64) (id uint32, err error)                                 ││
+│ │     Get(id uint32) float64                                                      ││
+│ │     GetSlice(start, end uint32) []float64  ← zero-copy                          ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Zero-copy access via unsafe.Slice                                     ││
+│ │     - [ ] Checksum per shard                                                    ││
+│ │     - [ ] NO recomputation of norms on load                                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   TEST: ivf/sharded_norms_test.go                                               ││
+│ │                                                                                  ││
+│ │ [ ] IVF.P3 - Shard Consistency Checker                                          ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/consistency.go                            ││
+│ │   RATIONALE: Detect and repair inconsistencies on load                          ││
+│ │                                                                                  ││
+│ │   TYPE:                                                                         ││
+│ │     type ConsistencyReport struct {                                             ││
+│ │         VectorCount    uint64                                                   ││
+│ │         GraphCount     uint64                                                   ││
+│ │         BBQCount       uint64                                                   ││
+│ │         NormCount      uint64                                                   ││
+│ │         CorruptShards  []CorruptShard  // shardIdx, storeType, reason           ││
+│ │         CountMismatch  bool                                                     ││
+│ │         MinValidCount  uint64          // safe count to use                     ││
+│ │     }                                                                           ││
+│ │                                                                                  ││
+│ │   FUNCTIONS:                                                                    ││
+│ │     CheckConsistency(dir string) (*ConsistencyReport, error)                    ││
+│ │       → verify all checksums, compare counts, identify issues                   ││
+│ │                                                                                  ││
+│ │     RepairFromSQLite(report *ConsistencyReport, db *sql.DB) error               ││
+│ │       → for each corrupt shard, rebuild from SQLite                             ││
+│ │       → query: SELECT id, vector FROM vectors WHERE id >= ? AND id < ?          ││
+│ │       → recompute norms, BBQ codes for affected range                           ││
+│ │                                                                                  ││
+│ │     TruncateToCounts(dir string, count uint64) error                            ││
+│ │       → truncate all stores to consistent count                                 ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Detects checksum failures in O(num_shards)                            ││
+│ │     - [ ] Detects count mismatches in O(1)                                      ││
+│ │     - [ ] Repair rebuilds ONLY corrupted shards, not entire index               ││
+│ │     - [ ] Repair cost is O(corrupted_shards × 65536), not O(total)              ││
+│ │     - [ ] Works with 10M+ vectors (repair 1 shard, not 10M)                     ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   TEST: ivf/consistency_test.go with intentional corruption                     ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 12B-B: Index Persistence (3 tasks)                                        ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] IVF.P4 - CentroidStore                                                      ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/centroid_store.go                         ││
+│ │   RATIONALE: Centroids are small (512 × 768 × 4 = 1.5MB), single file OK        ││
+│ │                                                                                  ││
+│ │   FORMAT:                                                                       ││
+│ │     [Magic:4B]["CTR1"][Version:4B][K:4B][Dim:4B]                                ││
+│ │     [Centroid0: dim×4B][Centroid1: dim×4B]...[CentroidK-1: dim×4B]              ││
+│ │     [Norm0:8B][Norm1:8B]...[NormK-1:8B]                                         ││
+│ │     [Checksum:8B]                                                               ││
+│ │                                                                                  ││
+│ │   METHODS:                                                                      ││
+│ │     Save(path string, centroids [][]float32, norms []float64) error             ││
+│ │     Load(path string) (centroids []float32, norms []float64, K, dim int, error) ││
+│ │       → mmap file, return slices pointing into mmap region                      ││
+│ │       → centroids is FLAT: access via centroids[i*dim : (i+1)*dim]              ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Load returns zero-copy slices into mmap                               ││
+│ │     - [ ] Norms stored, NOT recomputed                                          ││
+│ │     - [ ] Checksum verified on load                                             ││
+│ │     - [ ] Load in <1ms (just mmap + header parse)                               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] IVF.P5 - PartitionIndex (CSR format)                                        ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/partition_index.go                        ││
+│ │   RATIONALE: partitionIDs[p] needs O(1) access, not O(N) reconstruction         ││
+│ │                                                                                  ││
+│ │   FORMAT (Compressed Sparse Row):                                               ││
+│ │     [Magic:4B]["PTN1"][K:4B][N:4B]                                              ││
+│ │     [Offsets: (K+1)×4B]  ← offsets[p] = start of partition p's IDs              ││
+│ │     [IDs: N×4B]          ← all vector IDs, grouped by partition                 ││
+│ │     [Checksum:8B]                                                               ││
+│ │                                                                                  ││
+│ │   TYPE:                                                                         ││
+│ │     type PartitionIndex struct {                                                ││
+│ │         offsets []uint32  // mmap'd, K+1 entries                                ││
+│ │         ids     []uint32  // mmap'd, N entries                                  ││
+│ │         region  *storage.MmapRegion                                             ││
+│ │     }                                                                           ││
+│ │     func (pi *PartitionIndex) Partition(p int) []uint32 {                       ││
+│ │         return pi.ids[pi.offsets[p]:pi.offsets[p+1]]  // zero-copy              ││
+│ │     }                                                                           ││
+│ │                                                                                  ││
+│ │   METHODS:                                                                      ││
+│ │     Save(path, partitionIDs [][]uint32) error                                   ││
+│ │       → convert to CSR, write file                                              ││
+│ │     Load(path) (*PartitionIndex, error)                                         ││
+│ │       → mmap, create slice headers, NO reconstruction                           ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Load is O(1), not O(N) - just mmap + slice headers                    ││
+│ │     - [ ] Partition(p) returns zero-copy slice                                  ││
+│ │     - [ ] Works with SearchIVF (fallback search path)                           ││
+│ │   PRIORITY: MEDIUM (Vamana search doesn't need this)                            ││
+│ │                                                                                  ││
+│ │ [ ] IVF.P6 - Index Persistence Orchestration                                    ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/persistence.go                            ││
+│ │   MODIFIES: core/vectorgraphdb/vamana/ivf/index.go (add Save/Load to Index)     ││
+│ │                                                                                  ││
+│ │   DIRECTORY STRUCTURE:                                                          ││
+│ │     baseDir/                                                                    ││
+│ │     ├── metadata.yaml      # version, counts, config, medoid                    ││
+│ │     ├── centroids.bin      # CentroidStore                                      ││
+│ │     ├── partitions.bin     # PartitionIndex (CSR)                               ││
+│ │     ├── vectors/           # ShardedVectorStore (REUSE EXISTING)                ││
+│ │     │   ├── meta.yaml                                                           ││
+│ │     │   ├── shard_0000.bin                                                      ││
+│ │     │   └── shard_0001.bin                                                      ││
+│ │     ├── graph/             # ShardedGraphStore (REUSE EXISTING)                 ││
+│ │     │   ├── meta.yaml                                                           ││
+│ │     │   └── shard_0000.bin                                                      ││
+│ │     ├── norms/             # ShardedNormStore (NEW)                             ││
+│ │     │   ├── meta.yaml                                                           ││
+│ │     │   └── shard_0000.bin                                                      ││
+│ │     └── bbq/               # ShardedBBQStore (NEW)                              ││
+│ │         ├── meta.yaml                                                           ││
+│ │         └── shard_0000.bin                                                      ││
+│ │                                                                                  ││
+│ │   METADATA.YAML:                                                                ││
+│ │     version: 1                                                                  ││
+│ │     num_vectors: 309201                                                         ││
+│ │     dim: 768                                                                    ││
+│ │     num_partitions: 512                                                         ││
+│ │     bbq_code_len: 96                                                            ││
+│ │     graph_r: 64                                                                 ││
+│ │     graph_medoid: 12345                                                         ││
+│ │     active_shards:                                                              ││
+│ │       vectors: 4      # shard_0004.bin is active                                ││
+│ │       graph: 4                                                                  ││
+│ │       norms: 4                                                                  ││
+│ │       bbq: 4                                                                    ││
+│ │     created_at: 2025-01-23T14:30:00Z                                            ││
+│ │     last_modified: 2025-01-23T15:45:00Z                                         ││
+│ │                                                                                  ││
+│ │   METHODS ON Index:                                                             ││
+│ │     (idx *Index) Save(baseDir string) error                                     ││
+│ │       1. Create all sharded stores                                              ││
+│ │       2. Bulk-write all data (vectorsFlat, bbqCodes, vectorNorms, graph)        ││
+│ │       3. Write centroids.bin, partitions.bin                                    ││
+│ │       4. Compute and write checksums                                            ││
+│ │       5. Write metadata.yaml LAST (commit point)                                ││
+│ │                                                                                  ││
+│ │     LoadIndex(baseDir string) (*Index, error)                                   ││
+│ │       1. Read metadata.yaml                                                     ││
+│ │       2. mmap all stores (instant)                                              ││
+│ │       3. Run CheckConsistency()                                                 ││
+│ │       4. If issues found:                                                       ││
+│ │          - Minor (count mismatch): TruncateToCounts()                           ││
+│ │          - Major (corrupt shards): RepairFromSQLite() if db provided            ││
+│ │       5. Construct Index with pointers into mmap regions                        ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Save is atomic: all-or-nothing via metadata.yaml as commit point      ││
+│ │     - [ ] Load is instant: <10ms for 309K vectors (just mmap)                   ││
+│ │     - [ ] Load with consistency check: <50ms for 309K vectors                   ││
+│ │     - [ ] Round-trip: Save → Load → Search yields identical results             ││
+│ │     - [ ] Works with 10M+ vectors (scale test)                                  ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   TEST: ivf/persistence_test.go                                                 ││
+│ │   BENCHMARK: go test -bench=BenchmarkIVFLoad ./core/vectorgraphdb/vamana/ivf/   ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 12B-C: Incremental Updates (3 tasks)                                      ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] IVF.S1 - Append to Active Shards                                            ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/append.go                                 ││
+│ │   MODIFIES: ivf/index.go (add Append method)                                    ││
+│ │   RATIONALE: Add vectors without rebuilding; persist immediately                ││
+│ │                                                                                  ││
+│ │   METHOD:                                                                       ││
+│ │     (idx *Index) Append(vec []float32) (id uint32, err error)                   ││
+│ │       1. Assign to partition (O(√K) centroid comparisons)                       ││
+│ │       2. Append to active shards:                                               ││
+│ │          - vectors.Append(vec)       → writes to mmap                           ││
+│ │          - norms.Append(norm)        → writes to mmap                           ││
+│ │          - bbq.Append(code)          → writes to mmap                           ││
+│ │          - graph.AddNode()           → writes to mmap                           ││
+│ │       3. Connect to graph:                                                      ││
+│ │          - Find neighbors via BeamSearch                                        ││
+│ │          - Add bidirectional edges (writes to mmap)                             ││
+│ │       4. If any shard becomes full → seal it, create new active                 ││
+│ │       5. Update metadata.yaml (count, active_shards)                            ││
+│ │       6. Return assigned ID                                                     ││
+│ │                                                                                  ││
+│ │   WRITE PATH:                                                                   ││
+│ │     Append writes directly to mmap regions.                                     ││
+│ │     OS page cache handles write-back to disk.                                   ││
+│ │     For durability guarantee: optional msync after Append.                      ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Single vector append in <1ms                                          ││
+│ │     - [ ] Batch of 100 vectors in <50ms                                         ││
+│ │     - [ ] Appended vectors immediately searchable (no reload)                   ││
+│ │     - [ ] Shard sealing is automatic when full                                  ││
+│ │     - [ ] Survives crash: reload finds vectors (OS flushed pages)               ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] IVF.S2 - Graph Edge Updates                                                 ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/graph_update.go                           ││
+│ │   MODIFIES: ivf/graph.go (add UpdateEdges method)                               ││
+│ │   RATIONALE: Stitch/prune modify edges; must persist without rebuild            ││
+│ │                                                                                  ││
+│ │   METHOD:                                                                       ││
+│ │     (g *VamanaGraph) UpdateEdges(nodeID uint32, neighbors []uint32)             ││
+│ │       1. Validate len(neighbors) <= R                                           ││
+│ │       2. Compute offset: nodeID × (2 + R×4)                                     ││
+│ │       3. Write directly to mmap:                                                ││
+│ │          - [count:2B][n0:4B][n1:4B]...[nR-1:4B]                                  ││
+│ │       4. Writes go to page cache → OS flushes eventually                        ││
+│ │                                                                                  ││
+│ │   IMPORTANT: Graph nodes have FIXED SIZE (2 + R×4 bytes).                       ││
+│ │   This enables O(1) offset calculation and in-place updates.                    ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] Edge update is O(1) - direct offset write                             ││
+│ │     - [ ] No file resize needed                                                 ││
+│ │     - [ ] Concurrent reads safe during write (atomic count update)              ││
+│ │     - [ ] Updated edges visible immediately (same mmap region)                  ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] IVF.S3 - Stitch Integration                                                 ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/stitch.go                                 ││
+│ │   REUSES: stitch/boundary.go (SampleBoundary)                                   ││
+│ │   RATIONALE: Merge new segment into existing index                              ││
+│ │                                                                                  ││
+│ │   METHOD:                                                                       ││
+│ │     StitchVectors(idx *Index, newVecs [][]float32) error                        ││
+│ │       1. Append all new vectors (IVF.S1)                                        ││
+│ │       2. Sample √|new| boundary nodes from new vectors                          ││
+│ │       3. For each boundary node:                                                ││
+│ │          - Search existing graph for R/2 neighbors                              ││
+│ │          - Add bidirectional edges (IVF.S2)                                     ││
+│ │          - RobustPrune if degree > R                                            ││
+│ │                                                                                  ││
+│ │   EVENTUAL CONSISTENCY:                                                         ││
+│ │     If crash mid-stitch:                                                        ││
+│ │       - Some vectors appended, some not → count mismatch → truncate on load     ││
+│ │       - Some edges added, reverse missing → orphan edges → repair on load       ││
+│ │     Either way: O(damage) repair, not O(total) rebuild.                         ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] 5K vectors stitched in <200ms                                         ││
+│ │     - [ ] Recall maintained >99% after stitch                                   ││
+│ │     - [ ] Crash mid-stitch → recoverable on reload                              ││
+│ │     - [ ] O(√N) searches for stitching, not O(N)                                ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │   TEST: ivf/stitch_test.go                                                      ││
+│ │                                                                                  ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │ PHASE 12B-D: Validation & Cleanup (2 tasks)                                     ││
+│ │ ─────────────────────────────────────────────────────────────────────────────── ││
+│ │                                                                                  ││
+│ │ [ ] IVF.V1 - End-to-End Benchmark                                               ││
+│ │   FILE: core/vectorgraphdb/vamana/ivf/benchmark_persistence_test.go             ││
+│ │   RATIONALE: Prove the architecture works at scale                              ││
+│ │                                                                                  ││
+│ │   SCENARIOS:                                                                    ││
+│ │     BenchmarkIVF_ColdStart:                                                     ││
+│ │       - Build from 309K vectors, save, exit                                     ││
+│ │       - Fresh process: load, search                                             ││
+│ │       - TARGET: Load in <10ms, first search in <50ms                            ││
+│ │                                                                                  ││
+│ │     BenchmarkIVF_IncrementalAppend:                                             ││
+│ │       - Load existing 309K index                                                ││
+│ │       - Append 10K vectors                                                      ││
+│ │       - TARGET: <500ms total, recall still >99%                                 ││
+│ │                                                                                  ││
+│ │     BenchmarkIVF_CrashRecovery:                                                 ││
+│ │       - Corrupt 1 shard intentionally                                           ││
+│ │       - Load with repair                                                        ││
+│ │       - TARGET: Repair <500ms, search works                                     ││
+│ │                                                                                  ││
+│ │     BenchmarkIVF_ScaleTest:                                                     ││
+│ │       - Simulate 10M vectors (155 shards)                                       ││
+│ │       - Load time, search time, memory usage                                    ││
+│ │       - TARGET: Load <100ms, search <100ms                                      ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] All benchmarks pass targets                                           ││
+│ │     - [ ] Memory usage scales with active data, not total                       ││
+│ │     - [ ] Three concurrent agents can append without corruption                 ││
+│ │   PRIORITY: HIGH                                                                ││
+│ │                                                                                  ││
+│ │ [ ] IVF.V2 - ScaNN Deprecation                                                  ││
+│ │   FILES TO DELETE: core/vectorgraphdb/vamana/scann/*.go (14 files)              ││
+│ │   DEPENDS: IVF.V1 passes all benchmarks                                         ││
+│ │                                                                                  ││
+│ │   STEPS:                                                                        ││
+│ │     1. Update coldstart/ to use IVF instead of ScaNN                            ││
+│ │     2. Verify no imports of scann/ package                                      ││
+│ │        grep -r "vamana/scann" --include="*.go"                                  ││
+│ │     3. Delete scann/ directory                                                  ││
+│ │     4. go build ./... passes                                                    ││
+│ │                                                                                  ││
+│ │   ACCEPTANCE:                                                                   ││
+│ │     - [ ] scann/ directory deleted                                              ││
+│ │     - [ ] No remaining imports                                                  ││
+│ │     - [ ] Build passes                                                          ││
+│ │     - [ ] All IVF benchmarks still pass                                         ││
+│ │   PRIORITY: MEDIUM (after IVF.V1)                                               ││
 │ │                                                                                  ││
 │ │ ═══════════════════════════════════════════════════════════════════════════════ ││
 │ │ VAM PHASE 13: Cold Start Validation (1 task - depends on Phase 12)              ││
