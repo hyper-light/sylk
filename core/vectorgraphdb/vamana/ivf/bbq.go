@@ -176,3 +176,15 @@ func (b *BBQ) CodeLen() int         { return b.codeLen }
 func (b *BBQ) Dim() int             { return b.dim }
 func (b *BBQ) Means() []float32     { return b.means }
 func (b *BBQ) SetMeans(m []float32) { copy(b.means, m) }
+
+func NewBBQFromParams(dim, codeLen int, means []float32) *BBQ {
+	bbq := &BBQ{
+		dim:     dim,
+		codeLen: codeLen,
+		means:   make([]float32, dim),
+	}
+	if len(means) == dim {
+		copy(bbq.means, means)
+	}
+	return bbq
+}
