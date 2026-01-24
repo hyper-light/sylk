@@ -492,6 +492,42 @@ func main() {
 	postInsertAvgRecall := postInsertRecall / float64(numQueries)
 	fmt.Printf("recall@%d: %.2f%%\n", K, postInsertAvgRecall*100)
 
+	fmt.Printf("\n=== Phase 10c: StitchBatch Benchmark ===\n")
+	fmt.Printf("Building fresh index with %d vectors (99%%)...\n", len(buildEmbeddings))
+	stitchTestIdx := ivf.NewIndex(ivf.ConfigForN(len(buildEmbeddings), dim), dim)
+	stitchTestIdx.Build(buildEmbeddings)
+
+	fmt.Printf("Stitching %d vectors (1%%)...\n", len(insertEmbeddings))
+	stitchStart := time.Now()
+	stitchResult, err := stitchTestIdx.StitchBatch(insertEmbeddings)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stitch failed: %v\n", err)
+		os.Exit(1)
+	}
+	stitchTime := time.Since(stitchStart)
+
+	fmt.Printf("  Stitched %d vectors in %v\n", stitchResult.VectorsAdded, stitchTime)
+	fmt.Printf("  Boundary nodes: %d, Edges added: %d\n", stitchResult.BoundaryNodes, stitchResult.EdgesAdded)
+	fmt.Printf("  Searches performed: %d (vs %d for InsertBatch)\n", stitchResult.SearchesPerformed, len(insertEmbeddings))
+	fmt.Printf("  Stitch throughput: %.0f vec/sec\n", float64(len(insertEmbeddings))/stitchTime.Seconds())
+
+	fmt.Print("Phase 10d: Testing recall after stitch... ")
+	var postStitchRecall float64
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		results := stitchTestIdx.SearchVamana(queryVec, K)
+		postStitchRecall += computeRecall(results, groundTruth)
+	}
+	postStitchAvgRecall := postStitchRecall / float64(numQueries)
+	fmt.Printf("recall@%d: %.2f%%\n", K, postStitchAvgRecall*100)
+
+	fmt.Printf("\n  Comparison: InsertBatch=%v (%.0f vec/sec), StitchBatch=%v (%.0f vec/sec)\n",
+		totalInsertTime, float64(len(insertEmbeddings))/totalInsertTime.Seconds(),
+		stitchTime, float64(len(insertEmbeddings))/stitchTime.Seconds())
+	fmt.Printf("  Speedup: %.2fx\n", totalInsertTime.Seconds()/stitchTime.Seconds())
+
 	fmt.Print("\nPhase 11: Maintenance Stats... ")
 	mstats := insertTestIdx.MaintenanceStats()
 	fmt.Printf("\n  Vectors: %d, Partitions: %d\n", mstats.NumVectors, mstats.NumPartitions)

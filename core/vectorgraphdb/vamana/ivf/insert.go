@@ -27,6 +27,17 @@ func (idx *Index) Insert(vec []float32) (*InsertResult, error) {
 	}
 
 	newID := uint32(idx.numVectors)
+
+	if idx.wal != nil {
+		if _, err := idx.wal.LogInsert(newID, vec); err != nil {
+			return nil, err
+		}
+	}
+
+	return idx.insertInternal(vec, newID)
+}
+
+func (idx *Index) insertInternal(vec []float32, newID uint32) (*InsertResult, error) {
 	partition := idx.findNearestCentroid(vec)
 
 	idx.appendVector(vec)

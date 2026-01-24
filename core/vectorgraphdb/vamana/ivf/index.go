@@ -53,6 +53,8 @@ type Index struct {
 	graph *VamanaGraph
 
 	healthTracker *HealthTracker
+
+	wal *WAL
 }
 
 type idLocation struct {
@@ -1306,4 +1308,16 @@ func (idx *Index) BBQEncoder() func(vec []float32) []byte {
 		idx.bbq.EncodeDB(vec, code)
 		return code
 	}
+}
+
+func (idx *Index) SetWAL(w *WAL) {
+	idx.wal = w
+}
+
+func (idx *Index) WAL() *WAL {
+	return idx.wal
+}
+
+func (idx *Index) Dim() int {
+	return idx.dim
 }

@@ -165,6 +165,15 @@ func (idx *Index) Save(baseDir string) error {
 		return fmt.Errorf("ivf: save metadata: %w", err)
 	}
 
+	if idx.wal != nil {
+		lastSeq := idx.wal.LastSequence()
+		if lastSeq > 0 {
+			if err := idx.wal.Checkpoint(lastSeq); err != nil {
+				return fmt.Errorf("ivf: checkpoint wal: %w", err)
+			}
+		}
+	}
+
 	return nil
 }
 
