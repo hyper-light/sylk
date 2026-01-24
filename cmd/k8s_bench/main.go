@@ -335,18 +335,15 @@ func main() {
 
 	fmt.Print("Phase 7: Loading index from disk... ")
 	loadStart := time.Now()
-	loadedIdx, err := ivf.LoadIndex(indexDir)
+	loadedIdx, err := ivf.LoadIndexInMemory(indexDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load index: %v\n", err)
 		os.Exit(1)
 	}
-	defer loadedIdx.Close()
 	loadTime := time.Since(loadStart)
 	fmt.Printf("done in %v (%d vectors)\n", loadTime, loadedIdx.NumVectors())
 
 	fmt.Printf("Phase 7b: Validating loaded index search (queries=%d, K=%d)...\n", numQueries, K)
-	fmt.Printf("  Debug: in_memory_partitions=%d, loaded_partitions=%d, nprobe=%d\n",
-		len(idx.PartitionIDs()), loadedIdx.NumPartitions(), config.NProbe)
 
 	var loadedTotalRecall float64
 	var loadedTotalLatency time.Duration
@@ -358,9 +355,9 @@ func main() {
 		groundTruth := bruteForceTopK(queryVec, embeddings, K)
 
 		start := time.Now()
-		loadedResults := loadedIdx.Search(queryVec, K, config.NProbe)
+		loadedResults := loadedIdx.SearchIVF(queryVec, K)
 		loadedTotalLatency += time.Since(start)
-		loadedTotalRecall += computeRecallUint32(loadedResults, groundTruth)
+		loadedTotalRecall += computeRecall(loadedResults, groundTruth)
 	}
 
 	loadedAvgLatency := loadedTotalLatency / time.Duration(numQueries)
@@ -372,8 +369,6 @@ func main() {
 			loadedAvgRecall*100)
 		os.Exit(1)
 	}
-
-	loadedIdx.Close()
 
 	fmt.Print("\nPhase 8: Corruption test... ")
 	corruptBBQShard(indexDir, 0)
@@ -425,20 +420,19 @@ func main() {
 	fmt.Println("healthy")
 
 	fmt.Print("Phase 9c: Validating repaired index search... ")
-	repairedIdx, err := ivf.LoadIndex(indexDir)
+	repairedIdx, err := ivf.LoadIndexInMemory(indexDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load repaired index: %v\n", err)
 		os.Exit(1)
 	}
-	defer repairedIdx.Close()
 
 	var repairedTotalRecall float64
 	for i := range numQueries {
 		queryIdx := (i * stride) % n
 		queryVec := embeddings[queryIdx]
 		groundTruth := bruteForceTopK(queryVec, embeddings, K)
-		repairedResults := repairedIdx.Search(queryVec, K, config.NProbe)
-		repairedTotalRecall += computeRecallUint32(repairedResults, groundTruth)
+		repairedResults := repairedIdx.SearchIVF(queryVec, K)
+		repairedTotalRecall += computeRecall(repairedResults, groundTruth)
 	}
 
 	repairedAvgRecall := repairedTotalRecall / float64(numQueries)
@@ -451,7 +445,6 @@ func main() {
 	}
 
 	db.Close()
-	repairedIdx.Close()
 
 	fmt.Printf("\n=== Phase 10: Streaming Insert Benchmark ===\n")
 

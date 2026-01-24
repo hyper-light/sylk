@@ -112,26 +112,25 @@ func TestPersistence_SearchRoundTrip(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	loaded, err := LoadIndex(indexDir)
+	loaded, err := LoadIndexInMemory(indexDir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	defer loaded.Close()
 
 	query := vectors[0]
 	k := 10
 
 	originalResults := idx.SearchIVF(query, k)
-	loadedResults := loaded.Search(query, k, 4)
+	loadedResults := loaded.SearchIVF(query, k)
 
 	if len(loadedResults) == 0 {
 		t.Error("loaded search returned no results")
 	}
 
-	if loadedResults[0] != 0 {
+	if loadedResults[0].ID != 0 {
 		foundOriginal := false
-		for _, id := range loadedResults {
-			if id == 0 {
+		for _, r := range loadedResults {
+			if r.ID == 0 {
 				foundOriginal = true
 				break
 			}
@@ -144,8 +143,8 @@ func TestPersistence_SearchRoundTrip(t *testing.T) {
 	if len(originalResults) > 0 && len(loadedResults) > 0 {
 		overlap := 0
 		loadedSet := make(map[uint32]bool)
-		for _, id := range loadedResults {
-			loadedSet[id] = true
+		for _, r := range loadedResults {
+			loadedSet[r.ID] = true
 		}
 		for _, r := range originalResults {
 			if loadedSet[r.ID] {
@@ -415,16 +414,15 @@ func BenchmarkPersistence_Search(b *testing.B) {
 		b.Fatalf("save: %v", err)
 	}
 
-	loaded, err := LoadIndex(indexDir)
+	loaded, err := LoadIndexInMemory(indexDir)
 	if err != nil {
 		b.Fatalf("load: %v", err)
 	}
-	defer loaded.Close()
 
 	query := vectors[0]
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = loaded.Search(query, 10, 8)
+		_ = loaded.SearchIVF(query, 10)
 	}
 }

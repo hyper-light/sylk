@@ -73,6 +73,10 @@ func NewIndex(config Config, dim int) *Index {
 	}
 }
 
+func (idx *Index) NumVectors() int {
+	return idx.numVectors
+}
+
 func (idx *Index) Build(vectors [][]float32) (*BuildResult, *BuildStats) {
 	stats := &BuildStats{}
 	totalStart := time.Now()
@@ -838,7 +842,6 @@ func (idx *Index) SearchVamana(query []float32, k int) []SearchResult {
 	beamWidth := idx.config.NProbe
 	return idx.graph.BeamSearchBBQ(query, k, beamWidth)
 }
-
 func (idx *Index) findTopPartitions(query []float32, queryNorm float64) []int {
 	nprobe := idx.config.NProbe
 	numParts := len(idx.centroids)

@@ -4,14 +4,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc64"
-	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"time"
 	"unsafe"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/storage"
-	"github.com/viterin/vek/vek32"
 	"gopkg.in/yaml.v3"
 )
 
@@ -361,6 +360,174 @@ func LoadIndex(baseDir string) (*PersistentIndex, error) {
 	}, nil
 }
 
+func LoadIndexInMemory(baseDir string) (*Index, error) {
+	metaPath := filepath.Join(baseDir, metadataFile)
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: read metadata: %w", err)
+	}
+
+	var meta IndexMetadata
+	if err := yaml.Unmarshal(metaData, &meta); err != nil {
+		return nil, fmt.Errorf("ivf: parse metadata: %w", err)
+	}
+
+	if meta.Version != metadataVersion {
+		return nil, fmt.Errorf("ivf: unsupported version %d", meta.Version)
+	}
+
+	vectorsPath := filepath.Join(baseDir, vectorsDir)
+	vectorStore, err := storage.OpenShardedVectorStore(vectorsPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: open vectors: %w", err)
+	}
+	defer vectorStore.Close()
+
+	graphPath := filepath.Join(baseDir, graphDir)
+	graphStore, err := storage.OpenShardedGraphStore(graphPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: open graph: %w", err)
+	}
+	defer graphStore.Close()
+
+	normsPath := filepath.Join(baseDir, normsDir)
+	normStore, corrupted, err := OpenShardedNormStore(normsPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: open norms: %w", err)
+	}
+	if len(corrupted) > 0 {
+		normStore.Close()
+		return nil, fmt.Errorf("ivf: corrupted norm shards: %v", corrupted)
+	}
+	defer normStore.Close()
+
+	bbqPath := filepath.Join(baseDir, bbqDir)
+	bbqStore, corrupted, err := OpenShardedBBQStore(bbqPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: open bbq: %w", err)
+	}
+	if len(corrupted) > 0 {
+		bbqStore.Close()
+		return nil, fmt.Errorf("ivf: corrupted bbq shards: %v", corrupted)
+	}
+	defer bbqStore.Close()
+
+	centroidsPath := filepath.Join(baseDir, centroidsFile)
+	centroidStore, err := LoadCentroids(centroidsPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: load centroids: %w", err)
+	}
+	defer centroidStore.Close()
+
+	partitionsPath := filepath.Join(baseDir, partitionsFile)
+	partitionIndex, err := LoadPartitionIndex(partitionsPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: load partitions: %w", err)
+	}
+	defer partitionIndex.Close()
+
+	bbqMeansPath := filepath.Join(baseDir, bbqMeansFile)
+	bbqMeans, err := loadBBQMeans(bbqMeansPath)
+	if err != nil {
+		return nil, fmt.Errorf("ivf: load bbq means: %w", err)
+	}
+
+	n := meta.NumVectors
+	dim := meta.Dim
+	numPartitions := meta.NumPartitions
+
+	vectorsFlat := make([]float32, n*dim)
+	for i := range n {
+		vec := vectorStore.Get(uint32(i))
+		copy(vectorsFlat[i*dim:(i+1)*dim], vec)
+	}
+
+	vectorNorms := make([]float64, n)
+	for i := range n {
+		vectorNorms[i] = normStore.Get(uint32(i))
+	}
+
+	bbqCodeLen := meta.BBQCodeLen
+	bbqCodes := make([]byte, n*bbqCodeLen)
+	for i := range n {
+		code := bbqStore.Get(uint32(i))
+		copy(bbqCodes[i*bbqCodeLen:(i+1)*bbqCodeLen], code)
+	}
+
+	centroids := make([][]float32, numPartitions)
+	centroidNorms := make([]float64, numPartitions)
+	for i := range numPartitions {
+		centroids[i] = make([]float32, dim)
+		copy(centroids[i], centroidStore.GetCentroid(i))
+		centroidNorms[i] = centroidStore.GetNorm(i)
+	}
+
+	partitionIDs := make([][]uint32, numPartitions)
+	idToLocation := make([]idLocation, n)
+	postingLists := make([]PostingList, numPartitions)
+
+	for p := range numPartitions {
+		ids := partitionIndex.Partition(p)
+		partitionIDs[p] = make([]uint32, len(ids))
+		copy(partitionIDs[p], ids)
+
+		for localIdx, id := range ids {
+			idToLocation[id] = idLocation{
+				partition: uint32(p),
+				localIdx:  uint32(localIdx),
+			}
+		}
+
+		postingLists[p] = PostingList{
+			IDs:         partitionIDs[p],
+			BinaryCodes: make([]uint64, len(ids)),
+		}
+	}
+
+	adjacency := make([][]uint32, n)
+	for i := range n {
+		neighbors := graphStore.GetNeighbors(uint32(i))
+		adjacency[i] = make([]uint32, len(neighbors))
+		copy(adjacency[i], neighbors)
+	}
+
+	partitionBits := bits.Len(uint(numPartitions)) - 1
+	if partitionBits < 1 {
+		partitionBits = 1
+	}
+
+	config := ConfigForN(n, dim)
+	config.NumPartitions = numPartitions
+
+	idx := &Index{
+		config:        config,
+		dim:           dim,
+		partitionBits: partitionBits,
+		postingLists:  postingLists,
+		vectorsFlat:   vectorsFlat,
+		vectorNorms:   vectorNorms,
+		idToLocation:  idToLocation,
+		numVectors:    n,
+		bbq:           NewBBQFromParams(dim, bbqCodeLen, bbqMeans),
+		bbqCodes:      bbqCodes,
+		bbqCodeLen:    bbqCodeLen,
+		centroids:     centroids,
+		centroidNorms: centroidNorms,
+		partitionIDs:  partitionIDs,
+		graph: &VamanaGraph{
+			adjacency: adjacency,
+			R:         meta.GraphR,
+			medoid:    meta.GraphMedoid,
+		},
+	}
+
+	idx.initProjections()
+	idx.graph.idx = idx
+	idx.healthTracker = newHealthTracker(idx)
+
+	return idx, nil
+}
+
 func (pi *PersistentIndex) Close() error {
 	var firstErr error
 
@@ -440,203 +607,4 @@ func (pi *PersistentIndex) GetCentroidNorm(idx int) float64 {
 
 func (pi *PersistentIndex) GetPartition(p int) []uint32 {
 	return pi.partitionIndex.Partition(p)
-}
-
-func (pi *PersistentIndex) Search(query []float32, k int, nprobe int) []uint32 {
-	if nprobe <= 0 {
-		nprobe = 1
-	}
-	if nprobe > pi.meta.NumPartitions {
-		nprobe = pi.meta.NumPartitions
-	}
-
-	partitions := pi.findNearestPartitions(query, nprobe)
-	queryNorm := math.Sqrt(float64(vek32.Dot(query, query)))
-
-	candidates := make([]searchCandidate, 0, nprobe*1000)
-
-	for _, p := range partitions {
-		ids := pi.partitionIndex.Partition(p)
-		for _, id := range ids {
-			vec := pi.vectorStore.Get(id)
-			if vec == nil {
-				continue
-			}
-			vecNorm := pi.normStore.Get(id)
-			if vecNorm == 0 {
-				continue
-			}
-			similarity := float64(vek32.Dot(query, vec)) / (queryNorm * vecNorm)
-			candidates = append(candidates, searchCandidate{id: id, dist: -similarity})
-		}
-	}
-
-	partialSort(candidates, k)
-	if len(candidates) > k {
-		candidates = candidates[:k]
-	}
-
-	for i := 1; i < len(candidates); i++ {
-		j := i
-		for j > 0 && candidates[j].dist < candidates[j-1].dist {
-			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
-			j--
-		}
-	}
-
-	ids := make([]uint32, len(candidates))
-	for i, c := range candidates {
-		ids[i] = c.id
-	}
-	return ids
-}
-
-type searchCandidate struct {
-	id   uint32
-	dist float64
-}
-
-func (pi *PersistentIndex) findNearestPartitions(query []float32, nprobe int) []int {
-	queryNorm := math.Sqrt(float64(vek32.Dot(query, query)))
-
-	candidates := make([]searchCandidate, pi.meta.NumPartitions)
-	for i := range pi.meta.NumPartitions {
-		centroid := pi.centroidStore.GetCentroid(i)
-		centroidNorm := pi.centroidStore.GetNorm(i)
-		dist := 1.0 - float64(vek32.Dot(query, centroid))/(queryNorm*centroidNorm)
-		candidates[i] = searchCandidate{id: uint32(i), dist: dist}
-	}
-
-	partialSort(candidates, nprobe)
-
-	result := make([]int, nprobe)
-	for i := range nprobe {
-		result[i] = int(candidates[i].id)
-	}
-	return result
-}
-
-func partialSort(candidates []searchCandidate, k int) {
-	if len(candidates) <= k {
-		for i := 1; i < len(candidates); i++ {
-			j := i
-			for j > 0 && candidates[j].dist < candidates[j-1].dist {
-				candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
-				j--
-			}
-		}
-		return
-	}
-
-	pivotIdx := len(candidates) / 2
-	pivot := candidates[pivotIdx]
-	candidates[pivotIdx], candidates[len(candidates)-1] = candidates[len(candidates)-1], candidates[pivotIdx]
-
-	storeIdx := 0
-	for i := 0; i < len(candidates)-1; i++ {
-		if candidates[i].dist < pivot.dist {
-			candidates[i], candidates[storeIdx] = candidates[storeIdx], candidates[i]
-			storeIdx++
-		}
-	}
-	candidates[storeIdx], candidates[len(candidates)-1] = candidates[len(candidates)-1], candidates[storeIdx]
-
-	if storeIdx == k-1 {
-		return
-	} else if storeIdx > k-1 {
-		partialSort(candidates[:storeIdx], k)
-	} else {
-		partialSort(candidates[storeIdx+1:], k-storeIdx-1)
-	}
-}
-
-func (pi *PersistentIndex) SearchVamana(query []float32, k int, beamWidth int) []uint32 {
-	if beamWidth <= 0 {
-		beamWidth = k
-	}
-
-	n := pi.meta.NumVectors
-	if n == 0 || k <= 0 {
-		return nil
-	}
-
-	queryNorm := math.Sqrt(float64(vek32.Dot(query, query)))
-	if queryNorm == 0 {
-		return nil
-	}
-
-	visited := make(map[uint32]bool)
-	result := make([]searchCandidate, 0, k)
-	frontier := make([]searchCandidate, 0, beamWidth)
-
-	entryPoint := pi.meta.GraphMedoid
-	visited[entryPoint] = true
-
-	entryVec := pi.vectorStore.Get(entryPoint)
-	entryNorm := pi.normStore.Get(entryPoint)
-	if entryVec != nil && entryNorm > 0 {
-		sim := float64(vek32.Dot(query, entryVec)) / (queryNorm * entryNorm)
-		frontier = append(frontier, searchCandidate{id: entryPoint, dist: -sim})
-	}
-
-	for len(frontier) > 0 {
-		best := frontier[0]
-		frontier = frontier[1:]
-
-		result = insertCandidate(result, best, k)
-
-		if len(result) >= k && -best.dist < -result[k-1].dist {
-			break
-		}
-
-		neighbors := pi.graphStore.GetNeighbors(best.id)
-		for _, neighborID := range neighbors {
-			if visited[neighborID] {
-				continue
-			}
-			visited[neighborID] = true
-
-			neighborVec := pi.vectorStore.Get(neighborID)
-			neighborNorm := pi.normStore.Get(neighborID)
-			if neighborVec == nil || neighborNorm == 0 {
-				continue
-			}
-
-			sim := float64(vek32.Dot(query, neighborVec)) / (queryNorm * neighborNorm)
-			frontier = insertCandidate(frontier, searchCandidate{id: neighborID, dist: -sim}, beamWidth)
-		}
-	}
-
-	ids := make([]uint32, len(result))
-	for i, c := range result {
-		ids[i] = c.id
-	}
-	return ids
-}
-
-func insertCandidate(list []searchCandidate, item searchCandidate, maxLen int) []searchCandidate {
-	pos := len(list)
-	for i := range list {
-		if item.dist < list[i].dist {
-			pos = i
-			break
-		}
-	}
-
-	if pos >= maxLen {
-		return list
-	}
-
-	if len(list) < maxLen {
-		list = append(list, searchCandidate{})
-	}
-
-	copy(list[pos+1:], list[pos:])
-	list[pos] = item
-
-	if len(list) > maxLen {
-		list = list[:maxLen]
-	}
-
-	return list
 }
