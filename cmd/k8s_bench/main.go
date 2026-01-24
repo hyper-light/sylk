@@ -345,6 +345,9 @@ func main() {
 	fmt.Printf("done in %v (%d vectors)\n", loadTime, loadedIdx.NumVectors())
 
 	fmt.Printf("Phase 7b: Validating loaded index search (queries=%d, K=%d)...\n", numQueries, K)
+	fmt.Printf("  Debug: in_memory_partitions=%d, loaded_partitions=%d, nprobe=%d\n",
+		len(idx.PartitionIDs()), loadedIdx.NumPartitions(), config.NProbe)
+
 	var loadedTotalRecall float64
 	var loadedTotalLatency time.Duration
 

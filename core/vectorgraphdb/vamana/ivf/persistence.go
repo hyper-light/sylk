@@ -476,6 +476,14 @@ func (pi *PersistentIndex) Search(query []float32, k int, nprobe int) []uint32 {
 		candidates = candidates[:k]
 	}
 
+	for i := 1; i < len(candidates); i++ {
+		j := i
+		for j > 0 && candidates[j].dist < candidates[j-1].dist {
+			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
+			j--
+		}
+	}
+
 	ids := make([]uint32, len(candidates))
 	for i, c := range candidates {
 		ids[i] = c.id
@@ -540,4 +548,95 @@ func partialSort(candidates []searchCandidate, k int) {
 	} else {
 		partialSort(candidates[storeIdx+1:], k-storeIdx-1)
 	}
+}
+
+func (pi *PersistentIndex) SearchVamana(query []float32, k int, beamWidth int) []uint32 {
+	if beamWidth <= 0 {
+		beamWidth = k
+	}
+
+	n := pi.meta.NumVectors
+	if n == 0 || k <= 0 {
+		return nil
+	}
+
+	queryNorm := math.Sqrt(float64(vek32.Dot(query, query)))
+	if queryNorm == 0 {
+		return nil
+	}
+
+	visited := make(map[uint32]bool)
+	result := make([]searchCandidate, 0, k)
+	frontier := make([]searchCandidate, 0, beamWidth)
+
+	entryPoint := pi.meta.GraphMedoid
+	visited[entryPoint] = true
+
+	entryVec := pi.vectorStore.Get(entryPoint)
+	entryNorm := pi.normStore.Get(entryPoint)
+	if entryVec != nil && entryNorm > 0 {
+		sim := float64(vek32.Dot(query, entryVec)) / (queryNorm * entryNorm)
+		frontier = append(frontier, searchCandidate{id: entryPoint, dist: -sim})
+	}
+
+	for len(frontier) > 0 {
+		best := frontier[0]
+		frontier = frontier[1:]
+
+		result = insertCandidate(result, best, k)
+
+		if len(result) >= k && -best.dist < -result[k-1].dist {
+			break
+		}
+
+		neighbors := pi.graphStore.GetNeighbors(best.id)
+		for _, neighborID := range neighbors {
+			if visited[neighborID] {
+				continue
+			}
+			visited[neighborID] = true
+
+			neighborVec := pi.vectorStore.Get(neighborID)
+			neighborNorm := pi.normStore.Get(neighborID)
+			if neighborVec == nil || neighborNorm == 0 {
+				continue
+			}
+
+			sim := float64(vek32.Dot(query, neighborVec)) / (queryNorm * neighborNorm)
+			frontier = insertCandidate(frontier, searchCandidate{id: neighborID, dist: -sim}, beamWidth)
+		}
+	}
+
+	ids := make([]uint32, len(result))
+	for i, c := range result {
+		ids[i] = c.id
+	}
+	return ids
+}
+
+func insertCandidate(list []searchCandidate, item searchCandidate, maxLen int) []searchCandidate {
+	pos := len(list)
+	for i := range list {
+		if item.dist < list[i].dist {
+			pos = i
+			break
+		}
+	}
+
+	if pos >= maxLen {
+		return list
+	}
+
+	if len(list) < maxLen {
+		list = append(list, searchCandidate{})
+	}
+
+	copy(list[pos+1:], list[pos:])
+	list[pos] = item
+
+	if len(list) > maxLen {
+		list = list[:maxLen]
+	}
+
+	return list
 }
