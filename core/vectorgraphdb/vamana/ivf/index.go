@@ -1287,3 +1287,12 @@ func (idx *Index) GraphAdjacency() [][]uint32 {
 	}
 	return idx.graph.adjacency
 }
+
+func (idx *Index) BBQEncoder() func(vec []float32) []byte {
+	codeLen := idx.bbqCodeLen
+	return func(vec []float32) []byte {
+		code := make([]byte, codeLen)
+		idx.bbq.EncodeDB(vec, code)
+		return code
+	}
+}

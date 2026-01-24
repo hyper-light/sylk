@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io/fs"
+	"math"
 	"math/bits"
 	"os"
 	"path/filepath"
@@ -20,6 +23,7 @@ import (
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/ivf"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type scored struct {
@@ -34,6 +38,145 @@ type symbol struct {
 	signature string
 	filePath  string
 	nodeType  uint16
+}
+
+const benchDir = "/tmp/ivfbench"
+
+func initSQLite(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS symbols (
+			id INTEGER PRIMARY KEY,
+			symbol_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			signature TEXT,
+			file_path TEXT NOT NULL,
+			node_type INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS embeddings (
+			id INTEGER PRIMARY KEY,
+			embedding BLOB NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
+	`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func storeSymbolsAndEmbeddings(db *sql.DB, symbols []symbol, embeddings [][]float32) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	symbolStmt, err := tx.Prepare("INSERT INTO symbols (id, symbol_id, name, kind, signature, file_path, node_type) VALUES (?, ?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer symbolStmt.Close()
+
+	embedStmt, err := tx.Prepare("INSERT INTO embeddings (id, embedding) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer embedStmt.Close()
+
+	for i, s := range symbols {
+		if _, err := symbolStmt.Exec(i, s.id, s.name, s.kind, s.signature, s.filePath, s.nodeType); err != nil {
+			return err
+		}
+
+		embBytes := make([]byte, len(embeddings[i])*4)
+		for j, v := range embeddings[i] {
+			binary.LittleEndian.PutUint32(embBytes[j*4:], math.Float32bits(v))
+		}
+		if _, err := embedStmt.Exec(i, embBytes); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func loadEmbeddingFromDB(db *sql.DB, id int) ([]float32, error) {
+	var embBytes []byte
+	err := db.QueryRow("SELECT embedding FROM embeddings WHERE id = ?", id).Scan(&embBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	dim := len(embBytes) / 4
+	vec := make([]float32, dim)
+	for i := range dim {
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(embBytes[i*4:]))
+	}
+	return vec, nil
+}
+
+func computeRecallUint32(results []uint32, groundTruth []uint32) float64 {
+	if len(results) == 0 || len(groundTruth) == 0 {
+		return 0
+	}
+
+	truthSet := make(map[uint32]struct{}, len(groundTruth))
+	for _, id := range groundTruth {
+		truthSet[id] = struct{}{}
+	}
+
+	hits := 0
+	for _, id := range results {
+		if _, ok := truthSet[id]; ok {
+			hits++
+		}
+	}
+
+	return float64(hits) / float64(len(groundTruth))
+}
+
+func corruptBBQShard(indexDir string, shardIdx int) {
+	shardPath := filepath.Join(indexDir, "bbq", fmt.Sprintf("shard_%04d.bin", shardIdx))
+	data, err := os.ReadFile(shardPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read bbq shard: %v\n", err)
+		return
+	}
+
+	if len(data) > 100 {
+		for i := 50; i < 100; i++ {
+			data[i] ^= 0xFF
+		}
+	}
+	if err := os.WriteFile(shardPath, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write corrupted bbq shard: %v\n", err)
+	}
+}
+
+func corruptNormShard(indexDir string, shardIdx int) {
+	shardPath := filepath.Join(indexDir, "norms", fmt.Sprintf("shard_%04d.bin", shardIdx))
+	data, err := os.ReadFile(shardPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read norm shard: %v\n", err)
+		return
+	}
+
+	if len(data) > 100 {
+		for i := 50; i < 100; i++ {
+			data[i] ^= 0xFF
+		}
+	}
+	if err := os.WriteFile(shardPath, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write corrupted norm shard: %v\n", err)
+	}
 }
 
 func main() {
@@ -65,6 +208,12 @@ func main() {
 
 	totalStart := time.Now()
 
+	os.RemoveAll(benchDir)
+	if err := os.MkdirAll(benchDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create bench dir: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Print("Phase 1: Scanning files... ")
 	scanStart := time.Now()
 	var files []string
@@ -94,6 +243,20 @@ func main() {
 	fmt.Printf("%d embeddings in %v (%.0f emb/sec)\n",
 		len(embeddings), time.Since(embedStart),
 		float64(len(embeddings))/time.Since(embedStart).Seconds())
+
+	fmt.Print("Phase 3b: Storing in SQLite... ")
+	sqliteStart := time.Now()
+	dbPath := filepath.Join(benchDir, "knowledge.db")
+	db, err := initSQLite(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to init sqlite: %v\n", err)
+		os.Exit(1)
+	}
+	if err := storeSymbolsAndEmbeddings(db, symbols, embeddings); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to store data: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("done in %v\n", time.Since(sqliteStart))
 
 	config := ivf.ConfigForN(len(embeddings), dim)
 	fmt.Printf("\nIVF Config: partitions=%d, nprobe=%d, oversample=%d, dim=%d\n",
@@ -159,6 +322,133 @@ func main() {
 	ivfAvgRecall := ivfTotalRecall / float64(numQueries)
 	fmt.Printf("  [IVF]    Avg latency: %v, recall@%d: %.2f%%\n", ivfAvgLatency, K, ivfAvgRecall*100)
 
+	indexDir := filepath.Join(benchDir, "index")
+
+	fmt.Print("\nPhase 6: Saving index to disk... ")
+	saveStart := time.Now()
+	if err := idx.Save(indexDir); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to save index: %v\n", err)
+		os.Exit(1)
+	}
+	saveTime := time.Since(saveStart)
+	fmt.Printf("done in %v\n", saveTime)
+
+	fmt.Print("Phase 7: Loading index from disk... ")
+	loadStart := time.Now()
+	loadedIdx, err := ivf.LoadIndex(indexDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load index: %v\n", err)
+		os.Exit(1)
+	}
+	defer loadedIdx.Close()
+	loadTime := time.Since(loadStart)
+	fmt.Printf("done in %v (%d vectors)\n", loadTime, loadedIdx.NumVectors())
+
+	fmt.Printf("Phase 7b: Validating loaded index search (queries=%d, K=%d)...\n", numQueries, K)
+	var loadedTotalRecall float64
+	var loadedTotalLatency time.Duration
+
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+
+		start := time.Now()
+		loadedResults := loadedIdx.Search(queryVec, K, config.NProbe)
+		loadedTotalLatency += time.Since(start)
+		loadedTotalRecall += computeRecallUint32(loadedResults, groundTruth)
+	}
+
+	loadedAvgLatency := loadedTotalLatency / time.Duration(numQueries)
+	loadedAvgRecall := loadedTotalRecall / float64(numQueries)
+	fmt.Printf("  [Loaded] Avg latency: %v, recall@%d: %.2f%%\n", loadedAvgLatency, K, loadedAvgRecall*100)
+
+	if loadedAvgRecall < 0.85 {
+		fmt.Fprintf(os.Stderr, "ERROR: Loaded index recall too low: %.2f%% (expected >85%%)\n",
+			loadedAvgRecall*100)
+		os.Exit(1)
+	}
+
+	loadedIdx.Close()
+
+	fmt.Print("\nPhase 8: Corruption test... ")
+	corruptBBQShard(indexDir, 0)
+	corruptNormShard(indexDir, 1)
+	fmt.Println("corrupted BBQ shard 0 and Norm shard 1")
+
+	fmt.Print("Phase 8b: Running consistency check... ")
+	checker := ivf.NewConsistencyChecker(indexDir)
+	report, err := checker.Check()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "consistency check failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if report.IsHealthy() {
+		fmt.Fprintf(os.Stderr, "ERROR: Corrupted index reported as healthy!\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("detected %d corrupt shards\n", len(report.CorruptShards))
+	for _, cs := range report.CorruptShards {
+		fmt.Printf("  - %s shard %d: %s\n", cs.StoreType, cs.ShardIdx, cs.Reason)
+	}
+
+	fmt.Print("\nPhase 9: Repairing corrupted shards... ")
+	repairStart := time.Now()
+	bbqEncoder := idx.BBQEncoder()
+	repairCfg := ivf.RepairConfig{
+		BBQEncoder: bbqEncoder,
+		Dim:        dim,
+	}
+	if err := ivf.RepairFromSQLite(indexDir, report, nil, repairCfg); err != nil {
+		fmt.Fprintf(os.Stderr, "repair failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("done in %v\n", time.Since(repairStart))
+
+	fmt.Print("Phase 9b: Verifying repair with consistency check... ")
+	report, err = checker.Check()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "post-repair check failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !report.IsHealthy() {
+		fmt.Fprintf(os.Stderr, "ERROR: Index still unhealthy after repair!\n")
+		os.Exit(1)
+	}
+	fmt.Println("healthy")
+
+	fmt.Print("Phase 9c: Validating repaired index search... ")
+	repairedIdx, err := ivf.LoadIndex(indexDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load repaired index: %v\n", err)
+		os.Exit(1)
+	}
+	defer repairedIdx.Close()
+
+	var repairedTotalRecall float64
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		repairedResults := repairedIdx.Search(queryVec, K, config.NProbe)
+		repairedTotalRecall += computeRecallUint32(repairedResults, groundTruth)
+	}
+
+	repairedAvgRecall := repairedTotalRecall / float64(numQueries)
+	fmt.Printf("recall@%d: %.2f%%\n", K, repairedAvgRecall*100)
+
+	if math.Abs(repairedAvgRecall-loadedAvgRecall) > 0.01 {
+		fmt.Fprintf(os.Stderr, "ERROR: Repaired index recall differs from pre-corruption loaded recall: %.2f%% vs %.2f%%\n",
+			repairedAvgRecall*100, loadedAvgRecall*100)
+		os.Exit(1)
+	}
+
+	db.Close()
+
 	totalTime := time.Since(totalStart)
 	fmt.Printf("\n=== Summary ===\n")
 	fmt.Printf("Total files:      %d\n", len(files))
@@ -167,6 +457,9 @@ func main() {
 	fmt.Printf("Build time:       %v (%.0f vec/sec)\n", buildTime, float64(len(embeddings))/buildTime.Seconds())
 	fmt.Printf("Search latency:   %v avg\n", vamanaAvgLatency)
 	fmt.Printf("Recall@%d:        %.2f%%\n", K, vamanaAvgRecall*100)
+	fmt.Printf("Persistence:      save=%v, load=%v\n", saveTime, loadTime)
+	fmt.Printf("Loaded recall:    %.2f%%\n", loadedAvgRecall*100)
+	fmt.Printf("Repaired recall:  %.2f%%\n", repairedAvgRecall*100)
 
 	if *memProfile != "" {
 		f, err := os.Create(*memProfile)

@@ -1383,7 +1383,6 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 	}
 	logP := bits.Len(uint(numParts))
 
-	// Base nprobe derived from k and partition count
 	missRate := 1.0 / float64(k*logK)
 	sqrtK := math.Sqrt(float64(k))
 	coverageFactor := 1.0 - math.Pow(missRate, 1.0/sqrtK)
@@ -1394,22 +1393,9 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 		nprobe = minProbe
 	}
 
-	// Adjust nprobe based on clustering quality
-	// clusteringQuality = mean(ownSim / bestOtherSim)
-	// - Quality > 1.0: vectors are closer to own centroid than others (well-clustered)
-	// - Quality ≈ 1.0: vectors equally close to own and adjacent centroids (poorly clustered)
-	//
-	// For well-clustered data (quality > 1): reduce nprobe (fewer partitions needed)
-	// For poorly-clustered data (quality ≈ 1): increase nprobe (need more coverage)
-	//
-	// Derivation: spreadFactor = 1 / quality
-	// - quality=2.0 → spreadFactor=0.5 → probe half as many partitions
-	// - quality=1.0 → spreadFactor=1.0 → probe base amount
-	// - quality=0.5 → spreadFactor=2.0 → probe twice as many partitions
 	if g.clusteringQuality > 0 {
 		spreadFactor := 1.0 / g.clusteringQuality
 		nprobe = int(float64(nprobe) * spreadFactor)
-		// Ensure minimum probe count for safety
 		if nprobe < minProbe {
 			nprobe = minProbe
 		}
@@ -1531,4 +1517,8 @@ func (idx *Index) GraphStats() GraphStats {
 		return GraphStats{}
 	}
 	return idx.graph.Stats()
+}
+
+func (g *VamanaGraph) ClusteringQuality() float64 {
+	return g.clusteringQuality
 }

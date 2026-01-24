@@ -28,15 +28,16 @@ const (
 )
 
 type IndexMetadata struct {
-	Version       int       `yaml:"version"`
-	NumVectors    int       `yaml:"num_vectors"`
-	Dim           int       `yaml:"dim"`
-	NumPartitions int       `yaml:"num_partitions"`
-	BBQCodeLen    int       `yaml:"bbq_code_len"`
-	GraphR        int       `yaml:"graph_r"`
-	GraphMedoid   uint32    `yaml:"graph_medoid"`
-	CreatedAt     time.Time `yaml:"created_at"`
-	LastModified  time.Time `yaml:"last_modified"`
+	Version           int       `yaml:"version"`
+	NumVectors        int       `yaml:"num_vectors"`
+	Dim               int       `yaml:"dim"`
+	NumPartitions     int       `yaml:"num_partitions"`
+	BBQCodeLen        int       `yaml:"bbq_code_len"`
+	GraphR            int       `yaml:"graph_r"`
+	GraphMedoid       uint32    `yaml:"graph_medoid"`
+	ClusteringQuality float64   `yaml:"clustering_quality"`
+	CreatedAt         time.Time `yaml:"created_at"`
+	LastModified      time.Time `yaml:"last_modified"`
 }
 
 type PersistentIndex struct {
@@ -148,15 +149,16 @@ func (idx *Index) Save(baseDir string) error {
 
 	now := time.Now()
 	meta := &IndexMetadata{
-		Version:       metadataVersion,
-		NumVectors:    idx.numVectors,
-		Dim:           idx.dim,
-		NumPartitions: idx.config.NumPartitions,
-		BBQCodeLen:    idx.bbqCodeLen,
-		GraphR:        idx.graph.R,
-		GraphMedoid:   idx.graph.medoid,
-		CreatedAt:     now,
-		LastModified:  now,
+		Version:           metadataVersion,
+		NumVectors:        idx.numVectors,
+		Dim:               idx.dim,
+		NumPartitions:     idx.config.NumPartitions,
+		BBQCodeLen:        idx.bbqCodeLen,
+		GraphR:            idx.graph.R,
+		GraphMedoid:       idx.graph.medoid,
+		ClusteringQuality: idx.graph.ClusteringQuality(),
+		CreatedAt:         now,
+		LastModified:      now,
 	}
 
 	metaPath := filepath.Join(baseDir, metadataFile)
@@ -449,51 +451,34 @@ func (pi *PersistentIndex) Search(query []float32, k int, nprobe int) []uint32 {
 	}
 
 	partitions := pi.findNearestPartitions(query, nprobe)
-
 	queryNorm := math.Sqrt(float64(vek32.Dot(query, query)))
-	bbqQuery := pi.bbq.EncodeQuery(query)
 
 	candidates := make([]searchCandidate, 0, nprobe*1000)
 
 	for _, p := range partitions {
 		ids := pi.partitionIndex.Partition(p)
 		for _, id := range ids {
-			code := pi.bbqStore.Get(id)
-			if code == nil {
+			vec := pi.vectorStore.Get(id)
+			if vec == nil {
 				continue
 			}
-			bbqDist := bbqQuery.Distance(code)
-			candidates = append(candidates, searchCandidate{id: id, dist: float64(-bbqDist)})
+			vecNorm := pi.normStore.Get(id)
+			if vecNorm == 0 {
+				continue
+			}
+			similarity := float64(vek32.Dot(query, vec)) / (queryNorm * vecNorm)
+			candidates = append(candidates, searchCandidate{id: id, dist: -similarity})
 		}
 	}
 
-	if len(candidates) > k*10 {
-		partialSort(candidates, k*10)
-		candidates = candidates[:k*10]
+	partialSort(candidates, k)
+	if len(candidates) > k {
+		candidates = candidates[:k]
 	}
 
-	results := make([]searchCandidate, 0, k)
-	for _, c := range candidates {
-		vec := pi.vectorStore.Get(c.id)
-		if vec == nil {
-			continue
-		}
-		vecNorm := pi.normStore.Get(c.id)
-		if vecNorm == 0 {
-			continue
-		}
-		dist := 1.0 - float64(vek32.Dot(query, vec))/(queryNorm*vecNorm)
-		results = append(results, searchCandidate{id: c.id, dist: dist})
-	}
-
-	partialSort(results, k)
-	if len(results) > k {
-		results = results[:k]
-	}
-
-	ids := make([]uint32, len(results))
-	for i, r := range results {
-		ids[i] = r.id
+	ids := make([]uint32, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.id
 	}
 	return ids
 }
