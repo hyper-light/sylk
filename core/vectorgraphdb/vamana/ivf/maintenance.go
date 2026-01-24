@@ -201,31 +201,137 @@ func (idx *Index) RefreshCentroids(iterations int) (*RefreshResult, error) {
 
 	k := len(idx.centroids)
 	dim := idx.dim
+	n := idx.numVectors
+	numWorkers := runtime.GOMAXPROCS(0)
 
-	assignments := make([]int, idx.numVectors)
-	for i := range idx.numVectors {
-		vec := idx.getVector(uint32(i))
-		if vec != nil {
-			assignments[i] = idx.findNearestCentroid(vec)
+	centroidsFlat := make([]float32, k*dim)
+	centroidNormsSq := make([]float64, k)
+	for p := range k {
+		copy(centroidsFlat[p*dim:(p+1)*dim], idx.centroids[p])
+		centroidNormsSq[p] = idx.centroidNorms[p] * idx.centroidNorms[p]
+	}
+
+	sqrtK := 1
+	for sqrtK*sqrtK < k {
+		sqrtK++
+	}
+
+	superCentroids := make([]float32, sqrtK*dim)
+	superNormsSq := make([]float64, sqrtK)
+	groupStarts := make([]int, sqrtK)
+	groupEnds := make([]int, sqrtK)
+
+	for i := range sqrtK {
+		groupStarts[i] = i * (k / sqrtK)
+		groupEnds[i] = groupStarts[i] + k/sqrtK
+		if i == sqrtK-1 {
+			groupEnds[i] = k
+		}
+		for j := range dim {
+			var sum float32
+			for c := groupStarts[i]; c < groupEnds[i]; c++ {
+				sum += centroidsFlat[c*dim+j]
+			}
+			superCentroids[i*dim+j] = sum / float32(groupEnds[i]-groupStarts[i])
+		}
+		superNormsSq[i] = float64(vek32.Dot(superCentroids[i*dim:(i+1)*dim], superCentroids[i*dim:(i+1)*dim]))
+	}
+
+	assignFast := func(assignments []int) {
+		chunkSize := (n + numWorkers - 1) / numWorkers
+		var wg sync.WaitGroup
+
+		for w := range numWorkers {
+			start := w * chunkSize
+			end := min(start+chunkSize, n)
+			if start >= end {
+				continue
+			}
+
+			wg.Add(1)
+			go func(start, end int) {
+				defer wg.Done()
+				superDists := make([]float64, sqrtK)
+
+				for i := start; i < end; i++ {
+					vec := idx.getVector(uint32(i))
+					if vec == nil {
+						continue
+					}
+					vecNormSq := idx.vectorNorms[i] * idx.vectorNorms[i]
+
+					for s := range sqrtK {
+						dot := vek32.Dot(vec, superCentroids[s*dim:(s+1)*dim])
+						superDists[s] = vecNormSq + superNormsSq[s] - 2*float64(dot)
+					}
+
+					best1, best2 := 0, 1
+					if superDists[1] < superDists[0] {
+						best1, best2 = 1, 0
+					}
+					for s := 2; s < sqrtK; s++ {
+						if superDists[s] < superDists[best1] {
+							best2 = best1
+							best1 = s
+						} else if superDists[s] < superDists[best2] {
+							best2 = s
+						}
+					}
+
+					bestCentroid := groupStarts[best1]
+					bestDist := math.MaxFloat64
+
+					for c := groupStarts[best1]; c < groupEnds[best1]; c++ {
+						dot := vek32.Dot(vec, centroidsFlat[c*dim:(c+1)*dim])
+						d := vecNormSq + centroidNormsSq[c] - 2*float64(dot)
+						if d < bestDist {
+							bestDist = d
+							bestCentroid = c
+						}
+					}
+					for c := groupStarts[best2]; c < groupEnds[best2]; c++ {
+						dot := vek32.Dot(vec, centroidsFlat[c*dim:(c+1)*dim])
+						d := vecNormSq + centroidNormsSq[c] - 2*float64(dot)
+						if d < bestDist {
+							bestDist = d
+							bestCentroid = c
+						}
+					}
+					assignments[i] = bestCentroid
+				}
+			}(start, end)
+		}
+		wg.Wait()
+	}
+
+	rebuildSuperCentroids := func() {
+		for i := range sqrtK {
+			for j := range dim {
+				var sum float32
+				for c := groupStarts[i]; c < groupEnds[i]; c++ {
+					sum += centroidsFlat[c*dim+j]
+				}
+				superCentroids[i*dim+j] = sum / float32(groupEnds[i]-groupStarts[i])
+			}
+			superNormsSq[i] = float64(vek32.Dot(superCentroids[i*dim:(i+1)*dim], superCentroids[i*dim:(i+1)*dim]))
 		}
 	}
 
+	assignments := make([]int, n)
+	assignFast(assignments)
+
 	for iter := range iterations {
-		newCentroids := make([][]float32, k)
+		newCentroidsFlat := make([]float32, k*dim)
 		counts := make([]int, k)
 
-		for p := range k {
-			newCentroids[p] = make([]float32, dim)
-		}
-
-		for i := range idx.numVectors {
+		for i := range n {
 			p := assignments[i]
 			vec := idx.getVector(uint32(i))
 			if vec == nil {
 				continue
 			}
 			for j, v := range vec {
-				newCentroids[p][j] += v
+				newCentroidsFlat[p*dim+j] += v
 			}
 			counts[p]++
 		}
@@ -234,54 +340,50 @@ func (idx *Index) RefreshCentroids(iterations int) (*RefreshResult, error) {
 			if counts[p] > 0 {
 				invCount := 1.0 / float32(counts[p])
 				for j := range dim {
-					newCentroids[p][j] *= invCount
+					newCentroidsFlat[p*dim+j] *= invCount
 				}
 			} else {
-				copy(newCentroids[p], idx.centroids[p])
+				copy(newCentroidsFlat[p*dim:(p+1)*dim], centroidsFlat[p*dim:(p+1)*dim])
 			}
+			centroidNormsSq[p] = float64(vek32.Dot(newCentroidsFlat[p*dim:(p+1)*dim], newCentroidsFlat[p*dim:(p+1)*dim]))
 		}
 
-		idx.centroids = newCentroids
-		for p := range k {
-			idx.centroidNorms[p] = math.Sqrt(float64(vek32.Dot(idx.centroids[p], idx.centroids[p])))
-		}
+		centroidsFlat = newCentroidsFlat
+		rebuildSuperCentroids()
 
 		if iter < iterations-1 {
-			for i := range idx.numVectors {
-				vec := idx.getVector(uint32(i))
-				if vec != nil {
-					assignments[i] = idx.findNearestCentroid(vec)
-				}
+			assignFast(assignments)
+		}
+	}
+
+	for p := range k {
+		idx.centroids[p] = make([]float32, dim)
+		copy(idx.centroids[p], centroidsFlat[p*dim:(p+1)*dim])
+		idx.centroidNorms[p] = math.Sqrt(centroidNormsSq[p])
+	}
+
+	result.NewCentroids = idx.centroids
+
+	originalPartitions := make([]int, n)
+	for p, ids := range idx.partitionIDs {
+		for _, id := range ids {
+			if int(id) < n {
+				originalPartitions[id] = p
 			}
 		}
 	}
 
-	result.NewCentroids = idx.centroids
+	finalAssignments := make([]int, n)
+	assignFast(finalAssignments)
 
 	newPartitionIDs := make([][]uint32, k)
 	for p := range k {
 		newPartitionIDs[p] = make([]uint32, 0)
 	}
 
-	for i := range idx.numVectors {
-		vec := idx.getVector(uint32(i))
-		if vec == nil {
-			continue
-		}
-		oldPartition := -1
-		for p, ids := range idx.partitionIDs {
-			for _, id := range ids {
-				if id == uint32(i) {
-					oldPartition = p
-					break
-				}
-			}
-			if oldPartition >= 0 {
-				break
-			}
-		}
-
-		newPartition := idx.findNearestCentroid(vec)
+	for i := range n {
+		oldPartition := originalPartitions[i]
+		newPartition := finalAssignments[i]
 		newPartitionIDs[newPartition] = append(newPartitionIDs[newPartition], uint32(i))
 
 		if oldPartition != newPartition {
