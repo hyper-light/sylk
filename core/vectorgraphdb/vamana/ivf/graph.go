@@ -397,7 +397,8 @@ func (g *VamanaGraph) buildPartitionGraphHamming(partIdx int, cfg GraphConfig, w
 		localR = n - 1
 	}
 
-	localL := cfg.L
+	logR := bits.Len(uint(localR))
+	localL := localR * logR
 	if localL > n-1 {
 		localL = n - 1
 	}
@@ -483,10 +484,25 @@ func (g *VamanaGraph) greedySearchLocal(queryLocal, startLocal int, localAdj [][
 	startDist := HammingDistance(queryCode, startCode)
 	w.pq.insert(uint32(startLocal), startDist)
 
+	logN := bits.Len(uint(n))
+	staleLimit := logN
+	staleCount := 0
+	bestDist := startDist
+
 	for w.pq.hasUnexpanded() {
 		currentID, currentDist, ok := w.pq.closestUnexpanded()
 		if !ok {
 			break
+		}
+
+		if currentDist < bestDist {
+			bestDist = currentDist
+			staleCount = 0
+		} else {
+			staleCount++
+			if staleCount >= staleLimit {
+				break
+			}
 		}
 
 		w.candidates = append(w.candidates, vamanaCandidate{currentID, currentDist})
