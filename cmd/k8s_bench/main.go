@@ -562,6 +562,23 @@ func main() {
 	fmt.Printf("done in %v (nodes=%d, +%d/-%d edges)\n",
 		time.Since(optimizeStart), optimizeResult.NodesUpdated, optimizeResult.EdgesAdded, optimizeResult.EdgesRemoved)
 
+	fmt.Print("Phase 11e: Testing recall after graph optimization... ")
+	var postOptimizeRecall float64
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		results := insertTestIdx.SearchVamana(queryVec, K)
+		postOptimizeRecall += computeRecall(results, groundTruth)
+	}
+	postOptimizeAvgRecall := postOptimizeRecall / float64(numQueries)
+	fmt.Printf("recall@%d: %.2f%%\n", K, postOptimizeAvgRecall*100)
+
+	if postOptimizeAvgRecall < postInsertAvgRecall-0.02 {
+		fmt.Fprintf(os.Stderr, "WARNING: Graph optimization hurt recall: %.2f%% -> %.2f%%\n",
+			postInsertAvgRecall*100, postOptimizeAvgRecall*100)
+	}
+
 	totalTime := time.Since(totalStart)
 	fmt.Printf("\n=== Summary ===\n")
 	fmt.Printf("Total files:      %d\n", len(files))

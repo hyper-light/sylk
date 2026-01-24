@@ -544,19 +544,8 @@ func (idx *Index) OptimizeGraph(sampleFraction float64) *OptimizeResult {
 
 			for _, nodeIDInt := range nodeIDs {
 				nodeID := uint32(nodeIDInt)
-				vec := idx.getVector(nodeID)
-				if vec == nil {
-					continue
-				}
 
-				results := idx.graph.BeamSearchBBQ(vec, idx.graph.R*2, idx.graph.R*2)
-
-				newNeighbors := make([]uint32, 0, idx.graph.R)
-				for _, r := range results {
-					if r.ID != nodeID && len(newNeighbors) < idx.graph.R {
-						newNeighbors = append(newNeighbors, r.ID)
-					}
-				}
+				newNeighbors := idx.graph.searchGraphBBQ(nodeID, idx.graph.R, idx.graph.R*2)
 
 				mu.Lock()
 				oldNeighbors := idx.graph.adjacency[nodeID]

@@ -1463,6 +1463,103 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 	return result
 }
 
+func (g *VamanaGraph) searchGraphBBQ(queryID uint32, k int, beamWidth int) []uint32 {
+	idx := g.idx
+	n := idx.numVectors
+	if n == 0 || k <= 0 {
+		return nil
+	}
+
+	codeLen := idx.bbqCodeLen
+	codes := idx.bbqCodes
+	queryCode := codes[int(queryID)*codeLen : int(queryID)*codeLen+codeLen]
+
+	visited := make(map[uint32]struct{}, beamWidth*4)
+	beam := make([]graphCandidate, 0, beamWidth)
+	allCandidates := make([]graphCandidate, 0, beamWidth*4)
+
+	startNode := g.medoid
+	if g.nodeToPartition != nil && queryID < uint32(len(g.nodeToPartition)) {
+		p := g.nodeToPartition[queryID]
+		if int(p) < len(g.partitionReps) {
+			startNode = g.partitionReps[p]
+		}
+	}
+
+	visited[startNode] = struct{}{}
+	visited[queryID] = struct{}{}
+	startCode := codes[int(startNode)*codeLen : int(startNode)*codeLen+codeLen]
+	startDist := HammingDistance(queryCode, startCode)
+	beam = append(beam, graphCandidate{startNode, int32(startDist)})
+	allCandidates = append(allCandidates, graphCandidate{startNode, int32(startDist)})
+
+	logN := bits.Len(uint(n))
+	staleLimit := logN
+	staleCount := 0
+	bestDist := int32(startDist)
+
+	for len(beam) > 0 {
+		bestIdx := 0
+		for i := 1; i < len(beam); i++ {
+			if beam[i].bbqDist < beam[bestIdx].bbqDist {
+				bestIdx = i
+			}
+		}
+
+		current := beam[bestIdx]
+		beam[bestIdx] = beam[len(beam)-1]
+		beam = beam[:len(beam)-1]
+
+		if current.bbqDist < bestDist {
+			bestDist = current.bbqDist
+			staleCount = 0
+		} else {
+			staleCount++
+			if staleCount >= staleLimit {
+				break
+			}
+		}
+
+		for _, nbID := range g.adjacency[current.id] {
+			if _, seen := visited[nbID]; seen {
+				continue
+			}
+			visited[nbID] = struct{}{}
+
+			nbCode := codes[int(nbID)*codeLen : int(nbID)*codeLen+codeLen]
+			nbDist := int32(HammingDistance(queryCode, nbCode))
+
+			candidate := graphCandidate{nbID, nbDist}
+			allCandidates = append(allCandidates, candidate)
+
+			if len(beam) < beamWidth {
+				beam = append(beam, candidate)
+			} else {
+				worstIdx := 0
+				for i := 1; i < len(beam); i++ {
+					if beam[i].bbqDist > beam[worstIdx].bbqDist {
+						worstIdx = i
+					}
+				}
+				if nbDist < beam[worstIdx].bbqDist {
+					beam[worstIdx] = candidate
+				}
+			}
+		}
+	}
+
+	slices.SortFunc(allCandidates, func(a, b graphCandidate) int {
+		return int(a.bbqDist) - int(b.bbqDist)
+	})
+
+	resultLen := min(k, len(allCandidates))
+	result := make([]uint32, resultLen)
+	for i := range resultLen {
+		result[i] = allCandidates[i].id
+	}
+	return result
+}
+
 type GraphStats struct {
 	NumNodes         int
 	NumEdges         int
