@@ -51,6 +51,8 @@ type Index struct {
 	partitionIDs  [][]uint32
 
 	graph *VamanaGraph
+
+	healthTracker *HealthTracker
 }
 
 type idLocation struct {
@@ -102,6 +104,8 @@ func (idx *Index) Build(vectors [][]float32) (*BuildResult, *BuildStats) {
 	stats.BBQNanos = t2.Sub(t1).Nanoseconds()
 	stats.PartitionNanos = t3.Sub(t2).Nanoseconds()
 	stats.GraphNanos = t4.Sub(t3).Nanoseconds()
+
+	idx.healthTracker = newHealthTracker(idx)
 
 	result := &BuildResult{
 		NumVectors:       n,
@@ -824,6 +828,10 @@ func (idx *Index) SearchIVF(query []float32, k int) []SearchResult {
 }
 
 func (idx *Index) SearchVamana(query []float32, k int) []SearchResult {
+	if idx.healthTracker != nil && !idx.healthTracker.sampling.Load() {
+		idx.healthTracker.RecordQuery()
+	}
+
 	if idx.graph == nil {
 		return idx.SearchIVF(query, k)
 	}

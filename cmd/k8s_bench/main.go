@@ -448,6 +448,87 @@ func main() {
 	}
 
 	db.Close()
+	repairedIdx.Close()
+
+	fmt.Printf("\n=== Phase 10: Streaming Insert Benchmark ===\n")
+
+	splitPoint := int(float64(len(embeddings)) * 0.99)
+	buildEmbeddings := embeddings[:splitPoint]
+	insertEmbeddings := embeddings[splitPoint:]
+
+	fmt.Printf("Building index with %d vectors (99%%)...\n", len(buildEmbeddings))
+	insertTestIdx := ivf.NewIndex(ivf.ConfigForN(len(buildEmbeddings), dim), dim)
+	insertTestIdx.Build(buildEmbeddings)
+
+	fmt.Printf("Streaming insert of %d vectors (1%%)...\n", len(insertEmbeddings))
+	insertStart := time.Now()
+	var insertLatencies []time.Duration
+	for _, vec := range insertEmbeddings {
+		opStart := time.Now()
+		_, err := insertTestIdx.Insert(vec)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "insert failed: %v\n", err)
+			os.Exit(1)
+		}
+		insertLatencies = append(insertLatencies, time.Since(opStart))
+	}
+	totalInsertTime := time.Since(insertStart)
+
+	var totalLatency time.Duration
+	for _, lat := range insertLatencies {
+		totalLatency += lat
+	}
+	avgInsertLatency := totalLatency / time.Duration(len(insertLatencies))
+
+	fmt.Printf("  Inserted %d vectors in %v\n", len(insertEmbeddings), totalInsertTime)
+	fmt.Printf("  Avg insert latency: %v\n", avgInsertLatency)
+	fmt.Printf("  Insert throughput: %.0f vec/sec\n", float64(len(insertEmbeddings))/totalInsertTime.Seconds())
+
+	fmt.Print("Phase 10b: Testing recall after inserts... ")
+	var postInsertRecall float64
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		results := insertTestIdx.SearchVamana(queryVec, K)
+		postInsertRecall += computeRecall(results, groundTruth)
+	}
+	postInsertAvgRecall := postInsertRecall / float64(numQueries)
+	fmt.Printf("recall@%d: %.2f%%\n", K, postInsertAvgRecall*100)
+
+	fmt.Print("\nPhase 11: Maintenance Stats... ")
+	mstats := insertTestIdx.MaintenanceStats()
+	fmt.Printf("\n  Vectors: %d, Partitions: %d\n", mstats.NumVectors, mstats.NumPartitions)
+	fmt.Printf("  Partition balance: gini=%.4f, cv=%.4f\n", mstats.PartitionSizeGini, mstats.PartitionSizeCV)
+	fmt.Printf("  Drift ratio: %.4f (1.0 = baseline)\n", mstats.DriftRatio)
+	fmt.Printf("  Graph health: connectivity=%.4f, fill_rate=%.4f\n", mstats.ConnectivityRatio, mstats.DegreeFillRate)
+
+	fmt.Print("\nPhase 11b: Refreshing centroids... ")
+	refreshStart := time.Now()
+	refreshResult, err := insertTestIdx.RefreshCentroids(3)
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+	} else {
+		fmt.Printf("done in %v (%d vectors reassigned)\n", time.Since(refreshStart), refreshResult.VectorsReassigned)
+
+		fmt.Print("Phase 11c: Testing recall after centroid refresh... ")
+		var postRefreshRecall float64
+		for i := range numQueries {
+			queryIdx := (i * stride) % n
+			queryVec := embeddings[queryIdx]
+			groundTruth := bruteForceTopK(queryVec, embeddings, K)
+			results := insertTestIdx.SearchVamana(queryVec, K)
+			postRefreshRecall += computeRecall(results, groundTruth)
+		}
+		postRefreshAvgRecall := postRefreshRecall / float64(numQueries)
+		fmt.Printf("recall@%d: %.2f%%\n", K, postRefreshAvgRecall*100)
+	}
+
+	fmt.Print("\nPhase 11d: Optimizing graph... ")
+	optimizeStart := time.Now()
+	optimizeResult := insertTestIdx.OptimizeGraph(0)
+	fmt.Printf("done in %v (nodes=%d, +%d/-%d edges)\n",
+		time.Since(optimizeStart), optimizeResult.NodesUpdated, optimizeResult.EdgesAdded, optimizeResult.EdgesRemoved)
 
 	totalTime := time.Since(totalStart)
 	fmt.Printf("\n=== Summary ===\n")
@@ -460,6 +541,8 @@ func main() {
 	fmt.Printf("Persistence:      save=%v, load=%v\n", saveTime, loadTime)
 	fmt.Printf("Loaded recall:    %.2f%%\n", loadedAvgRecall*100)
 	fmt.Printf("Repaired recall:  %.2f%%\n", repairedAvgRecall*100)
+	fmt.Printf("Insert:           %v avg, %.0f vec/sec\n", avgInsertLatency, float64(len(insertEmbeddings))/totalInsertTime.Seconds())
+	fmt.Printf("Post-insert recall: %.2f%%\n", postInsertAvgRecall*100)
 
 	if *memProfile != "" {
 		f, err := os.Create(*memProfile)
