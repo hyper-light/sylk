@@ -103,7 +103,6 @@ type IngestStats struct {
 }
 
 const (
-	// Mock embedding dimension (matches text-embedding-3-small)
 	embeddingDim = 768
 
 	// Domain for code

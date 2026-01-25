@@ -17,6 +17,10 @@ func NewMockEmbedder(dimension int) *MockEmbedder {
 	return &MockEmbedder{dimension: dimension}
 }
 
+func NewDefaultMockEmbedder() *MockEmbedder {
+	return &MockEmbedder{dimension: EmbeddingDimension}
+}
+
 func NewMockEmbedderWithLatency(dimension int, latency time.Duration) *MockEmbedder {
 	return &MockEmbedder{dimension: dimension, latency: latency}
 }

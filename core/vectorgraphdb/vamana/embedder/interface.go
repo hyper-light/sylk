@@ -22,12 +22,12 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Model:          "text-embedding-3-small",
-		Dimension:      768,
-		BatchSize:      100,
-		Timeout:        30 * time.Second,
-		TokensPerMin:   1_000_000,
-		RequestsPerMin: 3000,
+		Model:          string(VoyageCode3),
+		Dimension:      voyageCode3Dim,
+		BatchSize:      voyageDefaultBatchSize,
+		Timeout:        voyageDefaultTimeout,
+		TokensPerMin:   voyageTokensPerMin,
+		RequestsPerMin: voyageRequestsPerMin,
 	}
 }
 

@@ -226,8 +226,7 @@ func TestDimensionMismatchUsesConstant(t *testing.T) {
 		t.Fatal("expected to find dimension_mismatch check")
 	}
 
-	// The query should contain the EmbeddingDimension constant value
-	expectedSubstring := "768"
+	expectedSubstring := "1024"
 	if len(check.Query) == 0 {
 		t.Fatal("dimension_mismatch query is empty")
 	}

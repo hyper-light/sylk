@@ -173,23 +173,18 @@ func (k EdgeKind) String() string {
 // Result Types
 // =============================================================================
 
-// IngestionResult holds the results and metrics of an ingestion.
 type IngestionResult struct {
-	Graph *CodeGraph
-
-	// Metrics
+	Graph          *CodeGraph
 	TotalFiles     int
 	TotalSymbols   int
 	TotalLines     int
 	TotalBytes     int64
 	TotalDuration  time.Duration
 	PhaseDurations PhaseDurations
-
-	// Errors (non-fatal)
-	ParseErrors []FileParseError
+	VectorResult   *VectorResult
+	ParseErrors    []FileParseError
 }
 
-// PhaseDurations holds timing for each ingestion phase.
 type PhaseDurations struct {
 	Discovery time.Duration
 	Mmap      time.Duration
@@ -197,6 +192,13 @@ type PhaseDurations struct {
 	Aggregate time.Duration
 	Persist   time.Duration
 	Index     time.Duration
+	Vector    time.Duration
+}
+
+type VectorResult struct {
+	SymbolCount    int
+	EmbedderSource string
+	DiskSizeBytes  int64
 }
 
 // FileParseError represents a file that failed to parse.
@@ -209,28 +211,22 @@ type FileParseError struct {
 // Configuration
 // =============================================================================
 
-// Config holds ingestion configuration.
 type Config struct {
-	// Root path to scan
-	RootPath string
-
-	// Gitignore patterns (compiled)
+	RootPath       string
 	IgnorePatterns []string
+	SQLitePath     string
+	BlevePath      string
+	Workers        int
+	SkipPersist    bool
+	SkipBleve      bool
+	VectorConfig   *VectorConfig
+}
 
-	// SQLite database path (for VectorGraphDB)
-	SQLitePath string
-
-	// Bleve index path
-	BlevePath string
-
-	// Worker count (derived from CPU count if 0)
-	Workers int
-
-	// Skip persistence (for testing)
-	SkipPersist bool
-
-	// Skip Bleve (only persist to SQLite)
-	SkipBleve bool
+type VectorConfig struct {
+	StorageDir    string
+	ForceLocal    bool
+	SkipModelLoad bool
+	BatchSize     int
 }
 
 // WithDefaults applies default values to the config.

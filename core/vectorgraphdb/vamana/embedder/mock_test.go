@@ -6,7 +6,7 @@ import (
 )
 
 func TestMockEmbedder_Deterministic(t *testing.T) {
-	e := NewMockEmbedder(768)
+	e := NewMockEmbedder(EmbeddingDimension)
 
 	text := "func TestMockEmbedder_Deterministic"
 	v1, err := e.Embed(context.Background(), text)
@@ -18,8 +18,8 @@ func TestMockEmbedder_Deterministic(t *testing.T) {
 		t.Fatalf("Embed failed: %v", err)
 	}
 
-	if len(v1) != 768 {
-		t.Errorf("Expected dimension 768, got %d", len(v1))
+	if len(v1) != EmbeddingDimension {
+		t.Errorf("Expected dimension %d, got %d", EmbeddingDimension, len(v1))
 	}
 
 	for i := range v1 {
@@ -31,7 +31,7 @@ func TestMockEmbedder_Deterministic(t *testing.T) {
 }
 
 func TestMockEmbedder_DifferentInputs(t *testing.T) {
-	e := NewMockEmbedder(768)
+	e := NewMockEmbedder(EmbeddingDimension)
 
 	v1, _ := e.Embed(context.Background(), "hello")
 	v2, _ := e.Embed(context.Background(), "world")
@@ -50,7 +50,7 @@ func TestMockEmbedder_DifferentInputs(t *testing.T) {
 }
 
 func TestMockEmbedder_EmbedBatch(t *testing.T) {
-	e := NewMockEmbedder(768)
+	e := NewMockEmbedder(EmbeddingDimension)
 
 	texts := []string{"func Foo", "type Bar", "const Baz"}
 	results, err := e.EmbedBatch(context.Background(), texts)
@@ -63,7 +63,7 @@ func TestMockEmbedder_EmbedBatch(t *testing.T) {
 	}
 
 	for i, r := range results {
-		if len(r) != 768 {
+		if len(r) != EmbeddingDimension {
 			t.Errorf("Result %d has wrong dimension: %d", i, len(r))
 		}
 	}
