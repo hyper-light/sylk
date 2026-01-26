@@ -2,19 +2,22 @@ package embedder
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/adalundhe/sylk/core/llm"
 )
 
 type FactoryConfig struct {
-	CacheDir         string
-	ForceLocal       bool
-	ForceTier        *ModelTier
-	VoyageAPIKey     string
-	SkipModelLoad    bool
-	OrtLibraryPath   string
-	AutoDownloadLibs bool
-	LibraryManager   *LibraryManager
+	CacheDir          string
+	EnableHighQuality bool
+	ForceTier         *ModelTier
+	VoyageAPIKey      string
+
+	// voyageBaseURL is used for testing to inject a mock server URL.
+	// Empty string uses the default Voyage API URL.
+	voyageBaseURL string
 }
 
 type FactoryResult struct {
@@ -22,179 +25,154 @@ type FactoryResult struct {
 	Tier     ModelTier
 	Source   string
 	Hardware HardwareCapabilities
+	UseGPU   bool
 }
 
 func NewEmbedder(ctx context.Context, cfg FactoryConfig) (*FactoryResult, error) {
 	hardware := DetectHardware()
 
-	if !cfg.ForceLocal {
-		apiKey := cfg.VoyageAPIKey
-		if apiKey == "" {
-			apiKey = os.Getenv("VOYAGE_API_KEY")
-		}
-
-		if apiKey != "" {
-			voyageCfg := VoyageConfig{
-				APIKey: apiKey,
-				Model:  VoyageCode3,
-			}
-
-			embedder, err := NewVoyageEmbedder(voyageCfg)
-			if err == nil {
-				return &FactoryResult{
-					Embedder: embedder,
-					Tier:     TierQwen3,
-					Source:   "voyage-api",
-					Hardware: hardware,
-				}, nil
-			}
+	if cfg.CacheDir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			cfg.CacheDir = filepath.Join(home, ".sylk", "models")
 		}
 	}
 
-	var tier ModelTier
+	if cfg.VoyageAPIKey == "" {
+		if key, err := llm.ResolveAPIKey("voyage"); err == nil {
+			cfg.VoyageAPIKey = key
+		}
+	}
+
 	if cfg.ForceTier != nil {
-		tier = *cfg.ForceTier
-	} else {
-		tier = hardware.SelectModelTier()
+		return createEmbedderForTier(ctx, *cfg.ForceTier, cfg, hardware)
 	}
 
-	switch tier {
-	case TierHybridLocal:
+	if cfg.VoyageAPIKey != "" && cfg.EnableHighQuality {
+		if err := verifyVoyageAPIKeyWithURL(ctx, cfg.VoyageAPIKey, cfg.voyageBaseURL); err == nil {
+			return createVoyageEmbedderWithURL(cfg.VoyageAPIKey, cfg.voyageBaseURL, hardware)
+		}
+		slog.Warn("voyage API key verification failed, falling back to local embedder",
+			"error", "verification_failed")
+		tier := hardware.SelectHighQualityTier()
+		return createEmbedderForTier(ctx, tier, cfg, hardware)
+	}
+
+	if cfg.VoyageAPIKey != "" {
+		return createVoyageEmbedderWithURL(cfg.VoyageAPIKey, cfg.voyageBaseURL, hardware)
+	}
+
+	if cfg.EnableHighQuality {
+		tier := hardware.SelectHighQualityTier()
+		return createEmbedderForTier(ctx, tier, cfg, hardware)
+	}
+
+	return &FactoryResult{
+		Embedder: NewEnhancedHybridEmbedder(),
+		Tier:     TierHybridLocal,
+		Source:   "hybrid-local",
+		Hardware: hardware,
+		UseGPU:   false,
+	}, nil
+}
+
+func createVoyageEmbedderWithURL(apiKey, baseURL string, hardware HardwareCapabilities) (*FactoryResult, error) {
+	voyageCfg := VoyageConfig{
+		APIKey:  apiKey,
+		Model:   VoyageCode3,
+		BaseURL: baseURL,
+	}
+	embedder, err := NewVoyageEmbedder(voyageCfg)
+	if err != nil {
+		return nil, err
+	}
+	return &FactoryResult{
+		Embedder: embedder,
+		Tier:     TierQwen3_4B,
+		Source:   "voyage-api",
+		Hardware: hardware,
+		UseGPU:   false,
+	}, nil
+}
+
+func createEmbedderForTier(ctx context.Context, tier ModelTier, cfg FactoryConfig, hardware HardwareCapabilities) (*FactoryResult, error) {
+	if tier == TierHybridLocal {
 		return &FactoryResult{
-			Embedder: NewHybridLocalEmbedder(),
+			Embedder: NewEnhancedHybridEmbedder(),
 			Tier:     TierHybridLocal,
 			Source:   "hybrid-local",
 			Hardware: hardware,
+			UseGPU:   false,
 		}, nil
+	}
 
-	case TierGTELarge, TierQwen3:
-		ortPath := cfg.OrtLibraryPath
-		if ortPath == "" {
-			ortPath = findOrtLibraryPath()
-		}
-
-		if ortPath == "" && cfg.AutoDownloadLibs {
-			libMgr := cfg.LibraryManager
-			if libMgr == nil {
-				var err error
-				libMgr, err = NewLibraryManager()
-				if err != nil {
-					return &FactoryResult{
-						Embedder: NewHybridLocalEmbedder(),
-						Tier:     TierHybridLocal,
-						Source:   "hybrid-local-fallback",
-						Hardware: hardware,
-					}, nil
-				}
-			}
-
-			if _, err := libMgr.EnsureLibraries(); err != nil {
+	if !hardware.CanRunTier(tier) {
+		if tier == TierQwen3_4B {
+			tier = TierQwen3_0_6B
+			if !hardware.CanRunTier(tier) {
 				return &FactoryResult{
-					Embedder: NewHybridLocalEmbedder(),
+					Embedder: NewEnhancedHybridEmbedder(),
 					Tier:     TierHybridLocal,
 					Source:   "hybrid-local-fallback",
 					Hardware: hardware,
+					UseGPU:   false,
 				}, nil
 			}
-
-			ortPath = libMgr.LibDir()
-		}
-
-		onnxCfg := ONNXConfig{
-			Tier:           tier,
-			CacheDir:       cfg.CacheDir,
-			UseGPU:         hardware.HasNVIDIAGPU && hardware.VRAMGB >= tier.Spec().MinVRAMGB,
-			OrtLibraryPath: ortPath,
-		}
-
-		embedder, err := NewONNXEmbedder(onnxCfg)
-		if err != nil {
+		} else {
 			return &FactoryResult{
-				Embedder: NewHybridLocalEmbedder(),
+				Embedder: NewEnhancedHybridEmbedder(),
 				Tier:     TierHybridLocal,
 				Source:   "hybrid-local-fallback",
 				Hardware: hardware,
+				UseGPU:   false,
 			}, nil
 		}
+	}
 
-		if !cfg.SkipModelLoad {
-			if err := embedder.EnsureModel(ctx); err != nil {
-				return &FactoryResult{
-					Embedder: embedder.Fallback(),
-					Tier:     TierHybridLocal,
-					Source:   "hybrid-local-fallback",
-					Hardware: hardware,
-				}, nil
-			}
-		}
+	useGPU := hardware.CanUseGPU(tier)
 
-		source := "onnx-" + tier.String()
-		if embedder.IsReady() {
-			return &FactoryResult{
-				Embedder: embedder,
-				Tier:     tier,
-				Source:   source,
-				Hardware: hardware,
-			}, nil
-		}
+	ggufCfg := GGUFConfig{
+		Tier:     tier,
+		CacheDir: cfg.CacheDir,
+		UseGPU:   useGPU,
+	}
 
+	embedder, err := NewGGUFEmbedder(ctx, ggufCfg)
+	if err != nil {
 		return &FactoryResult{
-			Embedder: embedder.Fallback(),
+			Embedder: NewEnhancedHybridEmbedder(),
 			Tier:     TierHybridLocal,
 			Source:   "hybrid-local-fallback",
 			Hardware: hardware,
-		}, nil
-
-	default:
-		return &FactoryResult{
-			Embedder: NewHybridLocalEmbedder(),
-			Tier:     TierHybridLocal,
-			Source:   "hybrid-local",
-			Hardware: hardware,
+			UseGPU:   false,
 		}, nil
 	}
+
+	source := "gguf-cpu-" + tier.String()
+	if useGPU {
+		source = "gguf-gpu-" + tier.String()
+	}
+
+	return &FactoryResult{
+		Embedder: embedder,
+		Tier:     tier,
+		Source:   source,
+		Hardware: hardware,
+		UseGPU:   useGPU,
+	}, nil
 }
 
 func NewLocalEmbedder(ctx context.Context) (*FactoryResult, error) {
-	cfg := FactoryConfig{ForceLocal: true}
+	cfg := FactoryConfig{EnableHighQuality: false}
 	return NewEmbedder(ctx, cfg)
 }
 
-func NewHybridEmbedder() Embedder {
-	return NewHybridLocalEmbedder()
+func NewHighQualityEmbedder(ctx context.Context) (*FactoryResult, error) {
+	cfg := FactoryConfig{EnableHighQuality: true}
+	return NewEmbedder(ctx, cfg)
 }
 
-func findOrtLibraryPath() string {
-	candidates := []string{
-		"/usr/lib",
-		"/usr/local/lib",
-		"/usr/lib/x86_64-linux-gnu",
-	}
-
-	home, err := os.UserHomeDir()
-	if err == nil {
-		candidates = append(candidates, filepath.Join(home, ".sylk", "lib"))
-	}
-
-	cwd, err := os.Getwd()
-	if err == nil {
-		candidates = append(candidates, filepath.Join(cwd, "lib"))
-		for {
-			parent := filepath.Dir(cwd)
-			if parent == cwd {
-				break
-			}
-			cwd = parent
-			candidates = append(candidates, filepath.Join(cwd, "lib"))
-		}
-	}
-
-	for _, dir := range candidates {
-		libPath := filepath.Join(dir, "libonnxruntime.so")
-		if _, err := os.Stat(libPath); err == nil {
-			return dir
-		}
-	}
-
-	return ""
+// NewHybridEmbedder returns the enhanced hybrid embedder (default).
+func NewHybridEmbedder() Embedder {
+	return NewEnhancedHybridEmbedder()
 }
