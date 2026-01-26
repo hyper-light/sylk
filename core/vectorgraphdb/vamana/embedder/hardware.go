@@ -59,24 +59,142 @@ func ResetHardwareCache() {
 	capabilitiesMu.Unlock()
 }
 
-// detectNVIDIAGPU attempts to detect NVIDIA GPU using nvidia-smi.
+// detectNVIDIAGPU attempts to detect NVIDIA GPU.
 // Returns VRAM in GB, GPU name, and success flag.
 func detectNVIDIAGPU() (float64, string, bool) {
-	// Try nvidia-smi first (most reliable)
-	if vram, name, ok := detectViaNvidiaSMI(); ok {
+	// Try sysfs first (instant, no driver cold-start)
+	if vram, name, ok := detectViaSysfs(); ok {
 		return vram, name, true
 	}
 
-	// Fallback: check sysfs for NVIDIA devices
-	if hasNVIDIADevice() {
-		// Can't determine VRAM without nvidia-smi, assume minimal
-		return 0, "NVIDIA GPU (unknown model)", true
+	// Fallback to nvidia-smi (may have 1-2s cold-start on first call)
+	if vram, name, ok := detectViaNvidiaSMI(); ok {
+		return vram, name, true
 	}
 
 	return 0, "", false
 }
 
+// detectViaSysfs reads GPU info from Linux sysfs (instant, no driver init).
+// VRAM is extracted from PCI BAR1 which maps GPU memory.
+func detectViaSysfs() (float64, string, bool) {
+	if runtime.GOOS != "linux" {
+		return 0, "", false
+	}
+
+	pciDevices := "/sys/bus/pci/devices"
+	entries, err := os.ReadDir(pciDevices)
+	if err != nil {
+		return 0, "", false
+	}
+
+	for _, entry := range entries {
+		devicePath := filepath.Join(pciDevices, entry.Name())
+
+		// Check vendor ID (NVIDIA = 0x10de)
+		vendorData, err := os.ReadFile(filepath.Join(devicePath, "vendor"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(vendorData)) != "0x10de" {
+			continue
+		}
+
+		// Check device class (display controller = 0x03xxxx)
+		classData, err := os.ReadFile(filepath.Join(devicePath, "class"))
+		if err != nil {
+			continue
+		}
+		if !strings.HasPrefix(strings.TrimSpace(string(classData)), "0x03") {
+			continue
+		}
+
+		// Found NVIDIA GPU - extract VRAM from PCI resource file
+		vram := parseVRAMFromResource(filepath.Join(devicePath, "resource"))
+
+		// Try to get device name from device ID
+		name := "NVIDIA GPU"
+		if deviceData, err := os.ReadFile(filepath.Join(devicePath, "device")); err == nil {
+			deviceID := strings.TrimSpace(string(deviceData))
+			name = lookupNVIDIADeviceName(deviceID)
+		}
+
+		return vram, name, true
+	}
+
+	return 0, "", false
+}
+
+// parseVRAMFromResource extracts VRAM size from PCI resource file.
+// BAR1 (second line) contains the GPU memory mapping.
+func parseVRAMFromResource(path string) float64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+
+	lines := strings.Split(string(data), "\n")
+	if len(lines) < 2 {
+		return 0
+	}
+
+	// BAR1 is the second line (index 1), contains VRAM mapping
+	// Format: "start_addr end_addr flags"
+	fields := strings.Fields(lines[1])
+	if len(fields) < 2 {
+		return 0
+	}
+
+	start, err := strconv.ParseUint(strings.TrimPrefix(fields[0], "0x"), 16, 64)
+	if err != nil {
+		return 0
+	}
+	end, err := strconv.ParseUint(strings.TrimPrefix(fields[1], "0x"), 16, 64)
+	if err != nil {
+		return 0
+	}
+
+	if end <= start {
+		return 0
+	}
+
+	sizeBytes := end - start + 1
+	return float64(sizeBytes) / (1024 * 1024 * 1024) // Convert to GB
+}
+
+// lookupNVIDIADeviceName returns a human-readable name for common NVIDIA GPUs.
+func lookupNVIDIADeviceName(deviceID string) string {
+	// Common consumer/workstation GPUs (can be extended)
+	names := map[string]string{
+		"0x2684": "GeForce RTX 4090",
+		"0x2704": "GeForce RTX 4080",
+		"0x2782": "GeForce RTX 4070 Ti",
+		"0x2786": "GeForce RTX 4070",
+		"0x28e0": "GeForce RTX 4070 Mobile",
+		"0x28e1": "GeForce RTX 4070 Mobile",
+		"0x2820": "GeForce RTX 4070 Laptop GPU",
+		"0x2860": "GeForce RTX 4070 Max-Q",
+		"0x2717": "GeForce RTX 4080 Super",
+		"0x2757": "GeForce RTX 4070 Super",
+		"0x2882": "GeForce RTX 4060",
+		"0x2420": "GeForce RTX 3090",
+		"0x2204": "GeForce RTX 3090",
+		"0x2206": "GeForce RTX 3080",
+		"0x2216": "GeForce RTX 3080 Mobile",
+		"0x2208": "GeForce RTX 3080 Ti",
+		"0x2484": "GeForce RTX 3070",
+		"0x2488": "GeForce RTX 3070 Ti",
+		"0x2503": "GeForce RTX 3060",
+		"0x2504": "GeForce RTX 3060 Ti",
+	}
+	if name, ok := names[deviceID]; ok {
+		return name
+	}
+	return "NVIDIA GPU"
+}
+
 // detectViaNvidiaSMI uses nvidia-smi to query GPU information.
+// Note: nvidia-smi has ~1.8s cold-start on first invocation due to driver init.
 func detectViaNvidiaSMI() (float64, string, bool) {
 	cmd := exec.Command("nvidia-smi",
 		"--query-gpu=memory.total,name",
@@ -108,46 +226,6 @@ func detectViaNvidiaSMI() (float64, string, bool) {
 	vramGB := memMiB / 1024.0
 
 	return vramGB, name, true
-}
-
-// hasNVIDIADevice checks sysfs for NVIDIA PCI devices.
-func hasNVIDIADevice() bool {
-	if runtime.GOOS != "linux" {
-		return false
-	}
-
-	// NVIDIA vendor ID is 10de
-	pciDevices := "/sys/bus/pci/devices"
-	entries, err := os.ReadDir(pciDevices)
-	if err != nil {
-		return false
-	}
-
-	for _, entry := range entries {
-		vendorPath := filepath.Join(pciDevices, entry.Name(), "vendor")
-		data, err := os.ReadFile(vendorPath)
-		if err != nil {
-			continue
-		}
-
-		vendor := strings.TrimSpace(string(data))
-		// NVIDIA vendor ID
-		if vendor == "0x10de" {
-			// Check device class is display controller (03xx)
-			classPath := filepath.Join(pciDevices, entry.Name(), "class")
-			classData, err := os.ReadFile(classPath)
-			if err != nil {
-				continue
-			}
-			class := strings.TrimSpace(string(classData))
-			// Display controller class starts with 0x03
-			if strings.HasPrefix(class, "0x03") {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // detectSystemRAM returns system RAM in GB.
@@ -230,18 +308,22 @@ func detectRAMWindows() float64 {
 	return 4.0
 }
 
-// SelectModelTier determines the appropriate model tier based on hardware.
-func (h HardwareCapabilities) SelectModelTier() ModelTier {
-	// Tier 1: GPU with ≥2GB VRAM
-	if h.HasNVIDIAGPU && h.VRAMGB >= 2.0 {
-		return TierQwen3
+func (h HardwareCapabilities) SelectHighQualityTier() ModelTier {
+	if h.SystemRAMGB >= 6.0 {
+		return TierQwen3_4B
 	}
+	return TierQwen3_0_6B
+}
 
-	// Tier 2: GPU with <2GB VRAM or CPU with ≥2GB RAM
-	if h.HasNVIDIAGPU || h.SystemRAMGB >= 2.0 {
-		return TierGTELarge
+func (h HardwareCapabilities) CanUseGPU(tier ModelTier) bool {
+	if !h.HasNVIDIAGPU {
+		return false
 	}
+	spec := tier.Spec()
+	return h.VRAMGB >= spec.MinVRAMGB
+}
 
-	// Tier 3: Limited resources
-	return TierHybridLocal
+func (h HardwareCapabilities) CanRunTier(tier ModelTier) bool {
+	spec := tier.Spec()
+	return h.SystemRAMGB >= spec.MinRAMGB
 }
