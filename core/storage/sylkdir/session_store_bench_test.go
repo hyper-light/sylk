@@ -53,7 +53,7 @@ func BenchmarkSessionCheckpoint(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		sess.Checkpoint(fmt.Sprintf("cp%d", i), "explicit")
+		sess.Checkpoint(fmt.Sprintf("cp%d", i), CheckpointPatch)
 	}
 }
 
@@ -66,16 +66,21 @@ func BenchmarkSessionCheckout(b *testing.B) {
 	store := NewSessionStore(sd)
 	sess, _ := store.Create(1, nil)
 
-	// Create 10 versions
-	for i := 0; i < 10; i++ {
-		sess.Checkpoint(fmt.Sprintf("cp%d", i), "explicit")
+	// Create 10 versions: v1.0.0 through v1.0.9
+	for i := 0; i < 9; i++ {
+		sess.Checkpoint(fmt.Sprintf("cp%d", i), CheckpointPatch)
+	}
+
+	// Pre-compute versions for checkout
+	versions := []SemanticVersion{
+		{Major: 1, Minor: 0, Patch: 0},
+		{Major: 1, Minor: 0, Patch: 4},
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		// Alternate between versions 1 and 5
-		versionID := uint32((i % 2) * 4 + 1)
-		sess.Checkout(versionID)
+		// Alternate between v1.0.0 and v1.0.4
+		sess.Checkout(versions[i%2])
 	}
 }
 
@@ -90,7 +95,7 @@ func BenchmarkSessionGetAncestorChain(b *testing.B) {
 
 	// Create 100 versions (deep history)
 	for i := 0; i < 100; i++ {
-		sess.Checkpoint(fmt.Sprintf("cp%d", i), "explicit")
+		sess.Checkpoint(fmt.Sprintf("cp%d", i), CheckpointPatch)
 	}
 
 	b.ResetTimer()
@@ -117,7 +122,7 @@ func BenchmarkSessionWithVersions_5(b *testing.B) {
 
 		// Create 4 additional versions (total 5)
 		for v := 0; v < 4; v++ {
-			sess.Checkpoint(fmt.Sprintf("checkpoint-%d", v), "explicit")
+			sess.Checkpoint(fmt.Sprintf("checkpoint-%d", v), CheckpointPatch)
 		}
 
 		// Verify structure
@@ -152,9 +157,9 @@ func BenchmarkFullSessionWorkflow(b *testing.B) {
 		}
 
 		// 2. Create checkpoints (simulating work)
-		sess.Checkpoint("initial-indexing", "implicit")
-		sess.Checkpoint("after-refactor", "explicit")
-		sess.Checkpoint("auto-checkpoint", "auto_delta")
+		sess.Checkpoint("initial-indexing", CheckpointPatch)
+		sess.Checkpoint("after-refactor", CheckpointMinor)
+		sess.Checkpoint("auto-checkpoint", CheckpointPatch)
 
 		// 3. Simulate writing docs to version (create batch.jsonl)
 		docsPath := sess.DocsPath(sess.Manifest.Head)
@@ -166,15 +171,16 @@ func BenchmarkFullSessionWorkflow(b *testing.B) {
 			b.Fatalf("Write docs failed: %v", err)
 		}
 
-		// 4. Checkout earlier version
-		sess.Checkout(2)
+		// 4. Checkout earlier version (v1.0.1)
+		v101 := SemanticVersion{Major: 1, Minor: 0, Patch: 1}
+		sess.Checkout(v101)
 
 		// 5. Create branch
-		sess.Checkpoint("branch-from-v2", "explicit")
+		sess.Checkpoint("branch-from-v101", CheckpointPatch)
 
 		// 6. Get ancestor chain
 		chain := sess.GetAncestorChain()
-		if len(chain) != 3 { // v5 -> v2 -> v1
+		if len(chain) != 3 { // v1.0.2 -> v1.0.1 -> v1.0.0
 			b.Fatalf("Expected 3 ancestors, got %d", len(chain))
 		}
 
@@ -206,7 +212,7 @@ func BenchmarkSessionStoreStats(b *testing.B) {
 	for i := uint32(1); i <= 10; i++ {
 		sess, _ := store.Create(i, nil)
 		for j := 0; j < int(i); j++ {
-			sess.Checkpoint(fmt.Sprintf("cp%d", j), "explicit")
+			sess.Checkpoint(fmt.Sprintf("cp%d", j), CheckpointPatch)
 		}
 	}
 
@@ -246,7 +252,13 @@ func BenchmarkDeepVersionHistory(b *testing.B) {
 
 	// Create 500 versions (deep history)
 	for i := 0; i < 500; i++ {
-		sess.Checkpoint("", "auto_delta")
+		sess.Checkpoint("", CheckpointPatch)
+	}
+
+	// Pre-compute versions for checkout benchmark
+	var checkoutVersions []SemanticVersion
+	for i := 0; i < 500; i++ {
+		checkoutVersions = append(checkoutVersions, SemanticVersion{Major: 1, Minor: 0, Patch: uint16(i)})
 	}
 
 	b.ResetTimer()
@@ -259,7 +271,7 @@ func BenchmarkDeepVersionHistory(b *testing.B) {
 
 	b.Run("Checkout", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			sess.Checkout(uint32(i%500 + 1))
+			sess.Checkout(checkoutVersions[i%500])
 		}
 	})
 

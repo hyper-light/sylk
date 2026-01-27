@@ -45,22 +45,85 @@ type VersionStats struct {
 	DocsBytes      uint64 `json:"docs_bytes"`
 }
 
+// SemanticVersion represents a semantic version (major.minor.patch).
+type SemanticVersion struct {
+	Major uint16 `json:"major"`
+	Minor uint16 `json:"minor"`
+	Patch uint16 `json:"patch"`
+}
+
+// String returns the version as "vMAJOR.MINOR.PATCH".
+func (v SemanticVersion) String() string {
+	return fmt.Sprintf("v%d.%d.%d", v.Major, v.Minor, v.Patch)
+}
+
+// DirName returns the directory name for this version.
+func (v SemanticVersion) DirName() string {
+	return v.String()
+}
+
+// IsZero returns true if this is the zero version.
+func (v SemanticVersion) IsZero() bool {
+	return v.Major == 0 && v.Minor == 0 && v.Patch == 0
+}
+
+// Equal returns true if two versions are equal.
+func (v SemanticVersion) Equal(other SemanticVersion) bool {
+	return v.Major == other.Major && v.Minor == other.Minor && v.Patch == other.Patch
+}
+
+// BumpMajor returns a new version with major incremented.
+func (v SemanticVersion) BumpMajor() SemanticVersion {
+	return SemanticVersion{Major: v.Major + 1, Minor: 0, Patch: 0}
+}
+
+// BumpMinor returns a new version with minor incremented.
+func (v SemanticVersion) BumpMinor() SemanticVersion {
+	return SemanticVersion{Major: v.Major, Minor: v.Minor + 1, Patch: 0}
+}
+
+// BumpPatch returns a new version with patch incremented.
+func (v SemanticVersion) BumpPatch() SemanticVersion {
+	return SemanticVersion{Major: v.Major, Minor: v.Minor, Patch: v.Patch + 1}
+}
+
+// ParseSemanticVersion parses a version string like "v1.0.0".
+func ParseSemanticVersion(s string) (SemanticVersion, error) {
+	s = strings.TrimPrefix(s, "v")
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return SemanticVersion{}, fmt.Errorf("invalid version format: %s", s)
+	}
+	major, err := strconv.ParseUint(parts[0], 10, 16)
+	if err != nil {
+		return SemanticVersion{}, err
+	}
+	minor, err := strconv.ParseUint(parts[1], 10, 16)
+	if err != nil {
+		return SemanticVersion{}, err
+	}
+	patch, err := strconv.ParseUint(parts[2], 10, 16)
+	if err != nil {
+		return SemanticVersion{}, err
+	}
+	return SemanticVersion{Major: uint16(major), Minor: uint16(minor), Patch: uint16(patch)}, nil
+}
+
 // Version represents a checkpoint in session history.
 type Version struct {
-	ID        uint32       `json:"id"`
-	ParentID  uint32       `json:"parent_id"`
-	Name      string       `json:"name,omitempty"`
-	CreatedAt time.Time    `json:"created_at"`
-	Trigger   string       `json:"trigger"` // "explicit", "auto_delta", "implicit"
-	Stats     VersionStats `json:"stats"`
+	ID        SemanticVersion `json:"id"`
+	ParentID  SemanticVersion `json:"parent_id"`
+	Name      string          `json:"name,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+	Trigger   string          `json:"trigger"` // "explicit", "auto_delta", "implicit"
+	Stats     VersionStats    `json:"stats"`
 }
 
 // VersionManifest tracks the version DAG for a session.
 type VersionManifest struct {
-	SessionID   uint32    `json:"session_id"`
-	Head        uint32    `json:"head"`
-	NextVersion uint32    `json:"next_version"`
-	Versions    []Version `json:"versions"`
+	SessionID uint32          `json:"session_id"`
+	Head      SemanticVersion `json:"head"`
+	Versions  []Version       `json:"versions"`
 }
 
 // SessionStore manages per-session storage directories.
@@ -121,16 +184,16 @@ func (s *SessionStore) Create(sessionID uint32, baseSnapshot *BaseSnapshot) (*Se
 		return nil, fmt.Errorf("write base snapshot: %w", err)
 	}
 
-	// Create version manifest with initial version
+	// Create version manifest with initial version v1.0.0
+	initialVersion := SemanticVersion{Major: 1, Minor: 0, Patch: 0}
 	manifest := &VersionManifest{
-		SessionID:   sessionID,
-		Head:        1,
-		NextVersion: 2,
+		SessionID: sessionID,
+		Head:      initialVersion,
 		Versions: []Version{
 			{
-				ID:        1,
-				ParentID:  0,
-				Name:      "session_start",
+				ID:        initialVersion,
+				ParentID:  SemanticVersion{}, // Zero value = no parent
+				Name:      "initial",
 				CreatedAt: time.Now(),
 				Trigger:   "implicit",
 				Stats:     VersionStats{},
@@ -143,7 +206,7 @@ func (s *SessionStore) Create(sessionID uint32, baseSnapshot *BaseSnapshot) (*Se
 	}
 
 	// Create initial version directory
-	if err := s.createVersionDir(sessionPath, 1); err != nil {
+	if err := s.createVersionDirSemver(sessionPath, initialVersion); err != nil {
 		return nil, fmt.Errorf("create initial version: %w", err)
 	}
 
@@ -249,9 +312,9 @@ func (s *SessionStore) sessionPath(stringID string) string {
 	return filepath.Join(s.sylkDir.SessionsPath(), stringID)
 }
 
-// createVersionDir creates a version directory with all subdirectories.
-func (s *SessionStore) createVersionDir(sessionPath string, versionID uint32) error {
-	versionPath := filepath.Join(sessionPath, "versions", fmt.Sprintf("v%06d", versionID))
+// createVersionDirSemver creates a version directory with semantic versioning.
+func (s *SessionStore) createVersionDirSemver(sessionPath string, version SemanticVersion) error {
+	versionPath := filepath.Join(sessionPath, "versions", version.DirName())
 
 	dirs := []string{
 		versionPath,
@@ -269,7 +332,7 @@ func (s *SessionStore) createVersionDir(sessionPath string, versionID uint32) er
 
 	// Create version meta
 	vMeta := map[string]interface{}{
-		"id":         versionID,
+		"version":    version.String(),
 		"created_at": time.Now().Format(time.RFC3339),
 	}
 
@@ -375,8 +438,8 @@ func (sess *Session) Path() string {
 }
 
 // VersionPath returns the path to a specific version directory.
-func (sess *Session) VersionPath(versionID uint32) string {
-	return filepath.Join(sess.path, "versions", fmt.Sprintf("v%06d", versionID))
+func (sess *Session) VersionPath(version SemanticVersion) string {
+	return filepath.Join(sess.path, "versions", version.DirName())
 }
 
 // HeadVersionPath returns the path to the HEAD version directory.
@@ -385,71 +448,89 @@ func (sess *Session) HeadVersionPath() string {
 }
 
 // DocsPath returns the path to the docs directory for a version.
-func (sess *Session) DocsPath(versionID uint32) string {
-	return filepath.Join(sess.VersionPath(versionID), "docs")
+func (sess *Session) DocsPath(version SemanticVersion) string {
+	return filepath.Join(sess.VersionPath(version), "docs")
 }
 
-// Checkpoint creates a new version checkpoint.
-func (sess *Session) Checkpoint(name string, trigger string) (uint32, error) {
-	newID := sess.Manifest.NextVersion
-	sess.Manifest.NextVersion++
+// CheckpointType specifies how to bump the version.
+type CheckpointType string
+
+const (
+	CheckpointMajor CheckpointType = "major" // Breaking changes
+	CheckpointMinor CheckpointType = "minor" // New features
+	CheckpointPatch CheckpointType = "patch" // Bug fixes
+)
+
+// Checkpoint creates a new version checkpoint with semantic versioning.
+func (sess *Session) Checkpoint(name string, checkpointType CheckpointType) (SemanticVersion, error) {
+	var newVersion SemanticVersion
+	switch checkpointType {
+	case CheckpointMajor:
+		newVersion = sess.Manifest.Head.BumpMajor()
+	case CheckpointMinor:
+		newVersion = sess.Manifest.Head.BumpMinor()
+	case CheckpointPatch:
+		newVersion = sess.Manifest.Head.BumpPatch()
+	default:
+		newVersion = sess.Manifest.Head.BumpPatch()
+	}
 
 	v := Version{
-		ID:        newID,
+		ID:        newVersion,
 		ParentID:  sess.Manifest.Head,
 		Name:      name,
 		CreatedAt: time.Now(),
-		Trigger:   trigger,
-		Stats:     VersionStats{}, // TODO: populate from delta tracker
+		Trigger:   string(checkpointType),
+		Stats:     VersionStats{},
 	}
 
 	// Create version directory
-	if err := sess.store.createVersionDir(sess.path, newID); err != nil {
-		return 0, err
+	if err := sess.store.createVersionDirSemver(sess.path, newVersion); err != nil {
+		return SemanticVersion{}, err
 	}
 
 	sess.Manifest.Versions = append(sess.Manifest.Versions, v)
-	sess.Manifest.Head = newID
+	sess.Manifest.Head = newVersion
 
 	// Persist manifest
 	if err := sess.store.writeManifest(sess.path, sess.Manifest); err != nil {
-		return 0, err
+		return SemanticVersion{}, err
 	}
 
-	return newID, nil
+	return newVersion, nil
 }
 
 // Checkout switches HEAD to a different version.
-func (sess *Session) Checkout(versionID uint32) error {
+func (sess *Session) Checkout(version SemanticVersion) error {
 	// Verify version exists
 	found := false
 	for _, v := range sess.Manifest.Versions {
-		if v.ID == versionID {
+		if v.ID.Equal(version) {
 			found = true
 			break
 		}
 	}
 	if !found {
-		return fmt.Errorf("version %d not found", versionID)
+		return fmt.Errorf("version %s not found", version.String())
 	}
 
-	sess.Manifest.Head = versionID
+	sess.Manifest.Head = version
 	return sess.store.writeManifest(sess.path, sess.Manifest)
 }
 
 // GetAncestorChain returns the ancestor chain from HEAD to root.
-func (sess *Session) GetAncestorChain() []uint32 {
-	versionMap := make(map[uint32]*Version)
+func (sess *Session) GetAncestorChain() []SemanticVersion {
+	versionMap := make(map[string]*Version)
 	for i := range sess.Manifest.Versions {
-		versionMap[sess.Manifest.Versions[i].ID] = &sess.Manifest.Versions[i]
+		versionMap[sess.Manifest.Versions[i].ID.String()] = &sess.Manifest.Versions[i]
 	}
 
-	var chain []uint32
+	var chain []SemanticVersion
 	current := sess.Manifest.Head
 
-	for current != 0 {
+	for !current.IsZero() {
 		chain = append(chain, current)
-		if v, ok := versionMap[current]; ok {
+		if v, ok := versionMap[current.String()]; ok {
 			current = v.ParentID
 		} else {
 			break
