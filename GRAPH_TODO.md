@@ -133,15 +133,51 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 ---
 
-### TODO 1.7: Integrate Bleve with .sylk Layout
+### TODO 1.7: Integrate Global Bleve with .sylk Layout
 
-**Description**: Configure Bleve to use `.sylk/bleve/index/`.
+**Description**: Configure global (committed) Bleve index at `.sylk/bleve/index/`.
 
 **Acceptance Criteria**:
-- [ ] Bleve index created at `.sylk/bleve/index/`
-- [ ] `BleveStore.Open(sylkDir)` uses correct path
+- [ ] Global Bleve index created at `.sylk/bleve/index/`
+- [ ] `GlobalBleveStore.Open(sylkDir)` uses correct path
+- [ ] Global index holds ONLY committed session data (merged on commit)
 - [ ] Existing Bleve tests pass
 - [ ] Index survives process restart
+
+**NOTE**: This is the GLOBAL committed index. Per-session documents are stored in version folders and merged here on commit. See TODO 3.7.
+
+---
+
+### TODO 1.8: Implement Session Directory Structure
+
+**Description**: Create per-session storage with versioned data directories.
+
+**Acceptance Criteria**:
+- [ ] `SessionStore.Create(sessionID)` creates:
+  ```
+  sessions/ses_XXX/
+  ├── meta.json              # Session metadata
+  ├── base/
+  │   └── snapshot.json      # Global state at session start
+  ├── versions/
+  │   ├── manifest.json      # Version DAG
+  │   └── v000001/           # Initial version (session_start)
+  │       ├── meta.json
+  │       ├── nodes/
+  │       ├── edges/
+  │       ├── vectors/
+  │       ├── docs/          # Per-version document storage
+  │       │   └── batch.jsonl
+  │       └── deletions.json
+  ├── delta/
+  │   └── tracker.json
+  ├── state/
+  ├── agents/
+  └── messages/
+  ```
+- [ ] `sessions/active` symlink points to current session
+- [ ] `SessionStore.SetActive(sessionID)` updates symlink atomically
+- [ ] Benchmark: Create session with 5 versions, verify structure
 
 ---
 
@@ -426,6 +462,39 @@ This document tracks the implementation work required to bring the Knowledge Gra
   - time.Since(LastCheckpoint) >= 10 minutes
 - [ ] `DeltaTracker.Reset()` zeros counters, updates LastCheckpoint
 - [ ] Persisted to `delta/tracker.json` for crash recovery
+
+---
+
+### TODO 3.7: Implement Per-Version Document Storage
+
+**Description**: Store documents as JSONL in version folders for session isolation.
+
+**Acceptance Criteria**:
+- [ ] `VersionDocStore.Write(versionID, doc)` appends to `versions/vNNN/docs/batch.jsonl`
+- [ ] JSONL format for efficient append-only writes:
+  ```jsonl
+  {"id":"doc1","path":"/test.go","content":"...","indexed_at":"..."}
+  {"id":"doc2","path":"/test2.go","content":"...","indexed_at":"..."}
+  ```
+- [ ] `VersionDocStore.Read(versionID)` streams documents from version
+- [ ] `VersionDocStore.ReadAncestorChain(versions []uint32)` yields docs from all ancestors
+- [ ] Per-session document count tracked in DeltaTracker.DocsBytes
+- [ ] Benchmark: Write 1000 docs to version < 500ms
+
+---
+
+### TODO 3.8: Implement Session-Aware Document Search
+
+**Description**: Document search respects session visibility rules.
+
+**Acceptance Criteria**:
+- [ ] `SessionDocSearcher` searches:
+  1. Current session's version docs (ancestor chain of HEAD)
+  2. Global Bleve for committed sessions in BaseSnapshot
+- [ ] Query result merges both sources with deduplication by doc ID
+- [ ] Visibility: docs from other active sessions NOT visible
+- [ ] Visibility: docs committed AFTER session start NOT visible
+- [ ] Integration test: two sessions, verify isolation
 
 ---
 
@@ -732,21 +801,30 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 ### TODO 7.3: Implement CommitToGlobal
 
-**Description**: Merge session data to global knowledge graph.
+**Description**: Merge session data to global knowledge graph including documents.
 
 **Acceptance Criteria**:
 - [ ] `Session.Commit()` performs merge:
-  1. Collect all entities from ancestor chain
+  1. Collect all entities from ancestor chain (nodes, edges, vectors, **docs**)
   2. For each node:
      - If canonical key exists in global → create supersession
      - Else → append to global
   3. Update canonical key index
   4. Resolve edge endpoints (map session IDs to global)
   5. Append vectors to global IVF
-  6. Register in GlobalMeta.CommittedSessions
-  7. Update session status to "committed"
+  6. **Index documents in global Bleve** (merge docs/batch.jsonl from all versions)
+  7. Apply deletions (mark deleted in global, remove from Bleve)
+  8. Register in GlobalMeta.CommittedSessions
+  9. Update session status to "committed"
+- [ ] Document merge:
+  ```go
+  docs := s.collectDocsFromVersions(ancestorChain)
+  for _, doc := range docs {
+      kg.GlobalBleve.Index(ctx, doc)
+  }
+  ```
 - [ ] Atomic: either all succeeds or nothing changes
-- [ ] Integration test: create session → add data → commit → query from new session
+- [ ] Integration test: create session → add docs → commit → query from new session → finds docs in global Bleve
 
 ---
 
@@ -832,16 +910,16 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 | Phase | TODOs | Focus |
 |-------|-------|-------|
-| **1. Filesystem** | 1.1-1.7 | .sylk directory, binary storage layout |
+| **1. Filesystem** | 1.1-1.8 | .sylk directory, binary storage layout, session dirs |
 | **2. Data Structures** | 2.1-2.10 | Node/Edge compliance, binary formats |
-| **3. Session Storage** | 3.1-3.6 | Per-session dirs, versioning, delta tracking |
+| **3. Session Storage** | 3.1-3.8 | Per-session versioning, delta tracking, **per-version docs** |
 | **4. Ingestion** | 4.1-4.6 | Boot index, embeddings, IVF build |
 | **5. Query Pipeline** | 5.1-5.5 | IVF adapter, wiring, agent skills |
 | **6. Query Visibility** | 6.1-6.2 | Session-aware queries, visibility rules |
-| **7. Session Ops** | 7.1-7.3 | Checkpoint, Checkout, CommitToGlobal |
+| **7. Session Ops** | 7.1-7.3 | Checkpoint, Checkout, CommitToGlobal **(incl. doc merge)** |
 | **8. Bootstrap & CLI** | 8.1-8.3 | Unified init, CLI commands, E2E test |
 
-**Total: 40 TODOs**
+**Total: 43 TODOs**
 
 ---
 
