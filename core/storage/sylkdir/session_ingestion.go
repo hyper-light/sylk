@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
 )
@@ -22,6 +23,10 @@ const (
 	NodeTypeInterface
 	NodeTypeConst
 	NodeTypeVar
+
+	// Document/chunk node types (non-contiguous to separate from code types).
+	NodeTypeDocument NodeType = 20
+	NodeTypeChunk    NodeType = 21
 )
 
 // Domain represents the domain of a node.
@@ -41,6 +46,10 @@ const (
 	EdgeTypeContains
 	EdgeTypeCalls
 	EdgeTypeReferences
+
+	// Document/chunk edge types (non-contiguous to separate from code types).
+	EdgeTypeContainsChunk EdgeType = 10 // Document → Chunk
+	EdgeTypeChunkSequence EdgeType = 11 // Chunk[i] → Chunk[i+1]
 )
 
 // SessionIngestion handles ingestion of code into session version stores.
@@ -91,7 +100,7 @@ func (s *SessionIngestion) IngestCodeGraph(ctx context.Context, graph *ingestion
 	result := &SessionIngestionResult{}
 
 	// Convert and write file nodes
-	fileNodes, fileIDMap, err := s.convertFileNodes(graph.Files)
+	fileNodes, fileIDMap, filePathMap, docRefMap, err := s.convertFileNodes(graph.Files)
 	if err != nil {
 		return nil, fmt.Errorf("convert file nodes: %w", err)
 	}
@@ -102,7 +111,7 @@ func (s *SessionIngestion) IngestCodeGraph(ctx context.Context, graph *ingestion
 	result.FilesProcessed = len(fileNodes)
 
 	// Convert and write symbol nodes
-	symbolNodes, symbolIDMap, err := s.convertSymbolNodes(graph.Symbols, fileIDMap)
+	symbolNodes, symbolIDMap, err := s.convertSymbolNodes(graph.Symbols, fileIDMap, filePathMap, docRefMap)
 	if err != nil {
 		return nil, fmt.Errorf("convert symbol nodes: %w", err)
 	}
@@ -144,6 +153,15 @@ func (s *SessionIngestion) IngestCodeGraph(ctx context.Context, graph *ingestion
 		return nil, fmt.Errorf("write documents: %w", err)
 	}
 	result.DocsCreated = len(docs)
+
+	// Index into session Bleve for immediate searchability
+	if err := s.indexDocsIntoSessionBleve(ctx, docs); err != nil {
+		return nil, fmt.Errorf("index documents in session bleve: %w", err)
+	}
+
+	// Update delta tracker and evaluate checkpoint.
+	s.updateDeltaTracker(result)
+	s.evaluateCheckpoint()
 
 	result.Duration = time.Since(start)
 	return result, nil
@@ -190,6 +208,10 @@ func (s *SessionIngestion) nodeToEmbeddingText(node *Node) string {
 		return fmt.Sprintf("type %s", node.Name)
 	case NodeTypeConst, NodeTypeVar:
 		return fmt.Sprintf("var %s", node.Name)
+	case NodeTypeDocument:
+		return fmt.Sprintf("doc: %s", node.Path)
+	case NodeTypeChunk:
+		return node.Name
 	default:
 		return node.Name
 	}
@@ -215,9 +237,13 @@ func (s *SessionIngestion) IngestDirectory(ctx context.Context, rootPath string)
 }
 
 // convertFileNodes converts ingestion FileNodes to sylkdir Nodes.
-func (s *SessionIngestion) convertFileNodes(files []ingestion.FileNode) ([]*Node, map[uint32]uint32, error) {
+// Returns: nodes, idMap (ingestion ID -> session node ID), pathMap (ingestion ID -> file path),
+// docRefMap (ingestion ID -> DocRef uint32 for symbol node linking).
+func (s *SessionIngestion) convertFileNodes(files []ingestion.FileNode) ([]*Node, map[uint32]uint32, map[uint32]string, map[uint32]uint32, error) {
 	nodes := make([]*Node, len(files))
-	idMap := make(map[uint32]uint32, len(files)) // old ID -> new ID
+	idMap := make(map[uint32]uint32, len(files))      // old ID -> new ID
+	pathMap := make(map[uint32]string, len(files))     // old ID -> file path
+	docRefMap := make(map[uint32]uint32, len(files))   // old ID -> DocRef
 
 	now := uint64(time.Now().UnixNano())
 
@@ -225,6 +251,15 @@ func (s *SessionIngestion) convertFileNodes(files []ingestion.FileNode) ([]*Node
 		newID := s.nextNodeID
 		s.nextNodeID++
 		idMap[file.ID] = newID
+		pathMap[file.ID] = file.Path
+
+		// Assign DocRef via DocIDMap. The doc string ID matches what
+		// createDocuments produces, so the OffsetIndex key will match.
+		var docRef uint32
+		if s.session.DocIDMap != nil {
+			docRef = s.session.DocIDMap.GetOrAssign(fmt.Sprintf("file_%d", newID))
+		}
+		docRefMap[file.ID] = docRef
 
 		nodes[i] = &Node{
 			ID:           newID,
@@ -233,19 +268,22 @@ func (s *SessionIngestion) convertFileNodes(files []ingestion.FileNode) ([]*Node
 			NodeType:     uint8(NodeTypeFile),
 			Name:         file.Path,
 			Path:         file.Path,
-			Package:      "", // Could extract from path
+			Package:      "",
 			Signature:    "",
 			CreatedAt:    now,
 			SessionID:    s.session.Meta.ID,
-			CreatedBy:    0, // System
+			CreatedBy:    0,
+			DocRef:       docRef,
 		}
 	}
 
-	return nodes, idMap, nil
+	return nodes, idMap, pathMap, docRefMap, nil
 }
 
 // convertSymbolNodes converts ingestion SymbolNodes to sylkdir Nodes.
-func (s *SessionIngestion) convertSymbolNodes(symbols []ingestion.SymbolNode, fileIDMap map[uint32]uint32) ([]*Node, map[uint32]uint32, error) {
+// filePathMap maps ingestion file IDs to file paths for canonical key construction.
+// docRefMap maps ingestion file IDs to DocRef values so symbols inherit their parent file's document.
+func (s *SessionIngestion) convertSymbolNodes(symbols []ingestion.SymbolNode, fileIDMap map[uint32]uint32, filePathMap map[uint32]string, docRefMap map[uint32]uint32) ([]*Node, map[uint32]uint32, error) {
 	nodes := make([]*Node, len(symbols))
 	idMap := make(map[uint32]uint32, len(symbols))
 
@@ -256,18 +294,8 @@ func (s *SessionIngestion) convertSymbolNodes(symbols []ingestion.SymbolNode, fi
 		s.nextNodeID++
 		idMap[sym.ID] = newID
 
-		// Map symbol kind to node type
 		nodeType := symbolKindToNodeType(sym.Kind)
-
-		// Get file path for canonical key
-		var filePath string
-		for _, fileID := range fileIDMap {
-			if fileID == sym.FileID {
-				// Find the original file
-				filePath = fmt.Sprintf("file_%d", sym.FileID)
-				break
-			}
-		}
+		filePath := filePathMap[sym.FileID]
 
 		nodes[i] = &Node{
 			ID:           newID,
@@ -281,6 +309,7 @@ func (s *SessionIngestion) convertSymbolNodes(symbols []ingestion.SymbolNode, fi
 			CreatedAt:    now,
 			SessionID:    s.session.Meta.ID,
 			CreatedBy:    0,
+			DocRef:       docRefMap[sym.FileID],
 		}
 	}
 
@@ -382,7 +411,7 @@ func (s *SessionIngestion) IngestWithContent(ctx context.Context, rootPath strin
 	result := &SessionIngestionResult{}
 
 	// Convert and write file nodes
-	fileNodes, fileIDMap, err := s.convertFileNodes(graph.Files)
+	fileNodes, fileIDMap, filePathMap, docRefMap, err := s.convertFileNodes(graph.Files)
 	if err != nil {
 		return nil, fmt.Errorf("convert file nodes: %w", err)
 	}
@@ -393,7 +422,7 @@ func (s *SessionIngestion) IngestWithContent(ctx context.Context, rootPath strin
 	result.FilesProcessed = len(fileNodes)
 
 	// Convert and write symbol nodes
-	symbolNodes, symbolIDMap, err := s.convertSymbolNodes(graph.Symbols, fileIDMap)
+	symbolNodes, symbolIDMap, err := s.convertSymbolNodes(graph.Symbols, fileIDMap, filePathMap, docRefMap)
 	if err != nil {
 		return nil, fmt.Errorf("convert symbol nodes: %w", err)
 	}
@@ -435,6 +464,15 @@ func (s *SessionIngestion) IngestWithContent(ctx context.Context, rootPath strin
 	}
 	result.DocsCreated = len(docs)
 
+	// Index into session Bleve for immediate searchability
+	if err := s.indexDocsIntoSessionBleve(ctx, docs); err != nil {
+		return nil, fmt.Errorf("index documents in session bleve: %w", err)
+	}
+
+	// Update delta tracker and evaluate checkpoint.
+	s.updateDeltaTracker(result)
+	s.evaluateCheckpoint()
+
 	result.Duration = time.Since(start)
 	return result, nil
 }
@@ -465,6 +503,24 @@ func (s *SessionIngestion) createDocumentsWithContent(mapped []ingestion.MappedF
 	return docs
 }
 
+// indexDocsIntoSessionBleve indexes version documents into the session's
+// per-version Bleve index for immediate full-text searchability.
+// No-op if the session has no BleveStore or if HEAD is not open.
+func (s *SessionIngestion) indexDocsIntoSessionBleve(ctx context.Context, docs []*VersionDocument) error {
+	if s.session.BleveStore == nil || s.session.BleveStore.Head() == nil {
+		return nil
+	}
+	if len(docs) == 0 {
+		return nil
+	}
+
+	searchDocs := make([]*search.Document, len(docs))
+	for i, vdoc := range docs {
+		searchDocs[i] = ConvertToSearchDocument(vdoc)
+	}
+	return s.session.BleveStore.IndexBatch(ctx, searchDocs)
+}
+
 // GetNodeStore returns the underlying node store for direct access.
 func (s *SessionIngestion) GetNodeStore() *VersionNodeStore {
 	return s.nodeStore
@@ -483,4 +539,29 @@ func (s *SessionIngestion) GetDocStore() *VersionDocStore {
 // GetVectorStore returns the underlying vector store for direct access.
 func (s *SessionIngestion) GetVectorStore() *VersionVectorStore {
 	return s.vectorStore
+}
+
+// updateDeltaTracker records ingestion results in the session's delta tracker.
+func (s *SessionIngestion) updateDeltaTracker(result *SessionIngestionResult) {
+	dt := s.session.DeltaTracker
+	if dt == nil {
+		return
+	}
+	dt.IncrNodes(uint64(result.NodesCreated))
+	dt.IncrEdges(uint64(result.EdgesCreated))
+	dt.IncrVectors(uint64(result.VectorsCreated))
+}
+
+// evaluateCheckpoint checks the checkpoint controller and executes if triggered.
+func (s *SessionIngestion) evaluateCheckpoint() {
+	cc := s.session.CheckpointCtrl
+	if cc == nil {
+		return
+	}
+	decision := cc.ShouldCheckpoint()
+	if !decision.ShouldCheckpoint {
+		return
+	}
+	// Best-effort: checkpoint failure does not fail ingestion.
+	_ = s.session.ExecuteCheckpoint(decision.Granularity)
 }

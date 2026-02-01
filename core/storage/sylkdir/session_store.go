@@ -2,13 +2,17 @@
 package sylkdir
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/adalundhe/sylk/core/search"
 )
 
 // SessionStatus represents the state of a session.
@@ -32,9 +36,10 @@ type SessionMeta struct {
 
 // BaseSnapshot captures global state at session start.
 type BaseSnapshot struct {
-	CommittedSessions []uint32  `json:"committed_sessions"`
-	SnapshotAt        time.Time `json:"snapshot_at"`
-	NextNodeID        uint32    `json:"next_node_id"`
+	GlobalVersion     SemanticVersion `json:"global_version"`     // Global KG version at session start
+	CommittedSessions []uint32        `json:"committed_sessions"`
+	SnapshotAt        time.Time       `json:"snapshot_at"`
+	NextNodeID        uint32          `json:"next_node_id"`
 }
 
 // VersionStats tracks changes in a version.
@@ -141,6 +146,11 @@ func NewSessionStore(sd *SylkDir) *SessionStore {
 // Create creates a new session with initial version.
 func (s *SessionStore) Create(sessionID uint32, baseSnapshot *BaseSnapshot) (*Session, error) {
 	stringID := fmt.Sprintf("ses_%03d", sessionID)
+	return s.CreateNamed(sessionID, stringID, baseSnapshot)
+}
+
+// CreateNamed creates a new session with a custom string ID.
+func (s *SessionStore) CreateNamed(sessionID uint32, stringID string, baseSnapshot *BaseSnapshot) (*Session, error) {
 	sessionPath := s.sessionPath(stringID)
 
 	// Create session directory structure
@@ -152,6 +162,10 @@ func (s *SessionStore) Create(sessionID uint32, baseSnapshot *BaseSnapshot) (*Se
 		filepath.Join(sessionPath, "state"),
 		filepath.Join(sessionPath, "agents"),
 		filepath.Join(sessionPath, "messages"),
+		filepath.Join(sessionPath, "wal"),
+		filepath.Join(sessionPath, "data", "nodes"),
+		filepath.Join(sessionPath, "data", "vectors"),
+		filepath.Join(sessionPath, "data", "docs"),
 	}
 
 	for _, dir := range dirs {
@@ -210,18 +224,69 @@ func (s *SessionStore) Create(sessionID uint32, baseSnapshot *BaseSnapshot) (*Se
 		return nil, fmt.Errorf("create initial version: %w", err)
 	}
 
-	// Initialize delta tracker
-	if err := s.initDeltaTracker(sessionPath); err != nil {
-		return nil, fmt.Errorf("init delta tracker: %w", err)
+	// Create delta tracker
+	delta := NewDeltaTracker(filepath.Join(sessionPath, "delta", "tracker.json"))
+	if err := delta.Persist(); err != nil {
+		return nil, fmt.Errorf("persist delta tracker: %w", err)
 	}
 
-	return &Session{
+	sess := &Session{
 		store:        s,
 		path:         sessionPath,
 		Meta:         meta,
 		BaseSnapshot: baseSnapshot,
 		Manifest:     manifest,
-	}, nil
+	}
+
+	// Open shared data files for nodes and vectors.
+	nodeDF, err := OpenSharedDataFile(sess.SharedNodeDataPath())
+	if err != nil {
+		return nil, fmt.Errorf("open node data file: %w", err)
+	}
+	sess.NodeDataFile = nodeDF
+
+	vecDF, err := OpenSharedDataFile(sess.SharedVectorDataPath())
+	if err != nil {
+		nodeDF.Close()
+		return nil, fmt.Errorf("open vector data file: %w", err)
+	}
+	sess.VectorDataFile = vecDF
+
+	docDF, err := OpenSharedDataFile(sess.SharedDocDataPath())
+	if err != nil {
+		nodeDF.Close()
+		vecDF.Close()
+		return nil, fmt.Errorf("open doc data file: %w", err)
+	}
+	sess.DocDataFile = docDF
+
+	docIDMap, err := LoadDocIDMap(sess.DocIDMapPath())
+	if err != nil {
+		// No existing map — create fresh.
+		docIDMap = NewDocIDMap(sess.DocIDMapPath())
+	}
+	sess.DocIDMap = docIDMap
+
+	// Open session WAL
+	sessionWAL, err := OpenSessionWAL(SessionWALConfig{
+		Dir:         filepath.Join(sessionPath, "wal"),
+		SyncOnWrite: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open session wal: %w", err)
+	}
+	sess.WAL = sessionWAL
+	sess.DeltaTracker = delta
+	sess.CheckpointCtrl = s.buildCheckpointController(delta, sessionWAL)
+
+	// Create per-version Bleve store and open HEAD
+	vbs := NewVersionBleveStore(sess)
+	if err := vbs.OpenHead(); err != nil {
+		return nil, fmt.Errorf("open head bleve: %w", err)
+	}
+	sess.BleveStore = vbs
+
+	return sess, nil
 }
 
 // Load loads an existing session.
@@ -247,13 +312,79 @@ func (s *SessionStore) Load(stringID string) (*Session, error) {
 		return nil, fmt.Errorf("load manifest: %w", err)
 	}
 
-	return &Session{
+	sess := &Session{
 		store:        s,
 		path:         sessionPath,
 		Meta:         meta,
 		BaseSnapshot: baseSnapshot,
 		Manifest:     manifest,
-	}, nil
+	}
+
+	// Open shared data files and WAL for active sessions.
+	if meta.Status == SessionActive {
+		nodeDF, dfErr := OpenSharedDataFile(sess.SharedNodeDataPath())
+		if dfErr == nil {
+			sess.NodeDataFile = nodeDF
+		}
+		vecDF, dfErr := OpenSharedDataFile(sess.SharedVectorDataPath())
+		if dfErr == nil {
+			sess.VectorDataFile = vecDF
+		}
+		docDF, dfErr := OpenSharedDataFile(sess.SharedDocDataPath())
+		if dfErr == nil {
+			sess.DocDataFile = docDF
+		}
+		docIDMap, dimErr := LoadDocIDMap(sess.DocIDMapPath())
+		if dimErr != nil {
+			docIDMap = NewDocIDMap(sess.DocIDMapPath())
+		}
+		sess.DocIDMap = docIDMap
+
+		walDir := filepath.Join(sessionPath, "wal")
+		if _, statErr := os.Stat(walDir); statErr == nil {
+			sessionWAL, walErr := OpenSessionWAL(SessionWALConfig{Dir: walDir})
+			if walErr == nil {
+				sess.WAL = sessionWAL
+			}
+		}
+	}
+
+	// Load delta tracker and checkpoint controller for active sessions.
+	if meta.Status == SessionActive {
+		delta := NewDeltaTracker(filepath.Join(sessionPath, "delta", "tracker.json"))
+		_ = delta.Load() // Non-fatal: fresh start on error
+		sess.DeltaTracker = delta
+		sess.CheckpointCtrl = s.buildCheckpointController(delta, sess.WAL)
+	}
+
+	// Open or create per-version Bleve for active sessions.
+	if meta.Status == SessionActive {
+		vbs := NewVersionBleveStore(sess)
+		bleveDBPath := filepath.Join(sess.VersionPath(manifest.Head), "bleve", "documents.bleve")
+
+		if _, statErr := os.Stat(bleveDBPath); statErr == nil {
+			// Bleve exists on disk — reopen if not locked.
+			if !isBoltLocked(filepath.Join(bleveDBPath, "store", "root.bolt")) {
+				if err := vbs.OpenHead(); err == nil {
+					sess.BleveStore = vbs
+				}
+			}
+		} else if os.IsNotExist(statErr) {
+			// No Bleve on disk — bootstrap from JSONL.
+			sess.BleveStore = vbs
+			if err := vbs.RebuildHead(); err != nil {
+				return nil, fmt.Errorf("bootstrap version bleve: %w", err)
+			}
+		}
+
+		// Migration: remove old flat bleve directory if present
+		oldBlevePath := filepath.Join(sessionPath, "bleve")
+		if _, err := os.Stat(oldBlevePath); err == nil {
+			os.RemoveAll(oldBlevePath)
+		}
+	}
+
+	return sess, nil
 }
 
 // List returns all session IDs.
@@ -322,6 +453,8 @@ func (s *SessionStore) createVersionDirSemver(sessionPath string, version Semant
 		filepath.Join(versionPath, "edges"),
 		filepath.Join(versionPath, "vectors"),
 		filepath.Join(versionPath, "docs"),
+		filepath.Join(versionPath, "chunks"),
+		filepath.Join(versionPath, "bleve"),
 	}
 
 	for _, dir := range dirs {
@@ -347,7 +480,35 @@ func (s *SessionStore) createVersionDirSemver(sessionPath string, version Semant
 		"edges": []interface{}{},
 	}
 	data, _ = json.MarshalIndent(deletions, "", "  ")
-	return os.WriteFile(filepath.Join(versionPath, "deletions.json"), data, 0644)
+	if err := os.WriteFile(filepath.Join(versionPath, "deletions.json"), data, 0644); err != nil {
+		return err
+	}
+
+	// Create per-version edge data file (edges remain per-version in sessions).
+	edgeFile := filepath.Join(versionPath, "edges", "data.bin")
+	if err := os.WriteFile(edgeFile, []byte{}, 0644); err != nil {
+		return fmt.Errorf("create data file %s: %w", edgeFile, err)
+	}
+
+	// Create empty offset indexes for nodes, vectors, and docs.
+	nodeIdx := NewOffsetIndex(filepath.Join(versionPath, "nodes", "index.bin"), offsetIndexMinCapacity)
+	if err := nodeIdx.Save(); err != nil {
+		return fmt.Errorf("create node index: %w", err)
+	}
+	vecIdx := NewOffsetIndex(filepath.Join(versionPath, "vectors", "index.bin"), offsetIndexMinCapacity)
+	if err := vecIdx.Save(); err != nil {
+		return fmt.Errorf("create vector index: %w", err)
+	}
+	docIdx := NewOffsetIndex(filepath.Join(versionPath, "docs", "index.bin"), offsetIndexMinCapacity)
+	if err := docIdx.Save(); err != nil {
+		return fmt.Errorf("create doc index: %w", err)
+	}
+	chunkIdx := NewOffsetIndex(filepath.Join(versionPath, "chunks", "index.bin"), offsetIndexMinCapacity)
+	if err := chunkIdx.Save(); err != nil {
+		return fmt.Errorf("create chunk index: %w", err)
+	}
+
+	return nil
 }
 
 func (s *SessionStore) writeMeta(sessionPath string, meta *SessionMeta) error {
@@ -410,17 +571,18 @@ func (s *SessionStore) loadManifest(sessionPath string) (*VersionManifest, error
 	return &manifest, nil
 }
 
-func (s *SessionStore) initDeltaTracker(sessionPath string) error {
-	tracker := map[string]interface{}{
-		"nodes_created":   0,
-		"edges_created":   0,
-		"edges_modified":  0,
-		"vectors_created": 0,
-		"docs_bytes":      0,
-		"last_checkpoint": time.Now().Format(time.RFC3339),
+// buildCheckpointController creates a CheckpointController from calibration data.
+func (s *SessionStore) buildCheckpointController(delta *DeltaTracker, wal *SessionWAL) *CheckpointController {
+	calibration, _ := LoadCalibration(s.sylkDir.RootPath())
+	walBytesFn := func() int64 { return 0 }
+	if wal != nil {
+		walBytesFn = wal.WALBytes
 	}
-	data, _ := json.MarshalIndent(tracker, "", "  ")
-	return os.WriteFile(filepath.Join(sessionPath, "delta", "tracker.json"), data, 0644)
+	return NewCheckpointController(CheckpointControllerConfig{
+		Calibration: calibration,
+		Delta:       delta,
+		WALBytes:    walBytesFn,
+	})
 }
 
 // Session represents an active session.
@@ -430,6 +592,86 @@ type Session struct {
 	Meta         *SessionMeta
 	BaseSnapshot *BaseSnapshot
 	Manifest     *VersionManifest
+	BleveStore     *VersionBleveStore     // Per-version Bleve store (nil until opened)
+	WAL            *SessionWAL            // Session WAL (nil for global/committed sessions)
+	DeltaTracker   *DeltaTracker          // Mutation delta tracker (nil for committed sessions)
+	CheckpointCtrl *CheckpointController  // Adaptive checkpoint controller (nil for committed sessions)
+	NodeDataFile   *SharedDataFile        // Shared node data file (nil for committed sessions)
+	VectorDataFile *SharedDataFile        // Shared vector data file (nil for committed sessions)
+	DocDataFile    *SharedDataFile        // Shared doc data file (nil for committed sessions)
+	ChunkDataFile  *SharedDataFile        // Shared chunk ref data file (nil for committed sessions)
+	DocIDMap       *DocIDMap              // String→uint32 doc ID mapping (nil for committed sessions)
+
+	// Registered version stores (set by constructors for checkpoint integration).
+	nodeStore     *VersionNodeStore
+	vectorStore   *VersionVectorStore
+	docStore      *VersionDocStore
+	chunkRefStore *ChunkRefStore
+}
+
+// RegisterNodeStore is called by NewVersionNodeStore to enable checkpoint index saving.
+func (sess *Session) RegisterNodeStore(s *VersionNodeStore) {
+	sess.nodeStore = s
+}
+
+// RegisterVectorStore is called by NewVersionVectorStore to enable checkpoint index saving.
+func (sess *Session) RegisterVectorStore(s *VersionVectorStore) {
+	sess.vectorStore = s
+}
+
+// RegisterDocStore is called by NewVersionDocStore to enable checkpoint index saving.
+func (sess *Session) RegisterDocStore(s *VersionDocStore) {
+	sess.docStore = s
+}
+
+// RegisterChunkRefStore is called by NewChunkRefStore to enable checkpoint index saving.
+func (sess *Session) RegisterChunkRefStore(s *ChunkRefStore) {
+	sess.chunkRefStore = s
+}
+
+// SharedNodeDataPath returns the path to the session's shared node data file.
+func (sess *Session) SharedNodeDataPath() string {
+	return filepath.Join(sess.path, "data", "nodes", "data.bin")
+}
+
+// SharedVectorDataPath returns the path to the session's shared vector data file.
+func (sess *Session) SharedVectorDataPath() string {
+	return filepath.Join(sess.path, "data", "vectors", "data.bin")
+}
+
+// SharedDocDataPath returns the path to the session's shared doc data file.
+func (sess *Session) SharedDocDataPath() string {
+	return filepath.Join(sess.path, "data", "docs", "data.bin")
+}
+
+// DocIDMapPath returns the path to the session's doc ID map file.
+func (sess *Session) DocIDMapPath() string {
+	return filepath.Join(sess.path, "data", "docs", "id_map.bin")
+}
+
+// DocIndexPath returns the path to the doc offset index for a version.
+func (sess *Session) DocIndexPath(version SemanticVersion) string {
+	return filepath.Join(sess.VersionPath(version), "docs", "index.bin")
+}
+
+// NodeIndexPath returns the path to the node offset index for a version.
+func (sess *Session) NodeIndexPath(version SemanticVersion) string {
+	return filepath.Join(sess.VersionPath(version), "nodes", "index.bin")
+}
+
+// VectorIndexPath returns the path to the vector offset index for a version.
+func (sess *Session) VectorIndexPath(version SemanticVersion) string {
+	return filepath.Join(sess.VersionPath(version), "vectors", "index.bin")
+}
+
+// SharedChunkDataPath returns the path to the session's shared chunk ref data file.
+func (sess *Session) SharedChunkDataPath() string {
+	return filepath.Join(sess.path, "data", "chunks", "data.bin")
+}
+
+// ChunkIndexPath returns the path to the chunk ref offset index for a version.
+func (sess *Session) ChunkIndexPath(version SemanticVersion) string {
+	return filepath.Join(sess.VersionPath(version), "chunks", "index.bin")
 }
 
 // Path returns the session directory path.
@@ -462,22 +704,25 @@ const (
 )
 
 // Checkpoint creates a new version checkpoint with semantic versioning.
+// Each version is a cumulative snapshot containing all data from parent versions.
 func (sess *Session) Checkpoint(name string, checkpointType CheckpointType) (SemanticVersion, error) {
 	var newVersion SemanticVersion
+	oldHead := sess.Manifest.Head
+
 	switch checkpointType {
 	case CheckpointMajor:
-		newVersion = sess.Manifest.Head.BumpMajor()
+		newVersion = oldHead.BumpMajor()
 	case CheckpointMinor:
-		newVersion = sess.Manifest.Head.BumpMinor()
+		newVersion = oldHead.BumpMinor()
 	case CheckpointPatch:
-		newVersion = sess.Manifest.Head.BumpPatch()
+		newVersion = oldHead.BumpPatch()
 	default:
-		newVersion = sess.Manifest.Head.BumpPatch()
+		newVersion = oldHead.BumpPatch()
 	}
 
 	v := Version{
 		ID:        newVersion,
-		ParentID:  sess.Manifest.Head,
+		ParentID:  oldHead,
 		Name:      name,
 		CreatedAt: time.Now(),
 		Trigger:   string(checkpointType),
@@ -487,6 +732,18 @@ func (sess *Session) Checkpoint(name string, checkpointType CheckpointType) (Sem
 	// Create version directory
 	if err := sess.store.createVersionDirSemver(sess.path, newVersion); err != nil {
 		return SemanticVersion{}, err
+	}
+
+	// Snapshot parent data into new version for cumulative semantics
+	if err := sess.snapshotParentData(oldHead, newVersion); err != nil {
+		return SemanticVersion{}, fmt.Errorf("snapshot parent data: %w", err)
+	}
+
+	// Snapshot Bleve (close parent, copy, open new)
+	if sess.BleveStore != nil {
+		if err := sess.BleveStore.SnapshotBleve(oldHead, newVersion); err != nil {
+			return SemanticVersion{}, fmt.Errorf("snapshot bleve: %w", err)
+		}
 	}
 
 	sess.Manifest.Versions = append(sess.Manifest.Versions, v)
@@ -501,6 +758,9 @@ func (sess *Session) Checkpoint(name string, checkpointType CheckpointType) (Sem
 }
 
 // Checkout switches HEAD to a different version.
+// Since versions are cumulative snapshots, checkout closes the current HEAD's
+// Bleve and opens the target version's. If the target version's Bleve is
+// missing (lazy snapshot), it will be rebuilt from doc data on demand.
 func (sess *Session) Checkout(version SemanticVersion) error {
 	// Verify version exists
 	found := false
@@ -514,8 +774,26 @@ func (sess *Session) Checkout(version SemanticVersion) error {
 		return fmt.Errorf("version %s not found", version.String())
 	}
 
+	// Close current HEAD Bleve before changing HEAD
+	if sess.BleveStore != nil {
+		if err := sess.BleveStore.CloseHead(); err != nil {
+			return fmt.Errorf("close head bleve: %w", err)
+		}
+	}
+
 	sess.Manifest.Head = version
-	return sess.store.writeManifest(sess.path, sess.Manifest)
+	if err := sess.store.writeManifest(sess.path, sess.Manifest); err != nil {
+		return err
+	}
+
+	// Open checked-out version's Bleve (cumulative, so it has everything)
+	if sess.BleveStore != nil {
+		if err := sess.BleveStore.OpenHead(); err != nil {
+			return fmt.Errorf("open checkout head bleve: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // GetAncestorChain returns the ancestor chain from HEAD to root.
@@ -558,6 +836,223 @@ func (sess *Session) Save() error {
 	return sess.store.writeManifest(sess.path, sess.Manifest)
 }
 
+// snapshotParentData creates cumulative snapshots by cloning node/vector/doc
+// offset indexes and copying per-version edge data files from parent to target.
+func (sess *Session) snapshotParentData(parent, target SemanticVersion) error {
+	// Clone node index (from in-memory if available, else from disk).
+	if err := sess.cloneNodeIndex(parent, target); err != nil {
+		return fmt.Errorf("clone node index: %w", err)
+	}
+
+	// Clone vector index.
+	if err := sess.cloneVectorIndex(parent, target); err != nil {
+		return fmt.Errorf("clone vector index: %w", err)
+	}
+
+	// Clone doc index.
+	if err := sess.cloneDocIndex(parent, target); err != nil {
+		return fmt.Errorf("clone doc index: %w", err)
+	}
+
+	// Clone chunk ref index.
+	if err := sess.cloneChunkIndex(parent, target); err != nil {
+		return fmt.Errorf("clone chunk index: %w", err)
+	}
+
+	// Copy per-version edge data file.
+	src := filepath.Join(sess.VersionPath(parent), "edges", "data.bin")
+	dst := filepath.Join(sess.VersionPath(target), "edges", "data.bin")
+	if err := copyFileIfExists(src, dst); err != nil {
+		return fmt.Errorf("copy edges/data.bin: %w", err)
+	}
+
+	return nil
+}
+
+// cloneNodeIndex clones the parent version's node offset index for the target.
+func (sess *Session) cloneNodeIndex(parent, target SemanticVersion) error {
+	targetPath := sess.NodeIndexPath(target)
+
+	// Try in-memory index from registered store first.
+	if sess.nodeStore != nil {
+		if idx := sess.nodeStore.getInMemoryIndex(parent); idx != nil {
+			cloned := idx.Clone(targetPath)
+			sess.nodeStore.RegisterIndex(target, cloned)
+			return cloned.Save()
+		}
+	}
+
+	// Fall back to copying the on-disk index file.
+	return copyFileIfExists(sess.NodeIndexPath(parent), targetPath)
+}
+
+// cloneVectorIndex clones the parent version's vector offset index for the target.
+func (sess *Session) cloneVectorIndex(parent, target SemanticVersion) error {
+	targetPath := sess.VectorIndexPath(target)
+
+	// Try in-memory index from registered store first.
+	if sess.vectorStore != nil {
+		if idx := sess.vectorStore.getInMemoryIndex(parent); idx != nil {
+			cloned := idx.Clone(targetPath)
+			sess.vectorStore.RegisterIndex(target, cloned)
+			return cloned.Save()
+		}
+	}
+
+	// Fall back to copying the on-disk index file.
+	return copyFileIfExists(sess.VectorIndexPath(parent), targetPath)
+}
+
+// cloneDocIndex clones the parent version's doc offset index for the target.
+func (sess *Session) cloneDocIndex(parent, target SemanticVersion) error {
+	targetPath := sess.DocIndexPath(target)
+
+	// Try in-memory index from registered store first.
+	if sess.docStore != nil {
+		if idx := sess.docStore.getInMemoryIndex(parent); idx != nil {
+			cloned := idx.Clone(targetPath)
+			sess.docStore.RegisterIndex(target, cloned)
+			return cloned.Save()
+		}
+	}
+
+	// Fall back to copying the on-disk index file.
+	return copyFileIfExists(sess.DocIndexPath(parent), targetPath)
+}
+
+// cloneChunkIndex clones the parent version's chunk ref offset index for the target.
+func (sess *Session) cloneChunkIndex(parent, target SemanticVersion) error {
+	targetPath := sess.ChunkIndexPath(target)
+
+	// Try in-memory index from registered store first.
+	if sess.chunkRefStore != nil {
+		if idx := sess.chunkRefStore.getInMemoryIndex(parent); idx != nil {
+			cloned := idx.Clone(targetPath)
+			sess.chunkRefStore.RegisterIndex(target, cloned)
+			return cloned.Save()
+		}
+	}
+
+	// Fall back to copying the on-disk index file.
+	return copyFileIfExists(sess.ChunkIndexPath(parent), targetPath)
+}
+
+// CloseBleve closes the per-version Bleve store.
+// Safe to call on a session with no BleveStore (no-op).
+func (sess *Session) CloseBleve() error {
+	if sess.BleveStore == nil {
+		return nil
+	}
+	return sess.BleveStore.CloseAll()
+}
+
+// CloseWAL closes the session WAL. Safe to call when WAL is nil.
+func (sess *Session) CloseWAL() error {
+	if sess.WAL == nil {
+		return nil
+	}
+	return sess.WAL.Close()
+}
+
+// ExecuteCheckpoint dispatches a checkpoint operation based on granularity.
+// Errors are non-fatal from the caller's perspective — data is already durable.
+func (sess *Session) ExecuteCheckpoint(granularity CheckpointGranularity) error {
+	if sess.CheckpointCtrl != nil {
+		sess.CheckpointCtrl.SetCheckpointing(true)
+		defer sess.CheckpointCtrl.SetCheckpointing(false)
+	}
+	switch granularity {
+	case GranularityLight:
+		return sess.checkpointLight()
+	case GranularityStandard, GranularityFullMerge:
+		return sess.checkpointStandard()
+	default:
+		return nil
+	}
+}
+
+// checkpointLight performs a WAL fsync only.
+func (sess *Session) checkpointLight() error {
+	if sess.WAL == nil {
+		return nil
+	}
+	return sess.WAL.Sync()
+}
+
+// checkpointStandard creates a version checkpoint and truncates the WAL.
+func (sess *Session) checkpointStandard() error {
+	if _, err := sess.Checkpoint("auto_checkpoint", CheckpointPatch); err != nil {
+		return fmt.Errorf("session checkpoint: %w", err)
+	}
+	if err := sess.truncateWALAfterCheckpoint(); err != nil {
+		return err
+	}
+	return sess.resetDeltaTracker()
+}
+
+// truncateWALAfterCheckpoint checkpoints the WAL at the current sequence.
+func (sess *Session) truncateWALAfterCheckpoint() error {
+	if sess.WAL == nil {
+		return nil
+	}
+	return sess.WAL.Checkpoint(sess.WAL.LastSequence())
+}
+
+// resetDeltaTracker resets and persists the delta tracker after a checkpoint.
+func (sess *Session) resetDeltaTracker() error {
+	if sess.DeltaTracker == nil {
+		return nil
+	}
+	sess.DeltaTracker.Reset(0)
+	return sess.DeltaTracker.Persist()
+}
+
+// Close closes all session resources (DeltaTracker, SharedDataFiles, DocIDMap, Bleve, and WAL).
+func (sess *Session) Close() error {
+	if sess.DeltaTracker != nil {
+		_ = sess.DeltaTracker.Persist()
+	}
+	if sess.NodeDataFile != nil {
+		sess.NodeDataFile.Close()
+	}
+	if sess.VectorDataFile != nil {
+		sess.VectorDataFile.Close()
+	}
+	if sess.DocDataFile != nil {
+		sess.DocDataFile.Close()
+	}
+	if sess.DocIDMap != nil {
+		_ = sess.DocIDMap.Save()
+	}
+	bleveErr := sess.CloseBleve()
+	walErr := sess.CloseWAL()
+	if bleveErr != nil {
+		return bleveErr
+	}
+	return walErr
+}
+
+// Search performs full-text search against the session's HEAD version Bleve.
+// Returns nil, nil if no Bleve store is open.
+func (sess *Session) Search(ctx context.Context, req *search.SearchRequest) (*search.SearchResult, error) {
+	if sess.BleveStore == nil {
+		return nil, nil
+	}
+	return sess.BleveStore.Search(ctx, req)
+}
+
+// RebuildBleve rebuilds the HEAD version's Bleve from JSONL source of truth.
+// This is used for recovery when the Bleve database is missing or corrupt.
+func (sess *Session) RebuildBleve() error {
+	if sess.BleveStore != nil {
+		if err := sess.BleveStore.CloseAll(); err != nil {
+			return fmt.Errorf("close bleve before rebuild: %w", err)
+		}
+	}
+	sess.BleveStore = NewVersionBleveStore(sess)
+	return sess.BleveStore.RebuildHead()
+}
+
 // SessionStoreStats contains statistics about session storage.
 type SessionStoreStats struct {
 	TotalSessions    int
@@ -593,6 +1088,27 @@ func (s *SessionStore) Stats() (SessionStoreStats, error) {
 	}
 
 	return stats, nil
+}
+
+// isBoltLocked returns true if the bolt database file at path is exclusively
+// locked by another process or goroutine. Uses a non-blocking flock probe.
+// Returns false if the file doesn't exist or cannot be opened.
+func isBoltLocked(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	// Try non-blocking exclusive lock
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		// EWOULDBLOCK means another process holds the lock.
+		return true
+	}
+	// We acquired it — release immediately.
+	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false
 }
 
 // parseSessionID extracts the numeric ID from a string ID like "ses_001".
