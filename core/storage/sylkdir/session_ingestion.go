@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
@@ -352,7 +353,7 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 				parentNodeID := ent.fileIDMap[fe.file.ID]
 				parentDocRef := ent.docRefMap[fe.file.ID]
 
-				cr := s.computeChunks(ctx, []byte(fe.content), symsByFile[fe.file.ID])
+				cr := s.computeChunks(ctx, stringToReadOnlyBytes(fe.content), symsByFile[fe.file.ID])
 
 				// Pre-compute the doc ID prefix once per file: "file_<parentNodeID>_c"
 				docIDPrefix := "file_" + strconv.FormatUint(uint64(parentNodeID), 10) + "_c"
@@ -865,6 +866,17 @@ func symbolKindToNodeType(kind ingestion.SymbolKind) NodeType {
 	default:
 		return NodeTypeUnknown
 	}
+}
+
+// stringToReadOnlyBytes returns a []byte that shares the string's underlying memory.
+// The returned slice MUST NOT be written to — strings are immutable in Go.
+// Avoids the allocation and copy of []byte(s) for read-only consumers
+// (boundary detection, segment splitting).
+func stringToReadOnlyBytes(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // zeroPad formats n as a decimal string zero-padded to width digits.
