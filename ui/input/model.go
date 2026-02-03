@@ -90,7 +90,7 @@ func (m *Model) View() string {
 	if popup != "" {
 		body = body + "\n" + popup
 	}
-	return style.Width(m.width).Render(body)
+	return style.Width(m.contentWidth()).Render(body)
 }
 
 // ---------------------------------------------------------------------------

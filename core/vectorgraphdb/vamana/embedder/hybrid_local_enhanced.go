@@ -66,7 +66,6 @@ func (c *embedCtx) ensureStemsLen(n int) {
 //   - MinHash signatures:        10% (robust set similarity)
 type EnhancedHybridEmbedder struct {
 	dimension int
-	vecPool   sync.Pool
 	ctxPool   sync.Pool
 	workers   int
 	stemCache sync.Map // Cache for stemmed words
@@ -78,11 +77,6 @@ func NewEnhancedHybridEmbedder() *EnhancedHybridEmbedder {
 	return &EnhancedHybridEmbedder{
 		dimension: dim,
 		workers:   runtime.NumCPU(),
-		vecPool: sync.Pool{
-			New: func() any {
-				return make([]float32, dim)
-			},
-		},
 		ctxPool: sync.Pool{
 			New: func() any {
 				return &embedCtx{
@@ -170,8 +164,7 @@ func (e *EnhancedHybridEmbedder) EmbedBatch(ctx context.Context, texts []string)
 }
 
 func (e *EnhancedHybridEmbedder) embedEnhanced(text string) []float32 {
-	vec := e.vecPool.Get().([]float32)
-	clear(vec)
+	vec := make([]float32, e.dimension)
 
 	ectx := e.ctxPool.Get().(*embedCtx)
 	ectx.reset()
@@ -215,13 +208,9 @@ func (e *EnhancedHybridEmbedder) embedEnhanced(text string) []float32 {
 	e.addMinHashFeatures(vec, ectx.stems, minhashWeight)
 
 	normalizeVecFast(vec)
-
-	result := make([]float32, e.dimension)
-	copy(result, vec)
-	e.vecPool.Put(vec)
 	e.ctxPool.Put(ectx)
 
-	return result
+	return vec
 }
 
 // BM25 parameters
