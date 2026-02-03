@@ -22,6 +22,9 @@ type Config struct {
 
 	// Interrupt
 	InterruptThresholdMs int // Double Ctrl+C window in ms (default 500)
+
+	// Mock mode
+	MockMode bool // Run with mock backend for testing (no real agents)
 }
 
 // ThemeMode selects the color scheme.

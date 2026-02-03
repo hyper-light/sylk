@@ -276,6 +276,172 @@ func TestWeightedAvgNorm(t *testing.T) {
 	})
 }
 
+func TestMergeWithEmbeddingsSingle(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	merger := NewSegmentMerger(mock, 10000)
+	ctx := context.Background()
+
+	content := make([]byte, 100)
+	segments := []Segment{{Start: 0, End: 100, RightStrength: 0}}
+	embs := [][]float32{{1.0, 0, 0}}
+
+	mr := merger.MergeWithEmbeddings(ctx, content, segments, embs)
+
+	if len(mr.Segments) != 1 {
+		t.Errorf("expected 1 segment, got %d", len(mr.Segments))
+	}
+	if len(mr.Embeddings) != 1 || mr.Embeddings[0][0] != 1.0 {
+		t.Error("single segment embedding should be returned unchanged")
+	}
+}
+
+func TestMergeWithEmbeddingsFitsCeiling(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	content := []byte("hello world this is a test")
+	merger := NewSegmentMerger(mock, uint32(len(content)+100))
+	ctx := context.Background()
+
+	segments := []Segment{
+		{Start: 0, End: 5, RightStrength: 1},
+		{Start: 6, End: 11, RightStrength: 1},
+		{Start: 12, End: uint32(len(content)), RightStrength: 0},
+	}
+
+	// Pre-compute embeddings (same as what EmbedBatch would produce).
+	texts := make([]string, len(segments))
+	for i, seg := range segments {
+		texts[i] = string(content[seg.Start:seg.End])
+	}
+	embs, _ := mock.EmbedBatch(ctx, texts)
+
+	mr := merger.MergeWithEmbeddings(ctx, content, segments, embs)
+
+	// All fit ceiling → merged to one segment.
+	if len(mr.Segments) != 1 {
+		t.Errorf("expected 1 merged segment, got %d", len(mr.Segments))
+	}
+	if mr.Segments[0].Start != 0 || mr.Segments[0].End != uint32(len(content)) {
+		t.Errorf("merged segment: want [0, %d), got [%d, %d)", len(content), mr.Segments[0].Start, mr.Segments[0].End)
+	}
+	if len(mr.Embeddings) != 1 || mr.Embeddings[0] == nil {
+		t.Error("expected one weighted-average embedding")
+	}
+}
+
+func TestMergeWithEmbeddingsCeilingEnforced(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	merger := NewSegmentMerger(mock, 10)
+	ctx := context.Background()
+
+	content := []byte("aaaaaa\nbbbbbb\ncccccc\ndddddd")
+	segments := []Segment{
+		{Start: 0, End: 7, RightStrength: 1},
+		{Start: 7, End: 14, RightStrength: 1},
+		{Start: 14, End: 21, RightStrength: 1},
+		{Start: 21, End: 27, RightStrength: 0},
+	}
+
+	texts := make([]string, len(segments))
+	for i, seg := range segments {
+		texts[i] = string(content[seg.Start:seg.End])
+	}
+	embs, _ := mock.EmbedBatch(ctx, texts)
+
+	mr := merger.MergeWithEmbeddings(ctx, content, segments, embs)
+
+	for _, seg := range mr.Segments {
+		size := seg.End - seg.Start
+		if size > 10 {
+			t.Errorf("segment [%d, %d) exceeds ceiling: %d > 10", seg.Start, seg.End, size)
+		}
+	}
+	if len(mr.Embeddings) != len(mr.Segments) {
+		t.Errorf("embeddings count %d != segments count %d", len(mr.Embeddings), len(mr.Segments))
+	}
+}
+
+func TestMergeWithEmbeddingsMatchesMerge(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	merger := NewSegmentMerger(mock, 200)
+	ctx := context.Background()
+
+	content := []byte("package main\n\nfunc Foo() {\n\treturn\n}\n\nfunc Bar() {\n\treturn\n}\n")
+	segments := []Segment{
+		{Start: 0, End: 13, RightStrength: 1},
+		{Start: 14, End: 36, RightStrength: 2},
+		{Start: 37, End: uint32(len(content)), RightStrength: 0},
+	}
+
+	// Run Merge (embeds internally).
+	mr1 := merger.Merge(ctx, content, segments)
+
+	// Run MergeWithEmbeddings with the same pre-computed embeddings.
+	texts := make([]string, len(segments))
+	for i, seg := range segments {
+		texts[i] = string(content[seg.Start:seg.End])
+	}
+	embs, _ := mock.EmbedBatch(ctx, texts)
+	mr2 := merger.MergeWithEmbeddings(ctx, content, segments, embs)
+
+	// Same number of resulting segments.
+	if len(mr1.Segments) != len(mr2.Segments) {
+		t.Fatalf("Merge produced %d segments, MergeWithEmbeddings produced %d", len(mr1.Segments), len(mr2.Segments))
+	}
+	for i := range mr1.Segments {
+		if mr1.Segments[i].Start != mr2.Segments[i].Start || mr1.Segments[i].End != mr2.Segments[i].End {
+			t.Errorf("segment %d: Merge=[%d,%d) MergeWithEmb=[%d,%d)", i,
+				mr1.Segments[i].Start, mr1.Segments[i].End,
+				mr2.Segments[i].Start, mr2.Segments[i].End)
+		}
+	}
+}
+
+func TestWeightedAvgAllSegments(t *testing.T) {
+	segments := []Segment{
+		{Start: 0, End: 10, RightStrength: 0},
+		{Start: 10, End: 30, RightStrength: 0},
+	}
+	embs := [][]float32{
+		{1, 0, 0},
+		{0, 1, 0},
+	}
+
+	result := weightedAvgAllSegments(embs, segments)
+
+	// Size 10 and 20 → weights 1/3 and 2/3.
+	// Result: (1/3, 2/3, 0) normalized.
+	if result[0] >= result[1] {
+		t.Errorf("larger segment should have more weight: result=%v", result)
+	}
+
+	// Verify unit length.
+	var sumSq float64
+	for _, v := range result {
+		sumSq += float64(v) * float64(v)
+	}
+	if diff := sumSq - 1.0; diff > 0.001 || diff < -0.001 {
+		t.Errorf("not unit length: ||v||² = %f", sumSq)
+	}
+}
+
+func TestWeightedAvgAllSegmentsEqual(t *testing.T) {
+	segments := []Segment{
+		{Start: 0, End: 10, RightStrength: 0},
+		{Start: 10, End: 20, RightStrength: 0},
+	}
+	embs := [][]float32{
+		{1, 0, 0},
+		{0, 1, 0},
+	}
+
+	result := weightedAvgAllSegments(embs, segments)
+
+	// Equal size → equal weight → (0.5, 0.5, 0) normalized.
+	if diff := result[0] - result[1]; diff > 0.001 || diff < -0.001 {
+		t.Errorf("equal segments should produce equal weights: result=%v", result)
+	}
+}
+
 func TestMergerBoundaryStrengthAffectsThreshold(t *testing.T) {
 	mock := embedder.NewDefaultMockEmbedder()
 	// Use a moderate ceiling so merges are possible.

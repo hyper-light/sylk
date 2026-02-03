@@ -53,6 +53,63 @@ func (c *UniversalChunker) SetCodeBlockParser(p CodeBlockParser) {
 	c.codeBlockParser = p
 }
 
+// PreparedChunk holds boundary detection results for deferred embedding + merge.
+// Used in the 3-phase chunk pipeline: Prepare → batch embed → MergeFromEmbeddings.
+type PreparedChunk struct {
+	Segments  []Segment
+	lineIndex lineIndex
+}
+
+// Prepare detects boundaries and splits content into segments without embedding.
+func (c *UniversalChunker) Prepare(ctx context.Context, content []byte) PreparedChunk {
+	if len(content) == 0 {
+		return PreparedChunk{}
+	}
+	li := buildLineIndex(content)
+	boundaries := DetectBoundaries(content, li)
+	if c.codeBlockParser != nil {
+		symBounds := c.parseCodeBlockSymbols(ctx, content, li)
+		if len(symBounds) > 0 {
+			extra := symbolTaggedBoundaries(li, symBounds)
+			boundaries = mergeTaggedBoundaries(boundaries, extra)
+		}
+	}
+	return PreparedChunk{
+		Segments:  SplitAtBoundaries(content, boundaries),
+		lineIndex: li,
+	}
+}
+
+// PrepareWithSymbols detects boundaries with symbol info, splits without embedding.
+func (c *UniversalChunker) PrepareWithSymbols(ctx context.Context, content []byte, symbols []SymbolBound) PreparedChunk {
+	if len(content) == 0 {
+		return PreparedChunk{}
+	}
+	li := buildLineIndex(content)
+	boundaries := DetectBoundariesWithSymbols(content, li, symbols)
+	return PreparedChunk{
+		Segments:  SplitAtBoundaries(content, boundaries),
+		lineIndex: li,
+	}
+}
+
+// MergeFromEmbeddings merges segments using pre-computed embeddings.
+func (c *UniversalChunker) MergeFromEmbeddings(ctx context.Context, content []byte, prep PreparedChunk, embeddings [][]float32) ChunkResult {
+	if len(prep.Segments) == 0 {
+		return ChunkResult{}
+	}
+	mr := c.merger.MergeWithEmbeddings(ctx, content, prep.Segments, embeddings)
+	return ChunkResult{
+		Boundaries: segmentsToBoundaries(prep.lineIndex, mr.Segments),
+		Embeddings: mr.Embeddings,
+	}
+}
+
+// SimilarityEmbedder returns the embedder used for segment similarity.
+func (c *UniversalChunker) SimilarityEmbedder() embedder.Embedder {
+	return c.merger.similarity
+}
+
 // ChunkResult holds chunk boundaries and their corresponding embeddings.
 // Embeddings are parallel to Boundaries — result.Embeddings[i] is the
 // cached embedding for the content in result.Boundaries[i]. Embeddings may be

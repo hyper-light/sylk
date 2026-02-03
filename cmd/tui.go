@@ -17,6 +17,7 @@ import (
 
 var (
 	tuiTheme string
+	tuiMock  bool
 )
 
 var tuiCmd = &cobra.Command{
@@ -29,6 +30,7 @@ var tuiCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(tuiCmd)
 	tuiCmd.Flags().StringVar(&tuiTheme, "theme", "dark", "Color theme (dark or light)")
+	tuiCmd.Flags().BoolVar(&tuiMock, "mock", false, "Run with mock backend (no real agents)")
 }
 
 func runTUI(_ *cobra.Command, _ []string) error {
@@ -43,6 +45,7 @@ func runTUI(_ *cobra.Command, _ []string) error {
 
 	cfg := ui.DefaultConfig()
 	cfg.ThemeMode = parseThemeMode(tuiTheme)
+	cfg.MockMode = tuiMock
 
 	return ui.Run(ctx, cfg, deps)
 }

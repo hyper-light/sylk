@@ -20,6 +20,36 @@ func init() {
 	}
 }
 
+// embedCtx holds reusable buffers for a single embedEnhanced call.
+// Pooled via sync.Pool to avoid per-call map and slice allocations.
+type embedCtx struct {
+	tokens     []string
+	stems      []string
+	codeTokens []string
+	phonetic   []string
+	tfMap      map[string]int
+	scoreMap   map[string]float64
+}
+
+// reset clears all slices and maps for reuse, preserving allocated capacity.
+func (c *embedCtx) reset() {
+	c.tokens = c.tokens[:0]
+	c.stems = c.stems[:0]
+	c.codeTokens = c.codeTokens[:0]
+	c.phonetic = c.phonetic[:0]
+	clear(c.tfMap)
+	clear(c.scoreMap)
+}
+
+// ensureStemsLen sets stems length, growing capacity if needed.
+func (c *embedCtx) ensureStemsLen(n int) {
+	if cap(c.stems) < n {
+		c.stems = make([]string, n)
+	} else {
+		c.stems = c.stems[:n]
+	}
+}
+
 // EnhancedHybridEmbedder implements a sophisticated non-neural embedder targeting 50-52 MTEB.
 // It combines multiple signal types for maximum semantic capture without learned representations.
 //
@@ -35,6 +65,7 @@ func init() {
 type EnhancedHybridEmbedder struct {
 	dimension int
 	vecPool   sync.Pool
+	ctxPool   sync.Pool
 	workers   int
 	stemCache sync.Map // Cache for stemmed words
 }
@@ -48,6 +79,14 @@ func NewEnhancedHybridEmbedder() *EnhancedHybridEmbedder {
 		vecPool: sync.Pool{
 			New: func() any {
 				return make([]float32, dim)
+			},
+		},
+		ctxPool: sync.Pool{
+			New: func() any {
+				return &embedCtx{
+					tfMap:    make(map[string]int),
+					scoreMap: make(map[string]float64),
+				}
 			},
 		},
 	}
@@ -128,76 +167,57 @@ func (e *EnhancedHybridEmbedder) EmbedBatch(ctx context.Context, texts []string)
 	}
 }
 
-// textAnalysis holds preprocessed features for embedding.
-// N-grams and co-occurrence pairs are computed inline during feature
-// extraction to avoid intermediate slice allocations.
-type textAnalysis struct {
-	lower      string
-	tokens     []string // Raw tokens
-	stems      []string // Porter-stemmed tokens
-	codeTokens []string // Code-aware split tokens
-	phonetic   []string // Phonetic encodings
-}
-
-func (e *EnhancedHybridEmbedder) analyzeText(text string) textAnalysis {
-	lower := toLowerASCII(text)
-	tokens := tokenizeEnhanced(lower)
-
-	stems := make([]string, len(tokens))
-	for i, tok := range tokens {
-		stems[i] = e.stem(tok)
-	}
-
-	codeTokens := tokenizeCode(text)
-
-	phonetic := make([]string, 0, len(tokens))
-	for _, tok := range tokens {
-		if ph := metaphone(tok); ph != "" {
-			phonetic = append(phonetic, ph)
-		}
-	}
-
-	return textAnalysis{
-		lower:      lower,
-		tokens:     tokens,
-		stems:      stems,
-		codeTokens: codeTokens,
-		phonetic:   phonetic,
-	}
-}
-
 func (e *EnhancedHybridEmbedder) embedEnhanced(text string) []float32 {
 	vec := e.vecPool.Get().([]float32)
 	clear(vec)
 
-	a := e.analyzeText(text)
+	ectx := e.ctxPool.Get().(*embedCtx)
+	ectx.reset()
 
-	// Weight constants - empirically tuned
+	// Inline text analysis using pooled buffers.
+	lower := toLowerASCII(text)
+	tokenizeEnhancedInto(lower, &ectx.tokens)
+
+	ectx.ensureStemsLen(len(ectx.tokens))
+	for i, tok := range ectx.tokens {
+		ectx.stems[i] = e.stem(tok)
+	}
+
+	tokenizeCodeInto(text, &ectx.codeTokens)
+
+	for _, tok := range ectx.tokens {
+		if ph := metaphone(tok); ph != "" {
+			ectx.phonetic = append(ectx.phonetic, ph)
+		}
+	}
+
+	// Weight constants — empirically tuned.
 	const (
-		stemWeight       = 0.25
-		wordNgramWeight  = 0.15
-		charNgramWeight  = 0.15
-		skipWeight       = 0.10
-		cooccurWeight    = 0.10
-		codeWeight       = 0.10
-		phoneticWeight   = 0.05
-		minhashWeight    = 0.10
+		stemWeight      = 0.25
+		wordNgramWeight = 0.15
+		charNgramWeight = 0.15
+		skipWeight      = 0.10
+		cooccurWeight   = 0.10
+		codeWeight      = 0.10
+		phoneticWeight  = 0.05
+		minhashWeight   = 0.10
 	)
 
-	e.addBM25StemFeatures(vec, a.stems, stemWeight)
-	e.addWordNgramFeatures(vec, a.stems, wordNgramWeight)
-	e.addCharNgramFeatures(vec, a.lower, charNgramWeight)
-	e.addSkipGramFeatures(vec, a.stems, skipWeight)
-	e.addCooccurrenceFeatures(vec, a.stems, cooccurWeight)
-	e.addCodeTokenFeatures(vec, a.codeTokens, codeWeight)
-	e.addPhoneticFeatures(vec, a.phonetic, phoneticWeight)
-	e.addMinHashFeatures(vec, a.stems, minhashWeight)
+	e.addBM25StemFeatures(vec, ectx.stems, stemWeight, ectx.tfMap, ectx.scoreMap)
+	e.addWordNgramFeatures(vec, ectx.stems, wordNgramWeight)
+	e.addCharNgramFeatures(vec, lower, charNgramWeight)
+	e.addSkipGramFeatures(vec, ectx.stems, skipWeight)
+	e.addCooccurrenceFeatures(vec, ectx.stems, cooccurWeight)
+	e.addCodeTokenFeatures(vec, ectx.codeTokens, codeWeight, ectx.tfMap)
+	e.addPhoneticFeatures(vec, ectx.phonetic, phoneticWeight, ectx.tfMap)
+	e.addMinHashFeatures(vec, ectx.stems, minhashWeight)
 
 	normalizeVecFast(vec)
 
 	result := make([]float32, e.dimension)
 	copy(result, vec)
 	e.vecPool.Put(vec)
+	e.ctxPool.Put(ectx)
 
 	return result
 }
@@ -210,12 +230,13 @@ const (
 )
 
 // addBM25StemFeatures adds BM25-weighted stemmed token features.
-func (e *EnhancedHybridEmbedder) addBM25StemFeatures(vec []float32, stems []string, weight float64) {
+// tf and scores are pre-allocated maps cleared before use.
+func (e *EnhancedHybridEmbedder) addBM25StemFeatures(vec []float32, stems []string, weight float64, tf map[string]int, scores map[string]float64) {
 	if len(stems) == 0 {
 		return
 	}
 
-	tf := make(map[string]int, len(stems))
+	clear(tf)
 	for _, stem := range stems {
 		tf[stem]++
 	}
@@ -223,7 +244,7 @@ func (e *EnhancedHybridEmbedder) addBM25StemFeatures(vec []float32, stems []stri
 	lenRatio := float64(len(stems)) / avgDocLen
 	var normSq float64
 
-	scores := make(map[string]float64, len(tf))
+	clear(scores)
 	for stem, count := range tf {
 		// Zipf-based IDF estimation: longer words are rarer
 		// log(1 + len) approximates IDF without corpus
@@ -367,12 +388,13 @@ func (e *EnhancedHybridEmbedder) addCooccurrenceFeatures(vec []float32, stems []
 }
 
 // addCodeTokenFeatures adds code-aware token features.
-func (e *EnhancedHybridEmbedder) addCodeTokenFeatures(vec []float32, codeTokens []string, weight float64) {
+// tf is a pre-allocated map cleared before use.
+func (e *EnhancedHybridEmbedder) addCodeTokenFeatures(vec []float32, codeTokens []string, weight float64, tf map[string]int) {
 	if len(codeTokens) == 0 {
 		return
 	}
 
-	tf := make(map[string]int, len(codeTokens))
+	clear(tf)
 	for _, tok := range codeTokens {
 		tf[tok]++
 	}
@@ -394,12 +416,13 @@ func (e *EnhancedHybridEmbedder) addCodeTokenFeatures(vec []float32, codeTokens 
 }
 
 // addPhoneticFeatures adds phonetic encoding features for spelling tolerance.
-func (e *EnhancedHybridEmbedder) addPhoneticFeatures(vec []float32, phonetic []string, weight float64) {
+// tf is a pre-allocated map cleared before use.
+func (e *EnhancedHybridEmbedder) addPhoneticFeatures(vec []float32, phonetic []string, weight float64, tf map[string]int) {
 	if len(phonetic) == 0 {
 		return
 	}
 
-	tf := make(map[string]int, len(phonetic))
+	clear(tf)
 	for _, ph := range phonetic {
 		tf[ph]++
 	}
@@ -769,17 +792,22 @@ func step5(word string) string {
 	return word
 }
 
-// tokenizeCode splits identifiers by camelCase and snake_case.
-// Uses byte-level processing for ASCII (fast path) with UTF-8 fallback.
-func tokenizeCode(text string) []string {
-	var tokens []string
-	var current strings.Builder
+// tokenizeCodeInto splits identifiers by camelCase and snake_case, appending to out.
+// Uses position tracking instead of strings.Builder to avoid per-token heap allocations.
+func tokenizeCodeInto(text string, out *[]string) {
+	start := -1
+	hasUpper := false
 
-	flushToken := func() {
-		if current.Len() >= 2 {
-			tokens = append(tokens, toLowerASCII(current.String()))
+	flush := func(end int) {
+		if start >= 0 && end-start >= 2 {
+			tok := text[start:end]
+			if hasUpper {
+				tok = toLowerASCII(tok)
+			}
+			*out = append(*out, tok)
 		}
-		current.Reset()
+		start = -1
+		hasUpper = false
 	}
 
 	for i := 0; i < len(text); {
@@ -787,217 +815,275 @@ func tokenizeCode(text string) []string {
 
 		// ASCII fast path — handles >95% of source code characters.
 		if c < 0x80 {
-			switch {
-			case c == '_' || c == '-' || c == '.':
-				flushToken()
-			case c >= 'A' && c <= 'Z':
-				if current.Len() > 0 && i+1 < len(text) &&
-					text[i+1] >= 'a' && text[i+1] <= 'z' {
-					flushToken()
-				}
-				current.WriteByte(c + 32)
-			case (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'):
-				current.WriteByte(c)
-			default:
-				flushToken()
-			}
+			tokenizeCodeASCII(c, i, text, &start, &hasUpper, flush, out)
 			i++
 			continue
 		}
 
 		// UTF-8 multibyte fallback.
 		r, size := utf8.DecodeRuneInString(text[i:])
-		switch {
-		case unicode.IsUpper(r):
-			if current.Len() > 0 {
-				if i+size < len(text) {
-					nextR, _ := utf8.DecodeRuneInString(text[i+size:])
-					if unicode.IsLower(nextR) {
-						flushToken()
-					}
-				}
-			}
-			current.WriteRune(unicode.ToLower(r))
-		case unicode.IsLetter(r) || unicode.IsDigit(r):
-			current.WriteRune(r)
-		default:
-			flushToken()
-		}
+		tokenizeCodeUTF8(r, i, size, text, &start, &hasUpper, flush)
 		i += size
 	}
-	flushToken()
+	flush(len(text))
+}
 
-	return tokens
+func tokenizeCodeASCII(c byte, i int, text string, start *int, hasUpper *bool, flush func(int), out *[]string) {
+	switch {
+	case c == '_' || c == '-' || c == '.':
+		flush(i)
+	case c >= 'A' && c <= 'Z':
+		if *start >= 0 && i+1 < len(text) && text[i+1] >= 'a' && text[i+1] <= 'z' {
+			flush(i)
+		}
+		if *start < 0 {
+			*start = i
+		}
+		*hasUpper = true
+	case (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'):
+		if *start < 0 {
+			*start = i
+		}
+	default:
+		flush(i)
+	}
+}
+
+func tokenizeCodeUTF8(r rune, i, size int, text string, start *int, hasUpper *bool, flush func(int)) {
+	switch {
+	case unicode.IsUpper(r):
+		if *start >= 0 && i+size < len(text) {
+			nextR, _ := utf8.DecodeRuneInString(text[i+size:])
+			if unicode.IsLower(nextR) {
+				flush(i)
+			}
+		}
+		if *start < 0 {
+			*start = i
+		}
+		*hasUpper = true
+	case unicode.IsLetter(r) || unicode.IsDigit(r):
+		if *start < 0 {
+			*start = i
+		}
+	default:
+		flush(i)
+	}
 }
 
 // metaphone implements a simplified Double Metaphone algorithm.
+// Uses a fixed [4]byte buffer and inline uppercase to avoid heap allocations
+// from strings.ToUpper and strings.Builder.
 func metaphone(word string) string {
 	if len(word) == 0 {
 		return ""
 	}
 
-	word = strings.ToUpper(word)
-	var result strings.Builder
+	var buf [4]byte
+	n := 0
 
-	// Skip initial silent letters
+	// Inline uppercase lookup — avoids strings.ToUpper allocation.
+	upper := func(i int) byte {
+		c := word[i]
+		if c >= 'a' && c <= 'z' {
+			return c - 32
+		}
+		return c
+	}
+
+	// upperIsVowel checks if the uppercase byte at position i is a vowel.
+	upperIsVowel := func(i int) bool {
+		c := upper(i)
+		return c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U'
+	}
+
+	// emit appends a byte to the buffer if space remains.
+	emit := func(b byte) {
+		if n < 4 {
+			buf[n] = b
+			n++
+		}
+	}
+
+	// Skip initial silent letters.
 	start := 0
 	if len(word) >= 2 {
-		switch word[:2] {
-		case "GN", "KN", "PN", "WR", "PS":
+		b0, b1 := upper(0), upper(1)
+		if (b0 == 'G' && b1 == 'N') || (b0 == 'K' && b1 == 'N') ||
+			(b0 == 'P' && b1 == 'N') || (b0 == 'W' && b1 == 'R') ||
+			(b0 == 'P' && b1 == 'S') {
 			start = 1
 		}
 	}
 
-	for i := start; i < len(word) && result.Len() < 4; i++ {
-		c := word[i]
-
-		switch c {
-		case 'A', 'E', 'I', 'O', 'U':
-			if i == start {
-				result.WriteByte('A')
-			}
-		case 'B':
-			if i == 0 || word[i-1] != 'M' || i == len(word)-1 {
-				result.WriteByte('P')
-			}
-		case 'C':
-			if i+1 < len(word) {
-				switch word[i+1] {
-				case 'H':
-					result.WriteByte('X')
-					i++
-				case 'I', 'E', 'Y':
-					result.WriteByte('S')
-				default:
-					result.WriteByte('K')
-				}
-			} else {
-				result.WriteByte('K')
-			}
-		case 'D':
-			if i+1 < len(word) && word[i+1] == 'G' {
-				next2 := byte(0)
-				if i+2 < len(word) {
-					next2 = word[i+2]
-				}
-				if next2 == 'E' || next2 == 'I' || next2 == 'Y' {
-					result.WriteByte('J')
-					i++
-				} else {
-					result.WriteByte('T')
-				}
-			} else {
-				result.WriteByte('T')
-			}
-		case 'F':
-			result.WriteByte('F')
-		case 'G':
-			if i+1 < len(word) {
-				switch word[i+1] {
-				case 'H':
-					if i+2 < len(word) && !isVowel(word[i+2]) {
-						i++
-					} else {
-						result.WriteByte('K')
-					}
-				case 'N':
-					// Silent
-				case 'I', 'E', 'Y':
-					result.WriteByte('J')
-				default:
-					result.WriteByte('K')
-				}
-			} else {
-				result.WriteByte('K')
-			}
-		case 'H':
-			if i > 0 && isVowel(word[i-1]) {
-				// Silent after vowel
-			} else if i+1 < len(word) && isVowel(word[i+1]) {
-				result.WriteByte('H')
-			}
-		case 'J':
-			result.WriteByte('J')
-		case 'K':
-			if i == 0 || word[i-1] != 'C' {
-				result.WriteByte('K')
-			}
-		case 'L':
-			result.WriteByte('L')
-		case 'M':
-			result.WriteByte('M')
-		case 'N':
-			result.WriteByte('N')
-		case 'P':
-			if i+1 < len(word) && word[i+1] == 'H' {
-				result.WriteByte('F')
-				i++
-			} else {
-				result.WriteByte('P')
-			}
-		case 'Q':
-			result.WriteByte('K')
-		case 'R':
-			result.WriteByte('R')
-		case 'S':
-			if i+1 < len(word) && word[i+1] == 'H' {
-				result.WriteByte('X')
-				i++
-			} else {
-				result.WriteByte('S')
-			}
-		case 'T':
-			if i+1 < len(word) {
-				switch word[i+1] {
-				case 'H':
-					result.WriteByte('0') // TH sound
-					i++
-				case 'I':
-					if i+2 < len(word) && (word[i+2] == 'O' || word[i+2] == 'A') {
-						result.WriteByte('X')
-					} else {
-						result.WriteByte('T')
-					}
-				default:
-					result.WriteByte('T')
-				}
-			} else {
-				result.WriteByte('T')
-			}
-		case 'V':
-			result.WriteByte('F')
-		case 'W':
-			if i+1 < len(word) && isVowel(word[i+1]) {
-				result.WriteByte('W')
-			}
-		case 'X':
-			result.WriteByte('K')
-			result.WriteByte('S')
-		case 'Y':
-			if i+1 < len(word) && isVowel(word[i+1]) {
-				result.WriteByte('Y')
-			}
-		case 'Z':
-			result.WriteByte('S')
-		}
+	for i := start; i < len(word) && n < 4; i++ {
+		c := upper(i)
+		metaphoneChar(c, i, word, start, upper, upperIsVowel, emit, &i)
 	}
 
-	return result.String()
+	if n == 0 {
+		return ""
+	}
+	return string(buf[:n])
 }
 
-func isVowel(c byte) bool {
+// metaphoneChar processes one character of the metaphone algorithm.
+// Separated from the loop to keep cyclomatic complexity bounded.
+func metaphoneChar(c byte, i int, word string, start int, upper func(int) byte, isV func(int) bool, emit func(byte), iPtr *int) {
 	switch c {
 	case 'A', 'E', 'I', 'O', 'U':
-		return true
+		if i == start {
+			emit('A')
+		}
+	case 'B':
+		if i == 0 || upper(i-1) != 'M' || i == len(word)-1 {
+			emit('P')
+		}
+	case 'C':
+		metaphoneC(i, word, upper, emit, iPtr)
+	case 'D':
+		metaphoneD(i, word, upper, emit, iPtr)
+	case 'F':
+		emit('F')
+	case 'G':
+		metaphoneG(i, word, upper, isV, emit, iPtr)
+	case 'H':
+		metaphoneH(i, word, isV, emit)
+	case 'J':
+		emit('J')
+	case 'K':
+		if i == 0 || upper(i-1) != 'C' {
+			emit('K')
+		}
+	case 'L':
+		emit('L')
+	case 'M':
+		emit('M')
+	case 'N':
+		emit('N')
+	case 'P':
+		if i+1 < len(word) && upper(i+1) == 'H' {
+			emit('F')
+			*iPtr = i + 1
+		} else {
+			emit('P')
+		}
+	case 'Q':
+		emit('K')
+	case 'R':
+		emit('R')
+	case 'S':
+		if i+1 < len(word) && upper(i+1) == 'H' {
+			emit('X')
+			*iPtr = i + 1
+		} else {
+			emit('S')
+		}
+	case 'T':
+		metaphoneT(i, word, upper, emit, iPtr)
+	case 'V':
+		emit('F')
+	case 'W':
+		if i+1 < len(word) && isV(i+1) {
+			emit('W')
+		}
+	case 'X':
+		emit('K')
+		emit('S')
+	case 'Y':
+		if i+1 < len(word) && isV(i+1) {
+			emit('Y')
+		}
+	case 'Z':
+		emit('S')
 	}
-	return false
 }
 
-// tokenizeEnhanced extracts tokens with improved handling.
-func tokenizeEnhanced(text string) []string {
-	estimated := len(text) / 5
-	tokens := make([]string, 0, estimated)
+func metaphoneC(i int, word string, upper func(int) byte, emit func(byte), iPtr *int) {
+	if i+1 >= len(word) {
+		emit('K')
+		return
+	}
+	switch upper(i + 1) {
+	case 'H':
+		emit('X')
+		*iPtr = i + 1
+	case 'I', 'E', 'Y':
+		emit('S')
+	default:
+		emit('K')
+	}
+}
 
+func metaphoneD(i int, word string, upper func(int) byte, emit func(byte), iPtr *int) {
+	if i+1 < len(word) && upper(i+1) == 'G' {
+		next2 := byte(0)
+		if i+2 < len(word) {
+			next2 = upper(i + 2)
+		}
+		if next2 == 'E' || next2 == 'I' || next2 == 'Y' {
+			emit('J')
+			*iPtr = i + 1
+		} else {
+			emit('T')
+		}
+	} else {
+		emit('T')
+	}
+}
+
+func metaphoneG(i int, word string, upper func(int) byte, isV func(int) bool, emit func(byte), iPtr *int) {
+	if i+1 >= len(word) {
+		emit('K')
+		return
+	}
+	switch upper(i + 1) {
+	case 'H':
+		if i+2 < len(word) && !isV(i+2) {
+			*iPtr = i + 1
+		} else {
+			emit('K')
+		}
+	case 'N':
+		// Silent
+	case 'I', 'E', 'Y':
+		emit('J')
+	default:
+		emit('K')
+	}
+}
+
+func metaphoneH(i int, word string, isV func(int) bool, emit func(byte)) {
+	if i > 0 && isV(i-1) {
+		return // Silent after vowel.
+	}
+	if i+1 < len(word) && isV(i+1) {
+		emit('H')
+	}
+}
+
+func metaphoneT(i int, word string, upper func(int) byte, emit func(byte), iPtr *int) {
+	if i+1 >= len(word) {
+		emit('T')
+		return
+	}
+	switch upper(i + 1) {
+	case 'H':
+		emit('0') // TH sound
+		*iPtr = i + 1
+	case 'I':
+		if i+2 < len(word) && (upper(i+2) == 'O' || upper(i+2) == 'A') {
+			emit('X')
+		} else {
+			emit('T')
+		}
+	default:
+		emit('T')
+	}
+}
+
+// tokenizeEnhancedInto extracts tokens into the provided slice, preserving capacity.
+func tokenizeEnhancedInto(text string, out *[]string) {
 	var start int
 	inToken := false
 
@@ -1010,17 +1096,15 @@ func tokenizeEnhanced(text string) []string {
 			}
 		} else if inToken {
 			if i-start >= 2 {
-				tokens = append(tokens, text[start:i])
+				*out = append(*out, text[start:i])
 			}
 			inToken = false
 		}
 	}
 
 	if inToken && len(text)-start >= 2 {
-		tokens = append(tokens, text[start:])
+		*out = append(*out, text[start:])
 	}
-
-	return tokens
 }
 
 // toLowerASCII is an optimized lowercase for ASCII-heavy text.

@@ -59,7 +59,12 @@ type EdgeKey struct {
 // MarshalBinary encodes the edge to a fixed-size binary record.
 func (e *Edge) MarshalBinary() []byte {
 	buf := make([]byte, EdgeRecordSize)
+	e.MarshalBinaryTo(buf)
+	return buf
+}
 
+// MarshalBinaryTo encodes the edge into the provided buffer (must be >= EdgeRecordSize).
+func (e *Edge) MarshalBinaryTo(buf []byte) {
 	binary.LittleEndian.PutUint32(buf[0:4], e.SourceID)
 	binary.LittleEndian.PutUint32(buf[4:8], e.TargetID)
 	buf[8] = e.Type
@@ -68,8 +73,6 @@ func (e *Edge) MarshalBinary() []byte {
 	binary.LittleEndian.PutUint16(buf[17:19], e.AgentID)
 	binary.LittleEndian.PutUint64(buf[19:27], e.CreatedAt)
 	binary.LittleEndian.PutUint64(buf[27:35], e.UpdatedAt)
-
-	return buf
 }
 
 // UnmarshalBinary decodes the edge from a binary record.

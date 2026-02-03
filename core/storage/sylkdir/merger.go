@@ -120,6 +120,53 @@ func (m *SegmentMerger) Merge(ctx context.Context, content []byte, segments []Se
 	return m.runMerge(ctx, state)
 }
 
+// MergeWithEmbeddings performs agglomerative merge using pre-computed embeddings.
+// embeddings[i] corresponds to segments[i]. Avoids any EmbedBatch calls.
+func (m *SegmentMerger) MergeWithEmbeddings(ctx context.Context, content []byte, segments []Segment, embeddings [][]float32) MergeResult {
+	if len(segments) <= 1 {
+		return MergeResult{Segments: segments, Embeddings: embeddings}
+	}
+	totalSize := segments[len(segments)-1].End - segments[0].Start
+	if totalSize <= m.ceiling {
+		merged := []Segment{{
+			Start:         segments[0].Start,
+			End:           segments[len(segments)-1].End,
+			RightStrength: segments[len(segments)-1].RightStrength,
+		}}
+		emb := weightedAvgAllSegments(embeddings, segments)
+		return MergeResult{Segments: merged, Embeddings: [][]float32{emb}}
+	}
+	state := m.initMergeStateFromEmbeddings(segments, embeddings)
+	return m.runMerge(ctx, state)
+}
+
+// weightedAvgAllSegments computes a size-weighted average of all embeddings, L2-normalized.
+func weightedAvgAllSegments(embeddings [][]float32, segments []Segment) []float32 {
+	dim := len(embeddings[0])
+	result := make([]float32, dim)
+	var totalSize float64
+	for _, seg := range segments {
+		totalSize += float64(seg.End - seg.Start)
+	}
+	for i, emb := range embeddings {
+		w := float64(segments[i].End-segments[i].Start) / totalSize
+		for j, v := range emb {
+			result[j] += float32(w * float64(v))
+		}
+	}
+	var sumSq float64
+	for _, v := range result {
+		sumSq += float64(v) * float64(v)
+	}
+	if sumSq > 0 {
+		invNorm := float32(1.0 / math.Sqrt(sumSq))
+		for i := range result {
+			result[i] *= invNorm
+		}
+	}
+	return result
+}
+
 // embedSingleResult embeds a trivial result (0 or 1 segments) and returns it.
 func (m *SegmentMerger) embedSingleResult(ctx context.Context, content []byte, segments []Segment) MergeResult {
 	if len(segments) == 0 {
@@ -148,7 +195,7 @@ type mergeState struct {
 	scaleFactor float64
 }
 
-// initMergeState allocates state, embeds all segments, and builds the initial heap.
+// initMergeState embeds all segments then builds merge state.
 func (m *SegmentMerger) initMergeState(ctx context.Context, content []byte, segments []Segment) *mergeState {
 	texts := make([]string, len(segments))
 	for i, seg := range segments {
@@ -159,7 +206,18 @@ func (m *SegmentMerger) initMergeState(ctx context.Context, content []byte, segm
 	if err != nil {
 		return nil
 	}
+	return m.buildMergeState(segments, embeddings)
+}
 
+// initMergeStateFromEmbeddings builds merge state from pre-computed embeddings.
+// Caller must ensure no concurrent access to the embedding sub-slices —
+// merge mutates them in-place via weightedAvgNorm during segment merging.
+func (m *SegmentMerger) initMergeStateFromEmbeddings(segments []Segment, embeddings [][]float32) *mergeState {
+	return m.buildMergeState(segments, embeddings)
+}
+
+// buildMergeState constructs the linked list + heap from segments and embeddings.
+func (m *SegmentMerger) buildMergeState(segments []Segment, embeddings [][]float32) *mergeState {
 	n := len(segments)
 	state := &mergeState{
 		segments:   make([]Segment, n),

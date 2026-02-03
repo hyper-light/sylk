@@ -11,6 +11,10 @@ import (
 	"sync"
 )
 
+// recordSizePrefixLen is the byte width of the uint32 record length prefix
+// used by node and doc records: [size:4][payload].
+const recordSizePrefixLen = 4
+
 // VersionNodeStore writes nodes to the session's shared data file with
 // per-version offset indexes for O(1) lookups and zero-copy checkpoints.
 //
@@ -91,28 +95,25 @@ func (s *VersionNodeStore) walLogNodeBatch(nodes []*Node) error {
 	return s.session.WAL.LogNodeBatch(walData)
 }
 
-// appendNodeBatch appends all nodes to the data file and updates the index.
+// appendNodeBatch pre-marshals all nodes, writes them in a single I/O via
+// AppendBatch, and updates the index with SetBatch.
 func (s *VersionNodeStore) appendNodeBatch(version SemanticVersion, nodes []*Node) error {
 	idx := s.nodeIndex(version)
-	for _, node := range nodes {
-		if err := s.appendSingleNode(idx, node); err != nil {
+	records := make([][]byte, len(nodes))
+	ids := make([]uint32, len(nodes))
+	for i, node := range nodes {
+		rec, err := marshalNodeRecord(node)
+		if err != nil {
 			return err
 		}
+		records[i] = rec
+		ids[i] = node.ID
 	}
-	return nil
-}
-
-// appendSingleNode marshals and appends one node to the data file.
-func (s *VersionNodeStore) appendSingleNode(idx *OffsetIndex, node *Node) error {
-	record, err := marshalNodeRecord(node)
+	offsets, err := s.session.NodeDataFile.AppendBatch(records)
 	if err != nil {
-		return err
+		return fmt.Errorf("append nodes: %w", err)
 	}
-	offset, err := s.session.NodeDataFile.Append(record)
-	if err != nil {
-		return fmt.Errorf("append node %d: %w", node.ID, err)
-	}
-	idx.Set(node.ID, offset)
+	idx.SetBatch(ids, offsets)
 	return nil
 }
 
@@ -237,22 +238,19 @@ func (s *VersionNodeStore) loadIndex(version SemanticVersion) *OffsetIndex {
 	return actual.(*OffsetIndex)
 }
 
-// marshalNodeRecord serializes a node as [size:4][binary_data].
+// marshalNodeRecord serializes a node as [size:4][binary_data] in a single allocation.
 func marshalNodeRecord(node *Node) ([]byte, error) {
-	data, err := node.MarshalBinary()
-	if err != nil {
-		return nil, fmt.Errorf("marshal node: %w", err)
-	}
-	record := make([]byte, 4+len(data))
-	binary.LittleEndian.PutUint32(record[0:4], uint32(len(data)))
-	copy(record[4:], data)
+	dataSize := node.BinarySize()
+	record := make([]byte, recordSizePrefixLen+dataSize)
+	binary.LittleEndian.PutUint32(record[:recordSizePrefixLen], uint32(dataSize))
+	node.MarshalBinaryTo(record[recordSizePrefixLen:])
 	return record, nil
 }
 
 // readNodeAtOffset reads a node from a shared data file at the given offset.
 func readNodeAtOffset(sdf *SharedDataFile, offset int64) (*Node, error) {
 	// Read size prefix.
-	sizeBuf := make([]byte, 4)
+	sizeBuf := make([]byte, recordSizePrefixLen)
 	if _, err := sdf.ReadAt(sizeBuf, offset); err != nil {
 		return nil, err
 	}
@@ -260,7 +258,7 @@ func readNodeAtOffset(sdf *SharedDataFile, offset int64) (*Node, error) {
 
 	// Read node data.
 	data := make([]byte, size)
-	if _, err := sdf.ReadAt(data, offset+4); err != nil {
+	if _, err := sdf.ReadAt(data, offset+recordSizePrefixLen); err != nil {
 		return nil, err
 	}
 
@@ -365,7 +363,8 @@ func (s *VersionEdgeStore) walLogEdgeBatch(edges []*Edge) error {
 	return s.session.WAL.LogEdgeBatch(walData)
 }
 
-// appendEdgeBatch writes all edges to the data file and updates indexes.
+// appendEdgeBatch marshals all edges into a contiguous buffer and writes
+// them in a single I/O operation, then updates the in-memory indexes.
 func (s *VersionEdgeStore) appendEdgeBatch(version SemanticVersion, edges []*Edge) error {
 	dataPath := filepath.Join(s.session.VersionPath(version), "edges", "data.bin")
 
@@ -379,18 +378,23 @@ func (s *VersionEdgeStore) appendEdgeBatch(version SemanticVersion, edges []*Edg
 	}
 	defer f.Close()
 
-	offset, _ := f.Seek(0, io.SeekEnd)
+	baseOffset, _ := f.Seek(0, io.SeekEnd)
 	vKey := version.String()
 	s.ensureIndexes(vKey)
 
-	for _, edge := range edges {
-		data := edge.MarshalBinary()
-		if _, err := f.Write(data); err != nil {
-			return fmt.Errorf("write edge: %w", err)
-		}
+	buf := make([]byte, len(edges)*EdgeRecordSize)
+	for i, edge := range edges {
+		edge.MarshalBinaryTo(buf[i*EdgeRecordSize : (i+1)*EdgeRecordSize])
+	}
+
+	if _, err := f.Write(buf); err != nil {
+		return fmt.Errorf("write edges: %w", err)
+	}
+
+	for i, edge := range edges {
+		offset := baseOffset + int64(i*EdgeRecordSize)
 		s.outgoing[vKey][edge.SourceID] = append(s.outgoing[vKey][edge.SourceID], offset)
 		s.incoming[vKey][edge.TargetID] = append(s.incoming[vKey][edge.TargetID], offset)
-		offset += int64(len(data))
 	}
 
 	return nil
@@ -688,28 +692,25 @@ func (s *VersionDocStore) walLogDocBatch(docs []*VersionDocument) error {
 	return s.session.WAL.LogDocBatch(walData)
 }
 
-// appendDocBatch appends all docs to the data file and updates the index.
+// appendDocBatch pre-marshals all docs, writes them in a single I/O via
+// AppendBatch, and updates the index with SetBatch.
 func (s *VersionDocStore) appendDocBatch(version SemanticVersion, docs []*VersionDocument) error {
 	idx := s.docIndex(version)
-	for _, doc := range docs {
-		if err := s.appendSingleDoc(idx, doc); err != nil {
+	records := make([][]byte, len(docs))
+	ids := make([]uint32, len(docs))
+	for i, doc := range docs {
+		rec, err := marshalDocRecord(doc)
+		if err != nil {
 			return err
 		}
+		records[i] = rec
+		ids[i] = s.session.DocIDMap.GetOrAssign(doc.ID)
 	}
-	return nil
-}
-
-// appendSingleDoc marshals and appends one document to the data file.
-func (s *VersionDocStore) appendSingleDoc(idx *OffsetIndex, doc *VersionDocument) error {
-	record, err := marshalDocRecord(doc)
+	offsets, err := s.session.DocDataFile.AppendBatch(records)
 	if err != nil {
-		return err
+		return fmt.Errorf("append docs: %w", err)
 	}
-	offset, err := s.session.DocDataFile.Append(record)
-	if err != nil {
-		return fmt.Errorf("append doc %s: %w", doc.ID, err)
-	}
-	idx.Set(s.session.DocIDMap.GetOrAssign(doc.ID), offset)
+	idx.SetBatch(ids, offsets)
 	return nil
 }
 
@@ -835,11 +836,11 @@ const docRecordMinSize = 24
 // marshalDocRecord serializes a document as binary:
 // [TotalSize:4][IndexedAt:8][IDLen:2][ID][PathLen:2][Path][TypeLen:2][Type][ContentLen:4][Content][LangLen:2][Language]
 func marshalDocRecord(doc *VersionDocument) ([]byte, error) {
-	payloadSize := docRecordMinSize - 4 + len(doc.ID) + len(doc.Path) + len(doc.Type) + len(doc.Content) + len(doc.Language)
-	record := make([]byte, 4+payloadSize)
+	payloadSize := docRecordMinSize - recordSizePrefixLen + len(doc.ID) + len(doc.Path) + len(doc.Type) + len(doc.Content) + len(doc.Language)
+	record := make([]byte, recordSizePrefixLen+payloadSize)
 
-	binary.LittleEndian.PutUint32(record[0:4], uint32(payloadSize))
-	off := 4
+	binary.LittleEndian.PutUint32(record[:recordSizePrefixLen], uint32(payloadSize))
+	off := recordSizePrefixLen
 
 	binary.LittleEndian.PutUint64(record[off:off+8], uint64(doc.IndexedAt))
 	off += 8
@@ -867,14 +868,14 @@ func docWriteStr16(buf []byte, off int, s string) int {
 
 // readDocAtOffset reads a document from a shared data file at the given offset.
 func readDocAtOffset(sdf *SharedDataFile, offset int64) (*VersionDocument, error) {
-	sizeBuf := make([]byte, 4)
+	sizeBuf := make([]byte, recordSizePrefixLen)
 	if _, err := sdf.ReadAt(sizeBuf, offset); err != nil {
 		return nil, err
 	}
 	size := binary.LittleEndian.Uint32(sizeBuf)
 
 	data := make([]byte, size)
-	if _, err := sdf.ReadAt(data, offset+4); err != nil {
+	if _, err := sdf.ReadAt(data, offset+recordSizePrefixLen); err != nil {
 		return nil, err
 	}
 
@@ -883,7 +884,7 @@ func readDocAtOffset(sdf *SharedDataFile, offset int64) (*VersionDocument, error
 
 // unmarshalDocPayload decodes a binary doc payload (without the TotalSize prefix).
 func unmarshalDocPayload(data []byte) (*VersionDocument, error) {
-	if len(data) < docRecordMinSize-4 {
+	if len(data) < docRecordMinSize-recordSizePrefixLen {
 		return nil, fmt.Errorf("doc record truncated: %d bytes", len(data))
 	}
 

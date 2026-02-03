@@ -658,9 +658,21 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		tea.WithContext(ctx),
 	)
 
+	adapter := &programAdapter{program: p}
+
 	// Start bridges with the program reference via adapter.
-	if err := app.StartBridges(&programAdapter{program: p}); err != nil {
+	if err := app.StartBridges(adapter); err != nil {
 		return err
+	}
+
+	// In mock mode, seed data and start the mock agent.
+	if cfg.MockMode {
+		seedMockData(deps)
+		mock := NewMockAgent(deps.GuideBus, deps.ActivityBus, adapter, deps.Scope)
+		if err := mock.Start(); err != nil {
+			return err
+		}
+		defer mock.Stop()
 	}
 
 	_, err := p.Run()

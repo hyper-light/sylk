@@ -207,6 +207,148 @@ func TestFormatSymbolKind(t *testing.T) {
 	}
 }
 
+func TestChunkerPrepare(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	chunker := NewUniversalChunker(mock, uint32(mock.MaxInputBytes()))
+	ctx := context.Background()
+
+	content := []byte("package main\n\nfunc Foo() {\n\treturn\n}\n\nfunc Bar() {\n\treturn\n}\n")
+
+	prep := chunker.Prepare(ctx, content)
+
+	if len(prep.Segments) == 0 {
+		t.Fatal("Prepare should produce segments")
+	}
+
+	// Segments should cover the content.
+	if prep.Segments[0].Start != 0 {
+		t.Errorf("first segment should start at 0, got %d", prep.Segments[0].Start)
+	}
+	last := prep.Segments[len(prep.Segments)-1]
+	if last.End != uint32(len(content)) {
+		t.Errorf("last segment should end at %d, got %d", len(content), last.End)
+	}
+}
+
+func TestChunkerPrepareWithSymbols(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	chunker := NewUniversalChunker(mock, uint32(mock.MaxInputBytes()))
+	ctx := context.Background()
+
+	content := []byte("package main\n\nfunc Foo() {\n\treturn\n}\n\nfunc Bar() {\n\treturn\n}\n")
+	symbols := []SymbolBound{
+		{StartLine: 3, EndLine: 5, Strength: 2},
+		{StartLine: 7, EndLine: 9, Strength: 2},
+	}
+
+	prep := chunker.PrepareWithSymbols(ctx, content, symbols)
+
+	if len(prep.Segments) == 0 {
+		t.Fatal("PrepareWithSymbols should produce segments")
+	}
+}
+
+func TestChunkerPrepareEmpty(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	chunker := NewUniversalChunker(mock, 1000)
+	ctx := context.Background()
+
+	prep := chunker.Prepare(ctx, nil)
+	if len(prep.Segments) != 0 {
+		t.Errorf("Prepare(nil) should return 0 segments, got %d", len(prep.Segments))
+	}
+
+	prep = chunker.Prepare(ctx, []byte{})
+	if len(prep.Segments) != 0 {
+		t.Errorf("Prepare([]) should return 0 segments, got %d", len(prep.Segments))
+	}
+}
+
+func TestChunkerMergeFromEmbeddings(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	chunker := NewUniversalChunker(mock, uint32(mock.MaxInputBytes()))
+	ctx := context.Background()
+
+	content := []byte("package main\n\nfunc Foo() {\n\treturn\n}\n\nfunc Bar() {\n\treturn\n}\n")
+
+	// Prepare segments.
+	prep := chunker.Prepare(ctx, content)
+	if len(prep.Segments) == 0 {
+		t.Fatal("no segments from Prepare")
+	}
+
+	// Embed segment texts.
+	texts := make([]string, len(prep.Segments))
+	for i, seg := range prep.Segments {
+		texts[i] = string(content[seg.Start:seg.End])
+	}
+	embs, err := chunker.SimilarityEmbedder().EmbedBatch(ctx, texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+
+	// Merge with pre-computed embeddings.
+	cr := chunker.MergeFromEmbeddings(ctx, content, prep, embs)
+
+	if len(cr.Boundaries) == 0 {
+		t.Fatal("MergeFromEmbeddings should produce chunks")
+	}
+	if cr.Boundaries[0].ByteStart != 0 {
+		t.Errorf("first chunk should start at 0, got %d", cr.Boundaries[0].ByteStart)
+	}
+	lastEnd := cr.Boundaries[len(cr.Boundaries)-1].ByteEnd
+	if lastEnd != uint32(len(content)) {
+		t.Errorf("last chunk should end at %d, got %d", len(content), lastEnd)
+	}
+}
+
+func TestChunkerMergeFromEmbeddingsMatchesChunk(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	chunker := NewUniversalChunker(mock, uint32(mock.MaxInputBytes()))
+	ctx := context.Background()
+
+	content := []byte("small text")
+
+	// Full Chunk path (embeds internally).
+	cr1 := chunker.Chunk(ctx, content)
+
+	// Split path: Prepare → Embed → MergeFromEmbeddings.
+	prep := chunker.Prepare(ctx, content)
+	texts := make([]string, len(prep.Segments))
+	for i, seg := range prep.Segments {
+		texts[i] = string(content[seg.Start:seg.End])
+	}
+	embs, _ := chunker.SimilarityEmbedder().EmbedBatch(ctx, texts)
+	cr2 := chunker.MergeFromEmbeddings(ctx, content, prep, embs)
+
+	// Same number of boundaries.
+	if len(cr1.Boundaries) != len(cr2.Boundaries) {
+		t.Fatalf("Chunk produced %d boundaries, MergeFromEmbeddings produced %d",
+			len(cr1.Boundaries), len(cr2.Boundaries))
+	}
+	for i := range cr1.Boundaries {
+		if cr1.Boundaries[i].ByteStart != cr2.Boundaries[i].ByteStart ||
+			cr1.Boundaries[i].ByteEnd != cr2.Boundaries[i].ByteEnd {
+			t.Errorf("boundary %d mismatch: Chunk=[%d,%d) Split=[%d,%d)", i,
+				cr1.Boundaries[i].ByteStart, cr1.Boundaries[i].ByteEnd,
+				cr2.Boundaries[i].ByteStart, cr2.Boundaries[i].ByteEnd)
+		}
+	}
+}
+
+func TestChunkerSimilarityEmbedder(t *testing.T) {
+	mock := embedder.NewDefaultMockEmbedder()
+	chunker := NewUniversalChunker(mock, 1000)
+
+	emb := chunker.SimilarityEmbedder()
+	if emb == nil {
+		t.Fatal("SimilarityEmbedder returned nil")
+	}
+	if emb.Dimension() != mock.Dimension() {
+		t.Errorf("dimension mismatch: got %d, want %d", emb.Dimension(), mock.Dimension())
+	}
+}
+
 func strContains(s, substr string) bool {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {

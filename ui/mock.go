@@ -1,0 +1,377 @@
+package ui
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/session"
+	"github.com/adalundhe/sylk/ui/bridge"
+	"github.com/adalundhe/sylk/ui/msg"
+)
+
+// ---------------------------------------------------------------------------
+// Mock agent constants (all derived, not magic)
+// ---------------------------------------------------------------------------
+
+// mockGuideID is the agent identifier for the mock guide agent.
+const mockGuideID = "mock-guide"
+
+// mockGuideName is the display name for the mock guide agent.
+const mockGuideName = "Guide"
+
+// mockGuideType is the agent type classification for the mock guide.
+const mockGuideType = "guide"
+
+// mockArchitectID is the agent identifier for the mock architect agent.
+const mockArchitectID = "mock-architect"
+
+// mockArchitectName is the display name for the mock architect agent.
+const mockArchitectName = "Architect"
+
+// mockArchitectType is the agent type classification for the mock architect.
+const mockArchitectType = "architect"
+
+// mockChunkDelay is the delay between streaming chunks.
+// Derived from: typical LLM token emission rate (~25 tokens/sec → 40ms).
+const mockChunkDelay = 40 * time.Millisecond
+
+// mockThinkDelay simulates agent "thinking" time before starting a response.
+// Derived from: noticeable but not frustrating pause (~300ms).
+const mockThinkDelay = 300 * time.Millisecond
+
+// mockMaxChunks bounds the number of streaming chunks per response.
+// Derived from: generous upper bound on token count for display responses.
+const mockMaxChunks = 512
+
+// mockResponseTimeout is the maximum time allowed for a single mock response.
+// Derived from: mockChunkDelay × mockMaxChunks ≈ 20s, plus margin.
+const mockResponseTimeout = 30 * time.Second
+
+// mockFirstWordsCount is the number of words echoed from user input.
+// Derived from: enough for context recognition without being verbose.
+const mockFirstWordsCount = 8
+
+// ---------------------------------------------------------------------------
+// MockAgent
+// ---------------------------------------------------------------------------
+
+// MockAgent subscribes to guide requests on the EventBus and generates
+// fake streaming responses. It allows manual testing of the TUI without
+// a real agent backend — type a prompt, get a streaming response.
+type MockAgent struct {
+	bus          guide.EventBus
+	activityBus  *events.ActivityEventBus
+	program      bridge.TeaProgram
+	scope        *concurrency.GoroutineScope
+	subscription guide.Subscription
+}
+
+// NewMockAgent creates a mock agent with the given dependencies.
+func NewMockAgent(
+	bus guide.EventBus,
+	activityBus *events.ActivityEventBus,
+	program bridge.TeaProgram,
+	scope *concurrency.GoroutineScope,
+) *MockAgent {
+	return &MockAgent{
+		bus:         bus,
+		activityBus: activityBus,
+		program:     program,
+		scope:       scope,
+	}
+}
+
+// Start subscribes to guide requests and begins handling them.
+func (m *MockAgent) Start() error {
+	sub, err := m.bus.Subscribe(guide.TopicGuideRequests, m.onRequest)
+	if err != nil {
+		return err
+	}
+	m.subscription = sub
+	return nil
+}
+
+// Stop unsubscribes from the guide bus.
+func (m *MockAgent) Stop() {
+	if m.subscription != nil {
+		_ = m.subscription.Unsubscribe()
+	}
+}
+
+// onRequest handles an incoming guide request by spawning a tracked goroutine.
+func (m *MockAgent) onRequest(busMsg *guide.Message) error {
+	req, ok := busMsg.GetRouteRequest()
+	if !ok {
+		return nil
+	}
+	return m.scope.Go(
+		"mock.respond."+req.CorrelationID,
+		mockResponseTimeout,
+		m.respondFunc(req),
+	)
+}
+
+// respondFunc returns a WorkFunc that generates a mock streaming response.
+func (m *MockAgent) respondFunc(req *guide.RouteRequest) concurrency.WorkFunc {
+	return func(ctx context.Context) error {
+		m.respond(ctx, req)
+		return nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Response generation
+// ---------------------------------------------------------------------------
+
+// respond produces a streaming mock response for the given request.
+func (m *MockAgent) respond(ctx context.Context, req *guide.RouteRequest) {
+	sessionID := req.SessionID
+	correlationID := req.CorrelationID
+
+	// Phase 1: agent starts thinking.
+	m.emitActivity(sessionID, mockGuideID, mockGuideName, mockGuideType,
+		events.EventTypeAgentDecision, events.OutcomePending,
+		"Analyzing request...", 0.1)
+
+	if !sleepCtx(ctx, mockThinkDelay) {
+		return
+	}
+
+	// Phase 2: agent starts acting.
+	m.emitActivity(sessionID, mockGuideID, mockGuideName, mockGuideType,
+		events.EventTypeAgentAction, events.OutcomePending,
+		"Generating response...", 0.3)
+
+	// Phase 3: stream response chunks.
+	response := mockResponse(req.Input)
+	chunks := splitIntoChunks(response)
+
+	m.program.Send(msg.StreamStartMsg{
+		SessionID:     sessionID,
+		CorrelationID: correlationID,
+	})
+
+	for _, chunk := range chunks {
+		if !sleepCtx(ctx, mockChunkDelay) {
+			return
+		}
+		m.program.Send(msg.StreamChunkMsg{
+			SessionID:     sessionID,
+			CorrelationID: correlationID,
+			Text:          chunk,
+		})
+	}
+
+	m.program.Send(msg.StreamCompleteMsg{
+		SessionID:     sessionID,
+		CorrelationID: correlationID,
+	})
+
+	// Phase 4: agent completes.
+	m.emitActivity(sessionID, mockGuideID, mockGuideName, mockGuideType,
+		events.EventTypeSuccess, events.OutcomeSuccess,
+		"Response complete", 0.0)
+}
+
+// sleepCtx pauses for the given duration, returning false if the context
+// is cancelled before the duration elapses.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// emitActivity publishes an activity event for a mock agent.
+func (m *MockAgent) emitActivity(
+	sessionID, agentID, agentName, agentType string,
+	eventType events.EventType,
+	outcome events.EventOutcome,
+	content string,
+	contextUsage float64,
+) {
+	m.activityBus.Publish(&events.ActivityEvent{
+		ID:        uuid.New().String(),
+		EventType: eventType,
+		Timestamp: time.Now(),
+		SessionID: sessionID,
+		AgentID:   agentID,
+		Content:   content,
+		Outcome:   outcome,
+		Data: map[string]any{
+			"agent_type":    agentType,
+			"agent_name":    agentName,
+			"context_usage": contextUsage,
+		},
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Mock data seeding
+// ---------------------------------------------------------------------------
+
+// seedMockData pre-populates sessions and registers mock agents so the TUI
+// has content to display on startup.
+func seedMockData(deps Deps) {
+	seedSessions(deps.SessionManager)
+	seedAgents(deps.ActivityBus)
+}
+
+// mockSessionConfig holds the parameters for a single mock session.
+type mockSessionConfig struct {
+	name   string
+	branch string
+}
+
+// mockSessionConfigs returns the configurations for pre-populated sessions.
+func mockSessionConfigs() []mockSessionConfig {
+	return []mockSessionConfig{
+		{name: "Feature Planning", branch: "feature/auth"},
+		{name: "Bug Triage", branch: "main"},
+		{name: "Code Review", branch: "pr/142"},
+	}
+}
+
+// seedSessions creates mock sessions and switches to the first one.
+func seedSessions(mgr *session.Manager) {
+	configs := mockSessionConfigs()
+	var firstID string
+	for i, mc := range configs {
+		cfg := session.DefaultConfig()
+		cfg.Name = mc.name
+		cfg.Branch = mc.branch
+		s, err := mgr.Create(context.Background(), cfg)
+		if err != nil {
+			continue
+		}
+		if i == 0 {
+			firstID = s.ID()
+		}
+	}
+	if firstID != "" {
+		_ = mgr.Switch(firstID)
+	}
+}
+
+// mockAgentSeed describes an agent to register at startup.
+type mockAgentSeed struct {
+	id        string
+	name      string
+	agentType string
+}
+
+// mockAgentSeeds returns the initial mock agent registrations.
+func mockAgentSeeds() []mockAgentSeed {
+	return []mockAgentSeed{
+		{id: mockGuideID, name: mockGuideName, agentType: mockGuideType},
+		{id: mockArchitectID, name: mockArchitectName, agentType: mockArchitectType},
+	}
+}
+
+// seedAgents publishes initial activity events to register mock agents
+// in the agent panel.
+func seedAgents(bus *events.ActivityEventBus) {
+	for _, agent := range mockAgentSeeds() {
+		bus.Publish(&events.ActivityEvent{
+			ID:        uuid.New().String(),
+			EventType: events.EventTypeLLMResponse,
+			Timestamp: time.Now(),
+			AgentID:   agent.id,
+			Content:   "Ready",
+			Outcome:   events.OutcomeSuccess,
+			Data: map[string]any{
+				"agent_type":    agent.agentType,
+				"agent_name":    agent.name,
+				"context_usage": 0.0,
+			},
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Response text generation
+// ---------------------------------------------------------------------------
+
+// mockResponse generates a markdown response that exercises chat rendering.
+// It echoes part of the user's input for a contextual feel.
+func mockResponse(input string) string {
+	echo := firstWords(input, mockFirstWordsCount)
+
+	var b strings.Builder
+	b.WriteString("Regarding \"")
+	b.WriteString(echo)
+	b.WriteString("\" — here's my analysis:\n\n")
+	b.WriteString("## Overview\n\n")
+	b.WriteString("I've examined the relevant code and identified several key areas:\n\n")
+	b.WriteString("1. **Architecture** — The current design follows clean separation of concerns\n")
+	b.WriteString("2. **Performance** — There are optimization opportunities in the hot path\n")
+	b.WriteString("3. **Testing** — Coverage could be improved with integration tests\n\n")
+	b.WriteString("## Implementation\n\n")
+	b.WriteString("```go\n")
+	b.WriteString("func Process(ctx context.Context, input string) (string, error) {\n")
+	b.WriteString("    result, err := analyze(ctx, input)\n")
+	b.WriteString("    if err != nil {\n")
+	b.WriteString("        return \"\", fmt.Errorf(\"analysis: %%w\", err)\n")
+	b.WriteString("    }\n")
+	b.WriteString("    return format(result), nil\n")
+	b.WriteString("}\n")
+	b.WriteString("```\n\n")
+	b.WriteString("## Next Steps\n\n")
+	b.WriteString("- Review the proposed changes above\n")
+	b.WriteString("- Run the test suite to verify correctness\n")
+	b.WriteString("- Consider edge cases for error handling\n\n")
+	b.WriteString("Let me know if you'd like me to elaborate or proceed with the implementation.")
+	return b.String()
+}
+
+// firstWords returns the first n whitespace-delimited words from s.
+func firstWords(s string, n int) string {
+	words := strings.Fields(s)
+	if len(words) > n {
+		words = words[:n]
+	}
+	return strings.Join(words, " ")
+}
+
+// splitIntoChunks breaks text into word-boundary chunks for streaming.
+// Each chunk preserves trailing whitespace (spaces, newlines) so the
+// reassembled text matches the original. Returns at most mockMaxChunks pieces.
+func splitIntoChunks(text string) []string {
+	if text == "" {
+		return nil
+	}
+
+	// Pre-allocate with a reasonable estimate (1 chunk per ~4 chars).
+	estimated := min(len(text)/4+1, mockMaxChunks)
+	chunks := make([]string, 0, estimated)
+
+	var current strings.Builder
+	for _, r := range text {
+		current.WriteRune(r)
+		// Emit at word boundaries.
+		if (r == ' ' || r == '\n') && current.Len() > 0 {
+			if len(chunks) >= mockMaxChunks {
+				break
+			}
+			chunks = append(chunks, current.String())
+			current.Reset()
+		}
+	}
+
+	// Flush remaining content.
+	if current.Len() > 0 && len(chunks) < mockMaxChunks {
+		chunks = append(chunks, current.String())
+	}
+
+	return chunks
+}

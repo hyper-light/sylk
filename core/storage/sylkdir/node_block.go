@@ -59,18 +59,26 @@ type Node struct {
 	Supersedes   uint32 // ID of older version (0 = original)
 }
 
-// MarshalBinary encodes the node to binary format.
-// Format: fixed 32-byte header + variable-length strings (length-prefixed).
-func (n *Node) MarshalBinary() ([]byte, error) {
-	// Calculate total size
-	varLen := 2 + len(n.CanonicalKey) +
+// BinarySize returns the serialized size in bytes.
+func (n *Node) BinarySize() int {
+	return NodeHeaderSize +
+		2 + len(n.CanonicalKey) +
 		2 + len(n.Name) +
 		2 + len(n.Path) +
 		2 + len(n.Package) +
 		2 + len(n.Signature)
+}
 
-	buf := make([]byte, NodeHeaderSize+varLen)
+// MarshalBinary encodes the node to binary format.
+// Format: fixed 32-byte header + variable-length strings (length-prefixed).
+func (n *Node) MarshalBinary() ([]byte, error) {
+	buf := make([]byte, n.BinarySize())
+	n.MarshalBinaryTo(buf)
+	return buf, nil
+}
 
+// MarshalBinaryTo encodes the node into the provided buffer (must be >= BinarySize()).
+func (n *Node) MarshalBinaryTo(buf []byte) {
 	// Write fixed header (32 bytes, zero padding)
 	binary.LittleEndian.PutUint32(buf[0:4], n.ID)
 	buf[4] = n.Domain
@@ -89,8 +97,6 @@ func (n *Node) MarshalBinary() ([]byte, error) {
 	offset = writeString(buf, offset, n.Path)
 	offset = writeString(buf, offset, n.Package)
 	writeString(buf, offset, n.Signature)
-
-	return buf, nil
 }
 
 // UnmarshalBinary decodes the node from binary format.

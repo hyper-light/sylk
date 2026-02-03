@@ -91,25 +91,21 @@ func (s *ChunkRefStore) walLogChunkRefBatch(refs []*ChunkRef) error {
 	return s.session.WAL.LogChunkRefBatch(walData)
 }
 
-// appendChunkRefBatch appends all refs to the data file and updates the index.
+// appendChunkRefBatch pre-marshals all refs, writes them in a single I/O via
+// AppendBatch, and updates the index with SetBatch.
 func (s *ChunkRefStore) appendChunkRefBatch(version SemanticVersion, refs []*ChunkRef) error {
 	idx := s.chunkIndex(version)
-	for _, ref := range refs {
-		if err := s.appendSingleChunkRef(idx, ref); err != nil {
-			return err
-		}
+	records := make([][]byte, len(refs))
+	ids := make([]uint32, len(refs))
+	for i, ref := range refs {
+		records[i] = ref.MarshalBinary()
+		ids[i] = ref.NodeID
 	}
-	return nil
-}
-
-// appendSingleChunkRef marshals and appends one chunk ref to the data file.
-func (s *ChunkRefStore) appendSingleChunkRef(idx *OffsetIndex, ref *ChunkRef) error {
-	record := ref.MarshalBinary()
-	offset, err := s.session.ChunkDataFile.Append(record)
+	offsets, err := s.session.ChunkDataFile.AppendBatch(records)
 	if err != nil {
-		return fmt.Errorf("append chunk ref %d: %w", ref.NodeID, err)
+		return fmt.Errorf("append chunk refs: %w", err)
 	}
-	idx.Set(ref.NodeID, offset)
+	idx.SetBatch(ids, offsets)
 	return nil
 }
 
