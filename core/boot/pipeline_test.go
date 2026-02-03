@@ -233,6 +233,9 @@ func foo() {}
 		t.Error("first boot should not be incremental")
 	}
 
+	// Wait for background file hashing to complete — delta detection uses these hashes.
+	result1.BackgroundHasher.Wait()
+
 	updatedFile := `package main
 
 func foo() {}
@@ -352,6 +355,9 @@ func TestBootPipeline_RealProjectIncremental(t *testing.T) {
 	if result1.FilesProcessed == 0 {
 		t.Fatal("cold boot should process files")
 	}
+
+	// Wait for background file hashing to complete — delta detection uses these hashes.
+	result1.BackgroundHasher.Wait()
 
 	// Modify a single file to trigger delta detection.
 	targetFile := filepath.Join(projectTmp, "core", "boot", "meta.go")
@@ -515,6 +521,9 @@ func TestBootPipeline_NoChangesSkip(t *testing.T) {
 		t.Fatal("first boot should create nodes")
 	}
 
+	// Wait for background file hashing to complete — change detection uses these hashes.
+	result1.BackgroundHasher.Wait()
+
 	// Second boot with no changes should skip
 	result2, err := Boot(ctx, tmpDir)
 	if err != nil {
@@ -606,9 +615,15 @@ func copyFile(src, dst string) error {
 }
 
 // closeBackgroundIndexer cancels and waits for the background indexer
-// goroutine to finish. Safe to call with nil result or nil indexer.
+// and background hasher goroutines to finish. Safe to call with nil result.
 func closeBackgroundIndexer(result *PipelineResult) {
-	if result != nil && result.BackgroundIndexer != nil {
+	if result == nil {
+		return
+	}
+	if result.BackgroundIndexer != nil {
 		result.BackgroundIndexer.Close()
+	}
+	if result.BackgroundHasher != nil {
+		result.BackgroundHasher.Wait()
 	}
 }

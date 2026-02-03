@@ -53,6 +53,11 @@ type PipelineResult struct {
 	// The caller can Wait() on it, use Ready() to check completion, or
 	// call PromoteDocs() for on-demand query-time indexing.
 	BackgroundIndexer *sylkdir.BackgroundIndexer
+
+	// BackgroundHasher is non-nil when file hashing was deferred.
+	// Hashes are only needed for next boot's change detection.
+	// The caller can Wait() to ensure hashes are persisted.
+	BackgroundHasher *BackgroundHasher
 }
 
 // PhaseTiming records wall-clock duration of each boot phase.
@@ -199,12 +204,15 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	// Phase 6: Finalize meta
 	log.Printf("[boot] Phase 6: Finalize starting")
 	finalizeStart := time.Now()
-	p.finalizeMeta(ctx, projectRoot, isGitRepo, meta, ingestResult, commitResult, result)
+	p.finalizeMeta(projectRoot, isGitRepo, meta, ingestResult, commitResult, result)
 	if err := meta.Save(projectRoot); err != nil {
 		return nil, fmt.Errorf("save meta: %w", err)
 	}
 	result.Phases.Finalize = time.Since(finalizeStart)
 	log.Printf("[boot] Phase 6: Finalize done: %v", result.Phases.Finalize)
+
+	// File hashing runs asynchronously — only needed for next boot's change detection.
+	result.BackgroundHasher = p.startBackgroundHashing(projectRoot, meta)
 
 	result.Duration = time.Since(start)
 
@@ -408,8 +416,8 @@ func extractDeletedPaths(root string, changes []FileChange) []string {
 }
 
 // finalizeMeta updates Meta and PipelineResult from the ingestion and commit results.
+// File hashing is deferred to startBackgroundHashing (not needed for current boot).
 func (p *Pipeline) finalizeMeta(
-	ctx context.Context,
 	root string,
 	isGitRepo bool,
 	meta *Meta,
@@ -419,13 +427,12 @@ func (p *Pipeline) finalizeMeta(
 ) {
 	if isGitRepo {
 		detector := NewChangeDetector(root, meta, isGitRepo)
-		if commit, err := detector.GetCurrentCommit(ctx); err == nil {
+		if commit, err := detector.GetCurrentCommit(context.Background()); err == nil {
 			meta.SetCommit(commit)
 		}
 	}
 
 	meta.UpdateStats(int64(ir.NodesCreated), int64(ir.EdgesCreated), int64(ir.VectorsCreated))
-	p.populateFileHashes(ctx, meta, root)
 
 	result.FilesProcessed = int64(ir.FilesProcessed)
 	result.NodesCreated = int64(ir.NodesCreated)
@@ -511,6 +518,40 @@ func hashFileContents(path string) string {
 		return ""
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// BackgroundHasher computes file hashes asynchronously after boot completes.
+// Hashes are only needed for the next boot's change detection, so they
+// run off the critical path. The caller can Wait() to block until done.
+type BackgroundHasher struct {
+	done chan struct{}
+}
+
+// Wait blocks until background hashing completes.
+func (bh *BackgroundHasher) Wait() {
+	if bh != nil {
+		<-bh.done
+	}
+}
+
+// Done returns a channel that closes when background hashing completes.
+func (bh *BackgroundHasher) Done() <-chan struct{} {
+	return bh.done
+}
+
+// startBackgroundHashing launches a goroutine to compute file hashes and
+// re-save Meta with the hashes populated. Returns a BackgroundHasher the
+// caller can Wait() on.
+func (p *Pipeline) startBackgroundHashing(root string, meta *Meta) *BackgroundHasher {
+	bh := &BackgroundHasher{done: make(chan struct{})}
+	go func() {
+		defer close(bh.done)
+		p.populateFileHashes(context.Background(), meta, root)
+		if err := meta.Save(root); err != nil {
+			log.Printf("[boot] background hash save: %v", err)
+		}
+	}()
+	return bh
 }
 
 func (p *Pipeline) setError(err error) {
