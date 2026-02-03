@@ -610,7 +610,9 @@ func (s *GlobalVersionVectorStore) WriteBatch(vecs []*VersionVector) error {
 }
 
 // WriteBatchToVersion writes multiple vectors to a specific version.
-// Uses 3-phase batch: pre-marshal all → single AppendBatch → single SetBatch.
+// Pre-marshals all vectors into a single contiguous buffer using direct memory
+// copy (marshalVectorRecordTo), then writes via AppendRaw — single allocation,
+// single I/O, single index update.
 func (s *GlobalVersionVectorStore) WriteBatchToVersion(version SemanticVersion, vecs []*VersionVector) error {
 	if len(vecs) == 0 {
 		return nil
@@ -619,16 +621,24 @@ func (s *GlobalVersionVectorStore) WriteBatchToVersion(version SemanticVersion, 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	records := make([][]byte, len(vecs))
+	dim := len(vecs[0].Vector)
+	recSize := vectorRecordByteSize(dim)
+
+	buf := make([]byte, len(vecs)*recSize)
 	ids := make([]uint32, len(vecs))
 	for i, vec := range vecs {
-		records[i] = marshalVectorRecord(vec)
+		marshalVectorRecordTo(buf[i*recSize:(i+1)*recSize], vec)
 		ids[i] = vec.NodeID
 	}
 
-	offsets, err := s.dataFile.AppendBatch(records)
+	baseOffset, err := s.dataFile.AppendRaw(buf)
 	if err != nil {
 		return fmt.Errorf("append global vectors: %w", err)
+	}
+
+	offsets := make([]int64, len(vecs))
+	for i := range vecs {
+		offsets[i] = baseOffset + int64(i*recSize)
 	}
 
 	s.vectorIndex(version).SetBatch(ids, offsets)

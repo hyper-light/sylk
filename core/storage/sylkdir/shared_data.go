@@ -109,6 +109,23 @@ func (sdf *SharedDataFile) AppendBatch(records [][]byte) ([]int64, error) {
 	return offsets, nil
 }
 
+// AppendRaw writes a pre-assembled buffer in a single I/O operation.
+// Returns the starting offset. Single mutex acquisition.
+// Use this when the caller has already marshaled all records into a contiguous
+// buffer (e.g., fixed-size records marshaled with MarshalTo pattern).
+func (sdf *SharedDataFile) AppendRaw(buf []byte) (int64, error) {
+	sdf.mu.Lock()
+	baseOffset := sdf.size.Load()
+	n, err := sdf.file.WriteAt(buf, baseOffset)
+	sdf.size.Add(int64(n))
+	sdf.mu.Unlock()
+
+	if err != nil {
+		return 0, fmt.Errorf("append raw: %w", err)
+	}
+	return baseOffset, nil
+}
+
 // Close closes the underlying file.
 func (sdf *SharedDataFile) Close() error {
 	if sdf.file == nil {

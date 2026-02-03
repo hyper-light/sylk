@@ -5,10 +5,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
+	"unsafe"
 )
 
 // recordSizePrefixLen is the byte width of the uint32 record length prefix
@@ -1025,25 +1025,35 @@ func (s *VersionVectorStore) walLogVectorBatch(vecs []*VersionVector) error {
 	return s.session.WAL.LogVectorBatch(walData)
 }
 
-// appendVectorBatch appends all vectors to the data file and updates the index.
+// appendVectorBatch pre-marshals all vectors into a contiguous buffer,
+// writes via AppendRaw, and updates the index with SetBatch.
 func (s *VersionVectorStore) appendVectorBatch(version SemanticVersion, vecs []*VersionVector) error {
-	idx := s.vectorIndex(version)
-	for _, vec := range vecs {
-		if err := s.appendSingleVector(idx, vec); err != nil {
-			return err
-		}
+	if len(vecs) == 0 {
+		return nil
 	}
-	return nil
-}
 
-// appendSingleVector marshals and appends one vector to the data file.
-func (s *VersionVectorStore) appendSingleVector(idx *OffsetIndex, vec *VersionVector) error {
-	record := marshalVectorRecord(vec)
-	offset, err := s.session.VectorDataFile.Append(record)
-	if err != nil {
-		return fmt.Errorf("append vector %d: %w", vec.NodeID, err)
+	idx := s.vectorIndex(version)
+	dim := len(vecs[0].Vector)
+	recSize := vectorRecordByteSize(dim)
+
+	buf := make([]byte, len(vecs)*recSize)
+	ids := make([]uint32, len(vecs))
+	for i, vec := range vecs {
+		marshalVectorRecordTo(buf[i*recSize:(i+1)*recSize], vec)
+		ids[i] = vec.NodeID
 	}
-	idx.Set(vec.NodeID, offset)
+
+	baseOffset, err := s.session.VectorDataFile.AppendRaw(buf)
+	if err != nil {
+		return fmt.Errorf("append vectors: %w", err)
+	}
+
+	offsets := make([]int64, len(vecs))
+	for i := range vecs {
+		offsets[i] = baseOffset + int64(i*recSize)
+	}
+
+	idx.SetBatch(ids, offsets)
 	return nil
 }
 
@@ -1166,49 +1176,53 @@ func (s *VersionVectorStore) loadVectorIndex(version SemanticVersion) *OffsetInd
 	return actual.(*OffsetIndex)
 }
 
+// vectorRecordHeaderSize is the byte width of the vector record header: [NodeID:4][Dim:4].
+const vectorRecordHeaderSize = 8
+
+// vectorRecordByteSize returns the serialized byte size of a vector with the given dimension.
+func vectorRecordByteSize(dim int) int {
+	return vectorRecordHeaderSize + dim*4
+}
+
+// marshalVectorRecordTo writes a vector record into buf (must be >= vectorRecordSize).
+// Uses direct memory copy for the float32 slice — valid on little-endian architectures
+// (x86, ARM64) where float32 memory layout matches binary.LittleEndian byte order.
+func marshalVectorRecordTo(buf []byte, vec *VersionVector) {
+	dim := len(vec.Vector)
+	binary.LittleEndian.PutUint32(buf[0:4], vec.NodeID)
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(dim))
+	if dim > 0 {
+		src := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(vec.Vector))), dim*4)
+		copy(buf[vectorRecordHeaderSize:], src)
+	}
+}
+
 // marshalVectorRecord serializes a vector as [NodeID:4][Dim:4][Vector:Dim*4].
 func marshalVectorRecord(vec *VersionVector) []byte {
-	dim := len(vec.Vector)
-	record := make([]byte, 8+dim*4)
-	binary.LittleEndian.PutUint32(record[0:4], vec.NodeID)
-	binary.LittleEndian.PutUint32(record[4:8], uint32(dim))
-	for i, v := range vec.Vector {
-		binary.LittleEndian.PutUint32(record[8+i*4:], uint32FromFloat32(v))
-	}
-	return record
+	buf := make([]byte, vectorRecordByteSize(len(vec.Vector)))
+	marshalVectorRecordTo(buf, vec)
+	return buf
 }
 
 // readVectorAtOffset reads a vector from a shared data file at the given offset.
+// Uses direct memory reinterpretation on little-endian architectures to avoid
+// per-element uint32→float32 conversion.
 func readVectorAtOffset(sdf *SharedDataFile, offset int64) (*VersionVector, error) {
-	header := make([]byte, 8)
-	if _, err := sdf.ReadAt(header, offset); err != nil {
+	var header [vectorRecordHeaderSize]byte
+	if _, err := sdf.ReadAt(header[:], offset); err != nil {
 		return nil, err
 	}
 
 	nodeID := binary.LittleEndian.Uint32(header[0:4])
 	dim := binary.LittleEndian.Uint32(header[4:8])
 
-	vecBuf := make([]byte, dim*4)
-	if _, err := sdf.ReadAt(vecBuf, offset+8); err != nil {
+	vec := make([]float32, dim)
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(vec))), dim*4)
+	if _, err := sdf.ReadAt(dst, offset+vectorRecordHeaderSize); err != nil {
 		return nil, err
 	}
 
-	vec := make([]float32, dim)
-	for i := range vec {
-		vec[i] = float32FromUint32(binary.LittleEndian.Uint32(vecBuf[i*4:]))
-	}
-
 	return &VersionVector{NodeID: nodeID, Vector: vec}, nil
-}
-
-// uint32FromFloat32 converts float32 to uint32 bit representation.
-func uint32FromFloat32(f float32) uint32 {
-	return math.Float32bits(f)
-}
-
-// float32FromUint32 converts uint32 bit representation to float32.
-func float32FromUint32(u uint32) float32 {
-	return math.Float32frombits(u)
 }
 
 // --- WAL conversion helpers ---

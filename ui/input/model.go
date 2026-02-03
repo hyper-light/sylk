@@ -533,7 +533,7 @@ func (m *Model) contentWidth() int {
 
 // renderBody renders the visible lines with cursor and placeholder.
 func (m *Model) renderBody() string {
-	if m.isEmpty() && m.focused {
+	if m.isEmpty() && !m.focused {
 		return m.theme.Placeholder.Render("Type a message...")
 	}
 
