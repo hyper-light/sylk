@@ -481,9 +481,9 @@ const inputAreaMinHeight = 3
 // Derived from: 1 char per side × 2 sides = 2.
 const panelBorderSize = 2
 
-// leftPanelOverhead is the vertical space consumed by section headers and divider.
-// Derived from: 2 headers (1 line each) + 1 divider (1 line) = 3.
-const leftPanelOverhead = 3
+// leftPanelOverhead is the vertical space consumed by section headers.
+// Derived from: 2 headers (1 line each) = 2.
+const leftPanelOverhead = 2
 
 func (m *AppModel) recalcLayout() {
 	// Reserve space for input and status bar.
@@ -541,25 +541,30 @@ func (m *AppModel) renderMainArea() string {
 	}
 }
 
-// renderLeftPanel stacks sessions and agents with section headers and a divider.
+// renderLeftPanel stacks sessions and agents with line-extended section headers.
+// Each header renders as " Label ────────" to match the border's visual weight.
 func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
 	leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
 	innerW := max(leftW-panelBorderSize, 1)
 
-	headerStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
-	dividerStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
-
-	sessionHeader := headerStyle.Render(" Sessions")
-	agentHeader := headerStyle.Render(" Agents")
-	divider := dividerStyle.Render(strings.Repeat("─", innerW))
-
 	return strings.Join([]string{
-		sessionHeader,
+		sectionHeader("Sessions", innerW, th),
 		m.sessionPanel.View(),
-		divider,
-		agentHeader,
+		sectionHeader("Agents", innerW, th),
 		m.agentPanel.View(),
 	}, "\n")
+}
+
+// sectionHeader renders a label with a trailing line extending to the given width.
+func sectionHeader(label string, width int, th *theme.Theme) string {
+	headerStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
+	lineStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+
+	text := headerStyle.Render(" " + label + " ")
+	textWidth := lipgloss.Width(text)
+	lineWidth := max(width-textWidth, 0)
+
+	return text + lineStyle.Render(strings.Repeat("─", lineWidth))
 }
 
 func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.Theme) string {

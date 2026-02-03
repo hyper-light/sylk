@@ -132,10 +132,11 @@ type ingestionEntities struct {
 	embedTexts []string // parallel: text for each node to embed
 	embedIDs   []uint32 // parallel: node ID for each embedding
 
-	// cachedEmbeddings holds merger embeddings keyed by node ID.
+	// cachedEmbeddings is parallel to chunkNodes: index i holds the merger
+	// embedding for chunkNodes[i], or nil if no cached embedding exists.
 	// Chunks with cached embeddings are excluded from embedTexts/embedIDs
 	// and written directly in writeEntities without re-embedding.
-	cachedEmbeddings map[uint32][]float32
+	cachedEmbeddings [][]float32
 
 	fileIDMap   map[uint32]uint32 // ingestion file ID -> session node ID
 	symbolIDMap map[uint32]uint32 // ingestion symbol ID -> session node ID
@@ -298,7 +299,7 @@ type chunkLocalResult struct {
 	docs       []*VersionDocument
 	refs       []*ChunkRef
 	edges      []*Edge
-	cachedEmbs map[uint32][]float32 // nodeID → merger embedding
+	cachedEmbs [][]float32 // parallel to nodes: merger embedding or nil
 }
 
 // buildChunkEntities chunks all files in parallel across runtime.NumCPU() workers.
@@ -346,9 +347,7 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 		wg.Add(1)
 		go func(idx int, batch []chunkFileEntry) {
 			defer wg.Done()
-			local := chunkLocalResult{
-				cachedEmbs: make(map[uint32][]float32),
-			}
+			var local chunkLocalResult
 
 			for _, fe := range batch {
 				parentNodeID := ent.fileIDMap[fe.file.ID]
@@ -406,10 +405,12 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 						},
 					})
 
-					// Cache merger embedding for this chunk if available.
-					if cr.Embeddings != nil && i < len(cr.Embeddings) && cr.Embeddings[i] != nil {
-						local.cachedEmbs[chunkID] = cr.Embeddings[i]
+					// Parallel to nodes: cache merger embedding or nil.
+					var emb []float32
+					if cr.Embeddings != nil && i < len(cr.Embeddings) {
+						emb = cr.Embeddings[i]
 					}
+					local.cachedEmbs = append(local.cachedEmbs, emb)
 
 					local.edges = append(local.edges, &Edge{
 						SourceID:  parentNodeID,
@@ -440,18 +441,13 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 	}
 	wg.Wait()
 
-	// Merge worker results.
-	if ent.cachedEmbeddings == nil {
-		ent.cachedEmbeddings = make(map[uint32][]float32)
-	}
+	// Merge worker results (cachedEmbs is parallel to nodes).
 	for _, r := range results {
 		ent.chunkNodes = append(ent.chunkNodes, r.nodes...)
 		ent.chunkDocs = append(ent.chunkDocs, r.docs...)
 		ent.chunkRefs = append(ent.chunkRefs, r.refs...)
 		ent.chunkEdges = append(ent.chunkEdges, r.edges...)
-		for id, emb := range r.cachedEmbs {
-			ent.cachedEmbeddings[id] = emb
-		}
+		ent.cachedEmbeddings = append(ent.cachedEmbeddings, r.cachedEmbs...)
 	}
 }
 
@@ -492,13 +488,13 @@ func (s *SessionIngestion) buildEmbedTexts(ent *ingestionEntities) {
 		ent.embedIDs = append(ent.embedIDs, node.ID)
 	}
 
-	for _, node := range ent.chunkNodes {
+	for i, node := range ent.chunkNodes {
 		if node.Name == "" {
 			continue
 		}
 		// Skip chunks that have cached merger embeddings —
 		// their vectors are written directly from the cache.
-		if _, cached := ent.cachedEmbeddings[node.ID]; cached {
+		if i < len(ent.cachedEmbeddings) && ent.cachedEmbeddings[i] != nil {
 			continue
 		}
 		ent.embedTexts = append(ent.embedTexts, node.Name)
@@ -646,7 +642,7 @@ func (s *SessionIngestion) embedAll(ctx context.Context, texts []string) ([][]fl
 // whose embeddings were computed during agglomerative merging and don't need
 // to be recomputed in G2.
 func (s *SessionIngestion) writeVectorsWithCache(ctx context.Context, ent *ingestionEntities, embeddings [][]float32) ([]*VersionVector, error) {
-	totalCap := len(ent.embedIDs) + len(ent.cachedEmbeddings)
+	totalCap := len(ent.embedIDs) + len(ent.chunkNodes)
 	vectors := make([]*VersionVector, 0, totalCap)
 
 	// Fresh G2 embeddings.
@@ -662,10 +658,13 @@ func (s *SessionIngestion) writeVectorsWithCache(ctx context.Context, ent *inges
 		}
 	}
 
-	// Cached merger embeddings (chunk nodes that bypassed G2).
-	for nodeID, emb := range ent.cachedEmbeddings {
+	// Cached merger embeddings (parallel to chunkNodes, bypassed G2).
+	for i, emb := range ent.cachedEmbeddings {
+		if emb == nil {
+			continue
+		}
 		vectors = append(vectors, &VersionVector{
-			NodeID: nodeID,
+			NodeID: ent.chunkNodes[i].ID,
 			Vector: emb,
 		})
 	}
