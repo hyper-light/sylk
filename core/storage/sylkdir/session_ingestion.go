@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -513,12 +514,17 @@ func (s *SessionIngestion) buildEmbedTexts(ent *ingestionEntities) {
 func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEntities) (*SessionIngestionResult, error) {
 	result := &SessionIngestionResult{}
 
+	// Pre-compute concatenated slices once (shared across G1 and G3).
+	allNodes := slices.Concat(ent.fileNodes, ent.symbolNodes, ent.chunkNodes)
+	allEdges := slices.Concat(ent.containsEdges, ent.importEdges, ent.chunkEdges)
+	allDocs := slices.Concat(ent.fileDocs, ent.chunkDocs)
+
 	g, gctx := errgroup.WithContext(ctx)
 
 	// G1: Write all stores (nodes, edges, docs, chunk refs).
 	g.Go(func() error {
 		t := time.Now()
-		err := s.writeStores(gctx, ent, result)
+		err := s.writeStores(gctx, allNodes, allEdges, allDocs, ent.chunkRefs, result)
 		log.Printf("[write] G1 stores: %v (nodes=%d edges=%d docs=%d refs=%d)",
 			time.Since(t), result.NodesCreated, result.EdgesCreated, result.DocsCreated, result.ChunkRefsCreated)
 		return err
@@ -540,8 +546,8 @@ func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEnti
 	// G3: Index all docs into Bleve concurrently.
 	g.Go(func() error {
 		t := time.Now()
-		err := s.indexAllDocs(gctx, ent)
-		log.Printf("[write] G3 bleve: %v (%d docs)", time.Since(t), len(ent.fileDocs)+len(ent.chunkDocs))
+		err := s.indexDocsIntoSessionBleve(gctx, allDocs)
+		log.Printf("[write] G3 bleve: %v (%d docs)", time.Since(t), len(allDocs))
 		return err
 	})
 
@@ -570,15 +576,11 @@ func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEnti
 	return result, nil
 }
 
-// writeStores writes all entity stores sequentially (stores have internal mutexes).
 // writeStores writes all entity stores concurrently.
 // Nodes, edges, docs, and chunk refs have independent SharedDataFiles
 // and mutexes, so they can run in parallel.
-func (s *SessionIngestion) writeStores(ctx context.Context, ent *ingestionEntities, result *SessionIngestionResult) error {
-	allNodes := concatNodes(ent.fileNodes, ent.symbolNodes, ent.chunkNodes)
-	allEdges := concatEdges(ent.containsEdges, ent.importEdges, ent.chunkEdges)
-	allDocs := concatDocs(ent.fileDocs, ent.chunkDocs)
-
+// Receives pre-computed concatenated slices to avoid duplicate allocations.
+func (s *SessionIngestion) writeStores(ctx context.Context, allNodes []*Node, allEdges []*Edge, allDocs []*VersionDocument, chunkRefs []*ChunkRef, result *SessionIngestionResult) error {
 	g, _ := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
@@ -609,14 +611,14 @@ func (s *SessionIngestion) writeStores(ctx context.Context, ent *ingestionEntiti
 	})
 
 	g.Go(func() error {
-		if len(ent.chunkRefs) == 0 {
+		if len(chunkRefs) == 0 {
 			return nil
 		}
 		t := time.Now()
-		if err := s.chunkRefStore.WriteBatch(ent.chunkRefs); err != nil {
+		if err := s.chunkRefStore.WriteBatch(chunkRefs); err != nil {
 			return fmt.Errorf("write chunk refs: %w", err)
 		}
-		log.Printf("[stores] chunkRefs: %v (%d)", time.Since(t), len(ent.chunkRefs))
+		log.Printf("[stores] chunkRefs: %v (%d)", time.Since(t), len(chunkRefs))
 		return nil
 	})
 
@@ -627,7 +629,7 @@ func (s *SessionIngestion) writeStores(ctx context.Context, ent *ingestionEntiti
 	result.NodesCreated = len(allNodes)
 	result.EdgesCreated = len(allEdges)
 	result.DocsCreated = len(allDocs)
-	result.ChunkRefsCreated = len(ent.chunkRefs)
+	result.ChunkRefsCreated = len(chunkRefs)
 	return nil
 }
 
@@ -637,12 +639,6 @@ func (s *SessionIngestion) embedAll(ctx context.Context, texts []string) ([][]fl
 		return nil, nil
 	}
 	return s.embedder.EmbedBatch(ctx, texts)
-}
-
-// indexAllDocs indexes file + chunk docs into session Bleve.
-func (s *SessionIngestion) indexAllDocs(ctx context.Context, ent *ingestionEntities) error {
-	allDocs := concatDocs(ent.fileDocs, ent.chunkDocs)
-	return s.indexDocsIntoSessionBleve(ctx, allDocs)
 }
 
 // writeVectorsWithCache combines fresh G2 embeddings with cached merger embeddings,
@@ -682,46 +678,6 @@ func (s *SessionIngestion) writeVectorsWithCache(ctx context.Context, ent *inges
 	// Eliminates the session disk round-trip (WAL + data file + offset index).
 	s.session.PendingVectors = vectors
 	return vectors, nil
-}
-
-// =========================================================================
-// Helpers: Entity Concatenation
-// =========================================================================
-
-func concatNodes(slices ...[]*Node) []*Node {
-	var total int
-	for _, s := range slices {
-		total += len(s)
-	}
-	result := make([]*Node, 0, total)
-	for _, s := range slices {
-		result = append(result, s...)
-	}
-	return result
-}
-
-func concatEdges(slices ...[]*Edge) []*Edge {
-	var total int
-	for _, s := range slices {
-		total += len(s)
-	}
-	result := make([]*Edge, 0, total)
-	for _, s := range slices {
-		result = append(result, s...)
-	}
-	return result
-}
-
-func concatDocs(slices ...[]*VersionDocument) []*VersionDocument {
-	var total int
-	for _, s := range slices {
-		total += len(s)
-	}
-	result := make([]*VersionDocument, 0, total)
-	for _, s := range slices {
-		result = append(result, s...)
-	}
-	return result
 }
 
 // groupSymbolsByFile partitions symbols by their FileID.

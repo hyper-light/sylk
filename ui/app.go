@@ -482,8 +482,8 @@ const inputAreaMinHeight = 3
 const panelBorderSize = 2
 
 // leftPanelOverhead is the vertical space consumed by section headers and divider.
-// Derived from: 2 headers (1 line each) + 2 spacer lines + 1 divider (1 line) = 5.
-const leftPanelOverhead = 5
+// Derived from: 2 headers (1 line each) + 1 divider (1 line) = 3.
+const leftPanelOverhead = 3
 
 func (m *AppModel) recalcLayout() {
 	// Reserve space for input and status bar.
@@ -555,11 +555,9 @@ func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
 
 	return strings.Join([]string{
 		sessionHeader,
-		"",
 		m.sessionPanel.View(),
 		divider,
 		agentHeader,
-		"",
 		m.agentPanel.View(),
 	}, "\n")
 }
