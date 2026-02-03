@@ -347,3 +347,88 @@ func TestSharedDataFile_CreatesDirs(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 }
+
+func TestAppendBatch(t *testing.T) {
+	dir := t.TempDir()
+	sdf, err := OpenSharedDataFile(filepath.Join(dir, "batch.dat"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer sdf.Close()
+
+	// Write a prefix via regular Append to test interleaving.
+	prefix := []byte("prefix")
+	prefixOff, err := sdf.Append(prefix)
+	if err != nil {
+		t.Fatalf("Append prefix: %v", err)
+	}
+	if prefixOff != 0 {
+		t.Fatalf("prefix offset = %d, want 0", prefixOff)
+	}
+
+	// Batch append three records.
+	records := [][]byte{
+		[]byte("aaaa"),
+		[]byte("bb"),
+		[]byte("cccccc"),
+	}
+	offsets, err := sdf.AppendBatch(records)
+	if err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+
+	if len(offsets) != 3 {
+		t.Fatalf("got %d offsets, want 3", len(offsets))
+	}
+
+	// Verify offsets are contiguous after prefix.
+	wantBase := int64(len(prefix))
+	if offsets[0] != wantBase {
+		t.Errorf("offsets[0] = %d, want %d", offsets[0], wantBase)
+	}
+	if offsets[1] != wantBase+4 {
+		t.Errorf("offsets[1] = %d, want %d", offsets[1], wantBase+4)
+	}
+	if offsets[2] != wantBase+6 {
+		t.Errorf("offsets[2] = %d, want %d", offsets[2], wantBase+6)
+	}
+
+	// Verify each record is readable at its offset.
+	for i, rec := range records {
+		buf := make([]byte, len(rec))
+		n, readErr := sdf.ReadAt(buf, offsets[i])
+		if readErr != nil {
+			t.Errorf("ReadAt record %d: %v", i, readErr)
+			continue
+		}
+		if n != len(rec) || string(buf) != string(rec) {
+			t.Errorf("record %d: got %q, want %q", i, buf, rec)
+		}
+	}
+
+	// Size should reflect all writes.
+	wantSize := int64(len(prefix) + 4 + 2 + 6)
+	if sdf.Size() != wantSize {
+		t.Errorf("Size = %d, want %d", sdf.Size(), wantSize)
+	}
+}
+
+func TestAppendBatchEmpty(t *testing.T) {
+	dir := t.TempDir()
+	sdf, err := OpenSharedDataFile(filepath.Join(dir, "empty_batch.dat"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer sdf.Close()
+
+	offsets, err := sdf.AppendBatch(nil)
+	if err != nil {
+		t.Fatalf("AppendBatch nil: %v", err)
+	}
+	if len(offsets) != 0 {
+		t.Errorf("expected 0 offsets, got %d", len(offsets))
+	}
+	if sdf.Size() != 0 {
+		t.Errorf("Size = %d after empty batch, want 0", sdf.Size())
+	}
+}

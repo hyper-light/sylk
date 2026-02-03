@@ -82,23 +82,32 @@ func (s *GlobalVersionNodeStore) WriteBatch(nodes []*Node) error {
 }
 
 // WriteBatchToVersion writes multiple nodes to a specific version.
+// Uses 3-phase batch: pre-marshal all → single AppendBatch → single SetBatch.
 func (s *GlobalVersionNodeStore) WriteBatchToVersion(version SemanticVersion, nodes []*Node) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	idx := s.nodeIndex(version)
-	for _, node := range nodes {
-		record, err := marshalNodeRecord(node)
+	records := make([][]byte, len(nodes))
+	ids := make([]uint32, len(nodes))
+	for i, node := range nodes {
+		rec, err := marshalNodeRecord(node)
 		if err != nil {
 			return err
 		}
-		offset, err := s.dataFile.Append(record)
-		if err != nil {
-			return fmt.Errorf("append global node %d: %w", node.ID, err)
-		}
-		idx.Set(node.ID, offset)
+		records[i] = rec
+		ids[i] = node.ID
 	}
 
+	offsets, err := s.dataFile.AppendBatch(records)
+	if err != nil {
+		return fmt.Errorf("append global nodes: %w", err)
+	}
+
+	s.nodeIndex(version).SetBatch(ids, offsets)
 	return nil
 }
 
@@ -406,6 +415,7 @@ func (s *GlobalVersionDocStore) WriteBatch(docs []*VersionDocument) error {
 }
 
 // WriteBatchToVersion writes multiple documents to a specific version.
+// Uses 3-phase batch: pre-marshal all → single AppendBatch → single SetBatch.
 func (s *GlobalVersionDocStore) WriteBatchToVersion(version SemanticVersion, docs []*VersionDocument) error {
 	if len(docs) == 0 {
 		return nil
@@ -414,19 +424,23 @@ func (s *GlobalVersionDocStore) WriteBatchToVersion(version SemanticVersion, doc
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	idx := s.docIndex(version)
-	for _, doc := range docs {
-		record, err := marshalDocRecord(doc)
+	records := make([][]byte, len(docs))
+	ids := make([]uint32, len(docs))
+	for i, doc := range docs {
+		rec, err := marshalDocRecord(doc)
 		if err != nil {
 			return err
 		}
-		offset, err := s.dataFile.Append(record)
-		if err != nil {
-			return fmt.Errorf("append global doc %s: %w", doc.ID, err)
-		}
-		idx.Set(s.docIDMap.GetOrAssign(doc.ID), offset)
+		records[i] = rec
+		ids[i] = s.docIDMap.GetOrAssign(doc.ID)
 	}
 
+	offsets, err := s.dataFile.AppendBatch(records)
+	if err != nil {
+		return fmt.Errorf("append global docs: %w", err)
+	}
+
+	s.docIndex(version).SetBatch(ids, offsets)
 	return nil
 }
 
@@ -596,6 +610,7 @@ func (s *GlobalVersionVectorStore) WriteBatch(vecs []*VersionVector) error {
 }
 
 // WriteBatchToVersion writes multiple vectors to a specific version.
+// Uses 3-phase batch: pre-marshal all → single AppendBatch → single SetBatch.
 func (s *GlobalVersionVectorStore) WriteBatchToVersion(version SemanticVersion, vecs []*VersionVector) error {
 	if len(vecs) == 0 {
 		return nil
@@ -604,16 +619,19 @@ func (s *GlobalVersionVectorStore) WriteBatchToVersion(version SemanticVersion, 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	idx := s.vectorIndex(version)
-	for _, vec := range vecs {
-		record := marshalVectorRecord(vec)
-		offset, err := s.dataFile.Append(record)
-		if err != nil {
-			return fmt.Errorf("append global vector %d: %w", vec.NodeID, err)
-		}
-		idx.Set(vec.NodeID, offset)
+	records := make([][]byte, len(vecs))
+	ids := make([]uint32, len(vecs))
+	for i, vec := range vecs {
+		records[i] = marshalVectorRecord(vec)
+		ids[i] = vec.NodeID
 	}
 
+	offsets, err := s.dataFile.AppendBatch(records)
+	if err != nil {
+		return fmt.Errorf("append global vectors: %w", err)
+	}
+
+	s.vectorIndex(version).SetBatch(ids, offsets)
 	return nil
 }
 

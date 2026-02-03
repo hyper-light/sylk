@@ -99,6 +99,47 @@ func (idx *OffsetIndex) Set(id uint32, offset int64) {
 	idx.dirty.Store(true)
 }
 
+// SetBatch stores offsets for multiple IDs. Single writeMu acquisition.
+// ids and offsets must be parallel slices of equal length.
+func (idx *OffsetIndex) SetBatch(ids []uint32, offsets []int64) {
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+
+	// Find max ID for single grow.
+	var maxID uint32
+	for _, id := range ids {
+		if id > maxID {
+			maxID = id
+		}
+	}
+
+	s := idx.state.Load()
+	if maxID >= s.capacity {
+		newCap := s.capacity
+		for newCap <= maxID {
+			newCap *= 2
+		}
+		grown := make([]int64, newCap)
+		copy(grown, s.entries)
+		fillAbsent(grown[s.capacity:])
+		s = &indexState{entries: grown, capacity: newCap}
+		idx.state.Store(s)
+	}
+
+	var added uint32
+	for i, id := range ids {
+		wasAbsent := s.entries[id] == offsetIndexAbsent
+		atomic.StoreInt64(&s.entries[id], offsets[i])
+		if wasAbsent {
+			added++
+		}
+	}
+	if added > 0 {
+		idx.count.Add(added)
+	}
+	idx.dirty.Store(true)
+}
+
 // Delete marks the given ID as absent.
 func (idx *OffsetIndex) Delete(id uint32) {
 	idx.writeMu.Lock()

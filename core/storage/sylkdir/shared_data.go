@@ -78,6 +78,37 @@ func (sdf *SharedDataFile) Sync() error {
 	return sdf.file.Sync()
 }
 
+// AppendBatch writes multiple records in a single I/O operation.
+// Returns the starting offset of each record. Single mutex acquisition.
+func (sdf *SharedDataFile) AppendBatch(records [][]byte) ([]int64, error) {
+	totalSize := 0
+	for _, r := range records {
+		totalSize += len(r)
+	}
+
+	buf := make([]byte, totalSize)
+	offsets := make([]int64, len(records))
+
+	sdf.mu.Lock()
+	baseOffset := sdf.size.Load()
+
+	pos := 0
+	for i, r := range records {
+		offsets[i] = baseOffset + int64(pos)
+		copy(buf[pos:], r)
+		pos += len(r)
+	}
+
+	n, err := sdf.file.WriteAt(buf, baseOffset)
+	sdf.size.Add(int64(n))
+	sdf.mu.Unlock()
+
+	if err != nil {
+		return nil, fmt.Errorf("append batch: %w", err)
+	}
+	return offsets, nil
+}
+
 // Close closes the underlying file.
 func (sdf *SharedDataFile) Close() error {
 	if sdf.file == nil {

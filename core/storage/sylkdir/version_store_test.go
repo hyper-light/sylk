@@ -1,6 +1,7 @@
 package sylkdir
 
 import (
+	"encoding/binary"
 	"testing"
 	"time"
 )
@@ -580,5 +581,96 @@ func TestSemanticVersionBumping(t *testing.T) {
 
 	if major := v.BumpMajor(); !major.Equal(SemanticVersion{2, 0, 0}) {
 		t.Errorf("BumpMajor: got %s, want v2.0.0", major.String())
+	}
+}
+
+func TestMarshalDocRecordBinaryRoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  VersionDocument
+	}{
+		{
+			name: "full fields",
+			doc: VersionDocument{
+				ID:        "doc_123",
+				Path:      "/src/main.go",
+				Type:      "source_code",
+				Content:   "package main\n\nfunc main() {}",
+				Language:  "go",
+				IndexedAt: 1700000000000000000,
+			},
+		},
+		{
+			name: "empty content",
+			doc: VersionDocument{
+				ID:        "empty",
+				Path:      "/empty.txt",
+				Type:      "text",
+				Content:   "",
+				Language:  "",
+				IndexedAt: 0,
+			},
+		},
+		{
+			name: "large content",
+			doc: VersionDocument{
+				ID:        "big_file",
+				Path:      "/src/generated.go",
+				Type:      "source_code",
+				Content:   string(make([]byte, 100000)),
+				Language:  "go",
+				IndexedAt: 9999999999,
+			},
+		},
+		{
+			name: "unicode content",
+			doc: VersionDocument{
+				ID:        "i18n",
+				Path:      "/docs/readme.md",
+				Type:      "markdown",
+				Content:   "Hello \xe4\xb8\x96\xe7\x95\x8c \xf0\x9f\x8c\x8d",
+				Language:  "markdown",
+				IndexedAt: 42,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record, err := marshalDocRecord(&tt.doc)
+			if err != nil {
+				t.Fatalf("marshalDocRecord: %v", err)
+			}
+
+			// Decode: skip the 4-byte size prefix, pass payload to unmarshal.
+			size := binary.LittleEndian.Uint32(record[0:4])
+			if int(size) != len(record)-4 {
+				t.Fatalf("size prefix = %d, record payload = %d", size, len(record)-4)
+			}
+
+			got, decErr := unmarshalDocPayload(record[4:])
+			if decErr != nil {
+				t.Fatalf("unmarshalDocPayload: %v", decErr)
+			}
+
+			if got.ID != tt.doc.ID {
+				t.Errorf("ID: got %q, want %q", got.ID, tt.doc.ID)
+			}
+			if got.Path != tt.doc.Path {
+				t.Errorf("Path: got %q, want %q", got.Path, tt.doc.Path)
+			}
+			if got.Type != tt.doc.Type {
+				t.Errorf("Type: got %q, want %q", got.Type, tt.doc.Type)
+			}
+			if got.Content != tt.doc.Content {
+				t.Errorf("Content length: got %d, want %d", len(got.Content), len(tt.doc.Content))
+			}
+			if got.Language != tt.doc.Language {
+				t.Errorf("Language: got %q, want %q", got.Language, tt.doc.Language)
+			}
+			if got.IndexedAt != tt.doc.IndexedAt {
+				t.Errorf("IndexedAt: got %d, want %d", got.IndexedAt, tt.doc.IndexedAt)
+			}
+		})
 	}
 }

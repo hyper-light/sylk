@@ -3,7 +3,6 @@ package sylkdir
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -829,16 +828,41 @@ func (s *VersionDocStore) loadDocIndex(version SemanticVersion) *OffsetIndex {
 	return actual.(*OffsetIndex)
 }
 
-// marshalDocRecord serializes a document as [size:4][json_data].
+// docRecordMinSize is the minimum binary doc record size:
+// TotalSize(4) + IndexedAt(8) + IDLen(2) + PathLen(2) + TypeLen(2) + ContentLen(4) + LangLen(2) = 24
+const docRecordMinSize = 24
+
+// marshalDocRecord serializes a document as binary:
+// [TotalSize:4][IndexedAt:8][IDLen:2][ID][PathLen:2][Path][TypeLen:2][Type][ContentLen:4][Content][LangLen:2][Language]
 func marshalDocRecord(doc *VersionDocument) ([]byte, error) {
-	data, err := json.Marshal(doc)
-	if err != nil {
-		return nil, fmt.Errorf("marshal doc: %w", err)
-	}
-	record := make([]byte, 4+len(data))
-	binary.LittleEndian.PutUint32(record[0:4], uint32(len(data)))
-	copy(record[4:], data)
+	payloadSize := docRecordMinSize - 4 + len(doc.ID) + len(doc.Path) + len(doc.Type) + len(doc.Content) + len(doc.Language)
+	record := make([]byte, 4+payloadSize)
+
+	binary.LittleEndian.PutUint32(record[0:4], uint32(payloadSize))
+	off := 4
+
+	binary.LittleEndian.PutUint64(record[off:off+8], uint64(doc.IndexedAt))
+	off += 8
+
+	off = docWriteStr16(record, off, doc.ID)
+	off = docWriteStr16(record, off, doc.Path)
+	off = docWriteStr16(record, off, doc.Type)
+
+	binary.LittleEndian.PutUint32(record[off:off+4], uint32(len(doc.Content)))
+	off += 4
+	copy(record[off:], doc.Content)
+	off += len(doc.Content)
+
+	docWriteStr16(record, off, doc.Language)
 	return record, nil
+}
+
+// docWriteStr16 writes a 2-byte length-prefixed string and returns the new offset.
+func docWriteStr16(buf []byte, off int, s string) int {
+	binary.LittleEndian.PutUint16(buf[off:off+2], uint16(len(s)))
+	off += 2
+	copy(buf[off:], s)
+	return off + len(s)
 }
 
 // readDocAtOffset reads a document from a shared data file at the given offset.
@@ -854,11 +878,64 @@ func readDocAtOffset(sdf *SharedDataFile, offset int64) (*VersionDocument, error
 		return nil, err
 	}
 
+	return unmarshalDocPayload(data)
+}
+
+// unmarshalDocPayload decodes a binary doc payload (without the TotalSize prefix).
+func unmarshalDocPayload(data []byte) (*VersionDocument, error) {
+	if len(data) < docRecordMinSize-4 {
+		return nil, fmt.Errorf("doc record truncated: %d bytes", len(data))
+	}
+
 	doc := &VersionDocument{}
-	if err := json.Unmarshal(data, doc); err != nil {
+	off := 0
+
+	doc.IndexedAt = int64(binary.LittleEndian.Uint64(data[off : off+8]))
+	off += 8
+
+	var err error
+	doc.ID, off, err = docReadStr16(data, off)
+	if err != nil {
+		return nil, err
+	}
+	doc.Path, off, err = docReadStr16(data, off)
+	if err != nil {
+		return nil, err
+	}
+	doc.Type, off, err = docReadStr16(data, off)
+	if err != nil {
+		return nil, err
+	}
+
+	if off+4 > len(data) {
+		return nil, fmt.Errorf("doc content length truncated")
+	}
+	contentLen := int(binary.LittleEndian.Uint32(data[off : off+4]))
+	off += 4
+	if off+contentLen > len(data) {
+		return nil, fmt.Errorf("doc content truncated")
+	}
+	doc.Content = string(data[off : off+contentLen])
+	off += contentLen
+
+	doc.Language, _, err = docReadStr16(data, off)
+	if err != nil {
 		return nil, err
 	}
 	return doc, nil
+}
+
+// docReadStr16 reads a 2-byte length-prefixed string and returns the new offset.
+func docReadStr16(data []byte, off int) (string, int, error) {
+	if off+2 > len(data) {
+		return "", off, fmt.Errorf("doc string length truncated at %d", off)
+	}
+	slen := int(binary.LittleEndian.Uint16(data[off : off+2]))
+	off += 2
+	if off+slen > len(data) {
+		return "", off, fmt.Errorf("doc string data truncated at %d", off)
+	}
+	return string(data[off : off+slen]), off + slen, nil
 }
 
 // VersionVector represents a vector embedding for a node.

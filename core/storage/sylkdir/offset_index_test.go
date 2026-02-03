@@ -347,3 +347,72 @@ func TestOffsetIndex_ZeroOffset(t *testing.T) {
 		t.Errorf("Count = %d, want 1", idx.Count())
 	}
 }
+
+func TestSetBatch(t *testing.T) {
+	dir := t.TempDir()
+	idx := NewOffsetIndex(filepath.Join(dir, "batch.idx"), 64)
+
+	ids := []uint32{10, 20, 30, 50}
+	offsets := []int64{100, 200, 300, 500}
+	idx.SetBatch(ids, offsets)
+
+	// Verify all entries set.
+	if idx.Count() != 4 {
+		t.Fatalf("Count = %d, want 4", idx.Count())
+	}
+	for i, id := range ids {
+		got, ok := idx.Get(id)
+		if !ok || got != offsets[i] {
+			t.Errorf("Get(%d) = (%d, %v), want (%d, true)", id, got, ok, offsets[i])
+		}
+	}
+
+	// Absent IDs still absent.
+	if _, ok := idx.Get(15); ok {
+		t.Error("Get(15) should be absent")
+	}
+}
+
+func TestSetBatchGrow(t *testing.T) {
+	dir := t.TempDir()
+	idx := NewOffsetIndex(filepath.Join(dir, "grow.idx"), 64)
+
+	// Set an ID beyond initial capacity to force grow.
+	ids := []uint32{5, 200}
+	offsets := []int64{50, 2000}
+	idx.SetBatch(ids, offsets)
+
+	if idx.Count() != 2 {
+		t.Fatalf("Count = %d, want 2", idx.Count())
+	}
+	if idx.Capacity() <= 200 {
+		t.Errorf("Capacity = %d, should be > 200 after grow", idx.Capacity())
+	}
+
+	got, ok := idx.Get(200)
+	if !ok || got != 2000 {
+		t.Errorf("Get(200) = (%d, %v), want (2000, true)", got, ok)
+	}
+}
+
+func TestSetBatchOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	idx := NewOffsetIndex(filepath.Join(dir, "overwrite.idx"), 64)
+
+	// Set ID 10 initially.
+	idx.Set(10, 100)
+	if idx.Count() != 1 {
+		t.Fatalf("Count = %d after initial Set, want 1", idx.Count())
+	}
+
+	// Batch set overwrites ID 10 and adds ID 20.
+	idx.SetBatch([]uint32{10, 20}, []int64{999, 200})
+
+	if idx.Count() != 2 {
+		t.Errorf("Count = %d, want 2", idx.Count())
+	}
+	got, _ := idx.Get(10)
+	if got != 999 {
+		t.Errorf("Get(10) = %d, want 999 (overwritten)", got)
+	}
+}

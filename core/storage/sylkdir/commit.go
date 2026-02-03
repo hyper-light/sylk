@@ -671,15 +671,13 @@ func resolveSupersededDocID(node *Node, docIDMap *DocIDMap, fallbackID uint32) s
 	return fmt.Sprintf("file_%d", fallbackID)
 }
 
-// saveGlobalIndexes saves offset indexes for all global stores to disk.
+// saveGlobalIndexes saves offset indexes for all global stores to disk in parallel.
 func saveGlobalIndexes(nodeStore *GlobalVersionNodeStore, edgeStore *GlobalVersionEdgeStore, docStore *GlobalVersionDocStore, vectorStore *GlobalVersionVectorStore) error {
-	if err := nodeStore.SaveIndexes(); err != nil {
-		return fmt.Errorf("sylkdir: save global node indexes: %w", err)
-	}
-	if err := vectorStore.SaveIndexes(); err != nil {
-		return fmt.Errorf("sylkdir: save global vector indexes: %w", err)
-	}
-	return docStore.SaveIndexes()
+	g, _ := errgroup.WithContext(context.Background())
+	g.Go(func() error { return nodeStore.SaveIndexes() })
+	g.Go(func() error { return vectorStore.SaveIndexes() })
+	g.Go(func() error { return docStore.SaveIndexes() })
+	return g.Wait()
 }
 
 // ── Parallel commit helpers ────────────────────────────────────────────────
