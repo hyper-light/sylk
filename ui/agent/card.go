@@ -68,7 +68,7 @@ func RenderCard(agent AgentState, width int, th *theme.Theme, selected, focused,
 // unselected inactive agents get an outline dot in Muted.
 func agentStyledDot(active, selected, focused bool, th *theme.Theme) string {
 	if selected {
-		color := agentSelectionColor(active, focused, th)
+		color := agentSelectionColor(th)
 		return lipgloss.NewStyle().Foreground(color).Render(agentDotFilled)
 	}
 	if active {
@@ -82,7 +82,7 @@ func agentStyledDot(active, selected, focused bool, th *theme.Theme) string {
 // Unselected active agents use AgentActive; unselected inactive use AgentInactive.
 func agentNameStyle(active, selected, focused bool, th *theme.Theme) lipgloss.Style {
 	if selected {
-		color := agentSelectionColor(active, focused, th)
+		color := agentSelectionColor(th)
 		return lipgloss.NewStyle().Foreground(color).Bold(true)
 	}
 	if active {
@@ -92,16 +92,9 @@ func agentNameStyle(active, selected, focused bool, th *theme.Theme) lipgloss.St
 }
 
 // agentSelectionColor returns the foreground color for a selected agent.
-// Active agents keep their green; inactive agents use the focus-dependent
-// selection color (Secondary when focused, Muted when unfocused).
-func agentSelectionColor(active, focused bool, th *theme.Theme) lipgloss.Color {
-	if active {
-		return th.Palette.Success
-	}
-	if focused {
-		return th.Palette.Secondary
-	}
-	return th.Palette.Muted
+// Selected agents always use Success (green) regardless of focus state.
+func agentSelectionColor(th *theme.Theme) lipgloss.Color {
+	return th.Palette.Success
 }
 
 // selectIndicator returns the visual indicator for selection state.
