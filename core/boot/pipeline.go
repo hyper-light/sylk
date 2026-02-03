@@ -166,6 +166,11 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	_ = sess.CloseBleve()
 	sess.BleveStore = nil
 
+	// Activate PendingMode: entities bypass session disk stores and go
+	// directly to CommitToGlobal via in-memory Pending* fields.
+	// Non-nil (even empty) PendingNodes is the sentinel.
+	sess.PendingNodes = make([]*sylkdir.Node, 0)
+
 	// Phase 4: Ingest via SessionIngestion
 	log.Printf("[boot] Phase 4: Ingest starting")
 	ingestStart := time.Now()

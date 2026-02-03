@@ -515,16 +515,33 @@ func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEnti
 	allEdges := slices.Concat(ent.containsEdges, ent.importEdges, ent.chunkEdges)
 	allDocs := slices.Concat(ent.fileDocs, ent.chunkDocs)
 
+	// PendingMode: stash entities in memory for direct CommitToGlobal consumption.
+	// Skips G1 session store writes entirely.
+	pendingMode := s.session.PendingNodes != nil
+	if pendingMode {
+		s.session.PendingNodes = allNodes
+		s.session.PendingEdges = allEdges
+		s.session.PendingDocs = allDocs
+		s.session.PendingChunkRefs = ent.chunkRefs
+		result.NodesCreated = len(allNodes)
+		result.EdgesCreated = len(allEdges)
+		result.DocsCreated = len(allDocs)
+		result.ChunkRefsCreated = len(ent.chunkRefs)
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
 
 	// G1: Write all stores (nodes, edges, docs, chunk refs).
-	g.Go(func() error {
-		t := time.Now()
-		err := s.writeStores(gctx, allNodes, allEdges, allDocs, ent.chunkRefs, result)
-		log.Printf("[write] G1 stores: %v (nodes=%d edges=%d docs=%d refs=%d)",
-			time.Since(t), result.NodesCreated, result.EdgesCreated, result.DocsCreated, result.ChunkRefsCreated)
-		return err
-	})
+	// Skipped in PendingMode — entities go directly to CommitToGlobal.
+	if !pendingMode {
+		g.Go(func() error {
+			t := time.Now()
+			err := s.writeStores(gctx, allNodes, allEdges, allDocs, ent.chunkRefs, result)
+			log.Printf("[write] G1 stores: %v (nodes=%d edges=%d docs=%d refs=%d)",
+				time.Since(t), result.NodesCreated, result.EdgesCreated, result.DocsCreated, result.ChunkRefsCreated)
+			return err
+		})
+	}
 
 	// G2: Batch embed all texts concurrently.
 	// embedDone signals G4 to start vector writes without waiting for G3 (Bleve).

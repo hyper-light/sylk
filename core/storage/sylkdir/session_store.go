@@ -626,9 +626,15 @@ type Session struct {
 	docStore      *VersionDocStore
 	chunkRefStore *ChunkRefStore
 
-	// PendingVectors holds vectors from session ingestion that bypass
-	// the session disk store. Consumed directly by CommitToGlobal.
-	PendingVectors []*VersionVector
+	// Pending* fields hold entities from session ingestion that bypass
+	// the session disk stores. Consumed directly by CommitToGlobal.
+	// When PendingNodes is non-nil (even empty), PendingMode is active:
+	// writeEntities skips G1 session store writes entirely.
+	PendingNodes     []*Node
+	PendingEdges     []*Edge
+	PendingDocs      []*VersionDocument
+	PendingChunkRefs []*ChunkRef
+	PendingVectors   []*VersionVector
 }
 
 // RegisterNodeStore is called by NewVersionNodeStore to enable checkpoint index saving.

@@ -140,24 +140,39 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	log.Printf("[commit] step1 checkpoint: %v", time.Since(t))
 
 	// ── Step 2: Collect all entities from ancestor chain (parallel) ────
+	// When Pending* fields are non-nil (PendingMode), entities are already
+	// in memory from writeEntities — no disk read needed.
 	var (
-		nodes   []*Node
-		edges   []*Edge
-		docs    []*VersionDocument
-		vectors []*VersionVector
+		nodes    []*Node
+		edges    []*Edge
+		docs     []*VersionDocument
+		vectors  []*VersionVector
+		chunkRefs []*ChunkRef
 	)
 	collectG, _ := errgroup.WithContext(context.Background())
 	collectG.Go(func() error {
+		if sess.PendingNodes != nil {
+			nodes = sess.PendingNodes
+			return nil
+		}
 		var readErr error
 		nodes, readErr = NewVersionNodeStore(sess).ReadAllFromAncestorChain()
 		return readErr
 	})
 	collectG.Go(func() error {
+		if sess.PendingEdges != nil {
+			edges = sess.PendingEdges
+			return nil
+		}
 		var readErr error
 		edges, readErr = NewVersionEdgeStore(sess).ReadAllFromAncestorChain()
 		return readErr
 	})
 	collectG.Go(func() error {
+		if sess.PendingDocs != nil {
+			docs = sess.PendingDocs
+			return nil
+		}
 		var readErr error
 		docs, readErr = NewVersionDocStore(sess).ReadFromAncestorChain()
 		return readErr
@@ -171,11 +186,24 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 		vectors, readErr = NewVersionVectorStore(sess).ReadAllFromAncestorChain()
 		return readErr
 	})
+	collectG.Go(func() error {
+		if sess.PendingChunkRefs != nil {
+			chunkRefs = sess.PendingChunkRefs
+			return nil
+		}
+		chunkRefs, _ = collectSessionChunkRefsFromDisk(sess)
+		return nil
+	})
 	if err := collectG.Wait(); err != nil {
 		return nil, fmt.Errorf("sylkdir: collect session entities: %w", err)
 	}
-	sess.PendingVectors = nil // Release reference; vectors held by local var.
-	log.Printf("[commit] step2 collect: %v (nodes=%d edges=%d docs=%d vectors=%d)", time.Since(t), len(nodes), len(edges), len(docs), len(vectors))
+	// Release Pending references; entities held by local vars.
+	sess.PendingNodes = nil
+	sess.PendingEdges = nil
+	sess.PendingDocs = nil
+	sess.PendingVectors = nil
+	sess.PendingChunkRefs = nil
+	log.Printf("[commit] step2 collect: %v (nodes=%d edges=%d docs=%d vectors=%d chunkRefs=%d)", time.Since(t), len(nodes), len(edges), len(docs), len(vectors), len(chunkRefs))
 
 	// ── Step 3: Create version directory + snapshot or compact parent data ─
 	if err := cfg.SylkDir.CreateGlobalVersion(newVersion); err != nil {
@@ -230,7 +258,7 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	// ── Steps 5+6: Store writes and Bleve indexing run in parallel ─────
 	// Store writes (nodes, edges, docs, vectors) and Bleve indexing write
 	// to independent files and can safely overlap.
-	chunkRefs, chunksStaged := collectSessionChunkRefs(sess)
+	chunksStaged := len(chunkRefs)
 
 	// Close session Bleve before copying — ensures a clean snapshot for promotion.
 	sessionBlevePath := closeAndGetSessionBlevePath(sess)
@@ -499,8 +527,8 @@ func isUnderAnyRoot(filePath string, roots []string) bool {
 	return false
 }
 
-// collectSessionChunkRefs reads all chunk refs from the session's ancestor chain.
-func collectSessionChunkRefs(sess *Session) ([]*ChunkRef, int) {
+// collectSessionChunkRefsFromDisk reads all chunk refs from the session's ancestor chain.
+func collectSessionChunkRefsFromDisk(sess *Session) ([]*ChunkRef, int) {
 	if sess.ChunkDataFile == nil {
 		return nil, 0
 	}
