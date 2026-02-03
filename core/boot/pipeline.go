@@ -179,7 +179,7 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	// Phase 4: Ingest via SessionIngestion
 	log.Printf("[boot] Phase 4: Ingest starting")
 	ingestStart := time.Now()
-	ingestResult, err := p.ingest(ctx, sess, projectRoot, changes)
+	ingestResult, err := p.ingest(ctx, sess, sd, projectRoot, changes)
 	if err != nil {
 		return nil, fmt.Errorf("ingest: %w", err)
 	}
@@ -346,13 +346,18 @@ func (p *Pipeline) estimateFileCount(ctx context.Context, root string, changes [
 
 // ingest runs the SessionIngestion pipeline: discovery → parse → chunk → embed → write.
 // When changes is non-nil (delta), only changed files are read/parsed/aggregated.
-func (p *Pipeline) ingest(ctx context.Context, sess *sylkdir.Session, root string, changes []FileChange) (*sylkdir.SessionIngestionResult, error) {
+func (p *Pipeline) ingest(ctx context.Context, sess *sylkdir.Session, sd *sylkdir.SylkDir, root string, changes []FileChange) (*sylkdir.SessionIngestionResult, error) {
 	si := sylkdir.NewSessionIngestion(sess)
 	si.SetEmbedder(p.embedder)
 
+	cache := NewParseCache(filepath.Join(sd.CachePath(), "parse"))
+
+	si.SetChunkCache(cache)
+
 	config := &ingestion.Config{
-		RootPath: root,
-		Workers:  ingestion.WorkerCount(),
+		RootPath:   root,
+		Workers:    ingestion.WorkerCount(),
+		ParseCache: cache,
 	}
 	if changes != nil {
 		config.IncludePaths = changesToAbsPaths(root, changes)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"slices"
@@ -117,11 +118,12 @@ func readFileToMapped(f FileInfo) (MappedFile, error) {
 	fc := ClassifyFile(f.Path, data[:headerLen])
 
 	return MappedFile{
-		Path:    f.Path,
-		Data:    data,
-		Lang:    fc.Lang,
-		DocType: fc.DocType,
-		Size:    f.Size,
+		Path:        f.Path,
+		Data:        data,
+		Lang:        fc.Lang,
+		DocType:     fc.DocType,
+		Size:        f.Size,
+		ContentHash: sha256.Sum256(data),
 	}, nil
 }
 

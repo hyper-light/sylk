@@ -133,18 +133,83 @@ func (i *ingester) runRead(ctx context.Context) error {
 }
 
 // runParse executes the parallel parsing phase.
+// When a ParseCache is configured, unchanged files (cache hits) skip tree-sitter entirely.
 func (i *ingester) runParse(ctx context.Context) error {
 	start := time.Now()
 
-	pool := NewParserPool(i.config.Workers)
-	defer pool.Close()
+	hits, misses := i.partitionByCache()
 
-	parsed, errors := pool.ParseAll(ctx, i.mapped)
+	if len(misses) > 0 {
+		pool := NewParserPool(i.config.Workers)
+		defer pool.Close()
 
-	i.parsed = parsed
-	i.errors = errors
+		parsed, errors := pool.ParseAll(ctx, misses)
+		i.errors = errors
+
+		i.storeParseCacheEntries(misses, parsed)
+		i.parsed = append(hits, parsed...)
+	} else {
+		i.parsed = hits
+	}
+
 	i.result.PhaseDurations.Parse = time.Since(start)
 	return nil
+}
+
+// partitionByCache splits mapped files into cache hits and misses.
+// Returns (cached ParsedFiles, uncached MappedFiles to parse).
+func (i *ingester) partitionByCache() ([]ParsedFile, []MappedFile) {
+	cache := i.config.ParseCache
+	if cache == nil {
+		return nil, i.mapped
+	}
+
+	var zeroHash [32]byte
+	hits := make([]ParsedFile, 0, len(i.mapped))
+	misses := make([]MappedFile, 0, len(i.mapped))
+
+	for _, m := range i.mapped {
+		if m.ContentHash == zeroHash {
+			misses = append(misses, m)
+			continue
+		}
+		entry := cache.LookupParse(m.ContentHash)
+		if entry == nil {
+			misses = append(misses, m)
+			continue
+		}
+		hits = append(hits, ParsedFile{
+			Path:    m.Path,
+			Lang:    m.Lang,
+			Symbols: entry.Symbols,
+			Imports: entry.Imports,
+			Lines:   entry.Lines,
+		})
+	}
+	return hits, misses
+}
+
+// storeParseCacheEntries stores freshly parsed results in the cache.
+func (i *ingester) storeParseCacheEntries(files []MappedFile, parsed []ParsedFile) {
+	cache := i.config.ParseCache
+	if cache == nil {
+		return
+	}
+	var zeroHash [32]byte
+	for idx, p := range parsed {
+		if idx >= len(files) {
+			break
+		}
+		h := files[idx].ContentHash
+		if h == zeroHash {
+			continue
+		}
+		cache.StoreParse(h, &ParseCacheEntry{
+			Symbols: p.Symbols,
+			Imports: p.Imports,
+			Lines:   p.Lines,
+		})
+	}
 }
 
 // runAggregate executes the graph aggregation phase.

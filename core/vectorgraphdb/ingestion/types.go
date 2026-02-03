@@ -18,11 +18,12 @@ type FileInfo struct {
 }
 
 type MappedFile struct {
-	Path    string
-	Data    []byte
-	Lang    string
-	DocType string // from ClassifyFile: "source_code", "markdown", "config", "note", "web_content"
-	Size    int64
+	Path        string
+	Data        []byte
+	Lang        string
+	DocType     string   // from ClassifyFile: "source_code", "markdown", "config", "note", "web_content"
+	Size        int64
+	ContentHash [32]byte // SHA-256 of Data, computed during read phase.
 }
 
 // ParsedFile holds the result of parsing a single file.
@@ -92,6 +93,24 @@ type ParseError struct {
 }
 
 // =============================================================================
+// Parse Cache Interface
+// =============================================================================
+
+// ParseCacheLookup provides content-hash-keyed lookup for parse results.
+// Defined as an interface here to avoid import cycles (implementation in core/boot).
+type ParseCacheLookup interface {
+	LookupParse(contentHash [32]byte) *ParseCacheEntry
+	StoreParse(contentHash [32]byte, entry *ParseCacheEntry)
+}
+
+// ParseCacheEntry holds cached parse results for a single file.
+type ParseCacheEntry struct {
+	Symbols []Symbol
+	Imports []Import
+	Lines   int
+}
+
+// =============================================================================
 // CodeGraph - In-Memory Representation
 // =============================================================================
 
@@ -119,12 +138,13 @@ type CodeGraph struct {
 
 // FileNode represents a file in the code graph.
 type FileNode struct {
-	ID        uint32
-	Path      string
-	Lang      string
-	DocType   string // from ClassifyFile, propagated through aggregation
-	LineCount int
-	ByteCount int64
+	ID          uint32
+	Path        string
+	Lang        string
+	DocType     string   // from ClassifyFile, propagated through aggregation
+	LineCount   int
+	ByteCount   int64
+	ContentHash [32]byte // SHA-256 from MappedFile, propagated for cache lookups.
 }
 
 // SymbolNode represents a symbol in the code graph.
@@ -226,6 +246,7 @@ type Config struct {
 	Discovery      *DiscoveryOptions // Nil uses defaults (existing behavior).
 	RetainContent  bool              // When true, MappedFile data is kept in IngestionResult.
 	IncludePaths   map[string]bool   // When non-nil, only these absolute paths proceed past discovery.
+	ParseCache     ParseCacheLookup  // When non-nil, cache-aware parsing skips unchanged files.
 }
 
 // DiscoveryOptions controls file discovery behavior.

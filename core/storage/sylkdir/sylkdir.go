@@ -395,6 +395,11 @@ func (s *SylkDir) GlobalNodeBlocksPath() string {
 	return filepath.Join(s.GlobalDataPath(), "node_blocks")
 }
 
+// CachePath returns the path to the .sylk/cache directory.
+func (s *SylkDir) CachePath() string {
+	return filepath.Join(s.RootPath(), "cache")
+}
+
 // CreateGlobalVersion creates a global version directory with subdirectories.
 // Structure: .sylk/versions/v1.0.0/{nodes,vectors,docs,chunks,bleve}
 func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {

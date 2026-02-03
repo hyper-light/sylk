@@ -89,11 +89,12 @@ func (a *aggregator) processPartition(files []MappedFile, parsedByPath map[strin
 		fileID := a.fileIDGen.Add(1)
 
 		fileNode := FileNode{
-			ID:        fileID,
-			Path:      f.Path,
-			Lang:      f.Lang,
-			DocType:   f.DocType,
-			ByteCount: f.Size,
+			ID:          fileID,
+			Path:        f.Path,
+			Lang:        f.Lang,
+			DocType:     f.DocType,
+			ByteCount:   f.Size,
+			ContentHash: f.ContentHash,
 		}
 
 		if p, ok := parsedByPath[f.Path]; ok {

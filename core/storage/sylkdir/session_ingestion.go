@@ -60,6 +60,19 @@ const (
 	EdgeTypeChunkSequence EdgeType = 11 // Chunk[i] → Chunk[i+1]
 )
 
+// ChunkCacheLookup provides content-hash-keyed lookup for chunk results.
+// Defined as an interface to avoid import cycles (implementation in core/boot).
+type ChunkCacheLookup interface {
+	LookupChunk(contentHash [32]byte) *ChunkCacheEntry
+	StoreChunk(contentHash [32]byte, entry *ChunkCacheEntry)
+}
+
+// ChunkCacheEntry holds cached chunk results for a single file.
+type ChunkCacheEntry struct {
+	Boundaries []ChunkBoundary
+	Embeddings [][]float32
+}
+
 // SessionIngestion handles ingestion of code into session version stores.
 type SessionIngestion struct {
 	session       *Session
@@ -70,7 +83,8 @@ type SessionIngestion struct {
 	chunkRefStore *ChunkRefStore
 	embedder      embedder.Embedder
 	chunker       *UniversalChunker
-	nextNodeID    *uint32 // shared counter from session's BaseSnapshot
+	chunkCache    ChunkCacheLookup // nil means no caching
+	nextNodeID    *uint32          // shared counter from session's BaseSnapshot
 }
 
 // NewSessionIngestion creates a new session ingestion handler.
@@ -99,6 +113,11 @@ func (s *SessionIngestion) SetEmbedder(e embedder.Embedder) {
 		embedder.NewEnhancedHybridEmbedder(),
 		uint32(e.MaxInputBytes()),
 	)
+}
+
+// SetChunkCache sets the chunk cache for content-hash-keyed chunk result caching.
+func (s *SessionIngestion) SetChunkCache(c ChunkCacheLookup) {
+	s.chunkCache = c
 }
 
 // SessionIngestionResult contains the results of a session ingestion.
@@ -289,8 +308,9 @@ func (s *SessionIngestion) buildSymbolEntities(symbols []ingestion.SymbolNode, e
 
 // chunkFileEntry pairs a file with its content for parallel chunking.
 type chunkFileEntry struct {
-	file    ingestion.FileNode
-	content string
+	file        ingestion.FileNode
+	content     string
+	contentHash [32]byte
 }
 
 // chunkLocalResult holds per-worker chunk results for lock-free accumulation.
@@ -313,7 +333,7 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 	entries := make([]chunkFileEntry, 0, len(graph.Files))
 	for _, file := range graph.Files {
 		if c := contentMap[file.Path]; c != "" {
-			entries = append(entries, chunkFileEntry{file: file, content: c})
+			entries = append(entries, chunkFileEntry{file: file, content: c, contentHash: file.ContentHash})
 		}
 	}
 	if len(entries) == 0 {
@@ -353,7 +373,7 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 				parentNodeID := ent.fileIDMap[fe.file.ID]
 				parentDocRef := ent.docRefMap[fe.file.ID]
 
-				cr := s.computeChunks(ctx, stringToReadOnlyBytes(fe.content), symsByFile[fe.file.ID])
+				cr := s.computeChunksWithCache(ctx, fe, symsByFile[fe.file.ID])
 
 				// Pre-compute the doc ID prefix once per file: "file_<parentNodeID>_c"
 				docIDPrefix := "file_" + strconv.FormatUint(uint64(parentNodeID), 10) + "_c"
@@ -449,6 +469,28 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 		ent.chunkEdges = append(ent.chunkEdges, r.edges...)
 		ent.cachedEmbeddings = append(ent.cachedEmbeddings, r.cachedEmbs...)
 	}
+}
+
+// computeChunksWithCache checks the chunk cache before computing chunks.
+// On cache hit, returns the cached ChunkResult directly.
+// On cache miss, computes chunks and stores the result in the cache.
+func (s *SessionIngestion) computeChunksWithCache(ctx context.Context, fe chunkFileEntry, symbols []ingestion.SymbolNode) ChunkResult {
+	var zeroHash [32]byte
+	if s.chunkCache != nil && fe.contentHash != zeroHash {
+		if entry := s.chunkCache.LookupChunk(fe.contentHash); entry != nil {
+			return ChunkResult{Boundaries: entry.Boundaries, Embeddings: entry.Embeddings}
+		}
+	}
+
+	cr := s.computeChunks(ctx, stringToReadOnlyBytes(fe.content), symbols)
+
+	if s.chunkCache != nil && fe.contentHash != zeroHash {
+		s.chunkCache.StoreChunk(fe.contentHash, &ChunkCacheEntry{
+			Boundaries: cr.Boundaries,
+			Embeddings: cr.Embeddings,
+		})
+	}
+	return cr
 }
 
 // computeChunks selects the chunking strategy based on available symbols.
