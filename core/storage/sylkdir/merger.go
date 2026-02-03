@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
+	"github.com/viterin/vek/vek32"
 )
 
 // Segment represents a contiguous text region between structural boundaries.
@@ -144,25 +145,17 @@ func (m *SegmentMerger) MergeWithEmbeddings(ctx context.Context, content []byte,
 func weightedAvgAllSegments(embeddings [][]float32, segments []Segment) []float32 {
 	dim := len(embeddings[0])
 	result := make([]float32, dim)
-	var totalSize float64
+	var totalSize float32
 	for _, seg := range segments {
-		totalSize += float64(seg.End - seg.Start)
+		totalSize += float32(seg.End - seg.Start)
 	}
 	for i, emb := range embeddings {
-		w := float64(segments[i].End-segments[i].Start) / totalSize
-		for j, v := range emb {
-			result[j] += float32(w * float64(v))
-		}
+		w := float32(segments[i].End-segments[i].Start) / totalSize
+		vek32.Add_Inplace(result, vek32.MulNumber(emb, w))
 	}
-	var sumSq float64
-	for _, v := range result {
-		sumSq += float64(v) * float64(v)
-	}
-	if sumSq > 0 {
-		invNorm := float32(1.0 / math.Sqrt(sumSq))
-		for i := range result {
-			result[i] *= invNorm
-		}
+	normSq := vek32.Dot(result, result)
+	if normSq > 0 {
+		vek32.MulNumber_Inplace(result, float32(1.0/math.Sqrt(float64(normSq))))
 	}
 	return result
 }
@@ -360,32 +353,22 @@ func (m *SegmentMerger) collectActive(state *mergeState) MergeResult {
 
 // dotSimilarity computes dot product of two L2-normalized vectors (= cosine similarity).
 func dotSimilarity(a, b []float32) float64 {
-	var sum float64
-	for i := range a {
-		sum += float64(a[i]) * float64(b[i])
-	}
-	return sum
+	return float64(vek32.Dot(a, b))
 }
 
 // weightedAvgNorm computes a size-weighted average of dst and src in-place on dst,
 // then L2-normalizes. Used for approximate merge-decision embeddings.
 func weightedAvgNorm(dst, src []float32, sizeA, sizeB uint32) {
-	total := float64(sizeA + sizeB)
-	wA := float64(sizeA) / total
-	wB := float64(sizeB) / total
-	var sumSq float64
-	for i := range dst {
-		v := wA*float64(dst[i]) + wB*float64(src[i])
-		dst[i] = float32(v)
-		sumSq += v * v
-	}
-	if sumSq == 0 {
+	total := float32(sizeA + sizeB)
+	wA := float32(sizeA) / total
+	wB := float32(sizeB) / total
+	vek32.MulNumber_Inplace(dst, wA)
+	vek32.Add_Inplace(dst, vek32.MulNumber(src, wB))
+	normSq := vek32.Dot(dst, dst)
+	if normSq == 0 {
 		return
 	}
-	invNorm := float32(1.0 / math.Sqrt(sumSq))
-	for i := range dst {
-		dst[i] *= invNorm
-	}
+	vek32.MulNumber_Inplace(dst, float32(1.0/math.Sqrt(float64(normSq))))
 }
 
 // stddev computes the sample standard deviation of a float64 slice.

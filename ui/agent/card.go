@@ -38,7 +38,7 @@ const contextBarWidth = 4
 // It shows: [indicator] [status icon] [agent name] [task summary...] [context %]
 func RenderCard(agent AgentState, width int, th *theme.Theme, selected bool) string {
 	icon := statusIcon(agent.Status)
-	indicator := selectIndicator(selected)
+	indicator := selectIndicator(selected, th)
 
 	nameStyle := th.AgentBadge(agent.AgentType)
 	name := nameStyle.Render(agent.Name)
@@ -74,9 +74,10 @@ func statusIcon(status AgentStatus) string {
 }
 
 // selectIndicator returns the visual indicator for selection state.
-func selectIndicator(selected bool) string {
+// Selected entries use Primary color to match the session panel.
+func selectIndicator(selected bool, th *theme.Theme) string {
 	if selected {
-		return selectedIndicator
+		return lipgloss.NewStyle().Foreground(th.Palette.Primary).Render(selectedIndicator)
 	}
 	return unselectedIndicator
 }

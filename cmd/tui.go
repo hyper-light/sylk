@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -56,10 +55,9 @@ const activityBusBuffer = 1000
 // bootstrapDeps initializes the core systems needed by the TUI.
 // Returns a Deps struct and a cleanup function.
 func bootstrapDeps(ctx context.Context) (ui.Deps, func(), error) {
-	// Goroutine budget with no memory pressure (level 0).
-	pressureLevel := &atomic.Int32{}
-	budget := concurrency.NewGoroutineBudget(pressureLevel)
-	scope := concurrency.NewGoroutineScope(ctx, "tui", budget)
+	// TUI goroutines are infrastructure, not agent workloads.
+	// A nil budget skips agent-level budget tracking.
+	scope := concurrency.NewGoroutineScope(ctx, "tui", nil)
 
 	activityBus := events.NewActivityEventBus(activityBusBuffer)
 	activityBus.Start()

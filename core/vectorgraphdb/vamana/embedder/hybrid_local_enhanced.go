@@ -8,6 +8,8 @@ import (
 	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/viterin/vek/vek32"
 )
 
 // Pre-computed MinHash seeds — constant across all calls.
@@ -1208,15 +1210,9 @@ func fnvHash64JoinedInline(prefix string, words []string, sep byte) uint64 {
 
 // normalizeVecFast normalizes the vector in-place to unit length.
 func normalizeVecFast(vec []float32) {
-	var sumSq float64
-	for _, v := range vec {
-		sumSq += float64(v) * float64(v)
-	}
-	if sumSq == 0 {
+	normSq := vek32.Dot(vec, vec)
+	if normSq == 0 {
 		return
 	}
-	invNorm := float32(1.0 / math.Sqrt(sumSq))
-	for i := range vec {
-		vec[i] *= invNorm
-	}
+	vek32.MulNumber_Inplace(vec, float32(1.0/math.Sqrt(float64(normSq))))
 }

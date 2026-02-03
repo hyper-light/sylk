@@ -77,8 +77,10 @@ func NewGoroutineScope(parentCtx context.Context, agentID string, budget *Gorout
 func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFunc) error {
 	timeout = s.normalizeTimeout(timeout)
 
-	if err := s.budget.Acquire(s.agentID); err != nil {
-		return err
+	if s.budget != nil {
+		if err := s.budget.Acquire(s.agentID); err != nil {
+			return err
+		}
 	}
 
 	w := s.createWorker(description, timeout)
@@ -87,7 +89,9 @@ func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFu
 	// between wg.Add(1) and wg.Wait() during shutdown.
 	if err := s.checkAndRegister(w); err != nil {
 		w.cancel()
-		s.budget.Release(s.agentID)
+		if s.budget != nil {
+			s.budget.Release(s.agentID)
+		}
 		return err
 	}
 
@@ -182,7 +186,9 @@ func (s *GoroutineScope) cleanupWorker(w *worker) {
 	s.mu.Unlock()
 
 	s.emitWorkerStopped(w, count, monitor)
-	s.budget.Release(s.agentID)
+	if s.budget != nil {
+		s.budget.Release(s.agentID)
+	}
 	s.wg.Done()
 }
 

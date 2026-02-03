@@ -2,6 +2,7 @@ package input
 
 import (
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -15,6 +16,10 @@ import (
 // defaultMaxHeight is the maximum visible rows before internal scrolling.
 const defaultMaxHeight = 10
 
+// blinkInterval is the cursor blink period.
+// Derived from: standard terminal cursor blink rate (~530ms).
+const blinkInterval = 530 * time.Millisecond
+
 // Model is the prompt input component.
 type Model struct {
 	lines     [][]rune // Content as lines of runes
@@ -22,6 +27,10 @@ type Model struct {
 	cursorCol int
 	maxHeight int // Max visible rows before internal scroll
 	scrollOff int // First visible line when content exceeds maxHeight
+
+	// Cursor blink state
+	cursorVisible bool
+	lastBlinkAt   time.Time
 
 	history   *InputHistory
 	completer *Completer
@@ -41,11 +50,13 @@ var (
 // New creates a Model with the given theme, history capacity, and completion providers.
 func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) *Model {
 	return &Model{
-		lines:     [][]rune{nil},
-		maxHeight: defaultMaxHeight,
-		history:   NewInputHistory(historyCapacity),
-		completer: NewCompleter(providers...),
-		theme:     th,
+		lines:         [][]rune{nil},
+		maxHeight:     defaultMaxHeight,
+		cursorVisible: true,
+		lastBlinkAt:   time.Now(),
+		history:       NewInputHistory(historyCapacity),
+		completer:     NewCompleter(providers...),
+		theme:         th,
 	}
 }
 
@@ -58,11 +69,15 @@ func (m *Model) Init() tea.Cmd { return nil }
 
 // Update processes a tea.Msg and returns the updated component and command.
 func (m *Model) Update(raw tea.Msg) (component.Component, tea.Cmd) {
-	keyMsg, ok := raw.(tea.KeyMsg)
-	if !ok {
+	switch typed := raw.(type) {
+	case tea.KeyMsg:
+		return m.handleKey(typed)
+	case msg.TickMsg:
+		m.advanceBlink(typed.Time)
+		return m, nil
+	default:
 		return m, nil
 	}
-	return m.handleKey(keyMsg)
 }
 
 // View renders the input area.
@@ -88,8 +103,13 @@ func (m *Model) ID() component.FocusID { return component.FocusInput }
 // Focused reports whether this component currently has focus.
 func (m *Model) Focused() bool { return m.focused }
 
-// SetFocused sets the focus state.
-func (m *Model) SetFocused(focused bool) { m.focused = focused }
+// SetFocused sets the focus state, resetting the cursor blink on focus gain.
+func (m *Model) SetFocused(focused bool) {
+	m.focused = focused
+	if focused {
+		m.resetBlink()
+	}
+}
 
 // ---------------------------------------------------------------------------
 // component.Resizable
@@ -99,6 +119,27 @@ func (m *Model) SetFocused(focused bool) { m.focused = focused }
 func (m *Model) SetSize(width, height int) {
 	m.width = width
 	m.height = height
+}
+
+// ---------------------------------------------------------------------------
+// Cursor blink
+// ---------------------------------------------------------------------------
+
+// advanceBlink toggles cursor visibility when the blink interval has elapsed.
+func (m *Model) advanceBlink(now time.Time) {
+	if !m.focused {
+		return
+	}
+	if now.Sub(m.lastBlinkAt) >= blinkInterval {
+		m.cursorVisible = !m.cursorVisible
+		m.lastBlinkAt = now
+	}
+}
+
+// resetBlink makes the cursor visible and resets the blink timer.
+func (m *Model) resetBlink() {
+	m.cursorVisible = true
+	m.lastBlinkAt = time.Now()
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +182,7 @@ var normalKeys = []keyEntry{
 
 // handleKey dispatches a key message through the appropriate table.
 func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
+	m.resetBlink()
 	if m.completer.IsActive() {
 		if cmd, handled := m.dispatch(completerKeys, k); handled {
 			return m, cmd
@@ -527,7 +569,12 @@ func (m *Model) renderLine(line []rune, absRow int) string {
 }
 
 // renderCursor inserts a visible block cursor at the cursor position.
+// When the cursor is in the invisible phase of its blink, the text
+// renders without the reverse-video highlight.
 func (m *Model) renderCursor(line []rune, lineStr string) string {
+	if !m.cursorVisible {
+		return lineStr
+	}
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
 	if m.cursorCol >= len(line) {

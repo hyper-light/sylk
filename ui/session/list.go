@@ -30,9 +30,11 @@ var stateIcons = map[coresession.State]string{
 	coresession.StateFailed:    theme.IconError,
 }
 
-// listEntryPadding accounts for the icon, spaces, and branch indicator.
-// Derived from: icon(1) + space(1) + branch_icon(1) + space(1) = 4.
-const listEntryPadding = 4
+// selectedIndicator is the left-side marker for the currently selected entry.
+const selectedIndicator = theme.IconExpand
+
+// unselectedPad replaces the indicator with a space for non-selected entries.
+const unselectedPad = " "
 
 // RenderList renders the session list with the selected entry highlighted.
 func RenderList(summaries []SessionSummary, selected int, width, height int, th *theme.Theme) string {
@@ -53,29 +55,56 @@ func RenderList(summaries []SessionSummary, selected int, width, height int, th 
 	return strings.Join(lines, "\n")
 }
 
-// renderSessionEntry renders a single session list entry.
+// entryFixedWidth is the space consumed by the indicator, icon, and separating spaces.
+// Derived from: indicator(1) + space(1) + icon(1) + space(1) = 4.
+const entryFixedWidth = 4
+
+// renderSessionEntry renders a single session list entry, truncated to width.
 func renderSessionEntry(s SessionSummary, selected bool, width int, th *theme.Theme) string {
 	icon := sessionStateIcon(s.State)
-	nameStyle := sessionNameStyle(s.Active, th)
+	indicator, nameStyle := entryStyles(s.Active, selected, th)
+
 	name := nameStyle.Render(s.Name)
-
 	branchStr := renderBranch(s.Branch, th)
-	ageStr := renderAge(s.CreatedAt, th)
 
-	// Calculate summary: [icon space] [name] [ branch] [ age]
-	nameWidth := lipgloss.Width(name)
-	branchWidth := lipgloss.Width(branchStr)
-	ageWidth := lipgloss.Width(ageStr)
-	fixedWidth := listEntryPadding + nameWidth + branchWidth + ageWidth
-	spacerWidth := max(width-fixedWidth, 0)
-	spacer := strings.Repeat(" ", spacerWidth)
-
-	entry := fmt.Sprintf("  %s %s%s%s%s", icon, name, spacer, branchStr, ageStr)
-
-	if selected {
-		return renderSelected(entry, width, th)
+	content := name + branchStr
+	contentWidth := lipgloss.Width(content)
+	available := max(width-entryFixedWidth, 0)
+	if contentWidth > available {
+		content = truncateVisible(content, available)
 	}
-	return entry
+
+	return fmt.Sprintf("%s %s %s", indicator, icon, content)
+}
+
+// entryStyles returns the indicator string and name style for a session entry.
+func entryStyles(active, selected bool, th *theme.Theme) (string, lipgloss.Style) {
+	if selected {
+		indicator := lipgloss.NewStyle().Foreground(th.Palette.Primary).Render(selectedIndicator)
+		style := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
+		return indicator, style
+	}
+	return unselectedPad, sessionNameStyle(active, th)
+}
+
+// truncateVisible truncates a styled string to fit within maxWidth visible
+// columns, appending an ellipsis if truncated.
+func truncateVisible(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	ellipsis := "\u2026"
+	for i := range runes {
+		candidate := string(runes[:i]) + ellipsis
+		if lipgloss.Width(candidate) > maxWidth {
+			if i == 0 {
+				return ellipsis[:min(len(ellipsis), maxWidth)]
+			}
+			return string(runes[:i-1]) + ellipsis
+		}
+	}
+	return s
 }
 
 // sessionStateIcon returns the icon for a session state.
@@ -103,42 +132,6 @@ func renderBranch(branch string, th *theme.Theme) string {
 	return " " + branchStyle.Render(theme.IconBranch+" "+branch)
 }
 
-// renderAge formats the session age as a human-readable duration.
-func renderAge(createdAt time.Time, th *theme.Theme) string {
-	ageStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	return " " + ageStyle.Render(formatAge(createdAt))
-}
-
-// renderSelected highlights the entry row for the selected session.
-func renderSelected(entry string, width int, th *theme.Theme) string {
-	highlightStyle := lipgloss.NewStyle().
-		Background(th.Palette.Subtle).
-		Width(width)
-	return highlightStyle.Render(entry)
-}
-
-// formatAge returns a concise human-readable age string.
-func formatAge(t time.Time) string {
-	d := time.Since(t)
-
-	// Time thresholds derived from common duration display conventions.
-	const (
-		minuteThreshold = time.Minute
-		hourThreshold   = time.Hour
-		dayThreshold    = 24 * time.Hour
-	)
-
-	if d < minuteThreshold {
-		return "now"
-	}
-	if d < hourThreshold {
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	}
-	if d < dayThreshold {
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	}
-	return fmt.Sprintf("%dd", int(d.Hours()/24))
-}
 
 // visibleWindow calculates the start and end indices for a scrolling
 // window centered on the selected item.

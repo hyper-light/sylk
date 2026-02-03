@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -219,38 +220,41 @@ func (s *SessionIngestion) buildEntities(ctx context.Context, graph *ingestion.C
 func (s *SessionIngestion) buildFileEntities(files []ingestion.FileNode, contentMap map[string]string, ent *ingestionEntities) {
 	ent.fileNodes = make([]*Node, len(files))
 	ent.fileDocs = make([]*VersionDocument, len(files))
-	now := uint64(time.Now().UnixNano())
+	nowNano := time.Now().UnixNano()
+	nowNode := uint64(nowNano)
 
 	for i, file := range files {
 		nodeID := s.allocID()
 		ent.fileIDMap[file.ID] = nodeID
 		ent.filePathMap[file.ID] = file.Path
 
+		docID := "file_" + strconv.FormatUint(uint64(nodeID), 10)
+
 		var docRef uint32
 		if s.session.DocIDMap != nil {
-			docRef = s.session.DocIDMap.GetOrAssign(fmt.Sprintf("file_%d", nodeID))
+			docRef = s.session.DocIDMap.GetOrAssign(docID)
 		}
 		ent.docRefMap[file.ID] = docRef
 
 		ent.fileNodes[i] = &Node{
 			ID:           nodeID,
-			CanonicalKey: fmt.Sprintf("file:%s", file.Path),
+			CanonicalKey: "file:" + file.Path,
 			Domain:       uint8(DomainCode),
 			NodeType:     uint8(NodeTypeFile),
 			Name:         file.Path,
 			Path:         file.Path,
-			CreatedAt:    now,
+			CreatedAt:    nowNode,
 			SessionID:    s.session.Meta.ID,
 			DocRef:       docRef,
 		}
 
 		ent.fileDocs[i] = &VersionDocument{
-			ID:        fmt.Sprintf("file_%d", nodeID),
+			ID:        docID,
 			Path:      file.Path,
 			Type:      "source_code",
 			Content:   contentMap[file.Path],
 			Language:  file.Lang,
-			IndexedAt: time.Now().UnixNano(),
+			IndexedAt: nowNano,
 		}
 	}
 }
@@ -267,7 +271,7 @@ func (s *SessionIngestion) buildSymbolEntities(symbols []ingestion.SymbolNode, e
 
 		ent.symbolNodes[i] = &Node{
 			ID:           nodeID,
-			CanonicalKey: fmt.Sprintf("symbol:%s:%s:%s", filePath, sym.Name, sym.Kind.String()),
+			CanonicalKey: "symbol:" + filePath + ":" + sym.Name + ":" + sym.Kind.String(),
 			Domain:       uint8(DomainCode),
 			NodeType:     uint8(symbolKindToNodeType(sym.Kind)),
 			Name:         sym.Name,
@@ -314,7 +318,8 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 	}
 
 	symsByFile := groupSymbolsByFile(graph.Symbols)
-	now := uint64(time.Now().UnixNano())
+	nowNano := time.Now().UnixNano()
+	now := uint64(nowNano)
 
 	// Split across workers.
 	workers := runtime.NumCPU()
@@ -349,18 +354,26 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 
 				cr := s.computeChunks(ctx, []byte(fe.content), symsByFile[fe.file.ID])
 
+				// Pre-compute the doc ID prefix once per file: "file_<parentNodeID>_c"
+				docIDPrefix := "file_" + strconv.FormatUint(uint64(parentNodeID), 10) + "_c"
+				// Pre-compute canonical key prefix once per file: "chunk:<path>:"
+				canonPrefix := "chunk:" + fe.file.Path + ":"
+
 				var prevChunkID uint32
 				for i, b := range cr.Boundaries {
 					chunkID := s.allocID()
 
+					chunkSeq := zeroPad(i, 3)
+					docID := docIDPrefix + chunkSeq
+
 					var chunkDocRef uint32
 					if s.session.DocIDMap != nil {
-						chunkDocRef = s.session.DocIDMap.GetOrAssign(fmt.Sprintf("file_%d_c%03d", parentNodeID, i))
+						chunkDocRef = s.session.DocIDMap.GetOrAssign(docID)
 					}
 
 					local.nodes = append(local.nodes, &Node{
 						ID:           chunkID,
-						CanonicalKey: fmt.Sprintf("chunk:%s:%04d", fe.file.Path, i),
+						CanonicalKey: canonPrefix + zeroPad(i, 4),
 						Domain:       uint8(DomainCode),
 						NodeType:     uint8(NodeTypeChunk),
 						Name:         fe.content[b.ByteStart:b.ByteEnd],
@@ -371,11 +384,11 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 					})
 
 					local.docs = append(local.docs, &VersionDocument{
-						ID:        fmt.Sprintf("file_%d_c%03d", parentNodeID, i),
+						ID:        docID,
 						Path:      fe.file.Path,
 						Type:      "source_code",
 						Content:   fe.content[b.ByteStart:b.ByteEnd],
-						IndexedAt: time.Now().UnixNano(),
+						IndexedAt: nowNano,
 					})
 
 					local.refs = append(local.refs, &ChunkRef{
@@ -464,7 +477,7 @@ func (s *SessionIngestion) buildEmbedTexts(ent *ingestionEntities) {
 	ent.embedIDs = make([]uint32, 0, totalCap)
 
 	for _, node := range ent.fileNodes {
-		ent.embedTexts = append(ent.embedTexts, fmt.Sprintf("file: %s", node.Path))
+		ent.embedTexts = append(ent.embedTexts, "file: "+node.Path)
 		ent.embedIDs = append(ent.embedIDs, node.ID)
 	}
 
@@ -748,18 +761,18 @@ func symbolKindStrengthFromIngestion(kind ingestion.SymbolKind) uint32 {
 func (s *SessionIngestion) nodeToEmbeddingText(node *Node) string {
 	switch NodeType(node.NodeType) {
 	case NodeTypeFile:
-		return fmt.Sprintf("file: %s", node.Path)
+		return "file: " + node.Path
 	case NodeTypeFunction, NodeTypeMethod:
 		if node.Signature != "" {
-			return fmt.Sprintf("%s %s", node.Name, node.Signature)
+			return node.Name + " " + node.Signature
 		}
 		return node.Name
 	case NodeTypeType, NodeTypeInterface:
-		return fmt.Sprintf("type %s", node.Name)
+		return "type " + node.Name
 	case NodeTypeConst, NodeTypeVar:
-		return fmt.Sprintf("var %s", node.Name)
+		return "var " + node.Name
 	case NodeTypeDocument:
-		return fmt.Sprintf("doc: %s", node.Path)
+		return "doc: " + node.Path
 	case NodeTypeChunk:
 		return node.Name
 	default:
@@ -852,6 +865,23 @@ func symbolKindToNodeType(kind ingestion.SymbolKind) NodeType {
 	default:
 		return NodeTypeUnknown
 	}
+}
+
+// zeroPad formats n as a decimal string zero-padded to width digits.
+// Uses strconv.AppendInt to avoid fmt.Sprintf overhead (called ~100k+ times per boot).
+func zeroPad(n, width int) string {
+	var buf [20]byte // max uint64 decimal digits
+	s := strconv.AppendInt(buf[:0], int64(n), 10)
+	if len(s) >= width {
+		return string(s)
+	}
+	var padded [20]byte
+	pad := width - len(s)
+	for i := range pad {
+		padded[i] = '0'
+	}
+	copy(padded[pad:], s)
+	return string(padded[:width])
 }
 
 // docTypeToContentClass converts a DocType string to a ContentClass.

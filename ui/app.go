@@ -142,7 +142,7 @@ type AppModel struct {
 func New(cfg Config, deps Deps) *AppModel {
 	th := cfg.Theme()
 
-	return &AppModel{
+	app := &AppModel{
 		config:           cfg,
 		deps:             deps,
 		layout:           layout.NewManager(0, 0, defaultPanels),
@@ -163,6 +163,8 @@ func New(cfg Config, deps Deps) *AppModel {
 		guideBridge:      bridge.NewGuideBridge(deps.GuideBus, deps.Scope),
 		interruptHandler: interrupt.NewHandler(),
 	}
+	app.syncFocusState()
+	return app
 }
 
 // Init starts all event bridges and the tick timer.
@@ -333,8 +335,10 @@ func (m *AppModel) handleQuit() tea.Cmd {
 }
 
 func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
-	// Forward tick to status bar.
+	// Forward tick to status bar and input (for cursor blink).
 	m.statusBar.Update(tick)
+	comp, _ := m.input.Update(tick)
+	m.input = comp.(*inputpkg.Model)
 	return m.tickCmd()
 }
 
@@ -472,6 +476,10 @@ const statusBarHeight = 1
 // Derived from: 1 border top + up to maxHeight lines + 1 border bottom.
 const inputAreaMinHeight = 3
 
+// panelBorderSize is the space consumed by a rounded border on each axis.
+// Derived from: 1 char per side × 2 sides = 2.
+const panelBorderSize = 2
+
 func (m *AppModel) recalcLayout() {
 	// Reserve space for input and status bar.
 	mainHeight := m.height - inputAreaMinHeight - statusBarHeight
@@ -479,23 +487,26 @@ func (m *AppModel) recalcLayout() {
 
 	m.layout.SetSize(m.width, mainHeight)
 
-	// Center panel: chat.
+	// Center panel: chat. Subtract border so content fits inside renderPanel().
 	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
-	m.chat.SetSize(chatW, chatH)
+	m.chat.SetSize(max(chatW-panelBorderSize, 1), max(chatH-panelBorderSize, 1))
 
 	// Left panel: split between session (top half) and agent (bottom half).
+	// Content area is inside the shared left border.
 	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
-	sessionH := leftH / 2
-	agentH := leftH - sessionH
-	m.sessionPanel.SetSize(leftW, sessionH)
-	m.agentPanel.SetSize(leftW, agentH)
+	innerLeftW := max(leftW-panelBorderSize, 1)
+	innerLeftH := max(leftH-panelBorderSize, 1)
+	sessionH := innerLeftH / 2
+	agentH := innerLeftH - sessionH
+	m.sessionPanel.SetSize(innerLeftW, sessionH)
+	m.agentPanel.SetSize(innerLeftW, agentH)
 
 	// Right panel: code viewer (and knowledge, same dimensions).
 	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
-	m.codePanel.SetSize(rightW, rightH)
-	m.knowledgePanel.SetSize(rightW, rightH)
+	m.codePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	m.knowledgePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 
-	// Fixed-height components.
+	// Fixed-height components (input handles its own border internally).
 	m.input.SetSize(m.width, inputAreaMinHeight)
 	m.statusBar.SetSize(m.width, statusBarHeight)
 
@@ -538,7 +549,11 @@ func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.T
 	if m.focus.IsFocused(id) {
 		border = th.ActiveBorder
 	}
-	return border.Width(w - 2).Height(h - 2).Render(content)
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
 }
 
 // ---------------------------------------------------------------------------
