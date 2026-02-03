@@ -178,10 +178,55 @@ func (h *HealthTracker) measurePartitionCohesion() float64 {
 	return totalSim / float64(validSamples)
 }
 
+// measureTombstoneRatio returns the fraction of dead vectors in the index.
+func (h *HealthTracker) measureTombstoneRatio() float64 {
+	idx := h.idx
+	if idx.numVectors == 0 || idx.tombstones == nil {
+		return 0
+	}
+
+	dead := 0
+	for i := range idx.numVectors {
+		if idx.tombstones.IsDead(uint32(i)) {
+			dead++
+		}
+	}
+	return float64(dead) / float64(idx.numVectors)
+}
+
+// NeedsPartitionRebuild returns the indices of partitions whose dead ratio
+// exceeds 1/sqrt(partitionSize). These partitions have degraded centroid
+// accuracy and should have their centroids recomputed from live vectors.
+func (h *HealthTracker) NeedsPartitionRebuild() []int {
+	idx := h.idx
+	if idx.tombstones == nil || len(idx.partitionIDs) == 0 {
+		return nil
+	}
+
+	var rebuild []int
+	for p, ids := range idx.partitionIDs {
+		if len(ids) == 0 {
+			continue
+		}
+		dead := 0
+		for _, id := range ids {
+			if idx.tombstones.IsDead(id) {
+				dead++
+			}
+		}
+		threshold := 1.0 / math.Sqrt(float64(len(ids)))
+		if float64(dead)/float64(len(ids)) > threshold {
+			rebuild = append(rebuild, p)
+		}
+	}
+	return rebuild
+}
+
 type HealthStatus struct {
 	SelfRecall        float64
 	EdgeQuality       float64
 	PartitionCohesion float64
+	TombstoneRatio    float64
 
 	SelfRecallTrend        float64
 	EdgeQualityTrend       float64
@@ -200,6 +245,7 @@ func (h *HealthTracker) Status() HealthStatus {
 		SelfRecall:        currentSelfRecall,
 		EdgeQuality:       currentEdgeQuality,
 		PartitionCohesion: currentPartitionCoh,
+		TombstoneRatio:    h.measureTombstoneRatio(),
 
 		SelfRecallTrend:        currentSelfRecall - h.selfRecallEMA,
 		EdgeQualityTrend:       currentEdgeQuality - h.edgeQualityEMA,
@@ -207,12 +253,12 @@ func (h *HealthTracker) Status() HealthStatus {
 	}
 }
 
-func (h *HealthTracker) NeedsMaintenance() (needsCentroidRefresh, needsGraphOptimize bool) {
+func (h *HealthTracker) NeedsMaintenance() (needsCentroidRefresh, needsGraphOptimize, needsPartitionRebuild bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	if !h.initialized {
-		return false, false
+		return false, false, false
 	}
 
 	currentSelfRecall := h.measureSelfRecall()
@@ -227,6 +273,7 @@ func (h *HealthTracker) NeedsMaintenance() (needsCentroidRefresh, needsGraphOpti
 
 	needsCentroidRefresh = cohesionDrop > emaVariance && recallDrop > emaVariance
 	needsGraphOptimize = edgeDrop > emaVariance && recallDrop > emaVariance
+	needsPartitionRebuild = len(h.NeedsPartitionRebuild()) > 0
 
-	return needsCentroidRefresh, needsGraphOptimize
+	return needsCentroidRefresh, needsGraphOptimize, needsPartitionRebuild
 }

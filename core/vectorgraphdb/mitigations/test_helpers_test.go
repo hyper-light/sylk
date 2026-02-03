@@ -25,7 +25,7 @@ func setupTestDB(t *testing.T) (*vectorgraphdb.VectorGraphDB, func()) {
 }
 
 func makeTestEmbedding() []float32 {
-	embedding := make([]float32, 768)
+	embedding := make([]float32, 1024)
 	for i := range embedding {
 		embedding[i] = 0.1
 	}

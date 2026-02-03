@@ -210,8 +210,10 @@ func (pdb *ProtectedVectorDB) stopBackgroundTasks() {
 // closeAllSessions closes all active sessions.
 func (pdb *ProtectedVectorDB) closeAllSessions() {
 	pdb.sessions.Range(func(key, val any) bool {
-		view := val.(*SessionScopedView)
-		_ = view.Close()
+		view, ok := val.(*SessionScopedView)
+		if ok {
+			_ = view.Close()
+		}
 		pdb.sessions.Delete(key)
 		return true
 	})

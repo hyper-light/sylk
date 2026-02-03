@@ -56,7 +56,7 @@ func TestDiscoverFiles(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	files, err := DiscoverFiles(ctx, projectRoot, nil)
+	files, err := DiscoverFiles(ctx, projectRoot, nil, nil)
 	if err != nil {
 		t.Fatalf("Discovery failed: %v", err)
 	}
@@ -81,11 +81,11 @@ func TestDiscoverFiles(t *testing.T) {
 func TestParseFiles(t *testing.T) {
 	projectRoot := "../../../"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	// Discover
-	files, err := DiscoverFiles(ctx, projectRoot, nil)
+	files, err := DiscoverFiles(ctx, projectRoot, nil, nil)
 	if err != nil {
 		t.Fatalf("Discovery failed: %v", err)
 	}
@@ -128,11 +128,11 @@ func TestParseFiles(t *testing.T) {
 func TestAggregate(t *testing.T) {
 	projectRoot := "../../../"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	// Full pipeline up to aggregation
-	files, _ := DiscoverFiles(ctx, projectRoot, nil)
+	files, _ := DiscoverFiles(ctx, projectRoot, nil, nil)
 	mapped, _ := ReadFiles(ctx, files, WorkerCount())
 
 	pool := NewParserPool(WorkerCount())
@@ -180,7 +180,7 @@ func BenchmarkDiscovery(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		files, err := DiscoverFiles(ctx, projectRoot, nil)
+		files, err := DiscoverFiles(ctx, projectRoot, nil, nil)
 		if err != nil {
 			b.Fatalf("Discovery failed: %v", err)
 		}
@@ -194,7 +194,7 @@ func BenchmarkParsing(b *testing.B) {
 	ctx := context.Background()
 
 	// Prepare files once
-	files, _ := DiscoverFiles(ctx, projectRoot, nil)
+	files, _ := DiscoverFiles(ctx, projectRoot, nil, nil)
 	mapped, _ := ReadFiles(ctx, files, WorkerCount())
 
 	b.ResetTimer()

@@ -189,7 +189,7 @@ func TestDeriveOPQConfig(t *testing.T) {
 	}{
 		{"64-dim, 500 vectors", 64, 500},
 		{"128-dim, 1000 vectors", 128, 1000},
-		{"768-dim, 10000 vectors", 768, 10000},
+		{"1024-dim, 10000 vectors", 1024, 10000},
 		{"32-dim, 200 vectors", 32, 200},
 	}
 

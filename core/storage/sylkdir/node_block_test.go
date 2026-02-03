@@ -11,13 +11,14 @@ func makeTestNode(id uint32) *Node {
 		CanonicalKey: "repo:path/to/file.go:FunctionName:func",
 		Domain:       1, // DomainCode
 		NodeType:     2, // NodeTypeFunction
+		CreatedBy:    1,
+		CreatedAt:    uint64(time.Now().UnixNano()),
+		SessionID:    1,
+		DocRef:       0,
 		Name:         "FunctionName",
 		Path:         "path/to/file.go",
 		Package:      "mypackage",
 		Signature:    "func FunctionName(ctx context.Context) error",
-		CreatedAt:    uint64(time.Now().UnixNano()),
-		SessionID:    1,
-		CreatedBy:    1,
 		SupersededBy: 0,
 		Supersedes:   0,
 	}
@@ -72,11 +73,36 @@ func TestNodeMarshalUnmarshal(t *testing.T) {
 	if decoded.CreatedBy != original.CreatedBy {
 		t.Errorf("CreatedBy: got %d, want %d", decoded.CreatedBy, original.CreatedBy)
 	}
+	if decoded.DocRef != original.DocRef {
+		t.Errorf("DocRef: got %d, want %d", decoded.DocRef, original.DocRef)
+	}
 	if decoded.SupersededBy != original.SupersededBy {
 		t.Errorf("SupersededBy: got %d, want %d", decoded.SupersededBy, original.SupersededBy)
 	}
 	if decoded.Supersedes != original.Supersedes {
 		t.Errorf("Supersedes: got %d, want %d", decoded.Supersedes, original.Supersedes)
+	}
+}
+
+func TestNodeDocRefRoundTrip(t *testing.T) {
+	node := makeTestNode(42)
+	node.DocRef = 12345
+
+	data, err := node.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+
+	decoded := &Node{}
+	if err := decoded.UnmarshalBinary(data); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+
+	if decoded.DocRef != 12345 {
+		t.Errorf("DocRef: got %d, want 12345", decoded.DocRef)
+	}
+	if decoded.CreatedBy != node.CreatedBy {
+		t.Errorf("CreatedBy: got %d, want %d", decoded.CreatedBy, node.CreatedBy)
 	}
 }
 

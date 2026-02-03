@@ -54,14 +54,30 @@ This document tracks the implementation work required to bring the Knowledge Gra
   ```go
   type GlobalMeta struct {
       SchemaVersion      int                 `json:"schema_version"`
+      Version            SemanticVersion     `json:"version"`            // Global KG version
       NextNodeID         uint32              `json:"next_node_id"`
       NextSessionID      uint32              `json:"next_session_id"`
       CommittedSessions  []CommittedSession  `json:"committed_sessions"`
   }
+
+  type CommittedSession struct {
+      SessionID     uint32          `json:"session_id"`
+      FinalVersion  SemanticVersion `json:"final_version"`  // Session's version at commit
+      GlobalVersion SemanticVersion `json:"global_version"` // Global version after commit
+      CommittedAt   time.Time       `json:"committed_at"`
+  }
   ```
 - [ ] `GlobalMeta.AllocateNodeID()` atomically increments and persists `next_node_id`
 - [ ] `GlobalMeta.AllocateSessionID()` atomically increments `next_session_id`
-- [ ] `GlobalMeta.RegisterCommit(sessionID, finalVersion)` appends to committed_sessions
+- [ ] `GlobalMeta.RegisterCommit(sessionID, finalVersion)` performs:
+  1. Create pre-commit checkpoint in session (minor bump: v1.x.y → v1.(x+1).0)
+  2. Append to committed_sessions with finalVersion and new globalVersion
+  3. **MAJOR bump on global version** (e.g., v2.0.0 → v3.0.0)
+- [ ] Global version bump rules:
+  - Session commit (merge): **MAJOR** bump
+  - Schema migration: MAJOR bump
+  - Incremental updates (future): MINOR bump
+  - Index rebuild / data repair: PATCH bump
 - [ ] File locking prevents concurrent writes
 - [ ] Atomic write (write to temp, rename) prevents corruption
 
@@ -181,6 +197,70 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 ---
 
+### TODO 1.9: Implement Version Data Stores ✓
+
+**Description**: Create stores that write nodes/edges/docs/vectors to session version directories using semantic versioning.
+
+**Acceptance Criteria**:
+- [x] `SemanticVersion` type with Major/Minor/Patch fields:
+  ```go
+  type SemanticVersion struct {
+      Major uint16 `json:"major"`
+      Minor uint16 `json:"minor"`
+      Patch uint16 `json:"patch"`
+  }
+  func (v SemanticVersion) String() string      // "v1.0.0"
+  func (v SemanticVersion) DirName() string     // "v1.0.0"
+  func (v SemanticVersion) BumpPatch/Minor/Major() SemanticVersion
+  ```
+- [x] `CheckpointType` enum: `CheckpointMajor`, `CheckpointMinor`, `CheckpointPatch`
+- [x] `VersionNodeStore` writes to `sessions/ses_XXX/versions/v1.0.0/nodes/`:
+  ```go
+  func (s *VersionNodeStore) Write(node *Node) error  // writes to HEAD version
+  func (s *VersionNodeStore) WriteToVersion(version SemanticVersion, node *Node) error
+  func (s *VersionNodeStore) ReadFromVersion(version SemanticVersion, nodeID uint32) (*Node, error)
+  func (s *VersionNodeStore) ReadFromAncestorChain(nodeID uint32) (*Node, error)
+  ```
+- [x] `VersionEdgeStore` writes to `sessions/ses_XXX/versions/v1.0.0/edges/`:
+  ```go
+  func (s *VersionEdgeStore) Write(edge *Edge) error
+  func (s *VersionEdgeStore) GetOutgoingFromVersion(version SemanticVersion, nodeID uint32) ([]*Edge, error)
+  func (s *VersionEdgeStore) GetOutgoingFromAncestorChain(nodeID uint32) ([]*Edge, error)
+  ```
+- [x] `VersionDocStore` writes to `sessions/ses_XXX/versions/v1.0.0/docs/batch.jsonl`:
+  ```go
+  func (s *VersionDocStore) Write(doc *Document) error  // appends JSONL to HEAD
+  func (s *VersionDocStore) ReadFromVersion(version SemanticVersion) ([]*Document, error)
+  func (s *VersionDocStore) ReadFromAncestorChain() ([]*Document, error)
+  ```
+- [x] `VersionVectorStore` writes to `sessions/ses_XXX/versions/v1.0.0/vectors/`:
+  ```go
+  func (s *VersionVectorStore) Write(vec *VersionVector) error
+  func (s *VersionVectorStore) WriteBatch(vecs []*VersionVector) error
+  func (s *VersionVectorStore) GetFromVersion(version SemanticVersion, nodeID uint32) (*VersionVector, error)
+  func (s *VersionVectorStore) ReadAllFromAncestorChain() ([]*VersionVector, error)
+  // Binary format: [NodeID:4][Dim:4][float32×Dim]
+  ```
+- [x] `SessionIngestion` integrates with existing ingestion pipeline:
+  ```go
+  func (s *SessionIngestion) SetEmbedder(e embedder.Embedder)
+  func (s *SessionIngestion) IngestWithContent(ctx, rootPath) (*SessionIngestionResult, error)
+  // Generates vectors during ingestion when embedder is set
+  ```
+- [x] All stores respect session HEAD pointer for writes
+- [x] Read operations support ancestor chain traversal (newest first)
+- [x] Initial version always v1.0.0, subsequent checkpoints bump appropriately
+- [x] Benchmark: Write 1000 nodes + 5000 edges + 100 docs to session < 500ms
+- [x] Integration test: Create session → write data → checkpoint → write more → read from ancestor chain
+
+**Implementation**:
+- `core/storage/sylkdir/version_store.go` - VersionNodeStore, VersionEdgeStore, VersionDocStore, VersionVectorStore
+- `core/storage/sylkdir/version_store_test.go` - 18 tests including vector store tests
+- `core/storage/sylkdir/session_store.go` - SemanticVersion, CheckpointType
+- `core/storage/sylkdir/session_ingestion.go` - SessionIngestion with embedder support
+
+---
+
 ## Phase 2: Data Structure Compliance
 
 ### TODO 2.1: Add CanonicalKey to Node
@@ -246,68 +326,78 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 ---
 
-### TODO 2.6: Add Provenance Fields to Edge
+### TODO 2.6: Add Provenance Fields to Edge ✓ (Partial)
 
 **Description**: Track who created/modified edges.
 
 **Acceptance Criteria**:
-- [ ] `GraphEdge` struct updated:
+- [x] `Edge` struct in version_store.go already has:
   ```go
-  type GraphEdge struct {
+  type Edge struct {
       SourceID  uint32
       TargetID  uint32
-      Type      EdgeType    // uint8
+      Type      uint8       // EdgeType
       Weight    float32
-      SessionID uint32      // NEW
-      AgentID   uint16      // NEW
+      SessionID uint32
+      AgentID   uint16
       CreatedAt uint64      // Unix nano
-      UpdatedAt uint64      // NEW: Unix nano
+      UpdatedAt uint64      // Unix nano
   }
   ```
-- [ ] All edge write paths populate provenance fields
+- [x] 35-byte binary format implemented in VersionEdgeStore
+- [ ] Migrate global EdgeShardStore to use same format
+
+**Note**: Already implemented for per-version storage. Needs migration to global storage.
 
 ---
 
-### TODO 2.7: Remove Autoincrement ID from Edges
+### TODO 2.7: Remove Autoincrement ID from Edges ✓
 
 **Description**: Edge identity is (src, dst, type), not a separate ID.
 
 **Acceptance Criteria**:
-- [ ] Edge primary key is `(source_id, target_id, edge_type)`
-- [ ] No separate autoincrement ID
-- [ ] All code referencing `edge.ID` updated to use compound key
-- [ ] Queries use compound key for lookups
+- [x] Edge primary key is `(source_id, target_id, edge_type)` via `EdgeKey` struct
+- [x] No separate autoincrement ID in version stores
+- [ ] Migrate global EdgeShardStore to compound key
+- [ ] Update SQLite schema to remove autoincrement ID
+
+**Note**: Implemented in VersionEdgeStore. Needs migration to global storage.
 
 ---
 
-### TODO 2.8: Convert Edge IDs to uint32
+### TODO 2.8: Convert Edge IDs to uint32 ✓
 
 **Description**: Align edge source/target with uint32 node IDs.
 
 **Acceptance Criteria**:
-- [ ] `GraphEdge.SourceID uint32` (was string)
-- [ ] `GraphEdge.TargetID uint32` (was string)
-- [ ] Foreign keys reference nodes as uint32
+- [x] `Edge.SourceID uint32` in version stores
+- [x] `Edge.TargetID uint32` in version stores
+- [ ] Migrate global EdgeShardStore
+- [ ] Update foreign key references
+
+**Note**: Implemented in version stores.
 
 ---
 
-### TODO 2.9: Implement Compact EdgeType
+### TODO 2.9: Implement Compact EdgeType ✓
 
 **Description**: EdgeType as uint8 for space efficiency.
 
 **Acceptance Criteria**:
-- [ ] `EdgeType` underlying type is `uint8`
-- [ ] Max 256 edge types (current ~20, plenty of room)
-- [ ] Binary format uses 1 byte
+- [x] `Edge.Type uint8` in version stores
+- [x] Binary format uses 1 byte
+- [ ] Define EdgeType constants for all relationship types
+
+**Note**: Implemented in version stores.
 
 ---
 
-### TODO 2.10: Implement Binary Edge Record Format
+### TODO 2.10: Implement Binary Edge Record Format ✓
 
 **Description**: Define fixed-size binary format for edges.
 
 **Acceptance Criteria**:
-- [ ] Edge binary record:
+- [x] Edge binary record (35 bytes) implemented:
   ```
   SourceID:  4 bytes (uint32)
   TargetID:  4 bytes (uint32)
@@ -320,41 +410,53 @@ This document tracks the implementation work required to bring the Knowledge Gra
   ─────────────────────────────
   Total:     35 bytes per edge
   ```
-- [ ] Reader/writer functions for binary format
-- [ ] Unit tests verify round-trip serialization
+- [x] `MarshalBinary()` / `UnmarshalBinary()` implemented
+- [x] Unit tests verify round-trip serialization
+
+**Implementation**: `core/storage/sylkdir/version_store.go`
 
 ---
 
 ## Phase 3: Session Storage
 
-### TODO 3.1: Implement Session Directory Structure
+### TODO 3.1: Implement Session Directory Structure ✓
 
 **Description**: Create per-session storage directories.
 
 **Acceptance Criteria**:
-- [ ] `SessionStore.Create(sessionID)` creates:
+- [x] `SessionStore.Create(sessionID)` creates:
   ```
   sessions/ses_XXX/
   ├── meta.json
   ├── base/snapshot.json
-  ├── versions/manifest.json
+  ├── versions/
+  │   ├── manifest.json
+  │   └── v1.0.0/           # Initial version (semantic versioning)
+  │       ├── meta.json
+  │       ├── nodes/
+  │       ├── edges/
+  │       ├── vectors/
+  │       ├── docs/
+  │       └── deletions.json
   ├── delta/tracker.json
   ├── state/
   ├── agents/
   └── messages/
   ```
-- [ ] `sessions/active` symlink points to current session
-- [ ] `SessionStore.SetActive(sessionID)` updates symlink atomically
-- [ ] `SessionStore.List()` returns all session IDs with status
+- [x] `sessions/active` symlink points to current session
+- [x] `SessionStore.SetActive(sessionID)` updates symlink atomically
+- [x] `SessionStore.List()` returns all session IDs with status
+
+**Implementation**: `core/storage/sylkdir/session_store.go`
 
 ---
 
-### TODO 3.2: Implement Session Meta
+### TODO 3.2: Implement Session Meta ✓
 
 **Description**: Create session metadata management.
 
 **Acceptance Criteria**:
-- [ ] `SessionMeta` struct matches DB.md:
+- [x] `SessionMeta` struct matches DB.md:
   ```go
   type SessionMeta struct {
       ID          uint32        `json:"id"`
@@ -370,12 +472,12 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 ---
 
-### TODO 3.3: Implement Base Snapshot
+### TODO 3.3: Implement Base Snapshot ✓
 
 **Description**: Capture global state at session start.
 
 **Acceptance Criteria**:
-- [ ] `BaseSnapshot` struct:
+- [x] `BaseSnapshot` struct:
   ```go
   type BaseSnapshot struct {
       CommittedSessions []uint32  `json:"committed_sessions"`
@@ -383,59 +485,65 @@ This document tracks the implementation work required to bring the Knowledge Gra
       NextNodeID        uint32    `json:"next_node_id"`
   }
   ```
-- [ ] `Session.Start()` creates `base/snapshot.json` from current GlobalMeta
-- [ ] Snapshot is immutable after creation
-- [ ] Used for visibility rules during queries
+- [x] `Session.Create()` creates `base/snapshot.json` from current GlobalMeta
+- [x] Snapshot is immutable after creation
+- [ ] Used for visibility rules during queries (TODO 6.2)
+
+**Implementation**: `core/storage/sylkdir/session_store.go`
 
 ---
 
-### TODO 3.4: Implement Version Manifest
+### TODO 3.4: Implement Version Manifest ✓
 
-**Description**: Create per-session version DAG.
+**Description**: Create per-session version DAG with semantic versioning.
 
 **Acceptance Criteria**:
-- [ ] `VersionManifest` struct:
+- [x] `VersionManifest` struct with semantic versioning:
   ```go
   type VersionManifest struct {
-      SessionID   uint32    `json:"session_id"`
-      Head        uint32    `json:"head"`
-      NextVersion uint32    `json:"next_version"`
-      Versions    []Version `json:"versions"`
+      SessionID   uint32            `json:"session_id"`
+      Head        SemanticVersion   `json:"head"`       // e.g., v1.0.2
+      Versions    []Version         `json:"versions"`
   }
   type Version struct {
-      ID        uint32       `json:"id"`
-      ParentID  uint32       `json:"parent_id"`
-      Name      string       `json:"name,omitempty"`
-      CreatedAt time.Time    `json:"created_at"`
-      Trigger   string       `json:"trigger"` // "explicit", "auto_delta", "implicit"
-      Stats     VersionStats `json:"stats"`
+      ID        SemanticVersion  `json:"id"`          // e.g., v1.0.0
+      ParentID  SemanticVersion  `json:"parent_id"`   // zero for v1.0.0
+      Name      string           `json:"name,omitempty"`
+      CreatedAt time.Time        `json:"created_at"`
+      Trigger   string           `json:"trigger"`     // "major", "minor", "patch", "implicit"
+      Stats     VersionStats     `json:"stats"`
   }
   ```
-- [ ] `Manifest.CreateVersion(name, trigger)` adds version, updates Head
-- [ ] `Manifest.GetAncestorChain(versionID)` returns [head, parent, ..., 1]
-- [ ] `Manifest.Save()` persists atomically
+- [x] `Session.Checkpoint(name, checkpointType)` creates version with appropriate bump
+- [x] `Session.GetAncestorChain()` returns [HEAD, parent, ..., v1.0.0]
+- [x] `Manifest.Save()` persists atomically
+
+**Implementation**: `core/storage/sylkdir/session_store.go`
 
 ---
 
-### TODO 3.5: Implement Version Storage
+### TODO 3.5: Implement Version Storage ✓
 
-**Description**: Create per-version data directories.
+**Description**: Create per-version data directories with semantic versioning.
 
 **Acceptance Criteria**:
-- [ ] Each version creates `versions/v000001/`:
+- [x] Each version creates `versions/v1.0.0/` (semantic versioning):
   ```
-  v000001/
+  v1.0.0/
   ├── meta.json
-  ├── nodes/data.bin, index.bin
-  ├── edges/
-  ├── vectors/
-  ├── docs/
+  ├── nodes/data.bin
+  ├── edges/data.bin
+  ├── vectors/data.bin
+  ├── docs/batch.jsonl
   └── deletions.json
   ```
-- [ ] `VersionStore.WriteNode(versionID, node)` appends to version's node store
-- [ ] `VersionStore.WriteEdge(versionID, edge)` appends to version's edge store
-- [ ] `deletions.json` tracks IDs deleted in this version
-- [ ] Data is append-only within version
+- [x] `VersionNodeStore.WriteToVersion(version, node)` appends to version's node store
+- [x] `VersionEdgeStore.WriteToVersion(version, edge)` appends to version's edge store
+- [x] `VersionVectorStore.WriteToVersion(version, vec)` appends to version's vector store
+- [x] `deletions.json` tracks IDs deleted in this version
+- [x] Data is append-only within version
+
+**Implementation**: `core/storage/sylkdir/version_store.go`
 
 ---
 
@@ -453,33 +561,39 @@ This document tracks the implementation work required to bring the Knowledge Gra
       VectorsCreated atomic.Uint32
       DocsBytes      atomic.Uint64
       LastCheckpoint time.Time
+      LastCheckpointVer SemanticVersion  // Uses semantic versioning
   }
   ```
 - [ ] `DeltaTracker.ShouldCheckpoint()` returns true when:
   - NodesCreated >= 50, OR
   - EdgesCreated + EdgesModified >= 200, OR
+  - VectorsCreated >= 50, OR
   - DocsBytes >= 512KB, OR
   - time.Since(LastCheckpoint) >= 10 minutes
-- [ ] `DeltaTracker.Reset()` zeros counters, updates LastCheckpoint
+- [ ] `DeltaTracker.Reset(newVersion SemanticVersion)` zeros counters, updates LastCheckpoint
 - [ ] Persisted to `delta/tracker.json` for crash recovery
+
+**Note**: Structure defined, needs implementation.
 
 ---
 
-### TODO 3.7: Implement Per-Version Document Storage
+### TODO 3.7: Implement Per-Version Document Storage ✓
 
 **Description**: Store documents as JSONL in version folders for session isolation.
 
 **Acceptance Criteria**:
-- [ ] `VersionDocStore.Write(versionID, doc)` appends to `versions/vNNN/docs/batch.jsonl`
-- [ ] JSONL format for efficient append-only writes:
+- [x] `VersionDocStore.WriteToVersion(version, doc)` appends to `versions/v1.0.0/docs/batch.jsonl`
+- [x] JSONL format for efficient append-only writes:
   ```jsonl
   {"id":"doc1","path":"/test.go","content":"...","indexed_at":"..."}
   {"id":"doc2","path":"/test2.go","content":"...","indexed_at":"..."}
   ```
-- [ ] `VersionDocStore.Read(versionID)` streams documents from version
-- [ ] `VersionDocStore.ReadAncestorChain(versions []uint32)` yields docs from all ancestors
+- [x] `VersionDocStore.ReadFromVersion(version)` streams documents from version
+- [x] `VersionDocStore.ReadFromAncestorChain()` yields docs from all ancestors (newest first)
 - [ ] Per-session document count tracked in DeltaTracker.DocsBytes
-- [ ] Benchmark: Write 1000 docs to version < 500ms
+- [x] Benchmark: Write 1000 docs to version < 500ms
+
+**Implementation**: `core/storage/sylkdir/version_store.go`
 
 ---
 
@@ -799,32 +913,41 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 ---
 
-### TODO 7.3: Implement CommitToGlobal
+### TODO 7.3: Implement CommitToGlobal ✓ (Partial)
 
-**Description**: Merge session data to global knowledge graph including documents.
+**Description**: Merge session data to global knowledge graph including documents. Session commits trigger **MAJOR** version bump on global KG.
 
 **Acceptance Criteria**:
-- [ ] `Session.Commit()` performs merge:
-  1. Collect all entities from ancestor chain (nodes, edges, vectors, **docs**)
-  2. For each node:
+- [x] `CommitToGlobal(cfg CommitConfig)` performs merge:
+  1. **Create pre-commit checkpoint** in session (minor bump: v1.x.y → v1.(x+1).0)
+  2. Collect all entities from ancestor chain (nodes, edges, vectors, **docs**)
+  3. For each node:
      - If canonical key exists in global → create supersession
      - Else → append to global
-  3. Update canonical key index
-  4. Resolve edge endpoints (map session IDs to global)
-  5. Append vectors to global IVF
-  6. **Index documents in global Bleve** (merge docs/batch.jsonl from all versions)
-  7. Apply deletions (mark deleted in global, remove from Bleve)
+  4. Update canonical key index
+  5. Write edges to global EdgeShardStore
+  6. Persist global indexes (nodes, edges, canonical keys)
+  7. **MAJOR bump on global version** via RegisterCommit (v2.0.0 → v3.0.0)
   8. Register in GlobalMeta.CommittedSessions
   9. Update session status to "committed"
-- [ ] Document merge:
-  ```go
-  docs := s.collectDocsFromVersions(ancestorChain)
-  for _, doc := range docs {
-      kg.GlobalBleve.Index(ctx, doc)
-  }
-  ```
-- [ ] Atomic: either all succeeds or nothing changes
-- [ ] Integration test: create session → add docs → commit → query from new session → finds docs in global Bleve
+- [x] Supersession handling:
+  - Old node gets `SupersededBy = newID`
+  - New node gets `Supersedes = oldID`
+  - Canonical index updated to point to new node
+- [x] `CommitResult` returns staged vectors and docs for caller to index
+- [x] Integration tests:
+  - `TestCommitToGlobal` — full commit with disk verification
+  - `TestCommitToGlobalSupersession` — canonical key conflict handling
+  - `TestCommitToGlobalDuplicate` — double-commit prevention
+  - `TestCommitToGlobalMultipleSessions` — sequential commits with version progression
+  - `TestCommitToGlobalFileLayout` — file system structure verification
+- [x] Benchmarks: `FullCommitWorkflow` (2.4ms/op), `CommitFileRoundTrip` (3.4ms/op)
+- [ ] Append vectors to global IVF (Phase 4/5 — vectors staged in CommitResult)
+- [ ] **Index documents in global Bleve** (Phase 4 — docs staged in CommitResult)
+- [ ] Apply deletions (mark deleted in global, remove from Bleve)
+- [ ] Atomic: WAL-based atomicity (Phase 7+ — currently ordered writes with crash-safe ordering)
+
+**Implementation**: `core/storage/sylkdir/commit.go`, `core/storage/sylkdir/commit_test.go`
 
 ---
 
@@ -908,18 +1031,31 @@ This document tracks the implementation work required to bring the Knowledge Gra
 
 ## Summary
 
-| Phase | TODOs | Focus |
-|-------|-------|-------|
-| **1. Filesystem** | 1.1-1.8 | .sylk directory, binary storage layout, session dirs |
-| **2. Data Structures** | 2.1-2.10 | Node/Edge compliance, binary formats |
-| **3. Session Storage** | 3.1-3.8 | Per-session versioning, delta tracking, **per-version docs** |
-| **4. Ingestion** | 4.1-4.6 | Boot index, embeddings, IVF build |
-| **5. Query Pipeline** | 5.1-5.5 | IVF adapter, wiring, agent skills |
-| **6. Query Visibility** | 6.1-6.2 | Session-aware queries, visibility rules |
-| **7. Session Ops** | 7.1-7.3 | Checkpoint, Checkout, CommitToGlobal **(incl. doc merge)** |
-| **8. Bootstrap & CLI** | 8.1-8.3 | Unified init, CLI commands, E2E test |
+| Phase | TODOs | Status | Focus |
+|-------|-------|--------|-------|
+| **1. Filesystem** | 1.1-1.9 | ✓ Complete | .sylk directory, binary storage, session dirs, **version data stores with semantic versioning** |
+| **2. Data Structures** | 2.1-2.10 | Partial | Node/Edge compliance, binary formats (2.6-2.10 done in version stores) |
+| **3. Session Storage** | 3.1-3.8 | Partial | Per-session versioning (3.1-3.5, 3.7 done), delta tracking pending |
+| **4. Ingestion** | 4.1-4.6 | Pending | Boot index, embeddings, IVF build |
+| **5. Query Pipeline** | 5.1-5.5 | Pending | IVF adapter, wiring, agent skills |
+| **6. Query Visibility** | 6.1-6.2 | Pending | Session-aware queries, visibility rules |
+| **7. Session Ops** | 7.1-7.3 | Partial | Checkpoint/Checkout done, CommitToGlobal partial (IVF/Bleve staging pending) |
+| **8. Bootstrap & CLI** | 8.1-8.3 | Pending | Unified init, CLI commands, E2E test |
 
-**Total: 43 TODOs**
+**Total: 44 TODOs (20 complete, 24 remaining)**
+
+### Key Implementation Notes
+
+1. **Semantic Versioning**: All version references use `SemanticVersion` (v1.0.0 format) instead of sequential IDs
+2. **CheckpointType**: `CheckpointMajor`, `CheckpointMinor`, `CheckpointPatch` for version bumping
+3. **VersionVectorStore**: Per-version vector storage with binary format `[NodeID:4][Dim:4][float32×Dim]`
+4. **SessionIngestion**: Integrates with existing ingestion pipeline, supports embedder for vector generation
+5. **Global Versioning Strategy**:
+   - Global KG maintains its own `SemanticVersion` (separate from session versions)
+   - **Session commit = MAJOR bump** on global (e.g., v2.0.0 → v3.0.0)
+   - Pre-commit creates **minor checkpoint** in session before merge (e.g., v1.2.3 → v1.3.0)
+   - Each major version in global history corresponds to one committed session
+   - GlobalMeta tracks: `Version`, `CommittedSessions[]{SessionID, FinalVersion, GlobalVersion, CommittedAt}`
 
 ---
 
@@ -928,8 +1064,8 @@ This document tracks the implementation work required to bring the Knowledge Gra
 The minimum path to "agents can query real data":
 
 ```
-1.1 (SylkDir)
-  → 1.6 (IVF paths)
+1.1 (SylkDir) ✓
+  → 1.6 (IVF paths) ✓
     → 4.5 (Wire embedder)
       → 4.2 (Boot indexer)
         → 4.6 (IVF build)
@@ -941,16 +1077,16 @@ The minimum path to "agents can query real data":
                     → 8.1 (Bootstrap)
 ```
 
-**Estimated critical path: 12 TODOs**
+**Critical path progress: 2/12 TODOs complete**
 
 ---
 
 ## Dependencies
 
 ```
-Phase 1 (Filesystem) ──┬──→ Phase 2 (Data Structures)
-                       │
-                       └──→ Phase 3 (Session Storage)
+Phase 1 (Filesystem) ✓ ──┬──→ Phase 2 (Data Structures) [partial]
+                         │
+                         └──→ Phase 3 (Session Storage) [partial]
 
 Phase 2 ──→ Phase 4 (Ingestion) ──→ Phase 5 (Query)
 
@@ -961,4 +1097,4 @@ Phase 5 + Phase 7 ──→ Phase 8 (Bootstrap)
 
 ---
 
-*Last updated: 2025-01-26*
+*Last updated: 2026-01-26*

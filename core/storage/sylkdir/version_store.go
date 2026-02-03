@@ -2,7 +2,6 @@
 package sylkdir
 
 import (
-	"bufio"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -13,21 +12,24 @@ import (
 	"sync"
 )
 
-// VersionNodeStore writes nodes to session version directories.
+// VersionNodeStore writes nodes to the session's shared data file with
+// per-version offset indexes for O(1) lookups and zero-copy checkpoints.
+//
+// Concurrency model: single-writer-multiple-reader.
+// Reads (ReadFromVersion, ReadAllFromVersion, Count) are lock-free
+// using sync.Map for index lookup and lock-free OffsetIndex operations.
+// Writes (WriteToVersion, WriteBatchToVersion) are serialized via writeMu.
 type VersionNodeStore struct {
 	session *Session
-	mu      sync.RWMutex
-
-	// Per-version indexes: version string -> nodeID -> offset
-	indexes map[string]map[uint32]int64
+	indexes sync.Map   // string -> *OffsetIndex
+	writeMu sync.Mutex
 }
 
 // NewVersionNodeStore creates a node store for the given session.
 func NewVersionNodeStore(sess *Session) *VersionNodeStore {
-	return &VersionNodeStore{
-		session: sess,
-		indexes: make(map[string]map[uint32]int64),
-	}
+	s := &VersionNodeStore{session: sess}
+	sess.RegisterNodeStore(s)
+	return s
 }
 
 // Write writes a node to the current HEAD version.
@@ -37,52 +39,27 @@ func (s *VersionNodeStore) Write(node *Node) error {
 
 // WriteToVersion writes a node to a specific version.
 func (s *VersionNodeStore) WriteToVersion(version SemanticVersion, node *Node) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	dataPath := filepath.Join(s.session.VersionPath(version), "nodes", "data.bin")
-
-	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(dataPath), 0755); err != nil {
-		return fmt.Errorf("create nodes dir: %w", err)
+	// WAL log before data write for crash safety.
+	if s.session.WAL != nil {
+		if _, err := s.session.WAL.LogNodeInsert(nodeToWALData(node)); err != nil {
+			return fmt.Errorf("wal log node: %w", err)
+		}
 	}
 
-	// Open file for append
-	f, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	record, err := marshalNodeRecord(node)
 	if err != nil {
-		return fmt.Errorf("open nodes file: %w", err)
+		return err
 	}
-	defer f.Close()
 
-	// Get current offset for index
-	offset, err := f.Seek(0, io.SeekEnd)
+	offset, err := s.session.NodeDataFile.Append(record)
 	if err != nil {
-		return fmt.Errorf("seek: %w", err)
+		return fmt.Errorf("append node: %w", err)
 	}
 
-	// Serialize and write node with size prefix
-	data, err := node.MarshalBinary()
-	if err != nil {
-		return fmt.Errorf("marshal node: %w", err)
-	}
-
-	// Write size prefix (4 bytes) + data
-	sizeBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(sizeBuf, uint32(len(data)))
-	if _, err := f.Write(sizeBuf); err != nil {
-		return fmt.Errorf("write size: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("write node: %w", err)
-	}
-
-	// Update in-memory index
-	vKey := version.String()
-	if s.indexes[vKey] == nil {
-		s.indexes[vKey] = make(map[uint32]int64)
-	}
-	s.indexes[vKey][node.ID] = offset
-
+	s.nodeIndex(version).Set(node.ID, offset)
 	return nil
 }
 
@@ -92,168 +69,199 @@ func (s *VersionNodeStore) WriteBatch(nodes []*Node) error {
 }
 
 // WriteBatchToVersion writes multiple nodes to a specific version.
+// WAL entries are batched with a single fsync for the entire batch.
 func (s *VersionNodeStore) WriteBatchToVersion(version SemanticVersion, nodes []*Node) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	dataPath := filepath.Join(s.session.VersionPath(version), "nodes", "data.bin")
-
-	if err := os.MkdirAll(filepath.Dir(dataPath), 0755); err != nil {
-		return fmt.Errorf("create nodes dir: %w", err)
+	if err := s.walLogNodeBatch(nodes); err != nil {
+		return err
 	}
+	return s.appendNodeBatch(version, nodes)
+}
 
-	f, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open nodes file: %w", err)
+// walLogNodeBatch writes all node WAL entries with a single sync.
+func (s *VersionNodeStore) walLogNodeBatch(nodes []*Node) error {
+	if s.session.WAL == nil {
+		return nil
 	}
-	defer f.Close()
-
-	offset, _ := f.Seek(0, io.SeekEnd)
-
-	vKey := version.String()
-	if s.indexes[vKey] == nil {
-		s.indexes[vKey] = make(map[uint32]int64)
+	walData := make([]*WALNodeData, len(nodes))
+	for i, node := range nodes {
+		walData[i] = nodeToWALData(node)
 	}
+	return s.session.WAL.LogNodeBatch(walData)
+}
 
-	sizeBuf := make([]byte, 4)
+// appendNodeBatch appends all nodes to the data file and updates the index.
+func (s *VersionNodeStore) appendNodeBatch(version SemanticVersion, nodes []*Node) error {
+	idx := s.nodeIndex(version)
 	for _, node := range nodes {
-		data, err := node.MarshalBinary()
-		if err != nil {
-			return fmt.Errorf("marshal node %d: %w", node.ID, err)
+		if err := s.appendSingleNode(idx, node); err != nil {
+			return err
 		}
-
-		// Write size prefix + data
-		binary.LittleEndian.PutUint32(sizeBuf, uint32(len(data)))
-		if _, err := f.Write(sizeBuf); err != nil {
-			return fmt.Errorf("write size: %w", err)
-		}
-		if _, err := f.Write(data); err != nil {
-			return fmt.Errorf("write node %d: %w", node.ID, err)
-		}
-		s.indexes[vKey][node.ID] = offset
-		offset += int64(4 + len(data))
 	}
+	return nil
+}
 
+// appendSingleNode marshals and appends one node to the data file.
+func (s *VersionNodeStore) appendSingleNode(idx *OffsetIndex, node *Node) error {
+	record, err := marshalNodeRecord(node)
+	if err != nil {
+		return err
+	}
+	offset, err := s.session.NodeDataFile.Append(record)
+	if err != nil {
+		return fmt.Errorf("append node %d: %w", node.ID, err)
+	}
+	idx.Set(node.ID, offset)
 	return nil
 }
 
 // ReadFromVersion reads a node from a specific version.
 func (s *VersionNodeStore) ReadFromVersion(version SemanticVersion, nodeID uint32) (*Node, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	dataPath := filepath.Join(s.session.VersionPath(version), "nodes", "data.bin")
-
-	f, err := os.Open(dataPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNodeNotFound
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	// Check in-memory index first
-	vKey := version.String()
-	if idx, ok := s.indexes[vKey]; ok {
-		if offset, ok := idx[nodeID]; ok {
-			return s.readNodeAt(f, offset)
-		}
+	idx := s.loadIndex(version)
+	if idx == nil {
+		return nil, ErrNodeNotFound
 	}
 
-	// Scan file for node
-	return s.scanForNode(f, nodeID)
+	offset, ok := idx.Get(nodeID)
+	if !ok {
+		return nil, ErrNodeNotFound
+	}
+
+	return readNodeAtOffset(s.session.NodeDataFile, offset)
 }
 
-// ReadFromAncestorChain reads a node from the ancestor chain (newest first).
+// ReadFromAncestorChain reads a node from HEAD version.
+// Since versions are cumulative snapshots, HEAD contains all ancestor data.
 func (s *VersionNodeStore) ReadFromAncestorChain(nodeID uint32) (*Node, error) {
-	chain := s.session.GetAncestorChain()
-
-	for _, version := range chain {
-		node, err := s.ReadFromVersion(version, nodeID)
-		if err == nil {
-			return node, nil
-		}
-		if err != ErrNodeNotFound {
-			return nil, err
-		}
-	}
-
-	return nil, ErrNodeNotFound
+	return s.ReadFromVersion(s.session.Manifest.Head, nodeID)
 }
 
 // ReadAllFromVersion reads all nodes from a specific version.
+// No dedup needed — the offset index guarantees one entry per ID.
 func (s *VersionNodeStore) ReadAllFromVersion(version SemanticVersion) ([]*Node, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	dataPath := filepath.Join(s.session.VersionPath(version), "nodes", "data.bin")
-
-	f, err := os.Open(dataPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []*Node{}, nil
-		}
-		return nil, err
+	idx := s.loadIndex(version)
+	if idx == nil {
+		return []*Node{}, nil
 	}
-	defer f.Close()
 
-	var nodes []*Node
-	for {
-		node, err := s.readNextNode(f)
-		if err == io.EOF {
-			break
-		}
+	nodes := make([]*Node, 0, idx.Count())
+	var readErr error
+	idx.ForEach(func(_ uint32, offset int64) bool {
+		node, err := readNodeAtOffset(s.session.NodeDataFile, offset)
 		if err != nil {
-			return nil, err
+			readErr = err
+			return false
 		}
 		nodes = append(nodes, node)
-	}
+		return true
+	})
 
-	return nodes, nil
+	return nodes, readErr
 }
 
-// ReadAllFromAncestorChain reads all nodes from the ancestor chain.
-// Returns nodes deduplicated by ID (newest version wins).
+// ReadAllFromAncestorChain reads all nodes from HEAD version.
 func (s *VersionNodeStore) ReadAllFromAncestorChain() ([]*Node, error) {
-	chain := s.session.GetAncestorChain()
-	seen := make(map[uint32]bool)
-	var result []*Node
-
-	for _, version := range chain {
-		nodes, err := s.ReadAllFromVersion(version)
-		if err != nil {
-			return nil, err
-		}
-		for _, node := range nodes {
-			if !seen[node.ID] {
-				seen[node.ID] = true
-				result = append(result, node)
-			}
-		}
-	}
-
-	return result, nil
+	return s.ReadAllFromVersion(s.session.Manifest.Head)
 }
 
-func (s *VersionNodeStore) readNodeAt(f *os.File, offset int64) (*Node, error) {
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
+// Count returns the number of nodes in HEAD version.
+func (s *VersionNodeStore) Count() int {
+	idx := s.loadIndex(s.session.Manifest.Head)
+	if idx == nil {
+		return 0
 	}
-	return s.readNextNode(f)
+	return int(idx.Count())
 }
 
-func (s *VersionNodeStore) readNextNode(f *os.File) (*Node, error) {
-	// Read size prefix (4 bytes)
+// SaveIndexes saves all in-memory offset indexes to disk.
+func (s *VersionNodeStore) SaveIndexes() error {
+	var saveErr error
+	s.indexes.Range(func(_, val any) bool {
+		idx, ok := val.(*OffsetIndex)
+		if !ok {
+			return true
+		}
+		if err := idx.Save(); err != nil {
+			saveErr = err
+			return false
+		}
+		return true
+	})
+	return saveErr
+}
+
+// RegisterIndex stores an OffsetIndex in the in-memory map for a version.
+// Used during checkpoint to register the cloned index.
+func (s *VersionNodeStore) RegisterIndex(version SemanticVersion, idx *OffsetIndex) {
+	s.indexes.Store(version.String(), idx)
+}
+
+// getInMemoryIndex returns the in-memory OffsetIndex for a version, or nil.
+func (s *VersionNodeStore) getInMemoryIndex(version SemanticVersion) *OffsetIndex {
+	if val, ok := s.indexes.Load(version.String()); ok {
+		return val.(*OffsetIndex)
+	}
+	return nil
+}
+
+// nodeIndex returns the OffsetIndex for a version, creating if needed.
+// Called under writeMu; uses sync.Map for storage.
+func (s *VersionNodeStore) nodeIndex(version SemanticVersion) *OffsetIndex {
+	vKey := version.String()
+	if val, ok := s.indexes.Load(vKey); ok {
+		return val.(*OffsetIndex)
+	}
+	path := s.session.NodeIndexPath(version)
+	idx, err := LoadOffsetIndex(path)
+	if err != nil {
+		idx = NewOffsetIndex(path, offsetIndexMinCapacity)
+	}
+	s.indexes.Store(vKey, idx)
+	return idx
+}
+
+// loadIndex returns the OffsetIndex for a version (read path). Lock-free.
+// Caches loaded indexes via sync.Map.LoadOrStore.
+func (s *VersionNodeStore) loadIndex(version SemanticVersion) *OffsetIndex {
+	vKey := version.String()
+	if val, ok := s.indexes.Load(vKey); ok {
+		return val.(*OffsetIndex)
+	}
+	path := s.session.NodeIndexPath(version)
+	idx, err := LoadOffsetIndex(path)
+	if err != nil {
+		return nil
+	}
+	actual, _ := s.indexes.LoadOrStore(vKey, idx)
+	return actual.(*OffsetIndex)
+}
+
+// marshalNodeRecord serializes a node as [size:4][binary_data].
+func marshalNodeRecord(node *Node) ([]byte, error) {
+	data, err := node.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("marshal node: %w", err)
+	}
+	record := make([]byte, 4+len(data))
+	binary.LittleEndian.PutUint32(record[0:4], uint32(len(data)))
+	copy(record[4:], data)
+	return record, nil
+}
+
+// readNodeAtOffset reads a node from a shared data file at the given offset.
+func readNodeAtOffset(sdf *SharedDataFile, offset int64) (*Node, error) {
+	// Read size prefix.
 	sizeBuf := make([]byte, 4)
-	if _, err := io.ReadFull(f, sizeBuf); err != nil {
+	if _, err := sdf.ReadAt(sizeBuf, offset); err != nil {
 		return nil, err
 	}
 	size := binary.LittleEndian.Uint32(sizeBuf)
 
-	// Read node data
+	// Read node data.
 	data := make([]byte, size)
-	if _, err := io.ReadFull(f, data); err != nil {
+	if _, err := sdf.ReadAt(data, offset+4); err != nil {
 		return nil, err
 	}
 
@@ -261,37 +269,7 @@ func (s *VersionNodeStore) readNextNode(f *os.File) (*Node, error) {
 	if err := node.UnmarshalBinary(data); err != nil {
 		return nil, err
 	}
-
 	return node, nil
-}
-
-func (s *VersionNodeStore) scanForNode(f *os.File, nodeID uint32) (*Node, error) {
-	f.Seek(0, io.SeekStart)
-
-	for {
-		node, err := s.readNextNode(f)
-		if err == io.EOF {
-			return nil, ErrNodeNotFound
-		}
-		if err != nil {
-			return nil, err
-		}
-		if node.ID == nodeID {
-			return node, nil
-		}
-	}
-}
-
-// Count returns the number of nodes in HEAD version.
-func (s *VersionNodeStore) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	vKey := s.session.Manifest.Head.String()
-	if idx, ok := s.indexes[vKey]; ok {
-		return len(idx)
-	}
-	return 0
 }
 
 // VersionEdgeStore writes edges to session version directories.
@@ -323,6 +301,13 @@ func (s *VersionEdgeStore) Write(edge *Edge) error {
 func (s *VersionEdgeStore) WriteToVersion(version SemanticVersion, edge *Edge) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// WAL log before .bin write for crash safety.
+	if s.session.WAL != nil {
+		if _, err := s.session.WAL.LogEdgeInsert(edgeToWALData(edge)); err != nil {
+			return fmt.Errorf("wal log edge: %w", err)
+		}
+	}
 
 	dataPath := filepath.Join(s.session.VersionPath(version), "edges", "data.bin")
 
@@ -358,10 +343,31 @@ func (s *VersionEdgeStore) WriteBatch(edges []*Edge) error {
 }
 
 // WriteBatchToVersion writes multiple edges to a specific version.
+// WAL entries are batched with a single fsync for the entire batch.
 func (s *VersionEdgeStore) WriteBatchToVersion(version SemanticVersion, edges []*Edge) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.walLogEdgeBatch(edges); err != nil {
+		return err
+	}
+	return s.appendEdgeBatch(version, edges)
+}
+
+// walLogEdgeBatch writes all edge WAL entries with a single sync.
+func (s *VersionEdgeStore) walLogEdgeBatch(edges []*Edge) error {
+	if s.session.WAL == nil {
+		return nil
+	}
+	walData := make([]*WALEdgeData, len(edges))
+	for i, edge := range edges {
+		walData[i] = edgeToWALData(edge)
+	}
+	return s.session.WAL.LogEdgeBatch(walData)
+}
+
+// appendEdgeBatch writes all edges to the data file and updates indexes.
+func (s *VersionEdgeStore) appendEdgeBatch(version SemanticVersion, edges []*Edge) error {
 	dataPath := filepath.Join(s.session.VersionPath(version), "edges", "data.bin")
 
 	if err := os.MkdirAll(filepath.Dir(dataPath), 0755); err != nil {
@@ -401,6 +407,8 @@ func (s *VersionEdgeStore) ensureIndexes(vKey string) {
 }
 
 // GetOutgoingFromVersion gets all outgoing edges from a node in a specific version.
+// With cumulative snapshots, always scans the file since the in-memory index
+// may not include edges copied from parent versions during checkpoint.
 func (s *VersionEdgeStore) GetOutgoingFromVersion(version SemanticVersion, nodeID uint32) ([]*Edge, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -416,39 +424,14 @@ func (s *VersionEdgeStore) GetOutgoingFromVersion(version SemanticVersion, nodeI
 	}
 	defer f.Close()
 
-	// Use index if available
-	vKey := version.String()
-	if idx, ok := s.outgoing[vKey]; ok {
-		if offsets, ok := idx[nodeID]; ok {
-			return s.readEdgesAtOffsets(f, offsets)
-		}
-	}
-
-	// Scan file
+	// Always scan file for correctness with cumulative snapshots
 	return s.scanEdgesWithSource(f, nodeID)
 }
 
-// GetOutgoingFromAncestorChain gets all outgoing edges from the ancestor chain.
+// GetOutgoingFromAncestorChain gets all outgoing edges from HEAD version.
+// Since versions are cumulative snapshots, HEAD contains all ancestor data.
 func (s *VersionEdgeStore) GetOutgoingFromAncestorChain(nodeID uint32) ([]*Edge, error) {
-	chain := s.session.GetAncestorChain()
-	seen := make(map[EdgeKey]bool)
-	var result []*Edge
-
-	for _, version := range chain {
-		edges, err := s.GetOutgoingFromVersion(version, nodeID)
-		if err != nil {
-			return nil, err
-		}
-		for _, edge := range edges {
-			key := edge.EdgeKey()
-			if !seen[key] {
-				seen[key] = true
-				result = append(result, edge)
-			}
-		}
-	}
-
-	return result, nil
+	return s.GetOutgoingFromVersion(s.session.Manifest.Head, nodeID)
 }
 
 // GetIncomingFromVersion gets all incoming edges to a node in a specific version.
@@ -477,30 +460,8 @@ func (s *VersionEdgeStore) GetIncomingFromVersion(version SemanticVersion, nodeI
 	return s.scanEdgesWithTarget(f, nodeID)
 }
 
-// GetIncomingFromAncestorChain gets all incoming edges from the ancestor chain.
-func (s *VersionEdgeStore) GetIncomingFromAncestorChain(nodeID uint32) ([]*Edge, error) {
-	chain := s.session.GetAncestorChain()
-	seen := make(map[EdgeKey]bool)
-	var result []*Edge
-
-	for _, version := range chain {
-		edges, err := s.GetIncomingFromVersion(version, nodeID)
-		if err != nil {
-			return nil, err
-		}
-		for _, edge := range edges {
-			key := edge.EdgeKey()
-			if !seen[key] {
-				seen[key] = true
-				result = append(result, edge)
-			}
-		}
-	}
-
-	return result, nil
-}
-
 // ReadAllFromVersion reads all edges from a specific version.
+// With cumulative snapshots, deduplicates by EdgeKey (last occurrence wins).
 func (s *VersionEdgeStore) ReadAllFromVersion(version SemanticVersion) ([]*Edge, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -516,7 +477,9 @@ func (s *VersionEdgeStore) ReadAllFromVersion(version SemanticVersion) ([]*Edge,
 	}
 	defer f.Close()
 
-	var edges []*Edge
+	// Deduplicate by EdgeKey (last occurrence wins for cumulative snapshots)
+	edgeMap := make(map[EdgeKey]*Edge)
+	var order []EdgeKey
 	buf := make([]byte, EdgeRecordSize)
 
 	for {
@@ -530,33 +493,25 @@ func (s *VersionEdgeStore) ReadAllFromVersion(version SemanticVersion) ([]*Edge,
 		if err := edge.UnmarshalBinary(buf); err != nil {
 			return nil, err
 		}
-		edges = append(edges, edge)
+		key := edge.EdgeKey()
+		if _, seen := edgeMap[key]; !seen {
+			order = append(order, key)
+		}
+		edgeMap[key] = edge
 	}
 
+	// Return in order of first appearance
+	edges := make([]*Edge, len(order))
+	for i, key := range order {
+		edges[i] = edgeMap[key]
+	}
 	return edges, nil
 }
 
-// ReadAllFromAncestorChain reads all edges from the ancestor chain.
+// ReadAllFromAncestorChain reads all edges from HEAD version.
+// Since versions are cumulative snapshots, HEAD contains all ancestor data.
 func (s *VersionEdgeStore) ReadAllFromAncestorChain() ([]*Edge, error) {
-	chain := s.session.GetAncestorChain()
-	seen := make(map[EdgeKey]bool)
-	var result []*Edge
-
-	for _, version := range chain {
-		edges, err := s.ReadAllFromVersion(version)
-		if err != nil {
-			return nil, err
-		}
-		for _, edge := range edges {
-			key := edge.EdgeKey()
-			if !seen[key] {
-				seen[key] = true
-				result = append(result, edge)
-			}
-		}
-	}
-
-	return result, nil
+	return s.ReadAllFromVersion(s.session.Manifest.Head)
 }
 
 func (s *VersionEdgeStore) readEdgesAtOffsets(f *os.File, offsets []int64) ([]*Edge, error) {
@@ -653,17 +608,24 @@ type VersionDocument struct {
 	IndexedAt int64  `json:"indexed_at"`
 }
 
-// VersionDocStore writes documents to session version directories as JSONL.
+// VersionDocStore writes documents to the session's shared doc data file with
+// per-version offset indexes for O(1) lookups and zero-copy checkpoints.
+// Binary format per record: [Size:4][JSON:Size]
+//
+// Concurrency model: single-writer-multiple-reader.
+// Reads are lock-free using sync.Map and lock-free OffsetIndex operations.
+// Writes are serialized via writeMu.
 type VersionDocStore struct {
 	session *Session
-	mu      sync.RWMutex
+	indexes sync.Map   // string -> *OffsetIndex
+	writeMu sync.Mutex
 }
 
 // NewVersionDocStore creates a document store for the given session.
 func NewVersionDocStore(sess *Session) *VersionDocStore {
-	return &VersionDocStore{
-		session: sess,
-	}
+	s := &VersionDocStore{session: sess}
+	sess.RegisterDocStore(s)
+	return s
 }
 
 // Write writes a document to the current HEAD version.
@@ -673,30 +635,28 @@ func (s *VersionDocStore) Write(doc *VersionDocument) error {
 
 // WriteToVersion writes a document to a specific version.
 func (s *VersionDocStore) WriteToVersion(version SemanticVersion, doc *VersionDocument) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	docsPath := filepath.Join(s.session.VersionPath(version), "docs", "batch.jsonl")
-
-	if err := os.MkdirAll(filepath.Dir(docsPath), 0755); err != nil {
-		return fmt.Errorf("create docs dir: %w", err)
+	// WAL log before data write for crash safety.
+	if s.session.WAL != nil {
+		if _, err := s.session.WAL.LogDocInsert(docToWALData(doc)); err != nil {
+			return fmt.Errorf("wal log doc: %w", err)
+		}
 	}
 
-	f, err := os.OpenFile(docsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	record, err := marshalDocRecord(doc)
 	if err != nil {
-		return fmt.Errorf("open docs file: %w", err)
+		return err
 	}
-	defer f.Close()
 
-	data, err := json.Marshal(doc)
+	offset, err := s.session.DocDataFile.Append(record)
 	if err != nil {
-		return fmt.Errorf("marshal doc: %w", err)
+		return fmt.Errorf("append doc: %w", err)
 	}
 
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("write doc: %w", err)
-	}
-
+	docID := s.session.DocIDMap.GetOrAssign(doc.ID)
+	s.docIndex(version).Set(docID, offset)
 	return nil
 }
 
@@ -706,112 +666,199 @@ func (s *VersionDocStore) WriteBatch(docs []*VersionDocument) error {
 }
 
 // WriteBatchToVersion writes multiple documents to a specific version.
+// WAL entries are batched with a single fsync for the entire batch.
 func (s *VersionDocStore) WriteBatchToVersion(version SemanticVersion, docs []*VersionDocument) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	docsPath := filepath.Join(s.session.VersionPath(version), "docs", "batch.jsonl")
-
-	if err := os.MkdirAll(filepath.Dir(docsPath), 0755); err != nil {
-		return fmt.Errorf("create docs dir: %w", err)
+	if err := s.walLogDocBatch(docs); err != nil {
+		return err
 	}
+	return s.appendDocBatch(version, docs)
+}
 
-	f, err := os.OpenFile(docsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open docs file: %w", err)
+// walLogDocBatch writes all doc WAL entries with a single sync.
+func (s *VersionDocStore) walLogDocBatch(docs []*VersionDocument) error {
+	if s.session.WAL == nil {
+		return nil
 	}
-	defer f.Close()
+	walData := make([]*WALDocData, len(docs))
+	for i, doc := range docs {
+		walData[i] = docToWALData(doc)
+	}
+	return s.session.WAL.LogDocBatch(walData)
+}
 
+// appendDocBatch appends all docs to the data file and updates the index.
+func (s *VersionDocStore) appendDocBatch(version SemanticVersion, docs []*VersionDocument) error {
+	idx := s.docIndex(version)
 	for _, doc := range docs {
-		data, err := json.Marshal(doc)
-		if err != nil {
-			return fmt.Errorf("marshal doc: %w", err)
-		}
-		if _, err := f.Write(append(data, '\n')); err != nil {
-			return fmt.Errorf("write doc: %w", err)
+		if err := s.appendSingleDoc(idx, doc); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
+// appendSingleDoc marshals and appends one document to the data file.
+func (s *VersionDocStore) appendSingleDoc(idx *OffsetIndex, doc *VersionDocument) error {
+	record, err := marshalDocRecord(doc)
+	if err != nil {
+		return err
+	}
+	offset, err := s.session.DocDataFile.Append(record)
+	if err != nil {
+		return fmt.Errorf("append doc %s: %w", doc.ID, err)
+	}
+	idx.Set(s.session.DocIDMap.GetOrAssign(doc.ID), offset)
 	return nil
 }
 
 // ReadFromVersion reads all documents from a specific version.
+// No dedup needed — the offset index guarantees one entry per doc ID.
 func (s *VersionDocStore) ReadFromVersion(version SemanticVersion) ([]*VersionDocument, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	docsPath := filepath.Join(s.session.VersionPath(version), "docs", "batch.jsonl")
-
-	f, err := os.Open(docsPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []*VersionDocument{}, nil
-		}
-		return nil, err
+	idx := s.loadDocIndex(version)
+	if idx == nil {
+		return []*VersionDocument{}, nil
 	}
-	defer f.Close()
 
-	var docs []*VersionDocument
-	scanner := bufio.NewScanner(f)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		doc := &VersionDocument{}
-		if err := json.Unmarshal(line, doc); err != nil {
-			return nil, fmt.Errorf("parse doc: %w", err)
+	docs := make([]*VersionDocument, 0, idx.Count())
+	var readErr error
+	idx.ForEach(func(_ uint32, offset int64) bool {
+		doc, err := readDocAtOffset(s.session.DocDataFile, offset)
+		if err != nil {
+			readErr = err
+			return false
 		}
 		docs = append(docs, doc)
-	}
+		return true
+	})
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return docs, nil
+	return docs, readErr
 }
 
-// ReadFromAncestorChain reads all documents from the ancestor chain.
-// Returns documents deduplicated by ID (newest version wins).
-func (s *VersionDocStore) ReadFromAncestorChain() ([]*VersionDocument, error) {
-	chain := s.session.GetAncestorChain()
-	seen := make(map[string]bool)
-	var result []*VersionDocument
-
-	for _, version := range chain {
-		docs, err := s.ReadFromVersion(version)
-		if err != nil {
-			return nil, err
-		}
-		for _, doc := range docs {
-			if !seen[doc.ID] {
-				seen[doc.ID] = true
-				result = append(result, doc)
-			}
-		}
+// ReadByDocRef reads a single document by its uint32 DocRef from a version.
+// DocRef is the key assigned by DocIDMap and stored in the OffsetIndex.
+func (s *VersionDocStore) ReadByDocRef(version SemanticVersion, docRef uint32) (*VersionDocument, error) {
+	idx := s.loadDocIndex(version)
+	if idx == nil {
+		return nil, fmt.Errorf("sylkdir: no doc index for version %s", version.String())
 	}
+	offset, ok := idx.Get(docRef)
+	if !ok {
+		return nil, fmt.Errorf("sylkdir: doc ref %d not found", docRef)
+	}
+	return readDocAtOffset(s.session.DocDataFile, offset)
+}
 
-	return result, nil
+// ReadFromAncestorChain reads all documents from HEAD version.
+// Since versions are cumulative snapshots, HEAD contains all ancestor data.
+func (s *VersionDocStore) ReadFromAncestorChain() ([]*VersionDocument, error) {
+	return s.ReadFromVersion(s.session.Manifest.Head)
 }
 
 // Count returns the number of documents in HEAD version.
 func (s *VersionDocStore) Count() (int, error) {
-	docs, err := s.ReadFromVersion(s.session.Manifest.Head)
-	if err != nil {
-		return 0, err
+	idx := s.loadDocIndex(s.session.Manifest.Head)
+	if idx == nil {
+		return 0, nil
 	}
-	return len(docs), nil
+	return int(idx.Count()), nil
 }
 
-// CountInAncestorChain returns the total unique documents in ancestor chain.
-func (s *VersionDocStore) CountInAncestorChain() (int, error) {
-	docs, err := s.ReadFromAncestorChain()
-	if err != nil {
-		return 0, err
+// SaveIndexes saves all in-memory offset indexes to disk.
+func (s *VersionDocStore) SaveIndexes() error {
+	var saveErr error
+	s.indexes.Range(func(_, val any) bool {
+		idx, ok := val.(*OffsetIndex)
+		if !ok {
+			return true
+		}
+		if err := idx.Save(); err != nil {
+			saveErr = err
+			return false
+		}
+		return true
+	})
+	return saveErr
+}
+
+// RegisterIndex stores an OffsetIndex in the in-memory map for a version.
+// Used during checkpoint to register the cloned index.
+func (s *VersionDocStore) RegisterIndex(version SemanticVersion, idx *OffsetIndex) {
+	s.indexes.Store(version.String(), idx)
+}
+
+// getInMemoryIndex returns the in-memory OffsetIndex for a version, or nil.
+func (s *VersionDocStore) getInMemoryIndex(version SemanticVersion) *OffsetIndex {
+	if val, ok := s.indexes.Load(version.String()); ok {
+		return val.(*OffsetIndex)
 	}
-	return len(docs), nil
+	return nil
+}
+
+// docIndex returns the OffsetIndex for a version, creating if needed.
+// Called under writeMu; uses sync.Map for storage.
+func (s *VersionDocStore) docIndex(version SemanticVersion) *OffsetIndex {
+	vKey := version.String()
+	if val, ok := s.indexes.Load(vKey); ok {
+		return val.(*OffsetIndex)
+	}
+	path := s.session.DocIndexPath(version)
+	idx, err := LoadOffsetIndex(path)
+	if err != nil {
+		idx = NewOffsetIndex(path, offsetIndexMinCapacity)
+	}
+	s.indexes.Store(vKey, idx)
+	return idx
+}
+
+// loadDocIndex returns the OffsetIndex for a version (read path). Lock-free.
+// Caches loaded indexes via sync.Map.LoadOrStore.
+func (s *VersionDocStore) loadDocIndex(version SemanticVersion) *OffsetIndex {
+	vKey := version.String()
+	if val, ok := s.indexes.Load(vKey); ok {
+		return val.(*OffsetIndex)
+	}
+	path := s.session.DocIndexPath(version)
+	idx, err := LoadOffsetIndex(path)
+	if err != nil {
+		return nil
+	}
+	actual, _ := s.indexes.LoadOrStore(vKey, idx)
+	return actual.(*OffsetIndex)
+}
+
+// marshalDocRecord serializes a document as [size:4][json_data].
+func marshalDocRecord(doc *VersionDocument) ([]byte, error) {
+	data, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal doc: %w", err)
+	}
+	record := make([]byte, 4+len(data))
+	binary.LittleEndian.PutUint32(record[0:4], uint32(len(data)))
+	copy(record[4:], data)
+	return record, nil
+}
+
+// readDocAtOffset reads a document from a shared data file at the given offset.
+func readDocAtOffset(sdf *SharedDataFile, offset int64) (*VersionDocument, error) {
+	sizeBuf := make([]byte, 4)
+	if _, err := sdf.ReadAt(sizeBuf, offset); err != nil {
+		return nil, err
+	}
+	size := binary.LittleEndian.Uint32(sizeBuf)
+
+	data := make([]byte, size)
+	if _, err := sdf.ReadAt(data, offset+4); err != nil {
+		return nil, err
+	}
+
+	doc := &VersionDocument{}
+	if err := json.Unmarshal(data, doc); err != nil {
+		return nil, err
+	}
+	return doc, nil
 }
 
 // VersionVector represents a vector embedding for a node.
@@ -820,22 +867,24 @@ type VersionVector struct {
 	Vector []float32
 }
 
-// VersionVectorStore writes vectors to session version directories.
+// VersionVectorStore writes vectors to the session's shared data file with
+// per-version offset indexes for O(1) lookups and zero-copy checkpoints.
 // Binary format per record: [NodeID:4][Dim:4][Vector:Dim*4]
+//
+// Concurrency model: single-writer-multiple-reader.
+// Reads are lock-free using sync.Map and lock-free OffsetIndex operations.
+// Writes are serialized via writeMu.
 type VersionVectorStore struct {
 	session *Session
-	mu      sync.RWMutex
-
-	// Per-version index: version string -> nodeID -> offset
-	indexes map[string]map[uint32]int64
+	indexes sync.Map   // string -> *OffsetIndex
+	writeMu sync.Mutex
 }
 
 // NewVersionVectorStore creates a vector store for the given session.
 func NewVersionVectorStore(sess *Session) *VersionVectorStore {
-	return &VersionVectorStore{
-		session: sess,
-		indexes: make(map[string]map[uint32]int64),
-	}
+	s := &VersionVectorStore{session: sess}
+	sess.RegisterVectorStore(s)
+	return s
 }
 
 // Write writes a vector to the current HEAD version.
@@ -845,50 +894,23 @@ func (s *VersionVectorStore) Write(vec *VersionVector) error {
 
 // WriteToVersion writes a vector to a specific version.
 func (s *VersionVectorStore) WriteToVersion(version SemanticVersion, vec *VersionVector) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	dataPath := filepath.Join(s.session.VersionPath(version), "vectors", "data.bin")
-
-	if err := os.MkdirAll(filepath.Dir(dataPath), 0755); err != nil {
-		return fmt.Errorf("create vectors dir: %w", err)
-	}
-
-	f, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open vectors file: %w", err)
-	}
-	defer f.Close()
-
-	offset, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return fmt.Errorf("seek: %w", err)
-	}
-
-	// Write: [NodeID:4][Dim:4][Vector:Dim*4]
-	header := make([]byte, 8)
-	binary.LittleEndian.PutUint32(header[0:4], vec.NodeID)
-	binary.LittleEndian.PutUint32(header[4:8], uint32(len(vec.Vector)))
-	if _, err := f.Write(header); err != nil {
-		return fmt.Errorf("write header: %w", err)
-	}
-
-	// Write vector data as float32 array
-	for _, v := range vec.Vector {
-		buf := make([]byte, 4)
-		binary.LittleEndian.PutUint32(buf, uint32FromFloat32(v))
-		if _, err := f.Write(buf); err != nil {
-			return fmt.Errorf("write vector: %w", err)
+	// WAL log before data write for crash safety.
+	if s.session.WAL != nil {
+		if _, err := s.session.WAL.LogVectorInsert(vectorToWALData(vec)); err != nil {
+			return fmt.Errorf("wal log vector: %w", err)
 		}
 	}
 
-	// Update index
-	vKey := version.String()
-	if s.indexes[vKey] == nil {
-		s.indexes[vKey] = make(map[uint32]int64)
+	record := marshalVectorRecord(vec)
+	offset, err := s.session.VectorDataFile.Append(record)
+	if err != nil {
+		return fmt.Errorf("append vector: %w", err)
 	}
-	s.indexes[vKey][vec.NodeID] = offset
 
+	s.vectorIndex(version).Set(vec.NodeID, offset)
 	return nil
 }
 
@@ -898,254 +920,207 @@ func (s *VersionVectorStore) WriteBatch(vecs []*VersionVector) error {
 }
 
 // WriteBatchToVersion writes multiple vectors to a specific version.
+// WAL entries are batched with a single fsync for the entire batch.
 func (s *VersionVectorStore) WriteBatchToVersion(version SemanticVersion, vecs []*VersionVector) error {
 	if len(vecs) == 0 {
 		return nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	dataPath := filepath.Join(s.session.VersionPath(version), "vectors", "data.bin")
-
-	if err := os.MkdirAll(filepath.Dir(dataPath), 0755); err != nil {
-		return fmt.Errorf("create vectors dir: %w", err)
+	if err := s.walLogVectorBatch(vecs); err != nil {
+		return err
 	}
+	return s.appendVectorBatch(version, vecs)
+}
 
-	f, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open vectors file: %w", err)
+// walLogVectorBatch writes all vector WAL entries with a single sync.
+func (s *VersionVectorStore) walLogVectorBatch(vecs []*VersionVector) error {
+	if s.session.WAL == nil {
+		return nil
 	}
-	defer f.Close()
-
-	vKey := version.String()
-	if s.indexes[vKey] == nil {
-		s.indexes[vKey] = make(map[uint32]int64)
+	walData := make([]*WALVectorData, len(vecs))
+	for i, vec := range vecs {
+		walData[i] = vectorToWALData(vec)
 	}
+	return s.session.WAL.LogVectorBatch(walData)
+}
 
+// appendVectorBatch appends all vectors to the data file and updates the index.
+func (s *VersionVectorStore) appendVectorBatch(version SemanticVersion, vecs []*VersionVector) error {
+	idx := s.vectorIndex(version)
 	for _, vec := range vecs {
-		offset, err := f.Seek(0, io.SeekEnd)
-		if err != nil {
-			return fmt.Errorf("seek: %w", err)
+		if err := s.appendSingleVector(idx, vec); err != nil {
+			return err
 		}
-
-		// Write header
-		header := make([]byte, 8)
-		binary.LittleEndian.PutUint32(header[0:4], vec.NodeID)
-		binary.LittleEndian.PutUint32(header[4:8], uint32(len(vec.Vector)))
-		if _, err := f.Write(header); err != nil {
-			return fmt.Errorf("write header: %w", err)
-		}
-
-		// Write vector data
-		for _, v := range vec.Vector {
-			buf := make([]byte, 4)
-			binary.LittleEndian.PutUint32(buf, uint32FromFloat32(v))
-			if _, err := f.Write(buf); err != nil {
-				return fmt.Errorf("write vector: %w", err)
-			}
-		}
-
-		s.indexes[vKey][vec.NodeID] = offset
 	}
+	return nil
+}
 
+// appendSingleVector marshals and appends one vector to the data file.
+func (s *VersionVectorStore) appendSingleVector(idx *OffsetIndex, vec *VersionVector) error {
+	record := marshalVectorRecord(vec)
+	offset, err := s.session.VectorDataFile.Append(record)
+	if err != nil {
+		return fmt.Errorf("append vector %d: %w", vec.NodeID, err)
+	}
+	idx.Set(vec.NodeID, offset)
 	return nil
 }
 
 // GetFromVersion reads a vector by node ID from a specific version.
 func (s *VersionVectorStore) GetFromVersion(version SemanticVersion, nodeID uint32) (*VersionVector, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	dataPath := filepath.Join(s.session.VersionPath(version), "vectors", "data.bin")
-
-	f, err := os.Open(dataPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	// Try index first
-	vKey := version.String()
-	if idx, ok := s.indexes[vKey]; ok {
-		if offset, ok := idx[nodeID]; ok {
-			return s.readVectorAtOffset(f, offset)
-		}
+	idx := s.loadVectorIndex(version)
+	if idx == nil {
+		return nil, nil
 	}
 
-	// Scan file
-	return s.scanForNodeID(f, nodeID)
+	offset, ok := idx.Get(nodeID)
+	if !ok {
+		return nil, nil
+	}
+
+	return readVectorAtOffset(s.session.VectorDataFile, offset)
 }
 
-// GetFromAncestorChain reads a vector by node ID from the ancestor chain.
-// Returns the first (newest) version found.
+// GetFromAncestorChain reads a vector by node ID from HEAD version.
 func (s *VersionVectorStore) GetFromAncestorChain(nodeID uint32) (*VersionVector, error) {
-	chain := s.session.GetAncestorChain()
-
-	for _, version := range chain {
-		vec, err := s.GetFromVersion(version, nodeID)
-		if err != nil {
-			return nil, err
-		}
-		if vec != nil {
-			return vec, nil
-		}
-	}
-
-	return nil, nil
+	return s.GetFromVersion(s.session.Manifest.Head, nodeID)
 }
 
 // ReadAllFromVersion reads all vectors from a specific version.
+// No dedup needed — the offset index guarantees one entry per node ID.
 func (s *VersionVectorStore) ReadAllFromVersion(version SemanticVersion) ([]*VersionVector, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	dataPath := filepath.Join(s.session.VersionPath(version), "vectors", "data.bin")
-
-	f, err := os.Open(dataPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []*VersionVector{}, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	var vectors []*VersionVector
-	header := make([]byte, 8)
-
-	for {
-		if _, err := io.ReadFull(f, header); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-
-		nodeID := binary.LittleEndian.Uint32(header[0:4])
-		dim := binary.LittleEndian.Uint32(header[4:8])
-
-		vec := make([]float32, dim)
-		buf := make([]byte, 4)
-		for i := range vec {
-			if _, err := io.ReadFull(f, buf); err != nil {
-				return nil, err
-			}
-			vec[i] = float32FromUint32(binary.LittleEndian.Uint32(buf))
-		}
-
-		vectors = append(vectors, &VersionVector{
-			NodeID: nodeID,
-			Vector: vec,
-		})
+	idx := s.loadVectorIndex(version)
+	if idx == nil {
+		return []*VersionVector{}, nil
 	}
 
-	return vectors, nil
+	vectors := make([]*VersionVector, 0, idx.Count())
+	var readErr error
+	idx.ForEach(func(_ uint32, offset int64) bool {
+		vec, err := readVectorAtOffset(s.session.VectorDataFile, offset)
+		if err != nil {
+			readErr = err
+			return false
+		}
+		vectors = append(vectors, vec)
+		return true
+	})
+
+	return vectors, readErr
 }
 
-// ReadAllFromAncestorChain reads all vectors from the ancestor chain.
-// Deduplicates by nodeID (newest version wins).
+// ReadAllFromAncestorChain reads all vectors from HEAD version.
 func (s *VersionVectorStore) ReadAllFromAncestorChain() ([]*VersionVector, error) {
-	chain := s.session.GetAncestorChain()
-	seen := make(map[uint32]bool)
-	var result []*VersionVector
-
-	for _, version := range chain {
-		vecs, err := s.ReadAllFromVersion(version)
-		if err != nil {
-			return nil, err
-		}
-		for _, vec := range vecs {
-			if !seen[vec.NodeID] {
-				seen[vec.NodeID] = true
-				result = append(result, vec)
-			}
-		}
-	}
-
-	return result, nil
+	return s.ReadAllFromVersion(s.session.Manifest.Head)
 }
 
 // Count returns the number of vectors in HEAD version.
 func (s *VersionVectorStore) Count() (int, error) {
-	vecs, err := s.ReadAllFromVersion(s.session.Manifest.Head)
-	if err != nil {
-		return 0, err
+	idx := s.loadVectorIndex(s.session.Manifest.Head)
+	if idx == nil {
+		return 0, nil
 	}
-	return len(vecs), nil
+	return int(idx.Count()), nil
 }
 
-// CountInAncestorChainVectors returns the total unique vectors in ancestor chain.
-func (s *VersionVectorStore) CountInAncestorChainVectors() (int, error) {
-	vecs, err := s.ReadAllFromAncestorChain()
-	if err != nil {
-		return 0, err
-	}
-	return len(vecs), nil
+// SaveIndexes saves all in-memory offset indexes to disk.
+func (s *VersionVectorStore) SaveIndexes() error {
+	var saveErr error
+	s.indexes.Range(func(_, val any) bool {
+		idx, ok := val.(*OffsetIndex)
+		if !ok {
+			return true
+		}
+		if err := idx.Save(); err != nil {
+			saveErr = err
+			return false
+		}
+		return true
+	})
+	return saveErr
 }
 
-func (s *VersionVectorStore) readVectorAtOffset(f *os.File, offset int64) (*VersionVector, error) {
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
-	}
+// RegisterIndex stores an OffsetIndex in the in-memory map for a version.
+func (s *VersionVectorStore) RegisterIndex(version SemanticVersion, idx *OffsetIndex) {
+	s.indexes.Store(version.String(), idx)
+}
 
+// getInMemoryIndex returns the in-memory OffsetIndex for a version, or nil.
+func (s *VersionVectorStore) getInMemoryIndex(version SemanticVersion) *OffsetIndex {
+	if val, ok := s.indexes.Load(version.String()); ok {
+		return val.(*OffsetIndex)
+	}
+	return nil
+}
+
+// vectorIndex returns the OffsetIndex for a version, creating if needed.
+// Called under writeMu; uses sync.Map for storage.
+func (s *VersionVectorStore) vectorIndex(version SemanticVersion) *OffsetIndex {
+	vKey := version.String()
+	if val, ok := s.indexes.Load(vKey); ok {
+		return val.(*OffsetIndex)
+	}
+	path := s.session.VectorIndexPath(version)
+	idx, err := LoadOffsetIndex(path)
+	if err != nil {
+		idx = NewOffsetIndex(path, offsetIndexMinCapacity)
+	}
+	s.indexes.Store(vKey, idx)
+	return idx
+}
+
+// loadVectorIndex returns the OffsetIndex for a version (read path). Lock-free.
+// Caches loaded indexes via sync.Map.LoadOrStore.
+func (s *VersionVectorStore) loadVectorIndex(version SemanticVersion) *OffsetIndex {
+	vKey := version.String()
+	if val, ok := s.indexes.Load(vKey); ok {
+		return val.(*OffsetIndex)
+	}
+	path := s.session.VectorIndexPath(version)
+	idx, err := LoadOffsetIndex(path)
+	if err != nil {
+		return nil
+	}
+	actual, _ := s.indexes.LoadOrStore(vKey, idx)
+	return actual.(*OffsetIndex)
+}
+
+// marshalVectorRecord serializes a vector as [NodeID:4][Dim:4][Vector:Dim*4].
+func marshalVectorRecord(vec *VersionVector) []byte {
+	dim := len(vec.Vector)
+	record := make([]byte, 8+dim*4)
+	binary.LittleEndian.PutUint32(record[0:4], vec.NodeID)
+	binary.LittleEndian.PutUint32(record[4:8], uint32(dim))
+	for i, v := range vec.Vector {
+		binary.LittleEndian.PutUint32(record[8+i*4:], uint32FromFloat32(v))
+	}
+	return record
+}
+
+// readVectorAtOffset reads a vector from a shared data file at the given offset.
+func readVectorAtOffset(sdf *SharedDataFile, offset int64) (*VersionVector, error) {
 	header := make([]byte, 8)
-	if _, err := io.ReadFull(f, header); err != nil {
+	if _, err := sdf.ReadAt(header, offset); err != nil {
 		return nil, err
 	}
 
 	nodeID := binary.LittleEndian.Uint32(header[0:4])
 	dim := binary.LittleEndian.Uint32(header[4:8])
 
+	vecBuf := make([]byte, dim*4)
+	if _, err := sdf.ReadAt(vecBuf, offset+8); err != nil {
+		return nil, err
+	}
+
 	vec := make([]float32, dim)
-	buf := make([]byte, 4)
 	for i := range vec {
-		if _, err := io.ReadFull(f, buf); err != nil {
-			return nil, err
-		}
-		vec[i] = float32FromUint32(binary.LittleEndian.Uint32(buf))
+		vec[i] = float32FromUint32(binary.LittleEndian.Uint32(vecBuf[i*4:]))
 	}
 
 	return &VersionVector{NodeID: nodeID, Vector: vec}, nil
-}
-
-func (s *VersionVectorStore) scanForNodeID(f *os.File, targetNodeID uint32) (*VersionVector, error) {
-	f.Seek(0, io.SeekStart)
-	header := make([]byte, 8)
-
-	for {
-		if _, err := io.ReadFull(f, header); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-
-		nodeID := binary.LittleEndian.Uint32(header[0:4])
-		dim := binary.LittleEndian.Uint32(header[4:8])
-
-		if nodeID == targetNodeID {
-			vec := make([]float32, dim)
-			buf := make([]byte, 4)
-			for i := range vec {
-				if _, err := io.ReadFull(f, buf); err != nil {
-					return nil, err
-				}
-				vec[i] = float32FromUint32(binary.LittleEndian.Uint32(buf))
-			}
-			return &VersionVector{NodeID: nodeID, Vector: vec}, nil
-		}
-
-		// Skip this vector's data
-		if _, err := f.Seek(int64(dim)*4, io.SeekCurrent); err != nil {
-			return nil, err
-		}
-	}
-
-	return nil, nil
 }
 
 // uint32FromFloat32 converts float32 to uint32 bit representation.
@@ -1156,4 +1131,44 @@ func uint32FromFloat32(f float32) uint32 {
 // float32FromUint32 converts uint32 bit representation to float32.
 func float32FromUint32(u uint32) float32 {
 	return math.Float32frombits(u)
+}
+
+// --- WAL conversion helpers ---
+
+func nodeToWALData(n *Node) *WALNodeData {
+	return &WALNodeData{
+		NodeID:   n.ID,
+		Domain:   n.Domain,
+		NodeType: n.NodeType,
+		Key:      n.CanonicalKey,
+		Name:     n.Name,
+		Path:     n.Path,
+	}
+}
+
+func edgeToWALData(e *Edge) *WALEdgeData {
+	return &WALEdgeData{
+		SourceID:  e.SourceID,
+		TargetID:  e.TargetID,
+		EdgeType:  e.Type,
+		Weight:    e.Weight,
+		SessionID: e.SessionID,
+	}
+}
+
+func vectorToWALData(v *VersionVector) *WALVectorData {
+	return &WALVectorData{
+		NodeID: v.NodeID,
+		Vector: v.Vector,
+	}
+}
+
+func docToWALData(d *VersionDocument) *WALDocData {
+	return &WALDocData{
+		ID:       d.ID,
+		Path:     d.Path,
+		DocType:  d.Type,
+		Content:  d.Content,
+		Language: d.Language,
+	}
 }

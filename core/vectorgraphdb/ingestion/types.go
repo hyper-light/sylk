@@ -18,10 +18,11 @@ type FileInfo struct {
 }
 
 type MappedFile struct {
-	Path string
-	Data []byte
-	Lang string
-	Size int64
+	Path    string
+	Data    []byte
+	Lang    string
+	DocType string // from ClassifyFile: "source_code", "markdown", "config", "note", "web_content"
+	Size    int64
 }
 
 // ParsedFile holds the result of parsing a single file.
@@ -121,6 +122,7 @@ type FileNode struct {
 	ID        uint32
 	Path      string
 	Lang      string
+	DocType   string // from ClassifyFile, propagated through aggregation
 	LineCount int
 	ByteCount int64
 }
@@ -183,6 +185,7 @@ type IngestionResult struct {
 	PhaseDurations PhaseDurations
 	VectorResult   *VectorResult
 	ParseErrors    []FileParseError
+	MappedFiles    []MappedFile // Populated when Config.RetainContent is true.
 }
 
 type PhaseDurations struct {
@@ -220,13 +223,39 @@ type Config struct {
 	SkipPersist    bool
 	SkipBleve      bool
 	VectorConfig   *VectorConfig
+	Discovery      *DiscoveryOptions // Nil uses defaults (existing behavior).
+	RetainContent  bool              // When true, MappedFile data is kept in IngestionResult.
+	IncludePaths   map[string]bool   // When non-nil, only these absolute paths proceed past discovery.
+}
+
+// DiscoveryOptions controls file discovery behavior.
+// Zero-value preserves existing defaults for backward compatibility.
+type DiscoveryOptions struct {
+	// IncludeAllExtensions bypasses the IsSupportedExtension filter.
+	// Files without tree-sitter grammars still enter the graph as FileNodes
+	// with LineCount computed from raw content.
+	IncludeAllExtensions bool
+
+	// SkipDefaultPatterns disables appendDefaultPatterns
+	// (vendor/, node_modules/, go.sum, *.lock, build/, dist/).
+	SkipDefaultPatterns bool
+
+	// MaxFileSizeOverride overrides MaxFileSizeBytes when > 0.
+	MaxFileSizeOverride int64
+
+	// IncludeDotDirs allows dot-prefixed directories.
+	// VCS directories (.git, .hg, .svn, .bzr) are always skipped.
+	IncludeDotDirs bool
+
+	// IncludeVendorDirs allows vendor/, build/, dist/, target/, out/,
+	// node_modules/, __pycache__/, and venv/ directories.
+	IncludeVendorDirs bool
 }
 
 type VectorConfig struct {
-	StorageDir    string
-	ForceLocal    bool
-	SkipModelLoad bool
-	BatchSize     int
+	StorageDir        string
+	EnableHighQuality bool
+	BatchSize         int
 }
 
 // WithDefaults applies default values to the config.

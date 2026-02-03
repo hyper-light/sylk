@@ -4,11 +4,16 @@ package sylkdir
 import (
 	"context"
 	"fmt"
+	"log"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
+	"golang.org/x/sync/errgroup"
 )
 
 // NodeType represents the type of node in the knowledge graph.
@@ -54,144 +59,689 @@ const (
 
 // SessionIngestion handles ingestion of code into session version stores.
 type SessionIngestion struct {
-	session     *Session
-	nodeStore   *VersionNodeStore
-	edgeStore   *VersionEdgeStore
-	docStore    *VersionDocStore
-	vectorStore *VersionVectorStore
-	embedder    embedder.Embedder
-
-	// ID allocation
-	nextNodeID uint32
+	session       *Session
+	nodeStore     *VersionNodeStore
+	edgeStore     *VersionEdgeStore
+	docStore      *VersionDocStore
+	vectorStore   *VersionVectorStore
+	chunkRefStore *ChunkRefStore
+	embedder      embedder.Embedder
+	chunker       *UniversalChunker
+	nextNodeID    *uint32 // shared counter from session's BaseSnapshot
 }
 
 // NewSessionIngestion creates a new session ingestion handler.
 func NewSessionIngestion(sess *Session) *SessionIngestion {
 	return &SessionIngestion{
-		session:     sess,
-		nodeStore:   NewVersionNodeStore(sess),
-		edgeStore:   NewVersionEdgeStore(sess),
-		docStore:    NewVersionDocStore(sess),
-		vectorStore: NewVersionVectorStore(sess),
-		embedder:    nil, // Set via SetEmbedder
-		nextNodeID:  1,
+		session:       sess,
+		nodeStore:     NewVersionNodeStore(sess),
+		edgeStore:     NewVersionEdgeStore(sess),
+		docStore:      NewVersionDocStore(sess),
+		vectorStore:   NewVersionVectorStore(sess),
+		chunkRefStore: NewChunkRefStore(sess),
+		embedder:      nil, // Set via SetEmbedder
+		nextNodeID:    sess.nextAllocID(),
 	}
 }
 
-// SetEmbedder sets the embedder for vector generation.
+// allocID atomically allocates and returns the next node ID from the shared counter.
+func (s *SessionIngestion) allocID() uint32 {
+	return atomic.AddUint32(s.nextNodeID, 1) - 1
+}
+
+// SetEmbedder sets the embedder for vector generation and creates the universal chunker.
 func (s *SessionIngestion) SetEmbedder(e embedder.Embedder) {
 	s.embedder = e
+	s.chunker = NewUniversalChunker(
+		embedder.NewEnhancedHybridEmbedder(),
+		uint32(e.MaxInputBytes()),
+	)
 }
 
 // SessionIngestionResult contains the results of a session ingestion.
 type SessionIngestionResult struct {
-	NodesCreated    int
-	EdgesCreated    int
-	DocsCreated     int
-	VectorsCreated  int
-	FilesProcessed  int
-	Duration        time.Duration
-	EmbeddingErrors int
+	NodesCreated     int
+	EdgesCreated     int
+	DocsCreated      int
+	VectorsCreated   int
+	ChunkRefsCreated int
+	FilesProcessed   int
+	Duration         time.Duration
+	EmbeddingErrors  int
 }
 
-// IngestCodeGraph converts and writes a CodeGraph to the session version stores.
-func (s *SessionIngestion) IngestCodeGraph(ctx context.Context, graph *ingestion.CodeGraph) (*SessionIngestionResult, error) {
+// ingestionEntities collects all entities built during the construction phase
+// before concurrent writes. Fields are grouped by entity type with parallel
+// embedTexts/embedIDs slices for batch embedding.
+type ingestionEntities struct {
+	fileNodes   []*Node
+	symbolNodes []*Node
+	chunkNodes  []*Node
+
+	containsEdges []*Edge
+	importEdges   []*Edge
+	chunkEdges    []*Edge
+
+	fileDocs  []*VersionDocument
+	chunkDocs []*VersionDocument
+	chunkRefs []*ChunkRef
+
+	embedTexts []string // parallel: text for each node to embed
+	embedIDs   []uint32 // parallel: node ID for each embedding
+
+	// cachedEmbeddings holds merger embeddings keyed by node ID.
+	// Chunks with cached embeddings are excluded from embedTexts/embedIDs
+	// and written directly in writeEntities without re-embedding.
+	cachedEmbeddings map[uint32][]float32
+
+	fileIDMap   map[uint32]uint32 // ingestion file ID -> session node ID
+	symbolIDMap map[uint32]uint32 // ingestion symbol ID -> session node ID
+	filePathMap map[uint32]string // ingestion file ID -> file path
+	docRefMap   map[uint32]uint32 // ingestion file ID -> DocRef
+}
+
+// IngestCodeGraph converts a CodeGraph + file contents into a fully-linked entity set:
+// file nodes, symbol nodes, chunk nodes with ChunkRefs, documents, edges, and vectors.
+// All files with content are chunked; chunks carry the semantic content for embedding.
+//
+// Three-phase pipeline:
+//
+//	Phase 1 (sequential): buildEntities — construct all nodes, edges, docs, refs, embed texts
+//	Phase 2 (concurrent):  writeEntities — errgroup: store writes, embedding, Bleve indexing
+//	Phase 3 (sequential): writeVectors — write embeddings after G2 completes
+func (s *SessionIngestion) IngestCodeGraph(ctx context.Context, graph *ingestion.CodeGraph, contentMap map[string]string) (*SessionIngestionResult, error) {
 	start := time.Now()
-	result := &SessionIngestionResult{}
 
-	// Convert and write file nodes
-	fileNodes, fileIDMap, filePathMap, docRefMap, err := s.convertFileNodes(graph.Files)
+	log.Printf("[ingest] buildEntities: files=%d symbols=%d content_entries=%d",
+		len(graph.Files), len(graph.Symbols), len(contentMap))
+	buildStart := time.Now()
+	ent := s.buildEntities(ctx, graph, contentMap)
+	log.Printf("[ingest] buildEntities done: %v (nodes=%d+%d+%d edges=%d+%d+%d docs=%d+%d embeds=%d)",
+		time.Since(buildStart),
+		len(ent.fileNodes), len(ent.symbolNodes), len(ent.chunkNodes),
+		len(ent.containsEdges), len(ent.importEdges), len(ent.chunkEdges),
+		len(ent.fileDocs), len(ent.chunkDocs), len(ent.embedTexts))
+
+	writeStart := time.Now()
+	result, err := s.writeEntities(ctx, ent)
 	if err != nil {
-		return nil, fmt.Errorf("convert file nodes: %w", err)
+		return nil, err
 	}
-	if err := s.nodeStore.WriteBatch(fileNodes); err != nil {
-		return nil, fmt.Errorf("write file nodes: %w", err)
-	}
-	result.NodesCreated += len(fileNodes)
-	result.FilesProcessed = len(fileNodes)
+	log.Printf("[ingest] writeEntities done: %v", time.Since(writeStart))
 
-	// Convert and write symbol nodes
-	symbolNodes, symbolIDMap, err := s.convertSymbolNodes(graph.Symbols, fileIDMap, filePathMap, docRefMap)
-	if err != nil {
-		return nil, fmt.Errorf("convert symbol nodes: %w", err)
-	}
-	if err := s.nodeStore.WriteBatch(symbolNodes); err != nil {
-		return nil, fmt.Errorf("write symbol nodes: %w", err)
-	}
-	result.NodesCreated += len(symbolNodes)
-
-	// Generate and write vectors for all nodes (if embedder is set)
-	if s.embedder != nil {
-		allNodes := append(fileNodes, symbolNodes...)
-		vectors, embeddingErrors := s.generateVectors(ctx, allNodes)
-		if len(vectors) > 0 {
-			if err := s.vectorStore.WriteBatch(vectors); err != nil {
-				return nil, fmt.Errorf("write vectors: %w", err)
-			}
-		}
-		result.VectorsCreated = len(vectors)
-		result.EmbeddingErrors = embeddingErrors
-	}
-
-	// Convert and write contains edges (file -> symbol)
-	containsEdges := s.convertEdges(graph.ContainsEdges, fileIDMap, symbolIDMap, EdgeTypeContains)
-	if err := s.edgeStore.WriteBatch(containsEdges); err != nil {
-		return nil, fmt.Errorf("write contains edges: %w", err)
-	}
-	result.EdgesCreated += len(containsEdges)
-
-	// Convert and write import edges (file -> file)
-	importEdges := s.convertEdges(graph.ImportEdges, fileIDMap, fileIDMap, EdgeTypeImports)
-	if err := s.edgeStore.WriteBatch(importEdges); err != nil {
-		return nil, fmt.Errorf("write import edges: %w", err)
-	}
-	result.EdgesCreated += len(importEdges)
-
-	// Create documents for files
-	docs := s.createDocuments(graph.Files, fileIDMap)
-	if err := s.docStore.WriteBatch(docs); err != nil {
-		return nil, fmt.Errorf("write documents: %w", err)
-	}
-	result.DocsCreated = len(docs)
-
-	// Index into session Bleve for immediate searchability
-	if err := s.indexDocsIntoSessionBleve(ctx, docs); err != nil {
-		return nil, fmt.Errorf("index documents in session bleve: %w", err)
-	}
-
-	// Update delta tracker and evaluate checkpoint.
+	result.FilesProcessed = len(ent.fileNodes)
 	s.updateDeltaTracker(result)
 	s.evaluateCheckpoint()
 
 	result.Duration = time.Since(start)
+	log.Printf("[ingest] IngestCodeGraph total: %v", result.Duration)
 	return result, nil
 }
 
-// generateVectors creates embeddings for nodes using the configured embedder.
-func (s *SessionIngestion) generateVectors(ctx context.Context, nodes []*Node) ([]*VersionVector, int) {
-	vectors := make([]*VersionVector, 0, len(nodes))
-	errors := 0
+// =========================================================================
+// Phase 1: Entity Construction (sequential, allocation-heavy)
+// =========================================================================
 
-	for _, node := range nodes {
-		// Create embedding text from node metadata
+// buildEntities constructs all graph entities in a single sequential pass.
+func (s *SessionIngestion) buildEntities(ctx context.Context, graph *ingestion.CodeGraph, contentMap map[string]string) *ingestionEntities {
+	ent := &ingestionEntities{
+		fileIDMap:   make(map[uint32]uint32, len(graph.Files)),
+		symbolIDMap: make(map[uint32]uint32, len(graph.Symbols)),
+		filePathMap: make(map[uint32]string, len(graph.Files)),
+		docRefMap:   make(map[uint32]uint32, len(graph.Files)),
+	}
+
+	t := time.Now()
+	s.buildFileEntities(graph.Files, contentMap, ent)
+	log.Printf("[build] files: %v (%d)", time.Since(t), len(ent.fileNodes))
+
+	t = time.Now()
+	s.buildSymbolEntities(graph.Symbols, ent)
+	log.Printf("[build] symbols: %v (%d)", time.Since(t), len(ent.symbolNodes))
+
+	t = time.Now()
+	s.buildChunkEntities(ctx, graph, contentMap, ent)
+	log.Printf("[build] chunks: %v (%d nodes, %d docs, %d refs, %d edges)",
+		time.Since(t), len(ent.chunkNodes), len(ent.chunkDocs), len(ent.chunkRefs), len(ent.chunkEdges))
+
+	t = time.Now()
+	s.buildEdgeEntities(graph, ent)
+	log.Printf("[build] edges: %v (contains=%d imports=%d)", time.Since(t), len(ent.containsEdges), len(ent.importEdges))
+
+	t = time.Now()
+	s.buildEmbedTexts(ent)
+	log.Printf("[build] embedTexts: %v (%d)", time.Since(t), len(ent.embedTexts))
+
+	return ent
+}
+
+// buildFileEntities creates file nodes and file documents.
+func (s *SessionIngestion) buildFileEntities(files []ingestion.FileNode, contentMap map[string]string, ent *ingestionEntities) {
+	ent.fileNodes = make([]*Node, len(files))
+	ent.fileDocs = make([]*VersionDocument, len(files))
+	now := uint64(time.Now().UnixNano())
+
+	for i, file := range files {
+		nodeID := s.allocID()
+		ent.fileIDMap[file.ID] = nodeID
+		ent.filePathMap[file.ID] = file.Path
+
+		var docRef uint32
+		if s.session.DocIDMap != nil {
+			docRef = s.session.DocIDMap.GetOrAssign(fmt.Sprintf("file_%d", nodeID))
+		}
+		ent.docRefMap[file.ID] = docRef
+
+		ent.fileNodes[i] = &Node{
+			ID:           nodeID,
+			CanonicalKey: fmt.Sprintf("file:%s", file.Path),
+			Domain:       uint8(DomainCode),
+			NodeType:     uint8(NodeTypeFile),
+			Name:         file.Path,
+			Path:         file.Path,
+			CreatedAt:    now,
+			SessionID:    s.session.Meta.ID,
+			DocRef:       docRef,
+		}
+
+		ent.fileDocs[i] = &VersionDocument{
+			ID:        fmt.Sprintf("file_%d", nodeID),
+			Path:      file.Path,
+			Type:      "source_code",
+			Content:   contentMap[file.Path],
+			Language:  file.Lang,
+			IndexedAt: time.Now().UnixNano(),
+		}
+	}
+}
+
+// buildSymbolEntities creates symbol nodes.
+func (s *SessionIngestion) buildSymbolEntities(symbols []ingestion.SymbolNode, ent *ingestionEntities) {
+	ent.symbolNodes = make([]*Node, len(symbols))
+	now := uint64(time.Now().UnixNano())
+
+	for i, sym := range symbols {
+		nodeID := s.allocID()
+		ent.symbolIDMap[sym.ID] = nodeID
+		filePath := ent.filePathMap[sym.FileID]
+
+		ent.symbolNodes[i] = &Node{
+			ID:           nodeID,
+			CanonicalKey: fmt.Sprintf("symbol:%s:%s:%s", filePath, sym.Name, sym.Kind.String()),
+			Domain:       uint8(DomainCode),
+			NodeType:     uint8(symbolKindToNodeType(sym.Kind)),
+			Name:         sym.Name,
+			Path:         filePath,
+			Signature:    sym.Signature,
+			CreatedAt:    now,
+			SessionID:    s.session.Meta.ID,
+			DocRef:       ent.docRefMap[sym.FileID],
+		}
+	}
+}
+
+// chunkFileEntry pairs a file with its content for parallel chunking.
+type chunkFileEntry struct {
+	file    ingestion.FileNode
+	content string
+}
+
+// chunkLocalResult holds per-worker chunk results for lock-free accumulation.
+type chunkLocalResult struct {
+	nodes      []*Node
+	docs       []*VersionDocument
+	refs       []*ChunkRef
+	edges      []*Edge
+	cachedEmbs map[uint32][]float32 // nodeID → merger embedding
+}
+
+// buildChunkEntities chunks all files in parallel across runtime.NumCPU() workers.
+// Each worker processes its file subset independently, then results are merged.
+func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingestion.CodeGraph, contentMap map[string]string, ent *ingestionEntities) {
+	if s.chunker == nil {
+		return
+	}
+
+	// Filter to files with content.
+	entries := make([]chunkFileEntry, 0, len(graph.Files))
+	for _, file := range graph.Files {
+		if c := contentMap[file.Path]; c != "" {
+			entries = append(entries, chunkFileEntry{file: file, content: c})
+		}
+	}
+	if len(entries) == 0 {
+		return
+	}
+
+	symsByFile := groupSymbolsByFile(graph.Symbols)
+	now := uint64(time.Now().UnixNano())
+
+	// Split across workers.
+	workers := runtime.NumCPU()
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+	perWorker := (len(entries) + workers - 1) / workers
+
+	results := make([]chunkLocalResult, workers)
+
+	var wg sync.WaitGroup
+	for w := range workers {
+		lo := w * perWorker
+		hi := lo + perWorker
+		if hi > len(entries) {
+			hi = len(entries)
+		}
+		if lo >= hi {
+			continue
+		}
+
+		wg.Add(1)
+		go func(idx int, batch []chunkFileEntry) {
+			defer wg.Done()
+			local := chunkLocalResult{
+				cachedEmbs: make(map[uint32][]float32),
+			}
+
+			for _, fe := range batch {
+				parentNodeID := ent.fileIDMap[fe.file.ID]
+				parentDocRef := ent.docRefMap[fe.file.ID]
+
+				cr := s.computeChunks(ctx, []byte(fe.content), symsByFile[fe.file.ID])
+
+				var prevChunkID uint32
+				for i, b := range cr.Boundaries {
+					chunkID := s.allocID()
+
+					var chunkDocRef uint32
+					if s.session.DocIDMap != nil {
+						chunkDocRef = s.session.DocIDMap.GetOrAssign(fmt.Sprintf("file_%d_c%03d", parentNodeID, i))
+					}
+
+					local.nodes = append(local.nodes, &Node{
+						ID:           chunkID,
+						CanonicalKey: fmt.Sprintf("chunk:%s:%04d", fe.file.Path, i),
+						Domain:       uint8(DomainCode),
+						NodeType:     uint8(NodeTypeChunk),
+						Name:         fe.content[b.ByteStart:b.ByteEnd],
+						Path:         fe.file.Path,
+						CreatedAt:    now,
+						SessionID:    s.session.Meta.ID,
+						DocRef:       chunkDocRef,
+					})
+
+					local.docs = append(local.docs, &VersionDocument{
+						ID:        fmt.Sprintf("file_%d_c%03d", parentNodeID, i),
+						Path:      fe.file.Path,
+						Type:      "source_code",
+						Content:   fe.content[b.ByteStart:b.ByteEnd],
+						IndexedAt: time.Now().UnixNano(),
+					})
+
+					local.refs = append(local.refs, &ChunkRef{
+						NodeID: chunkID,
+						Span: ChunkSpan{
+							DocRef:    parentDocRef,
+							ChunkSeq:  uint16(i),
+							ByteStart: b.ByteStart,
+							ByteEnd:   b.ByteEnd,
+							LineStart: b.LineStart,
+							LineEnd:   b.LineEnd,
+							Flags:     PackFlags(OverlapNone, ContentClassSourceCode, b.Kind),
+						},
+					})
+
+					// Cache merger embedding for this chunk if available.
+					if cr.Embeddings != nil && i < len(cr.Embeddings) && cr.Embeddings[i] != nil {
+						local.cachedEmbs[chunkID] = cr.Embeddings[i]
+					}
+
+					local.edges = append(local.edges, &Edge{
+						SourceID:  parentNodeID,
+						TargetID:  chunkID,
+						Type:      uint8(EdgeTypeContainsChunk),
+						Weight:    1.0,
+						SessionID: s.session.Meta.ID,
+						CreatedAt: now,
+						UpdatedAt: now,
+					})
+
+					if i > 0 {
+						local.edges = append(local.edges, &Edge{
+							SourceID:  prevChunkID,
+							TargetID:  chunkID,
+							Type:      uint8(EdgeTypeChunkSequence),
+							Weight:    1.0,
+							SessionID: s.session.Meta.ID,
+							CreatedAt: now,
+							UpdatedAt: now,
+						})
+					}
+					prevChunkID = chunkID
+				}
+			}
+			results[idx] = local
+		}(w, entries[lo:hi])
+	}
+	wg.Wait()
+
+	// Merge worker results.
+	if ent.cachedEmbeddings == nil {
+		ent.cachedEmbeddings = make(map[uint32][]float32)
+	}
+	for _, r := range results {
+		ent.chunkNodes = append(ent.chunkNodes, r.nodes...)
+		ent.chunkDocs = append(ent.chunkDocs, r.docs...)
+		ent.chunkRefs = append(ent.chunkRefs, r.refs...)
+		ent.chunkEdges = append(ent.chunkEdges, r.edges...)
+		for id, emb := range r.cachedEmbs {
+			ent.cachedEmbeddings[id] = emb
+		}
+	}
+}
+
+// computeChunks selects the chunking strategy based on available symbols.
+// Returns chunk boundaries with their cached merger embeddings.
+func (s *SessionIngestion) computeChunks(ctx context.Context, content []byte, symbols []ingestion.SymbolNode) ChunkResult {
+	if len(symbols) > 0 {
+		return s.chunker.ChunkWithSymbols(ctx, content, symbolsToBounds(symbols))
+	}
+	return s.chunker.Chunk(ctx, content)
+}
+
+// buildEdgeEntities creates structural edges (Contains, Imports).
+func (s *SessionIngestion) buildEdgeEntities(graph *ingestion.CodeGraph, ent *ingestionEntities) {
+	ent.containsEdges = s.convertEdges(graph.ContainsEdges, ent.fileIDMap, ent.symbolIDMap, EdgeTypeContains)
+	ent.importEdges = s.convertEdges(graph.ImportEdges, ent.fileIDMap, ent.fileIDMap, EdgeTypeImports)
+}
+
+// buildEmbedTexts builds parallel embedTexts/embedIDs from all node types.
+// File nodes get path-only embedding; chunks carry semantic content.
+// Chunks with cached merger embeddings are excluded — they bypass G2 entirely.
+func (s *SessionIngestion) buildEmbedTexts(ent *ingestionEntities) {
+	totalCap := len(ent.fileNodes) + len(ent.symbolNodes) + len(ent.chunkNodes)
+	ent.embedTexts = make([]string, 0, totalCap)
+	ent.embedIDs = make([]uint32, 0, totalCap)
+
+	for _, node := range ent.fileNodes {
+		ent.embedTexts = append(ent.embedTexts, fmt.Sprintf("file: %s", node.Path))
+		ent.embedIDs = append(ent.embedIDs, node.ID)
+	}
+
+	for _, node := range ent.symbolNodes {
 		text := s.nodeToEmbeddingText(node)
 		if text == "" {
 			continue
 		}
+		ent.embedTexts = append(ent.embedTexts, text)
+		ent.embedIDs = append(ent.embedIDs, node.ID)
+	}
 
-		vec, err := s.embedder.Embed(ctx, text)
-		if err != nil {
-			errors++
+	for _, node := range ent.chunkNodes {
+		if node.Name == "" {
 			continue
 		}
+		// Skip chunks that have cached merger embeddings —
+		// their vectors are written directly from the cache.
+		if _, cached := ent.cachedEmbeddings[node.ID]; cached {
+			continue
+		}
+		ent.embedTexts = append(ent.embedTexts, node.Name)
+		ent.embedIDs = append(ent.embedIDs, node.ID)
+	}
+}
 
+// =========================================================================
+// Phase 2: Concurrent Writes (errgroup)
+// =========================================================================
+
+// writeEntities runs store writes, batch embedding, and Bleve indexing concurrently.
+func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEntities) (*SessionIngestionResult, error) {
+	result := &SessionIngestionResult{}
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	// G1: Write all stores (nodes, edges, docs, chunk refs).
+	g.Go(func() error {
+		t := time.Now()
+		err := s.writeStores(gctx, ent, result)
+		log.Printf("[write] G1 stores: %v (nodes=%d edges=%d docs=%d refs=%d)",
+			time.Since(t), result.NodesCreated, result.EdgesCreated, result.DocsCreated, result.ChunkRefsCreated)
+		return err
+	})
+
+	// G2: Batch embed all texts concurrently.
+	// embedDone signals G4 to start vector writes without waiting for G3 (Bleve).
+	var embeddings [][]float32
+	embedDone := make(chan struct{})
+	g.Go(func() error {
+		t := time.Now()
+		var err error
+		embeddings, err = s.embedAll(gctx, ent.embedTexts)
+		close(embedDone)
+		log.Printf("[write] G2 embed: %v (%d texts)", time.Since(t), len(ent.embedTexts))
+		return err
+	})
+
+	// G3: Index all docs into Bleve concurrently.
+	g.Go(func() error {
+		t := time.Now()
+		err := s.indexAllDocs(gctx, ent)
+		log.Printf("[write] G3 bleve: %v (%d docs)", time.Since(t), len(ent.fileDocs)+len(ent.chunkDocs))
+		return err
+	})
+
+	// G4: Write vectors as soon as G2 completes (overlaps with G3).
+	// Merges G2 fresh embeddings with cached merger embeddings.
+	g.Go(func() error {
+		select {
+		case <-embedDone:
+		case <-gctx.Done():
+			return gctx.Err()
+		}
+		t := time.Now()
+		vectors, err := s.writeVectorsWithCache(gctx, ent, embeddings)
+		if err != nil {
+			return err
+		}
+		result.VectorsCreated = len(vectors)
+		log.Printf("[write] G4 vectors: %v (%d pending)", time.Since(t), len(vectors))
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// writeStores writes all entity stores sequentially (stores have internal mutexes).
+// writeStores writes all entity stores concurrently.
+// Nodes, edges, docs, and chunk refs have independent SharedDataFiles
+// and mutexes, so they can run in parallel.
+func (s *SessionIngestion) writeStores(ctx context.Context, ent *ingestionEntities, result *SessionIngestionResult) error {
+	allNodes := concatNodes(ent.fileNodes, ent.symbolNodes, ent.chunkNodes)
+	allEdges := concatEdges(ent.containsEdges, ent.importEdges, ent.chunkEdges)
+	allDocs := concatDocs(ent.fileDocs, ent.chunkDocs)
+
+	g, _ := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		t := time.Now()
+		if err := s.nodeStore.WriteBatch(allNodes); err != nil {
+			return fmt.Errorf("write nodes: %w", err)
+		}
+		log.Printf("[stores] nodes: %v (%d)", time.Since(t), len(allNodes))
+		return nil
+	})
+
+	g.Go(func() error {
+		t := time.Now()
+		if err := s.edgeStore.WriteBatch(allEdges); err != nil {
+			return fmt.Errorf("write edges: %w", err)
+		}
+		log.Printf("[stores] edges: %v (%d)", time.Since(t), len(allEdges))
+		return nil
+	})
+
+	g.Go(func() error {
+		t := time.Now()
+		if err := s.docStore.WriteBatch(allDocs); err != nil {
+			return fmt.Errorf("write docs: %w", err)
+		}
+		log.Printf("[stores] docs: %v (%d)", time.Since(t), len(allDocs))
+		return nil
+	})
+
+	g.Go(func() error {
+		if len(ent.chunkRefs) == 0 {
+			return nil
+		}
+		t := time.Now()
+		if err := s.chunkRefStore.WriteBatch(ent.chunkRefs); err != nil {
+			return fmt.Errorf("write chunk refs: %w", err)
+		}
+		log.Printf("[stores] chunkRefs: %v (%d)", time.Since(t), len(ent.chunkRefs))
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	result.NodesCreated = len(allNodes)
+	result.EdgesCreated = len(allEdges)
+	result.DocsCreated = len(allDocs)
+	result.ChunkRefsCreated = len(ent.chunkRefs)
+	return nil
+}
+
+// embedAll calls EmbedBatch on all texts. Returns nil, nil if no embedder.
+func (s *SessionIngestion) embedAll(ctx context.Context, texts []string) ([][]float32, error) {
+	if s.embedder == nil || len(texts) == 0 {
+		return nil, nil
+	}
+	return s.embedder.EmbedBatch(ctx, texts)
+}
+
+// indexAllDocs indexes file + chunk docs into session Bleve.
+func (s *SessionIngestion) indexAllDocs(ctx context.Context, ent *ingestionEntities) error {
+	allDocs := concatDocs(ent.fileDocs, ent.chunkDocs)
+	return s.indexDocsIntoSessionBleve(ctx, allDocs)
+}
+
+// writeVectorsWithCache combines fresh G2 embeddings with cached merger embeddings,
+// then writes all vectors in one batch. Cached embeddings are for chunk nodes
+// whose embeddings were computed during agglomerative merging and don't need
+// to be recomputed in G2.
+func (s *SessionIngestion) writeVectorsWithCache(ctx context.Context, ent *ingestionEntities, embeddings [][]float32) ([]*VersionVector, error) {
+	totalCap := len(ent.embedIDs) + len(ent.cachedEmbeddings)
+	vectors := make([]*VersionVector, 0, totalCap)
+
+	// Fresh G2 embeddings.
+	if embeddings != nil {
+		for i, emb := range embeddings {
+			if emb == nil {
+				continue
+			}
+			vectors = append(vectors, &VersionVector{
+				NodeID: ent.embedIDs[i],
+				Vector: emb,
+			})
+		}
+	}
+
+	// Cached merger embeddings (chunk nodes that bypassed G2).
+	for nodeID, emb := range ent.cachedEmbeddings {
 		vectors = append(vectors, &VersionVector{
-			NodeID: node.ID,
-			Vector: vec,
+			NodeID: nodeID,
+			Vector: emb,
 		})
 	}
 
-	return vectors, errors
+	if len(vectors) == 0 {
+		return nil, nil
+	}
+
+	// Store vectors in memory for direct consumption by CommitToGlobal.
+	// Eliminates the session disk round-trip (WAL + data file + offset index).
+	s.session.PendingVectors = vectors
+	return vectors, nil
+}
+
+// =========================================================================
+// Helpers: Entity Concatenation
+// =========================================================================
+
+func concatNodes(slices ...[]*Node) []*Node {
+	var total int
+	for _, s := range slices {
+		total += len(s)
+	}
+	result := make([]*Node, 0, total)
+	for _, s := range slices {
+		result = append(result, s...)
+	}
+	return result
+}
+
+func concatEdges(slices ...[]*Edge) []*Edge {
+	var total int
+	for _, s := range slices {
+		total += len(s)
+	}
+	result := make([]*Edge, 0, total)
+	for _, s := range slices {
+		result = append(result, s...)
+	}
+	return result
+}
+
+func concatDocs(slices ...[]*VersionDocument) []*VersionDocument {
+	var total int
+	for _, s := range slices {
+		total += len(s)
+	}
+	result := make([]*VersionDocument, 0, total)
+	for _, s := range slices {
+		result = append(result, s...)
+	}
+	return result
+}
+
+// groupSymbolsByFile partitions symbols by their FileID.
+func groupSymbolsByFile(symbols []ingestion.SymbolNode) map[uint32][]ingestion.SymbolNode {
+	m := make(map[uint32][]ingestion.SymbolNode, len(symbols))
+	for _, sym := range symbols {
+		m[sym.FileID] = append(m[sym.FileID], sym)
+	}
+	return m
+}
+
+// symbolsToBounds converts ingestion.SymbolNode to SymbolBound for the chunker.
+func symbolsToBounds(symbols []ingestion.SymbolNode) []SymbolBound {
+	bounds := make([]SymbolBound, len(symbols))
+	for i, sym := range symbols {
+		bounds[i] = SymbolBound{
+			StartLine: sym.StartLine,
+			EndLine:   sym.EndLine,
+			Strength:  symbolKindStrengthFromIngestion(sym.Kind),
+		}
+	}
+	return bounds
+}
+
+// symbolKindStrengthFromIngestion maps ingestion.SymbolKind to boundary strength.
+func symbolKindStrengthFromIngestion(kind ingestion.SymbolKind) uint32 {
+	switch kind {
+	case ingestion.SymbolKindInterface, ingestion.SymbolKindType:
+		return 3
+	case ingestion.SymbolKindFunction, ingestion.SymbolKindMethod:
+		return 2
+	default:
+		return 1
+	}
 }
 
 // nodeToEmbeddingText converts a node to text suitable for embedding.
@@ -219,101 +769,32 @@ func (s *SessionIngestion) nodeToEmbeddingText(node *Node) string {
 
 // IngestDirectory runs the full ingestion pipeline on a directory.
 func (s *SessionIngestion) IngestDirectory(ctx context.Context, rootPath string) (*SessionIngestionResult, error) {
-	// Run the ingestion pipeline
-	config := &ingestion.Config{
-		RootPath:    rootPath,
-		Workers:     ingestion.WorkerCount(),
-		SkipPersist: true, // We handle persistence via version stores
-		SkipBleve:   true, // We handle doc indexing via version stores
-	}
+	return s.IngestDirectoryWithConfig(ctx, &ingestion.Config{
+		RootPath: rootPath,
+		Workers:  ingestion.WorkerCount(),
+	})
+}
 
-	ingestionResult, err := ingestion.IngestCodebase(ctx, config)
+// IngestDirectoryWithConfig runs ingestion with full configuration control.
+// Sets SkipPersist, SkipBleve, and RetainContent automatically.
+func (s *SessionIngestion) IngestDirectoryWithConfig(ctx context.Context, config *ingestion.Config) (*SessionIngestionResult, error) {
+	config.SkipPersist = true
+	config.SkipBleve = true
+	config.RetainContent = true
+
+	t := time.Now()
+	result, err := ingestion.IngestCodebase(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("ingest codebase: %w", err)
 	}
+	log.Printf("[pipeline] IngestCodebase: %v (files=%d symbols=%d lines=%d)",
+		time.Since(t), result.TotalFiles, result.TotalSymbols, result.TotalLines)
 
-	// Convert and write to version stores
-	return s.IngestCodeGraph(ctx, ingestionResult.Graph)
-}
+	t = time.Now()
+	contentMap := buildContentMap(result.MappedFiles)
+	log.Printf("[pipeline] buildContentMap: %v (%d entries)", time.Since(t), len(contentMap))
 
-// convertFileNodes converts ingestion FileNodes to sylkdir Nodes.
-// Returns: nodes, idMap (ingestion ID -> session node ID), pathMap (ingestion ID -> file path),
-// docRefMap (ingestion ID -> DocRef uint32 for symbol node linking).
-func (s *SessionIngestion) convertFileNodes(files []ingestion.FileNode) ([]*Node, map[uint32]uint32, map[uint32]string, map[uint32]uint32, error) {
-	nodes := make([]*Node, len(files))
-	idMap := make(map[uint32]uint32, len(files))      // old ID -> new ID
-	pathMap := make(map[uint32]string, len(files))     // old ID -> file path
-	docRefMap := make(map[uint32]uint32, len(files))   // old ID -> DocRef
-
-	now := uint64(time.Now().UnixNano())
-
-	for i, file := range files {
-		newID := s.nextNodeID
-		s.nextNodeID++
-		idMap[file.ID] = newID
-		pathMap[file.ID] = file.Path
-
-		// Assign DocRef via DocIDMap. The doc string ID matches what
-		// createDocuments produces, so the OffsetIndex key will match.
-		var docRef uint32
-		if s.session.DocIDMap != nil {
-			docRef = s.session.DocIDMap.GetOrAssign(fmt.Sprintf("file_%d", newID))
-		}
-		docRefMap[file.ID] = docRef
-
-		nodes[i] = &Node{
-			ID:           newID,
-			CanonicalKey: fmt.Sprintf("file:%s", file.Path),
-			Domain:       uint8(DomainCode),
-			NodeType:     uint8(NodeTypeFile),
-			Name:         file.Path,
-			Path:         file.Path,
-			Package:      "",
-			Signature:    "",
-			CreatedAt:    now,
-			SessionID:    s.session.Meta.ID,
-			CreatedBy:    0,
-			DocRef:       docRef,
-		}
-	}
-
-	return nodes, idMap, pathMap, docRefMap, nil
-}
-
-// convertSymbolNodes converts ingestion SymbolNodes to sylkdir Nodes.
-// filePathMap maps ingestion file IDs to file paths for canonical key construction.
-// docRefMap maps ingestion file IDs to DocRef values so symbols inherit their parent file's document.
-func (s *SessionIngestion) convertSymbolNodes(symbols []ingestion.SymbolNode, fileIDMap map[uint32]uint32, filePathMap map[uint32]string, docRefMap map[uint32]uint32) ([]*Node, map[uint32]uint32, error) {
-	nodes := make([]*Node, len(symbols))
-	idMap := make(map[uint32]uint32, len(symbols))
-
-	now := uint64(time.Now().UnixNano())
-
-	for i, sym := range symbols {
-		newID := s.nextNodeID
-		s.nextNodeID++
-		idMap[sym.ID] = newID
-
-		nodeType := symbolKindToNodeType(sym.Kind)
-		filePath := filePathMap[sym.FileID]
-
-		nodes[i] = &Node{
-			ID:           newID,
-			CanonicalKey: fmt.Sprintf("symbol:%s:%s:%s", filePath, sym.Name, sym.Kind.String()),
-			Domain:       uint8(DomainCode),
-			NodeType:     uint8(nodeType),
-			Name:         sym.Name,
-			Path:         filePath,
-			Package:      "",
-			Signature:    sym.Signature,
-			CreatedAt:    now,
-			SessionID:    s.session.Meta.ID,
-			CreatedBy:    0,
-			DocRef:       docRefMap[sym.FileID],
-		}
-	}
-
-	return nodes, idMap, nil
+	return s.IngestCodeGraph(ctx, result.Graph, contentMap)
 }
 
 // convertEdges converts ingestion Edges to sylkdir Edges.
@@ -344,23 +825,13 @@ func (s *SessionIngestion) convertEdges(edges []ingestion.Edge, sourceIDMap, tar
 	return result
 }
 
-// createDocuments creates VersionDocuments from FileNodes.
-func (s *SessionIngestion) createDocuments(files []ingestion.FileNode, fileIDMap map[uint32]uint32) []*VersionDocument {
-	docs := make([]*VersionDocument, len(files))
-	now := time.Now().UnixNano()
-
-	for i, file := range files {
-		docs[i] = &VersionDocument{
-			ID:        fmt.Sprintf("file_%d", fileIDMap[file.ID]),
-			Path:      file.Path,
-			Type:      "source_code",
-			Content:   "", // Content would come from MappedFile, not FileNode
-			Language:  file.Lang,
-			IndexedAt: now,
-		}
+// buildContentMap creates a path-to-content mapping from mapped files.
+func buildContentMap(mapped []ingestion.MappedFile) map[string]string {
+	contentMap := make(map[string]string, len(mapped))
+	for _, m := range mapped {
+		contentMap[m.Path] = string(m.Data)
 	}
-
-	return docs
+	return contentMap
 }
 
 // symbolKindToNodeType converts ingestion SymbolKind to sylkdir NodeType.
@@ -383,124 +854,31 @@ func symbolKindToNodeType(kind ingestion.SymbolKind) NodeType {
 	}
 }
 
+// docTypeToContentClass converts a DocType string to a ContentClass.
+func docTypeToContentClass(docType string) ContentClass {
+	return ContentClassFromDocType(search.DocumentType(docType))
+}
+
 // IngestWithContent runs ingestion and includes file content in documents.
 func (s *SessionIngestion) IngestWithContent(ctx context.Context, rootPath string) (*SessionIngestionResult, error) {
-	start := time.Now()
-
-	// Phase 1: Discovery
-	files, err := ingestion.DiscoverFiles(ctx, rootPath, nil)
+	files, err := ingestion.DiscoverFiles(ctx, rootPath, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("discover files: %w", err)
 	}
 
-	// Phase 2: Read files
 	mappedFiles, err := ingestion.ReadFiles(ctx, files, ingestion.WorkerCount())
 	if err != nil {
 		return nil, fmt.Errorf("read files: %w", err)
 	}
 
-	// Phase 3: Parse files
 	pool := ingestion.NewParserPool(ingestion.WorkerCount())
-	parsed, parseErrors := pool.ParseAll(ctx, mappedFiles)
-	_ = parseErrors // Log or handle parse errors
+	defer pool.Close()
+	parsed, _ := pool.ParseAll(ctx, mappedFiles)
 
-	// Phase 4: Aggregate into CodeGraph
 	graph := ingestion.Aggregate(rootPath, mappedFiles, parsed)
+	contentMap := buildContentMap(mappedFiles)
 
-	// Phase 5: Convert and write to version stores
-	result := &SessionIngestionResult{}
-
-	// Convert and write file nodes
-	fileNodes, fileIDMap, filePathMap, docRefMap, err := s.convertFileNodes(graph.Files)
-	if err != nil {
-		return nil, fmt.Errorf("convert file nodes: %w", err)
-	}
-	if err := s.nodeStore.WriteBatch(fileNodes); err != nil {
-		return nil, fmt.Errorf("write file nodes: %w", err)
-	}
-	result.NodesCreated += len(fileNodes)
-	result.FilesProcessed = len(fileNodes)
-
-	// Convert and write symbol nodes
-	symbolNodes, symbolIDMap, err := s.convertSymbolNodes(graph.Symbols, fileIDMap, filePathMap, docRefMap)
-	if err != nil {
-		return nil, fmt.Errorf("convert symbol nodes: %w", err)
-	}
-	if err := s.nodeStore.WriteBatch(symbolNodes); err != nil {
-		return nil, fmt.Errorf("write symbol nodes: %w", err)
-	}
-	result.NodesCreated += len(symbolNodes)
-
-	// Generate and write vectors for all nodes (if embedder is set)
-	if s.embedder != nil {
-		allNodes := append(fileNodes, symbolNodes...)
-		vectors, embeddingErrors := s.generateVectors(ctx, allNodes)
-		if len(vectors) > 0 {
-			if err := s.vectorStore.WriteBatch(vectors); err != nil {
-				return nil, fmt.Errorf("write vectors: %w", err)
-			}
-		}
-		result.VectorsCreated = len(vectors)
-		result.EmbeddingErrors = embeddingErrors
-	}
-
-	// Convert and write edges
-	containsEdges := s.convertEdges(graph.ContainsEdges, fileIDMap, symbolIDMap, EdgeTypeContains)
-	if err := s.edgeStore.WriteBatch(containsEdges); err != nil {
-		return nil, fmt.Errorf("write contains edges: %w", err)
-	}
-	result.EdgesCreated += len(containsEdges)
-
-	importEdges := s.convertEdges(graph.ImportEdges, fileIDMap, fileIDMap, EdgeTypeImports)
-	if err := s.edgeStore.WriteBatch(importEdges); err != nil {
-		return nil, fmt.Errorf("write import edges: %w", err)
-	}
-	result.EdgesCreated += len(importEdges)
-
-	// Create documents WITH content from mapped files
-	docs := s.createDocumentsWithContent(mappedFiles, graph.Files, fileIDMap)
-	if err := s.docStore.WriteBatch(docs); err != nil {
-		return nil, fmt.Errorf("write documents: %w", err)
-	}
-	result.DocsCreated = len(docs)
-
-	// Index into session Bleve for immediate searchability
-	if err := s.indexDocsIntoSessionBleve(ctx, docs); err != nil {
-		return nil, fmt.Errorf("index documents in session bleve: %w", err)
-	}
-
-	// Update delta tracker and evaluate checkpoint.
-	s.updateDeltaTracker(result)
-	s.evaluateCheckpoint()
-
-	result.Duration = time.Since(start)
-	return result, nil
-}
-
-// createDocumentsWithContent creates VersionDocuments with file content.
-func (s *SessionIngestion) createDocumentsWithContent(mapped []ingestion.MappedFile, files []ingestion.FileNode, fileIDMap map[uint32]uint32) []*VersionDocument {
-	// Build path -> content map
-	contentMap := make(map[string]string, len(mapped))
-	for _, m := range mapped {
-		contentMap[m.Path] = string(m.Data)
-	}
-
-	docs := make([]*VersionDocument, len(files))
-	now := time.Now().UnixNano()
-
-	for i, file := range files {
-		content := contentMap[file.Path]
-		docs[i] = &VersionDocument{
-			ID:        fmt.Sprintf("file_%d", fileIDMap[file.ID]),
-			Path:      file.Path,
-			Type:      "source_code",
-			Content:   content,
-			Language:  file.Lang,
-			IndexedAt: now,
-		}
-	}
-
-	return docs
+	return s.IngestCodeGraph(ctx, graph, contentMap)
 }
 
 // indexDocsIntoSessionBleve indexes version documents into the session's
@@ -539,6 +917,11 @@ func (s *SessionIngestion) GetDocStore() *VersionDocStore {
 // GetVectorStore returns the underlying vector store for direct access.
 func (s *SessionIngestion) GetVectorStore() *VersionVectorStore {
 	return s.vectorStore
+}
+
+// GetChunkRefStore returns the underlying chunk ref store for direct access.
+func (s *SessionIngestion) GetChunkRefStore() *ChunkRefStore {
+	return s.chunkRefStore
 }
 
 // updateDeltaTracker records ingestion results in the session's delta tracker.

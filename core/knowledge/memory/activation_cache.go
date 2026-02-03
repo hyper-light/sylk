@@ -187,17 +187,19 @@ func (c *ActivationCache) Get(nodeID string, accessTime time.Time) (float64, boo
 
 	c.mu.RLock()
 	entry, found := c.entries[key]
-	c.mu.RUnlock()
-
 	if !found {
+		c.mu.RUnlock()
 		c.recordMiss()
 		return 0.0, false
 	}
 
-	// Check expiration
-	if entry.IsExpired() {
+	// Read fields while holding RLock to prevent race with Set() writes.
+	expired := entry.IsExpired()
+	activation := entry.Activation
+	c.mu.RUnlock()
+
+	if expired {
 		c.recordExpiration()
-		// Don't remove here (would need write lock), let it be cleaned up later
 		return 0.0, false
 	}
 
@@ -207,7 +209,7 @@ func (c *ActivationCache) Get(nodeID string, accessTime time.Time) (float64, boo
 	c.mu.Unlock()
 
 	c.recordHit()
-	return entry.Activation, true
+	return activation, true
 }
 
 // Set stores an activation value in the cache.

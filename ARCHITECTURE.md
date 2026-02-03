@@ -4124,8 +4124,8 @@ type UniversalContentStore struct {
 | Architect | Opus 4.5 | 200K | Knowledge | Task Completion Eviction | GP-detected |
 | Engineer | Opus 4.5 | 200K | Pipeline | **Same-Type Handoff** | GP-detected |
 | Designer | Sonnet 4.5 | 200K | Pipeline | **Same-Type Handoff** | GP-detected |
-| Inspector | Sonnet/Haiku | 200K | Pipeline/Standalone | **Same-Type Handoff** | GP-detected |
-| Tester | Sonnet/Haiku | 200K | Pipeline/Standalone | **Same-Type Handoff** | GP-detected |
+| Inspector | Codex 5.2 | 200K | Pipeline/Standalone | **Same-Type Handoff** | GP-detected |
+| Tester | Codex5.2 | 200K | Pipeline/Standalone | **Same-Type Handoff** | GP-detected |
 
 ### Context Reference Markers
 

@@ -223,10 +223,10 @@ func StandardChecks() []InvariantCheck {
 			Severity:    SeverityError,
 		},
 		{
-			Name:        "invalid_hnsw_entry",
-			Description: "HNSW index entries pointing to non-existent nodes",
-			Query:       "SELECT node_id FROM hnsw_nodes WHERE node_id NOT IN (SELECT id FROM nodes)",
-			Repair:      "DELETE FROM hnsw_nodes WHERE node_id NOT IN (SELECT id FROM nodes)",
+			Name:        "invalid_vector_index_meta",
+			Description: "Vector index metadata with invalid references",
+			Query:       "SELECT key FROM vector_index_meta WHERE key LIKE 'node:%' AND SUBSTR(key, 6) NOT IN (SELECT id FROM nodes)",
+			Repair:      "DELETE FROM vector_index_meta WHERE key LIKE 'node:%' AND SUBSTR(key, 6) NOT IN (SELECT id FROM nodes)",
 			Severity:    SeverityCritical,
 		},
 		{

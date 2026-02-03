@@ -125,7 +125,8 @@ func (s *ShardedVectorStore) saveMeta() error {
 }
 
 func (s *ShardedVectorStore) loadShards() []*vectorShard {
-	return s.shards.Load().([]*vectorShard)
+	v, _ := s.shards.Load().([]*vectorShard)
+	return v
 }
 
 func (s *ShardedVectorStore) createShard() error {

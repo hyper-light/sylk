@@ -164,6 +164,93 @@ func (w *SessionWAL) LogChunkRefInsert(d *WALChunkRefData) (uint64, error) {
 	return w.append(wal.OpChunkRefInsert, d.MarshalBinary())
 }
 
+// --- Batch log methods (single sync per batch) ---
+
+// LogNodeBatch logs multiple node insertions with a single sync.
+func (w *SessionWAL) LogNodeBatch(nodes []*WALNodeData) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, d := range nodes {
+		if err := w.logNodeInsertLocked(d); err != nil {
+			return err
+		}
+	}
+	return w.syncLocked()
+}
+
+// logNodeInsertLocked encodes and appends a single node entry. Caller holds w.mu.
+func (w *SessionWAL) logNodeInsertLocked(d *WALNodeData) error {
+	data, err := EncodeNodeData(d)
+	if err != nil {
+		return err
+	}
+	_, err = w.appendLocked(wal.OpNodeInsert, data)
+	return err
+}
+
+// LogEdgeBatch logs multiple edge insertions with a single sync.
+func (w *SessionWAL) LogEdgeBatch(edges []*WALEdgeData) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, d := range edges {
+		if _, err := w.appendLocked(wal.OpEdgeInsert, EncodeEdgeData(d)); err != nil {
+			return err
+		}
+	}
+	return w.syncLocked()
+}
+
+// LogDocBatch logs multiple document insertions with a single sync.
+func (w *SessionWAL) LogDocBatch(docs []*WALDocData) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, d := range docs {
+		if err := w.logDocInsertLocked(d); err != nil {
+			return err
+		}
+	}
+	return w.syncLocked()
+}
+
+// logDocInsertLocked encodes and appends a single doc entry. Caller holds w.mu.
+func (w *SessionWAL) logDocInsertLocked(d *WALDocData) error {
+	data, err := EncodeDocData(d)
+	if err != nil {
+		return err
+	}
+	_, err = w.appendLocked(wal.OpDocInsert, data)
+	return err
+}
+
+// LogVectorBatch logs multiple vector insertions with a single sync.
+func (w *SessionWAL) LogVectorBatch(vectors []*WALVectorData) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, d := range vectors {
+		if _, err := w.appendLocked(wal.OpVectorInsert, EncodeVectorData(d)); err != nil {
+			return err
+		}
+	}
+	return w.syncLocked()
+}
+
+// LogChunkRefBatch logs multiple chunk ref insertions with a single sync.
+func (w *SessionWAL) LogChunkRefBatch(refs []*WALChunkRefData) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, d := range refs {
+		if _, err := w.appendLocked(wal.OpChunkRefInsert, d.MarshalBinary()); err != nil {
+			return err
+		}
+	}
+	return w.syncLocked()
+}
+
 // --- Replay ---
 
 // SessionReplayHandler holds optional callbacks for each session OpType.
@@ -273,6 +360,16 @@ func (w *SessionWAL) append(opType wal.OpType, data []byte) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	seq, err := w.appendLocked(opType, data)
+	if err != nil {
+		return 0, err
+	}
+	return seq, w.syncLocked()
+}
+
+// appendLocked writes a single WAL entry without acquiring the lock or syncing.
+// Caller must hold w.mu and call syncLocked after the batch completes.
+func (w *SessionWAL) appendLocked(opType wal.OpType, data []byte) (uint64, error) {
 	if w.currentEntries >= walSegmentCapacity {
 		if err := w.rotateSegment(); err != nil {
 			return 0, fmt.Errorf("session wal: rotate: %w", err)
@@ -280,17 +377,9 @@ func (w *SessionWAL) append(opType wal.OpType, data []byte) (uint64, error) {
 	}
 
 	seq := w.sequence.Add(1)
-
-	entry := wal.WALEntry{
-		SequenceID: seq,
-		OpType:     opType,
-		Timestamp:  time.Now().UnixNano(),
-		Data:       data,
-	}
-
-	entryBytes, err := entry.MarshalBinary()
+	entryBytes, err := w.marshalEntry(seq, opType, data)
 	if err != nil {
-		return 0, fmt.Errorf("session wal: marshal: %w", err)
+		return 0, err
 	}
 
 	if _, err := w.currentSegment.Write(entryBytes); err != nil {
@@ -298,14 +387,27 @@ func (w *SessionWAL) append(opType wal.OpType, data []byte) (uint64, error) {
 	}
 
 	w.currentEntries++
-
-	if w.syncOnWrite {
-		if err := w.currentSegment.Sync(); err != nil {
-			return 0, fmt.Errorf("session wal: sync: %w", err)
-		}
-	}
-
 	return seq, nil
+}
+
+// marshalEntry creates and serializes a WAL entry.
+func (w *SessionWAL) marshalEntry(seq uint64, opType wal.OpType, data []byte) ([]byte, error) {
+	entry := wal.WALEntry{
+		SequenceID: seq,
+		OpType:     opType,
+		Timestamp:  time.Now().UnixNano(),
+		Data:       data,
+	}
+	return entry.MarshalBinary()
+}
+
+// syncLocked syncs the current segment if syncOnWrite is enabled.
+// Caller must hold w.mu.
+func (w *SessionWAL) syncLocked() error {
+	if w.syncOnWrite && w.currentSegment != nil {
+		return w.currentSegment.Sync()
+	}
+	return nil
 }
 
 // Checkpoint saves the checkpoint sequence and GCs old segments.

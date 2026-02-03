@@ -52,6 +52,13 @@ type KMeansConfig struct {
 
 	// Seed for reproducible results. 0 = use current time.
 	Seed int64
+
+	// Workers is the max number of parallel restart workers.
+	// 0 = runtime.NumCPU(). When KMeansOptimal is called from within
+	// a parallel operation (e.g., per-subspace PQ training), the caller
+	// should set this to its share of the total CPU budget to prevent
+	// goroutine multiplication.
+	Workers int
 }
 
 // DeriveKMeansConfig returns configuration derived from problem parameters.
@@ -671,11 +678,11 @@ func KMeansOptimal(ctx context.Context, vectors [][]float32, k int, config KMean
 	}
 
 	// Determine parallelization strategy
-	numWorkers := config.NumRestarts
-	maxWorkers := runtime.NumCPU()
-	if numWorkers > maxWorkers {
-		numWorkers = maxWorkers
+	maxWorkers := config.Workers
+	if maxWorkers <= 0 {
+		maxWorkers = runtime.NumCPU()
 	}
+	numWorkers := min(config.NumRestarts, maxWorkers)
 
 	// For sequential execution (GOMAXPROCS=1 or limited workers), reuse state to avoid memory churn
 	if runtime.GOMAXPROCS(0) == 1 || numWorkers == 1 {

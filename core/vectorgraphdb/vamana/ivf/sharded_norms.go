@@ -292,7 +292,8 @@ func (s *normShard) Close() error {
 }
 
 func (s *ShardedNormStore) loadShards() []*normShard {
-	return s.shards.Load().([]*normShard)
+	v, _ := s.shards.Load().([]*normShard)
+	return v
 }
 
 func (s *ShardedNormStore) createShard() error {

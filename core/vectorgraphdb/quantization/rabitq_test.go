@@ -19,7 +19,7 @@ func TestNewRaBitQCode(t *testing.T) {
 	}{
 		{"positive dimension 8", 8, 1, false},
 		{"positive dimension 64", 64, 8, false},
-		{"positive dimension 768", 768, 96, false},
+		{"positive dimension 1024", 1024, 128, false},
 		{"positive dimension 9 (rounds up)", 9, 2, false},
 		{"positive dimension 1", 1, 1, false},
 		{"zero dimension", 0, 0, true},
@@ -53,7 +53,7 @@ func TestRaBitQCode_Dimension(t *testing.T) {
 	}{
 		{"8 dimensions", 8, 8},
 		{"64 dimensions", 64, 64},
-		{"768 dimensions", 768, 768},
+		{"1024 dimensions", 1024, 1024},
 		{"9 dimensions (rounds to 16)", 9, 16},
 		{"1 dimension (rounds to 8)", 1, 8},
 	}
@@ -196,7 +196,7 @@ func TestRaBitQCode_String(t *testing.T) {
 		{"nil code", nil, "nil"},
 		{"empty code", RaBitQCode{}, "[0]"},
 		{"short code", NewRaBitQCode(16), "[2]"},
-		{"long code", NewRaBitQCode(768), "[96]"},
+		{"long code", NewRaBitQCode(1024), "[128]"},
 	}
 
 	for _, tt := range tests {
@@ -326,7 +326,7 @@ func TestRaBitQEncoder_Encode_DifferentVectors(t *testing.T) {
 }
 
 func TestRaBitQEncoder_Encode_CodeLength(t *testing.T) {
-	dimensions := []int{8, 64, 128, 768}
+	dimensions := []int{8, 64, 128, 1024}
 
 	for _, dim := range dimensions {
 		t.Run(dimName(dim), func(t *testing.T) {
@@ -938,7 +938,7 @@ func TestRaBitQEncoder_EdgeCases_SmallDimension(t *testing.T) {
 
 func TestRaBitQEncoder_EdgeCases_LargeDimension(t *testing.T) {
 	config := RaBitQConfig{
-		Dimension:        768,
+		Dimension:        1024,
 		Seed:             12345,
 		CorrectionFactor: true,
 	}
@@ -948,7 +948,7 @@ func TestRaBitQEncoder_EdgeCases_LargeDimension(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(42))
-	vector := make([]float32, 768)
+	vector := make([]float32, 1024)
 	for i := range vector {
 		vector[i] = float32(rng.NormFloat64())
 	}
@@ -958,15 +958,15 @@ func TestRaBitQEncoder_EdgeCases_LargeDimension(t *testing.T) {
 		t.Fatalf("encoding failed: %v", err)
 	}
 
-	expectedBytes := 96 // 768 / 8
+	expectedBytes := 128 // 1024 / 8
 	if len(code) != expectedBytes {
 		t.Errorf("code length = %d bytes, want %d", len(code), expectedBytes)
 	}
 
 	// Verify PopCount is reasonable (should be roughly 50% for random vector)
 	popCount := code.PopCount()
-	if popCount < 300 || popCount > 468 {
-		t.Logf("Large vector PopCount = %d (expected ~384)", popCount)
+	if popCount < 400 || popCount > 624 {
+		t.Logf("Large vector PopCount = %d (expected ~512)", popCount)
 	}
 }
 
@@ -1064,7 +1064,7 @@ func BenchmarkRaBitQEncode(b *testing.B) {
 	}{
 		{"64d", 64},
 		{"128d", 128},
-		{"768d", 768},
+		{"1024d", 1024},
 	}
 
 	for _, bm := range benchmarks {
@@ -1092,15 +1092,15 @@ func BenchmarkRaBitQEncode(b *testing.B) {
 
 func BenchmarkRaBitQHammingDistance(b *testing.B) {
 	config := RaBitQConfig{
-		Dimension:        768,
+		Dimension:        1024,
 		Seed:             12345,
 		CorrectionFactor: true,
 	}
 	encoder, _ := NewRaBitQEncoder(config)
 
 	rng := rand.New(rand.NewSource(42))
-	vec1 := make([]float32, 768)
-	vec2 := make([]float32, 768)
+	vec1 := make([]float32, 1024)
+	vec2 := make([]float32, 1024)
 	for i := range vec1 {
 		vec1[i] = float32(rng.NormFloat64())
 		vec2[i] = float32(rng.NormFloat64())
@@ -1117,15 +1117,15 @@ func BenchmarkRaBitQHammingDistance(b *testing.B) {
 
 func BenchmarkRaBitQApproximateL2(b *testing.B) {
 	config := RaBitQConfig{
-		Dimension:        768,
+		Dimension:        1024,
 		Seed:             12345,
 		CorrectionFactor: true,
 	}
 	encoder, _ := NewRaBitQEncoder(config)
 
 	rng := rand.New(rand.NewSource(42))
-	query := make([]float32, 768)
-	target := make([]float32, 768)
+	query := make([]float32, 1024)
+	target := make([]float32, 1024)
 	for i := range query {
 		query[i] = float32(rng.NormFloat64())
 		target[i] = float32(rng.NormFloat64())
@@ -1141,7 +1141,7 @@ func BenchmarkRaBitQApproximateL2(b *testing.B) {
 
 func BenchmarkRaBitQEncodeBatch(b *testing.B) {
 	config := RaBitQConfig{
-		Dimension:        768,
+		Dimension:        1024,
 		Seed:             12345,
 		CorrectionFactor: true,
 	}
@@ -1150,7 +1150,7 @@ func BenchmarkRaBitQEncodeBatch(b *testing.B) {
 	rng := rand.New(rand.NewSource(42))
 	vectors := make([][]float32, 100)
 	for j := range vectors {
-		vectors[j] = make([]float32, 768)
+		vectors[j] = make([]float32, 1024)
 		for i := range vectors[j] {
 			vectors[j][i] = float32(rng.NormFloat64())
 		}
@@ -1169,7 +1169,7 @@ func BenchmarkGenerateOrthogonalMatrix(b *testing.B) {
 	}{
 		{"64d", 64},
 		{"128d", 128},
-		{"768d", 768},
+		{"1024d", 1024},
 	}
 
 	for _, bm := range benchmarks {

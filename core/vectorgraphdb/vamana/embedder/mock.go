@@ -29,6 +29,10 @@ func (m *MockEmbedder) Dimension() int {
 	return m.dimension
 }
 
+func (m *MockEmbedder) MaxInputBytes() int {
+	return m.dimension * 4
+}
+
 func (m *MockEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	if m.latency > 0 {
 		select {

@@ -15,9 +15,9 @@ const (
 	DefaultNodeBlockSize = 4096
 
 	// NodeHeaderSize is the fixed header size for binary node format.
-	// Layout: ID(4) + Domain(1) + Type(1) + padding(2) + CreatedAt(8) +
-	//         SessionID(4) + CreatedBy(2) + padding(2) + SupersededBy(4) + Supersedes(4)
-	// Total: 32 bytes (cache-line aligned)
+	// Layout: ID(4) + Domain(1) + Type(1) + CreatedBy(2) + CreatedAt(8) +
+	//         SessionID(4) + DocRef(4) + SupersededBy(4) + Supersedes(4)
+	// Total: 32 bytes (cache-line aligned, zero padding)
 	NodeHeaderSize = 32
 
 	// MaxStringLen is the maximum length for a variable-length string field.
@@ -40,16 +40,19 @@ type Node struct {
 	Domain   uint8 // Domain enum
 	NodeType uint8 // NodeType enum
 
+	// Provenance
+	CreatedBy uint16 // Agent ID
+	CreatedAt uint64 // Unix nano timestamp
+	SessionID uint32 // Session that created this node
+
+	// Document reference (many-to-one: multiple nodes → one document)
+	DocRef uint32 // Document ID from DocIDMap (0 = no document)
+
 	// Content
 	Name      string // Human-readable name
 	Path      string // File path or URL
 	Package   string // Package/module
 	Signature string // Function signature
-
-	// Provenance
-	CreatedAt uint64 // Unix nano timestamp
-	SessionID uint32 // Session that created this node
-	CreatedBy uint16 // Agent ID
 
 	// Supersession chain
 	SupersededBy uint32 // ID of newer version (0 = current)
@@ -68,15 +71,14 @@ func (n *Node) MarshalBinary() ([]byte, error) {
 
 	buf := make([]byte, NodeHeaderSize+varLen)
 
-	// Write fixed header
+	// Write fixed header (32 bytes, zero padding)
 	binary.LittleEndian.PutUint32(buf[0:4], n.ID)
 	buf[4] = n.Domain
 	buf[5] = n.NodeType
-	// buf[6:8] = padding
+	binary.LittleEndian.PutUint16(buf[6:8], n.CreatedBy)
 	binary.LittleEndian.PutUint64(buf[8:16], n.CreatedAt)
 	binary.LittleEndian.PutUint32(buf[16:20], n.SessionID)
-	binary.LittleEndian.PutUint16(buf[20:22], n.CreatedBy)
-	// buf[22:24] = padding
+	binary.LittleEndian.PutUint32(buf[20:24], n.DocRef)
 	binary.LittleEndian.PutUint32(buf[24:28], n.SupersededBy)
 	binary.LittleEndian.PutUint32(buf[28:32], n.Supersedes)
 
@@ -97,13 +99,14 @@ func (n *Node) UnmarshalBinary(data []byte) error {
 		return ErrInvalidNodeData
 	}
 
-	// Read fixed header
+	// Read fixed header (32 bytes, zero padding)
 	n.ID = binary.LittleEndian.Uint32(data[0:4])
 	n.Domain = data[4]
 	n.NodeType = data[5]
+	n.CreatedBy = binary.LittleEndian.Uint16(data[6:8])
 	n.CreatedAt = binary.LittleEndian.Uint64(data[8:16])
 	n.SessionID = binary.LittleEndian.Uint32(data[16:20])
-	n.CreatedBy = binary.LittleEndian.Uint16(data[20:22])
+	n.DocRef = binary.LittleEndian.Uint32(data[20:24])
 	n.SupersededBy = binary.LittleEndian.Uint32(data[24:28])
 	n.Supersedes = binary.LittleEndian.Uint32(data[28:32])
 
@@ -187,7 +190,7 @@ func NewNodeBlockStore(blocksPath, indexPath string) *NodeBlockStore {
 
 // NewNodeBlockStoreFromSylkDir creates a NodeBlockStore from a SylkDir.
 func NewNodeBlockStoreFromSylkDir(sd *SylkDir) *NodeBlockStore {
-	return NewNodeBlockStore(sd.NodeBlocksPath(), sd.NodeIndexPath())
+	return NewNodeBlockStore(sd.GlobalNodeBlocksPath(), sd.GlobalCanonicalIndexPath())
 }
 
 // Init initializes the node block store, loading existing index if present.

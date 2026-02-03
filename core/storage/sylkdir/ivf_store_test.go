@@ -48,14 +48,14 @@ func TestIVFStorePaths(t *testing.T) {
 		got      string
 		expected string
 	}{
-		{"Path", store.Path(), "/project/root/.sylk/knowledge/vectors"},
-		{"VectorsSubpath", store.VectorsSubpath(), "/project/root/.sylk/knowledge/vectors/vectors"},
-		{"GraphSubpath", store.GraphSubpath(), "/project/root/.sylk/knowledge/vectors/graph"},
-		{"NormsSubpath", store.NormsSubpath(), "/project/root/.sylk/knowledge/vectors/norms"},
-		{"BBQSubpath", store.BBQSubpath(), "/project/root/.sylk/knowledge/vectors/bbq"},
-		{"CentroidsPath", store.CentroidsPath(), "/project/root/.sylk/knowledge/vectors/centroids.bin"},
-		{"PartitionsPath", store.PartitionsPath(), "/project/root/.sylk/knowledge/vectors/partitions.bin"},
-		{"MetadataPath", store.MetadataPath(), "/project/root/.sylk/knowledge/vectors/metadata.yaml"},
+		{"Path", store.Path(), "/project/root/.sylk/data/ivf"},
+		{"VectorsSubpath", store.VectorsSubpath(), "/project/root/.sylk/data/ivf/vectors"},
+		{"GraphSubpath", store.GraphSubpath(), "/project/root/.sylk/data/ivf/graph"},
+		{"NormsSubpath", store.NormsSubpath(), "/project/root/.sylk/data/ivf/norms"},
+		{"BBQSubpath", store.BBQSubpath(), "/project/root/.sylk/data/ivf/bbq"},
+		{"CentroidsPath", store.CentroidsPath(), "/project/root/.sylk/data/ivf/centroids.bin"},
+		{"PartitionsPath", store.PartitionsPath(), "/project/root/.sylk/data/ivf/partitions.bin"},
+		{"MetadataPath", store.MetadataPath(), "/project/root/.sylk/data/ivf/metadata.yaml"},
 	}
 
 	for _, tt := range tests {

@@ -17,6 +17,7 @@ func createTestSession(t *testing.T) (*Session, *SessionStore) {
 	if err != nil {
 		t.Fatalf("Create session failed: %v", err)
 	}
+	t.Cleanup(func() { sess.CloseBleve() })
 
 	return sess, store
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/search"
+	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
 )
 
 // SessionStatus represents the state of a session.
@@ -166,6 +167,7 @@ func (s *SessionStore) CreateNamed(sessionID uint32, stringID string, baseSnapsh
 		filepath.Join(sessionPath, "data", "nodes"),
 		filepath.Join(sessionPath, "data", "vectors"),
 		filepath.Join(sessionPath, "data", "docs"),
+		filepath.Join(sessionPath, "data", "chunks"),
 	}
 
 	for _, dir := range dirs {
@@ -260,6 +262,15 @@ func (s *SessionStore) CreateNamed(sessionID uint32, stringID string, baseSnapsh
 	}
 	sess.DocDataFile = docDF
 
+	chunkDF, err := OpenSharedDataFile(sess.SharedChunkDataPath())
+	if err != nil {
+		nodeDF.Close()
+		vecDF.Close()
+		docDF.Close()
+		return nil, fmt.Errorf("open chunk data file: %w", err)
+	}
+	sess.ChunkDataFile = chunkDF
+
 	docIDMap, err := LoadDocIDMap(sess.DocIDMapPath())
 	if err != nil {
 		// No existing map — create fresh.
@@ -279,7 +290,7 @@ func (s *SessionStore) CreateNamed(sessionID uint32, stringID string, baseSnapsh
 	sess.DeltaTracker = delta
 	sess.CheckpointCtrl = s.buildCheckpointController(delta, sessionWAL)
 
-	// Create per-version Bleve store and open HEAD
+	// Create per-version Bleve store and open HEAD.
 	vbs := NewVersionBleveStore(sess)
 	if err := vbs.OpenHead(); err != nil {
 		return nil, fmt.Errorf("open head bleve: %w", err)
@@ -333,6 +344,10 @@ func (s *SessionStore) Load(stringID string) (*Session, error) {
 		docDF, dfErr := OpenSharedDataFile(sess.SharedDocDataPath())
 		if dfErr == nil {
 			sess.DocDataFile = docDF
+		}
+		chunkDF, dfErr := OpenSharedDataFile(sess.SharedChunkDataPath())
+		if dfErr == nil {
+			sess.ChunkDataFile = chunkDF
 		}
 		docIDMap, dimErr := LoadDocIDMap(sess.DocIDMapPath())
 		if dimErr != nil {
@@ -602,11 +617,18 @@ type Session struct {
 	ChunkDataFile  *SharedDataFile        // Shared chunk ref data file (nil for committed sessions)
 	DocIDMap       *DocIDMap              // String→uint32 doc ID mapping (nil for committed sessions)
 
+	// Shared node ID counter for ingestion. Initialized from BaseSnapshot.NextNodeID.
+	nextNodeID uint32
+
 	// Registered version stores (set by constructors for checkpoint integration).
 	nodeStore     *VersionNodeStore
 	vectorStore   *VersionVectorStore
 	docStore      *VersionDocStore
 	chunkRefStore *ChunkRefStore
+
+	// PendingVectors holds vectors from session ingestion that bypass
+	// the session disk store. Consumed directly by CommitToGlobal.
+	PendingVectors []*VersionVector
 }
 
 // RegisterNodeStore is called by NewVersionNodeStore to enable checkpoint index saving.
@@ -627,6 +649,23 @@ func (sess *Session) RegisterDocStore(s *VersionDocStore) {
 // RegisterChunkRefStore is called by NewChunkRefStore to enable checkpoint index saving.
 func (sess *Session) RegisterChunkRefStore(s *ChunkRefStore) {
 	sess.chunkRefStore = s
+}
+
+// InsertDocument creates a document with chunked content, embeddings, and
+// graph structure. This is the primary entry point for document ingestion.
+// The embedder may be nil, in which case no vectors are created.
+func (sess *Session) InsertDocument(ctx context.Context, req *JointDocRequest, e embedder.Embedder) (*JointDocResult, error) {
+	jdi := NewJointDocIngestion(sess, sess.nextAllocID(), e)
+	return jdi.Insert(ctx, req)
+}
+
+// nextAllocID returns a pointer to the session's shared node ID counter.
+// Initializes from BaseSnapshot.NextNodeID on first use.
+func (sess *Session) nextAllocID() *uint32 {
+	if sess.nextNodeID == 0 && sess.BaseSnapshot != nil {
+		sess.nextNodeID = sess.BaseSnapshot.NextNodeID
+	}
+	return &sess.nextNodeID
 }
 
 // SharedNodeDataPath returns the path to the session's shared node data file.
@@ -752,6 +791,13 @@ func (sess *Session) Checkpoint(name string, checkpointType CheckpointType) (Sem
 	// Persist manifest
 	if err := sess.store.writeManifest(sess.path, sess.Manifest); err != nil {
 		return SemanticVersion{}, err
+	}
+
+	// Reopen HEAD Bleve for the new version (rebuild from doc data if needed).
+	if sess.BleveStore != nil {
+		if err := sess.BleveStore.OpenHead(); err != nil {
+			return SemanticVersion{}, fmt.Errorf("reopen head bleve after checkpoint: %w", err)
+		}
 	}
 
 	return newVersion, nil
@@ -1020,6 +1066,9 @@ func (sess *Session) Close() error {
 	}
 	if sess.DocDataFile != nil {
 		sess.DocDataFile.Close()
+	}
+	if sess.ChunkDataFile != nil {
+		sess.ChunkDataFile.Close()
 	}
 	if sess.DocIDMap != nil {
 		_ = sess.DocIDMap.Save()

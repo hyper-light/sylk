@@ -28,6 +28,12 @@ const (
 	lcgCenter = 1 << 30
 )
 
+// TombstoneFilter provides O(1) dead-node checking for search filtering.
+// Implementations include TombstoneBitmap (sylkdir) and TombstoneSet (vamana).
+type TombstoneFilter interface {
+	IsDead(nodeID uint32) bool
+}
+
 type Index struct {
 	config        Config
 	dim           int
@@ -54,7 +60,8 @@ type Index struct {
 
 	healthTracker *HealthTracker
 
-	wal *WAL
+	wal        *WAL
+	tombstones TombstoneFilter // nil = no filtering
 }
 
 type idLocation struct {
@@ -73,6 +80,17 @@ func NewIndex(config Config, dim int) *Index {
 		dim:           dim,
 		partitionBits: partitionBits,
 	}
+}
+
+// SetTombstones injects a tombstone filter for dead-node exclusion during search.
+// Pass nil to disable filtering.
+func (idx *Index) SetTombstones(tf TombstoneFilter) {
+	idx.tombstones = tf
+}
+
+// isDead returns true if the node is tombstoned. Safe to call when tombstones is nil.
+func (idx *Index) isDead(nodeID uint32) bool {
+	return idx.tombstones != nil && idx.tombstones.IsDead(nodeID)
 }
 
 func (idx *Index) NumVectors() int {
@@ -740,6 +758,10 @@ func (idx *Index) parallelBBQSearch(query []float32, queryNorm float64, k int) [
 
 			codeLen := idx.bbqCodeLen
 			for i := start; i < end; i++ {
+				if idx.isDead(uint32(i)) {
+					continue
+				}
+
 				offset := i * codeLen
 				code := idx.bbqCodes[offset : offset+codeLen]
 				dist := qEnc.Distance(code)
@@ -890,6 +912,10 @@ func (idx *Index) searchPartitions(query []float32, queryNorm float64, partition
 	for _, p := range partitions {
 		ids := idx.partitionIDs[p]
 		for _, id := range ids {
+			if idx.isDead(id) {
+				continue
+			}
+
 			vecStart := int(id) * dim
 			vec := idx.vectorsFlat[vecStart : vecStart+dim]
 			vecNorm := idx.vectorNorms[id]
@@ -923,6 +949,10 @@ func (idx *Index) exactSearch(query []float32, queryNorm float64, k int) []Searc
 	heap.Init(h)
 
 	for i := range idx.numVectors {
+		if idx.isDead(uint32(i)) {
+			continue
+		}
+
 		vecStart := i * dim
 		vec := idx.vectorsFlat[vecStart : vecStart+dim]
 		vecNorm := idx.vectorNorms[i]
@@ -980,6 +1010,10 @@ func (idx *Index) parallelExactSearch(query []float32, queryNorm float64, k int)
 			heap.Init(h)
 
 			for i := start; i < end; i++ {
+				if idx.isDead(uint32(i)) {
+					continue
+				}
+
 				vecStart := i * dim
 				vec := idx.vectorsFlat[vecStart : vecStart+dim]
 				vecNorm := idx.vectorNorms[i]
@@ -1226,6 +1260,10 @@ func (idx *Index) exactRerank(candidates []uint32, query []float32, queryNorm fl
 	heap.Init(h)
 
 	for _, id := range candidates {
+		if idx.isDead(id) {
+			continue
+		}
+
 		vecStart := int(id) * dim
 		vec := idx.vectorsFlat[vecStart : vecStart+dim]
 		vecNorm := idx.vectorNorms[id]

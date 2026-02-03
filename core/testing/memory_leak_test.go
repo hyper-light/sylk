@@ -15,8 +15,7 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/search/coordinator"
-	"github.com/adalundhe/sylk/core/vectorgraphdb"
-	"github.com/adalundhe/sylk/core/vectorgraphdb/hnsw"
+	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/ivf"
 )
 
 const (
@@ -65,70 +64,69 @@ func checkMemoryGrowth(t *testing.T, before, after memorySnapshot, label string)
 	}
 }
 
-// TestMemoryLeakHNSWGraph tests for memory leaks in HNSW operations.
-func TestMemoryLeakHNSWGraph(t *testing.T) {
-	t.Run("InsertDeleteCycle", testHNSWInsertDeleteCycle)
-	t.Run("SearchOperations", testHNSWSearchOperations)
+// TestMemoryLeakIVFIndex tests for memory leaks in IVF index operations.
+func TestMemoryLeakIVFIndex(t *testing.T) {
+	t.Run("InsertCycle", testIVFInsertCycle)
+	t.Run("SearchOperations", testIVFSearchOperations)
 }
 
-func testHNSWInsertDeleteCycle(t *testing.T) {
+func testIVFInsertCycle(t *testing.T) {
+	// Warmup: run the same workload to fully stabilize the runtime allocator.
+	// IVF Build allocates centroids, graph, and BBQ structures that cause
+	// heap expansion; multiple cycles let the GC reach steady state.
+	runIVFLifecycle(t, iterations)
+
 	baseline := takeMemorySnapshot()
-	cfg := hnsw.Config{M: 8, EfConstruct: 50, EfSearch: 50, Dimension: 64}
-
-	for i := range iterations {
-		idx := hnsw.New(cfg)
-		runHNSWInsertDelete(t, idx, i)
-	}
-
+	runIVFLifecycle(t, iterations)
 	final := takeMemorySnapshot()
-	checkMemoryGrowth(t, baseline, final, "HNSW insert/delete cycle")
+	checkMemoryGrowth(t, baseline, final, "IVF insert cycle")
 }
 
-func runHNSWInsertDelete(t *testing.T, idx *hnsw.Index, iteration int) {
+// runIVFLifecycle creates, populates, and discards IVF indexes for n cycles.
+func runIVFLifecycle(t *testing.T, n int) {
 	t.Helper()
-	ids := make([]string, operationsPerIteration)
+	for range n {
+		cfg := ivf.ConfigForN(operationsPerIteration, 64)
+		idx := ivf.NewIndex(cfg, 64)
+		idx.Build(generateVectors(cfg.NumPartitions*2, 64))
+		runIVFInserts(t, idx)
+	}
+}
 
-	for j := range operationsPerIteration {
-		id := fmt.Sprintf("node-%d-%d", iteration, j)
+func runIVFInserts(t *testing.T, idx *ivf.Index) {
+	t.Helper()
+	for range operationsPerIteration {
 		vec := randomVector(64)
-		if err := idx.Insert(id, vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile); err != nil {
+		if _, err := idx.Insert(vec); err != nil {
 			t.Fatalf("insert failed: %v", err)
 		}
-		ids[j] = id
-	}
-
-	for _, id := range ids {
-		if err := idx.Delete(id); err != nil {
-			t.Fatalf("delete failed: %v", err)
-		}
 	}
 }
 
-func testHNSWSearchOperations(t *testing.T) {
-	cfg := hnsw.Config{M: 8, EfConstruct: 50, EfSearch: 50, Dimension: 64}
-	idx := hnsw.New(cfg)
-	populateHNSWIndex(t, idx, 200)
+func testIVFSearchOperations(t *testing.T) {
+	cfg := ivf.ConfigForN(200, 64)
+	idx := ivf.NewIndex(cfg, 64)
+	populateIVFIndex(t, idx, 200)
+
+	// Warmup: stabilize search allocations before measuring.
+	for range operationsPerIteration {
+		_ = idx.Search(randomVector(64), 10)
+	}
 
 	baseline := takeMemorySnapshot()
 
 	for range iterations * operationsPerIteration {
-		query := randomVector(64)
-		_ = idx.Search(query, 10, nil)
+		q := randomVector(64)
+		_ = idx.Search(q, 10)
 	}
 
 	final := takeMemorySnapshot()
-	checkMemoryGrowth(t, baseline, final, "HNSW search operations")
+	checkMemoryGrowth(t, baseline, final, "IVF search operations")
 }
 
-func populateHNSWIndex(t *testing.T, idx *hnsw.Index, count int) {
+func populateIVFIndex(t *testing.T, idx *ivf.Index, count int) {
 	t.Helper()
-	for i := range count {
-		id := fmt.Sprintf("base-%d", i)
-		vec := randomVector(64)
-		if err := idx.Insert(id, vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile); err != nil {
-			t.Fatalf("populate failed: %v", err)
-		}
-	}
+	idx.Build(generateVectors(count, 64))
 }
 
 // TestMemoryLeakBoundedOverflow tests for memory leaks in bounded overflow.
@@ -476,6 +474,15 @@ func checkGoroutineLeak(t *testing.T, before, after int, label string) {
 		t.Errorf("%s: leaked %d goroutines (before: %d, after: %d)",
 			label, leaked, before, after)
 	}
+}
+
+// generateVectors creates n random vectors of the given dimension.
+func generateVectors(n, dim int) [][]float32 {
+	vecs := make([][]float32, n)
+	for i := range vecs {
+		vecs[i] = randomVector(dim)
+	}
+	return vecs
 }
 
 // randomVector generates a random float32 vector.

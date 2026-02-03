@@ -16,21 +16,23 @@ const (
 )
 
 type ModelSpec struct {
-	Tier        ModelTier
-	Name        string
-	Format      ModelFormat
-	HFRepo      string
-	GGUFFile    string
-	Dimension   int
-	MaxDim      int
-	SizeBytes   int64
-	MTEBScore   float64
-	MinVRAMGB   float64
-	MinRAMGB    float64
-	SupportsGPU bool
-	SupportsMRL bool
-	Languages   int
-	CodeSupport bool
+	Tier           ModelTier
+	Name           string
+	Format         ModelFormat
+	HFRepo         string
+	GGUFFile       string
+	Dimension      int
+	MaxDim         int
+	MaxInputTokens int // Maximum input tokens the model can process.
+	BytesPerToken  int // Bytes per token for this model's tokenizer (from model documentation).
+	SizeBytes      int64
+	MTEBScore      float64
+	MinVRAMGB      float64
+	MinRAMGB       float64
+	SupportsGPU    bool
+	SupportsMRL    bool
+	Languages      int
+	CodeSupport    bool
 }
 
 const EmbeddingDimension = 1024
@@ -50,40 +52,45 @@ var ModelRegistry = map[ModelTier]ModelSpec{
 		SupportsMRL: false,
 		Languages:   0,
 		CodeSupport: true,
+		// MaxInputTokens/BytesPerToken omitted: non-neural, MaxInputBytes derived at runtime.
 	},
 	TierQwen3_0_6B: {
-		Tier:        TierQwen3_0_6B,
-		Name:        "Qwen3-Embedding-0.6B",
-		Format:      FormatGGUF,
-		HFRepo:      "Qwen/Qwen3-Embedding-0.6B-GGUF",
-		GGUFFile:    "qwen3-embedding-0.6b-q8_0.gguf",
-		Dimension:   EmbeddingDimension,
-		MaxDim:      1024,
-		SizeBytes:   639_000_000,
-		MTEBScore:   70.70,
-		MinVRAMGB:   1.0,
-		MinRAMGB:    1.5,
-		SupportsGPU: true,
-		SupportsMRL: true,
-		Languages:   100,
-		CodeSupport: true,
+		Tier:           TierQwen3_0_6B,
+		Name:           "Qwen3-Embedding-0.6B",
+		Format:         FormatGGUF,
+		HFRepo:         "Qwen/Qwen3-Embedding-0.6B-GGUF",
+		GGUFFile:       "qwen3-embedding-0.6b-q8_0.gguf",
+		Dimension:      EmbeddingDimension,
+		MaxDim:         1024,
+		MaxInputTokens: 32768, // Qwen3 model card: 32768 token context.
+		BytesPerToken:  4,     // BPE tokenizer, from Qwen3 model card.
+		SizeBytes:      639_000_000,
+		MTEBScore:      70.70,
+		MinVRAMGB:      1.0,
+		MinRAMGB:       1.5,
+		SupportsGPU:    true,
+		SupportsMRL:    true,
+		Languages:      100,
+		CodeSupport:    true,
 	},
 	TierQwen3_4B: {
-		Tier:        TierQwen3_4B,
-		Name:        "Qwen3-Embedding-4B",
-		Format:      FormatGGUF,
-		HFRepo:      "Qwen/Qwen3-Embedding-4B-GGUF",
-		GGUFFile:    "qwen3-embedding-4b-q4_k_m.gguf",
-		Dimension:   EmbeddingDimension,
-		MaxDim:      2560,
-		SizeBytes:   2_500_000_000,
-		MTEBScore:   74.60,
-		MinVRAMGB:   4.0,
-		MinRAMGB:    6.0,
-		SupportsGPU: true,
-		SupportsMRL: true,
-		Languages:   100,
-		CodeSupport: true,
+		Tier:           TierQwen3_4B,
+		Name:           "Qwen3-Embedding-4B",
+		Format:         FormatGGUF,
+		HFRepo:         "Qwen/Qwen3-Embedding-4B-GGUF",
+		GGUFFile:       "qwen3-embedding-4b-q4_k_m.gguf",
+		Dimension:      EmbeddingDimension,
+		MaxDim:         2560,
+		MaxInputTokens: 32768, // Qwen3 model card: 32768 token context.
+		BytesPerToken:  4,     // BPE tokenizer, from Qwen3 model card.
+		SizeBytes:      2_500_000_000,
+		MTEBScore:      74.60,
+		MinVRAMGB:      4.0,
+		MinRAMGB:       6.0,
+		SupportsGPU:    true,
+		SupportsMRL:    true,
+		Languages:      100,
+		CodeSupport:    true,
 	},
 }
 

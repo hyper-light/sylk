@@ -16,7 +16,7 @@ import (
 //
 // Key properties:
 //   - ZERO training time: rotation matrix deterministically derived from seed
-//   - 1 bit per dimension: 768-dim vector → 96 bytes
+//   - 1 bit per dimension: 1024-dim vector → 128 bytes
 //   - ~88% recall as instant baseline while LOPQ trains in background
 //   - Theoretical error bounds under mild assumptions
 
@@ -26,7 +26,7 @@ import (
 
 // RaBitQCode represents a sign-quantized vector as packed bits.
 // Each byte contains 8 sign bits from the rotated vector.
-// For a 768-dimensional vector, this produces 96 bytes.
+// For a 1024-dimensional vector, this produces 128 bytes.
 type RaBitQCode []byte
 
 // NewRaBitQCode creates a new RaBitQCode for a vector of the given dimension.

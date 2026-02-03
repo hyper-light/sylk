@@ -40,24 +40,6 @@ func TestNewVoyageEmbedder(t *testing.T) {
 		}
 	})
 
-	t.Run("uses provided rate limiter", func(t *testing.T) {
-		rl := NewRateLimiter(Config{TokensPerMin: 1000, RequestsPerMin: 10})
-		defer rl.Close()
-
-		v, err := NewVoyageEmbedder(VoyageConfig{
-			APIKey:      "test-key",
-			RateLimiter: rl,
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		defer v.Close()
-
-		if v.ownLimiter {
-			t.Error("should not own rate limiter when provided externally")
-		}
-	})
-
 	t.Run("uses custom base URL", func(t *testing.T) {
 		v, err := NewVoyageEmbedder(VoyageConfig{
 			APIKey:  "test-key",
@@ -208,7 +190,7 @@ func TestDimensionForModel(t *testing.T) {
 func TestParseVoyageError(t *testing.T) {
 	t.Run("valid error response", func(t *testing.T) {
 		body := `{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit"}}`
-		err := parseVoyageError(429, []byte(body))
+		err := parseVoyageError(429, []byte(body), http.Header{})
 
 		voyageErr, ok := err.(*VoyageError)
 		if !ok {
@@ -228,7 +210,7 @@ func TestParseVoyageError(t *testing.T) {
 
 	t.Run("invalid JSON falls back to raw body", func(t *testing.T) {
 		body := `not json`
-		err := parseVoyageError(500, []byte(body))
+		err := parseVoyageError(500, []byte(body), http.Header{})
 
 		voyageErr, ok := err.(*VoyageError)
 		if !ok {
@@ -262,38 +244,14 @@ func TestDefaultVoyageConfig(t *testing.T) {
 }
 
 func TestVoyageEmbedder_Close(t *testing.T) {
-	t.Run("closes owned rate limiter", func(t *testing.T) {
-		v, err := NewVoyageEmbedder(VoyageConfig{APIKey: "test-key"})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	v, err := NewVoyageEmbedder(VoyageConfig{APIKey: "test-key"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		if !v.ownLimiter {
-			t.Error("should own rate limiter when not provided")
-		}
-
-		if err := v.Close(); err != nil {
-			t.Errorf("Close failed: %v", err)
-		}
-	})
-
-	t.Run("does not close external rate limiter", func(t *testing.T) {
-		rl := NewRateLimiter(Config{TokensPerMin: 1000, RequestsPerMin: 10})
-
-		v, err := NewVoyageEmbedder(VoyageConfig{
-			APIKey:      "test-key",
-			RateLimiter: rl,
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		if err := v.Close(); err != nil {
-			t.Errorf("Close failed: %v", err)
-		}
-
-		rl.Close()
-	})
+	if err := v.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
 }
 
 func TestVoyageEmbedder_Integration(t *testing.T) {
@@ -326,15 +284,15 @@ func TestVoyageEmbedder_Integration(t *testing.T) {
 			t.Errorf("model = %s, want %s", req.Model, VoyageCode3)
 		}
 
-		embeddings := make([][]float32, len(req.Input))
-		for i := range embeddings {
-			embeddings[i] = embedding
+		data := make([]voyageEmbeddingData, len(req.Input))
+		for i := range data {
+			data[i] = voyageEmbeddingData{Embedding: embedding, Index: i}
 		}
 
 		resp := voyageResponse{
-			Embeddings: embeddings,
-			Model:      req.Model,
-			Usage:      voyageUsage{PromptTokens: 10, TotalTokens: 10},
+			Data:  data,
+			Model: req.Model,
+			Usage: voyageUsage{PromptTokens: 10, TotalTokens: 10},
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -381,14 +339,14 @@ func TestVoyageEmbedder_Batching(t *testing.T) {
 		var req voyageRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		embeddings := make([][]float32, len(req.Input))
-		for i := range embeddings {
-			embeddings[i] = make([]float32, voyageCode3Dim)
+		data := make([]voyageEmbeddingData, len(req.Input))
+		for i := range data {
+			data[i] = voyageEmbeddingData{Embedding: make([]float32, voyageCode3Dim), Index: i}
 		}
 
 		resp := voyageResponse{
-			Embeddings: embeddings,
-			Model:      req.Model,
+			Data:  data,
+			Model: req.Model,
 		}
 
 		json.NewEncoder(w).Encode(resp)
@@ -417,6 +375,73 @@ func TestVoyageEmbedder_Batching(t *testing.T) {
 	}
 }
 
+func TestVoyageEmbedder_ParallelBatching(t *testing.T) {
+	var concurrentRequests atomic.Int32
+	var maxConcurrent atomic.Int32
+	var totalRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := concurrentRequests.Add(1)
+		defer concurrentRequests.Add(-1)
+
+		for {
+			old := maxConcurrent.Load()
+			if current <= old || maxConcurrent.CompareAndSwap(old, current) {
+				break
+			}
+		}
+
+		totalRequests.Add(1)
+		time.Sleep(50 * time.Millisecond)
+
+		var req voyageRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		data := make([]voyageEmbeddingData, len(req.Input))
+		for i := range data {
+			data[i] = voyageEmbeddingData{Embedding: make([]float32, voyageCode3Dim), Index: i}
+		}
+
+		resp := voyageResponse{Data: data, Model: req.Model}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := VoyageConfig{
+		APIKey:      "test-key",
+		BatchSize:   10,
+		Concurrency: 3,
+		BaseURL:     server.URL,
+	}
+	v, err := NewVoyageEmbedder(cfg)
+	if err != nil {
+		t.Fatalf("NewVoyageEmbedder failed: %v", err)
+	}
+	defer v.Close()
+
+	texts := make([]string, 50)
+	for i := range texts {
+		texts[i] = "text"
+	}
+
+	results, err := v.EmbedBatch(context.Background(), texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch failed: %v", err)
+	}
+
+	if len(results) != 50 {
+		t.Errorf("results length = %d, want 50", len(results))
+	}
+
+	if totalRequests.Load() != 5 {
+		t.Errorf("total requests = %d, want 5 (50 texts / batch size 10)", totalRequests.Load())
+	}
+
+	if maxConcurrent.Load() < 2 {
+		t.Errorf("max concurrent = %d, want >= 2 (concurrency was set to 3)", maxConcurrent.Load())
+	}
+}
+
 func TestVoyageEmbedder_Retry(t *testing.T) {
 	var attempts atomic.Int32
 
@@ -437,8 +462,8 @@ func TestVoyageEmbedder_Retry(t *testing.T) {
 		json.NewDecoder(r.Body).Decode(&req)
 
 		resp := voyageResponse{
-			Embeddings: [][]float32{make([]float32, voyageCode3Dim)},
-			Model:      req.Model,
+			Data:  []voyageEmbeddingData{{Embedding: make([]float32, voyageCode3Dim), Index: 0}},
+			Model: req.Model,
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
@@ -489,8 +514,8 @@ func TestVoyageEmbedder_NoRetryOnAuthError(t *testing.T) {
 func TestVoyageEmbedder_Stats(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := voyageResponse{
-			Embeddings: [][]float32{make([]float32, voyageCode3Dim)},
-			Model:      string(VoyageCode3),
+			Data:  []voyageEmbeddingData{{Embedding: make([]float32, voyageCode3Dim), Index: 0}},
+			Model: string(VoyageCode3),
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
@@ -502,9 +527,12 @@ func TestVoyageEmbedder_Stats(t *testing.T) {
 	v.Embed(context.Background(), "test1")
 	v.Embed(context.Background(), "test2")
 
-	calls, lastErr := v.Stats()
+	calls, rateLimits, lastErr := v.Stats()
 	if calls != 2 {
 		t.Errorf("calls = %d, want 2", calls)
+	}
+	if rateLimits != 0 {
+		t.Errorf("rateLimits = %d, want 0", rateLimits)
 	}
 	if lastErr != nil {
 		t.Errorf("unexpected lastErr: %v", lastErr)
@@ -550,4 +578,94 @@ func createTestEmbedderWithBatchSize(t *testing.T, baseURL string, batchSize int
 	}
 
 	return v
+}
+
+func TestVerifyVoyageAPIKey(t *testing.T) {
+	t.Run("empty key returns error", func(t *testing.T) {
+		err := VerifyVoyageAPIKey(context.Background(), "")
+		if err == nil {
+			t.Fatal("expected error for empty API key")
+		}
+		if err.Error() != "voyage: API key is empty" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("valid key succeeds", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer valid-key" {
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(voyageErrorResponse{
+					Error: struct {
+						Message string `json:"message"`
+						Type    string `json:"type"`
+						Code    string `json:"code"`
+					}{Message: "invalid api key", Type: "authentication_error"},
+				})
+				return
+			}
+
+			resp := voyageResponse{
+				Data:  []voyageEmbeddingData{{Embedding: make([]float32, voyageCode3Dim), Index: 0}},
+				Model: string(VoyageCode3),
+			}
+			json.NewEncoder(w).Encode(resp)
+		}))
+		defer server.Close()
+
+		err := verifyVoyageAPIKeyWithURL(context.Background(), "valid-key", server.URL)
+		if err != nil {
+			t.Fatalf("expected success for valid key, got: %v", err)
+		}
+	})
+
+	t.Run("invalid key returns error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(voyageErrorResponse{
+				Error: struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+				}{Message: "invalid api key", Type: "authentication_error"},
+			})
+		}))
+		defer server.Close()
+
+		err := verifyVoyageAPIKeyWithURL(context.Background(), "invalid-key", server.URL)
+		if err == nil {
+			t.Fatal("expected error for invalid API key")
+		}
+		if err.Error() != "voyage: invalid API key" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("server error returns verification failed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("internal server error"))
+		}))
+		defer server.Close()
+
+		err := verifyVoyageAPIKeyWithURL(context.Background(), "some-key", server.URL)
+		if err == nil {
+			t.Fatal("expected error for server error")
+		}
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(time.Second)
+		}))
+		defer server.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		err := verifyVoyageAPIKeyWithURL(ctx, "some-key", server.URL)
+		if err == nil {
+			t.Fatal("expected error for context cancellation")
+		}
+	})
 }

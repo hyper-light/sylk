@@ -124,7 +124,7 @@ func NewEdgeShardStore(basePath string) *EdgeShardStore {
 
 // NewEdgeShardStoreFromSylkDir creates an EdgeShardStore from a SylkDir.
 func NewEdgeShardStoreFromSylkDir(sd *SylkDir) *EdgeShardStore {
-	return NewEdgeShardStore(sd.EdgesPath())
+	return NewEdgeShardStore(sd.GlobalEdgeDataPath())
 }
 
 // Init initializes the edge shard store, loading indexes if present.
@@ -233,6 +233,118 @@ func (s *EdgeShardStore) updateEdgeAtOffset(edge *Edge, globalOffset int64) erro
 	}
 
 	return nil
+}
+
+// WriteBatch writes multiple edges. Edges with existing keys are updated in place.
+func (s *EdgeShardStore) WriteBatch(edges []*Edge) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Group new edges by shard, collect updates separately
+	type shardWrite struct {
+		edge  *Edge
+		shard uint32
+	}
+	var newEdges []shardWrite
+	var updates []shardWrite
+
+	for _, edge := range edges {
+		key := edge.EdgeKey()
+		if _, exists := s.edgeKeyIndex[key]; exists {
+			updates = append(updates, shardWrite{edge: edge, shard: uint32(s.edgeKeyIndex[key] >> 48)})
+		} else {
+			newEdges = append(newEdges, shardWrite{edge: edge, shard: edge.SourceID / s.shardSize})
+		}
+	}
+
+	// Process updates (in-place writes)
+	for _, upd := range updates {
+		offset := s.edgeKeyIndex[upd.edge.EdgeKey()]
+		if err := s.updateEdgeAtOffset(upd.edge, offset); err != nil {
+			return err
+		}
+	}
+
+	// Group new edges by shard for sequential I/O
+	shardBatches := make(map[uint32][]*Edge)
+	for _, sw := range newEdges {
+		shardBatches[sw.shard] = append(shardBatches[sw.shard], sw.edge)
+	}
+
+	for shardNum, batch := range shardBatches {
+		if err := s.writeShardBatch(shardNum, batch); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// writeShardBatch writes a batch of new edges to a single shard.
+// Caller must hold the write lock.
+func (s *EdgeShardStore) writeShardBatch(shardNum uint32, edges []*Edge) error {
+	shardPath := s.shardPath(shardNum)
+	if err := os.MkdirAll(shardPath, 0755); err != nil {
+		return fmt.Errorf("sylkdir: create shard dir: %w", err)
+	}
+
+	edgesFile := filepath.Join(shardPath, "edges.bin")
+	f, err := os.OpenFile(edgesFile, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("sylkdir: open edges file: %w", err)
+	}
+	defer f.Close()
+
+	offset, err := f.Seek(0, 2)
+	if err != nil {
+		return fmt.Errorf("sylkdir: seek: %w", err)
+	}
+
+	for _, edge := range edges {
+		globalOffset := int64(shardNum)<<48 | offset
+		data := edge.MarshalBinary()
+		if _, err := f.Write(data); err != nil {
+			return fmt.Errorf("sylkdir: write edge: %w", err)
+		}
+
+		key := edge.EdgeKey()
+		s.outgoingIndex[edge.SourceID] = append(s.outgoingIndex[edge.SourceID], globalOffset)
+		s.incomingIndex[edge.TargetID] = append(s.incomingIndex[edge.TargetID], globalOffset)
+		s.edgeKeyIndex[key] = globalOffset
+		s.shardForOffset[globalOffset] = shardNum
+		offset += int64(len(data))
+	}
+
+	return nil
+}
+
+// ReadAll returns all edges in the store (no filtering).
+func (s *EdgeShardStore) ReadAll() ([]*Edge, error) {
+	s.mu.RLock()
+	offsets := make([]int64, 0, len(s.edgeKeyIndex))
+	for _, offset := range s.edgeKeyIndex {
+		offsets = append(offsets, offset)
+	}
+	s.mu.RUnlock()
+
+	return s.readEdgesAtOffsets(offsets)
+}
+
+// ReadAllFiltered returns all edges where filter returns true.
+// The filter receives sourceID and targetID for each edge.
+func (s *EdgeShardStore) ReadAllFiltered(filter func(sourceID, targetID uint32) bool) ([]*Edge, error) {
+	all, err := s.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := make([]*Edge, 0, len(all))
+	for _, edge := range all {
+		if filter(edge.SourceID, edge.TargetID) {
+			filtered = append(filtered, edge)
+		}
+	}
+	return filtered, nil
 }
 
 // GetOutgoing returns all edges with the given source node ID.

@@ -66,10 +66,10 @@ func BenchmarkSylkDirPathAccessors(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = sd.RootPath()
-		_ = sd.KnowledgePath()
-		_ = sd.NodesPath()
-		_ = sd.EdgesPath()
-		_ = sd.VectorsPath()
+		_ = sd.MetaPath()
+		_ = sd.GlobalDataPath()
+		_ = sd.GlobalVersionsPath()
+		_ = sd.GlobalEdgeDataPath()
 		_ = sd.SessionsPath()
 	}
 }

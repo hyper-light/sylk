@@ -64,6 +64,7 @@ func (s *ChunkRefStore) WriteBatch(refs []*ChunkRef) error {
 }
 
 // WriteBatchToVersion writes multiple chunk references to a specific version.
+// WAL entries are batched with a single fsync for the entire batch.
 func (s *ChunkRefStore) WriteBatchToVersion(version SemanticVersion, refs []*ChunkRef) error {
 	if len(refs) == 0 {
 		return nil
@@ -72,25 +73,43 @@ func (s *ChunkRefStore) WriteBatchToVersion(version SemanticVersion, refs []*Chu
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	// WAL log each chunk ref before data writes.
-	if s.session.WAL != nil {
-		for _, ref := range refs {
-			if _, err := s.session.WAL.LogChunkRefInsert(chunkRefToWALData(ref)); err != nil {
-				return fmt.Errorf("wal log chunk ref batch: %w", err)
-			}
-		}
+	if err := s.walLogChunkRefBatch(refs); err != nil {
+		return err
 	}
+	return s.appendChunkRefBatch(version, refs)
+}
 
+// walLogChunkRefBatch writes all chunk ref WAL entries with a single sync.
+func (s *ChunkRefStore) walLogChunkRefBatch(refs []*ChunkRef) error {
+	if s.session.WAL == nil {
+		return nil
+	}
+	walData := make([]*WALChunkRefData, len(refs))
+	for i, ref := range refs {
+		walData[i] = chunkRefToWALData(ref)
+	}
+	return s.session.WAL.LogChunkRefBatch(walData)
+}
+
+// appendChunkRefBatch appends all refs to the data file and updates the index.
+func (s *ChunkRefStore) appendChunkRefBatch(version SemanticVersion, refs []*ChunkRef) error {
 	idx := s.chunkIndex(version)
 	for _, ref := range refs {
-		record := ref.MarshalBinary()
-		offset, err := s.session.ChunkDataFile.Append(record)
-		if err != nil {
-			return fmt.Errorf("append chunk ref %d: %w", ref.NodeID, err)
+		if err := s.appendSingleChunkRef(idx, ref); err != nil {
+			return err
 		}
-		idx.Set(ref.NodeID, offset)
 	}
+	return nil
+}
 
+// appendSingleChunkRef marshals and appends one chunk ref to the data file.
+func (s *ChunkRefStore) appendSingleChunkRef(idx *OffsetIndex, ref *ChunkRef) error {
+	record := ref.MarshalBinary()
+	offset, err := s.session.ChunkDataFile.Append(record)
+	if err != nil {
+		return fmt.Errorf("append chunk ref %d: %w", ref.NodeID, err)
+	}
+	idx.Set(ref.NodeID, offset)
 	return nil
 }
 

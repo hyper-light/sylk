@@ -17,14 +17,6 @@ func setupProtectedDB(t *testing.T) (*ProtectedVectorDB, string) {
 		t.Fatalf("failed to open db: %v", err)
 	}
 
-	// Create hnsw_nodes table for testing (not in main schema)
-	_, err = db.DB().Exec(`CREATE TABLE IF NOT EXISTS hnsw_nodes (
-		node_id TEXT PRIMARY KEY
-	)`)
-	if err != nil {
-		t.Fatalf("failed to create hnsw_nodes table: %v", err)
-	}
-
 	cfg := DefaultProtectionConfig()
 	cfg.SnapshotGCInterval = 100 * time.Millisecond
 	cfg.IntegrityConfig.PeriodicInterval = 100 * time.Millisecond

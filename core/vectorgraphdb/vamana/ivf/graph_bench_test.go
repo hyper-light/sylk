@@ -66,7 +66,7 @@ func BenchmarkGreedySearchLocal(b *testing.B) {
 	for _, n := range sizes {
 		b.Run(sprintf("n=%d", n), func(b *testing.B) {
 			codeLen := 96
-			_, codes := generateTestData(n, 768, codeLen)
+			_, codes := generateTestData(n, 1024, codeLen)
 
 			members := make([]uint32, n)
 			for i := range members {
@@ -99,7 +99,7 @@ func BenchmarkRobustPruneLocal(b *testing.B) {
 		b.Run(sprintf("candidates=%d", numCandidates), func(b *testing.B) {
 			n := 300
 			codeLen := 96
-			_, codes := generateTestData(n, 768, codeLen)
+			_, codes := generateTestData(n, 1024, codeLen)
 
 			members := make([]uint32, n)
 			for i := range members {
@@ -134,7 +134,7 @@ func BenchmarkBuildPartitionGraph(b *testing.B) {
 	sizes := []int{100, 300, 500}
 	for _, n := range sizes {
 		b.Run(sprintf("n=%d", n), func(b *testing.B) {
-			dim := 768
+			dim := 1024
 			vectors, _ := generateTestData(n, dim, 96)
 
 			config := ConfigForN(n, dim)
@@ -152,7 +152,7 @@ func BenchmarkFullBuild(b *testing.B) {
 	sizes := []int{1000, 5000, 10000}
 	for _, n := range sizes {
 		b.Run(sprintf("n=%d", n), func(b *testing.B) {
-			dim := 768
+			dim := 1024
 			vectors, _ := generateTestData(n, dim, 96)
 
 			config := ConfigForN(n, dim)

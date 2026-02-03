@@ -22,53 +22,61 @@ var (
 	ErrEmbeddingMissing = errors.New("embedding required for node")
 )
 
-// HNSWInsertError represents a failure during HNSW index insertion.
+// VectorIndexInsertError represents a failure during vector index insertion.
 // It includes information about whether the rollback succeeded.
-type HNSWInsertError struct {
+type VectorIndexInsertError struct {
 	NodeID         string
-	HNSWErr        error
+	IndexErr       error
 	RollbackFailed bool
 	RollbackErr    error
 }
 
-func (e *HNSWInsertError) Error() string {
+func (e *VectorIndexInsertError) Error() string {
 	if e.RollbackFailed {
-		return fmt.Sprintf("HNSW insert failed for node %s: %v; rollback also failed: %v",
-			e.NodeID, e.HNSWErr, e.RollbackErr)
+		return fmt.Sprintf("vector index insert failed for node %s: %v; rollback also failed: %v",
+			e.NodeID, e.IndexErr, e.RollbackErr)
 	}
-	return fmt.Sprintf("HNSW insert failed for node %s (rolled back): %v", e.NodeID, e.HNSWErr)
+	return fmt.Sprintf("vector index insert failed for node %s (rolled back): %v", e.NodeID, e.IndexErr)
 }
 
-func (e *HNSWInsertError) Unwrap() error {
-	return e.HNSWErr
+func (e *VectorIndexInsertError) Unwrap() error {
+	return e.IndexErr
 }
 
-// HNSWInserter defines the interface for HNSW index operations.
+// VectorIndexInserter defines the interface for vector index operations.
 // This abstraction allows the NodeStore to insert/delete vectors
-// without direct dependency on the HNSW implementation.
-type HNSWInserter interface {
+// without direct dependency on the IVF+BBQ+Vamana implementation.
+type VectorIndexInserter interface {
 	Insert(id string, vector []float32, domain Domain, nodeType NodeType) error
 	Delete(id string) error
 	DeleteBatch(ids []string) error
 }
 
+// HNSWInsertError is an alias for VectorIndexInsertError for backward compatibility.
+// Deprecated: Use VectorIndexInsertError instead.
+type HNSWInsertError = VectorIndexInsertError
+
+// HNSWInserter is an alias for VectorIndexInserter for backward compatibility.
+// Deprecated: Use VectorIndexInserter instead.
+type HNSWInserter = VectorIndexInserter
+
 // NodeStore provides CRUD operations for graph nodes in VectorGraphDB.
-// It manages both the SQLite persistence and HNSW vector index synchronization.
+// It manages both the SQLite persistence and vector index synchronization.
 //
 // Thread Safety: NodeStore operations are thread-safe through the underlying
-// VectorGraphDB and HNSW index implementations.
+// VectorGraphDB and vector index implementations.
 //
 // Consistency: Node insertions are performed in a transaction with the embedding,
-// followed by HNSW index insertion. HNSW failures do not roll back the database.
+// followed by vector index insertion. Index failures do not roll back the database.
 type NodeStore struct {
-	db   *VectorGraphDB
-	hnsw HNSWInserter
+	db          *VectorGraphDB
+	vectorIndex VectorIndexInserter
 }
 
-// NewNodeStore creates a new NodeStore with the given database and optional HNSW index.
-// If hnswIndex is nil, vector operations will be skipped.
-func NewNodeStore(db *VectorGraphDB, hnswIndex HNSWInserter) *NodeStore {
-	return &NodeStore{db: db, hnsw: hnswIndex}
+// NewNodeStore creates a new NodeStore with the given database and optional vector index.
+// If vectorIndex is nil, vector operations will be skipped.
+func NewNodeStore(db *VectorGraphDB, vectorIndex VectorIndexInserter) *NodeStore {
+	return &NodeStore{db: db, vectorIndex: vectorIndex}
 }
 
 func (ns *NodeStore) InsertNode(node *GraphNode, embedding []float32) error {
@@ -111,17 +119,17 @@ func (ns *NodeStore) insertNodeTx(node *GraphNode, embedding []float32) error {
 	if err := ns.insertNodeToDB(node, embedding); err != nil {
 		return err
 	}
-	if err := ns.insertNodeToHNSW(node, embedding); err != nil {
+	if err := ns.insertNodeToVectorIndex(node, embedding); err != nil {
 		return ns.rollbackDBInsert(node.ID, err)
 	}
 	return nil
 }
 
-func (ns *NodeStore) rollbackDBInsert(nodeID string, hnswErr error) error {
+func (ns *NodeStore) rollbackDBInsert(nodeID string, indexErr error) error {
 	rollbackErr := ns.deleteNodeFromDB(nodeID)
-	return &HNSWInsertError{
+	return &VectorIndexInsertError{
 		NodeID:         nodeID,
-		HNSWErr:        hnswErr,
+		IndexErr:       indexErr,
 		RollbackFailed: rollbackErr != nil,
 		RollbackErr:    rollbackErr,
 	}
@@ -151,11 +159,11 @@ func (ns *NodeStore) insertNodeToDB(node *GraphNode, embedding []float32) error 
 	return tx.Commit()
 }
 
-func (ns *NodeStore) insertNodeToHNSW(node *GraphNode, embedding []float32) error {
-	if ns.hnsw == nil {
+func (ns *NodeStore) insertNodeToVectorIndex(node *GraphNode, embedding []float32) error {
+	if ns.vectorIndex == nil {
 		return nil
 	}
-	return ns.hnsw.Insert(node.ID, embedding, node.Domain, node.NodeType)
+	return ns.vectorIndex.Insert(node.ID, embedding, node.Domain, node.NodeType)
 }
 
 func (ns *NodeStore) insertNodeRow(tx *sql.Tx, node *GraphNode) error {
@@ -326,8 +334,8 @@ func (ns *NodeStore) DeleteNode(id string) error {
 		return ErrNodeNotFound
 	}
 
-	if ns.hnsw != nil {
-		ns.hnsw.Delete(id)
+	if ns.vectorIndex != nil {
+		ns.vectorIndex.Delete(id)
 	}
 	return nil
 }

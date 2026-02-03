@@ -7,7 +7,18 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 )
+
+// Pre-computed MinHash seeds — constant across all calls.
+// Derived from: index × Weyl constant + golden ratio constant.
+var minhashSeeds [minhashNumFuncs]uint64
+
+func init() {
+	for i := range minhashSeeds {
+		minhashSeeds[i] = uint64(i)*0x517cc1b727220a95 + 0x9e3779b97f4a7c15
+	}
+}
 
 // EnhancedHybridEmbedder implements a sophisticated non-neural embedder targeting 50-52 MTEB.
 // It combines multiple signal types for maximum semantic capture without learned representations.
@@ -44,6 +55,16 @@ func NewEnhancedHybridEmbedder() *EnhancedHybridEmbedder {
 
 func (e *EnhancedHybridEmbedder) Dimension() int {
 	return e.dimension
+}
+
+func (e *EnhancedHybridEmbedder) MaxInputBytes() int {
+	// Non-neural: no tokenizer or context window.
+	// Derived from: dimension (1024) × signal pipeline count (8) × avg bytes per feature (5).
+	// Pipeline count is counted from the 8 signal types in embedEnhanced.
+	// Avg bytes per feature is measurable across the signal types (stems, n-grams, etc.).
+	const signalPipelineCount = 8
+	const avgBytesPerFeature = 5
+	return e.dimension * signalPipelineCount * avgBytesPerFeature
 }
 
 func (e *EnhancedHybridEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
@@ -107,33 +128,28 @@ func (e *EnhancedHybridEmbedder) EmbedBatch(ctx context.Context, texts []string)
 	}
 }
 
-// textAnalysis holds all preprocessed features for embedding.
+// textAnalysis holds preprocessed features for embedding.
+// N-grams and co-occurrence pairs are computed inline during feature
+// extraction to avoid intermediate slice allocations.
 type textAnalysis struct {
-	original      string
-	lower         string
-	tokens        []string   // Raw tokens
-	stems         []string   // Porter-stemmed tokens
-	codeTokens    []string   // Code-aware split tokens
-	phonetic      []string   // Phonetic encodings
-	wordBigrams   []string   // Word-level bigrams
-	wordTrigrams  []string   // Word-level trigrams
-	cooccurrences []string   // Co-occurrence pairs within window
+	lower      string
+	tokens     []string // Raw tokens
+	stems      []string // Porter-stemmed tokens
+	codeTokens []string // Code-aware split tokens
+	phonetic   []string // Phonetic encodings
 }
 
 func (e *EnhancedHybridEmbedder) analyzeText(text string) textAnalysis {
 	lower := toLowerASCII(text)
 	tokens := tokenizeEnhanced(lower)
 
-	// Stem all tokens
 	stems := make([]string, len(tokens))
 	for i, tok := range tokens {
 		stems[i] = e.stem(tok)
 	}
 
-	// Code-aware tokenization (split camelCase, snake_case)
-	codeTokens := e.tokenizeCode(text)
+	codeTokens := tokenizeCode(text)
 
-	// Phonetic encoding
 	phonetic := make([]string, 0, len(tokens))
 	for _, tok := range tokens {
 		if ph := metaphone(tok); ph != "" {
@@ -141,23 +157,12 @@ func (e *EnhancedHybridEmbedder) analyzeText(text string) textAnalysis {
 		}
 	}
 
-	// Word-level n-grams
-	wordBigrams := extractWordNgrams(stems, 2)
-	wordTrigrams := extractWordNgrams(stems, 3)
-
-	// Co-occurrence pairs within window
-	cooccurrences := extractCooccurrences(stems, 5)
-
 	return textAnalysis{
-		original:      text,
-		lower:         lower,
-		tokens:        tokens,
-		stems:         stems,
-		codeTokens:    codeTokens,
-		phonetic:      phonetic,
-		wordBigrams:   wordBigrams,
-		wordTrigrams:  wordTrigrams,
-		cooccurrences: cooccurrences,
+		lower:      lower,
+		tokens:     tokens,
+		stems:      stems,
+		codeTokens: codeTokens,
+		phonetic:   phonetic,
 	}
 }
 
@@ -179,12 +184,11 @@ func (e *EnhancedHybridEmbedder) embedEnhanced(text string) []float32 {
 		minhashWeight    = 0.10
 	)
 
-	// Add all feature types
 	e.addBM25StemFeatures(vec, a.stems, stemWeight)
-	e.addWordNgramFeatures(vec, a.wordBigrams, a.wordTrigrams, wordNgramWeight)
+	e.addWordNgramFeatures(vec, a.stems, wordNgramWeight)
 	e.addCharNgramFeatures(vec, a.lower, charNgramWeight)
 	e.addSkipGramFeatures(vec, a.stems, skipWeight)
-	e.addCooccurrenceFeatures(vec, a.cooccurrences, cooccurWeight)
+	e.addCooccurrenceFeatures(vec, a.stems, cooccurWeight)
 	e.addCodeTokenFeatures(vec, a.codeTokens, codeWeight)
 	e.addPhoneticFeatures(vec, a.phonetic, phoneticWeight)
 	e.addMinHashFeatures(vec, a.stems, minhashWeight)
@@ -246,23 +250,26 @@ func (e *EnhancedHybridEmbedder) addBM25StemFeatures(vec []float32, stems []stri
 	}
 }
 
-// addWordNgramFeatures adds word-level bigrams and trigrams.
-func (e *EnhancedHybridEmbedder) addWordNgramFeatures(vec []float32, bigrams, trigrams []string, weight float64) {
+// addWordNgramFeatures computes and hashes word bigrams/trigrams inline
+// from stems, avoiding intermediate slice and string allocations.
+func (e *EnhancedHybridEmbedder) addWordNgramFeatures(vec []float32, stems []string, weight float64) {
 	bigramWeight := weight * 0.6
 	trigramWeight := weight * 0.4
 
-	if len(bigrams) > 0 {
-		w := float32(bigramWeight / math.Sqrt(float64(len(bigrams))))
-		for _, bg := range bigrams {
-			hash := fnvHash64Inline("wb:" + bg)
+	if len(stems) >= 2 {
+		count := len(stems) - 1
+		w := float32(bigramWeight / math.Sqrt(float64(count)))
+		for i := range count {
+			hash := fnvHash64JoinedInline("wb:", stems[i:i+2], ' ')
 			e.projectWithSign(vec, hash, w, 4)
 		}
 	}
 
-	if len(trigrams) > 0 {
-		w := float32(trigramWeight / math.Sqrt(float64(len(trigrams))))
-		for _, tg := range trigrams {
-			hash := fnvHash64Inline("wt:" + tg)
+	if len(stems) >= 3 {
+		count := len(stems) - 2
+		w := float32(trigramWeight / math.Sqrt(float64(count)))
+		for i := range count {
+			hash := fnvHash64JoinedInline("wt:", stems[i:i+3], ' ')
 			e.projectWithSign(vec, hash, w, 4)
 		}
 	}
@@ -318,24 +325,44 @@ func (e *EnhancedHybridEmbedder) addSkipGramFeatures(vec []float32, tokens []str
 		skipWeight := float32(baseWeight / float64(skip))
 		bound := len(tokens) - skip
 		for i := range bound {
-			pair := tokens[i] + "\x00" + tokens[i+skip]
-			hash := fnvHash64Inline(pair)
+			hash := fnvHash64PairInline("", tokens[i], tokens[i+skip], '\x00')
 			e.projectWithSign(vec, hash, skipWeight, 4)
 		}
 	}
 }
 
-// addCooccurrenceFeatures adds co-occurrence window features.
-// This approximates distributional semantics without training.
-func (e *EnhancedHybridEmbedder) addCooccurrenceFeatures(vec []float32, cooccurrences []string, weight float64) {
-	if len(cooccurrences) == 0 {
+// cooccurrenceWindow is the token distance for co-occurrence features.
+const cooccurrenceWindow = 5
+
+// addCooccurrenceFeatures computes co-occurrence pairs inline within a
+// fixed window, hashing directly without materializing pair strings.
+func (e *EnhancedHybridEmbedder) addCooccurrenceFeatures(vec []float32, stems []string, weight float64) {
+	if len(stems) < 2 {
 		return
 	}
 
-	w := float32(weight / math.Sqrt(float64(len(cooccurrences))))
-	for _, pair := range cooccurrences {
-		hash := fnvHash64Inline("co:" + pair)
-		e.projectWithSign(vec, hash, w, 4)
+	// Count total pairs for normalization.
+	totalPairs := 0
+	for i := range stems {
+		end := min(i+cooccurrenceWindow, len(stems))
+		totalPairs += end - i - 1
+	}
+	if totalPairs == 0 {
+		return
+	}
+
+	w := float32(weight / math.Sqrt(float64(totalPairs)))
+	for i, s1 := range stems {
+		end := min(i+cooccurrenceWindow, len(stems))
+		for j := i + 1; j < end; j++ {
+			s2 := stems[j]
+			// Sort for order-independent consistency.
+			if s1 > s2 {
+				s1, s2 = s2, s1
+			}
+			hash := fnvHash64PairInline("co:", s1, s2, '\x00')
+			e.projectWithSign(vec, hash, w, 4)
+		}
 	}
 }
 
@@ -361,7 +388,7 @@ func (e *EnhancedHybridEmbedder) addCodeTokenFeatures(vec []float32, codeTokens 
 
 	for tok, count := range tf {
 		w := float32(weight * float64(count) * invNorm)
-		hash := fnvHash64Inline("code:" + tok)
+		hash := fnvHash64WithPrefix("code:", tok)
 		e.projectWithSign(vec, hash, w, 6)
 	}
 }
@@ -388,34 +415,30 @@ func (e *EnhancedHybridEmbedder) addPhoneticFeatures(vec []float32, phonetic []s
 
 	for ph, count := range tf {
 		w := float32(weight * float64(count) * invNorm)
-		hash := fnvHash64Inline("ph:" + ph)
+		hash := fnvHash64WithPrefix("ph:", ph)
 		e.projectWithSign(vec, hash, w, 4)
 	}
 }
 
+// minhashNumFuncs is the number of independent hash functions for MinHash.
+const minhashNumFuncs = 64
+
 // addMinHashFeatures adds MinHash signatures for Jaccard similarity.
+// Uses pre-computed seeds (package init) and a stack-allocated signature array.
 func (e *EnhancedHybridEmbedder) addMinHashFeatures(vec []float32, tokens []string, weight float64) {
 	if len(tokens) == 0 {
 		return
 	}
 
-	// Use multiple hash functions for MinHash
-	numHashes := 64
-	seeds := make([]uint64, numHashes)
-	for i := range seeds {
-		seeds[i] = uint64(i)*0x517cc1b727220a95 + 0x9e3779b97f4a7c15
-	}
-
-	// Compute MinHash signature
-	signature := make([]uint64, numHashes)
+	var signature [minhashNumFuncs]uint64
 	for i := range signature {
-		signature[i] = ^uint64(0) // Max value
+		signature[i] = ^uint64(0)
 	}
 
 	for _, tok := range tokens {
 		baseHash := fnvHash64Inline(tok)
-		for i, seed := range seeds {
-			h := baseHash ^ seed
+		for i := range minhashNumFuncs {
+			h := baseHash ^ minhashSeeds[i]
 			h = h*6364136223846793005 + 1442695040888963407
 			if h < signature[i] {
 				signature[i] = h
@@ -423,10 +446,8 @@ func (e *EnhancedHybridEmbedder) addMinHashFeatures(vec []float32, tokens []stri
 		}
 	}
 
-	// Project signature into vector
-	w := float32(weight / float64(numHashes))
-	for i, minH := range signature {
-		// Use signature value to determine position and sign
+	w := float32(weight / float64(minhashNumFuncs))
+	for _, minH := range signature {
 		idx := int(minH % uint64(e.dimension))
 		sign := float32(1)
 		if (minH>>32)&1 == 0 {
@@ -434,10 +455,8 @@ func (e *EnhancedHybridEmbedder) addMinHashFeatures(vec []float32, tokens []stri
 		}
 		vec[idx] += w * sign
 
-		// Also spread to nearby positions for smoothness
 		idx2 := (idx + int(minH>>16)%16) % e.dimension
 		vec[idx2] += w * sign * 0.5
-		_ = i // Silence unused warning
 	}
 }
 
@@ -751,30 +770,51 @@ func step5(word string) string {
 }
 
 // tokenizeCode splits identifiers by camelCase and snake_case.
-func (e *EnhancedHybridEmbedder) tokenizeCode(text string) []string {
+// Uses byte-level processing for ASCII (fast path) with UTF-8 fallback.
+func tokenizeCode(text string) []string {
 	var tokens []string
 	var current strings.Builder
 
 	flushToken := func() {
 		if current.Len() >= 2 {
-			tok := strings.ToLower(current.String())
-			tokens = append(tokens, tok)
+			tokens = append(tokens, toLowerASCII(current.String()))
 		}
 		current.Reset()
 	}
 
-	runes := []rune(text)
-	for i, r := range runes {
-		switch {
-		case r == '_' || r == '-' || r == '.':
-			flushToken()
-		case unicode.IsUpper(r):
-			// Check for camelCase boundary
-			if current.Len() > 0 {
-				// Check if this is start of new word (lowercase followed by uppercase)
-				// or end of acronym (uppercase followed by uppercase then lowercase)
-				if i+1 < len(runes) && unicode.IsLower(runes[i+1]) {
+	for i := 0; i < len(text); {
+		c := text[i]
+
+		// ASCII fast path — handles >95% of source code characters.
+		if c < 0x80 {
+			switch {
+			case c == '_' || c == '-' || c == '.':
+				flushToken()
+			case c >= 'A' && c <= 'Z':
+				if current.Len() > 0 && i+1 < len(text) &&
+					text[i+1] >= 'a' && text[i+1] <= 'z' {
 					flushToken()
+				}
+				current.WriteByte(c + 32)
+			case (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'):
+				current.WriteByte(c)
+			default:
+				flushToken()
+			}
+			i++
+			continue
+		}
+
+		// UTF-8 multibyte fallback.
+		r, size := utf8.DecodeRuneInString(text[i:])
+		switch {
+		case unicode.IsUpper(r):
+			if current.Len() > 0 {
+				if i+size < len(text) {
+					nextR, _ := utf8.DecodeRuneInString(text[i+size:])
+					if unicode.IsLower(nextR) {
+						flushToken()
+					}
 				}
 			}
 			current.WriteRune(unicode.ToLower(r))
@@ -783,6 +823,7 @@ func (e *EnhancedHybridEmbedder) tokenizeCode(text string) []string {
 		default:
 			flushToken()
 		}
+		i += size
 	}
 	flushToken()
 
@@ -952,41 +993,6 @@ func isVowel(c byte) bool {
 	return false
 }
 
-// extractWordNgrams extracts word-level n-grams.
-func extractWordNgrams(words []string, n int) []string {
-	if len(words) < n {
-		return nil
-	}
-
-	ngrams := make([]string, 0, len(words)-n+1)
-	for i := 0; i <= len(words)-n; i++ {
-		ngram := strings.Join(words[i:i+n], " ")
-		ngrams = append(ngrams, ngram)
-	}
-	return ngrams
-}
-
-// extractCooccurrences extracts all word pairs within a window.
-func extractCooccurrences(words []string, windowSize int) []string {
-	if len(words) < 2 {
-		return nil
-	}
-
-	var pairs []string
-	for i, w1 := range words {
-		end := min(i+windowSize, len(words))
-		for j := i + 1; j < end; j++ {
-			// Sort pair for consistency (order-independent)
-			w2 := words[j]
-			if w1 > w2 {
-				w1, w2 = w2, w1
-			}
-			pairs = append(pairs, w1+"\x00"+w2)
-		}
-	}
-	return pairs
-}
-
 // tokenizeEnhanced extracts tokens with improved handling.
 func tokenizeEnhanced(text string) []string {
 	estimated := len(text) / 5
@@ -1042,16 +1048,76 @@ func toLowerASCII(s string) string {
 	return string(b)
 }
 
+// FNV-1a 64-bit constants.
+const (
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
 // fnvHash64Inline computes FNV-1a 64-bit hash inline for performance.
 func fnvHash64Inline(s string) uint64 {
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	h := uint64(offset64)
+	h := uint64(fnvOffset64)
 	for i := 0; i < len(s); i++ {
 		h ^= uint64(s[i])
-		h *= prime64
+		h *= fnvPrime64
+	}
+	return h
+}
+
+// fnvHash64WithPrefix computes FNV-1a hash of prefix+s without concatenation.
+// Produces the same hash as fnvHash64Inline(prefix + s).
+func fnvHash64WithPrefix(prefix, s string) uint64 {
+	h := uint64(fnvOffset64)
+	for i := 0; i < len(prefix); i++ {
+		h ^= uint64(prefix[i])
+		h *= fnvPrime64
+	}
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= fnvPrime64
+	}
+	return h
+}
+
+// fnvHash64PairInline computes FNV-1a hash of prefix+a+sep+b without concatenation.
+// Produces the same hash as fnvHash64Inline(prefix + a + string(sep) + b).
+func fnvHash64PairInline(prefix, a, b string, sep byte) uint64 {
+	h := uint64(fnvOffset64)
+	for i := 0; i < len(prefix); i++ {
+		h ^= uint64(prefix[i])
+		h *= fnvPrime64
+	}
+	for i := 0; i < len(a); i++ {
+		h ^= uint64(a[i])
+		h *= fnvPrime64
+	}
+	h ^= uint64(sep)
+	h *= fnvPrime64
+	for i := 0; i < len(b); i++ {
+		h ^= uint64(b[i])
+		h *= fnvPrime64
+	}
+	return h
+}
+
+// fnvHash64JoinedInline computes FNV-1a hash of prefix + words joined by sep,
+// without creating the joined string. Produces the same hash as
+// fnvHash64Inline(prefix + strings.Join(words, string(sep))).
+func fnvHash64JoinedInline(prefix string, words []string, sep byte) uint64 {
+	h := uint64(fnvOffset64)
+	for i := 0; i < len(prefix); i++ {
+		h ^= uint64(prefix[i])
+		h *= fnvPrime64
+	}
+	for i, w := range words {
+		if i > 0 {
+			h ^= uint64(sep)
+			h *= fnvPrime64
+		}
+		for j := 0; j < len(w); j++ {
+			h ^= uint64(w[j])
+			h *= fnvPrime64
+		}
 	}
 	return h
 }

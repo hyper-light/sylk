@@ -2,184 +2,41 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"io/fs"
-	"math"
 	"math/bits"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"slices"
-	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/adalundhe/sylk/core/treesitter"
-	"github.com/adalundhe/sylk/core/vectorgraphdb"
+	"github.com/adalundhe/sylk/core/storage/sylkdir"
+	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/ivf"
-	_ "github.com/mattn/go-sqlite3"
 )
+
+const benchDir = "/tmp/ivfbench"
+
+// maxFileSizeOverride is the maximum file size for discovery (10 MB).
+const maxFileSizeOverride = 10 * 1024 * 1024
+
 
 type scored struct {
 	id         uint32
 	similarity float64
 }
 
-type symbol struct {
-	id        string
-	name      string
-	kind      string
-	signature string
-	filePath  string
-	nodeType  uint16
+type benchConfig struct {
+	root       string
+	cpuProfile string
+	memProfile string
 }
 
-const benchDir = "/tmp/ivfbench"
-
-func initSQLite(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS symbols (
-			id INTEGER PRIMARY KEY,
-			symbol_id TEXT NOT NULL,
-			name TEXT NOT NULL,
-			kind TEXT NOT NULL,
-			signature TEXT,
-			file_path TEXT NOT NULL,
-			node_type INTEGER NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS embeddings (
-			id INTEGER PRIMARY KEY,
-			embedding BLOB NOT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
-	`)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-
-	return db, nil
-}
-
-func storeSymbolsAndEmbeddings(db *sql.DB, symbols []symbol, embeddings [][]float32) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	symbolStmt, err := tx.Prepare("INSERT INTO symbols (id, symbol_id, name, kind, signature, file_path, node_type) VALUES (?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer symbolStmt.Close()
-
-	embedStmt, err := tx.Prepare("INSERT INTO embeddings (id, embedding) VALUES (?, ?)")
-	if err != nil {
-		return err
-	}
-	defer embedStmt.Close()
-
-	for i, s := range symbols {
-		if _, err := symbolStmt.Exec(i, s.id, s.name, s.kind, s.signature, s.filePath, s.nodeType); err != nil {
-			return err
-		}
-
-		embBytes := make([]byte, len(embeddings[i])*4)
-		for j, v := range embeddings[i] {
-			binary.LittleEndian.PutUint32(embBytes[j*4:], math.Float32bits(v))
-		}
-		if _, err := embedStmt.Exec(i, embBytes); err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
-func loadEmbeddingFromDB(db *sql.DB, id int) ([]float32, error) {
-	var embBytes []byte
-	err := db.QueryRow("SELECT embedding FROM embeddings WHERE id = ?", id).Scan(&embBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	dim := len(embBytes) / 4
-	vec := make([]float32, dim)
-	for i := range dim {
-		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(embBytes[i*4:]))
-	}
-	return vec, nil
-}
-
-func computeRecallUint32(results []uint32, groundTruth []uint32) float64 {
-	if len(results) == 0 || len(groundTruth) == 0 {
-		return 0
-	}
-
-	truthSet := make(map[uint32]struct{}, len(groundTruth))
-	for _, id := range groundTruth {
-		truthSet[id] = struct{}{}
-	}
-
-	hits := 0
-	for _, id := range results {
-		if _, ok := truthSet[id]; ok {
-			hits++
-		}
-	}
-
-	return float64(hits) / float64(len(groundTruth))
-}
-
-func corruptBBQShard(indexDir string, shardIdx int) {
-	shardPath := filepath.Join(indexDir, "bbq", fmt.Sprintf("shard_%04d.bin", shardIdx))
-	data, err := os.ReadFile(shardPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read bbq shard: %v\n", err)
-		return
-	}
-
-	if len(data) > 100 {
-		for i := 50; i < 100; i++ {
-			data[i] ^= 0xFF
-		}
-	}
-	if err := os.WriteFile(shardPath, data, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to write corrupted bbq shard: %v\n", err)
-	}
-}
-
-func corruptNormShard(indexDir string, shardIdx int) {
-	shardPath := filepath.Join(indexDir, "norms", fmt.Sprintf("shard_%04d.bin", shardIdx))
-	data, err := os.ReadFile(shardPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read norm shard: %v\n", err)
-		return
-	}
-
-	if len(data) > 100 {
-		for i := 50; i < 100; i++ {
-			data[i] ^= 0xFF
-		}
-	}
-	if err := os.WriteFile(shardPath, data, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to write corrupted norm shard: %v\n", err)
-	}
-}
-
-func main() {
+func parseFlags() benchConfig {
 	cpuProfile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memProfile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
@@ -189,84 +46,167 @@ func main() {
 		root = flag.Arg(0)
 	}
 
-	fmt.Printf("=== Kubernetes Full Ingest Benchmark ===\n")
-	fmt.Printf("Root: %s\n\n", root)
-
-	if *cpuProfile != "" {
-		f, err := os.Create(*cpuProfile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "could not create CPU profile: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			fmt.Fprintf(os.Stderr, "could not start CPU profile: %v\n", err)
-			os.Exit(1)
-		}
-		defer pprof.StopCPUProfile()
+	return benchConfig{
+		root:       root,
+		cpuProfile: *cpuProfile,
+		memProfile: *memProfile,
 	}
+}
+
+func main() {
+	cfg := parseFlags()
+
+	fmt.Printf("=== Kubernetes Full Ingest Benchmark ===\n")
+	fmt.Printf("Root: %s\n\n", cfg.root)
+
+	setupProfiles(&cfg)
+	defer teardownProfiles(&cfg)
 
 	totalStart := time.Now()
 
 	os.RemoveAll(benchDir)
 	if err := os.MkdirAll(benchDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create bench dir: %v\n", err)
-		os.Exit(1)
+		fatal("create bench dir: %v", err)
 	}
 
-	fmt.Print("Phase 1: Scanning files... ")
-	scanStart := time.Now()
-	var files []string
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		if filepath.Ext(path) == ".go" {
-			files = append(files, path)
-		}
-		return nil
-	})
-	fmt.Printf("%d files in %v\n", len(files), time.Since(scanStart))
+	ctx := context.Background()
 
-	fmt.Print("Phase 2: Parsing symbols... ")
-	parseStart := time.Now()
-	symbols := parseAllSymbols(root, files)
-	fmt.Printf("%d symbols in %v (%.0f files/sec)\n",
-		len(symbols), time.Since(parseStart),
-		float64(len(files))/time.Since(parseStart).Seconds())
+	// Phase 1: Session setup
+	sd, sess, emb := setupSession(ctx)
+	defer sd.Close()
+	defer sess.Close()
 
-	fmt.Print("Phase 3: Generating embeddings... ")
-	embedStart := time.Now()
-	dim := embedder.DefaultConfig().Dimension
-	emb := embedder.NewClusteredMockEmbedder(dim)
-	embeddings := generateEmbeddings(emb, symbols)
-	fmt.Printf("%d embeddings in %v (%.0f emb/sec)\n",
-		len(embeddings), time.Since(embedStart),
-		float64(len(embeddings))/time.Since(embedStart).Seconds())
+	dim := emb.Dimension()
 
-	fmt.Print("Phase 3b: Storing in SQLite... ")
-	sqliteStart := time.Now()
-	dbPath := filepath.Join(benchDir, "knowledge.db")
-	db, err := initSQLite(dbPath)
+	// Phase 2: Production ingestion
+	ingestResult := runIngestion(ctx, sess, emb, cfg.root)
+
+	// Phase 3: Extract vectors
+	embeddings := extractVectors(sess)
+
+	// Phase 4: Build IVF index
+	idx, buildTime := buildIVF(embeddings, dim)
+
+	// Phase 5: Recall benchmark
+	K, numQueries, stride := deriveSearchParams(len(embeddings))
+	vamanaRecall, ivfRecall := runRecallBenchmark(embeddings, idx, K, numQueries, stride)
+
+	// Phase 6-7: Save/load/validate
+	indexDir := filepath.Join(benchDir, "index")
+	saveTime, loadTime, loadedRecall := runPersistenceTest(embeddings, idx, indexDir, K, numQueries, stride)
+
+	// Phase 8: Streaming insert
+	insertRecall := runInsertBenchmark(embeddings, dim, K, numQueries, stride)
+
+	// Phase 9: StitchBatch
+	runStitchBenchmark(embeddings, dim, K, numQueries, stride)
+
+	// Phase 10: Maintenance
+	runMaintenance(embeddings, dim, K, numQueries, stride)
+
+	// Summary
+	totalTime := time.Since(totalStart)
+	printSummary(ingestResult, embeddings, dim, buildTime, saveTime, loadTime,
+		vamanaRecall, ivfRecall, loadedRecall, insertRecall, K, totalTime)
+
+	writeMemProfile(cfg.memProfile)
+}
+
+// setupSession initializes the sylkdir, session, and embedder.
+func setupSession(ctx context.Context) (*sylkdir.SylkDir, *sylkdir.Session, embedder.Embedder) {
+	fmt.Print("Phase 1: Setting up session infrastructure... ")
+	start := time.Now()
+
+	sd := sylkdir.New(benchDir)
+	if err := sd.Init(); err != nil {
+		fatal("init sylkdir: %v", err)
+	}
+	if err := sd.Lock(); err != nil {
+		fatal("lock sylkdir: %v", err)
+	}
+
+	ss := sylkdir.NewSessionStore(sd)
+	sess, err := ss.Create(1, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to init sqlite: %v\n", err)
-		os.Exit(1)
+		fatal("create session: %v", err)
 	}
-	if err := storeSymbolsAndEmbeddings(db, symbols, embeddings); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to store data: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("done in %v\n", time.Since(sqliteStart))
 
+	result, err := embedder.NewEmbedder(ctx, embedder.FactoryConfig{})
+	if err != nil {
+		fatal("create embedder: %v", err)
+	}
+
+	fmt.Printf("done in %v (embedder: %s, dim=%d)\n",
+		time.Since(start), result.Source, result.Embedder.Dimension())
+
+	return sd, sess, result.Embedder
+}
+
+// runIngestion uses the production pipeline to ingest all files.
+func runIngestion(ctx context.Context, sess *sylkdir.Session, emb embedder.Embedder, root string) *sylkdir.SessionIngestionResult {
+	fmt.Print("Phase 2: Ingesting via production pipeline... ")
+	start := time.Now()
+
+	si := sylkdir.NewSessionIngestion(sess)
+	si.SetEmbedder(emb)
+
+	config := &ingestion.Config{
+		RootPath: root,
+		Discovery: &ingestion.DiscoveryOptions{
+			IncludeAllExtensions: true,
+			SkipDefaultPatterns:  true,
+			IncludeVendorDirs:    true,
+			MaxFileSizeOverride:  maxFileSizeOverride,
+		},
+	}
+
+	result, err := si.IngestDirectoryWithConfig(ctx, config)
+	if err != nil {
+		fatal("ingest: %v", err)
+	}
+
+	fmt.Printf("done in %v\n", time.Since(start))
+	fmt.Printf("  Files: %d, Nodes: %d, Edges: %d, Vectors: %d, Docs: %d\n",
+		result.FilesProcessed, result.NodesCreated, result.EdgesCreated,
+		result.VectorsCreated, result.DocsCreated)
+	if result.EmbeddingErrors > 0 {
+		fmt.Printf("  Embedding errors: %d\n", result.EmbeddingErrors)
+	}
+
+	return result
+}
+
+// extractVectors reads all vectors from the production version store.
+func extractVectors(sess *sylkdir.Session) [][]float32 {
+	fmt.Print("Phase 3: Extracting vectors from version store... ")
+	start := time.Now()
+
+	vectorStore := sylkdir.NewVersionVectorStore(sess)
+	versionVectors, err := vectorStore.ReadAllFromAncestorChain()
+	if err != nil {
+		fatal("read vectors: %v", err)
+	}
+
+	embeddings := make([][]float32, len(versionVectors))
+	for i, vv := range versionVectors {
+		embeddings[i] = vv.Vector
+	}
+
+	fmt.Printf("%d vectors in %v\n", len(embeddings), time.Since(start))
+	return embeddings
+}
+
+// buildIVF builds an IVF index from the extracted vectors.
+func buildIVF(embeddings [][]float32, dim int) (*ivf.Index, time.Duration) {
 	config := ivf.ConfigForN(len(embeddings), dim)
 	fmt.Printf("\nIVF Config: partitions=%d, nprobe=%d, oversample=%d, dim=%d\n",
 		config.NumPartitions, config.NProbe, config.Oversample, dim)
 
 	fmt.Print("\nPhase 4: Building IVF index... ")
-	buildStart := time.Now()
+	start := time.Now()
 	idx := ivf.NewIndex(config, dim)
 	_, stats := idx.Build(embeddings)
-	buildTime := time.Since(buildStart)
+	buildTime := time.Since(start)
 
 	fmt.Printf("done in %v (%.0f vec/sec)\n", buildTime, float64(len(embeddings))/buildTime.Seconds())
 	fmt.Printf("  Store: %dms, BBQ: %dms, Partition: %dms, Graph: %dms\n",
@@ -276,32 +216,30 @@ func main() {
 	fmt.Printf("  Graph: nodes=%d, edges=%d, avgDeg=%.1f, minDeg=%d, maxDeg=%d\n",
 		gs.NumNodes, gs.NumEdges, gs.AvgDegree, gs.MinDegree, gs.MaxDegree)
 
-	n := len(embeddings)
+	return idx, buildTime
+}
+
+// deriveSearchParams derives K, numQueries, and stride from the dataset size.
+func deriveSearchParams(n int) (K, numQueries, stride int) {
 	logN := bits.Len(uint(n))
+	K = logN
+	numQueries = logN * logN
+	stride = n / numQueries
+	return K, numQueries, stride
+}
 
-	// K: search depth = log2(N), one result per level of binary search tree
-	K := logN
-
-	// numQueries: for recall standard error < 2%, need variance < 0.0004
-	// With recall ~0.9, variance = 0.09/numQueries, so numQueries > 225
-	// log2(N)^2 gives 361 for N=309K, achieving SE ~1.6%
-	numQueries := logN * logN
-
-	// stride: evenly distribute queries across dataset
-	stride := n / numQueries
-
+// runRecallBenchmark measures recall for Vamana and IVF search.
+func runRecallBenchmark(embeddings [][]float32, idx *ivf.Index, K, numQueries, stride int) (vamanaRecall, ivfRecall float64) {
+	n := len(embeddings)
 	fmt.Printf("\nPhase 5: Search benchmark (n=%d, queries=%d, K=%d, stride=%d)...\n",
 		n, numQueries, K, stride)
 
-	var vamanaTotalLatency time.Duration
-	var vamanaTotalRecall float64
-	var ivfTotalLatency time.Duration
-	var ivfTotalRecall float64
+	var vamanaTotalLatency, ivfTotalLatency time.Duration
+	var vamanaTotalRecall, ivfTotalRecall float64
 
 	for i := range numQueries {
 		queryIdx := (i * stride) % n
 		queryVec := embeddings[queryIdx]
-
 		groundTruth := bruteForceTopK(queryVec, embeddings, K)
 
 		start := time.Now()
@@ -314,144 +252,75 @@ func main() {
 		ivfTotalLatency += time.Since(start)
 		ivfTotalRecall += computeRecall(ivfResults, groundTruth)
 	}
-	vamanaAvgLatency := vamanaTotalLatency / time.Duration(numQueries)
-	vamanaAvgRecall := vamanaTotalRecall / float64(numQueries)
-	fmt.Printf("  [Vamana] Avg latency: %v, recall@%d: %.2f%%\n", vamanaAvgLatency, K, vamanaAvgRecall*100)
 
-	ivfAvgLatency := ivfTotalLatency / time.Duration(numQueries)
-	ivfAvgRecall := ivfTotalRecall / float64(numQueries)
-	fmt.Printf("  [IVF]    Avg latency: %v, recall@%d: %.2f%%\n", ivfAvgLatency, K, ivfAvgRecall*100)
+	vamanaAvg := vamanaTotalLatency / time.Duration(numQueries)
+	vamanaRecall = vamanaTotalRecall / float64(numQueries)
+	fmt.Printf("  [Vamana] Avg latency: %v, recall@%d: %.2f%%\n", vamanaAvg, K, vamanaRecall*100)
 
-	indexDir := filepath.Join(benchDir, "index")
+	ivfAvg := ivfTotalLatency / time.Duration(numQueries)
+	ivfRecall = ivfTotalRecall / float64(numQueries)
+	fmt.Printf("  [IVF]    Avg latency: %v, recall@%d: %.2f%%\n", ivfAvg, K, ivfRecall*100)
+
+	return vamanaRecall, ivfRecall
+}
+
+// runPersistenceTest saves, loads, and validates the index.
+func runPersistenceTest(embeddings [][]float32, idx *ivf.Index, indexDir string, K, numQueries, stride int) (saveTime, loadTime time.Duration, loadedRecall float64) {
+	n := len(embeddings)
 
 	fmt.Print("\nPhase 6: Saving index to disk... ")
 	saveStart := time.Now()
 	if err := idx.Save(indexDir); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to save index: %v\n", err)
-		os.Exit(1)
+		fatal("save index: %v", err)
 	}
-	saveTime := time.Since(saveStart)
+	saveTime = time.Since(saveStart)
 	fmt.Printf("done in %v\n", saveTime)
 
 	fmt.Print("Phase 7: Loading index from disk... ")
 	loadStart := time.Now()
 	loadedIdx, err := ivf.LoadIndexInMemory(indexDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load index: %v\n", err)
-		os.Exit(1)
+		fatal("load index: %v", err)
 	}
-	loadTime := time.Since(loadStart)
+	loadTime = time.Since(loadStart)
 	fmt.Printf("done in %v (%d vectors)\n", loadTime, loadedIdx.NumVectors())
 
 	fmt.Printf("Phase 7b: Validating loaded index search (queries=%d, K=%d)...\n", numQueries, K)
-
-	var loadedTotalRecall float64
-	var loadedTotalLatency time.Duration
+	var totalRecall float64
+	var totalLatency time.Duration
 
 	for i := range numQueries {
 		queryIdx := (i * stride) % n
 		queryVec := embeddings[queryIdx]
-
 		groundTruth := bruteForceTopK(queryVec, embeddings, K)
 
 		start := time.Now()
-		loadedResults := loadedIdx.SearchIVF(queryVec, K)
-		loadedTotalLatency += time.Since(start)
-		loadedTotalRecall += computeRecall(loadedResults, groundTruth)
+		results := loadedIdx.SearchIVF(queryVec, K)
+		totalLatency += time.Since(start)
+		totalRecall += computeRecall(results, groundTruth)
 	}
 
-	loadedAvgLatency := loadedTotalLatency / time.Duration(numQueries)
-	loadedAvgRecall := loadedTotalRecall / float64(numQueries)
-	fmt.Printf("  [Loaded] Avg latency: %v, recall@%d: %.2f%%\n", loadedAvgLatency, K, loadedAvgRecall*100)
+	loadedRecall = totalRecall / float64(numQueries)
+	avgLatency := totalLatency / time.Duration(numQueries)
+	fmt.Printf("  [Loaded] Avg latency: %v, recall@%d: %.2f%%\n", avgLatency, K, loadedRecall*100)
 
-	if loadedAvgRecall < 0.85 {
+	if loadedRecall < 0.85 {
 		fmt.Fprintf(os.Stderr, "ERROR: Loaded index recall too low: %.2f%% (expected >85%%)\n",
-			loadedAvgRecall*100)
+			loadedRecall*100)
 		os.Exit(1)
 	}
 
-	fmt.Print("\nPhase 8: Corruption test... ")
-	corruptBBQShard(indexDir, 0)
-	corruptNormShard(indexDir, 1)
-	fmt.Println("corrupted BBQ shard 0 and Norm shard 1")
+	return saveTime, loadTime, loadedRecall
+}
 
-	fmt.Print("Phase 8b: Running consistency check... ")
-	checker := ivf.NewConsistencyChecker(indexDir)
-	report, err := checker.Check()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "consistency check failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if report.IsHealthy() {
-		fmt.Fprintf(os.Stderr, "ERROR: Corrupted index reported as healthy!\n")
-		os.Exit(1)
-	}
-
-	fmt.Printf("detected %d corrupt shards\n", len(report.CorruptShards))
-	for _, cs := range report.CorruptShards {
-		fmt.Printf("  - %s shard %d: %s\n", cs.StoreType, cs.ShardIdx, cs.Reason)
-	}
-
-	fmt.Print("\nPhase 9: Repairing corrupted shards... ")
-	repairStart := time.Now()
-	bbqEncoder := idx.BBQEncoder()
-	repairCfg := ivf.RepairConfig{
-		BBQEncoder: bbqEncoder,
-		Dim:        dim,
-	}
-	if err := ivf.RepairFromSQLite(indexDir, report, nil, repairCfg); err != nil {
-		fmt.Fprintf(os.Stderr, "repair failed: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("done in %v\n", time.Since(repairStart))
-
-	fmt.Print("Phase 9b: Verifying repair with consistency check... ")
-	report, err = checker.Check()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "post-repair check failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if !report.IsHealthy() {
-		fmt.Fprintf(os.Stderr, "ERROR: Index still unhealthy after repair!\n")
-		os.Exit(1)
-	}
-	fmt.Println("healthy")
-
-	fmt.Print("Phase 9c: Validating repaired index search... ")
-	repairedIdx, err := ivf.LoadIndexInMemory(indexDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load repaired index: %v\n", err)
-		os.Exit(1)
-	}
-
-	var repairedTotalRecall float64
-	for i := range numQueries {
-		queryIdx := (i * stride) % n
-		queryVec := embeddings[queryIdx]
-		groundTruth := bruteForceTopK(queryVec, embeddings, K)
-		repairedResults := repairedIdx.SearchIVF(queryVec, K)
-		repairedTotalRecall += computeRecall(repairedResults, groundTruth)
-	}
-
-	repairedAvgRecall := repairedTotalRecall / float64(numQueries)
-	fmt.Printf("recall@%d: %.2f%%\n", K, repairedAvgRecall*100)
-
-	if math.Abs(repairedAvgRecall-loadedAvgRecall) > 0.01 {
-		fmt.Fprintf(os.Stderr, "ERROR: Repaired index recall differs from pre-corruption loaded recall: %.2f%% vs %.2f%%\n",
-			repairedAvgRecall*100, loadedAvgRecall*100)
-		os.Exit(1)
-	}
-
-	db.Close()
-
-	fmt.Printf("\n=== Phase 10: Streaming Insert Benchmark ===\n")
-
-	splitPoint := int(float64(len(embeddings)) * 0.99)
+// runInsertBenchmark tests streaming insert and recall after insertion.
+func runInsertBenchmark(embeddings [][]float32, dim, K, numQueries, stride int) float64 {
+	n := len(embeddings)
+	splitPoint := int(float64(n) * 0.99)
 	buildEmbeddings := embeddings[:splitPoint]
 	insertEmbeddings := embeddings[splitPoint:]
 
+	fmt.Printf("\n=== Phase 8: Streaming Insert Benchmark ===\n")
 	fmt.Printf("Building index with %d vectors (99%%)...\n", len(buildEmbeddings))
 	insertTestIdx := ivf.NewIndex(ivf.ConfigForN(len(buildEmbeddings), dim), dim)
 	insertTestIdx.Build(buildEmbeddings)
@@ -463,8 +332,7 @@ func main() {
 		opStart := time.Now()
 		_, err := insertTestIdx.Insert(vec)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "insert failed: %v\n", err)
-			os.Exit(1)
+			fatal("insert: %v", err)
 		}
 		insertLatencies = append(insertLatencies, time.Since(opStart))
 	}
@@ -480,7 +348,7 @@ func main() {
 	fmt.Printf("  Avg insert latency: %v\n", avgInsertLatency)
 	fmt.Printf("  Insert throughput: %.0f vec/sec\n", float64(len(insertEmbeddings))/totalInsertTime.Seconds())
 
-	fmt.Print("Phase 10b: Testing recall after inserts... ")
+	fmt.Print("Phase 8b: Testing recall after inserts... ")
 	var postInsertRecall float64
 	for i := range numQueries {
 		queryIdx := (i * stride) % n
@@ -492,7 +360,17 @@ func main() {
 	postInsertAvgRecall := postInsertRecall / float64(numQueries)
 	fmt.Printf("recall@%d: %.2f%%\n", K, postInsertAvgRecall*100)
 
-	fmt.Printf("\n=== Phase 10c: StitchBatch Benchmark ===\n")
+	return postInsertAvgRecall
+}
+
+// runStitchBenchmark tests StitchBatch and recall after stitching.
+func runStitchBenchmark(embeddings [][]float32, dim, K, numQueries, stride int) {
+	n := len(embeddings)
+	splitPoint := int(float64(n) * 0.99)
+	buildEmbeddings := embeddings[:splitPoint]
+	insertEmbeddings := embeddings[splitPoint:]
+
+	fmt.Printf("\n=== Phase 9: StitchBatch Benchmark ===\n")
 	fmt.Printf("Building fresh index with %d vectors (99%%)...\n", len(buildEmbeddings))
 	stitchTestIdx := ivf.NewIndex(ivf.ConfigForN(len(buildEmbeddings), dim), dim)
 	stitchTestIdx.Build(buildEmbeddings)
@@ -501,17 +379,15 @@ func main() {
 	stitchStart := time.Now()
 	stitchResult, err := stitchTestIdx.StitchBatch(insertEmbeddings)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "stitch failed: %v\n", err)
-		os.Exit(1)
+		fatal("stitch: %v", err)
 	}
 	stitchTime := time.Since(stitchStart)
 
 	fmt.Printf("  Stitched %d vectors in %v\n", stitchResult.VectorsAdded, stitchTime)
 	fmt.Printf("  Boundary nodes: %d, Edges added: %d\n", stitchResult.BoundaryNodes, stitchResult.EdgesAdded)
-	fmt.Printf("  Searches performed: %d (vs %d for InsertBatch)\n", stitchResult.SearchesPerformed, len(insertEmbeddings))
 	fmt.Printf("  Stitch throughput: %.0f vec/sec\n", float64(len(insertEmbeddings))/stitchTime.Seconds())
 
-	fmt.Print("Phase 10d: Testing recall after stitch... ")
+	fmt.Print("Phase 9b: Testing recall after stitch... ")
 	var postStitchRecall float64
 	for i := range numQueries {
 		queryIdx := (i * stride) % n
@@ -522,196 +398,95 @@ func main() {
 	}
 	postStitchAvgRecall := postStitchRecall / float64(numQueries)
 	fmt.Printf("recall@%d: %.2f%%\n", K, postStitchAvgRecall*100)
+}
 
-	fmt.Printf("\n  Comparison: InsertBatch=%v (%.0f vec/sec), StitchBatch=%v (%.0f vec/sec)\n",
-		totalInsertTime, float64(len(insertEmbeddings))/totalInsertTime.Seconds(),
-		stitchTime, float64(len(insertEmbeddings))/stitchTime.Seconds())
-	fmt.Printf("  Speedup: %.2fx\n", totalInsertTime.Seconds()/stitchTime.Seconds())
+// runMaintenance tests centroid refresh, graph optimization, and recall impact.
+func runMaintenance(embeddings [][]float32, dim, K, numQueries, stride int) {
+	n := len(embeddings)
+	splitPoint := int(float64(n) * 0.99)
+	buildEmbeddings := embeddings[:splitPoint]
+	insertEmbeddings := embeddings[splitPoint:]
 
-	fmt.Print("\nPhase 11: Maintenance Stats... ")
-	mstats := insertTestIdx.MaintenanceStats()
+	// Build index with inserts for maintenance testing
+	maintIdx := ivf.NewIndex(ivf.ConfigForN(len(buildEmbeddings), dim), dim)
+	maintIdx.Build(buildEmbeddings)
+	for _, vec := range insertEmbeddings {
+		maintIdx.Insert(vec)
+	}
+
+	fmt.Print("\nPhase 10: Maintenance Stats... ")
+	mstats := maintIdx.MaintenanceStats()
 	fmt.Printf("\n  Vectors: %d, Partitions: %d\n", mstats.NumVectors, mstats.NumPartitions)
 	fmt.Printf("  Partition balance: gini=%.4f, cv=%.4f\n", mstats.PartitionSizeGini, mstats.PartitionSizeCV)
 	fmt.Printf("  Drift ratio: %.4f (1.0 = baseline)\n", mstats.DriftRatio)
 	fmt.Printf("  Graph health: connectivity=%.4f, fill_rate=%.4f\n", mstats.ConnectivityRatio, mstats.DegreeFillRate)
 
-	fmt.Print("\nPhase 11b: Refreshing centroids... ")
+	fmt.Print("\nPhase 10b: Refreshing centroids... ")
 	refreshStart := time.Now()
-	refreshResult, err := insertTestIdx.RefreshCentroids(3)
+	refreshResult, err := maintIdx.RefreshCentroids(3)
 	if err != nil {
 		fmt.Printf("error: %v\n", err)
-	} else {
-		fmt.Printf("done in %v (%d vectors reassigned)\n", time.Since(refreshStart), refreshResult.VectorsReassigned)
-
-		fmt.Print("Phase 11c: Testing recall after centroid refresh... ")
-		var postRefreshRecall float64
-		for i := range numQueries {
-			queryIdx := (i * stride) % n
-			queryVec := embeddings[queryIdx]
-			groundTruth := bruteForceTopK(queryVec, embeddings, K)
-			results := insertTestIdx.SearchVamana(queryVec, K)
-			postRefreshRecall += computeRecall(results, groundTruth)
-		}
-		postRefreshAvgRecall := postRefreshRecall / float64(numQueries)
-		fmt.Printf("recall@%d: %.2f%%\n", K, postRefreshAvgRecall*100)
+		return
 	}
+	fmt.Printf("done in %v (%d vectors reassigned)\n", time.Since(refreshStart), refreshResult.VectorsReassigned)
 
-	fmt.Print("\nPhase 11d: Optimizing graph... ")
+	fmt.Print("Phase 10c: Testing recall after centroid refresh... ")
+	var postRefreshRecall float64
+	for i := range numQueries {
+		queryIdx := (i * stride) % n
+		queryVec := embeddings[queryIdx]
+		groundTruth := bruteForceTopK(queryVec, embeddings, K)
+		results := maintIdx.SearchVamana(queryVec, K)
+		postRefreshRecall += computeRecall(results, groundTruth)
+	}
+	postRefreshAvgRecall := postRefreshRecall / float64(numQueries)
+	fmt.Printf("recall@%d: %.2f%%\n", K, postRefreshAvgRecall*100)
+
+	fmt.Print("\nPhase 10d: Optimizing graph... ")
 	optimizeStart := time.Now()
-	optimizeResult := insertTestIdx.OptimizeGraph(0)
+	optimizeResult := maintIdx.OptimizeGraph(0)
 	fmt.Printf("done in %v (nodes=%d, +%d/-%d edges)\n",
 		time.Since(optimizeStart), optimizeResult.NodesUpdated, optimizeResult.EdgesAdded, optimizeResult.EdgesRemoved)
 
-	fmt.Print("Phase 11e: Testing recall after graph optimization... ")
+	fmt.Print("Phase 10e: Testing recall after graph optimization... ")
 	var postOptimizeRecall float64
 	for i := range numQueries {
 		queryIdx := (i * stride) % n
 		queryVec := embeddings[queryIdx]
 		groundTruth := bruteForceTopK(queryVec, embeddings, K)
-		results := insertTestIdx.SearchVamana(queryVec, K)
+		results := maintIdx.SearchVamana(queryVec, K)
 		postOptimizeRecall += computeRecall(results, groundTruth)
 	}
 	postOptimizeAvgRecall := postOptimizeRecall / float64(numQueries)
 	fmt.Printf("recall@%d: %.2f%%\n", K, postOptimizeAvgRecall*100)
+}
 
-	if postOptimizeAvgRecall < postInsertAvgRecall-0.02 {
-		fmt.Fprintf(os.Stderr, "WARNING: Graph optimization hurt recall: %.2f%% -> %.2f%%\n",
-			postInsertAvgRecall*100, postOptimizeAvgRecall*100)
-	}
-
-	totalTime := time.Since(totalStart)
+// printSummary outputs the final benchmark summary.
+func printSummary(
+	ingest *sylkdir.SessionIngestionResult,
+	embeddings [][]float32, dim int,
+	buildTime, saveTime, loadTime time.Duration,
+	vamanaRecall, ivfRecall, loadedRecall, insertRecall float64,
+	K int, totalTime time.Duration,
+) {
 	fmt.Printf("\n=== Summary ===\n")
-	fmt.Printf("Total files:      %d\n", len(files))
-	fmt.Printf("Total symbols:    %d\n", len(symbols))
+	fmt.Printf("Files processed:  %d\n", ingest.FilesProcessed)
+	fmt.Printf("Nodes created:    %d\n", ingest.NodesCreated)
+	fmt.Printf("Vectors created:  %d\n", ingest.VectorsCreated)
+	fmt.Printf("Dimension:        %d\n", dim)
 	fmt.Printf("Total time:       %v\n", totalTime)
 	fmt.Printf("Build time:       %v (%.0f vec/sec)\n", buildTime, float64(len(embeddings))/buildTime.Seconds())
-	fmt.Printf("Search latency:   %v avg\n", vamanaAvgLatency)
-	fmt.Printf("Recall@%d:        %.2f%%\n", K, vamanaAvgRecall*100)
 	fmt.Printf("Persistence:      save=%v, load=%v\n", saveTime, loadTime)
-	fmt.Printf("Loaded recall:    %.2f%%\n", loadedAvgRecall*100)
-	fmt.Printf("Repaired recall:  %.2f%%\n", repairedAvgRecall*100)
-	fmt.Printf("Insert:           %v avg, %.0f vec/sec\n", avgInsertLatency, float64(len(insertEmbeddings))/totalInsertTime.Seconds())
-	fmt.Printf("Post-insert recall: %.2f%%\n", postInsertAvgRecall*100)
-
-	if *memProfile != "" {
-		f, err := os.Create(*memProfile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "could not create memory profile: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		runtime.GC()
-		if err := pprof.WriteHeapProfile(f); err != nil {
-			fmt.Fprintf(os.Stderr, "could not write memory profile: %v\n", err)
-			os.Exit(1)
-		}
-	}
+	fmt.Printf("Recall@%d:\n", K)
+	fmt.Printf("  Vamana:         %.2f%%\n", vamanaRecall*100)
+	fmt.Printf("  IVF:            %.2f%%\n", ivfRecall*100)
+	fmt.Printf("  Loaded:         %.2f%%\n", loadedRecall*100)
+	fmt.Printf("  Post-insert:    %.2f%%\n", insertRecall*100)
 }
 
-func parseAllSymbols(root string, files []string) []symbol {
-	tool := treesitter.NewTreeSitterTool()
-	ctx := context.Background()
-
-	var symbols []symbol
-	var mu sync.Mutex
-	var parsed atomic.Int64
-
-	workCh := make(chan string, 1000)
-	var wg sync.WaitGroup
-
-	workers := runtime.NumCPU()
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var local []symbol
-
-			for path := range workCh {
-				content, err := os.ReadFile(path)
-				if err != nil {
-					continue
-				}
-
-				result, err := tool.ParseFast(ctx, path, content)
-				if err != nil {
-					continue
-				}
-
-				relPath, _ := filepath.Rel(root, path)
-
-				for _, fn := range result.Functions {
-					nt := uint16(vectorgraphdb.NodeTypeFunction)
-					if fn.IsMethod {
-						nt = uint16(vectorgraphdb.NodeTypeMethod)
-					}
-					sig := fn.Parameters
-					if fn.ReturnType != "" {
-						sig += " " + fn.ReturnType
-					}
-					local = append(local, symbol{
-						id:        relPath + ":" + fn.Name,
-						name:      fn.Name,
-						kind:      "function",
-						signature: sig,
-						filePath:  relPath,
-						nodeType:  nt,
-					})
-				}
-
-				for _, typ := range result.Types {
-					nt := uint16(vectorgraphdb.NodeTypeStruct)
-					if typ.Kind == "interface" {
-						nt = uint16(vectorgraphdb.NodeTypeInterface)
-					}
-					local = append(local, symbol{
-						id:        relPath + ":" + typ.Name,
-						name:      typ.Name,
-						kind:      typ.Kind,
-						signature: "",
-						filePath:  relPath,
-						nodeType:  nt,
-					})
-				}
-
-				parsed.Add(1)
-			}
-
-			mu.Lock()
-			symbols = append(symbols, local...)
-			mu.Unlock()
-		}()
-	}
-
-	for _, f := range files {
-		workCh <- f
-	}
-	close(workCh)
-	wg.Wait()
-
-	return symbols
-}
-
-func generateEmbeddings(emb *embedder.ClusteredMockEmbedder, symbols []symbol) [][]float32 {
-	texts := make([]string, len(symbols))
-	for i, s := range symbols {
-		texts[i] = embedder.SerializeSymbolStandalone(s.name, s.kind, s.signature, s.filePath)
-	}
-
-	rawEmbeddings, err := emb.EmbedBatch(context.Background(), texts)
-	if err != nil {
-		panic(err)
-	}
-
-	dim := emb.Dimension()
-	flat := make([]float32, len(rawEmbeddings)*dim)
-	embeddings := make([][]float32, len(rawEmbeddings))
-	for i, e := range rawEmbeddings {
-		copy(flat[i*dim:], e)
-		embeddings[i] = flat[i*dim : (i+1)*dim : (i+1)*dim]
-	}
-
-	return embeddings
-}
+// =============================================================================
+// Utilities
+// =============================================================================
 
 func bruteForceTopK(query []float32, embeddings [][]float32, K int) []uint32 {
 	results := bruteForceWithSims(query, embeddings, K)
@@ -770,3 +545,43 @@ func computeRecall(results []ivf.SearchResult, groundTruth []uint32) float64 {
 
 	return float64(hits) / float64(len(groundTruth))
 }
+
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "FATAL: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+func setupProfiles(cfg *benchConfig) {
+	if cfg.cpuProfile == "" {
+		return
+	}
+	f, err := os.Create(cfg.cpuProfile)
+	if err != nil {
+		fatal("create CPU profile: %v", err)
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		fatal("start CPU profile: %v", err)
+	}
+}
+
+func teardownProfiles(cfg *benchConfig) {
+	if cfg.cpuProfile != "" {
+		pprof.StopCPUProfile()
+	}
+}
+
+func writeMemProfile(path string) {
+	if path == "" {
+		return
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		fatal("create memory profile: %v", err)
+	}
+	defer f.Close()
+	runtime.GC()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		fatal("write memory profile: %v", err)
+	}
+}
+

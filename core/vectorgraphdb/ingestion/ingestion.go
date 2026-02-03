@@ -55,6 +55,9 @@ func (i *ingester) ingest(ctx context.Context) (*IngestionResult, error) {
 		return nil, fmt.Errorf("discovery: %w", err)
 	}
 
+	// Phase 1b: Filter to included paths (delta ingestion).
+	i.applyPathFilter()
+
 	// Phase 2: Read
 	if err := i.runRead(ctx); err != nil {
 		return nil, fmt.Errorf("read: %w", err)
@@ -89,7 +92,7 @@ func (i *ingester) ingest(ctx context.Context) (*IngestionResult, error) {
 func (i *ingester) runDiscovery(ctx context.Context) error {
 	start := time.Now()
 
-	files, err := DiscoverFiles(ctx, i.config.RootPath, i.config.IgnorePatterns)
+	files, err := DiscoverFiles(ctx, i.config.RootPath, i.config.IgnorePatterns, i.config.Discovery)
 	if err != nil {
 		return err
 	}
@@ -97,6 +100,22 @@ func (i *ingester) runDiscovery(ctx context.Context) error {
 	i.files = files
 	i.result.PhaseDurations.Discovery = time.Since(start)
 	return nil
+}
+
+// applyPathFilter restricts the discovered files to only those in Config.IncludePaths.
+// When IncludePaths is nil, all discovered files proceed (full ingestion).
+// When set, only files whose absolute path is in the set are kept (delta ingestion).
+func (i *ingester) applyPathFilter() {
+	if i.config.IncludePaths == nil {
+		return
+	}
+	filtered := make([]FileInfo, 0, len(i.config.IncludePaths))
+	for _, f := range i.files {
+		if i.config.IncludePaths[f.Path] {
+			filtered = append(filtered, f)
+		}
+	}
+	i.files = filtered
 }
 
 // runRead executes the file reading phase.
@@ -203,6 +222,9 @@ func (i *ingester) finalizeResult(start time.Time) {
 	i.result.TotalBytes = i.graph.TotalBytes
 	i.result.TotalDuration = time.Since(start)
 	i.result.ParseErrors = i.errors
+	if i.config.RetainContent {
+		i.result.MappedFiles = i.mapped
+	}
 }
 
 // =============================================================================

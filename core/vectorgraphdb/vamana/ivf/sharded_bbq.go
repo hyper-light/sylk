@@ -347,7 +347,8 @@ func (s *bbqShard) Close() error {
 
 // loadShards returns the current shard slice.
 func (s *ShardedBBQStore) loadShards() []*bbqShard {
-	return s.shards.Load().([]*bbqShard)
+	v, _ := s.shards.Load().([]*bbqShard)
+	return v
 }
 
 // createShard creates a new BBQ shard.

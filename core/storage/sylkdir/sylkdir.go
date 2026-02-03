@@ -14,6 +14,8 @@ import (
 	"sort"
 	"syscall"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // Directory and file constants for the .sylk layout.
@@ -97,6 +99,7 @@ func (s *SylkDir) Init() error {
 		filepath.Join(s.GlobalDataPath(), "nodes"),
 		filepath.Join(s.GlobalDataPath(), "vectors"),
 		filepath.Join(s.GlobalDataPath(), "docs"),
+		filepath.Join(s.GlobalDataPath(), "chunks"),
 		s.GlobalEdgeDataPath(),
 		s.GlobalCanonicalIndexPath(),
 	}
@@ -393,7 +396,7 @@ func (s *SylkDir) GlobalNodeBlocksPath() string {
 }
 
 // CreateGlobalVersion creates a global version directory with subdirectories.
-// Structure: .sylk/versions/v1.0.0/{nodes,edges,vectors,docs,bleve}
+// Structure: .sylk/versions/v1.0.0/{nodes,vectors,docs,chunks,bleve}
 func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {
 	versionPath := s.GlobalVersionPath(version)
 
@@ -402,6 +405,7 @@ func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {
 		filepath.Join(versionPath, "nodes"),
 		filepath.Join(versionPath, "vectors"),
 		filepath.Join(versionPath, "docs"),
+		filepath.Join(versionPath, "chunks"),
 		filepath.Join(versionPath, "bleve"),
 	}
 
@@ -450,38 +454,31 @@ func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {
 // SnapshotGlobalData copies parent version's index/data files into the target version.
 // Nodes and vectors use offset index files (cloned, not data copied).
 // Edges and docs use per-version data files (physical copy).
+// All file copies run in parallel since they are independent.
 func (s *SylkDir) SnapshotGlobalData(parent, target SemanticVersion) error {
 	parentPath := s.GlobalVersionPath(parent)
 	targetPath := s.GlobalVersionPath(target)
 
-	// Index files for nodes, vectors, and docs (offset indexes into shared data files).
-	indexFiles := []string{
+	// All copyable files: index files (offset indexes) + per-version data files.
+	files := []string{
 		"nodes/index.bin",
 		"vectors/index.bin",
 		"docs/index.bin",
-	}
-	for _, file := range indexFiles {
-		src := filepath.Join(parentPath, file)
-		dst := filepath.Join(targetPath, file)
-		if err := copyFileIfExists(src, dst); err != nil {
-			return fmt.Errorf("sylkdir: copy index %s: %w", file, err)
-		}
-	}
-
-	// Per-version data files: tombstones (edges use shared EdgeShardStore,
-	// nodes/vectors/docs use shared data files with per-version offset indexes).
-	dataFiles := []string{
 		TombstoneFile,
 	}
-	for _, file := range dataFiles {
-		src := filepath.Join(parentPath, file)
-		dst := filepath.Join(targetPath, file)
-		if err := copyFileIfExists(src, dst); err != nil {
-			return fmt.Errorf("sylkdir: copy %s: %w", file, err)
-		}
-	}
 
-	return nil
+	g := new(errgroup.Group)
+	for _, file := range files {
+		g.Go(func() error {
+			src := filepath.Join(parentPath, file)
+			dst := filepath.Join(targetPath, file)
+			if err := copyFileIfExists(src, dst); err != nil {
+				return fmt.Errorf("sylkdir: copy %s: %w", file, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // CompactGlobalData compacts parent version's data into the target version,

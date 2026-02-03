@@ -16,7 +16,7 @@ func TestSource_String(t *testing.T) {
 		expected string
 	}{
 		{"bleve", SourceBleve, "bleve"},
-		{"hnsw", SourceHNSW, "hnsw"},
+		{"vector", SourceVector, "vector"},
 		{"graph", SourceGraph, "graph"},
 		{"combined", SourceCombined, "combined"},
 		{"unknown", Source(99), "source(99)"},

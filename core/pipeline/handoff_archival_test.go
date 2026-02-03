@@ -22,7 +22,7 @@ func TestNewHandoffArchiver(t *testing.T) {
 		config := pipeline.ArchiverConfig{
 			AsyncQueueSize: 50,
 			WorkerCount:    4,
-			EmbeddingDim:   768,
+			EmbeddingDim:   1024,
 			MaxRetries:     5,
 			RetryBackoff:   2 * time.Second,
 		}

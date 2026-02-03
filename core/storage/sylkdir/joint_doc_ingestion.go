@@ -7,6 +7,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
+	"golang.org/x/sync/errgroup"
 )
 
 // JointDocIngestion provides atomic Insert/Update/Delete for documents
@@ -19,9 +20,9 @@ type JointDocIngestion struct {
 	docStore      *VersionDocStore
 	vectorStore   *VersionVectorStore
 	chunkRefStore *ChunkRefStore
-	embedder      embedder.Embedder
-	chunkerReg    *ChunkerRegistry
-	nextNodeID    *uint32 // shared counter (may be shared with SessionIngestion)
+	embedder   embedder.Embedder
+	chunker    *UniversalChunker
+	nextNodeID *uint32 // shared counter (may be shared with SessionIngestion)
 }
 
 // JointDocRequest describes a document to ingest jointly.
@@ -47,7 +48,14 @@ type JointDocResult struct {
 }
 
 // NewJointDocIngestion creates a joint ingestion handler for the session.
-func NewJointDocIngestion(sess *Session, nextNodeID *uint32, e embedder.Embedder, maxTokens int) *JointDocIngestion {
+func NewJointDocIngestion(sess *Session, nextNodeID *uint32, e embedder.Embedder) *JointDocIngestion {
+	similarity := embedder.NewEnhancedHybridEmbedder()
+	var ceiling uint32
+	if e != nil {
+		ceiling = uint32(e.MaxInputBytes())
+	} else {
+		ceiling = uint32(similarity.MaxInputBytes())
+	}
 	return &JointDocIngestion{
 		session:       sess,
 		nodeStore:     NewVersionNodeStore(sess),
@@ -56,7 +64,7 @@ func NewJointDocIngestion(sess *Session, nextNodeID *uint32, e embedder.Embedder
 		vectorStore:   NewVersionVectorStore(sess),
 		chunkRefStore: NewChunkRefStore(sess),
 		embedder:      e,
-		chunkerReg:    NewChunkerRegistry(maxTokens),
+		chunker:       NewUniversalChunker(similarity, ceiling),
 		nextNodeID:    nextNodeID,
 	}
 }
@@ -68,11 +76,12 @@ func (j *JointDocIngestion) allocID() uint32 {
 	return id
 }
 
-// Insert atomically creates a document with its chunks, nodes, edges,
-// vectors, and Bleve index entries.
+// Insert creates a document with its chunks, nodes, edges, vectors, and
+// Bleve index entries. Store writes, batch embedding, and Bleve indexing
+// run concurrently via errgroup for throughput.
 func (j *JointDocIngestion) Insert(ctx context.Context, req *JointDocRequest) (*JointDocResult, error) {
 	cc := ContentClassFromDocType(req.DocType)
-	boundaries := j.chunkBoundaries(req, cc)
+	boundaries := j.chunkBoundaries(ctx, req)
 	result := &JointDocResult{ChunkCount: len(boundaries)}
 
 	parentNode, parentDocRef := j.createParentNode(req, cc)
@@ -85,18 +94,42 @@ func (j *JointDocIngestion) Insert(ctx context.Context, req *JointDocRequest) (*
 	edges := j.createChunkEdges(parentNode.ID, chunkNodes)
 	result.EdgesCreated = len(edges)
 
-	if err := j.writeAll(ctx, parentNode, parentDoc, chunkNodes, chunkDocs, chunkRefs, edges); err != nil {
+	allDocs := make([]*VersionDocument, 0, 1+len(chunkDocs))
+	allDocs = append(allDocs, parentDoc)
+	allDocs = append(allDocs, chunkDocs...)
+	result.DocsCreated = len(allDocs)
+
+	chunkTexts := extractChunkTexts(chunkDocs)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Store writes: nodes, docs, chunk refs, edges.
+	g.Go(func() error {
+		return j.writeAll(gctx, parentNode, parentDoc, chunkNodes, chunkDocs, chunkRefs, edges)
+	})
+
+	// Batch embed all chunk texts concurrently with store writes.
+	var embeddings [][]float32
+	g.Go(func() error {
+		var err error
+		embeddings, err = j.embedBatch(gctx, chunkTexts)
+		return err
+	})
+
+	// Bleve index concurrently with store writes and embedding.
+	g.Go(func() error {
+		return j.indexBleve(gctx, allDocs)
+	})
+
+	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	result.DocsCreated = 1 + len(chunkDocs)
 
-	vectors, err := j.embedChunks(ctx, chunkNodes, chunkDocs)
+	// Write vectors after embeddings are ready.
+	vectors, err := j.writeVectors(ctx, chunkNodes, chunkDocs, embeddings)
 	if err == nil {
 		result.VectorsCreated = len(vectors)
 	}
-
-	allDocs := append([]*VersionDocument{parentDoc}, chunkDocs...)
-	_ = j.indexBleve(ctx, allDocs)
 
 	j.trackAndCheckpoint(result)
 	return result, nil
@@ -119,12 +152,19 @@ func (j *JointDocIngestion) Delete(ctx context.Context, canonicalKey string) err
 // Chunking
 // ---------------------------------------------------------------------------
 
-func (j *JointDocIngestion) chunkBoundaries(req *JointDocRequest, cc ContentClass) []ChunkBoundary {
-	chunker := j.chunkerReg.Get(cc)
-	if src, ok := chunker.(*SourceCodeChunker); ok && len(req.Symbols) > 0 {
-		return src.ChunkWithSymbols(req.Content, req.Symbols)
+func (j *JointDocIngestion) chunkBoundaries(ctx context.Context, req *JointDocRequest) []ChunkBoundary {
+	if len(req.Symbols) > 0 {
+		bounds := make([]SymbolBound, len(req.Symbols))
+		for i, sym := range req.Symbols {
+			bounds[i] = SymbolBound{
+				StartLine: uint32(sym.Line),
+				EndLine:   0,
+				Strength:  SearchKindToStrength(string(sym.Kind)),
+			}
+		}
+		return j.chunker.ChunkWithSymbols(ctx, req.Content, bounds).Boundaries
 	}
-	return chunker.Chunk(req.Content)
+	return j.chunker.Chunk(ctx, req.Content).Boundaries
 }
 
 // ---------------------------------------------------------------------------
@@ -296,22 +336,34 @@ func (j *JointDocIngestion) writeAll(ctx context.Context, parentNode *Node, pare
 	return nil
 }
 
-func (j *JointDocIngestion) embedChunks(ctx context.Context, nodes []*Node, docs []*VersionDocument) ([]*VersionVector, error) {
+// embedBatch calls EmbedBatch on all chunk texts. Returns nil, nil if no
+// embedder is configured. The embedder handles internal concurrency,
+// batching, and rate limiting.
+func (j *JointDocIngestion) embedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if j.embedder == nil {
 		return nil, nil
 	}
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	return j.embedder.EmbedBatch(ctx, texts)
+}
+
+// writeVectors constructs VersionVector records from batch embeddings and
+// writes them to the vector store. Skips positions where embedding is nil
+// or content was empty.
+func (j *JointDocIngestion) writeVectors(_ context.Context, nodes []*Node, docs []*VersionDocument, embeddings [][]float32) ([]*VersionVector, error) {
+	if embeddings == nil {
+		return nil, nil
+	}
 	vectors := make([]*VersionVector, 0, len(nodes))
-	for i, doc := range docs {
-		if doc.Content == "" {
-			continue
-		}
-		vec, err := j.embedder.Embed(ctx, doc.Content)
-		if err != nil {
+	for i, emb := range embeddings {
+		if emb == nil || docs[i].Content == "" {
 			continue
 		}
 		vectors = append(vectors, &VersionVector{
 			NodeID: nodes[i].ID,
-			Vector: vec,
+			Vector: emb,
 		})
 	}
 	if len(vectors) == 0 {
@@ -321,6 +373,16 @@ func (j *JointDocIngestion) embedChunks(ctx context.Context, nodes []*Node, docs
 		return nil, fmt.Errorf("write vectors: %w", err)
 	}
 	return vectors, nil
+}
+
+// extractChunkTexts collects content strings from chunk documents.
+// Returns a parallel slice suitable for EmbedBatch.
+func extractChunkTexts(docs []*VersionDocument) []string {
+	texts := make([]string, len(docs))
+	for i, doc := range docs {
+		texts[i] = doc.Content
+	}
+	return texts
 }
 
 func (j *JointDocIngestion) indexBleve(ctx context.Context, docs []*VersionDocument) error {

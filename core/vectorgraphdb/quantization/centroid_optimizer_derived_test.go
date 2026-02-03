@@ -744,7 +744,7 @@ func TestBackwardCompatibility(t *testing.T) {
 }
 
 func TestDeriveFactorsWithVariousDimensions(t *testing.T) {
-	dimensions := []int{32, 64, 128, 768}
+	dimensions := []int{32, 64, 128, 1024}
 
 	for _, dim := range dimensions {
 		t.Run(derivedTestDimName(dim), func(t *testing.T) {
@@ -803,7 +803,7 @@ func BenchmarkDeriveScalingFactors(b *testing.B) {
 		{"small_32d", 500, 32, 4},
 		{"medium_64d", 1000, 64, 8},
 		{"large_128d", 2000, 128, 16},
-		{"xlarge_768d", 1000, 768, 96},
+		{"xlarge_1024d", 1000, 1024, 96},
 	}
 
 	for _, bc := range benchCases {

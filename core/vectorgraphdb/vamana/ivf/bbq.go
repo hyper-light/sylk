@@ -9,7 +9,7 @@ import (
 )
 
 // BBQ: Better Binary Quantization with lookup-table acceleration.
-// DB: 1-bit/dim (96 bytes for 768-dim), Query: int8 + 48KB lookup table (fits L2).
+// DB: 1-bit/dim (128 bytes for 1024-dim), Query: int8 + 64KB lookup table (fits L2).
 // Distance: O(codeLen) lookups vs O(dim) multiply-accumulates. Zero allocations in hot path.
 type BBQ struct {
 	dim     int

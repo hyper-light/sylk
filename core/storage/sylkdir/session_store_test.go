@@ -1,10 +1,13 @@
 package sylkdir
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/search"
 )
 
 func TestSessionStoreCreate(t *testing.T) {
@@ -17,6 +20,7 @@ func TestSessionStoreCreate(t *testing.T) {
 	store := NewSessionStore(sd)
 
 	baseSnapshot := &BaseSnapshot{
+		GlobalVersion:     SemanticVersion{Major: 1, Minor: 0, Patch: 0},
 		CommittedSessions: []uint32{},
 		SnapshotAt:        time.Now(),
 		NextNodeID:        1,
@@ -26,6 +30,7 @@ func TestSessionStoreCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
+	defer sess.CloseBleve()
 
 	// Verify session directory structure
 	expectedDirs := []string{
@@ -103,6 +108,7 @@ func TestSessionStoreLoadSession(t *testing.T) {
 	store := NewSessionStore(sd)
 
 	baseSnapshot := &BaseSnapshot{
+		GlobalVersion:     SemanticVersion{Major: 2, Minor: 0, Patch: 0},
 		CommittedSessions: []uint32{1, 2},
 		SnapshotAt:        time.Now(),
 		NextNodeID:        1000,
@@ -133,6 +139,10 @@ func TestSessionStoreLoadSession(t *testing.T) {
 	}
 	if sess.BaseSnapshot.NextNodeID != 1000 {
 		t.Errorf("BaseSnapshot.NextNodeID = %d, want 1000", sess.BaseSnapshot.NextNodeID)
+	}
+	expectedGlobalVersion := SemanticVersion{Major: 2, Minor: 0, Patch: 0}
+	if !sess.BaseSnapshot.GlobalVersion.Equal(expectedGlobalVersion) {
+		t.Errorf("BaseSnapshot.GlobalVersion = %s, want %s", sess.BaseSnapshot.GlobalVersion.String(), expectedGlobalVersion.String())
 	}
 }
 
@@ -478,6 +488,7 @@ func TestSemanticVersionBumps(t *testing.T) {
 
 	store := NewSessionStore(sd)
 	sess, _ := store.Create(1, nil)
+	defer sess.CloseBleve()
 
 	// Test patch bump: v1.0.0 -> v1.0.1
 	v, _ := sess.Checkpoint("patch", CheckpointPatch)
@@ -495,5 +506,349 @@ func TestSemanticVersionBumps(t *testing.T) {
 	v, _ = sess.Checkpoint("major", CheckpointMajor)
 	if v.Major != 2 || v.Minor != 0 || v.Patch != 0 {
 		t.Errorf("Major bump = %s, want v2.0.0", v.String())
+	}
+}
+
+func TestSessionCreateHasBleve(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+	sess, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer sess.CloseBleve()
+
+	// Session should have a BleveStore
+	if sess.BleveStore == nil {
+		t.Fatal("Expected session to have BleveStore after Create")
+	}
+
+	// Bleve should be open and functional
+	if sess.BleveStore.Head() == nil || sess.BleveStore.Head().Manager() == nil {
+		t.Fatal("Expected Bleve Manager to be non-nil")
+	}
+
+	// Bleve database should exist on disk in HEAD version directory
+	blevePath := filepath.Join(sess.VersionPath(sess.Manifest.Head), "bleve", "documents.bleve")
+	if _, err := os.Stat(blevePath); os.IsNotExist(err) {
+		t.Errorf("Expected Bleve database at %s", blevePath)
+	}
+}
+
+func TestSessionLoadReopensBleve(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+	sess, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Index a document into session Bleve
+	ctx := context.Background()
+	doc := &search.Document{
+		ID:      "test-1",
+		Path:    "/test.go",
+		Content: "session bleve persistence test",
+	}
+	if err := sess.BleveStore.Index(ctx, doc); err != nil {
+		t.Fatalf("Index failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Close session Bleve
+	if err := sess.CloseBleve(); err != nil {
+		t.Fatalf("CloseBleve failed: %v", err)
+	}
+
+	// Load should reopen Bleve for active sessions
+	loaded, err := store.Load("ses_001")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	defer loaded.CloseBleve()
+
+	if loaded.BleveStore == nil {
+		t.Fatal("Expected BleveStore to be reopened on Load for active session")
+	}
+
+	// Verify the indexed document persisted
+	count, err := loaded.BleveStore.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("DocumentCount after reload = %d, want 1", count)
+	}
+}
+
+func TestSessionLoadCommittedNoBleveReopen(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+	sess, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Simulate committed session
+	sess.Meta.Status = SessionCommitted
+	now := time.Now()
+	sess.Meta.CommittedAt = &now
+	sess.CloseBleve()
+	sess.Save()
+
+	// Load committed session — should NOT reopen Bleve
+	loaded, err := store.Load("ses_001")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if loaded.BleveStore != nil {
+		t.Error("Expected BleveStore to be nil for committed session on Load")
+	}
+}
+
+func TestSessionSearch(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+	sess, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer sess.CloseBleve()
+
+	ctx := context.Background()
+
+	// Index a document
+	doc := &search.Document{
+		ID:      "file-1",
+		Path:    "/src/main.go",
+		Content: "func handleRequest() { return nil }",
+	}
+	if err := sess.BleveStore.Index(ctx, doc); err != nil {
+		t.Fatalf("Index failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Search via session method
+	result, err := sess.Search(ctx, &search.SearchRequest{
+		Query: "handleRequest",
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Expected non-nil SearchResult")
+	}
+	if result.TotalHits < 1 {
+		t.Errorf("TotalHits = %d, want >= 1", result.TotalHits)
+	}
+}
+
+func TestSessionSearchNilBleve(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+	sess, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	sess.CloseBleve()
+
+	// Search on a session with nil Bleve should return nil, nil
+	result, err := sess.Search(context.Background(), &search.SearchRequest{Query: "test", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if result != nil {
+		t.Error("Expected nil result when Bleve is nil")
+	}
+}
+
+func TestSessionBleveStoreOpenHeadIdempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+	sess, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer sess.CloseBleve()
+
+	// Bleve is already open from Create. Calling OpenHead again should be no-op.
+	head := sess.BleveStore.Head()
+	if err := sess.BleveStore.OpenHead(); err != nil {
+		t.Fatalf("OpenHead (idempotent) failed: %v", err)
+	}
+
+	// Should be the same BleveStore head (not recreated)
+	if sess.BleveStore.Head() != head {
+		t.Error("Expected OpenHead to be idempotent (same head)")
+	}
+}
+
+func TestSessionRebuildBleve(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+	sess, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Write a document to JSONL (source of truth)
+	docStore := NewVersionDocStore(sess)
+	docs := []*VersionDocument{
+		{ID: "file_1", Path: "main.go", Type: "source_code", Content: "rebuild test content", Language: "go", IndexedAt: time.Now().UnixNano()},
+	}
+	if err := docStore.WriteBatch(docs); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// Close and destroy the Bleve index
+	sess.CloseBleve()
+	blevePath := filepath.Join(sess.VersionPath(sess.Manifest.Head), "bleve")
+	os.RemoveAll(blevePath)
+
+	// Rebuild from JSONL
+	if err := sess.RebuildBleve(); err != nil {
+		t.Fatalf("RebuildBleve failed: %v", err)
+	}
+	defer sess.CloseBleve()
+
+	if sess.BleveStore == nil {
+		t.Fatal("Expected BleveStore to be non-nil after rebuild")
+	}
+
+	// Verify the document was re-indexed
+	time.Sleep(100 * time.Millisecond)
+	count, err := sess.BleveStore.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("DocumentCount after rebuild = %d, want 1", count)
+	}
+
+	// Search should find the rebuilt document
+	ctx := context.Background()
+	result, err := sess.BleveStore.Search(ctx, &search.SearchRequest{Query: "rebuild test", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if result.TotalHits < 1 {
+		t.Errorf("TotalHits = %d, want >= 1", result.TotalHits)
+	}
+}
+
+func TestSessionBleveIsolation(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("SylkDir init failed: %v", err)
+	}
+
+	store := NewSessionStore(sd)
+
+	// Create two sessions
+	sess1, err := store.Create(1, nil)
+	if err != nil {
+		t.Fatalf("Create sess1 failed: %v", err)
+	}
+	defer sess1.CloseBleve()
+
+	sess2, err := store.Create(2, nil)
+	if err != nil {
+		t.Fatalf("Create sess2 failed: %v", err)
+	}
+	defer sess2.CloseBleve()
+
+	ctx := context.Background()
+
+	// Index different documents into each session
+	doc1 := &search.Document{
+		ID:      "sess1-doc",
+		Path:    "/session1/file.go",
+		Content: "session one unique content alpha",
+	}
+	if err := sess1.BleveStore.Index(ctx, doc1); err != nil {
+		t.Fatalf("Index sess1 failed: %v", err)
+	}
+
+	doc2 := &search.Document{
+		ID:      "sess2-doc",
+		Path:    "/session2/file.go",
+		Content: "session two unique content beta",
+	}
+	if err := sess2.BleveStore.Index(ctx, doc2); err != nil {
+		t.Fatalf("Index sess2 failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Session 1 should find "alpha" but not "beta"
+	r1, err := sess1.Search(ctx, &search.SearchRequest{Query: "alpha", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search sess1 alpha failed: %v", err)
+	}
+	if r1.TotalHits < 1 {
+		t.Errorf("Session 1 should find 'alpha', got %d hits", r1.TotalHits)
+	}
+
+	r1b, err := sess1.Search(ctx, &search.SearchRequest{Query: "beta", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search sess1 beta failed: %v", err)
+	}
+	if r1b.TotalHits != 0 {
+		t.Errorf("Session 1 should NOT find 'beta', got %d hits", r1b.TotalHits)
+	}
+
+	// Session 2 should find "beta" but not "alpha"
+	r2, err := sess2.Search(ctx, &search.SearchRequest{Query: "beta", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search sess2 beta failed: %v", err)
+	}
+	if r2.TotalHits < 1 {
+		t.Errorf("Session 2 should find 'beta', got %d hits", r2.TotalHits)
+	}
+
+	r2a, err := sess2.Search(ctx, &search.SearchRequest{Query: "alpha", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search sess2 alpha failed: %v", err)
+	}
+	if r2a.TotalHits != 0 {
+		t.Errorf("Session 2 should NOT find 'alpha', got %d hits", r2a.TotalHits)
 	}
 }

@@ -103,7 +103,7 @@ type IngestStats struct {
 }
 
 const (
-	embeddingDim = 768
+	embeddingDim = 1024
 
 	// Domain for code
 	domainCode uint8 = 0
@@ -470,7 +470,7 @@ func verifyStorage(t *testing.T, tmpDir string, symbols []Symbol, stats IngestSt
 		t.Logf("PASS: Throughput %.0f symbols/sec meets 100,000 target", throughput)
 	}
 
-	// Target: <=3.3KB per symbol (floor is 3,203: 768×4 vector + 32×4 graph + 3 labels)
+	// Target: <=3.3KB per symbol (floor is 3,203: 1024×4 vector + 32×4 graph + 3 labels)
 	bytesPerSymbol := float64(stats.DiskSize) / float64(stats.SymbolCount)
 	if bytesPerSymbol > 3300 {
 		t.Logf("WARNING: Disk usage %.0f bytes/symbol exceeds 3.3KB target", bytesPerSymbol)
@@ -538,7 +538,7 @@ func TestStorageIngest_Parallel(t *testing.T) {
 
 	const (
 		numVectors = 10000
-		dim        = 768
+		dim        = 1024
 		workers    = 8
 	)
 

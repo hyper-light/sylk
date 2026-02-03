@@ -73,8 +73,8 @@ func (p *ParserPool) PreWarmGrammars(ctx context.Context, files []MappedFile) {
 }
 
 func extForLang(lang string) string {
-	for ext, l := range SupportedLanguages {
-		if l == lang {
+	for ext, e := range extensionMap {
+		if e.lang == lang {
 			return ext[1:]
 		}
 	}
@@ -133,6 +133,13 @@ func (p *ParserPool) parseWorker(
 		}
 
 		result, err := p.tool.ParseWithParser(ctx, parser, f.Path, f.Data, &currentLang)
+
+		// Check context after CGo returns — the CGo call cannot be
+		// cancelled, so this is the earliest we can observe cancellation.
+		if ctx.Err() != nil {
+			return
+		}
+
 		if err != nil {
 			errors.Append(FileParseError{Path: f.Path, Error: err.Error()})
 			continue

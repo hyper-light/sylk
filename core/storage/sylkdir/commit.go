@@ -4,10 +4,13 @@ package sylkdir
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/core/search"
+	"github.com/adalundhe/sylk/core/search/bleve"
+	"golang.org/x/sync/errgroup"
 )
 
 // CommitConfig holds the dependencies required to commit a session to global.
@@ -28,6 +31,18 @@ type CommitConfig struct {
 	// session's file nodes is considered a deleted file — all its entities
 	// are tombstoned. If empty, only entity-level orphan detection runs.
 	ScopeRoots []string
+
+	// DeletedPaths lists absolute file paths to tombstone explicitly.
+	// Used for delta commits where the session only contains changed files.
+	// When set, scope-based detectDeletedFiles is skipped.
+	DeletedPaths []string
+
+	// DeferBleveIndexing defers document indexing to a BackgroundIndexer.
+	// When true, commit only runs the fast directory-copy snapshot and returns
+	// a BackgroundIndexer in CommitResult. The caller is responsible for
+	// either waiting on it or letting it run asynchronously.
+	// When false (default), inline indexing runs as before.
+	DeferBleveIndexing bool
 }
 
 // CommitResult describes what the commit produced.
@@ -61,6 +76,11 @@ type CommitResult struct {
 	// StagedDocs holds all documents from the session for the caller to
 	// push into the Bleve index after commit returns.
 	StagedDocs []*VersionDocument
+
+	// BackgroundIndexer is non-nil when DeferBleveIndexing is true.
+	// It indexes docs asynchronously; the caller can Wait() on it or
+	// let it run. PromoteDocs enables on-demand query-time indexing.
+	BackgroundIndexer *BackgroundIndexer
 
 	Duration time.Duration
 }
@@ -112,36 +132,50 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	}
 
 	// ── Step 1: Pre-commit minor checkpoint ────────────────────────────
+	t := time.Now()
 	preCommitVer, err := sess.Checkpoint("pre-commit", CheckpointMinor)
 	if err != nil {
 		return nil, fmt.Errorf("sylkdir: pre-commit checkpoint: %w", err)
 	}
+	log.Printf("[commit] step1 checkpoint: %v", time.Since(t))
 
-	// ── Step 2: Collect all entities from ancestor chain ───────────────
-	sessNodeStore := NewVersionNodeStore(sess)
-	sessEdgeStore := NewVersionEdgeStore(sess)
-	sessDocStore := NewVersionDocStore(sess)
-	sessVectorStore := NewVersionVectorStore(sess)
-
-	nodes, err := sessNodeStore.ReadAllFromAncestorChain()
-	if err != nil {
-		return nil, fmt.Errorf("sylkdir: read session nodes: %w", err)
+	// ── Step 2: Collect all entities from ancestor chain (parallel) ────
+	var (
+		nodes   []*Node
+		edges   []*Edge
+		docs    []*VersionDocument
+		vectors []*VersionVector
+	)
+	collectG, _ := errgroup.WithContext(context.Background())
+	collectG.Go(func() error {
+		var readErr error
+		nodes, readErr = NewVersionNodeStore(sess).ReadAllFromAncestorChain()
+		return readErr
+	})
+	collectG.Go(func() error {
+		var readErr error
+		edges, readErr = NewVersionEdgeStore(sess).ReadAllFromAncestorChain()
+		return readErr
+	})
+	collectG.Go(func() error {
+		var readErr error
+		docs, readErr = NewVersionDocStore(sess).ReadFromAncestorChain()
+		return readErr
+	})
+	collectG.Go(func() error {
+		if sess.PendingVectors != nil {
+			vectors = sess.PendingVectors
+			return nil
+		}
+		var readErr error
+		vectors, readErr = NewVersionVectorStore(sess).ReadAllFromAncestorChain()
+		return readErr
+	})
+	if err := collectG.Wait(); err != nil {
+		return nil, fmt.Errorf("sylkdir: collect session entities: %w", err)
 	}
-
-	edges, err := sessEdgeStore.ReadAllFromAncestorChain()
-	if err != nil {
-		return nil, fmt.Errorf("sylkdir: read session edges: %w", err)
-	}
-
-	docs, err := sessDocStore.ReadFromAncestorChain()
-	if err != nil {
-		return nil, fmt.Errorf("sylkdir: read session docs: %w", err)
-	}
-
-	vectors, err := sessVectorStore.ReadAllFromAncestorChain()
-	if err != nil {
-		return nil, fmt.Errorf("sylkdir: read session vectors: %w", err)
-	}
+	sess.PendingVectors = nil // Release reference; vectors held by local var.
+	log.Printf("[commit] step2 collect: %v (nodes=%d edges=%d docs=%d vectors=%d)", time.Since(t), len(nodes), len(edges), len(docs), len(vectors))
 
 	// ── Step 3: Create version directory + snapshot or compact parent data ─
 	if err := cfg.SylkDir.CreateGlobalVersion(newVersion); err != nil {
@@ -191,172 +225,76 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	}
 	defer globalVectorStore.Close()
 
-	// ── Step 5: Append session data to new version (with supersession) ─
-	superseded := make(map[string][2]uint32)
+	log.Printf("[commit] step3 snapshot/compact: %v", time.Since(t))
 
-	// Track superseded nodes for updating old nodes
-	type supersessionUpdate struct {
-		oldID  uint32
-		newID  uint32
-	}
-	var updates []supersessionUpdate
-
-	// Remap DocRef from session DocIDMap → global DocIDMap so the uint32
-	// values align with the global doc OffsetIndex keys.
-	sessDocIDMap := cfg.Session.DocIDMap
-	globalDocIDMap := globalDocStore.DocIDMap()
-
-	for _, node := range nodes {
-		if node.CanonicalKey != "" {
-			existingID, wasSet := cfg.CanonicalIndex.SetIfNotExists(node.CanonicalKey, node.ID)
-			if !wasSet {
-				// Key already existed — this is a supersession.
-				cfg.CanonicalIndex.Set(node.CanonicalKey, node.ID)
-				superseded[node.CanonicalKey] = [2]uint32{existingID, node.ID}
-				node.Supersedes = existingID
-				updates = append(updates, supersessionUpdate{oldID: existingID, newID: node.ID})
-			}
-		}
-
-		// Translate DocRef from session to global address space.
-		if node.DocRef != 0 && sessDocIDMap != nil && globalDocIDMap != nil {
-			docStringID := sessDocIDMap.Reverse(node.DocRef)
-			if docStringID != "" {
-				node.DocRef = globalDocIDMap.GetOrAssign(docStringID)
-			}
-		}
-
-		if err := globalNodeStore.Write(node); err != nil {
-			return nil, fmt.Errorf("sylkdir: write global node %d: %w", node.ID, err)
-		}
-	}
-
-	// Update old nodes' SupersededBy field and collect superseded doc IDs for Bleve cleanup.
-	var supersededDocIDs []string
-	parentNodeStore, err := NewGlobalVersionNodeStore(cfg.SylkDir, oldHead)
-	if err == nil {
-		defer parentNodeStore.Close()
-		for _, upd := range updates {
-			oldNode, readErr := parentNodeStore.ReadFromVersion(oldHead, upd.oldID)
-			if readErr != nil {
-				continue // Non-fatal: supersession metadata is supplementary
-			}
-			// Collect doc string ID before overwriting the node.
-			if oldNode.DocRef != 0 && globalDocIDMap != nil {
-				if docID := globalDocIDMap.Reverse(oldNode.DocRef); docID != "" {
-					supersededDocIDs = append(supersededDocIDs, docID)
-				}
-			} else {
-				// Backward compat: derive doc ID from node ID for pre-DocRef data.
-				supersededDocIDs = append(supersededDocIDs, fmt.Sprintf("file_%d", upd.oldID))
-			}
-			oldNode.SupersededBy = upd.newID
-			if writeErr := globalNodeStore.Write(oldNode); writeErr != nil {
-				continue
-			}
-		}
-	}
-
-	// Write edges
-	for _, edge := range edges {
-		if err := globalEdgeStore.Write(edge); err != nil {
-			return nil, fmt.Errorf("sylkdir: write global edge (%d→%d): %w",
-				edge.SourceID, edge.TargetID, err)
-		}
-	}
-
-	// Write docs
-	if err := globalDocStore.WriteBatch(docs); err != nil {
-		return nil, fmt.Errorf("sylkdir: write global docs: %w", err)
-	}
-
-	// Write vectors
-	if err := globalVectorStore.WriteBatch(vectors); err != nil {
-		return nil, fmt.Errorf("sylkdir: write global vectors: %w", err)
-	}
-
-	// Write chunk refs from session ancestor chain (if any exist).
+	// ── Steps 5+6: Store writes and Bleve indexing run in parallel ─────
+	// Store writes (nodes, edges, docs, vectors) and Bleve indexing write
+	// to independent files and can safely overlap.
 	chunkRefs, chunksStaged := collectSessionChunkRefs(sess)
-	if chunksStaged > 0 {
-		globalChunkRefStore, chunkErr := NewGlobalChunkRefStore(cfg.SylkDir, newVersion)
-		if chunkErr != nil {
-			return nil, fmt.Errorf("sylkdir: open global chunk ref store: %w", chunkErr)
+
+	// Close session Bleve before copying — ensures a clean snapshot for promotion.
+	sessionBlevePath := closeAndGetSessionBlevePath(sess)
+
+	var (
+		storeResult    storeWriteResult
+		tb             *TombstoneBitmap
+		orphanedKeys   int
+		deletedFiles   int
+		docsIndexed    int
+		docsSuperseded int
+		bgIndexer      *BackgroundIndexer
+	)
+
+	commitG, gctx := errgroup.WithContext(context.Background())
+
+	// Path A: Mutation pass → batch store writes → tombstone/orphan.
+	commitG.Go(func() error {
+		var writeErr error
+		storeResult, writeErr = commitWriteEntities(cfg, sess, newVersion, oldHead,
+			nodes, edges, docs, vectors, chunkRefs, chunksStaged,
+			globalNodeStore, globalEdgeStore, globalDocStore, globalVectorStore)
+		if writeErr != nil {
+			return writeErr
 		}
-		if chunkErr := globalChunkRefStore.WriteBatch(chunkRefs); chunkErr != nil {
-			return nil, fmt.Errorf("sylkdir: write global chunk refs: %w", chunkErr)
+		log.Printf("[commit] step5 write stores: %v", time.Since(t))
+
+		tb, orphanedKeys, deletedFiles, writeErr = commitTombstoneOrphan(cfg, newVersion, storeResult.updates, nodes, parentTotalNodes)
+		log.Printf("[commit] step5bc tombstone+orphan: %v", time.Since(t))
+		return writeErr
+	})
+
+	// Path B: Bleve snapshot/promote.
+	// When DeferBleveIndexing is true, only runs the fast directory-copy
+	// snapshot — actual indexing is deferred to a BackgroundIndexer.
+	// When false, runs the full inline snapshot + index flow.
+	commitG.Go(func() error {
+		if cfg.DeferBleveIndexing {
+			return snapshotBleveOnly(cfg.GlobalBleveStore, oldHead, newVersion, sessionBlevePath)
 		}
-		if chunkErr := globalChunkRefStore.SaveIndexes(); chunkErr != nil {
-			return nil, fmt.Errorf("sylkdir: save global chunk indexes: %w", chunkErr)
+		var bleveErr error
+		docsIndexed, bleveErr = snapshotAndIndexBleve(gctx, cfg.GlobalBleveStore, oldHead, newVersion, docs, sessionBlevePath)
+		return bleveErr
+	})
+
+	if err := commitG.Wait(); err != nil {
+		return nil, fmt.Errorf("sylkdir: commit parallel: %w", err)
+	}
+
+	// After both paths complete: finalize Bleve.
+	if cfg.DeferBleveIndexing {
+		bgIndexer = NewBackgroundIndexer(
+			cfg.GlobalBleveStore,
+			docs,
+			storeResult.supersededDocIDs,
+			func() error { return recordBleveIndexed(cfg.GlobalBleveStore, cfg.GlobalMeta, newVersion) },
+		)
+		log.Printf("[commit] step6 bleve: deferred to background (%d docs)", len(docs))
+	} else {
+		docsSuperseded = deleteSupersededBleveDocs(cfg.GlobalBleveStore, storeResult.supersededDocIDs)
+		if err := recordBleveIndexed(cfg.GlobalBleveStore, cfg.GlobalMeta, newVersion); err != nil {
+			return nil, err
 		}
-	}
-
-	// Save offset indexes for nodes and vectors to disk.
-	if err := globalNodeStore.SaveIndexes(); err != nil {
-		return nil, fmt.Errorf("sylkdir: save global node indexes: %w", err)
-	}
-	if err := globalVectorStore.SaveIndexes(); err != nil {
-		return nil, fmt.Errorf("sylkdir: save global vector indexes: %w", err)
-	}
-	if err := globalDocStore.SaveIndexes(); err != nil {
-		return nil, fmt.Errorf("sylkdir: save global doc indexes: %w", err)
-	}
-
-	// ── Step 5b: Mark superseded nodes in tombstone bitmap ─────────────
-	newVersionPath := cfg.SylkDir.GlobalVersionPath(newVersion)
-	tb, err := LoadOrCreateTombstoneBitmap(newVersionPath, cfg.GlobalMeta.GetCurrentNodeID())
-	if err != nil {
-		return nil, fmt.Errorf("sylkdir: load tombstone bitmap: %w", err)
-	}
-	for _, upd := range updates {
-		tb.MarkDead(upd.oldID)
-	}
-
-	// ── Step 5c: Scope-aware orphan detection ────────────────────────
-	orphanedKeys, deletedFiles := detectOrphans(cfg, nodes, tb)
-
-	// Save tombstone bitmap (includes supersession + orphan marks)
-	if err := tb.Save(); err != nil {
-		return nil, fmt.Errorf("sylkdir: save tombstone bitmap: %w", err)
-	}
-
-	// Save canonical index (after supersession updates + orphan deletions)
-	if err := cfg.CanonicalIndex.Save(); err != nil {
-		return nil, fmt.Errorf("sylkdir: save canonical index: %w", err)
-	}
-
-	// ── Step 6: Snapshot Bleve into new version + index new docs ───────
-	var docsIndexed, docsSuperseded int
-	if cfg.GlobalBleveStore != nil {
-		// Snapshot parent Bleve to new version
-		if err := cfg.GlobalBleveStore.SnapshotBleve(oldHead, newVersion); err != nil {
-			return nil, fmt.Errorf("sylkdir: snapshot global bleve: %w", err)
-		}
-
-		// Delete superseded documents (IDs collected during node update loop)
-		if cfg.GlobalBleveStore.Store() != nil && cfg.GlobalBleveStore.Store().Manager() != nil {
-			for _, docID := range supersededDocIDs {
-				if err := cfg.GlobalBleveStore.Store().Manager().Delete(context.Background(), docID); err == nil {
-					docsSuperseded++
-				}
-			}
-		}
-
-		// Index new documents
-		if len(docs) > 0 {
-			searchDocs := make([]*search.Document, len(docs))
-			for i, vdoc := range docs {
-				searchDocs[i] = ConvertToSearchDocument(vdoc)
-			}
-			if err := cfg.GlobalBleveStore.IndexBatch(context.Background(), searchDocs); err != nil {
-				return nil, fmt.Errorf("sylkdir: index documents in global bleve: %w", err)
-			}
-			docsIndexed = len(searchDocs)
-		}
-
-		// Record that Bleve indexing completed for this version.
-		if err := cfg.GlobalMeta.SetLastBleveIndexed(newVersion); err != nil {
-			return nil, fmt.Errorf("sylkdir: set last bleve indexed: %w", err)
-		}
+		log.Printf("[commit] step6 bleve: %v (indexed=%d superseded=%d)", time.Since(t), docsIndexed, docsSuperseded)
 	}
 
 	// ── Step 6: Update manifest + register commit ──────────────────────
@@ -415,21 +353,22 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	}
 
 	return &CommitResult{
-		SessionID:        sess.Meta.ID,
-		PreCommitVersion: preCommitVer,
-		GlobalVersion:    newVersion,
-		NodesMerged:      len(nodes),
-		EdgesMerged:      len(edges),
-		VectorsStaged:    len(vectors),
-		DocsStaged:       len(docs),
-		ChunksStaged:     chunksStaged,
-		DocsIndexed:      docsIndexed,
-		DocsSuperseded:   docsSuperseded,
-		DeadNodeCount:    deadCount,
-		TombstoneRatio:   tb.DeadRatio(uint32(len(nodes))),
-		OrphanedKeys:     orphanedKeys,
-		DeletedFiles:     deletedFiles,
-		Superseded:       superseded,
+		SessionID:         sess.Meta.ID,
+		PreCommitVersion:  preCommitVer,
+		GlobalVersion:     newVersion,
+		NodesMerged:       len(nodes),
+		EdgesMerged:       len(edges),
+		VectorsStaged:     len(vectors),
+		DocsStaged:        len(docs),
+		ChunksStaged:      chunksStaged,
+		DocsIndexed:       docsIndexed,
+		DocsSuperseded:    docsSuperseded,
+		BackgroundIndexer: bgIndexer,
+		DeadNodeCount:     deadCount,
+		TombstoneRatio:    tb.DeadRatio(uint32(len(nodes))),
+		OrphanedKeys:      orphanedKeys,
+		DeletedFiles:      deletedFiles,
+		Superseded:       storeResult.superseded,
 		StagedVectors:    vectors,
 		StagedDocs:       docs,
 		Duration:         time.Since(start),
@@ -440,11 +379,35 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 // files the session re-indexed but are not present in the session's output.
 // These are entities that were removed (function deleted, etc.) or files that
 // were deleted from disk. Returns counts for reporting.
-func detectOrphans(cfg CommitConfig, sessionNodes []*Node, tb *TombstoneBitmap) (orphanedKeys, deletedFiles int) {
-	// Build session ground truth
-	sessionKeys := make(map[string]bool, len(sessionNodes))
-	indexedPaths := make(map[string]bool)
-	for _, n := range sessionNodes {
+//
+// When parentTotalNodes is 0, no previous global data exists and orphan
+// detection is skipped (no prior entities can be orphaned).
+func detectOrphans(cfg CommitConfig, sessionNodes []*Node, tb *TombstoneBitmap, parentTotalNodes uint32) (orphanedKeys, deletedFiles int) {
+	if parentTotalNodes == 0 {
+		return 0, 0
+	}
+
+	sessionKeys, indexedPaths := buildSessionGroundTruth(sessionNodes)
+	orphanedKeys = detectEntityOrphans(cfg, sessionKeys, indexedPaths, tb)
+
+	// Explicit deletions (delta commits) take priority over scope-based detection.
+	explicitDeleted, explicitOrphans := tombstoneExplicitDeletions(cfg, tb)
+	deletedFiles += explicitDeleted
+	orphanedKeys += explicitOrphans
+
+	if len(cfg.DeletedPaths) == 0 {
+		scopeDeleted, scopeOrphans := detectDeletedFiles(cfg, indexedPaths, tb)
+		deletedFiles += scopeDeleted
+		orphanedKeys += scopeOrphans
+	}
+	return orphanedKeys, deletedFiles
+}
+
+// buildSessionGroundTruth extracts canonical keys and indexed file paths from session nodes.
+func buildSessionGroundTruth(nodes []*Node) (sessionKeys map[string]bool, indexedPaths map[string]bool) {
+	sessionKeys = make(map[string]bool, len(nodes))
+	indexedPaths = make(map[string]bool)
+	for _, n := range nodes {
 		if n.CanonicalKey != "" {
 			sessionKeys[n.CanonicalKey] = true
 		}
@@ -452,36 +415,62 @@ func detectOrphans(cfg CommitConfig, sessionNodes []*Node, tb *TombstoneBitmap) 
 			indexedPaths[n.Path] = true
 		}
 	}
+	return sessionKeys, indexedPaths
+}
 
-	// Per-file scope diff: for each file the session touched, find global
-	// keys that the session didn't produce (removed entities).
+// detectEntityOrphans finds per-file entity orphans using the path index.
+// For each file the session touched, keys in the canonical index that the
+// session didn't produce are tombstoned (removed entities).
+func detectEntityOrphans(cfg CommitConfig, sessionKeys, indexedPaths map[string]bool, tb *TombstoneBitmap) int {
+	orphaned := 0
 	for path := range indexedPaths {
-		fileKeys := cfg.CanonicalIndex.LookupPrefix("file:" + path)
-		symbolKeys := cfg.CanonicalIndex.LookupPrefix("symbol:" + path + ":")
-		orphanedKeys += tombstoneOrphans(cfg.CanonicalIndex, tb, sessionKeys, fileKeys)
-		orphanedKeys += tombstoneOrphans(cfg.CanonicalIndex, tb, sessionKeys, symbolKeys)
+		pathKeys := cfg.CanonicalIndex.LookupByPath(path)
+		orphaned += tombstoneOrphans(cfg.CanonicalIndex, tb, sessionKeys, pathKeys)
+	}
+	return orphaned
+}
+
+// detectDeletedFiles finds files that were deleted from disk via ScopeRoots.
+// Uses AllFilePaths for O(files) enumeration instead of O(keys) prefix scan.
+func detectDeletedFiles(cfg CommitConfig, indexedPaths map[string]bool, tb *TombstoneBitmap) (deletedFiles, orphanedKeys int) {
+	if len(cfg.ScopeRoots) == 0 {
+		return 0, 0
 	}
 
-	// File deletion detection via ScopeRoots
-	if len(cfg.ScopeRoots) > 0 {
-		allFileKeys := cfg.CanonicalIndex.LookupPrefix("file:")
-		for key, nodeID := range allFileKeys {
-			filePath := strings.TrimPrefix(key, "file:")
-			if indexedPaths[filePath] || !isUnderAnyRoot(filePath, cfg.ScopeRoots) {
-				continue
-			}
-			// File was deleted — tombstone file node + all its symbols
-			tb.MarkDead(nodeID)
-			cfg.CanonicalIndex.Delete(key)
-			orphanedKeys++
-			deletedFiles++
-
-			symbolKeys := cfg.CanonicalIndex.LookupPrefix("symbol:" + filePath + ":")
-			orphanedKeys += tombstoneOrphans(cfg.CanonicalIndex, tb, nil, symbolKeys)
+	allFiles := cfg.CanonicalIndex.AllFilePaths()
+	for filePath, nodeID := range allFiles {
+		if indexedPaths[filePath] || !isUnderAnyRoot(filePath, cfg.ScopeRoots) {
+			continue
 		}
-	}
+		tb.MarkDead(nodeID)
+		cfg.CanonicalIndex.Delete("file:" + filePath)
+		orphanedKeys++
+		deletedFiles++
 
-	return orphanedKeys, deletedFiles
+		// Tombstone all symbols under the deleted file.
+		pathKeys := cfg.CanonicalIndex.LookupByPath(filePath)
+		orphanedKeys += tombstoneOrphans(cfg.CanonicalIndex, tb, nil, pathKeys)
+	}
+	return deletedFiles, orphanedKeys
+}
+
+// tombstoneExplicitDeletions tombstones files listed in DeletedPaths and all their child entities.
+// Used for delta commits where the session only contains changed files.
+func tombstoneExplicitDeletions(cfg CommitConfig, tb *TombstoneBitmap) (deletedFiles, orphanedKeys int) {
+	for _, filePath := range cfg.DeletedPaths {
+		nodeID, err := cfg.CanonicalIndex.Lookup("file:" + filePath)
+		if err != nil {
+			continue
+		}
+		tb.MarkDead(nodeID)
+		cfg.CanonicalIndex.Delete("file:" + filePath)
+		orphanedKeys++
+		deletedFiles++
+
+		pathKeys := cfg.CanonicalIndex.LookupByPath(filePath)
+		orphanedKeys += tombstoneOrphans(cfg.CanonicalIndex, tb, nil, pathKeys)
+	}
+	return deletedFiles, orphanedKeys
 }
 
 // tombstoneOrphans marks nodes as dead and removes their canonical keys.
@@ -537,6 +526,324 @@ func NewGlobalChunkRefStore(sd *SylkDir, version SemanticVersion) (*ChunkRefStor
 		ChunkDataFile: chunkDataFile,
 	}
 	return NewChunkRefStore(globalSess), nil
+}
+
+// ── Commit step helpers ────────────────────────────────────────────────────
+
+// supersessionUpdate tracks a single supersession for deferred old-node update.
+type supersessionUpdate struct {
+	oldID uint32
+	newID uint32
+}
+
+// prepareNodeMutations runs the canonical-index check and DocRef remap pass
+// over all session nodes. This mutates nodes in place (Supersedes, DocRef)
+// without performing any I/O, so subsequent batch writes see correct values.
+func prepareNodeMutations(cfg CommitConfig, nodes []*Node, globalDocIDMap *DocIDMap) (superseded map[string][2]uint32, updates []supersessionUpdate) {
+	superseded = make(map[string][2]uint32)
+	sessDocIDMap := cfg.Session.DocIDMap
+
+	for _, node := range nodes {
+		if node.CanonicalKey != "" {
+			updates = detectSupersession(cfg, node, superseded, updates)
+		}
+		remapDocRef(node, sessDocIDMap, globalDocIDMap)
+	}
+	return superseded, updates
+}
+
+// detectSupersession checks if a node's canonical key already exists in the index.
+// If so, records the supersession. Mutates node.Supersedes in place.
+func detectSupersession(cfg CommitConfig, node *Node, superseded map[string][2]uint32, updates []supersessionUpdate) []supersessionUpdate {
+	existingID, wasSet := cfg.CanonicalIndex.SetIfNotExists(node.CanonicalKey, node.ID)
+	if wasSet {
+		return updates
+	}
+	cfg.CanonicalIndex.Set(node.CanonicalKey, node.ID)
+	superseded[node.CanonicalKey] = [2]uint32{existingID, node.ID}
+	node.Supersedes = existingID
+	return append(updates, supersessionUpdate{oldID: existingID, newID: node.ID})
+}
+
+// remapDocRef translates a node's DocRef from session to global address space.
+func remapDocRef(node *Node, sessDocIDMap, globalDocIDMap *DocIDMap) {
+	if node.DocRef == 0 || sessDocIDMap == nil || globalDocIDMap == nil {
+		return
+	}
+	if docStringID := sessDocIDMap.Reverse(node.DocRef); docStringID != "" {
+		node.DocRef = globalDocIDMap.GetOrAssign(docStringID)
+	}
+}
+
+// writeGlobalStores batch-writes all entity types to global stores.
+// Nodes, edges, docs, and vectors use independent data files and can
+// be written in parallel via errgroup.
+func writeGlobalStores(
+	sd *SylkDir, version SemanticVersion,
+	nodeStore *GlobalVersionNodeStore,
+	edgeStore *GlobalVersionEdgeStore,
+	docStore *GlobalVersionDocStore,
+	vectorStore *GlobalVersionVectorStore,
+	nodes []*Node, edges []*Edge,
+	docs []*VersionDocument, vectors []*VersionVector,
+	chunkRefs []*ChunkRef, chunksStaged int,
+) error {
+	g, _ := errgroup.WithContext(context.Background())
+
+	g.Go(func() error {
+		return nodeStore.WriteBatch(nodes)
+	})
+	g.Go(func() error {
+		return edgeStore.WriteBatch(edges)
+	})
+	g.Go(func() error {
+		return docStore.WriteBatch(docs)
+	})
+	g.Go(func() error {
+		return vectorStore.WriteBatch(vectors)
+	})
+	g.Go(func() error {
+		return writeGlobalChunkRefs(sd, version, chunkRefs, chunksStaged)
+	})
+
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("sylkdir: write global stores: %w", err)
+	}
+	return nil
+}
+
+// writeGlobalChunkRefs writes chunk refs to the global store if any exist.
+func writeGlobalChunkRefs(sd *SylkDir, version SemanticVersion, refs []*ChunkRef, count int) error {
+	if count == 0 {
+		return nil
+	}
+	store, err := NewGlobalChunkRefStore(sd, version)
+	if err != nil {
+		return fmt.Errorf("open global chunk ref store: %w", err)
+	}
+	if err := store.WriteBatch(refs); err != nil {
+		return fmt.Errorf("write global chunk refs: %w", err)
+	}
+	return store.SaveIndexes()
+}
+
+// applySupersessions updates old nodes' SupersededBy field and collects
+// superseded document IDs for Bleve cleanup.
+func applySupersessions(sd *SylkDir, oldHead SemanticVersion, globalNodeStore *GlobalVersionNodeStore, globalDocIDMap *DocIDMap, updates []supersessionUpdate) []string {
+	if len(updates) == 0 {
+		return nil
+	}
+	parentNodeStore, err := NewGlobalVersionNodeStore(sd, oldHead)
+	if err != nil {
+		return nil
+	}
+	defer parentNodeStore.Close()
+
+	var supersededDocIDs []string
+	for _, upd := range updates {
+		docID := applySingleSupersession(parentNodeStore, globalNodeStore, globalDocIDMap, oldHead, upd)
+		if docID != "" {
+			supersededDocIDs = append(supersededDocIDs, docID)
+		}
+	}
+	return supersededDocIDs
+}
+
+// applySingleSupersession updates one old node and returns its doc ID (if any).
+func applySingleSupersession(parent, global *GlobalVersionNodeStore, docIDMap *DocIDMap, oldHead SemanticVersion, upd supersessionUpdate) string {
+	oldNode, err := parent.ReadFromVersion(oldHead, upd.oldID)
+	if err != nil {
+		return ""
+	}
+	docID := resolveSupersededDocID(oldNode, docIDMap, upd.oldID)
+	oldNode.SupersededBy = upd.newID
+	_ = global.Write(oldNode) // Non-fatal: supplementary metadata
+	return docID
+}
+
+// resolveSupersededDocID extracts the document string ID from a superseded node.
+func resolveSupersededDocID(node *Node, docIDMap *DocIDMap, fallbackID uint32) string {
+	if node.DocRef != 0 && docIDMap != nil {
+		if docID := docIDMap.Reverse(node.DocRef); docID != "" {
+			return docID
+		}
+	}
+	return fmt.Sprintf("file_%d", fallbackID)
+}
+
+// saveGlobalIndexes saves offset indexes for all global stores to disk.
+func saveGlobalIndexes(nodeStore *GlobalVersionNodeStore, edgeStore *GlobalVersionEdgeStore, docStore *GlobalVersionDocStore, vectorStore *GlobalVersionVectorStore) error {
+	if err := nodeStore.SaveIndexes(); err != nil {
+		return fmt.Errorf("sylkdir: save global node indexes: %w", err)
+	}
+	if err := vectorStore.SaveIndexes(); err != nil {
+		return fmt.Errorf("sylkdir: save global vector indexes: %w", err)
+	}
+	return docStore.SaveIndexes()
+}
+
+// ── Parallel commit helpers ────────────────────────────────────────────────
+
+// storeWriteResult holds outputs from the store write path needed by later steps.
+type storeWriteResult struct {
+	supersededDocIDs []string
+	superseded       map[string][2]uint32
+	updates          []supersessionUpdate
+}
+
+// commitWriteEntities performs mutation pass, batch writes, supersession, and index saves.
+func commitWriteEntities(
+	cfg CommitConfig, sess *Session, newVersion, oldHead SemanticVersion,
+	nodes []*Node, edges []*Edge, docs []*VersionDocument, vectors []*VersionVector,
+	chunkRefs []*ChunkRef, chunksStaged int,
+	ns *GlobalVersionNodeStore, es *GlobalVersionEdgeStore, ds *GlobalVersionDocStore, vs *GlobalVersionVectorStore,
+) (storeWriteResult, error) {
+	globalDocIDMap := ds.DocIDMap()
+	superseded, updates := prepareNodeMutations(cfg, nodes, globalDocIDMap)
+	if err := writeGlobalStores(cfg.SylkDir, newVersion, ns, es, ds, vs, nodes, edges, docs, vectors, chunkRefs, chunksStaged); err != nil {
+		return storeWriteResult{}, err
+	}
+	supersededDocIDs := applySupersessions(cfg.SylkDir, oldHead, ns, globalDocIDMap, updates)
+	if err := saveGlobalIndexes(ns, es, ds, vs); err != nil {
+		return storeWriteResult{}, err
+	}
+	return storeWriteResult{
+		supersededDocIDs: supersededDocIDs,
+		superseded:       superseded,
+		updates:          updates,
+	}, nil
+}
+
+// commitTombstoneOrphan loads tombstone bitmap, marks dead nodes, detects orphans, and saves.
+func commitTombstoneOrphan(
+	cfg CommitConfig, newVersion SemanticVersion,
+	updates []supersessionUpdate, nodes []*Node, parentTotalNodes uint32,
+) (*TombstoneBitmap, int, int, error) {
+	tb, err := loadAndMarkTombstones(cfg, newVersion, updates)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	orphanedKeys, deletedFiles := detectOrphans(cfg, nodes, tb, parentTotalNodes)
+	return tb, orphanedKeys, deletedFiles, saveTombstoneAndCanonical(tb, cfg.CanonicalIndex)
+}
+
+// loadAndMarkTombstones loads the tombstone bitmap and marks superseded nodes as dead.
+func loadAndMarkTombstones(cfg CommitConfig, newVersion SemanticVersion, updates []supersessionUpdate) (*TombstoneBitmap, error) {
+	newVersionPath := cfg.SylkDir.GlobalVersionPath(newVersion)
+	tb, err := LoadOrCreateTombstoneBitmap(newVersionPath, cfg.GlobalMeta.GetCurrentNodeID())
+	if err != nil {
+		return nil, fmt.Errorf("sylkdir: load tombstone bitmap: %w", err)
+	}
+	for _, upd := range updates {
+		tb.MarkDead(upd.oldID)
+	}
+	return tb, nil
+}
+
+// saveTombstoneAndCanonical persists the tombstone bitmap and canonical index to disk.
+func saveTombstoneAndCanonical(tb *TombstoneBitmap, canonIdx *CanonicalKeyIndex) error {
+	if err := tb.Save(); err != nil {
+		return fmt.Errorf("sylkdir: save tombstone bitmap: %w", err)
+	}
+	return canonIdx.Save()
+}
+
+// closeAndGetSessionBlevePath closes the session Bleve and returns its path.
+// Closing before copy ensures a clean snapshot for promotion to global.
+func closeAndGetSessionBlevePath(sess *Session) string {
+	if sess.BleveStore == nil {
+		return ""
+	}
+	_ = sess.BleveStore.CloseHead()
+	return sess.BleveStore.HeadBlevePath()
+}
+
+// snapshotBleveOnly runs only the fast directory-copy snapshot step.
+// Used when DeferBleveIndexing is true — actual indexing is handled by BackgroundIndexer.
+func snapshotBleveOnly(store *GlobalVersionBleveStore, oldHead, newVersion SemanticVersion, sessionBlevePath string) error {
+	if store == nil {
+		return nil
+	}
+	_, err := store.SnapshotOrPromote(oldHead, newVersion, sessionBlevePath)
+	if err != nil {
+		return fmt.Errorf("sylkdir: snapshot global bleve: %w", err)
+	}
+	return nil
+}
+
+// snapshotAndIndexBleve prepares the global Bleve for the new version.
+// On cold start (no parent global Bleve), promotes the session Bleve — all docs
+// are already indexed, so no re-indexing is needed.
+// On incremental boot, copies the parent global Bleve and indexes new session docs.
+func snapshotAndIndexBleve(ctx context.Context, store *GlobalVersionBleveStore, oldHead, newVersion SemanticVersion, docs []*VersionDocument, sessionBlevePath string) (int, error) {
+	if store == nil {
+		return 0, nil
+	}
+	return promoteOrIndex(ctx, store, oldHead, newVersion, docs, sessionBlevePath)
+}
+
+// promoteOrIndex promotes session Bleve on cold start, or indexes new docs on incremental.
+func promoteOrIndex(ctx context.Context, store *GlobalVersionBleveStore, oldHead, newVersion SemanticVersion, docs []*VersionDocument, sessionBlevePath string) (int, error) {
+	promoted, err := store.SnapshotOrPromote(oldHead, newVersion, sessionBlevePath)
+	if err != nil {
+		return 0, fmt.Errorf("sylkdir: snapshot/promote global bleve: %w", err)
+	}
+	if promoted {
+		return len(docs), nil
+	}
+	return indexNewDocs(ctx, store, docs)
+}
+
+// indexNewDocs converts session docs to search docs and indexes them into the global Bleve.
+func indexNewDocs(ctx context.Context, store *GlobalVersionBleveStore, docs []*VersionDocument) (int, error) {
+	if len(docs) == 0 {
+		return 0, nil
+	}
+	searchDocs := convertToSearchDocs(docs)
+	if err := store.IndexBatch(ctx, searchDocs); err != nil {
+		return 0, fmt.Errorf("sylkdir: index documents in global bleve: %w", err)
+	}
+	return len(searchDocs), nil
+}
+
+// convertToSearchDocs converts session documents to Bleve-compatible search documents.
+func convertToSearchDocs(docs []*VersionDocument) []*search.Document {
+	searchDocs := make([]*search.Document, len(docs))
+	for i, vdoc := range docs {
+		searchDocs[i] = ConvertToSearchDocument(vdoc)
+	}
+	return searchDocs
+}
+
+// deleteSupersededBleveDocs removes superseded document IDs from the Bleve index.
+func deleteSupersededBleveDocs(store *GlobalVersionBleveStore, docIDs []string) int {
+	if store == nil || store.Store() == nil || len(docIDs) == 0 {
+		return 0
+	}
+	mgr := store.Store().Manager()
+	if mgr == nil {
+		return 0
+	}
+	return countBleveDeletions(mgr, docIDs)
+}
+
+// countBleveDeletions deletes each doc ID from the IndexManager, returning the count of successful deletions.
+func countBleveDeletions(mgr *bleve.IndexManager, docIDs []string) int {
+	var count int
+	for _, id := range docIDs {
+		if mgr.Delete(context.Background(), id) == nil {
+			count++
+		}
+	}
+	return count
+}
+
+// recordBleveIndexed records that Bleve indexing completed for the given version.
+func recordBleveIndexed(store *GlobalVersionBleveStore, gm *GlobalMeta, ver SemanticVersion) error {
+	if store == nil {
+		return nil
+	}
+	return gm.SetLastBleveIndexed(ver)
 }
 
 // logCommitBegin writes an OpCommitBegin entry if the WAL is non-nil.

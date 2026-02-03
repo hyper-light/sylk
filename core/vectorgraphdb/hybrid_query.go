@@ -97,12 +97,12 @@ type HybridEntity struct {
 // It provides SearchVector(), TraverseGraph(), and GetEntity() methods compatible
 // with the HybridQueryCoordinator.
 type VectorGraphDBHybridAdapter struct {
-	db         *VectorGraphDB
-	hnsw       HNSWSearcher
-	nodeStore  *NodeStore
-	edgeStore  *EdgeStore
-	traverser  *GraphTraverser
-	domainHint *Domain
+	db          *VectorGraphDB
+	vectorIndex VectorIndexSearcher
+	nodeStore   *NodeStore
+	edgeStore   *EdgeStore
+	traverser   *GraphTraverser
+	domainHint  *Domain
 
 	mu sync.RWMutex
 }
@@ -112,8 +112,12 @@ type VectorGraphDBHybridAdapterConfig struct {
 	// DB is the VectorGraphDB instance to wrap.
 	DB *VectorGraphDB
 
-	// HNSW is the HNSW index for vector search.
-	HNSW HNSWSearcher
+	// VectorIndex is the vector index for vector search.
+	VectorIndex VectorIndexSearcher
+
+	// HNSW is an alias for VectorIndex for backward compatibility.
+	// Deprecated: Use VectorIndex instead.
+	HNSW VectorIndexSearcher
 
 	// DomainHint is an optional domain to filter results.
 	DomainHint *Domain
@@ -125,23 +129,29 @@ func NewVectorGraphDBHybridAdapter(config VectorGraphDBHybridAdapterConfig) *Vec
 		return nil
 	}
 
+	// Support both new VectorIndex and deprecated HNSW field
+	vectorIndex := config.VectorIndex
+	if vectorIndex == nil {
+		vectorIndex = config.HNSW
+	}
+
 	adapter := &VectorGraphDBHybridAdapter{
-		db:         config.DB,
-		hnsw:       config.HNSW,
-		nodeStore:  NewNodeStore(config.DB, nil),
-		edgeStore:  NewEdgeStore(config.DB),
-		traverser:  NewGraphTraverser(config.DB),
-		domainHint: config.DomainHint,
+		db:          config.DB,
+		vectorIndex: vectorIndex,
+		nodeStore:   NewNodeStore(config.DB, nil),
+		edgeStore:   NewEdgeStore(config.DB),
+		traverser:   NewGraphTraverser(config.DB),
+		domainHint:  config.DomainHint,
 	}
 
 	return adapter
 }
 
 // NewVectorGraphDBHybridAdapterSimple creates a hybrid adapter with minimal config.
-func NewVectorGraphDBHybridAdapterSimple(db *VectorGraphDB, hnsw HNSWSearcher) *VectorGraphDBHybridAdapter {
+func NewVectorGraphDBHybridAdapterSimple(db *VectorGraphDB, vectorIndex VectorIndexSearcher) *VectorGraphDBHybridAdapter {
 	return NewVectorGraphDBHybridAdapter(VectorGraphDBHybridAdapterConfig{
-		DB:   db,
-		HNSW: hnsw,
+		DB:          db,
+		VectorIndex: vectorIndex,
 	})
 }
 
@@ -150,13 +160,13 @@ func NewVectorGraphDBHybridAdapterSimple(db *VectorGraphDB, hnsw HNSWSearcher) *
 // =============================================================================
 
 // Search implements VectorSearchable interface.
-// Performs k-nearest neighbors search using the HNSW index.
+// Performs k-nearest neighbors search using the vector index.
 func (a *VectorGraphDBHybridAdapter) Search(vector []float32, k int) ([]string, []float32, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if a.hnsw == nil {
-		return nil, nil, fmt.Errorf("HNSW index not configured")
+	if a.vectorIndex == nil {
+		return nil, nil, fmt.Errorf("vector index not configured")
 	}
 
 	if len(vector) == 0 {
@@ -168,15 +178,15 @@ func (a *VectorGraphDBHybridAdapter) Search(vector []float32, k int) ([]string, 
 	}
 
 	// Build filter from domain hint
-	var filter *HNSWSearchFilter
+	var filter *VectorIndexSearchFilter
 	if a.domainHint != nil {
-		filter = &HNSWSearchFilter{
+		filter = &VectorIndexSearchFilter{
 			Domains: []Domain{*a.domainHint},
 		}
 	}
 
 	// Execute search
-	results := a.hnsw.Search(vector, k, filter)
+	results := a.vectorIndex.Search(vector, k, filter)
 
 	// Convert results
 	ids := make([]string, len(results))
@@ -195,7 +205,7 @@ func (a *VectorGraphDBHybridAdapter) SearchVector(ctx context.Context, vector []
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if a.hnsw == nil {
+	if a.vectorIndex == nil {
 		return &VectorSearchResult{Results: []VectorMatch{}}, nil
 	}
 
@@ -218,7 +228,7 @@ func (a *VectorGraphDBHybridAdapter) SearchVector(ctx context.Context, vector []
 	filter := a.buildSearchFilter(opts)
 
 	// Execute search
-	results := a.hnsw.Search(vector, k, filter)
+	results := a.vectorIndex.Search(vector, k, filter)
 
 	// Convert to VectorMatch
 	matches := make([]VectorMatch, 0, len(results))
@@ -236,13 +246,13 @@ func (a *VectorGraphDBHybridAdapter) SearchVector(ctx context.Context, vector []
 	return &VectorSearchResult{Results: matches}, nil
 }
 
-// buildSearchFilter builds an HNSW filter from options.
-func (a *VectorGraphDBHybridAdapter) buildSearchFilter(opts *VectorSearchOptions) *HNSWSearchFilter {
+// buildSearchFilter builds a vector index filter from options.
+func (a *VectorGraphDBHybridAdapter) buildSearchFilter(opts *VectorSearchOptions) *VectorIndexSearchFilter {
 	if opts == nil && a.domainHint == nil {
 		return nil
 	}
 
-	filter := &HNSWSearchFilter{}
+	filter := &VectorIndexSearchFilter{}
 
 	if opts != nil {
 		filter.Domains = opts.Domains
@@ -585,18 +595,24 @@ func (a *VectorGraphDBHybridAdapter) GetDomainHint() *Domain {
 	return a.domainHint
 }
 
-// SetHNSW updates the HNSW index.
-func (a *VectorGraphDBHybridAdapter) SetHNSW(hnsw HNSWSearcher) {
+// SetVectorIndex updates the vector index.
+func (a *VectorGraphDBHybridAdapter) SetVectorIndex(vectorIndex VectorIndexSearcher) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.hnsw = hnsw
+	a.vectorIndex = vectorIndex
+}
+
+// SetHNSW updates the vector index.
+// Deprecated: Use SetVectorIndex instead.
+func (a *VectorGraphDBHybridAdapter) SetHNSW(vectorIndex VectorIndexSearcher) {
+	a.SetVectorIndex(vectorIndex)
 }
 
 // IsReady returns true if the adapter is properly configured.
 func (a *VectorGraphDBHybridAdapter) IsReady() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.db != nil && a.hnsw != nil
+	return a.db != nil && a.vectorIndex != nil
 }
 
 // DB returns the underlying VectorGraphDB.
@@ -628,7 +644,7 @@ func (a *VectorGraphDBHybridAdapter) ExecuteHybridQuery(ctx context.Context, que
 
 	// Execute vector search if vector provided
 	var vectorMatches []VectorMatch
-	if len(query.Vector) > 0 && a.hnsw != nil {
+	if len(query.Vector) > 0 && a.vectorIndex != nil {
 		vectorResult, err := a.SearchVector(ctx, query.Vector, query.Limit*2, &VectorSearchOptions{
 			Domains:       query.Domains,
 			NodeTypes:     query.NodeTypes,

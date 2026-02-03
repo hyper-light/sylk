@@ -38,59 +38,174 @@ func TestDetectHardware_Cached(t *testing.T) {
 	}
 }
 
-func TestHardwareCapabilities_SelectModelTier(t *testing.T) {
+func TestHardwareCapabilities_SelectHighQualityTier(t *testing.T) {
 	tests := []struct {
 		name     string
 		caps     HardwareCapabilities
 		expected ModelTier
 	}{
 		{
-			name: "high-end GPU",
+			name: "high RAM selects 4B",
 			caps: HardwareCapabilities{
 				HasNVIDIAGPU: true,
 				VRAMGB:       8.0,
 				SystemRAMGB:  32.0,
 				CPUCores:     16,
 			},
-			expected: TierQwen3,
+			expected: TierQwen3_4B,
 		},
 		{
-			name: "low-end GPU",
-			caps: HardwareCapabilities{
-				HasNVIDIAGPU: true,
-				VRAMGB:       1.5,
-				SystemRAMGB:  8.0,
-				CPUCores:     4,
-			},
-			expected: TierGTELarge,
-		},
-		{
-			name: "no GPU, good RAM",
+			name: "medium RAM selects 4B",
 			caps: HardwareCapabilities{
 				HasNVIDIAGPU: false,
 				VRAMGB:       0,
 				SystemRAMGB:  8.0,
 				CPUCores:     4,
 			},
-			expected: TierGTELarge,
+			expected: TierQwen3_4B,
 		},
 		{
-			name: "no GPU, low RAM",
+			name: "6GB RAM threshold selects 4B",
 			caps: HardwareCapabilities{
 				HasNVIDIAGPU: false,
 				VRAMGB:       0,
-				SystemRAMGB:  1.5,
+				SystemRAMGB:  6.0,
+				CPUCores:     4,
+			},
+			expected: TierQwen3_4B,
+		},
+		{
+			name: "low RAM selects 0.6B",
+			caps: HardwareCapabilities{
+				HasNVIDIAGPU: false,
+				VRAMGB:       0,
+				SystemRAMGB:  4.0,
 				CPUCores:     2,
 			},
-			expected: TierHybridLocal,
+			expected: TierQwen3_0_6B,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tier := tt.caps.SelectModelTier()
+			tier := tt.caps.SelectHighQualityTier()
 			if tier != tt.expected {
 				t.Errorf("Expected tier %v, got %v", tt.expected, tier)
+			}
+		})
+	}
+}
+
+func TestHardwareCapabilities_CanUseGPU(t *testing.T) {
+	tests := []struct {
+		name     string
+		caps     HardwareCapabilities
+		tier     ModelTier
+		expected bool
+	}{
+		{
+			name: "no GPU",
+			caps: HardwareCapabilities{
+				HasNVIDIAGPU: false,
+				VRAMGB:       0,
+			},
+			tier:     TierQwen3_4B,
+			expected: false,
+		},
+		{
+			name: "GPU with sufficient VRAM for 4B",
+			caps: HardwareCapabilities{
+				HasNVIDIAGPU: true,
+				VRAMGB:       4.0,
+			},
+			tier:     TierQwen3_4B,
+			expected: true,
+		},
+		{
+			name: "GPU with insufficient VRAM for 4B",
+			caps: HardwareCapabilities{
+				HasNVIDIAGPU: true,
+				VRAMGB:       1.0,
+			},
+			tier:     TierQwen3_4B,
+			expected: false,
+		},
+		{
+			name: "GPU with sufficient VRAM for 0.6B",
+			caps: HardwareCapabilities{
+				HasNVIDIAGPU: true,
+				VRAMGB:       1.0,
+			},
+			tier:     TierQwen3_0_6B,
+			expected: true,
+		},
+		{
+			name: "HybridLocal never uses GPU",
+			caps: HardwareCapabilities{
+				HasNVIDIAGPU: true,
+				VRAMGB:       8.0,
+			},
+			tier:     TierHybridLocal,
+			expected: true, // MinVRAMGB is 0 for HybridLocal
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.caps.CanUseGPU(tt.tier)
+			if result != tt.expected {
+				t.Errorf("Expected CanUseGPU=%v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestHardwareCapabilities_CanRunTier(t *testing.T) {
+	tests := []struct {
+		name     string
+		caps     HardwareCapabilities
+		tier     ModelTier
+		expected bool
+	}{
+		{
+			name: "sufficient RAM for 4B",
+			caps: HardwareCapabilities{
+				SystemRAMGB: 8.0,
+			},
+			tier:     TierQwen3_4B,
+			expected: true,
+		},
+		{
+			name: "insufficient RAM for 4B",
+			caps: HardwareCapabilities{
+				SystemRAMGB: 3.0,
+			},
+			tier:     TierQwen3_4B,
+			expected: false,
+		},
+		{
+			name: "sufficient RAM for 0.6B",
+			caps: HardwareCapabilities{
+				SystemRAMGB: 2.0,
+			},
+			tier:     TierQwen3_0_6B,
+			expected: true,
+		},
+		{
+			name: "HybridLocal always runs",
+			caps: HardwareCapabilities{
+				SystemRAMGB: 0.5,
+			},
+			tier:     TierHybridLocal,
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.caps.CanRunTier(tt.tier)
+			if result != tt.expected {
+				t.Errorf("Expected CanRunTier=%v, got %v", tt.expected, result)
 			}
 		})
 	}
@@ -101,9 +216,9 @@ func TestModelTier_String(t *testing.T) {
 		tier     ModelTier
 		expected string
 	}{
-		{TierQwen3, "Qwen3-Embedding-0.6B"},
-		{TierGTELarge, "gte-large-en-v1.5"},
 		{TierHybridLocal, "HybridLocal"},
+		{TierQwen3_0_6B, "Qwen3-Embedding-0.6B"},
+		{TierQwen3_4B, "Qwen3-Embedding-4B"},
 	}
 
 	for _, tt := range tests {

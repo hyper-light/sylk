@@ -24,14 +24,6 @@ func setupRepairTestDB(t *testing.T) (*VectorGraphDB, *IntegrityValidator) {
 		t.Fatalf("failed to disable foreign keys: %v", err)
 	}
 
-	// Create hnsw_nodes table for testing (not in main schema)
-	_, err = db.DB().Exec(`CREATE TABLE IF NOT EXISTS hnsw_nodes (
-		node_id TEXT PRIMARY KEY
-	)`)
-	if err != nil {
-		t.Fatalf("failed to create hnsw_nodes table: %v", err)
-	}
-
 	config := DefaultIntegrityConfig()
 	validator := NewIntegrityValidator(db, config, nil)
 	return db, validator
@@ -56,17 +48,12 @@ func setupRepairTestDBWithConfig(t *testing.T, config IntegrityConfig) (*VectorG
 	return db, validator
 }
 
-// repairTestableChecks returns checks that work with SQLite (excludes PostgreSQL-specific queries
-// and checks that depend on tables not in the main schema).
+// repairTestableChecks returns checks that work with SQLite (excludes PostgreSQL-specific queries).
 func repairTestableChecks() []InvariantCheck {
 	var checks []InvariantCheck
 	for _, check := range StandardChecks() {
 		// Skip superseded_cycle which uses PostgreSQL's ARRAY and ANY() functions
 		if check.Name == "superseded_cycle" {
-			continue
-		}
-		// Skip invalid_hnsw_entry which requires hnsw_nodes table (managed by HNSW package)
-		if check.Name == "invalid_hnsw_entry" {
 			continue
 		}
 		checks = append(checks, check)
@@ -90,7 +77,7 @@ func TestRepairViolationsRepairsWhenAutoRepairTrue(t *testing.T) {
 
 	// Insert an orphaned vector (node doesn't exist)
 	_, err = db.DB().Exec(`INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
-		VALUES ('orphan1', X'00', 1.0, 768, 0, 0)`)
+		VALUES ('orphan1', X'00', 1.0, 1024, 0, 0)`)
 	if err != nil {
 		t.Fatalf("insert orphaned vector: %v", err)
 	}
@@ -131,7 +118,7 @@ func TestRepairViolationsSkipsWhenAutoRepairFalse(t *testing.T) {
 
 	// Insert an orphaned vector
 	_, err := db.DB().Exec(`INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
-		VALUES ('orphan1', X'00', 1.0, 768, 0, 0)`)
+		VALUES ('orphan1', X'00', 1.0, 1024, 0, 0)`)
 	if err != nil {
 		t.Fatalf("insert orphaned vector: %v", err)
 	}
@@ -231,7 +218,7 @@ func TestRepairViolationsMarksRepairedFlag(t *testing.T) {
 
 	// Insert an orphaned vector
 	_, err := db.DB().Exec(`INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
-		VALUES ('orphan1', X'00', 1.0, 768, 0, 0)`)
+		VALUES ('orphan1', X'00', 1.0, 1024, 0, 0)`)
 	if err != nil {
 		t.Fatalf("insert orphaned vector: %v", err)
 	}
@@ -264,7 +251,7 @@ func TestValidateAndRepairReturnsCorrectCounts(t *testing.T) {
 
 	// Insert an orphaned vector (will be repaired)
 	_, err := db.DB().Exec(`INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
-		VALUES ('orphan1', X'00', 1.0, 768, 0, 0)`)
+		VALUES ('orphan1', X'00', 1.0, 1024, 0, 0)`)
 	if err != nil {
 		t.Fatalf("insert orphaned vector: %v", err)
 	}
@@ -513,7 +500,7 @@ func TestRepairMultipleViolationTypes(t *testing.T) {
 
 	// Insert an orphaned vector
 	_, err := db.DB().Exec(`INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
-		VALUES ('orphan_vec', X'00', 1.0, 768, 0, 0)`)
+		VALUES ('orphan_vec', X'00', 1.0, 1024, 0, 0)`)
 	if err != nil {
 		t.Fatalf("insert orphaned vector: %v", err)
 	}

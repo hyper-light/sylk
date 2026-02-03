@@ -4,6 +4,8 @@ package testing
 
 import (
 	"context"
+	"math"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"strconv"
@@ -12,8 +14,8 @@ import (
 
 	"github.com/adalundhe/sylk/core/knowledge/inference"
 	"github.com/adalundhe/sylk/core/knowledge/query"
-	"github.com/adalundhe/sylk/core/vectorgraphdb"
-	"github.com/adalundhe/sylk/core/vectorgraphdb/hnsw"
+	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
+	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/ivf"
 )
 
 // =============================================================================
@@ -84,13 +86,14 @@ func reportLatency(t *testing.T, name string, latency, threshold time.Duration) 
 }
 
 // generateTestVector creates a normalized test vector of given dimension.
+// Each seed produces a deterministic, diverse vector suitable for IVF clustering.
 func generateTestVector(dim int, seed float32) []float32 {
+	rng := rand.New(rand.NewPCG(uint64(math.Float32bits(seed)), 0))
 	vec := make([]float32, dim)
 	for i := range vec {
-		vec[i] = seed + float32(i)*0.01
+		vec[i] = rng.Float32()
 	}
-	normalized, _ := hnsw.NormalizeVectorCopy(vec)
-	return normalized
+	return vamana.NormalizeVectorCopy(vec)
 }
 
 // =============================================================================
@@ -105,13 +108,13 @@ func TestRegressionVectorSearch(t *testing.T) {
 	t.Run("VectorSearch_10000_k10", func(t *testing.T) {
 		memBefore := memoryHighWaterMark()
 
-		// Setup: Create HNSW index with 10000 vectors
+		// Setup: Create IVF index with 10000 vectors
 		index := createTestIndex(t, 10000, 128)
 
 		// Measure search latency
 		queryVec := generateTestVector(128, 0.5)
 		start := time.Now()
-		results := index.Search(queryVec, 10, nil)
+		results := index.Search(queryVec, 10)
 		latency := time.Since(start)
 
 		memAfter := memoryHighWaterMark()
@@ -126,19 +129,17 @@ func TestRegressionVectorSearch(t *testing.T) {
 	})
 }
 
-// createTestIndex builds an HNSW index with n vectors.
-func createTestIndex(t *testing.T, n, dim int) *hnsw.Index {
-	cfg := hnsw.DefaultConfig()
-	cfg.Dimension = dim
-	index := hnsw.New(cfg)
+// createTestIndex builds an IVF index with n vectors.
+func createTestIndex(t *testing.T, n, dim int) *ivf.Index {
+	t.Helper()
+	cfg := ivf.ConfigForN(n, dim)
+	index := ivf.NewIndex(cfg, dim)
 
+	vectors := make([][]float32, n)
 	for i := range n {
-		vec := generateTestVector(dim, float32(i)*0.001)
-		id := "node-" + strconv.Itoa(i)
-		if err := index.Insert(id, vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFunction); err != nil {
-			t.Fatalf("Failed to insert vector %d: %v", i, err)
-		}
+		vectors[i] = generateTestVector(dim, float32(i)*0.001)
 	}
+	index.Build(vectors)
 	return index
 }
 
@@ -346,11 +347,11 @@ func TestRegressionIndexingPipeline(t *testing.T) {
 		vectorLatency := time.Since(start)
 		t.Logf("Vector generation: %v (%d vectors)", vectorLatency, len(vectors))
 
-		// Stage 3: HNSW indexing
+		// Stage 3: IVF indexing
 		start = time.Now()
 		index := indexVectors(t, vectors)
 		indexLatency := time.Since(start)
-		t.Logf("HNSW indexing: %v (%d nodes)", indexLatency, index.Size())
+		t.Logf("IVF indexing: %v (%d nodes)", indexLatency, index.NumVectors())
 
 		memAfter := memoryHighWaterMark()
 		reportMemoryDelta(t, memBefore, memAfter)
@@ -387,24 +388,19 @@ func generateDocumentVectors(docs []testDocument, dim int) map[string][]float32 
 	return vectors
 }
 
-// indexVectors builds an HNSW index from document vectors.
-func indexVectors(t *testing.T, vectors map[string][]float32) *hnsw.Index {
+// indexVectors builds an IVF index from document vectors.
+func indexVectors(t *testing.T, vectors map[string][]float32) *ivf.Index {
+	t.Helper()
+	vecs := make([][]float32, 0, len(vectors))
 	var dim int
 	for _, v := range vectors {
 		dim = len(v)
-		break
+		vecs = append(vecs, v)
 	}
 
-	cfg := hnsw.DefaultConfig()
-	cfg.Dimension = dim
-	index := hnsw.New(cfg)
-
-	for id, vec := range vectors {
-		err := index.Insert(id, vec, vectorgraphdb.DomainCode, vectorgraphdb.NodeTypeFile)
-		if err != nil {
-			t.Fatalf("Failed to index vector %s: %v", id, err)
-		}
-	}
+	cfg := ivf.ConfigForN(len(vecs), dim)
+	index := ivf.NewIndex(cfg, dim)
+	index.Build(vecs)
 	return index
 }
 
@@ -421,7 +417,7 @@ func TestRegressionSearchPipeline(t *testing.T) {
 		// Stage 1: Vector search
 		queryVec := generateTestVector(128, 0.5)
 		start := time.Now()
-		vectorResults := index.Search(queryVec, 50, nil)
+		vectorResults := index.Search(queryVec, 50)
 		vectorLatency := time.Since(start)
 		t.Logf("Vector search: %v (%d results)", vectorLatency, len(vectorResults))
 
@@ -433,7 +429,7 @@ func TestRegressionSearchPipeline(t *testing.T) {
 
 		// Stage 3: Convert and fuse results
 		start = time.Now()
-		convertedVec := convertHNSWToVectorResults(vectorResults)
+		convertedVec := convertIVFToVectorResults(vectorResults)
 		graphResults := createMockGraphResults(50)
 
 		fusion := query.DefaultRRFFusion()
@@ -449,12 +445,12 @@ func TestRegressionSearchPipeline(t *testing.T) {
 	})
 }
 
-// convertHNSWToVectorResults converts HNSW results to query.VectorResult.
-func convertHNSWToVectorResults(results []hnsw.SearchResult) []query.VectorResult {
+// convertIVFToVectorResults converts IVF results to query.VectorResult.
+func convertIVFToVectorResults(results []ivf.SearchResult) []query.VectorResult {
 	converted := make([]query.VectorResult, len(results))
 	for i, r := range results {
 		converted[i] = query.VectorResult{
-			ID:    r.ID,
+			ID:    strconv.FormatUint(uint64(r.ID), 10),
 			Score: r.Similarity,
 		}
 	}

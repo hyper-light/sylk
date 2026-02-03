@@ -59,7 +59,7 @@ func TestBleveStorePaths(t *testing.T) {
 	}
 }
 
-func TestBleveStoreExistsEmpty(t *testing.T) {
+func TestBleveStoreExistsAfterInit(t *testing.T) {
 	tmpDir := t.TempDir()
 	sd := New(tmpDir)
 	if err := sd.Init(); err != nil {
@@ -68,9 +68,20 @@ func TestBleveStoreExistsEmpty(t *testing.T) {
 
 	store := NewBleveStore(sd)
 
-	// Should not exist before opening
+	// With versioned storage, flat Bleve is not created automatically.
+	// It exists only after explicitly opening it.
 	if store.Exists() {
-		t.Error("Exists should return false before opening")
+		t.Error("Exists should return false before Open (versioned storage)")
+	}
+
+	// After Open, it should exist
+	if err := store.Open(); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if !store.Exists() {
+		t.Error("Exists should return true after Open")
 	}
 }
 
@@ -258,13 +269,13 @@ func TestBleveStoreStats(t *testing.T) {
 
 	store := NewBleveStore(sd)
 
-	// Stats before open
+	// Stats before open — with versioned storage, flat Bleve is not created.
 	stats := store.Stats()
 	if stats.Exists {
-		t.Error("Stats.Exists should be false before open")
+		t.Error("Stats.Exists should be false before Open (versioned storage)")
 	}
 	if stats.IsOpen {
-		t.Error("Stats.IsOpen should be false before open")
+		t.Error("Stats.IsOpen should be false before Open()")
 	}
 
 	// Open
@@ -394,6 +405,124 @@ func TestBleveStoreOperationsOnClosedStore(t *testing.T) {
 	_, err = store.Search(ctx, &search.SearchRequest{Query: "test"})
 	if err == nil {
 		t.Error("Search should error on closed store")
+	}
+}
+
+func TestBleveStoreAtPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	blevePath := tmpDir + "/custom-bleve"
+
+	store := NewBleveStoreAtPath(blevePath)
+
+	// Verify paths derive from explicit path, not SylkDir
+	expectedIndex := blevePath + "/documents.bleve"
+	if store.IndexPath() != expectedIndex {
+		t.Errorf("IndexPath = %s, want %s", store.IndexPath(), expectedIndex)
+	}
+	if store.Path() != blevePath {
+		t.Errorf("Path = %s, want %s", store.Path(), blevePath)
+	}
+
+	// Open should create the directory and database
+	if err := store.Open(); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if !store.Exists() {
+		t.Error("Expected index to exist after open")
+	}
+
+	// Index and search should work
+	ctx := context.Background()
+	doc := &search.Document{
+		ID:         "test-1",
+		Path:       "/test/file.go",
+		Type:       search.DocTypeSourceCode,
+		Content:    "package test // explicit path store",
+		IndexedAt:  time.Now(),
+		ModifiedAt: time.Now(),
+	}
+	if err := store.Index(ctx, doc); err != nil {
+		t.Fatalf("Index failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	count, err := store.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("DocumentCount = %d, want 1", count)
+	}
+
+	result, err := store.Search(ctx, &search.SearchRequest{Query: "explicit path", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if result.TotalHits < 1 {
+		t.Errorf("TotalHits = %d, want >= 1", result.TotalHits)
+	}
+}
+
+func TestBleveStoreAtPathPersistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	blevePath := tmpDir + "/persist-bleve"
+
+	// Create, index, close
+	store1 := NewBleveStoreAtPath(blevePath)
+	if err := store1.Open(); err != nil {
+		t.Fatalf("Open 1 failed: %v", err)
+	}
+	ctx := context.Background()
+	doc := &search.Document{
+		ID:      "persist-1",
+		Path:    "/test.go",
+		Content: "persisted content unique",
+	}
+	if err := store1.Index(ctx, doc); err != nil {
+		t.Fatalf("Index failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := store1.Close(); err != nil {
+		t.Fatalf("Close 1 failed: %v", err)
+	}
+
+	// Reopen and verify
+	store2 := NewBleveStoreAtPath(blevePath)
+	if err := store2.Open(); err != nil {
+		t.Fatalf("Open 2 failed: %v", err)
+	}
+	defer store2.Close()
+
+	count, err := store2.DocumentCount()
+	if err != nil {
+		t.Fatalf("DocumentCount failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("DocumentCount after reopen = %d, want 1", count)
+	}
+}
+
+func TestBleveStoreAtPathDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+	blevePath := tmpDir + "/delete-bleve"
+
+	store := NewBleveStoreAtPath(blevePath)
+	if err := store.Open(); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if !store.Exists() {
+		t.Fatal("Expected index to exist after open")
+	}
+
+	if err := store.Delete(); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	if store.Exists() {
+		t.Error("Expected index to not exist after delete")
 	}
 }
 

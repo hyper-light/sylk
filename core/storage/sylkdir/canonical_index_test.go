@@ -432,3 +432,67 @@ func TestCanonicalKeyIndexLargeDataset(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalKeyIndexDeletePrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	idx := NewCanonicalKeyIndexFromSylkDir(sd)
+	idx.Init()
+
+	// Populate with keys in different scopes
+	idx.Set("file:main.go", 1)
+	idx.Set("symbol:main.go:Run:func", 2)
+	idx.Set("symbol:main.go:Config:type", 3)
+	idx.Set("file:util.go", 4)
+	idx.Set("symbol:util.go:Helper:func", 5)
+
+	// Delete all symbol keys for main.go
+	deleted := idx.DeletePrefix("symbol:main.go:")
+	if len(deleted) != 2 {
+		t.Errorf("DeletePrefix returned %d, want 2", len(deleted))
+	}
+	if deleted["symbol:main.go:Run:func"] != 2 {
+		t.Errorf("missing Run in deleted map")
+	}
+	if deleted["symbol:main.go:Config:type"] != 3 {
+		t.Errorf("missing Config in deleted map")
+	}
+
+	// Verify deleted keys are gone
+	if idx.Has("symbol:main.go:Run:func") {
+		t.Error("Run should be deleted")
+	}
+	if idx.Has("symbol:main.go:Config:type") {
+		t.Error("Config should be deleted")
+	}
+
+	// Verify other keys survived
+	if !idx.Has("file:main.go") {
+		t.Error("file:main.go should survive")
+	}
+	if !idx.Has("file:util.go") {
+		t.Error("file:util.go should survive")
+	}
+	if !idx.Has("symbol:util.go:Helper:func") {
+		t.Error("util.go Helper should survive")
+	}
+
+	if idx.Count() != 3 {
+		t.Errorf("Count = %d, want 3", idx.Count())
+	}
+
+	// Delete with no matches
+	empty := idx.DeletePrefix("nonexistent:")
+	if len(empty) != 0 {
+		t.Errorf("DeletePrefix nonexistent returned %d, want 0", len(empty))
+	}
+
+	// Index should be dirty
+	if !idx.IsDirty() {
+		t.Error("index should be dirty after DeletePrefix")
+	}
+}

@@ -16,9 +16,37 @@ var ErrMetaNotLoaded = errors.New("sylkdir: global meta not loaded")
 
 // CommittedSession records a session that has been committed to the global graph.
 type CommittedSession struct {
-	SessionID    uint32    `json:"session_id"`
-	FinalVersion uint32    `json:"final_version"`
-	CommittedAt  time.Time `json:"committed_at"`
+	SessionID     uint32          `json:"session_id"`
+	FinalVersion  SemanticVersion `json:"final_version"`  // Session's version at commit time
+	GlobalVersion SemanticVersion `json:"global_version"` // Global version after this commit
+	CommittedAt   time.Time       `json:"committed_at"`
+}
+
+// GlobalVersionManifest tracks the version DAG for the global knowledge graph.
+// This mirrors the session VersionManifest structure for consistency.
+type GlobalVersionManifest struct {
+	Head     SemanticVersion `json:"head"`
+	Versions []GlobalVersion `json:"versions"`
+}
+
+// GlobalVersion represents a checkpoint in the global knowledge graph history.
+// Each commit from a session creates a new global version.
+type GlobalVersion struct {
+	ID         SemanticVersion    `json:"id"`
+	ParentID   SemanticVersion    `json:"parent_id"`
+	SessionID  uint32             `json:"session_id"`      // Which session caused this version
+	SessionVer SemanticVersion    `json:"session_version"` // Session's version at commit time
+	CreatedAt  time.Time          `json:"created_at"`
+	Stats      GlobalVersionStats `json:"stats"`
+}
+
+// GlobalVersionStats tracks cumulative counts at a global version.
+type GlobalVersionStats struct {
+	TotalNodes     uint32 `json:"total_nodes"`
+	TotalEdges     uint32 `json:"total_edges"`
+	TotalVectors   uint32 `json:"total_vectors"`
+	TotalDocs      uint32 `json:"total_docs"`
+	TombstoneCount uint32 `json:"tombstone_count"` // Dead nodes tracked by tombstone bitmap
 }
 
 // GlobalMeta manages the global metadata stored in knowledge/meta.json.
@@ -26,12 +54,20 @@ type CommittedSession struct {
 type GlobalMeta struct {
 	// SchemaVersion indicates the data format version for migrations.
 	SchemaVersion int `json:"schema_version"`
+	// Version is the current global knowledge graph version.
+	Version SemanticVersion `json:"version"`
 	// NextNodeID is the next available node ID (atomically incremented).
 	NextNodeID uint32 `json:"next_node_id"`
 	// NextSessionID is the next available session ID (atomically incremented).
 	NextSessionID uint32 `json:"next_session_id"`
 	// CommittedSessions lists all sessions merged into global state.
 	CommittedSessions []CommittedSession `json:"committed_sessions"`
+	// Manifest tracks the version DAG for cumulative snapshots.
+	Manifest *GlobalVersionManifest `json:"manifest,omitempty"`
+	// LastBleveIndexedVersion is the last global version whose documents were
+	// fully indexed in Bleve. Used for crash recovery: if HEAD > this value,
+	// the Bleve index must be rebuilt from the HEAD version's JSONL.
+	LastBleveIndexedVersion *SemanticVersion `json:"last_bleve_indexed_version,omitempty"`
 
 	// path is the filesystem path to meta.json.
 	path string
@@ -46,7 +82,8 @@ type GlobalMeta struct {
 func NewGlobalMeta(metaPath string) *GlobalMeta {
 	return &GlobalMeta{
 		path:              metaPath,
-		SchemaVersion:     1,
+		SchemaVersion:     2, // v2 includes global versioning
+		Version:           SemanticVersion{Major: 0, Minor: 0, Patch: 0}, // Initial version
 		NextNodeID:        1,
 		NextSessionID:     1,
 		CommittedSessions: make([]CommittedSession, 0),
@@ -76,6 +113,11 @@ func (m *GlobalMeta) Load() error {
 	// Ensure CommittedSessions is not nil
 	if m.CommittedSessions == nil {
 		m.CommittedSessions = make([]CommittedSession, 0)
+	}
+
+	// Ensure Manifest.Versions is not nil (for existing files without manifest)
+	if m.Manifest != nil && m.Manifest.Versions == nil {
+		m.Manifest.Versions = make([]GlobalVersion, 0)
 	}
 
 	m.loaded = true
@@ -138,6 +180,34 @@ func (m *GlobalMeta) saveUnlocked() error {
 
 	success = true
 	return nil
+}
+
+// initWithManifest initializes a new GlobalMeta file with the given initial version.
+// This creates the meta.json file from scratch with proper manifest structure.
+func (m *GlobalMeta) initWithManifest(initialVersion SemanticVersion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.SchemaVersion = 2
+	m.Version = initialVersion
+	m.NextNodeID = 1
+	m.NextSessionID = 1
+	m.CommittedSessions = make([]CommittedSession, 0)
+	m.Manifest = &GlobalVersionManifest{
+		Head: initialVersion,
+		Versions: []GlobalVersion{
+			{
+				ID:        initialVersion,
+				ParentID:  SemanticVersion{}, // Zero = no parent
+				SessionID: 0,                 // System-created
+				CreatedAt: time.Now().UTC(),
+				Stats:     GlobalVersionStats{},
+			},
+		},
+	}
+	m.loaded = true
+
+	return m.saveUnlocked()
 }
 
 // AllocateNodeID atomically increments NextNodeID and returns the allocated ID.
@@ -211,8 +281,9 @@ func (m *GlobalMeta) AllocateSessionID() (uint32, error) {
 }
 
 // RegisterCommit records a session as committed to the global graph.
-// This is called after successfully merging session data.
-func (m *GlobalMeta) RegisterCommit(sessionID uint32, finalVersion uint32) error {
+// This performs a MAJOR version bump on the global KG (session commit = major milestone).
+// finalVersion is the session's version at commit time (typically after a minor pre-commit bump).
+func (m *GlobalMeta) RegisterCommit(sessionID uint32, finalVersion SemanticVersion) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -227,14 +298,20 @@ func (m *GlobalMeta) RegisterCommit(sessionID uint32, finalVersion uint32) error
 		}
 	}
 
+	// MAJOR bump on global version (session commit = major milestone)
+	oldVersion := m.Version
+	m.Version = m.Version.BumpMajor()
+
 	m.CommittedSessions = append(m.CommittedSessions, CommittedSession{
-		SessionID:    sessionID,
-		FinalVersion: finalVersion,
-		CommittedAt:  time.Now().UTC(),
+		SessionID:     sessionID,
+		FinalVersion:  finalVersion,
+		GlobalVersion: m.Version,
+		CommittedAt:   time.Now().UTC(),
 	})
 
 	if err := m.saveUnlocked(); err != nil {
 		// Rollback on save failure
+		m.Version = oldVersion
 		m.CommittedSessions = m.CommittedSessions[:len(m.CommittedSessions)-1]
 		return fmt.Errorf("sylkdir: failed to persist commit registration: %w", err)
 	}
@@ -253,6 +330,55 @@ func (m *GlobalMeta) IsSessionCommitted(sessionID uint32) bool {
 		}
 	}
 	return false
+}
+
+// GetVersion returns the current global version.
+func (m *GlobalMeta) GetVersion() SemanticVersion {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Version
+}
+
+// BumpMinorVersion increments the minor version and persists.
+// Use for incremental updates (future feature).
+func (m *GlobalMeta) BumpMinorVersion() (SemanticVersion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return SemanticVersion{}, ErrMetaNotLoaded
+	}
+
+	oldVersion := m.Version
+	m.Version = m.Version.BumpMinor()
+
+	if err := m.saveUnlocked(); err != nil {
+		m.Version = oldVersion
+		return SemanticVersion{}, fmt.Errorf("sylkdir: failed to persist version bump: %w", err)
+	}
+
+	return m.Version, nil
+}
+
+// BumpPatchVersion increments the patch version and persists.
+// Use for index rebuilds or data repairs.
+func (m *GlobalMeta) BumpPatchVersion() (SemanticVersion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return SemanticVersion{}, ErrMetaNotLoaded
+	}
+
+	oldVersion := m.Version
+	m.Version = m.Version.BumpPatch()
+
+	if err := m.saveUnlocked(); err != nil {
+		m.Version = oldVersion
+		return SemanticVersion{}, fmt.Errorf("sylkdir: failed to persist version bump: %w", err)
+	}
+
+	return m.Version, nil
 }
 
 // GetCommittedSessions returns a copy of the committed sessions list.
@@ -290,6 +416,160 @@ func (m *GlobalMeta) IsLoaded() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.loaded
+}
+
+// GetHead returns the current HEAD version from the manifest.
+// Returns zero version if manifest is not initialized.
+func (m *GlobalMeta) GetHead() SemanticVersion {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Manifest == nil {
+		return SemanticVersion{}
+	}
+	return m.Manifest.Head
+}
+
+// SetHead updates the HEAD version in the manifest and persists.
+func (m *GlobalMeta) SetHead(version SemanticVersion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return ErrMetaNotLoaded
+	}
+
+	if m.Manifest == nil {
+		return fmt.Errorf("sylkdir: manifest not initialized")
+	}
+
+	oldHead := m.Manifest.Head
+	m.Manifest.Head = version
+
+	if err := m.saveUnlocked(); err != nil {
+		m.Manifest.Head = oldHead
+		return fmt.Errorf("sylkdir: failed to persist head update: %w", err)
+	}
+
+	return nil
+}
+
+// GetAncestorChain returns the version chain from HEAD to root.
+func (m *GlobalMeta) GetAncestorChain() []SemanticVersion {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Manifest == nil {
+		return nil
+	}
+
+	versionMap := make(map[string]*GlobalVersion)
+	for i := range m.Manifest.Versions {
+		versionMap[m.Manifest.Versions[i].ID.String()] = &m.Manifest.Versions[i]
+	}
+
+	var chain []SemanticVersion
+	current := m.Manifest.Head
+
+	for !current.IsZero() {
+		chain = append(chain, current)
+		if v, ok := versionMap[current.String()]; ok {
+			current = v.ParentID
+		} else {
+			break
+		}
+	}
+
+	return chain
+}
+
+// AddVersion adds a new version to the manifest and persists.
+// This does NOT update HEAD — call SetHead separately.
+func (m *GlobalMeta) AddVersion(v GlobalVersion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return ErrMetaNotLoaded
+	}
+
+	if m.Manifest == nil {
+		return fmt.Errorf("sylkdir: manifest not initialized")
+	}
+
+	// Check for duplicate version
+	for _, existing := range m.Manifest.Versions {
+		if existing.ID.Equal(v.ID) {
+			return fmt.Errorf("sylkdir: version %s already exists", v.ID.String())
+		}
+	}
+
+	m.Manifest.Versions = append(m.Manifest.Versions, v)
+
+	if err := m.saveUnlocked(); err != nil {
+		m.Manifest.Versions = m.Manifest.Versions[:len(m.Manifest.Versions)-1]
+		return fmt.Errorf("sylkdir: failed to persist version addition: %w", err)
+	}
+
+	return nil
+}
+
+// InitManifest initializes the version manifest with an initial version.
+// This is called during SylkDir.Init() for fresh installs.
+func (m *GlobalMeta) InitManifest(initialVersion SemanticVersion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return ErrMetaNotLoaded
+	}
+
+	if m.Manifest != nil {
+		return nil // Already initialized
+	}
+
+	m.Manifest = &GlobalVersionManifest{
+		Head: initialVersion,
+		Versions: []GlobalVersion{
+			{
+				ID:        initialVersion,
+				ParentID:  SemanticVersion{}, // Zero = no parent
+				SessionID: 0,                 // System-created
+				CreatedAt: time.Now().UTC(),
+				Stats:     GlobalVersionStats{},
+			},
+		},
+	}
+
+	// Also set the Version field to match
+	m.Version = initialVersion
+
+	return m.saveUnlocked()
+}
+
+// HasManifest returns true if the version manifest is initialized.
+func (m *GlobalMeta) HasManifest() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Manifest != nil
+}
+
+// GetManifest returns a copy of the version manifest.
+func (m *GlobalMeta) GetManifest() *GlobalVersionManifest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Manifest == nil {
+		return nil
+	}
+
+	// Return a copy
+	versions := make([]GlobalVersion, len(m.Manifest.Versions))
+	copy(versions, m.Manifest.Versions)
+	return &GlobalVersionManifest{
+		Head:     m.Manifest.Head,
+		Versions: versions,
+	}
 }
 
 // LockedMeta wraps GlobalMeta with an additional file lock for
@@ -339,4 +619,98 @@ func (lm *LockedMeta) Release() error {
 	err := lm.lockFile.Close()
 	lm.lockFile = nil
 	return err
+}
+
+// ErrVersionNotFound is returned when checkout targets a nonexistent version.
+var ErrVersionNotFound = errors.New("sylkdir: version not found")
+
+// Checkout switches the global HEAD to the specified version.
+// The version must exist in the manifest. This only updates the HEAD pointer;
+// the caller is responsible for reopening any stores (like Bleve) at the new HEAD.
+func (m *GlobalMeta) Checkout(version SemanticVersion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return ErrMetaNotLoaded
+	}
+
+	if m.Manifest == nil {
+		return fmt.Errorf("sylkdir: manifest not initialized")
+	}
+
+	// Verify the version exists in the manifest
+	found := false
+	for _, v := range m.Manifest.Versions {
+		if v.ID.Equal(version) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ErrVersionNotFound
+	}
+
+	// Update HEAD
+	oldHead := m.Manifest.Head
+	m.Manifest.Head = version
+	m.Version = version
+
+	if err := m.saveUnlocked(); err != nil {
+		m.Manifest.Head = oldHead
+		m.Version = oldHead
+		return fmt.Errorf("sylkdir: failed to persist checkout: %w", err)
+	}
+
+	return nil
+}
+
+// GetVersionInfo returns the GlobalVersion for a specific version ID.
+// Returns nil if not found.
+func (m *GlobalMeta) GetVersionInfo(version SemanticVersion) *GlobalVersion {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Manifest == nil {
+		return nil
+	}
+
+	for _, v := range m.Manifest.Versions {
+		if v.ID.Equal(version) {
+			copy := v // Make a copy
+			return &copy
+		}
+	}
+	return nil
+}
+
+// GetLastBleveIndexed returns the last version whose docs were fully indexed in Bleve.
+// Returns the zero SemanticVersion if not yet set.
+func (m *GlobalMeta) GetLastBleveIndexed() SemanticVersion {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.LastBleveIndexedVersion == nil {
+		return SemanticVersion{}
+	}
+	return *m.LastBleveIndexedVersion
+}
+
+// SetLastBleveIndexed records the version whose Bleve indexing completed and persists.
+func (m *GlobalMeta) SetLastBleveIndexed(v SemanticVersion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return ErrMetaNotLoaded
+	}
+
+	old := m.LastBleveIndexedVersion
+	m.LastBleveIndexedVersion = &v
+
+	if err := m.saveUnlocked(); err != nil {
+		m.LastBleveIndexedVersion = old
+		return fmt.Errorf("sylkdir: failed to persist last bleve indexed version: %w", err)
+	}
+	return nil
 }

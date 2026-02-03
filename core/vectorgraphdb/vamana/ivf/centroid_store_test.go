@@ -248,7 +248,7 @@ func TestCentroidStore_LargeK(t *testing.T) {
 	path := filepath.Join(dir, "centroids.bin")
 
 	k := 512
-	dim := 768
+	dim := 1024
 
 	centroids := make([][]float32, k)
 	norms := make([]float64, k)
@@ -301,7 +301,7 @@ func BenchmarkCentroidStore_Load(b *testing.B) {
 	path := filepath.Join(dir, "centroids.bin")
 
 	k := 512
-	dim := 768
+	dim := 1024
 
 	centroids := make([][]float32, k)
 	norms := make([]float64, k)
@@ -330,7 +330,7 @@ func BenchmarkCentroidStore_GetCentroid(b *testing.B) {
 	path := filepath.Join(dir, "centroids.bin")
 
 	k := 512
-	dim := 768
+	dim := 1024
 
 	centroids := make([][]float32, k)
 	norms := make([]float64, k)

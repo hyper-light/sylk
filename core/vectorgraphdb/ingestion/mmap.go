@@ -100,13 +100,15 @@ func readFileToMapped(f FileInfo) (MappedFile, error) {
 		return MappedFile{}, err
 	}
 
-	ext := extractExtension(f.Path)
+	headerLen := min(len(data), binarySniffSize)
+	fc := ClassifyFile(f.Path, data[:headerLen])
 
 	return MappedFile{
-		Path: f.Path,
-		Data: data,
-		Lang: GetLanguage(ext),
-		Size: f.Size,
+		Path:    f.Path,
+		Data:    data,
+		Lang:    fc.Lang,
+		DocType: fc.DocType,
+		Size:    f.Size,
 	}, nil
 }
 

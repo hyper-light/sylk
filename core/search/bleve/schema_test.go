@@ -165,7 +165,7 @@ func TestBuildDocumentMapping_ContentFieldUsesCodeAnalyzer(t *testing.T) {
 	assert.Equal(t, analyzer.CodeAnalyzerName, fieldMapping.Analyzer, "content should use code analyzer")
 	assert.True(t, fieldMapping.Store, "content should be stored")
 	assert.True(t, fieldMapping.Index, "content should be indexed")
-	assert.True(t, fieldMapping.IncludeInAll, "content should be included in _all")
+	assert.False(t, fieldMapping.IncludeInAll, "content should not be in _all (uses multi-field query)")
 }
 
 // =============================================================================
@@ -183,7 +183,7 @@ func TestBuildDocumentMapping_SymbolsFieldUsesSymbolAnalyzer(t *testing.T) {
 	assert.Equal(t, analyzer.SymbolAnalyzerName, fieldMapping.Analyzer, "symbols should use symbol analyzer")
 	assert.True(t, fieldMapping.Store, "symbols should be stored")
 	assert.True(t, fieldMapping.Index, "symbols should be indexed")
-	assert.True(t, fieldMapping.IncludeInAll, "symbols should be included in _all")
+	assert.False(t, fieldMapping.IncludeInAll, "symbols should not be in _all (uses multi-field query)")
 }
 
 // =============================================================================
@@ -201,7 +201,7 @@ func TestBuildDocumentMapping_CommentsFieldUsesCommentAnalyzer(t *testing.T) {
 	assert.Equal(t, analyzer.CommentAnalyzerName, fieldMapping.Analyzer, "comments should use comment analyzer")
 	assert.True(t, fieldMapping.Store, "comments should be stored")
 	assert.True(t, fieldMapping.Index, "comments should be indexed")
-	assert.True(t, fieldMapping.IncludeInAll, "comments should be included in _all")
+	assert.False(t, fieldMapping.IncludeInAll, "comments should not be in _all (uses multi-field query)")
 }
 
 // =============================================================================
@@ -320,7 +320,7 @@ func TestBuildCodeField_Configuration(t *testing.T) {
 	assert.Equal(t, analyzer.CodeAnalyzerName, field.Analyzer)
 	assert.True(t, field.Store, "code field should be stored")
 	assert.True(t, field.Index, "code field should be indexed")
-	assert.True(t, field.IncludeInAll, "code field should be in _all")
+	assert.False(t, field.IncludeInAll, "code field should not be in _all")
 }
 
 func TestBuildSymbolField_Configuration(t *testing.T) {
@@ -329,7 +329,7 @@ func TestBuildSymbolField_Configuration(t *testing.T) {
 	assert.Equal(t, analyzer.SymbolAnalyzerName, field.Analyzer)
 	assert.True(t, field.Store, "symbol field should be stored")
 	assert.True(t, field.Index, "symbol field should be indexed")
-	assert.True(t, field.IncludeInAll, "symbol field should be in _all")
+	assert.False(t, field.IncludeInAll, "symbol field should not be in _all")
 }
 
 func TestBuildCommentField_Configuration(t *testing.T) {
@@ -338,7 +338,7 @@ func TestBuildCommentField_Configuration(t *testing.T) {
 	assert.Equal(t, analyzer.CommentAnalyzerName, field.Analyzer)
 	assert.True(t, field.Store, "comment field should be stored")
 	assert.True(t, field.Index, "comment field should be indexed")
-	assert.True(t, field.IncludeInAll, "comment field should be in _all")
+	assert.False(t, field.IncludeInAll, "comment field should not be in _all")
 }
 
 func TestBuildDateTimeField_Configuration(t *testing.T) {
@@ -464,21 +464,11 @@ func TestFieldMappingTypes_DateTimeFields(t *testing.T) {
 func TestDocumentMapping_AllFieldInclusion(t *testing.T) {
 	docMapping := BuildDocumentMapping()
 
-	// Fields that should be included in _all (searchable content)
-	includedInAll := []string{"content", "symbols", "comments"}
-
-	// Fields that should NOT be included in _all (metadata/exact match)
+	// No fields should be included in _all — multi-field queries replace _all
+	// to eliminate duplicate analysis at index time.
 	notIncludedInAll := []string{
-		"id", "path", "type", "language", "imports",
-		"checksum", "modified_at", "indexed_at", "git_commit", "domain",
-	}
-
-	for _, fieldName := range includedInAll {
-		propMapping := docMapping.Properties[fieldName]
-		require.NotNil(t, propMapping, "field %s should exist", fieldName)
-		require.Len(t, propMapping.Fields, 1, "field %s should have one mapping", fieldName)
-		assert.True(t, propMapping.Fields[0].IncludeInAll,
-			"field %s should be included in _all", fieldName)
+		"id", "path", "type", "language", "content", "symbols", "comments",
+		"imports", "checksum", "modified_at", "indexed_at", "git_commit", "domain",
 	}
 
 	for _, fieldName := range notIncludedInAll {

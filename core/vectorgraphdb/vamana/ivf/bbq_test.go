@@ -6,7 +6,7 @@ import (
 )
 
 func BenchmarkBBQ_Distance(b *testing.B) {
-	dim := 768
+	dim := 1024
 	bbq := NewBBQ(dim)
 
 	vectors := make([][]float32, 1000)
@@ -41,7 +41,7 @@ func BenchmarkBBQ_Distance(b *testing.B) {
 }
 
 func BenchmarkBBQ_DistanceFlat(b *testing.B) {
-	dim := 768
+	dim := 1024
 	bbq := NewBBQ(dim)
 
 	n := 10000
@@ -100,7 +100,7 @@ func BenchmarkHamming(b *testing.B) {
 }
 
 func TestBBQ_Correctness(t *testing.T) {
-	dim := 768
+	dim := 1024
 	bbq := NewBBQ(dim)
 
 	n := 1000

@@ -1436,6 +1436,10 @@ func (g *VamanaGraph) BeamSearchBBQ(query []float32, k int, beamWidth int) []Sea
 		p := scores[pi].idx
 		ids := idx.partitionIDs[p]
 		for _, id := range ids {
+			if idx.isDead(id) {
+				continue
+			}
+
 			vecStart := int(id) * dim
 			vec := flat[vecStart : vecStart+dim]
 			vecNorm := norms[id]
@@ -1491,7 +1495,10 @@ func (g *VamanaGraph) searchGraphBBQ(queryID uint32, k int, beamWidth int) []uin
 	startCode := codes[int(startNode)*codeLen : int(startNode)*codeLen+codeLen]
 	startDist := HammingDistance(queryCode, startCode)
 	beam = append(beam, graphCandidate{startNode, int32(startDist)})
-	allCandidates = append(allCandidates, graphCandidate{startNode, int32(startDist)})
+	// Dead start nodes still serve as traversal entry points but are excluded from results
+	if !idx.isDead(startNode) {
+		allCandidates = append(allCandidates, graphCandidate{startNode, int32(startDist)})
+	}
 
 	logN := bits.Len(uint(n))
 	staleLimit := logN
@@ -1530,7 +1537,12 @@ func (g *VamanaGraph) searchGraphBBQ(queryID uint32, k int, beamWidth int) []uin
 			nbDist := int32(HammingDistance(queryCode, nbCode))
 
 			candidate := graphCandidate{nbID, nbDist}
-			allCandidates = append(allCandidates, candidate)
+
+			// Dead nodes are added to beam for traversal (bridge connectivity)
+			// but excluded from result candidates.
+			if !idx.isDead(nbID) {
+				allCandidates = append(allCandidates, candidate)
+			}
 
 			if len(beam) < beamWidth {
 				beam = append(beam, candidate)

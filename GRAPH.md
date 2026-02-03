@@ -4515,11 +4515,11 @@ import (
 )
 
 const (
-    NumSubspaces   = 96   // 768 / 8 = 96 subvectors
-    SubspaceDim    = 8    // Dimensions per subspace
+    NumSubspaces   = 32   // 1024 / 32 = 32 subvectors
+    SubspaceDim    = 32   // Dimensions per subspace
     NumCentroids   = 256  // Centroids per subspace (fits in 1 byte)
-    FullVectorDim  = 768
-    CompressedSize = 96   // 96 bytes vs 3072 bytes = 32x compression
+    FullVectorDim  = 1024
+    CompressedSize = 32   // 32 bytes vs 4096 bytes = 128x compression
 )
 
 // ProductQuantizer compresses vectors using product quantization
@@ -4814,12 +4814,12 @@ func (h *QuantizedHNSW) searchWithTable(
 
 | Storage | Per Vector | 1M Vectors | 10M Vectors |
 |---------|------------|------------|-------------|
-| Full float32 | 3,072 B | 2.9 GB | 29 GB |
-| PQ (96 bytes) | 96 B | 91 MB | 910 MB |
-| Savings | 32x | 32x | 32x |
+| Full float32 | 4,096 B | 3.8 GB | 38 GB |
+| PQ (32 bytes) | 32 B | 30 MB | 305 MB |
+| Savings | 128x | 128x | 128x |
 
 **ACCEPTANCE CRITERIA - Product Quantization:**
-- [ ] Compression ratio: ≥30x (96 bytes vs 3072 bytes)
+- [ ] Compression ratio: ≥100x (32 bytes vs 4096 bytes)
 - [ ] Recall@10: ≥95% compared to exact search
 - [ ] Training completes in <60s for 100K vectors
 - [ ] Search latency: <2x overhead vs full vectors
@@ -9855,7 +9855,7 @@ func DeriveOPQConfig(vectorDim, numVectors, targetBytesPerVector int) OPQConfig 
 ### Acceptance Criteria (Updated)
 
 **ACCEPTANCE CRITERIA - Adaptive Product Quantization:**
-- [x] Compression ratio: ≥30x (96 bytes vs 3072 bytes for 768-dim)
+- [x] Compression ratio: ≥100x (32 bytes vs 4096 bytes for 1024-dim)
 - [x] Recall@10 with Rerank(10x): ≥95% (achieved 100%)
 - [x] Recall@10 without Rerank: ≥30% baseline (achieved 37-40%)
 - [x] Residual PQ error reduction: ≥30% vs standard PQ (achieved 37.59%)

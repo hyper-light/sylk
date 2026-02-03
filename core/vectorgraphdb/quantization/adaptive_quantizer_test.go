@@ -433,7 +433,7 @@ func TestAdaptiveQuantizer_DerivedConfig(t *testing.T) {
 		{"32-dim, 200 vectors", 32, 200},
 		{"64-dim, 1000 vectors", 64, 1000},
 		{"128-dim, 5000 vectors", 128, 5000},
-		{"768-dim, 2000 vectors", 768, 2000}, // Reduced from 10000 for faster CI
+		{"1024-dim, 2000 vectors", 1024, 2000}, // Reduced from 10000 for faster CI
 	}
 
 	ctx := context.Background()

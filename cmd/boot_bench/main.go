@@ -51,7 +51,12 @@ func main() {
 
 	totalStart := time.Now()
 
-	projectRoot, isGitRepo := boot.FindProjectRoot(rootPath)
+	projectRoot := rootPath
+	isGitRepo := false
+	if gitRoot, err := boot.FindGitRoot(rootPath); err == nil {
+		projectRoot = gitRoot
+		isGitRepo = true
+	}
 	fmt.Printf("Project root: %s\n", projectRoot)
 	fmt.Printf("Git repo: %v\n", isGitRepo)
 	fmt.Println()

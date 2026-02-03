@@ -1,7 +1,7 @@
 package vectorgraphdb
 
 // SnapshotSearchResult represents a search result from a snapshot.
-// This mirrors the hnsw.SearchResult without creating an import cycle.
+// This mirrors VectorIndexSearchResult without creating an import cycle.
 type SnapshotSearchResult struct {
 	ID         string
 	Similarity float64

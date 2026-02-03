@@ -5,20 +5,25 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
+	"path/filepath"
+	"runtime"
 
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/search/bleve"
 )
 
-// BleveStore wraps Bleve IndexManager to use SylkDir paths.
-// This ensures full-text search index storage follows the .sylk layout:
+// BleveStore wraps Bleve IndexManager to use SylkDir paths or an explicit path.
+// When constructed with NewBleveStore, paths derive from the .sylk layout:
 //
 //	bleve/
 //	└── index/  (Bleve index files)
+//
+// When constructed with NewBleveStoreAtPath, paths derive from the explicit path
+// (used for per-session Bleve indices).
 type BleveStore struct {
-	sylkDir *SylkDir
-	manager *bleve.IndexManager
+	sylkDir      *SylkDir // nil when using explicitPath
+	explicitPath string   // non-empty when decoupled from SylkDir
+	manager      *bleve.IndexManager
 }
 
 // NewBleveStore creates a Bleve store using SylkDir paths.
@@ -28,19 +33,29 @@ func NewBleveStore(sd *SylkDir) *BleveStore {
 	}
 }
 
-// Open opens or creates the Bleve index at the SylkDir path.
+// NewBleveStoreAtPath creates a BleveStore at an explicit filesystem path.
+// The index is stored at <blevePath>/documents.bleve.
+// Use this for per-session Bleve indices that are decoupled from SylkDir.
+func NewBleveStoreAtPath(blevePath string) *BleveStore {
+	return &BleveStore{
+		explicitPath: blevePath,
+	}
+}
+
+// Open opens or creates the Bleve index.
 // Creates the index directory if it doesn't exist.
 func (s *BleveStore) Open() error {
-	// Ensure directory exists
-	if err := os.MkdirAll(s.sylkDir.BleveIndexPath(), 0755); err != nil {
+	// Ensure parent directory exists
+	indexPath := s.IndexPath()
+	parentDir := filepath.Dir(indexPath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return fmt.Errorf("sylkdir: failed to create bleve directory: %w", err)
 	}
 
 	config := bleve.IndexConfig{
-		Path:          s.IndexPath(),
-		BatchSize:     100,
-		MaxConcurrent: 4,
-		BatchTimeout:  30 * time.Second,
+		Path:          indexPath,
+		MaxConcurrent: runtime.NumCPU(),
+		UnsafeBatch:   true, // Safe: WAL + data store recovery can rebuild Bleve.
 	}
 
 	s.manager = bleve.NewIndexManagerWithConfig(config)
@@ -48,15 +63,17 @@ func (s *BleveStore) Open() error {
 }
 
 // OpenWithConfig opens or creates the Bleve index with custom configuration.
-// The Path field in config is overridden to use SylkDir paths.
+// The Path field in config is overridden to use this store's path.
 func (s *BleveStore) OpenWithConfig(config bleve.IndexConfig) error {
-	// Ensure directory exists
-	if err := os.MkdirAll(s.sylkDir.BleveIndexPath(), 0755); err != nil {
+	// Ensure parent directory exists
+	indexPath := s.IndexPath()
+	parentDir := filepath.Dir(indexPath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return fmt.Errorf("sylkdir: failed to create bleve directory: %w", err)
 	}
 
-	// Override path to use SylkDir
-	config.Path = s.IndexPath()
+	// Override path
+	config.Path = indexPath
 
 	s.manager = bleve.NewIndexManagerWithConfig(config)
 	return s.manager.Open()
@@ -76,14 +93,19 @@ func (s *BleveStore) Manager() *bleve.IndexManager {
 	return s.manager
 }
 
-// IndexPath returns the path where the Bleve index is stored.
-// This is within the .sylk directory structure.
+// IndexPath returns the path where the Bleve index database is stored.
 func (s *BleveStore) IndexPath() string {
-	return s.sylkDir.BleveIndexPath() + "/documents.bleve"
+	if s.explicitPath != "" {
+		return filepath.Join(s.explicitPath, "documents.bleve")
+	}
+	return filepath.Join(s.sylkDir.BleveIndexPath(), "documents.bleve")
 }
 
 // Path returns the base path for Bleve storage.
 func (s *BleveStore) Path() string {
+	if s.explicitPath != "" {
+		return s.explicitPath
+	}
 	return s.sylkDir.BlevePath()
 }
 

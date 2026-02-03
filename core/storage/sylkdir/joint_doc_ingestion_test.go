@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/search"
@@ -63,7 +64,7 @@ func openTestDataFile(t *testing.T, path string) *SharedDataFile {
 func TestJointDocInsertBasic(t *testing.T) {
 	sess := setupJointTestSession(t)
 	var nextID uint32 = 1
-	jdi := NewJointDocIngestion(sess, &nextID, nil, 512)
+	jdi := NewJointDocIngestion(sess, &nextID, nil)
 
 	req := &JointDocRequest{
 		DocID:   "test-doc",
@@ -90,8 +91,9 @@ func TestJointDocInsertCreatesChunks(t *testing.T) {
 	sess := setupJointTestSession(t)
 	var nextID uint32 = 1
 
-	// Use very small config to force multiple chunks.
-	jdi := NewJointDocIngestion(sess, &nextID, nil, 20)
+	// Use embedder with small MaxInputBytes to force multiple chunks.
+	mock := &mockBatchEmbedder{dim: 4, maxBytes: 50}
+	jdi := NewJointDocIngestion(sess, &nextID, mock)
 
 	// Content large enough to be split into multiple chunks.
 	content := "# Section 1\nParagraph about topic one.\n\n# Section 2\nParagraph about topic two.\n\n# Section 3\nParagraph about topic three.\n"
@@ -128,7 +130,8 @@ func TestJointDocInsertCreatesChunks(t *testing.T) {
 func TestJointDocInsertStoresChunkRefs(t *testing.T) {
 	sess := setupJointTestSession(t)
 	var nextID uint32 = 1
-	jdi := NewJointDocIngestion(sess, &nextID, nil, 20)
+	mock := &mockBatchEmbedder{dim: 4, maxBytes: 20}
+	jdi := NewJointDocIngestion(sess, &nextID, mock)
 
 	content := "Line 1\n\nLine 2\n\nLine 3\n\nLine 4\n\nLine 5\n\nLine 6\n\nLine 7\n\nLine 8\n\nLine 9\n\nLine 10\n"
 	req := &JointDocRequest{
@@ -160,7 +163,7 @@ func TestJointDocInsertStoresChunkRefs(t *testing.T) {
 func TestJointDocDelete(t *testing.T) {
 	sess := setupJointTestSession(t)
 	var nextID uint32 = 1
-	jdi := NewJointDocIngestion(sess, &nextID, nil, 512)
+	jdi := NewJointDocIngestion(sess, &nextID, nil)
 
 	req := &JointDocRequest{
 		DocID:   "del-doc",
@@ -193,7 +196,7 @@ func TestJointDocDelete(t *testing.T) {
 func TestJointDocUpdate(t *testing.T) {
 	sess := setupJointTestSession(t)
 	var nextID uint32 = 1
-	jdi := NewJointDocIngestion(sess, &nextID, nil, 512)
+	jdi := NewJointDocIngestion(sess, &nextID, nil)
 
 	req := &JointDocRequest{
 		DocID:   "update-doc",
@@ -234,4 +237,103 @@ func TestJointDocUpdate(t *testing.T) {
 	if oldNode.SupersededBy != ^uint32(0) {
 		t.Errorf("old node not tombstoned: SupersededBy=%d", oldNode.SupersededBy)
 	}
+}
+
+func TestJointDocInsertConcurrentEmbedding(t *testing.T) {
+	sess := setupJointTestSession(t)
+	var nextID uint32 = 1
+
+	mock := &mockBatchEmbedder{dim: 4}
+	jdi := NewJointDocIngestion(sess, &nextID, mock)
+
+	content := "# Section A\nFirst paragraph content.\n\n# Section B\nSecond paragraph content.\n"
+	req := &JointDocRequest{
+		DocID:   "concurrent-embed",
+		Path:    "/test/concurrent.md",
+		Content: []byte(content),
+		DocType: search.DocTypeMarkdown,
+		Domain:  DomainDoc,
+	}
+
+	result, err := jdi.Insert(context.Background(), req)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// EmbedBatch should be used, not individual Embed calls.
+	if mock.batchCalls.Load() == 0 {
+		t.Error("expected EmbedBatch to be called")
+	}
+	if mock.singleCalls.Load() > 0 {
+		t.Error("expected no individual Embed calls")
+	}
+	if result.VectorsCreated != result.ChunkCount {
+		t.Errorf("VectorsCreated: got %d, want %d", result.VectorsCreated, result.ChunkCount)
+	}
+}
+
+func TestSessionInsertDocumentAPI(t *testing.T) {
+	sess := setupJointTestSession(t)
+	sess.BaseSnapshot = &BaseSnapshot{NextNodeID: 1}
+
+	req := &JointDocRequest{
+		DocID:   "session-api-test",
+		Path:    "/test/session.md",
+		Content: []byte("# Hello\nWorld\n"),
+		DocType: search.DocTypeMarkdown,
+		Domain:  DomainDoc,
+	}
+
+	result, err := sess.InsertDocument(context.Background(), req, nil)
+	if err != nil {
+		t.Fatalf("InsertDocument: %v", err)
+	}
+
+	if result.DocNodeID == 0 {
+		t.Error("DocNodeID should be non-zero")
+	}
+	if result.DocsCreated < 1 {
+		t.Errorf("DocsCreated: got %d, want >= 1", result.DocsCreated)
+	}
+}
+
+// mockBatchEmbedder tracks calls to Embed vs EmbedBatch. Thread-safe.
+type mockBatchEmbedder struct {
+	dim         int
+	maxBytes    int // 0 uses default 8192*4
+	singleCalls atomic.Int64
+	batchCalls  atomic.Int64
+}
+
+func (m *mockBatchEmbedder) Embed(_ context.Context, _ string) ([]float32, error) {
+	m.singleCalls.Add(1)
+	vec := make([]float32, m.dim)
+	for i := range vec {
+		vec[i] = 0.1
+	}
+	return vec, nil
+}
+
+func (m *mockBatchEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+	m.batchCalls.Add(1)
+	result := make([][]float32, len(texts))
+	for i := range texts {
+		vec := make([]float32, m.dim)
+		for j := range vec {
+			vec[j] = float32(i) * 0.1
+		}
+		result[i] = vec
+	}
+	return result, nil
+}
+
+func (m *mockBatchEmbedder) Dimension() int {
+	return m.dim
+}
+
+func (m *mockBatchEmbedder) MaxInputBytes() int {
+	if m.maxBytes > 0 {
+		return m.maxBytes
+	}
+	return 8192 * 4
 }

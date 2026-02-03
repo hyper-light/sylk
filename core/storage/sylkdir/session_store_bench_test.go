@@ -2,8 +2,6 @@ package sylkdir
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -161,14 +159,15 @@ func BenchmarkFullSessionWorkflow(b *testing.B) {
 		sess.Checkpoint("after-refactor", CheckpointMinor)
 		sess.Checkpoint("auto-checkpoint", CheckpointPatch)
 
-		// 3. Simulate writing docs to version (create batch.jsonl)
-		docsPath := sess.DocsPath(sess.Manifest.Head)
-		docContent := `{"id":"doc1","path":"/src/main.go","content":"package main"}
-{"id":"doc2","path":"/src/util.go","content":"package util"}
-{"id":"doc3","path":"/README.md","content":"# Project"}
-`
-		if err := os.WriteFile(filepath.Join(docsPath, "batch.jsonl"), []byte(docContent), 0644); err != nil {
-			b.Fatalf("Write docs failed: %v", err)
+		// 3. Write docs via VersionDocStore (shared data file + offset index)
+		vds := NewVersionDocStore(sess)
+		docs := []*VersionDocument{
+			{ID: "doc1", Path: "/src/main.go", Content: "package main"},
+			{ID: "doc2", Path: "/src/util.go", Content: "package util"},
+			{ID: "doc3", Path: "/README.md", Content: "# Project"},
+		}
+		if err := vds.WriteBatch(docs); err != nil {
+			b.Fatalf("WriteBatch docs failed: %v", err)
 		}
 
 		// 4. Checkout earlier version (v1.0.1)

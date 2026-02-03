@@ -278,7 +278,7 @@ func (qe *QueryEngine) SemanticExpand(seedNodeIDs []string, limit int) ([]Hybrid
 		return nil, nil
 	}
 
-	vector, err := qe.vs.hnsw.GetVector(seedNodeIDs[0])
+	vector, err := qe.vs.vectorIndex.GetVector(seedNodeIDs[0])
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +294,7 @@ func (qe *QueryEngine) RelatedInDomain(nodeID string, limit int) ([]HybridResult
 		return nil, err
 	}
 
-	vector, err := qe.vs.hnsw.GetVector(nodeID)
+	vector, err := qe.vs.vectorIndex.GetVector(nodeID)
 	if err != nil {
 		return nil, err
 	}

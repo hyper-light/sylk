@@ -87,13 +87,10 @@ func (u *UnifiedIndexer) runVectorPipeline(ctx context.Context, graph *mainInges
 
 func IndexWithVectors(ctx context.Context, rootPath, vectorDir string) (*UnifiedIndexerResult, error) {
 	indexer := NewUnifiedIndexer(UnifiedIndexerConfig{
-		RootPath:    rootPath,
-		VectorDir:   vectorDir,
-		SkipPersist: true,
-		EmbedderConfig: embedder.FactoryConfig{
-			ForceLocal:    true,
-			SkipModelLoad: true,
-		},
+		RootPath:       rootPath,
+		VectorDir:      vectorDir,
+		SkipPersist:    true,
+		EmbedderConfig: embedder.FactoryConfig{},
 	})
 	return indexer.Index(ctx)
 }

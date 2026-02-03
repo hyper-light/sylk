@@ -19,14 +19,11 @@ func TestUnifiedIndexer_Sylk(t *testing.T) {
 	}
 
 	indexer := NewUnifiedIndexer(UnifiedIndexerConfig{
-		RootPath:    projectRoot,
-		VectorDir:   vectorDir,
-		SkipPersist: true,
-		SkipVector:  false,
-		EmbedderConfig: embedder.FactoryConfig{
-			ForceLocal:    true,
-			SkipModelLoad: true,
-		},
+		RootPath:       projectRoot,
+		VectorDir:      vectorDir,
+		SkipPersist:    true,
+		SkipVector:     false,
+		EmbedderConfig: embedder.FactoryConfig{},
 	})
 
 	result, err := indexer.Index(context.Background())

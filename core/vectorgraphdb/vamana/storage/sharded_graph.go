@@ -131,7 +131,8 @@ func (s *ShardedGraphStore) saveMeta() error {
 }
 
 func (s *ShardedGraphStore) loadShards() []*graphShard {
-	return s.shards.Load().([]*graphShard)
+	v, _ := s.shards.Load().([]*graphShard)
+	return v
 }
 
 func (s *ShardedGraphStore) createShard() error {

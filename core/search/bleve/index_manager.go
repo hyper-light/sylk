@@ -7,13 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/blevesearch/bleve/v2"
+	"github.com/blevesearch/bleve/v2/search/query"
 	blevesearch "github.com/blevesearch/bleve/v2/search"
 	"github.com/blevesearch/bleve/v2/search/highlight/highlighter/ansi"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/adalundhe/sylk/core/search"
 )
@@ -29,6 +32,12 @@ type IndexConfig struct {
 	MaxConcurrent int
 	BatchTimeout  time.Duration // Timeout for batch commit operations. Default: 30s
 
+	// UnsafeBatch skips fsync wait on Scorch batch commits. Batch() returns as
+	// soon as the segment is introduced (applied to the index), allowing
+	// persistence to happen asynchronously. Safe when WAL-based crash recovery
+	// can rebuild the index from data stores.
+	UnsafeBatch bool
+
 	// Async indexing configuration
 	AsyncEnabled       bool
 	AsyncQueueSize     int
@@ -40,12 +49,25 @@ type IndexConfig struct {
 	PathIndexCache PathIndexCacheConfig
 }
 
+// configureAnalysisOnce ensures the global bleve analysis queue is sized to
+// the available hardware exactly once across all IndexManager instances.
+var configureAnalysisOnce sync.Once
+
+// configureAnalysisQueue scales Scorch's shared analysis worker pool from the
+// default (4) to runtime.NumCPU(), matching analysis parallelism to hardware.
+func configureAnalysisQueue() {
+	bleve.Config.SetAnalysisQueueSize(runtime.NumCPU())
+}
+
 // DefaultBatchTimeout is the default timeout for batch commit operations.
 const DefaultBatchTimeout = 30 * time.Second
 
-// DefaultMaxConcurrentBatches is the default limit for concurrent batch commit goroutines.
-// This prevents goroutine explosion under high load (W4P.5).
-const DefaultMaxConcurrentBatches = 16
+// defaultMaxConcurrentBatches returns the fallback limit for concurrent batch commit
+// goroutines, derived from available hardware. Used by initBatchSemaphore when
+// config.MaxConcurrent is not set.
+func defaultMaxConcurrentBatches() int {
+	return runtime.NumCPU()
+}
 
 // =============================================================================
 // Batch Size Validation (PF.3.10)
@@ -149,8 +171,7 @@ func CustomFieldConfig(fields []string, loadContent bool) FieldConfig {
 func DefaultIndexConfig(basePath string) IndexConfig {
 	return IndexConfig{
 		Path:          basePath + "/documents.bleve",
-		BatchSize:     100,
-		MaxConcurrent: 4,
+		MaxConcurrent: runtime.NumCPU(),
 		BatchTimeout:  DefaultBatchTimeout,
 	}
 }
@@ -266,7 +287,7 @@ func NewIndexManager(path string) *IndexManager {
 	return &IndexManager{
 		config: IndexConfig{
 			Path:           path,
-			BatchSize:      100,
+			MaxConcurrent:  runtime.NumCPU(),
 			BatchTimeout:   DefaultBatchTimeout,
 			PathIndexCache: DefaultPathIndexCacheConfig(),
 		},
@@ -296,6 +317,8 @@ func NewIndexManagerWithConfig(config IndexConfig) *IndexManager {
 // Returns ErrIndexAlreadyOpen if the index is already open.
 // Returns ErrIndexCorrupted if corruption is detected and autoRebuild is disabled.
 func (m *IndexManager) Open() error {
+	configureAnalysisOnce.Do(configureAnalysisQueue)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -382,7 +405,7 @@ func (m *IndexManager) rebuildLocked() error {
 func (m *IndexManager) initBatchSemaphore() {
 	maxConcurrent := m.config.MaxConcurrent
 	if maxConcurrent <= 0 {
-		maxConcurrent = DefaultMaxConcurrentBatches
+		maxConcurrent = defaultMaxConcurrentBatches()
 	}
 	m.batchSemMu.Lock()
 	m.batchSem = make(chan struct{}, maxConcurrent)
@@ -468,12 +491,29 @@ func (m *IndexManager) batchFunc(ops []*IndexOperation) error {
 	return m.index.Batch(batch)
 }
 
+// scorchKVConfig returns the Scorch kvconfig map when UnsafeBatch is enabled.
+func (m *IndexManager) scorchKVConfig() map[string]interface{} {
+	if !m.config.UnsafeBatch {
+		return nil
+	}
+	return map[string]interface{}{"unsafe_batch": true}
+}
+
 // openOrCreate attempts to open existing index, falls back to creating new one.
+// When UnsafeBatch is configured, uses bleve.OpenUsing to pass Scorch runtime config.
 // Must be called with write lock held.
 func (m *IndexManager) openOrCreate() error {
-	index, err := bleve.Open(m.config.Path)
+	var idx bleve.Index
+	var err error
+
+	if kvconfig := m.scorchKVConfig(); kvconfig != nil {
+		idx, err = bleve.OpenUsing(m.config.Path, kvconfig)
+	} else {
+		idx, err = bleve.Open(m.config.Path)
+	}
+
 	if err == nil {
-		m.index = index
+		m.index = idx
 		m.closed = false
 		return nil
 	}
@@ -481,7 +521,11 @@ func (m *IndexManager) openOrCreate() error {
 	return m.createNewIndex()
 }
 
+// scorchIndexType is the Scorch index type name used by bleve v2.
+const scorchIndexType = "scorch"
+
 // createNewIndex creates a new Bleve index with the document mapping.
+// When UnsafeBatch is configured, uses bleve.NewUsing with explicit Scorch config.
 // Must be called with write lock held.
 func (m *IndexManager) createNewIndex() error {
 	indexMapping, err := BuildIndexMapping()
@@ -489,12 +533,17 @@ func (m *IndexManager) createNewIndex() error {
 		return fmt.Errorf("build mapping: %w", err)
 	}
 
-	index, err := bleve.New(m.config.Path, indexMapping)
+	var idx bleve.Index
+	if kvconfig := m.scorchKVConfig(); kvconfig != nil {
+		idx, err = bleve.NewUsing(m.config.Path, indexMapping, scorchIndexType, scorchIndexType, kvconfig)
+	} else {
+		idx, err = bleve.New(m.config.Path, indexMapping)
+	}
 	if err != nil {
 		return fmt.Errorf("create index: %w", err)
 	}
 
-	m.index = index
+	m.index = idx
 	m.closed = false
 	return nil
 }
@@ -964,11 +1013,11 @@ func (m *IndexManager) validateDocument(doc *search.Document) error {
 	return nil
 }
 
-// IndexBatch indexes multiple documents in a single batch operation.
-// This is more efficient than indexing documents individually.
-// Commits batches at the configured BatchSize for memory efficiency.
-// If the number of documents exceeds the effective batch size, documents
-// are automatically chunked to prevent OOM issues (PF.3.10).
+// IndexBatch indexes multiple documents using parallel workers.
+// Documents are split across min(runtime.NumCPU(), len(docs)) workers,
+// each building and committing an independent batch. This enables Scorch
+// pipeline overlap: while worker N's batch is being introduced/persisted,
+// worker N+1's batch is being analyzed by the shared AnalysisQueue.
 // Returns ErrIndexClosed if the index is not open.
 // Returns ErrEmptyBatch if docs is empty.
 func (m *IndexManager) IndexBatch(ctx context.Context, docs []*search.Document) error {
@@ -976,58 +1025,39 @@ func (m *IndexManager) IndexBatch(ctx context.Context, docs []*search.Document) 
 		return ErrEmptyBatch
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	// Snapshot index reference under read lock.
+	m.mu.RLock()
 	if m.closed || m.index == nil {
+		m.mu.RUnlock()
 		return ErrIndexClosed
 	}
+	idx := m.index
+	m.mu.RUnlock()
 
-	// Validate and apply batch size bounds (PF.3.10)
-	effectiveBatchSize := ValidateBatchSize(m.config.BatchSize)
-
-	// If docs exceed effective batch size, chunk them to prevent OOM
-	if len(docs) > effectiveBatchSize {
-		return m.indexBatchChunked(ctx, docs, effectiveBatchSize)
+	// Apply data-derived timeout when the caller has not set a deadline.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, chunkTimeout(docs))
+		defer cancel()
 	}
 
-	return m.indexBatchLocked(ctx, docs)
+	numWorkers := min(runtime.NumCPU(), len(docs))
+	chunkSize := (len(docs) + numWorkers - 1) / numWorkers
+
+	g, gctx := errgroup.WithContext(ctx)
+	for start := 0; start < len(docs); start += chunkSize {
+		chunk := docs[start:min(start+chunkSize, len(docs))]
+		g.Go(func() error {
+			return m.indexChunk(gctx, idx, chunk)
+		})
+	}
+
+	return g.Wait()
 }
 
-// indexBatchChunked processes large batches in smaller chunks to prevent OOM.
-// Must be called with write lock held.
-func (m *IndexManager) indexBatchChunked(ctx context.Context, docs []*search.Document, chunkSize int) error {
-	for i := 0; i < len(docs); i += chunkSize {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		end := i + chunkSize
-		if end > len(docs) {
-			end = len(docs)
-		}
-
-		if err := m.indexBatchLocked(ctx, docs[i:end]); err != nil {
-			return fmt.Errorf("chunk %d: %w", i/chunkSize, err)
-		}
-	}
-	return nil
-}
-
-// indexBatchLocked performs batch indexing with configurable batch size.
-// Uses timeout-protected batch commits to prevent hanging.
-// Must be called with write lock held.
-func (m *IndexManager) indexBatchLocked(ctx context.Context, docs []*search.Document) error {
-	batch := m.index.NewBatch()
-	batchSize := m.config.BatchSize
-	if batchSize <= 0 {
-		batchSize = 100
-	}
-
-	// Collect paths for batch path index update (PF.3.3)
-	pathsToUpdate := make(map[string]string)
+// indexChunk builds and commits a Bleve batch for a slice of documents.
+func (m *IndexManager) indexChunk(ctx context.Context, idx bleve.Index, docs []*search.Document) error {
+	batch := idx.NewBatch()
 
 	for _, doc := range docs {
 		select {
@@ -1036,45 +1066,67 @@ func (m *IndexManager) indexBatchLocked(ctx context.Context, docs []*search.Docu
 		default:
 		}
 
-		if err := m.addToBatch(batch, doc); err != nil {
+		if err := m.validateDocument(doc); err != nil {
 			return err
 		}
-
-		// Collect path mappings
-		if doc.Path != "" {
-			pathsToUpdate[doc.Path] = doc.ID
-		}
-
-		// Commit batch at configured size with timeout protection
-		if batch.Size() >= batchSize {
-			if err := m.BatchWithTimeout(ctx, batch); err != nil {
-				return fmt.Errorf("commit batch: %w", err)
-			}
-			batch = m.index.NewBatch()
+		if err := batch.Index(doc.ID, doc); err != nil {
+			return err
 		}
 	}
 
-	// Commit remaining documents with timeout protection
 	if batch.Size() > 0 {
-		if err := m.BatchWithTimeout(ctx, batch); err != nil {
-			return fmt.Errorf("commit final batch: %w", err)
+		if err := m.commitBatch(ctx, idx, batch); err != nil {
+			return err
 		}
 	}
 
-	// Update path cache (PF.3.3, W4P.12)
-	for path, docID := range pathsToUpdate {
-		m.pathCache.Put(path, docID)
+	for _, doc := range docs {
+		if doc.Path != "" {
+			m.pathCache.Put(doc.Path, doc.ID)
+		}
 	}
 
 	return nil
 }
 
-// addToBatch validates and adds a document to the batch.
-func (m *IndexManager) addToBatch(batch *bleve.Batch, doc *search.Document) error {
-	if err := m.validateDocument(doc); err != nil {
+// commitBatch commits a Bleve batch with semaphore-bounded concurrency
+// and timeout protection. The commit runs in a tracked goroutine racing
+// against the context deadline.
+func (m *IndexManager) commitBatch(ctx context.Context, idx bleve.Index, batch *bleve.Batch) error {
+	if err := m.acquireBatchSemaphore(ctx); err != nil {
 		return err
 	}
-	return batch.Index(doc.ID, doc)
+
+	done := make(chan error, 1)
+	go func() {
+		defer m.releaseBatchSemaphore()
+		done <- idx.Batch(batch)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("commit batch: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %v", ErrBatchTimeout, ctx.Err())
+	}
+}
+
+// chunkTimeout derives a safety timeout from the chunk's data volume.
+// Scales with document count (1ms per doc for analysis overhead) and
+// content size (1ms per KB for tokenization/FST construction).
+func chunkTimeout(docs []*search.Document) time.Duration {
+	var totalContentBytes int
+	for _, doc := range docs {
+		if doc != nil {
+			totalContentBytes += len(doc.Content)
+		}
+	}
+	perDoc := time.Duration(len(docs)) * time.Millisecond
+	perKB := time.Duration(totalContentBytes/1024) * time.Millisecond
+	return max(perDoc+perKB, 10*time.Second)
 }
 
 // BatchWithTimeout wraps batch commit with context timeout protection.
@@ -1310,6 +1362,28 @@ func (m *IndexManager) DocumentCount() (uint64, error) {
 }
 
 // =============================================================================
+// Multi-Field Query (replaces _all composite field)
+// =============================================================================
+
+// SearchableFields are the document fields searched by multi-field queries.
+// These replace the _all composite field to eliminate duplicate analysis at
+// index time: each field is analyzed once for its own inverted index.
+var SearchableFields = []string{"content", "symbols", "comments"}
+
+// NewMultiFieldTextQuery creates a disjunction query across all searchable
+// document fields. Each field is searched independently and results are
+// merged with OR semantics — matching any field satisfies the query.
+func NewMultiFieldTextQuery(queryStr string) query.Query {
+	disjuncts := make([]query.Query, len(SearchableFields))
+	for i, field := range SearchableFields {
+		mq := bleve.NewMatchQuery(queryStr)
+		mq.SetField(field)
+		disjuncts[i] = mq
+	}
+	return bleve.NewDisjunctionQuery(disjuncts...)
+}
+
+// =============================================================================
 // Search Methods
 // =============================================================================
 
@@ -1364,8 +1438,7 @@ func (m *IndexManager) executeSearch(ctx context.Context, req *search.SearchRequ
 
 // buildBleveRequestWithFields constructs a Bleve SearchRequest with configurable fields.
 func (m *IndexManager) buildBleveRequestWithFields(req *search.SearchRequest, fieldCfg FieldConfig) *bleve.SearchRequest {
-	query := bleve.NewQueryStringQuery(req.Query)
-	bleveReq := bleve.NewSearchRequestOptions(query, req.Limit, req.Offset, false)
+	bleveReq := bleve.NewSearchRequestOptions(NewMultiFieldTextQuery(req.Query), req.Limit, req.Offset, false)
 
 	// Configure field loading based on FieldConfig
 	if fieldCfg.Fields == nil || fieldCfg.LoadContent {

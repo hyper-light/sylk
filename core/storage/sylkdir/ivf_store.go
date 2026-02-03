@@ -10,9 +10,9 @@ import (
 )
 
 // IVFStore wraps IVF persistence to use SylkDir paths.
-// This ensures vector index storage follows the .sylk layout:
+// Data is stored under .sylk/data/ivf/:
 //
-//	knowledge/vectors/
+//	data/ivf/
 //	├── metadata.yaml
 //	├── centroids.bin
 //	├── partitions.bin
@@ -30,7 +30,7 @@ type IVFStore struct {
 func NewIVFStore(sd *SylkDir) *IVFStore {
 	return &IVFStore{
 		sylkDir:    sd,
-		vectorPath: sd.VectorsPath(),
+		vectorPath: sd.GlobalIVFPath(),
 	}
 }
 

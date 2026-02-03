@@ -1046,7 +1046,7 @@ type DBStats struct {
 	// TotalVectors is the count of all vector embeddings.
 	TotalVectors int64 `json:"total_vectors"`
 
-	// IndexSize is the size of the HNSW index in bytes.
+	// IndexSize is the size of the vector index in bytes.
 	IndexSize int64 `json:"index_size"`
 
 	// DBSizeBytes is the total database file size.

@@ -2,7 +2,7 @@ package coldstart
 
 import (
 	"github.com/adalundhe/sylk/core/events"
-	"github.com/adalundhe/sylk/core/vectorgraphdb/hnsw"
+	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
 )
 
 // =============================================================================
@@ -107,7 +107,7 @@ func (ap *ActionTypePrior) calculateRecency(currentTurn, eventTurn int) float64 
 
 // calculateSemantic computes semantic similarity between query and event.
 func (ap *ActionTypePrior) calculateSemantic(queryEmbed, eventEmbed []float32) float64 {
-	return hnsw.CosineSimilarityVectors(queryEmbed, eventEmbed)
+	return vamana.CosineSimilarity(queryEmbed, eventEmbed)
 }
 
 // computeWeightedScore combines the three components using fixed weights.
