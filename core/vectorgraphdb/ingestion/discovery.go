@@ -1,7 +1,6 @@
 package ingestion
 
 import (
-	"bytes"
 	"context"
 	"io/fs"
 	"os"
@@ -180,10 +179,6 @@ func (d *discoverer) processFile(path string) {
 		return
 	}
 
-	if isBinaryFile(path) {
-		return
-	}
-
 	d.files.Append(FileInfo{
 		Path:    path,
 		Size:    info.Size(),
@@ -301,26 +296,10 @@ func (d *discoverer) shouldSkipDir(name string) bool {
 	return false
 }
 
-// isBinaryFile detects binary files by scanning the first binarySniffSize
-// bytes for null bytes. Text files do not contain null bytes in any
-// encoding commonly used in source repositories.
-func isBinaryFile(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	buf := make([]byte, binarySniffSize)
-	n, err := f.Read(buf)
-	if n == 0 {
-		return false
-	}
-	return bytes.ContainsRune(buf[:n], 0)
-}
-
 // binarySniffSize is the number of bytes to read for binary detection.
 // Derived from POSIX file(1) and Go's net/http.DetectContentType.
+// Binary detection itself is performed in readFileToMapped (mmap.go)
+// on already-read data, eliminating a redundant file open.
 const binarySniffSize = 512
 
 // extractExtension extracts the file extension including the dot.

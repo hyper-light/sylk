@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -480,6 +481,10 @@ const inputAreaMinHeight = 3
 // Derived from: 1 char per side × 2 sides = 2.
 const panelBorderSize = 2
 
+// leftPanelOverhead is the vertical space consumed by section headers and divider.
+// Derived from: 2 headers (1 line each) + 2 spacer lines + 1 divider (1 line) = 5.
+const leftPanelOverhead = 5
+
 func (m *AppModel) recalcLayout() {
 	// Reserve space for input and status bar.
 	mainHeight := m.height - inputAreaMinHeight - statusBarHeight
@@ -491,13 +496,14 @@ func (m *AppModel) recalcLayout() {
 	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
 	m.chat.SetSize(max(chatW-panelBorderSize, 1), max(chatH-panelBorderSize, 1))
 
-	// Left panel: split between session (top half) and agent (bottom half).
-	// Content area is inside the shared left border.
+	// Left panel: split between session (top) and agent (bottom).
+	// Overhead: 2 section headers (1 line each) + 1 divider (1 line) = 3 lines.
 	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
 	innerLeftW := max(leftW-panelBorderSize, 1)
 	innerLeftH := max(leftH-panelBorderSize, 1)
-	sessionH := innerLeftH / 2
-	agentH := innerLeftH - sessionH
+	contentH := max(innerLeftH-leftPanelOverhead, 2)
+	sessionH := contentH / 2
+	agentH := contentH - sessionH
 	m.sessionPanel.SetSize(innerLeftW, sessionH)
 	m.agentPanel.SetSize(innerLeftW, agentH)
 
@@ -524,23 +530,38 @@ func (m *AppModel) renderMainArea() string {
 
 	switch layoutMode {
 	case layout.ThreeColumn:
-		leftView := m.renderPanel(m.renderLeftPanel(), component.FocusSessionPanel, th)
+		leftView := m.renderPanel(m.renderLeftPanel(th), component.FocusSessionPanel, th)
 		rightView := m.renderPanel(m.codePanel.View(), component.FocusCodeViewer, th)
 		return m.layout.RenderColumns(leftView, chatView, rightView)
 	case layout.TwoColumn:
-		leftView := m.renderPanel(m.renderLeftPanel(), component.FocusSessionPanel, th)
+		leftView := m.renderPanel(m.renderLeftPanel(th), component.FocusSessionPanel, th)
 		return m.layout.RenderColumns(leftView, chatView)
 	default:
 		return chatView
 	}
 }
 
-// renderLeftPanel stacks the session panel (top) and agent panel (bottom).
-func (m *AppModel) renderLeftPanel() string {
-	return lipgloss.JoinVertical(lipgloss.Left,
+// renderLeftPanel stacks sessions and agents with section headers and a divider.
+func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
+	leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+	innerW := max(leftW-panelBorderSize, 1)
+
+	headerStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
+	dividerStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+
+	sessionHeader := headerStyle.Render(" Sessions")
+	agentHeader := headerStyle.Render(" Agents")
+	divider := dividerStyle.Render(strings.Repeat("─", innerW))
+
+	return strings.Join([]string{
+		sessionHeader,
+		"",
 		m.sessionPanel.View(),
+		divider,
+		agentHeader,
+		"",
 		m.agentPanel.View(),
-	)
+	}, "\n")
 }
 
 func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.Theme) string {
