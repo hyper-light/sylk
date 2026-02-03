@@ -6,17 +6,13 @@ import (
 	"github.com/adalundhe/sylk/ui/theme"
 )
 
-// scrollPageFraction is the fraction of viewHeight used for page scrolling.
-// Derived from standard terminal pager behavior (full page minus one overlap line).
-const scrollPageFraction = 1
-
-// Viewport renders only visible chat entries using offset-based virtual scrolling.
-// It references a History ring buffer and renders entries on demand, avoiding
-// the need to pre-render all messages.
+// Viewport renders only visible chat entries using line-based virtual scrolling.
+// It references a History ring buffer and renders entries on demand with caching.
+// scrollOff tracks the number of rendered lines scrolled back from the bottom.
 type Viewport struct {
 	history    *History
 	theme      *theme.Theme
-	scrollOff  int  // Number of entries scrolled back from the bottom.
+	scrollOff  int  // Lines scrolled back from the bottom (0 = following).
 	viewHeight int
 	viewWidth  int
 	following  bool // Auto-scroll to bottom on new content.
@@ -37,55 +33,58 @@ func (vp *Viewport) SetSize(width, height int) {
 	vp.viewHeight = max(height, 0)
 }
 
-// ScrollUp scrolls up by one entry.
+// ScrollUp scrolls up by one line.
 func (vp *Viewport) ScrollUp() {
 	vp.following = false
-	maxOff := vp.maxScrollOffset()
-	vp.scrollOff = min(vp.scrollOff+1, maxOff)
+	vp.scrollOff = min(vp.scrollOff+1, vp.maxScrollOffset())
 }
 
-// ScrollDown scrolls down by one entry.
+// ScrollDown scrolls down by one line.
 func (vp *Viewport) ScrollDown() {
 	vp.scrollOff = max(vp.scrollOff-1, 0)
 	vp.following = vp.scrollOff == 0
 }
 
-// PageUp scrolls up by approximately one page of entries.
+// pageOverlap is the number of lines retained between pages for context.
+// Derived from: standard pager convention of 1 overlap line.
+const pageOverlap = 1
+
+// PageUp scrolls up by one page minus overlap.
 func (vp *Viewport) PageUp() {
 	vp.following = false
-	step := max(vp.estimatePageEntries(), scrollPageFraction)
-	maxOff := vp.maxScrollOffset()
-	vp.scrollOff = min(vp.scrollOff+step, maxOff)
+	step := max(vp.viewHeight-pageOverlap, 1)
+	vp.scrollOff = min(vp.scrollOff+step, vp.maxScrollOffset())
 }
 
-// PageDown scrolls down by approximately one page of entries.
+// PageDown scrolls down by one page minus overlap.
 func (vp *Viewport) PageDown() {
-	step := max(vp.estimatePageEntries(), scrollPageFraction)
+	step := max(vp.viewHeight-pageOverlap, 1)
 	vp.scrollOff = max(vp.scrollOff-step, 0)
 	vp.following = vp.scrollOff == 0
 }
 
-// ToTop scrolls to the oldest visible entry.
+// ToTop scrolls to the oldest content.
 func (vp *Viewport) ToTop() {
 	vp.following = false
 	vp.scrollOff = vp.maxScrollOffset()
 }
 
-// ToBottom scrolls to the newest entry and re-enables follow mode.
+// ToBottom scrolls to the newest content and re-enables follow mode.
 func (vp *Viewport) ToBottom() {
 	vp.scrollOff = 0
 	vp.following = true
 }
 
 // OnNewEntry should be called when a new entry is pushed to History.
-// If in follow mode, scroll offset stays at zero (bottom).
-// Otherwise, the offset is incremented so the user's view does not shift.
+// If following, scroll offset stays at zero. Otherwise, the offset is
+// increased by the new entry's line count so the user's view stays stable.
 func (vp *Viewport) OnNewEntry() {
 	if vp.following {
 		return
 	}
-	maxOff := vp.maxScrollOffset()
-	vp.scrollOff = min(vp.scrollOff+1, maxOff)
+	newIdx := vp.history.Len() - 1
+	h := vp.entryHeight(newIdx)
+	vp.scrollOff = min(vp.scrollOff+h, vp.maxScrollOffset())
 }
 
 // Following reports whether the viewport is auto-following new content.
@@ -105,19 +104,30 @@ func (vp *Viewport) View() string {
 	return vp.formatOutput(lines)
 }
 
-// collectVisibleLines walks backwards from the bottom entry (accounting for
-// scrollOff) and collects rendered lines until the viewport is full.
+// collectVisibleLines flattens all entry lines and extracts the window
+// defined by scrollOff and viewHeight.
 func (vp *Viewport) collectVisibleLines(total int) []string {
-	// The bottom-most entry index (logical) is total-1-scrollOff.
-	bottomIdx := total - 1 - min(vp.scrollOff, total-1)
+	all := vp.flattenLines(total)
+	totalLines := len(all)
 
-	var collected []string
-	for i := bottomIdx; i >= 0 && len(collected) < vp.viewHeight; i-- {
-		entryLines := vp.renderEntry(i)
-		// Prepend lines in reverse order.
-		collected = prependLines(collected, entryLines, vp.viewHeight)
+	end := max(totalLines-vp.scrollOff, 0)
+	start := max(end-vp.viewHeight, 0)
+
+	if end > totalLines {
+		end = totalLines
 	}
-	return collected
+
+	return all[start:end]
+}
+
+// flattenLines renders all entries and concatenates their lines.
+// Rendering is cached per entry, so repeated calls are cheap.
+func (vp *Viewport) flattenLines(total int) []string {
+	var all []string
+	for i := 0; i < total; i++ {
+		all = append(all, vp.renderEntry(i)...)
+	}
+	return all
 }
 
 // renderEntry renders a single entry by logical index, using cached lines
@@ -153,54 +163,45 @@ func (vp *Viewport) cacheRendered(index int, lines []string) {
 // formatOutput trims or pads the collected lines to exactly viewHeight
 // and joins them with newlines.
 func (vp *Viewport) formatOutput(lines []string) string {
-	// Take only the last viewHeight lines.
 	if len(lines) > vp.viewHeight {
-		lines = lines[len(lines)-vp.viewHeight:]
+		lines = lines[:vp.viewHeight]
 	}
 
-	// Pad with empty lines if fewer than viewHeight.
+	// Pad with empty lines at the bottom if fewer than viewHeight.
 	for len(lines) < vp.viewHeight {
-		lines = append([]string{""}, lines...)
+		lines = append(lines, "")
 	}
 
 	return strings.Join(lines, "\n")
 }
 
-// maxScrollOffset returns the maximum valid scroll offset.
-func (vp *Viewport) maxScrollOffset() int {
+// totalLines returns the sum of all rendered entry heights.
+func (vp *Viewport) totalLines() int {
 	total := vp.history.Len()
-	if total <= 0 {
+	lines := 0
+	for i := 0; i < total; i++ {
+		lines += vp.entryHeight(i)
+	}
+	return lines
+}
+
+// maxScrollOffset returns the maximum line-based scroll offset.
+// This is the total rendered lines minus one viewport, clamped to zero.
+func (vp *Viewport) maxScrollOffset() int {
+	return max(vp.totalLines()-vp.viewHeight, 0)
+}
+
+// entryHeight returns the rendered line count for an entry, rendering it
+// on demand if not already cached.
+func (vp *Viewport) entryHeight(index int) int {
+	entry := vp.history.Get(index)
+	if entry == nil {
 		return 0
 	}
-	return total - 1
-}
-
-// estimatePageEntries estimates how many entries fit in one page.
-// Uses a simple heuristic: viewHeight divided by average entry height.
-// Falls back to viewHeight / 3 (assumes ~3 lines per entry on average).
-const estimatedLinesPerEntry = 3
-
-func (vp *Viewport) estimatePageEntries() int {
-	if vp.viewHeight <= 0 {
-		return 1
+	if entry.Height >= 0 {
+		return entry.Height
 	}
-	return max(vp.viewHeight/estimatedLinesPerEntry, 1)
-}
-
-// prependLines inserts src lines before dst, respecting a maximum total.
-func prependLines(dst []string, src []string, maxTotal int) []string {
-	remaining := maxTotal - len(dst)
-	if remaining <= 0 {
-		return dst
-	}
-
-	// If src exceeds remaining space, take only the tail.
-	if len(src) > remaining {
-		src = src[len(src)-remaining:]
-	}
-
-	result := make([]string, 0, len(src)+len(dst))
-	result = append(result, src...)
-	result = append(result, dst...)
-	return result
+	rendered := RenderEntry(entry, vp.viewWidth, vp.theme)
+	vp.cacheRendered(index, rendered)
+	return len(rendered)
 }

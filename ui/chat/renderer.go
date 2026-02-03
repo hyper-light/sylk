@@ -1,8 +1,10 @@
 package chat
 
 import (
+	"fmt"
 	"strings"
 
+	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -57,10 +59,11 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) []string {
 	bodyStyle := messageStyle(entry.Source, th)
 	contentLines := renderContent(entry.Content, width, bodyStyle, th)
 
-	// Pre-allocate: 1 header + content lines.
-	lines := make([]string, 0, 1+len(contentLines))
+	// Pre-allocate: 1 header + content lines + 1 trailing spacer.
+	lines := make([]string, 0, 2+len(contentLines))
 	lines = append(lines, header)
 	lines = append(lines, contentLines...)
+	lines = append(lines, "")
 	return lines
 }
 
@@ -104,34 +107,137 @@ func messageStyle(source ChatSource, th *theme.Theme) lipgloss.Style {
 	return th.SystemMessage
 }
 
+// langAliases maps common short fence tags to the canonical language names
+// used by the syntax highlighter's keyword tables.
+var langAliases = map[string]string{
+	"js":     "javascript",
+	"ts":     "typescript",
+	"py":     "python",
+	"rb":     "ruby",
+	"c++":    "cpp",
+	"rs":     "rust",
+	"golang": "go",
+}
+
+// normalizeLang converts a fence language tag to the canonical form.
+func normalizeLang(tag string) string {
+	lang := strings.ToLower(strings.TrimSpace(tag))
+	if alias, ok := langAliases[lang]; ok {
+		return alias
+	}
+	return lang
+}
+
 // renderContent splits raw content into styled, word-wrapped lines.
-// Code fences (``` blocks) are detected and rendered with a subtle background.
+// Code fences (``` blocks) are syntax-highlighted with line numbers; prose is word-wrapped.
 func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme) []string {
 	if width <= 0 {
 		return nil
 	}
 
-	codeStyle := lipgloss.NewStyle().
-		Foreground(th.Palette.Foreground).
-		Background(th.Palette.Subtle)
-
 	var result []string
+	var codeBuffer []string
+	var codeLang string
 	inCode := false
 
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(line, "```") {
-			inCode = !inCode
-			// Render the fence delimiter itself in code style.
-			result = append(result, wrapLine(line, width, codeStyle)...)
+			if !inCode {
+				codeLang = normalizeLang(strings.TrimPrefix(line, "```"))
+				inCode = true
+			} else {
+				result = append(result, renderCodeBlock(codeBuffer, codeLang, width, th)...)
+				codeBuffer = nil
+				codeLang = ""
+				inCode = false
+			}
 			continue
 		}
-		active := style
 		if inCode {
-			active = codeStyle
+			codeBuffer = append(codeBuffer, line)
+		} else {
+			result = append(result, wrapLine(line, width, style)...)
 		}
-		result = append(result, wrapLine(line, width, active)...)
+	}
+
+	// Flush unclosed fence as highlighted code.
+	if inCode && len(codeBuffer) > 0 {
+		result = append(result, renderCodeBlock(codeBuffer, codeLang, width, th)...)
+	}
+
+	return result
+}
+
+// gutterSep is the separator between line numbers and code content.
+const gutterSep = " │ "
+
+// gutterSepWidth is the visible column width of gutterSep.
+// Derived from: space(1) + vertical bar(1) + space(1) = 3.
+const gutterSepWidth = 3
+
+// renderCodeBlock syntax-highlights buffered code lines with line numbers.
+func renderCodeBlock(lines []string, lang string, width int, th *theme.Theme) []string {
+	hl := codepkg.NewHighlighter(th)
+	content := strings.Join(lines, "\n")
+	allRegions := hl.HighlightContent(content, lang)
+
+	digits := digitCount(len(lines))
+	gutterWidth := digits + gutterSepWidth
+
+	numStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+	sepStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+
+	result := make([]string, 0, len(lines))
+	for i, line := range lines {
+		var regions []codepkg.HighlightRegion
+		if i < len(allRegions) {
+			regions = allRegions[i]
+		}
+
+		num := numStyle.Render(fmt.Sprintf("%*d", digits, i+1))
+		sep := sepStyle.Render(gutterSep)
+		highlighted := hl.HighlightLine(line, i, regions)
+
+		// Truncate code if it exceeds available width after the gutter.
+		codeWidth := max(width-gutterWidth, 1)
+		if lipgloss.Width(highlighted) > codeWidth {
+			highlighted = truncateCode(highlighted, codeWidth)
+		}
+
+		result = append(result, num+sep+highlighted)
 	}
 	return result
+}
+
+// truncateCode truncates a styled string to fit within maxWidth visible columns.
+func truncateCode(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	for i := range runes {
+		if lipgloss.Width(string(runes[:i])) > maxWidth {
+			if i == 0 {
+				return ""
+			}
+			return string(runes[:i-1])
+		}
+	}
+	return s
+}
+
+// digitCount returns the number of decimal digits in n.
+// Derived from: iterative division avoids float/log dependency.
+func digitCount(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	count := 0
+	for n > 0 {
+		count++
+		n /= 10
+	}
+	return count
 }
 
 // wrapLine performs word wrapping on a single line, returning one or more

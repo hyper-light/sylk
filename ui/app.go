@@ -58,6 +58,7 @@ const (
 	overlaySearch              // Command palette.
 )
 
+
 // ---------------------------------------------------------------------------
 // Panel layout
 // ---------------------------------------------------------------------------
@@ -134,6 +135,7 @@ type AppModel struct {
 	interruptHandler *interrupt.Handler
 
 	// State
+	chord  chordState
 	width  int
 	height int
 	ready  bool
@@ -150,7 +152,7 @@ func New(cfg Config, deps Deps) *AppModel {
 		focus:            layout.NewFocusManager(defaultTabOrder),
 		chat:             chat.New(th, cfg.ChatHistoryCapacity),
 		input:            inputpkg.New(th, cfg.InputHistoryCapacity),
-		statusBar:        status.New(th),
+		statusBar:        status.New(th, deps.SessionManager),
 		sessionPanel:     sessionpkg.New(deps.SessionManager, th),
 		agentPanel:       agentpkg.New(th),
 		codePanel:        codepkg.New(th),
@@ -183,6 +185,8 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleResize(typed)
 	case tea.KeyMsg:
 		return m.handleKey(typed)
+	case tea.MouseMsg:
+		return m, m.handleMouse(typed)
 	case msg.SubmitPromptMsg:
 		return m, m.handleSubmit(typed)
 	case msg.InterruptMsg:
@@ -292,16 +296,14 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Tab cycles focus.
-	if key.String() == "tab" && !m.focus.IsFocused(component.FocusInput) {
-		m.focus.Next()
-		m.syncFocusState()
-		return m, nil
+	// Two-key chord: S then Left/Right (sessions), A then Left/Right (agents).
+	if cmd, handled := m.handleChord(key); handled {
+		return m, cmd
 	}
 
-	// Shift+tab reverse-cycles focus.
-	if key.String() == "shift+tab" {
-		m.focus.Previous()
+	// Shift+arrow moves focus spatially between panels.
+	if target, ok := spatialFocusTarget(m.focus.Current(), key.String(), m.layout.Mode()); ok {
+		m.focus.SetFocus(target)
 		m.syncFocusState()
 		return m, nil
 	}
@@ -384,6 +386,96 @@ func (m *AppModel) handleModalClosed() tea.Cmd {
 	return nil
 }
 
+// chordState tracks which chord prefix is pending.
+type chordState int
+
+const (
+	chordNone    chordState = iota
+	chordSession            // "S" pressed, waiting for arrow.
+	chordAgent              // "A" pressed, waiting for arrow.
+)
+
+// chordArrowDelta maps arrow key strings (including shift-held variants) to
+// a cycle direction. The shift+arrow variants handle the common case where the
+// user still holds Shift from the prefix key when pressing the arrow.
+var chordArrowDelta = map[string]int{
+	"left":        -1,
+	"right":       1,
+	"shift+left":  -1,
+	"shift+right": 1,
+}
+
+// chordLabel maps active chord state to a display label for the hint overlay.
+var chordLabel = map[chordState]string{
+	chordSession: "Session select",
+	chordAgent:   "Agent select",
+}
+
+// chordHint returns a styled hint string when a chord is active, or "" when idle.
+func (m *AppModel) chordHint(th *theme.Theme) string {
+	label, ok := chordLabel[m.chord]
+	if !ok {
+		return ""
+	}
+	labelStyle := lipgloss.NewStyle().Foreground(th.Palette.Secondary).Bold(true)
+	keyStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+	return labelStyle.Render(label) + keyStyle.Render("  ←/→ cycle  any key to exit ")
+}
+
+// handleChord processes two-key chord shortcuts: S then Left/Right for sessions,
+// A then Left/Right for agents. The chord stays active while arrows are pressed,
+// allowing repeated cycling. Any non-arrow key cancels the chord and falls
+// through to normal handling. Returns (cmd, true) if consumed.
+func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
+	if m.chord != chordNone {
+		if delta, ok := chordArrowDelta[key.String()]; ok {
+			return m.dispatchChordCycle(m.chord, delta), true
+		}
+		m.chord = chordNone
+		return nil, false
+	}
+
+	switch key.String() {
+	case "S":
+		m.chord = chordSession
+		return nil, true
+	case "A":
+		m.chord = chordAgent
+		return nil, true
+	}
+	return nil, false
+}
+
+// dispatchChordCycle routes a completed chord to the target panel.
+func (m *AppModel) dispatchChordCycle(chord chordState, delta int) tea.Cmd {
+	switch chord {
+	case chordSession:
+		if delta < 0 {
+			return m.sessionPanel.CyclePrev()
+		}
+		return m.sessionPanel.CycleNext()
+	case chordAgent:
+		if delta < 0 {
+			m.agentPanel.CyclePrev()
+		} else {
+			m.agentPanel.CycleNext()
+		}
+	}
+	return nil
+}
+
+// handleMouse forwards mouse wheel events to the chat viewport
+// regardless of which panel has focus.
+func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
+	switch mouse.Button {
+	case tea.MouseButtonWheelUp:
+		m.chat.ScrollUp()
+	case tea.MouseButtonWheelDown:
+		m.chat.ScrollDown()
+	}
+	return nil
+}
+
 func (m *AppModel) toggleSearch() {
 	if m.searchOverlay.Visible() {
 		m.searchOverlay.Hide()
@@ -438,8 +530,12 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 
 	switch focused {
 	case component.FocusInput:
+		prevLines := m.input.LineCount()
 		comp, cmd := m.input.Update(key)
 		m.input = comp.(*inputpkg.Model)
+		if m.input.LineCount() != prevLines {
+			m.recalcLayout()
+		}
 		return cmd
 	case component.FocusChat:
 		comp, cmd := m.chat.Update(key)
@@ -473,21 +569,36 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 // statusBarHeight is the fixed height of the status bar (1 line).
 const statusBarHeight = 1
 
-// inputAreaHeight is the estimated height reserved for the input area.
-// Derived from: 1 border top + up to maxHeight lines + 1 border bottom.
-const inputAreaMinHeight = 3
+// inputBorderSize is the vertical space consumed by the input border.
+// Derived from: 1 char top + 1 char bottom = 2.
+const inputBorderSize = 2
+
+// inputMinContentLines is the minimum visible content lines in the input.
+const inputMinContentLines = 1
+
+// inputMaxContentLines is the maximum visible content lines before the input scrolls.
+// Derived from: user requirement of 3 visible lines.
+const inputMaxContentLines = 3
 
 // panelBorderSize is the space consumed by a rounded border on each axis.
 // Derived from: 1 char per side × 2 sides = 2.
 const panelBorderSize = 2
 
-// leftPanelOverhead is the vertical space consumed by section headers.
-// Derived from: 2 headers (1 line each) = 2.
-const leftPanelOverhead = 2
+// leftPanelOverhead is the vertical space consumed by section chrome.
+// Derived from: 2 headers (1 line each) + 1 divider (1 line + 1 top padding) = 4.
+const leftPanelOverhead = 4
+
+// inputHeight returns the current rendered height of the input area
+// based on its content line count, clamped to [min, max] + border.
+func (m *AppModel) inputHeight() int {
+	lines := clampInt(m.input.LineCount(), inputMinContentLines, inputMaxContentLines)
+	return lines + inputBorderSize
+}
 
 func (m *AppModel) recalcLayout() {
-	// Reserve space for input and status bar.
-	mainHeight := m.height - inputAreaMinHeight - statusBarHeight
+	// Reserve space for input (dynamic) and status bar.
+	inputH := m.inputHeight()
+	mainHeight := m.height - inputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
 
 	m.layout.SetSize(m.width, mainHeight)
@@ -497,7 +608,6 @@ func (m *AppModel) recalcLayout() {
 	m.chat.SetSize(max(chatW-panelBorderSize, 1), max(chatH-panelBorderSize, 1))
 
 	// Left panel: split between session (top) and agent (bottom).
-	// Overhead: 2 section headers (1 line each) + 1 divider (1 line) = 3 lines.
 	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
 	innerLeftW := max(leftW-panelBorderSize, 1)
 	innerLeftH := max(leftH-panelBorderSize, 1)
@@ -512,8 +622,8 @@ func (m *AppModel) recalcLayout() {
 	m.codePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 	m.knowledgePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 
-	// Fixed-height components (input handles its own border internally).
-	m.input.SetSize(m.width, inputAreaMinHeight)
+	// Input: dynamic height based on content.
+	m.input.SetSize(m.width, inputH)
 	m.statusBar.SetSize(m.width, statusBarHeight)
 
 	// Overlays get full terminal dimensions.
@@ -526,39 +636,81 @@ func (m *AppModel) renderMainArea() string {
 	layoutMode := m.layout.Mode()
 	th := m.config.Theme()
 
-	chatView := m.renderPanel(m.chat.View(), component.FocusChat, th)
+	chatContent := m.chat.View()
+	if hint := m.chordHint(th); hint != "" {
+		chatW, _ := m.layout.GetPanelSize(component.FocusChat)
+		innerW := max(chatW-panelBorderSize, 1)
+		hintWidth := lipgloss.Width(hint)
+		pad := max(innerW-hintWidth, 0)
+		chatContent = strings.Repeat(" ", pad) + hint + "\n\n" + chatContent
+	}
+	chatView := m.renderPanel(chatContent, component.FocusChat, th)
 
 	switch layoutMode {
 	case layout.ThreeColumn:
-		leftView := m.renderPanel(m.renderLeftPanel(th), component.FocusSessionPanel, th)
+		leftView := m.renderLeftPanelBordered(th)
 		rightView := m.renderPanel(m.codePanel.View(), component.FocusCodeViewer, th)
 		return m.layout.RenderColumns(leftView, chatView, rightView)
 	case layout.TwoColumn:
-		leftView := m.renderPanel(m.renderLeftPanel(th), component.FocusSessionPanel, th)
+		leftView := m.renderLeftPanelBordered(th)
 		return m.layout.RenderColumns(leftView, chatView)
 	default:
 		return chatView
 	}
 }
 
-// renderLeftPanel stacks sessions and agents with line-extended section headers.
-// Each header renders as " Label ────────" to match the border's visual weight.
+// isLeftPanelFocused returns true when either sub-section of the left panel has focus.
+func (m *AppModel) isLeftPanelFocused() bool {
+	return m.focus.IsFocused(component.FocusSessionPanel) || m.focus.IsFocused(component.FocusAgentPanel)
+}
+
+// renderLeftPanelBordered wraps the left panel content in a border that activates
+// when either sessions or agents is focused.
+func (m *AppModel) renderLeftPanelBordered(th *theme.Theme) string {
+	w, h := m.layout.GetPanelSize(component.FocusSessionPanel)
+	border := th.InactiveBorder
+	if m.isLeftPanelFocused() {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(m.renderLeftPanel(th))
+}
+
+// renderLeftPanel stacks sessions and agents with line-extended headers and a divider.
 func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
 	leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
 	innerW := max(leftW-panelBorderSize, 1)
 
+	sessionsFocused := m.focus.IsFocused(component.FocusSessionPanel)
+	agentsFocused := m.focus.IsFocused(component.FocusAgentPanel)
+
+	dividerStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+	divider := lipgloss.NewStyle().PaddingTop(1).Render(
+		dividerStyle.Render(strings.Repeat("─", innerW)),
+	)
+
 	return strings.Join([]string{
-		sectionHeader("Sessions", innerW, th),
+		sectionHeader("Sessions", innerW, sessionsFocused, th),
 		m.sessionPanel.View(),
-		sectionHeader("Agents", innerW, th),
+		divider,
+		sectionHeader("Agents", innerW, agentsFocused, th),
 		m.agentPanel.View(),
 	}, "\n")
 }
 
-// sectionHeader renders a label with a trailing line extending to the given width.
-func sectionHeader(label string, width int, th *theme.Theme) string {
-	headerStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
-	lineStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+// sectionHeader renders a label followed by a trailing line.
+// When focused, the label uses Primary color to indicate the active sub-section.
+func sectionHeader(label string, width int, focused bool, th *theme.Theme) string {
+	labelColor := th.Palette.Muted
+	lineColor := th.Palette.Border
+	if focused {
+		labelColor = th.Palette.Secondary
+	}
+	headerStyle := lipgloss.NewStyle().Foreground(labelColor).Bold(true)
+	lineStyle := lipgloss.NewStyle().Foreground(lineColor)
 
 	text := headerStyle.Render(" " + label + " ")
 	textWidth := lipgloss.Width(text)
@@ -591,6 +743,80 @@ func (m *AppModel) syncFocusState() {
 	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
 	m.codePanel.SetFocused(current == component.FocusCodeViewer)
+}
+
+// focusEdge encodes a (panel, direction) pair for spatial focus lookup.
+type focusEdge struct {
+	from component.FocusID
+	key  string
+}
+
+// spatialFocusMap defines the directional adjacency between panels.
+// The layout is:
+//
+//	┌──────────┬───────────┬──────────┐
+//	│ Sessions │ Chat      │ Code     │
+//	│──────────│           │ Viewer   │
+//	│ Agents   │───────────│          │
+//	│          │ Input     │          │
+//	└──────────┴───────────┴──────────┘
+var spatialFocusMap = map[focusEdge]component.FocusID{
+	// From Input
+	{component.FocusInput, "shift+up"}:    component.FocusChat,
+	{component.FocusInput, "shift+left"}:  component.FocusAgentPanel,
+	{component.FocusInput, "shift+right"}: component.FocusCodeViewer,
+
+	// From Chat
+	{component.FocusChat, "shift+down"}:  component.FocusInput,
+	{component.FocusChat, "shift+left"}:  component.FocusSessionPanel,
+	{component.FocusChat, "shift+right"}: component.FocusCodeViewer,
+
+	// From Session Panel
+	{component.FocusSessionPanel, "shift+right"}: component.FocusChat,
+	{component.FocusSessionPanel, "shift+down"}:  component.FocusAgentPanel,
+
+	// From Agent Panel
+	{component.FocusAgentPanel, "shift+right"}: component.FocusChat,
+	{component.FocusAgentPanel, "shift+up"}:    component.FocusSessionPanel,
+	{component.FocusAgentPanel, "shift+down"}:  component.FocusInput,
+
+	// From Code Viewer
+	{component.FocusCodeViewer, "shift+left"}: component.FocusChat,
+	{component.FocusCodeViewer, "shift+down"}: component.FocusInput,
+}
+
+// visiblePanels returns the set of focusable panels for a given layout mode.
+func visiblePanels(mode layout.LayoutMode) map[component.FocusID]struct{} {
+	// Chat and Input are always visible.
+	panels := map[component.FocusID]struct{}{
+		component.FocusChat:  {},
+		component.FocusInput: {},
+	}
+	if mode >= layout.TwoColumn {
+		panels[component.FocusSessionPanel] = struct{}{}
+		panels[component.FocusAgentPanel] = struct{}{}
+	}
+	if mode >= layout.ThreeColumn {
+		panels[component.FocusCodeViewer] = struct{}{}
+	}
+	return panels
+}
+
+// spatialFocusTarget looks up the target panel for a directional shift+arrow key,
+// returning false if the source or target panel is not visible in the current layout.
+func spatialFocusTarget(current component.FocusID, key string, mode layout.LayoutMode) (component.FocusID, bool) {
+	target, ok := spatialFocusMap[focusEdge{current, key}]
+	if !ok {
+		return 0, false
+	}
+	visible := visiblePanels(mode)
+	if _, srcOk := visible[current]; !srcOk {
+		return 0, false
+	}
+	if _, dstOk := visible[target]; !dstOk {
+		return 0, false
+	}
+	return target, true
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +893,11 @@ func (m *AppModel) tickCmd() tea.Cmd {
 // ---------------------------------------------------------------------------
 
 // appendCmd appends a non-nil command to the slice.
+// clampInt constrains v to [lo, hi].
+func clampInt(v, lo, hi int) int {
+	return max(lo, min(v, hi))
+}
+
 func appendCmd(cmds []tea.Cmd, cmd tea.Cmd) []tea.Cmd {
 	if cmd != nil {
 		return append(cmds, cmd)

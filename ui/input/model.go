@@ -13,8 +13,9 @@ import (
 	"github.com/adalundhe/sylk/ui/theme"
 )
 
-// defaultMaxHeight is the maximum visible rows before internal scrolling.
-const defaultMaxHeight = 10
+// defaultMaxHeight is the maximum visible content rows before internal scrolling.
+// Derived from: 3 lines of user input before the box scrolls internally.
+const defaultMaxHeight = 3
 
 // blinkInterval is the cursor blink period.
 // Derived from: standard terminal cursor blink rate (~530ms).
@@ -121,6 +122,11 @@ func (m *Model) SetSize(width, height int) {
 	m.height = height
 }
 
+// LineCount returns the number of content lines currently in the input.
+func (m *Model) LineCount() int {
+	return len(m.lines)
+}
+
 // ---------------------------------------------------------------------------
 // Cursor blink
 // ---------------------------------------------------------------------------
@@ -191,8 +197,8 @@ func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
 	if cmd, handled := m.dispatch(normalKeys, k); handled {
 		return m, cmd
 	}
-	// Fall through: insert rune.
-	if k.Type == tea.KeyRunes {
+	// Fall through: insert printable characters (including space).
+	if k.Type == tea.KeyRunes || k.Type == tea.KeySpace {
 		m.insertRunes([]rune(k.String()))
 		m.completer.Dismiss()
 	}

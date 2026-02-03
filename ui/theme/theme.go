@@ -32,8 +32,10 @@ type Theme struct {
 	SessionActive   lipgloss.Style
 	SessionInactive lipgloss.Style
 
-	// Agent badges
-	AgentBadge func(agentType string) lipgloss.Style
+	// Agent panel
+	AgentActive   lipgloss.Style
+	AgentInactive lipgloss.Style
+	AgentBadge    func(agentType string) lipgloss.Style
 
 	// Syntax highlighting
 	Syntax map[SyntaxCategory]lipgloss.Style
@@ -80,22 +82,18 @@ func New(p Palette) *Theme {
 			Foreground(p.Muted),
 
 		StatusBar: lipgloss.NewStyle().
-			Foreground(p.Foreground).
-			Background(p.Subtle),
+			Foreground(p.Muted),
 
 		StatusNormal: lipgloss.NewStyle().
 			Foreground(p.Success).
-			Background(p.Subtle).
 			Bold(true),
 
 		StatusWarning: lipgloss.NewStyle().
 			Foreground(p.Warning).
-			Background(p.Subtle).
 			Bold(true),
 
 		StatusError: lipgloss.NewStyle().
 			Foreground(p.Error).
-			Background(p.Subtle).
 			Bold(true),
 
 		SessionActive: lipgloss.NewStyle().
@@ -103,6 +101,13 @@ func New(p Palette) *Theme {
 			Bold(true),
 
 		SessionInactive: lipgloss.NewStyle().
+			Foreground(p.Muted),
+
+		AgentActive: lipgloss.NewStyle().
+			Foreground(p.Success).
+			Bold(true),
+
+		AgentInactive: lipgloss.NewStyle().
 			Foreground(p.Muted),
 
 		Syntax: SyntaxStyles(p),

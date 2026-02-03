@@ -20,15 +20,12 @@ type SessionSummary struct {
 	Active    bool
 }
 
-// stateIcons maps session State to display icons.
-var stateIcons = map[coresession.State]string{
-	coresession.StateCreated:   theme.IconIdle,
-	coresession.StateActive:    theme.IconActing,
-	coresession.StatePaused:    theme.IconWaiting,
-	coresession.StateSuspended: theme.IconWaiting,
-	coresession.StateCompleted: theme.IconSuccess,
-	coresession.StateFailed:    theme.IconError,
-}
+// Session dot glyphs. Active sessions use a filled dot; all others use an outline.
+const (
+	sessionDotFilled  = "●" // U+25CF BLACK CIRCLE
+	sessionDotOutline = "○" // U+25CB WHITE CIRCLE
+)
+
 
 // selectedIndicator is the left-side marker for the currently selected entry.
 const selectedIndicator = theme.IconExpand
@@ -37,18 +34,18 @@ const selectedIndicator = theme.IconExpand
 const unselectedPad = " "
 
 // RenderList renders the session list with the selected entry highlighted.
-func RenderList(summaries []SessionSummary, selected int, width, height int, th *theme.Theme) string {
+// When focused is false, the selected entry uses a subdued style.
+func RenderList(summaries []SessionSummary, selected int, width, height int, focused bool, th *theme.Theme) string {
 	if len(summaries) == 0 || height <= 0 || width <= 0 {
 		emptyStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Italic(true)
 		return emptyStyle.Render("  No sessions")
 	}
 
-	// Determine visible window around the selected item.
 	visStart, visEnd := visibleWindow(selected, len(summaries), height)
 
 	lines := make([]string, 0, visEnd-visStart)
 	for i := visStart; i < visEnd; i++ {
-		line := renderSessionEntry(summaries[i], i == selected, width, th)
+		line := renderSessionEntry(summaries[i], i == selected, focused, width, th)
 		lines = append(lines, line)
 	}
 
@@ -60,9 +57,9 @@ func RenderList(summaries []SessionSummary, selected int, width, height int, th 
 const entryFixedWidth = 4
 
 // renderSessionEntry renders a single session list entry, truncated to width.
-func renderSessionEntry(s SessionSummary, selected bool, width int, th *theme.Theme) string {
-	icon := sessionStateIcon(s.State)
-	indicator, nameStyle := entryStyles(s.Active, selected, th)
+func renderSessionEntry(s SessionSummary, selected, focused bool, width int, th *theme.Theme) string {
+	indicator, nameStyle := entryStyles(s.Active, selected, focused, th)
+	icon := stateStyledDot(s.Active, selected, focused, th)
 
 	name := nameStyle.Render(s.Name)
 	branchStr := renderBranch(s.Branch, th)
@@ -78,13 +75,40 @@ func renderSessionEntry(s SessionSummary, selected bool, width int, th *theme.Th
 }
 
 // entryStyles returns the indicator string and name style for a session entry.
-func entryStyles(active, selected bool, th *theme.Theme) (string, lipgloss.Style) {
+// Active sessions always keep their Primary text color.
+// The indicator uses the selection color when selected.
+func entryStyles(active, selected, focused bool, th *theme.Theme) (string, lipgloss.Style) {
 	if selected {
-		indicator := lipgloss.NewStyle().Foreground(th.Palette.Primary).Render(selectedIndicator)
-		style := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
-		return indicator, style
+		indicatorColor := th.Palette.Muted
+		if focused {
+			indicatorColor = th.Palette.Secondary
+		}
+		indicator := lipgloss.NewStyle().Foreground(indicatorColor).Render(selectedIndicator)
+		nameStyle := sessionNameStyle(active, th)
+		if !active {
+			nameStyle = lipgloss.NewStyle().Foreground(indicatorColor).Bold(true)
+		}
+		return indicator, nameStyle
 	}
 	return unselectedPad, sessionNameStyle(active, th)
+}
+
+// stateStyledDot renders the session dot.
+// Active sessions always get a filled dot in Primary.
+// Inactive selected sessions use the selection color with an outline dot.
+// Inactive unselected sessions use Muted with an outline dot.
+func stateStyledDot(active, selected, focused bool, th *theme.Theme) string {
+	if active {
+		return lipgloss.NewStyle().Foreground(th.Palette.Primary).Render(sessionDotFilled)
+	}
+	if selected {
+		color := th.Palette.Muted
+		if focused {
+			color = th.Palette.Secondary
+		}
+		return lipgloss.NewStyle().Foreground(color).Render(sessionDotOutline)
+	}
+	return lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(sessionDotOutline)
 }
 
 // truncateVisible truncates a styled string to fit within maxWidth visible
@@ -107,13 +131,6 @@ func truncateVisible(s string, maxWidth int) string {
 	return s
 }
 
-// sessionStateIcon returns the icon for a session state.
-func sessionStateIcon(state coresession.State) string {
-	if icon, ok := stateIcons[state]; ok {
-		return icon
-	}
-	return theme.IconIdle
-}
 
 // sessionNameStyle returns the style for a session name based on whether it is active.
 func sessionNameStyle(active bool, th *theme.Theme) lipgloss.Style {

@@ -9,45 +9,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// detailHeaderLines is the number of lines consumed by the agent detail header.
-// Derived from: 1 (name/status line) + 1 (separator line) = 2.
-const detailHeaderLines = 2
-
-// RenderDetail renders the expanded detail view for a single agent.
-// It shows a header with the agent name and status, followed by the most
-// recent events that fit within the available height.
-func RenderDetail(agent AgentState, evts []AgentEvent, width, height int, th *theme.Theme) string {
-	if height <= 0 || width <= 0 {
-		return ""
-	}
-
-	header := renderDetailHeader(agent, width, th)
-	availableLines := height - detailHeaderLines
-	if availableLines <= 0 {
-		return header
-	}
-
-	eventLines := renderEventLines(evts, width, availableLines, th)
-	return header + "\n" + eventLines
-}
-
-// renderDetailHeader builds the agent name, status icon, and separator.
-func renderDetailHeader(agent AgentState, width int, th *theme.Theme) string {
-	icon := statusIcon(agent.Status)
-	nameStyle := th.AgentBadge(agent.AgentType).Bold(true)
-	statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-
-	headerText := fmt.Sprintf("%s %s %s",
-		icon,
-		nameStyle.Render(agent.Name),
-		statusStyle.Render(agent.Status.String()),
-	)
-
-	separator := lipgloss.NewStyle().
+// renderDetailSeparator renders a horizontal line separator for the detail view.
+func renderDetailSeparator(width int, th *theme.Theme) string {
+	return lipgloss.NewStyle().
 		Foreground(th.Palette.Border).
 		Render(strings.Repeat("\u2500", max(width, 0)))
-
-	return headerText + "\n" + separator
 }
 
 // renderEventLines renders the most recent events that fit in availableLines.

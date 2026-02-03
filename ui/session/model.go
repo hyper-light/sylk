@@ -84,7 +84,7 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 
 // View renders the session panel.
 func (m *Model) View() string {
-	return RenderList(m.summaries, m.selected, m.width, m.height, m.theme)
+	return RenderList(m.summaries, m.selected, m.width, m.height, m.focused, m.theme)
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +155,18 @@ func (m *Model) moveSelection(delta int) {
 // ---------------------------------------------------------------------------
 // Session actions
 // ---------------------------------------------------------------------------
+
+// CyclePrev moves the selection cursor backward and activates the session.
+func (m *Model) CyclePrev() tea.Cmd {
+	m.moveSelection(-1)
+	return m.switchSession()
+}
+
+// CycleNext moves the selection cursor forward and activates the session.
+func (m *Model) CycleNext() tea.Cmd {
+	m.moveSelection(1)
+	return m.switchSession()
+}
 
 // switchSession switches to the selected session.
 func (m *Model) switchSession() tea.Cmd {

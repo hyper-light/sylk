@@ -36,6 +36,21 @@ func NewHighlighter(th *theme.Theme) *Highlighter {
 	}
 }
 
+// NewHighlighterWithBg creates a Highlighter where every style (including the
+// default) includes the given background color. This is used for rendering
+// syntax-highlighted code blocks on a tinted background (e.g. chat code fences).
+func NewHighlighterWithBg(th *theme.Theme, bg lipgloss.TerminalColor) *Highlighter {
+	styles := make(map[theme.SyntaxCategory]lipgloss.Style, len(th.Syntax))
+	for cat, style := range th.Syntax {
+		styles[cat] = style.Background(bg)
+	}
+	return &Highlighter{
+		theme:    th,
+		styles:   styles,
+		default_: lipgloss.NewStyle().Foreground(th.Palette.Foreground).Background(bg),
+	}
+}
+
 // HighlightLine applies highlight regions to a single line string and returns
 // the lipgloss-styled result. Regions must not overlap. Characters not covered
 // by any region use the default foreground style.
@@ -72,6 +87,11 @@ func (h *Highlighter) HighlightLine(line string, _ int, regions []HighlightRegio
 	}
 
 	return b.String()
+}
+
+// DefaultStyle returns the style used for unhighlighted text.
+func (h *Highlighter) DefaultStyle() lipgloss.Style {
+	return h.default_
 }
 
 // styleFor returns the lipgloss style for a category, falling back to default.

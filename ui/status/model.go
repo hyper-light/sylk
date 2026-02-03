@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
 )
@@ -17,15 +18,18 @@ const separatorChar = " | "
 // droppedWarningPrefix is prepended to the dropped event count indicator.
 const droppedWarningPrefix = "dropped:"
 
+// statusBarInset is the horizontal inset on each side to align with
+// panel content above. Derived from: rounded border = 1 char per side.
+const statusBarInset = 1
+
 // Model is the status bar rendered at the bottom of the TUI.
 type Model struct {
-	theme *theme.Theme
-	width int
+	theme   *theme.Theme
+	manager *session.Manager
+	width   int
 
 	// Left section
-	mode          string
-	sessionName   string
-	sessionBranch string
+	mode string
 
 	// Center section
 	spinner       *Spinner
@@ -37,10 +41,11 @@ type Model struct {
 	droppedEvents atomic.Int64
 }
 
-// New creates a status bar Model bound to the given theme.
-func New(t *theme.Theme) *Model {
+// New creates a status bar Model bound to the given theme and session manager.
+func New(t *theme.Theme, mgr *session.Manager) *Model {
 	return &Model{
 		theme:   t,
+		manager: mgr,
 		mode:    "CHAT",
 		spinner: NewSpinner(),
 		tokens:  NewTokenDisplay(t.StatusBar),
@@ -72,7 +77,8 @@ func (m *Model) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// View renders the status bar as a single styled line.
+// View renders the status bar as a single styled line with horizontal
+// margins matching the panel borders above.
 func (m *Model) View() string {
 	left := m.renderLeft()
 	center := m.renderCenter()
@@ -80,21 +86,19 @@ func (m *Model) View() string {
 
 	sep := m.theme.StatusBar.Render(separatorChar)
 
-	// Compute the space available for padding between sections.
-	leftSection := left + sep + center
-	leftWidth := lipgloss.Width(leftSection)
-	rightWidth := lipgloss.Width(right)
-	padWidth := m.width - leftWidth - rightWidth - lipgloss.Width(sep)
+	contentWidth := max(m.width-statusBarInset*2, 1)
 
-	if padWidth < 0 {
-		padWidth = 0
-	}
+	leftSection := left + sep + center
+	fixedWidth := lipgloss.Width(leftSection) + lipgloss.Width(sep) + lipgloss.Width(right)
+	padWidth := max(contentWidth-fixedWidth, 0)
 
 	padding := m.theme.StatusBar.Render(repeatSpace(padWidth))
+	content := leftSection + padding + sep + right
 
-	return m.theme.StatusBar.
-		Width(m.width).
-		Render(leftSection + padding + sep + right)
+	return lipgloss.NewStyle().
+		Width(contentWidth).
+		MarginLeft(statusBarInset).
+		Render(content)
 }
 
 // SetSize updates the available width for the status bar.
@@ -112,16 +116,9 @@ func (m *Model) handleTick() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) handleSessionEvent(v msg.SessionEventMsg) (tea.Model, tea.Cmd) {
-	if v.Event == nil || v.Event.Data == nil {
-		return m, nil
-	}
-	if name, ok := v.Event.Data["name"].(string); ok {
-		m.sessionName = name
-	}
-	if branch, ok := v.Event.Data["branch"].(string); ok {
-		m.sessionBranch = branch
-	}
+func (m *Model) handleSessionEvent(_ msg.SessionEventMsg) (tea.Model, tea.Cmd) {
+	// Session events just trigger a re-render; the active session is read
+	// directly from the manager in sessionLabel().
 	return m, nil
 }
 
@@ -187,18 +184,25 @@ func (m *Model) renderRight() string {
 
 // -- Helpers ----------------------------------------------------------------
 
-// sessionLabel builds the "session:branch" display string.
+// sessionLabel builds the "session:branch" display string
+// by reading the active session directly from the manager.
 func (m *Model) sessionLabel() string {
-	name := m.sessionName
+	active, ok := m.manager.GetActive()
+	if !ok {
+		return "-"
+	}
+
+	name := active.Name()
 	if name == "" {
 		name = "-"
 	}
 
-	if m.sessionBranch == "" {
+	branch := active.Branch()
+	if branch == "" {
 		return name
 	}
 
-	return name + ":" + m.sessionBranch
+	return name + ":" + branch
 }
 
 // repeatSpace returns a string of n spaces. Returns empty for n <= 0.

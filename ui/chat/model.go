@@ -192,6 +192,10 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	switch key.String() {
+	case "up", "k":
+		m.viewport.ScrollUp()
+	case "down", "j":
+		m.viewport.ScrollDown()
 	case "pgup":
 		m.viewport.PageUp()
 	case "pgdown":
@@ -212,6 +216,16 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 func (m *Model) PushEntry(entry *ChatEntry) {
 	m.history.Push(entry)
 	m.viewport.OnNewEntry()
+}
+
+// ScrollUp scrolls the chat viewport up by one entry.
+func (m *Model) ScrollUp() {
+	m.viewport.ScrollUp()
+}
+
+// ScrollDown scrolls the chat viewport down by one entry.
+func (m *Model) ScrollDown() {
+	m.viewport.ScrollDown()
 }
 
 // syncAccumulatorToEntry writes the accumulated content back into the

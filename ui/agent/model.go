@@ -89,11 +89,21 @@ func keyActionTable() map[string]keyAction {
 	}
 }
 
+// activeEventTypes is the set of event types that mark an agent as the
+// currently active agent. These represent an agent initiating work.
+var activeEventTypes = map[events.EventType]bool{
+	events.EventTypeAgentAction:   true,
+	events.EventTypeAgentDecision: true,
+	events.EventTypeLLMRequest:    true,
+	events.EventTypeToolCall:      true,
+}
+
 // Model is the Bubble Tea model for the agent dashboard panel.
 type Model struct {
 	agents    map[string]*AgentState
 	streams   map[string]*AgentEventStream
 	order     []string // Agent IDs in insertion order (bounded by maxAgentOrder).
+	activeID  string   // Agent ID of the currently active agent.
 	selected  int      // Index into order for keyboard navigation.
 	expanded  string   // Agent ID of the expanded detail view ("" if none).
 	theme     *theme.Theme
@@ -191,6 +201,11 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	m.ensureAgent(agentID, ev)
 	m.updateAgentStatus(agentID, ev)
 	m.pushAgentEvent(agentID, ev)
+
+	if activeEventTypes[ev.Event.EventType] {
+		m.activeID = agentID
+	}
+
 	return nil
 }
 
@@ -217,6 +232,11 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 	}
 	m.streams[agentID] = NewAgentEventStream()
 	m.order = append(m.order, agentID)
+
+	// First agent becomes active by default.
+	if m.activeID == "" {
+		m.activeID = agentID
+	}
 }
 
 // updateAgentStatus applies the table-driven EventType->AgentStatus mapping.
@@ -276,6 +296,16 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // Navigation
 // ---------------------------------------------------------------------------
 
+// CyclePrev moves the agent selection cursor backward.
+func (m *Model) CyclePrev() {
+	m.moveSelection(-1)
+}
+
+// CycleNext moves the agent selection cursor forward.
+func (m *Model) CycleNext() {
+	m.moveSelection(1)
+}
+
 // moveSelection moves the selection cursor by delta (positive = down, negative = up).
 func (m *Model) moveSelection(delta int) {
 	count := len(m.order)
@@ -323,24 +353,39 @@ func (m *Model) renderListView() string {
 			continue
 		}
 		selected := i == m.selected
-		lines = append(lines, RenderCard(*agent, m.width, m.theme, selected))
+		active := agentID == m.activeID
+		lines = append(lines, RenderCard(*agent, m.width, m.theme, selected, m.focused, active))
 	}
 	return strings.Join(lines, "\n")
 }
 
+// expandedCardOverhead is the number of lines consumed by the card and separator
+// in the expanded view.
+// Derived from: 1 (card) + 1 (separator) = 2.
+const expandedCardOverhead = 2
+
 // renderExpandedView renders the detail view for the expanded agent.
+// The selected agent card stays visible at the top, followed by a separator
+// and the event stream below.
 func (m *Model) renderExpandedView() string {
 	agent, ok := m.agents[m.expanded]
 	if !ok {
 		return ""
 	}
-	stream, ok := m.streams[m.expanded]
-	if !ok {
-		return RenderDetail(*agent, nil, m.width, m.height, m.theme)
+
+	active := m.expanded == m.activeID
+	card := RenderCard(*agent, m.width, m.theme, true, m.focused, active)
+
+	var evts []AgentEvent
+	if stream, ok := m.streams[m.expanded]; ok {
+		evts = stream.Last(m.height)
 	}
 
-	evts := stream.Last(m.height)
-	return RenderDetail(*agent, evts, m.width, m.height, m.theme)
+	separator := renderDetailSeparator(m.width, m.theme)
+	availableLines := m.height - expandedCardOverhead
+	eventContent := renderEventLines(evts, m.width, availableLines, m.theme)
+
+	return card + "\n" + separator + "\n" + eventContent
 }
 
 // ---------------------------------------------------------------------------
