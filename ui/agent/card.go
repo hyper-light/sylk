@@ -31,13 +31,12 @@ const contextBarWidth = 4
 
 // RenderCard renders a compact one-line agent card.
 // It shows: [indicator] [status icon] [agent name] [task summary...] [context %]
-// The active agent uses Success (green) styling; inactive agents match the
-// non-active session entry pattern (Muted/Secondary based on selection).
-func RenderCard(agent AgentState, width int, th *theme.Theme, selected, focused, active bool) string {
-	icon := agentStyledDot(active, selected, focused, th)
-	indicator := selectIndicator(selected, focused, th)
+// The selected agent uses Success (green) styling; all others use Muted.
+func RenderCard(agent AgentState, width int, th *theme.Theme, selected bool) string {
+	icon := agentStyledDot(selected, th)
+	indicator := selectIndicator(selected, th)
 
-	nameStyle := agentNameStyle(active, selected, focused, th)
+	nameStyle := agentNameStyle(selected, th)
 	name := nameStyle.Render(agent.Name)
 	nameLen := lipgloss.Width(name)
 
@@ -63,49 +62,28 @@ func RenderCard(agent AgentState, width int, th *theme.Theme, selected, focused,
 }
 
 // agentStyledDot renders the agent dot.
-// Selected agents always get a filled dot so the cursor position is visible.
-// Active agents use AgentActive (green); selected uses Secondary/Muted;
-// unselected inactive agents get an outline dot in Muted.
-func agentStyledDot(active, selected, focused bool, th *theme.Theme) string {
+// Selected: filled dot in Success (green). Unselected: outline dot in Muted.
+func agentStyledDot(selected bool, th *theme.Theme) string {
 	if selected {
-		color := agentSelectionColor(th)
-		return lipgloss.NewStyle().Foreground(color).Render(agentDotFilled)
-	}
-	if active {
 		return th.AgentActive.Render(agentDotFilled)
 	}
 	return th.AgentInactive.Render(agentDotOutline)
 }
 
 // agentNameStyle returns the style for an agent name.
-// Selected agents use the selection color (green if active, Secondary/Muted otherwise).
-// Unselected active agents use AgentActive; unselected inactive use AgentInactive.
-func agentNameStyle(active, selected, focused bool, th *theme.Theme) lipgloss.Style {
+// Selected: AgentActive (green bold). Unselected: AgentInactive (muted).
+func agentNameStyle(selected bool, th *theme.Theme) lipgloss.Style {
 	if selected {
-		color := agentSelectionColor(th)
-		return lipgloss.NewStyle().Foreground(color).Bold(true)
-	}
-	if active {
 		return th.AgentActive
 	}
 	return th.AgentInactive
 }
 
-// agentSelectionColor returns the foreground color for a selected agent.
-// Selected agents always use Success (green) regardless of focus state.
-func agentSelectionColor(th *theme.Theme) lipgloss.Color {
-	return th.Palette.Success
-}
-
 // selectIndicator returns the visual indicator for selection state.
-// When selected and focused, uses Primary color. When selected but unfocused, uses Muted.
-func selectIndicator(selected, focused bool, th *theme.Theme) string {
+// Selected: green arrow. Unselected: space.
+func selectIndicator(selected bool, th *theme.Theme) string {
 	if selected {
-		color := th.Palette.Muted
-		if focused {
-			color = th.Palette.Secondary
-		}
-		return lipgloss.NewStyle().Foreground(color).Render(selectedIndicator)
+		return th.AgentActive.Render(selectedIndicator)
 	}
 	return unselectedIndicator
 }

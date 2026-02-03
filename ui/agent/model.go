@@ -353,8 +353,7 @@ func (m *Model) renderListView() string {
 			continue
 		}
 		selected := i == m.selected
-		active := agentID == m.activeID
-		lines = append(lines, RenderCard(*agent, m.width, m.theme, selected, m.focused, active))
+		lines = append(lines, RenderCard(*agent, m.width, m.theme, selected))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -373,8 +372,7 @@ func (m *Model) renderExpandedView() string {
 		return ""
 	}
 
-	active := m.expanded == m.activeID
-	card := RenderCard(*agent, m.width, m.theme, true, m.focused, active)
+	card := RenderCard(*agent, m.width, m.theme, true)
 
 	var evts []AgentEvent
 	if stream, ok := m.streams[m.expanded]; ok {
