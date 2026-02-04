@@ -24,6 +24,8 @@ type Palette struct {
 	// UI elements
 	Border       lipgloss.Color
 	BorderActive lipgloss.Color
+	Highlight    lipgloss.Color // Subtle background for transient highlights.
+	Selection    lipgloss.Color // Background for persistent entry selection.
 
 	// Agent-specific (indexed by type hash for consistency)
 	AgentColors []lipgloss.Color
@@ -47,6 +49,8 @@ var DarkPalette = Palette{
 
 	Border:       lipgloss.Color("#45475a"),
 	BorderActive: lipgloss.Color("#89b4fa"),
+	Highlight:    lipgloss.Color("#45475a"), // surface1 – prominent transient copy feedback
+	Selection:    lipgloss.Color("#313244"), // surface0 – subtle persistent selection
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#89b4fa"), // blue - engineer
@@ -80,6 +84,8 @@ var LightPalette = Palette{
 
 	Border:       lipgloss.Color("#bcc0cc"),
 	BorderActive: lipgloss.Color("#1e66f5"),
+	Highlight:    lipgloss.Color("#dce0e8"), // crust – prominent transient copy feedback
+	Selection:    lipgloss.Color("#e6e9ef"), // mantle – subtle persistent selection
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#1e66f5"), // blue

@@ -75,17 +75,43 @@ var eventTypeToStatus = map[events.EventType]AgentStatus{
 	events.EventTypeFailure:       StatusError,
 }
 
-// keyActions maps key strings to handler methods for focused keyboard input.
+// viewState represents which view the agent panel is currently showing.
+type viewState int
+
+const (
+	viewList        viewState = iota // Agent list with cards.
+	viewExpanded                     // Expanded agent with navigable event list.
+	viewEventDetail                  // Full content view of a single event.
+)
+
+// keyAction is a handler for a single key press in a specific view state.
 type keyAction func(m *Model) tea.Cmd
 
-func keyActionTable() map[string]keyAction {
-	return map[string]keyAction{
-		"j":     func(m *Model) tea.Cmd { m.moveSelection(1); return nil },
-		"down":  func(m *Model) tea.Cmd { m.moveSelection(1); return nil },
-		"k":     func(m *Model) tea.Cmd { m.moveSelection(-1); return nil },
-		"up":    func(m *Model) tea.Cmd { m.moveSelection(-1); return nil },
-		"enter": func(m *Model) tea.Cmd { m.toggleExpand(); return nil },
-		"esc":   func(m *Model) tea.Cmd { m.collapse(); return nil },
+// viewKeyActions maps view states to their key action tables.
+func viewKeyActions() map[viewState]map[string]keyAction {
+	return map[viewState]map[string]keyAction{
+		viewList: {
+			"j":     func(m *Model) tea.Cmd { m.moveSelection(1); return nil },
+			"down":  func(m *Model) tea.Cmd { m.moveSelection(1); return nil },
+			"k":     func(m *Model) tea.Cmd { m.moveSelection(-1); return nil },
+			"up":    func(m *Model) tea.Cmd { m.moveSelection(-1); return nil },
+			"enter": func(m *Model) tea.Cmd { m.enterExpanded(); return nil },
+		},
+		viewExpanded: {
+			"j":     func(m *Model) tea.Cmd { m.moveEventSelection(1); return nil },
+			"down":  func(m *Model) tea.Cmd { m.moveEventSelection(1); return nil },
+			"k":     func(m *Model) tea.Cmd { m.moveEventSelection(-1); return nil },
+			"up":    func(m *Model) tea.Cmd { m.moveEventSelection(-1); return nil },
+			"enter": func(m *Model) tea.Cmd { m.enterEventDetail(); return nil },
+			"esc":   func(m *Model) tea.Cmd { m.exitExpanded(); return nil },
+		},
+		viewEventDetail: {
+			"j":     func(m *Model) tea.Cmd { m.scrollDetail(1); return nil },
+			"down":  func(m *Model) tea.Cmd { m.scrollDetail(1); return nil },
+			"k":     func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
+			"up":    func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
+			"esc":   func(m *Model) tea.Cmd { m.exitEventDetail(); return nil },
+		},
 	}
 }
 
@@ -102,10 +128,13 @@ var activeEventTypes = map[events.EventType]bool{
 type Model struct {
 	agents    map[string]*AgentState
 	streams   map[string]*AgentEventStream
-	order     []string // Agent IDs in insertion order (bounded by maxAgentOrder).
-	activeID  string   // Agent ID of the currently active agent.
-	selected  int      // Index into order for keyboard navigation.
-	expanded  string   // Agent ID of the expanded detail view ("" if none).
+	order     []string  // Agent IDs in insertion order (bounded by maxAgentOrder).
+	activeID  string    // Agent ID of the currently active agent.
+	selected  int       // Index into order for list view navigation.
+	expanded  string    // Agent ID of the expanded detail view ("" if none).
+	view      viewState // Current view state.
+	eventSel  int       // Selected event index in expanded view (logical, 0=oldest, -1=tail-follow).
+	scrollOff int       // Scroll offset for event detail view.
 	theme     *theme.Theme
 	width     int
 	height    int
@@ -122,10 +151,12 @@ var (
 // New creates an agent panel Model with the given theme.
 func New(th *theme.Theme) *Model {
 	return &Model{
-		agents:  make(map[string]*AgentState, maxAgents),
-		streams: make(map[string]*AgentEventStream, maxAgents),
-		order:   make([]string, 0, maxAgentOrder),
-		theme:   th,
+		agents:   make(map[string]*AgentState, maxAgents),
+		streams:  make(map[string]*AgentEventStream, maxAgents),
+		order:    make([]string, 0, maxAgentOrder),
+		theme:    th,
+		view:     viewList,
+		eventSel: -1,
 	}
 }
 
@@ -150,12 +181,17 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	}
 }
 
-// View renders the agent panel.
+// View renders the agent panel based on the current view state.
 func (m *Model) View() string {
-	if m.expanded != "" {
-		return m.renderExpandedView()
+	renderers := map[viewState]func() string{
+		viewList:        m.renderListView,
+		viewExpanded:    m.renderExpandedView,
+		viewEventDetail: m.renderEventDetailView,
 	}
-	return m.renderListView()
+	if render, ok := renderers[m.view]; ok {
+		return render()
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -265,11 +301,15 @@ func (m *Model) updateAgentMetadata(agent *AgentState, ev msg.ActivityEventMsg) 
 }
 
 // pushAgentEvent appends the activity event to the agent's event stream.
+// When the expanded agent's stream evicts its oldest entry, the event
+// selection index is decremented to keep the cursor on the same event.
 func (m *Model) pushAgentEvent(agentID string, ev msg.ActivityEventMsg) {
 	stream, ok := m.streams[agentID]
 	if !ok {
 		return
 	}
+
+	willEvict := stream.Full()
 
 	stream.Push(AgentEvent{
 		Timestamp: ev.Event.Timestamp,
@@ -277,17 +317,24 @@ func (m *Model) pushAgentEvent(agentID string, ev msg.ActivityEventMsg) {
 		Content:   ev.Event.Content,
 		Outcome:   ev.Event.Outcome,
 	})
+
+	if agentID == m.expanded && willEvict && m.eventSel >= 0 {
+		m.eventSel = max(m.eventSel-1, 0)
+	}
 }
 
 // handleKey processes keyboard input when the panel is focused.
+// Key dispatch is driven by the current view state.
 func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 	if !m.focused {
 		return nil
 	}
 
-	actions := keyActionTable()
-	if action, ok := actions[key.String()]; ok {
-		return action(m)
+	tables := viewKeyActions()
+	if actions, ok := tables[m.view]; ok {
+		if action, ok := actions[key.String()]; ok {
+			return action(m)
+		}
 	}
 	return nil
 }
@@ -296,17 +343,23 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // Navigation
 // ---------------------------------------------------------------------------
 
-// CyclePrev moves the agent selection cursor backward.
+// CyclePrev moves the agent selection cursor backward (list view only).
 func (m *Model) CyclePrev() {
+	if m.view != viewList {
+		return
+	}
 	m.moveSelection(-1)
 }
 
-// CycleNext moves the agent selection cursor forward.
+// CycleNext moves the agent selection cursor forward (list view only).
 func (m *Model) CycleNext() {
+	if m.view != viewList {
+		return
+	}
 	m.moveSelection(1)
 }
 
-// moveSelection moves the selection cursor by delta (positive = down, negative = up).
+// moveSelection moves the agent selection cursor by delta.
 func (m *Model) moveSelection(delta int) {
 	count := len(m.order)
 	if count == 0 {
@@ -315,22 +368,61 @@ func (m *Model) moveSelection(delta int) {
 	m.selected = clampIndex(m.selected+delta, count)
 }
 
-// toggleExpand expands the selected agent or collapses if already expanded.
-func (m *Model) toggleExpand() {
+// enterExpanded transitions from list view to expanded view for the selected agent.
+func (m *Model) enterExpanded() {
 	if len(m.order) == 0 {
 		return
 	}
-	agentID := m.order[m.selected]
-	if m.expanded == agentID {
-		m.expanded = ""
-		return
-	}
-	m.expanded = agentID
+	m.expanded = m.order[m.selected]
+	m.view = viewExpanded
+	m.eventSel = -1
+	m.scrollOff = 0
 }
 
-// collapse closes the detail view.
-func (m *Model) collapse() {
+// exitExpanded returns from expanded view to list view.
+func (m *Model) exitExpanded() {
 	m.expanded = ""
+	m.view = viewList
+	m.eventSel = -1
+	m.scrollOff = 0
+}
+
+// enterEventDetail opens the full content view for the selected event.
+func (m *Model) enterEventDetail() {
+	if m.eventSel < 0 {
+		return
+	}
+	m.view = viewEventDetail
+	m.scrollOff = 0
+}
+
+// exitEventDetail returns to the expanded event list.
+func (m *Model) exitEventDetail() {
+	m.view = viewExpanded
+	m.scrollOff = 0
+}
+
+// moveEventSelection moves the event cursor by delta within the expanded view.
+// When eventSel is -1 (tail-follow), the first navigation selects the newest event.
+func (m *Model) moveEventSelection(delta int) {
+	stream, ok := m.streams[m.expanded]
+	if !ok {
+		return
+	}
+	count := stream.Len()
+	if count == 0 {
+		return
+	}
+	if m.eventSel < 0 {
+		m.eventSel = count - 1
+		return
+	}
+	m.eventSel = clampIndex(m.eventSel+delta, count)
+}
+
+// scrollDetail scrolls the event detail content by delta lines.
+func (m *Model) scrollDetail(delta int) {
+	m.scrollOff = max(m.scrollOff+delta, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,34 +430,40 @@ func (m *Model) collapse() {
 // ---------------------------------------------------------------------------
 
 // renderListView renders the compact list of agent cards.
+// Selected cards occupy selectedCardLines; unselected occupy unselectedCardLines.
 func (m *Model) renderListView() string {
 	if len(m.order) == 0 {
 		return ""
 	}
 
-	lines := make([]string, 0, min(len(m.order), m.height))
+	cards := make([]string, 0, min(len(m.order), m.height))
+	var consumedLines int
 	for i, agentID := range m.order {
-		if len(lines) >= m.height {
+		selected := i == m.selected
+		needed := cardLineCount(selected)
+		if consumedLines+needed > m.height {
 			break
 		}
 		agent, ok := m.agents[agentID]
 		if !ok {
 			continue
 		}
-		selected := i == m.selected
-		lines = append(lines, RenderCard(*agent, m.width, m.theme, selected))
+		cards = append(cards, RenderCard(*agent, m.width, m.theme, selected))
+		consumedLines += needed
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(cards, "\n")
 }
 
-// expandedCardOverhead is the number of lines consumed by the card and separator
-// in the expanded view.
-// Derived from: 1 (card) + 1 (separator) = 2.
-const expandedCardOverhead = 2
+// expandedSeparatorLines is the separator between the card and event stream.
+const expandedSeparatorLines = 1
 
-// renderExpandedView renders the detail view for the expanded agent.
-// The selected agent card stays visible at the top, followed by a separator
-// and the event stream below.
+// expandedCardOverhead is the total lines consumed by the card and separator
+// in the expanded view.
+// Derived from: selectedCardLines(1) + expandedSeparatorLines(1) = 2.
+const expandedCardOverhead = selectedCardLines + expandedSeparatorLines
+
+// renderExpandedView renders the expanded agent with navigable event entries.
+// Layout: card header + separator + selectable 2-line event entries.
 func (m *Model) renderExpandedView() string {
 	agent, ok := m.agents[m.expanded]
 	if !ok {
@@ -373,17 +471,47 @@ func (m *Model) renderExpandedView() string {
 	}
 
 	card := RenderCard(*agent, m.width, m.theme, true)
+	separator := renderDetailSeparator(m.width, m.theme)
 
 	var evts []AgentEvent
 	if stream, ok := m.streams[m.expanded]; ok {
-		evts = stream.Last(m.height)
+		evts = stream.Last(stream.Len())
 	}
 
-	separator := renderDetailSeparator(m.width, m.theme)
 	availableLines := m.height - expandedCardOverhead
-	eventContent := renderEventLines(evts, m.width, availableLines, m.theme)
+	eventContent := renderEventEntries(evts, m.width, availableLines, m.eventSel, m.theme)
 
 	return card + "\n" + separator + "\n" + eventContent
+}
+
+// detailViewOverhead is the lines consumed by the card and separator
+// in the event detail view. Same as expandedCardOverhead.
+const detailViewOverhead = expandedCardOverhead
+
+// renderEventDetailView renders the full content of the selected event.
+// Layout: card header + separator + word-wrapped event content.
+func (m *Model) renderEventDetailView() string {
+	stream, ok := m.streams[m.expanded]
+	if !ok {
+		return ""
+	}
+	ev, ok := stream.Get(m.eventSel)
+	if !ok {
+		return ""
+	}
+
+	agent, ok := m.agents[m.expanded]
+	if !ok {
+		return ""
+	}
+
+	card := RenderCard(*agent, m.width, m.theme, true)
+	separator := renderDetailSeparator(m.width, m.theme)
+
+	availableLines := m.height - detailViewOverhead
+	detail := renderEventDetailContent(ev, m.width, availableLines, m.scrollOff, m.theme)
+
+	return card + "\n" + separator + "\n" + detail
 }
 
 // ---------------------------------------------------------------------------

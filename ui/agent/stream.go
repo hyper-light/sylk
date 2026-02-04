@@ -96,6 +96,24 @@ func (s *AgentEventStream) Last(n int) []AgentEvent {
 	return result
 }
 
+// Get returns a copy of the event at the given logical index (0 = oldest).
+// Returns the event and true if the index is valid, or a zero value and false otherwise.
+func (s *AgentEventStream) Get(index int) (AgentEvent, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if index < 0 || index >= s.count {
+		return AgentEvent{}, false
+	}
+	return s.events[s.logicalToPhysical(index)], true
+}
+
+// Full reports whether the ring buffer is at capacity and will evict on the next Push.
+func (s *AgentEventStream) Full() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.count == s.capacity
+}
+
 // logicalToPhysical converts a logical index (0 = oldest) to a
 // physical ring buffer index. Caller must hold at least a read lock.
 func (s *AgentEventStream) logicalToPhysical(logical int) int {

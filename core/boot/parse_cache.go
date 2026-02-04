@@ -3,6 +3,7 @@ package boot
 import (
 	"encoding/gob"
 	"encoding/hex"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -137,22 +138,30 @@ func (pc *ParseCache) loadUnlocked(contentHash [32]byte) *cacheEntry {
 // storeUnlocked writes a cache entry to disk. Caller must hold the shard lock.
 func (pc *ParseCache) storeUnlocked(contentHash [32]byte, entry *cacheEntry) {
 	path := pc.entryPath(contentHash)
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		log.Printf("[parse-cache] mkdir %s: %v", filepath.Dir(path), err)
+		return
+	}
 
 	// Write to temp file then rename for atomic replacement.
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
+		log.Printf("[parse-cache] create %s: %v", tmp, err)
 		return
 	}
 
 	if err := gob.NewEncoder(f).Encode(entry); err != nil {
 		f.Close()
 		os.Remove(tmp)
+		log.Printf("[parse-cache] encode %s: %v", tmp, err)
 		return
 	}
 	f.Close()
-	os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		log.Printf("[parse-cache] rename %s → %s: %v", tmp, path, err)
+	}
 }
 
 // entryPath returns the file path for a content hash.

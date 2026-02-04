@@ -15,6 +15,10 @@ import (
 // separatorChar is the visual delimiter between status bar sections.
 const separatorChar = " | "
 
+// flashDurationTicks is how many ticks a flash message persists.
+// Derived from: 2 seconds at 16ms per tick ≈ 125 ticks.
+const flashDurationTicks = 125
+
 // droppedWarningPrefix is prepended to the dropped event count indicator.
 const droppedWarningPrefix = "dropped:"
 
@@ -35,6 +39,10 @@ type Model struct {
 	spinner       *Spinner
 	spinnerActive bool
 	statusText    string
+
+	// Flash overlay
+	flash      string
+	flashTicks int
 
 	// Right section
 	tokens        *TokenDisplay
@@ -107,11 +115,24 @@ func (m *Model) SetSize(width, _ int) {
 	m.width = width
 }
 
+// SetFlash displays a temporary message in the center section.
+// The flash auto-clears after flashDurationTicks.
+func (m *Model) SetFlash(text string) {
+	m.flash = text
+	m.flashTicks = flashDurationTicks
+}
+
 // -- Message handlers -------------------------------------------------------
 
 func (m *Model) handleTick() (tea.Model, tea.Cmd) {
 	if m.spinnerActive {
 		m.spinner.Tick()
+	}
+	if m.flashTicks > 0 {
+		m.flashTicks--
+		if m.flashTicks == 0 {
+			m.flash = ""
+		}
 	}
 	return m, nil
 }
@@ -159,6 +180,9 @@ func (m *Model) renderLeft() string {
 }
 
 func (m *Model) renderCenter() string {
+	if m.flash != "" {
+		return m.theme.StatusNormal.Render(m.flash)
+	}
 	if m.spinnerActive {
 		return m.theme.StatusBar.Render(m.spinner.Current())
 	}

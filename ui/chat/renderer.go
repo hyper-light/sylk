@@ -43,13 +43,18 @@ func sourceLabel(source ChatSource) string {
 // (icon + space + label + space + timestamp).
 const badgeTimestampFormat = "15:04:05"
 
+// headerLines is the number of lines the entry header occupies.
+// Derived from: badge + timestamp = 1 line.
+const headerLines = 1
+
 // RenderEntry renders a ChatEntry into a slice of display lines that
 // fit within the given width. Lines are word-wrapped. The theme controls
 // colors and styling. Code fence blocks (``` ... ```) are rendered with
-// a subtle background.
-func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) []string {
+// a subtle background. Returns the rendered lines and any code block regions
+// (with line indices relative to the returned slice).
+func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []CodeRegion) {
 	if width <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	badge := renderBadge(entry, th)
@@ -57,14 +62,20 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) []string {
 	header := badge + " " + lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(timestamp)
 
 	bodyStyle := messageStyle(entry.Source, th)
-	contentLines := renderContent(entry.Content, width, bodyStyle, th)
+	contentLines, codeRegions := renderContent(entry.Content, width, bodyStyle, th)
 
 	// Pre-allocate: 1 header + content lines + 1 trailing spacer.
 	lines := make([]string, 0, 2+len(contentLines))
 	lines = append(lines, header)
 	lines = append(lines, contentLines...)
 	lines = append(lines, "")
-	return lines
+
+	// Offset code region indices to account for the header line.
+	for i := range codeRegions {
+		codeRegions[i].Start += headerLines
+		codeRegions[i].End += headerLines
+	}
+	return lines, codeRegions
 }
 
 // renderBadge produces the styled icon + label string for the entry header.
@@ -130,12 +141,14 @@ func normalizeLang(tag string) string {
 
 // renderContent splits raw content into styled, word-wrapped lines.
 // Code fences (``` blocks) are syntax-highlighted with line numbers; prose is word-wrapped.
-func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme) []string {
+// Returns the rendered lines and code block regions (indices relative to the returned slice).
+func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme) ([]string, []CodeRegion) {
 	if width <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	var result []string
+	var regions []CodeRegion
 	var codeBuffer []string
 	var codeLang string
 	inCode := false
@@ -146,7 +159,13 @@ func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme)
 				codeLang = normalizeLang(strings.TrimPrefix(line, "```"))
 				inCode = true
 			} else {
+				codeStart := len(result)
 				result = append(result, renderCodeBlock(codeBuffer, codeLang, width, th)...)
+				regions = append(regions, CodeRegion{
+					Start:   codeStart,
+					End:     len(result),
+					Content: strings.Join(codeBuffer, "\n"),
+				})
 				codeBuffer = nil
 				codeLang = ""
 				inCode = false
@@ -162,10 +181,16 @@ func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme)
 
 	// Flush unclosed fence as highlighted code.
 	if inCode && len(codeBuffer) > 0 {
+		codeStart := len(result)
 		result = append(result, renderCodeBlock(codeBuffer, codeLang, width, th)...)
+		regions = append(regions, CodeRegion{
+			Start:   codeStart,
+			End:     len(result),
+			Content: strings.Join(codeBuffer, "\n"),
+		})
 	}
 
-	return result
+	return result, regions
 }
 
 // gutterSep is the separator between line numbers and code content.

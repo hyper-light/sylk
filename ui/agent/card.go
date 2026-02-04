@@ -8,11 +8,16 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Agent dot glyphs. Selected agents use a filled dot; unselected use an outline.
-const (
-	agentDotFilled  = "●" // U+25CF BLACK CIRCLE
-	agentDotOutline = "○" // U+25CB WHITE CIRCLE
-)
+// statusIcons maps AgentStatus to its display glyph from theme/icons.go.
+var statusIcons = map[AgentStatus]string{
+	StatusIdle:     theme.IconIdle,
+	StatusThinking: theme.IconThinking,
+	StatusActing:   theme.IconActing,
+	StatusError:    theme.IconError,
+	StatusSuccess:  theme.IconSuccess,
+	StatusHandoff:  theme.IconHandoff,
+	StatusWaiting:  theme.IconWaiting,
+}
 
 // selectedIndicator is the left-side marker for the currently selected card.
 const selectedIndicator = theme.IconExpand
@@ -24,16 +29,45 @@ const unselectedIndicator = " "
 // Derived from: len(selectedIndicator) + 1 space.
 const cardPadding = 2
 
+// iconWidth is the column width of the agent dot glyph.
+const iconWidth = 1
 
 // contextBarWidth is the fixed width for the context usage percentage.
 // Derived from: 3 digits + "%" = 4 characters.
 const contextBarWidth = 4
 
-// RenderCard renders a compact one-line agent card.
-// It shows: [indicator] [status icon] [agent name] [task summary...] [context %]
-// The selected agent uses Success (green) styling; all others use Muted.
+// selectedCardLines is the number of terminal lines a selected card occupies.
+const selectedCardLines = 1
+
+// unselectedCardLines is the number of terminal lines an unselected card occupies.
+const unselectedCardLines = 1
+
+// RenderCard renders a single-line agent card.
+// Layout: [indicator] [status-icon] [name] [summary-truncated] [context%]
 func RenderCard(agent AgentState, width int, th *theme.Theme, selected bool) string {
-	icon := agentStyledDot(selected, th)
+	if selected {
+		return renderSelectedCard(agent, width, th)
+	}
+	return renderCompactCard(agent, width, th)
+}
+
+// cardLineCount returns the number of terminal lines a card occupies.
+func cardLineCount(selected bool) int {
+	if selected {
+		return selectedCardLines
+	}
+	return unselectedCardLines
+}
+
+// renderCompactCard renders a single-line card.
+// Layout: [indicator] [icon] [name] [truncated summary...] [context %]
+func renderCompactCard(agent AgentState, width int, th *theme.Theme) string {
+	return renderCardLine(agent, width, th, false)
+}
+
+// renderCardLine renders the one-line card layout with configurable selection styling.
+func renderCardLine(agent AgentState, width int, th *theme.Theme, selected bool) string {
+	icon := agentStatusDot(agent.Status, selected, th)
 	indicator := selectIndicator(selected, th)
 
 	nameStyle := agentNameStyle(selected, th)
@@ -44,8 +78,7 @@ func RenderCard(agent AgentState, width int, th *theme.Theme, selected bool) str
 
 	// Calculate available space for the task summary.
 	// Layout: [indicator space] [icon space] [name space] [summary] [ context%]
-	// Fixed overhead: cardPadding + icon(1) + space(1) + space(1) + contextBarWidth + space(1)
-	iconWidth := 1
+	// Fixed overhead: cardPadding + iconWidth + space(1) + space(1) + contextBarWidth + space(1)
 	separators := 3 // spaces between icon/name, name/summary, summary/context
 	fixedWidth := cardPadding + iconWidth + nameLen + separators + contextBarWidth
 	summaryWidth := width - fixedWidth
@@ -61,13 +94,40 @@ func RenderCard(agent AgentState, width int, th *theme.Theme, selected bool) str
 		indicator, icon, name, summary, contextStr)
 }
 
-// agentStyledDot renders the agent dot.
-// Selected: filled dot in Success (green). Unselected: outline dot in Muted.
-func agentStyledDot(selected bool, th *theme.Theme) string {
-	if selected {
-		return th.AgentActive.Render(agentDotFilled)
+// renderSelectedCard renders a two-line card for the selected agent.
+// Line 1: [indicator] [icon] [name] [truncated summary] [context %]
+// Line 2: [indent] [full task summary]
+func renderSelectedCard(agent AgentState, width int, th *theme.Theme) string {
+	return renderCardLine(agent, width, th, true)
+}
+
+// statusColors maps AgentStatus to a palette color accessor.
+var statusColors = map[AgentStatus]func(*theme.Theme) lipgloss.Color{
+	StatusIdle:     func(th *theme.Theme) lipgloss.Color { return th.Palette.Muted },
+	StatusThinking: func(th *theme.Theme) lipgloss.Color { return th.Palette.Info },
+	StatusActing:   func(th *theme.Theme) lipgloss.Color { return th.Palette.Success },
+	StatusError:    func(th *theme.Theme) lipgloss.Color { return th.Palette.Error },
+	StatusSuccess:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Success },
+	StatusHandoff:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Warning },
+	StatusWaiting:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Muted },
+}
+
+// agentStatusDot renders a status icon reflecting the agent's operational state.
+// The icon shape conveys status; the color conveys selection.
+// Selected agents use AgentActive (green+bold); unselected use status-based colors.
+func agentStatusDot(status AgentStatus, selected bool, th *theme.Theme) string {
+	icon := statusIcons[status]
+	if icon == "" {
+		icon = theme.IconIdle
 	}
-	return th.AgentInactive.Render(agentDotOutline)
+	if selected {
+		return th.AgentActive.Render(icon)
+	}
+	colorFn := statusColors[status]
+	if colorFn == nil {
+		colorFn = func(th *theme.Theme) lipgloss.Color { return th.Palette.Muted }
+	}
+	return lipgloss.NewStyle().Foreground(colorFn(th)).Render(icon)
 }
 
 // agentNameStyle returns the style for an agent name.

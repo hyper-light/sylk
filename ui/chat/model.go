@@ -10,6 +10,10 @@ import (
 	"github.com/google/uuid"
 )
 
+// highlightDurationTicks is how many ticks a copied-entry highlight persists.
+// Derived from: 2 seconds at 16ms per tick ≈ 125 ticks.
+const highlightDurationTicks = 125
+
 // Model is the Bubble Tea model for the chat panel.
 // It displays a scrollable history of chat entries with virtual scrolling,
 // supports LLM streaming, and handles keyboard navigation.
@@ -21,6 +25,10 @@ type Model struct {
 	width       int
 	height      int
 	focused     bool
+
+	// Transient highlight for copy feedback.
+	highlightID    string
+	highlightTicks int
 }
 
 // Verify interface compliance at compile time.
@@ -53,6 +61,10 @@ func (m *Model) Init() tea.Cmd {
 // Update processes incoming messages and returns the updated component.
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
+	case msg.TickMsg:
+		m.tickHighlight()
+		m.viewport.TickEdgeFlash()
+		return m, nil
 	case msg.ActivityEventMsg:
 		return m, m.handleActivity(typed)
 	case msg.StreamStartMsg:
@@ -89,9 +101,12 @@ func (m *Model) Focused() bool {
 	return m.focused
 }
 
-// SetFocused sets the focus state.
+// SetFocused sets the focus state. Selection is cleared on blur.
 func (m *Model) SetFocused(focused bool) {
 	m.focused = focused
+	if !focused {
+		m.viewport.ClearSelection()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +152,12 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		Height:    -1,
 		Streaming: true,
 	}
+	willEvict := m.history.Full()
 	m.history.Push(entry)
 	m.viewport.OnNewEntry()
+	if willEvict {
+		m.viewport.AdjustSelectionForEviction()
+	}
 	idx := m.history.Len() - 1
 	m.accumulator = NewStreamAccumulator(idx)
 	return nil
@@ -187,14 +206,19 @@ func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 }
 
 // handleKey processes keyboard input when the chat panel is focused.
+// Arrow keys select entries; j/k scroll by line.
 func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 	if !m.focused {
 		return nil
 	}
 	switch key.String() {
-	case "up", "k":
+	case "up":
+		m.viewport.SelectUp()
+	case "down":
+		m.viewport.SelectDown()
+	case "k":
 		m.viewport.ScrollUp()
-	case "down", "j":
+	case "j":
 		m.viewport.ScrollDown()
 	case "pgup":
 		m.viewport.PageUp()
@@ -204,6 +228,8 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 		m.viewport.ToTop()
 	case "end":
 		m.viewport.ToBottom()
+	case "esc":
+		m.viewport.ClearSelection()
 	}
 	return nil
 }
@@ -213,9 +239,15 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 // PushEntry appends an entry and notifies the viewport.
+// If the ring buffer is full, the oldest entry is evicted and the
+// viewport selection index is adjusted to compensate.
 func (m *Model) PushEntry(entry *ChatEntry) {
+	willEvict := m.history.Full()
 	m.history.Push(entry)
 	m.viewport.OnNewEntry()
+	if willEvict {
+		m.viewport.AdjustSelectionForEviction()
+	}
 }
 
 // ScrollUp scrolls the chat viewport up by one entry.
@@ -226,6 +258,48 @@ func (m *Model) ScrollUp() {
 // ScrollDown scrolls the chat viewport down by one entry.
 func (m *Model) ScrollDown() {
 	m.viewport.ScrollDown()
+}
+
+// EntryAtViewLine returns the chat entry visible at the given viewport-relative
+// line (0 = top visible line). Returns nil if out of bounds.
+func (m *Model) EntryAtViewLine(y int) *ChatEntry {
+	return m.viewport.EntryAtViewLine(y)
+}
+
+// CopyTargetAtViewLine resolves a viewport-relative line to a CopyTarget
+// describing what content to copy and what line range to highlight.
+func (m *Model) CopyTargetAtViewLine(y int) *CopyTarget {
+	return m.viewport.CopyTargetAtViewLine(y)
+}
+
+// SetHighlight marks an entry for transient visual highlight (copy feedback).
+// When the chat panel is focused, the selection is always moved to the copied
+// region so arrow keys continue from there after the highlight fades.
+// When unfocused, no selection is created.
+func (m *Model) SetHighlight(entryID string, entryIndex, start, end int) {
+	m.highlightID = entryID
+	m.highlightTicks = highlightDurationTicks
+	if m.focused {
+		m.viewport.SelectRegionContaining(entryIndex, start)
+	}
+	m.viewport.SetHighlight(entryID, start, end)
+}
+
+// tickHighlight decrements the highlight countdown and clears when expired.
+// The selection is only cleared alongside the highlight when the chat panel
+// is not focused; otherwise the selection persists for continued navigation.
+func (m *Model) tickHighlight() {
+	if m.highlightTicks <= 0 {
+		return
+	}
+	m.highlightTicks--
+	if m.highlightTicks == 0 {
+		m.highlightID = ""
+		m.viewport.SetHighlight("", 0, 0)
+		if !m.focused {
+			m.viewport.ClearSelection()
+		}
+	}
 }
 
 // syncAccumulatorToEntry writes the accumulated content back into the
@@ -243,6 +317,7 @@ func (m *Model) syncAccumulatorToEntry() {
 	physical := m.history.logicalToPhysical(idx)
 	m.history.entries[physical].Content = content
 	m.history.entries[physical].RenderedLines = nil
+	m.history.entries[physical].CodeRegions = nil
 	m.history.entries[physical].Height = -1
 }
 
@@ -261,6 +336,7 @@ func (m *Model) finalizeStream() {
 	m.history.entries[physical].Content = content
 	m.history.entries[physical].Streaming = false
 	m.history.entries[physical].RenderedLines = nil
+	m.history.entries[physical].CodeRegions = nil
 	m.history.entries[physical].Height = -1
 }
 

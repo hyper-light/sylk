@@ -412,21 +412,28 @@ var chordArrowDelta = map[string]int{
 	"alt+right": 1,
 }
 
-// chordLabel maps active chord state to a display label for the hint overlay.
-var chordLabel = map[chordState]string{
-	chordSession: "Session select",
-	chordAgent:   "Agent select",
+// chordDisplay holds the label and color for a chord hint overlay.
+type chordDisplay struct {
+	label string
+	color func(*theme.Palette) lipgloss.Color
+}
+
+// chordDisplays maps chord states to their display properties.
+// Session select uses Primary (blue), Agent select uses Success (green).
+var chordDisplays = map[chordState]chordDisplay{
+	chordSession: {"Session select", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
+	chordAgent:   {"Agent select", func(p *theme.Palette) lipgloss.Color { return p.Success }},
 }
 
 // chordHint returns a styled hint string when a chord is active, or "" when idle.
 func (m *AppModel) chordHint(th *theme.Theme) string {
-	label, ok := chordLabel[m.chord]
+	disp, ok := chordDisplays[m.chord]
 	if !ok {
 		return ""
 	}
-	labelStyle := lipgloss.NewStyle().Foreground(th.Palette.Secondary).Bold(true)
+	labelStyle := lipgloss.NewStyle().Foreground(disp.color(&th.Palette)).Bold(true)
 	keyStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	return labelStyle.Render(label) + keyStyle.Render("  ←/→ cycle  any key to exit ")
+	return labelStyle.Render(disp.label) + keyStyle.Render("  ←/→ cycle  any key to exit ")
 }
 
 // handleChord processes two-key chord shortcuts: Alt+S then Left/Right for sessions,
@@ -530,7 +537,7 @@ func (m *AppModel) handleChatClick(x, y int) tea.Cmd {
 		m.statusBar.SetFlash("Copy failed")
 		return nil
 	}
-	m.chat.SetHighlight(target.EntryID, target.HighlightStart, target.HighlightEnd)
+	m.chat.SetHighlight(target.EntryID, target.EntryIndex, target.HighlightStart, target.HighlightEnd)
 	m.statusBar.SetFlash("Copied!")
 	return nil
 }
@@ -711,7 +718,10 @@ func (m *AppModel) renderMainArea() string {
 		innerW := max(chatW-panelBorderSize, 1)
 		hintWidth := lipgloss.Width(hint)
 		pad := max(innerW-hintWidth, 0)
-		chatContent = strings.Repeat(" ", pad) + hint + "\n\n" + chatContent
+		divider := lipgloss.NewStyle().
+			Foreground(th.Palette.Border).
+			Render(strings.Repeat("\u2500", innerW))
+		chatContent = strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + chatContent
 	}
 	chatView := m.renderPanel(chatContent, component.FocusChat, th)
 

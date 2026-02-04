@@ -1,6 +1,7 @@
 package register
 
 import (
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -16,19 +17,22 @@ type ClipboardProvider interface {
 // clipboardEntry describes the OS commands used to interact with the
 // system clipboard on a specific platform.
 type clipboardEntry struct {
-	copyCmd  string
-	copyArgs []string
+	copyCmd   string
+	copyArgs  []string
 	pasteCmd  string
 	pasteArgs []string
+	envGuard  string // Environment variable that must be non-empty to use this entry.
 }
 
 // clipboardTable maps GOOS values to their clipboard commands.
+// Entries are probed in order; the first that passes both the envGuard
+// check and PATH lookup wins.
 var clipboardTable = map[string][]clipboardEntry{
 	"darwin": {
 		{copyCmd: "pbcopy", pasteCmd: "pbpaste"},
 	},
 	"linux": {
-		{copyCmd: "wl-copy", pasteCmd: "wl-paste"},
+		{copyCmd: "wl-copy", pasteCmd: "wl-paste", envGuard: "WAYLAND_DISPLAY"},
 		{copyCmd: "xclip", copyArgs: []string{"-selection", "clipboard"}, pasteCmd: "xclip", pasteArgs: []string{"-selection", "clipboard", "-o"}},
 		{copyCmd: "xsel", copyArgs: []string{"--clipboard", "--input"}, pasteCmd: "xsel", pasteArgs: []string{"--clipboard", "--output"}},
 	},
@@ -55,12 +59,16 @@ func NewOSClipboard() *OSClipboard {
 }
 
 // probeClipboard checks available clipboard commands for the current OS.
+// Entries with an envGuard are skipped when that environment variable is unset.
 func probeClipboard() *clipboardEntry {
 	entries, ok := clipboardTable[runtime.GOOS]
 	if !ok {
 		return nil
 	}
 	for i := range entries {
+		if entries[i].envGuard != "" && os.Getenv(entries[i].envGuard) == "" {
+			continue
+		}
 		if commandAvailable(entries[i].copyCmd) && commandAvailable(entries[i].pasteCmd) {
 			return &entries[i]
 		}

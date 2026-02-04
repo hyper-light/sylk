@@ -21,6 +21,14 @@ const (
 	SourceError
 )
 
+// CodeRegion describes a code block's position within a rendered entry.
+// Line indices are relative to the entry's RenderedLines slice.
+type CodeRegion struct {
+	Start   int    // First rendered line (inclusive).
+	End     int    // Last rendered line (exclusive).
+	Content string // Raw code without fence markers.
+}
+
 // ChatEntry represents a single message in the chat history.
 type ChatEntry struct {
 	ID            string
@@ -29,10 +37,11 @@ type ChatEntry struct {
 	AgentType     string
 	AgentID       string
 	SessionID     string
-	Content       string   // Raw content (markdown).
-	RenderedLines []string // Cached rendered output lines (lazily computed).
-	Height        int      // Cached line count (-1 means not yet computed).
-	Streaming     bool     // True while still receiving chunks.
+	Content       string       // Raw content (markdown).
+	RenderedLines []string     // Cached rendered output lines (lazily computed).
+	CodeRegions   []CodeRegion // Cached code block positions (lazily computed).
+	Height        int          // Cached line count (-1 means not yet computed).
+	Streaming     bool         // True while still receiving chunks.
 	Importance    float64
 }
 
@@ -134,7 +143,16 @@ func (h *History) InvalidateRender(index int) {
 	}
 	physical := h.logicalToPhysical(index)
 	h.entries[physical].RenderedLines = nil
+	h.entries[physical].CodeRegions = nil
 	h.entries[physical].Height = -1
+}
+
+// Full reports whether the ring buffer is at capacity.
+// The next Push will evict the oldest entry.
+func (h *History) Full() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.count == h.capacity
 }
 
 // logicalToPhysical converts a logical index (0 = oldest) to a physical

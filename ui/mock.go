@@ -225,6 +225,7 @@ func (m *MockAgent) emitActivity(
 func seedMockData(deps Deps) {
 	seedSessions(deps.SessionManager)
 	seedAgents(deps.ActivityBus)
+	seedAgentHistory(deps.ActivityBus)
 }
 
 // mockSessionConfig holds the parameters for a single mock session.
@@ -295,6 +296,103 @@ func seedAgents(bus *events.ActivityEventBus) {
 				"context_usage": 0.0,
 			},
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mock event history
+// ---------------------------------------------------------------------------
+
+// mockHistoryEvent describes a single event in a mock agent's history.
+type mockHistoryEvent struct {
+	eventType events.EventType
+	outcome   events.EventOutcome
+	content   string
+	usage     float64
+}
+
+// mockGuideHistory returns a realistic sequence of events for the Guide agent.
+func mockGuideHistory() []mockHistoryEvent {
+	return []mockHistoryEvent{
+		{events.EventTypeLLMRequest, events.OutcomePending, "Parsing user intent from prompt", 0.05},
+		{events.EventTypeLLMResponse, events.OutcomeSuccess, "Identified task: refactor authentication module", 0.08},
+		{events.EventTypeAgentDecision, events.OutcomePending, "Routing to Architect for structural analysis", 0.10},
+		{events.EventTypeAgentAction, events.OutcomePending, "Delegating subtask: review session middleware", 0.12},
+		{events.EventTypeToolCall, events.OutcomePending, "Reading file: core/auth/session.go", 0.15},
+		{events.EventTypeToolResult, events.OutcomeSuccess, "Loaded 247 lines from core/auth/session.go", 0.18},
+		{events.EventTypeToolCall, events.OutcomePending, "Reading file: core/auth/token.go", 0.20},
+		{events.EventTypeToolResult, events.OutcomeSuccess, "Loaded 183 lines from core/auth/token.go", 0.23},
+		{events.EventTypeLLMRequest, events.OutcomePending, "Analyzing session and token interdependencies", 0.28},
+		{events.EventTypeLLMResponse, events.OutcomeSuccess, "Found 3 circular imports between auth packages", 0.32},
+		{events.EventTypeAgentDecision, events.OutcomePending, "Planning refactor: extract shared types to auth/types.go", 0.35},
+		{events.EventTypeToolCall, events.OutcomePending, "Searching for usages of SessionToken across codebase", 0.38},
+		{events.EventTypeToolResult, events.OutcomeSuccess, "Found 14 references in 8 files", 0.40},
+		{events.EventTypeAgentAction, events.OutcomeSuccess, "Compiled dependency graph for auth subsystem", 0.42},
+		{events.EventTypeSuccess, events.OutcomeSuccess, "Analysis complete, ready for implementation", 0.45},
+	}
+}
+
+// mockArchitectHistory returns a realistic sequence of events for the Architect agent.
+func mockArchitectHistory() []mockHistoryEvent {
+	return []mockHistoryEvent{
+		{events.EventTypeLLMRequest, events.OutcomePending, "Evaluating architectural constraints for auth refactor", 0.05},
+		{events.EventTypeLLMResponse, events.OutcomeSuccess, "Identified layered architecture with 4 tiers", 0.10},
+		{events.EventTypeAgentDecision, events.OutcomePending, "Checking backward compatibility requirements", 0.12},
+		{events.EventTypeToolCall, events.OutcomePending, "Reading file: api/v2/handlers.go", 0.15},
+		{events.EventTypeToolResult, events.OutcomeSuccess, "Loaded 312 lines from api/v2/handlers.go", 0.18},
+		{events.EventTypeToolCall, events.OutcomePending, "Reading file: api/v2/middleware.go", 0.20},
+		{events.EventTypeToolResult, events.OutcomeSuccess, "Loaded 156 lines from api/v2/middleware.go", 0.22},
+		{events.EventTypeAgentDecision, events.OutcomePending, "Proposing interface extraction for auth providers", 0.25},
+		{events.EventTypeLLMRequest, events.OutcomePending, "Generating interface contract for AuthProvider", 0.28},
+		{events.EventTypeLLMResponse, events.OutcomeSuccess, "Drafted AuthProvider interface with 5 methods", 0.32},
+		{events.EventTypeToolCall, events.OutcomePending, "Validating proposed interface against existing implementations", 0.35},
+		{events.EventTypeToolResult, events.OutcomeSuccess, "3/4 implementations conform, 1 needs adapter", 0.38},
+		{events.EventTypeAgentAction, events.OutcomePending, "Designing adapter for legacy OAuth provider", 0.42},
+		{events.EventTypeToolCall, events.OutcomePending, "Writing file: core/auth/provider.go", 0.45},
+		{events.EventTypeToolResult, events.OutcomeSuccess, "Created provider interface definition (62 lines)", 0.48},
+		{events.EventTypeAgentError, events.OutcomeFailure, "Conflict detected: token refresh races with session expiry", 0.50},
+		{events.EventTypeLLMRequest, events.OutcomePending, "Analyzing race condition between refresh and expiry paths", 0.52},
+		{events.EventTypeLLMResponse, events.OutcomeSuccess, "Solution: introduce token lease with CAS update", 0.55},
+		{events.EventTypeAgentAction, events.OutcomeSuccess, "Revised design accounts for concurrent token operations", 0.58},
+		{events.EventTypeSuccess, events.OutcomeSuccess, "Architecture review complete, design approved", 0.60},
+	}
+}
+
+// mockEventInterval is the simulated time between mock history events.
+// Derived from: realistic agent activity at ~2 events/second.
+const mockEventInterval = 500 * time.Millisecond
+
+// seedAgentHistory populates each mock agent's event stream with a
+// realistic sequence of past events for testing the expanded view.
+func seedAgentHistory(bus *events.ActivityEventBus) {
+	type agentHistory struct {
+		seed   mockAgentSeed
+		events []mockHistoryEvent
+	}
+
+	histories := []agentHistory{
+		{mockAgentSeeds()[0], mockGuideHistory()},
+		{mockAgentSeeds()[1], mockArchitectHistory()},
+	}
+
+	baseTime := time.Now().Add(-time.Duration(20) * mockEventInterval)
+
+	for _, ah := range histories {
+		for i, evt := range ah.events {
+			bus.Publish(&events.ActivityEvent{
+				ID:        uuid.New().String(),
+				EventType: evt.eventType,
+				Timestamp: baseTime.Add(time.Duration(i) * mockEventInterval),
+				AgentID:   ah.seed.id,
+				Content:   evt.content,
+				Outcome:   evt.outcome,
+				Data: map[string]any{
+					"agent_type":    ah.seed.agentType,
+					"agent_name":    ah.seed.name,
+					"context_usage": evt.usage,
+				},
+			})
+		}
 	}
 }
 
