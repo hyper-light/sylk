@@ -250,15 +250,25 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 	}
 }
 
-// ScrollUp scrolls the chat viewport up by one entry.
-func (m *Model) ScrollUp() {
-	m.viewport.ScrollUp()
+// ScrollUp scrolls the chat viewport up by one line.
+// Returns true if the scroll was applied, false if at boundary.
+func (m *Model) ScrollUp() bool {
+	return m.viewport.ScrollUp()
 }
 
-// ScrollDown scrolls the chat viewport down by one entry.
-func (m *Model) ScrollDown() {
-	m.viewport.ScrollDown()
+// ScrollDown scrolls the chat viewport down by one line.
+// Returns true if the scroll was applied, false if at boundary.
+func (m *Model) ScrollDown() bool {
+	return m.viewport.ScrollDown()
 }
+
+// SetBounceOffset updates the visual bounce displacement for rendering.
+func (m *Model) SetBounceOffset(offset int) {
+	m.viewport.SetBounceOffset(offset)
+}
+
+// IsStreaming reports whether a response is currently being streamed.
+func (m *Model) IsStreaming() bool { return m.accumulator != nil }
 
 // EntryAtViewLine returns the chat entry visible at the given viewport-relative
 // line (0 = top visible line). Returns nil if out of bounds.

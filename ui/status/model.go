@@ -44,6 +44,9 @@ type Model struct {
 	flash      string
 	flashTicks int
 
+	// View ring indicator (pre-formatted by app, empty when no panels collapsed)
+	viewRingHint string
+
 	// Right section
 	tokens        *TokenDisplay
 	droppedEvents atomic.Int64
@@ -122,6 +125,12 @@ func (m *Model) SetFlash(text string) {
 	m.flashTicks = flashDurationTicks
 }
 
+// SetViewRingHint updates the pre-formatted ring indicator string.
+// Pass "" to clear the indicator when all panels are visible.
+func (m *Model) SetViewRingHint(hint string) {
+	m.viewRingHint = hint
+}
+
 // -- Message handlers -------------------------------------------------------
 
 func (m *Model) handleTick() (tea.Model, tea.Cmd) {
@@ -184,10 +193,17 @@ func (m *Model) renderCenter() string {
 		return m.theme.StatusNormal.Render(m.flash)
 	}
 	if m.spinnerActive {
-		return m.theme.StatusBar.Render(m.spinner.Current())
+		spinner := m.theme.StatusBar.Render(m.spinner.Current())
+		if m.viewRingHint != "" {
+			return spinner + " " + m.viewRingHint
+		}
+		return spinner
 	}
 	if m.statusText != "" {
 		return m.theme.StatusBar.Render(m.statusText)
+	}
+	if m.viewRingHint != "" {
+		return m.viewRingHint
 	}
 	return m.theme.StatusBar.Render("ready")
 }

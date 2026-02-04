@@ -7,6 +7,7 @@ type Palette struct {
 	// Base
 	Background lipgloss.Color
 	Foreground lipgloss.Color
+	Subtext    lipgloss.Color // Between Foreground and Muted; secondary content.
 	Muted      lipgloss.Color
 	Subtle     lipgloss.Color
 
@@ -35,6 +36,7 @@ type Palette struct {
 var DarkPalette = Palette{
 	Background: lipgloss.Color("#1e1e2e"),
 	Foreground: lipgloss.Color("#cdd6f4"),
+	Subtext:    lipgloss.Color("#a6adc8"),
 	Muted:      lipgloss.Color("#6c7086"),
 	Subtle:     lipgloss.Color("#45475a"),
 
@@ -70,6 +72,7 @@ var DarkPalette = Palette{
 var LightPalette = Palette{
 	Background: lipgloss.Color("#eff1f5"),
 	Foreground: lipgloss.Color("#4c4f69"),
+	Subtext:    lipgloss.Color("#6c6f85"),
 	Muted:      lipgloss.Color("#9ca0b0"),
 	Subtle:     lipgloss.Color("#bcc0cc"),
 

@@ -41,6 +41,7 @@ type Viewport struct {
 	selectedRegion  int    // Region index within the selected entry.
 	edgeFlash       int    // Edge flash direction: -1 = top, 0 = none, 1 = bottom.
 	edgeFlashTicks  int    // Remaining ticks for edge flash.
+	bounceOffset    int    // Visual line displacement from overscroll bounce.
 }
 
 // NewViewport creates a Viewport bound to the given History.
@@ -59,16 +60,22 @@ func (vp *Viewport) SetSize(width, height int) {
 	vp.viewHeight = max(height, 0)
 }
 
-// ScrollUp scrolls up by one line.
-func (vp *Viewport) ScrollUp() {
+// ScrollUp scrolls up by one line. Returns true if the scroll was applied,
+// false if already at the top boundary.
+func (vp *Viewport) ScrollUp() bool {
 	vp.following = false
+	prev := vp.scrollOff
 	vp.scrollOff = min(vp.scrollOff+1, vp.maxScrollOffset())
+	return vp.scrollOff != prev
 }
 
-// ScrollDown scrolls down by one line.
-func (vp *Viewport) ScrollDown() {
+// ScrollDown scrolls down by one line. Returns true if the scroll was applied,
+// false if already at the bottom boundary.
+func (vp *Viewport) ScrollDown() bool {
+	prev := vp.scrollOff
 	vp.scrollOff = max(vp.scrollOff-1, 0)
 	vp.following = vp.scrollOff == 0
+	return vp.scrollOff != prev
 }
 
 // pageOverlap is the number of lines retained between pages for context.
@@ -710,9 +717,16 @@ func (vp *Viewport) cacheRendered(index int, lines []string, regions []CodeRegio
 	vp.history.entries[physical].Height = len(lines)
 }
 
-// formatOutput trims or pads the collected lines to exactly viewHeight
-// and joins them with newlines.
+// SetBounceOffset updates the visual bounce displacement for rendering.
+func (vp *Viewport) SetBounceOffset(offset int) {
+	vp.bounceOffset = offset
+}
+
+// formatOutput applies the bounce offset, trims or pads the collected lines
+// to exactly viewHeight, and joins them with newlines.
 func (vp *Viewport) formatOutput(lines []string) string {
+	lines = applyBounceShift(lines, vp.bounceOffset, vp.viewHeight)
+
 	if len(lines) > vp.viewHeight {
 		lines = lines[:vp.viewHeight]
 	}
@@ -723,6 +737,36 @@ func (vp *Viewport) formatOutput(lines []string) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// applyBounceShift shifts the entire content block by the bounce offset,
+// simulating iOS rubber-band overscroll.
+// Positive offset (bottom boundary): content slides up as a whole block —
+// top lines scroll off-screen, empty space appears at the bottom.
+// Negative offset (top boundary): content slides down as a whole block —
+// empty space appears at the top, bottom lines fall off-screen.
+func applyBounceShift(lines []string, offset, viewHeight int) []string {
+	if offset == 0 || viewHeight <= 0 {
+		return lines
+	}
+
+	absOffset := offset
+	if absOffset < 0 {
+		absOffset = -absOffset
+	}
+	absOffset = min(absOffset, viewHeight)
+
+	if offset > 0 {
+		// Bouncing off bottom: content slides up. Top lines scroll off,
+		// remaining content moves up, empty space opens at the bottom.
+		shift := min(absOffset, len(lines))
+		return lines[shift:]
+	}
+
+	// Bouncing off top: content slides down. Empty space opens at
+	// the top, bottom lines fall off-screen (truncated by formatOutput).
+	pad := make([]string, absOffset, absOffset+len(lines))
+	return append(pad, lines...)
 }
 
 // totalLines returns the sum of all rendered entry heights.

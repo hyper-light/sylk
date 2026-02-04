@@ -23,6 +23,9 @@ type Config struct {
 	// Interrupt
 	InterruptThresholdMs int // Double Ctrl+C window in ms (default 500)
 
+	// Project root (git root, user-specified, or CWD). Set automatically if empty.
+	ProjectRoot string
+
 	// Mock mode
 	MockMode bool // Run with mock backend for testing (no real agents)
 }

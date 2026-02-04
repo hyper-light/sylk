@@ -9,46 +9,67 @@ const (
 	SingleColumn LayoutMode = iota
 	TwoColumn
 	ThreeColumn
+	FourColumn
 )
 
 // PanelSpec describes a panel's layout constraints.
 type PanelSpec struct {
-	ID       component.FocusID
-	MinWidth int
-	MinHeight int
-	FlexGrow float64
-	Visible  bool
+	ID            component.FocusID
+	MinWidth      int
+	MinHeight     int
+	FlexGrow      float64
+	CollapseWidth int // Allocated width below which the panel collapses.
+	Visible       bool
 }
 
 // PanelSizes holds computed widths for each column region and the shared height.
 type PanelSizes struct {
-	Left   int
-	Center int
-	Right  int
-	Height int
+	Left       int
+	CenterLeft int // FileTree column; 0 when mode < FourColumn.
+	Center     int
+	Right      int
+	Height     int
 }
 
-// modeForWidth determines layout mode from terminal width and the minimum
-// panel width. Breakpoints are derived: TwoColumn requires 2*minPanel,
-// ThreeColumn requires 3*minPanel.
-func modeForWidth(width, minPanel int) LayoutMode {
-	type breakpoint struct {
-		threshold int
-		mode      LayoutMode
-	}
+// ModeCandidate defines which panels occupy which columns for a given mode.
+// Candidates are evaluated from widest to narrowest; the first that fits wins.
+type ModeCandidate struct {
+	Mode    LayoutMode
+	Columns []component.FocusID
+}
 
-	breakpoints := []breakpoint{
-		{threshold: 3 * minPanel, mode: ThreeColumn},
-		{threshold: 2 * minPanel, mode: TwoColumn},
-	}
-
-	for _, bp := range breakpoints {
-		if width >= bp.threshold {
-			return bp.mode
+// modeForCandidates determines the layout mode by iterating candidates from
+// widest to narrowest. For each candidate it looks up the PanelSpec for every
+// column, distributes width via flex-grow, and checks collapse thresholds.
+func modeForCandidates(width int, candidates []ModeCandidate, index map[component.FocusID]PanelSpec) LayoutMode {
+	for _, c := range candidates {
+		specs := lookupSpecs(c.Columns, index)
+		widths := distributeWidth(width, len(specs), specs)
+		if panelsFitCollapse(specs, widths) {
+			return c.Mode
 		}
 	}
-
 	return SingleColumn
+}
+
+// lookupSpecs resolves column IDs to PanelSpecs via the index map.
+func lookupSpecs(columns []component.FocusID, index map[component.FocusID]PanelSpec) []PanelSpec {
+	specs := make([]PanelSpec, len(columns))
+	for i, id := range columns {
+		specs[i] = index[id]
+	}
+	return specs
+}
+
+// panelsFitCollapse returns true when every panel's allocated width meets
+// its CollapseWidth threshold. Panels with CollapseWidth <= 0 are unchecked.
+func panelsFitCollapse(panels []PanelSpec, widths []int) bool {
+	for i, p := range panels {
+		if p.CollapseWidth > 0 && i < len(widths) && widths[i] < p.CollapseWidth {
+			return false
+		}
+	}
+	return true
 }
 
 // visiblePanels returns the subset of panels where Visible is true.
@@ -71,6 +92,7 @@ func columnCount(mode LayoutMode, panelCount int) int {
 		SingleColumn: 1,
 		TwoColumn:    2,
 		ThreeColumn:  3,
+		FourColumn:   4,
 	}
 
 	cols := modeColumns[mode]
@@ -78,31 +100,63 @@ func columnCount(mode LayoutMode, panelCount int) int {
 	return min(cols, panelCount)
 }
 
-// computePanelSizes distributes available width across columns using
-// flex-grow weights from visible panels, and sets a uniform height.
-func computePanelSizes(width, height int, mode LayoutMode, panels []PanelSpec) PanelSizes {
-	visible := visiblePanels(panels)
-	cols := columnCount(mode, len(visible))
+// computePanelSizes distributes available width across columns for the active
+// mode candidate and sets a uniform height.
+func computePanelSizes(width, height int, mode LayoutMode, candidates []ModeCandidate, index map[component.FocusID]PanelSpec) PanelSizes {
+	columns := columnsForMode(mode, candidates)
+	cols := len(columns)
 
 	if cols == 0 {
 		return PanelSizes{Height: height}
 	}
 
-	widths := distributeWidth(width, cols, visible)
+	specs := lookupSpecs(columns, index)
+	widths := distributeWidth(width, cols, specs)
 
 	return PanelSizes{
-		Left:   widths[0],
-		Center: safeIndex(widths, 1),
-		Right:  safeIndex(widths, 2),
-		Height: height,
+		Left:       safeIndex(widths, 0),
+		CenterLeft: safeIndex(widths, 1),
+		Center:     safeIndex(widths, centerIndex(cols)),
+		Right:      safeIndex(widths, rightIndex(cols)),
+		Height:     height,
 	}
 }
 
+// centerIndex returns the width-array index for the Center column.
+// 1-col → 0 (reuse Left), 2-col → 1, 3-col → 1, 4-col → 2.
+func centerIndex(cols int) int {
+	switch cols {
+	case 4:
+		return 2
+	case 3:
+		return 1
+	case 2:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// rightIndex returns the width-array index for the Right column.
+// 1-col → 0, 2-col → 1, 3-col → 2, 4-col → 3.
+func rightIndex(cols int) int {
+	return max(cols-1, 0)
+}
+
+// columnsForMode finds the candidate matching the given mode.
+func columnsForMode(mode LayoutMode, candidates []ModeCandidate) []component.FocusID {
+	for _, c := range candidates {
+		if c.Mode == mode {
+			return c.Columns
+		}
+	}
+	return nil
+}
+
 // distributeWidth allocates width proportionally to flex-grow weights.
-// Each column is backed by one visible panel (by index). Panels beyond
-// the column count are folded into the last column's weight.
-func distributeWidth(width, cols int, visible []PanelSpec) []int {
-	weights := gatherWeights(cols, visible)
+// Each column maps to exactly one panel by index.
+func distributeWidth(width, cols int, panels []PanelSpec) []int {
+	weights := gatherWeights(cols, panels)
 	totalWeight := sumWeights(weights)
 
 	widths := make([]int, cols)
@@ -119,21 +173,18 @@ func distributeWidth(width, cols int, visible []PanelSpec) []int {
 	return widths
 }
 
-// gatherWeights collects flex-grow weights for each column. If there are
-// more visible panels than columns, extra panel weights are added to the
-// last column.
-func gatherWeights(cols int, visible []PanelSpec) []float64 {
+// gatherWeights collects flex-grow weights for each column. Each column
+// maps to exactly one panel; panels beyond the column count are ignored.
+func gatherWeights(cols int, panels []PanelSpec) []float64 {
 	weights := make([]float64, cols)
 	const defaultWeight = 1.0
 
-	for i, p := range visible {
-		w := p.FlexGrow
+	for i := range min(cols, len(panels)) {
+		w := panels[i].FlexGrow
 		if w <= 0 {
 			w = defaultWeight
 		}
-
-		idx := min(i, cols-1)
-		weights[idx] += w
+		weights[i] = w
 	}
 
 	return weights

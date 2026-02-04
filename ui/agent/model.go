@@ -182,6 +182,7 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 }
 
 // View renders the agent panel based on the current view state.
+// Output is always padded to exactly m.height lines for stable frame sizes.
 func (m *Model) View() string {
 	renderers := map[viewState]func() string{
 		viewList:        m.renderListView,
@@ -189,9 +190,9 @@ func (m *Model) View() string {
 		viewEventDetail: m.renderEventDetailView,
 	}
 	if render, ok := renderers[m.view]; ok {
-		return render()
+		return padToHeight(render(), m.height)
 	}
-	return ""
+	return padToHeight("", m.height)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +343,38 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // ---------------------------------------------------------------------------
 // Navigation
 // ---------------------------------------------------------------------------
+
+// ScrollUp scrolls the agent panel up by one step, respecting the current view state.
+// Returns true if scroll was consumed. List view returns false because mouse
+// scroll should not change agent selection.
+func (m *Model) ScrollUp() bool {
+	switch m.view {
+	case viewExpanded:
+		m.moveEventSelection(-1)
+		return true
+	case viewEventDetail:
+		m.scrollDetail(-1)
+		return true
+	default:
+		return false
+	}
+}
+
+// ScrollDown scrolls the agent panel down by one step, respecting the current view state.
+// Returns true if scroll was consumed. List view returns false because mouse
+// scroll should not change agent selection.
+func (m *Model) ScrollDown() bool {
+	switch m.view {
+	case viewExpanded:
+		m.moveEventSelection(1)
+		return true
+	case viewEventDetail:
+		m.scrollDetail(1)
+		return true
+	default:
+		return false
+	}
+}
 
 // CyclePrev moves the agent selection cursor backward (list view only).
 func (m *Model) CyclePrev() {
@@ -517,6 +550,21 @@ func (m *Model) renderEventDetailView() string {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// padToHeight ensures s contains exactly targetHeight lines by appending empty lines.
+func padToHeight(s string, targetHeight int) string {
+	if targetHeight <= 0 {
+		return s
+	}
+	if s == "" {
+		return strings.Repeat("\n", max(targetHeight-1, 0))
+	}
+	current := strings.Count(s, "\n") + 1
+	if current < targetHeight {
+		s += strings.Repeat("\n", targetHeight-current)
+	}
+	return s
+}
 
 // clampIndex constrains an index to [0, count-1].
 func clampIndex(idx, count int) int {

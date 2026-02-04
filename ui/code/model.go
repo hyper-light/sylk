@@ -3,7 +3,9 @@ package code
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -11,6 +13,47 @@ import (
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/theme"
 )
+
+// textSelection tracks a mouse-driven text selection in document coordinates.
+// Byte offsets are used for columns (matching HighlightRegion).
+type textSelection struct {
+	startLine int
+	startCol  int
+	endLine   int
+	endCol    int
+	dragging  bool // Mouse button is currently held.
+	set       bool // A selection has been established.
+}
+
+// active reports whether a non-empty selection exists.
+func (s textSelection) active() bool {
+	return s.set && (s.startLine != s.endLine || s.startCol != s.endCol)
+}
+
+// normalize returns selection bounds in forward order (start <= end).
+func (s textSelection) normalize() (sl, sc, el, ec int) {
+	if s.startLine < s.endLine || (s.startLine == s.endLine && s.startCol <= s.endCol) {
+		return s.startLine, s.startCol, s.endLine, s.endCol
+	}
+	return s.endLine, s.endCol, s.startLine, s.startCol
+}
+
+// colRange returns the selected byte range for a given line.
+// Returns (-1, -1) if the line has no selection.
+func (s textSelection) colRange(lineIdx, lineLen int) (int, int) {
+	sl, sc, el, ec := s.normalize()
+	if lineIdx < sl || lineIdx > el {
+		return -1, -1
+	}
+	start, end := 0, lineLen
+	if lineIdx == sl {
+		start = min(sc, lineLen)
+	}
+	if lineIdx == el {
+		end = min(ec, lineLen)
+	}
+	return start, end
+}
 
 // Model is the Bubble Tea model for the code viewer panel.
 // It displays source files with syntax highlighting, line numbers,
@@ -31,6 +74,8 @@ type Model struct {
 	highlighter      *Highlighter
 	showLineNumbers  bool
 	wordWrap         bool
+	bounceOffset     int           // Visual line displacement from overscroll bounce.
+	selection        textSelection // Mouse-driven text selection state.
 }
 
 // Compile-time interface checks.
@@ -52,12 +97,16 @@ func New(th *theme.Theme) *Model {
 // SetContent sets the source content, file path, and language, then
 // triggers a re-highlight of the content.
 func (m *Model) SetContent(content, filePath, language string) {
+	// Normalize line endings: \r\n → \n, stray \r → \n.
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
 	m.content = content
 	m.filePath = filePath
 	m.language = language
 	m.lines = strings.Split(content, "\n")
 	m.scrollOffset = 0
 	m.cursorLine = 0
+	m.selection = textSelection{}
 	m.reHighlight()
 }
 
@@ -100,13 +149,25 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 }
 
 // View renders the visible portion of the code with optional line numbers.
+// When a file is loaded, a header line showing the filename is prepended.
+// Output is always padded to exactly m.height lines for stable frame sizes.
 func (m *Model) View() string {
+	viewHeight := m.viewportHeight()
 	lineCount := len(m.lines)
-	if lineCount == 0 {
-		return ""
+
+	var header string
+	if m.filePath != "" {
+		header = m.renderFileHeader()
 	}
 
-	viewHeight := m.viewportHeight()
+	if lineCount == 0 {
+		code := padLines("", viewHeight)
+		if header != "" {
+			return header + "\n" + code
+		}
+		return code
+	}
+
 	visibleEnd := min(m.scrollOffset+viewHeight, lineCount)
 	visibleStart := m.scrollOffset
 
@@ -116,7 +177,7 @@ func (m *Model) View() string {
 
 	var b strings.Builder
 	// Pre-allocate: each line needs gutter + separator + content + newline.
-	b.Grow((gutterWidth + contentWidth + 2) * (visibleEnd - visibleStart))
+	b.Grow((gutterWidth + contentWidth + 2) * viewHeight)
 
 	for i := visibleStart; i < visibleEnd; i++ {
 		if i > visibleStart {
@@ -125,31 +186,117 @@ func (m *Model) View() string {
 		m.renderViewLine(&b, i, gutterWidth, contentWidth, gutterStyle)
 	}
 
-	return b.String()
+	code := padLines(applyCodeBounceShift(b.String(), m.bounceOffset, viewHeight), viewHeight)
+	if header != "" {
+		return header + "\n" + code
+	}
+	return code
 }
 
-// renderViewLine writes a single viewport line (gutter + content) to the builder.
+// renderFileHeader renders a header line: " filename.ext ──────────────".
+func (m *Model) renderFileHeader() string {
+	name := filepath.Base(m.filePath)
+	nameStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted).Bold(true)
+	lineStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
+
+	text := nameStyle.Render(" " + name + " ")
+	textWidth := lipgloss.Width(text)
+	lineWidth := max(m.width-textWidth, 0)
+
+	return text + lineStyle.Render(strings.Repeat("─", lineWidth))
+}
+
+// padLines ensures s contains exactly targetLines lines by appending empty lines.
+func padLines(s string, targetLines int) string {
+	if targetLines <= 0 {
+		return s
+	}
+	if s == "" {
+		return strings.Repeat("\n", max(targetLines-1, 0))
+	}
+	current := strings.Count(s, "\n") + 1
+	if current < targetLines {
+		s += strings.Repeat("\n", targetLines-current)
+	}
+	return s
+}
+
+// renderViewLine writes a single viewport line (gutter + content) to the builder,
+// padded or truncated to exactly m.width visual characters so that the border
+// wrapper sees consistent line widths regardless of wide-character content.
 func (m *Model) renderViewLine(b *strings.Builder, lineIdx, gutterWidth, contentWidth int, gutterStyle lipgloss.Style) {
+	var lb strings.Builder
+
 	if m.showLineNumbers {
-		// Line numbers are 1-based, right-aligned within the gutter.
 		numStr := fmt.Sprintf("%*d", gutterWidth, lineIdx+1)
-		b.WriteString(gutterStyle.Render(numStr))
-		b.WriteByte(' ')
+		lb.WriteString(gutterStyle.Render(numStr))
+		lb.WriteByte(' ')
 	}
 
 	styledLine := m.styledLine(lineIdx)
-	if m.wordWrap && contentWidth > 0 {
-		styledLine = truncateVisible(styledLine, contentWidth)
+	lb.WriteString(styledLine)
+
+	line := lb.String()
+	visWidth := lipgloss.Width(line)
+
+	switch {
+	case visWidth > m.width && m.width > 0:
+		line = truncateStyledLine(line, m.width)
+	case visWidth < m.width:
+		line += strings.Repeat(" ", m.width-visWidth)
 	}
-	b.WriteString(styledLine)
+
+	b.WriteString(line)
 }
 
-// styledLine returns the cached highlighted line or falls back to default styling.
+// styledLine returns the highlighted line, overlaying selection background
+// when the line overlaps the active selection.
 func (m *Model) styledLine(idx int) string {
+	if m.lineHasSelection(idx) {
+		return m.styledLineWithSelection(idx)
+	}
 	if idx < len(m.highlightedLines) {
 		return m.highlightedLines[idx]
 	}
-	return m.lines[idx]
+	return m.lineAt(idx)
+}
+
+// lineHasSelection reports whether line idx overlaps the active selection.
+func (m *Model) lineHasSelection(idx int) bool {
+	if !m.selection.active() {
+		return false
+	}
+	start, _ := m.selection.colRange(idx, m.lineLen(idx))
+	return start >= 0
+}
+
+// styledLineWithSelection re-renders a line with selection background.
+func (m *Model) styledLineWithSelection(idx int) string {
+	line := m.lineAt(idx)
+	regions := m.regionsAt(idx)
+	selStart, selEnd := m.selection.colRange(idx, len(line))
+	return m.highlighter.HighlightLineWithSelection(line, regions, selStart, selEnd, m.theme.Palette.Selection)
+}
+
+func (m *Model) lineAt(idx int) string {
+	if idx < len(m.lines) {
+		return m.lines[idx]
+	}
+	return ""
+}
+
+func (m *Model) regionsAt(idx int) []HighlightRegion {
+	if idx < len(m.highlightRegions) {
+		return m.highlightRegions[idx]
+	}
+	return nil
+}
+
+func (m *Model) lineLen(idx int) int {
+	if idx < len(m.lines) {
+		return len(m.lines[idx])
+	}
+	return 0
 }
 
 // truncateVisible limits visible content to the given width. This is a simple
@@ -249,14 +396,15 @@ func matchKey(desc string) func(tea.KeyMsg) bool {
 // ---------------------------------------------------------------------------
 
 func actionScrollDown(m *Model) tea.Cmd {
-	m.cursorLine = min(m.cursorLine+1, len(m.lines)-1)
-	m.scrollIntoView()
+	maxOffset := max(len(m.lines)-m.viewportHeight(), 0)
+	m.scrollOffset = min(m.scrollOffset+1, maxOffset)
+	m.cursorLine = min(m.scrollOffset+m.viewportHeight()-1, max(len(m.lines)-1, 0))
 	return nil
 }
 
 func actionScrollUp(m *Model) tea.Cmd {
-	m.cursorLine = max(m.cursorLine-1, 0)
-	m.scrollIntoView()
+	m.scrollOffset = max(m.scrollOffset-1, 0)
+	m.cursorLine = m.scrollOffset
 	return nil
 }
 
@@ -274,15 +422,16 @@ func actionScrollBottom(m *Model) tea.Cmd {
 
 func actionPageDown(m *Model) tea.Cmd {
 	pageSize := m.viewportHeight()
-	m.cursorLine = min(m.cursorLine+pageSize, len(m.lines)-1)
-	m.scrollIntoView()
+	maxOffset := max(len(m.lines)-m.viewportHeight(), 0)
+	m.scrollOffset = min(m.scrollOffset+pageSize, maxOffset)
+	m.cursorLine = min(m.scrollOffset+m.viewportHeight()-1, max(len(m.lines)-1, 0))
 	return nil
 }
 
 func actionPageUp(m *Model) tea.Cmd {
 	pageSize := m.viewportHeight()
-	m.cursorLine = max(m.cursorLine-pageSize, 0)
-	m.scrollIntoView()
+	m.scrollOffset = max(m.scrollOffset-pageSize, 0)
+	m.cursorLine = m.scrollOffset
 	return nil
 }
 
@@ -297,15 +446,153 @@ func actionToggleWordWrap(m *Model) tea.Cmd {
 }
 
 // ---------------------------------------------------------------------------
+// Public scroll API (for mouse routing from app level)
+// ---------------------------------------------------------------------------
+
+// ScrollUp scrolls the viewport up by one line.
+// Returns true if the scroll was applied, false if at the top boundary.
+// Keeps cursorLine within the visible range to prevent jumps on keyboard resume.
+func (m *Model) ScrollUp() bool {
+	prev := m.scrollOffset
+	m.scrollOffset = max(m.scrollOffset-1, 0)
+	m.clampCursorToView()
+	return m.scrollOffset != prev
+}
+
+// ScrollDown scrolls the viewport down by one line.
+// Returns true if the scroll was applied, false if at the bottom boundary.
+// Keeps cursorLine within the visible range to prevent jumps on keyboard resume.
+func (m *Model) ScrollDown() bool {
+	prev := m.scrollOffset
+	maxOffset := max(len(m.lines)-m.viewportHeight(), 0)
+	m.scrollOffset = min(m.scrollOffset+1, maxOffset)
+	m.clampCursorToView()
+	return m.scrollOffset != prev
+}
+
+// ScrollToLine scrolls the viewport so the given 0-based line is visible
+// and positions the cursor there.
+func (m *Model) ScrollToLine(line int) {
+	line = min(line, max(len(m.lines)-1, 0))
+	line = max(line, 0)
+	m.cursorLine = line
+	m.scrollIntoView()
+}
+
+// SetBounceOffset updates the visual bounce displacement for rendering.
+func (m *Model) SetBounceOffset(offset int) {
+	m.bounceOffset = offset
+}
+
+// ---------------------------------------------------------------------------
+// Public selection API (for mouse routing from app level)
+// ---------------------------------------------------------------------------
+
+// StartDrag begins a text selection at the given document coordinates.
+func (m *Model) StartDrag(line, col int) {
+	m.selection = textSelection{
+		startLine: line,
+		startCol:  col,
+		endLine:   line,
+		endCol:    col,
+		dragging:  true,
+		set:       true,
+	}
+}
+
+// ExtendDrag updates the selection endpoint during a drag.
+func (m *Model) ExtendDrag(line, col int) {
+	if !m.selection.dragging {
+		return
+	}
+	m.selection.endLine = line
+	m.selection.endCol = col
+}
+
+// EndDrag finalizes the selection. The highlight persists until cleared.
+func (m *Model) EndDrag() {
+	m.selection.dragging = false
+}
+
+// ClearSelection removes any active selection.
+func (m *Model) ClearSelection() {
+	m.selection = textSelection{}
+}
+
+// IsDragging reports whether a drag is currently in progress.
+func (m *Model) IsDragging() bool {
+	return m.selection.dragging
+}
+
+// HasSelection reports whether a non-empty text selection exists.
+func (m *Model) HasSelection() bool {
+	return m.selection.active()
+}
+
+// SelectedText returns the text within the selection range.
+func (m *Model) SelectedText() string {
+	if !m.selection.active() {
+		return ""
+	}
+	sl, sc, el, ec := m.selection.normalize()
+	sl = min(sl, max(len(m.lines)-1, 0))
+	el = min(el, max(len(m.lines)-1, 0))
+	if sl == el {
+		return extractRange(m.lines[sl], sc, ec)
+	}
+	return m.extractMultiLine(sl, sc, el, ec)
+}
+
+// extractRange returns the byte slice [start, end) from a line, clamped.
+func extractRange(line string, start, end int) string {
+	start = min(start, len(line))
+	end = min(end, len(line))
+	if start >= end {
+		return ""
+	}
+	return line[start:end]
+}
+
+// extractMultiLine builds the selected text across multiple lines.
+func (m *Model) extractMultiLine(sl, sc, el, ec int) string {
+	var b strings.Builder
+	b.WriteString(extractRange(m.lines[sl], sc, len(m.lines[sl])))
+	for i := sl + 1; i < el; i++ {
+		b.WriteByte('\n')
+		b.WriteString(m.lines[i])
+	}
+	b.WriteByte('\n')
+	b.WriteString(extractRange(m.lines[el], 0, ec))
+	return b.String()
+}
+
+// clampCursorToView ensures cursorLine stays within [scrollOffset, scrollOffset+viewportHeight).
+func (m *Model) clampCursorToView() {
+	vh := m.viewportHeight()
+	m.cursorLine = max(m.cursorLine, m.scrollOffset)
+	m.cursorLine = min(m.cursorLine, m.scrollOffset+vh-1)
+	m.cursorLine = min(m.cursorLine, max(len(m.lines)-1, 0))
+}
+
+// ---------------------------------------------------------------------------
 // Scroll management
 // ---------------------------------------------------------------------------
 
-// viewportHeight returns the number of lines visible in the viewport.
+// fileHeaderHeight returns 1 when a file is loaded (header shown), 0 otherwise.
+func (m *Model) fileHeaderHeight() int {
+	if m.filePath != "" {
+		return 1
+	}
+	return 0
+}
+
+// viewportHeight returns the number of lines visible in the viewport,
+// accounting for the file header when a file is loaded.
 func (m *Model) viewportHeight() int {
 	if m.height <= 0 {
 		return 1
 	}
-	return m.height
+	return max(m.height-m.fileHeaderHeight(), 1)
 }
 
 // scrollIntoView adjusts scrollOffset so the cursorLine is visible.
@@ -331,6 +618,43 @@ func (m *Model) clampScroll() {
 	maxOffset := max(len(m.lines)-m.viewportHeight(), 0)
 	m.scrollOffset = min(m.scrollOffset, maxOffset)
 	m.scrollOffset = max(m.scrollOffset, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Bounce rendering
+// ---------------------------------------------------------------------------
+
+// applyCodeBounceShift applies the bounce visual offset to rendered code output,
+// simulating iOS rubber-band overscroll.
+// Positive offset (bottom bounce): content slides up, empty at bottom.
+// Negative offset (top bounce): empty at top, content slides down.
+func applyCodeBounceShift(rendered string, offset, viewHeight int) string {
+	if offset == 0 || viewHeight <= 0 {
+		return rendered
+	}
+
+	lines := strings.Split(rendered, "\n")
+
+	absOffset := offset
+	if absOffset < 0 {
+		absOffset = -absOffset
+	}
+	absOffset = min(absOffset, viewHeight)
+
+	if offset > 0 {
+		shift := min(absOffset, len(lines))
+		lines = lines[shift:]
+	} else {
+		pad := make([]string, absOffset, absOffset+len(lines))
+		lines = append(pad, lines...)
+	}
+
+	// Truncate to viewHeight so shifted content never overflows the panel border.
+	if len(lines) > viewHeight {
+		lines = lines[:viewHeight]
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -363,4 +687,46 @@ func (m *Model) contentWidth(gutterWidth int) int {
 		return 1
 	}
 	return w
+}
+
+// truncateStyledLine clips a styled string (with ANSI escape codes) to fit
+// within the given visual width. ANSI CSI sequences are copied verbatim.
+func truncateStyledLine(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	var buf strings.Builder
+	visWidth := 0
+	i := 0
+	for i < len(s) && visWidth < w {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSIEnd(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			buf.WriteString(s[i:j])
+			i = j
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		buf.WriteString(s[i : i+size])
+		visWidth++
+		i += size
+	}
+	buf.WriteString("\x1b[0m")
+	return buf.String()
+}
+
+// isCSIEnd reports whether b is a CSI sequence final byte.
+func isCSIEnd(b byte) bool {
+	return b >= 0x40 && b <= 0x7E
 }

@@ -8,6 +8,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	codepkg "github.com/adalundhe/sylk/ui/code"
+	"github.com/adalundhe/sylk/ui/filetree"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/session"
@@ -393,6 +395,200 @@ func seedAgentHistory(bus *events.ActivityEventBus) {
 				},
 			})
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mock code panel
+// ---------------------------------------------------------------------------
+
+// mockCodeFilePath is the file path displayed in the code viewer header.
+const mockCodeFilePath = "core/auth/session.go"
+
+// mockCodeLanguage is the language identifier for syntax highlighting.
+const mockCodeLanguage = "go"
+
+// seedCodePanel populates the code viewer with a realistic Go source file.
+func seedCodePanel(panel *codepkg.Model) {
+	panel.SetContent(mockGoSource(), mockCodeFilePath, mockCodeLanguage)
+}
+
+// mockGoSource returns a realistic Go source file for the code viewer.
+func mockGoSource() string {
+	var b strings.Builder
+	b.WriteString("package auth\n")
+	b.WriteString("\n")
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"crypto/rand\"\n")
+	b.WriteString("\t\"encoding/hex\"\n")
+	b.WriteString("\t\"errors\"\n")
+	b.WriteString("\t\"sync\"\n")
+	b.WriteString("\t\"time\"\n")
+	b.WriteString(")\n")
+	b.WriteString("\n")
+	b.WriteString("// tokenLength is the byte length of generated session tokens.\n")
+	b.WriteString("// Derived from: 32 bytes = 256 bits of entropy.\n")
+	b.WriteString("const tokenLength = 32\n")
+	b.WriteString("\n")
+	b.WriteString("// defaultTTL is the default time-to-live for a session.\n")
+	b.WriteString("// Derived from: 24 hours, standard web session duration.\n")
+	b.WriteString("const defaultTTL = 24 * time.Hour\n")
+	b.WriteString("\n")
+	b.WriteString("// maxSessions is the upper bound on concurrent sessions per user.\n")
+	b.WriteString("const maxSessions = 8\n")
+	b.WriteString("\n")
+	b.WriteString("// Errors returned by session operations.\n")
+	b.WriteString("var (\n")
+	b.WriteString("\tErrSessionNotFound = errors.New(\"session not found\")\n")
+	b.WriteString("\tErrSessionExpired  = errors.New(\"session expired\")\n")
+	b.WriteString("\tErrMaxSessions     = errors.New(\"maximum sessions reached\")\n")
+	b.WriteString(")\n")
+	b.WriteString("\n")
+	b.WriteString("// Session represents an authenticated user session.\n")
+	b.WriteString("type Session struct {\n")
+	b.WriteString("\tID        string\n")
+	b.WriteString("\tUserID    string\n")
+	b.WriteString("\tToken     string\n")
+	b.WriteString("\tCreatedAt time.Time\n")
+	b.WriteString("\tExpiresAt time.Time\n")
+	b.WriteString("\tMetadata  map[string]any\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// IsExpired reports whether the session has passed its expiry time.\n")
+	b.WriteString("func (s *Session) IsExpired() bool {\n")
+	b.WriteString("\treturn time.Now().After(s.ExpiresAt)\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// Remaining returns the duration until the session expires.\n")
+	b.WriteString("func (s *Session) Remaining() time.Duration {\n")
+	b.WriteString("\treturn time.Until(s.ExpiresAt)\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// Store manages active sessions with bounded concurrency.\n")
+	b.WriteString("type Store struct {\n")
+	b.WriteString("\tmu       sync.RWMutex\n")
+	b.WriteString("\tsessions map[string]*Session\n")
+	b.WriteString("\tbyUser   map[string][]string\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// NewStore creates an empty session store.\n")
+	b.WriteString("func NewStore() *Store {\n")
+	b.WriteString("\treturn &Store{\n")
+	b.WriteString("\t\tsessions: make(map[string]*Session),\n")
+	b.WriteString("\t\tbyUser:   make(map[string][]string),\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// Create generates a new session for the given user.\n")
+	b.WriteString("func (s *Store) Create(ctx context.Context, userID string) (*Session, error) {\n")
+	b.WriteString("\ts.mu.Lock()\n")
+	b.WriteString("\tdefer s.mu.Unlock()\n")
+	b.WriteString("\n")
+	b.WriteString("\tif len(s.byUser[userID]) >= maxSessions {\n")
+	b.WriteString("\t\treturn nil, ErrMaxSessions\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\n")
+	b.WriteString("\ttoken, err := generateToken()\n")
+	b.WriteString("\tif err != nil {\n")
+	b.WriteString("\t\treturn nil, err\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\n")
+	b.WriteString("\tnow := time.Now()\n")
+	b.WriteString("\tsess := &Session{\n")
+	b.WriteString("\t\tID:        generateID(),\n")
+	b.WriteString("\t\tUserID:    userID,\n")
+	b.WriteString("\t\tToken:     token,\n")
+	b.WriteString("\t\tCreatedAt: now,\n")
+	b.WriteString("\t\tExpiresAt: now.Add(defaultTTL),\n")
+	b.WriteString("\t\tMetadata:  make(map[string]any),\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\n")
+	b.WriteString("\ts.sessions[sess.ID] = sess\n")
+	b.WriteString("\ts.byUser[userID] = append(s.byUser[userID], sess.ID)\n")
+	b.WriteString("\treturn sess, nil\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// Validate checks whether a token corresponds to a valid, unexpired session.\n")
+	b.WriteString("func (s *Store) Validate(ctx context.Context, token string) (*Session, error) {\n")
+	b.WriteString("\ts.mu.RLock()\n")
+	b.WriteString("\tdefer s.mu.RUnlock()\n")
+	b.WriteString("\n")
+	b.WriteString("\tfor _, sess := range s.sessions {\n")
+	b.WriteString("\t\tif sess.Token != token {\n")
+	b.WriteString("\t\t\tcontinue\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tif sess.IsExpired() {\n")
+	b.WriteString("\t\t\treturn nil, ErrSessionExpired\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\treturn sess, nil\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn nil, ErrSessionNotFound\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// Revoke removes a session by ID.\n")
+	b.WriteString("func (s *Store) Revoke(ctx context.Context, sessionID string) error {\n")
+	b.WriteString("\ts.mu.Lock()\n")
+	b.WriteString("\tdefer s.mu.Unlock()\n")
+	b.WriteString("\n")
+	b.WriteString("\tsess, ok := s.sessions[sessionID]\n")
+	b.WriteString("\tif !ok {\n")
+	b.WriteString("\t\treturn ErrSessionNotFound\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\n")
+	b.WriteString("\tdelete(s.sessions, sessionID)\n")
+	b.WriteString("\ts.removeFromUser(sess.UserID, sessionID)\n")
+	b.WriteString("\treturn nil\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// removeFromUser removes a session ID from the user's session list.\n")
+	b.WriteString("func (s *Store) removeFromUser(userID, sessionID string) {\n")
+	b.WriteString("\tids := s.byUser[userID]\n")
+	b.WriteString("\tfor i, id := range ids {\n")
+	b.WriteString("\t\tif id == sessionID {\n")
+	b.WriteString("\t\t\ts.byUser[userID] = append(ids[:i], ids[i+1:]...)\n")
+	b.WriteString("\t\t\treturn\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// generateToken returns a cryptographically random hex-encoded token.\n")
+	b.WriteString("func generateToken() (string, error) {\n")
+	b.WriteString("\tbuf := make([]byte, tokenLength)\n")
+	b.WriteString("\tif _, err := rand.Read(buf); err != nil {\n")
+	b.WriteString("\t\treturn \"\", err\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn hex.EncodeToString(buf), nil\n")
+	b.WriteString("}\n")
+	b.WriteString("\n")
+	b.WriteString("// generateID returns a short unique identifier for a session.\n")
+	b.WriteString("func generateID() string {\n")
+	b.WriteString("\tbuf := make([]byte, 8)\n")
+	b.WriteString("\t_, _ = rand.Read(buf)\n")
+	b.WriteString("\treturn hex.EncodeToString(buf)\n")
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Mock file tree
+// ---------------------------------------------------------------------------
+
+// seedFileTree populates the file tree panel with a mock project structure.
+func seedFileTree(tree *filetree.Model) {
+	tree.SetEntries(mockFileTreeEntries())
+}
+
+// mockFileTreeEntries returns a realistic Go project tree for display testing.
+// All directories default to collapsed; users expand them explicitly.
+func mockFileTreeEntries() []filetree.Entry {
+	return []filetree.Entry{
+		{Name: "agents", Path: "agents", IsDir: true, Depth: 0},
+		{Name: "core", Path: "core", IsDir: true, Depth: 0},
+		{Name: "ui", Path: "ui", IsDir: true, Depth: 0},
+		{Name: "go.mod", Path: "go.mod", IsDir: false, Depth: 0},
+		{Name: "go.sum", Path: "go.sum", IsDir: false, Depth: 0},
+		{Name: "main.go", Path: "main.go", IsDir: false, Depth: 0},
 	}
 }
 

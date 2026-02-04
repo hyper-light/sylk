@@ -132,3 +132,15 @@ type OpenEditorMsg struct {
 
 // CloseEditorMsg signals the editor overlay should close.
 type CloseEditorMsg struct{}
+
+// ---------------------------------------------------------------------------
+// File tree
+// ---------------------------------------------------------------------------
+
+// FileOpenMsg requests displaying a file in the code viewer.
+type FileOpenMsg struct {
+	Path     string
+	Name     string
+	Language string
+	Line     int // 0 = top, >0 = scroll to this 1-based line.
+}

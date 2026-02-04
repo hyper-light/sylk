@@ -3,6 +3,7 @@ package chat
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -147,6 +148,10 @@ func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme)
 		return nil, nil
 	}
 
+	// Normalize line endings so \r\n and bare \r don't produce phantom columns.
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+
 	var result []string
 	var regions []CodeRegion
 	var codeBuffer []string
@@ -212,6 +217,7 @@ func renderCodeBlock(lines []string, lang string, width int, th *theme.Theme) []
 	numStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	sepStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
 
+	codeWidth := max(width-gutterWidth, 1)
 	result := make([]string, 0, len(lines))
 	for i, line := range lines {
 		var regions []codepkg.HighlightRegion
@@ -223,10 +229,12 @@ func renderCodeBlock(lines []string, lang string, width int, th *theme.Theme) []
 		sep := sepStyle.Render(gutterSep)
 		highlighted := hl.HighlightLine(line, i, regions)
 
-		// Truncate code if it exceeds available width after the gutter.
-		codeWidth := max(width-gutterWidth, 1)
-		if lipgloss.Width(highlighted) > codeWidth {
-			highlighted = truncateCode(highlighted, codeWidth)
+		visWidth := lipgloss.Width(highlighted)
+		switch {
+		case visWidth > codeWidth:
+			highlighted = truncateStyledCode(highlighted, codeWidth)
+		case visWidth < codeWidth:
+			highlighted += strings.Repeat(" ", codeWidth-visWidth)
 		}
 
 		result = append(result, num+sep+highlighted)
@@ -234,21 +242,43 @@ func renderCodeBlock(lines []string, lang string, width int, th *theme.Theme) []
 	return result
 }
 
-// truncateCode truncates a styled string to fit within maxWidth visible columns.
-func truncateCode(s string, maxWidth int) string {
+// truncateStyledCode truncates a styled string to fit within maxWidth visible
+// columns, preserving ANSI escape sequences and appending a reset.
+func truncateStyledCode(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return ""
 	}
-	runes := []rune(s)
-	for i := range runes {
-		if lipgloss.Width(string(runes[:i])) > maxWidth {
-			if i == 0 {
-				return ""
+	var buf strings.Builder
+	vis := 0
+	i := 0
+	for i < len(s) && vis < maxWidth {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSITerminator(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
 			}
-			return string(runes[:i-1])
+			buf.WriteString(s[i:j])
+			i = j
+			continue
 		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		buf.WriteString(s[i : i+size])
+		vis++
+		i += size
 	}
-	return s
+	buf.WriteString("\x1b[0m")
+	return buf.String()
+}
+
+// isCSITerminator reports whether b is a CSI sequence final byte (0x40–0x7E).
+func isCSITerminator(b byte) bool {
+	return b >= 0x40 && b <= 0x7E
 }
 
 // digitCount returns the number of decimal digits in n.

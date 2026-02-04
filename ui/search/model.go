@@ -111,6 +111,24 @@ func (m *Model) Visible() bool {
 	return m.visible
 }
 
+// ScrollUp moves the selected result up by one, scrolling the result list
+// within the fixed overlay box. The overlay position itself does not move.
+func (m *Model) ScrollUp() {
+	if m.selected > 0 {
+		m.selected--
+		m.scrollSelectedIntoView()
+	}
+}
+
+// ScrollDown moves the selected result down by one, scrolling the result list
+// within the fixed overlay box. The overlay position itself does not move.
+func (m *Model) ScrollDown() {
+	if m.selected < len(m.results)-1 {
+		m.selected++
+		m.scrollSelectedIntoView()
+	}
+}
+
 // ---------------------------------------------------------------------------
 // component.Component
 // ---------------------------------------------------------------------------
@@ -130,8 +148,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	return m.handleKey(key)
 }
 
-// View renders the command palette as a centered overlay. Returns an empty
-// string when not visible.
+// View renders the command palette as a centered overlay. The search bar
+// (query + separator) and the results list are structurally independent
+// blocks so that scrolling only affects the results content.
 func (m *Model) View() string {
 	if !m.visible {
 		return ""
@@ -140,22 +159,22 @@ func (m *Model) View() string {
 	contentW := max(overlayW-overlayPadding, 1)
 	contentH := max(overlayH-overlayPadding, 1)
 
-	var b strings.Builder
-
-	// Query input line.
-	b.WriteString(m.renderQueryLine(contentW))
-	b.WriteByte('\n')
-
-	// Separator.
+	// Fixed header: query input + separator. Never moves.
 	sepStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
-	b.WriteString(sepStyle.Render(strings.Repeat("─", contentW)))
+	header := m.renderQueryLine(contentW) + "\n" +
+		sepStyle.Render(strings.Repeat("─", contentW))
 
-	// Results.
-	maxVisible := m.maxVisibleResults(contentH)
-	b.WriteString(m.renderResults(contentW, maxVisible))
+	// Scrollable results in a fixed-height block.
+	resultsH := max(contentH-inputLineHeight, 1)
+	maxVisible := resultsH / resultLineHeight
+	resultsBlock := lipgloss.NewStyle().
+		Width(contentW).
+		Height(resultsH).
+		MaxHeight(resultsH).
+		Render(m.renderResults(contentW, maxVisible))
 
-	// Wrap in overlay box.
-	return m.renderOverlay(b.String(), overlayW, overlayH)
+	content := lipgloss.JoinVertical(lipgloss.Left, header, resultsBlock)
+	return m.renderOverlay(content, overlayW, overlayH)
 }
 
 // ---------------------------------------------------------------------------
@@ -407,12 +426,13 @@ func (m *Model) overlayDimensions() (int, int) {
 }
 
 func (m *Model) renderOverlay(content string, overlayW, overlayH int) string {
+	innerH := max(overlayH-overlayPadding, 1)
 	boxStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Palette.BorderActive).
 		Padding(1).
 		Width(max(overlayW-overlayPadding, 1)).
-		MaxHeight(overlayH)
+		Height(innerH)
 
 	box := boxStyle.Render(content)
 

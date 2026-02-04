@@ -89,6 +89,90 @@ func (h *Highlighter) HighlightLine(line string, _ int, regions []HighlightRegio
 	return b.String()
 }
 
+// ---------------------------------------------------------------------------
+// Selection-aware rendering
+// ---------------------------------------------------------------------------
+
+// selSegment is a byte range with styling and selection state.
+type selSegment struct {
+	start, end int
+	style      lipgloss.Style
+	selected   bool
+}
+
+// HighlightLineWithSelection renders a line preserving syntax colors but
+// applying selBg background to bytes in [selStart, selEnd).
+func (h *Highlighter) HighlightLineWithSelection(line string, regions []HighlightRegion, selStart, selEnd int, selBg lipgloss.Color) string {
+	lineLen := len(line)
+	base := h.buildSegments(line, lineLen, regions)
+	marked := markSelection(base, selStart, min(selEnd, lineLen))
+	return renderSelSegments(line, marked, selBg)
+}
+
+// buildSegments creates base segments from highlight regions.
+func (h *Highlighter) buildSegments(line string, lineLen int, regions []HighlightRegion) []selSegment {
+	segments := make([]selSegment, 0, len(regions)*2+1)
+	cursor := 0
+	for _, r := range regions {
+		start := clampIndex(r.StartCol, lineLen)
+		end := clampIndex(r.EndCol, lineLen)
+		if start >= end {
+			continue
+		}
+		if cursor < start {
+			segments = append(segments, selSegment{cursor, start, h.default_, false})
+		}
+		segments = append(segments, selSegment{start, end, h.styleFor(r.Category), false})
+		cursor = end
+	}
+	if cursor < lineLen {
+		segments = append(segments, selSegment{cursor, lineLen, h.default_, false})
+	}
+	return segments
+}
+
+// markSelection splits segments at selection boundaries, flagging overlaps.
+func markSelection(segments []selSegment, selStart, selEnd int) []selSegment {
+	if selStart >= selEnd {
+		return segments
+	}
+	result := make([]selSegment, 0, len(segments)+2)
+	for _, seg := range segments {
+		result = append(result, splitAtSel(seg, selStart, selEnd)...)
+	}
+	return result
+}
+
+// splitAtSel splits a single segment at selection boundaries.
+func splitAtSel(seg selSegment, selStart, selEnd int) []selSegment {
+	if seg.end <= selStart || seg.start >= selEnd {
+		return []selSegment{seg}
+	}
+	var parts []selSegment
+	if seg.start < selStart {
+		parts = append(parts, selSegment{seg.start, selStart, seg.style, false})
+	}
+	parts = append(parts, selSegment{max(seg.start, selStart), min(seg.end, selEnd), seg.style, true})
+	if seg.end > selEnd {
+		parts = append(parts, selSegment{selEnd, seg.end, seg.style, false})
+	}
+	return parts
+}
+
+// renderSelSegments renders all segments, applying selBg to selected ones.
+func renderSelSegments(line string, segments []selSegment, selBg lipgloss.Color) string {
+	var b strings.Builder
+	b.Grow(len(line) * 2)
+	for _, seg := range segments {
+		style := seg.style
+		if seg.selected {
+			style = style.Background(selBg)
+		}
+		b.WriteString(style.Render(line[seg.start:seg.end]))
+	}
+	return b.String()
+}
+
 // DefaultStyle returns the style used for unhighlighted text.
 func (h *Highlighter) DefaultStyle() lipgloss.Style {
 	return h.default_
