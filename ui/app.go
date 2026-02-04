@@ -16,6 +16,7 @@ import (
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/bridge"
 	"github.com/adalundhe/sylk/ui/chat"
+	"github.com/adalundhe/sylk/ui/editor/register"
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/editor"
@@ -134,6 +135,9 @@ type AppModel struct {
 	// Interrupt
 	interruptHandler *interrupt.Handler
 
+	// Clipboard
+	clipboard register.ClipboardProvider
+
 	// State
 	chord  chordState
 	width  int
@@ -165,6 +169,7 @@ func New(cfg Config, deps Deps) *AppModel {
 		streamBridge:     bridge.NewStreamBridge(deps.Scope),
 		guideBridge:      bridge.NewGuideBridge(deps.GuideBus, deps.Scope),
 		interruptHandler: interrupt.NewHandler(),
+		clipboard:        register.NewOSClipboard(),
 	}
 	app.syncFocusState()
 	return app
@@ -338,10 +343,12 @@ func (m *AppModel) handleQuit() tea.Cmd {
 }
 
 func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
-	// Forward tick to status bar and input (for cursor blink).
+	// Forward tick to status bar, input (cursor blink), and chat (highlight).
 	m.statusBar.Update(tick)
 	comp, _ := m.input.Update(tick)
 	m.input = comp.(*inputpkg.Model)
+	chatComp, _ := m.chat.Update(tick)
+	m.chat = chatComp.(*chat.Model)
 	return m.tickCmd()
 }
 
@@ -391,18 +398,18 @@ type chordState int
 
 const (
 	chordNone    chordState = iota
-	chordSession            // "S" pressed, waiting for arrow.
-	chordAgent              // "A" pressed, waiting for arrow.
+	chordSession            // Alt+S pressed, waiting for arrow.
+	chordAgent              // Alt+A pressed, waiting for arrow.
 )
 
-// chordArrowDelta maps arrow key strings (including shift-held variants) to
-// a cycle direction. The shift+arrow variants handle the common case where the
-// user still holds Shift from the prefix key when pressing the arrow.
+// chordArrowDelta maps arrow key strings (including alt-held variants) to
+// a cycle direction. The alt+arrow variants handle the common case where the
+// user still holds Alt from the prefix key when pressing the arrow.
 var chordArrowDelta = map[string]int{
-	"left":        -1,
-	"right":       1,
-	"shift+left":  -1,
-	"shift+right": 1,
+	"left":      -1,
+	"right":     1,
+	"alt+left":  -1,
+	"alt+right": 1,
 }
 
 // chordLabel maps active chord state to a display label for the hint overlay.
@@ -422,28 +429,31 @@ func (m *AppModel) chordHint(th *theme.Theme) string {
 	return labelStyle.Render(label) + keyStyle.Render("  ←/→ cycle  any key to exit ")
 }
 
-// handleChord processes two-key chord shortcuts: S then Left/Right for sessions,
-// A then Left/Right for agents. The chord stays active while arrows are pressed,
+// handleChord processes two-key chord shortcuts: Alt+S then Left/Right for sessions,
+// Alt+A then Left/Right for agents. The chord stays active while arrows are pressed,
 // allowing repeated cycling. Any non-arrow key cancels the chord and falls
 // through to normal handling. Returns (cmd, true) if consumed.
 func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
-	if m.chord != chordNone {
-		if delta, ok := chordArrowDelta[key.String()]; ok {
-			return m.dispatchChordCycle(m.chord, delta), true
-		}
-		m.chord = chordNone
-		return nil, false
-	}
-
+	// Chord triggers work from any state, allowing direct switching.
 	switch key.String() {
-	case "S":
+	case "alt+s":
 		m.chord = chordSession
 		return nil, true
-	case "A":
+	case "alt+a":
 		m.chord = chordAgent
 		return nil, true
 	}
-	return nil, false
+
+	if m.chord == chordNone {
+		return nil, false
+	}
+
+	// Active chord: arrow keys cycle, anything else cancels.
+	if delta, ok := chordArrowDelta[key.String()]; ok {
+		return m.dispatchChordCycle(m.chord, delta), true
+	}
+	m.chord = chordNone
+	return nil, true
 }
 
 // dispatchChordCycle routes a completed chord to the target panel.
@@ -465,15 +475,74 @@ func (m *AppModel) dispatchChordCycle(chord chordState, delta int) tea.Cmd {
 }
 
 // handleMouse forwards mouse wheel events to the chat viewport
-// regardless of which panel has focus.
+// and handles click-to-copy on chat messages.
 func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	switch mouse.Button {
 	case tea.MouseButtonWheelUp:
 		m.chat.ScrollUp()
 	case tea.MouseButtonWheelDown:
 		m.chat.ScrollDown()
+	case tea.MouseButtonLeft:
+		if mouse.Action != tea.MouseActionMotion {
+			return m.handleChatClick(mouse.X, mouse.Y)
+		}
 	}
 	return nil
+}
+
+// handleChatClick copies the content of the chat entry at the clicked
+// position to the system clipboard.
+func (m *AppModel) handleChatClick(x, y int) tea.Cmd {
+	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
+	if chatW == 0 || chatH == 0 {
+		return nil
+	}
+
+	chatX := m.chatPanelX()
+	innerH := max(chatH-panelBorderSize, 0)
+
+	// Content area within the bordered chat panel.
+	contentLeft := chatX + 1
+	contentRight := chatX + chatW - 1
+
+	// Chord hint pushes viewport content down by 2 lines when active.
+	chordOffset := 0
+	if m.chord != chordNone {
+		chordOffset = 2
+	}
+	viewportTop := 1 + chordOffset // 1 = top border
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight {
+		return nil
+	}
+	if y < viewportTop || y >= contentBottom {
+		return nil
+	}
+
+	viewportLine := y - viewportTop
+	target := m.chat.CopyTargetAtViewLine(viewportLine)
+	if target == nil {
+		return nil
+	}
+
+	if err := m.clipboard.Set(target.Content); err != nil {
+		m.statusBar.SetFlash("Copy failed")
+		return nil
+	}
+	m.chat.SetHighlight(target.EntryID, target.HighlightStart, target.HighlightEnd)
+	m.statusBar.SetFlash("Copied!")
+	return nil
+}
+
+// chatPanelX returns the X coordinate where the chat panel starts,
+// based on the current layout mode.
+func (m *AppModel) chatPanelX() int {
+	if m.layout.Mode() >= layout.TwoColumn {
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		return leftW
+	}
+	return 0
 }
 
 func (m *AppModel) toggleSearch() {

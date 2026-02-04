@@ -91,6 +91,16 @@ func (m *Model) View() string {
 	if popup != "" {
 		body = body + "\n" + popup
 	}
+
+	// Right-align a submit hint when the input is empty.
+	if m.isEmpty() {
+		w := m.contentWidth()
+		hint := m.theme.Placeholder.Render("enter ↵")
+		if gap := w - lipgloss.Width(body) - lipgloss.Width(hint); gap > 0 {
+			body = body + strings.Repeat(" ", gap) + hint
+		}
+	}
+
 	return style.Width(m.contentWidth()).Render(body)
 }
 
