@@ -26,6 +26,9 @@ const (
 	MethodDefinition         = "textDocument/definition"
 	MethodDocumentHighlight  = "textDocument/documentHighlight"
 	MethodReferences         = "textDocument/references"
+	MethodDocumentSymbol     = "textDocument/documentSymbol"
+	MethodSignatureHelp      = "textDocument/signatureHelp"
+	MethodFormatting         = "textDocument/formatting"
 )
 
 // ---------------------------------------------------------------------------
@@ -74,6 +77,8 @@ type TextDocumentClientCapabilities struct {
 	Definition         DefinitionClientCapabilities             `json:"definition,omitempty"`
 	DocumentHighlight  DocumentHighlightClientCapabilities      `json:"documentHighlight,omitempty"`
 	References         ReferencesClientCapabilities             `json:"references,omitempty"`
+	DocumentSymbol     DocumentSymbolClientCapabilities         `json:"documentSymbol,omitempty"`
+	SignatureHelp      SignatureHelpClientCapabilities          `json:"signatureHelp,omitempty"`
 }
 
 // CompletionClientCapabilities describes completion support.
@@ -108,6 +113,27 @@ type ReferencesClientCapabilities struct {
 	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
 }
 
+// DocumentSymbolClientCapabilities describes document symbol support.
+type DocumentSymbolClientCapabilities struct {
+	DynamicRegistration               bool `json:"dynamicRegistration,omitempty"`
+	HierarchicalDocumentSymbolSupport bool `json:"hierarchicalDocumentSymbolSupport,omitempty"`
+}
+
+// SignatureHelpClientCapabilities describes signature help support.
+type SignatureHelpClientCapabilities struct {
+	SignatureInformation *SignatureInfoClientCaps `json:"signatureInformation,omitempty"`
+}
+
+// SignatureInfoClientCaps describes signature information capabilities.
+type SignatureInfoClientCaps struct {
+	ParameterInformation *ParamInfoClientCaps `json:"parameterInformation,omitempty"`
+}
+
+// ParamInfoClientCaps declares label offset support.
+type ParamInfoClientCaps struct {
+	LabelOffsetSupport bool `json:"labelOffsetSupport,omitempty"`
+}
+
 // TextDocumentSyncClientCapabilities describes sync support.
 type TextDocumentSyncClientCapabilities struct {
 	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
@@ -138,6 +164,8 @@ type ServerCaps struct {
 	RenameProvider             json.RawMessage `json:"renameProvider,omitempty"`
 	DiagnosticProvider         json.RawMessage `json:"diagnosticProvider,omitempty"`
 	DocumentHighlightProvider  json.RawMessage `json:"documentHighlightProvider,omitempty"`
+	SignatureHelpProvider      json.RawMessage `json:"signatureHelpProvider,omitempty"`
+	DocumentFormattingProvider json.RawMessage `json:"documentFormattingProvider,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +263,52 @@ type ProtocolLocation struct {
 	Range ProtocolRange `json:"range"`
 }
 
+// ProtocolDocumentSymbol is the hierarchical wire format (modern servers).
+type ProtocolDocumentSymbol struct {
+	Name           string                   `json:"name"`
+	Detail         string                   `json:"detail,omitempty"`
+	Kind           int                      `json:"kind"`
+	Range          ProtocolRange            `json:"range"`
+	SelectionRange ProtocolRange            `json:"selectionRange"`
+	Children       []ProtocolDocumentSymbol `json:"children,omitempty"`
+}
+
+// ProtocolSymbolInformation is the flat wire format (legacy servers).
+type ProtocolSymbolInformation struct {
+	Name     string           `json:"name"`
+	Kind     int              `json:"kind"`
+	Location ProtocolLocation `json:"location"`
+}
+
+// ---------------------------------------------------------------------------
+// Signature help (textDocument/signatureHelp)
+// ---------------------------------------------------------------------------
+
+// SignatureHelpParams is the request body for textDocument/signatureHelp.
+type SignatureHelpParams struct {
+	TextDocumentPositionParams
+}
+
+// ProtocolSignatureHelp is the wire-format response.
+type ProtocolSignatureHelp struct {
+	Signatures      []ProtocolSignatureInformation `json:"signatures"`
+	ActiveSignature int                            `json:"activeSignature"`
+	ActiveParameter int                            `json:"activeParameter"`
+}
+
+// ProtocolSignatureInformation is the wire format of a single signature.
+type ProtocolSignatureInformation struct {
+	Label         string                         `json:"label"`
+	Documentation json.RawMessage                `json:"documentation,omitempty"`
+	Parameters    []ProtocolParameterInformation `json:"parameters,omitempty"`
+}
+
+// ProtocolParameterInformation is the wire format of a parameter.
+// Label can be either a string or a [startOffset, endOffset] pair.
+type ProtocolParameterInformation struct {
+	Label json.RawMessage `json:"label"`
+}
+
 // ---------------------------------------------------------------------------
 // Conversions: wire types → existing domain types
 // ---------------------------------------------------------------------------
@@ -253,6 +327,8 @@ func ToServerCapabilities(sc ServerCaps) ServerCapabilities {
 		CodeActionProvider:         isTruthy(sc.CodeActionProvider),
 		RenameProvider:             isTruthy(sc.RenameProvider),
 		DocumentHighlightProvider:  isTruthy(sc.DocumentHighlightProvider),
+		SignatureHelpProvider:      isTruthy(sc.SignatureHelpProvider),
+		FormattingProvider:         isTruthy(sc.DocumentFormattingProvider),
 	}
 }
 
@@ -530,6 +606,83 @@ type ReferenceContext struct {
 }
 
 // ---------------------------------------------------------------------------
+// Document Symbol conversions
+// ---------------------------------------------------------------------------
+
+// toDocumentSymbols converts hierarchical wire-format symbols to domain types.
+func toDocumentSymbols(protos []ProtocolDocumentSymbol) []DocumentSymbol {
+	result := make([]DocumentSymbol, len(protos))
+	for i, p := range protos {
+		result[i] = DocumentSymbol{
+			Name:           p.Name,
+			Detail:         p.Detail,
+			Kind:           SymbolKind(p.Kind),
+			Range:          toCoreRange(p.Range),
+			SelectionRange: toCoreRange(p.SelectionRange),
+			Children:       toDocumentSymbols(p.Children),
+		}
+	}
+	return result
+}
+
+// symbolInfoToDocumentSymbols converts flat wire-format symbols to domain types.
+func symbolInfoToDocumentSymbols(infos []ProtocolSymbolInformation) []DocumentSymbol {
+	result := make([]DocumentSymbol, len(infos))
+	for i, si := range infos {
+		r := toCoreRange(si.Location.Range)
+		result[i] = DocumentSymbol{
+			Name:           si.Name,
+			Kind:           SymbolKind(si.Kind),
+			Range:          r,
+			SelectionRange: r,
+		}
+	}
+	return result
+}
+
+// ToSignatureHelp converts a wire-format signature help to the domain type.
+// Returns nil if there are no signatures.
+func ToSignatureHelp(ph ProtocolSignatureHelp) *SignatureHelp {
+	if len(ph.Signatures) == 0 {
+		return nil
+	}
+	sigs := make([]SignatureInformation, len(ph.Signatures))
+	for i, ps := range ph.Signatures {
+		sigs[i] = toSignatureInformation(ps)
+	}
+	return &SignatureHelp{
+		Signatures:      sigs,
+		ActiveSignature: ph.ActiveSignature,
+		ActiveParameter: ph.ActiveParameter,
+	}
+}
+
+func toSignatureInformation(ps ProtocolSignatureInformation) SignatureInformation {
+	params := make([]ParameterInformation, len(ps.Parameters))
+	for i, pp := range ps.Parameters {
+		params[i] = toParameterInformation(pp)
+	}
+	return SignatureInformation{
+		Label:      ps.Label,
+		Parameters: params,
+	}
+}
+
+func toParameterInformation(pp ProtocolParameterInformation) ParameterInformation {
+	// Try string label first.
+	var s string
+	if json.Unmarshal(pp.Label, &s) == nil {
+		return ParameterInformation{LabelString: s}
+	}
+	// Try [start, end] offset pair.
+	var offsets [2]int
+	if json.Unmarshal(pp.Label, &offsets) == nil {
+		return ParameterInformation{LabelOffsets: offsets}
+	}
+	return ParameterInformation{}
+}
+
+// ---------------------------------------------------------------------------
 // Completion provider capabilities
 // ---------------------------------------------------------------------------
 
@@ -546,6 +699,45 @@ func CompletionTriggerChars(raw json.RawMessage) []string {
 		return nil
 	}
 	return opts.TriggerCharacters
+}
+
+// ---------------------------------------------------------------------------
+// Signature help provider capabilities
+// ---------------------------------------------------------------------------
+
+// SignatureHelpTriggerChars extracts trigger and retrigger characters from
+// the signatureHelpProvider capability. Returns nil slices if absent.
+func SignatureHelpTriggerChars(raw json.RawMessage) (trigger, retrigger []string) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var opts struct {
+		TriggerCharacters   []string `json:"triggerCharacters"`
+		RetriggerCharacters []string `json:"retriggerCharacters"`
+	}
+	if json.Unmarshal(raw, &opts) != nil {
+		return nil, nil
+	}
+	return opts.TriggerCharacters, opts.RetriggerCharacters
+}
+
+// ---------------------------------------------------------------------------
+// Formatting (textDocument/formatting)
+// ---------------------------------------------------------------------------
+
+// DocumentFormattingParams is the wire format for textDocument/formatting.
+type DocumentFormattingParams struct {
+	TextDocument TextDocumentIdentifier  `json:"textDocument"`
+	Options      ProtocolFormattingOptions `json:"options"`
+}
+
+// ProtocolFormattingOptions controls formatting behavior.
+type ProtocolFormattingOptions struct {
+	TabSize                int  `json:"tabSize"`
+	InsertSpaces           bool `json:"insertSpaces"`
+	TrimTrailingWhitespace bool `json:"trimTrailingWhitespace,omitempty"`
+	InsertFinalNewline     bool `json:"insertFinalNewline,omitempty"`
+	TrimFinalNewlines      bool `json:"trimFinalNewlines,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,9 @@
 package editor
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -22,6 +24,7 @@ import (
 	"github.com/adalundhe/sylk/ui/editor/highlight"
 	"github.com/adalundhe/sylk/ui/editor/hover"
 	"github.com/adalundhe/sylk/ui/editor/mode"
+	"github.com/adalundhe/sylk/ui/editor/signature"
 	"github.com/adalundhe/sylk/ui/editor/motion"
 	"github.com/adalundhe/sylk/ui/editor/statusline"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -87,8 +90,18 @@ type Model struct {
 	hoverPopup  *hover.Hover
 	hoverActive bool
 
+	// LSP signature help popup.
+	sigHelp       *signature.SignatureHelp
+	sigHelpActive bool
+
 	// LSP document highlights (same-symbol occurrences).
 	highlightRanges []lsp.DocumentHighlight
+
+	// Jump marker: visual indicator set after jumping to a symbol/reference.
+	jumpLine     int  // 0-indexed target line.
+	jumpStartCol int  // 0-indexed start column (rune offset).
+	jumpEndCol   int  // 0-indexed end column (exclusive, rune offset).
+	jumpActive   bool // Whether the jump marker is visible.
 
 	// Completion popup.
 	completionEngine *completion.Engine
@@ -141,6 +154,7 @@ func New(th *theme.Theme) *Model {
 		statusLine:  statusline.New(th),
 		jumpList:         motion.NewJumpList(),
 		hoverPopup:       hover.New(),
+		sigHelp:          signature.New(),
 		completionEngine: completion.NewEngine(registry),
 		lspSource:        lspSrc,
 		cursorBlink:      true,
@@ -159,8 +173,10 @@ func (m *Model) OpenFile(path, content, language string) {
 	m.diagnostics = nil
 	m.parseErrors = nil
 	m.highlightRanges = nil
+	m.jumpActive = false
 	m.scrollOffset = 0
 	m.DismissHover()
+	m.DismissSignatureHelp()
 
 	m.buf = buffer.NewPieceTable(content)
 	m.lineIndex = buffer.NewLineIndex(m.buf)
@@ -228,15 +244,8 @@ func (m *Model) View() string {
 	// Apply bounce shift for overscroll feedback.
 	lines = applyBounceShift(lines, m.bounceOffset, viewHeight)
 
-	// Overlay hover popup if active.
-	if m.hoverActive && m.hoverPopup.Active() {
-		lines = m.overlayHover(lines, viewHeight)
-	}
-
-	// Overlay completion popup if active.
-	if m.completionEngine.Active() {
-		lines = m.overlayCompletion(lines, viewHeight)
-	}
+	// Overlay all active popups with collision detection.
+	lines = m.overlayPopups(lines, viewHeight)
 
 	body := strings.Join(lines, "\n")
 	if findBarStr != "" {
@@ -295,6 +304,9 @@ func (m *Model) Modified() bool { return m.modified }
 // FilePath returns the current file path.
 func (m *Model) FilePath() string { return m.filePath }
 
+// TabWidth returns the editor's tab stop width for formatting requests.
+func (m *Model) TabWidth() int { return editorTabWidth }
+
 // ClearFile resets the editor to an empty state with no file loaded.
 func (m *Model) ClearFile() {
 	m.filePath = ""
@@ -304,7 +316,9 @@ func (m *Model) ClearFile() {
 	m.diagnostics = nil
 	m.parseErrors = nil
 	m.highlightRanges = nil
+	m.jumpActive = false
 	m.scrollOffset = 0
+	m.DismissSignatureHelp()
 	m.buf = buffer.NewPieceTable("")
 	m.regions = nil
 }
@@ -341,6 +355,33 @@ func (m *Model) CursorLine() int { return m.state.CursorLine }
 
 // CursorCol returns the 0-indexed column offset of the cursor within its line.
 func (m *Model) CursorCol() int { return m.state.CursorCol }
+
+// GoToLine moves the cursor to the beginning of the given 0-indexed line
+// and adjusts the scroll offset so the line is visible.
+func (m *Model) GoToLine(line int) {
+	m.state.Cursor = m.lineIndex.LineColToPos(line, 0)
+	m.state.ClampCursor(1)
+	vh := m.viewportHeight()
+	if vh > 0 {
+		// Center the target line in the viewport.
+		m.scrollOffset = max(m.state.CursorLine-vh/2, 0)
+	}
+	m.syncStatusLine()
+}
+
+// SetJumpMarker sets a visual marker on the given line/column range.
+// The marker persists until the next cursor movement or buffer change.
+func (m *Model) SetJumpMarker(line, startCol, endCol int) {
+	m.jumpLine = line
+	m.jumpStartCol = startCol
+	m.jumpEndCol = endCol
+	m.jumpActive = true
+}
+
+// ClearJumpMarker removes the jump marker.
+func (m *Model) ClearJumpMarker() {
+	m.jumpActive = false
+}
 
 // ---------------------------------------------------------------------------
 // Hover
@@ -389,6 +430,30 @@ func (m *Model) HoverAnchorLine() int { return m.hoverPopup.AnchorLine() }
 
 // HoverAnchorCol returns the column the hover popup is anchored to.
 func (m *Model) HoverAnchorCol() int { return m.hoverPopup.AnchorCol() }
+
+// ---------------------------------------------------------------------------
+// Signature Help
+// ---------------------------------------------------------------------------
+
+// ShowSignatureHelp displays the signature help popup at the current cursor.
+// A nil or empty result dismisses the popup.
+func (m *Model) ShowSignatureHelp(result *lsp.SignatureHelp) {
+	if result == nil || len(result.Signatures) == 0 {
+		m.DismissSignatureHelp()
+		return
+	}
+	m.sigHelp.Show(result, m.state.CursorLine, m.state.CursorCol)
+	m.sigHelpActive = true
+}
+
+// DismissSignatureHelp hides the signature help popup.
+func (m *Model) DismissSignatureHelp() {
+	m.sigHelp.Dismiss()
+	m.sigHelpActive = false
+}
+
+// SignatureHelpActive reports whether the signature popup is visible.
+func (m *Model) SignatureHelpActive() bool { return m.sigHelpActive }
 
 // ---------------------------------------------------------------------------
 // Document Highlights
@@ -511,15 +576,15 @@ func (m *Model) WordBoundsAt(line, col int) (start, end int) {
 // currently displayed hover popup. Returns false when no hover is active.
 func (m *Model) IsInsideHoverPopup(x, y int) bool {
 	viewHeight := m.viewportHeight()
-	popupLines, startRow, ok := m.hoverPopupLayout(viewHeight)
-	if !ok || len(popupLines) == 0 {
+	_, hover, _ := m.popupLayout(viewHeight)
+	if hover.content == "" {
 		return false
 	}
-	if y < startRow || y >= startRow+len(popupLines) {
+	if y < hover.start || y >= hover.start+hover.height {
 		return false
 	}
-	popupWidth := lipgloss.Width(popupLines[0])
-	return x >= 0 && x < popupWidth
+	firstLine := strings.SplitN(hover.content, "\n", 2)[0]
+	return x >= 0 && x < lipgloss.Width(firstLine)
 }
 
 // jumpBack navigates to the previous position in the jump list (Ctrl+O).
@@ -559,67 +624,209 @@ func (m *Model) jumpTo(entry motion.JumpEntry) (component.Component, tea.Cmd) {
 	}
 }
 
-// hoverPopupLayout computes the rendered popup lines and viewport start row.
-// Returns (popupLines, startRow, ok). The popup is always positioned below
-// the anchor line so the hovered content remains visible.
-func (m *Model) hoverPopupLayout(viewHeight int) (popupLines []string, startRow int, ok bool) {
-	if !m.hoverActive {
-		return nil, 0, false
-	}
+// ---------------------------------------------------------------------------
+// Unified Popup Layout — collision detection
+// ---------------------------------------------------------------------------
 
-	anchorRow := m.hoverPopup.AnchorLine() - m.scrollOffset
-
-	// Available rows on each side of the anchor (excluding the anchor itself).
-	spaceBelow := viewHeight - anchorRow - 1
-	spaceAbove := anchorRow
-
-	// Pick the side with more room; that determines the max popup height.
-	below := spaceBelow >= spaceAbove
-	maxLines := spaceBelow
-	if !below {
-		maxLines = spaceAbove
-	}
-	// Derived from: hover.minVisibleLines (5) + 2 border rows.
-	const minPopupLines = 7
-	if maxLines < minPopupLines {
-		maxLines = minPopupLines
-	}
-
-	popup := m.hoverPopup.View(m.width, maxLines, m.theme)
-	if popup == "" {
-		return nil, 0, false
-	}
-	popupLines = strings.Split(popup, "\n")
-	hoverH := len(popupLines)
-
-	if below {
-		startRow = anchorRow + 1
-	} else {
-		startRow = anchorRow - hoverH
-	}
-
-	// Final clamp — keep within viewport bounds.
-	startRow = max(startRow, 0)
-	if startRow+hoverH > viewHeight {
-		startRow = viewHeight - hoverH
-	}
-	return popupLines, startRow, true
+// popupPlacement describes a rendered popup's viewport position.
+type popupPlacement struct {
+	content string // rendered popup text ("" = inactive)
+	start   int    // first viewport row
+	height  int    // number of viewport rows occupied
 }
 
-// overlayHover replaces viewport lines with hover popup content, positioned
-// below the anchor line when room permits, above otherwise.
-func (m *Model) overlayHover(lines []string, viewHeight int) []string {
-	popupLines, startRow, ok := m.hoverPopupLayout(viewHeight)
-	if !ok {
-		return lines
+// rowInterval is a half-open viewport row range [start, end).
+type rowInterval struct {
+	start, end int
+}
+
+// popupLayout computes collision-free viewport positions for all active
+// popups (signature help, hover tooltip, completion).
+func (m *Model) popupLayout(viewHeight int) (sig, hover, comp popupPlacement) {
+	cursorRow := m.contentLineToViewRow(m.state.CursorLine)
+	sig = m.sigHelpPlacement(cursorRow)
+	comp = m.completionPlacement(cursorRow, viewHeight)
+	hover = m.hoverPlacement(viewHeight, cursorRow, sig, comp)
+	return
+}
+
+// sigHelpPlacement renders signature help and positions it above the cursor.
+func (m *Model) sigHelpPlacement(cursorRow int) popupPlacement {
+	if !m.sigHelpActive || !m.sigHelp.Active() {
+		return popupPlacement{}
 	}
-	for i, pLine := range popupLines {
-		row := startRow + i
+	popup := m.sigHelp.View(m.width, m.theme)
+	if popup == "" {
+		return popupPlacement{}
+	}
+	h := strings.Count(popup, "\n") + 1
+	return popupPlacement{content: popup, start: max(cursorRow-h, 0), height: h}
+}
+
+// completionPlacement renders completion and positions it below the cursor.
+func (m *Model) completionPlacement(cursorRow, viewHeight int) popupPlacement {
+	if !m.completionEngine.Active() {
+		return popupPlacement{}
+	}
+	start := cursorRow + 1
+	avail := viewHeight - start
+	if avail <= 0 {
+		return popupPlacement{}
+	}
+	popup := m.completionEngine.Render(m.width, avail, m.theme)
+	if popup == "" {
+		return popupPlacement{}
+	}
+	return popupPlacement{content: popup, start: start, height: strings.Count(popup, "\n") + 1}
+}
+
+// hoverPlacement positions hover in the largest free viewport zone,
+// avoiding signature help, the cursor row, and completion.
+func (m *Model) hoverPlacement(viewHeight, cursorRow int, sig, comp popupPlacement) popupPlacement {
+	if !m.hoverActive || !m.hoverPopup.Active() {
+		return popupPlacement{}
+	}
+	anchorRow := m.contentLineToViewRow(m.hoverPopup.AnchorLine())
+	zones := popupFreeZones(viewHeight, cursorRow, sig, comp)
+	return m.placeHoverInZones(zones, anchorRow)
+}
+
+// popupFreeZones builds sorted reserved intervals (sig, cursor, comp)
+// and returns the free gaps between them within [0, viewHeight).
+func popupFreeZones(viewHeight, cursorRow int, sig, comp popupPlacement) []rowInterval {
+	reserved := make([]rowInterval, 0, 3)
+	if sig.height > 0 {
+		reserved = append(reserved, rowInterval{sig.start, sig.start + sig.height})
+	}
+	reserved = append(reserved, rowInterval{cursorRow, cursorRow + 1})
+	if comp.height > 0 {
+		reserved = append(reserved, rowInterval{comp.start, comp.start + comp.height})
+	}
+	return gapIntervals(reserved, viewHeight)
+}
+
+// gapIntervals returns the free intervals between sorted, non-overlapping
+// reserved intervals within [0, viewHeight).
+func gapIntervals(sorted []rowInterval, viewHeight int) []rowInterval {
+	gaps := make([]rowInterval, 0, len(sorted)+1)
+	edge := 0
+	for _, r := range sorted {
+		if r.start > edge {
+			gaps = append(gaps, rowInterval{edge, r.start})
+		}
+		edge = max(edge, r.end)
+	}
+	if edge < viewHeight {
+		gaps = append(gaps, rowInterval{edge, viewHeight})
+	}
+	return gaps
+}
+
+// placeHoverInZones renders hover and finds the optimal free zone closest
+// to the anchor row. Falls back to constrainHover when no zone fits.
+func (m *Model) placeHoverInZones(zones []rowInterval, anchorRow int) popupPlacement {
+	maxH := largestZoneHeight(zones)
+	// Derived from: hover.minVisibleLines (5) + 2 border rows.
+	const minHoverLines = 7
+	popup := m.hoverPopup.View(m.width, max(maxH, minHoverLines), m.theme)
+	if popup == "" {
+		return popupPlacement{}
+	}
+	hoverH := strings.Count(popup, "\n") + 1
+	start, ok := bestSlotInZones(zones, anchorRow, hoverH)
+	if ok {
+		return popupPlacement{content: popup, start: start, height: hoverH}
+	}
+	return m.constrainHover(zones)
+}
+
+// largestZoneHeight returns the height of the tallest free zone.
+func largestZoneHeight(zones []rowInterval) int {
+	best := 0
+	for _, z := range zones {
+		if h := z.end - z.start; h > best {
+			best = h
+		}
+	}
+	return best
+}
+
+// bestSlotInZones returns the start row in the zone closest to anchorRow
+// that can fit popupH rows. Returns (_, false) if no zone is large enough.
+func bestSlotInZones(zones []rowInterval, anchorRow, popupH int) (int, bool) {
+	bestStart, bestDist := -1, 1<<30
+	for _, z := range zones {
+		if z.end-z.start < popupH {
+			continue
+		}
+		start, dist := closestSlot(z, anchorRow, popupH)
+		if dist < bestDist {
+			bestDist = dist
+			bestStart = start
+		}
+	}
+	return bestStart, bestStart >= 0
+}
+
+// closestSlot finds the position within zone z that puts the popup
+// closest to anchorRow, trying both below-anchor and above-anchor.
+func closestSlot(z rowInterval, anchorRow, popupH int) (int, int) {
+	below := max(min(anchorRow+1, z.end-popupH), z.start)
+	above := max(min(anchorRow-popupH, z.end-popupH), z.start)
+	distB := below - anchorRow
+	if distB < 0 {
+		distB = -distB
+	}
+	distA := anchorRow - (above + popupH - 1)
+	if distA < 0 {
+		distA = -distA
+	}
+	if distA < distB {
+		return above, distA
+	}
+	return below, distB
+}
+
+// constrainHover re-renders hover to fit the largest available zone.
+func (m *Model) constrainHover(zones []rowInterval) popupPlacement {
+	var largest rowInterval
+	for _, z := range zones {
+		if z.end-z.start > largest.end-largest.start {
+			largest = z
+		}
+	}
+	h := largest.end - largest.start
+	if h <= 0 {
+		return popupPlacement{}
+	}
+	popup := m.hoverPopup.View(m.width, h, m.theme)
+	if popup == "" {
+		return popupPlacement{}
+	}
+	return popupPlacement{content: popup, start: largest.start, height: strings.Count(popup, "\n") + 1}
+}
+
+// overlayPopups positions all active popups with collision detection and
+// writes them into the viewport lines.
+func (m *Model) overlayPopups(lines []string, viewHeight int) []string {
+	sig, hover, comp := m.popupLayout(viewHeight)
+	applyPopupOverlay(lines, sig)
+	applyPopupOverlay(lines, hover)
+	applyPopupOverlay(lines, comp)
+	return lines
+}
+
+// applyPopupOverlay stamps a popup's rendered lines onto the viewport.
+func applyPopupOverlay(lines []string, p popupPlacement) {
+	if p.content == "" {
+		return
+	}
+	for i, pLine := range strings.Split(p.content, "\n") {
+		row := p.start + i
 		if row >= 0 && row < len(lines) {
 			lines[row] = pLine
 		}
 	}
-	return lines
 }
 
 // acceptCompletion replaces the current prefix with the selected completion
@@ -754,6 +961,46 @@ func (m *Model) triggerCompletion() tea.Cmd {
 	}
 }
 
+// triggerSignatureHelp checks whether the last-typed character should
+// trigger a signature help request. Returns nil if no trigger.
+func (m *Model) triggerSignatureHelp(key tea.KeyMsg) tea.Cmd {
+	if m.filePath == "" {
+		return nil
+	}
+
+	// Check typed runes for explicit dismiss/trigger characters.
+	if len(key.Runes) > 0 {
+		typed := string(key.Runes[:1])
+		if typed == ")" {
+			m.DismissSignatureHelp()
+			return nil
+		}
+		if typed == "(" || typed == "," {
+			return m.signatureHelpCmd()
+		}
+	}
+
+	// If already active, retrigger on any buffer-changing keystroke
+	// (including Backspace/Delete) so the server can update activeParameter
+	// or dismiss when the call context is deleted.
+	if m.sigHelpActive {
+		return m.signatureHelpCmd()
+	}
+
+	return nil
+}
+
+// signatureHelpCmd emits the LSP signature help request message.
+func (m *Model) signatureHelpCmd() tea.Cmd {
+	return func() tea.Msg {
+		return msg.LSPSignatureHelpRequestMsg{
+			FilePath: m.filePath,
+			Line:     m.state.CursorLine,
+			Col:      m.state.CursorCol,
+		}
+	}
+}
+
 // HandleCompletionClick checks whether viewport coordinates (x, y) land on
 // the completion popup. If they do, the clicked item is accepted and true is
 // returned. The caller should skip normal cursor placement when true.
@@ -824,11 +1071,11 @@ func (m *Model) HandleCompletionClick(_, y int) bool {
 // anchor. Returns (cmd, true) when the click was consumed.
 func (m *Model) HandleHoverClick(_, y int) (tea.Cmd, bool) {
 	viewHeight := m.viewportHeight()
-	popupLines, startRow, ok := m.hoverPopupLayout(viewHeight)
-	if !ok {
+	_, hover, _ := m.popupLayout(viewHeight)
+	if hover.content == "" {
 		return nil, false
 	}
-	if y < startRow || y >= startRow+len(popupLines) {
+	if y < hover.start || y >= hover.start+hover.height {
 		return nil, false
 	}
 	anchorLine := m.hoverPopup.AnchorLine()
@@ -850,30 +1097,26 @@ func (m *Model) HandleHoverClick(_, y int) (tea.Cmd, bool) {
 	return cmd, true
 }
 
-// overlayCompletion renders the completion popup below the cursor line,
-// truncating to fit the available viewport space.
-func (m *Model) overlayCompletion(lines []string, viewHeight int) []string {
-	// Compute rows available below the cursor.
-	cursorRow := m.state.CursorLine - m.scrollOffset
-	startRow := cursorRow + 1
-	availRows := viewHeight - startRow
-	if availRows <= 0 {
-		return lines
-	}
-
-	popup := m.completionEngine.Render(m.width, availRows, m.theme)
-	if popup == "" {
-		return lines
-	}
-	popupLines := strings.Split(popup, "\n")
-
-	for i, pLine := range popupLines {
-		row := startRow + i
-		if row >= 0 && row < len(lines) {
-			lines[row] = pLine
+// contentLineToViewRow maps a content line number to its row index in the
+// rendered viewport slice, accounting for diagnostic virtual lines that
+// renderVisibleLines inserts after each diagnosed line.
+func (m *Model) contentLineToViewRow(contentLine int) int {
+	row := contentLine - m.scrollOffset
+	for i := m.scrollOffset; i < contentLine; i++ {
+		if _, ok := m.diagnosticForLine(i); ok {
+			row++
 		}
 	}
-	return lines
+	return row
+}
+
+// completionPopupStart returns the first viewport row where the completion
+// popup should begin — directly after the cursor line. The diagnostic
+// virtual line on the cursor line (if any) is intentionally ignored so
+// that the popup position stays stable as diagnostics appear/disappear
+// during typing; the popup overlays on top of the virtual line.
+func (m *Model) completionPopupStart() int {
+	return m.contentLineToViewRow(m.state.CursorLine) + 1
 }
 
 // ScrollUp scrolls the viewport up by one line.
@@ -974,6 +1217,85 @@ func (m *Model) Redo() {
 	m.lastEditAt = time.Now()
 	m.rehighlight()
 	m.syncStatusLine()
+}
+
+// ApplyTextEdits applies a set of LSP text edits to the buffer. Edits are
+// sorted in reverse document order (bottom-up) so that earlier positions
+// remain valid as later edits shift content. Each edit is recorded in the
+// undo tree. Returns the number of edits applied.
+func (m *Model) ApplyTextEdits(edits []lsp.TextEdit) int {
+	if len(edits) == 0 {
+		return 0
+	}
+
+	// Sort edits in reverse document order so bottom-up application
+	// preserves earlier positions.
+	sorted := make([]lsp.TextEdit, len(edits))
+	copy(sorted, edits)
+	slices.SortFunc(sorted, func(a, b lsp.TextEdit) int {
+		if c := cmp.Compare(b.Range.Start.Line, a.Range.Start.Line); c != 0 {
+			return c
+		}
+		return cmp.Compare(b.Range.Start.Character, a.Range.Start.Character)
+	})
+
+	applied := 0
+	for _, edit := range sorted {
+		m.applySingleEdit(edit)
+		applied++
+	}
+
+	m.lineIndex.Rebuild(m.buf)
+	m.modified = true
+	m.lspDirty = true
+	m.lastEditAt = time.Now()
+	m.rehighlight()
+	m.syncStatusLine()
+	return applied
+}
+
+// applySingleEdit converts an LSP TextEdit to buffer operations and records
+// undo entries. The caller must call lineIndex.Rebuild afterwards.
+func (m *Model) applySingleEdit(edit lsp.TextEdit) {
+	startPos := m.lspPositionToRune(edit.Range.Start)
+	endPos := m.lspPositionToRune(edit.Range.End)
+
+	// Delete the replaced range.
+	if endPos > startPos {
+		old := m.substringAt(startPos, endPos)
+		m.buf.Delete(startPos, endPos-startPos)
+		m.undoTree.Record(buffer.EditOp{
+			Type:    buffer.EditDelete,
+			Pos:     startPos,
+			OldText: old,
+		})
+		// Rebuild line index between delete and insert so the insert
+		// position is correct after line shifts.
+		m.lineIndex.Rebuild(m.buf)
+	}
+
+	// Insert the new text.
+	if edit.NewText != "" {
+		m.buf.Insert(startPos, edit.NewText)
+		m.undoTree.Record(buffer.EditOp{
+			Type: buffer.EditInsert,
+			Pos:  startPos,
+			Text: edit.NewText,
+		})
+		m.lineIndex.Rebuild(m.buf)
+	}
+}
+
+// lspPositionToRune converts an LSP Position (line + UTF-16 character offset)
+// to an absolute rune position in the buffer.
+func (m *Model) lspPositionToRune(pos lsp.Position) int {
+	info, ok := m.lineIndex.Get(pos.Line)
+	if !ok {
+		return m.buf.Length()
+	}
+	lineText := m.substringAt(info.StartPos, info.StartPos+info.Length)
+	runeCol := lsp.UTF16ToRuneOffset(lineText, pos.Character)
+	return info.StartPos + min(runeCol, info.Length)
 }
 
 // SelectedText returns the text covered by the active selection (keyboard
@@ -1247,6 +1569,7 @@ const (
 	msgKindStandaloneResult
 	msgKindLSPCompletion
 	msgKindLSPDocHighlight
+	msgKindLSPSignatureHelp
 	msgKindUnknown
 )
 
@@ -1272,6 +1595,8 @@ func msgType(incoming tea.Msg) msgKind {
 		return msgKindLSPCompletion
 	case msg.LSPDocumentHighlightMsg:
 		return msgKindLSPDocHighlight
+	case msg.LSPSignatureHelpMsg:
+		return msgKindLSPSignatureHelp
 	default:
 		return msgKindUnknown
 	}
@@ -1289,7 +1614,8 @@ var msgHandlerTable = map[msgKind]msgHandler{
 	msgKindLSPDefinition:    handleLSPDefinition,
 	msgKindStandaloneResult: handleStandaloneResult,
 	msgKindLSPCompletion:    handleLSPCompletion,
-	msgKindLSPDocHighlight:  handleLSPDocHighlight,
+	msgKindLSPDocHighlight:   handleLSPDocHighlight,
+	msgKindLSPSignatureHelp:  handleLSPSignatureHelp,
 }
 
 func handleOpenEditor(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
@@ -1351,13 +1677,23 @@ func handleLSPCompletion(m *Model, incoming tea.Msg) (component.Component, tea.C
 		return m, nil
 	}
 	m.lspSource.SetItems(c.Items)
-	// Only re-trigger the engine if a completion session is still active.
-	// If the user dismissed the popup (Esc, arrow-away, mode change), the
-	// stale LSP response must not reopen it.
-	if m.completionEngine.Active() {
+	// Re-trigger the engine if still in insert mode. The initial
+	// triggerCompletion may have found 0 buffer-word matches (e.g. after
+	// typing "fmt.") and dismissed the engine before LSP items arrived.
+	// Mode check prevents stale responses from reopening after Esc.
+	if m.currentMode == mode.ModeInsert {
 		content := []rune(m.buf.Content())
 		m.completionEngine.Start(completion.ModeGeneric, content, m.state.Cursor, m.state.CursorLine)
 	}
+	return m, nil
+}
+
+func handleLSPSignatureHelp(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
+	sh := incoming.(msg.LSPSignatureHelpMsg)
+	if sh.Err != nil || sh.FilePath != m.filePath {
+		return m, nil
+	}
+	m.ShowSignatureHelp(sh.Result)
 	return m, nil
 }
 
@@ -1442,10 +1778,10 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 			m.completionEngine.Dismiss()
 			m.syncStatusLine()
 			return m, nil
-		case tea.KeyCtrlN:
+		case tea.KeyCtrlN, tea.KeyDown:
 			m.completionEngine.Next()
 			return m, nil
-		case tea.KeyCtrlP:
+		case tea.KeyCtrlP, tea.KeyUp:
 			m.completionEngine.Prev()
 			return m, nil
 		}
@@ -1518,10 +1854,13 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 		m.modified = true
 		m.lspDirty = true
 		m.lastEditAt = time.Now()
-		// Diagnostics are intentionally NOT cleared here. Stale diagnostics
-		// persist until the LSP server sends a fresh publishDiagnostics
-		// response after the debounced didChange. This eliminates the visual
-		// "flap" where gutter signs vanish on every keystroke.
+		// Clear stale diagnostics on edited lines so gutter signs vanish
+		// immediately when the user fixes an issue. The server will
+		// re-publish if the error persists after the didChange flush.
+		m.clearDiagnosticsOnLine(prevCursorLine)
+		if m.state.CursorLine != prevCursorLine {
+			m.clearDiagnosticsOnLine(m.state.CursorLine)
+		}
 		m.rehighlight()
 	}
 
@@ -1531,10 +1870,21 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 		cmd = tea.Batch(cmd, compCmd)
 	}
 
-	// Dismiss completion when buffer didn't change in insert mode
-	// (e.g. arrow keys moved cursor away from prefix).
-	if m.currentMode == mode.ModeInsert && !bufChanged && m.completionEngine.Active() {
-		m.completionEngine.Dismiss()
+	// Trigger signature help in insert mode on specific chars.
+	if m.currentMode == mode.ModeInsert && bufChanged {
+		sigCmd := m.triggerSignatureHelp(key)
+		cmd = tea.Batch(cmd, sigCmd)
+	}
+
+	// Dismiss completion and signature help when buffer didn't change in
+	// insert mode (e.g. arrow keys moved cursor away from context).
+	if m.currentMode == mode.ModeInsert && !bufChanged {
+		if m.completionEngine.Active() {
+			m.completionEngine.Dismiss()
+		}
+		if m.sigHelpActive {
+			m.DismissSignatureHelp()
+		}
 	}
 
 	// Clear document highlights when the cursor moves to a different word.
@@ -1549,6 +1899,11 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 		if !sameWord {
 			m.highlightRanges = nil
 		}
+	}
+
+	// Clear jump marker on any cursor movement or buffer change.
+	if m.jumpActive && (cursorMoved || bufChanged) {
+		m.jumpActive = false
 	}
 
 	m.syncStatusLine()
@@ -1587,10 +1942,17 @@ func shiftArrowMotion(key tea.KeyMsg) motion.MotionType {
 // when the editor mode changes, and dismisses completion when leaving
 // insert mode.
 func (m *Model) transitionMode(next mode.Mode) {
-	// Dismiss completion popup when leaving insert mode.
+	// Dismiss completion and signature help when leaving insert mode.
 	if m.currentMode == mode.ModeInsert && next != mode.ModeInsert {
 		m.completionEngine.Dismiss()
 		m.lspSource.Clear()
+		m.DismissSignatureHelp()
+		// Force a final didChange so the server re-publishes diagnostics
+		// for the post-edit buffer. The completion flush may have already
+		// cleared lspDirty, so we unconditionally mark dirty and zero the
+		// edit timestamp so the next 16ms tick fires the debounce immediately.
+		m.lspDirty = true
+		m.lastEditAt = time.Time{}
 	}
 
 	wasVisual := isVisualMode(m.currentMode)
@@ -1716,6 +2078,7 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 		inSelection := hasSelection && i >= selStartLine && i <= selEndLine
 		findSpans := m.findMatchSpans(i, len([]rune(contentLines[i])), colMap)
 		hlSpans := m.highlightSpansForLine(i, colMap)
+		jumpSpans := m.jumpMarkerSpansForLine(i, colMap)
 
 		// Compute diagnostic underline ranges for this line.
 		ulRanges := m.diagnosticDisplayRanges(i, colMap)
@@ -1740,6 +2103,13 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 			}
 			result = append(result, m.renderFindMatchLine(
 				i, displayLine, displayRegions, gutterWidth, defaultStyle, findSpans, curCol, ulRanges))
+		case len(jumpSpans) > 0:
+			curCol := -1
+			if i == m.state.CursorLine && m.focused && m.cursorBlink {
+				curCol = safeMapCol(colMap, m.state.CursorCol)
+			}
+			result = append(result, m.renderHighlightLine(
+				i, displayLine, displayRegions, gutterWidth, defaultStyle, jumpSpans, curCol, ulRanges))
 		case !m.findActive && i == m.state.CursorLine && m.focused:
 			displayCol := safeMapCol(colMap, m.state.CursorCol)
 			curCol := -1
@@ -1891,9 +2261,30 @@ func (m *Model) renderGutter(lineNum, gutterWidth int) string {
 		return signStyle.Render(numStr) + strings.Repeat(" ", gutterPadding)
 	}
 
+	// Jump marker dot takes priority over plain line number.
+	if m.jumpActive && lineNum == m.jumpLine {
+		dotStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Primary).Bold(true)
+		numStr := fmt.Sprintf("%*s", gutterWidth-gutterPadding, "•")
+		return dotStyle.Render(numStr) + strings.Repeat(" ", gutterPadding)
+	}
+
 	gutterStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	numStr := fmt.Sprintf("%*d", gutterWidth-gutterPadding, lineNum+1)
 	return gutterStyle.Render(numStr) + strings.Repeat(" ", gutterPadding)
+}
+
+// clearDiagnosticsOnLine removes all LSP diagnostics anchored to the given
+// line. Edits to a line invalidate any diagnostic on it; the server will
+// re-publish if the error persists after the next didChange flush.
+func (m *Model) clearDiagnosticsOnLine(line int) {
+	n := 0
+	for _, d := range m.diagnostics {
+		if d.Range.Start.Line != line {
+			m.diagnostics[n] = d
+			n++
+		}
+	}
+	m.diagnostics = m.diagnostics[:n]
 }
 
 // diagnosticForLine returns the highest-severity diagnostic on a given line.
@@ -2163,6 +2554,20 @@ func (m *Model) highlightSpansForLine(lineNum int, colMap []int) []colSpan {
 		}
 	}
 	return spans
+}
+
+// jumpMarkerSpansForLine returns a display-column span for the jump marker
+// if it overlaps the given line. Returns nil otherwise.
+func (m *Model) jumpMarkerSpansForLine(lineNum int, colMap []int) []colSpan {
+	if !m.jumpActive || lineNum != m.jumpLine {
+		return nil
+	}
+	sc := safeMapCol(colMap, m.jumpStartCol)
+	ec := safeMapCol(colMap, m.jumpEndCol)
+	if ec <= sc {
+		ec = sc + 1
+	}
+	return []colSpan{{start: sc, end: ec}}
 }
 
 // filterRegions returns regions that overlap with [startCol, endCol).

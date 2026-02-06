@@ -102,7 +102,9 @@ type Client struct {
 
 	// Server capabilities (set after initialize).
 	capabilities  ServerCapabilities
-	triggerChars  []string // completion trigger characters from server
+	triggerChars          []string // completion trigger characters from server
+	sigHelpTriggerChars   []string // signature help trigger characters
+	sigHelpRetriggerChars []string // signature help retrigger characters
 
 	// Status (atomic for lock-free reads).
 	status atomic.Int32
@@ -248,6 +250,12 @@ func (c *Client) TriggerCharacters() []string {
 	return c.triggerChars
 }
 
+// SignatureHelpTriggerCharacters returns the trigger characters for
+// signature help negotiated during initialize.
+func (c *Client) SignatureHelpTriggerCharacters() []string {
+	return c.sigHelpTriggerChars
+}
+
 // ---------------------------------------------------------------------------
 // LSP request methods (Tier 2)
 // ---------------------------------------------------------------------------
@@ -328,6 +336,43 @@ func (c *Client) Hover(ctx context.Context, filePath string, line, character int
 		return nil, fmt.Errorf("decode hover: %w", err)
 	}
 	return ToHoverResult(ph), nil
+}
+
+// SignatureHelp sends a textDocument/signatureHelp request.
+func (c *Client) SignatureHelp(ctx context.Context, filePath string, line, character int) (*SignatureHelp, error) {
+	if c.Status() != StatusReady {
+		return nil, errClientNotReady
+	}
+	uri := PathToFileURI(filePath)
+	lineText := c.documents.LineText(uri, line)
+	utf16Col := RuneOffsetToUTF16(lineText, character)
+
+	params := SignatureHelpParams{
+		TextDocumentPositionParams: TextDocumentPositionParams{
+			TextDocument: TextDocumentIdentifier{URI: uri},
+			Position:     ProtocolPosition{Line: line, Character: utf16Col},
+		},
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	resp, err := c.sendRequest(reqCtx, MethodSignatureHelp, params)
+	if err != nil {
+		return nil, fmt.Errorf("signatureHelp request: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	if string(resp.Result) == "null" {
+		return nil, nil
+	}
+
+	var ph ProtocolSignatureHelp
+	if err := json.Unmarshal(resp.Result, &ph); err != nil {
+		return nil, fmt.Errorf("decode signatureHelp: %w", err)
+	}
+	return ToSignatureHelp(ph), nil
 }
 
 // Definition sends a textDocument/definition request and returns locations.
@@ -444,6 +489,96 @@ func (c *Client) References(ctx context.Context, filePath string, line, characte
 		return nil, fmt.Errorf("decode references: %w", err)
 	}
 	return toLocationSlice(locs), nil
+}
+
+// DocumentSymbol sends a textDocument/documentSymbol request and returns symbols.
+func (c *Client) DocumentSymbol(ctx context.Context, filePath string) ([]DocumentSymbol, error) {
+	if c.Status() != StatusReady {
+		return nil, errClientNotReady
+	}
+	uri := PathToFileURI(filePath)
+	params := struct {
+		TextDocument TextDocumentIdentifier `json:"textDocument"`
+	}{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	resp, err := c.sendRequest(reqCtx, MethodDocumentSymbol, params)
+	if err != nil {
+		return nil, fmt.Errorf("documentSymbol request: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	if string(resp.Result) == "null" {
+		return nil, nil
+	}
+
+	// Try hierarchical format first (modern servers).
+	var hierarchical []ProtocolDocumentSymbol
+	if json.Unmarshal(resp.Result, &hierarchical) == nil && len(hierarchical) > 0 {
+		// Distinguish from flat format: hierarchical has selectionRange.
+		if hierarchical[0].SelectionRange != (ProtocolRange{}) || hierarchical[0].Range != (ProtocolRange{}) {
+			return toDocumentSymbols(hierarchical), nil
+		}
+	}
+
+	// Fallback: flat format (legacy servers).
+	var flat []ProtocolSymbolInformation
+	if err := json.Unmarshal(resp.Result, &flat); err != nil {
+		return nil, fmt.Errorf("decode documentSymbol: %w", err)
+	}
+	return symbolInfoToDocumentSymbols(flat), nil
+}
+
+// Format sends a textDocument/formatting request and returns text edits.
+func (c *Client) Format(ctx context.Context, filePath string, tabSize int, insertSpaces bool) ([]TextEdit, error) {
+	if c.Status() != StatusReady {
+		return nil, errClientNotReady
+	}
+	uri := PathToFileURI(filePath)
+	params := DocumentFormattingParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+		Options: ProtocolFormattingOptions{
+			TabSize:      tabSize,
+			InsertSpaces: insertSpaces,
+		},
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	resp, err := c.sendRequest(reqCtx, MethodFormatting, params)
+	if err != nil {
+		return nil, fmt.Errorf("formatting request: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	if string(resp.Result) == "null" {
+		return nil, nil
+	}
+
+	var edits []ProtocolTextEdit
+	if err := json.Unmarshal(resp.Result, &edits); err != nil {
+		return nil, fmt.Errorf("decode formatting: %w", err)
+	}
+	return toTextEdits(edits), nil
+}
+
+// toTextEdits converts wire text edits to domain TextEdit.
+func toTextEdits(pedits []ProtocolTextEdit) []TextEdit {
+	result := make([]TextEdit, len(pedits))
+	for i, pe := range pedits {
+		result[i] = TextEdit{
+			Range:   toCoreRange(pe.Range),
+			NewText: pe.NewText,
+		}
+	}
+	return result
 }
 
 // toLocationSlice converts wire locations to domain Location.
@@ -614,6 +749,16 @@ func (c *Client) initialize(ctx context.Context) error {
 				Definition:        DefinitionClientCapabilities{},
 				DocumentHighlight: DocumentHighlightClientCapabilities{},
 				References:        ReferencesClientCapabilities{},
+				DocumentSymbol: DocumentSymbolClientCapabilities{
+					HierarchicalDocumentSymbolSupport: true,
+				},
+				SignatureHelp: SignatureHelpClientCapabilities{
+					SignatureInformation: &SignatureInfoClientCaps{
+						ParameterInformation: &ParamInfoClientCaps{
+							LabelOffsetSupport: true,
+						},
+					},
+				},
 			},
 		},
 		ClientInfo: &ClientInfo{
@@ -639,6 +784,7 @@ func (c *Client) initialize(ctx context.Context) error {
 	c.capabilities = ToServerCapabilities(result.Capabilities)
 	c.syncKind = ToSyncKind(result.Capabilities.TextDocumentSync)
 	c.triggerChars = CompletionTriggerChars(result.Capabilities.CompletionProvider)
+	c.sigHelpTriggerChars, c.sigHelpRetriggerChars = SignatureHelpTriggerChars(result.Capabilities.SignatureHelpProvider)
 
 	// Send "initialized" notification.
 	return c.sendNotification(MethodInitialized, struct{}{})

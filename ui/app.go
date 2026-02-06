@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -440,20 +441,20 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.SubmitPromptMsg:
 		if m.editCmdInput {
 			m.editCmdInput = false
-			m.handleExCommand(typed.Text)
+			exCmd := m.handleExCommand(typed.Text)
 			if m.editMode {
 				m.focus.SetFocus(component.FocusCodeViewer)
 				m.syncFocusState()
 			}
-			return m, nil
+			return m, exCmd
 		}
 		if m.editMode {
-			m.handleExCommand(typed.Text)
+			exCmd := m.handleExCommand(typed.Text)
 			if m.editMode {
 				m.focus.SetFocus(component.FocusCodeViewer)
 				m.syncFocusState()
 			}
-			return m, nil
+			return m, exCmd
 		}
 		return m, m.handleSubmit(typed)
 	case msg.InterruptMsg:
@@ -543,8 +544,25 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		_, cmd := m.inlineEditor.Update(typed)
 		return m, cmd
 	case msg.LSPCompletionRequestMsg:
-		return m, m.lspCompletionCmd(typed.FilePath, typed.Line, typed.Col)
+		// Flush pending didChange so the server sees the latest buffer content.
+		var flushContent string
+		if m.inlineEditor.LSPDirty() {
+			m.inlineEditor.ClearLSPDirty()
+			flushContent = m.inlineEditor.Content()
+		}
+		return m, m.lspCompletionCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
 	case msg.LSPCompletionMsg:
+		m.inlineEditor.Update(typed)
+		return m, nil
+	case msg.LSPSignatureHelpRequestMsg:
+		// Flush pending didChange so the server sees the trigger character.
+		var flushContent string
+		if m.inlineEditor.LSPDirty() {
+			m.inlineEditor.ClearLSPDirty()
+			flushContent = m.inlineEditor.Content()
+		}
+		return m, m.lspSignatureHelpCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
+	case msg.LSPSignatureHelpMsg:
 		m.inlineEditor.Update(typed)
 		return m, nil
 	case msg.LSPDocHighlightTickMsg:
@@ -556,6 +574,12 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.lspReferencesCmd(typed.FilePath, typed.Line, typed.Col)
 	case msg.LSPReferencesMsg:
 		return m, m.handleLSPReferences(typed)
+	case msg.LSPDocumentSymbolMsg:
+		return m, m.handleLSPDocumentSymbol(typed)
+	case msg.LSPFormatRequestMsg:
+		return m, m.lspFormatCmd(typed.FilePath)
+	case msg.LSPFormatMsg:
+		return m, m.handleLSPFormat(typed)
 	case msg.NerdFontsResultMsg:
 		// Don't switch icon mode mid-session — the terminal won't render
 		// newly-installed Nerd Font glyphs until restarted. The install
@@ -697,6 +721,15 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Alt+Shift+. (alt+>): document symbols for current file (edit mode).
+	if ks == "alt+>" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		fp := m.inlineEditor.FilePath()
+		if fp != "" {
+			return m, m.lspDocumentSymbolCmd(fp)
+		}
+		return m, nil
+	}
+
 	// Alt+E toggles inline edit mode.
 	if key.String() == "alt+e" {
 		return m, m.toggleEditMode()
@@ -705,7 +738,7 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Escape: close references panel if active, abort command input,
 	// route to editor in edit mode, or double-tap to interrupt agent.
 	if key.String() == "esc" {
-		if m.fileTree.InReferencesMode() && m.focus.Current() == component.FocusFileTree {
+		if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode()) && m.focus.Current() == component.FocusFileTree {
 			m.fileTree.Update(key)
 			return m, nil
 		}
@@ -1169,6 +1202,93 @@ func readLineFromFile(path string, lineNum int) string {
 	return strings.TrimSpace(lines[lineNum])
 }
 
+// ---------------------------------------------------------------------------
+// LSP Document Symbols
+// ---------------------------------------------------------------------------
+
+// lspDocumentSymbolCmd returns a Cmd that requests document symbols for the
+// given file. Results arrive as msg.LSPDocumentSymbolMsg.
+func (m *AppModel) lspDocumentSymbolCmd(filePath string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		syms, err := mgr.DocumentSymbol(ctx, root, filePath)
+		return msg.LSPDocumentSymbolMsg{
+			FilePath: filePath,
+			Symbols:  syms,
+			Err:      err,
+		}
+	}
+}
+
+// lspFormatCmd sends a textDocument/formatting request to the language server.
+func (m *AppModel) lspFormatCmd(filePath string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	tabSize := m.inlineEditor.TabWidth()
+	return func() tea.Msg {
+		edits, err := mgr.Format(ctx, root, filePath, tabSize, false)
+		return msg.LSPFormatMsg{
+			FilePath: filePath,
+			Edits:    edits,
+			Err:      err,
+		}
+	}
+}
+
+// handleLSPFormat applies formatting edits from the language server.
+func (m *AppModel) handleLSPFormat(r msg.LSPFormatMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Format: " + r.Err.Error())
+		return nil
+	}
+	if len(r.Edits) == 0 {
+		m.statusBar.SetFlash("Already formatted")
+		return nil
+	}
+	n := m.inlineEditor.ApplyTextEdits(r.Edits)
+	m.statusBar.SetFlash(fmt.Sprintf("Formatted (%d edits)", n))
+	return nil
+}
+
+// handleLSPDocumentSymbol displays document symbols in the file tree panel.
+func (m *AppModel) handleLSPDocumentSymbol(r msg.LSPDocumentSymbolMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Symbols: " + r.Err.Error())
+		return nil
+	}
+	if len(r.Symbols) == 0 {
+		m.statusBar.SetFlash("No symbols found")
+		return nil
+	}
+	title := filepath.Base(r.FilePath)
+	entries := flattenSymbols(r.Symbols, 0)
+	m.fileTree.SetDocumentSymbols(title, r.FilePath, entries)
+	m.focus.SetFocus(component.FocusFileTree)
+	m.syncFocusState()
+	return nil
+}
+
+// flattenSymbols recursively converts hierarchical DocumentSymbol trees into a
+// flat, depth-annotated SymbolEntry list for display in the file tree panel.
+func flattenSymbols(syms []lsp.DocumentSymbol, depth int) []filetree.SymbolEntry {
+	var result []filetree.SymbolEntry
+	for _, s := range syms {
+		result = append(result, filetree.SymbolEntry{
+			Name:   s.Name,
+			Kind:   s.Kind,
+			Line:   s.SelectionRange.Start.Line,
+			Col:    s.SelectionRange.Start.Character,
+			Detail: s.Detail,
+			Depth:  depth,
+		})
+		result = append(result, flattenSymbols(s.Children, depth+1)...)
+	}
+	return result
+}
+
 // handleHoverDefinition stores the definition symbol and package path on the
 // active hover tooltip. If the hover content hasn't arrived yet, stashes
 // the info so it can be applied when the hover activates.
@@ -1242,15 +1362,42 @@ func stripModVersion(path string) string {
 }
 
 // lspCompletionCmd returns a Cmd that requests completion items from the LSP.
-func (m *AppModel) lspCompletionCmd(filePath string, line, col int) tea.Cmd {
+// If flushContent is non-empty, a didChange notification is sent first so
+// the server sees the latest buffer content before the request arrives.
+func (m *AppModel) lspCompletionCmd(filePath string, line, col int, flushContent string) tea.Cmd {
 	mgr := m.lspManager
 	root := m.config.ProjectRoot
 	ctx := m.ctx
 	return func() tea.Msg {
+		if flushContent != "" {
+			_ = mgr.NotifyDidChange(ctx, root, filePath, flushContent)
+		}
 		items, err := mgr.Completion(ctx, root, filePath, line, col)
 		return msg.LSPCompletionMsg{
 			FilePath: filePath,
 			Items:    items,
+			Err:      err,
+		}
+	}
+}
+
+// lspSignatureHelpCmd returns a Cmd that requests signature help from the LSP.
+// If flushContent is non-empty, a didChange notification is sent first so
+// the server sees the trigger character before the request arrives.
+func (m *AppModel) lspSignatureHelpCmd(filePath string, line, col int, flushContent string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		if flushContent != "" {
+			_ = mgr.NotifyDidChange(ctx, root, filePath, flushContent)
+		}
+		result, err := mgr.SignatureHelp(ctx, root, filePath, line, col)
+		return msg.LSPSignatureHelpMsg{
+			FilePath: filePath,
+			Line:     line,
+			Col:      col,
+			Result:   result,
 			Err:      err,
 		}
 	}
@@ -1318,9 +1465,12 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 
 		// Restore from snapshot if available, otherwise load from disk.
 		if m.inlineEditor.FilePath() == o.Path {
-			// Already on this file — no switch needed.
+			// Already on this file — no switch needed, just jump.
 			if o.Line > 0 {
-				m.codePanel.ScrollToLine(o.Line - 1)
+				targetLine := o.Line - 1
+				m.inlineEditor.GoToLine(targetLine)
+				m.codePanel.ScrollToLine(targetLine)
+				m.setJumpMarker(targetLine, o.Col, o.EndCol)
 			}
 			return nil
 		} else if snap, ok := m.editSnapshots[o.Path]; ok {
@@ -1332,10 +1482,31 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 	}
 
 	if o.Line > 0 {
-		m.codePanel.ScrollToLine(o.Line - 1) // convert 1-based to 0-based
+		targetLine := o.Line - 1
+		m.codePanel.ScrollToLine(targetLine)
+		if m.editMode {
+			m.inlineEditor.GoToLine(targetLine)
+			m.setJumpMarker(targetLine, o.Col, o.EndCol)
+		}
 	}
 
 	return m.lspDidOpenCmd(o.Path, detectEditorLanguage(o.Path), lspContent)
+}
+
+// setJumpMarker activates the visual jump marker on the inline editor when
+// column info is available. When endCol is 0, derives bounds from the word
+// at the given column.
+func (m *AppModel) setJumpMarker(line, col, endCol int) {
+	if col <= 0 && endCol <= 0 {
+		return
+	}
+	startCol, ec := col, endCol
+	if ec <= startCol {
+		startCol, ec = m.inlineEditor.WordBoundsAt(line, col)
+	}
+	if ec > startCol {
+		m.inlineEditor.SetJumpMarker(line, startCol, ec)
+	}
 }
 
 func (m *AppModel) handleCloseEditor() tea.Cmd {
@@ -1671,7 +1842,7 @@ func (m *AppModel) restoreEditorSnapshot(snap *editorSnapshot) {
 // handleExCommand processes a vim ex command entered in the input panel
 // during edit mode. Supported: :w (save), :q (quit), :wq (save+quit),
 // :q! (force quit).
-func (m *AppModel) handleExCommand(text string) {
+func (m *AppModel) handleExCommand(text string) tea.Cmd {
 	cmd := strings.TrimSpace(text)
 
 	// Strip leading ':' if present.
@@ -1684,7 +1855,7 @@ func (m *AppModel) handleExCommand(text string) {
 	case "q":
 		if m.inlineEditor.Modified() {
 			m.statusBar.SetFlash("Unsaved changes (use :q! to discard)")
-			return
+			return nil
 		}
 		m.exitEditMode()
 	case "wq", "x":
@@ -1693,9 +1864,18 @@ func (m *AppModel) handleExCommand(text string) {
 	case "q!":
 		delete(m.editSnapshots, m.inlineEditor.FilePath())
 		m.exitEditMode()
+	case "symbols":
+		if fp := m.inlineEditor.FilePath(); fp != "" {
+			return m.lspDocumentSymbolCmd(fp)
+		}
+	case "format", "fmt":
+		if fp := m.inlineEditor.FilePath(); fp != "" {
+			return m.lspFormatCmd(fp)
+		}
 	default:
 		m.statusBar.SetFlash("Unknown command: :" + cmd)
 	}
+	return nil
 }
 
 // saveEditorBuffer writes the inline editor buffer to disk.

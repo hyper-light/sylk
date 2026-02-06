@@ -149,6 +149,12 @@ type ServerCapabilities struct {
 
 	// DocumentHighlightProvider indicates the server supports document highlights.
 	DocumentHighlightProvider bool
+
+	// SignatureHelpProvider indicates the server supports signature help.
+	SignatureHelpProvider bool
+
+	// FormattingProvider indicates the server supports document formatting.
+	FormattingProvider bool
 }
 
 // ClientStatus represents the current state of an LSP client connection.
@@ -308,6 +314,14 @@ type Position struct {
 
 	// Character is the 0-based character offset within the line.
 	Character int
+}
+
+// TextEdit represents a change to a text document. The range describes the
+// region to replace; newText is the replacement. An empty newText deletes
+// the range; an empty range (start == end) inserts at the position.
+type TextEdit struct {
+	Range   Range
+	NewText string
 }
 
 // LSPConfig provides user-configurable overrides for language server settings.
@@ -594,6 +608,113 @@ func ToCompletionItems(items []ProtocolCompletionItem) []CompletionItem {
 		}
 	}
 	return result
+}
+
+// ---------------------------------------------------------------------------
+// Document Symbol domain types
+// ---------------------------------------------------------------------------
+
+// SymbolKind identifies the kind of a document symbol per the LSP spec.
+type SymbolKind int
+
+const (
+	SymbolKindFile          SymbolKind = 1
+	SymbolKindModule        SymbolKind = 2
+	SymbolKindNamespace     SymbolKind = 3
+	SymbolKindPackage       SymbolKind = 4
+	SymbolKindClass         SymbolKind = 5
+	SymbolKindMethod        SymbolKind = 6
+	SymbolKindProperty      SymbolKind = 7
+	SymbolKindField         SymbolKind = 8
+	SymbolKindConstructor   SymbolKind = 9
+	SymbolKindEnum          SymbolKind = 10
+	SymbolKindInterface     SymbolKind = 11
+	SymbolKindFunction      SymbolKind = 12
+	SymbolKindVariable      SymbolKind = 13
+	SymbolKindConstant      SymbolKind = 14
+	SymbolKindString        SymbolKind = 15
+	SymbolKindNumber        SymbolKind = 16
+	SymbolKindBoolean       SymbolKind = 17
+	SymbolKindArray         SymbolKind = 18
+	SymbolKindObject        SymbolKind = 19
+	SymbolKindKey           SymbolKind = 20
+	SymbolKindNull          SymbolKind = 21
+	SymbolKindEnumMember    SymbolKind = 22
+	SymbolKindStruct        SymbolKind = 23
+	SymbolKindEvent         SymbolKind = 24
+	SymbolKindOperator      SymbolKind = 25
+	SymbolKindTypeParameter SymbolKind = 26
+)
+
+var symbolKindLabels = map[SymbolKind]string{
+	SymbolKindFile:          "file",
+	SymbolKindModule:        "mod",
+	SymbolKindNamespace:     "ns",
+	SymbolKindPackage:       "pkg",
+	SymbolKindClass:         "class",
+	SymbolKindMethod:        "meth",
+	SymbolKindProperty:      "prop",
+	SymbolKindField:         "field",
+	SymbolKindConstructor:   "ctor",
+	SymbolKindEnum:          "enum",
+	SymbolKindInterface:     "iface",
+	SymbolKindFunction:      "fn",
+	SymbolKindVariable:      "var",
+	SymbolKindConstant:      "const",
+	SymbolKindString:        "str",
+	SymbolKindNumber:        "num",
+	SymbolKindBoolean:       "bool",
+	SymbolKindArray:         "arr",
+	SymbolKindObject:        "obj",
+	SymbolKindKey:           "key",
+	SymbolKindNull:          "null",
+	SymbolKindEnumMember:    "enumv",
+	SymbolKindStruct:        "struct",
+	SymbolKindEvent:         "event",
+	SymbolKindOperator:      "op",
+	SymbolKindTypeParameter: "tparam",
+}
+
+// SymbolKindLabel returns a short human-readable label for a SymbolKind.
+func SymbolKindLabel(k SymbolKind) string {
+	if label, ok := symbolKindLabels[k]; ok {
+		return label
+	}
+	return "sym"
+}
+
+// DocumentSymbol represents a symbol in a document (function, class, variable, etc.).
+type DocumentSymbol struct {
+	Name           string
+	Detail         string
+	Kind           SymbolKind
+	Range          Range          // Full declaration span.
+	SelectionRange Range          // Name span (for cursor positioning).
+	Children       []DocumentSymbol
+}
+
+// ---------------------------------------------------------------------------
+// Signature Help
+// ---------------------------------------------------------------------------
+
+// SignatureHelp is the domain-level representation of a signature help response.
+type SignatureHelp struct {
+	Signatures      []SignatureInformation
+	ActiveSignature int
+	ActiveParameter int
+}
+
+// SignatureInformation represents one overload of a callable symbol.
+type SignatureInformation struct {
+	Label      string
+	Parameters []ParameterInformation
+}
+
+// ParameterInformation represents one parameter in a signature.
+// Exactly one of LabelString or LabelOffsets is populated.
+type ParameterInformation struct {
+	LabelString  string // Non-empty when label is a string.
+	LabelOffsets [2]int // Non-zero when label is [start, end] byte offsets.
 }
 
 // ToHoverResult converts a wire-format hover result to the domain type.

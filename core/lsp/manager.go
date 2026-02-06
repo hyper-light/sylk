@@ -188,6 +188,25 @@ func (m *Manager) DocumentHighlight(ctx context.Context, projectRoot, filePath s
 	return client.DocumentHighlight(ctx, filePath, line, character)
 }
 
+// SignatureHelp sends a signature help request to the appropriate client.
+func (m *Manager) SignatureHelp(ctx context.Context, projectRoot, filePath string, line, character int) (*SignatureHelp, error) {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return nil, nil
+	}
+	return client.SignatureHelp(ctx, filePath, line, character)
+}
+
+// SignatureHelpTriggerCharacters returns signature help trigger characters
+// for the server handling the given file.
+func (m *Manager) SignatureHelpTriggerCharacters(projectRoot, filePath string) []string {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return nil
+	}
+	return client.SignatureHelpTriggerCharacters()
+}
+
 // References sends a references request to the appropriate client.
 func (m *Manager) References(ctx context.Context, projectRoot, filePath string, line, character int, includeDeclaration bool) ([]Location, error) {
 	client := m.clientForFile(projectRoot, filePath)
@@ -195,6 +214,24 @@ func (m *Manager) References(ctx context.Context, projectRoot, filePath string, 
 		return nil, nil
 	}
 	return client.References(ctx, filePath, line, character, includeDeclaration)
+}
+
+// DocumentSymbol sends a documentSymbol request to the appropriate client.
+func (m *Manager) DocumentSymbol(ctx context.Context, projectRoot, filePath string) ([]DocumentSymbol, error) {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return nil, nil
+	}
+	return client.DocumentSymbol(ctx, filePath)
+}
+
+// Format sends a formatting request to the appropriate client.
+func (m *Manager) Format(ctx context.Context, projectRoot, filePath string, tabSize int, insertSpaces bool) ([]TextEdit, error) {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return nil, nil
+	}
+	return client.Format(ctx, filePath, tabSize, insertSpaces)
 }
 
 // TriggerCharacters returns completion trigger characters for the server

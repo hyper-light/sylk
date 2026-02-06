@@ -86,16 +86,29 @@ const maxCompletionItems = 200
 // popup UX conventions.
 const maxVisibleItems = 10
 
+// maxRowShrinkPerUpdate is the maximum number of rows the popup can
+// shrink per Start() call. Limits visual bounce while allowing gradual
+// resizing. Derived from: at 2 rows per update, a 10-row popup reaches
+// its target in at most 5 keystrokes.
+const maxRowShrinkPerUpdate = 2
+
+// maxWidthShrinkPerUpdate is the maximum number of columns the popup can
+// shrink per Start() call. Derived from: at 4 chars per update, a
+// 28-char popup reaches its target in at most 7 keystrokes.
+const maxWidthShrinkPerUpdate = 4
+
 // Engine manages the lifecycle and rendering of the completion popup.
 type Engine struct {
-	mu       sync.RWMutex
-	sources  *SourceRegistry
-	active   bool
-	items    []CompletionItem
-	selected int
-	prefix   string
-	startCol int
-	mode     CompletionMode
+	mu           sync.RWMutex
+	sources      *SourceRegistry
+	active       bool
+	items        []CompletionItem
+	selected     int
+	prefix       string
+	startCol     int
+	mode         CompletionMode
+	sessionWidth int // damped popup width — grows instantly, shrinks gradually
+	sessionRows  int // damped visible row count — grows instantly, shrinks gradually
 }
 
 // NewEngine creates an Engine backed by the given source registry.
@@ -121,12 +134,35 @@ func (e *Engine) Start(mode CompletionMode, content []rune, cursorPos int, curre
 	}
 
 	e.mu.Lock()
+	// Preserve the previously selected word across re-triggers so the
+	// highlight doesn't jump to the top on every keystroke.
+	prevWord := ""
+	if e.active && e.selected < len(e.items) {
+		prevWord = e.items[e.selected].Word
+	}
+
 	e.active = len(items) > 0
 	e.items = items
-	e.selected = 0
+	e.selected = findItemIndex(items, prevWord)
 	e.prefix = prefix
 	e.startCol = cursorPos - utf8.RuneCountInString(prefix)
 	e.mode = mode
+
+	// Track popup dimensions with damped shrinking: grow instantly so new
+	// items are always visible, shrink at most N units per keystroke to
+	// avoid frame-to-frame bounce while still converging to target size.
+	targetWidth := e.longestWord(items) + kindBadgeWidth + rowPadding
+	if targetWidth > e.sessionWidth {
+		e.sessionWidth = targetWidth
+	} else if targetWidth < e.sessionWidth {
+		e.sessionWidth = max(targetWidth, e.sessionWidth-maxWidthShrinkPerUpdate)
+	}
+	targetRows := min(len(items), maxVisibleItems)
+	if targetRows > e.sessionRows {
+		e.sessionRows = targetRows
+	} else if targetRows < e.sessionRows {
+		e.sessionRows = max(targetRows, e.sessionRows-maxRowShrinkPerUpdate)
+	}
 	e.mu.Unlock()
 }
 
@@ -242,6 +278,19 @@ func (e *Engine) deactivate() {
 	e.selected = 0
 	e.prefix = ""
 	e.startCol = 0
+	e.sessionWidth = 0
+	e.sessionRows = 0
+}
+
+// findItemIndex returns the index of the item whose Word matches target,
+// or 0 if not found. Used to preserve selection across re-triggers.
+func findItemIndex(items []CompletionItem, target string) int {
+	for i, item := range items {
+		if item.Word == target {
+			return i
+		}
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +326,11 @@ func (e *Engine) Render(width, maxHeight int, th *theme.Theme) string {
 	visibleStart, visibleEnd := e.visibleWindowN(itemLimit)
 	visible := e.items[visibleStart:visibleEnd]
 
-	wordCol := e.longestWord(visible)
+	// Use sessionWidth (damped) so the popup shrinks gradually rather
+	// than snapping to a narrower size on every keystroke.
+	wordCol := e.longestWord(e.items)
+	computedWidth := wordCol + kindBadgeWidth + rowPadding
+	stableWidth := max(computedWidth, e.sessionWidth)
 
 	borderStyle := lipgloss.NewStyle().
 		Foreground(th.Palette.Border).
@@ -296,18 +349,26 @@ func (e *Engine) Render(width, maxHeight int, th *theme.Theme) string {
 		Foreground(th.Palette.Background).
 		Background(th.Palette.Primary)
 
-	maxWidth := min(wordCol+kindBadgeWidth+rowPadding, max(width, popupColWidth))
+	maxWidth := min(stableWidth, max(width, popupColWidth))
+
+	// Use sessionRows (damped) so the popup height shrinks gradually.
+	stableRows := min(max(e.sessionRows, len(visible)), itemLimit)
 
 	var b strings.Builder
 	topBorder := borderStyle.Render(strings.Repeat("\u2500", maxWidth))
 	b.WriteString(topBorder)
 	b.WriteRune('\n')
 
-	for i, item := range visible {
-		isSelected := (visibleStart + i) == e.selected
-		row := e.renderRow(item, wordCol, maxWidth, isSelected, normalStyle, selectedStyle, kindStyle, kindSelectedStyle)
-		b.WriteString(row)
-		if i < len(visible)-1 {
+	for i := range stableRows {
+		if i < len(visible) {
+			isSelected := (visibleStart + i) == e.selected
+			row := e.renderRow(visible[i], wordCol, maxWidth, isSelected, normalStyle, selectedStyle, kindStyle, kindSelectedStyle)
+			b.WriteString(row)
+		} else {
+			// Pad empty row to maintain stable height.
+			b.WriteString(normalStyle.Render(strings.Repeat(" ", maxWidth)))
+		}
+		if i < stableRows-1 {
 			b.WriteRune('\n')
 		}
 	}
@@ -316,13 +377,13 @@ func (e *Engine) Render(width, maxHeight int, th *theme.Theme) string {
 	bottomBorder := borderStyle.Render(strings.Repeat("\u2500", maxWidth))
 	b.WriteString(bottomBorder)
 
-	// Footer: key hints and optional scroll indicator.
+	// Footer: key hints and optional scroll indicator, padded to full width.
 	b.WriteRune('\n')
 	footer := " Tab select"
 	if len(e.items) > len(visible) {
 		footer = fmt.Sprintf(" %d/%d  Tab select", e.selected+1, len(e.items))
 	}
-	b.WriteString(borderStyle.Render(footer))
+	b.WriteString(borderStyle.Render(padRight(footer, maxWidth)))
 
 	return b.String()
 }
@@ -387,12 +448,12 @@ func (e *Engine) renderRow(
 
 	badge := badgeStyle.Render(fmt.Sprintf("[%-*s]", maxKindNameLen, item.Kind.KindName()))
 	word := padRight(item.Word, wordCol)
-	text := rowStyle.Render(word)
 
-	row := fmt.Sprintf(" %s %s", badge, text)
+	// Style every segment (including spaces) so the background is uniform.
+	row := rowStyle.Render(" ") + badge + rowStyle.Render(" ") + rowStyle.Render(word)
 
 	// Pad to maxWidth for consistent row widths across the popup.
-	visibleWidth := utf8.RuneCountInString(stripAnsi(row))
+	visibleWidth := lipgloss.Width(row)
 	if visibleWidth < maxWidth {
 		row += rowStyle.Render(strings.Repeat(" ", maxWidth-visibleWidth))
 	}
@@ -433,25 +494,3 @@ func padRight(s string, w int) string {
 	return s + strings.Repeat(" ", w-n)
 }
 
-// stripAnsi removes ANSI escape sequences for width measurement.
-// This is a minimal implementation covering the CSI sequences produced
-// by lipgloss.
-func stripAnsi(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	inEscape := false
-	for _, r := range s {
-		if r == '\x1b' {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
-				inEscape = false
-			}
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}

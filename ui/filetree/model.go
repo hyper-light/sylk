@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -56,7 +57,8 @@ type viewMode int
 const (
 	viewTree       viewMode = iota
 	viewSearch
-	viewReferences // LSP references results.
+	viewReferences  // LSP references results.
+	viewDocSymbols  // LSP document symbol outline.
 )
 
 // searchItemKind classifies entries in the search results list.
@@ -99,6 +101,16 @@ type ReferenceEntry struct {
 
 	// Preview is the trimmed content of the referenced line.
 	Preview string
+}
+
+// SymbolEntry represents a single document symbol in a flat, depth-annotated list.
+type SymbolEntry struct {
+	Name   string
+	Kind   lsp.SymbolKind
+	Line   int    // 0-indexed start line.
+	Col    int    // 0-indexed start column.
+	Detail string // Optional detail (e.g., return type).
+	Depth  int    // Nesting depth (0 = top-level).
 }
 
 // searchFocus identifies which element in the search footer has keyboard focus.
@@ -287,6 +299,15 @@ type Model struct {
 	refScroll   int
 	refNumWidth int // Digit width of the largest line number in results.
 
+	// Document symbols state (viewDocSymbols mode).
+	symTitle    string        // File name shown in header.
+	symFilePath string        // Absolute file path for navigation.
+	symEntries  []SymbolEntry // Flat, depth-annotated symbol list.
+	symItems    []searchItem  // Flat searchItem list for rendering.
+	symCursor   int
+	symScroll   int
+	symNumWidth int // Digit width for line numbers.
+
 	// New-entry state: two-phase (pending chord → active input).
 	pendingNewEntry bool   // Alt+N pressed, waiting for F (file) or D (dir).
 	newEntryActive  bool   // Whether the input footer is visible.
@@ -373,6 +394,8 @@ func (m *Model) View() string {
 		return m.viewSearchMode()
 	case viewReferences:
 		return m.viewReferencesMode()
+	case viewDocSymbols:
+		return m.viewDocSymbolsMode()
 	default:
 		return m.viewTreeMode()
 	}
@@ -461,6 +484,8 @@ func (m *Model) activeScroll() *int {
 		return &m.searchScroll
 	case viewReferences:
 		return &m.refScroll
+	case viewDocSymbols:
+		return &m.symScroll
 	default:
 		return &m.scroll
 	}
@@ -473,6 +498,8 @@ func (m *Model) visibleItemCount() int {
 		return len(m.searchItems)
 	case viewReferences:
 		return len(m.refItems)
+	case viewDocSymbols:
+		return len(m.symItems)
 	default:
 		return len(m.entries)
 	}
@@ -497,6 +524,11 @@ func (m *Model) InSearchMode() bool {
 // InReferencesMode reports whether the file tree is showing LSP references.
 func (m *Model) InReferencesMode() bool {
 	return m.mode == viewReferences
+}
+
+// InDocSymbolsMode reports whether the file tree is showing document symbols.
+func (m *Model) InDocSymbolsMode() bool {
+	return m.mode == viewDocSymbols
 }
 
 // SetReferences switches the panel to references mode, displaying the given
@@ -583,6 +615,75 @@ func (m *Model) exitReferences() {
 	m.refNumWidth = 0
 }
 
+// SetDocumentSymbols switches the panel to document symbols mode, displaying
+// the given entries as a flat outline. Snapshots tree state for restore on exit.
+func (m *Model) SetDocumentSymbols(title, filePath string, entries []SymbolEntry) {
+	if m.mode == viewSearch {
+		m.exitSearch()
+	}
+	if m.mode == viewReferences {
+		m.exitReferences()
+	}
+	if m.mode != viewDocSymbols {
+		m.savedEntries = make([]Entry, len(m.entries))
+		copy(m.savedEntries, m.entries)
+		m.savedCursor = m.cursor
+		m.savedScroll = m.scroll
+	}
+
+	m.symTitle = title
+	m.symFilePath = filePath
+	m.symEntries = entries
+	m.symItems, m.symNumWidth = buildSymItems(entries)
+	m.symCursor = 0
+	m.symScroll = 0
+	m.mode = viewDocSymbols
+}
+
+// buildSymItems converts symbol entries into a flat searchItem list.
+// Each symbol becomes a match line with kind label and indented name.
+func buildSymItems(entries []SymbolEntry) ([]searchItem, int) {
+	if len(entries) == 0 {
+		return nil, 0
+	}
+	items := make([]searchItem, len(entries))
+	maxLine := 0
+	for i, e := range entries {
+		displayLine := e.Line + 1 // 1-based for display.
+		indent := strings.Repeat("  ", e.Depth)
+		label := lsp.SymbolKindLabel(e.Kind)
+		text := indent + label + " " + e.Name
+		if e.Detail != "" {
+			text += " " + e.Detail
+		}
+		items[i] = searchItem{
+			kind: searchItemMatch,
+			line: displayLine,
+			text: text,
+		}
+		maxLine = max(maxLine, displayLine)
+	}
+	return items, digitCount(maxLine)
+}
+
+// exitDocSymbols restores the tree state from before document symbols mode.
+func (m *Model) exitDocSymbols() {
+	m.entries = m.savedEntries
+	m.rebuildPathIndex()
+	m.cursor = m.savedCursor
+	m.scroll = m.savedScroll
+	m.mode = viewTree
+
+	m.savedEntries = nil
+	m.symTitle = ""
+	m.symFilePath = ""
+	m.symEntries = nil
+	m.symItems = nil
+	m.symCursor = 0
+	m.symScroll = 0
+	m.symNumWidth = 0
+}
+
 // ClickAt handles a left-click at the given content-relative coordinates.
 // viewX is the column offset within the panel content area; viewY is the
 // row offset (0 = first line inside the panel border).
@@ -592,6 +693,8 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 		return m.clickSearchMode(viewX, viewY)
 	case viewReferences:
 		return m.clickReferencesMode(viewY)
+	case viewDocSymbols:
+		return m.clickDocSymbolsMode(viewY)
 	default:
 		return m.clickTreeMode(viewY)
 	}
@@ -707,6 +810,8 @@ func (m *Model) RevealPath(targetPath string) {
 		m.exitSearch()
 	case viewReferences:
 		m.exitReferences()
+	case viewDocSymbols:
+		m.exitDocSymbols()
 	}
 
 	// Fast path: file is already visible in the flat entry list.
@@ -791,6 +896,9 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 	}
 	if m.pendingNewEntry {
 		return m.handlePendingNewEntry(key)
+	}
+	if m.mode == viewDocSymbols {
+		return m.handleDocSymbolsKey(key)
 	}
 	if m.mode == viewReferences {
 		return m.handleReferencesKey(key)
@@ -896,6 +1004,17 @@ func (m *Model) activateRefResult() tea.Cmd {
 	name := filepath.Base(path)
 	lang := langFromPath(path)
 
+	// Look up column from the matching reference entry.
+	col := 0
+	if line > 0 {
+		for _, e := range m.refEntries {
+			if e.AbsPath == path && e.Line+1 == line {
+				col = e.Col
+				break
+			}
+		}
+	}
+
 	m.exitReferences()
 
 	return func() tea.Msg {
@@ -904,6 +1023,7 @@ func (m *Model) activateRefResult() tea.Cmd {
 			Name:     name,
 			Language: lang,
 			Line:     line,
+			Col:      col,
 		}
 	}
 }
@@ -922,6 +1042,104 @@ func (m *Model) ensureRefCursorVisible() {
 	}
 	maxScroll := max(len(m.refItems)-bh, 0)
 	m.refScroll = clampInt(m.refScroll, 0, maxScroll)
+}
+
+// ---------------------------------------------------------------------------
+// Document symbols key handling
+// ---------------------------------------------------------------------------
+
+// handleDocSymbolsKey processes keys in document symbols mode.
+func (m *Model) handleDocSymbolsKey(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case "esc", "q":
+		m.exitDocSymbols()
+	case "up", "k":
+		m.moveSymCursor(-1)
+	case "down", "j":
+		m.moveSymCursor(1)
+	case "enter":
+		return m.activateSymResult()
+	case "g":
+		m.symCursor = 0
+		m.symScroll = 0
+	case "G":
+		if len(m.symItems) > 0 {
+			m.symCursor = len(m.symItems) - 1
+			m.ensureSymCursorVisible()
+		}
+	}
+	return nil
+}
+
+// moveSymCursor moves the cursor within symbol items (no gaps to skip).
+func (m *Model) moveSymCursor(delta int) {
+	n := len(m.symItems)
+	if n == 0 {
+		return
+	}
+	m.symCursor = clampInt(m.symCursor+delta, 0, n-1)
+	m.ensureSymCursorVisible()
+}
+
+// activateSymResult handles Enter on a symbol entry.
+// Exits doc symbols mode and returns a FileOpenMsg for navigation.
+func (m *Model) activateSymResult() tea.Cmd {
+	if m.symCursor >= len(m.symItems) || m.symCursor >= len(m.symEntries) {
+		return nil
+	}
+	entry := m.symEntries[m.symCursor]
+	item := m.symItems[m.symCursor]
+	line := item.line // 1-based
+
+	path := m.symFilePath
+	name := filepath.Base(path)
+	lang := langFromPath(path)
+
+	col := entry.Col
+	endCol := col + len([]rune(entry.Name))
+
+	m.exitDocSymbols()
+
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     path,
+			Name:     name,
+			Language: lang,
+			Line:     line,
+			Col:      col,
+			EndCol:   endCol,
+		}
+	}
+}
+
+// ensureSymCursorVisible keeps the symbol cursor within the visible window.
+func (m *Model) ensureSymCursorVisible() {
+	bh := m.bodyHeight()
+	if bh <= 0 {
+		return
+	}
+	if m.symCursor < m.symScroll {
+		m.symScroll = m.symCursor
+	}
+	if m.symCursor >= m.symScroll+bh {
+		m.symScroll = m.symCursor - bh + 1
+	}
+	maxScroll := max(len(m.symItems)-bh, 0)
+	m.symScroll = clampInt(m.symScroll, 0, maxScroll)
+}
+
+// clickDocSymbolsMode handles clicks in document symbols mode body area.
+func (m *Model) clickDocSymbolsMode(viewY int) tea.Cmd {
+	bodyY := viewY - topChromeHeight
+	if bodyY < 0 {
+		return nil
+	}
+	idx := m.symScroll + bodyY
+	if idx < 0 || idx >= len(m.symItems) {
+		return nil
+	}
+	m.symCursor = idx
+	return m.activateSymResult()
 }
 
 // handleSearchKey processes keys in search mode, dispatching to the
@@ -2305,6 +2523,93 @@ func (m *Model) renderReferencesHint(contentWidth int) string {
 	return line
 }
 
+// ---------------------------------------------------------------------------
+// Document symbols rendering
+// ---------------------------------------------------------------------------
+
+// viewDocSymbolsMode renders the complete document symbols panel.
+func (m *Model) viewDocSymbolsMode() string {
+	contentWidth := max(m.width, 1)
+	header := m.renderHeader(contentWidth)
+	bh := m.bodyHeight()
+	emptyLine := strings.Repeat(" ", contentWidth)
+
+	bodyLines := m.renderDocSymbolsBody(bh, contentWidth, emptyLine)
+	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
+
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteByte('\n')
+	b.WriteString(m.renderDocSymbolsTitle(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchDivider(contentWidth))
+	for _, line := range bodyLines {
+		b.WriteByte('\n')
+		b.WriteString(line)
+	}
+	b.WriteByte('\n')
+	b.WriteString(m.renderToolbarSeparator(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderDocSymbolsHint(contentWidth))
+	return b.String()
+}
+
+// renderDocSymbolsTitle renders the file title: " ▸ filename.go (N symbols)".
+func (m *Model) renderDocSymbolsTitle(contentWidth int) string {
+	arrowStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	titleStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Primary).Bold(true)
+	countStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+
+	arrow := arrowStyle.Render(theme.IconArrowRight + " ")
+	title := titleStyle.Render(m.symTitle)
+	count := countStyle.Render(fmt.Sprintf(" (%d)", len(m.symEntries)))
+
+	line := " " + arrow + title + count
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderDocSymbolsBody renders the symbol outline body lines.
+func (m *Model) renderDocSymbolsBody(bh, contentWidth int, emptyLine string) []string {
+	if len(m.symItems) == 0 {
+		lines := make([]string, bh)
+		style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+		lines[0] = style.Render("No symbols found")
+		padCount := max(contentWidth-lipgloss.Width(lines[0]), 0)
+		if padCount > 0 {
+			lines[0] += strings.Repeat(" ", padCount)
+		}
+		for i := 1; i < bh; i++ {
+			lines[i] = emptyLine
+		}
+		return lines
+	}
+	start := clampInt(m.symScroll, 0, max(len(m.symItems)-1, 0))
+	end := min(start+bh, len(m.symItems))
+	lines := make([]string, 0, bh)
+	for i := start; i < end; i++ {
+		lines = append(lines, m.renderListItem(i, contentWidth))
+	}
+	for range bh - (end - start) {
+		lines = append(lines, emptyLine)
+	}
+	return lines
+}
+
+// renderDocSymbolsHint renders the key hint footer for document symbols mode.
+func (m *Model) renderDocSymbolsHint(contentWidth int) string {
+	keyStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	line := keyStyle.Render(" Esc close  Enter open")
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
 // renderSearchBody renders the search results body lines for the given height.
 func (m *Model) renderSearchBody(bh, contentWidth int, emptyLine string) []string {
 	if len(m.searchItems) == 0 {
@@ -2569,26 +2874,38 @@ func (m *Model) renderNewEntryInput(contentWidth int) string {
 
 // activeCursor returns the cursor index for the active list mode.
 func (m *Model) activeCursor() int {
-	if m.mode == viewReferences {
+	switch m.mode {
+	case viewReferences:
 		return m.refCursor
+	case viewDocSymbols:
+		return m.symCursor
+	default:
+		return m.searchCursor
 	}
-	return m.searchCursor
 }
 
 // activeNumWidth returns the line number digit width for the active mode.
 func (m *Model) activeNumWidth() int {
-	if m.mode == viewReferences {
+	switch m.mode {
+	case viewReferences:
 		return m.refNumWidth
+	case viewDocSymbols:
+		return m.symNumWidth
+	default:
+		return m.searchNumWidth
 	}
-	return m.searchNumWidth
 }
 
 // activeItems returns the searchItem slice for the active list mode.
 func (m *Model) activeItems() []searchItem {
-	if m.mode == viewReferences {
+	switch m.mode {
+	case viewReferences:
 		return m.refItems
+	case viewDocSymbols:
+		return m.symItems
+	default:
+		return m.searchItems
 	}
-	return m.searchItems
 }
 
 // renderListItem renders a single result row (file header, match line, or gap)
@@ -2676,7 +2993,7 @@ func (m *Model) renderMatchLine(item searchItem, contentWidth int, selected bool
 // respecting the current match configuration for case sensitivity.
 // In references mode (no query), renders plain text.
 func (m *Model) highlightQuery(text string, normalStyle, hlStyle lipgloss.Style) string {
-	if m.mode == viewReferences {
+	if m.mode == viewReferences || m.mode == viewDocSymbols {
 		return normalStyle.Render(text)
 	}
 	query := string(m.searchQuery)
@@ -2781,8 +3098,11 @@ func (m *Model) renderHeader(contentWidth int) string {
 	lineStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
 
 	title := " Files "
-	if m.mode == viewReferences {
+	switch m.mode {
+	case viewReferences:
 		title = " References "
+	case viewDocSymbols:
+		title = " Symbols "
 	}
 	text := headerStyle.Render(title)
 	textWidth := lipgloss.Width(text)
@@ -2965,6 +3285,8 @@ func (m *Model) bodyHeight() int {
 	case viewSearch:
 		footer = searchFooterHeight
 	case viewReferences:
+		footer = searchFooterHeight // separator + hint line
+	case viewDocSymbols:
 		footer = searchFooterHeight // separator + hint line
 	}
 	if m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive {

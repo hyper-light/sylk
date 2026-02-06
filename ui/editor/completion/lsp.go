@@ -54,7 +54,9 @@ func (s *LSPSource) Clear() {
 	s.mu.Unlock()
 }
 
-// Gather returns cached items that match the prefix.
+// Gather returns cached items that match the prefix. Each returned item's
+// Word is prefixed with the dot-qualifier (e.g. "fmt.") so that
+// acceptCompletion replaces the full typed prefix correctly.
 func (s *LSPSource) Gather(ctx CompletionContext) []CompletionItem {
 	s.mu.RLock()
 	items := s.items
@@ -63,14 +65,46 @@ func (s *LSPSource) Gather(ctx CompletionContext) []CompletionItem {
 	if ctx.Prefix == "" || len(items) == 0 {
 		return nil
 	}
+	qualifier, filterPrefix := lspSplitPrefix(ctx.Prefix)
+	return filterLSPItems(items, qualifier, filterPrefix)
+}
 
-	prefixLower := strings.ToLower(ctx.Prefix)
+// lspSplitPrefix splits a completion prefix into a dot-qualifier and the
+// trailing symbol portion. For "fmt.Pr" it returns ("fmt.", "Pr"). When
+// there is no dot, qualifier is empty and the full prefix is returned.
+func lspSplitPrefix(prefix string) (qualifier, filter string) {
+	if idx := strings.LastIndex(prefix, "."); idx >= 0 {
+		return prefix[:idx+1], prefix[idx+1:]
+	}
+	return "", prefix
+}
+
+// filterLSPItems returns items whose Word starts with filterPrefix,
+// prepending qualifier to each item's Word so the engine's startCol-based
+// replacement covers the full typed prefix (e.g. "fmt." + "Println").
+// An empty filterPrefix (user just typed the dot) matches all items.
+func filterLSPItems(items []CompletionItem, qualifier, filterPrefix string) []CompletionItem {
+	if filterPrefix == "" {
+		return qualifyItems(items, qualifier)
+	}
+	prefixLower := strings.ToLower(filterPrefix)
 	var result []CompletionItem
 	for _, item := range items {
-		wordLower := strings.ToLower(item.Word)
-		if strings.HasPrefix(wordLower, prefixLower) {
-			result = append(result, item)
+		if strings.HasPrefix(strings.ToLower(item.Word), prefixLower) {
+			qualified := item
+			qualified.Word = qualifier + item.Word
+			result = append(result, qualified)
 		}
+	}
+	return result
+}
+
+// qualifyItems returns a copy of all items with qualifier prepended to Word.
+func qualifyItems(items []CompletionItem, qualifier string) []CompletionItem {
+	result := make([]CompletionItem, len(items))
+	for i, item := range items {
+		item.Word = qualifier + item.Word
+		result[i] = item
 	}
 	return result
 }

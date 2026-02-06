@@ -235,6 +235,13 @@ type LSPReferencesMsg struct {
 	Err       error
 }
 
+// LSPDocumentSymbolMsg carries document symbols from a language server.
+type LSPDocumentSymbolMsg struct {
+	FilePath string
+	Symbols  []lsp.DocumentSymbol
+	Err      error
+}
+
 // LSPDocumentHighlightMsg carries document highlights from a language server.
 type LSPDocumentHighlightMsg struct {
 	FilePath   string
@@ -248,6 +255,23 @@ type LSPDocumentHighlightMsg struct {
 type LSPCompletionMsg struct {
 	FilePath string
 	Items    []lsp.CompletionItem
+	Err      error
+}
+
+// LSPSignatureHelpRequestMsg is emitted by the editor in insert mode
+// when a trigger character is typed, requesting signature help.
+type LSPSignatureHelpRequestMsg struct {
+	FilePath string
+	Line     int // 0-indexed
+	Col      int // 0-indexed (rune offset)
+}
+
+// LSPSignatureHelpMsg carries signature help from a language server.
+type LSPSignatureHelpMsg struct {
+	FilePath string
+	Line     int
+	Col      int
+	Result   *lsp.SignatureHelp
 	Err      error
 }
 
@@ -268,6 +292,19 @@ type LSPDefinitionMsg struct {
 	ForHover  bool // true when accompanying a hover tooltip (don't navigate)
 }
 
+// LSPFormatRequestMsg is emitted by the editor when the user runs :format,
+// requesting textDocument/formatting from the language server.
+type LSPFormatRequestMsg struct {
+	FilePath string
+}
+
+// LSPFormatMsg carries formatting edits from a language server.
+type LSPFormatMsg struct {
+	FilePath string
+	Edits    []lsp.TextEdit
+	Err      error
+}
+
 // ---------------------------------------------------------------------------
 // File tree
 // ---------------------------------------------------------------------------
@@ -283,6 +320,8 @@ type FileOpenMsg struct {
 	Name     string
 	Language string
 	Line     int // 0 = top, >0 = scroll to this 1-based line.
+	Col      int // 0-indexed start column for jump marker. 0 = no marker.
+	EndCol   int // 0-indexed end column (exclusive). 0 = derive from word bounds.
 }
 
 // FileTreeNewFileMsg requests creation of a new file in the given directory.

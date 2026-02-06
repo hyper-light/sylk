@@ -151,6 +151,7 @@ func (vs *VectorSearcher) loadNodesFallback(indexResults []VectorIndexSearchResu
 
 // SearchByDomain performs search filtered to a specific domain.
 func (vs *VectorSearcher) SearchByDomain(query []float32, domain Domain, limit int) ([]SearchResult, error) {
+
 	return vs.Search(query, &SearchOptions{
 		Domains: []Domain{domain},
 		Limit:   limit,
@@ -168,7 +169,7 @@ func (vs *VectorSearcher) SearchByNodeType(query []float32, nodeTypes []NodeType
 // SearchMultiDomain performs search across multiple domains with per-domain limits.
 func (vs *VectorSearcher) SearchMultiDomain(query []float32, limits map[Domain]int) (map[Domain][]SearchResult, error) {
 	results := make(map[Domain][]SearchResult)
-
+		
 	for domain, limit := range limits {
 		domainResults, err := vs.SearchByDomain(query, domain, limit)
 		if err != nil {
