@@ -3292,7 +3292,7 @@ func (m *Model) replaceCurrentMatch() {
 	m.lineIndex.Rebuild(m.buf)
 	m.markModified()
 	m.recomputeReplace()
-	m.replaceBar.NearestMatch(match.Start)
+	m.replaceBar.NearestMatch(match.Start + len([]rune(replacement)))
 	m.jumpToCurrentReplaceMatch()
 }
 

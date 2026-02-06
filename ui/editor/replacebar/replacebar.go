@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -15,6 +16,10 @@ import (
 	"github.com/adalundhe/sylk/ui/editor/search"
 	"github.com/adalundhe/sylk/ui/theme"
 )
+
+// btnFlashDuration is how long a button stays highlighted after activation.
+// Derived from: typical UI feedback duration (200ms).
+const btnFlashDuration = 200 * time.Millisecond
 
 // Action describes the result of a key event processed by the replace bar.
 type Action int
@@ -127,6 +132,10 @@ type ReplaceBar struct {
 	badgeAbsPos [toggleCount]badgePos
 	btnOnePos   badgePos
 	btnAllPos   badgePos
+
+	// Button flash state for visual feedback.
+	btnFlash   replaceFocus // which button flashed (focusBtnOne or focusBtnAll)
+	btnFlashAt time.Time    // when the flash started
 }
 
 // New creates a ReplaceBar, pre-populating the search query from the given
@@ -391,8 +400,10 @@ func (r *ReplaceBar) handleReplaceKey(key tea.KeyMsg) Action {
 	switch key.Type {
 	case tea.KeyEnter:
 		if key.String() == "ctrl+enter" {
+			r.flashBtn(focusBtnAll)
 			return ActionReplaceAll
 		}
+		r.flashBtn(focusBtnOne)
 		return ActionReplaceOne
 	case tea.KeyBackspace:
 		if r.replaceCur > 0 {
@@ -434,6 +445,7 @@ func (r *ReplaceBar) handleReplaceKey(key tea.KeyMsg) Action {
 func (r *ReplaceBar) handleBtnKey(key tea.KeyMsg) Action {
 	switch key.Type {
 	case tea.KeyEnter, tea.KeySpace:
+		r.flashBtn(r.focus)
 		if r.focus == focusBtnOne {
 			return ActionReplaceOne
 		}
@@ -450,6 +462,17 @@ func (r *ReplaceBar) handleBtnKey(key tea.KeyMsg) Action {
 		return ActionNone
 	}
 	return ActionNone
+}
+
+// flashBtn records a button press for visual feedback.
+func (r *ReplaceBar) flashBtn(btn replaceFocus) {
+	r.btnFlash = btn
+	r.btnFlashAt = time.Now()
+}
+
+// btnFlashing reports whether the given button is currently flashing.
+func (r *ReplaceBar) btnFlashing(btn replaceFocus) bool {
+	return r.btnFlash == btn && time.Since(r.btnFlashAt) < btnFlashDuration
 }
 
 // activateToggle flips a toggle badge.
@@ -513,10 +536,12 @@ func (r *ReplaceBar) handleFindRowClick(col int) Action {
 func (r *ReplaceBar) handleReplaceRowClick(col int) Action {
 	if col >= r.btnOnePos.start && col < r.btnOnePos.end {
 		r.focus = focusBtnOne
+		r.flashBtn(focusBtnOne)
 		return ActionReplaceOne
 	}
 	if col >= r.btnAllPos.start && col < r.btnAllPos.end {
 		r.focus = focusBtnAll
+		r.flashBtn(focusBtnAll)
 		return ActionReplaceAll
 	}
 	r.focus = focusReplace
@@ -675,10 +700,17 @@ func (r *ReplaceBar) renderBadge(idx toggleIndex, th *theme.Theme) string {
 }
 
 // renderButtons builds the action button string and records each button's
-// relative column position. Uses the same color pattern as renderBadge.
+// relative column position. Uses the same color pattern as renderBadge,
+// with a brief flash of the primary color after activation.
 func (r *ReplaceBar) renderButtons(th *theme.Theme) (string, int) {
 	oneFg := th.Palette.Muted
+	if r.btnFlashing(focusBtnOne) {
+		oneFg = th.Palette.Primary
+	}
 	allFg := th.Palette.Muted
+	if r.btnFlashing(focusBtnAll) {
+		allFg = th.Palette.Primary
+	}
 	oneStyle := lipgloss.NewStyle().Foreground(oneFg)
 	if r.focus == focusBtnOne {
 		oneStyle = oneStyle.Background(th.Palette.Selection)
