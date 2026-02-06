@@ -229,7 +229,7 @@ func (m *Manager) DocumentSymbol(ctx context.Context, projectRoot, filePath stri
 func (m *Manager) Format(ctx context.Context, projectRoot, filePath string, tabSize int, insertSpaces bool) ([]TextEdit, error) {
 	client := m.clientForFile(projectRoot, filePath)
 	if client == nil {
-		return nil, nil
+		return nil, errNoServer
 	}
 	return client.Format(ctx, filePath, tabSize, insertSpaces)
 }

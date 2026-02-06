@@ -300,9 +300,10 @@ type LSPFormatRequestMsg struct {
 
 // LSPFormatMsg carries formatting edits from a language server.
 type LSPFormatMsg struct {
-	FilePath string
-	Edits    []lsp.TextEdit
-	Err      error
+	FilePath       string
+	Edits          []lsp.TextEdit
+	Err            error
+	EditGeneration int // buffer generation at request time for staleness detection
 }
 
 // ---------------------------------------------------------------------------

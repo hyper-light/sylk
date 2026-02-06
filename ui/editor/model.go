@@ -83,8 +83,9 @@ type Model struct {
 	parseErrors []treesitter.ParseError
 
 	// LSP change tracking for debounced didChange notifications.
-	lspDirty   bool      // buffer changed since last didChange flush
-	lastEditAt time.Time // timestamp of last buffer modification
+	lspDirty       bool      // buffer changed since last didChange flush
+	lastEditAt     time.Time // timestamp of last buffer modification
+	editGeneration int       // monotonic counter for stale-response detection
 
 	// LSP hover tooltip.
 	hoverPopup  *hover.Hover
@@ -350,6 +351,10 @@ func (m *Model) LastEditAt() time.Time { return m.lastEditAt }
 // ClearLSPDirty resets the dirty flag after a didChange is sent.
 func (m *Model) ClearLSPDirty() { m.lspDirty = false }
 
+// EditGeneration returns a monotonic counter that increments on every
+// buffer mutation. Used to detect stale LSP responses.
+func (m *Model) EditGeneration() int { return m.editGeneration }
+
 // CursorLine returns the 0-indexed line number of the cursor.
 func (m *Model) CursorLine() int { return m.state.CursorLine }
 
@@ -573,19 +578,33 @@ func (m *Model) WordBoundsAt(line, col int) (start, end int) {
 }
 
 // IsInsideHoverPopup reports whether viewport-local (x, y) falls within the
-// currently displayed hover popup. Returns false when no hover is active.
+// currently displayed hover popup, using the actual rendered dimensions.
 func (m *Model) IsInsideHoverPopup(x, y int) bool {
 	viewHeight := m.viewportHeight()
-	_, hover, _ := m.popupLayout(viewHeight)
-	if hover.content == "" {
-		return false
-	}
-	if y < hover.start || y >= hover.start+hover.height {
-		return false
-	}
-	firstLine := strings.SplitN(hover.content, "\n", 2)[0]
-	return x >= 0 && x < lipgloss.Width(firstLine)
+	_, hov, _ := m.popupLayout(viewHeight)
+	return insidePopup(hov, x, y)
 }
+
+// IsInsideOverlayPopup reports whether viewport-local (x, y) falls within
+// any non-hover overlay popup (signature help or completion), using actual
+// rendered dimensions. Prevents hover dismissal when the mouse crosses an
+// overlay on its way to the tooltip.
+func (m *Model) IsInsideOverlayPopup(x, y int) bool {
+	viewHeight := m.viewportHeight()
+	sig, _, comp := m.popupLayout(viewHeight)
+	return insidePopup(sig, x, y) || insidePopup(comp, x, y)
+}
+
+// insidePopup checks whether (x, y) falls within a popup's actual bounds.
+func insidePopup(p popupPlacement, x, y int) bool {
+	if p.content == "" {
+		return false
+	}
+	return inBounds(y, p.start, p.start+p.height) && inBounds(x, 0, p.width)
+}
+
+// inBounds reports whether v is in the half-open range [lo, hi).
+func inBounds(v, lo, hi int) bool { return v >= lo && v < hi }
 
 // jumpBack navigates to the previous position in the jump list (Ctrl+O).
 func (m *Model) jumpBack() (component.Component, tea.Cmd) {
@@ -628,11 +647,26 @@ func (m *Model) jumpTo(entry motion.JumpEntry) (component.Component, tea.Cmd) {
 // Unified Popup Layout — collision detection
 // ---------------------------------------------------------------------------
 
-// popupPlacement describes a rendered popup's viewport position.
+// popupPlacement describes a rendered popup's viewport position and size.
 type popupPlacement struct {
 	content string // rendered popup text ("" = inactive)
 	start   int    // first viewport row
 	height  int    // number of viewport rows occupied
+	width   int    // visual width in columns (derived from rendered content)
+}
+
+// newPopupPlacement derives height and width from actual rendered content.
+func newPopupPlacement(content string, start int) popupPlacement {
+	if content == "" {
+		return popupPlacement{}
+	}
+	firstLine := strings.SplitN(content, "\n", 2)[0]
+	return popupPlacement{
+		content: content,
+		start:   start,
+		height:  strings.Count(content, "\n") + 1,
+		width:   lipgloss.Width(firstLine),
+	}
 }
 
 // rowInterval is a half-open viewport row range [start, end).
@@ -656,11 +690,9 @@ func (m *Model) sigHelpPlacement(cursorRow int) popupPlacement {
 		return popupPlacement{}
 	}
 	popup := m.sigHelp.View(m.width, m.theme)
-	if popup == "" {
-		return popupPlacement{}
-	}
-	h := strings.Count(popup, "\n") + 1
-	return popupPlacement{content: popup, start: max(cursorRow-h, 0), height: h}
+	p := newPopupPlacement(popup, 0)
+	p.start = max(cursorRow-p.height, 0)
+	return p
 }
 
 // completionPlacement renders completion and positions it below the cursor.
@@ -677,7 +709,7 @@ func (m *Model) completionPlacement(cursorRow, viewHeight int) popupPlacement {
 	if popup == "" {
 		return popupPlacement{}
 	}
-	return popupPlacement{content: popup, start: start, height: strings.Count(popup, "\n") + 1}
+	return newPopupPlacement(popup, start)
 }
 
 // hoverPlacement positions hover in the largest free viewport zone,
@@ -687,21 +719,28 @@ func (m *Model) hoverPlacement(viewHeight, cursorRow int, sig, comp popupPlaceme
 		return popupPlacement{}
 	}
 	anchorRow := m.contentLineToViewRow(m.hoverPopup.AnchorLine())
-	zones := popupFreeZones(viewHeight, cursorRow, sig, comp)
+	zones := hoverFreeZones(viewHeight, cursorRow, anchorRow, sig, comp)
 	return m.placeHoverInZones(zones, anchorRow)
 }
 
-// popupFreeZones builds sorted reserved intervals (sig, cursor, comp)
-// and returns the free gaps between them within [0, viewHeight).
-func popupFreeZones(viewHeight, cursorRow int, sig, comp popupPlacement) []rowInterval {
-	reserved := make([]rowInterval, 0, 3)
+// hoverFreeZones builds reserved intervals (sig, cursor, anchor, comp) and
+// returns the free gaps between them within [0, viewHeight). The anchor row
+// is reserved so the hover popup never covers the text being hovered.
+func hoverFreeZones(viewHeight, cursorRow, anchorRow int, sig, comp popupPlacement) []rowInterval {
+	reserved := make([]rowInterval, 0, 4)
 	if sig.height > 0 {
 		reserved = append(reserved, rowInterval{sig.start, sig.start + sig.height})
 	}
 	reserved = append(reserved, rowInterval{cursorRow, cursorRow + 1})
+	if anchorRow != cursorRow {
+		reserved = append(reserved, rowInterval{anchorRow, anchorRow + 1})
+	}
 	if comp.height > 0 {
 		reserved = append(reserved, rowInterval{comp.start, comp.start + comp.height})
 	}
+	slices.SortFunc(reserved, func(a, b rowInterval) int {
+		return cmp.Compare(a.start, b.start)
+	})
 	return gapIntervals(reserved, viewHeight)
 }
 
@@ -722,88 +761,78 @@ func gapIntervals(sorted []rowInterval, viewHeight int) []rowInterval {
 	return gaps
 }
 
-// placeHoverInZones renders hover and finds the optimal free zone closest
-// to the anchor row. Falls back to constrainHover when no zone fits.
+// placeHoverInZones greedily picks the best free zone for the hover tooltip.
+// Strategy: among zones closest to the anchor, pick the largest so the popup
+// can display the most content without scrolling. Renders the popup
+// constrained to the chosen zone's actual height.
 func (m *Model) placeHoverInZones(zones []rowInterval, anchorRow int) popupPlacement {
-	maxH := largestZoneHeight(zones)
-	// Derived from: hover.minVisibleLines (5) + 2 border rows.
-	const minHoverLines = 7
-	popup := m.hoverPopup.View(m.width, max(maxH, minHoverLines), m.theme)
-	if popup == "" {
+	zone := bestHoverZone(zones, anchorRow)
+	zoneH := zone.end - zone.start
+	if zoneH <= hover.BorderRows {
 		return popupPlacement{}
 	}
-	hoverH := strings.Count(popup, "\n") + 1
-	start, ok := bestSlotInZones(zones, anchorRow, hoverH)
-	if ok {
-		return popupPlacement{content: popup, start: start, height: hoverH}
-	}
-	return m.constrainHover(zones)
+	popup := m.hoverPopup.View(m.width, zoneH, m.theme)
+	p := newPopupPlacement(popup, 0)
+	p.start = hoverSlot(zone, anchorRow, p.height)
+	return p
 }
 
-// largestZoneHeight returns the height of the tallest free zone.
-func largestZoneHeight(zones []rowInterval) int {
-	best := 0
-	for _, z := range zones {
-		if h := z.end - z.start; h > best {
-			best = h
-		}
+// bestHoverZone selects the optimal free zone for hover placement. Zones are
+// ranked by: (1) proximity to anchor (actual row gap), (2) available height
+// (larger = more content visible), (3) position below anchor preferred.
+func bestHoverZone(zones []rowInterval, anchorRow int) rowInterval {
+	sorted := slices.Clone(zones)
+	slices.SortStableFunc(sorted, zoneComparator(anchorRow))
+	if len(sorted) == 0 {
+		return rowInterval{}
 	}
-	return best
+	return sorted[0]
 }
 
-// bestSlotInZones returns the start row in the zone closest to anchorRow
-// that can fit popupH rows. Returns (_, false) if no zone is large enough.
-func bestSlotInZones(zones []rowInterval, anchorRow, popupH int) (int, bool) {
-	bestStart, bestDist := -1, 1<<30
-	for _, z := range zones {
-		if z.end-z.start < popupH {
-			continue
+// zoneComparator returns a sort function that ranks zones by proximity to
+// anchor, then by size (descending), then by below-preference.
+func zoneComparator(anchorRow int) func(a, b rowInterval) int {
+	return func(a, b rowInterval) int {
+		da, db := zoneGap(a, anchorRow), zoneGap(b, anchorRow)
+		if da != db {
+			return cmp.Compare(da, db)
 		}
-		start, dist := closestSlot(z, anchorRow, popupH)
-		if dist < bestDist {
-			bestDist = dist
-			bestStart = start
+		sizeA, sizeB := a.end-a.start, b.end-b.start
+		if sizeA != sizeB {
+			return cmp.Compare(sizeB, sizeA) // descending: larger first
 		}
+		return cmp.Compare(b.start, a.start) // descending: below first
 	}
-	return bestStart, bestStart >= 0
 }
 
-// closestSlot finds the position within zone z that puts the popup
-// closest to anchorRow, trying both below-anchor and above-anchor.
-func closestSlot(z rowInterval, anchorRow, popupH int) (int, int) {
+// zoneGap returns the number of rows between the zone boundary and the
+// anchor row. Adjacent zones (immediately above or below the reserved
+// anchor row) return 0.
+func zoneGap(z rowInterval, anchorRow int) int {
+	if z.start > anchorRow+1 {
+		return z.start - anchorRow - 1
+	}
+	if z.end < anchorRow {
+		return anchorRow - z.end
+	}
+	return 0
+}
+
+// hoverSlot finds the position within zone z that puts the popup closest
+// to anchorRow, preferring below-anchor when distances tie.
+func hoverSlot(z rowInterval, anchorRow, popupH int) int {
 	below := max(min(anchorRow+1, z.end-popupH), z.start)
 	above := max(min(anchorRow-popupH, z.end-popupH), z.start)
-	distB := below - anchorRow
-	if distB < 0 {
-		distB = -distB
+	if preferAbove(below-anchorRow, anchorRow-(above+popupH-1)) {
+		return above
 	}
-	distA := anchorRow - (above + popupH - 1)
-	if distA < 0 {
-		distA = -distA
-	}
-	if distA < distB {
-		return above, distA
-	}
-	return below, distB
+	return below
 }
 
-// constrainHover re-renders hover to fit the largest available zone.
-func (m *Model) constrainHover(zones []rowInterval) popupPlacement {
-	var largest rowInterval
-	for _, z := range zones {
-		if z.end-z.start > largest.end-largest.start {
-			largest = z
-		}
-	}
-	h := largest.end - largest.start
-	if h <= 0 {
-		return popupPlacement{}
-	}
-	popup := m.hoverPopup.View(m.width, h, m.theme)
-	if popup == "" {
-		return popupPlacement{}
-	}
-	return popupPlacement{content: popup, start: largest.start, height: strings.Count(popup, "\n") + 1}
+// preferAbove returns true when placing the popup above the anchor is
+// strictly closer than placing it below.
+func preferAbove(distBelow, distAbove int) bool {
+	return distAbove > 0 && (distBelow < 0 || distAbove < distBelow)
 }
 
 // overlayPopups positions all active popups with collision detection and
@@ -860,6 +889,7 @@ func (m *Model) acceptCompletion() {
 	m.lineIndex.Rebuild(m.buf)
 	m.state.Cursor = startPos + len([]rune(item.Word))
 	m.state.SyncCursorPos()
+	m.editGeneration++
 	m.modified = true
 	m.lspDirty = true
 	m.lastEditAt = time.Now()
@@ -1057,6 +1087,7 @@ func (m *Model) HandleCompletionClick(_, y int) bool {
 	m.lineIndex.Rebuild(m.buf)
 	m.state.Cursor = startPos + len([]rune(item.Word))
 	m.state.SyncCursorPos()
+	m.editGeneration++
 	m.modified = true
 	m.lspDirty = true
 	m.lastEditAt = time.Now()
@@ -1069,13 +1100,10 @@ func (m *Model) HandleCompletionClick(_, y int) bool {
 // the hover popup. If so, it pushes the current position to the jump list,
 // dismisses the popup, and returns a go-to-definition command at the hover
 // anchor. Returns (cmd, true) when the click was consumed.
-func (m *Model) HandleHoverClick(_, y int) (tea.Cmd, bool) {
+func (m *Model) HandleHoverClick(x, y int) (tea.Cmd, bool) {
 	viewHeight := m.viewportHeight()
-	_, hover, _ := m.popupLayout(viewHeight)
-	if hover.content == "" {
-		return nil, false
-	}
-	if y < hover.start || y >= hover.start+hover.height {
+	_, hov, _ := m.popupLayout(viewHeight)
+	if !insidePopup(hov, x, y) {
 		return nil, false
 	}
 	anchorLine := m.hoverPopup.AnchorLine()
@@ -1177,20 +1205,19 @@ func (m *Model) MarkSaved() {
 	m.syncStatusLine()
 }
 
-// Undo reverses the last edit operation.
+// Undo reverses the last edit operation (or grouped operation).
 func (m *Model) Undo() {
-	edit, ok := m.undoTree.Undo()
+	edits, ok := m.undoTree.Undo()
 	if !ok {
 		return
 	}
-	if edit.Type == buffer.EditInsert {
-		m.buf.Delete(edit.Pos, len([]rune(edit.Text)))
-	} else {
-		m.buf.Insert(edit.Pos, edit.OldText)
+	for _, edit := range edits {
+		m.reverseEdit(edit)
 	}
 	m.lineIndex.Rebuild(m.buf)
-	m.state.Cursor = edit.Pos
+	m.state.Cursor = edits[0].Pos
 	m.state.ClampCursor(1)
+	m.editGeneration++
 	m.modified = true
 	m.lspDirty = true
 	m.lastEditAt = time.Now()
@@ -1198,25 +1225,42 @@ func (m *Model) Undo() {
 	m.syncStatusLine()
 }
 
-// Redo reapplies the last undone edit operation.
+// Redo reapplies the last undone edit operation (or grouped operation).
 func (m *Model) Redo() {
-	edit, ok := m.undoTree.Redo()
+	edits, ok := m.undoTree.Redo()
 	if !ok {
 		return
 	}
-	if edit.Type == buffer.EditInsert {
-		m.buf.Insert(edit.Pos, edit.Text)
-	} else {
-		m.buf.Delete(edit.Pos, len([]rune(edit.OldText)))
+	for _, edit := range edits {
+		m.reapplyEdit(edit)
 	}
 	m.lineIndex.Rebuild(m.buf)
-	m.state.Cursor = edit.Pos
+	m.state.Cursor = edits[len(edits)-1].Pos
 	m.state.ClampCursor(1)
+	m.editGeneration++
 	m.modified = true
 	m.lspDirty = true
 	m.lastEditAt = time.Now()
 	m.rehighlight()
 	m.syncStatusLine()
+}
+
+// reverseEdit undoes a single edit operation on the buffer.
+func (m *Model) reverseEdit(edit buffer.EditOp) {
+	if edit.Type == buffer.EditInsert {
+		m.buf.Delete(edit.Pos, len([]rune(edit.Text)))
+	} else {
+		m.buf.Insert(edit.Pos, edit.OldText)
+	}
+}
+
+// reapplyEdit re-applies a single edit operation on the buffer.
+func (m *Model) reapplyEdit(edit buffer.EditOp) {
+	if edit.Type == buffer.EditInsert {
+		m.buf.Insert(edit.Pos, edit.Text)
+	} else {
+		m.buf.Delete(edit.Pos, len([]rune(edit.OldText)))
+	}
 }
 
 // ApplyTextEdits applies a set of LSP text edits to the buffer. Edits are
@@ -1239,13 +1283,15 @@ func (m *Model) ApplyTextEdits(edits []lsp.TextEdit) int {
 		return cmp.Compare(b.Range.Start.Character, a.Range.Start.Character)
 	})
 
+	m.undoTree.BeginGroup()
 	applied := 0
 	for _, edit := range sorted {
 		m.applySingleEdit(edit)
 		applied++
 	}
-
-	m.lineIndex.Rebuild(m.buf)
+	m.undoTree.EndGroup()
+	m.state.ClampCursor(1)
+	m.editGeneration++
 	m.modified = true
 	m.lspDirty = true
 	m.lastEditAt = time.Now()
@@ -1335,6 +1381,9 @@ func (m *Model) ClickAt(x, y int) {
 	if m.completionEngine.Active() {
 		m.completionEngine.Dismiss()
 	}
+	if m.sigHelpActive {
+		m.DismissSignatureHelp()
+	}
 	m.setCursorFromViewport(x, y)
 	m.syncStatusLine()
 }
@@ -1407,7 +1456,10 @@ func (m *Model) deleteSelection() {
 
 	m.visualMode = nil
 	m.currentMode = mode.ModeNormal
+	m.editGeneration++
 	m.modified = true
+	m.lspDirty = true
+	m.lastEditAt = time.Now()
 	m.rehighlight()
 	m.syncStatusLine()
 }
@@ -1802,10 +1854,19 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 	}
 
 	// Shift+arrow: enter or extend visual-char selection.
+	// Left/right use simple increment to allow crossing line boundaries
+	// (standard text editor behaviour); up/down use line-based motions.
 	if isShiftArrow(key) {
 		anchor := m.state.Cursor
-		mr := motion.ExecuteMotion(shiftArrowMotion(key), m.state.Buffer, m.state.LineIndex, m.state.Cursor, 1)
-		m.state.Cursor = mr.End
+		switch key.String() {
+		case "shift+right":
+			m.state.Cursor = min(m.state.Cursor+1, m.buf.Length())
+		case "shift+left":
+			m.state.Cursor = max(m.state.Cursor-1, 0)
+		default:
+			mr := motion.ExecuteMotion(shiftArrowMotion(key), m.state.Buffer, m.state.LineIndex, m.state.Cursor, 1)
+			m.state.Cursor = mr.End
+		}
 		m.state.SyncCursorPos()
 		if !isVisualMode(m.currentMode) {
 			m.visualMode = mode.NewVisualMode(m.theme, anchor, mode.VisualChar)
@@ -1851,6 +1912,7 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 	}
 	bufChanged := m.buf.Version() != prevVersion
 	if bufChanged {
+		m.editGeneration++
 		m.modified = true
 		m.lspDirty = true
 		m.lastEditAt = time.Now()

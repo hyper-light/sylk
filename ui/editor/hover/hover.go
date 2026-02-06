@@ -21,9 +21,10 @@ const (
 	popupMinWidth      = 30  // hard floor
 )
 
-// minVisibleLines is the hard floor for the hover viewport height.
-// Derived from: minimum for a type signature + one doc line.
-const minVisibleLines = 5
+// BorderRows is the number of viewport rows consumed by the top and bottom
+// border of the hover popup (┌─┐ and └─┘). Exported so placement code can
+// derive minimum zone heights from the popup structure.
+const BorderRows = 2
 
 // Hover manages the state and rendering of a floating hover tooltip.
 type Hover struct {
@@ -99,6 +100,70 @@ func (h *Hover) ScrollDown() { h.scrollOffset++ }
 // ScrollUp moves the scroll offset back by one line, clamped to zero.
 func (h *Hover) ScrollUp() { h.scrollOffset = max(h.scrollOffset-1, 0) }
 
+// ContentHeight returns the total number of rendered content lines (excluding
+// borders). Triggers a render if needed. Used by placement code to compute
+// the ideal zone height that avoids scrolling.
+func (h *Hover) ContentHeight(width int, th *theme.Theme) int {
+	popupWidth := responsivePopupWidth(width)
+	innerWidth := popupWidth - 4 // 2 border chars + 2 padding chars
+	if h.renderedLines == nil || h.renderWidth != innerWidth {
+		styles := newHoverStyles(th)
+		h.renderedLines = renderMarkdown(h.content, innerWidth, styles, th)
+		h.appendDefFooter(innerWidth, styles, th)
+		h.renderWidth = innerWidth
+	}
+	return len(h.renderedLines)
+}
+
+// scrollView computes the scrolled display lines, prioritizing content over
+// scroll indicators when space is tight.
+func (h *Hover) scrollView(maxVisible, innerWidth int, indicatorStyle, bgStyle lipgloss.Style) []string {
+	totalLines := len(h.renderedLines)
+	maxScroll := totalLines - maxVisible
+	h.scrollOffset = max(0, min(h.scrollOffset, maxScroll))
+
+	showUp := h.scrollOffset > 0
+	showDown := h.scrollOffset+maxVisible < totalLines
+	contentSlots := scrollContentSlots(maxVisible, showUp, showDown)
+
+	// Recompute indicators after content-priority adjustment.
+	showUp = showUp && contentSlots < maxVisible
+	showDown = showDown && contentSlots < maxVisible
+
+	lines := h.renderedLines[h.scrollOffset : h.scrollOffset+contentSlots]
+	return assembleScrollLines(lines, showUp, showDown, h.scrollOffset,
+		totalLines-h.scrollOffset-contentSlots, innerWidth, indicatorStyle, bgStyle)
+}
+
+// scrollContentSlots returns the number of content lines to show, ensuring
+// content always takes priority over scroll indicators.
+func scrollContentSlots(maxVisible int, showUp, showDown bool) int {
+	slots := maxVisible
+	if showUp && slots > 1 {
+		slots--
+	}
+	if showDown && slots > 1 {
+		slots--
+	}
+	return slots
+}
+
+// assembleScrollLines builds the display lines with optional scroll indicators.
+func assembleScrollLines(content []string, showUp, showDown bool, above, below, innerWidth int,
+	indicatorStyle, bgStyle lipgloss.Style) []string {
+	var out []string
+	if showUp {
+		ind := fmt.Sprintf("▲ %d more above", above)
+		out = append(out, centerText(ind, innerWidth, indicatorStyle, bgStyle))
+	}
+	out = append(out, content...)
+	if showDown {
+		ind := fmt.Sprintf("▼ %d more below", below)
+		out = append(out, centerText(ind, innerWidth, indicatorStyle, bgStyle))
+	}
+	return out
+}
+
 // responsivePopupWidth derives the popup width from the available editor width.
 func responsivePopupWidth(editorWidth int) int {
 	derived := editorWidth * popupWidthFraction / popupWidthDivisor
@@ -125,8 +190,8 @@ func (h *Hover) View(width, maxLines int, th *theme.Theme) string {
 		h.renderWidth = innerWidth
 	}
 
-	// Subtract 2 for top/bottom border rows that are part of the popup.
-	maxVisible := max(maxLines-2, minVisibleLines)
+	// Subtract border rows; respect caller's maxLines for small zones.
+	maxVisible := max(maxLines-BorderRows, 1)
 	totalLines := len(h.renderedLines)
 
 	bgColor := th.Palette.PopupBg
@@ -144,33 +209,7 @@ func (h *Hover) View(width, maxLines int, th *theme.Theme) string {
 		h.scrollOffset = 0
 		displayLines = h.renderedLines
 	} else {
-		// Clamp scroll offset.
-		maxScroll := totalLines - maxVisible
-		h.scrollOffset = max(0, min(h.scrollOffset, maxScroll))
-
-		showUp := h.scrollOffset > 0
-		showDown := h.scrollOffset+maxVisible < totalLines
-
-		// Indicator rows consume content slots to keep total height constant.
-		contentSlots := maxVisible
-		if showUp {
-			contentSlots--
-		}
-		if showDown {
-			contentSlots--
-		}
-		contentLines := h.renderedLines[h.scrollOffset : h.scrollOffset+contentSlots]
-
-		if showUp {
-			ind := fmt.Sprintf("▲ %d more above", h.scrollOffset)
-			displayLines = append(displayLines, centerText(ind, innerWidth, indicatorStyle, bgStyle))
-		}
-		displayLines = append(displayLines, contentLines...)
-		if showDown {
-			below := totalLines - (h.scrollOffset + contentSlots)
-			ind := fmt.Sprintf("▼ %d more below", below)
-			displayLines = append(displayLines, centerText(ind, innerWidth, indicatorStyle, bgStyle))
-		}
+		displayLines = h.scrollView(maxVisible, innerWidth, indicatorStyle, bgStyle)
 	}
 
 	var b strings.Builder

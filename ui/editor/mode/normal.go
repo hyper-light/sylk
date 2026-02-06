@@ -81,14 +81,14 @@ var namedKeyTable = map[tea.KeyType]func(state *EditorState) tea.Cmd{
 		return nil
 	},
 	tea.KeyLeft: func(state *EditorState) tea.Cmd {
-		mr := motion.ExecuteMotion(motion.MotionLeft, state.Buffer, state.LineIndex, state.Cursor, 1)
-		state.Cursor = mr.End
+		// Arrow keys cross line boundaries (standard editor behaviour);
+		// vim h/l motions stay within the line.
+		state.Cursor = max(state.Cursor-1, 0)
 		state.ClampCursor(1)
 		return nil
 	},
 	tea.KeyRight: func(state *EditorState) tea.Cmd {
-		mr := motion.ExecuteMotion(motion.MotionRight, state.Buffer, state.LineIndex, state.Cursor, 1)
-		state.Cursor = mr.End
+		state.Cursor = min(state.Cursor+1, state.Buffer.Length())
 		state.ClampCursor(1)
 		return nil
 	},
@@ -270,19 +270,29 @@ func insertLineAbove(state *EditorState) {
 // ---------------------------------------------------------------------------
 
 func applyUndo(state *EditorState) {
-	edit, ok := state.UndoTree.Undo()
+	edits, ok := state.UndoTree.Undo()
 	if !ok {
 		return
 	}
-	reverseEdit(state, edit)
+	for _, edit := range edits {
+		reverseEdit(state, edit)
+	}
+	state.LineIndex.Rebuild(state.Buffer)
+	state.Cursor = edits[0].Pos
+	state.ClampCursor(1)
 }
 
 func applyRedo(state *EditorState) {
-	edit, ok := state.UndoTree.Redo()
+	edits, ok := state.UndoTree.Redo()
 	if !ok {
 		return
 	}
-	reapplyEdit(state, edit)
+	for _, edit := range edits {
+		reapplyEdit(state, edit)
+	}
+	state.LineIndex.Rebuild(state.Buffer)
+	state.Cursor = edits[len(edits)-1].Pos
+	state.ClampCursor(1)
 }
 
 func reverseEdit(state *EditorState, edit buffer.EditOp) {
@@ -291,9 +301,6 @@ func reverseEdit(state *EditorState, edit buffer.EditOp) {
 	} else {
 		state.Buffer.Insert(edit.Pos, edit.OldText)
 	}
-	state.LineIndex.Rebuild(state.Buffer)
-	state.Cursor = edit.Pos
-	state.ClampCursor(1)
 }
 
 func reapplyEdit(state *EditorState, edit buffer.EditOp) {
@@ -302,9 +309,6 @@ func reapplyEdit(state *EditorState, edit buffer.EditOp) {
 	} else {
 		state.Buffer.Delete(edit.Pos, len([]rune(edit.OldText)))
 	}
-	state.LineIndex.Rebuild(state.Buffer)
-	state.Cursor = edit.Pos
-	state.ClampCursor(1)
 }
 
 // ---------------------------------------------------------------------------

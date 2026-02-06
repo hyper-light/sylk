@@ -577,7 +577,12 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.LSPDocumentSymbolMsg:
 		return m, m.handleLSPDocumentSymbol(typed)
 	case msg.LSPFormatRequestMsg:
-		return m, m.lspFormatCmd(typed.FilePath)
+		var flushContent string
+		if m.inlineEditor.LSPDirty() {
+			m.inlineEditor.ClearLSPDirty()
+			flushContent = m.inlineEditor.Content()
+		}
+		return m, m.lspFormatCmd(typed.FilePath, flushContent, m.inlineEditor.EditGeneration())
 	case msg.LSPFormatMsg:
 		return m, m.handleLSPFormat(typed)
 	case msg.NerdFontsResultMsg:
@@ -1223,17 +1228,23 @@ func (m *AppModel) lspDocumentSymbolCmd(filePath string) tea.Cmd {
 }
 
 // lspFormatCmd sends a textDocument/formatting request to the language server.
-func (m *AppModel) lspFormatCmd(filePath string) tea.Cmd {
+// If flushContent is non-empty, a didChange notification is sent first so the
+// server formats the latest buffer content.
+func (m *AppModel) lspFormatCmd(filePath, flushContent string, editGen int) tea.Cmd {
 	mgr := m.lspManager
 	root := m.config.ProjectRoot
 	ctx := m.ctx
 	tabSize := m.inlineEditor.TabWidth()
 	return func() tea.Msg {
+		if flushContent != "" {
+			_ = mgr.NotifyDidChange(ctx, root, filePath, flushContent)
+		}
 		edits, err := mgr.Format(ctx, root, filePath, tabSize, false)
 		return msg.LSPFormatMsg{
-			FilePath: filePath,
-			Edits:    edits,
-			Err:      err,
+			FilePath:       filePath,
+			Edits:          edits,
+			Err:            err,
+			EditGeneration: editGen,
 		}
 	}
 }
@@ -1244,13 +1255,20 @@ func (m *AppModel) handleLSPFormat(r msg.LSPFormatMsg) tea.Cmd {
 		m.statusBar.SetFlash("Format: " + r.Err.Error())
 		return nil
 	}
-	if len(r.Edits) == 0 {
-		m.statusBar.SetFlash("Already formatted")
-		return nil
-	}
-	n := m.inlineEditor.ApplyTextEdits(r.Edits)
-	m.statusBar.SetFlash(fmt.Sprintf("Formatted (%d edits)", n))
+	m.statusBar.SetFlash(m.applyFormatEdits(r))
 	return nil
+}
+
+// applyFormatEdits validates and applies formatting edits, returning a
+// status message. Separated from handleLSPFormat to keep CC < 4.
+func (m *AppModel) applyFormatEdits(r msg.LSPFormatMsg) string {
+	if r.EditGeneration != m.inlineEditor.EditGeneration() {
+		return "Format: buffer changed, discarding"
+	}
+	if len(r.Edits) == 0 {
+		return "Already formatted"
+	}
+	return fmt.Sprintf("Formatted (%d edits)", m.inlineEditor.ApplyTextEdits(r.Edits))
 }
 
 // handleLSPDocumentSymbol displays document symbols in the file tree panel.
@@ -1870,7 +1888,12 @@ func (m *AppModel) handleExCommand(text string) tea.Cmd {
 		}
 	case "format", "fmt":
 		if fp := m.inlineEditor.FilePath(); fp != "" {
-			return m.lspFormatCmd(fp)
+			var flushContent string
+			if m.inlineEditor.LSPDirty() {
+				m.inlineEditor.ClearLSPDirty()
+				flushContent = m.inlineEditor.Content()
+			}
+			return m.lspFormatCmd(fp, flushContent, m.inlineEditor.EditGeneration())
 		}
 	default:
 		m.statusBar.SetFlash("Unknown command: :" + cmd)
@@ -2625,6 +2648,13 @@ func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
 	// can scroll with the wheel. Only "see through" to the buffer when
 	// the mouse is outside the popup bounds.
 	if m.inlineEditor.HoverActive() && m.inlineEditor.IsInsideHoverPopup(viewX, viewY) {
+		return nil
+	}
+
+	// When the mouse crosses a non-hover overlay (signature help or
+	// completion) on its way to the hover tooltip, keep hover stable
+	// so it doesn't vanish mid-transit.
+	if m.inlineEditor.HoverActive() && m.inlineEditor.IsInsideOverlayPopup(viewX, viewY) {
 		return nil
 	}
 

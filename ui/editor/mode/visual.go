@@ -175,16 +175,16 @@ func visualArrowDown(vm *VisualMode, state *EditorState) Mode {
 }
 
 func visualArrowLeft(vm *VisualMode, state *EditorState) Mode {
-	mr := motion.ExecuteMotion(motion.MotionLeft, state.Buffer, state.LineIndex, state.Cursor, 1)
-	state.Cursor = mr.End
+	// Arrow keys cross line boundaries (standard editor behaviour);
+	// vim h/l motions stay within the line.
+	state.Cursor = max(state.Cursor-1, 0)
 	state.ClampCursor(0)
 	vm.State.CursorPos = state.Cursor
 	return vm.currentMode()
 }
 
 func visualArrowRight(vm *VisualMode, state *EditorState) Mode {
-	mr := motion.ExecuteMotion(motion.MotionRight, state.Buffer, state.LineIndex, state.Cursor, 1)
-	state.Cursor = mr.End
+	state.Cursor = min(state.Cursor+1, state.Buffer.Length())
 	state.ClampCursor(0)
 	vm.State.CursorPos = state.Cursor
 	return vm.currentMode()
