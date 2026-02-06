@@ -674,14 +674,53 @@ type rowInterval struct {
 	start, end int
 }
 
+// layoutCandidate represents one possible allocation of space between
+// completion and hover. Scored by total visible content lines.
+type layoutCandidate struct {
+	compHeight  int         // total rows allocated to completion (0 = not shown)
+	hoverZone   rowInterval // zone where hover is placed
+	hoverHeight int         // total rows allocated to hover (0 = not shown)
+	score       int         // total visible content lines (higher = better)
+	anchorGap   int         // row distance from hover zone to anchor (lower = better)
+}
+
+// layoutScore computes the total visible content lines for a given
+// allocation. Higher is better.
+func layoutScore(compH, compItems, hoverH, hoverContentLines int) int {
+	compVisible := min(max(compH-completion.PopupChromeRows(), 0), compItems)
+	hoverVisible := min(max(hoverH-hover.BorderRows, 0), hoverContentLines)
+	return compVisible + hoverVisible
+}
+
 // popupLayout computes collision-free viewport positions for all active
-// popups (signature help, hover tooltip, completion).
-func (m *Model) popupLayout(viewHeight int) (sig, hover, comp popupPlacement) {
+// popups (signature help, hover tooltip, completion), maximizing total
+// visible content via cost-function optimization.
+func (m *Model) popupLayout(viewHeight int) (sig, hov, comp popupPlacement) {
 	cursorRow := m.contentLineToViewRow(m.state.CursorLine)
 	sig = m.sigHelpPlacement(cursorRow)
-	comp = m.completionPlacement(cursorRow, viewHeight)
-	hover = m.hoverPlacement(viewHeight, cursorRow, sig, comp)
+	comp, hov = m.layoutCompAndHover(viewHeight, cursorRow, sig)
 	return
+}
+
+// layoutCompAndHover dispatches to the appropriate placement strategy
+// based on which popups are active.
+func (m *Model) layoutCompAndHover(viewHeight, cursorRow int, sig popupPlacement) (comp, hov popupPlacement) {
+	compActive := m.completionEngine.Active()
+	hoverActive := m.hoverActive && m.hoverPopup.Active()
+	if !compActive && !hoverActive {
+		return
+	}
+	if !hoverActive {
+		comp = m.completionPlacement(cursorRow, viewHeight)
+		return
+	}
+	anchorRow := m.contentLineToViewRow(m.hoverPopup.AnchorLine())
+	if !compActive {
+		zones := baseZones(viewHeight, cursorRow, anchorRow, sig)
+		hov = m.placeHoverInZones(zones, anchorRow)
+		return
+	}
+	return m.optimizedDualLayout(viewHeight, cursorRow, anchorRow, sig)
 }
 
 // sigHelpPlacement renders signature help and positions it above the cursor.
@@ -712,22 +751,11 @@ func (m *Model) completionPlacement(cursorRow, viewHeight int) popupPlacement {
 	return newPopupPlacement(popup, start)
 }
 
-// hoverPlacement positions hover in the largest free viewport zone,
-// avoiding signature help, the cursor row, and completion.
-func (m *Model) hoverPlacement(viewHeight, cursorRow int, sig, comp popupPlacement) popupPlacement {
-	if !m.hoverActive || !m.hoverPopup.Active() {
-		return popupPlacement{}
-	}
-	anchorRow := m.contentLineToViewRow(m.hoverPopup.AnchorLine())
-	zones := hoverFreeZones(viewHeight, cursorRow, anchorRow, sig, comp)
-	return m.placeHoverInZones(zones, anchorRow)
-}
-
-// hoverFreeZones builds reserved intervals (sig, cursor, anchor, comp) and
-// returns the free gaps between them within [0, viewHeight). The anchor row
-// is reserved so the hover popup never covers the text being hovered.
-func hoverFreeZones(viewHeight, cursorRow, anchorRow int, sig, comp popupPlacement) []rowInterval {
-	reserved := make([]rowInterval, 0, 4)
+// baseZones computes free intervals with only sig, cursor, and anchor
+// reserved. Completion is excluded so the optimizer can explore different
+// comp heights.
+func baseZones(viewHeight, cursorRow, anchorRow int, sig popupPlacement) []rowInterval {
+	reserved := make([]rowInterval, 0, 3)
 	if sig.height > 0 {
 		reserved = append(reserved, rowInterval{sig.start, sig.start + sig.height})
 	}
@@ -735,13 +763,224 @@ func hoverFreeZones(viewHeight, cursorRow, anchorRow int, sig, comp popupPlaceme
 	if anchorRow != cursorRow {
 		reserved = append(reserved, rowInterval{anchorRow, anchorRow + 1})
 	}
-	if comp.height > 0 {
-		reserved = append(reserved, rowInterval{comp.start, comp.start + comp.height})
-	}
 	slices.SortFunc(reserved, func(a, b rowInterval) int {
 		return cmp.Compare(a.start, b.start)
 	})
 	return gapIntervals(reserved, viewHeight)
+}
+
+// optimizedDualLayout finds the allocation of space between completion and
+// hover that maximizes total visible content lines.
+func (m *Model) optimizedDualLayout(viewHeight, cursorRow, anchorRow int, sig popupPlacement) (comp, hov popupPlacement) {
+	compStart := cursorRow + 1
+	compItems := len(m.completionEngine.Items())
+	compIdeal := completion.PopupChromeRows() + min(compItems, completion.MaxVisibleItems())
+	compMin := completion.PopupChromeRows() + 1
+	hoverContentLines := m.hoverPopup.ContentHeight(m.width, m.theme)
+	hoverIdeal := hover.BorderRows + hoverContentLines
+	hoverMin := hover.BorderRows + 1
+
+	zones := baseZones(viewHeight, cursorRow, anchorRow, sig)
+	// Cap comp ideal to the space actually available in its zone.
+	compAvail := zoneSpaceFrom(zones, compStart)
+	compIdeal = min(compIdeal, compAvail)
+	compMin = min(compMin, compAvail)
+
+	best := findBestLayout(zones, compStart, compMin, compIdeal, compItems,
+		anchorRow, hoverMin, hoverIdeal, hoverContentLines)
+
+	comp = m.renderComp(compStart, best.compHeight)
+	hov = m.renderHover(best.hoverZone, best.hoverHeight, anchorRow)
+	return
+}
+
+// zoneSpaceFrom returns the available rows from pos to the end of the zone
+// containing pos. Returns 0 if pos is not inside any zone.
+func zoneSpaceFrom(zones []rowInterval, pos int) int {
+	for _, z := range zones {
+		if pos >= z.start && pos < z.end {
+			return z.end - pos
+		}
+	}
+	return 0
+}
+
+// findBestLayout evaluates all candidate allocations and returns the one
+// with the highest score.
+func findBestLayout(
+	zones []rowInterval,
+	compStart, compMin, compIdeal, compItems int,
+	anchorRow, hoverMin, hoverIdeal, hoverContentLines int,
+) layoutCandidate {
+	best := layoutCandidate{score: -1}
+	for _, z := range zones {
+		candidates := zoneCandidates(z, compStart, compMin, compIdeal, compItems,
+			anchorRow, hoverMin, hoverIdeal, hoverContentLines)
+		best = bestOfSlice(best, candidates)
+	}
+	return compFallback(best, compIdeal, compItems)
+}
+
+// bestOfSlice returns the candidate with the highest score among current
+// best and all entries in candidates. Ties broken by proximity to anchor
+// (smaller anchorGap wins), then by preferring below-anchor zones.
+func bestOfSlice(current layoutCandidate, candidates []layoutCandidate) layoutCandidate {
+	for _, c := range candidates {
+		if betterCandidate(c, current) {
+			current = c
+		}
+	}
+	return current
+}
+
+// betterCandidate reports whether a is a better layout than b.
+// Primary: closer to hover anchor (mouse or K position). Secondary: higher
+// total visible content. Tertiary: prefer below-anchor zone.
+func betterCandidate(a, b layoutCandidate) bool {
+	if a.anchorGap != b.anchorGap {
+		return a.anchorGap < b.anchorGap
+	}
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	return a.hoverZone.start > b.hoverZone.start // prefer below
+}
+
+// compFallback returns a comp-only layout when no valid dual layout exists.
+func compFallback(best layoutCandidate, compIdeal, compItems int) layoutCandidate {
+	if best.score >= 0 {
+		return best
+	}
+	return layoutCandidate{
+		compHeight: compIdeal,
+		score:      min(max(compIdeal-completion.PopupChromeRows(), 0), compItems),
+	}
+}
+
+// zoneCandidates generates all valid layout candidates for placing hover
+// in zone z. When comp also occupies z, it tries different comp heights.
+func zoneCandidates(
+	z rowInterval,
+	compStart, compMin, compIdeal, compItems int,
+	anchorRow, hoverMin, hoverIdeal, hoverContentLines int,
+) []layoutCandidate {
+	compInZone := compStart >= z.start && compStart < z.end
+	if !compInZone {
+		return independentCandidates(z, compIdeal, compItems,
+			anchorRow, hoverMin, hoverIdeal, hoverContentLines)
+	}
+	return sharedZoneCandidates(z, compStart, compMin, compIdeal, compItems,
+		anchorRow, hoverMin, hoverIdeal, hoverContentLines)
+}
+
+// independentCandidates returns a single candidate where comp gets its
+// ideal height and hover gets the full zone.
+func independentCandidates(
+	z rowInterval,
+	compIdeal, compItems int,
+	anchorRow, hoverMin, hoverIdeal, hoverContentLines int,
+) []layoutCandidate {
+	zoneH := z.end - z.start
+	hoverH := min(zoneH, hoverIdeal)
+	if hoverH < hoverMin {
+		return nil
+	}
+	return []layoutCandidate{{
+		compHeight:  compIdeal,
+		hoverZone:   z,
+		hoverHeight: hoverH,
+		score:       layoutScore(compIdeal, compItems, hoverH, hoverContentLines),
+		anchorGap:   zoneGap(z, anchorRow),
+	}}
+}
+
+// sharedZoneCandidates generates candidates by varying comp height within
+// a zone that both popups want to occupy.
+func sharedZoneCandidates(
+	z rowInterval,
+	compStart, compMin, compIdeal, compItems int,
+	anchorRow, hoverMin, hoverIdeal, hoverContentLines int,
+) []layoutCandidate {
+	maxCompInZone := z.end - compStart
+	compHi := min(compIdeal, maxCompInZone)
+	compLo := min(compMin, maxCompInZone)
+	candidates := make([]layoutCandidate, 0, compHi-compLo+1)
+	for ch := compLo; ch <= compHi; ch++ {
+		hc := sharedHoverCandidate(z, compStart, ch, compItems, anchorRow,
+			hoverMin, hoverIdeal, hoverContentLines)
+		if hc.score >= 0 {
+			candidates = append(candidates, hc)
+		}
+	}
+	return candidates
+}
+
+// sharedHoverCandidate computes the hover allocation for a fixed comp
+// height within a shared zone.
+func sharedHoverCandidate(
+	z rowInterval, compStart, compH, compItems int,
+	anchorRow, hoverMin, hoverIdeal, hoverContentLines int,
+) layoutCandidate {
+	compEnd := compStart + compH
+	hz := hoverSubZone(z, compStart, compEnd, anchorRow)
+	hoverH := min(hz.end-hz.start, hoverIdeal)
+	if hoverH < hoverMin {
+		return layoutCandidate{score: -1}
+	}
+	return layoutCandidate{
+		compHeight:  compH,
+		hoverZone:   hz,
+		hoverHeight: hoverH,
+		score:       layoutScore(compH, compItems, hoverH, hoverContentLines),
+		anchorGap:   zoneGap(hz, anchorRow),
+	}
+}
+
+// hoverSubZone selects the sub-interval within zone z that is available
+// for hover after comp occupies [compStart, compEnd). Picks the sub-zone
+// closer to anchorRow.
+func hoverSubZone(z rowInterval, compStart, compEnd, anchorRow int) rowInterval {
+	above := rowInterval{z.start, compStart}
+	below := rowInterval{compEnd, z.end}
+	if above.end-above.start <= 0 {
+		return below
+	}
+	if below.end-below.start <= 0 {
+		return above
+	}
+	return closerToAnchor(above, below, anchorRow)
+}
+
+// closerToAnchor returns whichever interval is closer to anchorRow.
+// Ties broken by preferring below.
+func closerToAnchor(a, b rowInterval, anchorRow int) rowInterval {
+	if zoneGap(a, anchorRow) < zoneGap(b, anchorRow) {
+		return a
+	}
+	return b
+}
+
+// renderComp renders completion constrained to the allocated height.
+func (m *Model) renderComp(start, allocHeight int) popupPlacement {
+	if allocHeight <= 0 || !m.completionEngine.Active() {
+		return popupPlacement{}
+	}
+	popup := m.completionEngine.Render(m.width, allocHeight, m.theme)
+	if popup == "" {
+		return popupPlacement{}
+	}
+	return newPopupPlacement(popup, start)
+}
+
+// renderHover renders hover constrained to the allocated zone and height.
+func (m *Model) renderHover(zone rowInterval, allocHeight, anchorRow int) popupPlacement {
+	if allocHeight <= 0 || !m.hoverActive {
+		return popupPlacement{}
+	}
+	popup := m.hoverPopup.View(m.width, allocHeight, m.theme)
+	p := newPopupPlacement(popup, 0)
+	p.start = hoverSlot(zone, anchorRow, p.height)
+	return p
 }
 
 // gapIntervals returns the free intervals between sorted, non-overlapping
@@ -761,48 +1000,46 @@ func gapIntervals(sorted []rowInterval, viewHeight int) []rowInterval {
 	return gaps
 }
 
-// placeHoverInZones greedily picks the best free zone for the hover tooltip.
-// Strategy: among zones closest to the anchor, pick the largest so the popup
-// can display the most content without scrolling. Renders the popup
-// constrained to the chosen zone's actual height.
+// placeHoverInZones picks the zone that maximizes visible hover content,
+// breaking ties by proximity to anchor, then preferring below.
 func (m *Model) placeHoverInZones(zones []rowInterval, anchorRow int) popupPlacement {
-	zone := bestHoverZone(zones, anchorRow)
-	zoneH := zone.end - zone.start
-	if zoneH <= hover.BorderRows {
-		return popupPlacement{}
-	}
-	popup := m.hoverPopup.View(m.width, zoneH, m.theme)
-	p := newPopupPlacement(popup, 0)
-	p.start = hoverSlot(zone, anchorRow, p.height)
-	return p
+	contentLines := m.hoverPopup.ContentHeight(m.width, m.theme)
+	ideal := hover.BorderRows + contentLines
+	minH := hover.BorderRows + 1
+	best := bestHoverOnlyZone(zones, anchorRow, minH, ideal, contentLines)
+	return m.renderHover(best, min(best.end-best.start, ideal), anchorRow)
 }
 
-// bestHoverZone selects the optimal free zone for hover placement. Zones are
-// ranked by: (1) proximity to anchor (actual row gap), (2) available height
-// (larger = more content visible), (3) position below anchor preferred.
-func bestHoverZone(zones []rowInterval, anchorRow int) rowInterval {
-	sorted := slices.Clone(zones)
-	slices.SortStableFunc(sorted, zoneComparator(anchorRow))
-	if len(sorted) == 0 {
-		return rowInterval{}
+// bestHoverOnlyZone selects the optimal free zone for hover-only placement.
+// Scored by visible content; ties broken by proximity then below-preference.
+func bestHoverOnlyZone(zones []rowInterval, anchorRow, minH, idealH, contentLines int) rowInterval {
+	best := rowInterval{}
+	bestScore := -1
+	for _, z := range zones {
+		h := min(z.end-z.start, idealH)
+		if h < minH {
+			continue
+		}
+		score := min(max(h-hover.BorderRows, 0), contentLines)
+		if betterHoverZone(score, z, bestScore, best, anchorRow) {
+			best, bestScore = z, score
+		}
 	}
-	return sorted[0]
+	return best
 }
 
-// zoneComparator returns a sort function that ranks zones by proximity to
-// anchor, then by size (descending), then by below-preference.
-func zoneComparator(anchorRow int) func(a, b rowInterval) int {
-	return func(a, b rowInterval) int {
-		da, db := zoneGap(a, anchorRow), zoneGap(b, anchorRow)
-		if da != db {
-			return cmp.Compare(da, db)
-		}
-		sizeA, sizeB := a.end-a.start, b.end-b.start
-		if sizeA != sizeB {
-			return cmp.Compare(sizeB, sizeA) // descending: larger first
-		}
-		return cmp.Compare(b.start, a.start) // descending: below first
+// betterHoverZone reports whether (score, z) is a better hover zone than
+// (bestScore, best). Primary: closer to anchor. Secondary: more content.
+// Tertiary: prefer below.
+func betterHoverZone(score int, z rowInterval, bestScore int, best rowInterval, anchorRow int) bool {
+	dz, db := zoneGap(z, anchorRow), zoneGap(best, anchorRow)
+	if dz != db {
+		return dz < db
 	}
+	if score != bestScore {
+		return score > bestScore
+	}
+	return z.start > best.start // prefer below
 }
 
 // zoneGap returns the number of rows between the zone boundary and the
