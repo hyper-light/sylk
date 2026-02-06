@@ -34,6 +34,11 @@ const headerHeight = 1
 // Derived from: header(1) + input-or-hint(1) + divider(1) = 3.
 const topChromeHeight = 3
 
+// replaceChromeHeight is the vertical space consumed by the top section in
+// replace mode, which adds a replacement input row below the search bar.
+// Derived from: header(1) + search bar(1) + replace bar(1) + divider(1) = 4.
+const replaceChromeHeight = 4
+
 // searchFooterHeight is the vertical space consumed by the search-mode footer.
 // Derived from: toolbar separator(1) + toolbar(1) = 2.
 const searchFooterHeight = 2
@@ -59,6 +64,7 @@ const (
 	viewSearch
 	viewReferences  // LSP references results.
 	viewDocSymbols  // LSP document symbol outline.
+	viewReplace     // Multi-file find and replace.
 )
 
 // searchItemKind classifies entries in the search results list.
@@ -118,12 +124,23 @@ type searchFocus int
 
 const (
 	focusQuery   searchFocus = iota // The search query input line.
+	focusReplace                    // The replacement text input (replace mode only).
 	focusToggles                    // The toggle badges row.
 	focusScope                      // The path scope text input.
 )
 
-// searchFocusCount is the number of focus zones in the search footer.
-// Derived from: the three searchFocus values above.
+// searchFocusOrder defines the Tab-cycling order for search mode, skipping
+// focusReplace which is only relevant in replace mode.
+// Derived from: the three active focus zones in search mode.
+var searchFocusOrder = [3]searchFocus{focusQuery, focusToggles, focusScope}
+
+// replaceFocusOrder defines the Tab-cycling order for replace mode.
+// Derived from: the four active focus zones in replace mode.
+var replaceFocusOrder = [4]searchFocus{focusQuery, focusReplace, focusToggles, focusScope}
+
+// searchFocusCount is kept for backward compatibility with existing code
+// that references it. Search mode cycles through 3 zones.
+// Derived from: the three searchFocusOrder values.
 const searchFocusCount = 3
 
 // toggleIndex identifies a specific toggle badge within the toolbar.
@@ -232,6 +249,14 @@ func (c *fileCache) put(path string, lines []string, size int64) {
 	c.totalSize += size
 }
 
+// evict removes a single path from the cache so the next access re-reads disk.
+func (c *fileCache) evict(path string) {
+	if e, ok := c.entries[path]; ok {
+		c.totalSize -= e.size
+		delete(c.entries, path)
+	}
+}
+
 // Entry represents a single visible node in the flattened tree.
 type Entry struct {
 	Name     string
@@ -307,6 +332,9 @@ type Model struct {
 	symCursor   int
 	symScroll   int
 	symNumWidth int // Digit width for line numbers.
+
+	// Replace state (viewReplace mode).
+	replaceInput []rune // Replacement text input contents.
 
 	// New-entry state: two-phase (pending chord → active input).
 	pendingNewEntry bool   // Alt+N pressed, waiting for F (file) or D (dir).
@@ -392,6 +420,8 @@ func (m *Model) View() string {
 	switch m.mode {
 	case viewSearch:
 		return m.viewSearchMode()
+	case viewReplace:
+		return m.viewReplaceMode()
 	case viewReferences:
 		return m.viewReferencesMode()
 	case viewDocSymbols:
@@ -691,6 +721,8 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 	switch m.mode {
 	case viewSearch:
 		return m.clickSearchMode(viewX, viewY)
+	case viewReplace:
+		return m.clickReplaceMode(viewX, viewY)
 	case viewReferences:
 		return m.clickReferencesMode(viewY)
 	case viewDocSymbols:
@@ -902,6 +934,9 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 	}
 	if m.mode == viewReferences {
 		return m.handleReferencesKey(key)
+	}
+	if m.mode == viewReplace {
+		return m.handleReplaceKey(key)
 	}
 	if m.mode == viewSearch {
 		return m.handleSearchKey(key)
@@ -1169,14 +1204,36 @@ func (m *Model) handleSearchKey(key tea.KeyMsg) tea.Cmd {
 	return m.dispatchToFocusZone(key)
 }
 
-// advanceSearchFocus moves focus to the next zone in the toolbar.
+// advanceSearchFocus moves focus to the next zone using the mode's focus order.
 func (m *Model) advanceSearchFocus() {
-	m.searchFocus = (m.searchFocus + 1) % searchFocusCount
+	m.searchFocus = m.nextFocus(1)
 }
 
-// retreatSearchFocus moves focus to the previous zone in the toolbar.
+// retreatSearchFocus moves focus to the previous zone using the mode's focus order.
 func (m *Model) retreatSearchFocus() {
-	m.searchFocus = (m.searchFocus + searchFocusCount - 1) % searchFocusCount
+	m.searchFocus = m.nextFocus(-1)
+}
+
+// nextFocus cycles through the active focus order by the given delta (+1/-1).
+func (m *Model) nextFocus(delta int) searchFocus {
+	order := m.focusOrder()
+	n := len(order)
+	idx := 0
+	for i, f := range order {
+		if f == m.searchFocus {
+			idx = i
+			break
+		}
+	}
+	return order[(idx+delta+n)%n]
+}
+
+// focusOrder returns the focus cycling order for the current mode.
+func (m *Model) focusOrder() []searchFocus {
+	if m.mode == viewReplace {
+		return replaceFocusOrder[:]
+	}
+	return searchFocusOrder[:]
 }
 
 // handleSearchEnter dispatches Enter based on the current focus zone.
@@ -1859,6 +1916,335 @@ func (m *Model) exitSearch() {
 	m.compiledRegexp = nil
 }
 
+// ---------------------------------------------------------------------------
+// Replace mode (multi-file find and replace)
+// ---------------------------------------------------------------------------
+
+// enterReplace enters multi-file replace mode, reusing the search
+// infrastructure for file collection and match display.
+func (m *Model) enterReplace() {
+	m.enterSearch()
+	m.mode = viewReplace
+	m.replaceInput = nil
+	m.searchFocus = focusQuery
+}
+
+// exitReplace cleans up replace-specific state and delegates to exitSearch.
+func (m *Model) exitReplace() {
+	m.replaceInput = nil
+	m.exitSearch()
+}
+
+// ToggleReplace enters or exits multi-file replace mode.
+func (m *Model) ToggleReplace() {
+	if m.mode == viewReplace {
+		m.exitReplace()
+		return
+	}
+	m.enterReplace()
+}
+
+// InReplaceMode reports whether the file tree is in multi-file replace mode.
+func (m *Model) InReplaceMode() bool { return m.mode == viewReplace }
+
+// handleReplaceKey processes keys in replace mode. It reuses the search
+// infrastructure for match display and navigation, adding replace actions.
+func (m *Model) handleReplaceKey(key tea.KeyMsg) tea.Cmd {
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
+	switch key.String() {
+	case "ctrl+u":
+		m.exitReplace()
+		return nil
+	case "up":
+		m.moveSearchCursor(-1)
+		return nil
+	case "down":
+		m.moveSearchCursor(1)
+		return nil
+	case "tab":
+		m.advanceSearchFocus()
+		return nil
+	case "shift+tab":
+		m.retreatSearchFocus()
+		return nil
+	case "enter":
+		return m.handleReplaceEnter()
+	case "ctrl+enter":
+		return m.replaceAllSearchMatches()
+	}
+	return m.dispatchToReplaceFocusZone(key)
+}
+
+// handleReplaceEnter dispatches Enter based on the current focus zone.
+func (m *Model) handleReplaceEnter() tea.Cmd {
+	if m.searchFocus == focusToggles {
+		return m.toggleBadge(m.toggleCursor)
+	}
+	if m.searchFocus == focusReplace {
+		return m.replaceCurrentSearchMatch()
+	}
+	return m.activateSearchResult()
+}
+
+// dispatchToReplaceFocusZone routes key input to the handler for the active
+// focus zone in replace mode.
+func (m *Model) dispatchToReplaceFocusZone(key tea.KeyMsg) tea.Cmd {
+	switch m.searchFocus {
+	case focusQuery:
+		return m.handleQueryInput(key)
+	case focusReplace:
+		return m.handleReplaceInput(key)
+	case focusToggles:
+		return m.handleToggleInput(key)
+	case focusScope:
+		return m.handleScopeInput(key)
+	}
+	return nil
+}
+
+// handleReplaceInput processes keys when the replacement text input is focused.
+func (m *Model) handleReplaceInput(key tea.KeyMsg) tea.Cmd {
+	if key.String() == "backspace" {
+		if len(m.replaceInput) > 0 {
+			m.replaceInput = m.replaceInput[:len(m.replaceInput)-1]
+		}
+		return nil
+	}
+	if key.Type != tea.KeyRunes && key.Type != tea.KeySpace {
+		return nil
+	}
+	m.appendToReplace([]rune(key.String()))
+	return nil
+}
+
+// appendToReplace appends runes to the replacement input, capped at maxInputLen.
+func (m *Model) appendToReplace(runes []rune) {
+	remaining := maxInputLen - len(m.replaceInput)
+	if remaining <= 0 {
+		return
+	}
+	if len(runes) > remaining {
+		runes = runes[:remaining]
+	}
+	m.replaceInput = append(m.replaceInput, runes...)
+}
+
+// replaceCurrentSearchMatch replaces the match at the current search cursor
+// position on disk and refreshes results.
+func (m *Model) replaceCurrentSearchMatch() tea.Cmd {
+	if len(m.searchQuery) == 0 {
+		return nil
+	}
+	if m.searchCursor >= len(m.searchItems) {
+		return nil
+	}
+	item := m.searchItems[m.searchCursor]
+	if item.kind != searchItemMatch {
+		return nil
+	}
+	cfg := m.buildMatchConfig(string(m.searchQuery))
+	replaced := m.replaceInFile(item.path, string(m.searchQuery), string(m.replaceInput), cfg, item.line)
+	if !replaced {
+		return nil
+	}
+	m.searchCache.evict(item.path)
+	m.refilterSync()
+	return func() tea.Msg {
+		return msg.FileReplacedMsg{Path: item.path}
+	}
+}
+
+// replaceAllSearchMatches replaces all matches across all files on disk.
+func (m *Model) replaceAllSearchMatches() tea.Cmd {
+	if len(m.searchQuery) == 0 || len(m.searchItems) == 0 {
+		return nil
+	}
+	cfg := m.buildMatchConfig(string(m.searchQuery))
+	query := string(m.searchQuery)
+	replacement := string(m.replaceInput)
+
+	// Collect unique file paths from match items.
+	paths := m.collectMatchedPaths()
+	filesChanged := 0
+	totalReplaced := 0
+	for _, path := range paths {
+		n := m.replaceAllInFile(path, query, replacement, cfg)
+		if n > 0 {
+			filesChanged++
+			totalReplaced += n
+			m.searchCache.evict(path)
+		}
+	}
+	m.refilterSync()
+	return func() tea.Msg {
+		return msg.MultiFileReplaceDoneMsg{
+			FilesChanged:  filesChanged,
+			TotalReplaced: totalReplaced,
+		}
+	}
+}
+
+// collectMatchedPaths returns the unique file paths from the current search results.
+func (m *Model) collectMatchedPaths() []string {
+	seen := make(map[string]struct{}, len(m.searchItems)/2)
+	paths := make([]string, 0, len(m.searchItems)/2)
+	for _, item := range m.searchItems {
+		if item.path == "" {
+			continue
+		}
+		if _, ok := seen[item.path]; ok {
+			continue
+		}
+		seen[item.path] = struct{}{}
+		paths = append(paths, item.path)
+	}
+	return paths
+}
+
+// replaceInFile replaces the first match on the given line in a file on disk.
+// Returns true if a replacement was made. Preserves original line endings
+// and file permissions.
+func (m *Model) replaceInFile(path, query, replacement string, cfg matchConfig, lineNum int) bool {
+	if cfg.compiled == nil {
+		return false
+	}
+	data, mode, err := readFileWithMode(path)
+	if err != nil {
+		return false
+	}
+	eol := detectLineEnding(data)
+	lines := splitLines(string(data), eol)
+	idx := lineNum - 1 // searchMatch uses 1-based line numbers.
+	if idx < 0 || idx >= len(lines) {
+		return false
+	}
+	newLine := replaceFirstWithRe(lines[idx], cfg.compiled, replacement, cfg.useRegex)
+	if newLine == lines[idx] {
+		return false
+	}
+	lines[idx] = newLine
+	return os.WriteFile(path, []byte(strings.Join(lines, eol)), mode) == nil
+}
+
+// replaceAllInFile replaces all matches in a file on disk.
+// Returns the number of line replacements made. Preserves original line
+// endings and file permissions.
+func (m *Model) replaceAllInFile(path, query, replacement string, cfg matchConfig) int {
+	if cfg.compiled == nil {
+		return 0
+	}
+	data, mode, err := readFileWithMode(path)
+	if err != nil {
+		return 0
+	}
+	eol := detectLineEnding(data)
+	lines := splitLines(string(data), eol)
+	count := 0
+	for i, line := range lines {
+		newLine := replaceAllWithRe(line, cfg.compiled, replacement, cfg.useRegex)
+		if newLine != line {
+			lines[i] = newLine
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	if os.WriteFile(path, []byte(strings.Join(lines, eol)), mode) != nil {
+		return 0
+	}
+	return count
+}
+
+// readFileWithMode reads a file and returns its contents along with the
+// original file permissions, for faithful round-trip writes.
+func readFileWithMode(path string) ([]byte, os.FileMode, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	return data, info.Mode().Perm(), nil
+}
+
+// detectLineEnding returns the line-ending sequence used in data.
+// Returns "\r\n" if CRLF is present, "\n" otherwise.
+func detectLineEnding(data []byte) string {
+	if bytes.Contains(data, []byte("\r\n")) {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+// splitLines splits content by the given line ending sequence.
+func splitLines(content, eol string) []string {
+	return strings.Split(content, eol)
+}
+
+// replaceFirstWithRe replaces only the first match on a line using a
+// pre-compiled regex. For regex mode, backreferences in the replacement
+// are expanded; for literal mode, the replacement is inserted verbatim.
+func replaceFirstWithRe(line string, re *regexp.Regexp, replacement string, isRegex bool) string {
+	loc := re.FindStringIndex(line)
+	if loc == nil {
+		return line
+	}
+	if isRegex {
+		matched := line[loc[0]:loc[1]]
+		expanded := re.ReplaceAllString(matched, replacement)
+		return line[:loc[0]] + expanded + line[loc[1]:]
+	}
+	return line[:loc[0]] + replacement + line[loc[1]:]
+}
+
+// replaceAllWithRe replaces all matches on a line using a pre-compiled regex.
+// For regex mode, backreferences are expanded; for literal mode, the
+// replacement is inserted verbatim.
+func replaceAllWithRe(line string, re *regexp.Regexp, replacement string, isRegex bool) string {
+	if isRegex {
+		return re.ReplaceAllString(line, replacement)
+	}
+	return re.ReplaceAllLiteralString(line, replacement)
+}
+
+// refilterSync runs the search pipeline synchronously (no debounce),
+// used after replacements to immediately refresh results.
+func (m *Model) refilterSync() {
+	m.searchVersion++
+	m.runSearch()
+}
+
+// clickReplaceMode handles clicks in replace mode, dispatching to search
+// input, replace input, body, or toolbar based on Y position.
+func (m *Model) clickReplaceMode(viewX, viewY int) tea.Cmd {
+	bh := m.bodyHeight()
+
+	// Layout: header(0) | search bar(1) | replace bar(2) | divider(3) | body(4..4+bh-1) | toolbar sep | toolbar.
+
+	if viewY == headerHeight {
+		m.searchFocus = focusQuery
+		return nil
+	}
+	if viewY == headerHeight+1 {
+		m.searchFocus = focusReplace
+		return nil
+	}
+
+	bodyY := viewY - replaceChromeHeight
+	if bodyY >= 0 && bodyY < bh {
+		return m.clickSearchBody(bodyY)
+	}
+
+	if viewY == replaceChromeHeight+bh+1 {
+		return m.clickToolbar(viewX)
+	}
+	return nil
+}
+
 // collectFiles walks the root entries recursively, collecting all files
 // (not directories) into a flat list bounded by maxSearchFiles.
 func (m *Model) collectFiles(roots []Entry) []Entry {
@@ -1950,23 +2336,32 @@ func (m *Model) runSearch() {
 }
 
 // buildMatchConfig constructs a matchConfig from the current toggle state
-// and query content, implementing smart-case behavior.
+// and query content, implementing smart-case behavior. Always pre-compiles
+// a regex for both search matching and replacement, applying case-insensitive
+// and whole-word flags via regex syntax for correct Unicode handling.
 func (m *Model) buildMatchConfig(query string) matchConfig {
 	cfg := matchConfig{
 		caseSensitive: m.toggleActive[toggleCase] || hasUpperCase(query),
 		wholeWord:     m.toggleActive[toggleWord],
 		useRegex:      m.toggleActive[toggleRegex],
 	}
-	if cfg.useRegex {
-		cfg.compiled = compileSearchRegex(query, cfg.caseSensitive)
-	}
+	cfg.compiled = compileMatchRegex(query, cfg)
 	return cfg
 }
 
-// compileSearchRegex compiles the query as a regex pattern.
-// Returns nil if the pattern is invalid.
-func compileSearchRegex(pattern string, caseSensitive bool) *regexp.Regexp {
-	if !caseSensitive {
+// compileMatchRegex compiles the query into a regex suitable for both matching
+// and replacement. For regex mode, compiles the raw pattern; for literal mode,
+// escapes the query and adds \b word boundaries if needed. Case insensitivity
+// is applied via (?i) flag for correct Unicode case folding.
+func compileMatchRegex(query string, cfg matchConfig) *regexp.Regexp {
+	pattern := query
+	if !cfg.useRegex {
+		pattern = regexp.QuoteMeta(query)
+	}
+	if cfg.wholeWord {
+		pattern = `\b` + pattern + `\b`
+	}
+	if !cfg.caseSensitive {
 		pattern = "(?i)" + pattern
 	}
 	re, err := regexp.Compile(pattern)
@@ -2138,70 +2533,13 @@ func isBlankLine(s string) bool {
 	return true
 }
 
-// lineMatches reports whether a single line matches the query with the
-// given configuration (regex, case-sensitive, whole-word).
-func lineMatches(line, query string, cfg matchConfig) bool {
-	if cfg.useRegex {
-		return regexLineMatch(line, cfg.compiled)
-	}
-	return substringLineMatch(line, query, cfg)
-}
-
-// regexLineMatch checks whether a compiled regex matches anywhere in line.
-func regexLineMatch(line string, re *regexp.Regexp) bool {
-	if re == nil {
+// lineMatches reports whether a single line matches the query using the
+// pre-compiled regex from matchConfig (covers all flag combinations).
+func lineMatches(line, _ string, cfg matchConfig) bool {
+	if cfg.compiled == nil {
 		return false
 	}
-	return re.MatchString(line)
-}
-
-// substringLineMatch checks for a substring match, honoring case and
-// whole-word settings.
-func substringLineMatch(line, query string, cfg matchConfig) bool {
-	haystack, needle := line, query
-	if !cfg.caseSensitive {
-		haystack = strings.ToLower(haystack)
-		needle = strings.ToLower(needle)
-	}
-	if !cfg.wholeWord {
-		return strings.Contains(haystack, needle)
-	}
-	return containsWholeWord(haystack, needle)
-}
-
-// containsWholeWord reports whether haystack contains needle bounded by
-// non-word characters on both sides.
-func containsWholeWord(haystack, needle string) bool {
-	pos := 0
-	for {
-		idx := strings.Index(haystack[pos:], needle)
-		if idx < 0 {
-			return false
-		}
-		if isWordBoundary(haystack, pos+idx, len(needle)) {
-			return true
-		}
-		pos += idx + 1
-	}
-}
-
-// isWordBoundary reports whether the substring at [start, start+length)
-// is bounded by non-word characters (or string edges).
-func isWordBoundary(s string, start, length int) bool {
-	if start > 0 && isWordChar(rune(s[start-1])) {
-		return false
-	}
-	end := start + length
-	if end < len(s) && isWordChar(rune(s[end])) {
-		return false
-	}
-	return true
-}
-
-// isWordChar reports whether r is a word character (letter, digit, or
-// underscore). Matches the convention in code/highlight.go.
-func isWordChar(r rune) bool {
-	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+	return cfg.compiled.MatchString(line)
 }
 
 // hasUpperCase reports whether s contains any uppercase ASCII letter.
@@ -2433,6 +2771,77 @@ func (m *Model) viewSearchMode() string {
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchToolbar(contentWidth))
 	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Rendering: replace mode
+// ---------------------------------------------------------------------------
+
+// viewReplaceMode renders the header, search bar, replace bar, divider,
+// search results, and toolbar.
+func (m *Model) viewReplaceMode() string {
+	contentWidth := max(m.width, 1)
+	header := m.renderHeader(contentWidth)
+	bh := m.bodyHeight()
+	emptyLine := strings.Repeat(" ", contentWidth)
+
+	bodyLines := m.renderSearchBody(bh, contentWidth, emptyLine)
+	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
+
+	// Compose: header + search bar + replace bar + divider + body + toolbar separator + toolbar.
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchBar(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderReplaceBar(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchDivider(contentWidth))
+	for _, line := range bodyLines {
+		b.WriteByte('\n')
+		b.WriteString(line)
+	}
+	b.WriteByte('\n')
+	b.WriteString(m.renderToolbarSeparator(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchToolbar(contentWidth))
+	return b.String()
+}
+
+// renderReplaceBar renders the replacement text input line with a prefix
+// and blinking cursor, matching the style of the search bar.
+func (m *Model) renderReplaceBar(contentWidth int) string {
+	prefixStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	prefix := prefixStyle.Render(theme.IconArrowRight + " ")
+	prefixWidth := lipgloss.Width(prefix)
+
+	// Always reserve 1 column for the cursor so layout is stable.
+	availableForText := max(contentWidth-prefixWidth-1, 0)
+
+	// Pre-truncate text; show tail so recent keystrokes stay visible.
+	textStr := string(m.replaceInput)
+	textRunes := []rune(textStr)
+	if len(textRunes) > availableForText {
+		textStr = string(textRunes[len(textRunes)-availableForText:])
+	}
+
+	// Show blinking cursor only when this input has focus.
+	cursor := " "
+	if m.searchFocus == focusReplace && m.cursorBlink {
+		cursor = cursorStyle.Render(" ")
+	}
+
+	line := prefix + textStyle.Render(textStr) + cursor
+	lineWidth := lipgloss.Width(line)
+
+	padCount := max(contentWidth-lineWidth, 0)
+	if padCount > 0 {
+		line += strings.Repeat(" ", padCount)
+	}
+	return line
 }
 
 // ---------------------------------------------------------------------------
@@ -3281,8 +3690,12 @@ func (m *Model) emptyView(contentWidth int) string {
 // chrome (header + input/hint + divider) and the mode-specific footer.
 func (m *Model) bodyHeight() int {
 	footer := 0
+	top := topChromeHeight
 	switch m.mode {
 	case viewSearch:
+		footer = searchFooterHeight
+	case viewReplace:
+		top = replaceChromeHeight
 		footer = searchFooterHeight
 	case viewReferences:
 		footer = searchFooterHeight // separator + hint line
@@ -3292,7 +3705,7 @@ func (m *Model) bodyHeight() int {
 	if m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive {
 		footer += newEntryFooterHeight
 	}
-	return max(m.height-topChromeHeight-footer, 1)
+	return max(m.height-top-footer, 1)
 }
 
 func (m *Model) ensureCursorVisible() {

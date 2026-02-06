@@ -25,12 +25,27 @@ const (
 )
 
 // barFocus tracks which element of the find bar has keyboard focus.
+// Tab stops are ordered left-to-right:
+//
+//	find input → [Aa] → [ab] → [.*] → [Sel]
 type barFocus int
 
 const (
-	focusQuery   barFocus = iota // The text input line.
-	focusToggles                 // The toggle badge row.
+	focusQuery     barFocus = iota // The text input line.
+	focusToggleAa                  // [Aa] case sensitivity.
+	focusToggleAb                  // [ab] whole word.
+	focusToggleRx                  // [.*] regex mode.
+	focusToggleSel                 // [Sel] find in selection.
 )
+
+// focusCount is the total number of tab stops.
+// Derived from: the five barFocus values above.
+const focusCount = 5
+
+// isToggleFocus reports whether f is one of the toggle badge tab stops.
+func isToggleFocus(f barFocus) bool {
+	return f >= focusToggleAa && f <= focusToggleSel
+}
 
 // toggleIndex identifies a specific toggle badge.
 type toggleIndex int
@@ -66,7 +81,6 @@ type FindBar struct {
 
 	focus        barFocus
 	toggleActive [toggleCount]bool
-	toggleCursor toggleIndex
 
 	// Selection snapshot captured when the bar opened.
 	selStart int
@@ -83,20 +97,20 @@ type FindBar struct {
 	badgeAbsPos [toggleCount]badgePos
 }
 
-// New creates a FindBar. If the editor has an active selection, selStart/selEnd
-// are the rune offsets and hasSel is true; the "find in selection" toggle is
-// auto-enabled.
+// New creates a FindBar. selStart/selEnd are inclusive rune offsets of any
+// active selection; hasSel indicates whether these bounds are valid. The
+// [Sel] toggle starts off — the user must enable it manually.
 func New(selStart, selEnd int, hasSel bool) *FindBar {
-	fb := &FindBar{
+	return &FindBar{
 		selStart: selStart,
 		selEnd:   selEnd,
 		hasSel:   hasSel,
 	}
-	if hasSel {
-		fb.toggleActive[toggleSel] = true
-	}
-	return fb
 }
+
+// HasSelectionRange reports whether valid selection bounds were captured
+// when the bar was created (independent of whether [Sel] is toggled on).
+func (f *FindBar) HasSelectionRange() bool { return f.hasSel }
 
 // Height returns the number of terminal lines consumed by the bar.
 func (f *FindBar) Height() int { return barHeight }
@@ -121,8 +135,20 @@ func (f *FindBar) Compiled() *regexp.Regexp { return f.compiled }
 // FindInSelection reports whether the "Sel" toggle is active.
 func (f *FindBar) FindInSelection() bool { return f.toggleActive[toggleSel] }
 
+// EnableSelToggle turns the [Sel] toggle on (idempotent).
+func (f *FindBar) EnableSelToggle() { f.toggleActive[toggleSel] = true }
+
+// DisableSelToggle turns the [Sel] toggle off (idempotent).
+func (f *FindBar) DisableSelToggle() { f.toggleActive[toggleSel] = false }
+
 // SelectionRange returns the saved selection bounds.
 func (f *FindBar) SelectionRange() (int, int) { return f.selStart, f.selEnd }
+
+// SetQuery sets the query text and moves the cursor to the end.
+func (f *FindBar) SetQuery(text string) {
+	f.query = []rune(text)
+	f.cursor = len(f.query)
+}
 
 // ---------------------------------------------------------------------------
 // Search execution
@@ -209,9 +235,26 @@ func (f *FindBar) compileQuery() *regexp.Regexp {
 // Key handling
 // ---------------------------------------------------------------------------
 
+// toggleIdx returns the toggleIndex for the current focus.
+// Only meaningful when isToggleFocus(f.focus) is true.
+func (f *FindBar) toggleIdx() toggleIndex {
+	return toggleIndex(f.focus - focusToggleAa)
+}
+
 // HandleKey processes a key event and returns the resulting action.
 func (f *FindBar) HandleKey(key tea.KeyMsg) Action {
-	if f.focus == focusToggles {
+	if key.Type == tea.KeyEsc {
+		return ActionClose
+	}
+	if key.Type == tea.KeyTab {
+		f.focus = barFocus((int(f.focus) + 1) % focusCount)
+		return ActionNone
+	}
+	if key.String() == "shift+tab" {
+		f.focus = barFocus((int(f.focus) + focusCount - 1) % focusCount)
+		return ActionNone
+	}
+	if isToggleFocus(f.focus) {
 		return f.handleToggleKey(key)
 	}
 	return f.handleQueryKey(key)
@@ -219,8 +262,6 @@ func (f *FindBar) HandleKey(key tea.KeyMsg) Action {
 
 func (f *FindBar) handleQueryKey(key tea.KeyMsg) Action {
 	switch key.Type {
-	case tea.KeyEsc:
-		return ActionClose
 	case tea.KeyEnter:
 		switch key.String() {
 		case "shift+enter":
@@ -259,21 +300,12 @@ func (f *FindBar) handleQueryKey(key tea.KeyMsg) Action {
 	case tea.KeyEnd:
 		f.cursor = len(f.query)
 		return ActionNone
-	case tea.KeyTab:
-		f.focus = focusToggles
-		return ActionNone
 	}
-	// Ctrl+U clears the query.
 	if key.String() == "ctrl+u" {
 		f.query = f.query[:0]
 		f.cursor = 0
 		return ActionQueryChanged
 	}
-	// Shift+Enter via string match (some terminals).
-	if key.String() == "shift+enter" {
-		return ActionPrevMatch
-	}
-	// Printable rune insertion at cursor position.
 	if len(key.Runes) > 0 {
 		return f.insertRunesAtCursor(key.Runes)
 	}
@@ -296,19 +328,18 @@ func (f *FindBar) insertRunesAtCursor(runes []rune) Action {
 
 func (f *FindBar) handleToggleKey(key tea.KeyMsg) Action {
 	switch key.Type {
-	case tea.KeyEsc:
-		return ActionClose
-	case tea.KeyTab:
-		f.focus = focusQuery
-		return ActionNone
+	case tea.KeyEnter, tea.KeySpace:
+		return f.activateToggle(f.toggleIdx())
 	case tea.KeyLeft:
-		f.toggleCursor = toggleIndex(max(int(f.toggleCursor)-1, 0))
+		if f.focus > focusToggleAa {
+			f.focus--
+		}
 		return ActionNone
 	case tea.KeyRight:
-		f.toggleCursor = toggleIndex(min(int(f.toggleCursor)+1, toggleCount-1))
+		if f.focus < focusToggleSel {
+			f.focus++
+		}
 		return ActionNone
-	case tea.KeyEnter, tea.KeySpace:
-		return f.activateToggle(f.toggleCursor)
 	}
 	return ActionNone
 }
@@ -319,8 +350,7 @@ func (f *FindBar) HandleClick(col int) Action {
 	for i := range toggleCount {
 		bp := f.badgeAbsPos[i]
 		if col >= bp.start && col < bp.end {
-			f.focus = focusToggles
-			f.toggleCursor = toggleIndex(i)
+			f.focus = focusToggleAa + barFocus(i)
 			return f.activateToggle(toggleIndex(i))
 		}
 	}
@@ -329,11 +359,8 @@ func (f *FindBar) HandleClick(col int) Action {
 	return ActionNone
 }
 
-// activateToggle flips a toggle badge, respecting the Sel prerequisite.
+// activateToggle flips a toggle badge.
 func (f *FindBar) activateToggle(idx toggleIndex) Action {
-	if idx == toggleSel && !f.hasSel {
-		return ActionNone
-	}
 	f.toggleActive[idx] = !f.toggleActive[idx]
 	return ActionQueryChanged
 }
@@ -346,6 +373,12 @@ func (f *FindBar) activateToggle(idx toggleIndex) Action {
 // matching the chord hint overlay style. cursorVisible controls the
 // blinking cursor in the query input (pass the editor's blink state).
 func (f *FindBar) View(width int, th *theme.Theme, cursorVisible bool) string {
+	line := f.renderFindRow(width, th, cursorVisible)
+	divider := renderDivider(width, th)
+	return line + "\n" + divider
+}
+
+func (f *FindBar) renderFindRow(width int, th *theme.Theme, cursorVisible bool) string {
 	labelStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
 	queryStyle := lipgloss.NewStyle().Foreground(th.Palette.Foreground)
 	countStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
@@ -383,7 +416,7 @@ func (f *FindBar) View(width int, th *theme.Theme, cursorVisible bool) string {
 	visEnd := min(visStart+availQ, qLen)
 
 	// Build query display with cursor at the correct position.
-	queryDisplay := f.renderQueryWithCursor(visStart, visEnd, queryStyle, cursorStyle, cursorVisible)
+	queryDisplay := renderTextWithCursor(f.query, f.cursor, visStart, visEnd, queryStyle, cursorStyle, cursorVisible)
 
 	leftPart := label + " " + queryDisplay + countStr
 	leftW := lipgloss.Width(leftPart)
@@ -401,12 +434,40 @@ func (f *FindBar) View(width int, th *theme.Theme, cursorVisible bool) string {
 	if pad := width - lineW; pad > 0 {
 		line += strings.Repeat(" ", pad)
 	}
+	return line
+}
 
-	divider := lipgloss.NewStyle().
+// renderDivider renders a horizontal divider line.
+func renderDivider(width int, th *theme.Theme) string {
+	return lipgloss.NewStyle().
 		Foreground(th.Palette.Border).
 		Render(strings.Repeat("\u2500", width))
+}
 
-	return line + "\n" + divider
+// renderTextWithCursor renders a visible window of text with a blinking cursor.
+func renderTextWithCursor(text []rune, cursor, visStart, visEnd int, textStyle, cursorStyle lipgloss.Style, cursorVisible bool) string {
+	before := displaySlice(text, visStart, min(cursor, visEnd))
+
+	var cursorPart string
+	if cursor < len(text) {
+		ch := string(displayRune(text[cursor]))
+		if cursorVisible {
+			cursorPart = cursorStyle.Render(ch)
+		} else {
+			cursorPart = textStyle.Render(ch)
+		}
+	} else {
+		if cursorVisible {
+			cursorPart = cursorStyle.Render(" ")
+		} else {
+			cursorPart = " "
+		}
+	}
+
+	afterStart := min(cursor+1, len(text))
+	after := displaySlice(text, afterStart, visEnd)
+
+	return textStyle.Render(before) + cursorPart + textStyle.Render(after)
 }
 
 // displayRune maps control characters to visible glyphs for the find bar.
@@ -431,33 +492,6 @@ func displaySlice(query []rune, start, end int) string {
 		buf[i] = displayRune(r)
 	}
 	return string(buf)
-}
-
-// renderQueryWithCursor renders the visible window [visStart, visEnd) of the
-// query text with the blinking cursor embedded at f.cursor.
-func (f *FindBar) renderQueryWithCursor(visStart, visEnd int, queryStyle, cursorStyle lipgloss.Style, cursorVisible bool) string {
-	before := displaySlice(f.query, visStart, min(f.cursor, visEnd))
-
-	var cursorPart string
-	if f.cursor < len(f.query) {
-		ch := string(displayRune(f.query[f.cursor]))
-		if cursorVisible {
-			cursorPart = cursorStyle.Render(ch)
-		} else {
-			cursorPart = queryStyle.Render(ch)
-		}
-	} else {
-		if cursorVisible {
-			cursorPart = cursorStyle.Render(" ")
-		} else {
-			cursorPart = " "
-		}
-	}
-
-	afterStart := min(f.cursor+1, len(f.query))
-	after := displaySlice(f.query, afterStart, visEnd)
-
-	return queryStyle.Render(before) + cursorPart + queryStyle.Render(after)
 }
 
 // renderBadges builds the badge string and records each badge's relative
@@ -485,12 +519,8 @@ func (f *FindBar) renderBadge(idx toggleIndex, th *theme.Theme) string {
 	if f.toggleActive[idx] {
 		fg = th.Palette.Primary
 	}
-	// Dim the Sel badge when no selection was captured.
-	if idx == toggleSel && !f.hasSel {
-		fg = th.Palette.Subtle
-	}
 	style := lipgloss.NewStyle().Foreground(fg)
-	if f.focus == focusToggles && f.toggleCursor == idx {
+	if isToggleFocus(f.focus) && f.toggleIdx() == idx {
 		style = style.Background(th.Palette.Selection)
 	}
 	return style.Render("[" + badgeLabels[idx] + "]")

@@ -21,6 +21,8 @@ import (
 	"github.com/adalundhe/sylk/ui/editor/buffer"
 	"github.com/adalundhe/sylk/ui/editor/completion"
 	"github.com/adalundhe/sylk/ui/editor/findbar"
+	"github.com/adalundhe/sylk/ui/editor/replacebar"
+	"github.com/adalundhe/sylk/ui/editor/search"
 	"github.com/adalundhe/sylk/ui/editor/highlight"
 	"github.com/adalundhe/sylk/ui/editor/hover"
 	"github.com/adalundhe/sylk/ui/editor/mode"
@@ -114,6 +116,10 @@ type Model struct {
 	// Find bar (in-file search).
 	findBar    *findbar.FindBar
 	findActive bool
+
+	// Replace bar (in-file find and replace).
+	replaceBar    *replacebar.ReplaceBar
+	replaceActive bool
 
 	// Focus and cursor blink.
 	focused      bool
@@ -218,18 +224,22 @@ func (m *Model) View() string {
 
 	viewHeight := m.viewportHeight()
 
-	// Reserve space for the find bar when open.
-	findBarStr := ""
-	findBarH := 0
-	if m.findActive && m.findBar != nil {
-		findBarStr = m.findBar.View(m.width, m.theme, m.cursorBlink)
-		findBarH = m.findBar.Height()
-		viewHeight -= findBarH
+	// Reserve space for the find/replace bar when open.
+	barStr := ""
+	barH := 0
+	if m.replaceActive && m.replaceBar != nil {
+		barStr = m.replaceBar.View(m.width, m.theme, m.cursorBlink)
+		barH = m.replaceBar.Height()
+		viewHeight -= barH
+	} else if m.findActive && m.findBar != nil {
+		barStr = m.findBar.View(m.width, m.theme, m.cursorBlink)
+		barH = m.findBar.Height()
+		viewHeight -= barH
 	}
 
 	if viewHeight <= 0 {
-		if findBarStr != "" {
-			return findBarStr + "\n" + m.statusLine.View(m.width)
+		if barStr != "" {
+			return barStr + "\n" + m.statusLine.View(m.width)
 		}
 		return m.statusLine.View(m.width)
 	}
@@ -249,8 +259,8 @@ func (m *Model) View() string {
 	lines = m.overlayPopups(lines, viewHeight)
 
 	body := strings.Join(lines, "\n")
-	if findBarStr != "" {
-		return findBarStr + "\n" + body + "\n" + m.statusLine.View(m.width)
+	if barStr != "" {
+		return barStr + "\n" + body + "\n" + m.statusLine.View(m.width)
 	}
 	return body + "\n" + m.statusLine.View(m.width)
 }
@@ -1611,7 +1621,8 @@ func (m *Model) selectionRange() (bool, int, int) {
 // are accounted for internally. Any active selection and completion popup
 // are dismissed.
 func (m *Model) ClickAt(x, y int) {
-	if m.visualMode != nil {
+	hadSelection := m.visualMode != nil
+	if hadSelection {
 		m.visualMode = nil
 		m.currentMode = mode.ModeNormal
 	}
@@ -1623,6 +1634,9 @@ func (m *Model) ClickAt(x, y int) {
 	}
 	m.setCursorFromViewport(x, y)
 	m.syncStatusLine()
+	if hadSelection {
+		m.clearSelectionSearch()
+	}
 }
 
 // StartDragSelection begins a mouse-initiated text selection anchored at the
@@ -1631,6 +1645,7 @@ func (m *Model) StartDragSelection() {
 	m.visualMode = mode.NewVisualMode(m.theme, m.state.Cursor, mode.VisualChar)
 	m.currentMode = mode.ModeVisual
 	m.syncStatusLine()
+	m.recomputeSelectionSearch()
 }
 
 // ExtendDragSelection moves the cursor and updates the visual selection
@@ -1642,6 +1657,35 @@ func (m *Model) ExtendDragSelection(x, y int) {
 	m.setCursorFromViewport(x, y)
 	m.visualMode.State.CursorPos = m.state.Cursor
 	m.syncStatusLine()
+	m.recomputeSelectionSearch()
+}
+
+// recomputeSelectionSearch auto-enables [Sel] and re-runs the active search
+// bar's query when the user makes a selection while a bar is open.
+func (m *Model) recomputeSelectionSearch() {
+	if m.findActive && m.findBar != nil {
+		m.findBar.EnableSelToggle()
+		m.recomputeFind()
+		return
+	}
+	if m.replaceActive && m.replaceBar != nil {
+		m.replaceBar.EnableSelToggle()
+		m.recomputeReplace()
+	}
+}
+
+// clearSelectionSearch disables [Sel] and recomputes when the selection is
+// cleared while a search bar is open with [Sel] active.
+func (m *Model) clearSelectionSearch() {
+	if m.findActive && m.findBar != nil && m.findBar.FindInSelection() {
+		m.findBar.DisableSelToggle()
+		m.recomputeFind()
+		return
+	}
+	if m.replaceActive && m.replaceBar != nil && m.replaceBar.FindInSelection() {
+		m.replaceBar.DisableSelToggle()
+		m.recomputeReplace()
+	}
 }
 
 // ClearSelection clears any active visual-mode selection.
@@ -1650,6 +1694,7 @@ func (m *Model) ClearSelection() {
 		m.visualMode = nil
 		m.currentMode = mode.ModeNormal
 		m.state.ClampCursor(1)
+		m.clearSelectionSearch()
 	}
 }
 
@@ -1720,11 +1765,11 @@ func (m *Model) CutSelection() string {
 // its bounds are captured so the "find in selection" toggle can restrict the
 // search range.
 func (m *Model) OpenFindBar() {
+	m.CloseReplaceBar()
 	var selStart, selEnd int
-	hasSel := false
-	if m.visualMode != nil {
+	hasSel := m.visualMode != nil
+	if hasSel {
 		selStart, selEnd = m.visualMode.State.CharRange()
-		hasSel = true
 	}
 	m.findBar = findbar.New(selStart, selEnd, hasSel)
 	m.findActive = true
@@ -1771,6 +1816,67 @@ func (m *Model) ToggleFindBar() {
 		return
 	}
 	m.OpenFindBar()
+}
+
+// ---------------------------------------------------------------------------
+// Replace bar (in-file find and replace)
+// ---------------------------------------------------------------------------
+
+// OpenReplaceBar opens the find-and-replace bar, pre-populating the search
+// field from the active selection. Closes the find bar if open.
+func (m *Model) OpenReplaceBar() {
+	m.CloseFindBar()
+	query := m.SelectedText()
+	var selStart, selEnd int
+	hasSel := m.visualMode != nil
+	if hasSel {
+		selStart, selEnd = m.visualMode.State.CharRange()
+	}
+	m.replaceBar = replacebar.New(query, selStart, selEnd, hasSel)
+	m.replaceActive = true
+	m.recomputeReplace()
+}
+
+// CloseReplaceBar closes the find-and-replace bar and clears state.
+func (m *Model) CloseReplaceBar() {
+	m.replaceBar = nil
+	m.replaceActive = false
+}
+
+// ToggleReplaceBar opens the replace bar if closed, or closes it if open.
+func (m *Model) ToggleReplaceBar() {
+	if m.replaceActive {
+		m.CloseReplaceBar()
+		return
+	}
+	m.OpenReplaceBar()
+}
+
+// ReplaceActive reports whether the replace bar is open.
+func (m *Model) ReplaceActive() bool { return m.replaceActive }
+
+// overlayActive reports whether any overlay input bar (find or replace)
+// currently owns keyboard focus, suppressing the editor cursor.
+func (m *Model) overlayActive() bool { return m.findActive || m.replaceActive }
+
+// ReplaceBarHeight returns the number of viewport rows consumed by the
+// replace bar (0 when closed).
+func (m *Model) ReplaceBarHeight() int {
+	if m.replaceActive && m.replaceBar != nil {
+		return m.replaceBar.Height()
+	}
+	return 0
+}
+
+// HandleReplaceBarClick processes a mouse click at viewport-local (x, y)
+// that falls within the replace bar area. Returns true if consumed.
+func (m *Model) HandleReplaceBarClick(x, y int) bool {
+	if !m.replaceActive || m.replaceBar == nil || y >= m.replaceBar.Height()-1 {
+		return false // last row = divider, ignore
+	}
+	action := m.replaceBar.HandleClick(x, y)
+	m.dispatchReplaceAction(action)
+	return true
 }
 
 // ViewportToBufferPos converts viewport-local (x, y) to a buffer line and
@@ -2078,7 +2184,10 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 		// then retrigger completion after the buffer edit.
 	}
 
-	// Find bar key interception — all keys go to the find bar while open.
+	// Replace/find bar key interception — all keys go to the active bar.
+	if m.replaceActive {
+		return m.handleReplaceBarKey(key)
+	}
 	if m.findActive {
 		return m.handleFindKey(key)
 	}
@@ -2393,23 +2502,28 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 			if i == selEndLine {
 				ec = safeMapCol(colMap, selEndCol+1)
 			}
-			result = append(result, m.renderSelectedLine(
-				i, displayLine, displayRegions, gutterWidth, defaultStyle, sc, ec, ulRanges))
+			if len(findSpans) > 0 {
+				result = append(result, m.renderSelectedLineWithMatches(
+					i, displayLine, displayRegions, gutterWidth, defaultStyle, sc, ec, findSpans, ulRanges))
+			} else {
+				result = append(result, m.renderSelectedLine(
+					i, displayLine, displayRegions, gutterWidth, defaultStyle, sc, ec, ulRanges))
+			}
 		case len(findSpans) > 0:
 			curCol := -1
-			if !m.findActive && i == m.state.CursorLine && m.focused && m.cursorBlink {
+			if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
 				curCol = safeMapCol(colMap, m.state.CursorCol)
 			}
 			result = append(result, m.renderFindMatchLine(
 				i, displayLine, displayRegions, gutterWidth, defaultStyle, findSpans, curCol, ulRanges))
 		case len(jumpSpans) > 0:
 			curCol := -1
-			if i == m.state.CursorLine && m.focused && m.cursorBlink {
+			if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
 				curCol = safeMapCol(colMap, m.state.CursorCol)
 			}
 			result = append(result, m.renderHighlightLine(
 				i, displayLine, displayRegions, gutterWidth, defaultStyle, jumpSpans, curCol, ulRanges))
-		case !m.findActive && i == m.state.CursorLine && m.focused:
+		case !m.overlayActive() && i == m.state.CursorLine && m.focused:
 			displayCol := safeMapCol(colMap, m.state.CursorCol)
 			curCol := -1
 			if m.cursorBlink {
@@ -2467,6 +2581,78 @@ func (m *Model) renderSelectedLine(lineNum int, line string, regions []highlight
 		filterUnderlines(ulRanges, selEnd, len(runes)))
 
 	return gutter + beforeStyled + selStyle.Render(selected) + afterStyled
+}
+
+// renderSelectedLineWithMatches renders a line that is both within the visual
+// selection AND contains find-match spans. Non-match parts of the selection
+// use the selection style; match spans use the match/current-match style.
+func (m *Model) renderSelectedLineWithMatches(lineNum int, line string, regions []highlight.HighlightRegion, gutterWidth int, defaultStyle lipgloss.Style, selStart, selEnd int, spans []colSpan, ulRanges []highlight.UnderlineRange) string {
+	gutter := m.renderGutter(lineNum, gutterWidth)
+	runes := []rune(line)
+	n := len(runes)
+
+	selStyle := lipgloss.NewStyle().Reverse(true)
+	matchBg := lipgloss.NewStyle().
+		Background(m.theme.Palette.Warning).
+		Foreground(m.theme.Palette.Background)
+	currentBg := lipgloss.NewStyle().
+		Background(m.theme.Palette.Primary).
+		Foreground(m.theme.Palette.Background)
+
+	selStart = max(selStart, 0)
+	selEnd = min(selEnd, n)
+
+	var b strings.Builder
+	pos := 0
+
+	// Before selection: normal syntax.
+	if selStart > 0 {
+		seg := string(runes[:selStart])
+		b.WriteString(highlight.RenderLineWithUnderlines(
+			seg, filterRegions(regions, 0, selStart), m.theme.Syntax, defaultStyle,
+			filterUnderlines(ulRanges, 0, selStart)))
+		pos = selStart
+	}
+
+	// Inside selection: alternate between selection style and match style.
+	for _, span := range spans {
+		spanStart := max(span.start, selStart)
+		spanEnd := min(span.end, selEnd)
+		if spanStart >= spanEnd {
+			continue
+		}
+		// Gap before this match (still in selection): selection style.
+		if spanStart > pos {
+			gapEnd := min(spanStart, selEnd)
+			if gapEnd > pos {
+				b.WriteString(selStyle.Render(string(runes[pos:gapEnd])))
+				pos = gapEnd
+			}
+		}
+		// The match span itself: match highlight style.
+		style := matchBg
+		if span.isCurrent {
+			style = currentBg
+		}
+		b.WriteString(style.Render(string(runes[spanStart:spanEnd])))
+		pos = spanEnd
+	}
+
+	// Remaining selected text after last match.
+	if pos < selEnd {
+		b.WriteString(selStyle.Render(string(runes[pos:selEnd])))
+		pos = selEnd
+	}
+
+	// After selection: normal syntax.
+	if pos < n {
+		seg := string(runes[pos:])
+		b.WriteString(highlight.RenderLineWithUnderlines(
+			seg, filterRegions(regions, pos, n), m.theme.Syntax, defaultStyle,
+			filterUnderlines(ulRanges, pos, n)))
+	}
+
+	return gutter + b.String()
 }
 
 // renderHighlightLine renders a line with document-highlight background
@@ -2708,10 +2894,11 @@ type colSpan struct {
 }
 
 // findMatchSpans computes display-column spans for find matches that overlap
-// the given line. Returns nil when the find bar is inactive or there are no
-// overlapping matches.
+// the given line. Returns nil when no search bar is active or there are no
+// overlapping matches. Works with both the find bar and replace bar.
 func (m *Model) findMatchSpans(lineNum int, displayLen int, colMap []int) []colSpan {
-	if !m.findActive || m.findBar == nil {
+	matches, currentIdx := m.activeSearchMatches()
+	if matches == nil {
 		return nil
 	}
 	lineInfo, ok := m.lineIndex.Get(lineNum)
@@ -2720,8 +2907,6 @@ func (m *Model) findMatchSpans(lineNum int, displayLen int, colMap []int) []colS
 	}
 	lineStart := lineInfo.StartPos
 	lineEnd := lineStart + displayLen
-	matches := m.findBar.Matches()
-	currentIdx := m.findBar.MatchIndex()
 	var spans []colSpan
 	for i, match := range matches {
 		if match.End <= lineStart || match.Start >= lineEnd {
@@ -2960,11 +3145,32 @@ func (m *Model) recomputeFind() {
 	content := []rune(m.buf.Content())
 	searchStart, searchEnd := 0, len(content)
 	if m.findBar.FindInSelection() {
-		s, e := m.findBar.SelectionRange()
-		searchStart = s
-		searchEnd = min(e+1, len(content))
+		s, e, ok := m.selectionBounds()
+		if ok {
+			searchStart = s
+			searchEnd = min(e+1, len(content))
+		}
 	}
 	m.findBar.Recompute(content, searchStart, searchEnd)
+}
+
+// selectionBounds returns the inclusive rune range of the current selection.
+// It prefers the live visual mode state; falls back to the find/replace bar's
+// stored snapshot.
+func (m *Model) selectionBounds() (start, end int, ok bool) {
+	if m.visualMode != nil {
+		s, e := m.visualMode.State.CharRange()
+		return s, e, true
+	}
+	if m.findActive && m.findBar != nil && m.findBar.HasSelectionRange() {
+		s, e := m.findBar.SelectionRange()
+		return s, e, true
+	}
+	if m.replaceActive && m.replaceBar != nil && m.replaceBar.HasSelectionRange() {
+		s, e := m.replaceBar.SelectionRange()
+		return s, e, true
+	}
+	return 0, 0, false
 }
 
 func (m *Model) jumpToCurrentMatch() {
@@ -2974,6 +3180,167 @@ func (m *Model) jumpToCurrentMatch() {
 	}
 	m.state.Cursor = match.Start
 	m.state.SyncCursorPos()
+	m.syncStatusLine()
+}
+
+// ---------------------------------------------------------------------------
+// Replace bar helpers
+// ---------------------------------------------------------------------------
+
+// activeSearchMatches returns the match list and current index from whichever
+// search bar (find or replace) is currently active. Returns nil when neither
+// is active.
+func (m *Model) activeSearchMatches() ([]search.MatchRange, int) {
+	if m.replaceActive && m.replaceBar != nil {
+		return m.replaceBar.Matches(), m.replaceBar.MatchIndex()
+	}
+	if m.findActive && m.findBar != nil {
+		return m.findBar.Matches(), m.findBar.MatchIndex()
+	}
+	return nil, 0
+}
+
+func (m *Model) handleReplaceBarKey(key tea.KeyMsg) (component.Component, tea.Cmd) {
+	if m.replaceBar == nil {
+		return m, nil
+	}
+	action := m.replaceBar.HandleKey(key)
+	m.dispatchReplaceAction(action)
+	return m, nil
+}
+
+// dispatchReplaceAction processes a replacebar.Action.
+func (m *Model) dispatchReplaceAction(action replacebar.Action) {
+	switch action {
+	case replacebar.ActionClose:
+		m.CloseReplaceBar()
+	case replacebar.ActionNextMatch:
+		if m.replaceBar == nil {
+			return
+		}
+		m.replaceBar.AdvanceMatch()
+		m.jumpToCurrentReplaceMatch()
+	case replacebar.ActionPrevMatch:
+		if m.replaceBar == nil {
+			return
+		}
+		m.replaceBar.RetreatMatch()
+		m.jumpToCurrentReplaceMatch()
+	case replacebar.ActionQueryChanged:
+		if m.replaceBar == nil {
+			return
+		}
+		m.recomputeReplace()
+		m.replaceBar.NearestMatch(m.state.Cursor)
+		m.jumpToCurrentReplaceMatch()
+	case replacebar.ActionReplaceOne:
+		m.replaceCurrentMatch()
+	case replacebar.ActionReplaceAll:
+		m.replaceAllMatches()
+	}
+}
+
+func (m *Model) recomputeReplace() {
+	if m.replaceBar == nil {
+		return
+	}
+	content := []rune(m.buf.Content())
+	searchStart, searchEnd := 0, len(content)
+	if m.replaceBar.FindInSelection() {
+		s, e, ok := m.selectionBounds()
+		if ok {
+			searchStart = s
+			searchEnd = min(e+1, len(content))
+		}
+	}
+	m.replaceBar.Recompute(content, searchStart, searchEnd)
+}
+
+func (m *Model) jumpToCurrentReplaceMatch() {
+	if m.replaceBar == nil {
+		return
+	}
+	match, ok := m.replaceBar.CurrentMatch()
+	if !ok {
+		return
+	}
+	m.state.Cursor = match.Start
+	m.state.SyncCursorPos()
+	m.syncStatusLine()
+}
+
+// replaceCurrentMatch replaces the current search match with the replacement
+// text and advances to the next match. Supports regex backreferences.
+func (m *Model) replaceCurrentMatch() {
+	if m.replaceBar == nil {
+		return
+	}
+	match, ok := m.replaceBar.CurrentMatch()
+	if !ok {
+		return
+	}
+	old := m.substringAt(match.Start, match.End)
+	replacement := m.computeReplacement(old)
+
+	m.undoTree.BeginGroup()
+	m.buf.Delete(match.Start, match.End-match.Start)
+	m.undoTree.Record(buffer.EditOp{Type: buffer.EditDelete, Pos: match.Start, OldText: old})
+	m.buf.Insert(match.Start, replacement)
+	m.undoTree.Record(buffer.EditOp{Type: buffer.EditInsert, Pos: match.Start, Text: replacement})
+	m.undoTree.EndGroup()
+
+	m.lineIndex.Rebuild(m.buf)
+	m.markModified()
+	m.recomputeReplace()
+	m.replaceBar.NearestMatch(match.Start)
+	m.jumpToCurrentReplaceMatch()
+}
+
+// replaceAllMatches replaces all search matches in reverse order so that
+// earlier positions remain valid. All replacements share a single undo group.
+func (m *Model) replaceAllMatches() {
+	if m.replaceBar == nil {
+		return
+	}
+	matches := m.replaceBar.Matches()
+	if len(matches) == 0 {
+		return
+	}
+	m.undoTree.BeginGroup()
+	for i := len(matches) - 1; i >= 0; i-- {
+		match := matches[i]
+		old := m.substringAt(match.Start, match.End)
+		replacement := m.computeReplacement(old)
+		m.buf.Delete(match.Start, match.End-match.Start)
+		m.undoTree.Record(buffer.EditOp{Type: buffer.EditDelete, Pos: match.Start, OldText: old})
+		m.buf.Insert(match.Start, replacement)
+		m.undoTree.Record(buffer.EditOp{Type: buffer.EditInsert, Pos: match.Start, Text: replacement})
+	}
+	m.undoTree.EndGroup()
+
+	m.lineIndex.Rebuild(m.buf)
+	m.markModified()
+	m.recomputeReplace()
+}
+
+// computeReplacement applies the compiled regex to the matched text to resolve
+// backreferences ($1, $2, etc.) in the replacement string.
+func (m *Model) computeReplacement(matchedText string) string {
+	compiled := m.replaceBar.Compiled()
+	if compiled == nil {
+		return m.replaceBar.Replacement()
+	}
+	return compiled.ReplaceAllString(matchedText, m.replaceBar.Replacement())
+}
+
+// markModified updates the editor's modified/lspDirty/editGeneration state
+// after a buffer mutation.
+func (m *Model) markModified() {
+	m.editGeneration++
+	m.modified = true
+	m.lspDirty = true
+	m.lastEditAt = time.Now()
+	m.rehighlight()
 	m.syncStatusLine()
 }
 

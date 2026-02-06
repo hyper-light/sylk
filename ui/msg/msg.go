@@ -368,3 +368,16 @@ type FileTreeEntryRenamedMsg struct {
 	NewPath string
 	IsDir   bool
 }
+
+// FileReplacedMsg notifies the app that a file was modified on disk
+// by multi-file replace, so the editor can reload if it's the active file.
+type FileReplacedMsg struct {
+	Path string
+}
+
+// MultiFileReplaceDoneMsg reports the outcome of a multi-file replace-all.
+type MultiFileReplaceDoneMsg struct {
+	FilesChanged  int
+	TotalReplaced int
+	Skipped       int // Files skipped (unsaved changes in editor).
+}

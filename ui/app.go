@@ -487,6 +487,10 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.fileTree.SetActiveFile("")
 		return m, nil
+	case msg.FileReplacedMsg:
+		return m, m.handleFileReplaced(typed)
+	case msg.MultiFileReplaceDoneMsg:
+		return m, m.handleMultiFileReplaceDone(typed)
 	case msg.GuideResponseMsg:
 		return m, m.handleGuideResponse(typed)
 	case modal.ModalClosedMsg:
@@ -809,6 +813,32 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.lastToggleAt = now
 		m.chord = chordNone // dismiss chord hint — only one overlay at a time
 		m.inlineEditor.ToggleFindBar()
+		return m, nil
+	}
+
+	// Alt+Shift+R toggles the in-file find-and-replace bar when the editor has focus.
+	if ks == "alt+R" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.inlineEditor.ToggleReplaceBar()
+		return m, nil
+	}
+
+	// Alt+Shift+R toggles multi-file replace when the file tree has focus.
+	if ks == "alt+R" && m.focus.Current() == component.FocusFileTree {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.fileTree.ToggleReplace()
 		return m, nil
 	}
 
@@ -1546,6 +1576,42 @@ func (m *AppModel) handleCloseEditor() tea.Cmd {
 	return cmd
 }
 
+// handleFileReplaced reloads the editor buffer when a multi-file replace
+// modified the currently open file on disk (only if there are no unsaved changes).
+func (m *AppModel) handleFileReplaced(r msg.FileReplacedMsg) tea.Cmd {
+	if !m.editMode || m.inlineEditor.FilePath() != r.Path {
+		return nil
+	}
+	if m.inlineEditor.Modified() {
+		return nil
+	}
+	return m.reloadEditorFromDisk(r.Path)
+}
+
+// handleMultiFileReplaceDone flashes a status message after multi-file replace-all.
+func (m *AppModel) handleMultiFileReplaceDone(r msg.MultiFileReplaceDoneMsg) tea.Cmd {
+	status := fmt.Sprintf("Replaced %d occurrences in %d files", r.TotalReplaced, r.FilesChanged)
+	if r.Skipped > 0 {
+		status += fmt.Sprintf(" (%d skipped)", r.Skipped)
+	}
+	m.statusBar.SetFlash(status)
+	return nil
+}
+
+// reloadEditorFromDisk reads the file from disk and reloads the editor buffer.
+func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	content := string(data)
+	lang := detectEditorLanguage(path)
+	m.inlineEditor.OpenFile(path, content, lang)
+	m.codePanel.SetContent(content, path, lang)
+	delete(m.editSnapshots, path)
+	return nil
+}
+
 func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
@@ -1647,9 +1713,14 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 			m.chord = chordNone
 		} else {
 			m.chord = target
-			// Dismiss find bar — only one overlay at a time.
-			if m.editMode && m.inlineEditor.FindActive() {
-				m.inlineEditor.CloseFindBar()
+			// Dismiss find/replace bar — only one overlay at a time.
+			if m.editMode {
+				if m.inlineEditor.ReplaceActive() {
+					m.inlineEditor.CloseReplaceBar()
+				}
+				if m.inlineEditor.FindActive() {
+					m.inlineEditor.CloseFindBar()
+				}
 			}
 		}
 		return nil, true
@@ -2559,14 +2630,21 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
 
-	// When the find bar is open, clicks in its area toggle badges;
-	// clicks below it are offset to content-local coordinates.
-	fbH := m.inlineEditor.FindBarHeight()
-	if fbH > 0 && viewY < fbH {
-		m.inlineEditor.HandleFindBarClick(viewX, viewY)
+	// When a search bar (find or replace) is open, clicks in its area
+	// toggle badges/buttons; clicks below are offset to content-local coords.
+	barH := m.inlineEditor.ReplaceBarHeight()
+	if barH > 0 && viewY < barH {
+		m.inlineEditor.HandleReplaceBarClick(viewX, viewY)
 		return true, nil
 	}
-	viewY -= fbH
+	if barH == 0 {
+		barH = m.inlineEditor.FindBarHeight()
+		if barH > 0 && viewY < barH {
+			m.inlineEditor.HandleFindBarClick(viewX, viewY)
+			return true, nil
+		}
+	}
+	viewY -= barH
 
 	// When the hover popup is visible, clicks on it trigger go-to-definition.
 	if cmd, ok := m.inlineEditor.HandleHoverClick(viewX, viewY); ok {
