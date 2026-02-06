@@ -812,6 +812,18 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Alt+Shift+F triggers LSP formatting when the editor has focus.
+	if ks == "alt+F" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		if fp := m.inlineEditor.FilePath(); fp != "" {
+			var flushContent string
+			if m.inlineEditor.LSPDirty() {
+				m.inlineEditor.ClearLSPDirty()
+				flushContent = m.inlineEditor.Content()
+			}
+			return m, m.lspFormatCmd(fp, flushContent, m.inlineEditor.EditGeneration())
+		}
+	}
+
 	// Two-key chord: S then Left/Right (sessions), A then Left/Right (agents).
 	if cmd, handled := m.handleChord(key); handled {
 		return m, cmd
