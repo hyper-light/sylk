@@ -406,6 +406,46 @@ func (c *Client) DocumentHighlight(ctx context.Context, filePath string, line, c
 	return ToDocumentHighlights(items), nil
 }
 
+// References sends a textDocument/references request and returns locations.
+func (c *Client) References(ctx context.Context, filePath string, line, character int, includeDeclaration bool) ([]Location, error) {
+	if c.Status() != StatusReady {
+		return nil, errClientNotReady
+	}
+	uri := PathToFileURI(filePath)
+	lineText := c.documents.LineText(uri, line)
+	utf16Col := RuneOffsetToUTF16(lineText, character)
+
+	params := ReferenceParams{
+		TextDocumentPositionParams: TextDocumentPositionParams{
+			TextDocument: TextDocumentIdentifier{URI: uri},
+			Position:     ProtocolPosition{Line: line, Character: utf16Col},
+		},
+		Context: ReferenceContext{
+			IncludeDeclaration: includeDeclaration,
+		},
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	resp, err := c.sendRequest(reqCtx, MethodReferences, params)
+	if err != nil {
+		return nil, fmt.Errorf("references request: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	if string(resp.Result) == "null" {
+		return nil, nil
+	}
+
+	var locs []ProtocolLocation
+	if err := json.Unmarshal(resp.Result, &locs); err != nil {
+		return nil, fmt.Errorf("decode references: %w", err)
+	}
+	return toLocationSlice(locs), nil
+}
+
 // toLocationSlice converts wire locations to domain Location.
 func toLocationSlice(plocs []ProtocolLocation) []Location {
 	result := make([]Location, len(plocs))
@@ -573,6 +613,7 @@ func (c *Client) initialize(ctx context.Context) error {
 				},
 				Definition:        DefinitionClientCapabilities{},
 				DocumentHighlight: DocumentHighlightClientCapabilities{},
+				References:        ReferencesClientCapabilities{},
 			},
 		},
 		ClientInfo: &ClientInfo{

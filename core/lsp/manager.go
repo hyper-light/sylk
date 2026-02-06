@@ -188,6 +188,15 @@ func (m *Manager) DocumentHighlight(ctx context.Context, projectRoot, filePath s
 	return client.DocumentHighlight(ctx, filePath, line, character)
 }
 
+// References sends a references request to the appropriate client.
+func (m *Manager) References(ctx context.Context, projectRoot, filePath string, line, character int, includeDeclaration bool) ([]Location, error) {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return nil, nil
+	}
+	return client.References(ctx, filePath, line, character, includeDeclaration)
+}
+
 // TriggerCharacters returns completion trigger characters for the server
 // handling the given file. Returns nil if no client is active.
 func (m *Manager) TriggerCharacters(projectRoot, filePath string) []string {

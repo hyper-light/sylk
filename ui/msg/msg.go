@@ -218,6 +218,23 @@ type LSPCompletionRequestMsg struct {
 	Col      int
 }
 
+// LSPReferencesRequestMsg is emitted by the editor when the user presses gr
+// in normal mode, requesting all references of the symbol under the cursor.
+type LSPReferencesRequestMsg struct {
+	FilePath string
+	Line     int // 0-indexed
+	Col      int // 0-indexed (rune offset)
+}
+
+// LSPReferencesMsg carries reference locations from a language server.
+type LSPReferencesMsg struct {
+	FilePath  string
+	Line      int
+	Col       int
+	Locations []lsp.Location
+	Err       error
+}
+
 // LSPDocumentHighlightMsg carries document highlights from a language server.
 type LSPDocumentHighlightMsg struct {
 	FilePath   string

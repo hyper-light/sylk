@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/concurrency"
@@ -58,6 +59,10 @@ func bootstrapDeps(ctx context.Context) (ui.Deps, func(), error) {
 	// TUI goroutines are infrastructure, not agent workloads.
 	// A nil budget skips agent-level budget tracking.
 	scope := concurrency.NewGoroutineScope(ctx, "tui", nil)
+	// TUI infrastructure goroutines (LSP readloops, bridges, fan-in) must
+	// survive for the entire editing session. The default 5m max lifetime
+	// would kill these, breaking diagnostics, hover, and references.
+	scope.SetMaxLifetime(24 * time.Hour)
 
 	activityBus := events.NewActivityEventBus(activityBusBuffer)
 	activityBus.Start()

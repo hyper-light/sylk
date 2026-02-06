@@ -63,6 +63,12 @@ const lspDebounceInterval = 300 * time.Millisecond
 // Derived from: these are thin JSON-RPC writes to a local process; 5s is ample.
 const lspNotifyTimeout = 5 * time.Second
 
+// overlayToggleDebounce prevents hold-to-repeat from rapidly toggling
+// overlay elements (chord hints, find bar). Derived from: typical terminal
+// key repeat starts at ~30ms intervals; 150ms absorbs repeats while still
+// feeling responsive for intentional double-taps.
+const overlayToggleDebounce = 150 * time.Millisecond
+
 // sourceAgentTUI identifies the TUI as the source agent for guide routing.
 const sourceAgentTUI = "tui"
 
@@ -194,8 +200,8 @@ type AppModel struct {
 	// Overlay components
 	editorOverlay *editor.Model
 	modalOverlay  *modal.Model
-	searchOverlay *search.Model
-	overlay       overlayState
+	searchOverlay    *search.Model
+	overlay          overlayState
 
 	// Bridges
 	activityBridge *bridge.ActivityBridge
@@ -217,6 +223,8 @@ type AppModel struct {
 
 	// State
 	chord             chordState
+	lastToggleKey     string    // Last overlay toggle key (debounce guard).
+	lastToggleAt      time.Time // When lastToggleKey was pressed.
 	leftRing          viewRing // Left slot cycling ring (Session/FileTree).
 	rightRing         viewRing // Right slot cycling ring (Chat/Code).
 	collapseHintShown bool     // First-collapse flash shown once per session.
@@ -544,6 +552,10 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.LSPDocumentHighlightMsg:
 		m.inlineEditor.Update(typed)
 		return m, nil
+	case msg.LSPReferencesRequestMsg:
+		return m, m.lspReferencesCmd(typed.FilePath, typed.Line, typed.Col)
+	case msg.LSPReferencesMsg:
+		return m, m.handleLSPReferences(typed)
 	case msg.NerdFontsResultMsg:
 		// Don't switch icon mode mid-session — the terminal won't render
 		// newly-installed Nerd Font glyphs until restarted. The install
@@ -676,14 +688,27 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Alt+R: find references for symbol under cursor (edit mode).
+	if ks == "alt+r" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		fp := m.inlineEditor.FilePath()
+		if fp != "" {
+			return m, m.lspReferencesCmd(fp, m.inlineEditor.CursorLine(), m.inlineEditor.CursorCol())
+		}
+		return m, nil
+	}
+
 	// Alt+E toggles inline edit mode.
 	if key.String() == "alt+e" {
 		return m, m.toggleEditMode()
 	}
 
-	// Escape: abort command input, or route to editor in edit mode,
-	// or double-tap to interrupt agent.
+	// Escape: close references panel if active, abort command input,
+	// route to editor in edit mode, or double-tap to interrupt agent.
 	if key.String() == "esc" {
+		if m.fileTree.InReferencesMode() && m.focus.Current() == component.FocusFileTree {
+			m.fileTree.Update(key)
+			return m, nil
+		}
 		if m.editCmdInput {
 			m.exitCmdInput()
 			return m, nil
@@ -729,7 +754,6 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.searchOverlay = comp.(*search.Model)
 		return m, cmd
 	}
-
 	// Ctrl+P toggles the search overlay (unless the editor completion popup
 	// is active, where Ctrl+P navigates to the previous item).
 	if key.String() == "ctrl+p" && !m.inlineEditor.CompletionActive() {
@@ -739,6 +763,13 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Alt+F toggles the in-file find bar when the editor has focus.
 	if ks == "alt+f" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone // dismiss chord hint — only one overlay at a time
 		m.inlineEditor.ToggleFindBar()
 		return m, nil
 	}
@@ -1062,6 +1093,82 @@ func (m *AppModel) lspDefinitionCmd(filePath string, line, col int, forHover boo
 	}
 }
 
+// lspReferencesCmd returns a Cmd that requests all references of the symbol
+// at the given position. Results include the declaration and are enriched
+// with line preview text by reading from disk.
+func (m *AppModel) lspReferencesCmd(filePath string, line, col int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		locs, err := mgr.References(ctx, root, filePath, line, col, true)
+		return msg.LSPReferencesMsg{
+			FilePath:  filePath,
+			Line:      line,
+			Col:       col,
+			Locations: locs,
+			Err:       err,
+		}
+	}
+}
+
+// handleLSPReferences builds reference entries and displays them in the file
+// tree panel's references mode.
+func (m *AppModel) handleLSPReferences(r msg.LSPReferencesMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("References: " + r.Err.Error())
+		return nil
+	}
+	if len(r.Locations) == 0 {
+		m.statusBar.SetFlash("No references found")
+		return nil
+	}
+
+	symbol := m.inlineEditor.WordAt(r.Line, r.Col)
+	entries := m.buildReferenceEntries(r.Locations)
+	m.fileTree.SetReferences(symbol, entries)
+
+	m.focus.SetFocus(component.FocusFileTree)
+	m.syncFocusState()
+	return nil
+}
+
+// buildReferenceEntries converts LSP locations to display entries, reading
+// line preview text from disk and making paths relative to the project root.
+func (m *AppModel) buildReferenceEntries(locs []lsp.Location) []filetree.ReferenceEntry {
+	entries := make([]filetree.ReferenceEntry, 0, len(locs))
+	for _, loc := range locs {
+		absPath := lsp.FileURIToPath(loc.URI)
+		relPath, err := filepath.Rel(m.config.ProjectRoot, absPath)
+		if err != nil {
+			relPath = absPath
+		}
+		preview := readLineFromFile(absPath, loc.Range.Start.Line)
+		entries = append(entries, filetree.ReferenceEntry{
+			FilePath: relPath,
+			AbsPath:  absPath,
+			Line:     loc.Range.Start.Line,
+			Col:      loc.Range.Start.Character,
+			Preview:  preview,
+		})
+	}
+	return entries
+}
+
+// readLineFromFile reads a single line (0-indexed) from a file on disk.
+// Returns the trimmed line content, or "" on error.
+func readLineFromFile(path string, lineNum int) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	if lineNum < 0 || lineNum >= len(lines) {
+		return ""
+	}
+	return strings.TrimSpace(lines[lineNum])
+}
+
 // handleHoverDefinition stores the definition symbol and package path on the
 // active hover tooltip. If the hover content hasn't arrived yet, stashes
 // the info so it can be applied when the hover activates.
@@ -1326,10 +1433,23 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 		if required, guarded := chordFocusGuard[target]; guarded && m.focus.Current() != required {
 			return nil, false
 		}
+		// Debounce: absorb key-repeat to prevent rapid toggle cycling.
+		ks := key.String()
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return nil, true
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+
 		if m.chord == target {
 			m.chord = chordNone
 		} else {
 			m.chord = target
+			// Dismiss find bar — only one overlay at a time.
+			if m.editMode && m.inlineEditor.FindActive() {
+				m.inlineEditor.CloseFindBar()
+			}
 		}
 		return nil, true
 	}
@@ -3007,121 +3127,160 @@ func (m *AppModel) syncFocusState() {
 }
 
 // spatialFocusTarget resolves an alt+shift+arrow key to the panel it should
-// navigate to using grid-based navigation. Panels are arranged in rows;
-// left/right cycle through reading order (wrapping between rows), while
-// up/down jump to the leftmost panel of the adjacent row.
+// navigate to. Left/right cycle through panels in column-major order (sub-panels
+// grouped with their column) so there is no visual zig-zag. Up/down move to the
+// leftmost panel of the adjacent grid row (wrapping at edges).
 func (m *AppModel) spatialFocusTarget(key string) (component.FocusID, bool) {
-	grid := m.buildFocusGrid()
 	current := m.focus.Current()
 
-	row, col := -1, -1
-	for r, panels := range grid {
-		for c, id := range panels {
+	switch key {
+	case "alt+shift+right", "alt+shift+left":
+		cycle := m.buildFocusCycle()
+		idx := -1
+		for i, id := range cycle {
 			if id == current {
-				row, col = r, c
+				idx = i
 				break
 			}
 		}
-		if row >= 0 {
-			break
+		if idx < 0 {
+			return 0, false
 		}
-	}
-	if row < 0 {
-		return 0, false
-	}
+		n := len(cycle)
+		if key == "alt+shift+right" {
+			return cycle[(idx+1)%n], true
+		}
+		return cycle[(idx-1+n)%n], true
 
-	switch key {
-	case "alt+shift+right":
-		col++
-		if col >= len(grid[row]) {
-			row = (row + 1) % len(grid)
-			col = 0
-		}
-		return grid[row][col], true
-	case "alt+shift+left":
-		col--
-		if col < 0 {
-			row = (row - 1 + len(grid)) % len(grid)
-			col = len(grid[row]) - 1
-		}
-		return grid[row][col], true
-	case "alt+shift+up":
-		if row <= 0 {
+	case "alt+shift+up", "alt+shift+down":
+		grid := m.buildFocusGrid()
+		if len(grid) == 0 {
 			return 0, false
 		}
-		return grid[row-1][0], true
-	case "alt+shift+down":
-		if row >= len(grid)-1 {
+		row := -1
+		for r, panels := range grid {
+			for _, id := range panels {
+				if id == current {
+					row = r
+					break
+				}
+			}
+			if row >= 0 {
+				break
+			}
+		}
+		if row < 0 {
 			return 0, false
 		}
-		return grid[row+1][0], true
+		n := len(grid)
+		if key == "alt+shift+up" {
+			return grid[(row-1+n)%n][0], true
+		}
+		return grid[(row+1)%n][0], true
 	}
 	return 0, false
 }
 
-// buildFocusGrid returns the visible panels arranged in rows (left-to-right)
-// based on the current layout mode and ring state.
+// buildFocusCycle returns panels in column-major order for left/right cycling.
+// Sub-panels within the same visual column (e.g. Sessions + Agents) are grouped
+// together so cycling visits each column fully before moving to the next.
 //
-//	FourColumn:
-//	  Row 0: Sessions, FileTree, Chat, CodeViewer
-//	  Row 1: Agents, Input
-//
-//	ThreeColumn:
-//	  Row 0: <left-ring>, Chat, CodeViewer
-//	  Row 1: [Agents,] Input
-//
-//	TwoColumn:
-//	  Row 0: <left-ring>, <right-ring>
-//	  Row 1: [Agents,] Input
-//
-//	SingleColumn:
-//	  Row 0: <left-ring>  (or SessionPanel)
-//	  Row 1: Input        (or AgentPanel)
-//	  Row 2:              (   Input)
-func (m *AppModel) buildFocusGrid() [][]component.FocusID {
+//	FourColumn:  Sessions, Agents, FileTree, Chat, Code, Input
+//	ThreeColumn: <left>, [Agents], Chat, Code, Input
+//	TwoColumn:   <left>, [Agents], <right>, Input
+//	SingleColumn: <left>, [Agents], Input
+func (m *AppModel) buildFocusCycle() []component.FocusID {
+	cycle := make([]component.FocusID, 0, 8)
+
 	switch m.layout.Mode() {
 	case layout.FourColumn:
-		return [][]component.FocusID{
-			{component.FocusSessionPanel, component.FocusFileTree, component.FocusChat, component.FocusCodeViewer},
-			{component.FocusAgentPanel, component.FocusInput},
-		}
+		cycle = append(cycle,
+			component.FocusSessionPanel, component.FocusAgentPanel,
+			component.FocusFileTree, component.FocusChat, component.FocusCodeViewer,
+		)
 	case layout.ThreeColumn:
 		left := m.leftRing.current()
-		row1 := make([]component.FocusID, 0, 2)
+		cycle = append(cycle, left)
 		if left == component.FocusSessionPanel {
-			row1 = append(row1, component.FocusAgentPanel)
+			cycle = append(cycle, component.FocusAgentPanel)
 		}
-		row1 = append(row1, component.FocusInput)
-		return [][]component.FocusID{
-			{left, component.FocusChat, component.FocusCodeViewer},
-			row1,
-		}
+		cycle = append(cycle, component.FocusChat, component.FocusCodeViewer)
 	case layout.TwoColumn:
 		left := m.leftRing.current()
 		right := m.rightRing.current()
-		row1 := make([]component.FocusID, 0, 2)
+		cycle = append(cycle, left)
 		if left == component.FocusSessionPanel {
-			row1 = append(row1, component.FocusAgentPanel)
+			cycle = append(cycle, component.FocusAgentPanel)
 		}
-		row1 = append(row1, component.FocusInput)
-		return [][]component.FocusID{
-			{left, right},
-			row1,
-		}
+		cycle = append(cycle, right)
 	default: // SingleColumn
 		active := m.leftRing.current()
+		cycle = append(cycle, active)
 		if active == component.FocusSessionPanel {
-			return [][]component.FocusID{
-				{component.FocusSessionPanel},
-				{component.FocusAgentPanel},
-				{component.FocusInput},
-			}
-		}
-		return [][]component.FocusID{
-			{active},
-			{component.FocusInput},
+			cycle = append(cycle, component.FocusAgentPanel)
 		}
 	}
+
+	cycle = append(cycle, component.FocusInput)
+	return cycle
+}
+
+// buildFocusGrid returns the visible panels arranged in rows (left-to-right)
+// based on the current layout mode and ring state. The grid matches the
+// visual layout: AgentPanel occupies a separate row within the left column
+// (when the sessions view is active), and Input is always the last row.
+//
+//	FourColumn:
+//	  Row 0: Sessions, FileTree, Chat, CodeViewer
+//	  Row 1: Agents
+//	  Row 2: Input
+//
+//	ThreeColumn:
+//	  Row 0: <left-ring>, Chat, CodeViewer
+//	  Row 1: [Agents]
+//	  Row N: Input
+//
+//	TwoColumn:
+//	  Row 0: <left-ring>, <right-ring>
+//	  Row 1: [Agents]
+//	  Row N: Input
+//
+//	SingleColumn:
+//	  Row 0: <left-ring>
+//	  Row 1: [Agents]
+//	  Row N: Input
+func (m *AppModel) buildFocusGrid() [][]component.FocusID {
+	var top []component.FocusID
+	showAgents := false
+
+	switch m.layout.Mode() {
+	case layout.FourColumn:
+		top = []component.FocusID{
+			component.FocusSessionPanel, component.FocusFileTree,
+			component.FocusChat, component.FocusCodeViewer,
+		}
+		showAgents = true
+	case layout.ThreeColumn:
+		left := m.leftRing.current()
+		top = []component.FocusID{left, component.FocusChat, component.FocusCodeViewer}
+		showAgents = left == component.FocusSessionPanel
+	case layout.TwoColumn:
+		left := m.leftRing.current()
+		right := m.rightRing.current()
+		top = []component.FocusID{left, right}
+		showAgents = left == component.FocusSessionPanel
+	default: // SingleColumn
+		active := m.leftRing.current()
+		top = []component.FocusID{active}
+		showAgents = active == component.FocusSessionPanel
+	}
+
+	grid := [][]component.FocusID{top}
+	if showAgents {
+		grid = append(grid, []component.FocusID{component.FocusAgentPanel})
+	}
+	grid = append(grid, []component.FocusID{component.FocusInput})
+	return grid
 }
 
 // ---------------------------------------------------------------------------

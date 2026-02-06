@@ -355,7 +355,7 @@ func (f *FindBar) View(width int, th *theme.Theme, cursorVisible bool) string {
 	badgesStr, badgesW := f.renderBadges(th)
 
 	// Left side: "Find:" label + query + cursor + count.
-	label := labelStyle.Render("Find:")
+	label := labelStyle.Render(" Find:")
 	labelW := lipgloss.Width(label) + 1 // +1 for trailing space
 
 	// End-of-query cursor needs an extra column; mid-query cursor

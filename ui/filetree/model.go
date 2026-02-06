@@ -54,8 +54,9 @@ const iconFile = " "
 type viewMode int
 
 const (
-	viewTree   viewMode = iota
+	viewTree       viewMode = iota
 	viewSearch
+	viewReferences // LSP references results.
 )
 
 // searchItemKind classifies entries in the search results list.
@@ -79,6 +80,25 @@ type searchItem struct {
 type searchMatch struct {
 	line int    // 1-based.
 	text string // Full line content.
+}
+
+// ReferenceEntry represents a single reference location with an optional
+// line preview, passed from app.go to the file tree via SetReferences.
+type ReferenceEntry struct {
+	// FilePath is the display path (relative to project root).
+	FilePath string
+
+	// AbsPath is the absolute file path used for navigation.
+	AbsPath string
+
+	// Line is the 0-indexed line number.
+	Line int
+
+	// Col is the 0-indexed column (rune offset).
+	Col int
+
+	// Preview is the trimmed content of the referenced line.
+	Preview string
 }
 
 // searchFocus identifies which element in the search footer has keyboard focus.
@@ -254,10 +274,18 @@ type Model struct {
 	cursorBlink bool
 	lastBlinkAt time.Time
 
-	// Snapshot of tree state before entering search, restored on exit.
+	// Snapshot of tree state before entering search or references, restored on exit.
 	savedEntries []Entry
 	savedCursor  int
 	savedScroll  int
+
+	// References state (viewReferences mode).
+	refTitle    string           // Symbol name shown in header.
+	refEntries  []ReferenceEntry // Raw reference locations.
+	refItems    []searchItem     // Flat list reusing searchItem infrastructure.
+	refCursor   int
+	refScroll   int
+	refNumWidth int // Digit width of the largest line number in results.
 
 	// New-entry state: two-phase (pending chord → active input).
 	pendingNewEntry bool   // Alt+N pressed, waiting for F (file) or D (dir).
@@ -340,10 +368,14 @@ func (m *Model) handleSearchTick(tick searchTickMsg) tea.Cmd {
 
 // View dispatches to the active view mode.
 func (m *Model) View() string {
-	if m.mode == viewSearch {
+	switch m.mode {
+	case viewSearch:
 		return m.viewSearchMode()
+	case viewReferences:
+		return m.viewReferencesMode()
+	default:
+		return m.viewTreeMode()
 	}
-	return m.viewTreeMode()
 }
 
 // ---------------------------------------------------------------------------
@@ -424,18 +456,26 @@ func (m *Model) ScrollDown() bool {
 
 // activeScroll returns a pointer to the scroll offset for the current mode.
 func (m *Model) activeScroll() *int {
-	if m.mode == viewSearch {
+	switch m.mode {
+	case viewSearch:
 		return &m.searchScroll
+	case viewReferences:
+		return &m.refScroll
+	default:
+		return &m.scroll
 	}
-	return &m.scroll
 }
 
 // visibleItemCount returns the number of items in the active list.
 func (m *Model) visibleItemCount() int {
-	if m.mode == viewSearch {
+	switch m.mode {
+	case viewSearch:
 		return len(m.searchItems)
+	case viewReferences:
+		return len(m.refItems)
+	default:
+		return len(m.entries)
 	}
-	return len(m.entries)
 }
 
 // SetBounceOffset updates the visual bounce displacement for rendering.
@@ -454,14 +494,124 @@ func (m *Model) InSearchMode() bool {
 	return m.mode == viewSearch
 }
 
+// InReferencesMode reports whether the file tree is showing LSP references.
+func (m *Model) InReferencesMode() bool {
+	return m.mode == viewReferences
+}
+
+// SetReferences switches the panel to references mode, displaying the given
+// entries grouped by file. Snapshots the current tree state for restore on exit.
+func (m *Model) SetReferences(title string, entries []ReferenceEntry) {
+	// Snapshot tree state (same as enterSearch).
+	if m.mode == viewSearch {
+		m.exitSearch()
+	}
+	if m.mode != viewReferences {
+		m.savedEntries = make([]Entry, len(m.entries))
+		copy(m.savedEntries, m.entries)
+		m.savedCursor = m.cursor
+		m.savedScroll = m.scroll
+	}
+
+	m.refTitle = title
+	m.refEntries = entries
+	m.refItems, m.refNumWidth = buildRefItems(entries)
+	m.refCursor = 0
+	m.refScroll = 0
+	m.mode = viewReferences
+}
+
+// buildRefItems converts reference entries into a flat searchItem list grouped
+// by file, with gap separators between groups.
+func buildRefItems(entries []ReferenceEntry) ([]searchItem, int) {
+	if len(entries) == 0 {
+		return nil, 0
+	}
+
+	// Group entries by AbsPath preserving order of first occurrence.
+	type fileGroup struct {
+		path    string
+		entries []ReferenceEntry
+	}
+	orderMap := make(map[string]int, len(entries))
+	var groups []fileGroup
+	for _, e := range entries {
+		idx, ok := orderMap[e.AbsPath]
+		if !ok {
+			idx = len(groups)
+			orderMap[e.AbsPath] = idx
+			groups = append(groups, fileGroup{path: e.AbsPath})
+		}
+		groups[idx].entries = append(groups[idx].entries, e)
+	}
+
+	var items []searchItem
+	maxLine := 0
+	for gi, g := range groups {
+		if gi > 0 {
+			items = append(items, searchItem{kind: searchItemGap})
+		}
+		items = append(items, searchItem{kind: searchItemFile, path: g.path})
+		for _, e := range g.entries {
+			displayLine := e.Line + 1 // 1-based for display.
+			items = append(items, searchItem{
+				kind: searchItemMatch,
+				path: g.path,
+				line: displayLine,
+				text: e.Preview,
+			})
+			maxLine = max(maxLine, displayLine)
+		}
+	}
+	return items, digitCount(maxLine)
+}
+
+// exitReferences restores the tree state from before references mode.
+func (m *Model) exitReferences() {
+	m.entries = m.savedEntries
+	m.rebuildPathIndex()
+	m.cursor = m.savedCursor
+	m.scroll = m.savedScroll
+	m.mode = viewTree
+
+	m.savedEntries = nil
+	m.refTitle = ""
+	m.refEntries = nil
+	m.refItems = nil
+	m.refCursor = 0
+	m.refScroll = 0
+	m.refNumWidth = 0
+}
+
 // ClickAt handles a left-click at the given content-relative coordinates.
 // viewX is the column offset within the panel content area; viewY is the
 // row offset (0 = first line inside the panel border).
 func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
-	if m.mode == viewSearch {
+	switch m.mode {
+	case viewSearch:
 		return m.clickSearchMode(viewX, viewY)
+	case viewReferences:
+		return m.clickReferencesMode(viewY)
+	default:
+		return m.clickTreeMode(viewY)
 	}
-	return m.clickTreeMode(viewY)
+}
+
+// clickReferencesMode handles clicks in references mode body area.
+func (m *Model) clickReferencesMode(viewY int) tea.Cmd {
+	bodyY := viewY - topChromeHeight
+	if bodyY < 0 {
+		return nil
+	}
+	idx := m.refScroll + bodyY
+	if idx < 0 || idx >= len(m.refItems) {
+		return nil
+	}
+	if m.refItems[idx].kind == searchItemGap {
+		return nil
+	}
+	m.refCursor = idx
+	return m.activateRefResult()
 }
 
 // clickTreeMode handles clicks in tree browsing mode.
@@ -552,8 +702,11 @@ func (m *Model) clickToolbar(viewX int) tea.Cmd {
 // the cursor on it, like VS Code's "reveal in explorer". Works with both
 // absolute paths (when rootPath is set) and relative paths (mock/SetEntries mode).
 func (m *Model) RevealPath(targetPath string) {
-	if m.mode == viewSearch {
+	switch m.mode {
+	case viewSearch:
 		m.exitSearch()
+	case viewReferences:
+		m.exitReferences()
 	}
 
 	// Fast path: file is already visible in the flat entry list.
@@ -639,6 +792,9 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 	if m.pendingNewEntry {
 		return m.handlePendingNewEntry(key)
 	}
+	if m.mode == viewReferences {
+		return m.handleReferencesKey(key)
+	}
 	if m.mode == viewSearch {
 		return m.handleSearchKey(key)
 	}
@@ -675,6 +831,97 @@ func (m *Model) handleTreeKey(key tea.KeyMsg) tea.Cmd {
 		return m.requestDelete()
 	}
 	return nil
+}
+
+// handleReferencesKey processes keys in references mode.
+func (m *Model) handleReferencesKey(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case "esc", "q":
+		m.exitReferences()
+	case "up", "k":
+		m.moveRefCursor(-1)
+	case "down", "j":
+		m.moveRefCursor(1)
+	case "enter":
+		return m.activateRefResult()
+	case "g":
+		m.refCursor = 0
+		m.refScroll = 0
+	case "G":
+		if len(m.refItems) > 0 {
+			m.refCursor = len(m.refItems) - 1
+			m.ensureRefCursorVisible()
+		}
+	}
+	return nil
+}
+
+// moveRefCursor moves the cursor within reference items, skipping gap entries.
+func (m *Model) moveRefCursor(delta int) {
+	n := len(m.refItems)
+	if n == 0 {
+		return
+	}
+	next := clampInt(m.refCursor+delta, 0, n-1)
+	step := 1
+	if delta < 0 {
+		step = -1
+	}
+	for next >= 0 && next < n && m.refItems[next].kind == searchItemGap {
+		next += step
+	}
+	if next < 0 || next >= n {
+		return
+	}
+	m.refCursor = next
+	m.ensureRefCursorVisible()
+}
+
+// activateRefResult handles Enter on a reference file header or match line.
+// Exits references mode so the tree view is restored before navigation.
+func (m *Model) activateRefResult() tea.Cmd {
+	if m.refCursor >= len(m.refItems) {
+		return nil
+	}
+	item := m.refItems[m.refCursor]
+	if item.kind == searchItemGap {
+		return nil
+	}
+	line := 0
+	if item.kind == searchItemMatch {
+		line = item.line
+	}
+
+	path := item.path
+	name := filepath.Base(path)
+	lang := langFromPath(path)
+
+	m.exitReferences()
+
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     path,
+			Name:     name,
+			Language: lang,
+			Line:     line,
+		}
+	}
+}
+
+// ensureRefCursorVisible keeps the ref cursor within the visible window.
+func (m *Model) ensureRefCursorVisible() {
+	bh := m.bodyHeight()
+	if bh <= 0 {
+		return
+	}
+	if m.refCursor < m.refScroll {
+		m.refScroll = m.refCursor
+	}
+	if m.refCursor >= m.refScroll+bh {
+		m.refScroll = m.refCursor - bh + 1
+	}
+	maxScroll := max(len(m.refItems)-bh, 0)
+	m.refScroll = clampInt(m.refScroll, 0, maxScroll)
 }
 
 // handleSearchKey processes keys in search mode, dispatching to the
@@ -1970,6 +2217,94 @@ func (m *Model) viewSearchMode() string {
 	return b.String()
 }
 
+// ---------------------------------------------------------------------------
+// Rendering: references mode
+// ---------------------------------------------------------------------------
+
+// viewReferencesMode renders the header, symbol title bar, divider, reference
+// results body, and a key hint footer.
+func (m *Model) viewReferencesMode() string {
+	contentWidth := max(m.width, 1)
+	header := m.renderHeader(contentWidth)
+	bh := m.bodyHeight()
+	emptyLine := strings.Repeat(" ", contentWidth)
+
+	bodyLines := m.renderReferencesBody(bh, contentWidth, emptyLine)
+	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
+
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteByte('\n')
+	b.WriteString(m.renderReferencesTitle(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchDivider(contentWidth))
+	for _, line := range bodyLines {
+		b.WriteByte('\n')
+		b.WriteString(line)
+	}
+	b.WriteByte('\n')
+	b.WriteString(m.renderToolbarSeparator(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderReferencesHint(contentWidth))
+	return b.String()
+}
+
+// renderReferencesTitle renders the symbol title: " ▸ SymbolName (N refs)".
+func (m *Model) renderReferencesTitle(contentWidth int) string {
+	arrowStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	titleStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Primary).Bold(true)
+	countStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+
+	arrow := arrowStyle.Render(theme.IconArrowRight + " ")
+	title := titleStyle.Render(m.refTitle)
+	count := countStyle.Render(fmt.Sprintf(" (%d)", len(m.refEntries)))
+
+	line := " " + arrow + title + count
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderReferencesBody renders the references results body lines.
+func (m *Model) renderReferencesBody(bh, contentWidth int, emptyLine string) []string {
+	if len(m.refItems) == 0 {
+		lines := make([]string, bh)
+		style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+		lines[0] = style.Render("No references found")
+		padCount := max(contentWidth-lipgloss.Width(lines[0]), 0)
+		if padCount > 0 {
+			lines[0] += strings.Repeat(" ", padCount)
+		}
+		for i := 1; i < bh; i++ {
+			lines[i] = emptyLine
+		}
+		return lines
+	}
+	start := clampInt(m.refScroll, 0, max(len(m.refItems)-1, 0))
+	end := min(start+bh, len(m.refItems))
+	lines := make([]string, 0, bh)
+	for i := start; i < end; i++ {
+		lines = append(lines, m.renderListItem(i, contentWidth))
+	}
+	for range bh - (end - start) {
+		lines = append(lines, emptyLine)
+	}
+	return lines
+}
+
+// renderReferencesHint renders the key hint footer for references mode.
+func (m *Model) renderReferencesHint(contentWidth int) string {
+	keyStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	line := keyStyle.Render(" Esc close  Enter open")
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
 // renderSearchBody renders the search results body lines for the given height.
 func (m *Model) renderSearchBody(bh, contentWidth int, emptyLine string) []string {
 	if len(m.searchItems) == 0 {
@@ -1998,7 +2333,7 @@ func (m *Model) renderPopulatedSearchBody(bh, contentWidth int, emptyLine string
 	end := min(start+bh, len(m.searchItems))
 	lines := make([]string, 0, bh)
 	for i := start; i < end; i++ {
-		lines = append(lines, m.renderSearchItem(i, contentWidth))
+		lines = append(lines, m.renderListItem(i, contentWidth))
 	}
 	for range bh - (end - start) {
 		lines = append(lines, emptyLine)
@@ -2232,10 +2567,36 @@ func (m *Model) renderNewEntryInput(contentWidth int) string {
 	return line
 }
 
-// renderSearchItem renders a single search result row (file header, match line, or gap).
-func (m *Model) renderSearchItem(idx, contentWidth int) string {
-	item := m.searchItems[idx]
-	selected := idx == m.searchCursor && m.focused
+// activeCursor returns the cursor index for the active list mode.
+func (m *Model) activeCursor() int {
+	if m.mode == viewReferences {
+		return m.refCursor
+	}
+	return m.searchCursor
+}
+
+// activeNumWidth returns the line number digit width for the active mode.
+func (m *Model) activeNumWidth() int {
+	if m.mode == viewReferences {
+		return m.refNumWidth
+	}
+	return m.searchNumWidth
+}
+
+// activeItems returns the searchItem slice for the active list mode.
+func (m *Model) activeItems() []searchItem {
+	if m.mode == viewReferences {
+		return m.refItems
+	}
+	return m.searchItems
+}
+
+// renderListItem renders a single result row (file header, match line, or gap)
+// using mode-aware cursor and item list.
+func (m *Model) renderListItem(idx, contentWidth int) string {
+	items := m.activeItems()
+	item := items[idx]
+	selected := idx == m.activeCursor() && m.focused
 
 	switch item.kind {
 	case searchItemFile:
@@ -2292,7 +2653,7 @@ func (m *Model) renderMatchLine(item searchItem, contentWidth int, selected bool
 	}
 
 	// Indent + right-aligned line number + gap.
-	numStr := fmt.Sprintf("  %*d  ", m.searchNumWidth, item.line)
+	numStr := fmt.Sprintf("  %*d  ", m.activeNumWidth(), item.line)
 	prefix := numStyle.Render(numStr)
 	prefixWidth := lipgloss.Width(prefix)
 
@@ -2313,7 +2674,11 @@ func (m *Model) renderMatchLine(item searchItem, contentWidth int, selected bool
 
 // highlightQuery splits text at query occurrences and highlights them,
 // respecting the current match configuration for case sensitivity.
+// In references mode (no query), renders plain text.
 func (m *Model) highlightQuery(text string, normalStyle, hlStyle lipgloss.Style) string {
+	if m.mode == viewReferences {
+		return normalStyle.Render(text)
+	}
 	query := string(m.searchQuery)
 	if len(query) == 0 {
 		return normalStyle.Render(text)
@@ -2415,7 +2780,11 @@ func (m *Model) renderHeader(contentWidth int) string {
 	headerStyle := lipgloss.NewStyle().Foreground(labelColor).Bold(true)
 	lineStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
 
-	text := headerStyle.Render(" Files ")
+	title := " Files "
+	if m.mode == viewReferences {
+		title = " References "
+	}
+	text := headerStyle.Render(title)
 	textWidth := lipgloss.Width(text)
 	lineWidth := max(contentWidth-textWidth, 0)
 
@@ -2592,8 +2961,11 @@ func (m *Model) emptyView(contentWidth int) string {
 // chrome (header + input/hint + divider) and the mode-specific footer.
 func (m *Model) bodyHeight() int {
 	footer := 0
-	if m.mode == viewSearch {
+	switch m.mode {
+	case viewSearch:
 		footer = searchFooterHeight
+	case viewReferences:
+		footer = searchFooterHeight // separator + hint line
 	}
 	if m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive {
 		footer += newEntryFooterHeight

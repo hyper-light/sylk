@@ -404,6 +404,16 @@ func (m *Model) ClearHighlightRanges() {
 	m.highlightRanges = nil
 }
 
+// PushJump saves the current cursor position in the jump list so the user
+// can return with Ctrl+O.
+func (m *Model) PushJump() {
+	m.jumpList.Push(motion.JumpEntry{
+		File: m.filePath,
+		Line: m.state.CursorLine,
+		Col:  m.state.CursorCol,
+	})
+}
+
 // WordAt returns the text of the word at (line, col), or "" if not on a word.
 func (m *Model) WordAt(line, col int) string {
 	start, end := m.WordBoundsAt(line, col)
@@ -1371,6 +1381,14 @@ func handleStandaloneResult(m *Model, incoming tea.Msg) (component.Component, te
 		})
 		return m, func() tea.Msg {
 			return msg.LSPDefinitionRequestMsg{
+				FilePath: m.filePath,
+				Line:     sr.Line,
+				Col:      sr.Col,
+			}
+		}
+	case motion.OpGotoReferences:
+		return m, func() tea.Msg {
+			return msg.LSPReferencesRequestMsg{
 				FilePath: m.filePath,
 				Line:     sr.Line,
 				Col:      sr.Col,

@@ -25,6 +25,7 @@ const (
 	MethodHover              = "textDocument/hover"
 	MethodDefinition         = "textDocument/definition"
 	MethodDocumentHighlight  = "textDocument/documentHighlight"
+	MethodReferences         = "textDocument/references"
 )
 
 // ---------------------------------------------------------------------------
@@ -72,6 +73,7 @@ type TextDocumentClientCapabilities struct {
 	Hover              HoverClientCapabilities                  `json:"hover,omitempty"`
 	Definition         DefinitionClientCapabilities             `json:"definition,omitempty"`
 	DocumentHighlight  DocumentHighlightClientCapabilities      `json:"documentHighlight,omitempty"`
+	References         ReferencesClientCapabilities             `json:"references,omitempty"`
 }
 
 // CompletionClientCapabilities describes completion support.
@@ -98,6 +100,11 @@ type DefinitionClientCapabilities struct {
 
 // DocumentHighlightClientCapabilities describes document highlight support.
 type DocumentHighlightClientCapabilities struct {
+	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
+}
+
+// ReferencesClientCapabilities describes find-references support.
+type ReferencesClientCapabilities struct {
 	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
 }
 
@@ -505,6 +512,21 @@ func ToDocumentHighlights(items []ProtocolDocumentHighlight) []DocumentHighlight
 		}
 	}
 	return result
+}
+
+// ---------------------------------------------------------------------------
+// References (textDocument/references)
+// ---------------------------------------------------------------------------
+
+// ReferenceParams is the request body for textDocument/references.
+type ReferenceParams struct {
+	TextDocumentPositionParams
+	Context ReferenceContext `json:"context"`
+}
+
+// ReferenceContext controls what references are returned.
+type ReferenceContext struct {
+	IncludeDeclaration bool `json:"includeDeclaration"`
 }
 
 // ---------------------------------------------------------------------------
