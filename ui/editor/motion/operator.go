@@ -16,6 +16,7 @@ const (
 	OpUppercase
 	OpLowercase
 	OpToggleCase
+	OpGotoDefinition
 )
 
 // EditResult carries the outcome of an operator execution.
@@ -42,6 +43,7 @@ var operatorTable = []operatorEntry{
 	{runes: []rune{'g', 'U'}, op: OpUppercase},
 	{runes: []rune{'g', 'u'}, op: OpLowercase},
 	{runes: []rune{'g', '~'}, op: OpToggleCase},
+	{runes: []rune{'g', 'd'}, op: OpGotoDefinition},
 }
 
 // LookupOperator attempts to match the given rune sequence against known
@@ -64,6 +66,18 @@ func IsOperatorPrefix(runes []rune) bool {
 		}
 	}
 	return false
+}
+
+// standaloneOperators is the set of operators that complete immediately
+// without requiring a subsequent motion or count. Used for commands like
+// gd (go-to-definition) that act on the cursor position directly.
+var standaloneOperators = map[OperatorType]bool{
+	OpGotoDefinition: true,
+}
+
+// IsStandalone reports whether an operator completes without a motion.
+func IsStandalone(op OperatorType) bool {
+	return standaloneOperators[op]
 }
 
 // runesEqual returns true when a and b contain the same runes.

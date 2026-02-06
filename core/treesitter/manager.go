@@ -459,9 +459,15 @@ var extToLang = map[string]string{
 	".zig":        "zig",
 }
 
-func detectLanguage(filePath string) string {
+// DetectLanguage returns the tree-sitter grammar name for a file path based
+// on its extension. Returns empty string if the extension is not recognized.
+func DetectLanguage(filePath string) string {
 	ext := extractExtension(filePath)
 	return extToLang[ext]
+}
+
+func detectLanguage(filePath string) string {
+	return DetectLanguage(filePath)
 }
 
 func extractExtension(path string) string {

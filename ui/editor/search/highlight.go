@@ -52,12 +52,12 @@ func (hm *HighlightMatches) FindAll(re *regexp.Regexp, content []rune, visibleSt
 	if !active || re == nil {
 		return nil
 	}
-	return findAllInRange(re, content, visibleStart, visibleEnd)
+	return FindAllInRange(re, content, visibleStart, visibleEnd)
 }
 
-// findAllInRange locates all non-overlapping matches within the specified
+// FindAllInRange locates all non-overlapping matches within the specified
 // rune range of content.
-func findAllInRange(re *regexp.Regexp, content []rune, visibleStart, visibleEnd int) []MatchRange {
+func FindAllInRange(re *regexp.Regexp, content []rune, visibleStart, visibleEnd int) []MatchRange {
 	start := max(visibleStart, 0)
 	end := min(visibleEnd, len(content))
 	if start >= end {

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	glua "github.com/yuin/gopher-lua"
+	rt "github.com/arnodel/golua/runtime"
 )
 
 // ---------------------------------------------------------------------------
@@ -34,26 +34,26 @@ type AutocmdEvent string
 
 // Supported autocommand events.
 const (
-	BufEnter       AutocmdEvent = "BufEnter"
-	BufLeave       AutocmdEvent = "BufLeave"
-	BufWritePre    AutocmdEvent = "BufWritePre"
-	BufWritePost   AutocmdEvent = "BufWritePost"
-	BufNewFile     AutocmdEvent = "BufNewFile"
-	BufReadPost    AutocmdEvent = "BufReadPost"
-	WinEnter       AutocmdEvent = "WinEnter"
-	WinLeave       AutocmdEvent = "WinLeave"
-	CursorMoved    AutocmdEvent = "CursorMoved"
-	CursorMovedI   AutocmdEvent = "CursorMovedI"
-	InsertEnter    AutocmdEvent = "InsertEnter"
-	InsertLeave    AutocmdEvent = "InsertLeave"
-	ModeChanged    AutocmdEvent = "ModeChanged"
-	TextChanged    AutocmdEvent = "TextChanged"
-	TextChangedI   AutocmdEvent = "TextChangedI"
-	VimEnter       AutocmdEvent = "VimEnter"
-	VimLeave       AutocmdEvent = "VimLeave"
-	FileType       AutocmdEvent = "FileType"
-	ColorScheme    AutocmdEvent = "ColorScheme"
-	UserEvent      AutocmdEvent = "User"
+	BufEnter     AutocmdEvent = "BufEnter"
+	BufLeave     AutocmdEvent = "BufLeave"
+	BufWritePre  AutocmdEvent = "BufWritePre"
+	BufWritePost AutocmdEvent = "BufWritePost"
+	BufNewFile   AutocmdEvent = "BufNewFile"
+	BufReadPost  AutocmdEvent = "BufReadPost"
+	WinEnter     AutocmdEvent = "WinEnter"
+	WinLeave     AutocmdEvent = "WinLeave"
+	CursorMoved  AutocmdEvent = "CursorMoved"
+	CursorMovedI AutocmdEvent = "CursorMovedI"
+	InsertEnter  AutocmdEvent = "InsertEnter"
+	InsertLeave  AutocmdEvent = "InsertLeave"
+	ModeChanged  AutocmdEvent = "ModeChanged"
+	TextChanged  AutocmdEvent = "TextChanged"
+	TextChangedI AutocmdEvent = "TextChangedI"
+	VimEnter     AutocmdEvent = "VimEnter"
+	VimLeave     AutocmdEvent = "VimLeave"
+	FileType     AutocmdEvent = "FileType"
+	ColorScheme  AutocmdEvent = "ColorScheme"
+	UserEvent    AutocmdEvent = "User"
 )
 
 // validEvents is the set of all recognised events for O(1) validation.
@@ -75,7 +75,7 @@ type Autocmd struct {
 	Event    AutocmdEvent
 	Pattern  string
 	Group    string
-	Callback any // string (ex-cmd) or *glua.LFunction
+	Callback any // string (ex-cmd) or rt.Value (callable)
 	Once     bool
 	Desc     string
 }
@@ -94,25 +94,42 @@ type AugroupDef struct {
 // autocmdOptField maps an option-table key to a setter on the Autocmd.
 type autocmdOptField struct {
 	Key   string
-	Apply func(ac *Autocmd, val glua.LValue)
+	Apply func(ac *Autocmd, val rt.Value)
 }
 
 // autocmdOptFields is the table-driven opts parser for nvim_create_autocmd.
 var autocmdOptFields = []autocmdOptField{
-	{Key: "pattern", Apply: func(ac *Autocmd, v glua.LValue) { ac.Pattern = v.String() }},
-	{Key: "group", Apply: func(ac *Autocmd, v glua.LValue) { ac.Group = v.String() }},
-	{Key: "once", Apply: func(ac *Autocmd, v glua.LValue) { ac.Once = luaToBool(v) }},
-	{Key: "desc", Apply: func(ac *Autocmd, v glua.LValue) { ac.Desc = v.String() }},
-	{Key: "callback", Apply: func(ac *Autocmd, v glua.LValue) { ac.Callback = resolveAutocmdCallback(v) }},
-	{Key: "command", Apply: func(ac *Autocmd, v glua.LValue) { ac.Callback = v.String() }},
+	{Key: "pattern", Apply: func(ac *Autocmd, v rt.Value) {
+		if s, ok := v.TryString(); ok {
+			ac.Pattern = s
+		}
+	}},
+	{Key: "group", Apply: func(ac *Autocmd, v rt.Value) {
+		if s, ok := v.TryString(); ok {
+			ac.Group = s
+		}
+	}},
+	{Key: "once", Apply: func(ac *Autocmd, v rt.Value) { ac.Once = luaToBool(v) }},
+	{Key: "desc", Apply: func(ac *Autocmd, v rt.Value) {
+		if s, ok := v.TryString(); ok {
+			ac.Desc = s
+		}
+	}},
+	{Key: "callback", Apply: func(ac *Autocmd, v rt.Value) { ac.Callback = resolveAutocmdCallback(v) }},
+	{Key: "command", Apply: func(ac *Autocmd, v rt.Value) {
+		if s, ok := v.TryString(); ok {
+			ac.Callback = s
+		}
+	}},
 }
 
 // resolveAutocmdCallback converts a Lua value to a callback representation.
-func resolveAutocmdCallback(v glua.LValue) any {
-	if fn, ok := v.(*glua.LFunction); ok {
-		return fn
+func resolveAutocmdCallback(v rt.Value) any {
+	if _, ok := v.TryCallable(); ok {
+		return v
 	}
-	return v.String()
+	s, _ := v.TryString()
+	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -194,9 +211,8 @@ func (as *AutocmdStore) clearGroupLocked(name string) {
 
 // Fire triggers every autocmd matching the event and pattern.  "Once"
 // autocmds are removed after firing.  Returns an aggregate of all errors.
-func (as *AutocmdStore) Fire(event AutocmdEvent, data map[string]any, rt *Runtime) error {
+func (as *AutocmdStore) Fire(event AutocmdEvent, data map[string]any, luaRT *Runtime) error {
 	as.mu.RLock()
-	// Collect matching autocmds under read lock; execute after release.
 	type match struct {
 		ac   Autocmd
 		once bool
@@ -215,7 +231,7 @@ func (as *AutocmdStore) Fire(event AutocmdEvent, data map[string]any, rt *Runtim
 
 	var errs []error
 	for _, m := range matches {
-		if err := fireOne(m.ac, data, rt); err != nil {
+		if err := fireOne(m.ac, data, luaRT); err != nil {
 			errs = append(errs, err)
 		}
 		if m.once {
@@ -242,34 +258,29 @@ func patternMatches(pattern string, data map[string]any) bool {
 }
 
 // fireOne executes a single autocmd callback.
-func fireOne(ac Autocmd, data map[string]any, rt *Runtime) error {
-	if fn, ok := ac.Callback.(*glua.LFunction); ok {
-		return fireLuaCallback(fn, data, rt)
+func fireOne(ac Autocmd, data map[string]any, luaRT *Runtime) error {
+	switch cb := ac.Callback.(type) {
+	case rt.Value:
+		return fireLuaCallback(cb, data, luaRT)
+	case string:
+		return luaRT.editor.Command(cb)
+	default:
+		return nil
 	}
-	if cmd, ok := ac.Callback.(string); ok {
-		return rt.editor.Command(cmd)
-	}
-	return nil
 }
 
 // fireLuaCallback invokes a Lua function autocmd handler.
-// It uses buildEventTable + CallFunction to avoid accessing rt.State()
-// without holding the runtime mutex.
-func fireLuaCallback(fn *glua.LFunction, data map[string]any, rt *Runtime) error {
-	rt.mu.Lock()
-	tbl := buildEventTable(rt.state, data)
-	rt.mu.Unlock()
-
-	_, err := rt.CallFunction(fn, tbl)
+func fireLuaCallback(fn rt.Value, data map[string]any, luaRT *Runtime) error {
+	tbl := buildEventTable(data)
+	_, err := luaRT.CallFunction(fn, rt.TableValue(tbl))
 	return err
 }
 
 // buildEventTable constructs a Lua table from autocmd event data.
-// Caller MUST hold rt.mu.
-func buildEventTable(L *glua.LState, data map[string]any) *glua.LTable {
-	tbl := L.NewTable()
+func buildEventTable(data map[string]any) *rt.Table {
+	tbl := rt.NewTable()
 	for k, v := range data {
-		tbl.RawSetString(k, goToLua(L, v))
+		tbl.Set(rt.StringValue(k), goToLua(v))
 	}
 	return tbl
 }
@@ -279,83 +290,85 @@ func buildEventTable(L *glua.LState, data map[string]any) *glua.LTable {
 // ---------------------------------------------------------------------------
 
 // registerAutocmdFunctions attaches autocmd API functions to vim.api.
-func registerAutocmdFunctions(L *glua.LState, apiTbl *glua.LTable, rt *Runtime) {
+func registerAutocmdFunctions(_ *rt.Runtime, apiTbl *rt.Table, luaRT *Runtime) {
 	type registration struct {
 		Name    string
-		Handler func(*glua.LState) int
+		Handler func(*rt.Thread, *rt.GoCont) (rt.Cont, error)
 	}
 	regs := []registration{
-		{Name: "nvim_create_autocmd", Handler: func(ls *glua.LState) int { return luaCreateAutocmd(ls, rt) }},
-		{Name: "nvim_del_autocmd", Handler: func(ls *glua.LState) int { return luaDelAutocmd(ls, rt) }},
-		{Name: "nvim_create_augroup", Handler: func(ls *glua.LState) int { return luaCreateAugroup(ls, rt) }},
-		{Name: "nvim_del_augroup_by_name", Handler: func(ls *glua.LState) int { return luaDelAugroup(ls, rt) }},
+		{Name: "nvim_create_autocmd", Handler: func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return luaCreateAutocmd(t, c, luaRT)
+		}},
+		{Name: "nvim_del_autocmd", Handler: func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return luaDelAutocmd(t, c, luaRT)
+		}},
+		{Name: "nvim_create_augroup", Handler: func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return luaCreateAugroup(t, c, luaRT)
+		}},
+		{Name: "nvim_del_augroup_by_name", Handler: func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return luaDelAugroup(t, c, luaRT)
+		}},
 	}
 	for _, r := range regs {
-		fn := r.Handler
-		apiTbl.RawSetString(r.Name, L.NewFunction(func(ls *glua.LState) int {
-			return fn(ls)
-		}))
+		setGoFunc(apiTbl, r.Name, r.Handler, defaultMaxArgs, true)
 	}
 }
 
 // luaCreateAutocmd implements nvim_create_autocmd(event, opts).
-func luaCreateAutocmd(L *glua.LState, rt *Runtime) int {
-	eventStr := L.ToString(1)
+func luaCreateAutocmd(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	eventStr, _ := c.StringArg(0)
 	event := AutocmdEvent(eventStr)
 	if _, ok := validEvents[event]; !ok {
-		L.Push(glua.LNumber(-1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(-1)), nil
 	}
 
 	ac := Autocmd{Event: event}
 
-	if opts, ok := L.Get(2).(*glua.LTable); ok {
+	optsVal := c.Arg(1)
+	if opts, ok := optsVal.TryTable(); ok {
 		applyAutocmdOpts(&ac, opts)
 	}
 
-	id, err := rt.Autocmds.Create(ac)
+	id, err := luaRT.Autocmds.Create(ac)
 	if err != nil {
-		L.Push(glua.LNumber(-1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(-1)), nil
 	}
-	L.Push(glua.LNumber(id))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(id))), nil
 }
 
 // applyAutocmdOpts walks autocmdOptFields and applies matching entries.
-func applyAutocmdOpts(ac *Autocmd, opts *glua.LTable) {
+func applyAutocmdOpts(ac *Autocmd, opts *rt.Table) {
 	for _, f := range autocmdOptFields {
-		val := opts.RawGetString(f.Key)
-		if val != glua.LNil {
+		val := opts.Get(rt.StringValue(f.Key))
+		if !val.IsNil() {
 			f.Apply(ac, val)
 		}
 	}
 }
 
-func luaDelAutocmd(L *glua.LState, rt *Runtime) int {
-	id := L.ToInt(1)
-	rt.Autocmds.Delete(id)
-	return 0
+func luaDelAutocmd(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	id, _ := c.IntArg(0)
+	luaRT.Autocmds.Delete(int(id))
+	return c.Next(), nil
 }
 
-func luaCreateAugroup(L *glua.LState, rt *Runtime) int {
-	name := L.ToString(1)
+func luaCreateAugroup(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	name, _ := c.StringArg(0)
 	clear := false
-	if opts, ok := L.Get(2).(*glua.LTable); ok {
-		val := opts.RawGetString("clear")
+	optsVal := c.Arg(1)
+	if opts, ok := optsVal.TryTable(); ok {
+		val := opts.Get(rt.StringValue("clear"))
 		clear = luaToBool(val)
 	}
-	id, err := rt.Autocmds.CreateGroup(name, clear)
+	id, err := luaRT.Autocmds.CreateGroup(name, clear)
 	if err != nil {
-		L.Push(glua.LNumber(-1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(-1)), nil
 	}
-	L.Push(glua.LNumber(id))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(id))), nil
 }
 
-func luaDelAugroup(L *glua.LState, rt *Runtime) int {
-	name := L.ToString(1)
-	rt.Autocmds.DeleteGroup(name)
-	return 0
+func luaDelAugroup(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	name, _ := c.StringArg(0)
+	luaRT.Autocmds.DeleteGroup(name)
+	return c.Next(), nil
 }

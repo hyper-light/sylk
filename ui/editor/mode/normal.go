@@ -68,6 +68,30 @@ var namedKeyTable = map[tea.KeyType]func(state *EditorState) tea.Cmd{
 		applyRedo(state)
 		return nil
 	},
+	tea.KeyUp: func(state *EditorState) tea.Cmd {
+		mr := motion.ExecuteMotion(motion.MotionUp, state.Buffer, state.LineIndex, state.Cursor, 1)
+		state.Cursor = mr.End
+		state.ClampCursor(1)
+		return nil
+	},
+	tea.KeyDown: func(state *EditorState) tea.Cmd {
+		mr := motion.ExecuteMotion(motion.MotionDown, state.Buffer, state.LineIndex, state.Cursor, 1)
+		state.Cursor = mr.End
+		state.ClampCursor(1)
+		return nil
+	},
+	tea.KeyLeft: func(state *EditorState) tea.Cmd {
+		mr := motion.ExecuteMotion(motion.MotionLeft, state.Buffer, state.LineIndex, state.Cursor, 1)
+		state.Cursor = mr.End
+		state.ClampCursor(1)
+		return nil
+	},
+	tea.KeyRight: func(state *EditorState) tea.Cmd {
+		mr := motion.ExecuteMotion(motion.MotionRight, state.Buffer, state.LineIndex, state.Cursor, 1)
+		state.Cursor = mr.End
+		state.ClampCursor(1)
+		return nil
+	},
 }
 
 // handleRune dispatches a single rune in normal mode.
@@ -101,8 +125,37 @@ func (nm *NormalMode) feedParser(r rune, state *EditorState) (Mode, tea.Cmd) {
 	if !done {
 		return ModeNormal, nil
 	}
+	// Standalone operators (gd) are signalled via StandaloneResult
+	// so the caller can produce the appropriate Cmd.
+	if motion.IsStandalone(result.Operator) {
+		return ModeNormal, standaloneCmd(result, state)
+	}
 	executeNormalCommand(result, state)
 	return ModeNormal, nil
+}
+
+// standaloneCmd builds a tea.Cmd from a standalone parse result by
+// storing the operator and cursor state in a StandaloneResult message.
+func standaloneCmd(result *motion.ParseResult, state *EditorState) tea.Cmd {
+	op := result.Operator
+	line := state.CursorLine
+	col := state.CursorCol
+	return func() tea.Msg {
+		return StandaloneResult{
+			Operator: op,
+			Line:     line,
+			Col:      col,
+		}
+	}
+}
+
+// StandaloneResult is returned as a tea.Msg when a standalone operator
+// (like gd) is parsed. The editor model maps it to the appropriate
+// LSP request message.
+type StandaloneResult struct {
+	Operator motion.OperatorType
+	Line     int
+	Col      int
 }
 
 // executeNormalCommand applies a parsed motion/operator to the editor state.

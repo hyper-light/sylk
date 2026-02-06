@@ -1,7 +1,7 @@
 package lua
 
 import (
-	glua "github.com/yuin/gopher-lua"
+	rt "github.com/arnodel/golua/runtime"
 )
 
 // ---------------------------------------------------------------------------
@@ -9,7 +9,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // apiFunc is a Lua-callable handler for one vim.api.nvim_* function.
-type apiFunc func(L *glua.LState, rt *Runtime) int
+type apiFunc func(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error)
 
 // apiEntry pairs a Neovim API function name with its Go handler.
 type apiEntry struct {
@@ -52,12 +52,12 @@ var apiTable = []apiEntry{
 }
 
 // registerAPITable wires every entry in apiTable onto the Lua table.
-func registerAPITable(L *glua.LState, tbl *glua.LTable, rt *Runtime) {
+func registerAPITable(_ *rt.Runtime, tbl *rt.Table, luaRT *Runtime) {
 	for _, entry := range apiTable {
 		fn := entry.Handler // capture for closure
-		tbl.RawSetString(entry.Name, L.NewFunction(func(ls *glua.LState) int {
-			return fn(ls, rt)
-		}))
+		setGoFunc(tbl, entry.Name, func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return fn(t, c, luaRT)
+		}, defaultMaxArgs, true)
 	}
 }
 
@@ -65,283 +65,279 @@ func registerAPITable(L *glua.LState, tbl *glua.LTable, rt *Runtime) {
 // Buffer helpers
 // ---------------------------------------------------------------------------
 
-// resolveBuf returns the BufferAccess for the given Lua buf argument.
+// resolveBuf returns the BufferAccess for the given buf argument.
 // buf == 0 means "current buffer".
-func resolveBuf(rt *Runtime, bufArg int) BufferAccess {
+func resolveBuf(luaRT *Runtime, bufArg int) BufferAccess {
 	if bufArg == 0 {
-		return rt.editor.CurrentBuffer()
+		return luaRT.editor.CurrentBuffer()
 	}
-	return rt.editor.GetBuffer(bufArg)
+	return luaRT.editor.GetBuffer(bufArg)
 }
 
-// resolveWin returns the WindowAccess for the given Lua win argument.
+// resolveWin returns the WindowAccess for the given win argument.
 // win == 0 means "current window".
-func resolveWin(rt *Runtime, winArg int) WindowAccess {
+func resolveWin(luaRT *Runtime, winArg int) WindowAccess {
 	if winArg == 0 {
-		return rt.editor.CurrentWindow()
+		return luaRT.editor.CurrentWindow()
 	}
-	return rt.editor.GetWindow(winArg)
+	return luaRT.editor.GetWindow(winArg)
 }
 
 // ---------------------------------------------------------------------------
 // Buffer API handlers
 // ---------------------------------------------------------------------------
 
-func apiBufGetLines(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
-	start := L.ToInt(2)
-	end := L.ToInt(3)
-	// strict (arg 4) is accepted but not enforced in this implementation.
+func apiBufGetLines(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
+	start, _ := c.IntArg(1)
+	end, _ := c.IntArg(2)
+	// strict (arg 3) is accepted but not enforced.
 	if buf == nil {
-		L.Push(glua.LNil)
-		return 1
+		return c.PushingNext1(t.Runtime, rt.NilValue), nil
 	}
-	lines := buf.GetLines(start, end)
-	L.Push(stringsToTable(L, lines))
-	return 1
+	lines := buf.GetLines(int(start), int(end))
+	return c.PushingNext1(t.Runtime, rt.TableValue(stringsToTable(lines))), nil
 }
 
-func apiBufSetLines(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
-	start := L.ToInt(2)
-	end := L.ToInt(3)
-	// strict (arg 4) accepted but not enforced.
-	linesTbl, ok := L.Get(5).(*glua.LTable)
+func apiBufSetLines(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
+	start, _ := c.IntArg(1)
+	end, _ := c.IntArg(2)
+	// strict (arg 3) accepted but not enforced.
+	linesTbl, ok := c.Arg(4).TryTable()
 	if !ok || buf == nil {
-		return 0
+		return c.Next(), nil
 	}
 	lines := luaTableToStrings(linesTbl)
-	_ = buf.SetLines(start, end, lines)
-	return 0
+	_ = buf.SetLines(int(start), int(end), lines)
+	return c.Next(), nil
 }
 
-func apiBufGetName(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
+func apiBufGetName(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
 	if buf == nil {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
-	L.Push(glua.LString(buf.Name()))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(buf.Name())), nil
 }
 
-func apiBufSetName(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
+func apiBufSetName(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
 	if buf == nil {
-		return 0
+		return c.Next(), nil
 	}
-	buf.SetName(L.ToString(2))
-	return 0
+	name, _ := c.StringArg(1)
+	buf.SetName(name)
+	return c.Next(), nil
 }
 
-func apiBufLineCount(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
+func apiBufLineCount(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
 	if buf == nil {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
-	L.Push(glua.LNumber(buf.LineCount()))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(buf.LineCount()))), nil
 }
 
-func apiBufGetOption(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
-	name := L.ToString(2)
+func apiBufGetOption(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
+	name, _ := c.StringArg(1)
 	if buf == nil {
-		L.Push(glua.LNil)
-		return 1
+		return c.PushingNext1(t.Runtime, rt.NilValue), nil
 	}
 	val, ok := buf.GetOption(name)
 	if !ok {
-		L.Push(glua.LNil)
-		return 1
+		return c.PushingNext1(t.Runtime, rt.NilValue), nil
 	}
-	L.Push(goToLua(L, val))
-	return 1
+	return c.PushingNext1(t.Runtime, goToLua(val)), nil
 }
 
-func apiBufSetOption(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
+func apiBufSetOption(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
 	if buf == nil {
-		return 0
+		return c.Next(), nil
 	}
-	buf.SetOption(L.ToString(2), luaToGo(L.Get(3)))
-	return 0
+	name, _ := c.StringArg(1)
+	buf.SetOption(name, luaToGo(c.Arg(2)))
+	return c.Next(), nil
 }
 
-func apiBufGetVar(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
-	name := L.ToString(2)
+func apiBufGetVar(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
+	name, _ := c.StringArg(1)
 	if buf == nil {
-		L.Push(glua.LNil)
-		return 1
+		return c.PushingNext1(t.Runtime, rt.NilValue), nil
 	}
 	val, ok := buf.GetVar(name)
 	if !ok {
-		L.Push(glua.LNil)
-		return 1
+		return c.PushingNext1(t.Runtime, rt.NilValue), nil
 	}
-	L.Push(goToLua(L, val))
-	return 1
+	return c.PushingNext1(t.Runtime, goToLua(val)), nil
 }
 
-func apiBufSetVar(L *glua.LState, rt *Runtime) int {
-	buf := resolveBuf(rt, L.ToInt(1))
+func apiBufSetVar(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	bufArg, _ := c.IntArg(0)
+	buf := resolveBuf(luaRT, int(bufArg))
 	if buf == nil {
-		return 0
+		return c.Next(), nil
 	}
-	buf.SetVar(L.ToString(2), luaToGo(L.Get(3)))
-	return 0
+	name, _ := c.StringArg(1)
+	buf.SetVar(name, luaToGo(c.Arg(2)))
+	return c.Next(), nil
 }
 
 // ---------------------------------------------------------------------------
 // Window API handlers
 // ---------------------------------------------------------------------------
 
-func apiWinGetCursor(L *glua.LState, rt *Runtime) int {
-	win := resolveWin(rt, L.ToInt(1))
+func apiWinGetCursor(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	winArg, _ := c.IntArg(0)
+	win := resolveWin(luaRT, int(winArg))
 	if win == nil {
-		L.Push(glua.LNil)
-		return 1
+		return c.PushingNext1(t.Runtime, rt.NilValue), nil
 	}
 	line, col := win.GetCursor()
-	tbl := L.NewTable()
-	tbl.Append(glua.LNumber(line))
-	tbl.Append(glua.LNumber(col))
-	L.Push(tbl)
-	return 1
+	tbl := rt.NewTable()
+	tbl.Set(rt.IntValue(1), rt.IntValue(int64(line)))
+	tbl.Set(rt.IntValue(2), rt.IntValue(int64(col)))
+	return c.PushingNext1(t.Runtime, rt.TableValue(tbl)), nil
 }
 
-func apiWinSetCursor(L *glua.LState, rt *Runtime) int {
-	win := resolveWin(rt, L.ToInt(1))
+func apiWinSetCursor(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	winArg, _ := c.IntArg(0)
+	win := resolveWin(luaRT, int(winArg))
 	if win == nil {
-		return 0
+		return c.Next(), nil
 	}
-	posTbl, ok := L.Get(2).(*glua.LTable)
+	posTbl, ok := c.Arg(1).TryTable()
 	if !ok {
-		return 0
+		return c.Next(), nil
 	}
-	lineVal, lineOK := posTbl.RawGetInt(1).(glua.LNumber)
-	colVal, colOK := posTbl.RawGetInt(2).(glua.LNumber)
+	lineVal := posTbl.Get(rt.IntValue(1))
+	colVal := posTbl.Get(rt.IntValue(2))
+	line, lineOK := lineVal.TryInt()
+	col, colOK := colVal.TryInt()
 	if !lineOK || !colOK {
-		return 0
+		return c.Next(), nil
 	}
-	win.SetCursor(int(lineVal), int(colVal))
-	return 0
+	win.SetCursor(int(line), int(col))
+	return c.Next(), nil
 }
 
-func apiWinGetBuf(L *glua.LState, rt *Runtime) int {
-	win := resolveWin(rt, L.ToInt(1))
+func apiWinGetBuf(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	winArg, _ := c.IntArg(0)
+	win := resolveWin(luaRT, int(winArg))
 	if win == nil {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
-	L.Push(glua.LNumber(win.GetBuffer()))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(win.GetBuffer()))), nil
 }
 
-func apiWinSetBuf(L *glua.LState, rt *Runtime) int {
-	win := resolveWin(rt, L.ToInt(1))
+func apiWinSetBuf(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	winArg, _ := c.IntArg(0)
+	win := resolveWin(luaRT, int(winArg))
 	if win == nil {
-		return 0
+		return c.Next(), nil
 	}
-	_ = win.SetBuffer(L.ToInt(2))
-	return 0
+	bufID, _ := c.IntArg(1)
+	_ = win.SetBuffer(int(bufID))
+	return c.Next(), nil
 }
 
-func apiWinGetWidth(L *glua.LState, rt *Runtime) int {
-	win := resolveWin(rt, L.ToInt(1))
+func apiWinGetWidth(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	winArg, _ := c.IntArg(0)
+	win := resolveWin(luaRT, int(winArg))
 	if win == nil {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
-	L.Push(glua.LNumber(win.Width()))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(win.Width()))), nil
 }
 
-func apiWinGetHeight(L *glua.LState, rt *Runtime) int {
-	win := resolveWin(rt, L.ToInt(1))
+func apiWinGetHeight(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	winArg, _ := c.IntArg(0)
+	win := resolveWin(luaRT, int(winArg))
 	if win == nil {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
-	L.Push(glua.LNumber(win.Height()))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(win.Height()))), nil
 }
 
-func apiWinClose(L *glua.LState, rt *Runtime) int {
-	win := resolveWin(rt, L.ToInt(1))
+func apiWinClose(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	winArg, _ := c.IntArg(0)
+	win := resolveWin(luaRT, int(winArg))
 	if win == nil {
-		return 0
+		return c.Next(), nil
 	}
-	force := L.ToBool(2)
+	force, _ := c.BoolArg(1)
 	_ = win.Close(force)
-	return 0
+	return c.Next(), nil
 }
 
 // ---------------------------------------------------------------------------
 // Global API handlers
 // ---------------------------------------------------------------------------
 
-func apiCommand(L *glua.LState, rt *Runtime) int {
-	cmd := L.ToString(1)
-	_ = rt.editor.Command(cmd)
-	return 0
+func apiCommand(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	cmd, _ := c.StringArg(0)
+	_ = luaRT.editor.Command(cmd)
+	return c.Next(), nil
 }
 
-func apiGetCurrentBuf(L *glua.LState, _ *Runtime) int {
-	// 0 is the Neovim convention for "current buffer".
-	L.Push(glua.LNumber(0))
-	return 1
+func apiGetCurrentBuf(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 }
 
-func apiGetCurrentWin(L *glua.LState, _ *Runtime) int {
-	L.Push(glua.LNumber(0))
-	return 1
+func apiGetCurrentWin(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 }
 
-func apiListBufs(L *glua.LState, rt *Runtime) int {
-	ids := rt.editor.ListBuffers()
-	tbl := L.NewTable()
-	for _, id := range ids {
-		tbl.Append(glua.LNumber(id))
+func apiListBufs(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	ids := luaRT.editor.ListBuffers()
+	tbl := rt.NewTable()
+	for i, id := range ids {
+		tbl.Set(rt.IntValue(int64(i+1)), rt.IntValue(int64(id)))
 	}
-	L.Push(tbl)
-	return 1
+	return c.PushingNext1(t.Runtime, rt.TableValue(tbl)), nil
 }
 
-func apiListWins(L *glua.LState, rt *Runtime) int {
-	ids := rt.editor.ListWindows()
-	tbl := L.NewTable()
-	for _, id := range ids {
-		tbl.Append(glua.LNumber(id))
+func apiListWins(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	ids := luaRT.editor.ListWindows()
+	tbl := rt.NewTable()
+	for i, id := range ids {
+		tbl.Set(rt.IntValue(int64(i+1)), rt.IntValue(int64(id)))
 	}
-	L.Push(tbl)
-	return 1
+	return c.PushingNext1(t.Runtime, rt.TableValue(tbl)), nil
 }
 
-func apiGetMode(L *glua.LState, rt *Runtime) int {
-	m := rt.editor.GetMode()
-	tbl := L.NewTable()
-	tbl.RawSetString("mode", glua.LString(m))
-	tbl.RawSetString("blocking", glua.LFalse)
-	L.Push(tbl)
-	return 1
+func apiGetMode(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	m := luaRT.editor.GetMode()
+	tbl := rt.NewTable()
+	tbl.Set(rt.StringValue("mode"), rt.StringValue(m))
+	tbl.Set(rt.StringValue("blocking"), rt.BoolValue(false))
+	return c.PushingNext1(t.Runtime, rt.TableValue(tbl)), nil
 }
 
-func apiEcho(L *glua.LState, rt *Runtime) int {
-	chunksTbl, ok := L.Get(1).(*glua.LTable)
+func apiEcho(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	chunksTbl, ok := c.Arg(0).TryTable()
 	if !ok {
-		return 0
+		return c.Next(), nil
 	}
 	chunks := luaTableToStrings(chunksTbl)
-	rt.editor.Echo(chunks)
-	return 0
+	luaRT.editor.Echo(chunks)
+	return c.Next(), nil
 }
 
-func apiNotify(L *glua.LState, rt *Runtime) int {
-	msg := L.ToString(1)
-	level := L.ToInt(2)
-	rt.editor.Notify(msg, level)
-	return 0
+func apiNotify(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	msg, _ := c.StringArg(0)
+	level, _ := c.IntArg(1)
+	luaRT.editor.Notify(msg, int(level))
+	return c.Next(), nil
 }

@@ -56,12 +56,16 @@ type LanguageServerDefinition struct {
 	// AutoDownload specifies how to automatically install the server if not found.
 	// If nil, auto-download is not supported.
 	AutoDownload *AutoDownloadConfig
+
+	// InitializationOptions are server-specific options sent during the
+	// LSP initialize handshake. If nil, no options are sent.
+	InitializationOptions map[string]interface{}
 }
 
 // AutoDownloadConfig specifies how to automatically download and install a language server.
 type AutoDownloadConfig struct {
 	// Source indicates the package manager or download source.
-	// Supported values: "npm", "go", "github", "pip", "cargo"
+	// Supported values: "npm", "go", "github", "gem", "system"
 	Source string
 
 	// Package is the package name to install (e.g., "typescript-language-server", "golang.org/x/tools/gopls").
@@ -69,6 +73,12 @@ type AutoDownloadConfig struct {
 
 	// Binary is the name of the binary after installation, if different from the package name.
 	Binary string
+
+	// Owner is the GitHub repository owner (used when Source == "github").
+	Owner string
+
+	// Repo is the GitHub repository name (used when Source == "github").
+	Repo string
 }
 
 // AutoDownload sources.
@@ -78,6 +88,8 @@ const (
 	SourceGitHub = "github"
 	SourcePip    = "pip"
 	SourceCargo  = "cargo"
+	SourceGem    = "gem"
+	SourceSystem = "system" // Detect only; never auto-install.
 )
 
 // LSPClient represents an active connection to a language server instance.
@@ -134,6 +146,9 @@ type ServerCapabilities struct {
 
 	// RenameProvider indicates the server supports rename refactoring.
 	RenameProvider bool
+
+	// DocumentHighlightProvider indicates the server supports document highlights.
+	DocumentHighlightProvider bool
 }
 
 // ClientStatus represents the current state of an LSP client connection.
@@ -218,6 +233,30 @@ type Location struct {
 
 	// Range is the text range within the document.
 	Range Range
+}
+
+// DocumentHighlightKind categorises the kind of highlight.
+type DocumentHighlightKind int
+
+const (
+	// HighlightText is a textual occurrence (default).
+	HighlightText DocumentHighlightKind = 1
+
+	// HighlightRead is a read-access reference.
+	HighlightRead DocumentHighlightKind = 2
+
+	// HighlightWrite is a write-access reference.
+	HighlightWrite DocumentHighlightKind = 3
+)
+
+// DocumentHighlight represents a range in a document that should be
+// highlighted because it references the same symbol as the cursor position.
+type DocumentHighlight struct {
+	// Range is the text range to highlight.
+	Range Range
+
+	// Kind is the highlight kind (text, read, or write).
+	Kind DocumentHighlightKind
 }
 
 // DiagnosticSeverity indicates the severity level of a diagnostic.
@@ -419,3 +458,155 @@ func appendUnique(slice []ServerID, id ServerID) []ServerID {
 
 // DefaultRegistry is the global registry instance pre-populated with common servers.
 var DefaultRegistry = NewLSPRegistry()
+
+// ---------------------------------------------------------------------------
+// Completion domain types
+// ---------------------------------------------------------------------------
+
+// CompletionItemKind identifies the kind of a completion item.
+type CompletionItemKind int
+
+const (
+	CompletionKindText          CompletionItemKind = 1
+	CompletionKindMethod        CompletionItemKind = 2
+	CompletionKindFunction      CompletionItemKind = 3
+	CompletionKindConstructor   CompletionItemKind = 4
+	CompletionKindField         CompletionItemKind = 5
+	CompletionKindVariable      CompletionItemKind = 6
+	CompletionKindClass         CompletionItemKind = 7
+	CompletionKindInterface     CompletionItemKind = 8
+	CompletionKindModule        CompletionItemKind = 9
+	CompletionKindProperty      CompletionItemKind = 10
+	CompletionKindUnit          CompletionItemKind = 11
+	CompletionKindValue         CompletionItemKind = 12
+	CompletionKindEnum          CompletionItemKind = 13
+	CompletionKindKeyword       CompletionItemKind = 14
+	CompletionKindSnippet       CompletionItemKind = 15
+	CompletionKindColor         CompletionItemKind = 16
+	CompletionKindFile          CompletionItemKind = 17
+	CompletionKindReference     CompletionItemKind = 18
+	CompletionKindFolder        CompletionItemKind = 19
+	CompletionKindEnumMember    CompletionItemKind = 20
+	CompletionKindConstant      CompletionItemKind = 21
+	CompletionKindStruct        CompletionItemKind = 22
+	CompletionKindEvent         CompletionItemKind = 23
+	CompletionKindOperator      CompletionItemKind = 24
+	CompletionKindTypeParameter CompletionItemKind = 25
+)
+
+var completionKindNames = map[CompletionItemKind]string{
+	CompletionKindText:          "text",
+	CompletionKindMethod:        "method",
+	CompletionKindFunction:      "function",
+	CompletionKindConstructor:   "constructor",
+	CompletionKindField:         "field",
+	CompletionKindVariable:      "variable",
+	CompletionKindClass:         "class",
+	CompletionKindInterface:     "interface",
+	CompletionKindModule:        "module",
+	CompletionKindProperty:      "property",
+	CompletionKindUnit:          "unit",
+	CompletionKindValue:         "value",
+	CompletionKindEnum:          "enum",
+	CompletionKindKeyword:       "keyword",
+	CompletionKindSnippet:       "snippet",
+	CompletionKindColor:         "color",
+	CompletionKindFile:          "file",
+	CompletionKindReference:     "reference",
+	CompletionKindFolder:        "folder",
+	CompletionKindEnumMember:    "enum member",
+	CompletionKindConstant:      "constant",
+	CompletionKindStruct:        "struct",
+	CompletionKindEvent:         "event",
+	CompletionKindOperator:      "operator",
+	CompletionKindTypeParameter: "type parameter",
+}
+
+// String returns the human-readable name of a CompletionItemKind.
+func (k CompletionItemKind) String() string {
+	if name, ok := completionKindNames[k]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+// CompletionItem is the domain-level representation of a single completion.
+type CompletionItem struct {
+	// Label is the primary text shown in the completion popup.
+	Label string
+
+	// Detail provides additional information (e.g., type signature).
+	Detail string
+
+	// Kind identifies what the completion represents.
+	Kind CompletionItemKind
+
+	// InsertText is the text to insert when this item is accepted.
+	// Falls back to Label if empty.
+	InsertText string
+
+	// SortText controls ordering in the completion popup.
+	SortText string
+
+	// FilterText is used for prefix matching. Falls back to Label.
+	FilterText string
+}
+
+// ---------------------------------------------------------------------------
+// Hover domain types
+// ---------------------------------------------------------------------------
+
+// HoverResult is the domain-level representation of a hover response.
+type HoverResult struct {
+	// Contents is the hover text (may be markdown or plaintext).
+	Contents string
+
+	// Range is the optional text range the hover applies to.
+	Range *Range
+}
+
+// ---------------------------------------------------------------------------
+// Completion/Hover conversion helpers
+// ---------------------------------------------------------------------------
+
+// ToCompletionItems converts wire-format completion items to domain types.
+func ToCompletionItems(items []ProtocolCompletionItem) []CompletionItem {
+	result := make([]CompletionItem, len(items))
+	for i, pi := range items {
+		insertText := pi.InsertText
+		if insertText == "" && pi.TextEdit != nil {
+			insertText = pi.TextEdit.NewText
+		}
+		if insertText == "" {
+			insertText = pi.Label
+		}
+		filterText := pi.FilterText
+		if filterText == "" {
+			filterText = pi.Label
+		}
+		result[i] = CompletionItem{
+			Label:      pi.Label,
+			Detail:     pi.Detail,
+			Kind:       CompletionItemKind(pi.Kind),
+			InsertText: insertText,
+			SortText:   pi.SortText,
+			FilterText: filterText,
+		}
+	}
+	return result
+}
+
+// ToHoverResult converts a wire-format hover result to the domain type.
+func ToHoverResult(ph ProtocolHoverResult) *HoverResult {
+	if ph.Contents.Value == "" {
+		return nil
+	}
+	hr := &HoverResult{
+		Contents: ph.Contents.Value,
+	}
+	if ph.Range != nil {
+		r := toCoreRange(*ph.Range)
+		hr.Range = &r
+	}
+	return hr
+}

@@ -163,6 +163,19 @@ func (e *Engine) Accept() *CompletionItem {
 	return &item
 }
 
+// AcceptAt selects the item at the given absolute index and accepts it.
+// Returns nil if the index is out of range or no completion is active.
+func (e *Engine) AcceptAt(index int) *CompletionItem {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.active || index < 0 || index >= len(e.items) {
+		return nil
+	}
+	item := e.items[index]
+	e.deactivate()
+	return &item
+}
+
 // Dismiss closes the completion popup without accepting any item.
 func (e *Engine) Dismiss() {
 	e.mu.Lock()
@@ -207,6 +220,21 @@ func (e *Engine) Prefix() string {
 	return e.prefix
 }
 
+// VisibleRange returns the start and end indices of items currently shown
+// in the popup window, limited to maxItems visible rows.
+func (e *Engine) VisibleRange(maxItems int) (int, int) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.visibleWindowN(maxItems)
+}
+
+// MaxVisibleItems returns the maximum item rows the popup will show.
+func MaxVisibleItems() int { return maxVisibleItems }
+
+// PopupChromeRows returns the number of non-item rows in the popup
+// (borders + footer).
+func PopupChromeRows() int { return popupChrome }
+
 // deactivate resets state. Caller must hold e.mu.
 func (e *Engine) deactivate() {
 	e.active = false
@@ -226,7 +254,14 @@ const popupColWidth = 20
 
 // Render produces the styled completion popup string. The caller is
 // responsible for overlaying this at the correct screen position.
-func (e *Engine) Render(width int, th *theme.Theme) string {
+// popupChrome is the number of lines consumed by borders and the footer:
+// top border (1) + bottom border (1) + hint footer (1).
+const popupChrome = 3
+
+// Render produces the styled completion popup string. The maxHeight
+// parameter limits the total popup height in terminal rows (including
+// borders and indicator). Pass 0 for no constraint.
+func (e *Engine) Render(width, maxHeight int, th *theme.Theme) string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -234,7 +269,12 @@ func (e *Engine) Render(width int, th *theme.Theme) string {
 		return ""
 	}
 
-	visibleStart, visibleEnd := e.visibleWindow()
+	itemLimit := maxVisibleItems
+	if maxHeight > 0 {
+		itemLimit = min(itemLimit, max(maxHeight-popupChrome, 1))
+	}
+
+	visibleStart, visibleEnd := e.visibleWindowN(itemLimit)
 	visible := e.items[visibleStart:visibleEnd]
 
 	wordCol := e.longestWord(visible)
@@ -256,7 +296,7 @@ func (e *Engine) Render(width int, th *theme.Theme) string {
 		Foreground(th.Palette.Background).
 		Background(th.Palette.Primary)
 
-	maxWidth := min(wordCol+kindBadgeWidth+menuPadding, max(width, popupColWidth))
+	maxWidth := min(wordCol+kindBadgeWidth+rowPadding, max(width, popupColWidth))
 
 	var b strings.Builder
 	topBorder := borderStyle.Render(strings.Repeat("\u2500", maxWidth))
@@ -276,28 +316,30 @@ func (e *Engine) Render(width int, th *theme.Theme) string {
 	bottomBorder := borderStyle.Render(strings.Repeat("\u2500", maxWidth))
 	b.WriteString(bottomBorder)
 
-	// Scroll indicator when items exceed visible window.
-	if len(e.items) > maxVisibleItems {
-		indicator := fmt.Sprintf(" %d/%d ", e.selected+1, len(e.items))
-		b.WriteRune('\n')
-		b.WriteString(borderStyle.Render(indicator))
+	// Footer: key hints and optional scroll indicator.
+	b.WriteRune('\n')
+	footer := " Tab select"
+	if len(e.items) > len(visible) {
+		footer = fmt.Sprintf(" %d/%d  Tab select", e.selected+1, len(e.items))
 	}
+	b.WriteString(borderStyle.Render(footer))
 
 	return b.String()
 }
 
-// kindBadgeWidth is the number of characters reserved for the kind badge
-// column: "[Buf] " = bracket + 4 chars + bracket + space.
-const kindBadgeWidth = 7
+// kindBadgeWidth is the visible width of the kind badge column.
+// All kind names are padded to 4 characters: "[Xxxx]" = 6 visible chars.
+const kindBadgeWidth = 6
 
-// menuPadding is the spacing between the kind badge and menu text.
-const menuPadding = 2
+// rowPadding accounts for the leading space and the space separating the
+// badge from the word column in each popup row.
+const rowPadding = 2
 
-// visibleWindow computes the start and end indices for the virtual scroll
-// window around the selected item.
-func (e *Engine) visibleWindow() (int, int) {
+// visibleWindowN computes the start and end indices for the virtual scroll
+// window around the selected item, showing at most n items.
+func (e *Engine) visibleWindowN(n int) (int, int) {
 	total := len(e.items)
-	visible := min(maxVisibleItems, total)
+	visible := min(n, total)
 	start := 0
 
 	// Keep the selected item within the visible window.
@@ -324,7 +366,11 @@ func (e *Engine) longestWord(items []CompletionItem) int {
 	return longest
 }
 
-// renderRow renders a single popup row.
+// maxKindNameLen is the longest kind name across all completion kinds.
+// Used to left-pad shorter names inside the badge brackets for alignment.
+const maxKindNameLen = 4
+
+// renderRow renders a single popup row with consistent width.
 func (e *Engine) renderRow(
 	item CompletionItem,
 	wordCol int,
@@ -339,16 +385,16 @@ func (e *Engine) renderRow(
 		badgeStyle = kindSel
 	}
 
-	badge := badgeStyle.Render(fmt.Sprintf("[%s]", item.Kind.KindName()))
+	badge := badgeStyle.Render(fmt.Sprintf("[%-*s]", maxKindNameLen, item.Kind.KindName()))
 	word := padRight(item.Word, wordCol)
 	text := rowStyle.Render(word)
 
 	row := fmt.Sprintf(" %s %s", badge, text)
 
-	// Truncate to maxWidth if necessary.
-	if runeWidth := utf8.RuneCountInString(stripAnsi(row)); runeWidth > maxWidth {
-		runes := []rune(row)
-		row = string(runes[:maxWidth])
+	// Pad to maxWidth for consistent row widths across the popup.
+	visibleWidth := utf8.RuneCountInString(stripAnsi(row))
+	if visibleWidth < maxWidth {
+		row += rowStyle.Render(strings.Repeat(" ", maxWidth-visibleWidth))
 	}
 	return row
 }

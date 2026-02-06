@@ -63,6 +63,9 @@ func New(t *theme.Theme, mgr *session.Manager) *Model {
 	}
 }
 
+// SetMode updates the mode badge (e.g. "CHAT", "EDIT").
+func (m *Model) SetMode(mode string) { m.mode = mode }
+
 // Init satisfies tea.Model. The status bar requires no initial command.
 func (m *Model) Init() tea.Cmd {
 	return nil

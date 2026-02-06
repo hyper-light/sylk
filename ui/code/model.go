@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/theme"
 )
@@ -76,6 +77,7 @@ type Model struct {
 	wordWrap         bool
 	bounceOffset     int           // Visual line displacement from overscroll bounce.
 	selection        textSelection // Mouse-driven text selection state.
+	diagnostics      []lsp.Diagnostic // LSP diagnostics for the current file.
 }
 
 // Compile-time interface checks.
@@ -94,6 +96,15 @@ func New(th *theme.Theme) *Model {
 	}
 }
 
+// FilePath returns the current file path.
+func (m *Model) FilePath() string { return m.filePath }
+
+// Content returns the current raw content.
+func (m *Model) Content() string { return m.content }
+
+// Language returns the current language identifier.
+func (m *Model) Language() string { return m.language }
+
 // SetContent sets the source content, file path, and language, then
 // triggers a re-highlight of the content.
 func (m *Model) SetContent(content, filePath, language string) {
@@ -107,7 +118,32 @@ func (m *Model) SetContent(content, filePath, language string) {
 	m.scrollOffset = 0
 	m.cursorLine = 0
 	m.selection = textSelection{}
+	m.diagnostics = nil
 	m.reHighlight()
+}
+
+// ClearFile resets the panel to an empty state with no file loaded.
+func (m *Model) ClearFile() {
+	m.content = ""
+	m.filePath = ""
+	m.language = ""
+	m.lines = nil
+	m.highlightedLines = nil
+	m.highlightRegions = nil
+	m.scrollOffset = 0
+	m.cursorLine = 0
+	m.selection = textSelection{}
+	m.diagnostics = nil
+}
+
+// SetDiagnostics updates the diagnostics for the given file. If the file
+// matches the currently displayed file, the diagnostics are stored; otherwise
+// they are ignored.
+func (m *Model) SetDiagnostics(filePath string, diags []lsp.Diagnostic) {
+	if filePath != m.filePath {
+		return
+	}
+	m.diagnostics = diags
 }
 
 // reHighlight runs the highlighter on the current content and caches
@@ -155,10 +191,12 @@ func (m *Model) View() string {
 	viewHeight := m.viewportHeight()
 	lineCount := len(m.lines)
 
-	var header string
-	if m.filePath != "" {
-		header = m.renderFileHeader()
+	if m.filePath == "" {
+		return m.renderPlaceholder()
 	}
+
+	var header string
+	header = m.renderFileHeader()
 
 	if lineCount == 0 {
 		code := padLines("", viewHeight)
@@ -206,6 +244,26 @@ func (m *Model) renderFileHeader() string {
 	return text + lineStyle.Render(strings.Repeat("─", lineWidth))
 }
 
+// renderPlaceholder renders a vertically and horizontally centered placeholder
+// message when no file is open.
+func (m *Model) renderPlaceholder() string {
+	const placeholder = "Select a file to view."
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+
+	textWidth := lipgloss.Width(placeholder)
+	padLeft := max((m.width-textWidth)/2, 0)
+	centeredLine := strings.Repeat(" ", padLeft) + style.Render(placeholder)
+
+	lines := make([]string, m.height)
+	midRow := m.height / 2
+	for i := range lines {
+		if i == midRow {
+			lines[i] = centeredLine
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // padLines ensures s contains exactly targetLines lines by appending empty lines.
 func padLines(s string, targetLines int) string {
 	if targetLines <= 0 {
@@ -228,8 +286,19 @@ func (m *Model) renderViewLine(b *strings.Builder, lineIdx, gutterWidth, content
 	var lb strings.Builder
 
 	if m.showLineNumbers {
-		numStr := fmt.Sprintf("%*d", gutterWidth, lineIdx+1)
-		lb.WriteString(gutterStyle.Render(numStr))
+		if diag, ok := m.diagnosticForLine(lineIdx); ok {
+			sign := severitySign[diag.Severity]
+			if sign == "" {
+				sign = "?"
+			}
+			color := m.diagnosticColor(diag.Severity)
+			signStyle := lipgloss.NewStyle().Foreground(color).Bold(true)
+			numStr := fmt.Sprintf("%*s", gutterWidth, sign)
+			lb.WriteString(signStyle.Render(numStr))
+		} else {
+			numStr := fmt.Sprintf("%*d", gutterWidth, lineIdx+1)
+			lb.WriteString(gutterStyle.Render(numStr))
+		}
 		lb.WriteByte(' ')
 	}
 
@@ -297,6 +366,48 @@ func (m *Model) lineLen(idx int) int {
 		return len(m.lines[idx])
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic rendering
+// ---------------------------------------------------------------------------
+
+// severitySign maps diagnostic severity to a gutter sign character.
+var severitySign = map[lsp.DiagnosticSeverity]string{
+	lsp.SeverityError:       "E",
+	lsp.SeverityWarning:     "W",
+	lsp.SeverityInformation: "I",
+	lsp.SeverityHint:        "H",
+}
+
+// diagnosticForLine returns the highest-severity diagnostic on a given line.
+func (m *Model) diagnosticForLine(line int) (lsp.Diagnostic, bool) {
+	var best lsp.Diagnostic
+	found := false
+	for _, d := range m.diagnostics {
+		if d.Range.Start.Line != line {
+			continue
+		}
+		if !found || d.Severity < best.Severity {
+			best = d
+			found = true
+		}
+	}
+	return best, found
+}
+
+// diagnosticColor returns the palette color for a diagnostic severity.
+func (m *Model) diagnosticColor(severity lsp.DiagnosticSeverity) lipgloss.Color {
+	switch severity {
+	case lsp.SeverityError:
+		return m.theme.Palette.Error
+	case lsp.SeverityWarning:
+		return m.theme.Palette.Warning
+	case lsp.SeverityInformation:
+		return m.theme.Palette.Info
+	default:
+		return m.theme.Palette.Muted
+	}
 }
 
 // truncateVisible limits visible content to the given width. This is a simple

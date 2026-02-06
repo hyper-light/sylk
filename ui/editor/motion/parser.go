@@ -142,11 +142,16 @@ func handleCount1(p *Parser, r rune) ParserState {
 }
 
 func handleOperator(p *Parser, r rune) ParserState {
-	// Continue accumulating multi-rune operators (g~, gu, gU).
+	// Continue accumulating multi-rune operators (g~, gu, gU, gd).
 	extended := append(p.opRunes, r)
 	if op, ok := LookupOperator(extended); ok {
 		p.opRunes = extended
 		p.op = op
+		if IsStandalone(op) {
+			// Standalone operators (gd) complete immediately.
+			p.pending = append(p.pending, r) // ensure tryComplete sees content
+			return StateIdle
+		}
 		return StateCount2
 	}
 	// Check for doubled operator (dd, cc, yy) => linewise self-motion.

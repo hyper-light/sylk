@@ -227,8 +227,8 @@ func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
 			return m, e.action(m)
 		}
 	}
-	// Fall through: insert rune.
-	if k.Type == tea.KeyRunes {
+	// Fall through: insert rune (including space).
+	if k.Type == tea.KeyRunes || k.Type == tea.KeySpace {
 		m.insertRune([]rune(k.String()))
 		m.refilter()
 	}

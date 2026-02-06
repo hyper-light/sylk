@@ -1,7 +1,7 @@
 package lua
 
 import (
-	glua "github.com/yuin/gopher-lua"
+	rt "github.com/arnodel/golua/runtime"
 )
 
 // ---------------------------------------------------------------------------
@@ -11,8 +11,8 @@ import (
 // optScope describes how to get/set values for a particular vim.* scope.
 type optScope struct {
 	Name   string
-	Getter func(EditorAccess, *glua.LState, string) glua.LValue
-	Setter func(EditorAccess, *glua.LState, string, glua.LValue)
+	Getter func(EditorAccess, string) rt.Value
+	Setter func(EditorAccess, string, rt.Value)
 }
 
 // scopeTable is the authoritative mapping of Lua table name to scope
@@ -30,48 +30,57 @@ var scopeTable = []optScope{
 
 // registerOptTables creates userdata with metamethods for every scope
 // entry and attaches them to the vim table.
-func registerOptTables(L *glua.LState, vim *glua.LTable, editor EditorAccess) {
+func registerOptTables(_ *rt.Runtime, vim *rt.Table, editor EditorAccess) {
 	for _, scope := range scopeTable {
-		ud := newScopeUserdata(L, editor, scope)
-		vim.RawSetString(scope.Name, ud)
+		ud := newScopeUserdata(editor, scope)
+		vim.Set(rt.StringValue(scope.Name), ud)
 	}
 }
 
 // newScopeUserdata builds a Lua userdata whose metamethods proxy reads
 // and writes through the scope's getter/setter pair.
-func newScopeUserdata(L *glua.LState, editor EditorAccess, scope optScope) *glua.LUserData {
-	ud := L.NewUserData()
-	mt := L.NewTable()
+func newScopeUserdata(editor EditorAccess, scope optScope) rt.Value {
 	get := scope.Getter // capture for closure
 	set := scope.Setter
-	mt.RawSetString("__index", L.NewFunction(func(ls *glua.LState) int {
-		key := ls.ToString(2)
-		ls.Push(get(editor, ls, key))
-		return 1
-	}))
-	mt.RawSetString("__newindex", L.NewFunction(func(ls *glua.LState) int {
-		key := ls.ToString(2)
-		val := ls.Get(3)
-		set(editor, ls, key, val)
-		return 0
-	}))
-	L.SetMetatable(ud, mt)
-	return ud
+
+	mt := rt.NewTable()
+
+	setGoFunc(mt, "__index", func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+		// arg 0 = self (userdata), arg 1 = key
+		key, err := c.StringArg(1)
+		if err != nil {
+			return c.PushingNext1(t.Runtime, rt.NilValue), nil
+		}
+		return c.PushingNext1(t.Runtime, get(editor, key)), nil
+	}, 2, false)
+
+	setGoFunc(mt, "__newindex", func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+		key, err := c.StringArg(1)
+		if err != nil {
+			return c.Next(), nil
+		}
+		val := c.Arg(2)
+		set(editor, key, val)
+		return c.Next(), nil
+	}, 3, false)
+
+	ud := rt.NewUserData(nil, mt)
+	return rt.UserDataValue(ud)
 }
 
 // ---------------------------------------------------------------------------
 // Global options (vim.opt / vim.o)
 // ---------------------------------------------------------------------------
 
-func globalOptGet(editor EditorAccess, L *glua.LState, name string) glua.LValue {
+func globalOptGet(editor EditorAccess, name string) rt.Value {
 	val, ok := editor.GetOption(name)
 	if !ok {
-		return glua.LNil
+		return rt.NilValue
 	}
-	return goToLua(L, val)
+	return goToLua(val)
 }
 
-func globalOptSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue) {
+func globalOptSet(editor EditorAccess, name string, val rt.Value) {
 	editor.SetOption(name, luaToGo(val))
 }
 
@@ -79,19 +88,19 @@ func globalOptSet(editor EditorAccess, _ *glua.LState, name string, val glua.LVa
 // Buffer-local options (vim.bo)
 // ---------------------------------------------------------------------------
 
-func bufOptGet(editor EditorAccess, L *glua.LState, name string) glua.LValue {
+func bufOptGet(editor EditorAccess, name string) rt.Value {
 	buf := editor.CurrentBuffer()
 	if buf == nil {
-		return glua.LNil
+		return rt.NilValue
 	}
 	val, ok := buf.GetOption(name)
 	if !ok {
-		return glua.LNil
+		return rt.NilValue
 	}
-	return goToLua(L, val)
+	return goToLua(val)
 }
 
-func bufOptSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue) {
+func bufOptSet(editor EditorAccess, name string, val rt.Value) {
 	buf := editor.CurrentBuffer()
 	if buf == nil {
 		return
@@ -103,19 +112,19 @@ func bufOptSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue
 // Window-local options (vim.wo)
 // ---------------------------------------------------------------------------
 
-func winOptGet(editor EditorAccess, L *glua.LState, name string) glua.LValue {
+func winOptGet(editor EditorAccess, name string) rt.Value {
 	win := editor.CurrentWindow()
 	if win == nil {
-		return glua.LNil
+		return rt.NilValue
 	}
 	val, ok := win.GetOption(name)
 	if !ok {
-		return glua.LNil
+		return rt.NilValue
 	}
-	return goToLua(L, val)
+	return goToLua(val)
 }
 
-func winOptSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue) {
+func winOptSet(editor EditorAccess, name string, val rt.Value) {
 	win := editor.CurrentWindow()
 	if win == nil {
 		return
@@ -127,15 +136,15 @@ func winOptSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue
 // Global variables (vim.g)
 // ---------------------------------------------------------------------------
 
-func globalVarGet(editor EditorAccess, L *glua.LState, name string) glua.LValue {
+func globalVarGet(editor EditorAccess, name string) rt.Value {
 	val, ok := editor.GetVar(name)
 	if !ok {
-		return glua.LNil
+		return rt.NilValue
 	}
-	return goToLua(L, val)
+	return goToLua(val)
 }
 
-func globalVarSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue) {
+func globalVarSet(editor EditorAccess, name string, val rt.Value) {
 	editor.SetVar(name, luaToGo(val))
 }
 
@@ -143,19 +152,19 @@ func globalVarSet(editor EditorAccess, _ *glua.LState, name string, val glua.LVa
 // Buffer-local variables (vim.b)
 // ---------------------------------------------------------------------------
 
-func bufVarGet(editor EditorAccess, L *glua.LState, name string) glua.LValue {
+func bufVarGet(editor EditorAccess, name string) rt.Value {
 	buf := editor.CurrentBuffer()
 	if buf == nil {
-		return glua.LNil
+		return rt.NilValue
 	}
 	val, ok := buf.GetVar(name)
 	if !ok {
-		return glua.LNil
+		return rt.NilValue
 	}
-	return goToLua(L, val)
+	return goToLua(val)
 }
 
-func bufVarSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue) {
+func bufVarSet(editor EditorAccess, name string, val rt.Value) {
 	buf := editor.CurrentBuffer()
 	if buf == nil {
 		return
@@ -167,19 +176,19 @@ func bufVarSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue
 // Window-local variables (vim.w)
 // ---------------------------------------------------------------------------
 
-func winVarGet(editor EditorAccess, L *glua.LState, name string) glua.LValue {
+func winVarGet(editor EditorAccess, name string) rt.Value {
 	win := editor.CurrentWindow()
 	if win == nil {
-		return glua.LNil
+		return rt.NilValue
 	}
-	val, ok := win.GetOption(name) // windows expose vars through option iface
+	val, ok := win.GetOption(name)
 	if !ok {
-		return glua.LNil
+		return rt.NilValue
 	}
-	return goToLua(L, val)
+	return goToLua(val)
 }
 
-func winVarSet(editor EditorAccess, _ *glua.LState, name string, val glua.LValue) {
+func winVarSet(editor EditorAccess, name string, val rt.Value) {
 	win := editor.CurrentWindow()
 	if win == nil {
 		return

@@ -150,6 +150,19 @@ func computeReason(available, hasMarker bool) string {
 	return "binary available"
 }
 
+// SuggestServer returns a server definition that matches the file extension
+// and root markers but is NOT currently enabled (binary not available).
+// Returns nil if no installable suggestion exists.
+func (s *LSPSelector) SuggestServer(root, filePath string) *LanguageServerDefinition {
+	ext := normalizeExt(filePath)
+	for _, srv := range s.servers {
+		if matchesExt(srv, ext) && !isServerEnabled(srv) && hasRootMarker(srv, root) && srv.AutoDownload != nil {
+			return srv
+		}
+	}
+	return nil
+}
+
 func sortDetectionByConfidence(results []DetectionResult) {
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Confidence > results[j].Confidence

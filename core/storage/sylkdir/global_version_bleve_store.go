@@ -156,10 +156,10 @@ func (gvbs *GlobalVersionBleveStore) DocumentCount() (uint64, error) {
 	return gvbs.store.DocumentCount()
 }
 
-// SnapshotBleve prepares the target version's Bleve for incremental indexing.
-// Copies the parent Bleve to the target if available; otherwise creates a fresh
-// empty index. The caller (CommitToGlobal) handles indexing new documents and
-// deleting superseded ones — no full rebuild from doc data is performed here.
+// SnapshotBleve prepares the target version's Bleve by rebuilding from the
+// doc store. Bleve indices use UnsafeBatch (no WAL) so segment data is
+// volatile across close/reopen — directory copies produce empty indices.
+// Rebuilding from the cumulative doc store is the only reliable path.
 func (gvbs *GlobalVersionBleveStore) SnapshotBleve(parent, target SemanticVersion) error {
 	gvbs.mu.Lock()
 	defer gvbs.mu.Unlock()
@@ -171,21 +171,10 @@ func (gvbs *GlobalVersionBleveStore) SnapshotBleve(parent, target SemanticVersio
 		gvbs.store = nil
 	}
 
-	gvbs.copyParentBleve(parent, target)
-
 	gvbs.head = target
-	return gvbs.openOrCreateLocked()
+	return gvbs.rebuildLocked()
 }
 
-// copyParentBleve copies the parent's Bleve directory to the target version.
-// No-op if the parent has no Bleve database.
-func (gvbs *GlobalVersionBleveStore) copyParentBleve(parent, target SemanticVersion) {
-	parentDB := filepath.Join(gvbs.BlevePath(parent), "documents.bleve")
-	if _, err := os.Stat(parentDB); err != nil {
-		return
-	}
-	_ = copyDir(gvbs.BlevePath(parent), gvbs.BlevePath(target))
-}
 
 // SnapshotOrPromote prepares the target version's Bleve using the best available source.
 // On incremental boot, copies the parent global Bleve (contains all prior docs).

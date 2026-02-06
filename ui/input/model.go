@@ -29,6 +29,9 @@ type Model struct {
 	maxHeight int // Max visible rows before internal scroll
 	scrollOff int // First visible line when content exceeds maxHeight
 
+	// Selection state.
+	allSelected bool // Ctrl+A select-all active.
+
 	// Cursor blink state
 	cursorVisible bool
 	lastBlinkAt   time.Time
@@ -36,10 +39,11 @@ type Model struct {
 	history   *InputHistory
 	completer *Completer
 
-	theme   *theme.Theme
-	width   int
-	height  int
-	focused bool
+	theme       *theme.Theme
+	placeholder string // Idle text when empty and unfocused.
+	width       int
+	height      int
+	focused     bool
 }
 
 // Compile-time interface checks.
@@ -58,7 +62,58 @@ func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) 
 		history:       NewInputHistory(historyCapacity),
 		completer:     NewCompleter(providers...),
 		theme:         th,
+		placeholder:   "Type a message...",
 	}
+}
+
+// SetPlaceholder changes the idle text shown when the input is empty.
+func (m *Model) SetPlaceholder(text string) { m.placeholder = text }
+
+// SetText replaces the input content and positions the cursor at the end.
+func (m *Model) SetText(s string) { m.setText(s) }
+
+// Clear resets the input content to empty.
+func (m *Model) Clear() {
+	m.lines = [][]rune{nil}
+	m.cursorRow = 0
+	m.cursorCol = 0
+	m.scrollOff = 0
+	m.completer.Dismiss()
+}
+
+// SelectAll marks all input content as selected.
+func (m *Model) SelectAll() { m.allSelected = true }
+
+// HasSelection reports whether a selection is active.
+func (m *Model) HasSelection() bool { return m.allSelected && !m.isEmpty() }
+
+// SelectedText returns the selected text, or "" if nothing is selected.
+func (m *Model) SelectedText() string {
+	if !m.HasSelection() {
+		return ""
+	}
+	return m.Text()
+}
+
+// CutSelection copies the selected text and clears the input.
+func (m *Model) CutSelection() string {
+	text := m.SelectedText()
+	if text == "" {
+		return ""
+	}
+	m.Clear()
+	m.allSelected = false
+	return text
+}
+
+// clearSelectionContent replaces a select-all with an empty buffer, ready for
+// new input. No-op when nothing is selected.
+func (m *Model) clearSelectionContent() {
+	if !m.allSelected {
+		return
+	}
+	m.Clear()
+	m.allSelected = false
 }
 
 // ---------------------------------------------------------------------------
@@ -199,17 +254,34 @@ var normalKeys = []keyEntry{
 // handleKey dispatches a key message through the appropriate table.
 func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
 	m.resetBlink()
+
+	// Bracketed paste: replace selection if active, then insert.
+	if k.Paste && len(k.Runes) > 0 {
+		m.clearSelectionContent()
+		m.insertPaste(k.Runes)
+		m.completer.Dismiss()
+		return m, nil
+	}
+
+	// Backspace/Delete with selection: clear selected content.
+	if m.allSelected && (k.Type == tea.KeyBackspace || k.Type == tea.KeyDelete) {
+		m.clearSelectionContent()
+		return m, nil
+	}
+
 	if m.completer.IsActive() {
 		if cmd, handled := m.dispatch(completerKeys, k); handled {
 			return m, cmd
 		}
 	}
 	if cmd, handled := m.dispatch(normalKeys, k); handled {
+		m.allSelected = false
 		return m, cmd
 	}
-	// Fall through: insert printable characters (including space).
+	// Fall through: insert printable characters (replacing selection).
 	if k.Type == tea.KeyRunes || k.Type == tea.KeySpace {
-		m.insertRunes([]rune(k.String()))
+		m.clearSelectionContent()
+		m.insertRunes(k.Runes)
 		m.completer.Dismiss()
 	}
 	return m, nil
@@ -410,6 +482,23 @@ func (m *Model) insertRunes(rs []rune) {
 	m.cursorCol += len(rs)
 }
 
+// insertPaste handles bracketed paste by normalizing line endings and
+// splitting the pasted text into proper multi-line content.
+func (m *Model) insertPaste(runes []rune) {
+	text := string(runes)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+
+	parts := strings.Split(text, "\n")
+	m.insertRunes([]rune(parts[0]))
+	for _, part := range parts[1:] {
+		m.insertNewline()
+		if len(part) > 0 {
+			m.insertRunes([]rune(part))
+		}
+	}
+}
+
 // insertNewline splits the current line at the cursor.
 func (m *Model) insertNewline() {
 	line := m.lines[m.cursorRow]
@@ -550,7 +639,7 @@ func (m *Model) contentWidth() int {
 // renderBody renders the visible lines with cursor and placeholder.
 func (m *Model) renderBody() string {
 	if m.isEmpty() && !m.focused {
-		return m.theme.Placeholder.Render("Type a message...")
+		return m.theme.Placeholder.Render(m.placeholder)
 	}
 
 	visibleEnd := min(m.scrollOff+m.maxHeight, len(m.lines))

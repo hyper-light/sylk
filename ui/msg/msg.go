@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui/component"
 )
@@ -134,8 +135,130 @@ type OpenEditorMsg struct {
 type CloseEditorMsg struct{}
 
 // ---------------------------------------------------------------------------
+// LSP
+// ---------------------------------------------------------------------------
+
+// LSPDiagnosticMsg carries diagnostics from a language server for a file.
+type LSPDiagnosticMsg struct {
+	ServerID    string
+	FilePath    string
+	Diagnostics []lsp.Diagnostic
+}
+
+// LSPStatusMsg reports a change in LSP client status.
+type LSPStatusMsg struct {
+	ServerID    string
+	ProjectRoot string
+	Status      string // "starting", "ready", "error", "stopped"
+}
+
+// LSPProvisionDoneMsg signals that background LSP provisioning completed.
+type LSPProvisionDoneMsg struct {
+	Err error
+}
+
+// LSPServerMissingMsg is sent when a file is opened but the matching language
+// server binary is not installed. Carries enough context to trigger on-demand
+// installation and re-open the document afterwards.
+type LSPServerMissingMsg struct {
+	ServerID   string
+	ServerName string
+	FilePath   string
+	LanguageID string
+	Content    string
+}
+
+// LSPServerInstalledMsg reports the outcome of an on-demand server install.
+type LSPServerInstalledMsg struct {
+	ServerID   string
+	ServerName string
+	FilePath   string
+	LanguageID string
+	Content    string
+	Err        error
+}
+
+// LSPHoverRequestMsg is emitted by the editor when the user presses K
+// in normal mode, requesting hover information from the language server.
+type LSPHoverRequestMsg struct {
+	FilePath string
+	Line     int // 0-indexed
+	Col      int // 0-indexed (rune offset)
+}
+
+// LSPMouseHoverTickMsg is sent after a debounce delay when the mouse
+// hovers over a new position in the editor. If the mouse hasn't moved
+// since the tick was scheduled, a hover request is fired.
+type LSPMouseHoverTickMsg struct {
+	Line int
+	Col  int
+}
+
+// LSPDefinitionRequestMsg is emitted by the editor when the user triggers
+// go-to-definition (gd), requesting definition locations from the server.
+type LSPDefinitionRequestMsg struct {
+	FilePath string
+	Line     int
+	Col      int
+	ForHover bool // true when accompanying a hover tooltip
+}
+
+// LSPDocHighlightTickMsg is sent after a debounce delay when the cursor
+// rests on a symbol in normal mode, triggering a documentHighlight request.
+type LSPDocHighlightTickMsg struct {
+	Line int
+	Col  int
+}
+
+// LSPCompletionRequestMsg is emitted by the editor in insert mode to
+// request completion items from the language server.
+type LSPCompletionRequestMsg struct {
+	FilePath string
+	Line     int
+	Col      int
+}
+
+// LSPDocumentHighlightMsg carries document highlights from a language server.
+type LSPDocumentHighlightMsg struct {
+	FilePath   string
+	Line       int // anchor line for cache invalidation
+	Col        int
+	Highlights []lsp.DocumentHighlight
+	Err        error
+}
+
+// LSPCompletionMsg carries completion items from a language server.
+type LSPCompletionMsg struct {
+	FilePath string
+	Items    []lsp.CompletionItem
+	Err      error
+}
+
+// LSPHoverMsg carries hover information from a language server.
+type LSPHoverMsg struct {
+	FilePath string
+	Line     int // 0-indexed anchor line for positioning the tooltip
+	Col      int // 0-indexed anchor column
+	Result   *lsp.HoverResult
+	Err      error
+}
+
+// LSPDefinitionMsg carries definition locations from a language server.
+type LSPDefinitionMsg struct {
+	FilePath  string
+	Locations []lsp.Location
+	Err       error
+	ForHover  bool // true when accompanying a hover tooltip (don't navigate)
+}
+
+// ---------------------------------------------------------------------------
 // File tree
 // ---------------------------------------------------------------------------
+
+// NerdFontsResultMsg reports whether Nerd Font symbols were installed.
+type NerdFontsResultMsg struct {
+	Available bool
+}
 
 // FileOpenMsg requests displaying a file in the code viewer.
 type FileOpenMsg struct {
@@ -143,4 +266,48 @@ type FileOpenMsg struct {
 	Name     string
 	Language string
 	Line     int // 0 = top, >0 = scroll to this 1-based line.
+}
+
+// FileTreeNewFileMsg requests creation of a new file in the given directory.
+type FileTreeNewFileMsg struct {
+	Dir string // Parent directory for the new file.
+}
+
+// FileTreeNewDirMsg requests creation of a new directory in the given directory.
+type FileTreeNewDirMsg struct {
+	Dir string // Parent directory for the new directory.
+}
+
+// FileTreeRenameMsg requests renaming the entry at Path.
+type FileTreeRenameMsg struct {
+	Path  string
+	IsDir bool
+}
+
+// FileTreeDeleteMsg requests deletion of the entry at Path.
+type FileTreeDeleteMsg struct {
+	Path  string
+	IsDir bool
+}
+
+// FileTreeEntryCreatedMsg is emitted after a new file or directory is
+// successfully created via the inline new-entry input.
+type FileTreeEntryCreatedMsg struct {
+	Path  string
+	IsDir bool
+}
+
+// FileTreeEntryDeletedMsg is emitted after a file or directory is
+// successfully deleted via the inline delete confirmation.
+type FileTreeEntryDeletedMsg struct {
+	Path  string
+	IsDir bool
+}
+
+// FileTreeEntryRenamedMsg is emitted after a file or directory is
+// successfully renamed via the inline rename input.
+type FileTreeEntryRenamedMsg struct {
+	OldPath string
+	NewPath string
+	IsDir   bool
 }

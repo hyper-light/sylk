@@ -62,6 +62,11 @@ func (jl *JumpList) Forward() (JumpEntry, bool) {
 	return jl.entryAt(jl.cursor), true
 }
 
+// CanBack reports whether a backward jump is available.
+func (jl *JumpList) CanBack() bool {
+	return jl.cursor > 0
+}
+
 // Len returns the number of entries in the jump list.
 func (jl *JumpList) Len() int {
 	return jl.count

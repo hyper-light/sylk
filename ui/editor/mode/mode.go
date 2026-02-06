@@ -64,12 +64,14 @@ func ModeIcon(m Mode) string {
 
 // EditorState is the shared mutable state passed to every mode handler.
 type EditorState struct {
-	Buffer     *buffer.PieceTable
-	LineIndex  *buffer.LineIndex
-	Cursor     int
-	CursorLine int
-	CursorCol  int
-	UndoTree   *buffer.UndoTree
+	Buffer            *buffer.PieceTable
+	LineIndex         *buffer.LineIndex
+	Cursor            int
+	CursorLine        int
+	CursorCol         int
+	UndoTree          *buffer.UndoTree
+	InStringOrComment bool   // set by the model from tree-sitter or highlight regions
+	CursorNodeType    string // tree-sitter node type at cursor position
 }
 
 // SyncCursorPos updates CursorLine and CursorCol from the absolute Cursor

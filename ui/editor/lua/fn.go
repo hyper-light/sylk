@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	glua "github.com/yuin/gopher-lua"
+	rt "github.com/arnodel/golua/runtime"
 )
 
 // ---------------------------------------------------------------------------
@@ -15,7 +15,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // vimFn is a Go handler for one vim.fn.* function.
-type vimFn func(L *glua.LState, rt *Runtime) int
+type vimFn func(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error)
 
 // fnEntry pairs a vim function name with its handler.
 type fnEntry struct {
@@ -75,22 +75,24 @@ func init() {
 
 // registerFnTable sets up vim.fn with an __index metamethod so that
 // vim.fn.foo(args) dispatches to the handler registered for "foo".
-func registerFnTable(L *glua.LState, tbl *glua.LTable, rt *Runtime) {
-	mt := L.NewTable()
-	mt.RawSetString("__index", L.NewFunction(func(ls *glua.LState) int {
-		name := ls.ToString(2)
+func registerFnTable(_ *rt.Runtime, tbl *rt.Table, luaRT *Runtime) {
+	mt := rt.NewTable()
+	setGoFunc(mt, "__index", func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+		name, err := c.StringArg(1) // arg 0 = self, arg 1 = key
+		if err != nil {
+			return c.PushingNext1(t.Runtime, rt.NilValue), nil
+		}
 		handler, ok := fnLookup[name]
 		if !ok {
-			ls.Push(glua.LNil)
-			return 1
+			return c.PushingNext1(t.Runtime, rt.NilValue), nil
 		}
 		fn := handler // capture
-		ls.Push(ls.NewFunction(func(inner *glua.LState) int {
-			return fn(inner, rt)
-		}))
-		return 1
-	}))
-	L.SetMetatable(tbl, mt)
+		goFn := rt.NewGoFunction(func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return fn(t, c, luaRT)
+		}, name, defaultMaxArgs, true)
+		return c.PushingNext1(t.Runtime, rt.FunctionValue(goFn)), nil
+	}, 2, false)
+	tbl.SetMetatable(mt)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +123,13 @@ type fnameMod struct {
 
 // fnameModTable is the table-driven modifier set.
 var fnameModTable = []fnameMod{
-	{Suffix: ":p", Apply: func(p string) string { a, err := filepath.Abs(p); if err != nil { return p }; return a }},
+	{Suffix: ":p", Apply: func(p string) string {
+		a, err := filepath.Abs(p)
+		if err != nil {
+			return p
+		}
+		return a
+	}},
 	{Suffix: ":h", Apply: filepath.Dir},
 	{Suffix: ":t", Apply: filepath.Base},
 	{Suffix: ":r", Apply: func(p string) string { return strings.TrimSuffix(p, filepath.Ext(p)) }},
@@ -129,92 +137,98 @@ var fnameModTable = []fnameMod{
 }
 
 // ---------------------------------------------------------------------------
-// Lua type numbers (vim convention)
+// Vim type numbers — resolved via Try* methods rather than a type map
 // ---------------------------------------------------------------------------
 
-// vimTypeNumber maps Lua type identifiers to vim-style type integers.
-var vimTypeNumber = map[glua.LValueType]int{
-	glua.LTNumber: 0,
-	glua.LTString: 1,
-	// func = 2
-	glua.LTTable: 3,
-	// dict = 4 (tables serve as both in Lua)
-	glua.LTBool:   6,
-	glua.LTNil:    7,
+// vimTypeOf maps a golua Value to a vim-convention type integer.
+func vimTypeOf(v rt.Value) int {
+	type typeCheck struct {
+		check  func(rt.Value) bool
+		typeID int
+	}
+	checks := []typeCheck{
+		{check: func(v rt.Value) bool { return v.IsNil() }, typeID: 7},
+		{check: func(v rt.Value) bool { _, ok := v.TryInt(); return ok }, typeID: 0},
+		{check: func(v rt.Value) bool { _, ok := v.TryFloat(); return ok }, typeID: 0},
+		{check: func(v rt.Value) bool { _, ok := v.TryString(); return ok }, typeID: 1},
+		{check: func(v rt.Value) bool { _, ok := v.TryCallable(); return ok }, typeID: 2},
+		{check: func(v rt.Value) bool { _, ok := v.TryTable(); return ok }, typeID: 3},
+		{check: func(v rt.Value) bool { _, ok := v.TryBool(); return ok }, typeID: 6},
+	}
+	for _, tc := range checks {
+		if tc.check(v) {
+			return tc.typeID
+		}
+	}
+	return -1
 }
 
 // ---------------------------------------------------------------------------
 // Handler implementations
 // ---------------------------------------------------------------------------
 
-func fnExpand(L *glua.LState, rt *Runtime) int {
-	expr := L.ToString(1)
-	result := expandExpr(expr, rt)
-	L.Push(glua.LString(result))
-	return 1
+func fnExpand(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	expr, _ := c.StringArg(0)
+	result := expandExpr(expr, luaRT)
+	return c.PushingNext1(t.Runtime, rt.StringValue(result)), nil
 }
 
 // expandExpr resolves vim-style expansion tokens.
-func expandExpr(expr string, rt *Runtime) string {
+func expandExpr(expr string, luaRT *Runtime) string {
 	type expander struct {
 		Token   string
 		Resolve func(*Runtime) string
 	}
 	expanders := []expander{
-		{Token: "%", Resolve: func(rt *Runtime) string {
-			buf := rt.editor.CurrentBuffer()
-			if buf == nil { return "" }
+		{Token: "%", Resolve: func(r *Runtime) string {
+			buf := r.editor.CurrentBuffer()
+			if buf == nil {
+				return ""
+			}
 			return buf.Name()
 		}},
-		{Token: "#", Resolve: func(_ *Runtime) string { return "" }}, // no alternate file concept yet
+		{Token: "#", Resolve: func(_ *Runtime) string { return "" }},
 	}
 	for _, e := range expanders {
 		if expr == e.Token {
-			return e.Resolve(rt)
+			return e.Resolve(luaRT)
 		}
 	}
 	return expr
 }
 
-func fnGlob(L *glua.LState, _ *Runtime) int {
-	pattern := L.ToString(1)
+func fnGlob(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	pattern, _ := c.StringArg(0)
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
-	L.Push(glua.LString(strings.Join(matches, "\n")))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(strings.Join(matches, "\n"))), nil
 }
 
-func fnFilereadable(L *glua.LState, _ *Runtime) int {
-	path := L.ToString(1)
+func fnFilereadable(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	path, _ := c.StringArg(0)
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
-	L.Push(glua.LNumber(1))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 }
 
-func fnIsdirectory(L *glua.LState, _ *Runtime) int {
-	path := L.ToString(1)
+func fnIsdirectory(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	path, _ := c.StringArg(0)
 	info, err := os.Stat(path)
 	if err != nil || !info.IsDir() {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
-	L.Push(glua.LNumber(1))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 }
 
-func fnFnamemodify(L *glua.LState, _ *Runtime) int {
-	path := L.ToString(1)
-	mods := L.ToString(2)
+func fnFnamemodify(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	path, _ := c.StringArg(0)
+	mods, _ := c.StringArg(1)
 	result := applyFnameModifiers(path, mods)
-	L.Push(glua.LString(result))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(result)), nil
 }
 
 // applyFnameModifiers iterates the modifier table, applying each matching
@@ -233,41 +247,37 @@ func applyFnameModifiers(path, mods string) string {
 			}
 		}
 		if !applied {
-			break // unknown modifier -- stop processing
+			break
 		}
 	}
 	return result
 }
 
-func fnSystem(L *glua.LState, _ *Runtime) int {
-	cmdStr := L.ToString(1)
+func fnSystem(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	cmdStr, _ := c.StringArg(0)
 	out, err := exec.Command("sh", "-c", cmdStr).Output()
 	if err != nil {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
-	L.Push(glua.LString(string(out)))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(string(out))), nil
 }
 
-func fnTrim(L *glua.LState, _ *Runtime) int {
-	L.Push(glua.LString(strings.TrimSpace(L.ToString(1))))
-	return 1
+func fnTrim(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	s, _ := c.StringArg(0)
+	return c.PushingNext1(t.Runtime, rt.StringValue(strings.TrimSpace(s))), nil
 }
 
-func fnSubstitute(L *glua.LState, _ *Runtime) int {
-	str := L.ToString(1)
-	pat := L.ToString(2)
-	sub := L.ToString(3)
-	flags := L.ToString(4)
+func fnSubstitute(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	str, _ := c.StringArg(0)
+	pat, _ := c.StringArg(1)
+	sub, _ := c.StringArg(2)
+	flags, _ := c.StringArg(3)
 	re, err := regexp.Compile(pat)
 	if err != nil {
-		L.Push(glua.LString(str))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue(str)), nil
 	}
 	result := applySubstitution(re, str, sub, flags)
-	L.Push(glua.LString(result))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(result)), nil
 }
 
 // applySubstitution replaces matches in str.  The "g" flag replaces all.
@@ -275,7 +285,6 @@ func applySubstitution(re *regexp.Regexp, str, sub, flags string) string {
 	if strings.Contains(flags, "g") {
 		return re.ReplaceAllString(str, sub)
 	}
-	// Replace only first occurrence.
 	loc := re.FindStringIndex(str)
 	if loc == nil {
 		return str
@@ -283,116 +292,98 @@ func applySubstitution(re *regexp.Regexp, str, sub, flags string) string {
 	return str[:loc[0]] + sub + str[loc[1]:]
 }
 
-func fnMatch(L *glua.LState, _ *Runtime) int {
-	str := L.ToString(1)
-	pat := L.ToString(2)
+func fnMatch(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	str, _ := c.StringArg(0)
+	pat, _ := c.StringArg(1)
 	re, err := regexp.Compile(pat)
 	if err != nil {
-		L.Push(glua.LNumber(-1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(-1)), nil
 	}
 	loc := re.FindStringIndex(str)
 	if loc == nil {
-		L.Push(glua.LNumber(-1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(-1)), nil
 	}
-	L.Push(glua.LNumber(loc[0]))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(loc[0]))), nil
 }
 
-func fnMatchstr(L *glua.LState, _ *Runtime) int {
-	str := L.ToString(1)
-	pat := L.ToString(2)
+func fnMatchstr(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	str, _ := c.StringArg(0)
+	pat, _ := c.StringArg(1)
 	re, err := regexp.Compile(pat)
 	if err != nil {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
 	m := re.FindString(str)
-	L.Push(glua.LString(m))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(m)), nil
 }
 
-func fnSplit(L *glua.LState, _ *Runtime) int {
-	str := L.ToString(1)
-	pat := L.ToString(2)
+func fnSplit(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	str, _ := c.StringArg(0)
+	pat, _ := c.StringArg(1)
 	re, err := regexp.Compile(pat)
 	if err != nil {
-		tbl := L.NewTable()
-		tbl.Append(glua.LString(str))
-		L.Push(tbl)
-		return 1
+		tbl := rt.NewTable()
+		tbl.Set(rt.IntValue(1), rt.StringValue(str))
+		return c.PushingNext1(t.Runtime, rt.TableValue(tbl)), nil
 	}
 	parts := re.Split(str, -1)
-	L.Push(stringsToTable(L, parts))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.TableValue(stringsToTable(parts))), nil
 }
 
-func fnJoin(L *glua.LState, _ *Runtime) int {
-	listTbl, ok := L.Get(1).(*glua.LTable)
+func fnJoin(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	listTbl, ok := c.Arg(0).TryTable()
 	if !ok {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
-	sep := L.ToString(2)
+	sep, _ := c.StringArg(1)
 	parts := luaTableToStrings(listTbl)
-	L.Push(glua.LString(strings.Join(parts, sep)))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(strings.Join(parts, sep))), nil
 }
 
-func fnLen(L *glua.LState, _ *Runtime) int {
-	val := L.Get(1)
+func fnLen(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	val := c.Arg(0)
 	length := luaValueLen(val)
-	L.Push(glua.LNumber(length))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(length))), nil
 }
 
 // luaValueLen returns the "length" of a Lua value (string len or table len).
-func luaValueLen(v glua.LValue) int {
-	type measurer struct {
-		Match func(glua.LValue) bool
-		Len   func(glua.LValue) int
+func luaValueLen(v rt.Value) int {
+	if s, ok := v.TryString(); ok {
+		return len(s)
 	}
-	measurers := []measurer{
-		{Match: func(v glua.LValue) bool { _, ok := v.(glua.LString); return ok },
-			Len: func(v glua.LValue) int { return len(string(v.(glua.LString))) }},
-		{Match: func(v glua.LValue) bool { _, ok := v.(*glua.LTable); return ok },
-			Len: func(v glua.LValue) int { return v.(*glua.LTable).Len() }},
-	}
-	for _, m := range measurers {
-		if m.Match(v) {
-			return m.Len(v)
-		}
+	if tbl, ok := v.TryTable(); ok {
+		return int(tbl.Len())
 	}
 	return 0
 }
 
-func fnEmpty(L *glua.LState, _ *Runtime) int {
-	val := L.Get(1)
+func fnEmpty(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	val := c.Arg(0)
 	result := luaValueEmpty(val)
-	L.Push(glua.LNumber(result))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(result))), nil
 }
 
 // luaValueEmpty returns 1 if the value is "empty" (vim semantics), 0 otherwise.
-func luaValueEmpty(v glua.LValue) int {
+func luaValueEmpty(v rt.Value) int {
 	type checker struct {
-		Match func(glua.LValue) bool
-		Empty func(glua.LValue) bool
+		Match func(rt.Value) bool
+		Empty func(rt.Value) bool
 	}
 	checkers := []checker{
-		{Match: func(v glua.LValue) bool { return v == glua.LNil },
-			Empty: func(_ glua.LValue) bool { return true }},
-		{Match: func(v glua.LValue) bool { _, ok := v.(glua.LString); return ok },
-			Empty: func(v glua.LValue) bool { return string(v.(glua.LString)) == "" }},
-		{Match: func(v glua.LValue) bool { _, ok := v.(glua.LNumber); return ok },
-			Empty: func(v glua.LValue) bool { return float64(v.(glua.LNumber)) == 0 }},
-		{Match: func(v glua.LValue) bool { _, ok := v.(*glua.LTable); return ok },
-			Empty: func(v glua.LValue) bool { return v.(*glua.LTable).Len() == 0 }},
+		{Match: func(v rt.Value) bool { return v.IsNil() },
+			Empty: func(_ rt.Value) bool { return true }},
+		{Match: func(v rt.Value) bool { _, ok := v.TryString(); return ok },
+			Empty: func(v rt.Value) bool { s, _ := v.TryString(); return s == "" }},
+		{Match: func(v rt.Value) bool { _, ok := v.TryInt(); return ok },
+			Empty: func(v rt.Value) bool { n, _ := v.TryInt(); return n == 0 }},
+		{Match: func(v rt.Value) bool { _, ok := v.TryFloat(); return ok },
+			Empty: func(v rt.Value) bool { f, _ := v.TryFloat(); return f == 0 }},
+		{Match: func(v rt.Value) bool { _, ok := v.TryTable(); return ok },
+			Empty: func(v rt.Value) bool { tbl, _ := v.TryTable(); return tbl.Len() == 0 }},
 	}
-	for _, c := range checkers {
-		if c.Match(v) {
-			if c.Empty(v) {
+	for _, ck := range checkers {
+		if ck.Match(v) {
+			if ck.Empty(v) {
 				return 1
 			}
 			return 0
@@ -401,90 +392,76 @@ func luaValueEmpty(v glua.LValue) int {
 	return 1
 }
 
-func fnHas(L *glua.LState, _ *Runtime) int {
-	feature := L.ToString(1)
+func fnHas(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	feature, _ := c.StringArg(0)
 	_, ok := supportedFeatures[feature]
 	if ok {
-		L.Push(glua.LNumber(1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 	}
-	L.Push(glua.LNumber(0))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 }
 
-func fnExists(L *glua.LState, _ *Runtime) int {
-	expr := L.ToString(1)
-	// Check if the name exists as a vim.fn.* function.
+func fnExists(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	expr, _ := c.StringArg(0)
 	_, ok := fnLookup[expr]
 	if ok {
-		L.Push(glua.LNumber(1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 	}
-	L.Push(glua.LNumber(0))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 }
 
-func fnType(L *glua.LState, _ *Runtime) int {
-	val := L.Get(1)
-	typeNum, ok := vimTypeNumber[val.Type()]
-	if !ok {
-		// Functions are type 2 in vim.
-		if val.Type() == glua.LTFunction {
-			L.Push(glua.LNumber(2))
-			return 1
-		}
-		L.Push(glua.LNumber(-1))
-		return 1
-	}
-	L.Push(glua.LNumber(typeNum))
-	return 1
+func fnType(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	val := c.Arg(0)
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(vimTypeOf(val)))), nil
 }
 
-func fnLine(L *glua.LState, rt *Runtime) int {
-	expr := L.ToString(1)
-	line := resolveLineExpr(expr, rt)
-	L.Push(glua.LNumber(line))
-	return 1
+func fnLine(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	expr, _ := c.StringArg(0)
+	line := resolveLineExpr(expr, luaRT)
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(line))), nil
 }
 
 // resolveLineExpr maps vim-style line expressions to actual line numbers.
-func resolveLineExpr(expr string, rt *Runtime) int {
+func resolveLineExpr(expr string, luaRT *Runtime) int {
 	type lineResolver struct {
 		Token   string
 		Resolve func(*Runtime) int
 	}
 	resolvers := []lineResolver{
-		{Token: ".", Resolve: func(rt *Runtime) int {
-			win := rt.editor.CurrentWindow()
-			if win == nil { return 0 }
+		{Token: ".", Resolve: func(r *Runtime) int {
+			win := r.editor.CurrentWindow()
+			if win == nil {
+				return 0
+			}
 			line, _ := win.GetCursor()
 			return line
 		}},
-		{Token: "$", Resolve: func(rt *Runtime) int {
-			buf := rt.editor.CurrentBuffer()
-			if buf == nil { return 0 }
+		{Token: "$", Resolve: func(r *Runtime) int {
+			buf := r.editor.CurrentBuffer()
+			if buf == nil {
+				return 0
+			}
 			return buf.LineCount()
 		}},
 	}
 	for _, r := range resolvers {
 		if expr == r.Token {
-			return r.Resolve(rt)
+			return r.Resolve(luaRT)
 		}
 	}
 	return 0
 }
 
-func fnCol(L *glua.LState, rt *Runtime) int {
-	expr := L.ToString(1)
-	col := resolveColExpr(expr, rt)
-	L.Push(glua.LNumber(col))
-	return 1
+func fnCol(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	expr, _ := c.StringArg(0)
+	col := resolveColExpr(expr, luaRT)
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(col))), nil
 }
 
 // resolveColExpr maps vim-style column expressions.
-func resolveColExpr(expr string, rt *Runtime) int {
+func resolveColExpr(expr string, luaRT *Runtime) int {
 	if expr == "." {
-		win := rt.editor.CurrentWindow()
+		win := luaRT.editor.CurrentWindow()
 		if win == nil {
 			return 0
 		}
@@ -494,76 +471,62 @@ func resolveColExpr(expr string, rt *Runtime) int {
 	return 0
 }
 
-func fnGetline(L *glua.LState, rt *Runtime) int {
-	lnum := L.ToInt(1)
-	buf := rt.editor.CurrentBuffer()
+func fnGetline(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	lnum, _ := c.IntArg(0)
+	buf := luaRT.editor.CurrentBuffer()
 	if buf == nil {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
-	lines := buf.GetLines(lnum-1, lnum) // vim is 1-indexed
+	lines := buf.GetLines(int(lnum)-1, int(lnum))
 	if len(lines) == 0 {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
-	L.Push(glua.LString(lines[0]))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(lines[0])), nil
 }
 
-func fnSetline(L *glua.LState, rt *Runtime) int {
-	lnum := L.ToInt(1)
-	text := L.ToString(2)
-	buf := rt.editor.CurrentBuffer()
+func fnSetline(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	lnum, _ := c.IntArg(0)
+	text, _ := c.StringArg(1)
+	buf := luaRT.editor.CurrentBuffer()
 	if buf == nil {
-		L.Push(glua.LNumber(1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 	}
-	err := buf.SetLines(lnum-1, lnum, []string{text})
+	err := buf.SetLines(int(lnum)-1, int(lnum), []string{text})
 	if err != nil {
-		L.Push(glua.LNumber(1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 	}
-	L.Push(glua.LNumber(0))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 }
 
-func fnAppend(L *glua.LState, rt *Runtime) int {
-	lnum := L.ToInt(1)
-	text := L.ToString(2)
-	buf := rt.editor.CurrentBuffer()
+func fnAppend(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	lnum, _ := c.IntArg(0)
+	text, _ := c.StringArg(1)
+	buf := luaRT.editor.CurrentBuffer()
 	if buf == nil {
-		L.Push(glua.LNumber(1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 	}
-	// Append inserts a line after lnum.
-	err := buf.SetLines(lnum, lnum, []string{text})
+	err := buf.SetLines(int(lnum), int(lnum), []string{text})
 	if err != nil {
-		L.Push(glua.LNumber(1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 	}
-	L.Push(glua.LNumber(0))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 }
 
-func fnIndent(L *glua.LState, rt *Runtime) int {
-	lnum := L.ToInt(1)
-	buf := rt.editor.CurrentBuffer()
+func fnIndent(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	lnum, _ := c.IntArg(0)
+	buf := luaRT.editor.CurrentBuffer()
 	if buf == nil {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
-	lines := buf.GetLines(lnum-1, lnum)
+	lines := buf.GetLines(int(lnum)-1, int(lnum))
 	if len(lines) == 0 {
-		L.Push(glua.LNumber(0))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 	}
 	level := countLeadingSpaces(lines[0])
-	L.Push(glua.LNumber(level))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(level))), nil
 }
 
-// countLeadingSpaces counts the number of leading space/tab characters,
-// treating each tab as one indent unit.
+// countLeadingSpaces counts the number of leading space/tab characters.
 func countLeadingSpaces(s string) int {
 	count := 0
 	for _, ch := range s {
@@ -575,29 +538,22 @@ func countLeadingSpaces(s string) int {
 	return count
 }
 
-func fnBufnr(L *glua.LState, _ *Runtime) int {
-	// In Neovim, bufnr('%') returns current buffer id.
-	// We return 0 (the convention for "current").
-	L.Push(glua.LNumber(0))
-	return 1
+func fnBufnr(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	return c.PushingNext1(t.Runtime, rt.IntValue(0)), nil
 }
 
-func fnBufname(L *glua.LState, rt *Runtime) int {
-	buf := rt.editor.CurrentBuffer()
+func fnBufname(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	buf := luaRT.editor.CurrentBuffer()
 	if buf == nil {
-		L.Push(glua.LString(""))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.StringValue("")), nil
 	}
-	L.Push(glua.LString(buf.Name()))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.StringValue(buf.Name())), nil
 }
 
-func fnWinnr(L *glua.LState, _ *Runtime) int {
-	L.Push(glua.LNumber(1)) // single-window model: always window 1
-	return 1
+func fnWinnr(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 }
 
-func fnTabpagenr(L *glua.LState, _ *Runtime) int {
-	L.Push(glua.LNumber(1)) // single-tab model: always tab 1
-	return 1
+func fnTabpagenr(t *rt.Thread, c *rt.GoCont, _ *Runtime) (rt.Cont, error) {
+	return c.PushingNext1(t.Runtime, rt.IntValue(1)), nil
 }

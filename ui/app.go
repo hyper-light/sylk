@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,16 +16,20 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/session"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/bridge"
 	"github.com/adalundhe/sylk/ui/chat"
-	"github.com/adalundhe/sylk/ui/editor/register"
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/editor"
+	"github.com/adalundhe/sylk/ui/editor/mode"
+	"github.com/adalundhe/sylk/ui/editor/register"
 	"github.com/adalundhe/sylk/ui/filetree"
+	"github.com/adalundhe/sylk/ui/fonts"
 	inputpkg "github.com/adalundhe/sylk/ui/input"
 	"github.com/adalundhe/sylk/ui/interrupt"
 	knowledgepkg "github.com/adalundhe/sylk/ui/knowledge"
@@ -42,10 +47,21 @@ import (
 const tickInterval = 16 * time.Millisecond
 
 // shutdownGrace is the grace period for goroutine shutdown.
-const shutdownGrace = 3 * time.Second
+// Derived from: once contexts are cancelled, goroutines exit within ms.
+const shutdownGrace = 1 * time.Second
 
-// shutdownHard is the hard deadline for goroutine shutdown.
-const shutdownHard = 5 * time.Second
+// shutdownHard is the hard deadline for goroutine shutdown after force cancel.
+const shutdownHard = 2 * time.Second
+
+// lspDebounceInterval is the delay after the last keystroke before sending
+// a didChange notification. Derived from: typical typing speed ~5 chars/sec
+// = 200ms between keystrokes; 300ms batches rapid edits while staying
+// responsive. Standard for LSP clients (VSCode uses 300ms).
+const lspDebounceInterval = 300 * time.Millisecond
+
+// lspNotifyTimeout bounds fire-and-forget LSP notifications (didSave, didClose).
+// Derived from: these are thin JSON-RPC writes to a local process; 5s is ample.
+const lspNotifyTimeout = 5 * time.Second
 
 // sourceAgentTUI identifies the TUI as the source agent for guide routing.
 const sourceAgentTUI = "tui"
@@ -53,6 +69,17 @@ const sourceAgentTUI = "tui"
 // ---------------------------------------------------------------------------
 // Overlay state
 // ---------------------------------------------------------------------------
+
+// editorSnapshot captures the state of the inline editor for one file,
+// allowing users to switch between files without losing unsaved edits.
+type editorSnapshot struct {
+	filePath     string
+	content      string
+	language     string
+	cursor       int
+	scrollOffset int
+	modified     bool
+}
 
 // overlayState tracks which overlay (if any) is currently active.
 type overlayState int
@@ -140,6 +167,10 @@ type Deps struct {
 
 // AppModel is the root Bubble Tea model that composes all TUI components.
 type AppModel struct {
+	// Lifecycle context — cancelled on Shutdown to abort in-flight Cmds.
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// Configuration
 	config Config
 
@@ -171,6 +202,11 @@ type AppModel struct {
 	sessionBridge  *bridge.SessionBridge
 	streamBridge   *bridge.StreamBridge
 	guideBridge    *bridge.GuideBridge
+	lspBridge      *bridge.LSPBridge
+
+	// LSP
+	lspManager    *lsp.Manager
+	lspInstalling map[lsp.ServerID]bool // Tracks in-progress on-demand installs.
 
 	// Interrupt
 	interruptHandler *interrupt.Handler
@@ -189,9 +225,45 @@ type AppModel struct {
 	bounceSpring      harmonica.Spring // Underdamped spring for overscroll bounce.
 	bounce            bounceState     // Current bounce animation state.
 	swipe             swipeState      // Horizontal scroll accumulation for ring cycling.
-	width             int
-	height            int
-	ready             bool
+
+	// Inline editor (Alt+E edit mode).
+	inlineEditor  *editor.Model     // Vim editor rendered in the code panel slot.
+	editMode      bool              // Whether inline editing is active.
+	savedLeftIdx  int               // Saved leftRing.index before edit mode.
+	savedRightIdx int               // Saved rightRing.index before edit mode.
+	savedFocus    component.FocusID // Saved focus target before edit mode.
+
+	// Mouse drag tracking for inline editor selection.
+	editorMouseDown bool // Left button pressed inside the code panel.
+	editorDragging  bool // Actual drag motion detected after press.
+
+	// Mouse hover tracking for LSP hover tooltips.
+	hoverMouseLine      int // last buffer line the mouse was over (-1 = none)
+	hoverMouseCol       int // last buffer col for LSP request precision
+	hoverMouseWordStart int // start col of the word under cursor
+	hoverPending        bool
+
+	// Pending hover definition: stashed when the definition response arrives
+	// before the hover content. Applied when the hover becomes active.
+	pendingHoverSymbol  string
+	pendingHoverPkgPath string
+
+	// Document highlight tracking (cursor-rest symbol highlighting).
+	highlightLine int // last line a highlight debounce was scheduled for
+	highlightCol  int // last col a highlight debounce was scheduled for
+
+	// Command input tracking: true when ':' activated the input panel.
+	editCmdInput bool
+
+	// Per-file editor snapshots for multi-file editing within a session.
+	editSnapshots map[string]*editorSnapshot
+
+	width  int
+	height int
+	ready  bool
+
+	// Font detection result cached from New() to avoid repeated fc-list calls.
+	nerdFontsDetected bool
 }
 
 // viewRing tracks a cycling list of panels for a swappable layout slot.
@@ -234,6 +306,17 @@ func (r *viewRing) reset(panels []component.FocusID) {
 	}
 }
 
+// setTo positions the ring on the given panel. Returns true if found.
+func (r *viewRing) setTo(id component.FocusID) bool {
+	for i, p := range r.panels {
+		if p == id {
+			r.index = i
+			return true
+		}
+	}
+	return false
+}
+
 // empty reports whether the ring has no panels to cycle.
 func (r *viewRing) empty() bool { return len(r.panels) == 0 }
 
@@ -261,10 +344,17 @@ type swipeState struct {
 }
 
 // New creates a root AppModel from configuration and dependencies.
-func New(cfg Config, deps Deps) *AppModel {
+func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
+	// Ensure managed LSP binaries are discoverable before any server
+	// selection occurs. Must precede NewManager / selector creation.
+	lsp.EnsureManagedBinOnPath()
+
+	appCtx, appCancel := context.WithCancel(ctx)
 	th := cfg.Theme()
 
 	app := &AppModel{
+		ctx:              appCtx,
+		cancel:           appCancel,
 		config:           cfg,
 		deps:             deps,
 		layout:           layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
@@ -278,27 +368,56 @@ func New(cfg Config, deps Deps) *AppModel {
 		knowledgePanel:   knowledgepkg.New(th),
 		fileTree:         filetree.New(th),
 		editorOverlay:    editor.New(th),
+		inlineEditor:     editor.New(th),
+		editSnapshots:    make(map[string]*editorSnapshot),
 		modalOverlay:     modal.New(th),
 		searchOverlay:    search.New(th, search.NewProviderRegistry()),
 		activityBridge:   bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
 		sessionBridge:    bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
 		streamBridge:     bridge.NewStreamBridge(deps.Scope),
 		guideBridge:      bridge.NewGuideBridge(deps.GuideBus, deps.Scope),
+		lspManager:       lsp.NewManager(deps.Scope),
+		lspInstalling:    make(map[lsp.ServerID]bool),
 		interruptHandler: interrupt.NewHandler(),
 		clipboard:        register.NewOSClipboard(),
 		scrollSpring:     harmonica.NewSpring(harmonica.FPS(scrollFPS), scrollFrequency, scrollDamping),
 		bounceSpring:     harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
+		hoverMouseLine:   -1,
+		highlightLine:   -1,
 	}
+	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
 	app.syncFocusState()
+
+	// Nerd Font detection: the font must be installed AND a fontconfig
+	// fallback snippet must be in place (so VTE terminals like Terminator
+	// resolve PUA codepoints to Symbols Nerd Font).
+	app.nerdFontsDetected = fonts.Detected()
+	app.fileTree.SetNerdFonts(app.nerdFontsDetected)
+
 	return app
 }
 
-// Init starts all event bridges and the tick timer.
+// Init starts all event bridges, the tick timer, and background LSP provisioning.
 func (m *AppModel) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.startBridges(),
 		m.tickCmd(),
-	)
+		m.provisionLSPServers(),
+	}
+	if !m.nerdFontsDetected {
+		cmds = append(cmds, m.installNerdFontsCmd())
+	}
+	return tea.Batch(cmds...)
+}
+
+// installNerdFontsCmd returns a Cmd that downloads and installs Nerd Font
+// symbols in the background, cancellable via the app context.
+func (m *AppModel) installNerdFontsCmd() tea.Cmd {
+	ctx := m.ctx
+	return func() tea.Msg {
+		err := fonts.InstallCtx(ctx)
+		return msg.NerdFontsResultMsg{Available: err == nil}
+	}
 }
 
 // Update dispatches incoming messages to the appropriate handler.
@@ -311,6 +430,23 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseMsg:
 		return m, m.handleMouse(typed)
 	case msg.SubmitPromptMsg:
+		if m.editCmdInput {
+			m.editCmdInput = false
+			m.handleExCommand(typed.Text)
+			if m.editMode {
+				m.focus.SetFocus(component.FocusCodeViewer)
+				m.syncFocusState()
+			}
+			return m, nil
+		}
+		if m.editMode {
+			m.handleExCommand(typed.Text)
+			if m.editMode {
+				m.focus.SetFocus(component.FocusCodeViewer)
+				m.syncFocusState()
+			}
+			return m, nil
+		}
 		return m, m.handleSubmit(typed)
 	case msg.InterruptMsg:
 		return m, m.handleInterrupt()
@@ -326,10 +462,93 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleCloseEditor()
 	case msg.FileOpenMsg:
 		return m, m.handleFileOpen(typed)
+	case msg.FileTreeEntryCreatedMsg:
+		if !typed.IsDir {
+			return m, func() tea.Msg { return msg.FileOpenMsg{Path: typed.Path} }
+		}
+		return m, nil
+	case msg.FileTreeEntryRenamedMsg:
+		return m, nil
+	case msg.FileTreeEntryDeletedMsg:
+		if m.codePanel.FilePath() == typed.Path {
+			m.codePanel.ClearFile()
+		}
+		if m.inlineEditor.FilePath() == typed.Path {
+			m.inlineEditor.ClearFile()
+		}
+		m.fileTree.SetActiveFile("")
+		return m, nil
 	case msg.GuideResponseMsg:
 		return m, m.handleGuideResponse(typed)
 	case modal.ModalClosedMsg:
 		return m, m.handleModalClosed()
+	case msg.LSPDiagnosticMsg:
+		return m, m.handleLSPDiagnostic(typed)
+	case msg.LSPProvisionDoneMsg:
+		if typed.Err == nil {
+			detect.ClearCache()
+		}
+		return m, nil
+	case msg.LSPServerMissingMsg:
+		return m, m.handleLSPServerMissing(typed)
+	case msg.LSPServerInstalledMsg:
+		return m, m.handleLSPServerInstalled(typed)
+	case mode.StandaloneResult:
+		// Forward standalone operator results (gd) to the inline editor.
+		_, cmd := m.inlineEditor.Update(typed)
+		return m, cmd
+	case msg.LSPHoverRequestMsg:
+		// Sync hover tracking so the staleness check in LSPHoverMsg passes
+		// regardless of whether hover was triggered by K or mouse.
+		m.hoverMouseLine = typed.Line
+		m.hoverMouseCol = typed.Col
+		wordStart, _ := m.inlineEditor.WordBoundsAt(typed.Line, typed.Col)
+		m.hoverMouseWordStart = wordStart
+		m.pendingHoverSymbol = ""
+		m.pendingHoverPkgPath = ""
+		return m, tea.Batch(
+			m.lspHoverCmd(typed.FilePath, typed.Line, typed.Col),
+			m.lspDefinitionCmd(typed.FilePath, typed.Line, typed.Col, true),
+		)
+	case msg.LSPMouseHoverTickMsg:
+		return m, m.handleMouseHoverTick(typed)
+	case msg.LSPHoverMsg:
+		// Discard stale hover responses if the mouse has moved to a different word.
+		wordStart, _ := m.inlineEditor.WordBoundsAt(typed.Line, typed.Col)
+		if typed.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+			return m, nil
+		}
+		m.inlineEditor.Update(typed)
+		// Apply definition info that arrived before the hover content.
+		if m.inlineEditor.HoverActive() && m.pendingHoverSymbol != "" {
+			m.inlineEditor.SetHoverDefinition(m.pendingHoverSymbol, m.pendingHoverPkgPath)
+			m.pendingHoverSymbol = ""
+			m.pendingHoverPkgPath = ""
+		}
+		return m, nil
+	case msg.LSPDefinitionRequestMsg:
+		return m, m.lspDefinitionCmd(typed.FilePath, typed.Line, typed.Col, typed.ForHover)
+	case msg.LSPDefinitionMsg:
+		if typed.ForHover {
+			return m, m.handleHoverDefinition(typed)
+		}
+		_, cmd := m.inlineEditor.Update(typed)
+		return m, cmd
+	case msg.LSPCompletionRequestMsg:
+		return m, m.lspCompletionCmd(typed.FilePath, typed.Line, typed.Col)
+	case msg.LSPCompletionMsg:
+		m.inlineEditor.Update(typed)
+		return m, nil
+	case msg.LSPDocHighlightTickMsg:
+		return m, m.handleDocHighlightTick(typed)
+	case msg.LSPDocumentHighlightMsg:
+		m.inlineEditor.Update(typed)
+		return m, nil
+	case msg.NerdFontsResultMsg:
+		// Don't switch icon mode mid-session — the terminal won't render
+		// newly-installed Nerd Font glyphs until restarted. The install
+		// takes effect on the next app launch.
+		return m, nil
 	default:
 		return m, m.propagate(raw)
 	}
@@ -365,10 +584,13 @@ func (m *AppModel) View() string {
 
 // Shutdown gracefully stops all bridges and waits for goroutine cleanup.
 func (m *AppModel) Shutdown() error {
+	m.cancel() // Cancel all in-flight Cmd contexts first.
 	m.activityBridge.Stop()
 	m.sessionBridge.Stop()
 	m.streamBridge.Stop()
 	m.guideBridge.Stop()
+	m.lspBridge.Stop()
+	_ = m.lspManager.Shutdown()
 	return m.deps.Scope.Shutdown(shutdownGrace, shutdownHard)
 }
 
@@ -392,14 +614,85 @@ func (m *AppModel) handleResize(sz tea.WindowSizeMsg) tea.Cmd {
 }
 
 func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Ctrl+C always goes to the interrupt handler.
-	if key.String() == "ctrl+c" {
-		result := m.interruptHandler.HandleCtrlC()
-		return m, func() tea.Msg { return result }
+	// Ctrl+C / Ctrl+Shift+C: copy selection in edit mode, otherwise interrupt.
+	ks := key.String()
+	if ks == "ctrl+c" || ks == "ctrl+shift+c" {
+		if m.editMode && m.inlineEditor.HasSelection() {
+			text := m.inlineEditor.SelectedText()
+			if err := m.clipboard.Set(text); err != nil {
+				m.statusBar.SetFlash("Copy failed")
+			} else {
+				m.statusBar.SetFlash("Copied!")
+			}
+			m.inlineEditor.ClearSelection()
+			return m, nil
+		}
+		if ks == "ctrl+c" {
+			result := m.interruptHandler.HandleCtrlC()
+			return m, func() tea.Msg { return result }
+		}
+		return m, nil
 	}
 
-	// Escape triggers agent interrupt with two-press confirmation.
+	// Select all in the focused component (Alt+Shift+A).
+	if key.String() == "alt+A" {
+		switch {
+		case m.editMode && m.focus.Current() == component.FocusCodeViewer:
+			m.inlineEditor.SelectAll()
+		case m.focus.Current() == component.FocusInput:
+			m.input.SelectAll()
+		}
+		return m, nil
+	}
+
+	// Ctrl+X / Ctrl+Shift+X: cut selection to clipboard.
+	if ks == "ctrl+x" || ks == "ctrl+shift+x" {
+		var text string
+		switch {
+		case m.editMode && m.focus.Current() == component.FocusCodeViewer:
+			text = m.inlineEditor.CutSelection()
+		case m.focus.Current() == component.FocusInput && m.input.HasSelection():
+			text = m.input.CutSelection()
+		}
+		if text != "" {
+			if err := m.clipboard.Set(text); err != nil {
+				m.statusBar.SetFlash("Cut failed")
+			} else {
+				m.statusBar.SetFlash("Cut!")
+			}
+		}
+		return m, nil
+	}
+
+	// Undo in the editor (Alt+Z, only when editor is focused).
+	if key.String() == "alt+z" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		m.inlineEditor.Undo()
+		return m, nil
+	}
+
+	// Redo in the editor (Alt+Shift+Z, only when editor is focused).
+	if key.String() == "alt+Z" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		m.inlineEditor.Redo()
+		return m, nil
+	}
+
+	// Alt+E toggles inline edit mode.
+	if key.String() == "alt+e" {
+		return m, m.toggleEditMode()
+	}
+
+	// Escape: abort command input, or route to editor in edit mode,
+	// or double-tap to interrupt agent.
 	if key.String() == "esc" {
+		if m.editCmdInput {
+			m.exitCmdInput()
+			return m, nil
+		}
+		if m.editMode && m.focus.Current() == component.FocusCodeViewer {
+			comp, cmd := m.inlineEditor.Update(key)
+			m.inlineEditor = comp.(*editor.Model)
+			return m, cmd
+		}
 		now := time.Now()
 		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
 			m.lastEscTime = time.Time{}
@@ -409,6 +702,14 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.lastEscTime = now
 		m.statusBar.SetFlash("Press Esc again to interrupt agent")
+		return m, nil
+	}
+
+	// Colon in edit mode normal: activate command input panel.
+	if key.String() == ":" && m.editMode &&
+		m.focus.Current() == component.FocusCodeViewer &&
+		m.inlineEditor.IsNormalMode() {
+		m.enterCmdInput()
 		return m, nil
 	}
 
@@ -429,9 +730,16 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// Ctrl+P toggles the search overlay.
-	if key.String() == "ctrl+p" {
+	// Ctrl+P toggles the search overlay (unless the editor completion popup
+	// is active, where Ctrl+P navigates to the previous item).
+	if key.String() == "ctrl+p" && !m.inlineEditor.CompletionActive() {
 		m.toggleSearch()
+		return m, nil
+	}
+
+	// Alt+F toggles the in-file find bar when the editor has focus.
+	if ks == "alt+f" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		m.inlineEditor.ToggleFindBar()
 		return m, nil
 	}
 
@@ -440,7 +748,7 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// Shift+arrow moves focus spatially between panels.
+	// Alt+Shift+arrow moves focus spatially between panels.
 	if target, ok := m.spatialFocusTarget(key.String()); ok {
 		m.focus.SetFocus(target)
 		m.syncFocusState()
@@ -477,18 +785,29 @@ func (m *AppModel) handleQuit() tea.Cmd {
 }
 
 func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
-	// Forward tick to status bar, input (cursor blink), and chat (highlight).
+	// Forward tick to status bar, input (cursor blink), editor (cursor blink),
+	// and chat (highlight).
 	m.statusBar.Update(tick)
 	comp, _ := m.input.Update(tick)
 	m.input = comp.(*inputpkg.Model)
 	chatComp, _ := m.chat.Update(tick)
 	m.chat = chatComp.(*chat.Model)
+	if m.editMode {
+		m.inlineEditor.Update(tick)
+	}
+	m.fileTree.Update(tick)
 	m.tickScrollMomentum()
 	m.tickSwipeDecay()
 
 	// Refresh ring hint so streaming activity badge stays current.
 	if !m.leftRing.empty() || !m.rightRing.empty() {
 		m.statusBar.SetViewRingHint(m.buildRingHint())
+	}
+
+	// Flush debounced LSP didChange when the editor has pending edits.
+	if m.editMode && m.inlineEditor.LSPDirty() && time.Since(m.inlineEditor.LastEditAt()) >= lspDebounceInterval {
+		m.inlineEditor.ClearLSPDirty()
+		return tea.Batch(m.tickCmd(), m.lspDidChangeCmd(m.inlineEditor.FilePath(), m.inlineEditor.Content()))
 	}
 
 	return m.tickCmd()
@@ -505,7 +824,361 @@ func (m *AppModel) handleOpenEditor(o msg.OpenEditorMsg) tea.Cmd {
 	m.editorOverlay = comp.(*editor.Model)
 	m.editorOverlay.SetSize(m.width, m.height)
 	m.overlay = overlayEditor
+
+	// Notify LSP that the document was opened (fire-and-forget).
+	if o.FilePath != "" {
+		lang := detectEditorLanguage(o.FilePath)
+		lspCmd := m.lspDidOpenCmd(o.FilePath, lang, o.Content)
+		return tea.Batch(cmd, lspCmd)
+	}
 	return cmd
+}
+
+func (m *AppModel) handleLSPDiagnostic(d msg.LSPDiagnosticMsg) tea.Cmd {
+	// Forward to all views that render diagnostics.
+	m.editorOverlay.Update(d)
+	m.inlineEditor.Update(d)
+	m.codePanel.SetDiagnostics(d.FilePath, d.Diagnostics)
+	return nil
+}
+
+// handleLSPServerMissing triggers on-demand installation when a language
+// server binary is missing. De-duplicates by server ID.
+func (m *AppModel) handleLSPServerMissing(d msg.LSPServerMissingMsg) tea.Cmd {
+	sid := lsp.ServerID(d.ServerID)
+	if m.lspInstalling[sid] {
+		return nil // install already in progress
+	}
+	m.lspInstalling[sid] = true
+	m.statusBar.SetFlash("Installing " + d.ServerName + "…")
+	return m.installLSPServerCmd(d)
+}
+
+// handleLSPServerInstalled handles the result of an on-demand server install.
+// On success, clears the detect cache and re-sends didOpen for the file that
+// triggered the install.
+func (m *AppModel) handleLSPServerInstalled(d msg.LSPServerInstalledMsg) tea.Cmd {
+	delete(m.lspInstalling, lsp.ServerID(d.ServerID))
+	if d.Err != nil {
+		m.statusBar.SetFlash(d.ServerName + " install failed: " + d.Err.Error())
+		return nil
+	}
+	detect.ClearCache()
+	m.statusBar.SetFlash(d.ServerName + " installed")
+	return m.lspDidOpenCmd(d.FilePath, d.LanguageID, d.Content)
+}
+
+// installLSPServerCmd returns a Cmd that installs a single language server
+// binary in the background and reports the result.
+func (m *AppModel) installLSPServerCmd(d msg.LSPServerMissingMsg) tea.Cmd {
+	appCtx := m.ctx
+	return func() tea.Msg {
+		installer, err := lsp.NewInstaller()
+		if err != nil {
+			return msg.LSPServerInstalledMsg{
+				ServerID:   d.ServerID,
+				ServerName: d.ServerName,
+				FilePath:   d.FilePath,
+				LanguageID: d.LanguageID,
+				Content:    d.Content,
+				Err:        err,
+			}
+		}
+		ctx, cancel := context.WithTimeout(appCtx, lsp.ProvisionTimeout)
+		defer cancel()
+		err = installer.EnsureServer(ctx, lsp.ServerID(d.ServerID))
+		return msg.LSPServerInstalledMsg{
+			ServerID:   d.ServerID,
+			ServerName: d.ServerName,
+			FilePath:   d.FilePath,
+			LanguageID: d.LanguageID,
+			Content:    d.Content,
+			Err:        err,
+		}
+	}
+}
+
+// provisionLSPServers kicks off background LSP server detection and installation.
+func (m *AppModel) provisionLSPServers() tea.Cmd {
+	root := m.config.ProjectRoot
+	scope := m.deps.Scope
+	return func() tea.Msg {
+		installer, err := lsp.NewInstaller()
+		if err != nil {
+			return msg.LSPProvisionDoneMsg{Err: err}
+		}
+		_ = scope.Go("lsp.provision", lsp.ProvisionTimeout, func(ctx context.Context) error {
+			return installer.Provision(ctx, root)
+		})
+		return msg.LSPProvisionDoneMsg{}
+	}
+}
+
+// lspDidOpenCmd returns a Cmd that notifies the LSP manager about a file open.
+// If no server is available but one could be installed, returns an
+// LSPServerMissingMsg to trigger on-demand installation.
+func (m *AppModel) lspDidOpenCmd(filePath, languageID, content string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		err := mgr.NotifyDidOpen(ctx, root, filePath, languageID, content)
+		if err != nil {
+			return nil
+		}
+		// SuggestServer returns a disabled-but-installable server for this
+		// file type. If NotifyDidOpen started a client successfully the
+		// server is enabled and SuggestServer returns nil.
+		suggested := mgr.SuggestServer(root, filePath)
+		if suggested != nil {
+			return msg.LSPServerMissingMsg{
+				ServerID:   string(suggested.ID),
+				ServerName: suggested.Name,
+				FilePath:   filePath,
+				LanguageID: languageID,
+				Content:    content,
+			}
+		}
+		return nil
+	}
+}
+
+// lspDidChangeCmd returns a Cmd that sends a didChange notification.
+func (m *AppModel) lspDidChangeCmd(filePath, content string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		_ = mgr.NotifyDidChange(ctx, root, filePath, content)
+		return nil
+	}
+}
+
+// lspDidSaveAsync sends a didSave notification as a tracked background goroutine.
+func (m *AppModel) lspDidSaveAsync(filePath, content string) {
+	if filePath == "" {
+		return
+	}
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	_ = m.deps.Scope.Go("lsp.didSave", lspNotifyTimeout, func(ctx context.Context) error {
+		return mgr.NotifyDidSave(ctx, root, filePath, content)
+	})
+}
+
+// lspDidCloseAsync sends a didClose notification as a tracked background goroutine.
+func (m *AppModel) lspDidCloseAsync(filePath string) {
+	if filePath == "" {
+		return
+	}
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	_ = m.deps.Scope.Go("lsp.didClose", lspNotifyTimeout, func(ctx context.Context) error {
+		return mgr.NotifyDidClose(ctx, root, filePath)
+	})
+}
+
+// lspReopenCmd returns a Cmd that atomically closes then re-opens a document
+// in the LSP client. This avoids the race between async didClose (from
+// exitEditMode) and async didOpen (from enterEditMode) where didOpen could
+// run first, be silently rejected because the document is still tracked,
+// and then didClose removes it — leaving the document permanently untracked.
+func (m *AppModel) lspReopenCmd(filePath, languageID, content string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		// Close first so the document tracker drops the stale entry.
+		_ = mgr.NotifyDidClose(ctx, root, filePath)
+
+		// Now open — guaranteed to succeed because we just closed.
+		err := mgr.NotifyDidOpen(ctx, root, filePath, languageID, content)
+		if err != nil {
+			return nil
+		}
+
+		suggested := mgr.SuggestServer(root, filePath)
+		if suggested != nil {
+			return msg.LSPServerMissingMsg{
+				ServerID:   string(suggested.ID),
+				ServerName: suggested.Name,
+				FilePath:   filePath,
+				LanguageID: languageID,
+				Content:    content,
+			}
+		}
+		return nil
+	}
+}
+
+// lspHoverCmd returns a Cmd that requests hover information from the LSP.
+func (m *AppModel) lspHoverCmd(filePath string, line, col int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		result, err := mgr.Hover(ctx, root, filePath, line, col)
+		return msg.LSPHoverMsg{
+			FilePath: filePath,
+			Line:     line,
+			Col:      col,
+			Result:   result,
+			Err:      err,
+		}
+	}
+}
+
+// lspDocumentHighlightCmd returns a Cmd that requests document highlights from the LSP.
+func (m *AppModel) lspDocumentHighlightCmd(filePath string, line, col int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		highlights, err := mgr.DocumentHighlight(ctx, root, filePath, line, col)
+		return msg.LSPDocumentHighlightMsg{
+			FilePath:   filePath,
+			Line:       line,
+			Col:        col,
+			Highlights: highlights,
+			Err:        err,
+		}
+	}
+}
+
+// lspDefinitionCmd returns a Cmd that requests definition locations from the LSP.
+// When forHover is true, the result decorates the hover tooltip instead of navigating.
+func (m *AppModel) lspDefinitionCmd(filePath string, line, col int, forHover bool) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		locs, err := mgr.Definition(ctx, root, filePath, line, col)
+		return msg.LSPDefinitionMsg{
+			FilePath:  filePath,
+			Locations: locs,
+			Err:       err,
+			ForHover:  forHover,
+		}
+	}
+}
+
+// handleHoverDefinition stores the definition symbol and package path on the
+// active hover tooltip. If the hover content hasn't arrived yet, stashes
+// the info so it can be applied when the hover activates.
+func (m *AppModel) handleHoverDefinition(d msg.LSPDefinitionMsg) tea.Cmd {
+	if d.Err != nil || len(d.Locations) == 0 {
+		return nil
+	}
+	loc := d.Locations[0]
+	filePath := lsp.FileURIToPath(loc.URI)
+
+	// Use the tracked hover position (works for both keyboard and mouse).
+	word := m.inlineEditor.WordAt(m.hoverMouseLine, m.hoverMouseCol)
+
+	pkgName, pkgPath := defPackageInfo(filePath, m.config.ProjectRoot)
+	symbol := word
+	if pkgName != "" && word != "" {
+		symbol = pkgName + "." + word
+	}
+
+	if m.inlineEditor.HoverActive() {
+		m.inlineEditor.SetHoverDefinition(symbol, pkgPath)
+	} else {
+		// Hover content hasn't arrived yet; stash for when it does.
+		m.pendingHoverSymbol = symbol
+		m.pendingHoverPkgPath = pkgPath
+	}
+	return nil
+}
+
+// defPackageInfo extracts a Go package name and clean display path from a
+// definition file path. Strips module versions and GOROOT/GOMODCACHE prefixes.
+func defPackageInfo(filePath, projectRoot string) (pkgName, displayPath string) {
+	// Local project file.
+	if rel, err := filepath.Rel(projectRoot, filePath); err == nil && !strings.HasPrefix(rel, "..") {
+		dir := filepath.Dir(rel)
+		if dir == "." {
+			dir = filepath.Base(projectRoot)
+		}
+		return filepath.Base(dir), dir
+	}
+
+	// Go module cache: .../pkg/mod/github.com/foo/bar@v1.0.0/pkg/file.go
+	if idx := strings.Index(filePath, "/pkg/mod/"); idx >= 0 {
+		modRel := filePath[idx+len("/pkg/mod/"):]
+		dir := filepath.Dir(modRel)
+		dir = stripModVersion(dir)
+		return filepath.Base(dir), dir
+	}
+
+	// Go standard library: .../go/src/context/context.go
+	if idx := strings.Index(filePath, "/src/"); idx >= 0 {
+		srcRel := filePath[idx+len("/src/"):]
+		dir := filepath.Dir(srcRel)
+		return filepath.Base(dir), dir
+	}
+
+	// Fallback.
+	dir := filepath.Dir(filePath)
+	return filepath.Base(dir), dir
+}
+
+// stripModVersion removes @version suffixes from Go module path components.
+func stripModVersion(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if at := strings.Index(p, "@"); at >= 0 {
+			parts[i] = p[:at]
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// lspCompletionCmd returns a Cmd that requests completion items from the LSP.
+func (m *AppModel) lspCompletionCmd(filePath string, line, col int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		items, err := mgr.Completion(ctx, root, filePath, line, col)
+		return msg.LSPCompletionMsg{
+			FilePath: filePath,
+			Items:    items,
+			Err:      err,
+		}
+	}
+}
+
+// extToLSPLanguage maps file extensions to LSP language identifiers.
+var extToLSPLanguage = map[string]string{
+	".go":   "go",
+	".ts":   "typescript",
+	".tsx":  "typescriptreact",
+	".js":   "javascript",
+	".jsx":  "javascriptreact",
+	".py":   "python",
+	".rs":   "rust",
+	".c":    "c",
+	".h":    "c",
+	".cpp":  "cpp",
+	".hpp":  "cpp",
+	".rb":   "ruby",
+	".java": "java",
+	".yaml": "yaml",
+	".yml":  "yaml",
+	".tf":   "terraform",
+	".lua":  "lua",
+	".zig":  "zig",
+	".ml":   "ocaml",
+}
+
+// detectEditorLanguage returns the LSP language ID for a file path.
+func detectEditorLanguage(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if lang, ok := extToLSPLanguage[ext]; ok {
+		return lang
+	}
+	return ""
 }
 
 // handleFileOpen reads a file from disk and displays it in the code viewer.
@@ -520,11 +1193,42 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 		m.statusBar.SetFlash("Cannot open: " + o.Name)
 		return nil
 	}
-	m.codePanel.SetContent(string(data), o.Path, o.Language)
+	content := string(data)
+	m.codePanel.SetContent(content, o.Path, o.Language)
+
+	// Track which content the LSP should analyze.
+	lspContent := content
+
+	if m.editMode {
+		// Close the previous document before switching.
+		oldPath := m.inlineEditor.FilePath()
+		if oldPath != "" && oldPath != o.Path {
+			m.lspDidCloseAsync(oldPath)
+		}
+
+		// Save current editor state before switching.
+		m.snapshotCurrentEditor()
+
+		// Restore from snapshot if available, otherwise load from disk.
+		if m.inlineEditor.FilePath() == o.Path {
+			// Already on this file — no switch needed.
+			if o.Line > 0 {
+				m.codePanel.ScrollToLine(o.Line - 1)
+			}
+			return nil
+		} else if snap, ok := m.editSnapshots[o.Path]; ok {
+			m.restoreEditorSnapshot(snap)
+			lspContent = snap.content
+		} else {
+			m.inlineEditor.OpenFile(o.Path, content, o.Language)
+		}
+	}
+
 	if o.Line > 0 {
 		m.codePanel.ScrollToLine(o.Line - 1) // convert 1-based to 0-based
 	}
-	return nil
+
+	return m.lspDidOpenCmd(o.Path, detectEditorLanguage(o.Path), lspContent)
 }
 
 func (m *AppModel) handleCloseEditor() tea.Cmd {
@@ -558,10 +1262,10 @@ func (m *AppModel) handleModalClosed() tea.Cmd {
 type chordState int
 
 const (
-	chordNone    chordState = iota
-	chordSession            // Alt+S pressed, waiting for arrow.
-	chordAgent              // Alt+A pressed, waiting for arrow.
-	chordView               // Alt+V pressed, waiting for arrow.
+	chordNone     chordState = iota
+	chordSession             // Alt+S pressed, waiting for arrow.
+	chordAgent               // Alt+A pressed, waiting for arrow.
+	chordView // Alt+V pressed, waiting for arrow.
 )
 
 // chordArrowDelta maps arrow key strings (including alt-held variants) to
@@ -574,18 +1278,23 @@ var chordArrowDelta = map[string]int{
 	"alt+right": 1,
 }
 
-// chordDisplay holds the label and color for a chord hint overlay.
+// chordFocusGuard restricts specific chords to a required focused pane.
+// Chords not listed here are global (activate regardless of focus).
+var chordFocusGuard = map[chordState]component.FocusID{}
+
+// chordDisplay holds the label, key hints, and color for a chord hint overlay.
 type chordDisplay struct {
 	label string
+	keys  string
 	color func(*theme.Palette) lipgloss.Color
 }
 
 // chordDisplays maps chord states to their display properties.
 // Session select uses Primary (blue), Agent select uses Success (green).
 var chordDisplays = map[chordState]chordDisplay{
-	chordSession: {"Session select", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
-	chordAgent:   {"Agent select", func(p *theme.Palette) lipgloss.Color { return p.Success }},
-	chordView:    {"View select", func(p *theme.Palette) lipgloss.Color { return p.Accent }},
+	chordSession:  {"Session select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
+	chordAgent:    {"Agent select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Success }},
+	chordView:     {"View select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Accent }},
 }
 
 // chordHint returns a styled hint string when a chord is active, or "" when idle.
@@ -596,24 +1305,32 @@ func (m *AppModel) chordHint(th *theme.Theme) string {
 	}
 	labelStyle := lipgloss.NewStyle().Foreground(disp.color(&th.Palette)).Bold(true)
 	keyStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	return labelStyle.Render(disp.label) + keyStyle.Render("  ←/→ cycle  any key to exit ")
+	return labelStyle.Render(disp.label) + keyStyle.Render("  "+disp.keys+"  any key to exit ")
 }
 
 // handleChord processes two-key chord shortcuts: Alt+S then Left/Right for sessions,
 // Alt+A then Left/Right for agents. The chord stays active while arrows are pressed,
 // allowing repeated cycling. Any non-arrow key cancels the chord and falls
 // through to normal handling. Returns (cmd, true) if consumed.
+// chordKeyMap maps chord trigger keys to their chord state.
+var chordKeyMap = map[string]chordState{
+	"alt+s": chordSession,
+	"alt+a": chordAgent,
+	"alt+v": chordView,
+}
+
 func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
-	// Chord triggers work from any state, allowing direct switching.
-	switch key.String() {
-	case "alt+s":
-		m.chord = chordSession
-		return nil, true
-	case "alt+a":
-		m.chord = chordAgent
-		return nil, true
-	case "alt+v":
-		m.chord = chordView
+	// Chord triggers: toggle on if idle or switching, toggle off if repeated.
+	if target, ok := chordKeyMap[key.String()]; ok {
+		// Focus guard: some chords only activate with a specific pane focused.
+		if required, guarded := chordFocusGuard[target]; guarded && m.focus.Current() != required {
+			return nil, false
+		}
+		if m.chord == target {
+			m.chord = chordNone
+		} else {
+			m.chord = target
+		}
 		return nil, true
 	}
 
@@ -625,6 +1342,7 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 	if delta, ok := chordArrowDelta[key.String()]; ok {
 		return m.dispatchChordCycle(m.chord, delta), true
 	}
+
 	m.chord = chordNone
 	return nil, true
 }
@@ -688,6 +1406,204 @@ func (m *AppModel) cycleRing(ring *viewRing, delta int) {
 		m.focus.SetFocus(newPanel)
 	}
 	m.syncViewState()
+}
+
+// ---------------------------------------------------------------------------
+// Edit mode (Alt+E)
+// ---------------------------------------------------------------------------
+
+// toggleEditMode switches between inline editing and read-only code viewing.
+func (m *AppModel) toggleEditMode() tea.Cmd {
+	if m.editMode {
+		m.exitEditMode()
+		return nil
+	}
+	return m.enterEditMode()
+}
+
+// enterEditMode activates inline vim editing in the code panel slot.
+// Returns a Cmd that sends didOpen so the LSP client tracks the document
+// for subsequent didChange notifications. Idempotent if already tracked.
+func (m *AppModel) enterEditMode() tea.Cmd {
+	// Save ring state and focus.
+	m.savedLeftIdx = m.leftRing.index
+	m.savedRightIdx = m.rightRing.index
+	m.savedFocus = m.focus.Current()
+
+	// Ensure the code panel is visible.
+	switch m.layout.Mode() {
+	case layout.ThreeColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+	case layout.TwoColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+		m.rightRing.setTo(component.FocusCodeViewer)
+	case layout.SingleColumn:
+		m.leftRing.setTo(component.FocusCodeViewer)
+	}
+
+	// Load the editor with the current file, or leave empty for placeholder.
+	var lspCmd tea.Cmd
+	if fp := m.codePanel.FilePath(); fp != "" {
+		var content string
+		if snap, ok := m.editSnapshots[fp]; ok {
+			m.restoreEditorSnapshot(snap)
+			content = snap.content
+		} else {
+			content = m.codePanel.Content()
+			m.inlineEditor.OpenFile(fp, content, m.codePanel.Language())
+		}
+		m.fileTree.SetActiveFile(fp)
+		m.fileTree.RevealPath(fp)
+
+		// Atomically close then re-open so the LSP document tracker
+		// is always in a clean state, regardless of whether a prior
+		// exitEditMode's async didClose has completed yet.
+		lspCmd = m.lspReopenCmd(fp, detectEditorLanguage(fp), content)
+	} else {
+		m.inlineEditor.ClearFile()
+	}
+
+	// Size the editor to match the code panel slot.
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.inlineEditor.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
+
+	m.editMode = true
+	m.statusBar.SetMode("EDIT")
+	m.input.SetPlaceholder(":")
+	m.focus.SetFocus(component.FocusCodeViewer)
+	m.syncFocusState()
+	m.syncViewState()
+	m.statusBar.SetFlash("Edit mode")
+	return lspCmd
+}
+
+// exitEditMode deactivates inline editing and syncs content back to the
+// code viewer.
+func (m *AppModel) exitEditMode() {
+	// NOTE: We do NOT call lspDidCloseAsync here. The close is handled
+	// atomically by lspReopenCmd when the user re-enters edit mode, which
+	// avoids a race condition between async didClose and async didOpen.
+
+	// Save current editor state so re-entering edit mode restores it.
+	m.snapshotCurrentEditor()
+
+	m.codePanel.SetContent(
+		m.inlineEditor.Content(),
+		m.inlineEditor.FilePath(),
+		m.inlineEditor.Language(),
+	)
+
+	// Restore ring state.
+	m.leftRing.index = m.savedLeftIdx
+	m.rightRing.index = m.savedRightIdx
+
+	m.editMode = false
+	m.editCmdInput = false
+	m.statusBar.SetMode("CHAT")
+	m.input.SetPlaceholder("Type a message...")
+	m.focus.SetFocus(m.savedFocus)
+	m.syncFocusState()
+	m.syncViewState()
+	m.statusBar.SetFlash("View mode")
+}
+
+// enterCmdInput activates the input panel for ex command entry,
+// pre-filling it with ":" and switching focus.
+func (m *AppModel) enterCmdInput() {
+	m.editCmdInput = true
+	m.input.SetText(":")
+	m.focus.SetFocus(component.FocusInput)
+	m.syncFocusState()
+}
+
+// exitCmdInput aborts command input and returns focus to the code panel.
+func (m *AppModel) exitCmdInput() {
+	m.editCmdInput = false
+	m.input.Clear()
+	m.focus.SetFocus(component.FocusCodeViewer)
+	m.syncFocusState()
+}
+
+// snapshotCurrentEditor saves the inline editor's current state so it can
+// be restored when the user switches back to this file.
+func (m *AppModel) snapshotCurrentEditor() {
+	path := m.inlineEditor.FilePath()
+	if path == "" {
+		return
+	}
+	m.editSnapshots[path] = &editorSnapshot{
+		filePath:     path,
+		content:      m.inlineEditor.Content(),
+		language:     m.inlineEditor.Language(),
+		cursor:       m.inlineEditor.CursorPos(),
+		scrollOffset: m.inlineEditor.ScrollOffset(),
+		modified:     m.inlineEditor.Modified(),
+	}
+}
+
+// restoreEditorSnapshot loads a previously saved editor state, including
+// buffer content, cursor position, and scroll offset.
+func (m *AppModel) restoreEditorSnapshot(snap *editorSnapshot) {
+	m.inlineEditor.OpenFile(snap.filePath, snap.content, snap.language)
+	m.inlineEditor.RestoreState(snap.cursor, snap.scrollOffset)
+}
+
+// handleExCommand processes a vim ex command entered in the input panel
+// during edit mode. Supported: :w (save), :q (quit), :wq (save+quit),
+// :q! (force quit).
+func (m *AppModel) handleExCommand(text string) {
+	cmd := strings.TrimSpace(text)
+
+	// Strip leading ':' if present.
+	cmd = strings.TrimPrefix(cmd, ":")
+	cmd = strings.TrimSpace(cmd)
+
+	switch cmd {
+	case "w":
+		m.saveEditorBuffer()
+	case "q":
+		if m.inlineEditor.Modified() {
+			m.statusBar.SetFlash("Unsaved changes (use :q! to discard)")
+			return
+		}
+		m.exitEditMode()
+	case "wq", "x":
+		m.saveEditorBuffer()
+		m.exitEditMode()
+	case "q!":
+		delete(m.editSnapshots, m.inlineEditor.FilePath())
+		m.exitEditMode()
+	default:
+		m.statusBar.SetFlash("Unknown command: :" + cmd)
+	}
+}
+
+// saveEditorBuffer writes the inline editor buffer to disk.
+func (m *AppModel) saveEditorBuffer() {
+	path := m.inlineEditor.FilePath()
+	if path == "" {
+		m.statusBar.SetFlash("No file path")
+		return
+	}
+	content := m.inlineEditor.Content()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		m.statusBar.SetFlash("Write failed: " + err.Error())
+		return
+	}
+	m.inlineEditor.MarkSaved()
+	m.lspDidSaveAsync(path, content)
+	m.codePanel.SetContent(content, path, m.inlineEditor.Language())
+	m.snapshotCurrentEditor()
+	m.statusBar.SetFlash("Saved " + path)
+}
+
+// codePanelView returns the rendered view for the code panel slot,
+// switching between the inline editor and the read-only viewer.
+func (m *AppModel) codePanelView() string {
+	if m.editMode {
+		return m.inlineEditor.View()
+	}
+	return m.codePanel.View()
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +1725,32 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
+	// Route wheel events to the hover popup when it is active and the
+	// cursor is over it, instead of scrolling the underlying panel.
+	if m.editMode && m.inlineEditor.HoverActive() && isWheelEvent(mouse) {
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			vx, vy := m.editorViewCoords(mouse.X, mouse.Y)
+			vy -= m.inlineEditor.FindBarHeight()
+			if m.inlineEditor.IsInsideHoverPopup(vx, vy) {
+				switch mouse.Button {
+				case tea.MouseButtonWheelUp:
+					m.inlineEditor.ScrollHoverUp()
+				case tea.MouseButtonWheelDown:
+					m.inlineEditor.ScrollHoverDown()
+				}
+				return nil
+			}
+		}
+	}
+
+	// Handle motion events for hover before button-specific routing.
+	// Some terminals send MouseButtonLeft for motion after a click-release
+	// instead of MouseButtonNone. Routing hover here ensures it works
+	// regardless of reported button, as long as we're not mid-drag.
+	if m.editMode && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown {
+		return m.handleEditorMouseHover(mouse)
+	}
+
 	switch mouse.Button {
 	case tea.MouseButtonWheelUp:
 		if mouse.Alt {
@@ -832,10 +1774,22 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	return nil
 }
 
-// handleLeftClick dispatches left-button press events to the file tree
-// and chat panels. Code panel uses native terminal selection and system
-// copy/paste shortcuts (Ctrl+Shift+C/V or Cmd+C/V).
+// isWheelEvent reports whether the mouse event is a scroll wheel action.
+func isWheelEvent(mouse tea.MouseMsg) bool {
+	return mouse.Button == tea.MouseButtonWheelUp ||
+		mouse.Button == tea.MouseButtonWheelDown
+}
+
+// handleLeftClick dispatches left-button events to the file tree,
+// inline editor (in edit mode), and chat panels.
 func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
+	// Edit mode: handle press, drag, and release in the code panel.
+	if m.editMode {
+		if consumed, cmd := m.handleEditorMouse(mouse); consumed {
+			return cmd
+		}
+	}
+
 	if mouse.Action != tea.MouseActionPress {
 		return nil
 	}
@@ -896,6 +1850,8 @@ func (m *AppModel) applyScrollImpulse(x int, impulse float64) {
 	if !ok {
 		return
 	}
+	// In edit mode, scroll the inline editor instead of the code viewer.
+	// The spring pipeline dispatches to editor.ScrollUp/ScrollDown via scrollOneLine.
 	if panelID != m.scroll.panel {
 		m.scroll = scrollState{panel: panelID}
 		m.bounce = bounceState{panel: panelID}
@@ -935,7 +1891,11 @@ func (m *AppModel) tickScrollMomentum() {
 
 	// Push bounce offset to panels for rendering.
 	m.chat.SetBounceOffset(m.bounceOffset(component.FocusChat))
-	m.codePanel.SetBounceOffset(m.bounceOffset(component.FocusCodeViewer))
+	codeBounce := m.bounceOffset(component.FocusCodeViewer)
+	m.codePanel.SetBounceOffset(codeBounce)
+	if m.editMode {
+		m.inlineEditor.SetBounceOffset(codeBounce)
+	}
 	m.fileTree.SetBounceOffset(m.bounceOffset(component.FocusFileTree))
 }
 
@@ -970,6 +1930,12 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		}
 		return m.chat.ScrollDown()
 	case component.FocusCodeViewer:
+		if m.editMode {
+			if direction < 0 {
+				return m.inlineEditor.ScrollUp()
+			}
+			return m.inlineEditor.ScrollDown()
+		}
 		if direction < 0 {
 			return m.codePanel.ScrollUp()
 		}
@@ -1202,7 +2168,248 @@ func (m *AppModel) chatPanelX() int {
 	return 0
 }
 
+// codePanelX returns the X coordinate where the code panel starts,
+// based on the current layout mode.
+func (m *AppModel) codePanelX() int {
+	mode := m.layout.Mode()
+	switch mode {
+	case layout.FourColumn:
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		treeW, _ := m.layout.GetPanelSize(component.FocusFileTree)
+		chatW, _ := m.layout.GetPanelSize(component.FocusChat)
+		return leftW + treeW + chatW
+	case layout.ThreeColumn:
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		chatW, _ := m.layout.GetPanelSize(component.FocusChat)
+		return leftW + chatW
+	case layout.TwoColumn:
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		return leftW
+	default:
+		return 0
+	}
+}
 
+// handleEditorMouse handles all left-button mouse actions (press, drag,
+// release) inside the code panel during edit mode. Returns (consumed, cmd).
+func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	// Release always clears tracking, even outside the panel.
+	if mouse.Action == tea.MouseActionRelease {
+		m.editorMouseDown = false
+		m.editorDragging = false
+		return true, nil
+	}
+
+	// Motion while dragging: extend selection even if the pointer left
+	// the panel bounds (clamp handled by the editor).
+	if mouse.Action == tea.MouseActionMotion && m.editorMouseDown {
+		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		viewY -= m.inlineEditor.FindBarHeight()
+		if !m.editorDragging {
+			m.inlineEditor.StartDragSelection()
+			m.editorDragging = true
+		}
+		m.inlineEditor.ExtendDragSelection(viewX, viewY)
+		return true, nil
+	}
+
+	// Press: must be inside the code panel.
+	if mouse.Action != tea.MouseActionPress {
+		return false, nil
+	}
+
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return false, nil
+	}
+
+	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+
+	// When the find bar is open, clicks in its area toggle badges;
+	// clicks below it are offset to content-local coordinates.
+	fbH := m.inlineEditor.FindBarHeight()
+	if fbH > 0 && viewY < fbH {
+		m.inlineEditor.HandleFindBarClick(viewX, viewY)
+		return true, nil
+	}
+	viewY -= fbH
+
+	// When the hover popup is visible, clicks on it trigger go-to-definition.
+	if cmd, ok := m.inlineEditor.HandleHoverClick(viewX, viewY); ok {
+		return true, cmd
+	}
+
+	// When the completion popup is visible, clicks on it select an item
+	// instead of moving the cursor.
+	if m.inlineEditor.HandleCompletionClick(viewX, viewY) {
+		return true, nil
+	}
+
+	m.inlineEditor.ClickAt(viewX, viewY)
+	m.editorMouseDown = true
+	m.editorDragging = false
+
+	// Schedule document highlight debounce after click places cursor on a word.
+	line := m.inlineEditor.CursorLine()
+	col := m.inlineEditor.CursorCol()
+	if m.inlineEditor.IsWordCharAtPos(line, col) {
+		m.highlightLine = line
+		m.highlightCol = col
+		m.inlineEditor.ClearHighlightRanges()
+		return true, tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+			return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+		})
+	}
+	m.inlineEditor.ClearHighlightRanges()
+	return true, nil
+}
+
+// isInsideCodePanel reports whether screen coordinates (x, y) fall within
+// the content area of the code panel.
+func (m *AppModel) isInsideCodePanel(x, y int) bool {
+	codeW, codeH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	if codeW == 0 || codeH == 0 {
+		return false
+	}
+	codeX := m.codePanelX()
+	innerH := max(codeH-panelBorderSize, 0)
+
+	contentLeft := codeX + 1
+	contentRight := codeX + codeW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	return x >= contentLeft && x < contentRight && y >= contentTop && y < contentBottom
+}
+
+// editorViewCoords converts screen coordinates to content-local viewport
+// coordinates for the code panel. Coordinates are clamped to [0, max).
+func (m *AppModel) editorViewCoords(screenX, screenY int) (int, int) {
+	codeW, codeH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	codeX := m.codePanelX()
+	innerW := max(codeW-panelBorderSize, 0)
+	innerH := max(codeH-panelBorderSize, 0)
+
+	viewX := max(min(screenX-(codeX+1), innerW-1), 0)
+	viewY := max(min(screenY-1, innerH-1), 0)
+	return viewX, viewY
+}
+
+// hoverDebounce delays before firing an LSP hover request.
+// Derived from: 150ms is responsive without flooding the server on fast swipes;
+// 50ms retrigger keeps the tooltip "following" the cursor between words.
+const (
+	hoverInitialDebounce   = 350 * time.Millisecond // first hover when no tooltip is showing
+	hoverRetriggerDebounce = 50 * time.Millisecond  // re-trigger when moving between words
+)
+
+// highlightDebounce is the delay before firing a documentHighlight request
+// after the cursor comes to rest on a symbol.
+// Derived from: 100ms feels snappy while still batching rapid j/k navigation.
+const highlightDebounce = 100 * time.Millisecond
+
+// handleEditorMouseHover fires a debounced LSP hover request when the
+// mouse moves to a new word in edit mode. Only triggers on word characters;
+// moving within the same word does not reset the debounce.
+func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		if m.inlineEditor.HoverActive() {
+			m.inlineEditor.DismissHover()
+		}
+		m.hoverMouseLine = -1
+		return nil
+	}
+	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+	viewY -= m.inlineEditor.FindBarHeight()
+
+	// When the mouse is inside the popup, keep it stable so the user
+	// can scroll with the wheel. Only "see through" to the buffer when
+	// the mouse is outside the popup bounds.
+	if m.inlineEditor.HoverActive() && m.inlineEditor.IsInsideHoverPopup(viewX, viewY) {
+		return nil
+	}
+
+	line, col, ok := m.inlineEditor.ViewportToBufferPos(viewX, viewY)
+	if !ok {
+		return nil
+	}
+
+	// Only fire hover on word characters (identifiers, not whitespace).
+	if !m.inlineEditor.IsWordCharAtPos(line, col) {
+		if m.inlineEditor.HoverActive() {
+			m.inlineEditor.DismissHover()
+		}
+		m.hoverMouseLine = -1
+		return nil
+	}
+
+	// Compare by word boundary, not exact column — moving within the
+	// same identifier should not reset the debounce timer.
+	wordStart, _ := m.inlineEditor.WordBoundsAt(line, col)
+	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart {
+		return nil
+	}
+
+	// Dismiss the current tooltip immediately so the user can see the
+	// source line they just moved to — especially when the old popup
+	// was overlaying that line.
+	debounce := hoverInitialDebounce
+	if m.inlineEditor.HoverActive() {
+		m.inlineEditor.DismissHover()
+		debounce = hoverRetriggerDebounce
+	}
+
+	m.hoverMouseLine = line
+	m.hoverMouseCol = col
+	m.hoverMouseWordStart = wordStart
+	m.pendingHoverSymbol = ""
+	m.pendingHoverPkgPath = ""
+	return tea.Tick(debounce, func(_ time.Time) tea.Msg {
+		return msg.LSPMouseHoverTickMsg{Line: line, Col: col}
+	})
+}
+
+// handleMouseHoverTick processes the debounced hover tick. If the mouse
+// is still on the same word, fires parallel LSP hover and definition requests.
+func (m *AppModel) handleMouseHoverTick(tick msg.LSPMouseHoverTickMsg) tea.Cmd {
+	if !m.editMode {
+		return nil
+	}
+	// Check the mouse is still on the same word (by line + wordStart).
+	wordStart, _ := m.inlineEditor.WordBoundsAt(tick.Line, tick.Col)
+	if tick.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+		return nil
+	}
+	filePath := m.inlineEditor.FilePath()
+	if filePath == "" {
+		return nil
+	}
+	m.pendingHoverSymbol = ""
+	m.pendingHoverPkgPath = ""
+	return tea.Batch(
+		m.lspHoverCmd(filePath, tick.Line, tick.Col),
+		m.lspDefinitionCmd(filePath, tick.Line, tick.Col, true),
+	)
+}
+
+// handleDocHighlightTick processes the debounced document highlight tick.
+// If the cursor is still on the same position and in normal mode, fires
+// the LSP documentHighlight request.
+func (m *AppModel) handleDocHighlightTick(tick msg.LSPDocHighlightTickMsg) tea.Cmd {
+	if !m.editMode {
+		return nil
+	}
+	if m.inlineEditor.CursorLine() != tick.Line || m.inlineEditor.CursorCol() != tick.Col {
+		return nil
+	}
+	if !m.inlineEditor.IsWordCharAtPos(tick.Line, tick.Col) {
+		return nil
+	}
+	filePath := m.inlineEditor.FilePath()
+	if filePath == "" {
+		return nil
+	}
+	return m.lspDocumentHighlightCmd(filePath, tick.Line, tick.Col)
+}
 
 func (m *AppModel) toggleSearch() {
 	if m.searchOverlay.Visible() {
@@ -1289,6 +2496,24 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		m.agentPanel = comp.(*agentpkg.Model)
 		return cmd
 	case component.FocusCodeViewer:
+		if m.editMode {
+			comp, cmd := m.inlineEditor.Update(key)
+			m.inlineEditor = comp.(*editor.Model)
+			// Schedule document highlight when cursor rests on a word.
+			line := m.inlineEditor.CursorLine()
+			col := m.inlineEditor.CursorCol()
+			if m.inlineEditor.IsWordCharAtPos(line, col) {
+				m.highlightLine = line
+				m.highlightCol = col
+				hlCmd := tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+					return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+				})
+				return tea.Batch(cmd, hlCmd)
+			}
+			// Cursor moved off a word — clear any stale highlights.
+			m.inlineEditor.ClearHighlightRanges()
+			return cmd
+		}
 		comp, cmd := m.codePanel.Update(key)
 		m.codePanel = comp.(*codepkg.Model)
 		return cmd
@@ -1344,7 +2569,15 @@ func (m *AppModel) recalcLayout() {
 	mainHeight := m.height - inputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
 
+	// Clear mode cap before initial computation so the layout can
+	// upgrade to a wider mode when the terminal expands.
+	m.layout.ClearMaxMode()
 	m.layout.SetSize(m.width, mainHeight)
+
+	// In edit mode, check for content cutoff and force mode downgrade.
+	if m.editMode && m.inlineEditor.FilePath() != "" {
+		m.shrinkLayoutForEditorFit(mainHeight)
+	}
 
 	// Sync tab order and focus to the current layout mode so collapsed
 	// panels are excluded from keyboard navigation.
@@ -1372,6 +2605,9 @@ func (m *AppModel) recalcLayout() {
 	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
 	m.codePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 	m.knowledgePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	if m.editMode {
+		m.inlineEditor.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	}
 
 	// Input: dynamic height based on content.
 	m.input.SetSize(m.width, inputH)
@@ -1381,6 +2617,27 @@ func (m *AppModel) recalcLayout() {
 	m.editorOverlay.SetSize(m.width, m.height)
 	m.modalOverlay.SetSize(m.width, m.height)
 	m.searchOverlay.SetSize(m.width, m.height)
+}
+
+// shrinkLayoutForEditorFit checks whether the editor's visible content
+// is wider than the code panel. If any line is cut off, it forces the
+// layout to a smaller mode and recomputes until the content fits or
+// SingleColumn is reached.
+func (m *AppModel) shrinkLayoutForEditorFit(mainHeight int) {
+	for {
+		rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+		contentW := max(rightW-panelBorderSize, 1)
+		needed := m.inlineEditor.MaxVisibleLineWidth()
+		if needed <= contentW {
+			return // content fits
+		}
+		current := m.layout.Mode()
+		if current <= layout.SingleColumn {
+			return // already at smallest mode
+		}
+		m.layout.SetMaxMode(current - 1)
+		m.layout.SetSize(m.width, mainHeight)
+	}
 }
 
 // syncViewState rebuilds the dual view cycling rings for the current layout
@@ -1418,6 +2675,20 @@ func (m *AppModel) syncViewState() {
 			component.FocusCodeViewer,
 		})
 		m.rightRing.reset(nil)
+	}
+
+	// When edit mode is active, ensure CodeViewer is visible in the
+	// ring that contains it. For the left ring, prefer CodeViewer
+	// (SingleColumn) or fall back to FileTree for navigation.
+	if m.editMode {
+		if !m.rightRing.empty() {
+			m.rightRing.setTo(component.FocusCodeViewer)
+		}
+		if !m.leftRing.empty() {
+			if !m.leftRing.setTo(component.FocusCodeViewer) {
+				m.leftRing.setTo(component.FocusFileTree)
+			}
+		}
 	}
 
 	// First-collapse flash: show once when panels first collapse.
@@ -1552,7 +2823,7 @@ func (m *AppModel) renderMainArea() string {
 		chatView := m.renderPanel(
 			m.overlayChordHint(m.chat.View(), component.FocusChat, th),
 			component.FocusChat, th)
-		codeView := m.renderPanel(m.codePanel.View(), component.FocusCodeViewer, th)
+		codeView := m.renderPanel(m.codePanelView(), component.FocusCodeViewer, th)
 		return m.layout.RenderColumns(leftView, treeView, chatView, codeView)
 
 	case layout.ThreeColumn:
@@ -1561,7 +2832,7 @@ func (m *AppModel) renderMainArea() string {
 		chatView := m.renderPanel(
 			m.overlayChordHint(m.chat.View(), component.FocusChat, th),
 			component.FocusChat, th)
-		codeView := m.renderPanel(m.codePanel.View(), component.FocusCodeViewer, th)
+		codeView := m.renderPanel(m.codePanelView(), component.FocusCodeViewer, th)
 		return m.layout.RenderColumns(leftView, chatView, codeView)
 
 	case layout.TwoColumn:
@@ -1602,7 +2873,7 @@ func (m *AppModel) panelContent(id component.FocusID) string {
 	case component.FocusChat:
 		return m.chat.View()
 	case component.FocusCodeViewer:
-		return m.codePanel.View()
+		return m.codePanelView()
 	case component.FocusFileTree:
 		return m.fileTree.View()
 	default:
@@ -1610,20 +2881,36 @@ func (m *AppModel) panelContent(id component.FocusID) string {
 	}
 }
 
+// chordHintLines is the number of lines consumed by the chord hint overlay
+// (label row + divider row).
+const chordHintLines = 2
+
 // overlayChordHint prepends the chord hint bar to content when a chord is active.
+// The content is trimmed from the bottom so the total line count stays within
+// the panel's inner height budget, preventing border clipping from MaxHeight.
 func (m *AppModel) overlayChordHint(content string, panelID component.FocusID, th *theme.Theme) string {
 	hint := m.chordHint(th)
 	if hint == "" {
 		return content
 	}
-	w, _ := m.layout.GetPanelSize(panelID)
+	w, h := m.layout.GetPanelSize(panelID)
 	innerW := max(w-panelBorderSize, 1)
+	innerH := max(h-panelBorderSize, 1)
 	hintWidth := lipgloss.Width(hint)
 	pad := max(innerW-hintWidth, 0)
 	divider := lipgloss.NewStyle().
 		Foreground(th.Palette.Border).
 		Render(strings.Repeat("\u2500", innerW))
-	return strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + content
+
+	// Trim content from the bottom to make room for the hint + divider,
+	// keeping total output within innerH lines.
+	lines := strings.Split(content, "\n")
+	maxContent := max(innerH-chordHintLines, 0)
+	if len(lines) > maxContent {
+		lines = lines[:maxContent]
+	}
+
+	return strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + strings.Join(lines, "\n")
 }
 
 // isLeftPanelFocused returns true when either sub-section of the left panel has focus.
@@ -1715,199 +3002,126 @@ func (m *AppModel) syncFocusState() {
 	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
 	m.codePanel.SetFocused(current == component.FocusCodeViewer)
+	m.inlineEditor.SetFocused(current == component.FocusCodeViewer && m.editMode)
 	m.fileTree.SetFocused(current == component.FocusFileTree)
 }
 
-// focusEdge encodes a (panel, direction) pair for spatial focus lookup.
-type focusEdge struct {
-	from component.FocusID
-	key  string
-}
-
-// leftSlotSentinel is a placeholder FocusID in spatial adjacency maps
-// representing whichever panel currently occupies the left ring's active slot.
-const leftSlotSentinel component.FocusID = -1
-
-// rightSlotSentinel is a placeholder FocusID in spatial adjacency maps
-// representing whichever panel currently occupies the right ring's active slot.
-const rightSlotSentinel component.FocusID = -2
-
-// slotMapping pairs a sentinel with the actual panel it represents.
-type slotMapping struct {
-	sentinel component.FocusID
-	actual   component.FocusID
-}
-
-// fourColumnSpatialMap defines panel adjacency when all 4 columns are visible.
-//
-//	┌──────────┬──────────┬───────────┬──────────┐
-//	│ Sessions │ FileTree │ Chat      │ Code     │
-//	│──────────│          │           │ Viewer   │
-//	│ Agents   │          │───────────│          │
-//	│          │          │ Input     │          │
-//	└──────────┴──────────┴───────────┴──────────┘
-var fourColumnSpatialMap = map[focusEdge]component.FocusID{
-	{component.FocusInput, "shift+up"}:    component.FocusChat,
-	{component.FocusInput, "shift+left"}:  component.FocusAgentPanel,
-	{component.FocusInput, "shift+right"}: component.FocusCodeViewer,
-
-	{component.FocusChat, "shift+down"}:  component.FocusInput,
-	{component.FocusChat, "shift+left"}:  component.FocusFileTree,
-	{component.FocusChat, "shift+right"}: component.FocusCodeViewer,
-
-	{component.FocusFileTree, "shift+left"}:  component.FocusSessionPanel,
-	{component.FocusFileTree, "shift+right"}: component.FocusChat,
-	{component.FocusFileTree, "shift+down"}:  component.FocusInput,
-
-	{component.FocusSessionPanel, "shift+right"}: component.FocusFileTree,
-	{component.FocusSessionPanel, "shift+down"}:  component.FocusAgentPanel,
-
-	{component.FocusAgentPanel, "shift+right"}: component.FocusFileTree,
-	{component.FocusAgentPanel, "shift+up"}:    component.FocusSessionPanel,
-	{component.FocusAgentPanel, "shift+down"}:  component.FocusInput,
-
-	{component.FocusCodeViewer, "shift+left"}: component.FocusChat,
-	{component.FocusCodeViewer, "shift+down"}: component.FocusInput,
-}
-
-// threeColumnSpatialMap defines adjacency with left column cycling
-// (Session/FileTree via leftSlotSentinel), Chat in center, Code on right.
-var threeColumnSpatialMap = map[focusEdge]component.FocusID{
-	{component.FocusInput, "shift+up"}:    component.FocusChat,
-	{component.FocusInput, "shift+left"}:  leftSlotSentinel,
-	{component.FocusInput, "shift+right"}: component.FocusCodeViewer,
-
-	{component.FocusChat, "shift+down"}:  component.FocusInput,
-	{component.FocusChat, "shift+left"}:  leftSlotSentinel,
-	{component.FocusChat, "shift+right"}: component.FocusCodeViewer,
-
-	{leftSlotSentinel, "shift+right"}: component.FocusChat,
-	{leftSlotSentinel, "shift+down"}:  component.FocusInput,
-
-	// Session composite: Agent is below Session in the left column.
-	{component.FocusSessionPanel, "shift+down"}: component.FocusAgentPanel,
-	{component.FocusAgentPanel, "shift+up"}:     component.FocusSessionPanel,
-	{component.FocusAgentPanel, "shift+right"}:  component.FocusChat,
-	{component.FocusAgentPanel, "shift+down"}:   component.FocusInput,
-
-	{component.FocusCodeViewer, "shift+left"}: component.FocusChat,
-	{component.FocusCodeViewer, "shift+down"}: component.FocusInput,
-}
-
-// twoColumnSpatialMap defines adjacency with left column cycling
-// (leftSlotSentinel) and right column cycling (rightSlotSentinel).
-var twoColumnSpatialMap = map[focusEdge]component.FocusID{
-	{component.FocusInput, "shift+up"}:   rightSlotSentinel,
-	{component.FocusInput, "shift+left"}: leftSlotSentinel,
-
-	{rightSlotSentinel, "shift+down"}: component.FocusInput,
-	{rightSlotSentinel, "shift+left"}: leftSlotSentinel,
-
-	{leftSlotSentinel, "shift+right"}: rightSlotSentinel,
-	{leftSlotSentinel, "shift+down"}:  component.FocusInput,
-
-	// Session composite sub-navigation.
-	{component.FocusSessionPanel, "shift+down"}: component.FocusAgentPanel,
-	{component.FocusAgentPanel, "shift+up"}:     component.FocusSessionPanel,
-	{component.FocusAgentPanel, "shift+right"}:  rightSlotSentinel,
-	{component.FocusAgentPanel, "shift+down"}:   component.FocusInput,
-}
-
-// singleColumnSpatialMap defines adjacency when a single swappable panel
-// (Chat, Code, or FileTree) is stacked above Input.
-var singleColumnSpatialMap = map[focusEdge]component.FocusID{
-	{component.FocusInput, "shift+up"}: leftSlotSentinel,
-	{leftSlotSentinel, "shift+down"}:   component.FocusInput,
-}
-
-// singleColumnSessionMap defines adjacency when the Session composite
-// (Session + Agent) fills the single column above Input.
-var singleColumnSessionMap = map[focusEdge]component.FocusID{
-	{component.FocusInput, "shift+up"}:          component.FocusSessionPanel,
-	{component.FocusSessionPanel, "shift+down"}: component.FocusAgentPanel,
-	{component.FocusAgentPanel, "shift+up"}:     component.FocusSessionPanel,
-	{component.FocusAgentPanel, "shift+down"}:   component.FocusInput,
-}
-
-// spatialFocusTarget resolves a shift+arrow key to the panel it should
-// navigate to, accounting for the current layout mode and dual ring state.
+// spatialFocusTarget resolves an alt+shift+arrow key to the panel it should
+// navigate to using grid-based navigation. Panels are arranged in rows;
+// left/right cycle through reading order (wrapping between rows), while
+// up/down jump to the leftmost panel of the adjacent row.
 func (m *AppModel) spatialFocusTarget(key string) (component.FocusID, bool) {
-	mode := m.layout.Mode()
-	slots := m.buildSlotMappings(mode)
-	adjacency := m.spatialAdjacency(mode)
-	return resolveSpatial(adjacency, m.focus.Current(), key, slots)
-}
+	grid := m.buildFocusGrid()
+	current := m.focus.Current()
 
-// buildSlotMappings returns the sentinel→actual mappings for the current mode.
-func (m *AppModel) buildSlotMappings(mode layout.LayoutMode) []slotMapping {
-	switch mode {
-	case layout.FourColumn:
-		return nil
-	case layout.ThreeColumn:
-		return []slotMapping{
-			{leftSlotSentinel, m.leftRing.current()},
-		}
-	case layout.TwoColumn:
-		return []slotMapping{
-			{leftSlotSentinel, m.leftRing.current()},
-			{rightSlotSentinel, m.rightRing.current()},
-		}
-	default:
-		return []slotMapping{
-			{leftSlotSentinel, m.leftRing.current()},
-		}
-	}
-}
-
-// spatialAdjacency selects the adjacency map for the current mode and ring.
-func (m *AppModel) spatialAdjacency(mode layout.LayoutMode) map[focusEdge]component.FocusID {
-	switch mode {
-	case layout.FourColumn:
-		return fourColumnSpatialMap
-	case layout.ThreeColumn:
-		return threeColumnSpatialMap
-	case layout.TwoColumn:
-		return twoColumnSpatialMap
-	case layout.SingleColumn:
-		if m.leftRing.current() == component.FocusSessionPanel {
-			return singleColumnSessionMap
-		}
-		return singleColumnSpatialMap
-	default:
-		return singleColumnSpatialMap
-	}
-}
-
-// resolveSpatial looks up a target in the adjacency map, substituting
-// sentinels for actual panels in both source and target positions.
-func resolveSpatial(adjacency map[focusEdge]component.FocusID, from component.FocusID, key string, slots []slotMapping) (component.FocusID, bool) {
-	target, found := lookupWithSlots(adjacency, from, key, slots)
-	if !found {
-		return 0, false
-	}
-	// Resolve sentinel in target.
-	for _, s := range slots {
-		if target == s.sentinel {
-			return s.actual, true
-		}
-	}
-	return target, true
-}
-
-// lookupWithSlots tries a direct map lookup, then for each slot where
-// from matches the slot's actual panel, retries with the slot's sentinel.
-func lookupWithSlots(adjacency map[focusEdge]component.FocusID, from component.FocusID, key string, slots []slotMapping) (component.FocusID, bool) {
-	if target, ok := adjacency[focusEdge{from, key}]; ok {
-		return target, true
-	}
-	for _, s := range slots {
-		if from == s.actual {
-			if target, ok := adjacency[focusEdge{s.sentinel, key}]; ok {
-				return target, ok
+	row, col := -1, -1
+	for r, panels := range grid {
+		for c, id := range panels {
+			if id == current {
+				row, col = r, c
+				break
 			}
 		}
+		if row >= 0 {
+			break
+		}
+	}
+	if row < 0 {
+		return 0, false
+	}
+
+	switch key {
+	case "alt+shift+right":
+		col++
+		if col >= len(grid[row]) {
+			row = (row + 1) % len(grid)
+			col = 0
+		}
+		return grid[row][col], true
+	case "alt+shift+left":
+		col--
+		if col < 0 {
+			row = (row - 1 + len(grid)) % len(grid)
+			col = len(grid[row]) - 1
+		}
+		return grid[row][col], true
+	case "alt+shift+up":
+		if row <= 0 {
+			return 0, false
+		}
+		return grid[row-1][0], true
+	case "alt+shift+down":
+		if row >= len(grid)-1 {
+			return 0, false
+		}
+		return grid[row+1][0], true
 	}
 	return 0, false
+}
+
+// buildFocusGrid returns the visible panels arranged in rows (left-to-right)
+// based on the current layout mode and ring state.
+//
+//	FourColumn:
+//	  Row 0: Sessions, FileTree, Chat, CodeViewer
+//	  Row 1: Agents, Input
+//
+//	ThreeColumn:
+//	  Row 0: <left-ring>, Chat, CodeViewer
+//	  Row 1: [Agents,] Input
+//
+//	TwoColumn:
+//	  Row 0: <left-ring>, <right-ring>
+//	  Row 1: [Agents,] Input
+//
+//	SingleColumn:
+//	  Row 0: <left-ring>  (or SessionPanel)
+//	  Row 1: Input        (or AgentPanel)
+//	  Row 2:              (   Input)
+func (m *AppModel) buildFocusGrid() [][]component.FocusID {
+	switch m.layout.Mode() {
+	case layout.FourColumn:
+		return [][]component.FocusID{
+			{component.FocusSessionPanel, component.FocusFileTree, component.FocusChat, component.FocusCodeViewer},
+			{component.FocusAgentPanel, component.FocusInput},
+		}
+	case layout.ThreeColumn:
+		left := m.leftRing.current()
+		row1 := make([]component.FocusID, 0, 2)
+		if left == component.FocusSessionPanel {
+			row1 = append(row1, component.FocusAgentPanel)
+		}
+		row1 = append(row1, component.FocusInput)
+		return [][]component.FocusID{
+			{left, component.FocusChat, component.FocusCodeViewer},
+			row1,
+		}
+	case layout.TwoColumn:
+		left := m.leftRing.current()
+		right := m.rightRing.current()
+		row1 := make([]component.FocusID, 0, 2)
+		if left == component.FocusSessionPanel {
+			row1 = append(row1, component.FocusAgentPanel)
+		}
+		row1 = append(row1, component.FocusInput)
+		return [][]component.FocusID{
+			{left, right},
+			row1,
+		}
+	default: // SingleColumn
+		active := m.leftRing.current()
+		if active == component.FocusSessionPanel {
+			return [][]component.FocusID{
+				{component.FocusSessionPanel},
+				{component.FocusAgentPanel},
+				{component.FocusInput},
+			}
+		}
+		return [][]component.FocusID{
+			{active},
+			{component.FocusInput},
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1931,6 +3145,7 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 		m.sessionBridge,
 		m.streamBridge,
 		m.guideBridge,
+		m.lspBridge,
 	}
 	for _, b := range bridges {
 		if err := b.Start(program); err != nil {
@@ -2019,15 +3234,16 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		} else {
 			root = cwd
 		}
+		cfg.ProjectRoot = root
 	}
 
-	app := New(cfg, deps)
+	app := New(ctx, cfg, deps)
 	app.fileTree.SetRoot(root)
 
 	p := tea.NewProgram(
 		app,
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
+		tea.WithMouseAllMotion(),
 		tea.WithContext(ctx),
 	)
 
@@ -2041,7 +3257,6 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 	// In mock mode, seed data and start the mock agent.
 	if cfg.MockMode {
 		seedMockData(deps)
-		seedCodePanel(app.codePanel)
 		mock := NewMockAgent(deps.GuideBus, deps.ActivityBus, adapter, deps.Scope)
 		if err := mock.Start(); err != nil {
 			return err

@@ -209,7 +209,7 @@ func (t *TreeSitterTool) buildParseResultFast(tree *Tree, filePath, langName str
 		result.Types = extractDiffFiles(root)
 	}
 
-	result.Errors = collectParseErrors(root)
+	result.Errors = CollectParseErrors(root)
 
 	return result
 }
@@ -3039,7 +3039,7 @@ func (t *TreeSitterTool) buildParseResult(tree *Tree, filePath, langName string,
 	result.Functions = extractFunctions(root, langName)
 	result.Types = extractTypes(root, langName)
 	result.Imports = extractImports(root, langName)
-	result.Errors = collectParseErrors(root)
+	result.Errors = CollectParseErrors(root)
 
 	return result
 }
@@ -3240,23 +3240,6 @@ func parseImportSpec(node *Node) ImportInfo {
 	return info
 }
 
-func collectParseErrors(root *Node) []ParseError {
-	if !root.HasError() {
-		return nil
-	}
-
-	var errors []ParseError
-	walkAllChildren(root, func(node *Node) {
-		if node.HasError() && node.Type() == "ERROR" {
-			errors = append(errors, ParseError{
-				Line:    node.StartPosition().Row + 1,
-				Column:  node.StartPosition().Column,
-				Message: "syntax error",
-			})
-		}
-	})
-	return errors
-}
 
 func walkNamedChildren(node *Node, fn func(*Node)) {
 	count := node.NamedChildCount()

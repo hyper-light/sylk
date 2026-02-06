@@ -130,6 +130,37 @@ var NodeTypeToCategory = map[string]SyntaxCategory{
 	"iota":       CatConstant,
 	"none":       CatConstant,
 
+	// Strings (additional)
+	"escape_sequence": CatString,
+
+	// Constants (additional)
+	"self":  CatConstant,
+	"this":  CatConstant,
+	"super": CatConstant,
+
+	// Punctuation (leaf terminals)
+	"(": CatPunctuation, ")": CatPunctuation,
+	"{": CatPunctuation, "}": CatPunctuation,
+	"[": CatPunctuation, "]": CatPunctuation,
+	";": CatPunctuation, ",": CatPunctuation,
+	".": CatPunctuation, ":": CatPunctuation,
+
+	// Operators (leaf terminals)
+	"=":  CatOperator, "==": CatOperator, "!=": CatOperator,
+	"+":  CatOperator, "-": CatOperator, "*": CatOperator,
+	"/":  CatOperator, "%": CatOperator,
+	"<":  CatOperator, ">": CatOperator,
+	"<=": CatOperator, ">=": CatOperator,
+	"&&": CatOperator, "||": CatOperator,
+	"!":  CatOperator, "&": CatOperator,
+	"|":  CatOperator, "^": CatOperator,
+	"<<": CatOperator, ">>": CatOperator,
+	":=": CatOperator, "+=": CatOperator,
+	"->": CatOperator, "=>": CatOperator,
+
+	// Keywords (additional leaf types)
+	"type": CatKeyword,
+
 	// Namespace
 	"package_identifier": CatNamespace,
 	"module":             CatNamespace,
@@ -140,20 +171,20 @@ var NodeTypeToCategory = map[string]SyntaxCategory{
 // from the given palette.
 func SyntaxStyles(p Palette) map[SyntaxCategory]lipgloss.Style {
 	return map[SyntaxCategory]lipgloss.Style{
-		CatKeyword:     lipgloss.NewStyle().Foreground(p.Secondary).Bold(true),
-		CatFunction:    lipgloss.NewStyle().Foreground(p.Primary),
-		CatType:        lipgloss.NewStyle().Foreground(p.Info),
-		CatString:      lipgloss.NewStyle().Foreground(p.Success),
-		CatNumber:      lipgloss.NewStyle().Foreground(p.Warning),
-		CatComment:     lipgloss.NewStyle().Foreground(p.Muted).Italic(true),
-		CatOperator:    lipgloss.NewStyle().Foreground(p.Foreground),
-		CatVariable:    lipgloss.NewStyle().Foreground(p.Foreground),
-		CatConstant:    lipgloss.NewStyle().Foreground(p.Warning).Bold(true),
-		CatPunctuation: lipgloss.NewStyle().Foreground(p.Subtle),
-		CatTag:         lipgloss.NewStyle().Foreground(p.Error),
-		CatAttribute:   lipgloss.NewStyle().Foreground(p.Accent),
-		CatNamespace:   lipgloss.NewStyle().Foreground(p.Info).Bold(true),
-		CatBuiltin:     lipgloss.NewStyle().Foreground(p.Accent),
-		CatProperty:    lipgloss.NewStyle().Foreground(p.Info),
+		CatKeyword:     lipgloss.NewStyle().Foreground(p.Secondary).Bold(true), // mauve — reserved words
+		CatFunction:    lipgloss.NewStyle().Foreground(p.Primary),              // blue — functions & methods
+		CatType:        lipgloss.NewStyle().Foreground(p.Warning),              // yellow — type names
+		CatString:      lipgloss.NewStyle().Foreground(p.Success),              // green — string literals
+		CatNumber:      lipgloss.NewStyle().Foreground(p.Peach),               // peach — numeric literals
+		CatComment:     lipgloss.NewStyle().Foreground(p.Muted).Italic(true),  // muted — comments
+		CatOperator:    lipgloss.NewStyle().Foreground(p.Subtext),             // subtext — structural
+		CatVariable:    lipgloss.NewStyle().Foreground(p.Foreground),          // foreground — identifiers
+		CatConstant:    lipgloss.NewStyle().Foreground(p.Peach).Bold(true),    // peach bold — constants
+		CatPunctuation: lipgloss.NewStyle().Foreground(p.Subtext),             // subtext — delimiters
+		CatTag:         lipgloss.NewStyle().Foreground(p.Error),               // red — HTML/JSX tags
+		CatAttribute:   lipgloss.NewStyle().Foreground(p.Accent),              // pink — attributes
+		CatNamespace:   lipgloss.NewStyle().Foreground(p.Teal),                // teal — packages/imports
+		CatBuiltin:     lipgloss.NewStyle().Foreground(p.Teal),                // teal — built-in functions
+		CatProperty:    lipgloss.NewStyle().Foreground(p.Lavender),            // lavender — field access
 	}
 }

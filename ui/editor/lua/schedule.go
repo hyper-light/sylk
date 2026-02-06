@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	glua "github.com/yuin/gopher-lua"
+	rt "github.com/arnodel/golua/runtime"
 )
 
 // ---------------------------------------------------------------------------
@@ -29,7 +29,7 @@ var errScheduleFull = errors.New("schedule buffer full")
 
 // deferEntry pairs a Lua callback with the earliest time it should run.
 type deferEntry struct {
-	Fn       *glua.LFunction
+	Fn       rt.Value
 	RunAfter time.Time
 }
 
@@ -41,7 +41,7 @@ type deferEntry struct {
 // Immediate callbacks are held in a bounded channel; deferred callbacks
 // sit in a bounded slice guarded by a mutex.
 type Scheduler struct {
-	pending  chan *glua.LFunction
+	pending  chan rt.Value
 	mu       sync.Mutex
 	deferred []deferEntry
 }
@@ -49,13 +49,13 @@ type Scheduler struct {
 // NewScheduler returns a ready-to-use scheduler.
 func NewScheduler() *Scheduler {
 	return &Scheduler{
-		pending:  make(chan *glua.LFunction, scheduleBufferSize),
+		pending:  make(chan rt.Value, scheduleBufferSize),
 		deferred: make([]deferEntry, 0, maxDeferredCallbacks),
 	}
 }
 
 // Schedule queues fn for execution on the next Drain cycle.
-func (s *Scheduler) Schedule(fn *glua.LFunction) error {
+func (s *Scheduler) Schedule(fn rt.Value) error {
 	select {
 	case s.pending <- fn:
 		return nil
@@ -65,7 +65,7 @@ func (s *Scheduler) Schedule(fn *glua.LFunction) error {
 }
 
 // DeferFn queues fn for execution after delayMs milliseconds.
-func (s *Scheduler) DeferFn(fn *glua.LFunction, delayMs int) error {
+func (s *Scheduler) DeferFn(fn rt.Value, delayMs int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.deferred) >= maxDeferredCallbacks {
@@ -80,20 +80,20 @@ func (s *Scheduler) DeferFn(fn *glua.LFunction, delayMs int) error {
 
 // Drain executes all pending and ready deferred callbacks.  It returns a
 // slice of any errors encountered during callback execution.
-func (s *Scheduler) Drain(rt *Runtime) []error {
+func (s *Scheduler) Drain(luaRT *Runtime) []error {
 	var errs []error
-	errs = append(errs, s.drainImmediate(rt)...)
-	errs = append(errs, s.drainDeferred(rt)...)
+	errs = append(errs, s.drainImmediate(luaRT)...)
+	errs = append(errs, s.drainDeferred(luaRT)...)
 	return errs
 }
 
 // drainImmediate processes all entries currently in the pending channel.
-func (s *Scheduler) drainImmediate(rt *Runtime) []error {
+func (s *Scheduler) drainImmediate(luaRT *Runtime) []error {
 	var errs []error
 	for {
 		select {
 		case fn := <-s.pending:
-			if _, err := rt.CallFunction(fn); err != nil {
+			if _, err := luaRT.CallFunction(fn); err != nil {
 				errs = append(errs, err)
 			}
 		default:
@@ -103,7 +103,7 @@ func (s *Scheduler) drainImmediate(rt *Runtime) []error {
 }
 
 // drainDeferred fires any deferred entries whose RunAfter time has passed.
-func (s *Scheduler) drainDeferred(rt *Runtime) []error {
+func (s *Scheduler) drainDeferred(luaRT *Runtime) []error {
 	s.mu.Lock()
 	now := time.Now()
 	ready, remaining := partitionDeferred(s.deferred, now)
@@ -112,7 +112,7 @@ func (s *Scheduler) drainDeferred(rt *Runtime) []error {
 
 	var errs []error
 	for _, entry := range ready {
-		if _, err := rt.CallFunction(entry.Fn); err != nil {
+		if _, err := luaRT.CallFunction(entry.Fn); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -139,32 +139,32 @@ func partitionDeferred(entries []deferEntry, now time.Time) (ready, remaining []
 // ---------------------------------------------------------------------------
 
 // registerScheduleFunctions attaches vim.schedule and vim.defer_fn.
-func registerScheduleFunctions(L *glua.LState, vim *glua.LTable, rt *Runtime) {
-	vim.RawSetString("schedule", L.NewFunction(func(ls *glua.LState) int {
-		return luaSchedule(ls, rt)
-	}))
-	vim.RawSetString("defer_fn", L.NewFunction(func(ls *glua.LState) int {
-		return luaDeferFn(ls, rt)
-	}))
+func registerScheduleFunctions(_ *rt.Runtime, vim *rt.Table, luaRT *Runtime) {
+	setGoFunc(vim, "schedule", func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+		return luaSchedule(t, c, luaRT)
+	}, 1, false)
+	setGoFunc(vim, "defer_fn", func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+		return luaDeferFn(t, c, luaRT)
+	}, 2, false)
 }
 
 // luaSchedule implements vim.schedule(fn).
-func luaSchedule(L *glua.LState, rt *Runtime) int {
-	fn, ok := L.Get(1).(*glua.LFunction)
-	if !ok {
-		return 0
+func luaSchedule(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	fn := c.Arg(0)
+	if _, ok := fn.TryCallable(); !ok {
+		return c.Next(), nil
 	}
-	_ = rt.Scheduler.Schedule(fn)
-	return 0
+	_ = luaRT.Scheduler.Schedule(fn)
+	return c.Next(), nil
 }
 
 // luaDeferFn implements vim.defer_fn(fn, delay).
-func luaDeferFn(L *glua.LState, rt *Runtime) int {
-	fn, ok := L.Get(1).(*glua.LFunction)
-	if !ok {
-		return 0
+func luaDeferFn(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	fn := c.Arg(0)
+	if _, ok := fn.TryCallable(); !ok {
+		return c.Next(), nil
 	}
-	delayMs := L.ToInt(2)
-	_ = rt.Scheduler.DeferFn(fn, delayMs)
-	return 0
+	delayMs, _ := c.IntArg(1)
+	_ = luaRT.Scheduler.DeferFn(fn, int(delayMs))
+	return c.Next(), nil
 }

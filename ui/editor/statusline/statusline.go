@@ -14,15 +14,18 @@ import (
 
 // StatusLine holds the state displayed in the editor's bottom status bar.
 type StatusLine struct {
-	theme      *theme.Theme
-	mode       mode.Mode
-	fileName   string
-	modified   bool
-	line       int
-	col        int
-	totalLines int
-	fileType   string
-	encoding   string
+	theme           *theme.Theme
+	mode            mode.Mode
+	fileName        string
+	modified        bool
+	line            int
+	col             int
+	totalLines      int
+	fileType        string
+	encoding        string
+	nodeType        string // tree-sitter node type at cursor
+	parseErrorCount int    // number of tree-sitter parse errors
+	jumpBack        bool   // jump-back is available (Ctrl+O)
 }
 
 // New creates a StatusLine with sensible defaults.
@@ -51,6 +54,15 @@ func (s *StatusLine) SetPosition(line, col, total int) {
 
 // SetModified updates the modification indicator.
 func (s *StatusLine) SetModified(m bool) { s.modified = m }
+
+// SetNodeType updates the displayed tree-sitter node type at the cursor.
+func (s *StatusLine) SetNodeType(nt string) { s.nodeType = nt }
+
+// SetParseErrorCount updates the displayed parse error count.
+func (s *StatusLine) SetParseErrorCount(n int) { s.parseErrorCount = n }
+
+// SetJumpBack updates the jump-back availability indicator.
+func (s *StatusLine) SetJumpBack(available bool) { s.jumpBack = available }
 
 // View renders the status line to fill the given width.
 func (s *StatusLine) View(width int) string {
@@ -82,15 +94,26 @@ func (s *StatusLine) renderLeft() string {
 	return fmt.Sprintf(" %s %s%s ", badge, name, mod)
 }
 
-// renderRight produces the right portion: filetype | encoding | line:col/total
+// renderRight produces the right portion: [errors] [node] filetype | encoding | line:col/total
 func (s *StatusLine) renderRight() string {
 	ft := s.fileType
 	if ft == "" {
 		ft = "plain"
 	}
-	return fmt.Sprintf(" %s | %s | %d:%d/%d ",
-		ft, s.encoding,
-		s.line+1, s.col+1, s.totalLines)
+	var parts []string
+	if s.jumpBack {
+		parts = append(parts, "Ctrl+O \u2190")
+	}
+	if s.parseErrorCount > 0 {
+		parts = append(parts, fmt.Sprintf("E:%d", s.parseErrorCount))
+	}
+	if s.nodeType != "" {
+		parts = append(parts, s.nodeType)
+	}
+	parts = append(parts, ft)
+	parts = append(parts, s.encoding)
+	parts = append(parts, fmt.Sprintf("%d:%d/%d", s.line+1, s.col+1, s.totalLines))
+	return " " + strings.Join(parts, " | ") + " "
 }
 
 // modeBadge returns the styled mode indicator.

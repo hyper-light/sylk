@@ -17,23 +17,29 @@ import (
 	"github.com/adalundhe/sylk/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	devicons "github.com/epilande/go-devicons"
 )
 
 // indentWidth is the number of spaces per nesting level.
 // Derived from: 2 spaces per level is standard for compact tree views.
 const indentWidth = 2
 
-// headerHeight is the vertical space consumed by the header.
+// headerHeight is the vertical space consumed by the title line alone.
 // Derived from: 1 title line = 1.
 const headerHeight = 1
 
-// footerHeight is the vertical space consumed by the bottom line in tree mode.
-// Derived from: 1 search hint line = 1.
-const footerHeight = 1
+// topChromeHeight is the vertical space consumed by the top section in
+// both tree and search modes.
+// Derived from: header(1) + input-or-hint(1) + divider(1) = 3.
+const topChromeHeight = 3
 
 // searchFooterHeight is the vertical space consumed by the search-mode footer.
-// Derived from: divider(1) + search input(1) + toolbar separator(1) + toolbar(1) = 4.
-const searchFooterHeight = 4
+// Derived from: toolbar separator(1) + toolbar(1) = 2.
+const searchFooterHeight = 2
+
+// newEntryFooterHeight is the vertical space consumed by the new-entry input.
+// Derived from: separator(1) + input line(1) = 2.
+const newEntryFooterHeight = 2
 
 // iconDir is the prefix glyph for expanded directories.
 const iconDir = theme.IconCollapse
@@ -244,10 +250,35 @@ type Model struct {
 	scopeQuery     []rune             // Path scope text input contents.
 	compiledRegexp *regexp.Regexp     // Cached compiled regex (nil if invalid/unused).
 
+	// Cursor blink state for search inputs.
+	cursorBlink bool
+	lastBlinkAt time.Time
+
 	// Snapshot of tree state before entering search, restored on exit.
 	savedEntries []Entry
 	savedCursor  int
 	savedScroll  int
+
+	// New-entry state: two-phase (pending chord → active input).
+	pendingNewEntry bool   // Alt+N pressed, waiting for F (file) or D (dir).
+	newEntryActive  bool   // Whether the input footer is visible.
+	newEntryIsDir   bool   // true = directory, false = file.
+	newEntryDir     string // Parent directory for the new entry.
+	newEntryInput   []rune // Text being typed (capped at maxInputLen).
+
+	// Delete confirmation state.
+	deleteConfirm     bool   // Whether the delete confirmation footer is visible.
+	deleteConfirmPath string // Absolute path of the entry to delete.
+	deleteConfirmDir  bool   // true if the target is a directory.
+
+	// Rename inline input state.
+	renameActive bool   // Whether the rename input footer is visible.
+	renamePath   string // Absolute path of the entry being renamed.
+	renameIsDir  bool   // true if the target is a directory.
+	renameInput  []rune // New name being typed (capped at maxInputLen).
+
+	// Font capability: true when Nerd Font symbols are available.
+	nerdFonts bool
 }
 
 // Verify interface compliance at compile time.
@@ -264,6 +295,9 @@ func New(th *theme.Theme) *Model {
 	}
 }
 
+// SetNerdFonts enables or disables Nerd Font icon rendering.
+func (m *Model) SetNerdFonts(available bool) { m.nerdFonts = available }
+
 // ---------------------------------------------------------------------------
 // component.Component
 // ---------------------------------------------------------------------------
@@ -277,6 +311,13 @@ func (m *Model) Init() tea.Cmd {
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
 	case msg.TickMsg:
+		if m.focused && (m.mode == viewSearch || m.newEntryActive || m.renameActive) {
+			const blinkHalfPeriod = 530 * time.Millisecond
+			if typed.Time.Sub(m.lastBlinkAt) >= blinkHalfPeriod {
+				m.cursorBlink = !m.cursorBlink
+				m.lastBlinkAt = typed.Time
+			}
+		}
 		return m, nil
 	case tea.KeyMsg:
 		return m, m.handleKey(typed)
@@ -425,7 +466,14 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 
 // clickTreeMode handles clicks in tree browsing mode.
 func (m *Model) clickTreeMode(viewY int) tea.Cmd {
-	bodyY := viewY - headerHeight
+	// Click on search hint (row 1) → enter search mode.
+	if viewY == headerHeight {
+		m.enterSearch()
+		return nil
+	}
+
+	// Click in body area (rows topChromeHeight .. topChromeHeight+bh-1).
+	bodyY := viewY - topChromeHeight
 	if bodyY < 0 {
 		return nil
 	}
@@ -437,26 +485,30 @@ func (m *Model) clickTreeMode(viewY int) tea.Cmd {
 	return m.activateEntry()
 }
 
-// clickSearchMode handles clicks in search mode, dispatching to body,
-// search input, or toolbar based on Y position.
+// clickSearchMode handles clicks in search mode, dispatching to search
+// input, body, or toolbar based on Y position.
 func (m *Model) clickSearchMode(viewX, viewY int) tea.Cmd {
 	bh := m.bodyHeight()
-	bodyY := viewY - headerHeight
 
-	// Click in body area: activate search result.
+	// Layout: header(0) | search bar(1) | divider(2) | body(3..3+bh-1) | toolbar sep | toolbar.
+
+	// Click on search bar (row 1, below header).
+	if viewY == headerHeight {
+		m.searchFocus = focusQuery
+		return nil
+	}
+
+	// Click in body area (rows topChromeHeight .. topChromeHeight+bh-1).
+	bodyY := viewY - topChromeHeight
 	if bodyY >= 0 && bodyY < bh {
 		return m.clickSearchBody(bodyY)
 	}
 
-	// Footer layout (relative to headerHeight + bh):
-	// +0 divider, +1 input, +2 toolbar separator, +3 toolbar.
-	footerBase := headerHeight + bh
-	switch viewY {
-	case footerBase + 1:
-		m.searchFocus = focusQuery
-	case footerBase + 3:
+	// Toolbar (row topChromeHeight + bh + 1, after toolbar separator).
+	if viewY == topChromeHeight+bh+1 {
 		return m.clickToolbar(viewX)
 	}
+
 	return nil
 }
 
@@ -575,6 +627,18 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 	if !m.focused {
 		return nil
 	}
+	if m.deleteConfirm {
+		return m.handleDeleteConfirmKey(key)
+	}
+	if m.renameActive {
+		return m.handleRenameKey(key)
+	}
+	if m.newEntryActive {
+		return m.handleNewEntryKey(key)
+	}
+	if m.pendingNewEntry {
+		return m.handlePendingNewEntry(key)
+	}
 	if m.mode == viewSearch {
 		return m.handleSearchKey(key)
 	}
@@ -602,6 +666,13 @@ func (m *Model) handleTreeKey(key tea.KeyMsg) tea.Cmd {
 		m.ensureCursorVisible()
 	case "/":
 		m.enterSearch()
+	case "alt+n":
+		m.pendingNewEntry = true
+		return nil
+	case "alt+r":
+		return m.requestRename()
+	case "alt+backspace", "alt+delete":
+		return m.requestDelete()
 	}
 	return nil
 }
@@ -609,6 +680,8 @@ func (m *Model) handleTreeKey(key tea.KeyMsg) tea.Cmd {
 // handleSearchKey processes keys in search mode, dispatching to the
 // appropriate focus zone handler.
 func (m *Model) handleSearchKey(key tea.KeyMsg) tea.Cmd {
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
 	switch key.String() {
 	case "ctrl+u":
 		m.exitSearch()
@@ -667,7 +740,7 @@ func (m *Model) handleQueryInput(key tea.KeyMsg) tea.Cmd {
 	if key.String() == "backspace" {
 		return m.deleteQueryChar()
 	}
-	if key.Type != tea.KeyRunes {
+	if key.Type != tea.KeyRunes && key.Type != tea.KeySpace {
 		return nil
 	}
 	m.appendToQuery([]rune(key.String()))
@@ -725,7 +798,7 @@ func (m *Model) handleScopeInput(key tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
-	if key.Type != tea.KeyRunes {
+	if key.Type != tea.KeyRunes && key.Type != tea.KeySpace {
 		return nil
 	}
 	m.appendToScope([]rune(key.String()))
@@ -784,6 +857,353 @@ func (m *Model) activateEntry() tea.Cmd {
 			Name:     entry.Name,
 			Language: langFromPath(entry.Path),
 		}
+	}
+}
+
+// SelectedDir returns the directory path for the current cursor position.
+// If the cursor is on a directory, that directory's path is returned.
+// If the cursor is on a file, the file's parent directory is returned.
+// Falls back to rootPath when there are no entries.
+func (m *Model) SelectedDir() string {
+	if m.cursor >= len(m.entries) {
+		return m.rootPath
+	}
+	entry := &m.entries[m.cursor]
+	if entry.IsDir {
+		return entry.Path
+	}
+	return filepath.Dir(entry.Path)
+}
+
+// requestRename activates the inline rename input footer, pre-filled with
+// the current entry name.
+func (m *Model) requestRename() tea.Cmd {
+	if m.cursor >= len(m.entries) {
+		return nil
+	}
+	entry := &m.entries[m.cursor]
+	m.renameActive = true
+	m.renamePath = entry.Path
+	m.renameIsDir = entry.IsDir
+	m.renameInput = []rune(entry.Name)
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
+	return nil
+}
+
+// requestDelete activates the inline delete confirmation footer.
+func (m *Model) requestDelete() tea.Cmd {
+	if m.cursor >= len(m.entries) {
+		return nil
+	}
+	entry := &m.entries[m.cursor]
+	m.deleteConfirm = true
+	m.deleteConfirmPath = entry.Path
+	m.deleteConfirmDir = entry.IsDir
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// New-entry inline input
+// ---------------------------------------------------------------------------
+
+// handlePendingNewEntry resolves the Alt+N chord: F activates file input,
+// D activates directory input, anything else cancels.
+func (m *Model) handlePendingNewEntry(key tea.KeyMsg) tea.Cmd {
+	m.pendingNewEntry = false
+	switch key.String() {
+	case "f":
+		m.EnterNewEntry(m.SelectedDir(), false)
+	case "d":
+		m.EnterNewEntry(m.SelectedDir(), true)
+	}
+	return nil
+}
+
+// EnterNewEntry activates the inline input footer for creating a new file
+// or directory inside dir.
+func (m *Model) EnterNewEntry(dir string, isDir bool) {
+	m.newEntryActive = true
+	m.newEntryIsDir = isDir
+	m.newEntryDir = dir
+	m.newEntryInput = nil
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
+}
+
+// exitNewEntry cancels the inline input without creating anything.
+func (m *Model) exitNewEntry() {
+	m.newEntryActive = false
+	m.newEntryInput = nil
+	m.newEntryDir = ""
+}
+
+// handleNewEntryKey processes keys while the new-entry input is active.
+func (m *Model) handleNewEntryKey(key tea.KeyMsg) tea.Cmd {
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
+
+	switch key.String() {
+	case "escape":
+		m.exitNewEntry()
+		return nil
+	case "enter":
+		return m.commitNewEntry()
+	case "backspace":
+		if len(m.newEntryInput) > 0 {
+			m.newEntryInput = m.newEntryInput[:len(m.newEntryInput)-1]
+		}
+		return nil
+	}
+	// Append printable runes.
+	for _, r := range key.Runes {
+		if len(m.newEntryInput) >= maxInputLen {
+			break
+		}
+		m.newEntryInput = append(m.newEntryInput, r)
+	}
+	return nil
+}
+
+// commitNewEntry creates the file or directory on disk, inserts it into the
+// tree at the correct position, and emits a result message.
+func (m *Model) commitNewEntry() tea.Cmd {
+	name := strings.TrimSpace(string(m.newEntryInput))
+	if name == "" {
+		m.exitNewEntry()
+		return nil
+	}
+	fullPath := filepath.Join(m.newEntryDir, name)
+	isDir := m.newEntryIsDir
+
+	if isDir {
+		if err := os.MkdirAll(fullPath, 0o755); err != nil {
+			m.exitNewEntry()
+			return nil
+		}
+	} else {
+		// Ensure parent directory exists for nested paths.
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			m.exitNewEntry()
+			return nil
+		}
+		if err := os.WriteFile(fullPath, nil, 0o644); err != nil {
+			m.exitNewEntry()
+			return nil
+		}
+	}
+
+	dir := m.newEntryDir
+	m.exitNewEntry()
+
+	// Insert the new entry into the live tree at the correct sorted position
+	// within its parent directory, preserving existing expand/collapse state.
+	m.insertNewTreeEntry(dir, fullPath, name, isDir)
+
+	return func() tea.Msg {
+		return msg.FileTreeEntryCreatedMsg{Path: fullPath, IsDir: isDir}
+	}
+}
+
+// insertNewTreeEntry inserts a newly created entry into the flattened tree
+// at the correct sorted position among its siblings, then moves the cursor
+// to the new entry.
+func (m *Model) insertNewTreeEntry(parentDir, fullPath, name string, isDir bool) {
+	depth := 0
+	startPos := 0
+
+	if parentDir == m.rootPath {
+		// Root-level insertion: siblings are all depth-0 entries.
+		depth = 0
+		startPos = 0
+	} else {
+		parentIdx, parentFound := m.pathIndex[parentDir]
+		if !parentFound {
+			return
+		}
+		parent := &m.entries[parentIdx]
+		if !parent.IsDir {
+			return
+		}
+		// Ensure parent is expanded so the child is visible.
+		if !parent.Expanded {
+			m.expandAt(parentIdx)
+			parentIdx = m.pathIndex[parentDir]
+		}
+		depth = parent.Depth + 1
+		startPos = parentIdx + 1
+	}
+
+	newEntry := Entry{
+		Name:  name,
+		Path:  fullPath,
+		IsDir: isDir,
+		Depth: depth,
+	}
+
+	// Walk siblings to find the sorted insertion point.
+	// Directories sort before files; within each group, sort alphabetically.
+	insertPos := startPos
+	for insertPos < len(m.entries) && m.entries[insertPos].Depth >= depth {
+		sib := &m.entries[insertPos]
+		if sib.Depth > depth {
+			insertPos++
+			continue
+		}
+		if isDir && !sib.IsDir {
+			break
+		}
+		if !isDir && sib.IsDir {
+			insertPos++
+			continue
+		}
+		if strings.ToLower(name) < strings.ToLower(sib.Name) {
+			break
+		}
+		insertPos++
+	}
+
+	m.entries = sliceInsert(m.entries, insertPos, []Entry{newEntry})
+	m.rebuildPathIndex()
+	m.cursor = insertPos
+	m.ensureCursorVisible()
+}
+
+// ---------------------------------------------------------------------------
+// Delete confirmation
+// ---------------------------------------------------------------------------
+
+// exitDeleteConfirm cancels the delete confirmation.
+func (m *Model) exitDeleteConfirm() {
+	m.deleteConfirm = false
+	m.deleteConfirmPath = ""
+}
+
+// handleDeleteConfirmKey processes keys while the delete confirmation is shown.
+func (m *Model) handleDeleteConfirmKey(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case "y":
+		return m.commitDelete()
+	case "n", "escape":
+		m.exitDeleteConfirm()
+	}
+	return nil
+}
+
+// commitDelete removes the file or directory from disk and the tree.
+func (m *Model) commitDelete() tea.Cmd {
+	path := m.deleteConfirmPath
+	isDir := m.deleteConfirmDir
+	m.exitDeleteConfirm()
+
+	if isDir {
+		if err := os.RemoveAll(path); err != nil {
+			return nil
+		}
+	} else {
+		if err := os.Remove(path); err != nil {
+			return nil
+		}
+	}
+
+	m.removeTreeEntry(path)
+
+	return func() tea.Msg {
+		return msg.FileTreeEntryDeletedMsg{Path: path, IsDir: isDir}
+	}
+}
+
+// removeTreeEntry removes an entry (and its descendants if a directory) from
+// the flattened tree and adjusts the cursor.
+func (m *Model) removeTreeEntry(path string) {
+	idx, ok := m.pathIndex[path]
+	if !ok {
+		return
+	}
+
+	// Determine range to remove: the entry itself plus any expanded children.
+	end := idx + 1
+	depth := m.entries[idx].Depth
+	for end < len(m.entries) && m.entries[end].Depth > depth {
+		end++
+	}
+
+	m.entries = sliceRemove(m.entries, idx, end)
+	m.rebuildPathIndex()
+
+	if m.cursor >= len(m.entries) {
+		m.cursor = max(len(m.entries)-1, 0)
+	}
+	m.ensureCursorVisible()
+}
+
+// ---------------------------------------------------------------------------
+// Rename inline input
+// ---------------------------------------------------------------------------
+
+// exitRename cancels the rename input.
+func (m *Model) exitRename() {
+	m.renameActive = false
+	m.renamePath = ""
+	m.renameInput = nil
+}
+
+// handleRenameKey processes keys while the rename input is active.
+func (m *Model) handleRenameKey(key tea.KeyMsg) tea.Cmd {
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
+
+	switch key.String() {
+	case "escape":
+		m.exitRename()
+		return nil
+	case "enter":
+		return m.commitRename()
+	case "backspace":
+		if len(m.renameInput) > 0 {
+			m.renameInput = m.renameInput[:len(m.renameInput)-1]
+		}
+		return nil
+	}
+	for _, r := range key.Runes {
+		if len(m.renameInput) >= maxInputLen {
+			break
+		}
+		m.renameInput = append(m.renameInput, r)
+	}
+	return nil
+}
+
+// commitRename renames the file or directory on disk and updates the tree.
+func (m *Model) commitRename() tea.Cmd {
+	newName := strings.TrimSpace(string(m.renameInput))
+	if newName == "" || newName == filepath.Base(m.renamePath) {
+		m.exitRename()
+		return nil
+	}
+
+	oldPath := m.renamePath
+	isDir := m.renameIsDir
+	newPath := filepath.Join(filepath.Dir(oldPath), newName)
+
+	if err := os.Rename(oldPath, newPath); err != nil {
+		m.exitRename()
+		return nil
+	}
+
+	m.exitRename()
+
+	// Update the entry in-place in the tree.
+	if idx, ok := m.pathIndex[oldPath]; ok {
+		m.entries[idx].Name = newName
+		m.entries[idx].Path = newPath
+		m.rebuildPathIndex()
+		m.cursor = idx
+		m.ensureCursorVisible()
+	}
+
+	return func() tea.Msg {
+		return msg.FileTreeEntryRenamedMsg{OldPath: oldPath, NewPath: newPath, IsDir: isDir}
 	}
 }
 
@@ -924,6 +1344,8 @@ func (m *Model) enterSearch() {
 	m.searchCursor = 0
 	m.searchScroll = 0
 	m.searchNumWidth = 0
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
 
 	// Initialize performance caches.
 	m.searchVersion = 0
@@ -1480,15 +1902,38 @@ func (m *Model) viewTreeMode() string {
 	// Apply bounce shift (same approach as code panel's applyCodeBounceShift).
 	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
 
-	// Combine header + body + footer.
+	// Combine header + search hint + divider + body + optional new-entry footer.
 	var b strings.Builder
 	b.WriteString(header)
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchHint(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchDivider(contentWidth))
 	for _, line := range bodyLines {
 		b.WriteByte('\n')
 		b.WriteString(line)
 	}
-	b.WriteByte('\n')
-	b.WriteString(m.renderSearchHint(contentWidth))
+	if m.deleteConfirm {
+		b.WriteByte('\n')
+		b.WriteString(m.renderToolbarSeparator(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderDeleteConfirm(contentWidth))
+	} else if m.pendingNewEntry {
+		b.WriteByte('\n')
+		b.WriteString(m.renderToolbarSeparator(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderNewEntryHint(contentWidth))
+	} else if m.renameActive {
+		b.WriteByte('\n')
+		b.WriteString(m.renderToolbarSeparator(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderRenameInput(contentWidth))
+	} else if m.newEntryActive {
+		b.WriteByte('\n')
+		b.WriteString(m.renderToolbarSeparator(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderNewEntryInput(contentWidth))
+	}
 	return b.String()
 }
 
@@ -1496,7 +1941,7 @@ func (m *Model) viewTreeMode() string {
 // Rendering: search mode
 // ---------------------------------------------------------------------------
 
-// viewSearchMode renders the header, search results, divider, search bar,
+// viewSearchMode renders the header, search bar, divider, search results,
 // and toolbar.
 func (m *Model) viewSearchMode() string {
 	contentWidth := max(m.width, 1)
@@ -1507,17 +1952,17 @@ func (m *Model) viewSearchMode() string {
 	bodyLines := m.renderSearchBody(bh, contentWidth, emptyLine)
 	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
 
-	// Compose: header + body + divider + input + toolbar separator + toolbar.
+	// Compose: header + search bar + divider + body + toolbar separator + toolbar.
 	var b strings.Builder
 	b.WriteString(header)
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchBar(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderSearchDivider(contentWidth))
 	for _, line := range bodyLines {
 		b.WriteByte('\n')
 		b.WriteString(line)
 	}
-	b.WriteByte('\n')
-	b.WriteString(m.renderSearchDivider(contentWidth))
-	b.WriteByte('\n')
-	b.WriteString(m.renderSearchBar(contentWidth))
 	b.WriteByte('\n')
 	b.WriteString(m.renderToolbarSeparator(contentWidth))
 	b.WriteByte('\n')
@@ -1561,29 +2006,30 @@ func (m *Model) renderPopulatedSearchBody(bh, contentWidth int, emptyLine string
 	return lines
 }
 
-// renderSearchBar renders the search input line. The cursor block is only
-// shown when the query input is the active focus zone.
+// renderSearchBar renders the search input line with a blinking block cursor
+// that stays visible regardless of which search element has keyboard focus.
 func (m *Model) renderSearchBar(contentWidth int) string {
 	prefixStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	queryStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
 	prefix := prefixStyle.Render("/ ")
 	prefixWidth := lipgloss.Width(prefix)
 
-	cursor := ""
-	cursorWidth := 0
-	if m.searchFocus == focusQuery {
-		cursorStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Primary)
-		cursor = cursorStyle.Render("█")
-		cursorWidth = lipgloss.Width(cursor)
-	}
+	// Always reserve 1 column for the cursor so layout is stable.
+	availableForQuery := max(contentWidth-prefixWidth-1, 0)
 
 	// Pre-truncate query text; show tail so recent keystrokes stay visible.
 	queryStr := string(m.searchQuery)
-	availableForQuery := max(contentWidth-prefixWidth-cursorWidth, 0)
 	queryRunes := []rune(queryStr)
 	if len(queryRunes) > availableForQuery {
 		queryStr = string(queryRunes[len(queryRunes)-availableForQuery:])
+	}
+
+	// Show blinking cursor only when this input has focus.
+	cursor := " "
+	if m.searchFocus == focusQuery && m.cursorBlink {
+		cursor = cursorStyle.Render(" ")
 	}
 
 	line := prefix + queryStyle.Render(queryStr) + cursor
@@ -1608,8 +2054,8 @@ func (m *Model) renderSearchHint(contentWidth int) string {
 	return text
 }
 
-// renderSearchDivider renders a horizontal line separating the results body
-// from the search input area below.
+// renderSearchDivider renders a horizontal line separating the search input
+// above from the results body below.
 func (m *Model) renderSearchDivider(contentWidth int) string {
 	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
 	return style.Render(strings.Repeat("─", contentWidth))
@@ -1666,28 +2112,124 @@ func (m *Model) badgeStyle(idx toggleIndex) lipgloss.Style {
 	return style
 }
 
-// renderScopeInput renders the path scope field: "In: path█" or "In: path".
+// renderScopeInput renders the path scope field with a blinking block cursor
+// that stays visible regardless of which search element has keyboard focus.
 func (m *Model) renderScopeInput(availableWidth int) string {
 	prefixStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
 	prefix := prefixStyle.Render(scopePrefix)
 	prefixW := lipgloss.Width(prefix)
 
-	cursor := ""
-	if m.searchFocus == focusScope {
-		cursorStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Primary)
-		cursor = cursorStyle.Render("█")
-	}
-
+	maxTextW := max(availableWidth-prefixW-1, 0)
 	scopeStr := string(m.scopeQuery)
-	maxTextW := max(availableWidth-prefixW-lipgloss.Width(cursor), 0)
 	scopeRunes := []rune(scopeStr)
 	if len(scopeRunes) > maxTextW {
 		scopeStr = string(scopeRunes[len(scopeRunes)-maxTextW:])
 	}
 
+	// Show blinking cursor only when this input has focus.
+	cursor := " "
+	if m.searchFocus == focusScope && m.cursorBlink {
+		cursor = cursorStyle.Render(" ")
+	}
+
 	return prefix + textStyle.Render(scopeStr) + cursor
+}
+
+// renderRenameInput renders the inline rename input with a blinking cursor,
+// pre-filled with the current entry name.
+func (m *Model) renderRenameInput(contentWidth int) string {
+	labelStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	prefix := " " + labelStyle.Render("Rename: ")
+	prefixW := lipgloss.Width(prefix)
+
+	maxTextW := max(contentWidth-prefixW-1, 0)
+	inputStr := string(m.renameInput)
+	inputRunes := m.renameInput
+	if len(inputRunes) > maxTextW {
+		inputStr = string(inputRunes[len(inputRunes)-maxTextW:])
+	}
+
+	cursor := " "
+	if m.cursorBlink {
+		cursor = cursorStyle.Render(" ")
+	}
+
+	line := prefix + textStyle.Render(inputStr) + cursor
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderDeleteConfirm renders the delete confirmation line showing the
+// entry name and Y/N options.
+func (m *Model) renderDeleteConfirm(contentWidth int) string {
+	labelStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Error).Bold(true)
+	nameStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+	keyStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+
+	name := filepath.Base(m.deleteConfirmPath)
+	line := " " + labelStyle.Render("Delete") + " " + nameStyle.Render(name) + keyStyle.Render("  Y yes  N no")
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderNewEntryHint renders the chord hint shown after Alt+N is pressed,
+// prompting the user to press F (file) or D (directory).
+func (m *Model) renderNewEntryHint(contentWidth int) string {
+	labelStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Warning).Bold(true)
+	keyStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+
+	line := " " + labelStyle.Render("New entry") + keyStyle.Render("  F file  D dir")
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderNewEntryInput renders the inline input line for creating a new file
+// or directory, including a label prefix and blinking cursor.
+func (m *Model) renderNewEntryInput(contentWidth int) string {
+	labelStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	label := "New file: "
+	if m.newEntryIsDir {
+		label = "New dir:  "
+	}
+	prefix := " " + labelStyle.Render(label)
+	prefixW := lipgloss.Width(prefix)
+
+	maxTextW := max(contentWidth-prefixW-1, 0)
+	inputStr := string(m.newEntryInput)
+	inputRunes := m.newEntryInput
+	if len(inputRunes) > maxTextW {
+		inputStr = string(inputRunes[len(inputRunes)-maxTextW:])
+	}
+
+	cursor := " "
+	if m.cursorBlink {
+		cursor = cursorStyle.Render(" ")
+	}
+
+	line := prefix + textStyle.Render(inputStr) + cursor
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
 }
 
 // renderSearchItem renders a single search result row (file header, match line, or gap).
@@ -1887,11 +2429,11 @@ func (m *Model) renderEntry(idx, contentWidth int, entries []Entry, cursorIdx in
 	selected := idx == cursorIdx && m.focused
 	active := !entry.IsDir && entry.Path == m.activeFilePath
 
-	icon := iconFile
 	nameColor := m.theme.Palette.Foreground
-	iconColor := m.theme.Palette.Muted
+	icon, iconColor := m.fileIcon(entry)
 	if entry.IsDir {
 		nameColor = m.theme.Palette.Primary
+		iconColor = m.theme.Palette.Muted
 		if entry.Expanded {
 			icon = iconDir
 		} else {
@@ -1899,7 +2441,6 @@ func (m *Model) renderEntry(idx, contentWidth int, entries []Entry, cursorIdx in
 		}
 	}
 	if active {
-		icon = iconFileActive
 		nameColor = m.theme.Palette.Accent
 		iconColor = m.theme.Palette.Accent
 	}
@@ -1933,6 +2474,109 @@ func (m *Model) renderEntry(idx, contentWidth int, entries []Entry, cursorIdx in
 	return line
 }
 
+// fileIcon returns an icon glyph and color for a file entry. When Nerd Fonts
+// are available, it uses go-devicons; otherwise it falls back to simple Unicode
+// glyphs colored with the theme palette.
+func (m *Model) fileIcon(entry Entry) (string, lipgloss.Color) {
+	if entry.IsDir {
+		return iconDir, m.theme.Palette.Muted
+	}
+	if m.nerdFonts {
+		style := devicons.IconForPath(entry.Path)
+		return style.Icon, lipgloss.Color(style.Color)
+	}
+	return fallbackIcon(entry.Name), m.theme.Palette.Muted
+}
+
+// fileCategory groups file extensions for fallback icon assignment.
+type fileCategory int
+
+const (
+	catGeneric fileCategory = iota
+	catCode
+	catMarkup
+	catConfig
+	catData
+	catImage
+	catMedia
+	catArchive
+)
+
+// categoryGlyph maps each category to a universally-supported Unicode glyph.
+// Derived from: geometric shapes block (U+25A0–U+25FF) and musical symbols.
+var categoryGlyph = [...]string{
+	catGeneric: "○",
+	catCode:    "◆",
+	catMarkup:  "◇",
+	catConfig:  "◈",
+	catData:    "▪",
+	catImage:   "◐",
+	catMedia:   "♪",
+	catArchive: "●",
+}
+
+// extCategoryMap maps common file extensions to a display category.
+var extCategoryMap = map[string]fileCategory{
+	// Source code
+	"go": catCode, "py": catCode, "js": catCode, "ts": catCode,
+	"tsx": catCode, "jsx": catCode, "rs": catCode, "c": catCode,
+	"cpp": catCode, "cc": catCode, "h": catCode, "hpp": catCode,
+	"java": catCode, "kt": catCode, "kts": catCode, "swift": catCode,
+	"rb": catCode, "php": catCode, "cs": catCode, "fs": catCode,
+	"lua": catCode, "zig": catCode, "nim": catCode, "v": catCode,
+	"ex": catCode, "exs": catCode, "erl": catCode, "hs": catCode,
+	"ml": catCode, "mli": catCode, "elm": catCode, "clj": catCode,
+	"scala": catCode, "dart": catCode, "r": catCode, "jl": catCode,
+	"sh": catCode, "bash": catCode, "zsh": catCode, "fish": catCode,
+	"ps1": catCode, "bat": catCode, "cmd": catCode, "asm": catCode,
+	"s": catCode, "pl": catCode, "pm": catCode, "cr": catCode,
+	"d": catCode, "pas": catCode, "lisp": catCode, "rkt": catCode,
+	// Markup / documentation
+	"md": catMarkup, "markdown": catMarkup, "rst": catMarkup,
+	"adoc": catMarkup, "tex": catMarkup, "html": catMarkup,
+	"htm": catMarkup, "xml": catMarkup, "xhtml": catMarkup,
+	"svg": catMarkup, "vue": catMarkup, "svelte": catMarkup,
+	"astro": catMarkup, "erb": catMarkup, "haml": catMarkup,
+	"pug": catMarkup, "slim": catMarkup, "njk": catMarkup,
+	// Configuration
+	"json": catConfig, "yaml": catConfig, "yml": catConfig,
+	"toml": catConfig, "ini": catConfig, "cfg": catConfig,
+	"conf": catConfig, "env": catConfig, "properties": catConfig,
+	"editorconfig": catConfig, "eslintrc": catConfig,
+	"prettierrc": catConfig, "babelrc": catConfig,
+	// Data
+	"csv": catData, "tsv": catData, "sql": catData, "db": catData,
+	"sqlite": catData, "parquet": catData, "avro": catData,
+	"proto": catData, "graphql": catData, "gql": catData,
+	// Images
+	"png": catImage, "jpg": catImage, "jpeg": catImage, "gif": catImage,
+	"bmp": catImage, "ico": catImage, "webp": catImage, "avif": catImage,
+	"tiff": catImage, "psd": catImage, "xcf": catImage,
+	// Media (audio/video)
+	"mp3": catMedia, "wav": catMedia, "ogg": catMedia, "flac": catMedia,
+	"aac": catMedia, "m4a": catMedia, "wma": catMedia,
+	"mp4": catMedia, "mkv": catMedia, "avi": catMedia, "mov": catMedia,
+	"webm": catMedia, "flv": catMedia,
+	// Archives / binaries
+	"zip": catArchive, "tar": catArchive, "gz": catArchive,
+	"bz2": catArchive, "xz": catArchive, "7z": catArchive,
+	"rar": catArchive, "deb": catArchive, "rpm": catArchive,
+	"dmg": catArchive, "iso": catArchive, "jar": catArchive,
+	"whl": catArchive, "exe": catArchive, "dll": catArchive,
+	"so": catArchive, "dylib": catArchive, "wasm": catArchive,
+}
+
+// fallbackIcon returns a simple Unicode glyph for a filename based on its
+// extension category.
+func fallbackIcon(name string) string {
+	ext := strings.TrimPrefix(filepath.Ext(name), ".")
+	cat, ok := extCategoryMap[strings.ToLower(ext)]
+	if !ok {
+		return categoryGlyph[catGeneric]
+	}
+	return categoryGlyph[cat]
+}
+
 func (m *Model) emptyView(contentWidth int) string {
 	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	text := style.Render("No files loaded")
@@ -1944,14 +2588,17 @@ func (m *Model) emptyView(contentWidth int) string {
 // Scroll helpers
 // ---------------------------------------------------------------------------
 
-// bodyHeight returns the number of entry lines visible between the header
-// and footer. In search mode the footer is taller (divider + input + toolbar).
+// bodyHeight returns the number of entry lines visible between the top
+// chrome (header + input/hint + divider) and the mode-specific footer.
 func (m *Model) bodyHeight() int {
-	footer := footerHeight
+	footer := 0
 	if m.mode == viewSearch {
 		footer = searchFooterHeight
 	}
-	return max(m.height-headerHeight-footer, 1)
+	if m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive {
+		footer += newEntryFooterHeight
+	}
+	return max(m.height-topChromeHeight-footer, 1)
 }
 
 func (m *Model) ensureCursorVisible() {

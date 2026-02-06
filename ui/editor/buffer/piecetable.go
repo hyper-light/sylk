@@ -26,6 +26,7 @@ type PieceTable struct {
 	original []rune
 	add      []rune
 	pieces   []Piece
+	version  uint64 // incremented on every Insert/Delete
 }
 
 // NewPieceTable creates a PieceTable initialised with content.
@@ -62,6 +63,7 @@ func (pt *PieceTable) Insert(pos int, text string) {
 
 	idx, offset := pt.findPiece(pos)
 	pt.spliceInsert(idx, offset, newPiece)
+	pt.version++
 }
 
 // Delete removes length runes starting at pos.
@@ -72,6 +74,14 @@ func (pt *PieceTable) Delete(pos, length int) {
 	startIdx, startOff := pt.findPiece(pos)
 	endIdx, endOff := pt.findPiece(pos + length)
 	pt.spliceDelete(startIdx, startOff, endIdx, endOff)
+	pt.version++
+}
+
+// Version returns a monotonically increasing counter that changes on every
+// Insert or Delete. Callers can compare versions to detect content changes
+// even when the buffer length stays the same (e.g. character replace).
+func (pt *PieceTable) Version() uint64 {
+	return pt.version
 }
 
 // Content materialises the full text by walking all pieces.

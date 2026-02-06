@@ -37,3 +37,4 @@ third_party/
 # Sylk knowledge graph data (user data, not source)
 .sylk/**/*
 .sylk
+

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	glua "github.com/yuin/gopher-lua"
+	rt "github.com/arnodel/golua/runtime"
 )
 
 // ---------------------------------------------------------------------------
@@ -21,8 +21,8 @@ const maxNamespaces = 64
 
 // Sentinel errors.
 var (
-	errHighlightsFull  = errors.New("highlight store full")
-	errNamespacesFull  = errors.New("namespace store full")
+	errHighlightsFull = errors.New("highlight store full")
+	errNamespacesFull = errors.New("namespace store full")
 )
 
 // ---------------------------------------------------------------------------
@@ -44,19 +44,31 @@ type HighlightAttrs struct {
 // hlAttrField maps a Lua table key to a setter on HighlightAttrs.
 type hlAttrField struct {
 	Key   string
-	Apply func(attrs *HighlightAttrs, val glua.LValue)
+	Apply func(attrs *HighlightAttrs, val rt.Value)
 }
 
 // hlAttrFields is the table-driven parser for highlight attribute tables.
 var hlAttrFields = []hlAttrField{
-	{Key: "fg", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Foreground = v.String() }},
-	{Key: "bg", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Background = v.String() }},
-	{Key: "bold", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Bold = luaToBool(v) }},
-	{Key: "italic", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Italic = luaToBool(v) }},
-	{Key: "underline", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Underline = luaToBool(v) }},
-	{Key: "strikethrough", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Strikethrough = luaToBool(v) }},
-	{Key: "reverse", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Reverse = luaToBool(v) }},
-	{Key: "link", Apply: func(a *HighlightAttrs, v glua.LValue) { a.Link = v.String() }},
+	{Key: "fg", Apply: func(a *HighlightAttrs, v rt.Value) {
+		if s, ok := v.TryString(); ok {
+			a.Foreground = s
+		}
+	}},
+	{Key: "bg", Apply: func(a *HighlightAttrs, v rt.Value) {
+		if s, ok := v.TryString(); ok {
+			a.Background = s
+		}
+	}},
+	{Key: "bold", Apply: func(a *HighlightAttrs, v rt.Value) { a.Bold = luaToBool(v) }},
+	{Key: "italic", Apply: func(a *HighlightAttrs, v rt.Value) { a.Italic = luaToBool(v) }},
+	{Key: "underline", Apply: func(a *HighlightAttrs, v rt.Value) { a.Underline = luaToBool(v) }},
+	{Key: "strikethrough", Apply: func(a *HighlightAttrs, v rt.Value) { a.Strikethrough = luaToBool(v) }},
+	{Key: "reverse", Apply: func(a *HighlightAttrs, v rt.Value) { a.Reverse = luaToBool(v) }},
+	{Key: "link", Apply: func(a *HighlightAttrs, v rt.Value) {
+		if s, ok := v.TryString(); ok {
+			a.Link = s
+		}
+	}},
 }
 
 // ---------------------------------------------------------------------------
@@ -133,97 +145,97 @@ func (hs *HighlightStore) CreateNamespace(name string) (int, error) {
 // ---------------------------------------------------------------------------
 
 // registerHighlightFunctions attaches highlight API functions to vim.api.
-func registerHighlightFunctions(L *glua.LState, apiTbl *glua.LTable, rt *Runtime) {
+func registerHighlightFunctions(_ *rt.Runtime, apiTbl *rt.Table, luaRT *Runtime) {
 	type registration struct {
 		Name    string
-		Handler func(*glua.LState) int
+		Handler func(*rt.Thread, *rt.GoCont) (rt.Cont, error)
 	}
 	regs := []registration{
-		{Name: "nvim_set_hl", Handler: func(ls *glua.LState) int { return luaSetHL(ls, rt) }},
-		{Name: "nvim_get_hl", Handler: func(ls *glua.LState) int { return luaGetHL(ls, rt) }},
-		{Name: "nvim_create_namespace", Handler: func(ls *glua.LState) int { return luaCreateNamespace(ls, rt) }},
+		{Name: "nvim_set_hl", Handler: func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return luaSetHL(t, c, luaRT)
+		}},
+		{Name: "nvim_get_hl", Handler: func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return luaGetHL(t, c, luaRT)
+		}},
+		{Name: "nvim_create_namespace", Handler: func(t *rt.Thread, c *rt.GoCont) (rt.Cont, error) {
+			return luaCreateNamespace(t, c, luaRT)
+		}},
 	}
 	for _, r := range regs {
-		fn := r.Handler
-		apiTbl.RawSetString(r.Name, L.NewFunction(func(ls *glua.LState) int {
-			return fn(ls)
-		}))
+		setGoFunc(apiTbl, r.Name, r.Handler, defaultMaxArgs, true)
 	}
 }
 
 // luaSetHL implements nvim_set_hl(ns, name, val).
-func luaSetHL(L *glua.LState, rt *Runtime) int {
-	ns := L.ToInt(1)
-	name := L.ToString(2)
+func luaSetHL(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	ns, _ := c.IntArg(0)
+	name, _ := c.StringArg(1)
 	attrs := HighlightAttrs{}
-	if valTbl, ok := L.Get(3).(*glua.LTable); ok {
+	valTblArg := c.Arg(2)
+	if valTbl, ok := valTblArg.TryTable(); ok {
 		parseHLAttrs(&attrs, valTbl)
 	}
-	_ = rt.Highlights.SetHL(ns, name, attrs)
-	return 0
+	_ = luaRT.Highlights.SetHL(int(ns), name, attrs)
+	return c.Next(), nil
 }
 
 // parseHLAttrs walks hlAttrFields to populate attrs from a Lua table.
-func parseHLAttrs(attrs *HighlightAttrs, tbl *glua.LTable) {
+func parseHLAttrs(attrs *HighlightAttrs, tbl *rt.Table) {
 	for _, f := range hlAttrFields {
-		val := tbl.RawGetString(f.Key)
-		if val != glua.LNil {
+		val := tbl.Get(rt.StringValue(f.Key))
+		if !val.IsNil() {
 			f.Apply(attrs, val)
 		}
 	}
 }
 
 // luaGetHL implements nvim_get_hl(ns, opts) where opts.name is the group.
-func luaGetHL(L *glua.LState, rt *Runtime) int {
-	ns := L.ToInt(1)
+func luaGetHL(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	ns, _ := c.IntArg(0)
 	name := ""
-	if opts, ok := L.Get(2).(*glua.LTable); ok {
-		val := opts.RawGetString("name")
-		if val != glua.LNil {
-			name = val.String()
+	optsVal := c.Arg(1)
+	if opts, ok := optsVal.TryTable(); ok {
+		val := opts.Get(rt.StringValue("name"))
+		if s, sOk := val.TryString(); sOk {
+			name = s
 		}
 	}
-	attrs, ok := rt.Highlights.GetHL(ns, name)
+	attrs, ok := luaRT.Highlights.GetHL(int(ns), name)
 	if !ok {
-		L.Push(L.NewTable())
-		return 1
+		return c.PushingNext1(t.Runtime, rt.TableValue(rt.NewTable())), nil
 	}
-	L.Push(hlAttrsToTable(L, attrs))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.TableValue(hlAttrsToTable(attrs))), nil
 }
 
 // hlAttrsToTable serialises HighlightAttrs into a Lua table.
-func hlAttrsToTable(L *glua.LState, attrs HighlightAttrs) *glua.LTable {
-	tbl := L.NewTable()
-	// Table-driven serialisation matching hlAttrFields order.
+func hlAttrsToTable(attrs HighlightAttrs) *rt.Table {
+	tbl := rt.NewTable()
 	type field struct {
 		Key string
-		Val glua.LValue
+		Val rt.Value
 	}
 	fields := []field{
-		{Key: "fg", Val: glua.LString(attrs.Foreground)},
-		{Key: "bg", Val: glua.LString(attrs.Background)},
-		{Key: "bold", Val: glua.LBool(attrs.Bold)},
-		{Key: "italic", Val: glua.LBool(attrs.Italic)},
-		{Key: "underline", Val: glua.LBool(attrs.Underline)},
-		{Key: "strikethrough", Val: glua.LBool(attrs.Strikethrough)},
-		{Key: "reverse", Val: glua.LBool(attrs.Reverse)},
-		{Key: "link", Val: glua.LString(attrs.Link)},
+		{Key: "fg", Val: rt.StringValue(attrs.Foreground)},
+		{Key: "bg", Val: rt.StringValue(attrs.Background)},
+		{Key: "bold", Val: rt.BoolValue(attrs.Bold)},
+		{Key: "italic", Val: rt.BoolValue(attrs.Italic)},
+		{Key: "underline", Val: rt.BoolValue(attrs.Underline)},
+		{Key: "strikethrough", Val: rt.BoolValue(attrs.Strikethrough)},
+		{Key: "reverse", Val: rt.BoolValue(attrs.Reverse)},
+		{Key: "link", Val: rt.StringValue(attrs.Link)},
 	}
 	for _, f := range fields {
-		tbl.RawSetString(f.Key, f.Val)
+		tbl.Set(rt.StringValue(f.Key), f.Val)
 	}
 	return tbl
 }
 
 // luaCreateNamespace implements nvim_create_namespace(name).
-func luaCreateNamespace(L *glua.LState, rt *Runtime) int {
-	name := L.ToString(1)
-	id, err := rt.Highlights.CreateNamespace(name)
+func luaCreateNamespace(t *rt.Thread, c *rt.GoCont, luaRT *Runtime) (rt.Cont, error) {
+	name, _ := c.StringArg(0)
+	id, err := luaRT.Highlights.CreateNamespace(name)
 	if err != nil {
-		L.Push(glua.LNumber(-1))
-		return 1
+		return c.PushingNext1(t.Runtime, rt.IntValue(-1)), nil
 	}
-	L.Push(glua.LNumber(id))
-	return 1
+	return c.PushingNext1(t.Runtime, rt.IntValue(int64(id))), nil
 }

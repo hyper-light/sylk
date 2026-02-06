@@ -100,6 +100,10 @@ var visualKeyTable = map[rune]visualKeyHandler{
 var visualNamedKeyTable = map[tea.KeyType]visualKeyHandler{
 	tea.KeyEsc:   visualEscape,
 	tea.KeyCtrlC: visualEscape,
+	tea.KeyUp:    visualArrowUp,
+	tea.KeyDown:  visualArrowDown,
+	tea.KeyLeft:  visualArrowLeft,
+	tea.KeyRight: visualArrowRight,
 }
 
 // HandleKey processes a key event in visual mode.
@@ -144,6 +148,42 @@ func (vm *VisualMode) feedMotion(r rune, state *EditorState) Mode {
 		return vm.currentMode()
 	}
 	mr := motion.ExecuteMotion(result.Motion, state.Buffer, state.LineIndex, state.Cursor, result.Count)
+	state.Cursor = mr.End
+	state.ClampCursor(0)
+	vm.State.CursorPos = state.Cursor
+	return vm.currentMode()
+}
+
+// ---------------------------------------------------------------------------
+// Arrow key handlers
+// ---------------------------------------------------------------------------
+
+func visualArrowUp(vm *VisualMode, state *EditorState) Mode {
+	mr := motion.ExecuteMotion(motion.MotionUp, state.Buffer, state.LineIndex, state.Cursor, 1)
+	state.Cursor = mr.End
+	state.ClampCursor(0)
+	vm.State.CursorPos = state.Cursor
+	return vm.currentMode()
+}
+
+func visualArrowDown(vm *VisualMode, state *EditorState) Mode {
+	mr := motion.ExecuteMotion(motion.MotionDown, state.Buffer, state.LineIndex, state.Cursor, 1)
+	state.Cursor = mr.End
+	state.ClampCursor(0)
+	vm.State.CursorPos = state.Cursor
+	return vm.currentMode()
+}
+
+func visualArrowLeft(vm *VisualMode, state *EditorState) Mode {
+	mr := motion.ExecuteMotion(motion.MotionLeft, state.Buffer, state.LineIndex, state.Cursor, 1)
+	state.Cursor = mr.End
+	state.ClampCursor(0)
+	vm.State.CursorPos = state.Cursor
+	return vm.currentMode()
+}
+
+func visualArrowRight(vm *VisualMode, state *EditorState) Mode {
+	mr := motion.ExecuteMotion(motion.MotionRight, state.Buffer, state.LineIndex, state.Cursor, 1)
 	state.Cursor = mr.End
 	state.ClampCursor(0)
 	vm.State.CursorPos = state.Cursor

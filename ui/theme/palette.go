@@ -16,6 +16,11 @@ type Palette struct {
 	Secondary lipgloss.Color
 	Accent    lipgloss.Color
 
+	// Extended accent (syntax highlighting differentiation)
+	Peach    lipgloss.Color
+	Teal     lipgloss.Color
+	Lavender lipgloss.Color
+
 	// Semantic
 	Success lipgloss.Color
 	Warning lipgloss.Color
@@ -27,6 +32,7 @@ type Palette struct {
 	BorderActive lipgloss.Color
 	Highlight    lipgloss.Color // Subtle background for transient highlights.
 	Selection    lipgloss.Color // Background for persistent entry selection.
+	PopupBg      lipgloss.Color // Background for floating popups (darker than base).
 
 	// Agent-specific (indexed by type hash for consistency)
 	AgentColors []lipgloss.Color
@@ -44,6 +50,10 @@ var DarkPalette = Palette{
 	Secondary: lipgloss.Color("#cba6f7"),
 	Accent:    lipgloss.Color("#f5c2e7"),
 
+	Peach:    lipgloss.Color("#fab387"),
+	Teal:     lipgloss.Color("#94e2d5"),
+	Lavender: lipgloss.Color("#b4befe"),
+
 	Success: lipgloss.Color("#a6e3a1"),
 	Warning: lipgloss.Color("#f9e2af"),
 	Error:   lipgloss.Color("#f38ba8"),
@@ -53,6 +63,7 @@ var DarkPalette = Palette{
 	BorderActive: lipgloss.Color("#89b4fa"),
 	Highlight:    lipgloss.Color("#45475a"), // surface1 – prominent transient copy feedback
 	Selection:    lipgloss.Color("#313244"), // surface0 – subtle persistent selection
+	PopupBg:      lipgloss.Color("#181825"), // mantle – darker than base for floating popups
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#89b4fa"), // blue - engineer
@@ -80,6 +91,10 @@ var LightPalette = Palette{
 	Secondary: lipgloss.Color("#8839ef"),
 	Accent:    lipgloss.Color("#ea76cb"),
 
+	Peach:    lipgloss.Color("#fe640b"),
+	Teal:     lipgloss.Color("#179299"),
+	Lavender: lipgloss.Color("#7287fd"),
+
 	Success: lipgloss.Color("#40a02b"),
 	Warning: lipgloss.Color("#df8e1d"),
 	Error:   lipgloss.Color("#d20f39"),
@@ -89,6 +104,7 @@ var LightPalette = Palette{
 	BorderActive: lipgloss.Color("#1e66f5"),
 	Highlight:    lipgloss.Color("#dce0e8"), // crust – prominent transient copy feedback
 	Selection:    lipgloss.Color("#e6e9ef"), // mantle – subtle persistent selection
+	PopupBg:      lipgloss.Color("#dce0e8"), // crust – lighter than base for floating popups
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#1e66f5"), // blue

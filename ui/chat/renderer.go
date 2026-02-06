@@ -208,6 +208,7 @@ const gutterSepWidth = 3
 // renderCodeBlock syntax-highlights buffered code lines with line numbers.
 func renderCodeBlock(lines []string, lang string, width int, th *theme.Theme) []string {
 	hl := codepkg.NewHighlighter(th)
+	defer hl.Close()
 	content := strings.Join(lines, "\n")
 	allRegions := hl.HighlightContent(content, lang)
 

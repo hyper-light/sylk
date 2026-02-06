@@ -1,10 +1,12 @@
 package code
 
 import (
+	"bytes"
 	"regexp"
 	"strings"
 	"unicode"
 
+	"github.com/adalundhe/sylk/core/treesitter"
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -18,12 +20,18 @@ type HighlightRegion struct {
 }
 
 // Highlighter applies syntax highlighting to source code lines using the
-// theme's Syntax style map. This implementation uses a pure-Go regex/scanner
-// approach and does not require CGo or tree-sitter C bindings.
+// theme's Syntax style map. When a tree-sitter grammar is available for
+// the language, full AST-based highlighting is used. Otherwise a regex/scanner
+// fallback provides keyword-level highlighting.
 type Highlighter struct {
-	theme   *theme.Theme
-	styles  map[theme.SyntaxCategory]lipgloss.Style
-	default_ lipgloss.Style
+	theme      *theme.Theme
+	styles     map[theme.SyntaxCategory]lipgloss.Style
+	default_   lipgloss.Style
+	parser     *treesitter.Parser // lazily created, reusable
+	tree       *treesitter.Tree   // current parse tree
+	tsLang     string             // current tree-sitter language name
+	grammarOK  bool               // grammar loaded successfully
+	grammarErr bool               // grammar load failed (don't retry)
 }
 
 // NewHighlighter creates a Highlighter that uses the given theme's syntax
@@ -48,6 +56,18 @@ func NewHighlighterWithBg(th *theme.Theme, bg lipgloss.TerminalColor) *Highlight
 		theme:    th,
 		styles:   styles,
 		default_: lipgloss.NewStyle().Foreground(th.Palette.Foreground).Background(bg),
+	}
+}
+
+// Close releases tree-sitter resources held by the highlighter.
+func (h *Highlighter) Close() {
+	if h.tree != nil {
+		h.tree.Close()
+		h.tree = nil
+	}
+	if h.parser != nil {
+		h.parser.Close()
+		h.parser = nil
 	}
 }
 
@@ -197,10 +217,23 @@ func clampIndex(idx, max int) int {
 	return idx
 }
 
-// HighlightContent scans source content and produces per-line highlight
-// regions using a regex-based scanner. This works without CGo or tree-sitter
-// C bindings. The language parameter selects the keyword set.
+// HighlightContent produces per-line highlight regions for the given content.
+// When a tree-sitter grammar is available for the language, full AST-based
+// highlighting is used. Otherwise falls back to regex-based keyword scanning.
 func (h *Highlighter) HighlightContent(content string, language string) [][]HighlightRegion {
+	if language != h.tsLang {
+		h.setTreeSitterLang(language)
+	}
+	if h.grammarOK {
+		if regions := h.highlightTreeSitter(content); regions != nil {
+			return regions
+		}
+	}
+	return h.highlightRegex(content, language)
+}
+
+// highlightRegex produces regions using the regex/keyword scanner fallback.
+func (h *Highlighter) highlightRegex(content string, language string) [][]HighlightRegion {
 	lines := strings.Split(content, "\n")
 	result := make([][]HighlightRegion, len(lines))
 
@@ -215,6 +248,302 @@ func (h *Highlighter) HighlightContent(content string, language string) [][]High
 	}
 
 	return result
+}
+
+// ---------------------------------------------------------------------------
+// Tree-sitter highlighting
+// ---------------------------------------------------------------------------
+
+// setTreeSitterLang attempts to load a tree-sitter grammar for the language.
+func (h *Highlighter) setTreeSitterLang(language string) {
+	h.tsLang = language
+	h.grammarOK = false
+	h.grammarErr = false
+	if h.tree != nil {
+		h.tree.Close()
+		h.tree = nil
+	}
+	if language == "" {
+		return
+	}
+	if !treesitter.IsGrammarAvailable(language) {
+		h.grammarErr = true
+		return
+	}
+	if h.parser == nil {
+		h.parser = treesitter.NewParser()
+	}
+	if err := h.parser.SetLanguageByName(language); err != nil {
+		h.grammarErr = true
+		return
+	}
+	h.grammarOK = true
+}
+
+// highlightTreeSitter parses content and walks leaf nodes to collect regions.
+func (h *Highlighter) highlightTreeSitter(content string) [][]HighlightRegion {
+	source := []byte(content)
+	// Full reparse: we don't track byte-level edits, so passing the old tree
+	// without ts_tree_edit info would produce misaligned regions.
+	tree, err := h.parser.Parse(source, nil)
+	if err != nil {
+		return nil
+	}
+	if h.tree != nil {
+		h.tree.Close()
+	}
+	h.tree = tree
+	return walkTreeByteRegions(tree, source)
+}
+
+// walkTreeByteRegions performs a depth-first walk of the parse tree, collecting
+// byte-offset highlight regions. Non-leaf span nodes (strings, comments) are
+// highlighted as a single region covering the entire node; their children are
+// skipped.
+func walkTreeByteRegions(tree *treesitter.Tree, source []byte) [][]HighlightRegion {
+	root := tree.RootNode()
+	imports := collectGoImports(root)
+	cursor := root.Walk()
+	defer cursor.Close()
+
+	sourceLines := bytes.Split(source, []byte("\n"))
+	regions := make([][]HighlightRegion, len(sourceLines))
+
+	reachedRoot := false
+	for !reachedRoot {
+		node := cursor.Node()
+		skipChildren := false
+
+		if node.ChildCount() > 0 {
+			if cat := spanCategory(node); cat != "" {
+				addNodeByteRegions(regions, node, cat, sourceLines)
+				skipChildren = true
+			}
+		}
+
+		if !skipChildren && node.ChildCount() == 0 {
+			cat := categorizeNode(node, cursor.FieldName(), imports)
+			if cat != "" {
+				addNodeByteRegions(regions, node, cat, sourceLines)
+			}
+		}
+
+		if !skipChildren && cursor.GotoFirstChild() {
+			continue
+		}
+		if cursor.GotoNextSibling() {
+			continue
+		}
+		for {
+			if !cursor.GotoParent() {
+				reachedRoot = true
+				break
+			}
+			if cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	return regions
+}
+
+// spanCategory returns the syntax category for non-leaf nodes that should be
+// highlighted as a single span covering all children (e.g. string literals
+// and comments whose children are delimiters and content fragments).
+func spanCategory(node *treesitter.Node) theme.SyntaxCategory {
+	cat, ok := theme.NodeTypeToCategory[node.Type()]
+	if !ok {
+		return ""
+	}
+	if cat == theme.CatString || cat == theme.CatComment {
+		return cat
+	}
+	return ""
+}
+
+// categorizeNode determines the syntax category for a leaf node using
+// the NodeTypeToCategory map and context-aware overrides for identifiers
+// and field/property access nodes.
+func categorizeNode(node *treesitter.Node, fieldName string, imports map[string]bool) theme.SyntaxCategory {
+	nodeType := node.Type()
+	cat, ok := theme.NodeTypeToCategory[nodeType]
+	if !ok {
+		return ""
+	}
+	switch nodeType {
+	case "identifier":
+		return identifierCategory(node, fieldName, imports)
+	case "field_identifier", "property_identifier":
+		return fieldIdentifierCategory(node)
+	}
+	return cat
+}
+
+// identifierCategory refines the category for identifier nodes based on
+// their field name within the parent and the parent node type.
+func identifierCategory(node *treesitter.Node, fieldName string, imports map[string]bool) theme.SyntaxCategory {
+	switch fieldName {
+	case "function":
+		return theme.CatFunction
+	case "type":
+		return theme.CatType
+	case "name":
+		return identifierNameCategory(node)
+	case "operand":
+		return identifierOperandCategory(node, imports)
+	}
+	return theme.CatVariable
+}
+
+// identifierNameCategory handles identifiers with field name "name".
+func identifierNameCategory(node *treesitter.Node) theme.SyntaxCategory {
+	parent := node.Parent()
+	if parent == nil {
+		return theme.CatVariable
+	}
+	switch parent.Type() {
+	case "function_declaration", "method_declaration",
+		"function_definition", "function_item":
+		return theme.CatFunction
+	case "type_spec", "type_alias_declaration":
+		return theme.CatType
+	case "package_clause":
+		return theme.CatNamespace
+	}
+	return theme.CatVariable
+}
+
+// identifierOperandCategory handles identifiers with field name "operand"
+// (the left side of selector_expression, e.g. "fmt" in "fmt.Println()" or
+// "time" in "time.Hour"). The imports set, collected from the file's import
+// declarations, distinguishes package qualifiers from struct variables.
+func identifierOperandCategory(node *treesitter.Node, imports map[string]bool) theme.SyntaxCategory {
+	parent := node.Parent()
+	if parent == nil || parent.Type() != "selector_expression" {
+		return theme.CatVariable
+	}
+	if len(imports) > 0 && imports[node.Content()] {
+		return theme.CatNamespace
+	}
+	return theme.CatVariable
+}
+
+// fieldIdentifierCategory refines field_identifier and property_identifier
+// nodes. When the field is part of a method/function call (selector inside
+// call_expression), it is categorized as CatFunction. Otherwise CatProperty.
+func fieldIdentifierCategory(node *treesitter.Node) theme.SyntaxCategory {
+	parent := node.Parent()
+	if parent == nil {
+		return theme.CatProperty
+	}
+	switch parent.Type() {
+	case "selector_expression":
+		grandparent := parent.Parent()
+		if grandparent != nil && grandparent.Type() == "call_expression" {
+			return theme.CatFunction
+		}
+	case "method_declaration":
+		return theme.CatFunction
+	}
+	return theme.CatProperty
+}
+
+// ---------------------------------------------------------------------------
+// Import collection (Go-specific)
+// ---------------------------------------------------------------------------
+
+// collectGoImports scans top-level import declarations and returns the set of
+// local package names (aliases or last path segment). For non-Go files the
+// result is empty, which causes all selector operands to fall back to
+// CatVariable.
+func collectGoImports(root *treesitter.Node) map[string]bool {
+	imports := make(map[string]bool)
+	for i := uint(0); i < root.ChildCount(); i++ {
+		child := root.Child(i)
+		if child.Type() == "import_declaration" {
+			extractImportNames(child, imports)
+		}
+	}
+	return imports
+}
+
+func extractImportNames(node *treesitter.Node, imports map[string]bool) {
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		switch child.Type() {
+		case "import_spec":
+			addImportSpec(child, imports)
+		case "import_spec_list":
+			extractImportNames(child, imports)
+		}
+	}
+}
+
+func addImportSpec(spec *treesitter.Node, imports map[string]bool) {
+	nameNode := spec.ChildByFieldName("name")
+	if nameNode != nil {
+		name := nameNode.Content()
+		if name != "." && name != "_" {
+			imports[name] = true
+		}
+		return
+	}
+	pathNode := spec.ChildByFieldName("path")
+	if pathNode == nil {
+		return
+	}
+	path := pathNode.Content()
+	path = strings.Trim(path, "\"")
+	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+		path = path[idx+1:]
+	}
+	if path != "" {
+		imports[path] = true
+	}
+}
+
+// addNodeByteRegions converts a tree-sitter node's position into byte-offset
+// HighlightRegions and appends them to the appropriate lines.
+func addNodeByteRegions(regions [][]HighlightRegion, node *treesitter.Node, cat theme.SyntaxCategory, sourceLines [][]byte) {
+	start := node.StartPosition()
+	end := node.EndPosition()
+	startRow := int(start.Row)
+	endRow := int(end.Row)
+
+	if startRow == endRow {
+		if startRow >= len(regions) {
+			return
+		}
+		sc := int(start.Column)
+		ec := int(end.Column)
+		if sc < ec {
+			regions[startRow] = append(regions[startRow], HighlightRegion{
+				StartCol: sc, EndCol: ec, Category: cat,
+			})
+		}
+		return
+	}
+
+	for row := startRow; row <= endRow && row < len(regions); row++ {
+		lineLen := len(sourceLines[row])
+		var sc, ec int
+		switch {
+		case row == startRow:
+			sc = int(start.Column)
+			ec = lineLen
+		case row == endRow:
+			sc = 0
+			ec = int(end.Column)
+		default:
+			sc = 0
+			ec = lineLen
+		}
+		if sc < ec {
+			regions[row] = append(regions[row], HighlightRegion{
+				StartCol: sc, EndCol: ec, Category: cat,
+			})
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
