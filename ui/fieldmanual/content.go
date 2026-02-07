@@ -25,7 +25,9 @@ func allSections() []Section {
 		sectionVimVisual(),
 		sectionCommandLine(),
 		sectionExCommands(),
+		sectionWarpPoints(),
 		sectionFileTree(),
+		sectionFileSearch(),
 		sectionChatPanel(),
 		sectionCodeViewer(),
 		sectionInputPanel(),
@@ -74,6 +76,8 @@ func sectionEditMode() Section {
 			{"Alt+t", "Toggle Tab/Explorer panel", "Edit mode active"},
 			{"Alt+Enter", "Close tab (Tab panel or Tab bar)", "Edit mode active and Edit panel focused"},
 			{"Shift+Tab", "Cycle to next tab", "Edit mode active, Edit panel focused and in insert/normal mode"},
+			{"Ctrl+Left", "Previous tab (page-jump at edge)", "Edit mode active"},
+			{"Ctrl+Right", "Next tab (page-jump at edge)", "Edit mode active"},
 			{":", "Enter command input", "Edit mode active and Edit panel in normal mode"},
 			{"Alt+f", "Toggle find bar", "Edit mode and Edit panel panel focused"},
 			{"Alt+Shift+r", "Toggle find-and-replace bar", "Edit mode active and Edit panel focused"},
@@ -213,6 +217,17 @@ func sectionExCommands() Section {
 	}
 }
 
+func sectionWarpPoints() Section {
+	return Section{
+		Title: "Warp Points (Alt+1..9 bookmarks)",
+		Bindings: []Binding{
+			{"Alt+1..9", "Set warp point at cursor (or teleport if already set)", "Edit mode active"},
+			{"Alt+Shift+1..9", "Clear warp point", "Any mode"},
+			{"Alt+1..9", "Teleport to warp point (cross-file)", "Warp point set"},
+		},
+	}
+}
+
 func sectionFileTree() Section {
 	return Section{
 		Title: "File Tree",
@@ -224,10 +239,27 @@ func sectionFileTree() Section {
 			{"Enter", "Open file / activate entry", "File tree focused"},
 			{"g", "Go to first entry", "File tree focused"},
 			{"G", "Go to last entry", "File tree focused"},
-			{"Alt+f", "Toggle search/filter", "File tree focused"},
-			{"Alt+Shift+r", "Toggle multi-file replace", "File tree focused"},
+			{"Alt+f", "Toggle file content search", "File tree focused"},
+			{"Alt+Shift+r", "Toggle multi-file find and replace", "File tree focused"},
 			{"/", "Enter tab filter (in tabs mode)", "Tabs panel active"},
 			{"Esc / q", "Exit references / symbols / tabs", "Submode active"},
+		},
+	}
+}
+
+func sectionFileSearch() Section {
+	return Section{
+		Title: "File Content Search (Alt+f in file tree)",
+		Bindings: []Binding{
+			{"Tab", "Cycle focus (query / toggles / scope)", "Search active"},
+			{"Shift+Tab", "Cycle focus backward", "Search active"},
+			{"Enter", "Open file at match line", "On match result"},
+			{"Up / Down", "Navigate results", "Search active"},
+			{"[Aa]", "Toggle case sensitivity (smart-case default)", "Toggle focused"},
+			{"[ab]", "Toggle whole word matching", "Toggle focused"},
+			{"[.*]", "Toggle regex mode", "Toggle focused"},
+			{"[re]", "Toggle regex scope filter", "Toggle focused"},
+			{"Esc", "Exit search", "Search active"},
 		},
 	}
 }
@@ -329,9 +361,14 @@ func sectionFieldManual() Section {
 			{"PgUp", "Page up", ""},
 			{"g / Home", "Scroll to top", ""},
 			{"G / End", "Scroll to bottom", ""},
-			{"/ / Alt+f", "Toggle search/filter", ""},
-			{"Tab", "Cycle focus (query / toggles)", "Search active"},
-			{"Esc / q", "Close Field Manual", ""},
+			{"/ / Alt+f", "Search bindings by key or description", ""},
+			{"Tab", "Cycle focus (query / [Aa] [ab] [.*] toggles)", "Search active"},
+			{"Shift+Tab", "Cycle focus backward", "Search active"},
+			{"[Aa]", "Toggle case sensitivity", "Toggle focused"},
+			{"[ab]", "Toggle whole word matching", "Toggle focused"},
+			{"[.*]", "Toggle regex mode", "Toggle focused"},
+			{"Esc", "Close search (or close Field Manual if not searching)", ""},
+			{"q", "Close Field Manual", ""},
 		},
 	}
 }

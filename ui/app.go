@@ -90,6 +90,30 @@ const escDisambiguateTimeout = 50 * time.Millisecond
 const sourceAgentTUI = "tui"
 
 // ---------------------------------------------------------------------------
+// Warp points
+// ---------------------------------------------------------------------------
+
+// warpSlotCount is the number of warp point slots (Alt+1 through Alt+9).
+// Derived from: 9 digit keys on the keyboard.
+const warpSlotCount = 9
+
+// WarpPoint stores a cursor position bookmark for instant teleportation.
+type WarpPoint struct {
+	Path     string // Absolute file path.
+	Line     int    // 0-indexed line number.
+	Col      int    // 0-indexed column (rune offset).
+	StartCol int    // 0-indexed start of symbol at cursor (rune offset).
+	EndCol   int    // 0-indexed end of symbol at cursor (exclusive, rune offset).
+}
+
+// shiftDigitSlot maps shifted digit characters to warp slot indices.
+// Derived from: US keyboard Shift+1..9 produces !@#$%^&*(.
+var shiftDigitSlot = map[byte]int{
+	'!': 0, '@': 1, '#': 2, '$': 3, '%': 4,
+	'^': 5, '&': 6, '*': 7, '(': 8,
+}
+
+// ---------------------------------------------------------------------------
 // Overlay state
 // ---------------------------------------------------------------------------
 
@@ -292,6 +316,9 @@ type AppModel struct {
 	// Ordered list of open editor tab file paths.
 	tabOrder      []string
 	savedActiveTab string // Path of the active tab saved on exitEditMode for restore.
+
+	// Warp points: numbered teleport bookmarks (nil = empty slot).
+	warpPoints [warpSlotCount]*WarpPoint
 
 	// Focus state saved when entering the tabs panel, restored on exit.
 	preTabsFocus component.FocusID
@@ -914,9 +941,24 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Alt+1..9: jump to tab by number (1-indexed).
+	// Alt+1..9: set or teleport warp point.
 	if len(ks) == 5 && ks[:4] == "alt+" && ks[4] >= '1' && ks[4] <= '9' {
-		return m, m.switchToTab(int(ks[4] - '1'))
+		idx := int(ks[4] - '1')
+		if m.warpPoints[idx] != nil {
+			return m, m.teleportToWarp(idx)
+		}
+		if m.editMode {
+			m.setWarpPoint(idx)
+		}
+		return m, nil
+	}
+
+	// Alt+Shift+1..9: clear warp point.
+	if len(ks) == 5 && ks[:4] == "alt+" {
+		if idx, ok := shiftDigitSlot[ks[4]]; ok {
+			m.clearWarpPoint(idx)
+			return m, nil
+		}
 	}
 
 	// Alt+T toggles the tabs panel in the file tree (edit mode only).
@@ -1100,6 +1142,16 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if ks == "alt+S" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
 		m.saveEditorBuffer()
 		return m, nil
+	}
+
+	// Ctrl+Left/Right in edit mode: pagination-aware tab navigation.
+	if m.editMode && len(m.tabOrder) > 1 {
+		if ks == "ctrl+left" {
+			return m, m.tabNavLeft()
+		}
+		if ks == "ctrl+right" {
+			return m, m.tabNavRight()
+		}
 	}
 
 	// Two-key chord: S then Left/Right (sessions), A then Left/Right (agents).
@@ -1928,7 +1980,11 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 			m.appendTab(o.Path)
 			if o.Line > 0 {
 				targetLine := o.Line - 1
-				m.inlineEditor.GoToLine(targetLine)
+				if o.CursorCol > 0 {
+					m.inlineEditor.GoToLineCol(targetLine, o.CursorCol)
+				} else {
+					m.inlineEditor.GoToLine(targetLine)
+				}
 				m.codePanel.ScrollToLine(targetLine)
 				m.setJumpMarker(targetLine, o.Col, o.EndCol)
 			}
@@ -1960,11 +2016,16 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 		targetLine := o.Line - 1
 		m.codePanel.ScrollToLine(targetLine)
 		if m.editMode {
-			m.inlineEditor.GoToLine(targetLine)
+			if o.CursorCol > 0 {
+				m.inlineEditor.GoToLineCol(targetLine, o.CursorCol)
+			} else {
+				m.inlineEditor.GoToLine(targetLine)
+			}
 			m.setJumpMarker(targetLine, o.Col, o.EndCol)
 		}
 	}
 
+	m.syncEditorWarpLines()
 	return m.lspDidOpenCmd(o.Path, detectEditorLanguage(o.Path), lspContent)
 }
 
@@ -2853,6 +2914,82 @@ func (m *AppModel) switchToTab(idx int) tea.Cmd {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Warp point methods
+// ---------------------------------------------------------------------------
+
+// setWarpPoint stores the current editor position as warp point idx (0-indexed).
+func (m *AppModel) setWarpPoint(idx int) {
+	fp := m.inlineEditor.FilePath()
+	if fp == "" {
+		return
+	}
+	line := m.inlineEditor.CursorLine()
+	col := m.inlineEditor.CursorCol()
+	startCol, endCol := m.inlineEditor.WordBoundsAt(line, col)
+	if startCol == endCol {
+		// Cursor not on a word — highlight just the single character.
+		endCol = col + 1
+		startCol = col
+	}
+	m.warpPoints[idx] = &WarpPoint{
+		Path:     fp,
+		Line:     line,
+		Col:      col,
+		StartCol: startCol,
+		EndCol:   endCol,
+	}
+	m.syncEditorWarpLines()
+}
+
+// clearWarpPoint removes warp point idx (0-indexed).
+func (m *AppModel) clearWarpPoint(idx int) {
+	m.warpPoints[idx] = nil
+	m.syncEditorWarpLines()
+}
+
+// teleportToWarp navigates to the warp point at idx via FileOpenMsg.
+func (m *AppModel) teleportToWarp(idx int) tea.Cmd {
+	wp := m.warpPoints[idx]
+	if wp == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:      wp.Path,
+			Name:      filepath.Base(wp.Path),
+			Language:  detectEditorLanguage(wp.Path),
+			Line:      wp.Line + 1, // FileOpenMsg uses 1-based line.
+			CursorCol: wp.Col,
+		}
+	}
+}
+
+// syncEditorWarpLines updates the editor's warp line indicators to reflect
+// the current warp points for the active file.
+func (m *AppModel) syncEditorWarpLines() {
+	fp := m.inlineEditor.FilePath()
+	if fp == "" {
+		m.inlineEditor.SetWarpLines(nil)
+		return
+	}
+	var warpMap map[int]editor.WarpLineInfo
+	for i, wp := range m.warpPoints {
+		if wp == nil || wp.Path != fp {
+			continue
+		}
+		if warpMap == nil {
+			warpMap = make(map[int]editor.WarpLineInfo)
+		}
+		warpMap[wp.Line] = editor.WarpLineInfo{
+			Slot:     i + 1, // 1-indexed slot number for display.
+			StartCol: wp.StartCol,
+			EndCol:   wp.EndCol,
+		}
+	}
+	m.inlineEditor.SetWarpLines(warpMap)
+}
+
 // nextTab switches to the next tab (wraps around).
 func (m *AppModel) nextTab() tea.Cmd {
 	if len(m.tabOrder) < 2 {
@@ -2869,6 +3006,54 @@ func (m *AppModel) prevTab() tea.Cmd {
 	}
 	idx := (m.activeTabIndex() - 1 + len(m.tabOrder)) % len(m.tabOrder)
 	return m.switchToTab(idx)
+}
+
+// tabNavRight navigates to the next tab. When the active tab is at the
+// right edge of the visible window, it page-jumps to the first tab on
+// the next visible page instead of stepping by one.
+func (m *AppModel) tabNavRight() tea.Cmd {
+	n := len(m.tabOrder)
+	if n < 2 {
+		return nil
+	}
+	active := m.activeTabIndex()
+	cfg := m.tabBarConfig()
+	_, hi := tabbar.VisibleRange(cfg)
+
+	// All tabs visible or not at right edge: simple step.
+	if hi >= n-1 || active < hi {
+		return m.switchToTab((active + 1) % n)
+	}
+
+	// At right edge of overflow window — page forward.
+	// Simulate centering on hi+1 to find the new visible page.
+	cfg.Active = hi + 1
+	newLo, _ := tabbar.VisibleRange(cfg)
+	return m.switchToTab(newLo)
+}
+
+// tabNavLeft navigates to the previous tab. When the active tab is at the
+// left edge of the visible window, it page-jumps to the last tab on the
+// previous visible page instead of stepping by one.
+func (m *AppModel) tabNavLeft() tea.Cmd {
+	n := len(m.tabOrder)
+	if n < 2 {
+		return nil
+	}
+	active := m.activeTabIndex()
+	cfg := m.tabBarConfig()
+	lo, _ := tabbar.VisibleRange(cfg)
+
+	// All tabs visible or not at left edge: simple step.
+	if lo <= 0 || active > lo {
+		return m.switchToTab((active - 1 + n) % n)
+	}
+
+	// At left edge of overflow window — page backward.
+	// Simulate centering on lo-1 to find the new visible page.
+	cfg.Active = lo - 1
+	_, newHi := tabbar.VisibleRange(cfg)
+	return m.switchToTab(newHi)
 }
 
 // toggleTabsPanel toggles the tabs list view in the file tree panel.
@@ -2928,6 +3113,13 @@ func (m *AppModel) closeCurrentTab(discard bool) tea.Cmd {
 
 	m.removeTab(path)
 	m.editorCache.Delete(path)
+
+	// Clear the editor so the subsequent detachCurrentEditor (in
+	// handleFileOpen) sees an empty file path and skips re-caching
+	// the discarded state.
+	if discard {
+		m.inlineEditor.ClearFile()
+	}
 
 	// Last tab closed — show placeholder, stay in edit mode.
 	if len(m.tabOrder) == 0 {

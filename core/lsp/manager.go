@@ -29,6 +29,11 @@ const managerDiagBufferSize = 256
 // Derived from: runs for the duration of the client's lifetime.
 const fanInTimeout = 24 * time.Hour
 
+// minRestartInterval prevents rapid client restart loops after errors.
+// Derived from: typical LSP crash + restart cycle should space out at
+// least 10s to avoid thrashing.
+const minRestartInterval = 10 * time.Second
+
 // Sentinel errors.
 var (
 	errTooManyClients = errors.New("too many active LSP clients")
@@ -52,10 +57,11 @@ type clientKey struct {
 // Manager manages multiple LSP clients and routes document events to
 // the appropriate server. It is safe for concurrent use.
 type Manager struct {
-	mu       sync.RWMutex
-	clients  map[clientKey]*Client
-	selector *LSPSelector
-	scope    *concurrency.GoroutineScope
+	mu             sync.RWMutex
+	clients        map[clientKey]*Client
+	lastStartFail  map[clientKey]time.Time // restart backoff tracker
+	selector       *LSPSelector
+	scope          *concurrency.GoroutineScope
 
 	// Aggregated diagnostics channel from all active clients.
 	diagnostics chan DiagnosticResult
@@ -65,10 +71,11 @@ type Manager struct {
 // NewManager creates a Manager with the default server selector.
 func NewManager(scope *concurrency.GoroutineScope) *Manager {
 	return &Manager{
-		clients:     make(map[clientKey]*Client, maxActiveClients),
-		selector:    NewLSPSelector(),
-		scope:       scope,
-		diagnostics: make(chan DiagnosticResult, managerDiagBufferSize),
+		clients:       make(map[clientKey]*Client, maxActiveClients),
+		lastStartFail: make(map[clientKey]time.Time),
+		selector:      NewLSPSelector(),
+		scope:         scope,
+		diagnostics:   make(chan DiagnosticResult, managerDiagBufferSize),
 	}
 }
 
@@ -293,7 +300,9 @@ func (m *Manager) Shutdown() error {
 	m.clients = make(map[clientKey]*Client, maxActiveClients)
 	m.mu.Unlock()
 
-	defer close(m.diagnostics)
+	// Note: m.diagnostics is NOT closed here. Fan-in goroutines may still
+	// be draining after client.Stop() returns. The bridge exits via its own
+	// done channel / context cancellation, not channel close.
 
 	if len(clients) == 0 {
 		return nil
@@ -333,7 +342,8 @@ func (m *Manager) ClientCount() int {
 // Internal
 // ---------------------------------------------------------------------------
 
-// startClient creates, starts, and registers a new Client.
+// startClient creates, starts, and registers a new Client. It handles
+// stale client cleanup and restart backoff to prevent thrashing.
 func (m *Manager) startClient(
 	ctx context.Context,
 	def *LanguageServerDefinition,
@@ -342,9 +352,22 @@ func (m *Manager) startClient(
 ) (*Client, error) {
 	m.mu.Lock()
 	// Double-check under write lock.
-	if existing, ok := m.clients[key]; ok && existing.Status() == StatusReady {
-		m.mu.Unlock()
-		return existing, nil
+	if existing, ok := m.clients[key]; ok {
+		if existing.Status() == StatusReady {
+			m.mu.Unlock()
+			return existing, nil
+		}
+		// Remove stale client (StatusError or other non-ready state).
+		delete(m.clients, key)
+		m.cleanupStaleClient(existing)
+	}
+	// Enforce restart backoff to prevent rapid restart loops.
+	if lastFail, ok := m.lastStartFail[key]; ok {
+		if time.Since(lastFail) < minRestartInterval {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("client %s restart backoff (retry after %s)",
+				key.serverID, minRestartInterval)
+		}
 	}
 	if len(m.clients) >= maxActiveClients {
 		m.mu.Unlock()
@@ -354,15 +377,28 @@ func (m *Manager) startClient(
 
 	client := NewClient(def, projectRoot, m.scope)
 	if err := client.Start(ctx); err != nil {
+		m.mu.Lock()
+		m.lastStartFail[key] = time.Now()
+		m.mu.Unlock()
 		return nil, err
 	}
 
 	m.mu.Lock()
 	m.clients[key] = client
+	delete(m.lastStartFail, key) // clear backoff on success
 	m.mu.Unlock()
 
 	m.fanInDiagnostics(client)
 	return client, nil
+}
+
+// cleanupStaleClient stops a stale client in a tracked goroutine.
+// Must be called with m.mu held (this method does not access m.mu).
+func (m *Manager) cleanupStaleClient(c *Client) {
+	desc := fmt.Sprintf("lsp.cleanup.%s", c.ServerID())
+	_ = m.scope.Go(desc, managerShutdownTimeout, func(_ context.Context) error {
+		return c.Stop()
+	})
 }
 
 // clientForFile looks up an existing running client for a file.

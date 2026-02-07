@@ -357,12 +357,13 @@ type NerdFontsResultMsg struct {
 
 // FileOpenMsg requests displaying a file in the code viewer.
 type FileOpenMsg struct {
-	Path     string
-	Name     string
-	Language string
-	Line     int // 0 = top, >0 = scroll to this 1-based line.
-	Col      int // 0-indexed start column for jump marker. 0 = no marker.
-	EndCol   int // 0-indexed end column (exclusive). 0 = derive from word bounds.
+	Path      string
+	Name      string
+	Language  string
+	Line      int // 0 = top, >0 = scroll to this 1-based line.
+	Col       int // 0-indexed start column for jump marker. 0 = no marker.
+	EndCol    int // 0-indexed end column (exclusive). 0 = derive from word bounds.
+	CursorCol int // If > 0, position cursor at this 0-indexed column after line jump.
 }
 
 // FileTreeNewFileMsg requests creation of a new file in the given directory.

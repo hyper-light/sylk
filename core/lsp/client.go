@@ -40,6 +40,10 @@ const shutdownTimeout = 2 * time.Second
 // Derived from: language servers run for the duration of the editing session.
 const readLoopTimeout = 24 * time.Hour
 
+// stderrDrainSize caps stderr capture to prevent unbounded memory growth.
+// Derived from: typical LSP server stderr is mostly warnings/debug under 64 KiB.
+const stderrDrainSize = 64 * 1024
+
 // Sentinel errors.
 var (
 	errTooManyRequests = errors.New("too many pending requests")
@@ -91,6 +95,7 @@ type Client struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser // server stdin pipe (closed on Stop to unblock writes)
 	stdout io.ReadCloser  // server stdout pipe (closed on Stop to unblock reads)
+	stderr io.ReadCloser  // server stderr pipe (drained for diagnostics)
 
 	// Transport.
 	transport *Transport
@@ -110,8 +115,9 @@ type Client struct {
 	status atomic.Int32
 
 	// Outbound diagnostic channel (consumed by Manager/Bridge).
-	diagnostics chan DiagnosticResult
-	dropped     atomic.Int64
+	diagnostics  chan DiagnosticResult
+	dropped      atomic.Int64
+	stderrOutput string // captured server stderr (bounded by stderrDrainSize)
 
 	// Notification dispatch (built from notifyTable).
 	notifyMap map[string]notifyHandler
@@ -163,16 +169,22 @@ func (c *Client) Start(ctx context.Context) error {
 
 	desc := "lsp.readloop." + string(c.definition.ID)
 	if err := c.scope.Go(desc, readLoopTimeout, c.readLoop); err != nil {
+		c.closePipes()
 		c.killProcess()
 		c.setStatus(StatusError)
 		return fmt.Errorf("start readloop %s: %w", c.definition.ID, err)
 	}
+
+	// Start stderr drain (non-fatal if scope rejects).
+	stderrDesc := "lsp.stderr." + string(c.definition.ID)
+	_ = c.scope.Go(stderrDesc, readLoopTimeout, c.drainStderr)
 
 	initCtx, cancel := context.WithTimeout(ctx, initializeTimeout)
 	defer cancel()
 
 	if err := c.initialize(initCtx); err != nil {
 		close(c.done)
+		c.closePipes()
 		c.killProcess()
 		c.setStatus(StatusError)
 		return fmt.Errorf("initialize %s: %w", c.definition.ID, err)
@@ -192,15 +204,10 @@ func (c *Client) Stop() error {
 	// can dispatch the server's shutdown response.
 	shutdownErr := c.shutdownExit()
 
-	// Signal readloop to exit, then close pipes to unblock any
-	// blocked reads/writes in the readloop before killing the process.
+	// Signal readloop and stderr drain to exit, then close pipes to
+	// unblock any blocked I/O before killing the process.
 	close(c.done)
-	if c.stdout != nil {
-		_ = c.stdout.Close()
-	}
-	if c.stdin != nil {
-		_ = c.stdin.Close()
-	}
+	c.closePipes()
 	c.killProcess()
 	c.setStatus(StatusStopped)
 	c.cancelPending()
@@ -756,8 +763,10 @@ func (c *Client) startProcess() error {
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-	// Discard stderr to avoid blocking.
-	c.cmd.Stderr = nil
+	stderr, err := c.cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
 
 	if err := c.cmd.Start(); err != nil {
 		return fmt.Errorf("exec: %w", err)
@@ -765,32 +774,71 @@ func (c *Client) startProcess() error {
 
 	c.stdin = stdin
 	c.stdout = stdout
+	c.stderr = stderr
 	c.transport = NewTransport(stdout, stdin)
 	return nil
 }
 
-// killTimeout bounds how long we wait for a killed process to exit.
-// Derived from: after SIGKILL, process exit is near-instant on Linux;
-// 1s provides headroom for slow I/O drain.
-const killTimeout = 1 * time.Second
+// closePipes closes stdin, stdout, and stderr pipes to unblock any
+// goroutines blocked on pipe I/O. Must be called before killProcess
+// so that cmd.Wait() returns promptly.
+func (c *Client) closePipes() {
+	if c.stdout != nil {
+		_ = c.stdout.Close()
+	}
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+	}
+	if c.stderr != nil {
+		_ = c.stderr.Close()
+	}
+}
 
 // killProcess terminates the server process if it's still running.
+// Pipes must be closed before calling this method so that cmd.Wait()
+// returns promptly after SIGKILL (no untracked goroutine needed).
 func (c *Client) killProcess() {
 	if c.cmd == nil || c.cmd.Process == nil {
 		return
 	}
 	_ = c.cmd.Process.Kill()
+	_ = c.cmd.Wait()
+}
 
-	// Wait with a timeout to avoid blocking shutdown if pipes won't drain.
-	done := make(chan struct{})
-	go func() {
-		_ = c.cmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(killTimeout):
+// drainStderr reads from the server's stderr pipe and stores the output
+// for diagnostic purposes. Exits when the pipe is closed (via closePipes).
+func (c *Client) drainStderr(_ context.Context) error {
+	if c.stderr == nil {
+		return nil
 	}
+	var output []byte
+	buf := make([]byte, 4096)
+	for len(output) < stderrDrainSize {
+		n, err := c.stderr.Read(buf)
+		if n > 0 {
+			remaining := stderrDrainSize - len(output)
+			if n > remaining {
+				n = remaining
+			}
+			output = append(output, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	if len(output) > 0 {
+		c.mu.Lock()
+		c.stderrOutput = string(output)
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+// StderrOutput returns the captured server stderr output.
+func (c *Client) StderrOutput() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stderrOutput
 }
 
 // ---------------------------------------------------------------------------
@@ -905,9 +953,14 @@ func (c *Client) dispatchIncoming(data []byte) {
 	switch msg.Classify() {
 	case kindResponse:
 		var resp Response
-		if json.Unmarshal(data, &resp) == nil {
-			c.dispatchResponse(resp)
+		if json.Unmarshal(data, &resp) != nil {
+			// Malformed response: clean up the pending entry using the
+			// partially-parsed ID so the caller gets an error instead
+			// of hanging until timeout.
+			c.cleanupByRawID(msg.ID)
+			return
 		}
+		c.dispatchResponse(resp)
 	case kindNotification:
 		var notif Notification
 		if json.Unmarshal(data, &notif) == nil {
@@ -1032,11 +1085,38 @@ func (c *Client) removePending(id int64) {
 	c.mu.Unlock()
 }
 
-// cancelPending closes all pending response channels to unblock waiters.
+// cleanupByRawID attempts to clean up a pending request whose response
+// failed full decoding, using the raw ID from the partial parse.
+func (c *Client) cleanupByRawID(rawID json.RawMessage) {
+	var id RequestID
+	if json.Unmarshal(rawID, &id) != nil {
+		return
+	}
+	intID, ok := id.Int()
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	pr, found := c.pending[intID]
+	if found {
+		delete(c.pending, intID)
+	}
+	c.mu.Unlock()
+	if found {
+		pr.ch <- Response{
+			Error: &RPCError{Code: -32603, Message: "malformed response from server"},
+		}
+	}
+}
+
+// cancelPending sends an error response to all pending waiters so callers
+// receive a typed error rather than a zero-value Response from a closed channel.
 func (c *Client) cancelPending() {
 	c.mu.Lock()
 	for id, pr := range c.pending {
-		close(pr.ch)
+		pr.ch <- Response{
+			Error: &RPCError{Code: -32099, Message: "client stopped"},
+		}
 		delete(c.pending, id)
 	}
 	c.mu.Unlock()

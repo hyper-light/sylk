@@ -33,6 +33,7 @@ type Palette struct {
 	Highlight    lipgloss.Color // Subtle background for transient highlights.
 	Selection    lipgloss.Color // Background for persistent entry selection.
 	PopupBg      lipgloss.Color // Background for floating popups (darker than base).
+	WarpBg       lipgloss.Color // Subtle background for warp-pointed lines.
 
 	// Agent-specific (indexed by type hash for consistency)
 	AgentColors []lipgloss.Color
@@ -64,6 +65,7 @@ var DarkPalette = Palette{
 	Highlight:    lipgloss.Color("#45475a"), // surface1 – prominent transient copy feedback
 	Selection:    lipgloss.Color("#313244"), // surface0 – subtle persistent selection
 	PopupBg:      lipgloss.Color("#181825"), // mantle – darker than base for floating popups
+	WarpBg:       lipgloss.Color("#2a2040"), // dark purple tint – subtle warp line background
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#89b4fa"), // blue - engineer
@@ -105,6 +107,7 @@ var LightPalette = Palette{
 	Highlight:    lipgloss.Color("#dce0e8"), // crust – prominent transient copy feedback
 	Selection:    lipgloss.Color("#e6e9ef"), // mantle – subtle persistent selection
 	PopupBg:      lipgloss.Color("#dce0e8"), // crust – lighter than base for floating popups
+	WarpBg:       lipgloss.Color("#e8dff5"), // light purple tint – subtle warp line background
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#1e66f5"), // blue

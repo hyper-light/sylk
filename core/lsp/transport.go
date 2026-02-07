@@ -81,22 +81,25 @@ func (t *Transport) WriteMessage(data []byte) error {
 
 // readContentLength scans header lines until it finds Content-Length,
 // then reads past the blank line terminating the header block.
+// Header lines are bounded by maxHeaderLineBytes and matched
+// case-insensitively per HTTP/1.1 header field rules.
 func (t *Transport) readContentLength() (int, error) {
 	contentLen := -1
 	for {
-		line, err := t.reader.ReadString('\n')
+		line, err := t.readHeaderLine()
 		if err != nil {
 			return 0, fmt.Errorf("read header: %w", err)
 		}
-		line = strings.TrimRight(line, "\r\n")
 
 		// Blank line terminates the header block.
 		if line == "" {
 			break
 		}
 
-		if strings.HasPrefix(line, headerPrefix) {
-			n, parseErr := strconv.Atoi(line[len(headerPrefix):])
+		// Case-insensitive prefix match per HTTP/1.1 header conventions.
+		if len(line) >= len(headerPrefix) &&
+			strings.EqualFold(line[:len(headerPrefix)], headerPrefix) {
+			n, parseErr := strconv.Atoi(strings.TrimSpace(line[len(headerPrefix):]))
 			if parseErr != nil {
 				return 0, fmt.Errorf("parse content length: %w", parseErr)
 			}
@@ -111,6 +114,28 @@ func (t *Transport) readContentLength() (int, error) {
 		return 0, fmt.Errorf("message too large: %d bytes (max %d)", contentLen, maxMessageBytes)
 	}
 	return contentLen, nil
+}
+
+// readHeaderLine reads a single CRLF-terminated header line, bounded by
+// maxHeaderLineBytes to prevent unbounded reads from a misbehaving server.
+func (t *Transport) readHeaderLine() (string, error) {
+	var buf [maxHeaderLineBytes]byte
+	n := 0
+	for n < maxHeaderLineBytes {
+		b, err := t.reader.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == '\n' {
+			if n > 0 && buf[n-1] == '\r' {
+				n--
+			}
+			return string(buf[:n]), nil
+		}
+		buf[n] = b
+		n++
+	}
+	return "", fmt.Errorf("header line exceeds %d bytes", maxHeaderLineBytes)
 }
 
 // readBody reads exactly n bytes from the reader.

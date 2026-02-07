@@ -107,6 +107,9 @@ type Model struct {
 	jumpEndCol   int  // 0-indexed end column (exclusive, rune offset).
 	jumpActive   bool // Whether the jump marker is visible.
 
+	// Warp point indicators: line → info. Set externally by app.
+	warpLines map[int]WarpLineInfo
+
 	// Completion popup.
 	completionEngine *completion.Engine
 	lspSource        *completion.LSPSource
@@ -515,6 +518,18 @@ func (m *Model) GoToLine(line int) {
 	m.syncStatusLine()
 }
 
+// GoToLineCol moves the cursor to the given 0-indexed line and column
+// and adjusts the scroll offset so the line is centered in the viewport.
+func (m *Model) GoToLineCol(line, col int) {
+	m.state.Cursor = m.lineIndex.LineColToPos(line, col)
+	m.state.ClampCursor(1)
+	vh := m.viewportHeight()
+	if vh > 0 {
+		m.scrollOffset = max(m.state.CursorLine-vh/2, 0)
+	}
+	m.syncStatusLine()
+}
+
 // SetJumpMarker sets a visual marker on the given line/column range.
 // The marker persists until the next cursor movement or buffer change.
 func (m *Model) SetJumpMarker(line, startCol, endCol int) {
@@ -527,6 +542,19 @@ func (m *Model) SetJumpMarker(line, startCol, endCol int) {
 // ClearJumpMarker removes the jump marker.
 func (m *Model) ClearJumpMarker() {
 	m.jumpActive = false
+}
+
+// WarpLineInfo describes a warp point on a specific line.
+type WarpLineInfo struct {
+	Slot     int // 1-indexed slot number for display (1-9).
+	StartCol int // 0-indexed start column of highlighted symbol (rune offset).
+	EndCol   int // 0-indexed end column (exclusive, rune offset).
+}
+
+// SetWarpLines updates the warp point indicators. The map keys are 0-indexed
+// line numbers. Nil clears all.
+func (m *Model) SetWarpLines(lines map[int]WarpLineInfo) {
+	m.warpLines = lines
 }
 
 // ---------------------------------------------------------------------------
@@ -2705,6 +2733,10 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 			if len(hlSpans) > 0 {
 				result = append(result, m.renderHighlightLine(
 					i, displayLine, displayRegions, gutterWidth, defaultStyle, hlSpans, curCol, ulRanges))
+			} else if wInfo, isWarp := m.warpLines[i]; isWarp {
+				warpSpan := []colSpan{{start: wInfo.StartCol, end: min(wInfo.EndCol, displayLineRunes)}}
+				result = append(result, m.renderWarpLine(
+					i, displayLine, displayRegions, gutterWidth, defaultStyle, warpSpan, curCol, ulRanges))
 			} else if curCol >= 0 {
 				result = append(result, m.applyCursor(
 					displayLine, displayRegions, gutterWidth, defaultStyle, displayCol, ulRanges))
@@ -2718,10 +2750,16 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 			result = append(result, m.renderHighlightLine(
 				i, displayLine, displayRegions, gutterWidth, defaultStyle, hlSpans, -1, ulRanges))
 		default:
-			gutter := m.renderGutter(i, gutterWidth)
-			lineText := highlight.RenderLineWithUnderlines(
-				displayLine, displayRegions, m.theme.Syntax, defaultStyle, ulRanges)
-			result = append(result, gutter+lineText)
+			if wInfo, isWarp := m.warpLines[i]; isWarp {
+				warpSpan := []colSpan{{start: wInfo.StartCol, end: min(wInfo.EndCol, displayLineRunes)}}
+				result = append(result, m.renderWarpLine(
+					i, displayLine, displayRegions, gutterWidth, defaultStyle, warpSpan, -1, ulRanges))
+			} else {
+				gutter := m.renderGutter(i, gutterWidth)
+				lineText := highlight.RenderLineWithUnderlines(
+					displayLine, displayRegions, m.theme.Syntax, defaultStyle, ulRanges)
+				result = append(result, gutter+lineText)
+			}
 		}
 
 		// Append diagnostic virtual text line below if space remains.
@@ -2874,6 +2912,47 @@ func (m *Model) renderHighlightLine(lineNum int, line string, regions []highligh
 	return gutter + beforeStyled + cursorStyle.Render(cursorChar) + afterStyled
 }
 
+// renderWarpLine renders a line with a subtle purple warp background, using
+// the same structure as renderHighlightLine but with the WarpBg palette color.
+func (m *Model) renderWarpLine(lineNum int, line string, regions []highlight.HighlightRegion, gutterWidth int, defaultStyle lipgloss.Style, spans []colSpan, cursorCol int, ulRanges []highlight.UnderlineRange) string {
+	gutter := m.renderGutter(lineNum, gutterWidth)
+	runes := []rune(line)
+	n := len(runes)
+
+	bgRanges := make([]highlight.UnderlineRange, len(spans))
+	for i, s := range spans {
+		bgRanges[i] = highlight.UnderlineRange{StartCol: s.start, EndCol: min(s.end, n)}
+	}
+
+	if cursorCol < 0 {
+		return gutter + highlight.RenderLineWithBgRanges(
+			line, regions, m.theme.Syntax, defaultStyle, bgRanges, m.theme.Palette.WarpBg)
+	}
+
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+	beforeEnd := min(cursorCol, n)
+	afterStart := min(cursorCol+1, n)
+
+	before := string(runes[:beforeEnd])
+	after := string(runes[afterStart:])
+	cursorChar := " "
+	if cursorCol < n {
+		r := runes[cursorCol]
+		if r >= ' ' {
+			cursorChar = string(r)
+		}
+	}
+
+	beforeStyled := highlight.RenderLineWithBgRanges(
+		before, filterRegions(regions, 0, beforeEnd), m.theme.Syntax, defaultStyle,
+		filterUnderlines(bgRanges, 0, beforeEnd), m.theme.Palette.WarpBg)
+	afterStyled := highlight.RenderLineWithBgRanges(
+		after, filterRegions(regions, afterStart, n), m.theme.Syntax, defaultStyle,
+		filterUnderlines(bgRanges, afterStart, n), m.theme.Palette.WarpBg)
+
+	return gutter + beforeStyled + cursorStyle.Render(cursorChar) + afterStyled
+}
+
 func (m *Model) applyCursor(line string, regions []highlight.HighlightRegion, gutterWidth int, defaultStyle lipgloss.Style, col int, ulRanges []highlight.UnderlineRange) string {
 	gutter := m.renderGutter(m.state.CursorLine, gutterWidth)
 	runes := []rune(line)
@@ -2924,6 +3003,13 @@ func (m *Model) renderGutter(lineNum, gutterWidth int) string {
 		dotStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Primary).Bold(true)
 		numStr := fmt.Sprintf("%*s", gutterWidth-gutterPadding, "•")
 		return dotStyle.Render(numStr) + strings.Repeat(" ", gutterPadding)
+	}
+
+	// Warp point: purple dot in the line number column.
+	if _, ok := m.warpLines[lineNum]; ok {
+		warpStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Secondary).Bold(true)
+		numStr := fmt.Sprintf("%*s", gutterWidth-gutterPadding, "•")
+		return warpStyle.Render(numStr) + strings.Repeat(" ", gutterPadding)
 	}
 
 	gutterStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
@@ -3320,6 +3406,11 @@ func (m *Model) syncStatusLine() {
 	m.statusLine.SetNodeType(m.state.CursorNodeType)
 	m.statusLine.SetParseErrorCount(len(m.parseErrors))
 	m.statusLine.SetJumpBack(m.jumpList.CanBack())
+	if wInfo, ok := m.warpLines[m.state.CursorLine]; ok {
+		m.statusLine.SetWarpSlot(wInfo.Slot)
+	} else {
+		m.statusLine.SetWarpSlot(0)
+	}
 }
 
 func (m *Model) rehighlight() {

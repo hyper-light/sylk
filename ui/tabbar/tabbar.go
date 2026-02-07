@@ -340,7 +340,7 @@ func renderDivider(cfg Config, widths []int) string {
 // in overflow mode, matching the layout produced by renderOverflow.
 func renderOverflowDivider(cfg Config) string {
 	lineStyle := lipgloss.NewStyle().Foreground(cfg.Theme.Palette.Border)
-	lo, hi := visibleRange(cfg)
+	lo, hi := VisibleRange(cfg)
 
 	// Walk the same layout as renderOverflow to find the active tab bounds.
 	pos := 0
@@ -387,9 +387,9 @@ func renderOverflowDivider(cfg Config) string {
 	return b.String()
 }
 
-// visibleRange computes the inclusive [lo, hi] index range of tabs visible
+// VisibleRange computes the inclusive [lo, hi] index range of tabs visible
 // in overflow mode, centered on cfg.Active.
-func visibleRange(cfg Config) (lo, hi int) {
+func VisibleRange(cfg Config) (lo, hi int) {
 	n := len(cfg.Tabs)
 	lo, hi = cfg.Active, cfg.Active
 	used := naturalWidth(cfg, cfg.Tabs[cfg.Active])
@@ -442,7 +442,7 @@ func visibleRange(cfg Config) (lo, hi int) {
 func renderOverflow(cfg Config) string {
 	th := cfg.Theme
 	n := len(cfg.Tabs)
-	lo, hi := visibleRange(cfg)
+	lo, hi := VisibleRange(cfg)
 
 	sep := separatorStyle(th)
 	leftStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
@@ -521,7 +521,7 @@ func HitTest(cfg Config, x int) HitResult {
 // layout as renderOverflow: optional ◀, visible tabs, optional ▶.
 func hitTestOverflow(cfg Config, x int) HitResult {
 	n := len(cfg.Tabs)
-	lo, hi := visibleRange(cfg)
+	lo, hi := VisibleRange(cfg)
 
 	pos := 0
 

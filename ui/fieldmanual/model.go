@@ -394,13 +394,17 @@ func (m *Model) assembleSectionLines(sections []Section, contentW int) []string 
 	return lines
 }
 
-// renderSectionLines renders a single section: header + separator + bindings.
+// renderSectionLines renders a single section: header + separator + bindings
+// with a blank line between each binding for readability.
 func (m *Model) renderSectionLines(sec Section, contentW int) []string {
 	lines := []string{
 		m.renderSectionHeader(sec.Title),
 		m.renderSeparator(contentW),
 	}
-	for _, b := range sec.Bindings {
+	for i, b := range sec.Bindings {
+		if i > 0 {
+			lines = append(lines, "")
+		}
 		lines = append(lines, m.renderBinding(b, contentW)...)
 	}
 	return lines

@@ -24,6 +24,7 @@ type openDocument struct {
 	languageID string
 	version    int
 	lastText   string
+	lines      []string // cached line splits, rebuilt on text change
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ func (dt *DocumentTracker) Open(uri, languageID, text string) (int, bool) {
 		languageID: languageID,
 		version:    1,
 		lastText:   text,
+		lines:      splitDocLines(text),
 	}
 	return 1, true
 }
@@ -79,6 +81,7 @@ func (dt *DocumentTracker) Change(uri, newText string) (int, bool) {
 	}
 	doc.version++
 	doc.lastText = newText
+	doc.lines = splitDocLines(newText)
 	return doc.version, true
 }
 
@@ -155,17 +158,28 @@ func (dt *DocumentTracker) LanguageID(uri string) string {
 
 // LineText returns the text of a 0-indexed line for a tracked URI.
 // Returns "" if the document is not tracked or the line is out of range.
+// Uses cached line splits for O(1) lookup.
 func (dt *DocumentTracker) LineText(uri string, line int) string {
 	dt.mu.RLock()
 	defer dt.mu.RUnlock()
 
 	doc, ok := dt.docs[uri]
-	if !ok || line < 0 {
+	if !ok || line < 0 || line >= len(doc.lines) {
 		return ""
 	}
-	lines := strings.SplitAfter(doc.lastText, "\n")
-	if line >= len(lines) {
-		return ""
+	return doc.lines[line]
+}
+
+// splitDocLines splits text into lines, stripping trailing newlines from
+// each line. Rebuilt on Open and Change so LineText is O(1).
+func splitDocLines(text string) []string {
+	raw := strings.SplitAfter(text, "\n")
+	// SplitAfter may produce an empty trailing element if text ends with \n.
+	if len(raw) > 0 && raw[len(raw)-1] == "" {
+		raw = raw[:len(raw)-1]
 	}
-	return strings.TrimRight(lines[line], "\n")
+	for i, l := range raw {
+		raw[i] = strings.TrimRight(l, "\n")
+	}
+	return raw
 }

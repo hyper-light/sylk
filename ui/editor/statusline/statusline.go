@@ -26,6 +26,7 @@ type StatusLine struct {
 	nodeType        string // tree-sitter node type at cursor
 	parseErrorCount int    // number of tree-sitter parse errors
 	jumpBack        bool   // jump-back is available (Ctrl+O)
+	warpSlot        int    // active warp slot on cursor line (0 = none, 1-9 = slot)
 }
 
 // New creates a StatusLine with sensible defaults.
@@ -63,6 +64,9 @@ func (s *StatusLine) SetParseErrorCount(n int) { s.parseErrorCount = n }
 
 // SetJumpBack updates the jump-back availability indicator.
 func (s *StatusLine) SetJumpBack(available bool) { s.jumpBack = available }
+
+// SetWarpSlot updates the warp point slot indicator (0 = none, 1-9 = slot).
+func (s *StatusLine) SetWarpSlot(slot int) { s.warpSlot = slot }
 
 // View renders the status line to fill the given width.
 func (s *StatusLine) View(width int) string {
@@ -106,6 +110,9 @@ func (s *StatusLine) renderRight() string {
 	}
 	if s.parseErrorCount > 0 {
 		parts = append(parts, fmt.Sprintf("E:%d", s.parseErrorCount))
+	}
+	if s.warpSlot > 0 {
+		parts = append(parts, fmt.Sprintf("W%d", s.warpSlot))
 	}
 	if s.nodeType != "" {
 		parts = append(parts, s.nodeType)
