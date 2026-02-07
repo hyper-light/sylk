@@ -17,6 +17,7 @@ const (
 	FocusSearch
 	FocusEditor
 	FocusFileTree
+	FocusFieldManual
 )
 
 // Component defines the contract for all TUI sub-models.

@@ -32,6 +32,7 @@ import (
 	"github.com/adalundhe/sylk/ui/editor"
 	"github.com/adalundhe/sylk/ui/editor/mode"
 	"github.com/adalundhe/sylk/ui/editor/register"
+	"github.com/adalundhe/sylk/ui/fieldmanual"
 	"github.com/adalundhe/sylk/ui/filetree"
 	"github.com/adalundhe/sylk/ui/fonts"
 	inputpkg "github.com/adalundhe/sylk/ui/input"
@@ -96,10 +97,11 @@ const sourceAgentTUI = "tui"
 type overlayState int
 
 const (
-	overlayNone   overlayState = iota
-	overlayEditor              // Full-screen editor.
-	overlayModal               // Modal dialog stack.
-	overlaySearch              // Command palette.
+	overlayNone        overlayState = iota
+	overlayEditor                   // Full-screen editor.
+	overlayModal                    // Modal dialog stack.
+	overlaySearch                   // Command palette.
+	overlayFieldManual              // Field Manual help overlay.
 )
 
 
@@ -205,8 +207,9 @@ type AppModel struct {
 	// Overlay components
 	editorOverlay *editor.Model
 	modalOverlay  *modal.Model
-	searchOverlay    *search.Model
-	overlay          overlayState
+	searchOverlay      *search.Model
+	fieldManualOverlay *fieldmanual.Model
+	overlay            overlayState
 
 	// Bridges
 	activityBridge *bridge.ActivityBridge
@@ -416,7 +419,8 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		inlineEditor:     editor.New(th),
 		editorCache:      editor.NewEditorCache(editor.CacheConfig{}),
 		modalOverlay:     modal.New(th),
-		searchOverlay:    search.New(th, search.NewProviderRegistry()),
+		searchOverlay:      search.New(th, search.NewProviderRegistry()),
+		fieldManualOverlay: fieldmanual.New(th),
 		activityBridge:   bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
 		sessionBridge:    bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
 		streamBridge:     bridge.NewStreamBridge(deps.Scope),
@@ -734,6 +738,9 @@ func (m *AppModel) View() string {
 	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
 		return m.searchOverlay.View()
 	}
+	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
+		return m.fieldManualOverlay.View()
+	}
 
 	return base
 }
@@ -939,6 +946,12 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.toggleEditMode()
 	}
 
+	// Alt+H toggles the Field Manual help overlay.
+	if key.String() == "alt+h" {
+		m.toggleFieldManual()
+		return m, nil
+	}
+
 	// Escape: close references panel if active, abort command input,
 	// route to editor in edit mode, or double-tap to interrupt agent.
 	if key.String() == "esc" {
@@ -967,10 +980,10 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Shift+Tab in edit mode normal: cycle to next tab.
+	// Shift+Tab in edit mode: cycle to next tab.
 	if ks == "shift+tab" && m.editMode &&
 		m.focus.Current() == component.FocusCodeViewer &&
-		m.inlineEditor.IsNormalMode() && len(m.tabOrder) > 0 {
+		len(m.tabOrder) > 0 {
 		return m, m.nextTab()
 	}
 
@@ -996,6 +1009,14 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
 		comp, cmd := m.searchOverlay.Update(key)
 		m.searchOverlay = comp.(*search.Model)
+		return m, cmd
+	}
+	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
+		comp, cmd := m.fieldManualOverlay.Update(key)
+		m.fieldManualOverlay = comp.(*fieldmanual.Model)
+		if !m.fieldManualOverlay.Visible() {
+			m.overlay = overlayNone
+		}
 		return m, cmd
 	}
 	// Ctrl+P toggles the search overlay (unless the editor completion popup
@@ -2601,6 +2622,7 @@ func (m *AppModel) saveEditorBuffer() {
 	m.lspDidSaveAsync(path, content)
 	m.codePanel.SetContent(content, path, m.inlineEditor.Language())
 	m.nudgeGitWatcher()
+	m.refreshTabsModified()
 	m.statusBar.SetFlash("Saved " + path)
 }
 
@@ -2859,7 +2881,7 @@ func (m *AppModel) toggleTabsPanel() tea.Cmd {
 		return nil
 	}
 	m.preTabsFocus = m.focus.Current()
-	m.fileTree.SetTabs(m.tabOrder, m.inlineEditor.FilePath())
+	m.fileTree.SetTabs(m.tabOrder, m.inlineEditor.FilePath(), m.tabModifiedSet())
 	if !m.isFileTreeVisible() {
 		m.leftRing.setTo(component.FocusFileTree)
 	}
@@ -2968,8 +2990,32 @@ func (m *AppModel) closeTabByPath(path string) tea.Cmd {
 // visible, keeping it in sync with the app's tabOrder.
 func (m *AppModel) refreshTabsPanel() {
 	if m.fileTree.InTabsMode() {
-		m.fileTree.SetTabs(m.tabOrder, m.inlineEditor.FilePath())
+		m.fileTree.SetTabs(m.tabOrder, m.inlineEditor.FilePath(), m.tabModifiedSet())
 	}
+}
+
+// refreshTabsModified updates the modified indicators in the tabs panel
+// without resetting cursor, scroll, or filter state.
+func (m *AppModel) refreshTabsModified() {
+	if m.fileTree.InTabsMode() {
+		m.fileTree.UpdateTabModified(m.tabModifiedSet())
+	}
+}
+
+// tabModifiedSet returns a set of paths with unsaved changes.
+func (m *AppModel) tabModifiedSet() map[string]bool {
+	currentPath := m.inlineEditor.FilePath()
+	mod := make(map[string]bool, len(m.tabOrder))
+	for _, path := range m.tabOrder {
+		if path == currentPath {
+			if m.inlineEditor.Modified() {
+				mod[path] = true
+			}
+		} else if m.editorCache.IsModified(path) {
+			mod[path] = true
+		}
+	}
+	return mod
 }
 
 // ---------------------------------------------------------------------------
@@ -3084,6 +3130,15 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 			m.searchOverlay.ScrollUp()
 		case tea.MouseButtonWheelDown:
 			m.searchOverlay.ScrollDown()
+		}
+		return nil
+	}
+	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
+		switch mouse.Button {
+		case tea.MouseButtonWheelUp:
+			m.fieldManualOverlay.ScrollUp()
+		case tea.MouseButtonWheelDown:
+			m.fieldManualOverlay.ScrollDown()
 		}
 		return nil
 	}
@@ -3833,6 +3888,21 @@ func (m *AppModel) toggleSearch() {
 	}
 }
 
+func (m *AppModel) toggleFieldManual() {
+	if m.fieldManualOverlay.Visible() {
+		m.fieldManualOverlay.Hide()
+		m.overlay = overlayNone
+	} else {
+		m.scroll = scrollState{}
+		m.bounce = bounceState{}
+		m.chat.SetBounceOffset(0)
+		m.codePanel.SetBounceOffset(0)
+		m.fileTree.SetBounceOffset(0)
+		m.fieldManualOverlay.Show()
+		m.overlay = overlayFieldManual
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Message propagation
 // ---------------------------------------------------------------------------
@@ -3902,8 +3972,12 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		return cmd
 	case component.FocusCodeViewer:
 		if m.editMode {
+			wasMod := m.inlineEditor.Modified()
 			comp, cmd := m.inlineEditor.Update(key)
 			m.inlineEditor = comp.(*editor.Model)
+			if m.inlineEditor.Modified() != wasMod {
+				m.refreshTabsModified()
+			}
 			// Schedule document highlight when cursor rests on a word.
 			line := m.inlineEditor.CursorLine()
 			col := m.inlineEditor.CursorCol()
@@ -4014,6 +4088,7 @@ func (m *AppModel) recalcLayout() {
 	m.editorOverlay.SetSize(m.width, m.height)
 	m.modalOverlay.SetSize(m.width, m.height)
 	m.searchOverlay.SetSize(m.width, m.height)
+	m.fieldManualOverlay.SetSize(m.width, m.height)
 }
 
 

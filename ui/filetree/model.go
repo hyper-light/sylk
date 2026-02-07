@@ -389,6 +389,7 @@ type Model struct {
 
 	// Tabs state (viewTabs mode).
 	tabPaths      []string        // Absolute paths of all open tabs.
+	tabModified   map[string]bool // Paths with unsaved changes.
 	tabFiltered   []int           // Indices into tabPaths matching current filter.
 	tabDupBases   map[string]bool // Base filenames that appear more than once (for disambiguation).
 	tabActive     string          // Path of the currently active tab (for highlight).
@@ -909,8 +910,8 @@ func (m *Model) ExitDocSymbols() {
 }
 
 // SetTabs switches the panel to tabs mode, displaying the given open tabs.
-// Snapshots tree state for restore on exit.
-func (m *Model) SetTabs(tabs []string, active string) {
+// modified maps paths with unsaved changes. Snapshots tree state for restore.
+func (m *Model) SetTabs(tabs []string, active string, modified map[string]bool) {
 	if m.mode == viewSearch {
 		m.exitSearch()
 	}
@@ -928,6 +929,7 @@ func (m *Model) SetTabs(tabs []string, active string) {
 	}
 
 	m.tabPaths = tabs
+	m.tabModified = modified
 	m.tabActive = active
 	m.tabDupBases = buildDupBasenames(tabs)
 	m.tabFiltered = m.buildTabFiltered()
@@ -951,6 +953,12 @@ func (m *Model) SetTabs(tabs []string, active string) {
 	}
 }
 
+// UpdateTabModified refreshes which tabs have unsaved changes without
+// resetting cursor, scroll, or filter state.
+func (m *Model) UpdateTabModified(modified map[string]bool) {
+	m.tabModified = modified
+}
+
 // ExitTabs restores the tree state from before tabs mode.
 func (m *Model) ExitTabs() {
 	m.entries = m.savedEntries
@@ -961,6 +969,7 @@ func (m *Model) ExitTabs() {
 
 	m.savedEntries = nil
 	m.tabPaths = nil
+	m.tabModified = nil
 	m.tabFiltered = nil
 	m.tabDupBases = nil
 	m.tabActive = ""
@@ -4225,9 +4234,17 @@ func (m *Model) renderTabEntry(filteredIdx, contentWidth int) string {
 	}
 
 	hoverClose := filteredIdx == m.tabCloseHover
+	modified := m.tabModified[path]
 	closeColor := m.theme.Palette.Muted
+	if modified {
+		closeColor = m.theme.Palette.Warning
+	}
 	if hoverClose {
 		closeColor = m.theme.Palette.Error
+	}
+	closeGlyph := "✕"
+	if modified {
+		closeGlyph = "●"
 	}
 	nameStyle := lipgloss.NewStyle().Foreground(nameColor)
 	iconStyle := lipgloss.NewStyle().Foreground(iconColor)
@@ -4243,8 +4260,8 @@ func (m *Model) renderTabEntry(filteredIdx, contentWidth int) string {
 
 	prefix := iconStyle.Render(" " + icon + " ")
 	prefixWidth := lipgloss.Width(prefix)
-	suffix := closeStyle.Render("✕") + padStyle.Render(" ")
-	suffixWidth := 2 // "✕" + " "
+	suffix := closeStyle.Render(closeGlyph) + padStyle.Render(" ")
+	suffixWidth := 2 // glyph + " "
 
 	nameSpace := max(contentWidth-prefixWidth-suffixWidth, 0)
 	name := truncatePlain(displayName, nameSpace)

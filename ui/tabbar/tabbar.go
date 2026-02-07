@@ -43,9 +43,8 @@ const Height = 2
 // Derived from: 1 space + 1 pipe + 1 space.
 const separatorWidth = 3
 
-// modifiedWidth is the rendered width of the modified indicator (" ●").
-// Derived from: 1 space + 1 dot.
-const modifiedWidth = 2
+// modifiedGlyph replaces the close icon on tabs with unsaved changes.
+const modifiedGlyph = "●"
 
 // closeWidth is the rendered width of the close region (" ✕ ").
 // Derived from: 1 space + 1 glyph + 1 space, so the hover highlight
@@ -111,11 +110,7 @@ func iconDisplayWidth(cfg Config, t Tab) int {
 // naturalWidth returns the display width of a tab at its full name.
 func naturalWidth(cfg Config, t Tab) int {
 	name := filepath.Base(t.Path)
-	w := padWidth + iconDisplayWidth(cfg, t) + iconGap + runewidth.StringWidth(name) + closeWidth
-	if t.Modified {
-		w += modifiedWidth
-	}
-	return w
+	return padWidth + iconDisplayWidth(cfg, t) + iconGap + runewidth.StringWidth(name) + closeWidth
 }
 
 // naturalWidths returns the natural width of each tab.
@@ -215,9 +210,6 @@ func renderTab(cfg Config, t Tab, active, hoverClose bool, budget int) string {
 	// Determine available display columns for the name.
 	iconW := runewidth.StringWidth(icon)
 	overhead := padWidth + iconW + iconGap + closeWidth
-	if t.Modified {
-		overhead += modifiedWidth
-	}
 	nameSpace := budget - overhead
 	if nameSpace < 0 {
 		nameSpace = minNameChars
@@ -225,18 +217,20 @@ func renderTab(cfg Config, t Tab, active, hoverClose bool, budget int) string {
 	name = truncateName(name, nameSpace)
 
 	// Build styles.
-	nameStyle, iconSt, modStyle, closeGapSt, closeGlyphSt := tabStyles(cfg.Theme, iconColor, active, hoverClose)
+	nameStyle, iconSt, closeGapSt, closeGlyphSt := tabStyles(cfg.Theme, iconColor, active, hoverClose, t.Modified)
+
+	closeGlyph := "✕"
+	if t.Modified {
+		closeGlyph = modifiedGlyph
+	}
 
 	var b strings.Builder
 	b.WriteByte(' ')
 	b.WriteString(iconSt.Render(icon))
 	b.WriteByte(' ')
 	b.WriteString(nameStyle.Render(name))
-	if t.Modified {
-		b.WriteString(modStyle.Render(" ⦁"))
-	}
 	b.WriteString(closeGapSt.Render(" "))
-	b.WriteString(closeGlyphSt.Render("✕"))
+	b.WriteString(closeGlyphSt.Render(closeGlyph))
 	b.WriteString(closeGapSt.Render(" "))
 	return b.String()
 }
@@ -244,8 +238,12 @@ func renderTab(cfg Config, t Tab, active, hoverClose bool, budget int) string {
 // tabStyles returns lipgloss styles for the tab components.
 // closeGapStyle is for the spaces flanking the close glyph; closeGlyphStyle is
 // for the glyph itself so the hover highlight covers the full close region.
-func tabStyles(th *theme.Theme, iconColor lipgloss.Color, active, hoverClose bool) (nameStyle, iconStyle, modStyle, closeGapStyle, closeGlyphStyle lipgloss.Style) {
+// When modified is true the close glyph shows the warning color (unsaved dot).
+func tabStyles(th *theme.Theme, iconColor lipgloss.Color, active, hoverClose, modified bool) (nameStyle, iconStyle, closeGapStyle, closeGlyphStyle lipgloss.Style) {
 	closeColor := th.Palette.Muted
+	if modified {
+		closeColor = th.Palette.Warning
+	}
 	if active {
 		nameStyle = lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
 		iconStyle = lipgloss.NewStyle().Foreground(iconColor).Bold(true)
@@ -253,8 +251,7 @@ func tabStyles(th *theme.Theme, iconColor lipgloss.Color, active, hoverClose boo
 		nameStyle = lipgloss.NewStyle().Foreground(th.Palette.Muted)
 		iconStyle = lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	}
-	modStyle = lipgloss.NewStyle().Foreground(th.Palette.Warning)
-	closeGapStyle = lipgloss.NewStyle().Foreground(closeColor)
+	closeGapStyle = lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	closeGlyphStyle = lipgloss.NewStyle().Foreground(closeColor)
 	if hoverClose {
 		closeGlyphStyle = lipgloss.NewStyle().Foreground(th.Palette.Error)
