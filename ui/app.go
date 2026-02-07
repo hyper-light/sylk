@@ -730,8 +730,12 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Alt+Shift+. (alt+>): document symbols for current file (edit mode).
-	if ks == "alt+>" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+	// Alt+Shift+. (alt+>): toggle document symbols for current file (edit mode).
+	if ks == "alt+>" && m.editMode {
+		if m.fileTree.InDocSymbolsMode() {
+			m.fileTree.ExitDocSymbols()
+			return m, nil
+		}
 		fp := m.inlineEditor.FilePath()
 		if fp != "" {
 			return m, m.lspDocumentSymbolCmd(fp)

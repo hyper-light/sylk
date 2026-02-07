@@ -724,8 +724,8 @@ func buildSymItems(entries []SymbolEntry) ([]searchItem, int) {
 	return items, digitCount(maxLine)
 }
 
-// exitDocSymbols restores the tree state from before document symbols mode.
-func (m *Model) exitDocSymbols() {
+// ExitDocSymbols restores the tree state from before document symbols mode.
+func (m *Model) ExitDocSymbols() {
 	m.entries = m.savedEntries
 	m.rebuildPathIndex()
 	m.cursor = m.savedCursor
@@ -934,7 +934,7 @@ func (m *Model) RevealPath(targetPath string) {
 	case viewReferences:
 		m.exitReferences()
 	case viewDocSymbols:
-		m.exitDocSymbols()
+		m.ExitDocSymbols()
 	}
 
 	// Fast path: file is already visible in the flat entry list.
@@ -1178,7 +1178,7 @@ func (m *Model) ensureRefCursorVisible() {
 func (m *Model) handleDocSymbolsKey(key tea.KeyMsg) tea.Cmd {
 	switch key.String() {
 	case "esc", "q":
-		m.exitDocSymbols()
+		m.ExitDocSymbols()
 	case "up", "k":
 		m.moveSymCursor(-1)
 	case "down", "j":
@@ -1224,7 +1224,7 @@ func (m *Model) activateSymResult() tea.Cmd {
 	col := entry.Col
 	endCol := col + len([]rune(entry.Name))
 
-	m.exitDocSymbols()
+	m.ExitDocSymbols()
 
 	return func() tea.Msg {
 		return msg.FileOpenMsg{
