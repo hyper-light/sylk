@@ -143,18 +143,40 @@ func searchForward(re *regexp.Regexp, content []rune, fromRune int) (start, end 
 }
 
 // searchBackward finds the last match before beforeRune in the rune slice.
+// Uses iterative forward scanning to find the last match in O(N) time and
+// O(1) match memory (no allocation of all-matches list).
 func searchBackward(re *regexp.Regexp, content []rune, beforeRune int) (start, end int, found bool) {
 	if beforeRune <= 0 {
 		return 0, 0, false
 	}
 	upperBound := min(beforeRune, len(content))
 	text := string(content[:upperBound])
-	matches := re.FindAllStringIndex(text, -1)
-	if len(matches) == 0 {
+	// Walk forward keeping only the last match. Each FindStringIndex
+	// advances past the prior match so total regex work is O(N).
+	var lastStart, lastEnd int
+	offset := 0
+	for {
+		loc := re.FindStringIndex(text[offset:])
+		if loc == nil {
+			break
+		}
+		lastStart = offset + loc[0]
+		lastEnd = offset + loc[1]
+		found = true
+		// Advance past this match (at least 1 byte for zero-width).
+		advance := loc[1]
+		if advance == 0 {
+			advance = 1
+		}
+		offset += advance
+		if offset >= len(text) {
+			break
+		}
+	}
+	if !found {
 		return 0, 0, false
 	}
-	last := matches[len(matches)-1]
-	matchRunes := []rune(text[:last[0]])
-	matchEndRunes := []rune(text[:last[1]])
+	matchRunes := []rune(text[:lastStart])
+	matchEndRunes := []rune(text[:lastEnd])
 	return len(matchRunes), len(matchEndRunes), true
 }

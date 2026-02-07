@@ -3,7 +3,7 @@ package filetree
 import (
 	"bytes"
 	"fmt"
-	"math"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -270,15 +270,20 @@ type cachedFile struct {
 }
 
 // fileCache provides bounded, session-scoped caching of file content to
-// eliminate redundant disk I/O across keystrokes.
+// eliminate redundant disk I/O across keystrokes. Uses FIFO eviction when
+// the cache exceeds maxFileCacheSize.
 type fileCache struct {
 	entries   map[string]*cachedFile
+	order     []string // insertion order for FIFO eviction
 	totalSize int64
 }
 
 // newFileCache creates an empty file cache.
 func newFileCache() *fileCache {
-	return &fileCache{entries: make(map[string]*cachedFile, 512)}
+	return &fileCache{
+		entries: make(map[string]*cachedFile, 512),
+		order:   make([]string, 0, 512),
+	}
 }
 
 // get returns the cached lines for path, or nil if not cached.
@@ -289,20 +294,49 @@ func (c *fileCache) get(path string) []string {
 	return nil
 }
 
-// put stores file lines in the cache if space permits.
+// put stores file lines in the cache, evicting oldest entries if the new
+// entry would exceed the budget.
 func (c *fileCache) put(path string, lines []string, size int64) {
-	if c.totalSize+size > maxFileCacheSize {
+	if _, ok := c.entries[path]; ok {
 		return
 	}
+	for c.totalSize+size > maxFileCacheSize && len(c.order) > 0 {
+		c.evictOldest()
+	}
+	if c.totalSize+size > maxFileCacheSize {
+		return // single entry exceeds budget
+	}
 	c.entries[path] = &cachedFile{lines: lines, size: size}
+	c.order = append(c.order, path)
 	c.totalSize += size
+}
+
+// evictOldest removes the oldest cache entry.
+func (c *fileCache) evictOldest() {
+	if len(c.order) == 0 {
+		return
+	}
+	oldest := c.order[0]
+	c.order = c.order[1:]
+	if e, ok := c.entries[oldest]; ok {
+		c.totalSize -= e.size
+		delete(c.entries, oldest)
+	}
 }
 
 // evict removes a single path from the cache so the next access re-reads disk.
 func (c *fileCache) evict(path string) {
-	if e, ok := c.entries[path]; ok {
-		c.totalSize -= e.size
-		delete(c.entries, path)
+	e, ok := c.entries[path]
+	if !ok {
+		return
+	}
+	c.totalSize -= e.size
+	delete(c.entries, path)
+	for i, p := range c.order {
+		if p == path {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
 	}
 }
 
@@ -347,11 +381,13 @@ type Model struct {
 	// Async search worker and state.
 	searchWorker *SearchWorker // Parallel async scanner (nil when not searching).
 	searchDone   bool          // True when the latest async scan is complete.
+	searchStale  bool          // True when a new scan is in-flight but no batch has arrived yet.
 
 	// Search performance: debounce, caching, pre-indexed scope.
 	searchVersion int        // Monotonic counter; gates stale debounce ticks.
 	searchCache   *fileCache // Session-scoped file content cache.
 	scopeIndex    map[string][]int // dir prefix → indices into searchSource.
+	scopeSorted   []string         // sorted keys of scopeIndex for binary search.
 
 	// Search toolbar state.
 	searchFocus    searchFocus        // Active focus zone within search footer.
@@ -558,13 +594,14 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 
 // handleSearchTick processes a debounced search tick. If the version matches
 // the current searchVersion, launches an async scan via the search worker.
+// Old results stay visible (searchStale flag) until the first new batch
+// arrives, preventing a "no results" flicker between queries.
 func (m *Model) handleSearchTick(tick searchTickMsg) tea.Cmd {
 	if tick.version != m.searchVersion || m.searchWorker == nil {
 		return nil
 	}
 
-	m.searchItems = nil
-	m.searchNumWidth = 0
+	m.searchStale = true
 	m.searchDone = false
 	m.compiledRegexp = nil
 
@@ -580,6 +617,15 @@ func (m *Model) handleSearchTick(tick searchTickMsg) tea.Cmd {
 func (m *Model) handleSearchBatch(batch searchBatchMsg) tea.Cmd {
 	if m.searchWorker == nil || batch.version != m.searchVersion {
 		return nil
+	}
+
+	// First batch for a new query: replace stale results from the previous query.
+	if m.searchStale {
+		m.searchItems = nil
+		m.searchNumWidth = 0
+		m.searchCursor = 0
+		m.searchScroll = 0
+		m.searchStale = false
 	}
 
 	// Merge items: add cross-batch gap if appending to existing results.
@@ -2727,7 +2773,7 @@ func (m *Model) enterSearch() {
 	// Initialize performance caches.
 	m.searchVersion = 0
 	m.searchCache = newFileCache()
-	m.scopeIndex = buildScopeIndex(m.searchSource, m.rootPath)
+	m.scopeIndex, m.scopeSorted = buildScopeIndex(m.searchSource, m.rootPath)
 
 	// Initialize toolbar state.
 	m.searchFocus = focusQuery
@@ -2763,6 +2809,7 @@ func (m *Model) exitSearch() {
 	m.searchVersion = 0
 	m.searchCache = nil
 	m.scopeIndex = nil
+	m.scopeSorted = nil
 
 	// Clear toolbar state.
 	m.searchFocus = focusQuery
@@ -3422,19 +3469,22 @@ func (m *Model) filterByRegex(pattern string) []string {
 }
 
 // lookupScope returns paths under the given scope using the directory index.
-// Collects all index entries whose directory key starts with the scope prefix.
+// Uses binary search on sorted keys for O(log N + K) instead of O(N).
 func (m *Model) lookupScope(scope string) []string {
 	scope = filepath.FromSlash(scope)
 	prefix := filepath.Join(m.rootPath, scope)
 	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
 		prefix += string(filepath.Separator)
 	}
+	// Binary search for the first key >= prefix.
+	start := sort.SearchStrings(m.scopeSorted, prefix)
 	var filtered []string
-	for dir, indices := range m.scopeIndex {
-		if !strings.HasPrefix(dir, prefix) {
-			continue
+	for i := start; i < len(m.scopeSorted); i++ {
+		key := m.scopeSorted[i]
+		if !strings.HasPrefix(key, prefix) {
+			break
 		}
-		for _, idx := range indices {
+		for _, idx := range m.scopeIndex[key] {
 			filtered = append(filtered, m.searchSource[idx])
 		}
 	}
@@ -3442,8 +3492,9 @@ func (m *Model) lookupScope(scope string) []string {
 }
 
 // buildScopeIndex groups searchSource paths by their parent directory
-// for efficient scope filtering. Built once at search entry.
-func buildScopeIndex(sources []string, rootPath string) map[string][]int {
+// for efficient scope filtering. Returns the index map and a sorted key
+// list for binary-search-based prefix matching. Built once at search entry.
+func buildScopeIndex(sources []string, rootPath string) (map[string][]int, []string) {
 	index := make(map[string][]int, len(sources)/4)
 	for i, path := range sources {
 		dir := filepath.Dir(path)
@@ -3452,7 +3503,12 @@ func buildScopeIndex(sources []string, rootPath string) map[string][]int {
 		}
 		index[dir] = append(index[dir], i)
 	}
-	return index
+	keys := make([]string, 0, len(index))
+	for k := range index {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return index, keys
 }
 
 // grepSources scans files synchronously and builds the searchItems list,
@@ -3537,12 +3593,19 @@ func (m *Model) cachedFileLines(path string) []string {
 
 // readSearchableFile reads a file's bytes, skipping files that are too large,
 // unreadable, or binary. Returns nil if the file should be skipped.
+// Uses a single open + fstat on the file descriptor to avoid TOCTOU races
+// and reduce syscall count (vs. separate Stat + ReadFile).
 func readSearchableFile(path string) []byte {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil || info.Size() > maxSearchFileSize {
 		return nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil
 	}
@@ -3566,7 +3629,7 @@ func matchLines(lines []string, query string, cfg matchConfig) []searchMatch {
 		if isBlankLine(line) {
 			continue
 		}
-		if lineMatches(line, query, cfg) {
+		if lineMatches(line, cfg) {
 			matches = append(matches, searchMatch{line: i + 1, text: line})
 		}
 	}
@@ -3584,9 +3647,9 @@ func isBlankLine(s string) bool {
 	return true
 }
 
-// lineMatches reports whether a single line matches the query using the
-// pre-compiled regex from matchConfig (covers all flag combinations).
-func lineMatches(line, _ string, cfg matchConfig) bool {
+// lineMatches reports whether a single line matches using the pre-compiled
+// regex from matchConfig (covers all flag combinations).
+func lineMatches(line string, cfg matchConfig) bool {
 	if cfg.compiled == nil {
 		return false
 	}
@@ -3604,11 +3667,18 @@ func hasUpperCase(s string) bool {
 }
 
 // digitCount returns the number of decimal digits in n, minimum 1.
+// Uses integer division to avoid floating-point precision issues at
+// power-of-10 boundaries.
 func digitCount(n int) int {
 	if n <= 0 {
 		return 1
 	}
-	return int(math.Log10(float64(n))) + 1
+	count := 0
+	for n > 0 {
+		n /= 10
+		count++
+	}
+	return count
 }
 
 // moveSearchCursor moves the cursor within search items, skipping gap entries.
@@ -3753,8 +3823,8 @@ func (m *Model) readDir(dirPath string, depth int) []Entry {
 		}
 	}
 
-	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name < dirs[j].Name })
-	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+	sort.Slice(dirs, func(i, j int) bool { return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name) })
+	sort.Slice(files, func(i, j int) bool { return strings.ToLower(files[i].Name) < strings.ToLower(files[j].Name) })
 
 	return append(dirs, files...)
 }

@@ -68,20 +68,45 @@ func FindAllInRange(re *regexp.Regexp, content []rune, visibleStart, visibleEnd 
 	if len(byteMatches) == 0 {
 		return nil
 	}
+	// Single-pass byte→rune conversion: walk the string once, resolving
+	// all match byte offsets to rune offsets in O(N) total.
+	runeMap := byteToRuneOffsets(visible, byteMatches)
 	result := make([]MatchRange, 0, len(byteMatches))
 	for _, loc := range byteMatches {
 		if len(result) >= maxHighlightMatches {
 			break
 		}
-		// Convert byte offsets to rune offsets within the visible slice.
-		mStart := len([]rune(visible[:loc[0]]))
-		mEnd := len([]rune(visible[:loc[1]]))
 		result = append(result, MatchRange{
-			Start: start + mStart,
-			End:   start + mEnd,
+			Start: start + runeMap[loc[0]],
+			End:   start + runeMap[loc[1]],
 		})
 	}
 	return result
+}
+
+// byteToRuneOffsets walks s once and returns the rune index for each byte
+// offset referenced by locs. locs must be sorted ascending (as produced
+// by FindAllStringIndex). The returned map covers every distinct byte
+// offset in locs.
+func byteToRuneOffsets(s string, locs [][]int) map[int]int {
+	needed := make(map[int]struct{}, len(locs)*2)
+	for _, loc := range locs {
+		needed[loc[0]] = struct{}{}
+		needed[loc[1]] = struct{}{}
+	}
+	m := make(map[int]int, len(needed))
+	runeIdx := 0
+	for byteIdx := range s {
+		if _, ok := needed[byteIdx]; ok {
+			m[byteIdx] = runeIdx
+		}
+		runeIdx++
+	}
+	// Handle end-of-string offset (len(s) is past the last rune start).
+	if _, ok := needed[len(s)]; ok {
+		m[len(s)] = runeIdx
+	}
+	return m
 }
 
 // FindAllContent is a convenience method that searches the entire content

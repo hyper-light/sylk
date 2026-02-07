@@ -61,7 +61,7 @@ func walkCollect(absPath string, relParts []string, parentPatterns []gitignore.P
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
-		childRel := append(relParts, name)
+		childRel := append(relParts[:len(relParts):len(relParts)], name)
 		childAbs := filepath.Join(absPath, name)
 		dispatchEntry(de, childAbs, childRel, allPatterns, matcher, files)
 	}

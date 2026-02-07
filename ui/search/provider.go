@@ -226,11 +226,11 @@ func (r *ProviderRegistry) Search(ctx context.Context, query string, limit int) 
 		}(p)
 	}
 
-	// Close channel after all goroutines complete.
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
+	// Wait for all provider goroutines then close the channel.
+	// The channel is buffered to len(providers), so all sends complete
+	// before Wait returns — no untracked goroutine needed.
+	wg.Wait()
+	close(ch)
 
 	var merged []Result
 	for pr := range ch {

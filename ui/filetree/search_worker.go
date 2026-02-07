@@ -69,7 +69,8 @@ type fileScanResult struct {
 // pool. Follows the git status watcher pattern: output channel with Bubble
 // Tea subscription, context-based cancellation, WaitGroup goroutine tracking.
 type SearchWorker struct {
-	output chan searchBatchMsg
+	output    chan searchBatchMsg
+	closeOnce sync.Once
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -121,16 +122,19 @@ func (w *SearchWorker) Stop() {
 	w.drainAndClose()
 }
 
-// drainAndClose empties the output channel and closes it.
+// drainAndClose empties the output channel and closes it. Safe to call
+// multiple times — the close is guarded by sync.Once.
 func (w *SearchWorker) drainAndClose() {
-	for {
-		select {
-		case <-w.output:
-		default:
-			close(w.output)
-			return
+	w.closeOnce.Do(func() {
+		for {
+			select {
+			case <-w.output:
+			default:
+				close(w.output)
+				return
+			}
 		}
-	}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -139,12 +143,18 @@ func (w *SearchWorker) drainAndClose() {
 
 // runScan is the pipeline entry point, running in a tracked goroutine.
 // It fans out file scanning to a worker pool and aggregates results.
+// All inner goroutines (feeder, scanners, closer) are tracked via pipeWG
+// and awaited before this function returns, ensuring no untracked goroutines.
 func (w *SearchWorker) runScan(ctx context.Context, files []string, query string, cfg matchConfig, version int) {
 	fileCh := make(chan string, scanChanBuf)
 	resultCh := make(chan fileScanResult, scanChanBuf)
 
+	var pipeWG sync.WaitGroup
+
 	// Feeder: sends file paths to the scanner pool.
+	pipeWG.Add(1)
 	go func() {
+		defer pipeWG.Done()
 		defer close(fileCh)
 		feedFiles(ctx, files, fileCh)
 	}()
@@ -153,20 +163,29 @@ func (w *SearchWorker) runScan(ctx context.Context, files []string, query string
 	var scanWG sync.WaitGroup
 	for range scanWorkerCount {
 		scanWG.Add(1)
+		pipeWG.Add(1)
 		go func() {
+			defer pipeWG.Done()
 			defer scanWG.Done()
 			scanLoop(ctx, fileCh, resultCh, query, cfg)
 		}()
 	}
 
 	// Closer: waits for all scanners to finish, then closes resultCh.
+	pipeWG.Add(1)
 	go func() {
+		defer pipeWG.Done()
 		scanWG.Wait()
 		close(resultCh)
 	}()
 
-	// Aggregator: collects results into batches and sends them.
+	// Aggregator runs in this goroutine.
 	w.aggregate(ctx, resultCh, version)
+
+	// Wait for all pipeline goroutines before returning. Context is
+	// already cancelled (or aggregate finished normally), so all
+	// goroutines exit promptly via their ctx.Done() select branches.
+	pipeWG.Wait()
 }
 
 // feedFiles sends each file path to fileCh, respecting context cancellation.
