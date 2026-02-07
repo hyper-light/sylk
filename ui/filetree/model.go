@@ -29,19 +29,31 @@ const indentWidth = 2
 // Derived from: 1 title line = 1.
 const headerHeight = 1
 
+// treeChromeHeight is the vertical space consumed by the top section in
+// tree browsing mode, references mode, and document symbols mode.
+// Derived from: header(1) + hint-or-input(1) + divider(1) = 3.
+const treeChromeHeight = 3
+
 // topChromeHeight is the vertical space consumed by the top section in
-// both tree and search modes.
-// Derived from: header(1) + input-or-hint(1) + divider(1) = 3.
-const topChromeHeight = 3
+// search mode. Scope line is part of top chrome, separated by dividers.
+// Derived from: header(1) + search bar(1) + divider(1) + scope line(1) + divider(1) = 5.
+const topChromeHeight = 5
 
 // replaceChromeHeight is the vertical space consumed by the top section in
 // replace mode, which adds a replacement input row below the search bar.
-// Derived from: header(1) + search bar(1) + replace bar(1) + divider(1) = 4.
-const replaceChromeHeight = 4
+// Derived from: header(1) + search bar(1) + replace bar(1) + divider(1) + scope line(1) + divider(1) = 6.
+const replaceChromeHeight = 6
 
 // searchFooterHeight is the vertical space consumed by the search-mode footer.
-// Derived from: toolbar separator(1) + toolbar(1) = 2.
-const searchFooterHeight = 2
+// Derived from: toolbar separator(1) + toolbar(1) + match summary(1) = 3.
+const searchFooterHeight = 3
+
+// footerToolbarOffset is the toolbar's row offset from the footer base (separator).
+const footerToolbarOffset = 1
+
+// refsFooterHeight is the vertical space consumed by the references/symbols footer.
+// Derived from: separator(1) + hint line(1) = 2.
+const refsFooterHeight = 2
 
 // newEntryFooterHeight is the vertical space consumed by the new-entry input.
 // Derived from: separator(1) + input line(1) = 2.
@@ -126,22 +138,18 @@ const (
 	focusQuery   searchFocus = iota // The search query input line.
 	focusReplace                    // The replacement text input (replace mode only).
 	focusToggles                    // The toggle badges row.
+	focusBtnOne                     // The [→1] replace-one button (replace mode only).
+	focusBtnAll                     // The [→*] replace-all button (replace mode only).
 	focusScope                      // The path scope text input.
 )
 
-// searchFocusOrder defines the Tab-cycling order for search mode, skipping
-// focusReplace which is only relevant in replace mode.
-// Derived from: the three active focus zones in search mode.
-var searchFocusOrder = [3]searchFocus{focusQuery, focusToggles, focusScope}
+// searchFocusOrder defines the Tab-cycling order for search mode.
+// Derived from: query → scope (top chrome) → toggles (footer).
+var searchFocusOrder = [3]searchFocus{focusQuery, focusScope, focusToggles}
 
 // replaceFocusOrder defines the Tab-cycling order for replace mode.
-// Derived from: the four active focus zones in replace mode.
-var replaceFocusOrder = [4]searchFocus{focusQuery, focusReplace, focusToggles, focusScope}
-
-// searchFocusCount is kept for backward compatibility with existing code
-// that references it. Search mode cycles through 3 zones.
-// Derived from: the three searchFocusOrder values.
-const searchFocusCount = 3
+// Derived from: query → replace → scope (top chrome) → toggles → buttons (footer).
+var replaceFocusOrder = [6]searchFocus{focusQuery, focusReplace, focusScope, focusToggles, focusBtnOne, focusBtnAll}
 
 // toggleIndex identifies a specific toggle badge within the toolbar.
 type toggleIndex int
@@ -150,15 +158,26 @@ const (
 	toggleCase  toggleIndex = iota // [Aa] case sensitivity.
 	toggleWord                     // [ab] whole word.
 	toggleRegex                    // [.*] regex mode.
+	toggleGlob                     // [re] glob pattern for scope filter.
 )
 
-// toggleCount is the number of toggle badges.
-// Derived from: the three toggleIndex values above.
-const toggleCount = 3
+// toggleCount is the total number of toggles.
+// Derived from: the four toggleIndex values above.
+const toggleCount = 4
+
+// toolbarToggleCount is the number of toggles rendered on the toolbar line.
+// The glob toggle [re] renders on the scope line instead.
+// Derived from: [Aa], [ab], [.*] = 3.
+const toolbarToggleCount = 3
 
 // badgeLabels maps each toggle index to its display string.
-// Derived from: the three search mode indicators [Aa], [ab], [.*].
-var badgeLabels = [toggleCount]string{"Aa", "ab", ".*"}
+// Derived from: the four toggle indicators [Aa], [ab], [.*], [re].
+var badgeLabels = [toggleCount]string{"Aa", "ab", ".*", "re"}
+
+// toggleTabOrder defines the Tab-cycling sequence for toggle badges.
+// [re] comes first (adjacent to the scope input), then [Aa] [ab] [.*].
+// Derived from: user-facing order In: → [re] → [Aa] → [ab] → [.*].
+var toggleTabOrder = [toggleCount]toggleIndex{toggleGlob, toggleCase, toggleWord, toggleRegex}
 
 // scopePrefix is the label rendered before the scope input field.
 const scopePrefix = "In: "
@@ -204,6 +223,10 @@ const maxInputLen = 1024
 // the search grep pipeline. Batches rapid sequential keystrokes into one scan.
 // Derived from: 50ms ≈ 3 frames at 60fps, imperceptible to users.
 const searchDebounceInterval = 50 * time.Millisecond
+
+// btnFlashDuration is how long a replace button stays highlighted after activation.
+// Derived from: 200ms matches the editor's replacebar flash duration.
+const btnFlashDuration = 200 * time.Millisecond
 
 // maxFileCacheSize caps total cached file content to prevent unbounded memory.
 // Derived from: 64MB covers 256 files × 256KB average with headroom.
@@ -305,6 +328,7 @@ type Model struct {
 	toggleActive   [toggleCount]bool  // State of [Aa], [ab], [.*] toggles.
 	toggleCursor   toggleIndex        // Which badge is selected when focusToggles.
 	scopeQuery     []rune             // Path scope text input contents.
+	scopeCursor    int                // Rune-based insertion position within scopeQuery.
 	compiledRegexp *regexp.Regexp     // Cached compiled regex (nil if invalid/unused).
 
 	// Cursor blink state for search inputs.
@@ -334,7 +358,11 @@ type Model struct {
 	symNumWidth int // Digit width for line numbers.
 
 	// Replace state (viewReplace mode).
-	replaceInput []rune // Replacement text input contents.
+	replaceInput []rune       // Replacement text input contents.
+	btnFlash     searchFocus  // Which replace button is flashing (focusBtnOne or focusBtnAll).
+	btnFlashAt   time.Time    // When the button flash started.
+	btnOneCol    int          // Absolute column of [→1] button start (for click handling).
+	btnAllCol    int          // Absolute column of [→*] button start (for click handling).
 
 	// New-entry state: two-phase (pending chord → active input).
 	pendingNewEntry bool   // Alt+N pressed, waiting for F (file) or D (dir).
@@ -734,7 +762,7 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 
 // clickReferencesMode handles clicks in references mode body area.
 func (m *Model) clickReferencesMode(viewY int) tea.Cmd {
-	bodyY := viewY - topChromeHeight
+	bodyY := viewY - treeChromeHeight
 	if bodyY < 0 {
 		return nil
 	}
@@ -757,8 +785,8 @@ func (m *Model) clickTreeMode(viewY int) tea.Cmd {
 		return nil
 	}
 
-	// Click in body area (rows topChromeHeight .. topChromeHeight+bh-1).
-	bodyY := viewY - topChromeHeight
+	// Click in body area (rows treeChromeHeight .. treeChromeHeight+bh-1).
+	bodyY := viewY - treeChromeHeight
 	if bodyY < 0 {
 		return nil
 	}
@@ -775,31 +803,34 @@ func (m *Model) clickTreeMode(viewY int) tea.Cmd {
 func (m *Model) clickSearchMode(viewX, viewY int) tea.Cmd {
 	bh := m.bodyHeight()
 
-	// Layout: header(0) | search bar(1) | divider(2) | body(3..3+bh-1) | toolbar sep | toolbar.
+	// Layout: header(0) | search bar(1) | divider(2) | scope line(3) | divider(4) |
+	//         body(5..5+bh-1) | separator(+0) | toolbar(+1) | summary(+2).
+	footerBase := topChromeHeight + bh
 
-	// Click on search bar (row 1, below header).
 	if viewY == headerHeight {
 		m.searchFocus = focusQuery
 		return nil
 	}
+	if viewY == headerHeight+2 {
+		return m.clickScopeLine(viewX)
+	}
 
-	// Click in body area (rows topChromeHeight .. topChromeHeight+bh-1).
 	bodyY := viewY - topChromeHeight
 	if bodyY >= 0 && bodyY < bh {
 		return m.clickSearchBody(bodyY)
 	}
 
-	// Toolbar (row topChromeHeight + bh + 1, after toolbar separator).
-	if viewY == topChromeHeight+bh+1 {
+	if viewY-footerBase == footerToolbarOffset {
 		return m.clickToolbar(viewX)
 	}
 
 	return nil
 }
 
-// clickSearchBody activates a search result at the given body-relative row.
+// clickSearchBody activates a search result at the given body-relative row,
+// accounting for replacement preview lines that expand match items.
 func (m *Model) clickSearchBody(bodyY int) tea.Cmd {
-	idx := m.searchScroll + bodyY
+	idx := m.visualRowToIndex(bodyY)
 	if idx < 0 || idx >= len(m.searchItems) {
 		return nil
 	}
@@ -810,17 +841,37 @@ func (m *Model) clickSearchBody(bodyY int) tea.Cmd {
 	return m.activateSearchResult()
 }
 
-// clickToolbar dispatches a click on the toolbar line to toggle badges
-// or focus the scope input based on X position.
-func (m *Model) clickToolbar(viewX int) tea.Cmd {
-	// Badge layout: " [Aa] [ab] [.*]  In: path"
-	// Compute cumulative X ranges for each badge.
-	x := 1 // leading space
-	for i := range toggleCount {
-		if i > 0 {
-			x++ // space between badges
+// visualRowToIndex converts a body-relative visual row to an item index,
+// accounting for replacement preview lines.
+func (m *Model) visualRowToIndex(bodyY int) int {
+	preview := m.hasReplacePreview()
+	row := 0
+	for i := m.searchScroll; i < len(m.searchItems); i++ {
+		if row == bodyY {
+			return i
 		}
-		badgeW := len(badgeLabels[i]) + 2 // "[" + label + "]"
+		row++
+		if preview && m.searchItems[i].kind == searchItemMatch {
+			if row == bodyY {
+				return i // Click on preview line → same item.
+			}
+			row++
+		}
+	}
+	return -1
+}
+
+// clickToolbar dispatches a click on the toolbar line to toggle badges,
+// replace buttons, or focus the scope input based on X position.
+func (m *Model) clickToolbar(viewX int) tea.Cmd {
+	// Toolbar layout: " [Aa] [ab] [.*]" or " [Aa] [ab] [.*]  [→1] [→*]".
+	// The [re] toggle is on the scope line, not here.
+	x := 1 // leading space
+	for i := range toolbarToggleCount {
+		if i > 0 {
+			x++
+		}
+		badgeW := lipgloss.Width("[" + badgeLabels[i] + "]")
 		if viewX >= x && viewX < x+badgeW {
 			m.searchFocus = focusToggles
 			m.toggleCursor = toggleIndex(i)
@@ -828,8 +879,48 @@ func (m *Model) clickToolbar(viewX int) tea.Cmd {
 		}
 		x += badgeW
 	}
-	// Past badges: scope input area.
+
+	if m.mode == viewReplace {
+		if cmd := m.clickReplaceButtons(viewX); cmd != nil {
+			return cmd
+		}
+	}
+
+	return nil
+}
+
+// clickScopeLine handles a click on the scope line " In: <text>  [re]".
+// Clicks on the [re] badge toggle glob mode; anything else focuses scope input.
+func (m *Model) clickScopeLine(viewX int) tea.Cmd {
+	contentWidth := max(m.width, 1)
+	badgeW := lipgloss.Width("[" + badgeLabels[toggleGlob] + "]")
+	const trailingSpace = 1
+	badgeStart := contentWidth - badgeW - trailingSpace
+	if viewX >= badgeStart && viewX < badgeStart+badgeW {
+		m.searchFocus = focusToggles
+		m.toggleCursor = toggleGlob
+		return m.toggleBadge(toggleGlob)
+	}
 	m.searchFocus = focusScope
+	return nil
+}
+
+// clickReplaceButtons checks if a click hit [→1] or [→*] and activates it.
+func (m *Model) clickReplaceButtons(viewX int) tea.Cmd {
+	// btnOneCol/btnAllCol are absolute columns recorded during render.
+	// Derive widths from the canonical labels to avoid hardcoded magic numbers.
+	btnOneW := lipgloss.Width("[" + theme.IconArrowRight + "1]")
+	btnAllW := lipgloss.Width("[" + theme.IconArrowRight + "*]")
+	if viewX >= m.btnOneCol && viewX < m.btnOneCol+btnOneW {
+		m.searchFocus = focusBtnOne
+		m.flashBtn(focusBtnOne)
+		return m.replaceCurrentSearchMatch()
+	}
+	if viewX >= m.btnAllCol && viewX < m.btnAllCol+btnAllW {
+		m.searchFocus = focusBtnAll
+		m.flashBtn(focusBtnAll)
+		return m.replaceAllSearchMatches()
+	}
 	return nil
 }
 
@@ -1165,7 +1256,7 @@ func (m *Model) ensureSymCursorVisible() {
 
 // clickDocSymbolsMode handles clicks in document symbols mode body area.
 func (m *Model) clickDocSymbolsMode(viewY int) tea.Cmd {
-	bodyY := viewY - topChromeHeight
+	bodyY := viewY - treeChromeHeight
 	if bodyY < 0 {
 		return nil
 	}
@@ -1204,14 +1295,38 @@ func (m *Model) handleSearchKey(key tea.KeyMsg) tea.Cmd {
 	return m.dispatchToFocusZone(key)
 }
 
-// advanceSearchFocus moves focus to the next zone using the mode's focus order.
+// advanceSearchFocus moves focus forward. Within the toggles zone, Tab
+// advances through badges in tab order: [re]→[Aa]→[ab]→[.*] before
+// jumping to the next focus zone.
 func (m *Model) advanceSearchFocus() {
+	if m.searchFocus == focusToggles {
+		pos := toggleTabPos(m.toggleCursor)
+		if pos < toggleCount-1 {
+			m.toggleCursor = toggleTabOrder[pos+1]
+			return
+		}
+	}
 	m.searchFocus = m.nextFocus(1)
+	if m.searchFocus == focusToggles {
+		m.toggleCursor = toggleTabOrder[0]
+	}
 }
 
-// retreatSearchFocus moves focus to the previous zone using the mode's focus order.
+// retreatSearchFocus moves focus backward. Within the toggles zone,
+// Shift+Tab retreats through badges in reverse tab order:
+// [.*]→[ab]→[Aa]→[re] before jumping to the previous focus zone.
 func (m *Model) retreatSearchFocus() {
+	if m.searchFocus == focusToggles {
+		pos := toggleTabPos(m.toggleCursor)
+		if pos > 0 {
+			m.toggleCursor = toggleTabOrder[pos-1]
+			return
+		}
+	}
 	m.searchFocus = m.nextFocus(-1)
+	if m.searchFocus == focusToggles {
+		m.toggleCursor = toggleTabOrder[toggleCount-1]
+	}
 }
 
 // nextFocus cycles through the active focus order by the given delta (+1/-1).
@@ -1238,10 +1353,12 @@ func (m *Model) focusOrder() []searchFocus {
 
 // handleSearchEnter dispatches Enter based on the current focus zone.
 func (m *Model) handleSearchEnter() tea.Cmd {
-	if m.searchFocus == focusToggles {
+	switch m.searchFocus {
+	case focusToggles:
 		return m.toggleBadge(m.toggleCursor)
+	default:
+		return m.activateSearchResult()
 	}
-	return m.activateSearchResult()
 }
 
 // dispatchToFocusZone routes key input to the handler for the active zone.
@@ -1312,10 +1429,20 @@ func (m *Model) handleToggleInput(key tea.KeyMsg) tea.Cmd {
 }
 
 // handleScopeInput processes keys when the scope path input is focused.
+// Supports cursor movement via arrow keys, insertion at cursor, and
+// backspace-before-cursor deletion.
 func (m *Model) handleScopeInput(key tea.KeyMsg) tea.Cmd {
-	if key.String() == "backspace" {
-		if len(m.scopeQuery) > 0 {
-			m.scopeQuery = m.scopeQuery[:len(m.scopeQuery)-1]
+	switch key.String() {
+	case "left":
+		m.scopeCursor = max(m.scopeCursor-1, 0)
+		return nil
+	case "right":
+		m.scopeCursor = min(m.scopeCursor+1, len(m.scopeQuery))
+		return nil
+	case "backspace":
+		if m.scopeCursor > 0 && m.scopeCursor <= len(m.scopeQuery) {
+			m.scopeQuery = append(m.scopeQuery[:m.scopeCursor-1], m.scopeQuery[m.scopeCursor:]...)
+			m.scopeCursor--
 			return m.refilter()
 		}
 		return nil
@@ -1323,12 +1450,13 @@ func (m *Model) handleScopeInput(key tea.KeyMsg) tea.Cmd {
 	if key.Type != tea.KeyRunes && key.Type != tea.KeySpace {
 		return nil
 	}
-	m.appendToScope([]rune(key.String()))
+	m.insertAtScopeCursor([]rune(key.String()))
 	return m.refilter()
 }
 
-// appendToScope appends runes to the scope query, capped at maxInputLen.
-func (m *Model) appendToScope(runes []rune) {
+// insertAtScopeCursor inserts runes at the current scope cursor position,
+// capped at maxInputLen.
+func (m *Model) insertAtScopeCursor(runes []rune) {
 	remaining := maxInputLen - len(m.scopeQuery)
 	if remaining <= 0 {
 		return
@@ -1336,13 +1464,27 @@ func (m *Model) appendToScope(runes []rune) {
 	if len(runes) > remaining {
 		runes = runes[:remaining]
 	}
-	m.scopeQuery = append(m.scopeQuery, runes...)
+	tail := append(runes, m.scopeQuery[m.scopeCursor:]...)
+	m.scopeQuery = append(m.scopeQuery[:m.scopeCursor], tail...)
+	m.scopeCursor += len(runes)
 }
 
-// moveToggleCursor moves the toggle badge cursor left or right, clamping.
+// toggleTabPos returns the position of idx within toggleTabOrder.
+func toggleTabPos(idx toggleIndex) int {
+	for i, t := range toggleTabOrder {
+		if t == idx {
+			return i
+		}
+	}
+	return 0
+}
+
+// moveToggleCursor moves the toggle badge cursor left or right through
+// the tab order, clamping to the valid range.
 func (m *Model) moveToggleCursor(delta int) {
-	next := int(m.toggleCursor) + delta
-	m.toggleCursor = toggleIndex(clampInt(next, 0, toggleCount-1))
+	pos := toggleTabPos(m.toggleCursor)
+	next := clampInt(pos+delta, 0, toggleCount-1)
+	m.toggleCursor = toggleTabOrder[next]
 }
 
 // toggleBadge flips the state of the given toggle and triggers refilter.
@@ -1879,6 +2021,7 @@ func (m *Model) enterSearch() {
 	m.toggleActive = [toggleCount]bool{}
 	m.toggleCursor = toggleCase
 	m.scopeQuery = nil
+	m.scopeCursor = 0
 	m.compiledRegexp = nil
 }
 
@@ -1913,6 +2056,7 @@ func (m *Model) exitSearch() {
 	m.toggleActive = [toggleCount]bool{}
 	m.toggleCursor = toggleCase
 	m.scopeQuery = nil
+	m.scopeCursor = 0
 	m.compiledRegexp = nil
 }
 
@@ -1936,6 +2080,14 @@ func (m *Model) exitReplace() {
 }
 
 // ToggleReplace enters or exits multi-file replace mode.
+func (m *Model) ToggleSearch() {
+	if m.mode == viewSearch {
+		m.exitSearch()
+		return
+	}
+	m.enterSearch()
+}
+
 func (m *Model) ToggleReplace() {
 	if m.mode == viewReplace {
 		m.exitReplace()
@@ -1978,13 +2130,20 @@ func (m *Model) handleReplaceKey(key tea.KeyMsg) tea.Cmd {
 
 // handleReplaceEnter dispatches Enter based on the current focus zone.
 func (m *Model) handleReplaceEnter() tea.Cmd {
-	if m.searchFocus == focusToggles {
+	switch m.searchFocus {
+	case focusToggles:
 		return m.toggleBadge(m.toggleCursor)
-	}
-	if m.searchFocus == focusReplace {
+	case focusReplace:
 		return m.replaceCurrentSearchMatch()
+	case focusBtnOne:
+		m.flashBtn(focusBtnOne)
+		return m.replaceCurrentSearchMatch()
+	case focusBtnAll:
+		m.flashBtn(focusBtnAll)
+		return m.replaceAllSearchMatches()
+	default:
+		return m.activateSearchResult()
 	}
-	return m.activateSearchResult()
 }
 
 // dispatchToReplaceFocusZone routes key input to the handler for the active
@@ -1997,6 +2156,8 @@ func (m *Model) dispatchToReplaceFocusZone(key tea.KeyMsg) tea.Cmd {
 		return m.handleReplaceInput(key)
 	case focusToggles:
 		return m.handleToggleInput(key)
+	case focusBtnOne, focusBtnAll:
+		return m.handleReplaceBtnInput(key)
 	case focusScope:
 		return m.handleScopeInput(key)
 	}
@@ -2030,13 +2191,38 @@ func (m *Model) appendToReplace(runes []rune) {
 	m.replaceInput = append(m.replaceInput, runes...)
 }
 
-// replaceCurrentSearchMatch replaces the match at the current search cursor
-// position on disk and refreshes results.
-func (m *Model) replaceCurrentSearchMatch() tea.Cmd {
-	if len(m.searchQuery) == 0 {
-		return nil
+// handleReplaceBtnInput processes keys when a replace button is focused.
+// Space activates the button; left/right navigates between [→1] and [→*].
+func (m *Model) handleReplaceBtnInput(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case " ":
+		m.flashBtn(m.searchFocus)
+		if m.searchFocus == focusBtnOne {
+			return m.replaceCurrentSearchMatch()
+		}
+		return m.replaceAllSearchMatches()
+	case "left":
+		m.searchFocus = focusBtnOne
+	case "right":
+		m.searchFocus = focusBtnAll
 	}
-	if m.searchCursor >= len(m.searchItems) {
+	return nil
+}
+
+// flashBtn records a flash on the given replace button for visual feedback.
+func (m *Model) flashBtn(btn searchFocus) {
+	m.btnFlash = btn
+	m.btnFlashAt = time.Now()
+}
+
+// replaceCurrentSearchMatch replaces the match at the current search cursor
+// position on disk and advances to the next match. When the replacement
+// changes the file, the affected file is re-grepped and its items patched
+// in place (no full refilter). When the replacement is a no-op (identical
+// text), the item is removed from the list and the cursor advances so the
+// user sees consistent step-through behavior.
+func (m *Model) replaceCurrentSearchMatch() tea.Cmd {
+	if len(m.searchQuery) == 0 || m.searchCursor >= len(m.searchItems) {
 		return nil
 	}
 	item := m.searchItems[m.searchCursor]
@@ -2045,14 +2231,177 @@ func (m *Model) replaceCurrentSearchMatch() tea.Cmd {
 	}
 	cfg := m.buildMatchConfig(string(m.searchQuery))
 	replaced := m.replaceInFile(item.path, string(m.searchQuery), string(m.replaceInput), cfg, item.line)
-	if !replaced {
-		return nil
+	if replaced {
+		m.searchCache.evict(item.path)
+		m.patchFileItems(item.path, cfg)
+	} else {
+		m.removeSearchItem(m.searchCursor)
 	}
-	m.searchCache.evict(item.path)
-	m.refilterSync()
-	return func() tea.Msg {
-		return msg.FileReplacedMsg{Path: item.path}
+	m.seekFirstMatchFrom(m.searchCursor)
+	if replaced {
+		return func() tea.Msg {
+			return msg.FileReplacedMsg{Path: item.path}
+		}
 	}
+	return nil
+}
+
+// patchFileItems re-greps a single file and splices its updated match items
+// into searchItems, replacing the old entries for that path. Preserves the
+// position of the file group within the list. O(n) where n ≤ maxTotalMatches.
+func (m *Model) patchFileItems(path string, cfg matchConfig) {
+	query := string(m.searchQuery)
+	newMatches := m.grepFileWithCache(path, query, cfg)
+
+	// Locate the span [start, end) covering the old file group (header + matches).
+	start, end := m.fileGroupSpan(path)
+	if start < 0 {
+		return
+	}
+
+	// Build replacement slice: header + new matches (if any).
+	var replacement []searchItem
+	if len(newMatches) > 0 {
+		replacement = make([]searchItem, 0, len(newMatches)+1)
+		replacement = append(replacement, searchItem{kind: searchItemFile, path: path})
+		for _, match := range newMatches {
+			replacement = append(replacement, searchItem{
+				kind: searchItemMatch,
+				path: path,
+				line: match.line,
+				text: match.text,
+			})
+		}
+	}
+
+	// Splice: remove old [start, end), insert replacement at start.
+	tail := append(replacement, m.searchItems[end:]...)
+	m.searchItems = append(m.searchItems[:start], tail...)
+	m.compactSearchItems()
+	m.recalcSearchNumWidth()
+}
+
+// fileGroupSpan returns the half-open index range [start, end) covering
+// the file header and all its match lines for the given path. The preceding
+// gap (if any) is included in start. Returns (-1, -1) if not found.
+func (m *Model) fileGroupSpan(path string) (int, int) {
+	headerIdx := -1
+	for i, item := range m.searchItems {
+		if item.kind == searchItemFile && item.path == path {
+			headerIdx = i
+			break
+		}
+	}
+	if headerIdx < 0 {
+		return -1, -1
+	}
+	// Include preceding gap.
+	start := headerIdx
+	if start > 0 && m.searchItems[start-1].kind == searchItemGap {
+		start--
+	}
+	// Find end: first item after the match run.
+	end := headerIdx + 1
+	for end < len(m.searchItems) && m.searchItems[end].kind == searchItemMatch {
+		end++
+	}
+	return start, end
+}
+
+// removeSearchItem removes the item at idx from searchItems and cleans up
+// any orphaned file headers or gaps that result. O(n) where n ≤ maxTotalMatches.
+func (m *Model) removeSearchItem(idx int) {
+	if idx < 0 || idx >= len(m.searchItems) {
+		return
+	}
+	m.searchItems = append(m.searchItems[:idx], m.searchItems[idx+1:]...)
+	m.compactSearchItems()
+}
+
+// compactSearchItems removes orphaned file headers (headers with no
+// subsequent match before the next gap/header/end) and normalizes gaps
+// (no leading gaps, no trailing gaps, no consecutive gaps). In-place,
+// single pass, O(n) where n ≤ maxTotalMatches.
+func (m *Model) compactSearchItems() {
+	items := m.searchItems
+	w := 0
+	for r := 0; r < len(items); r++ {
+		switch items[r].kind {
+		case searchItemGap:
+			if w > 0 && items[w-1].kind != searchItemGap {
+				items[w] = items[r]
+				w++
+			}
+		case searchItemFile:
+			if fileHasMatches(items, r) {
+				items[w] = items[r]
+				w++
+			}
+		case searchItemMatch:
+			items[w] = items[r]
+			w++
+		}
+	}
+	// Trim trailing gap.
+	if w > 0 && items[w-1].kind == searchItemGap {
+		w--
+	}
+	clear(items[w:])
+	m.searchItems = items[:w]
+}
+
+// fileHasMatches reports whether the file header at idx has at least one
+// match item before the next gap, header, or end of list.
+func fileHasMatches(items []searchItem, idx int) bool {
+	for i := idx + 1; i < len(items); i++ {
+		if items[i].kind == searchItemMatch {
+			return true
+		}
+		if items[i].kind == searchItemGap || items[i].kind == searchItemFile {
+			return false
+		}
+	}
+	return false
+}
+
+// recalcSearchNumWidth recomputes searchNumWidth from the current items.
+func (m *Model) recalcSearchNumWidth() {
+	maxLine := 0
+	for _, item := range m.searchItems {
+		if item.kind == searchItemMatch && item.line > maxLine {
+			maxLine = item.line
+		}
+	}
+	m.searchNumWidth = digitCount(maxLine)
+}
+
+// seekFirstMatchFrom positions the cursor on the nearest match item at or
+// after pos. If no match exists at or after pos, wraps to the first match.
+// If no matches remain, resets cursor and scroll to 0.
+func (m *Model) seekFirstMatchFrom(pos int) {
+	n := len(m.searchItems)
+	if n == 0 {
+		m.searchCursor = 0
+		m.searchScroll = 0
+		return
+	}
+	pos = clampInt(pos, 0, n-1)
+	for i := pos; i < n; i++ {
+		if m.searchItems[i].kind == searchItemMatch {
+			m.searchCursor = i
+			m.ensureSearchCursorVisible()
+			return
+		}
+	}
+	for i := range pos {
+		if m.searchItems[i].kind == searchItemMatch {
+			m.searchCursor = i
+			m.ensureSearchCursorVisible()
+			return
+		}
+	}
+	m.searchCursor = 0
+	m.ensureSearchCursorVisible()
 }
 
 // replaceAllSearchMatches replaces all matches across all files on disk.
@@ -2223,7 +2572,9 @@ func (m *Model) refilterSync() {
 func (m *Model) clickReplaceMode(viewX, viewY int) tea.Cmd {
 	bh := m.bodyHeight()
 
-	// Layout: header(0) | search bar(1) | replace bar(2) | divider(3) | body(4..4+bh-1) | toolbar sep | toolbar.
+	// Layout: header(0) | search bar(1) | replace bar(2) | scope line(3) | divider(4) |
+	//         body(5..5+bh-1) | separator(+0) | toolbar(+1) | summary(+2).
+	footerBase := replaceChromeHeight + bh
 
 	if viewY == headerHeight {
 		m.searchFocus = focusQuery
@@ -2233,13 +2584,16 @@ func (m *Model) clickReplaceMode(viewX, viewY int) tea.Cmd {
 		m.searchFocus = focusReplace
 		return nil
 	}
+	if viewY == headerHeight+3 {
+		return m.clickScopeLine(viewX)
+	}
 
 	bodyY := viewY - replaceChromeHeight
 	if bodyY >= 0 && bodyY < bh {
 		return m.clickSearchBody(bodyY)
 	}
 
-	if viewY == replaceChromeHeight+bh+1 {
+	if viewY-footerBase == footerToolbarOffset {
 		return m.clickToolbar(viewX)
 	}
 	return nil
@@ -2379,7 +2733,34 @@ func (m *Model) scopedSources() []Entry {
 	if scope == "" {
 		return m.searchSource
 	}
+	if m.toggleActive[toggleGlob] {
+		return m.filterByRegex(scope)
+	}
 	return m.lookupScope(scope)
+}
+
+// filterByRegex returns entries whose paths match the given regex pattern.
+// Patterns containing a path separator are matched against the entry's
+// relative path; otherwise they are matched against the base name only.
+// Invalid patterns return no results.
+func (m *Model) filterByRegex(pattern string) []Entry {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil
+	}
+	matchPath := strings.ContainsRune(pattern, filepath.Separator) ||
+		strings.ContainsRune(pattern, '/')
+	filtered := make([]Entry, 0, len(m.searchSource)/4)
+	for i := range m.searchSource {
+		name := filepath.Base(m.searchSource[i].Path)
+		if matchPath {
+			name = m.relativePath(m.searchSource[i].Path)
+		}
+		if re.MatchString(name) {
+			filtered = append(filtered, m.searchSource[i])
+		}
+	}
+	return filtered
 }
 
 // lookupScope returns entries under the given scope using the directory index.
@@ -2434,8 +2815,20 @@ func (m *Model) grepSources(sources []Entry, query string, cfg matchConfig) {
 		m.appendFileResults(sources[i].Path, matches, &totalMatches, &maxLine)
 	}
 	m.searchNumWidth = digitCount(maxLine)
-	m.searchCursor = 0
 	m.searchScroll = 0
+	m.seekFirstMatch()
+}
+
+// seekFirstMatch positions searchCursor on the first match item in
+// searchItems. Falls back to 0 if no match items exist.
+func (m *Model) seekFirstMatch() {
+	for i, item := range m.searchItems {
+		if item.kind == searchItemMatch {
+			m.searchCursor = i
+			return
+		}
+	}
+	m.searchCursor = 0
 }
 
 // appendFileResults adds a file header and its match lines to searchItems.
@@ -2611,20 +3004,57 @@ func (m *Model) activateSearchResult() tea.Cmd {
 	}
 }
 
-// ensureSearchCursorVisible keeps the search cursor within the visible window.
+// itemVisualLines returns the number of visual rows an item occupies.
+// Match items occupy 2 rows when replacement preview is active, all others 1.
+func (m *Model) itemVisualLines(idx int) int {
+	if m.hasReplacePreview() && m.searchItems[idx].kind == searchItemMatch {
+		return 2
+	}
+	return 1
+}
+
+// ensureSearchCursorVisible keeps the search cursor within the visible window,
+// accounting for replacement preview lines that expand match items to 2 rows.
+// Single O(n) forward pass from scroll to cursor; trims from the front when
+// the cursor's visual bottom exceeds the viewport.
 func (m *Model) ensureSearchCursorVisible() {
 	bh := m.bodyHeight()
 	if bh <= 0 {
 		return
 	}
+
+	// Scroll up: cursor above viewport.
 	if m.searchCursor < m.searchScroll {
 		m.searchScroll = m.searchCursor
 	}
-	if m.searchCursor >= m.searchScroll+bh {
-		m.searchScroll = m.searchCursor - bh + 1
+
+	// Scroll down: accumulate visual lines from scroll to cursor inclusive.
+	// If the total exceeds bh, trim items from the front until it fits.
+	vis := 0
+	for i := m.searchScroll; i <= m.searchCursor; i++ {
+		vis += m.itemVisualLines(i)
 	}
-	maxScroll := max(len(m.searchItems)-bh, 0)
-	m.searchScroll = clampInt(m.searchScroll, 0, maxScroll)
+	for vis > bh && m.searchScroll < m.searchCursor {
+		vis -= m.itemVisualLines(m.searchScroll)
+		m.searchScroll++
+	}
+
+	// Clamp to maximum: walk backwards from end to find last valid scroll.
+	ms := m.computeMaxScroll(bh)
+	m.searchScroll = clampInt(m.searchScroll, 0, ms)
+}
+
+// computeMaxScroll returns the maximum valid scroll index such that items
+// from that index through the end fit within bh visual rows.
+func (m *Model) computeMaxScroll(bh int) int {
+	vis := 0
+	for i := len(m.searchItems) - 1; i >= 0; i-- {
+		vis += m.itemVisualLines(i)
+		if vis > bh {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -2755,11 +3185,15 @@ func (m *Model) viewSearchMode() string {
 	bodyLines := m.renderSearchBody(bh, contentWidth, emptyLine)
 	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
 
-	// Compose: header + search bar + divider + body + toolbar separator + toolbar.
+	// Compose: header + search bar + divider + scope line + divider + body + separator + toolbar + summary.
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchBar(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderToolbarSeparator(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderScopeLine(contentWidth))
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchDivider(contentWidth))
 	for _, line := range bodyLines {
@@ -2770,6 +3204,8 @@ func (m *Model) viewSearchMode() string {
 	b.WriteString(m.renderToolbarSeparator(contentWidth))
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchToolbar(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderMatchSummary(contentWidth))
 	return b.String()
 }
 
@@ -2788,13 +3224,17 @@ func (m *Model) viewReplaceMode() string {
 	bodyLines := m.renderSearchBody(bh, contentWidth, emptyLine)
 	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
 
-	// Compose: header + search bar + replace bar + divider + body + toolbar separator + toolbar.
+	// Compose: header + search bar + replace bar + divider + scope line + divider + body + separator + toolbar + summary.
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchBar(contentWidth))
 	b.WriteByte('\n')
 	b.WriteString(m.renderReplaceBar(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderToolbarSeparator(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderScopeLine(contentWidth))
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchDivider(contentWidth))
 	for _, line := range bodyLines {
@@ -2805,17 +3245,21 @@ func (m *Model) viewReplaceMode() string {
 	b.WriteString(m.renderToolbarSeparator(contentWidth))
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchToolbar(contentWidth))
+	b.WriteByte('\n')
+	b.WriteString(m.renderMatchSummary(contentWidth))
 	return b.String()
 }
 
 // renderReplaceBar renders the replacement text input line with a prefix
 // and blinking cursor, matching the style of the search bar.
 func (m *Model) renderReplaceBar(contentWidth int) string {
-	prefixStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
-	prefix := prefixStyle.Render(theme.IconArrowRight + " ")
+	prefix := lipgloss.NewStyle().
+		Foreground(m.theme.Palette.Primary).
+		Bold(true).
+		Render(" Replace: ")
 	prefixWidth := lipgloss.Width(prefix)
 
 	// Always reserve 1 column for the cursor so layout is stable.
@@ -3042,14 +3486,21 @@ func (m *Model) renderEmptySearchBody(bh, contentWidth int, emptyLine string) []
 }
 
 // renderPopulatedSearchBody renders actual search result lines.
+// In replace mode with replacement text, match lines are followed by a
+// replacement preview line, consuming 2 visual rows per match item.
 func (m *Model) renderPopulatedSearchBody(bh, contentWidth int, emptyLine string) []string {
+	preview := m.hasReplacePreview()
 	start := clampInt(m.searchScroll, 0, max(len(m.searchItems)-1, 0))
-	end := min(start+bh, len(m.searchItems))
 	lines := make([]string, 0, bh)
-	for i := start; i < end; i++ {
+	for i := start; i < len(m.searchItems) && len(lines) < bh; i++ {
 		lines = append(lines, m.renderListItem(i, contentWidth))
+		if preview && m.searchItems[i].kind == searchItemMatch && len(lines) < bh {
+			selected := i == m.activeCursor() && m.focused
+			isTarget := m.isReplaceTarget(i)
+			lines = append(lines, m.renderReplaceLine(m.searchItems[i], contentWidth, selected, isTarget))
+		}
 	}
-	for range bh - (end - start) {
+	for len(lines) < bh {
 		lines = append(lines, emptyLine)
 	}
 	return lines
@@ -3058,11 +3509,20 @@ func (m *Model) renderPopulatedSearchBody(bh, contentWidth int, emptyLine string
 // renderSearchBar renders the search input line with a blinking block cursor
 // that stays visible regardless of which search element has keyboard focus.
 func (m *Model) renderSearchBar(contentWidth int) string {
-	prefixStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	queryStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
-	prefix := prefixStyle.Render("/ ")
+	var prefix string
+	if m.mode == viewReplace {
+		prefix = lipgloss.NewStyle().
+			Foreground(m.theme.Palette.Primary).
+			Bold(true).
+			Render(" Find: ")
+	} else {
+		prefix = lipgloss.NewStyle().
+			Foreground(m.theme.Palette.Muted).
+			Render("/ ")
+	}
 	prefixWidth := lipgloss.Width(prefix)
 
 	// Always reserve 1 column for the cursor so layout is stable.
@@ -3117,29 +3577,118 @@ func (m *Model) renderToolbarSeparator(contentWidth int) string {
 	return style.Render(strings.Repeat("╌", contentWidth))
 }
 
-// renderSearchToolbar renders the toolbar line: toggle badges + scope input.
+// renderSearchToolbar renders the toolbar line with toggle badges [Aa] [ab] [.*].
+// In replace mode, also renders [→1] and [→*] buttons after badges.
+// The [re] glob toggle is on the scope line, not here.
 func (m *Model) renderSearchToolbar(contentWidth int) string {
 	var b strings.Builder
 	b.WriteByte(' ')
 
-	for i := range toggleCount {
+	for i := range toolbarToggleCount {
 		if i > 0 {
 			b.WriteByte(' ')
 		}
 		b.WriteString(m.renderBadge(toggleIndex(i)))
 	}
 
-	// Separator between badges and scope.
-	b.WriteString("  ")
-	b.WriteString(m.renderScopeInput(max(contentWidth-lipgloss.Width(b.String()), 0)))
+	if m.mode == viewReplace {
+		b.WriteString("  ")
+		col := lipgloss.Width(b.String())
+		b.WriteString(m.renderReplaceButtons(col))
+	}
 
 	line := b.String()
-	lineWidth := lipgloss.Width(line)
-	padCount := max(contentWidth-lineWidth, 0)
+	padCount := max(contentWidth-lipgloss.Width(line), 0)
 	if padCount > 0 {
 		line += strings.Repeat(" ", padCount)
 	}
 	return line
+}
+
+// renderScopeLine renders " In: <text>  [re]" with the [re] badge pinned
+// to the far right. The scope text scrolls within a fixed-width region
+// so the badge never shifts.
+func (m *Model) renderScopeLine(contentWidth int) string {
+	badge := m.renderGlobBadge()
+	badgeW := lipgloss.Width(badge)
+
+	// Layout: " In: <text>  [re] " — leading space, prefix, text, gap, badge, trailing space.
+	const leadingSpace = 1
+	const gapBeforeBadge = 2
+	const trailingSpace = 1
+	scopeRegion := max(contentWidth-leadingSpace-gapBeforeBadge-badgeW-trailingSpace, 0)
+
+	scopeStr := m.renderScopeInput(scopeRegion)
+
+	var b strings.Builder
+	b.Grow(contentWidth)
+	b.WriteByte(' ')
+	b.WriteString(scopeStr)
+
+	// Pad between scope input and badge to push badge to fixed position.
+	used := leadingSpace + lipgloss.Width(scopeStr)
+	targetBadgeCol := contentWidth - badgeW - trailingSpace
+	if pad := targetBadgeCol - used; pad > 0 {
+		b.WriteString(strings.Repeat(" ", pad))
+	}
+	b.WriteString(badge)
+
+	// Trailing pad to fill line.
+	line := b.String()
+	if pad := contentWidth - lipgloss.Width(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderGlobBadge renders the [re] toggle badge for glob mode.
+// Styled like toolbar badges: muted when off, primary when on,
+// selection background when focused via toggle cursor.
+func (m *Model) renderGlobBadge() string {
+	fg := m.theme.Palette.Muted
+	if m.toggleActive[toggleGlob] {
+		fg = m.theme.Palette.Primary
+	}
+	style := lipgloss.NewStyle().Foreground(fg)
+	if m.searchFocus == focusToggles && m.toggleCursor == toggleGlob {
+		style = style.Background(m.theme.Palette.Selection)
+	}
+	return style.Render("[" + badgeLabels[toggleGlob] + "]")
+}
+
+func (m *Model) renderMatchSummary(contentWidth int) string {
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+
+	matches, files := m.countMatchesAndFiles()
+	var text string
+	switch {
+	case len(m.searchQuery) < minSearchQueryLen:
+		text = ""
+	case matches == 0:
+		text = style.Render(" No results")
+	default:
+		text = style.Render(fmt.Sprintf(" %d results in %d files", matches, files))
+	}
+
+	padCount := max(contentWidth-lipgloss.Width(text), 0)
+	if padCount > 0 {
+		text += strings.Repeat(" ", padCount)
+	}
+	return text
+}
+
+// countMatchesAndFiles counts searchItemMatch and searchItemFile entries
+// in the current search results.
+func (m *Model) countMatchesAndFiles() (matches, files int) {
+	for _, item := range m.searchItems {
+		switch item.kind {
+		case searchItemMatch:
+			matches++
+		case searchItemFile:
+			files++
+		}
+	}
+	return matches, files
 }
 
 // renderBadge renders a single toggle badge like "[Aa]".
@@ -3161,8 +3710,38 @@ func (m *Model) badgeStyle(idx toggleIndex) lipgloss.Style {
 	return style
 }
 
-// renderScopeInput renders the path scope field with a blinking block cursor
-// that stays visible regardless of which search element has keyboard focus.
+// renderReplaceButtons renders the [→1] and [→*] buttons for replace mode,
+// recording their absolute column positions for click handling.
+func (m *Model) renderReplaceButtons(startCol int) string {
+	btnOneLabel := "[" + theme.IconArrowRight + "1]"
+	btnAllLabel := "[" + theme.IconArrowRight + "*]"
+
+	m.btnOneCol = startCol
+	btnOneStr := m.replaceButtonStyle(focusBtnOne).Render(btnOneLabel)
+
+	// "[→1]" is 4 visible columns, plus 1 space separator.
+	m.btnAllCol = startCol + lipgloss.Width(btnOneStr) + 1
+	btnAllStr := m.replaceButtonStyle(focusBtnAll).Render(btnAllLabel)
+
+	return btnOneStr + " " + btnAllStr
+}
+
+// replaceButtonStyle returns the style for a replace button based on
+// flash state and focus.
+func (m *Model) replaceButtonStyle(btn searchFocus) lipgloss.Style {
+	fg := m.theme.Palette.Muted
+	if m.btnFlash == btn && time.Since(m.btnFlashAt) < btnFlashDuration {
+		fg = m.theme.Palette.Primary
+	}
+	style := lipgloss.NewStyle().Foreground(fg)
+	if m.searchFocus == btn {
+		style = style.Background(m.theme.Palette.Selection)
+	}
+	return style
+}
+
+// renderScopeInput renders the "In: " prefix plus a cursor-aware scrollable
+// text region. The cursor position determines which portion of text is visible.
 func (m *Model) renderScopeInput(availableWidth int) string {
 	prefixStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
@@ -3171,20 +3750,51 @@ func (m *Model) renderScopeInput(availableWidth int) string {
 	prefix := prefixStyle.Render(scopePrefix)
 	prefixW := lipgloss.Width(prefix)
 
-	maxTextW := max(availableWidth-prefixW-1, 0)
-	scopeStr := string(m.scopeQuery)
-	scopeRunes := []rune(scopeStr)
-	if len(scopeRunes) > maxTextW {
-		scopeStr = string(scopeRunes[len(scopeRunes)-maxTextW:])
+	// Text region: availableWidth minus prefix minus 1 cursor column.
+	textW := max(availableWidth-prefixW-1, 0)
+	n := len(m.scopeQuery)
+	cur := clampInt(m.scopeCursor, 0, n)
+
+	// Compute visible window [start, end) that keeps cursor in view.
+	start := 0
+	end := n
+	if n > textW {
+		// Try to center cursor, then clamp.
+		start = cur - textW/2
+		start = clampInt(start, 0, n-textW)
+		end = start + textW
+	}
+	visible := string(m.scopeQuery[start:end])
+
+	// Cursor character: the rune at cursor position (or space if at end).
+	cursorChar := " "
+	if cur < n {
+		cursorChar = string(m.scopeQuery[cur])
 	}
 
-	// Show blinking cursor only when this input has focus.
-	cursor := " "
+	// Build: prefix + text-before-cursor + cursor-char + text-after-cursor.
+	beforeLen := cur - start
+	afterStart := cur + 1 - start
+
+	before := ""
+	after := ""
+	visRunes := []rune(visible)
+	if beforeLen > 0 && beforeLen <= len(visRunes) {
+		before = string(visRunes[:beforeLen])
+	}
+	if afterStart >= 0 && afterStart < len(visRunes) {
+		after = string(visRunes[afterStart:])
+	}
+
+	// Render cursor: blinking block when focused, plain text otherwise.
+	var cursorRendered string
 	if m.searchFocus == focusScope && m.cursorBlink {
-		cursor = cursorStyle.Render(" ")
+		cursorRendered = cursorStyle.Render(cursorChar)
+	} else {
+		cursorRendered = textStyle.Render(cursorChar)
 	}
 
-	return prefix + textStyle.Render(scopeStr) + cursor
+	return prefix + textStyle.Render(before) + cursorRendered + textStyle.Render(after)
 }
 
 // renderRenameInput renders the inline rename input with a blinking cursor,
@@ -3328,7 +3938,8 @@ func (m *Model) renderListItem(idx, contentWidth int) string {
 	case searchItemFile:
 		return m.renderFileHeader(item, contentWidth, selected)
 	case searchItemMatch:
-		return m.renderMatchLine(item, contentWidth, selected)
+		isTarget := m.isReplaceTarget(idx)
+		return m.renderMatchLine(item, contentWidth, selected, isTarget)
 	case searchItemGap:
 		return strings.Repeat(" ", contentWidth)
 	default:
@@ -3364,18 +3975,25 @@ func (m *Model) renderFileHeader(item searchItem, contentWidth int, selected boo
 }
 
 // renderMatchLine renders a match line: "   42  content" with query highlighted.
-func (m *Model) renderMatchLine(item searchItem, contentWidth int, selected bool) string {
+// When isTarget is true (current replacement target in replace mode), uses a
+// Highlight background to distinguish this match from others.
+func (m *Model) renderMatchLine(item searchItem, contentWidth int, selected, isTarget bool) string {
 	numStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Subtext)
 	hlStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Warning)
 	padStyle := lipgloss.NewStyle()
 
-	if selected {
-		bg := m.theme.Palette.Selection
+	applyBg := func(bg lipgloss.Color) {
 		numStyle = numStyle.Background(bg)
 		textStyle = textStyle.Background(bg)
 		hlStyle = hlStyle.Background(bg)
 		padStyle = padStyle.Background(bg)
+	}
+	switch {
+	case isTarget:
+		applyBg(m.theme.Palette.Highlight)
+	case selected:
+		applyBg(m.theme.Palette.Selection)
 	}
 
 	// Indent + right-aligned line number + gap.
@@ -3386,7 +4004,22 @@ func (m *Model) renderMatchLine(item searchItem, contentWidth int, selected bool
 	// Trim leading whitespace, pre-truncate to available width, then highlight.
 	trimmed := strings.TrimLeft(item.text, " \t")
 	trimmed = truncatePlain(trimmed, max(contentWidth-prefixWidth, 0))
-	content := m.highlightQuery(trimmed, textStyle, hlStyle)
+
+	// In replace mode with replacement text, show matches with strikethrough.
+	// The replacement preview is rendered on a separate line below.
+	var content string
+	if m.mode == viewReplace && len(m.replaceInput) > 0 {
+		strikeStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Error).Strikethrough(true)
+		switch {
+		case isTarget:
+			strikeStyle = strikeStyle.Background(m.theme.Palette.Highlight)
+		case selected:
+			strikeStyle = strikeStyle.Background(m.theme.Palette.Selection)
+		}
+		content = m.highlightQuery(trimmed, textStyle, strikeStyle)
+	} else {
+		content = m.highlightQuery(trimmed, textStyle, hlStyle)
+	}
 
 	line := prefix + content
 	lineWidth := lipgloss.Width(line)
@@ -3396,6 +4029,55 @@ func (m *Model) renderMatchLine(item searchItem, contentWidth int, selected bool
 		line += padStyle.Render(strings.Repeat(" ", padCount))
 	}
 	return line
+}
+
+// renderReplaceLine renders the replacement preview line below a match line.
+// Shows the post-replacement text in success (green) color, indented to align
+// with the match content above. When isTarget is true, uses Highlight bg.
+func (m *Model) renderReplaceLine(item searchItem, contentWidth int, selected, isTarget bool) string {
+	replStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Success)
+	padStyle := lipgloss.NewStyle()
+
+	switch {
+	case isTarget:
+		bg := m.theme.Palette.Highlight
+		replStyle = replStyle.Background(bg)
+		padStyle = padStyle.Background(bg)
+	case selected:
+		bg := m.theme.Palette.Selection
+		replStyle = replStyle.Background(bg)
+		padStyle = padStyle.Background(bg)
+	}
+
+	// Measure the same prefix string used in renderMatchLine, then blank it.
+	numStr := fmt.Sprintf("  %*d  ", m.activeNumWidth(), item.line)
+	prefixWidth := lipgloss.Width(numStr)
+	prefix := padStyle.Render(strings.Repeat(" ", prefixWidth))
+
+	trimmed := strings.TrimLeft(item.text, " \t")
+	replaced := m.replaceText(trimmed)
+	replaced = truncatePlain(replaced, max(contentWidth-prefixWidth, 0))
+
+	line := prefix + replStyle.Render(replaced)
+	lineWidth := lipgloss.Width(line)
+
+	padCount := max(contentWidth-lineWidth, 0)
+	if padCount > 0 {
+		line += padStyle.Render(strings.Repeat(" ", padCount))
+	}
+	return line
+}
+
+// hasReplacePreview reports whether the current mode should show replacement
+// preview lines below match lines.
+func (m *Model) hasReplacePreview() bool {
+	return m.mode == viewReplace && len(m.replaceInput) > 0
+}
+
+// isReplaceTarget reports whether the item at idx is the current replacement
+// target — the match line the cursor is on in replace mode with replacement text.
+func (m *Model) isReplaceTarget(idx int) bool {
+	return m.hasReplacePreview() && idx == m.searchCursor && m.searchItems[idx].kind == searchItemMatch
 }
 
 // highlightQuery splits text at query occurrences and highlights them,
@@ -3463,6 +4145,43 @@ func highlightSubstring(text, query string, caseSensitive bool, normalStyle, hlS
 		}
 		b.WriteString(hlStyle.Render(text[pos+idx : pos+idx+qLen]))
 		pos += idx + qLen
+	}
+	return b.String()
+}
+
+// replaceText applies the current query→replacement substitution to text,
+// respecting case/regex/word toggles. Used to produce the preview line.
+func (m *Model) replaceText(text string) string {
+	query := string(m.searchQuery)
+	replacement := string(m.replaceInput)
+	if m.toggleActive[toggleRegex] && m.compiledRegexp != nil {
+		return m.compiledRegexp.ReplaceAllString(text, replacement)
+	}
+	caseSensitive := m.toggleActive[toggleCase] || hasUpperCase(query)
+	return replaceAllLiteral(text, query, replacement, caseSensitive)
+}
+
+// replaceAllLiteral replaces all literal occurrences of needle in text,
+// optionally case-insensitive, preserving original casing in non-match spans.
+func replaceAllLiteral(text, needle, replacement string, caseSensitive bool) string {
+	if caseSensitive {
+		return strings.ReplaceAll(text, needle, replacement)
+	}
+	haystack := strings.ToLower(text)
+	search := strings.ToLower(needle)
+	nLen := len(search)
+
+	var b strings.Builder
+	pos := 0
+	for pos < len(text) {
+		idx := strings.Index(haystack[pos:], search)
+		if idx < 0 {
+			b.WriteString(text[pos:])
+			break
+		}
+		b.WriteString(text[pos : pos+idx])
+		b.WriteString(replacement)
+		pos += idx + nLen
 	}
 	return b.String()
 }
@@ -3690,17 +4409,18 @@ func (m *Model) emptyView(contentWidth int) string {
 // chrome (header + input/hint + divider) and the mode-specific footer.
 func (m *Model) bodyHeight() int {
 	footer := 0
-	top := topChromeHeight
+	top := treeChromeHeight
 	switch m.mode {
 	case viewSearch:
+		top = topChromeHeight
 		footer = searchFooterHeight
 	case viewReplace:
 		top = replaceChromeHeight
 		footer = searchFooterHeight
 	case viewReferences:
-		footer = searchFooterHeight // separator + hint line
+		footer = refsFooterHeight
 	case viewDocSymbols:
-		footer = searchFooterHeight // separator + hint line
+		footer = refsFooterHeight
 	}
 	if m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive {
 		footer += newEntryFooterHeight

@@ -829,6 +829,19 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Alt+F toggles multi-file search when the file tree has focus.
+	if ks == "alt+f" && m.focus.Current() == component.FocusFileTree {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.fileTree.ToggleSearch()
+		return m, nil
+	}
+
 	// Alt+Shift+R toggles multi-file replace when the file tree has focus.
 	if ks == "alt+R" && m.focus.Current() == component.FocusFileTree {
 		now := time.Now()
