@@ -329,6 +329,8 @@ func sectionFieldManual() Section {
 			{"PgUp", "Page up", ""},
 			{"g / Home", "Scroll to top", ""},
 			{"G / End", "Scroll to bottom", ""},
+			{"/ / Alt+f", "Toggle search/filter", ""},
+			{"Tab", "Cycle focus (query / toggles)", "Search active"},
 			{"Esc / q", "Close Field Manual", ""},
 		},
 	}

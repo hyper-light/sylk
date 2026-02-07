@@ -954,7 +954,8 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Escape: close references panel if active, abort command input,
 	// route to editor in edit mode, or double-tap to interrupt agent.
-	if key.String() == "esc" {
+	// When an overlay is active, skip — overlays handle their own Esc.
+	if key.String() == "esc" && m.overlay == overlayNone {
 		if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode() || m.fileTree.InTabsMode()) && m.focus.Current() == component.FocusFileTree {
 			m.fileTree.Update(key)
 			return m, nil
