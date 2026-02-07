@@ -29,6 +29,8 @@ const (
 	MethodDocumentSymbol     = "textDocument/documentSymbol"
 	MethodSignatureHelp      = "textDocument/signatureHelp"
 	MethodFormatting         = "textDocument/formatting"
+	MethodPrepareRename      = "textDocument/prepareRename"
+	MethodRename             = "textDocument/rename"
 )
 
 // ---------------------------------------------------------------------------
@@ -79,6 +81,7 @@ type TextDocumentClientCapabilities struct {
 	References         ReferencesClientCapabilities             `json:"references,omitempty"`
 	DocumentSymbol     DocumentSymbolClientCapabilities         `json:"documentSymbol,omitempty"`
 	SignatureHelp      SignatureHelpClientCapabilities          `json:"signatureHelp,omitempty"`
+	Rename             RenameClientCapabilities                `json:"rename,omitempty"`
 }
 
 // CompletionClientCapabilities describes completion support.
@@ -132,6 +135,12 @@ type SignatureInfoClientCaps struct {
 // ParamInfoClientCaps declares label offset support.
 type ParamInfoClientCaps struct {
 	LabelOffsetSupport bool `json:"labelOffsetSupport,omitempty"`
+}
+
+// RenameClientCapabilities describes rename support.
+type RenameClientCapabilities struct {
+	DynamicRegistration bool `json:"dynamicRegistration,omitempty"`
+	PrepareSupport      bool `json:"prepareSupport,omitempty"`
 }
 
 // TextDocumentSyncClientCapabilities describes sync support.
@@ -326,10 +335,26 @@ func ToServerCapabilities(sc ServerCaps) ServerCapabilities {
 		WorkspaceSymbolProvider:    isTruthy(sc.WorkspaceSymbol),
 		CodeActionProvider:         isTruthy(sc.CodeActionProvider),
 		RenameProvider:             isTruthy(sc.RenameProvider),
+		PrepareRenameSupported:     hasPrepareRename(sc.RenameProvider),
 		DocumentHighlightProvider:  isTruthy(sc.DocumentHighlightProvider),
 		SignatureHelpProvider:      isTruthy(sc.SignatureHelpProvider),
 		FormattingProvider:         isTruthy(sc.DocumentFormattingProvider),
 	}
+}
+
+// hasPrepareRename checks if the renameProvider capability includes
+// prepareProvider support (e.g. {"prepareProvider": true}).
+func hasPrepareRename(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var obj struct {
+		PrepareProvider bool `json:"prepareProvider"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return obj.PrepareProvider
+	}
+	return false
 }
 
 // ToSyncKind extracts the TextDocumentSyncKind from the polymorphic
@@ -738,6 +763,89 @@ type ProtocolFormattingOptions struct {
 	TrimTrailingWhitespace bool `json:"trimTrailingWhitespace,omitempty"`
 	InsertFinalNewline     bool `json:"insertFinalNewline,omitempty"`
 	TrimFinalNewlines      bool `json:"trimFinalNewlines,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Rename (textDocument/prepareRename, textDocument/rename)
+// ---------------------------------------------------------------------------
+
+// ProtocolRenameParams is the wire format for textDocument/rename.
+type ProtocolRenameParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     ProtocolPosition       `json:"position"`
+	NewName      string                 `json:"newName"`
+}
+
+// ProtocolPrepareRenameResult is the wire format for prepareRename responses.
+// Servers may return {range, placeholder}, {start, end}, or {defaultBehavior}.
+type ProtocolPrepareRenameResult struct {
+	Range       *ProtocolRange `json:"range,omitempty"`
+	Placeholder string         `json:"placeholder,omitempty"`
+	Start       *ProtocolPosition `json:"start,omitempty"`
+	End         *ProtocolPosition `json:"end,omitempty"`
+}
+
+// ProtocolWorkspaceEdit is the wire format for workspace/applyEdit results.
+type ProtocolWorkspaceEdit struct {
+	Changes         map[string][]ProtocolTextEdit `json:"changes,omitempty"`
+	DocumentChanges json.RawMessage               `json:"documentChanges,omitempty"`
+}
+
+// ProtocolTextDocumentEdit is an element of the documentChanges array.
+type ProtocolTextDocumentEdit struct {
+	TextDocument ProtocolVersionedTextDocumentID `json:"textDocument"`
+	Edits        []ProtocolTextEdit              `json:"edits"`
+}
+
+// ProtocolVersionedTextDocumentID identifies a specific version of a document.
+type ProtocolVersionedTextDocumentID struct {
+	URI     string `json:"uri"`
+	Version *int   `json:"version"`
+}
+
+// ToPrepareRenameResult converts the wire format to a domain PrepareRenameResult.
+func ToPrepareRenameResult(p ProtocolPrepareRenameResult) *PrepareRenameResult {
+	if p.Range != nil {
+		return &PrepareRenameResult{
+			Range:       toCoreRange(*p.Range),
+			Placeholder: p.Placeholder,
+		}
+	}
+	if p.Start != nil && p.End != nil {
+		return &PrepareRenameResult{
+			Range: Range{
+				Start: Position{Line: p.Start.Line, Character: p.Start.Character},
+				End:   Position{Line: p.End.Line, Character: p.End.Character},
+			},
+		}
+	}
+	return &PrepareRenameResult{}
+}
+
+// ToWorkspaceEdit converts the wire format to a domain WorkspaceEdit.
+// Normalizes both the `changes` map and `documentChanges` array into a
+// unified FileEdits map keyed by absolute file path.
+func ToWorkspaceEdit(pw ProtocolWorkspaceEdit) *WorkspaceEdit {
+	result := &WorkspaceEdit{FileEdits: make(map[string][]TextEdit)}
+
+	// Prefer documentChanges if present.
+	if len(pw.DocumentChanges) > 0 && string(pw.DocumentChanges) != "null" {
+		var docChanges []ProtocolTextDocumentEdit
+		if json.Unmarshal(pw.DocumentChanges, &docChanges) == nil && len(docChanges) > 0 {
+			for _, dc := range docChanges {
+				path := FileURIToPath(dc.TextDocument.URI)
+				result.FileEdits[path] = toTextEdits(dc.Edits)
+			}
+			return result
+		}
+	}
+
+	// Fall back to changes map.
+	for uri, pedits := range pw.Changes {
+		path := FileURIToPath(uri)
+		result.FileEdits[path] = toTextEdits(pedits)
+	}
+	return result
 }
 
 // ---------------------------------------------------------------------------

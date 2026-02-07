@@ -234,6 +234,34 @@ func (m *Manager) Format(ctx context.Context, projectRoot, filePath string, tabS
 	return client.Format(ctx, filePath, tabSize, insertSpaces)
 }
 
+// PrepareRename checks whether the symbol at the given position can be renamed.
+func (m *Manager) PrepareRename(ctx context.Context, projectRoot, filePath string, line, character int) (*PrepareRenameResult, error) {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return nil, errNoServer
+	}
+	return client.PrepareRename(ctx, filePath, line, character)
+}
+
+// Rename performs a rename of the symbol at the given position.
+func (m *Manager) Rename(ctx context.Context, projectRoot, filePath string, line, character int, newName string) (*WorkspaceEdit, error) {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return nil, errNoServer
+	}
+	return client.Rename(ctx, filePath, line, character, newName)
+}
+
+// PrepareRenameSupported returns whether the server for the given file
+// supports the prepareRename request.
+func (m *Manager) PrepareRenameSupported(projectRoot, filePath string) bool {
+	client := m.clientForFile(projectRoot, filePath)
+	if client == nil {
+		return false
+	}
+	return client.Capabilities().PrepareRenameSupported
+}
+
 // TriggerCharacters returns completion trigger characters for the server
 // handling the given file. Returns nil if no client is active.
 func (m *Manager) TriggerCharacters(projectRoot, filePath string) []string {

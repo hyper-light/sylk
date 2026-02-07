@@ -569,6 +569,78 @@ func (c *Client) Format(ctx context.Context, filePath string, tabSize int, inser
 	return toTextEdits(edits), nil
 }
 
+// PrepareRename sends a textDocument/prepareRename request to check
+// whether the symbol at the given position can be renamed.
+func (c *Client) PrepareRename(ctx context.Context, filePath string, line, character int) (*PrepareRenameResult, error) {
+	if c.Status() != StatusReady {
+		return nil, errClientNotReady
+	}
+	uri := PathToFileURI(filePath)
+	lineText := c.documents.LineText(uri, line)
+	utf16Col := RuneOffsetToUTF16(lineText, character)
+
+	params := TextDocumentPositionParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+		Position:     ProtocolPosition{Line: line, Character: utf16Col},
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	resp, err := c.sendRequest(reqCtx, MethodPrepareRename, params)
+	if err != nil {
+		return nil, fmt.Errorf("prepareRename request: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	if string(resp.Result) == "null" {
+		return nil, nil
+	}
+
+	var pr ProtocolPrepareRenameResult
+	if err := json.Unmarshal(resp.Result, &pr); err != nil {
+		return nil, fmt.Errorf("decode prepareRename: %w", err)
+	}
+	return ToPrepareRenameResult(pr), nil
+}
+
+// Rename sends a textDocument/rename request and returns the workspace edit.
+func (c *Client) Rename(ctx context.Context, filePath string, line, character int, newName string) (*WorkspaceEdit, error) {
+	if c.Status() != StatusReady {
+		return nil, errClientNotReady
+	}
+	uri := PathToFileURI(filePath)
+	lineText := c.documents.LineText(uri, line)
+	utf16Col := RuneOffsetToUTF16(lineText, character)
+
+	params := ProtocolRenameParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+		Position:     ProtocolPosition{Line: line, Character: utf16Col},
+		NewName:      newName,
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	resp, err := c.sendRequest(reqCtx, MethodRename, params)
+	if err != nil {
+		return nil, fmt.Errorf("rename request: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	if string(resp.Result) == "null" {
+		return nil, nil
+	}
+
+	var pw ProtocolWorkspaceEdit
+	if err := json.Unmarshal(resp.Result, &pw); err != nil {
+		return nil, fmt.Errorf("decode rename: %w", err)
+	}
+	return ToWorkspaceEdit(pw), nil
+}
+
 // toTextEdits converts wire text edits to domain TextEdit.
 func toTextEdits(pedits []ProtocolTextEdit) []TextEdit {
 	result := make([]TextEdit, len(pedits))
@@ -758,6 +830,9 @@ func (c *Client) initialize(ctx context.Context) error {
 							LabelOffsetSupport: true,
 						},
 					},
+				},
+				Rename: RenameClientCapabilities{
+					PrepareSupport: true,
 				},
 			},
 		},

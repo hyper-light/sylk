@@ -147,6 +147,9 @@ type ServerCapabilities struct {
 	// RenameProvider indicates the server supports rename refactoring.
 	RenameProvider bool
 
+	// PrepareRenameSupported indicates the server supports prepareRename.
+	PrepareRenameSupported bool
+
 	// DocumentHighlightProvider indicates the server supports document highlights.
 	DocumentHighlightProvider bool
 
@@ -322,6 +325,20 @@ type Position struct {
 type TextEdit struct {
 	Range   Range
 	NewText string
+}
+
+// WorkspaceEdit represents a set of edits across multiple files, normalized
+// from both the LSP `changes` and `documentChanges` wire formats.
+// FileEdits maps absolute file paths to their text edits.
+type WorkspaceEdit struct {
+	FileEdits map[string][]TextEdit
+}
+
+// PrepareRenameResult contains the range and placeholder text returned by
+// textDocument/prepareRename, confirming that rename is valid at a position.
+type PrepareRenameResult struct {
+	Range       Range
+	Placeholder string
 }
 
 // LSPConfig provides user-configurable overrides for language server settings.

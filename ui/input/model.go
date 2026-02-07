@@ -44,6 +44,11 @@ type Model struct {
 	width       int
 	height      int
 	focused     bool
+
+	// lineStyler, when set, overrides default text styling for line 0.
+	// Receives the raw line text and returns a styled string plus an
+	// optional hint displayed after the text in muted style.
+	lineStyler func(text string) (styled string, hint string)
 }
 
 // Compile-time interface checks.
@@ -65,6 +70,11 @@ func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) 
 		placeholder:   "Type a message...",
 	}
 }
+
+// SetLineStyler sets an optional styling function for line 0 text.
+// The function returns styled text and an optional hint string.
+// Pass nil to clear.
+func (m *Model) SetLineStyler(fn func(string) (string, string)) { m.lineStyler = fn }
 
 // SetPlaceholder changes the idle text shown when the input is empty.
 func (m *Model) SetPlaceholder(text string) { m.placeholder = text }
@@ -660,17 +670,59 @@ func (m *Model) renderBody() string {
 // renderLine renders a single line, highlighting @agent prefix and showing the cursor.
 func (m *Model) renderLine(line []rune, absRow int) string {
 	lineStr := string(line)
+	needsCursor := m.focused && absRow == m.cursorRow
 
-	// Highlight @agent prefix on the first line.
+	// Apply custom line styler or default @agent highlighting on line 0.
+	if absRow == 0 && m.lineStyler != nil {
+		return m.renderStyledLine(line, needsCursor)
+	}
 	if absRow == 0 {
 		lineStr = m.highlightAgentPrefix(lineStr)
 	}
 
-	// Show cursor on the focused row.
-	if !m.focused || absRow != m.cursorRow {
+	if !needsCursor {
 		return lineStr
 	}
 	return m.renderCursor(line, lineStr)
+}
+
+// renderStyledLine applies the lineStyler and appends any hint text.
+func (m *Model) renderStyledLine(line []rune, needsCursor bool) string {
+	hintStyle := m.theme.Placeholder
+
+	if needsCursor {
+		styled, hint := m.renderStyledCursor(line, m.lineStyler)
+		if hint != "" {
+			return styled + hintStyle.Render(" "+hint)
+		}
+		return styled
+	}
+	styled, hint := m.lineStyler(string(line))
+	if hint != "" {
+		return styled + hintStyle.Render(" "+hint)
+	}
+	return styled
+}
+
+// renderStyledCursor combines a line styler with cursor rendering by
+// applying the style to segments before and after the cursor separately.
+// Returns the rendered text and any hint from the styler.
+func (m *Model) renderStyledCursor(line []rune, styler func(string) (string, string)) (string, string) {
+	// Use the full text to get the hint (styler may vary hint by content).
+	_, hint := styler(string(line))
+	textStyler := func(s string) string { r, _ := styler(s); return r }
+
+	if !m.cursorVisible {
+		return textStyler(string(line)), hint
+	}
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+	if m.cursorCol >= len(line) {
+		return textStyler(string(line)) + cursorStyle.Render(" "), hint
+	}
+	before := textStyler(string(line[:m.cursorCol]))
+	under := cursorStyle.Render(string(line[m.cursorCol : m.cursorCol+1]))
+	after := textStyler(string(line[m.cursorCol+1:]))
+	return before + under + after, hint
 }
 
 // renderCursor inserts a visible block cursor at the cursor position.

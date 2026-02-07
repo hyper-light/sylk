@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -441,6 +442,7 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.SubmitPromptMsg:
 		if m.editCmdInput {
 			m.editCmdInput = false
+			m.input.SetLineStyler(nil)
 			exCmd := m.handleExCommand(typed.Text)
 			if m.editMode {
 				m.focus.SetFocus(component.FocusCodeViewer)
@@ -587,6 +589,10 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 			flushContent = m.inlineEditor.Content()
 		}
 		return m, m.lspFormatCmd(typed.FilePath, flushContent, m.inlineEditor.EditGeneration())
+	case msg.LSPPrepareRenameMsg:
+		return m, m.handleLSPPrepareRename(typed)
+	case msg.LSPRenameMsg:
+		return m, m.handleLSPRename(typed)
 	case msg.LSPFormatMsg:
 		return m, m.handleLSPFormat(typed)
 	case msg.NerdFontsResultMsg:
@@ -1366,6 +1372,157 @@ func flattenSymbols(syms []lsp.DocumentSymbol, depth int) []filetree.SymbolEntry
 	return result
 }
 
+// ---------------------------------------------------------------------------
+// LSP Rename
+// ---------------------------------------------------------------------------
+
+// lspPrepareRenameCmd sends a textDocument/prepareRename request.
+func (m *AppModel) lspPrepareRenameCmd(filePath string, line, col int, newName string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		result, err := mgr.PrepareRename(ctx, root, filePath, line, col)
+		return msg.LSPPrepareRenameMsg{
+			FilePath: filePath,
+			Line:     line,
+			Col:      col,
+			NewName:  newName,
+			Result:   result,
+			Err:      err,
+		}
+	}
+}
+
+// lspRenameCmd sends a textDocument/rename request.
+func (m *AppModel) lspRenameCmd(filePath string, line, col int, newName string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		edit, err := mgr.Rename(ctx, root, filePath, line, col, newName)
+		return msg.LSPRenameMsg{
+			FilePath: filePath,
+			NewName:  newName,
+			Edit:     edit,
+			Err:      err,
+		}
+	}
+}
+
+// handleLSPPrepareRename processes the prepareRename response and either
+// proceeds with the rename or shows an error.
+func (m *AppModel) handleLSPPrepareRename(r msg.LSPPrepareRenameMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Rename: " + r.Err.Error())
+		return nil
+	}
+	if r.Result == nil {
+		m.statusBar.SetFlash("Cannot rename symbol at cursor")
+		return nil
+	}
+	return m.lspRenameCmd(r.FilePath, r.Line, r.Col, r.NewName)
+}
+
+// handleLSPRename applies the workspace edit from a rename response.
+func (m *AppModel) handleLSPRename(r msg.LSPRenameMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Rename: " + r.Err.Error())
+		return nil
+	}
+	if r.Edit == nil || len(r.Edit.FileEdits) == 0 {
+		m.statusBar.SetFlash("Rename: no changes")
+		return nil
+	}
+	n := m.applyWorkspaceEdit(r.Edit)
+	m.statusBar.SetFlash(fmt.Sprintf("Renamed to %s in %d file(s)", r.NewName, n))
+	return nil
+}
+
+// applyWorkspaceEdit applies a workspace edit across files. Open editor
+// buffers are edited in-place (with undo support); other files are
+// modified on disk. Returns the number of files changed.
+func (m *AppModel) applyWorkspaceEdit(edit *lsp.WorkspaceEdit) int {
+	editorPath := m.inlineEditor.FilePath()
+	changed := 0
+	for path, edits := range edit.FileEdits {
+		if path == editorPath {
+			m.inlineEditor.ApplyTextEdits(edits)
+			changed++
+			continue
+		}
+		if applyEditsToFile(path, edits) {
+			changed++
+		}
+	}
+	return changed
+}
+
+// applyEditsToFile reads a file, applies text edits, and writes it back.
+// Edits are applied in reverse order to preserve earlier offsets.
+func applyEditsToFile(path string, edits []lsp.TextEdit) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(data), "\n")
+
+	// Sort edits reverse by position so earlier offsets remain valid.
+	sorted := make([]lsp.TextEdit, len(edits))
+	copy(sorted, edits)
+	slices.SortFunc(sorted, func(a, b lsp.TextEdit) int {
+		if a.Range.Start.Line != b.Range.Start.Line {
+			return b.Range.Start.Line - a.Range.Start.Line
+		}
+		return b.Range.Start.Character - a.Range.Start.Character
+	})
+
+	for _, edit := range sorted {
+		lines = spliceLines(lines, edit)
+	}
+
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644) == nil
+}
+
+// spliceLines applies a single text edit to a line slice.
+func spliceLines(lines []string, edit lsp.TextEdit) []string {
+	startLine := edit.Range.Start.Line
+	endLine := edit.Range.End.Line
+	if startLine >= len(lines) {
+		return lines
+	}
+	if endLine >= len(lines) {
+		endLine = len(lines) - 1
+	}
+
+	startCol := clampCol(lines[startLine], edit.Range.Start.Character)
+	endCol := clampCol(lines[endLine], edit.Range.End.Character)
+
+	prefix := lines[startLine][:startCol]
+	suffix := lines[endLine][endCol:]
+	replacement := prefix + edit.NewText + suffix
+
+	newLines := strings.Split(replacement, "\n")
+
+	// Splice: replace lines[startLine..endLine] with newLines.
+	result := make([]string, 0, len(lines)-((endLine-startLine)+1)+len(newLines))
+	result = append(result, lines[:startLine]...)
+	result = append(result, newLines...)
+	result = append(result, lines[endLine+1:]...)
+	return result
+}
+
+// clampCol clamps a column index to the valid range for a line.
+func clampCol(line string, col int) int {
+	if col < 0 {
+		return 0
+	}
+	if col > len(line) {
+		return len(line)
+	}
+	return col
+}
+
 // handleHoverDefinition stores the definition symbol and package path on the
 // active hover tooltip. If the hover content hasn't arrived yet, stashes
 // the info so it can be applied when the hover activates.
@@ -1921,6 +2078,7 @@ func (m *AppModel) exitEditMode() {
 func (m *AppModel) enterCmdInput() {
 	m.editCmdInput = true
 	m.input.SetText(":")
+	m.input.SetLineStyler(m.cmdLineStyler())
 	m.focus.SetFocus(component.FocusInput)
 	m.syncFocusState()
 }
@@ -1928,6 +2086,7 @@ func (m *AppModel) enterCmdInput() {
 // exitCmdInput aborts command input and returns focus to the code panel.
 func (m *AppModel) exitCmdInput() {
 	m.editCmdInput = false
+	m.input.SetLineStyler(nil)
 	m.input.Clear()
 	m.focus.SetFocus(component.FocusCodeViewer)
 	m.syncFocusState()
@@ -1955,6 +2114,57 @@ func (m *AppModel) snapshotCurrentEditor() {
 func (m *AppModel) restoreEditorSnapshot(snap *editorSnapshot) {
 	m.inlineEditor.OpenFile(snap.filePath, snap.content, snap.language)
 	m.inlineEditor.RestoreState(snap.cursor, snap.scrollOffset)
+}
+
+// exCmdInfo describes a known ex command and its argument requirement.
+type exCmdInfo struct {
+	argHint string // Non-empty means the command requires an argument.
+}
+
+// knownExCommands maps command words to their validation info.
+var knownExCommands = map[string]exCmdInfo{
+	"w": {}, "q": {}, "wq": {}, "x": {}, "q!": {},
+	"symbols": {}, "format": {}, "fmt": {},
+	"rename": {argHint: "<newname>"},
+}
+
+// validateExCommand checks the typed text against known commands.
+// Returns: known (command word recognized), valid (ready to execute), hint.
+func validateExCommand(text string) (known, valid bool, hint string) {
+	cmd := strings.TrimPrefix(strings.TrimSpace(text), ":")
+	cmd = strings.TrimSpace(cmd)
+
+	word, args, hasArgs := strings.Cut(cmd, " ")
+	info, ok := knownExCommands[word]
+	if !ok {
+		return false, false, ""
+	}
+	if info.argHint == "" {
+		return true, true, ""
+	}
+	if hasArgs && strings.TrimSpace(args) != "" {
+		return true, true, ""
+	}
+	return true, false, info.argHint
+}
+
+// cmdLineStyler returns a line styler that colors command text green when
+// valid, red when recognized but incomplete, and returns a hint for
+// incomplete commands.
+func (m *AppModel) cmdLineStyler() func(string) (string, string) {
+	th := m.config.Theme()
+	validStyle := lipgloss.NewStyle().Foreground(th.Palette.Success)
+	invalidStyle := lipgloss.NewStyle().Foreground(th.Palette.Error)
+	return func(text string) (string, string) {
+		known, valid, hint := validateExCommand(text)
+		if !known {
+			return text, ""
+		}
+		if valid {
+			return validStyle.Render(text), ""
+		}
+		return invalidStyle.Render(text), hint
+	}
 }
 
 // handleExCommand processes a vim ex command entered in the input panel
@@ -1996,9 +2206,37 @@ func (m *AppModel) handleExCommand(text string) tea.Cmd {
 			return m.lspFormatCmd(fp, flushContent, m.inlineEditor.EditGeneration())
 		}
 	default:
+		if newName, ok := strings.CutPrefix(cmd, "rename "); ok {
+			return m.handleRenameCommand(strings.TrimSpace(newName))
+		}
 		m.statusBar.SetFlash("Unknown command: :" + cmd)
 	}
 	return nil
+}
+
+// handleRenameCommand initiates an LSP rename for the symbol under the cursor.
+func (m *AppModel) handleRenameCommand(newName string) tea.Cmd {
+	if newName == "" {
+		m.statusBar.SetFlash("Usage: :rename <newname>")
+		return nil
+	}
+	fp := m.inlineEditor.FilePath()
+	if fp == "" {
+		return nil
+	}
+	line := m.inlineEditor.CursorLine()
+	col := m.inlineEditor.CursorCol()
+
+	// Flush pending edits so the server sees the latest buffer.
+	if m.inlineEditor.LSPDirty() {
+		m.inlineEditor.ClearLSPDirty()
+		_ = m.lspManager.NotifyDidChange(m.ctx, m.config.ProjectRoot, fp, m.inlineEditor.Content())
+	}
+
+	if m.lspManager.PrepareRenameSupported(m.config.ProjectRoot, fp) {
+		return m.lspPrepareRenameCmd(fp, line, col, newName)
+	}
+	return m.lspRenameCmd(fp, line, col, newName)
 }
 
 // saveEditorBuffer writes the inline editor buffer to disk.

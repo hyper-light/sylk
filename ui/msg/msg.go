@@ -306,6 +306,24 @@ type LSPFormatMsg struct {
 	EditGeneration int // buffer generation at request time for staleness detection
 }
 
+// LSPPrepareRenameMsg carries the result of a prepareRename request.
+type LSPPrepareRenameMsg struct {
+	FilePath string
+	Line     int
+	Col      int
+	NewName  string // Carried through to the rename step.
+	Result   *lsp.PrepareRenameResult
+	Err      error
+}
+
+// LSPRenameMsg carries the workspace edit from a rename request.
+type LSPRenameMsg struct {
+	FilePath string
+	NewName  string
+	Edit     *lsp.WorkspaceEdit
+	Err      error
+}
+
 // ---------------------------------------------------------------------------
 // File tree
 // ---------------------------------------------------------------------------
