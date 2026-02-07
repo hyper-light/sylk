@@ -224,10 +224,6 @@ type matchConfig struct {
 // Derived from: 2 characters avoids scanning every file for single-char queries.
 const minSearchQueryLen = 2
 
-// maxSearchScanFiles bounds the number of files whose contents are read.
-// Derived from: 256 files keeps per-keystroke I/O under ~16MB.
-const maxSearchScanFiles = 256
-
 // maxSearchFileSize is the largest file we'll read for content search (64KB).
 // Derived from: 65536 bytes covers most source files while skipping binaries.
 const maxSearchFileSize = 65536
@@ -259,8 +255,8 @@ const searchDebounceInterval = 50 * time.Millisecond
 const btnFlashDuration = 200 * time.Millisecond
 
 // maxFileCacheSize caps total cached file content to prevent unbounded memory.
-// Derived from: 64MB covers 256 files × 256KB average with headroom.
-const maxFileCacheSize = 64 << 20
+// Derived from: 128MB covers large project file sets with headroom.
+const maxFileCacheSize = 128 << 20
 
 // searchTickMsg is the debounce timer message. The version field gates stale
 // ticks so only the latest query triggers a grep.
@@ -282,7 +278,7 @@ type fileCache struct {
 
 // newFileCache creates an empty file cache.
 func newFileCache() *fileCache {
-	return &fileCache{entries: make(map[string]*cachedFile, maxSearchScanFiles)}
+	return &fileCache{entries: make(map[string]*cachedFile, 512)}
 }
 
 // get returns the cached lines for path, or nil if not cached.
@@ -342,11 +338,15 @@ type Model struct {
 	// Search state.
 	mode           viewMode
 	searchQuery    []rune
-	searchSource   []Entry      // All files found recursively (built on search enter).
+	searchSource   []string     // All searchable file paths (gitignore-filtered, built on enter).
 	searchItems    []searchItem // Flat list of file headers, match lines, and gaps.
 	searchCursor   int
 	searchScroll   int
 	searchNumWidth int // Digit width of the largest line number in results.
+
+	// Async search worker and state.
+	searchWorker *SearchWorker // Parallel async scanner (nil when not searching).
+	searchDone   bool          // True when the latest async scan is complete.
 
 	// Search performance: debounce, caching, pre-indexed scope.
 	searchVersion int        // Monotonic counter; gates stale debounce ticks.
@@ -549,19 +549,75 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 		return m, m.handleKey(typed)
 	case searchTickMsg:
 		return m, m.handleSearchTick(typed)
+	case searchBatchMsg:
+		return m, m.handleSearchBatch(typed)
 	default:
 		return m, nil
 	}
 }
 
 // handleSearchTick processes a debounced search tick. If the version matches
-// the current searchVersion, runs the grep pipeline; otherwise discards it.
+// the current searchVersion, launches an async scan via the search worker.
 func (m *Model) handleSearchTick(tick searchTickMsg) tea.Cmd {
-	if tick.version != m.searchVersion {
+	if tick.version != m.searchVersion || m.searchWorker == nil {
 		return nil
 	}
-	m.runSearch()
+
+	m.searchItems = nil
+	m.searchNumWidth = 0
+	m.searchDone = false
+	m.compiledRegexp = nil
+
+	query := string(m.searchQuery)
+	cfg := m.buildMatchConfig(query)
+	m.compiledRegexp = cfg.compiled
+
+	m.searchWorker.Start(m.scopedSourcePaths(), query, cfg, m.searchVersion)
+	return searchWatchCmd(m.searchWorker)
+}
+
+// handleSearchBatch merges progressive async results into the model.
+func (m *Model) handleSearchBatch(batch searchBatchMsg) tea.Cmd {
+	if m.searchWorker == nil || batch.version != m.searchVersion {
+		return nil
+	}
+
+	// Merge items: add cross-batch gap if appending to existing results.
+	if len(m.searchItems) > 0 && len(batch.items) > 0 {
+		m.searchItems = append(m.searchItems, searchItem{kind: searchItemGap})
+	}
+	m.searchItems = append(m.searchItems, batch.items...)
+
+	// Update match summary width.
+	m.searchNumWidth = max(m.searchNumWidth, digitCount(batch.maxLine))
+
+	// Cache file content from batch.
+	for _, entry := range batch.cached {
+		m.searchCache.put(entry.path, entry.lines, entry.size)
+	}
+
+	// Position cursor on first match if this is the first batch with results.
+	if batch.matches > 0 && m.searchCursor == 0 {
+		m.seekFirstMatch()
+	}
+
+	m.searchDone = batch.done
+	if !batch.done {
+		return searchWatchCmd(m.searchWorker)
+	}
 	return nil
+}
+
+// searchWatchCmd returns a Bubble Tea command that subscribes to the search
+// worker's output channel, following the git status watcher subscription pattern.
+func searchWatchCmd(worker *SearchWorker) tea.Cmd {
+	return func() tea.Msg {
+		batch, ok := <-worker.Output()
+		if !ok {
+			return nil
+		}
+		return batch
+	}
 }
 
 // View dispatches to the active view mode.
@@ -2639,29 +2695,21 @@ func (m *Model) collapseAt(idx int) {
 // Search
 // ---------------------------------------------------------------------------
 
-// maxSearchFiles bounds the recursive file walk to prevent unbounded growth.
-// Derived from: 4096 files covers most medium-to-large repos.
-const maxSearchFiles = 4096
-
-// maxSearchDepth bounds the recursive walk depth.
-// Derived from: 16 levels covers virtually all project structures.
-const maxSearchDepth = 16
-
-// enterSearch snapshots the current tree state, walks the filesystem to
-// build a flat file index, and switches to search mode. When rootPath is
-// set, walks from the project root so all project files are searchable
-// regardless of the current tree expansion state.
+// enterSearch snapshots the current tree state, walks the filesystem
+// (gitignore-aware) to build a flat file index, creates the async search
+// worker, and switches to search mode.
 func (m *Model) enterSearch() {
 	m.savedEntries = make([]Entry, len(m.entries))
 	copy(m.savedEntries, m.entries)
 	m.savedCursor = m.cursor
 	m.savedScroll = m.scroll
 
-	if m.rootPath != "" {
-		m.searchSource = m.collectFromRoot()
-	} else {
-		m.searchSource = m.collectFiles(m.entries)
+	// Gitignore-aware walk: prunes entire ignored directory trees.
+	root := m.rootPath
+	if root == "" {
+		root = "."
 	}
+	m.searchSource = collectSearchableFiles(root)
 
 	m.mode = viewSearch
 	m.searchQuery = nil
@@ -2669,8 +2717,12 @@ func (m *Model) enterSearch() {
 	m.searchCursor = 0
 	m.searchScroll = 0
 	m.searchNumWidth = 0
+	m.searchDone = true
 	m.cursorBlink = true
 	m.lastBlinkAt = time.Now()
+
+	// Create async search worker.
+	m.searchWorker = NewSearchWorker()
 
 	// Initialize performance caches.
 	m.searchVersion = 0
@@ -2686,16 +2738,15 @@ func (m *Model) enterSearch() {
 	m.compiledRegexp = nil
 }
 
-// collectFromRoot walks the rootPath recursively to collect all files,
-// providing a consistent search source regardless of tree expansion state.
-func (m *Model) collectFromRoot() []Entry {
-	files := make([]Entry, 0, maxSearchFiles)
-	m.walkDir(m.rootPath, 0, &files)
-	return files
-}
-
-// exitSearch restores the tree state from before search was entered.
+// exitSearch stops the async worker, restores the tree state, and clears
+// all search-related fields.
 func (m *Model) exitSearch() {
+	// Stop async worker and release.
+	if m.searchWorker != nil {
+		m.searchWorker.Stop()
+		m.searchWorker = nil
+	}
+
 	m.entries = m.savedEntries
 	m.rebuildPathIndex()
 	m.cursor = m.savedCursor
@@ -2706,6 +2757,7 @@ func (m *Model) exitSearch() {
 	m.searchItems = nil
 	m.savedEntries = nil
 	m.searchNumWidth = 0
+	m.searchDone = true
 
 	// Release caches.
 	m.searchVersion = 0
@@ -3225,7 +3277,20 @@ func replaceAllWithRe(line string, re *regexp.Regexp, replacement string, isRege
 // used after replacements to immediately refresh results.
 func (m *Model) refilterSync() {
 	m.searchVersion++
-	m.runSearch()
+	m.searchItems = nil
+	m.searchNumWidth = 0
+	m.compiledRegexp = nil
+
+	query := string(m.searchQuery)
+	if len(query) < minSearchQueryLen {
+		m.searchCursor = 0
+		m.searchScroll = 0
+		return
+	}
+
+	cfg := m.buildMatchConfig(query)
+	m.compiledRegexp = cfg.compiled
+	m.grepSources(m.scopedSourcePaths(), query, cfg)
 }
 
 // clickReplaceMode handles clicks in replace mode, dispatching to search
@@ -3260,55 +3325,6 @@ func (m *Model) clickReplaceMode(viewX, viewY int) tea.Cmd {
 	return nil
 }
 
-// collectFiles walks the root entries recursively, collecting all files
-// (not directories) into a flat list bounded by maxSearchFiles.
-func (m *Model) collectFiles(roots []Entry) []Entry {
-	files := make([]Entry, 0, min(len(roots)*8, maxSearchFiles))
-	for _, root := range roots {
-		if len(files) >= maxSearchFiles {
-			break
-		}
-		if !root.IsDir {
-			files = append(files, Entry{
-				Name: root.Name,
-				Path: root.Path,
-			})
-			continue
-		}
-		m.walkDir(root.Path, 0, &files)
-	}
-	return files
-}
-
-// walkDir recursively collects files from a directory, respecting depth
-// and count bounds. Hidden files (dot-prefixed) are excluded.
-func (m *Model) walkDir(dirPath string, depth int, files *[]Entry) {
-	if depth >= maxSearchDepth || len(*files) >= maxSearchFiles {
-		return
-	}
-	dirEntries, err := os.ReadDir(dirPath)
-	if err != nil {
-		return
-	}
-	for _, de := range dirEntries {
-		if len(*files) >= maxSearchFiles {
-			return
-		}
-		name := de.Name()
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-		fullPath := filepath.Join(dirPath, name)
-		if de.IsDir() {
-			m.walkDir(fullPath, depth+1, files)
-		} else {
-			*files = append(*files, Entry{
-				Name: name,
-				Path: fullPath,
-			})
-		}
-	}
-}
 
 // refilter schedules a debounced search. Each call increments the version
 // counter and starts a timer; only the latest version actually runs the grep.
@@ -3322,6 +3338,7 @@ func (m *Model) refilter() tea.Cmd {
 		m.compiledRegexp = nil
 		m.searchCursor = 0
 		m.searchScroll = 0
+		m.searchDone = true
 		return nil
 	}
 
@@ -3331,24 +3348,6 @@ func (m *Model) refilter() tea.Cmd {
 	})
 }
 
-// runSearch executes the grep pipeline synchronously. Called from
-// handleSearchTick when the debounce fires and the version is still current.
-func (m *Model) runSearch() {
-	m.searchItems = nil
-	m.searchNumWidth = 0
-	m.compiledRegexp = nil
-
-	query := string(m.searchQuery)
-	if len(query) < minSearchQueryLen {
-		m.searchCursor = 0
-		m.searchScroll = 0
-		return
-	}
-
-	cfg := m.buildMatchConfig(query)
-	m.compiledRegexp = cfg.compiled
-	m.grepSources(m.scopedSources(), query, cfg)
-}
 
 // buildMatchConfig constructs a matchConfig from the current toggle state
 // and query content, implementing smart-case behavior. Always pre-compiles
@@ -3386,10 +3385,9 @@ func compileMatchRegex(query string, cfg matchConfig) *regexp.Regexp {
 	return re
 }
 
-// scopedSources returns the subset of searchSource files whose paths
-// match the scope prefix. Uses the pre-built scopeIndex for O(matched)
-// lookups instead of O(n) full scan.
-func (m *Model) scopedSources() []Entry {
+// scopedSourcePaths returns the subset of searchSource paths that match
+// the scope prefix. Used by the async worker pipeline.
+func (m *Model) scopedSourcePaths() []string {
 	scope := strings.TrimSpace(string(m.scopeQuery))
 	if scope == "" {
 		return m.searchSource
@@ -3400,39 +3398,38 @@ func (m *Model) scopedSources() []Entry {
 	return m.lookupScope(scope)
 }
 
-// filterByRegex returns entries whose paths match the given regex pattern.
-// Patterns containing a path separator are matched against the entry's
-// relative path; otherwise they are matched against the base name only.
-// Invalid patterns return no results.
-func (m *Model) filterByRegex(pattern string) []Entry {
+// filterByRegex returns paths whose names match the given regex pattern.
+// Patterns containing a path separator are matched against the relative
+// path; otherwise matched against the base name only.
+func (m *Model) filterByRegex(pattern string) []string {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil
 	}
 	matchPath := strings.ContainsRune(pattern, filepath.Separator) ||
 		strings.ContainsRune(pattern, '/')
-	filtered := make([]Entry, 0, len(m.searchSource)/4)
-	for i := range m.searchSource {
-		name := filepath.Base(m.searchSource[i].Path)
+	filtered := make([]string, 0, len(m.searchSource)/4)
+	for _, path := range m.searchSource {
+		name := filepath.Base(path)
 		if matchPath {
-			name = m.relativePath(m.searchSource[i].Path)
+			name = m.relativePath(path)
 		}
 		if re.MatchString(name) {
-			filtered = append(filtered, m.searchSource[i])
+			filtered = append(filtered, path)
 		}
 	}
 	return filtered
 }
 
-// lookupScope returns entries under the given scope using the directory index.
+// lookupScope returns paths under the given scope using the directory index.
 // Collects all index entries whose directory key starts with the scope prefix.
-func (m *Model) lookupScope(scope string) []Entry {
+func (m *Model) lookupScope(scope string) []string {
 	scope = filepath.FromSlash(scope)
 	prefix := filepath.Join(m.rootPath, scope)
 	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
 		prefix += string(filepath.Separator)
 	}
-	var filtered []Entry
+	var filtered []string
 	for dir, indices := range m.scopeIndex {
 		if !strings.HasPrefix(dir, prefix) {
 			continue
@@ -3444,12 +3441,12 @@ func (m *Model) lookupScope(scope string) []Entry {
 	return filtered
 }
 
-// buildScopeIndex groups searchSource entries by their parent directory
+// buildScopeIndex groups searchSource paths by their parent directory
 // for efficient scope filtering. Built once at search entry.
-func buildScopeIndex(sources []Entry, rootPath string) map[string][]int {
+func buildScopeIndex(sources []string, rootPath string) map[string][]int {
 	index := make(map[string][]int, len(sources)/4)
-	for i, entry := range sources {
-		dir := filepath.Dir(entry.Path)
+	for i, path := range sources {
+		dir := filepath.Dir(path)
 		if !strings.HasSuffix(dir, string(filepath.Separator)) {
 			dir += string(filepath.Separator)
 		}
@@ -3458,22 +3455,22 @@ func buildScopeIndex(sources []Entry, rootPath string) map[string][]int {
 	return index
 }
 
-// grepSources scans files and builds the searchItems list, using the
-// session file cache to avoid redundant disk I/O.
-func (m *Model) grepSources(sources []Entry, query string, cfg matchConfig) {
+// grepSources scans files synchronously and builds the searchItems list,
+// using the session file cache to avoid redundant disk I/O. Used for
+// synchronous refilter after replace operations.
+func (m *Model) grepSources(sources []string, query string, cfg matchConfig) {
 	totalMatches := 0
 	maxLine := 0
-	scanLimit := min(len(sources), maxSearchScanFiles)
 
-	for i := range scanLimit {
+	for _, path := range sources {
 		if totalMatches >= maxTotalMatches {
 			break
 		}
-		matches := m.grepFileWithCache(sources[i].Path, query, cfg)
+		matches := m.grepFileWithCache(path, query, cfg)
 		if len(matches) == 0 {
 			continue
 		}
-		m.appendFileResults(sources[i].Path, matches, &totalMatches, &maxLine)
+		m.appendFileResults(path, matches, &totalMatches, &maxLine)
 	}
 	m.searchNumWidth = digitCount(maxLine)
 	m.searchScroll = 0
@@ -4565,6 +4562,10 @@ func (m *Model) renderMatchSummary(contentWidth int) string {
 	switch {
 	case len(m.searchQuery) < minSearchQueryLen:
 		text = ""
+	case !m.searchDone && matches == 0:
+		text = style.Render(" Searching...")
+	case !m.searchDone:
+		text = style.Render(fmt.Sprintf(" %d results in %d files (searching...)", matches, files))
 	case matches == 0:
 		text = style.Render(" No results")
 	default:
